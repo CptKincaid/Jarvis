@@ -40,3 +40,29 @@ def resolve_mic_by_name(saved_name, devices=None):
             return i
 
     return None
+
+
+def denoise_audio(audio, sr=16000, enabled=True):
+    """Remove background noise using spectral gating.
+
+    Args:
+        audio: numpy float32 array, mono
+        sr: sample rate
+        enabled: if False, returns audio unchanged
+
+    Returns:
+        Denoised numpy float32 array, same shape as input.
+    """
+    if not enabled or len(audio) < 1600:
+        return audio
+
+    try:
+        import noisereduce as nr
+        reduced = nr.reduce_noise(
+            y=audio.astype(np.float32), sr=sr,
+            stationary=True, prop_decrease=0.75,
+            n_fft=512, hop_length=128,
+        )
+        return reduced.astype(np.float32)
+    except Exception:
+        return audio
