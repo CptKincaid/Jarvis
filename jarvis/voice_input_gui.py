@@ -842,17 +842,16 @@ class HotwordListener:
         if self._model is None:
             try:
                 from openwakeword.model import Model
-                custom_verifier = {}
+                # Load base model first, then attach custom verifier after
+                self._model = Model()
+                _log(f"OpenWakeWord loaded: {list(self._model.models.keys())}")
+
                 verifier_path = Path.home() / ".aiws_trainer" / "hey_jarvis_verifier.pkl"
                 if verifier_path.exists():
                     import joblib
-                    custom_verifier["hey_jarvis"] = joblib.load(str(verifier_path))
-                    _log(f"Custom wake word verifier loaded: {verifier_path}")
-                self._model = Model(
-                    custom_verifier_models=custom_verifier,
-                    custom_verifier_threshold=0.3,
-                )
-                _log(f"OpenWakeWord loaded: {list(self._model.models.keys())}")
+                    self._model.custom_verifier_models["hey_jarvis"] = joblib.load(str(verifier_path))
+                    self._model.custom_verifier_threshold = 0.3
+                    _log(f"Custom wake word verifier attached: {verifier_path}")
             except Exception as e:
                 _log(f"OpenWakeWord load error: {e}")
                 self.active = False
@@ -912,11 +911,24 @@ class HotwordListener:
                 buf.clear()
                 _open_stream()
                 _log("Hotword stream resumed")
-                # Reset OWW model state after pause
+                # Reset OWW model state and add cooldown so residual
+                # audio from the previous recording doesn't false-trigger
                 if self._model:
                     self._model.reset()
+                self._resume_cooldown = time.monotonic() + 2.0  # 2s cooldown
 
             if self.gui.recording or not self._stream:
+                continue
+
+            # Skip detection while TTS is speaking (prevents feedback loop)
+            tts = getattr(self.gui, '_tts', None)
+            if tts and tts.is_speaking:
+                buf.clear()
+                continue
+
+            # Skip detection during post-resume cooldown
+            if time.monotonic() < getattr(self, '_resume_cooldown', 0):
+                buf.clear()
                 continue
 
             # Need at least 80ms of audio
@@ -1193,7 +1205,7 @@ class VoiceInputGUI:
         self.jarvis_mode_var = tk.BooleanVar(value=False)  # Claude brain mode
         self.tts_engine_var = tk.StringVar(value="edge")  # "edge" or "xtts"
         self.speaker_verify_var = tk.BooleanVar(value=False)
-        self.speaker_threshold_var = tk.DoubleVar(value=0.40)
+        self.speaker_threshold_var = tk.DoubleVar(value=0.35)
         self.silence_var = tk.DoubleVar(value=SILENCE_TIMEOUT)
         self.noise_threshold_var = tk.DoubleVar(value=SILENCE_THRESHOLD)
         self._last_segments = []  # (text, avg_logprob) for confidence display
@@ -1292,6 +1304,17 @@ class VoiceInputGUI:
             _log(f"Mic detection error: {e}")
             self._mic_devices = {"Default": None}
 
+    def _get_mic_raw_name(self):
+        """Get raw device name (without index prefix) for persistence."""
+        display = self.mic_var.get()
+        if display == "Default":
+            return None
+        if display.startswith("["):
+            bracket_end = display.find("]")
+            if bracket_end > 0:
+                return display[bracket_end + 2:].strip()
+        return display
+
     # ------------------------------------------------------------------
     # Settings persistence
     # ------------------------------------------------------------------
@@ -1336,6 +1359,23 @@ class VoiceInputGUI:
                     except (ValueError, TypeError):
                         pass
 
+            # Resolve mic by name (survives reboots/USB re-enumeration)
+            saved_mic_name = data.get("mic_name")
+            if saved_mic_name:
+                from jarvis.audio_pipeline import resolve_mic_by_name
+                import sounddevice as sd
+                idx = resolve_mic_by_name(saved_mic_name, sd.query_devices())
+                if idx is not None:
+                    for display, dev_idx in self._mic_devices.items():
+                        if dev_idx == idx:
+                            self.mic_var.set(display)
+                            _log(f"Mic resolved: '{saved_mic_name}' -> [{idx}]")
+                            break
+                else:
+                    _log(f"WARNING: Mic '{saved_mic_name}' not found")
+                    self.root.after(1000, lambda n=saved_mic_name: self._set_status(
+                        "Mic not found", "#da3633", f"'{n}' — check USB"))
+
             # Restore pinned target window name
             saved_target = data.get("target_name")
             if saved_target:
@@ -1352,6 +1392,7 @@ class VoiceInputGUI:
             "model": self.model_var.get(),
             "gpu": self.gpu_var.get(),
             "mic": self.mic_var.get(),
+            "mic_name": self._get_mic_raw_name(),
             "language": self.lang_var.get(),
             "auto_type": self.auto_type_var.get(),
             "continuous": self.continuous_var.get(),
@@ -2370,11 +2411,19 @@ class VoiceInputGUI:
         mic_name = self.mic_var.get()
         mic_idx = self._mic_devices.get(mic_name)
 
-        # If saved mic no longer exists, fall back to default
+        # If saved mic no longer exists, try resolving by name
         if mic_name not in self._mic_devices:
-            _log(f"Saved mic {mic_name!r} not found, using default")
-            mic_idx = None
-            self.mic_var.set("Default")
+            from jarvis.audio_pipeline import resolve_mic_by_name
+            import sounddevice as sd
+            raw_name = self._get_mic_raw_name()
+            resolved = resolve_mic_by_name(raw_name, sd.query_devices()) if raw_name else None
+            if resolved is not None:
+                mic_idx = resolved
+                _log(f"Mic resolved by name: '{raw_name}' -> [{resolved}]")
+            else:
+                _log(f"WARNING: Mic not found, recording disabled")
+                self._set_status("Mic not found", "#da3633", "Check USB connection")
+                return
 
         # Detect the device's native sample rate (many mics only do 44100/48000)
         try:
@@ -2559,24 +2608,34 @@ class VoiceInputGUI:
     def _transcribe_worker(self, audio):
         try:
             # Speaker verification — filter to only user's voice segments
+            # Skip segment filter if the periodic speaker check already
+            # confirmed our voice during recording (saves ~0.5s)
             if self.speaker_verify_var.get() and self._speaker_verifier is not None:
-                filtered, stats = self._speaker_verifier.filter_segments(audio)
-                if filtered is None:
-                    avg = (sum(stats["scores"]) / len(stats["scores"])
-                           if stats["scores"] else 0.0)
-                    _log(f"Speaker rejected all {stats['total']} segments "
-                         f"(avg score={avg:.3f})")
-                    self.root.after(0, lambda a=avg: self._on_transcription(
-                        "", None, speaker_rejected=True, speaker_score=a))
-                    return
-                if stats["total"] > 0:
-                    kept_pct = stats["matched"] / stats["total"] * 100
-                    orig_sec = len(audio) / SAMPLE_RATE
-                    filt_sec = len(filtered) / SAMPLE_RATE
-                    _log(f"Speaker filter: kept {stats['matched']}/{stats['total']} "
-                         f"segments ({kept_pct:.0f}%), "
-                         f"{orig_sec:.1f}s -> {filt_sec:.1f}s audio")
-                audio = filtered
+                duration_sec = len(audio) / SAMPLE_RATE
+                voice_confirmed = getattr(self, '_voice_id_match', False)
+
+                if voice_confirmed and duration_sec < 15:
+                    # Short recording, voice already verified — skip segment filter
+                    _log(f"Speaker skip: voice confirmed during recording, "
+                         f"{duration_sec:.1f}s < 15s")
+                else:
+                    filtered, stats = self._speaker_verifier.filter_segments(audio)
+                    if filtered is None:
+                        avg = (sum(stats["scores"]) / len(stats["scores"])
+                               if stats["scores"] else 0.0)
+                        _log(f"Speaker rejected all {stats['total']} segments "
+                             f"(avg score={avg:.3f})")
+                        self.root.after(0, lambda a=avg: self._on_transcription(
+                            "", None, speaker_rejected=True, speaker_score=a))
+                        return
+                    if stats["total"] > 0:
+                        kept_pct = stats["matched"] / stats["total"] * 100
+                        orig_sec = len(audio) / SAMPLE_RATE
+                        filt_sec = len(filtered) / SAMPLE_RATE
+                        _log(f"Speaker filter: kept {stats['matched']}/{stats['total']} "
+                             f"segments ({kept_pct:.0f}%), "
+                             f"{orig_sec:.1f}s -> {filt_sec:.1f}s audio")
+                    audio = filtered
 
             lang = self._get_whisper_language()
             kwargs = dict(
@@ -4361,8 +4420,10 @@ class VoiceInputGUI:
             return
 
         now = time.monotonic()
-        # Don't check for the first 3 seconds of recording
-        if self._record_start_time and (now - self._record_start_time) < 3.0:
+        # Don't check for the first 5 seconds of recording — the initial
+        # audio after hotword detection is unreliable (mix of wake word +
+        # start of sentence scores low on speaker verification)
+        if self._record_start_time and (now - self._record_start_time) < 5.0:
             self.root.after(3000, self._check_speaker_silence)
             return
 
@@ -4703,6 +4764,12 @@ class VoiceInputGUI:
             self.root.after(2000, self._watch_speak_queue)
             return
 
+        # Don't queue new speech while already speaking (prevents double-play)
+        tts = self._get_tts()
+        if tts.is_speaking:
+            self.root.after(1000, self._watch_speak_queue)
+            return
+
         speak_file = Path("/tmp/vss_voice/speak_queue.txt")
         try:
             if speak_file.exists():
@@ -4713,21 +4780,17 @@ class VoiceInputGUI:
                         new_lines = f.read()
                     self._speak_queue_pos = size
 
-                    # Combine all new lines into one utterance
                     combined = " ".join(
                         l.strip() for l in new_lines.strip().splitlines()
                         if l.strip()
                     )
                     if combined:
                         _log(f"Talk-back queue: {combined[:60]}")
-                        tts = self._get_tts()
                         self.root.after(0, lambda: self._set_status(
                             "Speaking...", self.ACCENT, "Jarvis"))
-                        # Activate arc reactor while speaking
                         self._speaking_animation = True
                         self.root.after(0, self._update_speaking_animation)
 
-                        # Show transcript in Jarvis text box
                         def _show_transcript(t=combined):
                             self.jarvis_text.config(state=tk.NORMAL)
                             self.jarvis_text.delete("1.0", tk.END)
@@ -4742,20 +4805,23 @@ class VoiceInputGUI:
                         self.root.after(0, _show_transcript)
 
                         def _speak_and_stop(t=combined):
-                            # Pause hotword listener so TTS saying "Jarvis"
-                            # doesn't trigger a feedback loop
-                            if self.hotword_var.get() and self._hotword._stream:
-                                self.root.after(0, self._hotword.pause)
+                            # Pause hotword BEFORE speaking (synchronous,
+                            # not via root.after) to prevent feedback loop
+                            if self.hotword_var.get():
+                                self._hotword.pause()
+                                time.sleep(0.3)  # Let mic fully release
+
                             try:
                                 tts.speak(t, block=True)
                             finally:
                                 self._speaking_animation = False
+                                # Wait for echo to die before resuming hotword
                                 if self.hotword_var.get():
-                                    time.sleep(0.5)
-                                    self.root.after(0, self._hotword.resume)
+                                    time.sleep(1.5)
+                                    self._hotword.resume()
                                 self.root.after(0, lambda: self._set_status(
                                     "Ready", self.GREEN, ""))
-                                _log("Talk-back: animation stopped, hotword resumed")
+                                _log("Talk-back: speech done, hotword resumed after 1.5s cooldown")
 
                         threading.Thread(target=_speak_and_stop,
                                          daemon=True).start()
@@ -5544,6 +5610,12 @@ class VoiceInputGUI:
     # Cleanup
     # ------------------------------------------------------------------
     def _on_close(self):
+        # If launched by daemon, minimize to tray instead of closing
+        # so next "Jarvis" is instant (no model reload)
+        if self._daemon_launched and self._tray._available:
+            self._minimize_to_tray()
+            _log("Minimized to tray (daemon mode — staying alive for fast wake)")
+            return
         self._cleanup()
         if self.on_close_callback:
             self.on_close_callback()
