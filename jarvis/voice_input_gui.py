@@ -789,7 +789,9 @@ class HotwordListener:
     transcription every 0.8s and often missed short wake words in noise.
     """
 
-    THRESHOLD = 0.3  # Wake word confidence threshold (lowered for "Jarvis" without "Hey")
+    THRESHOLD = 0.2       # Primary trigger threshold
+    CONFIRM_THRESHOLD = 0.15  # Confirmation threshold (lower)
+    CONFIRM_WINDOW = 1.0      # Seconds to look for confirmation frame
 
     def __init__(self, gui):
         self.gui = gui
@@ -957,12 +959,41 @@ class HotwordListener:
                 predictions.get("hey_jarvis", 0.0),
                 predictions.get("hey_mycroft", 0.0) * 0.7,
             )
+
+            # Log near-misses for debugging
+            if score >= 0.1:
+                _log(f"Hotword score: {score:.3f}")
+
+            # Dual-threshold confirmation: need one frame above THRESHOLD
+            # OR two frames above CONFIRM_THRESHOLD within CONFIRM_WINDOW
+            now = time.monotonic()
             if score >= self.THRESHOLD:
-                _log(f"Hotword detected (score={score:.3f})")
+                # Strong detection — trigger immediately
+                _log(f"Hotword detected (strong, score={score:.3f})")
                 buf.clear()
                 self._model.reset()
+                self._pending_hotword = None
                 self.gui.root.after(0, self._on_hotword)
-                time.sleep(1.5)  # Debounce
+                time.sleep(1.5)
+            elif score >= self.CONFIRM_THRESHOLD:
+                # Weak detection — need confirmation
+                pending = getattr(self, '_pending_hotword', None)
+                if pending and (now - pending) < self.CONFIRM_WINDOW:
+                    # Second weak frame within window — confirmed
+                    _log(f"Hotword confirmed (2 frames, score={score:.3f})")
+                    buf.clear()
+                    self._model.reset()
+                    self._pending_hotword = None
+                    self.gui.root.after(0, self._on_hotword)
+                    time.sleep(1.5)
+                else:
+                    # First weak frame — start confirmation window
+                    self._pending_hotword = now
+            else:
+                # Below both thresholds — clear pending
+                if getattr(self, '_pending_hotword', None):
+                    if (now - self._pending_hotword) > self.CONFIRM_WINDOW:
+                        self._pending_hotword = None
 
     def _on_hotword(self):
         """Called when hotword is detected. Releases mic first so recording can use it."""
