@@ -2524,6 +2524,13 @@ class VoiceInputGUI:
         duration = len(audio) / SAMPLE_RATE
         _log(f"Stopped: {duration:.1f}s audio")
 
+        # Cap audio at 60 seconds to prevent freezes
+        max_samples = SAMPLE_RATE * 60
+        if len(audio) > max_samples:
+            _log(f"Audio capped from {duration:.1f}s to 60s")
+            audio = audio[:max_samples]
+            duration = 60.0
+
         if duration < 0.3:
             self._set_status("Ready", self.GREEN, "Too short")
             self._reset_button()
@@ -4289,15 +4296,30 @@ class VoiceInputGUI:
     # ------------------------------------------------------------------
     # Silence auto-stop
     # ------------------------------------------------------------------
+    MAX_RECORDING_SECONDS = 60  # Hard cap to prevent memory issues
+
     def _check_silence(self):
         if not self.recording:
             return
+
+        # Hard cap on recording length
+        if self._record_start_time:
+            elapsed = time.monotonic() - self._record_start_time
+            if elapsed >= self.MAX_RECORDING_SECONDS:
+                _log(f"Max recording time reached ({self.MAX_RECORDING_SECONDS}s)")
+                self._voice_stopped = True
+                try:
+                    self._stop_and_transcribe()
+                except Exception as e:
+                    _log(f"Max recording stop error: {e}")
+                    self.recording = False
+                    self._reset_button()
+                return
 
         timeout = self.silence_var.get()
         min_frames = int(SAMPLE_RATE * 0.5 / (SAMPLE_RATE * 0.1))
         # Don't auto-stop in the first 5 seconds of recording
         if self._record_start_time and (time.monotonic() - self._record_start_time) < 5.0:
-            # Reset silence timer so it doesn't accumulate during grace period
             self._silence_start = None
             self._loud_chunks = 0
             self.root.after(300, self._check_silence)
