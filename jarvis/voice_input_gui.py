@@ -2579,6 +2579,27 @@ class VoiceInputGUI:
             else:
                 _log(f"Transcribed: {text!r}")
 
+            # Dictation mode — type directly, don't send to Claude
+            if getattr(self, '_dictation_mode', False):
+                if "end dictation" in text.lower():
+                    self._dictation_mode = False
+                    _log("Dictation mode ended")
+                    self.root.after(0, lambda: self._show_jarvis_text(
+                        "Dictation mode: OFF"))
+                    self.root.after(0, lambda: self._on_transcription(
+                        "[Dictation ended]", None))
+                    return
+                # Type text directly without submitting
+                if self.auto_type_var.get():
+                    threading.Thread(
+                        target=lambda t=text: subprocess.run(
+                            ["xdotool", "type", "--clearmodifiers", "--delay", "5", t + " "],
+                            timeout=10, capture_output=True,
+                        ), daemon=True,
+                    ).start()
+                self.root.after(0, lambda t=text: self._on_transcription(t, seg_data))
+                return
+
             # Desktop control commands ("Jarvis, switch to opera and scroll down")
             if self._check_desktop_command(text):
                 self.root.after(0, lambda t=text, s=seg_data: self._on_transcription(t, s))
@@ -3244,6 +3265,143 @@ class VoiceInputGUI:
                 from jarvis.jarvis_speak_queue import say
                 names = ", ".join(Path(f).name for f in files[:3])
                 say(f"Most recently modified: {names}.")
+            return True
+
+        # Clipboard history: "show clipboard" / "clipboard history"
+        if any(p in cmd_text for p in ("show clipboard", "clipboard history",
+                                        "last copies", "paste history")):
+            items = self._agent.get_clipboard_history()
+            if items:
+                text = "\n".join(f"{i+1}. {c['text'][:60]}"
+                                 for i, c in enumerate(items))
+                self._show_jarvis_text(f"Clipboard history:\n{text}")
+                if self.talkback_var.get():
+                    from jarvis.jarvis_speak_queue import say
+                    say(f"You have {len(items)} items in clipboard history.")
+            else:
+                self._show_jarvis_text("Clipboard history is empty.")
+            return True
+
+        # "paste the one before last" / "paste item 2"
+        paste_match = re.match(r"paste (?:item |number )?(\d+|before last|previous)", cmd_text)
+        if paste_match:
+            idx_str = paste_match.group(1)
+            idx = 1 if idx_str in ("before last", "previous") else int(idx_str) - 1
+            result = self._agent.paste_from_history(idx)
+            if result:
+                self._show_jarvis_text(f"Pasted: {result}")
+            return True
+
+        # Voice notes: "take a note <text>" / "note that <text>"
+        note_match = re.match(r"(?:take a note|note that|note)\s+(.+)", cmd_text)
+        if note_match:
+            note = note_match.group(1).strip()
+            path = self._agent.save_voice_note(note)
+            self._show_jarvis_text(f"Note saved: {note}")
+            if self.talkback_var.get():
+                from jarvis.jarvis_speak_queue import say
+                say("Note saved.")
+            return True
+
+        # "show notes" / "read notes"
+        if any(p in cmd_text for p in ("show notes", "read notes", "my notes",
+                                        "list notes", "voice notes")):
+            notes = self._agent.list_voice_notes()
+            if notes:
+                text = "\n".join(f"- {n['content']}" for n in notes)
+                self._show_jarvis_text(f"Recent notes:\n{text}")
+            else:
+                self._show_jarvis_text("No voice notes yet.")
+            return True
+
+        # Shell piping: "run <command>" / "execute <command>"
+        run_match = re.match(r"(?:run|execute|shell)\s+(.+)", cmd_text)
+        if run_match:
+            shell_cmd = run_match.group(1).strip()
+            _log(f"Shell command: {shell_cmd}")
+            self._set_status("Running...", self.ACCENT, shell_cmd[:30])
+            def _run():
+                output = self._agent.run_shell(shell_cmd)
+                self.root.after(0, lambda: self._show_jarvis_text(
+                    f"$ {shell_cmd}\n{output}"))
+                self.root.after(0, lambda: self._set_status(
+                    "Ready", self.GREEN, "Command done"))
+                if self.talkback_var.get() and len(output) < 200:
+                    from jarvis.jarvis_speak_queue import say
+                    say(f"Result: {output[:100]}")
+            threading.Thread(target=_run, daemon=True).start()
+            return True
+
+        # "count lines in <file>"
+        count_match = re.match(r"count (?:the )?lines? in (.+)", cmd_text)
+        if count_match:
+            filename = count_match.group(1).strip()
+            output = self._agent.run_shell(f"wc -l {filename} 2>/dev/null || find /home/hunterp -name '{filename}' -exec wc -l {{}} + 2>/dev/null | tail -1")
+            self._show_jarvis_text(output)
+            if self.talkback_var.get():
+                from jarvis.jarvis_speak_queue import say
+                say(output)
+            return True
+
+        # Multi-monitor: "move to other screen" / "other monitor"
+        if any(p in cmd_text for p in ("other screen", "other monitor",
+                                        "move to monitor", "next screen",
+                                        "next monitor")):
+            success = self._agent.move_window_to_monitor("next")
+            if success:
+                self._show_jarvis_text("Window moved to other monitor.")
+                if self.talkback_var.get():
+                    from jarvis.jarvis_speak_queue import say
+                    say("Done.")
+            else:
+                self._show_jarvis_text("Could not move window. Single monitor?")
+            return True
+
+        # Dictation mode: "dictate" — continuous typing without Claude
+        if cmd_text in ("dictate", "start dictation", "dictation mode"):
+            self._dictation_mode = True
+            self._show_jarvis_text("Dictation mode: ON\nSay 'end dictation' to stop.")
+            if self.talkback_var.get():
+                from jarvis.jarvis_speak_queue import say
+                say("Dictation mode active. I'll type everything you say directly. Say end dictation to stop.")
+            return True
+
+        # Conditional trigger: "when gpu drops below 50 notify me"
+        trigger_match = re.match(r"when (.+?)(?:,?\s*(?:notify me|tell me|alert me|let me know))", cmd_text)
+        if trigger_match:
+            condition = trigger_match.group(1).strip()
+            self._agent.set_trigger(condition, f"Alert: {condition}")
+            self._show_jarvis_text(f"Trigger set: when {condition}")
+            if self.talkback_var.get():
+                from jarvis.jarvis_speak_queue import say
+                say(f"I'll notify you when {condition}.")
+            return True
+
+        # Text transformation: "make that uppercase" / "fix the grammar"
+        if any(p in cmd_text for p in ("make that uppercase", "uppercase that",
+                                        "make that lowercase", "lowercase that")):
+            try:
+                r = subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-o"],
+                    capture_output=True, text=True, timeout=2,
+                )
+                clip = r.stdout.strip()
+                if "upper" in cmd_text:
+                    result = clip.upper()
+                else:
+                    result = clip.lower()
+                proc = subprocess.Popen(
+                    ["xclip", "-selection", "clipboard"],
+                    stdin=subprocess.PIPE,
+                )
+                proc.communicate(input=result.encode(), timeout=2)
+                subprocess.run(
+                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                    timeout=2, capture_output=True,
+                )
+                self._show_jarvis_text(f"Transformed: {result[:50]}")
+            except Exception:
+                pass
             return True
 
         # Direct questions Jarvis can answer locally

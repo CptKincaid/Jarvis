@@ -634,3 +634,182 @@ class JarvisAgent:
                 return "Could not fetch weather data."
 
         return None
+
+    # ------------------------------------------------------------------
+    # 13. Clipboard History
+    # ------------------------------------------------------------------
+    def _init_clipboard(self):
+        if not hasattr(self, '_clipboard_history'):
+            self._clipboard_history = deque(maxlen=20)
+            self._last_clip = ""
+
+    def poll_clipboard(self):
+        self._init_clipboard()
+        try:
+            r = subprocess.run(
+                ["xclip", "-selection", "clipboard", "-o"],
+                capture_output=True, text=True, timeout=2,
+            )
+            current = r.stdout.strip()
+            if current and current != self._last_clip:
+                self._clipboard_history.append({
+                    "time": datetime.now().isoformat(),
+                    "text": current[:500],
+                })
+                self._last_clip = current
+        except Exception:
+            pass
+
+    def get_clipboard_history(self, n=5):
+        self._init_clipboard()
+        return list(self._clipboard_history)[-n:]
+
+    def paste_from_history(self, index):
+        self._init_clipboard()
+        items = list(self._clipboard_history)
+        if 0 <= index < len(items):
+            text = items[-(index + 1)]["text"]
+            try:
+                proc = subprocess.Popen(
+                    ["xclip", "-selection", "clipboard"],
+                    stdin=subprocess.PIPE,
+                )
+                proc.communicate(input=text.encode(), timeout=2)
+                subprocess.run(
+                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                    timeout=2, capture_output=True,
+                )
+                return text[:50]
+            except Exception:
+                pass
+        return None
+
+    # ------------------------------------------------------------------
+    # 14. Voice Notes
+    # ------------------------------------------------------------------
+    def save_voice_note(self, text):
+        notes_dir = DATA_DIR / "voice_notes"
+        notes_dir.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        note_file = notes_dir / f"note_{ts}.txt"
+        note_file.write_text(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n{text}\n")
+        _log(f"Voice note saved: {note_file.name}")
+        return str(note_file)
+
+    def list_voice_notes(self, n=5):
+        notes_dir = DATA_DIR / "voice_notes"
+        if not notes_dir.exists():
+            return []
+        files = sorted(notes_dir.glob("note_*.txt"), reverse=True)[:n]
+        return [{"file": f.name, "content": f.read_text().strip()[:100]}
+                for f in files]
+
+    # ------------------------------------------------------------------
+    # 15. Shell Piping
+    # ------------------------------------------------------------------
+    def run_shell(self, command):
+        _log(f"Shell: {command[:60]}")
+        try:
+            r = subprocess.run(
+                command, shell=True, capture_output=True,
+                text=True, timeout=30,
+                cwd="/home/hunterp/jarvis",
+            )
+            output = r.stdout.strip()
+            if r.returncode != 0 and r.stderr:
+                output += f"\nError: {r.stderr.strip()[:200]}"
+            return output[:1000]
+        except subprocess.TimeoutExpired:
+            return "Command timed out."
+        except Exception as e:
+            return f"Error: {e}"
+
+    # ------------------------------------------------------------------
+    # 16. Multi-Monitor
+    # ------------------------------------------------------------------
+    def move_window_to_monitor(self, direction="next"):
+        try:
+            r = subprocess.run(
+                ["xdotool", "getactivewindow"],
+                capture_output=True, text=True, timeout=2,
+            )
+            wid = r.stdout.strip()
+            r2 = subprocess.run(
+                ["xdotool", "getwindowgeometry", wid],
+                capture_output=True, text=True, timeout=2,
+            )
+            m = re.search(r"Position: (\d+),(\d+)", r2.stdout)
+            if not m:
+                return False
+            x, y = int(m.group(1)), int(m.group(2))
+
+            r3 = subprocess.run(
+                ["xrandr", "--query"],
+                capture_output=True, text=True, timeout=2,
+            )
+            monitors = []
+            for line in r3.stdout.splitlines():
+                match = re.search(r"(\d+)x(\d+)\+(\d+)\+(\d+)", line)
+                if match and " connected" in line:
+                    monitors.append({
+                        "w": int(match.group(1)), "h": int(match.group(2)),
+                        "x": int(match.group(3)), "y": int(match.group(4)),
+                    })
+            if len(monitors) < 2:
+                return False
+
+            current_idx = 0
+            for i, mon in enumerate(monitors):
+                if mon["x"] <= x < mon["x"] + mon["w"]:
+                    current_idx = i
+                    break
+
+            target_idx = ((current_idx + 1) if direction == "next"
+                          else (current_idx - 1)) % len(monitors)
+            target = monitors[target_idx]
+            new_x = target["x"] + (x - monitors[current_idx]["x"])
+            new_y = target["y"] + (y - monitors[current_idx]["y"])
+
+            subprocess.run(
+                ["xdotool", "windowmove", wid, str(new_x), str(new_y)],
+                capture_output=True, timeout=2,
+            )
+            _log(f"Moved window to monitor {target_idx}")
+            return True
+        except Exception as e:
+            _log(f"Move monitor error: {e}")
+            return False
+
+    # ------------------------------------------------------------------
+    # 17. Conditional Triggers
+    # ------------------------------------------------------------------
+    def set_trigger(self, condition, action_msg):
+        if not hasattr(self, '_triggers'):
+            self._triggers = []
+        self._triggers.append({"condition": condition, "action": action_msg})
+        _log(f"Trigger set: when {condition} → {action_msg}")
+
+    def check_triggers(self):
+        if not hasattr(self, '_triggers'):
+            return []
+        fired = []
+        remaining = []
+        for trigger in self._triggers:
+            cond = trigger["condition"].lower()
+            if "gpu" in cond and "below" in cond:
+                m = re.search(r"(\d+)", cond)
+                if m:
+                    try:
+                        r = subprocess.run(
+                            ["nvidia-smi", "--query-gpu=utilization.gpu",
+                             "--format=csv,noheader,nounits"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if int(r.stdout.strip().splitlines()[0]) < int(m.group(1)):
+                            fired.append(trigger)
+                            continue
+                    except Exception:
+                        pass
+            remaining.append(trigger)
+        self._triggers = remaining
+        return fired
