@@ -27,9 +27,9 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VENV_DIR = Path(__file__).resolve().parent.parent.parent
-VENV_PYTHON = VENV_DIR / "bin" / "python3"
-GUI_SCRIPT = VENV_DIR / "jarvis" / "voice_input_gui.py"
+JARVIS_DIR = Path(__file__).resolve().parent.parent
+VENV_PYTHON = Path(sys.executable)  # Use whatever python launched us
+GUI_SCRIPT = JARVIS_DIR / "jarvis" / "voice_input_gui.py"
 SETTINGS_FILE = Path.home() / ".aiws_trainer" / "voice_settings.json"
 VOICEPRINT_FILE = Path.home() / ".aiws_trainer" / "voiceprint.npz"
 LOG_DIR = Path("/tmp/vss_voice")
@@ -65,6 +65,7 @@ def _load_settings():
             data = json.loads(SETTINGS_FILE.read_text())
             return {
                 "mic": data.get("mic", defaults["mic"]),
+                "mic_name": data.get("mic_name", data.get("mic")),
                 "gpu": data.get("gpu", defaults["gpu"]),
                 "speaker_verify": data.get("speaker_verify", False),
                 "speaker_threshold": data.get("speaker_threshold", 0.40),
@@ -78,6 +79,14 @@ def _resolve_mic(mic_name):
     import sounddevice as sd
     if not mic_name or mic_name == "Default":
         return None
+    # Name-based resolution (survives reboots)
+    from jarvis.audio_pipeline import resolve_mic_by_name
+    devices = sd.query_devices()
+    idx = resolve_mic_by_name(mic_name, devices)
+    if idx is not None:
+        _log(f"Mic resolved: '{mic_name}' -> [{idx}]")
+        return idx
+    # Legacy: try index extraction
     if mic_name.startswith("["):
         try:
             idx = int(mic_name.split("]")[0][1:])
@@ -85,6 +94,7 @@ def _resolve_mic(mic_name):
             return idx
         except Exception:
             pass
+    _log(f"WARNING: Mic '{mic_name}' not found")
     devices = sd.query_devices()
     for i, d in enumerate(devices):
         if d["max_input_channels"] > 0 and mic_name in d["name"]:
@@ -146,7 +156,7 @@ def _launch_or_focus_gui():
         env["DISPLAY"] = os.environ.get("DISPLAY", ":0")
         subprocess.Popen(
             [str(VENV_PYTHON), str(GUI_SCRIPT), "--auto-record"],
-            cwd=str(VENV_DIR), env=env,
+            cwd=str(JARVIS_DIR), env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -255,7 +265,7 @@ def run_daemon():
     from faster_whisper import WhisperModel
 
     settings = _load_settings()
-    mic_idx = _resolve_mic(settings.get("mic"))
+    mic_idx = _resolve_mic(settings.get("mic_name") or settings.get("mic"))
     gpu = settings.get("gpu", 1)
 
     _log(f"Hotword daemon starting (mic={mic_idx}, gpu={gpu})")
@@ -334,6 +344,10 @@ def run_daemon():
             audio = scipy_resample(audio_raw, new_len).astype(np.float32)
         else:
             audio = audio_raw
+
+        # Denoise before hotword check
+        from jarvis.audio_pipeline import denoise_audio
+        audio = denoise_audio(audio, sr=16000)
 
         # Quick transcription — no VAD filter for short wake words
         try:
