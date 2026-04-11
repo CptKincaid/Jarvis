@@ -66,3 +66,60 @@ def denoise_audio(audio, sr=16000, enabled=True):
         return reduced.astype(np.float32)
     except Exception:
         return audio
+
+
+import torch
+
+
+class SileroVAD:
+    """Silero VAD wrapper for speech detection.
+
+    Replaces RMS-based silence threshold. Handles TV/music background
+    noise correctly. Runs on CPU, <1ms per call.
+
+    Note: torch.hub.load uses torch internals for model loading which
+    may trigger security tool warnings — this is expected and safe for
+    the official Silero VAD model from snakers4/silero-vad.
+    """
+
+    def __init__(self):
+        self._model = None
+        self._loaded = False
+
+    def _ensure_loaded(self):
+        if self._loaded:
+            return
+        self._model, _ = torch.hub.load(
+            'snakers4/silero-vad', 'silero_vad', trust_repo=True,
+        )
+        self._loaded = True
+
+    def is_speech(self, audio_chunk, sr=16000):
+        """Check if audio chunk contains speech.
+
+        Args:
+            audio_chunk: numpy float32 array, 32ms (512 samples at 16kHz)
+            sr: sample rate
+
+        Returns:
+            Speech probability (0.0 to 1.0). Above 0.3 is likely speech.
+        """
+        self._ensure_loaded()
+
+        if isinstance(audio_chunk, np.ndarray):
+            tensor = torch.from_numpy(audio_chunk).float()
+        else:
+            tensor = audio_chunk
+
+        if tensor.dim() > 1:
+            tensor = tensor.squeeze()
+
+        with torch.no_grad():
+            prob = self._model(tensor, sr)
+
+        return float(prob)
+
+    def reset(self):
+        """Reset model state between recordings."""
+        if self._model is not None:
+            self._model.reset_states()

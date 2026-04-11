@@ -30,3 +30,35 @@ def test_denoise_disabled_returns_original():
     audio = np.random.randn(16000).astype(np.float32)
     result = denoise_audio(audio, sr=16000, enabled=False)
     np.testing.assert_array_equal(result, audio)
+
+def test_vad_silence_detected():
+    from jarvis.audio_pipeline import SileroVAD
+    vad = SileroVAD()
+    silence = np.zeros(512, dtype=np.float32)
+    prob = vad.is_speech(silence, sr=16000)
+    assert prob < 0.3
+
+def test_vad_returns_float_in_range():
+    from jarvis.audio_pipeline import SileroVAD
+    vad = SileroVAD()
+    audio = np.random.randn(512).astype(np.float32) * 0.01
+    prob = vad.is_speech(audio, sr=16000)
+    assert isinstance(prob, float)
+    assert 0.0 <= prob <= 1.0
+
+def test_vad_reusable():
+    from jarvis.audio_pipeline import SileroVAD
+    vad = SileroVAD()
+    silence = np.zeros(512, dtype=np.float32)
+    for _ in range(5):
+        prob = vad.is_speech(silence, sr=16000)
+    assert prob < 0.3
+
+def test_vad_reset():
+    from jarvis.audio_pipeline import SileroVAD
+    vad = SileroVAD()
+    silence = np.zeros(512, dtype=np.float32)
+    vad.is_speech(silence, sr=16000)
+    vad.reset()
+    prob = vad.is_speech(silence, sr=16000)
+    assert prob < 0.3
