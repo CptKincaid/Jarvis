@@ -1169,6 +1169,7 @@ class VoiceInputGUI:
         self.model_loaded = False
         self.model_loading = False
         self._whisper_model = None
+        self._stt_engine = None
         self._stream = None
         self._audio_frames = []
         self._silence_start = None
@@ -2261,30 +2262,23 @@ class VoiceInputGUI:
 
     def _load_model_worker(self):
         try:
-            from faster_whisper import WhisperModel
+            from jarvis.stt_engine import STTEngine
 
-            model_size = self.model_var.get()
             gpu = self.gpu_var.get()
-            _log(f"Loading model: {model_size} on GPU {gpu}")
+            _log(f"Loading STT engine on GPU {gpu}")
 
-            try:
-                self._whisper_model = WhisperModel(
-                    model_size, device="cuda",
-                    device_index=gpu, compute_type="float16",
-                )
-                backend = f"CUDA:{gpu}"
-            except Exception:
-                self._whisper_model = WhisperModel(
-                    model_size, device="cpu", compute_type="int8",
-                )
-                backend = "CPU"
+            self._stt_engine = STTEngine(gpu=gpu)
+            loaded = self._stt_engine.load()
+            if not loaded:
+                raise RuntimeError("No STT engine available")
 
+            engine_name = self._stt_engine.engine_name
             self.model_loaded = True
             self.model_loading = False
-            _log(f"Model loaded on {backend}")
+            _log(f"STT engine loaded: {engine_name}")
 
             self.root.after(0, lambda: self._set_status(
-                "Ready", self.GREEN, f"{model_size} on {backend}"))
+                "Ready", self.GREEN, f"{engine_name} on CUDA:{gpu}"))
             self.root.after(0, lambda: self.record_btn.config(
                 state=tk.NORMAL, bg="#0c1822", fg="#67e8f9",
                 activebackground="#132637", activeforeground="#67e8f9"))
@@ -2718,22 +2712,11 @@ class VoiceInputGUI:
                              f"{orig_sec:.1f}s -> {filt_sec:.1f}s audio")
                     audio = filtered
 
-            lang = self._get_whisper_language()
-            kwargs = dict(
-                beam_size=5,
-                initial_prompt=_load_vocab(),
-                vad_filter=True,
-                vad_parameters=dict(min_silence_duration_ms=500),
-            )
-            if lang is not None:
-                kwargs["language"] = lang
-
-            # Acquire lock to prevent concurrent model access with partial transcriber
+            # Transcribe using STT engine (Parakeet or Whisper fallback)
             with self._partial_lock:
-                segments, info = self._whisper_model.transcribe(audio, **kwargs)
-                seg_list = list(segments)
-            text = " ".join(seg.text.strip() for seg in seg_list).strip()
-            seg_data = [(seg.text, seg.avg_logprob) for seg in seg_list]
+                result = self._stt_engine.transcribe(audio)
+            text = result.text
+            seg_data = result.segments
 
             # Confidence gate — reject low-confidence transcriptions
             if seg_data:
@@ -2826,6 +2809,10 @@ class VoiceInputGUI:
     def _stream_partial(self):
         """Periodically transcribe accumulated audio for a live preview."""
         if not self.recording or not self.streaming_var.get():
+            return
+        # Parakeet is fast enough that partial preview is unnecessary
+        if self._stt_engine and "Parakeet" in (self._stt_engine.engine_name or ""):
+            self.root.after(500, self._stream_partial)
             return
 
         now = time.monotonic()
