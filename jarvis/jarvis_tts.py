@@ -1,11 +1,12 @@
-"""Jarvis TTS — dual-engine text-to-speech.
+"""Jarvis TTS — triple-engine text-to-speech.
 
-Fast mode: Edge TTS (en-GB-RyanNeural) — ~0.5s latency, requires internet
-Quality mode: XTTS v2 voice clone — ~8-12s latency, local, sounds like JARVIS
+Fast mode: Kokoro 82M — ~50ms latency, local, high quality pre-built voices
+Cloud mode: Edge TTS (en-GB-RyanNeural) — ~0.5s latency, requires internet
+Clone mode: XTTS v2 voice clone — ~3-5s latency, local, sounds like JARVIS
 
 Usage:
     from jarvis.jarvis_tts import JarvisTTS
-    tts = JarvisTTS()
+    tts = JarvisTTS(engine="kokoro")  # or "edge" or "xtts"
     tts.speak("Hello sir. All systems operational.")
 """
 
@@ -34,22 +35,41 @@ def _log(msg):
 
 
 class JarvisTTS:
-    """Dual-engine TTS: Edge TTS (fast) or XTTS v2 (quality)."""
+    """Triple-engine TTS: Kokoro (fast) / Edge (cloud) / XTTS v2 (clone)."""
 
     MAX_SPEAK_LENGTH = 500
 
-    def __init__(self, gpu=1, engine="edge"):
+    def __init__(self, gpu=1, engine="kokoro"):
         self._xtts = None
+        self._kokoro = None
         self._gpu = gpu
         self._speaking = False
         self._stop_flag = False
         self._lock = threading.Lock()
-        self.engine = engine  # "edge" or "xtts"
+        self.engine = engine  # "kokoro", "edge", or "xtts"
 
     def load(self):
         """Load TTS engine."""
         if self.engine == "edge":
             return True  # Edge TTS needs no preloading
+
+        if self.engine == "kokoro":
+            if self._kokoro is not None:
+                return True
+            try:
+                from kokoro import KPipeline
+                self._kokoro = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
+                # Warm up
+                for _, _, _ in self._kokoro('warmup', voice='af_heart'):
+                    pass
+                _log("Kokoro 82M loaded (CPU)")
+                return True
+            except Exception as e:
+                _log(f"Kokoro load error: {e}, falling back to Edge TTS")
+                self.engine = "edge"
+                return True
+
+        # XTTS v2
         if self._xtts is not None:
             return True
         if not VOICE_REF.exists():
@@ -134,6 +154,11 @@ class JarvisTTS:
                 self._speak_xtts_streaming(text)
                 return
 
+            # Kokoro — fast local TTS
+            if self.engine == "kokoro":
+                self._speak_kokoro(text)
+                return
+
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
 
@@ -213,6 +238,70 @@ class JarvisTTS:
             loop.run_until_complete(communicate.save(out_path))
         finally:
             loop.close()
+
+    def _speak_kokoro(self, text):
+        """Synthesize and play with Kokoro 82M — instant, high quality."""
+        import numpy as np
+        import soundfile as sf
+
+        try:
+            all_audio = []
+            for _, _, audio_chunk in self._kokoro(text, voice='af_heart'):
+                if self._stop_flag:
+                    break
+                all_audio.append(np.array(audio_chunk))
+
+            if not all_audio or self._stop_flag:
+                return
+
+            full_audio = np.concatenate(all_audio)
+
+            # Amplitude tracking for animation
+            chunk_size = int(24000 * 0.08)
+            self._amp_envelope = []
+            for i in range(0, len(full_audio), chunk_size):
+                chunk = full_audio[i:i + chunk_size]
+                rms = float(np.sqrt(np.mean(chunk ** 2)))
+                self._amp_envelope.append(min(1.0, rms * 4))
+            self._amp_index = 0
+            self._amp_playing = True
+
+            import time as _time
+
+            def _feed_amp():
+                while self._amp_playing and self._amp_index < len(self._amp_envelope):
+                    self._current_amp = self._amp_envelope[self._amp_index]
+                    self._amp_index += 1
+                    _time.sleep(0.08)
+                self._current_amp = 0.0
+                self._amp_playing = False
+
+            threading.Thread(target=_feed_amp, daemon=True).start()
+
+            # Save and play
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp.name, full_audio, 24000)
+
+            for cmd in [["paplay", tmp.name], ["pw-play", tmp.name],
+                        ["aplay", "-q", tmp.name]]:
+                try:
+                    subprocess.run(cmd, timeout=30, check=True,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    break
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    continue
+
+            self._amp_playing = False
+            self._current_amp = 0.0
+            os.unlink(tmp.name)
+            _log("Kokoro speech complete")
+
+        except Exception as e:
+            _log(f"Kokoro speech error: {e}")
+        finally:
+            with self._lock:
+                self._speaking = False
 
     def _speak_xtts_streaming(self, text):
         """Synthesize and play XTTS sentence-by-sentence — starts playing
