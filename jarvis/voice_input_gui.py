@@ -1190,6 +1190,7 @@ class VoiceInputGUI:
         self.auto_enter_var = tk.BooleanVar(value=False)
         self.live_write_var = tk.BooleanVar(value=False)
         self.talkback_var = tk.BooleanVar(value=False)
+        self.jarvis_mode_var = tk.BooleanVar(value=False)  # Claude brain mode
         self.tts_engine_var = tk.StringVar(value="edge")  # "edge" or "xtts"
         self.speaker_verify_var = tk.BooleanVar(value=False)
         self.speaker_threshold_var = tk.DoubleVar(value=0.40)
@@ -1250,6 +1251,10 @@ class VoiceInputGUI:
         # Jarvis Agent — intelligence layer
         from jarvis.jarvis_agent import JarvisAgent
         self._agent = JarvisAgent()
+
+        # Jarvis Brain — Claude-powered intelligence
+        from jarvis.jarvis_brain import JarvisBrain
+        self._brain = JarvisBrain()
 
         # Speaker verification (lazy-loaded when enabled)
         self._speaker_verifier = None
@@ -1315,6 +1320,7 @@ class VoiceInputGUI:
                 "auto_enter": (self.auto_enter_var, bool),
                 "live_write": (self.live_write_var, bool),
                 "talkback": (self.talkback_var, bool),
+                "jarvis_mode": (self.jarvis_mode_var, bool),
                 "tts_engine": (self.tts_engine_var, str),
                 "speaker_verify": (self.speaker_verify_var, bool),
                 "speaker_threshold": (self.speaker_threshold_var, float),
@@ -1359,6 +1365,7 @@ class VoiceInputGUI:
             "auto_enter": self.auto_enter_var.get(),
             "live_write": self.live_write_var.get(),
             "talkback": self.talkback_var.get(),
+            "jarvis_mode": self.jarvis_mode_var.get(),
             "tts_engine": self.tts_engine_var.get(),
             "speaker_verify": self.speaker_verify_var.get(),
             "speaker_threshold": self.speaker_threshold_var.get(),
@@ -1380,7 +1387,7 @@ class VoiceInputGUI:
             self.review_var, self.voice_cmds_var, self.noise_gate_var,
             self.streaming_var, self.hotword_var, self.smart_target_var,
             self.auto_enter_var, self.live_write_var,
-            self.talkback_var, self.tts_engine_var,
+            self.talkback_var, self.jarvis_mode_var, self.tts_engine_var,
             self.speaker_verify_var, self.speaker_threshold_var,
             self.silence_var, self.noise_threshold_var, self.gpu_var,
         ):
@@ -1899,6 +1906,21 @@ class VoiceInputGUI:
         _Tooltip(add_clip_btn,
                  "Paste a YouTube URL with clean JARVIS dialogue\n"
                  "to improve the XTTS voice clone quality.")
+
+        # Row 5: Jarvis Mode
+        row5_mode = tk.Frame(settings_inner, bg=self.CARD_BG)
+        row5_mode.pack(fill="x", pady=(4, 0))
+
+        chk_jmode = tk.Checkbutton(
+            row5_mode, text="Jarvis Mode", variable=self.jarvis_mode_var,
+            **chk_style,
+        )
+        chk_jmode.pack(side="left", padx=(0, 4))
+        _Tooltip(chk_jmode,
+                 "Jarvis Mode: Claude IS Jarvis's brain.\n"
+                 "Messages go to Claude CLI instead of typing\n"
+                 "into a terminal. Jarvis thinks, speaks, and\n"
+                 "executes actions autonomously.")
 
         chk_vcmd = tk.Checkbutton(
             row4, text="Voice cmds", variable=self.voice_cmds_var, **chk_style,
@@ -2859,15 +2881,24 @@ class VoiceInputGUI:
             self._history = self._history[:8]
             self.history_label.config(text="\n".join(self._history))
 
+            # Log command for habit learning
+            self._agent.log_command(text[:50])
+
+            # Jarvis Mode — send to Claude brain instead of terminal
+            if self.jarvis_mode_var.get():
+                self._set_status("Thinking...", self.ACCENT, "Jarvis is thinking")
+                self._speaking_animation = True
+                self.root.after(0, self._update_speaking_animation)
+                self._brain.think(text, callback=self._on_brain_response)
+                self._maybe_continuous_restart()
+                return
+
             # Intent enhancement — add context if relevant
             type_text = text
             enhanced = self._agent.interpret_intent(text)
             if enhanced:
                 type_text = enhanced
                 _log(f"Intent enhanced: +{len(enhanced) - len(text)} chars context")
-
-            # Log command for habit learning
-            self._agent.log_command(text[:50])
 
             # Auto-type, then screenshot if requested
             if self.auto_type_var.get():
@@ -3759,6 +3790,52 @@ class VoiceInputGUI:
         self.root.after(0, lambda: self._set_status(
             "Ready", self.GREEN, f"Workflow '{name}' complete"))
         self._agent.log_command(f"workflow:{name}")
+
+    def _on_brain_response(self, actions):
+        """Handle structured response from Claude brain."""
+        _log(f"Brain response: {len(actions)} actions")
+        spoken_parts = []
+        gui_parts = []
+
+        def _execute():
+            for action_type, action_data in actions:
+                if action_type == "SPEAK":
+                    spoken_parts.append(action_data)
+                    gui_parts.append(action_data)
+                elif action_type == "SILENT":
+                    gui_parts.append(action_data)
+                elif action_type == "RUN":
+                    _log(f"Brain RUN: {action_data[:50]}")
+                    output = self._agent.run_shell(action_data)
+                    gui_parts.append(f"$ {action_data}\n{output}")
+                elif action_type == "TYPE":
+                    subprocess.run(
+                        ["xdotool", "type", "--clearmodifiers",
+                         "--delay", "5", action_data],
+                        timeout=10, capture_output=True,
+                    )
+                elif action_type == "WINDOW":
+                    self._execute_desktop_actions([("window", action_data)])
+                elif action_type == "CLICK":
+                    self._agent.click_on_text(action_data)
+                time.sleep(0.2)
+
+            # Update GUI
+            jarvis_text = "\n".join(gui_parts)
+            self.root.after(0, lambda: self._show_jarvis_text(jarvis_text))
+
+            # Speak
+            if spoken_parts and self.talkback_var.get():
+                full_speech = " ".join(spoken_parts)
+                from jarvis.jarvis_speak_queue import say
+                say(full_speech)
+            else:
+                self._speaking_animation = False
+
+            self.root.after(0, lambda: self._set_status(
+                "Ready", self.GREEN, ""))
+
+        threading.Thread(target=_execute, daemon=True).start()
 
     def _show_jarvis_text(self, text):
         """Update the Jarvis transcription box."""
