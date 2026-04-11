@@ -13,6 +13,7 @@ Response format from Claude:
 """
 
 import json
+import os
 import re
 import subprocess
 import threading
@@ -114,12 +115,14 @@ class JarvisBrain:
         _log(f"Querying Claude: {user_input[:60]}")
 
         try:
+            claude_bin = "/home/hunterp/.npm-global/bin/claude"
             result = subprocess.run(
-                ["claude", "-p", "--output-format", "text"],
+                [claude_bin, "-p", "--output-format", "text"],
                 input=prompt,
                 capture_output=True, text=True,
                 timeout=30,
                 cwd="/home/hunterp/jarvis",
+                env={**os.environ, "PATH": f"/home/hunterp/.npm-global/bin:{os.environ.get('PATH', '')}"},
             )
             response = result.stdout.strip()
             _log(f"Claude response: {response[:100]}")
