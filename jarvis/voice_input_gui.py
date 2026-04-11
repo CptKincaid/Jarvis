@@ -53,7 +53,7 @@ if str(SCRIPT_DIR) not in sys.path:
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SILENCE_THRESHOLD = 0.04
-SILENCE_TIMEOUT = 3.0
+SILENCE_TIMEOUT = 2.0
 DEFAULT_MODEL = "small"
 DEFAULT_GPU = 1
 LOG_DIR = Path("/tmp/vss_voice")
@@ -1196,6 +1196,7 @@ class VoiceInputGUI:
         self.review_var = tk.BooleanVar(value=False)
         self.voice_cmds_var = tk.BooleanVar(value=True)
         self.noise_gate_var = tk.BooleanVar(value=True)
+        self.noise_suppress_var = tk.BooleanVar(value=True)
         self.streaming_var = tk.BooleanVar(value=True)
         self.hotword_var = tk.BooleanVar(value=False)
         self.smart_target_var = tk.BooleanVar(value=True)
@@ -1253,6 +1254,10 @@ class VoiceInputGUI:
 
         # Hotword listener (started on demand via checkbox)
         self._hotword = HotwordListener(self)
+
+        # Silero VAD for speech detection (replaces RMS silence threshold)
+        from jarvis.audio_pipeline import SileroVAD
+        self._silero_vad = SileroVAD()
 
         # Jarvis TTS
         self._tts = None
@@ -1337,6 +1342,7 @@ class VoiceInputGUI:
                 "review": (self.review_var, bool),
                 "voice_cmds": (self.voice_cmds_var, bool),
                 "noise_gate": (self.noise_gate_var, bool),
+                "noise_suppression": (self.noise_suppress_var, bool),
                 "streaming": (self.streaming_var, bool),
                 "hotword": (self.hotword_var, bool),
                 "smart_target": (self.smart_target_var, bool),
@@ -1400,6 +1406,7 @@ class VoiceInputGUI:
             "review": self.review_var.get(),
             "voice_cmds": self.voice_cmds_var.get(),
             "noise_gate": self.noise_gate_var.get(),
+            "noise_suppression": self.noise_suppress_var.get(),
             "streaming": self.streaming_var.get(),
             "hotword": self.hotword_var.get(),
             "smart_target": self.smart_target_var.get(),
@@ -1425,7 +1432,7 @@ class VoiceInputGUI:
         for var in (
             self.model_var, self.mic_var, self.lang_var,
             self.auto_type_var, self.continuous_var, self.sound_var,
-            self.review_var, self.voice_cmds_var, self.noise_gate_var,
+            self.review_var, self.voice_cmds_var, self.noise_gate_var, self.noise_suppress_var,
             self.streaming_var, self.hotword_var, self.smart_target_var,
             self.auto_enter_var, self.live_write_var,
             self.talkback_var, self.jarvis_mode_var, self.tts_engine_var,
@@ -1845,6 +1852,12 @@ class VoiceInputGUI:
         cb_mic.pack(side="left", padx=(6, 10))
         _Tooltip(cb_mic, SETTING_TIPS["mic"])
 
+        test_mic_btn = self._holo_btn(row2, "Test Mic", self._test_mic)
+        test_mic_btn.pack(side="left", padx=(0, 10))
+        _Tooltip(test_mic_btn,
+                 "Records 3s and plays back through speakers.\n"
+                 "Verify you hear YOUR voice, not system audio.")
+
         lbl_lang = tk.Label(row2, text="Lang", font=("Arial", 10),
                             bg=self.CARD_BG, fg=self.MUTED)
         lbl_lang.pack(side="left")
@@ -1974,6 +1987,14 @@ class VoiceInputGUI:
         )
         chk_ng.pack(side="left", padx=(0, 4))
         _Tooltip(chk_ng, SETTING_TIPS["noise_gate"])
+
+        chk_denoise = tk.Checkbutton(
+            row4, text="Denoise", variable=self.noise_suppress_var, **chk_style,
+        )
+        chk_denoise.pack(side="left", padx=(0, 4))
+        _Tooltip(chk_denoise,
+                 "Removes TV/music/ambient noise before transcription.\n"
+                 "Uses spectral gating. Default: ON.")
 
         chk_stream = tk.Checkbutton(
             row4, text="Live preview", variable=self.streaming_var, **chk_style,
@@ -2300,6 +2321,60 @@ class VoiceInputGUI:
         self._set_status("Loading model...", self.YELLOW, "")
         self._load_model_async()
 
+    def _test_mic(self):
+        """Record 3 seconds from selected mic and play back."""
+        if self.recording:
+            self._set_status("Stop recording first", self.YELLOW, "")
+            return
+        if self.hotword_var.get() and self._hotword._stream:
+            self._hotword.pause()
+
+        mic_idx = self._mic_devices.get(self.mic_var.get())
+        self._set_status("Testing mic...", self.ACCENT, "Speak now (3 seconds)")
+
+        def _worker():
+            import sounddevice as sd
+            import wave, tempfile, os
+            try:
+                dev_info = sd.query_devices(mic_idx, 'input')
+                rate = int(dev_info['default_samplerate'])
+            except Exception:
+                rate = 44100
+            try:
+                audio = sd.rec(int(3 * rate), samplerate=rate,
+                               channels=1, dtype='float32', device=mic_idx)
+                sd.wait()
+                rms = float(np.sqrt(np.mean(audio ** 2)))
+                _log(f"Test mic: RMS={rms:.4f}")
+                self.root.after(0, lambda: self._set_status(
+                    "Playing back...", self.ACCENT, f"RMS: {rms:.4f}"))
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                with wave.open(tmp.name, 'wb') as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(rate)
+                    wf.writeframes((audio * 32767).astype(np.int16).tobytes())
+                for cmd in [["paplay", tmp.name], ["aplay", "-q", tmp.name]]:
+                    try:
+                        subprocess.run(cmd, timeout=10, check=True,
+                                       stdout=subprocess.DEVNULL,
+                                       stderr=subprocess.DEVNULL)
+                        break
+                    except (FileNotFoundError, subprocess.CalledProcessError):
+                        continue
+                os.unlink(tmp.name)
+                self.root.after(0, lambda: self._set_status(
+                    "Ready", self.GREEN, f"Mic test done (RMS: {rms:.4f})"))
+            except Exception as e:
+                _log(f"Test mic error: {e}")
+                self.root.after(0, lambda: self._set_status(
+                    "Error", "#da3633", str(e)[:40]))
+            finally:
+                if self.hotword_var.get():
+                    self.root.after(0, self._hotword.resume)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
     def _calibrate_noise(self):
         """Sample background noise for 3 seconds and set threshold above it."""
         if self.recording:
@@ -2448,6 +2523,7 @@ class VoiceInputGUI:
 
         # Cache threshold for audio thread (Tkinter vars aren't thread-safe)
         silence_thresh = self.noise_threshold_var.get()
+        noise_suppress_enabled = self.noise_suppress_var.get()
 
         def audio_callback(indata, frame_count, time_info, status):
             if not self.recording:
@@ -2475,6 +2551,11 @@ class VoiceInputGUI:
             if self.noise_gate_var.get() and rms < NOISE_GATE_THRESHOLD:
                 chunk[:] = 0.0
 
+            # Noise suppression (spectral gating — removes TV/ambient)
+            if noise_suppress_enabled and len(chunk) >= 1600:
+                from jarvis.audio_pipeline import denoise_audio
+                chunk = denoise_audio(chunk.flatten(), sr=native_rate).reshape(-1, 1)
+
             self._audio_frames.append(chunk.reshape(-1, 1))
 
             # Waveform samples
@@ -2498,7 +2579,7 @@ class VoiceInputGUI:
 
         self._update_waveform()
         self._check_silence()
-        self._check_speaker_silence()
+        self._silero_vad.reset()
         self._update_timer()
 
         # Open mic stream (may block briefly — animation already running)
@@ -4358,6 +4439,7 @@ class VoiceInputGUI:
     MAX_RECORDING_SECONDS = 60  # Hard cap to prevent memory issues
 
     def _check_silence(self):
+        """Auto-stop recording when Silero VAD detects no speech."""
         if not self.recording:
             return
 
@@ -4365,7 +4447,7 @@ class VoiceInputGUI:
         if self._record_start_time:
             elapsed = time.monotonic() - self._record_start_time
             if elapsed >= self.MAX_RECORDING_SECONDS:
-                _log(f"Max recording time reached ({self.MAX_RECORDING_SECONDS}s)")
+                _log(f"Max recording time ({self.MAX_RECORDING_SECONDS}s)")
                 self._voice_stopped = True
                 try:
                     self._stop_and_transcribe()
@@ -4375,32 +4457,48 @@ class VoiceInputGUI:
                     self._reset_button()
                 return
 
-        timeout = self.silence_var.get()
-        min_frames = int(SAMPLE_RATE * 0.5 / (SAMPLE_RATE * 0.1))
-        # Don't auto-stop in the first 5 seconds of recording
-        if self._record_start_time and (time.monotonic() - self._record_start_time) < 5.0:
-            self._silence_start = None
-            self._loud_chunks = 0
-            self.root.after(300, self._check_silence)
-            return
-        if (self._silence_start is not None
-                and (time.monotonic() - self._silence_start) >= timeout
-                and len(self._audio_frames) > min_frames):
-            _log(f"Auto-stop on silence ({timeout}s timeout)")
-            self._voice_stopped = True  # Skip continuous restart
-            try:
-                self._stop_and_transcribe()
-            except Exception as e:
-                _log(f"Auto-stop error: {e}")
-                self.recording = False
-                self._reset_button()
-                self._set_status("Error", "#da3633", str(e)[:50])
-                # Resume hotword listener so the app stays usable
-                if self.hotword_var.get():
-                    self._hotword.resume()
+        # Skip first 2 seconds (let speech establish)
+        if self._record_start_time and (time.monotonic() - self._record_start_time) < 2.0:
+            self.root.after(100, self._check_silence)
             return
 
-        self.root.after(300, self._check_silence)
+        # Silero VAD speech detection
+        try:
+            if len(self._audio_frames) >= 2:
+                recent = np.concatenate(self._audio_frames[-2:], axis=0).flatten()
+                rate = getattr(self, '_record_rate', 16000)
+                if rate != 16000:
+                    from scipy.signal import resample
+                    new_len = int(len(recent) * 16000 / rate)
+                    recent = resample(recent, new_len).astype(np.float32)
+                chunk = recent[-512:] if len(recent) >= 512 else recent
+                speech_prob = self._silero_vad.is_speech(chunk, sr=16000)
+            else:
+                speech_prob = 1.0
+        except Exception:
+            speech_prob = 1.0
+
+        timeout = self.silence_var.get()
+
+        if speech_prob < 0.3:
+            if self._silence_start is None:
+                self._silence_start = time.monotonic()
+            elif (time.monotonic() - self._silence_start) >= timeout:
+                _log(f"Auto-stop: no speech for {timeout}s (prob={speech_prob:.2f})")
+                self._voice_stopped = True
+                try:
+                    self._stop_and_transcribe()
+                except Exception as e:
+                    _log(f"Auto-stop error: {e}")
+                    self.recording = False
+                    self._reset_button()
+                    if self.hotword_var.get():
+                        self._hotword.resume()
+                return
+        else:
+            self._silence_start = None
+
+        self.root.after(100, self._check_silence)
 
     def _check_speaker_silence(self):
         """Voice-aware silence: auto-stop when user hasn't spoken for timeout,
