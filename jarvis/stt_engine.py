@@ -76,7 +76,7 @@ class STTEngine:
                 "nvidia/parakeet-tdt-0.6b-v2"
             )
             self._model = self._model.to(f"cuda:{self.gpu}")
-            self._model.set_return_best_hypothesis(True)
+            self._model.eval()
             self._engine_name = "Parakeet-TDT"
             self._loaded = True
             # Warm up
