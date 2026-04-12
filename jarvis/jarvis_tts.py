@@ -46,7 +46,8 @@ class JarvisTTS:
         self._speaking = False
         self._stop_flag = False
         self._lock = threading.Lock()
-        self.engine = engine  # "kokoro", "edge", or "xtts"
+        self._f5 = None
+        self.engine = engine  # "kokoro", "f5", "edge", or "xtts"
 
     def load(self):
         """Load TTS engine."""
@@ -59,7 +60,6 @@ class JarvisTTS:
             try:
                 from kokoro import KPipeline
                 self._kokoro = KPipeline(lang_code='a', repo_id='hexgrad/Kokoro-82M')
-                # Warm up
                 for _, _, _ in self._kokoro('warmup', voice='af_heart'):
                     pass
                 _log("Kokoro 82M loaded (CPU)")
@@ -68,6 +68,22 @@ class JarvisTTS:
                 _log(f"Kokoro load error: {e}, falling back to Edge TTS")
                 self.engine = "edge"
                 return True
+
+        if self.engine == "f5":
+            if self._f5 is not None:
+                return True
+            if not VOICE_REF.exists():
+                _log(f"Voice reference not found: {VOICE_REF}")
+                return False
+            try:
+                from f5_tts.api import F5TTS
+                self._f5 = F5TTS()
+                _log("F5-TTS loaded (voice cloning, ~1s latency)")
+                return True
+            except Exception as e:
+                _log(f"F5-TTS load error: {e}, falling back to XTTS")
+                self.engine = "xtts"
+                return self.load()
 
         # XTTS v2
         if self._xtts is not None:
@@ -159,6 +175,11 @@ class JarvisTTS:
                 self._speak_kokoro(text)
                 return
 
+            # F5-TTS — voice cloning
+            if self.engine == "f5":
+                self._speak_f5(text)
+                return
+
             tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
             tmp.close()
 
@@ -238,6 +259,70 @@ class JarvisTTS:
             loop.run_until_complete(communicate.save(out_path))
         finally:
             loop.close()
+
+    def _speak_f5(self, text):
+        """Synthesize and play with F5-TTS voice cloning (~1s latency)."""
+        import numpy as np
+        import soundfile as sf
+
+        try:
+            ref_text = "Hello, I am Jarvis, your personal assistant."
+            wav, sr, _ = self._f5.infer(
+                ref_file=str(VOICE_REF),
+                ref_text=ref_text,
+                gen_text=text,
+            )
+
+            if self._stop_flag or wav is None or len(wav) == 0:
+                return
+
+            # Amplitude tracking for animation
+            audio_np = np.array(wav).flatten()
+            chunk_size = int(sr * 0.08)
+            self._amp_envelope = []
+            for i in range(0, len(audio_np), chunk_size):
+                chunk = audio_np[i:i + chunk_size]
+                rms = float(np.sqrt(np.mean(chunk ** 2)))
+                self._amp_envelope.append(min(1.0, rms * 4))
+            self._amp_index = 0
+            self._amp_playing = True
+
+            import time as _time
+
+            def _feed_amp():
+                while self._amp_playing and self._amp_index < len(self._amp_envelope):
+                    self._current_amp = self._amp_envelope[self._amp_index]
+                    self._amp_index += 1
+                    _time.sleep(0.08)
+                self._current_amp = 0.0
+                self._amp_playing = False
+
+            threading.Thread(target=_feed_amp, daemon=True).start()
+
+            # Save and play
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            sf.write(tmp.name, audio_np, sr)
+
+            for cmd in [["paplay", tmp.name], ["pw-play", tmp.name],
+                        ["aplay", "-q", tmp.name]]:
+                try:
+                    subprocess.run(cmd, timeout=30, check=True,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                    break
+                except (FileNotFoundError, subprocess.CalledProcessError):
+                    continue
+
+            self._amp_playing = False
+            self._current_amp = 0.0
+            os.unlink(tmp.name)
+            _log("F5-TTS speech complete")
+
+        except Exception as e:
+            _log(f"F5-TTS speech error: {e}")
+        finally:
+            with self._lock:
+                self._speaking = False
 
     def _speak_kokoro(self, text):
         """Synthesize and play with Kokoro 82M — instant, high quality."""
