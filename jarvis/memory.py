@@ -46,7 +46,12 @@ class JarvisMemory:
 
     def _save(self, filename, data):
         try:
-            (MEMORY_DIR / filename).write_text(json.dumps(data, indent=2))
+            target = MEMORY_DIR / filename
+            # Atomic write — crash mid-write cannot corrupt persistent state.
+            tmp = target.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            import os
+            os.replace(tmp, target)
         except Exception as e:
             _log(f"Save error ({filename}): {e}")
 

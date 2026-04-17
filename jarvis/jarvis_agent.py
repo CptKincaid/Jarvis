@@ -60,7 +60,10 @@ class JarvisAgent:
 
     def _save_habits(self):
         try:
-            HABITS_FILE.write_text(json.dumps(self._habits[-500:], indent=2))
+            # Atomic write — crash mid-write cannot corrupt the file.
+            tmp = HABITS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._habits[-500:], indent=2))
+            os.replace(tmp, HABITS_FILE)
         except Exception:
             pass
 
@@ -242,7 +245,9 @@ class JarvisAgent:
         """Define a reusable workflow."""
         self._workflows[name] = steps
         try:
-            WORKFLOWS_FILE.write_text(json.dumps(self._workflows, indent=2))
+            tmp = WORKFLOWS_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(self._workflows, indent=2))
+            os.replace(tmp, WORKFLOWS_FILE)
         except Exception:
             pass
         _log(f"Workflow defined: {name} ({len(steps)} steps)")
