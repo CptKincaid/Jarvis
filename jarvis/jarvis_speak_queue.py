@@ -1,19 +1,23 @@
 """Jarvis speak queue — file-based communication between Claude and TTS.
 
-Claude writes lines prefixed with "Jarvis:" to a queue file.
-The voice GUI watches this file and speaks any new lines.
+Claude writes HMAC-signed lines to the queue file so untrusted local
+processes cannot make Jarvis speak arbitrary text.
 
 Usage from Claude Code:
-    echo "Jarvis: Hello, how can I help?" >> /tmp/vss_voice/speak_queue.txt
+    from jarvis.jarvis_speak_queue import say
+    say("Jarvis: Hello, how can I help?")
 """
 
 from pathlib import Path
+
+from jarvis.speak_queue_auth import sign, _ensure_queue_dir
 
 SPEAK_QUEUE = Path("/tmp/vss_voice/speak_queue.txt")
 
 
 def say(text):
-    """Queue a message for Jarvis to speak."""
-    SPEAK_QUEUE.parent.mkdir(parents=True, exist_ok=True)
+    """Queue a signed message for Jarvis to speak."""
+    _ensure_queue_dir()
+    signed = sign(text.strip())
     with open(SPEAK_QUEUE, "a") as f:
-        f.write(text.strip() + "\n")
+        f.write(signed + "\n")

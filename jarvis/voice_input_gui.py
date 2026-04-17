@@ -4937,6 +4937,9 @@ class VoiceInputGUI:
 
     def _start_speak_queue_watcher(self):
         """Watch the speak queue file for new lines from Claude."""
+        from jarvis.speak_queue_auth import _ensure_queue_dir
+        _ensure_queue_dir()
+
         speak_file = Path("/tmp/vss_voice/speak_queue.txt")
         self._speak_queue_pos = 0
 
@@ -4947,7 +4950,9 @@ class VoiceInputGUI:
         self._watch_speak_queue()
 
     def _watch_speak_queue(self):
-        """Poll the speak queue file for new Jarvis: lines."""
+        """Poll the speak queue file for new HMAC-signed lines."""
+        from jarvis.speak_queue_auth import verify
+
         if not self.talkback_var.get():
             self.root.after(2000, self._watch_speak_queue)
             return
@@ -4968,10 +4973,18 @@ class VoiceInputGUI:
                         new_lines = f.read()
                     self._speak_queue_pos = size
 
-                    combined = " ".join(
-                        l.strip() for l in new_lines.strip().splitlines()
-                        if l.strip()
-                    )
+                    verified = []
+                    for line in new_lines.strip().splitlines():
+                        line = line.strip()
+                        if not line:
+                            continue
+                        payload = verify(line)
+                        if payload is None:
+                            _log("Speak queue: dropped unsigned line")
+                            continue
+                        verified.append(payload)
+
+                    combined = " ".join(verified)
                     if combined:
                         _log(f"Talk-back queue: {combined[:60]}")
                         self.root.after(0, lambda: self._set_status(
