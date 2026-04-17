@@ -47,6 +47,11 @@ from collections import deque
 
 import numpy as np
 
+from jarvis.recording import RecordingController
+from jarvis.transcription import TranscriptionPipeline
+from jarvis.dispatcher import CommandDispatcher, CommandHandler
+from jarvis.animation import AnimationRenderer, generate_beep as _generate_beep_samples
+
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -533,18 +538,20 @@ def _log(msg):
 # Sound generation (no external files needed)
 # ------------------------------------------------------------------
 def _generate_beep(freq=880, duration_ms=120, volume=0.3):
-    """Generate a short beep as WAV bytes."""
+    """Generate a short beep as WAV bytes (vectorized)."""
     n_samples = int(SAMPLE_RATE * duration_ms / 1000)
+    i = np.arange(n_samples)
+    t = i / SAMPLE_RATE
+    env = np.minimum(i / 200, 1.0) * np.minimum((n_samples - i) / 200, 1.0)
+    samples = (volume * env * 32767 * np.sin(2 * np.pi * freq * t))
+    samples = np.clip(samples, -32767, 32767).astype(np.int16)
+
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(SAMPLE_RATE)
-        for i in range(n_samples):
-            t = i / SAMPLE_RATE
-            env = min(i / 200, 1.0) * min((n_samples - i) / 200, 1.0)
-            sample = int(volume * env * 32767 * math.sin(2 * math.pi * freq * t))
-            w.writeframes(struct.pack("<h", max(-32767, min(32767, sample))))
+        w.writeframes(samples.tobytes())
     return buf.getvalue()
 
 
