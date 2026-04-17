@@ -212,7 +212,14 @@ class IntentClassifier:
                         else:
                             self._learned_negative.add(ngram)
                             self._learned_positive.discard(ngram)
-        except Exception:
+        except Exception as e:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            backup = self.INTENT_LOG.with_suffix(f".json.corrupt.{ts}")
+            try:
+                self.INTENT_LOG.rename(backup)
+                _log(f"Intent log corrupt ({e}); backed up to {backup.name}")
+            except Exception as rename_err:
+                _log(f"Intent log corrupt and unbackup-able: {rename_err}")
             self._log_data = []
 
     def _save_log(self):
