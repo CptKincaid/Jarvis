@@ -2586,10 +2586,14 @@ class VoiceInputGUI:
 
             self._audio_frames.append(chunk.reshape(-1, 1))
 
-            # Waveform samples
-            step = max(1, len(chunk) // 4)
-            for val in chunk[::step]:
-                self._waveform_buffer.append(float(val))
+            # Waveform samples — flatten to guarantee 1D so float(v) works.
+            # Without .ravel() / np.ndarray.item(), iterating a 2D chunk
+            # yields arrays and raises TypeError, which silently drops
+            # every subsequent callback (this is the "0.1s captured over
+            # 60s" bug — one good callback before the rest crash).
+            flat = np.asarray(chunk).ravel()
+            step = max(1, len(flat) // 4)
+            self._waveform_buffer.extend(flat[::step].tolist())
 
         # Set recording state and start animation BEFORE opening mic
         # (mic open can block briefly and cause frame stutter)
