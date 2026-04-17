@@ -21,7 +21,8 @@ LOG_DIR = Path("/tmp/vss_voice")
 
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "llama3.2:latest"
-CLAUDE_BIN = "/home/hunterp/.npm-global/bin/claude"
+CLAUDE_BIN = str(Path.home() / ".npm-global" / "bin" / "claude")
+_NPM_BIN_PATH = str(Path.home() / ".npm-global" / "bin")
 
 # Simple questions Ollama can handle
 LOCAL_PATTERNS = [
@@ -239,7 +240,7 @@ class JarvisBrain:
                 capture_output=True, text=True,
                 timeout=120,
                 env={**os.environ,
-                     "PATH": f"/home/hunterp/.npm-global/bin:{os.environ.get('PATH', '')}"},
+                     "PATH": f"{_NPM_BIN_PATH}:{os.environ.get('PATH', '')}"},
             )
             response = result.stdout.strip()
             _log(f"Claude response: {response[:80]}")
@@ -288,7 +289,7 @@ If something fails, use [SPEAK] to explain and suggest alternatives."""
                     capture_output=True, text=True,
                     timeout=60,
                     env={**os.environ,
-                         "PATH": f"/home/hunterp/.npm-global/bin:{os.environ.get('PATH', '')}"},
+                         "PATH": f"{_NPM_BIN_PATH}:{os.environ.get('PATH', '')}"},
                 )
                 actions = self._parse_response(result.stdout.strip())
             except Exception as e:

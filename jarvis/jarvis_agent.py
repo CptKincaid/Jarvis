@@ -22,15 +22,12 @@ MEMORY_FILE = DATA_DIR / "context_memory.json"
 WORKFLOWS_FILE = DATA_DIR / "workflows.json"
 
 
-def _log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    line = f"{ts} [Agent] {msg}"
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG_DIR / "gui_debug.log", "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+from jarvis.logging import get_logger
+_log = get_logger("AGENT")
+
+
+_VSS = str(Path.home() / "vss_env")
+_JARVIS = str(Path.home() / "jarvis")
 
 
 class JarvisAgent:
@@ -257,9 +254,9 @@ class JarvisAgent:
     # Default workflows
     DEFAULT_WORKFLOWS = {
         "deploy": [
-            ("shell", "cd /home/hunterp/vss_env && python scripts/agents/test_agent.py"),
-            ("shell", "cd /home/hunterp/vss_env && python scripts/agents/security_agent.py"),
-            ("shell", "cd /home/hunterp/vss_env && git add -A && git status -s"),
+            ("shell", f"cd {_VSS} && python scripts/agents/test_agent.py"),
+            ("shell", f"cd {_VSS} && python scripts/agents/security_agent.py"),
+            ("shell", f"cd {_VSS} && git add -A && git status -s"),
             ("speak", "Tests and security scan complete. Ready to commit."),
         ],
         "morning": [
@@ -270,7 +267,7 @@ class JarvisAgent:
         ],
         "training check": [
             ("shell", "nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu --format=csv"),
-            ("shell", "ls -lt /home/hunterp/vss_env/aiws_system/training_data/*/images/ 2>/dev/null | head -5"),
+            ("shell", f"ls -lt {_VSS}/aiws_system/training_data/*/images/ 2>/dev/null | head -5"),
             ("speak", "Training status retrieved."),
         ],
     }
@@ -487,7 +484,7 @@ class JarvisAgent:
     # ------------------------------------------------------------------
     # 9. Git Intelligence
     # ------------------------------------------------------------------
-    def git_summary(self, repo_path="/home/hunterp/vss_env"):
+    def git_summary(self, repo_path=_VSS):
         """Get a quick git status summary."""
         try:
             def _run(cmd):
@@ -549,7 +546,7 @@ class JarvisAgent:
     # ------------------------------------------------------------------
     # 11. File Operations
     # ------------------------------------------------------------------
-    def find_file(self, name, search_dir="/home/hunterp/vss_env"):
+    def find_file(self, name, search_dir=_VSS):
         """Find files matching a name pattern."""
         try:
             r = subprocess.run(
@@ -563,7 +560,7 @@ class JarvisAgent:
         except Exception:
             return []
 
-    def recent_files(self, directory="/home/hunterp/vss_env", count=5):
+    def recent_files(self, directory=_VSS, count=5):
         """List recently modified files."""
         try:
             r = subprocess.run(
@@ -713,7 +710,7 @@ class JarvisAgent:
             r = subprocess.run(
                 command, shell=True, capture_output=True,
                 text=True, timeout=30,
-                cwd="/home/hunterp/jarvis",
+                cwd=_JARVIS,
             )
             output = r.stdout.strip()
             if r.returncode != 0 and r.stderr:

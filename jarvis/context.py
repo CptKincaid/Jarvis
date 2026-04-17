@@ -35,8 +35,8 @@ class ContextEngine:
 
     CACHE_TTL = 30  # seconds
 
-    def __init__(self, project_dir="/home/hunterp/jarvis",
-                 vss_dir="/home/hunterp/vss_env"):
+    def __init__(self, project_dir=str(Path.home() / "jarvis"),
+                 vss_dir=str(Path.home() / "vss_env")):
         self._cache = {}
         self._cache_times = {}
         self._conversation = []

@@ -415,9 +415,10 @@ STOP_RECORDING_PHRASES = {
 }
 
 # Quick voice commands — "Jarvis, commit" etc.
+_VSS = str(Path.home() / "vss_env")
 QUICK_COMMANDS = {
-    "commit": "cd /home/hunterp/vss_env && git add -A && git status -s",
-    "run tests": "cd /home/hunterp/vss_env && python scripts/agents/run_all.py --quick",
+    "commit": f"cd {_VSS} && git add -A && git status -s",
+    "run tests": f"cd {_VSS} && python scripts/agents/run_all.py --quick",
     "check gpu": "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv",
     "check disk": "df -h / /storage 2>/dev/null",
     "check logs": "tail -20 /tmp/vss_voice/gui_debug.log",
@@ -3548,7 +3549,7 @@ class VoiceInputGUI:
         count_match = re.match(r"count (?:the )?lines? in (.+)", cmd_text)
         if count_match:
             filename = count_match.group(1).strip()
-            output = self._agent.run_shell(f"wc -l {filename} 2>/dev/null || find /home/hunterp -name '{filename}' -exec wc -l {{}} + 2>/dev/null | tail -1")
+            output = self._agent.run_shell(f"wc -l {filename} 2>/dev/null || find {Path.home()} -name '{filename}' -exec wc -l {{}} + 2>/dev/null | tail -1")
             self._show_jarvis_text(output)
             if self.talkback_var.get():
                 from jarvis.jarvis_speak_queue import say
@@ -4701,9 +4702,25 @@ class VoiceInputGUI:
         """Detect Claude Code terminal by its spinner-prefixed title."""
         return bool(name) and ord(name[0]) > 127 and len(name) > 1 and name[1] == ' '
 
+    _claude_wid_cache: tuple | None = None  # (wid, expires_monotonic)
+
+    @classmethod
+    def _find_claude_terminal(cls):
+        """Find the Claude Code terminal window ID, or None (5s TTL cache)."""
+        now = time.monotonic()
+        cached = cls._claude_wid_cache
+        if cached is not None:
+            wid, expires = cached
+            if now < expires:
+                return wid
+
+        wid = cls._lookup_claude_terminal_uncached()
+        cls._claude_wid_cache = (wid, now + 5.0)
+        return wid
+
     @staticmethod
-    def _find_claude_terminal():
-        """Find the Claude Code terminal window ID, or None."""
+    def _lookup_claude_terminal_uncached():
+        """Uncached lookup — scans terminals for Claude's spinner-prefixed title."""
         try:
             result = subprocess.run(
                 ["xdotool", "search", "--class", "terminal"],
@@ -5536,35 +5553,37 @@ class VoiceInputGUI:
     # Window target system
     # ------------------------------------------------------------------
     def _get_window_list(self):
-        """Get list of (wid, name) for all visible windows."""
+        """Get list of (wid, name) for all visible windows (single wmctrl call)."""
         windows = []
+        own_wid = None
+        try:
+            own_wid_int = self.root.winfo_id()
+            # wmctrl returns hex WIDs (0x0...); xdotool uses decimal.
+            # Convert our own decimal WID to the hex wmctrl emits.
+            own_wid = f"0x{own_wid_int:08x}"
+        except Exception:
+            pass
+
         try:
             result = subprocess.run(
-                ["xdotool", "search", "--onlyvisible", "--name", ""],
-                capture_output=True, text=True, timeout=3,
+                ["wmctrl", "-l"], capture_output=True, text=True, timeout=2,
             )
-            own_wid = None
-            try:
-                own_wid = str(self.root.winfo_id())
-            except Exception:
-                pass
+        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+            _log(f"Window list error (wmctrl missing/timeout): {e}")
+            return []
+        if result.returncode != 0:
+            return []
 
-            for wid in result.stdout.strip().splitlines():
-                wid = wid.strip()
-                if not wid or wid == own_wid:
-                    continue
-                try:
-                    name_result = subprocess.run(
-                        ["xdotool", "getwindowname", wid],
-                        capture_output=True, text=True, timeout=1,
-                    )
-                    name = name_result.stdout.strip()
-                    if name and len(name) > 1:
-                        windows.append((wid, name))
-                except Exception:
-                    pass
-        except Exception as e:
-            _log(f"Window list error: {e}")
+        for line in result.stdout.strip().splitlines():
+            # Format: "<wid> <desktop> <host> <title...>"
+            parts = line.split(None, 3)
+            if len(parts) < 4:
+                continue
+            wid, _, _, name = parts
+            if own_wid and wid.lower() == own_wid.lower():
+                continue
+            if name and len(name) > 1:
+                windows.append((wid, name))
         return windows
 
     def _refresh_window_list(self):
