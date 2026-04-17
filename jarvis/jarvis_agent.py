@@ -22,7 +22,7 @@ MEMORY_FILE = DATA_DIR / "context_memory.json"
 WORKFLOWS_FILE = DATA_DIR / "workflows.json"
 
 
-from jarvis.logging import get_logger
+from jarvis.jarvis_logging import get_logger
 _log = get_logger("AGENT")
 
 

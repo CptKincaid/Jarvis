@@ -21,7 +21,7 @@ SILENCE_TIMEOUT = 2.0
 NOISE_GATE_THRESHOLD = 0.005
 
 
-from jarvis.logging import get_logger
+from jarvis.jarvis_logging import get_logger
 _log = get_logger("REC")
 
 

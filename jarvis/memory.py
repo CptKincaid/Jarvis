@@ -17,7 +17,7 @@ from pathlib import Path
 MEMORY_DIR = Path.home() / ".aiws_trainer" / "jarvis_memory"
 
 
-from jarvis.logging import get_logger
+from jarvis.jarvis_logging import get_logger
 _log = get_logger("MEM")
 
 

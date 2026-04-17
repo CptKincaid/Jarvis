@@ -47,14 +47,17 @@ from collections import deque
 
 import numpy as np
 
+# Ensure jarvis package is importable when this file is run as a script
+# (e.g. `python voice_input_gui.py` from the hotword daemon). Must happen
+# BEFORE any `from jarvis.*` import below.
+SCRIPT_DIR = Path(__file__).resolve().parent.parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
 from jarvis.recording import RecordingController
 from jarvis.transcription import TranscriptionPipeline
 from jarvis.dispatcher import CommandDispatcher, CommandHandler
 from jarvis.animation import AnimationRenderer, generate_beep as _generate_beep_samples
-
-SCRIPT_DIR = Path(__file__).resolve().parent.parent
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SILENCE_THRESHOLD = 0.04
@@ -512,7 +515,7 @@ def _apply_voice_commands(text):
     return result.strip()
 
 
-from jarvis.logging import get_logger
+from jarvis.jarvis_logging import get_logger
 _log = get_logger("GUI")
 
 

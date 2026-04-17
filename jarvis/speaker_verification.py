@@ -44,7 +44,7 @@ MIN_AUDIO_SECONDS = 1.0
 SAMPLE_RATE = 16000
 
 
-from jarvis.logging import get_logger
+from jarvis.jarvis_logging import get_logger
 _log = get_logger("VER")
 
 

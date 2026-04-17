@@ -23,7 +23,7 @@ VOICE_REF = Path.home() / ".aiws_trainer" / "jarvis_voice_ref.wav"
 LOG_DIR = Path("/tmp/vss_voice")
 
 
-from jarvis.logging import get_logger
+from jarvis.jarvis_logging import get_logger
 _log = get_logger("TTS")
 
 

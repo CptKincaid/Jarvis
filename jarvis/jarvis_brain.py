@@ -56,7 +56,7 @@ For multi-step tasks, execute one step at a time.
 User (Hunter) said: {input}"""
 
 
-from jarvis.logging import get_logger
+from jarvis.jarvis_logging import get_logger
 _log = get_logger("BRAIN")
 
 
