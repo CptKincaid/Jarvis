@@ -2546,9 +2546,12 @@ class VoiceInputGUI:
         self._partial_text = ""
         self._last_partial_time = time.monotonic()
 
-        # Cache threshold for audio thread (Tkinter vars aren't thread-safe)
+        # Cache threshold for audio thread (Tkinter vars aren't thread-safe —
+        # calling .get() from the sounddevice callback thread raises
+        # "main thread is not in main loop" and drops the entire chunk).
         silence_thresh = self.noise_threshold_var.get()
         noise_suppress_enabled = self.noise_suppress_var.get()
+        noise_gate_enabled = self.noise_gate_var.get()
 
         def audio_callback(indata, frame_count, time_info, status):
             if not self.recording:
@@ -2573,7 +2576,7 @@ class VoiceInputGUI:
                     self._silence_start = None
 
             # Noise gate: zero out quiet blocks (after silence check)
-            if self.noise_gate_var.get() and rms < NOISE_GATE_THRESHOLD:
+            if noise_gate_enabled and rms < NOISE_GATE_THRESHOLD:
                 chunk[:] = 0.0
 
             # Noise suppression (spectral gating — removes TV/ambient)
