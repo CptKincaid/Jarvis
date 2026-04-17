@@ -808,6 +808,7 @@ class HotwordListener:
         self._stream = None
         self._model = None
         self._reopen = False
+        self._stream_lock = threading.Lock()
 
     def start(self):
         if self.active:
@@ -838,13 +839,14 @@ class HotwordListener:
             _log("Hotword listener restarted fresh")
 
     def _close_stream(self):
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                pass
-            self._stream = None
+        with self._stream_lock:
+            if self._stream:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    pass
+                self._stream = None
 
     def _listen_loop(self):
         import sounddevice as sd
@@ -893,19 +895,22 @@ class HotwordListener:
                 buf.extend(chunk.tolist())
 
         def _open_stream():
-            try:
-                self._stream = sd.InputStream(
-                    samplerate=native_rate, channels=CHANNELS,
-                    dtype="float32", device=mic_idx,
-                    callback=callback,
-                    blocksize=chunk_samples,
-                )
-                self._stream.start()
-                return True
-            except Exception as e:
-                _log(f"Hotword stream error: {e}")
-                self._stream = None
-                return False
+            with self._stream_lock:
+                if self._stream is not None:
+                    return True  # Already open — don't re-create
+                try:
+                    self._stream = sd.InputStream(
+                        samplerate=native_rate, channels=CHANNELS,
+                        dtype="float32", device=mic_idx,
+                        callback=callback,
+                        blocksize=chunk_samples,
+                    )
+                    self._stream.start()
+                    return True
+                except Exception as e:
+                    _log(f"Hotword stream error: {e}")
+                    self._stream = None
+                    return False
 
         if not _open_stream():
             self.active = False
@@ -917,13 +922,15 @@ class HotwordListener:
             time.sleep(0.08)  # Check every 80ms (matches OWW chunk size)
 
             # Re-open stream after recording finishes
-            if self._reopen and not self.gui.recording and not self._stream:
-                self._reopen = False
+            should_reopen = False
+            with self._stream_lock:
+                if self._reopen and not self.gui.recording and self._stream is None:
+                    self._reopen = False
+                    should_reopen = True
+            if should_reopen:
                 buf.clear()
                 _open_stream()
                 _log("Hotword stream resumed")
-                # Reset OWW model state and add cooldown so residual
-                # audio from the previous recording doesn't false-trigger
                 if self._model:
                     self._model.reset()
                 self._resume_cooldown = time.monotonic() + 2.0  # 2s cooldown
