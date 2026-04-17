@@ -29,13 +29,23 @@ class CommandHandler:
 
 
 class CommandDispatcher:
-    """Dispatches text to the first matching handler; falls through to brain."""
+    """Dispatches text to the first matching handler.
+
+    Two entry points:
+      - `try_handle(text, ctx) -> bool` returns True iff a registered
+        handler matched and returned True. Use this when you want to
+        progressively migrate commands — the caller can fall through
+        to legacy logic when it returns False.
+      - `handle(text, ctx)` dispatches via try_handle, then falls
+        through to `brain.handle` for unmatched text.
+    """
 
     def __init__(self, handlers: list[CommandHandler], brain: Any):
         self._compiled = [(h.compiled(), h.handler) for h in handlers]
         self.brain = brain
 
-    def handle(self, text: str, ctx: dict | None = None) -> None:
+    def try_handle(self, text: str, ctx: dict | None = None) -> bool:
+        """Return True iff a registered handler claimed the text."""
         ctx = ctx if ctx is not None else {}
         for pattern, handler in self._compiled:
             m = pattern.match(text)
@@ -43,7 +53,13 @@ class CommandDispatcher:
                 try:
                     if handler(m, ctx):
                         _log(f"Dispatched: {pattern.pattern!r} -> handled")
-                        return
+                        return True
                 except Exception as e:
                     _log(f"Handler error ({pattern.pattern!r}): {e}")
-        self.brain.handle(text, ctx)
+        return False
+
+    def handle(self, text: str, ctx: dict | None = None) -> None:
+        """Dispatch; unmatched text falls through to brain."""
+        ctx = ctx if ctx is not None else {}
+        if not self.try_handle(text, ctx):
+            self.brain.handle(text, ctx)

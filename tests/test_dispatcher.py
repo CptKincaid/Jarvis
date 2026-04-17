@@ -112,3 +112,28 @@ def test_handler_exception_falls_through_to_brain():
     d.handle("list", ctx={})
     # Handler raised, so dispatcher continues to brain fallback
     brain.handle.assert_called_once()
+
+
+def test_try_handle_returns_true_when_handler_claims():
+    d = CommandDispatcher(
+        handlers=[CommandHandler(r"^yes$", lambda m, c: True)],
+        brain=MagicMock(),
+    )
+    assert d.try_handle("yes") is True
+
+
+def test_try_handle_returns_false_when_no_match():
+    brain = MagicMock()
+    d = CommandDispatcher(handlers=[CommandHandler(r"^yes$", lambda m, c: True)],
+                          brain=brain)
+    assert d.try_handle("unknown text") is False
+    brain.handle.assert_not_called()
+
+
+def test_try_handle_returns_false_when_handler_refuses():
+    """Handler that returns False = 'not my problem, try the next one'."""
+    d = CommandDispatcher(
+        handlers=[CommandHandler(r"^list.*", lambda m, c: False)],
+        brain=MagicMock(),
+    )
+    assert d.try_handle("list files") is False
