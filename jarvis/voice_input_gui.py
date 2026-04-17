@@ -106,6 +106,17 @@ SHELL_ALLOWLIST = {
 }
 
 
+def is_shell_cmd_allowlisted(shell_cmd: str) -> bool:
+    """Return True iff the first token of shell_cmd is in SHELL_ALLOWLIST.
+
+    Extracted so the classification is unit-testable without a GUI.
+    """
+    tokens = shell_cmd.strip().split()
+    if not tokens:
+        return False
+    return tokens[0] in SHELL_ALLOWLIST
+
+
 def _draw_circle(frame, cx, cy, r, color, alpha):
     """Draw a circle outline onto a numpy RGB frame."""
     S = frame.shape[0]
@@ -2724,11 +2735,6 @@ class VoiceInputGUI:
             target=self._transcribe_worker, args=(audio,), daemon=True
         ).start()
 
-    def _get_whisper_language(self):
-        """Get the language code for Whisper from current selection."""
-        lang_name = self.lang_var.get()
-        return self._lang_map.get(lang_name, "en")
-
     def _transcribe_worker(self, audio):
         try:
             # Speaker verification — filter to only user's voice segments
@@ -3533,8 +3539,7 @@ class VoiceInputGUI:
         run_match = re.match(r"(?:run|execute|shell)\s+(.+)", cmd_text)
         if run_match:
             shell_cmd = run_match.group(1).strip()
-            first_token = shell_cmd.split()[0] if shell_cmd.split() else ""
-            if first_token in SHELL_ALLOWLIST:
+            if is_shell_cmd_allowlisted(shell_cmd):
                 _log(f"Shell command (allowlisted): {shell_cmd}")
                 self._set_status("Running...", self.ACCENT, shell_cmd[:30])
                 self._run_shell_async(shell_cmd)
