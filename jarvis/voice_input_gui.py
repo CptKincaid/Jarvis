@@ -5839,11 +5839,6 @@ class VoiceInputGUI:
                 self._orbit_server.shutdown()
             except Exception:
                 pass
-        if hasattr(self, '_orbit_server') and self._orbit_server:
-            try:
-                self._orbit_server.shutdown()
-            except Exception:
-                pass
         try:
             self._hotword.stop()
         except Exception:
