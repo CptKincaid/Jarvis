@@ -1469,7 +1469,11 @@ class VoiceInputGUI:
         }
         try:
             SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+            # Atomic write: write to .tmp then rename so a crash mid-write
+            # cannot leave a truncated settings.json that fails to parse.
+            tmp_path = SETTINGS_FILE.with_suffix(".tmp")
+            tmp_path.write_text(json.dumps(data, indent=2))
+            os.replace(tmp_path, SETTINGS_FILE)
         except Exception as e:
             _log(f"Settings save error: {e}")
 
@@ -4757,12 +4761,25 @@ class VoiceInputGUI:
     # Talk-back TTS
     # ------------------------------------------------------------------
     def _get_tts(self):
-        """Lazy-load TTS engine."""
-        if self._tts is None:
-            from jarvis.jarvis_tts import JarvisTTS
-            self._tts = JarvisTTS(engine=self.tts_engine_var.get())
-        else:
-            self._tts.engine = self.tts_engine_var.get()
+        """Lazy-load TTS engine; recreate when the engine selection changes.
+
+        Avoids instantiating the full JarvisTTS model on every speak-queue
+        poll tick when talkback is off. Also fully reloads the underlying
+        model (not just the engine attribute) when the user switches
+        engines in the dropdown — previously the attribute changed but the
+        loaded weights did not.
+        """
+        want_engine = self.tts_engine_var.get()
+        if self._tts is not None and self._tts.engine == want_engine:
+            return self._tts
+        if self._tts is not None:
+            try:
+                self._tts.stop()
+            except Exception:
+                pass
+            self._tts = None
+        from jarvis.jarvis_tts import JarvisTTS
+        self._tts = JarvisTTS(engine=want_engine)
         return self._tts
 
     def _add_voice_clip(self):
