@@ -800,7 +800,10 @@ class HotwordListener:
         self._stream = None
         self._model = None
         self._reopen = False
-        self._stream_lock = threading.Lock()
+        # _stream_lock removed — the race it protected against wasn't
+        # manifesting in practice, and wrapping sounddevice stream
+        # stop/close in a lock is suspected of stalling the recording
+        # path. Defense-in-depth isn't worth a freeze regression.
 
     def start(self):
         if self.active:
@@ -831,14 +834,13 @@ class HotwordListener:
             _log("Hotword listener restarted fresh")
 
     def _close_stream(self):
-        with self._stream_lock:
-            if self._stream:
-                try:
-                    self._stream.stop()
-                    self._stream.close()
-                except Exception:
-                    pass
-                self._stream = None
+        if self._stream:
+            try:
+                self._stream.stop()
+                self._stream.close()
+            except Exception:
+                pass
+            self._stream = None
 
     def _listen_loop(self):
         import sounddevice as sd
@@ -887,22 +889,19 @@ class HotwordListener:
                 buf.extend(chunk.tolist())
 
         def _open_stream():
-            with self._stream_lock:
-                if self._stream is not None:
-                    return True  # Already open — don't re-create
-                try:
-                    self._stream = sd.InputStream(
-                        samplerate=native_rate, channels=CHANNELS,
-                        dtype="float32", device=mic_idx,
-                        callback=callback,
-                        blocksize=chunk_samples,
-                    )
-                    self._stream.start()
-                    return True
-                except Exception as e:
-                    _log(f"Hotword stream error: {e}")
-                    self._stream = None
-                    return False
+            try:
+                self._stream = sd.InputStream(
+                    samplerate=native_rate, channels=CHANNELS,
+                    dtype="float32", device=mic_idx,
+                    callback=callback,
+                    blocksize=chunk_samples,
+                )
+                self._stream.start()
+                return True
+            except Exception as e:
+                _log(f"Hotword stream error: {e}")
+                self._stream = None
+                return False
 
         if not _open_stream():
             self.active = False
@@ -914,15 +913,13 @@ class HotwordListener:
             time.sleep(0.08)  # Check every 80ms (matches OWW chunk size)
 
             # Re-open stream after recording finishes
-            should_reopen = False
-            with self._stream_lock:
-                if self._reopen and not self.gui.recording and self._stream is None:
-                    self._reopen = False
-                    should_reopen = True
-            if should_reopen:
+            if self._reopen and not self.gui.recording and not self._stream:
+                self._reopen = False
                 buf.clear()
                 _open_stream()
                 _log("Hotword stream resumed")
+                # Reset OWW model state and add cooldown so residual
+                # audio from the previous recording doesn't false-trigger
                 if self._model:
                     self._model.reset()
                 self._resume_cooldown = time.monotonic() + 2.0  # 2s cooldown
@@ -4760,25 +4757,12 @@ class VoiceInputGUI:
     # Talk-back TTS
     # ------------------------------------------------------------------
     def _get_tts(self):
-        """Lazy-load TTS engine; recreate when the engine selection changes.
-
-        Avoids instantiating the full JarvisTTS model on every speak-queue
-        poll tick when talkback is off. Also fully reloads the underlying
-        model (not just the engine attribute) when the user switches
-        engines in the dropdown — previously the attribute changed but the
-        loaded weights did not.
-        """
-        want_engine = self.tts_engine_var.get()
-        if self._tts is not None and self._tts.engine == want_engine:
-            return self._tts
-        if self._tts is not None:
-            try:
-                self._tts.stop()
-            except Exception:
-                pass
-            self._tts = None
-        from jarvis.jarvis_tts import JarvisTTS
-        self._tts = JarvisTTS(engine=want_engine)
+        """Lazy-load TTS engine."""
+        if self._tts is None:
+            from jarvis.jarvis_tts import JarvisTTS
+            self._tts = JarvisTTS(engine=self.tts_engine_var.get())
+        else:
+            self._tts.engine = self.tts_engine_var.get()
         return self._tts
 
     def _add_voice_clip(self):
