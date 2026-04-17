@@ -40,7 +40,7 @@ Surgical, in-place fixes. No module moves, no new test scaffolding. One commit p
 | 2 | `voice_input_gui.py:4889`, `jarvis_speak_queue.py` | `os.makedirs("/tmp/vss_voice", mode=0o700, exist_ok=True)` + `os.chmod` on every startup. Generate `~/.aiws_trainer/speak_queue.key` (32 random bytes, mode 0600) if missing. All queue writers prepend `hmac_sha256(key, line).hexdigest()[:16] + " "`. Watcher verifies HMAC and drops unsigned/mismatched lines. |
 | 3 | `voice_input_gui.py:5757-5761` | Delete duplicate `_orbit_server.shutdown()` block (4 lines). |
 | 4 | `voice_input_gui.py:2881` | Replace `self._whisper_model.transcribe(audio, **kwargs)` with `self._stt_engine.transcribe(audio)` (returns `STTResult`; use `.text`). Guard entry with `if not self._stt_engine or not self._stt_engine.is_loaded: return` so the worker no-ops safely when STT hasn't finished loading yet. |
-| 5 | `voice_input_gui.py:4926` | Wrap `self._hotword.pause()` call in `self.root.after(0, ...)` so it marshals onto the GUI thread rather than racing with the hotword loop. |
+| 5 | `voice_input_gui.py:815-838` (`HotwordListener`) | Add `self._stream_lock = threading.Lock()` to `HotwordListener.__init__`. Wrap `_open_stream()`, `_close_stream()`, and the loop's stream-reopen block (line 911-920) in `with self._stream_lock:`. Keeps the existing synchronous `pause()` call (needed to prevent TTS feedback) but serializes the stream mutations so `pause()` cannot race with `resume()` or the loop's reopen. |
 
 **Phase 1 verification (manual smoke):**
 - Say "run ls" → allowlisted, runs.
