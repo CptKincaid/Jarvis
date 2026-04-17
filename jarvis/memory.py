@@ -17,15 +17,8 @@ from pathlib import Path
 MEMORY_DIR = Path.home() / ".aiws_trainer" / "jarvis_memory"
 
 
-def _log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    try:
-        log_dir = Path("/tmp/vss_voice")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / "gui_debug.log", "a") as f:
-            f.write(f"{ts} [Memory] {msg}\n")
-    except Exception:
-        pass
+from jarvis.logging import get_logger
+_log = get_logger("MEM")
 
 
 class JarvisMemory:
