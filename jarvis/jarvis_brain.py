@@ -249,6 +249,10 @@ class JarvisBrain:
             )
             response = result.stdout.strip()
             _log(f"Claude response: {response[:80]}")
+            if not response:
+                # Empty response — log diagnostics to understand why
+                _log(f"Claude EMPTY: returncode={result.returncode}, "
+                     f"stderr={result.stderr[:200]!r}")
 
             if response:
                 return self._parse_response(response)
