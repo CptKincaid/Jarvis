@@ -2882,13 +2882,13 @@ class VoiceInputGUI:
         """
         with self._partial_lock:
             try:
-                lang = self._get_whisper_language()
-                kwargs = dict(beam_size=1, initial_prompt=_load_vocab())
-                if lang is not None:
-                    kwargs["language"] = lang
-
-                segments, _ = self._whisper_model.transcribe(audio, **kwargs)
-                text = " ".join(seg.text.strip() for seg in segments).strip()
+                # Route through the unified STT engine (Parakeet primary,
+                # Whisper fallback). Skip cleanly if STT isn't loaded yet
+                # so the preview worker can't crash with AttributeError.
+                if self._stt_engine is None or not self._stt_engine.is_loaded:
+                    return
+                result = self._stt_engine.transcribe(audio)
+                text = (result.text or "").strip()
 
                 if text and self.recording:
                     self._partial_text = text
