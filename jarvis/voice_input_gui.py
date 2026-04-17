@@ -951,6 +951,12 @@ class HotwordListener:
             # Dual-threshold confirmation: need one frame above THRESHOLD
             # OR two frames above CONFIRM_THRESHOLD within CONFIRM_WINDOW
             now = time.monotonic()
+            # Detection cooldown — skip processing if recently detected.
+            # Non-blocking (monotonic timestamp) so the loop stays responsive
+            # to self.active=False.
+            if time.monotonic() < getattr(self, '_detection_cooldown', 0):
+                continue
+
             if score >= self.THRESHOLD:
                 # Strong detection — trigger immediately
                 _log(f"Hotword detected (strong, score={score:.3f})")
@@ -958,7 +964,7 @@ class HotwordListener:
                 self._model.reset()
                 self._pending_hotword = None
                 self.gui.root.after(0, self._on_hotword)
-                time.sleep(1.5)
+                self._detection_cooldown = time.monotonic() + 1.5
             elif score >= self.CONFIRM_THRESHOLD:
                 # Weak detection — need confirmation
                 pending = getattr(self, '_pending_hotword', None)
@@ -969,7 +975,7 @@ class HotwordListener:
                     self._model.reset()
                     self._pending_hotword = None
                     self.gui.root.after(0, self._on_hotword)
-                    time.sleep(1.5)
+                    self._detection_cooldown = time.monotonic() + 1.5
                 else:
                     # First weak frame — start confirmation window
                     self._pending_hotword = now
@@ -1293,6 +1299,22 @@ class VoiceInputGUI:
         self._speaker_verifier = None
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # SIGTERM handler so _cleanup runs even when minimized to tray
+        # (tray path skips _cleanup intentionally for fast re-wake, so
+        # without this the hotword stream + hotkey context leak on kill).
+        import signal
+        def _sigterm(*_):
+            _log("SIGTERM received; running _cleanup()")
+            try:
+                self._cleanup()
+            finally:
+                os._exit(0)
+        try:
+            signal.signal(signal.SIGTERM, _sigterm)
+        except (ValueError, OSError):
+            # Not on main thread or signal not supported; skip
+            pass
 
         # Start speak queue watcher for talk-back
         self._start_speak_queue_watcher()
@@ -2825,9 +2847,10 @@ class VoiceInputGUI:
         """Periodically transcribe accumulated audio for a live preview."""
         if not self.recording or not self.streaming_var.get():
             return
-        # Parakeet is fast enough that partial preview is unnecessary
+        # Parakeet is fast enough that partial preview is unnecessary;
+        # stop the reschedule loop entirely rather than burning a slot
+        # every 500ms while the engine is active.
         if self._stt_engine and "Parakeet" in (self._stt_engine.engine_name or ""):
-            self.root.after(500, self._stream_partial)
             return
 
         now = time.monotonic()

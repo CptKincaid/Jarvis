@@ -36,6 +36,8 @@ class RecordingController:
         noise_gate_threshold=NOISE_GATE_THRESHOLD,
         on_amplitude=None,
         on_stopped=None,
+        apply_denoise: bool = False,
+        denoise_fn=None,
     ):
         self.sample_rate = sample_rate
         self.silence_threshold = silence_threshold
@@ -43,6 +45,8 @@ class RecordingController:
         self.noise_gate_threshold = noise_gate_threshold
         self.on_amplitude = on_amplitude
         self.on_stopped = on_stopped
+        self.apply_denoise = apply_denoise
+        self.denoise_fn = denoise_fn
 
         self._stream = None
         self._frames = []
@@ -129,6 +133,11 @@ class RecordingController:
                 pass
             self._stream = None
         audio = self.get_audio()
+        if self.apply_denoise and self.denoise_fn is not None and audio.size:
+            try:
+                audio = self.denoise_fn(audio, self.sample_rate)
+            except Exception as e:
+                _log(f"Denoise error: {e}")
         if self.on_stopped is not None:
             self.on_stopped(audio)
         _log(f"Recording stopped ({len(audio)} samples)")
