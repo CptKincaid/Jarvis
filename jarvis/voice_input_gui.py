@@ -1324,21 +1324,10 @@ class VoiceInputGUI:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # SIGTERM handler so _cleanup runs even when minimized to tray
-        # (tray path skips _cleanup intentionally for fast re-wake, so
-        # without this the hotword stream + hotkey context leak on kill).
-        import signal
-        def _sigterm(*_):
-            _log("SIGTERM received; running _cleanup()")
-            try:
-                self._cleanup()
-            finally:
-                os._exit(0)
-        try:
-            signal.signal(signal.SIGTERM, _sigterm)
-        except (ValueError, OSError):
-            # Not on main thread or signal not supported; skip
-            pass
+        # (SIGTERM handler removed — installing Python signal handlers
+        # interacts poorly with Tk's C-level mainloop and was suspected
+        # of causing the auto-record / recording freeze. SIGTERM now
+        # falls back to Python's default behavior.)
 
         # Start speak queue watcher for talk-back
         self._start_speak_queue_watcher()
@@ -5477,37 +5466,64 @@ class VoiceInputGUI:
     # Window target system
     # ------------------------------------------------------------------
     def _get_window_list(self):
-        """Get list of (wid, name) for all visible windows (single wmctrl call)."""
+        """Get list of (wid, name) for all visible windows.
+
+        Prefers wmctrl (single subprocess) when available; falls back to
+        xdotool (N+1 subprocesses) because wmctrl isn't guaranteed to be
+        installed. Previously this path logged a warning on every refresh
+        when wmctrl was missing — now we silently fall back.
+        """
         windows = []
-        own_wid = None
+        own_wid_decimal = None
+        own_wid_hex = None
         try:
             own_wid_int = self.root.winfo_id()
-            # wmctrl returns hex WIDs (0x0...); xdotool uses decimal.
-            # Convert our own decimal WID to the hex wmctrl emits.
-            own_wid = f"0x{own_wid_int:08x}"
+            own_wid_decimal = str(own_wid_int)
+            own_wid_hex = f"0x{own_wid_int:08x}"
         except Exception:
             pass
 
+        # Try wmctrl first — one call
         try:
             result = subprocess.run(
                 ["wmctrl", "-l"], capture_output=True, text=True, timeout=2,
             )
-        except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-            _log(f"Window list error (wmctrl missing/timeout): {e}")
-            return []
-        if result.returncode != 0:
-            return []
+            if result.returncode == 0:
+                for line in result.stdout.strip().splitlines():
+                    parts = line.split(None, 3)
+                    if len(parts) < 4:
+                        continue
+                    wid, _, _, name = parts
+                    if own_wid_hex and wid.lower() == own_wid_hex.lower():
+                        continue
+                    if name and len(name) > 1:
+                        windows.append((wid, name))
+                return windows
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            pass  # Fall through to xdotool
 
-        for line in result.stdout.strip().splitlines():
-            # Format: "<wid> <desktop> <host> <title...>"
-            parts = line.split(None, 3)
-            if len(parts) < 4:
-                continue
-            wid, _, _, name = parts
-            if own_wid and wid.lower() == own_wid.lower():
-                continue
-            if name and len(name) > 1:
-                windows.append((wid, name))
+        # xdotool fallback (original behavior)
+        try:
+            result = subprocess.run(
+                ["xdotool", "search", "--onlyvisible", "--name", ""],
+                capture_output=True, text=True, timeout=3,
+            )
+            for wid in result.stdout.strip().splitlines():
+                wid = wid.strip()
+                if not wid or wid == own_wid_decimal:
+                    continue
+                try:
+                    name_result = subprocess.run(
+                        ["xdotool", "getwindowname", wid],
+                        capture_output=True, text=True, timeout=1,
+                    )
+                    name = name_result.stdout.strip()
+                    if name and len(name) > 1:
+                        windows.append((wid, name))
+                except Exception:
+                    pass
+        except Exception as e:
+            _log(f"Window list error: {e}")
         return windows
 
     def _refresh_window_list(self):
