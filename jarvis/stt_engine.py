@@ -17,15 +17,8 @@ from datetime import datetime
 LOG_DIR = Path("/tmp/vss_voice")
 
 
-def _log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    line = f"{ts} [STT] {msg}"
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG_DIR / "gui_debug.log", "a") as f:
-            f.write(line + "\n")
-    except Exception:
-        pass
+from jarvis.logging import get_logger
+_log = get_logger("STT")
 
 
 @dataclass

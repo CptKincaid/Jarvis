@@ -55,14 +55,8 @@ For multi-step tasks, execute one step at a time.
 User (Hunter) said: {input}"""
 
 
-def _log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    try:
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
-        with open(LOG_DIR / "gui_debug.log", "a") as f:
-            f.write(f"{ts} [Brain] {msg}\n")
-    except Exception:
-        pass
+from jarvis.logging import get_logger
+_log = get_logger("BRAIN")
 
 
 class JarvisBrain:

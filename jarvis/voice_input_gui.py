@@ -141,39 +141,6 @@ def _draw_filled_circle(frame, cx, cy, r, color, alpha):
 FILLER_WORDS = {"uh", "um", "uhh", "umm", "hmm", "hm", "er", "ah", "ehh", "eh",
                 "erm", "uhhh", "ummm"}
 
-# --- Intent detection: is the user talking to the assistant? ---
-# Patterns that strongly suggest assistant-directed speech
-_ASSISTANT_PATTERNS = [
-    # Questions
-    "how do", "how can", "can you", "could you", "would you", "what is",
-    "what are", "what's", "where is", "where's", "why is", "why does",
-    "is there", "are there", "do you", "tell me", "show me", "explain",
-    # Commands
-    "implement", "fix", "create", "make", "build", "add", "remove",
-    "delete", "update", "change", "modify", "run", "check", "test",
-    "start", "stop", "open", "close", "save", "commit", "push",
-    "install", "deploy", "debug", "refactor", "write",
-    # Assistant references
-    "jarvis", "claude", "hey claude",
-    # Technical terms
-    "the code", "the file", "the bug", "the error", "the gui",
-    "the config", "the model", "the script", "the function",
-    "this file", "this code", "this bug",
-    # Action-oriented
-    "let's", "let me", "i want", "i need", "i'd like",
-    "go ahead", "please", "take a look", "look at",
-    "check the screen", "screenshot",
-]
-
-# Patterns that suggest casual/side conversation (not for the assistant)
-_CASUAL_PATTERNS = [
-    "bless her", "bless him", "oh my god", "that's crazy",
-    "no way", "for real", "i know right", "lol", "haha",
-    "she said", "he said", "they said", "she's", "he's",
-    "dude", "bro", "man ", "yo ",
-]
-
-
 class IntentClassifier:
     """Learns whether speech is directed at the assistant or is background chat.
 
@@ -524,14 +491,8 @@ def _apply_voice_commands(text):
     return result.strip()
 
 
-def _log(msg):
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    try:
-        with open(LOG_DIR / "gui_debug.log", "a") as f:
-            f.write(f"{ts} {msg}\n")
-    except Exception:
-        pass
+from jarvis.logging import get_logger
+_log = get_logger("GUI")
 
 
 # ------------------------------------------------------------------

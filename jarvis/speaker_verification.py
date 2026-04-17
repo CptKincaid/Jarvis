@@ -44,13 +44,8 @@ MIN_AUDIO_SECONDS = 1.0
 SAMPLE_RATE = 16000
 
 
-def _log(msg):
-    """Log to the voice input GUI log if available."""
-    try:
-        from jarvis.voice_input_gui import _log as gui_log
-        gui_log(msg)
-    except Exception:
-        print(f"[speaker] {msg}")
+from jarvis.logging import get_logger
+_log = get_logger("VER")
 
 
 MODEL_VERSION = "titanet-large"
