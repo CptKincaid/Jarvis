@@ -22,12 +22,15 @@ MEMORY_FILE = DATA_DIR / "context_memory.json"
 WORKFLOWS_FILE = DATA_DIR / "workflows.json"
 
 
-from jarvis.jarvis_logging import get_logger
-_log = get_logger("AGENT")
-
-
-_VSS = str(Path.home() / "vss_env")
-_JARVIS = str(Path.home() / "jarvis")
+def _log(msg):
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"{ts} [Agent] {msg}"
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "gui_debug.log", "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 class JarvisAgent:
@@ -60,10 +63,7 @@ class JarvisAgent:
 
     def _save_habits(self):
         try:
-            # Atomic write — crash mid-write cannot corrupt the file.
-            tmp = HABITS_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._habits[-500:], indent=2))
-            os.replace(tmp, HABITS_FILE)
+            HABITS_FILE.write_text(json.dumps(self._habits[-500:], indent=2))
         except Exception:
             pass
 
@@ -245,9 +245,7 @@ class JarvisAgent:
         """Define a reusable workflow."""
         self._workflows[name] = steps
         try:
-            tmp = WORKFLOWS_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(self._workflows, indent=2))
-            os.replace(tmp, WORKFLOWS_FILE)
+            WORKFLOWS_FILE.write_text(json.dumps(self._workflows, indent=2))
         except Exception:
             pass
         _log(f"Workflow defined: {name} ({len(steps)} steps)")
@@ -259,9 +257,9 @@ class JarvisAgent:
     # Default workflows
     DEFAULT_WORKFLOWS = {
         "deploy": [
-            ("shell", f"cd {_VSS} && python scripts/agents/test_agent.py"),
-            ("shell", f"cd {_VSS} && python scripts/agents/security_agent.py"),
-            ("shell", f"cd {_VSS} && git add -A && git status -s"),
+            ("shell", "cd /home/hunterp/vss_env && python scripts/agents/test_agent.py"),
+            ("shell", "cd /home/hunterp/vss_env && python scripts/agents/security_agent.py"),
+            ("shell", "cd /home/hunterp/vss_env && git add -A && git status -s"),
             ("speak", "Tests and security scan complete. Ready to commit."),
         ],
         "morning": [
@@ -272,7 +270,7 @@ class JarvisAgent:
         ],
         "training check": [
             ("shell", "nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu --format=csv"),
-            ("shell", f"ls -lt {_VSS}/aiws_system/training_data/*/images/ 2>/dev/null | head -5"),
+            ("shell", "ls -lt /home/hunterp/vss_env/aiws_system/training_data/*/images/ 2>/dev/null | head -5"),
             ("speak", "Training status retrieved."),
         ],
     }
@@ -489,7 +487,7 @@ class JarvisAgent:
     # ------------------------------------------------------------------
     # 9. Git Intelligence
     # ------------------------------------------------------------------
-    def git_summary(self, repo_path=_VSS):
+    def git_summary(self, repo_path="/home/hunterp/vss_env"):
         """Get a quick git status summary."""
         try:
             def _run(cmd):
@@ -551,7 +549,7 @@ class JarvisAgent:
     # ------------------------------------------------------------------
     # 11. File Operations
     # ------------------------------------------------------------------
-    def find_file(self, name, search_dir=_VSS):
+    def find_file(self, name, search_dir="/home/hunterp/vss_env"):
         """Find files matching a name pattern."""
         try:
             r = subprocess.run(
@@ -565,7 +563,7 @@ class JarvisAgent:
         except Exception:
             return []
 
-    def recent_files(self, directory=_VSS, count=5):
+    def recent_files(self, directory="/home/hunterp/vss_env", count=5):
         """List recently modified files."""
         try:
             r = subprocess.run(
@@ -715,7 +713,7 @@ class JarvisAgent:
             r = subprocess.run(
                 command, shell=True, capture_output=True,
                 text=True, timeout=30,
-                cwd=_JARVIS,
+                cwd="/home/hunterp/jarvis",
             )
             output = r.stdout.strip()
             if r.returncode != 0 and r.stderr:

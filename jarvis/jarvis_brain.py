@@ -21,8 +21,7 @@ LOG_DIR = Path("/tmp/vss_voice")
 
 OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = "llama3.2:latest"
-CLAUDE_BIN = str(Path.home() / ".npm-global" / "bin" / "claude")
-_NPM_BIN_PATH = str(Path.home() / ".npm-global" / "bin")
+CLAUDE_BIN = "/home/hunterp/.npm-global/bin/claude"
 
 # Simple questions Ollama can handle
 LOCAL_PATTERNS = [
@@ -56,8 +55,14 @@ For multi-step tasks, execute one step at a time.
 User (Hunter) said: {input}"""
 
 
-from jarvis.jarvis_logging import get_logger
-_log = get_logger("BRAIN")
+def _log(msg):
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "gui_debug.log", "a") as f:
+            f.write(f"{ts} [Brain] {msg}\n")
+    except Exception:
+        pass
 
 
 class JarvisBrain:
@@ -240,7 +245,7 @@ class JarvisBrain:
                 capture_output=True, text=True,
                 timeout=120,
                 env={**os.environ,
-                     "PATH": f"{_NPM_BIN_PATH}:{os.environ.get('PATH', '')}"},
+                     "PATH": f"/home/hunterp/.npm-global/bin:{os.environ.get('PATH', '')}"},
             )
             response = result.stdout.strip()
             _log(f"Claude response: {response[:80]}")
@@ -289,7 +294,7 @@ If something fails, use [SPEAK] to explain and suggest alternatives."""
                     capture_output=True, text=True,
                     timeout=60,
                     env={**os.environ,
-                         "PATH": f"{_NPM_BIN_PATH}:{os.environ.get('PATH', '')}"},
+                         "PATH": f"/home/hunterp/.npm-global/bin:{os.environ.get('PATH', '')}"},
                 )
                 actions = self._parse_response(result.stdout.strip())
             except Exception as e:

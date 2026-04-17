@@ -47,17 +47,9 @@ from collections import deque
 
 import numpy as np
 
-# Ensure jarvis package is importable when this file is run as a script
-# (e.g. `python voice_input_gui.py` from the hotword daemon). Must happen
-# BEFORE any `from jarvis.*` import below.
 SCRIPT_DIR = Path(__file__).resolve().parent.parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
-
-from jarvis.recording import RecordingController
-from jarvis.transcription import TranscriptionPipeline
-from jarvis.dispatcher import CommandDispatcher, CommandHandler
-from jarvis.animation import AnimationRenderer, generate_beep as _generate_beep_samples
 SAMPLE_RATE = 16000
 CHANNELS = 1
 SILENCE_THRESHOLD = 0.04
@@ -99,26 +91,6 @@ WAVEFORM_BARS = 64
 # Noise gate: RMS below this in a block → zero it out
 NOISE_GATE_THRESHOLD = 0.005
 
-# Shell commands allowed without voice confirmation.
-# Anything outside this set requires a spoken "yes" or "confirm".
-SHELL_ALLOWLIST = {
-    "ls", "pwd", "cd", "git", "df", "du", "free", "uptime",
-    "date", "whoami", "hostname", "wc", "cat", "head", "tail",
-    "echo", "which", "whereis", "ps", "top", "env", "printenv",
-    "python", "python3", "pip", "pytest",
-}
-
-
-def is_shell_cmd_allowlisted(shell_cmd: str) -> bool:
-    """Return True iff the first token of shell_cmd is in SHELL_ALLOWLIST.
-
-    Extracted so the classification is unit-testable without a GUI.
-    """
-    tokens = shell_cmd.strip().split()
-    if not tokens:
-        return False
-    return tokens[0] in SHELL_ALLOWLIST
-
 
 def _draw_circle(frame, cx, cy, r, color, alpha):
     """Draw a circle outline onto a numpy RGB frame."""
@@ -154,6 +126,39 @@ def _draw_filled_circle(frame, cx, cy, r, color, alpha):
 # Only pure filler sounds, NOT common words like "like", "so", "well"
 FILLER_WORDS = {"uh", "um", "uhh", "umm", "hmm", "hm", "er", "ah", "ehh", "eh",
                 "erm", "uhhh", "ummm"}
+
+# --- Intent detection: is the user talking to the assistant? ---
+# Patterns that strongly suggest assistant-directed speech
+_ASSISTANT_PATTERNS = [
+    # Questions
+    "how do", "how can", "can you", "could you", "would you", "what is",
+    "what are", "what's", "where is", "where's", "why is", "why does",
+    "is there", "are there", "do you", "tell me", "show me", "explain",
+    # Commands
+    "implement", "fix", "create", "make", "build", "add", "remove",
+    "delete", "update", "change", "modify", "run", "check", "test",
+    "start", "stop", "open", "close", "save", "commit", "push",
+    "install", "deploy", "debug", "refactor", "write",
+    # Assistant references
+    "jarvis", "claude", "hey claude",
+    # Technical terms
+    "the code", "the file", "the bug", "the error", "the gui",
+    "the config", "the model", "the script", "the function",
+    "this file", "this code", "this bug",
+    # Action-oriented
+    "let's", "let me", "i want", "i need", "i'd like",
+    "go ahead", "please", "take a look", "look at",
+    "check the screen", "screenshot",
+]
+
+# Patterns that suggest casual/side conversation (not for the assistant)
+_CASUAL_PATTERNS = [
+    "bless her", "bless him", "oh my god", "that's crazy",
+    "no way", "for real", "i know right", "lol", "haha",
+    "she said", "he said", "they said", "she's", "he's",
+    "dude", "bro", "man ", "yo ",
+]
+
 
 class IntentClassifier:
     """Learns whether speech is directed at the assistant or is background chat.
@@ -226,23 +231,14 @@ class IntentClassifier:
                         else:
                             self._learned_negative.add(ngram)
                             self._learned_positive.discard(ngram)
-        except Exception as e:
-            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-            backup = self.INTENT_LOG.with_suffix(f".json.corrupt.{ts}")
-            try:
-                self.INTENT_LOG.rename(backup)
-                _log(f"Intent log corrupt ({e}); backed up to {backup.name}")
-            except Exception as rename_err:
-                _log(f"Intent log corrupt and unbackup-able: {rename_err}")
+        except Exception:
             self._log_data = []
 
     def _save_log(self):
-        """Save intent log to disk (atomic)."""
+        """Save intent log to disk."""
         try:
             self.INTENT_LOG.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.INTENT_LOG.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self._log_data, indent=2))
-            os.replace(tmp, self.INTENT_LOG)
+            self.INTENT_LOG.write_text(json.dumps(self._log_data, indent=2))
         except Exception:
             pass
 
@@ -431,10 +427,9 @@ STOP_RECORDING_PHRASES = {
 }
 
 # Quick voice commands — "Jarvis, commit" etc.
-_VSS = str(Path.home() / "vss_env")
 QUICK_COMMANDS = {
-    "commit": f"cd {_VSS} && git add -A && git status -s",
-    "run tests": f"cd {_VSS} && python scripts/agents/run_all.py --quick",
+    "commit": "cd /home/hunterp/vss_env && git add -A && git status -s",
+    "run tests": "cd /home/hunterp/vss_env && python scripts/agents/run_all.py --quick",
     "check gpu": "nvidia-smi --query-gpu=name,memory.used,memory.total,utilization.gpu --format=csv",
     "check disk": "df -h / /storage 2>/dev/null",
     "check logs": "tail -20 /tmp/vss_voice/gui_debug.log",
@@ -515,28 +510,32 @@ def _apply_voice_commands(text):
     return result.strip()
 
 
-from jarvis.jarvis_logging import get_logger
-_log = get_logger("GUI")
+def _log(msg):
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    try:
+        with open(LOG_DIR / "gui_debug.log", "a") as f:
+            f.write(f"{ts} {msg}\n")
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------
 # Sound generation (no external files needed)
 # ------------------------------------------------------------------
 def _generate_beep(freq=880, duration_ms=120, volume=0.3):
-    """Generate a short beep as WAV bytes (vectorized)."""
+    """Generate a short beep as WAV bytes."""
     n_samples = int(SAMPLE_RATE * duration_ms / 1000)
-    i = np.arange(n_samples)
-    t = i / SAMPLE_RATE
-    env = np.minimum(i / 200, 1.0) * np.minimum((n_samples - i) / 200, 1.0)
-    samples = (volume * env * 32767 * np.sin(2 * np.pi * freq * t))
-    samples = np.clip(samples, -32767, 32767).astype(np.int16)
-
     buf = io.BytesIO()
     with wave.open(buf, "wb") as w:
         w.setnchannels(1)
         w.setsampwidth(2)
         w.setframerate(SAMPLE_RATE)
-        w.writeframes(samples.tobytes())
+        for i in range(n_samples):
+            t = i / SAMPLE_RATE
+            env = min(i / 200, 1.0) * min((n_samples - i) / 200, 1.0)
+            sample = int(volume * env * 32767 * math.sin(2 * math.pi * freq * t))
+            w.writeframes(struct.pack("<h", max(-32767, min(32767, sample))))
     return buf.getvalue()
 
 
@@ -800,10 +799,6 @@ class HotwordListener:
         self._stream = None
         self._model = None
         self._reopen = False
-        # _stream_lock removed — the race it protected against wasn't
-        # manifesting in practice, and wrapping sounddevice stream
-        # stop/close in a lock is suspected of stalling the recording
-        # path. Defense-in-depth isn't worth a freeze regression.
 
     def start(self):
         if self.active:
@@ -972,12 +967,6 @@ class HotwordListener:
             # Dual-threshold confirmation: need one frame above THRESHOLD
             # OR two frames above CONFIRM_THRESHOLD within CONFIRM_WINDOW
             now = time.monotonic()
-            # Detection cooldown — skip processing if recently detected.
-            # Non-blocking (monotonic timestamp) so the loop stays responsive
-            # to self.active=False.
-            if time.monotonic() < getattr(self, '_detection_cooldown', 0):
-                continue
-
             if score >= self.THRESHOLD:
                 # Strong detection — trigger immediately
                 _log(f"Hotword detected (strong, score={score:.3f})")
@@ -985,7 +974,7 @@ class HotwordListener:
                 self._model.reset()
                 self._pending_hotword = None
                 self.gui.root.after(0, self._on_hotword)
-                self._detection_cooldown = time.monotonic() + 1.5
+                time.sleep(1.5)
             elif score >= self.CONFIRM_THRESHOLD:
                 # Weak detection — need confirmation
                 pending = getattr(self, '_pending_hotword', None)
@@ -996,7 +985,7 @@ class HotwordListener:
                     self._model.reset()
                     self._pending_hotword = None
                     self.gui.root.after(0, self._on_hotword)
-                    self._detection_cooldown = time.monotonic() + 1.5
+                    time.sleep(1.5)
                 else:
                     # First weak frame — start confirmation window
                     self._pending_hotword = now
@@ -1321,11 +1310,6 @@ class VoiceInputGUI:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
-        # (SIGTERM handler removed — installing Python signal handlers
-        # interacts poorly with Tk's C-level mainloop and was suspected
-        # of causing the auto-record / recording freeze. SIGTERM now
-        # falls back to Python's default behavior.)
-
         # Start speak queue watcher for talk-back
         self._start_speak_queue_watcher()
 
@@ -1471,11 +1455,7 @@ class VoiceInputGUI:
         }
         try:
             SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
-            # Atomic write: write to .tmp then rename so a crash mid-write
-            # cannot leave a truncated settings.json that fails to parse.
-            tmp_path = SETTINGS_FILE.with_suffix(".tmp")
-            tmp_path.write_text(json.dumps(data, indent=2))
-            os.replace(tmp_path, SETTINGS_FILE)
+            SETTINGS_FILE.write_text(json.dumps(data, indent=2))
         except Exception as e:
             _log(f"Settings save error: {e}")
 
@@ -2726,6 +2706,11 @@ class VoiceInputGUI:
             target=self._transcribe_worker, args=(audio,), daemon=True
         ).start()
 
+    def _get_whisper_language(self):
+        """Get the language code for Whisper from current selection."""
+        lang_name = self.lang_var.get()
+        return self._lang_map.get(lang_name, "en")
+
     def _transcribe_worker(self, audio):
         try:
             # Speaker verification — filter to only user's voice segments
@@ -2856,10 +2841,9 @@ class VoiceInputGUI:
         """Periodically transcribe accumulated audio for a live preview."""
         if not self.recording or not self.streaming_var.get():
             return
-        # Parakeet is fast enough that partial preview is unnecessary;
-        # stop the reschedule loop entirely rather than burning a slot
-        # every 500ms while the engine is active.
+        # Parakeet is fast enough that partial preview is unnecessary
         if self._stt_engine and "Parakeet" in (self._stt_engine.engine_name or ""):
+            self.root.after(500, self._stream_partial)
             return
 
         now = time.monotonic()
@@ -2889,13 +2873,13 @@ class VoiceInputGUI:
         """
         with self._partial_lock:
             try:
-                # Route through the unified STT engine (Parakeet primary,
-                # Whisper fallback). Skip cleanly if STT isn't loaded yet
-                # so the preview worker can't crash with AttributeError.
-                if self._stt_engine is None or not self._stt_engine.is_loaded:
-                    return
-                result = self._stt_engine.transcribe(audio)
-                text = (result.text or "").strip()
+                lang = self._get_whisper_language()
+                kwargs = dict(beam_size=1, initial_prompt=_load_vocab())
+                if lang is not None:
+                    kwargs["language"] = lang
+
+                segments, _ = self._whisper_model.transcribe(audio, **kwargs)
+                text = " ".join(seg.text.strip() for seg in segments).strip()
 
                 if text and self.recording:
                     self._partial_text = text
@@ -3530,26 +3514,25 @@ class VoiceInputGUI:
         run_match = re.match(r"(?:run|execute|shell)\s+(.+)", cmd_text)
         if run_match:
             shell_cmd = run_match.group(1).strip()
-            if is_shell_cmd_allowlisted(shell_cmd):
-                _log(f"Shell command (allowlisted): {shell_cmd}")
-                self._set_status("Running...", self.ACCENT, shell_cmd[:30])
-                self._run_shell_async(shell_cmd)
-            else:
-                _log(f"Shell command requires confirmation: {shell_cmd}")
-                self._set_status("Confirming...", self.YELLOW,
-                                 "Say yes to run")
-                threading.Thread(
-                    target=self._confirm_and_run_shell,
-                    args=(shell_cmd,),
-                    daemon=True,
-                ).start()
+            _log(f"Shell command: {shell_cmd}")
+            self._set_status("Running...", self.ACCENT, shell_cmd[:30])
+            def _run():
+                output = self._agent.run_shell(shell_cmd)
+                self.root.after(0, lambda: self._show_jarvis_text(
+                    f"$ {shell_cmd}\n{output}"))
+                self.root.after(0, lambda: self._set_status(
+                    "Ready", self.GREEN, "Command done"))
+                if self.talkback_var.get() and len(output) < 200:
+                    from jarvis.jarvis_speak_queue import say
+                    say(f"Result: {output[:100]}")
+            threading.Thread(target=_run, daemon=True).start()
             return True
 
         # "count lines in <file>"
         count_match = re.match(r"count (?:the )?lines? in (.+)", cmd_text)
         if count_match:
             filename = count_match.group(1).strip()
-            output = self._agent.run_shell(f"wc -l {filename} 2>/dev/null || find {Path.home()} -name '{filename}' -exec wc -l {{}} + 2>/dev/null | tail -1")
+            output = self._agent.run_shell(f"wc -l {filename} 2>/dev/null || find /home/hunterp -name '{filename}' -exec wc -l {{}} + 2>/dev/null | tail -1")
             self._show_jarvis_text(output)
             if self.talkback_var.get():
                 from jarvis.jarvis_speak_queue import say
@@ -3658,67 +3641,6 @@ class VoiceInputGUI:
             return True
 
         return False
-
-    def _run_shell_async(self, shell_cmd):
-        """Run a shell command in a daemon thread; display + optionally speak the result."""
-        def _run():
-            output = self._agent.run_shell(shell_cmd)
-            self.root.after(0, lambda: self._show_jarvis_text(
-                f"$ {shell_cmd}\n{output}"))
-            self.root.after(0, lambda: self._set_status(
-                "Ready", self.GREEN, "Command done"))
-            if self.talkback_var.get() and len(output) < 200:
-                from jarvis.jarvis_speak_queue import say
-                say(f"Result: {output[:100]}")
-        threading.Thread(target=_run, daemon=True).start()
-
-    def _confirm_and_run_shell(self, shell_cmd):
-        """Prompt for voice confirmation, then run shell_cmd iff user said yes/confirm."""
-        import sounddevice as sd
-
-        tts = self._get_tts()
-        hotword_was_active = self.hotword_var.get()
-        if hotword_was_active:
-            self._hotword.pause()
-        try:
-            tts.speak(f"Confirm: run {shell_cmd}?", block=True)
-
-            try:
-                audio = sd.rec(int(3 * SAMPLE_RATE),
-                               samplerate=SAMPLE_RATE,
-                               channels=1, dtype="float32")
-                sd.wait()
-            except Exception as e:
-                _log(f"Confirm recording error: {e}")
-                self.root.after(0, lambda: self._set_status(
-                    "Ready", self.GREEN, "Confirmation failed"))
-                return
-
-            audio_flat = audio.flatten() if audio.ndim > 1 else audio
-            if self._stt_engine is None or not self._stt_engine.is_loaded:
-                _log("Confirm: STT not loaded; refusing")
-                self.root.after(0, lambda: self._set_status(
-                    "Ready", self.GREEN, "Refused (STT not ready)"))
-                return
-
-            result = self._stt_engine.transcribe(audio_flat)
-            transcript = (result.text or "").strip().lower()
-            _log(f"Confirm transcript: {transcript!r}")
-
-            if "yes" in transcript or "confirm" in transcript:
-                _log(f"Confirm accepted; running: {shell_cmd}")
-                self.root.after(0, lambda: self._set_status(
-                    "Running...", self.ACCENT, shell_cmd[:30]))
-                self._run_shell_async(shell_cmd)
-            else:
-                _log(f"Confirm rejected: {transcript!r}")
-                self.root.after(0, lambda: self._show_jarvis_text(
-                    f"Refused: {shell_cmd} (heard: {transcript!r})"))
-                self.root.after(0, lambda: self._set_status(
-                    "Ready", self.GREEN, "Refused"))
-        finally:
-            if hotword_was_active:
-                self._hotword.resume()
 
     def _run_quick_command(self, name, shell_cmd):
         """Execute a quick command and speak the result."""
@@ -4414,6 +4336,109 @@ class VoiceInputGUI:
                 S // 2, S // 2, anchor="center", image=self._orbit_photo)
         self._orbit_pending = None
 
+    def _render_orbit_frame(self, amp, t, particles):
+        """Render orbit — numpy glow center + PIL particles."""
+        from PIL import Image, ImageDraw
+
+        S = self._orbit_size  # 220
+        cx, cy = S // 2, S // 2 - 5
+        bg_r, bg_g, bg_b = self._orbit_bg
+
+        # --- Arc Reactor center (numpy) ---
+        frame = np.full((S, S, 3), [bg_r, bg_g, bg_b], dtype=np.uint8)
+
+        # Outer ambient glow
+        glow_r = int(45 + amp * 35)
+        y_c, x_c = np.ogrid[-cy:S - cy, -cx:S - cx]
+        dist_sq = x_c * x_c + y_c * y_c
+        glow_mask = dist_sq < glow_r * glow_r
+        if glow_mask.any():
+            dist = np.sqrt(dist_sq[glow_mask].astype(np.float32))
+            intensity = (1.0 - dist / glow_r) * (0.10 + amp * 0.20)
+            intensity = np.clip(intensity, 0, 1)
+            for ch, target in enumerate([6, 182, 212]):
+                cur = frame[glow_mask, ch].astype(np.float32)
+                frame[glow_mask, ch] = np.clip(
+                    cur + (target - cur) * intensity, 0, 255
+                ).astype(np.uint8)
+
+        # Concentric arc reactor rings
+        ring_alpha = 0.25 + amp * 0.35
+        _draw_circle(frame, cx, cy, 38, (6, 182, 212), ring_alpha * 0.3)
+        _draw_circle(frame, cx, cy, 32, (6, 182, 212), ring_alpha * 0.5)
+        _draw_circle(frame, cx, cy, 24, (6, 182, 212), ring_alpha * 0.7)
+        _draw_circle(frame, cx, cy, 16, (103, 232, 249), ring_alpha)
+
+        # Reactor segments — small bright dots on the middle ring
+        seg_count = 10
+        seg_r = 32
+        for i in range(seg_count):
+            angle = (i / seg_count) * math.pi * 2 + t * 0.5
+            sx = int(cx + math.cos(angle) * seg_r)
+            sy = int(cy + math.sin(angle) * seg_r)
+            _draw_filled_circle(frame, sx, sy, 2, (103, 232, 249),
+                                0.5 + amp * 0.4)
+
+        # Bright center core with glow
+        core_r = max(6, int(7 + amp * 3))
+        core_glow_r = core_r + 12
+        dg_y1 = max(0, cy - core_glow_r)
+        dg_y2 = min(S, cy + core_glow_r + 1)
+        dg_x1 = max(0, cx - core_glow_r)
+        dg_x2 = min(S, cx + core_glow_r + 1)
+        yy, xx = np.ogrid[dg_y1 - cy:dg_y2 - cy, dg_x1 - cx:dg_x2 - cx]
+        d_dist = np.sqrt((xx * xx + yy * yy).astype(np.float32))
+        d_mask = d_dist < core_glow_r
+        region = frame[dg_y1:dg_y2, dg_x1:dg_x2]
+        d_int = np.clip((1 - d_dist / core_glow_r) * (0.6 + amp * 0.4), 0, 1)
+        for ch, tgt in enumerate([103, 232, 249]):
+            cur = region[:, :, ch].astype(np.float32)
+            cur[d_mask] += (tgt - cur[d_mask]) * d_int[d_mask]
+            region[:, :, ch] = np.clip(cur, 0, 255).astype(np.uint8)
+        _draw_filled_circle(frame, cx, cy, core_r, (150, 240, 255), 0.95)
+
+        # --- Particles using PIL (smooth anti-aliased ellipses) ---
+        img = Image.fromarray(frame, "RGB").convert("RGBA")
+        draw = ImageDraw.Draw(img)
+
+        for p in particles:
+            ring = p["ring"]
+            # Fixed radius orbit with sporadic jitter
+            wobble = math.sin(t * 2.5 + p["phase"]) * 3
+            r = p["base_r"] + wobble
+
+            # Sporadic movement — random-ish offset that changes with time
+            jx = math.sin(t * 3.7 + p["phase"] * 2.3) * (2 + amp * 5)
+            jy = math.cos(t * 4.1 + p["phase"] * 1.7) * (2 + amp * 5)
+
+            x = cx + math.cos(p["angle"]) * r + jx
+            y = cy + math.sin(p["angle"]) * r + jy
+
+            alpha = 0.2 + amp * 0.6 * (1 - ring * 0.1)
+            size = max(1, p["size"] * (0.5 + amp * 0.3))
+            a = int(alpha * 255)
+
+            if ring % 2 == 0:
+                color = (6, 182, 212, a)
+            else:
+                color = (103, 232, 249, int(a * 0.8))
+
+            draw.ellipse([x - size, y - size, x + size, y + size],
+                         fill=color)
+
+        # Voice ID indicator ring
+        if self.recording and self.speaker_verify_var.get():
+            voice_match = getattr(self, '_voice_id_match', False)
+            vr = S // 2 - 8
+            if voice_match:
+                draw.ellipse([cx - vr, cy - vr, cx + vr, cy + vr],
+                             outline=(63, 185, 80, 100), width=1)
+            else:
+                draw.ellipse([cx - vr, cy - vr, cx + vr, cy + vr],
+                             outline=(80, 40, 40, 50), width=1)
+
+        return img.convert("RGB")
+
     # ------------------------------------------------------------------
     # Recording timer
     # ------------------------------------------------------------------
@@ -4599,25 +4624,9 @@ class VoiceInputGUI:
         """Detect Claude Code terminal by its spinner-prefixed title."""
         return bool(name) and ord(name[0]) > 127 and len(name) > 1 and name[1] == ' '
 
-    _claude_wid_cache: tuple | None = None  # (wid, expires_monotonic)
-
-    @classmethod
-    def _find_claude_terminal(cls):
-        """Find the Claude Code terminal window ID, or None (5s TTL cache)."""
-        now = time.monotonic()
-        cached = cls._claude_wid_cache
-        if cached is not None:
-            wid, expires = cached
-            if now < expires:
-                return wid
-
-        wid = cls._lookup_claude_terminal_uncached()
-        cls._claude_wid_cache = (wid, now + 5.0)
-        return wid
-
     @staticmethod
-    def _lookup_claude_terminal_uncached():
-        """Uncached lookup — scans terminals for Claude's spinner-prefixed title."""
+    def _find_claude_terminal():
+        """Find the Claude Code terminal window ID, or None."""
         try:
             result = subprocess.run(
                 ["xdotool", "search", "--class", "terminal"],
@@ -4856,9 +4865,6 @@ class VoiceInputGUI:
 
     def _start_speak_queue_watcher(self):
         """Watch the speak queue file for new lines from Claude."""
-        from jarvis.speak_queue_auth import _ensure_queue_dir
-        _ensure_queue_dir()
-
         speak_file = Path("/tmp/vss_voice/speak_queue.txt")
         self._speak_queue_pos = 0
 
@@ -4869,9 +4875,7 @@ class VoiceInputGUI:
         self._watch_speak_queue()
 
     def _watch_speak_queue(self):
-        """Poll the speak queue file for new HMAC-signed lines."""
-        from jarvis.speak_queue_auth import verify
-
+        """Poll the speak queue file for new Jarvis: lines."""
         if not self.talkback_var.get():
             self.root.after(2000, self._watch_speak_queue)
             return
@@ -4892,18 +4896,10 @@ class VoiceInputGUI:
                         new_lines = f.read()
                     self._speak_queue_pos = size
 
-                    verified = []
-                    for line in new_lines.strip().splitlines():
-                        line = line.strip()
-                        if not line:
-                            continue
-                        payload = verify(line)
-                        if payload is None:
-                            _log("Speak queue: dropped unsigned line")
-                            continue
-                        verified.append(payload)
-
-                    combined = " ".join(verified)
+                    combined = " ".join(
+                        l.strip() for l in new_lines.strip().splitlines()
+                        if l.strip()
+                    )
                     if combined:
                         _log(f"Talk-back queue: {combined[:60]}")
                         self.root.after(0, lambda: self._set_status(
@@ -5450,51 +5446,22 @@ class VoiceInputGUI:
     # Window target system
     # ------------------------------------------------------------------
     def _get_window_list(self):
-        """Get list of (wid, name) for all visible windows.
-
-        Prefers wmctrl (single subprocess) when available; falls back to
-        xdotool (N+1 subprocesses) because wmctrl isn't guaranteed to be
-        installed. Previously this path logged a warning on every refresh
-        when wmctrl was missing — now we silently fall back.
-        """
+        """Get list of (wid, name) for all visible windows."""
         windows = []
-        own_wid_decimal = None
-        own_wid_hex = None
-        try:
-            own_wid_int = self.root.winfo_id()
-            own_wid_decimal = str(own_wid_int)
-            own_wid_hex = f"0x{own_wid_int:08x}"
-        except Exception:
-            pass
-
-        # Try wmctrl first — one call
-        try:
-            result = subprocess.run(
-                ["wmctrl", "-l"], capture_output=True, text=True, timeout=2,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.strip().splitlines():
-                    parts = line.split(None, 3)
-                    if len(parts) < 4:
-                        continue
-                    wid, _, _, name = parts
-                    if own_wid_hex and wid.lower() == own_wid_hex.lower():
-                        continue
-                    if name and len(name) > 1:
-                        windows.append((wid, name))
-                return windows
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            pass  # Fall through to xdotool
-
-        # xdotool fallback (original behavior)
         try:
             result = subprocess.run(
                 ["xdotool", "search", "--onlyvisible", "--name", ""],
                 capture_output=True, text=True, timeout=3,
             )
+            own_wid = None
+            try:
+                own_wid = str(self.root.winfo_id())
+            except Exception:
+                pass
+
             for wid in result.stdout.strip().splitlines():
                 wid = wid.strip()
-                if not wid or wid == own_wid_decimal:
+                if not wid or wid == own_wid:
                     continue
                 try:
                     name_result = subprocess.run(
@@ -5782,6 +5749,11 @@ class VoiceInputGUI:
         """Release all resources — mic, hotword, tray, global hotkey, browser."""
         self.recording = False
         # Shut down orbit server if running
+        if hasattr(self, '_orbit_server') and self._orbit_server:
+            try:
+                self._orbit_server.shutdown()
+            except Exception:
+                pass
         if hasattr(self, '_orbit_server') and self._orbit_server:
             try:
                 self._orbit_server.shutdown()

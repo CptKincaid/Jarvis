@@ -17,8 +17,15 @@ from pathlib import Path
 MEMORY_DIR = Path.home() / ".aiws_trainer" / "jarvis_memory"
 
 
-from jarvis.jarvis_logging import get_logger
-_log = get_logger("MEM")
+def _log(msg):
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    try:
+        log_dir = Path("/tmp/vss_voice")
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "gui_debug.log", "a") as f:
+            f.write(f"{ts} [Memory] {msg}\n")
+    except Exception:
+        pass
 
 
 class JarvisMemory:
@@ -46,12 +53,7 @@ class JarvisMemory:
 
     def _save(self, filename, data):
         try:
-            target = MEMORY_DIR / filename
-            # Atomic write — crash mid-write cannot corrupt persistent state.
-            tmp = target.with_suffix(".tmp")
-            tmp.write_text(json.dumps(data, indent=2))
-            import os
-            os.replace(tmp, target)
+            (MEMORY_DIR / filename).write_text(json.dumps(data, indent=2))
         except Exception as e:
             _log(f"Save error ({filename}): {e}")
 

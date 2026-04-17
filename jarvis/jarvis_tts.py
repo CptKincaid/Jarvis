@@ -23,8 +23,15 @@ VOICE_REF = Path.home() / ".aiws_trainer" / "jarvis_voice_ref.wav"
 LOG_DIR = Path("/tmp/vss_voice")
 
 
-from jarvis.jarvis_logging import get_logger
-_log = get_logger("TTS")
+def _log(msg):
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    line = f"{ts} [TTS] {msg}"
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "gui_debug.log", "a") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
 
 
 class JarvisTTS:
@@ -32,7 +39,7 @@ class JarvisTTS:
 
     MAX_SPEAK_LENGTH = 500
 
-    def __init__(self, gpu=1, engine="f5"):
+    def __init__(self, gpu=1, engine="kokoro"):
         self._xtts = None
         self._kokoro = None
         self._gpu = gpu

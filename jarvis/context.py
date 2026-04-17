@@ -20,8 +20,14 @@ from pathlib import Path
 LOG_DIR = Path("/tmp/vss_voice")
 
 
-from jarvis.jarvis_logging import get_logger
-_log = get_logger("CTX")
+def _log(msg):
+    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
+    try:
+        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        with open(LOG_DIR / "gui_debug.log", "a") as f:
+            f.write(f"{ts} [Context] {msg}\n")
+    except Exception:
+        pass
 
 
 class ContextEngine:
@@ -29,8 +35,8 @@ class ContextEngine:
 
     CACHE_TTL = 30  # seconds
 
-    def __init__(self, project_dir=str(Path.home() / "jarvis"),
-                 vss_dir=str(Path.home() / "vss_env")):
+    def __init__(self, project_dir="/home/hunterp/jarvis",
+                 vss_dir="/home/hunterp/vss_env"):
         self._cache = {}
         self._cache_times = {}
         self._conversation = []
