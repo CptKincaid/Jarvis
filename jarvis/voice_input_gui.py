@@ -91,6 +91,15 @@ WAVEFORM_BARS = 64
 # Noise gate: RMS below this in a block → zero it out
 NOISE_GATE_THRESHOLD = 0.005
 
+# Shell commands allowed without voice confirmation.
+# Anything outside this set requires a spoken "yes" or "confirm".
+SHELL_ALLOWLIST = {
+    "ls", "pwd", "cd", "git", "df", "du", "free", "uptime",
+    "date", "whoami", "hostname", "wc", "cat", "head", "tail",
+    "echo", "which", "whereis", "ps", "top", "env", "printenv",
+    "python", "python3", "pip", "pytest",
+}
+
 
 def _draw_circle(frame, cx, cy, r, color, alpha):
     """Draw a circle outline onto a numpy RGB frame."""
@@ -3514,18 +3523,20 @@ class VoiceInputGUI:
         run_match = re.match(r"(?:run|execute|shell)\s+(.+)", cmd_text)
         if run_match:
             shell_cmd = run_match.group(1).strip()
-            _log(f"Shell command: {shell_cmd}")
-            self._set_status("Running...", self.ACCENT, shell_cmd[:30])
-            def _run():
-                output = self._agent.run_shell(shell_cmd)
-                self.root.after(0, lambda: self._show_jarvis_text(
-                    f"$ {shell_cmd}\n{output}"))
-                self.root.after(0, lambda: self._set_status(
-                    "Ready", self.GREEN, "Command done"))
-                if self.talkback_var.get() and len(output) < 200:
-                    from jarvis.jarvis_speak_queue import say
-                    say(f"Result: {output[:100]}")
-            threading.Thread(target=_run, daemon=True).start()
+            first_token = shell_cmd.split()[0] if shell_cmd.split() else ""
+            if first_token in SHELL_ALLOWLIST:
+                _log(f"Shell command (allowlisted): {shell_cmd}")
+                self._set_status("Running...", self.ACCENT, shell_cmd[:30])
+                self._run_shell_async(shell_cmd)
+            else:
+                _log(f"Shell command requires confirmation: {shell_cmd}")
+                self._set_status("Confirming...", self.YELLOW,
+                                 "Say yes to run")
+                threading.Thread(
+                    target=self._confirm_and_run_shell,
+                    args=(shell_cmd,),
+                    daemon=True,
+                ).start()
             return True
 
         # "count lines in <file>"
@@ -3641,6 +3652,67 @@ class VoiceInputGUI:
             return True
 
         return False
+
+    def _run_shell_async(self, shell_cmd):
+        """Run a shell command in a daemon thread; display + optionally speak the result."""
+        def _run():
+            output = self._agent.run_shell(shell_cmd)
+            self.root.after(0, lambda: self._show_jarvis_text(
+                f"$ {shell_cmd}\n{output}"))
+            self.root.after(0, lambda: self._set_status(
+                "Ready", self.GREEN, "Command done"))
+            if self.talkback_var.get() and len(output) < 200:
+                from jarvis.jarvis_speak_queue import say
+                say(f"Result: {output[:100]}")
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _confirm_and_run_shell(self, shell_cmd):
+        """Prompt for voice confirmation, then run shell_cmd iff user said yes/confirm."""
+        import sounddevice as sd
+
+        tts = self._get_tts()
+        hotword_was_active = self.hotword_var.get()
+        if hotword_was_active:
+            self._hotword.pause()
+        try:
+            tts.speak(f"Confirm: run {shell_cmd}?", block=True)
+
+            try:
+                audio = sd.rec(int(3 * SAMPLE_RATE),
+                               samplerate=SAMPLE_RATE,
+                               channels=1, dtype="float32")
+                sd.wait()
+            except Exception as e:
+                _log(f"Confirm recording error: {e}")
+                self.root.after(0, lambda: self._set_status(
+                    "Ready", self.GREEN, "Confirmation failed"))
+                return
+
+            audio_flat = audio.flatten() if audio.ndim > 1 else audio
+            if self._stt_engine is None or not self._stt_engine.is_loaded:
+                _log("Confirm: STT not loaded; refusing")
+                self.root.after(0, lambda: self._set_status(
+                    "Ready", self.GREEN, "Refused (STT not ready)"))
+                return
+
+            result = self._stt_engine.transcribe(audio_flat)
+            transcript = (result.text or "").strip().lower()
+            _log(f"Confirm transcript: {transcript!r}")
+
+            if "yes" in transcript or "confirm" in transcript:
+                _log(f"Confirm accepted; running: {shell_cmd}")
+                self.root.after(0, lambda: self._set_status(
+                    "Running...", self.ACCENT, shell_cmd[:30]))
+                self._run_shell_async(shell_cmd)
+            else:
+                _log(f"Confirm rejected: {transcript!r}")
+                self.root.after(0, lambda: self._show_jarvis_text(
+                    f"Refused: {shell_cmd} (heard: {transcript!r})"))
+                self.root.after(0, lambda: self._set_status(
+                    "Ready", self.GREEN, "Refused"))
+        finally:
+            if hotword_was_active:
+                self._hotword.resume()
 
     def _run_quick_command(self, name, shell_cmd):
         """Execute a quick command and speak the result."""
