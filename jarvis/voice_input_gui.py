@@ -234,10 +234,12 @@ class IntentClassifier:
             self._log_data = []
 
     def _save_log(self):
-        """Save intent log to disk."""
+        """Save intent log to disk (atomic)."""
         try:
             self.INTENT_LOG.parent.mkdir(parents=True, exist_ok=True)
-            self.INTENT_LOG.write_text(json.dumps(self._log_data, indent=2))
+            tmp = self.INTENT_LOG.with_suffix(".json.tmp")
+            tmp.write_text(json.dumps(self._log_data, indent=2))
+            os.replace(tmp, self.INTENT_LOG)
         except Exception:
             pass
 
