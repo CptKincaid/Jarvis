@@ -121,12 +121,40 @@ class IntentClassifier:
         "the config", "the model", "the script", "the function",
         "this file", "this code", "this bug",
         "let's", "let me", "i want", "i need", "i'd like",
+        # --- assistant vocabulary (timers, media, calendar, mail) ---
+        # Absent until 2026-08-27, so "play some jazz", "volume up" and
+        # "remind me to call the supplier" were classified NO and dropped
+        # silently -- and only UNCERTAIN ever prompts, so the feedback loop
+        # could never learn its way out of it.
+        "remind", "timer", "alarm", "wake me", "snooze",
+        "play", "pause", "resume", "skip", "next track", "previous track",
+        "volume", "turn up", "turn down", "mute", "louder", "quieter",
+        "read me", "read the", "what time", "the time",
+        "weather", "forecast", "temperature",
+        "calendar", "schedule", "agenda", "my day", "briefing", "brief me",
+        "note", "email", "inbox", "message",
+        "set a", "set an", "set the", "cancel",
+        "how long", "how many", "when is", "when's",
+        "summarize", "summarise", "look up", "search for", "give me",
+        "terminal", "spotify", "music", "song", "track", "playlist",
         "go ahead", "please", "take a look", "look at",
         "check the screen", "screenshot", "take a screenshot",
         "take screenshot",
     ]
 
     # Patterns that suggest casual/side conversation
+    # Verbs that make a 1-3 word utterance a command outright.
+    _SHORT_COMMAND_VERBS = (
+        "run", "fix", "check", "stop", "test", "take",
+        "commit", "push", "show", "open", "screenshot",
+        "save", "deploy", "start", "build", "install",
+        # assistant-era, added 2026-08-27
+        "play", "pause", "resume", "skip", "next", "back",
+        "mute", "unmute", "snooze", "cancel", "read", "set",
+        "call", "remind", "close", "quit", "louder", "quieter",
+        "volume", "repeat", "again",
+    )
+
     _NEGATIVE_PATTERNS = [
         "bless her", "bless him", "oh my god", "that's crazy",
         "no way", "for real", "i know right", "lol", "haha",
@@ -213,13 +241,14 @@ class IntentClassifier:
 
         # Very short reactions (1-3 words)
         if len(words) <= 3:
-            if any(lower.startswith(p) for p in (
-                    "run", "fix", "check", "stop", "test", "take",
-                    "commit", "push", "show", "open", "screenshot",
-                    "save", "deploy", "start", "build", "install")):
+            if any(lower.startswith(p) for p in self._SHORT_COMMAND_VERBS):
                 return self.YES, 0.9
             if "screenshot" in lower:
                 return self.YES, 0.9
+            # A short command can carry no verb from that list at all --
+            # "volume up", "next track", "snooze" are vocabulary, not syntax.
+            if any(pattern in lower for pattern in self._POSITIVE_PATTERNS):
+                return self.YES, 0.85
             if lower.endswith("?"):
                 return self.YES, 0.8
             return self.NO, 0.8
@@ -243,9 +272,10 @@ class IntentClassifier:
         pronoun_count = sum(1 for w in words if w in other_pronouns)
         neg_score += pronoun_count * 0.5
 
-        # Long text without positive signals
-        if len(words) >= 8 and pos_score == 0:
-            neg_score += 1
+        # (Removed: "len(words) >= 8 and pos_score == 0 -> neg_score += 1".
+        # Length says nothing about who you are talking to, and it was what
+        # pushed "remind me to call the supplier at four" to NO 1.00 -- a real
+        # command, discarded with no prompt.)
 
         # --- Learned patterns from feedback ---
         for n in (2, 3):

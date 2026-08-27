@@ -103,3 +103,63 @@ def test_log_capped_at_500(clf):
     for i in range(510):
         clf.log_feedback(f"sample utterance number {i} words", True)
     assert clf.num_examples == 500
+
+
+# ---------------------------------------------- assistant-era vocabulary
+#
+# _POSITIVE_PATTERNS was written when Jarvis was a coding assistant: fix,
+# commit, push, refactor, "the bug", "the file". It never learned the
+# vocabulary that arrived with timers, alarms, media, calendar and mail, so
+# on a clean install real commands were being classified NO and discarded
+# SILENTLY -- no card, no prompt, no way for the feedback loop to correct it,
+# because only UNCERTAIN ever asks. Measured before the fix: "play some jazz",
+# "volume up", "next track" and "snooze" were all NO 0.80, and "remind me to
+# call the supplier at four" was NO 1.00.
+#
+# A false NO is the expensive error here. Anything reaching this classifier
+# already cleared the wake word AND the speaker gate, so it is the enrolled
+# user talking to Jarvis on purpose; refusing to hear them is worse than
+# occasionally acting on something they were only half-asking for.
+ASSISTANT_COMMANDS = [
+    "set a timer for ten minutes", "set an alarm for seven am",
+    "remind me to call the supplier at four", "wake me at six thirty",
+    "snooze", "cancel the timer",
+    "play some jazz", "play some miles davis", "pause the music",
+    "next track", "skip this song", "volume up", "turn the volume down",
+    "mute", "what time is it", "what's the weather tomorrow",
+    "what's on my calendar today", "read me the last message",
+    "summarize my day for me", "add a note about the supplier",
+    "check my email", "how long until the meeting",
+]
+
+BACKGROUND_CHATTER = [
+    "oh my god that's crazy lol haha",
+    "she said he told them about her party yesterday",
+    "yeah totally", "hi", "",
+]
+
+
+@pytest.mark.parametrize("text", ASSISTANT_COMMANDS)
+def test_assistant_commands_are_not_discarded(clf, text):
+    """The regression that mattered: never silently NO on a real command."""
+    label, conf = clf.classify(text)
+    assert label != IntentClassifier.NO, f"{text!r} would be silently dropped"
+
+
+@pytest.mark.parametrize("text", ASSISTANT_COMMANDS)
+def test_assistant_commands_route_without_asking(clf, text):
+    """...and they should not need a card either; that is just friction."""
+    label, conf = clf.classify(text)
+    assert label == IntentClassifier.YES, f"{text!r} -> {label} {conf}"
+
+
+@pytest.mark.parametrize("text", BACKGROUND_CHATTER)
+def test_background_chatter_is_still_dropped(clf, text):
+    assert clf.classify(text)[0] == IntentClassifier.NO, text
+
+
+def test_length_alone_is_not_evidence_against_a_command(clf):
+    """`len(words) >= 8 and pos_score == 0` used to push long unmatched
+    commands to NO. Length is not evidence about who you are talking to."""
+    label, _ = clf.classify("remind me to call the supplier at four o'clock")
+    assert label == IntentClassifier.YES
