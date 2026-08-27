@@ -6,8 +6,8 @@ When it hears "Hey Jarvis", it optionally verifies the speaker against the
 enrolled voiceprint before launching the GUI.
 
 Usage:
-    python scripts/utilities/hotword_daemon.py           # Run in foreground
-    python scripts/utilities/hotword_daemon.py --daemon   # Run daemonized
+    python scripts/hotword_daemon.py           # Run in foreground
+    python scripts/hotword_daemon.py --daemon   # Run daemonized
 
 Systemd service: ~/.config/systemd/user/aiws-hotword.service
 """
@@ -27,11 +27,14 @@ import numpy as np
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
-VENV_DIR = Path(__file__).resolve().parent.parent.parent
-VENV_PYTHON = VENV_DIR / "bin" / "python3"
-GUI_SCRIPT = VENV_DIR / "jarvis" / "voice_input_gui.py"
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))   # so `import jarvis.*` works
+
+_VSS_PYTHON = Path.home() / "vss_env" / "bin" / "python"
+VENV_PYTHON = _VSS_PYTHON if _VSS_PYTHON.exists() else Path(sys.executable)
+GUI_SCRIPT = REPO_ROOT / "jarvis" / "voice_input_gui.py"
 SETTINGS_FILE = Path.home() / ".aiws_trainer" / "voice_settings.json"
-VOICEPRINT_FILE = Path.home() / ".aiws_trainer" / "voiceprint.npz"
 LOG_DIR = Path("/tmp/vss_voice")
 LOG_FILE = LOG_DIR / "hotword_daemon.log"
 
@@ -59,7 +62,7 @@ def _log(msg):
 # Settings
 # ---------------------------------------------------------------------------
 def _load_settings():
-    defaults = {"mic": None, "gpu": 1, "speaker_verify": False}
+    defaults = {"mic": None, "gpu": 0, "speaker_verify": False}
     try:
         if SETTINGS_FILE.exists():
             data = json.loads(SETTINGS_FILE.read_text())
@@ -146,7 +149,7 @@ def _launch_or_focus_gui():
         env["DISPLAY"] = os.environ.get("DISPLAY", ":0")
         subprocess.Popen(
             [str(VENV_PYTHON), str(GUI_SCRIPT), "--auto-record"],
-            cwd=str(VENV_DIR), env=env,
+            cwd=str(REPO_ROOT), env=env,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
@@ -168,73 +171,32 @@ def _notify(title, body=""):
 # ---------------------------------------------------------------------------
 # Speaker verification (optional — checks if hotword came from the user)
 # ---------------------------------------------------------------------------
-class _SpeakerChecker:
-    """Lightweight speaker check for the daemon. Loads ECAPA on demand."""
-
-    def __init__(self, gpu, threshold):
-        self.gpu = gpu
-        self.threshold = threshold
-        self._model = None
-        self._centroid = None
-
-    def load(self):
-        """Load voiceprint and model."""
-        if not VOICEPRINT_FILE.exists():
-            _log("No voiceprint file — speaker check disabled")
-            return False
-        try:
-            data = np.load(VOICEPRINT_FILE)
-            embeddings = [data[k] for k in sorted(data.files)]
-            if not embeddings:
-                return False
-            self._centroid = np.mean(embeddings, axis=0)
-            _log(f"Voiceprint loaded: {len(embeddings)} samples")
-        except Exception as e:
-            _log(f"Voiceprint load error: {e}")
-            return False
-
-        try:
-            from speechbrain.inference.speaker import EncoderClassifier
-            self._model = EncoderClassifier.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                run_opts={"device": f"cuda:{self.gpu}"},
-                savedir=str(Path.home() / ".aiws_trainer" / "speaker_model"),
-            )
-            _log(f"Speaker model loaded on CUDA:{self.gpu}")
-            return True
-        except Exception as e:
-            _log(f"Speaker model error: {e}")
-            return False
-
-    def is_user(self, audio_16k_float):
-        """Check if audio matches voiceprint. Returns (is_match, score)."""
-        if self._model is None or self._centroid is None:
-            return True, 1.0  # No model = accept all
-        if len(audio_16k_float) < 16000:  # Need at least 1s
-            return True, 1.0
-        try:
-            import torch
-            waveform = torch.tensor(audio_16k_float, dtype=torch.float32).unsqueeze(0)
-            waveform = waveform.to(f"cuda:{self.gpu}")
-            with torch.no_grad():
-                emb = self._model.encode_batch(waveform)
-            emb = emb.squeeze().cpu().numpy()
-            score = float(np.dot(emb, self._centroid) / (
-                np.linalg.norm(emb) * np.linalg.norm(self._centroid)))
-            is_match = score >= self.threshold
-            _log(f"Speaker check: score={score:.3f} threshold={self.threshold} "
-                 f"{'MATCH' if is_match else 'REJECT'}")
-            return is_match, score
-        except Exception as e:
-            _log(f"Speaker check error: {e}")
-            return True, 1.0
+def _load_speaker_verifier(gpu, threshold):
+    """Build a jarvis.speaker.SpeakerVerifier for the daemon, or None."""
+    try:
+        from jarvis.speaker import SpeakerVerifier
+    except Exception as e:
+        _log(f"jarvis.speaker unavailable ({e}) — speaker check disabled")
+        return None
+    try:
+        verifier = SpeakerVerifier(gpu=gpu, threshold=threshold)
+        verifier.load()
+        if not verifier.enrolled:
+            _log("No voiceprint enrolled — speaker check disabled")
+            return None
+        if not verifier.load_model():
+            _log("Speaker model load failed — speaker check disabled")
+            return None
+        return verifier
+    except Exception as e:
+        _log(f"Speaker verifier init error: {e}")
+        return None
 
 
 # Wake word phrases
 HOTWORD_PHRASES = {
     "jarvis", "hey jarvis", "hey jarv",
     "jarvas", "jarves", "jarvus", "service jarvis",
-    "nervous", "harvest",
     "hey claude", "hey cloud", "hey claud",
     "okay claude", "ok claude",
 }
@@ -256,7 +218,7 @@ def run_daemon():
 
     settings = _load_settings()
     mic_idx = _resolve_mic(settings.get("mic"))
-    gpu = settings.get("gpu", 1)
+    gpu = settings.get("gpu", 0)
 
     _log(f"Hotword daemon starting (mic={mic_idx}, gpu={gpu})")
     _notify("Hotword Daemon", "Always-on voice activation ready")
@@ -269,25 +231,17 @@ def run_daemon():
         native_rate = 44100
     _log(f"Mic native rate: {native_rate}Hz")
 
-    # Load Whisper for hotword detection
+    # Load Whisper for hotword detection.
+    # GB10 has no CUDA-capable ctranslate2 — go straight to CPU int8.
     _log(f"Loading Whisper '{HOTWORD_MODEL}' for hotword detection...")
-    try:
-        model = WhisperModel(
-            HOTWORD_MODEL, device="cuda",
-            device_index=gpu, compute_type="float16",
-        )
-        _log(f"Whisper loaded on CUDA:{gpu}")
-    except Exception as e:
-        _log(f"GPU failed ({e}), falling back to CPU")
-        model = WhisperModel(HOTWORD_MODEL, device="cpu", compute_type="int8")
-        _log("Whisper loaded on CPU")
+    model = WhisperModel(HOTWORD_MODEL, device="cpu", compute_type="int8")
+    _log("Whisper loaded on CPU (int8)")
 
     # Load speaker verifier if enabled
     speaker_checker = None
     if settings.get("speaker_verify"):
-        speaker_checker = _SpeakerChecker(gpu, settings.get("speaker_threshold", 0.40))
-        if not speaker_checker.load():
-            speaker_checker = None
+        speaker_checker = _load_speaker_verifier(
+            gpu, settings.get("speaker_threshold", 0.40))
 
     # Audio buffer
     buf = deque(maxlen=int(native_rate * HOTWORD_WINDOW))
@@ -361,7 +315,7 @@ def run_daemon():
                             vlen = int(len(verify_audio) * 16000 / native_rate)
                             verify_audio = scipy_resample(
                                 verify_audio, vlen).astype(np.float32)
-                        is_user, spk_score = speaker_checker.is_user(verify_audio)
+                        is_user, spk_score = speaker_checker.verify(verify_audio)
                         if not is_user:
                             _log(f"Speaker rejected ({spk_score:.3f}), ignoring")
                             buf.clear()

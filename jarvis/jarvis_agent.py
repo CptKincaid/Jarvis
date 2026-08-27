@@ -15,7 +15,7 @@ from collections import deque
 from datetime import datetime
 from pathlib import Path
 
-LOG_DIR = Path("/tmp/vss_voice")
+LOG_DIR = Path(os.environ.get("JARVIS_LOG_DIR") or "/tmp/vss_voice")
 DATA_DIR = Path.home() / ".aiws_trainer" / "jarvis_data"
 HABITS_FILE = DATA_DIR / "habits.json"
 MEMORY_FILE = DATA_DIR / "context_memory.json"
@@ -284,7 +284,8 @@ class JarvisAgent:
             return
         self._alerts_active = True
         self._speak_func = speak_func
-        threading.Thread(target=self._monitor_loop, daemon=True).start()
+        threading.Thread(target=self._monitor_loop, daemon=True,
+                         name="agent-monitor").start()
         _log("Proactive monitoring started")
 
     def stop_monitoring(self):
@@ -344,7 +345,7 @@ class JarvisAgent:
         # Speak if available
         if self._speak_func:
             try:
-                from jarvis.jarvis_speak_queue import say
+                from jarvis.speak_queue import say
                 say(message)
             except Exception:
                 pass
@@ -357,7 +358,7 @@ class JarvisAgent:
         text = f"Notification from {title}. {body}"
         _log(f"Reading notification: {title}")
         try:
-            from jarvis.jarvis_speak_queue import say
+            from jarvis.speak_queue import say
             say(text)
         except Exception:
             pass
@@ -713,7 +714,7 @@ class JarvisAgent:
             r = subprocess.run(
                 command, shell=True, capture_output=True,
                 text=True, timeout=30,
-                cwd="/home/hunterp/jarvis",
+                cwd=str(Path(__file__).resolve().parents[1]),
             )
             output = r.stdout.strip()
             if r.returncode != 0 and r.stderr:

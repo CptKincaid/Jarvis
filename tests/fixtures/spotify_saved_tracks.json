@@ -1,0 +1,134 @@
+{
+ "href": "x",
+ "limit": 50,
+ "offset": 0,
+ "total": 5,
+ "next": null,
+ "items": [
+  {
+   "added_at": "2026-08-01T00:00:00Z",
+   "track": {
+    "id": "liked-1",
+    "uri": "spotify:track:liked-1",
+    "name": "Liked One",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-a",
+      "name": "A",
+      "uri": "spotify:artist:art-a",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "After Hours",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   }
+  },
+  {
+   "added_at": "2026-08-01T00:00:00Z",
+   "track": {
+    "id": "liked-2",
+    "uri": "spotify:track:liked-2",
+    "name": "Liked Two",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-b",
+      "name": "B",
+      "uri": "spotify:artist:art-b",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "After Hours",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   }
+  },
+  {
+   "added_at": "2026-08-01T00:00:00Z",
+   "track": {
+    "id": "liked-3",
+    "uri": "spotify:track:liked-3",
+    "name": "Liked Three",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-c",
+      "name": "C",
+      "uri": "spotify:artist:art-c",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "After Hours",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   }
+  },
+  {
+   "added_at": "2026-08-01T00:00:00Z",
+   "track": {
+    "id": "local-1",
+    "uri": "spotify:local:x",
+    "name": "Local Rip",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": true,
+    "artists": [
+     {
+      "id": "art-d",
+      "name": "D",
+      "uri": "spotify:artist:art-d",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "After Hours",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   }
+  },
+  {
+   "added_at": "2026-08-01T00:00:00Z",
+   "track": {
+    "id": "liked-5",
+    "uri": "spotify:track:liked-5",
+    "name": "Liked Five",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-e",
+      "name": "E",
+      "uri": "spotify:artist:art-e",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "After Hours",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   }
+  }
+ ]
+}

@@ -1,6 +1,16 @@
 """Persistent Memory — facts, habits, preferences, sessions, notes.
 
-Survives across sessions. All data stored in ~/.aiws_trainer/jarvis_memory/.
+THE single memory store for Jarvis V3. Survives across sessions. All data
+lives in ``PATHS.MEMORY_DIR`` (~/.aiws_trainer/jarvis_memory/).
+
+Absorbs the legacy jarvis_agent.py stores: on first run, anything in
+``PATHS.LEGACY_AGENT_DIR`` (~/.aiws_trainer/jarvis_data/) is migrated in —
+habit entries are merged (so habit counts merge), voice notes are copied —
+and the old dir is renamed ``jarvis_data.migrated``.
+
+``log_habit`` is the ONE habit sink (the V1 double-log — agent.log_command +
+memory.log_habit — is gone; all callers route here exactly once per
+utterance).
 
 Usage:
     mem = JarvisMemory()
@@ -8,66 +18,127 @@ Usage:
     results = mem.recall("training")
     mem.log_habit("check gpu")
     suggestion = mem.suggest_by_habit()
+    mem.save_session("worked on the detector")   # app shutdown
 """
+from __future__ import annotations
 
 import json
+import os
+import shutil
 from datetime import datetime
 from pathlib import Path
 
-MEMORY_DIR = Path.home() / ".aiws_trainer" / "jarvis_memory"
+from jarvis.config import PATHS
+from jarvis.logs import get_logger
 
-
-def _log(msg):
-    ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
-    try:
-        log_dir = Path("/tmp/vss_voice")
-        log_dir.mkdir(parents=True, exist_ok=True)
-        with open(log_dir / "gui_debug.log", "a") as f:
-            f.write(f"{ts} [Memory] {msg}\n")
-    except Exception:
-        pass
+log = get_logger("memory")
 
 
 class JarvisMemory:
-    """Persistent memory across Jarvis sessions."""
+    """Persistent memory across Jarvis sessions (single store)."""
 
-    def __init__(self):
-        MEMORY_DIR.mkdir(parents=True, exist_ok=True)
+    MAX_HABITS = 500
+    MAX_SESSIONS = 20
+    MAX_INTENTS = 500
+
+    def __init__(self, memory_dir: Path | str | None = None,
+                 legacy_dir: Path | str | None = None):
+        self._dir = Path(memory_dir) if memory_dir else PATHS.MEMORY_DIR
+        self._legacy_dir = (Path(legacy_dir) if legacy_dir
+                            else PATHS.LEGACY_AGENT_DIR)
+        self._dir.mkdir(parents=True, exist_ok=True)
         self._facts = self._load("facts.json", {})
         self._habits = self._load("habits.json", [])
         self._preferences = self._load("preferences.json", {})
         self._sessions = self._load("sessions.json", [])
         self._intent_log = self._load("intent_log.json", [])
+        self._migrate_legacy()
 
     # ------------------------------------------------------------------
-    # File I/O
+    # File I/O (atomic writes)
     # ------------------------------------------------------------------
     def _load(self, filename, default):
-        path = MEMORY_DIR / filename
+        path = self._dir / filename
         if path.exists():
             try:
                 return json.loads(path.read_text())
             except Exception:
-                pass
+                log.exception("failed to load %s; using default", filename)
         return default
 
     def _save(self, filename, data):
+        path = self._dir / filename
         try:
-            (MEMORY_DIR / filename).write_text(json.dumps(data, indent=2))
-        except Exception as e:
-            _log(f"Save error ({filename}): {e}")
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, indent=2))
+            os.replace(tmp, path)
+        except Exception:
+            log.exception("save failed (%s)", filename)
+
+    # ------------------------------------------------------------------
+    # One-time migration of the legacy jarvis_agent store
+    # ------------------------------------------------------------------
+    def _migrate_legacy(self):
+        """Merge ~/.aiws_trainer/jarvis_data into this store, once."""
+        legacy = self._legacy_dir
+        if not legacy.is_dir():
+            return
+        log.info("migrating legacy agent data from %s", legacy)
+        try:
+            # Merge habit entries (this merges the per-command counts too).
+            legacy_habits_file = legacy / "habits.json"
+            if legacy_habits_file.exists():
+                try:
+                    legacy_habits = json.loads(legacy_habits_file.read_text())
+                except Exception:
+                    log.exception("legacy habits.json unreadable; skipping")
+                    legacy_habits = []
+                if isinstance(legacy_habits, list) and legacy_habits:
+                    merged = legacy_habits + self._habits
+                    try:
+                        merged.sort(key=lambda h: str(h.get("time", "")))
+                    except Exception:
+                        log.exception("habit merge sort failed; keeping order")
+                    self._habits = merged[-self.MAX_HABITS:]
+                    self._save("habits.json", self._habits)
+                    log.info("merged %d legacy habit entries",
+                             len(legacy_habits))
+
+            # Copy voice notes into the single notes dir.
+            notes_src = legacy / "voice_notes"
+            if notes_src.is_dir():
+                notes_dst = self._dir / "notes"
+                notes_dst.mkdir(exist_ok=True)
+                copied = 0
+                for f in sorted(notes_src.glob("note_*.txt")):
+                    dst = notes_dst / f.name
+                    if not dst.exists():
+                        shutil.copy2(f, dst)
+                        copied += 1
+                log.info("copied %d legacy voice notes", copied)
+
+            # Rename the old dir so migration never runs twice.
+            migrated = legacy.with_name(legacy.name + ".migrated")
+            if migrated.exists():
+                log.warning("%s already exists; leaving legacy dir in place",
+                            migrated)
+            else:
+                legacy.rename(migrated)
+                log.info("legacy dir renamed to %s", migrated.name)
+        except Exception:
+            log.exception("legacy migration failed")
 
     # ------------------------------------------------------------------
     # Facts — key/value store with timestamps
     # ------------------------------------------------------------------
     def remember(self, key, value):
-        """Store a fact. Overwrites if key exists."""
+        """Store a fact persistently. Overwrites if key exists."""
         self._facts[key] = {
             "value": value,
             "time": datetime.now().isoformat(),
         }
         self._save("facts.json", self._facts)
-        _log(f"Remembered: {key} = {str(value)[:50]}")
+        log.info("remembered: %s = %s", key, str(value)[:50])
 
     def recall(self, query):
         """Search facts by key or value substring."""
@@ -89,7 +160,7 @@ class JarvisMemory:
         return self._facts
 
     # ------------------------------------------------------------------
-    # Habits — command logging with time patterns
+    # Habits — command logging with time patterns (the ONE habit log)
     # ------------------------------------------------------------------
     def log_habit(self, command, context=None):
         """Log a command execution for pattern learning."""
@@ -100,7 +171,7 @@ class JarvisMemory:
             "command": command[:100],
             "context": context,
         })
-        self._habits = self._habits[-500:]
+        self._habits = self._habits[-self.MAX_HABITS:]
         self._save("habits.json", self._habits)
 
     def suggest_by_habit(self):
@@ -124,7 +195,6 @@ class JarvisMemory:
         if not self._habits:
             return "No habits recorded yet."
         total = len(self._habits)
-        # Most common commands
         counts = {}
         for h in self._habits:
             cmd = h["command"]
@@ -152,14 +222,19 @@ class JarvisMemory:
     # Session summaries — compressed conversation history
     # ------------------------------------------------------------------
     def save_session(self, summary):
-        """Save a session summary for cross-session memory."""
+        """Save a session summary for cross-session memory.
+
+        Called from app shutdown so the next session remembers this one.
+        """
+        if not summary:
+            return
         self._sessions.append({
             "time": datetime.now().isoformat(),
-            "summary": summary[:500],
+            "summary": str(summary)[:500],
         })
-        self._sessions = self._sessions[-20:]
+        self._sessions = self._sessions[-self.MAX_SESSIONS:]
         self._save("sessions.json", self._sessions)
-        _log(f"Session saved: {summary[:50]}")
+        log.info("session saved: %s", str(summary)[:50])
 
     def get_recent_sessions(self, n=3):
         """Get last N session summaries."""
@@ -184,7 +259,7 @@ class JarvisMemory:
             "text": text[:200],
             "label": "yes" if is_for_assistant else "no",
         })
-        self._intent_log = self._intent_log[-500:]
+        self._intent_log = self._intent_log[-self.MAX_INTENTS:]
         self._save("intent_log.json", self._intent_log)
 
     def get_intent_log(self):
@@ -195,18 +270,18 @@ class JarvisMemory:
     # ------------------------------------------------------------------
     def save_note(self, text):
         """Save a timestamped voice note."""
-        notes_dir = MEMORY_DIR / "notes"
+        notes_dir = self._dir / "notes"
         notes_dir.mkdir(exist_ok=True)
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         path = notes_dir / f"note_{ts}.txt"
         path.write_text(
             f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}]\n{text}\n")
-        _log(f"Note saved: {path.name}")
+        log.info("note saved: %s", path.name)
         return str(path)
 
     def get_notes(self, n=5):
         """List recent voice notes."""
-        notes_dir = MEMORY_DIR / "notes"
+        notes_dir = self._dir / "notes"
         if not notes_dir.exists():
             return []
         files = sorted(notes_dir.glob("note_*.txt"), reverse=True)[:n]
@@ -220,18 +295,16 @@ class JarvisMemory:
         """Format all memory for LLM context injection."""
         parts = []
 
-        # Facts
         if self._facts:
             parts.append(f"Known facts ({len(self._facts)}):")
             for key, entry in list(self._facts.items())[-5:]:
                 parts.append(f"  {key}: {entry['value']}")
 
-        # Habits
         suggestion = self.suggest_by_habit()
         if suggestion:
-            parts.append(f"Habit suggestion: user often runs '{suggestion}' at this time")
+            parts.append(
+                f"Habit suggestion: user often runs '{suggestion}' at this time")
 
-        # Sessions
         sessions_text = self.format_sessions_for_prompt()
         if sessions_text:
             parts.append(sessions_text)

@@ -1,0 +1,24 @@
+{
+ "devices": [
+  {
+   "id": "dev-hp",
+   "is_active": false,
+   "is_private_session": false,
+   "is_restricted": false,
+   "name": "HPCOMPUTER",
+   "type": "Computer",
+   "volume_percent": 60,
+   "supports_volume": true
+  },
+  {
+   "id": "dev-phone",
+   "is_active": true,
+   "is_private_session": false,
+   "is_restricted": false,
+   "name": "Hunter's iPhone",
+   "type": "Smartphone",
+   "volume_percent": 40,
+   "supports_volume": true
+  }
+ ]
+}

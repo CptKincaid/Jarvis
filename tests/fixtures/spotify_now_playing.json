@@ -1,0 +1,43 @@
+{
+ "device": {
+  "id": "dev-hp",
+  "is_active": true,
+  "is_private_session": false,
+  "is_restricted": false,
+  "name": "HPCOMPUTER",
+  "type": "Computer",
+  "volume_percent": 60,
+  "supports_volume": true
+ },
+ "shuffle_state": false,
+ "repeat_state": "off",
+ "is_playing": true,
+ "progress_ms": 61000,
+ "currently_playing_type": "track",
+ "context": {
+  "type": "album",
+  "uri": "spotify:album:alb-after-hours"
+ },
+ "item": {
+  "id": "t-blinding",
+  "uri": "spotify:track:t-blinding",
+  "name": "Blinding Lights",
+  "type": "track",
+  "duration_ms": 200040,
+  "is_local": false,
+  "artists": [
+   {
+    "id": "art-the-weeknd",
+    "name": "The Weeknd",
+    "uri": "spotify:artist:art-the-weeknd",
+    "type": "artist"
+   }
+  ],
+  "album": {
+   "id": "alb-after-hours",
+   "name": "After Hours",
+   "type": "album",
+   "uri": "spotify:album:alb-after-hours"
+  }
+ }
+}

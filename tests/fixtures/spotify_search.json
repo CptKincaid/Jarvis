@@ -1,0 +1,218 @@
+{
+ "tracks": {
+  "href": "x",
+  "limit": 5,
+  "offset": 0,
+  "total": 3,
+  "next": null,
+  "items": [
+   {
+    "id": "t-blinding",
+    "uri": "spotify:track:t-blinding",
+    "name": "Blinding Lights",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-the-weeknd",
+      "name": "The Weeknd",
+      "uri": "spotify:artist:art-the-weeknd",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "After Hours",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   },
+   {
+    "id": "t-save",
+    "uri": "spotify:track:t-save",
+    "name": "Save Your Tears",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-the-weeknd",
+      "name": "The Weeknd",
+      "uri": "spotify:artist:art-the-weeknd",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "After Hours",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   },
+   {
+    "id": "t-otss",
+    "uri": "spotify:track:t-otss",
+    "name": "One More Time",
+    "type": "track",
+    "duration_ms": 320000,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-daft-punk",
+      "name": "Daft Punk",
+      "uri": "spotify:artist:art-daft-punk",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "Discovery",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   },
+   {
+    "id": "t-gym",
+    "uri": "spotify:track:t-gym",
+    "name": "Gym Anthem",
+    "type": "track",
+    "duration_ms": 200040,
+    "is_local": false,
+    "artists": [
+     {
+      "id": "art-nobody",
+      "name": "Nobody",
+      "uri": "spotify:artist:art-nobody",
+      "type": "artist"
+     }
+    ],
+    "album": {
+     "id": "alb-after-hours",
+     "name": "Workout",
+     "type": "album",
+     "uri": "spotify:album:alb-after-hours"
+    }
+   }
+  ]
+ },
+ "artists": {
+  "items": [
+   {
+    "id": "art-the-weeknd",
+    "uri": "spotify:artist:art-the-weeknd",
+    "name": "The Weeknd",
+    "type": "artist",
+    "followers": {
+     "total": 90000000
+    },
+    "genres": [
+     "pop"
+    ]
+   },
+   {
+    "id": "art-daft-punk",
+    "uri": "spotify:artist:art-daft-punk",
+    "name": "Daft Punk",
+    "type": "artist",
+    "followers": {
+     "total": 12000000
+    },
+    "genres": [
+     "pop"
+    ]
+   }
+  ]
+ },
+ "albums": {
+  "items": [
+   {
+    "id": "alb-after-hours",
+    "uri": "spotify:album:alb-after-hours",
+    "name": "After Hours",
+    "type": "album",
+    "total_tracks": 14,
+    "artists": [
+     {
+      "id": "art-the-weeknd",
+      "name": "The Weeknd"
+     }
+    ]
+   },
+   {
+    "id": "alb-discovery",
+    "uri": "spotify:album:alb-discovery",
+    "name": "Discovery",
+    "type": "album",
+    "total_tracks": 14,
+    "artists": [
+     {
+      "id": "art-daft-punk",
+      "name": "Daft Punk"
+     }
+    ]
+   }
+  ]
+ },
+ "playlists": {
+  "items": [
+   null,
+   {
+    "id": "pl-this-is-weeknd",
+    "uri": "spotify:playlist:pl-this-is-weeknd",
+    "name": "This Is The Weeknd",
+    "type": "playlist",
+    "owner": {
+     "id": "spotify",
+     "display_name": "spotify"
+    },
+    "public": true,
+    "tracks": {
+     "total": 50
+    }
+   },
+   {
+    "id": "pl-weeknd-radio",
+    "uri": "spotify:playlist:pl-weeknd-radio",
+    "name": "The Weeknd Radio",
+    "type": "playlist",
+    "owner": {
+     "id": "spotify",
+     "display_name": "spotify"
+    },
+    "public": true,
+    "tracks": {
+     "total": 50
+    }
+   },
+   {
+    "id": "pl-fan-weeknd",
+    "uri": "spotify:playlist:pl-fan-weeknd",
+    "name": "This Is The Weeknd",
+    "type": "playlist",
+    "owner": {
+     "id": "somefan",
+     "display_name": "somefan"
+    },
+    "public": true,
+    "tracks": {
+     "total": 50
+    }
+   },
+   {
+    "id": "pl-chill",
+    "uri": "spotify:playlist:pl-chill",
+    "name": "Chill Hits",
+    "type": "playlist",
+    "owner": {
+     "id": "spotify",
+     "display_name": "spotify"
+    },
+    "public": true,
+    "tracks": {
+     "total": 50
+    }
+   }
+  ]
+ }
+}

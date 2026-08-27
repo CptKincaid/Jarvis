@@ -1,0 +1,120 @@
+{
+ "tracks": [
+  {
+   "id": "top-1",
+   "uri": "spotify:track:top-1",
+   "name": "Blinding Lights",
+   "type": "track",
+   "duration_ms": 200040,
+   "is_local": false,
+   "artists": [
+    {
+     "id": "art-the-weeknd",
+     "name": "The Weeknd",
+     "uri": "spotify:artist:art-the-weeknd",
+     "type": "artist"
+    }
+   ],
+   "album": {
+    "id": "alb-after-hours",
+    "name": "After Hours",
+    "type": "album",
+    "uri": "spotify:album:alb-after-hours"
+   }
+  },
+  {
+   "id": "top-2",
+   "uri": "spotify:track:top-2",
+   "name": "Starboy",
+   "type": "track",
+   "duration_ms": 200040,
+   "is_local": false,
+   "artists": [
+    {
+     "id": "art-the-weeknd",
+     "name": "The Weeknd",
+     "uri": "spotify:artist:art-the-weeknd",
+     "type": "artist"
+    },
+    {
+     "id": "art-daft-punk",
+     "name": "Daft Punk",
+     "uri": "spotify:artist:art-daft-punk",
+     "type": "artist"
+    }
+   ],
+   "album": {
+    "id": "alb-after-hours",
+    "name": "After Hours",
+    "type": "album",
+    "uri": "spotify:album:alb-after-hours"
+   }
+  },
+  {
+   "id": "top-3",
+   "uri": "spotify:track:top-3",
+   "name": "The Hills",
+   "type": "track",
+   "duration_ms": 200040,
+   "is_local": false,
+   "artists": [
+    {
+     "id": "art-the-weeknd",
+     "name": "The Weeknd",
+     "uri": "spotify:artist:art-the-weeknd",
+     "type": "artist"
+    }
+   ],
+   "album": {
+    "id": "alb-after-hours",
+    "name": "After Hours",
+    "type": "album",
+    "uri": "spotify:album:alb-after-hours"
+   }
+  },
+  {
+   "id": "top-4",
+   "uri": "spotify:track:top-4",
+   "name": "Can't Feel My Face",
+   "type": "track",
+   "duration_ms": 200040,
+   "is_local": false,
+   "artists": [
+    {
+     "id": "art-the-weeknd",
+     "name": "The Weeknd",
+     "uri": "spotify:artist:art-the-weeknd",
+     "type": "artist"
+    }
+   ],
+   "album": {
+    "id": "alb-after-hours",
+    "name": "After Hours",
+    "type": "album",
+    "uri": "spotify:album:alb-after-hours"
+   }
+  },
+  {
+   "id": "top-5",
+   "uri": "spotify:track:top-5",
+   "name": "Die For You",
+   "type": "track",
+   "duration_ms": 200040,
+   "is_local": false,
+   "artists": [
+    {
+     "id": "art-the-weeknd",
+     "name": "The Weeknd",
+     "uri": "spotify:artist:art-the-weeknd",
+     "type": "artist"
+    }
+   ],
+   "album": {
+    "id": "alb-after-hours",
+    "name": "After Hours",
+    "type": "album",
+    "uri": "spotify:album:alb-after-hours"
+   }
+  }
+ ]
+}

@@ -1,0 +1,51 @@
+{
+ "href": "x",
+ "limit": 50,
+ "offset": 0,
+ "total": 3,
+ "next": null,
+ "items": [
+  {
+   "id": "pl-discover",
+   "uri": "spotify:playlist:pl-discover",
+   "name": "Discover Weekly",
+   "type": "playlist",
+   "owner": {
+    "id": "spotify",
+    "display_name": "spotify"
+   },
+   "public": false,
+   "tracks": {
+    "total": 50
+   }
+  },
+  {
+   "id": "pl-gym",
+   "uri": "spotify:playlist:pl-gym",
+   "name": "Gym Mix",
+   "type": "playlist",
+   "owner": {
+    "id": "hunter",
+    "display_name": "hunter"
+   },
+   "public": false,
+   "tracks": {
+    "total": 50
+   }
+  },
+  {
+   "id": "pl-release",
+   "uri": "spotify:playlist:pl-release",
+   "name": "Release Radar",
+   "type": "playlist",
+   "owner": {
+    "id": "spotify",
+    "display_name": "spotify"
+   },
+   "public": false,
+   "tracks": {
+    "total": 50
+   }
+  }
+ ]
+}
