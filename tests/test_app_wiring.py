@@ -32,6 +32,7 @@ import jarvis.channels.notify as notify_mod
 import jarvis.tools.timekeeper as tk_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import (AlarmFired, ApprovalRequested, ApprovalResolved,
+                           UncertainResolved, UncertainUtterance,
                            BriefingReady, ClaudeProgress, ClaudeTaskState,
                            JarvisReply, ReminderFired, bus)
 
@@ -59,7 +60,7 @@ class FakeTTS(_Stub):
     def __init__(self, *a, **kw):
         self.spoken: list[str] = []
 
-    def speak(self, text):
+    def speak(self, text, block=False):
         self.spoken.append(text)
 
     def interrupt(self):
@@ -743,3 +744,110 @@ def test_start_assistant_is_idempotent(app, monkeypatch):
     app.start_assistant(residency=False)
     app.start_assistant(residency=False)
     assert starts == ["tk", "ap", "dc"]
+
+
+# ------------------------------------ 2b. "Was that for me?" is answerable
+#
+# The commander has always had `on_uncertain` and `resolve_uncertain`, but the
+# app never set the hook, so an uncertain utterance produced a bare warn Status
+# -- a 4 s toast, no way to reply -- and the utterance was dropped. Nothing in
+# the shipping app ever reached resolve_uncertain, so the classifier feedback
+# it feeds was dead code too. These tests hold that wiring in place.
+def _make_uncertain(app, monkeypatch):
+    from jarvis.commander import IntentClassifier
+    monkeypatch.setattr(app.commander.intent, "classify",
+                        lambda text: (IntentClassifier.UNCERTAIN, 0.5))
+    # the spoken follow-up window needs a mic; covered by test_uncertain_reply
+    monkeypatch.setattr(app, "_ask_uncertain", lambda rid: None)
+
+
+def test_uncertain_utterance_asks_something_that_can_be_answered(app, monkeypatch):
+    _make_uncertain(app, monkeypatch)
+    sink = Sink(UncertainUtterance)
+    try:
+        app._dispatch("sort out the thing we talked about", "voice")
+        ev = sink.wait(UncertainUtterance)
+        assert ev is not None, "on_uncertain was never wired to the app"
+        assert ev.request_id
+        assert "Was that for me?" in ev.question
+        assert app._pending_uncertain[ev.request_id] == \
+            "sort out the thing we talked about"
+    finally:
+        sink.close()
+
+
+def test_answering_yes_actually_runs_the_utterance(app, monkeypatch):
+    _make_uncertain(app, monkeypatch)
+    seen = []
+    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    monkeypatch.setattr(app.brain, "classify_route",
+                        lambda text, timeout=None: ("local", 1.0))
+    sink = Sink(UncertainUtterance, UncertainResolved)
+    try:
+        app._dispatch("play some miles davis", "voice")
+        ev = sink.wait(UncertainUtterance)
+        assert seen == [], "must not run before it is answered"
+
+        app.uncertain_answer(ev.request_id, True)
+
+        assert seen == ["play some miles davis"], "YES must dispatch the utterance"
+        done = sink.wait(UncertainResolved)
+        assert done is not None and done.yes is True
+    finally:
+        sink.close()
+
+
+def test_answering_no_discards_it_and_teaches_the_classifier(app, monkeypatch):
+    _make_uncertain(app, monkeypatch)
+    taught = []
+    monkeypatch.setattr(app.commander.intent, "log_feedback",
+                        lambda text, is_for_assistant: taught.append(
+                            (text, is_for_assistant)))
+    seen = []
+    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    sink = Sink(UncertainUtterance)
+    try:
+        app._dispatch("she said no way lol haha dude", "voice")
+        ev = sink.wait(UncertainUtterance)
+        app.uncertain_answer(ev.request_id, False)
+
+        assert seen == [], "NO must not run anything"
+        assert taught == [("she said no way lol haha dude", False)], \
+            "the answer must train the intent classifier"
+    finally:
+        sink.close()
+
+
+def test_only_the_first_answer_counts(app, monkeypatch):
+    """The card and the spoken window race; resolving twice would route the
+    same utterance twice."""
+    _make_uncertain(app, monkeypatch)
+    seen = []
+    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    monkeypatch.setattr(app.brain, "classify_route",
+                        lambda text, timeout=None: ("local", 1.0))
+    sink = Sink(UncertainUtterance)
+    try:
+        app._dispatch("play some miles davis", "voice")
+        ev = sink.wait(UncertainUtterance)
+        app.uncertain_answer(ev.request_id, True)
+        app.uncertain_answer(ev.request_id, True)
+        assert seen == ["play some miles davis"], f"ran {len(seen)} times"
+    finally:
+        sink.close()
+
+
+def test_a_newer_question_supersedes_the_old_one(app, monkeypatch):
+    _make_uncertain(app, monkeypatch)
+    sink = Sink(UncertainUtterance, UncertainResolved)
+    try:
+        app._dispatch("first ambiguous thing", "voice")
+        first = sink.wait(UncertainUtterance)
+        app._dispatch("second ambiguous thing", "voice")
+        bus.drain()
+        assert first.request_id not in app._pending_uncertain
+        superseded = [e for e in sink.of(UncertainResolved)
+                      if e.source == "superseded"]
+        assert superseded, "the stale card must be closed, not left hanging"
+    finally:
+        sink.close()

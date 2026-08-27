@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import threading
+import uuid
 import time
 from types import SimpleNamespace
 
@@ -33,8 +34,9 @@ from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import (AlarmFired, ApprovalRequested, ApprovalResolved,
                            BriefingReady, ClaudeProgress, ClaudeTaskState,
                            JarvisReply, ModelInfo, RecordingStopped,
-                           ReminderFired, Status, Transcribed, UserUtterance,
-                           bus)
+                           ReminderFired, Status, Transcribed,
+                           UncertainResolved, UncertainUtterance,
+                           UserUtterance, bus)
 from jarvis.logs import get_logger
 
 from jarvis import brain as brain_mod
@@ -42,7 +44,7 @@ from jarvis import desktop as desktop_mod
 from jarvis import speak_queue, voice_check
 from jarvis.assistant_config import AssistantConfig
 from jarvis.brain import JarvisBrain
-from jarvis.commander import COURTESY_REPLIES, Commander
+from jarvis.commander import COURTESY_REPLIES, Commander, parse_yes_no
 from jarvis.context import ContextEngine
 from jarvis.history import TypedHistory
 from jarvis.hotword import Hotword
@@ -196,6 +198,13 @@ class JarvisApp:
         self.services = self._build_services()
         self._register_tools()
         self.commander = Commander(self.services)
+        # Without this hook the commander falls back to a bare warn Status --
+        # a 4 s toast with no way to answer it, after which the utterance is
+        # dropped and resolve_uncertain (and the classifier feedback it feeds)
+        # is never reached from the running app at all.
+        self.commander.on_uncertain = self._on_uncertain
+        self._pending_uncertain: dict = {}      # request_id -> utterance
+        self._uncertain_lock = threading.Lock()
 
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
@@ -795,8 +804,10 @@ class JarvisApp:
             bus.publish(Status(text="Transcription failed", kind="error"))
 
     # -------------------------------------------------------------- routing
-    def _dispatch(self, text, source):
-        result = self.commander.handle(text, source)
+    def _emit_result(self, result):
+        """Publish a CommandResult's reply/status. Shared by _dispatch and the
+        uncertain-prompt answer, so a YES there runs and SPEAKS exactly like a
+        command that had been understood the first time."""
         if result.reply:
             bus.publish(JarvisReply(text=result.reply, speak=result.speak))
             if result.speak:
@@ -804,6 +815,79 @@ class JarvisApp:
         if result.status:
             bus.publish(Status(text=result.status, kind="info"))
         return result
+
+    def _dispatch(self, text, source):
+        return self._emit_result(self.commander.handle(text, source))
+
+    # ---------------------------------------------------- uncertain intent
+    UNCERTAIN_LISTEN_S = 5.0
+
+    def _on_uncertain(self, text: str):
+        """Commander hook: ask a question that can actually be answered."""
+        rid = uuid.uuid4().hex[:12]
+        with self._uncertain_lock:
+            # One open question at a time -- a newer utterance supersedes the
+            # old one, or stale cards pile up with no way to tell which is live.
+            stale = list(self._pending_uncertain)
+            self._pending_uncertain.clear()
+            self._pending_uncertain[rid] = text
+        for old in stale:
+            bus.publish(UncertainResolved(request_id=old, yes=False,
+                                          source="superseded"))
+        bus.publish(UncertainUtterance(
+            request_id=rid, text=text,
+            question=f'Was that for me? — "{text[:60]}"'))
+        threading.Thread(target=self._ask_uncertain, args=(rid,), daemon=True,
+                         name="uncertain-ask").start()
+
+    def _ask_uncertain(self, rid: str):
+        """Say it out loud, then listen briefly for a spoken yes/no.
+
+        Blocks on the TTS before recording: talk-back holds the mic arbiter,
+        but the arbiter is a depth counter rather than a mutex, so without the
+        wait we would happily record Jarvis asking the question.
+        """
+        try:
+            if CONFIG.talkback:
+                self.tts.speak("Was that for me?", block=True)
+            if not MACHINE.has_mic or self.recorder.recording:
+                return
+            with self._uncertain_lock:
+                if rid not in self._pending_uncertain:
+                    return                      # already answered by a click
+            audio = self.recorder.record_fixed(self.UNCERTAIN_LISTEN_S)
+            if audio is None or len(audio) == 0:
+                return
+            if CONFIG.speaker_verify and self.speaker.enrolled:
+                filtered, _ = self.speaker.filter_segments(audio)
+                if filtered is None:
+                    log.info("uncertain reply ignored: not the enrolled speaker")
+                    return
+                audio = filtered
+            result = self.transcriber.transcribe(audio)
+            heard = result.text if result.accepted else ""
+            answer = parse_yes_no(heard)
+            log.info("uncertain follow-up heard %r -> %s", heard, answer)
+            if answer is None:
+                # Never route an unrecognised reply: it could classify as
+                # uncertain again and the two prompts would ping-pong. The
+                # card stays up for a click instead.
+                return
+            self.uncertain_answer(rid, answer, source="voice")
+        except Exception:
+            log.exception("uncertain follow-up failed")
+
+    def uncertain_answer(self, request_id: str, yes: bool, source: str = "ui"):
+        """Answer the open prompt. First answer wins -- the card and the
+        spoken window race each other, and resolve_uncertain would otherwise
+        route the same utterance twice."""
+        with self._uncertain_lock:
+            text = self._pending_uncertain.pop(request_id, None)
+        if text is None:
+            return None
+        bus.publish(UncertainResolved(request_id=request_id, yes=yes,
+                                      source=source))
+        return self._emit_result(self.commander.resolve_uncertain(text, yes))
 
     def dispatch_text(self, text, source="typed"):
         """MainWindow calls this on a worker thread for typed input; the
@@ -1025,6 +1109,7 @@ class JarvisApp:
             open_terminal=self.open_terminal,
             alarm_action=self.alarm_action,
             approval_answer=self.approval_answer,
+            uncertain_answer=self.uncertain_answer,
             get_option=self.get_option,
             set_option=self.set_option,
         )

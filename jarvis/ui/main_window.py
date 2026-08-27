@@ -64,6 +64,7 @@ from jarvis import perf
 from jarvis.config import CONFIG, MACHINE
 from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            ApprovalRequested, ApprovalResolved, AudioLevel,
+                           UncertainResolved, UncertainUtterance,
                            BrainState, BriefingReady, ClaudeProgress,
                            ClaudeTaskState, HotwordDetected, JarvisReply,
                            MicState, ModelInfo, PartialText, RecordingStarted,
@@ -325,6 +326,7 @@ class Services:
     open_terminal: Callable = _noop
     alarm_action: Callable = _noop
     approval_answer: Callable = _noop
+    uncertain_answer: Callable = _noop
     get_option: Callable = _noop
     set_option: Callable = _noop
 
@@ -1111,6 +1113,8 @@ class MainWindow:
         bus.subscribe(ActiveProject, self._ev_active_project)
         bus.subscribe(ApprovalRequested, self._ev_approval)
         bus.subscribe(ApprovalResolved, self._ev_approval_done)
+        bus.subscribe(UncertainUtterance, self._ev_uncertain)
+        bus.subscribe(UncertainResolved, self._ev_uncertain_done)
         bus.subscribe(AlarmFired, self._ev_alarm)
         bus.subscribe(AlarmStopped, self._ev_alarm_stopped)
         bus.subscribe(BriefingReady, self._ev_briefing)
@@ -1224,6 +1228,32 @@ class MainWindow:
 
     def _ev_approval_done(self, ev: ApprovalResolved):
         self.transcript.resolve_approval(ev.request_id, ev.allowed)
+
+    def _ev_uncertain(self, ev: UncertainUtterance):
+        """"Was that for me?" as a card that WAITS. The old behaviour was a
+        4 s toast plus a text-free info Status, so the question vanished
+        before it could be read, and nothing could answer it."""
+        self._utter_ts = None
+        self.transcript.add_approval(ev.request_id, ev.question,
+                                     self._answer_uncertain,
+                                     yes_text="YES", no_text="NO")
+
+    def _ev_uncertain_done(self, ev: UncertainResolved):
+        # also fires when the spoken reply answered it, so the card stops
+        # inviting a click that would arrive too late
+        self.transcript.resolve_approval(ev.request_id, ev.yes)
+
+    def _answer_uncertain(self, request_id: str, yes: bool):
+        fn = self.services.uncertain_answer
+
+        def run():
+            try:
+                fn(request_id, yes)
+            except Exception:
+                log.exception("uncertain_answer failed")
+
+        threading.Thread(target=run, daemon=True,
+                         name="uncertain-answer").start()
 
     def _answer_approval(self, request_id: str, allowed: bool):
         fn = self.services.approval_answer

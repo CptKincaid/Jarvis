@@ -222,6 +222,24 @@ class ApprovalResolved(Event):
 
 
 @dataclass
+class UncertainUtterance(Event):
+    """The commander could not tell whether an utterance was meant for
+    Jarvis. He asks aloud and the UI shows a card with YES / NO; the
+    answer feeds Commander.resolve_uncertain, which also trains the
+    intent classifier via log_feedback."""
+    request_id: str = ""
+    text: str = ""                    # the utterance in question
+    question: str = ""                # what he actually says
+
+
+@dataclass
+class UncertainResolved(Event):
+    request_id: str = ""
+    yes: bool = False
+    source: str = ""                  # ui | voice | superseded
+
+
+@dataclass
 class AlarmFired(Event):
     """An alarm (or timer/reminder promoted to ringing) started ringing.
     The UI shows the modal with DISMISS / SNOOZE; the timekeeper rings."""

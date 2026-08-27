@@ -786,10 +786,13 @@ class TranscriptView(tk.Frame):
         self._schedule_layout()
 
     def add_approval(self, request_id: str, question: str,
-                     on_answer: Optional[Callable] = None) -> Optional[Card]:
-        """JARVIS card carrying Claude's permission question with ALLOW /
-        DENY RoundButtons → on_answer(request_id, bool). One card per
-        request id (a repeat is ignored)."""
+                     on_answer: Optional[Callable] = None,
+                     yes_text: str = "ALLOW",
+                     no_text: str = "DENY") -> Optional[Card]:
+        """JARVIS card carrying a yes/no question with two RoundButtons →
+        on_answer(request_id, bool). One card per request id (a repeat is
+        ignored). Labels default to Claude's ALLOW / DENY; the
+        "Was that for me?" prompt passes YES / NO."""
         if not request_id or request_id in self._approvals:
             return None
         self._progress = None
@@ -812,10 +815,10 @@ class TranscriptView(tk.Frame):
                 except Exception:
                     log.exception("approval answer failed")
 
-        allow = RoundButton(row, text="ALLOW", kind="accent", bg=theme.RAISED,
+        allow = RoundButton(row, text=yes_text, kind="accent", bg=theme.RAISED,
                             command=lambda: answer(True))
         allow.pack(side="left")
-        deny = RoundButton(row, text="DENY", kind="default", bg=theme.RAISED,
+        deny = RoundButton(row, text=no_text, kind="default", bg=theme.RAISED,
                            command=lambda: answer(False))
         deny.pack(side="left", padx=(theme.PAD_S, 0))
         card.set_edge_glow()

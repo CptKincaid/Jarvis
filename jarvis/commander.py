@@ -1820,6 +1820,54 @@ def _call_manager(fn, args: dict):
 # ------------------------------------------------------------------
 # Commander — routing pipeline
 # ------------------------------------------------------------------
+# Spoken replies to "Was that for me?" are read ONLY by this function and are
+# never routed as a command. An ambiguous reply that went through the normal
+# path could classify as uncertain again and the prompts would ping-pong, so
+# anything not clearly recognised returns None and the on-screen card waits for
+# a click instead. Erring toward "didn't catch that" costs a click; erring the
+# other way runs something the user never asked for.
+_YES_WORDS = ("yes", "yeah", "yep", "yup", "sure", "correct", "affirmative",
+              "aye", "certainly")
+# "for you" / "that was" are deliberately absent: they are substrings of
+# "not for you" and "that wasn't", so they would fight the negatives.
+_YES_PHRASES = ("go ahead", "please do", "do it")
+_NO_WORDS = ("no", "nope", "nah", "negative", "wasnt", "wasn't")
+_NO_PHRASES = ("never mind", "nevermind", "ignore that", "forget it",
+               "not for you", "not you", "talking to")
+_UNSURE = ("not sure", "unsure", "dont know", "don't know", "dunno", "maybe",
+           "no idea")
+
+
+def parse_yes_no(text):
+    """Read a spoken yes/no. None when the reply is neither.
+
+    Whole-word matching only: substring matching would make "nothing",
+    "north" and "you know" all mean no.
+    """
+    if not text:
+        return None
+    lowered = re.sub(r"[^a-z0-9\s']+", " ", str(text).lower())
+    words = lowered.split()
+    if not words:
+        return None
+    padded = " " + " ".join(words) + " "
+    if any(p in padded for p in _UNSURE):
+        return None
+    # A reply to a yes/no question is short. A long sentence that merely
+    # contains "no" ("she said no way lol haha dude") is overheard speech,
+    # not an answer -- unless it actually opens with yes or no.
+    if len(words) > 6 and words[0] not in _YES_WORDS \
+            and words[0] not in _NO_WORDS:
+        return None
+    yes = any(w in _YES_WORDS for w in words) or \
+        any(p in padded for p in _YES_PHRASES)
+    no = any(w in _NO_WORDS for w in words) or \
+        any(p in padded for p in _NO_PHRASES)
+    if yes == no:                      # neither, or a contradictory reply
+        return None
+    return yes
+
+
 class Commander:
     """Routes a user utterance (voice or typed) through the V3 pipeline:
 
