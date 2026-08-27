@@ -151,3 +151,36 @@ def test_shim_before_any_valid_call_is_neutral():
     shim = hw.VerifierShim(FakePipeline(), 1536)
     out = shim.predict_proba(np.zeros((1, 34, 96)))
     assert out[0][-1] == 0.0                          # never inflates a score
+
+
+# ------------------------------------------------- release ordering
+def test_stop_releases_the_mic_only_after_finalising(monkeypatch):
+    """stop() used to hand the mic back BEFORE finalising the audio.
+
+    The log from 2026-08-27 shows the consequence: "Hotword stream resumed"
+    at 58.229 but "Stopped: 28.2s audio" at 58.397 -- the wake word was live
+    while the clip it had just captured was still being assembled. Releasing
+    last keeps the ordering honest.
+    """
+    import numpy as np
+    from jarvis.config import CONFIG
+
+    order = []
+
+    class Ctx:
+        def __exit__(self, *a):
+            order.append("release")
+            return False
+
+    monkeypatch.setattr(CONFIG, "sound", False)
+    rec = Recorder(MicArbiter(), speaker_verifier=None)
+    rec.recording = True
+    rec._session_ctx = Ctx()
+    monkeypatch.setattr(rec, "_join_poll_thread", lambda: None)
+    monkeypatch.setattr(rec, "_finalize_audio",
+                        lambda: (order.append("finalize"),
+                                 np.zeros(16, dtype=np.float32))[1])
+
+    rec.stop()
+
+    assert order == ["finalize", "release"], order

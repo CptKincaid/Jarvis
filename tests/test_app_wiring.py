@@ -851,3 +851,54 @@ def test_a_newer_question_supersedes_the_old_one(app, monkeypatch):
         assert superseded, "the stale card must be closed, not left hanging"
     finally:
         sink.close()
+
+
+# ---------------------------------- 2c. one utterance at a time
+#
+# _on_hotword guarded only on `recorder.recording`, which is already False for
+# the whole transcription pass -- ~20 s of Whisper on the 2026-08-27 clip. A
+# second wake word inside that window opened a competing recording while the
+# first transcript was still in flight. Releasing the mic after finalising
+# (recorder.stop) closes ~200 ms of it; this closes the rest.
+def test_a_wake_word_during_transcription_is_refused(app, monkeypatch):
+    started = []
+    # the stubbed recorder reports truthy .recording, which would satisfy the
+    # OLD guard and make this pass for the wrong reason
+    app.recorder.recording = False
+    monkeypatch.setattr(app.recorder, "start", lambda: started.append(1))
+    app._audio_busy.set()                    # pretend a transcript is in flight
+
+    app._on_hotword(0.9)
+    time.sleep(0.35)                         # the start is on a 0.2 s timer
+
+    assert started == [], "a second capture opened mid-transcription"
+
+
+def test_the_next_wake_word_works_once_processing_finishes(app, monkeypatch):
+    started = []
+    # speaker filtering is exercised elsewhere; this is about the busy flag
+    monkeypatch.setattr(CONFIG, "speaker_verify", False)
+    app.recorder.recording = False
+    monkeypatch.setattr(app.recorder, "start", lambda: started.append(1))
+    monkeypatch.setattr(app, "_dispatch", lambda text, source: None)
+    monkeypatch.setattr(app.transcriber, "transcribe",
+                        lambda audio: SimpleNamespace(
+                            text="", confidence=0.0, accepted=True))
+
+    app._process_audio(object())             # runs and clears the flag
+    assert not app._audio_busy.is_set()
+
+    app._on_hotword(0.9)
+    time.sleep(0.35)
+    assert started == [1]
+
+
+def test_a_failure_mid_transcription_does_not_leave_jarvis_deaf(app, monkeypatch):
+    """If the flag leaked on an exception, no wake word would ever work again."""
+    def boom(audio):
+        raise RuntimeError("cuda gone")
+
+    monkeypatch.setattr(CONFIG, "speaker_verify", False)
+    monkeypatch.setattr(app.transcriber, "transcribe", boom)
+    app._process_audio(object())
+    assert not app._audio_busy.is_set()

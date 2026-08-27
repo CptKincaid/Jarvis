@@ -436,9 +436,16 @@ class Recorder:
             self._stream = None
 
         self._join_poll_thread()
-        self._release_session()
 
-        audio = self._finalize_audio()
+        # Finalise BEFORE handing the mic back. Releasing first resumed the
+        # wake word while the clip it had just captured was still being
+        # assembled -- log 2026-08-27: "Hotword stream resumed" at 58.229,
+        # "Stopped: 28.2s audio" at 58.397. try/finally because a release
+        # skipped by a raising _finalize_audio would leave Jarvis deaf.
+        try:
+            audio = self._finalize_audio()
+        finally:
+            self._release_session()
         self.last_audio = audio
         bus.publish(RecordingStopped(reason=reason))
         return audio

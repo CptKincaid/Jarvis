@@ -205,6 +205,9 @@ class JarvisApp:
         self.commander.on_uncertain = self._on_uncertain
         self._pending_uncertain: dict = {}      # request_id -> utterance
         self._uncertain_lock = threading.Lock()
+        # Set while a captured clip is being transcribed. recorder.recording
+        # is already False by then, so it cannot serve as the guard.
+        self._audio_busy = threading.Event()
 
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
@@ -766,6 +769,15 @@ class JarvisApp:
         # Called from the hotword listener thread.
         if self.recorder.recording:
             return
+        if self._audio_busy.is_set():
+            # Transcription of the previous utterance is still running (~20 s
+            # for a long clip). Starting a second capture here raced two
+            # transcripts into the commander. Say so rather than ignoring it
+            # silently -- an unanswered wake word reads as a broken mic.
+            log.info("hotword ignored: still transcribing the previous clip")
+            bus.publish(Status(text="One moment — still on the last one",
+                               kind="warn"))
+            return
         if CONFIG.sound:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
         threading.Timer(0.2, self.recorder.start).start()
@@ -776,6 +788,7 @@ class JarvisApp:
         audio = self.recorder.last_audio
         if audio is None:
             return
+        self._audio_busy.set()
         threading.Thread(target=self._process_audio, args=(audio,),
                          daemon=True).start()
 
@@ -802,6 +815,10 @@ class JarvisApp:
         except Exception:
             log.exception("audio processing failed")
             bus.publish(Status(text="Transcription failed", kind="error"))
+        finally:
+            # Must run on every path: a leaked flag makes every future wake
+            # word a no-op, which looks exactly like a dead microphone.
+            self._audio_busy.clear()
 
     # -------------------------------------------------------------- routing
     def _emit_result(self, result):
