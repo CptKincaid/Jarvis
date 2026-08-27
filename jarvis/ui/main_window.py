@@ -1241,7 +1241,8 @@ class MainWindow:
     def _ev_uncertain_done(self, ev: UncertainResolved):
         # also fires when the spoken reply answered it, so the card stops
         # inviting a click that would arrive too late
-        self.transcript.resolve_approval(ev.request_id, ev.yes)
+        self.transcript.resolve_approval(ev.request_id, ev.yes,
+                                         yes_mark="yes", no_mark="no")
 
     def _answer_uncertain(self, request_id: str, yes: bool):
         fn = self.services.uncertain_answer

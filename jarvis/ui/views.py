@@ -828,9 +828,12 @@ class TranscriptView(tk.Frame):
         return card
 
     def resolve_approval(self, request_id: str, allowed: bool,
-                         mark: bool = True):
+                         mark: bool = True, yes_mark: str = "allowed",
+                         no_mark: str = "declined"):
         """Disable the card's buttons; with `mark` append '· allowed' /
-        '· declined' to its head row (ApprovalResolved)."""
+        '· declined' to its head row (ApprovalResolved). The
+        "Was that for me?" card passes 'yes' / 'no' -- approval wording on a
+        plain question reads as though permission was granted."""
         info = self._approvals.get(request_id)
         if not info:
             return
@@ -841,7 +844,7 @@ class TranscriptView(tk.Frame):
                 pass
         if mark and not info["done"]:
             info["done"] = True
-            word = "allowed" if allowed else "declined"
+            word = yes_mark if allowed else no_mark
             try:
                 info["stamp"].configure(text=f"{info['stamp_text']} · {word}")
             except tk.TclError:
