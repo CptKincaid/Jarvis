@@ -89,7 +89,10 @@ THINKING_LINES = [
     "Looking into it now, sir.",
     "One moment, sir — I'm checking.",
 ]
-THINKING_DELAY_S = 2.0          # only speak up if the answer is slower than this
+# 3.5 not 2.0: local replies measured 2.0-2.3 s, so firing at 2.0 guaranteed
+# the filler spoke every time -- and the real answer then queued BEHIND it,
+# adding ~2.9 s (2026-08-28 12:54). Only genuinely slow lookups should talk.
+THINKING_DELAY_S = 3.5
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
 _YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "aye", "allow",
@@ -493,11 +496,11 @@ class JarvisApp:
 
     # ------------------------------------------------------- brain executor
     def _on_brain_tags(self, tags):
-        # Whatever else these tags mean, their arrival ends the turn.
-        self._turn_finished()
         """Port of the monolith's _on_brain_response: act on [TAG] tuples.
         A ("BRIEFING", json) tag turns that turn's SPEAK into ONE
         BriefingReady card (no separate JarvisReply) — still spoken."""
+        # Whatever else these tags mean, their arrival ends the turn.
+        self._turn_finished()
         briefing = None
         for tag, content in tags:
             if tag == "BRIEFING":
@@ -511,12 +514,17 @@ class JarvisApp:
         for tag, content in tags:
             try:
                 if tag == "SPEAK":
+                    # The screen keeps the detail; the voice does not. Speaking
+                    # a four-class Monday verbatim took 23 s of audio on
+                    # 2026-08-28 while the text was already on screen. Every
+                    # other spoken path already capped; this one did not.
+                    spoken = self._spoken_cap(content) or content
                     if briefing is not None:
-                        bus.publish(BriefingReady(sections=briefing, spoken=content))
+                        bus.publish(BriefingReady(sections=briefing, spoken=spoken))
                         briefing = None
                     else:
                         bus.publish(JarvisReply(text=content, speak=True))
-                    self._say(content)
+                    self._say(spoken)
                     self.context.add_exchange("", content)
                 elif tag == "BRIEFING":
                     pass                               # consumed by the SPEAK
@@ -912,6 +920,8 @@ class JarvisApp:
 
     def _say_thinking(self):
         """Acknowledge a slow lookup. Rotates so it does not become a tic."""
+        if not self._turn_busy.is_set():
+            return          # the answer landed while this timer was firing
         try:
             line = THINKING_LINES[self._thinking_i % len(THINKING_LINES)]
             self._thinking_i += 1

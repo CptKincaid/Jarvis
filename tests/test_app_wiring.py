@@ -1027,3 +1027,58 @@ def test_a_synchronous_answer_closes_the_turn_immediately(app, monkeypatch):
 
     app._dispatch("what time is it", "voice")
     assert not app._turn_busy.is_set()
+
+
+# ------------------------------- 2f. the screen may be verbose; the voice not
+#
+# 2026-08-28 12:54: the reply appeared on screen instantly and then took 23.0 s
+# to speak. Not slow synthesis -- _on_brain_tags spoke the model's SPEAK text
+# verbatim, and for "what's on my calendar Monday?" that was four classes with
+# building names. Every other spoken path caps at two sentences; this one did
+# not.
+LONG_REPLY = (
+    "You have four academic commitments on Monday, sir, starting with "
+    "Biosensors at 9:10 am in Wisenbaker 049. Then Magnetic Resonance "
+    "Engineering at 12:40 pm in the Emerging Technologies Building 1003. "
+    "After that Electrical Design Lab Two presentation at 4:10 pm in ETB "
+    "1020. Finally Magnetic Resonance Engineering again at 6:00 pm in "
+    "Zachry 330 for about three hours.")
+
+
+def test_a_long_reply_is_trimmed_for_speech(app):
+    app._on_brain_tags([("SPEAK", LONG_REPLY)])
+
+    assert app.tts.spoken, "nothing was spoken"
+    said = app.tts.spoken[-1]
+    assert len(said) < len(LONG_REPLY), "spoke the whole thing"
+    assert said.count(".") <= 2, f"more than two sentences: {said!r}"
+
+
+def test_the_full_text_still_reaches_the_screen(app):
+    sink = Sink(JarvisReply)
+    try:
+        app._on_brain_tags([("SPEAK", LONG_REPLY)])
+        ev = sink.wait(JarvisReply)
+        assert ev is not None and ev.text == LONG_REPLY, \
+            "the screen should keep the detail the voice drops"
+    finally:
+        sink.close()
+
+
+def test_a_short_reply_is_untouched(app):
+    app._on_brain_tags([("SPEAK", "You have nothing on today, sir.")])
+    assert app.tts.spoken[-1] == "You have nothing on today, sir."
+
+
+def test_the_filler_does_not_speak_once_the_answer_has_landed(app, monkeypatch):
+    """It fired 31 ms before the reply on 2026-08-28 and the answer then
+    queued behind it, adding ~2.9 s for no benefit."""
+    app._turn_busy.clear()
+    app._say_thinking()
+    assert all(line not in app_mod.THINKING_LINES for line in app.tts.spoken)
+
+
+def test_the_filler_threshold_clears_a_typical_reply(app):
+    """Local replies measured 2.0-2.3 s; firing at 2.0 s guarantees it always
+    speaks, which is the opposite of 'only when he has to really look'."""
+    assert app_mod.THINKING_DELAY_S >= 3.0
