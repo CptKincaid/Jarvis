@@ -514,17 +514,18 @@ class JarvisApp:
         for tag, content in tags:
             try:
                 if tag == "SPEAK":
-                    # The screen keeps the detail; the voice does not. Speaking
-                    # a four-class Monday verbatim took 23 s of audio on
-                    # 2026-08-28 while the text was already on screen. Every
-                    # other spoken path already capped; this one did not.
-                    spoken = self._spoken_cap(content) or content
+                    # Spoken in full, deliberately. Capping this to two
+                    # sentences was tried on 2026-08-28 and reverted: cutting
+                    # an answer short mid-list is the LEAST human-sounding
+                    # option available. What made a long reply feel wrong was
+                    # the gap between chunks, and that is fixed in the
+                    # splitter (tts._split_sentences), not by saying less.
                     if briefing is not None:
-                        bus.publish(BriefingReady(sections=briefing, spoken=spoken))
+                        bus.publish(BriefingReady(sections=briefing, spoken=content))
                         briefing = None
                     else:
                         bus.publish(JarvisReply(text=content, speak=True))
-                    self._say(spoken)
+                    self._say(content)
                     self.context.add_exchange("", content)
                 elif tag == "BRIEFING":
                     pass                               # consumed by the SPEAK

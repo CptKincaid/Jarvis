@@ -503,14 +503,24 @@ class TTS:
         r'(?:\b(?:mr|mrs|ms|dr|prof|sr|jr|st|vs|etc|no|inc|ltd|co|fig|dept'
         r'|est|approx|min|max|e\.g|i\.e)|\b[A-Za-z])[.;]$', re.IGNORECASE)
 
-    def _split_sentences(self, text: str, min_chars: int = 20) -> list[str]:
-        """Split text into sentence chunks for pipelined synthesis.
+    _MAX_CHUNK_CHARS = 160
+
+    def _split_sentences(self, text: str, min_chars: int = 20,
+                         max_chars: int | None = None) -> list[str]:
+        """Split text into chunks for pipelined synthesis.
 
         Splits on [.!?;]+whitespace, keeps common abbreviations (Mr. / e.g. /
         single initials) attached, and merges fragments shorter than
         ``min_chars`` forward (a short trailing fragment merges backward).
+
+        Chunks longer than ``max_chars`` are then broken again at commas.
+        Sentence-only splitting starved playback: a short opening sentence
+        followed by one long comma-separated list meant chunk 2 took longer to
+        synthesise than chunk 1 took to play, and the gap was audible
+        (2026-08-28 13:02). Smaller chunks keep the producer ahead.
         """
         parts = re.split(r'(?<=[.!?;])\s+', text)
+        max_chars = self._MAX_CHUNK_CHARS if max_chars is None else max_chars
         chunks: list[str] = []
         buf = ""
         for part in parts:
@@ -527,7 +537,28 @@ class TTS:
                 chunks[-1] = f"{chunks[-1]} {buf}"   # tiny tail merges back
             else:
                 chunks.append(buf)
-        return chunks or [text]
+
+        # Second pass: a chunk far longer than the one before it starves
+        # playback, so break the long ones again at commas.
+        out: list[str] = []
+        for chunk in chunks:
+            if len(chunk) <= max_chars:
+                out.append(chunk)
+                continue
+            piece = ""
+            for part in re.split(r"(?<=,)\s+", chunk):
+                candidate = f"{piece} {part}".strip() if piece else part
+                if piece and len(candidate) > max_chars:
+                    out.append(piece)
+                    piece = part
+                else:
+                    piece = candidate
+            if piece:
+                if out and len(piece) < min_chars:
+                    out[-1] = f"{out[-1]} {piece}"
+                else:
+                    out.append(piece)
+        return out or [text]
 
     # --------------------------------------------------------- envelope
     def _start_amp_feeder(self, wav_path: str):

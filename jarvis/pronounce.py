@@ -41,6 +41,17 @@ USER_FILE = PATHS.AIWS / "tts_pronunciations.json"
 # spelled -> spoken. Keep entries to things both engines actually get wrong;
 # ordinary English needs no help. Lower-case keys match any casing.
 DEFAULT_PRONUNCIATIONS: dict[str, str] = {
+    # calendar shorthand. Course and room titles arrive from Navigate360 and
+    # Canvas already abbreviated ("MAGNETIC RESONANCE ENGR", "Wisenbaker
+    # Engineering Bldg 049"), so the text is never written out for him and
+    # this is the only place it can be expanded. Lower-case keys match any
+    # casing; matching is whole-token, so "Engrave" is untouched.
+    "engr": "Engineering",
+    "bldg": "Building",
+    "dept": "Department",
+    "lect": "Lecture",
+    "appt": "appointment",
+    "tamu": "Texas A and M",
     # the workshop
     "VSS": "V S S",
     "GB10": "G B ten",

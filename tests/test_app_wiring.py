@@ -1045,13 +1045,14 @@ LONG_REPLY = (
     "Zachry 330 for about three hours.")
 
 
-def test_a_long_reply_is_trimmed_for_speech(app):
+def test_a_long_reply_is_spoken_in_full(app):
+    """Capping this at two sentences was tried and reverted the same day: the
+    user wants him to sound human, and stopping mid-list does not. The delay
+    that prompted the cap came from chunking, not from length."""
     app._on_brain_tags([("SPEAK", LONG_REPLY)])
 
     assert app.tts.spoken, "nothing was spoken"
-    said = app.tts.spoken[-1]
-    assert len(said) < len(LONG_REPLY), "spoke the whole thing"
-    assert said.count(".") <= 2, f"more than two sentences: {said!r}"
+    assert app.tts.spoken[-1] == LONG_REPLY
 
 
 def test_the_full_text_still_reaches_the_screen(app):

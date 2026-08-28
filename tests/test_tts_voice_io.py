@@ -238,3 +238,47 @@ def test_in_process_say_goes_straight_to_sink(tmp_path, monkeypatch):
         assert not (tmp_path / "q.txt").exists()
     finally:
         sq.set_sink(None)
+
+
+# ------------------------------------------- chunking long sentences
+#
+# 2026-08-28 13:02: an audible gap between the first and second spoken
+# sentence. The pipelined path synthesises chunk N+1 while chunk N plays, but
+# it split only on [.!?;] -- so "It is overcast today with a high of 98." (a
+# few seconds of audio) was followed by one enormous comma-separated sentence
+# listing four classes with building names. Synthesis of chunk 2 took far
+# longer than chunk 1 took to play, and playback ran dry.
+LONG_SENTENCE = (
+    "On Monday you have Biosensors at 9:10 am in Wisenbaker 049, then "
+    "Magnetic Resonance Engineering at 12:40 pm in the Emerging Technologies "
+    "Building 1003, then Electrical Design Lab Two at 4:10 pm in ETB 1020, "
+    "and finally Magnetic Resonance Engineering again at 6:00 pm in Zachry 330.")
+
+
+def test_a_long_sentence_is_broken_up_for_synthesis(tts):
+    chunks = tts._split_sentences(LONG_SENTENCE)
+    assert len(chunks) > 1, "one huge chunk starves playback and you hear a gap"
+    assert all(len(c) <= 200 for c in chunks), [len(c) for c in chunks]
+
+
+def test_chunking_preserves_every_word_in_order(tts):
+    chunks = tts._split_sentences(LONG_SENTENCE)
+    assert " ".join(chunks).split() == LONG_SENTENCE.split()
+
+
+def test_it_breaks_at_commas_not_mid_word(tts):
+    for chunk in tts._split_sentences(LONG_SENTENCE):
+        assert chunk == chunk.strip()
+        assert not chunk.startswith(","), chunk
+
+
+def test_ordinary_sentences_are_left_alone(tts):
+    text = "You have nothing on today, sir."
+    assert tts._split_sentences(text) == [text]
+
+
+def test_two_normal_sentences_still_split_on_the_full_stop(tts):
+    # both halves over min_chars; a shorter tail merges backward by design
+    text = ("It is overcast today with a high of 98. "
+            "You have nothing else on the calendar today, sir.")
+    assert len(tts._split_sentences(text)) == 2

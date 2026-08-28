@@ -83,4 +83,33 @@ def test_defaults_have_no_plain_english():
     for key in DEFAULT_PRONUNCIATIONS:
         assert key != key.lower() or any(ch.isdigit() for ch in key) or key in {
             "nvidia", "ollama", "qwen", "pytorch", "pytest", "xdotool", "xclip",
-            "nmcli", "ffmpeg", "tkinter", "sudo", "ok", "aarch64", "llama3.2"}
+            "nmcli", "ffmpeg", "tkinter", "sudo", "ok", "aarch64", "llama3.2",
+            # calendar shorthand (2026-08-28). None is an English word, so
+            # matching any casing is safe. "rm" and "sem" were considered and
+            # rejected: "rm" would rewrite the shell command as "Room".
+            "engr", "bldg", "dept", "lect", "appt", "tamu"}
+
+
+# --------------------------------------------------- spoken abbreviations
+#
+# 2026-08-28: Jarvis read a calendar title aloud as "ENGR" rather than
+# "Engineering". Course titles arrive from Navigate360 already abbreviated
+# (MAGNETIC RESONANCE ENGR, Bldg, ETB), so the text is never written out for
+# him -- the pronunciation layer is the only place to expand it.
+@pytest.mark.parametrize("raw,spoken", [
+    ("MAGNETIC RESONANCE ENGR", "Engineering"),
+    ("Wisenbaker Engineering Bldg 049", "Building"),
+    ("ECEN 442 Lab", "Lab"),
+])
+def test_course_abbreviations_are_spoken_in_full(raw, spoken):
+    from jarvis.pronounce import Pronunciations
+    said = Pronunciations(path=None).apply(raw)
+    assert spoken.lower() in said.lower(), f"{raw!r} -> {said!r}"
+
+
+def test_expansion_is_whole_token_only():
+    """'Bldg' must expand; a word merely containing those letters must not."""
+    from jarvis.pronounce import Pronunciations
+    p = Pronunciations(path=None)
+    assert "Building" in p.apply("Bldg 049")
+    assert p.apply("Engrave the plate") == "Engrave the plate"
