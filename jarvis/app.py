@@ -81,6 +81,16 @@ APPROVAL_TIMEOUT_LINE = "No answer in two minutes, sir; I've declined it."
 ALLOWED_LINE = "Allowed, sir."
 DECLINED_LINE = "Declined, sir."
 
+# Spoken when an answer is slow to arrive. Cached at startup: an uncached XTTS
+# line took 12.6 s to render on 2026-08-27, which would make the reassurance
+# slower than the answer it is meant to cover.
+THINKING_LINES = [
+    "Checking right now, sir. One moment.",
+    "Looking into it now, sir.",
+    "One moment, sir — I'm checking.",
+]
+THINKING_DELAY_S = 2.0          # only speak up if the answer is slower than this
+
 _YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "aye", "allow",
                         "allowed", "approve", "approved", "ok", "okay", "sure",
                         "affirmative", "permit", "proceed", "go", "ahead", "do", "it"})
@@ -208,6 +218,7 @@ class JarvisApp:
         # Set while a captured clip is being transcribed. recorder.recording
         # is already False by then, so it cannot serve as the guard.
         self._audio_busy = threading.Event()
+        self._thinking_i = 0             # rotates THINKING_LINES
 
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
@@ -325,6 +336,7 @@ class JarvisApp:
         """Short lines Jarvis says verbatim and often — rendered into the
         speech cache at startup so they play instantly."""
         phrases = [p for lines in COURTESY_REPLIES.values() for p in lines]
+        phrases += list(THINKING_LINES)
         phrases += [CONTINUE_PROMPT, "Very good, sir.",
                     "I haven't said anything yet, sir.",
                     "The clipboard is empty, sir.",
@@ -833,8 +845,31 @@ class JarvisApp:
             bus.publish(Status(text=result.status, kind="info"))
         return result
 
+    _thinking_delay_s = THINKING_DELAY_S
+
     def _dispatch(self, text, source):
-        return self._emit_result(self.commander.handle(text, source))
+        # Voice only: a typed answer is visible as it arrives, so being told
+        # to wait is just noise. The timer is cancelled the moment the real
+        # reply is ready, so a fast answer says nothing extra.
+        timer = None
+        if source == "voice" and CONFIG.talkback:
+            timer = threading.Timer(self._thinking_delay_s, self._say_thinking)
+            timer.daemon = True
+            timer.start()
+        try:
+            return self._emit_result(self.commander.handle(text, source))
+        finally:
+            if timer is not None:
+                timer.cancel()
+
+    def _say_thinking(self):
+        """Acknowledge a slow lookup. Rotates so it does not become a tic."""
+        try:
+            line = THINKING_LINES[self._thinking_i % len(THINKING_LINES)]
+            self._thinking_i += 1
+            self._say(line)
+        except Exception:
+            log.exception("thinking line failed")
 
     # ---------------------------------------------------- uncertain intent
     UNCERTAIN_LISTEN_S = 5.0

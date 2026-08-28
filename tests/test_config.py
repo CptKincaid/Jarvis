@@ -18,7 +18,11 @@ def test_load_missing_file_gives_defaults(settings_file):
     cfg = Config.load()
     assert cfg.model == "small"
     assert cfg.talkback is True
-    assert cfg.silence_timeout == 8.0
+    # 8.0 until 2026-08-27: together with the 5 s grace it put a ~13 s
+    # floor under every utterance. Tuned for wake-word commands; raise
+    # both again for dictation, where long pauses are normal.
+    assert cfg.silence_timeout == 2.5
+    assert cfg.silence_grace == 1.5
     assert cfg._extra == {}
 
 

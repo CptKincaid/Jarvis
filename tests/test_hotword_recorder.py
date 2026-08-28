@@ -184,3 +184,77 @@ def test_stop_releases_the_mic_only_after_finalising(monkeypatch):
     rec.stop()
 
     assert order == ["finalize", "release"], order
+
+
+# ------------------------------------------- how long it keeps listening
+#
+# Measured 2026-08-27 19:46:49: a two-second question held the mic for 12.9 s
+# before auto-stopping. Two delays stacked -- a hard-coded 5 s grace where the
+# silence clock is erased, then an 8 s silence timeout -- giving a ~13 s floor
+# on every utterance however short. The grace is now configurable and both
+# defaults suit a wake-word command rather than dictation.
+def _recording(monkeypatch, started_ago: float, silent_for=None):
+    import jarvis.recorder as rec_mod
+
+    clock = [1000.0]
+    monkeypatch.setattr(rec_mod.time, "monotonic", lambda: clock[0])
+    r = Recorder(MicArbiter(), speaker_verifier=None)
+    r.recording = True
+    r._record_start_time = clock[0] - started_ago
+    r._silence_start = None if silent_for is None else clock[0] - silent_for
+    r._audio_frames = [object()] * 50
+    r.stopped_with = None
+    monkeypatch.setattr(r, "stop", lambda reason="manual": setattr(r, "stopped_with", reason))
+    return r
+
+
+def test_defaults_suit_a_spoken_command_not_dictation():
+    """The DATACLASS defaults, not the loaded CONFIG -- a user's saved
+    voice_settings.json overrides them, so this pins what a fresh install gets."""
+    import dataclasses
+    from jarvis.config import Config
+    defaults = {f.name: f.default for f in dataclasses.fields(Config)}
+    assert defaults["silence_grace"] <= 2.0, "grace this long makes commands feel stuck"
+    assert defaults["silence_timeout"] <= 3.0, "8 s of trailing silence was the complaint"
+
+
+def test_no_auto_stop_during_the_grace_period(monkeypatch):
+    from jarvis.config import CONFIG
+    monkeypatch.setattr(CONFIG, "silence_grace", 1.5)
+    monkeypatch.setattr(CONFIG, "silence_timeout", 2.5)
+    r = _recording(monkeypatch, started_ago=1.0, silent_for=99)
+
+    assert r._check_silence() is False
+    assert r.stopped_with is None
+    assert r._silence_start is None, "the grace must reset the silence clock"
+
+
+def test_auto_stop_once_grace_passed_and_silence_held(monkeypatch):
+    from jarvis.config import CONFIG
+    monkeypatch.setattr(CONFIG, "silence_grace", 1.5)
+    monkeypatch.setattr(CONFIG, "silence_timeout", 2.5)
+    r = _recording(monkeypatch, started_ago=5.0, silent_for=2.6)
+
+    assert r._check_silence() is True
+    assert r.stopped_with == "silence"
+
+
+def test_still_listening_when_silence_is_shorter_than_the_timeout(monkeypatch):
+    from jarvis.config import CONFIG
+    monkeypatch.setattr(CONFIG, "silence_grace", 1.5)
+    monkeypatch.setattr(CONFIG, "silence_timeout", 2.5)
+    r = _recording(monkeypatch, started_ago=5.0, silent_for=1.0)
+
+    assert r._check_silence() is False
+    assert r.stopped_with is None
+
+
+def test_grace_is_configurable_not_hard_coded(monkeypatch):
+    """The 5 s was a literal in _check_silence; a long grace must be reachable
+    again for dictation without editing code."""
+    from jarvis.config import CONFIG
+    monkeypatch.setattr(CONFIG, "silence_grace", 10.0)
+    monkeypatch.setattr(CONFIG, "silence_timeout", 2.5)
+    r = _recording(monkeypatch, started_ago=6.0, silent_for=99)
+
+    assert r._check_silence() is False, "grace of 10 s must still suppress at 6 s"

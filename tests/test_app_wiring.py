@@ -902,3 +902,60 @@ def test_a_failure_mid_transcription_does_not_leave_jarvis_deaf(app, monkeypatch
     monkeypatch.setattr(app.transcriber, "transcribe", boom)
     app._process_audio(object())
     assert not app._audio_busy.is_set()
+
+
+# ------------------------------ 2d. "one moment" while he goes and looks
+#
+# A calendar question on 2026-08-27 spent 2.2 s in the local model with no
+# sign anything was happening, on top of 12.9 s of listening. A short cached
+# acknowledgement fills that gap -- cached because an uncached XTTS line took
+# 12.6 s to render, which would make the reassurance slower than the answer.
+def test_a_fast_reply_says_nothing_extra(app, monkeypatch):
+    monkeypatch.setattr(app, "_thinking_delay_s", 5.0)   # far longer than the reply
+    monkeypatch.setattr(app.commander, "handle",
+                        lambda text, source: SimpleNamespace(
+                            reply="Right away, sir.", speak=True, status=""))
+
+    app._dispatch("what time is it", "voice")
+    time.sleep(0.3)
+
+    assert app.tts.spoken == ["Right away, sir."], app.tts.spoken
+
+
+def test_a_slow_lookup_gets_an_acknowledgement_first(app, monkeypatch):
+    monkeypatch.setattr(app, "_thinking_delay_s", 0.15)
+
+    def slow(text, source):
+        time.sleep(0.6)
+        return SimpleNamespace(reply="Nothing on today, sir.", speak=True, status="")
+
+    monkeypatch.setattr(app.commander, "handle", slow)
+
+    app._dispatch("what's on my calendar", "voice")
+    time.sleep(0.3)
+
+    assert app.tts.spoken, "nothing was said while he was looking"
+    assert app.tts.spoken[0] in app_mod.THINKING_LINES
+    assert app.tts.spoken[-1] == "Nothing on today, sir."
+
+
+def test_typed_input_never_gets_the_spoken_filler(app, monkeypatch):
+    """You can see a typed answer arriving; being told to wait is noise."""
+    monkeypatch.setattr(app, "_thinking_delay_s", 0.15)
+
+    def slow(text, source):
+        time.sleep(0.5)
+        return SimpleNamespace(reply="Done, sir.", speak=False, status="")
+
+    monkeypatch.setattr(app.commander, "handle", slow)
+
+    app._dispatch("what's on my calendar", "typed")
+
+    assert all(line not in app_mod.THINKING_LINES for line in app.tts.spoken)
+
+
+def test_the_acknowledgement_is_prewarmed(app):
+    """Uncached it would take longer to say than the answer it covers."""
+    phrases = app._canned_phrases()
+    for line in app_mod.THINKING_LINES:
+        assert line in phrases, f"{line!r} would be rendered live"

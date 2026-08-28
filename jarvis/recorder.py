@@ -567,8 +567,13 @@ class Recorder:
 
         timeout = CONFIG.silence_timeout
         min_frames = int(SAMPLE_RATE * 0.5 / (SAMPLE_RATE * 0.1))
-        # Don't auto-stop in the first 5 seconds of recording (grace period)
-        if self._record_start_time and (time.monotonic() - self._record_start_time) < 5.0:
+        # Grace period: no auto-stop this soon after the session opened, so a
+        # slow start ("Jarvis... uh...") is not clipped. Was a hard-coded 5.0,
+        # which together with an 8 s timeout put a ~13 s floor under every
+        # utterance no matter how short.
+        grace = CONFIG.silence_grace
+        if self._record_start_time and \
+                (time.monotonic() - self._record_start_time) < grace:
             self._silence_start = None
             self._loud_chunks = 0
             return False

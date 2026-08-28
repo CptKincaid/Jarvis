@@ -86,7 +86,12 @@ class Config:
     speaker_verify: bool = False
     speaker_threshold: float = 0.4
     target_name: str = ""
-    silence_timeout: float = 8.0
+    # Tuned 2026-08-27 for wake-word commands. At 5.0/8.0 a two-second
+    # question held the mic for ~13 s before auto-stopping. Raise both for
+    # dictation, where long pauses are normal and being cut off is worse
+    # than waiting.
+    silence_timeout: float = 2.5
+    silence_grace: float = 1.5     # no auto-stop this soon after start
     noise_threshold: float = 0.015
     window_geometry: str = ""
 
