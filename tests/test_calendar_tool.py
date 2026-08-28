@@ -384,7 +384,11 @@ def test_tool_spec_and_unconfigured_excuse(tmp_path, monkeypatch):
     specs = calendar.make_tools(FakeCfg(), SimpleNamespace())
     assert [s.name for s in specs] == ["get_calendar"]
     assert len(specs[0].description.split()) <= 20
-    assert specs[0].parameters["properties"]["range"]["enum"] == ["today", "tomorrow", "week", "next"]
+    enum = specs[0].parameters["properties"]["range"]["enum"]
+    assert enum[:4] == ["today", "tomorrow", "week", "next"]
+    # weekday names joined the enum 2026-08-28 so "agenda for Monday" can be
+    # asked for directly instead of degrading to "next" (one event).
+    assert "monday" in enum and "sunday" in enum
     reg, _ = tool_registry(tmp_path, FakeCfg(), monkeypatch)
     r = reg.call("get_calendar", {"range": "today"})
     assert not r.ok and r.text == \
@@ -439,3 +443,64 @@ def test_live_public_google_ics(tmp_path):
     assert src.refresh() is True and src.errors == []
     assert any(e.all_day for e in src.events())
     assert src.refresh() is True                       # conditional GET path
+
+
+# ------------------------------------------------------- named weekdays
+#
+# 2026-08-28 01:03: "What's on my agenda for Monday?" returned only
+# "Next: BIOSENSORS on Monday at 9:10 am" -- one event, when Monday held four.
+# The tool's range enum was (today, tomorrow, week, next), so "Monday" had
+# nowhere to land and the model picked "next", which means the single next
+# event. The model answered correctly for the vocabulary it was given.
+# Friday 28 Aug 2026; the following Monday is the 31st.
+FRI = datetime(2026, 8, 28, 9, 0).astimezone()
+MON = FRI + timedelta(days=3)
+
+
+def _ev(when, title):
+    return Event(start=when, end=when + timedelta(hours=1), title=title,
+                 calendar="Navigate360 - Courses")
+
+
+MONDAY_CLASSES = [
+    _ev(MON.replace(hour=9, minute=10), "BIOSENSORS"),
+    _ev(MON.replace(hour=12, minute=40), "MAGNETIC RESONANCE ENGR"),
+    _ev(MON.replace(hour=16, minute=10), "ELECTRICAL DESIGN LAB II"),
+    _ev(MON.replace(hour=18, minute=0), "MAGNETIC RESONANCE ENGR"),
+]
+
+
+def test_weekday_names_are_a_valid_range():
+    assert "monday" in calendar.RANGES
+    for word, want in (("monday", "monday"), ("Monday", "monday"),
+                       ("on monday", "monday"), ("for Monday", "monday"),
+                       ("this monday", "monday")):
+        assert coerce_range(word) == want, word
+
+
+def test_a_named_weekday_lists_every_event_that_day():
+    """The actual regression: four classes, not just the earliest."""
+    text = format_events(MONDAY_CLASSES, "monday", FRI)
+    for title in ("BIOSENSORS", "MAGNETIC RESONANCE ENGR",
+                  "ELECTRICAL DESIGN LAB II"):
+        assert title in text, f"{title} missing from {text!r}"
+    assert text.count("MAGNETIC RESONANCE ENGR") == 2, "both sittings"
+
+
+def test_a_weekday_resolves_forward_not_backward():
+    """Asked on Friday, 'Monday' means the coming Monday."""
+    text = format_events(MONDAY_CLASSES, "monday", FRI)
+    assert "BIOSENSORS" in text
+    # an event on the PREVIOUS Monday must not be picked up
+    old = [_ev((FRI - timedelta(days=4)).replace(hour=9), "OLD CLASS")]
+    assert "OLD CLASS" not in format_events(old, "monday", FRI)
+
+
+def test_todays_own_weekday_means_today():
+    friday_ev = [_ev(FRI.replace(hour=15), "OFFICE HOURS")]
+    assert "OFFICE HOURS" in format_events(friday_ev, "friday", FRI)
+
+
+def test_an_empty_weekday_says_so():
+    text = format_events([], "monday", FRI)
+    assert "monday" in text.lower() and "nothing" in text.lower()

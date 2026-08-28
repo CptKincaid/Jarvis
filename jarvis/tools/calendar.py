@@ -36,7 +36,12 @@ log = get_logger("tools.calendar")
 REFRESH_S = 600                 # refresh period and the "stale" threshold
 FETCH_TIMEOUT = 8
 WINDOW_DAYS = 14                # how far ahead the cache reaches
-RANGES = ("today", "tomorrow", "week", "next")
+# Named weekdays are ranges too. Without them "what's on my agenda for
+# Monday?" had nowhere to land and the model fell back to "next", which
+# answers with a single event -- seen 2026-08-28 when Monday held four.
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday",
+            "saturday", "sunday")
+RANGES = ("today", "tomorrow", "week", "next") + WEEKDAYS
 ICLOUD_URL = "https://caldav.icloud.com"
 CACHE_VERSION = 1
 
@@ -236,6 +241,10 @@ def coerce_range(value) -> str:
         return "today"
     if text in RANGES:
         return text
+    # "on monday", "for Monday", "this monday"
+    for day in WEEKDAYS:
+        if re.search(rf"\b{day}\b", text):
+            return day
     if "tomorrow" in text or text in ("tmrw", "tmr"):
         return "tomorrow"
     if "week" in text or "7 day" in text or "seven day" in text:
@@ -251,6 +260,16 @@ def format_events(events, range: str = "today", now: datetime = None) -> str:
     now = now or now_local()
     today = now.date()
     events = merge_events(events)
+    if range in WEEKDAYS:
+        # The NEXT such day, counting today. Asked on Friday, "Monday" is the
+        # coming Monday, never the one just gone.
+        want = WEEKDAYS.index(range)
+        day = today + timedelta(days=(want - today.weekday()) % 7)
+        todays = _day_events(events, day)
+        if not todays:
+            return f"Nothing on {range.capitalize()}, sir."
+        return f"{range.capitalize()}: " + \
+            ", ".join(_event_words(e) for e in todays) + "; nothing else."
     if range in ("today", "tomorrow"):
         day = today if range == "today" else today + timedelta(days=1)
         todays = _day_events(events, day)
@@ -583,6 +602,111 @@ def make_source(cfg, services=None, **kw) -> CalendarSource:
     return source
 
 
+# --------------------------------------------------------------- writing
+#
+# Writing is a different category from reading: a misheard time becomes a real
+# object on the user's phone. Policy (chosen 2026-08-28): add outright when the
+# parse is unambiguous, confirm when it is not -- so this predicate carries the
+# whole safety of the feature and is deliberately conservative.
+_DAY_WORDS = ("today", "tomorrow", "tonight", "monday", "tuesday", "wednesday",
+              "thursday", "friday", "saturday", "sunday",
+              "january", "february", "march", "april", "may", "june", "july",
+              "august", "september", "october", "november", "december")
+_EXPLICIT_TIME = re.compile(
+    r"\b\d{1,2}\s*[:.]\s*\d{2}\b"      # 4:10, 09.15
+    r"|\b\d{1,2}\s*(a\.?m\.?|p\.?m\.?)\b"   # 4 pm, 11am
+    r"|\bnoon\b|\bmidnight\b", re.I)
+_DATE_NUMERIC = re.compile(r"\b\d{1,2}[/-]\d{1,2}\b|\b\d{4}-\d{2}-\d{2}\b")
+
+
+DEFAULT_WRITE_CALENDAR = "Calendar"
+# Feeds that mirror data Jarvis does not own -- the university's advising and
+# LMS calendars. Writing there could corrupt a subscription the user cannot
+# easily repair, so they are refused even when named explicitly.
+PROTECTED_CALENDARS = ("Navigate360", "Navigate Student", "Canvas")
+
+
+def _cal_name(cal) -> str:
+    try:
+        import caldav
+        props = cal.get_properties([caldav.elements.dav.DisplayName()])
+        name = props.get("{DAV:}displayname")
+        if name:
+            return str(name)
+    except Exception:                       # noqa: BLE001 - fakes and odd servers
+        pass
+    return str(getattr(cal, "name", "") or "")
+
+
+def pick_write_calendar(calendars, requested: Optional[str]):
+    """The calendar to write an event to. Raises ValueError with a spoken-
+    friendly message rather than guessing, because guessing here means the
+    event lands somewhere the user will not look."""
+    named = [(c, _cal_name(c)) for c in calendars]
+
+    def takes_events(cal) -> bool:
+        try:
+            return "VEVENT" in cal.get_supported_components()
+        except Exception:                   # noqa: BLE001
+            return True                     # servers that do not say: assume yes
+
+    if requested:
+        want = requested.strip().lower()
+        for cal, name in named:
+            if name.lower() == want:
+                if any(p.lower() in name.lower() for p in PROTECTED_CALENDARS):
+                    raise ValueError(f"{name} is read-only, sir")
+                if not takes_events(cal):
+                    raise ValueError(f"{name} does not take events, sir")
+                return cal
+        raise ValueError(f"I don't have a calendar called {requested}, sir")
+
+    for cal, name in named:
+        if name.lower() == DEFAULT_WRITE_CALENDAR.lower() and takes_events(cal):
+            return cal
+    for cal, name in named:
+        if takes_events(cal) and not any(
+                p.lower() in name.lower() for p in PROTECTED_CALENDARS):
+            return cal
+    raise ValueError("I don't have a calendar I can write to, sir")
+
+
+def event_confidence(text: str, now: datetime) -> tuple[bool, str]:
+    """(confident, reason). Confident means: add it without asking.
+
+    Requires explicit evidence of BOTH a day and a time in what the user
+    actually said, plus something left over to use as a title. It does NOT
+    trust parse_when_full simply returning a datetime: that resolves "at four"
+    by a heuristic (bare hours become 7-11am / 12 noon / 1-6pm), and a guess is
+    precisely the case confirmation exists for.
+    """
+    from jarvis.tools.timekeeper import parse_when_full
+
+    raw = (text or "").strip()
+    if not raw:
+        return False, "nothing to add"
+
+    lowered = raw.lower()
+    has_day = any(w in lowered for w in _DAY_WORDS) or bool(_DATE_NUMERIC.search(lowered))
+    has_time = bool(_EXPLICIT_TIME.search(lowered))
+
+    try:
+        when, _repeat, leftover = parse_when_full(raw, now)
+    except Exception:                       # noqa: BLE001 - parser is best effort
+        log.exception("event parse failed")
+        return False, "I could not work out when"
+
+    if when is None:
+        return False, "I could not work out when"
+    if not (leftover or "").strip():
+        return False, "I did not catch a title for it"
+    if not has_day:
+        return False, "you did not say which day"
+    if not has_time:
+        return False, "you did not say a clear time"
+    return True, ""
+
+
 def make_tools(cfg, services) -> list[ToolSpec]:
     source = make_source(cfg, services)
 
@@ -605,7 +729,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
     return [ToolSpec(
         name="get_calendar",
-        description="Hunter's calendar events for today, tomorrow, this week, or the next one.",
+        description=("Hunter's calendar for a weekday name, today, tomorrow, "
+                     "week, or next for only the next event."),
         parameters={"type": "object", "properties": {
             "range": {"type": "string", "enum": list(RANGES),
                       "description": "today, tomorrow, week or next"}},

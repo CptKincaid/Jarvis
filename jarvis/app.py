@@ -90,6 +90,7 @@ THINKING_LINES = [
     "One moment, sir — I'm checking.",
 ]
 THINKING_DELAY_S = 2.0          # only speak up if the answer is slower than this
+TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
 _YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "aye", "allow",
                         "allowed", "approve", "approved", "ok", "okay", "sure",
@@ -219,6 +220,12 @@ class JarvisApp:
         # is already False by then, so it cannot serve as the guard.
         self._audio_busy = threading.Event()
         self._thinking_i = 0             # rotates THINKING_LINES
+        # A turn is NOT over when handle() returns: brain.chat runs on a
+        # worker thread and the commander says so with done=False. This
+        # stays set until the reply actually lands.
+        self._turn_busy = threading.Event()
+        self._turn_timer = None          # slow-answer filler
+        self._turn_watchdog = None
 
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
@@ -486,6 +493,8 @@ class JarvisApp:
 
     # ------------------------------------------------------- brain executor
     def _on_brain_tags(self, tags):
+        # Whatever else these tags mean, their arrival ends the turn.
+        self._turn_finished()
         """Port of the monolith's _on_brain_response: act on [TAG] tuples.
         A ("BRIEFING", json) tag turns that turn's SPEAK into ONE
         BriefingReady card (no separate JarvisReply) — still spoken."""
@@ -781,7 +790,7 @@ class JarvisApp:
         # Called from the hotword listener thread.
         if self.recorder.recording:
             return
-        if self._audio_busy.is_set():
+        if self._audio_busy.is_set() or self._turn_busy.is_set():
             # Transcription of the previous utterance is still running (~20 s
             # for a long clip). Starting a second capture here raced two
             # transcripts into the commander. Say so rather than ignoring it
@@ -846,21 +855,60 @@ class JarvisApp:
         return result
 
     _thinking_delay_s = THINKING_DELAY_S
+    _turn_timeout_s = TURN_TIMEOUT_S
 
     def _dispatch(self, text, source):
-        # Voice only: a typed answer is visible as it arrives, so being told
-        # to wait is just noise. The timer is cancelled the moment the real
-        # reply is ready, so a fast answer says nothing extra.
-        timer = None
-        if source == "voice" and CONFIG.talkback:
-            timer = threading.Timer(self._thinking_delay_s, self._say_thinking)
-            timer.daemon = True
-            timer.start()
+        # Voice only: a typed answer is visible as it arrives, so being told to
+        # wait is just noise.
+        if source == "voice":
+            self._turn_start()
         try:
-            return self._emit_result(self.commander.handle(text, source))
-        finally:
-            if timer is not None:
-                timer.cancel()
+            result = self._emit_result(self.commander.handle(text, source))
+        except Exception:
+            self._turn_finished()
+            raise
+        # done=False means the answer is still coming on a worker thread (the
+        # commander routes local chat that way). Anything else is over now.
+        if source != "voice" or getattr(result, "done", True) is not False:
+            self._turn_finished()
+        return result
+
+    def _turn_start(self):
+        """Open a turn: arm the slow-answer filler and a watchdog."""
+        self._turn_cancel_timers()
+        self._turn_busy.set()
+        if CONFIG.talkback:
+            self._turn_timer = threading.Timer(self._thinking_delay_s,
+                                               self._say_thinking)
+            self._turn_timer.daemon = True
+            self._turn_timer.start()
+        # Without this a reply that never arrives would hold _turn_busy for
+        # good, and every later wake word would be a silent no-op --
+        # indistinguishable from a dead microphone.
+        self._turn_watchdog = threading.Timer(self._turn_timeout_s,
+                                              self._turn_timed_out)
+        self._turn_watchdog.daemon = True
+        self._turn_watchdog.start()
+
+    def _turn_timed_out(self):
+        log.warning("turn watchdog fired after %.0fs; releasing the wake word",
+                    self._turn_timeout_s)
+        self._turn_finished()
+
+    def _turn_cancel_timers(self):
+        for name in ("_turn_timer", "_turn_watchdog"):
+            t = getattr(self, name, None)
+            if t is not None:
+                try:
+                    t.cancel()
+                except Exception:
+                    log.debug("timer cancel failed", exc_info=True)
+                setattr(self, name, None)
+
+    def _turn_finished(self):
+        """The answer landed (or gave up). Also called from the brain callback."""
+        self._turn_cancel_timers()
+        self._turn_busy.clear()
 
     def _say_thinking(self):
         """Acknowledge a slow lookup. Rotates so it does not become a tic."""

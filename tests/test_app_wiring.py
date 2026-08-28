@@ -959,3 +959,70 @@ def test_the_acknowledgement_is_prewarmed(app):
     phrases = app._canned_phrases()
     for line in app_mod.THINKING_LINES:
         assert line in phrases, f"{line!r} would be rendered live"
+
+
+# --------------------------- 2e. a turn is not over when handle() returns
+#
+# brain.chat runs on a worker thread (brain.py:902) and the commander returns
+# CommandResult(done=False) meaning "the answer is still coming". Two things
+# built on 2026-08-27/28 wrongly treated handle() returning as the end of the
+# turn, and the 2026-08-28 01:03 log shows both failing: the "one moment"
+# filler never spoke despite a 2.3 s wait, and a wake word at 01:03:17 opened
+# a competing recording while the reply was still being generated.
+def _async_result():
+    return SimpleNamespace(reply="", speak=False, status="Thinking…", done=False)
+
+
+def test_an_async_turn_stays_busy_until_the_reply_arrives(app, monkeypatch):
+    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+
+    app._dispatch("what's on my agenda for monday", "voice")
+    assert app._turn_busy.is_set(), "handle() returning is not the end of the turn"
+
+    app._on_brain_tags([("SPEAK", "You have Biosensors at nine ten, sir.")])
+    assert not app._turn_busy.is_set(), "the reply should close the turn"
+
+
+def test_a_wake_word_during_reply_generation_is_refused(app, monkeypatch):
+    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+    app.recorder.recording = False
+    started = []
+    monkeypatch.setattr(app.recorder, "start", lambda: started.append(1))
+
+    app._dispatch("what's on my agenda", "voice")
+    app._on_hotword(0.9)
+    time.sleep(0.35)
+
+    assert started == [], "opened a second capture mid-reply"
+    app._on_brain_tags([("SPEAK", "done")])
+
+
+def test_the_filler_speaks_for_a_slow_async_reply(app, monkeypatch):
+    """The case it was built for, and the case it silently missed."""
+    monkeypatch.setattr(app, "_thinking_delay_s", 0.15)
+    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+
+    app._dispatch("what's on my agenda for monday", "voice")
+    time.sleep(0.45)
+
+    assert app.tts.spoken and app.tts.spoken[0] in app_mod.THINKING_LINES
+    app._on_brain_tags([("SPEAK", "done")])
+
+
+def test_a_reply_that_never_comes_cannot_leave_him_deaf(app, monkeypatch):
+    """A stuck turn flag would make every future wake word a no-op."""
+    monkeypatch.setattr(app, "_turn_timeout_s", 0.2)
+    monkeypatch.setattr(app.commander, "handle", lambda t, s: _async_result())
+
+    app._dispatch("something that never answers", "voice")
+    assert app._turn_busy.is_set()
+    time.sleep(0.5)
+    assert not app._turn_busy.is_set(), "the watchdog must release the turn"
+
+
+def test_a_synchronous_answer_closes_the_turn_immediately(app, monkeypatch):
+    monkeypatch.setattr(app.commander, "handle", lambda t, s: SimpleNamespace(
+        reply="Half past nine, sir.", speak=True, status="", done=True))
+
+    app._dispatch("what time is it", "voice")
+    assert not app._turn_busy.is_set()
