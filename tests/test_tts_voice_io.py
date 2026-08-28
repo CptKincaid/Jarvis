@@ -328,3 +328,49 @@ def test_priming_is_a_noop_without_xtts(monkeypatch):
     from jarvis.tts import TTS
     t = TTS(engine="edge", cache=False)
     t._prime_voice()          # must not raise
+
+
+# 2026-08-28, re-benchmarked after the GPU cold drain: the 160-char cap alone
+# is NOT enough. Measured 5 reps/arm on the un-wedged GB10, XTTS renders at
+# RTF ~0.29 (audio ~0.053 s/char, synthesis ~0.0154 s/char), and a short
+# opener followed by one long list still starved playback in 5 of 5 reps --
+# "Here is your briefing." buys 1.57 s of audio while the 153-char chunk
+# behind it needs 2.40 s to synthesise, an audible ~1 s hole.
+#
+# The invariant that actually prevents it: a chunk may only be as long as the
+# playback its PREDECESSOR buys. cover = 0.053*prev vs need = 0.0154*next, so
+# next <= 3.44*prev breaks even; _CHUNK_GROWTH keeps a safety margin under it.
+# Chunks must therefore GROW from a small opener, not sit at a uniform cap.
+SHORT_OPENER_THEN_LIST = (
+    "Here is your briefing. You have meetings with the analytics group, "
+    "the vendor team, your advisor, the compliance reviewer, and the two "
+    "new contractors, followed by a site walk, a budget review, a hardware "
+    "inspection, and the quarterly retrospective, all before four o'clock.")
+
+
+def test_a_chunk_never_outgrows_the_playback_its_predecessor_buys(tts):
+    for text in (SHORT_OPENER_THEN_LIST, LONG_SENTENCE):
+        chunks = tts._split_sentences(text)
+        for i, (prev, nxt) in enumerate(zip(chunks, chunks[1:]), start=1):
+            # a chunk with no comma to break at is allowed to overrun: we do
+            # not split mid-clause. Everything else must respect the ratio.
+            if "," in nxt.rstrip(","):
+                assert len(nxt) <= tts._CHUNK_GROWTH * len(prev), (
+                    f"chunk {i} ({len(nxt)}ch) outgrows chunk {i-1} "
+                    f"({len(prev)}ch) -> playback runs dry: "
+                    f"{[len(c) for c in chunks]}")
+
+
+def test_the_short_opener_case_starts_small_and_grows(tts):
+    chunks = tts._split_sentences(SHORT_OPENER_THEN_LIST)
+    assert len(chunks) > 2, [len(c) for c in chunks]
+    assert len(chunks[0]) < 40, "the opener stays its own quick first chunk"
+    assert len(chunks[1]) < 80, (
+        f"chunk 1 is {len(chunks[1])}ch; at 0.0154 s/char that is "
+        f"{0.0154 * len(chunks[1]):.2f}s of synthesis against only "
+        f"{0.053 * len(chunks[0]):.2f}s of cover")
+
+
+def test_graduated_chunking_still_preserves_every_word(tts):
+    chunks = tts._split_sentences(SHORT_OPENER_THEN_LIST)
+    assert " ".join(chunks).split() == SHORT_OPENER_THEN_LIST.split()

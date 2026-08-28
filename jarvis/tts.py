@@ -542,6 +542,12 @@ class TTS:
         r'|est|approx|min|max|e\.g|i\.e)|\b[A-Za-z])[.;]$', re.IGNORECASE)
 
     _MAX_CHUNK_CHARS = 160
+    # A chunk may be at most this many times the length of the one before it.
+    # Measured on the un-wedged GB10 (2026-08-28): XTTS renders at RTF ~0.29,
+    # i.e. ~0.053 s of audio and ~0.0154 s of synthesis per character, so a
+    # chunk breaks even against its predecessor's playback at 3.44x. 2.5x
+    # keeps a margin for XTTS's run-to-run sampling variance.
+    _CHUNK_GROWTH = 2.5
 
     def _split_sentences(self, text: str, min_chars: int = 20,
                          max_chars: int | None = None) -> list[str]:
@@ -578,17 +584,34 @@ class TTS:
 
         # Second pass: a chunk far longer than the one before it starves
         # playback, so break the long ones again at commas.
+        #
+        # The cap is GRADUATED, not fixed. A uniform max_chars still ran dry
+        # when a short opener led (measured 2026-08-28 after the GPU cold
+        # drain: "Here is your briefing." buys 1.57s of audio, but the 153-char
+        # chunk behind it needs 2.40s to synthesise -- an audible ~1s hole in
+        # 5 of 5 reps). What bounds a chunk is the playback its PREDECESSOR
+        # buys, so the allowance starts small and grows with each chunk
+        # emitted, converging on max_chars once there is enough cover.
+        def limit_after(prev: str | None) -> int:
+            if prev is None:
+                return max_chars
+            return max(min_chars, min(max_chars,
+                                      int(self._CHUNK_GROWTH * len(prev))))
+
         out: list[str] = []
         for chunk in chunks:
-            if len(chunk) <= max_chars:
+            limit = limit_after(out[-1] if out else None)
+            if len(chunk) <= limit:
                 out.append(chunk)
                 continue
             piece = ""
             for part in re.split(r"(?<=,)\s+", chunk):
                 candidate = f"{piece} {part}".strip() if piece else part
-                if piece and len(candidate) > max_chars:
+                if piece and len(candidate) > limit:
                     out.append(piece)
                     piece = part
+                    # the chunk just emitted buys cover for the next one
+                    limit = limit_after(out[-1])
                 else:
                     piece = candidate
             if piece:
