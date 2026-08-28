@@ -120,3 +120,67 @@ def test_a_reminders_only_list_is_not_an_event_target():
 def test_an_unknown_name_is_refused_rather_than_guessed():
     with pytest.raises(ValueError, match="don't have a calendar"):
         pick_write_calendar(ICLOUD, "Quidditch")
+
+
+# --------------------------------------------------------- the write itself
+from datetime import timedelta                                    # noqa: E402
+
+from jarvis.tools.calendar import build_vevent, write_event       # noqa: E402
+
+WHEN = datetime(2026, 8, 31, 16, 10).astimezone()
+
+
+def test_vevent_carries_what_was_asked_for():
+    ical = build_vevent("Lab presentation", WHEN, WHEN + timedelta(hours=1))
+    text = ical.decode() if isinstance(ical, bytes) else ical
+    assert "BEGIN:VEVENT" in text and "END:VEVENT" in text
+    assert "SUMMARY:Lab presentation" in text
+    assert "20260831T161000" in text.replace("-", "").replace(":", "")
+    assert "UID:" in text, "iCloud rejects an event with no UID"
+    assert "DTSTAMP" in text
+
+
+def test_write_goes_to_the_default_calendar_and_reports_it():
+    cals = [FakeCal("Work"), FakeCal("Calendar"), FakeCal("Home")]
+    line = write_event(cals, "Lab presentation", WHEN, WHEN + timedelta(hours=1))
+    target = [c for c in cals if c.name == "Calendar"][0]
+    assert len(target.saved) == 1, "did not write to the default calendar"
+    assert "Lab presentation" in line
+    assert "calendar" in line.lower()
+
+
+def test_write_honours_a_named_calendar():
+    cals = [FakeCal("Work"), FakeCal("Calendar")]
+    write_event(cals, "Standup", WHEN, WHEN + timedelta(minutes=15),
+                calendar_name="work")
+    assert len(cals[0].saved) == 1 and not cals[1].saved
+
+
+def test_write_refuses_a_protected_feed_before_touching_it():
+    cals = [FakeCal("Navigate360 - Courses"), FakeCal("Calendar")]
+    with pytest.raises(ValueError, match="read-only"):
+        write_event(cals, "Fake class", WHEN, WHEN + timedelta(hours=1),
+                    calendar_name="Navigate360 - Courses")
+    assert not cals[0].saved, "refused, but wrote anyway"
+
+
+def test_a_server_failure_is_not_reported_as_success():
+    class Broken(FakeCal):
+        def save_event(self, ical):
+            raise RuntimeError("412 precondition failed")
+
+    with pytest.raises(RuntimeError):
+        write_event([Broken("Calendar")], "X", WHEN, WHEN + timedelta(hours=1))
+
+
+def test_the_default_calendar_is_not_announced_as_calendar_calendar():
+    """The default list is literally named "Calendar"."""
+    line = write_event([FakeCal("Calendar")], "Lab", WHEN, WHEN + timedelta(hours=1))
+    assert "calendar calendar" not in line.lower()
+    assert "to your calendar" in line.lower()
+
+
+def test_a_named_calendar_is_still_announced():
+    line = write_event([FakeCal("Work")], "Standup", WHEN, WHEN + timedelta(hours=1),
+                       calendar_name="Work")
+    assert "work" in line.lower()

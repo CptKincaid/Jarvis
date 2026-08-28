@@ -72,6 +72,7 @@ from jarvis import pronounce
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
+from jarvis.tools.calendar import write_event
 from jarvis.router import ROUTER_QUESTION, RouteDecision, estimate_size
 
 log = get_logger("commander")
@@ -1973,6 +1974,11 @@ class Commander:
         res = self._try_terminal_offer(text)
         if res is not None:
             return res
+        # 3c. add_event read an interpretation back; a plain yes means THAT
+        #     event, not a new command.
+        res = self._try_event_confirm(text)
+        if res is not None:
+            return res
         # 4. A pending router question: resolve it and dispatch the
         #    remembered utterance (spec 5.2 c).
         res = self._try_router_answer(text)
@@ -2170,6 +2176,35 @@ class Commander:
                           project=pend.project,
                           args=dict(getattr(pend, "args", None) or {}))
         return self._dispatch_route(d, pend.text)
+
+    def _try_event_confirm(self, text: str) -> Optional[CommandResult]:
+        """Resolve a calendar add that was read back for confirmation.
+
+        Anything that is not a clear yes or no DROPS the offer rather than
+        writing: changing the subject must never be read as consent, and a
+        lingering offer would attach the next stray "yes" to a stale event.
+        """
+        source = self._svc("calendar")
+        pending = getattr(source, "pending_event", None) if source else None
+        if not pending:
+            return None
+        answer = parse_yes_no(text)
+        source.pending_event = None
+        if answer is None:
+            return None
+        if not answer:
+            return CommandResult(handled=True, reply="Very good, sir.",
+                                 speak=True, status="Dropped")
+        try:
+            line = write_event(source.icloud_calendars(), pending["title"],
+                               pending["start"], pending["end"],
+                               calendar_name=pending.get("calendar"))
+        except Exception as exc:             # noqa: BLE001 - refusal or server
+            log.exception("calendar write failed")
+            line = f"I couldn't add that, sir — {type(exc).__name__}."
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status="Add failed")
+        return CommandResult(handled=True, reply=line, speak=True, status="Added")
 
     def _try_terminal_offer(self, text: str) -> Optional[CommandResult]:
         """After OUTSIDE_LINE ("...say the word and I'll open the terminal

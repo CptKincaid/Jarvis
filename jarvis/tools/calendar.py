@@ -22,7 +22,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -433,6 +433,17 @@ class CalendarSource:
             stamps = [e["fetched_at"] for e in self._sources.values()]
         return min(stamps) if stamps else None
 
+    pending_event = None      # set by add_event when it needs a yes
+
+    def icloud_calendars(self):
+        """Live caldav Calendar objects, for writing. Raises when unconfigured."""
+        creds = self.icloud
+        if creds is None:
+            raise ValueError("I don't have your iCloud calendar set up, sir")
+        client = self._dav_client(url=creds["url"], username=creds["username"],
+                                  password=creds["password"])
+        return list(client.principal().calendars())
+
     def events(self) -> list[Event]:
         with self._lock:
             groups = [list(e["events"]) for e in self._sources.values()]
@@ -671,6 +682,45 @@ def pick_write_calendar(calendars, requested: Optional[str]):
     raise ValueError("I don't have a calendar I can write to, sir")
 
 
+def build_vevent(title: str, start: datetime, end: datetime) -> bytes:
+    """A minimal, valid VEVENT. iCloud rejects events without UID/DTSTAMP."""
+    import uuid as _uuid
+
+    import icalendar
+
+    cal = icalendar.Calendar()
+    cal.add("prodid", "-//Jarvis//EN")
+    cal.add("version", "2.0")
+    ev = icalendar.Event()
+    ev.add("summary", title)
+    ev.add("dtstart", start)
+    ev.add("dtend", end)
+    ev.add("dtstamp", datetime.now(timezone.utc))
+    ev.add("uid", f"{_uuid.uuid4()}@jarvis")
+    cal.add_component(ev)
+    return cal.to_ical()
+
+
+def write_event(calendars, title: str, start: datetime, end: datetime,
+                calendar_name: Optional[str] = None) -> str:
+    """Add one event. Returns the line to speak; raises on refusal or failure.
+
+    Deliberately add-only -- no edit, no delete. Server errors propagate
+    rather than being smoothed into a success line: telling the user an event
+    was added when it was not is the worst outcome available here.
+    """
+    target = pick_write_calendar(calendars, calendar_name)   # raises ValueError
+    name = _cal_name(target) or DEFAULT_WRITE_CALENDAR
+    target.save_event(build_vevent(title, start, end))
+    log.info("calendar: added %r to %s at %s", title, name, start.isoformat())
+    when = start.strftime("%A at %-I:%M %p").replace(" 0", " ")
+    # The default list is literally called "Calendar"; "your Calendar calendar"
+    # reads like a stutter out loud.
+    where = "your calendar" if name.lower() == DEFAULT_WRITE_CALENDAR.lower() \
+        else f"your {name} calendar"
+    return f"Added {title}, {when}, to {where}, sir."
+
+
 def event_confidence(text: str, now: datetime) -> tuple[bool, str]:
     """(confident, reason). Confident means: add it without asking.
 
@@ -727,7 +777,59 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             text += f" That's as of {as_of_words(snap.fetched_at, now)}."
         return ToolResult(text=text)
 
+    def add_event(text="", calendar=None, **_) -> ToolResult:
+        """Add one event. Writes outright when the parse is unambiguous;
+        otherwise reads it back and waits for a yes."""
+        from jarvis.tools.timekeeper import parse_when_full
+
+        now = now_local(source.tz)
+        raw = _clean(text)
+        confident, reason = event_confidence(raw, now)
+        try:
+            when, _repeat, title = parse_when_full(raw, now)
+        except Exception:                    # noqa: BLE001
+            log.exception("event parse failed")
+            when, title = None, ""
+        title = _clean(title) or "an event"
+
+        if when is None:
+            source.pending_event = None
+            line = f"I couldn't work out when, sir — {reason}."
+            return ToolResult(text=line, ok=False, speak=line)
+
+        end = when + timedelta(hours=1)
+        if not confident:
+            # Stash the interpretation and read it back. Nothing is written
+            # until the user says yes: a misheard time would otherwise become
+            # a real event on their phone.
+            source.pending_event = {"title": title, "start": when, "end": end,
+                                    "calendar": calendar}
+            words = when.strftime("%A at %I:%M %p").replace(" 0", " ").lstrip("0")
+            line = f"I have {title}, {words} — {reason}. Shall I add it, sir?"
+            return ToolResult(text=line, speak=line)
+
+        source.pending_event = None
+        try:
+            line = write_event(source.icloud_calendars(), title, when, end,
+                               calendar_name=calendar)
+        except ValueError as exc:            # refusal: protected / unknown
+            return ToolResult(text=str(exc), ok=False, speak=str(exc))
+        except Exception as exc:             # noqa: BLE001 - server trouble
+            log.exception("calendar write failed")
+            line = f"I couldn't add that, sir — {type(exc).__name__}."
+            return ToolResult(text=line, ok=False, speak=line)
+        return ToolResult(text=line, speak=line)
+
     return [ToolSpec(
+        name="add_event",
+        description=("Add one event to Hunter's calendar: what it is and when."),
+        parameters={"type": "object", "properties": {
+            "text": {"type": "string",
+                     "description": "the event with its day and time, as said"},
+            "calendar": {"type": "string",
+                         "description": "target calendar name; omit for default"}},
+            "required": ["text"]},
+        handler=add_event), ToolSpec(
         name="get_calendar",
         description=("Hunter's calendar for a weekday name, today, tomorrow, "
                      "week, or next for only the next event."),

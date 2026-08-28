@@ -382,8 +382,10 @@ def tool_registry(tmp_path, cfg, monkeypatch, fetch=None, clock=None):
 
 def test_tool_spec_and_unconfigured_excuse(tmp_path, monkeypatch):
     specs = calendar.make_tools(FakeCfg(), SimpleNamespace())
-    assert [s.name for s in specs] == ["get_calendar"]
-    assert len(specs[0].description.split()) <= 20
+    specs = sorted(specs, key=lambda sp: sp.name != "get_calendar")
+    # add_event joined get_calendar 2026-08-28 (calendar writing)
+    assert sorted(s.name for s in specs) == ["add_event", "get_calendar"]
+    assert all(len(sp.description.split()) <= 20 for sp in specs)
     enum = specs[0].parameters["properties"]["range"]["enum"]
     assert enum[:4] == ["today", "tomorrow", "week", "next"]
     # weekday names joined the enum 2026-08-28 so "agenda for Monday" can be

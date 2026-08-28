@@ -225,7 +225,8 @@ def test_every_tool_module_is_registered(app):
     from jarvis import brain as brain_mod
     assert brain_mod._REGISTRY is app.tools
     # spec 4.1 budget: the 11 spec tools plus the (later) Spotify six
-    assert len(names) == 17
+    # 18 since 2026-08-28: calendar gained add_event alongside get_calendar
+    assert len(names) == 18
 
 
 def test_a_tool_module_that_fails_to_import_does_not_abort_boot(build,

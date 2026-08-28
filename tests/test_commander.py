@@ -1061,3 +1061,73 @@ def test_a_queue_line_from_the_manager_still_wins_over_the_terminal_line(
         "Claude's still on the last one for jarvis, sir; I've queued it."
     res = rich.handle("in the terminal, run the tests", source="typed")
     assert res.reply.startswith("Claude's still on the last one")
+
+
+# ------------------------------------------------ confirming a calendar add
+#
+# add_event writes outright when the parse is unambiguous and otherwise reads
+# its interpretation back. The user's plain "yes" then has to mean THAT event,
+# not a new command -- the same shape as the pending terminal offer.
+def _pending(services, title="Lab presentation"):
+    start = datetime(2026, 8, 31, 16, 10).astimezone()
+    cal = types.SimpleNamespace(
+        pending_event={"title": title, "start": start,
+                       "end": start + timedelta(hours=1), "calendar": None},
+        icloud_calendars=lambda: ["CAL"], written=[])
+    services.calendar = cal
+    return cal
+
+
+def test_yes_writes_the_event_that_was_read_back(cmdr, services, monkeypatch):
+    cal = _pending(services)
+    import jarvis.commander as cmd_mod
+    monkeypatch.setattr(cmd_mod, "write_event",
+                        lambda cals, title, s, e, calendar_name=None:
+                        (cal.written.append(title), f"Added {title}, sir.")[1])
+
+    res = cmdr.handle("yes", "voice")
+
+    assert cal.written == ["Lab presentation"]
+    assert "Added" in res.reply and res.speak
+    assert cal.pending_event is None, "the offer must not linger"
+
+
+def test_no_drops_it_without_writing(cmdr, services, monkeypatch):
+    cal = _pending(services)
+    import jarvis.commander as cmd_mod
+    monkeypatch.setattr(cmd_mod, "write_event",
+                        lambda *a, **kw: cal.written.append("SHOULD NOT HAPPEN"))
+
+    res = cmdr.handle("no", "voice")
+
+    assert cal.written == []
+    assert cal.pending_event is None
+    assert res.handled
+
+
+def test_an_unrelated_utterance_drops_the_offer_rather_than_writing(
+        cmdr, services, monkeypatch):
+    """Changing the subject must never be read as consent."""
+    cal = _pending(services)
+    import jarvis.commander as cmd_mod
+    monkeypatch.setattr(cmd_mod, "write_event",
+                        lambda *a, **kw: cal.written.append("SHOULD NOT HAPPEN"))
+
+    cmdr.handle("what's the weather tomorrow", "voice")
+
+    assert cal.written == []
+    assert cal.pending_event is None
+
+
+def test_a_write_failure_is_reported_not_swallowed(cmdr, services, monkeypatch):
+    cal = _pending(services)
+    import jarvis.commander as cmd_mod
+
+    def boom(*a, **kw):
+        raise RuntimeError("412 precondition failed")
+
+    monkeypatch.setattr(cmd_mod, "write_event", boom)
+    res = cmdr.handle("yes", "voice")
+
+    assert "couldn't add" in res.reply.lower()
+    assert cal.pending_event is None
