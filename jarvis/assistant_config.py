@@ -52,7 +52,8 @@ DEFAULTS: dict = {
     "google_ical_urls": [],
     "icloud": {"apple_id": "", "app_password": "",
                "url": "https://caldav.icloud.com"},
-    "gmail": {"address": "", "app_password": "", "imap_host": "imap.gmail.com"},
+    "gmail": {"address": "", "app_password": "", "imap_host": "imap.gmail.com",
+              "accounts": []},
     "claude": {
         "allowed_dirs": ["/home/hunterp/Jarvis", "/home/hunterp/haymaker-digest"],
         "projects_root": "/home/hunterp/projects",
@@ -443,6 +444,14 @@ class AssistantConfig:
             return not _is_placeholder(self.get("icloud.apple_id")) and \
                 not _is_placeholder(self.get("icloud.app_password"))
         if section == "gmail":
+            # Multi-account configs carry gmail.accounts and no top-level
+            # pair; without this the setup line kept telling the user to
+            # configure mail that was already working.
+            for entry in (self.get("gmail.accounts") or []):
+                if isinstance(entry, dict) and \
+                        not _is_placeholder(entry.get("address")) and \
+                        not _is_placeholder(entry.get("app_password")):
+                    return True
             return not _is_placeholder(self.get("gmail.address")) and \
                 not _is_placeholder(self.get("gmail.app_password"))
         if section == "discord":

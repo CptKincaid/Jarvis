@@ -15,7 +15,7 @@ import pytest
 
 from jarvis.tools import mail as mail_mod
 from jarvis.tools import notes as notes_mod
-from jarvis.tools.mail import (Mail, MailNotConfigured, NOTHING_NEW_LINE,
+from jarvis.tools.mail import (mail_accounts,Mail, MailNotConfigured, NOTHING_NEW_LINE,
                                UNREACHABLE_LINE, fact_sheet, fetch_unread,
                                imap_date, make_snippet, when_text)
 from jarvis.tools.notes import NotesStore, join_spoken, parse_which
@@ -621,3 +621,89 @@ def test_get_mail_excuse_is_spoken_without_a_model_turn(fake_imap, monkeypatch):
     tags = brain_mod.JarvisBrain(None, None, registry=reg)._chat_sync("mail?")
     assert tags == [("SPEAK", NOTHING_NEW_LINE)]
     assert len(calls) == 1, "no second model turn once the tool has spoken"
+
+
+# ------------------------------------------------- multiple mailboxes
+#
+# `gmail` held exactly one address/app_password pair. Hunter runs three
+# accounts (personal, work, school), so a single slot meant two of them were
+# invisible to the briefing. `gmail.accounts` is a list; the legacy top-level
+# pair still works so existing configs keep running untouched.
+MULTI_CFG = {"gmail": {"accounts": [
+    {"label": "personal", "address": "me@gmail.com", "app_password": "aaaa bbbb cccc dddd"},
+    {"label": "work", "address": "me@work.com", "app_password": "eeee ffff gggg hhhh"},
+]}}
+
+
+def test_legacy_single_account_config_still_works(fake_imap):
+    accts = mail_accounts(FakeCfg(GMAIL_CFG))
+    assert [a["address"] for a in accts] == ["hunter@example.com"]
+    assert accts[0]["host"] == "imap.gmail.com"
+
+
+def test_accounts_list_is_used_when_present():
+    accts = mail_accounts(FakeCfg(MULTI_CFG))
+    assert [a["address"] for a in accts] == ["me@gmail.com", "me@work.com"]
+    assert [a["label"] for a in accts] == ["personal", "work"]
+
+
+def test_unlabelled_accounts_get_a_label_from_the_address():
+    cfg = {"gmail": {"accounts": [
+        {"address": "hunterpey@school.edu", "app_password": "aaaa bbbb cccc dddd"}]}}
+    assert mail_accounts(FakeCfg(cfg))[0]["label"] == "hunterpey"
+
+
+def test_incomplete_accounts_are_skipped_not_fatal():
+    cfg = {"gmail": {"accounts": [
+        {"address": "good@gmail.com", "app_password": "aaaa bbbb cccc dddd"},
+        {"address": "", "app_password": "x"},
+        {"address": "<your address>", "app_password": "y"},
+        {"address": "nopassword@gmail.com", "app_password": ""},
+    ]}}
+    assert [a["address"] for a in mail_accounts(FakeCfg(cfg))] == ["good@gmail.com"]
+
+
+def test_fetch_unread_reads_every_account_and_tags_each_mail(fake_imap):
+    fake_imap.messages = _canned(NOW)[:2]
+    mails = fetch_unread(FakeCfg(MULTI_CFG), imap=fake_imap, now=NOW)
+
+    logins = [c[1] for i in fake_imap.instances for c in i.calls if c[0] == "login"]
+    assert logins == ["me@gmail.com", "me@work.com"], "did not visit both mailboxes"
+    assert len(mails) == 4, "both mailboxes' mail should be merged"
+    assert {m.account for m in mails} == {"personal", "work"}
+
+
+def test_merged_mail_is_newest_first_across_accounts(fake_imap):
+    fake_imap.messages = _canned(NOW)[:2]
+    mails = fetch_unread(FakeCfg(MULTI_CFG), imap=fake_imap, now=NOW)
+    dates = [m.date for m in mails if m.date]
+    assert dates == sorted(dates, reverse=True), "merge did not re-sort"
+
+
+def test_one_bad_mailbox_does_not_lose_the_others(fake_imap, monkeypatch):
+    """A wrong app password on one account must not blind Jarvis to the rest."""
+    fake_imap.messages = _canned(NOW)[:1]
+    real_login = fake_imap.login
+
+    def selective_login(self, user, password):
+        if user == "me@gmail.com":
+            self.calls.append(("login", user))
+            raise imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials")
+        return real_login(self, user, password)
+
+    monkeypatch.setattr(fake_imap, "login", selective_login)
+    mails = fetch_unread(FakeCfg(MULTI_CFG), imap=fake_imap, now=NOW)
+
+    assert mails, "the healthy mailbox was lost with the broken one"
+    assert {m.account for m in mails} == {"work"}
+
+
+def test_every_mailbox_failing_still_raises(fake_imap):
+    fake_imap.fail_login = True
+    with pytest.raises(imaplib.IMAP4.error):
+        fetch_unread(FakeCfg(MULTI_CFG), imap=fake_imap, now=NOW)
+
+
+def test_no_accounts_at_all_is_not_configured(fake_imap):
+    with pytest.raises(MailNotConfigured):
+        fetch_unread(FakeCfg({"gmail": {"accounts": []}}), imap=fake_imap, now=NOW)

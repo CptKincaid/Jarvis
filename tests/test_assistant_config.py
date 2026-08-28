@@ -570,3 +570,20 @@ def test_no_real_secret_strings_in_module_source():
     src = Path(ac.__file__).read_text()
     for marker in ("ghp_", "sk-ant", "xoxb-", "MTIz"):
         assert marker not in src
+
+
+def test_gmail_counts_as_configured_when_accounts_list_is_used(tmp_path):
+    """Multi-account configs have no top-level address/app_password, so the
+    old check reported gmail unconfigured and the setup line kept appearing."""
+    from jarvis.assistant_config import AssistantConfig
+    cfg = AssistantConfig(data={"gmail": {"accounts": [
+        {"label": "personal", "address": "me@gmail.com",
+         "app_password": "aaaa bbbb cccc dddd"}]}})
+    assert cfg.is_configured("gmail") is True
+
+
+def test_gmail_with_only_empty_accounts_is_not_configured():
+    from jarvis.assistant_config import AssistantConfig
+    assert AssistantConfig(data={"gmail": {"accounts": []}}).is_configured("gmail") is False
+    assert AssistantConfig(data={"gmail": {"accounts": [
+        {"address": "", "app_password": ""}]}}).is_configured("gmail") is False
