@@ -155,11 +155,49 @@ class TTS:
             except Exception:
                 pass
             log.info("XTTS v2 loaded on CUDA:%d", self._gpu)
+            self._prime_voice()
             return True
         except Exception:
             log.exception("XTTS load error — falling back to edge engine")
             self._engine = "edge"
             return False
+
+    def _prime_voice(self):
+        """Compute the speaker conditioning latents once, at load.
+
+        XTTS caches them internally, so only the FIRST synthesis pays: measured
+        on this box, first call 2.21 s against 0.97 s warm, with
+        get_conditioning_latents alone costing 1.37 s. prewarm() used to prime
+        them as a side effect, but it skips phrases already in the speech cache
+        -- and with a warm cache it renders nothing at all, so the first real
+        utterance of every session paid the cold path. Doing it here is
+        explicit and does not depend on the cache being empty.
+
+        Best effort: a prime is an optimisation, never a reason not to speak.
+        """
+        model = getattr(getattr(self._xtts, "synthesizer", None),
+                        "tts_model", None)
+        if model is None or not hasattr(model, "get_conditioning_latents"):
+            return
+        t0 = time.monotonic()
+        try:
+            model.get_conditioning_latents(audio_path=[str(VOICE_REF)])
+            # Latents alone are NOT the cold cost: measured on this box, priming
+            # them took 1.59 s and left the first utterance at 2.09 s against
+            # 2.21 s unprimed. The rest is CUDA kernel / autoregressive warm-up
+            # in the GPT and vocoder, which only a real synthesis touches.
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            try:
+                self._synth_xtts("Ready.", tmp.name)
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    pass
+            log.info("XTTS voice primed in %.2fs", time.monotonic() - t0)
+        except Exception:
+            log.exception("voice prime failed (first reply will be slower)")
 
     def speak(self, text: str, block: bool = False):
         """Enqueue text for speech; the worker drains FIFO (no silent drops).

@@ -1460,11 +1460,16 @@ class MainWindow:
         except Exception:
             log.debug("cpu temp read failed", exc_info=True)
         try:
+            # memory.used reads "N/A" on GB10 unified memory (see
+            # context.py:347) and was never displayed -- only vals[0] and
+            # vals[1] are read below. Querying it made nvidia-smi probe a
+            # field it cannot answer, and this call was timing out at 3 s
+            # often enough to fill the log with tracebacks.
             out = subprocess.run(
                 ["nvidia-smi",
-                 "--query-gpu=temperature.gpu,utilization.gpu,memory.used",
+                 "--query-gpu=temperature.gpu,utilization.gpu",
                  "--format=csv,noheader,nounits"],
-                capture_output=True, text=True, timeout=3)
+                capture_output=True, text=True, timeout=5)
             lines = out.stdout.strip().splitlines()
             for gi, line in enumerate(lines):
                 vals = [v.strip() for v in line.split(",")]

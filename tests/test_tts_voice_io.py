@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import wave
+from types import SimpleNamespace
 
 import pytest
 
@@ -282,3 +283,48 @@ def test_two_normal_sentences_still_split_on_the_full_stop(tts):
     text = ("It is overcast today with a high of 98. "
             "You have nothing else on the calendar today, sir.")
     assert len(tts._split_sentences(text)) == 2
+
+
+# ------------------------------------------------ priming the voice latents
+#
+# XTTS caches the speaker conditioning latents internally, so only the FIRST
+# synthesis pays for them (measured on the GB10: first call 2.21 s, warm 0.97 s;
+# get_conditioning_latents alone is 1.37 s). prewarm() would have primed them as
+# a side effect, but it skips phrases already in the speech cache -- and on a
+# warm cache it renders nothing at all ("prewarm: 0 phrase chunk(s) rendered"),
+# so the first real utterance of every session paid the cold path.
+def test_loading_primes_the_speaker_latents(monkeypatch, tmp_path):
+    from jarvis.tts import TTS
+
+    calls = []
+
+    class FakeModel:
+        def get_conditioning_latents(self, audio_path=None, **kw):
+            calls.append(audio_path)
+            return ("latent", "embedding")
+
+    t = TTS(engine="xtts", cache=False)
+    t._xtts = SimpleNamespace(synthesizer=SimpleNamespace(tts_model=FakeModel()))
+
+    t._prime_voice()
+
+    assert calls, "the first utterance will pay the cold latent cost"
+
+
+def test_priming_failure_never_breaks_startup(monkeypatch):
+    """A prime is an optimisation; it must not stop Jarvis from speaking."""
+    from jarvis.tts import TTS
+
+    class Broken:
+        def get_conditioning_latents(self, *a, **kw):
+            raise RuntimeError("cuda hiccup")
+
+    t = TTS(engine="xtts", cache=False)
+    t._xtts = SimpleNamespace(synthesizer=SimpleNamespace(tts_model=Broken()))
+    t._prime_voice()          # must not raise
+
+
+def test_priming_is_a_noop_without_xtts(monkeypatch):
+    from jarvis.tts import TTS
+    t = TTS(engine="edge", cache=False)
+    t._prime_voice()          # must not raise
