@@ -120,6 +120,89 @@ DEFAULT_SYMBOLS: dict[str, str] = {
 }
 
 
+# ------------------------------------------------------- clock times
+#
+# The vocabulary table below is token-based and has no notion of a clock, so
+# an "h:mm" token used to reach the engine verbatim and XTTS read the colon
+# form digit by digit -- "6:00 pm" came out as "six zero pm" (heard
+# 2026-08-28 answering a calendar question). The calendar, alarm, reminder
+# and briefing tools all emit times in exactly this shape.
+#
+# Only times carrying an am/pm marker are rewritten. A bare "16:9" or "3:15"
+# is far more likely to be a ratio or a score than a clock reading, and a
+# wrong rewrite there is worse than the digits.
+_ONES = ("twelve", "one", "two", "three", "four", "five", "six", "seven",
+         "eight", "nine", "ten", "eleven")
+_TENS = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty"}
+
+_TIME_RX = re.compile(
+    r"\b(1[0-2]|0?[1-9]|[01]\d|2[0-3]):([0-5]\d)\s*"
+    r"([ap])\.?\s?m\.?(?![a-z])",
+    re.IGNORECASE)
+
+
+def _minutes_in_words(m: int) -> str:
+    """1-59 as English minutes past the hour ("oh five", "twenty-two")."""
+    if m < 10:
+        return f"oh {_ONES[m]}"          # "oh five", never bare "five"
+    if m < 20:
+        return ("ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen",
+                "sixteen", "seventeen", "eighteen", "nineteen")[m - 10]
+    tens, ones = divmod(m, 10)
+    word = _TENS[tens]
+    return word if not ones else f"{word}-{_ONES[ones]}"
+
+
+# "am"/"pm" left as letters came out of XTTS as a spelled "A M" (heard
+# 2026-08-28). Writing them the way they are SAID keeps the marker without
+# handing the engine an abbreviation to spell.
+_HALF = {"a": "ay em", "p": "pee em"}
+
+
+def _spoken_time(match: "re.Match") -> str:
+    hour, minute, half = int(match.group(1)), int(match.group(2)), match.group(3)
+    hour = hour % 12                      # 12:xx and 00:xx both read "twelve"
+    spoken = _ONES[hour]
+    if minute:
+        spoken = f"{spoken} {_minutes_in_words(minute)}"
+    return f"{spoken} {_HALF[half.lower()]}"
+
+
+def speak_times(text: str) -> str:
+    """Rewrite "6:00 pm" as "six pm" so the engine does not spell the colon."""
+    return _TIME_RX.sub(_spoken_time, text)
+
+
+# ------------------------------------------------------- shouted words
+#
+# Calendar titles arrive from iCal as Hunter typed them, and course names are
+# shouted: "9:10 am BIOSENSORS at ...". An engine treats an all-caps token as
+# an acronym, so XTTS did not say "biosensors" -- it produced what was heard
+# as "bio censors" (2026-08-28). There is no list to enumerate here; the
+# titles change every semester.
+#
+# So: an all-caps run with the vowels to carry syllables is a WORD that
+# happens to be shouted, and gets title case. One without them ("HDMI",
+# "PHYS", "ETB") is an initialism and is left alone for the table or the
+# engine to spell. Known jargon is substituted before this runs, so entries
+# like VSS -> "V S S" are already gone by the time we get here.
+_SHOUT_RX = re.compile(r"\b[A-Z][A-Z'&-]{3,}\b")
+_VOWELS = set("AEIOUY")
+
+
+def _unshout(match: "re.Match") -> str:
+    word = match.group(0)
+    letters = [c for c in word if c.isalpha()]
+    if sum(1 for c in letters if c in _VOWELS) < 2:
+        return word                       # an initialism, not a word
+    return word.title()
+
+
+def unshout(text: str) -> str:
+    """Title-case shouted WORDS, leaving initialisms for the engine."""
+    return _SHOUT_RX.sub(_unshout, text)
+
+
 class Pronunciations:
     """A pronunciation table: shipped defaults + a user JSON file."""
 
@@ -236,11 +319,24 @@ class Pronunciations:
             return self._table[token]
         return self._lower.get(token.lower())
 
-    def apply(self, text: str) -> str:
-        """Rewrite tokens/symbols in ``text`` into their spoken forms."""
+    def apply(self, text: str, *, rewrite_times: bool = True,
+              unshout_words: bool = True) -> str:
+        """Rewrite tokens/symbols in ``text`` into their spoken forms.
+
+        The two rewrites are OPTIONAL because they are compensations for a
+        weak engine, not universal improvements. XTTS spelled "6:00 pm" as
+        "six zero pm" and read ALL-CAPS as an acronym, so both were added.
+        Fish's s2.1-pro normalises text itself, and there the rewrites make
+        things WORSE -- "ay em" comes out as "I'm" (heard 2026-08-28). The
+        caller passes what its engine actually needs.
+        """
         if not text:
             return text
         self._maybe_reload()
+        # Times first: the vocabulary pass is token-based and would happily
+        # leave "6:00" intact for the engine to spell out.
+        if rewrite_times:
+            text = speak_times(text)
         rx = self._rx
         if rx is not None:
             def _sub(m):
@@ -250,6 +346,11 @@ class Pronunciations:
         for sym, spoken in self._symbols.items():
             if sym in text:
                 text = text.replace(sym, spoken)
+        # Last: known jargon has already been substituted, so whatever is
+        # still shouting is Hunter's own text rather than something the
+        # table wanted spelled.
+        if unshout_words:
+            text = unshout(text)
         return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
@@ -266,5 +367,7 @@ def get() -> Pronunciations:
         return _default
 
 
-def apply(text: str) -> str:
-    return get().apply(text)
+def apply(text: str, *, rewrite_times: bool = True,
+          unshout_words: bool = True) -> str:
+    return get().apply(text, rewrite_times=rewrite_times,
+                       unshout_words=unshout_words)

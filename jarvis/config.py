@@ -42,7 +42,18 @@ class PATHS:
     VOICEPRINT = AIWS / "voiceprint.npz"
     HEY_JARVIS_VERIFIER = AIWS / "hey_jarvis_verifier.pkl"
     SPEAK_QUEUE = LOG_DIR / "speak_queue.txt"
-    VOICE_REF = AIWS / "jarvis_voice_ref.wav"
+    # Chosen by ear 2026-08-28: 35.8s built from three different Fish
+    # Audio renderings of Bettany. The old film clip is kept beside it
+    # (jarvis_voice_ref.wav) so this is a one-line rollback.
+    VOICE_REF = AIWS / "jarvis_voice_ref_fish3.wav"
+    # F5-TTS reference. Flow-matching infill needs the reference TEXT
+    # as well as the audio, so the transcript sits beside the wav.
+    VOICE_REF_F5 = AIWS / "jarvis_voice_ref_f5.wav"
+    VOICE_REF_F5_TEXT = AIWS / "jarvis_voice_ref_f5.txt"
+    # f5-tts cannot share vss_env: installing it there removes fastapi,
+    # which VSS's own api.py needs. It gets its own venv and a sidecar.
+    F5_PYTHON = Path.home() / ".local/share/jarvis-f5/venv/bin/python"
+    F5_SOCK = LOG_DIR / "f5.sock"
     VSS_ENV = Path.home() / "vss_env"
     REMINDERS = MEMORY_DIR / "reminders.json"
     # -- personal assistant (spec 2026-08-26, section 3.2) --------------

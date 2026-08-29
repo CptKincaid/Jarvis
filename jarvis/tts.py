@@ -46,6 +46,8 @@ import os
 import queue
 import re
 import subprocess
+import json
+import socket
 import tempfile
 import threading
 import time
@@ -62,15 +64,209 @@ log = get_logger("tts")
 
 VOICE_REF = PATHS.VOICE_REF          # ~/.aiws_trainer/jarvis_voice_ref.wav
 
-_ENGINES = ("edge", "xtts")
+_ENGINES = ("edge", "xtts", "f5", "fish")
+
+# Which engines need the text massaged before they can say it properly.
+# The time and shouted-word rewrites in jarvis/pronounce.py exist because
+# XTTS said "six zero pm" for "6:00 pm" and read BIOSENSORS as an acronym.
+# Fish s2.1-pro normalises both itself, and the rewrites HURT there: "ay em"
+# is voiced as "I'm" (heard 2026-08-28). Verified per engine by listening,
+# never assumed.
+_ENGINE_NEEDS_TIME_REWRITE = {"edge": True, "xtts": True, "f5": True,
+                              "fish": False}
+_ENGINE_NEEDS_UNSHOUT = {"edge": True, "xtts": True, "f5": True,
+                         "fish": True}
 
 # Voice parameters (unchanged from the V1 engine); they are part of the
 # speech-cache key so a tuning change never replays stale audio.
 EDGE_VOICE = "en-GB-RyanNeural"
 EDGE_RATE = "+5%"
 EDGE_PITCH = "-4Hz"
-XTTS_PARAMS = dict(speed=1.16, temperature=0.65, top_p=0.85,
-                   repetition_penalty=5.0)
+# Settled by listening on 2026-08-28: 1.16 was clipped and robotic, 1.00
+# dragged. repetition_penalty 2.0 is XTTS's own default and beat the 5.0 this
+# shipped with. These are part of the speech-cache key, so changing one can
+# never replay stale audio.
+XTTS_PARAMS = dict(speed=1.05, temperature=0.65, top_p=0.85,
+                   repetition_penalty=2.0)
+
+# XTTS renders this voice at about -18 LUFS, which is quiet for an assistant
+# across a room. Gain is applied to the OUTPUT, where it changes level and
+# nothing else -- the reference itself is left exactly as recorded, because
+# normalising THAT lost a listening test twice.
+#
+# CONSTANT, not per-utterance normalisation: _speak_xtts_pipelined renders a
+# reply chunk by chunk, and normalising each chunk to its own peak would make
+# the volume pump audibly between chunks of a single sentence. A hot chunk is
+# pulled back just far enough to stay inside full scale.
+# ------------------------------------------------------------- Fish Audio
+#
+# Hosted s2.1-pro. Chosen after five local engines were rejected by ear on
+# 2026-08-28; it is the model that produced the reference the user rated best,
+# and it measured 186 ms time-to-first-audio from this box — faster than every
+# local option, XTTS's 0.4 s included.
+#
+# The cost is a network dependency on the assistant's voice, so it is designed
+# around rather than ignored: the speech cache is consulted BEFORE the network
+# (a repeated line is free and works offline), and any failure falls back to a
+# LOCAL engine. Jarvis going silent because the internet did would read as a
+# broken assistant.
+#
+# The free backend is deliberately NOT the default: measured 2218 ms median,
+# degrading to 3294 ms over five consecutive calls, and its WebSocket path
+# returns 402. Paid is what makes this worth having.
+FISH_KEY_FILE = Path.home() / ".config" / "jarvis" / "fish_key"
+FISH_MODEL_FILE = Path.home() / ".config" / "jarvis" / "fish_model_id"
+FISH_BACKEND = "s2.1-pro"
+FISH_TIMEOUT_S = 10.0
+FISH_FALLBACK = "f5"          # must stay LOCAL, or an outage is still silence
+
+
+def _fish_creds():
+    """(api_key, reference_id) from disk, or (None, None). Never from source."""
+    try:
+        key = FISH_KEY_FILE.read_text().strip()
+        model = FISH_MODEL_FILE.read_text().strip()
+        return (key or None), (model or None)
+    except OSError:
+        return None, None
+
+
+def _fish_stream_model(text: str, out_path: str, timeout: float,
+                       model: str) -> dict:
+    """Same as _fish_stream but against an explicit voice — for A/B testing
+    voices without touching the configured one."""
+    from fish_audio_sdk import Session, TTSRequest
+    key, _ = _fish_creds()
+    session = Session(key)
+    started = time.monotonic(); first = None
+    with open(out_path, "wb") as fh:
+        for chunk in session.tts(
+                TTSRequest(text=text, reference_id=model, format="wav",
+                           latency="balanced"), backend=FISH_BACKEND):
+            if first is None:
+                first = time.monotonic() - started
+            fh.write(chunk)
+            if time.monotonic() - started > timeout:
+                raise TimeoutError(f"fish exceeded {timeout}s")
+    return {"ok": True, "ttfa": first}
+
+
+def _fish_stream(text: str, out_path: str, timeout: float) -> dict:
+    """Render one chunk via the Fish API. The network seam — tests patch this."""
+    from fish_audio_sdk import Session, TTSRequest
+    key, model = _fish_creds()
+    if not key or not model:
+        raise RuntimeError("fish credentials missing")
+    session = Session(key)
+    started = time.monotonic()
+    first = None
+    with open(out_path, "wb") as fh:
+        for chunk in session.tts(
+                TTSRequest(text=text, reference_id=model, format="wav",
+                           latency="balanced"),
+                backend=FISH_BACKEND):
+            if first is None:
+                first = time.monotonic() - started
+            fh.write(chunk)
+            if time.monotonic() - started > timeout:
+                raise TimeoutError(f"fish exceeded {timeout}s")
+    return {"ok": True, "ttfa": first}
+
+
+# ---------------------------------------------------------------- F5-TTS
+#
+# F5 runs in a SIDECAR, not in this process. jarvis and VSS share ~/vss_env,
+# and installing f5-tts there removes fastapi (VSS's api.py needs it), so F5
+# lives in its own venv and we talk to a resident server over a unix socket.
+# Loading the model costs seconds, so it stays up for the life of the app.
+F5_REF = PATHS.VOICE_REF_F5
+F5_REF_TEXT = PATHS.VOICE_REF_F5_TEXT
+F5_PYTHON = PATHS.F5_PYTHON
+F5_SOCK = PATHS.F5_SOCK
+F5_SERVER = PATHS.REPO_ROOT / "scripts" / "f5_server.py"
+
+# Chosen by ear 2026-08-28. nfe_step is the latency lever: F5 is flow-matching
+# and runs a FIXED number of denoising steps regardless of text length, so the
+# default 32 costs ~1.9 s per call even for two words. 8 is the lowest without
+# artefacts. speed 0.70 was preferred at every chunk length tested; 0.50 left
+# too long a pause at full stops, because lowering speed stretches the
+# silences as well as the words. Both are in the cache key.
+F5_PARAMS = dict(nfe_step=8, speed=0.7)
+
+_f5_proc = None
+_f5_lock = threading.Lock()
+
+
+def _f5_request(payload: dict, timeout: float = 120) -> dict:
+    """One request/response over the sidecar socket."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(str(F5_SOCK))
+        sock.sendall(json.dumps(payload).encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            part = sock.recv(65536)
+            if not part:
+                break
+            buf += part
+    return json.loads(buf.decode("utf-8") or "{}")
+
+
+def _f5_alive() -> bool:
+    try:
+        return bool(_f5_request({"ping": True}, timeout=5).get("ready"))
+    except Exception:
+        return False
+
+
+def _ensure_f5_server(startup_timeout: float = 180) -> bool:
+    """Start the sidecar if it is not already answering. True when ready."""
+    global _f5_proc
+    with _f5_lock:
+        if _f5_alive():
+            return True
+        for path in (F5_PYTHON, F5_SERVER, F5_REF, F5_REF_TEXT):
+            if not Path(path).exists():
+                log.error("f5 sidecar cannot start, missing: %s", path)
+                return False
+        F5_SOCK.parent.mkdir(parents=True, exist_ok=True)
+        log.info("starting f5 sidecar")
+        try:
+            _f5_proc = subprocess.Popen(
+                [str(F5_PYTHON), str(F5_SERVER), "--socket", str(F5_SOCK),
+                 "--ref", str(F5_REF), "--ref-text", str(F5_REF_TEXT),
+                 "--nfe", str(F5_PARAMS["nfe_step"]),
+                 "--speed", str(F5_PARAMS["speed"])],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            log.exception("f5 sidecar failed to spawn")
+            return False
+        deadline = time.monotonic() + startup_timeout
+        while time.monotonic() < deadline:
+            if _f5_proc.poll() is not None:
+                log.error("f5 sidecar exited during startup (rc=%s)",
+                          _f5_proc.returncode)
+                return False
+            if _f5_alive():
+                log.info("f5 sidecar ready")
+                return True
+            time.sleep(0.5)
+        log.error("f5 sidecar did not become ready in %.0fs", startup_timeout)
+        return False
+
+
+OUTPUT_GAIN = 1.34               # ~+2.5 dB; peak 0.72 -> ~0.97
+_CEILING = 0.99
+
+
+def apply_output_gain(wav):
+    """Raise the rendered level without touching timbre or dynamics."""
+    import numpy as np
+    out = np.asarray(wav, dtype=np.float32) * OUTPUT_GAIN
+    peak = float(np.abs(out).max()) if out.size else 0.0
+    if peak > _CEILING:          # rare outlier: scale it just under the rail
+        out *= _CEILING / peak
+    return out
 
 
 class TTS:
@@ -104,6 +300,7 @@ class TTS:
             SpeechCache(cache_dir) if cache else None)
         self._pronunciation = pronunciation
         self._synth_lock = threading.Lock()    # one XTTS inference at a time
+        self._load_lock = threading.Lock()     # one XTTS LOAD at a time
         self._prewarm_thread: threading.Thread | None = None
         self.last_text = ""                    # last cleaned utterance queued
         self.interrupts = 0                    # barge-ins that cut speech
@@ -124,10 +321,40 @@ class TTS:
 
     # ------------------------------------------------------------ public
     def load(self) -> bool:
-        """Load the TTS engine. Edge needs no preload; XTTS loads the model."""
+        """Load the TTS engine. Edge needs no preload; XTTS loads the model.
+
+        Serialised: the startup warmer (app._load_models) and the speak path
+        (_speak_sync) both call this, and an unguarded ``self._xtts is None``
+        check let both run a full 1.8 GB load concurrently -- the user then
+        waited out the SECOND one (11.07 s of silence after the reply was
+        ready, 2026-08-28). The check is repeated under the lock so a caller
+        that waited returns as soon as the winner has finished priming.
+        """
         if self._engine == "edge":
             return True
+        if self._engine == "fish":
+            key, model = _fish_creds()
+            if key and model:
+                return True
+            log.warning("fish credentials missing (%s) — falling back to %s",
+                        FISH_KEY_FILE, FISH_FALLBACK)
+            self._engine = FISH_FALLBACK
+            return self.load()
+        if self._engine == "f5":
+            if _ensure_f5_server():
+                return True
+            log.warning("f5 sidecar unavailable — falling back to edge")
+            self._engine = "edge"
+            return False
         if self._xtts is not None:
+            return True
+        with self._load_lock:
+            return self._load_xtts_locked()
+
+    def _load_xtts_locked(self) -> bool:
+        if self._engine == "edge":       # a failed load may have fallen back
+            return True
+        if self._xtts is not None:       # another thread got there first
             return True
         if not VOICE_REF.exists():
             log.warning("voice reference not found: %s", VOICE_REF)
@@ -297,7 +524,11 @@ class TTS:
                     tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
                     tmp.close()
                     try:
-                        if engine == "xtts" and self._xtts is not None:
+                        if engine == "fish":
+                            self._synth_fish(item, tmp.name)
+                        elif engine == "f5":
+                            self._synth_f5(item, tmp.name)
+                        elif engine == "xtts" and self._xtts is not None:
                             self._synth_xtts(item, tmp.name)
                         else:
                             self._synth_edge(item, tmp.name)
@@ -388,12 +619,27 @@ class TTS:
         if not self._pronunciation:
             return text
         try:
-            return pronounce.apply(text) or text
+            eng = self._engine
+            return pronounce.apply(
+                text,
+                rewrite_times=_ENGINE_NEEDS_TIME_REWRITE.get(eng, True),
+                unshout_words=_ENGINE_NEEDS_UNSHOUT.get(eng, True)) or text
         except Exception:
             log.exception("pronunciation apply failed")
             return text
 
     def _cache_key(self, engine: str, spoken: str) -> str:
+        if engine == "fish":
+            _key, model = _fish_creds()
+            return SpeechCache.key("fish", spoken, model=model or "none",
+                                   backend=FISH_BACKEND)
+        if engine == "f5":
+            try:
+                st = F5_REF.stat()
+                ref = f"{st.st_size}:{int(st.st_mtime)}"
+            except OSError:
+                ref = "none"
+            return SpeechCache.key("f5", spoken, ref=ref, **F5_PARAMS)
         if engine == "xtts":
             try:
                 st = VOICE_REF.stat()
@@ -430,9 +676,13 @@ class TTS:
 
         spoken = self._pronounce(text)
         # load() may have fallen back to edge, so re-check the engine here.
+        if self._engine in ("f5", "fish"):
+            log.info("speaking (%s): %.60s", self._engine, text)
+            self._speak_pipelined(spoken, self._engine)
+            return
         if self._engine == "xtts" and self._xtts is not None:
             log.info("speaking (xtts): %.60s", text)
-            self._speak_xtts_pipelined(spoken)
+            self._speak_pipelined(spoken, "xtts")
             return
 
         cached = self._cached("edge", spoken)
@@ -466,7 +716,14 @@ class TTS:
                     log.exception("temp wav unlink failed: %s", tmp_name)
 
     def _speak_xtts_pipelined(self, text: str):
-        """XTTS sentence pipelining: synthesize chunk N+1 while chunk N plays.
+        """Back-compat alias for the XTTS arm of _speak_pipelined."""
+        return self._speak_pipelined(text, "xtts")
+
+    def _speak_pipelined(self, text: str, engine: str = "xtts"):
+        """Sentence pipelining: synthesize chunk N+1 while chunk N plays.
+
+        Shared by the two local cloning engines (xtts, f5); only the
+        per-chunk synth call and the cache namespace differ.
 
         A producer thread synthesizes sentence chunks to per-chunk temp wavs
         (or takes them from the speech cache) and feeds them through a
@@ -477,6 +734,8 @@ class TTS:
         (cached files are never unlinked). Returns only after the LAST chunk
         finishes (blocking semantics).
         """
+        synth = {"f5": self._synth_f5, "fish": self._synth_fish}.get(
+            engine, self._synth_xtts)
         chunks = self._split_sentences(text)
         wav_q: queue.Queue = queue.Queue()
         _DONE = object()
@@ -486,7 +745,7 @@ class TTS:
                 for sent in chunks:
                     if self._stop_flag:
                         break
-                    cached = self._cached("xtts", sent)
+                    cached = self._cached(engine, sent)
                     if cached is not None:
                         wav_q.put((cached, False))
                         continue
@@ -494,22 +753,35 @@ class TTS:
                         suffix=".wav", delete=False)
                     tmp.close()
                     try:
-                        self._synth_xtts(sent, tmp.name)
+                        synth(sent, tmp.name)
                     except Exception:
-                        log.exception("XTTS chunk synth failed: %.60s", sent)
+                        log.exception("%s chunk synth failed: %.60s",
+                                      engine, sent)
+                        if engine == "fish":
+                            # the network died mid-reply: finish locally
+                            # rather than dropping the rest of the sentence
+                            try:
+                                log.warning("falling back to %s for this chunk",
+                                            FISH_FALLBACK)
+                                if self.load_fallback():
+                                    self._synth_f5(sent, tmp.name)
+                                    wav_q.put((tmp.name, True))
+                                    continue
+                            except Exception:
+                                log.exception("fallback synth failed too")
                         try:
                             os.unlink(tmp.name)
                         except OSError:
                             pass
                         continue
                     if not self._stop_flag:
-                        self._store("xtts", sent, tmp.name)
+                        self._store(engine, sent, tmp.name)
                     wav_q.put((tmp.name, True))
             finally:
                 wav_q.put(_DONE)
 
         producer = threading.Thread(
-            target=_producer, daemon=True, name="tts-xtts-synth")
+            target=_producer, daemon=True, name=f"tts-{engine}-synth")
         producer.start()
         try:
             while True:
@@ -698,6 +970,31 @@ class TTS:
             # non-zero exit → try the next player in the chain
 
     # -------------------------------------------------------- synthesis
+    def load_fallback(self) -> bool:
+        """Bring the local fallback engine up (used when fish fails)."""
+        if FISH_FALLBACK == "f5":
+            return _ensure_f5_server()
+        return True
+
+    def _synth_fish(self, text: str, out_path: str):
+        """Render one chunk through the hosted API. Raises on failure so the
+        caller can fall back locally rather than emitting silence."""
+        res = _fish_stream(text, out_path, FISH_TIMEOUT_S)
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("fish returned no audio")
+        return res
+
+    def _synth_f5(self, text: str, out_path: str):
+        """Render one chunk through the sidecar. Raises on failure — silence
+        from Jarvis reads as a broken assistant, so this must not be swallowed
+        here; the caller decides whether to fall back."""
+        resp = _f5_request({"text": text, "out": out_path,
+                            "nfe": F5_PARAMS["nfe_step"],
+                            "speed": F5_PARAMS["speed"]})
+        if not resp.get("ok"):
+            raise RuntimeError(f"f5 synthesis failed: {resp.get('error')}")
+        return resp
+
     def _synth_edge(self, text: str, out_path: str):
         """Synthesize with Edge TTS (fast, ~1s warm). 15s hard timeout.
         (The stream is MP3 whatever the suffix; see module docstring.)"""
@@ -748,7 +1045,8 @@ class TTS:
                 pass
 
         if all_wav:
-            sf.write(out_path, np.concatenate(all_wav), 24000)
+            sf.write(out_path, apply_output_gain(np.concatenate(all_wav)),
+                     24000)
 
     # ---------------------------------------------------------- cleaning
     def _clean_for_speech(self, text: str) -> str:
