@@ -30,6 +30,7 @@ import numpy as np
 from jarvis.config import CONFIG
 from jarvis.events import HotwordDetected, Status, bus
 from jarvis.logs import get_logger
+from jarvis.speaker import MIN_AUDIO_SECONDS as SPEAKER_MIN_AUDIO_SECONDS
 
 log = get_logger("hotword")
 
@@ -115,6 +116,23 @@ def wake_hit(predictions, threshold, unverified_threshold):
     return hit, max(jarvis, mycroft)
 
 
+# The wake decision must not be made on a buffer that has just been cleared:
+# jarvis/app.py releases the mic to record, and on resume the listener clears
+# its ring buffer and resets the model. Below speaker.MIN_AUDIO_SECONDS the
+# speaker gate cannot score at all -- _extract_embedding returns None, and
+# _speaker_ok fails OPEN -- so a wake in that window is accepted with nobody
+# checking who spoke (seen 2026-08-28 16:41:32.959, 0.349 s of audio,
+# "wake speaker check unavailable -- waking anyway"). Waiting the extra
+# fraction of a second costs nothing: the buffer fills in real time.
+WAKE_MIN_AUDIO_SECONDS = SPEAKER_MIN_AUDIO_SECONDS
+
+
+def wake_audio_sufficient(n_samples: int, native_rate: int,
+                          min_seconds: float = WAKE_MIN_AUDIO_SECONDS) -> bool:
+    """Is there enough buffered audio for the speaker gate to judge a wake?"""
+    return n_samples >= int(native_rate * min_seconds)
+
+
 def frames_agree(history, window, required):
     """True when `required` of the last `window` frames were hits.
 
@@ -157,6 +175,7 @@ class Hotword:
         self._reopen = False
         self._paused = False
         self._predict_failures = 0
+        self._short_wake_logged = False
         if arbiter is not None:
             try:
                 arbiter.register_hotword(self.pause, self.resume)
@@ -390,6 +409,19 @@ class Hotword:
             # Snapshot the ring buffer BEFORE clearing it -- it holds the
             # utterance that fired, which is what the speaker gate judges.
             utterance = np.array(buf, dtype=np.float32)
+            if not wake_audio_sufficient(len(utterance), native_rate):
+                # Not enough audio for the speaker gate, which abstains (and
+                # so admits) rather than rejects. Keep filling -- do NOT clear
+                # the buffer here, or the wait can never end.
+                if not self._short_wake_logged:
+                    log.info("wake held: %.2f s buffered since the stream "
+                             "reopened, speaker gate needs %.1f s",
+                             len(utterance) / native_rate,
+                             WAKE_MIN_AUDIO_SECONDS)
+                    self._short_wake_logged = True
+                continue
+            self._short_wake_logged = False
+
             buf.clear()
             self._model.reset()
             recent.clear()
