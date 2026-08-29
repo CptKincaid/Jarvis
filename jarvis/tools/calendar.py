@@ -254,6 +254,11 @@ def coerce_range(value) -> str:
     return "today"
 
 
+# A day commonly holds three or four events. At the default two
+# sentences Jarvis named the first and dropped the rest.
+CALENDAR_MAX_SENTENCES = 4
+
+
 def format_events(events, range: str = "today", now: datetime = None) -> str:
     """The compact text for today / tomorrow / week / next at ``now``."""
     range = coerce_range(range)
@@ -775,7 +780,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         text = format_events(snap.events, rng, now)
         if snap.stale:
             text += f" That's as of {as_of_words(snap.fetched_at, now)}."
-        return ToolResult(text=text)
+        return ToolResult(text=text, max_sentences=CALENDAR_MAX_SENTENCES)
 
     def add_event(text="", calendar=None, **_) -> ToolResult:
         """Add one event. Writes outright when the parse is unambiguous;

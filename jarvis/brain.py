@@ -85,6 +85,15 @@ INCLUDE_GIT_LINE = True        # latency knob (spec 4.3): drop "Git:" lines
 MAX_TOOL_TEXT_CHARS = 4000       # one tool result
 MAX_TOOL_TEXT_TOTAL_CHARS = 8000  # every tool result in one turn
 MAX_TOOL_CALLS_PER_ROUND = 8     # one confused turn may not fan out forever
+# A tool may raise the spoken cap (calendar, mail, briefing all hold lists).
+# That number used to reach only the post-trim, while the system prompt went
+# on telling the model "one or two sentences" -- so it wrote two, the raised
+# cap trimmed nothing, and a four-event day was answered with one event named
+# (heard 2026-08-28). The allowance has to be in the message the model reads.
+SENTENCE_ALLOWANCE = (
+    "\n[this result lists several items: you may take up to {n} sentences "
+    "here, and should name each item with its time rather than only the "
+    "first or a count of them]")
 TOOL_TRUNCATED_MARKER = (
     "\n[truncated: only the first {shown} of {total} characters of this "
     "result are shown. Answer from what is shown and tell Hunter you are "
@@ -1169,6 +1178,11 @@ class JarvisBrain:
                 truncated = True
                 log.warning("tool %s text truncated: %d chars -> %d",
                             name, len(result.text or ""), len(content))
+            allowed = int(getattr(result, "max_sentences", 2) or 2)
+            if allowed > MAX_SPOKEN_SENTENCES:
+                # appended after the budget accounting: this is instruction,
+                # not tool data, and must not squeeze the result itself out
+                content += SENTENCE_ALLOWANCE.format(n=allowed)
             return {"role": "tool", "content": content, "tool_name": name}
 
         rounds_left = max(1, int(max_rounds or 1))
