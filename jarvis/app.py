@@ -1070,10 +1070,26 @@ class JarvisApp:
             except Exception:
                 log.exception("autostart install failed")
 
+    def _load_tts(self):
+        try:
+            self.tts.load()
+        except Exception:
+            log.exception("tts load failed")
+
     def _load_models(self):
         # start_preload() may still be importing torch/whisper; importing the
         # same modules from two threads is what the preload exists to avoid.
         _PRELOAD_DONE.wait(120)
+        # XTTS is the only model sitting between a finished reply and the
+        # first audible word, so it must not queue behind the ones the user
+        # never waits on -- it used to load fourth, after a 5.5 s ollama
+        # warmup, and was still loading when the user spoke (11.07 s of
+        # silence after the reply was ready, 2026-08-28). Running it
+        # alongside the rest is safe: TTS.load() serialises against the
+        # speak path's own call rather than racing it.
+        tts_load = threading.Thread(target=self._load_tts, daemon=True,
+                                    name="tts-load")
+        tts_load.start()
         self.brain.warmup()
         bus.publish(Status(text="Loading speech model…", kind="busy"))
         try:
@@ -1083,10 +1099,6 @@ class JarvisApp:
         except Exception:
             log.exception("whisper load failed")
             bus.publish(Status(text="Speech model failed to load", kind="error"))
-        try:
-            self.tts.load()
-        except Exception:
-            log.exception("tts load failed")
         # Warm the speaker model here so the first wake word does not pay the
         # ~1.4 s CUDA cold start, and so the audio path never has to load it
         # inline. Verification loads lazily too, but that is the fallback.
@@ -1107,7 +1119,9 @@ class JarvisApp:
                     kind="warn"))
         except Exception:
             log.exception("output sink check failed")
-        # Render the canned lines into the speech cache while idle.
+        # Render the canned lines into the speech cache while idle. The
+        # prewarm needs the model, so this is where we finally wait for it.
+        tts_load.join(120)
         try:
             self.tts.prewarm(self._canned_phrases())
         except Exception:
