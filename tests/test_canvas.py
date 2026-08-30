@@ -508,3 +508,135 @@ def test_handlers_never_raise_through_the_registry(monkeypatch):
     assert reg.call("canvas_grades", {}).speak == cv.NO_GRADES_LINE
     r = reg.call("canvas_announcements", {})
     assert r.ok and r.text.endswith("1) Canvas - T")
+
+
+# ------------------------------------------------------------ next exam
+def _ev(title, start, all_day=False):
+    from types import SimpleNamespace
+    return SimpleNamespace(title=title, start=start, all_day=all_day, calendar="Canvas")
+
+
+def _due_item(title, due, course="BIOSENSORS"):
+    return {"course": course, "title": title, "due": due.astimezone(timezone.utc)}
+
+
+def test_exam_kind_words():
+    assert cv.exam_kind("Midterm 1") == "exam"
+    assert cv.exam_kind("FINAL EXAM (cumulative)") == "exam"
+    assert cv.exam_kind("Quiz 2") == "quiz"
+    assert cv.exam_kind("Lab 3 report") is None
+    # "test" is not an exam word: unit-test labs and COVID tests carry it
+    assert cv.exam_kind("Unit test lab") is None
+    assert cv.exam_kind("Finalize essay") is None
+
+
+def test_next_exam_filters_by_kind_and_course_words():
+    items = [_due_item("Quiz 2", _local(1, 17, 0), course="CIRCUITS"),
+             _due_item("Lab 3 report", _local(1, 23, 59)),
+             _due_item("Midterm 1", _local(6, 9, 0)),
+             _due_item("Final exam", _local(25, 8, 0), course="CIRCUITS")]
+    events = [_ev("Dentist", _local(2, 10, 0)),
+              _ev("Midterm 1", _local(6, 9, 0)),                 # the iCloud mirror
+              _ev("Physics exam", _local(3, 13, 0))]
+    got = cv.next_exam(items, events, NOW, "next exam")
+    assert (got["title"], got["source"]) == ("Physics exam", "calendar")
+    got = cv.next_exam(items, events, NOW, "biosensors midterm")
+    assert (got["title"], got["course"], got["source"]) == ("Midterm 1", "BIOSENSORS", "canvas")
+    assert cv.next_exam(items, events, NOW, "quiz")["title"] == "Quiz 2"
+    assert cv.next_exam(items, events, NOW, "circuits final")["title"] == "Final exam"
+    assert cv.next_exam(items, events, NOW, "chemistry exam") is None
+    assert cv.next_exam(items, events, NOW, "exam")["title"] == "Physics exam"
+    # a quiz never answers "next exam"; an exam never answers "quiz"
+    assert cv.next_exam([items[0]], [], NOW, "next exam") is None
+    assert cv.next_exam([items[2]], [], NOW, "the quiz") is None
+    # "final" / "midterm" name a particular exam; a bare "exam" is generic
+    assert cv.next_exam([items[2]], [], NOW, "next final") is None
+    assert cv.next_exam([items[3]], [], NOW, "next midterm") is None
+    assert cv.next_exam([items[2]], [], NOW, "next exam")["title"] == "Midterm 1"
+    assert cv.next_exam([items[3]], [], NOW, "my finals")["title"] == "Final exam"
+
+
+def test_exam_candidates_drop_the_past_and_dedupe_the_calendar_mirror():
+    when = _local(6, 9, 0)
+    items = [_due_item("Midterm 1", when), _due_item("Old exam", _local(-1, 9, 0))]
+    events = [_ev("midterm 1", when + timedelta(hours=1)), _ev("Quiz 9", _local(-2, 9, 0)),
+              _ev("Finals week", _local(2, 0, 0), all_day=True),
+              _ev("Naive exam", datetime(2026, 9, 3, 9, 0))]      # naive start: ignored
+    cands = cv.exam_candidates(items, events, NOW)
+    assert [(c["title"], c["source"]) for c in cands] == \
+        [("Finals week", "calendar"), ("Midterm 1", "canvas")]
+    assert cands[0]["all_day"] is True
+
+
+def test_countdown_words():
+    assert cv.countdown_words(_local(0, 14, 0), NOW) == "today at 2:00 pm"
+    assert cv.countdown_words(_local(1, 9, 0), NOW) == "tomorrow at 9:00 am"
+    assert cv.countdown_words(_local(1, 0, 0), NOW, all_day=True) == "tomorrow"
+    assert cv.countdown_words(_local(4, 9, 0), NOW) == "in 4 days, Friday at 9:00 am"
+    assert cv.countdown_words(_local(19, 9, 0), NOW) == "in 19 days, Sat 19 Sep at 9:00 am"
+    # a UTC due time reads in the caller's zone
+    utc = _local(4, 9, 0).astimezone(timezone.utc)
+    assert cv.countdown_words(utc, NOW) == "in 4 days, Friday at 9:00 am"
+    cand = {"course": "BIOSENSORS", "title": "Midterm 1", "when": _local(4, 9, 0)}
+    assert cv.exam_words(cand, NOW) == "Midterm 1 for BIOSENSORS, in 4 days, Friday at 9:00 am"
+    assert cv.exam_words({"course": "", "title": "Quiz", "when": _local(1, 9, 0)}, NOW) == \
+        "Quiz, tomorrow at 9:00 am"
+
+
+def _exam_planner():
+    return [_planner("quiz", 102, "Quiz 2", _local(1, 17, 0),
+                     context="ECEN 214 Electrical Circuit Theory FA26"),
+            _planner("assignment", 101, "Midterm 1", _local(6, 9, 0),
+                     context="BMEN 420 500 BIOSENSORS FA26"),
+            _planner("assignment", 101, "Lab 3 report", _local(1, 23, 59),
+                     context="BMEN 420 500 BIOSENSORS FA26")]
+
+
+class _Cal:
+    def __init__(self, events, configured=True):
+        self._events, self._configured = events, configured
+
+    @property
+    def configured(self):
+        return self._configured
+
+    def events(self):
+        return self._events
+
+
+def test_find_next_exam_merges_canvas_and_calendar():
+    fetch = FakeFetch({PLANNER_URL + "?": _ok(_exam_planner())})
+    cal = _Cal([_ev("Physics exam", _local(3, 13, 0))])
+    exam, checked = cv.find_next_exam(_cfg(), cal, "next exam", now=NOW, fetch=fetch)
+    assert checked and exam["title"] == "Physics exam"
+    exam, checked = cv.find_next_exam(_cfg(), cal, "biosensors midterm", now=NOW, fetch=fetch)
+    assert exam["course"] == "BIOSENSORS" and exam["when"] == _local(6, 9, 0)
+    # one planner call per lookup, thirty days wide
+    urls = fetch.urls()
+    assert len(urls) == 2 and all(u.startswith(PLANNER_URL) for u in urls)
+    assert "end_date=" + _iso(NOW + timedelta(days=30))[:10] in urls[0]
+    # the token rides only in the header
+    assert TOKEN not in urls[0] and fetch.calls[0][1]["Authorization"] == f"Bearer {TOKEN}"
+
+
+def test_find_next_exam_without_a_token_uses_the_calendar_and_says_so():
+    fetch = FakeFetch({})
+    cal = _Cal([_ev("Physics exam", _local(3, 13, 0))])
+    exam, checked = cv.find_next_exam(_cfg(token=""), cal, "exam", now=NOW, fetch=fetch)
+    assert exam["title"] == "Physics exam" and checked is False and fetch.calls == []
+    exam, checked = cv.find_next_exam(_cfg(token=""), None, "exam", now=NOW, fetch=fetch)
+    assert exam is None and checked is False
+    exam, checked = cv.find_next_exam(_cfg(token=""), _Cal([], configured=False), "exam",
+                                      now=NOW, fetch=fetch)
+    assert exam is None and checked is False
+
+
+def test_find_next_exam_survives_a_canvas_outage_and_a_bad_token():
+    cal = _Cal([_ev("Physics exam", _local(3, 13, 0))])
+    for table in ({PLANNER_URL + "?": OSError("down")},
+                  {PLANNER_URL + "?": (401, {}, {"errors": "bad token"})}):
+        exam, checked = cv.find_next_exam(_cfg(), cal, "exam", now=NOW, fetch=FakeFetch(table))
+        assert checked and exam["title"] == "Physics exam"
+    exam, checked = cv.find_next_exam(_cfg(), None, "exam", now=NOW,
+                                      fetch=FakeFetch({PLANNER_URL + "?": OSError("down")}))
+    assert exam is None and checked

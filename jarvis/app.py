@@ -1607,6 +1607,17 @@ class JarvisApp:
                 self.headsup.start()
         except Exception:
             log.exception("meeting heads-up failed to start")
+        try:
+            from jarvis.deadlines import DeadlineHeadsUp
+            hours = self.assistant.get("canvas.heads_up_hours", 3)
+            self.deadlines = DeadlineHeadsUp(
+                self.assistant, self.timekeeper, lead_hours=hours,
+                state_path=PATHS.MEMORY_DIR / "deadlines_state.json",
+                get_calendar=lambda: getattr(self.services, "calendar", None))
+            if self.timekeeper is not None:
+                self.deadlines.start()
+        except Exception:
+            log.exception("deadline heads-up failed to start")
         if residency:
             try:
                 # boot warm-up on its own daemon thread, then every 5 min
@@ -1727,7 +1738,8 @@ class JarvisApp:
                           ("timekeeper", self.timekeeper), ("calendar", cal),
                           ("claude", self.claude),
                           ("health_watchdog", getattr(self.services, "health_watchdog", None)),
-                          ("headsup", getattr(self, "headsup", None))):
+                          ("headsup", getattr(self, "headsup", None)),
+                          ("deadlines", getattr(self, "deadlines", None))):
             if obj is None:
                 continue
             fn = getattr(obj, "stop", None) or getattr(obj, "close", None)

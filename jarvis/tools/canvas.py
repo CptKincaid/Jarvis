@@ -485,6 +485,159 @@ def due_sheet(items: list[dict], days: int, now: datetime) -> str:
     return "\n".join(lines)
 
 
+# --------------------------------------------------------------- exams
+# "Exam-ish" titles across Canvas items and calendar events. Quizzes are
+# their own kind: "when's my next exam" must not answer with Quiz 3, but
+# "how long until the quiz" must find it. "test" is deliberately absent --
+# "Unit test lab", "Test your knowledge" and "COVID test" all carry it.
+_EXAM_KINDS = {"exam": ("exam", "exams", "midterm", "midterms", "final", "finals"),
+               "quiz": ("quiz", "quizzes")}
+_EXAM_WORDS = {w: k for k, words in _EXAM_KINDS.items() for w in words}
+_SPECIFIC = {"midterm": "midterm", "midterms": "midterm", "final": "final", "finals": "final"}
+_WORD_RX = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+# Question filler that must not become a title filter ("how long until
+# the biosensors midterm" -> just "biosensors").
+_QUERY_STOP = {"when", "whens", "when's", "is", "was", "are", "my", "the", "a", "an",
+               "next", "how", "long", "many", "days", "until", "till", "before",
+               "to", "do", "i", "have", "it", "in", "of", "for", "sir", "jarvis", "my"}
+NO_EXAM_LINE = "Nothing that looks like an exam on the books, sir."
+NO_QUIZ_LINE = "No quiz on the books, sir."
+EXAM_LOOKAHEAD_DAYS = MAX_DAYS       # one planner call; 30 days is Canvas's cap
+EXAM_EVE_HOUR = 19                   # the evening-before heads-up fires at 7 pm
+
+
+def exam_kind(title: str) -> Optional[str]:
+    """'exam' / 'quiz' when the title names one, else None."""
+    for w in _WORD_RX.findall(str(title or "").lower()):
+        kind = _EXAM_WORDS.get(w)
+        if kind:
+            return kind
+    return None
+
+
+def exam_candidates(items: list, events: list, now: datetime) -> list[dict]:
+    """[{course, title, when, kind, all_day, source}] soonest first, from
+    Canvas due items ({course, title, due}) and calendar events (.title,
+    .start, .all_day, .calendar). The same exam in both (the iCloud
+    'Canvas' subscription mirrors Canvas) keeps the Canvas copy: it carries
+    the course name; a calendar copy is kept only when no Canvas item shares
+    its title on that day."""
+    out: list[dict] = []
+    seen: set = set()
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        title = " ".join(str(it.get("title") or "").split())
+        when = it.get("due")
+        kind = exam_kind(title)
+        if not kind or not isinstance(when, datetime) or when <= now:
+            continue
+        seen.add((title.lower(), when.astimezone(now.tzinfo).date()))
+        out.append({"course": str(it.get("course") or ""), "title": title, "when": when,
+                    "kind": kind, "all_day": False, "source": "canvas"})
+    for ev in events or []:
+        title = " ".join(str(getattr(ev, "title", "") or "").split())
+        when = getattr(ev, "start", None)
+        kind = exam_kind(title)
+        if not kind or not isinstance(when, datetime) or when.tzinfo is None:
+            continue
+        all_day = bool(getattr(ev, "all_day", False))
+        # An all-day exam "starts" at midnight; the day is what matters.
+        if (when <= now and not all_day) or (all_day and when.date() < now.astimezone(when.tzinfo).date()):
+            continue
+        day_key = (title.lower(), when.astimezone(now.tzinfo).date())
+        if day_key in seen:
+            continue
+        seen.add(day_key)
+        out.append({"course": "", "title": title, "when": when, "kind": kind,
+                    "all_day": all_day, "source": "calendar"})
+    out.sort(key=lambda c: c["when"])
+    return out
+
+
+def next_exam(items: list, events: list, now: datetime, query: str = "") -> Optional[dict]:
+    """The soonest exam matching ``query`` ("next exam", "biosensors
+    midterm", "quiz"), or None. Kind words in the query pick the kind
+    (exam words never match a quiz and vice versa; no kind word -> exams
+    only); every other content word must appear in the course or title."""
+    words = _WORD_RX.findall(str(query or "").lower())
+    kinds = {_EXAM_WORDS[w] for w in words if w in _EXAM_WORDS} or {"exam"}
+    needles = [w for w in words if w not in _EXAM_WORDS and w not in _QUERY_STOP
+               and len(w) > 1]
+    # "final" and "midterm" name a particular exam: "when's my next final"
+    # must not answer with the midterm. "exam" alone is generic.
+    specific = {_SPECIFIC[w] for w in words if w in _SPECIFIC}
+    for cand in exam_candidates(items, events, now):
+        if cand["kind"] not in kinds:
+            continue
+        hay = f"{cand['course']} {cand['title']}".lower()
+        if specific and not any(s in cand["title"].lower() for s in specific):
+            continue
+        if all(n in hay for n in needles):
+            return cand
+    return None
+
+
+def countdown_words(when: datetime, now: datetime, all_day: bool = False) -> str:
+    """'today at 2:00 pm' / 'tomorrow at 9:00 am' / 'in 6 days, Friday at
+    9:00 am' / 'in 19 days, Wed 15 Oct at 9:00 am', in ``now``'s zone."""
+    local = when.astimezone(now.tzinfo) if now.tzinfo else when
+    days = (local.date() - now.date()).days
+    clock = "" if all_day else f" at {clock_words(local)}"
+    if days <= 0:
+        return f"today{clock}"
+    if days == 1:
+        return f"tomorrow{clock}"
+    if days < 7:
+        return f"in {days} days, {local.strftime('%A')}{clock}"
+    return f"in {days} days, {local.strftime('%a')} {local.day} {local.strftime('%b')}{clock}"
+
+
+def exam_words(cand: dict, now: datetime) -> str:
+    """'Midterm 1 for BIOSENSORS, in 6 days, Friday at 9:00 am' -- the
+    countdown fragment the briefing and the Tier-1 answer both speak."""
+    what = cand["title"]
+    if cand.get("course"):
+        what += f" for {cand['course']}"
+    return f"{what}, {countdown_words(cand['when'], now, cand.get('all_day', False))}"
+
+
+def _calendar_events(calendar) -> list:
+    """Events from a CalendarSource-like object; [] when absent, unconfigured
+    or broken (the calendar half must never take the Canvas half down)."""
+    if calendar is None:
+        return []
+    try:
+        conf = getattr(calendar, "configured", True)
+        if callable(conf):
+            conf = conf()
+        if not conf:
+            return []
+        return list(calendar.events())
+    except Exception:                          # noqa: BLE001 - source boundary
+        log.debug("canvas: calendar events unavailable", exc_info=True)
+        return []
+
+
+def find_next_exam(cfg, calendar=None, query: str = "", now: Optional[datetime] = None,
+                   fetch: Fetch = None) -> tuple[Optional[dict], bool]:
+    """(exam or None, canvas_checked). Canvas items (when the token is set;
+    a CanvasError is swallowed and logged -- the calendar half still
+    answers) merged with the calendar's cached events. ``canvas_checked``
+    is False when the token is unset so a caller can fall back to the
+    canvas_due tool turn, whose setup line explains what is missing."""
+    now = now or _now()
+    settings = canvas_settings(cfg)
+    items: list = []
+    checked = settings is not None
+    if checked:
+        try:
+            items = fetch_due(settings, EXAM_LOOKAHEAD_DAYS, fetch or _fetch, now)
+        except CanvasError as exc:
+            log.info("canvas: exam lookup skipped Canvas (%s)", exc.kind)
+    return next_exam(items, _calendar_events(calendar), now, query), checked
+
+
 # -------------------------------------------------------------- grades
 def _score_words(course: dict) -> str:
     score, grade = course.get("score"), course.get("grade")

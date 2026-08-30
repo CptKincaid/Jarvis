@@ -196,6 +196,13 @@ def briefing_rows(sections) -> list:
         rows.append(("WEATHER", weather))
     for i, line in enumerate(_as_lines(s.get("calendar"))):
         rows.append(("CALENDAR" if i == 0 else "", line))
+    # Coursework: DUE (one row per item) and the EXAM countdown, both
+    # absent when Canvas is unconfigured or nothing qualifies.
+    for i, line in enumerate(_as_lines(s.get("due"))):
+        rows.append(("DUE" if i == 0 else "", line))
+    exam = str(s.get("exam") or "").strip()
+    if exam:
+        rows.append(("EXAM", exam))
     items = []
     for item in (s.get("news") or [])[:3]:
         if isinstance(item, dict):
