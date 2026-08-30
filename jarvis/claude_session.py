@@ -87,6 +87,12 @@ UNSAFE_DIR_LINE = ("That's your home or a configuration folder, sir, not a "
                    "project, so I'd rather not turn Claude loose in it. Say "
                    "the word and I'll open the terminal there instead.")
 NO_RESULT_LINE = "Claude stopped without a result, sir."
+# The fixed half of "what's Claude doing?": the running-state line is built
+# per call (project, elapsed, counts) and cannot be prewarmed; this one can.
+IDLE_LINE = "Claude's idle, sir."
+# ~/.bashrc wraps `claude` in `tmux new -s cc-<basename>`: the user's OWN
+# terminals, which Jarvis never started but can still see from the status.
+OWN_SESSION_PREFIX = "cc-"
 
 # ------------------------------------------------- the interactive pane
 # VERIFIED live on tmux 3.4 / Claude Code 2.1.247, 2026-08-27:
@@ -261,6 +267,14 @@ class Task:
     # limiter (a task that starts at now=1 would otherwise be silenced).
     last_edit_milestone: float = NEVER
     last_milestone: float = NEVER
+    # The last milestone line that went out with milestone=True -- i.e. the
+    # last thing the app SPOKE about this task.  Kept on the task (not on
+    # the app) so status_text() can repeat it without any app plumbing.
+    last_spoken: str = ""
+    # An in-pane AskUserQuestion Claude is sitting on.  Distinct from
+    # state=="waiting": that is an MCP permission prompt (ApprovalRequested);
+    # a question in the pane sets nothing else, so status_text() needs this.
+    question: str = ""
 
     @property
     def final(self) -> bool:
@@ -459,6 +473,17 @@ def _join_names(names: list[str]) -> str:
     return ", ".join(names[:-1]) + " and " + names[-1]
 
 
+def _count(n: int, noun: str) -> str:
+    return f"{'one' if n == 1 else n} {noun}{'' if n == 1 else 's'}"
+
+
+def _spoken_clean(line: str) -> str:
+    """A milestone line quoted inside the status line: drop its own ", sir"
+    and full stop so the digest does not say "sir" twice."""
+    text = re.sub(r",?\s*\bsir\b[.!]?", "", str(line or "")).strip()
+    return text.rstrip(".!").strip() or "nothing yet"
+
+
 def _ago(seconds: float) -> str:
     words = ["zero", "one", "two", "three", "four", "five", "six", "seven",
              "eight", "nine", "ten", "eleven", "twelve", "thirteen",
@@ -587,6 +612,8 @@ def parse_stream_event(event, task: Task, now: Optional[float] = None) -> list:
                 milestone = False
             else:
                 task.last_milestone = now
+        if milestone:
+            task.last_spoken = line
         lines.append(ClaudeProgress(project=task.project, task_id=task.task_id,
                                     line=line, milestone=milestone))
     return lines
@@ -691,8 +718,9 @@ def _parse_tool_use(block: dict, task: Task, now: float, out: list):
         return
     if name == "AskUserQuestion":
         out.append((line, False, False))
-        out.append((f"Claude has a question, sir: {line[9:] if line.startswith('Question ') else 'see the terminal'}",
-                    True, True))
+        question = line[9:] if line.startswith("Question ") else "see the terminal"
+        task.question = question
+        out.append((f"Claude has a question, sir: {question}", True, True))
         return
     out.append((line, False, False))
 
@@ -701,6 +729,8 @@ def _parse_tool_result(block: dict, task: Task, out: list):
     tid = str(block.get("tool_use_id") or "")
     name, _inp = task.tool_uses.get(tid, ("tool", {}))
     text = _result_text(block.get("content"))
+    if name == "AskUserQuestion":
+        task.question = ""              # answered (in the terminal): no longer sitting on it
     if block.get("is_error"):
         # A test run that FAILS exits non-zero, and the CLI marks every
         # non-zero Bash result is_error — so the verdict ("2 tests failed,
@@ -1661,10 +1691,28 @@ class ClaudeSessionManager:
         return True
 
     def _capture_pane(self, slug: str) -> str:
-        r = self._tmux("capture-pane", "-p", "-t", f"jarvis-{slug}")
+        return self._capture_pane_named(f"jarvis-{slug}")
+
+    def _capture_pane_named(self, name: str) -> str:
+        """capture-pane by full tmux session name (the user's own cc-<dir>
+        sessions carry no jarvis- prefix)."""
+        r = self._tmux("capture-pane", "-p", "-t", name)
         if getattr(r, "returncode", 1) != 0:
             return ""
         return getattr(r, "stdout", "") or ""
+
+    def own_sessions(self) -> list[tuple[str, bool]]:
+        """The user's OWN Claude terminals -- tmux sessions named
+        cc-<dir> by ~/.bashrc's claude wrapper, which Jarvis did not start
+        -- as (name, mid-turn).  tmux only; never takes the lock."""
+        r = self._tmux("list-sessions", "-F", "#{session_name}", timeout=5)
+        if getattr(r, "returncode", 1) != 0:
+            return []
+        out = []
+        for name in (getattr(r, "stdout", "") or "").split():
+            if name.startswith(OWN_SESSION_PREFIX):
+                out.append((name, pane_working(self._capture_pane_named(name))))
+        return out
 
     def _send_line(self, slug: str, text: str) -> bool:
         """One line of literal text plus Enter.  `-l` matters: without it
@@ -2222,26 +2270,59 @@ class ClaudeSessionManager:
             return self._tasks.get(task_id)
 
     def status_text(self) -> str:
+        """"What's Claude doing?" -- one spoken digest from live state:
+        project, elapsed, files touched, the last milestone spoken, an
+        in-pane question, what is queued, and the user's own cc-* terminals.
+        The lock is held only to copy the fields; the tmux probe for the
+        user's own sessions runs unlocked (a runner thread may be mid-task)."""
         with self._lock:
-            running = list(self._running.values())
+            running = [(t.project, t.state, t.started, len(t.files_touched),
+                        t.last_spoken, t.question) for t in self._running.values()]
             queued = len(self._queue)
         now = self._now()
         if running:
-            t = running[0]
-            proj = self._projects.get(t.project)
-            name = proj.display if proj else display_name(t.project)
-            verb = "waiting on you about" if t.state == "waiting" else "working on"
-            line = f"Claude's {verb} {name}, sir; started {_ago(now - t.started)}."
+            project, state, started, files, spoken, question = running[0]
+            proj = self._projects.get(project)
+            name = proj.display if proj else display_name(project)
+            verb = "waiting on you about" if state == "waiting" else "working on"
+            line = f"Claude's {verb} {name}, sir; started {_ago(now - started)}"
+            if files:
+                line += f", {_count(files, 'file')} touched so far"
+            if spoken:
+                line += f"; the last word was: {_spoken_clean(spoken)}"
+            if question and state != "waiting":
+                line += f"; it's sitting on a question: {_spoken_clean(question)}"
+            line += "."
             if len(running) > 1:
-                line = line[:-1] + f", and {display_name(running[1].project)} alongside."
+                line = line[:-1] + f", and {display_name(running[1][0])} alongside."
         else:
             active = self.active_project
-            line = "Claude's idle, sir."
+            line = IDLE_LINE
             if active:
-                line = f"Claude's idle, sir; the active project is {display_name(active)}."
+                line = f"{IDLE_LINE[:-1]}; the active project is {display_name(active)}."
         if queued:
             line += " One more is queued." if queued == 1 else f" {queued} more are queued."
+        line += self._own_sessions_line()
         return line
+
+    def _own_sessions_line(self) -> str:
+        try:
+            own = self.own_sessions()
+        except Exception:                        # noqa: BLE001 - a probe, never the answer
+            log.exception("own-session probe failed")
+            return ""
+        if not own:
+            return ""
+        busy = [n for n, working in own if working]
+        idle = [n for n, working in own if not working]
+        parts = []
+        if busy:
+            parts.append(f"your own {_join_names(busy)} "
+                         f"{'is' if len(busy) == 1 else 'are'} mid-turn")
+        if idle:
+            parts.append(f"your own {_join_names(idle)} "
+                         f"{'is' if len(idle) == 1 else 'are'} idle")
+        return " And " + ", ".join(parts) + "."
 
     # --------------------------------------------------- approvals hook
     def _task_for_approval(self, project: str) -> Optional[Task]:

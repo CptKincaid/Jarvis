@@ -757,3 +757,30 @@ def test_a_session_action_beats_the_terminal_address():
                  "cancel that in the terminal"):
         d = r.route(text, "jarvis", terminal_open=term)
         assert d.kind == "action" and d.action == "cancel", (text, d)
+
+
+# ----------------------------------------------------- "what's Claude doing?"
+def test_the_status_question_is_a_session_action():
+    """docs/capabilities.md advertised the phrase while status_text() had
+    no caller: the cue regex wants have/ask/tell claude, so the question
+    fell through to the local model and got a persona guess."""
+    r = Router(None, classify=None)
+    for text in ("what's Claude doing?", "What is Claude doing right now",
+                 "how's claude getting on", "how is claude going",
+                 "is claude still working", "is claude done yet",
+                 "any word from claude", "claude status", "what's claude's status",
+                 "what's claude up to", "jarvis, what's claude doing",
+                 "what's claude working on", "has claude finished"):
+        d = r.route(text, "jarvis")
+        assert d.kind == "action" and d.action == "status_text", (text, d)
+        assert d.args == {}
+
+
+def test_a_bare_status_stays_with_the_persona():
+    """"status" / "status report" are the persona's git-line family and
+    the diagnostics command; only CLAUDE's status is the session action."""
+    r = Router(None, classify=None)
+    for text in ("status", "give me a status report", "what's the status of the build",
+                 "have claude check the status page"):
+        d = r.route(text, "jarvis")
+        assert d.action != "status_text", (text, d)

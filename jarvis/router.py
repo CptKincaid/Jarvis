@@ -272,6 +272,23 @@ _MODEL_RX = re.compile(
     r"(?:\s+(?:model|for (?:this|it|that)(?:\s+(?:one|task))?))?\b"
     r"|\b(?P<hard>think hard(?:er)?|think (?:really )?deeply|this is a big one|"
     r"this one'?s big|big one)\b", re.I)
+# "what's Claude doing?" -> ClaudeSessionManager.status_text().  Checked
+# FIRST in _action: the cue regex below never matched these forms (it wants
+# have/ask/tell/get claude), so the question used to fall through to the
+# local model, which guessed.  A bare "status" is deliberately NOT here:
+# that word belongs to the persona's status-report family (the git line).
+_STATUS_RX = re.compile(
+    r"^(?:so\s+|and\s+)?(?:"
+    r"(?:what(?:'s|s| is)|how(?:'s|s| is))\s+claude\s+"
+    r"(?:doing|up to|getting on|getting along|going|working on|on|at)"
+    r"|what(?:'s|s| is)\s+claude(?:'s|s)?\s+(?:status|progress)"
+    r"|(?:is|has)\s+claude\s+(?:still\s+)?(?:busy|working|running|done|finished|"
+    r"going|stuck|waiting)(?:\s+on\s+(?:it|that|something))?(?:\s+yet)?"
+    r"|(?:any\s+)?(?:word|news|update|progress)\s+(?:from|on)\s+claude"
+    r"|claude(?:'s|s)?\s+status|status\s+(?:of|on)\s+claude"
+    r"|where(?:'s|s| is)\s+claude(?:\s+(?:at|up to))?"
+    r")(?:\s+(?:right\s+)?now|\s+at the moment|\s+today|\s+so far)?"
+    r"(?:\s*[,]?\s*(?:sir|jarvis|please))*$", re.I)
 _FAST_RX = re.compile(
     r"^(?:(?:turn|switch|put|set)\s+)?fast mode\s+(?P<on>on|off)$|"
     r"^(?:(?P<en>enable|turn on|switch on)|(?P<dis>disable|turn off|switch off))"
@@ -868,6 +885,8 @@ class Router:
         t = work.strip()
         if not t:
             return None
+        if _STATUS_RX.match(t):
+            return RouteDecision("action", "status", action="status_text", args={})
         if _CANCEL_RX.match(t):
             return RouteDecision("action", "cancel", action="cancel", args={})
         m = _FAST_RX.match(t)

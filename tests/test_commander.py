@@ -1316,3 +1316,139 @@ def test_next_exam_is_tier1_in_the_assistant_and_a_canvas_outage_falls_through(
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
     res = rich.handle("when's my next exam", source="typed")
     assert res.status != "No exam found" and "Command failed" not in (res.reply or "")
+
+# --------------------------------------------------- "what's Claude doing?"
+def test_the_status_question_speaks_the_managers_digest(rich, services):
+    """Router action status_text -> ClaudeSessionManager.status_text(), and
+    the string it returns IS the reply (no persona paraphrase, no task)."""
+    digest = "Claude's working on jarvis, sir; started just now, 2 files touched so far."
+    services.claude.status_text.return_value = digest
+    for text in ("what's claude doing?", "jarvis, how's claude getting on",
+                 "is claude still working"):
+        services.claude.reset_mock()
+        services.claude.status_text.return_value = digest
+        res = rich.handle(text, source="typed")
+        assert services.claude.status_text.call_count == 1, text
+        assert res.handled and res.speak and res.reply == digest, text
+        assert res.done is True
+        services.claude.submit.assert_not_called()
+
+
+# ------------------------------------------------- clipboard -> Claude
+TRACEBACK = ("Traceback (most recent call last):\n"
+             "  File \"/home/hunterp/Jarvis/jarvis/router.py\", line 12, in route\n"
+             "    raise ValueError(\"boom\")\n"
+             "ValueError: boom\n")
+
+
+@pytest.fixture
+def clip_project(rich, services, tmp_path, monkeypatch):
+    """An active project on tmp and a scripted xclip."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    services.claude.active_project = "proj"
+    services.claude.project_for.return_value = types.SimpleNamespace(
+        slug="proj", path=str(proj))
+    clips = {"clipboard": TRACEBACK, "primary": "def f():\n    return 1\n"}
+    asked = []
+
+    def xclip(selection, run=None):
+        asked.append(selection)
+        return clips[selection]
+    monkeypatch.setattr(commander.reader_mod, "_xclip", xclip)
+    return types.SimpleNamespace(path=proj, clips=clips, asked=asked)
+
+
+def _clip_files(proj):
+    return sorted((proj / ".jarvis" / "clips").glob("*.txt"))
+
+
+def test_the_clip_goes_to_claude_by_file_never_inline(rich, services, clip_project):
+    """A traceback cannot ride the prompt: sanitize_keys collapses it to one
+    line for send-keys, and the prompt is echoed to .prompt files, the bus
+    and Discord.  So the clip is a 0600 file under the project and the
+    prompt names it."""
+    res = rich.handle("have Claude fix what I copied", source="typed")
+    _, kwargs = _submitted(services)
+    prompt = services.claude.submit.call_args.args[0]
+    files = _clip_files(clip_project.path)
+    assert len(files) == 1 and files[0].read_text() == TRACEBACK
+    assert oct(files[0].stat().st_mode & 0o777) == "0o600"
+    assert (clip_project.path / ".jarvis" / ".gitignore").read_text() == "*\n"
+    assert prompt.startswith(f"fix the text in {files[0]}.")
+    assert "read it first" in prompt and "boom" not in prompt
+    assert kwargs["project"] == "proj"
+    assert clip_project.asked == ["clipboard"]
+    assert res.handled and res.speak and res.reply == "Right away, sir."
+
+
+def test_the_clip_command_beats_the_bare_clipboard_reader(rich, services, clip_project):
+    """REGISTRY's "clipboard" entry is a substring match that runs on any
+    jarvis-prefixed text BEFORE the router; unordered, "Jarvis, have Claude
+    fix the clipboard" would be read aloud instead of handed over."""
+    names = [c.name for c in REGISTRY]
+    assert names.index("clip to claude") < names.index("clipboard")
+    res = rich.handle("jarvis, have claude fix the clipboard", source="typed")
+    assert services.claude.submit.call_count == 1
+    assert not (res.reply or "").startswith("Clipboard:")
+    # ...and the same words unprefixed, as the hotword delivers them, land
+    # in Tier 1 rather than in the router as the bare prompt "fix the clipboard"
+    services.claude.reset_mock()
+    services.claude.active_project = "proj"
+    rich.handle("send what I copied to Claude and fix the error", source="typed")
+    prompt = services.claude.submit.call_args.args[0]
+    assert prompt.startswith("fix the error the text in ")
+
+
+@pytest.mark.parametrize("text,selection,head", [
+    ("ask claude about the clipboard", "clipboard", "Have a look at the text in "),
+    ("have claude look at the selection and explain it", "primary", "look at the text in "),
+    ("tell claude to fix what I highlighted", "primary", "fix the text in "),
+    ("give claude the clipboard", "clipboard", "Have a look at the text in "),
+    ("send the highlighted text to claude", "primary", "Have a look at the text in "),
+    ("have Claude fix the copied traceback in TurnLedger", "clipboard", "fix the text in "),
+])
+def test_clip_phrasings(rich, services, clip_project, text, selection, head):
+    rich.handle(text, source="typed")
+    prompt = services.claude.submit.call_args.args[0]
+    assert prompt.startswith(head), (text, prompt)
+    assert clip_project.asked == [selection], text
+    if "explain it" in text:
+        assert " and explain it." in prompt
+    if "TurnLedger" in text:
+        assert "in TurnLedger" in prompt            # casing kept from the raw text
+
+
+def test_code_nouns_are_not_a_clip(rich, services, clip_project):
+    """"the selection logic" is code, not the X selection: routes as a
+    plain Claude task with the words intact and reads no clipboard."""
+    rich.handle("have claude change the selection logic in the picker", source="typed")
+    prompt = services.claude.submit.call_args.args[0]
+    assert prompt == "change the selection logic in the picker"
+    assert clip_project.asked == []
+
+
+def test_an_empty_clip_is_said_not_sent(rich, services, clip_project):
+    clip_project.clips["clipboard"] = "  \n"
+    res = rich.handle("have claude fix what i copied", source="typed")
+    assert res.reply == commander.CLIP_EMPTY_LINE and res.speak
+    clip_project.clips["primary"] = ""
+    res = rich.handle("have claude fix the selection", source="typed")
+    assert res.reply == commander.SELECTION_EMPTY_LINE
+    services.claude.submit.assert_not_called()
+    assert _clip_files(clip_project.path) == []
+
+
+def test_no_active_project_means_no_file_and_the_project_line(rich, services, clip_project):
+    from jarvis.claude_session import NO_PROJECT_LINE
+    services.claude.active_project = None
+    res = rich.handle("have claude fix what i copied", source="typed")
+    assert res.reply == NO_PROJECT_LINE and res.speak
+    services.claude.submit.assert_not_called()
+    assert _clip_files(clip_project.path) == []
+
+
+def test_a_manager_refusal_is_spoken_as_is(rich, services, clip_project):
+    services.claude.submit.return_value = "Claude's still on the last one for proj, sir; I've queued it."
+    res = rich.handle("have claude fix what i copied", source="typed")
+    assert res.reply.startswith("Claude's still on the last one") and res.speak

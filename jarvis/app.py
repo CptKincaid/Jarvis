@@ -514,7 +514,7 @@ class JarvisApp:
                 # BUSY_LINE is a {project} template — never prewarmed.
                 ("jarvis.claude_session", ("CANCELLED_LINE", "NO_PROJECT_LINE",
                                            "OUTSIDE_LINE", "UNSAFE_DIR_LINE",
-                                           "NO_SESSION_LINE")),
+                                           "NO_SESSION_LINE", "IDLE_LINE")),
                 ("jarvis.approvals", ("TIMEOUT_LINE", "ALLOWED_LINE",
                                       "DECLINED_LINE")),
                 ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE",
@@ -686,6 +686,8 @@ class JarvisApp:
             calendar=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
+            log_triage=self.log_triage_text,
+            slow_turn=self.slow_turn_text,
             # "how did yesterday go": the day review, spoken (dayreview.py)
             dayreview=self.day_review_text,
             # the health watchdog resolves this at fire time (talkback-gated).
@@ -1493,6 +1495,23 @@ class JarvisApp:
         if self.speaker is not None and self.speaker.enrolled:
             parts.append(f"Your voiceprint holds {self.speaker.num_samples} samples.")
         return " ".join(parts)
+
+    def log_triage_text(self) -> tuple:
+        """"Anything wrong in your log?": (spoken, card) from the tail of
+        jarvis.log and the turn ledger (jarvis/logtriage.py)."""
+        from jarvis.logs import LOG_FILE
+        from jarvis.logtriage import (TAIL_LINES, cluster_warnings, read_tail,
+                                      read_turns, triage_text, turn_outliers)
+        lines = read_tail(LOG_FILE, TAIL_LINES)
+        return triage_text(cluster_warnings(lines),
+                           turn_outliers(read_turns(PATHS.LOG_DIR / "turns.jsonl")),
+                           examined=len(lines))
+
+    def slow_turn_text(self) -> str:
+        """"Why was that slow?": the last real turn on the ledger, split
+        into silence / transcription / the answer."""
+        from jarvis.logtriage import last_turn, slow_text
+        return slow_text(last_turn(PATHS.LOG_DIR / "turns.jsonl"))
 
     # ------------------------------------------------------- turn ledger
     def _wire_turn_clock(self):

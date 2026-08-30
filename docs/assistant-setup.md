@@ -349,6 +349,33 @@ directory. Two equal candidates get one question naming both.
 **The terminal button** (next to the mic) opens the tmux session Claude is
 working in; a second click raises the same window.
 
+**"What's Claude doing?"** — also "how's Claude getting on", "is Claude still
+working", "is Claude done yet", "any word from Claude", "Claude status". One
+spoken line from live state: the project, how long ago it started, how many
+files it has touched, the last milestone Jarvis spoke ("the last word was:
+Editing router.py"), whether Claude is sitting on an in-pane question (the
+AskUserQuestion menu — answer it in the terminal; a permission prompt is
+spoken separately and reads "waiting on you about"), how many tasks are
+queued, and whether your OWN `cc-<dir>` tmux sessions (the `claude` wrapper
+in `~/.bashrc`) are mid-turn or idle. With nothing running: "Claude's idle,
+sir; the active project is jarvis." A plain "status" or "status report" is not
+this question — that stays the persona's own status line.
+
+**Clipboard to Claude.** Copy a traceback, a log excerpt or a snippet anywhere
+and say "have Claude fix what I copied", "ask Claude about the clipboard",
+"send what I copied to Claude and fix the error" or "give Claude the
+clipboard". Highlight text in a terminal instead and say "have Claude look at
+the selection and explain it" / "tell Claude to fix what I highlighted" (the X
+primary selection). The clip is written to `<active project>/.jarvis/clips/`
+(mode 0600, the folder git-ignores itself) and the task Claude gets is your
+sentence with the clip phrase replaced by that file — "fix the text in
+…/.jarvis/clips/20260830-134905.txt. That file holds what I just copied on my
+screen; read it first." The clip itself is never put in the prompt, so it never
+reaches the task log, the bus or Discord. It goes to the active project; switch
+first ("work on the VSS project") if it belongs elsewhere. An empty clipboard
+gets "The clipboard is empty, sir." A plain "have Claude fix this" is still an
+ordinary task, not a clip.
+
 ### Web lookups
 
 "Look up …", "search the web for …", "who won …", "what's the latest news about …",
@@ -705,6 +732,37 @@ dictation. Speaker verification still gates the mic.
 - **He learns your voice** — a confident match joins the voiceprint (at most every 10 min).
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
+- **"Anything wrong in your log?"** — see the next section.
+
+## 18. Log triage: "anything wrong in your log?" / "why was that slow?"
+
+You are Jarvis's developer, so the fastest bug report is Jarvis reading his own
+log. Nothing to configure.
+
+- **"Anything wrong in your log?"** (also "check your log", "any errors in your
+  log today", "what's in your log", "log triage"). He clusters the WARNING and
+  ERROR lines in the last 400 lines of `/tmp/vss_voice/jarvis.log` by logger and
+  message (numbers, paths and ids folded, so two "watchdog fired after 45s / 61s"
+  lines are one thing), drops the known noise (the tools-registry budget warning,
+  the memory migrated-dir notice — the list is `NOISE` in `jarvis/logtriage.py`),
+  and speaks two sentences: "Three things in the log, sir: 'audio processing
+  failed' from app five times, 'speaker verify FAILED SHUT' from speaker once
+  and one more on the card, last at 13:20. On the ledger, two turns waited over
+  5 seconds." The text card lists every cluster with its count, last time and
+  the traceback that followed it. A clean tail gets "Nothing wrong in the log,
+  sir; the last 400 lines are clean."
+- **"Why was that slow?"** (also "why did that take so long", "what took so
+  long", "where did the time go", "break down that turn"). From the last real
+  record in `turns.jsonl` (the ledger `jarvis/turnclock.py` writes; a closed
+  follow-up window does not count, and the record may be hours old): "The last
+  turn waited 6.3 seconds, sir: 2.7 seconds silence before the recorder stopped,
+  0.7 seconds transcribing, 2.9 seconds working out the answer; the answer was
+  the slow part. The energy timer stopped it, not the voice detector." The
+  answer stage is the model and its tools together — the ledger has no mark
+  between them. A turn that got no answer says why (uncertain, rejected…).
+- The log line has no date, so the window is the tail of the file, never "the
+  last N minutes" (it survives midnight and a quiet evening alike). The same
+  clustering now feeds the local model's "recent errors" context slice.
 
 ## 18. Long-term memory that understands you (fully local)
 

@@ -651,17 +651,18 @@ class ContextEngine:
     # Errors / screen / processes
     # ------------------------------------------------------------------
     def _get_recent_errors(self):
+        """The log's WARNING/ERROR tail clustered (jarvis/logtriage.py), one
+        line per cluster.  The keyword grep this replaced surfaced the
+        tool-budget warning five times over and nothing else."""
         try:
             log_path = LOG_FILE if LOG_FILE.exists() else _LEGACY_LOG
             if not log_path.exists():
                 return []
-            lines = log_path.read_text(errors="replace").splitlines()[-100:]
-            errors = [
-                ln for ln in lines
-                if any(kw in ln.lower() for kw in
-                       ("error", "exception", "traceback", "failed"))
-            ]
-            return errors[-5:]
+            from jarvis.logtriage import TAIL_LINES, cluster_warnings, read_tail
+            clusters = cluster_warnings(read_tail(log_path, TAIL_LINES))
+            return [f"{c.short_logger} {c.level}: {c.example}"
+                    + (f" (x{c.count})" if c.count > 1 else "")
+                    for c in clusters[:5]]
         except Exception:
             log.exception("error-context read failed")
             return []
