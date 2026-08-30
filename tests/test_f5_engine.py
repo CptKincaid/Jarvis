@@ -16,7 +16,6 @@ SETTINGS, all chosen by listening on 2026-08-28:
                lowering speed stretches the silences, not just the words.
 """
 from pathlib import Path
-import socket
 
 import pytest
 
@@ -96,10 +95,15 @@ def test_a_sidecar_error_is_raised_not_swallowed(tmp_path, monkeypatch):
 
 
 def test_load_falls_back_when_the_sidecar_will_not_start(tmp_path, monkeypatch):
-    """Same contract as XTTS: a failed load degrades to edge, never silence."""
+    """A failed load degrades, never to silence -- and never QUIETLY to the
+    cloud. XTTS (local) is preferred when its clip exists; edge is the last
+    resort and is announced. Detail in tests/test_f5_service.py."""
     monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda: False)
+    monkeypatch.setattr(tts_mod, "VOICE_REF", tmp_path / "no_xtts_clip.wav")
     t = TTS(engine="f5", cache_dir=tmp_path / "c")
-    assert t.load() is False
+    # edge can speak, so the utterance that triggered the load is kept
+    # (the same contract fish's credential fallback follows)
+    assert t.load() is True
     assert t.engine == "edge"
 
 

@@ -1,0 +1,28 @@
+[Unit]
+Description=F5-TTS sidecar (resident local voice) for Jarvis
+# Keeps the F5 model resident across Jarvis restarts and reboots so the local
+# voice -- and the hosted voice's fallback -- never pays the ~180 s cold
+# start at the moment it is needed. Install with scripts/setup_f5_service.sh.
+# A crash-looping sidecar (missing venv, CUDA gone) must not restart forever
+# on a box whose GPU memory is the system memory.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# Paths mirror jarvis/config.py PATHS exactly: F5_PYTHON, VOICE_REF_F5,
+# VOICE_REF_F5_TEXT and F5_SOCK (LOG_DIR/f5.sock). jarvis/tts.py pings the
+# same socket and adopts this server instead of spawning its own. /tmp is
+# wiped at boot (tmpfiles `D /tmp`), so the socket directory is recreated
+# here rather than assumed.
+ExecStartPre=/usr/bin/mkdir -p /tmp/vss_voice
+ExecStart=%h/.local/share/jarvis-f5/venv/bin/python %h/Jarvis/scripts/f5_server.py --socket /tmp/vss_voice/f5.sock --ref %h/.aiws_trainer/jarvis_voice_ref_f5.wav --ref-text %h/.aiws_trainer/jarvis_voice_ref_f5.txt
+# The reference clip is what gives F5 its voice, and the server derives the
+# duration floor from it at start: swap the clip, restart the unit.
+Restart=always
+RestartSec=5
+# SIGTERM is enough; the server holds no state worth flushing.
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

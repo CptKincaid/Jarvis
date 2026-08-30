@@ -528,6 +528,56 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 
 ---
 
+## 18. Local voice: the F5 sidecar as a service
+
+F5-TTS is the local voice (blind-tied the hosted Fish voice, see
+`~/voice-training/HANDOFF.md`) and the fallback whenever `tts_engine` is `fish`.
+It runs as a sidecar in its own venv (`~/.local/share/jarvis-f5/venv`), and the
+model takes up to ~180 s to become resident, so it should be up before anything
+needs it. `jarvis-f5.service` is a user unit (no sudo) that keeps it resident
+across Jarvis restarts and reboots:
+
+```bash
+cd ~/Jarvis && scripts/setup_f5_service.sh        # copy the unit, daemon-reload, enable
+systemctl --user start jarvis-f5.service           # the live cutover: do this yourself
+journalctl --user -u jarvis-f5.service -f          # "f5: listening on ..." means ready
+systemctl --user is-active jarvis-f5.service
+```
+
+The script never starts the unit: the first start puts a few GB onto a GPU that
+shares its memory with everything else here (see the 28 Aug deadlock), so that
+moment is yours. The unit uses the same paths as `jarvis/config.py` PATHS —
+socket `/tmp/vss_voice/f5.sock`, clip `~/.aiws_trainer/jarvis_voice_ref_f5.wav`
+and its transcript `.txt` — and recreates `/tmp/vss_voice` first because `/tmp`
+is wiped at boot. Swap the reference clip → `systemctl --user restart jarvis-f5`
+(the server derives the short-utterance duration floor from the clip at start).
+
+What Jarvis does with it:
+
+- **Any engine**: `tts.py` pings the socket before ever starting a sidecar and
+  adopts a running one. While the unit is active (or still loading) Jarvis
+  refuses to spawn its own copy and waits for the unit's socket instead — the
+  server unlinks and rebinds the socket path on start, so two copies would
+  fight over it.
+- **`tts_engine: fish`**: the F5 fallback is warmed on a background thread at
+  load, so an outage costs one chunk, not a cold start. If it cannot be warmed
+  you get a warn status ("Local voice fallback (F5) is not running") and a log
+  line — the hosted voice keeps working.
+- **`tts_engine: f5`**: if the sidecar is unavailable Jarvis says so (status
+  "F5 voice down — using XTTS (local)") and loads XTTS, the other local voice;
+  only with no XTTS reference clip does it fall to edge, announced as the cloud
+  voice it is. It never drops to the cloud quietly.
+- **On quit**: a sidecar Jarvis spawned itself is left running (it makes the
+  next launch warm) unless the unit has taken over, in which case the
+  redundant copy is stopped.
+
+Flipping the default engine is still a manual step: set `"tts_engine": "f5"`
+in `~/.aiws_trainer/voice_settings.json` (or the Engine picker) and restart;
+the canned lines are re-rendered on F5 by the normal prewarm, and the Fish key
+becomes optional. The speech cache keys F5 and Fish audio separately.
+
+---
+
 ## What Jarvis says when something is missing
 
 | section not set up | is_configured needs | spoken line |

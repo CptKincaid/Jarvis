@@ -1765,6 +1765,15 @@ class JarvisApp:
             self.brain.cancel()
         except Exception:
             log.exception("shutdown cleanup failed")
+        # A sidecar this process spawned stays resident on purpose (it is
+        # what makes the next launch warm) UNLESS jarvis-f5.service has taken
+        # the socket over, in which case ours is a few GB answering nobody.
+        try:
+            release = getattr(self.tts, "release_f5_sidecar", None)
+            if callable(release):
+                release()
+        except Exception:
+            log.exception("f5 sidecar release failed")
         try:
             (PATHS.LOG_DIR / "jarvis.pid").unlink(missing_ok=True)
         except OSError:
