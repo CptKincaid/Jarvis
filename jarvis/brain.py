@@ -103,6 +103,11 @@ TOOL_TRUNCATED_MARKER = (
 MODEL_DOWN_LINE = "I'm afraid my local model is down, sir."
 MODEL_SLOW_LINE = "I'm afraid my local model didn't answer in time, sir."
 MODEL_EMPTY_LINE = "I'm afraid the local model gave me nothing, sir."
+# Spoken instead of a local turn while the model is lent to a trainer
+# (release()): the first local turn after an unload would silently reload
+# the 26B model (6.9 s) and defeat the yield.
+MODEL_LENT_LINE = ("My local model is lent to your trainer at the moment, sir; "
+                   "quick answers only until it's done.")
 # Spoken when the tool loop has a result but no model turn left to phrase
 # it. It replaces speaking the raw tool text: tool text can carry third
 # party words (a mail subject, a calendar title, a web page) and those are
@@ -403,7 +408,9 @@ def reset_static_prompt():
 # Model configuration, registry, HTTP seam
 # ----------------------------------------------------------------------
 _REGISTRY = None
-_RESIDENCY = {"unloaded_once": False, "thread": None}
+# "lent": the model was unloaded on purpose (a trainer has the GPU); every
+# local door raises ModelLent before any HTTP until reclaim().
+_RESIDENCY = {"unloaded_once": False, "thread": None, "lent": False}
 
 
 def configure(model=None):
@@ -431,6 +438,11 @@ def get_registry():
 
 class OllamaDown(Exception):
     """Ollama refused the connection (not running)."""
+
+
+class ModelLent(Exception):
+    """The local model is lent to a trainer (release()); no local turn may
+    load it back until reclaim()."""
 
 
 class MalformedReply(Exception):
@@ -547,8 +559,12 @@ def _options(**overrides):
 
 
 def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
+    # keep_alive -1 pins the model; while it is lent out any request that
+    # still slips through (a caller that skipped _check_lent) must not pin
+    # it again, so the payload itself says "unload after this one".
     payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": False,
-               "think": False, "keep_alive": -1,
+               "think": False,
+               "keep_alive": 0 if _RESIDENCY.get("lent") else -1,
                "options": _options(**opt_overrides)}
     if tools:
         payload["tools"] = tools
@@ -593,6 +609,11 @@ def ensure_resident(first=None):
     """
     if first is None:
         first = not _RESIDENCY["unloaded_once"]
+    if _RESIDENCY.get("lent"):
+        # The residency loop keeps running; it just must not re-warm the
+        # model a trainer was given the room for.
+        log.debug("ollama: %s is lent out; not re-warming", OLLAMA_MODEL)
+        return False
     try:
         ps = _http("/api/ps", timeout=5)
     except OllamaDown:
@@ -654,6 +675,54 @@ def start_residency(interval_s=RESIDENCY_INTERVAL_S):
     _RESIDENCY["thread"] = t
     t.start()
     return t
+
+
+# ----------------------------------------------------------------------
+# GPU yield: lend the model to a trainer, take it back when it is gone
+# ----------------------------------------------------------------------
+def is_lent():
+    return bool(_RESIDENCY.get("lent"))
+
+
+def _check_lent():
+    if _RESIDENCY.get("lent"):
+        raise ModelLent(OLLAMA_MODEL)
+
+
+def release(reason=""):
+    """Unload OLLAMA_MODEL now (keep_alive 0, the same call ensure_resident
+    makes for foreign models) and mark it lent. The flag is set even when
+    Ollama cannot be reached -- the point is that nothing reloads the model
+    behind the trainer's back. Returns True when the unload was accepted;
+    never raises."""
+    if _RESIDENCY.get("lent"):
+        return True
+    _RESIDENCY["lent"] = True
+    log.info("ollama: lending %s out%s", OLLAMA_MODEL,
+             f" ({reason})" if reason else "")
+    try:
+        _http("/api/generate", {"model": OLLAMA_MODEL, "keep_alive": 0},
+              timeout=30)
+        return True
+    except OllamaDown:
+        log.warning("ollama: not running; %s marked lent anyway", OLLAMA_MODEL)
+    except Exception as exc:
+        log.warning("ollama: could not unload %s: %s", OLLAMA_MODEL, exc)
+    return False
+
+
+def reclaim():
+    """Clear the lent flag and warm the model again. Returns
+    ensure_resident()'s verdict; never raises."""
+    if not _RESIDENCY.get("lent"):
+        return ensure_resident()
+    _RESIDENCY["lent"] = False
+    log.info("ollama: reclaiming %s", OLLAMA_MODEL)
+    try:
+        return bool(ensure_resident())
+    except Exception:
+        log.exception("ollama: reclaim warm-up failed")
+        return False
 
 
 # ----------------------------------------------------------------------
@@ -891,6 +960,7 @@ def _persona_turn(instruction, text, n):
 
 
 def _persona_request(instruction, text, n, timeout, num_predict):
+    _check_lent()          # summarize/local_line fall back to their text
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": _persona_turn(instruction, text, n)}]
     data = _http("/api/chat",
@@ -945,6 +1015,7 @@ def classify_route(text, timeout=CLASSIFY_TIMEOUT_S):
                  "content": f"{ROUTE_INSTRUCTION}\n\nHunter: "
                             f"{(text or '').strip()}"}]
     try:
+        _check_lent()      # the router's rules decide alone while lent
         data = _http("/api/chat",
                      _chat_payload(messages, _registry_schemas(_REGISTRY),
                                    fmt=ROUTE_FORMAT, num_predict=40,
@@ -1321,6 +1392,16 @@ class JarvisBrain:
     def ensure_resident(self, first=None):
         return ensure_resident(first=first)
 
+    # GPU yield (module-level state: the watchdog and the commander share it)
+    def release(self, reason=""):
+        return release(reason=reason)
+
+    def reclaim(self):
+        return reclaim()
+
+    def is_lent(self):
+        return is_lent()
+
     def cancel(self):
         """Kill any in-flight subprocess and clear the busy guard."""
         self._cancelled = True
@@ -1454,6 +1535,14 @@ class JarvisBrain:
         shows the full reply without speaking it a second time.
         """
         log.info("chat: %s", text[:60])
+        if _RESIDENCY.get("lent"):
+            # Before any HTTP, including a forced tool's render turn: the
+            # gate has to sit here, not on the residency loop, because every
+            # payload used to pin the model back with keep_alive -1.
+            log.info("chat: model lent out; answering with the excuse")
+            bus.publish(Status(text="Local model lent to the trainer",
+                               kind="info"))
+            return [("SPEAK", MODEL_LENT_LINE)]
         registry = self.registry
         ctx_text, mem_text = self._dynamic_context(text)
         messages = [{"role": "system", "content": static_system()},

@@ -114,7 +114,12 @@ DEFAULTS: dict = {
     # Quiz mode over the documents index: questions per round, chunks of
     # study text handed to the model per round (jarvis/tools/quiz.py).
     "quiz": {"questions": 5, "chunks": 6},
-    "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30},
+    # yield_to_trainer: when a training process appears, unload the local
+    # model (brain.release) and speak the lent line; reload once the trainer
+    # is gone for two ticks. Off by default: every tool answer runs through
+    # the local model, so a multi-hour run leaves Jarvis with Tier 1 only.
+    "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30,
+               "yield_to_trainer": False},
     # Long-term memory (jarvis/memory.py): facts are also indexed with
     # nomic-embed-text so "who's my dentist" finds "my dentist is Dr Patel";
     # semantic=false keeps the substring store only.

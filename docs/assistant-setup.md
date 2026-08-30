@@ -595,6 +595,35 @@ memory drops under `health.warn_gb` (16) — "Memory is getting tight, sir: …"
 `health.critical_gb` (8), and when two processes each hold over `health.hog_gb` (20), the
 pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` itself.
 
+### Lending the GPU to a trainer (opt-in)
+
+```json
+"health": {"yield_to_trainer": true}
+```
+
+With that on, the same watchdog lends the local model out the moment a training
+process appears (anything an interpreter runs whose script or `-m` module says
+`train` / `trainer` / `finetune` / `fine_tune` / `pretrain` — `train.py`,
+`aiws_trainer.train`, `finetune_piper.py`; size does not matter): it unloads the
+model through Ollama (`keep_alive: 0`, the call it already makes for foreign
+models) and says *"I have lent the GPU to your trainer, sir; quick answers only
+until it is done."* Until the trainer has been gone for two ticks (60 s) nothing
+reloads the model — not a question, not a forced tool, not the five-minute
+residency check — so every question that needs the local model gets *"My local
+model is lent to your trainer at the moment, sir; quick answers only until it's
+done."* The clock, timers, notes, to-dos, the standup and the Claude / web routes
+still work. When the run ends: *"Your trainer has finished, sir; I'm loading my
+model again."*
+
+It is off by default on purpose: every tool answer (weather, calendar, mail,
+Spotify, documents, briefings) runs through the local model, so a multi-hour run
+leaves Jarvis with Tier 1 only. The manual doors work whether or not it is on:
+*"lend the GPU"* / *"release the GPU"* / *"unload your model"*, and *"take the GPU
+back"* / *"reclaim the GPU"* / *"load your model back"*. Taking it back while the
+run is still going is an order — the watchdog will not lend to that run again,
+though a second trainer that starts alongside it still gets the GPU.
+
+
 ## 17. Study sessions (pomodoro)
 
 ```json
@@ -748,6 +777,23 @@ flashcards"* the next day asks exactly what you missed. Short answers are graded
 matching words and numbers; the model only judges the unclear ones, and when neither can
 tell he names the answer and moves on without a mark. `quiz.chunks` (6) is how much study
 text one round reads. Everything runs on the Spark.
+
+## 25. Git standup ("what did I do today?")
+
+*"What did I do today"* / *"what did I change today"* / *"what did I work on
+yesterday"* / *"standup"* / *"yesterday's standup"* — with or without the wake
+word. Jarvis walks every project cleared for Claude (`claude.allowed_dirs`, the
+children of `claude.projects_root` when that folder exists) plus `~/vss_env`,
+reads each repository's commits for the day, what is still uncommitted and how
+far ahead of `origin` it is, adds the Claude Code sessions whose transcript was
+touched that day (their titles, scratchpads and probes left out), and answers in
+two sentences — *"Today you made 4 commits in Jarvis and haymaker-digest, sir,
+with 3 files in Jarvis still uncommitted. Claude had 2 sessions today, on the
+standup feature and the TTS shootout."* — with a card of the commit subjects per
+repository. Nothing leaves the machine and no model turn is involved, so it
+still answers while the GPU is lent out (section 16). Nothing to configure:
+the repo list follows section 9. *"Git status"* now reports the Jarvis
+repository (it used to be hard-wired to the VSS tree).
 
 ---
 
