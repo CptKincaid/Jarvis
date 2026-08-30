@@ -104,6 +104,11 @@ DEFAULTS: dict = {
                  "sports_feeds": [], "stock_symbols": []},
     "alarms": {"sound": "", "volume": 0.8, "escalate": True,
                "max_ring_s": 300, "snooze_min": 10},
+    # "No, I said X": re-dispatch X, drop the misheard exchange, log the
+    # pair to corrections.json. learn_vocab additionally appends new
+    # capitalised words from X to the Whisper vocabulary prompt -- off by
+    # default because Whisper's casing on a misheard name is itself a guess.
+    "corrections": {"learn_vocab": False},
     "discord": {"bot_token": "", "channel_id": "", "user_id": ""},
     # Spotify (jarvis/tools/spotify.py): the developer-app credentials and the
     # speaker Jarvis reaches for when nothing else is playing. The OAuth token

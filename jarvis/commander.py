@@ -65,6 +65,7 @@ from datetime import datetime
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -499,6 +500,10 @@ class CommandResult:
     status: Optional[str] = None      # short status-strip text
     done: bool = True                 # False → async work still in flight
     ack: bool = False                 # `reply` acknowledges; the answer follows
+    # Set when the result answers a DIFFERENT utterance than the one
+    # handled: "no, I said X" re-dispatches X, "that was for you" re-runs
+    # the dropped command. The app records the exchange under this text.
+    corrected: Optional[str] = None
 
 
 @dataclass
@@ -2102,6 +2107,77 @@ def forced_call(reason: str, text: str) -> Optional[tuple]:
     return None
 
 
+# ------------------------------------------------------------------
+# Corrections: "no, I said ..." (2026-08-30)
+# ------------------------------------------------------------------
+# A misheard transcript used to stay in the model's window paired with
+# the reply it earned, and the only recourse was to wake Jarvis and say
+# the whole thing again. The correction re-dispatches the meant text with
+# the classifier bypassed (a correction is addressed to Jarvis by
+# construction), cuts the reply in flight, forgets the misheard exchange
+# and logs the (heard, meant) pair for a later vocab tune. Matched on the
+# raw text ahead of the yes/no stages, which would eat "no, I said X" as
+# a plain decline.
+CORRECTION_WINDOW_S = 60.0
+_CORRECTION_RX = re.compile(
+    r"^(?:(?:no|nope|nah)[,.!]?\s+)?"
+    r"(?:i\s+(?:said|meant|mean|actually said|was saying)|"
+    r"what i (?:said|meant) was|that'?s not what i said[,.]?\s*(?:i said)?)"
+    r"(?!\s+(?:to|it|that|you|nothing|so|this)\b)"
+    r"[,:]?\s+(?P<meant>.+?)[.!?]*$", re.I)
+# "not the terminal, the calendar": the comma is load-bearing; without it
+# "not now" and "not really" are plain sentences.
+_CORRECTION_NOT_RX = re.compile(
+    r"^(?:no[,.!]?\s+)?not\s+(?P<heard>[^,]{1,60}),\s*(?P<meant>.+?)[.!?]*$", re.I)
+
+
+def correction_kind(text: str) -> Optional[str]:
+    """The meant text when the utterance is a correction, else None."""
+    t = (text or "").strip()
+    m = _CORRECTION_RX.match(t) or _CORRECTION_NOT_RX.match(t)
+    if not m:
+        return None
+    meant = m.group("meant").strip(" ,")
+    return meant or None
+
+
+# Words that are capitalised for reasons other than being a name.
+_VOCAB_STOP = {
+    "i", "i'm", "i'll", "i've", "i'd", "jarvis", "the", "what", "what's", "how",
+    "when", "where", "who", "why", "which", "can", "could", "would", "will",
+    "please", "yes", "no", "okay", "ok", "set", "play", "remind", "open",
+    "close", "call", "tell", "show", "read", "check", "turn", "start", "stop",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "sir", "hunter",
+}
+VOCAB_CHAR_CAP = 900      # Whisper's initial_prompt budget is ~224 tokens
+
+
+def new_vocab_words(heard: str, meant: str) -> list:
+    """Capitalised words in the correction that the transcript lacked --
+    the names Whisper got wrong. Conservative by design: casing on a
+    misheard name is itself a guess, so this is opt-in."""
+    heard_l = {w.lower() for w in re.findall(r"[\w'-]+", heard or "")}
+    out, seen = [], set()
+    for w in re.findall(r"[A-Za-z][\w'-]+", meant or ""):
+        key = w.lower()
+        if not w[0].isupper() or len(w) < 3:
+            continue
+        if key in heard_l or key in _VOCAB_STOP or key in seen:
+            continue
+        seen.add(key)
+        out.append(w)
+    return out
+
+
+@dataclass
+class LastTurn:
+    text: str
+    status: str
+    ts: float
+
+
 class Commander:
     """Routes a user utterance (voice or typed) through the V3 pipeline:
 
@@ -2114,6 +2190,11 @@ class Commander:
     transcription pipeline; handle() receives accepted text only.
     """
 
+    # Class-level defaults for the per-turn state __init__ sets: a test
+    # (tests/test_custom_phrases.py) builds a Commander with __new__ and
+    # fills in only what it needs.
+    _last_turn: Optional[LastTurn] = None
+
     def __init__(self, services):
         self.services = services
         self.intent = IntentClassifier()
@@ -2125,6 +2206,9 @@ class Commander:
         # UI hook for uncertain intent ("Was this for me?"); wired by the
         # main window. Falls back to a warn Status event.
         self.on_uncertain: Optional[Callable[[str], None]] = None
+        # The last utterance handled, for "no, I said ..." and "that was
+        # for you"; the app's _last_user_text is not visible from here.
+        self._last_turn: Optional[LastTurn] = None
 
     # -- service access ------------------------------------------------
     def _svc(self, name: str):
@@ -2157,6 +2241,14 @@ class Commander:
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
+        result = self._handle_inner(text, source)
+        # A correction / re-run answers a different utterance: THAT is the
+        # last turn, so a second "no, I said ..." corrects the right text.
+        self._last_turn = LastTurn(getattr(result, "corrected", None) or text,
+                                   result.status or "", time.monotonic())
+        return result
+
+    def _handle_inner(self, text: str, source: str, gate: bool = True) -> CommandResult:
         log.info("handle %r source=%s", text, source)
         self._raw_text = text          # original casing for handlers that need it
 
@@ -2166,6 +2258,12 @@ class Commander:
 
         # 2. A ringing alarm owns the next words (spec 5.2 a).
         res = self._try_ringing(text)
+        if res is not None:
+            return res
+        # 2b. "No, I said X": ahead of every yes/no stage, which would read
+        #     it as a bare decline (parse_yes_no: any sentence opening with
+        #     "no" is a no).
+        res = self._try_correction(text, source)
         if res is not None:
             return res
         # 3. A pending permission question owns yes / no (spec 5.2 b).
@@ -2221,7 +2319,8 @@ class Commander:
         # A web cue is addressed to Jarvis by construction, like a custom
         # phrase: the classifier called "look up who won the last race"
         # uncertain and asked "Was that for me?" (live, 2026-08-29 23:45).
-        if source == "voice" and cmd_text is None and not WEB_CUE_RX.search(text):
+        if gate and source == "voice" and cmd_text is None \
+                and not WEB_CUE_RX.search(text):
             intent, conf = self.intent.classify(text)
             if intent == IntentClassifier.NO:
                 log.info("Ignored (background chat, conf=%.2f): %r",
@@ -2240,8 +2339,77 @@ class Commander:
         """UI feedback for the 'Was this for me?' prompt."""
         self.intent.log_feedback(text, yes)
         if yes:
-            return self._route_text(text)
+            res = self._route_text(text)
+            self._last_turn = LastTurn(text, res.status or "", time.monotonic())
+            return res
         return CommandResult(handled=True, status="Discarded")
+
+    # -- corrections, feedback, read-back ---------------------------------
+    def _try_correction(self, text: str, source: str) -> Optional[CommandResult]:
+        meant = correction_kind(strip_address(text))
+        if not meant:
+            return None
+        prev = self._last_turn
+        if source == "voice":
+            # By voice the wake word is consumed before the text arrives,
+            # so "addressed" cannot be read off a prefix. A correction
+            # presupposes a turn to correct: without a recent one, "not
+            # that one, the other one" is the room talking.
+            if prev is None or time.monotonic() - prev.ts > CORRECTION_WINDOW_S:
+                return None
+        heard = prev.text if prev is not None else ""
+        log.info("correction: heard %r -> meant %r", heard, meant)
+        # Cut the reply in flight: speech now, the model job too (its
+        # generation goes stale, so its result is dropped, not remembered).
+        _cut_speech(self)
+        brain = self._svc("brain")
+        cancel = getattr(brain, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                log.exception("brain cancel failed")
+        conv = self._svc("conversation")
+        if conv is not None and heard:
+            try:
+                conv.forget_exchange(heard)
+            except Exception:
+                log.exception("forget_exchange failed")
+        memory = self._svc("memory")
+        if memory is not None and hasattr(memory, "log_correction"):
+            try:
+                memory.log_correction(heard, meant)
+            except Exception:
+                log.exception("log_correction failed")
+        self._learn_vocab(heard, meant)
+        res = self._handle_inner(meant, source, gate=False)
+        res.corrected = meant
+        return res
+
+    def _learn_vocab(self, heard: str, meant: str):
+        """Opt-in (corrections.learn_vocab): new capitalised words from the
+        correction join the Whisper vocabulary prompt, so the next attempt
+        decodes the name right."""
+        if not _assistant_get(self, "corrections.learn_vocab", False):
+            return
+        words = new_vocab_words(heard, meant)
+        if not words:
+            return
+        try:
+            from jarvis.transcriber import load_vocab, save_vocab
+            vocab = load_vocab() or ""
+            have = {w.strip().lower() for w in re.split(r"[,\n]", vocab)}
+            add = [w for w in words if w.lower() not in have]
+            if not add:
+                return
+            text = (vocab.rstrip(", \n") + ", " if vocab.strip() else "") + ", ".join(add)
+            if len(text) > VOCAB_CHAR_CAP:
+                log.info("vocab learn skipped: prompt would exceed %d chars", VOCAB_CHAR_CAP)
+                return
+            save_vocab(text)
+            log.info("vocab learned: %s", add)
+        except Exception:
+            log.exception("vocab learn failed")
 
     # -- pipeline stages -----------------------------------------------
     def _handle_dictation(self, text: str) -> CommandResult:

@@ -535,6 +535,21 @@ down for a write ("book a meeting"), a second clause ("… and what's the weathe
 lowercase city, which take the full loop as before. Look for `route short-cut:` in the
 log.
 
+## 19. Corrections: "no, I said …"
+
+Say "no, I said …", "I meant …", or "not X, Y" (with the comma) — typed, on Discord, or
+by voice within a minute of the last turn. Jarvis stops talking, drops the misheard
+exchange from his short-term memory and answers what you meant. Pairs are kept in
+`~/.aiws_trainer/jarvis_memory/corrections.json`.
+
+```json
+"corrections": {"learn_vocab": false}
+```
+
+`learn_vocab: true` also adds new capitalised words from a correction ("Peyrovi") to the
+Whisper vocabulary prompt (`~/.aiws_trainer/voice_vocab.txt`), so the next attempt decodes
+the name. Off by default: Whisper's casing on a misheard name is itself a guess.
+
 ---
 
 ## What Jarvis says when something is missing

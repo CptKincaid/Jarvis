@@ -522,6 +522,9 @@ class JarvisApp:
             think=lambda text: b.think(text, callback=app._on_brain_tags),
             chat=chat,
             web_answer=web_answer,
+            # "no, I said ...": the misheard turn's model job is cut so its
+            # reply is neither spoken nor remembered (brain job generation).
+            cancel=lambda: app.brain.cancel(),
             # Delegate lazily rather than capturing the bound methods: the
             # namespace is built once at init, so a snapshot here would make
             # `app.brain.<fn> = ...` (tests, and any later brain swap) a no-op
@@ -537,6 +540,9 @@ class JarvisApp:
             desktop=desktop_ns, context=context_ns, memory=self.memory,
             workflows=workflows_ns, brain=brain_ns, tts=self.tts,
             reader=self.reader, history=self.history,
+            # the ContextEngine itself (`context` above is the agent's
+            # namespace): corrections drop the misheard exchange from it
+            conversation=self.context,
             # personal assistant (spec 2.2)
             assistant=self.assistant, tools=self.tools, router=self.router,
             timekeeper=self.timekeeper, notes=self.notes, claude=self.claude,
@@ -1018,6 +1024,9 @@ class JarvisApp:
 
     def _after_dispatch(self, text, source, result):
         """Bookkeeping once a command has been handled synchronously."""
+        # "no, I said X" / "that was for you" answered X, not the words
+        # said: the exchange is remembered under X.
+        text = getattr(result, "corrected", None) or text
         reply = getattr(result, "reply", None)
         done = getattr(result, "done", True) is not False
         if reply and done and not getattr(result, "ack", False):
@@ -1367,6 +1376,9 @@ class JarvisApp:
             self.turns.mark("handle")
         try:
             result = self._emit_result(self.commander.handle(text, source))
+            corrected = getattr(result, "corrected", None)
+            if corrected:
+                self._last_user_text = corrected
             if source == "voice":
                 self._turn_after_result(result)
             self._after_dispatch(text, source, result)

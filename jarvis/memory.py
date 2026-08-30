@@ -52,6 +52,7 @@ class JarvisMemory:
         self._preferences = self._load("preferences.json", {})
         self._sessions = self._load("sessions.json", [])
         self._intent_log = self._load("intent_log.json", [])
+        self._corrections = self._load("corrections.json", [])
         self._migrate_legacy()
 
     # ------------------------------------------------------------------
@@ -264,6 +265,26 @@ class JarvisMemory:
 
     def get_intent_log(self):
         return self._intent_log
+
+    # ------------------------------------------------------------------
+    # Mishearing corrections — "no, I said ..."
+    # ------------------------------------------------------------------
+    MAX_CORRECTIONS = 300
+
+    def log_correction(self, heard, meant):
+        """Record a (heard, meant) pair from a spoken correction. The file
+        is the evidence for a later vocab / prompt tune; nothing reads it
+        at runtime."""
+        self._corrections.append({
+            "time": datetime.now().isoformat(),
+            "heard": (heard or "")[:200],
+            "meant": (meant or "")[:200],
+        })
+        self._corrections = self._corrections[-self.MAX_CORRECTIONS:]
+        self._save("corrections.json", self._corrections)
+
+    def get_corrections(self):
+        return self._corrections
 
     # ------------------------------------------------------------------
     # Voice notes — timestamped text memos
