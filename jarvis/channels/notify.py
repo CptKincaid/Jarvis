@@ -124,6 +124,17 @@ class AlertRecord:
 # Cached briefly because it is consulted on notification paths.
 _BANNER_TTL_S = 5.0
 _banner_cache: Optional[tuple] = None        # (value, monotonic expiry)
+# Quiet hours / DND (jarvis/quiet.py): the app installs a callable that says
+# "hold everything right now". In-process on purpose -- the alternative,
+# `gsettings set ... show-banners false`, would leave the whole desktop mute
+# if Jarvis crashed mid-window, and would need undoing on every exit.
+_quiet_gate: Optional[Callable[[], bool]] = None
+
+
+def set_quiet_gate(fn: Optional[Callable[[], bool]]) -> None:
+    """Install (or clear, with None) the quiet-hours gate for desktop banners."""
+    global _quiet_gate
+    _quiet_gate = fn
 
 
 def desktop_banners_enabled() -> bool:
@@ -137,6 +148,13 @@ def desktop_banners_enabled() -> bool:
     until the next restart, and the documented reset hook had no caller.
     """
     global _banner_cache
+    gate = _quiet_gate
+    if gate is not None:
+        try:
+            if gate():
+                return False            # quiet: no banner, whatever the setting
+        except Exception:
+            log.debug("quiet gate failed; banners follow alerts.desktop", exc_info=True)
     now = time.monotonic()
     if _banner_cache is not None and now < _banner_cache[1]:
         return _banner_cache[0]

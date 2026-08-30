@@ -18,6 +18,7 @@ pure functions of the ``now`` they are given.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import math
 import os
@@ -102,6 +103,28 @@ def _run(argv, background=False, timeout=30.0):
     except Exception as exc:                # noqa: BLE001 - seam boundary
         log.warning("run %s failed: %s", argv[:1], exc)
         return None
+
+
+def _accepts_kw(fn, name: str) -> bool:
+    """Does ``fn`` take keyword ``name`` (or **kwargs)? False when the
+    signature cannot be read (builtins such as list.append)."""
+    try:
+        params = inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
+    return name in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+def _banners_ok() -> bool:
+    """Desktop banners obey alerts.desktop AND the quiet-hours gate; the
+    helper lives in channels/notify so every toaster asks the same
+    question. Import lazily: notify imports the assistant config, and this
+    module is imported by the tests without one."""
+    try:
+        from jarvis.channels.notify import desktop_banners_enabled
+        return desktop_banners_enabled()
+    except Exception:                           # noqa: BLE001
+        return True
 
 
 def _cfg_get(cfg, key: str, default=None):
@@ -903,6 +926,7 @@ class Timekeeper:
                  notify: bool = True):
         self.db_path = Path(db_path)
         self._say = say or (lambda text: None)
+        self._say_takes_flag = _accepts_kw(self._say, "proactive")
         self.cfg = cfg
         self._now = now
         # Late-bound: a default of `run=_run` is captured at import, so a
@@ -1305,14 +1329,22 @@ class Timekeeper:
         return True
 
     # ---------------------------------------------------------- firing
-    def _speak(self, line: str):
+    def _speak(self, line: str, proactive: bool = True, kind: str = "reminder"):
+        """Reminders and timers are PROACTIVE -- quiet hours / DND (jarvis/
+        quiet.py) may hold them for the catch-up digest. An alarm is not:
+        it rings regardless, so its line is spoken regardless. The flag only
+        reaches a ``say`` that accepts it (the app's _say does; the tests'
+        ``spoken.append`` does not)."""
         try:
-            self._say(line)
+            if self._say_takes_flag:
+                self._say(line, proactive=proactive, kind=kind)
+            else:
+                self._say(line)
         except Exception:                       # noqa: BLE001
             log.exception("timekeeper: say failed")
 
     def _toast(self, title: str, text: str, urgency: str = "normal"):
-        if not self.notify_enabled:
+        if not self.notify_enabled or not _banners_ok():
             return
         icon = "alarm-clock" if urgency == "critical" else "appointment-soon"
         self._run(["notify-send", "-a", "Jarvis", "-u", urgency, "-t",
@@ -1336,7 +1368,7 @@ class Timekeeper:
             if self.ring_enabled:
                 self._ring = _Ring(item.id, now)
                 self._service_ring(now, effects)      # first paplay right away
-            effects.append(lambda: self._speak(line))
+            effects.append(lambda: self._speak(line, proactive=False, kind="alarm"))
             effects.append(lambda: self._toast("Jarvis alarm", item.label or "Alarm", "critical"))
             effects.append(lambda: bus.publish(AlarmFired(
                 alarm_id=item.id, label=item.label, kind="alarm",
@@ -1368,7 +1400,7 @@ class Timekeeper:
                      datetime.fromtimestamp(nxt).strftime("%a %H:%M"))
         else:
             self._update(item.id, state="done", fired_at=now)
-        effects.append(lambda: self._speak(line))
+        effects.append(lambda: self._speak(line, proactive=True, kind=item.kind))
         effects.append(lambda: self._toast(title, text, "normal"))
         effects.append(lambda: bus.publish(ReminderFired(text=text)))
         log.info("timekeeper: %s fired %r", item.kind, item.label)

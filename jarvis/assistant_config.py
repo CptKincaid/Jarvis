@@ -112,6 +112,19 @@ DEFAULTS: dict = {
                 "default_device": "HPCOMPUTER", "liked_strategy": "uris",
                 "market": "from_token"},
     "autostart": {"enabled": False},
+    # Quiet hours / do-not-disturb (jarvis/quiet.py). hours: "HH:MM" 24 h,
+    # overnight windows wrap ("23:00" -> "07:00"); dnd_until / free_until are
+    # timestamps he sets himself ("do not disturb for an hour", "I am free");
+    # calendar: a running timed event whose title contains one of the
+    # keywords also holds proactive speech; hold_when_away needs presence.
+    "quiet": {"hours": {"start": "", "end": ""}, "dnd_until": 0, "free_until": 0,
+              "calendar": True, "calendar_keywords": ["class", "exam", "meeting", "busy"],
+              "hold_when_away": True},
+    # Presence (jarvis/presence.py): the phone's Wi-Fi address and/or MAC.
+    # away_after_min is the grace before "out" -- iPhones nap off Wi-Fi for
+    # minutes at a time, so anything under ~10 flaps.
+    "presence": {"enabled": True, "phone_ip": "", "phone_mac": "",
+                 "away_after_min": 12, "poll_s": 60},
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",

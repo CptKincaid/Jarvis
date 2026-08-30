@@ -61,7 +61,7 @@ import inspect
 import json
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import subprocess
 import sys
 import threading
@@ -1773,6 +1773,152 @@ def _h_remind_me(c, t, m):                                 # 3465-3483
                          speak=True, status=f"Reminder {desc}: {task[:30]}")
 
 
+# ---- Tier 1 ambient: do not disturb / quiet hours / I am free ------------
+# Answered locally: "do not disturb for an hour" must take effect NOW, not
+# after a model round trip that might itself be the interruption. The bare
+# "quiet" stays the barge-in above (_QUIET_RX is anchored, so "quiet for an
+# hour" and "quiet hours from ..." never reach it).
+_DND_RX = re.compile(
+    r"^(?:(?:please\s+)?(?:do not|don't|dont)\s+disturb(?:\s+me)?"
+    r"|(?:hold|mute|pause)\s+(?:my\s+|the\s+|all\s+|your\s+)?"
+    r"(?:notifications|alerts|interruptions|announcements|reminders)"
+    r"|(?:i'm|i am|im)\s+busy|(?:go\s+|be\s+|stay\s+)?quiet(?:\s+mode)?(?=\s+(?:for|until|till))"
+    r"|dnd)"
+    r"(?:\s+(?P<mode>for|until|till)\s+(?P<when>.+?))?[.!\s]*$", re.I)
+_QUIET_HOURS_RX = re.compile(
+    r"^(?:set\s+|make\s+|my\s+)?quiet\s+hours(?:\s+(?:are|to|from|between|run))?"
+    r"\s+(?:from\s+)?(?P<a>.+?)\s+(?:to|until|till|and)\s+(?P<b>.+?)[.!\s]*$", re.I)
+_QUIET_HOURS_OFF_RX = re.compile(
+    r"^(?:(?:turn|switch)\s+off|disable|clear|cancel|remove|no|stop)\s+"
+    r"(?:the\s+|my\s+)?quiet\s+hours[.!\s]*$", re.I)
+_FREE_RX = re.compile(
+    r"^(?:(?:i am|i'm|im)\s+(?:free|back|done|available|not busy|no longer busy|"
+    r"out of (?:class|the meeting|my meeting|the exam|my exam))(?:\s+now)?"
+    r"|(?:end|stop|cancel|lift|clear|turn off|switch off)\s+(?:the\s+)?"
+    r"(?:do not disturb|dnd|quiet mode|quiet time)"
+    r"|(?:resume|unmute)\s+(?:my\s+|the\s+|your\s+)?(?:alerts|notifications|announcements)"
+    r"|what did i miss|anything (?:i missed|held(?: back)?|while i was (?:busy|out|away)))"
+    r"[?.!\s]*$", re.I)
+_QUIET_STATUS_RX = re.compile(
+    r"^(?:(?:are you|am i)\s+(?:on|in)\s+(?:do not disturb|dnd|quiet hours|quiet mode)"
+    r"|(?:what|when) are (?:my|the) quiet hours|quiet status|is (?:do not disturb|dnd) on)"
+    r"[?.!\s]*$", re.I)
+
+
+def _dnd_seconds(c, mode: str, when: str, now: datetime) -> Optional[float]:
+    """'for an hour' / 'until seven' -> seconds from now; None = unparseable."""
+    when = (when or "").strip()
+    if not when:
+        return 3600.0
+    if mode in ("until", "till"):
+        from jarvis.quiet import parse_clock
+        # "until seven" with no am/pm: the NEXT seven, whichever half of the
+        # day that is (at 2 pm it is 7 pm; at 9 pm it is 7 am). Explicit
+        # am/pm parses the same under both defaults.
+        ends = []
+        for default in ("am", "pm"):
+            hm = parse_clock(when, default=default)
+            if hm is None:
+                continue
+            end = now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+            if end <= now:
+                end += timedelta(days=1)
+            ends.append(end)
+        if ends:
+            return (min(ends) - now).total_seconds()
+        due = _due_from(c, c._svc("timekeeper"), when, now)
+        return None if due is None or due <= now.timestamp() else due - now.timestamp()
+    try:
+        from jarvis.tools.timekeeper import parse_duration
+        secs = parse_duration(when)
+    except Exception:
+        secs = None
+    if secs is None and when.lower() in ("the rest of the day", "the day", "today"):
+        end = now.replace(hour=23, minute=59, second=0, microsecond=0)
+        secs = (end - now).total_seconds()
+    return secs
+
+
+def _h_dnd(c, t, m):
+    q = c._svc("quiet")
+    if q is None:
+        return None
+    now = datetime.fromtimestamp(q.now())
+    secs = _dnd_seconds(c, (m.group("mode") or "for").lower(), m.group("when") or "", now)
+    if secs is None:
+        from jarvis.tools.timekeeper import CANT_PARSE_LINE
+        return CommandResult(handled=True, reply=CANT_PARSE_LINE, speak=True,
+                             status="Do not disturb: when?")
+    from jarvis.quiet import DND_SET_LINE, fmt_clock
+    until = q.set_dnd(secs)
+    end = datetime.fromtimestamp(until)
+    words = fmt_clock(end.hour, end.minute)
+    bus.publish(Status(text=f"Do not disturb until {words}", kind="info"))
+    return CommandResult(handled=True, reply=DND_SET_LINE.format(until=words),
+                         speak=True, status=f"Do not disturb until {words}")
+
+
+def _h_quiet_hours(c, t, m):
+    q = c._svc("quiet")
+    if q is None:
+        return None
+    from jarvis.quiet import QUIET_HOURS_SET_LINE, fmt_clock, parse_clock
+    # Quiet hours run overnight by convention: a bare start hour is pm, a
+    # bare end hour is am ("from eleven to seven" = 23:00-07:00).
+    start, end = parse_clock(m.group("a"), default="pm"), parse_clock(m.group("b"), default="am")
+    if start is None or end is None or start == end:
+        from jarvis.tools.timekeeper import CANT_PARSE_LINE
+        return CommandResult(handled=True, reply=CANT_PARSE_LINE, speak=True,
+                             status="Quiet hours: when?")
+    q.set_hours(start, end)
+    a, b = fmt_clock(*start), fmt_clock(*end)
+    return CommandResult(handled=True, reply=QUIET_HOURS_SET_LINE.format(start=a, end=b),
+                         speak=True, status=f"Quiet hours {a}–{b}")
+
+
+def _h_quiet_hours_off(c, t, m):
+    q = c._svc("quiet")
+    if q is None:
+        return None
+    from jarvis.quiet import QUIET_HOURS_OFF_LINE
+    q.set_hours(None, None)
+    return CommandResult(handled=True, reply=QUIET_HOURS_OFF_LINE, speak=True,
+                         status="Quiet hours off")
+
+
+def _h_free(c, t, m):
+    q = c._svc("quiet")
+    if q is None:
+        return None
+    from jarvis.quiet import DND_ALREADY_FREE_LINE, NOTHING_HELD_LINE
+    line = q.free()
+    if line == DND_ALREADY_FREE_LINE and t.startswith(("what did", "anything")):
+        line = NOTHING_HELD_LINE
+    bus.publish(Status(text="Free", kind="info"))
+    return CommandResult(handled=True, reply=line, speak=True, status="Free")
+
+
+def _h_quiet_status(c, t, m):
+    q = c._svc("quiet")
+    if q is None:
+        return None
+    from jarvis.quiet import (QUIET_HOURS_OFF_LINE, QUIET_HOURS_SET_LINE,
+                              QUIET_STATUS_FREE_LINE, QUIET_STATUS_QUIET_LINE, fmt_clock)
+    if "quiet hours" in t and t.startswith(("what", "when")):
+        win = q.quiet_hours()
+        if win is None:
+            return CommandResult(handled=True, reply=QUIET_HOURS_OFF_LINE, speak=True,
+                                 status="Quiet hours off")
+        a, b = fmt_clock(*win[0]), fmt_clock(*win[1])
+        return CommandResult(handled=True,
+                             reply=QUIET_HOURS_SET_LINE.format(start=a, end=b),
+                             speak=True, status=f"Quiet hours {a}–{b}")
+    reason = q.reason()
+    line = QUIET_STATUS_QUIET_LINE.format(reason=reason) if reason else QUIET_STATUS_FREE_LINE
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Quiet" if reason else "Not quiet")
+
+
 # Ordered registry — mirrors _check_quick_command branch order (3036-3485).
 # The single insertion is "autonomous" before "workflow" (V3 spec: "deploy"
 # and "autonomous:" phrases route to brain.execute_autonomous).
@@ -1893,6 +2039,14 @@ REGISTRY: list[Command] = [
             needs=("context",)),
     Command("quick command", _m_quick_command, _h_quick_command),
     Command("remind me", _REMIND_RX.match, _h_remind_me),
+    # ambient (jarvis/quiet.py): before "free" so "I'm free until seven"
+    # does not read as a DND request, and status before the hours setter.
+    Command("quiet status", _QUIET_STATUS_RX.match, _h_quiet_status, needs=("quiet",)),
+    Command("quiet hours off", _QUIET_HOURS_OFF_RX.match, _h_quiet_hours_off,
+            needs=("quiet",)),
+    Command("quiet hours", _QUIET_HOURS_RX.match, _h_quiet_hours, needs=("quiet",)),
+    Command("do not disturb", _DND_RX.match, _h_dnd, needs=("quiet",)),
+    Command("free", _FREE_RX.match, _h_free, needs=("quiet",)),
 ]
 
 # The assistant's Tier 1 without the "jarvis" prefix (jarvis mode): the
@@ -1903,7 +2057,9 @@ ASSISTANT_TIER1: list[Command] = [
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
-                    "take note", "show notes", "answer question", "remind me")
+                    "take note", "show notes", "answer question", "remind me",
+                    "quiet status", "quiet hours off", "quiet hours", "do not disturb",
+                    "free")
 ]
 
 
