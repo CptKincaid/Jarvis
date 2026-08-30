@@ -289,6 +289,21 @@ def test_briefing_rows_optional_sections_and_strings():
     assert briefing_rows(None) == []
 
 
+def test_briefing_rows_coursework_sits_between_calendar_and_news():
+    rows = briefing_rows({"weather": "", "calendar": ["10:00 am dentist"],
+                          "due": ["BIOSENSORS - Lab 3 report, today 11:59 pm",
+                                  "CIRCUITS - Quiz 2, tomorrow 5:00 pm"],
+                          "exam": "Midterm 1 for BIOSENSORS, in 6 days, Tuesday at 9:00 am",
+                          "news": [{"title": "T", "source": "S"}]})
+    assert rows == [("CALENDAR", "10:00 am dentist"),
+                    ("DUE", "BIOSENSORS - Lab 3 report, today 11:59 pm"),
+                    ("", "CIRCUITS - Quiz 2, tomorrow 5:00 pm"),
+                    ("EXAM", "Midterm 1 for BIOSENSORS, in 6 days, Tuesday at 9:00 am"),
+                    ("NEWS", "T — S")]
+    # unconfigured Canvas: the keys are there but empty, and no row appears
+    assert briefing_rows({"due": [], "exam": "", "news": []}) == []
+
+
 # ------------------------------------------------------- alarm modal
 def test_alarm_modal_text():
     assert alarm_modal_text("Time to get up.", "alarm", "7:00 am") == \

@@ -442,7 +442,8 @@ def fetch_stocks(symbols: list[str], fetch: Fetch,
 
 
 # ------------------------------------------------------------ assemble
-def _registry_text(registry, name: str, args: dict) -> tuple[bool, str]:
+def _registry_result(registry, name: str, args: dict) -> tuple[bool, str]:
+    """(ok, raw text) from one tool call; never raises."""
     if registry is None or not hasattr(registry, "call"):
         return False, "not available"
     try:
@@ -453,8 +454,49 @@ def _registry_text(registry, name: str, args: dict) -> tuple[bool, str]:
     except Exception as exc:                  # noqa: BLE001 - tool boundary
         log.warning("briefing: %s failed: %s", name, type(exc).__name__)
         return False, "failed"
-    text = " ".join(str(getattr(res, "text", "") or "").split())
-    return bool(getattr(res, "ok", True)), text
+    return bool(getattr(res, "ok", True)), str(getattr(res, "text", "") or "")
+
+
+def _registry_text(registry, name: str, args: dict) -> tuple[bool, str]:
+    ok, text = _registry_result(registry, name, args)
+    return ok, " ".join(text.split())
+
+
+DUE_DAYS = 2            # at 7 am, "today" plus tomorrow morning's items
+_DUE_ITEM_RX = re.compile(r"^\d+\)\s*")
+
+
+def _due_lines(registry) -> list[str]:
+    """Canvas items due within DUE_DAYS, one per line, from the canvas_due
+    fact sheet ('Due in the next 2 days (2):' then '1) COURSE - title,
+    when'). Empty when the token is unset (canvas_due answers ok=False with
+    its setup line -- the briefing must not nag about a missing token every
+    morning), on any failure, and when nothing is due."""
+    ok, text = _registry_result(registry, "canvas_due", {"days": DUE_DAYS})
+    if not ok:
+        return []
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < 2 or not lines[0].lower().startswith("due"):
+        return []                         # "nothing due in the next 2 days"
+    return [_DUE_ITEM_RX.sub("", ln) for ln in lines[1:]]
+
+
+def _exam_line(exam_lookup, now: datetime) -> str:
+    """'Midterm 1 for BIOSENSORS, in 6 days, Friday at 9:00 am' or ''."""
+    if not callable(exam_lookup):
+        return ""
+    try:
+        exam = exam_lookup()
+    except Exception as exc:                  # noqa: BLE001 - source boundary
+        log.warning("briefing: exam lookup failed: %s", type(exc).__name__)
+        return ""
+    if not exam:
+        return ""
+    from jarvis.tools.canvas import exam_words
+    try:
+        return exam_words(exam, now)
+    except (KeyError, TypeError, AttributeError):
+        return ""
 
 
 def _day_line(now: datetime) -> str:
@@ -463,11 +505,12 @@ def _day_line(now: datetime) -> str:
 
 
 def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
-                   cache_path=None) -> tuple[dict, str]:
+                   cache_path=None, exam_lookup: Optional[Callable] = None) -> tuple[dict, str]:
     """-> (sections, fact_sheet). sections = {weather: str, calendar: [str],
-    news: [{title, source}], sports: [str], stocks: [str]}. ``fetch``
-    defaults to the module's ``_fetch`` looked up at call time (tests
-    monkeypatch it)."""
+    due: [str], exam: str, news: [{title, source}], sports: [str],
+    stocks: [str]}. ``fetch`` defaults to the module's ``_fetch`` looked up
+    at call time (tests monkeypatch it). ``exam_lookup`` () -> the next
+    exam dict (tools/canvas.find_next_exam) or None; the countdown line."""
     fetch = fetch or _fetch
     if now is None:
         now_dt = datetime.now().astimezone()
@@ -479,7 +522,8 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
     if cache_path is None:
         cache_path = Path.home() / ".cache" / "jarvis" / "news_cache.json"
 
-    sections = {"weather": "", "calendar": [], "news": [], "sports": [], "stocks": []}
+    sections = {"weather": "", "calendar": [], "due": [], "exam": "",
+                "news": [], "sports": [], "stocks": []}
     notes = {}
 
     sports_feeds = [str(u) for u in (_cfg_get(cfg, "briefing.sports_feeds", []) or [])
@@ -493,6 +537,10 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
             if sports_feeds else None
         stocks_future = pool.submit(fetch_stocks, symbols, fetch, pool) \
             if symbols else None
+        # Canvas can spend its whole 6 s budget; on the pool, not inline,
+        # so a slow LMS overlaps the feeds instead of adding to the wait.
+        due_future = pool.submit(_due_lines, registry)
+        exam_future = pool.submit(_exam_line, exam_lookup, now_dt)
 
         ok, text = _registry_text(registry, "get_weather", {"when": "today"})
         if ok and text:
@@ -504,6 +552,15 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
             sections["calendar"] = [ln.strip() for ln in text.splitlines() if ln.strip()]
         else:
             notes["calendar"] = text or "unavailable"
+        # Silent when Canvas is unconfigured or down: no note, no line.
+        try:
+            sections["due"] = due_future.result()
+        except Exception as exc:              # noqa: BLE001 - source boundary
+            log.warning("briefing: due failed: %s", type(exc).__name__)
+        try:
+            sections["exam"] = exam_future.result()
+        except Exception as exc:              # noqa: BLE001
+            log.warning("briefing: exam failed: %s", type(exc).__name__)
 
         try:
             news, complete = news_future.result()
@@ -536,6 +593,10 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
         lines.append("Calendar: " + " ".join(sections["calendar"]))
     else:
         lines.append(f"Calendar: {notes.get('calendar', 'nothing')}")
+    if sections["due"]:
+        lines.append("Due: " + " ".join(f"{i}) {d}" for i, d in enumerate(sections["due"], 1)))
+    if sections["exam"]:
+        lines.append(f"Exam: {sections['exam']}")
     if sections["news"]:
         items = " ".join(f"{i}) {n['title']} ({n['source']})"
                          for i, n in enumerate(sections["news"], 1))
@@ -561,6 +622,14 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         reg = getattr(services, "tools", None) if services is not None else None
         return reg
 
+    def _next_exam():
+        # Canvas (when the token is set) merged with the calendar's cache;
+        # silent None when neither has an exam or Canvas is unconfigured.
+        from jarvis.tools.canvas import find_next_exam
+        cal = getattr(services, "calendar", None) if services is not None else None
+        exam, _checked = find_next_exam(cfg, cal)
+        return exam
+
     def get_briefing(**_) -> ToolResult:
         # No `briefing.enabled` check here. That flag means "let a plain
         # 'good morning' trigger a briefing", and commander._h_briefing
@@ -568,8 +637,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         # regardless. The tool cannot tell the two apart, so refusing here
         # only ever broke the explicit ask: the user said "give me the
         # briefing" and was told the briefing is switched off.
-        sections, sheet = build_briefing(cfg, _registry(), cache_path=cache_path)
+        sections, sheet = build_briefing(cfg, _registry(), cache_path=cache_path,
+                                         exam_lookup=_next_exam)
         got_any = bool(sections["weather"] or sections["calendar"] or
+                       sections["due"] or sections["exam"] or
                        sections["news"] or sections["sports"] or sections["stocks"])
         if not got_any:
             return ToolResult(text="briefing sources unreachable", ok=False,
@@ -578,7 +649,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
     spec = ToolSpec(
         name="get_briefing",
-        description="Morning briefing: today's weather, calendar and three tech news items.",
+        description=("Morning briefing: today's weather, calendar, coursework due, "
+                     "next exam and three tech news items."),
         parameters={"type": "object", "properties": {}},
         handler=get_briefing,
     )

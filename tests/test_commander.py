@@ -1199,3 +1199,114 @@ def test_a_web_cue_by_voice_skips_the_intent_gate(rich, services, monkeypatch):
     res = rich.handle("look up who won the last formula one race", source="voice")
     services.brain.web_answer.assert_called_once()
     assert res.done is False and res.ack
+
+
+# ------------------------------------------------------------ next exam
+# "When's my next exam?" without a model turn: Canvas (token set) merged
+# with the calendar cache through tools/canvas.find_next_exam.
+import jarvis.commander as _cmd_mod  # noqa: E402
+
+
+@pytest.mark.parametrize("text, query", [
+    ("when's my next exam", "exam"),
+    ("when is my next midterm?", "midterm"),
+    ("When is the next quiz", "quiz"),
+    ("how long until the biosensors midterm", "biosensors midterm"),
+    ("how many days until my final exam", "final exam"),
+    ("how long till the circuits quiz?", "circuits quiz"),
+    ("when's the biosensors midterm", "biosensors midterm"),
+])
+def test_next_exam_regex_hands_over_the_query(text, query):
+    m = _cmd_mod._NEXT_EXAM_RX.match(text.lower().rstrip(".!?"))
+    assert m, text
+    assert (m.group("q1") or m.group("q2")).strip() == query
+
+
+@pytest.mark.parametrize("text", [
+    "when's my next meeting", "how long until dinner", "exam", "when is the exam hall open",
+    "how long until the exam results come out",
+])
+def test_next_exam_regex_leaves_other_questions_alone(text):
+    assert not _cmd_mod._NEXT_EXAM_RX.match(text)
+
+
+def _exam_cal(*events):
+    return types.SimpleNamespace(configured=True, events=lambda: list(events))
+
+
+def _event(title, start, all_day=False):
+    return types.SimpleNamespace(title=title, start=start, all_day=all_day, calendar="Canvas")
+
+
+def test_next_exam_answers_from_the_calendar_without_a_token(rich, services, monkeypatch):
+    import jarvis.tools.canvas as cv
+    monkeypatch.setattr(cv, "fetch_due", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("Canvas must not be asked without a token")))
+    start = (datetime.now().astimezone() + timedelta(days=3)).replace(hour=13, minute=0)
+    services.calendar = _exam_cal(_event("Physics exam", start), _event("Dentist", start))
+    res = rich.handle("when's my next exam", source="typed")
+    assert res.handled and res.speak
+    assert res.reply.startswith("Your next exam is the Physics exam, in 3 days, ")
+    assert res.reply.endswith(" at 1:00 pm, sir.")
+    services.brain.chat.assert_not_called()
+    res = rich.handle("how long until the physics exam", source="typed")
+    assert res.reply.startswith("The Physics exam, in 3 days, ")
+
+
+def test_next_exam_without_a_token_and_no_calendar_hit_falls_through(rich, services):
+    """Nothing on the calendar and no token: the router's model turn reaches
+    canvas_due, whose setup line names what is missing. A flat "nothing on
+    the books" here would vouch for a source that was never read."""
+    services.calendar = _exam_cal(_event("Dentist", datetime.now().astimezone() + timedelta(days=1)))
+    res = rich.handle("when's my next exam", source="typed")
+    assert res.status != "No exam found"
+    # the router's rule path routes a question locally: a model turn ran
+    services.brain.chat.assert_called_once()
+    assert services.brain.chat.call_args[0][0] == "when's my next exam"
+
+
+def test_next_exam_with_a_token_merges_canvas_and_speaks_the_course(rich, services, monkeypatch):
+    import jarvis.tools.canvas as cv
+    services.assistant = FakeAssistantCfg(**{"canvas.token": "7~abcDEF123secret"})
+    now = datetime.now().astimezone()
+    seen = {}
+
+    def fake_fetch_due(settings, days, fetch, when):
+        seen["days"] = days
+        assert settings["token"] == "7~abcDEF123secret"
+        return [{"course": "BIOSENSORS", "title": "Midterm 1",
+                 "due": (now + timedelta(days=6)).replace(hour=9, minute=0)},
+                {"course": "CIRCUITS", "title": "Quiz 2",
+                 "due": (now + timedelta(days=1)).replace(hour=17, minute=0)}]
+    monkeypatch.setattr(cv, "fetch_due", fake_fetch_due)
+    services.calendar = None
+    res = rich.handle("how long until the biosensors midterm", source="typed")
+    assert seen["days"] == cv.EXAM_LOOKAHEAD_DAYS
+    assert res.reply.startswith("The Midterm 1 for BIOSENSORS, in 6 days, ") and res.speak
+    res = rich.handle("when is my next quiz", source="typed")
+    assert res.reply == "Your next quiz is the Quiz 2 for CIRCUITS, tomorrow at 5:00 pm, sir."
+    # Canvas was read and holds nothing of the kind: say so, no model turn
+    res = rich.handle("when's my next final", source="typed")
+    assert res.reply == cv.NO_EXAM_LINE and res.status == "No exam found"
+    monkeypatch.setattr(cv, "fetch_due", lambda *a, **k: [])
+    res = rich.handle("how long until the quiz", source="typed")
+    assert res.reply == cv.NO_QUIZ_LINE
+    services.brain.chat.assert_not_called()
+
+
+def test_next_exam_is_tier1_in_the_assistant_and_a_canvas_outage_falls_through(
+        rich, services, monkeypatch):
+    assert "next exam" in [c.name for c in ASSISTANT_TIER1]
+    import jarvis.tools.canvas as cv
+    services.assistant = FakeAssistantCfg(**{"canvas.token": "7~abcDEF123secret"})
+    monkeypatch.setattr(cv, "fetch_due",
+                        lambda *a, **k: (_ for _ in ()).throw(cv.CanvasError("unreachable")))
+    services.calendar = None
+    res = rich.handle("when's my next exam", source="typed")
+    # Canvas was consulted (and failed quietly): "nothing on the books" is
+    # honest about what could be read; nothing crashed the handler
+    assert res.reply == cv.NO_EXAM_LINE
+    monkeypatch.setattr(cv, "find_next_exam",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))
+    res = rich.handle("when's my next exam", source="typed")
+    assert res.status != "No exam found" and "Command failed" not in (res.reply or "")

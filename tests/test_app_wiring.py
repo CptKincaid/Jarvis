@@ -1308,3 +1308,24 @@ def test_services_brain_chat_forwards_the_stream_hook_only_when_enabled(build, m
     monkeypatch.setattr(CONFIG, "stream_replies", False)
     app.services.brain.chat("what time is it")
     assert "on_sentence" not in seen and seen.get("callback") == app._on_brain_tags
+
+
+# ------------------------------------------------ deadline heads-up thread
+def test_deadline_heads_up_starts_beside_the_meeting_one_and_stops(app, paths, monkeypatch):
+    """Same shape as headsup: built in start_assistant, state under
+    MEMORY_DIR (never AIWS), stopped by stop_assistant. Without a token the
+    thread is silent -- no Canvas call, no state file."""
+    import jarvis.tools.canvas as cv
+    monkeypatch.setattr(cv, "fetch_due",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("Canvas asked")))
+    app.start_assistant(residency=False)
+    d = app.deadlines
+    assert d is not None and d._thread is not None and d._thread.is_alive()
+    assert d._state_path == paths / "memory" / "deadlines_state.json"
+    assert d.lead_hours == 3.0                                   # canvas.heads_up_hours
+    assert d._tk is app.timekeeper
+    assert d._get_calendar() is app.services.calendar
+    assert d.tick() == 0 and not d._state_path.exists()
+    app.stop_assistant()
+    d._thread.join(timeout=5)
+    assert not d._thread.is_alive()

@@ -1406,6 +1406,48 @@ _DIAG_RX = re.compile(
     r"status report|how are your systems)\W*$", re.I)
 
 
+# "When's my next exam?" / "how long until the biosensors midterm?" --
+# answered without a model turn from Canvas plus the calendar cache. The
+# whole question after the opener is the query: tools/canvas.next_exam reads
+# the kind word (exam/midterm/final vs quiz) and the course words from it.
+_NEXT_EXAM_RX = re.compile(
+    r"^(?:when(?:'s| is| do i have)\s+(?:my |the )?(?:next\s+)?"
+    r"(?P<q1>(?:\w+\s+){0,4}?(?:exams?|midterms?|finals?|quiz(?:zes)?))"
+    r"|how (?:long|many days) (?:is it |do i have )?(?:until|till|before|to)\s+"
+    r"(?:my |the )?(?P<q2>(?:\w+\s+){0,4}?(?:exams?|midterms?|finals?|quiz(?:zes)?)))"
+    r"\W*$", re.I)
+
+
+def _h_next_exam(c, t, m):
+    from jarvis.tools.canvas import NO_EXAM_LINE, NO_QUIZ_LINE, exam_words, find_next_exam
+    cfg = c._svc("assistant")
+    cal = c._svc("calendar")
+    if cfg is None and cal is None:
+        return None
+    query = (m.group("q1") or m.group("q2") or "").strip()
+    now = datetime.now().astimezone()
+    try:
+        exam, checked = find_next_exam(cfg, cal, query=query, now=now)
+    except Exception:
+        log.exception("next exam lookup failed")
+        return None
+    if exam is None:
+        if not checked:
+            # No token: let the router reach canvas_due, whose setup line
+            # says what is missing -- a bare "nothing on the books" would
+            # be a lie about a source that was never read.
+            return None
+        line = NO_QUIZ_LINE if re.search(r"quiz", query, re.I) else NO_EXAM_LINE
+        return CommandResult(handled=True, reply=line, speak=True, status="No exam found")
+    words = exam_words(exam, now)
+    if re.search(r"\bnext\b", t, re.I):
+        line = f"Your next {exam['kind']} is the {words}, sir."
+    else:
+        line = f"The {words}, sir."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"{exam['title'][:24]} {words.split(', ', 1)[-1][:24]}")
+
+
 def _h_diagnostics(c, t, m):
     """The film's "run diagnostics": uptime, models, today's turns, the box."""
     fn = c._svc("diagnostics")
@@ -1828,6 +1870,7 @@ REGISTRY: list[Command] = [
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
+    Command("next exam", _NEXT_EXAM_RX.match, _h_next_exam),
     # After the briefing: "good morning" is a briefing trigger first.
     Command("greeting", greeting_kind, _h_greeting),
     Command("good night",
@@ -1901,7 +1944,8 @@ REGISTRY: list[Command] = [
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
-                    "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
+                    "briefing", "last mail", "diagnostics", "next exam", "greeting",
+                    "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me")
 ]

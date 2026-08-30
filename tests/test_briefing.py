@@ -8,7 +8,7 @@ JARVIS_ASSISTANT_CONFIG; no network in the unit tests.
 """
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -285,6 +285,7 @@ def test_build_briefing_sections_and_fact_sheet(tmp_path):
     assert sections == {
         "weather": "72°F and partly cloudy, high 85, low 64, 10% chance of rain.",
         "calendar": ["Today: 10:00 am dentist for an hour, 2:30 pm standup; nothing else."],
+        "due": [], "exam": "",
         "news": [
             {"title": "AWS Acquires DuckLabs", "source": "Hacker News"},
             {"title": "Nvidia is about to be a hundred-billion-dollar company", "source": "The Verge"},
@@ -337,7 +338,8 @@ def test_build_briefing_degrades_per_section(tmp_path):
     ]
     # no registry at all, every feed down -> everything unavailable, never raises
     sections, sheet = build_briefing(Cfg(), None, FakeFetch({}), NOW, tmp_path / "n2.json")
-    assert sections == {"weather": "", "calendar": [], "news": [], "sports": [], "stocks": []}
+    assert sections == {"weather": "", "calendar": [], "due": [], "exam": "",
+                        "news": [], "sports": [], "stocks": []}
     assert sheet.splitlines()[1:] == ["Weather: not available", "Calendar: not available",
                                       "News: unavailable"]
     # a registry without the weather tool registered
@@ -503,3 +505,83 @@ def test_an_explicit_ask_briefs_through_the_brain_while_off(tmp_path, monkeypatc
     assert [t[0] for t in tags] == ["BRIEFING", "SPEAK"]
     assert tags[1][1] == BRIEF_REPLY
     assert len(payloads) == 1, "the model never rendered the briefing"
+
+
+# ------------------------------------------------ coursework: Due + Exam
+DUE_SHEET = ("Due in the next 2 days (2):\n"
+             "1) BIOSENSORS - Lab 3 report, today 11:59 pm\n"
+             "2) CIRCUITS - Quiz 2, tomorrow 5:00 pm")
+SETUP_LINE = "I'll need a Canvas access token set up, sir; the notes are in docs/assistant-setup.md."
+
+
+def _with_due(reg, text=DUE_SHEET, ok=True):
+    def d(**kw):
+        reg.calls.append(("canvas_due", kw))
+        return ToolResult(text=text, ok=ok)
+    reg.register(ToolSpec("canvas_due", "d", handler=d))
+    return reg
+
+
+def _exam():
+    return {"course": "BIOSENSORS", "title": "Midterm 1", "kind": "exam", "all_day": False,
+            "when": (NOW + timedelta(days=6)).replace(hour=9, minute=0), "source": "canvas"}
+
+
+def test_briefing_carries_due_items_and_the_exam_countdown(tmp_path):
+    reg = _with_due(FakeRegistry())
+    sections, sheet = build_briefing(Cfg(), reg, FakeFetch(), NOW, tmp_path / "news.json",
+                                     exam_lookup=_exam)
+    assert sections["due"] == ["BIOSENSORS - Lab 3 report, today 11:59 pm",
+                               "CIRCUITS - Quiz 2, tomorrow 5:00 pm"]
+    assert sections["exam"] == "Midterm 1 for BIOSENSORS, in 6 days, Tuesday at 9:00 am"
+    assert ("canvas_due", {"days": 2}) in reg.calls
+    lines = sheet.splitlines()
+    assert lines[3] == ("Due: 1) BIOSENSORS - Lab 3 report, today 11:59 pm "
+                        "2) CIRCUITS - Quiz 2, tomorrow 5:00 pm")
+    assert lines[4] == "Exam: Midterm 1 for BIOSENSORS, in 6 days, Tuesday at 9:00 am"
+    assert lines[5].startswith("News:")
+
+
+def test_briefing_is_silent_about_canvas_when_unconfigured_or_nothing_due(tmp_path):
+    """canvas_due answers ok=False with its setup line when the token is
+    unset; the Weather/Calendar pattern would put that line in every
+    'good morning'. No token, no Due line, no note -- and no line either
+    when the token works but nothing is due."""
+    reg = _with_due(FakeRegistry(), text=SETUP_LINE, ok=False)
+    sections, sheet = build_briefing(Cfg(), reg, FakeFetch(), NOW, tmp_path / "n1.json",
+                                     exam_lookup=lambda: None)
+    assert sections["due"] == [] and sections["exam"] == ""
+    assert "Due" not in sheet and "Exam" not in sheet and "Canvas" not in sheet
+    reg = _with_due(FakeRegistry(), text="nothing due in the next 2 days")
+    sections, sheet = build_briefing(Cfg(), reg, FakeFetch(), NOW, tmp_path / "n2.json")
+    assert sections["due"] == [] and "Due" not in sheet
+    # a registry without the tool, and an exam lookup that blows up
+    sections, sheet = build_briefing(Cfg(), FakeRegistry(), FakeFetch(), NOW, tmp_path / "n3.json",
+                                     exam_lookup=lambda: (_ for _ in ()).throw(OSError("x")))
+    assert sections["due"] == [] and sections["exam"] == "" and "Exam" not in sheet
+
+
+def test_get_briefing_counts_coursework_as_content_and_reads_the_calendar_service(
+        tmp_path, monkeypatch):
+    """Every other source down, Canvas up: still a briefing, not the
+    'nothing reachable' excuse. The exam lookup goes through
+    canvas.find_next_exam with the services' calendar."""
+    monkeypatch.setattr(br, "_fetch", FakeFetch({}))
+    reg = _with_due(FakeRegistry(weather="down", weather_ok=False, calendar="down",
+                                 calendar_ok=False))
+    seen = {}
+
+    def fake_find(cfg, calendar=None, query="", now=None, fetch=None):
+        seen["calendar"] = calendar
+        return _exam(), True
+    import jarvis.tools.canvas as cv
+    monkeypatch.setattr(cv, "find_next_exam", fake_find)
+    cal = object()
+    services = SimpleNamespace(tools=reg, news_cache_path=tmp_path / "news.json", calendar=cal)
+    reg.register_many(br.make_tools(Cfg(), services))
+    r = reg.call("get_briefing", {})
+    assert r.ok and r.card["due"] and r.card["exam"].startswith("Midterm 1 for BIOSENSORS")
+    assert seen["calendar"] is cal
+    assert "Due: 1) BIOSENSORS - Lab 3 report" in r.text
+    spec = next(s for s in br.make_tools(Cfg(), services))
+    assert spec.description_words() <= 20

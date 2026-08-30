@@ -90,8 +90,11 @@ DEFAULTS: dict = {
     # on_first_wake: deliver the briefing after the first thing you say to
     # Jarvis each day, once it is past `after` (24 h clock, local time).
     "calendar": {"heads_up_min": 10},
-    # Canvas LMS: Account > Settings > New Access Token (read-only use)
-    "canvas": {"base_url": "https://canvas.tamu.edu", "token": ""},
+    # Canvas LMS: Account > Settings > New Access Token (read-only use).
+    # heads_up_hours: the deadline heads-up (jarvis/deadlines.py) speaks
+    # this long before each due time; the meeting heads-up's ten minutes
+    # is no use for an 11:59 pm deadline.
+    "canvas": {"base_url": "https://canvas.tamu.edu", "token": "", "heads_up_hours": 3},
     # Local document Q&A: drop PDFs / notes here; indexed with nomic-embed-text
     "docs": {"paths": ["~/Documents/Jarvis Docs"], "index_dir": "~/.aiws_trainer/docs_index",
              "max_files": 500, "embed_model": "nomic-embed-text",
