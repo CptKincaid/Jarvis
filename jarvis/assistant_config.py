@@ -101,6 +101,15 @@ DEFAULTS: dict = {
              "ollama_url": "http://localhost:11434"},
     "screen": {"model": "llama3.2-vision:latest", "max_width": 1280},
     "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30},
+    # Long-term memory (jarvis/memory.py): facts are also indexed with
+    # nomic-embed-text so "who's my dentist" finds "my dentist is Dr Patel";
+    # semantic=false keeps the substring store only.
+    "memory": {"semantic": True},
+    # Activity journal (jarvis/context.py + tools/journal.py): the focused
+    # window is sampled every window_interval_s; day files older than
+    # keep_days are pruned. enabled=false stops the sampler only -- exchanges
+    # and tool calls are always journaled.
+    "journal": {"enabled": True, "window_interval_s": 60, "keep_days": 90},
     "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],

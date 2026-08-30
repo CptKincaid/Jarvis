@@ -17,6 +17,12 @@ V3 notes:
   context.
 - Every key gathered by get_context() is rendered by format_for_prompt()
   (the V1 gather/render mismatch is gone).
+- Activity journal (2026-08-30): every exchange, tool call, Claude task
+  result and window-focus change is appended as one JSON line to
+  ``PATHS.MEMORY_DIR/journal/<YYYY-MM-DD>.jsonl`` (untruncated, one file per
+  day so rollover is free). ``journal_rows()`` reads a time window back for
+  "recap my day" (jarvis/tools/journal.py). A write failure logs and drops
+  the row; it never reaches the turn.
 
 Usage:
     ctx = ContextEngine(memory=mem)
@@ -25,11 +31,13 @@ Usage:
 """
 from __future__ import annotations
 
+import json
 import re
 import subprocess
+import threading
 import time
 from collections import deque
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from jarvis.config import PATHS
@@ -38,6 +46,11 @@ from jarvis.logs import LOG_FILE, get_logger
 log = get_logger("context")
 
 _LEGACY_LOG = PATHS.LOG_DIR / "gui_debug.log"
+# One journal row keeps the whole utterance and reply (add_exchange's
+# 200-char cap is for the prompt window, not the record), but a pasted
+# document or a Claude transcript must not turn the day file into a dump.
+JOURNAL_TEXT_CAP = 4000
+JOURNAL_KINDS = ("exchange", "tool", "claude", "window")
 
 
 class ContextEngine:
@@ -47,8 +60,15 @@ class ContextEngine:
     # Exchanges older than this are not shown to the model: "what about
     # tomorrow?" refers to the last minute, not to this morning.
     CONVERSATION_TTL_S = 10 * 60
+    # Class-level defaults so an engine built without __init__ (the tests'
+    # ContextEngine.__new__ pattern) can still record an exchange.
+    _journal_dir = None
+    _journal_lock = threading.Lock()
+    _journal_failed_logged = False
+    _last_journaled_window = None
 
-    def __init__(self, project_dir=None, vss_dir=None, memory=None):
+    def __init__(self, project_dir=None, vss_dir=None, memory=None,
+                 journal_dir=None):
         self._cache = {}
         self._cache_times = {}
         self._conversation = []
@@ -57,6 +77,12 @@ class ContextEngine:
         self._memory = memory          # injected JarvisMemory (optional)
         self._windows = deque(maxlen=20)
         self._current_app = None
+        # journal_dir=None resolves PATHS.MEMORY_DIR at write time, so the
+        # test firewall's env redirect is honoured whenever it was set.
+        self._journal_dir = Path(journal_dir) if journal_dir else None
+        self._journal_lock = threading.Lock()
+        self._journal_failed_logged = False
+        self._last_journaled_window = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -89,13 +115,113 @@ class ContextEngine:
         return ctx
 
     def add_exchange(self, user_text, jarvis_response):
-        """Record a conversation exchange for context."""
+        """Record a conversation exchange for context (and the journal)."""
         self._conversation.append({
             "time": datetime.now().isoformat(),
             "user": (user_text or "")[:200],
             "jarvis": jarvis_response[:200] if jarvis_response else "",
         })
         self._conversation = self._conversation[-20:]
+        if user_text or jarvis_response:
+            self._journal_write("exchange", user=user_text or "",
+                                jarvis=jarvis_response or "")
+
+    # ------------------------------------------------------------------
+    # Activity journal — one JSON line per event, one file per day
+    # ------------------------------------------------------------------
+    def journal_dir(self) -> Path:
+        return self._journal_dir or (PATHS.MEMORY_DIR / "journal")
+
+    def _journal_write(self, kind, **fields):
+        """Append {time, kind, ...} to today's file. Mirrors
+        turnclock._default_emit: any failure is logged once and dropped."""
+        row = {"time": datetime.now().isoformat(timespec="seconds"), "kind": kind}
+        for key, value in fields.items():
+            if isinstance(value, str) and len(value) > JOURNAL_TEXT_CAP:
+                value = value[:JOURNAL_TEXT_CAP] + "…"
+            row[key] = value
+        try:
+            line = json.dumps(row, ensure_ascii=False, default=str)
+            with self._journal_lock:
+                d = self.journal_dir()
+                d.mkdir(parents=True, exist_ok=True)
+                with open(d / f"{date.today():%Y-%m-%d}.jsonl", "a",
+                          encoding="utf-8") as fh:
+                    fh.write(line + "\n")
+            self._journal_failed_logged = False
+        except Exception:
+            if not self._journal_failed_logged:
+                log.exception("journal write failed (further failures at debug)")
+                self._journal_failed_logged = True
+            else:
+                log.debug("journal write failed", exc_info=True)
+
+    def journal_tool(self, name, args=None, ok=True, text=""):
+        """A tool the model (or a Tier 1 handler) ran."""
+        try:
+            args = dict(args or {})
+        except (TypeError, ValueError):
+            args = {"args": str(args)}
+        self._journal_write("tool", name=str(name), args=args, ok=bool(ok),
+                            text=(text or "")[:600])
+
+    def journal_claude(self, project, state, text=""):
+        """A Claude task reached a terminal state (done / failed)."""
+        self._journal_write("claude", project=str(project or ""),
+                            state=str(state or ""), text=text or "")
+
+    def journal_window(self, title):
+        """A focus sample from the activity sampler: journaled only when it
+        changed, so an hour in one window is one row, not sixty."""
+        title = (title or "").strip()
+        if not title or title == "unknown":
+            return False          # xdotool failed / no focused window (locked)
+        if title == self._last_journaled_window:
+            return False
+        self._last_journaled_window = title
+        self.track_window(title)
+        self._journal_write("window", title=title)
+        return True
+
+    def journal_rows(self, since=None, until=None, kinds=None):
+        """Rows between ``since`` and ``until`` (datetimes; default: today
+        so far), oldest first. ``kinds`` restricts to JOURNAL_KINDS
+        members. Unreadable lines are skipped."""
+        now = datetime.now()
+        until = until or now
+        since = since or until.replace(hour=0, minute=0, second=0, microsecond=0)
+        if since > until:
+            since, until = until, since
+        want = set(kinds) if kinds else None
+        rows = []
+        day = since.date()
+        last = until.date()
+        while day <= last:
+            path = self.journal_dir() / f"{day:%Y-%m-%d}.jsonl"
+            if path.exists():
+                try:
+                    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    log.debug("journal read failed: %s", path, exc_info=True)
+                    lines = []
+                for line in lines:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                        when = datetime.fromisoformat(str(row.get("time", "")))
+                    except (ValueError, TypeError):
+                        continue
+                    if not (since <= when <= until):
+                        continue
+                    if want and row.get("kind") not in want:
+                        continue
+                    row["_when"] = when
+                    rows.append(row)
+            day += timedelta(days=1)
+        rows.sort(key=lambda r: r["_when"])
+        return rows
 
     def _recent_conversation(self, limit=10):
         """The last exchanges that are still fresh (CONVERSATION_TTL_S)."""
@@ -448,8 +574,8 @@ class ContextEngine:
                 return []
             lines = log_path.read_text(errors="replace").splitlines()[-100:]
             errors = [
-                l for l in lines
-                if any(kw in l.lower() for kw in
+                ln for ln in lines
+                if any(kw in ln.lower() for kw in
                        ("error", "exception", "traceback", "failed"))
             ]
             return errors[-5:]

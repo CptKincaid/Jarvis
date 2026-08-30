@@ -25,7 +25,7 @@ def test_sentence_splitting_waits_for_text_after_the_terminator():
 
 def _brain(monkeypatch, chunks):
     b = brain_mod.JarvisBrain(None, None, registry=None)
-    monkeypatch.setattr(b, "_dynamic_context", lambda: ("", ""))
+    monkeypatch.setattr(b, "_dynamic_context", lambda text="": ("", ""))
 
     def stream(path, payload, timeout=None):
         assert payload.get("stream") is not True or True
@@ -78,7 +78,7 @@ def test_a_stream_that_dies_keeps_what_was_said(monkeypatch):
         yield {"message": {"role": "assistant", "content": "The first part is fine. The sec"}, "done": False}
         raise urllib.error.URLError("connection dropped")
     b = brain_mod.JarvisBrain(None, None, registry=None)
-    monkeypatch.setattr(b, "_dynamic_context", lambda: ("", ""))
+    monkeypatch.setattr(b, "_dynamic_context", lambda text="": ("", ""))
     monkeypatch.setattr(brain_mod, "_http_stream", stream)
     monkeypatch.setattr(brain_mod.bus, "publish", lambda ev: None)
     spoken = []
@@ -90,7 +90,7 @@ def test_a_stream_that_dies_keeps_what_was_said(monkeypatch):
 
 def test_without_on_sentence_nothing_changes(monkeypatch):
     b = brain_mod.JarvisBrain(None, None, registry=None)
-    monkeypatch.setattr(b, "_dynamic_context", lambda: ("", ""))
+    monkeypatch.setattr(b, "_dynamic_context", lambda text="": ("", ""))
     monkeypatch.setattr(brain_mod, "_http_stream", lambda *a, **k: (_ for _ in ()).throw(AssertionError("streamed")))
     monkeypatch.setattr(brain_mod, "_http", lambda path, payload, timeout=None: {
         "message": {"role": "assistant", "content": "Plain reply, sir."}, "load_duration": 0})
@@ -152,7 +152,7 @@ def _tool_brain(monkeypatch, rounds, tool_result, name="screen_qa"):
     reg = ToolRegistry()
     reg.register(ToolSpec(name=name, description="a tool", handler=lambda **a: tool_result))
     b = brain_mod.JarvisBrain(None, None, registry=reg)
-    monkeypatch.setattr(b, "_dynamic_context", lambda: ("", ""))
+    monkeypatch.setattr(b, "_dynamic_context", lambda text="": ("", ""))
     it = iter(rounds)
 
     def stream(path, payload, timeout=None):

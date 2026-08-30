@@ -54,7 +54,7 @@ class FakeMemory:
     def __init__(self):
         self.habits = []
 
-    def format_for_context(self):
+    def format_for_context(self, text=""):
         return "Known facts (1):\n  editor: vim"
 
     def log_habit(self, text):

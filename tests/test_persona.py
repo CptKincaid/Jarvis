@@ -79,7 +79,7 @@ class FakeContext:
 
 
 class FakeMemory:
-    def format_for_context(self):
+    def format_for_context(self, text=""):
         return "Known facts (1):\n  editor: vim"
 
 

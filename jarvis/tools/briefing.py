@@ -585,7 +585,7 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
     # "no news in the morning" must not leave a "News: unavailable" line
     # for the model to apologise about.
     on = {name: section_on(cfg, name) for name in ("weather", "calendar", "news",
-                                                    "sports", "stocks")}
+                                                    "sports", "stocks", "canvas")}
 
     sports_feeds = [str(u) for u in (_cfg_get(cfg, "briefing.sports_feeds", []) or [])
                     if str(u).strip()] if on["sports"] else []

@@ -93,6 +93,7 @@ TOOL_MODULES = (
     "jarvis.tools.docs",
     "jarvis.tools.screen",
     "jarvis.tools.health",
+    "jarvis.tools.journal",
 )
 
 # Fixed persona lines the app itself speaks (spec 3.4); prewarmed. The
@@ -181,7 +182,8 @@ class JarvisApp:
         self._quitting = False
 
         # ---- intelligence -------------------------------------------------
-        self.memory = JarvisMemory()
+        self.memory = JarvisMemory(
+            semantic=bool(self.assistant.get("memory.semantic", True)))
         self.context = ContextEngine(memory=self.memory)
         self.brain = JarvisBrain(self.context, self.memory)
         # brain.configure(assistant.local_model): module-level in brain.py;
@@ -535,6 +537,9 @@ class JarvisApp:
 
         return SimpleNamespace(
             desktop=desktop_ns, context=context_ns, memory=self.memory,
+            # the engine itself, for the journal tool and the window
+            # sampler (context= above is the narrow V1-shaped adapter)
+            context_engine=self.context,
             workflows=workflows_ns, brain=brain_ns, tts=self.tts,
             reader=self.reader, history=self.history,
             # personal assistant (spec 2.2)
@@ -674,9 +679,19 @@ class JarvisApp:
                 bus.publish(JarvisReply(text=line, speak=True))
                 self._say(line)
             self._alert("blocked", f"Claude · {ev.project}", line)
+            self._journal_claude(ev.project, "failed", ev.text or line)
         elif ev.state == "cancelled":
             self._last_milestone.pop(ev.task_id, None)
             bus.publish(Status(text="Claude task cancelled", kind="info"))
+
+    def _journal_claude(self, project, state, text):
+        journal = getattr(self.context, "journal_claude", None)
+        if journal is None:
+            return
+        try:
+            journal(project, state, text)
+        except Exception:
+            log.exception("journal_claude failed")
 
     def _result_text(self, ev) -> str:
         """The task's full final text (manager's Task.result_text), else the
@@ -712,8 +727,11 @@ class JarvisApp:
             f"Claude's finished with {ev.project or 'the task'}, sir."
         bus.publish(JarvisReply(text=spoken, speak=True))
         self._say(spoken)
-        self.context.add_exchange("", spoken)
+        # The alert queues before the journal writes: a listener waiting on
+        # the reply then flushing the alerts must find it queued already.
         self._alert("done", f"Claude · {ev.project}", spoken)
+        self.context.add_exchange("", spoken)
+        self._journal_claude(ev.project, "done", text)
 
     # --------------------------------------------------------- approvals
     def _on_approval(self, req):
@@ -1610,6 +1628,12 @@ class JarvisApp:
                 wd.start()
             except Exception:
                 log.exception("health watchdog failed to start")
+        sampler = getattr(self.services, "activity_sampler", None)
+        if sampler is not None and self.assistant.get("journal.enabled", True):
+            try:
+                sampler.start()
+            except Exception:
+                log.exception("activity sampler failed to start")
         try:
             from jarvis.headsup import MeetingHeadsUp
             lead = int(self.assistant.get("calendar.heads_up_min", 10) or 10)
@@ -1637,6 +1661,12 @@ class JarvisApp:
                 brain_mod.start_residency()
             except Exception:
                 log.exception("ollama residency thread failed to start")
+            # Same gate (residency=False is the tests' "no Ollama"): migrate
+            # facts.json into the semantic index and load the embedder off
+            # the turn path -- a cold nomic-embed-text is ~7.5 s.
+            warm = getattr(self.memory, "warm_index", None)
+            if warm is not None:
+                threading.Thread(target=warm, daemon=True, name="memory-warm").start()
         if self.assistant.get("autostart.enabled", False):
             try:
                 from jarvis import autostart
@@ -1751,6 +1781,7 @@ class JarvisApp:
                           ("timekeeper", self.timekeeper), ("calendar", cal),
                           ("claude", self.claude),
                           ("health_watchdog", getattr(self.services, "health_watchdog", None)),
+                          ("activity_sampler", getattr(self.services, "activity_sampler", None)),
                           ("headsup", getattr(self, "headsup", None)),
                           ("deadlines", getattr(self, "deadlines", None))):
             if obj is None:
