@@ -56,7 +56,7 @@ from typing import Iterable, Iterator, Optional
 
 from jarvis import pronounce
 from jarvis.config import CONFIG, PATHS
-from jarvis.events import SpeakingState, bus
+from jarvis.events import SpeakingState, Status, bus
 from jarvis.logs import get_logger
 from jarvis.speech_cache import SpeechCache
 
@@ -378,8 +378,35 @@ F5_SERVER = PATHS.REPO_ROOT / "scripts" / "f5_server.py"
 # Both are in the cache key, so changing them invalidates cached audio.
 F5_PARAMS = dict(nfe_step=10, speed=0.85)
 
+# The sidecar is meant to be RESIDENT, engine or not: F5 is the local
+# fallback for the hosted voice, and a fallback that has to cold-start
+# (~180 s on this box) is not a fallback. scripts/systemd/jarvis-f5.service
+# (installed by scripts/setup_f5_service.sh) keeps it up across app restarts
+# and reboots. When that unit is active it OWNS the socket -- f5_server.py
+# unlinks and rebinds the path on start, so a second, Jarvis-spawned copy
+# would fight the unit's restarts for it and double the GPU footprint.
+F5_UNIT = "jarvis-f5.service"
+
 _f5_proc = None
 _f5_lock = threading.Lock()
+
+
+def _f5_unit_active() -> bool:
+    """True when systemd --user reports the sidecar unit up (or coming up).
+
+    "activating" counts: with Type=simple the unit is "active" the moment
+    the python process exists, long before the model is resident, so this
+    is only ever a hint that someone else owns the socket -- readiness is
+    still _f5_alive(). Any failure to ask (no systemctl, no user bus, a
+    timeout) is "not active": we would rather risk a duplicate sidecar than
+    never start one.
+    """
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-active", F5_UNIT],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.stdout.strip() in ("active", "activating", "reloading")
 
 
 def _f5_request(payload: dict, timeout: float = 120) -> dict:
@@ -405,17 +432,25 @@ def _f5_alive() -> bool:
 
 
 def _ensure_f5_server(startup_timeout: float = 180) -> bool:
-    """Start the sidecar if it is not already answering. True when ready."""
+    """Adopt a running sidecar, or start one. True when it answers a ping.
+
+    Three cases, in order: the socket already answers (a systemd-owned or
+    earlier Jarvis-spawned server -- adopted as-is); the systemd unit is
+    active but not yet answering (it is loading the model -- WAIT for it,
+    never spawn beside it); nothing owns the socket (spawn our own).
+    """
     global _f5_proc
     with _f5_lock:
         if _f5_alive():
             return True
+        if _f5_unit_active():
+            return _wait_for_f5_unit(startup_timeout)
         for path in (F5_PYTHON, F5_SERVER, F5_REF, F5_REF_TEXT):
             if not Path(path).exists():
                 log.error("f5 sidecar cannot start, missing: %s", path)
                 return False
         F5_SOCK.parent.mkdir(parents=True, exist_ok=True)
-        log.info("starting f5 sidecar")
+        log.info("starting f5 sidecar (%s is not active)", F5_UNIT)
         try:
             _f5_proc = subprocess.Popen(
                 [str(F5_PYTHON), str(F5_SERVER), "--socket", str(F5_SOCK),
@@ -438,6 +473,62 @@ def _ensure_f5_server(startup_timeout: float = 180) -> bool:
             time.sleep(0.5)
         log.error("f5 sidecar did not become ready in %.0fs", startup_timeout)
         return False
+
+
+def _wait_for_f5_unit(startup_timeout: float) -> bool:
+    """The systemd unit owns the socket: poll until it answers or dies.
+
+    Re-checks the unit every few seconds so a unit that crashed (or that
+    the user stopped) does not cost the whole startup budget -- and so we
+    do not then spawn our own copy underneath a unit that systemd is about
+    to restart (Restart=always).
+    """
+    log.info("f5 sidecar is owned by %s; waiting for it", F5_UNIT)
+    deadline = time.monotonic() + startup_timeout
+    next_unit_check = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _f5_alive():
+            log.info("f5 sidecar ready (%s)", F5_UNIT)
+            return True
+        if time.monotonic() >= next_unit_check:
+            if not _f5_unit_active():
+                log.error("%s stopped while we were waiting for it", F5_UNIT)
+                return False
+            next_unit_check = time.monotonic() + 5
+        time.sleep(0.5)
+    log.error("%s did not answer in %.0fs", F5_UNIT, startup_timeout)
+    return False
+
+
+def retire_own_f5_sidecar() -> bool:
+    """Stop a Jarvis-spawned sidecar that the systemd unit has superseded.
+
+    Only ours (``_f5_proc``), and only when the unit is active: once the
+    unit is up it has taken the socket path, so our copy answers nobody and
+    just holds a few GB of the unified pool. Without the unit our copy is
+    deliberately left running -- it is what makes the next launch warm.
+    Called at app shutdown; never touches a systemd-owned process.
+    """
+    global _f5_proc
+    with _f5_lock:
+        proc = _f5_proc
+        if proc is None or proc.poll() is not None:
+            return False
+        if not _f5_unit_active():
+            return False
+        log.info("stopping our f5 sidecar (pid %s): %s owns the socket now",
+                 proc.pid, F5_UNIT)
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except Exception:
+            log.exception("could not stop our f5 sidecar")
+            return False
+        _f5_proc = None
+        return True
 
 
 OUTPUT_GAIN = 1.34               # ~+2.5 dB; peak 0.72 -> ~0.97
@@ -488,6 +579,7 @@ class TTS:
         self._synth_lock = threading.Lock()    # one XTTS inference at a time
         self._load_lock = threading.Lock()     # one XTTS LOAD at a time
         self._prewarm_thread: threading.Thread | None = None
+        self._f5_warm_thread: threading.Thread | None = None
         self.last_text = ""                    # last cleaned utterance queued
         self.interrupts = 0                    # barge-ins that cut speech
         self._worker = threading.Thread(
@@ -521,6 +613,9 @@ class TTS:
         if self._engine == "fish":
             key, model = _fish_creds()
             if key and model:
+                # Hosted voice: nothing to load, but its LOCAL fallback must
+                # be warm NOW, not at the first outage (see warm_f5_fallback).
+                self.warm_f5_fallback()
                 return True
             log.warning("fish credentials missing (%s) — falling back to %s",
                         FISH_KEY_FILE, FISH_FALLBACK)
@@ -529,13 +624,79 @@ class TTS:
         if self._engine == "f5":
             if _ensure_f5_server():
                 return True
-            log.warning("f5 sidecar unavailable — falling back to edge")
-            self._engine = "edge"
-            return False
+            return self._f5_unavailable()
         if self._xtts is not None:
             return True
         with self._load_lock:
             return self._load_xtts_locked()
+
+    def warm_f5_fallback(self) -> Optional[threading.Thread]:
+        """Bring the F5 sidecar up in the background while another engine
+        is in use.
+
+        The hosted voice's fallback is F5, and _ensure_f5_server used to be
+        called for the first time by the first FAILING fish chunk -- which
+        then paid the sidecar's ~180 s cold start, i.e. an outage was still
+        a silent assistant. The unit (jarvis-f5.service) is the real answer;
+        this covers a box where it is not installed, and adopts the unit's
+        server when it is. Daemon thread, once per instance, never blocks
+        load(): a warm-up is an optimisation, not a reason to wait.
+        """
+        if FISH_FALLBACK != "f5":
+            return None
+        t = self._f5_warm_thread
+        if t is not None and t.is_alive():
+            return t
+
+        def _run():
+            if _ensure_f5_server():
+                log.info("f5 fallback is warm")
+                return
+            # Loud on purpose: the hosted voice still works, so nothing
+            # else would tell the user their outage plan is cold.
+            log.warning("f5 fallback could NOT be warmed -- a fish outage "
+                        "would cost a cold start or drop to another engine")
+            bus.publish(Status(text="Local voice fallback (F5) is not running",
+                               kind="warn"))
+
+        t = threading.Thread(target=_run, daemon=True, name="tts-f5-warm")
+        self._f5_warm_thread = t
+        t.start()
+        return t
+
+    def _f5_unavailable(self) -> bool:
+        """The configured local voice will not come up. Degrade LOUDLY and
+        stay local where possible.
+
+        This used to drop straight to edge -- Microsoft's cloud -- with one
+        log line, which on a box whose whole point is a local voice is the
+        wrong default twice over: it sends every utterance off the machine
+        and nobody notices until the accent changes. XTTS is local and
+        needs only its reference clip, so it is tried first; edge is the
+        last resort and is announced as the cloud engine it is. Returns
+        load()'s verdict for the engine actually chosen, so an utterance is
+        not discarded when the replacement can speak (fish's contract).
+        """
+        if VOICE_REF.exists():
+            log.error("f5 sidecar unavailable — falling back to xtts (local)")
+            bus.publish(Status(text="F5 voice down — using XTTS (local)",
+                               kind="warn"))
+            self._engine = "xtts"
+        else:
+            log.error("f5 sidecar unavailable and no XTTS reference at %s — "
+                      "falling back to edge (CLOUD)", VOICE_REF)
+            bus.publish(Status(text="F5 voice down — using edge (cloud voice)",
+                               kind="warn"))
+            self._engine = "edge"
+        return self.load()
+
+    def release_f5_sidecar(self) -> bool:
+        """App-shutdown hook: see retire_own_f5_sidecar()."""
+        try:
+            return retire_own_f5_sidecar()
+        except Exception:
+            log.exception("f5 sidecar release failed")
+            return False
 
     def _load_xtts_locked(self) -> bool:
         if self._engine == "edge":       # a failed load may have fallen back
