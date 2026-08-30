@@ -56,7 +56,7 @@ from jarvis.logs import get_logger
 
 from jarvis import brain as brain_mod
 from jarvis import desktop as desktop_mod
-from jarvis import speak_queue, voice_check
+from jarvis import speak_queue, standup, voice_check
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
 from jarvis.brain import JarvisBrain
@@ -183,6 +183,15 @@ class JarvisApp:
         # ---- intelligence -------------------------------------------------
         self.memory = JarvisMemory()
         self.context = ContextEngine(memory=self.memory)
+        # The standup and the prompt's git line walk the cleared projects
+        # (claude.allowed_dirs + projects_root) and the VSS tree, primary
+        # first; the engine's own default is the Jarvis repo + ~/vss_env.
+        try:
+            repos = standup.default_repo_dirs(self.assistant)
+            if repos:
+                self.context.repo_dirs = repos
+        except Exception:
+            log.exception("standup repo list failed; keeping the default")
         self.brain = JarvisBrain(self.context, self.memory)
         # brain.configure(assistant.local_model): module-level in brain.py;
         # env JARVIS_OLLAMA_MODEL wins inside it.
@@ -475,7 +484,10 @@ class JarvisApp:
             analyze_screen=ctx.capture_screen,
             click_on_text=a.click_on_text,
             list_heavy_processes=a.list_heavy_processes,
-            git_summary=a.git_summary,
+            # V3 probe: the primary repo (V1's git_summary was hard-coded to
+            # ~/vss_env, so "git status" reported the VSS tree, not Jarvis).
+            git_summary=ctx.git_summary,
+            git_repos=ctx.git_repos,
             check_connectivity=a.check_connectivity,
             find_file=a.find_file,
             recent_files=a.recent_files,
@@ -531,6 +543,10 @@ class JarvisApp:
             local_line=lambda *a, **kw: app.brain.local_line(*a, **kw),
             execute_autonomous=lambda task: b.execute_autonomous(
                 task, callback=app._on_brain_tags),
+            # GPU yield: "lend the GPU" / "take the GPU back" (commander)
+            release=lambda: app.brain.release(),
+            reclaim=lambda: app.brain.reclaim(),
+            is_lent=lambda: app.brain.is_lent(),
         )
 
         return SimpleNamespace(

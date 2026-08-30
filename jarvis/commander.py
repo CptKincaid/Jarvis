@@ -69,7 +69,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from jarvis import pronounce
+from jarvis import pronounce, standup
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
@@ -1461,6 +1461,104 @@ def _h_git_status(c, t, m):                                # 3252-3265
     return CommandResult(handled=True, status="No git info")
 
 
+def _h_standup(c, t, m):
+    """"What did I do today?" / "standup": every cleared repo's commits for
+    the day, the uncommitted diff stat, and the Claude sessions touched that
+    day -- a card of subjects plus two spoken sentences composed from the
+    data (no model turn, so it still answers while the GPU is lent out).
+    Synchronous: three repos and a few capped transcript reads are well
+    under a second, and a done=False turn would sit open until the 60 s
+    watchdog with nothing to close it."""
+    ctx = c._svc("context")
+    git_repos = getattr(ctx, "git_repos", None)
+    if not callable(git_repos):
+        return None
+    word = standup.day_word(m)
+    try:
+        line, card = standup.build(git_repos, word)
+    except Exception:
+        log.exception("standup failed")
+        return CommandResult(handled=True, reply=standup.FAILED_LINE, speak=True,
+                             status="Standup failed")
+    # The card is display-only; the spoken line is the reply so a voice
+    # question gets a voice answer (clock rule).
+    bus.publish(JarvisReply(text=card, speak=False))
+    return CommandResult(handled=True, reply=line, speak=True, status="Standup")
+
+
+# ---- GPU yield (jarvis/brain.py release/reclaim) -------------------------
+# The watchdog lends the model to a trainer on its own (health.yield_to_trainer);
+# these two are the manual doors. "Take the GPU back" while the trainer still
+# runs is an override: the watchdog remembers the trainer and does not lend to
+# it again (Watchdog.manual_reclaim), or the next tick would undo the order.
+_GPU_RECLAIM_RX = re.compile(
+    r"^(?:take (?:the |your )?gpu back|take back (?:the |your )?gpu|"
+    r"reclaim (?:the |your )?gpu|(?:re)?load your (?:model|brain)(?: back| again)?|"
+    r"get your (?:model|brain|gpu) back|bring your (?:model|brain) back)\W*$", re.I)
+_GPU_LEND_RX = re.compile(
+    r"^(?:lend (?:the |your )?gpu(?: to (?:the |my )?trainer)?|"
+    r"(?:release|free up|free|give up|yield) (?:the |your )?gpu|"
+    r"unload your (?:model|brain))\W*$", re.I)
+GPU_RECLAIMED_LINE = "The GPU is mine again, sir; my model is loading."
+GPU_RECLAIM_FAILED_LINE = "I have the GPU back, sir, but my model would not load."
+GPU_NOT_LENT_LINE = "I never lent it out, sir; my model is where it should be."
+GPU_LENT_LINE = "I've lent the GPU out, sir; quick answers only until you take it back."
+GPU_ALREADY_LENT_LINE = "It's already lent out, sir."
+
+
+def _gpu_doors(c):
+    brain = c._svc("brain")
+    release = getattr(brain, "release", None)
+    reclaim = getattr(brain, "reclaim", None)
+    if not callable(release) or not callable(reclaim):
+        return None
+    return brain
+
+
+def _h_gpu_reclaim(c, t, m):
+    brain = _gpu_doors(c)
+    if brain is None:
+        return None
+    is_lent = getattr(brain, "is_lent", None)
+    if callable(is_lent) and not is_lent():
+        return CommandResult(handled=True, reply=GPU_NOT_LENT_LINE, speak=True,
+                             status="GPU not lent")
+    wd = c._svc("health_watchdog")
+
+    def _run():
+        try:
+            hold = getattr(wd, "manual_reclaim", None)
+            ok = hold() if callable(hold) else brain.reclaim()
+        except Exception:
+            log.exception("gpu reclaim failed")
+            ok = False
+        bus.publish(Status(text="GPU reclaimed" if ok else "Model failed to load",
+                           kind="ok" if ok else "warn"))
+        if not ok:
+            c._speak(GPU_RECLAIM_FAILED_LINE)
+
+    # reclaim() warms the model (seconds): the acknowledgement goes first
+    c._bg(_run)
+    return CommandResult(handled=True, reply=GPU_RECLAIMED_LINE, speak=True,
+                         status="Reclaiming GPU…")
+
+
+def _h_gpu_lend(c, t, m):
+    brain = _gpu_doors(c)
+    if brain is None:
+        return None
+    is_lent = getattr(brain, "is_lent", None)
+    if callable(is_lent) and is_lent():
+        return CommandResult(handled=True, reply=GPU_ALREADY_LENT_LINE, speak=True,
+                             status="GPU lent")
+    try:
+        brain.release()
+    except Exception:
+        log.exception("gpu release failed")
+    return CommandResult(handled=True, reply=GPU_LENT_LINE, speak=True,
+                         status="GPU lent")
+
+
 def _h_network(c, t, m):                                   # 3267-3279
     net = c._svc("context").check_connectivity()
     status = "Online" if net.get("internet") else "Offline"
@@ -1838,6 +1936,13 @@ REGISTRY: list[Command] = [
             _m_contains("what's running", "whats running",
                         "heavy processes", "top processes"),
             _h_processes, needs=("context",)),
+    # Before "git status": "what did I change today" contains no git-status
+    # phrase, but the standup regex is anchored and the safer first match.
+    Command("standup", standup.STANDUP_RX.match, _h_standup,
+            needs=("context",)),
+    Command("gpu reclaim", _GPU_RECLAIM_RX.match, _h_gpu_reclaim,
+            needs=("brain",)),
+    Command("gpu lend", _GPU_LEND_RX.match, _h_gpu_lend, needs=("brain",)),
     Command("git status",
             _m_contains("git status", "what's changed", "whats changed",
                         "repo status"),
@@ -1903,7 +2008,8 @@ ASSISTANT_TIER1: list[Command] = [
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
-                    "take note", "show notes", "answer question", "remind me")
+                    "take note", "show notes", "answer question", "remind me",
+                    "standup", "gpu reclaim", "gpu lend")
 ]
 
 
