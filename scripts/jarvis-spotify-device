@@ -14,6 +14,9 @@ set -o pipefail
 # ~/.local/bin, which is not on the default unit PATH.
 export PATH="$HOME/.local/bin:/usr/bin:/bin"
 NAME="${LIBRESPOT_NAME:-Spark}"
+# Through the echo-cancelling sink when it exists, so music is subtracted
+# from Jarvis's mic too; the plain default otherwise.
+DEV=""; pactl list short sinks 2>/dev/null | grep -q jarvis_aec_sink && DEV="--device=jarvis_aec_sink"
 
 librespot \
     --name "$NAME" \
@@ -23,5 +26,5 @@ librespot \
     --initial-volume 60 \
     --cache "$HOME/.cache/librespot" \
     --disable-audio-cache \
-  | pacat --raw --rate=44100 --channels=2 --format=s16le \
+  | pacat $DEV --raw --rate=44100 --channels=2 --format=s16le \
           --latency-msec=200 --stream-name="Spotify ($NAME)"

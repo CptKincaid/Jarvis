@@ -64,7 +64,10 @@ class MeetingHeadsUp:
         if cal is None:
             return 0
         try:
-            if hasattr(cal, "configured") and not cal.configured():
+            conf = getattr(cal, "configured", True)
+            if callable(conf):                 # CalendarSource exposes a property;
+                conf = conf()                  # a fake may expose a method
+            if not conf:
                 return 0
             events = list(cal.events())
         except Exception:

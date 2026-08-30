@@ -238,10 +238,16 @@ def test_asking_for_the_briefing_counts_as_delivered(monkeypatch, tmp_path):
 
 # -------------------------------------------------------- meeting heads-up
 class _Cal:
+    """CalendarSource exposes `configured` as a PROPERTY: the first version
+    of the heads-up called it, and every tick died with 'bool' object is
+    not callable (live, 2026-08-30 05:54)."""
     def __init__(self, events):
         self._events = events
+
+    @property
     def configured(self):
         return True
+
     def events(self):
         return self._events
 
