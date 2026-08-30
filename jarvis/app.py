@@ -59,6 +59,7 @@ from jarvis.logs import get_logger
 from jarvis import brain as brain_mod
 from jarvis import desktop as desktop_mod
 from jarvis import speak_queue, standup, voice_check
+from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
@@ -271,7 +272,12 @@ class JarvisApp:
         # nothing no matter how the settings are configured.
         self.speaker.load()
         self.recorder = Recorder(self.arbiter, speaker_verifier=self.speaker)
-        self.transcriber = Transcriber()
+        # prompt_provider: every transcription's initial_prompt is built
+        # per turn from his own vocabulary — taught names, corrections,
+        # calendar titles, cached Canvas courses (jarvis/vocab.py) —
+        # instead of the static warehouse DEFAULT_VOCAB the V3 port
+        # carried over from VSS.
+        self.transcriber = Transcriber(prompt_provider=vocab_mod.build_prompt)
         # speaker= gates the wake word itself: a non-enrolled voice never
         # reaches _on_hotword, so the TV no longer opens a recording at all.
         self.hotword = Hotword(self.arbiter, self._mic_index, self._on_hotword,

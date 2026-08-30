@@ -640,3 +640,23 @@ def test_find_next_exam_survives_a_canvas_outage_and_a_bad_token():
     exam, checked = cv.find_next_exam(_cfg(), None, "exam", now=NOW,
                                       fetch=FakeFetch({PLANNER_URL + "?": OSError("down")}))
     assert exam is None and checked
+
+
+# ---------------------------------------------------- cached course names
+def test_cached_course_names_is_empty_before_any_fetch():
+    cv.clear_cache()
+    assert cv.cached_course_names() == []
+
+
+def test_cached_course_names_tidies_and_dedupes(monkeypatch):
+    cv.clear_cache()
+    cv._COURSES["https://canvas.tamu.edu"] = (cv._clock(), [
+        {"id": 1, "name": "BMEN 420 500 BIOSENSORS FA26"},
+        {"id": 2, "name": "BMEN 420 501 BIOSENSORS FA26"},
+        {"id": 3, "name": "ECEN 749 MAGNETIC RESONANCE ENGR SP26"},
+    ])
+    try:
+        assert cv.cached_course_names() == ["BIOSENSORS",
+                                            "MAGNETIC RESONANCE ENGR"]
+    finally:
+        cv.clear_cache()

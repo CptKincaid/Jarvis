@@ -29,6 +29,10 @@ class PATHS:
     SCREEN_DIR = Path("/tmp/vss_screen")
     SETTINGS_FILE = AIWS / "voice_settings.json"
     VOCAB_FILE = AIWS / "voice_vocab.txt"
+    # Names taught by voice ("my advisor's name is spelled P-E-Y-R-O-V-I")
+    # and "add X to your vocabulary"; one per line, append-only. Read by
+    # jarvis/vocab.py into the Whisper prompt alongside VOCAB_FILE.
+    NAMES_FILE = AIWS / "voice_names.txt"
     # JARVIS_MEMORY_DIR keeps the test suite (tests/conftest.py) out of the
     # user's real ~/.aiws_trainer/jarvis_memory: the timekeeper / notes /
     # claude-project state, the typed history and the memory store all hang
