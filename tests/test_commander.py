@@ -1199,3 +1199,20 @@ def test_a_web_cue_by_voice_skips_the_intent_gate(rich, services, monkeypatch):
     res = rich.handle("look up who won the last formula one race", source="voice")
     services.brain.web_answer.assert_called_once()
     assert res.done is False and res.ack
+
+
+# --------------------------------------------------- "what's Claude doing?"
+def test_the_status_question_speaks_the_managers_digest(rich, services):
+    """Router action status_text -> ClaudeSessionManager.status_text(), and
+    the string it returns IS the reply (no persona paraphrase, no task)."""
+    digest = "Claude's working on jarvis, sir; started just now, 2 files touched so far."
+    services.claude.status_text.return_value = digest
+    for text in ("what's claude doing?", "jarvis, how's claude getting on",
+                 "is claude still working"):
+        services.claude.reset_mock()
+        services.claude.status_text.return_value = digest
+        res = rich.handle(text, source="typed")
+        assert services.claude.status_text.call_count == 1, text
+        assert res.handled and res.speak and res.reply == digest, text
+        assert res.done is True
+        services.claude.submit.assert_not_called()

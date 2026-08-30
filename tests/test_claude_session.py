@@ -1658,3 +1658,116 @@ def test_ensure_project_settings_refuses_config_dirs(work):
             == cs.UNSAFE_DIR_LINE
     finally:
         m.close()
+
+
+# ------------------------------------------------- "what's Claude doing?"
+def test_status_text_digests_the_live_task(work):
+    """One line from live state: project, elapsed, files touched, the last
+    milestone SPOKEN (kept on the Task, not the app), an in-pane question,
+    and the queue.  Nothing here needs a tmux round trip for the task."""
+    m = make_manager(work, Recorder())
+    try:
+        t = cs.Task(task_id="t1", project="alpha", prompt="fix it", model="opus",
+                    state="running", started=m._now() - 130,
+                    files_touched={"/a/router.py", "/a/tests/test_router.py"},
+                    last_spoken="Editing router.py, sir.")
+        with m._lock:
+            m._tasks[t.task_id] = t
+            m._running[t.task_id] = t
+        line = m.status_text()
+        assert line == ("Claude's working on alpha, sir; started two minutes ago, "
+                        "2 files touched so far; the last word was: Editing router.py.")
+        t.question = "Which branch should I use?"
+        assert "it's sitting on a question: Which branch should I use?" in m.status_text()
+        # a permission prompt (state waiting) outranks the in-pane question
+        t.state = "waiting"
+        line = m.status_text()
+        assert line.startswith("Claude's waiting on you about alpha, sir")
+        assert "sitting on a question" not in line
+        # the queue is still counted
+        with m._lock:
+            m._queue.append(cs.Task(task_id="t2", project="alpha", prompt="next", model="opus"))
+        assert m.status_text().endswith("One more is queued.")
+    finally:
+        m.close()
+
+
+def test_status_text_idle_uses_the_prewarmed_line(work):
+    m = make_manager(work, Recorder())
+    try:
+        assert cs.IDLE_LINE == "Claude's idle, sir."
+        assert m.status_text().startswith(cs.IDLE_LINE[:-1])
+    finally:
+        m.close()
+
+
+def test_status_text_reports_the_users_own_cc_sessions(work):
+    """~/.bashrc names the user's own Claude terminals cc-<dir>; Jarvis did
+    not start them but the status can still say whether they are mid-turn.
+    The probe is by full session name (the jarvis- prefix does not apply)."""
+    rec = Recorder()
+
+    def run(argv, **kw):
+        if argv[:2] == ["tmux", "list-sessions"]:
+            return subprocess.CompletedProcess(argv, 0, "jarvis-alpha\ncc-hunterp\ncc-vss\n", "")
+        if argv[:2] == ["tmux", "capture-pane"] and argv[-1].startswith("cc-"):
+            pane = Recorder.WORKING_PANE if argv[-1] == "cc-hunterp" else Recorder.READY_PANE
+            return subprocess.CompletedProcess(argv, 0, pane, "")
+        return rec(argv, **kw)
+
+    m = make_manager(work, run)
+    try:
+        assert m.own_sessions() == [("cc-hunterp", True), ("cc-vss", False)]
+        line = m.status_text()
+        assert line.endswith("And your own cc-hunterp is mid-turn, your own cc-vss is idle.")
+        assert line.startswith(cs.IDLE_LINE[:-1])
+    finally:
+        m.close()
+
+
+def test_status_text_survives_a_dead_tmux(work):
+    def run(argv, **kw):
+        if argv[:2] == ["tmux", "list-sessions"]:
+            return subprocess.CompletedProcess(argv, 1, "", "no server running")
+        return Recorder()(argv, **kw)
+    m = make_manager(work, run)
+    try:
+        assert m.own_sessions() == []
+        assert "your own" not in m.status_text()
+    finally:
+        m.close()
+
+
+def test_milestones_and_questions_are_kept_on_the_task():
+    """parse_stream_event records the last SPOKEN milestone and an in-pane
+    AskUserQuestion on the task; the question clears when its tool_result
+    arrives (answered in the terminal).  The 20 s limiter's silenced lines
+    are not "spoken" and so are not recorded."""
+    t = cs.Task(task_id="t", project="p", prompt="x", model="opus")
+    ev = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "q1", "name": "AskUserQuestion",
+         "input": {"questions": [{"question": "Which one?"}]}}]}}
+    lines = cs.parse_stream_event(ev, t, now=100.0)
+    assert any(p.milestone for p in lines)
+    assert t.question == "Which one?"
+    assert t.last_spoken.startswith("Claude has a question, sir: Which one?")
+    # an exempt milestone (the question) does not consume the limiter, so
+    # the first edit right after it is spoken...
+    edit = {"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "id": "e1", "name": "Edit", "input": {"file_path": "/p/a.py"}}]}}
+    cs.parse_stream_event(edit, t, now=101.0)
+    assert t.last_spoken == "Editing a.py, sir."
+    cs.parse_stream_event({"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "q1", "content": "the first"}]}}, t, now=102.0)
+    assert t.question == ""
+    # ...and the next edit within 20 s is coalesced (not spoken, not recorded)
+    edit["message"]["content"][0]["input"]["file_path"] = "/p/b.py"
+    edit["message"]["content"][0]["id"] = "e2"
+    lines = cs.parse_stream_event(edit, t, now=103.0)
+    assert not any(p.milestone for p in lines)
+    assert t.last_spoken == "Editing a.py, sir."
+    edit["message"]["content"][0]["input"]["file_path"] = "/p/c.py"
+    edit["message"]["content"][0]["id"] = "e3"
+    lines = cs.parse_stream_event(edit, t, now=130.0)
+    assert any(p.milestone and p.line == "Editing b.py and c.py, sir." for p in lines)
+    assert t.last_spoken == "Editing b.py and c.py, sir."

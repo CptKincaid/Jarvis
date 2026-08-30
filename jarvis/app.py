@@ -403,7 +403,7 @@ class JarvisApp:
                 # BUSY_LINE is a {project} template — never prewarmed.
                 ("jarvis.claude_session", ("CANCELLED_LINE", "NO_PROJECT_LINE",
                                            "OUTSIDE_LINE", "UNSAFE_DIR_LINE",
-                                           "NO_SESSION_LINE")),
+                                           "NO_SESSION_LINE", "IDLE_LINE")),
                 ("jarvis.approvals", ("TIMEOUT_LINE", "ALLOWED_LINE",
                                       "DECLINED_LINE")),
                 ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE",

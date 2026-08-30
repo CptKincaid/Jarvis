@@ -292,6 +292,18 @@ directory. Two equal candidates get one question naming both.
 **The terminal button** (next to the mic) opens the tmux session Claude is
 working in; a second click raises the same window.
 
+**"What's Claude doing?"** — also "how's Claude getting on", "is Claude still
+working", "is Claude done yet", "any word from Claude", "Claude status". One
+spoken line from live state: the project, how long ago it started, how many
+files it has touched, the last milestone Jarvis spoke ("the last word was:
+Editing router.py"), whether Claude is sitting on an in-pane question (the
+AskUserQuestion menu — answer it in the terminal; a permission prompt is
+spoken separately and reads "waiting on you about"), how many tasks are
+queued, and whether your OWN `cc-<dir>` tmux sessions (the `claude` wrapper
+in `~/.bashrc`) are mid-turn or idle. With nothing running: "Claude's idle,
+sir; the active project is jarvis." A plain "status" or "status report" is not
+this question — that stays the persona's own status line.
+
 ### Web lookups
 
 "Look up …", "search the web for …", "who won …", "what's the latest news about …",
