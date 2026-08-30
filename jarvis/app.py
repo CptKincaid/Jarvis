@@ -286,6 +286,7 @@ class JarvisApp:
         # dropped and resolve_uncertain (and the classifier feedback it feeds)
         # is never reached from the running app at all.
         self.commander.on_uncertain = self._on_uncertain
+        self.commander.claim_uncertain = self._claim_uncertain
         self._pending_uncertain: dict = {}      # request_id -> utterance
         self._uncertain_lock = threading.Lock()
         # Set while a captured clip is being transcribed. recorder.recording
@@ -641,6 +642,9 @@ class JarvisApp:
             think=lambda text: b.think(text, callback=app._on_brain_tags),
             chat=chat,
             web_answer=web_answer,
+            # "no, I said ...": the misheard turn's model job is cut so its
+            # reply is neither spoken nor remembered (brain job generation).
+            cancel=lambda: app.brain.cancel(),
             # Delegate lazily rather than capturing the bound methods: the
             # namespace is built once at init, so a snapshot here would make
             # `app.brain.<fn> = ...` (tests, and any later brain swap) a no-op
@@ -666,6 +670,9 @@ class JarvisApp:
             context_engine=self.context,
             workflows=workflows_ns, brain=brain_ns, tts=self.tts,
             reader=self.reader, history=self.history,
+            # the ContextEngine itself (`context` above is the agent's
+            # namespace): corrections drop the misheard exchange from it
+            conversation=self.context,
             # personal assistant (spec 2.2)
             assistant=self.assistant, tools=self.tools, router=self.router,
             timekeeper=self.timekeeper, notes=self.notes, claude=self.claude,
@@ -1211,6 +1218,9 @@ class JarvisApp:
 
     def _after_dispatch(self, text, source, result):
         """Bookkeeping once a command has been handled synchronously."""
+        # "no, I said X" / "that was for you" answered X, not the words
+        # said: the exchange is remembered under X.
+        text = getattr(result, "corrected", None) or text
         reply = getattr(result, "reply", None)
         done = getattr(result, "done", True) is not False
         status = result.status or ""
@@ -1579,7 +1589,7 @@ class JarvisApp:
                 self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))
-                self._dispatch(text, "voice")
+                self._dispatch(text, "voice", confidence=result.confidence)
             elif not result.accepted and text:
                 # Garbled, not silent: say so and re-open the mic rather
                 # than routing "by Agenda 4.2.6" or going quiet -- once.
@@ -1631,15 +1641,21 @@ class JarvisApp:
     _thinking_delay_s = THINKING_DELAY_S
     _turn_timeout_s = TURN_TIMEOUT_S
 
-    def _dispatch(self, text, source):
+    def _dispatch(self, text, source, confidence=None):
         # Voice only: a typed answer is visible as it arrives, so being told to
         # wait is just noise.
         self._last_user_text, self._last_source = text, source
         if source == "voice":
             self._turn_start()
             self.turns.mark("handle")
+        # The Whisper avg_logprob travels only when there is one: typed
+        # text has none, and a stand-in commander need not take the keyword.
+        kw = {} if confidence is None else {"confidence": confidence}
         try:
-            result = self._emit_result(self.commander.handle(text, source))
+            result = self._emit_result(self.commander.handle(text, source, **kw))
+            corrected = getattr(result, "corrected", None)
+            if corrected:
+                self._last_user_text = corrected
             if source == "voice":
                 self._turn_after_result(result)
             self._after_dispatch(text, source, result)
@@ -1781,6 +1797,18 @@ class JarvisApp:
             self.uncertain_answer(rid, answer, source="voice")
         except Exception:
             log.exception("uncertain follow-up failed")
+
+    def _claim_uncertain(self, yes: bool) -> bool:
+        """Commander hook: a spoken "that was for you" / "that wasn't for
+        you" settles the open card. The commander logs the label and routes
+        the utterance itself; this only closes the cards and tells the UI.
+        Returns whether one was waiting."""
+        with self._uncertain_lock:
+            stale = list(self._pending_uncertain)
+            self._pending_uncertain.clear()
+        for rid in stale:
+            bus.publish(UncertainResolved(request_id=rid, yes=yes, source="voice"))
+        return bool(stale)
 
     def uncertain_answer(self, request_id: str, yes: bool, source: str = "ui"):
         """Answer the open prompt. First answer wins -- the card and the

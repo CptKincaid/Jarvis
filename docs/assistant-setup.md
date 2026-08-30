@@ -795,6 +795,51 @@ still answers while the GPU is lent out (section 16). Nothing to configure:
 the repo list follows section 9. *"Git status"* now reports the Jarvis
 repository (it used to be hard-wired to the VSS tree).
 
+## 26. Faster calendar, weather and time-in-city answers
+
+Nothing to set up. When the router already knows the tool — a read-only calendar
+question, a weather question, "what's the time in London" — the commander forces the
+tool call and only the render turn runs, so the answer lands ~1 s sooner. It stands
+down for a write ("book a meeting"), a second clause ("… and what's the weather") or a
+lowercase city, which take the full loop as before. Look for `route short-cut:` in the
+log.
+
+## 27. Corrections: "no, I said …"
+
+Say "no, I said …", "I meant …", or "not X, Y" (with the comma) — typed, on Discord, or
+by voice within a minute of the last turn. Jarvis stops talking, drops the misheard
+exchange from his short-term memory and answers what you meant. Pairs are kept in
+`~/.aiws_trainer/jarvis_memory/corrections.json`.
+
+```json
+"corrections": {"learn_vocab": false}
+```
+
+`learn_vocab: true` also adds new capitalised words from a correction ("Peyrovi") to the
+Whisper vocabulary prompt (`~/.aiws_trainer/voice_vocab.txt`), so the next attempt decodes
+the name. Off by default: Whisper's casing on a misheard name is itself a guess.
+
+## 28. Teaching the intent gate: "that was for you"
+
+If a command was dropped as background chat (nothing happens), say "Jarvis, that was for
+you" within 20 s: he runs it and remembers the words as his. If he answered something you
+said to someone else, "that wasn't for you" / "not you" within a minute stops him and
+remembers that too. Labels go to `~/.aiws_trainer/intent_log.json` (what the classifier
+reads) with an audit line in `~/.aiws_trainer/jarvis_memory/feedback.jsonl`. "That was for
+you" also answers the spoken "Was that for me?" window.
+
+## 29. Read-back before a bulk cancel or list wipe
+
+```json
+"confirm": {"read_back": true, "shaky_logprob": -0.7}
+```
+
+"Cancel all my alarms" with more than one alarm, or "clear my list" with more than one
+to-do, is read back — "Cancel all three alarms, sir?" — and waits for a yes through the
+follow-up window; "no" or any other subject drops it, and so does a yes a minute later. A
+transcript scoring under `shaky_logprob` is read back even for one item. A single "cancel
+the timer" never is. `read_back: false` turns it off.
+
 ---
 
 ## 18. Quiet hours and do not disturb

@@ -1197,14 +1197,22 @@ class JarvisBrain:
             return None
         gen = self._job_gen                   # this job's identity, for cancel()
 
+        def _live():
+            # cancel() then a new job: the new acquire resets _cancelled,
+            # so the flag alone let the dead job's reply be remembered and
+            # spoken over the live one (a "no, I said ..." correction
+            # re-dispatches within milliseconds). The generation cannot be
+            # reset back.
+            return not self._cancelled and self._job_gen == gen
+
         def _process():
             bus.publish(BrainState(state="thinking"))
             try:
                 tags = self._chat_sync(text, force_tool=force_tool,
                                        force_args=force_args,
                                        max_rounds=max_rounds,
-                                       on_sentence=on_sentence)
-                if self._cancelled:
+                                       on_sentence=on_sentence, gen=gen)
+                if not _live():
                     log.info("chat cancelled; dropping result")
                     return
                 self._remember(text, tags)
@@ -1215,7 +1223,7 @@ class JarvisBrain:
                 # it is unread text (and sometimes third-party text) that
                 # used to be read aloud verbatim. The log has the detail.
                 log.exception("chat error")
-                if callback and not self._cancelled:
+                if callback and _live():
                     callback([("SPEAK", INTERNAL_ERROR_LINE)])
             finally:
                 # cancel() (barge-in) already released the guard, and a
@@ -1524,8 +1532,14 @@ class JarvisBrain:
             args = {}
         return name, args
 
+    def _stale(self, gen=None) -> bool:
+        """True once this job was cancelled OR superseded by a newer one
+        (its generation moved on): the shared _cancelled flag is reset by
+        the next acquire, the generation is not."""
+        return self._cancelled or (gen is not None and self._job_gen != gen)
+
     def _chat_sync(self, text, force_tool=None, force_args=None, max_rounds=3,
-                   on_sentence=None):
+                   on_sentence=None, gen=None):
         """The tool loop (spec 4.2), synchronous. Returns tags.
 
         ``on_sentence(sentence)``: when given, the final model turn is
@@ -1640,11 +1654,12 @@ class JarvisBrain:
                     round_sentences = []
                     try:
                         data, content, calls = self._stream_round(
-                            messages, tools, cap, on_sentence, round_sentences, guard)
+                            messages, tools, cap, on_sentence, round_sentences, guard,
+                            gen=gen)
                     finally:
                         # kept even when the stream dies: they were spoken
                         streamed_sentences.extend(round_sentences)
-                    if self._cancelled:
+                    if self._stale(gen):
                         final = ""            # barged in: nothing more to say
                         break
                 else:
@@ -1760,7 +1775,7 @@ class JarvisBrain:
         return tags
 
     def _stream_round(self, messages, tools, cap, on_sentence, streamed,
-                      guard=None):
+                      guard=None, gen=None):
         """One /api/chat round, streamed. Complete sentences go to
         on_sentence as they land (guarded per sentence, capped at ``cap``);
         a round that turns out to be a tool call speaks nothing. Returns
@@ -1773,7 +1788,7 @@ class JarvisBrain:
                               timeout=OLLAMA_TIMEOUT_S)
         try:
             for chunk in stream:
-                if self._cancelled:
+                if self._stale(gen):
                     log.info("chat: cancelled mid-stream")
                     break
                 err = chunk.get("error")
@@ -1802,7 +1817,7 @@ class JarvisBrain:
                     break
         finally:
             stream.close()                    # a broken-off stream frees its socket
-        if not calls and buf.strip() and not self._cancelled:
+        if not calls and buf.strip() and not self._stale(gen):
             self._emit_sentence(buf, cap, on_sentence, streamed, guard)
         data = dict(last)
         data["message"] = {"role": "assistant", "content": content,

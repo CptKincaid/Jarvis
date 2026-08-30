@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from jarvis.logs import get_logger
+from jarvis.tools.location import cfg_get
 from jarvis.tools.registry import ToolResult, ToolSpec
 
 log = get_logger("tools.notes")
@@ -148,6 +149,10 @@ def parse_which(which) -> tuple[str, object]:
 class NotesStore:
     """SQLite-backed notes and to-dos. Thread-safe (one lock, one
     connection with check_same_thread=False)."""
+
+    # A whole-list clear waiting for a spoken yes ({"kind", "n", "ts"}),
+    # set by the tool and consumed by Commander._try_destructive_confirm.
+    pending_clear = None
 
     def __init__(self, db_path):
         self.db_path = Path(db_path).expanduser()
@@ -475,6 +480,20 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text=line, speak=line)
         if act == "remove":
             target = which if which not in (None, "") else (text or "last")
+            mode, _ = parse_which(target)
+            if mode == "all":
+                # Read a whole-list wipe back before doing it: a bare
+                # "clear" used to empty the list on the first transcript.
+                # The store carries the offer (the commander sees the same
+                # object as services.notes) and the next spoken yes runs
+                # it -- the pattern calendar.py uses for pending_event.
+                # A one-item list is not worth the question.
+                n = s.count(k)
+                if n > 1 and cfg_get(cfg, "confirm.read_back", True) is not False:
+                    s.pending_clear = {"kind": k, "n": n, "ts": time.time()}
+                    line = f"Clear all {number_word(n)} {_plural(k, n)}, sir?"
+                    return ToolResult(text=f"asked before clearing {n} {k}s", speak=line)
+            s.pending_clear = None
             removed = s.remove(k, target)
             if not removed:
                 line = "I couldn't find that one, sir."

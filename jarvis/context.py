@@ -289,6 +289,22 @@ class ContextEngine:
         rows.sort(key=lambda r: r["_when"])
         return rows
 
+    def forget_exchange(self, user_text) -> bool:
+        """Drop the most recent exchange whose user line is ``user_text``.
+
+        A misheard turn ("no, I said ...") would otherwise stay in the
+        model's window paired with the reply it earned, and "what about
+        tomorrow?" would follow the wrong question. True when one was
+        removed."""
+        want = (user_text or "")[:200]
+        if not want:
+            return False
+        for i in range(len(self._conversation) - 1, -1, -1):
+            if self._conversation[i].get("user") == want:
+                del self._conversation[i]
+                return True
+        return False
+
     def _recent_conversation(self, limit=10):
         """The last exchanges that are still fresh (CONVERSATION_TTL_S)."""
         cutoff = datetime.now().timestamp() - self.CONVERSATION_TTL_S

@@ -517,6 +517,10 @@ class CommandResult:
     status: Optional[str] = None      # short status-strip text
     done: bool = True                 # False → async work still in flight
     ack: bool = False                 # `reply` acknowledges; the answer follows
+    # Set when the result answers a DIFFERENT utterance than the one
+    # handled: "no, I said X" re-dispatches X, "that was for you" re-runs
+    # the dropped command. The app records the exchange under this text.
+    corrected: Optional[str] = None
 
 
 @dataclass
@@ -1659,16 +1663,42 @@ def _h_list_schedule(c, t, m):
                          status="Schedule")
 
 
-def _h_cancel_schedule(c, t, m):
-    tk = c._svc("timekeeper")
-    if tk is None:
-        return None
-    word = m.group("kind").lower()
-    kind = "reminder" if word.startswith("remind") else \
-        "timer" if word.startswith("timer") else "alarm"
-    which = (m.group("which") or "").strip()
-    if m.group("all") or (not which and word.endswith("s")):
-        which = "all"
+# Destructive read-back (2026-08-30). A bulk cancel used to run on the first
+# transcript, even one that scraped past the confidence gate; "cancel all
+# alarms" now reads back "Cancel all three alarms, sir?" and waits for a
+# yes. The follow-up window the app opens after any spoken reply is the
+# VAD-timed yes/no: a one-second "yes" costs one second. Only whole-list
+# actions with more than one item (or a shaky transcript) are read back --
+# a single timer is never worth the question, and a mis-cancelled one
+# costs nothing to set again.
+DESTRUCTIVE_TTL_S = 60.0
+_COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten", "eleven", "twelve")
+
+
+def _count_word(n: int) -> str:
+    return _COUNT_WORDS[n] if 0 <= n < len(_COUNT_WORDS) else str(n)
+
+
+def _pending_count(tk, kind: str) -> int:
+    """How many live items a whole-list cancel would take. 0 when the
+    timekeeper cannot say (an older stand-in without list())."""
+    try:
+        items = tk.list(kind)
+        return len(items)
+    except Exception:
+        return 0
+
+
+def _wants_read_back(c, n: int) -> bool:
+    if not _assistant_get(c, "confirm.read_back", True):
+        return False
+    if n > 1:
+        return True
+    return n == 1 and c.shaky_transcript()
+
+
+def _do_cancel_schedule(tk, which: str, kind: str) -> CommandResult:
     n = tk.cancel(which or "last", kind)
     try:
         n = int(n)
@@ -1680,6 +1710,28 @@ def _h_cancel_schedule(c, t, m):
     line = "Cancelled, sir." if n == 1 else f"Cancelled {n}, sir."
     return CommandResult(handled=True, reply=line, speak=True,
                          status=f"Cancelled {n} {kind}{'s' if n > 1 else ''}")
+
+
+def _h_cancel_schedule(c, t, m):
+    tk = c._svc("timekeeper")
+    if tk is None:
+        return None
+    word = m.group("kind").lower()
+    kind = "reminder" if word.startswith("remind") else \
+        "timer" if word.startswith("timer") else "alarm"
+    which = (m.group("which") or "").strip()
+    if m.group("all") or (not which and word.endswith("s")):
+        which = "all"
+    if which == "all":
+        n = _pending_count(tk, kind)
+        if _wants_read_back(c, n):
+            # n == 1 only on a shaky transcript: "all one alarm" reads badly
+            line = f"Cancel the {kind}, sir?" if n == 1 else \
+                f"Cancel all {_count_word(n)} {kind}s, sir?"
+            c.stash_destructive(lambda: _do_cancel_schedule(tk, "all", kind), line)
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status="Confirm?")
+    return _do_cancel_schedule(tk, which, kind)
 
 
 def _h_briefing(c, t, m):
@@ -2968,7 +3020,10 @@ _YES_WORDS = ("yes", "yeah", "yep", "yup", "sure", "correct", "affirmative",
               "aye", "certainly")
 # "for you" / "that was" are deliberately absent: they are substrings of
 # "not for you" and "that wasn't", so they would fight the negatives.
-_YES_PHRASES = ("go ahead", "please do", "do it")
+# "was for you" is safe: "wasn't for you" / "was not for you" do not
+# contain it, and the negatives still win a contradictory reply.
+_YES_PHRASES = ("go ahead", "please do", "do it", "was for you", "meant for you",
+                "asking you")
 _NO_WORDS = ("no", "nope", "nah", "negative", "wasnt", "wasn't")
 _NO_PHRASES = ("never mind", "nevermind", "ignore that", "forget it",
                "not for you", "not you", "talking to")
@@ -3006,6 +3061,242 @@ def parse_yes_no(text):
     return yes
 
 
+# ------------------------------------------------------------------
+# Route short-cuts: the router already named the tool (2026-08-30)
+# ------------------------------------------------------------------
+# For "what's on my calendar tomorrow?" the router says local:calendar and
+# the brain then spends a model turn choosing get_calendar (0.98-1.45 s
+# live, 2026-08-29) before a second turn renders the result. When the cue
+# class names the tool AND the arguments are in the sentence, the call is
+# forced (brain.chat force_tool/force_args, the path get_briefing and
+# get_mail already use) and only the render turn runs. The render turn is
+# kept on purpose: tool text can carry a stranger's words (calendar titles)
+# and brain.py never speaks it raw. Deliberately narrow -- a write verb, a
+# second clause or a city the regex is not sure of falls back to the full
+# loop, which is slower but cannot be wrong in a new way.
+_CAL_READ_RX = re.compile(
+    r"\b(?:what(?:'s| is|s| do i have| have i got)?|anything|any|do i have|"
+    r"have i got|is there|are there|show me|read me|check|list|tell me|"
+    r"when(?:'s| is)?|how many)\b.*"
+    r"\b(?:calendar|schedule|agenda|meetings?|appointments?|events?|plans?)\b"
+    r"|\bon (?:my |the )?(?:calendar|schedule|agenda)\b"
+    r"|\bnext (?:meeting|appointment|event)\b", re.I)
+# A write: the verb leads the clause ("schedule a meeting", "can you add
+# ...") or is unambiguous anywhere. "schedule" the noun ("what's on my
+# schedule") must not count, so the noun-like verbs are start-anchored.
+_CAL_WRITE_RX = re.compile(
+    r"^(?:(?:please|jarvis|can you|could you|would you|will you|go ahead and)"
+    r"[,\s]+)*(?:schedule|book|put|add|create|set up|make|move|reschedule|"
+    r"change|edit|update|block|pencil)\b"
+    r"|\b(?:book|reschedule|cancel|delete|remove|rename|invite|postpone|clear)\b",
+    re.I)
+# A second clause means a second intent: the full loop handles both.
+_CLAUSE_RX = re.compile(r",\s*and\b|\band\b|\balso\b|\bthen\b|\bplus\b|"
+                        r"\bas well as\b|;", re.I)
+# "in London", "at Salt Lake City", "for Paris": a capitalised run after a
+# place preposition. Whisper capitalises the places it knows; a lowercase
+# candidate ("in london", typed) is NOT trusted as a city and is left to
+# the model rather than geocoded blind.
+_PLACE_RX = re.compile(
+    r"\b(?:in|at|for|over in|out in)\s+"
+    r"(?P<place>[A-Za-z][\w'.-]*(?:\s+[A-Z][\w'.-]*)*)")
+_NOT_A_PLACE = {
+    "the", "a", "an", "my", "our", "your", "his", "her", "their", "this", "that",
+    "these", "those", "here", "there", "home", "town", "work", "school", "bed",
+    "today", "tomorrow", "tonight", "now", "noon", "midnight", "morning",
+    "afternoon", "evening", "night", "lunch", "dinner", "breakfast", "next",
+    "last", "least", "all", "me", "us", "him", "them", "it", "present",
+    "general", "celsius", "fahrenheit", "degrees", "case", "once", "about",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "christmas", "easter",
+    "weekend", "week", "month", "year", "hour", "minute", "moment", "while",
+    "sir", "jarvis", "hunter",
+}
+
+
+def place_in(text: str) -> Optional[str]:
+    """The city named after in/at/for, as the tool wants it.
+
+    "" when the sentence names no place (home), the city when it is
+    capitalised, None when a lowercase candidate makes the answer unsure
+    ("in london" typed, "in a while") -- the caller then does not force."""
+    for m in _PLACE_RX.finditer(text or ""):
+        place = m.group("place").strip(" .,!?")
+        head = place.split()[0].lower().strip(".") if place else ""
+        if not head or head in _NOT_A_PLACE:
+            continue
+        if place[0].isupper():
+            return place
+        return None
+    return ""
+
+
+def calendar_range(text: str) -> str:
+    """coerce_range over the whole utterance, with one repair: "when's my
+    meeting" carries no day, and today is the wrong default for a "when"
+    question -- the first upcoming event is."""
+    from jarvis.tools.calendar import coerce_range
+    rng = coerce_range(text)
+    t = (text or "").lower()
+    if rng == "today" and re.match(r"^\s*when", t) and not re.search(
+            r"\btoday\b|tonight|this (?:morning|afternoon|evening)|later", t):
+        return "next"
+    return rng
+
+
+def weather_when(text: str) -> str:
+    """The weather tool's when= from the utterance. Explicit day words win;
+    a bare "forecast" is tomorrow-and-on, not this minute."""
+    t = (text or "").lower()
+    if "tomorrow" in t:
+        return "tomorrow"
+    if re.search(r"\bweek\b|7 day|seven day|weekend|next few days", t):
+        return "week"
+    if re.search(r"\btoday\b|tonight|this (?:evening|afternoon|morning)|"
+                 r"\blater\b|rest of the day", t):
+        return "today"
+    if "forecast" in t:
+        return "today"
+    return "now"
+
+
+def forced_call(reason: str, text: str) -> Optional[tuple]:
+    """(tool, args) when the router's reason names the tool and the
+    utterance carries its arguments; None to run the full tool loop."""
+    t = (text or "").strip()
+    if not t or _CLAUSE_RX.search(t):
+        return None
+    if reason == "local:calendar":
+        if not _CAL_READ_RX.search(t) or _CAL_WRITE_RX.search(t):
+            return None
+        return "get_calendar", {"range": calendar_range(t)}
+    if reason == "local:weather":
+        place = place_in(t)
+        if place is None:
+            return None
+        return "get_weather", {"when": weather_when(t), "location": place}
+    if reason == "local:clock":
+        # The home clock never gets here (Tier-1 _h_clock); what does is
+        # "the time in <city>" -- and "what year is it", which has no
+        # city and is left to the model.
+        place = place_in(t)
+        if not place:
+            return None
+        return "get_time", {"location": place}
+    return None
+
+
+# ------------------------------------------------------------------
+# Corrections: "no, I said ..." (2026-08-30)
+# ------------------------------------------------------------------
+# A misheard transcript used to stay in the model's window paired with
+# the reply it earned, and the only recourse was to wake Jarvis and say
+# the whole thing again. The correction re-dispatches the meant text with
+# the classifier bypassed (a correction is addressed to Jarvis by
+# construction), cuts the reply in flight, forgets the misheard exchange
+# and logs the (heard, meant) pair for a later vocab tune. Matched on the
+# raw text ahead of the yes/no stages, which would eat "no, I said X" as
+# a plain decline.
+CORRECTION_WINDOW_S = 60.0
+_CORRECTION_RX = re.compile(
+    r"^(?:(?:no|nope|nah)[,.!]?\s+)?"
+    r"(?:i\s+(?:said|meant|mean|actually said|was saying)|"
+    r"what i (?:said|meant) was|that'?s not what i said[,.]?\s*(?:i said)?)"
+    r"(?!\s+(?:to|it|that|you|nothing|so|this)\b)"
+    r"[,:]?\s+(?P<meant>.+?)[.!?]*$", re.I)
+# "not the terminal, the calendar": the comma is load-bearing; without it
+# "not now" and "not really" are plain sentences.
+_CORRECTION_NOT_RX = re.compile(
+    r"^(?:no[,.!]?\s+)?not\s+(?P<heard>[^,]{1,60}),\s*(?P<meant>.+?)[.!?]*$", re.I)
+
+
+def correction_kind(text: str) -> Optional[str]:
+    """The meant text when the utterance is a correction, else None."""
+    t = (text or "").strip()
+    m = _CORRECTION_RX.match(t) or _CORRECTION_NOT_RX.match(t)
+    if not m:
+        return None
+    meant = m.group("meant").strip(" ,")
+    return meant or None
+
+
+# Words that are capitalised for reasons other than being a name.
+_VOCAB_STOP = {
+    "i", "i'm", "i'll", "i've", "i'd", "jarvis", "the", "what", "what's", "how",
+    "when", "where", "who", "why", "which", "can", "could", "would", "will",
+    "please", "yes", "no", "okay", "ok", "set", "play", "remind", "open",
+    "close", "call", "tell", "show", "read", "check", "turn", "start", "stop",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "sir", "hunter",
+}
+VOCAB_CHAR_CAP = 900      # Whisper's initial_prompt budget is ~224 tokens
+
+
+def new_vocab_words(heard: str, meant: str) -> list:
+    """Capitalised words in the correction that the transcript lacked --
+    the names Whisper got wrong. Conservative by design: casing on a
+    misheard name is itself a guess, so this is opt-in."""
+    heard_l = {w.lower() for w in re.findall(r"[\w'-]+", heard or "")}
+    out, seen = [], set()
+    for w in re.findall(r"[A-Za-z][\w'-]+", meant or ""):
+        key = w.lower()
+        if not w[0].isupper() or len(w) < 3:
+            continue
+        if key in heard_l or key in _VOCAB_STOP or key in seen:
+            continue
+        seen.add(key)
+        out.append(w)
+    return out
+
+
+# ------------------------------------------------------------------
+# Voice feedback: "that was for you" / "that wasn't for you" (2026-08-30)
+# ------------------------------------------------------------------
+# The only learning signal used to be the YES/NO card on UNCERTAIN
+# utterances; a command the classifier dropped as background chat (NO)
+# was silent and unrecoverable, and a confident misroute was never
+# recorded. These phrases label the LAST turn in the classifier's own log
+# (IntentClassifier.log_feedback -- the log classify() actually reads) and
+# re-run a dropped command. Matched ahead of the classifier: three-word
+# feedback would itself be classified NO and dropped.
+FEEDBACK_YES_WINDOW_S = 20.0    # after a dropped command: no reply marks the time
+FEEDBACK_NO_WINDOW_S = 60.0     # after a reply he did not ask for
+_FB_TAIL = r"(?:[,]?\s*(?:jarvis|sir|please|thanks))*[.!\s]*$"
+_FEEDBACK_YES_RX = re.compile(
+    r"^(?:(?:yes|yeah|jarvis)[,.!]?\s+)*"
+    r"(?:that (?:was|is|one was) (?:for|to|meant for|aimed at|directed at) you|"
+    r"i (?:was|am) (?:talking|speaking) to you|i (?:was|am) asking you|"
+    r"that was (?:a|an) (?:command|question|request)(?: for you)?|"
+    r"i meant you|that was you|it was for you)" + _FB_TAIL, re.I)
+_FEEDBACK_NO_RX = re.compile(
+    r"^(?:(?:no|nope|jarvis)[,.!]?\s+)*"
+    r"(?:that (?:wasn't|was not|isn't|is not|one wasn't) (?:for|to|meant for|"
+    r"aimed at|directed at) you|i (?:wasn't|was not) (?:talking|speaking) to you|"
+    r"(?:i was )?(?:talking|speaking) to (?:someone|somebody) else|"
+    r"not (?:for )?you|that wasn't you|i wasn't asking you|"
+    r"that (?:wasn't|was not) (?:a|an) (?:command|question|request))" + _FB_TAIL,
+    re.I)
+
+
+def feedback_kind(text: str) -> Optional[bool]:
+    """True = "that was for you", False = "that wasn't for you", else None."""
+    t = (text or "").strip()
+    if _FEEDBACK_NO_RX.match(t):
+        return False
+    if _FEEDBACK_YES_RX.match(t):
+        return True
+    return None
+
+
+@dataclass
+class LastTurn:
+    text: str
+    status: str
+    ts: float
+
+
 class Commander:
     """Routes a user utterance (voice or typed) through the V3 pipeline:
 
@@ -3017,6 +3308,14 @@ class Commander:
     (2820-2940). Speaker verification and the confidence gate stay in the
     transcription pipeline; handle() receives accepted text only.
     """
+
+    # Class-level defaults for the per-turn state __init__ sets: a test
+    # (tests/test_custom_phrases.py) builds a Commander with __new__ and
+    # fills in only what it needs.
+    claim_uncertain: Optional[Callable[[bool], bool]] = None
+    _last_turn: Optional[LastTurn] = None
+    _confidence: Optional[float] = None
+    _pending_destructive: Optional[tuple] = None
 
     def __init__(self, services):
         self.services = services
@@ -3040,6 +3339,17 @@ class Commander:
         # UI hook for uncertain intent ("Was this for me?"); wired by the
         # main window. Falls back to a warn Status event.
         self.on_uncertain: Optional[Callable[[str], None]] = None
+        # App hook: a spoken "that was for you" answers the open card too
+        # (claim_uncertain(yes) -> bool, whether a card was waiting).
+        self.claim_uncertain: Optional[Callable[[bool], bool]] = None
+        # The last utterance handled, for "no, I said ..." and "that was
+        # for you"; the app's _last_user_text is not visible from here.
+        self._last_turn: Optional[LastTurn] = None
+        # Whisper avg_logprob of the utterance being handled (None when
+        # typed / unknown); read by the destructive read-back.
+        self._confidence: Optional[float] = None
+        # A read-back waiting for a yes: (run, spoken line, stamp).
+        self._pending_destructive: Optional[tuple] = None
 
     # -- service access ------------------------------------------------
     def _svc(self, name: str):
@@ -3068,10 +3378,39 @@ class Commander:
         ))
 
     # -- public entry --------------------------------------------------
-    def handle(self, text: str, source: str = "voice") -> CommandResult:
+    def handle(self, text: str, source: str = "voice",
+               confidence: Optional[float] = None) -> CommandResult:
+        """Route one utterance. ``confidence`` is the transcript's Whisper
+        avg_logprob when the app has one (voice); every other caller
+        leaves it unset."""
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
+        self._confidence = confidence
+        result = self._handle_inner(text, source)
+        # A correction / re-run answers a different utterance: THAT is the
+        # last turn, so a second "no, I said ..." corrects the right text.
+        self._last_turn = LastTurn(getattr(result, "corrected", None) or text,
+                                   result.status or "", time.monotonic())
+        return result
+
+    def shaky_transcript(self) -> bool:
+        """The utterance being handled scraped in under confirm.shaky_logprob."""
+        conf = self._confidence
+        if conf is None:
+            return False
+        try:
+            floor = float(_assistant_get(self, "confirm.shaky_logprob", -0.7))
+        except (TypeError, ValueError):
+            floor = -0.7
+        return conf < floor
+
+    def stash_destructive(self, run: Callable[[], CommandResult], line: str):
+        """A handler read an action back instead of doing it; the next yes
+        runs it (``_try_destructive_confirm``)."""
+        self._pending_destructive = (run, line, time.monotonic())
+
+    def _handle_inner(self, text: str, source: str, gate: bool = True) -> CommandResult:
         log.info("handle %r source=%s", text, source)
         self._raw_text = text          # original casing for handlers that need it
 
@@ -3084,6 +3423,12 @@ class Commander:
 
         # 2. A ringing alarm owns the next words (spec 5.2 a).
         res = self._try_ringing(text)
+        if res is not None:
+            return res
+        # 2b. "No, I said X": ahead of every yes/no stage, which would read
+        #     it as a bare decline (parse_yes_no: any sentence opening with
+        #     "no" is a no).
+        res = self._try_correction(text, source)
         if res is not None:
             return res
         # 3. A pending permission question owns yes / no (spec 5.2 b).
@@ -3110,6 +3455,11 @@ class Commander:
         res = self._try_alarm_offer(text)
         if res is not None:
             return res
+        # 3e. A destructive action was read back ("Cancel all three alarms,
+        #     sir?"): a plain yes runs it, anything else drops it.
+        res = self._try_destructive_confirm(text)
+        if res is not None:
+            return res
         # 4. A pending router question: resolve it and dispatch the
         #    remembered utterance (spec 5.2 c).
         res = self._try_router_answer(text)
@@ -3117,6 +3467,13 @@ class Commander:
             return res
 
         cmd_text = strip_jarvis_prefix(text)
+
+        # 3e. "That was for you" / "that wasn't for you": label the last
+        #     turn for the classifier and re-run a dropped command. Before
+        #     the classifier, which would drop the feedback itself.
+        res = self._try_feedback(text, cmd_text, source)
+        if res is not None:
+            return res
 
         # 3a. User-defined phrases from assistant.json, ahead of the built-ins
         #     so a personal shortcut can shadow one -- and checked on the RAW
@@ -3149,7 +3506,8 @@ class Commander:
         # A web cue is addressed to Jarvis by construction, like a custom
         # phrase: the classifier called "look up who won the last race"
         # uncertain and asked "Was that for me?" (live, 2026-08-29 23:45).
-        if source == "voice" and cmd_text is None and not WEB_CUE_RX.search(text):
+        if gate and source == "voice" and cmd_text is None \
+                and not WEB_CUE_RX.search(text):
             intent, conf = self.intent.classify(text)
             if intent == IntentClassifier.NO:
                 log.info("Ignored (background chat, conf=%.2f): %r",
@@ -3167,9 +3525,197 @@ class Commander:
     def resolve_uncertain(self, text: str, yes: bool) -> CommandResult:
         """UI feedback for the 'Was this for me?' prompt."""
         self.intent.log_feedback(text, yes)
+        self._feedback_line(text, "Was that for me?", yes, "card")
         if yes:
-            return self._route_text(text)
+            res = self._route_text(text)
+            self._last_turn = LastTurn(text, res.status or "", time.monotonic())
+            return res
         return CommandResult(handled=True, status="Discarded")
+
+    # -- corrections, feedback, read-back ---------------------------------
+    def _try_correction(self, text: str, source: str) -> Optional[CommandResult]:
+        meant = correction_kind(strip_address(text))
+        if not meant:
+            return None
+        prev = self._last_turn
+        if source == "voice":
+            # By voice the wake word is consumed before the text arrives,
+            # so "addressed" cannot be read off a prefix. A correction
+            # presupposes a turn to correct: without a recent one, "not
+            # that one, the other one" is the room talking.
+            if prev is None or time.monotonic() - prev.ts > CORRECTION_WINDOW_S:
+                return None
+        heard = prev.text if prev is not None else ""
+        log.info("correction: heard %r -> meant %r", heard, meant)
+        # Cut the reply in flight: speech now, the model job too (its
+        # generation goes stale, so its result is dropped, not remembered).
+        _cut_speech(self)
+        brain = self._svc("brain")
+        cancel = getattr(brain, "cancel", None)
+        if callable(cancel):
+            try:
+                cancel()
+            except Exception:
+                log.exception("brain cancel failed")
+        conv = self._svc("conversation")
+        if conv is not None and heard:
+            try:
+                conv.forget_exchange(heard)
+            except Exception:
+                log.exception("forget_exchange failed")
+        memory = self._svc("memory")
+        if memory is not None and hasattr(memory, "log_correction"):
+            try:
+                memory.log_correction(heard, meant)
+            except Exception:
+                log.exception("log_correction failed")
+        self._learn_vocab(heard, meant)
+        res = self._handle_inner(meant, source, gate=False)
+        res.corrected = meant
+        return res
+
+    def _learn_vocab(self, heard: str, meant: str):
+        """Opt-in (corrections.learn_vocab): new capitalised words from the
+        correction join the Whisper vocabulary prompt, so the next attempt
+        decodes the name right."""
+        if not _assistant_get(self, "corrections.learn_vocab", False):
+            return
+        words = new_vocab_words(heard, meant)
+        if not words:
+            return
+        try:
+            from jarvis.transcriber import load_vocab, save_vocab
+            vocab = load_vocab() or ""
+            have = {w.strip().lower() for w in re.split(r"[,\n]", vocab)}
+            add = [w for w in words if w.lower() not in have]
+            if not add:
+                return
+            text = (vocab.rstrip(", \n") + ", " if vocab.strip() else "") + ", ".join(add)
+            if len(text) > VOCAB_CHAR_CAP:
+                log.info("vocab learn skipped: prompt would exceed %d chars", VOCAB_CHAR_CAP)
+                return
+            save_vocab(text)
+            log.info("vocab learned: %s", add)
+        except Exception:
+            log.exception("vocab learn failed")
+
+    FEEDBACK_LOG = PATHS.MEMORY_DIR / "feedback.jsonl"
+
+    def _feedback_line(self, prev_text: str, prev_status: str, label: bool, how: str):
+        """One JSON line per label: the audit trail the classifier's own
+        log (text + label only) cannot carry."""
+        try:
+            self.FEEDBACK_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.FEEDBACK_LOG, "a") as fh:
+                fh.write(json.dumps({
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "text": prev_text[:200], "prev_status": prev_status[:60],
+                    "label": "yes" if label else "no", "how": how}) + "\n")
+        except Exception:
+            log.exception("feedback log write failed")
+
+    def _try_feedback(self, text: str, cmd_text: Optional[str],
+                      source: str) -> Optional[CommandResult]:
+        said = cmd_text if cmd_text is not None else text
+        label = feedback_kind(said)
+        if label is None:
+            return None
+        prev = self._last_turn
+        if prev is None:
+            return CommandResult(handled=True, reply="I have nothing recent to go on, sir.",
+                                 speak=True, status="Feedback: no last turn")
+        status = prev.status or ""
+        dropped = status.startswith("Ignored")
+        asked = status.startswith("Was that for me")
+        window = FEEDBACK_YES_WINDOW_S if (dropped or asked) else FEEDBACK_NO_WINDOW_S
+        if time.monotonic() - prev.ts > window:
+            return CommandResult(handled=True,
+                                 reply="I'm not sure which one you mean, sir.",
+                                 speak=True, status="Feedback: stale")
+        if asked:
+            # The card is still up: settle it the same way a click would.
+            claim = self.claim_uncertain
+            if claim is not None:
+                try:
+                    claim(label)
+                except Exception:
+                    log.exception("claim_uncertain failed")
+            res = self.resolve_uncertain(prev.text, label)
+            if label:
+                res.corrected = prev.text
+            elif not res.reply:
+                res.reply, res.speak = "Very good, sir.", True
+            return res
+        self.intent.log_feedback(prev.text, label)
+        self._feedback_line(prev.text, status, label, "spoken")
+        if label and dropped:
+            log.info("feedback: re-running dropped %r", prev.text)
+            res = self._handle_inner(prev.text, source, gate=False)
+            res.corrected = prev.text
+            return res
+        if not label and not dropped:
+            # He did not ask: stop talking and forget the exchange.
+            _cut_speech(self)
+            conv = self._svc("conversation")
+            if conv is not None:
+                try:
+                    conv.forget_exchange(prev.text)
+                except Exception:
+                    log.exception("forget_exchange failed")
+            return CommandResult(handled=True, reply="My mistake, sir.", speak=True,
+                                 status="Feedback: not for me")
+        return CommandResult(handled=True, reply="Very good, sir.", speak=True,
+                             status="Feedback: noted")
+
+    def _try_destructive_confirm(self, text: str) -> Optional[CommandResult]:
+        """Resolve a read-back ("Cancel all three alarms, sir?").
+
+        As with a calendar add, anything that is not a clear yes or no
+        DROPS the offer: changing the subject is not consent, and a stale
+        offer would attach the next stray "yes" to an old cancel. An offer
+        older than DESTRUCTIVE_TTL_S is dropped even on a yes."""
+        pend, self._pending_destructive = self._pending_destructive, None
+        notes = self._svc("notes")
+        npend = getattr(notes, "pending_clear", None) if notes is not None else None
+        if not isinstance(npend, dict):
+            npend = None
+        elif notes is not None:
+            try:
+                notes.pending_clear = None
+            except Exception:
+                log.debug("notes.pending_clear reset failed", exc_info=True)
+        now = time.monotonic()
+        if pend is not None and now - pend[2] > DESTRUCTIVE_TTL_S:
+            log.info("read-back expired: %r", pend[1])
+            pend = None
+        if npend is not None and time.time() - float(npend.get("ts") or 0) > DESTRUCTIVE_TTL_S:
+            npend = None
+        if pend is None and npend is None:
+            return None
+        answer = parse_yes_no(text)
+        if answer is None:
+            return None
+        if not answer:
+            return CommandResult(handled=True, reply="Very good, sir.", speak=True,
+                                 status="Dropped")
+        if pend is not None:
+            try:
+                return pend[0]()
+            except Exception:
+                log.exception("confirmed action failed")
+                return CommandResult(handled=True, reply="I couldn't manage that, sir.",
+                                     speak=True, status="error")
+        kind = str(npend.get("kind") or "todo")
+        try:
+            removed = notes.remove(kind, "all")
+        except Exception:
+            log.exception("notes clear failed")
+            return CommandResult(handled=True, reply="I couldn't clear that, sir.",
+                                 speak=True, status="error")
+        n = len(removed) if removed else 0
+        line = "All cleared, sir." if n else "Nothing to clear, sir."
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status=f"Cleared {n} {kind}{'s' if n != 1 else ''}")
 
     # -- pipeline stages -----------------------------------------------
     def _handle_dictation(self, text: str) -> CommandResult:
@@ -3768,7 +4314,14 @@ class Commander:
                                      done=False)
             return CommandResult(handled=False, reply=text,
                                  status="No route (no brain)")
-        brain.chat(strip_address(text))
+        stripped = strip_address(text)
+        forced = forced_call(d.reason, stripped)
+        if forced is not None:
+            name, args = forced
+            log.info("route short-cut: %s(%s)", name, args)
+            brain.chat(stripped, force_tool=name, force_args=args)
+        else:
+            brain.chat(stripped)
         return CommandResult(handled=True, status="Thinking…", done=False)
 
     def _dispatch_action(self, d: RouteDecision) -> CommandResult:
