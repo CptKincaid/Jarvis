@@ -425,3 +425,65 @@ def test_the_focus_commands_are_tier_one(cmdr):
 def test_persona_lines_are_fixed_strings():
     for line in focus_mod.PERSONA_LINES:
         assert "{" not in line and line.endswith(".")
+
+
+# ------------------------------------------------- stale worker isolation
+class _SetupErr(Exception):
+    kind = "setup"
+    text = "no credentials"
+
+
+def test_a_stale_spotify_worker_cannot_poison_the_next_session(tmp_path):
+    """A Spotify call still in flight when the session ends (music runs on
+    a worker thread live) used to land its write-back -- including
+    music_off=True -- in the NEXT session's fresh state dict, silencing its
+    music for no reason."""
+    clock = FakeClock()
+    tk = Timekeeper(tmp_path / "tk.db", say=lambda s: None, cfg={}, now=clock.now,
+                    run=lambda *a, **k: None, ring=False, notify=False,
+                    cache_dir=tmp_path / "cache")
+    spotify = FakeSpotify()
+    deferred = []
+    services = SimpleNamespace(timekeeper=tk, speak=lambda s: None,
+                               assistant=Cfg(), spotify=spotify)
+    fs = FocusSession(services, state_path=tmp_path / "focus.json",
+                      now=clock.now, bg=deferred.append)
+    try:
+        fs.start("thesis")                       # queues the block's pause
+        first_state = fs.state
+        stale = deferred.pop()                   # session 1's worker, not yet run
+        fs.end()
+        fs.start("biosensors")                   # a fresh session, fresh dict
+        spotify.fail = _SetupErr()
+        stale()                                  # the old worker finally lands
+        # The guard drops the write entirely: the note belongs to a session
+        # that no longer exists, and the LIVE one must not inherit it.
+        assert first_state.get("music_off") is False, "abandoned dict: note dropped"
+        assert fs.state.get("music_off") is False, \
+            "a stale failure must not silence the new session's music"
+    finally:
+        fs.stop()
+        tk.close()
+
+
+def test_focus_lines_carry_the_message_kind(tmp_path):
+    """services.speak defaults proactive lines to kind='warning' (the
+    watchdog's); a held focus line must digest as a message instead."""
+    clock = FakeClock()
+    tk = Timekeeper(tmp_path / "tk.db", say=lambda s: None, cfg={}, now=clock.now,
+                    run=lambda *a, **k: None, ring=False, notify=False,
+                    cache_dir=tmp_path / "cache")
+    calls = []
+
+    def speak(line, proactive=True, kind="warning"):
+        calls.append((line, kind))
+    services = SimpleNamespace(timekeeper=tk, speak=speak, assistant=Cfg(),
+                               spotify=None)
+    fs = FocusSession(services, state_path=tmp_path / "focus.json",
+                      now=clock.now, bg=lambda fn: fn())
+    try:
+        fs._speak("Halfway, sir.")
+        assert calls == [("Halfway, sir.", "message")]
+    finally:
+        fs.stop()
+        tk.close()

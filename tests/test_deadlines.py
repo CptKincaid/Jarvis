@@ -243,3 +243,28 @@ def test_thread_start_is_idempotent_and_stops(tmp_path):
     h.stop()
     t.join(timeout=5)
     assert not t.is_alive()
+
+
+def test_the_deadline_thread_is_joinable_and_restartable(tmp_path):
+    h, _filed = _make(tmp_path, datetime(2026, 8, 31, 9, 0).astimezone())
+    h.start()
+    t1 = h._thread
+    assert t1 is not None and t1.is_alive()
+    h.stop()
+    assert not t1.is_alive(), "stop() joins the thread out"
+    h.start()
+    assert h._thread is not t1 and h._thread.is_alive()
+    h.stop()
+
+
+def test_the_meeting_heads_up_thread_is_joinable_and_restartable(tmp_path):
+    from jarvis.headsup import MeetingHeadsUp
+    h = MeetingHeadsUp(lambda: None, None, state_path=tmp_path / "h.json")
+    h.start()
+    t1 = h._thread
+    assert t1 is not None and t1.is_alive()
+    h.stop()
+    assert not t1.is_alive()
+    h.start()
+    assert h._thread is not t1 and h._thread.is_alive()
+    h.stop()

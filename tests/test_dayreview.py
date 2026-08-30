@@ -352,3 +352,19 @@ def test_the_handler_speaks_what_the_app_reports():
 def test_the_command_is_tier_one_without_the_prefix():
     from jarvis.commander import ASSISTANT_TIER1
     assert "day review" in [c.name for c in ASSISTANT_TIER1]
+
+
+def test_the_reviewer_thread_is_joinable_and_restartable(files):
+    """stop() used to be a bare Event.set(): a tick in flight (a Discord
+    post) outlived stop_assistant into the teardown, and a stopped
+    reviewer could never be started again."""
+    r = dr.DayReviewer(files.log, files.turns, files.dir / "reviews")
+    r.start()
+    t1 = r._thread
+    assert t1 is not None and t1.is_alive()
+    r.stop()
+    t1.join(timeout=2)
+    assert not t1.is_alive()
+    r.start()                                  # a fresh thread, cleared stop
+    assert r._thread is not t1 and r._thread.is_alive()
+    r.stop()

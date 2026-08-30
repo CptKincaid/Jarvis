@@ -385,3 +385,37 @@ def test_gpu_commands_are_tier_one_and_need_the_brain_doors(cmdr):
     cmdr.services.brain = MagicMock(spec=["chat"])     # no release/reclaim
     res = cmdr.handle("take the gpu back", source="typed")
     assert res.reply != commander.GPU_RECLAIMED_LINE
+
+
+# ------------------------------------------------- the lend/pin race (#12)
+def test_unpin_reunloads_only_a_pinning_payload_that_raced_the_lend(brain, setup, lent_off):  # noqa: F811
+    b, fake, _ = setup
+    brain._RESIDENCY["lent"] = True
+    brain._unpin_if_lent({"keep_alive": 0})          # built while lent: fine
+    assert fake.calls == []
+    brain._unpin_if_lent({"keep_alive": -1})         # built before, landed after
+    assert fake.calls == [("/api/generate",
+                           {"model": brain.OLLAMA_MODEL, "keep_alive": 0}, 30)]
+    brain._RESIDENCY["lent"] = False
+    brain._unpin_if_lent({"keep_alive": -1})         # not lent: nothing to do
+    assert len(fake.calls) == 1
+
+
+def test_unpin_swallows_an_unreachable_ollama(brain, setup, lent_off):  # noqa: F811
+    b, fake, _ = setup
+    brain._RESIDENCY["lent"] = True
+    fake.fail = brain.OllamaDown("refused")
+    brain._unpin_if_lent({"keep_alive": -1})         # must not raise
+
+
+def test_the_residency_warm_up_compensates_when_release_races_it(brain, setup, lent_off, monkeypatch):  # noqa: F811
+    """release() landing during the 300 s warm chat: the warm request pinned
+    the model back. ensure_resident must hand its payload to the unpin."""
+    b, fake, _ = setup
+    fake.replies = [{"message": {"role": "assistant", "content": ""},
+                     "done": True, "load_duration": 0}]
+    seen = []
+    monkeypatch.setattr(brain, "_unpin_if_lent", lambda payload: seen.append(payload))
+    assert brain.ensure_resident(first=False) is True
+    assert len(seen) == 1 and seen[0]["keep_alive"] == -1, \
+        "the warm payload must reach the compensating unload"

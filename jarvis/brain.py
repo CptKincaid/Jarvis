@@ -642,14 +642,15 @@ def ensure_resident(first=None):
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": ""}]
     t0 = time.monotonic()
+    payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
+                            num_predict=1)
     try:
-        data = _http("/api/chat",
-                     _chat_payload(messages, _registry_schemas(_REGISTRY),
-                                   num_predict=1),
-                     timeout=300)
+        data = _http("/api/chat", payload, timeout=300)
     except Exception as exc:
         log.warning("ollama: warm-up of %s failed: %s", OLLAMA_MODEL, exc)
         return False
+    finally:
+        _unpin_if_lent(payload)            # a 300 s warm can race release()
     load_s = (data.get("load_duration") or 0) / 1e9 or \
         (time.monotonic() - t0)
     log.info("ollama: %s resident (load %.1f s)", OLLAMA_MODEL, load_s)
@@ -709,6 +710,22 @@ def release(reason=""):
     except Exception as exc:
         log.warning("ollama: could not unload %s: %s", OLLAMA_MODEL, exc)
     return False
+
+
+def _unpin_if_lent(payload):
+    """A request that raced release(): its payload was built with
+    keep_alive -1 (pinning) before the lend, and finished after -- so the
+    model the trainer was given the room for is resident again. Compensate
+    with a best-effort unload; never raises. Called in a finally after
+    every pinning chat/warm request."""
+    if payload.get("keep_alive") != -1 or not _RESIDENCY.get("lent"):
+        return
+    log.info("ollama: request raced the lend; unloading %s again", OLLAMA_MODEL)
+    try:
+        _http("/api/generate", {"model": OLLAMA_MODEL, "keep_alive": 0},
+              timeout=30)
+    except Exception as exc:               # noqa: BLE001 - best effort
+        log.warning("ollama: could not unpin %s: %s", OLLAMA_MODEL, exc)
 
 
 def reclaim():
@@ -963,10 +980,12 @@ def _persona_request(instruction, text, n, timeout, num_predict):
     _check_lent()          # summarize/local_line fall back to their text
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": _persona_turn(instruction, text, n)}]
-    data = _http("/api/chat",
-                 _chat_payload(messages, _registry_schemas(_REGISTRY),
-                               num_predict=num_predict),
-                 timeout=timeout)
+    payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
+                            num_predict=num_predict)
+    try:
+        data = _http("/api/chat", payload, timeout=timeout)
+    finally:
+        _unpin_if_lent(payload)
     msg = data.get("message") or {}
     if msg.get("tool_calls"):
         return ""
@@ -1016,11 +1035,13 @@ def classify_route(text, timeout=CLASSIFY_TIMEOUT_S):
                             f"{(text or '').strip()}"}]
     try:
         _check_lent()      # the router's rules decide alone while lent
-        data = _http("/api/chat",
-                     _chat_payload(messages, _registry_schemas(_REGISTRY),
-                                   fmt=ROUTE_FORMAT, num_predict=40,
-                                   temperature=0.0),
-                     timeout=timeout)
+        payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
+                                fmt=ROUTE_FORMAT, num_predict=40,
+                                temperature=0.0)
+        try:
+            data = _http("/api/chat", payload, timeout=timeout)
+        finally:
+            _unpin_if_lent(payload)
         obj = json.loads((data.get("message") or {}).get("content") or "{}")
         route = str(obj.get("route", "")).strip().lower()
         confidence = float(obj.get("confidence", 0.0))
@@ -1071,11 +1092,13 @@ def _json_request(instruction, fmt, timeout, num_predict, temperature=0.2):
     None on any failure (callers speak a fixed excuse)."""
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": instruction}]
+    payload = _chat_payload(messages, None, fmt=fmt, num_predict=num_predict,
+                            temperature=temperature)
     try:
-        data = _http("/api/chat",
-                     _chat_payload(messages, None, fmt=fmt, num_predict=num_predict,
-                                   temperature=temperature),
-                     timeout=timeout)
+        try:
+            data = _http("/api/chat", payload, timeout=timeout)
+        finally:
+            _unpin_if_lent(payload)
         content, _calls = _message_parts(data)
         obj = json.loads(content or "{}")
     except Exception as exc:               # noqa: BLE001 - one seam, one excuse
@@ -1663,8 +1686,12 @@ class JarvisBrain:
                         final = ""            # barged in: nothing more to say
                         break
                 else:
-                    data = _http("/api/chat", _chat_payload(messages, tools),
-                                 timeout=OLLAMA_TIMEOUT_S)
+                    payload = _chat_payload(messages, tools)
+                    try:
+                        data = _http("/api/chat", payload,
+                                     timeout=OLLAMA_TIMEOUT_S)
+                    finally:
+                        _unpin_if_lent(payload)
                     content, calls = _message_parts(data)
                 server_s += (data.get("load_duration") or 0) / 1e9
                 if not calls or registry is None:
@@ -1784,8 +1811,8 @@ class JarvisBrain:
         # The socket timeout is per read, so a stream that keeps trickling
         # had no bound at all; the non-streamed request's wall bound stays.
         deadline = time.monotonic() + OLLAMA_TIMEOUT_S
-        stream = _http_stream("/api/chat", _chat_payload(messages, tools),
-                              timeout=OLLAMA_TIMEOUT_S)
+        payload = _chat_payload(messages, tools)
+        stream = _http_stream("/api/chat", payload, timeout=OLLAMA_TIMEOUT_S)
         try:
             for chunk in stream:
                 if self._stale(gen):
@@ -1817,6 +1844,7 @@ class JarvisBrain:
                     break
         finally:
             stream.close()                    # a broken-off stream frees its socket
+            _unpin_if_lent(payload)
         if not calls and buf.strip() and not self._stale(gen):
             self._emit_sentence(buf, cap, on_sentence, streamed, guard)
         data = dict(last)

@@ -132,7 +132,13 @@ class FocusSession:
         if not callable(say) or not line:
             return
         try:
-            say(line)
+            try:
+                # kind reaches the quiet digest ("two messages", not "two
+                # warnings" -- the services speak lambda defaults to the
+                # watchdog's kind).
+                say(line, kind="message")
+            except TypeError:
+                say(line)                  # a bare test seam takes text only
         except Exception:                  # noqa: BLE001 - speech boundary
             log.exception("focus: speak failed")
 
@@ -252,6 +258,11 @@ class FocusSession:
         if plan is None:
             return
         method, arg, remember = plan
+        # Bound the SESSION the result belongs to at closure creation:
+        # start() rebinds self.state to a fresh dict, and a Spotify call
+        # still in flight from the previous session (typically end()'s
+        # resume) used to land its write-back in the new session's dict.
+        st = self.state
 
         def run():
             try:
@@ -260,8 +271,9 @@ class FocusSession:
                 else:
                     spotify.control(arg)
                 with self._lock:
-                    self.state["music_did"] = remember
-                    self._save()
+                    if self.state is st:
+                        self.state["music_did"] = remember
+                        self._save()
                 log.info("focus: spotify %s %r ok", method, arg)
             except Exception as exc:       # noqa: BLE001 - SpotifyError or worse
                 kind = getattr(exc, "kind", "")
@@ -269,8 +281,9 @@ class FocusSession:
                          getattr(exc, "text", exc))
                 if kind in ("setup", "auth", "premium"):
                     with self._lock:
-                        self.state["music_off"] = True   # not worth retrying this session
-                        self._save()
+                        if self.state is st:
+                            self.state["music_off"] = True   # not worth retrying this session
+                            self._save()
 
         self._bg(run)
 

@@ -35,8 +35,9 @@ class FakeApp:
     def diagnostics_text(self):
         return "All systems nominal, sir."
 
-    def dispatch_text(self, text, source="typed", quiet=False):
+    def dispatch_text(self, text, source="typed", quiet=False, turn_id=""):
         self.calls.append((text, source, quiet))
+        self.turn_id = turn_id            # the real app stamps replies with it
         res = self.result
         if res.reply:
             bus.publish(JarvisReply(text=res.reply, speak=res.speak))
@@ -249,7 +250,9 @@ def test_the_real_app_answers_over_the_socket(build, monkeypatch):  # noqa: F811
     msgs = _run(PATHS.COMMAND_SOCK, "jarvis what time is it", quiet=True)
     assert [m["text"] for m in msgs if m["kind"] == "reply"]
     assert app.tts.spoken == spoken_before
-    assert app._quiet_turn
+    # the mute is per turn: a sync answer clears it on the way out, so a
+    # reminder firing a minute later is not silently swallowed
+    assert not app._quiet_turn
     # the next typed turn speaks again
     app.dispatch_text("jarvis what time is it", source="typed")
     assert len(app.tts.spoken) == len(spoken_before) + 1 and not app._quiet_turn
@@ -257,3 +260,30 @@ def test_the_real_app_answers_over_the_socket(build, monkeypatch):  # noqa: F811
     assert "jarvis what time is it" not in getattr(app.history, "items", lambda: [])()
     app.stop_assistant()
     assert not PATHS.COMMAND_SOCK.exists()
+
+
+def test_a_foreign_turns_tagged_reply_never_answers_this_one(server):
+    """Two CLI clients at once: the other turn's stamped reply must not
+    close this stream with the wrong text. Untagged (voice/typed) events
+    keep today's behaviour."""
+    app = server.app
+
+    def dispatch(text, source="typed", quiet=False, turn_id=""):
+        app.calls.append((text, source, quiet))
+
+        def _later():
+            time.sleep(0.1)
+            bus.publish(JarvisReply(text="the other client's answer",
+                                    speak=False, turn_id="deadbeef0000"))
+            time.sleep(0.1)
+            bus.publish(JarvisReply(text="two items on Tuesday, sir.",
+                                    speak=False, turn_id=turn_id))
+        threading.Thread(target=_later, daemon=True).start()
+        return CommandResult(handled=True, reply="", speak=False,
+                             status="Thinking…", done=False)
+    app.dispatch_text = dispatch
+    msgs = _run(server.sock, "what's due this week")
+    texts = [m["text"] for m in msgs if m["kind"] == "reply"]
+    assert "the other client's answer" not in texts
+    assert "two items on Tuesday, sir." in texts
+    assert msgs[-1]["reason"] == "answered"

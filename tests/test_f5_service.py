@@ -466,3 +466,24 @@ def test_install_script_points_the_unit_at_this_checkout(tmp_path, monkeypatch):
     assert "%h/Jarvis/" not in exec_line
     # the ref-clip paths stay %h-relative either way: they follow the user
     assert "%h/.aiws_trainer/jarvis_voice_ref_f5.wav" in exec_line
+
+
+def test_retire_skips_quickly_when_the_warm_up_holds_the_lock(monkeypatch):
+    """quit() calls retire synchronously on the UI thread; the warm thread
+    holds _f5_lock across a cold start (up to 180 s). A bounded acquire
+    skips retirement (leaving our sidecar resident is the default) rather
+    than freezing the window."""
+    import time
+    proc = _Proc()
+    monkeypatch.setattr(tts_mod, "_f5_proc", proc)
+    monkeypatch.setattr(tts_mod, "_f5_unit_active", lambda: True)
+    monkeypatch.setattr(tts_mod, "_F5_RETIRE_LOCK_S", 0.2, raising=False)
+    assert tts_mod._f5_lock.acquire(timeout=1)
+    try:
+        t0 = time.monotonic()
+        assert tts_mod.retire_own_f5_sidecar() is False
+        assert time.monotonic() - t0 < 5.0
+        assert not proc.terminated, "contention must not touch the process"
+    finally:
+        tts_mod._f5_lock.release()
+    assert tts_mod.retire_own_f5_sidecar() is True      # lock free again

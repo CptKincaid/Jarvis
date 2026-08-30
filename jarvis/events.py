@@ -104,11 +104,15 @@ class UserUtterance(Event):
 class JarvisReply(Event):
     text: str = ""
     speak: bool = False
+    # Correlation for turns whose replies stream back over a channel (the
+    # command socket): "" = untagged, today's behaviour everywhere else.
+    turn_id: str = ""
 
 
 @dataclass
 class BrainState(Event):
     state: str = "idle"               # idle | thinking
+    turn_id: str = ""                 # see JarvisReply.turn_id
 
 
 @dataclass
@@ -307,3 +311,4 @@ class BriefingReady(Event):
     is what the app says."""
     sections: dict = field(default_factory=dict)
     spoken: str = ""
+    turn_id: str = ""                 # see JarvisReply.turn_id

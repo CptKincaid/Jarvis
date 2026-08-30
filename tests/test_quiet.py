@@ -450,12 +450,17 @@ def test_first_wake_briefing_waits_for_the_quiet_window(monkeypatch):
 
 
 def test_welcome_back_once_per_return_with_the_held_lines(monkeypatch):
-    p = _policy(is_home=lambda: False)
+    # is_home must FLIP with the return: _on_presence now consults
+    # quiet.should_hold(), and a policy stuck on "you're out" would
+    # (correctly) keep holding the welcome forever.
+    home = [False]
+    p = _policy(is_home=lambda: home[0])
     a = _app(monkeypatch, quiet=p)
     a._say("Sir, this is your reminder. Water the plants", proactive=True, kind="reminder")
     assert a.tts.spoken == []
     a._on_presence(Presence(home=False, since=1.0, returned=False))
     assert a.tts.spoken == []                          # leaving is silent
+    home[0] = True
     a._on_presence(Presence(home=True, since=2.0, returned=True))
     assert a.tts.spoken[0] == "Welcome back, sir."
     assert a.tts.spoken[1].startswith(AWAY_PREFIX + ": one reminder.")
@@ -573,3 +578,40 @@ def test_real_app_wires_quiet_and_presence(build, monkeypatch):  # noqa: F811
     assert not a.quiet.running
     assert notify_mod._quiet_gate is None              # and let go of it on stop
 
+
+
+# ----------------------------------------------------- can_speak deferral
+def test_the_digest_waits_for_a_clear_moment():
+    """The catch-up digest used to speak the instant the window closed --
+    including over an open capture or a running turn. With can_speak False
+    the backlog is kept and the next tick retries."""
+    said, clear = [], [False]
+    p = _policy(say=said.append, can_speak=lambda: clear[0])
+    p.set_dnd(600)
+    p.hold("Sir, this is your reminder. Stand up", "reminder")
+    p.clock.tick(minutes=11)
+    assert p.tick() == "" and said == []            # mid-turn: held, not lost
+    assert p.tick() == "" and said == []            # still busy next tick
+    clear[0] = True
+    text = p.tick()
+    assert "one reminder" in text and said == [text]
+
+
+def test_a_broken_can_speak_probe_never_mutes_the_digest():
+    said = []
+
+    def boom():
+        raise RuntimeError("probe died")
+    p = _policy(say=said.append, can_speak=boom)
+    p.set_dnd(600)
+    p.hold("Sir, this is your reminder.", "reminder")
+    p.clock.tick(minutes=11)
+    assert p.tick() != "" and len(said) == 1
+
+
+def test_a_held_alarm_notice_is_digested_as_an_alarm():
+    p = _policy()
+    p.set_dnd(600)
+    p.hold("You missed your alarm at 7:00 am, sir.", "alarm")
+    p.clock.tick(minutes=11)
+    assert "one alarm" in p.tick(), "kind='alarm' must not read as 'message'"

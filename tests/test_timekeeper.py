@@ -787,3 +787,23 @@ def test_tools_without_timekeeper():
                        ("set_alarm", {"when": "at 7"}), ("manage_schedule", {"action": "list"})]:
         r = reg.call(name, args)
         assert not r.ok and r.speak == NO_TIMEKEEPER_LINE
+
+
+def test_missed_alarms_reach_the_quiet_digest_as_alarms(tmp_path):
+    """kind='alarm' on the rang-out and catch-up missed lines: held during
+    quiet hours they must digest as 'one alarm', not 'one reminder'."""
+    clock = FakeClock(NOW)
+    rec = []
+
+    def say(line, proactive=True, kind="reminder"):
+        rec.append((line, proactive, kind))
+    t = Timekeeper(tmp_path / "tk.db", say=say, cfg={}, now=clock.now,
+                   run=lambda *a, **k: None, ring=False, notify=False,
+                   cache_dir=tmp_path / "cache")
+    try:
+        t.add_alarm(clock.now() - 61 * 60, "wake")
+        t.catch_up()
+        missed = [k for line, _p, k in rec if "missed" in line.lower()]
+        assert missed == ["alarm"], rec
+    finally:
+        t.close()

@@ -195,13 +195,42 @@ def _fish_iter(text: str, timeout: float) -> Iterator[bytes]:
         raise RuntimeError("fish credentials missing")
     session = Session(key)
     started = time.monotonic()
-    for chunk in session.tts(
-            TTSRequest(text=text, reference_id=model, format="wav",
-                       latency="balanced"),
-            backend=FISH_BACKEND):
-        yield chunk
-        if time.monotonic() - started > timeout:
+    # The SDK's httpx client is built with timeout=None, so a connection
+    # that delivers no bytes used to block session.tts() forever and the
+    # old between-chunks deadline never ran -- the TTS worker wedged with
+    # the whole queue behind it. The SDK now iterates on a daemon feeder
+    # thread; this generator waits on the queue with the REMAINING
+    # deadline, so a silent socket raises instead of hanging.
+    q: queue.Queue = queue.Queue(maxsize=64)
+    _end = object()
+
+    def _feed():
+        try:
+            for chunk in session.tts(
+                    TTSRequest(text=text, reference_id=model, format="wav",
+                               latency="balanced"),
+                    backend=FISH_BACKEND):
+                q.put(chunk)
+                if time.monotonic() - started > timeout:
+                    return              # the consumer is raising; stop feeding
+            q.put(_end)
+        except BaseException as exc:    # noqa: BLE001 - carried to the consumer
+            q.put(exc)
+
+    threading.Thread(target=_feed, daemon=True, name="fish-feed").start()
+    while True:
+        remaining = timeout - (time.monotonic() - started)
+        if remaining <= 0:
             raise TimeoutError(f"fish exceeded {timeout}s")
+        try:
+            item = q.get(timeout=max(0.05, remaining))
+        except queue.Empty:
+            raise TimeoutError(f"fish exceeded {timeout}s") from None
+        if item is _end:
+            return
+        if isinstance(item, BaseException):
+            raise item
+        yield item
 
 
 def _fish_stream(text: str, out_path: str, timeout: float) -> dict:
@@ -510,7 +539,15 @@ def retire_own_f5_sidecar() -> bool:
     Called at app shutdown; never touches a systemd-owned process.
     """
     global _f5_proc
-    with _f5_lock:
+    # Bounded acquire: the warm thread holds _f5_lock across a cold start
+    # (up to 180 s) and quit() calls this synchronously on the UI thread.
+    # Skipping retirement on contention is safe -- leaving our sidecar
+    # resident is the documented default, and mid-cold-start there is
+    # nothing to retire yet.
+    if not _f5_lock.acquire(timeout=2):
+        log.info("f5 retire skipped: the warm-up holds the lock")
+        return False
+    try:
         proc = _f5_proc
         if proc is None or proc.poll() is not None:
             return False
@@ -529,6 +566,8 @@ def retire_own_f5_sidecar() -> bool:
             return False
         _f5_proc = None
         return True
+    finally:
+        _f5_lock.release()
 
 
 OUTPUT_GAIN = 1.34               # ~+2.5 dB; peak 0.72 -> ~0.97
@@ -732,9 +771,15 @@ class TTS:
             self._prime_voice()
             return True
         except Exception:
+            # Loud, like _f5_unavailable: edge sends every utterance off the
+            # machine, and a log line is the one place nobody looks. load()'s
+            # edge branch returns before touching _load_lock, so the
+            # recursion cannot deadlock.
             log.exception("XTTS load error — falling back to edge engine")
+            bus.publish(Status(text="XTTS load failed — using edge (cloud voice)",
+                               kind="warn"))
             self._engine = "edge"
-            return False
+            return self.load()
 
     def _prime_voice(self):
         """Compute the speaker conditioning latents once, at load.
@@ -842,6 +887,14 @@ class TTS:
             return False
         self.speak(self.last_text)
         return True
+
+    @property
+    def busy(self) -> bool:
+        """Speaking now OR lines still queued -- the was_talking predicate
+        interrupt() uses. For callers that need "is Jarvis mid-burst":
+        SpeakingState now marks first AUDIO (the honest ledger mark), so
+        during the render window the event says idle while this says busy."""
+        return bool(self._speaking or not self._q.empty())
 
     @property
     def is_speaking(self) -> bool:
@@ -1206,10 +1259,12 @@ class TTS:
                         except OSError:
                             pass
                         continue
+                    used = engine            # who actually rendered it
                     try:
                         if engine == "fish" and self._engine != "fish":
                             # retired mid-reply: straight to the local
                             # engine, no doomed API round-trip first
+                            used = "f5"
                             self._synth_f5(sent, tmp.name)
                         else:
                             synth(sent, tmp.name)
@@ -1239,7 +1294,10 @@ class TTS:
                             pass
                         continue
                     if not self._stop_flag:
-                        self._store(engine, sent, tmp.name)
+                        # under the RENDERING engine's key: F5 audio filed
+                        # as "fish" would replay in the wrong voice from
+                        # cache once the account recovers
+                        self._store(used, sent, tmp.name)
                     wav_q.put((tmp.name, True))
             finally:
                 wav_q.put(_DONE)

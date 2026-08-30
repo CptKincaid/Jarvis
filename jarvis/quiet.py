@@ -64,6 +64,7 @@ _KIND_NOUNS = {
     "timer": ("timer", "timers"),
     "warning": ("warning", "warnings"),
     "message": ("message", "messages"),
+    "alarm": ("alarm", "alarms"),
 }
 _COUNT_WORDS = ["no", "one", "two", "three", "four", "five", "six", "seven",
                 "eight", "nine", "ten", "eleven", "twelve"]
@@ -176,12 +177,14 @@ class QuietPolicy:
     def __init__(self, cfg, get_calendar: Optional[Callable] = None,
                  is_home: Optional[Callable[[], bool]] = None,
                  say: Optional[Callable[[str], None]] = None,
+                 can_speak: Optional[Callable[[], bool]] = None,
                  now: Callable[[], float] = time.time,
                  hold_max: int = HOLD_MAX, tick_s: float = TICK_S):
         self._cfg = cfg
         self._get_calendar = get_calendar
         self._is_home = is_home
         self._say = say
+        self._can_speak = can_speak
         self._now = now
         self.tick_s = float(tick_s)
         self._held: deque = deque(maxlen=max(1, int(hold_max)))
@@ -423,6 +426,17 @@ class QuietPolicy:
                 return ""
             if was is False or not self._held:
                 return ""
+            if self._can_speak is not None:
+                try:
+                    ok = bool(self._can_speak())
+                except Exception:  # noqa: BLE001 - a probe failure must not mute him
+                    ok = True
+                if not ok:
+                    # Mid-capture or mid-turn: the digest talking over an
+                    # open mic is the exact interruption quiet hours exist
+                    # to prevent. Keep the backlog; retry next tick.
+                    self._last_quiet = True
+                    return ""
             text = self.release()
         if text and callable(self._say):
             try:

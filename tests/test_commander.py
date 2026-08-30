@@ -541,6 +541,7 @@ def rich(services, tmp_path, monkeypatch):
 
     services.assistant = FakeAssistantCfg()
     services.timekeeper = MagicMock()
+    services.timekeeper.ringing = False
     services.timekeeper.ringing = None                    # nothing ringing
     services.timekeeper.list_text.return_value = "Nothing set, sir."
     services.timekeeper.cancel.return_value = 1
@@ -953,16 +954,23 @@ def test_voice_still_gates_background_chat(rich, services):
     services.brain.chat.assert_not_called()
 
 
-def test_dictation_still_beats_every_assistant_stage(rich, services,
-                                                     monkeypatch):
+def test_a_ringing_alarm_outranks_dictation_but_only_for_ring_words(
+        rich, services, monkeypatch):
+    """Reversed 2026-08-30 (review finding #7): this test used to pin the
+    OLD order -- dictation swallowed "stop", so a ringing alarm could not
+    be silenced by voice until "end dictation". Now the ring words win
+    while an alarm is actually ringing; everything else is still typed,
+    and the approvals stage still never sees dictated text."""
     typed = []
     monkeypatch.setattr(rich, "_type_raw", lambda t: typed.append(t))
     services.timekeeper.ringing = types.SimpleNamespace(id="a1", label="Get up")
     services.approvals.pending.return_value = [object()]
     rich.handle("jarvis dictate")
     rich.handle("stop")
-    assert typed == ["stop "]
-    services.timekeeper.stop_ringing.assert_not_called()
+    assert typed == [], "the ring-stop was typed into the window"
+    assert services.timekeeper.stop_ringing.called
+    rich.handle("dear sir stop me if you have heard this")
+    assert typed == ["dear sir stop me if you have heard this "]
     services.approvals.answer.assert_not_called()
 
 
@@ -1452,3 +1460,173 @@ def test_a_manager_refusal_is_spoken_as_is(rich, services, clip_project):
     services.claude.submit.return_value = "Claude's still on the last one for proj, sir; I've queued it."
     res = rich.handle("have claude fix what i copied", source="typed")
     assert res.reply.startswith("Claude's still on the last one") and res.speak
+
+
+# ---------------------------------------------------------------------------
+# Review round 2026-08-30: the intent gate vs the unprefixed Tier-1 commands.
+# "standup" and "review my flashcards" were classified NO and dropped
+# silently -- the third recurrence of the silent-drop bug (media words
+# 08-27, study words 08-30). A Tier-1 match now bypasses the gate, and this
+# table forces every FUTURE Tier-1 command to prove its phrase survives.
+# ---------------------------------------------------------------------------
+TIER1_SAMPLES = {
+    "explain document": "explain the biosensors lab handout",
+    "quiz": "quiz me on chapter three",
+    "review flashcards": "review my flashcards",
+    "stop quiz": "stop the quiz",
+    "focus start": "start a focus session",
+    "focus left": "how long left",
+    "focus end": "end the session",
+    "lecture notes": "notes for biosensors",
+    "timer": "set a timer for five minutes",
+    "alarm": "set an alarm for seven",
+    "list schedule": "any timers running",
+    "cancel schedule": "cancel the timer",
+    "briefing": "give me my briefing",
+    "preview": "what does tomorrow look like",
+    "week": "how's my week looking",
+    "briefing section": "no news in the morning",
+    "verbosity": "shorter briefings",
+    "last mail": "what was my last email",
+    "diagnostics": "run diagnostics",
+    "next exam": "when's my next exam",
+    "greeting": "good morning",
+    "day review": "how did yesterday go",
+    "todo done": "mark buy milk as done",
+    "todo add": "add buy milk to my todo list",
+    "todo list": "what's on my todo list",
+    "take note": "take a note buy milk",
+    "show notes": "show my notes",
+    "answer question": "what's your ip address",
+    "remind me": "remind me to call mum at five",
+    "person": "my advisor is Dr Peyrovi",
+    "remember": "remember that my dentist is dr patel",
+    "recall": "what did i say about the thesis",
+    "who is": "who's my advisor",
+    "recap": "recap my day",
+    "quiet status": "are you on do not disturb",
+    "quiet hours off": "turn off quiet hours",
+    "quiet hours": "quiet hours from eleven to seven",
+    "do not disturb": "do not disturb for an hour",
+    "free": "i am free",
+    "standup": "standup",
+    "gpu reclaim": "take the gpu back",
+    "gpu lend": "lend the gpu",
+    "log triage": "anything wrong in your log",
+    "slow turn": "why was that slow",
+    "clip to claude": "have claude fix what i copied",
+    "read control": "skip",
+}
+
+
+def test_every_tier_one_command_has_a_gate_sample():
+    from jarvis.commander import ASSISTANT_TIER1
+    names = {c.name for c in ASSISTANT_TIER1}
+    missing = names - set(TIER1_SAMPLES)
+    extra = set(TIER1_SAMPLES) - names
+    assert not missing and not extra, (
+        f"add a sample for {sorted(missing)} / drop {sorted(extra)}")
+
+
+def test_tier_one_samples_survive_the_intent_gate(tmp_path, monkeypatch):
+    """Every sample either matches its Tier-1 regex outright (gate bypass)
+    or at least classifies as not-NO. Fails when a future command's words
+    are missing from both the matchers' reach and the vocabulary."""
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "l.json")
+    c = object.__new__(Commander)
+    ic = IntentClassifier()
+    for name, phrase in TIER1_SAMPLES.items():
+        if c._match_assistant(phrase):
+            continue
+        verdict, conf = ic.classify(phrase)
+        assert verdict != IntentClassifier.NO, (name, phrase, conf)
+
+
+def test_a_tier_one_match_never_consults_the_classifier(rich, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("the classifier was consulted for a Tier-1 match")
+    monkeypatch.setattr(rich.intent, "classify", boom)
+    res = rich.handle("good morning", source="voice")
+    assert res.handled and res.speak
+
+
+def test_intent_log_is_firewalled_for_the_whole_suite():
+    import os as _os
+    assert str(IntentClassifier.INTENT_LOG) == _os.environ["JARVIS_INTENT_LOG"]
+    assert ".aiws_trainer" not in str(IntentClassifier.INTENT_LOG)
+
+
+# ------------------------------------------------ ringing vs sticky modes
+def test_ringing_alarm_is_reachable_during_lecture_notes(rich):
+    import types as _t
+    rich.lecture_course = "biosensors"
+    added = []
+    rich._lecture = _t.SimpleNamespace(add=lambda b: added.append(b) or 1,
+                                       close=lambda: "closed")
+    rich.services.timekeeper.ringing = True
+    res = rich.handle("stop", source="voice")
+    assert res.handled and added == [], "the ring-stop went into the notes"
+    res = rich.handle("impedance is the ratio", source="voice")
+    assert added == ["impedance is the ratio"], "a note line was eaten"
+
+
+def test_lecture_recovery_keeps_the_source_and_skips_the_gate(rich, monkeypatch):
+    rich.lecture_course = "ghost"
+    rich._lecture = None
+    def boom(*a, **k):
+        raise AssertionError("a typed turn reached the voice gate")
+    monkeypatch.setattr(rich.intent, "classify", boom)
+    res = rich.handle("tell me something wonderful today", source="typed")
+    assert rich.lecture_course is None and res is not None
+
+
+# ------------------------------------------------ "what did I miss?"
+def test_what_did_i_miss_reads_without_ending_the_window(rich):
+    import types as _t
+    q = _t.SimpleNamespace(
+        free=MagicMock(return_value="free!"),
+        release=MagicMock(return_value="While you were busy, sir: one reminder."))
+    rich.services.quiet = q
+    res = rich.handle("what did i miss", source="typed")
+    assert q.release.called and not q.free.called
+    assert res.reply.startswith("While you were busy")
+    q.release.return_value = ""
+    res = rich.handle("anything i missed", source="typed")
+    from jarvis.quiet import NOTHING_HELD_LINE
+    assert res.reply == NOTHING_HELD_LINE and not q.free.called
+    rich.handle("i am free", source="typed")
+    assert q.free.called
+
+
+# ------------------------------------------------ turn serialization
+def test_handle_serializes_concurrent_turns(rich, monkeypatch):
+    import threading as _th
+    import time as _time
+    seen = []
+    def slow_inner(text, source):
+        before = rich._confidence
+        _time.sleep(0.05)
+        seen.append((text, before, rich._confidence))
+        return CommandResult(handled=True, status="ok")
+    monkeypatch.setattr(rich, "_handle_inner", slow_inner)
+    ts = [ _th.Thread(target=rich.handle, args=(t, "voice"), kwargs={"confidence": c})
+           for t, c in (("a", -0.1), ("b", -0.9)) ]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    for text, before, after in seen:
+        want = -0.1 if text == "a" else -0.9
+        assert before == want == after, seen
+
+
+# ------------------------------------------------ feedback log bound
+def test_feedback_log_is_bounded(rich, tmp_path, monkeypatch):
+    fl = tmp_path / "feedback.jsonl"
+    monkeypatch.setattr(Commander, "FEEDBACK_LOG", fl)
+    pad = '{"pad": "' + "x" * 120 + '"}'
+    fl.write_text("\n".join(pad for _ in range(2500)) + "\n")
+    assert fl.stat().st_size > 262144
+    rich._feedback_line("the text", "the status", True, "card")
+    lines = fl.read_text().splitlines()
+    assert len(lines) == 1000 and '"how": "card"' in lines[-1]

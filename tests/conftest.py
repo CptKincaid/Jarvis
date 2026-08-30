@@ -49,6 +49,15 @@ os.environ.setdefault("JARVIS_LEGACY_DIR", str(_TEST_LOG_DIR / "legacy"))
 _TEST_SPOTIFY_TOKEN = Path(os.environ.get("JARVIS_SPOTIFY_TOKEN") or
                            (_TEST_LOG_DIR / "spotify_token.json"))
 os.environ["JARVIS_SPOTIFY_TOKEN"] = str(_TEST_SPOTIFY_TOKEN)
+# The intent classifier's feedback log: tests that resolve "Was that for
+# me?" call log_feedback, which used to write the user's real
+# ~/.aiws_trainer/intent_log.json (found 2026-08-30). Forced, not
+# setdefault: a preset pointing at the live file would defeat the firewall.
+os.environ["JARVIS_INTENT_LOG"] = str(_TEST_LOG_DIR / "intent_log.json")
+# The docs embedding index (jarvis/tools/docs.py: env > config > default):
+# without this a test building the real App indexes into the user's
+# ~/.aiws_trainer/docs_index.
+os.environ["JARVIS_DOCS_INDEX_DIR"] = str(_TEST_LOG_DIR / "docs_index")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -61,6 +70,9 @@ def _firewall_live_log_dir():
     assert config.PATHS.LOG_DIR != live, "PATHS.LOG_DIR still live"
     assert config.PATHS.SPEAK_QUEUE.parent != live, "speak queue still live"
     assert logs.LOG_FILE.parent == _TEST_LOG_DIR
+    from jarvis.commander import IntentClassifier
+    assert IntentClassifier.INTENT_LOG.parent == _TEST_LOG_DIR, \
+        "IntentClassifier.INTENT_LOG still points at the user's real log"
     try:
         from jarvis import jarvis_agent
         assert jarvis_agent.LOG_DIR != live, "jarvis_agent LOG_DIR still live"

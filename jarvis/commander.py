@@ -121,7 +121,11 @@ class IntentClassifier:
     to train a simple text classifier that improves over time.
     """
 
-    INTENT_LOG = Path.home() / ".aiws_trainer" / "intent_log.json"
+    # JARVIS_INTENT_LOG: the test suite (tests/conftest.py) redirects the
+    # feedback log. Tests that answered "Was that for me?" used to write
+    # label noise straight into the user's real classifier data.
+    INTENT_LOG = Path(os.environ.get("JARVIS_INTENT_LOG") or
+                      (Path.home() / ".aiws_trainer" / "intent_log.json"))
     YES = "yes"
     NO = "no"
     UNCERTAIN = "uncertain"
@@ -164,6 +168,14 @@ class IntentClassifier:
         # thesis" UNCERTAIN -- the same silent drop as the media words above.
         "session", "pomodoro", "study", "focus", "how much time", "time left",
         "notes for", "notes on", "end notes", "lecture",
+        # --- review round (2026-08-30): quiz, standup, logs, day review ---
+        # The THIRD recurrence of the same silent drop (media words 08-27,
+        # study words earlier today). The Tier-1 probe in _handle_inner now
+        # bypasses the gate for exact command matches, and this vocabulary
+        # covers the looser phrasings that reach the classifier anyway.
+        "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
+        "review", "cards", "yesterday go", "your logs", "the logs", "triage",
+        "what did i do", "what did i miss",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -177,6 +189,8 @@ class IntentClassifier:
         "mute", "unmute", "snooze", "cancel", "read", "set",
         "call", "remind", "close", "quit", "louder", "quieter",
         "volume", "repeat", "again",
+        # review round 2026-08-30: 1-3-word Tier-1 phrases
+        "quiz", "review", "standup", "drill", "recap", "triage", "explain",
     )
 
     _NEGATIVE_PATTERNS = [
@@ -2966,10 +2980,16 @@ def _h_free(c, t, m):
     q = c._svc("quiet")
     if q is None:
         return None
-    from jarvis.quiet import DND_ALREADY_FREE_LINE, NOTHING_HELD_LINE
+    from jarvis.quiet import BUSY_PREFIX, NOTHING_HELD_LINE
+    if t.startswith(("what did", "anything")):
+        # A question, not an order: read what was held WITHOUT ending the
+        # window. "What did I miss?" used to call free(), which cancelled
+        # an explicit do-not-disturb for good as a side effect.
+        held = q.release(prefix=BUSY_PREFIX)
+        return CommandResult(handled=True, reply=held or NOTHING_HELD_LINE,
+                             speak=True,
+                             status="Held lines" if held else "Nothing held")
     line = q.free()
-    if line == DND_ALREADY_FREE_LINE and t.startswith(("what did", "anything")):
-        line = NOTHING_HELD_LINE
     bus.publish(Status(text="Free", kind="info"))
     return CommandResult(handled=True, reply=line, speak=True, status="Free")
 
@@ -3678,8 +3698,17 @@ class Commander:
     _confidence: Optional[float] = None
     _pending_destructive: Optional[tuple] = None
 
+    # One turn at a time: handle() mutates per-turn fields (_confidence,
+    # _raw_text, _last_turn, _pending_*) and is entered from the voice
+    # worker thread, cmdsock client threads and Discord concurrently.
+    # Class-level default so a test commander built via object.__new__
+    # still has one; RLock because a handler may re-enter handle()
+    # (lecture recovery, corrections re-dispatch).
+    _turn_lock = threading.RLock()
+
     def __init__(self, services):
         self.services = services
+        self._turn_lock = threading.RLock()
         self.intent = IntentClassifier()
         self.dictation = False
         # Lecture-note capture (jarvis/lecture.py): the course name while
@@ -3747,12 +3776,15 @@ class Commander:
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
-        self._confidence = confidence
-        result = self._handle_inner(text, source)
-        # A correction / re-run answers a different utterance: THAT is the
-        # last turn, so a second "no, I said ..." corrects the right text.
-        self._last_turn = LastTurn(getattr(result, "corrected", None) or text,
-                                   result.status or "", time.monotonic())
+        with self._turn_lock:
+            self._confidence = confidence
+            result = self._handle_inner(text, source)
+            # A correction / re-run answers a different utterance: THAT is
+            # the last turn, so a second "no, I said ..." corrects the
+            # right text.
+            self._last_turn = LastTurn(
+                getattr(result, "corrected", None) or text,
+                result.status or "", time.monotonic())
         return result
 
     def shaky_transcript(self) -> bool:
@@ -3775,17 +3807,21 @@ class Commander:
         log.info("handle %r source=%s", text, source)
         self._raw_text = text          # original casing for handlers that need it
 
-        # 1. Dictation mode — type directly, don't route (2611-2630)
+        # 1. A ringing alarm owns the next words (spec 5.2 a) -- checked
+        #    BEFORE the sticky modes: dictation and lecture notes swallow
+        #    every utterance, so a ringing alarm could not be silenced by
+        #    voice until "end notes". _try_ringing returns None unless an
+        #    alarm is actually ringing AND the words are stop/snooze, so
+        #    note lines and dictated text still reach their handlers.
+        res = self._try_ringing(text)
+        if res is not None:
+            return res
+        # 1a. Dictation mode — type directly, don't route (2611-2630)
         if self.dictation:
             return self._handle_dictation(text)
         # 1b. Lecture notes open: file it, unless it is "end notes".
         if getattr(self, "lecture_course", None):
-            return self._handle_lecture(text)
-
-        # 2. A ringing alarm owns the next words (spec 5.2 a).
-        res = self._try_ringing(text)
-        if res is not None:
-            return res
+            return self._handle_lecture(text, source)
         # 2b. "No, I said X": ahead of every yes/no stage, which would read
         #     it as a bare decline (parse_yes_no: any sentence opening with
         #     "no" is a no).
@@ -3880,6 +3916,18 @@ class Commander:
         # A web cue is addressed to Jarvis by construction, like a custom
         # phrase: the classifier called "look up who won the last race"
         # uncertain and asked "Was that for me?" (live, 2026-08-29 23:45).
+        # 4-pre. A Tier-1 assistant command that matches outright is by
+        #    definition addressed to Jarvis -- the same rule as a custom
+        #    phrase. Without this the classifier guessed on "standup" and
+        #    "review my flashcards" and dropped them as background chat:
+        #    the third recurrence of the silent-drop bug that the
+        #    vocabulary patches of 08-27 and 08-30 each fixed once.
+        if gate and source == "voice" and cmd_text is None:
+            name = self._match_assistant(text)
+            if name:
+                log.info("tier-1 match %r bypasses the intent gate: %r",
+                         name, text)
+                gate = False
         if gate and source == "voice" and cmd_text is None \
                 and not WEB_CUE_RX.search(text):
             intent, conf = self.intent.classify(text)
@@ -3898,6 +3946,10 @@ class Commander:
 
     def resolve_uncertain(self, text: str, yes: bool) -> CommandResult:
         """UI feedback for the 'Was this for me?' prompt."""
+        with self._turn_lock:
+            return self._resolve_uncertain_locked(text, yes)
+
+    def _resolve_uncertain_locked(self, text: str, yes: bool) -> CommandResult:
         self.intent.log_feedback(text, yes)
         self._feedback_line(text, "Was that for me?", yes, "card")
         if yes:
@@ -3985,6 +4037,11 @@ class Commander:
                     "ts": datetime.now().isoformat(timespec="seconds"),
                     "text": prev_text[:200], "prev_status": prev_status[:60],
                     "label": "yes" if label else "no", "how": how}) + "\n")
+            # Bounded: an append-only audit file on a box that runs for
+            # months. Past ~256 KB the newest thousand lines are kept.
+            if self.FEEDBACK_LOG.stat().st_size > 262144:
+                lines = self.FEEDBACK_LOG.read_text().splitlines()[-1000:]
+                self.FEEDBACK_LOG.write_text("\n".join(lines) + "\n")
         except Exception:
             log.exception("feedback log write failed")
 
@@ -4101,7 +4158,7 @@ class Commander:
             self._type_raw(text + " ")
         return CommandResult(handled=True, reply=text, status="Dictating")
 
-    def _handle_lecture(self, text: str) -> CommandResult:
+    def _handle_lecture(self, text: str, source: str = "voice") -> CommandResult:
         body = strip_address(text).strip()
         if _LECTURE_END_RX.match(body.lower()):
             capture, self._lecture = self._lecture, None
@@ -4121,7 +4178,10 @@ class Commander:
                                  status="Notes closed")
         if self._lecture is None:          # flag without a file: recover
             self.lecture_course = None
-            return self.handle(text)
+            # _handle_inner, not handle(): the outer handle already set
+            # _confidence, and re-entering handle() would reset the source
+            # to "voice" and put a typed/cli utterance through the gate.
+            return self._handle_inner(text, source)
         try:
             n = self._lecture.add(body)
         except OSError:
@@ -4542,6 +4602,20 @@ class Commander:
         log.info("web lookup (%s): %r", model, d.prompt)
         return CommandResult(handled=True, reply=WEB_LOOKUP_LINE, speak=True,
                              ack=True, status="Looking it up…", done=False)
+
+    def _match_assistant(self, text: str) -> Optional[str]:
+        """The name of the ASSISTANT_TIER1 command whose matcher accepts
+        the bare utterance, else None. A probe only -- no handler runs, no
+        service is consulted -- used to spare exact command matches the
+        intent classifier's guess."""
+        t = text.strip().lower().rstrip(".!?")
+        for cmd in ASSISTANT_TIER1:
+            try:
+                if cmd.matcher(t):
+                    return cmd.name
+            except Exception:
+                log.exception("matcher %s failed", cmd.name)
+        return None
 
     def _try_assistant(self, text: str) -> Optional[CommandResult]:
         """Unprefixed Tier 1 for the assistant tools (jarvis mode)."""

@@ -246,3 +246,129 @@ def test_the_app_does_not_record_a_chat_exchange_twice(monkeypatch, tmp_path):
         except Exception:
             if callable(unsub):
                 unsub()
+
+
+# ----------------------------------------------------------------------
+# 2026-08-30 mega-wave review: CLI mute scoping, turn clobbering, stale
+# worker replies, the presence gate, proactive Claude narration.
+# ----------------------------------------------------------------------
+def _result(**over):
+    base = dict(handled=True, reply=None, speak=False, status="", ack=False, done=True)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def _wire_dispatch(a, **over):
+    """The real _dispatch against a stub commander."""
+    a.commander = SimpleNamespace(handle=lambda t, s, **k: _result(**over))
+    a._emit_result = lambda r: r
+    a._turn_after_result = lambda r: None
+    a._after_dispatch = lambda t, s, r: None
+
+
+def test_a_quiet_cli_turn_mutes_only_its_own_answer(monkeypatch, tmp_path):
+    a = _app(monkeypatch, tmp_path)
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    a.tts = SimpleNamespace(speak=lambda t: a.said.append(t))
+    a._say = app_mod.JarvisApp._say.__get__(a)          # the real gate
+    a._quiet_turn, a._last_source = True, "cli"
+    a._say("the answer, sir")
+    assert a.said == [], "the quiet turn's answer must stay silent"
+    a._async_reply("the answer, sir")                   # delivery clears the mute
+    assert not a._quiet_turn
+    a._say("Sir, your reminder.")
+    assert a.said == ["Sir, your reminder."], "later speech must not be muted"
+
+
+def test_dispatch_text_scopes_the_mute_and_never_interrupts_for_cli(monkeypatch, tmp_path):
+    a = _app(monkeypatch, tmp_path)
+    cuts = []
+    a.interrupt_speech = lambda: cuts.append(1)
+    a.history = SimpleNamespace(add=lambda t: None)
+    a._dispatch = lambda t, s: _result(done=True)
+    a.dispatch_text("what time is it", source="cli", quiet=True)
+    assert cuts == [], "an unattended script call cut Jarvis off mid-sentence"
+    assert not a._quiet_turn, "a sync answer ends the mute with the turn"
+    a.dispatch_text("hello", source="typed")
+    assert cuts == [1], "typed input still barges in"
+
+
+def test_a_cli_request_cannot_close_a_live_voice_turn(monkeypatch, tmp_path):
+    """#4: the socket thread used to kill the voice turn's watchdog."""
+    a = _app(monkeypatch, tmp_path)
+    _wire_dispatch(a, done=True)
+    a._turn_busy.set()                                  # a voice turn is open
+    a._dispatch("what's due", "cli")
+    assert a._turn_busy.is_set(), "the cli turn clobbered the voice turn"
+    a._dispatch("hello", "voice")                       # a voice turn still closes
+    assert not a._turn_busy.is_set()
+
+
+def test_a_stale_worker_reply_is_a_card_only(monkeypatch, tmp_path):
+    from jarvis import events
+    got = []
+    events.bus.subscribe(events.JarvisReply, got.append)
+    try:
+        a = _app(monkeypatch, tmp_path)
+        a._dispatch_gen, a._async_turn = 7, (6, "typed")   # superseded turn
+        a._turn_busy.set()
+        a._async_reply("the late answer, sir")
+        assert a.said == [] and a._turn_busy.is_set(), \
+            "a stale reply spoke / closed the live turn"
+        assert [e.text for e in got] == ["the late answer, sir"] and not got[0].speak
+        a._async_turn = (7, "typed")                       # the live turn's reply
+        a._async_reply("the fresh answer, sir")
+        assert a.said == ["the fresh answer, sir"]
+    finally:
+        events.bus.unsubscribe(events.JarvisReply, got.append)
+
+
+def test_a_barge_mute_dies_with_the_next_dispatch(monkeypatch, tmp_path):
+    a = _app(monkeypatch, tmp_path)
+    _wire_dispatch(a)
+    a._stream_muted = True                              # a fruitless barge left it
+    a._dispatch("hello", "typed")
+    assert not a._stream_muted
+
+
+def test_welcome_back_defers_only_for_a_non_away_reason(monkeypatch, tmp_path):
+    from jarvis.presence import WELCOME_LINE
+    a = _app(monkeypatch, tmp_path)
+    a.quiet = SimpleNamespace(reason=lambda: "quiet hours until 7:00 am",
+                              release=lambda: "held stuff")
+    a._on_presence(SimpleNamespace(home=True, returned=True))
+    assert a.said == [], "the greeting must wait out quiet hours"
+    a.quiet = SimpleNamespace(reason=lambda: "you're out",   # stale away reading
+                              release=lambda: "held stuff")
+    a._on_presence(SimpleNamespace(home=True, returned=True))
+    assert a.said == [WELCOME_LINE, "held stuff"]
+
+
+def test_claude_narration_is_proactive_so_quiet_can_hold_it(monkeypatch, tmp_path):
+    a = _app(monkeypatch, tmp_path)
+    spoken = []
+    a._say = lambda text, proactive=False, kind="message": spoken.append((text, proactive))
+    a._alert = lambda *x, **k: None
+    a._last_milestone = {}
+    a._on_claude_progress(SimpleNamespace(milestone=True, line="Halfway, sir.",
+                                          task_id="t1", project="jarvis"))
+    assert spoken == [("Halfway, sir.", True)]
+
+
+def test_briefing_state_is_written_atomically(monkeypatch, tmp_path):
+    a = _app(monkeypatch, tmp_path)
+    a._mark_briefing_delivered()
+    assert json.loads((tmp_path / "briefing.json").read_text())["delivered"]
+    assert list(tmp_path.glob("*.tmp")) == [], "the temp file must be renamed away"
+
+
+def test_barge_in_works_during_the_render_gap(monkeypatch, tmp_path):
+    """#8: no SpeakingState edge yet, but the queue is loaded: barge must cut."""
+    monkeypatch.setattr(CONFIG, "barge_in", True)
+    monkeypatch.setattr(CONFIG, "sound", False)
+    cut = []
+    a = _app(monkeypatch, tmp_path, tts=SimpleNamespace(busy=True))
+    a.interrupt_speech = lambda: cut.append(1) or True
+    a._tts_active = False                               # the edge has not risen yet
+    a._on_hotword(0.9)
+    assert cut == [1]

@@ -98,3 +98,73 @@ def test_the_fallback_engine_is_local(tmp_path):
     """If the fallback were also hosted, an outage would still be silence."""
     assert tts_mod.FISH_FALLBACK in ("f5", "xtts", "edge")
     assert tts_mod.FISH_FALLBACK != "fish"
+
+
+def test_a_stalled_connection_raises_instead_of_wedging(monkeypatch):
+    """The SDK's httpx client has timeout=None: a socket that delivers no
+    bytes used to block session.tts() forever, and the old between-chunks
+    deadline never ran -- the TTS worker (and everything queued behind it)
+    wedged. The feeder-thread iterator must raise on the wall clock."""
+    import sys
+    import threading as th
+    import time
+    import types as ty
+
+    class _Sess:
+        def __init__(self, key):
+            pass
+
+        def tts(self, req, backend=None):
+            th.Event().wait(10)          # a connection delivering nothing
+            yield b""                    # pragma: no cover - never reached
+
+    mod = ty.ModuleType("fish_audio_sdk")
+    mod.Session = _Sess
+    mod.TTSRequest = lambda **k: None
+    monkeypatch.setitem(sys.modules, "fish_audio_sdk", mod)
+    monkeypatch.setattr(tts_mod, "_fish_creds", lambda: ("k", "m"))
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError):
+        list(tts_mod._fish_iter("hello", timeout=0.3))
+    assert time.monotonic() - t0 < 3.0, "raised on the wall clock, not the stream"
+
+
+def test_chunks_still_flow_through_the_feeder(monkeypatch):
+    import sys
+    import types as ty
+
+    class _Sess:
+        def __init__(self, key):
+            pass
+
+        def tts(self, req, backend=None):
+            yield b"ab"
+            yield b"cd"
+
+    mod = ty.ModuleType("fish_audio_sdk")
+    mod.Session = _Sess
+    mod.TTSRequest = lambda **k: None
+    monkeypatch.setitem(sys.modules, "fish_audio_sdk", mod)
+    monkeypatch.setattr(tts_mod, "_fish_creds", lambda: ("k", "m"))
+    assert list(tts_mod._fish_iter("hello", timeout=5)) == [b"ab", b"cd"]
+
+
+def test_an_xtts_load_failure_is_loud_and_still_speaks(tmp_path, monkeypatch):
+    """The XTTS->edge hop used to be one log line and a False (the caller
+    dropped the utterance). It must announce the CLOUD fallback on the bus
+    and hand back edge's verdict so the line is still spoken."""
+    import sys
+    ref = tmp_path / "ref.wav"
+    ref.write_bytes(b"RIFF")
+    monkeypatch.setattr(tts_mod, "VOICE_REF", ref)
+    # the transformers shim import is the first heavy step: fail there,
+    # cheaply, before any model download could start
+    monkeypatch.setitem(sys.modules, "transformers.pytorch_utils", None)
+    published = []
+    monkeypatch.setattr(tts_mod.bus, "publish", published.append)
+    t = TTS(engine="xtts", cache_dir=tmp_path / "c")
+    assert t.load() is True, "edge can speak; the utterance is not dropped"
+    assert t.engine == "edge"
+    warns = [e for e in published
+             if getattr(e, "kind", "") == "warn" and "edge" in getattr(e, "text", "")]
+    assert warns, "the cloud fallback must be announced, not just logged"

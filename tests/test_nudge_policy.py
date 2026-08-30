@@ -273,3 +273,14 @@ def test_the_hotword_arms_the_wake_flag_after_its_refusal_checks(monkeypatch):
     monkeypatch.setattr(CONFIG, "barge_in", False)
     a._on_hotword(0.9)
     assert a._wake_pending is True
+
+
+def test_no_nudge_while_a_reply_is_still_rendering(monkeypatch):
+    """The SpeakingState edge now rises at first AUDIO, so tts.busy is the
+    truthful "he is talking" predicate during the render gap."""
+    a = _app(monkeypatch)
+    a.tts = SimpleNamespace(busy=True)
+    a._turn_from_wake = True
+    a._stop_event = None
+    a._nudge("empty")
+    assert a.said == [] and a.beeps == []

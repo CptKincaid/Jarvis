@@ -348,3 +348,19 @@ def test_skip_current_cuts_one_utterance_and_the_next_still_plays(monkeypatch):
     assert second.wait(2)
     assert played[0] == ("cut", 1)                     # cut with one still queued
     assert len(played) == 2                            # the second one played
+
+
+def test_a_retired_reply_is_cached_under_the_engine_that_rendered_it(
+        tmp_path, monkeypatch, fish):
+    """Fish retired mid-reply renders the rest via F5 -- filing that audio
+    under the fish cache key replayed the WRONG VOICE from cache once the
+    account recovered."""
+    t = fish
+    monkeypatch.setattr(tts_mod, "FISH_STREAM_PLAYBACK", False)
+    monkeypatch.setattr(t, "_start_amp_feeder", lambda p: None)
+    monkeypatch.setattr(t, "_synth_f5", lambda text, out: write_wav(out))
+    stored = []
+    monkeypatch.setattr(t, "_store", lambda engine, text, path: stored.append(engine))
+    t._engine = "f5"                     # retire_fish() already flipped it
+    t._speak_pipelined("Hello there, sir.", "fish")
+    assert stored and set(stored) == {"f5"}, stored

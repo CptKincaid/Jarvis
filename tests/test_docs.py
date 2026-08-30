@@ -109,6 +109,15 @@ def folder(tmp_path):
     return d
 
 
+@pytest.fixture(autouse=True)
+def _fresh_env_index(tmp_path, monkeypatch):
+    """conftest firewalls JARVIS_DOCS_INDEX_DIR for the whole session so a
+    real-App test cannot touch ~/.aiws_trainer/docs_index -- but env beats
+    cfg by design, so every test here would share ONE chromadb store and
+    bleed state. Each test gets its own."""
+    monkeypatch.setenv("JARVIS_DOCS_INDEX_DIR", str(tmp_path / "env_index"))
+
+
 @pytest.fixture
 def cfg(tmp_path, folder):
     return {"docs": {"paths": [str(folder)], "index_dir": str(tmp_path / "index"),

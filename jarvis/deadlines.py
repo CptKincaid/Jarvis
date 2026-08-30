@@ -202,13 +202,22 @@ class DeadlineHeadsUp:
 
     # ----------------------------------------------------------- thread
     def start(self) -> None:
-        if self._thread is not None:
+        # Alive-guard + clear, like presence.py: a stopped instance can be
+        # started again (tests, a config reload), and a dead thread must
+        # not block a fresh one.
+        if self._thread is not None and self._thread.is_alive():
             return
+        self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True, name="deadlines")
         self._thread.start()
 
     def stop(self) -> None:
         self._stop.set()
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            # a tick in flight (Discord post, Canvas fetch) must not outlive
+            # stop_assistant into the teardown
+            t.join(timeout=2.0)
 
     def _run(self) -> None:
         # first pass a little after boot: the calendar refresh and the

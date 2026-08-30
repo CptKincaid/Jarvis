@@ -1464,7 +1464,10 @@ class Timekeeper:
         self._finish_alarm(item, now, "missed")
         line = RING_TIMEOUT_LINE.format(label=item.spoken_label(),
                                         time=_when_words(_to_dt(item.due), _to_dt(now)))
-        effects.append(lambda: self._speak(line))
+        # kind="alarm": in a quiet-hours digest a missed alarm must read as
+        # an alarm, not a "reminder" (the ring itself at fire time already
+        # goes out proactive=False).
+        effects.append(lambda: self._speak(line, kind="alarm"))
         effects.append(lambda: bus.publish(AlarmStopped(alarm_id=item.id, action="timeout", snooze_min=0)))
         log.info("timekeeper: alarm %r rang out (missed)", item.label)
 
@@ -1570,7 +1573,8 @@ class Timekeeper:
         if spoken_missed:
             parts = [f"{m.spoken_label()} at {_when_words(_to_dt(m.effective_due), _to_dt(now))}"
                      for m in spoken_missed]
-            effects.append(lambda: self._speak(MISSED_LINE.format(what=join_and(parts))))
+            effects.append(lambda: self._speak(
+                MISSED_LINE.format(what=join_and(parts)), kind="alarm"))
         for fx in effects:
             try:
                 fx()

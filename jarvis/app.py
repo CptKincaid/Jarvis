@@ -397,11 +397,20 @@ class JarvisApp:
         if mod is None:
             return None
         presence = self.presence
-        policy = mod.QuietPolicy(
-            self.assistant,
+        def _can_speak():
+            # The catch-up digest must not land mid-capture or over a turn:
+            # a 30 s tick retries until the floor is clear.
+            return not (self._turn_busy.is_set() or self._audio_busy.is_set()
+                        or getattr(getattr(self, "recorder", None), "recording", False)
+                        or getattr(getattr(self, "tts", None), "busy", False) is True)
+        kwargs = dict(
             get_calendar=lambda: getattr(getattr(self, "services", None), "calendar", None),
             is_home=(presence.is_home if presence is not None else None),
             say=self._say)                  # the digest is an answer, never held
+        try:
+            policy = mod.QuietPolicy(self.assistant, can_speak=_can_speak, **kwargs)
+        except TypeError:                   # quiet.py without the predicate yet
+            policy = mod.QuietPolicy(self.assistant, **kwargs)
         try:
             from jarvis.channels import notify
             notify.set_quiet_gate(policy.is_quiet)
@@ -504,14 +513,31 @@ class JarvisApp:
         exactly as a brain reply does in _on_brain_tags. Without this door
         a done=False command only ended when the 60 s watchdog fired, and
         the next question needed the wake word."""
+        at = getattr(self, "_async_turn", None)
+        if at is not None:
+            gen, src = at
+            stale = gen != getattr(self, "_dispatch_gen", 0) or \
+                (src == "voice" and not self._turn_busy.is_set())
+            if stale:
+                # A newer turn owns the floor (or the watchdog closed this
+                # one): the late answer is shown, never spoken, and it must
+                # not close the live turn or open a mic over it.
+                log.info("stale worker reply shown as a card only")
+                if text:
+                    bus.publish(JarvisReply(text=text, speak=False))
+                return
+            self._async_turn = None
         self._turn_finished()
         if not text:
             return
-        bus.publish(JarvisReply(text=text, speak=speak))
+        bus.publish(JarvisReply(text=text, speak=speak,
+                                turn_id=getattr(self, "_active_turn_id", "")))
         if speak:
             self._say(text)
             if self._last_source == "voice":
                 self._followup_after_speech = True
+        if getattr(self, "_last_source", "") == "cli":
+            self._quiet_turn = False    # this CLI turn's answer is delivered
         try:
             self.context.add_exchange(self._last_user_text, text)
         except Exception:
@@ -793,11 +819,14 @@ class JarvisApp:
                     # option available. What made a long reply feel wrong was
                     # the gap between chunks, and that is fixed in the
                     # splitter (tts._split_sentences), not by saying less.
+                    tid = getattr(self, "_active_turn_id", "")
                     if briefing is not None:
-                        bus.publish(BriefingReady(sections=briefing, spoken=content))
+                        bus.publish(BriefingReady(sections=briefing, spoken=content,
+                                                  turn_id=tid))
                         briefing = None
                     else:
-                        bus.publish(JarvisReply(text=content, speak=not streamed))
+                        bus.publish(JarvisReply(text=content, speak=not streamed,
+                                                turn_id=tid))
                     if not streamed:          # streamed sentences already spoke
                         self._say(content)
                     if offer:
@@ -832,6 +861,8 @@ class JarvisApp:
                 # SILENT (and bare DONE): nothing to do
             except Exception:
                 log.exception("brain tag %s failed", tag)
+        if getattr(self, "_last_source", "") == "cli":
+            self._quiet_turn = False    # this CLI turn's answer is delivered
         if briefing is not None:                       # a card with no SPEAK
             bus.publish(BriefingReady(sections=briefing, spoken=""))
 
@@ -847,7 +878,8 @@ class JarvisApp:
     def _on_claude_progress(self, ev):
         if ev.milestone and ev.line:
             self._last_milestone[ev.task_id] = ev.line
-            self._say(ev.line)
+            # Proactive: quiet hours / DND hold the narration for the digest
+            self._say(ev.line, proactive=True)
             self._alert("milestone", f"Claude · {ev.project}", ev.line)
 
     def _on_claude_state(self, ev):
@@ -861,7 +893,7 @@ class JarvisApp:
             # milestone; do not say it twice.
             if self._last_milestone.pop(ev.task_id, None) != line:
                 bus.publish(JarvisReply(text=line, speak=True))
-                self._say(line)
+                self._say(line, proactive=True)
             self._alert("blocked", f"Claude · {ev.project}", line)
             self._journal_claude(ev.project, "failed", ev.text or line)
         elif ev.state == "cancelled":
@@ -910,7 +942,7 @@ class JarvisApp:
         spoken = self._spoken_cap(spoken or text) or \
             f"Claude's finished with {ev.project or 'the task'}, sir."
         bus.publish(JarvisReply(text=spoken, speak=True))
-        self._say(spoken)
+        self._say(spoken, proactive=True)
         # The alert queues before the journal writes: a listener waiting on
         # the reply then flushing the alerts must find it queued already.
         self._alert("done", f"Claude · {ev.project}", spoken)
@@ -927,8 +959,20 @@ class JarvisApp:
         if not ev.home or not ev.returned:
             return
         from jarvis.presence import WELCOME_LINE
-        self._say(WELCOME_LINE)
         quiet = getattr(self, "quiet", None)
+        if quiet is not None:
+            try:
+                reason = quiet.reason()
+            except Exception:
+                log.exception("presence: quiet gate failed")
+                reason = ""
+            # "you're out" is quiet.py's away reason: stale by definition on
+            # a returned event, so it never defers the greeting. Any OTHER
+            # reason (hours, DND, a meeting) does -- the backlog then waits
+            # for the policy's own tick.
+            if reason and reason != "you're out":
+                return
+        self._say(WELCOME_LINE)
         if quiet is None:
             return
         try:
@@ -1126,7 +1170,12 @@ class JarvisApp:
         # A streamed reply keeps the turn open for as long as the model is
         # producing sentences, so the turn gate must not refuse it: that
         # made barge-in unreachable exactly when a reply was long.
-        barge = CONFIG.barge_in and getattr(self, "_tts_active", False)
+        # _tts_active only rises at first AUDIO now (the honest ledger
+        # mark), so during the render gap it is False while a reply is very
+        # much on the way -- the TTS queue is the truthful predicate.
+        speaking = getattr(getattr(self, "tts", None), "busy", False) is True or \
+            getattr(self, "_tts_active", False)
+        barge = CONFIG.barge_in and speaking
         if self._audio_busy.is_set() or (self._turn_busy.is_set() and not barge):
             # Transcription of the previous utterance is still running (~20 s
             # for a long clip). Starting a second capture here raced two
@@ -1415,6 +1464,9 @@ class JarvisApp:
         self._say_again_count = 0
         self._stream_muted = False
         self._quiet_turn = False              # CLI turn asked for text only
+        self._active_turn_id = ""             # stamps this turn's replies (cli)
+        self._async_turn = None               # (gen, source) of a done=False turn
+        self._dispatch_gen = 0
         # speculative transcription (_maybe_speculate) and the nudge policy
         self._speculation = None
         self._spec_lock = threading.Lock()
@@ -1516,7 +1568,8 @@ class JarvisApp:
         """A clear wake word in a voice that is not the enrolled one."""
         if score < 0.85 or not CONFIG.talkback:
             return
-        if getattr(self, "_tts_active", False):
+        if getattr(getattr(self, "tts", None), "busy", False) is True or \
+                getattr(self, "_tts_active", False):
             return          # under barge-in the listener hears his own voice
         now = time.monotonic()
         if now - self._last_guest_ts < 180.0:
@@ -1582,7 +1635,9 @@ class JarvisApp:
         try:
             p = self._briefing_state_path()
             p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps({"delivered": datetime.now().date().isoformat()}))
+            tmp = p.with_suffix(".tmp")     # a torn write must not eat the day
+            tmp.write_text(json.dumps({"delivered": datetime.now().date().isoformat()}))
+            os.replace(tmp, p)
         except OSError:
             log.debug("briefing state save failed", exc_info=True)
 
@@ -1890,7 +1945,8 @@ class JarvisApp:
             return
         if not self._listening_opt("nudge", True):
             return
-        if getattr(self, "_tts_active", False):
+        if getattr(getattr(self, "tts", None), "busy", False) is True or \
+                getattr(self, "_tts_active", False):
             return                      # he is talking already (a barge-in wake)
         now = time.monotonic()
         cooldown = float(self._listening_opt("nudge_cooldown_s", 30) or 0)
@@ -1936,6 +1992,14 @@ class JarvisApp:
         # Voice only: a typed answer is visible as it arrives, so being told to
         # wait is just noise.
         self._last_user_text, self._last_source = text, source
+        # A barge's mute must not outlive the barged turn: a typed reply
+        # used to arrive silently after a fruitless barge-in capture.
+        self._stream_muted = False
+        # Every dispatch supersedes older done=False worker replies
+        # (_async_reply checks this before speaking a late answer).
+        self._dispatch_gen = getattr(self, "_dispatch_gen", 0) + 1
+        if source != "cli":
+            self._active_turn_id = ""
         if source == "voice":
             self._turn_start()
             self.turns.mark("handle")
@@ -1951,11 +2015,18 @@ class JarvisApp:
                 self._turn_after_result(result)
             self._after_dispatch(text, source, result)
         except Exception:
-            self._turn_finished()
+            if source == "voice":
+                self._turn_finished()
             raise
+        if getattr(result, "done", True) is False:
+            self._async_turn = (self._dispatch_gen, source)
+        else:
+            self._async_turn = None
         # done=False means the answer is still coming on a worker thread (the
-        # commander routes local chat that way). Anything else is over now.
-        if source != "voice" or getattr(result, "done", True) is not False:
+        # commander routes local chat that way). Only the voice path opened a
+        # turn: closing one here for cli/typed/discord clobbered a live voice
+        # turn's watchdog and busy guard from the socket thread.
+        if source == "voice" and getattr(result, "done", True) is not False:
             self._turn_finished()
         if getattr(self, "_reopen_mic", False):
             self._reopen_mic = False
@@ -2133,21 +2204,34 @@ class JarvisApp:
             self._turn_finished()
         return result
 
-    def dispatch_text(self, text, source="typed", quiet=False):
+    def dispatch_text(self, text, source="typed", quiet=False, turn_id=""):
         """MainWindow calls this on a worker thread for typed input; the
         Discord channel with source='discord'; the command socket
         (jarvis/cmdsock.py) with source='cli', on the client's thread.
-        `quiet` (cli only) answers in text and keeps the soundbar silent."""
+        `quiet` (cli only) answers in text and keeps the soundbar silent;
+        `turn_id` (cli) stamps this turn's replies for the socket stream."""
         text = (text or "").strip()
         if not text:
             return None
         # Barge-in: a typed command while Jarvis is talking cuts him off
         # (the films' JARVIS never talks over Tony), then gets answered.
-        self.interrupt_speech()
+        # NOT for cli: an unattended script or cron call must not cut a
+        # reply he is speaking to someone in the room.
+        if source != "cli":
+            self.interrupt_speech()
         if source == "typed":
             self.history.add(text)
         self._quiet_turn = bool(quiet) and source == "cli"
-        return self._dispatch(text, source)
+        self._active_turn_id = turn_id or ""
+        result = None
+        try:
+            result = self._dispatch(text, source)
+            return result
+        finally:
+            # The mute is per turn. A sync answer ends it here; a done=False
+            # turn keeps it until _async_reply / the brain tags deliver.
+            if result is None or getattr(result, "done", True) is not False:
+                self._quiet_turn = False
 
     # ------------------------------------------------------------ lifecycle
     def start_models(self):
@@ -2219,11 +2303,19 @@ class JarvisApp:
             except Exception:
                 log.exception("health watchdog failed to start")
         sampler = getattr(self.services, "activity_sampler", None)
-        if sampler is not None and self.assistant.get("journal.enabled", True):
+        if sampler is not None:
             try:
-                sampler.start()
+                # Retention is not optional: exchanges and tool calls are
+                # journaled regardless of the sampler switch, so old day
+                # files must be pruned even with journal.enabled false.
+                sampler.prune()
             except Exception:
-                log.exception("activity sampler failed to start")
+                log.exception("journal prune failed")
+            if self.assistant.get("journal.enabled", True):
+                try:
+                    sampler.start()
+                except Exception:
+                    log.exception("activity sampler failed to start")
         for name, obj in (("presence", self.presence), ("quiet", self.quiet)):
             if obj is None:
                 continue

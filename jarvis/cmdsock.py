@@ -44,6 +44,7 @@ import queue
 import socket
 import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Optional
 
@@ -62,9 +63,16 @@ NOT_RUNNING_LINE = "Jarvis is not running (no command socket)."
 
 
 class ReplyCollector:
-    """Queue the bus events of one turn; the socket thread drains it."""
+    """Queue the bus events of one turn; the socket thread drains it.
 
-    def __init__(self):
+    ``turn_id`` filters out replies STAMPED for a different turn (another
+    CLI client's answer landing on the shared bus must not close this
+    stream with the wrong text). Untagged events pass through: voice and
+    typed turns do not stamp, and dropping them would break the idle-edge
+    heuristics this stream already relies on."""
+
+    def __init__(self, turn_id: str = ""):
+        self.turn_id = turn_id
         self.q: "queue.Queue[tuple]" = queue.Queue()
         self._subs = ((JarvisReply, self._on_reply), (Status, self._on_status),
                       (BrainState, self._on_state), (BriefingReady, self._on_briefing))
@@ -78,10 +86,18 @@ class ReplyCollector:
         for etype, fn in self._subs:
             bus.unsubscribe(etype, fn)
 
+    def _foreign(self, ev) -> bool:
+        tid = getattr(ev, "turn_id", "")
+        return bool(self.turn_id and tid and tid != self.turn_id)
+
     def _on_reply(self, ev):
+        if self._foreign(ev):
+            return
         self.q.put(("reply", {"kind": "reply", "text": ev.text, "speak": bool(ev.speak)}))
 
     def _on_briefing(self, ev):
+        if self._foreign(ev):
+            return
         text = ev.spoken or json.dumps(ev.sections)
         self.q.put(("reply", {"kind": "reply", "text": text, "speak": bool(ev.spoken),
                               "sections": ev.sections}))
@@ -213,9 +229,11 @@ class CommandSocket:
             _send(conn, {"kind": "end", "reason": "done"})
             return
         log.info("cli: %r%s", text, " (quiet)" if quiet else "")
-        with ReplyCollector() as col:
+        turn_id = uuid.uuid4().hex[:12]
+        with ReplyCollector(turn_id) as col:
             bus.publish(UserUtterance(text=text, source="cli"))
-            result = self.app.dispatch_text(text, source="cli", quiet=quiet)
+            result = self.app.dispatch_text(text, source="cli", quiet=quiet,
+                                            turn_id=turn_id)
             reason = self._stream(conn, col, result, timeout)
         _send(conn, {"kind": "end", "reason": reason})
 
