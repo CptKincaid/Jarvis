@@ -55,7 +55,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from jarvis import pronounce
-from jarvis.config import PATHS
+from jarvis.config import CONFIG, PATHS
 from jarvis.events import SpeakingState, bus
 from jarvis.logs import get_logger
 from jarvis.speech_cache import SpeechCache
@@ -119,6 +119,25 @@ FISH_MODEL_FILE = Path.home() / ".config" / "jarvis" / "fish_model_id"
 FISH_BACKEND = "s2.1-pro"
 FISH_TIMEOUT_S = 10.0
 FISH_FALLBACK = "f5"          # must stay LOCAL, or an outage is still silence
+
+# Running out of credit is NOT the same failure as the network blinking, and
+# must not be handled the same way. A blip should cost one chunk; an exhausted
+# balance will fail EVERY chunk forever, so retrying the API before each
+# fallback would add a doomed round-trip to every sentence Jarvis ever speaks.
+# When we see a payment/quota error we switch to the local engine for good and
+# persist it, so the next launch starts local instead of rediscovering this.
+_FISH_CREDIT_MARKERS = ("402", "payment required", "insufficient", "quota",
+                        "out of credit", "credit", "balance", "billing")
+
+
+def _is_out_of_credit(exc: BaseException) -> bool:
+    """True when a fish failure means the balance is gone, not the network."""
+    text = f"{type(exc).__name__}: {exc}".lower()
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    if status == 402:
+        return True
+    # "credit"/"balance" are broad, so require an explicit payment signal too
+    return any(m in text for m in _FISH_CREDIT_MARKERS)
 
 
 def _fish_creds():
@@ -185,13 +204,22 @@ F5_PYTHON = PATHS.F5_PYTHON
 F5_SOCK = PATHS.F5_SOCK
 F5_SERVER = PATHS.REPO_ROOT / "scripts" / "f5_server.py"
 
-# Chosen by ear 2026-08-28. nfe_step is the latency lever: F5 is flow-matching
-# and runs a FIXED number of denoising steps regardless of text length, so the
-# default 32 costs ~1.9 s per call even for two words. 8 is the lowest without
-# artefacts. speed 0.70 was preferred at every chunk length tested; 0.50 left
-# too long a pause at full stops, because lowering speed stretches the
-# silences as well as the words. Both are in the cache key.
-F5_PARAMS = dict(nfe_step=8, speed=0.7)
+# Settled by BLIND listening, rounds 1-5, 2026-08-28/29 (see
+# ~/voice-training/NOTES.md). This configuration, with the duration floor in
+# scripts/f5_server.py and reference clip 0341, scored 5.00 against the real
+# hosted Fish control at 5.00 -- straight 5s, indistinguishable in a shuffled
+# set.
+#
+# nfe_step 10, NOT 8. 8 is outside F5's pruned EPSS timestep table, which
+# defines schedules only for n in {5, 6, 7, 10, 12, 16}; quality saturates at
+# 10 and 12 grazes the latency gate. speed 0.85, not 0.70: 0.70 was chosen by
+# ear before the duration floor existed, when slowing the whole utterance was
+# the only lever available for short lines. The floor fixes that at its
+# source, so the global rate no longer has to compensate -- and 0.85 measured
+# as the closest match to the target speaker's articulation.
+#
+# Both are in the cache key, so changing them invalidates cached audio.
+F5_PARAMS = dict(nfe_step=10, speed=0.85)
 
 _f5_proc = None
 _f5_lock = threading.Lock()
@@ -754,13 +782,18 @@ class TTS:
                     tmp.close()
                     try:
                         synth(sent, tmp.name)
-                    except Exception:
+                    except Exception as exc:
                         log.exception("%s chunk synth failed: %.60s",
                                       engine, sent)
                         if engine == "fish":
                             # the network died mid-reply: finish locally
-                            # rather than dropping the rest of the sentence
+                            # rather than dropping the rest of the sentence.
+                            # An exhausted balance is different: retire fish
+                            # for good so later chunks and later launches do
+                            # not each pay a doomed API round-trip first.
                             try:
+                                if _is_out_of_credit(exc):
+                                    self.retire_fish("out of credit")
                                 log.warning("falling back to %s for this chunk",
                                             FISH_FALLBACK)
                                 if self.load_fallback():
@@ -970,6 +1003,27 @@ class TTS:
             # non-zero exit → try the next player in the chain
 
     # -------------------------------------------------------- synthesis
+    def retire_fish(self, reason: str):
+        """Switch to the local engine permanently and remember the choice.
+
+        Called when fish fails in a way that will not recover on its own
+        (an exhausted balance). Idempotent: safe to call on every chunk of a
+        reply that is failing repeatedly.
+        """
+        if self._engine == FISH_FALLBACK:
+            return
+        log.warning("fish retired (%s) — switching to %s permanently",
+                    reason, FISH_FALLBACK)
+        self._engine = FISH_FALLBACK
+        try:
+            CONFIG.tts_engine = FISH_FALLBACK
+            CONFIG.save()
+            log.info("persisted tts_engine=%s", FISH_FALLBACK)
+        except Exception:
+            # a failed save must not take the voice down; the session is
+            # already local, only the persistence is lost.
+            log.exception("could not persist tts_engine")
+
     def load_fallback(self) -> bool:
         """Bring the local fallback engine up (used when fish fails)."""
         if FISH_FALLBACK == "f5":

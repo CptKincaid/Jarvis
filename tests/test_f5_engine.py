@@ -15,6 +15,7 @@ SETTINGS, all chosen by listening on 2026-08-28:
                0.50 was rated too slow, "too long of a pause at periods" --
                lowering speed stretches the silences, not just the words.
 """
+from pathlib import Path
 import json
 import socket
 import types
@@ -30,8 +31,15 @@ def test_f5_is_a_registered_engine():
 
 
 def test_the_settings_are_the_ones_chosen_by_ear():
-    assert tts_mod.F5_PARAMS["nfe_step"] == 8
-    assert tts_mod.F5_PARAMS["speed"] == 0.7
+    """Pinned by BLIND listening, rounds 1-5 (2026-08-29), not by preference.
+
+    nfe_step MUST stay in F5's pruned EPSS timestep table {5,6,7,10,12,16} --
+    8 is outside it. speed 0.85 replaced 0.70 once scripts/f5_server.py grew
+    the affine duration floor: 0.70 existed only to stretch short utterances,
+    which the floor now fixes at its source.
+    """
+    assert tts_mod.F5_PARAMS["nfe_step"] == 10
+    assert tts_mod.F5_PARAMS["speed"] == 0.85
 
 
 def test_the_reference_and_its_transcript_both_exist():
@@ -76,7 +84,7 @@ def test_synthesis_sends_the_text_and_the_settings(tmp_path, monkeypatch):
     t._synth_f5("Good evening, sir.", str(out))
     assert sent["text"] == "Good evening, sir."
     assert sent["out"] == str(out)
-    assert sent["nfe"] == 8 and sent["speed"] == 0.7
+    assert sent["nfe"] == 10 and sent["speed"] == 0.85
 
 
 def test_a_sidecar_error_is_raised_not_swallowed(tmp_path, monkeypatch):
@@ -95,3 +103,115 @@ def test_load_falls_back_when_the_sidecar_will_not_start(tmp_path, monkeypatch):
     t = TTS(engine="f5", cache_dir=tmp_path / "c")
     assert t.load() is False
     assert t.engine == "edge"
+
+
+# --------------------------------------------------------- duration floor
+#
+# F5 starves short text: utils_infer allots the generated span strictly
+# PROPORTIONAL to gen-text bytes through the origin, but real speech is
+# AFFINE (sec = 0.2540 + 0.04988*bytes, r=0.960 over the 400-clip corpus).
+# Before the floor, "Understood." rendered as literal SILENCE and 7 of 24
+# short lines failed. These tests pin the two properties that make the fix
+# safe to ship: it NEVER touches normal-length text, and it always lengthens.
+
+def _floor():
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "f5_server", Path(__file__).resolve().parent.parent / "scripts" / "f5_server.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# reference 0341 as infer() actually sees it, after preprocess_ref_audio_text
+REF_FRAMES, REF_TEXT_BYTES = 528, 109
+
+
+def test_floor_is_a_no_op_on_normal_length_text():
+    """The whole safety argument: long-form output must be byte-identical."""
+    m = _floor()
+    for text in ("You have seven meetings before noon. I'd offer sympathy, "
+                 "sir, but you scheduled them yourself.",
+                 "The first is Thermodynamics at twenty past three in the "
+                 "evening, in the Emerging Technologies Building."):
+        assert m.duration_floor(REF_FRAMES, REF_TEXT_BYTES, text, 0.85) is None
+
+
+def test_floor_binds_on_the_acknowledgements_that_used_to_collapse():
+    m = _floor()
+    for text in ("Always, sir.", "Understood.", "It is done.", "At once, sir."):
+        fd = m.duration_floor(REF_FRAMES, REF_TEXT_BYTES, text, 0.85)
+        assert fd is not None, f"{text!r} must be floored"
+        # a floor may only ever LENGTHEN: the result must exceed the reference
+        assert fd > REF_FRAMES / m.MEL_FPS
+
+
+def test_floor_boundary_is_where_the_two_lines_cross():
+    """C=0.45 stops binding at 41 bytes; that crossover is the design."""
+    m = _floor()
+    short = m.duration_floor(REF_FRAMES, REF_TEXT_BYTES, "x" * 30, 0.85)
+    long_ = m.duration_floor(REF_FRAMES, REF_TEXT_BYTES, "x" * 60, 0.85)
+    assert short is not None and long_ is None
+
+
+def test_floor_handles_empty_text_without_dividing_by_zero():
+    m = _floor()
+    assert m.duration_floor(REF_FRAMES, REF_TEXT_BYTES, "", 0.85) is None
+    assert m.duration_floor(REF_FRAMES, 0, "Always, sir.", 0.85) is None
+
+
+# ------------------------------------------- fish retirement on no credit
+#
+# Fish is the default voice while credit lasts; F5 is the local backup and
+# becomes PERMANENT once the balance is gone. The two failures must not be
+# handled alike: a network blip should cost one chunk, but an exhausted
+# balance fails every chunk forever, so retrying the API before each fallback
+# would add a doomed round-trip to every sentence Jarvis ever speaks.
+
+class _Resp:
+    def __init__(self, code):
+        self.status_code = code
+
+
+class _HttpErr(Exception):
+    def __init__(self, msg, code=None):
+        super().__init__(msg)
+        if code is not None:
+            self.response = _Resp(code)
+
+
+def test_out_of_credit_is_detected():
+    for exc in (_HttpErr("HTTP 402 Payment Required", 402),
+                _HttpErr("payment required"),
+                _HttpErr("insufficient balance"),
+                _HttpErr("quota exceeded")):
+        assert tts_mod._is_out_of_credit(exc), exc
+
+
+def test_transient_failures_do_NOT_retire_fish():
+    """A blip must cost one chunk, never the whole engine."""
+    for exc in (TimeoutError("fish exceeded 10.0s"),
+                ConnectionError("Connection reset by peer"),
+                OSError("Name or service not known"),
+                _HttpErr("HTTP 500 Internal Server Error", 500),
+                _HttpErr("HTTP 429 Too Many Requests", 429)):
+        assert not tts_mod._is_out_of_credit(exc), exc
+
+
+def test_retire_fish_switches_engine_and_persists(monkeypatch):
+    saved = {}
+    monkeypatch.setattr(tts_mod.CONFIG, "save", lambda: saved.setdefault("n", 0) or
+                        saved.update(n=saved.get("n", 0) + 1))
+    t = tts_mod.TTS(engine="fish")
+    t.retire_fish("out of credit")
+    assert t.engine == tts_mod.FISH_FALLBACK
+    assert tts_mod.CONFIG.tts_engine == tts_mod.FISH_FALLBACK
+    assert saved.get("n", 0) >= 1, "the choice must be persisted, not just in-memory"
+
+
+def test_retire_fish_is_idempotent():
+    """Called on every failing chunk of a reply; must not thrash config."""
+    t = tts_mod.TTS(engine="fish")
+    t._engine = tts_mod.FISH_FALLBACK
+    t.retire_fish("again")          # already local -> no-op, must not raise
+    assert t.engine == tts_mod.FISH_FALLBACK
