@@ -1308,3 +1308,52 @@ def test_services_brain_chat_forwards_the_stream_hook_only_when_enabled(build, m
     monkeypatch.setattr(CONFIG, "stream_replies", False)
     app.services.brain.chat("what time is it")
     assert "on_sentence" not in seen and seen.get("callback") == app._on_brain_tags
+
+
+# ---------------------------------------------- 12. study sessions & notes
+def test_focus_session_is_wired_through_the_real_app(app):
+    """"study session biosensors" typed into the real app: the session is on
+    services, its timers are SILENT items in the real timekeeper, the spoken
+    line comes from jarvis/focus.py (not the timer line), and a silent
+    ReminderFired never reaches the alerts hub."""
+    assert app.services.focus is app.focus and app.focus is not None
+    assert callable(getattr(app.services.docs_index, "kick", None)), \
+        "docs.make_tools never parked its index"
+    result = app.dispatch_text("study session biosensors")
+    assert result.handled and result.speak
+    assert app.tts.spoken[-1].startswith("25 minutes on biosensors, sir")
+    labels = sorted(i.label for i in app.timekeeper.list("timer"))
+    assert labels == ["focus: block 1", "focus: halfway 1"]
+    assert app.focus.active and app.focus.label == "biosensors"
+    # the alerts hub is not toasted for the session's own items
+    alerts = []
+    app.alerts.alert = lambda *a, **k: alerts.append(a)
+    bus.publish(ReminderFired(text="focus block 1", item_id="x", silent=True))
+    bus.publish(ReminderFired(text="call mum", item_id="y"))
+    assert [a[2] for a in alerts] == ["call mum"]
+    result = app.dispatch_text("how long left")
+    assert result.reply.startswith("25 minutes left in block 1") or \
+        result.reply.startswith("24 minutes left in block 1")
+    result = app.dispatch_text("end the session")
+    assert result.reply == "Session over, sir; no full blocks this time."
+    assert app.timekeeper.list("timer") == [] and not app.focus.active
+    # the state file lives under the (firewalled) memory dir
+    assert (PATHS.MEMORY_DIR / "focus_session.json").exists()
+
+
+def test_lecture_notes_are_wired_through_the_real_app(app, paths, monkeypatch):
+    folder = paths / "Jarvis Docs"
+    app.assistant.set("docs.paths", [str(folder)])
+    result = app.dispatch_text("notes for biosensors")
+    assert result.speak and app.commander.lecture_course == "biosensors"
+    result = app.dispatch_text("impedance is the ratio of voltage to current")
+    assert result.status.startswith("Noting: biosensors")
+    kicks = []
+    app.services.docs_index.kick = lambda: kicks.append(1) or True
+    result = app.dispatch_text("end notes")
+    assert result.reply == "Notes closed, sir: one line for biosensors."
+    assert kicks == [1] and app.commander.lecture_course is None
+    files = list((folder / "notes").glob("biosensors-*.md"))
+    assert len(files) == 1 and "impedance is the ratio" in files[0].read_text()
+    assert [n["text"] for n in app.notes.list("note")] == [
+        "impedance is the ratio of voltage to current"]
