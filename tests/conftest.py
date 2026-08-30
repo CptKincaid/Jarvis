@@ -83,7 +83,7 @@ def _firewall_live_log_dir():
         P.ASSISTANT_CONFIG.parent != real_cfg_dir, "assistant config still live"
     assert P.CACHE_DIR != real_cache and real_cache not in P.CACHE_DIR.parents, \
         "PATHS.CACHE_DIR still live"
-    for name in ("APPROVALS_SOCK", "CLAUDE_TASK_DIR", "MCP_CONFIG"):
+    for name in ("APPROVALS_SOCK", "COMMAND_SOCK", "CLAUDE_TASK_DIR", "MCP_CONFIG"):
         path = getattr(P, name)
         assert path != live and live not in path.parents, f"PATHS.{name} still live"
         assert path.parent == _TEST_LOG_DIR or _TEST_LOG_DIR in path.parents, \

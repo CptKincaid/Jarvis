@@ -1419,6 +1419,30 @@ def _h_diagnostics(c, t, m):
     return CommandResult(handled=True, reply=line, speak=True, status="Diagnostics")
 
 
+# "How did yesterday go" -- the nightly self-review (jarvis/dayreview.py),
+# spoken on demand. "Today" reads the open day so far. Whole-utterance only:
+# "how did the meeting go yesterday" is a question for the model.
+_DAYREVIEW_RX = re.compile(
+    r"^(?:how(?: did| was| were| has| is| are|'s|'d) (?:things |it |your day |the day )?"
+    r"(?:go(?:ing)? |been )?(?:for you )?(yesterday|today)(?: go(?:ing)?| been)?"
+    r"|(?:(yesterday|today)'?s? (?:self[- ])?(?:review|report|digest|summary))"
+    r"|(?:review (yesterday|today))"
+    r"|(?:what went wrong (yesterday|today)))\W*$", re.I)
+
+
+def _h_dayreview(c, t, m):
+    fn = c._svc("dayreview")
+    if fn is None:
+        return None
+    which = next((g for g in m.groups() if g), "yesterday").lower()
+    try:
+        line = fn(which)
+    except Exception:
+        log.exception("day review failed")
+        line = "I'm afraid the review didn't complete, sir."
+    return CommandResult(handled=True, reply=line, speak=True, status="Day review")
+
+
 def _h_last_mail(c, t, m):
     if _MAIL_WRITE_RX.search(t):
         return None
@@ -1828,6 +1852,7 @@ REGISTRY: list[Command] = [
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
+    Command("day review", _DAYREVIEW_RX.match, _h_dayreview),
     # After the briefing: "good morning" is a briefing trigger first.
     Command("greeting", greeting_kind, _h_greeting),
     Command("good night",
@@ -1901,7 +1926,8 @@ REGISTRY: list[Command] = [
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
-                    "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
+                    "briefing", "last mail", "diagnostics", "day review", "greeting",
+                    "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me")
 ]

@@ -68,6 +68,11 @@ class PATHS:
     CACHE_DIR = Path(os.environ.get("JARVIS_CACHE_DIR") or
                      (Path.home() / ".cache" / "jarvis"))
     APPROVALS_SOCK = LOG_DIR / "approvals.sock"
+    # jarvis/cmdsock.py: ask Jarvis from a shell (python -m jarvis.ask)
+    COMMAND_SOCK = LOG_DIR / "command.sock"
+    # jarvis/dayreview.py: one digest per day; MEMORY_DIR because LOG_DIR
+    # is tmpfs and the review is meant to outlive the boot that wipes it
+    REVIEWS_DIR = MEMORY_DIR / "reviews"
     CLAUDE_TASK_DIR = LOG_DIR / "claude"
     MCP_CONFIG = LOG_DIR / "mcp_jarvis.json"
     AUTOSTART_DESKTOP = Path.home() / ".config" / "autostart" / "jarvis.desktop"

@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import importlib
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 import os
 import re
 import subprocess
@@ -59,6 +59,7 @@ from jarvis import desktop as desktop_mod
 from jarvis import speak_queue, voice_check
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
+from jarvis import dayreview as dayreview_mod
 from jarvis.brain import JarvisBrain
 from jarvis.commander import COURTESY_REPLIES, Commander, parse_yes_no
 from jarvis.context import ContextEngine
@@ -233,6 +234,7 @@ class JarvisApp:
         self.router = self._construct("router", self._make_router)
         self.alerts = self._construct("alerts", self._make_alerts)
         self.discord = self._construct("discord", self._make_discord)
+        self.cmdsock = self._construct("cmdsock", self._make_cmdsock)
         if self.alerts is not None:
             try:
                 self.alerts.attach(self.discord)
@@ -344,6 +346,12 @@ class JarvisApp:
             return None
         return mod.DiscordChannel(self.assistant, on_message=self._on_discord)
 
+    def _make_cmdsock(self):
+        mod = _import_optional("jarvis.cmdsock")
+        if mod is None:
+            return None
+        return mod.CommandSocket(PATHS.COMMAND_SOCK, self)
+
     def _register_tools(self):
         """tools.register_many(m.make_tools(assistant, services)) for every
         tool module; failures log and skip. Then brain.set_registry(tools)."""
@@ -366,6 +374,13 @@ class JarvisApp:
 
     # ---------------------------------------------------------------- speech
     def _say(self, text):
+        # A quiet CLI turn (python -m jarvis.ask -q) is answered in text
+        # only. The check is per turn, not a global talkback toggle: a voice
+        # turn that lands while the CLI answer is still coming resets
+        # _last_source and speaks as usual.
+        if getattr(self, "_quiet_turn", False) and \
+                getattr(self, "_last_source", "") == "cli":
+            return
         if text and CONFIG.talkback:
             self.tts.speak(text)
 
@@ -550,6 +565,8 @@ class JarvisApp:
             calendar=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
+            # "how did yesterday go": the day review, spoken (dayreview.py)
+            dayreview=self.day_review_text,
             # the health watchdog resolves this at fire time (talkback-gated)
             speak=self._say,
         )
@@ -1013,6 +1030,7 @@ class JarvisApp:
         self._last_learn_ts = -1e9
         self._say_again_count = 0
         self._stream_muted = False
+        self._quiet_turn = False              # CLI turn asked for text only
         name = self.assistant.user_name if self.assistant is not None else "Hunter"
         self._guest_line = GUEST_LINE.format(name=name)
 
@@ -1148,6 +1166,18 @@ class JarvisApp:
             log.info("first-wake briefing: model busy; next turn")
             return
         log.info("first wake of the day: delivering the briefing")
+        # Yesterday's self-review first, as its own line: the briefing is a
+        # brain.chat(force_tool="get_briefing") call, so nothing can be
+        # folded into it "for free" -- and only when there was a yesterday
+        # to review (nothing said on a fresh box, or after a day off).
+        try:
+            review = self._review_line(datetime.now().date() - timedelta(days=1),
+                                       label="Yesterday")
+        except Exception:
+            log.exception("day review for the first wake failed")
+            review = ""
+        if review:
+            self._say(review)
         self._say("Your briefing for today, sir.")
         try:
             brain.chat("my morning briefing", force_tool="get_briefing")
@@ -1155,6 +1185,39 @@ class JarvisApp:
             log.exception("first-wake briefing failed")
             return
         self._mark_briefing_delivered()     # after the ask, not before
+
+    # -------------------------------------------------------- day review
+    def _review_line(self, day, label="Yesterday") -> str:
+        """The two-sentence review of `day` (dayreview.spoken_line), from
+        the filed digest when the nightly timer has run, else computed
+        now. Empty when there is nothing for that day."""
+        reviewer = getattr(self, "dayreviewer", None)
+        if reviewer is not None:
+            digest = reviewer.review(day)
+        else:
+            digest = dayreview_mod.summarize_day(PATHS.LOG_DIR / "jarvis.log",
+                                                 PATHS.LOG_DIR / "turns.jsonl", day)
+        name = "sir"
+        return dayreview_mod.spoken_line(digest, label=label, name=name)
+
+    def day_review_text(self, which="yesterday") -> str:
+        """"How did yesterday go" / "how is today going": the spoken review."""
+        today = datetime.now().date()
+        if str(which).lower() == "today":
+            # today is still open: never read from a filed digest
+            digest = dayreview_mod.summarize_day(PATHS.LOG_DIR / "jarvis.log",
+                                                 PATHS.LOG_DIR / "turns.jsonl", today)
+            line = dayreview_mod.spoken_line(digest, label="So far today")
+            return line or "Nothing to report yet today, sir."
+        line = self._review_line(today - timedelta(days=1), label="Yesterday")
+        return line or "I have no record of yesterday, sir. Either I was off, or the log has gone."
+
+    def _on_review_filed(self, day, digest):
+        """The nightly timer filed a digest: the table goes to Discord
+        through the Alerts hub (milestone = no desktop banner, and the hub
+        only posts when the channel is configured)."""
+        self._alert("milestone", f"Day review {day.isoformat()}",
+                    dayreview_mod.table(digest))
 
     # ------------------------------------------------------- diagnostics
     def diagnostics_text(self) -> str:
@@ -1534,9 +1597,11 @@ class JarvisApp:
             self._turn_finished()
         return result
 
-    def dispatch_text(self, text, source="typed"):
+    def dispatch_text(self, text, source="typed", quiet=False):
         """MainWindow calls this on a worker thread for typed input; the
-        Discord channel with source='discord'."""
+        Discord channel with source='discord'; the command socket
+        (jarvis/cmdsock.py) with source='cli', on the client's thread.
+        `quiet` (cli only) answers in text and keeps the soundbar silent."""
         text = (text or "").strip()
         if not text:
             return None
@@ -1545,6 +1610,7 @@ class JarvisApp:
         self.interrupt_speech()
         if source == "typed":
             self.history.add(text)
+        self._quiet_turn = bool(quiet) and source == "cli"
         return self._dispatch(text, source)
 
     # ------------------------------------------------------------ lifecycle
@@ -1577,6 +1643,7 @@ class JarvisApp:
         self._assistant_started = True
         for name, obj in (("timekeeper", self.timekeeper),
                           ("approvals", self.approvals),
+                          ("cmdsock", getattr(self, "cmdsock", None)),
                           ("discord", self.discord)):
             if obj is None:
                 continue
@@ -1585,6 +1652,16 @@ class JarvisApp:
             except Exception:
                 log.exception("assistant: %s failed to start", name)
                 bus.publish(Status(text=f"{name} failed to start", kind="warn"))
+        try:
+            # The nightly self-review: files yesterday's digest under
+            # MEMORY_DIR/reviews and posts the table to Discord when that
+            # channel is configured (dayreview.py).
+            self.dayreviewer = dayreview_mod.DayReviewer(
+                PATHS.LOG_DIR / "jarvis.log", PATHS.LOG_DIR / "turns.jsonl",
+                PATHS.REVIEWS_DIR, on_filed=self._on_review_filed)
+            self.dayreviewer.start()
+        except Exception:
+            log.exception("day reviewer failed to start")
         cal = getattr(self.services, "calendar", None)
         if cal is not None:
             try:
@@ -1724,10 +1801,12 @@ class JarvisApp:
         self._quitting = True
         cal = getattr(self.services, "calendar", None)
         for name, obj in (("discord", self.discord), ("approvals", self.approvals),
+                          ("cmdsock", getattr(self, "cmdsock", None)),
                           ("timekeeper", self.timekeeper), ("calendar", cal),
                           ("claude", self.claude),
                           ("health_watchdog", getattr(self.services, "health_watchdog", None)),
-                          ("headsup", getattr(self, "headsup", None))):
+                          ("headsup", getattr(self, "headsup", None)),
+                          ("dayreviewer", getattr(self, "dayreviewer", None))):
             if obj is None:
                 continue
             fn = getattr(obj, "stop", None) or getattr(obj, "close", None)
