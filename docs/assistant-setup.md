@@ -193,7 +193,7 @@ stranger's "yes" in a shared channel can never approve a `git push`; left
 blank, anyone who can post in `channel_id` can command him. Two optional
 switches silence a channel independently (both default on, and the key may
 be absent): `"alerts": {"desktop": true, "discord": true, "claude_hooks": true}`
-(`claude_hooks` is the spoken narration of your own Claude Code terminals, section 21).
+(`claude_hooks` is the spoken narration of your own Claude Code terminals, section 38).
 
 Troubleshooting from `jarvis.log`: gateway close **4014** means the MESSAGE
 CONTENT intent is still off in the portal (Jarvis falls back to REST polling
@@ -735,7 +735,7 @@ dictation. Speaker verification still gates the mic.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
 - **"Anything wrong in your log?"** — see the next section.
 
-## 18. Log triage: "anything wrong in your log?" / "why was that slow?"
+## 20. Log triage: "anything wrong in your log?" / "why was that slow?"
 
 You are Jarvis's developer, so the fastest bug report is Jarvis reading his own
 log. Nothing to configure.
@@ -765,7 +765,7 @@ log. Nothing to configure.
   last N minutes" (it survives midnight and a quiet evening alike). The same
   clustering now feeds the local model's "recent errors" context slice.
 
-## 18. Long-term memory that understands you (fully local)
+## 21. Long-term memory that understands you (fully local)
 
 *"Remember that my dentist is Dr Patel"* stores a fact; weeks later *"who's my dentist?"*
 or *"what did I say about the thesis last week?"* finds it however you phrase it. Facts
@@ -783,7 +783,7 @@ false` turns the index off. The embedder is kept loaded (`keep_alive: -1`, ~270 
 question after a quiet spell never pays the 7 s cold load; the first start after this
 update indexes your existing facts in the background.
 
-## 19. People: who "my advisor" and "Mom" are
+## 22. People: who "my advisor" and "Mom" are
 
 *"My advisor is Dr Peyrovi, email hp@tamu.edu"* / *"my mom is Linda"* / *"remember that my
 TA is Sam Ortiz, his email is sam@tamu.edu"* go into `people.json` beside the facts. From
@@ -798,7 +798,7 @@ full name — so *"my favourite colour is blue"* is still just conversation. Edi
 entry by hand in `~/.aiws_trainer/jarvis_memory/people.json` (alias → name / email /
 relation).
 
-## 20. The activity journal and "recap my day"
+## 23. The activity journal and "recap my day"
 
 Everything Jarvis does with you is journaled, one JSON line per event, in
 `~/.aiws_trainer/jarvis_memory/journal/YYYY-MM-DD.jsonl`: each exchange in full, each tool
@@ -810,7 +810,8 @@ and *"what did I do yesterday?"* read the journal back: the local model speaks a
 most four sentences and the full hour-by-hour digest appears on a card. Files older than
 `journal.keep_days` (90) are pruned at start; `journal.enabled: false` stops the window
 sampler (exchanges and tool calls are always journaled). Nothing leaves the machine.
-## 21. Explain a document, then have it read (fully local)
+
+## 24. Explain a document, then have it read (fully local)
 
 *"Explain the biosensors lab handout"* / *"summarize the CS101 syllabus"*. The name is
 matched against the files in `docs.paths` (and cwd, `~`, `~/Jarvis`), so say the title, not
@@ -823,7 +824,7 @@ reads one directly. Nothing leaves the machine. If he says he can't find it, the
 needs at least most of the words in the file name (`Biosensors_Lab_Handout.pdf` answers to
 "biosensors handout", not "the lab report").
 
-## 22. Quiz mode (flashcards from your documents)
+## 25. Quiz mode (flashcards from your documents)
 
 *"Quiz me on chapter three"* / *"test me on the syllabus"*. He pulls the matching chunks
 from the documents index (a file name or a "chapter N" heading first, the embedding search
@@ -837,7 +838,7 @@ matching words and numbers; the model only judges the unclear ones, and when nei
 tell he names the answer and moves on without a mark. `quiz.chunks` (6) is how much study
 text one round reads. Everything runs on the Spark.
 
-## 25. Git standup ("what did I do today?")
+## 26. Git standup ("what did I do today?")
 
 *"What did I do today"* / *"what did I change today"* / *"what did I work on
 yesterday"* / *"standup"* / *"yesterday's standup"* — with or without the wake
@@ -854,7 +855,7 @@ still answers while the GPU is lent out (section 16). Nothing to configure:
 the repo list follows section 9. *"Git status"* now reports the Jarvis
 repository (it used to be hard-wired to the VSS tree).
 
-## 26. Faster calendar, weather and time-in-city answers
+## 27. Faster calendar, weather and time-in-city answers
 
 Nothing to set up. When the router already knows the tool — a read-only calendar
 question, a weather question, "what's the time in London" — the commander forces the
@@ -863,7 +864,7 @@ down for a write ("book a meeting"), a second clause ("… and what's the weathe
 lowercase city, which take the full loop as before. Look for `route short-cut:` in the
 log.
 
-## 27. Corrections: "no, I said …"
+## 28. Corrections: "no, I said …"
 
 Say "no, I said …", "I meant …", or "not X, Y" (with the comma) — typed, on Discord, or
 by voice within a minute of the last turn. Jarvis stops talking, drops the misheard
@@ -878,7 +879,7 @@ exchange from his short-term memory and answers what you meant. Pairs are kept i
 Whisper vocabulary prompt (`~/.aiws_trainer/voice_vocab.txt`), so the next attempt decodes
 the name. Off by default: Whisper's casing on a misheard name is itself a guess.
 
-## 28. Teaching the intent gate: "that was for you"
+## 29. Teaching the intent gate: "that was for you"
 
 If a command was dropped as background chat (nothing happens), say "Jarvis, that was for
 you" within 20 s: he runs it and remembers the words as his. If he answered something you
@@ -887,7 +888,7 @@ remembers that too. Labels go to `~/.aiws_trainer/intent_log.json` (what the cla
 reads) with an audit line in `~/.aiws_trainer/jarvis_memory/feedback.jsonl`. "That was for
 you" also answers the spoken "Was that for me?" window.
 
-## 29. Read-back before a bulk cancel or list wipe
+## 30. Read-back before a bulk cancel or list wipe
 
 ```json
 "confirm": {"read_back": true, "shaky_logprob": -0.7}
@@ -899,7 +900,7 @@ follow-up window; "no" or any other subject drops it, and so does a yes a minute
 transcript scoring under `shaky_logprob` is read back even for one item. A single "cancel
 the timer" never is. `read_back: false` turns it off.
 
-## 18. Voice latency: the first-audio mark and streamed Fish playback
+## 31. Voice latency: the first-audio mark and streamed Fish playback
 
 Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
 
@@ -917,7 +918,7 @@ Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
   (module constant) and restart. F5, XTTS and edge are unchanged (F5's sidecar writes a
   file per request and cannot stream).
 
-## 19. Steering a read-aloud (skip / back / pause / go on)
+## 32. Steering a read-aloud (skip / back / pause / go on)
 
 Nothing to configure. While he is reading ("read the clipboard", "read file
 ~/syllabus.md", …) the transport words belong to the reading:
@@ -962,7 +963,7 @@ live-transcript preview), and the cue is a prewarmed line or a generated beep
 
 ---
 
-## 18. Quiet hours and do not disturb
+## 33. Quiet hours and do not disturb
 
 Jarvis holds his *proactive* lines — memory warnings, reminders and timers, meeting
 heads-ups, anything from the hooks narrator — while you are busy, and reads them back
@@ -977,7 +978,7 @@ what you ask, alarms and Claude's permission questions are never held.
 - **Calendar** — a timed event running now whose title contains one of
   `quiet.calendar_keywords` (`class`, `exam`, `meeting`, `busy`) is quiet automatically;
   `quiet.calendar: false` turns that off.
-- **Away** — with presence set up (section 19) he also holds while your phone is off the
+- **Away** — with presence set up (section 34) he also holds while your phone is off the
   Wi-Fi; `quiet.hold_when_away: false` turns that off.
 - *"I am free"* / *"what did I miss"* — ends the current window early and reads what was
   held; *"are you on do not disturb"* says why he is quiet.
@@ -993,7 +994,7 @@ backlog is capped at twelve lines.
           "hold_when_away": true}
 ```
 
-## 19. Presence (is anyone home?)
+## 34. Presence (is anyone home?)
 
 Give him your phone's Wi-Fi address and he knows whether you are in. Find it in the
 router's client list or on the phone (Settings › Wi-Fi › the network › IP address; iPhones
@@ -1013,7 +1014,8 @@ Wi-Fi power-save for minutes at a time; "home" is immediate. Leaving is silent; 
 return he says *"Welcome back, sir."* and reads anything held while you were out. Until
 the first probe answers he assumes you are home. Check the log for
 `presence: home` / `presence: away`.
-## 23. Nightly self-review ("how did yesterday go")
+
+## 35. Nightly self-review ("how did yesterday go")
 
 Every quarter hour a small thread checks whether a day has ended without a review
 and, if so, reads his own `jarvis.log` and `turns.jsonl` for that day and files a
@@ -1037,7 +1039,7 @@ What counts as "went wrong" comes from the exact lines the modules log (see
 file before the app's boot marker is ignored, so a stray test traceback cannot
 show up as "a tool call failed".
 
-## 24. Ask him from a shell (`jarvis`, SSH, tmux, scripts)
+## 36. Ask him from a shell (`jarvis`, SSH, tmux, scripts)
 
 The running app listens on `/tmp/vss_voice/command.sock` (0600, next to
 `approvals.sock`). `scripts/jarvis` sends one line and prints what he answers:
@@ -1059,7 +1061,7 @@ wake word, no intent guess), shows in the transcript, and is not stored in the
 typed-box history. `-t 300` waits longer than the default 90 s. Everything stays on
 the box: a UNIX socket, no port, no daemon beyond the app itself.
 
-## 18. Local voice: the F5 sidecar as a service
+## 37. Local voice: the F5 sidecar as a service
 
 F5-TTS is the local voice (blind-tied the hosted Fish voice, see
 `~/voice-training/HANDOFF.md`) and the fallback whenever `tts_engine` is `fish`.
@@ -1107,53 +1109,7 @@ in `~/.aiws_trainer/voice_settings.json` (or the Engine picker) and restart;
 the canned lines are re-rendered on F5 by the normal prewarm, and the Fish key
 becomes optional. The speech cache keys F5 and Fish audio separately.
 
-## 18. Long-term memory that understands you (fully local)
-
-*"Remember that my dentist is Dr Patel"* stores a fact; weeks later *"who's my dentist?"*
-or *"what did I say about the thesis last week?"* finds it however you phrase it. Facts
-live in `~/.aiws_trainer/jarvis_memory/facts.json` as before, and each one is also embedded
-with Ollama's `nomic-embed-text` (the same local model the documents tool uses) into a
-chromadb index beside it (`facts_index/`). Every turn, the model is shown the few facts that
-bear on what you just said — not the last five — so a fact you stored months ago still
-surfaces when it matters, and nothing is shown when nothing is close. *"Recall the thesis"*
-/ *"what did I say about the move yesterday"* answer directly; a time phrase (last week,
-yesterday, in the last three days) limits it to facts stored since then.
-
-Nothing leaves the machine. If chromadb or Ollama is unavailable Jarvis falls back to the
-old substring search and says nothing about it (one line in the log). `memory.semantic:
-false` turns the index off. The embedder is kept loaded (`keep_alive: -1`, ~270 MB) so a
-question after a quiet spell never pays the 7 s cold load; the first start after this
-update indexes your existing facts in the background.
-
-## 19. People: who "my advisor" and "Mom" are
-
-*"My advisor is Dr Peyrovi, email hp@tamu.edu"* / *"my mom is Linda"* / *"remember that my
-TA is Sam Ortiz, his email is sam@tamu.edu"* go into `people.json` beside the facts. From
-then on *"who's my advisor?"* answers straight away, *"any email from my advisor?"* filters
-the mailbox by that address, and *"add lunch with Mom tomorrow at noon"* lands on the
-calendar as lunch with her name. The people block is shown to the model on every turn, so
-the local model can connect "my advisor" to a name in anything else you ask.
-
-A sentence is taken as a contact only when it plainly is one — an address, a title (Dr,
-Prof, Mr…), a relation word (advisor, TA, mom, dentist, landlord…) or a capitalised
-full name — so *"my favourite colour is blue"* is still just conversation. Edit or remove an
-entry by hand in `~/.aiws_trainer/jarvis_memory/people.json` (alias → name / email /
-relation).
-
-## 20. The activity journal and "recap my day"
-
-Everything Jarvis does with you is journaled, one JSON line per event, in
-`~/.aiws_trainer/jarvis_memory/journal/YYYY-MM-DD.jsonl`: each exchange in full, each tool
-call, each finished or failed Claude task, and the window you are working in (sampled every
-`journal.window_interval_s` seconds, written only when it changes, never while the screen is
-locked or there is no focused window). *"Recap my day"*, *"what was I doing before lunch?"*,
-*"what did I get done this afternoon?"*, *"what have I been working on the last two hours?"*
-and *"what did I do yesterday?"* read the journal back: the local model speaks a recap of at
-most four sentences and the full hour-by-hour digest appears on a card. Files older than
-`journal.keep_days` (90) are pruned at start; `journal.enabled: false` stops the window
-sampler (exchanges and tool calls are always journaled). Nothing leaves the machine.
-
-## 21. Claude Code hooks (your own terminals)
+## 38. Claude Code hooks (your own terminals)
 
 The sessions you start yourself (the `~/.bashrc` tmux wrapper, any plain `claude`)
 never pass through Jarvis, so a failing test run or a permission prompt in another
