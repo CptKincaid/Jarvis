@@ -1082,3 +1082,25 @@ def test_the_filler_threshold_clears_a_typical_reply(app):
     """Local replies measured 2.0-2.3 s; firing at 2.0 s guarantees it always
     speaks, which is the opposite of 'only when he has to really look'."""
     assert app_mod.THINKING_DELAY_S >= 3.0
+
+
+def test_services_brain_chat_forwards_every_keyword_the_brain_takes(build, monkeypatch):
+    """The commander never sees JarvisBrain.chat, only the wrapper in
+    _build_services. A keyword the wrapper drops raises TypeError inside the
+    handler and the user hears "Command failed: <name>" -- which is exactly
+    what "what was my last email about?" said until force_args was forwarded.
+    The routing tests stub the brain and so could not see this."""
+    import inspect
+    app = build()
+    seen = {}
+    monkeypatch.setattr(app.brain, "chat", lambda text, **kw: seen.update(kw) or None)
+    app.services.brain.chat("my last email", force_tool="get_mail",
+                            force_args={"unread_only": False, "limit": 1})
+    assert seen["force_tool"] == "get_mail"
+    assert seen["force_args"] == {"unread_only": False, "limit": 1}
+    # and structurally: every keyword the real method accepts (bar callback,
+    # which the wrapper supplies) must be accepted by the wrapper
+    from jarvis.brain import JarvisBrain
+    real = set(inspect.signature(JarvisBrain.chat).parameters) - {"self", "callback", "max_rounds"}
+    wrapper = set(inspect.signature(app.services.brain.chat).parameters)
+    assert real <= wrapper, f"wrapper drops {real - wrapper}"

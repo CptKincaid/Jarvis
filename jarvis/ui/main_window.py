@@ -1171,6 +1171,11 @@ class MainWindow:
             reason = ev.reject_reason or "low confidence"
             self.set_status(f"Rejected ({reason})", "warn")
             self.transcript.clear_partial()
+        elif not (ev.text or "").strip():
+            # Accepted but empty: partial() (no VAD) may have previewed words
+            # that the final VAD pass then found nothing in. No UserUtterance
+            # follows to replace the ghost text, so it stayed on screen.
+            self.transcript.clear_partial()
 
     def _ev_user(self, ev: UserUtterance):
         conf = self._last_confidence if ev.source == "voice" else None

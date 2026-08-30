@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Spotify Connect endpoint on the Spark, feeding PipeWire.
+#
+# Built with --no-default-features: the rodio/alsa/pulse backends all need
+# audio -dev headers, which are not installed and would need root. The `pipe`
+# backend links nothing, so librespot writes raw PCM to stdout and pacat --
+# already present -- hands it to PipeWire. Same audio path, no sudo.
+#
+# S16 at 44100 stereo is librespot's pipe output; the pacat flags must match
+# it exactly or the stream plays at the wrong speed.
+set -o pipefail
+
+# A systemd --user service inherits almost no PATH, and librespot lives in
+# ~/.local/bin, which is not on the default unit PATH.
+export PATH="$HOME/.local/bin:/usr/bin:/bin"
+NAME="${LIBRESPOT_NAME:-Spark}"
+
+librespot \
+    --name "$NAME" \
+    --backend pipe \
+    --format S16 \
+    --bitrate 320 \
+    --initial-volume 60 \
+    --cache "$HOME/.cache/librespot" \
+    --disable-audio-cache \
+  | pacat --raw --rate=44100 --channels=2 --format=s16le \
+          --latency-msec=200 --stream-name="Spotify ($NAME)"

@@ -897,6 +897,18 @@ def test_last_mail_by_voice_reaches_tier1_and_pins_the_read_flag(rich, services,
         assert call.kwargs.get("force_tool") != "get_mail", call
 
 
+def test_mail_write_intents_are_not_answered_with_a_read(rich, services):
+    """"reply to my latest email" names the newest message but wants
+    something get_mail cannot do; forcing a read would answer the wrong
+    question with confidence. These must fall through to the router."""
+    for said in ("reply to my latest email", "delete my last email",
+                 "forward the last mail to bob", "archive the most recent email"):
+        services.brain.chat.reset_mock()
+        rich.handle(said, source="typed")
+        for call in services.brain.chat.call_args_list:
+            assert call.kwargs.get("force_tool") != "get_mail", said
+
+
 def test_assistant_tier1_is_a_subset_of_the_registry_in_order():
     names = [c.name for c in ASSISTANT_TIER1]
     reg = [c.name for c in REGISTRY]

@@ -15,8 +15,12 @@ The 2.5 s voice-ID timer could not even begin before 9 s, so the mechanism
 never once fired: all 30 stops in the log came from the energy path. An ECAPA
 verify measures ~5 ms, so the interval was never a cost decision.
 """
+import threading
+import time
+
 import numpy as np
 
+import jarvis.recorder as recorder_mod
 from jarvis.recorder import Recorder
 
 
@@ -45,22 +49,77 @@ def test_the_judged_window_is_recent_enough_to_notice_silence():
     assert Recorder._SPEAKER_WINDOW_S >= 1.0, "ECAPA needs ~1s to say anything"
 
 
-def test_the_window_is_taken_by_samples_not_by_frame_count(monkeypatch):
-    """Blocksize is 0.1 s today and the old index math relied on it. Feed
-    frames of a different size and the span judged must still be right."""
+def _recorder_mid_capture(rate=16000, frame=1024, seconds=12.8):
+    """A Recorder past warm-up with `seconds` of `frame`-sized chunks (NOT the
+    0.1 s blocksize the old index math assumed)."""
     rec = object.__new__(Recorder)
-    rate = 16000
+    rec.recording = True
     rec._record_rate = rate
-    rec._SPEAKER_WINDOW_S = 2.0
-    frame = np.ones((1024, 1), dtype=np.float32)          # not 0.1 s
-    rec._audio_frames = [frame] * 200                     # ~12.8 s of audio
+    rec._record_start_time = None                 # skips the warm-up gate
+    rec._audio_frames = [np.ones((frame, 1), dtype=np.float32)] * int(rate * seconds / frame)
+    rec._on_speaker_silence_result = lambda m, sc: None
+    rec._resample_to_16k = lambda a: a            # already 16 k here
+    return rec
 
-    samples_needed = int(rate * rec._SPEAKER_WINDOW_S)
-    tail, got = [], 0
-    for chunk in reversed(rec._audio_frames):
-        tail.append(chunk)
-        got += len(chunk)
-        if got >= samples_needed:
+
+class _Verifier:
+    enrolled = True
+    _model_failed = False
+
+    def __init__(self, hold=None):
+        self.seen, self.done, self.hold = [], threading.Event(), hold
+
+    def verify(self, audio):
+        self.seen.append(len(audio))
+        if self.hold is not None:
+            self.hold.wait(2)
+        self.done.set()
+        return True, 1.0
+
+
+def test_the_window_is_taken_by_samples_not_by_frame_count(monkeypatch):
+    """Drives Recorder._check_speaker_silence itself. The first version of
+    this test copied the tail-walk into the test body and asserted on the
+    copy, so it passed with the production method stubbed to a no-op."""
+    monkeypatch.setattr(recorder_mod.CONFIG, "speaker_verify", True)
+    rec = _recorder_mid_capture()
+    rec.speaker_verifier = v = _Verifier()
+    rec._check_speaker_silence()
+    assert v.done.wait(2), "verify never ran"
+    want = int(16000 * Recorder._SPEAKER_WINDOW_S)
+    assert v.seen == [want], f"judged {v.seen} samples, wanted {want}"
+
+
+def test_only_one_check_is_in_flight_at_a_time(monkeypatch):
+    """At 1 Hz a slow verify must not stack threads that all mutate the miss
+    counters and may all call stop(): a late check is skipped, not queued."""
+    monkeypatch.setattr(recorder_mod.CONFIG, "speaker_verify", True)
+    rec = _recorder_mid_capture()
+    gate = threading.Event()
+    rec.speaker_verifier = v = _Verifier(hold=gate)
+    rec._check_speaker_silence()                  # first: blocks in verify
+    for _ in range(50):
+        if v.seen:
             break
-    recent = np.concatenate(list(reversed(tail)), axis=0).flatten()[-samples_needed:]
-    assert len(recent) == samples_needed, "judged the wrong span of audio"
+        time.sleep(0.01)
+    rec._check_speaker_silence()                  # second: must be skipped
+    rec._check_speaker_silence()
+    gate.set()
+    assert v.done.wait(2)
+    time.sleep(0.05)
+    assert len(v.seen) == 1, f"{len(v.seen)} verifies ran concurrently"
+    rec._check_speaker_silence()                  # released: runs again
+    for _ in range(50):
+        if len(v.seen) == 2:
+            break
+        time.sleep(0.01)
+    assert len(v.seen) == 2
+
+
+def test_a_dead_model_is_not_polled():
+    rec = _recorder_mid_capture()
+    v = _Verifier()
+    v._model_failed = True
+    rec.speaker_verifier = v
+    rec._check_speaker_silence()
+    assert not v.done.wait(0.3) and v.seen == []

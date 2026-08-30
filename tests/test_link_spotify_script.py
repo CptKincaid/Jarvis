@@ -9,7 +9,6 @@ pins the constructor trap below.
 import importlib.util
 from pathlib import Path
 
-import pytest
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "link_spotify.py"
 
@@ -35,14 +34,23 @@ def test_uses_the_load_classmethod_not_the_positional_path():
     assert "AssistantConfig(PATHS" not in src, "positional path == silent defaults"
 
 
-def test_token_lands_beside_the_assistant_config():
+def test_token_lands_beside_the_assistant_config(tmp_path, monkeypatch):
     """token_path() reads cfg.path; load() sets it, a bare constructor does
     not. If that regresses the token is written somewhere the tool never
-    reads and linking appears to succeed while playback stays broken."""
-    from jarvis.assistant_config import AssistantConfig
-    from jarvis.tools.spotify import token_path
+    reads and linking appears to succeed while playback stays broken.
 
-    cfg = AssistantConfig.load()
-    if cfg.path is None:
-        pytest.skip("no assistant config path in this environment")
-    assert token_path(cfg).parent == Path(cfg.path).parent
+    The env override is cleared first: the test suite's conftest points
+    JARVIS_SPOTIFY_TOKEN and the config at the same directory, which made the
+    first version of this test pass for any implementation at all."""
+    from jarvis.assistant_config import AssistantConfig
+    from jarvis.tools.spotify import TOKEN_FILE, token_path
+
+    monkeypatch.delenv("JARVIS_SPOTIFY_TOKEN", raising=False)
+    cfg_file = tmp_path / "elsewhere" / "assistant.json"
+    cfg = AssistantConfig.load(cfg_file)
+    assert cfg.path == cfg_file
+    assert token_path(cfg) == cfg_file.parent / TOKEN_FILE
+    # and the trap the script fell into: a bare constructor has no path
+    bare = AssistantConfig()
+    assert bare.path is None
+    assert token_path(bare) != cfg_file.parent / TOKEN_FILE

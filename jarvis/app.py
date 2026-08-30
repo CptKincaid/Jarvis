@@ -466,8 +466,14 @@ class JarvisApp:
 
         b = self.brain
 
-        def chat(text, force_tool=None):
-            return b.chat(text, callback=app._on_brain_tags, force_tool=force_tool)
+        def chat(text, force_tool=None, force_args=None):
+            # Every keyword the real JarvisBrain.chat accepts must be forwarded
+            # here: the commander only ever sees this wrapper, and a keyword it
+            # does not take raises TypeError inside the handler, which the
+            # dispatcher turns into "Command failed: <name>" for the user.
+            extra = {"force_args": force_args} if force_args is not None else {}
+            return b.chat(text, callback=app._on_brain_tags,
+                          force_tool=force_tool, **extra)
 
         brain_ns = SimpleNamespace(
             think=lambda text: b.think(text, callback=app._on_brain_tags),
@@ -841,6 +847,9 @@ class JarvisApp:
 
     _PARTIAL_INTERVAL_S = 0.9    # re-decode cadence while speaking
     _PARTIAL_MIN_S = 0.7         # below this whisper mostly invents words
+    _PARTIAL_MAX_S = 20.0        # decode only the newest span: each pass
+                                 # re-decodes the whole buffer, and the final
+                                 # transcribe() waits on the same lock
 
     def _on_recording_started(self, _ev):
         threading.Thread(target=self._partial_loop, name="partial",
@@ -861,6 +870,8 @@ class JarvisApp:
             while self.recorder.recording:
                 started = time.monotonic()
                 audio = self.recorder.snapshot_audio()
+                if audio is not None:
+                    audio = audio[-int(SAMPLE_RATE * self._PARTIAL_MAX_S):]
                 if audio is not None and len(audio) >= int(
                         SAMPLE_RATE * self._PARTIAL_MIN_S):
                     try:
@@ -1081,7 +1092,18 @@ class JarvisApp:
                  "yes" if yes else "no", source)
         bus.publish(UncertainResolved(request_id=request_id, yes=yes,
                                       source=source))
-        return self._emit_result(self.commander.resolve_uncertain(text, yes))
+        result = self._emit_result(self.commander.resolve_uncertain(text, yes))
+        # The prompt left the turn open (done=False) so this answer could
+        # arrive. Close it now, or _turn_busy stays set and every wake word
+        # for the next 60 s is met with "One moment -- still on the last one"
+        # until the watchdog frees it. A YES that routes to the brain returns
+        # done=False again: re-arm the filler and watchdog for THAT lookup,
+        # and _on_brain_tags will close it as usual.
+        if getattr(result, "done", True) is False:
+            self._turn_start()
+        else:
+            self._turn_finished()
+        return result
 
     def dispatch_text(self, text, source="typed"):
         """MainWindow calls this on a worker thread for typed input; the

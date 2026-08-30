@@ -37,7 +37,7 @@ one optional — a missing member falls back to the legacy path):
     assistant  AssistantConfig: get(dotted, default), setup_line(section)
     router     Router: route(text, active_project) -> RouteDecision,
                pending(), resolve_answer(text), clear_pending()
-    brain      + chat(text, force_tool=None), local_line(instruction, text,
+    brain      + chat(text, force_tool=None, force_args=None), local_line(instruction, text,
                fallback=""), classify_route(text)
     timekeeper add_timer(seconds, label), add_reminder(due, text),
                add_alarm(due, label, repeat), list_text(kind), cancel(which,
@@ -1367,9 +1367,17 @@ def _h_briefing(c, t, m):
 _LAST_MAIL_RX = re.compile(
     r"\b(?:last|latest|most recent|newest)\s+(?:e-?mails?|mails?)\b", re.I)
 _LAST_MAIL_HOURS = 168        # a week: "my last email" is not "since midnight"
+# A read, never a write: "reply to my latest email" / "delete the last mail"
+# name the same message but want something get_mail cannot do. Those fall
+# through to the router, which can at least say so.
+_MAIL_WRITE_RX = re.compile(
+    r"\b(?:reply|respond|answer|delete|trash|forward|archive|send|compose|"
+    r"write|draft|mark|flag|star|unsubscribe|move)\b", re.I)
 
 
 def _h_last_mail(c, t, m):
+    if _MAIL_WRITE_RX.search(t):
+        return None
     brain = c._svc("brain")
     if brain is None or not hasattr(brain, "chat"):
         return None
@@ -2153,7 +2161,10 @@ class Commander:
             says = [says] if isinstance(says, str) else (says or [])
             for phrase in says:
                 key = self._phrase_key(phrase)
-                if key and key in said:
+                # Whole words only: raw containment let a short phrase fire
+                # inside an unrelated word ("play" in "display the time").
+                if key and re.search(r"(?<![a-z0-9])" + re.escape(key)
+                                     + r"(?![a-z0-9])", said):
                     if best is None or len(key) > best[0]:
                         best = (len(key), entry)
         if best is None:

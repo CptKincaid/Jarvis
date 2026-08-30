@@ -80,6 +80,12 @@ DEFAULTS: dict = {
             "^plan a feature (.+)$": "/feature-dev $1",
         },
     },
+    # Every desktop banner (the hub AND the direct notify-send sites) obeys
+    # alerts.desktop; alerts.discord gates the Discord fan-out.
+    "alerts": {"desktop": True, "discord": True},
+    # User-defined spoken shortcuts -> a tool call, matched ahead of the
+    # classifier and the model. See docs/assistant-setup.md "Custom phrases".
+    "phrases": [],
     "briefing": {"enabled": False, "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],
@@ -96,7 +102,12 @@ DEFAULTS: dict = {
     "autostart": {"enabled": False},
 }
 
-SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token")
+SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",
+               "spotify.client_secret")
+# Secrets that live inside a LIST of sections rather than at a dotted path:
+# (list key, field). gmail.accounts[].app_password was invisible to redacted()
+# and scrub(), so repr(cfg) printed three real app passwords in full.
+SECRET_LIST_FIELDS = (("gmail.accounts", "app_password"),)
 
 # is_configured() / setup_line() sections and the film-JARVIS excuse for each.
 SETUP_LINES: dict[str, str] = {
@@ -494,11 +505,24 @@ class AssistantConfig:
                 value = node[parts[-1]]
                 if not _is_placeholder(value):
                     node[parts[-1]] = MASK
+        for list_key, field in SECRET_LIST_FIELDS:
+            node = data
+            for part in list_key.split("."):
+                node = node.get(part) if isinstance(node, dict) else None
+            for entry in (node if isinstance(node, list) else []):
+                if isinstance(entry, dict) and not _is_placeholder(entry.get(field)):
+                    entry[field] = MASK
         return data
 
     def secret_values(self) -> list[str]:
-        return [v for v in (self.get(k) for k in SECRET_KEYS)
-                if isinstance(v, str) and not _is_placeholder(v)]
+        values = [v for v in (self.get(k) for k in SECRET_KEYS)
+                  if isinstance(v, str) and not _is_placeholder(v)]
+        for list_key, field in SECRET_LIST_FIELDS:
+            for entry in (self.get(list_key) or []):
+                v = entry.get(field) if isinstance(entry, dict) else None
+                if isinstance(v, str) and not _is_placeholder(v):
+                    values.append(v)
+        return values
 
     def scrub(self, text: Any) -> str:
         """Replace every configured secret value inside ``text`` with "•••"

@@ -49,14 +49,49 @@ def test_silent_once_the_answer_has_landed():
     assert app.said == []
 
 
-def test_resumes_after_the_question_is_answered():
-    """Answering must not leave the filler permanently muted."""
+def _answerable_app(result, monkeypatch):
+    """An app mid-prompt, with the real turn machinery and a commander whose
+    resolve_uncertain returns `result`."""
+    from types import SimpleNamespace
+    import jarvis.app as app_mod
     app = _app({"abc123": "what have you, and"})
-    app._say_thinking()
-    assert app.said == []
-    app._pending_uncertain.clear()          # user clicked yes/no
-    app._say_thinking()
-    assert len(app.said) == 1
+    app._turn_timer = app._turn_watchdog = None
+    app._thinking_delay_s, app._turn_timeout_s = 60.0, 120.0   # never fire here
+    app._emit_result = lambda r: r
+    app.commander = SimpleNamespace(resolve_uncertain=lambda text, yes: result)
+    # via monkeypatch: a bare assignment here silenced the event bus for every
+    # test that ran after this file (timekeeper, speak queue) -- it did.
+    monkeypatch.setattr(app_mod.bus, "publish", lambda ev: None)
+    return app
+
+
+def test_answering_no_closes_the_turn(monkeypatch):
+    """Discarded is done. Before this the turn stayed busy and every wake
+    word for the next 60 s got "One moment -- still on the last one"."""
+    from types import SimpleNamespace
+    from jarvis.config import CONFIG
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    app = _answerable_app(SimpleNamespace(handled=True, status="Discarded", done=True,
+                                          reply=None, speak=False), monkeypatch)
+    app.uncertain_answer("abc123", False, source="ui")
+    assert not app._turn_busy.is_set(), "turn left open after a NO"
+    assert app._turn_timer is None and app._turn_watchdog is None
+
+
+def test_answering_yes_that_routes_to_the_brain_rearms_the_filler(monkeypatch):
+    """The lookup the YES started deserves its own filler and watchdog; the
+    brain callback closes them as for any other turn."""
+    from types import SimpleNamespace
+    from jarvis.config import CONFIG
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    app = _answerable_app(SimpleNamespace(handled=True, status="Thinking", done=False,
+                                          reply=None, speak=False), monkeypatch)
+    try:
+        app.uncertain_answer("abc123", True, source="voice")
+        assert app._turn_busy.is_set()
+        assert app._turn_timer is not None and app._turn_watchdog is not None
+    finally:
+        app._turn_cancel_timers()
 
 
 def test_the_delay_clears_the_measured_tool_latency():

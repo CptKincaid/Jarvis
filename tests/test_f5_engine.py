@@ -16,9 +16,7 @@ SETTINGS, all chosen by listening on 2026-08-28:
                lowering speed stretches the silences, not just the words.
 """
 from pathlib import Path
-import json
 import socket
-import types
 
 import pytest
 
@@ -190,15 +188,32 @@ def test_out_of_credit_is_detected():
 
 def test_transient_failures_do_NOT_retire_fish():
     """A blip must cost one chunk, never the whole engine."""
+    from fish_audio_sdk.exceptions import HttpCodeErr
     for exc in (TimeoutError("fish exceeded 10.0s"),
                 ConnectionError("Connection reset by peer"),
                 OSError("Name or service not known"),
                 _HttpErr("HTTP 500 Internal Server Error", 500),
-                _HttpErr("HTTP 429 Too Many Requests", 429)):
+                _HttpErr("HTTP 429 Too Many Requests", 429),
+                # the status is authoritative: a 429/5xx whose body mentions
+                # credit or balance used to retire the engine permanently
+                HttpCodeErr(429, "rate limited; your credit refills hourly"),
+                HttpCodeErr(503, "balance service unavailable"),
+                _HttpErr("billing dashboard timed out", 504)):
         assert not tts_mod._is_out_of_credit(exc), exc
 
 
+def test_the_sdk_exception_shape_is_detected():
+    """fish_audio_sdk raises HttpCodeErr(status, message) -- `.status`, never
+    `.response.status_code`. The first detector only knew the latter."""
+    from fish_audio_sdk.exceptions import HttpCodeErr
+    assert tts_mod._is_out_of_credit(HttpCodeErr(402, "Payment Required"))
+    assert not tts_mod._is_out_of_credit(HttpCodeErr(500, "boom"))
+
+
 def test_retire_fish_switches_engine_and_persists(monkeypatch):
+    # restore the process-wide engine setting afterwards, or every later test
+    # in the session runs against f5
+    monkeypatch.setattr(tts_mod.CONFIG, "tts_engine", tts_mod.CONFIG.tts_engine)
     saved = {}
     monkeypatch.setattr(tts_mod.CONFIG, "save", lambda: saved.setdefault("n", 0) or
                         saved.update(n=saved.get("n", 0) + 1))

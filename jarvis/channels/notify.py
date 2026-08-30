@@ -121,9 +121,9 @@ class AlertRecord:
 # confirmations. Turning off alerts.desktop silenced the hub and they kept
 # firing anyway, so the setting only half-worked. They now all ask here.
 #
-# Cached because it is consulted on notification paths; call
-# reset_desktop_banner_cache() if the config is edited at runtime.
-_banner_cache: Optional[bool] = None
+# Cached briefly because it is consulted on notification paths.
+_BANNER_TTL_S = 5.0
+_banner_cache: Optional[tuple] = None        # (value, monotonic expiry)
 
 
 def desktop_banners_enabled() -> bool:
@@ -131,18 +131,23 @@ def desktop_banners_enabled() -> bool:
 
     Everything still speaks, still reaches Discord, and still lands in the
     transcript -- this governs only the interrupting surface.
+
+    Cached for a few seconds, not for the process: the first version cached
+    the first answer for good, so a hand edit of alerts.desktop did nothing
+    until the next restart, and the documented reset hook had no caller.
     """
     global _banner_cache
-    if _banner_cache is None:
-        try:
-            from jarvis.assistant_config import AssistantConfig
-            _banner_cache = _truthy(
-                cfg_get(AssistantConfig.load(), "alerts.desktop", True))
-        except Exception:
-            log.debug("could not read alerts.desktop; assuming on",
-                      exc_info=True)
-            _banner_cache = True
-    return _banner_cache
+    now = time.monotonic()
+    if _banner_cache is not None and now < _banner_cache[1]:
+        return _banner_cache[0]
+    try:
+        from jarvis.assistant_config import AssistantConfig
+        value = _truthy(cfg_get(AssistantConfig.load(), "alerts.desktop", True))
+    except Exception:
+        log.debug("could not read alerts.desktop; assuming on", exc_info=True)
+        value = True
+    _banner_cache = (value, now + _BANNER_TTL_S)
+    return value
 
 
 def reset_desktop_banner_cache() -> None:

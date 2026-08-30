@@ -19,3 +19,8 @@ build/
 *.bak
 *.bak-*
 *.bak[0-9]
+
+# StyleTTS2 checkout + model weights used by the voice experiments; never repo content
+repo/
+*.pth
+*.t7

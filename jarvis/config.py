@@ -95,7 +95,7 @@ class Config:
     jarvis_mode: bool = True
     tts_engine: str = "edge"
     speaker_verify: bool = False
-    speaker_threshold: float = 0.4
+    speaker_threshold: float = 0.3      # measured 2026-08-29; see speaker.DEFAULT_THRESHOLD
     target_name: str = ""
     # Tuned 2026-08-27 for wake-word commands. At 5.0/8.0 a two-second
     # question held the mic for ~13 s before auto-stopping. Raise both for

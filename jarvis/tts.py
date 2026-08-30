@@ -126,18 +126,27 @@ FISH_FALLBACK = "f5"          # must stay LOCAL, or an outage is still silence
 # fallback would add a doomed round-trip to every sentence Jarvis ever speaks.
 # When we see a payment/quota error we switch to the local engine for good and
 # persist it, so the next launch starts local instead of rediscovering this.
-_FISH_CREDIT_MARKERS = ("402", "payment required", "insufficient", "quota",
-                        "out of credit", "credit", "balance", "billing")
+_FISH_CREDIT_PHRASES = ("payment required", "out of credit", "insufficient balance",
+                        "insufficient credit", "quota exceeded", "no credit")
 
 
 def _is_out_of_credit(exc: BaseException) -> bool:
-    """True when a fish failure means the balance is gone, not the network."""
+    """True when a fish failure means the balance is gone, not the network.
+
+    The status code is authoritative when there is one: fish_audio_sdk raises
+    HttpCodeErr with ``.status`` (never ``.response``), and a 429 or a 5xx
+    whose body happens to mention "balance" or "credit" must NOT retire the
+    engine for good -- retire_fish persists the switch, so one such blip
+    would have turned hosted speech off permanently. Only without a status at
+    all does the text decide, and then only on explicit payment phrases.
+    """
+    status = getattr(exc, "status", None)
+    if not isinstance(status, int) or isinstance(status, bool):
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if isinstance(status, int) and not isinstance(status, bool):
+        return status == 402
     text = f"{type(exc).__name__}: {exc}".lower()
-    status = getattr(getattr(exc, "response", None), "status_code", None)
-    if status == 402:
-        return True
-    # "credit"/"balance" are broad, so require an explicit payment signal too
-    return any(m in text for m in _FISH_CREDIT_MARKERS)
+    return any(m in text for m in _FISH_CREDIT_PHRASES)
 
 
 def _fish_creds():

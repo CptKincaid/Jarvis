@@ -1,0 +1,21 @@
+[Unit]
+Description=Spotify Connect endpoint (librespot -> PipeWire) for Jarvis
+# pacat needs the PipeWire pulse socket to exist, or every start fails fast
+# and burns the restart budget.
+After=pipewire-pulse.service wireplumber.service
+Wants=pipewire-pulse.service
+# librespot drops its connection on network blips and on Connect handovers;
+# those are normal and must not trip the limiter into leaving the device gone.
+StartLimitIntervalSec=300
+StartLimitBurst=20
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/jarvis-spotify-device
+Restart=always
+RestartSec=3
+# Credentials cached under ~/.cache/librespot, so once the device is picked in
+# a Spotify app it reconnects by itself across restarts and reboots.
+
+[Install]
+WantedBy=default.target

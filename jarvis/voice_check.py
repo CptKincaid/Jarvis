@@ -215,7 +215,10 @@ def _load_model_checks() -> list[Check]:
     t0 = time.monotonic()
     try:
         from jarvis.speaker import SpeakerVerifier
-        v = SpeakerVerifier()
+        from jarvis.config import CONFIG as _cfg
+        # the live app passes the configured threshold; the module default
+        # reported 'failed' for clips the app accepted
+        v = SpeakerVerifier(threshold=_cfg.speaker_threshold)
         ok = v.load_model()
         out.append(Check("ecapa load", ok,
                          f"{v._device} in {time.monotonic() - t0:.1f}s"))
@@ -305,7 +308,10 @@ def run_mic_session(seconds: float = 4.0) -> list[Check]:
 
     try:
         from jarvis.speaker import SpeakerVerifier
-        v = SpeakerVerifier()
+        from jarvis.config import CONFIG as _cfg
+        # the live app passes the configured threshold; the module default
+        # reported 'failed' for clips the app accepted
+        v = SpeakerVerifier(threshold=_cfg.speaker_threshold)
         v.load_model()
         v.load()
         if v.enrolled:

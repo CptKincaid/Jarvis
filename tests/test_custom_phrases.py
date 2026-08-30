@@ -118,3 +118,15 @@ def test_fires_without_the_wake_word_still_in_the_transcript():
     assert res is not None and res.handled
     assert tools.calls == [("spotify_play", {"query": "Jingle Bells"})]
     assert res.reply == "Dropping the needle, sir."
+
+
+def test_a_phrase_does_not_fire_inside_another_word():
+    """Containment was character-level: a phrase "play" fired inside
+    "display the time" and "hi" inside "this". Whole words only."""
+    tools = _Tools()
+    c = _commander([{"say": "play", "tool": "spotify_play", "args": {}, "reply": "ok"},
+                    {"say": "hi", "tool": "spotify_play", "args": {}, "reply": "ok"}], tools)
+    assert c._try_custom_phrase("display the time") is None
+    assert c._try_custom_phrase("this is fine") is None
+    assert tools.calls == []
+    assert c._try_custom_phrase("jarvis play") is not None

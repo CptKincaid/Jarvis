@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 
 import numpy as np
 
@@ -37,13 +38,21 @@ SPEAKER_MODEL_DIR = PATHS.AIWS / "speaker_model"
 
 # Cosine similarity threshold for accepting a speaker match
 # Lower = more permissive, higher = stricter
-DEFAULT_THRESHOLD = 0.40
+# 0.30, measured (2026-08-29): with silence no longer pooled into the
+# embedding, this speaker's genuine short utterances score 0.377-0.397 and
+# every non-match seen (silence, TTS, other voices) sits at -0.03..-0.10.
+# speaker_tuning.recommend() on that data puts 0.40 at a 40% false-reject rate
+# and 0.30 at 0%/0%. The live value lives in voice_settings.json; this default
+# is what a fresh box or a reset gets, so it must not be the number that was
+# rejecting the user.
+DEFAULT_THRESHOLD = 0.30
 
 # Maximum stored embeddings (oldest beyond this are dropped)
 MAX_EMBEDDINGS = 100
 
 # Minimum audio length (seconds) for a useful embedding
 MIN_AUDIO_SECONDS = 1.0
+SAMPLE_RATE = 16000
 
 # Silence is not ignored by ECAPA -- it is pooled in like any other frame, so
 # a window's score lands near the speech-fraction-weighted average of the
@@ -57,41 +66,64 @@ SPEECH_PEAK_FRACTION = 0.08      # of the clip's own loudest frame
 SPEECH_FLOOR_MULTIPLE = 3.0      # of the clip's own noise floor
 MIN_SPEECH_SECONDS = 0.35        # below this we cannot tell, so change nothing
 
+# Bumped when the embedding pipeline changes in a way that makes stored
+# embeddings incomparable with fresh ones. 2 = probes are silence-trimmed.
+VOICEPRINT_FORMAT = 2
+
+
+def _frame_rms(audio_16k, n):
+    frames = np.asarray(audio_16k[:len(audio_16k) // n * n],
+                        dtype=np.float32).reshape(-1, n)
+    return np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1) + 1e-12)
+
+
+def _speech_threshold(rms):
+    """Per-frame RMS above which a frame counts as speech, or None when the
+    clip is too flat to tell (the quietest tenth of frames sits within 3x of
+    the loudest -- all speech, all room, or a sustained tone). Thresholds are
+    relative to the clip's own peak and floor, so quiet speech survives and a
+    loud room does not swallow it."""
+    if rms.size == 0:
+        return None
+    peak = float(rms.max())
+    if peak <= 0.0:
+        return None
+    thr = max(peak * SPEECH_PEAK_FRACTION,
+              float(np.percentile(rms, 10)) * SPEECH_FLOOR_MULTIPLE)
+    return thr if thr <= peak else None
+
+
+def speech_bounds(audio_16k, frame_ms=FRAME_MS, min_speech_s=MIN_SPEECH_SECONDS):
+    """(start, end) sample bounds of the speech in a clip, or None when no
+    speech can be told apart from the room (too short, digital silence, or a
+    flat clip -- see _speech_threshold). Endpoints only: interior pauses are
+    speech rhythm and are present in the enrolment audio too."""
+    n = int(SAMPLE_RATE * frame_ms / 1000)
+    if n <= 0 or len(audio_16k) < 2 * n:
+        return None
+    rms = _frame_rms(audio_16k, n)
+    thr = _speech_threshold(rms)
+    if thr is None:
+        return None
+    voiced = np.nonzero(rms >= thr)[0]
+    lo = max(0, int(voiced[0]) - 1)                  # one frame of margin so a
+    hi = min(len(rms), int(voiced[-1]) + 2)          # soft onset is not clipped
+    if (hi - lo) * n < int(SAMPLE_RATE * min_speech_s):
+        return None
+    return lo * n, hi * n
+
 
 def trim_silence(audio_16k, frame_ms=FRAME_MS, min_speech_s=MIN_SPEECH_SECONDS):
     """Strip leading and trailing silence before an embedding is taken.
 
-    Thresholds are relative to the clip's own peak and noise floor, so quiet
-    speech survives and a loud room does not swallow it. Endpoints only:
-    interior pauses are real speech rhythm and are also present in the
-    enrolment audio, so removing them would widen the mismatch, not close it.
-
-    Returns the audio unchanged whenever it cannot confidently find speech --
-    a trim that guesses wrong would fail shut on the transcript gate, and
-    unchanged is exactly today's behaviour.
+    Returns the audio unchanged whenever speech_bounds cannot confidently
+    find speech -- a trim that guessed wrong would fail shut on the
+    transcript gate, and unchanged is exactly the pre-trim behaviour.
     """
-    n = int(SAMPLE_RATE * frame_ms / 1000)
-    if n <= 0 or len(audio_16k) < 2 * n:
+    bounds = speech_bounds(audio_16k, frame_ms, min_speech_s)
+    if bounds is None:
         return audio_16k
-    frames = np.asarray(audio_16k[:len(audio_16k) // n * n], dtype=np.float32)
-    frames = frames.reshape(-1, n)
-    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1) + 1e-12)
-    peak = float(rms.max())
-    if peak <= 0.0:
-        return audio_16k
-    threshold = max(peak * SPEECH_PEAK_FRACTION,
-                    float(np.percentile(rms, 10)) * SPEECH_FLOOR_MULTIPLE)
-    voiced = np.nonzero(rms >= threshold)[0]
-    if voiced.size == 0:
-        return audio_16k
-    lo = max(0, int(voiced[0]) - 1)                  # one frame of margin so a
-    hi = min(len(rms), int(voiced[-1]) + 2)          # soft onset is not clipped
-    trimmed = audio_16k[lo * n:hi * n]
-    if len(trimmed) < int(SAMPLE_RATE * min_speech_s):
-        return audio_16k
-    return trimmed
-
-SAMPLE_RATE = 16000
+    return audio_16k[bounds[0]:bounds[1]]
 
 
 class SpeakerVerifier:
@@ -149,6 +181,14 @@ class SpeakerVerifier:
         session, because this blocks the voice path and a silent block is the
         experience being avoided. Typed input is unaffected.
         """
+        # The recorder polls verify() at 1 Hz while a capture is open, so with
+        # a broken model this fired every second. Still loud, still repeated
+        # (a silent block is the experience being avoided), but paced.
+        now = time.monotonic()
+        if now - getattr(self, "_fail_shut_last", 0.0) < 5.0:
+            log.debug("speaker verify failed shut (%s), paced", reason)
+            return
+        self._fail_shut_last = now
         log.error("speaker verify FAILED SHUT (%s) -- rejecting audio; "
                   "typed input still works", reason)
         try:
@@ -208,9 +248,20 @@ class SpeakerVerifier:
             return
         try:
             data = np.load(VOICEPRINT_FILE)
-            self._embeddings = [data[k] for k in sorted(data.files)]
+            keys = [k for k in sorted(data.files) if k.startswith("emb_")] or \
+                [k for k in sorted(data.files) if not k.startswith("_")]
+            self._embeddings = [data[k] for k in keys]
             self._recompute_centroid()
-            log.info("voiceprint loaded: %d samples", len(self._embeddings))
+            fmt = int(data["_format"][0]) if "_format" in data.files else 1
+            log.info("voiceprint loaded: %d samples (format %d)",
+                     len(self._embeddings), fmt)
+            if fmt < VOICEPRINT_FORMAT:
+                # Embeddings saved before trim_silence were pooled with the
+                # silence of fixed-length enrolment takes; probes are trimmed
+                # now, and the asymmetry measurably lowers genuine scores.
+                log.warning("voiceprint predates silence trimming (format %d < %d); "
+                            "genuine scores run low until you re-enrol: "
+                            "scripts/enroll_voice.py --reset", fmt, VOICEPRINT_FORMAT)
         except Exception:
             log.exception("voiceprint load error")
         self._loaded = True
@@ -223,6 +274,7 @@ class SpeakerVerifier:
             try:
                 VOICEPRINT_FILE.parent.mkdir(parents=True, exist_ok=True)
                 arrays = {f"emb_{i:04d}": emb for i, emb in enumerate(self._embeddings)}
+                arrays["_format"] = np.array([VOICEPRINT_FORMAT])
                 tmp = VOICEPRINT_FILE.with_name(VOICEPRINT_FILE.name + ".tmp")
                 # savez appends ".npz" to bare paths; a file handle keeps the
                 # exact tmp name so os.replace targets the right file.
@@ -488,8 +540,27 @@ class SpeakerVerifier:
         # spends a GPU pass to put a misleading number in the log. Drop those,
         # unless that would leave nothing, in which case score them all and let
         # the threshold decide as before.
-        voiced = [i for i, w in enumerate(windows)
-                  if len(trim_silence(w)) >= int(SAMPLE_RATE * MIN_SPEECH_SECONDS)]
+        #
+        # Judged against the threshold of the WHOLE capture, not the window's
+        # own: a window of pure room tone is flat, and a flat clip has no
+        # floor to measure against, so per-window it reads as "cannot tell".
+        # The capture as a whole holds both the speech and the room, which is
+        # exactly the contrast the threshold needs. (The first version asked
+        # len(trim_silence(w)) -- which never shrinks on no-speech, by design,
+        # so it skipped nothing.)
+        n = int(SAMPLE_RATE * FRAME_MS / 1000)
+        rms_all = _frame_rms(audio_16k, n)
+        thr = _speech_threshold(rms_all)
+        min_frames = max(1, int(SAMPLE_RATE * MIN_SPEECH_SECONDS) // n)
+
+        def _has_speech(pos, length):
+            if thr is None:
+                return True                  # flat capture: cannot tell, score it
+            seg = rms_all[pos // n:(pos + length) // n]
+            return int((seg >= thr).sum()) >= min_frames
+
+        voiced = [i for i, (w, pos) in enumerate(zip(windows, positions))
+                  if _has_speech(pos, len(w))]
         if voiced and len(voiced) < len(windows):
             windows = [windows[i] for i in voiced]
             positions = [positions[i] for i in voiced]

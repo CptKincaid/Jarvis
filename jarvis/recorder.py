@@ -641,16 +641,29 @@ class Recorder:
         except Exception:
             log.exception("speaker verifier enrolled-check failed")
             return
+        if getattr(verifier, "_model_failed", False):
+            return          # a dead model is not worth asking once a second
+
+        # One check in flight at a time. At 1 Hz a slow verify could otherwise
+        # stack threads that all mutate the miss counters and may all call
+        # stop(); a check that is late is simply skipped, the next poll asks.
+        lock = getattr(self, "_speaker_check_lock", None)
+        if lock is None:
+            lock = self._speaker_check_lock = threading.Lock()
+        if not lock.acquire(blocking=False):
+            return
 
         now = time.monotonic()
         if (self._record_start_time
                 and (now - self._record_start_time) < self._SPEAKER_WARMUP_S):
+            lock.release()
             return
 
         rate = self._record_rate
         samples_needed = int(rate * self._SPEAKER_WINDOW_S)
         frames = list(self._audio_frames)
         if not frames:
+            lock.release()
             return
 
         # Walk back until the window is filled rather than assuming a frame
@@ -668,13 +681,20 @@ class Recorder:
 
         def _check():
             try:
-                is_match, score = verifier.verify(audio_16k)
-            except Exception:
-                log.warning("speaker silence verify failed", exc_info=True)
-                return
-            self._on_speaker_silence_result(is_match, score)
+                try:
+                    is_match, score = verifier.verify(audio_16k)
+                except Exception:
+                    log.warning("speaker silence verify failed", exc_info=True)
+                    return
+                self._on_speaker_silence_result(is_match, score)
+            finally:
+                lock.release()
 
-        threading.Thread(target=_check, daemon=True).start()
+        try:
+            threading.Thread(target=_check, daemon=True).start()
+        except Exception:
+            lock.release()
+            raise
 
     def _on_speaker_silence_result(self, is_match, score):
         """Handle result of periodic speaker check during recording.

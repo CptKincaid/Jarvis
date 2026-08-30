@@ -323,9 +323,33 @@ that is announced as missed.
 
 ## 11. Spotify (music)
 
-Jarvis plays to your other Spotify Connect devices (HPCOMPUTER, your phone, a speaker), never
-to the Spark itself. Needs Spotify Premium for anything that controls playback (Free accounts
-get "I'm afraid that needs Spotify Premium, sir.").
+Jarvis plays to any Spotify Connect device: HPCOMPUTER, your phone, a speaker — or the Spark
+itself, which advertises as **"Spark"** once `jarvis-spotify.service` is running (below).
+`spotify.default_device` still decides where playback goes unless you name a device in the
+request. Needs Spotify Premium for anything that controls playback (Free accounts get
+"I'm afraid that needs Spotify Premium, sir.").
+
+### 0. The Spark as a Connect device (optional)
+
+There is no Spotify client for aarch64 Linux and the web player needs Widevine, which Google
+does not ship for it, so the Spark runs librespot and feeds PipeWire. No sudo is needed:
+librespot is built with the `pipe` backend (links no audio libraries) and `pacat` carries the
+PCM to whatever the default sink is (the soundbar here).
+
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
+~/.cargo/bin/cargo install librespot --locked --no-default-features \
+    --features rustls-tls-webpki-roots,with-libmdns --root ~/.local
+install -m755 scripts/jarvis-spotify-device ~/.local/bin/
+install -m644 scripts/systemd/jarvis-spotify.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now jarvis-spotify.service
+```
+
+`--locked` matters (an unlocked build hits a `vergen_lib` version skew in the build script),
+and `--no-default-features` alone fails on a missing TLS feature — hence the two features.
+Pick "Spark" once in any Spotify app; librespot caches the credentials under
+`~/.cache/librespot` and reconnects by itself across restarts and reboots (`Restart=always`).
+`LIBRESPOT_NAME` renames the device.
 
 ### 1. Create the developer app (once)
 
@@ -406,6 +430,30 @@ Troubleshooting: "Nothing's listening" while Spotify is open on the PC usually m
 Spotify app is not signed in to the same account or Connect is off — play any song there once
 and it appears in the device list. Every Spotify call is logged under `jarvis.tools.spotify`
 in `jarvis.log` without the secret or token.
+
+---
+
+## 12. Custom phrases (your own shortcuts)
+
+A phrase you choose, straight to a tool — no model, no classifier, the same every time:
+
+```json
+"phrases": [
+  {"say": ["drop my needle", "drop the needle"],
+   "tool": "spotify_play",
+   "args": {"query": "Jingle Bells Bombay Dub Orchestra Remix Joe Williams", "kind": "track"},
+   "reply": "Dropping the needle, sir."}
+]
+```
+
+- `say` is a string or a list; matching ignores case and punctuation, allows surrounding
+  words ("jarvis, drop the needle please"), and is whole-word only ("play" does not fire
+  inside "display"). The longest matching phrase wins.
+- Checked before everything else that could guess, and on the bare transcript too: the wake
+  word is consumed by the hotword, so "Jarvis, drop my needle" arrives as "drop my needle",
+  which the intent classifier would otherwise drop as background chat.
+- `reply` is spoken on success; a failing or unknown tool apologises aloud rather than
+  going silent.
 
 ---
 

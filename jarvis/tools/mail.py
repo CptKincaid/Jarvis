@@ -368,7 +368,7 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
         if typ != "OK":
             raise imaplib.IMAP4.error(f"search failed: {typ}")
         ids = (data[0] or b"").split() if data else []
-        log.info("mail: %d unseen since %s", len(ids), imap_date(since))
+        log.info("mail: %d %s since %s", len(ids), "unseen" if unread_only else "messages", imap_date(since))
         if not ids:
             return []
         ids = ids[-limit:]
@@ -407,8 +407,8 @@ def _fetch_one(settings: dict, since: datetime, limit: int,
         if typ != "OK":
             raise imaplib.IMAP4.error(f"search failed: {typ}")
         ids = (data[0] or b"").split() if data else []
-        log.info("mail: %s has %d unseen since %s", settings["label"],
-                 len(ids), imap_date(since))
+        log.info("mail: %s has %d %s since %s", settings["label"],
+                 len(ids), "unseen" if unread_only else "messages", imap_date(since))
         if not ids:
             return []
         ids = ids[-limit:]
@@ -451,14 +451,19 @@ def when_text(dt: Optional[datetime], now: Optional[datetime] = None) -> str:
 
 
 def fact_sheet(mails: list[Mail], total: int, since_hours: int = 24,
-               now: Optional[datetime] = None) -> str:
+               now: Optional[datetime] = None, unread: bool = True) -> str:
     """'5 unread since yesterday: 1) Jane Doe — Invoice 4471 due Friday
-    (2:10 pm): snippet …' — plain text for the model, one item per line."""
+    (2:10 pm): snippet …' — plain text for the model, one item per line.
+
+    ``unread=False`` when the search included read mail: the model renders
+    this sheet as fact, so calling twenty read messages "unread" had Jarvis
+    reporting a full inbox of new mail the user had already seen."""
     since = "yesterday" if since_hours <= 24 else f"{since_hours // 24} days"
+    kind = "unread" if unread else "messages"
     if total > len(mails):
-        head = f"{total} unread since {since}, latest {len(mails)}:"
+        head = f"{total} {kind} since {since}, latest {len(mails)}:"
     else:
-        head = f"{total} unread since {since}:"
+        head = f"{total} {kind} since {since}:"
     lines = [head]
     for i, m in enumerate(mails, 1):
         when = when_text(m.date, now)
@@ -497,10 +502,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         if not mail_accounts(cfg):
             line = setup_line(cfg, "gmail")
             return ToolResult(text=line, ok=False, speak=line)
+        unread = _truthy_flag(unread_only)
         try:
             mails = fetch_unread(cfg, since_hours=since_hours, limit=20,
-                                 imap=imap_cls,
-                                 unread_only=_truthy_flag(unread_only))
+                                 imap=imap_cls, unread_only=unread)
         except MailNotConfigured:
             line = setup_line(cfg, "gmail")
             return ToolResult(text=line, ok=False, speak=line)
@@ -510,9 +515,15 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                                    "connection failed", ok=False,
                               speak=UNREACHABLE_LINE)
         if not mails:
-            return ToolResult(text=f"no unread mail in the last {since_hours} hours",
-                              speak=NOTHING_NEW_LINE)
-        sheet = fact_sheet(mails[:limit], len(mails), since_hours)
+            if unread:
+                return ToolResult(text=f"no unread mail in the last {since_hours} hours",
+                                  speak=NOTHING_NEW_LINE)
+            # "Nothing new in the inbox" would be the wrong claim here: this
+            # search included read mail, so the inbox is simply empty for the
+            # period. Let the model say that from the fact.
+            return ToolResult(text=f"no mail at all, read or unread, in the last "
+                                   f"{since_hours} hours", max_sentences=2)
+        sheet = fact_sheet(mails[:limit], len(mails), since_hours, unread=unread)
         return ToolResult(text=sheet, max_sentences=4)
 
     spec = ToolSpec(

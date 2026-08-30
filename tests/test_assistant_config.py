@@ -132,7 +132,12 @@ def test_defaults_match_spec_10_1():
                                   "max_ring_s": 300, "snooze_min": 10}
     assert DEFAULTS["discord"] == {"bot_token": "", "channel_id": "", "user_id": ""}
     assert DEFAULTS["autostart"] == {"enabled": False}
-    assert SECRET_KEYS == ("icloud.app_password", "gmail.app_password", "discord.bot_token")
+    assert SECRET_KEYS == ("icloud.app_password", "gmail.app_password", "discord.bot_token",
+                           "spotify.client_secret")
+    from jarvis.assistant_config import SECRET_LIST_FIELDS
+    assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),)
+    assert DEFAULTS["alerts"] == {"desktop": True, "discord": True}
+    assert DEFAULTS["phrases"] == []
 
 
 def test_defaults_are_not_shared_with_instances(cfg):
@@ -587,3 +592,21 @@ def test_gmail_with_only_empty_accounts_is_not_configured():
     assert AssistantConfig(data={"gmail": {"accounts": []}}).is_configured("gmail") is False
     assert AssistantConfig(data={"gmail": {"accounts": [
         {"address": "", "app_password": ""}]}}).is_configured("gmail") is False
+
+
+def test_account_passwords_and_the_spotify_secret_are_redacted():
+    """gmail.accounts[].app_password and spotify.client_secret were outside
+    SECRET_KEYS, so repr(cfg) and scrub() printed them in full."""
+    from jarvis.assistant_config import MASK, AssistantConfig
+    cfg = AssistantConfig({
+        "gmail": {"accounts": [{"label": "a", "address": "a@x.com", "app_password": "abcd efgh ijkl mnop"},
+                               {"label": "b", "address": "b@x.com", "app_password": ""}]},
+        "spotify": {"client_id": "id", "client_secret": "3c9b703ab94844349fffafa4bc86c7df"},
+    })
+    red = cfg.redacted()
+    assert red["gmail"]["accounts"][0]["app_password"] == MASK
+    assert red["gmail"]["accounts"][1]["app_password"] == ""      # unset stays visible as unset
+    assert red["spotify"]["client_secret"] == MASK
+    assert "abcd efgh" not in repr(cfg) and "3c9b703a" not in repr(cfg)
+    assert cfg.scrub("pw=abcd efgh ijkl mnop secret=3c9b703ab94844349fffafa4bc86c7df") == \
+        f"pw={MASK} secret={MASK}"
