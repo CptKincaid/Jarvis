@@ -112,17 +112,32 @@ def read_loadavg() -> tuple[float, float, float]:
 
 
 def run_nvidia_smi() -> Optional[str]:
-    """Seam: one CSV line from nvidia-smi, None when it cannot answer."""
+    """Seam: one CSV line from nvidia-smi, None when it cannot answer.
+
+    Popen + communicate(timeout), never subprocess.run: on a timeout run()
+    kills the child and then WAITS for it, and an nvidia-smi wedged in
+    uninterruptible D-state under a stuck NVRM lock (the 2026-08-28 failure
+    mode on this box) never exits. Kill and walk away instead.
+    """
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             ["nvidia-smi", f"--query-gpu={SMI_QUERY}", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=SMI_TIMEOUT, check=False)
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     except (OSError, subprocess.SubprocessError) as exc:
         log.debug("nvidia-smi unavailable: %s", type(exc).__name__)
         return None
+    try:
+        out, _ = proc.communicate(timeout=SMI_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        log.warning("nvidia-smi did not answer in %ss; not waiting for it", SMI_TIMEOUT)
+        return None
     if proc.returncode != 0:
         return None
-    return proc.stdout.strip().splitlines()[0] if proc.stdout.strip() else None
+    return out.strip().splitlines()[0] if out.strip() else None
 
 
 def disk_free(path: str) -> Optional[float]:
@@ -288,7 +303,7 @@ def top_processes(n: int = TOP_N) -> list[Proc]:
     return out
 
 
-def snapshot() -> Snapshot:
+def snapshot(gpu: bool = True) -> Snapshot:
     """Every probe, each failing on its own; never raises."""
     snap = Snapshot()
     try:
@@ -304,7 +319,7 @@ def snapshot() -> Snapshot:
     except Exception:  # noqa: BLE001
         log.debug("loadavg unreadable", exc_info=True)
     try:
-        snap.gpu = parse_nvidia_smi(run_nvidia_smi())
+        snap.gpu = parse_nvidia_smi((run_nvidia_smi() if gpu else None))
     except Exception:  # noqa: BLE001
         log.debug("nvidia-smi failed", exc_info=True)
     for mount in DISKS:
@@ -400,7 +415,7 @@ class Alert:
 
 
 class Watchdog:
-    """Samples ``snapshot()`` on a daemon thread and raises the alarm once
+    """Samples ``snapshot(gpu=False)`` on a daemon thread and raises the alarm once
     per episode. ``check(snap)`` is the whole state machine (tests drive
     it directly); ``tick()`` is one sample; ``start()`` / ``stop()`` own
     the thread. ``speak`` may be None at construction: the callback is
@@ -464,7 +479,11 @@ class Watchdog:
                                    status=f"{len(heavy)} processes over {_gb(self.hog_gb)} GB",
                                    rule="hogs"))
                 self._hogs_alerted = True
-        else:
+        elif self._hogs_alerted and \
+                len(hogs(snap, self.hog_gb - REARM_MARGIN_GB)) < HOG_COUNT:
+            # Hysteresis, as for memory: a process hovering around hog_gb must
+            # not re-speak "last time that ended in a hard power-off" every
+            # other tick.
             self._hogs_alerted = False
         for alert in fired:
             self._fire(alert)
@@ -491,7 +510,7 @@ class Watchdog:
     # --------------------------------------------------------- thread
     def tick(self) -> list[Alert]:
         try:
-            return self.check(snapshot())
+            return self.check(snapshot(gpu=False))
         except Exception:  # noqa: BLE001 - the loop must survive anything
             log.exception("health watchdog: tick failed")
             return []
@@ -535,8 +554,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
     def system_health(**_) -> ToolResult:
         try:
-            snap = snapshot()
-        except Exception:  # noqa: BLE001 - belt and braces; snapshot() guards
+            snap = snapshot(gpu=False)
+        except Exception:  # noqa: BLE001 - belt and braces; snapshot(gpu=False) guards
             log.exception("system_health: snapshot failed")
             return ToolResult(text="system counters unreadable", ok=False,
                               speak=UNREADABLE_LINE)

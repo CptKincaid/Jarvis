@@ -27,7 +27,6 @@ import os
 import re
 import shutil
 import subprocess
-import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -97,23 +96,8 @@ def _grab_cli(display: str):
     installed or both failed."""
     from PIL import Image
     env = _display_env(display)
-    if shutil.which("gnome-screenshot"):
-        # No stdout mode: a 0700 temp dir, read, and removed in `finally`
-        # so the capture never outlives this call on disk.
-        tmp = tempfile.mkdtemp(prefix="jarvis-screen-")
-        try:
-            path = os.path.join(tmp, "grab.png")
-            proc = subprocess.run(["gnome-screenshot", "-f", path],
-                                  capture_output=True, timeout=GRAB_TIMEOUT_S,
-                                  env=env)
-            if proc.returncode == 0 and os.path.exists(path):
-                with Image.open(path) as img:
-                    img.load()
-                    return img.copy()
-        except (OSError, subprocess.SubprocessError) as exc:
-            log.debug("gnome-screenshot failed: %s", type(exc).__name__)
-        finally:
-            shutil.rmtree(tmp, ignore_errors=True)
+    # No gnome-screenshot: the project spec forbids it (it drives the Shell's
+    # screenshot UI). ImageMagick `import` reads the X root window quietly.
     if shutil.which("import"):
         try:
             proc = subprocess.run(["import", "-display", display, "-window", "root",
@@ -147,9 +131,9 @@ def _window_title(display: Optional[str] = None) -> str:
     display = display or display_name()
     try:
         proc = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
-                              capture_output=True, text=True,
+                              capture_output=True, text=True, errors="replace",
                               timeout=WINDOW_TIMEOUT_S, env=_display_env(display))
-    except (OSError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - a title is optional (a Latin-1 WM_NAME raised)
         return ""
     if proc.returncode != 0:
         return ""
@@ -309,7 +293,11 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                  orig[0], orig[1], small[0], small[1], len(b64) * 3 // 4096,
                  model, time.monotonic() - t0)
         text = f"Active window: {title}. {answer}" if title else answer
-        return ToolResult(text=text, max_sentences=MAX_SENTENCES)
+        # speak=answer: the vision call can take 25 s and the brain's tool
+        # loop budget is 8 s, so a second model turn to phrase this would be
+        # refused and "I have the result but..." spoken instead. The answer
+        # was asked for in spoken form; it goes straight to the speaker.
+        return ToolResult(text=text, max_sentences=MAX_SENTENCES, speak=answer)
 
     return [ToolSpec(
         name="screen_qa",

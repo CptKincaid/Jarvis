@@ -135,6 +135,8 @@ def seams(monkeypatch):
     for name in ("Transcriber", "Recorder", "MicArbiter", "SpeakerVerifier",
                  "Hotword", "JarvisAgent"):
         monkeypatch.setattr(app_mod, name, _Stub)
+    # the brain fakes below take (text, callback, force_tool): no streaming
+    monkeypatch.setattr(CONFIG, "stream_replies", False)
     monkeypatch.setattr(app_mod, "TTS", FakeTTS)
     monkeypatch.setattr(CONFIG, "talkback", True)
     monkeypatch.setattr(CONFIG, "hotword", False)
@@ -218,7 +220,9 @@ def test_every_tool_module_is_registered(app):
     for expected in ("get_time", "get_location", "get_weather", "get_calendar",
                      "set_reminder", "set_timer", "set_alarm", "manage_schedule",
                      "notes", "get_mail", "get_briefing", "spotify_play",
-                     "spotify_control", "spotify_now_playing"):
+                     "spotify_control", "spotify_now_playing",
+                     "canvas_due", "canvas_grades", "canvas_announcements",
+                     "ask_docs", "docs_reindex", "screen_qa", "system_health"):
         assert expected in names, f"{expected} not registered"
     assert len(names) == len(set(names)), "duplicate tool names"
     # the brain sees the same registry
@@ -226,7 +230,9 @@ def test_every_tool_module_is_registered(app):
     assert brain_mod._REGISTRY is app.tools
     # spec 4.1 budget: the 11 spec tools plus the (later) Spotify six
     # 18 since 2026-08-28: calendar gained add_event alongside get_calendar
-    assert len(names) == 18
+    # 25 since 2026-08-30: canvas (3), docs (2), screen (1), health (1). The
+    # prompt no longer carries them all: jarvis/tools/cues.py picks per turn.
+    assert len(names) == 25
 
 
 def test_a_tool_module_that_fails_to_import_does_not_abort_boot(build,
@@ -1101,7 +1107,8 @@ def test_services_brain_chat_forwards_every_keyword_the_brain_takes(build, monke
     # and structurally: every keyword the real method accepts (bar callback,
     # which the wrapper supplies) must be accepted by the wrapper
     from jarvis.brain import JarvisBrain
-    real = set(inspect.signature(JarvisBrain.chat).parameters) - {"self", "callback", "max_rounds"}
+    # callback and on_sentence are supplied by the wrapper itself
+    real = set(inspect.signature(JarvisBrain.chat).parameters) - {"self", "callback", "max_rounds", "on_sentence"}
     wrapper = set(inspect.signature(app.services.brain.chat).parameters)
     assert real <= wrapper, f"wrapper drops {real - wrapper}"
 
@@ -1244,3 +1251,23 @@ def test_the_app_report_is_built_from_real_sources(build, tmp_path, monkeypatch)
     assert text.startswith("All systems nominal, sir.")
     assert "2 turns today, median wait 1.7 seconds" in text
     assert "gigabytes free" in text
+
+
+def test_the_app_shows_but_does_not_respeak_a_streamed_reply(build, monkeypatch):
+    from jarvis.events import JarvisReply, bus as _bus
+    app = build()
+    said, shown = [], []
+    monkeypatch.setattr(app, "_say", said.append)
+    unsub = _bus.subscribe(JarvisReply, lambda ev: shown.append((ev.text, ev.speak)))
+    try:
+        app._last_source = "voice"
+        app._on_stream_sentence("It is ten, sir.")
+        app._on_brain_tags([("STREAMED", "1"), ("SPEAK", "It is ten, sir.")])
+        assert said == ["It is ten, sir."], said
+        assert shown and shown[-1] == ("It is ten, sir.", False)
+        assert app._followup_after_speech
+    finally:
+        try:
+            unsub()
+        except TypeError:
+            pass

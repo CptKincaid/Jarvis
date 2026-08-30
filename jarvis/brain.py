@@ -504,6 +504,41 @@ def _http(path, payload=None, timeout=OLLAMA_TIMEOUT_S):
         raise MalformedReply(f"body is not JSON: {str(exc)[:60]}") from exc
 
 
+def _http_stream(path, payload, timeout=OLLAMA_TIMEOUT_S):
+    """Streaming variant of _http: yields each NDJSON object as it arrives.
+    Same error mapping. Tests monkeypatch this."""
+    data = json.dumps(dict(payload, stream=True)).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}{path}", data=data,
+                                 headers={"Content-Type": "application/json"})
+    try:
+        resp = urllib.request.urlopen(req, timeout=timeout)
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+            raise OllamaDown(str(exc)) from exc
+        raise
+    with resp:
+        for line in resp:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except ValueError as exc:
+                raise MalformedReply(f"stream line is not JSON: {str(exc)[:60]}") from exc
+
+
+_SENTENCE_END_RX = re.compile(r"(?<=[.!?])\s+(?=\S)")
+
+
+def _split_complete_sentences(buf):
+    """(complete sentences, remainder) -- a sentence is complete once text
+    follows its terminator, so an abbreviation mid-stream is not cut."""
+    parts = _SENTENCE_END_RX.split(buf)
+    if len(parts) <= 1:
+        return [], buf
+    return parts[:-1], parts[-1]
+
+
 def _options(**overrides):
     opts = dict(CHAT_OPTIONS)
     opts.update(overrides)
@@ -946,7 +981,7 @@ class JarvisBrain:
     # Public API
     # ------------------------------------------------------------------
     def chat(self, text, callback=None, force_tool=None, force_args=None,
-             max_rounds=3):
+             max_rounds=3, on_sentence=None):
         """Tier 2 with tools on a worker thread; callback gets the tags
         ([("BRIEFING", json)] when a card was produced, then ("SPEAK",
         line))."""
@@ -961,7 +996,8 @@ class JarvisBrain:
             try:
                 tags = self._chat_sync(text, force_tool=force_tool,
                                        force_args=force_args,
-                                       max_rounds=max_rounds)
+                                       max_rounds=max_rounds,
+                                       on_sentence=on_sentence)
                 if self._cancelled:
                     log.info("chat cancelled; dropping result")
                     return
@@ -1241,8 +1277,16 @@ class JarvisBrain:
             args = {}
         return name, args
 
-    def _chat_sync(self, text, force_tool=None, force_args=None, max_rounds=3):
-        """The tool loop (spec 4.2), synchronous. Returns tags."""
+    def _chat_sync(self, text, force_tool=None, force_args=None, max_rounds=3,
+                   on_sentence=None):
+        """The tool loop (spec 4.2), synchronous. Returns tags.
+
+        ``on_sentence(sentence)``: when given, the final model turn is
+        STREAMED and each complete sentence is handed over as it lands, so
+        the first one is speaking while the rest generates. The returned
+        tags then carry ("STREAMED", "<n>") ahead of SPEAK so the caller
+        shows the full reply without speaking it a second time.
+        """
         log.info("chat: %s", text[:60])
         registry = self.registry
         ctx_text, mem_text = self._dynamic_context()
@@ -1314,12 +1358,17 @@ class JarvisBrain:
                 messages.append(tool_message(result, force_tool))
                 rounds_left = 1        # one model turn renders the result
 
+        streamed_sentences = []           # what on_sentence already received
         try:
             while speak is None and rounds_left > 0:
                 rounds_left -= 1
-                data = _http("/api/chat", _chat_payload(messages, tools),
-                             timeout=OLLAMA_TIMEOUT_S)
-                content, calls = _message_parts(data)
+                if on_sentence is not None:
+                    data, content, calls = self._stream_round(
+                        messages, tools, cap, on_sentence, streamed_sentences)
+                else:
+                    data = _http("/api/chat", _chat_payload(messages, tools),
+                                 timeout=OLLAMA_TIMEOUT_S)
+                    content, calls = _message_parts(data)
                 server_s += (data.get("load_duration") or 0) / 1e9
                 if not calls or registry is None:
                     final = content
@@ -1376,7 +1425,11 @@ class JarvisBrain:
             return [("SPEAK", MODEL_EMPTY_LINE)]
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
             log.warning("ollama request failed: %s", exc)
-            if tool_texts:
+            if streamed_sentences:
+                # the model died mid-reply after some of it was already
+                # spoken: keep what was said rather than say it timed out
+                final = " ".join(streamed_sentences)
+            elif tool_texts:
                 final = TOOL_ONLY_LINE
             else:
                 bus.publish(Status(text="Local model timed out", kind="warn"))
@@ -1409,8 +1462,53 @@ class JarvisBrain:
         tags = []
         if card:
             tags.append(("BRIEFING", json.dumps(card)))
+        if streamed_sentences:
+            tags.append(("STREAMED", str(len(streamed_sentences))))
         tags.append(("SPEAK", spoken))
         return tags
+
+    def _stream_round(self, messages, tools, cap, on_sentence, streamed):
+        """One /api/chat round, streamed. Complete sentences go to
+        on_sentence as they land (cleaned per sentence, capped at ``cap``);
+        a round that turns out to be a tool call speaks nothing. Returns
+        (data, content, calls) shaped like the non-streaming path."""
+        content, calls, buf, last = "", [], "", {}
+        for chunk in _http_stream("/api/chat", _chat_payload(messages, tools),
+                                  timeout=OLLAMA_TIMEOUT_S):
+            last = chunk
+            msg = chunk.get("message") or {}
+            piece = msg.get("content") or ""
+            if piece:
+                content += piece
+                buf += piece
+            for call in msg.get("tool_calls") or []:
+                calls.append(call)
+            if calls:
+                continue                      # a tool round: never spoken
+            done, buf = _split_complete_sentences(buf)
+            for sent in done:
+                self._emit_sentence(sent, cap, on_sentence, streamed)
+            if chunk.get("done"):
+                break
+        if not calls and buf.strip():
+            self._emit_sentence(buf, cap, on_sentence, streamed)
+        data = dict(last)
+        data["message"] = {"role": "assistant", "content": content,
+                           "tool_calls": calls}
+        return data, content, calls
+
+    @staticmethod
+    def _emit_sentence(sentence, cap, on_sentence, streamed):
+        if len(streamed) >= cap:
+            return                            # the spoken cap still holds
+        line = trim_spoken(strip_markdown(sentence).strip())
+        if not line:
+            return
+        streamed.append(line)
+        try:
+            on_sentence(line)
+        except Exception:
+            log.exception("on_sentence failed")
 
     # ------------------------------------------------------------------
     # Tier 3: Claude CLI (deep reasoning)

@@ -89,6 +89,10 @@ TOOL_MODULES = (
     "jarvis.tools.mail",
     "jarvis.tools.briefing",
     "jarvis.tools.spotify",
+    "jarvis.tools.canvas",
+    "jarvis.tools.docs",
+    "jarvis.tools.screen",
+    "jarvis.tools.health",
 )
 
 # Fixed persona lines the app itself speaks (spec 3.4); prewarmed. The
@@ -404,6 +408,10 @@ class JarvisApp:
                                       "DECLINED_LINE")),
                 ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE",
                                       "WEB_LOOKUP_LINE", "WEB_UNAVAILABLE_LINE")),
+                ("jarvis.tools.docs", ("INDEX_DOWN_LINE", "INDEXING_LINE",
+                                       "NO_QUESTION_LINE")),
+                ("jarvis.tools.screen", ("NO_SCREEN_LINE", "NO_VISION_LINE")),
+                ("jarvis.tools.health", ("UNREADABLE_LINE",)),
                 ("jarvis.tools.timekeeper", ("NOTHING_RINGING_LINE",
                                              "NO_TIMEKEEPER_LINE")),
                 ("jarvis.brain", ("MODEL_DOWN_LINE", "MODEL_SLOW_LINE",
@@ -417,7 +425,8 @@ class JarvisApp:
                     phrases.append(line)
         # Whole lists of fixed lines (the module is already imported when its
         # tools registered; a missing module simply contributes nothing).
-        for modname, name in (("jarvis.tools.spotify", "PERSONA_LINES"),):
+        for modname, name in (("jarvis.tools.spotify", "PERSONA_LINES"),
+                              ("jarvis.tools.canvas", "PERSONA_LINES")):
             lines = getattr(sys.modules.get(modname), name, None)
             if isinstance(lines, (list, tuple)):
                 phrases += [ln for ln in lines if isinstance(ln, str) and ln
@@ -501,6 +510,8 @@ class JarvisApp:
             # does not take raises TypeError inside the handler, which the
             # dispatcher turns into "Command failed: <name>" for the user.
             extra = {"force_args": force_args} if force_args is not None else {}
+            if CONFIG.stream_replies:
+                extra["on_sentence"] = app._on_stream_sentence
             return b.chat(text, callback=app._on_brain_tags,
                           force_tool=force_tool, **extra)
 
@@ -539,9 +550,19 @@ class JarvisApp:
             calendar=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
+            # the health watchdog resolves this at fire time (talkback-gated)
+            speak=self._say,
         )
 
     # ------------------------------------------------------- brain executor
+    def _on_stream_sentence(self, sentence):
+        """A sentence of the reply, as the model produces it: speak it now.
+        The full reply follows in the tags with a STREAMED marker so it is
+        shown, remembered and not spoken again."""
+        if self._last_source == "voice":
+            self._followup_after_speech = True
+        self._say(sentence)
+
     def _on_brain_tags(self, tags):
         """Port of the monolith's _on_brain_response: act on [TAG] tuples.
         A ("BRIEFING", json) tag turns that turn's SPEAK into ONE
@@ -549,6 +570,7 @@ class JarvisApp:
         # Whatever else these tags mean, their arrival ends the turn.
         self._turn_finished()
         briefing = None
+        streamed = any(tag == "STREAMED" for tag, _ in tags)
         for tag, content in tags:
             if tag == "BRIEFING":
                 try:
@@ -571,12 +593,13 @@ class JarvisApp:
                         bus.publish(BriefingReady(sections=briefing, spoken=content))
                         briefing = None
                     else:
-                        bus.publish(JarvisReply(text=content, speak=True))
-                    self._say(content)
+                        bus.publish(JarvisReply(text=content, speak=not streamed))
+                    if not streamed:          # streamed sentences already spoke
+                        self._say(content)
                     self.context.add_exchange(self._last_user_text, content)
                     if self._last_source == "voice":
                         self._followup_after_speech = True
-                elif tag == "BRIEFING":
+                elif tag in ("BRIEFING", "STREAMED"):
                     pass                               # consumed by the SPEAK
                 elif tag == "RUN":
                     def _run(cmd=content):
@@ -1493,6 +1516,12 @@ class JarvisApp:
                 cal.start()
             except Exception:
                 log.exception("calendar refresh start failed")
+        wd = getattr(self.services, "health_watchdog", None)
+        if wd is not None:
+            try:
+                wd.start()
+            except Exception:
+                log.exception("health watchdog failed to start")
         try:
             from jarvis.headsup import MeetingHeadsUp
             lead = int(self.assistant.get("calendar.heads_up_min", 10) or 10)

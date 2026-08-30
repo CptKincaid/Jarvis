@@ -133,7 +133,7 @@ def test_defaults_match_spec_10_1():
     assert DEFAULTS["discord"] == {"bot_token": "", "channel_id": "", "user_id": ""}
     assert DEFAULTS["autostart"] == {"enabled": False}
     assert SECRET_KEYS == ("icloud.app_password", "gmail.app_password", "discord.bot_token",
-                           "spotify.client_secret")
+                           "spotify.client_secret", "canvas.token")
     from jarvis.assistant_config import SECRET_LIST_FIELDS
     assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),)
     assert DEFAULTS["alerts"] == {"desktop": True, "discord": True}

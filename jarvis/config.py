@@ -113,6 +113,12 @@ class Config:
     # wake word ("...and Tuesday?"). Needs the VAD (it must know that nothing
     # was said); 0 turns it off. Every follow-up is still speaker-verified.
     followup_window: float = 4.0
+    # Speak each sentence of a model reply as it is generated instead of
+    # waiting for the whole reply.
+    stream_replies: bool = True
+    # PulseAudio/PipeWire sink for speech ("" = the default). Set to the
+    # echo-cancelling sink so barge-in hears you over Jarvis.
+    playback_device: str = ""
     # Barge-in: keep the wake word live while Jarvis speaks so "Jarvis, stop"
     # cuts him off. The speaker gate keeps his own voice from waking him.
     barge_in: bool = True

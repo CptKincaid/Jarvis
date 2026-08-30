@@ -347,6 +347,8 @@ class DocsIndex:
                 log.exception("docs index open failed")
                 result["error"] = f"store: {type(exc).__name__}"
                 self._last = result
+                if result.get("error"):
+                    self._kicked = False      # let the next ask kick a fresh pass
                 return result
             files = self.scan()
             present = {str(p) for p in files}
@@ -392,6 +394,8 @@ class DocsIndex:
                      result["skipped"], result["errors"], time.monotonic() - t0,
                      result["documents"])
             self._last = result
+            if result.get("error"):
+                self._kicked = False      # let the next ask kick a fresh pass
             return result
 
     def _index_file(self, col, path: Path, key: tuple[float, int]) -> bool:
@@ -509,23 +513,38 @@ def make_tools(cfg, services, embed: Embed = _embed) -> list[ToolSpec]:
             # background pass is still filling it, or the last pass could
             # not embed (Ollama down) or read anything. Blaming the folder
             # here would send Hunter to check a folder that is fine.
+            last = index.last_result or {}
+            if last.get("error"):
+                # The last pass failed (Ollama down). A retry was just
+                # kicked, but say what is wrong rather than "indexing now"
+                # every time until it recovers.
+                return ToolResult(text="document index unreachable", ok=False,
+                                  speak=INDEX_DOWN_LINE)
             if first or index.busy():
                 return ToolResult(text="indexing in progress", ok=False,
                                   speak=INDEXING_LINE)
-            if (index.last_result or {}).get("error"):
-                return ToolResult(text="document index unreachable", ok=False,
-                                  speak=INDEX_DOWN_LINE)
-            return ToolResult(text="documents present but none readable", ok=False,
-                              speak=UNREADABLE_LINE.format(folder=folder))
+            seen = int(last.get("documents", 0)) + int(last.get("errors", 0))
+            if int(last.get("errors", 0)) > 0 and len(index.scan()) <= seen:
+                return ToolResult(text="documents present but none readable", ok=False,
+                                  speak=UNREADABLE_LINE.format(folder=folder))
+            # Files the last pass never saw (dropped in since it ran): index
+            # them now rather than tell the user his new syllabus is unreadable.
+            index._kicked = False
+            index.start_background()
+            return ToolResult(text="indexing in progress", ok=False, speak=INDEXING_LINE)
         return ToolResult(text=fact_sheet(hits), max_sentences=4)
 
     def docs_reindex(**_) -> ToolResult:
-        index.mark_used()                      # an explicit pass IS the first use
+        # On a worker thread with a bounded wait: a synchronous pass held the
+        # brain's chat thread for the whole walk, and every other utterance
+        # got "Still on the last one" until it finished.
+        if not index.busy():
+            index._kicked = False              # an explicit pass may run again
+            index.start_background()
+        index.wait(timeout=5.0)
         if index.busy():
-            index.wait()                       # report the pass already running
-            result = index.last_result or {}
-        else:
-            result = index.reindex()
+            return ToolResult(text="indexing in progress", ok=False, speak=INDEXING_LINE)
+        result = index.last_result or {}
         if result.get("error") == "embed":
             return ToolResult(text="embedding model unreachable", ok=False,
                               speak=INDEX_DOWN_LINE)

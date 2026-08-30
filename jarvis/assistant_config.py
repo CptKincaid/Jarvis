@@ -90,6 +90,14 @@ DEFAULTS: dict = {
     # on_first_wake: deliver the briefing after the first thing you say to
     # Jarvis each day, once it is past `after` (24 h clock, local time).
     "calendar": {"heads_up_min": 10},
+    # Canvas LMS: Account > Settings > New Access Token (read-only use)
+    "canvas": {"base_url": "https://canvas.tamu.edu", "token": ""},
+    # Local document Q&A: drop PDFs / notes here; indexed with nomic-embed-text
+    "docs": {"paths": ["~/Documents/Jarvis Docs"], "index_dir": "~/.aiws_trainer/docs_index",
+             "max_files": 500, "embed_model": "nomic-embed-text",
+             "ollama_url": "http://localhost:11434"},
+    "screen": {"model": "llama3.2-vision:latest", "max_width": 1280},
+    "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30},
     "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],
@@ -107,7 +115,7 @@ DEFAULTS: dict = {
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",
-               "spotify.client_secret")
+               "spotify.client_secret", "canvas.token")
 # Secrets that live inside a LIST of sections rather than at a dotted path:
 # (list key, field). gmail.accounts[].app_password was invisible to redacted()
 # and scrub(), so repr(cfg) printed three real app passwords in full.

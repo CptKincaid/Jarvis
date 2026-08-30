@@ -278,7 +278,11 @@ def active_courses(settings: dict, fetch: Fetch, budget: _Budget) -> list[dict]:
             break
         # Non-student enrolments (a TA post, an observed course) stay in the
         # roster for announcements but carry no grade and no homework.
-        courses.append({"id": int(c["id"]), "name": name,
+        try:
+            cid = int(c["id"])
+        except (TypeError, ValueError):
+            continue
+        courses.append({"id": cid, "name": name,
                         "code": str(c.get("course_code") or ""),
                         "student": student, "score": score, "grade": grade})
     log.info("canvas: %d active courses at %s", len(courses), _host(key))
@@ -287,7 +291,7 @@ def active_courses(settings: dict, fetch: Fetch, budget: _Budget) -> list[dict]:
     return list(courses)
 
 
-_LEADING_CODE = re.compile(r"^[A-Z]{2,4}[\s\-_]*\d{3}[A-Z]?(?:[\s\-_]*\d{3})?[\s\-_:.]*",
+_LEADING_CODE = re.compile(r"^[A-Z]{2,4}[\s\-_]*\d{3,4}[A-Z]?(?:[\s\-_]*\d{3,4})?[\s\-_:.]*",
                            re.I)
 _TRAILING_TERM = re.compile(r"[\s\-_,(]*(?:(?:FA|SP|SU|WI)\s?\d{2}|(?:FALL|SPRING|SUMMER|WINTER)"
                             r"\s*\d{2,4}|\d{4,6})\)?[\s\-_]*$", re.I)
@@ -322,7 +326,16 @@ def _parse_iso(text) -> Optional[datetime]:
 def when_words(dt: datetime, now: datetime) -> str:
     """today 11:59 pm / tomorrow 11:59 pm / Tue 11:59 pm / Tue 15 Sep 11:59 pm,
     in ``now``'s timezone (the local one at call time)."""
-    local = dt.astimezone(now.tzinfo) if now.tzinfo else dt
+    # datetime.now().astimezone() hands back a FIXED offset; a due date on
+    # the other side of a DST change (inside every 30-day window in March
+    # and November) would render an hour off and often a day off. A bare
+    # astimezone() follows the system zone through the change.
+    if now.tzinfo is None:
+        local = dt
+    elif isinstance(now.tzinfo, timezone):
+        local = dt.astimezone()
+    else:
+        local = dt.astimezone(now.tzinfo)
     today = now.date()
     day = local.date()
     clock = clock_words(local)
@@ -344,7 +357,7 @@ def _now() -> datetime:
 def _days_arg(value, default: int) -> int:
     try:
         return max(1, min(MAX_DAYS, int(float(str(value)))))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):   # int(float("inf"))
         return default
 
 

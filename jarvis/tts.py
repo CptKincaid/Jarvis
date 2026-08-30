@@ -990,7 +990,11 @@ class TTS:
         Uses Popen + poll so stop() can interrupt playback; per-player
         timeout stays 30s, non-zero exit falls through to the next player.
         """
-        for cmd in [["paplay", wav_path], ["pw-play", wav_path],
+        dev = (CONFIG.playback_device or "").strip()
+        # An explicit sink (the echo-cancelling one) for the two players
+        # that can take one; aplay is the no-PipeWire fallback.
+        for cmd in [["paplay", *(["--device", dev] if dev else []), wav_path],
+                    ["pw-play", *(["--target", dev] if dev else []), wav_path],
                     ["aplay", "-q", wav_path]]:
             if self._stop_flag:
                 return

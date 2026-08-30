@@ -468,6 +468,66 @@ A phrase you choose, straight to a tool — no model, no classifier, the same ev
 
 ---
 
+## 13. Canvas (coursework, grades, announcements)
+
+Read-only. In Canvas: **Account → Settings → Approved Integrations → + New Access Token**,
+copy the token once, then in `assistant.json`:
+
+```json
+"canvas": {"base_url": "https://canvas.tamu.edu", "token": "<paste the token>"}
+```
+
+Then: *"what's due this week?"*, *"any new grades?"*, *"any announcements?"*,
+*"when's the biosensors midterm?"* The token is redacted from every log and repr. Unset:
+"I'll need a Canvas access token set up, sir; the notes are in docs/assistant-setup.md."
+
+## 14. Your own documents (fully local)
+
+Drop PDFs, `.txt`, `.md` or `.docx` into **`~/Documents/Jarvis Docs`** (or list folders in
+`docs.paths`). They are chunked, embedded with Ollama's `nomic-embed-text` and stored in a
+chromadb index under `~/.aiws_trainer/docs_index`; the first ask kicks the indexing pass
+("I'm indexing your documents now, sir; ask me again in a moment"), later asks are instant,
+and changed files re-index on their own. *"What does the syllabus say about late work?"* is
+answered from the text and cites the file. *"Reindex my documents"* forces a pass. Nothing
+leaves the machine.
+
+## 15. Screen Q&A (local vision model)
+
+*"What's on my screen?"*, *"what does this error say?"*, *"summarise what I'm looking at."*
+A screenshot of `DISPLAY=:1` goes to the local `llama3.2-vision` model through Ollama; the
+answer is spoken directly. Nothing is written to disk unless `JARVIS_DEBUG_SCREEN=1`. The
+first call after a while loads the model (~10 s); `screen.model` and `screen.max_width` tune it.
+
+## 16. Spark health and the memory watchdog
+
+*"How's the Spark doing?"* / *"system health"* reads memory, GPU, load, disk and the top
+processes. A watchdog checks memory every 30 s and speaks ONCE per episode when free
+memory drops under `health.warn_gb` (16) — "Memory is getting tight, sir: …" — again under
+`health.critical_gb` (8), and when two processes each hold over `health.hog_gb` (20), the
+pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` itself.
+
+## 17. How he behaves now (the 2026-08-30 set)
+
+- **Follow-ups without the wake word** — after an answer the mic stays open
+  `followup_window` (4 s) seconds; say "…and Tuesday?" straight away. Nothing said → it
+  closes quietly. Every follow-up is still speaker-verified.
+- **He remembers the conversation** — the last few exchanges (10 min) go to the model, so
+  "what about tomorrow?" follows a calendar question.
+- **Interrupt him** — say the wake word while he is talking ("Jarvis, stop"). `barge_in`
+  keeps the wake word live during speech; his own voice cannot wake him (the speaker gate
+  scores it at −0.03..−0.06). Echo cancellation: `scripts/audio/aec-install.sh`.
+- **"Say that again, sir?"** — a garbled transcription (confidence gate) is asked again
+  instead of being routed.
+- **First-wake briefing** — after the first thing you say each day past `briefing.after`
+  (06:00) he gives the briefing; `briefing.on_first_wake` turns it off.
+- **Meeting heads-up** — "BIOSENSORS in ten minutes, sir" (`calendar.heads_up_min`).
+- **Guests** — a clear wake word in another voice gets "I only answer to Hunter, sir."
+- **He learns your voice** — a confident match joins the voiceprint (at most every 10 min).
+- **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
+- **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
+
+---
+
 ## What Jarvis says when something is missing
 
 | section not set up | is_configured needs | spoken line |
