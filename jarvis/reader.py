@@ -12,6 +12,14 @@ being read is not a conversational reply. Long texts are read one *part*
 at a time (``max_part`` chars, about three minutes of speech); Jarvis
 then offers "continue reading" for the rest so a mis-fire never locks the
 speakers for ten minutes.
+
+Documents (.pdf / .docx) go through ``jarvis.tools.docs.extract_text``
+(pdftotext / stdlib zip) and are unwrapped first: pdftotext keeps the
+page's hard line breaks and form feeds, and read as-is those land as
+pauses mid-sentence. ``resolve_document`` also matches a spoken name
+("the biosensors lab handout") against the file names in the search
+folders, which include the docs folders, so a PDF never has to be named
+by its exact file name.
 """
 from __future__ import annotations
 
@@ -42,6 +50,8 @@ MAX_FILE_BYTES = 512_000
 TEXT_SUFFIXES = {".txt", ".md", ".rst", ".log", ".py", ".json", ".yaml",
                  ".yml", ".toml", ".cfg", ".ini", ".csv", ".sh", ".html",
                  ".htm", ".xml", ".tex", ".org", ""}
+DOC_SUFFIXES = {".pdf", ".docx"}       # via jarvis.tools.docs.extract_text
+NO_TEXT_LINE = "I couldn't get any text out of {name}, sir."
 
 CONTINUE_PROMPT = ("That's the first part, sir. Say 'continue reading' "
                    "for the rest.")
@@ -96,6 +106,19 @@ def chunk_text(text: str, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
     return chunks
 
 
+def unwrap_text(text: str) -> str:
+    """Undo pdftotext's page layout for speech: form feeds become
+    paragraph breaks, a lone newline inside a paragraph becomes a space
+    (a hard-wrapped line is not a sentence end) and a hyphen split across
+    a wrap is joined. Paragraph breaks (blank lines) survive."""
+    text = (text or "").replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\f", "\n\n")
+    text = re.sub(r"[ \t]+\n", "\n", text)
+    text = re.sub(r"(\w)-\n(?=[a-z])", r"\1", text)       # "bio-\nsensor"
+    text = re.sub(r"(?<!\n)\n(?!\n)", " ", text)
+    return re.sub(r"[ \t]{2,}", " ", text).strip()
+
+
 def looks_like_text(data: bytes) -> bool:
     if not data:
         return True
@@ -147,10 +170,63 @@ class ReadAloud:
                 return c
         return None
 
+    def resolve_document(self, name: str) -> Optional[Path]:
+        """``resolve_file`` first; failing that, the best fuzzy match of a
+        spoken name against the readable files in the search folders
+        (the docs folders included). None when nothing is close."""
+        path = self.resolve_file(name)
+        if path is not None:
+            return path
+        from jarvis.tools.docs import match_name    # lazy: docs pulls chromadb hints
+        candidates: dict[str, Path] = {}
+        for d in self._search_dirs:
+            try:
+                if not d.is_dir():
+                    continue
+                # Depth-limited on purpose: ~ holds a whole filesystem of
+                # names, and a spoken title must not resolve to a stray
+                # README three levels down a checkout.
+                for p in list(d.iterdir()) + [q for sub in d.iterdir()
+                                              if sub.is_dir() and not sub.name.startswith(".")
+                                              for q in sub.iterdir()]:
+                    if p.is_file() and not p.name.startswith(".") and \
+                            p.suffix.lower() in DOC_SUFFIXES | (TEXT_SUFFIXES - {""}):
+                        candidates.setdefault(p.name, p)
+            except OSError:
+                log.debug("resolve_document: cannot list %s", d, exc_info=True)
+        best = match_name(name, list(candidates))
+        return candidates[best] if best else None
+
+    def document_text(self, path: Path) -> str:
+        """The spoken-ready text of a file: documents through extract_text
+        and unwrap_text, text files as they are. '' when unreadable."""
+        suffix = path.suffix.lower()
+        if suffix in DOC_SUFFIXES:
+            from jarvis.tools.docs import extract_text
+            return unwrap_text(extract_text(path))[:MAX_FILE_BYTES]
+        try:
+            data = path.read_bytes()[:MAX_FILE_BYTES]
+        except OSError:
+            log.exception("document_text failed: %s", path)
+            return ""
+        if suffix not in TEXT_SUFFIXES or not looks_like_text(data):
+            return ""
+        return data.decode("utf-8", errors="replace")
+
     def read_file(self, name: str) -> ReadResult:
         path = self.resolve_file(name)
         if path is None:
             return ReadResult(False, f"I can't find a file called {name}, sir.")
+        return self.read_document(path)
+
+    def read_document(self, path: Path) -> ReadResult:
+        """Read a resolved file: .pdf/.docx through extract_text (the
+        "isn't a text file" refusal used to catch them), text as before."""
+        if path.suffix.lower() in DOC_SUFFIXES:
+            text = self.document_text(path)
+            if not text.strip():
+                return ReadResult(False, NO_TEXT_LINE.format(name=path.name))
+            return self.read_text(text, label=path.name)
         try:
             data = path.read_bytes()[:MAX_FILE_BYTES]
         except OSError:
