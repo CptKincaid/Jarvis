@@ -222,7 +222,8 @@ def test_every_tool_module_is_registered(app):
                      "notes", "get_mail", "get_briefing", "spotify_play",
                      "spotify_control", "spotify_now_playing",
                      "canvas_due", "canvas_grades", "canvas_announcements",
-                     "ask_docs", "docs_reindex", "screen_qa", "system_health"):
+                     "ask_docs", "docs_reindex", "screen_qa", "system_health",
+                     "recap_day"):
         assert expected in names, f"{expected} not registered"
     assert len(names) == len(set(names)), "duplicate tool names"
     # the brain sees the same registry
@@ -232,7 +233,8 @@ def test_every_tool_module_is_registered(app):
     # 18 since 2026-08-28: calendar gained add_event alongside get_calendar
     # 25 since 2026-08-30: canvas (3), docs (2), screen (1), health (1). All
     # of them ride every turn: the tools are part of the cached static prefix.
-    assert len(names) == 25
+    # 26 since 2026-08-30: the activity journal's recap_day.
+    assert len(names) == 26
 
 
 def test_a_tool_module_that_fails_to_import_does_not_abort_boot(build,

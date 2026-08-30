@@ -1,0 +1,379 @@
+"""Activity journal: "recap my day" / "what was I doing before lunch?"
+
+The journal itself is written by ``jarvis.context.ContextEngine`` (one JSON
+line per exchange, tool call, Claude task result and window-focus change,
+one file per day under ``PATHS.MEMORY_DIR/journal``). This module reads it
+back:
+
+* ``parse_window`` turns "this morning", "before lunch", "yesterday",
+  "the last two hours" into a (since, until, label) window;
+* ``digest`` renders the rows for that window as compact plain text,
+  bucketed by hour and bounded so it fits the tool-text budget (the brain
+  caps a tool result at 4 000 chars against NUM_CTX); the model then
+  speaks a short recap from it and the digest goes on a card;
+* ``ActivitySampler`` samples the focused window every minute through the
+  context engine's existing xdotool probe (no new subprocess), skipping
+  a locked or empty desktop, so "go back" and the recap both get window
+  history that was dead before;
+* ``make_tools`` registers ``recap_day``; the commander pins it with
+  force_tool for the Tier 1 phrases.
+
+Fully local: the journal is a file, the recap is the local model.
+"""
+from __future__ import annotations
+
+import re
+import threading
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional
+
+from jarvis.events import JarvisReply, bus
+from jarvis.logs import get_logger
+from jarvis.tools.registry import ToolResult, ToolSpec
+
+log = get_logger("tools.journal")
+
+DEFAULT_INTERVAL_S = 60.0
+DEFAULT_KEEP_DAYS = 90
+LUNCH_HOUR = 12
+EVENING_HOUR = 17
+# Under the brain's 4 000-char single-result cap with room for the
+# "(what follows is ...)" allowance; ~900 tokens of the 8 192 window.
+DIGEST_CHARS = 3200
+SNIPPET_CHARS = 110
+TITLE_CHARS = 48
+WINDOWS_PER_HOUR = 5
+RECAP_SENTENCES = 4
+
+NOTHING_LINE = "I have nothing in the journal for {label}, sir."
+NO_JOURNAL_LINE = "I'm afraid the journal isn't available, sir."
+
+_HOURS_RX = re.compile(
+    r"\b(?:last|past) (?:(?P<n>\d+|an?|one|two|three|four|five|six|seven|eight|"
+    r"nine|ten|twelve|couple of|few) )?(?P<unit>hours?|minutes?)\b", re.I)
+_NUM = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10, "twelve": 12}
+
+
+# ----------------------------------------------------------- windows
+def _day_start(d: datetime) -> datetime:
+    return d.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def parse_window(text: str, now: Optional[datetime] = None):
+    """-> (since, until, label). "before lunch" is midnight to noon;
+    "this morning" the same; "afternoon" noon to now (or five); "yesterday"
+    the whole of yesterday; "the last two hours" is relative; anything
+    else is today so far."""
+    now = now or datetime.now()
+    t = (text or "").lower()
+    start = _day_start(now)
+    m = _HOURS_RX.search(t)
+    if m:
+        raw_n = (m.group("n") or "1").lower()
+        n = _NUM.get(raw_n) or (int(raw_n) if raw_n.isdigit() else
+                                {"couple of": 2, "few": 3}.get(raw_n, 1))
+        delta = timedelta(hours=n) if m.group("unit").startswith("hour") \
+            else timedelta(minutes=n)
+        unit = "hour" if m.group("unit").startswith("hour") else "minute"
+        return now - delta, now, f"the last {n} {unit}{'s' if n != 1 else ''}"
+    if "yesterday" in t:
+        y = start - timedelta(days=1)
+        if "morning" in t or "before lunch" in t:
+            return y, y.replace(hour=LUNCH_HOUR), "yesterday morning"
+        if "afternoon" in t or "after lunch" in t:
+            return y.replace(hour=LUNCH_HOUR), y.replace(hour=EVENING_HOUR), \
+                "yesterday afternoon"
+        if "evening" in t or "tonight" in t or "last night" in t:
+            return y.replace(hour=EVENING_HOUR), start, "yesterday evening"
+        return y, start, "yesterday"
+    if "before lunch" in t or "morning" in t:
+        noon = start.replace(hour=LUNCH_HOUR)
+        return start, min(noon, now) if noon <= now else now, \
+            "before lunch" if "lunch" in t else "this morning"
+    if "after lunch" in t or "afternoon" in t:
+        noon = start.replace(hour=LUNCH_HOUR)
+        five = start.replace(hour=EVENING_HOUR)
+        until = now if now < five or "afternoon" not in t else five
+        return noon, max(until, noon), "this afternoon"
+    if "evening" in t or "tonight" in t:
+        five = start.replace(hour=EVENING_HOUR)
+        return five, max(now, five), "this evening"
+    if "this week" in t:
+        return start - timedelta(days=start.weekday()), now, "this week"
+    return start, now, "today"
+
+
+# ------------------------------------------------------------ digest
+def _clock(dt: datetime) -> str:
+    return dt.strftime("%I:%M %p").lstrip("0").lower()
+
+
+def _hour_label(dt: datetime) -> str:
+    return dt.strftime("%I %p").lstrip("0").lower()
+
+
+def _snip(text, n=SNIPPET_CHARS) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def _title(text) -> str:
+    text = re.sub(r"\s+", " ", str(text or "")).strip()
+    # "main.py - Jarvis - Visual Studio Code" -> keep the app and the file
+    return text if len(text) <= TITLE_CHARS else text[:TITLE_CHARS - 1] + "…"
+
+
+def _render_hours(rows, snippet=SNIPPET_CHARS, windows=True) -> list[str]:
+    """One block per hour: exchanges, tools, Claude results, then the
+    windows seen in that hour."""
+    hours: dict[datetime, list] = {}
+    for r in rows:
+        when = r.get("_when")
+        if not isinstance(when, datetime):
+            continue
+        hours.setdefault(when.replace(minute=0, second=0, microsecond=0), []).append(r)
+    out = []
+    for hour in sorted(hours):
+        lines = [f"{_hour_label(hour)}:"]
+        seen_windows: list[str] = []
+        for r in hours[hour]:
+            kind = r.get("kind")
+            when = _clock(r["_when"])
+            if kind == "exchange":
+                user, jarvis = r.get("user", ""), r.get("jarvis", "")
+                if user:
+                    line = f"  {when} you: {_snip(user, snippet)}"
+                    if jarvis:
+                        line += f" / Jarvis: {_snip(jarvis, snippet)}"
+                else:
+                    line = f"  {when} Jarvis: {_snip(jarvis, snippet)}"
+                lines.append(line)
+            elif kind == "tool":
+                name = r.get("name", "tool")
+                flag = "" if r.get("ok", True) else " (failed)"
+                lines.append(f"  {when} ran {name}{flag}")
+            elif kind == "claude":
+                state = r.get("state", "done")
+                proj = r.get("project") or "a task"
+                verb = "finished" if state == "done" else state
+                lines.append(f"  {when} Claude {verb} {proj}: {_snip(r.get('text', ''), snippet)}")
+            elif kind == "window" and windows:
+                title = _title(r.get("title", ""))
+                if title and title not in seen_windows:
+                    seen_windows.append(title)
+        if seen_windows:
+            shown = seen_windows[:WINDOWS_PER_HOUR]
+            more = len(seen_windows) - len(shown)
+            lines.append("  windows: " + "; ".join(shown) +
+                         (f" (+{more} more)" if more > 0 else ""))
+        if len(lines) > 1:
+            out.append("\n".join(lines))
+    return out
+
+
+def digest(rows, label="today", max_chars=DIGEST_CHARS) -> str:
+    """Plain text for the model: a header with counts, then hour blocks.
+    Bounded: window lines go first, then snippets shorten, then the oldest
+    hours collapse into a count -- the recent part of the day survives."""
+    rows = [r for r in rows if isinstance(r, dict)]
+    if not rows:
+        return ""
+    n_ex = sum(1 for r in rows if r.get("kind") == "exchange")
+    n_tool = sum(1 for r in rows if r.get("kind") == "tool")
+    n_claude = sum(1 for r in rows if r.get("kind") == "claude")
+    n_win = len({r.get("title") for r in rows if r.get("kind") == "window"})
+    first, last = rows[0]["_when"], rows[-1]["_when"]
+    head = (f"Journal for {label}, {_clock(first)} to {_clock(last)}: "
+            f"{n_ex} exchange{'s' if n_ex != 1 else ''}, {n_tool} tool call"
+            f"{'s' if n_tool != 1 else ''}, {n_claude} Claude task"
+            f"{'s' if n_claude != 1 else ''}, {n_win} window"
+            f"{'s' if n_win != 1 else ''}. Times are local; newest last.")
+    for snippet, windows in ((SNIPPET_CHARS, True), (SNIPPET_CHARS, False),
+                             (60, False), (40, False)):
+        blocks = _render_hours(rows, snippet=snippet, windows=windows)
+        text = head + "\n" + "\n".join(blocks)
+        if len(text) <= max_chars:
+            return text
+    # Still too long: drop the oldest hour blocks, say so.
+    dropped = 0
+    while blocks and len(head + "\n" + "\n".join(blocks)) > max_chars - 60:
+        blocks.pop(0)
+        dropped += 1
+    note = f"(earlier: {dropped} hour{'s' if dropped != 1 else ''} not shown)\n" \
+        if dropped else ""
+    return (head + "\n" + note + "\n".join(blocks))[:max_chars]
+
+
+# ----------------------------------------------------------- sampler
+class ActivitySampler:
+    """Every ``interval`` seconds, feed the focused window's title to the
+    context engine's journal (``journal_window`` dedupes and tracks it).
+    The engine's own cached xdotool probe is the only source: a failed or
+    empty probe -- a locked screen, no X -- journals nothing. start() /
+    stop() own the daemon thread (the jarvis/headsup.py pattern)."""
+
+    def __init__(self, context, interval: Optional[float] = None,
+                 keep_days: int = DEFAULT_KEEP_DAYS):
+        self._ctx = context
+        self.interval = float(interval or DEFAULT_INTERVAL_S)
+        self.keep_days = int(keep_days or 0)
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.samples = 0
+
+    def tick(self) -> bool:
+        """One sample; True when a new window was journaled."""
+        ctx = self._ctx
+        if ctx is None:
+            return False
+        try:
+            title = ctx._get_active_window()
+        except Exception:                          # noqa: BLE001
+            log.debug("window sample failed", exc_info=True)
+            return False
+        self.samples += 1
+        try:
+            return bool(ctx.journal_window(title))
+        except Exception:                          # noqa: BLE001
+            log.debug("journal_window failed", exc_info=True)
+            return False
+
+    def prune(self) -> int:
+        """Delete day files older than keep_days; returns how many."""
+        if self.keep_days <= 0 or self._ctx is None:
+            return 0
+        try:
+            d = Path(self._ctx.journal_dir())
+        except Exception:                          # noqa: BLE001
+            return 0
+        cutoff = (datetime.now() - timedelta(days=self.keep_days)).date()
+        removed = 0
+        for path in d.glob("*.jsonl") if d.is_dir() else []:
+            try:
+                day = datetime.strptime(path.stem, "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            if day < cutoff:
+                try:
+                    path.unlink()
+                    removed += 1
+                except OSError:
+                    log.debug("journal prune failed: %s", path, exc_info=True)
+        return removed
+
+    def start(self) -> None:
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="activity-sampler")
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=2.0)
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _run(self) -> None:
+        try:
+            self.prune()
+        except Exception:                          # noqa: BLE001
+            log.exception("journal prune failed")
+        # First sample after a short settle: at boot the focused window is
+        # the terminal that launched Jarvis, not what Hunter is doing.
+        if self._stop.wait(10.0):
+            return
+        while not self._stop.is_set():
+            try:
+                self.tick()
+            except Exception:                      # noqa: BLE001
+                log.exception("activity sample failed")
+            if self._stop.wait(max(1.0, self.interval)):
+                return
+
+
+# --------------------------------------------------------------- tool
+def _now() -> datetime:
+    """The clock (tests pin it)."""
+    return datetime.now()
+
+
+def _cfg_get(cfg, dotted, default=None):
+    if cfg is None:
+        return default
+    if isinstance(cfg, dict):
+        cur = cfg
+        for part in dotted.split("."):
+            if not isinstance(cur, dict) or part not in cur:
+                return default
+            cur = cur[part]
+        return default if cur is None else cur
+    get = getattr(cfg, "get", None)
+    if callable(get):
+        try:
+            val = get(dotted, default)
+            return default if val is None else val
+        except Exception:                          # noqa: BLE001
+            return default
+    cur = cfg
+    for part in dotted.split("."):
+        cur = cur.get(part) if isinstance(cur, dict) else None
+        if cur is None:
+            return default
+    return cur
+
+
+def make_tools(cfg, services) -> list[ToolSpec]:
+    engine = getattr(services, "context_engine", None) if services is not None else None
+
+    # Parked, not started: the app starts it in start_assistant beside the
+    # health watchdog and stops it in stop_assistant.
+    if services is not None and engine is not None and \
+            getattr(services, "activity_sampler", None) is None:
+        try:
+            interval = float(_cfg_get(cfg, "journal.window_interval_s", DEFAULT_INTERVAL_S)
+                             or DEFAULT_INTERVAL_S)
+            keep = int(_cfg_get(cfg, "journal.keep_days", DEFAULT_KEEP_DAYS) or 0)
+            services.activity_sampler = ActivitySampler(engine, interval=interval,
+                                                        keep_days=keep)
+        except (AttributeError, TypeError, ValueError):
+            log.debug("services does not accept activity_sampler")
+
+    def recap_day(when: str = "", **_) -> ToolResult:
+        if engine is None or not hasattr(engine, "journal_rows"):
+            return ToolResult(text="journal unavailable", ok=False,
+                              speak=NO_JOURNAL_LINE)
+        since, until, label = parse_window(str(when or ""), _now())
+        try:
+            rows = engine.journal_rows(since, until)
+        except Exception:                          # noqa: BLE001
+            log.exception("journal read failed")
+            return ToolResult(text="journal unreadable", ok=False,
+                              speak=NO_JOURNAL_LINE)
+        text = digest(rows, label)
+        if not text:
+            line = NOTHING_LINE.format(label=label)
+            return ToolResult(text=line, speak=line)
+        # The spoken recap is at most four sentences (the 500-char TTS
+        # ceiling); the whole digest goes on a card, display only.
+        try:
+            bus.publish(JarvisReply(text=text, speak=False))
+        except Exception:                          # noqa: BLE001
+            log.debug("recap card publish failed", exc_info=True)
+        return ToolResult(text=text, max_sentences=RECAP_SENTENCES)
+
+    return [ToolSpec(
+        name="recap_day",
+        description=("Recap what Hunter did: today, this morning, before "
+                     "lunch, afternoon, yesterday, last N hours."),
+        parameters={"type": "object", "properties": {
+            "when": {"type": "string",
+                     "description": "the period, as said (default today)"}}},
+        handler=recap_day)]
