@@ -43,6 +43,10 @@ class RecordingStopped(Event):
     reason: str = "manual"            # manual | silence | cap | abort
     endpoint: str = ""                # which detector ended it: vad | energy | voice_id | manual | cap
     dead_air_s: float | None = None   # silence waited through before stopping (turn ledger)
+    # The session was opened without a wake word (the follow-up window).
+    # The app's "did not catch that" policy stays silent on those: nothing
+    # said into a follow-up window is the normal case, not a lost turn.
+    followup: bool = False
     # Publisher-side clock: the bus queues events for the Tk thread when
     # the UI is attached, so a subscriber's own clock reads drain time.
     t: float = field(default_factory=time.monotonic)
@@ -60,6 +64,11 @@ class Transcribed(Event):
     speaker_score: float = 1.0
     accepted: bool = True
     reject_reason: str = ""           # "" | speaker | confidence
+    # The result came from a decode started during the endpoint silence,
+    # before the recorder stopped (JarvisApp._maybe_speculate). The turn
+    # ledger notes it so a short "stt" figure is never mistaken for a
+    # faster model.
+    speculative: bool = False
     # Publisher-side clock: the bus queues events for the Tk thread when
     # the UI is attached, so a subscriber's own clock reads drain time.
     t: float = field(default_factory=time.monotonic)
