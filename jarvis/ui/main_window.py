@@ -568,12 +568,7 @@ class MainWindow:
 
         theme.resolve_fonts(root)
         root.title("Jarvis")
-        # Borderless: splash-type windows are undecorated but still
-        # WM-managed (focus, stacking, tray restore). Must be set pre-map.
-        try:
-            root.attributes("-type", "splash")
-        except tk.TclError:
-            log.warning("could not set splash window type")
+        _strip_decorations(root)
         # Projected-panel frame: the root ground is a dim cyan step and
         # every section lives in a shell padded 1px inside it, so the
         # whole app reads as one hologram pane with a hairline outline.
@@ -1078,11 +1073,26 @@ class MainWindow:
             bool(CONFIG.hotword) and self._mic_available)
 
     # ---------------------------------------------------- reactor telemetry
-    @staticmethod
-    def _tts_desc(engine: str) -> str:
-        """Engine-card SPEAK value: 'XTTS' or 'EDGE · RYAN' (the Edge
-        en-GB-Ryan neural voice) — no device/locale noise."""
-        return "XTTS" if engine == "xtts" else "EDGE · RYAN"
+    # Engine-card SPEAK values. The card is narrow, so these stay short and
+    # carry the one fact that matters at a glance: WHICH voice is talking,
+    # and for fish whether it is the hosted one or the local fallback.
+    _TTS_DESC = {
+        "edge": "EDGE · RYAN",     # en-GB-RyanNeural
+        "xtts": "XTTS",
+        "fish": "FISH · S2.1",     # hosted, the default while credit lasts
+        "f5":   "F5 · LOCAL",      # the local voice fish retires to
+    }
+
+    @classmethod
+    def _tts_desc(cls, engine: str) -> str:
+        """Engine-card SPEAK value — no device/locale noise.
+
+        This used to be `"XTTS" if engine == "xtts" else "EDGE · RYAN"`,
+        written before fish and f5 existed, so BOTH of them displayed as
+        "EDGE · RYAN" and the HUD reported a voice that was not speaking.
+        """
+        return cls._TTS_DESC.get((engine or "").strip().lower(),
+                                 (engine or "?").upper())
 
     def _telemetry(self) -> dict:
         """Provider for Reactor.set_telemetry — cheap attribute reads on
@@ -1492,6 +1502,97 @@ class MainWindow:
             self.root.after(2500, self._temps_tick)
         except tk.TclError:
             pass
+
+
+# ------------------------------------------------------- borderless window
+def _wm_window_id(root) -> Optional[str]:
+    """The X window the WINDOW MANAGER manages for this Tk root.
+
+    NOT `root.winfo_id()`. Tk wraps every toplevel, so winfo_id() returns
+    the inner child: it carries no WM_CLASS and the WM does not read hints
+    from it. Setting _MOTIF_WM_HINTS there silently does nothing, which is
+    exactly the trap this helper exists to avoid.
+
+    Found by asking for windows of our WM_CLASS and keeping the first that
+    actually carries WM_CLASS (the wrapper does, the inner child does not).
+    A _NET_WM_PID match is preferred when present, but Tk does not set that
+    property, so in practice the class match is what selects the window --
+    fine for a single-instance app, and the reason this returns the first
+    match rather than erroring on several.
+    """
+    try:
+        r = subprocess.run(["xdotool", "search", "--class", "^jarvis$"],
+                           capture_output=True, text=True, timeout=3)
+    except Exception:
+        log.debug("xdotool search failed", exc_info=True)
+        return None
+    mine = str(os.getpid())
+    best = None
+    for wid in (r.stdout or "").split():
+        try:
+            pid = subprocess.run(["xprop", "-id", wid, "_NET_WM_PID"],
+                                 capture_output=True, text=True, timeout=3).stdout
+            cls = subprocess.run(["xprop", "-id", wid, "WM_CLASS"],
+                                 capture_output=True, text=True, timeout=3).stdout
+        except Exception:
+            continue
+        if "not found" in cls:
+            continue                      # the wrapper carries WM_CLASS
+        if mine in pid:
+            return wid
+        best = best or wid                # fall back to any jarvis window
+    return best
+
+
+def _strip_decorations(root) -> bool:
+    """Undecorate the window WITHOUT changing its window TYPE.
+
+    This used to be `root.attributes("-type", "splash")`. Splash windows are
+    undecorated, but the freedesktop spec has taskbars and docks SKIP them,
+    and Mutter also resists moving them -- so Jarvis never appeared in the
+    GNOME dash and could not be dragged. The class docstring always
+    described the intended mechanism (Motif hints, which keep the window
+    normal-type and fully WM-managed: alt-tab, dash, tray restore and
+    dragging all keep working); only the implementation diverged.
+
+    _MOTIF_WM_HINTS is 5 CARD32s -- flags, functions, decorations,
+    input_mode, status. flags=2 is MWM_HINTS_DECORATIONS and decorations=0
+    means "none", so this asks for a frameless but otherwise normal window.
+
+    Falls back to the old splash type when xprop/xdotool are unavailable:
+    that keeps the borderless look at the cost of the dock entry, which
+    beats a titlebar the theme does not expect.
+    """
+    def _fallback(why: str) -> bool:
+        log.warning("%s; falling back to splash type (no dash entry)", why)
+        try:
+            root.attributes("-type", "splash")
+        except tk.TclError:
+            log.warning("could not set splash window type either")
+        return False
+
+    if not (shutil.which("xprop") and shutil.which("xdotool")):
+        return _fallback("xprop/xdotool not installed")
+    try:
+        root.update_idletasks()          # map the window so it has WM_CLASS
+    except tk.TclError:
+        return _fallback("no X window yet")
+    wid = _wm_window_id(root)
+    if not wid:
+        return _fallback("could not find the WM-managed window")
+    try:
+        r = subprocess.run(
+            ["xprop", "-id", wid, "-f", "_MOTIF_WM_HINTS", "32c",
+             "-set", "_MOTIF_WM_HINTS", "2, 0, 0, 0, 0"],
+            capture_output=True, text=True, timeout=3)
+    except Exception:
+        return _fallback("xprop failed")
+    if r.returncode != 0:
+        return _fallback(f"xprop rc={r.returncode}: "
+                         f"{(r.stderr or '').strip()[:120]}")
+    log.info("decorations stripped on window %s via Motif hints "
+             "(normal-type: dash entry and dragging work)", wid)
+    return True
 
 
 # ---------------------------------------------------------------- helper
