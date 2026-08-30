@@ -204,7 +204,8 @@ def _recording(monkeypatch, started_ago: float, silent_for=None):
     r._silence_start = None if silent_for is None else clock[0] - silent_for
     r._audio_frames = [object()] * 50
     r.stopped_with = None
-    monkeypatch.setattr(r, "stop", lambda reason="manual": setattr(r, "stopped_with", reason))
+    # stop() also takes endpoint=/dead_air= (which detector ended the capture)
+    monkeypatch.setattr(r, "stop", lambda reason="manual", **kw: setattr(r, "stopped_with", reason))
     return r
 
 

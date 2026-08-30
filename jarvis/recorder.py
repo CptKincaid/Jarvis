@@ -434,15 +434,26 @@ class Recorder:
 
         log.info("Recording started")
 
-    def stop(self, reason: str = "manual") -> np.ndarray | None:
+    def stop(self, reason: str = "manual", endpoint: str = "",
+             dead_air: float | None = None) -> np.ndarray | None:
         """End the session; finalize audio (resample, cap, gate — port of
         monolith 2487-2541). Publishes RecordingStopped(reason). Returns 16k
         mono float32 audio, or None if nothing usable was captured. The same
-        array is stored in self.last_audio for event-driven consumers."""
+        array is stored in self.last_audio for event-driven consumers.
+
+        ``endpoint`` / ``dead_air`` say which detector ended the capture and
+        how long it waited. They are recorded HERE, under the lock, by the
+        caller that wins: three detectors on three threads can each decide
+        to stop within the same window, and a loser writing shared fields
+        after the winner used to be what got published.
+        """
         with self._stop_lock:
             if not self.recording:
                 return None
             self.recording = False
+            self._stop_endpoint = endpoint or reason
+            self._stop_dead_air = dead_air
+            t_stop = time.monotonic()        # the decision, not the teardown
 
         self._audio_level = 0.0
         self._voice_stopped = True
@@ -474,7 +485,7 @@ class Recorder:
             self._dump_capture(audio)
         bus.publish(RecordingStopped(reason=reason,
                                      endpoint=self._stop_endpoint or reason,
-                                     dead_air_s=self._stop_dead_air))
+                                     dead_air_s=self._stop_dead_air, t=t_stop))
         return audio
 
     def abort(self):
@@ -597,20 +608,31 @@ class Recorder:
         root.after chains at 2450-2452 / 4344 / 4390)."""
         next_silence = 0.0
         next_speaker = 0.0
-        while self.recording:
-            now = time.monotonic()
-            waveform = [min(abs(v), 1.0) for v in self._waveform_buffer]
-            bus.publish(AudioLevel(level=self._audio_level, waveform=waveform))
-            if self._check_endpoint():
-                return
-            if now >= next_silence:
-                next_silence = now + self._SILENCE_POLL_S
-                if self._check_silence():
+        try:
+            while self.recording:
+                now = time.monotonic()
+                waveform = [min(abs(v), 1.0) for v in self._waveform_buffer]
+                bus.publish(AudioLevel(level=self._audio_level, waveform=waveform))
+                if self._check_endpoint():
                     return
-            if now >= next_speaker:
-                next_speaker = now + self._SPEAKER_POLL_S
-                self._check_speaker_silence()
-            time.sleep(self._POLL_S)
+                if now >= next_silence:
+                    next_silence = now + self._SILENCE_POLL_S
+                    if self._check_silence():
+                        return
+                if now >= next_speaker:
+                    next_speaker = now + self._SPEAKER_POLL_S
+                    self._check_speaker_silence()
+                time.sleep(self._POLL_S)
+        except Exception:
+            # A raising check used to kill this thread with `recording` still
+            # True and the arbiter still held: the capture could then never
+            # end (even the 60 s cap lives here). End it instead.
+            log.exception("poll loop error; ending the capture")
+            try:
+                self.stop(reason="error")
+            except Exception:
+                log.exception("stop after poll error failed")
+                self.recording = False
 
     def _check_endpoint(self) -> bool:
         """VAD endpointing: stop CONFIG.endpoint_silence after the user's last
@@ -619,9 +641,11 @@ class Recorder:
         Runs every poll tick (~12 Hz) on the frames captured since the last
         tick, so a stop lands within ~100 ms of the threshold. Only ever
         stops AFTER speech has been heard: a capture in which nobody speaks
-        is left to the energy timer, and silence_grace still applies so the
-        tail of the wake word plus a thinking pause cannot end the capture
-        before the question has started.
+        is left to the energy timer. silence_grace still applies, so a pause
+        that ends within the grace of the capture opening (the tail of the
+        wake word, then thinking) cannot end it; a pause of endpoint_silence
+        AFTER the grace does, and raising endpoint_silence is the remedy if
+        that cuts a slow talker off.
         """
         ep = self.endpointer
         if ep is None or not self.recording or not CONFIG.endpoint_vad:
@@ -650,9 +674,8 @@ class Recorder:
             return False                      # by audio, not by frame count
         log.info("Auto-stop: %.2fs after the last word (vad)", gap)
         self._voice_stopped = True
-        self._stop_endpoint, self._stop_dead_air = "vad", gap
         try:
-            self.stop(reason="silence")
+            self.stop(reason="silence", endpoint="vad", dead_air=gap)
         except Exception:
             log.exception("endpoint stop error")
             self.recording = False
@@ -689,8 +712,12 @@ class Recorder:
             self._silence_start = None
             self._loud_chunks = 0
             return False
-        if (self._silence_start is not None
-                and (time.monotonic() - self._silence_start) >= timeout
+        # Snapshot: the audio callback sets _silence_start back to None on
+        # two loud chunks, from its own thread, and a re-read after the test
+        # raised TypeError here -- which killed the poll thread.
+        start = self._silence_start
+        if (start is not None
+                and (time.monotonic() - start) >= timeout
                 and len(self._audio_frames) > min_frames):
             log.info("Auto-stop on silence (%ss timeout)", timeout)
             if self.endpointer is not None and CONFIG.endpoint_vad:
@@ -700,10 +727,9 @@ class Recorder:
                 except Exception:
                     log.debug("vad describe failed", exc_info=True)
             self._voice_stopped = True
-            self._stop_endpoint = "energy"
-            self._stop_dead_air = time.monotonic() - self._silence_start
             try:
-                self.stop(reason="silence")
+                self.stop(reason="silence", endpoint="energy",
+                          dead_air=time.monotonic() - start)
             except Exception:
                 log.exception("Auto-stop error")
                 self.recording = False
@@ -831,9 +857,8 @@ class Recorder:
                 log.info("Voice-ID auto-stop: no user voice for %.1fs "
                          "(last score=%.3f)", elapsed, score)
                 self._voice_stopped = True
-                self._stop_endpoint, self._stop_dead_air = "voice_id", elapsed
                 try:
-                    self.stop(reason="silence")
+                    self.stop(reason="silence", endpoint="voice_id", dead_air=elapsed)
                 except Exception:
                     log.exception("Voice-ID auto-stop error")
                     self.recording = False

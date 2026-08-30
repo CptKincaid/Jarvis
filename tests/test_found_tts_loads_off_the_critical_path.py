@@ -47,6 +47,7 @@ def _stub_app(events):
 
     app = types.SimpleNamespace(
         brain=types.SimpleNamespace(warmup=warmup),
+        _install_endpointer=lambda: None,        # the VAD is its own step now
         transcriber=types.SimpleNamespace(load=lambda: "cuda"),
         tts=types.SimpleNamespace(load=tts_load,
                                   prewarm=lambda phrases: None),

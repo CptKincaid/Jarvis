@@ -122,7 +122,6 @@ class VoiceEndpointer:
                 import torch
                 m = torch.jit.load(str(self._path), map_location="cpu")
                 m.eval()
-                torch.set_num_threads(max(1, min(2, torch.get_num_threads())))
                 self._model = _TorchVAD(m)
                 log.info("silero VAD loaded from %s", self._path)
             except Exception as exc:          # noqa: BLE001 - reported once

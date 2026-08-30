@@ -239,15 +239,7 @@ class JarvisApp:
         self._turn_timer = None          # slow-answer filler
         self._turn_watchdog = None
 
-        # Turn ledger: one "turn:" line per voice turn with where the
-        # seconds went (jarvis/turnclock.py). Subscribed before the workers so
-        # its marks are taken as close to the event as the bus allows.
-        self.turns = TurnLedger(jsonl_path=PATHS.LOG_DIR / "turns.jsonl")
-        bus.subscribe(HotwordDetected, lambda ev: self.turns.mark("wake", at=ev.t))
-        bus.subscribe(RecordingStarted, lambda ev: self.turns.mark("mic", at=ev.t))
-        bus.subscribe(RecordingStopped, self._turn_on_stop)
-        bus.subscribe(Transcribed, self._turn_on_transcribed)
-        bus.subscribe(SpeakingState, self._turn_on_speaking)
+        self._wire_turn_clock()
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
         bus.subscribe(RecordingStarted, self._on_recording_started)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
@@ -902,7 +894,44 @@ class JarvisApp:
         except Exception:
             log.exception("partial loop died")
 
+    def _install_endpointer(self):
+        """Silero VAD for the recorder. Its own step, with no dependency on
+        the speaker model: the first version sat inside the enrolment branch,
+        so a box with no voiceprint (or a failed ECAPA load) silently kept
+        the 2.5 s energy timer while the config promised endpointing."""
+        if not CONFIG.endpoint_vad:
+            log.info("endpointing off by config; energy timer only")
+            return
+        try:
+            from jarvis.endpoint import VoiceEndpointer
+            ep = VoiceEndpointer()
+            if ep.warm():
+                self.recorder.endpointer = ep
+            else:
+                log.warning("silero VAD did not load; energy timer only")
+        except Exception:
+            log.exception("endpointer unavailable; energy timer only")
+
     # ------------------------------------------------------- turn ledger
+    def _wire_turn_clock(self):
+        """One "turn:" line per voice turn (jarvis/turnclock.py). Marks read
+        the events' publisher-side clock: the bus queues for the Tk thread."""
+        self.turns = TurnLedger(jsonl_path=PATHS.LOG_DIR / "turns.jsonl")
+        self._tts_active = False              # rising-edge detection for "audio"
+        self._turn_filler_pending = False     # the next speech is a filler line
+        bus.subscribe(HotwordDetected, self._turn_on_hotword)
+        bus.subscribe(RecordingStarted, lambda ev: self.turns.mark("mic", at=ev.t))
+        bus.subscribe(RecordingStopped, self._turn_on_stop)
+        bus.subscribe(Transcribed, self._turn_on_transcribed)
+        bus.subscribe(SpeakingState, self._turn_on_speaking)
+
+    def _turn_on_hotword(self, ev):
+        # Mirror _on_hotword's refusals: a wake that will be turned away
+        # ("still on the last one") must not supersede the turn being answered.
+        if self.recorder.recording or self._audio_busy.is_set() or self._turn_busy.is_set():
+            return
+        self.turns.mark("wake", at=ev.t)
+
     def _turn_on_stop(self, ev):
         if ev.reason == "abort":
             self.turns.abandon("abort")
@@ -919,14 +948,35 @@ class JarvisApp:
             self.turns.abandon("empty")
 
     def _turn_on_speaking(self, ev):
-        if ev.active:
-            self.turns.mark("audio", at=ev.t)
+        # Rising edge only: SpeakingState(active=True) repeats at ~12 Hz for
+        # amplitude, and a turn opened while a previous reply is still
+        # playing must not be closed by those ticks. A filler line ("Looking
+        # into it now, sir") is speech but not the answer.
+        was, self._tts_active = self._tts_active, ev.active
+        if not ev.active or was:
+            return
+        if self._turn_filler_pending:
+            self._turn_filler_pending = False
+            self.turns.mark("filler", at=ev.t)
+            return
+        self.turns.mark("audio", at=ev.t)
+
+    def _turn_after_result(self, result):
+        """Close the ledger for a voice turn that will produce no audio."""
+        status = result.status or ""
+        if status.startswith("Ignored"):
+            self.turns.abandon("ignored")
+        elif getattr(result, "done", True) is False:
+            return                            # the answer is still coming
+        elif not (result.reply and result.speak and CONFIG.talkback):
+            self.turns.abandon("unspoken")
 
     def _on_recording_stopped(self, ev):
         if ev.reason == "abort":
             return
         audio = self.recorder.last_audio
         if audio is None:
+            self.turns.abandon("no_audio")
             return
         self._audio_busy.set()
         threading.Thread(target=self._process_audio, args=(audio,),
@@ -955,6 +1005,7 @@ class JarvisApp:
         except Exception:
             log.exception("audio processing failed")
             bus.publish(Status(text="Transcription failed", kind="error"))
+            self.turns.abandon("error")
         finally:
             # Must run on every path: a leaked flag makes every future wake
             # word a no-op, which looks exactly like a dead microphone.
@@ -984,8 +1035,8 @@ class JarvisApp:
             self.turns.mark("handle")
         try:
             result = self._emit_result(self.commander.handle(text, source))
-            if source == "voice" and (result.status or "").startswith("Ignored"):
-                self.turns.abandon("ignored")
+            if source == "voice":
+                self._turn_after_result(result)
         except Exception:
             self._turn_finished()
             raise
@@ -1016,6 +1067,7 @@ class JarvisApp:
         log.warning("turn watchdog fired after %.0fs; releasing the wake word",
                     self._turn_timeout_s)
         self._turn_finished()
+        self.turns.abandon("timeout")
 
     def _turn_cancel_timers(self):
         for name in ("_turn_timer", "_turn_watchdog"):
@@ -1050,6 +1102,7 @@ class JarvisApp:
         try:
             line = THINKING_LINES[self._thinking_i % len(THINKING_LINES)]
             self._thinking_i += 1
+            self._turn_filler_pending = True      # the ledger must not call this the answer
             self._say(line)
         except Exception:
             log.exception("thinking line failed")
@@ -1072,6 +1125,9 @@ class JarvisApp:
         bus.publish(UncertainUtterance(
             request_id=rid, text=text,
             question=f'Was that for me? — "{text[:60]}"'))
+        # "Was that for me?" is speech but not an answer: close the ledger
+        # before the ask thread can publish SpeakingState for it.
+        self.turns.abandon("uncertain")
         threading.Thread(target=self._ask_uncertain, args=(rid,), daemon=True,
                          name="uncertain-ask").start()
 
@@ -1249,15 +1305,9 @@ class JarvisApp:
         try:
             if self.speaker.enrolled:
                 self.speaker.load_model()
-                try:
-                    from jarvis.endpoint import VoiceEndpointer
-                    ep = VoiceEndpointer()
-                    if ep.warm():
-                        self.recorder.endpointer = ep
-                except Exception:
-                    log.exception("endpointer unavailable; energy timer only")
         except Exception:
             log.exception("speaker model load failed")
+        self._install_endpointer()
         # Honest failure for the speakers: with only a dummy/null sink the
         # playback chain "succeeds" into silence (seen on this machine with
         # no HDMI audio device attached).

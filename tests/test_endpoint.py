@@ -116,7 +116,11 @@ def _recorder(endpointer, rate=16000):
     rec._stop_endpoint, rec._stop_dead_air = "", None
     rec._voice_stopped = False
     rec.stops = []
-    rec.stop = lambda reason="manual": rec.stops.append(reason) or rec.__setattr__("recording", False)
+
+    def stop(reason="manual", endpoint="", dead_air=None):
+        rec.stops.append((reason, endpoint, dead_air))
+        rec.recording = False
+    rec.stop = stop
     return rec
 
 
@@ -136,8 +140,8 @@ def test_recorder_stops_endpoint_silence_after_the_last_word(monkeypatch):
     assert rec._check_endpoint() is False
     _push(rec, 6)                                     # 0.83 s: stop
     assert rec._check_endpoint() is True
-    assert rec.stops == ["silence"]
-    assert rec._stop_endpoint == "vad" and rec._stop_dead_air >= 0.8
+    (reason, endpoint, dead_air), = rec.stops
+    assert (reason, endpoint) == ("silence", "vad") and dead_air >= 0.8
 
 
 def test_recorder_never_stops_before_speech_was_heard(monkeypatch):
@@ -159,6 +163,10 @@ def test_recorder_honours_the_grace_period(monkeypatch):
     rec._record_start_time = time.monotonic()         # capture just opened
     _push(rec, 40)                                    # 0.19 s speech + 1.1 s silence
     assert rec._check_endpoint() is False and rec.stops == []
+    # ...and the same pause AFTER the grace does end it: the grace is a
+    # window, not a notion of whether the question has begun
+    rec._record_start_time = time.monotonic() - 1.6
+    assert rec._check_endpoint() is True and rec.stops[0][1] == "vad"
 
 
 def test_recorder_feeds_only_new_frames(monkeypatch):

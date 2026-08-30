@@ -25,6 +25,7 @@ from jarvis.commander import _LAST_MAIL_RX, _h_last_mail
     "tell me about my last e-mail",
     "what did mark say in his last email",       # a name, not a verb
     "what was my last email about the move",     # a noun, not a verb
+    "what's the latest email from mark",
 ])
 def test_the_phrasings_that_mean_most_recent(said):
     assert _LAST_MAIL_RX.search(said), said
@@ -39,9 +40,23 @@ def test_the_phrasings_that_mean_most_recent(said):
     "what was the last message you sent",     # discord / notes / session, not mail
     "read my latest message",
 ])
+
+
 def test_unread_and_send_queries_are_left_alone(said):
     """These genuinely want the UNSEEN default, or are not a read at all."""
     assert not _LAST_MAIL_RX.search(said), said
+
+
+@pytest.mark.parametrize("said", [
+    "go ahead and delete my last email",         # a start-anchored guard missed these
+    "ok reply to my latest email",
+    "help me forward the last mail to bob",
+    "mark my last email as read",                # mark + an object = a verb
+    "move the latest email to trash",
+])
+def test_write_verbs_anywhere_in_the_request_fall_through(said):
+    c = SimpleNamespace(_svc=lambda name: SimpleNamespace(chat=lambda *a, **k: None))
+    assert _h_last_mail(c, said, None) is None, said
 
 
 def test_the_flag_is_pinned_not_suggested():

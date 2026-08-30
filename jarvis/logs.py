@@ -6,11 +6,31 @@ format kept for the error-context grep in context.py.
 import logging
 import logging.handlers
 import os
+import sys
 from pathlib import Path
 
-# JARVIS_LOG_DIR redirects everything under /tmp/vss_voice (the test suite
-# sets it so it never writes into the live app's log / speak queue).
-LOG_DIR = Path(os.environ.get("JARVIS_LOG_DIR") or "/tmp/vss_voice")
+LIVE_LOG_DIR = "/tmp/vss_voice"
+ADHOC_LOG_DIR = "/tmp/jarvis-adhoc"
+
+
+def _default_log_dir(env=None, main_name=None) -> str:
+    """Where this process logs. JARVIS_LOG_DIR wins (the test suite sets it);
+    otherwise only a `python -m jarvis.*` process (the app, voice_check) gets
+    the LIVE directory. Any other importer -- a scratch script, a one-off
+    harness, an agent poking at the code -- logs to ADHOC_LOG_DIR, because
+    on 2026-08-29 such runs wrote "Auto-stop on silence" and tracebacks into
+    the running app's log and were read as live events, twice."""
+    if env is None:
+        env = os.environ.get("JARVIS_LOG_DIR") or ""
+    if env:
+        return env
+    if main_name is None:
+        spec = getattr(sys.modules.get("__main__"), "__spec__", None)
+        main_name = getattr(spec, "name", "") or ""
+    return LIVE_LOG_DIR if main_name.startswith("jarvis.") else ADHOC_LOG_DIR
+
+
+LOG_DIR = Path(_default_log_dir())
 LOG_FILE = LOG_DIR / "jarvis.log"
 
 _configured = False

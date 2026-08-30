@@ -158,6 +158,7 @@ def test_emit_failure_never_propagates(monkeypatch):
     led = TurnLedger(clock=Clock(), emit=boom)
     led.mark("wake")
     led.mark("mic")
+    led.mark("stop")
     led.mark("audio")  # must not raise
     assert not led.open
 
@@ -176,3 +177,52 @@ def test_events_carry_their_own_clock():
     after = time.monotonic()
     for ev in evs:
         assert before <= ev.t <= after, type(ev).__name__
+
+
+def test_audio_before_the_capture_stopped_is_not_this_turns_answer():
+    """A turn opened while a previous reply is still playing gets that
+    reply's SpeakingState ticks; they must not close it."""
+    led, clock, out = _ledger()
+    led.mark("wake")
+    led.mark("mic")
+    led.mark("audio")                                 # the old reply, still playing
+    assert led.open and out == []
+    clock.tick(2.0)
+    led.mark("stop", stop="vad")
+    led.mark("stt")
+    led.mark("handle")
+    led.mark("audio")
+    assert len(out) == 1 and out[0]["outcome"] == "audio"
+
+
+def test_a_second_mic_open_supersedes_an_unanswered_turn():
+    led, clock, out = _ledger()
+    led.mark("mic")
+    clock.tick(1.0)
+    led.mark("stop", stop="manual")
+    clock.tick(1.0)
+    led.mark("mic")                                   # the button, pressed again
+    assert len(out) == 1 and out[0]["outcome"] == "superseded"
+    assert led.open
+
+
+def test_a_filler_line_is_recorded_and_does_not_close_the_turn():
+    """"Looking into it now, sir" is speech, not the answer."""
+    led, clock, out = _ledger()
+    led.mark("wake")
+    led.mark("mic")
+    clock.tick(2.0)
+    led.mark("speech_end", at=clock.t)
+    clock.tick(0.8)
+    led.mark("stop", stop="vad")
+    clock.tick(0.4)
+    led.mark("stt")
+    led.mark("handle")
+    clock.tick(4.5)
+    led.mark("filler")
+    assert led.open and out == []
+    clock.tick(2.0)
+    led.mark("audio")
+    assert len(out) == 1
+    assert abs(out[0]["filler"] - 5.7) < 1e-9 and abs(out[0]["wait"] - 7.7) < 1e-9
+    assert "filler@5.70s" in TurnLedger.format(out[0])

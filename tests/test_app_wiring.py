@@ -1134,3 +1134,59 @@ def test_turn_ledger_reports_one_line_per_voice_turn(build, monkeypatch):
     assert len(got) == 2 and got[1]["outcome"] == "rejected:speaker"
     _bus.publish(SpeakingState(active=True))                     # TTS from elsewhere
     assert len(got) == 2
+
+
+def test_endpointer_installs_without_a_voiceprint(build, monkeypatch):
+    """The first version constructed it inside `if self.speaker.enrolled:`,
+    so a box with no voiceprint silently kept the 2.5 s energy timer."""
+    import jarvis.endpoint as ep_mod
+    from jarvis.config import CONFIG
+
+    class FakeEP:
+        def warm(self):
+            return True
+    monkeypatch.setattr(ep_mod, "VoiceEndpointer", FakeEP)
+    monkeypatch.setattr(CONFIG, "endpoint_vad", True)
+    app = build()
+    monkeypatch.setattr(type(app.speaker), "enrolled", property(lambda self: False), raising=False)
+    app.recorder.endpointer = None
+    app._install_endpointer()
+    assert isinstance(app.recorder.endpointer, FakeEP)
+    monkeypatch.setattr(CONFIG, "endpoint_vad", False)
+    app.recorder.endpointer = None
+    app._install_endpointer()
+    assert app.recorder.endpointer is None
+
+
+def test_a_refused_wake_word_does_not_supersede_the_turn_being_answered(build, monkeypatch):
+    from jarvis.events import HotwordDetected, bus as _bus
+    app = build()
+    got = []
+    monkeypatch.setattr(app.turns, "_emit", got.append)
+    app.recorder.recording = False
+    _bus.publish(HotwordDetected(score=0.9))
+    assert app.turns.open
+    app._turn_busy.set()                              # "still on the last one"
+    _bus.publish(HotwordDetected(score=0.9))
+    assert got == [], "a refused wake superseded the open turn"
+    app._turn_busy.clear()
+
+
+def test_a_filler_line_does_not_close_the_ledger(build, monkeypatch):
+    from jarvis.events import (HotwordDetected, RecordingStarted, RecordingStopped,
+                               SpeakingState, Transcribed, bus as _bus)
+    app = build()
+    got = []
+    monkeypatch.setattr(app.turns, "_emit", got.append)
+    app.recorder.recording = False
+    _bus.publish(HotwordDetected(score=0.9))
+    _bus.publish(RecordingStarted())
+    _bus.publish(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))
+    _bus.publish(Transcribed(text="what's the weather", accepted=True))
+    app.turns.mark("handle")
+    app._turn_filler_pending = True                   # _say_thinking sets this
+    _bus.publish(SpeakingState(active=True))          # "Looking into it now, sir."
+    assert got == [] and app.turns.open
+    _bus.publish(SpeakingState(active=False))
+    _bus.publish(SpeakingState(active=True))          # the answer
+    assert len(got) == 1 and got[0]["outcome"] == "audio" and got[0]["filler"] is not None

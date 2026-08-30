@@ -14,7 +14,8 @@ PATHS.LOG_DIR/turns.jsonl so a week of turns can be plotted, not eyeballed.
 
 Pure and thread-agnostic: marks arrive from the hotword, recorder, STT,
 commander and TTS threads; a lock orders them. The app owns the wiring
-(JarvisApp._wire_turn_clock); nothing here imports the bus.
+(JarvisApp._wire_turn_clock and the _turn_on_* handlers in jarvis/app.py);
+nothing here imports the bus.
 """
 from __future__ import annotations
 
@@ -29,7 +30,7 @@ log = get_logger("turn")
 
 # Stage order. A stage may be missing (a button press has no "wake"; a
 # rejected clip never reaches "handle"), so the report prints what it has.
-STAGES = ("wake", "mic", "speech_end", "stop", "stt", "handle", "audio")
+STAGES = ("wake", "mic", "speech_end", "stop", "stt", "handle", "filler", "audio")
 STALE_S = 90.0          # a turn that never produced audio is dropped at the next wake
 
 
@@ -70,12 +71,19 @@ class TurnLedger:
             raise ValueError(f"unknown stage {stage!r}")
         now = self._clock() if at is None else float(at)
         with self._lock:
-            if stage == "wake" or (stage == "mic" and not self._open):
-                if self._open and stage == "wake":
+            # A wake opens a turn; so does a mic open with no turn, or a mic
+            # open while the previous turn has already had its own (the mic
+            # button pressed again): whatever was open is reported as
+            # superseded rather than swallowing the new turn's marks.
+            if stage == "wake" or (stage == "mic" and
+                                   (not self._open or "mic" in self._marks)):
+                if self._open:
                     self._discard_locked("superseded")
                 self._marks, self._notes, self._open = {}, {}, True
             if not self._open:
                 return
+            if stage == "audio" and "stop" not in self._marks:
+                return                       # TTS from elsewhere: not this turn's answer
             if stage in self._marks and stage != "speech_end":
                 return                       # first mark wins (first audio chunk)
             self._marks[stage] = now         # speech_end: the LAST one wins
@@ -124,6 +132,8 @@ class TurnLedger:
             "dead_air": (m["stop"] - m["speech_end"]) if "stop" in m and "speech_end" in m else None,
             "stt": span("stop", "stt"),
             "route": span("handle", "audio") if "handle" in m else None,
+            # a "still working on it" line was spoken before the answer
+            "filler": (m["filler"] - speech_end) if "filler" in m and speech_end else None,
             "stt_to_handle": span("stt", "handle"),
             # what the user feels: from their last word to Jarvis's first
             "wait": (m["audio"] - speech_end) if "audio" in m and speech_end else None,
@@ -140,6 +150,8 @@ class TurnLedger:
                  f"stt {_fmt(rec.get('stt'))}"]
         if rec.get("route") is not None:
             parts.append(f"route {_fmt(rec.get('route'))}")
+        if rec.get("filler") is not None:
+            parts.append(f"filler@{_fmt(rec.get('filler'))}")
         parts.append(f"wait {_fmt(rec.get('wait'))}")
         tail = " ".join(f"{k}={v}" for k, v in rec.items()
                         if k not in TurnLedger._NUMERIC and k != "outcome")
@@ -148,7 +160,7 @@ class TurnLedger:
         return f"{head}: " + " · ".join(parts) + (f" ({tail})" if tail else "")
 
     _NUMERIC = frozenset({"wake_to_mic", "speech", "dead_air", "stt", "route",
-                          "stt_to_handle", "wait", "total"})
+                          "filler", "stt_to_handle", "wait", "total"})
 
     def _default_emit(self, rec: dict) -> None:
         log.info("%s", self.format(rec))

@@ -1382,10 +1382,14 @@ _LAST_MAIL_HOURS = 168        # a week: "my last email" is not "since midnight"
 # Anchored to the leading verb: "what did mark say in his last email" and
 # "my last email about the move" are reads that happen to contain a name or
 # a noun from this list, and a bare word-list guard blocked them.
+# Unambiguous write verbs count anywhere ("go ahead and delete my last email"
+# defeated a start-anchored form); the two that double as a name or a noun,
+# mark and move, only when followed by an object ("mark my last email").
 _MAIL_WRITE_RX = re.compile(
-    r"^\W*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
-    r"(?:reply|respond|answer|delete|trash|forward|archive|send|compose|"
-    r"write|draft|mark|flag|star|unsubscribe|move)\b", re.I)
+    r"\b(?:reply|respond|answer|delete|trash|forward|archive|send|compose|"
+    r"write|draft|flag|star|unsubscribe)\b"
+    r"|\b(?:mark|move)\s+(?:my|the|this|that|it|his|her|their|last|latest|"
+    r"newest|most recent)\b", re.I)
 
 
 def _h_last_mail(c, t, m):
