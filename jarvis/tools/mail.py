@@ -481,11 +481,50 @@ _IMAP_ERRORS = (imaplib.IMAP4.error, OSError, socket.timeout, ssl.SSLError,
                 EOFError, ConnectionError)
 
 
+SENDER_FETCH_LIMIT = 60      # a sender filter over only the latest 20 is thin
+
+
+def sender_matches(mail: Mail, wanted: str) -> bool:
+    """Case-insensitive match on the address or the display name. An
+    address in ``wanted`` (from the people book) must match the address;
+    a bare name matches either field as a substring."""
+    w = (wanted or "").strip().lower()
+    if not w:
+        return True
+    addr = (mail.from_addr or "").lower()
+    name = (mail.from_name or "").lower()
+    if "@" in w:
+        return addr == w or addr.endswith("<" + w + ">") or w in addr
+    return w in name or w in addr
+
+
+def resolve_sender(services, sender: str) -> tuple[str, str]:
+    """-> (what to match on, how to name it). "my advisor" goes through the
+    people book (jarvis.memory) to the stored address, else the name; an
+    unknown alias matches literally."""
+    raw = (sender or "").strip()
+    if not raw:
+        return "", ""
+    memory = getattr(services, "memory", None) if services is not None else None
+    resolve = getattr(memory, "resolve_person", None)
+    if callable(resolve):
+        try:
+            person = resolve(raw)
+        except Exception:                            # noqa: BLE001
+            log.debug("resolve_person failed", exc_info=True)
+            person = None
+        if person:
+            who = person.get("name") or raw
+            return (person.get("email") or who), who
+    return raw, raw
+
+
 def make_tools(cfg, services) -> list[ToolSpec]:
     imap_cls = getattr(services, "imap", None) if services is not None else None
     imap_cls = imap_cls or imaplib.IMAP4_SSL
 
-    def get_mail(limit=5, since_hours=24, unread_only=True, **_) -> ToolResult:
+    def get_mail(limit=5, since_hours=24, unread_only=True, sender="",
+                 **_) -> ToolResult:
         try:
             limit = max(1, min(20, int(float(str(limit)))))
         except (TypeError, ValueError):
@@ -494,6 +533,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             since_hours = max(1, min(24 * 14, int(float(str(since_hours)))))
         except (TypeError, ValueError):
             since_hours = 24
+        wanted, who = resolve_sender(services, str(sender or ""))
         # mail_accounts(), NOT gmail_settings(): the latter only knows the
         # LEGACY top-level gmail.address / gmail.app_password pair, so on a
         # multi-account config (gmail.accounts) it returns None and Jarvis
@@ -504,7 +544,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text=line, ok=False, speak=line)
         unread = _truthy_flag(unread_only)
         try:
-            mails = fetch_unread(cfg, since_hours=since_hours, limit=20,
+            mails = fetch_unread(cfg, since_hours=since_hours,
+                                 limit=SENDER_FETCH_LIMIT if wanted else 20,
                                  imap=imap_cls, unread_only=unread)
         except MailNotConfigured:
             line = setup_line(cfg, "gmail")
@@ -514,6 +555,15 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text="mailbox unreachable: IMAP login or "
                                    "connection failed", ok=False,
                               speak=UNREACHABLE_LINE)
+        if wanted:
+            mails = [m for m in mails if sender_matches(m, wanted)]
+            if not mails:
+                # The model says it from the fact: "nothing from Dr Peyrovi
+                # this week, sir" -- NOTHING_NEW_LINE would claim an empty
+                # inbox.
+                kind = "unread mail" if unread else "mail"
+                return ToolResult(text=f"no {kind} from {who} in the last "
+                                       f"{since_hours} hours", max_sentences=2)
         if not mails:
             if unread:
                 return ToolResult(text=f"no unread mail in the last {since_hours} hours",
@@ -524,6 +574,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text=f"no mail at all, read or unread, in the last "
                                    f"{since_hours} hours", max_sentences=2)
         sheet = fact_sheet(mails[:limit], len(mails), since_hours, unread=unread)
+        if wanted:
+            sheet = f"From {who}: " + sheet
         return ToolResult(text=sheet, max_sentences=4)
 
     spec = ToolSpec(
@@ -547,6 +599,11 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                     "description": ("true = unread only (default); false = "
                                     "include already-read mail, which is "
                                     "what answers 'my last email'")},
+                "sender": {
+                    "type": "string",
+                    "description": ("only mail from this person: a name, an "
+                                    "address, or how Hunter refers to them "
+                                    "('my advisor')")},
             },
         },
         handler=get_mail,

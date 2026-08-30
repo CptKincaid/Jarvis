@@ -762,6 +762,21 @@ def event_confidence(text: str, now: datetime) -> tuple[bool, str]:
     return True, ""
 
 
+def expand_people(services, title: str) -> str:
+    """'lunch with mom' -> 'lunch with Linda Peyrovi' through the people
+    book (jarvis.memory.expand_aliases); unchanged when nothing matches
+    or no memory is wired."""
+    memory = getattr(services, "memory", None) if services is not None else None
+    expand = getattr(memory, "expand_aliases", None)
+    if not callable(expand) or not title:
+        return title
+    try:
+        return str(expand(title) or title)
+    except Exception:                                # noqa: BLE001
+        log.debug("expand_aliases failed", exc_info=True)
+        return title
+
+
 def make_tools(cfg, services) -> list[ToolSpec]:
     source = make_source(cfg, services)
 
@@ -795,7 +810,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         except Exception:                    # noqa: BLE001
             log.exception("event parse failed")
             when, title = None, ""
-        title = _clean(title) or "an event"
+        # The alias expands here, after the time words are gone and before
+        # either the write or the read-back: "lunch with Mom" lands on the
+        # phone as lunch with her name.
+        title = expand_people(services, _clean(title)) or "an event"
 
         if when is None:
             source.pending_event = None
