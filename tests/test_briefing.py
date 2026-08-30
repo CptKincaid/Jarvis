@@ -376,7 +376,12 @@ def test_get_briefing_runs_even_while_the_toggle_is_off(tmp_path, monkeypatch):
     assert fetch.calls, "briefed without fetching a single source"
     assert spec.name == "get_briefing"
     assert len(spec.description.split()) <= 20
-    assert spec.schema()["function"]["parameters"] == {"type": "object", "properties": {}}
+    # one optional `when` (today | tomorrow | week): the views share the tool
+    # rather than each costing a slot of the MAX_TOOLS budget
+    params = spec.schema()["function"]["parameters"]
+    assert list(params["properties"]) == ["when"]
+    assert params["properties"]["when"]["enum"] == ["today", "tomorrow", "week"]
+    assert "required" not in params
 
 
 def test_get_briefing_enabled(tmp_path, monkeypatch):

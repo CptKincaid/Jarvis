@@ -188,9 +188,16 @@ def briefing_rows(sections) -> list:
     .sections: WEATHER, CALENDAR (one row per line), NEWS (three rows
     'title — source'), optional SPORTS / STOCKS. A label appears once per
     section; continuation rows carry an empty label. Empty sections are
-    skipped."""
+    skipped.
+
+    The same card carries the evening preview (CANVAS, TO-DOS, ALARM and
+    the wake-up OFFER) and the week forecast (a WEEK summary row, then one
+    row per day labelled by its name). Unknown keys are still dropped."""
     s = sections or {}
     rows: list = []
+    summary = str(s.get("summary") or "").strip()
+    if summary:
+        rows.append(("WEEK", summary))
     weather = str(s.get("weather") or "").strip()
     if weather:
         rows.append(("WEATHER", weather))
@@ -210,6 +217,27 @@ def briefing_rows(sections) -> list:
     for key in ("sports", "stocks"):
         for i, line in enumerate(_as_lines(s.get(key))):
             rows.append((key.upper() if i == 0 else "", line))
+    # the week forecast: one row per day, "clear" when nothing is on it
+    for day in (s.get("days") or []):
+        if not isinstance(day, dict):
+            continue
+        label = str(day.get("label") or "").strip().upper()
+        lines = _as_lines(day.get("items"))
+        if not label:
+            continue
+        if not lines:
+            rows.append((label, "clear"))
+            continue
+        for i, line in enumerate(lines):
+            rows.append((label if i == 0 else "", line))
+    for key, label in (("canvas", "CANVAS"), ("todos", "TO-DOS"),
+                       ("reminders", "REMINDERS")):
+        for i, line in enumerate(_as_lines(s.get(key))):
+            rows.append((label if i == 0 else "", line))
+    for key, label in (("alarm", "ALARM"), ("offer", "OFFER")):
+        text = str(s.get(key) or "").strip()
+        if text:
+            rows.append((label, text))
     return rows
 
 

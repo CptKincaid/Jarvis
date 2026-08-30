@@ -65,6 +65,7 @@ from datetime import datetime
 import subprocess
 import sys
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -73,6 +74,7 @@ from jarvis import pronounce
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
+from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.tools.calendar import write_event
 from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
 
@@ -684,6 +686,13 @@ def courtesy_reply(kind: str, rng=None) -> str:
 
 
 def _h_courtesy(c, t, m):
+    if m == "goodnight":
+        # "Good night" is a courtesy first (this runs ahead of the registry's
+        # own good-night entry and again in _route_text): the wind-down
+        # preview hangs off it here, and falls back to the plain line.
+        res = _goodnight_preview(c, t)
+        if res is not None:
+            return res
     return CommandResult(handled=True, reply=courtesy_reply(m), speak=True,
                          status="Courtesy")
 
@@ -1118,6 +1127,69 @@ _BRIEFING_RX = re.compile(
     r"^(?:good morning(?:[, ]+jarvis)?|(?:morning|daily|my|the) briefing|briefing|"
     r"what'?s my briefing|(?:give me|read me|run|do) (?:the|my) (?:morning |daily )?briefing|"
     r"brief me)[.!?]*$", re.I)
+# The evening preview (get_briefing when=tomorrow). "what's on tomorrow" is
+# deliberately absent: that is a calendar question and stays with
+# get_calendar; the preview is the whole of tomorrow in one breath.
+_PREVIEW_RX = re.compile(
+    r"^(?:(?:what(?:'s| does| is)|how(?:'s| does| is)) tomorrow (?:look(?:ing)?|shaping up)"
+    r"(?: like)?|(?:preview|brief me on|brief me for) tomorrow|tomorrow'?s? (?:briefing|preview)|"
+    r"(?:give me|read me|run|do) (?:the |my )?(?:tomorrow|evening|night(?:ly)?) (?:briefing|preview)|"
+    r"(?:the |my )?(?:evening|night(?:ly)?) (?:briefing|preview))"
+    r"(?:[, ]+(?:please|jarvis|sir))*[?.!]*$", re.I)
+# The week forecast (get_briefing when=week). "what does my week look like"
+# is left to get_calendar (docs, Calendars row); these are the workload
+# phrasings a student actually uses on a Sunday evening.
+_WEEK_RX = re.compile(
+    r"^(?:how(?:'s| is| does| are) (?:my|the) (?:week|next seven days|next 7 days) "
+    r"(?:look(?:ing)?|shaping up)(?: like)?|what(?:'s| is) (?:my|the) week looking like|"
+    r"what(?:'s| is) (?:the |my )?(?:week|workload|week's workload) (?:ahead|looking like)|"
+    r"(?:the |my )?week(?:ly)? (?:briefing|forecast|preview|overview|workload)|"
+    r"(?:brief me on|preview|forecast) (?:the|my) week|how (?:heavy|busy|bad) is my week|"
+    r"what(?:'s| is) (?:the |my )?week ahead like)"
+    r"(?:[, ]+(?:please|jarvis|sir))*[?.!]*$", re.I)
+# Explicit preferences (33): "no news in the morning", "put the sports back
+# in my briefing". Persisted to assistant.json (briefing.sections.<name>)
+# AND memory.set_preference, so the file is the store consumers read and
+# the memory keeps the audit trail of what he asked for.
+_PREF_SECTIONS = {
+    "news": "news", "sport": "sports", "sports": "sports", "stock": "stocks",
+    "stocks": "stocks", "weather": "weather", "calendar": "calendar",
+    "canvas": "canvas", "coursework": "canvas", "todo": "todos", "todos": "todos",
+    "to-do": "todos", "to-dos": "todos", "tasks": "todos", "alarm": "alarms",
+    "alarms": "alarms", "reminder": "reminders", "reminders": "reminders",
+}
+_PREF_SECTION_WORDS = {"todos": "the to-dos", "alarms": "the alarms",
+                       "reminders": "the reminders", "canvas": "Canvas",
+                       "weather": "the weather", "calendar": "the calendar"}
+_PREF_SECTION_RX = re.compile(
+    r"^(?:(?P<off>no|skip|drop|leave out|lose|without|i don'?t want|i do not want|"
+    r"don'?t (?:read|include|give me|do|mention)|stop (?:reading|including|giving me))"
+    r"|(?P<on>include|add|put|bring back|read|give me|i want|i'?d like|"
+    r"start (?:reading|including)|mention))"
+    r"\s+(?:the\s+|my\s+|any\s+)?"
+    r"(?P<section>news|sports?|stocks?|weather|calendar|canvas|coursework|to-?dos?|tasks|"
+    r"alarms?|reminders?)"
+    r"(?:\s+(?:back|again))?"
+    r"\s+(?:(?:in|from|with|on)\s+(?:the|my)\s+(?:morning\s+|daily\s+|evening\s+|nightly\s+|"
+    r"weekly\s+)?(?:briefings?|previews?|forecast)|in the mornings?)"
+    r"(?:\s+(?:back|again))?"
+    r"(?:[, ]+(?:please|jarvis|sir|from now on))*[.!]*$", re.I)
+_PREF_VERBOSITY_RX = re.compile(
+    r"^(?:(?P<brief>(?:be|keep it|make it|make them|keep them) (?:briefer|shorter|"
+    r"more concise|more brief|snappier|less wordy)|"
+    r"(?:shorter|briefer|snappier) (?:briefings?|answers|replies|previews?)|(?:less|fewer) words|"
+    r"keep (?:the |your |my )?(?:briefings?|answers|replies) short(?:er)?|"
+    r"(?:brief|short) (?:briefings?|answers|replies)(?: only)?|too (?:long|wordy)|less detail)"
+    r"|(?P<full>(?:be|make it|make them) (?:more detailed|more thorough|less brief|longer|wordier)|"
+    r"(?:longer|fuller|full|normal|regular|detailed) (?:briefings?|answers|replies|previews?)|"
+    r"more detail(?:s)?|the full briefing))"
+    r"(?:[, ]+(?:please|jarvis|sir|from now on))*[.!]*$", re.I)
+PREVIEW_ASK = "good night; what does tomorrow look like?"
+GOODNIGHT_PREVIEW_LINE = "Good night, sir. Tomorrow, briefly."
+BRIEFER_LINE = "Briefer it is, sir."
+FULL_LENGTH_LINE = "Very good, sir; the full briefing again."
+NO_ALARM_LINE = "Very good, sir; no alarm."
+ALARM_FAILED_LINE = "I couldn't set that alarm, sir."
 # While an alarm rings (spec 5.2 a): these words stop it, "snooze [N]" snoozes.
 _RING_STOP_RX = re.compile(
     r"^(?:stop|dismiss|okay|ok|i'?m up|i am up|shut it off|shut up|enough|"
@@ -1375,6 +1447,108 @@ def _h_briefing(c, t, m):
     return CommandResult(handled=True, status="Briefing…", done=False)
 
 
+def _force_briefing(c, text: str, when: str, status: str) -> Optional[CommandResult]:
+    """One get_briefing view through the brain (when = tomorrow | week)."""
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "chat"):
+        return None
+    brain.chat(text, force_tool="get_briefing", force_args={"when": when})
+    return CommandResult(handled=True, status=status, done=False)
+
+
+def _h_preview(c, t, m):
+    """"What does tomorrow look like?": the evening preview, on request,
+    whatever briefing.enabled says (the flag governs only the plain
+    good-night trigger, as it governs only "good morning")."""
+    return _force_briefing(c, t, "tomorrow", "Preview…")
+
+
+def _h_week(c, t, m):
+    """"How's my week looking?": calendar, Canvas, reminders and to-dos day
+    by day, with the heavy and the clear days named."""
+    return _force_briefing(c, t, "week", "Week ahead…")
+
+
+def _goodnight_preview(c, t) -> Optional[CommandResult]:
+    """The "good night" wind-down: the night line now, tomorrow in one
+    breath when the tool lands (and "Shall I wake you at seven?" when the
+    first event is early and no alarm covers it -- see
+    Commander._try_alarm_offer). Only while briefing.enabled is on, the
+    same flag that turns a plain "good morning" into a briefing: on a box
+    that never asked for briefings a good night stays a good night."""
+    if not bool(_assistant_get(c, "briefing.enabled", False)):
+        return None
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "chat"):
+        return None
+    try:
+        brain.chat(PREVIEW_ASK, force_tool="get_briefing", force_args={"when": "tomorrow"})
+    except Exception:
+        log.exception("good-night preview failed to start")
+        return None
+    # ack=True: the night line is not the answer, so it neither closes the
+    # turn nor arms a follow-up window of its own; the preview does both.
+    return CommandResult(handled=True, reply=GOODNIGHT_PREVIEW_LINE, speak=True,
+                         ack=True, status="Preview…", done=False)
+
+
+def _persist_preference(c, key: str, value) -> bool:
+    """A voice-set preference goes to BOTH stores: assistant.json is what
+    the briefing reads (cfg.get), the memory's preferences.json is the
+    record of what he asked for. Returns True when the config took it."""
+    cfg = c._svc("assistant")
+    wrote = False
+    if cfg is not None and hasattr(cfg, "set"):
+        try:
+            cfg.set(key, value)
+            wrote = True
+        except Exception:
+            log.exception("preference %s could not be saved to the config", key)
+    memory = c._svc("memory")
+    fn = getattr(memory, "set_preference", None) if memory is not None else None
+    if callable(fn):
+        try:
+            fn(key, value)
+        except Exception:
+            log.exception("preference %s could not be saved to memory", key)
+    return wrote
+
+
+def _h_pref_section(c, t, m):
+    """"No news in the morning" / "put the sports back in my briefing"."""
+    cfg = c._svc("assistant")
+    if cfg is None or not hasattr(cfg, "set"):
+        return None
+    name = _PREF_SECTIONS.get(m.group("section").lower().replace(" ", ""))
+    if name is None:
+        return None
+    enable = bool(m.group("on"))
+    if not _persist_preference(c, f"briefing.sections.{name}", enable):
+        return None
+    words = _PREF_SECTION_WORDS.get(name, name)
+    if enable:
+        line = f"Very good, sir; {words} {'are' if name in ('todos', 'alarms', 'reminders') else 'is'} back in the briefing."
+    else:
+        line = f"Very good, sir; no {name.replace('todos', 'to-dos')} in the briefing from now on."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"Briefing: {name} {'on' if enable else 'off'}")
+
+
+def _h_verbosity(c, t, m):
+    """"Be briefer" / "shorter briefings" -> briefing.verbosity=brief (the
+    briefing views halve their sentence allowance); "the full briefing" /
+    "more detail" restores it. Ordinary replies are already capped at two
+    sentences, so the briefings are the only place a knob can bite."""
+    cfg = c._svc("assistant")
+    if cfg is None or not hasattr(cfg, "set"):
+        return None
+    brief = bool(m.group("brief"))
+    if not _persist_preference(c, "briefing.verbosity", "brief" if brief else "normal"):
+        return None
+    return CommandResult(handled=True, reply=BRIEFER_LINE if brief else FULL_LENGTH_LINE,
+                         speak=True, status="Briefings: brief" if brief else "Briefings: full")
+
+
 # "What was my last email about?" asks for the most recent message, read or
 # not. get_mail documents unread_only=false as the flag that answers exactly
 # that question, in the parameter description the model is shown -- and the
@@ -1432,6 +1606,10 @@ def _h_last_mail(c, t, m):
 
 
 def _h_goodnight(c, t, m):                                 # 3233-3238
+    if t in ("good night", "goodnight"):
+        res = _goodnight_preview(c, t)
+        if res is not None:
+            return res
     return CommandResult(
         handled=True,
         reply="Good night sir. I'll be here when you need me.",
@@ -1825,6 +2003,12 @@ REGISTRY: list[Command] = [
     Command("cancel schedule", _CANCEL_SCHED_RX.match, _h_cancel_schedule,
             needs=("timekeeper",)),
     Command("briefing", _BRIEFING_RX.match, _h_briefing, needs=("brain",)),
+    Command("preview", _PREVIEW_RX.match, _h_preview, needs=("brain",)),
+    Command("week", _WEEK_RX.match, _h_week, needs=("brain",)),
+    Command("briefing section", _PREF_SECTION_RX.match, _h_pref_section,
+            needs=("assistant",)),
+    Command("verbosity", _PREF_VERBOSITY_RX.match, _h_verbosity,
+            needs=("assistant",)),
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
@@ -1901,7 +2085,8 @@ REGISTRY: list[Command] = [
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
-                    "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
+                    "briefing", "preview", "week", "briefing section", "verbosity",
+                    "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me")
 ]
@@ -2054,6 +2239,11 @@ class Commander:
         # 3c. add_event read an interpretation back; a plain yes means THAT
         #     event, not a new command.
         res = self._try_event_confirm(text)
+        if res is not None:
+            return res
+        # 3d. The evening preview asked "Shall I wake you at seven?"; a
+        #     plain yes sets THAT alarm rather than becoming a new command.
+        res = self._try_alarm_offer(text)
         if res is not None:
             return res
         # 4. A pending router question: resolve it and dispatch the
@@ -2346,6 +2536,48 @@ class Commander:
                           project=pend.project,
                           args=dict(getattr(pend, "args", None) or {}))
         return self._dispatch_route(d, pend.text)
+
+    def _try_alarm_offer(self, text: str) -> Optional[CommandResult]:
+        """Resolve "Shall I wake you at 7:00 am, sir?" from the evening
+        preview (briefing.make_tools parks the offer on services.alarm_offer).
+
+        Same rule as _try_event_confirm: anything but a clear yes or no
+        DROPS the offer, and so does an offer older than OFFER_TTL_S -- a
+        "yes" to something else the next morning must not set an alarm.
+        """
+        offer = getattr(self.services, "alarm_offer", None)
+        if not isinstance(offer, dict) or not offer:
+            return None
+        try:
+            self.services.alarm_offer = None
+        except Exception:
+            log.debug("could not clear the alarm offer", exc_info=True)
+        try:
+            made = float(offer.get("made_at") or 0.0)
+        except (TypeError, ValueError):
+            made = 0.0
+        if made and time.time() - made > OFFER_TTL_S:
+            log.info("alarm offer expired; %r is a new subject", text[:40])
+            return None
+        answer = parse_yes_no(text)
+        if answer is None:
+            return None
+        if not answer:
+            return CommandResult(handled=True, reply=NO_ALARM_LINE, speak=True,
+                                 status="No alarm")
+        tk = self._svc("timekeeper")
+        if tk is None:
+            return CommandResult(handled=True, reply=TIMEKEEPER_SETUP_LINE,
+                                 speak=True, status="No timekeeper")
+        try:
+            tk.add_alarm(float(offer["due"]), offer.get("label") or "wake up", "once")
+        except Exception:
+            log.exception("alarm offer: add_alarm failed")
+            return CommandResult(handled=True, reply=ALARM_FAILED_LINE, speak=True,
+                                 status="Alarm failed")
+        when = offer.get("time") or "then"
+        return CommandResult(handled=True, reply=f"Alarm at {when}, sir.", speak=True,
+                             status=f"Alarm {when}")
 
     def _try_event_confirm(self, text: str) -> Optional[CommandResult]:
         """Resolve a calendar add that was read back for confirmation.

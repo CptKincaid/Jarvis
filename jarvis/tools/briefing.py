@@ -12,6 +12,18 @@ All HTTP goes through the module-level ``_fetch`` seam (tests pass a
 fake). Feeds are fetched in parallel with a bounded pool so a slow
 source cannot stall the tool loop; any source failing degrades to the
 sections that worked. News is cached 15 min at ``cache_path``.
+
+Two more views share the tool (``get_briefing(when=...)``):
+``build_preview`` is tomorrow in one breath for "good night" (first event
+and where, tomorrow's weather, Canvas due within a day, open to-dos, the
+alarm that is set -- and a wake-up offer when the first event is early and
+no alarm covers it); ``build_week`` is the workload forecast, day by day
+(calendar, Canvas, reminders) with the heavy and the clear days named.
+Neither fetches news: a preview or a forecast is not the morning paper.
+
+Every section obeys ``briefing.sections.<name>`` (True unless switched
+off by voice: "no news in the morning"), and ``briefing.verbosity``
+("brief") halves the sentence allowance the model is given.
 """
 from __future__ import annotations
 
@@ -23,7 +35,7 @@ import time
 import urllib.request
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -33,6 +45,20 @@ from jarvis.tools.registry import ToolResult, ToolSpec
 log = get_logger("tools.briefing")
 
 NOTHING_LINE = "I couldn't reach any of the briefing sources, sir."
+PREVIEW_NOTHING_LINE = "I can't see anything for tomorrow, sir; the sources are out of reach."
+WEEK_NOTHING_LINE = "I can't see your week, sir; the sources are out of reach."
+WHENS = ("today", "tomorrow", "week")
+# Every section a briefing view can carry. briefing.sections.<name> false
+# drops one (voice: "no news in the morning"); unknown names are ignored
+# so a typo in the file cannot blank the card.
+SECTIONS = ("weather", "calendar", "news", "sports", "stocks",
+            "canvas", "todos", "alarms", "reminders")
+# Spoken allowance per view; "brief" verbosity halves it (never below 2).
+VIEW_SENTENCES = {"today": 6, "tomorrow": 5, "week": 8}
+WAKE_LABEL = "wake up"
+OFFER_LINE = "Shall I wake you at {time}, sir?"
+OFFER_TTL_S = 180.0            # a bedtime yes is quick; anything later is a new subject
+WEEK_DAYS = 7
 DEFAULT_NEWS_FEEDS = ["https://www.theverge.com/rss/index.xml",
                       "https://feeds.arstechnica.com/arstechnica/index"]
 HN_TOP_URL = "https://hacker-news.firebaseio.com/v0/topstories.json"
@@ -110,6 +136,36 @@ def _truthy(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on", "enabled")
     return bool(value)
+
+
+def section_on(cfg, name: str) -> bool:
+    """``briefing.sections.<name>``: True unless explicitly switched off."""
+    return _truthy(_cfg_get(cfg, f"briefing.sections.{name}", True))
+
+
+def verbosity_cap(cfg, normal: int) -> int:
+    """The sentence allowance for a view: ``normal``, or half of it (at
+    least two) when ``briefing.verbosity`` is "brief" ("shorter
+    briefings", "be briefer")."""
+    mode = str(_cfg_get(cfg, "briefing.verbosity", "normal") or "normal").strip().lower()
+    if mode in ("brief", "short", "shorter", "terse"):
+        return max(2, int(normal) // 2)
+    return int(normal)
+
+
+def coerce_when(value) -> str:
+    """Loose model values -> one of WHENS ("tonight" -> "tomorrow")."""
+    text = " ".join(str(value or "").lower().split()).strip(" .?!")
+    if not text:
+        return "today"
+    if text in WHENS:
+        return text
+    if "tomorrow" in text or "tonight" in text or "evening" in text or \
+            text in ("tmrw", "tmr", "preview", "next day"):
+        return "tomorrow"
+    if "week" in text or "7 day" in text or "seven day" in text:
+        return "week"
+    return "today"
 
 
 # --------------------------------------------------------- hacker news
@@ -481,40 +537,51 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
 
     sections = {"weather": "", "calendar": [], "news": [], "sports": [], "stocks": []}
     notes = {}
+    # A section switched off by voice is neither fetched nor mentioned:
+    # "no news in the morning" must not leave a "News: unavailable" line
+    # for the model to apologise about.
+    on = {name: section_on(cfg, name) for name in ("weather", "calendar", "news",
+                                                    "sports", "stocks")}
 
     sports_feeds = [str(u) for u in (_cfg_get(cfg, "briefing.sports_feeds", []) or [])
-                    if str(u).strip()]
+                    if str(u).strip()] if on["sports"] else []
     symbols = [str(s) for s in (_cfg_get(cfg, "briefing.stock_symbols", []) or [])
-               if str(s).strip()]
+               if str(s).strip()] if on["stocks"] else []
 
     with ThreadPoolExecutor(max_workers=POOL_WORKERS) as pool:
-        news_future = pool.submit(fetch_news, cfg, fetch, cache_path, now_ts, pool)
+        news_future = pool.submit(fetch_news, cfg, fetch, cache_path, now_ts, pool) \
+            if on["news"] else None
         sports_future = pool.submit(fetch_sports, sports_feeds, fetch, pool) \
             if sports_feeds else None
         stocks_future = pool.submit(fetch_stocks, symbols, fetch, pool) \
             if symbols else None
 
-        ok, text = _registry_text(registry, "get_weather", {"when": "today"})
-        if ok and text:
-            sections["weather"] = text
-        else:
-            notes["weather"] = text or "unavailable"
-        ok, text = _registry_text(registry, "get_calendar", {"range": "today"})
-        if ok and text:
-            sections["calendar"] = [ln.strip() for ln in text.splitlines() if ln.strip()]
-        else:
-            notes["calendar"] = text or "unavailable"
+        if on["weather"]:
+            ok, text = _registry_text(registry, "get_weather", {"when": "today"})
+            if ok and text:
+                sections["weather"] = text
+            else:
+                notes["weather"] = text or "unavailable"
+        if on["calendar"]:
+            ok, text = _registry_text(registry, "get_calendar", {"range": "today"})
+            if ok and text:
+                sections["calendar"] = [ln.strip() for ln in text.splitlines() if ln.strip()]
+            else:
+                notes["calendar"] = text or "unavailable"
 
-        try:
-            news, complete = news_future.result()
-        except Exception as exc:              # noqa: BLE001 - source boundary
-            log.warning("briefing: news failed: %s", type(exc).__name__)
-            news, complete = [], False
+        news, complete = [], True
+        if news_future is not None:
+            try:
+                news, complete = news_future.result()
+            except Exception as exc:          # noqa: BLE001 - source boundary
+                log.warning("briefing: news failed: %s", type(exc).__name__)
+                news, complete = [], False
         sections["news"] = news
-        if not news:
-            notes["news"] = "unavailable"
-        elif not complete:
-            notes["news"] = "partial"
+        if on["news"]:
+            if not news:
+                notes["news"] = "unavailable"
+            elif not complete:
+                notes["news"] = "partial"
         if sports_future is not None:
             try:
                 sections["sports"] = sports_future.result()
@@ -531,17 +598,20 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
                 notes["stocks"] = "unavailable"
 
     lines = [_day_line(now_dt)]
-    lines.append(f"Weather: {sections['weather'] or notes.get('weather', 'unavailable')}")
-    if sections["calendar"]:
-        lines.append("Calendar: " + " ".join(sections["calendar"]))
-    else:
-        lines.append(f"Calendar: {notes.get('calendar', 'nothing')}")
-    if sections["news"]:
-        items = " ".join(f"{i}) {n['title']} ({n['source']})"
-                         for i, n in enumerate(sections["news"], 1))
-        lines.append(f"News: {items}")
-    else:
-        lines.append("News: unavailable")
+    if on["weather"]:
+        lines.append(f"Weather: {sections['weather'] or notes.get('weather', 'unavailable')}")
+    if on["calendar"]:
+        if sections["calendar"]:
+            lines.append("Calendar: " + " ".join(sections["calendar"]))
+        else:
+            lines.append(f"Calendar: {notes.get('calendar', 'nothing')}")
+    if on["news"]:
+        if sections["news"]:
+            items = " ".join(f"{i}) {n['title']} ({n['source']})"
+                             for i, n in enumerate(sections["news"], 1))
+            lines.append(f"News: {items}")
+        else:
+            lines.append("News: unavailable")
     if sports_feeds:
         lines.append("Sports: " + ("; ".join(sections["sports"]) or "unavailable"))
     if symbols:
@@ -553,6 +623,402 @@ def briefing_enabled(cfg) -> bool:
     return _truthy(_cfg_get(cfg, "briefing.enabled", False))
 
 
+# ------------------------------------------------- shared by the views
+_CLOCK_RX = re.compile(r"\b(\d{1,2}):(\d{2})\s*(am|pm)\b", re.I)
+_CANVAS_ITEM_RX = re.compile(
+    r"^(?P<body>.+?),\s+(?P<when>(?:today|tomorrow|yesterday|Mon|Tue|Wed|Thu|Fri|Sat|Sun)"
+    r"(?:\s+(?P<dom>\d{1,2})\s+(?P<mon>[A-Za-z]{3}))?\s+\d{1,2}:\d{2}\s+[ap]m)$", re.I)
+_WEEKDAY_ABBR = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+
+
+def _now_dt(now) -> datetime:
+    if now is None:
+        return datetime.now().astimezone()
+    if isinstance(now, datetime):
+        return now
+    return datetime.fromtimestamp(float(now)).astimezone()
+
+
+def _clock(d: datetime) -> str:
+    h = d.hour % 12 or 12
+    return f"{h}:{d.minute:02d} {'am' if d.hour < 12 else 'pm'}"
+
+
+def _svc(services, name: str):
+    return getattr(services, name, None) if services is not None else None
+
+
+def _day_word(day: date, today: date) -> str:
+    if day == today:
+        return "today"
+    if day == today + timedelta(days=1):
+        return "tomorrow"
+    return day.strftime("%A")
+
+
+def _first_clock(text: str, day: date, tz) -> Optional[datetime]:
+    """The earliest 'H:MM am/pm' in a calendar line, on ``day``. The line is
+    the calendar tool's own wording ("Tomorrow: 8:00 am Biosensors for an
+    hour at ZACH 350, ..."), so its clocks are the events' starts."""
+    best = None
+    for m in _CLOCK_RX.finditer(text or ""):
+        hour, minute = int(m.group(1)) % 12, int(m.group(2))
+        if m.group(3).lower() == "pm":
+            hour += 12
+        try:
+            dt = datetime(day.year, day.month, day.day, hour, minute, tzinfo=tz)
+        except ValueError:
+            continue
+        if best is None or dt < best:
+            best = dt
+    return best
+
+
+def _calendar_events(services) -> Optional[list]:
+    """Structured events from the parked CalendarSource, or None when
+    there is no usable source (then the tool's text is all we have)."""
+    cal = _svc(services, "calendar")
+    if cal is None:
+        return None
+    try:
+        conf = getattr(cal, "configured", True)
+        if callable(conf):
+            conf = conf()
+        if not conf:
+            return None
+        return list(cal.events())
+    except Exception:
+        log.debug("briefing: calendar events unavailable", exc_info=True)
+        return None
+
+
+def _event_line(ev) -> str:
+    title = (getattr(ev, "title", "") or "").strip() or "an event"
+    if getattr(ev, "all_day", False):
+        text = f"all day: {title}"
+    else:
+        text = f"{_clock(ev.start)} {title}"
+    loc = (getattr(ev, "location", "") or "").strip()
+    return f"{text} at {loc}" if loc else text
+
+
+def _canvas_items(text: str, today: date) -> list[tuple[date, str]]:
+    """The canvas_due sheet ("Due this week (2): 1) CSCE - Lab 3, tomorrow
+    11:59 pm 2) ...", whitespace already collapsed) -> [(day, 'CSCE - Lab
+    3, tomorrow 11:59 pm')]. Lines that carry no date ("and 2 more") are
+    dropped."""
+    out = []
+    for part in re.split(r"\s(?=\d+\)\s)", text or ""):
+        m = re.match(r"^\d+\)\s+(?P<rest>.+)$", part.strip())
+        if not m:
+            continue
+        # the sheet's "and 2 more" tail rides on the last item once the
+        # registry has collapsed the newlines
+        item = re.sub(r"\s+and \d+ more$", "", m.group("rest").strip())
+        w = _CANVAS_ITEM_RX.match(item)
+        if not w:
+            continue
+        when = w.group("when").lower()
+        day = None
+        if when.startswith("today"):
+            day = today
+        elif when.startswith("tomorrow"):
+            day = today + timedelta(days=1)
+        elif when.startswith("yesterday"):
+            day = today - timedelta(days=1)
+        elif w.group("dom"):
+            try:
+                parsed = datetime.strptime(
+                    f"{w.group('dom')} {w.group('mon')} {today.year}", "%d %b %Y").date()
+                # "Tue 5 Jan" asked in late December is next year's
+                if parsed < today - timedelta(days=7):
+                    parsed = parsed.replace(year=today.year + 1)
+                day = parsed
+            except ValueError:
+                day = None
+        else:
+            abbr = when[:3]
+            if abbr in _WEEKDAY_ABBR:
+                want = _WEEKDAY_ABBR.index(abbr)
+                day = today + timedelta(days=(want - today.weekday()) % 7)
+        if day is not None:
+            out.append((day, item))
+    return out
+
+
+def _open_todos(services, limit: int = 5) -> tuple[list[str], int]:
+    notes = _svc(services, "notes")
+    if notes is None or not hasattr(notes, "list"):
+        return [], 0
+    try:
+        items = notes.list("todo", limit=limit)
+        texts = [str(i.get("text") if isinstance(i, dict) else i).strip() for i in items]
+        texts = [t for t in texts if t]
+        count = getattr(notes, "count", None)
+        total = int(count("todo")) if callable(count) else len(texts)
+    except Exception:
+        log.debug("briefing: todos unavailable", exc_info=True)
+        return [], 0
+    return texts, max(total, len(texts))
+
+
+def _tk_items(services, kind: str) -> list:
+    tk = _svc(services, "timekeeper")
+    if tk is None or not hasattr(tk, "list"):
+        return []
+    try:
+        return list(tk.list(kind))
+    except Exception:
+        log.debug("briefing: %s list unavailable", kind, exc_info=True)
+        return []
+
+
+def _item_due(item, tz) -> Optional[datetime]:
+    due = getattr(item, "effective_due", None)
+    if due is None:
+        due = getattr(item, "due", None)
+    try:
+        return datetime.fromtimestamp(float(due), tz)
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+# -------------------------------------------------------------- preview
+def wake_offer(cfg, first_start: Optional[datetime], alarms: list, now: datetime) -> Optional[dict]:
+    """An alarm to offer for tomorrow's first event, or None.
+
+    Only when the event starts at or before ``briefing.early_before``
+    (09:00) and no alarm already rings tomorrow before it. The offered
+    time is ``briefing.wake_lead_min`` (60) before the event, on the
+    quarter hour, and must still be in the future."""
+    if first_start is None or not _truthy(_cfg_get(cfg, "briefing.wake_offer", True)):
+        return None
+    if not section_on(cfg, "alarms"):
+        return None
+    try:
+        hh, mm = (int(x) for x in str(_cfg_get(cfg, "briefing.early_before", "09:00")
+                                        or "09:00").split(":")[:2])
+        lead = int(_cfg_get(cfg, "briefing.wake_lead_min", 60) or 60)
+    except (TypeError, ValueError):
+        hh, mm, lead = 9, 0, 60
+    if (first_start.hour, first_start.minute) > (hh, mm):
+        return None
+    day = first_start.date()
+    for it in alarms:
+        due = _item_due(it, first_start.tzinfo)
+        if due is not None and due.date() == day and due <= first_start:
+            return None                           # an alarm already covers it
+    wake = first_start - timedelta(minutes=max(0, lead))
+    wake = wake.replace(minute=wake.minute - wake.minute % 15, second=0, microsecond=0)
+    if wake <= now:
+        return None
+    time_words = _clock(wake)
+    return {"due": wake.timestamp(), "time": time_words, "label": WAKE_LABEL,
+            "line": OFFER_LINE.format(time=time_words), "made_at": now.timestamp()}
+
+
+def build_preview(cfg, registry, services=None, now=None) -> tuple[dict, str, Optional[dict]]:
+    """Tomorrow in one breath -> (sections, fact_sheet, offer).
+
+    sections = {weather: str, calendar: [str], canvas: [str], todos: [str],
+    alarm: str, offer?: str}. ``offer`` is the wake-up alarm to propose
+    (see wake_offer) or None. Weather, calendar and Canvas come through the
+    registry the way the morning briefing's do; to-dos and alarms are read
+    from the services directly (they are local stores, not tools)."""
+    now_dt = _now_dt(now)
+    today = now_dt.date()
+    tomorrow = today + timedelta(days=1)
+    sections: dict = {"weather": "", "calendar": [], "canvas": [], "todos": [], "alarm": ""}
+    notes: dict = {}
+    first_start = None
+
+    if section_on(cfg, "weather"):
+        ok, text = _registry_text(registry, "get_weather", {"when": "tomorrow"})
+        if ok and text:
+            sections["weather"] = text
+        else:
+            notes["weather"] = text or "unavailable"
+    if section_on(cfg, "calendar"):
+        events = _calendar_events(services)
+        if events is not None:
+            todays = [e for e in events if getattr(e, "on", None) and e.on(tomorrow)]
+            todays.sort(key=lambda e: (not getattr(e, "all_day", False), e.start))
+            sections["calendar"] = [_event_line(e) for e in todays] or \
+                ["Nothing on tomorrow, sir."]
+            timed = [e for e in todays if not getattr(e, "all_day", False)]
+            first_start = min((e.start for e in timed), default=None)
+        else:
+            ok, text = _registry_text(registry, "get_calendar", {"range": "tomorrow"})
+            if ok and text:
+                sections["calendar"] = [ln.strip() for ln in text.splitlines() if ln.strip()]
+                first_start = _first_clock(text, tomorrow, now_dt.tzinfo)
+            else:
+                notes["calendar"] = text or "unavailable"
+    if section_on(cfg, "canvas") and _cfg_get(cfg, "canvas.token", ""):
+        ok, text = _registry_text(registry, "canvas_due", {"days": 1})
+        if ok and text:
+            sections["canvas"] = [item for _day, item in _canvas_items(text, today)]
+            if not sections["canvas"] and not text.lower().startswith("nothing due"):
+                notes["canvas"] = "nothing parsed"
+        else:
+            notes["canvas"] = text or "unavailable"
+    todos_total = 0
+    if section_on(cfg, "todos"):
+        sections["todos"], todos_total = _open_todos(services)
+    alarms = _tk_items(services, "alarm") if section_on(cfg, "alarms") else []
+    tomorrows = []
+    for it in alarms:
+        due = _item_due(it, now_dt.tzinfo)
+        if due is not None and due.date() == tomorrow:
+            label = (getattr(it, "label", "") or "").strip()
+            tomorrows.append(f"{_clock(due)}" + (f" ({label})" if label else ""))
+    if section_on(cfg, "alarms"):
+        sections["alarm"] = "; ".join(tomorrows) or "none set"
+    offer = wake_offer(cfg, first_start, alarms, now_dt) if section_on(cfg, "alarms") else None
+    if offer:
+        sections["offer"] = offer["line"]
+
+    lines = [f"Preview for tomorrow, {tomorrow.strftime('%A')} {tomorrow.day} "
+             f"{tomorrow.strftime('%B')}."]
+    if section_on(cfg, "weather"):
+        lines.append(f"Weather tomorrow: {sections['weather'] or notes.get('weather', 'unavailable')}")
+    if section_on(cfg, "calendar"):
+        if sections["calendar"]:
+            lines.append("First up: " + " ".join(sections["calendar"]))
+        else:
+            lines.append(f"Calendar: {notes.get('calendar', 'nothing')}")
+    if section_on(cfg, "canvas") and _cfg_get(cfg, "canvas.token", ""):
+        if sections["canvas"]:
+            lines.append("Canvas due tomorrow: " + "; ".join(sections["canvas"]))
+        else:
+            lines.append(f"Canvas: {notes.get('canvas', 'nothing due tomorrow')}")
+    if section_on(cfg, "todos"):
+        if sections["todos"]:
+            head = f"{todos_total} open" if todos_total > len(sections["todos"]) else "open"
+            lines.append(f"To-dos ({head}): " + "; ".join(sections["todos"]))
+        else:
+            lines.append("To-dos: none open")
+    if section_on(cfg, "alarms"):
+        lines.append(f"Alarm tomorrow: {sections['alarm']}")
+    return sections, "\n".join(lines), offer
+
+
+# ----------------------------------------------------------------- week
+def build_week(cfg, registry, services=None, now=None, days: int = WEEK_DAYS) -> tuple[dict, str]:
+    """The workload forecast -> (sections, fact_sheet). sections = {summary:
+    str, days: [{label, date, items: [str]}], todos: [str]}. Calendar
+    events (structured when the source is parked on services, else the
+    calendar tool's week text), Canvas due within the week and reminders
+    are bucketed day by day; the heaviest and the clear days are named so
+    the model can say "Heavy Tuesday, sir"."""
+    now_dt = _now_dt(now)
+    today = now_dt.date()
+    days = max(1, int(days or WEEK_DAYS))
+    span = [today + timedelta(days=i) for i in range(days)]
+    buckets: dict[date, list[str]] = {d: [] for d in span}
+    notes: dict = {}
+
+    if section_on(cfg, "calendar"):
+        events = _calendar_events(services)
+        if events is not None:
+            for d in span:
+                todays = [e for e in events if getattr(e, "on", None) and e.on(d)]
+                todays.sort(key=lambda e: (not getattr(e, "all_day", False), e.start))
+                buckets[d].extend(_event_line(e) for e in todays)
+        else:
+            ok, text = _registry_text(registry, "get_calendar", {"range": "week"})
+            if ok and text:
+                for d, item in _week_text_items(text, today):
+                    if d in buckets:
+                        buckets[d].append(item)
+            else:
+                notes["calendar"] = text or "unavailable"
+    if section_on(cfg, "canvas") and _cfg_get(cfg, "canvas.token", ""):
+        ok, text = _registry_text(registry, "canvas_due", {"days": days})
+        if ok and text:
+            for d, item in _canvas_items(text, today):
+                if d in buckets:
+                    buckets[d].append(f"due: {item}")
+        else:
+            notes["canvas"] = text or "unavailable"
+    if section_on(cfg, "reminders"):
+        for it in _tk_items(services, "reminder"):
+            due = _item_due(it, now_dt.tzinfo)
+            if due is None or due.date() not in buckets:
+                continue
+            label = (getattr(it, "label", "") or "").strip() or "a reminder"
+            buckets[due.date()].append(f"{_clock(due)} reminder: {label}")
+    todos, todos_total = _open_todos(services) if section_on(cfg, "todos") else ([], 0)
+
+    day_rows = [{"label": _day_word(d, today).capitalize(), "date": d.isoformat(),
+                 "items": list(buckets[d])} for d in span]
+    counts = {d: len(buckets[d]) for d in span}
+    clear = [_day_word(d, today) for d in span if counts[d] == 0]
+    busiest = max(span, key=lambda d: counts[d])
+    total = sum(counts.values())
+    if total == 0:
+        summary = "Nothing on the week at all."
+    else:
+        heavy = [d for d in span if counts[d] >= 3] or ([busiest] if counts[busiest] >= 2 else [])
+        parts = []
+        if heavy:
+            parts.append("Heaviest: " + ", ".join(
+                f"{_day_word(d, today)} ({counts[d]})" for d in heavy))
+        else:
+            parts.append("A light week: nothing over one item a day")
+        if clear:
+            parts.append("Clear: " + ", ".join(clear))
+        summary = "; ".join(parts) + "."
+    sections = {"summary": summary, "days": day_rows, "todos": todos,
+                "unavailable": sorted(notes)}
+
+    lines = [f"Week ahead from {today.strftime('%A')} {today.day} {today.strftime('%B')}: "
+             f"{total} item{'s' if total != 1 else ''} over {days} days."]
+    lines.append(summary)
+    for note_name in ("calendar", "canvas"):
+        if note_name in notes:
+            lines.append(f"{note_name.capitalize()}: {notes[note_name]}")
+    for row in day_rows:
+        lines.append(f"{row['label']}: " + ("; ".join(row["items"]) or "clear"))
+    if section_on(cfg, "todos"):
+        if todos:
+            head = f"{todos_total} open" if todos_total > len(todos) else "open"
+            lines.append(f"To-dos ({head}): " + "; ".join(todos))
+        else:
+            lines.append("To-dos: none open")
+    return sections, "\n".join(lines)
+
+
+def _week_text_items(text: str, today: date) -> list[tuple[date, str]]:
+    """The calendar tool's week line ("This week: today 8:00 am X, 2:30 pm
+    Y; Wednesday all day: Z; nothing else.") -> [(day, item)]."""
+    body = re.sub(r"^this week:\s*", "", text.strip(), flags=re.I)
+    body = re.sub(r"\.?\s*that's as of .*$", "", body, flags=re.I)
+    out = []
+    for part in body.split(";"):
+        part = part.strip().rstrip(".")
+        if not part or part.lower() == "nothing else":
+            continue
+        m = re.match(r"^(today|tomorrow|monday|tuesday|wednesday|thursday|friday|"
+                     r"saturday|sunday)\s+(.+)$", part, re.I)
+        if not m:
+            continue
+        word = m.group(1).lower()
+        if word == "today":
+            day = today
+        elif word == "tomorrow":
+            day = today + timedelta(days=1)
+        else:
+            want = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                    "saturday", "sunday").index(word)
+            day = today + timedelta(days=(want - today.weekday()) % 7)
+        for item in m.group(2).split(", "):
+            item = item.strip()
+            if item:
+                out.append((day, item))
+    return out
+
+
 # ---------------------------------------------------------------- tool
 def make_tools(cfg, services) -> list[ToolSpec]:
     cache_path = getattr(services, "news_cache_path", None) if services is not None else None
@@ -561,25 +1027,67 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         reg = getattr(services, "tools", None) if services is not None else None
         return reg
 
-    def get_briefing(**_) -> ToolResult:
+    def _park_offer(offer):
+        # The commander answers the "shall I wake you" yes/no from here
+        # (Commander._try_alarm_offer), the way a calendar add waits on
+        # calendar.pending_event. Parked on services, not on the tool: the
+        # tool never sees the reply.
+        if services is None:
+            return
+        try:
+            services.alarm_offer = offer
+        except Exception:
+            log.debug("could not park the alarm offer", exc_info=True)
+
+    def get_briefing(when="today", **_) -> ToolResult:
         # No `briefing.enabled` check here. That flag means "let a plain
         # 'good morning' trigger a briefing", and commander._h_briefing
         # already enforces exactly that -- it lets an EXPLICIT request past
         # regardless. The tool cannot tell the two apart, so refusing here
         # only ever broke the explicit ask: the user said "give me the
         # briefing" and was told the briefing is switched off.
-        sections, sheet = build_briefing(cfg, _registry(), cache_path=cache_path)
+        when = coerce_when(when)
+        registry = _registry()
+        if when == "tomorrow":
+            sections, sheet, offer = build_preview(cfg, registry, services)
+            _park_offer(offer)
+            # "none set" is the timekeeper's honest answer, not a source
+            # that came through: with everything else dark it is no preview
+            got_any = any(sections.get(k) for k in ("weather", "calendar", "canvas",
+                                                    "todos")) or \
+                sections.get("alarm") not in ("", "none set")
+            if not got_any:
+                return ToolResult(text="preview sources unreachable", ok=False,
+                                  speak=PREVIEW_NOTHING_LINE)
+            return ToolResult(text=sheet, card=sections,
+                              max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["tomorrow"]))
+        if when == "week":
+            sections, sheet = build_week(cfg, registry, services)
+            got_any = any(row["items"] for row in sections["days"]) or \
+                bool(sections["todos"]) or not sections["unavailable"]
+            if not got_any:
+                return ToolResult(text="week sources unreachable", ok=False,
+                                  speak=WEEK_NOTHING_LINE)
+            return ToolResult(text=sheet, card=sections,
+                              max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["week"]))
+        sections, sheet = build_briefing(cfg, registry, cache_path=cache_path)
         got_any = bool(sections["weather"] or sections["calendar"] or
                        sections["news"] or sections["sports"] or sections["stocks"])
         if not got_any:
             return ToolResult(text="briefing sources unreachable", ok=False,
                               speak=NOTHING_LINE)
-        return ToolResult(text=sheet, max_sentences=6, card=sections)
+        return ToolResult(text=sheet, card=sections,
+                          max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["today"]))
 
     spec = ToolSpec(
         name="get_briefing",
-        description="Morning briefing: today's weather, calendar and three tech news items.",
-        parameters={"type": "object", "properties": {}},
+        # <= 20 words: the descriptions ride in every prompt.
+        description=("Briefing: today's weather, calendar and tech news; "
+                     "tomorrow's preview; or the week ahead."),
+        parameters={"type": "object", "properties": {
+            "when": {"type": "string", "enum": list(WHENS),
+                     "description": "today (the morning briefing), tomorrow "
+                                    "(the evening preview) or week (the forecast)"}}},
         handler=get_briefing,
     )
     return [spec]
