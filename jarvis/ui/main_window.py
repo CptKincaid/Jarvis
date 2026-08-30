@@ -788,12 +788,39 @@ class MainWindow:
         self._rule_w = None
         rule.bind("<Configure>", self._draw_header_rule, add=True)
 
-        # Borderless window: the ENTIRE header strip is the drag handle —
-        # the frame plus every non-button child (wordmark, state pill).
-        # Only the buttons keep their own clicks.
-        for handle in (header, wordmark, self.pill, rule):
-            handle.bind("<ButtonPress-1>", self._move_start, add=True)
-            handle.bind("<B1-Motion>", self._move_drag, add=True)
+        # Borderless window: the ENTIRE header strip is the drag handle.
+        # Bound by WALKING the tree, not from a hand-written list. The list
+        # this replaces named (header, wordmark, pill, rule) and silently
+        # stopped covering the header the day BarGradient was added: it is a
+        # Canvas child that FILLS the header ground, and in Tk a child always
+        # renders above its parent's surface, so every click on empty header
+        # space landed on an unbound widget and the window could not be
+        # dragged at all. A structural walk cannot rot that way.
+        self._bind_drag_tree(header, skip=(self._close_btn, self._min_btn,
+                                           self._gear))
+        self._bind_drag_tree(rule)
+
+    def _bind_drag_tree(self, widget, skip=()):
+        """Make `widget` and every descendant drag the window.
+
+        `skip` excludes a widget AND its subtree -- the header buttons keep
+        their own clicks. Anything that is not a real Tk widget (BarGradient
+        wraps a Canvas rather than subclassing one) is bound through its
+        underlying widget when it exposes one, and ignored otherwise.
+        """
+        if widget is None or widget in skip:
+            return
+        try:
+            widget.bind("<ButtonPress-1>", self._move_start, add=True)
+            widget.bind("<B1-Motion>", self._move_drag, add=True)
+        except (AttributeError, tk.TclError):
+            return                       # not a bindable widget
+        try:
+            children = widget.winfo_children()
+        except (AttributeError, tk.TclError):
+            return
+        for child in children:
+            self._bind_drag_tree(child, skip)
 
     def _draw_header_rule(self, event):
         if self._rule_w == event.width:
