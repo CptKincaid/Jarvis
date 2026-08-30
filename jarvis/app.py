@@ -249,6 +249,10 @@ class JarvisApp:
         # ---- routing ------------------------------------------------------
         self.services = self._build_services()
         self._register_tools()
+        # After the tools: the session reaches Spotify through the handle
+        # spotify.make_tools parks on services.spotify.
+        self.focus = self._construct("focus", self._make_focus)
+        self.services.focus = self.focus
         self.commander = Commander(self.services)
         # Without this hook the commander falls back to a bare warn Status --
         # a 4 s toast with no way to answer it, after which the utterance is
@@ -310,6 +314,13 @@ class JarvisApp:
         except Exception:
             log.exception("timekeeper: legacy reminder import failed")
         return tk
+
+    def _make_focus(self):
+        mod = _import_optional("jarvis.focus")
+        if mod is None:
+            return None
+        return mod.FocusSession(self.services,
+                                state_path=PATHS.MEMORY_DIR / "focus_session.json")
 
     def _make_notes(self):
         mod = _import_optional("jarvis.tools.notes")
@@ -410,6 +421,7 @@ class JarvisApp:
                                       "DECLINED_LINE")),
                 ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE",
                                       "WEB_LOOKUP_LINE", "WEB_UNAVAILABLE_LINE")),
+                ("jarvis.lecture", ("END_NONE_LINE", "FAIL_LINE")),
                 ("jarvis.tools.docs", ("INDEX_DOWN_LINE", "INDEXING_LINE",
                                        "NO_QUESTION_LINE")),
                 ("jarvis.tools.screen", ("NO_SCREEN_LINE", "NO_VISION_LINE")),
@@ -428,7 +440,8 @@ class JarvisApp:
         # Whole lists of fixed lines (the module is already imported when its
         # tools registered; a missing module simply contributes nothing).
         for modname, name in (("jarvis.tools.spotify", "PERSONA_LINES"),
-                              ("jarvis.tools.canvas", "PERSONA_LINES")):
+                              ("jarvis.tools.canvas", "PERSONA_LINES"),
+                              ("jarvis.focus", "PERSONA_LINES")):
             lines = getattr(sys.modules.get(modname), name, None)
             if isinstance(lines, (list, tuple)):
                 phrases += [ln for ln in lines if isinstance(ln, str) and ln
@@ -778,6 +791,8 @@ class JarvisApp:
         self._alert("alarm", title, text or title)
 
     def _on_reminder_fired(self, ev):
+        if getattr(ev, "silent", False):
+            return              # a focus block / break: the session speaks for it
         self._alert("reminder", "Reminder", ev.text)
 
     def alarm_action(self, alarm_id, action, minutes=None) -> bool:
@@ -1036,6 +1051,7 @@ class JarvisApp:
         self._app_started = time.monotonic()
         self._last_user_text, self._last_source = "", "voice"
         self._followup_after_speech = False   # arm a wake-word-free listen
+        self._reopen_mic = False              # lecture notes: re-open after a silent turn
         self._briefing_pending = False        # first wake of the day
         # -1e9, not 0.0: time.monotonic() counts from boot, so a 0.0 stamp
         # muted the guest line and passive learning for the first 3 / 10
@@ -1051,12 +1067,20 @@ class JarvisApp:
         """Bookkeeping once a command has been handled synchronously."""
         reply = getattr(result, "reply", None)
         done = getattr(result, "done", True) is not False
+        status = result.status or ""
+        if status.startswith("Noting:"):
+            # A lecture line: nothing is spoken, so the follow-up window
+            # would never open. Re-open the mic once this turn closes
+            # (_dispatch) -- and keep the line out of the conversation
+            # memory, it is a note, not an exchange.
+            if source == "voice":
+                self._reopen_mic = True
+            return
         if reply and done and not getattr(result, "ack", False):
             self.context.add_exchange(text, reply)
             if source == "voice" and result.speak and CONFIG.talkback:
                 self._followup_after_speech = True
         if source == "voice":
-            status = result.status or ""
             if status.startswith("Briefing"):
                 self._mark_briefing_delivered()
             elif status.startswith(("Was that for me", "Ignored")):
@@ -1099,8 +1123,27 @@ class JarvisApp:
             return                      # without a VAD nothing can say "nothing was said"
         if self.recorder.recording or self._audio_busy.is_set() or self._turn_busy.is_set():
             return
-        log.info("follow-up window: listening %.1fs without a wake word", CONFIG.followup_window)
-        threading.Timer(0.15, lambda: self.recorder.start(followup=True)).start()
+        window = self._capture_window()
+        log.info("follow-up window: listening %.1fs without a wake word",
+                 window or CONFIG.followup_window)
+        # The keyword is only passed when a longer window is wanted: the
+        # recorder's default is CONFIG.followup_window.
+        kw = {"window": window} if window else {}
+        threading.Timer(0.15, lambda: self.recorder.start(followup=True, **kw)).start()
+
+    def _capture_window(self):
+        """A longer wait for the first word while lecture notes are open
+        (`lecture.window_s`, default 20 s), else None for the recorder's
+        own CONFIG.followup_window. The recorder caps it at half its hard
+        cap. This is still one capture per note, not a hands-free mic."""
+        commander = getattr(self, "commander", None)
+        if not getattr(commander, "lecture_course", None):
+            return None
+        try:
+            window = float(self.assistant.get("lecture.window_s", 20) or 20)
+        except (TypeError, ValueError, AttributeError):
+            window = 20.0
+        return max(window, float(CONFIG.followup_window))
 
     # ---------------------------------------------------- guests, learning
     def _on_guest(self, score):
@@ -1408,6 +1451,13 @@ class JarvisApp:
         # commander routes local chat that way). Anything else is over now.
         if source != "voice" or getattr(result, "done", True) is not False:
             self._turn_finished()
+        if getattr(self, "_reopen_mic", False):
+            self._reopen_mic = False
+            tts = getattr(self, "tts", None)
+            if getattr(tts, "is_speaking", False) or getattr(tts, "pending", 0):
+                self._followup_after_speech = True   # _after_speech opens it
+            else:
+                self._start_followup()
         return result
 
     def _turn_start(self):
@@ -1616,6 +1666,14 @@ class JarvisApp:
             except Exception:
                 log.exception("assistant: %s failed to start", name)
                 bus.publish(Status(text=f"{name} failed to start", kind="warn"))
+        focus = getattr(self, "focus", None)
+        if focus is not None:
+            try:
+                # After Timekeeper.start(): its catch-up has already fired or
+                # missed whatever came due while the app was down.
+                focus.reconcile()
+            except Exception:
+                log.exception("focus session reconcile failed")
         cal = getattr(self.services, "calendar", None)
         if cal is not None:
             try:
@@ -1783,7 +1841,8 @@ class JarvisApp:
                           ("health_watchdog", getattr(self.services, "health_watchdog", None)),
                           ("activity_sampler", getattr(self.services, "activity_sampler", None)),
                           ("headsup", getattr(self, "headsup", None)),
-                          ("deadlines", getattr(self, "deadlines", None))):
+                          ("deadlines", getattr(self, "deadlines", None)),
+                          ("focus", getattr(self, "focus", None))):
             if obj is None:
                 continue
             fn = getattr(obj, "stop", None) or getattr(obj, "close", None)

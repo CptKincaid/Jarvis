@@ -70,6 +70,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from jarvis import lecture as lecture_mod
 from jarvis import pronounce
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
@@ -147,6 +148,11 @@ class IntentClassifier:
         "go ahead", "please", "take a look", "look at",
         "check the screen", "screenshot", "take a screenshot",
         "take screenshot",
+        # --- study (2026-08-30): focus sessions and lecture notes ---
+        # "end the session" and "pomodoro" were NO, "focus session on the
+        # thesis" UNCERTAIN -- the same silent drop as the media words above.
+        "session", "pomodoro", "study", "focus", "how much time", "time left",
+        "notes for", "notes on", "end notes", "lecture",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -1647,6 +1653,101 @@ def _h_verbosity(c, t, m):
 # an older one as the latest. Pin it here rather than ask again more loudly.
 # Mail words only: "message" also means Discord, notes and Claude sessions
 # in this app, so "the last message you sent" must not be hijacked into mail.
+# ---- Tier 1 focus / study sessions (jarvis/focus.py) ------------------
+# "study session biosensors", "start a fifty-minute focus session",
+# "pomodoro", "25 minute study session for signals with a ten minute break".
+_FOCUS_KIND = r"(?:study|studying|focus|focused|pomodoro|revision|work|deep[- ]work)"
+_FOCUS_START_RX = re.compile(
+    r"^(?:(?:start|begin|run|do|open|kick off)\s+(?:a\s+|an\s+|the\s+|my\s+)?)?"
+    r"(?:(?P<n>" + _NUM_ALT + r")\s*[- ]?(?:minutes?|mins?)\s+)?"
+    r"(?:(?:(?P<kind>" + _FOCUS_KIND + r")\s+)?session|(?P<pomo>pomodoro))"
+    r"(?:\s+(?:for|on|of|about)?\s*(?P<label>(?!with\b)[^,]+?))?"
+    r"(?:,?\s+with\s+(?:a\s+|an\s+)?(?P<b>" + _NUM_ALT + r")\s*[- ]?(?:minutes?|mins?)\s+breaks?)?"
+    r"[.!]*$", re.I)
+_FOCUS_LEFT_RX = re.compile(
+    r"^(?:how (?:long|much time|much longer)(?: is| do i have| have i got|'s| is there)? left"
+    r"|how long (?:until|till|to) (?:the |my )?(?:next )?break|time left"
+    r"|how long (?:have i got|do i have|is there)(?: to go)?)"
+    r"(?:\s+(?:in|on|of)\s+(?:the|this|my)\s+(?:block|session|break|timer))?[?.!]*$", re.I)
+_FOCUS_END_RX = re.compile(
+    r"^(?:(?:end|stop|finish|close|quit|wrap up)\s+(?:the\s+|this\s+|my\s+)?"
+    r"(?:" + _FOCUS_KIND + r"\s+)?session|end session"
+    r"|(?:i'?m|i am) done (?:studying|working|for today|for now)"
+    r"|(?:that'?s|thats) enough (?:studying|for today|for now))[.!]*$", re.I)
+
+
+def _m_focus_start(t):
+    """A bare "session" is too vague (Claude sessions exist too): a kind
+    word, a length or "pomodoro" must be present."""
+    m = _FOCUS_START_RX.match(t)
+    if m and (m.group("kind") or m.group("n") or m.group("pomo")):
+        return m
+    return None
+
+
+def _h_focus_start(c, t, m):
+    focus = c._svc("focus")
+    if focus is None:
+        return None
+    n = _num(m.group("n")) if m.group("n") else None
+    brk = _num(m.group("b")) if m.group("b") else None
+    label = _raw_group(c, _FOCUS_START_RX, m, "label") if m.group("label") else ""
+    line = focus.start(label, n, brk)
+    status = f"Focus: {label}" if label else "Focus session"
+    return CommandResult(handled=True, reply=line, speak=True, status=status)
+
+
+def _h_focus_left(c, t, m):
+    focus = c._svc("focus")
+    if focus is not None and focus.active:
+        return CommandResult(handled=True, reply=focus.time_left(), speak=True,
+                             status="Focus: time left")
+    tk = c._svc("timekeeper")
+    if tk is None:
+        return None
+    # No session: the honest answer is whatever timer is running.
+    return CommandResult(handled=True, reply=tk.list_text("timer"), speak=True,
+                         status="Timers")
+
+
+def _h_focus_end(c, t, m):
+    focus = c._svc("focus")
+    if focus is None or not focus.active:
+        return None            # not ours: "stop the session" may mean Claude
+    return CommandResult(handled=True, reply=focus.end(), speak=True,
+                         status="Focus: ended")
+
+
+# ---- Tier 1 lecture notes (jarvis/lecture.py) ---------------------------
+# "notes for biosensors", "take notes for signals", "lecture notes on
+# physiology". A mode like dictation: Commander.handle files every later
+# utterance until "end notes".
+_LECTURE_RX = re.compile(
+    r"^(?:(?:start|open|begin|take|taking|start taking)\s+)?"
+    r"(?:(?:the\s+|my\s+)?(?:lecture|class|course)\s+)?notes"
+    r"\s+(?:for|on|in)\s+(?P<course>.+?)[.!]*$", re.I)
+_LECTURE_END_RX = re.compile(
+    r"^(?:(?:end|stop|close|finish|save)\s+(?:the\s+|my\s+)?(?:lecture\s+|class\s+)?notes"
+    r"|(?:end|stop)\s+(?:the\s+)?note[- ]taking)(?:[, ]+(?:please|now|jarvis))*[.!?]*$", re.I)
+
+
+def _h_lecture_start(c, t, m):
+    spoken = _raw_group(c, _LECTURE_RX, m, "course")
+    cfg = c._svc("assistant")
+    course = lecture_mod.resolve_course(cfg, spoken)
+    try:
+        c._lecture = lecture_mod.LectureNotes(cfg, course, notes=c._svc("notes"))
+    except OSError:
+        log.exception("lecture notes: cannot open the notes file")
+        return CommandResult(handled=True, reply=lecture_mod.FAIL_LINE, speak=True,
+                             status="Notes: folder unwritable")
+    c.lecture_course = c._lecture.course
+    log.info("lecture notes: open for %r -> %s", c.lecture_course, c._lecture.path)
+    return CommandResult(handled=True,
+                         reply=lecture_mod.START_LINE.format(course=c.lecture_course),
+                         speak=True, status=f"Lecture notes: {c.lecture_course}")
+
+
 _LAST_MAIL_RX = re.compile(
     r"\b(?:last|latest|most recent|newest)\s+(?:e-?mails?|mails?)\b", re.I)
 _LAST_MAIL_HOURS = 168        # a week: "my last email" is not "since midnight"
@@ -2139,6 +2240,9 @@ REGISTRY: list[Command] = [
     Command("web search",
             _m_re(r"(?:search|google|look up)\s+(?:for\s+)?(.+)"),
             _h_search),
+    Command("focus start", _m_focus_start, _h_focus_start, needs=("focus",)),
+    Command("focus left", _FOCUS_LEFT_RX.match, _h_focus_left),
+    Command("focus end", _FOCUS_END_RX.match, _h_focus_end, needs=("focus",)),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
     Command("list schedule", _LIST_SCHED_RX.match, _h_list_schedule,
@@ -2191,6 +2295,7 @@ REGISTRY: list[Command] = [
     Command("todo done", _TODO_DONE_RX.match, _h_todo_done, needs=("notes",)),
     Command("todo add", _TODO_ADD_RX.match, _h_todo_add, needs=("notes",)),
     Command("todo list", _TODO_LIST_RX.match, _h_todo_list, needs=("notes",)),
+    Command("lecture notes", _LECTURE_RX.match, _h_lecture_start),
     Command("take note", _NOTE_RX.match, _h_take_note),
     Command("show notes",
             _m_contains("show notes", "read notes", "my notes",
@@ -2228,7 +2333,8 @@ REGISTRY: list[Command] = [
 # typed "timer for 5 minutes" is instant and never a model round trip.
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
-    if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
+    if cmd.name in ("focus start", "focus left", "focus end", "lecture notes",
+                    "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "next exam", "greeting",
                     "todo done", "todo add",
@@ -2327,6 +2433,10 @@ class Commander:
         self.services = services
         self.intent = IntentClassifier()
         self.dictation = False
+        # Lecture-note capture (jarvis/lecture.py): the course name while
+        # notes are open, else None. Checked right after dictation.
+        self.lecture_course: Optional[str] = None
+        self._lecture = None
         self._raw_text = ""
         # Set when the Claude manager refuses an out-of-project task and
         # offers the terminal; the next "yes" opens it (spec 7 / OUTSIDE_LINE).
@@ -2372,6 +2482,9 @@ class Commander:
         # 1. Dictation mode — type directly, don't route (2611-2630)
         if self.dictation:
             return self._handle_dictation(text)
+        # 1b. Lecture notes open: file it, unless it is "end notes".
+        if getattr(self, "lecture_course", None):
+            return self._handle_lecture(text)
 
         # 2. A ringing alarm owns the next words (spec 5.2 a).
         res = self._try_ringing(text)
@@ -2466,6 +2579,37 @@ class Commander:
         if CONFIG.auto_type:
             self._type_raw(text + " ")
         return CommandResult(handled=True, reply=text, status="Dictating")
+
+    def _handle_lecture(self, text: str) -> CommandResult:
+        body = strip_address(text).strip()
+        if _LECTURE_END_RX.match(body.lower()):
+            capture, self._lecture = self._lecture, None
+            course, self.lecture_course = self.lecture_course, None
+            line = capture.close() if capture is not None else lecture_mod.END_NONE_LINE
+            log.info("lecture notes: closed for %r", course)
+            # The file just grew: queue a reindex so ask_docs sees it. The
+            # docs tool parks its index on services.docs_index.
+            index = self._svc("docs_index")
+            kick = getattr(index, "kick", None)
+            if callable(kick):
+                try:
+                    kick()
+                except Exception:
+                    log.exception("lecture notes: docs reindex kick failed")
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status="Notes closed")
+        if self._lecture is None:          # flag without a file: recover
+            self.lecture_course = None
+            return self.handle(text)
+        try:
+            n = self._lecture.add(body)
+        except OSError:
+            log.exception("lecture notes: append failed")
+            return CommandResult(handled=True, reply=lecture_mod.FAIL_LINE, speak=True,
+                                 status="Notes: write failed")
+        # speak=False: reading every line back would talk over the lecture.
+        return CommandResult(handled=True, reply=body, speak=False,
+                             status=f"Noting: {self.lecture_course} ({n})")
 
     def _try_desktop(self, cmd_text: str) -> bool:
         """Port of _check_desktop_command 3548-3584 (parse via services)."""
@@ -3038,8 +3182,9 @@ class Commander:
                 return CommandResult(handled=True, status="Target: auto")
             match = TARGET_PATTERN.match(tl)
             # "switch to the vss project" is a Claude project switch (router
-            # action), not a window target.
-            if match and not _PROJECT_SWITCH_RX.match(tl):
+            # action), not a window target; "focus session on the thesis"
+            # is a study session (jarvis/focus.py), not "focus <window>".
+            if match and not _PROJECT_SWITCH_RX.match(tl) and not _m_focus_start(tl):
                 query = match.group(1).strip().rstrip(".")
                 if desktop is not None:
                     desktop.target_window(query)

@@ -54,6 +54,10 @@ CHANNELS = 1
 NOISE_GATE_THRESHOLD = 0.005
 WAVEFORM_BARS = 64
 MAX_RECORDING_SECONDS = 60      # monolith 4299 — hard cap to prevent memory issues
+# The longest a follow-up capture may wait for the first word (lecture
+# notes): half the hard cap, so a sentence started at the end of the wait
+# still has 30 s before the cap cuts it.
+MAX_FOLLOWUP_WINDOW_S = MAX_RECORDING_SECONDS / 2
 
 
 # ------------------------------------------------------------------
@@ -220,6 +224,7 @@ class Recorder:
         self.endpointer = None
         self._ep_cursor = 0                      # frames already fed to it
         self._followup = False                   # opened without a wake word
+        self._followup_window = 0.0              # 0 -> CONFIG.followup_window
         self._stop_endpoint = ""                 # what ended the last capture
         self._stop_dead_air = None               # ...and how long it waited
 
@@ -305,12 +310,24 @@ class Recorder:
         return resampled
 
     # -- session control -------------------------------------------------
-    def start(self, followup: bool = False):
+    @staticmethod
+    def clamp_window(window) -> float:
+        """A follow-up wait in seconds: 0 (use CONFIG.followup_window) for
+        None / junk, never above MAX_FOLLOWUP_WINDOW_S."""
+        try:
+            return min(MAX_FOLLOWUP_WINDOW_S, max(0.0, float(window or 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def start(self, followup: bool = False, window: float = None):
         """Begin a recording session. No-op (with warn Status) when no mic.
 
         ``followup=True`` opens the mic without a wake word right after a
         reply: if the VAD hears no speech within CONFIG.followup_window the
         session is aborted quietly (no "No audio captured", no transcript).
+        ``window`` overrides that wait for one capture (lecture notes keep
+        the mic open longer between sentences); it is capped at
+        MAX_FOLLOWUP_WINDOW_S so the 60 s hard cap still leaves room to talk.
         """
         import_err = None
         if not self.mic_available:
@@ -360,6 +377,7 @@ class Recorder:
         self._ep_cursor = 0
         self._stop_endpoint, self._stop_dead_air = "", None
         self._followup = bool(followup)
+        self._followup_window = self.clamp_window(window)
         if self.endpointer is not None:
             try:
                 self.endpointer.reset()
@@ -673,10 +691,10 @@ class Recorder:
                 return False
         gap = ep.silence_since_speech
         if gap is None:
+            window = getattr(self, "_followup_window", 0.0) or CONFIG.followup_window
             if self._followup and self._record_start_time and \
-                    (time.monotonic() - self._record_start_time) >= CONFIG.followup_window:
-                log.info("follow-up: nothing said in %.1fs; closing quietly",
-                         CONFIG.followup_window)
+                    (time.monotonic() - self._record_start_time) >= window:
+                log.info("follow-up: nothing said in %.1fs; closing quietly", window)
                 self.abort()
                 return True
             return False

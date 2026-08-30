@@ -595,7 +595,59 @@ memory drops under `health.warn_gb` (16) — "Memory is getting tight, sir: …"
 `health.critical_gb` (8), and when two processes each hold over `health.hog_gb` (20), the
 pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` itself.
 
-## 17. How he behaves now (the 2026-08-30 set)
+## 17. Study sessions (pomodoro)
+
+```json
+"focus": {"block_min": 25, "break_min": 5, "halfway": true, "max_blocks": 4,
+          "music": "pause", "playlist": ""}
+```
+
+Say *"study session biosensors"*, *"start a fifty-minute focus session"*,
+*"pomodoro"* or *"25 minute study session for signals with a ten minute break"*.
+He confirms ("25 minutes on biosensors, sir; I'll call the halfway mark and the
+break"), says "Halfway, sir." in the middle of any block of ten minutes or more,
+"Time for a break, sir; that's block 1 done. Five minutes off." at the end of it,
+starts the break timer himself, and "Break's over, sir. Block 2." after it. It
+repeats until you say *"end the session"* (or *"I'm done studying"*) — "Session
+over, sir: three blocks of 25 minutes." — or until `max_blocks` blocks are done
+(0 = only when told). *"How long left?"* answers from the running block or break.
+
+- `music`: `pause` pauses Spotify for the block and resumes it for the break;
+  `playlist` plays `playlist` (a playlist name) for the block and pauses it for the
+  break; `off` leaves Spotify alone. No Connect device or no linked account is
+  simply a session without music — he never apologises mid-study.
+- The blocks are timekeeper items (silent ones: he speaks the session's own
+  lines, not "your timer is up"), so a session survives a restart: a block that
+  came due while the app was down moves into its break at boot; one missed by more
+  than an hour is closed with the count. State: `~/.aiws_trainer/jarvis_memory/focus_session.json`.
+- *"Any timers running?"* lists them as "focus block 1 in 20 minutes".
+- There is no do-not-disturb: heads-ups and reminders still speak during a block.
+
+## 18. Lecture notes by voice
+
+```json
+"lecture": {"window_s": 20}
+```
+
+*"Notes for biosensors"* (also *"take notes for …"*, *"lecture notes on …"*) opens a
+capture. Everything you say to him after that is appended as a timestamped line to
+`~/Documents/Jarvis Docs/notes/biosensors-2026-09-03.md` (the first folder in
+`docs.paths`, so the next reindex makes it searchable — *"what did I write about
+impedance?"* goes through `ask_docs`) and to the notes store tagged with the course.
+*"End notes"* closes it — "Notes closed, sir: 12 lines for BIOSENSORS." — and kicks
+the reindex. With a Canvas token set the course name is tidied against your roster;
+otherwise it is filed as you said it.
+
+**This is not a hands-free microphone.** Each line is one capture: say the wake
+word, say the sentence. After every noted line the mic re-opens without the wake
+word for `window_s` seconds (20; capped at 30 by the recorder) and closes quietly if
+you say nothing — so a run of sentences flows, but a long stretch of listening
+ends the window and the next note needs "Jarvis" again. Lines are not read back
+(that would talk over the lecture), they do not enter the conversation memory, and
+while notes are open nothing else routes until "end notes" — the same rule as
+dictation. Speaker verification still gates the mic.
+
+## 19. How he behaves now (the 2026-08-30 set)
 
 - **Follow-ups without the wake word** — after an answer the mic stays open
   `followup_window` (4 s) seconds; say "…and Tuesday?" straight away. Nothing said → it

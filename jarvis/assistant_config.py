@@ -100,6 +100,17 @@ DEFAULTS: dict = {
              "max_files": 500, "embed_model": "nomic-embed-text",
              "ollama_url": "http://localhost:11434"},
     "screen": {"model": "llama3.2-vision:latest", "max_width": 1280},
+    # Study / focus sessions (jarvis/focus.py): block and break lengths in
+    # minutes, "Halfway, sir" for blocks of 10+ min, the session ends itself
+    # after max_blocks (0 = until "end the session"). music: "pause" pauses
+    # Spotify for the block and resumes it for the break, "playlist" plays
+    # `playlist` for the block and pauses it for the break, "off" leaves it.
+    "focus": {"block_min": 25, "break_min": 5, "halfway": True, "max_blocks": 4,
+              "music": "pause", "playlist": ""},
+    # Lecture notes (jarvis/lecture.py): after each noted line the mic
+    # re-opens without a wake word for window_s seconds (capped at 30 by
+    # the recorder; the 60 s hard cap on a capture must leave room to talk).
+    "lecture": {"window_s": 20},
     "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30},
     # Long-term memory (jarvis/memory.py): facts are also indexed with
     # nomic-embed-text so "who's my dentist" finds "my dentist is Dr Patel";
