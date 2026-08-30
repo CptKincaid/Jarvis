@@ -118,7 +118,9 @@ INTERNAL_ERROR_LINE = "I'm afraid something went wrong on my end, sir."
 # Web lookups run as a one-shot `claude -p` with search allowed (the CLI has
 # it built in; nothing new in the venv). Measured 2026-08-29: ~12 s with one
 # search on haiku or sonnet, 28 s when the model went off fetching pages.
-WEB_TIMEOUT_S = 60.0
+# Below app.TURN_TIMEOUT_S (60) minus the classify budget, or the turn
+# watchdog abandons the ledger before the CLI's own timeout can speak.
+WEB_TIMEOUT_S = 50.0
 WEB_SLOW_LINE = "That lookup is taking longer than I'd like, sir."
 WEB_FAIL_LINE = "I couldn't get a straight answer from the web on that, sir."
 WEB_PROMPT = (
@@ -126,7 +128,7 @@ WEB_PROMPT = (
     "(one or two searches; fetch a page only if the result snippets are not "
     "enough). Reply in at most two short sentences of plain spoken English: no "
     "markdown, no bullet points, no links, no source list, no preamble. If you "
-    "cannot find it, say so in one sentence.\n\nQuestion: {q}")
+    "cannot find it, say so in one sentence.{recent}\n\nQuestion: {q}")
 _PARTIAL_RX = re.compile(
     r"\b(?:part|partial|truncat|cut off|shortened|only some|first few)",
     re.I)
@@ -680,10 +682,15 @@ def clean_ollama_reply(text):
     return text.strip()
 
 
-_URL_RX = re.compile(r"\bhttps?://\S+|\bwww\.\S+", re.I)
+_URL_RX = re.compile(r"\bhttps?://[^\s)\]]+|\bwww\.[^\s)\]]+", re.I)
 _MD_LINK_RX = re.compile(r"\[([^\]]+)\]\([^)]*\)")
-_SOURCES_RX = re.compile(r"^\s*(?:sources?|references?|citations?)\s*:.*$",
-                         re.I | re.M | re.S)
+# A source list at a line start OR after a sentence end -- and only when it
+# actually carries links, so an answer that opens "Source: Reuters." keeps
+# its text instead of being wiped to the failure line.
+_SOURCES_RX = re.compile(
+    r"(?:^|(?<=[.!?])\s+)(?:sources?|references?|citations?)\s*:"
+    r"(?=.*(?:https?://|www\.|\[[^\]]+\]\())(?:.*)$",
+    re.I | re.M | re.S)
 
 
 def clean_web_answer(text, max_sentences=3):
@@ -693,6 +700,7 @@ def clean_web_answer(text, max_sentences=3):
     text = _SOURCES_RX.sub("", text)          # from "Sources:" to the end
     text = _MD_LINK_RX.sub(r"\1", text)       # [text](url) -> text
     text = _URL_RX.sub("", text)
+    text = _BULLET_RX.sub("", text)           # while the line breaks still exist
     text = strip_markdown(text)
     text = re.sub(r"\s+", " ", text).strip(" -–—:;,")
     return trim_spoken(limit_sentences(text, max_sentences))
@@ -989,16 +997,34 @@ class JarvisBrain:
         if not self._acquire_busy():
             if callback:
                 callback([("SPEAK", "Still on the last one, sir. One moment.")])
-            return None
+            return False                  # busy: already spoken (None = no CLI)
+        gen = self._job_gen               # this job's identity, for cancel()
+
+        # "Look it up" needs a referent: the one-shot has no history unless
+        # it is handed some.
+        recent = ""
+        try:
+            if self._context:
+                recent = self._context.format_for_prompt(
+                    self._context.get_context("standard"), spoken=True) or ""
+        except Exception:
+            log.debug("web answer: context unavailable", exc_info=True)
+        recent = recent.strip()[-1200:]
+        block = ("\n\nRecent conversation, only so pronouns like 'it' resolve "
+                 "(do not answer it):\n" + recent) if recent else ""
+
+        def _live():
+            return not self._cancelled and self._job_gen == gen
 
         def _process():
             bus.publish(BrainState(state="thinking"))
             try:
                 out = self._run_claude(
-                    WEB_PROMPT.format(q=question), timeout=timeout,
+                    WEB_PROMPT.format(recent=block, q=question), timeout=timeout,
                     extra_args=["--model", str(model or "haiku"),
-                                "--allowedTools", "WebSearch,WebFetch"])
-                if self._cancelled:
+                                "--allowedTools", "WebSearch,WebFetch"],
+                    output_format="json")
+                if not _live():
                     log.info("web answer cancelled; dropping result")
                     return
                 line = clean_web_answer(out) or WEB_FAIL_LINE
@@ -1012,15 +1038,16 @@ class JarvisBrain:
                     callback(tags)
             except subprocess.TimeoutExpired:
                 log.warning("web answer timed out after %.0fs", timeout)
-                if callback and not self._cancelled:
+                if callback and _live():
                     callback([("SPEAK", WEB_SLOW_LINE)])
             except Exception:
                 log.exception("web answer error")
-                if callback and not self._cancelled:
+                if callback and _live():
                     callback([("SPEAK", WEB_FAIL_LINE)])
             finally:
-                self._busy = False
-                bus.publish(BrainState(state="idle"))
+                if self._job_gen == gen:  # a newer job owns the guard now
+                    self._busy = False
+                    bus.publish(BrainState(state="idle"))
 
         t = threading.Thread(target=_process, daemon=True, name="brain-web")
         t.start()
@@ -1151,6 +1178,9 @@ class JarvisBrain:
             self._busy = True
             self._busy_since = time.monotonic()
             self._cancelled = False
+            # Each job gets an identity: cancel() then a new job used to let
+            # the dead job's tail speak and release the new job's guard.
+            self._job_gen = getattr(self, "_job_gen", 0) + 1
             return True
 
     def _remember(self, user_input, tags):
@@ -1436,18 +1466,21 @@ class JarvisBrain:
 
         return [("SPEAK", "I'm afraid that one got away from me, sir.")]
 
-    def _run_claude(self, prompt, timeout, extra_args=None):
+    def _run_claude(self, prompt, timeout, extra_args=None, output_format="text"):
         """Run the Claude CLI with the prompt on stdin.
 
         Uses Popen (not run) so cancel() can kill it mid-flight. The
         binary's own dir is prepended to PATH for any helpers it spawns.
         ``extra_args`` go after the fixed flags (--model, --allowedTools).
+        ``output_format="json"`` returns only the model's `result` field --
+        a login prompt, a settings warning or an error on stdout is then
+        never mistaken for an answer -- and "" when the CLI reports an error.
         """
         claude = MACHINE.claude_bin
         env = dict(os.environ)
         env["PATH"] = f"{Path(claude).parent}:{env.get('PATH', '')}"
         proc = subprocess.Popen(
-            [claude, "-p", "--output-format", "text", *(extra_args or [])],
+            [claude, "-p", "--output-format", output_format, *(extra_args or [])],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, env=env,
         )
@@ -1465,10 +1498,24 @@ class JarvisBrain:
                     self._proc = None
         if self._cancelled:
             return ""
-        if proc.returncode not in (0, None) and not out.strip():
-            log.warning("claude exited rc=%s stderr=%s",
-                        proc.returncode, (err or "")[:200])
-        return (out or "").strip()
+        if proc.returncode not in (0, None):
+            # Whatever a failing CLI printed is not an answer: a login
+            # prompt or a bad --model message used to be read aloud.
+            log.warning("claude exited rc=%s stdout=%.200s stderr=%.200s",
+                        proc.returncode, (out or ""), (err or ""))
+            return ""
+        out = (out or "").strip()
+        if output_format == "json":
+            try:
+                data = json.loads(out)
+            except ValueError:
+                log.warning("claude json output unreadable: %.200s", out)
+                return ""
+            if data.get("is_error"):
+                log.warning("claude reported an error: %.200s", data.get("result"))
+                return ""
+            return str(data.get("result") or "").strip()
+        return out
 
     # ------------------------------------------------------------------
     # Autonomous multi-step execution

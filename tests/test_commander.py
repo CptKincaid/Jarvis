@@ -1187,3 +1187,15 @@ def test_a_write_failure_is_reported_not_swallowed(cmdr, services, monkeypatch):
 
     assert "couldn't add" in res.reply.lower()
     assert cal.pending_event is None
+
+
+def test_a_web_cue_by_voice_skips_the_intent_gate(rich, services, monkeypatch):
+    """Live: "Lookup who won the last Formula One [race]" was called uncertain
+    and answered "Was that for me?". A web cue is addressed by construction."""
+    def _boom(text):
+        raise AssertionError("reached the intent classifier")
+    monkeypatch.setattr(rich.intent, "classify", _boom)
+    services.brain.web_answer.return_value = object()
+    res = rich.handle("look up who won the last formula one race", source="voice")
+    services.brain.web_answer.assert_called_once()
+    assert res.done is False and res.ack

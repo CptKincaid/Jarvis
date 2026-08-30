@@ -74,7 +74,7 @@ from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.calendar import write_event
-from jarvis.router import ROUTER_QUESTION, RouteDecision, estimate_size
+from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
 
 log = get_logger("commander")
 
@@ -1026,6 +1026,11 @@ def _h_clipboard(c, t, m):                                 # 3185-3200
 
 
 def _h_search(c, t, m):                                    # 3202-3215
+    # With a brain that can answer from the web, "jarvis, look up X" is a
+    # question, not a request to open a browser tab: yield to the router.
+    brain = c._svc("brain")
+    if brain is not None and hasattr(brain, "web_answer") and c._svc("router") is not None:
+        return None
     query = m.group(1).strip()
     url = f"https://www.google.com/search?q={query.replace(' ', '+')}"
     subprocess.Popen(
@@ -2068,7 +2073,10 @@ class Commander:
         #    gate exists to drop background chat, and "Jarvis, cancel" is
         #    not background chat (the classifier calls every one- or
         #    two-word phrase NO, which used to eat the router actions).
-        if source == "voice" and cmd_text is None:
+        # A web cue is addressed to Jarvis by construction, like a custom
+        # phrase: the classifier called "look up who won the last race"
+        # uncertain and asked "Was that for me?" (live, 2026-08-29 23:45).
+        if source == "voice" and cmd_text is None and not WEB_CUE_RX.search(text):
             intent, conf = self.intent.classify(text)
             if intent == IntentClassifier.NO:
                 log.info("Ignored (background chat, conf=%.2f): %r",
@@ -2384,12 +2392,17 @@ class Commander:
         if brain is None or not hasattr(brain, "web_answer"):
             return CommandResult(handled=True, reply=WEB_UNAVAILABLE_LINE,
                                  speak=True, status="Web unavailable")
-        model = _assistant_get(self, "claude.web_model", "haiku")
+        # a spoken "use sonnet" beats the config default
+        model = ((getattr(d, "args", None) or {}).get("model")
+                 or _assistant_get(self, "claude.web_model", "haiku"))
         try:
             started = brain.web_answer(d.prompt, model=model)
         except Exception:
             log.exception("web lookup failed to start")
             started = None
+        if started is False:
+            # busy: the brain already said "Still on the last one" itself
+            return CommandResult(handled=True, status="Brain busy")
         if not started:
             return CommandResult(handled=True, reply=WEB_UNAVAILABLE_LINE,
                                  speak=True, status="Web unavailable")

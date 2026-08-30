@@ -41,6 +41,7 @@ def app(monkeypatch):
     a.recorder = _Rec()
     a._audio_busy = _Clear()
     a._turn_busy = _Clear()
+    a.turns = SimpleNamespace(mark=lambda *args, **kw: None)   # the ledger's wake mark
     monkeypatch.setattr(app_mod, "play_beep", lambda *a, **k: None)
     return a
 

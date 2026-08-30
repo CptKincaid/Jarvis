@@ -1109,14 +1109,17 @@ def test_services_brain_chat_forwards_every_keyword_the_brain_takes(build, monke
 def test_turn_ledger_reports_one_line_per_voice_turn(build, monkeypatch):
     """The "turn:" line is assembled from five events on four threads; this
     drives them through the real bus wiring and checks the arithmetic lands."""
-    from jarvis.events import (HotwordDetected, RecordingStarted, RecordingStopped,
-                               SpeakingState, Transcribed, bus as _bus)
+    from jarvis.events import (RecordingStarted, RecordingStopped, SpeakingState,
+                               Transcribed, bus as _bus)
     app = build()
     got = []
     monkeypatch.setattr(app.turns, "_emit", got.append)
-    _bus.publish(HotwordDetected(score=0.9))
+    # the stub recorder's fake audio must not run STT; clear the flag the handler set
+    monkeypatch.setattr(app, "_process_audio", lambda audio: app._audio_busy.clear())
+    app.recorder.recording = False
+    app._on_hotword(0.9)                              # "wake" is marked here, not via the bus
     _bus.publish(RecordingStarted())
-    app._turn_on_stop(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))  # the ledger handler itself; the pipeline's stub audio is noise here
+    _bus.publish(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))
     _bus.publish(Transcribed(text="what time is it", accepted=True))
     app.turns.mark("handle")
     _bus.publish(SpeakingState(active=True, amplitude=0.3))
@@ -1127,9 +1130,9 @@ def test_turn_ledger_reports_one_line_per_voice_turn(build, monkeypatch):
     assert abs(rec["dead_air"] - 0.8) < 0.05
     assert rec["wait"] is not None and rec["wait"] >= rec["dead_air"]
     # a rejected clip closes the turn without a reply
-    _bus.publish(HotwordDetected(score=0.9))
+    app._on_hotword(0.9)
     _bus.publish(RecordingStarted())
-    app._turn_on_stop(RecordingStopped(reason="silence", endpoint="energy", dead_air_s=2.5))  # the ledger handler itself; the pipeline's stub audio is noise here
+    _bus.publish(RecordingStopped(reason="silence", endpoint="energy", dead_air_s=2.5))
     _bus.publish(Transcribed(text="", accepted=False, reject_reason="speaker"))
     assert len(got) == 2 and got[1]["outcome"] == "rejected:speaker"
     _bus.publish(SpeakingState(active=True))                     # TTS from elsewhere
@@ -1159,29 +1162,32 @@ def test_endpointer_installs_without_a_voiceprint(build, monkeypatch):
 
 
 def test_a_refused_wake_word_does_not_supersede_the_turn_being_answered(build, monkeypatch):
-    from jarvis.events import HotwordDetected, bus as _bus
+    """The mark is taken in _on_hotword itself: through the bus it arrived
+    after the recorder had opened and read as refused ("wake→mic —")."""
     app = build()
     got = []
     monkeypatch.setattr(app.turns, "_emit", got.append)
     app.recorder.recording = False
-    _bus.publish(HotwordDetected(score=0.9))
+    app._on_hotword(0.9)
     assert app.turns.open
     app._turn_busy.set()                              # "still on the last one"
-    _bus.publish(HotwordDetected(score=0.9))
+    app._on_hotword(0.9)
     assert got == [], "a refused wake superseded the open turn"
     app._turn_busy.clear()
 
 
 def test_a_filler_line_does_not_close_the_ledger(build, monkeypatch):
-    from jarvis.events import (HotwordDetected, RecordingStarted, RecordingStopped,
-                               SpeakingState, Transcribed, bus as _bus)
+    from jarvis.events import (RecordingStarted, RecordingStopped, SpeakingState,
+                               Transcribed, bus as _bus)
     app = build()
     got = []
     monkeypatch.setattr(app.turns, "_emit", got.append)
     app.recorder.recording = False
-    _bus.publish(HotwordDetected(score=0.9))
+    monkeypatch.setattr(app, "_process_audio", lambda audio: app._audio_busy.clear())
+    app.recorder.recording = False
+    app._on_hotword(0.9)
     _bus.publish(RecordingStarted())
-    app._turn_on_stop(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))  # the ledger handler itself; the pipeline's stub audio is noise here
+    _bus.publish(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))
     _bus.publish(Transcribed(text="what's the weather", accepted=True))
     app.turns.mark("handle")
     app._turn_filler_pending = True                   # _say_thinking sets this
@@ -1206,3 +1212,22 @@ def test_services_brain_has_web_answer_and_an_ack_is_a_filler(build, monkeypatch
     monkeypatch.setattr(app, "_say", lambda text: None)
     app._emit_result(CommandResult(handled=True, reply="Looking that up, sir.", speak=True, ack=True))
     assert app._turn_filler_pending is True
+
+
+def test_an_ack_disarms_the_thinking_filler_but_not_the_watchdog(build, monkeypatch):
+    """Live: "Looking that up, sir." was followed 4.5 s later by "Checking
+    right now, sir. One moment." -- the ack IS the filler."""
+    import threading
+    from jarvis.commander import CommandResult
+    app = build()
+    monkeypatch.setattr(app, "_say", lambda text: None)
+    app._turn_timer = threading.Timer(60, lambda: None)
+    app._turn_timer.start()
+    app._turn_watchdog = threading.Timer(60, lambda: None)
+    app._turn_watchdog.start()
+    try:
+        app._emit_result(CommandResult(handled=True, reply="Looking that up, sir.", speak=True, ack=True))
+        assert app._turn_timer is None
+        assert app._turn_watchdog is not None and app._turn_watchdog.is_alive()
+    finally:
+        app._turn_cancel_timers()

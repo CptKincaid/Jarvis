@@ -299,7 +299,9 @@ working in; a second click raises the same window.
 built in, so nothing is added to the venv. Jarvis says "Looking that up, sir." at once
 and speaks the answer when it lands (~12–15 s). `claude.web_model` picks the model
 (default `haiku`: fastest, and it obeys "no links"; `sonnet` works too). This is the
-one path that leaves the machine; everything else stays local.
+only path that hands what you said to a web search; Jarvis's own reasoning otherwise stays
+on the local model (the coding sessions, weather, calendars, mail and Discord each talk to
+their own service).
 
 ## 10. Always on: start at login, never sleep
 

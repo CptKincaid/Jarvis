@@ -275,3 +275,26 @@ def test_describe_reports_the_vads_view():
     d = e.describe()
     assert "started=True" in d and "last_p=0.20" in d and "max_p=0.90" in d
     assert "gap=0.32s" in d
+
+
+def test_the_energy_timer_stands_down_while_the_vad_hears_speech(monkeypatch):
+    """On a real capture the user's RMS sat at 0.008-0.014 against a 0.015
+    threshold for a whole clause while the VAD held 0.97-1.00: the energy
+    timer counted the clause as silence and ended the capture mid-sentence."""
+    monkeypatch.setattr(recorder_mod.CONFIG, "endpoint_vad", True)
+    monkeypatch.setattr(recorder_mod.CONFIG, "endpoint_silence", 0.8)
+    monkeypatch.setattr(recorder_mod.CONFIG, "silence_timeout", 2.5)
+    monkeypatch.setattr(recorder_mod.CONFIG, "silence_grace", 0.0)
+
+    class Vad:
+        silence_since_speech = 0.3          # the user is (still) talking
+        def describe(self):
+            return "vad"
+    rec = _recorder(Vad())
+    for _ in range(10):                             # > min_frames of 0.1 s blocks
+        _push(rec, 3)
+    rec._silence_start = time.monotonic() - 5.0     # energy: "quiet for 5 s"
+    rec._loud_chunks = 0
+    assert rec._check_silence() is False and rec.stops == []
+    Vad.silence_since_speech = None                 # nobody has spoken: energy's case
+    assert rec._check_silence() is True and rec.stops[0][:2] == ("silence", "energy")

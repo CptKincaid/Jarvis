@@ -71,19 +71,27 @@ DEFAULT_SKILL_PHRASES = {
 
 # Questions that need the internet: an explicit ask to look something up, or
 # the shapes of a current fact (a result, a price, a headline about X). Kept
-# narrow on purpose: "what's the weather" and "what's the news" have local
-# tools, and anything not matched still reaches the local model.
+# narrow on purpose, and the router only takes it when the local/code cue
+# tables have nothing stronger: "google calendar", "when does my meeting
+# start", "headlines for today", "what happened with the tests" and "is the
+# terminal open" all wore these words and were being sent to the web.
 _WEB_CUE_RX = re.compile(
-    r"\b(?:look (?:it|that|this|them|him|her)? ?up\b|search (?:the web|online|the internet|for)\b|"
-    r"google\b|web search\b|search up\b|"
-    r"latest (?:news|scores?|results?|prices?|version|release)\b|"
-    r"(?:news|headlines?|updates?) (?:about|on|from|for)\b|"
+    r"\b(?:look (?:it|that|this|them|him|her)? ?up\b|"
+    r"search (?:the web|online|the internet|for)\b|web search\b|search up\b|"
+    r"(?:^|please |just |can you |could you )google (?!(?:calendar|chrome|docs?|drive|maps|photos|home|mail|meet|keep|play)\b)|"
+    r"on google\b|"
+    r"latest (?:scores?|results?|prices?)\b|"
+    r"(?:news|headlines?) (?:about|on) (?!today\b|tonight\b|the day\b)|"
     r"who won\b|what(?:'s| is) the score\b|price of\b|stock price\b|exchange rate\b|"
     r"how much (?:is|does|do|did) .+? (?:cost|worth|sell for)\b|"
-    r"what happened (?:to|with|in|at)\b|"
-    r"is .+? open (?:right )?(?:today|now|tonight|tomorrow|at the moment)\b|"
-    r"when (?:does|is|did|will) .+? (?:come out|release|start|open|close|premiere|air)\b)",
+    r"what happened in (?!my\b|the (?:tests?|build|terminal|session)\b)|"
+    r"is (?!(?:the |a |my |that )?(?:terminal|window|tab|file|session|editor|app|browser|mic|door|window)\b)"
+    r".+? open (?:right )?(?:today|now|tonight|tomorrow|at the moment)\b|"
+    r"when (?:does|is|did|will) (?!(?:my |the |our |that )?(?:next )?"
+    r"(?:meeting|class|call|appointment|lecture|standup|event|timer|alarm|reminder|session|build)\b)"
+    r".+? (?:come out|release|premiere|air)\b)",
     re.I)
+WEB_CUE_RX = _WEB_CUE_RX          # the commander's intent gate reads it too
 
 @dataclass
 class RouteDecision:
@@ -807,13 +815,6 @@ class Router:
                 return RouteDecision("local", "claude-cue-empty")
             return RouteDecision("local", "empty")
 
-        # 1c. the web: current facts the local model cannot know and no
-        #     local tool covers. Claude's CLI has search built in, so this
-        #     goes there as a ONE-SHOT question (brain.web_answer), never as
-        #     a coding session -- "ask claude to look up X" lands here too.
-        if _WEB_CUE_RX.search(work):
-            return RouteDecision("web", "web-cue", prompt=work, args=args)
-
         # 2. skill phrases --------------------------------------------
         prompt = self._skill(work)
         if prompt is not None:
@@ -821,13 +822,23 @@ class Router:
             return RouteDecision("claude", "skill", prompt=prompt,
                                  project=project, args=args)
 
+        cues = analyse(work)
+        # 2b. the web: current facts the local model cannot know and no
+        #     local tool covers. Claude's CLI has search built in, so this
+        #     goes there as a ONE-SHOT question (brain.web_answer), never as
+        #     a coding session -- "ask claude to look up X" lands here too.
+        #     A strong local cue (calendar, briefing...) or a code cue / a
+        #     path wins: those words are the tool's, not the internet's.
+        if (_WEB_CUE_RX.search(work) and not cues.local_strong
+                and not cues.code_strong and not _PATH_RX.search(work)):
+            return RouteDecision("web", "web-cue", prompt=work, args=args)
+
         # 3. explicit cue ---------------------------------------------
         if explicit:
             args.setdefault("size", estimate_size(work))
             return RouteDecision("claude", "explicit", prompt=work,
                                  project=project, args=args)
 
-        cues = analyse(work)
         # 4/5. cue tables (strong beats weak; wrappers are local) -------
         if cues.wrapper:
             return RouteDecision("local", f"local:{cues.local_kind or 'wrapper'}")

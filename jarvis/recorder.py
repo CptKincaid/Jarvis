@@ -719,6 +719,17 @@ class Recorder:
         if (start is not None
                 and (time.monotonic() - start) >= timeout
                 and len(self._audio_frames) > min_frames):
+            ep = self.endpointer
+            if ep is not None and CONFIG.endpoint_vad:
+                # The VAD still hears the user: stand down. Quiet speech reads
+                # as silence here -- on a real capture the user's RMS ran at
+                # 0.008-0.014 against a 0.015 threshold for a whole clause
+                # while the VAD held 0.97-1.00 -- so this timer was ending
+                # captures mid-sentence. The VAD stops them itself,
+                # endpoint_silence after the last word; the 60 s cap remains.
+                gap = ep.silence_since_speech
+                if gap is not None and gap < CONFIG.endpoint_silence:
+                    return False
             log.info("Auto-stop on silence (%ss timeout)", timeout)
             if self.endpointer is not None and CONFIG.endpoint_vad:
                 # The VAD was live and the energy timer still won: say why.

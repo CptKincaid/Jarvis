@@ -31,14 +31,26 @@ import time
 from types import SimpleNamespace
 
 from jarvis.config import CONFIG, MACHINE, PATHS
-from jarvis.events import (AlarmFired, ApprovalRequested, ApprovalResolved,
-                           BriefingReady, ClaudeProgress, ClaudeTaskState,
-                           JarvisReply, ModelInfo, PartialText,
-                           RecordingStarted, RecordingStopped,
-                           ReminderFired, Status, Transcribed,
-                           UncertainResolved, UncertainUtterance,
-                           UserUtterance, bus,
-    HotwordDetected, SpeakingState)
+from jarvis.events import (
+    AlarmFired,
+    ApprovalRequested,
+    ApprovalResolved,
+    BriefingReady,
+    ClaudeProgress,
+    ClaudeTaskState,
+    JarvisReply,
+    ModelInfo,
+    PartialText,
+    RecordingStarted,
+    RecordingStopped,
+    ReminderFired,
+    Status,
+    Transcribed,
+    UncertainResolved,
+    UncertainUtterance,
+    UserUtterance,
+    bus,
+    SpeakingState)
 from jarvis.logs import get_logger
 
 from jarvis import brain as brain_mod
@@ -831,6 +843,7 @@ class JarvisApp:
             bus.publish(Status(text="One moment — still on the last one",
                                kind="warn"))
             return
+        self.turns.mark("wake")            # accepted: this turn starts now
         if CONFIG.sound:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
         # The wake word ends and the user starts talking straight away, so
@@ -924,18 +937,13 @@ class JarvisApp:
         self.turns = TurnLedger(jsonl_path=PATHS.LOG_DIR / "turns.jsonl")
         self._tts_active = False              # rising-edge detection for "audio"
         self._turn_filler_pending = False     # the next speech is a filler line
-        bus.subscribe(HotwordDetected, self._turn_on_hotword)
+        # "wake" is marked in _on_hotword itself (synchronous, on the hotword
+        # thread, after its refusal checks): through the bus the mark arrived
+        # after the recorder had already opened and read as refused.
         bus.subscribe(RecordingStarted, lambda ev: self.turns.mark("mic", at=ev.t))
         bus.subscribe(RecordingStopped, self._turn_on_stop)
         bus.subscribe(Transcribed, self._turn_on_transcribed)
         bus.subscribe(SpeakingState, self._turn_on_speaking)
-
-    def _turn_on_hotword(self, ev):
-        # Mirror _on_hotword's refusals: a wake that will be turned away
-        # ("still on the last one") must not supersede the turn being answered.
-        if self.recorder.recording or self._audio_busy.is_set() or self._turn_busy.is_set():
-            return
-        self.turns.mark("wake", at=ev.t)
 
     def _turn_on_stop(self, ev):
         if ev.reason == "abort":
@@ -1027,7 +1035,13 @@ class JarvisApp:
                 if getattr(result, "ack", False):
                     # "Looking that up, sir." is speech, not the answer: the
                     # turn ledger records it as a filler and keeps waiting.
+                    # It IS the filler, too: 4.5 s later "Checking right
+                    # now, sir" followed it live. Disarm the thinking timer
+                    # and leave the watchdog.
                     self._turn_filler_pending = True
+                    t, self._turn_timer = getattr(self, "_turn_timer", None), None
+                    if t is not None:
+                        t.cancel()
                 self._say(result.reply)
         if result.status:
             bus.publish(Status(text=result.status, kind="info"))
