@@ -261,7 +261,7 @@ def test_a_tool_module_that_fails_to_import_does_not_abort_boot(build,
 # --------------------------------------------------------- 2. the routes
 def test_local_utterance_reaches_the_brain(app):
     seen = []
-    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: seen.append(text)
     result = app.dispatch_text("what's the weather like tomorrow")
     assert seen == ["what's the weather like tomorrow"]
     assert result.handled and result.done is False
@@ -314,7 +314,7 @@ def test_ambiguous_utterance_asks_exactly_one_question(app):
 
 def test_music_utterance_stays_local(app):
     seen = []
-    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: seen.append(text)
     app.dispatch_text("play some miles davis")
     assert seen == ["play some miles davis"]
 
@@ -520,7 +520,7 @@ def test_yes_no_words(text, expected):
 
 def test_discord_text_becomes_an_ordinary_command(app):
     seen = []
-    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: seen.append(text)
     t = app._on_discord("what's the weather like", "42")
     if t is not None:
         t.join(5)
@@ -533,7 +533,7 @@ def test_discord_yes_answers_a_pending_approval_instead(app):
     app.approvals.answer = lambda allowed, request_id=None, source="": \
         calls.append((allowed, source)) or True
     seen = []
-    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: seen.append(text)
     assert app._on_discord("yes", "42") is None
     assert calls == [(True, "discord")]
     assert seen == []
@@ -785,7 +785,7 @@ def test_uncertain_utterance_asks_something_that_can_be_answered(app, monkeypatc
 def test_answering_yes_actually_runs_the_utterance(app, monkeypatch):
     _make_uncertain(app, monkeypatch)
     seen = []
-    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: seen.append(text)
     monkeypatch.setattr(app.brain, "classify_route",
                         lambda text, timeout=None: ("local", 1.0))
     sink = Sink(UncertainUtterance, UncertainResolved)
@@ -810,7 +810,7 @@ def test_answering_no_discards_it_and_teaches_the_classifier(app, monkeypatch):
                         lambda text, is_for_assistant: taught.append(
                             (text, is_for_assistant)))
     seen = []
-    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: seen.append(text)
     sink = Sink(UncertainUtterance)
     try:
         app._dispatch("she said no way lol haha dude", "voice")
@@ -829,7 +829,7 @@ def test_only_the_first_answer_counts(app, monkeypatch):
     same utterance twice."""
     _make_uncertain(app, monkeypatch)
     seen = []
-    app.brain.chat = lambda text, callback=None, force_tool=None: seen.append(text)
+    app.brain.chat = lambda text, callback=None, force_tool=None, **kw: seen.append(text)
     monkeypatch.setattr(app.brain, "classify_route",
                         lambda text, timeout=None: ("local", 1.0))
     sink = Sink(UncertainUtterance)

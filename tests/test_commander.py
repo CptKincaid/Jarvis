@@ -664,7 +664,10 @@ def test_router_question_resolved_to_local_goes_to_the_brain(rich, services):
 def test_a_new_subject_drops_the_router_question(rich, services):
     rich.handle("sort out the thing we talked about", source="typed")
     rich.handle("what's the weather", source="typed")
-    services.brain.chat.assert_called_once_with("what's the weather")
+    # one chat call for the new subject (the route short-cut may add
+    # force_tool/force_args; tests/test_route_shortcut.py pins those)
+    assert services.brain.chat.call_count == 1
+    assert services.brain.chat.call_args.args == ("what's the weather",)
     assert services.router.pending() is None
     services.claude.submit.assert_not_called()
 
@@ -698,7 +701,8 @@ def test_unknown_slash_command_passes_through(rich, services):
 # --------------------------------------------------- router → services
 def test_local_route_goes_to_brain_chat(rich, services):
     res = rich.handle("what's on my calendar tomorrow", source="typed")
-    services.brain.chat.assert_called_once_with("what's on my calendar tomorrow")
+    assert services.brain.chat.call_count == 1
+    assert services.brain.chat.call_args.args == ("what's on my calendar tomorrow",)
     assert res.handled and not res.done
     services.claude.submit.assert_not_called()
 
@@ -939,7 +943,8 @@ def test_discord_text_skips_the_intent_gate(rich, services):
     assert services.classify_calls == ["she said no way lol haha dude"]
     assert res.reply == ROUTER_QUESTION
     rich.handle("what's the weather", source="discord")
-    services.brain.chat.assert_called_once_with("what's the weather")
+    assert services.brain.chat.call_count == 1
+    assert services.brain.chat.call_args.args == ("what's the weather",)
 
 
 def test_voice_still_gates_background_chat(rich, services):
@@ -1027,7 +1032,8 @@ def test_the_local_model_never_sees_the_address(rich, services):
     assert strip_address("what's the weather?") == "what's the weather?"
     assert strip_address("jarvis") == "jarvis"        # nothing but the name
     rich.handle("hey jarvis what's the weather", source="voice")
-    services.brain.chat.assert_called_once_with("what's the weather")
+    assert services.brain.chat.call_count == 1
+    assert services.brain.chat.call_args.args == ("what's the weather",)
 
 
 # ------------------------------------------- (h) an open terminal (rule 1b)

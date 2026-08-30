@@ -1976,6 +1976,132 @@ def parse_yes_no(text):
     return yes
 
 
+# ------------------------------------------------------------------
+# Route short-cuts: the router already named the tool (2026-08-30)
+# ------------------------------------------------------------------
+# For "what's on my calendar tomorrow?" the router says local:calendar and
+# the brain then spends a model turn choosing get_calendar (0.98-1.45 s
+# live, 2026-08-29) before a second turn renders the result. When the cue
+# class names the tool AND the arguments are in the sentence, the call is
+# forced (brain.chat force_tool/force_args, the path get_briefing and
+# get_mail already use) and only the render turn runs. The render turn is
+# kept on purpose: tool text can carry a stranger's words (calendar titles)
+# and brain.py never speaks it raw. Deliberately narrow -- a write verb, a
+# second clause or a city the regex is not sure of falls back to the full
+# loop, which is slower but cannot be wrong in a new way.
+_CAL_READ_RX = re.compile(
+    r"\b(?:what(?:'s| is|s| do i have| have i got)?|anything|any|do i have|"
+    r"have i got|is there|are there|show me|read me|check|list|tell me|"
+    r"when(?:'s| is)?|how many)\b.*"
+    r"\b(?:calendar|schedule|agenda|meetings?|appointments?|events?|plans?)\b"
+    r"|\bon (?:my |the )?(?:calendar|schedule|agenda)\b"
+    r"|\bnext (?:meeting|appointment|event)\b", re.I)
+# A write: the verb leads the clause ("schedule a meeting", "can you add
+# ...") or is unambiguous anywhere. "schedule" the noun ("what's on my
+# schedule") must not count, so the noun-like verbs are start-anchored.
+_CAL_WRITE_RX = re.compile(
+    r"^(?:(?:please|jarvis|can you|could you|would you|will you|go ahead and)"
+    r"[,\s]+)*(?:schedule|book|put|add|create|set up|make|move|reschedule|"
+    r"change|edit|update|block|pencil)\b"
+    r"|\b(?:book|reschedule|cancel|delete|remove|rename|invite|postpone|clear)\b",
+    re.I)
+# A second clause means a second intent: the full loop handles both.
+_CLAUSE_RX = re.compile(r",\s*and\b|\band\b|\balso\b|\bthen\b|\bplus\b|"
+                        r"\bas well as\b|;", re.I)
+# "in London", "at Salt Lake City", "for Paris": a capitalised run after a
+# place preposition. Whisper capitalises the places it knows; a lowercase
+# candidate ("in london", typed) is NOT trusted as a city and is left to
+# the model rather than geocoded blind.
+_PLACE_RX = re.compile(
+    r"\b(?:in|at|for|over in|out in)\s+"
+    r"(?P<place>[A-Za-z][\w'.-]*(?:\s+[A-Z][\w'.-]*)*)")
+_NOT_A_PLACE = {
+    "the", "a", "an", "my", "our", "your", "his", "her", "their", "this", "that",
+    "these", "those", "here", "there", "home", "town", "work", "school", "bed",
+    "today", "tomorrow", "tonight", "now", "noon", "midnight", "morning",
+    "afternoon", "evening", "night", "lunch", "dinner", "breakfast", "next",
+    "last", "least", "all", "me", "us", "him", "them", "it", "present",
+    "general", "celsius", "fahrenheit", "degrees", "case", "once", "about",
+    "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "christmas", "easter",
+    "weekend", "week", "month", "year", "hour", "minute", "moment", "while",
+    "sir", "jarvis", "hunter",
+}
+
+
+def place_in(text: str) -> Optional[str]:
+    """The city named after in/at/for, as the tool wants it.
+
+    "" when the sentence names no place (home), the city when it is
+    capitalised, None when a lowercase candidate makes the answer unsure
+    ("in london" typed, "in a while") -- the caller then does not force."""
+    for m in _PLACE_RX.finditer(text or ""):
+        place = m.group("place").strip(" .,!?")
+        head = place.split()[0].lower().strip(".") if place else ""
+        if not head or head in _NOT_A_PLACE:
+            continue
+        if place[0].isupper():
+            return place
+        return None
+    return ""
+
+
+def calendar_range(text: str) -> str:
+    """coerce_range over the whole utterance, with one repair: "when's my
+    meeting" carries no day, and today is the wrong default for a "when"
+    question -- the first upcoming event is."""
+    from jarvis.tools.calendar import coerce_range
+    rng = coerce_range(text)
+    t = (text or "").lower()
+    if rng == "today" and re.match(r"^\s*when", t) and not re.search(
+            r"\btoday\b|tonight|this (?:morning|afternoon|evening)|later", t):
+        return "next"
+    return rng
+
+
+def weather_when(text: str) -> str:
+    """The weather tool's when= from the utterance. Explicit day words win;
+    a bare "forecast" is tomorrow-and-on, not this minute."""
+    t = (text or "").lower()
+    if "tomorrow" in t:
+        return "tomorrow"
+    if re.search(r"\bweek\b|7 day|seven day|weekend|next few days", t):
+        return "week"
+    if re.search(r"\btoday\b|tonight|this (?:evening|afternoon|morning)|"
+                 r"\blater\b|rest of the day", t):
+        return "today"
+    if "forecast" in t:
+        return "today"
+    return "now"
+
+
+def forced_call(reason: str, text: str) -> Optional[tuple]:
+    """(tool, args) when the router's reason names the tool and the
+    utterance carries its arguments; None to run the full tool loop."""
+    t = (text or "").strip()
+    if not t or _CLAUSE_RX.search(t):
+        return None
+    if reason == "local:calendar":
+        if not _CAL_READ_RX.search(t) or _CAL_WRITE_RX.search(t):
+            return None
+        return "get_calendar", {"range": calendar_range(t)}
+    if reason == "local:weather":
+        place = place_in(t)
+        if place is None:
+            return None
+        return "get_weather", {"when": weather_when(t), "location": place}
+    if reason == "local:clock":
+        # The home clock never gets here (Tier-1 _h_clock); what does is
+        # "the time in <city>" -- and "what year is it", which has no
+        # city and is left to the model.
+        place = place_in(t)
+        if not place:
+            return None
+        return "get_time", {"location": place}
+    return None
+
+
 class Commander:
     """Routes a user utterance (voice or typed) through the V3 pipeline:
 
@@ -2574,7 +2700,14 @@ class Commander:
                                      done=False)
             return CommandResult(handled=False, reply=text,
                                  status="No route (no brain)")
-        brain.chat(strip_address(text))
+        stripped = strip_address(text)
+        forced = forced_call(d.reason, stripped)
+        if forced is not None:
+            name, args = forced
+            log.info("route short-cut: %s(%s)", name, args)
+            brain.chat(stripped, force_tool=name, force_args=args)
+        else:
+            brain.chat(stripped)
         return CommandResult(handled=True, status="Thinking…", done=False)
 
     def _dispatch_action(self, d: RouteDecision) -> CommandResult:

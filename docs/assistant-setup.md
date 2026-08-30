@@ -526,6 +526,15 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
 
+## 18. Faster calendar, weather and time-in-city answers
+
+Nothing to set up. When the router already knows the tool — a read-only calendar
+question, a weather question, "what's the time in London" — the commander forces the
+tool call and only the render turn runs, so the answer lands ~1 s sooner. It stands
+down for a write ("book a meeting"), a second clause ("… and what's the weather") or a
+lowercase city, which take the full loop as before. Look for `route short-cut:` in the
+log.
+
 ---
 
 ## What Jarvis says when something is missing
