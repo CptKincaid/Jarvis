@@ -26,6 +26,7 @@ does NOT start it: the integrator starts it beside the timekeeper.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import threading
@@ -55,6 +56,16 @@ DEFAULT_INTERVAL_S = 30.0
 # Interpreter names that say nothing about the job; the first script /
 # module on the command line is the useful label ("python (train.py)").
 _INTERPRETERS = {"python", "python3", "node", "bash", "sh", "uv", "perl", "ruby"}
+# A trainer is recognised by what the interpreter runs, not by its size
+# (a small-batch run under hog_gb would never trip the hogs rule): train.py,
+# aiws_trainer.train, finetune_piper.py, "-m trainer" ... The check is a
+# word inside the hint, so "constraint.py" does not count.
+TRAINER_HINT_RX = re.compile(
+    r"(?:^|[^a-z])(?:train|trainer|training|pretrain|finetune|fine_tune|fine-tune|"
+    r"finetuning)(?:[^a-z]|$)", re.I)
+_TRAINER_NAMES = {"python", "python3", "uv", "accelerate", "torchrun", "deepspeed"}
+TRAINER_ABSENT_TICKS = 2           # ticks without the trainer before reclaiming
+DEFAULT_YIELD = False
 
 UNREADABLE_LINE = "I can't read the system counters, sir."
 WARN_LINE = "Memory is getting tight, sir: {free} gigabytes free{hogs}."
@@ -62,6 +73,9 @@ CRITICAL_LINE = ("Memory is critical, sir: {free} gigabytes free{hogs}. "
                  "I'd stop something before the box does.")
 HOGS_LINE = ("Two processes each hold more than {hog} gigabytes, sir: {hogs}. "
              "Last time that ended in a hard power-off.")
+LENT_LINE = ("I have lent the GPU to your trainer, sir; quick answers only "
+             "until it is done.")
+RECLAIMED_LINE = "Your trainer has finished, sir; I'm loading my model again."
 
 
 # ------------------------------------------------------------- config
@@ -274,6 +288,7 @@ class Snapshot:
     gpu: Optional[dict] = None
     disks: list[tuple[str, Optional[float]]] = field(default_factory=list)
     top: list[Proc] = field(default_factory=list)
+    trainers: list[Proc] = field(default_factory=list)   # by cmdline, any size
 
     @property
     def readable(self) -> bool:
@@ -303,6 +318,43 @@ def top_processes(n: int = TOP_N) -> list[Proc]:
     return out
 
 
+def is_trainer(argv: list[str]) -> bool:
+    """True when an interpreter's command line names a training job."""
+    hint = cmdline_hint(argv)
+    if hint:
+        return bool(TRAINER_HINT_RX.search(hint))
+    # torchrun / accelerate launch <script>: no interpreter prefix, so
+    # cmdline_hint has nothing to say; look at the launcher's first script.
+    if argv and os.path.basename(argv[0]).lower() in _TRAINER_NAMES:
+        return any(TRAINER_HINT_RX.search(os.path.basename(a)) for a in argv[1:]
+                   if not a.startswith("-"))
+    return False
+
+
+def find_trainers(self_pid: Optional[int] = None) -> list[Proc]:
+    """Every process whose command line looks like a trainer, largest first.
+    Only interpreter-named processes have their cmdline read (a few dozen
+    small files, not the whole table). Never raises."""
+    me = os.getpid() if self_pid is None else self_pid
+    out: list[Proc] = []
+    try:
+        for pid, name, rss_kb in iter_process_rss():
+            if pid == me or name.lower() not in _TRAINER_NAMES:
+                continue
+            try:
+                argv = read_cmdline(pid)
+            except Exception:  # noqa: BLE001
+                continue
+            if is_trainer(argv):
+                out.append(Proc(pid=pid, name=name, rss_gb=rss_kb / KB_PER_GB,
+                                hint=cmdline_hint(argv) or
+                                os.path.basename(argv[-1] if argv else "")))
+    except Exception:  # noqa: BLE001 - a bad /proc must not sink the tick
+        log.debug("trainer scan failed", exc_info=True)
+    out.sort(key=lambda p: -p.rss_gb)
+    return out
+
+
 def snapshot(gpu: bool = True) -> Snapshot:
     """Every probe, each failing on its own; never raises."""
     snap = Snapshot()
@@ -328,6 +380,7 @@ def snapshot(gpu: bool = True) -> Snapshot:
         except Exception:  # noqa: BLE001
             snap.disks.append((mount, None))
     snap.top = top_processes()
+    snap.trainers = find_trainers()
     return snap
 
 
@@ -424,7 +477,19 @@ class Watchdog:
 
     def __init__(self, cfg=None, speak: Optional[Callable[[str], None]] = None,
                  services=None, publish: Optional[Callable] = None,
-                 interval: Optional[float] = None):
+                 interval: Optional[float] = None, brain=None):
+        # GPU yield (health.yield_to_trainer): ``brain`` is anything with
+        # release() / reclaim() / is_lent(); None means jarvis.brain itself,
+        # imported at fire time (tests pass a fake).
+        self.yield_to_trainer = bool(_cfg_get(cfg, "health.yield_to_trainer",
+                                              DEFAULT_YIELD))
+        self._brain_obj = brain
+        self._lent_to: Optional[int] = None      # trainer pid the model is lent to
+        self._absent_ticks = 0
+        # pids the user took the GPU back from ("take the GPU back" while the
+        # run continues): never lend to those again, or the next tick would
+        # undo a spoken order
+        self._held: set[int] = set()
         self.warn_gb = _cfg_float(cfg, "health.warn_gb", DEFAULT_WARN_GB)
         # A critical threshold above warn would fire "critical" first and
         # swallow the warning; clamp so the ladder always runs warn -> critical.
@@ -485,9 +550,81 @@ class Watchdog:
             # not re-speak "last time that ended in a hard power-off" every
             # other tick.
             self._hogs_alerted = False
+        if self.yield_to_trainer:
+            self._trainer_rule(snap, fired)
         for alert in fired:
             self._fire(alert)
         return fired
+
+    # ---------------------------------------------------- trainer yield
+    def _brain(self):
+        if self._brain_obj is None:
+            from jarvis import brain as brain_mod   # late: brain imports tools
+            self._brain_obj = brain_mod
+        return self._brain_obj
+
+    @property
+    def lent_to(self) -> Optional[int]:
+        """The trainer pid the model is currently lent to (None when not)."""
+        return self._lent_to
+
+    def _trainer_rule(self, snap: Snapshot, fired: list) -> None:
+        """Lend the model when a trainer appears; take it back once the
+        trainer has been gone for TRAINER_ABSENT_TICKS ticks (a run that
+        restarts between epochs must not cost a 7 s reload each time)."""
+        trainers = [p for p in (snap.trainers or []) if p.pid not in self._held]
+        present = {p.pid for p in trainers}
+        # forget a held pid once it is really gone, so a later run can lend
+        self._held &= {p.pid for p in (snap.trainers or [])}
+        if self._lent_to is None:
+            if not trainers:
+                return
+            lead = trainers[0]
+            try:
+                ok = self._brain().release(reason=f"trainer pid {lead.pid} {lead.hint}")
+            except Exception:  # noqa: BLE001
+                log.exception("health watchdog: brain.release failed")
+                return
+            self._lent_to = lead.pid
+            self._absent_ticks = 0
+            fired.append(Alert(kind="warn", line=LENT_LINE,
+                               status=f"GPU lent to {lead.hint or lead.name}"
+                                      f"{'' if ok else ' (unload failed)'}",
+                               rule="trainer"))
+            return
+        if self._lent_to in present or present:
+            # the lent-to run continues, or another trainer took over: keep
+            # the GPU lent, and follow the newest occupant
+            if self._lent_to not in present:
+                self._lent_to = trainers[0].pid
+            self._absent_ticks = 0
+            return
+        self._absent_ticks += 1
+        if self._absent_ticks < TRAINER_ABSENT_TICKS:
+            return
+        try:
+            ok = self._brain().reclaim()
+        except Exception:  # noqa: BLE001
+            log.exception("health watchdog: brain.reclaim failed")
+            ok = False
+        self._lent_to = None
+        self._absent_ticks = 0
+        fired.append(Alert(kind="ok" if ok else "warn", line=RECLAIMED_LINE,
+                           status="GPU reclaimed" if ok else "GPU reclaimed; model failed to load",
+                           rule="trainer"))
+
+    def manual_reclaim(self) -> bool:
+        """"Take the GPU back": reclaim now and hold off the trainer rule
+        for the run that is still going. Returns the warm-up verdict."""
+        if self._lent_to is not None:
+            self._held.add(self._lent_to)
+        self._lent_to = None
+        self._absent_ticks = 0
+        try:
+            return bool(self._brain().reclaim())
+        except Exception:  # noqa: BLE001
+            log.exception("health watchdog: manual reclaim failed")
+            return False
 
     def _fire(self, alert: Alert) -> None:
         log.warning("health watchdog [%s/%s]: %s", alert.rule, alert.kind, alert.status)

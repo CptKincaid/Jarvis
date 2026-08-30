@@ -97,7 +97,12 @@ DEFAULTS: dict = {
              "max_files": 500, "embed_model": "nomic-embed-text",
              "ollama_url": "http://localhost:11434"},
     "screen": {"model": "llama3.2-vision:latest", "max_width": 1280},
-    "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30},
+    # yield_to_trainer: when a training process appears, unload the local
+    # model (brain.release) and speak the lent line; reload once the trainer
+    # is gone for two ticks. Off by default: every tool answer runs through
+    # the local model, so a multi-hour run leaves Jarvis with Tier 1 only.
+    "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30,
+               "yield_to_trainer": False},
     "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],
