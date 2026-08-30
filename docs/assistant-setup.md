@@ -481,6 +481,38 @@ Then: *"what's due this week?"*, *"any new grades?"*, *"any announcements?"*,
 *"when's the biosensors midterm?"* The token is redacted from every log and repr. Unset:
 "I'll need a Canvas access token set up, sir; the notes are in docs/assistant-setup.md."
 
+### Deadlines in the briefing, and a heads-up before each one
+
+With the token set, the briefing gains a **Due** section (the next two days: *"Due:
+Lab 3 report for BIOSENSORS today 11:59 pm; Quiz 2 for CIRCUITS tomorrow 5:00 pm"*) and,
+a few hours before every Canvas deadline, Jarvis says so unprompted, the way he does for
+meetings — *"Sir, this is your reminder. Lab 3 report for BIOSENSORS is due in 3 hours."*
+
+```json
+"canvas": {"base_url": "https://canvas.tamu.edu", "token": "<paste the token>",
+           "heads_up_hours": 3}
+```
+
+`heads_up_hours` is the lead (the meeting heads-up's ten minutes is no use for an 11:59 pm
+deadline). He checks Canvas every fifteen minutes and files each reminder only once its
+time is near, so work you hand in during the day is never announced; a restart never
+repeats one (`~/.aiws_trainer/jarvis_memory/deadlines_state.json`). Without a token all of
+this is silent: no Due line in the briefing, no nagging about the missing token.
+
+### Exams: "when's my next exam?"
+
+*"When's my next exam?"*, *"when is my next quiz"*, *"how long until the biosensors
+midterm?"*, *"how many days until my final?"* are answered instantly, without the model,
+from Canvas (30 days ahead) merged with the calendar cache (14 days) — so the calendar half
+works before the token exists, and an exam that only the iCloud "Canvas" subscription
+carries is found too. Anything titled exam / midterm / final is an exam, a quiz is a quiz;
+*"next exam"* never answers with a quiz, and *"final"* / *"midterm"* must be in the title.
+The briefing adds an **Exam** countdown (*"Midterm 1 for BIOSENSORS, in 6 days, Tuesday at
+9:00 am"*), and at 7 pm the evening before he says *"Midterm 1 for BIOSENSORS is tomorrow
+at 9:00 am"*. With Canvas read and nothing found: *"Nothing that looks like an exam on the
+books, sir."* With no token and nothing on the calendar the question goes to the model,
+which reaches `canvas_due` and its setup line.
+
 ## 14. Your own documents (fully local)
 
 Drop PDFs, `.txt`, `.md` or `.docx` into **`~/Documents/Jarvis Docs`** (or list folders in
@@ -521,6 +553,9 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 - **First-wake briefing** — after the first thing you say each day past `briefing.after`
   (06:00) he gives the briefing; `briefing.on_first_wake` turns it off.
 - **Meeting heads-up** — "BIOSENSORS in ten minutes, sir" (`calendar.heads_up_min`).
+- **Deadline heads-up** — "Lab 3 report for BIOSENSORS is due in 3 hours"
+  (`canvas.heads_up_hours`; needs the Canvas token, §13) and, at 7 pm, "Midterm 1 for
+  BIOSENSORS is tomorrow at 9:00 am" for anything exam-like on Canvas or the calendar.
 - **Guests** — a clear wake word in another voice gets "I only answer to Hunter, sir."
 - **He learns your voice** — a confident match joins the voiceprint (at most every 10 min).
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
