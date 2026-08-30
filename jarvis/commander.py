@@ -1991,6 +1991,11 @@ class Commander:
             if self._try_desktop(cmd_text):
                 return CommandResult(handled=True, status="Desktop command",
                                      done=False)
+            # 3a. User-defined phrases from assistant.json, BEFORE the
+            #     built-in registry so a personal shortcut can shadow one.
+            res = self._try_custom_phrase(cmd_text)
+            if res is not None:
+                return res
             # 3. Quick/registry commands (2637-2640 → 3036-3485)
             res = self._try_registry(cmd_text)
             if res is not None:
@@ -2064,6 +2069,80 @@ class Commander:
             kind="busy"))
         self._bg(lambda: desktop.execute_actions(actions))
         return True
+
+    @staticmethod
+    def _phrase_key(text: str) -> str:
+        """Lowercase, punctuation-free, single-spaced -- so "Drop my
+        needle!" and "drop my needle" are the same phrase."""
+        return " ".join(
+            "".join(c for c in str(text).lower() if c.isalnum() or c.isspace())
+            .split())
+
+    def _try_custom_phrase(self, cmd_text: str) -> Optional[CommandResult]:
+        """User-defined phrase -> tool call, from assistant.json.
+
+        Deliberately ahead of the intent classifier and the local model: a
+        personal shortcut should not depend on an LLM parsing it, should not
+        cost a model round-trip, and should behave identically every time.
+
+            "phrases": [
+              {"say": "drop my needle",
+               "tool": "spotify_play",
+               "args": {"query": "..."},
+               "reply": "Dropping the needle, sir."}
+            ]
+
+        `say` may be a string or a list of alternatives. Longest phrase wins,
+        so a more specific shortcut beats a shorter one that is a prefix of
+        it. Unknown tools and handler failures degrade to a spoken apology
+        rather than silence -- the user said something they expect to work.
+        """
+        assistant = self._svc("assistant")
+        tools = self._svc("tools")
+        if assistant is None or tools is None:
+            return None
+        try:
+            entries = assistant.get("phrases") or []
+        except Exception:
+            log.debug("phrases lookup failed", exc_info=True)
+            return None
+        if not isinstance(entries, (list, tuple)):
+            return None
+
+        said = self._phrase_key(cmd_text)
+        if not said:
+            return None
+
+        best = None
+        for entry in entries:
+            if not isinstance(entry, dict) or not entry.get("tool"):
+                continue
+            says = entry.get("say")
+            says = [says] if isinstance(says, str) else (says or [])
+            for phrase in says:
+                key = self._phrase_key(phrase)
+                if key and key in said:
+                    if best is None or len(key) > best[0]:
+                        best = (len(key), entry)
+        if best is None:
+            return None
+
+        entry = best[1]
+        name = str(entry["tool"])
+        args = entry.get("args") if isinstance(entry.get("args"), dict) else {}
+        log.info("custom phrase -> %s(%s)", name, args)
+        try:
+            res = tools.call(name, dict(args))
+        except Exception:
+            log.exception("custom phrase tool %s failed", name)
+            return CommandResult(handled=True, speak=True,
+                                 reply="That shortcut failed, sir.",
+                                 status="phrase failed")
+        reply = entry.get("reply") or getattr(res, "speak", None) \
+            or getattr(res, "text", None) or ""
+        ok = getattr(res, "ok", True)
+        return CommandResult(handled=True, reply=str(reply), speak=bool(reply),
+                             status=name if ok else f"{name} failed")
 
     def _try_registry(self, cmd_text: str) -> Optional[CommandResult]:
         for cmd in REGISTRY:
