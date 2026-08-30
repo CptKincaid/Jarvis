@@ -115,6 +115,7 @@ def _recorder(endpointer, rate=16000):
     rec._audio_frames = []
     rec._stop_endpoint, rec._stop_dead_air = "", None
     rec._voice_stopped = False
+    rec._followup = False
     rec.stops = []
 
     def stop(reason="manual", endpoint="", dead_air=None):

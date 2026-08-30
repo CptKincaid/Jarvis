@@ -1231,3 +1231,16 @@ def test_an_ack_disarms_the_thinking_filler_but_not_the_watchdog(build, monkeypa
         assert app._turn_watchdog is not None and app._turn_watchdog.is_alive()
     finally:
         app._turn_cancel_timers()
+
+
+def test_the_app_report_is_built_from_real_sources(build, tmp_path, monkeypatch):  # noqa: E501
+    from jarvis.config import PATHS
+    app = build()
+    monkeypatch.setattr(PATHS, "LOG_DIR", tmp_path)
+    (tmp_path / "turns.jsonl").write_text(
+        '{"outcome": "audio", "wait": 1.3, "at": %f}\n{"outcome": "audio", "wait": 2.1, "at": %f}\n'
+        % (__import__("time").time(), __import__("time").time()))
+    text = app.diagnostics_text()
+    assert text.startswith("All systems nominal, sir.")
+    assert "2 turns today, median wait 1.7 seconds" in text
+    assert "gigabytes free" in text

@@ -93,6 +93,26 @@ class ToolRegistry:
     def schemas(self) -> list[dict]:
         return [t.schema() for t in self._tools.values()]
 
+    def set_cues(self, cues: dict) -> None:
+        """name -> tuple of compiled regexes (see jarvis/tools/cues.py)."""
+        self._cues = dict(cues or {})
+
+    def schemas_for(self, text: str) -> list[dict]:
+        """The schemas that ride in ONE model turn: the core set, every tool
+        with no cue entry, and every tool whose cues match ``text``. Falls
+        back to schemas() when no cues were installed."""
+        cues = getattr(self, "_cues", None)
+        if not cues:
+            return self.schemas()
+        from jarvis.tools.cues import CORE
+        text = text or ""
+        chosen = []
+        for name, spec in self._tools.items():
+            rx = cues.get(name)
+            if name in CORE or rx is None or any(r.search(text) for r in rx):
+                chosen.append(spec.schema())
+        return chosen
+
     def __len__(self) -> int:
         return len(self._tools)
 

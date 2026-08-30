@@ -522,11 +522,11 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
     return payload
 
 
-def _registry_schemas(registry):
+def _registry_schemas(registry, text=None):
     if registry is None:
         return []
     try:
-        return registry.schemas()
+        return (registry.schemas_for(text) if text is not None and hasattr(registry, 'schemas_for') else registry.schemas())
     except Exception:
         log.exception("tool registry schemas failed")
         return []
@@ -1249,7 +1249,7 @@ class JarvisBrain:
         messages = [{"role": "system", "content": static_system()},
                     {"role": "user",
                      "content": build_user_turn(ctx_text, mem_text, text)}]
-        tools = _registry_schemas(registry)
+        tools = _registry_schemas(registry, text)
         started = time.monotonic()
         deadline = started + CHAT_WALL_BUDGET_S
         cap = MAX_SPOKEN_SENTENCES

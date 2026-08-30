@@ -44,6 +44,9 @@ class ContextEngine:
     """Builds rich context snapshots for AI tiers."""
 
     CACHE_TTL = 30  # seconds
+    # Exchanges older than this are not shown to the model: "what about
+    # tomorrow?" refers to the last minute, not to this morning.
+    CONVERSATION_TTL_S = 10 * 60
 
     def __init__(self, project_dir=None, vss_dir=None, memory=None):
         self._cache = {}
@@ -74,7 +77,7 @@ class ContextEngine:
         if detail in ("standard", "full"):
             ctx["git"] = self._get_git_state()
             ctx["recent_files"] = self._get_recent_files()
-            ctx["conversation"] = self._conversation[-10:]
+            ctx["conversation"] = self._recent_conversation()
             ctx["sessions"] = self._get_sessions()
 
         if detail == "full":
@@ -89,10 +92,22 @@ class ContextEngine:
         """Record a conversation exchange for context."""
         self._conversation.append({
             "time": datetime.now().isoformat(),
-            "user": user_text[:200],
+            "user": (user_text or "")[:200],
             "jarvis": jarvis_response[:200] if jarvis_response else "",
         })
         self._conversation = self._conversation[-20:]
+
+    def _recent_conversation(self, limit=10):
+        """The last exchanges that are still fresh (CONVERSATION_TTL_S)."""
+        cutoff = datetime.now().timestamp() - self.CONVERSATION_TTL_S
+        fresh = []
+        for e in self._conversation[-limit:]:
+            try:
+                if datetime.fromisoformat(e["time"]).timestamp() >= cutoff:
+                    fresh.append(e)
+            except (KeyError, ValueError):
+                continue
+        return fresh
 
     def format_for_prompt(self, ctx, spoken=False):
         """Format context dict into text for LLM prompt injection.
@@ -108,6 +123,18 @@ class ContextEngine:
         nothing for the model to recite ("brain.py, tts.py, ...").
         """
         parts = [f"Current time: {ctx['time']}"]
+        # Gathered since V3 but never rendered -- and recorded with the user's
+        # side blank -- so the model had never seen a previous exchange and
+        # "what about tomorrow?" could not follow a calendar question.
+        convo = [e for e in (ctx.get("conversation") or []) if e.get("user") or e.get("jarvis")]
+        if convo:
+            lines = ["Recent conversation (newest last; answer follow-ups in its light):"]
+            for e in convo[-4:]:
+                if e.get("user"):
+                    lines.append(f"  User: {e['user']}")
+                if e.get("jarvis"):
+                    lines.append(f"  Jarvis: {e['jarvis']}")
+            parts.append("\n".join(lines))
 
         if ctx.get("active_window"):
             parts.append(f"Active window: {ctx['active_window']}")

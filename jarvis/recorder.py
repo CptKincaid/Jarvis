@@ -219,6 +219,7 @@ class Recorder:
         # the model is warm. None -> the energy timer alone ends captures.
         self.endpointer = None
         self._ep_cursor = 0                      # frames already fed to it
+        self._followup = False                   # opened without a wake word
         self._stop_endpoint = ""                 # what ended the last capture
         self._stop_dead_air = None               # ...and how long it waited
 
@@ -304,8 +305,13 @@ class Recorder:
         return resampled
 
     # -- session control -------------------------------------------------
-    def start(self):
-        """Begin a recording session. No-op (with warn Status) when no mic."""
+    def start(self, followup: bool = False):
+        """Begin a recording session. No-op (with warn Status) when no mic.
+
+        ``followup=True`` opens the mic without a wake word right after a
+        reply: if the VAD hears no speech within CONFIG.followup_window the
+        session is aborted quietly (no "No audio captured", no transcript).
+        """
         import_err = None
         if not self.mic_available:
             self._publish_mic_state()
@@ -353,6 +359,7 @@ class Recorder:
         self.last_audio = None
         self._ep_cursor = 0
         self._stop_endpoint, self._stop_dead_air = "", None
+        self._followup = bool(followup)
         if self.endpointer is not None:
             try:
                 self.endpointer.reset()
@@ -665,7 +672,15 @@ class Recorder:
                 self.endpointer = None
                 return False
         gap = ep.silence_since_speech
-        if gap is None or gap < CONFIG.endpoint_silence:
+        if gap is None:
+            if self._followup and self._record_start_time and \
+                    (time.monotonic() - self._record_start_time) >= CONFIG.followup_window:
+                log.info("follow-up: nothing said in %.1fs; closing quietly",
+                         CONFIG.followup_window)
+                self.abort()
+                return True
+            return False
+        if gap < CONFIG.endpoint_silence:
             return False
         if self._record_start_time and \
                 (time.monotonic() - self._record_start_time) < CONFIG.silence_grace:

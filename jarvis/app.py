@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import importlib
 import json
+from datetime import datetime
 import os
 import re
 import subprocess
@@ -114,6 +115,8 @@ THINKING_LINES = [
 # answer immediately queued behind it. The extra second moves the filler clear
 # of the common case, leaving it for lookups that are genuinely slow.
 THINKING_DELAY_S = 4.5
+SAY_AGAIN_LINE = "Say that again, sir?"
+GUEST_LINE = "I only answer to {name}, sir."
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
 _YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "aye", "allow",
@@ -153,6 +156,14 @@ def _import_optional(modname: str):
         log.exception("assistant module %s failed to import; running without it",
                       modname)
         return None
+
+
+def _brain_model_name() -> str:
+    try:
+        from jarvis.brain import OLLAMA_MODEL
+        return str(OLLAMA_MODEL).split(":")[0]
+    except Exception:
+        return "the local model"
 
 
 class JarvisApp:
@@ -201,7 +212,7 @@ class JarvisApp:
         # speaker= gates the wake word itself: a non-enrolled voice never
         # reaches _on_hotword, so the TV no longer opens a recording at all.
         self.hotword = Hotword(self.arbiter, self._mic_index, self._on_hotword,
-                               speaker=self.speaker)
+                               speaker=self.speaker, on_guest=self._on_guest)
 
         # ---- actions ------------------------------------------------------
         self.desktop = desktop_mod.DesktopControl()
@@ -252,6 +263,7 @@ class JarvisApp:
         self._turn_watchdog = None
 
         self._wire_turn_clock()
+        self._init_assistant_state()
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
         bus.subscribe(RecordingStarted, self._on_recording_started)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
@@ -370,6 +382,7 @@ class JarvisApp:
         speech cache at startup so they play instantly."""
         phrases = [p for lines in COURTESY_REPLIES.values() for p in lines]
         phrases += list(THINKING_LINES)
+        phrases += [SAY_AGAIN_LINE, self._guest_line]
         phrases += [CONTINUE_PROMPT, "Very good, sir.",
                     "I haven't said anything yet, sir.",
                     "The clipboard is empty, sir.",
@@ -525,6 +538,7 @@ class JarvisApp:
             # news cache path.
             calendar=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
+            diagnostics=self.diagnostics_text,
         )
 
     # ------------------------------------------------------- brain executor
@@ -559,7 +573,9 @@ class JarvisApp:
                     else:
                         bus.publish(JarvisReply(text=content, speak=True))
                     self._say(content)
-                    self.context.add_exchange("", content)
+                    self.context.add_exchange(self._last_user_text, content)
+                    if self._last_source == "voice":
+                        self._followup_after_speech = True
                 elif tag == "BRIEFING":
                     pass                               # consumed by the SPEAK
                 elif tag == "RUN":
@@ -578,7 +594,7 @@ class JarvisApp:
                     # Protocol: "[DONE] text — task complete, speak this"
                     bus.publish(JarvisReply(text=content, speak=True))
                     self._say(content)
-                    self.context.add_exchange("", content)
+                    self.context.add_exchange(self._last_user_text, content)
                 # SILENT (and bare DONE): nothing to do
             except Exception:
                 log.exception("brain tag %s failed", tag)
@@ -844,6 +860,13 @@ class JarvisApp:
                                kind="warn"))
             return
         self.turns.mark("wake")            # accepted: this turn starts now
+        self._followup_after_speech = False   # a wake supersedes any follow-up
+        if CONFIG.barge_in and getattr(self, "_tts_active", False):
+            # "Jarvis, stop" mid-reply: cut the speech first, then listen.
+            try:
+                self.interrupt_speech()
+            except Exception:
+                log.exception("barge-in interrupt failed")
         if CONFIG.sound:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
         # The wake word ends and the user starts talking straight away, so
@@ -930,6 +953,181 @@ class JarvisApp:
         except Exception:
             log.exception("endpointer unavailable; energy timer only")
 
+    # --------------------------------------------------- assistant state
+    def _init_assistant_state(self):
+        self._app_started = time.monotonic()
+        self._last_user_text, self._last_source = "", "voice"
+        self._followup_after_speech = False   # arm a wake-word-free listen
+        self._briefing_pending = False        # first wake of the day
+        self._last_guest_ts = 0.0
+        self._last_learn_ts = 0.0
+        name = self.assistant.user_name if self.assistant is not None else "Hunter"
+        self._guest_line = GUEST_LINE.format(name=name)
+
+    def _after_dispatch(self, text, source, result):
+        """Bookkeeping once a command has been handled synchronously."""
+        reply = getattr(result, "reply", None)
+        done = getattr(result, "done", True) is not False
+        if reply and done and not getattr(result, "ack", False):
+            self.context.add_exchange(text, reply)
+            if source == "voice" and result.speak and CONFIG.talkback:
+                self._followup_after_speech = True
+        if source == "voice":
+            if (result.status or "").startswith("Briefing"):
+                self._mark_briefing_delivered()
+            elif self._briefing_due():
+                self._briefing_pending = True
+
+    def _after_speech(self):
+        """Jarvis just finished a spoken burst: deliver a pending first-wake
+        briefing, else open the follow-up window."""
+        if self._briefing_pending:
+            self._briefing_pending = False
+            self._followup_after_speech = False
+            self._deliver_first_wake_briefing()
+            return
+        if self._followup_after_speech:
+            self._followup_after_speech = False
+            self._start_followup()
+
+    def _start_followup(self):
+        """Listen for a follow-up without the wake word (CONFIG.followup_window)."""
+        if CONFIG.followup_window <= 0 or not MACHINE.has_mic:
+            return
+        if self.recorder.endpointer is None:
+            return                      # without a VAD nothing can say "nothing was said"
+        if self.recorder.recording or self._audio_busy.is_set() or self._turn_busy.is_set():
+            return
+        log.info("follow-up window: listening %.1fs without a wake word", CONFIG.followup_window)
+        threading.Timer(0.15, lambda: self.recorder.start(followup=True)).start()
+
+    # ---------------------------------------------------- guests, learning
+    def _on_guest(self, score):
+        """A clear wake word in a voice that is not the enrolled one."""
+        if score < 0.85 or not CONFIG.talkback:
+            return
+        now = time.monotonic()
+        if now - self._last_guest_ts < 180.0:
+            return
+        self._last_guest_ts = now
+        log.info("guest wake (score=%.2f): declining politely", score)
+        self._say(self._guest_line)
+
+    def _maybe_learn_voice(self, audio, stats):
+        """Passive enrolment: an accepted utterance that matched the
+        voiceprint comfortably joins the pool, at most once every ten
+        minutes, so recognition tracks distance, colds and time of day.
+        add_sample() re-checks the score and refuses a pre-trim pool."""
+        try:
+            scores = list(stats.get("scores") or [])
+            if not scores or not CONFIG.speaker_verify:
+                return
+            if max(scores) < max(CONFIG.speaker_threshold + 0.2, 0.55):
+                return
+            if len(audio) < int(SAMPLE_RATE * 1.5):
+                return
+            now = time.monotonic()
+            if now - self._last_learn_ts < 600.0:
+                return
+            self._last_learn_ts = now
+            threading.Thread(target=self.speaker.add_sample, args=(audio,),
+                             daemon=True, name="voice-learn").start()
+        except Exception:
+            log.debug("passive learning skipped", exc_info=True)
+
+    # ------------------------------------------------- first-wake briefing
+    def _briefing_state_path(self):
+        return PATHS.AIWS / "briefing_state.json"
+
+    def _briefing_due(self, now=None):
+        try:
+            if not self.assistant.get("briefing.on_first_wake", True):
+                return False
+            after = str(self.assistant.get("briefing.after", "06:00") or "06:00")
+            hh, mm = (int(x) for x in after.split(":")[:2])
+        except Exception:
+            return False
+        now = now or datetime.now()
+        if (now.hour, now.minute) < (hh, mm):
+            return False
+        try:
+            state = json.loads(self._briefing_state_path().read_text())
+        except (OSError, ValueError):
+            state = {}
+        return state.get("delivered") != now.date().isoformat()
+
+    def _mark_briefing_delivered(self):
+        try:
+            p = self._briefing_state_path()
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(json.dumps({"delivered": datetime.now().date().isoformat()}))
+        except OSError:
+            log.debug("briefing state save failed", exc_info=True)
+
+    def _deliver_first_wake_briefing(self):
+        brain = getattr(self.services, "brain", None)
+        if brain is None or not hasattr(brain, "chat"):
+            return
+        self._mark_briefing_delivered()
+        log.info("first wake of the day: delivering the briefing")
+        self._say("Your briefing for today, sir.")
+        try:
+            brain.chat("my morning briefing", force_tool="get_briefing")
+        except Exception:
+            log.exception("first-wake briefing failed")
+
+    # ------------------------------------------------------- diagnostics
+    def diagnostics_text(self) -> str:
+        """"Run diagnostics": a spoken status in character, from real data."""
+        import statistics
+        import subprocess
+        parts = []
+        up = time.monotonic() - getattr(self, "_app_started", time.monotonic())
+        hours, mins = int(up // 3600), int((up % 3600) // 60)
+        uptime = (f"{hours} hour{'s' if hours != 1 else ''} and {mins} minute{'s' if mins != 1 else ''}"
+                  if hours else f"{mins} minute{'s' if mins != 1 else ''}")
+        engine = getattr(self.tts, "engine", CONFIG.tts_engine)
+        parts.append(f"All systems nominal, sir. Up {uptime}; whisper {CONFIG.model} on the GPU, "
+                     f"{_brain_model_name()} answering, {engine} speaking"
+                     f"{', voice-activity endpointing live' if self.recorder.endpointer else ''}.")
+        try:
+            waits, n = [], 0
+            day = datetime.now().date()
+            for line in (PATHS.LOG_DIR / "turns.jsonl").read_text().splitlines():
+                rec = json.loads(line)
+                if datetime.fromtimestamp(rec.get("at", 0)).date() != day:
+                    continue
+                n += 1
+                if rec.get("wait") is not None:
+                    waits.append(rec["wait"])
+            if n:
+                med = f", median wait {statistics.median(waits):.1f} seconds" if waits else ""
+                parts.append(f"{n} turn{'s' if n != 1 else ''} today{med}.")
+        except (OSError, ValueError):
+            pass
+        try:
+            mem = {}
+            for line in open("/proc/meminfo"):
+                k, v = line.split(":", 1)
+                mem[k] = int(v.split()[0])
+            free = mem["MemAvailable"] / 1048576
+            total = mem["MemTotal"] / 1048576
+            gpu = ""
+            try:
+                out = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu",
+                                      "--format=csv,noheader"], capture_output=True,
+                                     text=True, timeout=2).stdout.strip()
+                if out and out[0].isdigit():
+                    gpu = f", GPU at {out.split()[0]} degrees"
+            except Exception:
+                pass
+            parts.append(f"Memory {free:.0f} of {total:.0f} gigabytes free{gpu}.")
+        except Exception:
+            pass
+        if self.speaker is not None and self.speaker.enrolled:
+            parts.append(f"Your voiceprint holds {self.speaker.num_samples} samples.")
+        return " ".join(parts)
+
     # ------------------------------------------------------- turn ledger
     def _wire_turn_clock(self):
         """One "turn:" line per voice turn (jarvis/turnclock.py). Marks read
@@ -966,7 +1164,11 @@ class JarvisApp:
         # playing must not be closed by those ticks. A filler line ("Looking
         # into it now, sir") is speech but not the answer.
         was, self._tts_active = self._tts_active, ev.active
-        if not ev.active or was:
+        if not ev.active:
+            if was:
+                self._after_speech()
+            return
+        if was:
             return
         if self._turn_filler_pending:
             self._turn_filler_pending = False
@@ -996,6 +1198,7 @@ class JarvisApp:
                          daemon=True).start()
 
     def _process_audio(self, audio):
+        stats = {}
         try:
             if CONFIG.speaker_verify and self.speaker.enrolled:
                 filtered, stats = self.speaker.filter_segments(audio)
@@ -1013,8 +1216,16 @@ class JarvisApp:
                 reject_reason="" if result.accepted else "confidence"))
             text = result.text.strip()
             if result.accepted and text:
+                self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))
                 self._dispatch(text, "voice")
+            elif not result.accepted and text:
+                # Garbled, not silent: say so and re-open the mic rather
+                # than routing "by Agenda 4.2.6" or going quiet.
+                log.info("low confidence (%.2f): %r -> asking again",
+                         result.confidence, text)
+                self._say(SAY_AGAIN_LINE)
+                self._followup_after_speech = True
         except Exception:
             log.exception("audio processing failed")
             bus.publish(Status(text="Transcription failed", kind="error"))
@@ -1053,6 +1264,7 @@ class JarvisApp:
     def _dispatch(self, text, source):
         # Voice only: a typed answer is visible as it arrives, so being told to
         # wait is just noise.
+        self._last_user_text, self._last_source = text, source
         if source == "voice":
             self._turn_start()
             self.turns.mark("handle")
@@ -1060,6 +1272,7 @@ class JarvisApp:
             result = self._emit_result(self.commander.handle(text, source))
             if source == "voice":
                 self._turn_after_result(result)
+            self._after_dispatch(text, source, result)
         except Exception:
             self._turn_finished()
             raise
@@ -1280,6 +1493,16 @@ class JarvisApp:
                 cal.start()
             except Exception:
                 log.exception("calendar refresh start failed")
+        try:
+            from jarvis.headsup import MeetingHeadsUp
+            lead = int(self.assistant.get("calendar.heads_up_min", 10) or 10)
+            self.headsup = MeetingHeadsUp(lambda: getattr(self.services, "calendar", None),
+                                          self.timekeeper, lead_min=lead,
+                                          state_path=PATHS.AIWS / "headsup_state.json")
+            if self.timekeeper is not None:
+                self.headsup.start()
+        except Exception:
+            log.exception("meeting heads-up failed to start")
         if residency:
             try:
                 # boot warm-up on its own daemon thread, then every 5 min

@@ -160,11 +160,12 @@ class Hotword:
                                  # measured near 0.0, leaving ample room.
 
     def __init__(self, arbiter, get_mic_index: Callable, on_detect: Callable,
-                 speaker=None):
+                 speaker=None, on_guest: Callable = None):
         """arbiter: jarvis.recorder.MicArbiter (or None for standalone use).
         get_mic_index: () -> int | None (sounddevice input device index).
         on_detect: (score: float) -> None, called from the listener thread.
         """
+        self._on_guest = on_guest
         self._arbiter = arbiter
         self._get_mic_index = get_mic_index
         self._on_detect = on_detect
@@ -429,6 +430,11 @@ class Hotword:
             if not self._speaker_ok(utterance, native_rate):
                 log.info("Hotword suppressed (score=%.3f): not the enrolled "
                          "speaker", score)
+                if self._on_guest is not None:
+                    try:
+                        self._on_guest(float(score))   # a guest, politely
+                    except Exception:
+                        log.exception("on_guest callback failed")
                 time.sleep(0.5)      # shorter than a real wake's debounce
                 continue
 

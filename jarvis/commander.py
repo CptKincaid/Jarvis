@@ -1401,6 +1401,24 @@ _MAIL_WRITE_RX = re.compile(
     r"newest|most recent)\b", re.I)
 
 
+_DIAG_RX = re.compile(
+    r"^(?:run (?:a |the )?)?(?:diagnostics?|self[- ]test|system (?:report|check|status)|"
+    r"status report|how are your systems)\W*$", re.I)
+
+
+def _h_diagnostics(c, t, m):
+    """The film's "run diagnostics": uptime, models, today's turns, the box."""
+    fn = c._svc("diagnostics")
+    if fn is None:
+        return None
+    try:
+        line = fn()
+    except Exception:
+        log.exception("diagnostics failed")
+        line = "I'm afraid the diagnostics didn't complete, sir."
+    return CommandResult(handled=True, reply=line, speak=True, status="Diagnostics")
+
+
 def _h_last_mail(c, t, m):
     if _MAIL_WRITE_RX.search(t):
         return None
@@ -1809,6 +1827,7 @@ REGISTRY: list[Command] = [
     Command("briefing", _BRIEFING_RX.match, _h_briefing, needs=("brain",)),
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
+    Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
     # After the briefing: "good morning" is a briefing trigger first.
     Command("greeting", greeting_kind, _h_greeting),
     Command("good night",
@@ -1882,7 +1901,7 @@ REGISTRY: list[Command] = [
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
-                    "briefing", "last mail", "greeting", "todo done", "todo add",
+                    "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me")
 ]

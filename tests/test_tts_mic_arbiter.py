@@ -27,6 +27,13 @@ import pytest
 from jarvis.recorder import MicArbiter
 from jarvis.tts import TTS
 
+@pytest.fixture(autouse=True)
+def _no_barge_in(monkeypatch):
+    """These pin the pause-while-speaking contract; with barge_in on (the
+    default since 2026-08-30) the wake word deliberately stays live."""
+    import jarvis.tts as _tts
+    monkeypatch.setattr(_tts.CONFIG, "barge_in", False)
+
 
 def wait_until(pred, timeout=3.0):
     deadline = time.time() + timeout

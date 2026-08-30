@@ -109,6 +109,13 @@ class Config:
     # you off, lower it if the wait after a question feels long.
     endpoint_vad: bool = True
     endpoint_silence: float = 0.8
+    # After Jarvis answers, keep listening this long for a follow-up with no
+    # wake word ("...and Tuesday?"). Needs the VAD (it must know that nothing
+    # was said); 0 turns it off. Every follow-up is still speaker-verified.
+    followup_window: float = 4.0
+    # Barge-in: keep the wake word live while Jarvis speaks so "Jarvis, stop"
+    # cuts him off. The speaker gate keeps his own voice from waking him.
+    barge_in: bool = True
     noise_threshold: float = 0.015
     window_geometry: str = ""
 

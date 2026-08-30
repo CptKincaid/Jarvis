@@ -33,8 +33,10 @@ SAMPLE_RATE = 16000
 STREAMING_INTERVAL = 2.0
 
 # Confidence gate: reject transcriptions whose mean segment avg_logprob is
-# below this (port: 2602-2604).
-MIN_AVG_LOGPROB = -1.5
+# below this (port: 2602-2604). Was -1.5, which accepted "by Agenda 4.2.6"
+# at -0.94 and routed it; genuine utterances on this mic score -0.2..-0.6.
+# A rejection is spoken ("Say that again, sir?") and re-opens the mic.
+MIN_AVG_LOGPROB = -0.85
 
 # Domain vocabulary prompt — biases Whisper toward these terms
 # (port verbatim: voice_input_gui.py:78-86)

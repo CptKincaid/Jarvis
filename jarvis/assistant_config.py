@@ -87,7 +87,10 @@ DEFAULTS: dict = {
     # User-defined spoken shortcuts -> a tool call, matched ahead of the
     # classifier and the model. See docs/assistant-setup.md "Custom phrases".
     "phrases": [],
-    "briefing": {"enabled": False, "hn_items": 3,
+    # on_first_wake: deliver the briefing after the first thing you say to
+    # Jarvis each day, once it is past `after` (24 h clock, local time).
+    "calendar": {"heads_up_min": 10},
+    "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],
                  "sports_feeds": [], "stock_symbols": []},

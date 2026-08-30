@@ -609,6 +609,13 @@ class TTS:
         long text into many speak() calls, and every resume restarts the
         capture stream (openWakeWord blanks ~400 ms after reset()).
         """
+        if CONFIG.barge_in:
+            # Barge-in: the wake word stays live while Jarvis speaks, so
+            # "Jarvis, stop" can cut him off. His own voice cannot wake him:
+            # the speaker gate scores the TTS voice at -0.03..-0.06 against
+            # the enrolled voiceprint (measured 2026-08-29).
+            self._mic_hold = None
+            return
         if self._arbiter is None or self._mic_hold is not None:
             return
         stack = contextlib.ExitStack()
