@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from jarvis.config import AssistantConfig, PATHS                    # noqa: E402
+from jarvis.assistant_config import AssistantConfig                 # noqa: E402
 from jarvis.tools.spotify import (REDIRECT_URI, SCOPES, TokenCache,  # noqa: E402
                                   token_path)
 
@@ -32,11 +32,11 @@ def main() -> int:
         print("spotipy is not installed in this interpreter.")
         return 1
 
-    cfg = AssistantConfig(PATHS.ASSISTANT_CONFIG)
+    cfg = AssistantConfig.load()
     cid = cfg.get("spotify.client_id")
     secret = cfg.get("spotify.client_secret")
     if not cid or not secret:
-        print("No spotify.client_id / client_secret in", PATHS.ASSISTANT_CONFIG)
+        print("No spotify.client_id / client_secret in", cfg.path)
         return 1
 
     out = token_path(cfg)
@@ -75,7 +75,7 @@ def main() -> int:
         print("No ?code= found in that URL.")
         return 1
 
-    auth.get_access_token(code, as_dict=True, check_cache=False)
+    auth.get_access_token(code, as_dict=False, check_cache=False)
     if not cache.linked():
         print("Spotify returned a token but it did not reach", out)
         return 1
