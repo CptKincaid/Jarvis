@@ -111,6 +111,9 @@ DEFAULTS: dict = {
     # re-opens without a wake word for window_s seconds (capped at 30 by
     # the recorder; the 60 s hard cap on a capture must leave room to talk).
     "lecture": {"window_s": 20},
+    # Quiz mode over the documents index: questions per round, chunks of
+    # study text handed to the model per round (jarvis/tools/quiz.py).
+    "quiz": {"questions": 5, "chunks": 6},
     "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30},
     # Long-term memory (jarvis/memory.py): facts are also indexed with
     # nomic-embed-text so "who's my dentist" finds "my dentist is Dr Patel";

@@ -29,6 +29,7 @@ import sys
 import threading
 import uuid
 import time
+from pathlib import Path
 from types import SimpleNamespace
 
 from jarvis.config import CONFIG, MACHINE, PATHS
@@ -67,6 +68,7 @@ from jarvis.hotword import Hotword
 from jarvis.jarvis_agent import JarvisAgent
 from jarvis.memory import JarvisMemory
 from jarvis.reader import CONTINUE_PROMPT, ReadAloud
+from jarvis.tools.docs import doc_paths
 from jarvis.recorder import (SAMPLE_RATE, MicArbiter, Recorder,
                              play_beep)
 from jarvis.speaker import SpeakerVerifier
@@ -203,7 +205,12 @@ class JarvisApp:
         self.tts = TTS(gpu=0, engine=CONFIG.tts_engine, arbiter=self.arbiter)
         speak_queue.set_sink(self._say)
         speak_queue.start_watcher()
-        self.reader = ReadAloud(self.tts)       # "read the clipboard"
+        # "read the clipboard" / "read file x" / "explain the handout": the
+        # docs folders join the search path so a PDF dropped in
+        # ~/Documents/Jarvis Docs resolves by name (spec 11).
+        self.reader = ReadAloud(self.tts, search_dirs=[
+            Path.cwd(), Path.home(), Path.home() / "Jarvis",
+            *doc_paths(self.assistant)])
         self.history = TypedHistory()           # typed-command history
 
         # ---- audio in -----------------------------------------------------
@@ -382,6 +389,26 @@ class JarvisApp:
         if text and CONFIG.talkback:
             self.tts.speak(text)
 
+    def _async_reply(self, text, speak=True):
+        """A Tier 1 handler's answer arriving from its worker thread (an
+        explained document, the first quiz question): shown, spoken,
+        remembered, and it closes the turn and arms the follow-up window
+        exactly as a brain reply does in _on_brain_tags. Without this door
+        a done=False command only ended when the 60 s watchdog fired, and
+        the next question needed the wake word."""
+        self._turn_finished()
+        if not text:
+            return
+        bus.publish(JarvisReply(text=text, speak=speak))
+        if speak:
+            self._say(text)
+            if self._last_source == "voice":
+                self._followup_after_speech = True
+        try:
+            self.context.add_exchange(self._last_user_text, text)
+        except Exception:
+            log.debug("add_exchange failed", exc_info=True)
+
     def interrupt_speech(self) -> bool:
         """Barge-in: cut whatever Jarvis is saying (and any queued lines,
         including a read-aloud in progress). Returns True when something
@@ -420,10 +447,14 @@ class JarvisApp:
                 ("jarvis.approvals", ("TIMEOUT_LINE", "ALLOWED_LINE",
                                       "DECLINED_LINE")),
                 ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE",
-                                      "WEB_LOOKUP_LINE", "WEB_UNAVAILABLE_LINE")),
+                                      "WEB_LOOKUP_LINE", "WEB_UNAVAILABLE_LINE",
+                                      "EXPLAIN_FAIL_LINE", "READ_OFFER_LINE",
+                                      "NO_DOCUMENT_LINE")),
                 ("jarvis.lecture", ("END_NONE_LINE", "FAIL_LINE")),
                 ("jarvis.tools.docs", ("INDEX_DOWN_LINE", "INDEXING_LINE",
                                        "NO_QUESTION_LINE")),
+                ("jarvis.tools.quiz", ("NO_DOCS_LINE", "NOTHING_DUE_LINE", "NO_CARDS_LINE",
+                                       "QUIZ_STOPPED_EARLY_LINE")),
                 ("jarvis.tools.screen", ("NO_SCREEN_LINE", "NO_VISION_LINE")),
                 ("jarvis.tools.health", ("UNREADABLE_LINE",)),
                 ("jarvis.tools.timekeeper", ("NOTHING_RINGING_LINE",
@@ -544,6 +575,9 @@ class JarvisApp:
             classify_route=lambda *a, **kw: app.brain.classify_route(*a, **kw),
             summarize=lambda *a, **kw: app.brain.summarize(*a, **kw),
             local_line=lambda *a, **kw: app.brain.local_line(*a, **kw),
+            explain_text=lambda *a, **kw: app.brain.explain_text(*a, **kw),
+            make_quiz=lambda *a, **kw: app.brain.make_quiz(*a, **kw),
+            grade_answer=lambda *a, **kw: app.brain.grade_answer(*a, **kw),
             execute_autonomous=lambda task: b.execute_autonomous(
                 task, callback=app._on_brain_tags),
         )
@@ -570,6 +604,10 @@ class JarvisApp:
             diagnostics=self.diagnostics_text,
             # the health watchdog resolves this at fire time (talkback-gated)
             speak=self._say,
+            # a Tier 1 worker thread's answer (explain, quiz): see _async_reply
+            reply=self._async_reply,
+            # docs.make_tools parks its DocsIndex here for quiz mode
+            docs=None,
         )
 
     # ------------------------------------------------------- brain executor
@@ -1852,13 +1890,13 @@ class JarvisApp:
                 fn()
             except Exception:
                 log.exception("assistant: %s failed to stop", name)
-        for obj in (self.notes,):
+        for obj in (self.notes, getattr(self.commander, "_flashcards", None)):
             fn = getattr(obj, "close", None)
             if callable(fn):
                 try:
                     fn()
                 except Exception:
-                    log.exception("notes close failed")
+                    log.exception("store close failed")
 
     def quit(self):
         try:

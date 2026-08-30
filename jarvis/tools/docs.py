@@ -51,6 +51,7 @@ SUFFIXES = (".pdf", ".txt", ".md", ".docx")
 CHUNK_CHARS = 800
 CHUNK_OVERLAP = 120
 TOP_K = 5
+MIN_TOPIC_SCORE = 0.3              # topic_chunks: below this a hit is off-topic
 SHEET_CHUNK_CHARS = 700            # per-chunk cap in the fact sheet the model reads
 EMBED_TIMEOUT = 8.0                # one /api/embed call
 EMBED_BATCH = 32                   # chunks per /api/embed call
@@ -72,6 +73,19 @@ INDEXING_LINE = "I'm indexing your documents now, sir; ask me again in a moment.
 INDEXED_LINE = "Indexed {n} documents, sir."
 UNREADABLE_LINE = "I couldn't read any of the documents in {folder}, sir."
 NO_QUESTION_LINE = "What would you like to know from your documents, sir?"
+
+# Words a spoken document name carries that its file name never does.
+_NAME_STOPWORDS = frozenset({
+    "the", "a", "an", "my", "our", "this", "that", "of", "for", "on", "in",
+    "to", "and", "from", "file", "document", "doc", "pdf", "docx", "paper",
+    "handout", "notes", "reading", "please", "me", "it", "one"})
+_NUMBER_WORDS = {"one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+                 "six": "6", "seven": "7", "eight": "8", "nine": "9", "ten": "10",
+                 "eleven": "11", "twelve": "12"}
+_CHAPTER_RX = re.compile(
+    r"\b(chapter|chap|section|unit|lecture|week|module|part|lab)\s*"
+    r"(\d{1,3}|one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\b",
+    re.I)
 
 
 class EmbedError(RuntimeError):
@@ -266,6 +280,50 @@ def chunk_text(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP)
     return chunks
 
 
+def _name_tokens(text: str) -> list[str]:
+    """Lower-case alphanumeric tokens of a spoken name or a file name
+    ("Biosensors_Lab-Handout_v2.pdf" -> biosensors, lab, handout, v2),
+    number words as digits, stopwords out."""
+    stem = re.sub(r"\.(pdf|docx?|txt|md|rst|tex)$", "", str(text or "").strip(), flags=re.I)
+    toks = [t.lower() for t in re.findall(r"[A-Za-z]+|\d+", stem)]
+    toks = [_NUMBER_WORDS.get(t, t) for t in toks]
+    return [t for t in toks if t not in _NAME_STOPWORDS]
+
+
+def match_name(query: str, names: list[str], min_score: float = 0.6) -> Optional[str]:
+    """The file name a spoken name most plausibly means, or None.
+
+    Score = the share of the query's content words found in the file
+    name (whole token or prefix of one: "bio sensor" finds biosensors);
+    ties go to the name with the fewest extra words, so "the lab handout"
+    picks lab_handout.pdf over lab_handout_answers.pdf. The floor is above
+    one half so a two-word name needs both words: "the lab report" must
+    not resolve to the biosensors LAB handout."""
+    q = _name_tokens(query)
+    if not q or not names:
+        return None
+    best, best_key = None, None
+    for name in names:
+        n = _name_tokens(name)
+        if not n:
+            continue
+        joined = " ".join(n)
+        hit = 0
+        for tok in q:
+            if tok in n or (len(tok) >= 4 and any(t.startswith(tok) or tok.startswith(t)
+                                                  for t in n if len(t) >= 4)):
+                hit += 1
+            elif tok.isdigit() and tok in joined:
+                hit += 1
+        score = hit / len(q)
+        if score < min_score:
+            continue
+        key = (score, -abs(len(n) - len(q)), -len(name))
+        if best_key is None or key > best_key:
+            best, best_key = name, key
+    return best
+
+
 def _compact(text: str, limit: int = SHEET_CHUNK_CHARS) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[:limit - 1].rstrip() + "…"
@@ -325,6 +383,26 @@ class DocsIndex:
         except Exception:                      # noqa: BLE001 - store boundary
             log.exception("docs index unreadable")
             return 0
+
+    def names(self) -> list[str]:
+        """The file names in the store (sorted, unique)."""
+        return sorted({Path(p).name for p in self.indexed()})
+
+    def chunks_of(self, name: str) -> list[dict]:
+        """Every chunk of one indexed file, in document order:
+        [{name, path, text, chunk}]. No embedding call is made."""
+        got = self.collection().get(where={"name": name},
+                                    include=["documents", "metadatas"])
+        docs = got.get("documents") or []
+        metas = got.get("metadatas") or []
+        out = []
+        for doc, meta in zip(docs, metas):
+            meta = meta or {}
+            out.append({"name": str(meta.get("name") or name),
+                        "path": str(meta.get("path", "")), "text": doc or "",
+                        "chunk": int(meta.get("chunk", 0))})
+        out.sort(key=lambda h: h["chunk"])
+        return out
 
     # ------------------------------------------------------------- scan
     def scan(self) -> list[Path]:
@@ -488,6 +566,60 @@ class DocsIndex:
         return out
 
 
+def topic_chunks(index: DocsIndex, topic: str, k: int = 6) -> list[dict]:
+    """Chunks to study for a spoken topic, in reading order.
+
+    "Chapter three" is a poor semantic query (every chapter heading looks
+    alike to the embedder), so the order is: (1) a file whose NAME matches
+    the topic -> its chunks, starting at the "chapter N" heading when the
+    topic names one; (2) a "chapter N" heading anywhere in the store ->
+    that file from that chunk on; (3) the embedding query, its hits
+    re-sorted by (file, chunk) so the questions follow the text. Raises
+    EmbedError only on the last leg."""
+    topic = " ".join(str(topic or "").split())
+    if not topic:
+        return []
+    k = max(1, int(k))
+    heading = _CHAPTER_RX.search(topic)
+    head_rx = None
+    if heading:
+        num = _NUMBER_WORDS.get(heading.group(2).lower(), heading.group(2))
+        words = {v: k_ for k_, v in _NUMBER_WORDS.items()}.get(num, "")
+        head_rx = re.compile(r"\b%s\s*(?:%s%s)\b" % (
+            r"(?:chapter|chap\.?|section|unit|lecture|week|module|part|lab)",
+            re.escape(num), f"|{words}" if words else ""), re.I)
+
+    def _from_heading(chunks: list[dict]) -> list[dict]:
+        if head_rx is None:
+            return chunks[:k]
+        for i, h in enumerate(chunks):
+            if head_rx.search(h["text"]):
+                return chunks[i:i + k]
+        return []
+
+    name = match_name(topic, index.names())
+    if name:
+        chunks = index.chunks_of(name)
+        picked = _from_heading(chunks)
+        if picked:
+            return picked
+        if head_rx is None:
+            return chunks[:k]
+    if head_rx is not None:
+        for other in index.names():
+            if other == name:
+                continue
+            picked = _from_heading(index.chunks_of(other))
+            if picked:
+                return picked
+    # chroma always returns k neighbours; below the floor they are not
+    # about the topic (nomic scores unrelated passages ~0.3-0.45, related
+    # ones 0.55+), and a quiz written from them would be about the wrong thing.
+    hits = [h for h in index.query(topic, k=k) if h["score"] >= MIN_TOPIC_SCORE]
+    hits.sort(key=lambda h: (h["name"], h["chunk"]))
+    return hits
+
+
 def fact_sheet(hits: list[dict]) -> str:
     """One line per chunk, file name first, so the model can cite it."""
     return "\n".join(f"From {h['name']}: {_compact(h['text'])}" for h in hits)
@@ -511,6 +643,13 @@ def make_tools(cfg, services, embed: Embed = _embed) -> list[ToolSpec]:
     except Exception:                          # noqa: BLE001 - services may be frozen
         log.debug("services has no room for the docs index", exc_info=True)
     folder = str(doc_paths(cfg)[0]) if doc_paths(cfg) else DEFAULT_PATHS[0]
+    # Parked for the commander (quiz mode reads chunks straight from the
+    # store), the same idiom as calendar / health: nothing is opened here.
+    if services is not None and getattr(services, "docs", None) is None:
+        try:
+            services.docs = index
+        except (AttributeError, TypeError):
+            log.debug("services does not accept docs")
     no_docs = NO_DOCS_LINE.format(folder=folder)
     # Nothing is opened here: chromadb and the index dir are touched on the
     # first tool call, so a boot (or test_app_wiring) costs nothing.

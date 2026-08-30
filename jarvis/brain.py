@@ -961,6 +961,134 @@ def classify_route(text, timeout=CLASSIFY_TIMEOUT_S):
     return (route, max(0.0, min(1.0, confidence)))
 
 
+# ----------------------------------------------------------------------
+# Study helpers: explain a document, write a quiz, grade an answer.
+# ----------------------------------------------------------------------
+# These are NOT persona requests: _persona_request trims to n sentences and
+# HARD_SPOKEN_CHARS (~500 chars, ~30 s of speech), and returns "" when the
+# model emits a tool call -- a document summary needs a paragraph and a
+# quiz needs five pairs. Each is one /api/chat with a JSON schema, the
+# SAME static system prompt (so the persona and the "spoken" rules hold)
+# and NO tool schemas: the document text takes the room the schemas would
+# have (static_system is ~1.5k tokens; EXPLAIN_MAX_CHARS of text is ~3.5k;
+# NUM_CTX is 8192). The one cost is a prefix-cache miss on the next tool
+# loop call (~2 s of prefill, once), which a 20 s summary already dwarfs.
+EXPLAIN_MAX_CHARS = 12_000       # the head of a document one call can read
+EXPLAIN_TIMEOUT_S = 60.0
+QUIZ_MAX_CHARS = 6_000           # study text per generation call
+QUIZ_TIMEOUT_S = 45.0
+GRADE_TIMEOUT_S = 8.0            # local_line's 2 s is too tight for gemma4:26b
+EXPLAIN_FORMAT = {
+    "type": "object",
+    "properties": {"lead": {"type": "string"}, "summary": {"type": "string"}},
+    "required": ["lead", "summary"]}
+QUIZ_FORMAT = {
+    "type": "object",
+    "properties": {"questions": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"question": {"type": "string"}, "answer": {"type": "string"}},
+        "required": ["question", "answer"]}}},
+    "required": ["questions"]}
+GRADE_FORMAT = {
+    "type": "object",
+    "properties": {"correct": {"type": "boolean"}, "note": {"type": "string"}},
+    "required": ["correct", "note"]}
+
+
+def _json_request(instruction, fmt, timeout, num_predict, temperature=0.2):
+    """One tool-free /api/chat with a JSON schema; the parsed object, or
+    None on any failure (callers speak a fixed excuse)."""
+    messages = [{"role": "system", "content": static_system()},
+                {"role": "user", "content": instruction}]
+    try:
+        data = _http("/api/chat",
+                     _chat_payload(messages, None, fmt=fmt, num_predict=num_predict,
+                                   temperature=temperature),
+                     timeout=timeout)
+        content, _calls = _message_parts(data)
+        obj = json.loads(content or "{}")
+    except Exception as exc:               # noqa: BLE001 - one seam, one excuse
+        log.warning("json request failed: %s: %s", type(exc).__name__, exc)
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def explain_text(text, name="the document", timeout=EXPLAIN_TIMEOUT_S):
+    """(lead, summary) for a document: ``lead`` is the two-sentence spoken
+    opening, ``summary`` the fuller paragraph shown as a card. ("", "")
+    when the model is down or the text is empty."""
+    text = (text or "").strip()
+    if not text:
+        return "", ""
+    body = text[:EXPLAIN_MAX_CHARS]
+    cut = " (the opening pages; it goes on)" if len(text) > len(body) else ""
+    instruction = (
+        f"Instruction for Jarvis (not a question from Hunter): Hunter asked you "
+        f"to explain his document \"{name}\"{cut}. Reply with JSON only. "
+        f"\"lead\": two spoken sentences, as Jarvis would say them aloud, giving "
+        f"what the document is and the one thing that matters most in it. "
+        f"\"summary\": one plain paragraph of five to eight sentences with the key "
+        f"points, every number, date, deadline and anything due, in your own "
+        f"words, no lists, no markdown.\n\nDocument:\n{body}")
+    obj = _json_request(instruction, EXPLAIN_FORMAT, timeout, num_predict=420)
+    if not obj:
+        return "", ""
+    lead = strip_markdown(clean_ollama_reply(str(obj.get("lead") or "")))
+    summary = strip_markdown(clean_ollama_reply(str(obj.get("summary") or "")))
+    lead = trim_spoken(limit_sentences(lead, 2), cap=HARD_SPOKEN_CHARS)
+    if not lead and summary:
+        lead = trim_spoken(limit_sentences(summary, 2), cap=HARD_SPOKEN_CHARS)
+    return lead, summary
+
+
+def make_quiz(text, n=5, topic="", timeout=QUIZ_TIMEOUT_S):
+    """[{question, answer}] x up to n from study text; [] on failure. The
+    answers are asked to be short (a phrase, a number, a name) so the
+    string grader in tools.quiz has something to match."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    n = max(1, min(int(n or 5), 10))
+    about = f" about {topic}" if topic else ""
+    instruction = (
+        f"Instruction for Jarvis (not a question from Hunter): write {n} quiz "
+        f"questions{about} from the study text below, to test whether Hunter has "
+        f"learned it. Reply with JSON only. Each question is one spoken sentence "
+        f"answerable from the text; each answer is short -- a phrase, a number, "
+        f"a name or a definition of at most twelve words -- never a yes or no. "
+        f"Cover different facts; no markdown.\n\nStudy text:\n{text[:QUIZ_MAX_CHARS]}")
+    obj = _json_request(instruction, QUIZ_FORMAT, timeout, num_predict=110 * n,
+                        temperature=0.4)
+    out = []
+    for item in (obj or {}).get("questions") or []:
+        if not isinstance(item, dict):
+            continue
+        q = " ".join(str(item.get("question") or "").split())
+        a = " ".join(str(item.get("answer") or "").split())
+        if q and a:
+            out.append({"question": q, "answer": a})
+    return out[:n]
+
+
+def grade_answer(question, expected, given, timeout=GRADE_TIMEOUT_S):
+    """(correct, note) from the model, or None when it did not answer (the
+    caller then falls back to the string match or a shrug)."""
+    instruction = (
+        f"Instruction for Jarvis (not a question from Hunter): grade Hunter's "
+        f"spoken quiz answer. Reply with JSON only: \"correct\" is true when his "
+        f"answer means the same as the expected answer (wording, order and "
+        f"small transcription slips do not matter; a missing or wrong fact "
+        f"does), and \"note\" is one short spoken sentence from Jarvis saying "
+        f"what was right or what the answer was.\n\nQuestion: {question}\n"
+        f"Expected answer: {expected}\nHunter's answer: {given}")
+    obj = _json_request(instruction, GRADE_FORMAT, timeout, num_predict=60,
+                        temperature=0.0)
+    if not obj or "correct" not in obj:
+        return None
+    note = strip_markdown(clean_ollama_reply(str(obj.get("note") or "")))
+    return bool(obj.get("correct")), trim_spoken(limit_sentences(note, 1))
+
+
 class JarvisBrain:
     """Hybrid brain: Ollama (fast, tools) + Claude (smart), with context +
     memory.
@@ -1109,6 +1237,15 @@ class JarvisBrain:
                    fallback=""):
         return local_line(instruction, text, max_sentences=max_sentences,
                           timeout=timeout, fallback=fallback)
+
+    def explain_text(self, text, name="the document", timeout=EXPLAIN_TIMEOUT_S):
+        return explain_text(text, name=name, timeout=timeout)
+
+    def make_quiz(self, text, n=5, topic="", timeout=QUIZ_TIMEOUT_S):
+        return make_quiz(text, n=n, topic=topic, timeout=timeout)
+
+    def grade_answer(self, question, expected, given, timeout=GRADE_TIMEOUT_S):
+        return grade_answer(question, expected, given, timeout=timeout)
 
     def think(self, user_input, callback=None):
         """Legacy entry (deploy/autonomous era): a local question goes to
