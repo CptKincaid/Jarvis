@@ -40,6 +40,64 @@ log = get_logger("context")
 _LEGACY_LOG = PATHS.LOG_DIR / "gui_debug.log"
 
 
+def _git(repo_dir, *args, timeout=5):
+    """stdout of one git command run in repo_dir ("" on any failure)."""
+    try:
+        r = subprocess.run(["git", *args], capture_output=True, text=True,
+                           timeout=timeout, cwd=repo_dir)
+    except (OSError, subprocess.SubprocessError):
+        log.debug("git %s failed in %s", args[:1], repo_dir, exc_info=True)
+        return ""
+    return (r.stdout or "").strip()
+
+
+def probe_repo(repo_dir, since=None, until=None):
+    """One git work tree -> {repo, path, branch, changed, last_commit, ahead,
+    commits, diff_stat}; None when repo_dir is missing or not a git tree.
+
+    ``commits`` holds the subjects in the [since, until) window (git
+    approxidate or ISO strings) and stays empty when ``since`` is None: the
+    prompt path never pays for a log walk. ``diff_stat`` is the uncommitted
+    "--shortstat" line, so a day spent editing without a commit still shows
+    up in the standup. A detached HEAD reports branch "HEAD".
+    """
+    repo_dir = str(repo_dir)
+    if not Path(repo_dir).is_dir():
+        return None
+    if _git(repo_dir, "rev-parse", "--is-inside-work-tree") != "true":
+        return None
+    branch = _git(repo_dir, "branch", "--show-current") or "HEAD"
+    status = _git(repo_dir, "status", "--porcelain")
+    changed = len(status.splitlines()) if status else 0
+    # hash, subject and a relative age ("(6 hours ago)") so the model has
+    # the real timing instead of inventing one
+    last = _git(repo_dir, "log", "-1", "--format=%h %s (%cr)")
+    ahead = 0
+    if branch != "HEAD":
+        ahead_str = _git(repo_dir, "rev-list", "--count",
+                         f"origin/{branch}..HEAD")
+        ahead = int(ahead_str) if ahead_str.isdigit() else 0
+    commits = []
+    if since:
+        args = ["log", f"--since={since}", "--format=%s", "--no-merges"]
+        if until:
+            args.append(f"--until={until}")
+        commits = [ln for ln in _git(repo_dir, *args).splitlines()
+                   if ln.strip()]
+    return {
+        "repo": Path(repo_dir).name,
+        "path": repo_dir,
+        "branch": branch,
+        "changed": changed,
+        "last_commit": last,
+        "ahead": ahead,
+        "commits": commits,
+        # against HEAD: staged-but-uncommitted work counts as uncommitted too
+        "diff_stat": (_git(repo_dir, "diff", "HEAD", "--shortstat")
+                      if changed else ""),
+    }
+
+
 class ContextEngine:
     """Builds rich context snapshots for AI tiers."""
 
@@ -48,12 +106,21 @@ class ContextEngine:
     # tomorrow?" refers to the last minute, not to this morning.
     CONVERSATION_TTL_S = 10 * 60
 
-    def __init__(self, project_dir=None, vss_dir=None, memory=None):
+    def __init__(self, project_dir=None, vss_dir=None, memory=None,
+                 repo_dirs=None):
         self._cache = {}
         self._cache_times = {}
         self._conversation = []
         self._project_dir = str(project_dir or PATHS.REPO_ROOT)
         self._vss_dir = str(vss_dir or PATHS.VSS_ENV)
+        # Every repo the git probes walk, primary first. The prompt's "Git:"
+        # line reports the FIRST one that is a git tree (unchanged since V3,
+        # so the Tier 2 prefix never changes shape when more repos are
+        # configured); git_repos() reports them all for the standup. The app
+        # replaces this list from claude.allowed_dirs + projects_root once
+        # the assistant config is loaded.
+        self.repo_dirs = [str(d) for d in (repo_dirs or
+                                           [self._project_dir, self._vss_dir])]
         self._memory = memory          # injected JarvisMemory (optional)
         self._windows = deque(maxlen=20)
         self._current_app = None
@@ -301,45 +368,46 @@ class ContextEngine:
         return self._cached("git", self._fetch_git)
 
     def _fetch_git(self):
-        # Check both the Jarvis repo and the VSS tree
-        for repo_dir in [self._project_dir, self._vss_dir]:
-            try:
-                def _run(cmd):
-                    return subprocess.run(
-                        cmd, capture_output=True, text=True,
-                        timeout=5, cwd=repo_dir,
-                    ).stdout.strip()
-
-                branch = _run(["git", "branch", "--show-current"])
-                if not branch:
-                    continue
-
-                status = _run(["git", "status", "--porcelain"])
-                changed = len(status.splitlines()) if status else 0
-                # hash, subject and a relative age ("(6 hours ago)") so the
-                # model has the real timing instead of inventing one
-                last = _run(["git", "log", "-1", "--format=%h %s (%cr)"])
-
-                ahead = 0
-                try:
-                    ahead_str = _run(
-                        ["git", "rev-list", "--count",
-                         f"origin/{branch}..HEAD"])
-                    ahead = int(ahead_str) if ahead_str.isdigit() else 0
-                except Exception:
-                    log.debug("git ahead-count probe failed", exc_info=True)
-
-                return {
-                    "repo": Path(repo_dir).name,
-                    "branch": branch,
-                    "changed": changed,
-                    "last_commit": last,
-                    "ahead": ahead,
-                }
-            except Exception:
-                log.debug("git probe failed for %s", repo_dir, exc_info=True)
-                continue
+        """The prompt's git line: the first configured repo that is a git
+        tree (the project itself). One dict, never a list, so
+        format_for_prompt and the Tier 2 prefix keep their shape."""
+        for repo_dir in self.repo_dirs:
+            info = probe_repo(repo_dir)
+            if info:
+                return info
         return {}
+
+    def git_repos(self, since=None, until=None):
+        """Every configured repo that is a git tree, primary first, each
+        with its commit subjects in the [since, until) window when ``since``
+        is given. Missing directories (claude.projects_root does not exist
+        on this box) and non-repos are skipped; never raises."""
+        out, seen = [], set()
+        for repo_dir in self.repo_dirs:
+            key = str(repo_dir).rstrip("/")
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                info = probe_repo(repo_dir, since=since, until=until)
+            except Exception:
+                log.exception("git probe failed for %s", repo_dir)
+                info = None
+            if info:
+                out.append(info)
+        return out
+
+    def git_summary(self):
+        """The V1 jarvis_agent.git_summary shape ({branch, changed_files,
+        last_commit, commits_ahead}) for the "git status" command -- from the
+        primary repo, not the path V1 hard-coded to ~/vss_env."""
+        info = self._get_git_state()
+        if not info:
+            return None
+        return {"branch": info.get("branch", ""),
+                "changed_files": int(info.get("changed", 0) or 0),
+                "last_commit": info.get("last_commit", ""),
+                "commits_ahead": int(info.get("ahead", 0) or 0)}
 
     def _get_recent_files(self):
         return self._cached("files", self._fetch_recent_files)
@@ -448,8 +516,8 @@ class ContextEngine:
                 return []
             lines = log_path.read_text(errors="replace").splitlines()[-100:]
             errors = [
-                l for l in lines
-                if any(kw in l.lower() for kw in
+                line for line in lines
+                if any(kw in line.lower() for kw in
                        ("error", "exception", "traceback", "failed"))
             ]
             return errors[-5:]
