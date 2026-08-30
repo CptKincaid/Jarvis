@@ -881,6 +881,106 @@ def _h_pronounce(c, t, m):
                          speak=True, status=f"Pronounce {word} as {spoken}")
 
 
+# ---- Tier 1 name spelling: Whisper and the TTS in one utterance ---------
+# "my advisor's name is spelled P-E-Y-R-O-V-I, say it pay-ROH-vee" fixes
+# both directions at once: the letters go to the names file the prompt
+# builder (jarvis/vocab.py) feeds Whisper, and the "say it" clause goes to
+# the same TTS dictionary "pronounce X as Y" edits. Whisper renders spelled
+# letters inconsistently ("P E Y R O V I", "P-E-Y-R-O-V-I", "P., E., Y.",
+# sometimes glued to "PEYROVI"), so the run is normalised and the reply
+# echoes the reconstructed spelling for him to confirm by ear.
+_SPELL_NAME_RX = re.compile(
+    r"^" + _JV + r"(?:my\s+)?(?:(?P<who>[\w' ]+?)\s+)?(?:name\s+)?"
+    r"is\s+spel(?:led|t)(?:\s+(?:as|like))?[:,]?\s+"
+    r"(?P<letters>[a-z](?:[\s.,-]+[a-z])+|[a-z]{2,})[.!]?\s*"
+    r"(?:[,;]?\s*(?:and\s+)?(?:say|pronounce)\s+(?:it|that|him|her)"
+    r"(?:\s+(?:as|like))?\s+[\"']?(?P<spoken>.+?)[\"']?)?[.!\s]*$",
+    re.I)
+_ADD_VOCAB_RX = re.compile(
+    r"^" + _JV + r"add\s+(?:the\s+(?:word|name)\s+)?[\"']?(?P<word>.+?)[\"']?"
+    r"\s+to\s+(?:your|the|my)\s+(?:vocab(?:ulary)?|dictionary|word\s?list)"
+    r"[.!\s]*$", re.I)
+
+
+def spelled_word(run: str) -> str:
+    """Normalise a spelled letter run to a word: "P-E-Y-R-O-V-I",
+    "p e y r o v i" and "P., E., Y." all -> "Peyrovi". Whisper sometimes
+    glues the letters into one token ("PEYROVI"), so a single alphabetic
+    word passes through title-cased. Anything else (mixed multi-letter
+    tokens: "pey rovi") returns "" -- guessing at the word boundary would
+    store a wrong name forever."""
+    tokens = [t for t in re.split(r"[\s.,-]+", (run or "").strip()) if t]
+    if not tokens:
+        return ""
+    if all(len(t) == 1 and t.isalpha() for t in tokens):
+        word = "".join(tokens)
+    elif len(tokens) == 1 and tokens[0].isalpha():
+        word = tokens[0]
+    else:
+        return ""
+    if len(word) < 2:
+        return ""
+    return word[0].upper() + word[1:].lower()
+
+
+def _h_spell_name(c, t, m):
+    # The registry path lower-cases the command text; the "say it" clause's
+    # casing is his ("pay-ROH-vee"), so re-match the raw utterance the
+    # commander stashed in handle(), exactly as _h_pronounce does.
+    raw = getattr(c, "_raw_text", "") or ""
+    m2 = _SPELL_NAME_RX.match(raw.strip()) if raw else None
+    if m2 is not None:
+        m = m2
+    word = spelled_word(m.group("letters"))
+    if not word:
+        return CommandResult(
+            handled=True, speak=True, status="Spelling unclear",
+            reply="I didn't quite catch the letters, sir — once more, "
+                  "one at a time?")
+    try:
+        from jarvis import vocab as vocab_mod
+        vocab_mod.add_name(word)
+    except Exception:
+        log.exception("name save failed")
+        return CommandResult(handled=True, speak=True,
+                             reply="I couldn't save that, sir.",
+                             status="Name save failed")
+    spoken = (m.group("spoken") or "").strip()
+    if spoken:
+        try:
+            pronounce.get().add(word, spoken)
+        except Exception:
+            log.exception("pronunciation add failed")
+    # The echo IS the confirmation loop: the spelling proves the letters
+    # arrived intact, and the trailing word is spoken through the new
+    # pronunciation when one was given.
+    spelling = "-".join(word.upper())
+    return CommandResult(handled=True, speak=True,
+                         reply=f"Noted, sir: {spelling}. {word}.",
+                         status=f"Spelled {word}")
+
+
+def _h_add_vocab(c, t, m):
+    # Raw casing matters: "add Librespot ..." must store "Librespot".
+    word = " ".join(_raw_group(c, _ADD_VOCAB_RX, m, group="word").split())
+    word = word.strip("\"'")
+    if not word:
+        return CommandResult(handled=True, speak=True,
+                             reply="Add what, sir?", status="No word")
+    try:
+        from jarvis import vocab as vocab_mod
+        added = vocab_mod.add_name(word)
+    except Exception:
+        log.exception("vocabulary add failed")
+        return CommandResult(handled=True, speak=True,
+                             reply="I couldn't save that, sir.",
+                             status="Vocabulary save failed")
+    reply = (f"Noted, sir — I'll listen for {word}." if added
+             else f"I already have {word}, sir.")
+    return CommandResult(handled=True, reply=reply, speak=True,
+                         status=f"Vocabulary: {word}")
+
+
 # "Read it to me" after an explain means the document just explained, not
 # the X selection. The pronoun form is only diverted while a document is
 # fresh (LAST_DOCUMENT_S); "read this" / "read the selection" never are.
@@ -3061,6 +3161,8 @@ REGISTRY: list[Command] = [
     Command("quiet", quiet_kind, _h_quiet),              # Tier 1 barge-in
     Command("repeat", repeat_kind, _h_repeat),           # Tier 1 say again
     Command("pronounce", _PRONOUNCE_RX.match, _h_pronounce),
+    Command("spell name", _SPELL_NAME_RX.match, _h_spell_name),
+    Command("add vocabulary", _ADD_VOCAB_RX.match, _h_add_vocab),
     Command("read aloud", read_kind, _h_read_aloud, needs=("reader",)),
     Command("continue reading", continue_kind, _h_continue,
             needs=("reader",)),
@@ -4713,7 +4815,8 @@ class Commander:
             if kind:
                 return _h_courtesy(self, text, kind)
             # Voice I/O answered locally: quiet, say again, pronounce,
-            # read aloud, continue reading (only mid-reading).
+            # spelled names / vocabulary, read aloud, continue reading
+            # (only mid-reading).
             if quiet_kind(text):
                 return _h_quiet(self, text, True)
             if repeat_kind(text):
@@ -4721,6 +4824,12 @@ class Commander:
             pm = _PRONOUNCE_RX.match(text.strip())
             if pm:
                 return _h_pronounce(self, text, pm)
+            sm = _SPELL_NAME_RX.match(text.strip())
+            if sm:
+                return _h_spell_name(self, text, sm)
+            am = _ADD_VOCAB_RX.match(text.strip())
+            if am:
+                return _h_add_vocab(self, text, am)
             if self._svc("reader") is not None:
                 rk = read_kind(text)
                 if rk:

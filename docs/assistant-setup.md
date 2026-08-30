@@ -898,6 +898,39 @@ follow-up window; "no" or any other subject drops it, and so does a yes a minute
 transcript scoring under `shaky_logprob` is read back even for one item. A single "cancel
 the timer" never is. `read_back: false` turns it off.
 
+## 30. Names and the listening vocabulary (Whisper + TTS)
+
+Whisper is primed before every utterance with a prompt built from your own
+world — nothing to enable. In priority order (the tail falls off first, near
+Whisper's ~224-token prompt window):
+
+1. `~/.aiws_trainer/voice_vocab.txt` — your manual vocabulary (the
+   "Edit vocabulary…" button, one term per line) plus words learned from
+   corrections (`corrections.learn_vocab`).
+2. `~/.aiws_trainer/voice_names.txt` — names you teach by voice, newest first.
+3. Names you taught the voice to say ("pronounce X as Y").
+4. The built-in assistant seed (Jarvis, Canvas, Ollama, timers…). The old
+   warehouse list (AGV, forklift, pallet) is gone.
+5. Calendar event titles from the disk cache (BIOSENSORS and friends).
+6. Canvas course names already cached by the Canvas tool — never a fresh fetch.
+
+Rebuilt at most once a minute, except that teaching a name applies at once.
+
+Teach a name in both directions in one sentence:
+
+> "Jarvis, my advisor's name is spelled P-E-Y-R-O-V-I, say it pay-ROH-vee"
+
+The letters go to the names file (so Whisper *hears* Peyrovi), the "say it …"
+clause goes to the TTS dictionary (so he *says* pay-ROH-vee), and the reply
+echoes the spelling back — "Noted, sir: P-E-Y-R-O-V-I. Peyrovi." — so a
+misheard letter is caught on the spot. Simpler forms:
+
+- "the name is spelled P E Y R O V I" (names file only)
+- "Jarvis, add Librespot to your vocabulary"
+- "pronounce Peyrovi as pay-ROH-vee" (the TTS half alone, as before)
+
+Both files are plain text and safe to edit by hand.
+
 ## 18. Voice latency: the first-audio mark and streamed Fish playback
 
 Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
