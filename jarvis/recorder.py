@@ -88,18 +88,26 @@ def _init_beeps():
             PATHS.LOG_DIR.mkdir(parents=True, exist_ok=True)
             start_path = PATHS.LOG_DIR / "beep_start.wav"
             stop_path = PATHS.LOG_DIR / "beep_stop.wav"
+            # "nudge": the non-verbal "I heard nothing usable" cue the app
+            # plays after a wake-word turn that produced no reply (a rejected
+            # speaker, a second garbled clip). Lower and longer than the
+            # start/stop chimes so it cannot be mistaken for either.
+            nudge_path = PATHS.LOG_DIR / "beep_nudge.wav"
             if not start_path.exists():
                 start_path.write_bytes(_generate_beep(freq=880, duration_ms=100))
             if not stop_path.exists():
                 stop_path.write_bytes(_generate_beep(freq=660, duration_ms=150))
+            if not nudge_path.exists():
+                nudge_path.write_bytes(_generate_beep(freq=440, duration_ms=220))
             _BEEP_FILES["start"] = str(start_path)
             _BEEP_FILES["stop"] = str(stop_path)
+            _BEEP_FILES["nudge"] = str(nudge_path)
         except Exception:
             log.exception("beep init failed")
 
 
 def play_beep(kind: str):
-    """Play the 'start' or 'stop' beep asynchronously via paplay/aplay."""
+    """Play the 'start', 'stop' or 'nudge' beep asynchronously via paplay/aplay."""
     _init_beeps()
     path = _BEEP_FILES.get(kind)
     if not path:
@@ -261,6 +269,13 @@ class Recorder:
         except Exception as e:
             log.warning("Mic detection error: %s", e)
             self._mic_devices = {"Default": None}
+
+    @property
+    def followup(self) -> bool:
+        """True while (and after) a session opened without a wake word
+        (start(followup=True)). Read by the app's nudge policy: a follow-up
+        window that hears nothing is a normal outcome, not a lost turn."""
+        return bool(self._followup)
 
     @property
     def mic_available(self) -> bool:
@@ -492,7 +507,8 @@ class Recorder:
             self._dump_capture(audio)
         bus.publish(RecordingStopped(reason=reason,
                                      endpoint=self._stop_endpoint or reason,
-                                     dead_air_s=self._stop_dead_air, t=t_stop))
+                                     dead_air_s=self._stop_dead_air, t=t_stop,
+                                     followup=self._followup))
         return audio
 
     def abort(self):
@@ -518,7 +534,7 @@ class Recorder:
 
         self._audio_frames = []
         self.last_audio = None
-        bus.publish(RecordingStopped(reason="abort"))
+        bus.publish(RecordingStopped(reason="abort", followup=self._followup))
         log.info("Recording aborted")
 
     def _dump_capture(self, audio_16k):
@@ -572,6 +588,32 @@ class Recorder:
             log.debug("partial resample failed", exc_info=True)
             return None
 
+    def snapshot_final(self) -> "np.ndarray | None":
+        """snapshot_audio() shaped exactly as _finalize_audio would shape it
+        (60 s cap, 0.3 s minimum, noise gate), still with no side effects.
+
+        For the app's speculative transcription: a decode started during the
+        endpoint silence is only worth reusing if it saw the SAME clip the
+        normal path will see, and snapshot_audio() alone skips the cap and
+        the gate (the gate zeroes quiet 100 ms blocks, which changes what
+        whisper is given).
+        """
+        audio = self.snapshot_audio()
+        if audio is None:
+            return None
+        return self._shape_final(audio)
+
+    @staticmethod
+    def _shape_final(audio: np.ndarray) -> "np.ndarray | None":
+        """The final-clip rules shared by _finalize_audio and
+        snapshot_final: cap at 60 s, drop under 0.3 s, noise-gate."""
+        audio = audio[:SAMPLE_RATE * MAX_RECORDING_SECONDS]
+        if len(audio) / SAMPLE_RATE < 0.3:
+            return None
+        if CONFIG.noise_gate:
+            audio = _apply_noise_gate(audio)
+        return audio
+
     def _finalize_audio(self) -> np.ndarray | None:
         """Snapshot frames -> 16k float32 (port of monolith 2508-2541)."""
         # Snapshot audio frames (callback thread may still be draining)
@@ -592,21 +634,15 @@ class Recorder:
         log.info("Stopped: %.1fs audio", duration)
 
         # Cap audio at 60 seconds to prevent freezes
-        max_samples = SAMPLE_RATE * 60
-        if len(audio) > max_samples:
-            log.info("Audio capped from %.1fs to 60s", duration)
-            audio = audio[:max_samples]
-            duration = 60.0
+        if len(audio) > SAMPLE_RATE * MAX_RECORDING_SECONDS:
+            log.info("Audio capped from %.1fs to %ds", duration, MAX_RECORDING_SECONDS)
 
-        if duration < 0.3:
+        # 60 s cap, 0.3 s minimum, noise gate -- shared with snapshot_final()
+        # so a speculative decode and the real one see the same clip.
+        shaped = self._shape_final(audio)
+        if shaped is None:
             bus.publish(Status(text="Too short", kind="info"))
-            return None
-
-        # Apply noise gate to final audio
-        if CONFIG.noise_gate:
-            audio = _apply_noise_gate(audio)
-
-        return audio
+        return shaped
 
     # -- poll loop: AudioLevel + auto-stop -------------------------------
     def _poll_loop(self):

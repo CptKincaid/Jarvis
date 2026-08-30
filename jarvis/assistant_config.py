@@ -112,6 +112,12 @@ DEFAULTS: dict = {
                 "default_device": "HPCOMPUTER", "liked_strategy": "uris",
                 "market": "from_token"},
     "autostart": {"enabled": False},
+    # The voice path's two latency/feedback policies (jarvis/app.py):
+    # speculative_stt decodes the clip during the endpoint silence and reuses
+    # the result when no more speech followed; nudge is the short spoken /
+    # earcon cue after a wake-word turn that produced nothing to answer,
+    # at most once per nudge_cooldown_s.
+    "listening": {"speculative_stt": True, "nudge": True, "nudge_cooldown_s": 30},
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",

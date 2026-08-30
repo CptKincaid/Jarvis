@@ -120,6 +120,9 @@ THINKING_LINES = [
 # of the common case, leaving it for lookups that are genuinely slow.
 THINKING_DELAY_S = 4.5
 SAY_AGAIN_LINE = "Say that again, sir?"
+# The "did not catch that" cue (JarvisApp._nudge): a wake-word turn that
+# captured nothing usable gets this instead of silence.
+NUDGE_LINE = "Sir?"
 GUEST_LINE = "I only answer to {name}, sir."
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
@@ -168,6 +171,34 @@ def _brain_model_name() -> str:
         return str(OLLAMA_MODEL).split(":")[0]
     except Exception:
         return "the local model"
+
+
+class _Speculation:
+    """One speculative decode of the clip being captured (JarvisApp._maybe_speculate).
+
+    ``key`` is the endpointer's last_speech_seconds when the snapshot was
+    taken: the pass is only valid for the turn if that is still the last
+    word the VAD heard when the recorder stops. ``done`` lets _process_audio
+    wait for a pass still in flight instead of starting a second decode
+    that would only queue behind it on the model lock.
+    """
+    __slots__ = ("key", "done", "audio", "stats", "rejected", "result",
+                 "error", "started", "finished")
+
+    def __init__(self, key: float):
+        self.key = key
+        self.done = threading.Event()
+        self.audio = None
+        self.stats: dict = {}
+        self.rejected = False          # the speaker gate dropped the clip
+        self.result = None             # TranscribeResult, when it got that far
+        self.error = None
+        self.started = time.monotonic()
+        self.finished: float | None = None
+
+    @property
+    def usable(self) -> bool:
+        return self.error is None and (self.rejected or self.result is not None)
 
 
 class JarvisApp:
@@ -386,7 +417,7 @@ class JarvisApp:
         speech cache at startup so they play instantly."""
         phrases = [p for lines in COURTESY_REPLIES.values() for p in lines]
         phrases += list(THINKING_LINES)
-        phrases += [SAY_AGAIN_LINE, self._guest_line]
+        phrases += [SAY_AGAIN_LINE, NUDGE_LINE, self._guest_line]
         phrases += [CONTINUE_PROMPT, "Very good, sir.",
                     "I haven't said anything yet, sir.",
                     "The clipboard is empty, sir.",
@@ -914,6 +945,7 @@ class JarvisApp:
         self._followup_after_speech = False   # a wake supersedes any follow-up
         self._turn_filler_pending = False     # a stale flag would label this answer a filler
         self._say_again_count = 0
+        self._wake_pending = True             # the capture about to open answers a wake word
         if CONFIG.sound:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
         # The wake word ends and the user starts talking straight away, so
@@ -943,11 +975,18 @@ class JarvisApp:
                                  # transcribe() waits on the same lock
 
     def _on_recording_started(self, _ev):
+        # Consume the wake flag into this capture: a follow-up window or the
+        # mic button opens without one, and a stale True from an earlier
+        # wake must not make the nudge policy treat those as wake turns.
+        self._turn_from_wake, self._wake_pending = self._wake_pending, False
+        with self._spec_lock:
+            self._speculation = None        # a pass from the last capture is never this one's
         threading.Thread(target=self._partial_loop, name="partial",
                          daemon=True).start()
 
     def _partial_loop(self):
-        """Re-decode the growing buffer and publish PartialText.
+        """Re-decode the growing buffer and publish PartialText; run the
+        speculative decode once the user has paused (_maybe_speculate).
 
         Deliberately a separate thread: Recorder._poll_loop runs at ~12 Hz
         and owns silence detection, so a decode taking hundreds of ms there
@@ -955,10 +994,24 @@ class JarvisApp:
         must never delay, disturb or fail the real transcription that
         follows. Transcriber.partial() and transcribe() share one lock, so
         the final decode simply waits for at most one preview.
+
+        One thread for both duties on purpose: the speculative pass is a
+        full decode, and running it here means the greedy preview is
+        suspended while it holds the model instead of queueing behind it.
         """
         last = ""
+        due = 0.0                       # next greedy preview (monotonic)
         try:
             while self.recorder.recording:
+                if self._maybe_speculate():
+                    # The pass just held the model for a full decode and
+                    # published its own text: push the preview back a whole
+                    # interval rather than re-decoding the same silence.
+                    due = time.monotonic() + self._PARTIAL_INTERVAL_S
+                    continue
+                if time.monotonic() < due:
+                    time.sleep(self._SPECULATE_POLL_S)
+                    continue
                 started = time.monotonic()
                 audio = self.recorder.snapshot_audio()
                 if audio is not None:
@@ -977,10 +1030,148 @@ class JarvisApp:
                         bus.publish(PartialText(text=text))
                 # pace from the END of the decode, so a slow pass backs off
                 # instead of queueing up behind itself.
-                time.sleep(max(0.05, self._PARTIAL_INTERVAL_S -
-                               (time.monotonic() - started)))
+                due = time.monotonic() + max(0.05, self._PARTIAL_INTERVAL_S -
+                                             (time.monotonic() - started))
         except Exception:
             log.exception("partial loop died")
+
+    # ------------------------------------------- speculative transcription
+    #
+    # Every turn paid the full decode strictly AFTER the recorder stopped,
+    # while the GPU idled through the 0.8 s endpoint silence (ledger
+    # 2026-08-29: dead-air 0.80-0.96 s, then stt 0.40-0.67 s). Once the VAD
+    # has heard _SPECULATE_AFTER_S of silence the clip is decoded on the
+    # partial thread exactly as _process_audio would decode it -- the same
+    # final-clip shaping (recorder.snapshot_final), the same speaker filter,
+    # the same full-quality transcribe -- and if no more speech arrives
+    # before the stop, _process_audio publishes that result instead of
+    # decoding again. The saving is the overlap (~0.4-0.5 s on a short
+    # question), not the whole stt figure. A pause that turns out to be
+    # mid-sentence ("um...") wastes one decode, bounded like a stray
+    # preview; only one pass runs per pause, and one at a time.
+
+    _SPECULATE_AFTER_S = 0.3     # VAD silence before a speculative decode
+    _SPECULATE_POLL_S = 0.08     # endpointer poll cadence on the partial thread
+    _SPECULATE_JOIN_S = 30.0     # never wedge the real path behind a stuck pass
+
+    # Class-level defaults so a bare object (the preview-thread tests build
+    # the app with object.__new__) behaves like an app with no speculation.
+    _speculation = None
+    _spec_lock = threading.Lock()
+    _stop_event = None
+    _wake_pending = False
+    _turn_from_wake = False
+    _last_nudge_ts = -1e9
+
+    def _listening_opt(self, key, default):
+        """assistant.json ``listening.<key>``; silent when there is no
+        assistant config (get_option logs an exception, and this runs on
+        the preview thread several times a second)."""
+        cfg = getattr(self, "assistant", None)
+        if cfg is None:
+            return default
+        try:
+            value = cfg.get(f"listening.{key}", default)
+        except Exception:
+            return default
+        return default if value is None else value
+
+    def _decode_clip(self, audio):
+        """The one decode path for a captured clip: speaker filter, then the
+        full transcribe. Returns (audio, stats, rejected, result); rejected
+        means the speaker gate dropped the whole clip (result is None)."""
+        stats = {}
+        if CONFIG.speaker_verify and self.speaker.enrolled:
+            filtered, stats = self.speaker.filter_segments(audio)
+            if filtered is None:
+                return audio, stats, True, None
+            audio = filtered
+        return audio, stats, False, self.transcriber.transcribe(audio)
+
+    def _maybe_speculate(self) -> bool:
+        """Run one speculative decode when the VAD has heard
+        _SPECULATE_AFTER_S of silence since a word that has not been
+        speculated yet. Returns True when a pass held the model."""
+        rec = self.recorder
+        ep = getattr(rec, "endpointer", None)
+        if ep is None or not CONFIG.endpoint_vad or \
+                not self._listening_opt("speculative_stt", True):
+            return False
+        if not getattr(self.transcriber, "loaded", True):
+            return False                # never load whisper from the preview thread
+        try:
+            gap, key = ep.silence_since_speech, ep.last_speech_seconds
+        except Exception:
+            return False                # a stub or a broken endpointer: no speculation
+        if gap is None or key is None or gap < self._SPECULATE_AFTER_S:
+            return False
+        with self._spec_lock:
+            if not rec.recording:
+                return False            # the stop fired: that decode is _process_audio's
+            prev = self._speculation
+            if prev is not None and prev.key == key:
+                return False            # this pause was already decoded
+            spec = _Speculation(key)
+            self._speculation = spec
+        audio = None
+        try:
+            audio = rec.snapshot_final()
+            if audio is not None:
+                spec.audio, spec.stats, spec.rejected, spec.result = \
+                    self._decode_clip(audio)
+        except Exception as exc:        # noqa: BLE001 - best effort by design
+            spec.error = exc
+            log.debug("speculative decode failed", exc_info=True)
+        finally:
+            spec.finished = time.monotonic()
+            spec.done.set()
+        if audio is None:
+            return False                # too short to shape: nothing ran
+        result = spec.result
+        text = (result.text or "").strip() if result is not None else ""
+        if text and result.accepted and rec.recording:
+            # The speculative text IS the best preview there is.
+            bus.publish(PartialText(text=text))
+        log.debug("speculative decode at last_speech=%.2fs took %.2fs (%s)",
+                  key, spec.finished - spec.started,
+                  "rejected" if spec.rejected else repr(text))
+        return True
+
+    def _take_speculation(self):
+        """The speculative decode for the clip that just stopped, or None.
+
+        Takes the stash (a later pass can never be mistaken for this
+        turn), waits for a pass still in flight -- a second decode would
+        only queue behind it on the model lock -- and validates it: the
+        stop must be the VAD's own (a manual or energy stop may hold frames
+        the endpointer never scored) and the last word the VAD heard must
+        be the one that was speculated (more speech followed otherwise).
+        """
+        with self._spec_lock:
+            spec, self._speculation = self._speculation, None
+        if spec is None:
+            return None
+        if not spec.done.wait(self._SPECULATE_JOIN_S):
+            log.warning("speculative decode still running after %.0fs; decoding normally",
+                        self._SPECULATE_JOIN_S)
+            return None
+        ev = self._stop_event
+        ep = getattr(self.recorder, "endpointer", None)
+        try:
+            key = ep.last_speech_seconds if ep is not None else None
+        except Exception:
+            key = None
+        endpoint = getattr(ev, "endpoint", "") if ev is not None else ""
+        if endpoint != "vad":
+            log.info("speculative decode discarded: stop=%s", endpoint or "?")
+            return None
+        if key is None or key != spec.key:
+            log.info("speculative decode discarded: speech followed (%.2fs -> %s)",
+                     spec.key, "%.2fs" % key if key is not None else "-")
+            return None
+        if not spec.usable:
+            return None
+        return spec
 
     def _install_endpointer(self):
         """Silero VAD for the recorder. Its own step, with no dependency on
@@ -1013,6 +1204,13 @@ class JarvisApp:
         self._last_learn_ts = -1e9
         self._say_again_count = 0
         self._stream_muted = False
+        # speculative transcription (_maybe_speculate) and the nudge policy
+        self._speculation = None
+        self._spec_lock = threading.Lock()
+        self._stop_event = None               # the RecordingStopped being processed
+        self._wake_pending = False            # a wake word is opening the mic
+        self._turn_from_wake = False          # this capture answers a wake word
+        self._last_nudge_ts = -1e9            # monotonic; see _last_guest_ts
         name = self.assistant.user_name if self.assistant is not None else "Hunter"
         self._guest_line = GUEST_LINE.format(name=name)
 
@@ -1069,6 +1267,7 @@ class JarvisApp:
         if self.recorder.recording or self._audio_busy.is_set() or self._turn_busy.is_set():
             return
         log.info("follow-up window: listening %.1fs without a wake word", CONFIG.followup_window)
+        self._wake_pending = False          # nothing heard here is a normal outcome
         threading.Timer(0.15, lambda: self.recorder.start(followup=True)).start()
 
     # ---------------------------------------------------- guests, learning
@@ -1235,7 +1434,10 @@ class JarvisApp:
         self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason)
 
     def _turn_on_transcribed(self, ev):
-        self.turns.mark("stt", at=ev.t)
+        # A reused speculative decode makes "stt" the time from the stop to
+        # the publish, which is honest -- but only with the note saying why.
+        notes = {"decode": "speculative"} if getattr(ev, "speculative", False) else {}
+        self.turns.mark("stt", at=ev.t, **notes)
         if not ev.accepted:
             self.turns.abandon(f"rejected:{ev.reject_reason or 'confidence'}")
         elif not (ev.text or "").strip():
@@ -1276,9 +1478,12 @@ class JarvisApp:
     def _on_recording_stopped(self, ev):
         if ev.reason == "abort":
             return
+        self._stop_event = ev               # _take_speculation / _nudge read it
         audio = self.recorder.last_audio
         if audio is None:
+            # "No audio captured" and "Too short" both land here.
             self.turns.abandon("no_audio")
+            self._nudge("no_audio")
             return
         self._audio_busy.set()
         threading.Thread(target=self._process_audio, args=(audio,),
@@ -1287,20 +1492,29 @@ class JarvisApp:
     def _process_audio(self, audio):
         stats = {}
         try:
-            if CONFIG.speaker_verify and self.speaker.enrolled:
-                filtered, stats = self.speaker.filter_segments(audio)
-                if filtered is None:
-                    bus.publish(Transcribed(
-                        text="", accepted=False, reject_reason="speaker",
-                        speaker_score=float(stats.get("best_score", 0.0))
-                        if isinstance(stats, dict) else 0.0))
-                    return
-                audio = filtered
-            result = self.transcriber.transcribe(audio)
+            spec = self._take_speculation()
+            if spec is not None:
+                audio, stats = spec.audio, spec.stats
+                rejected, result = spec.rejected, spec.result
+                stop_t = getattr(self._stop_event, "t", spec.finished)
+                log.info("speculative transcript reused: decode %.2fs, ready %.2fs %s the stop",
+                         spec.finished - spec.started, abs(spec.finished - stop_t),
+                         "before" if spec.finished <= stop_t else "after")
+            else:
+                audio, stats, rejected, result = self._decode_clip(audio)
+            if rejected:
+                bus.publish(Transcribed(
+                    text="", accepted=False, reject_reason="speaker",
+                    speaker_score=float(stats.get("best_score", 0.0))
+                    if isinstance(stats, dict) else 0.0,
+                    speculative=spec is not None))
+                self._nudge("speaker")
+                return
             bus.publish(Transcribed(
                 text=result.text, confidence=result.confidence,
                 accepted=result.accepted,
-                reject_reason="" if result.accepted else "confidence"))
+                reject_reason="" if result.accepted else "confidence",
+                speculative=spec is not None))
             text = result.text.strip()
             if result.accepted and text:
                 self._say_again_count = 0
@@ -1318,11 +1532,16 @@ class JarvisApp:
                     log.info("low confidence again (%.2f): %r -> staying quiet",
                              result.confidence, text)
                     self.turns.abandon("rejected:confidence")
+                    self._nudge("confidence")
                 else:
                     log.info("low confidence (%.2f): %r -> asking again",
                              result.confidence, text)
                     self._say(SAY_AGAIN_LINE)
                     self._followup_after_speech = True
+            else:
+                # Accepted but empty (the VAD pass found no words): the
+                # ledger says "empty"; the user hears the nudge, not silence.
+                self._nudge("empty")
         except Exception:
             log.exception("audio processing failed")
             bus.publish(Status(text="Transcription failed", kind="error"))
@@ -1331,6 +1550,50 @@ class JarvisApp:
             # Must run on every path: a leaked flag makes every future wake
             # word a no-op, which looks exactly like a dead microphone.
             self._audio_busy.clear()
+
+    def _nudge(self, reason: str):
+        """The "did not catch that" policy: a cue instead of silence.
+
+        A wake word promises a reply, and several outcomes used to end in
+        nothing at all -- a clip the speaker gate dropped, an empty
+        transcript, "No audio captured" / "Too short" (status text only), a
+        second garbled clip -- which reads as a dead microphone. By cause:
+
+        - no_audio / empty: nothing was heard, so a short spoken "Sir?" and
+          a follow-up window, so the question can simply be repeated.
+        - speaker / confidence: a non-verbal earcon only. A rejected clip
+          may be a guest (a spoken line would answer them) or the user
+          under a strict threshold (silence would be wrong), and a second
+          garbled clip is usually the room reaching the mic, so re-opening
+          it would loop.
+
+        Wake-word turns only: a follow-up window that hears nothing is the
+        normal case, and the mic button shows its own status. Rate-limited
+        (listening.nudge_cooldown_s) so a noisy room cannot make him
+        chatter; every outcome still lands in turns.jsonl for tuning.
+        """
+        ev = self._stop_event
+        if ev is not None and getattr(ev, "followup", False):
+            return
+        if not self._turn_from_wake:
+            return
+        if not self._listening_opt("nudge", True):
+            return
+        if getattr(self, "_tts_active", False):
+            return                      # he is talking already (a barge-in wake)
+        now = time.monotonic()
+        cooldown = float(self._listening_opt("nudge_cooldown_s", 30) or 0)
+        if now - self._last_nudge_ts < cooldown:
+            log.info("nudge (%s) suppressed: within %.0fs of the last", reason, cooldown)
+            return
+        self._last_nudge_ts = now
+        spoken = reason in ("no_audio", "empty") and CONFIG.talkback
+        log.info("nudge (%s): %s", reason, "spoken" if spoken else "earcon")
+        if spoken:
+            self._say(NUDGE_LINE)
+            self._followup_after_speech = True
+        else:
+            threading.Thread(target=play_beep, args=("nudge",), daemon=True).start()
 
     # -------------------------------------------------------------- routing
     def _emit_result(self, result):

@@ -525,6 +525,28 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 - **He learns your voice** — a confident match joins the voiceprint (at most every 10 min).
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
+- **He starts transcribing before you have finished pausing** — once the VAD has heard
+  0.3 s of silence the clip is decoded while the 0.8 s endpoint silence runs out; if you
+  said nothing more, that result is used the moment the recorder stops (about 0.4-0.5 s
+  off a short question). The `turn:` line says `decode=speculative` when it was reused;
+  `listening.speculative_stt: false` turns it off.
+- **"Sir?" instead of silence** — after a wake word that captured nothing usable he says
+  "Sir?" and listens again without the wake word; a clip that was not your voice, or a
+  second garbled one in a row, gets a low beep instead. Never in a follow-up window, never
+  from the mic button, and at most once every `listening.nudge_cooldown_s` (30) seconds;
+  `listening.nudge: false` turns it off.
+
+### Listening options (`listening` in assistant.json)
+
+```json
+"listening": {"speculative_stt": true, "nudge": true, "nudge_cooldown_s": 30}
+```
+
+Both are fully local and cost nothing new: the speculative decode is the same whisper pass
+moved earlier (a pause that turns out to be mid-sentence wastes one decode, bounded like a
+live-transcript preview), and the cue is a prewarmed line or a generated beep
+(`/tmp/vss_voice/beep_nudge.wav`). Tune from `turns.jsonl`: a `no_audio` / `empty` /
+`rejected:*` outcome followed by an `audio` turn within the window is a cue that worked.
 
 ---
 
