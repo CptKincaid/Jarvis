@@ -552,6 +552,37 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 - **He learns your voice** — a confident match joins the voiceprint (at most every 10 min).
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
+- **"Anything wrong in your log?"** — see the next section.
+
+## 18. Log triage: "anything wrong in your log?" / "why was that slow?"
+
+You are Jarvis's developer, so the fastest bug report is Jarvis reading his own
+log. Nothing to configure.
+
+- **"Anything wrong in your log?"** (also "check your log", "any errors in your
+  log today", "what's in your log", "log triage"). He clusters the WARNING and
+  ERROR lines in the last 400 lines of `/tmp/vss_voice/jarvis.log` by logger and
+  message (numbers, paths and ids folded, so two "watchdog fired after 45s / 61s"
+  lines are one thing), drops the known noise (the tools-registry budget warning,
+  the memory migrated-dir notice — the list is `NOISE` in `jarvis/logtriage.py`),
+  and speaks two sentences: "Three things in the log, sir: 'audio processing
+  failed' from app five times, 'speaker verify FAILED SHUT' from speaker once
+  and one more on the card, last at 13:20. On the ledger, two turns waited over
+  5 seconds." The text card lists every cluster with its count, last time and
+  the traceback that followed it. A clean tail gets "Nothing wrong in the log,
+  sir; the last 400 lines are clean."
+- **"Why was that slow?"** (also "why did that take so long", "what took so
+  long", "where did the time go", "break down that turn"). From the last real
+  record in `turns.jsonl` (the ledger `jarvis/turnclock.py` writes; a closed
+  follow-up window does not count, and the record may be hours old): "The last
+  turn waited 6.3 seconds, sir: 2.7 seconds silence before the recorder stopped,
+  0.7 seconds transcribing, 2.9 seconds working out the answer; the answer was
+  the slow part. The energy timer stopped it, not the voice detector." The
+  answer stage is the model and its tools together — the ledger has no mark
+  between them. A turn that got no answer says why (uncertain, rejected…).
+- The log line has no date, so the window is the tail of the file, never "the
+  last N minutes" (it survives midnight and a quiet evening alike). The same
+  clustering now feeds the local model's "recent errors" context slice.
 
 ---
 

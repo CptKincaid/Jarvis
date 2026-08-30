@@ -1543,6 +1543,58 @@ def _h_diagnostics(c, t, m):
     return CommandResult(handled=True, reply=line, speak=True, status="Diagnostics")
 
 
+# Jarvis reading his own log (jarvis/logtriage.py): the developer's fastest
+# bug report.  Log-specific words only -- "what went wrong" alone is the
+# persona's, and "any errors" without "log" could be about a build.
+_LOGTRIAGE_RX = re.compile(
+    r"^(?:(?:is|was) there |is )?anything (?:wrong|bad|broken|amiss|off|new) "
+    r"(?:in|with) (?:your|the) logs?(?: today| lately| recently)?\W*$"
+    r"|^(?:check|read|look at|scan|triage|go through|review) (?:your|the) logs?"
+    r"(?: for (?:errors|problems|trouble|warnings))?\W*$"
+    r"|^(?:any|what|which) (?:errors|warnings|problems|trouble|failures) "
+    r"(?:in|from|on) (?:your|the) logs?(?: today| lately| recently)?\W*$"
+    r"|^what(?:'s| is) (?:in|wrong in|wrong with) (?:your|the) logs?\W*$"
+    r"|^(?:log|logs) triage\W*$|^triage (?:your|the) logs?\W*$", re.I)
+_SLOW_RX = re.compile(
+    r"^why (?:was|is|did) (?:that|it|this|the last (?:one|turn|answer|reply))"
+    r"(?: so| take so)? (?:slow|long)\W*$"
+    r"|^why did (?:that|it|this) take (?:so|that) long\W*$"
+    r"|^what took (?:you )?so long\W*$|^where did the time go\W*$"
+    r"|^why (?:so|the) slow\W*$|^what was slow(?: about (?:that|it))?\W*$"
+    r"|^(?:break down|explain) (?:that|the last) turn\W*$", re.I)
+
+
+def _h_log_triage(c, t, m):
+    """"Anything wrong in your log?": two spoken sentences; the clusters
+    and their tracebacks go to the text card (a display-only JarvisReply)."""
+    fn = c._svc("log_triage")
+    if fn is None:
+        return None
+    card = ""
+    try:
+        out = fn()
+        spoken, card = (out if isinstance(out, tuple) else (str(out), ""))
+    except Exception:
+        log.exception("log triage failed")
+        spoken = "I'm afraid I couldn't read my own log, sir."
+    if card:
+        bus.publish(JarvisReply(text=card, speak=False))
+    return CommandResult(handled=True, reply=spoken, speak=True, status="Log triage")
+
+
+def _h_slow_turn(c, t, m):
+    """"Why was that slow?": the last real turn on the ledger, by stage."""
+    fn = c._svc("slow_turn")
+    if fn is None:
+        return None
+    try:
+        line = fn()
+    except Exception:
+        log.exception("slow-turn lookup failed")
+        line = "I'm afraid I couldn't read the turn ledger, sir."
+    return CommandResult(handled=True, reply=line, speak=True, status="Turn breakdown")
+
+
 def _h_last_mail(c, t, m):
     if _MAIL_WRITE_RX.search(t):
         return None
@@ -1956,6 +2008,8 @@ REGISTRY: list[Command] = [
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
+    Command("log triage", _LOGTRIAGE_RX.match, _h_log_triage),
+    Command("slow turn", _SLOW_RX.match, _h_slow_turn),
     # After the briefing: "good morning" is a briefing trigger first.
     Command("greeting", greeting_kind, _h_greeting),
     Command("good night",
@@ -2032,6 +2086,7 @@ ASSISTANT_TIER1: list[Command] = [
                     "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me",
+                    "log triage", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router
                     # would hand Claude the bare words "fix what i copied".
