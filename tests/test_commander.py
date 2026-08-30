@@ -869,6 +869,34 @@ def test_briefing_only_when_enabled(rich, services):
                                                 force_tool="get_briefing")
 
 
+def test_last_mail_by_voice_reaches_tier1_and_pins_the_read_flag(rich, services,
+                                                                   monkeypatch):
+    """"What was my last email about?" arrives with NO "jarvis" prefix -- the
+    hotword consumed it -- and that path runs ASSISTANT_TIER1, not REGISTRY.
+    The command was first added to REGISTRY alone, so it never fired by
+    voice, which is the only way it is used. The handler-level tests in
+    test_last_mail_routing.py could not see that; this one drives handle()."""
+    from jarvis.commander import _LAST_MAIL_HOURS
+    monkeypatch.setattr(rich.intent, "classify",
+                        lambda text: (IntentClassifier.YES, 0.9))
+    res = rich.handle("What was my last email about?", source="voice")
+    # Tier 1 hands the handler the lower-cased, de-punctuated text.
+    services.brain.chat.assert_called_once_with(
+        "what was my last email about", force_tool="get_mail",
+        force_args={"limit": 1, "since_hours": _LAST_MAIL_HOURS,
+                    "unread_only": False})
+    assert res.handled and res.done is False
+    # and typed, which skips the intent gate entirely
+    services.brain.chat.reset_mock()
+    rich.handle("my latest email", source="typed")
+    assert services.brain.chat.call_args.kwargs["force_args"]["unread_only"] is False
+    # "message" is not mail here: Discord, notes and sessions all use the word
+    services.brain.chat.reset_mock()
+    rich.handle("what was the last message you sent", source="typed")
+    for call in services.brain.chat.call_args_list:
+        assert call.kwargs.get("force_tool") != "get_mail", call
+
+
 def test_assistant_tier1_is_a_subset_of_the_registry_in_order():
     names = [c.name for c in ASSISTANT_TIER1]
     reg = [c.name for c in REGISTRY]

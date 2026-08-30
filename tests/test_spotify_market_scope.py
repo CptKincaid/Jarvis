@@ -32,9 +32,32 @@ class _Tool(SpotifyTool):
         return {"ok": True}
 
 
+class _Translating(SpotifyTool):
+    default_device = "HPCOMPUTER"        # shadows the cfg-backed property
+
+
 def _scope_403():
-    return SpotifyError("Spotify isn't answering, sir.", "api",
-                        "http status: 403, Insufficient client scope", 403)
+    """A REAL spotipy exception through the REAL _translate.
+
+    The first version of this test hand-wrote the error text with "scope" in
+    it and passed while the production path was dead: spotipy's message
+    begins with the request URL, so on a real search "scope" sits at index
+    157 of 162 and _translate's 80-char cut removed it before the check.
+    """
+    from spotipy.exceptions import SpotifyException
+    url = ("https://api.spotify.com/v1/search?q=Jingle+Bells+Bombay+Dub+Orchestra"
+           "+Remix+Joe+Williams&limit=5&offset=0&type=track&market=from_token")
+    raw = SpotifyException(403, -1, "%s:\n %s" % (url, "Insufficient client scope"),
+                           reason=None)
+    assert raw.msg.find("scope") > 80, "fixture no longer reproduces the truncation"
+    t = object.__new__(_Translating)
+    return t._translate(raw)
+
+
+def test_a_real_scope_403_is_classified_before_truncation():
+    err = _scope_403()
+    assert err.kind == "scope" and err.status == 403
+    assert not err.fatal, "a scope error is routable; it must not short-circuit"
 
 
 def test_scope_denied_403_retries_without_the_market():

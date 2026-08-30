@@ -692,6 +692,13 @@ class SpotifyTool:
         if status == 403 and "restriction" in low:
             return SpotifyError(RESTRICTED_LINE, "restricted",
                                 "spotify: restriction violated")
+        if status == 403 and "scope" in low:
+            # Classified HERE, on the full message: spotipy's text starts with
+            # the request URL, so "Insufficient client scope" sits past the
+            # 80-char cut below (index 157 of 162 on a real search) and a
+            # substring check on the stored text never sees it.
+            return SpotifyError(API_DOWN_LINE, "scope",
+                                "spotify: insufficient client scope", status=403)
         if status == 429:
             return SpotifyError(RATE_LIMIT_LINE, "api", "spotify: rate limited")
         if status is None and name in ("ConnectionError", "Timeout", "ReadTimeout",
@@ -724,8 +731,7 @@ class SpotifyTool:
         except SpotifyError as exc:
             stripped = {k: v for k, v in kwargs.items()
                         if k not in ("market", "country")}
-            denied = str(getattr(exc, "text", "") or exc).lower()
-            scope_denied = exc.status == 403 and "scope" in denied
+            scope_denied = exc.kind == "scope"
             if (exc.status != 400 and not scope_denied) or stripped == kwargs:
                 raise
             log.warning("spotify: %s rejected market=%r; retrying without it",

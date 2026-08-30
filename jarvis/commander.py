@@ -1362,8 +1362,10 @@ def _h_briefing(c, t, m):
 # that question, in the parameter description the model is shown -- and the
 # model still chose true, so the answer skipped every read message and named
 # an older one as the latest. Pin it here rather than ask again more loudly.
+# Mail words only: "message" also means Discord, notes and Claude sessions
+# in this app, so "the last message you sent" must not be hijacked into mail.
 _LAST_MAIL_RX = re.compile(
-    r"\b(?:last|latest|most recent|newest)\s+(?:e-?mails?|messages?)\b", re.I)
+    r"\b(?:last|latest|most recent|newest)\s+(?:e-?mails?|mails?)\b", re.I)
 _LAST_MAIL_HOURS = 168        # a week: "my last email" is not "since midnight"
 
 
@@ -1846,7 +1848,7 @@ REGISTRY: list[Command] = [
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
-                    "briefing", "greeting", "todo done", "todo add",
+                    "briefing", "last mail", "greeting", "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me")
 ]

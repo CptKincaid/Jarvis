@@ -21,7 +21,7 @@ from jarvis.commander import _LAST_MAIL_RX, _h_last_mail
     "what was my last email about?",
     "my latest email",
     "read me my most recent email",
-    "what's my newest message",
+    "what's my newest mail",
     "tell me about my last e-mail",
 ])
 def test_the_phrasings_that_mean_most_recent(said):
@@ -34,6 +34,8 @@ def test_the_phrasings_that_mean_most_recent(said):
     "check my email",
     "send an email to mum",
     "what's in my inbox",
+    "what was the last message you sent",     # discord / notes / session, not mail
+    "read my latest message",
 ])
 def test_unread_and_send_queries_are_left_alone(said):
     """These genuinely want the UNSEEN default, or are not a read at all."""
