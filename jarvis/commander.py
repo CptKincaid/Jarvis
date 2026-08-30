@@ -37,7 +37,8 @@ one optional — a missing member falls back to the legacy path):
     assistant  AssistantConfig: get(dotted, default), setup_line(section)
     router     Router: route(text, active_project) -> RouteDecision,
                pending(), resolve_answer(text), clear_pending()
-    brain      + chat(text, force_tool=None, force_args=None), local_line(instruction, text,
+    brain      + chat(text, force_tool=None, force_args=None), web_answer(question, model),
+               local_line(instruction, text,
                fallback=""), classify_route(text)
     timekeeper add_timer(seconds, label), add_reminder(due, text),
                add_alarm(due, label, repeat), list_text(kind), cancel(which,
@@ -84,6 +85,8 @@ STOPPED_LINE = "Stopped, sir."
 NOTHING_RUNNING_LINE = "Nothing's running, sir."
 CLAUDE_ACK_FALLBACK = "Right away, sir."
 CLAUDE_SETUP_LINE = "I'll need Claude set up first, sir."
+WEB_LOOKUP_LINE = "Looking that up, sir."
+WEB_UNAVAILABLE_LINE = "I can't reach the web for that just now, sir."
 TIMEKEEPER_SETUP_LINE = "I'll need my timekeeper set up first, sir."
 NO_WHEN_LINE = "I didn't catch when, sir."
 
@@ -495,6 +498,7 @@ class CommandResult:
     speak: bool = False               # speak `reply` via TTS
     status: Optional[str] = None      # short status-strip text
     done: bool = True                 # False → async work still in flight
+    ack: bool = False                 # `reply` acknowledges; the answer follows
 
 
 @dataclass
@@ -2372,6 +2376,27 @@ class Commander:
         self._pending_terminal_slug = ""       # a new subject drops the offer
         return None
 
+    def _web_lookup(self, d) -> CommandResult:
+        """A question for the internet: acknowledge now, answer when the
+        one-shot lands (brain.web_answer speaks it through the brain
+        callback, which also closes the turn)."""
+        brain = self._svc("brain")
+        if brain is None or not hasattr(brain, "web_answer"):
+            return CommandResult(handled=True, reply=WEB_UNAVAILABLE_LINE,
+                                 speak=True, status="Web unavailable")
+        model = _assistant_get(self, "claude.web_model", "haiku")
+        try:
+            started = brain.web_answer(d.prompt, model=model)
+        except Exception:
+            log.exception("web lookup failed to start")
+            started = None
+        if not started:
+            return CommandResult(handled=True, reply=WEB_UNAVAILABLE_LINE,
+                                 speak=True, status="Web unavailable")
+        log.info("web lookup (%s): %r", model, d.prompt)
+        return CommandResult(handled=True, reply=WEB_LOOKUP_LINE, speak=True,
+                             ack=True, status="Looking it up…", done=False)
+
     def _try_assistant(self, text: str) -> Optional[CommandResult]:
         """Unprefixed Tier 1 for the assistant tools (jarvis mode)."""
         t = text.strip().lower().rstrip(".!?")
@@ -2452,6 +2477,8 @@ class Commander:
         if d.kind == "ask":
             return CommandResult(handled=True, reply=ROUTER_QUESTION,
                                  speak=True, status="Which way?")
+        if d.kind == "web":
+            return self._web_lookup(d)
         if d.kind == "claude":
             if claude is None:
                 line = self._setup_line("claude", CLAUDE_SETUP_LINE)

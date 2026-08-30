@@ -115,6 +115,18 @@ PARTIAL_RESULT_LINE = ("That's only part of it, sir; there was more than I "
                        "could take in at once.")
 # Spoken when something inside the brain raised. Never the exception text.
 INTERNAL_ERROR_LINE = "I'm afraid something went wrong on my end, sir."
+# Web lookups run as a one-shot `claude -p` with search allowed (the CLI has
+# it built in; nothing new in the venv). Measured 2026-08-29: ~12 s with one
+# search on haiku or sonnet, 28 s when the model went off fetching pages.
+WEB_TIMEOUT_S = 60.0
+WEB_SLOW_LINE = "That lookup is taking longer than I'd like, sir."
+WEB_FAIL_LINE = "I couldn't get a straight answer from the web on that, sir."
+WEB_PROMPT = (
+    "You are answering a spoken question for a voice assistant. Use web search "
+    "(one or two searches; fetch a page only if the result snippets are not "
+    "enough). Reply in at most two short sentences of plain spoken English: no "
+    "markdown, no bullet points, no links, no source list, no preamble. If you "
+    "cannot find it, say so in one sentence.\n\nQuestion: {q}")
 _PARTIAL_RX = re.compile(
     r"\b(?:part|partial|truncat|cut off|shortened|only some|first few)",
     re.I)
@@ -668,6 +680,24 @@ def clean_ollama_reply(text):
     return text.strip()
 
 
+_URL_RX = re.compile(r"\bhttps?://\S+|\bwww\.\S+", re.I)
+_MD_LINK_RX = re.compile(r"\[([^\]]+)\]\([^)]*\)")
+_SOURCES_RX = re.compile(r"^\s*(?:sources?|references?|citations?)\s*:.*$",
+                         re.I | re.M | re.S)
+
+
+def clean_web_answer(text, max_sentences=3):
+    """A spoken line from a one-shot web answer: the model was told no links
+    and no source list, and sonnet appended "Sources: [..](..)" anyway."""
+    text = text or ""
+    text = _SOURCES_RX.sub("", text)          # from "Sources:" to the end
+    text = _MD_LINK_RX.sub(r"\1", text)       # [text](url) -> text
+    text = _URL_RX.sub("", text)
+    text = strip_markdown(text)
+    text = re.sub(r"\s+", " ", text).strip(" -–—:;,")
+    return trim_spoken(limit_sentences(text, max_sentences))
+
+
 def strip_markdown(text):
     """Bold, code spans, headings, tables and URLs out; whitespace
     collapsed. Runs AFTER clean_ollama_reply (it destroys the line breaks
@@ -947,6 +977,54 @@ class JarvisBrain:
 
     def classify_route(self, text, timeout=CLASSIFY_TIMEOUT_S):
         return classify_route(text, timeout=timeout)
+
+    def web_answer(self, question, callback=None, model="haiku",
+                   timeout=WEB_TIMEOUT_S):
+        """Answer a question from the web through a one-shot `claude -p` on
+        a worker thread; the callback gets [("SPEAK", line)] like chat().
+        Returns the thread, or None when the CLI is missing or the brain is
+        busy (the busy line is spoken through the callback)."""
+        if not MACHINE.claude_bin:
+            return None
+        if not self._acquire_busy():
+            if callback:
+                callback([("SPEAK", "Still on the last one, sir. One moment.")])
+            return None
+
+        def _process():
+            bus.publish(BrainState(state="thinking"))
+            try:
+                out = self._run_claude(
+                    WEB_PROMPT.format(q=question), timeout=timeout,
+                    extra_args=["--model", str(model or "haiku"),
+                                "--allowedTools", "WebSearch,WebFetch"])
+                if self._cancelled:
+                    log.info("web answer cancelled; dropping result")
+                    return
+                line = clean_web_answer(out) or WEB_FAIL_LINE
+                log.info("web answer (%s): %.80s", model, line)
+                tags = [("SPEAK", line)]
+                try:
+                    self._remember(question, tags)
+                except Exception:
+                    log.debug("web answer remember failed", exc_info=True)
+                if callback:
+                    callback(tags)
+            except subprocess.TimeoutExpired:
+                log.warning("web answer timed out after %.0fs", timeout)
+                if callback and not self._cancelled:
+                    callback([("SPEAK", WEB_SLOW_LINE)])
+            except Exception:
+                log.exception("web answer error")
+                if callback and not self._cancelled:
+                    callback([("SPEAK", WEB_FAIL_LINE)])
+            finally:
+                self._busy = False
+                bus.publish(BrainState(state="idle"))
+
+        t = threading.Thread(target=_process, daemon=True, name="brain-web")
+        t.start()
+        return t
 
     def summarize(self, text, max_sentences=2, timeout=6.0):
         return summarize(text, max_sentences=max_sentences, timeout=timeout)
@@ -1358,17 +1436,18 @@ class JarvisBrain:
 
         return [("SPEAK", "I'm afraid that one got away from me, sir.")]
 
-    def _run_claude(self, prompt, timeout):
+    def _run_claude(self, prompt, timeout, extra_args=None):
         """Run the Claude CLI with the prompt on stdin.
 
         Uses Popen (not run) so cancel() can kill it mid-flight. The
         binary's own dir is prepended to PATH for any helpers it spawns.
+        ``extra_args`` go after the fixed flags (--model, --allowedTools).
         """
         claude = MACHINE.claude_bin
         env = dict(os.environ)
         env["PATH"] = f"{Path(claude).parent}:{env.get('PATH', '')}"
         proc = subprocess.Popen(
-            [claude, "-p", "--output-format", "text"],
+            [claude, "-p", "--output-format", "text", *(extra_args or [])],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, env=env,
         )

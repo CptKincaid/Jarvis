@@ -377,12 +377,13 @@ class JarvisApp:
                                            "NO_SESSION_LINE")),
                 ("jarvis.approvals", ("TIMEOUT_LINE", "ALLOWED_LINE",
                                       "DECLINED_LINE")),
-                ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE")),
+                ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE",
+                                      "WEB_LOOKUP_LINE", "WEB_UNAVAILABLE_LINE")),
                 ("jarvis.tools.timekeeper", ("NOTHING_RINGING_LINE",
                                              "NO_TIMEKEEPER_LINE")),
                 ("jarvis.brain", ("MODEL_DOWN_LINE", "MODEL_SLOW_LINE",
                                   "MODEL_EMPTY_LINE", "TOOL_ONLY_LINE",
-                                  "PARTIAL_RESULT_LINE", "INTERNAL_ERROR_LINE",
+                                  "PARTIAL_RESULT_LINE", "INTERNAL_ERROR_LINE", "WEB_SLOW_LINE", "WEB_FAIL_LINE",
                                   "NO_CLOCK_LINE", "UNSURE_CLOCK_LINE"))):
             mod = sys.modules.get(modname)
             for name in names:
@@ -478,9 +479,13 @@ class JarvisApp:
             return b.chat(text, callback=app._on_brain_tags,
                           force_tool=force_tool, **extra)
 
+        def web_answer(question, model="haiku"):
+            return b.web_answer(question, callback=app._on_brain_tags, model=model)
+
         brain_ns = SimpleNamespace(
             think=lambda text: b.think(text, callback=app._on_brain_tags),
             chat=chat,
+            web_answer=web_answer,
             # Delegate lazily rather than capturing the bound methods: the
             # namespace is built once at init, so a snapshot here would make
             # `app.brain.<fn> = ...` (tests, and any later brain swap) a no-op
@@ -1019,6 +1024,10 @@ class JarvisApp:
         if result.reply:
             bus.publish(JarvisReply(text=result.reply, speak=result.speak))
             if result.speak:
+                if getattr(result, "ack", False):
+                    # "Looking that up, sir." is speech, not the answer: the
+                    # turn ledger records it as a filler and keeps waiting.
+                    self._turn_filler_pending = True
                 self._say(result.reply)
         if result.status:
             bus.publish(Status(text=result.status, kind="info"))

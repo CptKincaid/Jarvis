@@ -292,6 +292,15 @@ directory. Two equal candidates get one question naming both.
 **The terminal button** (next to the mic) opens the tmux session Claude is
 working in; a second click raises the same window.
 
+### Web lookups
+
+"Look up …", "search the web for …", "who won …", "what's the latest news about …",
+"price of …" go to a one-shot `claude -p` with web search allowed — the CLI has it
+built in, so nothing is added to the venv. Jarvis says "Looking that up, sir." at once
+and speaks the answer when it lands (~12–15 s). `claude.web_model` picks the model
+(default `haiku`: fastest, and it obeys "no links"; `sonnet` works too). This is the
+one path that leaves the machine; everything else stays local.
+
 ## 10. Always on: start at login, never sleep
 
 Alarms and reminders ring only while Jarvis runs, so let him start with the

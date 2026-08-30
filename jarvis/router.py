@@ -68,9 +68,26 @@ DEFAULT_SKILL_PHRASES = {
 }
 
 
+
+# Questions that need the internet: an explicit ask to look something up, or
+# the shapes of a current fact (a result, a price, a headline about X). Kept
+# narrow on purpose: "what's the weather" and "what's the news" have local
+# tools, and anything not matched still reaches the local model.
+_WEB_CUE_RX = re.compile(
+    r"\b(?:look (?:it|that|this|them|him|her)? ?up\b|search (?:the web|online|the internet|for)\b|"
+    r"google\b|web search\b|search up\b|"
+    r"latest (?:news|scores?|results?|prices?|version|release)\b|"
+    r"(?:news|headlines?|updates?) (?:about|on|from|for)\b|"
+    r"who won\b|what(?:'s| is) the score\b|price of\b|stock price\b|exchange rate\b|"
+    r"how much (?:is|does|do|did) .+? (?:cost|worth|sell for)\b|"
+    r"what happened (?:to|with|in|at)\b|"
+    r"is .+? open (?:right )?(?:today|now|tonight|tomorrow|at the moment)\b|"
+    r"when (?:does|is|did|will) .+? (?:come out|release|start|open|close|premiere|air)\b)",
+    re.I)
+
 @dataclass
 class RouteDecision:
-    kind: str                 # "local" | "claude" | "ask" | "action"
+    kind: str                 # "local" | "claude" | "web" | "ask" | "action"
     reason: str               # rule name, for the log
     prompt: str = ""          # the text handed to Claude (skill-expanded)
     project: str = ""         # slug when the utterance named one
@@ -789,6 +806,13 @@ class Router:
             if explicit:
                 return RouteDecision("local", "claude-cue-empty")
             return RouteDecision("local", "empty")
+
+        # 1c. the web: current facts the local model cannot know and no
+        #     local tool covers. Claude's CLI has search built in, so this
+        #     goes there as a ONE-SHOT question (brain.web_answer), never as
+        #     a coding session -- "ask claude to look up X" lands here too.
+        if _WEB_CUE_RX.search(work):
+            return RouteDecision("web", "web-cue", prompt=work, args=args)
 
         # 2. skill phrases --------------------------------------------
         prompt = self._skill(work)

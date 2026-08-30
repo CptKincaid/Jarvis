@@ -1116,7 +1116,7 @@ def test_turn_ledger_reports_one_line_per_voice_turn(build, monkeypatch):
     monkeypatch.setattr(app.turns, "_emit", got.append)
     _bus.publish(HotwordDetected(score=0.9))
     _bus.publish(RecordingStarted())
-    _bus.publish(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))
+    app._turn_on_stop(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))  # the ledger handler itself; the pipeline's stub audio is noise here
     _bus.publish(Transcribed(text="what time is it", accepted=True))
     app.turns.mark("handle")
     _bus.publish(SpeakingState(active=True, amplitude=0.3))
@@ -1129,7 +1129,7 @@ def test_turn_ledger_reports_one_line_per_voice_turn(build, monkeypatch):
     # a rejected clip closes the turn without a reply
     _bus.publish(HotwordDetected(score=0.9))
     _bus.publish(RecordingStarted())
-    _bus.publish(RecordingStopped(reason="silence", endpoint="energy", dead_air_s=2.5))
+    app._turn_on_stop(RecordingStopped(reason="silence", endpoint="energy", dead_air_s=2.5))  # the ledger handler itself; the pipeline's stub audio is noise here
     _bus.publish(Transcribed(text="", accepted=False, reject_reason="speaker"))
     assert len(got) == 2 and got[1]["outcome"] == "rejected:speaker"
     _bus.publish(SpeakingState(active=True))                     # TTS from elsewhere
@@ -1181,7 +1181,7 @@ def test_a_filler_line_does_not_close_the_ledger(build, monkeypatch):
     app.recorder.recording = False
     _bus.publish(HotwordDetected(score=0.9))
     _bus.publish(RecordingStarted())
-    _bus.publish(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))
+    app._turn_on_stop(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))  # the ledger handler itself; the pipeline's stub audio is noise here
     _bus.publish(Transcribed(text="what's the weather", accepted=True))
     app.turns.mark("handle")
     app._turn_filler_pending = True                   # _say_thinking sets this
@@ -1190,3 +1190,19 @@ def test_a_filler_line_does_not_close_the_ledger(build, monkeypatch):
     _bus.publish(SpeakingState(active=False))
     _bus.publish(SpeakingState(active=True))          # the answer
     assert len(got) == 1 and got[0]["outcome"] == "audio" and got[0]["filler"] is not None
+
+
+def test_services_brain_has_web_answer_and_an_ack_is_a_filler(build, monkeypatch):
+    """The commander only sees the services wrapper (the force_args lesson),
+    and an acknowledgement must not close the turn ledger as the answer."""
+    from jarvis.commander import CommandResult
+    app = build()
+    seen = {}
+    monkeypatch.setattr(app.brain, "web_answer",
+                        lambda q, callback=None, model="haiku": seen.update(q=q, cb=callback, model=model) or "t")
+    assert app.services.brain.web_answer("who won", model="sonnet") == "t"
+    assert seen["q"] == "who won" and seen["model"] == "sonnet" and seen["cb"] == app._on_brain_tags
+    app._turn_filler_pending = False
+    monkeypatch.setattr(app, "_say", lambda text: None)
+    app._emit_result(CommandResult(handled=True, reply="Looking that up, sir.", speak=True, ack=True))
+    assert app._turn_filler_pending is True

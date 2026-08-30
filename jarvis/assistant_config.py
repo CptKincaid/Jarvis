@@ -58,6 +58,7 @@ DEFAULTS: dict = {
         "allowed_dirs": ["/home/hunterp/Jarvis", "/home/hunterp/haymaker-digest"],
         "projects_root": "/home/hunterp/projects",
         "permission_mode": "acceptEdits",
+        "web_model": "haiku",         # one-shot web lookups; fast beats big here
         "dangerously_skip_permissions": False,
         # User decision 2026-08-26: work is auto-approved ANYWHERE, not only
         # under allowed_dirs ("even if its not in the base project directory
