@@ -559,6 +559,18 @@ remembers that too. Labels go to `~/.aiws_trainer/intent_log.json` (what the cla
 reads) with an audit line in `~/.aiws_trainer/jarvis_memory/feedback.jsonl`. "That was for
 you" also answers the spoken "Was that for me?" window.
 
+## 21. Read-back before a bulk cancel or list wipe
+
+```json
+"confirm": {"read_back": true, "shaky_logprob": -0.7}
+```
+
+"Cancel all my alarms" with more than one alarm, or "clear my list" with more than one
+to-do, is read back — "Cancel all three alarms, sir?" — and waits for a yes through the
+follow-up window; "no" or any other subject drops it, and so does a yes a minute later. A
+transcript scoring under `shaky_logprob` is read back even for one item. A single "cancel
+the timer" never is. `read_back: false` turns it off.
+
 ---
 
 ## What Jarvis says when something is missing

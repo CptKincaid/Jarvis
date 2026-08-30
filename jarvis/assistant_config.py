@@ -104,6 +104,14 @@ DEFAULTS: dict = {
                  "sports_feeds": [], "stock_symbols": []},
     "alarms": {"sound": "", "volume": 0.8, "escalate": True,
                "max_ring_s": 300, "snooze_min": 10},
+    # Destructive read-back (commander._try_destructive_confirm): "cancel
+    # all alarms" / "clear my list" with more than one item is read back
+    # and waits for a yes. shaky_logprob: a transcript whose Whisper
+    # avg_logprob is below this also gets a read-back for a one-item
+    # whole-list cancel. Calibrated 2026-08-30 from the live log (n=32
+    # accepted turns: p10 -0.61, median -0.41; the garbled ones sat at
+    # -0.94/-0.95), so -0.7 flags the doubtful tail without nagging.
+    "confirm": {"read_back": True, "shaky_logprob": -0.7},
     # "No, I said X": re-dispatch X, drop the misheard exchange, log the
     # pair to corrections.json. learn_vocab additionally appends new
     # capitalised words from X to the Whisper vocabulary prompt -- off by

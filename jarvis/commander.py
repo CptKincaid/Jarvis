@@ -1345,16 +1345,42 @@ def _h_list_schedule(c, t, m):
                          status="Schedule")
 
 
-def _h_cancel_schedule(c, t, m):
-    tk = c._svc("timekeeper")
-    if tk is None:
-        return None
-    word = m.group("kind").lower()
-    kind = "reminder" if word.startswith("remind") else \
-        "timer" if word.startswith("timer") else "alarm"
-    which = (m.group("which") or "").strip()
-    if m.group("all") or (not which and word.endswith("s")):
-        which = "all"
+# Destructive read-back (2026-08-30). A bulk cancel used to run on the first
+# transcript, even one that scraped past the confidence gate; "cancel all
+# alarms" now reads back "Cancel all three alarms, sir?" and waits for a
+# yes. The follow-up window the app opens after any spoken reply is the
+# VAD-timed yes/no: a one-second "yes" costs one second. Only whole-list
+# actions with more than one item (or a shaky transcript) are read back --
+# a single timer is never worth the question, and a mis-cancelled one
+# costs nothing to set again.
+DESTRUCTIVE_TTL_S = 60.0
+_COUNT_WORDS = ("zero", "one", "two", "three", "four", "five", "six", "seven",
+                "eight", "nine", "ten", "eleven", "twelve")
+
+
+def _count_word(n: int) -> str:
+    return _COUNT_WORDS[n] if 0 <= n < len(_COUNT_WORDS) else str(n)
+
+
+def _pending_count(tk, kind: str) -> int:
+    """How many live items a whole-list cancel would take. 0 when the
+    timekeeper cannot say (an older stand-in without list())."""
+    try:
+        items = tk.list(kind)
+        return len(items)
+    except Exception:
+        return 0
+
+
+def _wants_read_back(c, n: int) -> bool:
+    if not _assistant_get(c, "confirm.read_back", True):
+        return False
+    if n > 1:
+        return True
+    return n == 1 and c.shaky_transcript()
+
+
+def _do_cancel_schedule(tk, which: str, kind: str) -> CommandResult:
     n = tk.cancel(which or "last", kind)
     try:
         n = int(n)
@@ -1366,6 +1392,28 @@ def _h_cancel_schedule(c, t, m):
     line = "Cancelled, sir." if n == 1 else f"Cancelled {n}, sir."
     return CommandResult(handled=True, reply=line, speak=True,
                          status=f"Cancelled {n} {kind}{'s' if n > 1 else ''}")
+
+
+def _h_cancel_schedule(c, t, m):
+    tk = c._svc("timekeeper")
+    if tk is None:
+        return None
+    word = m.group("kind").lower()
+    kind = "reminder" if word.startswith("remind") else \
+        "timer" if word.startswith("timer") else "alarm"
+    which = (m.group("which") or "").strip()
+    if m.group("all") or (not which and word.endswith("s")):
+        which = "all"
+    if which == "all":
+        n = _pending_count(tk, kind)
+        if _wants_read_back(c, n):
+            # n == 1 only on a shaky transcript: "all one alarm" reads badly
+            line = f"Cancel the {kind}, sir?" if n == 1 else \
+                f"Cancel all {_count_word(n)} {kind}s, sir?"
+            c.stash_destructive(lambda: _do_cancel_schedule(tk, "all", kind), line)
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status="Confirm?")
+    return _do_cancel_schedule(tk, which, kind)
 
 
 def _h_briefing(c, t, m):
@@ -2237,6 +2285,8 @@ class Commander:
     # fills in only what it needs.
     claim_uncertain: Optional[Callable[[bool], bool]] = None
     _last_turn: Optional[LastTurn] = None
+    _confidence: Optional[float] = None
+    _pending_destructive: Optional[tuple] = None
 
     def __init__(self, services):
         self.services = services
@@ -2255,6 +2305,11 @@ class Commander:
         # The last utterance handled, for "no, I said ..." and "that was
         # for you"; the app's _last_user_text is not visible from here.
         self._last_turn: Optional[LastTurn] = None
+        # Whisper avg_logprob of the utterance being handled (None when
+        # typed / unknown); read by the destructive read-back.
+        self._confidence: Optional[float] = None
+        # A read-back waiting for a yes: (run, spoken line, stamp).
+        self._pending_destructive: Optional[tuple] = None
 
     # -- service access ------------------------------------------------
     def _svc(self, name: str):
@@ -2283,16 +2338,37 @@ class Commander:
         ))
 
     # -- public entry --------------------------------------------------
-    def handle(self, text: str, source: str = "voice") -> CommandResult:
+    def handle(self, text: str, source: str = "voice",
+               confidence: Optional[float] = None) -> CommandResult:
+        """Route one utterance. ``confidence`` is the transcript's Whisper
+        avg_logprob when the app has one (voice); every other caller
+        leaves it unset."""
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
+        self._confidence = confidence
         result = self._handle_inner(text, source)
         # A correction / re-run answers a different utterance: THAT is the
         # last turn, so a second "no, I said ..." corrects the right text.
         self._last_turn = LastTurn(getattr(result, "corrected", None) or text,
                                    result.status or "", time.monotonic())
         return result
+
+    def shaky_transcript(self) -> bool:
+        """The utterance being handled scraped in under confirm.shaky_logprob."""
+        conf = self._confidence
+        if conf is None:
+            return False
+        try:
+            floor = float(_assistant_get(self, "confirm.shaky_logprob", -0.7))
+        except (TypeError, ValueError):
+            floor = -0.7
+        return conf < floor
+
+    def stash_destructive(self, run: Callable[[], CommandResult], line: str):
+        """A handler read an action back instead of doing it; the next yes
+        runs it (``_try_destructive_confirm``)."""
+        self._pending_destructive = (run, line, time.monotonic())
 
     def _handle_inner(self, text: str, source: str, gate: bool = True) -> CommandResult:
         log.info("handle %r source=%s", text, source)
@@ -2324,6 +2400,11 @@ class Commander:
         # 3c. add_event read an interpretation back; a plain yes means THAT
         #     event, not a new command.
         res = self._try_event_confirm(text)
+        if res is not None:
+            return res
+        # 3d. A destructive action was read back ("Cancel all three alarms,
+        #     sir?"): a plain yes runs it, anything else drops it.
+        res = self._try_destructive_confirm(text)
         if res is not None:
             return res
         # 4. A pending router question: resolve it and dispatch the
@@ -2532,6 +2613,56 @@ class Commander:
                                  status="Feedback: not for me")
         return CommandResult(handled=True, reply="Very good, sir.", speak=True,
                              status="Feedback: noted")
+
+    def _try_destructive_confirm(self, text: str) -> Optional[CommandResult]:
+        """Resolve a read-back ("Cancel all three alarms, sir?").
+
+        As with a calendar add, anything that is not a clear yes or no
+        DROPS the offer: changing the subject is not consent, and a stale
+        offer would attach the next stray "yes" to an old cancel. An offer
+        older than DESTRUCTIVE_TTL_S is dropped even on a yes."""
+        pend, self._pending_destructive = self._pending_destructive, None
+        notes = self._svc("notes")
+        npend = getattr(notes, "pending_clear", None) if notes is not None else None
+        if not isinstance(npend, dict):
+            npend = None
+        elif notes is not None:
+            try:
+                notes.pending_clear = None
+            except Exception:
+                log.debug("notes.pending_clear reset failed", exc_info=True)
+        now = time.monotonic()
+        if pend is not None and now - pend[2] > DESTRUCTIVE_TTL_S:
+            log.info("read-back expired: %r", pend[1])
+            pend = None
+        if npend is not None and time.time() - float(npend.get("ts") or 0) > DESTRUCTIVE_TTL_S:
+            npend = None
+        if pend is None and npend is None:
+            return None
+        answer = parse_yes_no(text)
+        if answer is None:
+            return None
+        if not answer:
+            return CommandResult(handled=True, reply="Very good, sir.", speak=True,
+                                 status="Dropped")
+        if pend is not None:
+            try:
+                return pend[0]()
+            except Exception:
+                log.exception("confirmed action failed")
+                return CommandResult(handled=True, reply="I couldn't manage that, sir.",
+                                     speak=True, status="error")
+        kind = str(npend.get("kind") or "todo")
+        try:
+            removed = notes.remove(kind, "all")
+        except Exception:
+            log.exception("notes clear failed")
+            return CommandResult(handled=True, reply="I couldn't clear that, sir.",
+                                 speak=True, status="error")
+        n = len(removed) if removed else 0
+        line = "All cleared, sir." if n else "Nothing to clear, sir."
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status=f"Cleared {n} {kind}{'s' if n != 1 else ''}")
 
     # -- pipeline stages -----------------------------------------------
     def _handle_dictation(self, text: str) -> CommandResult:

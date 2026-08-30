@@ -1316,7 +1316,7 @@ class JarvisApp:
                 self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))
-                self._dispatch(text, "voice")
+                self._dispatch(text, "voice", confidence=result.confidence)
             elif not result.accepted and text:
                 # Garbled, not silent: say so and re-open the mic rather
                 # than routing "by Agenda 4.2.6" or going quiet -- once.
@@ -1368,15 +1368,18 @@ class JarvisApp:
     _thinking_delay_s = THINKING_DELAY_S
     _turn_timeout_s = TURN_TIMEOUT_S
 
-    def _dispatch(self, text, source):
+    def _dispatch(self, text, source, confidence=None):
         # Voice only: a typed answer is visible as it arrives, so being told to
         # wait is just noise.
         self._last_user_text, self._last_source = text, source
         if source == "voice":
             self._turn_start()
             self.turns.mark("handle")
+        # The Whisper avg_logprob travels only when there is one: typed
+        # text has none, and a stand-in commander need not take the keyword.
+        kw = {} if confidence is None else {"confidence": confidence}
         try:
-            result = self._emit_result(self.commander.handle(text, source))
+            result = self._emit_result(self.commander.handle(text, source, **kw))
             corrected = getattr(result, "corrected", None)
             if corrected:
                 self._last_user_text = corrected
