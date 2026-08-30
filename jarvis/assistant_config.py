@@ -104,7 +104,18 @@ DEFAULTS: dict = {
     "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],
-                 "sports_feeds": [], "stock_symbols": []},
+                 "sports_feeds": [], "stock_symbols": [],
+                 # Per-section switches, set by voice ("no news in the
+                 # morning"); a missing name counts as on. verbosity "brief"
+                 # halves every briefing view's sentence allowance.
+                 "sections": {"weather": True, "calendar": True, "news": True,
+                              "sports": True, "stocks": True, "canvas": True,
+                              "todos": True, "alarms": True, "reminders": True},
+                 "verbosity": "normal",
+                 # The good-night preview offers a wake-up alarm when
+                 # tomorrow's first event starts by early_before and no alarm
+                 # already covers it: wake_lead_min before the event.
+                 "wake_offer": True, "early_before": "09:00", "wake_lead_min": 60},
     "alarms": {"sound": "", "volume": 0.8, "escalate": True,
                "max_ring_s": 300, "snooze_min": 10},
     "discord": {"bot_token": "", "channel_id": "", "user_id": ""},

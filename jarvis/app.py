@@ -578,6 +578,7 @@ class JarvisApp:
         # Whatever else these tags mean, their arrival ends the turn.
         self._turn_finished()
         briefing = None
+        offer = ""
         streamed = any(tag == "STREAMED" for tag, _ in tags)
         for tag, content in tags:
             if tag == "BRIEFING":
@@ -588,6 +589,12 @@ class JarvisApp:
                 except (TypeError, ValueError):
                     log.warning("BRIEFING tag carried non-JSON payload")
                     briefing = {}
+                # The evening preview's "Shall I wake you at seven?" is
+                # asked HERE, verbatim, after the spoken preview -- not left
+                # to the model, which would phrase (or drop) it. The yes/no
+                # is read by commander._try_alarm_offer from the offer the
+                # tool parked on services.alarm_offer.
+                offer = str(briefing.get("offer") or "").strip()
         for tag, content in tags:
             try:
                 if tag == "SPEAK":
@@ -604,6 +611,12 @@ class JarvisApp:
                         bus.publish(JarvisReply(text=content, speak=not streamed))
                     if not streamed:          # streamed sentences already spoke
                         self._say(content)
+                    if offer:
+                        self._say(offer)
+                        offer = ""
+                        # the answer window opens whatever the source: the
+                        # question was put to him aloud
+                        self._followup_after_speech = True
                     # brain._remember has already recorded this exchange;
                     # recording it here too rendered every turn twice.
                     if self._last_source == "voice":

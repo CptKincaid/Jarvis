@@ -66,7 +66,12 @@ Override the location for tests or a second profile with
   "briefing": {"enabled": false, "hn_items": 3,
                "news_feeds": ["https://www.theverge.com/rss/index.xml",
                               "https://feeds.arstechnica.com/arstechnica/index"],
-               "sports_feeds": [], "stock_symbols": []},
+               "sports_feeds": [], "stock_symbols": [],
+               "sections": {"weather": true, "calendar": true, "news": true, "sports": true,
+                            "stocks": true, "canvas": true, "todos": true, "alarms": true,
+                            "reminders": true},
+               "verbosity": "normal",
+               "wake_offer": true, "early_before": "09:00", "wake_lead_min": 60},
   "alarms": {"sound": "", "volume": 0.8, "escalate": true, "max_ring_s": 300, "snooze_min": 10},
   "discord": {"bot_token": "", "channel_id": "", "user_id": ""},
   "spotify": {"client_id": "", "client_secret": "", "default_device": "HPCOMPUTER",
@@ -216,6 +221,58 @@ total, one sentence each. Add an RSS/Atom URL to `sports_feeds` or a ticker
 they are silent while empty. While disabled, "good morning" is an ordinary
 greeting and "briefing" gets: "The morning briefing is switched off, sir; the
 toggle is in settings under Briefing."
+
+### The good-night preview
+
+With `briefing.enabled` on, "good night" answers "Good night, sir. Tomorrow,
+briefly." and then reads tomorrow in one breath: the weather, the first
+event and where, Canvas work due within a day (only once `canvas.token` is
+set), open to-dos and the alarm that is set. If the first event starts by
+`early_before` (09:00) and no alarm rings before it, he asks **"Shall I wake
+you at 7:00 am, sir?"** — a plain "yes" in the follow-up window sets it
+(`wake_lead_min` = 60 minutes before the event, on the quarter hour); "no",
+a change of subject, or three minutes of silence drops the offer. Asked
+outright — "what does tomorrow look like", "preview tomorrow", "tomorrow's
+briefing" — the preview runs whatever the toggle says.
+
+```json
+"briefing": {"wake_offer": true, "early_before": "09:00", "wake_lead_min": 60}
+```
+
+### The week ahead
+
+"How's my week looking?", "weekly forecast", "how busy is my week": the
+calendar, Canvas deadlines and reminders for the next seven days, day by
+day, plus the open to-dos — "Heavy Tuesday, sir: Biosensors, the lecture,
+the lab and the lab report; Wednesday and Saturday are clear." One card,
+one row per day. ("What does my week look like" stays a calendar question.)
+
+### Switching sections off, and how long he talks
+
+Say it and it sticks (written to this file under `briefing.sections`, and to
+the memory's `preferences.json`):
+
+- "no news in the morning", "I don't want the weather in my morning briefing",
+  "skip the sports in my briefing", "leave out canvas in the evening preview",
+  "drop the reminders from my weekly forecast"
+- back on: "put the news back in the briefing", "include the to-dos in my
+  briefing again"
+- "be briefer" / "shorter briefings" → `briefing.verbosity: "brief"`, which
+  halves the briefing, preview and forecast allowances; "the full briefing" /
+  "more detail" restores it. (Ordinary answers are already two sentences at
+  most, so this only changes the briefings.)
+
+```json
+"briefing": {
+  "sections": {"weather": true, "calendar": true, "news": true, "sports": true,
+               "stocks": true, "canvas": true, "todos": true, "alarms": true,
+               "reminders": true},
+  "verbosity": "normal"
+}
+```
+
+A section that is off is not fetched and not mentioned; a name missing from
+the map counts as on.
 
 ## 8. Alarms, timers, reminders
 
@@ -552,6 +609,13 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
   instead of being routed.
 - **First-wake briefing** — after the first thing you say each day past `briefing.after`
   (06:00) he gives the briefing; `briefing.on_first_wake` turns it off.
+- **Good-night preview** — with briefings on, "good night" reads tomorrow in one breath
+  and offers a wake-up alarm when the first event is early ("Shall I wake you at
+  7:00 am, sir?" — say yes). "What does tomorrow look like" asks for it any time.
+- **The week ahead** — "how's my week looking?": calendar, Canvas and reminders day by
+  day; he names the heavy day and the clear ones.
+- **Briefing preferences** — "no news in the morning", "put the sports back in my
+  briefing", "be briefer" / "the full briefing" all stick (section 7).
 - **Meeting heads-up** — "BIOSENSORS in ten minutes, sir" (`calendar.heads_up_min`).
 - **Deadline heads-up** — "Lab 3 report for BIOSENSORS is due in 3 hours"
   (`canvas.heads_up_hours`; needs the Canvas token, §13) and, at 7 pm, "Midterm 1 for
