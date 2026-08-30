@@ -437,6 +437,15 @@ class DocsIndex:
         self._thread.start()
         return True
 
+    def kick(self) -> bool:
+        """A fresh background pass regardless of the once-per-process latch
+        -- a file was just written (lecture notes) and should be findable
+        without waiting for the next ask. No-op while a pass is running."""
+        if self.busy():
+            return False
+        self._kicked = False
+        return self.start_background()
+
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
@@ -488,6 +497,13 @@ def build_index(cfg, embed: Embed = _embed) -> DocsIndex:
 
 def make_tools(cfg, services, embed: Embed = _embed) -> list[ToolSpec]:
     index = build_index(cfg, embed)
+    # Parked for the commander (lecture notes kick a reindex on "end notes"),
+    # the way spotify.make_tools parks its tool on services.spotify.
+    try:
+        if services is not None and getattr(services, "docs_index", None) is None:
+            services.docs_index = index
+    except Exception:                          # noqa: BLE001 - services may be frozen
+        log.debug("services has no room for the docs index", exc_info=True)
     folder = str(doc_paths(cfg)[0]) if doc_paths(cfg) else DEFAULT_PATHS[0]
     no_docs = NO_DOCS_LINE.format(folder=folder)
     # Nothing is opened here: chromadb and the index dir are touched on the
