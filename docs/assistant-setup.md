@@ -304,6 +304,21 @@ in `~/.bashrc`) are mid-turn or idle. With nothing running: "Claude's idle,
 sir; the active project is jarvis." A plain "status" or "status report" is not
 this question — that stays the persona's own status line.
 
+**Clipboard to Claude.** Copy a traceback, a log excerpt or a snippet anywhere
+and say "have Claude fix what I copied", "ask Claude about the clipboard",
+"send what I copied to Claude and fix the error" or "give Claude the
+clipboard". Highlight text in a terminal instead and say "have Claude look at
+the selection and explain it" / "tell Claude to fix what I highlighted" (the X
+primary selection). The clip is written to `<active project>/.jarvis/clips/`
+(mode 0600, the folder git-ignores itself) and the task Claude gets is your
+sentence with the clip phrase replaced by that file — "fix the text in
+…/.jarvis/clips/20260830-134905.txt. That file holds what I just copied on my
+screen; read it first." The clip itself is never put in the prompt, so it never
+reaches the task log, the bus or Discord. It goes to the active project; switch
+first ("work on the VSS project") if it belongs elsewhere. An empty clipboard
+gets "The clipboard is empty, sir." A plain "have Claude fix this" is still an
+ordinary task, not a clip.
+
 ### Web lookups
 
 "Look up …", "search the web for …", "who won …", "what's the latest news about …",

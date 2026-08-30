@@ -59,6 +59,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import os
 import random
 import re
 from datetime import datetime
@@ -70,6 +71,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from jarvis import pronounce
+from jarvis import reader as reader_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
@@ -1025,6 +1027,128 @@ def _h_clipboard(c, t, m):                                 # 3185-3200
         return CommandResult(handled=True, reply="Could not read clipboard")
 
 
+# ---- Tier 1 clipboard-to-Claude -------------------------------------
+# "have Claude fix what I copied" / "send the clipboard to Claude" / "ask
+# Claude about the selection": the clip (X clipboard or primary selection)
+# plus the spoken instruction becomes the next task in the active project.
+# The clip goes by FILE, never inline: sanitize_keys collapses a prompt to one
+# line before `send-keys -l` (a traceback would be mangled), and the prompt
+# is echoed to task_dir/<id>.prompt, the bus and Discord -- a pasted secret
+# would leak through every one of those.  The file sits under the project
+# (<proj>/.jarvis/clips/, self-ignored) so the interactive Claude can read it
+# without a permission prompt: task_dir is outside claude.allowed_dirs.
+_CLIP_PHRASE = (r"what i (?:just )?copied|(?:the |my )?clipboard(?: contents?| text)?|"
+                r"what(?:'s| is) (?:on|in) (?:the |my )?clipboard|"
+                r"the copied (?:text|bit|error|traceback|snippet|thing)")
+# The noun forms want an article: a bare "highlight" / "selection" is more
+# often a verb or a code noun ("change the selection logic") than the X
+# primary selection, hence the article and the lookahead below.
+_SEL_PHRASE = (r"(?:the |my )(?:selection|selected text|highlighted(?: text| bit| part| error)?|"
+               r"highlight)|what i (?:just )?(?:selected|highlighted)|this selection")
+_NOT_A_CLIP = (r"(?!\s+(?:logic|code|handler|function|class|module|widget|menu|list|"
+               r"history|manager|api|tool|box))")
+_CLIP_TO_CLAUDE_RX = re.compile(
+    r"^(?:please\s+)?(?:"
+    r"(?:have|ask|tell|get|let|make)\s+claude(?:\s+to)?\s+(?P<instr>.*?)\s*"
+    r"(?:(?P<clip>" + _CLIP_PHRASE + r")|(?P<sel>" + _SEL_PHRASE + r"))\b" + _NOT_A_CLIP +
+    r"(?P<tail>.*?)"
+    r"|(?:send|give|hand|pass|paste|forward|show)\s+(?:claude\s+)?"
+    r"(?:(?P<clip2>" + _CLIP_PHRASE + r")|(?P<sel2>" + _SEL_PHRASE + r"))\b" + _NOT_A_CLIP +
+    r"(?:\s+(?:over\s+)?to\s+claude)?(?:\s*[,;]?\s*(?:and\s+)?(?P<instr2>.+?))?"
+    r")[.!?\s]*$", re.I)
+# "ask claude ABOUT the clipboard": a lone preposition is no instruction.  A
+# trailing one is kept -- "look at" / "deal with" are verb phrases.
+_CLIP_PREP_RX = re.compile(r"^(?:about|at|with|on|to|over|through|into|regarding)$", re.I)
+CLIP_EMPTY_LINE = "The clipboard is empty, sir."
+SELECTION_EMPTY_LINE = "Nothing is highlighted, sir."
+CLIP_DEFAULT_INSTRUCTION = "Have a look at"
+
+
+def _clip_instruction(m) -> tuple[str, str, str]:
+    """(instruction, selection, tail) from a _CLIP_TO_CLAUDE_RX match."""
+    if m.group("clip") or m.group("sel"):
+        instr, tail = m.group("instr") or "", m.group("tail") or ""
+        selection = "clipboard" if m.group("clip") else "primary"
+    else:
+        instr, tail = m.group("instr2") or "", ""
+        selection = "clipboard" if m.group("clip2") else "primary"
+    instr = instr.strip(" ,;")
+    if _CLIP_PREP_RX.match(instr):
+        instr = ""
+    tail = tail.strip(" ,;.")            # "and explain it" keeps its "and"
+    return instr, selection, tail
+
+
+def _write_clip(project_path: str, text: str) -> Path:
+    """Write the clip 0600 under <project>/.jarvis/clips/ (dir 0700, with a
+    .gitignore so it never shows up in the user's `git status`)."""
+    clips = Path(project_path) / ".jarvis" / "clips"
+    clips.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(clips, 0o700)
+        ignore = clips.parent / ".gitignore"
+        if not ignore.exists():
+            ignore.write_text("*\n", encoding="utf-8")
+    except OSError:
+        log.debug("clip dir hygiene failed", exc_info=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    path = clips / f"{stamp}.txt"
+    n = 0
+    while True:
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            break
+        except FileExistsError:
+            n += 1
+            path = clips / f"{stamp}-{n}.txt"
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text if text.endswith("\n") else text + "\n")
+    return path
+
+
+def _h_clip_to_claude(c, t, m):
+    claude = c._svc("claude")
+    if claude is None:
+        return None
+    # Re-match the RAW text: the Tier-1 text is lowercased, and Claude should
+    # see the instruction as spoken (class and file names keep their case).
+    raw = strip_address(getattr(c, "_raw_text", "") or t)
+    mr = _CLIP_TO_CLAUDE_RX.match(raw.strip())
+    instr, selection, tail = _clip_instruction(mr or m)
+    text = reader_mod._xclip(selection)
+    if not text.strip():
+        line = CLIP_EMPTY_LINE if selection == "clipboard" else SELECTION_EMPTY_LINE
+        return CommandResult(handled=True, reply=line, speak=True, status="Clipboard empty")
+    active = None
+    try:
+        active = getattr(claude, "active_project", None)
+        proj = claude.project_for(active) if active else None
+    except Exception:
+        log.exception("claude.project_for(%r) failed", active)
+        proj = None
+    if proj is None or not getattr(proj, "path", ""):
+        cs_mod = sys.modules.get("jarvis.claude_session")
+        line = getattr(cs_mod, "NO_PROJECT_LINE", None) or \
+            "I don't have a project to work in, sir; name one first."
+        return CommandResult(handled=True, reply=line, speak=True, status="No project")
+    try:
+        path = _write_clip(proj.path, text)
+    except OSError:
+        log.exception("clip write failed under %s", proj.path)
+        return CommandResult(handled=True, speak=True, status="Clip write failed",
+                             reply="I couldn't put the clip where Claude can read it, sir.")
+    ref = f"the text in {path}"
+    body = f"{instr} {ref}" if instr else f"{CLIP_DEFAULT_INSTRUCTION} {ref}"
+    if tail:
+        body += f" {tail}"
+    what = "copied" if selection == "clipboard" else "highlighted"
+    prompt = f"{body}. That file holds what I just {what} on my screen; read it first."
+    log.info("clip -> Claude: %d chars in %s", len(text), path)
+    d = RouteDecision("claude", "clip-to-claude", prompt=prompt, project=active,
+                      args={"size": estimate_size(prompt)})
+    return c._dispatch_route(d, t)
+
+
 def _h_search(c, t, m):                                    # 3202-3215
     # With a brain that can answer from the web, "jarvis, look up X" is a
     # question, not a request to open a browser tab: yield to the router.
@@ -1812,6 +1936,10 @@ REGISTRY: list[Command] = [
             _h_windows, needs=("desktop",)),
     Command("launch", _m_re(r"launch\s+(.+)"), _h_launch),
     Command("type", _m_re(r"type\s+(.+)"), _h_type),
+    # BEFORE "clipboard": that matcher is a bare substring test, so "have
+    # Claude fix the clipboard" would otherwise be read aloud instead.
+    Command("clip to claude", _CLIP_TO_CLAUDE_RX.match, _h_clip_to_claude,
+            needs=("claude",)),
     Command("clipboard",
             _m_contains("clipboard", "what did i copy", "read clipboard"),
             _h_clipboard),
@@ -1903,7 +2031,11 @@ ASSISTANT_TIER1: list[Command] = [
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
-                    "take note", "show notes", "answer question", "remind me")
+                    "take note", "show notes", "answer question", "remind me",
+                    # the hotword consumes the wake word, so spoken text never
+                    # reaches the prefixed registry: without this the router
+                    # would hand Claude the bare words "fix what i copied".
+                    "clip to claude")
 ]
 
 
