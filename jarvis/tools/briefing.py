@@ -32,8 +32,6 @@ from jarvis.tools.registry import ToolResult, ToolSpec
 
 log = get_logger("tools.briefing")
 
-BRIEFING_OFF_LINE = ("The morning briefing is switched off, sir; "
-                     "the toggle is in settings under Briefing.")
 NOTHING_LINE = "I couldn't reach any of the briefing sources, sir."
 DEFAULT_NEWS_FEEDS = ["https://www.theverge.com/rss/index.xml",
                       "https://feeds.arstechnica.com/arstechnica/index"]
@@ -564,8 +562,12 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         return reg
 
     def get_briefing(**_) -> ToolResult:
-        if not briefing_enabled(cfg):
-            return ToolResult(text=BRIEFING_OFF_LINE, ok=False, speak=BRIEFING_OFF_LINE)
+        # No `briefing.enabled` check here. That flag means "let a plain
+        # 'good morning' trigger a briefing", and commander._h_briefing
+        # already enforces exactly that -- it lets an EXPLICIT request past
+        # regardless. The tool cannot tell the two apart, so refusing here
+        # only ever broke the explicit ask: the user said "give me the
+        # briefing" and was told the briefing is switched off.
         sections, sheet = build_briefing(cfg, _registry(), cache_path=cache_path)
         got_any = bool(sections["weather"] or sections["calendar"] or
                        sections["news"] or sections["sports"] or sections["stocks"])

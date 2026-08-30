@@ -370,7 +370,6 @@ class JarvisApp:
                 ("jarvis.approvals", ("TIMEOUT_LINE", "ALLOWED_LINE",
                                       "DECLINED_LINE")),
                 ("jarvis.commander", ("TERMINAL_OPEN_LINE", "TERMINAL_FAIL_LINE")),
-                ("jarvis.tools.briefing", ("BRIEFING_OFF_LINE",)),
                 ("jarvis.tools.timekeeper", ("NOTHING_RINGING_LINE",
                                              "NO_TIMEKEEPER_LINE")),
                 ("jarvis.brain", ("MODEL_DOWN_LINE", "MODEL_SLOW_LINE",

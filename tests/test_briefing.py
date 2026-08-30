@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 from jarvis.tools import briefing as br
-from jarvis.tools.briefing import (BRIEFING_OFF_LINE, build_briefing, dedupe,
+from jarvis.tools.briefing import (build_briefing, dedupe,
                                    feed_first_item, fetch_news, fetch_stocks,
                                    interleave, parse_feed, tidy_source)
 from jarvis.tools.registry import ToolRegistry, ToolResult, ToolSpec
@@ -356,16 +356,24 @@ def test_build_briefing_accepts_epoch_now_and_naive_datetime(tmp_path):
 
 
 # ---------------------------------------------------------------- tool
-def test_get_briefing_disabled_by_default(tmp_path, monkeypatch):
+def test_get_briefing_runs_even_while_the_toggle_is_off(tmp_path, monkeypatch):
+    """`briefing.enabled` decides whether a plain "good morning" turns into a
+    briefing. commander._h_briefing enforces that and deliberately lets an
+    EXPLICIT request past whatever the flag says -- but the tool could not
+    tell the two apart, so it refused both, and asking outright answered
+    "The morning briefing is switched off, sir". The flag is untouched here;
+    only the refusal is gone."""
     fetch = FakeFetch()
     monkeypatch.setattr(br, "_fetch", fetch)
     reg = FakeRegistry()
     services = SimpleNamespace(tools=reg, news_cache_path=tmp_path / "news.json")
     for cfg in (Cfg(), Cfg(enabled="false"), None, {"briefing": {}}):
+        assert br.briefing_enabled(cfg) is False, "this case must be OFF"
         (spec,) = br.make_tools(cfg, services)
         r = spec.handler(extra="ignored")
-        assert r.text == r.speak == BRIEFING_OFF_LINE and not r.ok
-    assert fetch.calls == [] and reg.calls == []
+        assert r.ok, "an explicit request was refused while the toggle is off"
+        assert r.text.startswith("Briefing for ")
+    assert fetch.calls, "briefed without fetching a single source"
     assert spec.name == "get_briefing"
     assert len(spec.description.split()) <= 20
     assert spec.schema()["function"]["parameters"] == {"type": "object", "properties": {}}
@@ -417,7 +425,7 @@ def test_live_stock_quote():
 # ---------------------------------------------- through the tool loop
 def test_disabled_by_default_in_the_real_assistant_config(tmp_path, monkeypatch):
     """Spec 10.1: a freshly created assistant.json has briefing.enabled
-    false, so the tool refuses without touching a single source."""
+    false. That still holds -- but it no longer silences an explicit ask."""
     from jarvis.assistant_config import AssistantConfig
 
     cfg = AssistantConfig.load(tmp_path / "assistant.json")
@@ -429,9 +437,8 @@ def test_disabled_by_default_in_the_real_assistant_config(tmp_path, monkeypatch)
     (spec,) = br.make_tools(cfg, SimpleNamespace(tools=reg,
                                                  news_cache_path=tmp_path / "n.json"))
     r = spec.handler()
-    assert not r.ok and r.speak == BRIEFING_OFF_LINE
-    assert "switched off" in r.speak and "Briefing" in r.speak   # says how to enable
-    assert fetch.calls == [] and reg.calls == []
+    assert r.ok and r.text.startswith("Briefing for ")
+    assert fetch.calls, "the default config refused an explicit request"
     cfg.set("briefing.enabled", True)
     assert br.briefing_enabled(cfg) is True
     assert spec.handler().ok
@@ -487,10 +494,12 @@ def test_briefing_rendered_by_the_local_model(tmp_path, monkeypatch):
     assert 1 <= spoken.count(". ") + 1 <= 6
 
 
-def test_briefing_disabled_speaks_the_off_line_through_the_brain(tmp_path, monkeypatch):
-    """Asked while off: the excuse is spoken verbatim, the model is never
-    called and no source is fetched."""
-    brain, payloads = _brain_with_briefing(tmp_path, monkeypatch, False, "unused")
+def test_an_explicit_ask_briefs_through_the_brain_while_off(tmp_path, monkeypatch):
+    """The regression, end to end: "brief me" with briefing.enabled false used
+    to speak the off-line and never reach the model. It must now render a real
+    briefing, exactly as it does with the toggle on."""
+    brain, payloads = _brain_with_briefing(tmp_path, monkeypatch, False, BRIEF_REPLY)
     tags = brain._chat_sync("brief me", force_tool="get_briefing")
-    assert tags == [("SPEAK", BRIEFING_OFF_LINE)]
-    assert payloads == []
+    assert [t[0] for t in tags] == ["BRIEFING", "SPEAK"]
+    assert tags[1][1] == BRIEF_REPLY
+    assert len(payloads) == 1, "the model never rendered the briefing"

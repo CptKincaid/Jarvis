@@ -613,11 +613,10 @@ def test_canned_phrases_include_the_fixed_persona_lines(app):
     from jarvis import approvals as ap_mod
     from jarvis import claude_session as cs_mod
     from jarvis.router import ROUTER_QUESTION
-    from jarvis.tools.briefing import BRIEFING_OFF_LINE
     from jarvis.commander import TERMINAL_OPEN_LINE
     from jarvis.tools.spotify import LINKED_LINE, NOT_LINKED_LINE
     for line in (TERMINAL_OPEN_LINE,
-                 ROUTER_QUESTION, BRIEFING_OFF_LINE, cs_mod.CANCELLED_LINE,
+                 ROUTER_QUESTION, cs_mod.CANCELLED_LINE,
                  cs_mod.OUTSIDE_LINE, ap_mod.TIMEOUT_LINE, ap_mod.DECLINED_LINE,
                  NOT_LINKED_LINE, LINKED_LINE, app_mod.APPROVAL_TIMEOUT_LINE):
         assert line in phrases, line
