@@ -526,6 +526,24 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
 
+## 18. Voice latency: the first-audio mark and streamed Fish playback
+
+Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
+
+- **The `wait` in the turn ledger is now honest.** `SpeakingState(active=True)` — the
+  "audio" mark `turns.jsonl` and "run diagnostics" report against — used to go out
+  before the first chunk was even rendered, so a logged `wait 1.32 s` was really
+  ~1.7–1.9 s to the ear. It now goes out when the player process is spawned. Expect the
+  numbers in `/tmp/vss_voice/turns.jsonl` to read HIGHER after this restart; they are
+  the same turns measured properly. Tune against the new ones.
+- **Fish plays while it renders.** With `tts_engine: fish`, the API's bytes go straight
+  into `paplay`'s stdin as they arrive (and into the speech cache file at the same time),
+  so its ~186 ms time-to-first-audio is finally what you hear. If the connection drops
+  mid-sentence you lose the tail of that one chunk; the next chunk comes from the local
+  F5 fallback as before. To compare by ear, set `jarvis.tts.FISH_STREAM_PLAYBACK = False`
+  (module constant) and restart. F5, XTTS and edge are unchanged (F5's sidecar writes a
+  file per request and cannot stream).
+
 ---
 
 ## What Jarvis says when something is missing
