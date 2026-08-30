@@ -146,6 +146,21 @@ def mail_accounts(cfg) -> list[dict]:
     return out
 
 
+def _truthy_flag(value, default: bool = True) -> bool:
+    """Tool arguments arrive as whatever the model emitted -- bool, "false",
+    "no", 0. Anything unrecognised keeps the safer default (unread only)."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    text = str(value).strip().lower()
+    if text in ("false", "0", "no", "off", "all"):
+        return False
+    if text in ("true", "1", "yes", "on", "unread"):
+        return True
+    return default
+
+
 def setup_line(cfg, section: str = "gmail") -> str:
     fn = getattr(cfg, "setup_line", None)
     if callable(fn):
@@ -305,8 +320,15 @@ def _parse_message(headers: bytes, body: bytes) -> Mail:
 
 def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
                  imap=imaplib.IMAP4_SSL, now: Optional[datetime] = None,
-                 timeout: float = IMAP_TIMEOUT) -> list[Mail]:
-    """Unread INBOX mail newer than ``since_hours``, newest first.
+                 timeout: float = IMAP_TIMEOUT,
+                 unread_only: bool = True) -> list[Mail]:
+    """INBOX mail newer than ``since_hours``, newest first.
+
+    ``unread_only=False`` drops the UNSEEN filter, which is what answers
+    "what was my last email about?" -- previously unanswerable, because the
+    only query this module could make was UNSEEN and a read message was
+    therefore invisible no matter how recent.
+
     Raises MailNotConfigured; IMAP/socket errors propagate."""
     accounts = mail_accounts(cfg)
     if not accounts:
@@ -323,7 +345,8 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
         failures = []
         for account in accounts:
             try:
-                merged.extend(_fetch_one(account, since, limit, imap, timeout))
+                merged.extend(_fetch_one(account, since, limit, imap,
+                                         timeout, unread_only))
             except Exception as exc:                     # noqa: BLE001
                 failures.append(exc)
                 log.warning("mail: %s failed: %s", account["label"], exc)
@@ -339,7 +362,9 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
     try:
         conn.login(settings["address"], settings["password"])
         conn.select("INBOX", readonly=True)
-        typ, data = conn.search(None, "UNSEEN", f"SINCE {imap_date(since)}")
+        criteria = (["UNSEEN"] if unread_only else []) + \
+            [f"SINCE {imap_date(since)}"]
+        typ, data = conn.search(None, *criteria)
         if typ != "OK":
             raise imaplib.IMAP4.error(f"search failed: {typ}")
         ids = (data[0] or b"").split() if data else []
@@ -367,7 +392,7 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
 
 
 def _fetch_one(settings: dict, since: datetime, limit: int,
-               imap, timeout: float) -> list[Mail]:
+               imap, timeout: float, unread_only: bool = True) -> list[Mail]:
     """One mailbox. Same conversation as the single-account path, with each
     Mail tagged so a merged briefing can say which inbox it came from."""
     log.info("mail: connecting to %s for %s (%s)", settings["host"],
@@ -376,7 +401,9 @@ def _fetch_one(settings: dict, since: datetime, limit: int,
     try:
         conn.login(settings["address"], settings["password"])
         conn.select("INBOX", readonly=True)
-        typ, data = conn.search(None, "UNSEEN", f"SINCE {imap_date(since)}")
+        criteria = (["UNSEEN"] if unread_only else []) + \
+            [f"SINCE {imap_date(since)}"]
+        typ, data = conn.search(None, *criteria)
         if typ != "OK":
             raise imaplib.IMAP4.error(f"search failed: {typ}")
         ids = (data[0] or b"").split() if data else []
@@ -453,7 +480,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     imap_cls = getattr(services, "imap", None) if services is not None else None
     imap_cls = imap_cls or imaplib.IMAP4_SSL
 
-    def get_mail(limit=5, since_hours=24, **_) -> ToolResult:
+    def get_mail(limit=5, since_hours=24, unread_only=True, **_) -> ToolResult:
         try:
             limit = max(1, min(20, int(float(str(limit)))))
         except (TypeError, ValueError):
@@ -462,12 +489,18 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             since_hours = max(1, min(24 * 14, int(float(str(since_hours)))))
         except (TypeError, ValueError):
             since_hours = 24
-        if gmail_settings(cfg) is None:
+        # mail_accounts(), NOT gmail_settings(): the latter only knows the
+        # LEGACY top-level gmail.address / gmail.app_password pair, so on a
+        # multi-account config (gmail.accounts) it returns None and Jarvis
+        # asked for credentials it already had -- while fetch_unread below
+        # would have read all three mailboxes perfectly well.
+        if not mail_accounts(cfg):
             line = setup_line(cfg, "gmail")
             return ToolResult(text=line, ok=False, speak=line)
         try:
             mails = fetch_unread(cfg, since_hours=since_hours, limit=20,
-                                 imap=imap_cls)
+                                 imap=imap_cls,
+                                 unread_only=_truthy_flag(unread_only))
         except MailNotConfigured:
             line = setup_line(cfg, "gmail")
             return ToolResult(text=line, ok=False, speak=line)
@@ -484,12 +517,25 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
     spec = ToolSpec(
         name="get_mail",
-        description="Unread Gmail from the last day: sender, subject, snippet.",
+        # <= 20 words: this rides in every prompt (test_get_mail_tool).
+        # The per-parameter descriptions carry the detail.
+        description=("Gmail: sender, subject, snippet. Unread from the last "
+                     "day by default; unread_only=false for the latest "
+                     "read mail."),
         parameters={
             "type": "object",
             "properties": {
                 "limit": {"type": "integer",
                           "description": "how many to report (default 5)"},
+                "since_hours": {
+                    "type": "integer",
+                    "description": ("how far back to look, hours "
+                                    "(default 24, max 336)")},
+                "unread_only": {
+                    "type": "boolean",
+                    "description": ("true = unread only (default); false = "
+                                    "include already-read mail, which is "
+                                    "what answers 'my last email'")},
             },
         },
         handler=get_mail,
