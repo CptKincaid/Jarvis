@@ -38,16 +38,20 @@ STREAMING_INTERVAL = 2.0
 # A rejection is spoken ("Say that again, sir?") and re-opens the mic.
 MIN_AVG_LOGPROB = -0.85
 
-# Domain vocabulary prompt — biases Whisper toward these terms
-# (port verbatim: voice_input_gui.py:78-86)
+# Default vocabulary prompt — biases Whisper toward the assistant's own
+# domain. Replaces the warehouse list ported verbatim from
+# voice_input_gui.py:78-86 ("AGV, forklift, pallet, conveyor, ..."):
+# with no ~/.aiws_trainer/voice_vocab.txt on this box, every utterance
+# was primed with VSS jargon he never says. This seed is the floor;
+# jarvis/vocab.py layers his names, corrections, calendar titles and
+# Canvas courses on top when app.py wires a prompt_provider in.
 DEFAULT_VOCAB = (
-    "AGV, loaded AGV, empty AGV, forklift, loaded forklift, empty forklift, "
-    "pallet, flat pallet, boxes pallet, full pallet, cardboard box, conveyor, "
-    "YOLO, VSS, KPI, ReID, SAM, ONNX, CUDA, GPU, RTSP, MJPEG, "
-    "zone, dwell time, heatmap, flow rate, counting line, proximity alert, "
-    "warehouse, surveillance, detection, tracking, annotation, training, "
-    "ChromaDB, knowledge graph, Cosmos VLM, narration, Ollama, "
-    "near-miss, safety incident, loading zone, staging area, shipping dock"
+    "Jarvis, Hunter, Spark, DGX, GB10, Ollama, Whisper, XTTS, "
+    "Claude, Claude Code, Canvas, Spotify, Gmail, Discord, iCloud, TAMU, "
+    "calendar, briefing, timer, alarm, reminder, flashcards, quiz, "
+    "pomodoro, lecture notes, standup, quiet hours, do not disturb, "
+    "syllabus, assignment, announcement, office hours, "
+    "terminal, tmux, GPU, CUDA, pytest, playlist, weather"
 )
 
 # Language options (port verbatim: voice_input_gui.py:351-372)
@@ -96,6 +100,14 @@ def save_vocab(text: str):
     PATHS.VOCAB_FILE.parent.mkdir(parents=True, exist_ok=True)
     PATHS.VOCAB_FILE.write_text(text.strip())
     log.info("Vocabulary saved to %s", PATHS.VOCAB_FILE)
+    # The dynamic prompt (jarvis/vocab.py) caches for 60 s; a word learned
+    # from a correction must reach the very next attempt, not the one
+    # after the TTL. Lazy import: vocab imports this module at top level.
+    try:
+        from jarvis import vocab as _vocab
+        _vocab.clear_cache()
+    except Exception:
+        pass
 
 
 # ------------------------------------------------------------------
@@ -127,15 +139,21 @@ class Transcriber:
     partial() (streaming preview) — port of _partial_lock (1169, 2592, 2716).
     """
 
-    def __init__(self):
+    def __init__(self, prompt_provider=None):
         self._model = None
         self._backend = ""
         self._gpu = False                    # True when openai-whisper on CUDA
         self._lock = threading.Lock()        # model access (full + partial)
         self._load_lock = threading.Lock()   # one-time load
+        # Called before EVERY pass (full and partial) to build the
+        # initial_prompt — app.py wires jarvis.vocab.build_prompt in.
+        # None keeps the legacy per-call load_vocab() behaviour
+        # (voice_check.py and scripts construct Transcriber() bare).
+        self._prompt_provider = prompt_provider
         vocab = load_vocab()
-        log.info("vocab: %d chars (%s)", len(vocab),
-                 "custom file" if PATHS.VOCAB_FILE.exists() else "default")
+        log.info("vocab: %d chars (%s)%s", len(vocab),
+                 "custom file" if PATHS.VOCAB_FILE.exists() else "default",
+                 "; dynamic prompt provider wired" if prompt_provider else "")
 
     # -- vocab ----------------------------------------------------------
     @property
@@ -147,6 +165,23 @@ class Transcriber:
     @vocab.setter
     def vocab(self, text: str):
         save_vocab(text)
+
+    def _prompt(self) -> str:
+        """initial_prompt for the next pass: the provider's live prompt
+        (names, calendar titles, courses — jarvis/vocab.py) when one is
+        wired, else the legacy vocab file / default. A provider failure
+        must never cost a transcription, so it degrades to load_vocab().
+        NOT routed through the ``vocab`` setter: that would persist the
+        dynamic prompt to ~/.aiws_trainer on every turn, and the user
+        file is a manual layer the builder reads, not a mirror."""
+        if self._prompt_provider is not None:
+            try:
+                text = (self._prompt_provider() or "").strip()
+                if text:
+                    return text
+            except Exception:
+                log.exception("prompt provider failed; using vocab file")
+        return load_vocab()
 
     # -- model ----------------------------------------------------------
     @property
@@ -242,7 +277,7 @@ class Transcriber:
             with self._lock:
                 result = self._model.transcribe(
                     audio,
-                    initial_prompt=load_vocab(),
+                    initial_prompt=self._prompt(),
                     language=lang,          # None = auto-detect
                     beam_size=5,
                     fp16=True,
@@ -259,7 +294,7 @@ class Transcriber:
         else:
             kwargs = dict(
                 beam_size=5,
-                initial_prompt=load_vocab(),
+                initial_prompt=self._prompt(),
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
             )
@@ -313,7 +348,7 @@ class Transcriber:
                     # tokens — fast text-only preview.
                     result = self._model.transcribe(
                         audio,
-                        initial_prompt=load_vocab(),
+                        initial_prompt=self._prompt(),
                         language=lang,
                         condition_on_previous_text=False,
                         temperature=0.0,
@@ -322,7 +357,7 @@ class Transcriber:
                     )
                     return (result.get("text") or "").strip()
 
-                kwargs = dict(beam_size=1, initial_prompt=load_vocab())
+                kwargs = dict(beam_size=1, initial_prompt=self._prompt())
                 if lang is not None:
                     kwargs["language"] = lang
 

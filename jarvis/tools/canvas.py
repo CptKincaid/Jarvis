@@ -314,6 +314,25 @@ def active_courses(settings: dict, fetch: Fetch, budget: _Budget) -> list[dict]:
     return list(courses)
 
 
+def cached_course_names() -> list:
+    """Course names already in the module cache, tidied for the Whisper
+    prompt (jarvis/vocab.py). Read-only by design: the transcriber asks
+    on every turn and must NEVER trigger a network fetch, so an empty
+    list before the first Canvas tool call is the correct price -- and
+    expiry is ignored on purpose, because a stale course name still
+    biases recognition the right way."""
+    with _CACHE_LOCK:
+        courses = [c for _, cached in _COURSES.values() for c in cached]
+    names, seen = [], set()
+    for c in courses:
+        name = tidy_course(str(c.get("name") or "")) if isinstance(c, dict) else ""
+        key = name.lower()
+        if name and key not in seen:
+            seen.add(key)
+            names.append(name)
+    return names
+
+
 _LEADING_CODE = re.compile(r"^[A-Z]{2,4}[\s\-_]*\d{3,4}[A-Z]?(?:[\s\-_]*\d{3,4})?[\s\-_:.]*",
                            re.I)
 _TRAILING_TERM = re.compile(r"[\s\-_,(]*(?:(?:FA|SP|SU|WI)\s?\d{2}|(?:FALL|SPRING|SUMMER|WINTER)"

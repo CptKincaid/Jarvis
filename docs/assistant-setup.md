@@ -193,7 +193,7 @@ stranger's "yes" in a shared channel can never approve a `git push`; left
 blank, anyone who can post in `channel_id` can command him. Two optional
 switches silence a channel independently (both default on, and the key may
 be absent): `"alerts": {"desktop": true, "discord": true, "claude_hooks": true}`
-(`claude_hooks` is the spoken narration of your own Claude Code terminals, section 38).
+(`claude_hooks` is the spoken narration of your own Claude Code terminals, section 39).
 
 Troubleshooting from `jarvis.log`: gateway close **4014** means the MESSAGE
 CONTENT intent is still off in the portal (Jarvis falls back to REST polling
@@ -900,7 +900,40 @@ follow-up window; "no" or any other subject drops it, and so does a yes a minute
 transcript scoring under `shaky_logprob` is read back even for one item. A single "cancel
 the timer" never is. `read_back: false` turns it off.
 
-## 31. Voice latency: the first-audio mark and streamed Fish playback
+## 31. Names and the listening vocabulary (Whisper + TTS)
+
+Whisper is primed before every utterance with a prompt built from your own
+world — nothing to enable. In priority order (the tail falls off first, near
+Whisper's ~224-token prompt window):
+
+1. `~/.aiws_trainer/voice_vocab.txt` — your manual vocabulary (the
+   "Edit vocabulary…" button, one term per line) plus words learned from
+   corrections (`corrections.learn_vocab`).
+2. `~/.aiws_trainer/voice_names.txt` — names you teach by voice, newest first.
+3. Names you taught the voice to say ("pronounce X as Y").
+4. The built-in assistant seed (Jarvis, Canvas, Ollama, timers…). The old
+   warehouse list (AGV, forklift, pallet) is gone.
+5. Calendar event titles from the disk cache (BIOSENSORS and friends).
+6. Canvas course names already cached by the Canvas tool — never a fresh fetch.
+
+Rebuilt at most once a minute, except that teaching a name applies at once.
+
+Teach a name in both directions in one sentence:
+
+> "Jarvis, my advisor's name is spelled P-E-Y-R-O-V-I, say it pay-ROH-vee"
+
+The letters go to the names file (so Whisper *hears* Peyrovi), the "say it …"
+clause goes to the TTS dictionary (so he *says* pay-ROH-vee), and the reply
+echoes the spelling back — "Noted, sir: P-E-Y-R-O-V-I. Peyrovi." — so a
+misheard letter is caught on the spot. Simpler forms:
+
+- "the name is spelled P E Y R O V I" (names file only)
+- "Jarvis, add Librespot to your vocabulary"
+- "pronounce Peyrovi as pay-ROH-vee" (the TTS half alone, as before)
+
+Both files are plain text and safe to edit by hand.
+
+## 32. Voice latency: the first-audio mark and streamed Fish playback
 
 Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
 
@@ -918,7 +951,7 @@ Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
   (module constant) and restart. F5, XTTS and edge are unchanged (F5's sidecar writes a
   file per request and cannot stream).
 
-## 32. Steering a read-aloud (skip / back / pause / go on)
+## 33. Steering a read-aloud (skip / back / pause / go on)
 
 Nothing to configure. While he is reading ("read the clipboard", "read file
 ~/syllabus.md", …) the transport words belong to the reading:
@@ -963,7 +996,7 @@ live-transcript preview), and the cue is a prewarmed line or a generated beep
 
 ---
 
-## 33. Quiet hours and do not disturb
+## 34. Quiet hours and do not disturb
 
 Jarvis holds his *proactive* lines — memory warnings, reminders and timers, meeting
 heads-ups, anything from the hooks narrator — while you are busy, and reads them back
@@ -978,7 +1011,7 @@ what you ask, alarms and Claude's permission questions are never held.
 - **Calendar** — a timed event running now whose title contains one of
   `quiet.calendar_keywords` (`class`, `exam`, `meeting`, `busy`) is quiet automatically;
   `quiet.calendar: false` turns that off.
-- **Away** — with presence set up (section 34) he also holds while your phone is off the
+- **Away** — with presence set up (section 35) he also holds while your phone is off the
   Wi-Fi; `quiet.hold_when_away: false` turns that off.
 - *"I am free"* / *"what did I miss"* — ends the current window early and reads what was
   held; *"are you on do not disturb"* says why he is quiet.
@@ -994,7 +1027,7 @@ backlog is capped at twelve lines.
           "hold_when_away": true}
 ```
 
-## 34. Presence (is anyone home?)
+## 35. Presence (is anyone home?)
 
 Give him your phone's Wi-Fi address and he knows whether you are in. Find it in the
 router's client list or on the phone (Settings › Wi-Fi › the network › IP address; iPhones
@@ -1015,7 +1048,7 @@ return he says *"Welcome back, sir."* and reads anything held while you were out
 the first probe answers he assumes you are home. Check the log for
 `presence: home` / `presence: away`.
 
-## 35. Nightly self-review ("how did yesterday go")
+## 36. Nightly self-review ("how did yesterday go")
 
 Every quarter hour a small thread checks whether a day has ended without a review
 and, if so, reads his own `jarvis.log` and `turns.jsonl` for that day and files a
@@ -1039,7 +1072,7 @@ What counts as "went wrong" comes from the exact lines the modules log (see
 file before the app's boot marker is ignored, so a stray test traceback cannot
 show up as "a tool call failed".
 
-## 36. Ask him from a shell (`jarvis`, SSH, tmux, scripts)
+## 37. Ask him from a shell (`jarvis`, SSH, tmux, scripts)
 
 The running app listens on `/tmp/vss_voice/command.sock` (0600, next to
 `approvals.sock`). `scripts/jarvis` sends one line and prints what he answers:
@@ -1061,7 +1094,7 @@ wake word, no intent guess), shows in the transcript, and is not stored in the
 typed-box history. `-t 300` waits longer than the default 90 s. Everything stays on
 the box: a UNIX socket, no port, no daemon beyond the app itself.
 
-## 37. Local voice: the F5 sidecar as a service
+## 38. Local voice: the F5 sidecar as a service
 
 F5-TTS is the local voice (blind-tied the hosted Fish voice, see
 `~/voice-training/HANDOFF.md`) and the fallback whenever `tts_engine` is `fish`.
@@ -1109,7 +1142,7 @@ in `~/.aiws_trainer/voice_settings.json` (or the Engine picker) and restart;
 the canned lines are re-rendered on F5 by the normal prewarm, and the Fish key
 becomes optional. The speech cache keys F5 and Fish audio separately.
 
-## 38. Claude Code hooks (your own terminals)
+## 39. Claude Code hooks (your own terminals)
 
 The sessions you start yourself (the `~/.bashrc` tmux wrapper, any plain `claude`)
 never pass through Jarvis, so a failing test run or a permission prompt in another
