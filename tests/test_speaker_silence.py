@@ -183,3 +183,45 @@ def test_fail_shut_is_paced_not_silenced(monkeypatch):
     clock["t"] += 6.0
     v._fail_shut("model not loaded")
     assert len(published) == 2
+
+
+def test_a_clip_too_short_to_judge_is_rejected_without_the_blocked_toast(monkeypatch):
+    """Live 21:47:33: a 0.5 s manual-stop clip -- long enough to finalize,
+    too short for ECAPA -- failed SHUT and toasted "Voice blocked: speaker
+    check unavailable", the line that means the model is down. It is not."""
+    import jarvis.speaker as speaker_mod
+    published = []
+    monkeypatch.setattr(speaker_mod.bus, "publish", published.append)
+    v = _verifier_with(lambda audio: (_ for _ in ()).throw(AssertionError("must not embed")))
+    v._model_loaded = True
+    ok, score = v.verify(_speech(0.5))
+    assert ok is False and score == 0.0
+    assert published == [], f"toasted for a short clip: {published}"
+
+
+def test_a_pre_trim_voiceprint_keeps_its_format_until_re_enrolled(tmp_path, monkeypatch):
+    """save() must write the pool's format, not the code's: otherwise the
+    first save after today's change would stamp a silence-pooled voiceprint
+    as current and the re-enrol warning would vanish."""
+    import jarvis.speaker as speaker_mod
+    path = tmp_path / "voiceprint.npz"
+    monkeypatch.setattr(speaker_mod, "VOICEPRINT_FILE", path)
+    vec = np.ones(192, dtype=np.float32) / np.sqrt(192)
+    np.savez(path, emb_0000=vec, emb_0001=vec)             # format-1 file: no marker
+    v = speaker_mod.SpeakerVerifier()
+    v.load()
+    assert v.num_samples == 2 and v._format == 1
+    v.save()
+    assert int(np.load(path)["_format"][0]) == 1, "stamped a stale pool as current"
+    # re-enrolment replaces the stale pool instead of mixing into it
+    monkeypatch.setattr(v, "_extract_embedding", lambda audio: vec)
+    ok, n = v.enroll_from_audio(_speech(2.0))
+    assert ok and n == 1 and v._format == speaker_mod.VOICEPRINT_FORMAT
+    assert int(np.load(path)["_format"][0]) == speaker_mod.VOICEPRINT_FORMAT
+    v2 = speaker_mod.SpeakerVerifier()
+    v2.load()
+    assert v2.num_samples == 1, "the _format array was loaded as an embedding"
+    # passive learning refuses to pollute a stale pool
+    v3 = speaker_mod.SpeakerVerifier()
+    v3._format, v3._embeddings = 1, [vec]
+    assert v3.add_sample(_speech(2.0)) is False

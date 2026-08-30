@@ -37,13 +37,15 @@ from jarvis.events import (AlarmFired, ApprovalRequested, ApprovalResolved,
                            RecordingStarted, RecordingStopped,
                            ReminderFired, Status, Transcribed,
                            UncertainResolved, UncertainUtterance,
-                           UserUtterance, bus)
+                           UserUtterance, bus,
+    HotwordDetected, SpeakingState)
 from jarvis.logs import get_logger
 
 from jarvis import brain as brain_mod
 from jarvis import desktop as desktop_mod
 from jarvis import speak_queue, voice_check
 from jarvis.assistant_config import AssistantConfig
+from jarvis.turnclock import TurnLedger
 from jarvis.brain import JarvisBrain
 from jarvis.commander import COURTESY_REPLIES, Commander, parse_yes_no
 from jarvis.context import ContextEngine
@@ -237,6 +239,15 @@ class JarvisApp:
         self._turn_timer = None          # slow-answer filler
         self._turn_watchdog = None
 
+        # Turn ledger: one "turn:" line per voice turn with where the
+        # seconds went (jarvis/turnclock.py). Subscribed before the workers so
+        # its marks are taken as close to the event as the bus allows.
+        self.turns = TurnLedger(jsonl_path=PATHS.LOG_DIR / "turns.jsonl")
+        bus.subscribe(HotwordDetected, lambda ev: self.turns.mark("wake"))
+        bus.subscribe(RecordingStarted, lambda ev: self.turns.mark("mic"))
+        bus.subscribe(RecordingStopped, self._turn_on_stop)
+        bus.subscribe(Transcribed, self._turn_on_transcribed)
+        bus.subscribe(SpeakingState, self._turn_on_speaking)
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
         bus.subscribe(RecordingStarted, self._on_recording_started)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
@@ -891,6 +902,26 @@ class JarvisApp:
         except Exception:
             log.exception("partial loop died")
 
+    # ------------------------------------------------------- turn ledger
+    def _turn_on_stop(self, ev):
+        if ev.reason == "abort":
+            self.turns.abandon("abort")
+            return
+        if ev.dead_air_s is not None:
+            self.turns.mark("speech_end", at=time.monotonic() - ev.dead_air_s)
+        self.turns.mark("stop", stop=ev.endpoint or ev.reason)
+
+    def _turn_on_transcribed(self, ev):
+        self.turns.mark("stt")
+        if not ev.accepted:
+            self.turns.abandon(f"rejected:{ev.reject_reason or 'confidence'}")
+        elif not (ev.text or "").strip():
+            self.turns.abandon("empty")
+
+    def _turn_on_speaking(self, ev):
+        if ev.active:
+            self.turns.mark("audio")
+
     def _on_recording_stopped(self, ev):
         if ev.reason == "abort":
             return
@@ -950,8 +981,11 @@ class JarvisApp:
         # wait is just noise.
         if source == "voice":
             self._turn_start()
+            self.turns.mark("handle")
         try:
             result = self._emit_result(self.commander.handle(text, source))
+            if source == "voice" and (result.status or "").startswith("Ignored"):
+                self.turns.abandon("ignored")
         except Exception:
             self._turn_finished()
             raise
@@ -1092,16 +1126,21 @@ class JarvisApp:
                  "yes" if yes else "no", source)
         bus.publish(UncertainResolved(request_id=request_id, yes=yes,
                                       source=source))
-        result = self._emit_result(self.commander.resolve_uncertain(text, yes))
         # The prompt left the turn open (done=False) so this answer could
-        # arrive. Close it now, or _turn_busy stays set and every wake word
-        # for the next 60 s is met with "One moment -- still on the last one"
-        # until the watchdog frees it. A YES that routes to the brain returns
-        # done=False again: re-arm the filler and watchdog for THAT lookup,
-        # and _on_brain_tags will close it as usual.
-        if getattr(result, "done", True) is False:
-            self._turn_start()
-        else:
+        # arrive. Re-arm BEFORE routing, exactly as _dispatch does: the brain's
+        # busy branch (and a fast failure) invokes _on_brain_tags ->
+        # _turn_finished synchronously inside resolve_uncertain, and a
+        # _turn_start() placed after it would re-open a turn nothing closes --
+        # every wake word refused until the 60 s watchdog. A YES that routes
+        # to the brain returns done=False and _on_brain_tags closes it; a NO
+        # or a synchronous command is closed right here.
+        self._turn_start()
+        try:
+            result = self._emit_result(self.commander.resolve_uncertain(text, yes))
+        except Exception:
+            self._turn_finished()
+            raise
+        if getattr(result, "done", True) is not False:
             self._turn_finished()
         return result
 
@@ -1210,6 +1249,13 @@ class JarvisApp:
         try:
             if self.speaker.enrolled:
                 self.speaker.load_model()
+                try:
+                    from jarvis.endpoint import VoiceEndpointer
+                    ep = VoiceEndpointer()
+                    if ep.warm():
+                        self.recorder.endpointer = ep
+                except Exception:
+                    log.exception("endpointer unavailable; energy timer only")
         except Exception:
             log.exception("speaker model load failed")
         # Honest failure for the speakers: with only a dummy/null sink the

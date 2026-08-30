@@ -208,6 +208,11 @@ def test_the_sdk_exception_shape_is_detected():
     from fish_audio_sdk.exceptions import HttpCodeErr
     assert tts_mod._is_out_of_credit(HttpCodeErr(402, "Payment Required"))
     assert not tts_mod._is_out_of_credit(HttpCodeErr(500, "boom"))
+    # the cases the old substring detector got WRONG, so this pins the fix:
+    class _StatusOnly(Exception):
+        status = 402
+    assert tts_mod._is_out_of_credit(_StatusOnly("nope"))            # no marker text
+    assert not tts_mod._is_out_of_credit(HttpCodeErr(500, "credit balance exhausted"))
 
 
 def test_retire_fish_switches_engine_and_persists(monkeypatch):

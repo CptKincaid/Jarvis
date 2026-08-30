@@ -214,6 +214,12 @@ class Recorder:
         # Optional jarvis.speaker.SpeakerVerifier for voice-aware auto-stop;
         # may be injected later by assigning recorder.speaker_verifier.
         self.speaker_verifier = speaker_verifier
+        # Optional jarvis.endpoint.VoiceEndpointer, injected by the app once
+        # the model is warm. None -> the energy timer alone ends captures.
+        self.endpointer = None
+        self._ep_cursor = 0                      # frames already fed to it
+        self._stop_endpoint = ""                 # what ended the last capture
+        self._stop_dead_air = None               # ...and how long it waited
 
         # Explicit state inventory (was scattered getattr state in the monolith)
         self.recording = False
@@ -344,6 +350,13 @@ class Recorder:
         self._voice_stopped = False
         self._waveform_buffer.clear()
         self.last_audio = None
+        self._ep_cursor = 0
+        self._stop_endpoint, self._stop_dead_air = "", None
+        if self.endpointer is not None:
+            try:
+                self.endpointer.reset()
+            except Exception:
+                log.debug("endpointer reset failed", exc_info=True)
 
         # Cache thresholds for the audio thread BEFORE creating the closure
         # (monolith 2400-2401 cached only silence_thresh and still read the
@@ -456,7 +469,9 @@ class Recorder:
         finally:
             self._release_session()
         self.last_audio = audio
-        bus.publish(RecordingStopped(reason=reason))
+        bus.publish(RecordingStopped(reason=reason,
+                                     endpoint=self._stop_endpoint or reason,
+                                     dead_air_s=self._stop_dead_air))
         return audio
 
     def abort(self):
@@ -570,6 +585,8 @@ class Recorder:
             now = time.monotonic()
             waveform = [min(abs(v), 1.0) for v in self._waveform_buffer]
             bus.publish(AudioLevel(level=self._audio_level, waveform=waveform))
+            if self._check_endpoint():
+                return
             if now >= next_silence:
                 next_silence = now + self._SILENCE_POLL_S
                 if self._check_silence():
@@ -578,6 +595,49 @@ class Recorder:
                 next_speaker = now + self._SPEAKER_POLL_S
                 self._check_speaker_silence()
             time.sleep(self._POLL_S)
+
+    def _check_endpoint(self) -> bool:
+        """VAD endpointing: stop CONFIG.endpoint_silence after the user's last
+        word. Returns True when it stopped the session.
+
+        Runs every poll tick (~12 Hz) on the frames captured since the last
+        tick, so a stop lands within ~100 ms of the threshold. Only ever
+        stops AFTER speech has been heard: a capture in which nobody speaks
+        is left to the energy timer, and silence_grace still applies so the
+        tail of the wake word plus a thinking pause cannot end the capture
+        before the question has started.
+        """
+        ep = self.endpointer
+        if ep is None or not self.recording or not CONFIG.endpoint_vad:
+            return False
+        frames = self._audio_frames
+        n = len(frames)
+        if n > self._ep_cursor:
+            fresh = frames[self._ep_cursor:n]
+            self._ep_cursor = n
+            try:
+                ep.feed(np.concatenate(fresh, axis=0).flatten(), self._record_rate)
+            except Exception:
+                log.debug("endpointer feed failed; energy timer only", exc_info=True)
+                self.endpointer = None
+                return False
+        gap = ep.silence_since_speech
+        if gap is None or gap < CONFIG.endpoint_silence:
+            return False
+        if self._record_start_time and \
+                (time.monotonic() - self._record_start_time) < CONFIG.silence_grace:
+            return False
+        if ep.audio_seconds < 0.5:
+            return False                      # by audio, not by frame count
+        log.info("Auto-stop: %.2fs after the last word (vad)", gap)
+        self._voice_stopped = True
+        self._stop_endpoint, self._stop_dead_air = "vad", gap
+        try:
+            self.stop(reason="silence")
+        except Exception:
+            log.exception("endpoint stop error")
+            self.recording = False
+        return True
 
     def _check_silence(self) -> bool:
         """Port of monolith 4301-4344. Returns True when it stopped the
@@ -615,6 +675,8 @@ class Recorder:
                 and len(self._audio_frames) > min_frames):
             log.info("Auto-stop on silence (%ss timeout)", timeout)
             self._voice_stopped = True
+            self._stop_endpoint = "energy"
+            self._stop_dead_air = time.monotonic() - self._silence_start
             try:
                 self.stop(reason="silence")
             except Exception:
@@ -653,6 +715,16 @@ class Recorder:
         if not lock.acquire(blocking=False):
             return
 
+        try:
+            self._start_speaker_check(lock, verifier)
+        except BaseException:
+            # Anything raised between acquire and the thread's own finally
+            # (concatenate, resample) would otherwise hold the lock for the
+            # life of the Recorder and silence every later voice-ID check.
+            lock.release()
+            raise
+
+    def _start_speaker_check(self, lock, verifier):
         now = time.monotonic()
         if (self._record_start_time
                 and (now - self._record_start_time) < self._SPEAKER_WARMUP_S):
@@ -690,11 +762,7 @@ class Recorder:
             finally:
                 lock.release()
 
-        try:
-            threading.Thread(target=_check, daemon=True).start()
-        except Exception:
-            lock.release()
-            raise
+        threading.Thread(target=_check, daemon=True).start()
 
     def _on_speaker_silence_result(self, is_match, score):
         """Handle result of periodic speaker check during recording.
@@ -738,6 +806,7 @@ class Recorder:
                 log.info("Voice-ID auto-stop: no user voice for %.1fs "
                          "(last score=%.3f)", elapsed, score)
                 self._voice_stopped = True
+                self._stop_endpoint, self._stop_dead_air = "voice_id", elapsed
                 try:
                     self.stop(reason="silence")
                 except Exception:

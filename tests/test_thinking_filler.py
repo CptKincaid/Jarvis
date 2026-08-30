@@ -99,3 +99,22 @@ def test_the_delay_clears_the_measured_tool_latency():
     the real answer queued behind it."""
     import jarvis.app as app_mod
     assert app_mod.THINKING_DELAY_S >= 4.5
+
+
+def test_a_yes_whose_lookup_closes_the_turn_synchronously_is_not_reopened(monkeypatch):
+    """brain.chat's busy branch invokes _on_brain_tags -> _turn_finished
+    INSIDE resolve_uncertain. Re-arming after it returned re-opened a turn
+    nothing would close: every wake word refused until the 60 s watchdog."""
+    from types import SimpleNamespace
+    from jarvis.config import CONFIG
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    app = _answerable_app(SimpleNamespace(handled=True, status="Thinking", done=False,
+                                          reply=None, speak=False), monkeypatch)
+    def resolve(text, yes):
+        app._turn_finished()                      # the brain answered inline
+        return SimpleNamespace(handled=True, status="Thinking", done=False,
+                               reply=None, speak=False)
+    app.commander = SimpleNamespace(resolve_uncertain=resolve)
+    app.uncertain_answer("abc123", True, source="voice")
+    assert not app._turn_busy.is_set(), "re-opened a turn the brain had closed"
+    assert app._turn_timer is None and app._turn_watchdog is None

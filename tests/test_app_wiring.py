@@ -1104,3 +1104,33 @@ def test_services_brain_chat_forwards_every_keyword_the_brain_takes(build, monke
     real = set(inspect.signature(JarvisBrain.chat).parameters) - {"self", "callback", "max_rounds"}
     wrapper = set(inspect.signature(app.services.brain.chat).parameters)
     assert real <= wrapper, f"wrapper drops {real - wrapper}"
+
+
+def test_turn_ledger_reports_one_line_per_voice_turn(build, monkeypatch):
+    """The "turn:" line is assembled from five events on four threads; this
+    drives them through the real bus wiring and checks the arithmetic lands."""
+    from jarvis.events import (HotwordDetected, RecordingStarted, RecordingStopped,
+                               SpeakingState, Transcribed, bus as _bus)
+    app = build()
+    got = []
+    monkeypatch.setattr(app.turns, "_emit", got.append)
+    _bus.publish(HotwordDetected(score=0.9))
+    _bus.publish(RecordingStarted())
+    _bus.publish(RecordingStopped(reason="silence", endpoint="vad", dead_air_s=0.8))
+    _bus.publish(Transcribed(text="what time is it", accepted=True))
+    app.turns.mark("handle")
+    _bus.publish(SpeakingState(active=True, amplitude=0.3))
+    _bus.publish(SpeakingState(active=True, amplitude=0.5))     # amplitude ticks
+    assert len(got) == 1, got
+    rec = got[0]
+    assert rec["outcome"] == "audio" and rec["stop"] == "vad"
+    assert abs(rec["dead_air"] - 0.8) < 0.05
+    assert rec["wait"] is not None and rec["wait"] >= rec["dead_air"]
+    # a rejected clip closes the turn without a reply
+    _bus.publish(HotwordDetected(score=0.9))
+    _bus.publish(RecordingStarted())
+    _bus.publish(RecordingStopped(reason="silence", endpoint="energy", dead_air_s=2.5))
+    _bus.publish(Transcribed(text="", accepted=False, reject_reason="speaker"))
+    assert len(got) == 2 and got[1]["outcome"] == "rejected:speaker"
+    _bus.publish(SpeakingState(active=True))                     # TTS from elsewhere
+    assert len(got) == 2

@@ -23,6 +23,8 @@ from jarvis.commander import _LAST_MAIL_RX, _h_last_mail
     "read me my most recent email",
     "what's my newest mail",
     "tell me about my last e-mail",
+    "what did mark say in his last email",       # a name, not a verb
+    "what was my last email about the move",     # a noun, not a verb
 ])
 def test_the_phrasings_that_mean_most_recent(said):
     assert _LAST_MAIL_RX.search(said), said
@@ -72,3 +74,26 @@ def test_it_looks_back_further_than_a_day():
 def test_no_brain_means_no_claim_to_have_handled_it():
     c = SimpleNamespace(_svc=lambda name: None)
     assert _h_last_mail(c, "my last email", None) is None
+
+
+@pytest.mark.parametrize("said", [
+    "what did mark say in his last email",
+    "what was my last email about the move",
+])
+def test_reads_that_merely_contain_a_write_word_still_read(said):
+    """The first guard was a bare word list, so a sender called Mark or a
+    subject about a move made the read fall through to the model."""
+    calls = []
+    brain = SimpleNamespace(chat=lambda t, **kw: calls.append(kw))
+    c = SimpleNamespace(_svc=lambda name: brain)
+    assert _h_last_mail(c, said, None) is not None, said
+    assert calls and calls[0]["force_tool"] == "get_mail"
+
+
+@pytest.mark.parametrize("said", [
+    "reply to my latest email", "delete my last email",
+    "could you forward the last mail to bob", "please archive my most recent email",
+])
+def test_leading_write_verbs_fall_through(said):
+    c = SimpleNamespace(_svc=lambda name: SimpleNamespace(chat=lambda *a, **k: None))
+    assert _h_last_mail(c, said, None) is None, said

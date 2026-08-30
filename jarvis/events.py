@@ -38,6 +38,8 @@ class RecordingStarted(Event):
 @dataclass
 class RecordingStopped(Event):
     reason: str = "manual"            # manual | silence | cap | abort
+    endpoint: str = ""                # which detector ended it: vad | energy | voice_id | manual | cap
+    dead_air_s: float | None = None   # silence waited through before stopping (turn ledger)
 
 
 @dataclass

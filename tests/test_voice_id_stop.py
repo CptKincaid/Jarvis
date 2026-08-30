@@ -106,7 +106,11 @@ def test_only_one_check_is_in_flight_at_a_time(monkeypatch):
     rec._check_speaker_silence()
     gate.set()
     assert v.done.wait(2)
-    time.sleep(0.05)
+    for _ in range(200):                              # until the worker's finally
+        if not rec._speaker_check_lock.locked():
+            break
+        time.sleep(0.01)
+    assert not rec._speaker_check_lock.locked()
     assert len(v.seen) == 1, f"{len(v.seen)} verifies ran concurrently"
     rec._check_speaker_silence()                  # released: runs again
     for _ in range(50):
@@ -116,10 +120,34 @@ def test_only_one_check_is_in_flight_at_a_time(monkeypatch):
     assert len(v.seen) == 2
 
 
-def test_a_dead_model_is_not_polled():
+def test_a_dead_model_is_not_polled(monkeypatch):
+    """speaker_verify is forced on so the ONLY thing short-circuiting the
+    poll is _model_failed -- without that, a box with the feature off in
+    voice_settings.json passed this test for the wrong reason."""
+    monkeypatch.setattr(recorder_mod.CONFIG, "speaker_verify", True)
     rec = _recorder_mid_capture()
     v = _Verifier()
     v._model_failed = True
     rec.speaker_verifier = v
     rec._check_speaker_silence()
     assert not v.done.wait(0.3) and v.seen == []
+    v._model_failed = False                           # control: the gate under test
+    rec._check_speaker_silence()
+    assert v.done.wait(2) and v.seen
+
+
+def test_a_failure_before_the_thread_starts_releases_the_lock(monkeypatch):
+    """concatenate/resample raising between acquire and the worker's own
+    finally would hold the lock for the life of the Recorder."""
+    monkeypatch.setattr(recorder_mod.CONFIG, "speaker_verify", True)
+    rec = _recorder_mid_capture()
+    rec.speaker_verifier = v = _Verifier()
+    rec._resample_to_16k = lambda a: (_ for _ in ()).throw(RuntimeError("scipy exploded"))
+    try:
+        rec._check_speaker_silence()
+    except RuntimeError:
+        pass
+    assert not rec._speaker_check_lock.locked(), "lock leaked past the failure"
+    rec._resample_to_16k = lambda a: a
+    rec._check_speaker_silence()
+    assert v.done.wait(2)

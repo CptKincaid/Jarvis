@@ -135,6 +135,7 @@ class SpeakerVerifier:
         self._model = None
         self._embeddings = []       # List of 192-dim numpy arrays
         self._centroid = None       # Mean of all embeddings
+        self._format = VOICEPRINT_FORMAT   # of the pool on disk; see load()
         self._lock = threading.Lock()
         self._loaded = False
         self._model_loaded = False
@@ -253,6 +254,7 @@ class SpeakerVerifier:
             self._embeddings = [data[k] for k in keys]
             self._recompute_centroid()
             fmt = int(data["_format"][0]) if "_format" in data.files else 1
+            self._format = fmt
             log.info("voiceprint loaded: %d samples (format %d)",
                      len(self._embeddings), fmt)
             if fmt < VOICEPRINT_FORMAT:
@@ -274,7 +276,10 @@ class SpeakerVerifier:
             try:
                 VOICEPRINT_FILE.parent.mkdir(parents=True, exist_ok=True)
                 arrays = {f"emb_{i:04d}": emb for i, emb in enumerate(self._embeddings)}
-                arrays["_format"] = np.array([VOICEPRINT_FORMAT])
+                # The pool's own format, not the code's: saving a pre-trim
+                # pool under the current number would silence the re-enrol
+                # warning while the embeddings stayed incomparable.
+                arrays["_format"] = np.array([self._format])
                 tmp = VOICEPRINT_FILE.with_name(VOICEPRINT_FILE.name + ".tmp")
                 # savez appends ".npz" to bare paths; a file handle keeps the
                 # exact tmp name so os.replace targets the right file.
@@ -362,6 +367,15 @@ class SpeakerVerifier:
             return False, len(self._embeddings)
 
         with self._lock:
+            if self._embeddings and self._format < VOICEPRINT_FORMAT:
+                # A fresh enrolment supersedes a pre-trim pool rather than
+                # mixing into it: the old embeddings were pooled with silence
+                # and would drag the centroid away from the trimmed takes.
+                log.warning("replacing a voiceprint enrolled before silence "
+                            "trimming (%d samples); this enrolment starts a "
+                            "fresh pool", len(self._embeddings))
+                self._embeddings = []
+            self._format = VOICEPRINT_FORMAT
             self._embeddings.append(embedding)
             self._recompute_centroid()
 
@@ -409,6 +423,14 @@ class SpeakerVerifier:
             self._fail_open("no voiceprint enrolled")
             return True, 1.0
 
+        if len(audio_16k) < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
+            # Too short to judge is a plain rejection, not a broken gate: a
+            # 0.5 s clip (long enough for _finalize_audio, short for ECAPA)
+            # used to fail SHUT here and toast "Voice blocked: speaker check
+            # unavailable" -- the line that means the model is down.
+            log.info("speaker verify: %.2fs is too short to judge; rejected",
+                     len(audio_16k) / SAMPLE_RATE)
+            return False, 0.0
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             # Can't extract embedding (model missing, audio too short) — accept
@@ -438,6 +460,10 @@ class SpeakerVerifier:
         Returns:
             True if sample was added
         """
+        if self._format < VOICEPRINT_FORMAT:
+            log.info("passive sample skipped: voiceprint predates silence "
+                     "trimming; re-enrol with scripts/enroll_voice.py --reset")
+            return False
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             return False
@@ -616,6 +642,7 @@ class SpeakerVerifier:
         with self._lock:
             self._embeddings.clear()
             self._centroid = None
+            self._format = VOICEPRINT_FORMAT
         try:
             VOICEPRINT_FILE.unlink(missing_ok=True)
             log.info("voiceprint cleared")

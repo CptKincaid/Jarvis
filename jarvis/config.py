@@ -103,6 +103,12 @@ class Config:
     # than waiting.
     silence_timeout: float = 2.5
     silence_grace: float = 1.5     # no auto-stop this soon after start
+    # Speech endpointing (jarvis/endpoint.py): stop this long after the VAD
+    # last heard speech, instead of waiting out silence_timeout. 0.8 s is the
+    # usual assistant figure; raise it if a thinking pause mid-question cuts
+    # you off, lower it if the wait after a question feels long.
+    endpoint_vad: bool = True
+    endpoint_silence: float = 0.8
     noise_threshold: float = 0.015
     window_geometry: str = ""
 

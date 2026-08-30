@@ -1370,8 +1370,12 @@ _LAST_MAIL_HOURS = 168        # a week: "my last email" is not "since midnight"
 # A read, never a write: "reply to my latest email" / "delete the last mail"
 # name the same message but want something get_mail cannot do. Those fall
 # through to the router, which can at least say so.
+# Anchored to the leading verb: "what did mark say in his last email" and
+# "my last email about the move" are reads that happen to contain a name or
+# a noun from this list, and a bare word-list guard blocked them.
 _MAIL_WRITE_RX = re.compile(
-    r"\b(?:reply|respond|answer|delete|trash|forward|archive|send|compose|"
+    r"^\W*(?:(?:can|could|would|will)\s+you\s+)?(?:please\s+)?"
+    r"(?:reply|respond|answer|delete|trash|forward|archive|send|compose|"
     r"write|draft|mark|flag|star|unsubscribe|move)\b", re.I)
 
 
