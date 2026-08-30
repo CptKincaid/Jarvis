@@ -12,46 +12,14 @@ from types import SimpleNamespace
 import numpy as np
 
 import jarvis.app as app_mod
+import jarvis.headsup as headsup_mod
 import jarvis.recorder as recorder_mod
 from jarvis.config import CONFIG
 from jarvis.headsup import MeetingHeadsUp
-from jarvis.tools.cues import CORE, compile_cues
-from jarvis.tools.registry import ToolRegistry, ToolResult, ToolSpec
 
 
 # ------------------------------------------------------------ tool subsets
-def _reg(names):
-    reg = ToolRegistry()
-    for n in names:
-        reg.register(ToolSpec(n, "desc", handler=lambda **k: ToolResult(text="x")))
-    reg.set_cues(compile_cues())
-    return reg
 
-
-def test_only_cued_tools_ride_with_the_utterance():
-    reg = _reg(["get_time", "get_weather", "get_calendar", "notes", "get_mail",
-                "spotify_play", "spotify_control", "get_briefing", "set_timer"])
-    def names(text):
-        return {s["function"]["name"] for s in reg.schemas_for(text)}
-    assert names("what's the weather") == set(CORE)
-    assert names("play some daft punk") == set(CORE) | {"spotify_play"}
-    assert names("what was my last email about") == set(CORE) | {"get_mail"}
-    assert names("set a timer for five minutes") == set(CORE) | {"set_timer"}
-    assert len(reg.schemas_for("who are you")) == len(CORE)
-
-
-def test_a_tool_without_cues_always_rides():
-    reg = _reg(["get_time", "brand_new_tool"])
-    assert {s["function"]["name"] for s in reg.schemas_for("anything")} == {"get_time", "brand_new_tool"}
-
-
-def test_without_cues_installed_everything_rides():
-    reg = ToolRegistry()
-    reg.register(ToolSpec("get_mail", "d", handler=lambda **k: ToolResult(text="x")))
-    assert len(reg.schemas_for("hello")) == 1
-
-
-# ------------------------------------------------------ conversation memory
 def test_the_model_now_sees_the_last_exchanges():
     from jarvis.context import ContextEngine
     ctx = ContextEngine.__new__(ContextEngine)
@@ -178,6 +146,10 @@ def test_a_wake_word_cancels_a_pending_follow_up_and_barges_in(monkeypatch, tmp_
 def test_a_guest_is_declined_politely_and_not_nagged(monkeypatch, tmp_path):
     monkeypatch.setattr(CONFIG, "talkback", True)
     a = _app(monkeypatch, state=tmp_path / "b.json")
+    # The rate limit is "now - last < 180 s" on CLOCK_MONOTONIC (seconds
+    # since boot): with the stamp at 0.0 this test only passed on a host
+    # up for more than three minutes. Pin the stamp far in the past.
+    a._last_guest_ts = -1e9
     a._on_guest(0.95)
     a._on_guest(0.95)
     assert a.said == ["I only answer to Hunter, sir."]
@@ -190,6 +162,7 @@ def test_passive_learning_takes_a_clear_match_once_in_a_while(monkeypatch, tmp_p
     monkeypatch.setattr(CONFIG, "speaker_verify", True)
     monkeypatch.setattr(CONFIG, "speaker_threshold", 0.3)
     a = _app(monkeypatch, state=tmp_path / "b.json")
+    a._last_learn_ts = -1e9        # not "since boot": see the guest test
     learned = []
     done = threading.Event()
     a.speaker = SimpleNamespace(add_sample=lambda audio: learned.append(len(audio)) or done.set())
@@ -197,9 +170,19 @@ def test_passive_learning_takes_a_clear_match_once_in_a_while(monkeypatch, tmp_p
     a._maybe_learn_voice(audio, {"scores": [0.62, -0.06]})
     assert done.wait(2) and learned == [32000]
     a._maybe_learn_voice(audio, {"scores": [0.62]})       # rate-limited
+    time.sleep(0.05)
+    assert learned == [32000]
+    # Lift the rate limit so the score threshold is what refuses this one:
+    # with the limit still armed the assertion could not tell the two
+    # early returns apart, and deleting the threshold check passed.
+    a._last_learn_ts = -1e9
     a._maybe_learn_voice(audio, {"scores": [0.35]})       # not clear enough
     time.sleep(0.05)
     assert learned == [32000]
+    done.clear()
+    a._last_learn_ts = -1e9
+    a._maybe_learn_voice(audio, {"scores": [0.62]})       # clear again: the limit was all that held it
+    assert done.wait(2) and learned == [32000, 32000]
 
 
 # ---------------------------------------------------- first-wake briefing
@@ -252,7 +235,7 @@ class _Cal:
         return self._events
 
 
-def test_heads_up_files_one_reminder_per_timed_event(tmp_path):
+def test_headsup_files_one_reminder_per_timed_event(tmp_path):
     tz = timezone.utc
     now = datetime(2026, 8, 31, 8, 30, tzinfo=tz)
     def ev(title, start, all_day=False):
@@ -275,7 +258,7 @@ def test_heads_up_files_one_reminder_per_timed_event(tmp_path):
     assert h2.tick() == 0, "a restart re-filed the same meeting"
 
 
-def test_heads_up_inside_the_lead_says_the_real_minutes(tmp_path):
+def test_headsup_inside_the_lead_says_the_real_minutes(tmp_path):
     tz = timezone.utc
     now = datetime(2026, 8, 31, 8, 30, tzinfo=tz)
     cal = _Cal([SimpleNamespace(title="Standup", start=now + timedelta(minutes=4), all_day=False)])
@@ -285,6 +268,39 @@ def test_heads_up_inside_the_lead_says_the_real_minutes(tmp_path):
                    now=lambda tzinfo=None: now).tick()
     assert filed[0][1] == "Standup in 4 minutes"
     assert filed[0][0] - now.timestamp() < 10
+
+
+def test_headsup_state_drops_malformed_entries_and_saves_atomically(tmp_path, monkeypatch):
+    """One non-string value in the state file (a hand edit, a half-written
+    save) raised TypeError in _prune on every tick, before the save; and
+    the save itself was a bare write_text, so a crash mid-write was how
+    such a file came to exist."""
+    tz = timezone.utc
+    now = datetime(2026, 8, 31, 8, 30, tzinfo=tz)
+    state = tmp_path / "s.json"
+    state.write_text(json.dumps({"Old|2026-08-01T09:00:00+00:00": 7, "Bad": None,
+                                 "Kept|2026-08-31T09:00:00+00:00": "2026-08-31T09:00:00+00:00"}))
+    cal = _Cal([SimpleNamespace(title="Standup", start=now + timedelta(minutes=30), all_day=False)])
+    filed = []
+    tk = SimpleNamespace(add_reminder=lambda due, text, repeat="": filed.append(text))
+    replaced = []
+    real_replace = headsup_mod.os.replace
+    monkeypatch.setattr(headsup_mod.os, "replace",
+                        lambda src, dst: replaced.append((str(src), str(dst))) or real_replace(src, dst))
+    h = MeetingHeadsUp(lambda: cal, tk, lead_min=10, state_path=state, now=lambda tzinfo=None: now)
+    assert h.tick() == 1 and filed == ["Standup in 10 minutes"]
+    saved = json.loads(state.read_text())
+    assert "Kept|2026-08-31T09:00:00+00:00" in saved and "Bad" not in saved
+    assert "Old|2026-08-01T09:00:00+00:00" not in saved
+    assert all(isinstance(v, str) for v in saved.values())
+    assert replaced and all(dst == str(state) and src != str(state) for src, dst in replaced)
+    assert all(src.startswith(str(tmp_path)) for src, _ in replaced), "temp file beside the state"
+    assert not list(tmp_path.glob("*.tmp")), "no temp file left behind"
+    # Not JSON at all: a fresh start, not a crash.
+    state.write_text("{not json")
+    h2 = MeetingHeadsUp(lambda: cal, tk, lead_min=10, state_path=state, now=lambda tzinfo=None: now)
+    assert h2.tick() == 1
+    assert json.loads(state.read_text())
 
 
 # -------------------------------------------------------------- barge-in

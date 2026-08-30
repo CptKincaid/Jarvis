@@ -558,10 +558,16 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
 
 
 def _registry_schemas(registry, text=None):
+    """Every registered tool, every turn. A per-turn subset chosen from
+    the text was tried (2026-08-30) and dropped: the chat template renders
+    the tools into the prefix, so a subset that changes between turns
+    evicts Ollama's prefix cache (module doc, "static-prefix rule") and
+    costs more prefill than the schemas it saves. ``text`` is accepted for
+    the older call shape and ignored."""
     if registry is None:
         return []
     try:
-        return (registry.schemas_for(text) if text is not None and hasattr(registry, 'schemas_for') else registry.schemas())
+        return registry.schemas()
     except Exception:
         log.exception("tool registry schemas failed")
         return []
@@ -990,6 +996,7 @@ class JarvisBrain:
                 callback([("SPEAK",
                            "Still on the last one, sir. One moment.")])
             return None
+        gen = self._job_gen                   # this job's identity, for cancel()
 
         def _process():
             bus.publish(BrainState(state="thinking"))
@@ -1012,7 +1019,11 @@ class JarvisBrain:
                 if callback and not self._cancelled:
                     callback([("SPEAK", INTERNAL_ERROR_LINE)])
             finally:
-                self._busy = False
+                # cancel() (barge-in) already released the guard, and a
+                # newer job may hold it by now: a blanket release here let
+                # the dead job's tail free the live job's guard.
+                if self._job_gen == gen:
+                    self._busy = False
                 bus.publish(BrainState(state="idle"))
 
         t = threading.Thread(target=_process, daemon=True, name="brain-chat")
@@ -1040,9 +1051,11 @@ class JarvisBrain:
         # it is handed some.
         recent = ""
         try:
-            if self._context:
-                recent = self._context.format_for_prompt(
-                    self._context.get_context("standard"), spoken=True) or ""
+            # The last exchanges only. format_for_prompt() also carries the
+            # git state, the active window title and the session log, and
+            # this prompt leaves the machine.
+            if self._context and hasattr(self._context, "recent_conversation_text"):
+                recent = self._context.recent_conversation_text() or ""
         except Exception:
             log.debug("web answer: context unavailable", exc_info=True)
         recent = recent.strip()[-1200:]
@@ -1359,12 +1372,38 @@ class JarvisBrain:
                 rounds_left = 1        # one model turn renders the result
 
         streamed_sentences = []           # what on_sentence already received
+        clock_line_said = []
+
+        def guard(sentence):
+            # The guards _finish_spoken applies to the whole reply, per
+            # sentence: a streamed sentence is spoken before the reply
+            # exists, so it must not carry an ungrounded clock claim or
+            # a leaked context line the full reply would have lost.
+            line = clean_ollama_reply(strip_markdown(clean_ollama_reply(sentence)))
+            guarded = guard_clock_claims(
+                line, "\n".join([ctx_text, mem_text] + tool_texts), text)
+            if guarded != line and guarded in (NO_CLOCK_LINE, UNSURE_CLOCK_LINE):
+                if clock_line_said:
+                    return ""             # the honest line once, not per sentence
+                clock_line_said.append(True)
+            return trim_spoken(guarded.strip())
+
         try:
             while speak is None and rounds_left > 0:
                 rounds_left -= 1
                 if on_sentence is not None:
-                    data, content, calls = self._stream_round(
-                        messages, tools, cap, on_sentence, streamed_sentences)
+                    # Each round gets the full spoken cap: what the model
+                    # said before a tool call must not eat the answer's.
+                    round_sentences = []
+                    try:
+                        data, content, calls = self._stream_round(
+                            messages, tools, cap, on_sentence, round_sentences, guard)
+                    finally:
+                        # kept even when the stream dies: they were spoken
+                        streamed_sentences.extend(round_sentences)
+                    if self._cancelled:
+                        final = ""            # barged in: nothing more to say
+                        break
                 else:
                     data = _http("/api/chat", _chat_payload(messages, tools),
                                  timeout=OLLAMA_TIMEOUT_S)
@@ -1457,51 +1496,84 @@ class JarvisBrain:
             if len(head) > budget:            # one very long sentence
                 head = _cut_at_clause(head, budget)
             spoken = f"{head} {PARTIAL_RESULT_LINE}"
+            if streamed_sentences and speak is None and on_sentence is not None \
+                    and not _PARTIAL_RX.search(" ".join(streamed_sentences)):
+                # the answer was spoken sentence by sentence: so is the notice
+                streamed_sentences.append(PARTIAL_RESULT_LINE)
+                try:
+                    on_sentence(PARTIAL_RESULT_LINE)
+                except Exception:
+                    log.exception("on_sentence failed")
         log.info("chat reply (%.2fs wall, %.2fs ollama overhead): %s",
                  time.monotonic() - started, server_s, spoken[:80])
         tags = []
         if card:
             tags.append(("BRIEFING", json.dumps(card)))
-        if streamed_sentences:
+        if streamed_sentences and speak is None:
+            # A tool's speak= line (screen_qa's answer, a canvas excuse) was
+            # never streamed: tagging it STREAMED silenced it.
             tags.append(("STREAMED", str(len(streamed_sentences))))
         tags.append(("SPEAK", spoken))
         return tags
 
-    def _stream_round(self, messages, tools, cap, on_sentence, streamed):
+    def _stream_round(self, messages, tools, cap, on_sentence, streamed,
+                      guard=None):
         """One /api/chat round, streamed. Complete sentences go to
-        on_sentence as they land (cleaned per sentence, capped at ``cap``);
+        on_sentence as they land (guarded per sentence, capped at ``cap``);
         a round that turns out to be a tool call speaks nothing. Returns
         (data, content, calls) shaped like the non-streaming path."""
         content, calls, buf, last = "", [], "", {}
-        for chunk in _http_stream("/api/chat", _chat_payload(messages, tools),
-                                  timeout=OLLAMA_TIMEOUT_S):
-            last = chunk
-            msg = chunk.get("message") or {}
-            piece = msg.get("content") or ""
-            if piece:
-                content += piece
-                buf += piece
-            for call in msg.get("tool_calls") or []:
-                calls.append(call)
-            if calls:
-                continue                      # a tool round: never spoken
-            done, buf = _split_complete_sentences(buf)
-            for sent in done:
-                self._emit_sentence(sent, cap, on_sentence, streamed)
-            if chunk.get("done"):
-                break
-        if not calls and buf.strip():
-            self._emit_sentence(buf, cap, on_sentence, streamed)
+        # The socket timeout is per read, so a stream that keeps trickling
+        # had no bound at all; the non-streamed request's wall bound stays.
+        deadline = time.monotonic() + OLLAMA_TIMEOUT_S
+        stream = _http_stream("/api/chat", _chat_payload(messages, tools),
+                              timeout=OLLAMA_TIMEOUT_S)
+        try:
+            for chunk in stream:
+                if self._cancelled:
+                    log.info("chat: cancelled mid-stream")
+                    break
+                err = chunk.get("error")
+                if err:
+                    # A failure after the first token (runner died, out of
+                    # memory) arrives as an NDJSON line, not an HTTP status:
+                    # the headers had already gone out. Treat it as the
+                    # request dying, which keeps what was already spoken.
+                    raise OSError(f"ollama stream error: {str(err)[:80]}")
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"ollama stream over {OLLAMA_TIMEOUT_S}s")
+                last = chunk
+                msg = chunk.get("message") or {}
+                piece = msg.get("content") or ""
+                if piece:
+                    content += piece
+                    buf += piece
+                for call in msg.get("tool_calls") or []:
+                    calls.append(call)
+                if calls:
+                    continue                  # a tool round: never spoken
+                done, buf = _split_complete_sentences(buf)
+                for sent in done:
+                    self._emit_sentence(sent, cap, on_sentence, streamed, guard)
+                if chunk.get("done"):
+                    break
+        finally:
+            stream.close()                    # a broken-off stream frees its socket
+        if not calls and buf.strip() and not self._cancelled:
+            self._emit_sentence(buf, cap, on_sentence, streamed, guard)
         data = dict(last)
         data["message"] = {"role": "assistant", "content": content,
                            "tool_calls": calls}
         return data, content, calls
 
     @staticmethod
-    def _emit_sentence(sentence, cap, on_sentence, streamed):
+    def _emit_sentence(sentence, cap, on_sentence, streamed, guard=None):
         if len(streamed) >= cap:
             return                            # the spoken cap still holds
-        line = trim_spoken(strip_markdown(sentence).strip())
+        if guard is not None:
+            line = guard(sentence)
+        else:
+            line = trim_spoken(strip_markdown(sentence).strip())
         if not line:
             return
         streamed.append(line)

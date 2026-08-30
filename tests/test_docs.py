@@ -443,6 +443,12 @@ def test_config_defaults_and_overrides(tmp_path, monkeypatch):
     assert docs_mod.index_dir({}) == Path("~/.aiws_trainer/docs_index").expanduser()
     monkeypatch.setenv("JARVIS_DOCS_INDEX_DIR", str(tmp_path / "env_index"))
     assert docs_mod.index_dir({}) == tmp_path / "env_index"
+    # env > config: AssistantConfig always carries docs.index_dir (DEFAULTS),
+    # so config-first had made the env override dead in the real app.
+    assert docs_mod.index_dir({"docs": {"index_dir": str(tmp_path / "cfg")}}) == tmp_path / "env_index"
+    from jarvis.assistant_config import AssistantConfig
+    assert docs_mod.index_dir(AssistantConfig({})) == tmp_path / "env_index"
+    monkeypatch.delenv("JARVIS_DOCS_INDEX_DIR")
     assert docs_mod.index_dir({"docs": {"index_dir": str(tmp_path / "cfg")}}) == tmp_path / "cfg"
     assert docs_mod.doc_paths({"docs": {"paths": "~/one"}}) == [Path("~/one").expanduser().resolve()]
     idx = docs_mod.build_index({"docs": {"max_files": "7", "embed_model": "x",

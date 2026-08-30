@@ -559,6 +559,14 @@ class JarvisApp:
         """A sentence of the reply, as the model produces it: speak it now.
         The full reply follows in the tags with a STREAMED marker so it is
         shown, remembered and not spoken again."""
+        if getattr(self, "_stream_muted", False):
+            return                  # barged in: the rest of this reply is dropped
+        # The answer has started, so no "thinking" line is warranted -- and
+        # one queued now would play BETWEEN the answer's sentences (the TTS
+        # queue is FIFO). Disarm the filler; the watchdog stays.
+        t, self._turn_timer = getattr(self, "_turn_timer", None), None
+        if t is not None:
+            t.cancel()
         if self._last_source == "voice":
             self._followup_after_speech = True
         self._say(sentence)
@@ -596,7 +604,8 @@ class JarvisApp:
                         bus.publish(JarvisReply(text=content, speak=not streamed))
                     if not streamed:          # streamed sentences already spoke
                         self._say(content)
-                    self.context.add_exchange(self._last_user_text, content)
+                    # brain._remember has already recorded this exchange;
+                    # recording it here too rendered every turn twice.
                     if self._last_source == "voice":
                         self._followup_after_speech = True
                 elif tag in ("BRIEFING", "STREAMED"):
@@ -873,7 +882,12 @@ class JarvisApp:
         # Called from the hotword listener thread.
         if self.recorder.recording:
             return
-        if self._audio_busy.is_set() or self._turn_busy.is_set():
+        # A wake word over Jarvis's own voice is a barge-in ("Jarvis, stop").
+        # A streamed reply keeps the turn open for as long as the model is
+        # producing sentences, so the turn gate must not refuse it: that
+        # made barge-in unreachable exactly when a reply was long.
+        barge = CONFIG.barge_in and getattr(self, "_tts_active", False)
+        if self._audio_busy.is_set() or (self._turn_busy.is_set() and not barge):
             # Transcription of the previous utterance is still running (~20 s
             # for a long clip). Starting a second capture here raced two
             # transcripts into the commander. Say so rather than ignoring it
@@ -882,14 +896,24 @@ class JarvisApp:
             bus.publish(Status(text="One moment — still on the last one",
                                kind="warn"))
             return
-        self.turns.mark("wake")            # accepted: this turn starts now
-        self._followup_after_speech = False   # a wake supersedes any follow-up
-        if CONFIG.barge_in and getattr(self, "_tts_active", False):
-            # "Jarvis, stop" mid-reply: cut the speech first, then listen.
+        if barge:
             try:
+                if self._turn_busy.is_set():
+                    # The model is still generating: stop it, drop the
+                    # sentences still in flight, and close that turn so its
+                    # tags cannot land on this one.
+                    self._stream_muted = True
+                    cancel = getattr(getattr(self, "brain", None), "cancel", None)
+                    if callable(cancel):
+                        cancel()
+                    self._turn_finished()
                 self.interrupt_speech()
             except Exception:
                 log.exception("barge-in interrupt failed")
+        self.turns.mark("wake")            # accepted: this turn starts now
+        self._followup_after_speech = False   # a wake supersedes any follow-up
+        self._turn_filler_pending = False     # a stale flag would label this answer a filler
+        self._say_again_count = 0
         if CONFIG.sound:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
         # The wake word ends and the user starts talking straight away, so
@@ -982,8 +1006,13 @@ class JarvisApp:
         self._last_user_text, self._last_source = "", "voice"
         self._followup_after_speech = False   # arm a wake-word-free listen
         self._briefing_pending = False        # first wake of the day
-        self._last_guest_ts = 0.0
-        self._last_learn_ts = 0.0
+        # -1e9, not 0.0: time.monotonic() counts from boot, so a 0.0 stamp
+        # muted the guest line and passive learning for the first 3 / 10
+        # minutes after a reboot.
+        self._last_guest_ts = -1e9
+        self._last_learn_ts = -1e9
+        self._say_again_count = 0
+        self._stream_muted = False
         name = self.assistant.user_name if self.assistant is not None else "Hunter"
         self._guest_line = GUEST_LINE.format(name=name)
 
@@ -996,14 +1025,32 @@ class JarvisApp:
             if source == "voice" and result.speak and CONFIG.talkback:
                 self._followup_after_speech = True
         if source == "voice":
-            if (result.status or "").startswith("Briefing"):
+            status = result.status or ""
+            if status.startswith("Briefing"):
                 self._mark_briefing_delivered()
-            elif self._briefing_due():
+            elif status.startswith(("Was that for me", "Ignored")):
+                pass        # no answer here: the briefing waits for a real turn
+            elif (reply or not done) and self._briefing_due():
                 self._briefing_pending = True
 
     def _after_speech(self):
         """Jarvis just finished a spoken burst: deliver a pending first-wake
-        briefing, else open the follow-up window."""
+        briefing, else open the follow-up window.
+
+        A burst is not the end of the turn. An ack ("Looking that up, sir"),
+        a thinking line and every streamed sentence each end in a falling
+        edge, and TTS may already hold the next line -- so a briefing fired
+        here landed on the in-flight brain call ("Still on the last one,
+        sir") and the follow-up mic opened under the answer. Wait for the
+        answer's own edge: nothing pending, no open mic, no queued speech."""
+        if self._turn_busy.is_set() or self._audio_busy.is_set() \
+                or getattr(self.recorder, "recording", False):
+            return                          # the answer is still coming / mic open
+        if getattr(self, "_pending_uncertain", None):
+            return                          # "Was that for me?" is waiting on a yes/no
+        tts = getattr(self, "tts", None)
+        if getattr(tts, "is_speaking", False) or getattr(tts, "pending", 0):
+            return                          # more speech is queued behind this burst
         if self._briefing_pending:
             self._briefing_pending = False
             self._followup_after_speech = False
@@ -1029,6 +1076,8 @@ class JarvisApp:
         """A clear wake word in a voice that is not the enrolled one."""
         if score < 0.85 or not CONFIG.talkback:
             return
+        if getattr(self, "_tts_active", False):
+            return          # under barge-in the listener hears his own voice
         now = time.monotonic()
         if now - self._last_guest_ts < 180.0:
             return
@@ -1060,7 +1109,9 @@ class JarvisApp:
 
     # ------------------------------------------------- first-wake briefing
     def _briefing_state_path(self):
-        return PATHS.AIWS / "briefing_state.json"
+        # MEMORY_DIR, not AIWS: the suite redirects MEMORY_DIR, so a test
+        # that builds a real app cannot mark the user's real day delivered.
+        return PATHS.MEMORY_DIR / "briefing_state.json"
 
     def _briefing_due(self, now=None):
         try:
@@ -1091,19 +1142,24 @@ class JarvisApp:
         brain = getattr(self.services, "brain", None)
         if brain is None or not hasattr(brain, "chat"):
             return
-        self._mark_briefing_delivered()
+        if getattr(getattr(self, "brain", None), "is_busy", False):
+            # chat() would only say "Still on the last one, sir": leave the
+            # day unmarked so the next answered turn delivers it.
+            log.info("first-wake briefing: model busy; next turn")
+            return
         log.info("first wake of the day: delivering the briefing")
         self._say("Your briefing for today, sir.")
         try:
             brain.chat("my morning briefing", force_tool="get_briefing")
         except Exception:
             log.exception("first-wake briefing failed")
+            return
+        self._mark_briefing_delivered()     # after the ask, not before
 
     # ------------------------------------------------------- diagnostics
     def diagnostics_text(self) -> str:
         """"Run diagnostics": a spoken status in character, from real data."""
         import statistics
-        import subprocess
         parts = []
         up = time.monotonic() - getattr(self, "_app_started", time.monotonic())
         hours, mins = int(up // 3600), int((up % 3600) // 60)
@@ -1120,6 +1176,8 @@ class JarvisApp:
                 rec = json.loads(line)
                 if datetime.fromtimestamp(rec.get("at", 0)).date() != day:
                     continue
+                if rec.get("outcome") == "abort":
+                    continue            # a silent follow-up window, not a turn
                 n += 1
                 if rec.get("wait") is not None:
                     waits.append(rec["wait"])
@@ -1137,11 +1195,13 @@ class JarvisApp:
             total = mem["MemTotal"] / 1048576
             gpu = ""
             try:
-                out = subprocess.run(["nvidia-smi", "--query-gpu=temperature.gpu",
-                                      "--format=csv,noheader"], capture_output=True,
-                                     text=True, timeout=2).stdout.strip()
-                if out and out[0].isdigit():
-                    gpu = f", GPU at {out.split()[0]} degrees"
+                # Popen + kill-without-wait (jarvis.tools.health): run() would
+                # wait on an nvidia-smi wedged in D-state under a stuck NVRM
+                # lock, and this is the command asked in exactly that state.
+                from jarvis.tools.health import parse_nvidia_smi, run_nvidia_smi
+                reading = parse_nvidia_smi(run_nvidia_smi()) or {}
+                if reading.get("temp_c") is not None:
+                    gpu = f", GPU at {reading['temp_c']:.0f} degrees"
             except Exception:
                 pass
             parts.append(f"Memory {free:.0f} of {total:.0f} gigabytes free{gpu}.")
@@ -1188,6 +1248,10 @@ class JarvisApp:
         # into it now, sir") is speech but not the answer.
         was, self._tts_active = self._tts_active, ev.active
         if not ev.active:
+            # A filler queued INTO a playing burst never gets its own rising
+            # edge; without this the flag outlived the burst and labelled
+            # the next answer "filler".
+            self._turn_filler_pending = False
             if was:
                 self._after_speech()
             return
@@ -1239,16 +1303,26 @@ class JarvisApp:
                 reject_reason="" if result.accepted else "confidence"))
             text = result.text.strip()
             if result.accepted and text:
+                self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))
                 self._dispatch(text, "voice")
             elif not result.accepted and text:
                 # Garbled, not silent: say so and re-open the mic rather
-                # than routing "by Agenda 4.2.6" or going quiet.
-                log.info("low confidence (%.2f): %r -> asking again",
-                         result.confidence, text)
-                self._say(SAY_AGAIN_LINE)
-                self._followup_after_speech = True
+                # than routing "by Agenda 4.2.6" or going quiet -- once.
+                # Twice in a row is not the user mumbling, it is the room
+                # (a television, music) reaching the follow-up mic, and
+                # asking again re-opens that mic without end.
+                self._say_again_count = getattr(self, "_say_again_count", 0) + 1
+                if self._say_again_count > 1:
+                    log.info("low confidence again (%.2f): %r -> staying quiet",
+                             result.confidence, text)
+                    self.turns.abandon("rejected:confidence")
+                else:
+                    log.info("low confidence (%.2f): %r -> asking again",
+                             result.confidence, text)
+                    self._say(SAY_AGAIN_LINE)
+                    self._followup_after_speech = True
         except Exception:
             log.exception("audio processing failed")
             bus.publish(Status(text="Transcription failed", kind="error"))
@@ -1308,6 +1382,7 @@ class JarvisApp:
     def _turn_start(self):
         """Open a turn: arm the slow-answer filler and a watchdog."""
         self._turn_cancel_timers()
+        self._stream_muted = False
         self._turn_busy.set()
         if CONFIG.talkback:
             self._turn_timer = threading.Timer(self._thinking_delay_s,
@@ -1527,7 +1602,7 @@ class JarvisApp:
             lead = int(self.assistant.get("calendar.heads_up_min", 10) or 10)
             self.headsup = MeetingHeadsUp(lambda: getattr(self.services, "calendar", None),
                                           self.timekeeper, lead_min=lead,
-                                          state_path=PATHS.AIWS / "headsup_state.json")
+                                          state_path=PATHS.MEMORY_DIR / "headsup_state.json")
             if self.timekeeper is not None:
                 self.headsup.start()
         except Exception:
@@ -1650,7 +1725,9 @@ class JarvisApp:
         cal = getattr(self.services, "calendar", None)
         for name, obj in (("discord", self.discord), ("approvals", self.approvals),
                           ("timekeeper", self.timekeeper), ("calendar", cal),
-                          ("claude", self.claude)):
+                          ("claude", self.claude),
+                          ("health_watchdog", getattr(self.services, "health_watchdog", None)),
+                          ("headsup", getattr(self, "headsup", None))):
             if obj is None:
                 continue
             fn = getattr(obj, "stop", None) or getattr(obj, "close", None)

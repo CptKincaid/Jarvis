@@ -96,3 +96,121 @@ def test_without_on_sentence_nothing_changes(monkeypatch):
         "message": {"role": "assistant", "content": "Plain reply, sir."}, "load_duration": 0})
     tags = b._chat_sync("q")
     assert [t for t, _ in tags] == ["SPEAK"]
+
+
+# ----------------------------------------------------------------------
+# 2026-08-30 review: the streamed path bypassed guards, error chunks, the
+# wall bound, a tool's speak= line, and cancellation.
+# ----------------------------------------------------------------------
+import time  # noqa: E402
+
+from jarvis.tools.registry import ToolRegistry, ToolResult, ToolSpec  # noqa: E402
+
+
+def test_an_error_chunk_keeps_what_was_said(monkeypatch):
+    chunks = _chunks("Half an answer, sir. The rest")[:-1]
+    chunks.append({"error": "runner process has terminated"})
+    b = _brain(monkeypatch, chunks)
+    spoken = []
+    tags = b._chat_sync("tell me", on_sentence=spoken.append)
+    assert spoken == ["Half an answer, sir."]
+    assert dict(tags)["SPEAK"] == "Half an answer, sir."
+
+
+def test_an_error_before_any_sentence_is_the_honest_line(monkeypatch):
+    b = _brain(monkeypatch, [{"error": "out of memory"}])
+    spoken = []
+    tags = b._chat_sync("tell me", on_sentence=spoken.append)
+    assert spoken == [] and dict(tags)["SPEAK"] == brain_mod.MODEL_SLOW_LINE
+    assert "STREAMED" not in dict(tags)
+
+
+def test_a_trickling_stream_meets_the_wall_bound(monkeypatch):
+    monkeypatch.setattr(brain_mod, "OLLAMA_TIMEOUT_S", 0.05)
+
+    def chunks():
+        yield {"message": {"role": "assistant", "content": "It is ten, sir. And"}, "done": False}
+        time.sleep(0.12)
+        yield {"message": {"role": "assistant", "content": "And it keeps going. "}, "done": False}
+        raise AssertionError("the stream ran past the wall bound")
+    b = _brain(monkeypatch, [])
+    monkeypatch.setattr(brain_mod, "_http_stream", lambda *a, **k: chunks())
+    spoken = []
+    tags = b._chat_sync("what time is it", on_sentence=spoken.append)
+    assert spoken == ["It is ten, sir."]
+    assert dict(tags)["SPEAK"] == "It is ten, sir."
+
+
+def test_streamed_sentences_get_the_clock_guard_once(monkeypatch):
+    b = _brain(monkeypatch, _chunks("It is 10:45 now, sir. It is 10:46 now, sir. The evening is clear."))
+    spoken = []
+    b._chat_sync("what time is it", on_sentence=spoken.append)
+    assert spoken == [brain_mod.NO_CLOCK_LINE, "The evening is clear."], spoken
+
+
+def _tool_brain(monkeypatch, rounds, tool_result, name="screen_qa"):
+    reg = ToolRegistry()
+    reg.register(ToolSpec(name=name, description="a tool", handler=lambda **a: tool_result))
+    b = brain_mod.JarvisBrain(None, None, registry=reg)
+    monkeypatch.setattr(b, "_dynamic_context", lambda: ("", ""))
+    it = iter(rounds)
+
+    def stream(path, payload, timeout=None):
+        yield from next(it)
+    monkeypatch.setattr(brain_mod, "_http_stream", stream)
+    return b
+
+
+def _tool_round(name):
+    return [{"message": {"role": "assistant", "content": "Let me look. One", "tool_calls": []}, "done": False},
+            {"message": {"role": "assistant", "content": "",
+                         "tool_calls": [{"function": {"name": name, "arguments": {}}}]},
+             "done": True, "load_duration": 0}]
+
+
+def test_a_tools_speak_line_is_not_marked_streamed(monkeypatch):
+    """screen_qa's answer went out as STREAMED and was never spoken."""
+    b = _tool_brain(monkeypatch, [_tool_round("screen_qa")],
+                    ToolResult(text="seen", speak="A terminal, sir."))
+    spoken = []
+    tags = b._chat_sync("what is on my screen", on_sentence=spoken.append)
+    assert spoken == ["Let me look."]
+    assert [t for t, _ in tags] == ["SPEAK"], tags
+    assert dict(tags)["SPEAK"] == "A terminal, sir."
+
+
+def test_pre_tool_chatter_does_not_eat_the_answers_cap(monkeypatch):
+    answer = _chunks("The file says hello. And goodbye. And more.")
+    b = _tool_brain(monkeypatch, [_tool_round("ask_docs"), answer],
+                    ToolResult(text="hello goodbye"), name="ask_docs")
+    spoken = []
+    tags = b._chat_sync("what does the file say", on_sentence=spoken.append)
+    assert spoken == ["Let me look.", "The file says hello.", "And goodbye."]
+    assert dict(tags)["STREAMED"] == "3"
+
+
+def test_the_partial_notice_is_spoken_on_the_streamed_path(monkeypatch):
+    answer = _chunks("The file says hello.")
+    b = _tool_brain(monkeypatch, [_tool_round("ask_docs"), answer],
+                    ToolResult(text="x" * (brain_mod.MAX_TOOL_TEXT_CHARS * 3)), name="ask_docs")
+    spoken = []
+    tags = b._chat_sync("what does the file say", on_sentence=spoken.append)
+    assert spoken[-1] == brain_mod.PARTIAL_RESULT_LINE, spoken
+    assert dict(tags)["SPEAK"].endswith(brain_mod.PARTIAL_RESULT_LINE)
+
+
+def test_cancel_stops_the_stream_mid_reply(monkeypatch):
+    b = _brain(monkeypatch, [])
+    served = []
+
+    def chunks():
+        for c in _chunks("It is ten, sir. And the rest of it, sir. More."):
+            served.append(c)
+            yield c
+            if len(served) == 4:
+                b.cancel()
+    monkeypatch.setattr(brain_mod, "_http_stream", lambda *a, **k: chunks())
+    spoken = []
+    b._chat_sync("what time is it", on_sentence=spoken.append)
+    assert len(served) == 5, "the stream stopped at the next chunk"
+    assert spoken == ["It is ten, sir."]

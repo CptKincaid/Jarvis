@@ -11,6 +11,7 @@ starts at midnight.
 from __future__ import annotations
 
 import json
+import os
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -43,7 +44,18 @@ class MeetingHeadsUp:
         try:
             if self._state_path and self._state_path.exists():
                 data = json.loads(self._state_path.read_text())
-                return dict(data) if isinstance(data, dict) else {}
+                if not isinstance(data, dict):
+                    return {}
+                # Only str -> ISO-string entries survive: _prune compares
+                # the values as strings, and one stray int or null (a hand
+                # edit, a half-written file) raised TypeError on every tick
+                # before the save could ever run.
+                clean = {k: v for k, v in data.items()
+                         if isinstance(k, str) and isinstance(v, str)}
+                if len(clean) != len(data):
+                    log.debug("headsup state: dropped %d malformed entries",
+                              len(data) - len(clean))
+                return clean
         except (OSError, ValueError):
             log.debug("headsup state unreadable", exc_info=True)
         return {}
@@ -53,7 +65,12 @@ class MeetingHeadsUp:
             return
         try:
             self._state_path.parent.mkdir(parents=True, exist_ok=True)
-            self._state_path.write_text(json.dumps(self._filed))
+            # Atomic: a crash mid-write must leave the old file behind, not
+            # half a JSON document that the next start reads as "nothing
+            # filed" (and then files every meeting again).
+            tmp = self._state_path.with_name(self._state_path.name + ".tmp")
+            tmp.write_text(json.dumps(self._filed))
+            os.replace(tmp, self._state_path)
         except OSError:
             log.debug("headsup state save failed", exc_info=True)
 
@@ -108,7 +125,8 @@ class MeetingHeadsUp:
 
     def _prune(self) -> None:
         cutoff = (self._now() - timedelta(days=1)).isoformat()
-        stale = [k for k, v in self._filed.items() if v < cutoff]
+        stale = [k for k, v in self._filed.items()
+                 if not isinstance(v, str) or v < cutoff]
         for k in stale:
             self._filed.pop(k, None)
         if stale:

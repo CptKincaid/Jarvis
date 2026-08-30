@@ -553,9 +553,13 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             log.debug("services does not accept health_watchdog")
 
     def system_health(**_) -> ToolResult:
+        # The TOOL may ask nvidia-smi (Popen + kill-without-wait, bounded):
+        # "how's the Spark doing" is a question about the GPU. Only the
+        # 30 s watchdog tick stays gpu=False -- a wedged nvidia-smi there
+        # would pile up a zombie every half minute.
         try:
-            snap = snapshot(gpu=False)
-        except Exception:  # noqa: BLE001 - belt and braces; snapshot(gpu=False) guards
+            snap = snapshot()
+        except Exception:  # noqa: BLE001 - belt and braces; snapshot() guards
             log.exception("system_health: snapshot failed")
             return ToolResult(text="system counters unreadable", ok=False,
                               speak=UNREADABLE_LINE)

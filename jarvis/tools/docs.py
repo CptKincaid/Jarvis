@@ -114,7 +114,10 @@ def doc_paths(cfg) -> list[Path]:
 
 
 def index_dir(cfg) -> Path:
-    raw = _cfg_get(cfg, "docs.index_dir", "") or os.environ.get("JARVIS_DOCS_INDEX_DIR") \
+    # env > config > default. AssistantConfig always answers docs.index_dir
+    # (DEFAULTS carries it), so config-first left JARVIS_DOCS_INDEX_DIR dead
+    # in the app and in every test built on a real config.
+    raw = os.environ.get("JARVIS_DOCS_INDEX_DIR") or _cfg_get(cfg, "docs.index_dir", "") \
         or DEFAULT_INDEX_DIR
     return Path(os.path.expanduser(str(raw)))
 

@@ -230,8 +230,8 @@ def test_every_tool_module_is_registered(app):
     assert brain_mod._REGISTRY is app.tools
     # spec 4.1 budget: the 11 spec tools plus the (later) Spotify six
     # 18 since 2026-08-28: calendar gained add_event alongside get_calendar
-    # 25 since 2026-08-30: canvas (3), docs (2), screen (1), health (1). The
-    # prompt no longer carries them all: jarvis/tools/cues.py picks per turn.
+    # 25 since 2026-08-30: canvas (3), docs (2), screen (1), health (1). All
+    # of them ride every turn: the tools are part of the cached static prefix.
     assert len(names) == 25
 
 
@@ -1241,16 +1241,36 @@ def test_an_ack_disarms_the_thinking_filler_but_not_the_watchdog(build, monkeypa
 
 
 def test_the_app_report_is_built_from_real_sources(build, tmp_path, monkeypatch):  # noqa: E501
+    """Real sources, fake host: the report reads /proc/meminfo and asks
+    nvidia-smi, and both are stubbed here so the test neither depends on
+    this box's memory nor spawns a GPU probe under the test runner."""
+    import builtins
+    import io
     from jarvis.config import PATHS
+    from jarvis.tools import health as health_mod
     app = build()
     monkeypatch.setattr(PATHS, "LOG_DIR", tmp_path)
+    meminfo = "MemTotal:       127000000 kB\nMemAvailable:    43000000 kB\n"
+    real_open = builtins.open
+
+    def fake_open(path, *args, **kw):
+        if str(path) == "/proc/meminfo":
+            return io.StringIO(meminfo)
+        return real_open(path, *args, **kw)
+    monkeypatch.setattr(builtins, "open", fake_open)
+    monkeypatch.setattr(health_mod, "read_meminfo",
+                        lambda: {"MemTotal": 127000000, "MemAvailable": 43000000})
+    monkeypatch.setattr(health_mod, "run_nvidia_smi", lambda: "41, 2418 MHz, 12.4 W, 2 %")
+    monkeypatch.setattr(subprocess, "run",
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, "41\n", ""))
     (tmp_path / "turns.jsonl").write_text(
         '{"outcome": "audio", "wait": 1.3, "at": %f}\n{"outcome": "audio", "wait": 2.1, "at": %f}\n'
         % (__import__("time").time(), __import__("time").time()))
     text = app.diagnostics_text()
     assert text.startswith("All systems nominal, sir.")
     assert "2 turns today, median wait 1.7 seconds" in text
-    assert "gigabytes free" in text
+    assert "Memory 41 of 121 gigabytes free" in text
+    assert "GPU at 41" in text
 
 
 def test_the_app_shows_but_does_not_respeak_a_streamed_reply(build, monkeypatch):
@@ -1271,3 +1291,20 @@ def test_the_app_shows_but_does_not_respeak_a_streamed_reply(build, monkeypatch)
             unsub()
         except TypeError:
             pass
+
+
+def test_services_brain_chat_forwards_the_stream_hook_only_when_enabled(build, monkeypatch):
+    """The seams fixture pins stream_replies=False for every wiring test, so
+    the wrapper branch that hands _on_stream_sentence to the brain never ran
+    under test and the structural signature check subtracts on_sentence."""
+    app = build()
+    seen = {}
+    monkeypatch.setattr(app.brain, "chat", lambda text, **kw: seen.update(kw) or None)
+    monkeypatch.setattr(CONFIG, "stream_replies", True)
+    app.services.brain.chat("what time is it")
+    assert seen.get("on_sentence") == app._on_stream_sentence
+    assert seen.get("callback") == app._on_brain_tags
+    seen.clear()
+    monkeypatch.setattr(CONFIG, "stream_replies", False)
+    app.services.brain.chat("what time is it")
+    assert "on_sentence" not in seen and seen.get("callback") == app._on_brain_tags

@@ -109,6 +109,18 @@ class ContextEngine:
                 continue
         return fresh
 
+
+    def recent_conversation_text(self, limit=4) -> str:
+        """The last exchanges as plain lines and nothing else -- for a
+        prompt that leaves the machine (the web lookup). format_for_prompt
+        also carries the git state, the active window and the session log."""
+        lines = []
+        for e in self._recent_conversation()[-limit:]:
+            if e.get("user"):
+                lines.append(f"User: {e['user'][:200]}")
+            if e.get("jarvis"):
+                lines.append(f"Jarvis: {e['jarvis'][:200]}")
+        return "\n".join(lines)
     def format_for_prompt(self, ctx, spoken=False):
         """Format context dict into text for LLM prompt injection.
 
@@ -125,7 +137,9 @@ class ContextEngine:
         parts = [f"Current time: {ctx['time']}"]
         # Gathered since V3 but never rendered -- and recorded with the user's
         # side blank -- so the model had never seen a previous exchange and
-        # "what about tomorrow?" could not follow a calendar question.
+        # "what about tomorrow?" could not follow a calendar question. This
+        # is the ONE rendering: a second, older block further down rendered
+        # the same exchanges again until 2026-08-30.
         convo = [e for e in (ctx.get("conversation") or []) if e.get("user") or e.get("jarvis")]
         if convo:
             lines = ["Recent conversation (newest last; answer follow-ups in its light):"]
@@ -167,13 +181,6 @@ class ContextEngine:
                 names = [Path(f.split(" ", 1)[-1] if " " in f else f).name
                          for f in files[:5]]
                 parts.append(f"Recently modified: {', '.join(names)}")
-
-        if ctx.get("conversation"):
-            parts.append("Recent conversation:")
-            for ex in ctx["conversation"][-4:]:
-                parts.append(f"  User: {ex['user'][:80]}")
-                if ex.get("jarvis"):
-                    parts.append(f"  Jarvis: {ex['jarvis'][:80]}")
 
         if ctx.get("sessions"):
             parts.append("Previous sessions:")

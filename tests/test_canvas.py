@@ -180,6 +180,27 @@ def test_settings_and_placeholders():
     assert cv.canvas_settings(None) is None and cv.canvas_settings({}) is None
 
 
+def test_plain_http_to_a_remote_host_never_carries_the_token(monkeypatch):
+    """canvas_settings accepts an http:// base_url verbatim, and the token
+    rides in a header: a typo in assistant.json put it on the wire in the
+    clear on every call. Refused before the request; localhost may."""
+    assert cv._insecure("http://canvas.example.edu/api/v1/planner/items")
+    assert not cv._insecure("https://canvas.example.edu/api/v1/planner/items")
+    for local in ("http://localhost:3000/api/v1/x", "http://127.0.0.1/api/v1/x",
+                  "http://LOCALHOST/api/v1/x"):
+        assert not cv._insecure(local), local
+    fetch = FakeFetch(canned())
+    cv._WARNED_INSECURE.clear()
+    reg = _tools(_cfg(base="http://canvas.example.edu"), fetch, monkeypatch)
+    for name in ("canvas_due", "canvas_grades", "canvas_announcements"):
+        r = reg.call(name, {})
+        assert not r.ok and r.speak == cv.INSECURE_LINE, name
+        assert TOKEN not in r.text
+    assert fetch.calls == [], "nothing went on the wire"
+    assert cv._WARNED_INSECURE == {"canvas.example.edu"}
+    assert cv.INSECURE_LINE in cv.PERSONA_LINES
+
+
 def test_unconfigured_token_speaks_setup_line_without_a_request(monkeypatch):
     fetch = FakeFetch(canned())
     for cfg in (None, {}, _cfg(token=""), _cfg(token="<paste here>")):

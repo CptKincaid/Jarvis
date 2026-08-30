@@ -187,6 +187,22 @@ def test_tool_contract(monkeypatch):
     assert not services.health_watchdog.running
 
 
+def test_tool_reports_the_gpu_it_probed_and_the_watchdog_never_asks(monkeypatch):
+    """06d6e18 switched the TOOL to snapshot(gpu=False) along with the
+    watchdog, so "how's the Spark doing" always said 'GPU unavailable'.
+    The tool may probe (Popen + kill-without-wait, bounded); only the
+    30 s watchdog tick must not."""
+    _fake_probes(monkeypatch)
+    probes = []
+    monkeypatch.setattr(health, "run_nvidia_smi",
+                        lambda: probes.append(1) or "42, 2418 MHz, 12.4 W, 2 %")
+    res = make_tools({}, None)[0].handler()
+    assert res.ok and probes == [1]
+    assert "GPU 42 C at 2418 MHz, 12 W, 2% busy" in res.text
+    Watchdog({}, services=None).tick()
+    assert probes == [1], "the watchdog never runs nvidia-smi"
+
+
 def test_tool_unreadable_counters_speak_the_excuse(monkeypatch):
     # Every seam raising (the autouse firewall) must not escape the handler.
     monkeypatch.setattr(health, "disk_free", lambda path: None)

@@ -19,8 +19,7 @@ from typing import Callable, Optional
 from zoneinfo import ZoneInfo
 
 from jarvis.logs import get_logger
-from jarvis.tools import location as _location
-from jarvis.tools.location import (Location, cache_dir, cfg_get, clock_words,
+from jarvis.tools.location import (cache_dir, cfg_get, clock_words,
                                    geocode, http_get, is_home_word,
                                    resolve_home, setup_line)
 from jarvis.tools.registry import ToolResult, ToolSpec

@@ -249,7 +249,7 @@ def test_grab_screen_falls_back_to_the_cli_when_pil_fails(monkeypatch):
     assert scr._grab_screen(":9").size == (1000, 500)
 
 
-def test_grab_cli_uses_gnome_screenshot_then_import(monkeypatch, tmp_path):
+def test_grab_cli_skips_gnome_screenshot_and_uses_import(monkeypatch, tmp_path):
     calls = []
 
     def fake_which(name):

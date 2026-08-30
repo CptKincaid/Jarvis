@@ -64,11 +64,12 @@ SETUP_LINE = ("I'll need a Canvas access token set up, sir; the notes are in "
               "docs/assistant-setup.md.")
 BAD_TOKEN_LINE = "Canvas rejected the token, sir."
 UNREACHABLE_LINE = "I can't reach Canvas, sir."
+INSECURE_LINE = "Canvas is set to plain http, sir; I won't send the token in the clear."
 NOTHING_DUE_LINE = "Nothing due this week, sir."
 NO_GRADES_LINE = "No grades posted yet, sir."
 NO_ANNOUNCEMENTS_LINE = "No announcements in the last {span}, sir."
 PERSONA_LINES = [SETUP_LINE, BAD_TOKEN_LINE, UNREACHABLE_LINE, NOTHING_DUE_LINE,
-                 NO_GRADES_LINE]
+                 NO_GRADES_LINE, INSECURE_LINE]
 
 # Planner item kinds that are "due": class sessions (calendar_event), notes
 # and pages are not homework.
@@ -81,7 +82,8 @@ _PLACEHOLDER = re.compile(r"^\s*$|^<.*>$|placeholder|^(paste|your|my)[-_ ]|"
 
 
 class CanvasError(RuntimeError):
-    """kind: setup | auth | unreachable | api (HTTP status other than 401)."""
+    """kind: setup | auth | unreachable | insecure | api (HTTP status other
+    than 401)."""
 
     def __init__(self, kind: str, detail: str = "", status: int = 0):
         super().__init__(detail or kind)
@@ -189,12 +191,33 @@ def _host(url: str) -> str:
     return urllib.parse.urlsplit(url).netloc or url[:40]
 
 
+_LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
+_WARNED_INSECURE: set = set()
+
+
+def _insecure(url: str) -> bool:
+    """True for plain http to anything but this machine: the bearer token
+    rides in a header, and canvas_settings accepts an http:// base_url
+    verbatim, so without this a typo in assistant.json would put the token
+    on the wire in cleartext on every call."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme != "http":
+        return False
+    return (parts.hostname or "").lower() not in _LOCAL_HOSTS
+
+
 def get_json(settings: dict, path_or_url: str, fetch: Fetch, budget: _Budget,
              params: Optional[list[tuple[str, str]]] = None) -> tuple[object, Optional[str]]:
     """One GET -> (parsed JSON, next-page url). Raises CanvasError."""
     url = path_or_url if path_or_url.startswith("http") else settings["base_url"] + path_or_url
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
+    if _insecure(url):
+        host = _host(url)
+        if host not in _WARNED_INSECURE:            # once per host, not per call
+            _WARNED_INSECURE.add(host)
+            log.warning("canvas: refusing to send the token over plain http to %s", host)
+        raise CanvasError("insecure", host)
     headers = {"Authorization": f"Bearer {settings['token']}",
                "Accept": "application/json", "User-Agent": USER_AGENT}
     try:
@@ -557,6 +580,9 @@ def _excuse(exc: CanvasError) -> ToolResult:
     if exc.kind == "api":
         return ToolResult(text=f"Canvas answered {exc.detail}", ok=False,
                           speak=UNREACHABLE_LINE)
+    if exc.kind == "insecure":
+        return ToolResult(text=f"Canvas base_url is plain http ({exc.detail}); "
+                               "token not sent", ok=False, speak=INSECURE_LINE)
     return ToolResult(text="Canvas unreachable", ok=False, speak=UNREACHABLE_LINE)
 
 
