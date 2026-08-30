@@ -544,6 +544,26 @@ Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
   (module constant) and restart. F5, XTTS and edge are unchanged (F5's sidecar writes a
   file per request and cannot stream).
 
+## 19. Steering a read-aloud (skip / back / pause / go on)
+
+Nothing to configure. While he is reading ("read the clipboard", "read file
+~/syllabus.md", …) the transport words belong to the reading:
+
+| say | he does |
+|---|---|
+| "skip" / "skip that" / "skip ahead" | cuts the chunk being spoken; the next one follows at once |
+| "back" / "go back" / "previous" / "say that again" | re-reads the previous chunk, then carries on |
+| "pause" / "hold on" / "hang on" / "wait" | "Paused, sir." — the rest is held |
+| "go on" / "carry on" / "resume" / "keep going" | picks up from the chunk that was cut (it restarts; a chunk is ~25 s) |
+| "quiet" / "stop" | ends the reading, as before |
+
+Say them with or without the wake word — `barge_in` keeps the wake word live while he
+speaks. The words are only his while a part is actually being spoken or the reading is
+paused; between parts (waiting for "continue reading") and at every other time "pause",
+"skip" and "back" mean what they always did — Spotify's transport and, with the prefix,
+the media keys and the previous window. While paused, "skip" and "back" move the cursor
+without speaking, so you can step to the bit you want and then say "go on".
+
 ---
 
 ## What Jarvis says when something is missing

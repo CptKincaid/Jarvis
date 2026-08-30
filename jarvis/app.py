@@ -375,7 +375,10 @@ class JarvisApp:
         was actually cut off. Wired to typed input below; the UI may also
         call it on the first keystroke (see scratchpad ui_hooks_todo.md)."""
         try:
-            self.reader.stop() if self.reader.pending_chunks else None
+            # A paused reading has nothing pending in the TTS but still
+            # owns the transport words; stop() clears that too.
+            if self.reader.pending_chunks or getattr(self.reader, "active", False):
+                self.reader.stop()
             return self.tts.interrupt()
         except Exception:
             log.exception("interrupt_speech failed")

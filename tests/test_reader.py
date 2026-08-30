@@ -1,5 +1,6 @@
 """Tests for jarvis.reader (read aloud) and the commander's voice-I/O
 Tier 1 commands: quiet, say again, pronounce, read aloud, continue."""
+import threading as _threading
 import types
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -364,3 +365,256 @@ def test_missing_reader_service_falls_through(services, tmp_path, monkeypatch):
     c.handle("read the clipboard", "typed")
     services.brain.think.assert_called_once()       # graceful degradation
     assert commander.read_kind("read the clipboard") is not None
+
+
+# ------------------------------------------------ steering: skip/back/pause
+# 2026-08-30. The only control over a reading used to be "quiet", which
+# dropped the whole queue. The reader now owns a cursor: TTS.speak() hands
+# back each chunk's done-event, so it knows which chunk is in the air, and
+# it keeps its own history for "back". No TTS ids, no per-item bookkeeping
+# in the TTS beyond skip_current().
+
+
+class SteerTTS(FakeTTS):
+    """FakeTTS whose speak() returns a done-event the test controls (as the
+    real TTS does) and which counts skip_current() calls."""
+
+    def __init__(self):
+        super().__init__()
+        self.events = []
+        self.skips = 0
+
+    def speak(self, text):
+        super().speak(text)
+        ev = _threading.Event()
+        self.events.append((text, ev))
+        return ev
+
+    def skip_current(self):
+        self.skips += 1
+        return True
+
+    def finish(self, n):
+        """Pretend the first ``n`` queued utterances have played."""
+        for _, ev in self.events[:n]:
+            ev.set()
+
+
+THREE = "Alpha part is here. Bravo part is here. Charlie part is here."
+
+
+def steer_reader(max_part=1000):
+    tts = SteerTTS()
+    r = ReadAloud(tts, max_part=max_part, max_chunk=22)
+    res = r.read_text(THREE, label="the note")
+    assert res.ok and res.chunks == 3 and tts.spoken == [
+        "Alpha part is here.", "Bravo part is here.", "Charlie part is here."]
+    return r, tts
+
+
+def test_active_only_while_a_chunk_is_in_the_air():
+    r, tts = steer_reader()
+    assert r.active and not r.paused
+    tts.finish(2)
+    assert r.active                                   # Charlie still queued
+    tts.finish(3)
+    assert not r.active                               # the part has played out
+    assert r.pending_chunks == 0
+
+
+def test_active_covers_the_continue_prompt_and_pending_parts_do_not_count():
+    tts = SteerTTS()
+    r = ReadAloud(tts, max_part=45, max_chunk=22)
+    r.read_text(THREE)
+    assert tts.spoken[-1] == CONTINUE_PROMPT and r.pending_chunks == 1
+    tts.finish(2)                                     # two chunks done
+    assert r.active                                   # the prompt is speaking
+    tts.finish(3)
+    assert not r.active, "waiting for 'continue' is idle: Spotify gets its words back"
+
+
+def test_skip_cuts_only_the_current_chunk_and_keeps_the_queue():
+    r, tts = steer_reader()
+    res = r.skip()
+    assert res.ok and tts.skips == 1
+    assert tts.stopped == 0                           # never the whole queue
+    assert len(tts.spoken) == 3                       # nothing re-queued
+    tts.finish(3)
+    assert r.skip().ok is False                       # nothing in the air
+
+
+def test_back_re_reads_the_previous_chunk_then_carries_on():
+    r, tts = steer_reader()
+    tts.finish(1)                                     # Alpha done, Bravo playing
+    res = r.back()
+    assert res.ok and tts.stopped == 1
+    assert tts.spoken[3:] == ["Alpha part is here.", "Bravo part is here.",
+                              "Charlie part is here."]
+    assert r.active
+
+
+def test_back_at_the_start_restarts_the_current_chunk():
+    r, tts = steer_reader()
+    res = r.back()                                    # nothing spoken yet
+    assert res.ok
+    assert tts.spoken[3:] == ["Alpha part is here.", "Bravo part is here.",
+                              "Charlie part is here."]
+
+
+def test_back_after_skip_returns_to_the_skipped_chunk():
+    r, tts = steer_reader()
+    r.skip()
+    tts.finish(1)                                     # the skipped one is 'done'
+    r.back()
+    assert tts.spoken[3] == "Alpha part is here."
+
+
+def test_pause_holds_the_rest_and_go_on_resumes_from_the_cut_chunk():
+    r, tts = steer_reader()
+    tts.finish(1)                                     # Alpha done, Bravo playing
+    res = r.pause()
+    assert res.ok and res.message == "Paused, sir." and tts.stopped == 1
+    assert r.paused and r.active                      # still owns the words
+    assert r.pending_chunks == 2                      # Bravo (restart) + Charlie
+    assert r.pause().ok is False                      # "Already paused, sir."
+    assert r.resume().ok
+    assert not r.paused
+    assert tts.spoken[3:] == ["Bravo part is here.", "Charlie part is here."]
+
+
+def test_continue_reading_also_lifts_a_pause():
+    r, tts = steer_reader()
+    r.pause()
+    assert r.continue_reading().ok and not r.paused
+
+
+def test_resume_when_not_paused_is_none_so_go_on_keeps_its_meaning():
+    r, tts = steer_reader()
+    assert r.resume() is None
+
+
+def test_paused_skip_and_back_move_the_cursor_without_speaking():
+    r, tts = steer_reader()
+    tts.finish(1)
+    r.pause()                                         # pending: Bravo, Charlie
+    spoken_before = len(tts.spoken)
+    assert r.skip().ok and r.pending_chunks == 1      # Bravo dropped
+    assert r.back().ok and r.pending_chunks == 2      # ... and back again
+    assert r.back().ok and r.pending_chunks == 3      # Alpha too
+    assert r.back().ok is False                       # "We're at the start, sir."
+    assert len(tts.spoken) == spoken_before and r.paused
+    r.resume()
+    assert tts.spoken[spoken_before:] == [
+        "Alpha part is here.", "Bravo part is here.", "Charlie part is here."]
+
+
+def test_stop_and_a_new_reading_clear_the_pause_and_the_history():
+    r, tts = steer_reader()
+    tts.finish(1)
+    r.pause()
+    r.stop()
+    assert not r.paused and not r.active and r.pending_chunks == 0
+    r.read_text("Fresh start here.")
+    assert r.back().ok                                # restarts, no stale history
+    assert tts.spoken[-1] == "Fresh start here."
+
+
+def test_a_tts_without_done_events_still_reads_but_cannot_be_steered():
+    tts = FakeTTS()                                   # speak() returns None
+    r = ReadAloud(tts, max_part=1000, max_chunk=22)
+    assert r.read_text(THREE).ok
+    assert not r.active                               # no handle, no claim on the words
+
+
+# ----------------------------------------------- commander: context gating
+@pytest.mark.parametrize("text,kind", [
+    ("skip", "skip"), ("jarvis, skip that", "skip"), ("skip ahead", "skip"),
+    ("back", "back"), ("go back", "back"), ("jarvis go back a bit", "back"),
+    ("say that again", "back"), ("previous", "back"),
+    ("pause", "pause"), ("hold on", "pause"), ("hang on", "pause"),
+    ("wait a second", "pause"), ("pause reading", "pause"),
+    ("go on", "resume"), ("carry on", "resume"), ("resume", "resume"),
+    ("continue reading", "resume"), ("keep going", "resume"),
+])
+def test_read_control_kind(text, kind):
+    assert commander.read_control_kind(text) == kind
+
+
+@pytest.mark.parametrize("text", [
+    "skip to the next track", "pause the music", "go back to the terminal",
+    "play some jazz", "continue the deployment", "back up the database",
+])
+def test_read_control_kind_rejects_longer_commands(text):
+    assert commander.read_control_kind(text) is None
+
+
+def test_read_control_is_tier_one_after_continue_reading():
+    names = [c.name for c in REGISTRY]
+    assert names.index("continue reading") < names.index("read control") < names.index("workflow")
+    assert "read control" in [c.name for c in commander.ASSISTANT_TIER1]
+
+
+def test_transport_words_keep_their_meaning_when_nothing_is_read(cmdr, services):
+    """Idle reader: "pause"/"skip" go on to the router (Spotify's transport
+    tool lives behind the brain) and "jarvis, go back" is the window switch."""
+    services.reader.active = False
+    services.context.get_last_window.return_value = "Terminal"
+    cmdr.handle("pause", "typed")
+    services.reader.pause.assert_not_called()
+    services.brain.think.assert_called_with("pause")                   # on to the router
+    cmdr.handle("skip", "typed")
+    services.reader.skip.assert_not_called()
+    services.brain.think.assert_called_with("skip")
+    res = cmdr.handle("jarvis, go back", "typed")
+    services.reader.back.assert_not_called()
+    assert res.status == "Back to Terminal"                            # the window "go back"
+
+
+def test_transport_words_steer_an_active_reading(cmdr, services):
+    services.reader.active = True
+    services.reader.skip.return_value = ReadResult(True, "Skipped")
+    services.reader.back.return_value = ReadResult(True, "Reading the note: 2 chunk(s)")
+    services.reader.pause.return_value = ReadResult(True, "Paused, sir.")
+    services.reader.resume.return_value = ReadResult(True, "Reading the note: 1 chunk(s)")
+
+    res = cmdr.handle("skip", "voice")                # one word, unprefixed, by voice
+    services.reader.skip.assert_called_once()
+    assert res.handled and res.speak is False         # the next chunk is the confirmation
+    services.desktop.handle_action.assert_not_called()
+    services.brain.think.assert_not_called()
+
+    res = cmdr.handle("jarvis, go back", "voice")
+    services.reader.back.assert_called_once()
+    services.context.get_last_window.assert_not_called()   # not the window switch
+
+    res = cmdr.handle("pause", "typed")
+    services.reader.pause.assert_called_once()
+    assert res.reply == "Paused, sir." and res.speak is True
+
+    res = cmdr.handle("go on", "typed")
+    services.reader.resume.assert_called_once()
+    assert res.status == "Reading the note: 1 chunk(s)"
+
+
+def test_go_on_while_reading_unpaused_still_means_the_next_part(cmdr, services):
+    services.reader.active = True
+    services.reader.paused = False
+    services.reader.resume.return_value = None        # not paused
+    services.reader.pending_chunks = 2
+    services.reader.continue_reading.return_value = ReadResult(True, "Reading x: 2 chunk(s)")
+    res = cmdr.handle("go on", "typed")
+    services.reader.continue_reading.assert_called_once()
+    assert res.status == "Reading x: 2 chunk(s)"
+
+
+def test_steering_excuses_are_spoken(cmdr, services):
+    services.reader.active = True
+    services.reader.back.return_value = ReadResult(False, "We're at the start, sir.")
+    res = cmdr.handle("back", "typed")
+    assert res.reply == "We're at the start, sir." and res.speak is True
+
+
+def test_quiet_still_ends_the_reading_and_frees_the_words(cmdr, services):
+    services.reader.active = True
+    cmdr.handle("jarvis, quiet", "typed")
+    services.reader.stop.assert_called_once()
