@@ -544,6 +544,34 @@ false` turns the index off. The embedder is kept loaded (`keep_alive: -1`, ~270 
 question after a quiet spell never pays the 7 s cold load; the first start after this
 update indexes your existing facts in the background.
 
+## 19. People: who "my advisor" and "Mom" are
+
+*"My advisor is Dr Peyrovi, email hp@tamu.edu"* / *"my mom is Linda"* / *"remember that my
+TA is Sam Ortiz, his email is sam@tamu.edu"* go into `people.json` beside the facts. From
+then on *"who's my advisor?"* answers straight away, *"any email from my advisor?"* filters
+the mailbox by that address, and *"add lunch with Mom tomorrow at noon"* lands on the
+calendar as lunch with her name. The people block is shown to the model on every turn, so
+the local model can connect "my advisor" to a name in anything else you ask.
+
+A sentence is taken as a contact only when it plainly is one — an address, a title (Dr,
+Prof, Mr…), a relation word (advisor, TA, mom, dentist, landlord…) or a capitalised
+full name — so *"my favourite colour is blue"* is still just conversation. Edit or remove an
+entry by hand in `~/.aiws_trainer/jarvis_memory/people.json` (alias → name / email /
+relation).
+
+## 20. The activity journal and "recap my day"
+
+Everything Jarvis does with you is journaled, one JSON line per event, in
+`~/.aiws_trainer/jarvis_memory/journal/YYYY-MM-DD.jsonl`: each exchange in full, each tool
+call, each finished or failed Claude task, and the window you are working in (sampled every
+`journal.window_interval_s` seconds, written only when it changes, never while the screen is
+locked or there is no focused window). *"Recap my day"*, *"what was I doing before lunch?"*,
+*"what did I get done this afternoon?"*, *"what have I been working on the last two hours?"*
+and *"what did I do yesterday?"* read the journal back: the local model speaks a recap of at
+most four sentences and the full hour-by-hour digest appears on a card. Files older than
+`journal.keep_days` (90) are pruned at start; `journal.enabled: false` stops the window
+sampler (exchanges and tool calls are always journaled). Nothing leaves the machine.
+
 ---
 
 ## What Jarvis says when something is missing
