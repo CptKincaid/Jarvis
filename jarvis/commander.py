@@ -1986,16 +1986,24 @@ class Commander:
             return res
 
         cmd_text = strip_jarvis_prefix(text)
+
+        # 3a. User-defined phrases from assistant.json, ahead of the built-ins
+        #     so a personal shortcut can shadow one -- and checked on the RAW
+        #     text as well as the addressed form. The hotword consumes the wake
+        #     word, so "Jarvis, drop my needle" arrives here as "drop my
+        #     needle" with no prefix left to strip; that sends it to the
+        #     classifier below, which calls short phrases background chat and
+        #     drops them silently. A phrase the user configured by hand is by
+        #     definition addressed to Jarvis and must not be subject to a guess.
+        res = self._try_custom_phrase(cmd_text if cmd_text is not None else text)
+        if res is not None:
+            return res
+
         if cmd_text is not None:
             # 2. Desktop control chains (2632-2635 → 3548-3584)
             if self._try_desktop(cmd_text):
                 return CommandResult(handled=True, status="Desktop command",
                                      done=False)
-            # 3a. User-defined phrases from assistant.json, BEFORE the
-            #     built-in registry so a personal shortcut can shadow one.
-            res = self._try_custom_phrase(cmd_text)
-            if res is not None:
-                return res
             # 3. Quick/registry commands (2637-2640 → 3036-3485)
             res = self._try_registry(cmd_text)
             if res is not None:

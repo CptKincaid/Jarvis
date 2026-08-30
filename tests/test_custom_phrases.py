@@ -84,3 +84,37 @@ def test_a_failing_tool_apologises_rather_than_going_silent():
     res = c._try_custom_phrase("drop my needle")
     assert res is not None and res.handled and res.speak
     assert "failed" in res.reply.lower()
+
+
+def test_fires_without_the_wake_word_still_in_the_transcript():
+    """The regression that made "Jarvis, drop my needle" do nothing.
+
+    The hotword consumes the wake word, so the transcript reaching handle()
+    is bare "drop my needle" -- no "jarvis" prefix left to strip. The phrase
+    check used to sit inside the `if cmd_text is not None` block, so it was
+    skipped entirely and the utterance fell through to the intent classifier,
+    which calls short phrases background chat and drops them silently:
+
+        handle 'drop my needle' source=voice
+        Ignored (background chat, conf=0.80): 'drop my needle'
+
+    A phrase the user wrote into assistant.json by hand is addressed to
+    Jarvis by construction; it must never be subject to that guess.
+    """
+    tools = _Tools()
+    c = _commander(PHRASE, tools)
+    c.dictation = False
+    for stub in ("_try_ringing", "_try_approval", "_try_terminal_offer",
+                 "_try_event_confirm", "_try_router_answer"):
+        setattr(c, stub, lambda *a, **k: None)
+    # Anything reaching the classifier is already a failure; make that loud
+    # rather than letting a NO verdict quietly look like a pass.
+    def _boom(*a, **k):
+        raise AssertionError("reached the intent classifier")
+    c.intent = SimpleNamespace(classify=_boom)
+
+    res = c.handle("drop my needle", source="voice")
+
+    assert res is not None and res.handled
+    assert tools.calls == [("spotify_play", {"query": "Jingle Bells"})]
+    assert res.reply == "Dropping the needle, sir."

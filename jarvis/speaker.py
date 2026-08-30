@@ -45,6 +45,52 @@ MAX_EMBEDDINGS = 100
 # Minimum audio length (seconds) for a useful embedding
 MIN_AUDIO_SECONDS = 1.0
 
+# Silence is not ignored by ECAPA -- it is pooled in like any other frame, so
+# a window's score lands near the speech-fraction-weighted average of the
+# speaker's true score and the score of silence (about -0.10 here). Measured
+# on a real rejection: a 3.9 s capture holding 1.4 s of speech scored 0.253
+# where the same voice scores 0.63 clean; 0.47*0.63 + 0.53*-0.10 = 0.25. With
+# a 0.40 threshold that demands ~68% of the window be speech, which no short
+# utterance survives once the recorder's 2.5 s silence auto-stop is appended.
+FRAME_MS = 20
+SPEECH_PEAK_FRACTION = 0.08      # of the clip's own loudest frame
+SPEECH_FLOOR_MULTIPLE = 3.0      # of the clip's own noise floor
+MIN_SPEECH_SECONDS = 0.35        # below this we cannot tell, so change nothing
+
+
+def trim_silence(audio_16k, frame_ms=FRAME_MS, min_speech_s=MIN_SPEECH_SECONDS):
+    """Strip leading and trailing silence before an embedding is taken.
+
+    Thresholds are relative to the clip's own peak and noise floor, so quiet
+    speech survives and a loud room does not swallow it. Endpoints only:
+    interior pauses are real speech rhythm and are also present in the
+    enrolment audio, so removing them would widen the mismatch, not close it.
+
+    Returns the audio unchanged whenever it cannot confidently find speech --
+    a trim that guesses wrong would fail shut on the transcript gate, and
+    unchanged is exactly today's behaviour.
+    """
+    n = int(SAMPLE_RATE * frame_ms / 1000)
+    if n <= 0 or len(audio_16k) < 2 * n:
+        return audio_16k
+    frames = np.asarray(audio_16k[:len(audio_16k) // n * n], dtype=np.float32)
+    frames = frames.reshape(-1, n)
+    rms = np.sqrt(np.mean(np.square(frames, dtype=np.float64), axis=1) + 1e-12)
+    peak = float(rms.max())
+    if peak <= 0.0:
+        return audio_16k
+    threshold = max(peak * SPEECH_PEAK_FRACTION,
+                    float(np.percentile(rms, 10)) * SPEECH_FLOOR_MULTIPLE)
+    voiced = np.nonzero(rms >= threshold)[0]
+    if voiced.size == 0:
+        return audio_16k
+    lo = max(0, int(voiced[0]) - 1)                  # one frame of margin so a
+    hi = min(len(rms), int(voiced[-1]) + 2)          # soft onset is not clipped
+    trimmed = audio_16k[lo * n:hi * n]
+    if len(trimmed) < int(SAMPLE_RATE * min_speech_s):
+        return audio_16k
+    return trimmed
+
 SAMPLE_RATE = 16000
 
 
@@ -220,6 +266,10 @@ class SpeakerVerifier:
             return None
         if len(audio_16k) < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
             return None
+        # Every score, verify, enrol and window passes through here, so the
+        # trim lands on all of them at once -- including the wake-word gate,
+        # which scores a 1 s buffer that is mostly pre-speech silence.
+        audio_16k = trim_silence(audio_16k)
         try:
             import torch
             # SpeechBrain expects (batch, time) tensor
@@ -366,6 +416,23 @@ class SpeakerVerifier:
         return True
 
     # ------------------------------------------------ segment filtering
+    def _dump_reject(self, audio_16k, windows, scores):
+        """Save a rejected capture so a rejection can be diagnosed from the
+        audio instead of from the score alone. Off unless JARVIS_DEBUG_AUDIO=1:
+        these are recordings of the user's room and do not accumulate silently.
+        """
+        try:
+            import soundfile as sf
+            out = PATHS.LOG_DIR / "reject_last.wav"
+            sf.write(out, audio_16k, SAMPLE_RATE)
+            parts = []
+            for w, sc in zip(windows, scores):
+                kept = len(trim_silence(w)) / SAMPLE_RATE
+                parts.append("%.2fs->%.2fs=%.3f" % (len(w) / SAMPLE_RATE, kept, sc))
+            log.info("reject dump: %s  windows: %s", out, "  ".join(parts))
+        except Exception:
+            log.exception("reject dump failed")
+
     def filter_segments(self, audio_16k, window_sec=3.0, hop_sec=1.5):
         """Filter audio to keep only segments matching the enrolled voice.
 
@@ -416,6 +483,17 @@ class SpeakerVerifier:
             windows.append(audio_16k[pos:total_samples])
             positions.append(pos)
 
+        # A window holding no speech can only ever score the silence embedding
+        # (about -0.06 against a voiceprint) -- it cannot match, and scoring it
+        # spends a GPU pass to put a misleading number in the log. Drop those,
+        # unless that would leave nothing, in which case score them all and let
+        # the threshold decide as before.
+        voiced = [i for i, w in enumerate(windows)
+                  if len(trim_silence(w)) >= int(SAMPLE_RATE * MIN_SPEECH_SECONDS)]
+        if voiced and len(voiced) < len(windows):
+            windows = [windows[i] for i in voiced]
+            positions = [positions[i] for i in voiced]
+
         # Batch embedding extraction for speed
         scores = []
         matched_mask = []
@@ -430,6 +508,8 @@ class SpeakerVerifier:
                 else:
                     scores.append(0.0)
                     matched_mask.append(False)
+            if os.environ.get("JARVIS_DEBUG_AUDIO") == "1" and not any(matched_mask):
+                self._dump_reject(audio_16k, windows, scores)
         except Exception:
             log.exception("segment verification error")
             self._fail_shut("segment verification error")

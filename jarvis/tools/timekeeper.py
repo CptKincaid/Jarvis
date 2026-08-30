@@ -898,14 +898,16 @@ class _Ring:
 class Timekeeper:
     """See the module docstring.  Every public method is thread-safe."""
 
-    def __init__(self, db_path, say=None, cfg=None, now=time.time, run=_run,
+    def __init__(self, db_path, say=None, cfg=None, now=time.time, run=None,
                  tick_s: float = 1.0, ring: bool = True, cache_dir=None,
                  notify: bool = True):
         self.db_path = Path(db_path)
         self._say = say or (lambda text: None)
         self.cfg = cfg
         self._now = now
-        self._run = run
+        # Late-bound: a default of `run=_run` is captured at import, so a
+        # test monkeypatching the module attribute would not reach it.
+        self._run = run if run is not None else _run
         self.tick_s = float(tick_s)
         self.ring_enabled = bool(ring)
         self.notify_enabled = bool(notify)

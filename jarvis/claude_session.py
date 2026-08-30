@@ -1071,7 +1071,7 @@ def pick_session(utterance: str, sessions: list, now: Optional[float] = None):
 # ------------------------------------------------------------- the manager
 class ClaudeSessionManager:
     def __init__(self, cfg, brain, approvals, state_path, task_dir,
-                 run: Callable = _run, claude_bin: Optional[str] = None,
+                 run: Optional[Callable] = None, claude_bin: Optional[str] = None,
                  python: str = sys.executable, projects_dir=None,
                  now: Callable[[], float] = time.time, poll_s: float = 0.25,
                  home=None, ready_s: float = 90.0, settle_s: float = 1.5,
@@ -1082,7 +1082,9 @@ class ClaudeSessionManager:
         self.approvals = approvals
         self.state_path = Path(state_path)
         self.task_dir = Path(task_dir)
-        self._run = run
+        # Late-bound: a default of `run=_run` is captured at import, so a
+        # test monkeypatching the module attribute would not reach it.
+        self._run = run if run is not None else _run
         if claude_bin is None:
             claude_bin = os.environ.get("JARVIS_CLAUDE_BIN") or ""
             if not claude_bin:

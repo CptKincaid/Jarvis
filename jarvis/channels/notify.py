@@ -155,9 +155,13 @@ class Alerts:
     """Fan-out hub. `attach(discord)` after construction; `alert(...)`
     from any thread; `flush(timeout)` in tests to wait for delivery."""
 
-    def __init__(self, cfg: Any, run: Callable = _run, timeout_s: float = 5.0):
+    def __init__(self, cfg: Any, run: Optional[Callable] = None,
+                 timeout_s: float = 5.0):
         self._cfg = cfg
-        self._run = run
+        # Late-bound: a default of `run=_run` is captured at import, so
+        # monkeypatching the module attribute in a test would not reach it
+        # and the suite would spawn real desktop banners.
+        self._run = run if run is not None else _run
         self._timeout = float(timeout_s)
         self._discord = None
         self._queue: "queue.Queue[AlertRecord]" = queue.Queue()
