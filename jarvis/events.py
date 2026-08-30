@@ -114,6 +114,14 @@ class SpeakingState(Event):
 @dataclass
 class ReminderFired(Event):
     text: str = ""
+    # Added for the focus session (jarvis/focus.py): a silent item (label
+    # prefixed timekeeper.SILENT_PREFIX) is never spoken or toasted by the
+    # timekeeper itself, so the owner needs the id to know WHICH of its items
+    # fired; `late` says it fired from the boot catch-up rather than on time.
+    item_id: str = ""
+    kind: str = ""                    # timer | reminder ("" from older publishers)
+    silent: bool = False
+    late: bool = False
 
 
 @dataclass

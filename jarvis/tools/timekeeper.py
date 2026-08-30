@@ -58,6 +58,14 @@ DEFAULT_HOUR = 9                   # "tomorrow" / "on friday" with no time
 MORNING_HOUR = 7                   # same, for alarms (prefer="morning")
 
 KINDS = ("reminder", "timer", "alarm")
+# A label carrying this prefix marks an item that another module owns
+# (jarvis/focus.py chains study blocks and breaks out of them). The
+# timekeeper still persists, schedules and fires it -- so it survives a
+# restart like any timer -- but it neither speaks nor toasts: the owner
+# hears ReminderFired(item_id=..., silent=True) and says its own line.
+# A label prefix rather than a new column so the items table (and its
+# salvage / quarantine path) is untouched.
+SILENT_PREFIX = "focus:"
 ACTIVE_STATES = ("pending", "ringing", "snoozed")
 STATES = ACTIVE_STATES + ("done", "missed", "cancelled")
 REPEATS = ("", "daily", "weekdays")
@@ -145,6 +153,18 @@ def _default_legacy_path() -> Path:
 
 
 # ------------------------------------------------------------ wording
+def is_silent(label) -> bool:
+    return str(label or "").lower().startswith(SILENT_PREFIX)
+
+
+def display_label(label) -> str:
+    """'focus: block 1' -> 'focus block 1' for the schedule read-out."""
+    text = str(label or "")
+    if is_silent(text):
+        return (SILENT_PREFIX.rstrip(":") + " " + text[len(SILENT_PREFIX):].strip()).strip()
+    return text
+
+
 def count_words(n: int) -> str:
     n = int(n)
     return _COUNT_WORDS[n] if 0 <= n < len(_COUNT_WORDS) else str(n)
@@ -821,7 +841,7 @@ class Item:
     def spoken_label(self) -> str:
         """What we call it in a sentence."""
         if self.kind == "timer":
-            return self.label or f"your {duration_words(self.duration)} timer"
+            return display_label(self.label) or f"your {duration_words(self.duration)} timer"
         if self.kind == "alarm":
             return self.label or "your alarm"
         return self.label
@@ -1161,6 +1181,21 @@ class Timekeeper:
     def add_alarm(self, due: float, label: str = "", repeat: str = "once") -> Item:
         return self._new("alarm", label, due, repeat=normalize_repeat(repeat))
 
+    def add_silent_timer(self, seconds: float, label: str = "") -> Item:
+        """A timer the timekeeper fires without speaking or toasting (see
+        SILENT_PREFIX): ReminderFired carries item.id for the owner."""
+        label = str(label or "").strip()
+        if not is_silent(label):
+            label = f"{SILENT_PREFIX} {label}".strip()
+        return self.add_timer(seconds, label)
+
+    def get(self, item_id: str) -> Optional[Item]:
+        """One item by id, any state; None when unknown."""
+        if not item_id:
+            return None
+        with self._lock:
+            return self._get(str(item_id))
+
     # --------------------------------------------------------- reading
     def list(self, kind: str = "all", include_done: bool = False) -> list[Item]:
         kind = normalize_kind(kind)
@@ -1193,7 +1228,7 @@ class Timekeeper:
                 return f"{head} snoozed until {_time_words(_to_dt(it.effective_due))}{tail}"
             return f"{head} {due}{tail}"
         if it.kind == "timer":
-            return f"{it.label or 'the ' + duration_words(it.duration) + ' timer'} {due}"
+            return f"{display_label(it.label) or 'the ' + duration_words(it.duration) + ' timer'} {due}"
         return f"{it.label} {due}"
 
     def list_text(self, kind: str = "all", now=None) -> str:
@@ -1368,9 +1403,20 @@ class Timekeeper:
                      datetime.fromtimestamp(nxt).strftime("%a %H:%M"))
         else:
             self._update(item.id, state="done", fired_at=now)
+        if is_silent(item.label):
+            # The owner speaks (or stays quiet) about this one; "Sir, your
+            # 25-minute focus: block 1 timer is up" would double every
+            # announcement and read the label out loud.
+            effects.append(lambda: bus.publish(ReminderFired(
+                text=display_label(item.label), item_id=item.id, kind=item.kind,
+                silent=True, late=late)))
+            log.info("timekeeper: silent %s fired %r%s", item.kind, item.label,
+                     " (late)" if late else "")
+            return True
         effects.append(lambda: self._speak(line))
         effects.append(lambda: self._toast(title, text, "normal"))
-        effects.append(lambda: bus.publish(ReminderFired(text=text)))
+        effects.append(lambda: bus.publish(ReminderFired(
+            text=text, item_id=item.id, kind=item.kind)))
         log.info("timekeeper: %s fired %r", item.kind, item.label)
         return True
 
@@ -1486,9 +1532,12 @@ class Timekeeper:
                     self._finish_alarm(it, now, "missed")
                     missed.append(it)
                     log.info("timekeeper: %s %r missed (%.0f s late)", it.kind, it.label, late)
-        if missed:
+        # Silent items belong to their owner (the focus session reconciles
+        # its own state at boot), so they are marked missed but not read out.
+        spoken_missed = [m for m in missed if not is_silent(m.label)]
+        if spoken_missed:
             parts = [f"{m.spoken_label()} at {_when_words(_to_dt(m.effective_due), _to_dt(now))}"
-                     for m in missed]
+                     for m in spoken_missed]
             effects.append(lambda: self._speak(MISSED_LINE.format(what=join_and(parts))))
         for fx in effects:
             try:
