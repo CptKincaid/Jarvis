@@ -35,7 +35,23 @@ from jarvis.logs import get_logger
 log = get_logger("channels.notify")
 
 KINDS = ("milestone", "done", "blocked", "question", "alarm", "reminder")
-CRITICAL_KINDS = frozenset({"question", "blocked", "alarm"})
+# GNOME (per freedesktop) NEVER auto-expires a `critical` notification --
+# the -t timeout is silently ignored for them. So `critical` means "stays on
+# screen until dismissed by hand", and only two kinds have earned that:
+# a question is literally blocking Claude until answered, and an alarm is
+# supposed to persist. `blocked` used to be here, which is why task banners
+# piled up at the top of the screen with an 8 s timeout that did nothing.
+CRITICAL_KINDS = frozenset({"question", "alarm"})
+
+# Kinds that put a banner on the desktop. Everything still reaches Discord
+# and the transcript -- this only governs the interrupting surface.
+# `milestone` is deliberately absent: it fires for EVERY Claude milestone,
+# which is a steady stream of banners during a long task.
+TOAST_KINDS = frozenset({"done", "blocked", "question", "alarm", "reminder"})
+
+# Identical alerts inside this window are delivered once. Repeats happen
+# when a task retries or a watcher re-reports the same state.
+DEDUPE_S = 30.0
 EXPIRE_MS = 8000
 QUESTION_SUFFIX = "Reply yes or no."
 APP_NAME = "Jarvis"
@@ -98,6 +114,42 @@ class AlertRecord:
     discord_ok: Optional[bool] = None
 
 
+# One switch for EVERY desktop banner, not just the hub's.
+#
+# Three call sites shell out to notify-send directly and never went through
+# Alerts: reminders (workflows), the agent monitor, and screenshot
+# confirmations. Turning off alerts.desktop silenced the hub and they kept
+# firing anyway, so the setting only half-worked. They now all ask here.
+#
+# Cached because it is consulted on notification paths; call
+# reset_desktop_banner_cache() if the config is edited at runtime.
+_banner_cache: Optional[bool] = None
+
+
+def desktop_banners_enabled() -> bool:
+    """False when the user has turned off top-of-screen banners.
+
+    Everything still speaks, still reaches Discord, and still lands in the
+    transcript -- this governs only the interrupting surface.
+    """
+    global _banner_cache
+    if _banner_cache is None:
+        try:
+            from jarvis.assistant_config import AssistantConfig
+            _banner_cache = _truthy(
+                cfg_get(AssistantConfig.load(), "alerts.desktop", True))
+        except Exception:
+            log.debug("could not read alerts.desktop; assuming on",
+                      exc_info=True)
+            _banner_cache = True
+    return _banner_cache
+
+
+def reset_desktop_banner_cache() -> None:
+    global _banner_cache
+    _banner_cache = None
+
+
 # ------------------------------------------------------------------ hub
 class Alerts:
     """Fan-out hub. `attach(discord)` after construction; `alert(...)`
@@ -116,6 +168,7 @@ class Alerts:
         self.desktop_enabled = _truthy(cfg_get(cfg, "alerts.desktop", True))
         self.discord_enabled = _truthy(cfg_get(cfg, "alerts.discord", True))
         self._toast_available = shutil.which("notify-send") is not None or run is not _run
+        self._last_toast: dict[tuple[str, str, str], float] = {}
 
     # -- wiring --------------------------------------------------------
     def attach(self, discord) -> None:
@@ -168,8 +221,31 @@ class Alerts:
             finally:
                 self._queue.task_done()
 
+    def _should_toast(self, rec: AlertRecord) -> bool:
+        """Desktop banners are the interrupting surface, so they are rationed.
+
+        Discord and the transcript still receive every alert; this only
+        decides what is allowed to cover the user's screen.
+        """
+        if rec.kind not in TOAST_KINDS:
+            return False
+        key = (rec.kind, rec.title, rec.text)
+        now = time.monotonic()
+        last = self._last_toast.get(key)
+        if last is not None and now - last < DEDUPE_S:
+            log.debug("alert deduped (%.1fs): %s / %s", now - last,
+                      rec.kind, rec.title)
+            return False
+        self._last_toast[key] = now
+        if len(self._last_toast) > 128:          # bound the table
+            cutoff = now - DEDUPE_S
+            self._last_toast = {k: v for k, v in self._last_toast.items()
+                                if v >= cutoff}
+        return True
+
     def _deliver(self, rec: AlertRecord) -> None:
-        if self.desktop_enabled and self._toast_available:
+        if self.desktop_enabled and self._toast_available and \
+                self._should_toast(rec):
             rec.toast_ok = self._toast(rec)
         discord = self._discord
         if discord is not None and self.discord_enabled and \

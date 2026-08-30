@@ -333,15 +333,20 @@ class JarvisAgent:
 
     def _alert(self, message):
         """Send a proactive alert."""
-        # Desktop notification
-        try:
-            subprocess.Popen(
-                ["notify-send", "-u", "critical", "-i", "dialog-warning",
-                 "Jarvis Alert", message],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            pass
+        # Desktop notification — skipped when the user has turned banners off
+        # (alerts.desktop). It was `-u critical`, which GNOME never
+        # auto-expires, so these sat on screen until dismissed by hand.
+        # The alert is still spoken below.
+        from jarvis.channels.notify import desktop_banners_enabled
+        if desktop_banners_enabled():
+            try:
+                subprocess.Popen(
+                    ["notify-send", "-u", "normal", "-i", "dialog-warning",
+                     "-t", "8000", "Jarvis Alert", message],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                pass
         # Speak if available
         if self._speak_func:
             try:

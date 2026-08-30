@@ -277,15 +277,18 @@ class Reminders:
         task = item["task"]
         log.info("Reminder fired: %r", task)
         self._save()
-        # Desktop notification
-        try:
-            subprocess.Popen(
-                ["notify-send", "-t", "10000", "-i", "appointment-soon",
-                 "Jarvis Reminder", task],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            )
-        except Exception:
-            log.warning("notify-send unavailable for reminder %r", task)
+        # Desktop notification — skipped when the user has turned banners
+        # off (alerts.desktop). The reminder is still spoken below.
+        from jarvis.channels.notify import desktop_banners_enabled
+        if desktop_banners_enabled():
+            try:
+                subprocess.Popen(
+                    ["notify-send", "-t", "10000", "-i", "appointment-soon",
+                     "Jarvis Reminder", task],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
+            except Exception:
+                log.warning("notify-send unavailable for reminder %r", task)
         # Speak it
         if CONFIG.talkback:
             try:

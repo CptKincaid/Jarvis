@@ -633,13 +633,15 @@ class DesktopControl:
                 old.unlink(missing_ok=True)
 
             log.info("Screenshot saved: %s", latest)
+            from jarvis.channels.notify import desktop_banners_enabled
             try:
-                subprocess.Popen(
-                    ["notify-send", "-u", "normal", "-i", "camera-photo",
-                     "-t", "3000", "Screenshot Captured",
-                     f"Saved to {latest}\nSending to Claude..."],
-                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                )
+                if desktop_banners_enabled():
+                    subprocess.Popen(
+                        ["notify-send", "-u", "normal", "-i", "camera-photo",
+                         "-t", "3000", "Screenshot Captured",
+                         f"Saved to {latest}\nSending to Claude..."],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    )
             except FileNotFoundError:
                 pass
 

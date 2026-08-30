@@ -775,7 +775,7 @@ class Recorder:
 
 @pytest.mark.parametrize("kind,urgency,expire", [
     ("milestone", "normal", "8000"), ("done", "normal", "8000"),
-    ("reminder", "normal", "8000"), ("blocked", "critical", "8000"),
+    ("reminder", "normal", "8000"), ("blocked", "normal", "8000"),
     ("alarm", "critical", "8000"), ("question", "critical", "0"),
 ])
 def test_notify_argv_per_kind(kind, urgency, expire):
@@ -816,7 +816,9 @@ def test_alerts_skip_discord_when_unconfigured_or_detached():
     assert len(run.argv) == 1
     fake = FakeDiscord(configured=False)
     alerts.attach(fake)
-    rec = alerts.alert("milestone", "Jarvis", "Running the tests.")
+    # a TOAST_KINDS kind, and distinct text: milestone no longer toasts, and
+    # an identical alert inside DEDUPE_S would be suppressed.
+    rec = alerts.alert("done", "Jarvis", "Second task finished, sir.")
     assert alerts.flush(2.0)
     assert fake.posts == [] and rec.discord_ok is None and rec.toast_ok is True
     assert len(run.argv) == 2
@@ -937,3 +939,56 @@ def test_live_gateway_hello_unauthenticated():
     r2 = tr.request("GET", f"{dmod.API_BASE}/gateway/bot",
                     {"Authorization": "Bot placeholder", "User-Agent": dmod.USER_AGENT})
     assert r2.status == 401
+
+
+# ------------------------------------------------ desktop-banner rationing
+#
+# The top-of-screen banner is the only surface that interrupts the user, so
+# it is rationed on three axes. Discord and the transcript still receive
+# everything; these tests pin what is allowed to cover the screen.
+
+def test_only_question_and_alarm_are_sticky():
+    """GNOME never auto-expires a `critical` notification — the -t value is
+    ignored. So `critical` must mean "deliberately stays until dismissed".
+    `blocked` was critical with an 8 s timeout that did nothing, which is
+    why task banners piled up."""
+    from jarvis.channels.notify import CRITICAL_KINDS, urgency_for
+    assert CRITICAL_KINDS == {"question", "alarm"}
+    assert urgency_for("blocked") == "normal"
+    assert urgency_for("done") == "normal"
+    assert urgency_for("milestone") == "normal"
+
+
+def test_milestones_never_reach_the_desktop():
+    """A milestone fires for EVERY Claude milestone — a stream of banners
+    during a long task. It still goes to Discord."""
+    run = Recorder()
+    alerts = Alerts(cfg(), run=run)
+    fake = FakeDiscord(configured=True)
+    alerts.attach(fake)
+    rec = alerts.alert("milestone", "Claude · jarvis", "Ran the tests.")
+    assert alerts.flush(2.0)
+    assert run.argv == [], "milestone must not raise a desktop banner"
+    assert rec.toast_ok is None
+    assert len(fake.posts) == 1, "but it must still reach Discord"
+
+
+def test_identical_alerts_are_deduped_on_the_desktop():
+    """Retries and re-reporting watchers repeat the same alert."""
+    run = Recorder()
+    alerts = Alerts(cfg(), run=run)
+    for _ in range(4):
+        alerts.alert("blocked", "Claude · jarvis", "The build broke, sir.")
+    assert alerts.flush(2.0)
+    assert len(run.argv) == 1, f"expected 1 banner, got {len(run.argv)}"
+
+
+def test_dedupe_is_per_message_not_global():
+    """Suppressing repeats must not suppress genuinely new alerts."""
+    run = Recorder()
+    alerts = Alerts(cfg(), run=run)
+    alerts.alert("blocked", "Claude · a", "The build broke, sir.")
+    alerts.alert("blocked", "Claude · b", "The build broke, sir.")
+    alerts.alert("done", "Claude · a", "The build broke, sir.")
+    assert alerts.flush(2.0)
+    assert len(run.argv) == 3
