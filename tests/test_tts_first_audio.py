@@ -161,6 +161,10 @@ def test_the_mark_is_once_per_burst_not_per_chunk(tmp_path, monkeypatch, events)
 @pytest.fixture
 def fish(tmp_path, monkeypatch):
     monkeypatch.setattr(tts_mod, "_fish_creds", lambda: ("key", "voice"))
+    # These tests own the Popen seam for the PLAYER; the F5 warm-up thread
+    # (load() on fish) would land its systemctl probe in the same fake and
+    # steal spawned[0]. The warm-up has its own tests (test_f5_service.py).
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
     monkeypatch.setattr(tts_mod, "FISH_STREAM_PLAYBACK", True)
     monkeypatch.setattr(tts_mod.subprocess, "Popen", FakeProc)
     t = TTS(engine="fish", cache_dir=tmp_path / "cache")

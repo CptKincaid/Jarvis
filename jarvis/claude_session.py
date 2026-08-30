@@ -173,6 +173,10 @@ STALE_ALLOW_RULES = ("mcp__*",)
 DENY_RULES = ["Bash(sudo *)", "Bash(rm -rf /*)", "Bash(rm -rf ~*)"]
 
 NEVER = float("-inf")           # "no milestone yet" for the 20 s limiter
+# Environment variable set on every pane Jarvis launches; the user's own
+# Claude Code hooks (scripts/claude_hooks/narrate.py) stay silent when it is
+# present.  The name is duplicated there (the hook is stdlib-only).
+DRIVEN_ENV = "JARVIS_DRIVEN"
 
 EDIT_TOOLS = frozenset({"Edit", "Write", "MultiEdit", "NotebookEdit"})
 TEST_CMD_RX = re.compile(
@@ -1664,7 +1668,12 @@ class ClaudeSessionManager:
             parts += ["--append-system-prompt-file", q(str(suffix_path))]
         if prompt:
             parts += [q(prompt)]
-        return f"clear; cd {q(proj.path)} && {' '.join(parts)}"
+        # JARVIS_DRIVEN=1 marks the pane as ours for the user's Claude Code
+        # hooks (scripts/claude_hooks/narrate.py): hooks inherit the CLI's
+        # environment, and this pane is already narrated from its transcript
+        # (_tail_transcript), so the hook exits at once instead of speaking
+        # every verdict twice.
+        return f"clear; cd {q(proj.path)} && {DRIVEN_ENV}=1 {' '.join(parts)}"
 
     # ------------------------------------------------------------ tmux
     def _tmux(self, *args, timeout: float = 10.0):

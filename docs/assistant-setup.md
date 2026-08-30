@@ -192,7 +192,8 @@ the portal and paste the new one.
 stranger's "yes" in a shared channel can never approve a `git push`; left
 blank, anyone who can post in `channel_id` can command him. Two optional
 switches silence a channel independently (both default on, and the key may
-be absent): `"alerts": {"desktop": true, "discord": true}`.
+be absent): `"alerts": {"desktop": true, "discord": true, "claude_hooks": true}`
+(`claude_hooks` is the spoken narration of your own Claude Code terminals, section 21).
 
 Troubleshooting from `jarvis.log`: gateway close **4014** means the MESSAGE
 CONTENT intent is still off in the portal (Jarvis falls back to REST polling
@@ -1105,6 +1106,120 @@ Flipping the default engine is still a manual step: set `"tts_engine": "f5"`
 in `~/.aiws_trainer/voice_settings.json` (or the Engine picker) and restart;
 the canned lines are re-rendered on F5 by the normal prewarm, and the Fish key
 becomes optional. The speech cache keys F5 and Fish audio separately.
+
+## 18. Long-term memory that understands you (fully local)
+
+*"Remember that my dentist is Dr Patel"* stores a fact; weeks later *"who's my dentist?"*
+or *"what did I say about the thesis last week?"* finds it however you phrase it. Facts
+live in `~/.aiws_trainer/jarvis_memory/facts.json` as before, and each one is also embedded
+with Ollama's `nomic-embed-text` (the same local model the documents tool uses) into a
+chromadb index beside it (`facts_index/`). Every turn, the model is shown the few facts that
+bear on what you just said — not the last five — so a fact you stored months ago still
+surfaces when it matters, and nothing is shown when nothing is close. *"Recall the thesis"*
+/ *"what did I say about the move yesterday"* answer directly; a time phrase (last week,
+yesterday, in the last three days) limits it to facts stored since then.
+
+Nothing leaves the machine. If chromadb or Ollama is unavailable Jarvis falls back to the
+old substring search and says nothing about it (one line in the log). `memory.semantic:
+false` turns the index off. The embedder is kept loaded (`keep_alive: -1`, ~270 MB) so a
+question after a quiet spell never pays the 7 s cold load; the first start after this
+update indexes your existing facts in the background.
+
+## 19. People: who "my advisor" and "Mom" are
+
+*"My advisor is Dr Peyrovi, email hp@tamu.edu"* / *"my mom is Linda"* / *"remember that my
+TA is Sam Ortiz, his email is sam@tamu.edu"* go into `people.json` beside the facts. From
+then on *"who's my advisor?"* answers straight away, *"any email from my advisor?"* filters
+the mailbox by that address, and *"add lunch with Mom tomorrow at noon"* lands on the
+calendar as lunch with her name. The people block is shown to the model on every turn, so
+the local model can connect "my advisor" to a name in anything else you ask.
+
+A sentence is taken as a contact only when it plainly is one — an address, a title (Dr,
+Prof, Mr…), a relation word (advisor, TA, mom, dentist, landlord…) or a capitalised
+full name — so *"my favourite colour is blue"* is still just conversation. Edit or remove an
+entry by hand in `~/.aiws_trainer/jarvis_memory/people.json` (alias → name / email /
+relation).
+
+## 20. The activity journal and "recap my day"
+
+Everything Jarvis does with you is journaled, one JSON line per event, in
+`~/.aiws_trainer/jarvis_memory/journal/YYYY-MM-DD.jsonl`: each exchange in full, each tool
+call, each finished or failed Claude task, and the window you are working in (sampled every
+`journal.window_interval_s` seconds, written only when it changes, never while the screen is
+locked or there is no focused window). *"Recap my day"*, *"what was I doing before lunch?"*,
+*"what did I get done this afternoon?"*, *"what have I been working on the last two hours?"*
+and *"what did I do yesterday?"* read the journal back: the local model speaks a recap of at
+most four sentences and the full hour-by-hour digest appears on a card. Files older than
+`journal.keep_days` (90) are pruned at start; `journal.enabled: false` stops the window
+sampler (exchanges and tool calls are always journaled). Nothing leaves the machine.
+
+## 21. Claude Code hooks (your own terminals)
+
+The sessions you start yourself (the `~/.bashrc` tmux wrapper, any plain `claude`)
+never pass through Jarvis, so a failing test run or a permission prompt in another
+window went unnoticed. A small stdlib-only hook script,
+`scripts/claude_hooks/narrate.py`, fixes that: Claude Code runs it on a few events
+and it appends one line to the speak queue Jarvis already tails
+(`/tmp/vss_voice/speak_queue.txt`). You hear:
+
+- after a `pytest` / `ruff` / `mypy` / `npm test` … command: "3 tests failed in
+  Jarvis, sir." / "Tests passed in haymaker digest, sir." / "The tests errored in
+  …, sir." — the same verdicts the Jarvis-driven sessions get;
+- on a permission prompt: "Claude needs your say-so in Jarvis, sir."; when Claude is
+  idle waiting for you: "Claude is waiting on you in Jarvis, sir.";
+- when a turn ends, "Claude has finished in Jarvis, sir." — but only if the turn ran a
+  test command or took at least 45 s (Stop fires after every reply; a chat answer
+  would otherwise become a tic).
+
+It stays quiet when Jarvis is not running (`jarvis.pid` absent or stale), when the
+session was started BY Jarvis (his launch line sets `JARVIS_DRIVEN=1`, and those
+panes are already narrated from the transcript), and when you turn it off:
+
+```json
+"alerts": {"desktop": true, "discord": true, "claude_hooks": false}
+```
+
+Repeats are limited per session (30 s; 2 min for the idle prompt) through a tiny
+state file under `~/.cache/jarvis/claude_hooks/`. Nothing is ever printed to the
+hook's stdout, and it always exits 0, so it can never block or fail the CLI.
+
+**Install (once, yourself — Jarvis never edits `~/.claude/settings.json`):**
+
+```bash
+~/vss_env/bin/python ~/Jarvis/scripts/claude_hooks/install.py             # merge
+~/vss_env/bin/python ~/Jarvis/scripts/claude_hooks/install.py --dry-run   # show only
+~/vss_env/bin/python ~/Jarvis/scripts/claude_hooks/install.py --uninstall
+```
+
+The merge is idempotent, keeps every other hook and setting in the file, and
+writes `settings.json.bak-claude-hooks` beside it the first time. Restart your
+Claude sessions afterwards. This is exactly what it adds (the `hooks` block; paste it
+by hand if you prefer):
+
+```json
+"hooks": {
+  "PostToolUse": [
+    {"matcher": "Bash",
+     "hooks": [{"type": "command", "timeout": 10,
+                "command": "/home/hunterp/vss_env/bin/python /home/hunterp/Jarvis/scripts/claude_hooks/narrate.py"}]}
+  ],
+  "Notification": [
+    {"hooks": [{"type": "command", "timeout": 10,
+                "command": "/home/hunterp/vss_env/bin/python /home/hunterp/Jarvis/scripts/claude_hooks/narrate.py"}]}
+  ],
+  "Stop": [
+    {"hooks": [{"type": "command", "timeout": 10,
+                "command": "/home/hunterp/vss_env/bin/python /home/hunterp/Jarvis/scripts/claude_hooks/narrate.py"}]}
+  ],
+  "UserPromptSubmit": [
+    {"hooks": [{"type": "command", "timeout": 10,
+                "command": "/home/hunterp/vss_env/bin/python /home/hunterp/Jarvis/scripts/claude_hooks/narrate.py"}]}
+  ]
+}
+```
+
+`UserPromptSubmit` only stamps when the turn began (for the 45 s gate); without it,
+"finished" is spoken only after a test run.
 
 ---
 

@@ -82,8 +82,11 @@ DEFAULTS: dict = {
         },
     },
     # Every desktop banner (the hub AND the direct notify-send sites) obeys
-    # alerts.desktop; alerts.discord gates the Discord fan-out.
-    "alerts": {"desktop": True, "discord": True},
+    # alerts.desktop; alerts.discord gates the Discord fan-out;
+    # alerts.claude_hooks gates the spoken lines from the user's OWN Claude
+    # Code sessions (scripts/claude_hooks/narrate.py reads this file with
+    # plain json, so the key lives here rather than in a jarvis module).
+    "alerts": {"desktop": True, "discord": True, "claude_hooks": True},
     # User-defined spoken shortcuts -> a tool call, matched ahead of the
     # classifier and the model. See docs/assistant-setup.md "Custom phrases".
     "phrases": [],

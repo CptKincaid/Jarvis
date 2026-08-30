@@ -527,8 +527,10 @@ def test_submit_runs_pipeline_exactly(work, sink):
         mcp = work.task_dir / "alpha" / "mcp_jarvis.json"
         suffix = work.task_dir / "system_suffix.txt"
         sid = rec.panes["alpha"]["sid"]
+        # JARVIS_DRIVEN=1 keeps the user's own narration hooks quiet in
+        # panes Jarvis drives (scripts/claude_hooks/narrate.py).
         expected = (
-            f"clear; cd {shlex.quote(str(work.alpha))} && /opt/bin/claude "
+            f"clear; cd {shlex.quote(str(work.alpha))} && JARVIS_DRIVEN=1 /opt/bin/claude "
             f"--model opus --session-id {sid} "
             f"--permission-mode acceptEdits "
             f"--mcp-config {shlex.quote(str(mcp))} "

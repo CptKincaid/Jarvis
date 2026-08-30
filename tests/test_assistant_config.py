@@ -136,7 +136,7 @@ def test_defaults_match_spec_10_1():
                            "spotify.client_secret", "canvas.token")
     from jarvis.assistant_config import SECRET_LIST_FIELDS
     assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),)
-    assert DEFAULTS["alerts"] == {"desktop": True, "discord": True}
+    assert DEFAULTS["alerts"] == {"desktop": True, "discord": True, "claude_hooks": True}
     assert DEFAULTS["phrases"] == []
 
 

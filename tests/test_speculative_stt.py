@@ -82,7 +82,7 @@ def _app(monkeypatch, rec, tr=None, speaker=None):
     a._tts_active = False
     a.said, a.dispatched, a.marks = [], [], []
     a._say = a.said.append
-    a._dispatch = lambda text, source: a.dispatched.append((text, source))
+    a._dispatch = lambda text, source, **kw: a.dispatched.append((text, source))
     a._maybe_learn_voice = lambda audio, stats: None
     a.turns = SimpleNamespace(mark=lambda *x, **k: a.marks.append(x),
                               abandon=lambda r: a.marks.append(("abandon", r)))
