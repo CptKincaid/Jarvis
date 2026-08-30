@@ -29,7 +29,13 @@ bus. Services namespace (constructor arg) provides, lazily and optionally:
     tts        speak(text), interrupt()->bool, last_text, repeat_last()
     reader     read_clipboard(), read_selection(), read_file(name),
                read_text(text), continue_reading() -> ReadResult,
-               stop(), pending_chunks
+               stop(), pending_chunks, resolve_document(name),
+               document_text(path), read_document(path)
+    docs       DocsIndex parked by tools.docs.make_tools (quiz mode reads
+               chunks straight from the store)
+    flashcards FlashcardStore (optional; built lazily under MEMORY_DIR)
+    reply      reply(text, speak=True): a worker-thread answer's door to
+               the UI, the TTS, the follow-up window and the turn ledger
 
 Personal-assistant services (spec 2026-08-26, sections 2.2 and 5.2; every
 one optional — a missing member falls back to the legacy path):
@@ -51,6 +57,7 @@ one optional — a missing member falls back to the legacy path):
     approvals  pending() -> list, answer(allowed, request_id=None, source)
 
 handle() order: dictation -> ringing-alarm words -> pending approval yes/no
+-> open quiz question (the answer) -> terminal offer -> event confirm
 -> pending router question -> desktop chains -> registry -> voice intent
 gate -> jarvis-mode Tier 1 -> Router -> (local: brain.chat | claude:
 claude.submit | ask: one question | action: claude.<action>).
@@ -73,7 +80,9 @@ from jarvis import pronounce
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
+from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import write_event
+from jarvis.tools.docs import EmbedError, INDEXING_LINE, topic_chunks
 from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
 
 log = get_logger("commander")
@@ -726,6 +735,8 @@ _READ_RX = re.compile(
     r"(?P<clip>(?:the\s+|my\s+)?clipboard|what i copied|what i just copied)"
     r"|(?P<sel>(?:the\s+|my\s+)?(?:selection|selected text|highlighted text|"
     r"highlight)|this|that|it)"
+    r"|(?P<doc>(?:the\s+|that\s+|this\s+|my\s+)?(?:whole\s+|full\s+|entire\s+)?"
+    r"(?:document|doc|handout|pdf|paper|summary(?:'s|\s+document)?)(?:\s+in full)?)"
     r"|file\s+(?P<file>\S.*?)"
     r"|(?:aloud|out loud)[:,]?\s+(?P<inline>.+?)"
     r"|(?P<inline2>.+?)\s+(?:aloud|out loud)"
@@ -753,6 +764,8 @@ def read_kind(text: str) -> Optional[tuple]:
         return ("clipboard", None)
     if m.group("sel"):
         return ("selection", None)
+    if m.group("doc"):
+        return ("document", None)
     if m.group("file"):
         return ("file", m.group("file").strip())
     inline = m.group("inline") or m.group("inline2") or ""
@@ -846,10 +859,145 @@ def _h_pronounce(c, t, m):
                          speak=True, status=f"Pronounce {word} as {spoken}")
 
 
+# "Read it to me" after an explain means the document just explained, not
+# the X selection. The pronoun form is only diverted while a document is
+# fresh (LAST_DOCUMENT_S); "read this" / "read the selection" never are.
+_READ_PRONOUN_RX = re.compile(
+    r"^" + _JV + r"read\s+(?:me\s+)?(?:it|that)(?:\s+(?:to me|back|aloud|"
+    r"out loud|back to me))?[.!\s]*$", re.I)
+LAST_DOCUMENT_S = 900.0
+NO_DOCUMENT_LINE = "I haven't a document on hand to read, sir."
+NO_SUCH_DOCUMENT_LINE = "I can't find a document called {name}, sir."
+EXPLAIN_ACK_LINE = "Let me have a look at {name}, sir."
+EXPLAIN_FAIL_LINE = "I'm afraid I couldn't make sense of that document just now, sir."
+EXPLAIN_NO_MODEL_LINE = ("I can't summarise just now, sir; say 'read it to me' "
+                         "and I'll read it instead.")
+READ_OFFER_LINE = "Say 'read it to me' for the whole thing."
+
+# Narrow on purpose (the tool loop handles "summarize my inbox"): a verb of
+# explanation plus a name that carries a document word or an extension.
+# STRONG document words speak an excuse when nothing resolves; WEAK ones
+# ("the report", "that paper") fall through to the router instead, since
+# they are as likely to mean a Claude result or a question about the world.
+_EXPLAIN_RX = re.compile(
+    r"^" + _JV + r"(?:explain|summari[sz]e|sum up|walk me through|brief me on|"
+    r"give me (?:a |the )?(?:summary|rundown|gist) of)\s+"
+    r"(?:the\s+|my\s+|this\s+|that\s+)?(?P<name>.+?)"
+    r"(?:\s+(?:to me|for me|please))?[.!?\s]*$", re.I)
+_STRONG_DOC_RX = re.compile(
+    r"\b(?:handout|pdf|docx?|document|syllabus|textbook|worksheet|slides|"
+    r"lecture notes|rubric|reading)\b|\.(?:pdf|docx|txt|md)\b", re.I)
+_WEAK_DOC_RX = re.compile(
+    r"\b(?:file|paper|report|article|essay|manual|assignment|spec|"
+    r"specification|chapter)\b", re.I)
+
+
+def explain_kind(text: str) -> Optional[tuple]:
+    """('strong'|'weak', name) for "explain the biosensors handout"; None
+    for anything without a document word in the name."""
+    m = _EXPLAIN_RX.match((text or "").strip())
+    if not m:
+        return None
+    name = m.group("name").strip()
+    if _STRONG_DOC_RX.search(name):
+        return ("strong", name)
+    if _WEAK_DOC_RX.search(name):
+        return ("weak", name)
+    return None
+
+
+def _spoken_name(path) -> str:
+    stem = re.sub(r"[_\-]+", " ", getattr(path, "stem", str(path)))
+    return " ".join(stem.split()) or str(path)
+
+
+def _deliver(c, text: str, speak: bool = True):
+    """A worker thread's answer: through services.reply when the app
+    provides it (show, speak, follow-up, close the turn), else the bus and
+    the commander's own TTS door."""
+    if not text:
+        return
+    fn = c._svc("reply")
+    if callable(fn):
+        try:
+            fn(text, speak=speak)
+            return
+        except Exception:
+            log.exception("services.reply failed")
+    bus.publish(JarvisReply(text=text, speak=speak))
+    if speak:
+        c._speak(text)
+
+
+def _h_explain_doc(c, t, m):
+    strength, name = m
+    reader = c._svc("reader")
+    if reader is None or not hasattr(reader, "resolve_document"):
+        return None
+    path = reader.resolve_document(name)
+    if path is None:
+        if strength == "weak":
+            return None                  # not a file of his: let the router have it
+        return CommandResult(handled=True, reply=NO_SUCH_DOCUMENT_LINE.format(name=name),
+                             speak=True, status="No such document")
+    text = reader.document_text(path)
+    if not text.strip():
+        return CommandResult(handled=True,
+                             reply=f"I couldn't get any text out of {path.name}, sir.",
+                             speak=True, status="No text")
+    c._last_document = (path, datetime.now().timestamp())
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "explain_text"):
+        return CommandResult(handled=True, reply=EXPLAIN_NO_MODEL_LINE, speak=True,
+                             status="No model")
+    spoken = _spoken_name(path)
+
+    def _work():
+        try:
+            lead, summary = brain.explain_text(text, name=spoken)
+        except Exception:
+            log.exception("explain_text failed")
+            lead, summary = "", ""
+        if not lead:
+            _deliver(c, EXPLAIN_FAIL_LINE)
+            return
+        # The fuller paragraph is a card (display only, never read aloud);
+        # the lead plus the offer is the spoken reply and arms the follow-up
+        # window so "read it to me" needs no wake word.
+        if summary and summary != lead:
+            bus.publish(JarvisReply(text=f"{path.name}\n{summary}", speak=False))
+        _deliver(c, f"{lead} {READ_OFFER_LINE}")
+
+    c._bg(_work)
+    return CommandResult(handled=True, reply=EXPLAIN_ACK_LINE.format(name=spoken),
+                         speak=True, ack=True, done=False,
+                         status=f"Explaining {path.name}…")
+
+
+def _fresh_document(c):
+    last = getattr(c, "_last_document", None)
+    if not last:
+        return None
+    path, when = last
+    if datetime.now().timestamp() - float(when) > LAST_DOCUMENT_S:
+        return None
+    return path
+
+
 def _h_read_aloud(c, t, m):
     reader = c._svc("reader")
     kind, arg = m
-    if kind == "clipboard":
+    raw = getattr(c, "_raw_text", "") or t
+    if kind == "selection" and _READ_PRONOUN_RX.match(raw.strip()) \
+            and _fresh_document(c) is not None:
+        kind = "document"
+    if kind == "document":
+        path = _fresh_document(c)
+        if path is None:
+            return CommandResult(handled=True, reply=NO_DOCUMENT_LINE, speak=True,
+                                 status="No document")
+        res = reader.read_document(path)
+    elif kind == "clipboard":
         res = reader.read_clipboard()
     elif kind == "selection":
         res = reader.read_selection()
@@ -1776,6 +1924,152 @@ def _h_remind_me(c, t, m):                                 # 3465-3483
 # Ordered registry — mirrors _check_quick_command branch order (3036-3485).
 # The single insertion is "autonomous" before "workflow" (V3 spec: "deploy"
 # and "autonomous:" phrases route to brain.execute_autonomous).
+# ---- Tier 1 quiz mode -------------------------------------------------
+# "Quiz me on chapter three" pulls the chunks (docs.topic_chunks), has the
+# model write the questions (brain.make_quiz), files them as Leitner cards
+# and asks the first one; the NEXT utterance is the answer (_try_quiz_answer
+# in handle(), ahead of the intent gate, which would call "forty percent"
+# background chat). All state lives here in the commander, never in the
+# app: app._pending_uncertain blocks the follow-up window.
+_QUIZ_RX = re.compile(
+    r"^" + _JV + r"(?:quiz|test|drill|grill|examine) me (?:on|about|over|from|with) "
+    r"(?:the\s+|my\s+)?(?P<topic>.+?)(?:\s+please)?[.!?\s]*$", re.I)
+_REVIEW_RX = re.compile(
+    r"^" + _JV + r"(?:(?:let's |let us )?(?:review|practice|practise|go through|"
+    r"run through|drill|study) (?:my |the |some |today's )?(?:flash ?cards|cards|"
+    r"due cards|deck|flashcard deck)|(?:start |begin )?(?:a |the |my )?"
+    r"(?:flash ?card review|flash ?cards|review session|card review))"
+    r"(?:\s+(?:please|now|again))?[.!?\s]*$", re.I)
+_QUIZ_STOP_RX = re.compile(
+    r"^" + _JV + r"(?:(?:stop|end|quit|finish|pause|cancel|enough(?: of| with)?|"
+    r"that's enough(?: of)?) (?:the |this |my )?(?:quiz|quizzing|flash ?cards|"
+    r"review|questions|test|quizzes)(?: me)?|stop quizzing me|no more questions|"
+    r"that's enough questions)[.!?\s]*$", re.I)
+_QUIZ_SKIP_RX = re.compile(
+    r"^(?:skip(?: it| that| this one)?|pass|next(?: one| question)?|"
+    r"i (?:don't|do not) know(?: that one| this one| it)?|no idea|not sure|"
+    r"dunno|i give up|tell me(?: the answer)?|what's the answer|"
+    r"what is the answer)[.!?\s]*$", re.I)
+
+
+def quiz_kind(text: str) -> Optional[str]:
+    m = _QUIZ_RX.match((text or "").strip())
+    return m.group("topic").strip() if m else None
+
+
+def review_kind(text: str) -> bool:
+    return bool(_REVIEW_RX.match((text or "").strip()))
+
+
+def quiz_stop_kind(text: str) -> bool:
+    return bool(_QUIZ_STOP_RX.match((text or "").strip()))
+
+
+def _quiz_store(c):
+    store = c._svc("flashcards")
+    if store is not None:
+        return store
+    if getattr(c, "_flashcards", None) is None:
+        c._flashcards = quiz_mod.FlashcardStore()
+    return c._flashcards
+
+
+def _cards_line(n: int) -> str:
+    return "One card due, sir." if n == 1 else f"{n} cards due, sir."
+
+
+def _h_quiz(c, t, m):
+    topic = m
+    index = c._svc("docs")
+    if index is None:
+        return CommandResult(handled=True, reply=quiz_mod.NO_DOCS_LINE, speak=True,
+                             status="No documents")
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "make_quiz"):
+        return CommandResult(handled=True, reply=quiz_mod.NO_QUESTIONS_LINE.format(topic=topic),
+                             speak=True, status="No model")
+    try:
+        store = _quiz_store(c)
+    except Exception:
+        log.exception("flashcard store unavailable")
+        return CommandResult(handled=True, reply=quiz_mod.NO_QUESTIONS_LINE.format(topic=topic),
+                             speak=True, status="No store")
+    n = _int_setting(c, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS)
+    k = _int_setting(c, "quiz.chunks", quiz_mod.DEFAULT_CHUNKS)
+    c._pending_quiz = None                       # a new quiz replaces the old
+
+    def _work():
+        try:
+            chunks = topic_chunks(index, topic, k=k)
+        except EmbedError as exc:
+            log.warning("quiz: embed failed: %s", exc)
+            _deliver(c, quiz_mod.INDEX_DOWN_LINE)
+            return
+        except Exception:                        # noqa: BLE001 - store boundary
+            log.exception("quiz: index failed")
+            _deliver(c, quiz_mod.INDEX_DOWN_LINE)
+            return
+        if not chunks:
+            if index.document_count() > 0:
+                _deliver(c, quiz_mod.NO_TOPIC_LINE.format(topic=topic))
+            elif index.scan():
+                index.start_background()         # files present, nothing stored yet
+                _deliver(c, INDEXING_LINE)
+            else:
+                _deliver(c, quiz_mod.NO_DOCS_LINE)
+            return
+        try:
+            pairs = brain.make_quiz(quiz_mod.study_text(chunks), n=n, topic=topic)
+        except Exception:
+            log.exception("make_quiz failed")
+            pairs = []
+        if not pairs:
+            _deliver(c, quiz_mod.NO_QUESTIONS_LINE.format(topic=topic))
+            return
+        cards = store.add_cards(pairs, source=chunks[0].get("name", ""), topic=topic)
+        session = quiz_mod.QuizSession(cards, topic=topic)
+        c._pending_quiz = session
+        _deliver(c, session.ask())
+
+    c._bg(_work)
+    return CommandResult(handled=True, reply=quiz_mod.PREPARING_LINE.format(topic=topic),
+                         speak=True, ack=True, done=False, status=f"Quiz: {topic}")
+
+
+def _h_review(c, t, m):
+    try:
+        store = _quiz_store(c)
+    except Exception:
+        log.exception("flashcard store unavailable")
+        return CommandResult(handled=True, reply=quiz_mod.NO_CARDS_LINE, speak=True,
+                             status="No store")
+    n = _int_setting(c, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS)
+    cards = store.due(limit=n)
+    if not cards:
+        line = quiz_mod.NO_CARDS_LINE if store.count() == 0 else quiz_mod.NOTHING_DUE_LINE
+        return CommandResult(handled=True, reply=line, speak=True, status="No cards due")
+    session = quiz_mod.QuizSession(cards, topic="review")
+    c._pending_quiz = session
+    return CommandResult(handled=True, reply=f"{_cards_line(len(cards))} {session.ask()}",
+                         speak=True, status=f"Flashcards 1/{len(cards)}")
+
+
+def _h_quiz_stop(c, t, m):
+    session = getattr(c, "_pending_quiz", None)
+    if session is None:
+        return None                              # no quiz: "stop the test" is the model's
+    c._pending_quiz = None
+    return CommandResult(handled=True, reply=session.score_line(), speak=True,
+                         status="Quiz stopped")
+
+
+def _int_setting(c, key: str, default: int) -> int:
+    try:
+        return max(1, int(_assistant_get(c, key, default) or default))
+    except (TypeError, ValueError):
+        return default
+
+
 REGISTRY: list[Command] = [
     Command("go back",
             _m_exact("go back", "previous window", "last window"),
@@ -1796,6 +2090,11 @@ REGISTRY: list[Command] = [
     Command("read aloud", read_kind, _h_read_aloud, needs=("reader",)),
     Command("continue reading", continue_kind, _h_continue,
             needs=("reader",)),
+    Command("explain document", explain_kind, _h_explain_doc,
+            needs=("reader",)),
+    Command("quiz", quiz_kind, _h_quiz),
+    Command("review flashcards", review_kind, _h_review),
+    Command("stop quiz", quiz_stop_kind, _h_quiz_stop),
     Command("workflow", lambda t: True, _h_workflow, needs=("workflows",)),
     Command("suggest",
             _m_contains("suggest", "what should i do", "any suggestions"),
@@ -1900,7 +2199,8 @@ REGISTRY: list[Command] = [
 # typed "timer for 5 minutes" is instant and never a model round trip.
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
-    if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
+    if cmd.name in ("explain document", "quiz", "review flashcards", "stop quiz",
+                    "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me")
@@ -1996,6 +2296,13 @@ class Commander:
         # Set when the Claude manager refuses an out-of-project task and
         # offers the terminal; the next "yes" opens it (spec 7 / OUTSIDE_LINE).
         self._pending_terminal_slug = ""
+        # Quiz mode: the QuizSession whose open question the next utterance
+        # answers (jarvis.tools.quiz); the flashcard store behind it is
+        # built on first use. The document last explained, for "read it to
+        # me": (Path, epoch seconds).
+        self._pending_quiz = None
+        self._flashcards = None
+        self._last_document = None
         # UI hook for uncertain intent ("Was this for me?"); wired by the
         # main window. Falls back to a warn Status event.
         self.on_uncertain: Optional[Callable[[str], None]] = None
@@ -2044,6 +2351,11 @@ class Commander:
             return res
         # 3. A pending permission question owns yes / no (spec 5.2 b).
         res = self._try_approval(text, source)
+        if res is not None:
+            return res
+        # 3a'. A quiz question is on the table: this is the answer (or
+        #      "skip" / "stop the quiz").
+        res = self._try_quiz_answer(text)
         if res is not None:
             return res
         # 3b. Claude offered the terminal after refusing an outside-dir
@@ -2375,6 +2687,73 @@ class Commander:
             return CommandResult(handled=True, reply=line, speak=True,
                                  status="Add failed")
         return CommandResult(handled=True, reply=line, speak=True, status="Added")
+
+    def _try_quiz_answer(self, text: str) -> Optional[CommandResult]:
+        """While a quiz question is open, the utterance is the answer.
+
+        Stop words end the quiz with the tally; skip words reveal the
+        answer and move on; a fresh "quiz me" / "review my flashcards"
+        drops the session for the new one; "quiet" ends it silently. A
+        question older than ANSWER_WINDOW_S is not what he is answering:
+        the session is dropped and the text routes as a new subject.
+        Grading: the string match first (no model round trip for "forty
+        percent"), the model only for the unclear ones, and a shrug that
+        names the answer when neither can tell."""
+        session = self._pending_quiz
+        if session is None:
+            return None
+        t = (strip_jarvis_prefix(text) or text).strip()
+        tl = t.lower().rstrip(".!?")
+        if session.stale() or session.finished or quiz_kind(tl) or review_kind(tl):
+            self._pending_quiz = None
+            return None
+        if quiet_kind(t) or cancel_kind(t):
+            self._pending_quiz = None
+            _cut_speech(self)
+            return CommandResult(handled=True, reply="Very good, sir.", speak=False,
+                                 status="Quiz stopped")
+        if _QUIZ_STOP_RX.match(t):
+            self._pending_quiz = None
+            return CommandResult(handled=True, reply=session.score_line(), speak=True,
+                                 status="Quiz stopped")
+        card = session.current
+        if _QUIZ_SKIP_RX.match(tl):
+            session.settle(None)
+            line = quiz_mod.SKIP_LINE.format(answer=card["answer"])
+        else:
+            verdict = quiz_mod.grade_by_string(card["answer"], t)
+            note = ""
+            if verdict is None:
+                brain = self._svc("brain")
+                if brain is not None and hasattr(brain, "grade_answer"):
+                    try:
+                        graded = brain.grade_answer(card["question"], card["answer"], t)
+                    except Exception:
+                        log.exception("grade_answer failed")
+                        graded = None
+                    if graded:
+                        verdict, note = bool(graded[0]), str(graded[1] or "")
+            if verdict is None:
+                session.settle(None)
+                line = quiz_mod.UNSURE_LINE.format(answer=card["answer"])
+            else:
+                try:
+                    _quiz_store(self).record(card["id"], verdict)
+                except Exception:
+                    log.exception("flashcard record failed")
+                session.settle(verdict)
+                if verdict:
+                    line = random.choice(quiz_mod.CORRECT_LINES)
+                else:
+                    line = note or quiz_mod.WRONG_LINE.format(answer=card["answer"])
+                    if "answer" not in line.lower() and card["answer"].lower() not in line.lower():
+                        line = quiz_mod.WRONG_LINE.format(answer=card["answer"])
+        if session.finished:
+            self._pending_quiz = None
+            return CommandResult(handled=True, reply=f"{line} {session.score_line()}",
+                                 speak=True, status="Quiz finished")
+        return CommandResult(handled=True, reply=f"{line} {session.ask()}", speak=True,
+                             status=f"Quiz {session.index + 1}/{session.total}")
 
     def _try_terminal_offer(self, text: str) -> Optional[CommandResult]:
         """After OUTSIDE_LINE ("...say the word and I'll open the terminal

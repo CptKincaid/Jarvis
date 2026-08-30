@@ -97,6 +97,9 @@ DEFAULTS: dict = {
              "max_files": 500, "embed_model": "nomic-embed-text",
              "ollama_url": "http://localhost:11434"},
     "screen": {"model": "llama3.2-vision:latest", "max_width": 1280},
+    # Quiz mode over the documents index: questions per round, chunks of
+    # study text handed to the model per round (jarvis/tools/quiz.py).
+    "quiz": {"questions": 5, "chunks": 6},
     "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30},
     "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",

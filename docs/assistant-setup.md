@@ -526,6 +526,33 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
 
+## 18. Explain a document, then have it read (fully local)
+
+*"Explain the biosensors lab handout"* / *"summarize the CS101 syllabus"*. The name is
+matched against the files in `docs.paths` (and cwd, `~`, `~/Jarvis`), so say the title, not
+the file name. He acks ("Let me have a look at the biosensors lab handout, sir."), the local
+model reads the first ~12 000 characters and, twenty seconds or so later, he gives a
+two-sentence lead aloud and puts the fuller paragraph on screen. Say *"read it to me"* and
+he reads the actual text in three-minute parts (*"continue reading"* for the next). PDFs
+come through `pdftotext`, `.docx` through the standard library; *"read file handout.pdf"*
+reads one directly. Nothing leaves the machine. If he says he can't find it, the name
+needs at least most of the words in the file name (`Biosensors_Lab_Handout.pdf` answers to
+"biosensors handout", not "the lab report").
+
+## 19. Quiz mode (flashcards from your documents)
+
+*"Quiz me on chapter three"* / *"test me on the syllabus"*. He pulls the matching chunks
+from the documents index (a file name or a "chapter N" heading first, the embedding search
+after), has the local model write `quiz.questions` (5) short questions, files them as
+flashcards under `~/.aiws_trainer/jarvis_memory/flashcards.db` and asks the first. Answer in
+the follow-up window (no wake word); *"skip"* or *"I don't know"* reveals the answer;
+*"stop the quiz"* gives the tally. Right answers move a card up a Leitner box (due again in
+1, 3, 7 then 14 days); wrong ones come straight back to box one, so *"review my
+flashcards"* the next day asks exactly what you missed. Short answers are graded by
+matching words and numbers; the model only judges the unclear ones, and when neither can
+tell he names the answer and moves on without a mark. `quiz.chunks` (6) is how much study
+text one round reads. Everything runs on the Spark.
+
 ---
 
 ## What Jarvis says when something is missing
