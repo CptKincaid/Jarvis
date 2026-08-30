@@ -991,6 +991,17 @@ class JarvisApp:
         """Acknowledge a slow lookup. Rotates so it does not become a tic."""
         if not self._turn_busy.is_set():
             return          # the answer landed while this timer was firing
+        with self._uncertain_lock:
+            asking = bool(self._pending_uncertain)
+        if asking:
+            # "Was that for me?" leaves the turn open (done=False) waiting on
+            # a yes/no, so this timer kept running and answered the user's
+            # question with "Looking into it now, sir." -- for an utterance
+            # about to be discarded. Worse, _ask_uncertain is recording the
+            # spoken reply by then, and the arbiter is a depth counter rather
+            # than a mutex, so Jarvis talked into his own yes/no window.
+            log.info("thinking line held: waiting on an answer, not on work")
+            return
         try:
             line = THINKING_LINES[self._thinking_i % len(THINKING_LINES)]
             self._thinking_i += 1
@@ -1064,6 +1075,10 @@ class JarvisApp:
             text = self._pending_uncertain.pop(request_id, None)
         if text is None:
             return None
+        # Log the source: a prompt was once answered "no" with no click and no
+        # spoken reply, and nothing recorded who did it.
+        log.info("uncertain %s answered %s by %s", request_id,
+                 "yes" if yes else "no", source)
         bus.publish(UncertainResolved(request_id=request_id, yes=yes,
                                       source=source))
         return self._emit_result(self.commander.resolve_uncertain(text, yes))

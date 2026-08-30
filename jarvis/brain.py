@@ -907,7 +907,8 @@ class JarvisBrain:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def chat(self, text, callback=None, force_tool=None, max_rounds=3):
+    def chat(self, text, callback=None, force_tool=None, force_args=None,
+             max_rounds=3):
         """Tier 2 with tools on a worker thread; callback gets the tags
         ([("BRIEFING", json)] when a card was produced, then ("SPEAK",
         line))."""
@@ -921,6 +922,7 @@ class JarvisBrain:
             bus.publish(BrainState(state="thinking"))
             try:
                 tags = self._chat_sync(text, force_tool=force_tool,
+                                       force_args=force_args,
                                        max_rounds=max_rounds)
                 if self._cancelled:
                     log.info("chat cancelled; dropping result")
@@ -1131,7 +1133,7 @@ class JarvisBrain:
             args = {}
         return name, args
 
-    def _chat_sync(self, text, force_tool=None, max_rounds=3):
+    def _chat_sync(self, text, force_tool=None, force_args=None, max_rounds=3):
         """The tool loop (spec 4.2), synchronous. Returns tags."""
         log.info("chat: %s", text[:60])
         registry = self.registry
@@ -1187,14 +1189,20 @@ class JarvisBrain:
 
         rounds_left = max(1, int(max_rounds or 1))
         if force_tool and registry is not None and registry.has(force_tool):
-            result = registry.call(force_tool, {})
+            # force_args pins arguments the model gets wrong on its own. It
+            # chose unread_only=True for "what was my last email about?"
+            # even with the parameter documented as the thing that answers
+            # exactly that question, so the read mail newer than the answer
+            # it gave was never searched.
+            args = dict(force_args or {})
+            result = registry.call(force_tool, args)
             note(result, force_tool)
             if result.speak:
                 speak = result.speak
             else:
                 messages.append({"role": "assistant", "content": "",
                                  "tool_calls": [{"function": {
-                                     "name": force_tool, "arguments": {}}}]})
+                                     "name": force_tool, "arguments": args}}]})
                 messages.append(tool_message(result, force_tool))
                 rounds_left = 1        # one model turn renders the result
 

@@ -1357,6 +1357,26 @@ def _h_briefing(c, t, m):
     return CommandResult(handled=True, status="Briefing…", done=False)
 
 
+# "What was my last email about?" asks for the most recent message, read or
+# not. get_mail documents unread_only=false as the flag that answers exactly
+# that question, in the parameter description the model is shown -- and the
+# model still chose true, so the answer skipped every read message and named
+# an older one as the latest. Pin it here rather than ask again more loudly.
+_LAST_MAIL_RX = re.compile(
+    r"\b(?:last|latest|most recent|newest)\s+(?:e-?mails?|messages?)\b", re.I)
+_LAST_MAIL_HOURS = 168        # a week: "my last email" is not "since midnight"
+
+
+def _h_last_mail(c, t, m):
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "chat"):
+        return None
+    brain.chat(t, force_tool="get_mail",
+               force_args={"limit": 1, "since_hours": _LAST_MAIL_HOURS,
+                           "unread_only": False})
+    return CommandResult(handled=True, status="Checking mail…", done=False)
+
+
 def _h_goodnight(c, t, m):                                 # 3233-3238
     return CommandResult(
         handled=True,
@@ -1751,6 +1771,8 @@ REGISTRY: list[Command] = [
     Command("cancel schedule", _CANCEL_SCHED_RX.match, _h_cancel_schedule,
             needs=("timekeeper",)),
     Command("briefing", _BRIEFING_RX.match, _h_briefing, needs=("brain",)),
+    Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
+            needs=("brain",)),
     # After the briefing: "good morning" is a briefing trigger first.
     Command("greeting", greeting_kind, _h_greeting),
     Command("good night",
