@@ -705,7 +705,17 @@ class SpotifyTool:
     def _api_market(self, method: str, *args, **kwargs):
         """``_api`` for the calls that carry a market/country: a 400 means
         Spotify rejected the market, so retry once without it and stop
-        sending it for the rest of this session."""
+        sending it for the rest of this session.
+
+        A 403 naming a scope means the same thing for a different reason:
+        ``market=from_token`` resolves the country from the user, so Spotify
+        requires the ``user-read-private`` scope for it. Without that scope
+        every search 403s and the user hears "Spotify isn't answering, sir"
+        -- a network-shaped line for a permissions problem. The scope cannot
+        simply be added to SCOPES: spotipy rejects a cached token whose scopes
+        do not cover the request, so widening them silently unlinks a working
+        account until the user re-authorises. Dropping the market is the fix
+        that costs the user nothing."""
         if self._market_bad:
             kwargs = {k: v for k, v in kwargs.items() if k not in ("market", "country")}
             return self._api(method, *args, **kwargs)
@@ -714,7 +724,9 @@ class SpotifyTool:
         except SpotifyError as exc:
             stripped = {k: v for k, v in kwargs.items()
                         if k not in ("market", "country")}
-            if exc.status != 400 or stripped == kwargs:
+            denied = str(getattr(exc, "text", "") or exc).lower()
+            scope_denied = exc.status == 403 and "scope" in denied
+            if (exc.status != 400 and not scope_denied) or stripped == kwargs:
                 raise
             log.warning("spotify: %s rejected market=%r; retrying without it",
                         method, kwargs.get("market") or kwargs.get("country"))
