@@ -550,6 +550,15 @@ exchange from his short-term memory and answers what you meant. Pairs are kept i
 Whisper vocabulary prompt (`~/.aiws_trainer/voice_vocab.txt`), so the next attempt decodes
 the name. Off by default: Whisper's casing on a misheard name is itself a guess.
 
+## 20. Teaching the intent gate: "that was for you"
+
+If a command was dropped as background chat (nothing happens), say "Jarvis, that was for
+you" within 20 s: he runs it and remembers the words as his. If he answered something you
+said to someone else, "that wasn't for you" / "not you" within a minute stops him and
+remembers that too. Labels go to `~/.aiws_trainer/intent_log.json` (what the classifier
+reads) with an audit line in `~/.aiws_trainer/jarvis_memory/feedback.jsonl`. "That was for
+you" also answers the spoken "Was that for me?" window.
+
 ---
 
 ## What Jarvis says when something is missing

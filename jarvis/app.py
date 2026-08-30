@@ -253,6 +253,7 @@ class JarvisApp:
         # dropped and resolve_uncertain (and the classifier feedback it feeds)
         # is never reached from the running app at all.
         self.commander.on_uncertain = self._on_uncertain
+        self.commander.claim_uncertain = self._claim_uncertain
         self._pending_uncertain: dict = {}      # request_id -> utterance
         self._uncertain_lock = threading.Lock()
         # Set while a captured clip is being transcribed. recorder.recording
@@ -1513,6 +1514,18 @@ class JarvisApp:
             self.uncertain_answer(rid, answer, source="voice")
         except Exception:
             log.exception("uncertain follow-up failed")
+
+    def _claim_uncertain(self, yes: bool) -> bool:
+        """Commander hook: a spoken "that was for you" / "that wasn't for
+        you" settles the open card. The commander logs the label and routes
+        the utterance itself; this only closes the cards and tells the UI.
+        Returns whether one was waiting."""
+        with self._uncertain_lock:
+            stale = list(self._pending_uncertain)
+            self._pending_uncertain.clear()
+        for rid in stale:
+            bus.publish(UncertainResolved(request_id=rid, yes=yes, source="voice"))
+        return bool(stale)
 
     def uncertain_answer(self, request_id: str, yes: bool, source: str = "ui"):
         """Answer the open prompt. First answer wins -- the card and the

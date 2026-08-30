@@ -1943,7 +1943,10 @@ _YES_WORDS = ("yes", "yeah", "yep", "yup", "sure", "correct", "affirmative",
               "aye", "certainly")
 # "for you" / "that was" are deliberately absent: they are substrings of
 # "not for you" and "that wasn't", so they would fight the negatives.
-_YES_PHRASES = ("go ahead", "please do", "do it")
+# "was for you" is safe: "wasn't for you" / "was not for you" do not
+# contain it, and the negatives still win a contradictory reply.
+_YES_PHRASES = ("go ahead", "please do", "do it", "was for you", "meant for you",
+                "asking you")
 _NO_WORDS = ("no", "nope", "nah", "negative", "wasnt", "wasn't")
 _NO_PHRASES = ("never mind", "nevermind", "ignore that", "forget it",
                "not for you", "not you", "talking to")
@@ -2171,6 +2174,45 @@ def new_vocab_words(heard: str, meant: str) -> list:
     return out
 
 
+# ------------------------------------------------------------------
+# Voice feedback: "that was for you" / "that wasn't for you" (2026-08-30)
+# ------------------------------------------------------------------
+# The only learning signal used to be the YES/NO card on UNCERTAIN
+# utterances; a command the classifier dropped as background chat (NO)
+# was silent and unrecoverable, and a confident misroute was never
+# recorded. These phrases label the LAST turn in the classifier's own log
+# (IntentClassifier.log_feedback -- the log classify() actually reads) and
+# re-run a dropped command. Matched ahead of the classifier: three-word
+# feedback would itself be classified NO and dropped.
+FEEDBACK_YES_WINDOW_S = 20.0    # after a dropped command: no reply marks the time
+FEEDBACK_NO_WINDOW_S = 60.0     # after a reply he did not ask for
+_FB_TAIL = r"(?:[,]?\s*(?:jarvis|sir|please|thanks))*[.!\s]*$"
+_FEEDBACK_YES_RX = re.compile(
+    r"^(?:(?:yes|yeah|jarvis)[,.!]?\s+)*"
+    r"(?:that (?:was|is|one was) (?:for|to|meant for|aimed at|directed at) you|"
+    r"i (?:was|am) (?:talking|speaking) to you|i (?:was|am) asking you|"
+    r"that was (?:a|an) (?:command|question|request)(?: for you)?|"
+    r"i meant you|that was you|it was for you)" + _FB_TAIL, re.I)
+_FEEDBACK_NO_RX = re.compile(
+    r"^(?:(?:no|nope|jarvis)[,.!]?\s+)*"
+    r"(?:that (?:wasn't|was not|isn't|is not|one wasn't) (?:for|to|meant for|"
+    r"aimed at|directed at) you|i (?:wasn't|was not) (?:talking|speaking) to you|"
+    r"(?:i was )?(?:talking|speaking) to (?:someone|somebody) else|"
+    r"not (?:for )?you|that wasn't you|i wasn't asking you|"
+    r"that (?:wasn't|was not) (?:a|an) (?:command|question|request))" + _FB_TAIL,
+    re.I)
+
+
+def feedback_kind(text: str) -> Optional[bool]:
+    """True = "that was for you", False = "that wasn't for you", else None."""
+    t = (text or "").strip()
+    if _FEEDBACK_NO_RX.match(t):
+        return False
+    if _FEEDBACK_YES_RX.match(t):
+        return True
+    return None
+
+
 @dataclass
 class LastTurn:
     text: str
@@ -2193,6 +2235,7 @@ class Commander:
     # Class-level defaults for the per-turn state __init__ sets: a test
     # (tests/test_custom_phrases.py) builds a Commander with __new__ and
     # fills in only what it needs.
+    claim_uncertain: Optional[Callable[[bool], bool]] = None
     _last_turn: Optional[LastTurn] = None
 
     def __init__(self, services):
@@ -2206,6 +2249,9 @@ class Commander:
         # UI hook for uncertain intent ("Was this for me?"); wired by the
         # main window. Falls back to a warn Status event.
         self.on_uncertain: Optional[Callable[[str], None]] = None
+        # App hook: a spoken "that was for you" answers the open card too
+        # (claim_uncertain(yes) -> bool, whether a card was waiting).
+        self.claim_uncertain: Optional[Callable[[bool], bool]] = None
         # The last utterance handled, for "no, I said ..." and "that was
         # for you"; the app's _last_user_text is not visible from here.
         self._last_turn: Optional[LastTurn] = None
@@ -2288,6 +2334,13 @@ class Commander:
 
         cmd_text = strip_jarvis_prefix(text)
 
+        # 3e. "That was for you" / "that wasn't for you": label the last
+        #     turn for the classifier and re-run a dropped command. Before
+        #     the classifier, which would drop the feedback itself.
+        res = self._try_feedback(text, cmd_text, source)
+        if res is not None:
+            return res
+
         # 3a. User-defined phrases from assistant.json, ahead of the built-ins
         #     so a personal shortcut can shadow one -- and checked on the RAW
         #     text as well as the addressed form. The hotword consumes the wake
@@ -2338,6 +2391,7 @@ class Commander:
     def resolve_uncertain(self, text: str, yes: bool) -> CommandResult:
         """UI feedback for the 'Was this for me?' prompt."""
         self.intent.log_feedback(text, yes)
+        self._feedback_line(text, "Was that for me?", yes, "card")
         if yes:
             res = self._route_text(text)
             self._last_turn = LastTurn(text, res.status or "", time.monotonic())
@@ -2410,6 +2464,74 @@ class Commander:
             log.info("vocab learned: %s", add)
         except Exception:
             log.exception("vocab learn failed")
+
+    FEEDBACK_LOG = PATHS.MEMORY_DIR / "feedback.jsonl"
+
+    def _feedback_line(self, prev_text: str, prev_status: str, label: bool, how: str):
+        """One JSON line per label: the audit trail the classifier's own
+        log (text + label only) cannot carry."""
+        try:
+            self.FEEDBACK_LOG.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.FEEDBACK_LOG, "a") as fh:
+                fh.write(json.dumps({
+                    "ts": datetime.now().isoformat(timespec="seconds"),
+                    "text": prev_text[:200], "prev_status": prev_status[:60],
+                    "label": "yes" if label else "no", "how": how}) + "\n")
+        except Exception:
+            log.exception("feedback log write failed")
+
+    def _try_feedback(self, text: str, cmd_text: Optional[str],
+                      source: str) -> Optional[CommandResult]:
+        said = cmd_text if cmd_text is not None else text
+        label = feedback_kind(said)
+        if label is None:
+            return None
+        prev = self._last_turn
+        if prev is None:
+            return CommandResult(handled=True, reply="I have nothing recent to go on, sir.",
+                                 speak=True, status="Feedback: no last turn")
+        status = prev.status or ""
+        dropped = status.startswith("Ignored")
+        asked = status.startswith("Was that for me")
+        window = FEEDBACK_YES_WINDOW_S if (dropped or asked) else FEEDBACK_NO_WINDOW_S
+        if time.monotonic() - prev.ts > window:
+            return CommandResult(handled=True,
+                                 reply="I'm not sure which one you mean, sir.",
+                                 speak=True, status="Feedback: stale")
+        if asked:
+            # The card is still up: settle it the same way a click would.
+            claim = self.claim_uncertain
+            if claim is not None:
+                try:
+                    claim(label)
+                except Exception:
+                    log.exception("claim_uncertain failed")
+            res = self.resolve_uncertain(prev.text, label)
+            if label:
+                res.corrected = prev.text
+            elif not res.reply:
+                res.reply, res.speak = "Very good, sir.", True
+            return res
+        self.intent.log_feedback(prev.text, label)
+        self._feedback_line(prev.text, status, label, "spoken")
+        if label and dropped:
+            log.info("feedback: re-running dropped %r", prev.text)
+            res = self._handle_inner(prev.text, source, gate=False)
+            res.corrected = prev.text
+            return res
+        if not label and not dropped:
+            # He did not ask: stop talking and forget the exchange.
+            _cut_speech(self)
+            conv = self._svc("conversation")
+            if conv is not None:
+                try:
+                    conv.forget_exchange(prev.text)
+                except Exception:
+                    log.exception("forget_exchange failed")
+            return CommandResult(handled=True, reply="My mistake, sir.", speak=True,
+                                 status="Feedback: not for me")
+        return CommandResult(handled=True, reply="Very good, sir.", speak=True,
+                             status="Feedback: noted")
 
     # -- pipeline stages -----------------------------------------------
     def _handle_dictation(self, text: str) -> CommandResult:
