@@ -73,6 +73,7 @@ from jarvis import pronounce
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
+from jarvis.memory import parse_person_statement, parse_since
 from jarvis.tools.calendar import write_event
 from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
 
@@ -952,25 +953,115 @@ def _h_suggest(c, t, m):                                   # 3094-3107
     return CommandResult(handled=True, reply=msg)
 
 
+def _raw_command(c, t):
+    """The utterance with its original casing (Whisper capitalises names;
+    the matchers only ever see the lowercased form), minus any "jarvis"
+    prefix. Falls back to the lowercased text."""
+    raw = (getattr(c, "_raw_text", "") or "").strip()
+    if not raw:
+        return t
+    lower = raw.lower().rstrip(".")
+    for prefix in JARVIS_PREFIXES:
+        if lower.startswith(prefix):
+            return raw[len(prefix):].strip()
+    return raw
+
+
+def _person_line(person) -> str:
+    """'Your advisor is Dr Peyrovi, sir; hp@tamu.edu.'"""
+    who = person.get("name", "")
+    alias = person.get("alias") or person.get("relation") or "contact"
+    line = f"Your {alias} is {who}, sir"
+    if person.get("email"):
+        line += f"; {person['email']}"
+    return line + "."
+
+
+def _h_add_person(c, t, m):
+    """'my advisor is Dr Peyrovi, email hp@tamu.edu' -> the people book.
+    None (fall through) when the sentence is not about a person, so "my
+    favourite colour is blue" still reaches the model."""
+    person = parse_person_statement(_raw_command(c, t))
+    if person is None:
+        return None
+    memory = c._svc("memory")
+    if not hasattr(memory, "add_person"):
+        return None
+    stored = memory.add_person(person["alias"], person["name"],
+                               email=person["email"])
+    if not stored:
+        return None
+    line = (f"Noted, sir: your {stored['alias']} is {stored['name']}"
+            + (f", {stored['email']}" if stored.get("email") else "") + ".")
+    c._speak(line)
+    return CommandResult(handled=True, reply=line)
+
+
+def _h_who_is(c, t, m):
+    """'who's my advisor' from the people book; None when unknown so the
+    model can answer from the facts it was shown."""
+    memory = c._svc("memory")
+    resolve = getattr(memory, "resolve_person", None)
+    if not callable(resolve):
+        return None
+    person = resolve(m.group(1).strip())
+    if not person:
+        return None
+    line = _person_line(person)
+    c._speak(line)
+    return CommandResult(handled=True, reply=line)
+
+
 def _h_remember(c, t, m):                                  # 3109-3118
     note = m.group(1).strip()
     # PERSISTENT store (jarvis.memory) — fixes the monolith's data loss.
     # Key on the note text (monolith reused one "user_note" key, which
-    # silently overwrote every previous note).
-    c._svc("memory").remember(note[:60], note)
+    # silently overwrote every previous note). remember() also writes the
+    # semantic index, so a paraphrase finds it later.
+    memory = c._svc("memory")
+    memory.remember(note[:60], note)
+    # "remember that my advisor is Dr X" is a fact AND a contact (parsed
+    # from the raw casing: the title and the capital are the evidence).
+    rm = re.match(r"^remember (?:that )?(.+)$", _raw_command(c, t), re.I)
+    person = parse_person_statement(rm.group(1) if rm else note)
+    if person is not None and hasattr(memory, "add_person"):
+        memory.add_person(person["alias"], person["name"], email=person["email"])
     c._speak("Noted. I'll remember that.")
     return CommandResult(handled=True, reply=f"Remembered: {note}")
 
 
 def _h_recall(c, t, m):                                    # 3120-3133
-    query = m.group(1).strip()
-    results = c._svc("memory").recall(query)
+    query, since = parse_since(m.group(1).strip())
+    memory = c._svc("memory")
+    results = memory.recall(query, since=since) if since is not None \
+        else memory.recall(query)
     if results:
         text = "\n".join(f"- {r['value']}" for r in results[:3])
         c._speak(f"I recall: {results[0]['value']}")
         return CommandResult(handled=True, reply=f"I recall:\n{text}")
-    return CommandResult(handled=True,
-                         reply="I don't have anything stored about that.")
+    when = " in that time" if since is not None else ""
+    line = f"I don't have anything stored about that{when}, sir."
+    c._speak(line)
+    return CommandResult(handled=True, reply=line)
+
+
+# "recap my day", "what was I doing before lunch", "what did I get done this
+# morning": the journal tool, pinned so the router never sends a recap to
+# Claude or the classifier calls it background chat.
+_RECAP_RX = re.compile(
+    r"^(?:(?:give me a |a )?(?:recap|summary|rundown|review) (?:of )?(?:my |the )?"
+    r"(?:day|morning|afternoon|evening|week|last \w+ hours?)\b|"
+    r"recap (?:my |the )?(?:day|morning|afternoon|evening|week)\b|"
+    r"what (?:was|have|had) i (?:been )?(?:doing|working on|up to|done)\b|"
+    r"what did i (?:do|get done|work on|accomplish)\b)", re.I)
+
+
+def _h_recap(c, t, m):
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "chat"):
+        return None
+    brain.chat(t, force_tool="recap_day", force_args={"when": t})
+    return CommandResult(handled=True, status="Looking back…", done=False)
 
 
 def _h_windows(c, t, m):                                   # 3135-3145
@@ -1800,12 +1891,22 @@ REGISTRY: list[Command] = [
     Command("suggest",
             _m_contains("suggest", "what should i do", "any suggestions"),
             _h_suggest, needs=("memory",)),
+    # People book ahead of the generic "remember": "my advisor is Dr X"
+    # is a contact, not a free-text fact. The handler returns None (falls
+    # through) unless the sentence is plainly about a person.
+    Command("person", _m_re(r"(?:my|our) [a-z][a-z' -]{0,30}? is .+"),
+            _h_add_person, needs=("memory",)),
+    # "remember to buy milk" is a to-do (the notes tool); only "remember
+    # (that) <fact>" lands in long-term memory.
     Command("remember",
-            _m_re(r"remember (?:that )?(.+)"),
+            _m_re(r"remember (?:that )?(?!to\b)(.+)"),
             _h_remember, needs=("memory",)),
     Command("recall",
-            _m_re(r"(?:recall|what did i say about|remember about)\s+(.+)"),
+            _m_re(r"(?:recall|what did i (?:say|tell you) about|remember about)\s+(.+)"),
             _h_recall, needs=("memory",)),
+    Command("who is", _m_re(r"who(?:'s| is) (my .+?)(?:'s)?$"),
+            _h_who_is, needs=("memory",)),
+    Command("recap", _RECAP_RX.match, _h_recap, needs=("brain",)),
     Command("windows",
             _m_exact("what's open", "whats open", "list windows",
                      "show windows", "what windows are open"),
@@ -1903,7 +2004,12 @@ ASSISTANT_TIER1: list[Command] = [
     if cmd.name in ("timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "last mail", "diagnostics", "greeting", "todo done", "todo add",
                     "todo list",
-                    "take note", "show notes", "answer question", "remind me")
+                    "take note", "show notes", "answer question", "remind me",
+                    # long-term memory, the people book and the day recap
+                    # answer without the wake-word prefix too: unprefixed
+                    # "remember that ..." used to reach the router and the
+                    # notes tool instead of the memory it was pitched for
+                    "person", "remember", "recall", "who is", "recap")
 ]
 
 

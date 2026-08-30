@@ -526,6 +526,24 @@ pattern that ended in a hard power-off on 28 August. It never runs `nvidia-smi` 
 - **"Run diagnostics"** — uptime, models, today's turns and median wait, memory, GPU.
 - **Streamed replies** — the first sentence speaks while the rest generates (`stream_replies`).
 
+## 18. Long-term memory that understands you (fully local)
+
+*"Remember that my dentist is Dr Patel"* stores a fact; weeks later *"who's my dentist?"*
+or *"what did I say about the thesis last week?"* finds it however you phrase it. Facts
+live in `~/.aiws_trainer/jarvis_memory/facts.json` as before, and each one is also embedded
+with Ollama's `nomic-embed-text` (the same local model the documents tool uses) into a
+chromadb index beside it (`facts_index/`). Every turn, the model is shown the few facts that
+bear on what you just said — not the last five — so a fact you stored months ago still
+surfaces when it matters, and nothing is shown when nothing is close. *"Recall the thesis"*
+/ *"what did I say about the move yesterday"* answer directly; a time phrase (last week,
+yesterday, in the last three days) limits it to facts stored since then.
+
+Nothing leaves the machine. If chromadb or Ollama is unavailable Jarvis falls back to the
+old substring search and says nothing about it (one line in the log). `memory.semantic:
+false` turns the index off. The embedder is kept loaded (`keep_alive: -1`, ~270 MB) so a
+question after a quiet spell never pays the 7 s cold load; the first start after this
+update indexes your existing facts in the background.
+
 ---
 
 ## What Jarvis says when something is missing

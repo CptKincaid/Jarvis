@@ -1262,15 +1262,31 @@ class JarvisBrain:
     # ------------------------------------------------------------------
     # Tier 2: Ollama /api/chat with tools
     # ------------------------------------------------------------------
-    def _dynamic_context(self):
+    def _dynamic_context(self, text=""):
+        """The per-turn background: context + memory. ``text`` (Hunter's
+        words) lets the memory pick the facts RELEVANT to this utterance;
+        it stays in the user turn, never the static system prompt."""
         ctx_text = ""
         if self._context:
             ctx = self._context.get_context("standard")
             ctx_text = self._context.format_for_prompt(ctx, spoken=True)
         mem_text = ""
         if self._memory:
-            mem_text = self._memory.format_for_context()
+            mem_text = self._memory.format_for_context(text) if text else \
+                self._memory.format_for_context()
         return ctx_text, mem_text
+
+    def _journal_tool(self, name, args, result):
+        """One journal row per tool call (jarvis.context journal); the
+        recap reads it back. Never raises into the tool loop."""
+        journal = getattr(self._context, "journal_tool", None)
+        if journal is None:
+            return
+        try:
+            journal(name, args, ok=bool(getattr(result, "ok", True)),
+                    text=str(getattr(result, "text", "") or ""))
+        except Exception:
+            log.exception("journal_tool failed")
 
     def _query_ollama(self, user_input):
         """Legacy action-list shape for think(): the tool loop's tags."""
@@ -1302,7 +1318,7 @@ class JarvisBrain:
         """
         log.info("chat: %s", text[:60])
         registry = self.registry
-        ctx_text, mem_text = self._dynamic_context()
+        ctx_text, mem_text = self._dynamic_context(text)
         messages = [{"role": "system", "content": static_system()},
                     {"role": "user",
                      "content": build_user_turn(ctx_text, mem_text, text)}]
@@ -1322,7 +1338,7 @@ class JarvisBrain:
         # was slow" when a reply misses the latency bar (spec 4.3).
         server_s = 0.0
 
-        def note(result, name):
+        def note(result, name, args=None):
             nonlocal cap, card
             cap = max(cap, int(getattr(result, "max_sentences", 2) or 2))
             if getattr(result, "card", None):
@@ -1330,6 +1346,7 @@ class JarvisBrain:
             tool_texts.append(result.text or "")
             log.info("tool %s -> ok=%s %s", name, result.ok,
                      (result.text or "")[:80])
+            self._journal_tool(name, args, result)
 
         def tool_message(result, name):
             """The tool result as the MODEL sees it: capped against
@@ -1361,7 +1378,7 @@ class JarvisBrain:
             # it gave was never searched.
             args = dict(force_args or {})
             result = registry.call(force_tool, args)
-            note(result, force_tool)
+            note(result, force_tool, args)
             if result.speak:
                 speak = result.speak
             else:
@@ -1428,7 +1445,7 @@ class JarvisBrain:
                 for call in calls:
                     name, args = self._tool_call_parts(call)
                     result = registry.call(name, args)
-                    note(result, name)
+                    note(result, name, args)
                     messages.append(tool_message(result, name))
                     if result.speak:
                         speak = result.speak

@@ -132,10 +132,16 @@ def _int_cfg(cfg, key: str, default: int) -> int:
 # --------------------------------------------------------------- embed
 def _embed(texts: list[str], model: str = DEFAULT_EMBED_MODEL,
            base_url: str = DEFAULT_OLLAMA_URL,
-           timeout: float = EMBED_TIMEOUT) -> list[list[float]]:
+           timeout: float = EMBED_TIMEOUT,
+           keep_alive=None) -> list[list[float]]:
     """The ONE network seam: POST /api/embed -> one vector per text.
-    Raises EmbedError on any failure (tests replace this function)."""
-    body = json.dumps({"model": model, "input": list(texts)}).encode()
+    Raises EmbedError on any failure (tests replace this function).
+    ``keep_alive`` (jarvis.memory pins it to -1) rides in the payload only
+    when given, so the documents index keeps Ollama's default unload."""
+    payload = {"model": model, "input": list(texts)}
+    if keep_alive is not None:
+        payload["keep_alive"] = keep_alive
+    body = json.dumps(payload).encode()
     req = urllib.request.Request(base_url.rstrip("/") + "/api/embed", data=body,
                                  headers={"Content-Type": "application/json"})
     try:
