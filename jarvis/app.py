@@ -797,6 +797,8 @@ class JarvisApp:
         devices = self.recorder.mic_devices
         return devices.get(CONFIG.mic)
 
+    _WAKE_BEEP_GUARD_S = 0.2   # only when CONFIG.sound plays a chime
+
     def _on_hotword(self, score):
         # Called from the hotword listener thread.
         if self.recorder.recording:
@@ -812,7 +814,18 @@ class JarvisApp:
             return
         if CONFIG.sound:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
-        threading.Timer(0.2, self.recorder.start).start()
+        # The wake word ends and the user starts talking straight away, so
+        # every millisecond before the mic opens is speech thrown away --
+        # measured 216-298 ms, median 259, of which this timer was 200.
+        #
+        # The wait exists so the start chime is not recorded back through the
+        # mic, so it belongs only where a chime actually plays. The thread hop
+        # is NOT optional and stays either way: start() acquires the arbiter,
+        # which pauses the hotword, and this runs ON the hotword listener
+        # thread -- pausing it from inside itself would wedge the listener.
+        # Timer(0) still hands off to a new thread.
+        threading.Timer(self._WAKE_BEEP_GUARD_S if CONFIG.sound else 0.0,
+                        self.recorder.start).start()
 
     # ------------------------------------------------- live transcript
     #
