@@ -142,11 +142,20 @@ def run_offline_checks(load_models: bool = False) -> list[Check]:
 
     from jarvis.config import MACHINE
     devs = input_devices()
+    # ALSA's PCM table is authoritative, exactly as in config.MachineProfile.
+    # While PipeWire holds a USB mic EXCLUSIVELY, PortAudio cannot probe hw:N
+    # and enumerates only the virtual pipewire/default names, which
+    # input_devices() then filters out -- so `devs` is empty with a live mic
+    # plugged in and capture working. Trusting `devs` alone reported
+    # "no microphone detected" on a machine that was hearing its wake word.
+    mic_ok = bool(devs) or MACHINE.has_mic
     checks.append(Check(
-        "microphone", bool(devs),
+        "microphone", mic_ok,
         ", ".join(d["name"] for d in devs) if devs else
-        "no capture devices (pipewire/default are virtual)",
-        fix="" if devs else "Plug in a USB mic, then run --mic.",
+        ("held exclusively by pipewire; ALSA reports a capture PCM"
+         if MACHINE.has_mic else
+         "no capture devices (pipewire/default are virtual)"),
+        fix="" if mic_ok else "Plug in a USB mic, then run --mic.",
         data={"devices": devs, "machine_has_mic": MACHINE.has_mic}))
 
     assets = model_assets()
@@ -251,7 +260,9 @@ def run_mic_session(seconds: float = 4.0) -> list[Check]:
 
     out: list[Check] = []
     devs = input_devices()
-    if not devs or not MACHINE.has_mic:
+    # OR, not AND: either signal alone is sufficient. See the note above --
+    # under PipeWire's exclusive hold devs is empty while capture works.
+    if not (devs or MACHINE.has_mic):
         out.append(Check("microphone", False, "no capture device"))
         return out
     rec = Recorder(MicArbiter())
