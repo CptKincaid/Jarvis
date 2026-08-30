@@ -490,6 +490,30 @@ class Recorder:
             t.join(timeout=1.0)
         self._poll_thread = None
 
+    def snapshot_audio(self) -> "np.ndarray | None":
+        """Current buffer as 16 kHz float32, or None if there is nothing yet.
+
+        Pure and side-effect free, unlike _finalize_audio: no Status events,
+        no logging, no noise gate, no minimum-length rule. It is called
+        repeatedly WHILE the user is still speaking to drive the live
+        transcript, so it must never publish, never raise, and never disturb
+        the session it is sampling.
+        """
+        frames = list(self._audio_frames)      # the callback may still append
+        if not frames:
+            return None
+        try:
+            raw = np.concatenate(frames, axis=0).flatten()
+        except ValueError:
+            return None
+        if raw.size == 0:
+            return None
+        try:
+            return self._resample_to_16k(raw)
+        except Exception:
+            log.debug("partial resample failed", exc_info=True)
+            return None
+
     def _finalize_audio(self) -> np.ndarray | None:
         """Snapshot frames -> 16k float32 (port of monolith 2508-2541)."""
         # Snapshot audio frames (callback thread may still be draining)

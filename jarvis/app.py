@@ -33,7 +33,8 @@ from types import SimpleNamespace
 from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import (AlarmFired, ApprovalRequested, ApprovalResolved,
                            BriefingReady, ClaudeProgress, ClaudeTaskState,
-                           JarvisReply, ModelInfo, RecordingStopped,
+                           JarvisReply, ModelInfo, PartialText,
+                           RecordingStarted, RecordingStopped,
                            ReminderFired, Status, Transcribed,
                            UncertainResolved, UncertainUtterance,
                            UserUtterance, bus)
@@ -51,7 +52,8 @@ from jarvis.hotword import Hotword
 from jarvis.jarvis_agent import JarvisAgent
 from jarvis.memory import JarvisMemory
 from jarvis.reader import CONTINUE_PROMPT, ReadAloud
-from jarvis.recorder import MicArbiter, Recorder, play_beep
+from jarvis.recorder import (SAMPLE_RATE, MicArbiter, Recorder,
+                             play_beep)
 from jarvis.speaker import SpeakerVerifier
 from jarvis.tools.registry import ToolRegistry
 from jarvis.transcriber import Transcriber
@@ -231,6 +233,7 @@ class JarvisApp:
         self._turn_watchdog = None
 
         bus.subscribe(RecordingStopped, self._on_recording_stopped)
+        bus.subscribe(RecordingStarted, self._on_recording_started)
         bus.subscribe(ClaudeProgress, self._on_claude_progress)
         bus.subscribe(ClaudeTaskState, self._on_claude_state)
         bus.subscribe(ApprovalRequested, self._on_approval_requested)
@@ -811,6 +814,54 @@ class JarvisApp:
         if CONFIG.sound:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
         threading.Timer(0.2, self.recorder.start).start()
+
+    # ------------------------------------------------- live transcript
+    #
+    # PartialText, Transcriber.partial() and the UI's ghost card all shipped
+    # with V3; nothing ever connected them, so words only appeared once the
+    # user stopped talking. partial()'s own docstring said the live typing
+    # "stays in the pipeline" -- this is that missing piece.
+
+    _PARTIAL_INTERVAL_S = 0.9    # re-decode cadence while speaking
+    _PARTIAL_MIN_S = 0.7         # below this whisper mostly invents words
+
+    def _on_recording_started(self, _ev):
+        threading.Thread(target=self._partial_loop, name="partial",
+                         daemon=True).start()
+
+    def _partial_loop(self):
+        """Re-decode the growing buffer and publish PartialText.
+
+        Deliberately a separate thread: Recorder._poll_loop runs at ~12 Hz
+        and owns silence detection, so a decode taking hundreds of ms there
+        would delay auto-stop. Everything here is best-effort -- a preview
+        must never delay, disturb or fail the real transcription that
+        follows. Transcriber.partial() and transcribe() share one lock, so
+        the final decode simply waits for at most one preview.
+        """
+        last = ""
+        try:
+            while self.recorder.recording:
+                started = time.monotonic()
+                audio = self.recorder.snapshot_audio()
+                if audio is not None and len(audio) >= int(
+                        SAMPLE_RATE * self._PARTIAL_MIN_S):
+                    try:
+                        text = (self.transcriber.partial(audio) or "").strip()
+                    except Exception:
+                        log.debug("partial decode failed", exc_info=True)
+                        text = ""
+                    # only publish on change: the ghost card redraws on
+                    # every event, and whisper often returns the same text.
+                    if text and text != last and self.recorder.recording:
+                        last = text
+                        bus.publish(PartialText(text=text))
+                # pace from the END of the decode, so a slow pass backs off
+                # instead of queueing up behind itself.
+                time.sleep(max(0.05, self._PARTIAL_INTERVAL_S -
+                               (time.monotonic() - started)))
+        except Exception:
+            log.exception("partial loop died")
 
     def _on_recording_stopped(self, ev):
         if ev.reason == "abort":
