@@ -94,7 +94,12 @@ THINKING_LINES = [
 # 3.5 not 2.0: local replies measured 2.0-2.3 s, so firing at 2.0 guaranteed
 # the filler spoke every time -- and the real answer then queued BEHIND it,
 # adding ~2.9 s (2026-08-28 12:54). Only genuinely slow lookups should talk.
-THINKING_DELAY_S = 3.5
+#
+# 4.5 not 3.5 (2026-08-29): the same collision was still audible, just rarer --
+# tool-backed lookups land right around 3.5 s, so the filler started and the
+# answer immediately queued behind it. The extra second moves the filler clear
+# of the common case, leaving it for lookups that are genuinely slow.
+THINKING_DELAY_S = 4.5
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
 _YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "aye", "allow",

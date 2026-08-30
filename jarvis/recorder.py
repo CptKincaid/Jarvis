@@ -198,7 +198,16 @@ class Recorder:
 
     _POLL_S = 0.083            # AudioLevel ~12Hz
     _SILENCE_POLL_S = 0.3      # monolith 4344: root.after(300, ...)
-    _SPEAKER_POLL_S = 3.0      # monolith 4390: root.after(3000, ...)
+    # Was 3.0, a literal port of the monolith's root.after(3000, ...) Tk
+    # chain rather than a cost decision: an ECAPA verify measures ~5 ms, so
+    # 1 Hz is under 1% duty. At 3 s the voice-ID stop could not win. Measured
+    # on a real capture with music playing: first check at 3 s, misses at 6 s
+    # and 9 s, so the 2.5 s timer could not even START before 9 s, and the
+    # energy detector -- which music defeats -- ran the recording to 11.9 s.
+    _SPEAKER_POLL_S = 1.0
+    _SPEAKER_WARMUP_S = 1.5    # ECAPA needs ~1 s of audio to say anything
+    _SPEAKER_WINDOW_S = 2.0    # the trailing audio judged; also the lag before
+                               # a stopped speaker can register as gone
 
     def __init__(self, arbiter: MicArbiter, speaker_verifier=None):
         self._arbiter = arbiter
@@ -634,19 +643,26 @@ class Recorder:
             return
 
         now = time.monotonic()
-        # Don't check for the first 3 seconds of recording
-        if self._record_start_time and (now - self._record_start_time) < 3.0:
+        if (self._record_start_time
+                and (now - self._record_start_time) < self._SPEAKER_WARMUP_S):
             return
 
-        # Grab the last 3 seconds of audio
         rate = self._record_rate
-        samples_needed = int(rate * 3.0)
+        samples_needed = int(rate * self._SPEAKER_WINDOW_S)
         frames = list(self._audio_frames)
         if not frames:
             return
 
-        recent = np.concatenate(frames[-max(1, samples_needed // int(rate * 0.1)):],
-                                axis=0).flatten()
+        # Walk back until the window is filled rather than assuming a frame
+        # size: blocksize is 0.1 s today, but the window is now a constant and
+        # this must not silently judge the wrong span if either ever changes.
+        tail, got = [], 0
+        for chunk in reversed(frames):
+            tail.append(chunk)
+            got += len(chunk)
+            if got >= samples_needed:
+                break
+        recent = np.concatenate(list(reversed(tail)), axis=0).flatten()[-samples_needed:]
         # Resample to 16kHz for speaker check
         audio_16k = self._resample_to_16k(recent)
 
