@@ -78,9 +78,11 @@ def test_native_rate_audio_is_resampled_and_remainders_carry_over():
     # 44.1 kHz frames of 0.1 s, as the recorder captures them
     for _ in range(10):
         e.feed(np.zeros(4410, dtype=np.float32), 44100)
-    # 1.0 s at 16 kHz is 16000 samples = 31 chunks + 128 left over
-    assert vad.i == 31 and e._pending.size == 128
-    assert abs(e.audio_seconds - 31 * CHUNK / SAMPLE_RATE) < 1e-9
+    # 1.0 s at 16 kHz is 16000 samples, less the resampler's 10 ms hold-back
+    held = e._resample._hold * 160 // 441
+    emitted = 16000 - held
+    assert vad.i == emitted // CHUNK and e._pending.size == emitted % CHUNK
+    assert abs(e.audio_seconds - vad.i * CHUNK / SAMPLE_RATE) < 1e-9
 
 
 def test_reset_clears_state_and_the_model():
@@ -235,3 +237,33 @@ def test_warm_is_safe_from_several_threads():
     [t.start() for t in ts]
     [t.join() for t in ts]
     assert e._failed
+
+
+def test_resampling_is_continuous_across_frames():
+    """Frame-by-frame resample_poly leaves a discontinuity at every frame
+    edge -- a 10 Hz click train under the signal, which is noise to a VAD
+    deciding at 0.35/0.5. With the carry, chunked output matches one long
+    resample everywhere but the very ends."""
+    from scipy.signal import resample_poly
+    rate = 44100
+    t = np.arange(int(rate * 1.0)) / rate
+    x = (0.5 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+    whole = resample_poly(x, 160, 441).astype(np.float32)
+    r = ep_mod._resampler(rate)
+    parts = [r(x[i:i + 4410]) for i in range(0, len(x), 4410)]
+    chunked = np.concatenate(parts)
+    n = min(len(whole), len(chunked)) - 200
+    err = float(np.max(np.abs(whole[100:n] - chunked[100:n])))
+    naive = np.concatenate([resample_poly(x[i:i + 4410], 160, 441) for i in range(0, len(x), 4410)]).astype(np.float32)
+    naive_err = float(np.max(np.abs(whole[100:n] - naive[100:n])))
+    assert err < 1e-3, f"carry resampler drifts from a whole resample by {err}"
+    assert naive_err > 10 * err, "the frame-by-frame path was not actually worse"
+
+
+def test_describe_reports_the_vads_view():
+    vad = ScriptedVAD([0.9] * 20 + [0.2] * 10)
+    e = VoiceEndpointer(model=vad)
+    e.feed(_chunks(30), SAMPLE_RATE)
+    d = e.describe()
+    assert "started=True" in d and "last_p=0.20" in d and "max_p=0.90" in d
+    assert "gap=0.32s" in d

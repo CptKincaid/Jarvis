@@ -160,3 +160,19 @@ def test_emit_failure_never_propagates(monkeypatch):
     led.mark("mic")
     led.mark("audio")  # must not raise
     assert not led.open
+
+
+def test_events_carry_their_own_clock():
+    """The bus queues events for the Tk thread when the UI is attached, so a
+    subscriber's clock reads drain time -- one live turn showed wake->mic
+    0 ms because both events drained in one tick. The five turn events stamp
+    themselves at publish time and the ledger reads that."""
+    import time
+    from jarvis.events import (HotwordDetected, RecordingStarted, RecordingStopped,
+                               SpeakingState, Transcribed)
+    before = time.monotonic()
+    evs = [HotwordDetected(score=0.9), RecordingStarted(), RecordingStopped(),
+           Transcribed(text="x"), SpeakingState(active=True)]
+    after = time.monotonic()
+    for ev in evs:
+        assert before <= ev.t <= after, type(ev).__name__

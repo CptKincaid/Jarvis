@@ -26,6 +26,7 @@ import io
 import math
 import struct
 import subprocess
+import os
 import threading
 import time
 import wave
@@ -469,6 +470,8 @@ class Recorder:
         finally:
             self._release_session()
         self.last_audio = audio
+        if audio is not None and os.environ.get("JARVIS_DEBUG_AUDIO") == "1":
+            self._dump_capture(audio)
         bus.publish(RecordingStopped(reason=reason,
                                      endpoint=self._stop_endpoint or reason,
                                      dead_air_s=self._stop_dead_air))
@@ -499,6 +502,19 @@ class Recorder:
         self.last_audio = None
         bus.publish(RecordingStopped(reason="abort"))
         log.info("Recording aborted")
+
+    def _dump_capture(self, audio_16k):
+        """JARVIS_DEBUG_AUDIO=1: keep the last capture as a wav, tagged with
+        what ended it, so an endpointing miss can be replayed offline through
+        the VAD instead of guessed at. Off by default: it records the room."""
+        try:
+            import soundfile as sf
+            from jarvis.config import PATHS
+            out = PATHS.LOG_DIR / f"capture_last_{self._stop_endpoint or 'manual'}.wav"
+            sf.write(out, audio_16k, SAMPLE_RATE)
+            log.info("capture dump: %s", out)
+        except Exception:
+            log.debug("capture dump failed", exc_info=True)
 
     def _release_session(self):
         ctx, self._session_ctx = self._session_ctx, None
@@ -674,6 +690,12 @@ class Recorder:
                 and (time.monotonic() - self._silence_start) >= timeout
                 and len(self._audio_frames) > min_frames):
             log.info("Auto-stop on silence (%ss timeout)", timeout)
+            if self.endpointer is not None and CONFIG.endpoint_vad:
+                # The VAD was live and the energy timer still won: say why.
+                try:
+                    log.info("energy beat the %s", self.endpointer.describe())
+                except Exception:
+                    log.debug("vad describe failed", exc_info=True)
             self._voice_stopped = True
             self._stop_endpoint = "energy"
             self._stop_dead_air = time.monotonic() - self._silence_start

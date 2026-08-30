@@ -243,8 +243,8 @@ class JarvisApp:
         # seconds went (jarvis/turnclock.py). Subscribed before the workers so
         # its marks are taken as close to the event as the bus allows.
         self.turns = TurnLedger(jsonl_path=PATHS.LOG_DIR / "turns.jsonl")
-        bus.subscribe(HotwordDetected, lambda ev: self.turns.mark("wake"))
-        bus.subscribe(RecordingStarted, lambda ev: self.turns.mark("mic"))
+        bus.subscribe(HotwordDetected, lambda ev: self.turns.mark("wake", at=ev.t))
+        bus.subscribe(RecordingStarted, lambda ev: self.turns.mark("mic", at=ev.t))
         bus.subscribe(RecordingStopped, self._turn_on_stop)
         bus.subscribe(Transcribed, self._turn_on_transcribed)
         bus.subscribe(SpeakingState, self._turn_on_speaking)
@@ -908,11 +908,11 @@ class JarvisApp:
             self.turns.abandon("abort")
             return
         if ev.dead_air_s is not None:
-            self.turns.mark("speech_end", at=time.monotonic() - ev.dead_air_s)
-        self.turns.mark("stop", stop=ev.endpoint or ev.reason)
+            self.turns.mark("speech_end", at=ev.t - ev.dead_air_s)
+        self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason)
 
     def _turn_on_transcribed(self, ev):
-        self.turns.mark("stt")
+        self.turns.mark("stt", at=ev.t)
         if not ev.accepted:
             self.turns.abandon(f"rejected:{ev.reject_reason or 'confidence'}")
         elif not (ev.text or "").strip():
@@ -920,7 +920,7 @@ class JarvisApp:
 
     def _turn_on_speaking(self, ev):
         if ev.active:
-            self.turns.mark("audio")
+            self.turns.mark("audio", at=ev.t)
 
     def _on_recording_stopped(self, ev):
         if ev.reason == "abort":

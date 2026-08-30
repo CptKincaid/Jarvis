@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import queue
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -32,7 +33,9 @@ class AudioLevel(Event):
 
 @dataclass
 class RecordingStarted(Event):
-    pass
+    # Publisher-side clock: the bus queues events for the Tk thread when
+    # the UI is attached, so a subscriber's own clock reads drain time.
+    t: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -40,6 +43,9 @@ class RecordingStopped(Event):
     reason: str = "manual"            # manual | silence | cap | abort
     endpoint: str = ""                # which detector ended it: vad | energy | voice_id | manual | cap
     dead_air_s: float | None = None   # silence waited through before stopping (turn ledger)
+    # Publisher-side clock: the bus queues events for the Tk thread when
+    # the UI is attached, so a subscriber's own clock reads drain time.
+    t: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -54,11 +60,17 @@ class Transcribed(Event):
     speaker_score: float = 1.0
     accepted: bool = True
     reject_reason: str = ""           # "" | speaker | confidence
+    # Publisher-side clock: the bus queues events for the Tk thread when
+    # the UI is attached, so a subscriber's own clock reads drain time.
+    t: float = field(default_factory=time.monotonic)
 
 
 @dataclass
 class HotwordDetected(Event):
     score: float = 0.0
+    # Publisher-side clock: the bus queues events for the Tk thread when
+    # the UI is attached, so a subscriber's own clock reads drain time.
+    t: float = field(default_factory=time.monotonic)
 
 
 @dataclass
@@ -94,6 +106,9 @@ class BrainState(Event):
 class SpeakingState(Event):
     active: bool = False
     amplitude: float = 0.0            # 0..1, streamed ~12Hz while active
+    # Publisher-side clock: the bus queues events for the Tk thread when
+    # the UI is attached, so a subscriber's own clock reads drain time.
+    t: float = field(default_factory=time.monotonic)
 
 
 @dataclass

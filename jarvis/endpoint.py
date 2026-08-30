@@ -39,14 +39,50 @@ SPEECH_OFF = 0.35               # ...and below which it is not (hysteresis)
 MIN_SPEECH_CHUNKS = 4           # ~130 ms of speech before "speech started"
 
 
+class _Resampler:
+    """native rate -> 16 kHz by polyphase, continuous across calls.
+
+    resample_poly has no filter state, so resampling each 0.1 s frame on its
+    own leaves a discontinuity at every frame edge -- a 10 Hz click train
+    under the signal, noise to a VAD deciding at 0.35/0.5. Both edges of a
+    polyphase output are unreliable for half the filter length, so each call
+    resamples [context + new frame], skips the context's share of the output
+    (emitted last time) and holds back the last HOLD native samples (emitted
+    next time, once they have a right-hand context). The interior is then
+    exactly what one long resample would give; the price is 10 ms of lag.
+    """
+
+    def __init__(self, rate: int):
+        from scipy.signal import resample_poly
+        self._rp = resample_poly
+        g = math.gcd(rate, SAMPLE_RATE)
+        self.up, self.down = SAMPLE_RATE // g, rate // g
+        self.rate = rate
+        # resample_poly's kaiser filter is 10*max(up,down) taps to each side
+        # in the upsampled domain -> that many / up native samples; round up
+        # to a multiple of `down` so the output index stays exact.
+        need = math.ceil(10 * max(self.up, self.down) / self.up)
+        self._hold = ((need + self.down - 1) // self.down) * self.down
+        self._carry = np.zeros(0, dtype=np.float32)
+
+    def __call__(self, x: np.ndarray) -> np.ndarray:
+        if self.rate == SAMPLE_RATE:
+            return x
+        buf = np.concatenate([self._carry, x]) if self._carry.size else x
+        out = self._rp(buf, self.up, self.down).astype(np.float32)
+        lead = max(0, self._carry.size - self._hold)      # native samples already emitted
+        start = lead * self.up // self.down
+        end = max(start, (buf.size - self._hold) * self.up // self.down)
+        keep = min(buf.size, 2 * self._hold)
+        self._carry = buf[-keep:]
+        return out[start:end]
+
+    def reset(self):
+        self._carry = np.zeros(0, dtype=np.float32)
+
+
 def _resampler(rate: int):
-    """44100 -> 16000 by polyphase (exact ratio), cached per rate."""
-    if rate == SAMPLE_RATE:
-        return lambda x: x
-    from scipy.signal import resample_poly
-    g = math.gcd(rate, SAMPLE_RATE)
-    up, down = SAMPLE_RATE // g, rate // g
-    return lambda x: resample_poly(x, up, down).astype(np.float32)
+    return _Resampler(rate)
 
 
 class VoiceEndpointer:
@@ -104,6 +140,10 @@ class VoiceEndpointer:
         self._speech_started = False
         self._last_speech_chunk: Optional[int] = None
         self._in_speech = False
+        self.last_prob = 0.0             # the newest chunk's speech probability
+        self.max_prob = 0.0              # the loudest speech seen this capture
+        if self._resample is not None:
+            self._resample.reset()
         m = self._model
         if m is not None:
             try:
@@ -128,6 +168,9 @@ class VoiceEndpointer:
         self._pending = buf[n * CHUNK:]
 
     def _step(self, p: float) -> None:
+        self.last_prob = p
+        if p > self.max_prob:
+            self.max_prob = p
         # Hysteresis: enter speech above SPEECH_ON, leave below SPEECH_OFF.
         if self._in_speech:
             self._in_speech = p >= SPEECH_OFF
@@ -165,6 +208,15 @@ class VoiceEndpointer:
         if not self._speech_started or self._last_speech_chunk is None:
             return None
         return (self._chunks - self._last_speech_chunk) * CHUNK / SAMPLE_RATE
+
+    def describe(self) -> str:
+        """One line for the log when another detector beats this one."""
+        gap = self.silence_since_speech
+        return ("vad: started=%s last_speech=%s gap=%s last_p=%.2f max_p=%.2f audio=%.1fs"
+                % (self._speech_started,
+                   "%.2fs" % self.last_speech_seconds if self.last_speech_seconds is not None else "-",
+                   "%.2fs" % gap if gap is not None else "-",
+                   self.last_prob, self.max_prob, self.audio_seconds))
 
 
 class _TorchVAD:
