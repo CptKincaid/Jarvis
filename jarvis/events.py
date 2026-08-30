@@ -274,6 +274,16 @@ class AlarmStopped(Event):
 
 
 @dataclass
+class Presence(Event):
+    """The phone came onto / left the Wi-Fi (jarvis/presence.py). Published
+    only on a transition; `returned` is True on away -> home, which is the
+    one the app greets ("Welcome back, sir") and reads the held lines on."""
+    home: bool = True
+    since: float = 0.0                # time.time() of the transition
+    returned: bool = False
+
+
+@dataclass
 class BriefingReady(Event):
     """A briefing was produced: `sections` renders as ONE transcript card
     (the reply card for that turn — no separate JarvisReply card), `spoken`
