@@ -1035,13 +1035,78 @@ def _h_read_aloud(c, t, m):
 
 def _h_continue(c, t, m):
     reader = c._svc("reader")
-    if reader is None or not reader.pending_chunks:
+    if reader is None:
+        return None
+    if not reader.pending_chunks and getattr(reader, "paused", False) is not True:
         return None                     # not a reading session: fall through
     res = reader.continue_reading()
     if res.ok:
         return CommandResult(handled=True, status=res.message)
     return CommandResult(handled=True, reply=res.message, speak=True,
                          status="Reading finished")
+
+
+# ---- Tier 1 read-aloud steering: skip / back / pause / go on -------------
+# "pause", "skip" and "back" are ALSO Spotify transport words (the router's
+# spotify_control tool) and "pause"/"play" are desktop media keys in
+# ACTION_COMMANDS. Ownership is decided by context, not by phrasing: while
+# the reader is active (a part is being spoken, or it is paused) the verbs
+# steer the reading; otherwise they fall through untouched and mean what
+# they always meant. "quiet" ends the reading and hands the words back.
+_READ_CTL_RX = re.compile(
+    r"^" + _JV + r"(?:"
+    r"(?P<skip>skip(?:\s+(?:that|this|it|ahead|forward|on|that bit|this bit|"
+    r"that part|this part))?)"
+    r"|(?P<back>(?:go\s+)?back(?:\s+(?:one|up|a bit|a little))?|"
+    r"(?:say|read)\s+(?:that|the last (?:bit|part|one))\s+again|"
+    r"previous(?:\s+(?:bit|part|one))?|what was that)"
+    r"|(?P<pause>pause(?:\s+(?:that|it|there|reading|the reading))?|"
+    r"hold(?:\s+(?:on|it|there|that thought))?|hang on|wait(?:\s+(?:a (?:sec|second|moment|minute)))?|"
+    r"one (?:sec|second|moment|minute))"
+    r"|(?P<resume>go on|carry on|continue(?:\s+reading)?|resume(?:\s+reading)?|"
+    r"keep going|unpause|where were we|as you were)"
+    r")(?:[,]?\s*jarvis)?[?.!\s]*$", re.I)
+
+
+def read_control_kind(text: str) -> Optional[str]:
+    """'skip' | 'back' | 'pause' | 'resume' | None."""
+    m = _READ_CTL_RX.match((text or "").strip())
+    if not m:
+        return None
+    return next(k for k in ("skip", "back", "pause", "resume") if m.group(k))
+
+
+def _h_read_control(c, t, m):
+    """Steer an active reading. Returns None (fall through) when nothing is
+    being read, so Spotify / the media keys / the brain get the word."""
+    reader = c._svc("reader")
+    # `is True`, not truthiness: the reader must SAY it is active
+    if reader is None or getattr(reader, "active", False) is not True:
+        return None
+    kind = m if isinstance(m, str) else read_control_kind(t)
+    try:
+        if kind == "skip":
+            res = reader.skip()
+        elif kind == "back":
+            res = reader.back()
+        elif kind == "pause":
+            res = reader.pause()
+        else:
+            res = reader.resume()
+            if res is None:             # not paused: "go on" = the next part
+                return _h_continue(c, t, m)
+    except Exception:
+        log.exception("reader %s failed", kind)
+        return CommandResult(handled=True, reply="I couldn't manage that, sir.",
+                             speak=True, status=f"Read {kind} failed")
+    if not res.ok:
+        return CommandResult(handled=True, reply=res.message, speak=True,
+                             status=f"Read {kind}: nothing")
+    # "Paused, sir." is spoken (the silence needs an owner); skip, back and
+    # go on are confirmed by the reading itself carrying on.
+    spoken = kind == "pause"
+    return CommandResult(handled=True, reply=res.message, speak=spoken,
+                         status=res.message if not spoken else "Reading paused")
 
 
 # ------------------------------------------------------------------
@@ -3004,6 +3069,12 @@ REGISTRY: list[Command] = [
     Command("quiz", quiz_kind, _h_quiz),
     Command("review flashcards", review_kind, _h_review),
     Command("stop quiz", quiz_stop_kind, _h_quiz_stop),
+    # Reached only when the reader is idle (handle() gives an active reading
+    # first claim on these words before the desktop chains and "go back");
+    # the handler then falls through, so the entry documents Tier 1
+    # membership without ever shadowing Spotify or the media keys.
+    Command("read control", read_control_kind, _h_read_control,
+            needs=("reader",)),
     Command("workflow", lambda t: True, _h_workflow, needs=("workflows",)),
     Command("suggest",
             _m_contains("suggest", "what should i do", "any suggestions"),
@@ -3167,13 +3238,13 @@ ASSISTANT_TIER1: list[Command] = [
                     "person", "remember", "recall", "who is", "recap",
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free",
-                    "standup", "gpu reclaim", "gpu lend")
-
+                    "standup", "gpu reclaim", "gpu lend",
                     "log triage", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router
                     # would hand Claude the bare words "fix what i copied".
-                    "clip to claude")
+                    "clip to claude",
+                    "read control")
 ]
 
 
@@ -3662,6 +3733,19 @@ class Commander:
         res = self._try_feedback(text, cmd_text, source)
         if res is not None:
             return res
+        # 4b. An active read-aloud owns the transport words, the way a
+        #     ringing alarm owns the next words. This runs BEFORE the
+        #     desktop chains ("go back" = previous window), the media-key
+        #     substitution ("pause" -> __ACTION__media_pause) and the intent
+        #     gate (which calls one-word phrases background chat) -- each of
+        #     which would otherwise eat "skip" / "back" / "pause" / "go on"
+        #     before the reader saw them. When nothing is being read the
+        #     handler returns None and every one of those keeps its meaning.
+        rc = read_control_kind(cmd_text if cmd_text is not None else text)
+        if rc and self._svc("reader") is not None:
+            res = _h_read_control(self, text, rc)
+            if res is not None:
+                return res
 
         # 3a. User-defined phrases from assistant.json, ahead of the built-ins
         #     so a personal shortcut can shadow one -- and checked on the RAW

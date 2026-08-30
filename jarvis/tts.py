@@ -52,7 +52,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
-from typing import Iterable, Optional
+from typing import Iterable, Iterator, Optional
 
 from jarvis import pronounce
 from jarvis.config import CONFIG, PATHS
@@ -166,7 +166,8 @@ def _fish_stream_model(text: str, out_path: str, timeout: float,
     from fish_audio_sdk import Session, TTSRequest
     key, _ = _fish_creds()
     session = Session(key)
-    started = time.monotonic(); first = None
+    started = time.monotonic()
+    first = None
     with open(out_path, "wb") as fh:
         for chunk in session.tts(
                 TTSRequest(text=text, reference_id=model, format="wav",
@@ -179,26 +180,173 @@ def _fish_stream_model(text: str, out_path: str, timeout: float,
     return {"ok": True, "ttfa": first}
 
 
-def _fish_stream(text: str, out_path: str, timeout: float) -> dict:
-    """Render one chunk via the Fish API. The network seam — tests patch this."""
+def _fish_iter(text: str, timeout: float) -> Iterator[bytes]:
+    """Yield the Fish API's audio bytes for ``text`` as they arrive.
+
+    The network seam for play-while-rendering: the pipelined fish path
+    feeds these straight into the player instead of waiting for the whole
+    chunk, so the API's measured 186 ms time-to-first-audio finally reaches
+    the ear rather than being hidden behind a full-chunk render.
+    ``_fish_stream`` (the file seam the tests patch) is a wrapper over it.
+    """
     from fish_audio_sdk import Session, TTSRequest
     key, model = _fish_creds()
     if not key or not model:
         raise RuntimeError("fish credentials missing")
     session = Session(key)
     started = time.monotonic()
+    for chunk in session.tts(
+            TTSRequest(text=text, reference_id=model, format="wav",
+                       latency="balanced"),
+            backend=FISH_BACKEND):
+        yield chunk
+        if time.monotonic() - started > timeout:
+            raise TimeoutError(f"fish exceeded {timeout}s")
+
+
+def _fish_stream(text: str, out_path: str, timeout: float) -> dict:
+    """Render one chunk via the Fish API into a file. Tests patch this."""
+    started = time.monotonic()
     first = None
     with open(out_path, "wb") as fh:
-        for chunk in session.tts(
-                TTSRequest(text=text, reference_id=model, format="wav",
-                           latency="balanced"),
-                backend=FISH_BACKEND):
+        for chunk in _fish_iter(text, timeout):
             if first is None:
                 first = time.monotonic() - started
             fh.write(chunk)
-            if time.monotonic() - started > timeout:
-                raise TimeoutError(f"fish exceeded {timeout}s")
     return {"ok": True, "ttfa": first}
+
+
+# Play a fish chunk while it is still arriving (paplay reads the wav from
+# stdin). Module-level so a test -- or an ear -- can switch the old
+# render-then-play path back on for comparison.
+FISH_STREAM_PLAYBACK = True
+
+# A RIFF/WAVE header alone is 44 bytes; a stream that died with no more than
+# that never reached the speaker and may be re-rendered by the fallback engine.
+_WAV_HEADER_BYTES = 44
+
+
+class _AudioStream:
+    """Audio for ONE chunk, arriving from the network while it plays.
+
+    The producer thread appends bytes (``feed``) and tees them into ``path``
+    so the speech cache still gets a complete file; the worker thread pulls
+    them (``get``) into the player's stdin. Never blocks the producer: the
+    buffer is unbounded (a sentence of wav is a few hundred KB), because a
+    producer blocked on a full pipe while the previous chunk played would
+    trip the fish timeout for no reason.
+    """
+
+    def __init__(self, path: str):
+        self.path = path
+        self.nbytes = 0
+        self.failed = False
+        self.done = threading.Event()
+        self._q: queue.Queue = queue.Queue()
+
+    def feed(self, data: bytes) -> None:
+        if not data:
+            return
+        self.nbytes += len(data)
+        self._q.put(data)
+
+    def close(self, failed: bool = False) -> None:
+        self.failed = failed
+        self.done.set()
+        self._q.put(None)
+
+    def get(self, timeout: float | None = None) -> bytes | None:
+        """Next bytes, ``None`` at end of stream; ``queue.Empty`` on timeout."""
+        return self._q.get(timeout=timeout)
+
+    @property
+    def heard(self) -> bool:
+        """True once audio (not just a header) has been handed to the player."""
+        return self.nbytes > _WAV_HEADER_BYTES
+
+
+class _LiveEnvelope:
+    """RMS envelope of a wav computed from its bytes as they stream past,
+    so the reactor pulses for a chunk that has no complete file yet.
+    Publishes through the same feeder as the file path (``_run_amp_feeder``);
+    ``values()`` yields one amplitude per 80 ms window."""
+
+    def __init__(self):
+        self._head = b""
+        self._pcm = b""
+        self._fmt = None            # (channels, rate, bits) once parsed
+        self._window = 0
+        self._q: queue.Queue = queue.Queue()
+        self._closed = False
+
+    def _parse_header(self) -> bool:
+        head = self._head
+        if len(head) < 12 or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+            return False
+        pos = 12
+        fmt = None
+        while pos + 8 <= len(head):
+            cid = head[pos:pos + 4]
+            size = int.from_bytes(head[pos + 4:pos + 8], "little")
+            if cid == b"fmt " and pos + 8 + 16 <= len(head):
+                body = head[pos + 8:pos + 8 + 16]
+                channels = int.from_bytes(body[2:4], "little")
+                rate = int.from_bytes(body[4:8], "little")
+                bits = int.from_bytes(body[14:16], "little")
+                fmt = (max(1, channels), max(1, rate), bits)
+            elif cid == b"data":
+                if fmt is None:
+                    return False
+                self._fmt = fmt
+                self._pcm = head[pos + 8:]
+                self._head = b""
+                return True
+            pos += 8 + size + (size & 1)
+        return False
+
+    def push(self, data: bytes) -> None:
+        if self._closed or not data:
+            return
+        if self._fmt is None:
+            self._head += data
+            if not self._parse_header():
+                if len(self._head) > 4096:
+                    self._closed = True      # not a wav we understand
+                return
+        else:
+            self._pcm += data
+        channels, rate, bits = self._fmt
+        if bits != 16:
+            return
+        frame = 2 * channels
+        step = int(rate * 0.08) * frame
+        while len(self._pcm) >= step:
+            block, self._pcm = self._pcm[:step], self._pcm[step:]
+            self._q.put(_rms_int16(block, channels))
+
+    def close(self) -> None:
+        self._closed = True
+        self._q.put(None)
+
+    def values(self) -> Iterator[float]:
+        while True:
+            amp = self._q.get()
+            if amp is None:
+                return
+            yield amp
+
+
+def _rms_int16(block: bytes, channels: int) -> float:
+    """Same scaling as the file envelope: soundfile floats in [-1, 1],
+    RMS * 4 capped at 1."""
+    import numpy as np
+    samples = np.frombuffer(block[:len(block) - len(block) % 2], dtype="<i2")
+    if channels > 1:
+        samples = samples[::channels]
+    if not samples.size:
+        return 0.0
+    rms = float(np.sqrt(np.mean((samples.astype(np.float32) / 32768.0) ** 2)))
+    return min(1.0, rms * 4)
 
 
 # ---------------------------------------------------------------- F5-TTS
@@ -326,6 +474,7 @@ class TTS:
         self._engine = engine if engine in _ENGINES else "edge"
         self._stop_flag = False
         self._speaking = False           # burst state (queue non-empty → done)
+        self._burst_announced = False    # SpeakingState(active=True) sent yet?
         self._amp_playing = False
         self._amp_gen = 0                # generation token: one per chunk feeder
         self._current_amp = 0.0
@@ -463,28 +612,50 @@ class TTS:
         except Exception:
             log.exception("voice prime failed (first reply will be slower)")
 
-    def speak(self, text: str, block: bool = False):
+    def speak(self, text: str, block: bool = False
+              ) -> Optional[threading.Event]:
         """Enqueue text for speech; the worker drains FIFO (no silent drops).
 
         Args:
             text: text to speak (cleaned/truncated before synthesis)
             block: if True, wait until this utterance finishes (or is stopped)
+
+        Returns the utterance's done event (set when it has played, been
+        skipped or been dropped) so a caller queuing many lines -- the
+        reader -- can tell which one is being spoken; None when nothing
+        was queued.
         """
         if not text or not text.strip():
-            return
+            return None
         text = self._clean_for_speech(text)
         if not text:
-            return
+            return None
         self.last_text = text
         done = threading.Event()
         self._q.put((text, done))
         if block:
             done.wait()
+        return done
 
     def stop(self):
         """Stop current speech and clear the pending queue."""
         self._stop_flag = True
         self._clear_queue()
+        self._terminate_playback()
+
+    def skip_current(self) -> bool:
+        """Cut the utterance being spoken; everything queued behind it still
+        plays. This is what "skip" means mid read-aloud: one chunk, not the
+        document. ``_stop_flag`` is already per-utterance (``_speak_sync``
+        resets it at the top of each item), so a skip is a stop without the
+        queue clear. False when nothing is being spoken."""
+        if not self._speaking:
+            return False
+        self._stop_flag = True
+        self._terminate_playback()
+        return True
+
+    def _terminate_playback(self):
         proc = self._play_proc
         if proc is not None:
             try:
@@ -643,8 +814,15 @@ class TTS:
             try:
                 if not self._speaking:
                     self._speaking = True
+                    self._burst_announced = False
                     self._acquire_mic()
-                    bus.publish(SpeakingState(active=True, amplitude=0.0))
+                    # SpeakingState(active=True) is NOT published here. It is
+                    # the app's "audio" mark, and the turn ledger's "wait"
+                    # ends on it -- publishing before _speak_sync renders
+                    # anything put the mark 0.4-0.8 s ahead of the first
+                    # sound (live log 2026-08-29: "turn:" landed 13-90 ms
+                    # after "speaking (fish)", before any paplay existed).
+                    # _mark_audio() sends it when playback actually starts.
                 self._speak_sync(text)
             except Exception:
                 log.exception("TTS worker error")
@@ -656,7 +834,21 @@ class TTS:
                     # this finally the worker thread dies, and a stranded
                     # acquire would mute the hotword for the whole session.
                     self._release_mic()
+                    if not self._burst_announced:
+                        # Nothing played (synthesis failed, or stopped before
+                        # playback): subscribers pair the falling edge with a
+                        # rising one, so give them the edge -- late, but the
+                        # turn still closes and the follow-up mic still opens.
+                        self._mark_audio()
                     bus.publish(SpeakingState(active=False, amplitude=0.0))
+
+    def _mark_audio(self):
+        """Publish the burst's SpeakingState(active=True) once, at the moment
+        the first audio is handed to a player -- the honest 'audio' mark."""
+        if self._burst_announced:
+            return
+        self._burst_announced = True
+        bus.publish(SpeakingState(active=True, amplitude=0.0))
 
     def _pronounce(self, text: str) -> str:
         """Apply the pronunciation dictionary (never fails speech)."""
@@ -783,6 +975,41 @@ class TTS:
         chunks = self._split_sentences(text)
         wav_q: queue.Queue = queue.Queue()
         _DONE = object()
+        streaming = engine == "fish" and FISH_STREAM_PLAYBACK
+
+        def _stream_fish(sent: str, tmp_name: str) -> bool:
+            """Play-while-rendering for one fish chunk. Hands an _AudioStream
+            to the consumer BEFORE the first byte arrives and tees the bytes
+            into ``tmp_name`` for the cache. Returns False when the chunk
+            must be rendered by the fallback engine instead (it failed before
+            any audio reached the player); raises nothing."""
+            stream = _AudioStream(tmp_name)
+            wav_q.put(stream)
+            try:
+                with open(tmp_name, "wb") as fh:
+                    for data in _fish_iter(sent, FISH_TIMEOUT_S):
+                        if self._stop_flag:
+                            break
+                        fh.write(data)
+                        stream.feed(data)
+            except Exception as exc:
+                log.exception("fish stream failed: %.60s", sent)
+                if _is_out_of_credit(exc):
+                    self.retire_fish("out of credit")
+                stream.close(failed=True)
+                # Audio already reached the ear: re-rendering the sentence
+                # locally would say the first half twice. Lose the tail of
+                # this one chunk instead; the next chunk goes local.
+                if stream.heard:
+                    log.warning("fish stream cut mid-chunk; not re-speaking")
+                    return True
+                return False
+            if not self._stop_flag:
+                # Store before close(): the consumer unlinks the tee file as
+                # soon as it has played, and close() is what lets it finish.
+                self._store(engine, sent, tmp_name)
+            stream.close()
+            return True
 
         def _producer():
             try:
@@ -796,8 +1023,35 @@ class TTS:
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".wav", delete=False)
                     tmp.close()
+                    if streaming and self._engine == "fish":
+                        if _stream_fish(sent, tmp.name):
+                            continue
+                        # failed before any audio: fall back below, into a
+                        # fresh temp file (the consumer owns the first one)
+                        tmp = tempfile.NamedTemporaryFile(
+                            suffix=".wav", delete=False)
+                        tmp.close()
+                        try:
+                            log.warning("falling back to %s for this chunk",
+                                        FISH_FALLBACK)
+                            if self.load_fallback():
+                                self._synth_f5(sent, tmp.name)
+                                wav_q.put((tmp.name, True))
+                                continue
+                        except Exception:
+                            log.exception("fallback synth failed too")
+                        try:
+                            os.unlink(tmp.name)
+                        except OSError:
+                            pass
+                        continue
                     try:
-                        synth(sent, tmp.name)
+                        if engine == "fish" and self._engine != "fish":
+                            # retired mid-reply: straight to the local
+                            # engine, no doomed API round-trip first
+                            self._synth_f5(sent, tmp.name)
+                        else:
+                            synth(sent, tmp.name)
                     except Exception as exc:
                         log.exception("%s chunk synth failed: %.60s",
                                       engine, sent)
@@ -837,6 +1091,27 @@ class TTS:
                 item = wav_q.get()      # producer always ends with _DONE
                 if item is _DONE:
                     break
+                if isinstance(item, _AudioStream):
+                    try:
+                        if not self._stop_flag:
+                            self._play_stream(item)
+                    finally:
+                        # Played to the end -> the producer has closed the
+                        # stream and _store has copied the tee, so the wait
+                        # is instant. Stopped mid-stream -> do NOT wait on a
+                        # stalled network; unlinking a file the producer
+                        # still holds open is fine, and a stopped chunk is
+                        # never stored anyway.
+                        if not self._stop_flag:
+                            item.done.wait(timeout=FISH_TIMEOUT_S + 5)
+                        try:
+                            os.unlink(item.path)
+                        except FileNotFoundError:
+                            pass
+                        except OSError:
+                            log.exception("temp wav unlink failed: %s",
+                                          item.path)
+                    continue
                 path, owned = item
                 try:
                     if not self._stop_flag:
@@ -962,13 +1237,21 @@ class TTS:
         except Exception:
             log.exception("amplitude envelope extraction failed")
             return
+        self._run_amp_feeder(iter(envelope))
 
+    def _run_amp_feeder(self, source: Iterator[float]):
+        """Stream ``source`` (one value per 80 ms window) as SpeakingState
+        amplitude events. The file path hands over a precomputed list; the
+        fish streaming path hands over a generator fed as bytes arrive."""
+        # The feeder's first tick is a SpeakingState(active=True): make sure
+        # the burst's rising edge is the mark, a few ms before the player.
+        self._mark_audio()
         self._amp_gen += 1
         gen = self._amp_gen              # a newer chunk's feeder supersedes us
         self._amp_playing = True
 
         def _feed_amp():
-            for amp in envelope:
+            for amp in source:
                 if (gen != self._amp_gen or not self._amp_playing
                         or self._stop_flag):
                     break
@@ -998,6 +1281,7 @@ class TTS:
                     ["aplay", "-q", wav_path]]:
             if self._stop_flag:
                 return
+            self._mark_audio()           # the honest "audio" mark: at Popen
             try:
                 proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL)
@@ -1005,22 +1289,117 @@ class TTS:
                 continue
             self._play_proc = proc
             try:
-                deadline = time.monotonic() + 30
-                while proc.poll() is None:
-                    if self._stop_flag or time.monotonic() > deadline:
-                        proc.terminate()
-                        try:
-                            proc.wait(timeout=2)
-                        except subprocess.TimeoutExpired:
-                            proc.kill()
-                            proc.wait(timeout=2)
-                        return
-                    time.sleep(0.05)
+                if not self._wait_player(proc, deadline_s=30):
+                    return
             finally:
                 self._play_proc = None
             if proc.returncode == 0:
                 return
             # non-zero exit → try the next player in the chain
+
+    def _wait_player(self, proc: subprocess.Popen, deadline_s: float) -> bool:
+        """Poll ``proc`` until it exits. False when it was cut short by
+        stop()/skip_current() or the deadline (and has been terminated)."""
+        deadline = time.monotonic() + deadline_s
+        while proc.poll() is None:
+            if self._stop_flag or time.monotonic() > deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+                return False
+            time.sleep(0.05)
+        return True
+
+    def _play_stream(self, stream: _AudioStream):
+        """Play a chunk's audio as it arrives: paplay reads the wav from
+        stdin, so the first bytes sound while the rest is still rendering.
+
+        Waits for the FIRST bytes before spawning anything, so a chunk that
+        failed before producing audio (the fallback engine renders it next)
+        costs no player and no false "audio" mark. Only paplay reads a wav
+        from a pipe reliably; without it, or if it dies at once (no sound
+        server), the complete tee file goes through the usual chain.
+        """
+        first = None
+        while first is None:
+            if self._stop_flag:
+                return
+            try:
+                first = stream.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            if first is None:            # closed with no audio at all
+                return
+        dev = (CONFIG.playback_device or "").strip()
+        cmd = ["paplay", *(["--device", dev] if dev else [])]
+        started = time.monotonic()
+        self._mark_audio()
+        try:
+            proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
+                                    stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except FileNotFoundError:
+            self._play_stream_from_file(stream)
+            return
+        self._play_proc = proc
+        envelope = _LiveEnvelope()
+        self._run_amp_feeder(envelope.values())
+        data: bytes | None = first
+        try:
+            while data is not None:
+                if self._stop_flag:
+                    break
+                try:
+                    proc.stdin.write(data)
+                except (BrokenPipeError, OSError):
+                    break                # the player died or was terminated
+                envelope.push(data)
+                while True:
+                    if self._stop_flag:
+                        data = None
+                        break
+                    try:
+                        data = stream.get(timeout=0.1)
+                        break
+                    except queue.Empty:
+                        continue
+            try:
+                proc.stdin.close()
+            except OSError:
+                pass
+            # Deadline covers the buffered audio still in the sound server
+            # plus a slow stream; the file path allows 30 s per player.
+            cut = not self._wait_player(proc, deadline_s=FISH_TIMEOUT_S + 30)
+        finally:
+            self._play_proc = None
+            envelope.close()
+        if cut or self._stop_flag or proc.returncode == 0:
+            return
+        if time.monotonic() - started < 0.5:
+            # died immediately (no server for paplay, say): nothing was
+            # heard, so the complete file can safely go down the chain
+            log.warning("paplay stdin playback failed (rc=%s); using the "
+                        "file chain", proc.returncode)
+            self._play_stream_from_file(stream)
+
+    def _play_stream_from_file(self, stream: _AudioStream):
+        """Fallback: wait for the tee file to be complete, then play it
+        exactly like a rendered chunk."""
+        if not stream.done.wait(timeout=FISH_TIMEOUT_S + 5):
+            return
+        while True:                      # drain what the pipe path would have
+            try:
+                if stream.get(timeout=0) is None:
+                    break
+            except queue.Empty:
+                break
+        if stream.failed or self._stop_flag:
+            return
+        self._start_amp_feeder(stream.path)
+        self._play(stream.path)
 
     # -------------------------------------------------------- synthesis
     def retire_fish(self, reason: str):

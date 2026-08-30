@@ -20,6 +20,14 @@ pauses mid-sentence. ``resolve_document`` also matches a spoken name
 ("the biosensors lab handout") against the file names in the search
 folders, which include the docs folders, so a PDF never has to be named
 by its exact file name.
+
+Steering (2026-08-30): "skip" cuts the chunk being spoken and the FIFO
+carries on; "back" re-reads the previous chunk; "pause" holds the rest;
+"go on" resumes. The reader owns the cursor -- ``TTS.speak`` hands back
+each chunk's done-event, so the reader knows which chunk is in the air
+without the TTS growing per-item ids -- and keeps its own history of
+spoken chunks for "back". The verbs are only honoured while ``active``
+(reading or paused) so they never collide with the Spotify transport.
 """
 from __future__ import annotations
 
@@ -143,6 +151,13 @@ class ReadAloud:
         self._pending: list[str] = []
         self._label = ""
         self._lock = threading.Lock()
+        # Chunks handed to the TTS for the current part, with the done
+        # event speak() returned (None when the TTS gave none -- counted as
+        # already spoken, since nothing can be steered without a handle).
+        self._queued: list[tuple[str, Optional[threading.Event]]] = []
+        self._prompt_ev: Optional[threading.Event] = None
+        self._spoken: list[str] = []          # history for "back"
+        self._paused = False
         self._search_dirs = search_dirs or [Path.cwd(), Path.home(),
                                             Path.home() / "Jarvis"]
 
@@ -246,16 +261,22 @@ class ReadAloud:
         with self._lock:
             self._label = label
             self._pending = chunks
+            self._queued = []
+            self._prompt_ev = None
+            self._spoken = []
+            self._paused = False
         return self._speak_next_part()
 
     def continue_reading(self) -> ReadResult:
         with self._lock:
+            self._paused = False
             if not self._pending:
                 return ReadResult(False, "That was all of it, sir.")
         return self._speak_next_part()
 
     def _speak_next_part(self) -> ReadResult:
         with self._lock:
+            still = self._fold_queued()
             part: list[str] = []
             used = 0
             while self._pending and (not part or
@@ -265,10 +286,13 @@ class ReadAloud:
                 used += len(chunk)
             remaining = len(self._pending)
             label = self._label or "text"
-        for chunk in part:
-            self._tts.speak(chunk)
+            self._paused = False
+        queued = [(chunk, self._tts.speak(chunk)) for chunk in part]
+        prompt_ev = self._tts.speak(CONTINUE_PROMPT) if remaining else None
+        with self._lock:
+            self._queued = still + queued
+            self._prompt_ev = prompt_ev
         if remaining:
-            self._tts.speak(CONTINUE_PROMPT)
             return ReadResult(True, f"Reading {label}: {len(part)} chunk(s), "
                                     f"{remaining} more pending",
                               chunks=len(part), remaining=remaining)
@@ -278,6 +302,10 @@ class ReadAloud:
     def stop(self) -> None:
         with self._lock:
             self._pending = []
+            self._queued = []
+            self._prompt_ev = None
+            self._spoken = []
+            self._paused = False
         try:
             self._tts.stop()
         except Exception:
@@ -287,3 +315,108 @@ class ReadAloud:
     def pending_chunks(self) -> int:
         with self._lock:
             return len(self._pending)
+
+    # -------------------------------------------------------- steering
+    @staticmethod
+    def _unplayed(ev: Optional[threading.Event]) -> bool:
+        return ev is not None and not ev.is_set()
+
+    def _fold_queued(self) -> list[tuple[str, Optional[threading.Event]]]:
+        """Under the lock: move the chunks the TTS has finished (or dropped)
+        into the spoken history; return the ones still in the air."""
+        still = []
+        for chunk, ev in self._queued:
+            if self._unplayed(ev):
+                still.append((chunk, ev))
+            else:
+                self._spoken.append(chunk)
+        del self._spoken[:-200]
+        self._queued = []
+        return still
+
+    @property
+    def active(self) -> bool:
+        """True while a part is being spoken or the reading is paused --
+        the window in which "skip", "back", "pause" and "go on" belong to
+        the reader rather than to Spotify."""
+        with self._lock:
+            if self._paused:
+                return True
+            if self._unplayed(self._prompt_ev):
+                return True
+            return any(self._unplayed(ev) for _, ev in self._queued)
+
+    @property
+    def paused(self) -> bool:
+        with self._lock:
+            return self._paused
+
+    def skip(self) -> ReadResult:
+        """Cut the chunk being spoken; the rest of the part follows at once
+        (it is already in the TTS FIFO). Paused: drop the next held chunk."""
+        with self._lock:
+            if self._paused:
+                if not self._pending:
+                    return ReadResult(False, "That was all of it, sir.")
+                self._spoken.append(self._pending.pop(0))
+                return ReadResult(True, "Skipped one (paused)",
+                                  remaining=len(self._pending))
+            playing = any(self._unplayed(ev) for _, ev in self._queued)
+        if not playing:
+            return ReadResult(False, "Nothing to skip, sir.")
+        try:
+            self._tts.skip_current()
+        except Exception:
+            log.exception("reader skip failed")
+            return ReadResult(False, "I couldn't skip that, sir.")
+        return ReadResult(True, "Skipped")
+
+    def back(self) -> ReadResult:
+        """Re-read the previous chunk, then carry on from where we were.
+        With nothing spoken yet the current chunk starts over. Paused: move
+        the cursor back one and stay paused."""
+        with self._lock:
+            if self._paused:
+                if not self._spoken:
+                    return ReadResult(False, "We're at the start, sir.")
+                self._pending.insert(0, self._spoken.pop())
+                return ReadResult(True, "Back one (paused)",
+                                  remaining=len(self._pending))
+            still = [chunk for chunk, _ in self._fold_queued()]
+            prev = self._spoken.pop() if self._spoken else None
+            if prev is None and not still:
+                return ReadResult(False, "There's nothing to go back to, sir.")
+            self._pending = ([prev] if prev else []) + still + self._pending
+            self._prompt_ev = None
+        try:
+            self._tts.stop()            # cut the current chunk; the FIFO is re-queued below
+        except Exception:
+            log.exception("reader back failed")
+        return self._speak_next_part()
+
+    def pause(self) -> ReadResult:
+        """Hold the reading: the chunk being spoken is cut and put back at
+        the front (a chunk is ~25 s, so it restarts on "go on"); everything
+        queued behind it is held with the parts still to come."""
+        with self._lock:
+            if self._paused:
+                return ReadResult(False, "Already paused, sir.")
+            still = [chunk for chunk, _ in self._fold_queued()]
+            self._pending = still + self._pending
+            self._prompt_ev = None
+            self._paused = True
+            held = len(self._pending)
+        try:
+            self._tts.stop()
+        except Exception:
+            log.exception("reader pause failed")
+        return ReadResult(True, "Paused, sir.", remaining=held)
+
+    def resume(self) -> ReadResult:
+        """"Go on" after a pause: the held chunks (front of the queue) are
+        spoken next. Not paused -> None, so the caller can give "go on" its
+        usual meaning (the next part)."""
+        with self._lock:
+            if not self._paused:
+                return None
+        return self.continue_reading()

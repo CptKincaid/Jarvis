@@ -898,6 +898,44 @@ follow-up window; "no" or any other subject drops it, and so does a yes a minute
 transcript scoring under `shaky_logprob` is read back even for one item. A single "cancel
 the timer" never is. `read_back: false` turns it off.
 
+## 18. Voice latency: the first-audio mark and streamed Fish playback
+
+Nothing to configure. Two things changed on 2026-08-30 in `jarvis/tts.py`:
+
+- **The `wait` in the turn ledger is now honest.** `SpeakingState(active=True)` — the
+  "audio" mark `turns.jsonl` and "run diagnostics" report against — used to go out
+  before the first chunk was even rendered, so a logged `wait 1.32 s` was really
+  ~1.7–1.9 s to the ear. It now goes out when the player process is spawned. Expect the
+  numbers in `/tmp/vss_voice/turns.jsonl` to read HIGHER after this restart; they are
+  the same turns measured properly. Tune against the new ones.
+- **Fish plays while it renders.** With `tts_engine: fish`, the API's bytes go straight
+  into `paplay`'s stdin as they arrive (and into the speech cache file at the same time),
+  so its ~186 ms time-to-first-audio is finally what you hear. If the connection drops
+  mid-sentence you lose the tail of that one chunk; the next chunk comes from the local
+  F5 fallback as before. To compare by ear, set `jarvis.tts.FISH_STREAM_PLAYBACK = False`
+  (module constant) and restart. F5, XTTS and edge are unchanged (F5's sidecar writes a
+  file per request and cannot stream).
+
+## 19. Steering a read-aloud (skip / back / pause / go on)
+
+Nothing to configure. While he is reading ("read the clipboard", "read file
+~/syllabus.md", …) the transport words belong to the reading:
+
+| say | he does |
+|---|---|
+| "skip" / "skip that" / "skip ahead" | cuts the chunk being spoken; the next one follows at once |
+| "back" / "go back" / "previous" / "say that again" | re-reads the previous chunk, then carries on |
+| "pause" / "hold on" / "hang on" / "wait" | "Paused, sir." — the rest is held |
+| "go on" / "carry on" / "resume" / "keep going" | picks up from the chunk that was cut (it restarts; a chunk is ~25 s) |
+| "quiet" / "stop" | ends the reading, as before |
+
+Say them with or without the wake word — `barge_in` keeps the wake word live while he
+speaks. The words are only his while a part is actually being spoken or the reading is
+paused; between parts (waiting for "continue reading") and at every other time "pause",
+"skip" and "back" mean what they always did — Spotify's transport and, with the prefix,
+the media keys and the previous window. While paused, "skip" and "back" move the cursor
+without speaking, so you can step to the bit you want and then say "go on".
+
 ---
 
 ## 18. Quiet hours and do not disturb
