@@ -43,6 +43,7 @@ from jarvis.events import (
     JarvisReply,
     ModelInfo,
     PartialText,
+    Presence,
     RecordingStarted,
     RecordingStopped,
     ReminderFired,
@@ -196,6 +197,12 @@ class JarvisApp:
             log.exception("brain.configure(%s) failed", self.assistant.local_model)
         self.agent = JarvisAgent()          # retained V1 tools (see spec note)
 
+        # ---- ambient: quiet hours / DND and presence ----------------------
+        # Both read services lazily (calendar, presence) because services is
+        # built further down; both are started in start_assistant.
+        self.presence = self._construct("presence", self._make_presence)
+        self.quiet = self._construct("quiet", self._make_quiet)
+
         # ---- speech -------------------------------------------------------
         # The arbiter is built here, ahead of the mic consumers below, because
         # TTS needs it too: hotword.py's contract lists "TTS talk-back" as a
@@ -203,7 +210,9 @@ class JarvisApp:
         # always-on hotword could hear Jarvis's own voice.
         self.arbiter = MicArbiter()
         self.tts = TTS(gpu=0, engine=CONFIG.tts_engine, arbiter=self.arbiter)
-        speak_queue.set_sink(self._say)
+        # The speak-queue file is the hooks narrator (Claude Code hooks, VSS,
+        # shell): nobody asked for those lines, so quiet hours hold them.
+        speak_queue.set_sink(lambda text: self._say(text, proactive=True, kind="message"))
         speak_queue.start_watcher()
         # "read the clipboard" / "read file x" / "explain the handout": the
         # docs folders join the search path so a PDF dropped in
@@ -290,6 +299,7 @@ class JarvisApp:
         bus.subscribe(AlarmFired, self._on_alarm_fired)
         bus.subscribe(ReminderFired, self._on_reminder_fired)
         bus.subscribe(JarvisReply, self._on_reply_for_discord)
+        bus.subscribe(Presence, self._on_presence)
 
         if CONFIG.target_name:
             self.desktop.restore_target(CONFIG.target_name)
@@ -328,6 +338,27 @@ class JarvisApp:
             return None
         return mod.FocusSession(self.services,
                                 state_path=PATHS.MEMORY_DIR / "focus_session.json")
+
+    def _make_presence(self):
+        mod = _import_optional("jarvis.presence")
+        return None if mod is None else mod.PresenceSentinel(self.assistant)
+
+    def _make_quiet(self):
+        mod = _import_optional("jarvis.quiet")
+        if mod is None:
+            return None
+        presence = self.presence
+        policy = mod.QuietPolicy(
+            self.assistant,
+            get_calendar=lambda: getattr(getattr(self, "services", None), "calendar", None),
+            is_home=(presence.is_home if presence is not None else None),
+            say=self._say)                  # the digest is an answer, never held
+        try:
+            from jarvis.channels import notify
+            notify.set_quiet_gate(policy.is_quiet)
+        except Exception:
+            log.exception("quiet: banner gate not installed")
+        return policy
 
     def _make_notes(self):
         mod = _import_optional("jarvis.tools.notes")
@@ -385,9 +416,25 @@ class JarvisApp:
         log.info("tools registered: %s", self.tools.names())
 
     # ---------------------------------------------------------------- speech
-    def _say(self, text):
-        if text and CONFIG.talkback:
-            self.tts.speak(text)
+    def _say(self, text, proactive=False, kind="message"):
+        """The one door to TTS. ``proactive=True`` marks a line Jarvis
+        decided to say on his own (watchdog, reminder, heads-up, narrator);
+        quiet hours / DND / a running meeting / an empty room hold those
+        for the catch-up digest (jarvis/quiet.py). Answers, alarms and
+        approval questions pass the default False and are never held."""
+        if not text or not CONFIG.talkback:
+            return
+        quiet = getattr(self, "quiet", None)
+        if proactive and quiet is not None:
+            try:
+                if quiet.should_hold():
+                    quiet.hold(text, kind)
+                    bus.publish(Status(text=f"Held ({quiet.reason() or 'quiet'}): "
+                                       f"{text[:60]}", kind="info"))
+                    return
+            except Exception:
+                log.exception("quiet gate failed; speaking")
+        self.tts.speak(text)
 
     def _async_reply(self, text, speak=True):
         """A Tier 1 handler's answer arriving from its worker thread (an
@@ -427,7 +474,7 @@ class JarvisApp:
         phrases = [p for lines in COURTESY_REPLIES.values() for p in lines]
         phrases += list(THINKING_LINES)
         phrases += [SAY_AGAIN_LINE, self._guest_line]
-        phrases += [CONTINUE_PROMPT, "Very good, sir.",
+        phrases += [CONTINUE_PROMPT, "Very good, sir.", "Welcome back, sir.",
                     "I haven't said anything yet, sir.",
                     "The clipboard is empty, sir.",
                     "Nothing is highlighted, sir.",
@@ -602,12 +649,17 @@ class JarvisApp:
             calendar=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
-            # the health watchdog resolves this at fire time (talkback-gated)
-            speak=self._say,
+            # the health watchdog resolves this at fire time (talkback-gated).
+            # Its warnings are proactive: quiet hours hold them for the digest
+            # ("...and a memory warning") instead of waking him at 3 am.
+            speak=lambda text, proactive=True, kind="warning": self._say(
+                text, proactive=proactive, kind=kind),
             # a Tier 1 worker thread's answer (explain, quiz): see _async_reply
             reply=self._async_reply,
             # docs.make_tools parks its DocsIndex here for quiz mode
             docs=None,
+            # quiet hours / DND and the presence sentinel (commander, tools)
+            quiet=self.quiet, presence=self.presence,
         )
 
     # ------------------------------------------------------- brain executor
@@ -783,6 +835,29 @@ class JarvisApp:
         self._alert("done", f"Claude · {ev.project}", spoken)
         self.context.add_exchange("", spoken)
         self._journal_claude(ev.project, "done", text)
+
+    # ---------------------------------------------------------- presence
+    def _on_presence(self, ev):
+        """The phone came back (or left). One greeting per return, then
+        whatever was held while he was out -- the quiet policy's own tick
+        would read it too, so release() drains atomically and whichever
+        gets there first says it."""
+        bus.publish(Status(text="Home" if ev.home else "Away", kind="info"))
+        if not ev.home or not ev.returned:
+            return
+        from jarvis.presence import WELCOME_LINE
+        self._say(WELCOME_LINE)
+        quiet = getattr(self, "quiet", None)
+        if quiet is None:
+            return
+        try:
+            digest = quiet.release()
+        except Exception:
+            log.exception("presence: digest failed")
+            return
+        if digest:
+            bus.publish(JarvisReply(text=digest, speak=True))
+            self._say(digest)
 
     # --------------------------------------------------------- approvals
     def _on_approval(self, req):
@@ -1236,6 +1311,14 @@ class JarvisApp:
         now = now or datetime.now()
         if (now.hour, now.minute) < (hh, mm):
             return False
+        # Quiet hours / a running class: the day stays unmarked, so the first
+        # answered turn after the window delivers it instead.
+        quiet = getattr(self, "quiet", None)
+        try:
+            if quiet is not None and quiet.is_quiet():
+                return False
+        except Exception:
+            log.debug("quiet check failed; briefing proceeds", exc_info=True)
         try:
             state = json.loads(self._briefing_state_path().read_text())
         except (OSError, ValueError):
@@ -1730,6 +1813,13 @@ class JarvisApp:
                 sampler.start()
             except Exception:
                 log.exception("activity sampler failed to start")
+        for name, obj in (("presence", self.presence), ("quiet", self.quiet)):
+            if obj is None:
+                continue
+            try:
+                obj.start()
+            except Exception:
+                log.exception("%s failed to start", name)
         try:
             from jarvis.headsup import MeetingHeadsUp
             lead = int(self.assistant.get("calendar.heads_up_min", 10) or 10)
@@ -1880,7 +1970,9 @@ class JarvisApp:
                           ("activity_sampler", getattr(self.services, "activity_sampler", None)),
                           ("headsup", getattr(self, "headsup", None)),
                           ("deadlines", getattr(self, "deadlines", None)),
-                          ("focus", getattr(self, "focus", None))):
+                          ("focus", getattr(self, "focus", None)),
+                          ("presence", getattr(self, "presence", None)),
+                          ("quiet", getattr(self, "quiet", None))):
             if obj is None:
                 continue
             fn = getattr(obj, "stop", None) or getattr(obj, "close", None)
@@ -1890,6 +1982,13 @@ class JarvisApp:
                 fn()
             except Exception:
                 log.exception("assistant: %s failed to stop", name)
+        try:
+            # The banner gate holds a reference to this policy; a stopped
+            # app (or a test's teardown) must not keep gating banners.
+            from jarvis.channels import notify
+            notify.set_quiet_gate(None)
+        except Exception:
+            log.debug("quiet gate not cleared", exc_info=True)
         for obj in (self.notes, getattr(self.commander, "_flashcards", None)):
             fn = getattr(obj, "close", None)
             if callable(fn):

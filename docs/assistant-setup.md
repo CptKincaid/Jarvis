@@ -751,6 +751,58 @@ text one round reads. Everything runs on the Spark.
 
 ---
 
+## 18. Quiet hours and do not disturb
+
+Jarvis holds his *proactive* lines — memory warnings, reminders and timers, meeting
+heads-ups, anything from the hooks narrator — while you are busy, and reads them back
+afterwards: *"While you were busy, sir: two reminders and one warning. …"* Answers to
+what you ask, alarms and Claude's permission questions are never held.
+
+- *"Do not disturb for an hour"* / *"don't disturb me until seven"* / *"hold my
+  notifications for two hours"* / *"I'm busy for the rest of the day"* — a one-off window
+  (`quiet.dnd_until`, survives a restart).
+- *"Quiet hours from eleven to seven"* — every night (`quiet.hours`, 24 h `"HH:MM"`,
+  overnight windows wrap); *"turn off quiet hours"*, *"what are my quiet hours"*.
+- **Calendar** — a timed event running now whose title contains one of
+  `quiet.calendar_keywords` (`class`, `exam`, `meeting`, `busy`) is quiet automatically;
+  `quiet.calendar: false` turns that off.
+- **Away** — with presence set up (section 19) he also holds while your phone is off the
+  Wi-Fi; `quiet.hold_when_away: false` turns that off.
+- *"I am free"* / *"what did I miss"* — ends the current window early and reads what was
+  held; *"are you on do not disturb"* says why he is quiet.
+
+Desktop banners are silenced in-process for the window (nothing is written to
+gsettings, so a crash cannot leave the desktop mute). The first-wake briefing waits for
+the window to close. A bare *"quiet"* is still the barge-in, not a DND request. The
+backlog is capped at twelve lines.
+
+```json
+"quiet": {"hours": {"start": "23:00", "end": "07:00"}, "dnd_until": 0, "free_until": 0,
+          "calendar": true, "calendar_keywords": ["class", "exam", "meeting", "busy"],
+          "hold_when_away": true}
+```
+
+## 19. Presence (is anyone home?)
+
+Give him your phone's Wi-Fi address and he knows whether you are in. Find it in the
+router's client list or on the phone (Settings › Wi-Fi › the network › IP address; iPhones
+use a per-network private MAC, which is fine — it is stable for that SSID). A DHCP
+reservation keeps the IP steady; otherwise set `phone_mac` and he pings whatever the ARP
+table has for it.
+
+```json
+"presence": {"enabled": true, "phone_ip": "192.168.50.42", "phone_mac": "",
+             "away_after_min": 12, "poll_s": 60}
+```
+
+Every `poll_s` he reads `ip -4 neigh` (REACHABLE = present) and pings once when the
+entry is stale or missing — no sudo, no Bluetooth (a phone does not stay connected to a
+Linux host). "Away" needs `away_after_min` of silence first, because iPhones drop off
+Wi-Fi power-save for minutes at a time; "home" is immediate. Leaving is silent; on the
+return he says *"Welcome back, sir."* and reads anything held while you were out. Until
+the first probe answers he assumes you are home. Check the log for
+`presence: home` / `presence: away`.
+
 ## What Jarvis says when something is missing
 
 | section not set up | is_configured needs | spoken line |
