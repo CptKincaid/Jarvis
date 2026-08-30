@@ -802,6 +802,51 @@ Wi-Fi power-save for minutes at a time; "home" is immediate. Leaving is silent; 
 return he says *"Welcome back, sir."* and reads anything held while you were out. Until
 the first probe answers he assumes you are home. Check the log for
 `presence: home` / `presence: away`.
+## 23. Nightly self-review ("how did yesterday go")
+
+Every quarter hour a small thread checks whether a day has ended without a review
+and, if so, reads his own `jarvis.log` and `turns.jsonl` for that day and files a
+digest to `~/.aiws_trainer/jarvis_memory/reviews/<date>.json` (kept 60 days — the log
+itself lives in `/tmp` and is wiped at boot). Nothing to configure; nothing leaves the
+box; no model call (every number is kept by construction).
+
+- **At first wake** — before "Your briefing for today, sir." he says two sentences:
+  *"Yesterday: 41 turns, median wait 1.4 seconds, worst 6.2. I dropped two clips of
+  yours at the speaker gate, the turn watchdog let go once and one tool call failed,
+  sir."* A day with nothing in it is not mentioned.
+- **On demand** — *"how did yesterday go"*, *"what went wrong yesterday"*,
+  *"yesterday's review"*; *"how's today going"* reads the open day so far.
+- **Discord** — when section 6 is configured, the full table (turns, waits, aborts,
+  uncertain / ignored, speaker-gate rejections, wake words refused, watchdog releases,
+  tool exceptions, TTS fallbacks, model reloads, boots, errors / warnings, the top error
+  lines) is posted when the digest is filed. No desktop banner.
+
+What counts as "went wrong" comes from the exact lines the modules log (see
+`COUNTERS` in `jarvis/dayreview.py`); a line from another process writing the same
+file before the app's boot marker is ignored, so a stray test traceback cannot
+show up as "a tool call failed".
+
+## 24. Ask him from a shell (`jarvis`, SSH, tmux, scripts)
+
+The running app listens on `/tmp/vss_voice/command.sock` (0600, next to
+`approvals.sock`). `scripts/jarvis` sends one line and prints what he answers:
+
+```bash
+ln -s ~/Jarvis/scripts/jarvis ~/.local/bin/jarvis      # once
+jarvis "what's due this week"                            # answered aloud AND printed
+jarvis -q "how did yesterday go"                         # text only; soundbar silent
+jarvis --status                                          # the "run diagnostics" line
+jarvis --json "timer 5 minutes"                          # raw JSON lines (scripts)
+ssh spark jarvis 'set an alarm for 7'                    # from the laptop or the phone
+```
+
+Replies go to stdout, status lines (`[info] Clock`) to stderr. Exit 0 means a reply
+came back, 2 means Jarvis is not running, 3 means the turn ended without one — a
+Claude task, for instance, answers with the acknowledgement and gets on with it. A
+question you send this way goes through the same commander as the typed box (no
+wake word, no intent guess), shows in the transcript, and is not stored in the
+typed-box history. `-t 300` waits longer than the default 90 s. Everything stays on
+the box: a UNIX socket, no port, no daemon beyond the app itself.
 
 ## What Jarvis says when something is missing
 
@@ -828,6 +873,8 @@ cd ~/Jarvis
 ~/vss_env/bin/python -m jarvis.app --spotify-login       # one-time Spotify link, then exit
 ~/vss_env/bin/python -m jarvis.autostart --status        # is the login entry installed?
 ~/vss_env/bin/python -m jarvis.tools.spotify --status    # configured / linked / token path
+~/vss_env/bin/python -m jarvis.ask "what's due today"     # ask the running app (scripts/jarvis)
+~/vss_env/bin/python -m jarvis.ask --status              # the diagnostics line, no speech
 ```
 
 Both `--install-autostart` and `--spotify-login` do their job and exit

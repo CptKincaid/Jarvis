@@ -121,6 +121,8 @@ def paths(tmp_path, monkeypatch):
     monkeypatch.setattr(PATHS, "REMINDERS", tmp_path / "memory" / "reminders.json")
     monkeypatch.setattr(PATHS, "CACHE_DIR", tmp_path / "cache")
     monkeypatch.setattr(PATHS, "APPROVALS_SOCK", tmp_path / "approvals.sock")
+    monkeypatch.setattr(PATHS, "COMMAND_SOCK", tmp_path / "command.sock")
+    monkeypatch.setattr(PATHS, "REVIEWS_DIR", tmp_path / "memory" / "reviews")
     monkeypatch.setattr(PATHS, "CLAUDE_TASK_DIR", tmp_path / "claude")
     monkeypatch.setattr(PATHS, "MCP_CONFIG", tmp_path / "mcp_jarvis.json")
     monkeypatch.setattr(PATHS, "AUTOSTART_DESKTOP", tmp_path / "autostart" /

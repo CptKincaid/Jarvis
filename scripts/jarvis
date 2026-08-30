@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# `jarvis "what's due this week"` from any shell, tmux pane or SSH session:
+#   ssh spark jarvis 'timer 5 minutes'
+#   jarvis -q "how did yesterday go"      # text only, soundbar silent
+#   jarvis --status                       # the diagnostics line
+# Talks to the running app over /tmp/vss_voice/command.sock (jarvis/cmdsock.py);
+# exit 2 means Jarvis is not running. Symlink it into ~/.local/bin:
+#   ln -s ~/Jarvis/scripts/jarvis ~/.local/bin/jarvis
+set -euo pipefail
+HERE="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+PY="${JARVIS_PYTHON:-$HOME/vss_env/bin/python}"
+[ -x "$PY" ] || PY=python3
+cd "$HERE"
+exec "$PY" -m jarvis.ask "$@"
