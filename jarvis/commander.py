@@ -542,11 +542,20 @@ _CLOCK_KINDS = (
 )
 
 
+# "what's the time in London" names a place: that is the get_time tool's job
+# (it geocodes the city for a timezone), not the local clock's. The Tier-1
+# match answered it with the home time (live, 2026-08-29 22:15).
+_CLOCK_PLACE_RX = re.compile(
+    r"\b(?:time|date|day)\b.*?\b(?:in|at|over in|for)\s+(?!the\b|a\b|an\b)[a-z]", re.I)
+
+
 def clock_kind(text: str) -> Optional[str]:
-    """'time' / 'date' / 'day' when the text asks for the clock, else None."""
+    """'time' / 'date' / 'day' when the text asks for the clock, else None.
+    A question that names a place is left to the router and get_time."""
+    text = text or ""
     for kind, rx in _CLOCK_KINDS:
-        if rx.search(text or ""):
-            return kind
+        if rx.search(text):
+            return None if _CLOCK_PLACE_RX.search(text) else kind
     return None
 
 

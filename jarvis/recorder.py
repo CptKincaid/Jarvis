@@ -634,7 +634,10 @@ class Recorder:
             try:
                 ep.feed(np.concatenate(fresh, axis=0).flatten(), self._record_rate)
             except Exception:
-                log.debug("endpointer feed failed; energy timer only", exc_info=True)
+                # WARNING, not debug: this silently returns every capture to
+                # the 2.5 s energy timer for the rest of the session.
+                log.warning("endpointer failed; energy timer only for this session",
+                            exc_info=True)
                 self.endpointer = None
                 return False
         gap = ep.silence_since_speech

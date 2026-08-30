@@ -1183,15 +1183,20 @@ class MainWindow:
         self._utter_ts = time.monotonic()         # RTT measurement start
         self.transcript.add_user(ev.text, confidence=conf)
 
+    def _take_rtt(self):
+        """Seconds since the utterance this reply answers, once; None if the
+        stamp is missing or stale."""
+        rtt = None
+        if self._utter_ts is not None:
+            dt = time.monotonic() - self._utter_ts
+            if 0.0 < dt < 600.0:
+                rtt = dt
+            self._utter_ts = None
+        return rtt
+
     def _ev_reply(self, ev: JarvisReply):
         if ev.text:
-            rtt = None
-            if self._utter_ts is not None:
-                dt = time.monotonic() - self._utter_ts
-                if 0.0 < dt < 600.0:
-                    rtt = dt
-                self._utter_ts = None
-            self.transcript.add_jarvis(ev.text, rtt=rtt)
+            self.transcript.add_jarvis(ev.text, rtt=self._take_rtt())
 
     def _ev_brain(self, ev: BrainState):
         self._thinking = (ev.state == "thinking")
@@ -1309,9 +1314,16 @@ class MainWindow:
         threading.Thread(target=run, daemon=True, name="approval").start()
 
     def _ev_briefing(self, ev: BriefingReady):
-        # the briefing card IS the answer to this turn (the app publishes
-        # no JarvisReply for it), so it consumes the utterance stamp too
-        self._utter_ts = None
+        # The card is the answer's structure; ev.spoken is what was actually
+        # SAID. The app publishes no JarvisReply for a briefing turn, and this
+        # used to render only the card -- so when one reply covered more than
+        # the briefing ("what's on Monday, and give me my daily brief", live
+        # 2026-08-29) the Monday half was spoken and never shown. The spoken
+        # line goes first, with the turn's RTT, then the card.
+        spoken = (ev.spoken or "").strip()
+        rtt = self._take_rtt()
+        if spoken:
+            self.transcript.add_jarvis(spoken, rtt=rtt)
         self.transcript.add_briefing(ev.sections)
 
     # ------------------------------------------------------ alarm modal

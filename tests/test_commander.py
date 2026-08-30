@@ -909,6 +909,22 @@ def test_mail_write_intents_are_not_answered_with_a_read(rich, services):
             assert call.kwargs.get("force_tool") != "get_mail", said
 
 
+def test_a_time_question_naming_a_place_goes_to_get_time(rich, services):
+    """"What's the time in London?" was answered with the home time: the
+    Tier-1 clock matcher fired on "what's the time" and never let the model
+    see "in London". get_time(location=...) already geocodes a city."""
+    from jarvis.commander import clock_kind
+    assert clock_kind("what's the time in london") is None
+    assert clock_kind("what time is it in tokyo right now") is None
+    assert clock_kind("what's the date in sydney") is None
+    assert clock_kind("what's the time") == "time"
+    assert clock_kind("what time is it in the morning") == "time"      # not a place
+    assert clock_kind("what's the date today") == "date"
+    services.brain.chat.reset_mock()
+    rich.handle("what's the time in london", source="typed")
+    assert services.brain.chat.call_count == 1, "the local clock answered instead of the router"
+
+
 def test_assistant_tier1_is_a_subset_of_the_registry_in_order():
     names = [c.name for c in ASSISTANT_TIER1]
     reg = [c.name for c in REGISTRY]

@@ -14,8 +14,16 @@ from pathlib import Path
 
 import pytest
 
-_TEST_LOG_DIR = Path(os.environ.get("JARVIS_LOG_DIR") or
-                     tempfile.mkdtemp(prefix="jarvis-tests-"))
+# A pre-set JARVIS_LOG_DIR is honoured ONLY if it is not the live app's
+# directory: a shell that exported it to /tmp/vss_voice to read the live
+# log (2026-08-29: review agents did) would otherwise make the suite write
+# its "throwaway" log straight into the file the running Jarvis is writing.
+_LIVE_LOG_DIR = "/tmp/vss_voice"
+_preset = os.environ.get("JARVIS_LOG_DIR") or ""
+if not _preset or Path(_preset).resolve() == Path(_LIVE_LOG_DIR) or \
+        str(Path(_preset).resolve()).startswith(_LIVE_LOG_DIR + "/"):
+    _preset = ""
+_TEST_LOG_DIR = Path(_preset or tempfile.mkdtemp(prefix="jarvis-tests-"))
 os.environ["JARVIS_LOG_DIR"] = str(_TEST_LOG_DIR)
 
 # Personal-assistant firewall (spec 2026-08-26, section 3.2/3.3): the real
