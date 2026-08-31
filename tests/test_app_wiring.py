@@ -1380,3 +1380,124 @@ def test_lecture_notes_are_wired_through_the_real_app(app, paths, monkeypatch):
     assert len(files) == 1 and "impedance is the ratio" in files[0].read_text()
     assert [n["text"] for n in app.notes.list("note")] == [
         "impedance is the ratio of voltage to current"]
+
+
+# ------------------------------- 20. desk presence, the walks, the watch
+#
+# The three modules have their own unit tests (test_deskpresence,
+# test_leavetime, test_calwatch). What only the real app can prove is the
+# WIRING: that the two away probes meet in one signal and one greeting,
+# that the board's dimming is nothing but this app's own state, and that
+# the leave question is never asked into a moment where nobody could
+# answer it.
+def _quiet_open(app):
+    """Silence the clock: quiet hours would otherwise defer the greeting
+    depending on what time the suite is run."""
+    app.quiet.reason = lambda *a, **kw: ""
+    app.quiet.release = lambda *a, **kw: ""
+
+
+def test_the_two_away_probes_meet_in_the_one_quiet_seam(app):
+    from jarvis.deskpresence import DeskSentinel
+    from jarvis.presence import PresenceSentinel
+    assert isinstance(app.desk, DeskSentinel)
+    assert isinstance(app.presence, PresenceSentinel)
+    # ONE suppression path: quiet.py's existing hold_when_away gate.
+    assert app.quiet._is_home == app._is_home
+
+
+def test_an_unconfigured_phone_and_a_session_without_mutter_read_as_home(app):
+    """Both probes fail OPEN. The phone has no address on this box and the
+    test suite has no idle monitor, so the app must behave exactly as it
+    did before either existed -- never "he's out"."""
+    assert app.desk.at_desk is None and not app.presence.configured
+    assert app._is_home() is True
+
+
+def test_an_established_empty_chair_is_the_away_signal(app):
+    app.desk.at_desk = False
+    assert app._is_home() is False
+    app.desk.at_desk = True
+    assert app._is_home() is True
+
+
+def test_one_walk_through_the_door_is_one_greeting(app):
+    """The phone crosses its threshold minutes after the keyboard does.
+    That is ONE return: release() drains atomically so the digest could not
+    double, but the greeting line would."""
+    from jarvis.events import DeskState, Presence
+    from jarvis.presence import WELCOME_LINE
+    _quiet_open(app)
+    bus.publish(DeskState(at_desk=True, idle_s=1.0, returned=True))
+    bus.publish(Presence(home=True, returned=True))
+    bus.drain()
+    assert app.tts.spoken.count(WELCOME_LINE) == 1
+
+
+def test_the_desk_probe_defers_to_a_configured_phone(app):
+    """Leaving the building is the return worth marking; sitting back down
+    after a coffee is not. With the phone configured it owns the line."""
+    from jarvis.events import DeskState
+    from jarvis.presence import WELCOME_LINE
+    _quiet_open(app)
+    app.assistant.set("presence.phone_ip", "192.168.1.42")
+    assert app.presence.configured
+    bus.publish(DeskState(at_desk=True, idle_s=1.0, returned=True))
+    bus.drain()
+    assert WELCOME_LINE not in app.tts.spoken
+
+
+def test_walking_away_is_never_announced(app):
+    from jarvis.events import DeskState
+    _quiet_open(app)
+    bus.publish(DeskState(at_desk=False, idle_s=1800.0))
+    bus.drain()
+    assert app.tts.spoken == []
+
+
+def test_services_hand_out_a_live_desk_reading_not_a_stale_number(app):
+    assert callable(app.services.desk_idle_s)
+    assert app.services.desk_idle_s() is None       # no reading in the suite
+    app.desk.last_idle = 42.0
+    assert app.services.desk_idle_s() == 42.0
+
+
+def test_the_walk_question_waits_for_a_moment_he_could_answer_it(app):
+    """A held question with an armed pending answer is a trap: he never
+    hears it and the next duration he says is filed as a walk."""
+    _quiet_open(app)
+    app.recorder.recording = False        # the stub answers callables, not bools
+    app.quiet.should_hold = lambda *a, **kw: True
+    assert app._ask_leave_time("Wisenbaker Engineering Bldg", "Wisenbaker") is False
+    assert app.commander._pending_leave is None
+    app.quiet.should_hold = lambda *a, **kw: False
+    app._turn_busy.set()
+    try:
+        assert app._ask_leave_time("Wisenbaker Engineering Bldg",
+                                   "Wisenbaker") is False
+    finally:
+        app._turn_busy.clear()
+    assert app.commander._pending_leave is None
+
+
+def test_the_walk_question_arms_the_answer_when_it_is_actually_asked(app):
+    from jarvis import leavetime as lt_mod
+    _quiet_open(app)
+    app.quiet.should_hold = lambda *a, **kw: False
+    app.recorder.recording = False        # the stub answers callables, not bools
+    assert app._ask_leave_time("Wisenbaker Engineering Bldg", "Wisenbaker") is True
+    assert app.tts.spoken[-1] == lt_mod.ASK_LINE.format(place="Wisenbaker")
+    assert app.commander._pending_leave[0] == "Wisenbaker Engineering Bldg"
+
+
+def test_the_two_calendar_watches_are_started_and_joined(app):
+    """Both file their state under the (firewalled) memory dir and both
+    are on the stop list, so their threads are joined at quit."""
+    app.start_assistant(residency=False)
+    assert app.calwatch._state_path == PATHS.MEMORY_DIR / "calwatch_state.json"
+    assert app.leavetime._state_path == PATHS.MEMORY_DIR / "leavetime_state.json"
+    assert app.calwatch._thread is not None and app.calwatch._thread.is_alive()
+    app.stop_assistant()
+    assert not app.calwatch._thread.is_alive()
+    assert app.leavetime._thread is None or not app.leavetime._thread.is_alive()
+    assert not app.desk.running
