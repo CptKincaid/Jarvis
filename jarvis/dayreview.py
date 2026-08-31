@@ -104,6 +104,18 @@ COUNTERS: tuple[tuple[str, re.Pattern], ...] = (
     # to edge, and Fish being retired for the session
     ("tts_fallbacks", re.compile(r"falling back to|^fish retired")),
     ("uncertain", re.compile(r"^Uncertain intent \(conf=")),
+    # Reasoned dissent (jarvis/objections.py). The overrule RATE is the
+    # whole point of counting it: an objection that is overruled every
+    # single time is a rule that is wrong, and nothing in dayreview reads
+    # the context journal, so it has to come off a log line.
+    ("objections", re.compile(r"^objection \S.* resolved: overruled=")),
+    ("objections_overruled", re.compile(r"^objection \S.* resolved: overruled=True")),
+    # The Aside's kill phrase (jarvis/aside.py). Silenced most days means
+    # the feature is wrong, and this line is how that is found out.
+    ("asides", re.compile(r"^aside: '")),
+    ("asides_silenced", re.compile(r"^aside: silenced for the day")),
+    # The debrief (jarvis/debrief.py): asked once, filed, never chat.
+    ("debriefs", re.compile(r"^debrief filed for ")),
     ("ignored", re.compile(r"^Ignored \(background chat")),
     ("boots", re.compile(re.escape(BOOT_MARKER))),
 )
@@ -401,6 +413,15 @@ def spoken_line(digest: dict, label: str = "Yesterday", name: str = "sir") -> st
         from jarvis.focus import blocks_words, time_words
         first += (f" You studied {blocks_words(blocks)}, "
                   f"{time_words(int(digest.get('study_minutes') or 0))}.")
+    # Counted as a PROBLEM on purpose (jarvis/aside.py rule 5): being told
+    # to stop volunteering things is the feature reporting on itself, and
+    # the day it happens most days is the day to switch it off.
+    if digest.get("asides_silenced"):
+        problems.append("you told me to stop volunteering things")
+    # An objection overruled every time is a rule that is simply wrong.
+    raised, over = digest.get("objections") or 0, digest.get("objections_overruled") or 0
+    if raised >= 3 and over == raised:
+        problems.append(f"you overruled all {raised} of my objections")
     if not problems:
         second = f"Nothing went wrong that I could see, {name}."
     elif len(problems) == 1:
@@ -433,6 +454,11 @@ def table(digest: dict) -> str:
             ("tool-handler exceptions", digest.get("tool_exceptions")),
             ("TTS fallbacks", digest.get("tts_fallbacks")),
             ("model reloads", digest.get("residency_reloads")),
+            ("objections raised", digest.get("objections")),
+            ("objections overruled", digest.get("objections_overruled")),
+            ("asides volunteered", digest.get("asides")),
+            ("asides silenced (\"no more asides\")", digest.get("asides_silenced")),
+            ("debriefs filed", digest.get("debriefs")),
             ("app boots", digest.get("boots")),
             ("log errors / warnings", f"{digest.get('errors', 0)} / {digest.get('warnings', 0)}")]
     width = max(len(k) for k, _ in rows)

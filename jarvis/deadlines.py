@@ -81,8 +81,25 @@ class DeadlineHeadsUp:
         self._get_calendar = get_calendar
         self._fetch_due = fetch_due or canvas_mod.fetch_due
         self._filed: dict[str, str] = self._load()
+        # The last Canvas planner rows this thread fetched, for readers on
+        # the SPOKEN path (jarvis/aside.py). fetch_due is a live REST
+        # round-trip; putting it behind a reply would add network latency to
+        # a turn and stall it behind a Canvas timeout on an outage. This
+        # tick already runs every 15 min on its own thread, so a snapshot
+        # that old is indistinguishable from a fresh one in a sentence.
+        self._snapshot: list[dict] = []
+        self._snapshot_at: Optional[datetime] = None
         self._stop = threading.Event()
         self._thread = None
+
+    def snapshot(self) -> list[dict]:
+        """The last Canvas rows seen, never a fetch. Copy: the caller must
+        not be able to mutate the list this thread rewrites."""
+        return list(self._snapshot)
+
+    @property
+    def snapshot_at(self) -> Optional[datetime]:
+        return self._snapshot_at
 
     # ------------------------------------------------------------ state
     def _load(self) -> dict:
@@ -148,6 +165,10 @@ class DeadlineHeadsUp:
         from jarvis import syllabus as syllabus_mod
         items = syllabus_mod.merge_items(self._canvas_items(now),
                                          self._syllabus_items(now))
+        # Stash before any filing: a tick that raises later must still leave
+        # the reply path a usable snapshot. The MERGED list, so an aside can
+        # also see a date a syllabus scan proposed and Canvas never had.
+        self._snapshot, self._snapshot_at = list(items), now
         events = self._calendar_events()
         filed = 0
         filed += self._file_deadlines(items, now)
