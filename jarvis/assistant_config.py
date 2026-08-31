@@ -178,6 +178,16 @@ DEFAULTS: dict = {
     "quiet": {"hours": {"start": "", "end": ""}, "dnd_until": 0, "free_until": 0,
               "calendar": True, "calendar_keywords": ["class", "exam", "meeting", "busy"],
               "hold_when_away": True},
+    # Bedtime wind-down (jarvis/winddown.py): "good night" fades Spotify to
+    # nothing over fade_s and pauses it, warms the screen (GNOME night
+    # light) and dims it to `brightness`, and arms do-not-disturb until
+    # quiet hours close (or `morning` when they are not configured).
+    # "Good morning" -- or the next app start after the window -- puts it
+    # all back. Off by default; every half has its own switch, and
+    # brightness is floored well above black.
+    "wind_down": {"enabled": False, "fade_s": 60, "brightness": 0.5,
+                  "night_light": True, "music": True, "dnd": True,
+                  "morning": "07:00"},
     # Presence (jarvis/presence.py): the phone's Wi-Fi address and/or MAC.
     # away_after_min is the grace before "out" -- iPhones nap off Wi-Fi for
     # minutes at a time, so anything under ~10 flaps.

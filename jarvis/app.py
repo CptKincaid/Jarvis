@@ -326,6 +326,10 @@ class JarvisApp:
         # spotify.make_tools parks on services.spotify.
         self.focus = self._construct("focus", self._make_focus)
         self.services.focus = self.focus
+        # Same shape as focus: it reaches Spotify and the quiet policy
+        # through the services namespace, so it is built after them.
+        self.winddown = self._construct("winddown", self._make_winddown)
+        self.services.winddown = self.winddown
         self.commander = Commander(self.services)
         # Without this hook the commander falls back to a bare warn Status --
         # a 4 s toast with no way to answer it, after which the utterance is
@@ -396,6 +400,13 @@ class JarvisApp:
             return None
         return mod.FocusSession(self.services,
                                 state_path=PATHS.MEMORY_DIR / "focus_session.json")
+
+    def _make_winddown(self):
+        mod = _import_optional("jarvis.winddown")
+        if mod is None:
+            return None
+        return mod.WindDown(self.services,
+                            state_path=PATHS.MEMORY_DIR / "winddown.json")
 
     def _make_presence(self):
         mod = _import_optional("jarvis.presence")
@@ -1672,6 +1683,14 @@ class JarvisApp:
             log.info("first-wake briefing: model busy; next turn")
             return
         log.info("first wake of the day: delivering the briefing")
+        wd = getattr(self, "winddown", None)
+        if wd is not None:
+            try:
+                # The other end of "good night": the first wake of the day is
+                # the morning even when he never said the word.
+                wd.restore()
+            except Exception:
+                log.exception("wind-down restore at first wake failed")
         # Yesterday's self-review first, as its own line: the briefing is a
         # brain.chat(force_tool="get_briefing") call, so nothing can be
         # folded into it "for free" -- and only when there was a yesterday
@@ -2303,6 +2322,17 @@ class JarvisApp:
                 focus.reconcile()
             except Exception:
                 log.exception("focus session reconcile failed")
+        wd = getattr(self, "winddown", None)
+        if wd is not None:
+            try:
+                # A screen dimmed last night by a Jarvis that has since been
+                # restarted has nobody else to brighten it: the autostart
+                # entry is not installed on this box, so app start IS the
+                # login hook. expired_only, because a restart at two in the
+                # morning must not light the room back up.
+                wd.restore(expired_only=True)
+            except Exception:
+                log.exception("wind-down restore at start failed")
         try:
             # The nightly self-review: files yesterday's digest under
             # MEMORY_DIR/reviews and posts the table to Discord when that
@@ -2498,6 +2528,7 @@ class JarvisApp:
                           ("headsup", getattr(self, "headsup", None)),
                           ("deadlines", getattr(self, "deadlines", None)),
                           ("focus", getattr(self, "focus", None)),
+                          ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),
                           ("quiet", getattr(self, "quiet", None)),
                           ("dayreviewer", getattr(self, "dayreviewer", None))):

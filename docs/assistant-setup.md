@@ -1338,3 +1338,72 @@ phone left recording cannot park the resident Whisper. A clip arrives as one
 JSON line: the request framing was 64 KB and is now the base64 of a whole
 clip, and a runaway request answers "request too large" instead of looking
 like a JSON bug.
+
+## 41. Bedtime wind-down: "good night" dims the room
+
+"Good night, sir. I'll be here." can be made physical. With the wind-down on,
+saying good night also fades the music out, warms and dims the screen, and
+arms do-not-disturb until quiet hours close. "Good morning" puts it all back.
+
+It is **off by default** and every half has its own switch:
+
+```json
+"wind_down": {
+  "enabled": false,
+  "fade_s": 60,
+  "brightness": 0.5,
+  "night_light": true,
+  "music": true,
+  "dnd": true,
+  "morning": "07:00"
+}
+```
+
+| key | what it does |
+|---|---|
+| `enabled` | the whole thing; `false` leaves "good night" as a spoken line |
+| `fade_s` | how long Spotify takes to reach silence (one volume step per 5 s) |
+| `brightness` | the `xrandr` level for every connected output; floored at 0.2 |
+| `night_light` | GNOME's warm screen (`night-light-enabled`) |
+| `music` | fade and pause Spotify |
+| `dnd` | hold proactive speech until quiet hours end |
+| `morning` | when `dnd` ends if `quiet.hours` is not configured |
+
+Say "good night", "night night" or "off to bed" and, in order: DND is armed,
+the screen warms and dims, and the music fades over `fade_s` and pauses. The
+Spotify **volume is put straight back after the pause** — the lasting effect
+is the pause, and a device left at 0% is indistinguishable from a broken
+speaker to anyone who presses play in the night.
+
+Say "good morning" (or "hello", or let the first-wake briefing run) and the
+screen, the night light and the volume go back to exactly what they were.
+
+### If something goes wrong
+
+Nothing is guessed. The state to restore is written to
+`~/.aiws_trainer/jarvis_memory/winddown.json` **before** the first thing
+changes, so:
+
+* a failure part-way through dimming restores the screen immediately;
+* a crash mid-fade leaves the file, and the next "good morning" undoes it;
+* a second "good night" is a no-op — snapshotting then would record the
+  *dimmed* screen as the brightness to go back to;
+* starting Jarvis again after the window is over restores it (a restart at
+  two in the morning deliberately does not, or the room would light up);
+* a file older than a day and a half is always restored, whatever it says.
+
+And there is a door from outside the app, for a screen left dim by something
+that took Jarvis with it:
+
+```bash
+~/vss_env/bin/python -m jarvis.winddown --status     # what it would put back
+~/vss_env/bin/python -m jarvis.winddown --restore    # put it back now
+```
+
+### Requirements
+
+`xrandr` and `gsettings`, both already present, both without sudo; the screen
+brightness is X's software gamma, not a backlight, so it works over HDMI on a
+desktop monitor. Spotify only does anything when the account is linked
+(section 11) and a device is reachable — otherwise it is a night without
+music and no apology, exactly as in a focus session.
