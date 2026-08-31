@@ -851,7 +851,9 @@ def test_tier1_notes_and_todos(rich, services):
     services.notes.add.assert_called_once()
     assert services.notes.add.call_args.args[0] == "note"
     services.notes.add.reset_mock()
-    rich.handle("add milk to my shopping list", source="typed")
+    # A bare "list" is still the to-do list; a NAMED one is not (spec 14 --
+    # "add milk to my shopping list" used to land among the to-dos).
+    rich.handle("add milk to my list", source="typed")
     assert services.notes.add.call_args.args[0] == "todo"
     services.brain.chat.assert_not_called()
 
@@ -1492,6 +1494,11 @@ TIER1_SAMPLES = {
     "next exam": "when's my next exam",
     "greeting": "good morning",
     "day review": "how did yesterday go",
+    "list add": "add milk to the shopping list",
+    "list read": "read my packing list",
+    "list strike": "take milk off the shopping list",
+    "list clear": "clear the shopping list",
+    "lists": "what lists do i have",
     "todo done": "mark buy milk as done",
     "todo add": "add buy milk to my todo list",
     "todo list": "what's on my todo list",

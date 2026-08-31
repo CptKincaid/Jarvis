@@ -86,9 +86,11 @@ from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import parse_person_statement, parse_since
+from jarvis.tools import notes as notes_mod
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import write_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, topic_chunks
+from jarvis.tools.notes import number_word
 from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
 
 log = get_logger("commander")
@@ -176,6 +178,11 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- named lists (2026-08-30) ---
+        # The Tier-1 probe covers the exact phrasings; these carry the
+        # looser ones ("anything else on the shopping list?") past the gate.
+        "shopping list", "grocery list", "packing list", "reading list",
+        "on the list", "off the list", "on my list", "my lists",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -537,6 +544,13 @@ class CommandResult:
     # handled: "no, I said X" re-dispatches X, "that was for you" re-runs
     # the dropped command. The app records the exchange under this text.
     corrected: Optional[str] = None
+    # How to take this turn back (spec 5): a handler that CREATED something
+    # -- a timer, an alarm, a reminder, a note, a list item -- hands back a
+    # closure that removes exactly that thing and returns the line to speak.
+    # Commander.handle stashes it for UNDO_WINDOW_S so "scratch that" can
+    # run it. None means the turn cannot be undone, and "scratch that"
+    # keeps its old dictation meaning.
+    undo: Optional[Callable[[], str]] = None
 
 
 @dataclass
@@ -1677,6 +1691,167 @@ _TODO_DONE_RX = re.compile(
     r"^(?:(?:mark|tick|check|cross)\s+(?:off\s+)?(?P<w1>.+?)\s+(?:as\s+)?(?:done|off|complete|completed|finished)"
     r"|(?:tick|check|cross)\s+off\s+(?P<w2>.+?)|(?:done with|finished|i did|i've done)\s+(?P<w3>.+?)"
     r"|(?:that's|thats|it's|its)\s+done)[.!]*$", re.I)
+# ---- Named lists (spec 14) ---------------------------------------------
+# "add milk to the shopping list" used to land in the generic to-do list:
+# _TODO_ADD_RX swallows every "... to my <word> list" phrasing (its
+# alternation even names "shopping"). These run BEFORE the to-do commands
+# and hand back None when the name IS a to-do word, so "add buy milk to my
+# task list" still reaches _h_todo_add. The name is required: "add milk to
+# my list" has no name and stays the to-do list.
+_LIST_NAME = r"(?P<name>[a-z0-9][a-z0-9'\- ]{0,39}?)"
+_LIST_ADD_RX = re.compile(
+    r"^(?:add|put|stick|throw|chuck)\s+(?P<item>.+?)\s+(?:to|on|onto|in)\s+"
+    r"(?:my|the|our)\s+" + _LIST_NAME + r"\s+list[.!]*$", re.I)
+_LIST_READ_RX = re.compile(
+    r"^(?:(?:read|show|list|check|open|give|tell)\s+(?:me\s+)?(?:out\s+)?"
+    r"|what(?:'s|s| is| are)\s+(?:on|in)\s+|what(?:'s|s| is)\s+)"
+    r"(?:my|the|our)\s+" + _LIST_NAME + r"\s+list[?.!]*$", re.I)
+_LIST_STRIKE_RX = re.compile(
+    r"^(?:take|cross|scratch|strike|knock|tick|check|rub)\s+(?:off\s+)?"
+    r"(?P<item>.+?)\s+(?:off(?:\s+of)?|from|out of)\s+(?:my|the|our)\s+"
+    + _LIST_NAME + r"\s+list[.!]*$", re.I)
+_LIST_CLEAR_RX = re.compile(
+    r"^(?:clear|empty|wipe|reset|erase|bin|delete)\s+(?:out\s+)?"
+    r"(?:everything\s+(?:off|from)\s+)?(?:my|the|our)\s+"
+    + _LIST_NAME + r"\s+list[.!]*$", re.I)
+_LISTS_RX = re.compile(
+    r"^(?:(?:what|which)\s+lists\s+(?:do i have|have i got|are there|"
+    r"do you have|do i keep)|(?:show|read|list|name)\s+(?:me\s+)?(?:my|the)\s+lists"
+    r"|what are (?:my|the) lists)[?.!]*$", re.I)
+# "milk, eggs and bread" is three items; "pick up the dry cleaning and post
+# the forms" is ONE errand. Only short, list-shaped text is split.
+_ITEM_SPLIT_RX = re.compile(r"\s*,\s*|\s+and\s+", re.I)
+LIST_SPLIT_CHARS = 60
+LIST_SPOKEN_LIMIT = 10          # == NotesStore.resolve's ordinal window
+
+
+def _split_items(text: str) -> list:
+    text = " ".join(str(text or "").split()).strip(" .,")
+    if not text:
+        return []
+    if len(text) > LIST_SPLIT_CHARS:
+        return [text]
+    parts = [p.strip(" .,") for p in _ITEM_SPLIT_RX.split(text)]
+    parts = [p for p in parts if p]
+    if len(parts) > 1 and all(len(p.split()) <= 3 for p in parts):
+        return parts
+    return [text]
+
+
+def _list_target(c, m, create: bool = False):
+    """``(store, name, kind)`` for a named-list command.
+
+    ``kind`` is None when the spoken name belongs to the built-in notes or
+    to-dos (the handler returns None so the to-do commands get their turn)
+    and "" when the list simply does not exist yet.
+    """
+    store = c._svc("notes")
+    spoken = (m.group("name") or "").strip()
+    if store is None or not notes_mod.list_kind(spoken):
+        return None, notes_mod.canon_list(spoken), None
+    name = store.make_list(spoken) if create else store.find_list(spoken)
+    if not isinstance(name, str) or not name:      # duck-typed / stub store
+        return store, notes_mod.canon_list(spoken), ""
+    return store, name, notes_mod.list_kind(name)
+
+
+def _no_such_list(name: str) -> CommandResult:
+    return CommandResult(handled=True, reply=f"You haven't a {name} list, sir.",
+                         speak=True, status="No such list")
+
+
+def _h_list_add(c, t, m):
+    # Original casing from the raw utterance ("add Waitrose coffee ...").
+    raw = getattr(c, "_raw_text", "") or ""
+    m2 = _LIST_ADD_RX.match(strip_jarvis_prefix(raw) or raw.strip()) if raw else None
+    mm = m2 or m
+    store, name, kind = _list_target(c, mm, create=True)
+    if kind is None:
+        return None
+    items = _split_items(mm.group("item"))
+    if not items:
+        return None
+    ids = [store.add(kind, i) for i in items]
+    line = f"Added to your {name} list, sir." if len(items) == 1 else \
+        f"{number_word(len(items)).capitalize()} added to your {name} list, sir."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"{name}: {', '.join(items)[:40]}",
+                         undo=_undo_notes(store, kind, ids,
+                                          f"Off the {name} list again, sir."))
+
+
+def _h_list_read(c, t, m):
+    store, name, kind = _list_target(c, m)
+    if kind is None:
+        return None
+    if not kind:
+        return _no_such_list(name)
+    return CommandResult(handled=True,
+                         reply=store.list_text(kind, LIST_SPOKEN_LIMIT),
+                         speak=True, status=f"{name} list")
+
+
+def _h_list_strike(c, t, m):
+    store, name, kind = _list_target(c, m)
+    if kind is None:
+        return None
+    if not kind:
+        return _no_such_list(name)
+    which = (m.group("item") or "").strip(" .")
+    removed = store.remove(kind, which)
+    if not removed:
+        return CommandResult(
+            handled=True, status="Not on the list", speak=True,
+            reply=f"I couldn't find that on your {name} list, sir.")
+    left = store.count(kind)
+    line = f"Off the {name} list, sir; {number_word(left)} left." if left else \
+        f"Off the {name} list, sir; that's it clear."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"{name}: struck {removed[0]['text'][:30]}",
+                         undo=_undo_restore(store, kind, removed,
+                                            f"Back on the {name} list, sir."))
+
+
+def _do_list_clear(store, kind: str, name: str) -> CommandResult:
+    rows = store.remove(kind, "all")
+    n = len(rows)
+    back = f"All {number_word(n)} back on the {name} list, sir." if n != 1 else \
+        f"Back on the {name} list, sir."
+    return CommandResult(handled=True, speak=True,
+                         reply=f"The {name} list is clear, sir.",
+                         status=f"Cleared {n} from the {name} list",
+                         undo=_undo_restore(store, kind, rows, back))
+
+
+def _h_list_clear(c, t, m):
+    store, name, kind = _list_target(c, m)
+    if kind is None:
+        return None
+    if not kind:
+        return _no_such_list(name)
+    n = store.count(kind)
+    if not n:
+        return CommandResult(handled=True, status="Empty", speak=True,
+                             reply=f"Your {name} list is empty already, sir.")
+    # The same read-back a bulk cancel gets: a wipe is worth one second of
+    # "yes", and the undo below is only as good as the words he heard.
+    if _wants_read_back(c, n):
+        line = f"Clear all {number_word(n)} off your {name} list, sir?" \
+            if n > 1 else f"Clear the one thing off your {name} list, sir?"
+        c.stash_destructive(lambda: _do_list_clear(store, kind, name), line)
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status="Confirm?")
+    return _do_list_clear(store, kind, name)
+
+
+def _h_lists(c, t, m):
+    store = c._svc("notes")
+    if store is None or not hasattr(store, "lists_text"):
+        return None
+    return CommandResult(handled=True, reply=store.lists_text(), speak=True,
+                         status="Lists")
+
+
 _BRIEFING_RX = re.compile(
     r"^(?:good morning(?:[, ]+jarvis)?|(?:morning|daily|my|the) briefing|briefing|"
     r"what'?s my briefing|(?:give me|read me|run|do) (?:the|my) (?:morning |daily )?briefing|"
@@ -1899,6 +2074,62 @@ def _assistant_get(c, key: str, default=None):
     return default if val is None else val
 
 
+# ------------------------------------------------------------------
+# Spoken undo: closures for "scratch that" (2026-08-30)
+# ------------------------------------------------------------------
+# Each targets the ONE item the turn created, by id. "cancel the last
+# timer" would be wrong: a timer set in between must not be the casualty,
+# and neither must a note whose words happen to match.
+def _undo_timekeeper(tk, item, kind: str, line: str):
+    item_id = getattr(item, "id", None)
+    if tk is None or not item_id:
+        return None
+
+    def _undo() -> str:
+        n = tk.cancel(which=item_id, kind=kind)
+        try:
+            n = int(n)
+        except (TypeError, ValueError):
+            n = 1 if n else 0
+        return line if n else "That one had gone already, sir."
+    return _undo
+
+
+def _undo_notes(store, kind: str, ids, line: str):
+    ids = [i for i in (ids if isinstance(ids, (list, tuple)) else [ids])
+           if i is not None]
+    if store is None or not ids or not hasattr(store, "delete"):
+        return None
+
+    def _undo() -> str:
+        gone = 0
+        for item_id in ids:
+            try:
+                if store.delete(kind, item_id):
+                    gone += 1
+            except Exception:
+                log.exception("undo delete failed")
+        return line if gone else "That one had gone already, sir."
+    return _undo
+
+
+def _undo_restore(store, kind: str, rows, line: str):
+    """Put removed rows back, original timestamps and all -- the undo of a
+    strike-off or a whole-list wipe."""
+    rows = [dict(r) for r in (rows or []) if r and r.get("text")]
+    if store is None or not rows:
+        return None
+
+    def _undo() -> str:
+        for row in rows:
+            try:
+                store.add(kind, row["text"], created=row.get("created"))
+            except Exception:
+                log.exception("undo restore failed")
+        return line
+    return _undo
+
+
 def _h_timer(c, t, m):                                     # 3217-3231
     n = _num(m.group("n1") or m.group("n2"))
     unit = (m.group("u1") or m.group("u2") or "minutes").lower()
@@ -1909,14 +2140,16 @@ def _h_timer(c, t, m):                                     # 3217-3231
     words = f"{n} {_unit_word(unit, n)}"
     tk = c._svc("timekeeper")
     if tk is not None:
-        tk.add_timer(seconds, label or f"{words} timer")
+        item = tk.add_timer(seconds, label or f"{words} timer")
         line = f"{words}, sir; I'll let you know."
         if label:
             what = label if re.match(r"^(?:the|my|a|an|your)\b", label, re.I) \
                 else f"the {label}"
             line = f"{words} for {what}, sir; I'll let you know."
         return CommandResult(handled=True, reply=line, speak=True,
-                             status=f"Timer set: {words}")
+                             status=f"Timer set: {words}",
+                             undo=_undo_timekeeper(tk, item, "timer",
+                                                   "Timer scrapped, sir."))
     workflows = c._svc("workflows")
     if workflows is None:
         return None
@@ -1946,11 +2179,13 @@ def _h_alarm(c, t, m):
     if due is None:
         return CommandResult(handled=True, reply=NO_WHEN_LINE, speak=True,
                              status="Alarm: when?")
-    tk.add_alarm(due, label, repeat)
+    item = tk.add_alarm(due, label, repeat)
     desc = _describe(tk, due, now, when)
     tail = {"daily": " Every day.", "weekdays": " Weekdays."}.get(repeat, "")
     return CommandResult(handled=True, reply=f"Alarm {desc}, sir.{tail}",
-                         speak=True, status=f"Alarm {desc}")
+                         speak=True, status=f"Alarm {desc}",
+                         undo=_undo_timekeeper(tk, item, "alarm",
+                                               "Alarm cancelled, sir."))
 
 
 def _h_list_schedule(c, t, m):
@@ -2607,9 +2842,11 @@ def _h_take_note(c, t, m):                                 # 3333-3342
         return None
     notes = c._svc("notes")
     if notes is not None:
-        notes.add("note", note)
+        note_id = notes.add("note", note)
         return CommandResult(handled=True, reply="Noted, sir.", speak=True,
-                             status=f"Note: {note[:40]}")
+                             status=f"Note: {note[:40]}",
+                             undo=_undo_notes(notes, "note", note_id,
+                                              "Note struck out, sir."))
     memory = c._svc("memory")
     if memory is None:
         return None
@@ -2644,9 +2881,11 @@ def _h_todo_add(c, t, m):
             mm.group("t4") or "").strip(" .")
     if not text:
         return None
-    notes.add("todo", text)
+    todo_id = notes.add("todo", text)
     return CommandResult(handled=True, reply="Added to your list, sir.",
-                         speak=True, status=f"To-do: {text[:40]}")
+                         speak=True, status=f"To-do: {text[:40]}",
+                         undo=_undo_notes(notes, "todo", todo_id,
+                                          "Off your list again, sir."))
 
 
 def _h_todo_list(c, t, m):
@@ -2855,12 +3094,14 @@ def _h_remind_me(c, t, m):                                 # 3465-3483
     if due is None:
         return CommandResult(handled=True, reply=NO_WHEN_LINE, speak=True,
                              status="Reminder: when?")
-    tk.add_reminder(due, task)
+    item = tk.add_reminder(due, task)
     desc = _describe(tk, due, now, when)
     what = task if re.match(r"^(?:that|about)\b", task, re.I) else f"to {task}"
     return CommandResult(handled=True,
                          reply=f"Very good, sir; I'll remind you {what} {desc}.",
-                         speak=True, status=f"Reminder {desc}: {task[:30]}")
+                         speak=True, status=f"Reminder {desc}: {task[:30]}",
+                         undo=_undo_timekeeper(tk, item, "reminder",
+                                               "Reminder cancelled, sir."))
 
 
 # ---- Tier 1 ambient: do not disturb / quiet hours / I am free ------------
@@ -3296,6 +3537,14 @@ REGISTRY: list[Command] = [
     Command("paste item",
             _m_re(r"paste (?:item |number )?(\d+|before last|previous)"),
             _h_paste_item, needs=("context",)),
+    # Named lists BEFORE the to-do commands: _TODO_ADD_RX would otherwise
+    # swallow "add milk to my shopping list" into the generic to-do list.
+    Command("list add", _LIST_ADD_RX.match, _h_list_add, needs=("notes",)),
+    Command("list read", _LIST_READ_RX.match, _h_list_read, needs=("notes",)),
+    Command("list strike", _LIST_STRIKE_RX.match, _h_list_strike,
+            needs=("notes",)),
+    Command("list clear", _LIST_CLEAR_RX.match, _h_list_clear, needs=("notes",)),
+    Command("lists", _LISTS_RX.match, _h_lists, needs=("notes",)),
     Command("todo done", _TODO_DONE_RX.match, _h_todo_done, needs=("notes",)),
     Command("todo add", _TODO_ADD_RX.match, _h_todo_add, needs=("notes",)),
     Command("todo list", _TODO_LIST_RX.match, _h_todo_list, needs=("notes",)),
@@ -3352,6 +3601,10 @@ ASSISTANT_TIER1: list[Command] = [
                     "last mail", "diagnostics", "next exam", "greeting", "day review",
                     "todo done", "todo add",
                     "todo list",
+                    # named lists: spoken in the aisle and read back over
+                    # SSH from the phone, neither with a wake-word prefix
+                    "list add", "list read", "list strike", "list clear",
+                    "lists",
                     "take note", "show notes", "answer question", "remind me",
                     # long-term memory, the people book and the day recap
                     # answer without the wake-word prefix too: unprefixed
@@ -3671,6 +3924,37 @@ def feedback_kind(text: str) -> Optional[bool]:
     return None
 
 
+# ------------------------------------------------------------------
+# Spoken undo: "scratch that" (2026-08-30)
+# ------------------------------------------------------------------
+# The phrase mapped to delete_last_sentence, a DICTATION action, so after
+# "set an alarm for six" a spoken "scratch that" typed editing keys at
+# whatever window had focus and the alarm stood. It now runs the last
+# turn's undo closure (CommandResult.undo) when there is one within the
+# window; with nothing to undo it returns None and the old typing meaning
+# survives untouched -- including "delete that", which is left alone.
+# The window is the correction window: an undo older than that is more
+# likely a stray transcript than a change of mind.
+UNDO_WINDOW_S = 60.0
+_UNDO_RX = re.compile(
+    r"^(?:(?:no|nope)[,.!]?\s+)?"
+    r"(?:scratch|undo|cancel|forget|belay|take back)\s+"
+    r"(?:that last one|the last(?: one| thing)?|that|it|this)"
+    r"|^(?:scratch|undo|belay) that"
+    r"|^undo(?: the)?(?: last)?(?: one| thing| action)?"
+    r"|^take that back"
+    r"|^(?:on second thought[s]?|actually)[,.]?\s+(?:scratch|undo|cancel) that",
+    re.I)
+_UNDO_TAIL_RX = re.compile(r"^[\s,.!]*(?:please|jarvis|sir|instead)?[\s,.!]*$", re.I)
+
+
+def undo_kind(text: str) -> bool:
+    """True when the utterance asks for the last action to be taken back."""
+    t = (text or "").strip()
+    m = _UNDO_RX.match(t)
+    return bool(m) and bool(_UNDO_TAIL_RX.match(t[m.end():]))
+
+
 @dataclass
 class LastTurn:
     text: str
@@ -3695,6 +3979,7 @@ class Commander:
     # fills in only what it needs.
     claim_uncertain: Optional[Callable[[bool], bool]] = None
     _last_turn: Optional[LastTurn] = None
+    _last_undo: Optional[tuple] = None
     _confidence: Optional[float] = None
     _pending_destructive: Optional[tuple] = None
 
@@ -3709,6 +3994,9 @@ class Commander:
     def __init__(self, services):
         self.services = services
         self._turn_lock = threading.RLock()
+        # (closure, monotonic stamp) from the last turn that created
+        # something; consumed by "scratch that".
+        self._last_undo: Optional[tuple] = None
         self.intent = IntentClassifier()
         self.dictation = False
         # Lecture-note capture (jarvis/lecture.py): the course name while
@@ -3785,6 +4073,9 @@ class Commander:
             self._last_turn = LastTurn(
                 getattr(result, "corrected", None) or text,
                 result.status or "", time.monotonic())
+            undo = getattr(result, "undo", None)
+            if undo is not None:
+                self._last_undo = (undo, time.monotonic())
         return result
 
     def shaky_transcript(self) -> bool:
@@ -3896,6 +4187,14 @@ class Commander:
         res = self._try_custom_phrase(cmd_text if cmd_text is not None else text)
         if res is not None:
             return res
+        # 3a'. "Scratch that": take back the last thing he had me create.
+        #      After the yes/no stages (a pending read-back owns "cancel
+        #      that") and after custom phrases, which shadow built-ins;
+        #      before the intent gate, which calls a two-word phrase
+        #      background chat and drops it silently.
+        res = self._try_undo(cmd_text if cmd_text is not None else text)
+        if res is not None:
+            return res
 
         if cmd_text is not None:
             # 2. Desktop control chains (2632-2635 → 3548-3584)
@@ -3955,6 +4254,8 @@ class Commander:
         if yes:
             res = self._route_text(text)
             self._last_turn = LastTurn(text, res.status or "", time.monotonic())
+            if getattr(res, "undo", None) is not None:
+                self._last_undo = (res.undo, time.monotonic())
             return res
         return CommandResult(handled=True, status="Discarded")
 
@@ -4098,6 +4399,30 @@ class Commander:
         return CommandResult(handled=True, reply="Very good, sir.", speak=True,
                              status="Feedback: noted")
 
+    def _try_undo(self, text: str) -> Optional[CommandResult]:
+        """Run the last turn's undo closure. None -- so the phrase keeps
+        its dictation meaning -- when it is not an undo, when nothing
+        undoable happened, or when what did happen has gone stale."""
+        if not undo_kind(text):
+            return None
+        pend, self._last_undo = self._last_undo, None
+        if pend is None:
+            log.info("undo asked for with nothing to undo: %r", text)
+            return None
+        if time.monotonic() - pend[1] > UNDO_WINDOW_S:
+            log.info("undo expired (%.0fs)", time.monotonic() - pend[1])
+            return None
+        try:
+            line = pend[0]()
+        except Exception:
+            log.exception("undo failed")
+            return CommandResult(handled=True, speak=True, status="Undo failed",
+                                 reply="I couldn't take that back, sir.")
+        if not line:
+            return None
+        return CommandResult(handled=True, reply=str(line), speak=True,
+                             status="Undone")
+
     def _try_destructive_confirm(self, text: str) -> Optional[CommandResult]:
         """Resolve a read-back ("Cancel all three alarms, sir?").
 
@@ -4144,9 +4469,15 @@ class Commander:
             return CommandResult(handled=True, reply="I couldn't clear that, sir.",
                                  speak=True, status="error")
         n = len(removed) if removed else 0
+        lname = notes_mod.list_name(kind)
         line = "All cleared, sir." if n else "Nothing to clear, sir."
+        if lname:
+            line = f"The {lname} list is clear, sir." if n else \
+                f"Your {lname} list was empty already, sir."
+        where = f"from the {lname} list" if lname else \
+            f"{kind}{'s' if n != 1 else ''}"
         return CommandResult(handled=True, reply=line, speak=True,
-                             status=f"Cleared {n} {kind}{'s' if n != 1 else ''}")
+                             status=f"Cleared {n} {where}")
 
     # -- pipeline stages -----------------------------------------------
     def _handle_dictation(self, text: str) -> CommandResult:
