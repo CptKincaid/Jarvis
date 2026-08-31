@@ -53,9 +53,20 @@ turn is a property of the code path rather than of a flag being clear.
 
 iOS will not start audio without a user gesture, so the AudioContext is
 created and unlocked on the TAP that enables Voice (and re-armed on each
-send, for a switch remembered in localStorage from last time). A context
-that is still suspended when a clip has been scheduled says so in the
-transcript instead of going quietly silent.
+send, for a switch remembered in localStorage from last time). iOS also
+decides whether a page may be HEARD before it decides how loud: a bare
+AudioContext plays in the "ambient" category, which the side switch on the
+phone silences outright -- the fetch succeeds, the samples are scheduled,
+``state`` says "running", and nothing comes out. The page claims
+``navigator.audioSession.type = "playback"`` (Safari 16.4+) to leave that
+category, and where it cannot it SAYS so rather than going quietly silent.
+
+Silence is the failure mode that costs a bug report, so every clip ends by
+saying what became of it -- nothing to say, nothing scheduled, a context
+that is not running, or how many seconds went to the speaker -- and the
+**Test** switch plays ``SOUND_CHECK`` down the identical path (same
+endpoint, voice, cache, RIFF walk and scheduler as a reply) so the audio
+path can be proved in one tap without asking a question first.
 
 SECURITY -- the reason this file is careful rather than short
 ------------------------------------------------------------
@@ -1268,6 +1279,12 @@ MANIFEST = json.dumps({
     ],
 }, indent=2)
 
+# What the Test switch plays. A real sentence rather than a synthetic tone
+# on purpose: it goes down the identical path a reply does -- render, speech
+# cache, chunked wav, RIFF walk, Web Audio -- so hearing it proves that path
+# end to end, and it is a cache hit from the second tap onward.
+SOUND_CHECK = "Sound check, sir."
+
 # The quick taps. Each is (label, the sentence actually dispatched) -- the
 # sentence is a real phrase off docs/capabilities.md, so a button and the
 # spoken form take exactly the same path through the commander.
@@ -1386,6 +1403,11 @@ PAGE = """<!doctype html>
   #voice.on { color: #041017; background: var(--cyan);
               border-color: var(--cyan); }
   #voice.on .dot { background: #041017; }
+  /* Both audio controls take only the width of their own words, so the
+     third switch costs the room switch nothing: "Aloud in the room" still
+     fits whole on a 375 px phone, which is why it is not sharing thirds. */
+  #voice, #check { flex: none; }
+  #check:active { background: #163b52; }
   #micnote { font-size: 12px; color: var(--warn); padding: 0 16px 12px;
              line-height: 1.5; }
   #keybox { padding: 16px; }
@@ -1435,6 +1457,12 @@ PAGE = """<!doctype html>
     <input type="checkbox" id="aloud">
     <span class="txt">Aloud in the room</span>
   </label>
+  <!-- One tap that proves the whole audio path without having to ask a
+       question first, and prints what happened either way. -->
+  <button id="check" type="button" class="sw"
+          title="Play one line through this phone, to prove the sound works">
+    <span class="txt">Test</span>
+  </button>
 </div>
 <p id="micnote" hidden></p>
 
@@ -1455,6 +1483,7 @@ PAGE = """<!doctype html>
   var keyInput = document.getElementById("key");
   var voiceBtn = document.getElementById("voice");
   var voiceLbl = document.getElementById("voicelbl");
+  var checkBtn = document.getElementById("check");
   var busy = false;
 
   /* The key rides in the URL so that "Add to Home Screen" bookmarks a
@@ -1602,14 +1631,44 @@ PAGE = """<!doctype html>
                               past, which plays it at once and stacks it */
   var MIN_BLOCK_S = 0.15;  /* and don't schedule slivers — a buffer seam
                               every few KB is audible as a tick */
+  var CHECK_LINE = __CHECK__;
   var actx = null, voiceOn = false, playAt = 0, playing = [], inflight = null;
   var chain = Promise.resolve();
+  var session = "no";      /* whether this browser let the page out of the
+                              "ambient" category -- see claimSession */
+  var told = false;        /* the side-switch line is said once per load */
+
+  /* iOS decides whether a page may be HEARD before it decides how loud.
+     A bare AudioContext plays in the "ambient" category, and the side
+     switch on the phone silences that category outright: the fetch
+     succeeds, the PCM is scheduled, state says "running", and nothing
+     comes out of the speaker. Claiming "playback" (Safari 16.4+) is what
+     leaves that category, so the switch stops mattering.
+
+     Older WebKit gives script no such control at all. The only escape
+     there is to play through an <audio> element, which would cost this
+     page the thing it is built on -- a chunked reply of unknown length
+     that Safari's media element will not commit to (see the note above
+     fetchSay). So where the claim cannot be made, the page says which
+     case he is in instead of pretending, and the Test switch prints it. */
+  function claimSession() {
+    var s = navigator.audioSession;
+    if (!s) { session = "no"; return; }
+    try { s.type = "playback"; } catch (e) { session = "no"; return; }
+    session = (s.type === "playback") ? "yes" : "no";
+  }
 
   function unlock() {
     var Ctx = window.AudioContext || window.webkitAudioContext;
     if (!Ctx) { return false; }
+    claimSession();                 /* before the context makes a sound */
+    if (actx && actx.state === "closed") { actx = null; playAt = 0; }
     if (!actx) { try { actx = new Ctx(); } catch (e) { return false; } }
-    if (actx.state === "suspended" && actx.resume) {
+    /* Not "suspended" alone: iOS parks a backgrounded or interrupted
+       context in WebKit's own "interrupted" state, which that test walked
+       straight past -- leaving a dead context to swallow the next reply
+       in silence. Resume anything that is not already running. */
+    if (actx.state !== "running" && actx.resume) {
       try { actx.resume(); } catch (e) {}
     }
     /* Starting one silent frame is what actually flips iOS out of
@@ -1631,6 +1690,40 @@ PAGE = """<!doctype html>
     chain = Promise.resolve();
   }
 
+  /* ---- did any of it actually reach the speaker? ---------------------
+     The bug this page had was not that audio broke; it was that audio
+     broke IN SILENCE, which on a phone looks exactly like a switch that
+     did not take -- and leaves him nothing to report but "it doesn't
+     talk". Every clip now ends by saying what became of it, in terms he
+     can act on. */
+  function report(probe, got, secs) {
+    var state = actx ? actx.state : "gone";
+    if (!got) {
+      note("There was nothing in that one to say aloud.");
+      return;
+    }
+    if (!secs) {
+      note("His voice arrived — " + (got >= 2048 ? Math.round(got / 1024) +
+           " KB" : got + " bytes") + " — and this phone played none of it.", 1);
+      return;
+    }
+    if (state !== "running") {
+      note("This phone is holding audio back: it is '" + state + "'. " +
+           "Tap Voice once more.", 1);
+      return;
+    }
+    if (!probe && told) { return; }
+    told = true;
+    note("Handed " + secs.toFixed(1) + " s of his voice to this phone's " +
+         "speaker. " + (session === "yes"
+           ? "If you heard nothing, turn the volume up with this page open, " +
+             "or check what it is paired to — the side switch is not what " +
+             "is stopping it."
+           : "If you heard nothing, your phone is muted: the side switch " +
+             "silences this kind of audio. Flip it off silent, turn the " +
+             "volume up, and tap Test."));
+  }
+
   function speak(t) {
     if (!voiceOn || !t) { return; }
     /* Serialised: two replies in one turn must not race each other into
@@ -1643,15 +1736,20 @@ PAGE = """<!doctype html>
                  });
   }
 
-  function fetchSay(text) {
+  function fetchSay(text, probe) {
     if (!unlock()) {
       return Promise.reject(new Error("this browser has no Web Audio"));
     }
     var ctrl = ("AbortController" in window) ? new AbortController() : null;
     inflight = ctrl;
     var head = null, pending = new Uint8Array(0);
+    /* What report() needs to tell "the server sent nothing" from "the
+       phone played nothing": bytes off the wire, and seconds handed to
+       the sound card. */
+    var got = 0, secs = 0;
 
     function grow(extra) {
+      got += extra.length;
       var out = new Uint8Array(pending.length + extra.length);
       out.set(pending);
       out.set(extra, pending.length);
@@ -1716,6 +1814,7 @@ PAGE = """<!doctype html>
       }
       src.start(playAt);
       playAt += buf.duration;
+      secs += buf.duration;
       playing.push(src);
       src.onended = function () {
         var i = playing.indexOf(src);
@@ -1753,12 +1852,10 @@ PAGE = """<!doctype html>
       });
     }).then(function () {
       if (inflight === ctrl) { inflight = null; }
-      /* Blocked audio must SAY it is blocked. A context still suspended
-         here has swallowed the clip, and silence is exactly what a broken
-         toggle looks like too. */
-      if (actx.state !== "running") {
-        note("This phone is holding audio back — tap Voice once more.", 1);
-      }
+      /* Blocked audio must SAY it is blocked, and so must audio that was
+         never scheduled: silence is exactly what a broken toggle, a muted
+         phone and an empty reply all look like from here. */
+      report(probe, got, secs);
     });
   }
 
@@ -1769,10 +1866,40 @@ PAGE = """<!doctype html>
     voiceLbl.textContent = voiceOn ? "Voice on" : "Voice off";
     try { localStorage.setItem(VOICE_STORE, voiceOn ? "1" : "0"); } catch (e) {}
     if (!voiceOn) { hush(); return; }
-    if (announce && !unlock()) {
+    if (!announce) { return; }
+    if (!unlock()) {
       note("This browser will not play audio here, sir.", 1);
+      return;
     }
+    /* Say where the switch has got to, and point at the one control that
+       settles it -- a toggle whose only feedback is its own colour is how
+       this went unreported twice. */
+    note("Voice on. Tap Test to hear him now, without asking anything.");
   }
+
+  /* The sound check: the SAME endpoint, voice, speech cache, RIFF walk and
+     scheduler a reply uses, off one tap. If this is heard and a reply is
+     not, the fault is not in the audio path; if neither is heard while the
+     page says it handed seconds to the speaker, the phone is muted. The
+     line is cached after the first tap, so it comes back as a file read. */
+  checkBtn.addEventListener("click", function () {
+    if (!unlock()) {
+      note("This browser will not play audio here, sir.", 1);
+      return;
+    }
+    hush();
+    note(session === "yes"
+      ? "Sound check: this page holds the media session, so the side " +
+        "switch cannot mute it."
+      : "Sound check: this browser will not let a page hold the media " +
+        "session, so the side switch CAN mute it.");
+    chain = chain.then(function () { return fetchSay(CHECK_LINE, true); })
+                 .catch(function (e) {
+                   if (e && e.name === "AbortError") { return; }
+                   note("The sound check did not reach this phone: " +
+                        ((e && e.message) || e), 1);
+                 });
+  });
 
   /* The enabling TAP is the gesture iOS wants, so the AudioContext is
      built and unlocked right here — never lazily on the first reply, which
@@ -1927,7 +2054,20 @@ PAGE = """<!doctype html>
   }
   setInterval(beat, BEAT_MS);
   document.addEventListener("visibilitychange", function () {
-    if (document.visibilityState === "visible") { beat(); }
+    if (document.visibilityState !== "visible") { return; }
+    beat();
+    /* iOS parks the AudioContext when the page goes away -- sometimes
+       "suspended", sometimes WebKit's own "interrupted" -- and until now
+       nothing woke it, so the first reply after the lock screen was
+       silent with no gesture in sight to blame. Returning to a tab is not
+       a user gesture everywhere, so this may not take; when it does not,
+       report() says which state it is stuck in on the next clip. */
+    if (voiceOn) { unlock(); }
+  });
+  /* Restored from the back-forward cache: the sources scheduled against
+     the old context will never fire, so drop them and re-arm. */
+  window.addEventListener("pageshow", function (e) {
+    if (e.persisted && voiceOn) { hush(); unlock(); }
   });
 })();
 </script>
@@ -1935,4 +2075,5 @@ PAGE = """<!doctype html>
 </html>
 """
 PAGE = (PAGE.replace("__TAPS__", json.dumps([list(t) for t in QUICK_TAPS]))
+            .replace("__CHECK__", json.dumps(SOUND_CHECK))
             .replace("__MIC_NOTE__", MIC_NOTE))

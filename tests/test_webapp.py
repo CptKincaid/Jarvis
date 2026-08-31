@@ -926,3 +926,133 @@ def test_a_streamed_clip_leaves_the_connection_reusable(server):
         assert json.loads(resp.read())["ok"] is True
     finally:
         conn.close()
+
+
+# ------------------------------------- 16. audio that fails where he can see
+# He reported "Jarvis still doesn't talk on the phone" twice, and both times
+# the server logs showed the clip going out (`phone say: ... 277036 bytes`).
+# Audio that is fetched and then silently dropped -- by a muted phone, by a
+# context iOS parked while the screen was off -- leaves him nothing to report
+# but the silence. These tests are about the page SAYING what happened.
+def page_of(server):
+    status, body = call(server.srv, "GET", "/")
+    assert status == 200
+    return body.decode("utf-8")
+
+
+def test_the_page_leaves_the_ambient_category_so_the_side_switch_cannot_mute(
+        server):
+    """The leading suspect, and the one that fits exactly: on iOS a bare
+    AudioContext plays in the "ambient" category, which the hardware side
+    switch silences -- the fetch succeeds, the PCM is scheduled, state says
+    "running", and nothing is heard. `navigator.audioSession.type =
+    "playback"` (Safari 16.4+) is what leaves that category, and it has to
+    be claimed BEFORE the context makes a sound."""
+    page = page_of(server)
+    assert "navigator.audioSession" in page, "the claim must be made at all"
+    assert 's.type = "playback";' in page
+    claim = page.index("function claimSession")
+    unlock = page.index("function unlock")
+    call_site = page.index("claimSession();", unlock)
+    make = page.index("actx = new Ctx()", unlock)
+    assert claim < unlock, "declared before it is used"
+    assert call_site < make, "claimed before the context exists"
+
+
+def test_an_interrupted_context_is_resumed_rather_than_walked_past(server):
+    """iOS parks a backgrounded context in WebKit's own "interrupted"
+    state, not "suspended". A resume guarded on "suspended" alone walks
+    straight past it and schedules the next reply into a dead context."""
+    page = page_of(server)
+    assert 'if (actx.state !== "running" && actx.resume)' in page
+    assert 'actx.state === "suspended" && actx.resume' not in page, \
+        "the narrow test is exactly the bug"
+    assert 'actx.state === "closed"' in page, "a closed context is rebuilt"
+
+
+def test_coming_back_to_the_phone_re_arms_the_audio(server):
+    """Nothing used to wake the context when he returned to the tab or
+    came back through the back-forward cache, so the first reply after the
+    lock screen was silent."""
+    page = page_of(server)
+    beat = page.index("function beat()")
+    assert "if (voiceOn) { unlock(); }" in page[beat:], \
+        "visibilitychange must re-arm the audio, not only ping"
+    assert 'window.addEventListener("pageshow"' in page
+    assert "if (e.persisted && voiceOn) { hush(); unlock(); }" in page
+
+
+def test_a_clip_that_makes_no_sound_says_so_instead_of_going_quiet(server):
+    """The whole point. Three different silences, three different lines --
+    an empty render, bytes that were never scheduled, and a context that is
+    not running -- so the next report is a diagnosis."""
+    page = page_of(server)
+    assert "function report(probe, got, secs)" in page
+    assert "report(probe, got, secs);" in page, "and every clip ends in it"
+    assert "There was nothing in that one to say aloud." in page
+    assert "this phone played none of it." in page
+    assert "This phone is holding audio back: it is '" in page
+    assert "var got = 0, secs = 0;" in page, "the seconds must be counted"
+    assert "secs += buf.duration;" in page, "and only when PCM is scheduled"
+
+
+def test_the_page_tells_him_the_phone_itself_may_be_muted(server):
+    """On a browser too old to claim the media session there is nothing
+    the code can do about the side switch -- so it says which case he is
+    in, in his own terms, rather than playing to a muted speaker."""
+    page = page_of(server)
+    assert "your phone is muted: the side switch " in page
+    assert "silences this kind of audio" in page
+    assert "the side switch CAN mute it." in page
+    assert "switch cannot mute it." in page
+
+
+def test_the_sound_check_is_one_tap_down_the_same_path_as_a_reply(server):
+    """A control he can prove the audio with WITHOUT asking a question
+    first, through the same endpoint, cache, RIFF walk and scheduler."""
+    page = page_of(server)
+    assert 'id="check"' in page and ">Test<" in page
+    assert 'checkBtn.addEventListener("click"' in page
+    assert "fetchSay(CHECK_LINE, true)" in page, \
+        "the same function a reply uses, flagged so it always reports"
+    assert json.dumps(wa.SOUND_CHECK) in page
+    # it lives with the other two switches, not bolted on somewhere else
+    switches = page.index('id="switches"')
+    assert page.index('id="check"') > switches
+    assert page.index('id="check"') < page.index("</div>", switches)
+    # ...without squeezing the room switch: a third of a 375 px row would
+    # ellipsise "Aloud in the room", so the two audio controls take only
+    # the width of their own words.
+    assert "#voice, #check { flex: none; }" in page
+
+
+def test_the_sound_check_line_really_renders_on_this_box(server):
+    """A test button that 503s is worse than none: the line has to be one
+    the speech path will actually say."""
+    status, head, body = audio(server.srv, wa.SOUND_CHECK)
+    assert status == 200
+    assert body[:4] == b"RIFF" and body[8:12] == b"WAVE"
+    assert server.app.tts.rendered == [wa.SOUND_CHECK]
+
+
+def test_nothing_new_on_the_page_needs_a_relaxed_policy(server):
+    """The CSP is the same class of bug as the one being fixed: an inline
+    handler or an external asset is refused SILENTLY. Everything added
+    here is an addEventListener on markup that is already served."""
+    conn = http.client.HTTPConnection(server.srv.host, server.srv.port,
+                                      timeout=20)
+    try:
+        conn.request("GET", "/")
+        resp = conn.getresponse()
+        page = resp.read().decode("utf-8")
+        csp = resp.getheader("Content-Security-Policy")
+    finally:
+        conn.close()
+    assert csp == wa.CSP
+    assert "default-src 'none'" in csp
+    assert "script-src 'unsafe-inline'" in csp and "https:" not in csp
+    assert "connect-src 'self'" in csp
+    assert 'src="http' not in page and 'href="http' not in page
+    assert "<script src" not in page
+    for handler in ("onclick=", "onchange=", "onload=", "onsubmit="):
+        assert handler not in page, f"{handler} would be blocked in silence"
