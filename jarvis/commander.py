@@ -176,6 +176,13 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- room control (2026-08-30): light, level and the scenes ---
+        # The Tier-1 probe bypasses the gate for the exact phrasings; this
+        # vocabulary covers the looser ones that reach the classifier
+        # anyway ("it's a bit bright in here, dim the display").
+        "dim", "lights", "brighter", "darker", "brightness", "night light",
+        "warmer", "cooler", "too bright", "too dark", "daylight",
+        "wind down", "power down", "workshop", "lights out",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -191,6 +198,9 @@ class IntentClassifier:
         "volume", "repeat", "again",
         # review round 2026-08-30: 1-3-word Tier-1 phrases
         "quiz", "review", "standup", "drill", "recap", "triage", "explain",
+        # room control 2026-08-30: "dim it", "lights up", "warmer"
+        "dim", "brighten", "warm", "cool", "lights", "brighter", "darker",
+        "warmer", "cooler",
     )
 
     _NEGATIVE_PATTERNS = [
@@ -726,9 +736,17 @@ def _h_courtesy(c, t, m):
         # "Good night" is a courtesy first (this runs ahead of the registry's
         # own good-night entry and again in _route_text): the wind-down
         # preview hangs off it here, and falls back to the plain line.
+        # The room scene is a side effect of the SAME call site rather than
+        # a second good-night handler, and only when he has asked for it
+        # (room.wind_down_on_goodnight, off by default).
+        scene = _maybe_wind_down(c)
         res = _goodnight_preview(c, t)
         if res is not None:
             return res
+        line = courtesy_reply(m)
+        return CommandResult(handled=True,
+                             reply=f"{scene} {line}".strip() if scene else line,
+                             speak=True, status="Courtesy")
     return CommandResult(handled=True, reply=courtesy_reply(m), speak=True,
                          status="Courtesy")
 
@@ -743,6 +761,11 @@ def greeting_kind(text: str) -> Optional[str]:
 
 
 def _h_greeting(c, t, m):
+    if m == "greeting":
+        # "Good morning" is the reverse of the wind-down: whatever the
+        # scene moved goes back before he has sat down. Silent when no
+        # scene is running (the usual case).
+        _scene_wake(c)
     return CommandResult(handled=True, reply=courtesy_reply(m), speak=True,
                          status="Greeting")
 
@@ -2040,6 +2063,10 @@ def _h_cancel_schedule(c, t, m):
 def _h_briefing(c, t, m):
     enabled = bool(_assistant_get(c, "briefing.enabled", False))
     explicit = not re.match(r"^good morning", t, re.I)
+    if not explicit:
+        # "Good morning" reaches the briefing before the greeting handler,
+        # so the wind-down's reverse has to be hung off BOTH call sites.
+        _scene_wake(c)
     if not enabled and not explicit:
         return None            # a plain greeting: the local model answers it
     brain = c._svc("brain")
@@ -2420,13 +2447,16 @@ def _h_last_mail(c, t, m):
 
 
 def _h_goodnight(c, t, m):                                 # 3233-3238
+    scene = ""
     if t in ("good night", "goodnight"):
+        scene = _maybe_wind_down(c)        # off unless he asked for it
         res = _goodnight_preview(c, t)
         if res is not None:
             return res
+    line = "Good night sir. I'll be here when you need me."
     return CommandResult(
         handled=True,
-        reply="Good night sir. I'll be here when you need me.",
+        reply=f"{scene} {line}".strip() if scene else line,
         speak=_talkback())
 
 
@@ -3015,6 +3045,158 @@ def _h_quiet_status(c, t, m):
                          status="Quiet" if reason else "Not quiet")
 
 
+# ---- Tier 1 room control: light, level and the scenes -------------------
+# "Dim it a little", "lights down", "warmer", "lights up", "power down the
+# workshop".  There are no bulbs in this room: what moves is the 43-inch
+# panel's gamma and GNOME's night light (jarvis/room.py), and the spoken
+# lines say so -- the screen dims, the room does not.  Every one of these
+# is reversible and is put back at "lights up", at boot and at quit.
+#
+# "lights up" is deliberately the RESTORE verb rather than one step
+# brighter: it is the sentence he will say when he wants the room back, and
+# "brighter" is there for the stepped version.
+_ROOM_LIGHT_KINDS = (
+    ("dim", re.compile(
+        r"^" + _JV + r"(?:dim(?: it| that| the (?:screen|display|lights?|room))?"
+        r"(?:\s+(?:a little|a bit|a touch|down|slightly))?|"
+        r"lights?\s+down|turn (?:the )?(?:lights?|screen|display) down|"
+        r"darker|make it darker|(?:it|the screen|the display)'?s? too bright)"
+        r"(?:[,]?\s*jarvis)?[.!?\s]*$", re.I)),
+    ("brighter", re.compile(
+        r"^" + _JV + r"(?:brighten(?: (?:it|the (?:screen|display)))?"
+        r"(?:\s+(?:a little|a bit|a touch|up))?|brighter|make it brighter|"
+        r"(?:a (?:little|bit) )?brighter|"
+        r"(?:it|the screen|the display)'?s? too dark)"
+        r"(?:[,]?\s*jarvis)?[.!?\s]*$", re.I)),
+    ("up", re.compile(
+        r"^" + _JV + r"(?:lights?\s+(?:up|on)|full brightness|"
+        r"turn (?:the )?(?:lights?|screen|display) (?:up|back up)|"
+        r"(?:bring|put) (?:the )?(?:lights?|screen|display) back(?: up)?)"
+        r"(?:[,]?\s*jarvis)?[.!?\s]*$", re.I)),
+    ("warm", re.compile(
+        r"^" + _JV + r"(?:warm(?:er)?(?: the (?:screen|display))?|"
+        r"warm (?:it|the screen|the display)(?: up)?|"
+        r"(?:turn on|switch on) (?:the )?night ?light|night ?light on)"
+        r"(?:[,]?\s*jarvis)?[.!?\s]*$", re.I)),
+    ("cool", re.compile(
+        r"^" + _JV + r"(?:cool(?:er)?(?: the (?:screen|display))?|"
+        r"cool (?:it|the screen|the display) down|"
+        r"(?:turn off|switch off) (?:the )?night ?light|night ?light off|"
+        r"back to daylight)(?:[,]?\s*jarvis)?[.!?\s]*$", re.I)),
+)
+# "lights out" is the SCENE (music, quiet hours and the light together);
+# "lights down" above is one step of the light alone.
+_SCENE_KINDS = (
+    ("down", re.compile(
+        r"^" + _JV + r"(?:(?:power|shut|close|lock) (?:down|up) (?:the )?"
+        r"(?:workshop|shop|lab|room|studio)|"
+        r"wind (?:it |things |the (?:workshop|room) )?down|"
+        r"(?:let'?s )?call it a night|lights? out)"
+        r"(?:[,]?\s*jarvis)?[.!?\s]*$", re.I)),
+    ("up", re.compile(
+        r"^" + _JV + r"(?:(?:wake|power|open|start) (?:up )?(?:the )?"
+        r"(?:workshop|shop|lab|room|studio)(?: (?:back )?up)?|"
+        r"bring (?:the )?(?:workshop|shop|lab|room|studio) back(?: up)?)"
+        r"(?:[,]?\s*jarvis)?[.!?\s]*$", re.I)),
+)
+
+
+def room_light_kind(text: str) -> Optional[str]:
+    """'dim' / 'brighter' / 'up' / 'warm' / 'cool' for a whole-utterance
+    light command, else None."""
+    for kind, rx in _ROOM_LIGHT_KINDS:
+        if rx.match((text or "").strip()):
+            return kind
+    return None
+
+
+def scene_kind(text: str) -> Optional[str]:
+    """'down' / 'up' for a whole-utterance scene command, else None."""
+    for kind, rx in _SCENE_KINDS:
+        if rx.match((text or "").strip()):
+            return kind
+    return None
+
+
+def _room_enabled(c) -> bool:
+    return bool(_assistant_get(c, "room.enabled", True))
+
+
+def _h_room_light(c, t, m):
+    """The light verbs.  The xrandr/gsettings probes are a handful of short
+    subprocess calls (~200 ms), run inline like the timekeeper's database
+    work: the answer has to carry the line that says what actually
+    happened, and a spoken reply costs far longer than the probe."""
+    light = c._svc("room_light")
+    if light is None or not _room_enabled(c):
+        return None
+    if m == "up":
+        # "Lights up" is the whole room back, not one notch: restore the
+        # scene when one is running, and the light's baseline otherwise.
+        scenes = c._svc("scenes")
+        if scenes is not None and (scenes.active() or light.changed):
+            res = scenes.restore()
+            return CommandResult(handled=True, reply=res.line, speak=True,
+                                 status="Lights up")
+        if light.changed:
+            _, line = light.restore()
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status="Lights up")
+        _, line = light.brighten()
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status="Lights up")
+    verb = {"dim": light.dim, "brighter": light.brighten,
+            "warm": light.warmer, "cool": light.cooler}[m]
+    _, line = verb()
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"Room light: {m}")
+
+
+def _h_scene(c, t, m):
+    scenes = c._svc("scenes")
+    if scenes is None or not _room_enabled(c):
+        return None
+    from jarvis.scenes import WIND_DOWN
+    res = scenes.restore() if m == "up" else scenes.apply(WIND_DOWN)
+    return CommandResult(handled=True, reply=res.line, speak=True,
+                         status="Workshop up" if m == "up" else "Workshop down")
+
+
+def _maybe_wind_down(c) -> str:
+    """The good-night hook.  OFF by default (room.wind_down_on_goodnight):
+    "good night" already has a handler, and a scene is a change to his
+    desktop that he did not ask for by saying good night.  Returns the
+    scene's line when it ran, "" otherwise."""
+    if not _assistant_get(c, "room.wind_down_on_goodnight", False):
+        return ""
+    scenes = c._svc("scenes")
+    if scenes is None or not _room_enabled(c):
+        return ""
+    try:
+        from jarvis.scenes import WIND_DOWN
+        return scenes.apply(WIND_DOWN).line or ""
+    except Exception:
+        log.exception("wind-down scene failed")
+        return ""
+
+
+def _scene_wake(c) -> bool:
+    """"Good morning": whatever the wind-down moved goes back.  True when
+    something was actually restored."""
+    scenes = c._svc("scenes")
+    if scenes is None:
+        return False
+    light = c._svc("room_light")
+    if not scenes.active() and not (light is not None and light.changed):
+        return False
+    try:
+        scenes.restore()
+    except Exception:
+        log.exception("scene restore at wake failed")
+        return False
+    return True
+
+
 # Ordered registry — mirrors _check_quick_command branch order (3036-3485).
 # The single insertion is "autonomous" before "workflow" (V3 spec: "deploy"
 # and "autonomous:" phrases route to brain.execute_autonomous).
@@ -3338,6 +3520,10 @@ REGISTRY: list[Command] = [
     Command("quiet hours", _QUIET_HOURS_RX.match, _h_quiet_hours, needs=("quiet",)),
     Command("do not disturb", _DND_RX.match, _h_dnd, needs=("quiet",)),
     Command("free", _FREE_RX.match, _h_free, needs=("quiet",)),
+    # room control (jarvis/room.py, jarvis/scenes.py): the scene BEFORE the
+    # light, so "lights out" is the whole wind-down and not one dim step.
+    Command("scene", scene_kind, _h_scene, needs=("scenes",)),
+    Command("room light", room_light_kind, _h_room_light, needs=("room_light",)),
 ]
 
 # The assistant's Tier 1 without the "jarvis" prefix (jarvis mode): the
@@ -3360,6 +3546,10 @@ ASSISTANT_TIER1: list[Command] = [
                     "person", "remember", "recall", "who is", "recap",
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free",
+                    # room control: "dim it a little" / "lights up" / "power
+                    # down the workshop" arrive by voice with the wake word
+                    # already consumed, so they need the unprefixed pass too
+                    "scene", "room light",
                     "standup", "gpu reclaim", "gpu lend",
                     "log triage", "slow turn",
                     # the hotword consumes the wake word, so spoken text never

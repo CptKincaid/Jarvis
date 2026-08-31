@@ -178,6 +178,35 @@ DEFAULTS: dict = {
     "quiet": {"hours": {"start": "", "end": ""}, "dnd_until": 0, "free_until": 0,
               "calendar": True, "calendar_keywords": ["class", "exam", "meeting", "busy"],
               "hold_when_away": True},
+    # The Room Mixer (jarvis/mixer.py): while Jarvis speaks or listens,
+    # every non-Jarvis stream slides to duck_level % over duck_ramp_ms and
+    # slides back. Per STREAM (pactl set-sink-input-volume), never the sink
+    # -- the default sink is the soundbar his own voice comes out of.
+    "audio": {"duck": True, "duck_level": 30, "duck_ramp_ms": 200},
+    # The room's light (jarvis/room.py) and scenes (jarvis/scenes.py).
+    # There are no bulbs here: this is the 4K panel's brightness (an xrandr
+    # gamma scale, floored at 0.55 -- Jarvis's own console lives on it) and
+    # GNOME's night-light temperature. Every change is reversible and is
+    # restored at "lights up", at boot and at quit.
+    # wind_down_on_goodnight is OFF by default: "good night" already has a
+    # handler (commander._goodnight_preview), and a scene is a change to
+    # his desktop that he did not ask for by saying good night.
+    # scenes: ordered lists of primitives -- brightness / temperature /
+    # music / quiet_hours / say. Edit them here; no code change needed.
+    "room": {
+        "enabled": True,
+        "wind_down_on_goodnight": False,
+        "scenes": {
+            "wind down": [
+                {"do": "temperature", "kelvin": 2700},
+                {"do": "brightness", "level": 0.6},
+                {"do": "music", "action": "pause"},
+                {"do": "quiet_hours", "start": "22:00", "end": "07:00"},
+                {"do": "say", "line": "Powering down the workshop, sir. "
+                                      "The screen's warm and the room is yours."},
+            ],
+        },
+    },
     # Presence (jarvis/presence.py): the phone's Wi-Fi address and/or MAC.
     # away_after_min is the grace before "out" -- iPhones nap off Wi-Fi for
     # minutes at a time, so anything under ~10 flaps.
