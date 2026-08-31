@@ -89,6 +89,7 @@ from jarvis.memory import parse_person_statement, parse_since
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import write_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, topic_chunks
+from jarvis import syllabus as syllabus_mod
 from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
 
 log = get_logger("commander")
@@ -176,6 +177,11 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- syllabus ingestion (2026-08-30) ---
+        # "go through my syllabus" reaches no Tier-1 matcher, so without
+        # these words it is the same silent NO the media and study words
+        # were before it.
+        "syllabus", "syllabi", "due dates", "exam schedule",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -3130,6 +3136,97 @@ def _h_quiz(c, t, m):
                          speak=True, ack=True, done=False, status=f"Quiz: {topic}")
 
 
+# "Scan the syllabus": the exam a professor never put in Canvas. The chunks
+# come from the documents index (topic_chunks on the syllabus topics), ONE
+# gemma call proposes {title, course, due} rows, and every row is READ BACK
+# before anything is filed -- the destructive-confirm rung, because a model
+# reading dates out of a PDF is exactly where a wrong year files a reminder
+# for the wrong week. Accepted rows land in jarvis/syllabus.py's store,
+# which deadlines.tick and canvas.find_next_exam both merge.
+_SYLLABUS_RX = re.compile(
+    r"^" + _JV + r"(?:(?:scan|read|check|go through|look through|go over|read through|"
+    r"import|ingest|pull the dates out of|get the dates out of)\s+"
+    r"(?:the\s+|my\s+|through\s+my\s+)?(?:syllabus|syllabi|syllabuses)"
+    r"(?:\s+for\s+(?:the\s+)?(?:dates?|deadlines?|exams?|due dates?))?|"
+    r"add (?:the |my )?syllabus (?:dates?|deadlines?|exams?)|"
+    r"(?:what's|what is|what are)\s+(?:on|in)\s+my\s+(?:syllabus|syllabi))"
+    r"(?:\s+please)?[.!?\s]*$", re.I)
+
+
+def syllabus_kind(text: str) -> bool:
+    return bool(_SYLLABUS_RX.match((text or "").strip()))
+
+
+def _do_file_syllabus(c, rows) -> CommandResult:
+    try:
+        n = syllabus_mod.add(rows)
+    except Exception:                            # noqa: BLE001 - store boundary
+        log.exception("syllabus: filing failed")
+        return CommandResult(handled=True, reply="I couldn't file those, sir.",
+                             speak=True, status="Syllabus: failed")
+    if n <= 0:
+        # Every row was already on the books: a second scan of the same
+        # syllabus must not read back "filed three" and change nothing.
+        return CommandResult(handled=True, reply="Already on the books, sir.",
+                             speak=True, status="Syllabus: nothing new")
+    line = syllabus_mod.FILED_ONE_LINE if n == 1 else syllabus_mod.FILED_LINE.format(n=n)
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"Syllabus: {n} filed")
+
+
+def _h_scan_syllabus(c, t, m):
+    index = c._svc("docs")
+    if index is None:
+        return CommandResult(handled=True, reply=syllabus_mod.NO_SYLLABUS_LINE,
+                             speak=True, status="No documents")
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "read_syllabus"):
+        return CommandResult(handled=True, reply=syllabus_mod.NO_DATES_LINE,
+                             speak=True, status="No model")
+
+    def _work():
+        try:
+            chunks = syllabus_mod.gather(index)
+        except EmbedError as exc:
+            log.warning("syllabus: embed failed: %s", exc)
+            _deliver(c, quiz_mod.INDEX_DOWN_LINE)
+            return
+        except Exception:                        # noqa: BLE001 - store boundary
+            log.exception("syllabus: index failed")
+            _deliver(c, quiz_mod.INDEX_DOWN_LINE)
+            return
+        if not chunks:
+            # Files present but nothing stored yet is "indexing", not "no
+            # syllabus": blaming the folder would send him to check a
+            # folder that is fine (the ask_docs precedent).
+            if index.document_count() == 0 and index.scan():
+                index.start_background()
+                _deliver(c, INDEXING_LINE)
+            else:
+                _deliver(c, syllabus_mod.NO_SYLLABUS_LINE)
+            return
+        now = datetime.now().astimezone()
+        try:
+            raw = brain.read_syllabus(syllabus_mod.source_text(chunks),
+                                      today=now.strftime("%A %d %B %Y"))
+        except Exception:                        # noqa: BLE001 - model boundary
+            log.exception("read_syllabus failed")
+            raw = []
+        rows = syllabus_mod.parse_rows(raw, now)
+        if not rows:
+            _deliver(c, syllabus_mod.NO_DATES_LINE)
+            return
+        line = syllabus_mod.read_back_line(rows, now)
+        # Stash BEFORE speaking: the follow-up window opens the moment the
+        # line is delivered, so a fast "yes" must find the offer waiting.
+        c.stash_destructive(lambda: _do_file_syllabus(c, rows), line)
+        _deliver(c, line)
+
+    c._bg(_work)
+    return CommandResult(handled=True, reply=syllabus_mod.SCANNING_LINE, speak=True,
+                         ack=True, done=False, status="Reading the syllabus")
+
+
 def _h_review(c, t, m):
     try:
         store = _quiz_store(c)
@@ -3189,6 +3286,7 @@ REGISTRY: list[Command] = [
     Command("explain document", explain_kind, _h_explain_doc,
             needs=("reader",)),
     Command("quiz", quiz_kind, _h_quiz),
+    Command("scan syllabus", syllabus_kind, _h_scan_syllabus),
     Command("review flashcards", review_kind, _h_review),
     Command("stop quiz", quiz_stop_kind, _h_quiz_stop),
     # Reached only when the reader is idle (handle() gives an active reading
@@ -3345,7 +3443,8 @@ REGISTRY: list[Command] = [
 # typed "timer for 5 minutes" is instant and never a model round trip.
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
-    if cmd.name in ("explain document", "quiz", "review flashcards", "stop quiz",
+    if cmd.name in ("explain document", "quiz", "scan syllabus",
+                    "review flashcards", "stop quiz",
                     "focus start", "focus left", "focus end", "lecture notes",
                     "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",

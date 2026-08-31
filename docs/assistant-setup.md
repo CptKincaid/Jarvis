@@ -1367,3 +1367,68 @@ it is a *lookup*:
 
 The index can say where things are; it cannot say where they belong or why
 they broke. Saying "ask Claude" explicitly always wins.
+
+## 42. Syllabus dates: the exam that never reached Canvas
+
+Canvas carries assignments. The midterm dates live in a PDF, and at TAMU
+that PDF is often the only place they exist — so "when's my next exam" said
+nothing, the evening-before heads-up never fired, and the briefing had
+nothing to count down to.
+
+Drop the syllabus into the documents folder from section 14 and say:
+
+> "Jarvis, scan my syllabus."
+>
+> "I found 2 dates in your syllabus, sir: Midterm 1 for CS 101, in 30 days,
+> Wednesday 1 Oct at 9:00 am; Final exam for CS 101, in 100 days, Wed 10 Dec.
+> Shall I put them on the books?"
+>
+> "Yes." — "Filed, sir; 2 on the books."
+
+Also: "read my syllabus", "go through my syllabus", "check my syllabus for
+dates", "add my syllabus dates", "what's on my syllabus". No wake word
+needed in jarvis mode.
+
+**Nothing is filed until you say yes**, and every date is read back in full
+rather than counted. That is deliberate: a model reading dates out of a PDF
+is exactly where a wrong *year* files a reminder for the wrong week, and the
+read-back is the only moment you can catch it. Saying anything other than a
+clear yes or no drops the offer, as with any other read-back (section 30).
+
+Three guards run before you even hear the question. A date the model could
+not write as a plain `YYYY-MM-DD` is dropped rather than guessed at; a date
+already in the past is dropped (scanning in October must not file
+September's midterm); and a date more than 400 days out is dropped as the
+hallucinated year it is.
+
+Once accepted, the dates are a **third source** beside Canvas and your
+calendar, and they are merged in both places that matter:
+
+- `deadlines.tick` — the lead-hours reminder ("Lab 3 report for CS 101 is
+  due in 3 hours") and the 7 pm evening-before exam call;
+- `canvas.find_next_exam` — "when's my next exam" and the briefing's exam
+  countdown.
+
+Merging only the first would have him call an exam eve for a midterm he
+would then deny having when asked, which is worse than no exam eve at all.
+If a professor posts the midterm to Canvas *and* lists it in the syllabus,
+Canvas wins: its due time is the authoritative one, and you get one
+reminder rather than two.
+
+Re-scanning the same syllabus is safe — already-known dates are recognised
+and he says "Already on the books, sir."
+
+```
+~/.aiws_trainer/jarvis_memory/syllabus_deadlines.json   the accepted rows
+```
+
+Written atomically, one row per date (`title`, `course`, `due`, `all_day`).
+Delete the file to forget everything a scan ever filed; the reminders
+already handed to the timekeeper are separate and are cancelled the usual
+way.
+
+**When it says nothing useful.** "I can't find a syllabus in your documents,
+sir" means the folder has nothing syllabus-shaped in it (or nothing at all);
+"I'm indexing your documents now" means the file is there but not embedded
+yet — ask again in a moment; "My document index isn't answering" means
+Ollama is down, not that the folder is wrong.
