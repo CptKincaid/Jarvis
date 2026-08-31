@@ -99,7 +99,7 @@ from jarvis import selfstate
 from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
 from jarvis.tools import quiz as quiz_mod
-from jarvis.tools.calendar import write_event
+from jarvis.tools.calendar import add_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
 from jarvis.tools.notes import number_word
 from jarvis import syllabus as syllabus_mod
@@ -6408,6 +6408,13 @@ class Commander:
             return None
         pend, self._last_undo = self._last_undo, None
         if pend is None:
+            # A calendar add made through the TOOL (the confident path, which
+            # never asks) carries no CommandResult, so its undo is parked on
+            # the source instead. Same staleness rule; nothing else is looked
+            # for here.
+            parked = self._calendar_add_undo()
+            if parked is not None:
+                return parked
             log.info("undo asked for with nothing to undo: %r", text)
             return None
         if time.monotonic() - pend[1] > UNDO_WINDOW_S:
@@ -6421,6 +6428,36 @@ class Commander:
                                  reply="I couldn't take that back, sir.")
         if not line:
             return None
+        return CommandResult(handled=True, reply=str(line), speak=True,
+                             status="Undone")
+
+    def _calendar_add_undo(self) -> Optional[CommandResult]:
+        """"Scratch that" after an event was added by the tool.
+
+        The entry is CLEARED whether or not the removal worked: a second
+        "scratch that" must not try to delete the same event twice, and the
+        honest "I can't take it back" is not made truer by repeating it.
+        """
+        source = self._svc("calendar")
+        entry = getattr(source, "last_add", None) if source is not None else None
+        if not isinstance(entry, dict) or not callable(entry.get("undo")):
+            return None
+        try:
+            source.last_add = None
+        except Exception:
+            log.debug("could not clear the parked calendar undo", exc_info=True)
+        try:
+            at = float(entry.get("at") or 0.0)
+        except (TypeError, ValueError):
+            at = 0.0
+        if at and time.monotonic() - at > UNDO_WINDOW_S:
+            log.info("calendar undo expired (%.0fs)", time.monotonic() - at)
+            return None
+        try:
+            line = entry["undo"]()
+        except Exception:
+            log.exception("calendar undo failed")
+            line = "I couldn't take that back, sir."
         return CommandResult(handled=True, reply=str(line), speak=True,
                              status="Undone")
 
@@ -6846,15 +6883,20 @@ class Commander:
             return CommandResult(handled=True, reply="Very good, sir.",
                                  speak=True, status="Dropped")
         try:
-            line = write_event(source.icloud_calendars(), pending["title"],
-                               pending["start"], pending["end"],
-                               calendar_name=pending.get("calendar"))
+            line, undo = add_event(source.icloud_calendars(), pending["title"],
+                                   pending["start"], pending["end"],
+                                   calendar_name=pending.get("calendar"))
         except Exception as exc:             # noqa: BLE001 - refusal or server
             log.exception("calendar write failed")
             line = f"I couldn't add that, sir — {type(exc).__name__}."
             return CommandResult(handled=True, reply=line, speak=True,
                                  status="Add failed")
-        return CommandResult(handled=True, reply=line, speak=True, status="Added")
+        # "Scratch that" now reaches the event: the closure deletes it, or
+        # says plainly that this server gives no way to. Falling through in
+        # silence -- what happened before -- reads as success while the
+        # event sits in his calendar.
+        return CommandResult(handled=True, reply=line, speak=True, status="Added",
+                             undo=undo)
 
     def _try_quiz_answer(self, text: str,
                          source: str = "voice") -> Optional[CommandResult]:

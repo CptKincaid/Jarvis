@@ -514,6 +514,13 @@ class CalendarSource:
         return min(stamps) if stamps else None
 
     pending_event = None      # set by add_event when it needs a yes
+    # The last event written and how to take it back: {"undo", "at", "title"}.
+    # Parked here rather than returned because the confident path writes from
+    # inside a TOOL call, whose ToolResult has no undo slot -- and that is
+    # the path most adds take, so without this "scratch that" would still
+    # have nothing to reach for. Commander._try_undo consults it, subject to
+    # the same staleness window as any other undo.
+    last_add = None
 
     def icloud_calendars(self):
         """Live caldav Calendar objects, for writing. Raises when unconfigured."""
@@ -791,24 +798,76 @@ def build_vevent(title: str, start: datetime, end: datetime) -> bytes:
     return cal.to_ical()
 
 
-def write_event(calendars, title: str, start: datetime, end: datetime,
-                calendar_name: Optional[str] = None) -> str:
-    """Add one event. Returns the line to speak; raises on refusal or failure.
+# The undo of an add. Three outcomes, and the third is the point: when the
+# server hands back no deletable object there IS no undo, and saying so is
+# the only honest answer -- "scratch that" used to fall through in silence,
+# which reads as success while the event sits in his calendar.
+UNDONE_LINE = "Taken back off your calendar, sir."
+UNDO_FAILED_LINE = "I couldn't remove {title} from your calendar, sir."
+CANNOT_UNDO_LINE = ("I can put events on your calendar, sir, but I can't take "
+                    "one back off — you'll want to delete {title} yourself.")
 
-    Deliberately add-only -- no edit, no delete. Server errors propagate
-    rather than being smoothed into a success line: telling the user an event
-    was added when it was not is the worst outcome available here.
+
+def _undo_add(saved, title: str):
+    """The closure that removes the event just written, or one that says why
+    it cannot.
+
+    ``caldav``'s ``save_event`` hands back the created Event object, whose
+    ``.delete()`` is the only handle to it we ever get: nothing else knows
+    its UID or its href. A server (or a stand-in) that returns something
+    without a delete gives us nothing to remove, and the caller must be able
+    to tell the difference.
+    """
+    delete = getattr(saved, "delete", None)
+    if not callable(delete):
+        def _cannot() -> str:
+            log.info("calendar: no delete path for %r; undo refused", title)
+            return CANNOT_UNDO_LINE.format(title=title)
+        return _cannot
+
+    def _undo() -> str:
+        try:
+            delete()
+        except Exception:                   # noqa: BLE001 - server boundary
+            log.exception("calendar: deleting %r failed", title)
+            return UNDO_FAILED_LINE.format(title=title)
+        log.info("calendar: %r removed again", title)
+        return UNDONE_LINE
+    return _undo
+
+
+def add_event(calendars, title: str, start: datetime, end: datetime,
+              calendar_name: Optional[str] = None) -> tuple:
+    """Add one event -> (line to speak, undo callable). Raises on refusal or
+    failure.
+
+    Server errors propagate rather than being smoothed into a success line:
+    telling the user an event was added when it was not is the worst outcome
+    available here. The undo callable never raises -- it returns the line to
+    say, including the honest refusal when this server gives no delete path.
     """
     target = pick_write_calendar(calendars, calendar_name)   # raises ValueError
     name = _cal_name(target) or DEFAULT_WRITE_CALENDAR
-    target.save_event(build_vevent(title, start, end))
+    saved = target.save_event(build_vevent(title, start, end))
     log.info("calendar: added %r to %s at %s", title, name, start.isoformat())
     when = start.strftime("%A at %-I:%M %p").replace(" 0", " ")
     # The default list is literally called "Calendar"; "your Calendar calendar"
     # reads like a stutter out loud.
     where = "your calendar" if name.lower() == DEFAULT_WRITE_CALENDAR.lower() \
         else f"your {name} calendar"
-    return f"Added {title}, {when}, to {where}, sir."
+    return f"Added {title}, {when}, to {where}, sir.", _undo_add(saved, title)
+
+
+# The tool handler inside make_tools is ALSO called add_event -- that is the
+# name the model calls -- and shadows this one inside that closure. This
+# alias is how it reaches the real writer.
+_add_event = add_event
+
+
+def write_event(calendars, title: str, start: datetime, end: datetime,
+                calendar_name: Optional[str] = None) -> str:
+    """``add_event`` without the undo, for callers that cannot use one."""
+    return add_event(calendars, title, start, end, calendar_name)[0]
 
 
 def event_confidence(text: str, now: datetime) -> tuple[bool, str]:
@@ -918,14 +977,18 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
         source.pending_event = None
         try:
-            line = write_event(source.icloud_calendars(), title, when, end,
-                               calendar_name=calendar)
+            line, undo = _add_event(source.icloud_calendars(), title, when, end,
+                                    calendar_name=calendar)
         except ValueError as exc:            # refusal: protected / unknown
             return ToolResult(text=str(exc), ok=False, speak=str(exc))
         except Exception as exc:             # noqa: BLE001 - server trouble
             log.exception("calendar write failed")
             line = f"I couldn't add that, sir — {type(exc).__name__}."
             return ToolResult(text=line, ok=False, speak=line)
+        # Park the way back out: a ToolResult carries no undo slot, and this
+        # is the path a confident add takes, so "scratch that" would
+        # otherwise have nothing to reach for.
+        source.last_add = {"undo": undo, "at": time.monotonic(), "title": title}
         return ToolResult(text=line, speak=line)
 
     return [ToolSpec(

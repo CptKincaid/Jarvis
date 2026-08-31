@@ -452,6 +452,35 @@ def tool_registry(tmp_path, cfg, monkeypatch, fetch=None, clock=None):
     return reg, src
 
 
+def test_a_confident_add_parks_its_undo_on_the_source(tmp_path, monkeypatch):
+    """The confident path never asks, so it returns a ToolResult and not a
+    CommandResult -- and a ToolResult has no undo slot. Without the parked
+    entry "scratch that" would have nothing to reach for, which is how an
+    add ended up being un-take-back-able in the first place."""
+    reg, src = tool_registry(tmp_path, FakeCfg(urls=[URL]), monkeypatch)
+    removed = []
+
+    class Saved:
+        def delete(self):
+            removed.append(1)
+
+    class WritableCal:
+        name = "Calendar"
+
+        def get_supported_components(self):
+            return ["VEVENT"]
+
+        def save_event(self, ical):
+            return Saved()
+
+    monkeypatch.setattr(src, "icloud_calendars", lambda: [WritableCal()])
+    r = reg.call("add_event", {"text": "lab presentation on friday at 9 am"})
+    assert r.ok and "Added" in r.text
+    assert callable(src.last_add["undo"]) and src.last_add["title"]
+    assert src.last_add["undo"]() == calendar.UNDONE_LINE
+    assert removed == [1]
+
+
 def test_tool_spec_and_unconfigured_excuse(tmp_path, monkeypatch):
     specs = calendar.make_tools(FakeCfg(), SimpleNamespace())
     specs = sorted(specs, key=lambda sp: sp.name != "get_calendar")
