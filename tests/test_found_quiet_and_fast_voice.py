@@ -26,7 +26,6 @@ the pipelined path synthesises chunk by chunk, and normalising each chunk
 independently would make the volume pump between them mid-sentence.
 """
 import numpy as np
-import pytest
 
 from jarvis import tts as tts_mod
 

@@ -22,6 +22,10 @@ cap and harvested material falls off the tail first:
    "BIOSENSORS" arrive here with no network and no CalendarService.
 6. Canvas course names via ``canvas.cached_course_names()`` -- a snapshot
    of that tool's module cache, NEVER a fetch.
+7. The buildings in those same events, normalised through
+   ``leavetime.building_key`` -- "Wisenbaker", "Emerging Technologies".
+   He says these out loud to teach a walk, and they are proper nouns no
+   language model expects.
 
 Whisper's prompt window is ~224 tokens and which end a backend trims
 differs, so the prompt is capped HERE (PROMPT_CHAR_CAP) and the cap drops
@@ -51,12 +55,14 @@ log = get_logger("vocab")
 PROMPT_CHAR_CAP = 880
 PROMPT_TTL_S = 60.0
 MAX_CALENDAR_TITLES = 20
+MAX_BUILDINGS = 8
 MAX_COURSES = 12
 
 _clock = time.monotonic        # test seam
 _lock = threading.Lock()
 _cached: tuple[float, str] | None = None
-_calendar_cached: tuple[float, list] | None = None   # (file mtime, titles)
+_calendar_cached: tuple[float, list, list] | None = None
+# (file mtime, event titles, building names)
 
 
 def clear_cache() -> None:
@@ -136,39 +142,74 @@ def _pronounce_keys() -> list:
         return []
 
 
-def _calendar_titles() -> list:
-    """Event titles from the calendar's disk cache, parsed once per file
-    mtime. Read-only on purpose: no CalendarService, no refresh, no lock
-    shared with the tool -- a stale title still biases Whisper right."""
+def _building_name(location) -> str:
+    """The spoken building in a calendar location string, or "".
+
+    Reuses jarvis/leavetime.py's normaliser so the prompt and the learned
+    walks agree on what a building is called: the two ETB rooms are one
+    "Emerging Technologies", the Zoom URL and the empty locations are
+    nothing. Imported here rather than at module scope -- build_prompt runs
+    on the hot voice path and this file's imports stay small."""
+    try:
+        from jarvis.leavetime import building_key, speech_name
+    except Exception:  # noqa: BLE001 - the prompt is best-effort
+        return ""
+    key = building_key(location)
+    return speech_name(key) if key else ""
+
+
+def _parse_calendar_cache() -> tuple:
+    """(titles, buildings) from the calendar's disk cache, parsed once per
+    file mtime. Read-only on purpose: no CalendarService, no refresh, no
+    lock shared with the tool -- a stale title still biases Whisper right."""
     global _calendar_cached
     path = PATHS.CACHE_DIR / "calendar_cache.json"
     try:
         mtime = path.stat().st_mtime
     except OSError:
-        return []
+        return [], []
     hit = _calendar_cached
     if hit is not None and hit[0] == mtime:
-        return list(hit[1])
+        return list(hit[1]), list(hit[2])
     titles, seen = [], set()
+    buildings, seen_b = [], set()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         sources = data.get("sources") if isinstance(data, dict) else None
         for entry in (sources or {}).values():
             events = entry.get("events") if isinstance(entry, dict) else None
             for ev in events if isinstance(events, list) else []:
-                title = " ".join(str(ev.get("title") or "").split()) \
-                    if isinstance(ev, dict) else ""
-                key = title.lower()
-                if not title or key == "untitled" or key in seen:
+                if not isinstance(ev, dict):
                     continue
-                seen.add(key)
-                titles.append(title[:48])
+                title = " ".join(str(ev.get("title") or "").split())
+                key = title.lower()
+                if title and key != "untitled" and key not in seen:
+                    seen.add(key)
+                    titles.append(title[:48])
+                place = _building_name(ev.get("location"))
+                if place and place.lower() not in seen_b:
+                    seen_b.add(place.lower())
+                    buildings.append(place[:32])
     except Exception:
         log.exception("calendar cache unreadable for the prompt")
-        return []
+        return [], []
     titles = titles[:MAX_CALENDAR_TITLES]
-    _calendar_cached = (mtime, titles)
-    return list(titles)
+    buildings = buildings[:MAX_BUILDINGS]
+    _calendar_cached = (mtime, titles, buildings)
+    return list(titles), list(buildings)
+
+
+def _calendar_titles() -> list:
+    return _parse_calendar_cache()[0]
+
+
+def _calendar_buildings() -> list:
+    """The buildings he actually walks to. He says these names out loud --
+    "how long to Wisenbaker" teaches jarvis/leavetime.py a walk -- and a
+    proper noun no language model expects is exactly what an initial_prompt
+    is for. Last in the priority order: the cap should eat a building
+    before it eats a name he taught by hand."""
+    return _parse_calendar_cache()[1]
 
 
 def _course_names() -> list:
@@ -207,7 +248,7 @@ def build_prompt() -> str:
     capped = False
     for term in (_terms(_user_vocab()) + load_names() + _pronounce_keys()
                  + _terms(DEFAULT_VOCAB) + _calendar_titles()
-                 + _course_names()):
+                 + _course_names() + _calendar_buildings()):
         key = term.lower()
         if key in seen:
             continue

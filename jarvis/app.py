@@ -44,6 +44,7 @@ from jarvis.events import (
     PowerUp,
     ClaudeProgress,
     ClaudeTaskState,
+    DeskState,
     JarvisReply,
     ModelInfo,
     PartialText,
@@ -67,6 +68,7 @@ from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
 from jarvis import earcons
 from jarvis import speak_queue, standup, voice_check
+from jarvis import leavetime as leavetime_mod
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
@@ -168,6 +170,12 @@ _NO_WORDS = frozenset({"no", "n", "nope", "nah", "deny", "denied", "decline",
                        "declined", "don't", "dont", "negative", "reject", "refuse"})
 
 DISCORD_ACTIVE_S = 600.0        # a Discord exchange stays "active" this long
+# Two probes answer "he's back" -- the phone on the Wi-Fi (jarvis/presence.py)
+# and the keyboard (jarvis/deskpresence.py). They cross their thresholds
+# minutes apart on the same walk through the door, and that is ONE return:
+# both greetings go through _greet_return, which speaks at most once per
+# damper. release() already drains atomically, so only the LINE could double.
+GREET_DAMPER_S = 600.0
 
 
 def yes_no(text: str):
@@ -286,6 +294,11 @@ class JarvisApp:
         # Both read services lazily (calendar, presence) because services is
         # built further down; both are started in start_assistant.
         self.presence = self._construct("presence", self._make_presence)
+        # The desk probe needs no configuration at all (GNOME's idle
+        # monitor over the session bus), so it is what actually answers
+        # "is he there" on this box: presence.phone_ip / phone_mac are
+        # unset, so the Wi-Fi sentinel has never fired in the room.
+        self.desk = self._construct("desk", self._make_desk)
         self.quiet = self._construct("quiet", self._make_quiet)
         # The arc names the hour and publishes ArcChanged; it is a state
         # source with no side effects, so it is safe to build before the
@@ -422,6 +435,8 @@ class JarvisApp:
         bus.subscribe(JarvisReply, self._on_reply_for_discord)
         bus.subscribe(Presence, self._on_presence)
         self._wire_roomtone()
+        bus.subscribe(DeskState, self._on_desk)
+        self._last_greeted = 0.0        # GREET_DAMPER_S, shared by both probes
 
         if CONFIG.target_name:
             self.desktop.restore_target(CONFIG.target_name)
@@ -513,6 +528,26 @@ class JarvisApp:
             return None
         return mod.RoomMixer(cfg=self.assistant,
                              state_path=PATHS.MEMORY_DIR / "mixer_state.json")
+    def _make_desk(self):
+        mod = _import_optional("jarvis.deskpresence")
+        return None if mod is None else mod.DeskSentinel(self.assistant)
+
+    def _is_home(self) -> bool:
+        """The ONE away signal the quiet policy reads (its ``is_home``
+        seam, gated by quiet.hold_when_away). Both probes fail OPEN, so
+        this is False only once one of them has ESTABLISHED he is gone: an
+        unconfigured phone probe and a session with no Mutter interface
+        both leave it True, exactly as before this existed."""
+        for probe in (getattr(getattr(self, "presence", None), "is_home", None),
+                      getattr(getattr(self, "desk", None), "is_at_desk", None)):
+            if not callable(probe):
+                continue
+            try:
+                if not probe():
+                    return False
+            except Exception:  # noqa: BLE001 - a broken probe must not mute him
+                log.debug("presence: probe failed", exc_info=True)
+        return True
 
     def _make_quiet(self):
         mod = _import_optional("jarvis.quiet")
@@ -527,7 +562,11 @@ class JarvisApp:
                         or getattr(getattr(self, "tts", None), "busy", False) is True)
         kwargs = dict(
             get_calendar=lambda: getattr(getattr(self, "services", None), "calendar", None),
-            is_home=(presence.is_home if presence is not None else None),
+            # Both away probes feed the ONE existing hold_when_away seam
+            # (see _is_home); a second suppression path would be invisible
+            # to every consumer that already reads this one.
+            is_home=(self._is_home if (presence is not None or self.desk is not None)
+                     else None),
             say=self._say)                  # the digest is an answer, never held
         # Lazy: self.focus is constructed AFTER the policy, so this must be a
         # late lookup, not the object.
@@ -925,7 +964,13 @@ class JarvisApp:
             # docs.make_tools parks its DocsIndex here for quiz mode
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
-            quiet=self.quiet, presence=self.presence,
+            quiet=self.quiet, presence=self.presence, desk=self.desk,
+            # Seconds since the last keyboard / mouse event, or None when
+            # this session has no idle signal. A callable, not a number.
+            desk_idle_s=(self.desk.idle_s if self.desk is not None
+                         else (lambda: None)),
+            # The learned per-building walks; filled in start_assistant.
+            leavetime=None,
             # Reasoned dissent + the Aside (jarvis/objections.py,
             # jarvis/aside.py). Both are parked here rather than reached
             # for by import so a stand-in services namespace in the tests
@@ -1169,6 +1214,27 @@ class JarvisApp:
             log.exception("presence: quiet gate failed")
             return ""
 
+    def _on_desk(self, ev):
+        """He sat down at (or walked away from) the keyboard.
+
+        Routed through the SAME greeter as the phone probe: with both
+        configured they would otherwise each say "Welcome back, sir" on the
+        same return -- release() drains atomically so the digest cannot
+        double, but the greeting line would. The damper in _greet_return is
+        what actually prevents it. The board's standby is a separate
+        consumer (the main window subscribes to DeskState itself)."""
+        bus.publish(Status(text="At the desk" if ev.at_desk else "Desk empty",
+                           kind="info"))
+        if not (ev.at_desk and ev.returned):
+            return
+        # When the Wi-Fi probe is configured it owns the greeting: it knows
+        # he left the building, which is the return worth marking. Sitting
+        # back down after a coffee is not.
+        presence = getattr(self, "presence", None)
+        if presence is not None and getattr(presence, "configured", False):
+            return
+        self._greet_return("desk")
+
     def _arrival_actions(self) -> dict:
         """The callables behind jarvis/arrival.ARRIVAL_STEPS.
 
@@ -1285,6 +1351,42 @@ class JarvisApp:
                 tone.settle()          # the bed drops to its floor; nothing is said
             except Exception:
                 log.exception("departure: room tone settle failed")
+        return True
+
+    # ------------------------------------------------------- leave times
+    def _ask_leave_time(self, key: str, place: str) -> bool:
+        """jarvis/leavetime.py asking, once ever, how long a walk is.
+
+        False means "not now": a turn is in flight, or talk-back is off, so
+        the question would land on top of something or be silently lost
+        with the pending answer armed. The watch retries on the next tick
+        and only records the ask when this returns True."""
+        if not CONFIG.talkback:
+            return False
+        if self._turn_busy.is_set() or self._audio_busy.is_set() or \
+                getattr(getattr(self, "recorder", None), "recording", False):
+            return False
+        commander = getattr(self, "commander", None)
+        arm = getattr(commander, "ask_leave_time", None)
+        if not callable(arm):
+            return False
+        # The line below is proactive (nobody asked for it), so the quiet
+        # gate would HOLD it -- and a held question with an armed pending
+        # answer is a trap: he never hears it and the next duration he says
+        # gets filed as a walk. Check the gate first and simply try again
+        # on a later tick.
+        quiet = getattr(self, "quiet", None)
+        if quiet is not None:
+            try:
+                if quiet.should_hold():
+                    return False
+            except Exception:
+                log.exception("leavetime: quiet gate failed")
+                return False
+        question = leavetime_mod.ASK_LINE.format(place=place)
+        arm(key, place)
+        bus.publish(JarvisReply(text=question, speak=False))
+        self._say(question, proactive=True, kind="message")
         return True
 
     # --------------------------------------------------------- approvals
@@ -3258,6 +3360,8 @@ class JarvisApp:
                           # "unknown" a sentinel reports before its first probe.
                           ("arc", self.arc), ("roomtone", self.roomtone),
                           ("mixer", self.mixer)):
+        for name, obj in (("presence", self.presence), ("desk", self.desk),
+                          ("quiet", self.quiet)):
             if obj is None:
                 continue
             try:
@@ -3353,6 +3457,27 @@ class JarvisApp:
             self.debrief.start()
         except Exception:
             log.exception("debrief watch failed to start")
+        try:
+            from jarvis.leavetime import LeadTable, LeaveTimes
+            self.leavetime = LeaveTimes(
+                lambda: getattr(self.services, "calendar", None),
+                self.timekeeper, LeadTable(self.memory),
+                ask=self._ask_leave_time, cfg=self.assistant, quiet=self.quiet,
+                state_path=PATHS.MEMORY_DIR / "leavetime_state.json")
+            self.services.leavetime = self.leavetime
+            if self.timekeeper is not None:
+                self.leavetime.start()
+        except Exception:
+            log.exception("leave-time heads-up failed to start")
+        try:
+            from jarvis.calwatch import CalendarWatch
+            self.calwatch = CalendarWatch(
+                lambda: getattr(self.services, "calendar", None),
+                say=self._say, quiet=self.quiet, cfg=self.assistant,
+                state_path=PATHS.MEMORY_DIR / "calwatch_state.json")
+            self.calwatch.start()
+        except Exception:
+            log.exception("calendar anomaly watch failed to start")
         if residency:
             try:
                 # boot warm-up on its own daemon thread, then every 5 min
@@ -3490,9 +3615,12 @@ class JarvisApp:
                           ("mailwatch", getattr(self, "mailwatch", None)),
                           ("keyword_watch", getattr(self, "keyword_watch", None)),
                           ("debrief", getattr(self, "debrief", None)),
+                          ("leavetime", getattr(self, "leavetime", None)),
+                          ("calwatch", getattr(self, "calwatch", None)),
                           ("focus", getattr(self, "focus", None)),
                           ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),
+                          ("desk", getattr(self, "desk", None)),
                           ("quiet", getattr(self, "quiet", None)),
                           # roomtone first of the pair: its stop() takes the
                           # paplay stream down, and a bed left playing over a

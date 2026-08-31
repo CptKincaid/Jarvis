@@ -2901,3 +2901,143 @@ The cost is honest: the soundbar's radio stays awake, so it will idle a little w
 a battery-powered speaker would drain. Undo it by deleting that one file and restarting
 wireplumber again. Nothing in Jarvis depends on it — without it his first word is
 occasionally clipped after a long silence, and that is all.
+---
+
+## Desk presence, the calendar anomaly watch, and learned walk times
+
+Three additions of 2026-08-30. None of them needs a key, an account or a
+network: everything below is local.
+
+### Desk presence (`presence.desk*`)
+
+Jarvis asks GNOME how long it has been since the keyboard or mouse moved:
+
+```bash
+gdbus call --session --dest org.gnome.Mutter.IdleMonitor \
+  --object-path /org/gnome/Mutter/IdleMonitor/Core \
+  --method org.gnome.Mutter.IdleMonitor.GetIdletime
+(uint64 13478107,)      # milliseconds
+```
+
+No sudo, no configuration. It matters because the older Wi-Fi probe needs
+`presence.phone_ip` or `presence.phone_mac`, and with those unset the
+sentinel logs `presence: no phone_ip / phone_mac configured; sentinel idle`
+— so the whole welcome-back and catch-up machine has never fired in the
+room.
+
+```json
+"presence": {
+  "desk": true,
+  "desk_away_after_min": 25,
+  "desk_poll_s": 30,
+  "desk_standby": true,
+  "desk_standby_alpha": 0.45
+}
+```
+
+| key | what it does |
+|---|---|
+| `desk` | the whole feature. `false` and nothing below runs |
+| `desk_away_after_min` | minutes of no keyboard/mouse before the chair counts as empty. Generous on purpose: idle time is keyboard and mouse only, so reading a paper at the desk looks like an empty chair |
+| `desk_poll_s` | how often the idle monitor is asked (floor 5 s) |
+| `desk_standby` | dim the Jarvis window while the chair is empty |
+| `desk_standby_alpha` | how far it dims (1.0 = not at all, floor 0.2 so he can always find the window) |
+
+What it does and — as importantly — what it does not:
+
+* **Suppresses, never announces.** He will never say "nobody's home". The
+  away signal goes into the same `quiet.hold_when_away` gate the phone
+  probe already used, so proactive lines wait for the catch-up digest.
+* **Greets the return once.** Both probes go through one greeter with a
+  ten-minute damper, so if you ever do configure the phone as well, one
+  walk through the door is one "Welcome back, sir".
+* **A failure is silence, not a wrong answer.** No gdbus, no Mutter
+  interface, a timeout, unparsable output — all read as "no signal", and
+  the app behaves exactly as it did before this existed.
+* **The board's dimming is reversible and always restored**: on any wake
+  word, on any recording, and at quit.
+
+Turn it off for one process without touching the config:
+
+```bash
+JARVIS_DESK_PRESENCE=0 ~/vss_env/bin/python -m jarvis.app
+```
+
+(The test suite sets that variable: the session bus is the developer's real
+desktop and is the one piece of state that cannot be redirected into a
+throwaway directory.)
+
+### Calendar anomaly watch (`calendar.anomaly_watch`)
+
+On by default. Every successful calendar refresh is diffed against the last
+one, and a change to today or tomorrow earns one spoken line:
+
+> Your 9:10 am BIOSENSORS has been cancelled, sir.
+> Your 9:10 am BIOSENSORS has moved to 10:10 am, sir.
+> Your 4:00 pm Chiro has moved to ETB 1020, sir.
+> ADVISOR has been added to today at 3:10 pm, sir.
+
+Only one line is spoken per refresh; the rest go into the catch-up digest,
+and anything further out than tomorrow is filed silently. Quiet hours, DND
+and a running class hold the line like any other unbidden speech.
+
+It cannot cry wolf on a network outage: a failed source keeps its previous
+events and the diff only runs when the refresh reports that some source
+answered. Set `"calendar": {"anomaly_watch": false}` to switch it off. The
+snapshot lives at `~/.aiws_trainer/jarvis_memory/calwatch_state.json`;
+delete it and the next refresh simply relearns, silently.
+
+### Learned walk times (`calendar.leave_times`)
+
+The meeting heads-up speaks one global lead (`calendar.heads_up_min`, ten
+minutes). Ten minutes is right for a call and useless for a lecture on the
+far side of campus, so each building in your calendar gets its own lead —
+**learned, never guessed, and never from a maps API**:
+
+> **Jarvis:** BIOSENSORS in ten minutes, sir.
+> **Jarvis:** How long do you need to get to Wisenbaker, sir?
+> **You:** About twelve minutes.
+> **Jarvis:** Wisenbaker, 12 minutes. I'll have you moving in good time, sir.
+
+and from then on, before every event in that building:
+
+> You want to be walking in 5 minutes, sir; Wisenbaker is a 12 minute walk.
+
+```json
+"calendar": {"heads_up_min": 10, "leave_times": true, "leave_notice_min": 5}
+```
+
+You can also teach, amend and query it outright:
+
+| say | effect |
+|---|---|
+| "it takes ten minutes to get to Wisenbaker" | stores the walk |
+| "it's a 12 minute walk to the ETB" | same |
+| "the walk to Zachry is eight minutes" | same |
+| "make that ten next time" | amends the building he last mentioned |
+| "how long to Wisenbaker" | reads it back, or admits he does not know |
+
+Rules worth knowing:
+
+* He asks about a building **once, ever** — and only in passing, inside the
+  heads-up window, never while quiet hours are on and never over a turn in
+  flight. Answer "no idea" and he never asks again.
+* He **never asks about a Zoom link or an empty location**, and never
+  invents a building he has not seen in your calendar.
+* The reply he accepts as an answer must be plainly a duration, so a timer
+  you set in the same minute is still a timer.
+* Two rooms in one building are one walk: `Emerging Technologies Building
+  1003` and `… 1020` share a lead.
+
+The walks are stored in long-term memory as `leave_lead.<building>`
+preferences, not in `assistant.json` — they are facts about you, not
+settings. To see or clear them:
+
+```bash
+cd ~/Jarvis && ~/vss_env/bin/python - <<'EOF'
+from jarvis.memory import JarvisMemory
+mem = JarvisMemory()
+print({k: v for k, v in mem.get_all_preferences().items()
+       if k.startswith("leave_lead.")})
+EOF
+```

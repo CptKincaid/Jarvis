@@ -67,7 +67,8 @@ from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            BoardCommand, PowerUp,
                            UncertainResolved, UncertainUtterance,
                            BrainState, BriefingReady, ClaudeProgress,
-                           ClaudeTaskState, HotwordDetected, JarvisReply,
+                           ClaudeTaskState, DeskState, HotwordDetected,
+                           JarvisReply,
                            MicState, ModelInfo, PartialText, RecordingStarted,
                            RecordingStopped, ReminderFired, SpeakingState,
                            Status, Transcribed, UserUtterance, bus)
@@ -78,8 +79,8 @@ from jarvis.ui.board import BoardWindow, board_enabled
 from jarvis.ui.console_mode import (STANDBY, ConsoleModes, DeskWatch,
                                     resolve_idle_fn)
 from jarvis.ui.reactor import Reactor
-from jarvis.ui.views import CommandBar, SettingsDrawer, StatusStrip, \
-    TranscriptView
+from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
+                             TranscriptView, standby_alpha)
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, StatePill,
                                Toast, px, set_scale, ui_display, ui_mono)
 
@@ -536,6 +537,9 @@ class MainWindow:
         self._temps_text = ""     # written by worker thread, read by Tk loop
         self._mem_text = ""       # used RAM ('26.8 GB'), same worker
         self._closing = False
+        # Desk standby (jarvis/deskpresence.py): the board's current opacity.
+        # 1.0 is the only state the app ever boots in.
+        self._standby_alpha = 1.0
         # app-state machine inputs (bus events) → the header StatePill
         self._thinking = False
         self._speaking = False
@@ -1011,10 +1015,47 @@ class MainWindow:
         else:
             self.root.iconify()
 
+    # ------------------------------------------------------------ standby
+    def _apply_standby(self, at_desk) -> float:
+        """Dim (or restore) the board for a desk state. Returns the opacity
+        actually asked for. The ONLY thing this touches is this window's
+        own alpha -- no compositor setting, no other window, nothing
+        outside the app -- and any Tk failure leaves the board bright."""
+        enabled, dim = True, standby_alpha(False)
+        try:
+            # A Services with no get_option wired answers None (_noop), which
+            # must read as "the default", not as "switched off".
+            on = self.services.get_option("presence.desk_standby", True)
+            enabled = True if on is None else bool(on)
+            value = self.services.get_option("presence.desk_standby_alpha", dim)
+            dim = dim if value is None else float(value)
+        except Exception:  # noqa: BLE001 - a config hiccup keeps the default
+            log.debug("standby: option read failed", exc_info=True)
+        alpha = standby_alpha(at_desk, enabled=enabled, dim=dim)
+        if alpha == getattr(self, "_standby_alpha", 1.0):
+            return alpha
+        self._standby_alpha = alpha
+        try:
+            self.root.attributes("-alpha", alpha)
+        except tk.TclError:
+            # No compositor, or a window manager without _NET_WM_WINDOW_OPACITY:
+            # the feature is simply unavailable, never an error he sees.
+            log.debug("standby: -alpha unsupported", exc_info=True)
+        return alpha
+
+    def _wake_board(self) -> None:
+        """Undo standby. Called on the wake word, on any recording, and at
+        quit: the dimming must never outlive the reason for it."""
+        if getattr(self, "_standby_alpha", 1.0) != 1.0:
+            self._apply_standby(True)
+
     def _on_close(self):
         if self._closing:
             return
         self._closing = True
+        # Reversible, and restored on the way out: a crash mid-standby must
+        # not be the last state a window manager remembers.
+        self._wake_board()
         # BEFORE the geometry save: standby's burn-in walk has moved the
         # window, and saving a drifted position would make the console
         # creep across the desk one quit at a time.
@@ -1370,6 +1411,7 @@ class MainWindow:
         # the console's second surface and its power-up choreography
         bus.subscribe(BoardCommand, self._ev_board)
         bus.subscribe(PowerUp, self._ev_power_up)
+        bus.subscribe(DeskState, self._ev_desk)
 
     def _ev_status(self, ev: Status):
         self.set_status(ev.text, ev.kind)
@@ -1443,8 +1485,19 @@ class MainWindow:
                             "warn")
 
     def _ev_hotword(self, ev: HotwordDetected):
+        # The wake word is proof he is there whatever the idle monitor
+        # last said: the board comes back before he sees it dimmed.
+        self._wake_board()
         self.set_status(f"Wake word ({ev.score:.2f})", "ok")
         self._note_activity()
+
+    def _ev_desk(self, ev: DeskState):
+        """He walked away from (or back to) the keyboard: the board goes
+        to standby and comes back. Opacity only -- nothing outside this
+        window changes, and _wake_board restores it on any wake word, any
+        recording and at quit, so a failed probe can never leave a dim
+        board behind."""
+        self._apply_standby(ev.at_desk)
 
     def _ev_reminder(self, ev: ReminderFired):
         self._note_output()
@@ -1453,6 +1506,7 @@ class MainWindow:
 
     def _ev_rec_start(self, _ev: RecordingStarted):
         self._note_activity()
+        self._wake_board()
         self._recording = True
         self.command_bar.set_mic_state("recording")
         self.tray.update_state(True)

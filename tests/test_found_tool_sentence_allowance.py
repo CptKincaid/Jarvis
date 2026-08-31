@@ -18,9 +18,7 @@ against a result holding four events, Jarvis said:
 One sentence, one event named, three dropped. The count was right and the
 content was not there.
 """
-import pytest
 
-from jarvis.tools.registry import ToolResult
 
 from tests.test_brain_tools import (FakeOllama, setup, brain, text_reply,  # noqa: F401
                                     tool_reply)

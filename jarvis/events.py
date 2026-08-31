@@ -305,6 +305,19 @@ class Presence(Event):
 
 
 @dataclass
+class DeskState(Event):
+    """He sat down at / walked away from the keyboard (jarvis/deskpresence.py,
+    GNOME's Mutter idle monitor). Published only on a threshold crossing;
+    `returned` is True on away -> at-desk, which the app greets through the
+    SAME handler as Presence so the two probes cannot both say "Welcome
+    back, sir". `idle_s` is the reading that crossed the threshold."""
+    at_desk: bool = True
+    idle_s: float = 0.0
+    since: float = 0.0                # time.time() of the transition
+    returned: bool = False
+
+
+@dataclass
 class BriefingReady(Event):
     """A briefing was produced: `sections` renders as ONE transcript card
     (the reply card for that turn — no separate JarvisReply card), `spoken`

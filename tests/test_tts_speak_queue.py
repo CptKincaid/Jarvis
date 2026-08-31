@@ -1,5 +1,4 @@
 """Tests for jarvis.tts (queue mechanics, no audio) and jarvis.speak_queue."""
-import threading
 import time
 
 import pytest
