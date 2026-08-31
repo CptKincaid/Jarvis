@@ -56,11 +56,30 @@ def test_placeholders_are_truthful_and_typographic():
     assert CommandBar.PLACEHOLDER_HOT == "Type a command — or say “Jarvis”"
 
 
-def test_engine_card_rows_are_hear_speak_think_device():
+def test_engine_card_rows_are_hear_speak_think_device_fault():
+    # FAULT joined the card in the fault-lane change (jarvis/faults.py): a
+    # warn Status holds its pill for 4 s and an error for 6 s, so a fault
+    # raised while the room was empty left no trace on the board at all.
     from jarvis.ui.reactor import CARD_ROWS
     assert [lab for lab, _key in CARD_ROWS] == ["HEAR", "SPEAK", "THINK",
-                                                "DEVICE"]
-    assert [key for _lab, key in CARD_ROWS] == ["asr", "tts", "llm", "dev"]
+                                                "DEVICE", "FAULT"]
+    assert [key for _lab, key in CARD_ROWS] == ["asr", "tts", "llm", "dev",
+                                                "fault"]
+
+
+def test_every_card_row_has_a_value_and_a_source():
+    """A row is three couplings, not one tuple: CARD_ROWS, the values dict
+    in Reactor._apply_telemetry, and MainWindow._telemetry. Miss either of
+    the last two and the row renders a permanent "--" that looks like a
+    healthy reading -- which is why the literal list above is not enough."""
+    import inspect
+    from jarvis.ui.reactor import CARD_ROWS, Reactor
+    from jarvis.ui.main_window import MainWindow
+    apply_src = inspect.getsource(Reactor._apply_telemetry)
+    telem_src = inspect.getsource(MainWindow._telemetry)
+    for _lab, key in CARD_ROWS:
+        assert f'"{key}"' in apply_src, f"{key} missing from _apply_telemetry"
+        assert f'"{key}"' in telem_src, f"{key} missing from _telemetry"
 
 
 def test_you_card_width_shrink_wraps_between_35_and_70_percent():
