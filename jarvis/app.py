@@ -57,7 +57,9 @@ from jarvis.events import (
 from jarvis.logs import get_logger
 
 from jarvis import brain as brain_mod
+from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
+from jarvis import earcons
 from jarvis import speak_queue, standup, voice_check
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
@@ -228,6 +230,11 @@ class JarvisApp:
         self._last_milestone: dict[str, str] = {}
         self._assistant_started = False
         self._quitting = False
+        # The earcon lexicon reads sound.earcons / sound.volume / cooldown
+        # from here. Installed the way channels.notify.set_quiet_gate is,
+        # because recorder.play_beep() is a module function with no config
+        # of its own and the tones must not need one to be auditioned.
+        earcons.set_config(self.assistant)
 
         # ---- intelligence -------------------------------------------------
         self.memory = JarvisMemory(
@@ -997,39 +1004,124 @@ class JarvisApp:
         self._journal_claude(ev.project, "done", text)
 
     # ---------------------------------------------------------- presence
-    def _on_presence(self, ev):
-        """The phone came back (or left). One greeting per return, then
-        whatever was held while he was out -- the quiet policy's own tick
-        would read it too, so release() drains atomically and whichever
-        gets there first says it."""
-        bus.publish(Status(text="Home" if ev.home else "Away", kind="info"))
-        if not ev.home or not ev.returned:
-            return
-        from jarvis.presence import WELCOME_LINE
+    def _quiet_reason(self) -> str:
         quiet = getattr(self, "quiet", None)
-        if quiet is not None:
-            try:
-                reason = quiet.reason()
-            except Exception:
-                log.exception("presence: quiet gate failed")
-                reason = ""
-            # "you're out" is quiet.py's away reason: stale by definition on
-            # a returned event, so it never defers the greeting. Any OTHER
-            # reason (hours, DND, a meeting) does -- the backlog then waits
-            # for the policy's own tick.
-            if reason and reason != "you're out":
-                return
-        self._say(WELCOME_LINE)
         if quiet is None:
-            return
+            return ""
         try:
-            digest = quiet.release()
+            return str(quiet.reason() or "")
         except Exception:
-            log.exception("presence: digest failed")
-            return
-        if digest:
+            log.exception("presence: quiet gate failed")
+            return ""
+
+    def _arrival_actions(self) -> dict:
+        """The callables behind jarvis/arrival.ARRIVAL_STEPS.
+
+        A step returning False did nothing (there was no backlog), and
+        arrival.run() records only what actually happened -- which is what
+        the tests assert on.
+        """
+        from jarvis.presence import WELCOME_LINE
+
+        def panel():
+            # The panel coming off its dim is owned by the night surface, not
+            # here; what this step owns is the Status that wakes the console.
+            bus.publish(Status(text="Home", kind="ok"))
+            wake = getattr(self.services, "panel_wake", None)
+            if callable(wake):
+                wake()
+            return True
+
+        def earcon():
+            return earcons.play(arrival_mod.ARRIVAL_EARCON)
+
+        def greeting():
+            self._say(WELCOME_LINE)
+            return True
+
+        def catch_up():
+            quiet = getattr(self, "quiet", None)
+            if quiet is None:
+                return False
+            # release() drains atomically: the policy's own tick would read
+            # the same backlog, and whichever gets there first says it.
+            digest = quiet.release()
+            if not digest:
+                return False
             bus.publish(JarvisReply(text=digest, speak=True))
             self._say(digest)
+            return True
+
+        return {"panel": panel, "earcon": earcon, "greeting": greeting,
+                "catch-up": catch_up}
+
+    def _on_presence(self, ev):
+        """The phone came back, or left.
+
+        Arrival is a composed cue in a fixed order (jarvis/arrival.py):
+        panel, earcon, "Welcome back, sir", catch-up. Departure is its
+        mirror only in shape -- it is silent, and it waits out a confirm
+        window plus a mic-silence veto first, because a sleeping phone
+        radio faking a departure while he is in the room is the failure
+        worth spending latency on.
+        """
+        self._cancel_departure()
+        if not ev.home:
+            bus.publish(Status(text="Away", kind="info"))
+            self._arm_departure(ev)
+            return
+        cue = bool(self.assistant.get("presence.arrival_cue", True))
+        steps = arrival_mod.arrival_plan(returned=ev.returned, home=ev.home,
+                                         quiet_reason=self._quiet_reason(), cue=cue)
+        if not steps:
+            bus.publish(Status(text="Home", kind="info"))
+            return
+        done = arrival_mod.run(steps, self._arrival_actions())
+        log.info("arrival: %s", " -> ".join(done) or "(nothing)")
+
+    # ------------------------------------------------------ departure
+    def _cancel_departure(self) -> None:
+        timer, self._departure_timer = getattr(self, "_departure_timer", None), None
+        if timer is not None:
+            timer.cancel()
+
+    def _arm_departure(self, ev) -> None:
+        """Schedule the confirm check. Nothing is spoken, then or later."""
+        wait = arrival_mod.confirm_s(self.assistant.get)
+        timer = threading.Timer(wait, self._settle_if_gone, args=(ev,))
+        timer.daemon = True
+        timer.name = "departure-confirm"
+        self._departure_timer = timer
+        timer.start()
+        log.info("departure: confirming in %.0fs", wait)
+
+    def _settle_if_gone(self, ev) -> bool:
+        """The confirm window closed: settle the room, or say why not."""
+        self._departure_timer = None
+        if self._quitting:
+            return False
+        presence = getattr(self, "presence", None)
+        still_away = getattr(presence, "state", "away") == "away" if presence else True
+        now = time.time()
+        idle = self.turns.idle_s()
+        ok, why = arrival_mod.departure_ready(
+            now=now, since=getattr(ev, "since", 0.0) or now,
+            last_turn=(now - idle) if idle is not None else None,
+            confirm=arrival_mod.confirm_s(self.assistant.get),
+            mic_silence=arrival_mod.mic_silence_s(self.assistant.get),
+            still_away=still_away)
+        if not ok:
+            log.info("departure: not settling (%s)", why)
+            return False
+        for step in arrival_mod.departure_plan(home=False):
+            log.info("departure: %s (silent by design)", step)
+        tone = getattr(self, "roomtone", None)
+        if tone is not None:
+            try:
+                tone.settle()          # the bed drops to its floor; nothing is said
+            except Exception:
+                log.exception("departure: room tone settle failed")
+        return True
 
     # --------------------------------------------------------- approvals
     def _on_approval(self, req):
@@ -1207,7 +1299,21 @@ class JarvisApp:
         devices = self.recorder.mic_devices
         return devices.get(CONFIG.mic)
 
-    _WAKE_BEEP_GUARD_S = 0.2   # only when CONFIG.sound plays a chime
+    # Only when a chime will actually play. The gate is the earcon lexicon's
+    # own key (sound.earcons, default true), NOT CONFIG.sound: that flag
+    # lives in voice_settings.json, defaults False and means "the old
+    # start/stop chimes", so hanging the wake acknowledgement off it shipped
+    # it mute. Whichever gate says yes, the guard applies -- the bloom fires
+    # while the mic is opening and would otherwise be recorded straight back
+    # through the Snowball.
+    _WAKE_BEEP_GUARD_S = 0.2
+
+    def _wake_chime_enabled(self) -> bool:
+        """True when the wake acknowledgement will make a sound."""
+        try:
+            return bool(CONFIG.sound or earcons.enabled())
+        except Exception:                       # noqa: BLE001 - config boundary
+            return bool(CONFIG.sound)
 
     def _on_hotword(self, score):
         # Called from the hotword listener thread.
@@ -1251,7 +1357,8 @@ class JarvisApp:
         self._turn_filler_pending = False     # a stale flag would label this answer a filler
         self._say_again_count = 0
         self._wake_pending = True             # the capture about to open answers a wake word
-        if CONFIG.sound:
+        chime = self._wake_chime_enabled()
+        if chime:
             threading.Thread(target=play_beep, args=("start",), daemon=True).start()
         # The wake word ends and the user starts talking straight away, so
         # every millisecond before the mic opens is speech thrown away --
@@ -1263,7 +1370,7 @@ class JarvisApp:
         # which pauses the hotword, and this runs ON the hotword listener
         # thread -- pausing it from inside itself would wedge the listener.
         # Timer(0) still hands off to a new thread.
-        threading.Timer(self._WAKE_BEEP_GUARD_S if CONFIG.sound else 0.0,
+        threading.Timer(self._WAKE_BEEP_GUARD_S if chime else 0.0,
                         self.recorder.start).start()
 
     # ------------------------------------------------- live transcript
@@ -1532,6 +1639,7 @@ class JarvisApp:
         self._wake_pending = False            # a wake word is opening the mic
         self._turn_from_wake = False          # this capture answers a wake word
         self._last_nudge_ts = -1e9            # monotonic; see _last_guest_ts
+        self._departure_timer = None          # the silent-settle confirm window
         name = self.assistant.user_name if self.assistant is not None else "Hunter"
         self._guest_line = GUEST_LINE.format(name=name)
 
@@ -2789,6 +2897,9 @@ class JarvisApp:
     def stop_assistant(self):
         """Stop every assistant thread (quit, and the tests' teardown)."""
         self._quitting = True
+        # Before the members: a departure confirm pending on a Timer would
+        # otherwise fire minutes into the teardown and touch a stopped room.
+        self._cancel_departure()
         cal = getattr(self.services, "calendar", None)
         for name, obj in (("discord", self.discord), ("approvals", self.approvals),
                           ("cmdsock", getattr(self, "cmdsock", None)),

@@ -36,6 +36,7 @@ log = get_logger("presence")
 
 DEFAULT_AWAY_MIN = 12
 DEFAULT_POLL_S = 60.0
+DEFAULT_AWAY_POLL_S = 10.0     # see the poll_s docstring: arrival must be prompt
 PING_TIMEOUT_S = 3.0
 PRESENT_STATES = ("REACHABLE", "DELAY", "PERMANENT")
 WELCOME_LINE = "Welcome back, sir."
@@ -143,12 +144,24 @@ class PresenceSentinel:
 
     @property
     def poll_s(self) -> float:
+        """Seconds until the next probe -- FASTER while he is out.
+
+        Arrival is detected on the next poll, so at the 60 s default "the
+        room notices the door" is in practice "the room notices up to a
+        minute after he sat down", by which time he may already be
+        mid-utterance and a staged arrival cue reads as late rather than
+        composed. Polling every ~10 s costs one ping per 10 s and only
+        while the house is empty; once he is home the slow cadence is back,
+        because a present phone has nothing to tell us in a hurry.
+        """
         if self._poll_s is not None:
             return float(self._poll_s)
+        key = "presence.poll_s_away" if self.state == "away" else "presence.poll_s"
+        default = DEFAULT_AWAY_POLL_S if key.endswith("_away") else DEFAULT_POLL_S
         try:
-            return max(5.0, float(_cfg_get(self._cfg, "presence.poll_s", DEFAULT_POLL_S)))
+            return max(5.0, float(_cfg_get(self._cfg, key, default)))
         except (TypeError, ValueError):
-            return DEFAULT_POLL_S
+            return default
 
     # ------------------------------------------------------------- state
     @property

@@ -63,7 +63,11 @@ def _timers(monkeypatch):
 
 
 def test_no_chime_means_no_wait(app, monkeypatch):
+    """BOTH gates off. Since 2026-08-30 the wake acknowledgement is an
+    earcon (sound.earcons, default true), so CONFIG.sound alone no longer
+    decides whether anything is heard."""
     monkeypatch.setattr(CONFIG, "sound", False)
+    monkeypatch.setattr(app_mod.earcons, "enabled", lambda: False)
     seen = _timers(monkeypatch)
     app._on_hotword(0.9)
     assert len(seen) == 1
@@ -73,6 +77,17 @@ def test_no_chime_means_no_wait(app, monkeypatch):
 def test_a_chime_still_gets_its_guard(app, monkeypatch):
     """Otherwise the mic records the beep and Whisper transcribes it."""
     monkeypatch.setattr(CONFIG, "sound", True)
+    monkeypatch.setattr(app_mod.earcons, "enabled", lambda: False)
+    seen = _timers(monkeypatch)
+    app._on_hotword(0.9)
+    assert seen[0][0] == app._WAKE_BEEP_GUARD_S > 0
+
+
+def test_the_earcon_wake_ack_earns_the_same_guard(app, monkeypatch):
+    """The bloom fires while the mic is opening and would be recorded
+    straight back through the Snowball without it."""
+    monkeypatch.setattr(CONFIG, "sound", False)
+    monkeypatch.setattr(app_mod.earcons, "enabled", lambda: True)
     seen = _timers(monkeypatch)
     app._on_hotword(0.9)
     assert seen[0][0] == app._WAKE_BEEP_GUARD_S > 0
