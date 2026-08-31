@@ -572,6 +572,88 @@ def test_fallback_lines_are_in_voice(brain, monkeypatch):
                         "I'm afraid the Claude CLI isn't available, sir.")]
 
 
+# ------------------------------------------------------- register (#16)
+# The invariant the whole feature exists to protect: a register change is
+# ONE cache miss, never one per turn. The naive version rebuilds the system
+# prompt every call and evicts Ollama's prefix cache on every question.
+def test_the_static_prompt_is_stable_and_a_register_change_is_its_one_miss(
+        brain, monkeypatch):
+    import threading as _threading
+    monkeypatch.setenv("JARVIS_SHOT_SEED", "20260830")
+    monkeypatch.setattr(brain, "_SHOT_RNG", brain._shot_rng())
+    was = brain.register()
+    brain.reset_static_prompt()
+    try:
+        first = brain.static_system()
+        assert all(brain.static_system() == first for _ in range(50))
+
+        # ... and across threads racing on a COLD cache: _STATIC is read by
+        # the warm-up, the streaming path and the tool loop at once, and two
+        # unsynchronised rebuilds would draw two different few-shot samples.
+        brain.reset_static_prompt()
+        seen, errors = set(), []
+        lock = _threading.Lock()
+
+        def grab():
+            try:
+                system = brain.static_system()
+            except Exception as exc:               # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+                return
+            with lock:
+                seen.add(system)
+
+        threads = [_threading.Thread(target=grab) for _ in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+        assert not errors and len(seen) == 1
+
+        # exactly one change, then byte-identical again
+        stable = seen.pop()
+        assert brain.set_register("formal") is True
+        formal = brain.static_system()
+        assert formal != stable
+        assert all(brain.static_system() == formal for _ in range(50))
+        assert "formal register" in formal
+        assert "UDP" not in formal          # the joke family is dropped
+        # a no-op change and an unknown name cost NOTHING: no clear, no
+        # reprocess, and the handler can still answer "already formal, sir"
+        assert brain.set_register("formal") is False
+        assert brain.set_register("FORMAL") is False
+        assert brain.set_register("sardonic") is False
+        assert brain.static_system() == formal
+
+        assert brain.set_register("banter") is True
+        banter = brain.static_system()
+        assert banter not in (stable, formal)
+        assert "loosen up a shade" in banter
+        # banter must NOT add a few-shot family: gemma4 lifts examples
+        # wholesale, which is why the pool is down to three
+        assert len(brain.select_few_shots(register="banter")) == \
+            len(brain.select_few_shots(register="normal"))
+    finally:
+        brain._REGISTER["name"] = was
+        brain.reset_static_prompt()
+
+
+def test_a_normal_register_renders_no_clause_at_all(brain):
+    """"normal" is the absence of a register, not a register: the prompt is
+    byte-identical to the one before registers existed."""
+    shots = brain.FEW_SHOTS
+    assert brain.build_ollama_system(shots=shots, register="normal") == \
+        brain.JARVIS_SYSTEM.format(examples=brain.format_few_shots(shots),
+                                   register="")
+    for name in brain.REGISTERS:
+        rendered = brain.build_ollama_system(shots=shots, register=name)
+        assert "{" not in rendered and "}" not in rendered
+        assert not _MARKDOWN.search(rendered)
+        # the closing brevity instruction stays LAST (recency wins)
+        assert rendered.rstrip().endswith("Then stop.")
+
+
 # ------------------------------------------------------------- live
 @pytest.mark.slow
 @pytest.mark.skipif(os.environ.get("JARVIS_LIVE_OLLAMA") != "1",

@@ -15,6 +15,11 @@ back:
   talk to my advisor?" -- the day files are walked NEWEST first and the
   scan stops at the first hit, so a term mentioned this morning costs one
   file read where ``journal_rows`` would have read ninety;
+* ``journal_repeats`` renders the "Earlier today" continuity block for the
+  per-turn background: the same tool with the same salient argument N
+  times, the same question asked N times. It is the only thing here that
+  runs on the hot path, so it is bounded to two clauses and reads only
+  rows it is handed;
 * ``ActivitySampler`` samples the focused window every minute through the
   context engine's existing xdotool probe (no new subprocess), skipping
   a locked or empty desktop, so "go back" and the recap both get window
@@ -458,6 +463,140 @@ def last_mention_line(row, target: str, now: Optional[datetime] = None,
 def no_mention_line(target: str, name: str = "sir") -> str:
     what = " ".join(str(target or "").split()) or "that"
     return f"Nothing in the journal about {what}, {name}."
+
+
+# ------------------------------------------------------- continuity
+# "That would be the third coffee timer, sir." The journal is the ONLY
+# place a tool's argument survives -- habits.json rows carry the user's
+# utterance and no tool name at all, and memory.format_for_context already
+# emits its own "Habit suggestion" line into the same background, so
+# merging the two would put two numeric habit lines in every turn.
+#
+# What this adds over what the model already sees: format_for_prompt
+# renders the last four exchanges, so a question repeated twice in a row is
+# visible without help. The callback that is NOT visible is the one from
+# earlier in the day, which is why a repeated question only counts when its
+# first asking has fallen out of that four-turn window.
+REPEAT_MIN = 2                 # a count of one is not a callback
+MAX_CLAUSES = 2                # at most two clauses, one line
+CONVO_WINDOW = 4               # what format_for_prompt already shows
+REPEAT_SNIPPET = 60
+# The argument that makes a repeat countable, per tool, in priority order.
+# Deliberately excludes numbers ("minutes"): "the third five-minute timer"
+# is a coincidence, "the third coffee timer" is a fact about his morning.
+# It also excludes the defaulted selectors -- when="today", range="today",
+# action="list" -- which are the tool's own boilerplate, not his subject;
+# quoting them produced 'the 2nd "today" weather check' on the synthetic
+# day, which is noise dressed up as a callback.
+_SALIENT_ARGS = ("label", "topic", "query", "question", "text", "location",
+                 "which", "project")
+# The noun the count attaches to. A missing tool falls back to its own name
+# with the underscores spoken out.
+_TOOL_NOUNS = {
+    "set_timer": "timer", "set_alarm": "alarm", "set_reminder": "reminder",
+    "manage_schedule": "schedule change", "get_weather": "weather check",
+    "get_calendar": "calendar check", "add_event": "diary entry",
+    "get_mail": "mail check", "get_time": "clock check",
+    "get_briefing": "briefing", "recap_day": "recap", "notes": "note",
+    "get_location": "location check", "system_health": "health check",
+    "canvas_due": "coursework check", "canvas_grades": "grades check",
+    "canvas_announcements": "announcements check",
+    "ask_docs": "document question", "screen_qa": "screen check",
+    "docs_reindex": "document reindex",
+}
+CONTINUITY_HEAD = "Earlier today: "
+# Correction, round 3: VOICE_RULES bans reciting file names and unperformed
+# checks but says NOTHING about numbers, and the measured number
+# suppression lives in a few-shot pool that is sampled once per process.
+# A block that hands the model a count therefore carries its own rule.
+CONTINUITY_RULE = ("Those counts are background: let them colour the reply, "
+                   "and never read one aloud unless he asks how many.")
+
+
+def _ordinal(n: int) -> str:
+    suffix = "th" if 10 <= n % 100 <= 20 else \
+        {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _times(n: int) -> str:
+    return "twice" if n == 2 else f"{n} times"
+
+
+def _norm(text) -> str:
+    """Lowercased, punctuation-free, wake-word-free key for one utterance."""
+    t = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    t = re.sub(r"^(?:hey |ok |okay )?jarvis[,!.]?\s*", "", t)
+    return re.sub(r"[^a-z0-9 ]", "", t).strip()
+
+
+def _salient(args) -> str:
+    """The one argument worth counting on, "" when the call had none."""
+    if not isinstance(args, dict):
+        return ""
+    for key in _SALIENT_ARGS:
+        val = args.get(key)
+        if isinstance(val, str) and val.strip():
+            return re.sub(r"\s+", " ", val).strip()[:40]
+    return ""
+
+
+def _tool_clause(name: str, arg: str, count: int) -> str:
+    noun = _TOOL_NOUNS.get(name) or str(name).replace("_", " ")
+    if arg:
+        return f'{_ordinal(count)} "{arg}" {noun}'
+    return f"{_ordinal(count)} {noun}"
+
+
+def journal_repeats(rows, max_clauses: int = MAX_CLAUSES) -> str:
+    """The "Earlier today" block for the per-turn background, or "".
+
+    Two lines at most: the counts, then the rule that keeps them out of his
+    ear. ``rows`` is whatever ``ContextEngine.journal_rows`` returned for
+    today; nothing here reads a file or a clock.
+    """
+    rows = [r for r in rows if isinstance(r, dict)]
+    if not rows:
+        return ""
+    tools: dict = {}
+    exchanges: list = []
+    for row in rows:
+        kind = row.get("kind")
+        if kind == "tool":
+            if not row.get("ok", True):
+                continue          # a failed call is not something he did twice
+            name = str(row.get("name") or "").strip()
+            if not name:
+                continue
+            key = (name, _salient(row.get("args")))
+            tools[key] = tools.get(key, 0) + 1
+        elif kind == "exchange":
+            said = str(row.get("user") or "").strip()
+            if said:
+                exchanges.append(said)
+
+    clauses = []
+    for (name, arg), count in tools.items():
+        if count >= REPEAT_MIN:
+            clauses.append((count, 0, _tool_clause(name, arg, count)))
+
+    seen: dict = {}
+    for i, said in enumerate(exchanges):
+        key = _norm(said)
+        if key:
+            seen.setdefault(key, []).append(i)
+    cutoff = len(exchanges) - CONVO_WINDOW
+    for key, hits in seen.items():
+        if len(hits) < REPEAT_MIN or hits[0] >= cutoff:
+            continue          # still inside the window the model already sees
+        said = _snip(exchanges[hits[0]], REPEAT_SNIPPET)
+        clauses.append((len(hits), 1, f'he asked "{said}" {_times(len(hits))}'))
+
+    if not clauses:
+        return ""
+    clauses.sort(key=lambda c: (-c[0], c[1]))
+    line = CONTINUITY_HEAD + "; ".join(c[2] for c in clauses[:max_clauses]) + "."
+    return f"{line}\n{CONTINUITY_RULE}"
 
 
 # ----------------------------------------------------------- sampler
