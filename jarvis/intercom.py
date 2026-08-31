@@ -68,6 +68,7 @@ EMPTY_LINE = "That clip was empty, sir."
 NO_DECODER_LINE = "I have no audio decoder installed, sir."
 NOT_HIM_LINE = "That didn't sound like you, sir."
 NOTHING_HEARD_LINE = "I couldn't make anything out of that clip, sir."
+OFF_LINE = "The intercom is switched off, sir."
 
 
 class IntercomError(Exception):
@@ -169,6 +170,56 @@ def to_mono_16k(raw: bytes):
 def clip_from_b64(payload, max_bytes: int = MAX_AUDIO_BYTES):
     """The one call a transport needs: base64 field -> pipeline audio."""
     return to_mono_16k(decode_b64(payload, max_bytes))
+
+
+def settings(app) -> tuple:
+    """``(enabled, verify_speaker, max_bytes)`` off the app's assistant
+    config, with the defaults when there is no config (or it is
+    unreadable).
+
+    Every transport reads the SAME three switches here rather than
+    keeping its own copy: the command socket (jarvis/cmdsock.py) and the
+    phone client (jarvis/webapp.py) must not be able to disagree about
+    whether the intercom is switched off or how large a clip may be."""
+    cfg = getattr(app, "assistant", None)
+    if cfg is None:
+        return True, False, MAX_AUDIO_BYTES
+    try:
+        return (bool(cfg.get("intercom.enabled", True)),
+                bool(cfg.get("intercom.verify_speaker", False)),
+                max(1, int(float(cfg.get("intercom.max_mb", 10)) * 1048576)))
+    except Exception:                     # noqa: BLE001 - config boundary
+        log.debug("intercom config unreadable; using defaults", exc_info=True)
+        return True, False, MAX_AUDIO_BYTES
+
+
+def text_from_clip(app, raw: bytes) -> str:
+    """Container bytes off a transport -> the transcript to dispatch.
+
+    The whole trip in one call: the switches, the size cap, the decode to
+    16 kHz mono, the speaker gate and Whisper. Raises IntercomError
+    carrying the line to show the far end."""
+    enabled, verify, max_bytes = settings(app)
+    if not enabled:
+        raise IntercomError(OFF_LINE, "disabled")
+    raw = bytes(raw or b"")
+    if not raw:
+        raise IntercomError(EMPTY_LINE, "empty")
+    if len(raw) > max_bytes:
+        raise IntercomError(TOO_BIG_LINE.format(mb=max_bytes / 1048576), "size")
+    return transcribe(app, to_mono_16k(raw), verify=verify)
+
+
+def text_from_b64(app, payload) -> str:
+    """text_from_clip for a transport that carries the clip as base64.
+
+    The size is still checked on the ENCODED text (decode_b64), before the
+    bytes exist in memory."""
+    enabled, verify, max_bytes = settings(app)
+    if not enabled:
+        raise IntercomError(OFF_LINE, "disabled")
+    return transcribe(app, clip_from_b64(payload, max_bytes=max_bytes),
+                      verify=verify)
 
 
 # ---------------------------------------------------------- transcription

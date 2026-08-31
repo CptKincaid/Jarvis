@@ -393,10 +393,26 @@ DEFAULTS: dict = {
     # the gate (which fails SHUT) would reject his own voice. max_mb caps
     # one clip; the socket framing allows a little more than this.
     "intercom": {"enabled": True, "verify_speaker": False, "max_mb": 10},
+    # The phone client (jarvis/webapp.py): a page served to a device on the
+    # home Wi-Fi, off the same dispatch_text the CLI uses. OFF by default
+    # and deliberately so -- nothing listens on a network port until he
+    # turns this on. `bind` empty means "this box's own LAN address",
+    # discovered at start; whatever it resolves to must be a PRIVATE
+    # address or the server refuses to start, and there is no wildcard
+    # bind, no tunnel and no port-forward anywhere in that module. `token`
+    # is generated on first enable, lives in this 0600 file and is in
+    # SECRET_KEYS; delete it and restart to rotate the key. link_file /
+    # qr_file are where the URL-with-key is left for him, 0600.
+    "phone": {"enabled": False, "bind": "", "port": 8765, "token": "",
+              "max_audio_mb": 8, "link_file": "~/jarvis-phone.txt",
+              "qr_file": "~/jarvis-phone.svg"},
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",
-               "spotify.client_secret", "canvas.token")
+               "spotify.client_secret", "canvas.token",
+               # the phone client's bearer key: it is the whole
+               # authentication, so it must never reach a log
+               "phone.token")
 # Secrets that live inside a LIST of sections rather than at a dotted path:
 # (list key, field). gmail.accounts[].app_password was invisible to redacted()
 # and scrub(), so repr(cfg) printed three real app passwords in full.

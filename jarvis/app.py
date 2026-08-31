@@ -158,14 +158,18 @@ NUDGE_LINE = "Sir?"
 GUEST_LINE = "I only answer to {name}, sir."
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
-# The sources that arrive over the command socket (jarvis/cmdsock.py): a
-# shell / SSH / cron client, and a clip sent from the phone
-# (jarvis/intercom.py). They share three rules that the voice, typed and
+# The sources that arrive from somewhere other than this desk: a shell /
+# SSH / cron client and a clip sent over the command socket
+# (jarvis/cmdsock.py, jarvis/intercom.py), and the phone client's page
+# (jarvis/webapp.py). They share three rules that the voice, typed and
 # Discord sources do not -- their replies are stamped with a turn_id for
-# the socket stream, `quiet` mutes THAT turn's speech, and neither cuts a
-# reply Jarvis is already speaking to someone in the room.
-SOCKET_SOURCES = ("cli", "intercom")     # intercom.SOURCE, spelled out here
-                                         # so the wiring hub need not import it
+# the requesting stream, `quiet` mutes THAT turn's speech, and none of them
+# cuts a reply Jarvis is already speaking to someone in the room. The last
+# two are why "phone" belongs here: a question asked from bed must not make
+# the soundbar answer the house, and must not talk over the room.
+SOCKET_SOURCES = ("cli", "intercom", "phone")   # intercom.SOURCE / webapp.SOURCE,
+                                                # spelled out so the wiring hub
+                                                # need not import either module
 
 _YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "aye", "allow",
                         "allowed", "approve", "approved", "ok", "okay", "sure",
@@ -387,6 +391,7 @@ class JarvisApp:
         self.alerts = self._construct("alerts", self._make_alerts)
         self.discord = self._construct("discord", self._make_discord)
         self.cmdsock = self._construct("cmdsock", self._make_cmdsock)
+        self.webapp = self._construct("webapp", self._make_webapp)
         if self.alerts is not None:
             try:
                 self.alerts.attach(self.discord)
@@ -669,6 +674,13 @@ class JarvisApp:
         if mod is None:
             return None
         return mod.CommandSocket(PATHS.COMMAND_SOCK, self)
+
+    def _make_webapp(self):
+        # The phone client. Constructing it binds nothing: PhoneServer.start()
+        # is where phone.enabled is read and where a non-private bind address
+        # is refused, so a box with the feature off never opens a port.
+        mod = _import_optional("jarvis.webapp")
+        return None if mod is None else mod.PhoneServer(self)
 
     def _register_tools(self):
         """tools.register_many(m.make_tools(assistant, services)) for every
@@ -3536,6 +3548,8 @@ class JarvisApp:
         for name, obj in (("timekeeper", self.timekeeper),
                           ("approvals", self.approvals),
                           ("cmdsock", getattr(self, "cmdsock", None)),
+                          # start() is a no-op unless phone.enabled
+                          ("webapp", getattr(self, "webapp", None)),
                           ("discord", self.discord)):
             if obj is None:
                 continue
@@ -3921,6 +3935,7 @@ class JarvisApp:
         cal = getattr(self.services, "calendar", None)
         for name, obj in (("discord", self.discord), ("approvals", self.approvals),
                           ("cmdsock", getattr(self, "cmdsock", None)),
+                          ("webapp", getattr(self, "webapp", None)),
                           ("timekeeper", self.timekeeper), ("calendar", cal),
                           ("claude", self.claude),
                           ("health_watchdog", getattr(self.services, "health_watchdog", None)),
