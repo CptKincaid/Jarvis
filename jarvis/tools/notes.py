@@ -6,6 +6,13 @@ JARVIS voice. The ``notes`` tool wraps it for the local tool loop; every
 confirmation is returned as ``ToolResult.speak`` so no model turn is
 needed for "note that …" / "what's on my list".
 
+Beyond the two built-in kinds there are NAMED lists ("shopping",
+"packing"): rows in ``lists`` / ``list_items`` addressed by the kind
+string ``list:<name>`` (``list_kind()`` builds one, ``list_name()`` reads
+one back). Every method below takes that kind, so named lists inherit the
+whole resolve / ordinal / read-back plumbing rather than growing a
+parallel one.
+
 ``which`` resolution (``resolve``): ``last`` / ``latest``, an ordinal or
 index ("the second one", "2", "#2", "number two"), ``first``, or a
 case-insensitive substring of the item text. Ordinals index the same
@@ -23,13 +30,13 @@ from pathlib import Path
 from typing import Optional
 
 from jarvis.logs import get_logger
+from jarvis.tools.docs import match_name
 from jarvis.tools.location import cfg_get
 from jarvis.tools.registry import ToolResult, ToolSpec
 
 log = get_logger("tools.notes")
 
 KINDS = ("note", "todo")
-_TABLE = {"note": "notes", "todo": "todos"}
 _KIND_WORDS = {"note": "note", "notes": "note", "memo": "note", "memos": "note",
                "todo": "todo", "todos": "todo", "to-do": "todo", "to-dos": "todo",
                "to do": "todo", "to dos": "todo", "task": "todo", "tasks": "todo",
@@ -44,6 +51,17 @@ _ACTION_WORDS = {
     "done": "done", "complete": "done", "finish": "done", "finished": "done",
     "tick": "done", "check": "done", "completed": "done", "mark": "done",
 }
+# A named list is a kind like any other: "list:shopping". Keeping it a
+# kind STRING (rather than an extra argument on nine methods) is what lets
+# resolve/remove/complete/list_text serve lists unchanged -- including the
+# commander's destructive read-back, which only ever passes a kind around.
+LIST_PREFIX = "list:"
+# Words that are never part of a list's name.
+_LIST_STOP = {"the", "a", "an", "my", "our", "your", "his", "her", "this",
+              "that", "some"}
+_LIST_TAIL = {"list", "lists"}
+LIST_NAME_CHARS = 40
+
 _ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
              "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
              "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
@@ -71,6 +89,20 @@ CREATE TABLE IF NOT EXISTS todos (
     done INTEGER DEFAULT 0,
     done_at REAL
 );
+CREATE TABLE IF NOT EXISTS lists (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS list_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    list_id INTEGER NOT NULL,
+    text TEXT NOT NULL,
+    created REAL NOT NULL,
+    done INTEGER DEFAULT 0,
+    done_at REAL
+);
+CREATE INDEX IF NOT EXISTS list_items_by_list ON list_items(list_id);
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -78,10 +110,42 @@ CREATE TABLE IF NOT EXISTS meta (
 """
 
 
+def canon_list(name) -> str:
+    """A spoken list name in canonical form: "the Shopping List" ->
+    "shopping". Empty when nothing usable is left ("the list")."""
+    words = re.findall(r"[\w'-]+", str(name or "").lower())
+    while words and words[0] in _LIST_STOP:
+        words.pop(0)
+    while words and words[-1] in _LIST_TAIL:
+        words.pop()
+    words = [w for w in words if w not in _LIST_STOP]
+    return " ".join(words)[:LIST_NAME_CHARS].strip()
+
+
+def list_kind(name) -> str:
+    """'shopping' / 'the shopping list' -> 'list:shopping'; '' when the
+    name is empty or reserved (a named list must not shadow the built-in
+    notes and to-dos: "my task list" stays the to-do list)."""
+    c = canon_list(name)
+    if not c or c in _KIND_WORDS or c in KINDS:
+        return ""
+    return LIST_PREFIX + c
+
+
+def list_name(kind) -> Optional[str]:
+    """'list:shopping' -> 'shopping'; None when the kind is not a list."""
+    k = str(kind or "").strip().lower()
+    if not k.startswith(LIST_PREFIX):
+        return None
+    return k[len(LIST_PREFIX):].strip() or None
+
+
 def _kind(kind) -> str:
     k = str(kind or "").strip().lower()
     if k in KINDS:
         return k
+    if k.startswith(LIST_PREFIX):
+        return list_kind(k[len(LIST_PREFIX):])
     return _KIND_WORDS.get(k, "")
 
 
@@ -93,6 +157,8 @@ def number_word(n: int) -> str:
 def _plural(kind: str, n: int) -> str:
     if kind == "todo":
         return "to-do" if n == 1 else "to-dos"
+    if list_name(kind) is not None:
+        return "item" if n == 1 else "items"
     return "note" if n == 1 else "notes"
 
 
@@ -171,11 +237,89 @@ class NotesStore:
             except Exception:
                 log.debug("notes db close failed", exc_info=True)
 
+    # ----------------------------------------------------- named lists
+    def _list_id(self, name, create: bool = False) -> Optional[int]:
+        """The row id of a named list, creating it on demand. None when
+        the name is unusable or unknown and ``create`` is False."""
+        name = canon_list(name)
+        if not name:
+            return None
+        with self._lock:
+            row = self._db.execute(
+                "SELECT id FROM lists WHERE name = ? COLLATE NOCASE",
+                (name,)).fetchone()
+            if row is not None:
+                return int(row["id"])
+            if not create:
+                return None
+            cur = self._db.execute(
+                "INSERT INTO lists(name, created) VALUES (?,?)",
+                (name, time.time()))
+            self._db.commit()
+            log.info("list %r created (#%d)", name, cur.lastrowid)
+            return int(cur.lastrowid)
+
+    def list_names(self) -> list:
+        """Every named list, oldest first (the order lists_text speaks)."""
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT name FROM lists ORDER BY id").fetchall()
+        return [str(r["name"]) for r in rows]
+
+    def find_list(self, spoken) -> Optional[str]:
+        """The existing list a spoken name means, or None. Exact match
+        first, then the fuzzy name match docs.py uses for file names --
+        Whisper hears "the pack in list" for "the packing list"."""
+        want = canon_list(spoken)
+        if not want:
+            return None
+        names = self.list_names()
+        if want in names:
+            return want
+        return match_name(want, names)
+
+    def make_list(self, spoken) -> Optional[str]:
+        """Resolve a spoken name to an existing list, else create it.
+        None when the name is empty or reserved."""
+        found = self.find_list(spoken)
+        if found is not None:
+            return found
+        if not list_kind(spoken):
+            return None
+        name = canon_list(spoken)
+        self._list_id(name, create=True)
+        return name
+
+    def _scope(self, kind, create: bool = False):
+        """``(table, where-fragments, params, has_done)`` for a kind, or
+        None when the kind is unknown (or names a list that does not
+        exist). The one place a kind becomes SQL."""
+        k = _kind(kind)
+        if k == "note":
+            return ("notes", [], [], False)
+        if k == "todo":
+            return ("todos", [], [], True)
+        name = list_name(k)
+        if name is None:
+            return None
+        lid = self._list_id(name, create=create)
+        if lid is None:
+            return None
+        return ("list_items", ["list_id = ?"], [lid], True)
+
+    def has_list(self, kind) -> bool:
+        """True when the kind names a list that exists."""
+        return list_name(_kind(kind)) is not None and self._scope(kind) is not None
+
+    @staticmethod
+    def _clause(where: list) -> str:
+        return (" WHERE " + " AND ".join(where)) if where else ""
+
     # ------------------------------------------------------------ CRUD
     def add(self, kind: str, text: str, tags: str = "",
             created: Optional[float] = None) -> int:
         k = _kind(kind)
-        if k not in KINDS:
+        if not k:
             raise ValueError(f"unknown kind {kind!r}")
         text = " ".join(str(text or "").split())
         if not text:
@@ -186,63 +330,80 @@ class NotesStore:
                 cur = self._db.execute(
                     "INSERT INTO notes(text, created, tags) VALUES (?,?,?)",
                     (text, created, tags or ""))
-            else:
+            elif k == "todo":
                 cur = self._db.execute(
                     "INSERT INTO todos(text, created) VALUES (?,?)",
                     (text, created))
+            else:
+                # Adding to a list is what brings it into being: "add milk
+                # to the shopping list" must not need the list declared first.
+                lid = self._list_id(list_name(k), create=True)
+                cur = self._db.execute(
+                    "INSERT INTO list_items(list_id, text, created) VALUES (?,?,?)",
+                    (lid, text, created))
             self._db.commit()
             log.info("%s added (#%d, %d chars)", k, cur.lastrowid, len(text))
             return int(cur.lastrowid)
+
+    def delete(self, kind: str, item_id) -> bool:
+        """Delete exactly one row by id -- the undo path. No matching and
+        no ambiguity: the row the add returned and no other."""
+        scope = self._scope(kind)
+        if scope is None or item_id is None:
+            return False
+        table, where, params, _done = scope
+        clause = self._clause(list(where) + ["id = ?"])
+        with self._lock:
+            cur = self._db.execute(f"DELETE FROM {table}{clause}",
+                                   (*params, int(item_id)))
+            self._db.commit()
+        return cur.rowcount > 0
 
     def list(self, kind: str, limit: int = 10,
              include_done: bool = False) -> list[dict]:
         """The most recent ``limit`` items in chronological order (oldest
         of the window first) — the order ``list_text`` speaks and the
         order ordinals refer to."""
-        k = _kind(kind)
-        if k not in KINDS:
+        scope = self._scope(kind)
+        if scope is None:
             return []
+        table, where, params, has_done = scope
+        if has_done and not include_done:
+            where = where + ["done = 0"]
         limit = max(1, int(limit or 10))
         with self._lock:
-            if k == "note":
-                rows = self._db.execute(
-                    "SELECT * FROM notes ORDER BY id DESC LIMIT ?",
-                    (limit,)).fetchall()
-            else:
-                where = "" if include_done else "WHERE done = 0"
-                rows = self._db.execute(
-                    f"SELECT * FROM todos {where} ORDER BY id DESC LIMIT ?",
-                    (limit,)).fetchall()
+            rows = self._db.execute(
+                f"SELECT * FROM {table}{self._clause(where)} "
+                "ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
         return [dict(r) for r in reversed(rows)]
 
     def count(self, kind: str, include_done: bool = False) -> int:
-        k = _kind(kind)
+        scope = self._scope(kind)
+        if scope is None:
+            return 0
+        table, where, params, has_done = scope
+        if has_done and not include_done:
+            where = where + ["done = 0"]
         with self._lock:
-            if k == "note":
-                return self._db.execute("SELECT COUNT(*) FROM notes").fetchone()[0]
-            if k == "todo":
-                where = "" if include_done else "WHERE done = 0"
-                return self._db.execute(
-                    f"SELECT COUNT(*) FROM todos {where}").fetchone()[0]
-        return 0
+            return int(self._db.execute(
+                f"SELECT COUNT(*) FROM {table}{self._clause(where)}",
+                tuple(params)).fetchone()[0])
 
     def search(self, kind: str, query: str, limit: int = 10,
                include_done: bool = True) -> list[dict]:
-        k = _kind(kind)
+        scope = self._scope(kind)
         q = " ".join(str(query or "").split()).lower()
-        if k not in KINDS or not q:
+        if scope is None or not q:
             return []
-        like = f"%{q}%"
+        table, where, params, has_done = scope
+        where = where + ["lower(text) LIKE ?"]
+        params = params + [f"%{q}%"]
+        if has_done and not include_done:
+            where = where + ["done = 0"]
         with self._lock:
-            if k == "note":
-                rows = self._db.execute(
-                    "SELECT * FROM notes WHERE lower(text) LIKE ? "
-                    "ORDER BY id DESC LIMIT ?", (like, limit)).fetchall()
-            else:
-                where = "" if include_done else "AND done = 0"
-                rows = self._db.execute(
-                    f"SELECT * FROM todos WHERE lower(text) LIKE ? {where} "
-                    "ORDER BY id DESC LIMIT ?", (like, limit)).fetchall()
+            rows = self._db.execute(
+                f"SELECT * FROM {table}{self._clause(where)} "
+                "ORDER BY id DESC LIMIT ?", (*params, limit)).fetchall()
         return [dict(r) for r in reversed(rows)]
 
     def resolve(self, kind: str, which=None, include_done: bool = False,
@@ -250,7 +411,7 @@ class NotesStore:
         """Pick one item by ``which`` (see module doc). None when nothing
         matches or the index is out of range."""
         k = _kind(kind)
-        if k not in KINDS:
+        if not k:
             return None
         mode, value = parse_which(which)
         items = self.list(k, limit=window, include_done=include_done)
@@ -277,59 +438,95 @@ class NotesStore:
         """Delete the matched item (or every open item for 'all').
         Returns the removed rows."""
         k = _kind(kind)
-        if k not in KINDS:
+        scope = self._scope(k)
+        if scope is None:
             return []
+        table, where, params, has_done = scope
         mode, _ = parse_which(which)
         with self._lock:
             if mode == "all":
                 rows = self.list(k, limit=1000)
-                if k == "note":
-                    self._db.execute("DELETE FROM notes")
-                else:
-                    self._db.execute("DELETE FROM todos WHERE done = 0")
+                w = list(where) + (["done = 0"] if has_done else [])
+                self._db.execute(f"DELETE FROM {table}{self._clause(w)}",
+                                 tuple(params))
                 self._db.commit()
                 log.info("%s cleared (%d)", k, len(rows))
                 return rows
             item = self.resolve(k, which)
             if item is None:
                 return []
-            self._db.execute(f"DELETE FROM {_TABLE[k]} WHERE id = ?",
+            self._db.execute(f"DELETE FROM {table} WHERE id = ?",
                              (item["id"],))
             self._db.commit()
             log.info("%s #%d removed", k, item["id"])
             return [item]
 
-    def complete(self, which=None, done_at: Optional[float] = None) -> list[dict]:
-        """Mark a to-do done ('all' completes every open one). Returns
-        the rows completed."""
+    def complete(self, which=None, done_at: Optional[float] = None,
+                 kind: str = "todo") -> list[dict]:
+        """Mark a to-do (or a named-list item) done -- 'all' completes
+        every open one. Returns the rows completed."""
+        k = _kind(kind) or "todo"
+        scope = self._scope(k)
+        if scope is None:
+            return []
+        table, where, params, has_done = scope
+        if not has_done:
+            return []                        # notes are not completable
         mode, _ = parse_which(which)
         ts = time.time() if done_at is None else float(done_at)
         with self._lock:
             if mode == "all":
-                rows = self.list("todo", limit=1000)
+                rows = self.list(k, limit=1000)
+                w = list(where) + ["done = 0"]
                 self._db.execute(
-                    "UPDATE todos SET done = 1, done_at = ? WHERE done = 0", (ts,))
+                    f"UPDATE {table} SET done = 1, done_at = ?{self._clause(w)}",
+                    (ts, *params))
                 self._db.commit()
                 return rows
-            item = self.resolve("todo", which)
+            item = self.resolve(k, which)
             if item is None:
                 return []
             self._db.execute(
-                "UPDATE todos SET done = 1, done_at = ? WHERE id = ?",
+                f"UPDATE {table} SET done = 1, done_at = ? WHERE id = ?",
                 (ts, item["id"]))
             self._db.commit()
-            log.info("todo #%d done", item["id"])
+            log.info("%s #%d done", k, item["id"])
             item = dict(item, done=1, done_at=ts)
             return [item]
 
     # --------------------------------------------------------- wording
+    def lists_text(self) -> str:
+        """"What lists do I have?" -- names only, never their contents."""
+        names = self.list_names()
+        if not names:
+            return "You haven't any lists yet, sir."
+        if len(names) == 1:
+            return f"One list, sir: {names[0]}."
+        return (f"{number_word(len(names)).capitalize()} lists, sir: "
+                f"{join_spoken(names)}.")
+
     def list_text(self, kind: str, limit: int = 10) -> str:
         k = _kind(kind) or "note"
+        name = list_name(k)
+        if name is not None and self._scope(k) is None:
+            # Never invent a list by reading it: an empty "packing list"
+            # that only exists because he asked for one is a lie.
+            return f"You haven't a {name} list, sir."
         items = self.list(k, limit=limit)
         total = self.count(k)
         if not items:
+            if name is not None:
+                return f"Nothing on your {name} list, sir."
             return "No notes yet, sir." if k == "note" else \
                 "Nothing on your list, sir."
+        if name is not None:
+            n = len(items)
+            body = join_spoken([_spoken_item(i["text"]) for i in items])
+            head = f"{number_word(n).capitalize()} on your {name} list, sir"
+            if total > n:
+                head = (f"{number_word(total).capitalize()} on your {name} "
+                        f"list, sir; the latest {number_word(n)}")
+            return f"{head}: {body}."
         n = len(items)
         count_word = number_word(n).capitalize()
         head = f"{count_word} {_plural(k, n)}, sir"
@@ -343,14 +540,23 @@ class NotesStore:
         k = _kind(kind) or "note"
         q = " ".join(str(query or "").split())
         hits = self.search(k, q, limit=10)
+        where = list_name(k)
+        where = f"on your {where} list" if where else f"in your {_plural(k, 2)}"
         if not hits:
-            return f"Nothing about {q} in your {_plural(k, 2)}, sir."
+            return f"Nothing about {q} {where}, sir."
         n = len(hits)
         body = join_spoken([_spoken_item(h["text"]) for h in hits])
         if n == 1:
             return f"One {_plural(k, 1)} mentions {q}, sir: {body}."
         return f"{number_word(n).capitalize()} {_plural(k, n)} mention {q}, " \
                f"sir: {body}."
+
+    def clear_line(self, kind: str, n: int) -> str:
+        """The read-back a whole-list wipe asks before running."""
+        name = list_name(_kind(kind))
+        if name:
+            return f"Clear all {number_word(n)} off your {name} list, sir?"
+        return f"Clear all {number_word(n)} {_plural(_kind(kind), n)}, sir?"
 
     # ---------------------------------------------------------- legacy
     def import_legacy(self, memory_notes_dir) -> int:
@@ -454,11 +660,25 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             store = NotesStore(path)
         return store
 
-    def notes(action="list", kind=None, text=None, which=None, **_) -> ToolResult:
+    # `list` shadows the builtin deliberately: the registry calls the
+    # handler with the schema's own key names (handler(**args)).
+    def notes(action="list", kind=None, text=None, which=None, list=None,
+              **_) -> ToolResult:
         act = _action(action)
         text = " ".join(str(text or "").split())
-        k = _kind_for(kind, act, text)
         s = _store()
+        if list:
+            # A named list ("shopping"): adding creates it, everything else
+            # only ever touches one that exists.
+            name = s.make_list(list) if act == "add" else s.find_list(list)
+            if name is None:
+                line = f"You haven't a {canon_list(list) or 'such'} list, sir."
+                return ToolResult(text=f"no list named {list!r}", ok=False,
+                                  speak=line)
+            k = list_kind(name)
+        else:
+            k = _kind_for(kind, act, text)
+        lname = list_name(k)
         if act == "add":
             if not text:
                 line = "What shall I note down, sir?" if k == "note" else \
@@ -466,7 +686,9 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                 return ToolResult(text="nothing to add: no text given",
                                   ok=False, speak=line)
             s.add(k, text)
-            line = "Noted, sir." if k == "note" else "Added to your list, sir."
+            line = "Noted, sir." if k == "note" else \
+                f"Added to your {lname} list, sir." if lname else \
+                "Added to your list, sir."
             return ToolResult(text=f"{k} added: {text}", speak=line)
         if act == "list":
             line = s.list_text(k)
@@ -491,7 +713,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                 n = s.count(k)
                 if n > 1 and cfg_get(cfg, "confirm.read_back", True) is not False:
                     s.pending_clear = {"kind": k, "n": n, "ts": time.time()}
-                    line = f"Clear all {number_word(n)} {_plural(k, n)}, sir?"
+                    line = s.clear_line(k, n)
                     return ToolResult(text=f"asked before clearing {n} {k}s", speak=line)
             s.pending_clear = None
             removed = s.remove(k, target)
@@ -501,7 +723,11 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                                   speak=line)
             left = s.count(k)
             if len(removed) > 1:
-                line = "All cleared, sir."
+                line = f"The {lname} list is clear, sir." if lname else \
+                    "All cleared, sir."
+            elif lname:
+                line = f"Off the {lname} list, sir; {number_word(left)} left." \
+                    if left else f"Off the {lname} list, sir; that's it clear."
             elif k == "todo":
                 line = f"Struck off, sir; {number_word(left)} left." if left \
                     else "Struck off, sir; the list is clear."
@@ -527,7 +753,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
     spec = ToolSpec(
         name="notes",
-        description="Add, list, search, remove or complete Hunter's notes and to-dos.",
+        description="Add, list, search, remove or complete Hunter's notes, "
+                    "to-dos and named lists (shopping, packing).",
         parameters={
             "type": "object",
             "properties": {
@@ -538,6 +765,9 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                          "description": "the note / to-do text, or a search query"},
                 "which": {"type": "string",
                           "description": "last, an index like 2, or words from the item"},
+                "list": {"type": "string",
+                         "description": "a named list such as shopping or packing; "
+                                        "leave out for notes and to-dos"},
             },
             "required": ["action", "kind"],
         },

@@ -1577,3 +1577,60 @@ The rules, which are deliberately strict:
 
 Nothing to configure. If a pair you expect is not chaining, say each half
 on its own first — if either one needs the model, the pair will too.
+## 40. Named lists ("add milk to the shopping list")
+
+Nothing to configure — the lists live in the same SQLite file as the notes
+and to-dos (`~/.local/share/jarvis/memory/notes.db` unless `PATHS.MEMORY_DIR`
+says otherwise) and the tables are created on the next start.
+
+```
+add milk to the shopping list          # creates the list if it is new
+put sunscreen on my packing list
+add milk, eggs and bread to the shopping list      # three items, not one
+read my packing list
+what's on the shopping list
+take milk off the shopping list
+cross the second one off the shopping list         # the order he read you
+clear the shopping list                            # asks first
+what lists do I have
+```
+
+Two rules worth knowing:
+
+* **The name is required.** "Add milk to my list" is still the to-do list, and
+  so are "my task list", "my to-do list" and "my notes list" — a named list
+  may not shadow the built-in two.
+* **Reading never creates.** Ask for a list you have not started and he says
+  "You haven't a packing list, sir." rather than inventing an empty one.
+
+From the aisle, with the phone:
+
+```bash
+ssh spark jarvis "what's on the shopping list"
+ssh spark jarvis "add milk to the shopping list"
+```
+
+That path skips the wake word and the intent gate entirely (see section 37).
+
+## 41. Taking it back: "scratch that"
+
+Say **"scratch that"** (or "undo that", "undo", "take that back", "belay
+that") within a minute of asking for something and he removes exactly that
+thing:
+
+| what you just did | what "scratch that" does |
+|---|---|
+| set a timer / an alarm / a reminder | cancels that one, by id |
+| took a note | deletes the note |
+| added a to-do or a list item | takes it back off |
+| struck something off a list | puts it back |
+| cleared a whole list | puts every row back, original order |
+
+It runs once, and only within `UNDO_WINDOW_S` (60 s). With nothing to undo the
+phrase keeps its old meaning — the dictation action that deletes the last
+sentence in whatever window has focus — so "delete that" is untouched.
+
+Calendar events are the exception: `write_event` is deliberately add-only, so
+a calendar add cannot be undone by voice. It has its own read-back before it
+writes; delete the event by hand if the answer was wrong.
+
