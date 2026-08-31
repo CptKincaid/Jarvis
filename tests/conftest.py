@@ -58,6 +58,14 @@ os.environ["JARVIS_INTENT_LOG"] = str(_TEST_LOG_DIR / "intent_log.json")
 # without this a test building the real App indexes into the user's
 # ~/.aiws_trainer/docs_index.
 os.environ["JARVIS_DOCS_INDEX_DIR"] = str(_TEST_LOG_DIR / "docs_index")
+# The room controls (jarvis/room.py, jarvis/mixer.py) shell out to xrandr,
+# gsettings and pactl, which act on the USER'S LIVE SESSION -- there is no
+# per-process display or sound server to redirect. The suite builds the real
+# app (tests/test_app_wiring.py) and publishes real events, so a
+# SpeakingState in a test would duck whatever he is actually listening to
+# and a scene test would dim the screen he is reading. Forced, not
+# setdefault: this firewall is not one a shell may switch off.
+os.environ["JARVIS_ROOM_CONTROL"] = "0"
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -73,6 +81,9 @@ def _firewall_live_log_dir():
     from jarvis.commander import IntentClassifier
     assert IntentClassifier.INTENT_LOG.parent == _TEST_LOG_DIR, \
         "IntentClassifier.INTENT_LOG still points at the user's real log"
+    from jarvis import mixer as _mixer
+    assert _mixer.blocked(), \
+        "the room controls could reach the user's live display and audio"
     try:
         from jarvis import jarvis_agent
         assert jarvis_agent.LOG_DIR != live, "jarvis_agent LOG_DIR still live"

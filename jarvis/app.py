@@ -245,6 +245,15 @@ class JarvisApp:
         self.presence = self._construct("presence", self._make_presence)
         self.quiet = self._construct("quiet", self._make_quiet)
 
+        # ---- the room: display light, scenes and the audio mixer ----------
+        # The light and the scenes are inert until spoken to; the Mixer runs
+        # itself off the bus (start_assistant). Any state a previous run was
+        # holding is restored there too, so a crash at 0.55 brightness or a
+        # ducked soundbar heals at the next start.
+        self.room_light = self._construct("room light", self._make_room_light)
+        self.scenes = self._construct("scenes", self._make_scenes)
+        self.mixer = self._construct("mixer", self._make_mixer)
+
         # ---- speech -------------------------------------------------------
         # The arbiter is built here, ahead of the mic consumers below, because
         # TTS needs it too: hotword.py's contract lists "TTS talk-back" as a
@@ -317,6 +326,11 @@ class JarvisApp:
         # spotify.make_tools parks on services.spotify.
         self.focus = self._construct("focus", self._make_focus)
         self.services.focus = self.focus
+        # The scene runner reaches quiet hours and Spotify through the same
+        # namespace focus does, and Spotify only lands on it once the tools
+        # are built (spotify.make_tools parks it there).
+        if self.scenes is not None:
+            self.scenes.services = self.services
         self.commander = Commander(self.services)
         # Without this hook the commander falls back to a bare warn Status --
         # a 4 s toast with no way to answer it, after which the utterance is
@@ -391,6 +405,28 @@ class JarvisApp:
     def _make_presence(self):
         mod = _import_optional("jarvis.presence")
         return None if mod is None else mod.PresenceSentinel(self.assistant)
+
+    def _make_room_light(self):
+        mod = _import_optional("jarvis.room")
+        if mod is None:
+            return None
+        return mod.RoomLight(state_path=PATHS.MEMORY_DIR / "room_state.json")
+
+    def _make_scenes(self):
+        mod = _import_optional("jarvis.scenes")
+        if mod is None or self.room_light is None:
+            return None
+        # services is built further down; the runner reads it lazily, so the
+        # attribute is filled in _build_services like focus does.
+        return mod.Scenes(None, light=self.room_light,
+                          state_path=PATHS.MEMORY_DIR / "scene_state.json")
+
+    def _make_mixer(self):
+        mod = _import_optional("jarvis.mixer")
+        if mod is None:
+            return None
+        return mod.RoomMixer(cfg=self.assistant,
+                             state_path=PATHS.MEMORY_DIR / "mixer_state.json")
 
     def _make_quiet(self):
         mod = _import_optional("jarvis.quiet")
@@ -767,6 +803,9 @@ class JarvisApp:
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
             quiet=self.quiet, presence=self.presence,
+            # the room: display light/level (jarvis/room.py) and the scenes
+            # that compose it with music and quiet hours (jarvis/scenes.py)
+            room_light=self.room_light, scenes=self.scenes, mixer=self.mixer,
         )
 
     # ------------------------------------------------------- brain executor
@@ -2316,13 +2355,24 @@ class JarvisApp:
                     sampler.start()
                 except Exception:
                     log.exception("activity sampler failed to start")
-        for name, obj in (("presence", self.presence), ("quiet", self.quiet)):
+        for name, obj in (("presence", self.presence), ("quiet", self.quiet),
+                          ("mixer", self.mixer)):
             if obj is None:
                 continue
             try:
                 obj.start()
             except Exception:
                 log.exception("%s failed to start", name)
+        # The price of admission for touching the desktop's light: a run
+        # that died holding the display at 0.55 (or warm at 1900 K) heals
+        # here, exactly as autostart.disable_gnome_suspend re-asserts its
+        # own setting at every start.
+        if self.room_light is not None and self.room_light.changed:
+            try:
+                self.room_light.restore()
+                log.info("room: a previous run's display change was restored")
+            except Exception:
+                log.exception("room light restore at boot failed")
         try:
             from jarvis.headsup import MeetingHeadsUp
             lead = int(self.assistant.get("calendar.heads_up_min", 10) or 10)
@@ -2477,6 +2527,9 @@ class JarvisApp:
                           ("focus", getattr(self, "focus", None)),
                           ("presence", getattr(self, "presence", None)),
                           ("quiet", getattr(self, "quiet", None)),
+                          # stop() restores every stream it ducked before it
+                          # joins its thread
+                          ("mixer", getattr(self, "mixer", None)),
                           ("dayreviewer", getattr(self, "dayreviewer", None))):
             if obj is None:
                 continue
@@ -2487,6 +2540,14 @@ class JarvisApp:
                 fn()
             except Exception:
                 log.exception("assistant: %s failed to stop", name)
+        # Never quit holding his display: a Jarvis that is not running
+        # cannot be asked for the lights back.
+        light = getattr(self, "room_light", None)
+        if light is not None and light.changed:
+            try:
+                light.restore()
+            except Exception:
+                log.exception("room light restore at quit failed")
         try:
             # The banner gate holds a reference to this policy; a stopped
             # app (or a test's teardown) must not keep gating banners.
