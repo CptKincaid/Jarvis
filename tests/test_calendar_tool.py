@@ -506,3 +506,22 @@ def test_todays_own_weekday_means_today():
 def test_an_empty_weekday_says_so():
     text = format_events([], "monday", FRI)
     assert "monday" in text.lower() and "nothing" in text.lower()
+
+
+def test_raw_ics_hands_back_the_bodies_it_already_fetched(tmp_path):
+    """The Canvas coursework adapter needs a TERM-long view of the feed and
+    this cache keeps only ``window_days``; handing back the bytes lets it
+    re-parse the SAME response instead of putting a second request on the
+    wire (jarvis/tools/canvas_ical.deep_rows)."""
+    server = IcsServer()
+    src = make_source(tmp_path, fetch=server)
+    assert src.raw_ics() == {}, "nothing fetched yet"
+    src.refresh()
+    assert src.raw_ics() == {URL: ICS}
+    # a 304 keeps the body: the conditional GET must not blank it
+    src.refresh()
+    assert src.raw_ics() == {URL: ICS}
+    assert any(h.get("If-None-Match") for _u, h in server.calls)
+    # a source reloaded from the disk cache has parsed events but no bodies
+    cold = make_source(tmp_path, fetch=server)
+    assert cold.events() and cold.raw_ics() == {}

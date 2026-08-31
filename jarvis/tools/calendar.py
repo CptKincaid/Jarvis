@@ -454,6 +454,22 @@ class CalendarSource:
             groups = [list(e["events"]) for e in self._sources.values()]
         return merge_events(*groups)
 
+    def raw_ics(self) -> dict:
+        """{url: the last ics body fetched} for the subscriptions, empty
+        before the first refresh.
+
+        The Canvas coursework adapter (jarvis/tools/canvas_ical.py) needs a
+        TERM-long view of the Canvas feed and this cache keeps only
+        ``window_days``; handing back the bytes lets it re-parse the very
+        same response over a wider window instead of putting a second
+        request on the wire for a body already in memory."""
+        try:
+            state = list(self._etags.items())
+        except RuntimeError:        # a refresh added a source mid-iteration
+            return {}
+        return {url: s["raw"] for url, s in state
+                if isinstance(s, dict) and s.get("raw")}
+
     def is_stale(self, now: float = None) -> bool:
         fetched = self.fetched_at
         now = self._clock() if now is None else now

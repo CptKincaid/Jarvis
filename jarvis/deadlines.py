@@ -17,10 +17,14 @@ time is the authoritative one. canvas.find_next_exam merges the same
 source, deliberately -- an exam eve for something "when's my next exam"
 would then deny is worse than no exam eve at all.
 
-Silent by design when the token is unset: canvas_settings() answers None
-and tick() returns 0 without a log line, so a box without a token never
-nags. A CanvasError (outage, bad token) is logged at debug and the tick
-is skipped; the calendar half still runs. State (what has been filed) is
+The Canvas half no longer needs a token: his university blocks personal
+ones, so ``canvas_ical`` reads the same coursework out of the Canvas
+calendar feed and hands it over in the same {course, title, due} rows.
+With neither a token nor a coursework feed there is simply nothing to
+file, and tick() returns 0 without a log line, so a box with no coursework
+at all never nags. A CanvasError (outage, bad token) is logged at debug
+and the REST half is skipped; the feed and the calendar still run. State
+(what has been filed) is
 an atomic JSON file under PATHS.MEMORY_DIR so a restart cannot file the
 same deadline twice -- the timekeeper persists the reminders themselves.
 """
@@ -35,6 +39,7 @@ from typing import Callable, Optional
 
 from jarvis.logs import get_logger
 from jarvis.tools import canvas as canvas_mod
+from jarvis.tools import canvas_ical
 from jarvis.tools.canvas import CanvasError, canvas_settings, exam_candidates
 from jarvis.tools.location import clock_words
 
@@ -128,17 +133,26 @@ class DeadlineHeadsUp:
             log.debug("deadlines state save failed", exc_info=True)
 
     # ------------------------------------------------------------ sources
-    def _canvas_items(self, now: datetime) -> list[dict]:
+    def _canvas_items(self, now: datetime, events: Optional[list] = None) -> list[dict]:
+        """The REST reading merged with the calendar feed's coursework.
+
+        The feed is what makes this thread work at all on a box whose
+        university blocks Canvas tokens: without it, no token meant no
+        rows, which meant no heads-up for an 11:59 pm deadline sitting in
+        plain sight in his calendar. REST rows go first -- they know
+        whether the work was already handed in."""
+        rest: list[dict] = []
         settings = canvas_settings(self._cfg)
-        if settings is None:
-            return []                             # no token: silent
-        try:
-            return list(self._fetch_due(settings, DUE_DAYS, None, now))
-        except CanvasError as exc:
-            log.debug("deadlines: Canvas unavailable (%s)", exc.kind)
-        except Exception:                         # noqa: BLE001 - source boundary
-            log.debug("deadlines: Canvas fetch failed", exc_info=True)
-        return []
+        if settings is not None:
+            try:
+                rest = list(self._fetch_due(settings, DUE_DAYS, None, now))
+            except CanvasError as exc:
+                log.debug("deadlines: Canvas unavailable (%s)", exc.kind)
+            except Exception:                     # noqa: BLE001 - source boundary
+                log.debug("deadlines: Canvas fetch failed", exc_info=True)
+        feed = canvas_ical.rows_from_events(
+            self._calendar_events() if events is None else events, DUE_DAYS, now)
+        return canvas_ical.merge_rows(rest, feed)
 
     def _calendar_events(self) -> list:
         cal = self._get_calendar() if callable(self._get_calendar) else self._get_calendar
@@ -163,16 +177,20 @@ class DeadlineHeadsUp:
             return 0
         now = self._now()
         from jarvis import syllabus as syllabus_mod
-        items = syllabus_mod.merge_items(self._canvas_items(now),
+        events = self._calendar_events()
+        items = syllabus_mod.merge_items(self._canvas_items(now, events),
                                          self._syllabus_items(now))
         # Stash before any filing: a tick that raises later must still leave
         # the reply path a usable snapshot. The MERGED list, so an aside can
         # also see a date a syllabus scan proposed and Canvas never had.
         self._snapshot, self._snapshot_at = list(items), now
-        events = self._calendar_events()
         filed = 0
         filed += self._file_deadlines(items, now)
-        filed += self._file_exam_eves(exam_candidates(items, events, now), now)
+        # Coursework is in ``items`` now, cleanly; its raw VEVENT must not
+        # also be a candidate or an exam-eve would be filed twice, once
+        # under a title still carrying its bracket of section numbers.
+        filed += self._file_exam_eves(
+            exam_candidates(items, canvas_ical.other_events(events), now), now)
         self._prune(now)
         if filed:
             self._save()
