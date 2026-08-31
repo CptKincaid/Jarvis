@@ -1210,6 +1210,11 @@ by hand if you prefer):
 `UserPromptSubmit` only stamps when the turn began (for the 45 s gate); without it,
 "finished" is spoken only after a test run.
 
+These hooks are the *outbound* half — your sessions telling you what happened.
+The inbound half (a session asking Jarvis for your calendar, due dates or memory
+with `jarvis -q "..."`) is section 40; panes Jarvis starts get it automatically,
+your own terminals need four lines in `~/.claude/CLAUDE.md`.
+
 ---
 
 ## What Jarvis says when something is missing
@@ -1258,3 +1263,57 @@ print("missing:", cfg.missing_sections())
 import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •••
 EOF
 ```
+
+## 40. Claude Code sessions can ask Jarvis back
+
+Section 37 gave you `jarvis -q "..."` from a shell. Section 39 made your own
+Claude terminals talk to you through Jarvis. This closes the loop the other way:
+every pane **Jarvis** starts is now told that the assistant driving it is itself
+queryable, so a coding session can look up your calendar, Canvas due dates, notes
+and long-term memory instead of guessing — or asking you to type it again.
+
+Nothing to install: the note rides `--append-system-prompt-file` on the launch
+line (the same file the "your final message is read aloud" rule already used),
+and `Bash(*)` is already in the session allowlist, so no permission prompt. It
+needs only the symlink from section 37:
+
+```bash
+ln -s ~/Jarvis/scripts/jarvis ~/.local/bin/jarvis      # once, if you haven't
+```
+
+What the session is told, in short:
+
+- `jarvis -q "when is my next exam"` / `"what's due this week"` / `"what's on my
+  list"` / `"what did I tell you about the venv"` — personal context it cannot
+  read out of the repo;
+- `jarvis -q "remember the F5 socket lives in /tmp/vss_voice"` — files a durable
+  fact into the **same** semantic memory the voice assistant recalls from. Facts
+  about your life and setup only; code notes belong in the repo;
+- exit 2 means Jarvis is not running (carry on without him, do not retry in a
+  loop), exit 3 means the turn produced no reply;
+- it must **not** delegate coding, editing or web work back to Jarvis — he would
+  route that straight back to `ClaudeSessionManager.submit()` and queue a task
+  from inside a task.
+
+`-q` is not decoration: without it the pane's lookup would be spoken aloud, on
+the soundbar, over whatever Jarvis was saying at the time.
+
+The suffix file under `/tmp/vss_voice/claude/system_suffix.txt` is rewritten
+whenever the constant in `jarvis/claude_session.py` changes, so a pane can never
+be launched with a stale contract; there is nothing to clear by hand.
+
+**Your own terminals** (the `~/.bashrc` tmux wrapper, any plain `claude`) never
+pass through Jarvis and so never see this suffix — the same reason the narration
+hooks in section 39 exist. If you want the same behaviour there, paste the four
+lines into `~/.claude/CLAUDE.md` yourself:
+
+```markdown
+Jarvis (Hunter's voice assistant) is queryable: `jarvis -q "..."` asks the
+running assistant and prints his answer (-q keeps the soundbar silent).
+Use it for personal context — calendar, Canvas due dates, notes, memory — and
+`jarvis -q "remember <fact>"` to file a discovery. Exit 2 means he is not
+running: carry on, do not retry. Never delegate coding or web work to him.
+```
+
+Jarvis never edits that file for you, for the same reason `install.py` is a
+manual step: your Claude configuration is yours.

@@ -13,6 +13,13 @@ surprise this repo avoids.  The merge is idempotent — our entries are
 recognised by the narrate.py path in their command — and every other hook,
 permission or setting in the file is left untouched.  A backup is written
 beside the file before the first change.
+
+These hooks are only the outbound half: they make your OWN Claude sessions
+speak through Jarvis.  The inbound half — a session running `jarvis -q "..."`
+to read his calendar, Canvas due dates, notes or memory — is automatic in panes
+Jarvis launches (claude_session.SYSTEM_SUFFIX) but NOT here, because your own
+sessions get no system suffix from us; docs/assistant-setup.md section 40 has
+the four lines to paste into ~/.claude/CLAUDE.md if you want it.
 """
 from __future__ import annotations
 
