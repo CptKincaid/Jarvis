@@ -3847,6 +3847,22 @@ def _start_review(c, n: int, topic: str = "") -> CommandResult:
     """Open a flashcard session over the cards due now, optionally on one
     deck. Shared by "review my flashcards" and the briefing's exam-week
     offer, so both end up in the same _pending_quiz rung."""
+    try:
+        store = _quiz_store(c)
+    except Exception:
+        log.exception("flashcard store unavailable")
+        return CommandResult(handled=True, reply=quiz_mod.NO_CARDS_LINE, speak=True,
+                             status="No store")
+    cards = store.due(limit=n, topic=topic)
+    if not cards:
+        line = quiz_mod.NO_CARDS_LINE if store.count() == 0 else quiz_mod.NOTHING_DUE_LINE
+        return CommandResult(handled=True, reply=line, speak=True, status="No cards due")
+    session = quiz_mod.QuizSession(cards, topic=topic or "review")
+    c._pending_quiz = session
+    return CommandResult(handled=True, reply=f"{_cards_line(len(cards))} {session.ask()}",
+                         speak=True, status=f"Flashcards 1/{len(cards)}")
+
+
 # "Scan the syllabus": the exam a professor never put in Canvas. The chunks
 # come from the documents index (topic_chunks on the syllabus topics), ONE
 # gemma call proposes {title, course, due} rows, and every row is READ BACK
