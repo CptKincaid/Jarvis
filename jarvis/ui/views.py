@@ -122,6 +122,28 @@ def command_bar_field_px(bar_w: int, buttons: int = 2, pad: int = 16,
     return bar_w - pad - pad_s - buttons * btn - (buttons - 1) * pad_s - pad
 
 
+STANDBY_ALPHA = 0.45        # the board's opacity while the chair is empty
+STANDBY_ALPHA_FLOOR = 0.2   # never so faint that he cannot find the window
+
+
+def standby_alpha(at_desk, enabled: bool = True,
+                  dim: float = STANDBY_ALPHA) -> float:
+    """The window opacity for a desk state (jarvis/deskpresence.py).
+
+    Full brightness whenever he is there, whenever standby is switched off,
+    and -- the case that matters -- whenever the desk state is UNKNOWN: a
+    session with no Mutter idle monitor must look exactly like today's app,
+    never like a board someone dimmed and forgot.
+    """
+    if at_desk is not False or not enabled:
+        return 1.0
+    try:
+        value = float(dim)
+    except (TypeError, ValueError):
+        value = STANDBY_ALPHA
+    return max(STANDBY_ALPHA_FLOOR, min(1.0, value))
+
+
 def fmt_project_chip(slug: str, budget: int) -> str:
     """Status-bar PROJECT value: the slug uppercased, ellipsized to
     `budget` characters. The budget never goes below PROJECT_MIN_CHARS

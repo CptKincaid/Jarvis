@@ -58,6 +58,15 @@ os.environ["JARVIS_INTENT_LOG"] = str(_TEST_LOG_DIR / "intent_log.json")
 # without this a test building the real App indexes into the user's
 # ~/.aiws_trainer/docs_index.
 os.environ["JARVIS_DOCS_INDEX_DIR"] = str(_TEST_LOG_DIR / "docs_index")
+# The desk-presence probe (jarvis/deskpresence.py) reads GNOME's idle monitor
+# over the session bus -- the one piece of state that cannot be redirected to
+# a throwaway path, because it is the DEVELOPER'S live desktop. A test that
+# builds the real App would otherwise learn that the chair has been empty all
+# afternoon and start holding proactive speech in unrelated tests (found
+# 2026-08-30: test_app_wiring's timer went into the quiet digest). Forced, not
+# setdefault: a shell that exported it on must not defeat the firewall.
+# tests/test_deskpresence.py clears it for its own cases.
+os.environ["JARVIS_DESK_PRESENCE"] = "0"
 
 
 @pytest.fixture(scope="session", autouse=True)
