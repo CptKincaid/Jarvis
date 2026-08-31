@@ -1757,7 +1757,39 @@ class JarvisApp:
             pass
         if self.speaker is not None and self.speaker.enrolled:
             parts.append(f"Your voiceprint holds {self.speaker.num_samples} samples.")
+        modes = self.open_modes_line()
+        if modes:
+            parts.append(modes)
         return " ".join(parts)
+
+    def open_modes_line(self) -> str:
+        """The sticky modes that are open, or "".
+
+        They listen to the microphone only (commander._handle_inner), so a
+        terminal turn is answered normally instead of being filed -- which
+        also means an open mode is invisible from a shell. "status" names
+        them, and the end phrase closes them from anywhere.
+        """
+        c = getattr(self, "commander", None)
+        if c is None:
+            return ""
+        bits = []
+        course = getattr(c, "lecture_course", None)
+        if course:
+            n = getattr(getattr(c, "_lecture", None), "count", 0) or 0
+            bits.append(f"lecture notes open for {course}, "
+                        f"{n} line{'s' if n != 1 else ''}")
+        if getattr(c, "dictation", False):
+            bits.append("dictation mode on")
+        quiz = getattr(c, "_pending_quiz", None)
+        if quiz is not None and not getattr(quiz, "finished", True):
+            bits.append(f"a quiz open at question {quiz.index + 1} "
+                        f"of {quiz.total}")
+        if not bits:
+            return ""
+        line = bits[0] if len(bits) == 1 else \
+            ", ".join(bits[:-1]) + " and " + bits[-1]
+        return line[0].upper() + line[1:] + "."
 
     def log_triage_text(self) -> tuple:
         """"Anything wrong in your log?": (spoken, card) from the tail of

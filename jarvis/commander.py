@@ -2234,6 +2234,28 @@ _LECTURE_RX = re.compile(
 _LECTURE_END_RX = re.compile(
     r"^(?:(?:end|stop|close|finish|save)\s+(?:the\s+|my\s+)?(?:lecture\s+|class\s+)?notes"
     r"|(?:end|stop)\s+(?:the\s+)?note[- ]taking)(?:[, ]+(?:please|now|jarvis))*[.!?]*$", re.I)
+# A deliberate note from a source the mode does not listen to: `jarvis
+# "note: the demo is on friday"` while the lecture runs on the microphone.
+_NOTE_PREFIX_RX = re.compile(r"^note\s*[:\-]\s*(?P<body>\S.*)$", re.I)
+
+
+def _dictation_end(text: str) -> bool:
+    """"end dictation" closes the mode from ANY source. The mode itself is
+    voice-only (_handle_inner), so a terminal that sees it in "status"
+    needs a way to close it."""
+    return "end dictation" in (text or "").lower()
+
+
+def _lecture_end(text: str) -> bool:
+    """Same rule for lecture notes: the end phrase is honoured from any
+    source, so "jarvis 'end notes'" from a shell closes the capture."""
+    return bool(_LECTURE_END_RX.match(strip_address(text).strip().lower()))
+
+
+def _note_prefix(text: str) -> Optional[str]:
+    """"note: the demo is on friday" -> "the demo is on friday", else None."""
+    m = _NOTE_PREFIX_RX.match(strip_address(text).strip())
+    return m.group("body").strip() if m else None
 
 
 def _h_lecture_start(c, t, m):
@@ -3816,12 +3838,30 @@ class Commander:
         res = self._try_ringing(text)
         if res is not None:
             return res
-        # 1a. Dictation mode — type directly, don't route (2611-2630)
+        # 1a-1b. The sticky modes belong to the MICROPHONE. Dictation and
+        #    lecture notes swallow every later utterance, and they used to do
+        #    it whatever the source: with notes open, `jarvis "what's the
+        #    weather"` from a tmux shell was filed as a lecture line and a
+        #    Discord message became a quiz answer -- and in dictation mode a
+        #    CLI turn was typed into whatever window happened to be focused.
+        #    A turn that arrives down a socket is a different room, so it
+        #    routes normally. Two escapes keep a terminal in control of a
+        #    mode it cannot see: the explicit end phrase works from ANY
+        #    source (with "status" naming the open modes), and "note: ..."
+        #    files a deliberate line while a lecture is open.
         if self.dictation:
-            return self._handle_dictation(text)
+            if source == "voice" or _dictation_end(text):
+                return self._handle_dictation(text)
         # 1b. Lecture notes open: file it, unless it is "end notes".
         if getattr(self, "lecture_course", None):
-            return self._handle_lecture(text, source)
+            note = None if source == "voice" else _note_prefix(text)
+            # getattr(self, "_lecture", None) is None: the flag outlived its
+            # file (a failed write). That recovery clears the flag and
+            # re-dispatches, so it must run for EVERY source -- otherwise a
+            # box that only ever sees CLI turns keeps a ghost mode forever.
+            if source == "voice" or note is not None or _lecture_end(text) \
+                    or getattr(self, "_lecture", None) is None:
+                return self._handle_lecture(text, source, note=note)
         # 2b. "No, I said X": ahead of every yes/no stage, which would read
         #     it as a bare decline (parse_yes_no: any sentence opening with
         #     "no" is a no).
@@ -3834,7 +3874,7 @@ class Commander:
             return res
         # 3a'. A quiz question is on the table: this is the answer (or
         #      "skip" / "stop the quiz").
-        res = self._try_quiz_answer(text)
+        res = self._try_quiz_answer(text, source)
         if res is not None:
             return res
         # 3b. Claude offered the terminal after refusing an outside-dir
@@ -4158,9 +4198,13 @@ class Commander:
             self._type_raw(text + " ")
         return CommandResult(handled=True, reply=text, status="Dictating")
 
-    def _handle_lecture(self, text: str, source: str = "voice") -> CommandResult:
-        body = strip_address(text).strip()
-        if _LECTURE_END_RX.match(body.lower()):
+    def _handle_lecture(self, text: str, source: str = "voice",
+                        note: Optional[str] = None) -> CommandResult:
+        """File one line. ``note`` is the body of an explicit "note: ..."
+        from a source the mode does not otherwise listen to -- it is filed
+        verbatim, so "note: end notes" writes a line instead of closing."""
+        body = note if note is not None else strip_address(text).strip()
+        if note is None and _LECTURE_END_RX.match(body.lower()):
             capture, self._lecture = self._lecture, None
             course, self.lecture_course = self.lecture_course, None
             line = capture.close() if capture is not None else lecture_mod.END_NONE_LINE
@@ -4483,8 +4527,15 @@ class Commander:
                                  status="Add failed")
         return CommandResult(handled=True, reply=line, speak=True, status="Added")
 
-    def _try_quiz_answer(self, text: str) -> Optional[CommandResult]:
-        """While a quiz question is open, the utterance is the answer.
+    def _try_quiz_answer(self, text: str,
+                         source: str = "voice") -> Optional[CommandResult]:
+        """While a quiz question is open, the SPOKEN utterance is the answer.
+
+        Only the spoken one: a `jarvis "..."` from a shell or a Discord
+        message arrives while the quiz sits on the microphone, and grading
+        it as the answer both loses the command and marks a card wrong.
+        The stop words are honoured from any source so a terminal can end a
+        quiz it can see in "status".
 
         Stop words end the quiz with the tally; skip words reveal the
         answer and move on; a fresh "quiz me" / "review my flashcards"
@@ -4511,6 +4562,8 @@ class Commander:
             self._pending_quiz = None
             return CommandResult(handled=True, reply=session.score_line(), speak=True,
                                  status="Quiz stopped")
+        if source != "voice":
+            return None            # not the answer: route it as a command
         card = session.current
         if _QUIZ_SKIP_RX.match(tl):
             session.settle(None)

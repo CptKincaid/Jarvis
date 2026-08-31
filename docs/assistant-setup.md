@@ -1258,3 +1258,37 @@ print("missing:", cfg.missing_sections())
 import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •••
 EOF
 ```
+
+## 40. Sticky modes and the terminal (voice-CLI handoff)
+
+Three modes are *sticky*: lecture notes, dictation and an open quiz
+question. Once open they claim the next utterance instead of routing it —
+that is the point, since a sentence spoken during a lecture has no other
+meaning.
+
+They claim the **microphone** only. A turn that arrives from the CLI
+socket (`jarvis "…"`, `jarvis.ask`, SSH, a script) or from Discord was
+typed on purpose, so it is answered normally. Before this, notes open on
+the desk meant every `jarvis "what's due today"` from a tmux pane was
+filed as a lecture line, and dictation mode typed it into whatever window
+happened to be focused.
+
+What still works from a terminal while a mode is open:
+
+| from anywhere | effect |
+|---|---|
+| `jarvis "end notes"` | closes the lecture capture (and reindexes the file) |
+| `jarvis "end dictation"` | leaves dictation mode |
+| `jarvis "stop the quiz"` | ends the quiz with the tally |
+| `jarvis "note: the demo is on friday"` | files one deliberate lecture line, verbatim |
+| `jarvis --status` | names the open modes |
+
+`--status` (the same line as "run diagnostics") ends with them:
+
+```
+All systems nominal, sir. Up 2 hours and 10 minutes; … Lecture notes open
+for BIOSENSORS, 12 lines and a quiz open at question 3 of 5.
+```
+
+That line is the only way to notice a mode from a shell now that a CLI
+turn no longer lands in one. Nothing to configure.
