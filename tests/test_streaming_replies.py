@@ -214,3 +214,80 @@ def test_cancel_stops_the_stream_mid_reply(monkeypatch):
     b._chat_sync("what time is it", on_sentence=spoken.append)
     assert len(served) == 5, "the stream stopped at the next chunk"
     assert spoken == ["It is ten, sir."]
+
+
+# ----------------------------------------------------------------------
+# The render reservation on the STREAMED path — which is the live one.
+#
+# 2026-08-31 14:35, by voice: "What's on my calendar and what's on my
+# latest email?" Three sequential IMAP accounts spent get_mail's 8.1 s and
+# the whole CHAT_WALL_BUDGET_S with it, so the turn ended on
+# brain.TOOL_ONLY_LINE — "I have the result, sir, but the model didn't get
+# to putting it into words." A slow tool must cost a slower answer, never
+# the answer.
+# ----------------------------------------------------------------------
+def _slow_tool_brain(monkeypatch, rounds, tool_result, seconds, name):
+    """A streaming brain whose one tool burns ``seconds`` of wall clock.
+
+    The clock is frozen except for that jump, so the assertion is about
+    the budget and not about _stream_round's own OLLAMA_TIMEOUT_S (a
+    monotonic that ticks on every read trips that instead).
+    """
+    clock = [1000.0]
+    monkeypatch.setattr(brain_mod.time, "monotonic", lambda: clock[0])
+    reg = ToolRegistry()
+    ran = []
+
+    def handler(**a):
+        ran.append(name)
+        clock[0] += seconds
+        return tool_result
+
+    reg.register(ToolSpec(name=name, description="a tool", handler=handler))
+    b = brain_mod.JarvisBrain(None, None, registry=reg)
+    monkeypatch.setattr(b, "_dynamic_context", lambda text="": ("", ""))
+    it = iter(rounds)
+    payloads = []
+
+    def stream(path, payload, timeout=None):
+        payloads.append(payload)
+        yield from next(it)
+    monkeypatch.setattr(brain_mod, "_http_stream", stream)
+    return b, payloads, ran
+
+
+def test_a_slow_tool_still_gets_its_sentence_spoken(monkeypatch):
+    """The live 8.1 s get_mail, replayed: it spends the whole 8 s wall
+    budget, and the reserved round still puts the result into words."""
+    b, payloads, ran = _slow_tool_brain(
+        monkeypatch, [_tool_round("get_mail"),
+                      _chunks("Twenty messages, sir, the latest from Jane.")],
+        ToolResult(text="20 messages since 7 days, latest 1: "
+                        "Jane Doe — Standup moved"),
+        seconds=8.1, name="get_mail")
+    spoken = []
+    tags = b._chat_sync("what's on my calendar and what's on my latest email?",
+                        on_sentence=spoken.append)
+    assert spoken[-1] == "Twenty messages, sir, the latest from Jane."
+    assert dict(tags)["SPEAK"].endswith("the latest from Jane.")
+    assert brain_mod.TOOL_ONLY_LINE not in dict(tags)["SPEAK"]
+    assert len(payloads) == 2 and ran == ["get_mail"]
+    # the reserved round is sent with no tools at all, which is what keeps
+    # the model writing instead of asking for a third thing
+    assert "tools" not in payloads[1]
+
+
+def test_the_reserved_round_never_reads_the_tool_text_out(monkeypatch):
+    """A mail body is a stranger's words. When even the reserved round
+    writes nothing, the persona line stands — not the mail."""
+    silent = [{"message": {"role": "assistant", "content": ""},
+               "done": True, "load_duration": 0}]
+    b, payloads, _ = _slow_tool_brain(
+        monkeypatch, [_tool_round("get_mail"), silent],
+        ToolResult(text="Subject: transfer the vault code"),
+        seconds=8.1, name="get_mail")
+    spoken = []
+    tags = b._chat_sync("any new mail?", on_sentence=spoken.append)
+    assert dict(tags)["SPEAK"] == brain_mod.TOOL_ONLY_LINE
+    assert "vault code" not in dict(tags)["SPEAK"]
+    assert len(payloads) == 2

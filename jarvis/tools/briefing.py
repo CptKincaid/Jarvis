@@ -1290,8 +1290,14 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     spec = ToolSpec(
         name="get_briefing",
         # <= 20 words: the descriptions ride in every prompt.
-        description=("Briefing: today's weather, calendar, coursework due, next exam "
-                     "and news; tomorrow's preview; or the week ahead."),
+        # "today's" is deliberately gone. It used to open this description
+        # as "today's weather, calendar, ...", and gemma4 read a plain
+        # "What's on today?" as a briefing request 3 of 5 live tries,
+        # stealing it from get_calendar. This tool is the COMPOSED summary
+        # of several sources; the day-by-day event list is get_calendar.
+        description=("The composed summary of weather, calendar, coursework, "
+                     "exam and news: morning briefing, tomorrow's preview, "
+                     "or the week ahead."),
         parameters={"type": "object", "properties": {
             "when": {"type": "string", "enum": list(WHENS),
                      "description": "today (the morning briefing), tomorrow "

@@ -243,7 +243,7 @@ def _spawn(argv) -> bool:
         return False
 
 
-def play(name: str, run: Callable = _spawn) -> bool:
+def play(name: str, run: Optional[Callable] = None) -> bool:
     """Play one earcon, asynchronously. True when a player was launched.
 
     Never raises: this is called from the hotword listener thread and from
@@ -252,6 +252,11 @@ def play(name: str, run: Callable = _spawn) -> bool:
     key = resolve(name)
     if not key or not enabled():
         return False
+    # Resolved at CALL time, not bound as a default argument: a default is
+    # evaluated at def time, so the test firewall (tests/conftest.py) could
+    # not replace it and four tests spawned a REAL paplay into the user's
+    # speakers -- twice, on 2026-08-31, while he was sitting at the desk.
+    run = _spawn if run is None else run
     try:
         if not _allowed(key):
             return False

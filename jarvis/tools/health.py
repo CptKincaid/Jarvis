@@ -16,6 +16,11 @@ MemAvailable drops under ``health.warn_gb`` (again, as an error, under
 ``warn_gb + REARM_MARGIN_GB``; and warns once when two or more processes
 each hold more than ``health.hog_gb`` (the two-trainers pattern).
 
+The GPU-yield rule lends the local model (``brain.release``) to whatever
+holds the GPU: a trainer by pattern, plus any job NAMED in
+``health.yield_to`` -- the nightly haymaker digest is not a trainer and
+starved behind a pinned gemma4:26b for ~50 minutes before it was named.
+
 Every probe is a module-level seam -- ``read_meminfo``, ``read_loadavg``,
 ``run_nvidia_smi``, ``disk_free``, ``iter_process_rss``, ``read_cmdline``
 -- looked up at call time so tests monkeypatch them. Nothing here
@@ -69,7 +74,28 @@ TRAINER_HINT_RX = re.compile(
     r"(?:^|[^a-z])(?:train|trainer|training|pretrain|finetune|fine_tune|fine-tune|"
     r"finetuning)(?:[^a-z]|$)", re.I)
 _TRAINER_NAMES = {"python", "python3", "uv", "accelerate", "torchrun", "deepspeed"}
-TRAINER_ABSENT_TICKS = 2           # ticks without the trainer before reclaiming
+# A GPU CLAIMANT that is not a trainer has to be NAMED, because guessing it
+# off the command line is exactly what failed. 2026-08-30: the haymaker
+# digest ("/usr/bin/python3 -u digest_llm.py --cache ./digest_cache.json
+# ...") asked Ollama for qwen2.5:32b and sat STARVED for ~50 minutes -- no
+# runner spawned, no [GIN] line, no progress -- behind Jarvis's gemma4:26b,
+# pinned with keep_alive -1 (brain.py) and re-warmed every 300 s. Nothing
+# in "digest_llm.py" says "train", so TRAINER_HINT_RX never saw it and the
+# whole lend/reclaim machinery below never ran. Saying "lend the GPU" by
+# voice freed it and the digest loaded within seconds: the ONLY gap was
+# this detector. health.yield_to NAMES the claimants; the trainer regex
+# above still stands on its own.
+DEFAULT_YIELD_TO = ("digest_llm",)
+# How a claimant is spoken about. Anything not listed is read off its
+# script name ("render_job" -> "the render job").
+CLAIMANT_WORDS = {"digest_llm": "the digest"}
+TRAINER_WORDS = "your trainer"
+TRAINER_ABSENT_TICKS = 2           # ticks without the claimant before reclaiming
+# health.yield_to_trainer's fallback when the cfg object carries no health
+# section at all (a bare dict, or a boot before assistant.json is read).
+# The USER-FACING default lives in assistant_config.DEFAULTS and is now
+# True; this one stays False so "no configuration whatsoever" never
+# unloads the model behind a process that merely LOOKS like a trainer.
 DEFAULT_YIELD = False
 
 UNREADABLE_LINE = "I can't read the system counters, sir."
@@ -88,6 +114,13 @@ FAULT_RULES = ("memory", "hogs", "trainers")
 LENT_LINE = ("I have lent the GPU to your trainer, sir; quick answers only "
              "until it is done.")
 RECLAIMED_LINE = "Your trainer has finished, sir; I'm loading my model again."
+# The same two beats for a NAMED claimant: calling the nightly digest "your
+# trainer" would be a small lie every night at 04:09.
+LENT_TO_LINE = ("I have lent the GPU to {what}, sir; quick answers only "
+                "until it is done.")
+RECLAIMED_TO_LINE = "{what} has finished, sir; I'm loading my model again."
+RECLAIMED_TO_ELAPSED_LINE = ("{what} has finished, sir; that took {elapsed}. "
+                             "I'm loading my model again.")
 # The run ledger's duration, folded ONTO the reclaim line rather than
 # spoken beside it: the count of spoken lines per run must not go up.
 RECLAIMED_ELAPSED_LINE = ("Your trainer has finished, sir; that took {elapsed}. "
@@ -288,6 +321,10 @@ class Proc:
     name: str
     rss_gb: float
     hint: str = ""
+    # "" a plain process | "trainer" (TRAINER_HINT_RX) | the health.yield_to
+    # name it matched. The lend rule reads this to decide whether the flag
+    # for trainers applies and what to call the job out loud.
+    claim: str = ""
 
     def label(self, hint: bool = True) -> str:
         text = f"{self.name} {_gb(self.rss_gb)} GB"
@@ -305,6 +342,10 @@ class Snapshot:
     disks: list[tuple[str, Optional[float]]] = field(default_factory=list)
     top: list[Proc] = field(default_factory=list)
     trainers: list[Proc] = field(default_factory=list)   # by cmdline, any size
+    # Trainers PLUS the jobs named in health.yield_to (a superset of
+    # ``trainers``): what the GPU-yield rule lends to. Kept separate so the
+    # two-trainers fault and the run ledger keep counting training runs only.
+    claimants: list[Proc] = field(default_factory=list)
 
     @property
     def readable(self) -> bool:
@@ -347,31 +388,109 @@ def is_trainer(argv: list[str]) -> bool:
     return False
 
 
-def find_trainers(self_pid: Optional[int] = None) -> list[Proc]:
-    """Every process whose command line looks like a trainer, largest first.
-    Only interpreter-named processes have their cmdline read (a few dozen
-    small files, not the whole table). Never raises."""
+def _claim_key(text: str) -> str:
+    """A claimant name reduced to its comparable stem: no directory, no
+    extension, lower case -- "./digest_llm.py" and "digest_llm" are one
+    name, which is what lets the config name a job the way a human would."""
+    stem = os.path.basename(str(text or "").strip()).lower()
+    for ext in (".py", ".sh", ".pyc"):
+        if stem.endswith(ext):
+            return stem[: -len(ext)]
+    return stem
+
+
+def claimant_names(value) -> tuple[str, ...]:
+    """health.yield_to -> the claimant stems to look for. Takes a list or a
+    comma-separated string. Interpreter names are DROPPED: "python3" in the
+    list would make every script on the box a GPU claimant."""
+    if value is None:
+        return ()
+    try:
+        items = value.split(",") if isinstance(value, str) else list(value)
+    except TypeError:            # a number or a dict in the config file
+        log.warning("health.yield_to: %r is not a list of names", value)
+        return ()
+    out: list[str] = []
+    for item in items:
+        key = _claim_key(item)
+        if not key or key in out:
+            continue
+        if key in _INTERPRETERS or key in _TRAINER_NAMES:
+            log.warning("health.yield_to: ignoring %r -- an interpreter name "
+                        "would match every script on the box", item)
+            continue
+        out.append(key)
+    return tuple(out)
+
+
+def claim_of(argv: list[str], names=()) -> str:
+    """What this command line claims the GPU as: "trainer" when it looks
+    like a training run, else the health.yield_to name it matches, else "".
+    The named branch is the one the starved digest needed -- its argv is
+    ["/usr/bin/python3", "-u", "digest_llm.py", "--cache", ...]."""
+    if is_trainer(argv):
+        return "trainer"
+    if not names:
+        return ""
+    hint = cmdline_hint(argv)
+    if hint and _claim_key(hint) in names:
+        return _claim_key(hint)
+    # A claimant that is not run through an interpreter (a compiled job, or
+    # a wrapper script): match any non-flag word of the command line.
+    for arg in argv:
+        if arg.startswith("-"):
+            continue
+        key = _claim_key(arg)
+        if key in names:
+            return key
+    return ""
+
+
+def find_claimants(self_pid: Optional[int] = None, names=()) -> list[Proc]:
+    """Every process claiming the GPU -- trainers by pattern plus the jobs
+    named in health.yield_to -- largest first. Only processes that COULD be
+    a claimant have their cmdline read (an interpreter, or a name from the
+    config), so this stays a few dozen small files and not the whole
+    table. Never raises."""
     me = os.getpid() if self_pid is None else self_pid
+    names = tuple(names or ())
     out: list[Proc] = []
     try:
         for pid, name, rss_kb in iter_process_rss():
-            if pid == me or name.lower() not in _TRAINER_NAMES:
+            lowered = name.lower()
+            if pid == me or (lowered not in _TRAINER_NAMES
+                             and _claim_key(lowered) not in names):
                 continue
             try:
                 argv = read_cmdline(pid)
             except Exception:  # noqa: BLE001
                 continue
-            if is_trainer(argv):
-                out.append(Proc(pid=pid, name=name, rss_gb=rss_kb / KB_PER_GB,
-                                hint=cmdline_hint(argv) or
-                                os.path.basename(argv[-1] if argv else "")))
+            claim = claim_of(argv, names)
+            if not claim:
+                continue
+            hint = cmdline_hint(argv)
+            if not hint:
+                # A named claimant that is not run through an interpreter has
+                # no script to point at; its own name beats argv[-1], which
+                # would put a flag ("--gpu") in the spoken status line.
+                hint = claim if claim != "trainer" else \
+                    os.path.basename(argv[-1] if argv else "")
+            out.append(Proc(pid=pid, name=name, rss_gb=rss_kb / KB_PER_GB,
+                            hint=hint, claim=claim))
     except Exception:  # noqa: BLE001 - a bad /proc must not sink the tick
-        log.debug("trainer scan failed", exc_info=True)
+        log.debug("claimant scan failed", exc_info=True)
     out.sort(key=lambda p: -p.rss_gb)
     return out
 
 
-def snapshot(gpu: bool = True) -> Snapshot:
+def find_trainers(self_pid: Optional[int] = None) -> list[Proc]:
+    """Every process whose command line looks like a TRAINING run, largest
+    first: the two-trainers rule and the run ledger count these, and a
+    digest is not one of them. Never raises."""
+    return [p for p in find_claimants(self_pid) if p.claim == "trainer"]
+
+
+def snapshot(gpu: bool = True, yield_to=()) -> Snapshot:
     """Every probe, each failing on its own; never raises."""
     snap = Snapshot()
     try:
@@ -396,7 +515,10 @@ def snapshot(gpu: bool = True) -> Snapshot:
         except Exception:  # noqa: BLE001
             snap.disks.append((mount, None))
     snap.top = top_processes()
-    snap.trainers = find_trainers()
+    # One /proc pass for both: trainers are the claimants that match the
+    # training pattern.
+    snap.claimants = find_claimants(names=yield_to)
+    snap.trainers = [p for p in snap.claimants if p.claim == "trainer"]
     return snap
 
 
@@ -500,6 +622,29 @@ def trainers_line(procs: list[Proc]) -> str:
     return TRAINERS_LINE.format(n=len(procs), names=joined)
 
 
+def claimant_words(proc: Proc) -> str:
+    """What a claimant is called out loud. A Proc with no claim is a
+    trainer -- that is all this rule knew before named claimants existed."""
+    if proc.claim in ("", "trainer"):
+        return TRAINER_WORDS
+    return CLAIMANT_WORDS.get(proc.claim, f"the {proc.claim.replace('_', ' ')} job")
+
+
+def lent_line(words: str = TRAINER_WORDS) -> str:
+    return LENT_LINE if words == TRAINER_WORDS else LENT_TO_LINE.format(what=words)
+
+
+def reclaimed_line(words: str = TRAINER_WORDS, elapsed: str = "") -> str:
+    """The reclaim beat, with the run ledger's duration folded in when there
+    is one (the count of spoken lines per run must not go up)."""
+    if words == TRAINER_WORDS:
+        return RECLAIMED_ELAPSED_LINE.format(elapsed=elapsed) if elapsed \
+            else RECLAIMED_LINE
+    what = words[0].upper() + words[1:]
+    return RECLAIMED_TO_ELAPSED_LINE.format(what=what, elapsed=elapsed) if elapsed \
+        else RECLAIMED_TO_LINE.format(what=what)
+
+
 # ------------------------------------------------------------ watchdog
 @dataclass
 class Alert:
@@ -526,8 +671,16 @@ class Watchdog:
         # imported at fire time (tests pass a fake).
         self.yield_to_trainer = bool(_cfg_get(cfg, "health.yield_to_trainer",
                                               DEFAULT_YIELD))
+        # Named GPU claimants (health.yield_to). Consulted even when
+        # yield_to_trainer is off: that flag speaks about processes GUESSED
+        # to be trainers, while a name in this list is Hunter saying "this
+        # job takes the GPU" -- and the job that starved (the nightly
+        # haymaker digest) is not a trainer at all.
+        self.yield_to = claimant_names(_cfg_get(cfg, "health.yield_to",
+                                                DEFAULT_YIELD_TO))
         self._brain_obj = brain
-        self._lent_to: Optional[int] = None      # trainer pid the model is lent to
+        self._lent_to: Optional[int] = None      # claimant pid the model is lent to
+        self._lent_words = TRAINER_WORDS         # what to call it out loud
         self._absent_ticks = 0
         # pids the user took the GPU back from ("take the GPU back" while the
         # run continues): never lend to those again, or the next tick would
@@ -627,7 +780,7 @@ class Watchdog:
             self._clear_fault("trainers")
             self._safe_publish(Status(text="One trainer on the pool", kind="ok"))
         self._run_ledger(snap, fired)
-        if self.yield_to_trainer:
+        if self.yield_to_trainer or self.yield_to:
             self._trainer_rule(snap, fired)
         for alert in fired:
             self._fire(alert)
@@ -682,38 +835,51 @@ class Watchdog:
 
     @property
     def lent_to(self) -> Optional[int]:
-        """The trainer pid the model is currently lent to (None when not)."""
+        """The claimant pid the model is currently lent to (None when not)."""
         return self._lent_to
 
+    def _claimants(self, snap: Snapshot) -> list[Proc]:
+        """The processes this tick may lend the GPU to, largest first. A
+        Proc with no claim counts as a trainer -- that is what every Proc
+        was before named claimants existed -- so yield_to_trainer still
+        gates the pattern-guessed ones and only those."""
+        procs = list(snap.claimants or snap.trainers or [])
+        if not self.yield_to_trainer:
+            procs = [p for p in procs if p.claim not in ("", "trainer")]
+        return [p for p in procs if p.pid not in self._held]
+
     def _trainer_rule(self, snap: Snapshot, fired: list) -> None:
-        """Lend the model when a trainer appears; take it back once the
-        trainer has been gone for TRAINER_ABSENT_TICKS ticks (a run that
-        restarts between epochs must not cost a 7 s reload each time)."""
-        trainers = [p for p in (snap.trainers or []) if p.pid not in self._held]
+        """Lend the model when a GPU claimant appears; take it back once it
+        has been gone for TRAINER_ABSENT_TICKS ticks (a run that restarts
+        between epochs must not cost a 7 s reload each time)."""
+        trainers = self._claimants(snap)
         present = {p.pid for p in trainers}
         # forget a held pid once it is really gone, so a later run can lend
-        self._held &= {p.pid for p in (snap.trainers or [])}
+        self._held &= {p.pid for p in (snap.claimants or snap.trainers or [])}
         if self._lent_to is None:
             if not trainers:
                 return
             lead = trainers[0]
             try:
-                ok = self._brain().release(reason=f"trainer pid {lead.pid} {lead.hint}")
+                ok = self._brain().release(
+                    reason=f"{lead.claim or 'trainer'} pid {lead.pid} {lead.hint}")
             except Exception:  # noqa: BLE001
                 log.exception("health watchdog: brain.release failed")
                 return
             self._lent_to = lead.pid
+            self._lent_words = claimant_words(lead)
             self._absent_ticks = 0
-            fired.append(Alert(kind="warn", line=LENT_LINE,
+            fired.append(Alert(kind="warn", line=lent_line(self._lent_words),
                                status=f"GPU lent to {lead.hint or lead.name}"
                                       f"{'' if ok else ' (unload failed)'}",
                                rule="trainer"))
             return
         if self._lent_to in present or present:
-            # the lent-to run continues, or another trainer took over: keep
+            # the lent-to run continues, or another claimant took over: keep
             # the GPU lent, and follow the newest occupant
             if self._lent_to not in present:
                 self._lent_to = trainers[0].pid
+                self._lent_words = claimant_words(trainers[0])
             self._absent_ticks = 0
             return
         self._absent_ticks += 1
@@ -729,11 +895,12 @@ class Watchdog:
         # The run ledger's finish for this tick, folded in: "that took 22
         # minutes" belongs ON this line, not spoken after it.
         done = self._run_finished
-        line = RECLAIMED_LINE
+        elapsed = ""
         if done is not None and not done.brief:
             from jarvis.runwatch import elapsed_words
-            line = RECLAIMED_ELAPSED_LINE.format(
-                elapsed=elapsed_words(done.elapsed_s))
+            elapsed = elapsed_words(done.elapsed_s)
+        line = reclaimed_line(self._lent_words, elapsed)
+        self._lent_words = TRAINER_WORDS
         fired.append(Alert(kind="ok" if ok else "warn", line=line,
                            status="GPU reclaimed" if ok else "GPU reclaimed; model failed to load",
                            rule="trainer"))
@@ -808,7 +975,7 @@ class Watchdog:
     # --------------------------------------------------------- thread
     def tick(self) -> list[Alert]:
         try:
-            return self.check(snapshot(gpu=False))
+            return self.check(snapshot(gpu=False, yield_to=self.yield_to))
         except Exception:  # noqa: BLE001 - the loop must survive anything
             log.exception("health watchdog: tick failed")
             return []

@@ -590,3 +590,28 @@ def test_get_briefing_counts_coursework_as_content_and_reads_the_calendar_servic
     assert "Due: 1) BIOSENSORS - Lab 3 report" in r.text
     spec = next(s for s in br.make_tools(Cfg(), services))
     assert spec.description_words() <= 20
+
+
+def test_get_briefing_is_the_composed_summary_not_the_day_list():
+    """The briefing side of the 2026-08-31 live miss (see
+    tests/test_calendar_tool.py::test_get_calendar_owns_the_bare_day_question):
+    this description used to open "Briefing: today's weather, calendar,
+    coursework due, ..." and gemma4:26b read a bare "What's on today?" as a
+    briefing request 3 of 5 tries, stealing it from get_calendar.
+
+    "today" is deliberately gone from it.  This tool is the COMPOSED
+    summary of several sources; the day's plain event list is get_calendar,
+    and the model has nothing but these two sentences to tell them apart."""
+    import jarvis.tools.calendar as cal_mod
+
+    (spec,) = br.make_tools(Cfg(enabled=True), SimpleNamespace())
+    desc = spec.description.lower()
+    assert "summary" in desc, "it must name itself a composed summary"
+    assert "today" not in desc, "the day word belongs to get_calendar"
+    # The three views it really does serve stay reachable by name.
+    assert "briefing" in desc and "tomorrow" in desc and "week" in desc
+
+    cal = next(sp for sp in cal_mod.make_tools(Cfg(), SimpleNamespace())
+               if sp.name == "get_calendar")
+    assert "what's on today" in cal.description.lower()
+    assert spec.description_words() <= 20 and cal.description_words() <= 20

@@ -8,6 +8,8 @@ import email.utils
 import imaplib
 import logging
 import os
+import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -667,8 +669,11 @@ def test_fetch_unread_reads_every_account_and_tags_each_mail(fake_imap):
     fake_imap.messages = _canned(NOW)[:2]
     mails = fetch_unread(FakeCfg(MULTI_CFG), imap=fake_imap, now=NOW)
 
+    # sorted(): the mailboxes are now fetched concurrently, so the order
+    # the logins land in is whatever the threads did, not config order.
     logins = [c[1] for i in fake_imap.instances for c in i.calls if c[0] == "login"]
-    assert logins == ["me@gmail.com", "me@work.com"], "did not visit both mailboxes"
+    assert sorted(logins) == ["me@gmail.com", "me@work.com"], \
+        "did not visit both mailboxes"
     assert len(mails) == 4, "both mailboxes' mail should be merged"
     assert {m.account for m in mails} == {"personal", "work"}
 
@@ -707,3 +712,106 @@ def test_every_mailbox_failing_still_raises(fake_imap):
 def test_no_accounts_at_all_is_not_configured(fake_imap):
     with pytest.raises(MailNotConfigured):
         fetch_unread(FakeCfg({"gmail": {"accounts": []}}), imap=fake_imap, now=NOW)
+
+
+# ------------------------------------------- concurrent mailbox fetch
+#
+# LIVE 2026-08-31 14:35 -- "what's on my calendar and what's on my latest
+# email?". The three IMAP accounts were opened one after another
+# (14:35:40.0 -> 14:35:43.5 just to reach them); get_mail returned ok=True
+# 8.1 s after dispatch, brain's whole 8 s CHAT_WALL_BUDGET_S was gone, and
+# Jarvis answered "I have the result, sir, but the model didn't get to
+# putting it into words."
+THREE_CFG = {"gmail": {"accounts": [
+    {"label": "personal", "address": "me@gmail.com", "app_password": "aaaa bbbb cccc dddd"},
+    {"label": "work", "address": "me@work.com", "app_password": "eeee ffff gggg hhhh"},
+    {"label": "school", "address": "me@school.edu", "app_password": "iiii jjjj kkkk llll"},
+]}}
+
+
+def test_mailboxes_are_connected_concurrently(fake_imap, monkeypatch):
+    """All three logins must be in flight at the same instant.
+
+    The barrier is the proof, not a stopwatch: it only releases when three
+    threads are inside login() together, so the old sequential loop can
+    never satisfy it however fast the machine is.
+    """
+    fake_imap.messages = _canned(NOW)[:1]
+    barrier = threading.Barrier(3, timeout=5.0)
+    together = []
+    real_login = fake_imap.login
+
+    def barrier_login(self, user, password):
+        try:
+            barrier.wait()
+            together.append(user)
+        except threading.BrokenBarrierError:
+            pass                      # sequential: never three at once
+        return real_login(self, user, password)
+
+    monkeypatch.setattr(fake_imap, "login", barrier_login)
+    mails = fetch_unread(FakeCfg(THREE_CFG), imap=fake_imap, now=NOW)
+
+    assert sorted(together) == ["me@gmail.com", "me@school.edu", "me@work.com"], \
+        "the mailboxes were fetched one after another"
+    assert {m.account for m in mails} == {"personal", "work", "school"}
+
+
+def test_three_slow_mailboxes_cost_one_mailbox_of_wall_time(fake_imap,
+                                                            monkeypatch):
+    """The live shape: each connection costs ~1 s, so the sequential loop
+    spent ~3 s before a single header was parsed."""
+    fake_imap.messages = _canned(NOW)[:1]
+    real_login = fake_imap.login
+
+    def slow_login(self, user, password):
+        time.sleep(0.4)
+        return real_login(self, user, password)
+
+    monkeypatch.setattr(fake_imap, "login", slow_login)
+    t0 = time.monotonic()
+    fetch_unread(FakeCfg(THREE_CFG), imap=fake_imap, now=NOW)
+    elapsed = time.monotonic() - t0
+    # sequential is >= 1.2 s; concurrent is one mailbox plus scheduling
+    assert elapsed < 0.9, f"{elapsed:.2f}s: mailboxes still fetched in series"
+
+
+def test_concurrent_merge_keeps_a_deterministic_order(fake_imap, monkeypatch):
+    """Whichever server answers first, the spoken answer must not change:
+    same-instant mail keeps config order, and the merge stays newest-first.
+    """
+    fake_imap.messages = _canned(NOW)[:2]
+    real_login = fake_imap.login
+    # the school mailbox answers first, personal last
+    delays = {"me@gmail.com": 0.15, "me@work.com": 0.05, "me@school.edu": 0.0}
+
+    def staggered_login(self, user, password):
+        time.sleep(delays.get(user, 0.0))
+        return real_login(self, user, password)
+
+    monkeypatch.setattr(fake_imap, "login", staggered_login)
+    runs = [[(m.account, m.subject) for m in
+             fetch_unread(FakeCfg(THREE_CFG), imap=fake_imap, now=NOW)]
+            for _ in range(3)]
+    assert runs[0] == runs[1] == runs[2], "merge order depended on the race"
+    dates = [m.date for m in
+             fetch_unread(FakeCfg(THREE_CFG), imap=fake_imap, now=NOW) if m.date]
+    assert dates == sorted(dates, reverse=True)
+
+
+def test_one_dead_mailbox_loses_only_its_own_rows_when_concurrent(
+        fake_imap, monkeypatch):
+    """Failure isolation has to survive the executor: a raising future must
+    not take the futures that succeeded with it."""
+    fake_imap.messages = _canned(NOW)[:1]
+    real_login = fake_imap.login
+
+    def selective_login(self, user, password):
+        if user == "me@work.com":
+            self.calls.append(("login", user))
+            raise imaplib.IMAP4.error("[AUTHENTICATIONFAILED] Invalid credentials")
+        return real_login(self, user, password)
+
+    monkeypatch.setattr(fake_imap, "login", selective_login)
+    mails = fetch_unread(FakeCfg(THREE_CFG), imap=fake_imap, now=NOW)
+    assert {m.account for m in mails} == {"personal", "school"}

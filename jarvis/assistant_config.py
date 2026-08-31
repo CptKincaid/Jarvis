@@ -139,12 +139,20 @@ DEFAULTS: dict = {
     # sized for "...and Tuesday?" and not for thinking about a flashcard.
     # Capped at 30 by the recorder, like lecture.window_s.
     "quiz": {"questions": 5, "chunks": 6, "window_s": 15},
-    # yield_to_trainer: when a training process appears, unload the local
-    # model (brain.release) and speak the lent line; reload once the trainer
-    # is gone for two ticks. Off by default: every tool answer runs through
-    # the local model, so a multi-hour run leaves Jarvis with Tier 1 only.
+    # yield_to_trainer: when a GPU claimant appears, unload the local model
+    # (brain.release) and speak the lent line; reload once it is gone for two
+    # ticks. ON since 2026-08-30: it was off because a multi-hour run leaves
+    # Jarvis with Tier 1 only, but the cost of NOT lending turned out to be
+    # worse -- the haymaker digest timer (04:09, nightly) sat starved for
+    # ~50 minutes waiting for qwen2.5:32b behind Jarvis's pinned gemma4:26b,
+    # which is the same unified-memory contention that hard-power-off
+    # wedged this box on 2026-08-28. Degraded answers are one spoken
+    # sentence away from repair ("take the GPU back"); a starved nightly job
+    # and a wedged box are not.
+    # yield_to: GPU claimants that are NOT training runs, named because
+    # nothing in their command line says "train" (jarvis/tools/health.py).
     "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30,
-               "yield_to_trainer": False},
+               "yield_to_trainer": True, "yield_to": ["digest_llm"]},
     # The run ledger (jarvis/runwatch.py), driven off the health tick: two
     # spoken beats per training run (started / finished, with an honest
     # duration read from /proc). narrate=false keeps the board lane and the

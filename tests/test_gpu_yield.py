@@ -6,6 +6,9 @@ Three layers, each against fakes:
   that turns every local door into the MODEL_LENT_LINE before any HTTP,
   keep_alive 0 on any payload built while lent, residency that stops
   re-warming, and the persona helpers falling back to their text.
+- the claimant detector: trainers by pattern AND the jobs named in
+  health.yield_to (the haymaker digest, whose real argv starved behind a
+  pinned gemma4:26b for ~50 minutes on 2026-08-30).
 - jarvis.tools.health.Watchdog: the trainer rule as a state machine driven
   through check() with a FakeBrain -- lend once when a trainer appears,
   hold while it runs, reclaim after TRAINER_ABSENT_TICKS ticks without it,
@@ -22,7 +25,8 @@ from jarvis.commander import Commander, IntentClassifier
 from jarvis.config import CONFIG
 from jarvis.tools import health
 from jarvis.tools.health import (LENT_LINE, RECLAIMED_LINE, Proc, Snapshot,
-                                 Watchdog, find_trainers, is_trainer)
+                                 Watchdog, claim_of, claimant_names,
+                                 find_claimants, find_trainers, is_trainer)
 from tests.test_brain_tools import brain, setup, text_reply  # noqa: F401
 
 GB_KB = 1024 * 1024
@@ -275,16 +279,132 @@ def test_watchdog_manual_reclaim_holds_off_the_running_trainer():
     assert wd2.manual_reclaim() is True and wd2._brain_obj.calls == [("reclaim",)]
 
 
-def test_watchdog_yield_is_off_by_default_and_memory_rules_still_run():
+def test_watchdog_yield_is_on_by_default_with_the_digest_named():
+    """The default flipped on 2026-08-30: the haymaker digest timer fires
+    nightly at 04:09 and starved for ~50 minutes behind the pinned model."""
     from jarvis.assistant_config import AssistantConfig
     wd, spoken, _ = _wd(cfg=AssistantConfig({}))
-    assert wd.yield_to_trainer is False
+    assert wd.yield_to_trainer is True and wd.yield_to == ("digest_llm",)
     fired = wd.check(_snap([(4242, 30.0, "train.py")], avail=12.0))
-    assert [a.rule for a in fired] == ["memory"]
-    assert wd._brain_obj.calls == [] and wd.lent_to is None
-    on = Watchdog(AssistantConfig({"health": {"yield_to_trainer": True}}),
-                  brain=FakeBrain())
-    assert on.yield_to_trainer is True
+    assert [a.rule for a in fired] == ["memory", "trainer"]
+    assert wd.lent_to == 4242
+    off = Watchdog(AssistantConfig({"health": {"yield_to_trainer": False}}),
+                   brain=FakeBrain())
+    assert off.yield_to_trainer is False
+    # A bare dict cfg (no health section at all) keeps the old fallback:
+    # nothing is unloaded behind a merely trainer-LOOKING process.
+    assert Watchdog({}, brain=FakeBrain()).yield_to_trainer is False
+
+
+DIGEST_ARGV = ["/usr/bin/python3", "-u", "digest_llm.py",
+               "--cache", "./digest_cache.json",
+               "--forums", "./digest_forums.json",
+               "--override-window", "7", "--out", "./themes_weekly.json",
+               "--no-push"]
+
+
+def test_the_digest_is_a_claimant_only_once_it_is_named():
+    """The live failure: nothing in digest_llm.py's command line says
+    "train", so the trainer regex never saw it and Jarvis never lent."""
+    assert is_trainer(DIGEST_ARGV) is False
+    assert claim_of(DIGEST_ARGV) == ""
+    assert claim_of(DIGEST_ARGV, ("digest_llm",)) == "digest_llm"
+    # named with the extension, or with a path, is the same name
+    assert claim_of(DIGEST_ARGV, claimant_names(["./digest_llm.py"])) == "digest_llm"
+    assert claim_of(DIGEST_ARGV, ("something_else",)) == ""
+    # a trainer still needs no naming at all
+    assert claim_of(["python", "train.py"], ()) == "trainer"
+
+
+def test_claimant_names_drops_interpreters_and_takes_a_string():
+    assert claimant_names("digest_llm, render_job") == ("digest_llm", "render_job")
+    assert claimant_names(["digest_llm", "digest_llm.py"]) == ("digest_llm",)
+    # "python3" in the list would make every script on the box a claimant
+    assert claimant_names(["python3", "python", "digest_llm"]) == ("digest_llm",)
+    assert claimant_names(None) == () and claimant_names([]) == ()
+
+
+def test_find_claimants_finds_the_digest_and_leaves_jarvis_alone(monkeypatch):
+    table = {200: ("python3", 9.0, DIGEST_ARGV),
+             201: ("python", 38.0, ["python", "train.py"]),
+             202: ("python", 1.0, ["python", "-m", "jarvis.app"]),
+             203: ("ollama", 22.0, ["/usr/bin/ollama", "runner"])}
+    monkeypatch.setattr(health, "iter_process_rss",
+                        lambda proc_root=None: ((pid, n, int(g * GB_KB))
+                                                for pid, (n, g, _) in table.items()))
+    monkeypatch.setattr(health, "read_cmdline",
+                        lambda pid, proc_root=None: table[pid][2])
+    assert [(p.pid, p.claim, p.hint) for p in
+            find_claimants(names=("digest_llm",))] == \
+        [(201, "trainer", "train.py"), (200, "digest_llm", "digest_llm.py")]
+    # unnamed, the digest is invisible -- the 2026-08-30 gap, in one line
+    assert [p.pid for p in find_claimants()] == [201]
+    assert [p.pid for p in find_trainers()] == [201]
+
+
+def _digest(pid=2200, gb=9.0):
+    return Proc(pid=pid, name="python3", rss_gb=gb, hint="digest_llm.py",
+                claim="digest_llm")
+
+
+def _csnap(claimants=(), avail=60.0):
+    procs = list(claimants)
+    return Snapshot(mem_total_gb=121.7, mem_avail_gb=avail, load1=1.0,
+                    top=[Proc(pid=1, name="ollama", rss_gb=22.0)],
+                    claimants=procs,
+                    trainers=[p for p in procs if p.claim == "trainer"])
+
+
+def test_watchdog_lends_to_the_digest_and_takes_it_back_when_it_exits():
+    wd, spoken, published = _wd(cfg={"health": {"yield_to_trainer": True,
+                                                "yield_to": ["digest_llm"]}})
+    fb = wd._brain_obj
+    assert wd.check(_csnap()) == []
+    fired = wd.check(_csnap([_digest()]))
+    assert [(a.rule, a.kind) for a in fired] == [("trainer", "warn")]
+    assert fired[0].line == \
+        "I have lent the GPU to the digest, sir; quick answers only until it is done."
+    assert fired[0].status == "GPU lent to digest_llm.py"
+    assert fb.calls == [("release", "digest_llm pid 2200 digest_llm.py")]
+    assert wd.lent_to == 2200
+    assert wd.check(_csnap([_digest()])) == []          # the run continues
+    assert wd.check(_csnap()) == [] and wd.lent_to == 2200
+    fired = wd.check(_csnap())
+    assert [(a.rule, a.kind, a.line) for a in fired] == \
+        [("trainer", "ok",
+          "The digest has finished, sir; I'm loading my model again.")]
+    assert fb.calls[-1] == ("reclaim",) and wd.lent_to is None
+    # a trainer afterwards is still spoken about as a trainer
+    fired = wd.check(_csnap([Proc(pid=9, name="python", rss_gb=30.0,
+                                  hint="train.py", claim="trainer")]))
+    assert fired[0].line == LENT_LINE
+    wd.check(_csnap()), wd.check(_csnap())
+    assert spoken[-1] == RECLAIMED_LINE
+
+
+def test_a_named_claimant_is_lent_to_even_with_yield_to_trainer_off():
+    """Hunter's ~/.config/jarvis/assistant.json carries an explicit
+    "yield_to_trainer": false, written before the digest existed. That flag
+    is about processes GUESSED to be trainers; a NAMED job is a different
+    statement, or the digest starves again tonight."""
+    wd, spoken, _ = _wd(cfg={"health": {"yield_to_trainer": False,
+                                        "yield_to": ["digest_llm"]}})
+    trainer = Proc(pid=5, name="python", rss_gb=30.0, hint="train.py",
+                   claim="trainer")
+    assert wd.check(_csnap([trainer])) == []            # guessed: not lent
+    assert wd.lent_to is None and wd._brain_obj.calls == []
+    fired = wd.check(_csnap([trainer, _digest()]))      # named: lent
+    assert [a.rule for a in fired] == ["trainer"] and wd.lent_to == 2200
+    # and the trainer alongside it does not hold the GPU once the digest goes
+    assert wd.check(_csnap([trainer])) == []
+    assert wd.check(_csnap([trainer]))[0].rule == "trainer"
+    assert wd._brain_obj.calls[-1] == ("reclaim",) and wd.lent_to is None
+
+
+def test_yield_to_can_be_emptied_and_then_only_trainers_count():
+    wd, _, _ = _wd(cfg={"health": {"yield_to_trainer": False, "yield_to": []}})
+    assert wd.yield_to == ()
+    assert wd.check(_csnap([_digest()])) == [] and wd.lent_to is None
 
 
 def test_watchdog_reports_a_failed_unload_and_a_failed_reload():
@@ -308,6 +428,7 @@ def test_snapshot_carries_the_trainers_it_found(monkeypatch):
     _fake_probes(monkeypatch)
     snap = health.snapshot(gpu=False)
     assert [p.hint for p in snap.trainers] == ["train.py"]
+    assert [p.claim for p in snap.claimants] == ["trainer"]
     assert health.fact_sheet(snap).startswith("Memory 41 of 122 GB free")
 
 

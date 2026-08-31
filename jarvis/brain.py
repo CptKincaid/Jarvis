@@ -58,6 +58,16 @@ OLLAMA_URL = "http://localhost:11434"
 OLLAMA_MODEL = os.environ.get("JARVIS_OLLAMA_MODEL") or "gemma4:26b"
 OLLAMA_TIMEOUT_S = 20          # one /api/chat request
 CHAT_WALL_BUDGET_S = 8.0       # the whole tool loop; beyond it, best text
+# ...but the last stretch of that budget belongs to WORDS, not more work.
+# LIVE 2026-08-31 14:35 ("what's on my calendar and what's on my latest
+# email?"): get_mail spent 8.1 s on three sequential IMAP accounts, the
+# loop then ran out and Jarvis said TOOL_ONLY_LINE -- it had the answer
+# and apologised for not phrasing it, which is worse than a slow answer.
+# So: past CHAT_WALL_BUDGET_S - RENDER_RESERVE_S no NEW tool call starts,
+# and one final model round (with the tools stripped, so it can only
+# write) is ALWAYS granted. Raising CHAT_WALL_BUDGET_S instead would just
+# hide the slow tool and tax every fast turn.
+RENDER_RESERVE_S = 3.0
 # Spec 4.2 sets 3 s; measured on this machine a classify turn costs
 # 2.4-3.0 s wall (about 1.9 s of that is Ollama's own per-request
 # overhead on a resident model, see 4.3 and scratchpad
@@ -103,10 +113,12 @@ TOOL_TRUNCATED_MARKER = (
 MODEL_DOWN_LINE = "I'm afraid my local model is down, sir."
 MODEL_SLOW_LINE = "I'm afraid my local model didn't answer in time, sir."
 MODEL_EMPTY_LINE = "I'm afraid the local model gave me nothing, sir."
-# Spoken instead of a local turn while the model is lent to a trainer
-# (release()): the first local turn after an unload would silently reload
-# the 26B model (6.9 s) and defeat the yield.
-MODEL_LENT_LINE = ("My local model is lent to your trainer at the moment, sir; "
+# Spoken instead of a local turn while the model is lent out (release()):
+# the first local turn after an unload would silently reload the 26B model
+# (6.9 s) and defeat the yield. NOT "your trainer" any more -- since
+# 2026-08-30 the claimant may be the nightly haymaker digest, which is no
+# kind of trainer (jarvis/tools/health.py, health.yield_to).
+MODEL_LENT_LINE = ("My local model is lent out at the moment, sir; "
                    "quick answers only until it's done.")
 # Spoken when the tool loop has a result but no model turn left to phrase
 # it. It replaces speaking the raw tool text: tool text can carry third
@@ -1832,7 +1844,8 @@ class JarvisBrain:
                      "content": build_user_turn(ctx_text, mem_text, text)}]
         tools = _registry_schemas(registry, text)
         started = time.monotonic()
-        deadline = started + CHAT_WALL_BUDGET_S
+        # New tool work stops here; the reserve past it is for rendering.
+        tool_deadline = started + max(0.0, CHAT_WALL_BUDGET_S - RENDER_RESERVE_S)
         cap = MAX_SPOKEN_SENTENCES
         card = None
         speak = None
@@ -1878,6 +1891,23 @@ class JarvisBrain:
             return {"role": "tool", "content": content, "tool_name": name}
 
         rounds_left = max(1, int(max_rounds or 1))
+        render_only = False        # next round writes; it may not call tools
+        render_granted = False     # the reserved render round, spent once
+
+        def grant_render_round():
+            """Spend the render reservation: one more model round, with
+            the tools stripped. False once already spent -- the reserve is
+            one round, not an escape from max_rounds."""
+            nonlocal render_only, render_granted, rounds_left
+            render_only = True
+            if render_granted:
+                return False
+            render_granted = True
+            rounds_left = 1        # exactly one, and it can only write
+            log.info("chat: %.1fs tool budget spent; reserving a render round",
+                     max(0.0, CHAT_WALL_BUDGET_S - RENDER_RESERVE_S))
+            return True
+
         if force_tool and registry is not None and registry.has(force_tool):
             # force_args pins arguments the model gets wrong on its own. It
             # chose unread_only=True for "what was my last email about?"
@@ -1916,14 +1946,17 @@ class JarvisBrain:
         try:
             while speak is None and rounds_left > 0:
                 rounds_left -= 1
+                # A render round is sent WITHOUT tools: asking a model to
+                # stop calling tools never worked, taking them away does.
+                round_tools = [] if render_only else tools
                 if on_sentence is not None:
                     # Each round gets the full spoken cap: what the model
                     # said before a tool call must not eat the answer's.
                     round_sentences = []
                     try:
                         data, content, calls = self._stream_round(
-                            messages, tools, cap, on_sentence, round_sentences, guard,
-                            gen=gen)
+                            messages, round_tools, cap, on_sentence,
+                            round_sentences, guard, gen=gen)
                     finally:
                         # kept even when the stream dies: they were spoken
                         streamed_sentences.extend(round_sentences)
@@ -1931,7 +1964,7 @@ class JarvisBrain:
                         final = ""            # barged in: nothing more to say
                         break
                 else:
-                    payload = _chat_payload(messages, tools)
+                    payload = _chat_payload(messages, round_tools)
                     try:
                         data = _http("/api/chat", payload,
                                      timeout=OLLAMA_TIMEOUT_S)
@@ -1939,13 +1972,27 @@ class JarvisBrain:
                         _unpin_if_lent(payload)
                     content, calls = _message_parts(data)
                 server_s += (data.get("load_duration") or 0) / 1e9
+                if render_only and calls:
+                    # Some models emit tool_calls even with none offered.
+                    log.warning("chat: render round asked for %d more tools; "
+                                "writing the answer instead", len(calls))
+                    calls = []
                 if not calls or registry is None:
                     final = content
+                    if render_only and tool_texts and not (final or "").strip():
+                        # the reserved round produced no words at all
+                        final = TOOL_ONLY_LINE
                     break
                 if force_tool and tool_texts and rounds_left == 0 and \
                         messages[-1].get("role") == "tool":
-                    # the single forced turn asked for more tools instead
-                    # of rendering the result
+                    # The single forced turn asked for more tools instead of
+                    # rendering the result. LIVE 14:35: force_tool=get_mail
+                    # answered, then the model wanted the calendar too (the
+                    # question asked for both) and this branch apologised for
+                    # work already done. Spend the render reservation on
+                    # saying what get_mail found instead.
+                    if grant_render_round():
+                        continue
                     final = TOOL_ONLY_LINE
                     break
                 messages.append({"role": "assistant", "content": content,
@@ -1963,18 +2010,22 @@ class JarvisBrain:
                     if result.speak:
                         speak = result.speak
                         break
-                    if time.monotonic() > deadline:
+                    if time.monotonic() > tool_deadline:
                         # the budget is checked INSIDE the round: a round
                         # of many calls must not run to the end first
-                        log.warning("chat: over the %.0fs budget mid-round",
-                                    CHAT_WALL_BUDGET_S)
-                        rounds_left = 0
+                        log.warning("chat: over the tool budget mid-round")
+                        grant_render_round()
                         break
-                if speak is None and rounds_left > 0 and \
-                        time.monotonic() > deadline:
-                    log.warning("chat: tool loop over %.0fs budget",
-                                CHAT_WALL_BUDGET_S)
+                if speak is None and not render_only and rounds_left > 0 and \
+                        time.monotonic() > tool_deadline:
+                    log.warning("chat: tool loop over the tool budget")
                     rounds_left = 0
+                if speak is None and not render_only and rounds_left == 0 and \
+                        tool_texts:
+                    # THE RESERVATION. Out of rounds with a result in hand is
+                    # exactly the 14:35 failure; one writing-only round turns
+                    # it into a slower but real answer.
+                    grant_render_round()
                 if speak is None and rounds_left == 0:
                     # Never the tool text itself: it can carry a stranger's
                     # words (a mail subject, a calendar title, a web page)

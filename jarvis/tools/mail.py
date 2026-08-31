@@ -16,6 +16,7 @@ import imaplib
 import re
 import socket
 import ssl
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
@@ -30,6 +31,10 @@ DEFAULT_IMAP_HOST = "imap.gmail.com"
 IMAP_PORT = 993
 IMAP_TIMEOUT = 15.0
 BODY_BYTES = 2000                      # partial body fetch (never the whole mail)
+# One thread per mailbox, capped: Hunter runs three (personal, work,
+# school) and the cap only exists so a config that grows to a dozen does
+# not open a dozen sockets at once.
+MAX_MAIL_WORKERS = 4
 SNIPPET_CHARS = 200
 NOTHING_NEW_LINE = "Nothing new in the inbox, sir."
 UNREACHABLE_LINE = "I can't reach your mailbox, sir."
@@ -338,18 +343,11 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
     limit = max(1, int(limit))
 
     if len(accounts) > 1:
+        merged, failures = _fetch_every(accounts, since, limit, imap,
+                                        timeout, unread_only)
         # One mailbox with a stale app password must not blind Jarvis to the
         # rest, so failures are collected and only re-raised if EVERY mailbox
         # failed -- silence there would look identical to an empty inbox.
-        merged: list[Mail] = []
-        failures = []
-        for account in accounts:
-            try:
-                merged.extend(_fetch_one(account, since, limit, imap,
-                                         timeout, unread_only))
-            except Exception as exc:                     # noqa: BLE001
-                failures.append(exc)
-                log.warning("mail: %s failed: %s", account["label"], exc)
         if failures and len(failures) == len(accounts):
             raise failures[0]
         merged.sort(key=lambda m: m.date or since, reverse=True)
@@ -389,6 +387,43 @@ def fetch_unread(cfg, since_hours: int = 24, limit: int = 20,
     fresh = [m for m in mails if m.date is None or m.date >= since]
     fresh.sort(key=lambda m: m.date or since, reverse=True)
     return fresh
+
+
+def _fetch_every(accounts: list[dict], since: datetime, limit: int,
+                 imap, timeout: float, unread_only: bool
+                 ) -> tuple[list[Mail], list[Exception]]:
+    """Every mailbox at once -> (merged mail, failures).
+
+    LIVE 2026-08-31 14:35, "what's on my calendar and what's on my latest
+    email?": the three accounts were opened one after another (14:35:40.0 ->
+    14:35:43.5 just to reach them), get_mail took 8.1 s, and brain's whole
+    CHAT_WALL_BUDGET_S was gone before the model could put the result into
+    words -- Jarvis answered with TOOL_ONLY_LINE. The connections are
+    independent, so the wall cost is now the SLOWEST mailbox, not their sum.
+
+    Two properties the sequential loop had, kept deliberately:
+
+    * per-account failure isolation -- a future that raises loses only its
+      own rows, and the exception is returned so the caller can tell "every
+      mailbox failed" (which must raise) from "one did" (which must not);
+    * deterministic ORDER -- results are collected per account in config
+      order, never in completion order, so the spoken answer does not
+      change depending on which IMAP server happened to answer first.
+    """
+    per_account: list[list[Mail]] = [[] for _ in accounts]
+    failures: list[Exception] = []
+    workers = max(1, min(len(accounts), MAX_MAIL_WORKERS))
+    with ThreadPoolExecutor(max_workers=workers,
+                            thread_name_prefix="mail") as pool:
+        futures = [pool.submit(_fetch_one, account, since, limit, imap,
+                               timeout, unread_only) for account in accounts]
+        for i, (account, future) in enumerate(zip(accounts, futures)):
+            try:
+                per_account[i] = future.result()
+            except Exception as exc:                     # noqa: BLE001
+                failures.append(exc)
+                log.warning("mail: %s failed: %s", account["label"], exc)
+    return [m for chunk in per_account for m in chunk], failures
 
 
 def _fetch_one(settings: dict, since: datetime, limit: int,

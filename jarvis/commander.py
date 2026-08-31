@@ -104,7 +104,8 @@ from jarvis.tools.calendar import add_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
 from jarvis.tools.notes import number_word
 from jarvis import syllabus as syllabus_mod
-from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
+from jarvis.router import (ROUTER_QUESTION, WEB_CUE_RX, RouteDecision,
+                           estimate_size, local_cues, normalise)
 
 log = get_logger("commander")
 
@@ -649,6 +650,24 @@ def split_clauses(text: str) -> list:
     if len(parts) != MAX_CLAUSES:
         return []
     return [strip_jarvis_prefix(p) or p for p in parts]
+
+
+def local_tool_clause(text: str) -> str:
+    """The local tool the router would name for this clause ALONE, "" for
+    none.
+
+    STRONG cues only, which is the whole point: a topic noun on its own
+    ("...and eggs", "a half minutes", "and take an umbrella") is a fragment
+    of one thought, not a second request, and a weak-cue test would split
+    sentences that were never compound. Used by _compound_hijack to tell a
+    genuine second intent from the tail of the first one.
+    """
+    try:
+        strong, _weak, kind, _at = local_cues(normalise(text or ""))
+    except Exception:
+        log.exception("local cue probe failed for %r", text)
+        return ""
+    return kind if strong else ""
 
 
 # ------------------------------------------------------------------
@@ -7037,6 +7056,12 @@ class Commander:
                 continue
             if not m:
                 continue
+            # The prefixed table has the same hijack in it: "Jarvis, what's
+            # on my calendar and what's on my latest email?" matches "last
+            # mail" here too. Same guard, same fall-through (_try_multi
+            # runs right after this pass, then the router).
+            if self._compound_hijack(cmd_text, cmd):
+                continue
             missing = [n for n in cmd.needs if self._svc(n) is None]
             if missing:
                 log.warning("command %r matched but services missing: %s",
@@ -7720,11 +7745,91 @@ class Commander:
             return parts
         return []
 
+    def _compound_hijack(self, text: str, cmd: Command) -> bool:
+        """True when ``cmd`` matched a compound utterance but means only
+        one half of it, and the other half is a request in its own right.
+
+        LIVE 2026-08-31 14:35, by voice: "What's on my calendar and what's
+        on my latest email?" -- one breath, two questions. "last mail" is a
+        `search`, so it matched the TAIL ("latest email"); _try_assistant
+        claimed the WHOLE utterance and forced get_mail on it, and the
+        calendar half was dropped without a word (the log reads "tier-1
+        match 'last mail' bypasses the intent gate").
+
+        The whole-utterance pass running BEFORE split_clauses is right and
+        stays -- "remind me to buy milk and eggs" must never be split -- so
+        this is a precondition on that pass, not a new ordering: a Tier-1
+        shortcut claims the turn only when the request it recognises IS the
+        utterance. The same rule forced_call already applies to the router
+        short-cut ("a second clause means a second intent: the full loop
+        handles both"), stated narrowly enough that the bare commands keep
+        their fast path -- a naive "contains 'and'" test would cost "set a
+        timer for one and a half minutes" its shortcut.
+
+        Two shapes, and nothing else:
+
+        1. Both halves are Tier-1 commands. _try_multi runs BOTH, which is
+           exactly what it was built for; it just never got the chance,
+           because the whole-utterance pass answered first. Deferred only
+           when _try_multi would actually take it (a shaky transcript
+           declines the split, and then the whole match is still the best
+           reading there is).
+        2. The match sits in the TRAILING clause and the utterance OPENS
+           with a request the router names a tool for. An anchored matcher
+           cannot do this; an unanchored `search` can, and skipping over a
+           whole question to answer the second one is the 14:35 bug.
+           This direction only: a command that LEADS the utterance keeps
+           the turn, because its handler is usually the fuller answer
+           ("good morning and what's on my calendar" is the briefing,
+           calendar included) and handing it to the model would lose it.
+        """
+        # "Jarvis, X and Y" reaches _try_assistant with the address still
+        # on it (only the registry pass gets a stripped copy), and a comma
+        # after the name is a clause separator: left in, the sentence
+        # splits three ways and split_clauses refuses it -- which read as
+        # "not a compound" and let the hijack straight through.
+        bare = strip_jarvis_prefix(text)
+        if bare is None:
+            bare = strip_address(text)
+        parts = split_clauses(bare)
+        if len(parts) != MAX_CLAUSES:
+            return False
+        hits = []
+        for part in parts:
+            try:
+                hits.append(bool(cmd.matcher(part.strip().lower().rstrip(".!?"))))
+            except Exception:
+                log.exception("matcher %s failed on clause %r", cmd.name, part)
+                return False
+        if sum(hits) != 1:
+            # It accepts both halves, or neither ("add milk and bread to my
+            # shopping list" matches only whole). Either way the match is
+            # not one clause of a two-request sentence.
+            return False
+        first = hits.index(True) == 0
+        other = parts[1] if first else parts[0]
+        opener = "" if first else local_tool_clause(other)
+        if self._multi_match(bare) and not self.shaky_transcript():
+            why = "both halves are Tier-1 commands"
+        elif opener:
+            why = f"it opens with a {opener} request"
+        else:
+            return False
+        log.info("tier-1 %r declines the compound %r: %s", cmd.name, text, why)
+        return True
+
     def _match_assistant(self, text: str) -> Optional[str]:
         """The name of the ASSISTANT_TIER1 command whose matcher accepts
         the bare utterance, else None. A probe only -- no handler runs, no
         service is consulted -- used to spare exact command matches the
-        intent classifier's guess."""
+        intent classifier's guess.
+
+        Deliberately NOT guarded by _compound_hijack: its other caller is
+        the intent gate, where the question is only "was this addressed to
+        Jarvis", and a compound of two requests plainly was. Making the
+        probe stricter there would hand the 14:35 utterance to the
+        classifier, which calls long sentences background chat and drops
+        them in silence -- trading a half answer for none."""
         t = text.strip().lower().rstrip(".!?")
         for cmd in ASSISTANT_TIER1:
             try:
@@ -7744,6 +7849,11 @@ class Commander:
                 log.exception("matcher %s failed", cmd.name)
                 continue
             if not m:
+                continue
+            # A shortcut only claims the turn when it IS the request: the
+            # compound falls through to _try_multi and then to the full
+            # tool loop, which answers both halves (live 14:35).
+            if self._compound_hijack(t, cmd):
                 continue
             if any(self._svc(n) is None for n in cmd.needs):
                 continue

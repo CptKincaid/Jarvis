@@ -471,6 +471,20 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     return [
         ToolSpec(
             name="get_time",
+            # DO NOT "fix" the live "What's the date there?" miss by
+            # rewording this description -- it was measured and it does
+            # nothing. gemma4:26b answers that question from the
+            # "Current time: ..." line build_user_turn puts in the
+            # background instead of calling this tool: 0/5 calls with this
+            # wording, and still 0/5 with four sharper rewordings (an
+            # explicit "for a place other than home", an explicit
+            # "never read the date off the background", a literal
+            # "\"there\" meaning the place last discussed", and a blunt
+            # "always call this"). Drop the Current-time line from the
+            # background and the SAME description calls the tool 5/5.
+            # The lever is the background, not the schema; changing this
+            # string only evicts Ollama's static prefix cache (1.55 s a
+            # turn) for nothing. Evidence: brainstudy probe2.py/probe_time.py.
             description="Current time and date at home or in a named city.",
             parameters={"type": "object", "properties": {
                 "location": {"type": "string",

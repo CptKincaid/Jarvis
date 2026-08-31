@@ -337,19 +337,41 @@ def test_force_tool_unknown_is_a_plain_chat(brain, setup):
         ["system", "user"]
 
 
-def test_forced_turn_that_asks_for_more_tools_never_speaks_the_result(
+def test_forced_turn_that_asks_for_more_tools_gets_a_render_round(
         brain, setup):
-    """FIXED 2026-08-26 (H7). The forced turn used to fall back to
-    speaking tool_texts[0] verbatim. A briefing fact sheet is built from
-    mail subjects, calendar titles and headlines — a stranger's words —
-    so it degrades to a persona line instead. The card still goes up."""
+    """THE LIVE 14:35 SHAPE. force_tool=get_mail answered, then the model
+    asked for the calendar too (Hunter's question wanted both) — and this
+    branch used to stop dead on TOOL_ONLY_LINE, apologising for work it
+    had already done. It now spends the render reservation: one more
+    round, tools stripped, so the result reaches words."""
     b, fake, _ = setup
-    fake.replies = [tool_reply(("get_weather", {"when": "today"}))]
+    fake.replies = [tool_reply(("get_weather", {"when": "today"})),
+                    text_reply("Seventy-two and sunny, sir.")]
     tags = b._chat_sync("briefing", force_tool="get_briefing")
     assert tags[0][0] == "BRIEFING"          # the card is unaffected
+    assert tags[1] == ("SPEAK", "Seventy-two and sunny, sir.")
+    assert len(fake.chat_payloads()) == 2
+    # the reserved round is offered NO tools: that is what stops the model
+    # asking for a third thing instead of answering
+    assert "tools" not in fake.chat_payloads()[1]
+
+
+def test_the_render_round_is_offered_once_and_never_speaks_the_result(
+        brain, setup):
+    """FIXED 2026-08-26 (H7), still true: the forced turn must never fall
+    back to speaking tool_texts[0] verbatim — a briefing fact sheet is
+    built from mail subjects, calendar titles and headlines, a stranger's
+    words. When even the reserved round writes nothing, the persona line
+    is what is left."""
+    b, fake, _ = setup
+    fake.replies = [tool_reply(("get_weather", {"when": "today"})),
+                    tool_reply(("get_weather", {"when": "tomorrow"}))]
+    tags = b._chat_sync("briefing", force_tool="get_briefing")
+    assert tags[0][0] == "BRIEFING"
     assert tags[1] == ("SPEAK", brain.TOOL_ONLY_LINE)
     assert "Weather: 72 and sunny" not in tags[1][1]
-    assert len(fake.chat_payloads()) == 1
+    # exactly two: the reservation is one round, not an unbounded retry
+    assert len(fake.chat_payloads()) == 2
 
 
 def test_two_sentence_cap_holds_without_a_tool(brain, setup):
@@ -360,17 +382,34 @@ def test_two_sentence_cap_holds_without_a_tool(brain, setup):
 
 def test_max_rounds_exhausted_speaks_a_persona_line(brain, setup):
     """FIXED 2026-08-26 (H7): the rounds-exhausted fallback used to speak
-    tool_texts[-1] verbatim."""
+    tool_texts[-1] verbatim. It still does not — and the extra payload is
+    the reserved render round, which runs NO tools (record stays at 3)."""
     b, fake, record = setup
     fake.replies = [tool_reply(("get_weather", {"when": "now"}))] * 5
     tags = b._chat_sync("weather", max_rounds=3)
-    assert len(fake.chat_payloads()) == 3
-    assert len(record) == 3
+    assert len(fake.chat_payloads()) == 4     # 3 tool rounds + the render
+    assert len(record) == 3, "the render round ran a tool"
     assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
 
 
-def test_wall_budget_stops_the_loop(brain, setup, monkeypatch):
-    b, fake, _ = setup
+def test_rounds_exhausted_still_puts_the_result_into_words(brain, setup):
+    """The reservation's whole point: out of rounds WITH a result in hand
+    is the 14:35 failure, and one writing-only round fixes it."""
+    b, fake, record = setup
+    fake.replies = [tool_reply(("get_weather", {"when": "now"}))] * 3 + \
+        [text_reply("Seventy-two and partly cloudy, sir.")]
+    tags = b._chat_sync("weather", max_rounds=3)
+    assert tags == [("SPEAK", "Seventy-two and partly cloudy, sir.")]
+    assert len(record) == 3
+    assert "tools" not in fake.chat_payloads()[3]
+
+
+def test_wall_budget_stops_new_tool_work_but_reserves_the_render(
+        brain, setup, monkeypatch):
+    """LIVE 2026-08-31 14:35: get_mail ate the whole 8 s budget and the
+    turn ended on TOOL_ONLY_LINE. The budget must stop TOOL work, never
+    the sentence: one round of tools, then the reserved render round."""
+    b, fake, record = setup
     clock = [100.0]
 
     def fake_monotonic():
@@ -379,11 +418,28 @@ def test_wall_budget_stops_the_loop(brain, setup, monkeypatch):
 
     monkeypatch.setattr(brain.time, "monotonic", fake_monotonic)
     fake.replies = [tool_reply(("get_weather", {"when": "now"})),
-                    text_reply("never reached")]
+                    text_reply("Seventy-two now, eighty-five later, sir.")]
     tags = b._chat_sync("weather")
-    assert len(fake.chat_payloads()) == 1
-    # FIXED 2026-08-26 (H7): a persona line, not the tool text
+    assert tags == [("SPEAK", "Seventy-two now, eighty-five later, sir.")]
+    assert len(record) == 1, "a new tool call started past the budget"
+    assert len(fake.chat_payloads()) == 2
+    assert "tools" not in fake.chat_payloads()[1]
+
+
+def test_the_reserved_round_is_the_last_one_over_budget(brain, setup,
+                                                        monkeypatch):
+    """The reserve does not become an open-ended retry loop: if the model
+    still writes nothing, the honest persona line stands."""
+    b, fake, record = setup
+    clock = [100.0]
+    monkeypatch.setattr(brain.time, "monotonic",
+                        lambda: clock.__setitem__(0, clock[0] + 9.0)
+                        or clock[0])
+    fake.replies = [tool_reply(("get_weather", {"when": "now"}))] * 4
+    tags = b._chat_sync("weather", max_rounds=3)
     assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
+    assert len(fake.chat_payloads()) == 2
+    assert len(record) == 1
 
 
 def test_failing_tool_is_reported_not_raised(brain, setup):
@@ -748,15 +804,35 @@ def test_hostile_mail_is_not_spoken_when_the_rounds_run_out(brain,
 
 
 def test_hostile_mail_is_not_spoken_when_the_budget_blows(brain, monkeypatch):
+    """Over budget now buys a render round rather than an apology — and
+    what it speaks is still the MODEL's sentence, never the mail text."""
     b, fake = _mail_brain(brain, monkeypatch)
     clock = [100.0]
     monkeypatch.setattr(brain.time, "monotonic",
                         lambda: clock.__setitem__(0, clock[0] + 9.0)
                         or clock[0])
-    fake.replies = [tool_reply(("get_mail", {})), text_reply("never reached")]
+    fake.replies = [tool_reply(("get_mail", {})),
+                    text_reply("One unread, sir, from nobody in particular.")]
+    tags = b._chat_sync("any new mail?")
+    assert tags == [("SPEAK", "One unread, sir, from nobody in particular.")]
+    assert "vault code" not in tags[0][1]
+    assert len(fake.chat_payloads()) == 2
+
+
+def test_hostile_mail_is_not_spoken_by_the_reserved_render_round(brain,
+                                                                 monkeypatch):
+    """The reservation must not become a hole in the H7 guarantee: a
+    render round that writes nothing still degrades to the persona line,
+    not to the mail body."""
+    b, fake = _mail_brain(brain, monkeypatch)
+    clock = [100.0]
+    monkeypatch.setattr(brain.time, "monotonic",
+                        lambda: clock.__setitem__(0, clock[0] + 9.0)
+                        or clock[0])
+    fake.replies = [tool_reply(("get_mail", {})), text_reply("")]
     tags = b._chat_sync("any new mail?")
     assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
-    assert len(fake.chat_payloads()) == 1
+    assert "vault code" not in tags[0][1]
 
 
 def test_hostile_mail_is_not_spoken_when_the_model_times_out(brain,
@@ -816,3 +892,101 @@ def test_nothing_touches_the_live_log_dir(brain):
     import jarvis.logs as logs
     assert not str(logs.LOG_FILE).startswith("/tmp/vss_voice")
     assert not os.path.exists("/tmp/vss_voice/pytest-w5-marker")
+
+
+# ============================================ the live 14:35 turn, replayed
+#
+# 2026-08-31, by voice: "What's on my calendar and what's on my latest
+# email?" — and Jarvis answered brain.TOOL_ONLY_LINE. The log:
+#
+#   14:35:37.408  tier-1 match 'last mail' bypasses the intent gate
+#   14:35:40.0 -> 43.5  get_mail opens THREE IMAP accounts, one at a time
+#   14:35:45.497  tool get_mail -> ok=True          (5.5 s into the chat)
+#   14:35:54.868  chat reply (14.85 s wall, 7.20 s ollama overhead):
+#                 "I have the result, sir, but the model didn't get to
+#                  putting it into words."
+#
+# Two independent causes, one per fix: get_mail spent the whole 8 s
+# CHAT_WALL_BUDGET_S on sequential mailboxes (jarvis/tools/mail.py now
+# fetches them concurrently), and the forced get_mail turn then asked for
+# the calendar as well — the question wanted both — which dead-ended on
+# TOOL_ONLY_LINE instead of writing the answer it was holding.
+LIVE_MAIL_SHEET = ("1 unread since yesterday: 1) Jane Doe — Standup moved "
+                   "(2:10 pm): Standup is at 2:30 pm today.")
+LIVE_ANSWER = "Dentist at ten, sir, and Jane moved standup to two thirty."
+
+
+def _live_turn(brain, monkeypatch, mail_seconds):
+    """A brain whose get_mail costs ``mail_seconds`` of wall clock, on a
+    fake monotonic so the assertion is about the budget, not the machine."""
+    clock = [0.0]
+    monkeypatch.setattr(brain.time, "monotonic", lambda: clock[0])
+    reg = ToolRegistry()
+    ran = []
+
+    def get_mail(**_):
+        ran.append("get_mail")
+        clock[0] += mail_seconds          # three mailboxes, sequential or not
+        return ToolResult(text=LIVE_MAIL_SHEET, max_sentences=4)
+
+    def get_calendar(**_):
+        ran.append("get_calendar")
+        clock[0] += 0.4
+        return ToolResult(text="10:00 am dentist")
+
+    reg.register_many([
+        ToolSpec("get_mail", "Recent mail.", {"type": "object",
+                                              "properties": {}}, get_mail),
+        ToolSpec("get_calendar", "Today's events.", {"type": "object",
+                                                     "properties": {}},
+                 get_calendar),
+    ])
+    monkeypatch.setattr(brain, "_REGISTRY", reg)
+    fake = FakeOllama()
+    monkeypatch.setattr(brain, "_http", fake)
+    return brain.JarvisBrain(context=FakeContext(), memory=None), fake, ran
+
+
+def test_the_1435_turn_now_speaks_a_real_reply(brain, monkeypatch):
+    """The regression, with the log's own numbers: 5.5 s of sequential
+    mail, then the forced turn asks for the calendar too."""
+    b, fake, ran = _live_turn(brain, monkeypatch, mail_seconds=5.5)
+    fake.replies = [tool_reply(("get_calendar", {})), text_reply(LIVE_ANSWER)]
+    tags = b._chat_sync("what's on my calendar and what's on my latest email?",
+                        force_tool="get_mail",
+                        force_args={"unread_only": False})
+    assert tags == [("SPEAK", LIVE_ANSWER)], "still the TOOL_ONLY_LINE apology"
+    assert brain.TOOL_ONLY_LINE not in dict(tags)["SPEAK"]
+    assert ran == ["get_mail"], "the render round started new tool work"
+
+
+def test_the_1435_turn_with_the_mail_fix_has_budget_to_spare(brain,
+                                                             monkeypatch):
+    """With the mailboxes fetched concurrently get_mail costs about the
+    slowest one (~2.6 s), which is inside CHAT_WALL_BUDGET_S -
+    RENDER_RESERVE_S — so the loop never even reaches the reservation and
+    the calendar the question asked for actually gets fetched."""
+    b, fake, ran = _live_turn(brain, monkeypatch, mail_seconds=2.6)
+    fake.replies = [tool_reply(("get_mail", {}), ("get_calendar", {})),
+                    text_reply(LIVE_ANSWER)]
+    tags = b._chat_sync("what's on my calendar and what's on my latest email?",
+                        max_rounds=3)
+    assert tags == [("SPEAK", LIVE_ANSWER)]
+    assert ran == ["get_mail", "get_calendar"], \
+        "the calendar half of the question was dropped"
+    # both tools ran AND the model was still offered them: no reservation
+    # was needed at 2.6 s + 0.4 s = 3.0 s, under the 5.0 s tool deadline
+    assert "tools" in fake.chat_payloads()[1]
+
+
+def test_sequential_mail_would_have_starved_the_calendar(brain, monkeypatch):
+    """The other side of the same coin: at the live 5.5 s the second tool
+    of the round never starts — the reservation fires mid-round — so the
+    answer is real but thinner. That degradation is the intended one."""
+    b, fake, ran = _live_turn(brain, monkeypatch, mail_seconds=5.5)
+    fake.replies = [tool_reply(("get_mail", {}), ("get_calendar", {})),
+                    text_reply("Jane moved standup to two thirty, sir.")]
+    tags = b._chat_sync("what's on my calendar and what's on my latest email?",
+                        max_rounds=3)
+    assert tags == [("SPEAK", "Jane moved standup to two thirty, sir.")]
+    assert ran == ["get_mail"], "a new tool started past the tool deadline"

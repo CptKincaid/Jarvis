@@ -373,7 +373,15 @@ def test_get_never_fetches_and_triggers_refresh_when_stale(tmp_path):
     assert snap.stale and triggered == [1, 1] and len(server.calls) == 1
 
 
-def test_worker_thread_refreshes_and_stops(tmp_path):
+def test_worker_thread_refreshes_and_stops(tmp_path, monkeypatch):
+    # The worker calls refresh() with now=None, so its window comes from the
+    # module's wall-clock seam and NOT from the injected `clock` (which is
+    # only the staleness stamp).  Unfrozen, this test rotted on its own: the
+    # window is yesterday-midnight .. +15 days, so once the real date passed
+    # 2026-08-28 the fixture's 2026-08-27 "Mum's birthday" fell out of it and
+    # the assertion below started reading "Nothing on tomorrow, sir."  Freeze
+    # the seam the way now_local's docstring says to.
+    monkeypatch.setattr(calendar, "now_local", lambda tz=None: NOW)
     fetched = threading.Event()
 
     class Server(IcsServer):
@@ -626,3 +634,35 @@ def test_raw_ics_hands_back_the_bodies_it_already_fetched(tmp_path):
     # a source reloaded from the disk cache has parsed events but no bodies
     cold = make_source(tmp_path, fetch=server)
     assert cold.events() and cold.raw_ics() == {}
+
+
+def test_get_calendar_owns_the_bare_day_question():
+    """LIVE MISS 2026-08-31: "What's on today?" reached get_briefing instead
+    of get_calendar on 3 of 5 tries against gemma4:26b (brainstudy bench,
+    case cal_today), so Hunter asked for his events and got the whole
+    morning briefing composed at him.
+
+    The tool descriptions are the ENTIRE boundary -- they are all the model
+    sees when it picks -- and the two overlapped: get_briefing opened
+    "Briefing: today's weather, calendar, ..." while get_calendar opened
+    "Hunter's calendar for a weekday name, ...".  So the summary tool owned
+    both "today" and "calendar" and the events tool led with a phrasing
+    nobody says.  Sharpening the two took the case to 5/5.
+
+    These strings ride in Ollama's cached static prefix, so they are worth
+    pinning: the boundary is the fix, not the wording of any one file."""
+    from jarvis.tools import briefing as br
+
+    cal = next(sp for sp in calendar.make_tools(FakeCfg(), SimpleNamespace())
+               if sp.name == "get_calendar")
+    (brief,) = br.make_tools(FakeCfg(), SimpleNamespace())
+    cal_d, brief_d = cal.description.lower(), brief.description.lower()
+
+    # The events tool leads with EVENTS, not with "a weekday name".
+    assert cal_d.split()[0].startswith("event")
+    # The words Hunter actually says belong to the tool that answers them.
+    assert "what's on today" in cal_d
+    # ...and the summary tool must not claim the day word back.
+    assert "today" not in brief_d
+    # Still inside the budget register() warns above; these ship on every turn.
+    assert cal.description_words() <= 20 and brief.description_words() <= 20

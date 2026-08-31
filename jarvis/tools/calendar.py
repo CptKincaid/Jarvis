@@ -1018,8 +1018,16 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             "required": ["text"]},
         handler=add_event), ToolSpec(
         name="get_calendar",
-        description=("Hunter's calendar for a weekday name, today, tomorrow, "
-                     "week, or next for only the next event."),
+        # Leads with EVENTS and with the literal words "what's on today":
+        # gemma4 sent "What's on today?" to get_briefing on 3 of 5 live
+        # tries, because get_briefing's description opened with "today's
+        # weather, calendar, ..." and this one opened with "a weekday
+        # name". The two descriptions are the only thing separating a bare
+        # event list from the composed morning summary, so the day word the
+        # user actually says has to sit in THIS one. <= 20 words: the
+        # description rides in the cached static prefix on every turn.
+        description=("Events on Hunter's calendar: what's on today, "
+                     "tomorrow, a named weekday, the week, or next."),
         parameters={"type": "object", "properties": {
             "range": {"type": "string", "enum": list(RANGES),
                       "description": "today, tomorrow, week or next"}},

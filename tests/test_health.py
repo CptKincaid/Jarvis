@@ -378,3 +378,68 @@ def test_watchdog_thread_start_stop(monkeypatch):
     assert not wd.running
     assert sink.spoken == []             # 40 GB free: nothing to say
     assert wd.last.mem_avail_gb == 40
+
+
+# ------------------------------------------------- GPU claimant detector
+DIGEST_ARGV = ["/usr/bin/python3", "-u", "digest_llm.py",
+               "--cache", "./digest_cache.json",
+               "--forums", "./digest_forums.json",
+               "--override-window", "7", "--out", "./themes_weekly.json",
+               "--no-push"]
+
+
+def test_tick_hands_the_configured_claimants_to_the_snapshot(monkeypatch):
+    """The live path, end to end: the 30 s tick must carry health.yield_to
+    into snapshot(), or the digest is invisible where it matters (it was:
+    ~50 minutes starved behind a pinned gemma4:26b on 2026-08-30)."""
+    _fake_probes(monkeypatch, procs=(("python3", 9.0, DIGEST_ARGV),))
+    seen = []
+
+    class FakeBrain:
+        def release(self, reason=""):
+            seen.append(reason)
+            return True
+
+        def reclaim(self):
+            return True
+
+    wd = Watchdog(AssistantConfig({}), publish=lambda ev: None,
+                  brain=FakeBrain())
+    wd.tick()
+    assert wd.last is not None
+    assert [(p.claim, p.hint) for p in wd.last.claimants] == \
+        [("digest_llm", "digest_llm.py")]
+    assert wd.last.trainers == []          # a digest is not a training run
+    assert seen == ["digest_llm pid 100 digest_llm.py"]
+    assert wd.lent_to == 100
+
+
+def test_claimant_scan_reads_only_candidate_cmdlines(monkeypatch):
+    """A named claimant may be a compiled job with no interpreter, but the
+    scan must still stay a few dozen small reads, not the whole table."""
+    table = {10: ("python3", 9.0, DIGEST_ARGV),
+             11: ("render_job", 4.0, ["/opt/render_job", "--gpu"]),
+             12: ("Xorg", 1.2, ["Xorg", ":1"]),
+             13: ("chrome", 8.0, ["/opt/chrome"])}
+    read = []
+    monkeypatch.setattr(health, "iter_process_rss",
+                        lambda proc_root=None: ((pid, n, int(g * GB_KB))
+                                                for pid, (n, g, _) in table.items()))
+
+    def cmdline(pid, proc_root=None):
+        read.append(pid)
+        return table[pid][2]
+    monkeypatch.setattr(health, "read_cmdline", cmdline)
+    got = health.find_claimants(names=("digest_llm", "render_job"))
+    assert [(p.pid, p.claim, p.hint) for p in got] == \
+        [(10, "digest_llm", "digest_llm.py"),
+         (11, "render_job", "render_job")]      # not "--gpu", the last argv
+    assert sorted(read) == [10, 11]      # never Xorg / chrome
+
+
+def test_yield_to_survives_a_malformed_config_value():
+    # A hand-edited assistant.json must never take the watchdog thread down.
+    assert health.claimant_names(7) == ()
+    assert health.claimant_names({"digest_llm": True}) == ("digest_llm",)
+    wd = Watchdog({"health": {"yield_to": 7}}, publish=lambda ev: None)
+    assert wd.yield_to == ()

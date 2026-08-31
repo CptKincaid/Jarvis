@@ -77,6 +77,16 @@ os.environ["JARVIS_ROOM_CONTROL"] = "0"
 os.environ["JARVIS_DESK_PRESENCE"] = "0"
 
 
+def _blocked_player(argv) -> bool:
+    """Stands in for earcons._spawn: the tone is "played" and the caller
+    sees the same True, but nothing reaches the sound server."""
+    _blocked_player.calls.append(list(argv))
+    return True
+
+
+_blocked_player.calls = []
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _firewall_live_log_dir():
     """Every jarvis path that can write under the log dir points at the
@@ -141,4 +151,17 @@ def _firewall_live_log_dir():
                 os.environ["JARVIS_ASSISTANT_CONFIG"] == str(_TEST_ASSISTANT_CONFIG)
     except ImportError:
         pass
-    yield
+    # The room's AUDIO OUT. jarvis/earcons.py synthesizes a tone and hands it
+    # to a real `paplay`, which reaches the USER'S SPEAKERS -- there is no
+    # per-process sound server to redirect, exactly as with the display above.
+    # On 2026-08-31 a full-suite run played two "heard-you" beeps and two
+    # "arrival" trills into the room while he sat at the desk, twice: four
+    # tests (test_app_wiring) call earcons.play() without injecting a runner.
+    # Tests that pass their own `run=` recorder are unaffected.
+    from jarvis import earcons
+    real_spawn = earcons._spawn
+    earcons._spawn = _blocked_player
+    try:
+        yield
+    finally:
+        earcons._spawn = real_spawn
