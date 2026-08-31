@@ -680,7 +680,7 @@ over, sir: three blocks of 25 minutes." — or until `max_blocks` blocks are don
 - *"Any timers running?"* lists them as "focus block 1 in 20 minutes".
 - A block is a do-not-disturb window (`focus.dnd`, on by default): heads-ups,
   deadline warnings and the hooks narrator are held and read back as the usual
-  catch-up digest when the break starts. See section 40.
+  catch-up digest when the break starts. See section 56.
 
 ## 18. Lecture notes by voice
 
@@ -1214,7 +1214,7 @@ by hand if you prefer):
 
 These hooks are the *outbound* half — your sessions telling you what happened.
 The inbound half (a session asking Jarvis for your calendar, due dates or memory
-with `jarvis -q "..."`) is section 40; panes Jarvis starts get it automatically,
+with `jarvis -q "..."`) is section 59; panes Jarvis starts get it automatically,
 your own terminals need four lines in `~/.claude/CLAUDE.md`.
 
 ---
@@ -1359,7 +1359,8 @@ announcements are watched. At most three hits are spoken per tick; the rest
 are marked seen and counted in the log, because a hit read out every fifteen
 minutes is worse than one missed. Seen hits live in
 `~/.aiws_trainer/jarvis_memory/keyword_watch_state.json` for fourteen days.
-## 40. Per-course scoping (quiz and lessons stay in one subject)
+
+## 43. Per-course scoping (quiz and lessons stay in one subject)
 
 Nothing to configure. Until now *"quiz me on electrode transducers in signals and
 systems"* matched no file by name, so the last resort was a global embedding query
@@ -1382,7 +1383,7 @@ course's files are read, in reading order, with no embedding call at all.
 - Naming a chapter the course does not have falls back rather than answering about
   the wrong week.
 
-## 41. "Teach me X" — a lesson, then a quiz on the same material
+## 44. "Teach me X" — a lesson, then a quiz on the same material
 
 > *"Teach me week four of signals and systems."*
 > "Week four covers sampling: a signal sampled at twice its highest frequency can be
@@ -1401,7 +1402,7 @@ back tomorrow.
 - *"teach me how to ..."*, *"teach me a lesson"* are not lessons and go to the model.
 - Requires the documents index (section on `docs.paths`) and the local model.
 
-## 42. Exam-week study in the morning briefing
+## 45. Exam-week study in the morning briefing
 
 When Canvas or your calendar has an exam inside the next `briefing.study_days`
 days, the briefing adds a line about the deck for **that course**:
@@ -1428,7 +1429,7 @@ The line is silent unless the exam carries a course name (without one there is
 nothing to filter the deck by), and it rides under the `canvas` switch like the exam
 countdown it depends on.
 
-## 43. Study ledger: "how much did I study this week?"
+## 46. Study ledger: "how much did I study this week?"
 
 Every finished focus session (section on focus/pomodoro) now appends one line to
 `~/.aiws_trainer/jarvis_memory/focus_history.jsonl`. Before this, the block count
@@ -1455,7 +1456,8 @@ fold that history into the ledger once:
 
 It is idempotent and never opens `timekeeper.db` for writing. Nothing leaves the box
 and no model is called.
-## 40. Sticky modes and the terminal (voice-CLI handoff)
+
+## 47. Sticky modes and the terminal (voice-CLI handoff)
 
 Three modes are *sticky*: lecture notes, dictation and an open quiz
 question. Once open they claim the next utterance instead of routing it —
@@ -1489,7 +1491,7 @@ for BIOSENSORS, 12 lines and a quiz open at question 3 of 5.
 That line is the only way to notice a mode from a shell now that a CLI
 turn no longer lands in one. Nothing to configure.
 
-## 41. How long the mic waits for your answer
+## 48. How long the mic waits for your answer
 
 After Jarvis speaks he keeps listening for a few seconds so you can follow
 up without the wake word. That window is `followup_window` in
@@ -1515,7 +1517,7 @@ does — a finished quiz, a read-back older than 60 s and a wake-alarm offer
 older than three minutes all fall straight back to 4 s. Every follow-up is
 still speaker-verified, so the open mic is still yours alone.
 
-## 42. Read-backs when he isn't sure he heard you
+## 49. Read-backs when he isn't sure he heard you
 
 Whisper returns a confidence for every utterance. Below
 `confirm.shaky_logprob` (default -0.7, calibrated from the live log) the
@@ -1544,7 +1546,7 @@ already had their own read-back and are unchanged.
 An unanswered question sets nothing: a "no", a change of subject, or 60
 seconds of silence all drop it (the same rule as "cancel all my alarms").
 The yes rides the follow-up window, which is 15 s while a read-back is open
-(§41).
+(§48).
 
 ```json
 { "confirm": { "read_back": true, "shaky_logprob": -0.7 } }
@@ -1554,7 +1556,7 @@ The yes rides the follow-up window, which is 15 s while a read-back is open
 Raise `shaky_logprob` toward 0 to be asked more often, lower it (-0.9) to be
 asked only when the transcript is nearly garbled.
 
-## 43. Two things at once
+## 50. Two things at once
 
 Tier-1 commands can be chained in one utterance, on the same conjunctions
 desktop chains have always used — "and then", "then", "and", a comma:
@@ -1579,12 +1581,13 @@ The rules, which are deliberately strict:
   the model whole: half an answer is worse than none.
 
 - **A doubtful transcript is never split.** If the words scraped in under
-  `confirm.shaky_logprob` (§42), the compound goes to the model whole
+  `confirm.shaky_logprob` (§49), the compound goes to the model whole
   rather than running two actions off a guess.
 
 Nothing to configure. If a pair you expect is not chaining, say each half
 on its own first — if either one needs the model, the pair will too.
-## 40. Named lists ("add milk to the shopping list")
+
+## 51. Named lists ("add milk to the shopping list")
 
 Nothing to configure — the lists live in the same SQLite file as the notes
 and to-dos (`~/.local/share/jarvis/memory/notes.db` unless `PATHS.MEMORY_DIR`
@@ -1619,7 +1622,7 @@ ssh spark jarvis "add milk to the shopping list"
 
 That path skips the wake word and the intent gate entirely (see section 37).
 
-## 41. Taking it back: "scratch that"
+## 52. Taking it back: "scratch that"
 
 Say **"scratch that"** (or "undo that", "undo", "take that back", "belay
 that") within a minute of asking for something and he removes exactly that
@@ -1641,7 +1644,7 @@ Calendar events are the exception: `write_event` is deliberately add-only, so
 a calendar add cannot be undone by voice. It has its own read-back before it
 writes; delete the event by hand if the answer was wrong.
 
-## 40. Episodic recall ("when did I last talk to my advisor?")
+## 53. Episodic recall ("when did I last talk to my advisor?")
 
 The activity journal (section 23) already records every exchange, tool call, Claude
 result and window title for 90 days; this asks it *when*.
@@ -1666,7 +1669,7 @@ Day files are walked newest-first and the scan stops at the first hit, so the us
 answer costs one file read rather than ninety. Term matching is whole-word but treats
 `_` and `.` as boundaries, so "thesis" finds `thesis_draft.tex - TeXstudio`.
 
-## 41. The weekly memory garden (what he learns about you on his own)
+## 54. The weekly memory garden (what he learns about you on his own)
 
 Nothing ever promoted what Jarvis **observed** into what he **knows** — the journal
 filled up and `facts.json` only ever held what you told him out loud. Once a week it
@@ -1699,7 +1702,7 @@ must never sit in front of a real question. Delivery rides the first-wake path, 
 already refuses to speak inside quiet hours, so a pass written at 3 am is heard at
 breakfast. Fully local: the journal is a file and the model is Ollama.
 
-## 42. The weekly self-review (the bugs he files about himself)
+## 55. The weekly self-review (the bugs he files about himself)
 
 The nightly digest (section 36) now also records the day's WARNING / ERROR clusters —
 it has to, because `/tmp` is wiped at boot and by Sunday there is nothing left to
@@ -1713,7 +1716,7 @@ re-read. Once the ISO week closes, the seven digests are aggregated into
   worse that I can see, sir."*
 - *"weekly review"*, *"how was my week"*, *"week in review"*, *"what went wrong last
   week"* — asks for it on demand, with the full table on a card. (*"how's my week
-  looking"* is still the calendar forecast, section 12.)
+  looking"* is still the calendar forecast, section 7.)
 - **Discord** — the table is posted when the report is filed, like the nightly one.
 - **feedback.jsonl** — every recurring warning cluster (2+ days, or 3+ occurrences) and
   every worsened number is appended to
@@ -1724,7 +1727,8 @@ re-read. Once the ISO week closes, the seven digests are aggregated into
 A "trend" needs the median wait to move by 0.4 s **and** 20%, so a quiet week of three
 turns cannot shout. All of it is arithmetic over JSON already on disk: no log
 re-reading, no model, nothing leaving the box.
-## 40. Do not disturb during a study block
+
+## 56. Do not disturb during a study block
 
 ```json
 "focus": {"block_min": 25, "break_min": 5, "dnd": true}
@@ -1754,7 +1758,7 @@ also ends the hold early and reads the digest immediately.
 Ordering note: an explicit *"do not disturb for an hour"* outranks the block when
 he is asked *why* he is quiet, but either one holds.
 
-## 41. Interval nudges: "every 45 minutes"
+## 57. Interval nudges: "every 45 minutes"
 
 Reminders have always repeated *daily* or *on weekdays*. They now also repeat on
 an interval:
@@ -1775,7 +1779,7 @@ Nothing to configure.
 
 **They know when to shut up.** A nudge is only true at the moment it is due, so
 when Jarvis is holding his tongue — quiet hours, do not disturb, a meeting on the
-calendar, a study block (section 40), or simply because you are out of the house —
+calendar, a study block (section 56), or simply because you are out of the house —
 a nudge that comes due **expires** instead of joining the catch-up digest. Come
 back from a two-hour meeting and you get your reminders and warnings, not four
 stacked "drink water" lines. Real reminders, timers, alarms and warnings are held
@@ -1789,7 +1793,7 @@ Two phrasings he deliberately refuses, because they are almost always a mis-hear
 He says "I couldn't make out the time, sir" rather than quietly setting something
 odd.
 
-## 42. Sums and unit conversions, answered instantly
+## 58. Sums and unit conversions, answered instantly
 
 Nothing to configure — this one just works, and it works with the wake word or
 without it.
@@ -1839,7 +1843,8 @@ the model is ever asked.
 
 Note that *"five pounds in kilos"* is a weight (2.27 kg) while *"five pounds in
 dollars"* is the currency refusal — the weight reading is tried first.
-## 40. Claude Code sessions can ask Jarvis back
+
+## 59. Claude Code sessions can ask Jarvis back
 
 Section 37 gave you `jarvis -q "..."` from a shell. Section 39 made your own
 Claude terminals talk to you through Jarvis. This closes the loop the other way:
@@ -1893,7 +1898,7 @@ running: carry on, do not retry. Never delegate coding or web work to him.
 Jarvis never edits that file for you, for the same reason `install.py` is a
 manual step: your Claude configuration is yours.
 
-## 41. Ask him where something is in your own code
+## 60. Ask him where something is in your own code
 
 > "Jarvis, where does the mic arbiter live?"
 > "It's in Jarvis, jarvis/recorder.py, lines 120 to 168, sir."
@@ -1943,7 +1948,7 @@ it is a *lookup*:
 The index can say where things are; it cannot say where they belong or why
 they broke. Saying "ask Claude" explicitly always wins.
 
-## 42. Syllabus dates: the exam that never reached Canvas
+## 61. Syllabus dates: the exam that never reached Canvas
 
 Canvas carries assignments. The midterm dates live in a PDF, and at TAMU
 that PDF is often the only place they exist — so "when's my next exam" said
@@ -2007,7 +2012,8 @@ sir" means the folder has nothing syllabus-shaped in it (or nothing at all);
 "I'm indexing your documents now" means the file is there but not embedded
 yet — ask again in a moment; "My document index isn't answering" means
 Ollama is down, not that the folder is wrong.
-## 40. Phone intercom: talk to him from bed (no wake word)
+
+## 62. Phone intercom: talk to him from bed (no wake word)
 
 The wake word does not reach the next room, and the soundbar's answer would
 wake the house. The intercom sends a *recording* over the command socket
@@ -2087,7 +2093,7 @@ JSON line: the request framing was 64 KB and is now the base64 of a whole
 clip, and a runaway request answers "request too large" instead of looking
 like a JSON bug.
 
-## 41. Bedtime wind-down: "good night" dims the room
+## 63. Bedtime wind-down: "good night" dims the room
 
 "Good night, sir. I'll be here." can be made physical. With the wind-down on,
 saying good night also fades the music out, warms and dims the screen, and
@@ -2156,7 +2162,7 @@ desktop monitor. Spotify only does anything when the account is linked
 (section 11) and a device is reachable — otherwise it is a night without
 music and no apology, exactly as in a focus session.
 
-## 40. The Aside: one thing you did not ask for
+## 64. The Aside: one thing you did not ask for
 
 > "Alarm for 7:00 am, sir. Incidentally, Lab 3 report for BIOSENSORS is due
 > at 11:59 pm that night."
@@ -2243,7 +2249,7 @@ Read the output as a transcript, not as a test. If more than a couple of the
 lines make you wince, the templates are wrong and no amount of ledger
 correctness will save it.
 
-## 41. Reasoned dissent: "I would advise against that, sir"
+## 65. Reasoned dissent: "I would advise against that, sir"
 
 > "Wake me at two."
 > "I would advise against a 2:00 am alarm, sir; your BIOSENSORS lecture is at
@@ -2316,7 +2322,7 @@ matters: if you overruled **all** of his objections, three or more times in a
 day, the rule is simply wrong. "Why did you argue with me about that alarm?"
 is answerable later too — every objection goes into the journal.
 
-## 42. The debrief: "how did the midterm go, sir?"
+## 66. The debrief: "how did the midterm go, sir?"
 
 The calendar says the BIOSENSORS midterm ended forty minutes ago and you are
 not out. He asks. **Once.**
@@ -2395,7 +2401,7 @@ Calendar first: Canvas exam rows carry a due time and no end, so there is
 nothing there that can say *it is over*.
 ---
 
-## 43. The arc: one named hour for the whole house
+## 67. The arc: one named hour for the whole house
 
 Time-of-day logic used to be five clocks that disagreed — quiet's hours, the
 deadline nudges' "not yet evening", hardcoded morning/evening greetings in two
@@ -2447,7 +2453,7 @@ failure this avoids.
 State lives in `MEMORY_DIR/arc_state.json` so a restart does not re-announce
 the hour you were already in.
 
-## 44. The earcon lexicon: six tones in one family
+## 68. The earcon lexicon: six tones in one family
 
 He had three beeps already — the capture opening at 880 Hz, the capture
 closing at 660, and the 440 Hz nudge that means "I heard you, and I have
@@ -2468,7 +2474,7 @@ Six names ship:
 | `heard-you` | the wake word landed | the wake acknowledgement |
 | `done` | the capture closed | end of recording |
 | `held-back` | heard you, nothing to answer | the nudge policy |
-| `arrival` | he came back | the arrival cue (§45) |
+| `arrival` | he came back | the arrival cue (§69) |
 | `thinking` | — | nothing, on purpose |
 | `warning` | — | nothing, on purpose |
 
@@ -2507,7 +2513,7 @@ false-wake metronome it prevents.
 The WAVs bake deterministically into `MEMORY_DIR/earcons` — not `LOG_DIR`,
 because `/tmp` is wiped at boot on this box.
 
-## 45. Arrival and departure: the room notices the door
+## 69. Arrival and departure: the room notices the door
 
 "Welcome back, sir" and the catch-up digest already shipped. What was missing
 was that they landed as a bare line into a dead room. Arrival is now a
@@ -2567,7 +2573,7 @@ Wi-Fi. Before tuning the confirm windows, it is worth just watching the
 that ledger answers how late arrival detection really is, and how often the
 radio naps, better than any guess.
 
-## 46. Room tone: a house that is audibly awake
+## 70. Room tone: a house that is audibly awake
 
 Under everything, a bed. One near-subliminal 12-second loop per arc phase:
 pre-dawn is almost nothing, the work hours carry a faint HVAC-and-servers hum,
@@ -2625,7 +2631,8 @@ synthesized on a tick, and certainly not while Whisper is decoding. The loops
 are periodic by construction — the drone rounded to whole cycles, the air
 built in the frequency domain — so there is no crossfade anywhere and no seam
 to hear.
-## 40. The Board — mission control on the empty right of the desk
+
+## 71. The Board — mission control on the empty right of the desk
 
 The console is 520x880 on a 3840x2160 panel. The Board fills the rest of the
 right flank with a second borderless panel in the same theme.
@@ -2683,7 +2690,7 @@ back to a "splash" window type — undecorated, but skipped by taskbars, which
 for a docked panel is what you wanted anyway.
 
 
-## 41. Standby and the ambient panel — the console when nobody is talking
+## 72. Standby and the ambient panel — the console when nobody is talking
 
 Between conversations the console stops being an app.
 
@@ -2747,7 +2754,7 @@ A live turn or a ringing alarm keeps it awake regardless.
 `standby_dim` is a floor, not a target: 0.35 means it never goes below 35%.
 
 
-## 42. Power-up — the room waking with you
+## 73. Power-up — the room waking with you
 
 The first time you touch the desk after the night — the phone coming back
 onto the Wi-Fi, or simply the first wake word of the day — the panels
@@ -2762,7 +2769,7 @@ information in it, and nothing waits on it.
 
 Two triggers, because on this machine one is not enough: the proper one is
 presence noticing you are back, but presence does nothing until `phone_ip`
-is set (section 21), so the first wake word of the day is what actually
+is set (section 35), so the first wake word of the day is what actually
 fires it here.
 
 The "once a day" latch is a `boot_sweep` date written into the same
@@ -2775,7 +2782,8 @@ Jarvis five times before breakfast still gets you one sweep.
 
 `powerup_gap_h` is how long the machine must have been left alone to count
 as "after the night". Set `powerup` to `false` and nothing sweeps.
-## 40. The room: display light, level and scenes
+
+## 74. The room: display light, level and scenes
 
 There are no bulbs in this room, so the 43-inch panel is the light. Jarvis moves two
 things and says so honestly — *"Dimming the display, sir."* The screen dims; the room
@@ -2837,7 +2845,7 @@ runs the scene as well. `room.enabled: false` switches the spoken verbs off enti
 and `JARVIS_ROOM_CONTROL=0` in the environment blocks every real `xrandr` / `gsettings` /
 `pactl` call (the test suite sets it, because those commands act on your live session).
 
-## 41. The Room Mixer (music bows under his voice)
+## 75. The Room Mixer (music bows under his voice)
 
 While Jarvis speaks — and while he is listening — every stream on the box that is not
 his own slides down to 30 % over about 200 ms, and slides back afterwards. Nothing to
@@ -3040,7 +3048,9 @@ mem = JarvisMemory()
 print({k: v for k, v in mem.get_all_preferences().items()
        if k.startswith("leave_lead.")})
 EOF
-## 44. The pre-class dossier and class-start staging
+```
+
+## 76. The pre-class dossier and class-start staging
 
 Two things that happen on their own around a lecture. Both hang off the
 same idea: **a course is a calendar slot, not a Canvas course**. Canvas
@@ -3178,6 +3188,7 @@ evs = [Event.from_dict(e) for v in d["sources"].values()
 print(courses.recurring_courses(evs))
 PY
 ```
+
 ## Register, continuity and the self sheet
 
 ### "Formal mode" before your advisor arrives
@@ -3277,7 +3288,8 @@ feet.
 Nothing here is phrased by the model. Every figure is a reading, and if the
 counters cannot be read he says so in a sentence rather than quietly
 shortening the report.
-## 40. Working sessions: "let us plan the week"
+
+## 77. Working sessions: "let us plan the week"
 
 Say **"let's plan the week"** (or "plan my week", "sort out my week") and he
 walks this week's Canvas deadlines and open to-dos one at a time, proposing
@@ -3320,7 +3332,7 @@ The machinery underneath (`jarvis/dialogue.py`) is a small protocol —
 multi-turn feature can rent. The week planner is its first tenant.
 
 
-## 41. The fault lane: he tells you once, and the board remembers
+## 78. The fault lane: he tells you once, and the board remembers
 
 The health watchdog already knew when memory was tight or two processes
 were eating the unified pool. The problem was that it said so into a
@@ -3363,7 +3375,7 @@ Thresholds are the existing `health` block — nothing new to configure:
 ```
 
 
-## 42. The run ledger: "that's done, sir; twenty-two minutes"
+## 79. The run ledger: "that's done, sir; twenty-two minutes"
 
 Start a training run and, until now, the room went quiet for the twenty
 minutes that mattered. The run ledger gives a run two beats and an honest
