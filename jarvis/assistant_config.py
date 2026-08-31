@@ -411,33 +411,57 @@ DEFAULTS: dict = {
     # the gate (which fails SHUT) would reject his own voice. max_mb caps
     # one clip; the socket framing allows a little more than this.
     "intercom": {"enabled": True, "verify_speaker": False, "max_mb": 10},
-    # Hunter's Oracle Cloud VM (jarvis/tools/oracle.py): the Oracle Linux
-    # box running the Discord "game-news" bot under pm2. OUTBOUND ONLY --
-    # Jarvis asks it questions over ssh; nothing here opens anything the
-    # other way, and there is deliberately no tunnel, reverse tunnel or
-    # port-forward setting to turn on.
+    # Hunter's Oracle Cloud VM (jarvis/tools/oracle.py): `demon-bot`,
+    # opc@163.192.101.18, Oracle Linux Server 9.6, running NINE app services
+    # under systemd behind nginx. Verified by ssh 2026-08-31; there is no
+    # pm2 on it (the pm2/game-news table this section used to hold described
+    # an OLDER server). OUTBOUND ONLY -- Jarvis asks it questions over ssh;
+    # nothing here opens anything the other way, and there is deliberately
+    # no tunnel, reverse tunnel or port-forward setting to turn on.
     #
-    # OFF and keyless by default: with `key_path` empty every entry point
-    # answers one line naming what is missing and NOTHING opens a socket.
-    # timeout_s is the whole budget for one round trip -- past it he says
-    # the box did not answer rather than holding the turn -- and cache_s is
+    # OFF by default. `key_path` points at the key that is verified to log
+    # in as opc, so `"enabled": true` is the ONLY edit needed to switch the
+    # lane on; until then every entry point answers one line naming what is
+    # missing and NOTHING opens a socket. timeout_s is the whole budget for
+    # one round trip -- the real round trip measures 1.0 s -- and cache_s is
     # how long the last good reading answers a second question for free.
     #
-    # `actions` is an ALLOW-LIST: a spoken name -> the exact command run on
-    # the far side. Nothing from a transcript is ever interpolated into a
-    # command; a misheard word can only fail to match a key. Any command
-    # that changes state (the restart) is read back for a yes first.
+    # `services` is the ALLOW-LIST. A spoken name resolves to one of these
+    # ROWS and the command is built in oracle.py from a fixed template plus
+    # that row's unit; nothing from a transcript is ever interpolated into a
+    # command, and a unit name that is not a plain systemd unit is dropped
+    # at load. The only actions are status, logs and restart, and a restart
+    # is read back for a yes first. `name` is what he is called out loud.
     "oracle": {
         "enabled": False,
-        "host": "170.9.245.136",
+        "host": "163.192.101.18",
         "user": "opc",
-        "key_path": "",
+        "key_path": "~/Downloads/Oracle Cloud Service (2)/Oracle Cloud "
+                    "Service/Discord Bot/Keys/ssh-key-2025-08-15.key",
         "timeout_s": 6,
         "cache_s": 25,
-        "actions": {
-            "status": "pm2 status --no-color",
-            "logs": "pm2 logs --lines 20 --nostream --no-color",
-            "restart the bot": "pm2 restart game-news",
+        "log_lines": 20,
+        "services": {
+            "haymaker": {"unit": "haymaker-bot", "name": "Haymaker"},
+            "coa": {"unit": "coa-bot", "name": "Court of Awe",
+                    "aliases": ["court of awe", "court of aw"]},
+            "exoshock": {"unit": "exoshock-bot", "name": "Exoshock",
+                         "aliases": ["exo shock"]},
+            "vrider": {"unit": "vrider-bot", "name": "VRider",
+                       "aliases": ["v rider", "the rider"]},
+            "timecard": {"unit": "timecard-bot", "name": "Timecard",
+                         "aliases": ["time card"]},
+            "knightfall": {"unit": "knightfall-web", "name": "Knightfall",
+                           "aliases": ["knightfall protocol", "nightfall"]},
+            "elevation api": {"unit": "elevation-api",
+                              "name": "the elevation API",
+                              "aliases": ["elevation", "ditch grade"]},
+            # no bare "monday": "what about Monday?" is about the week
+            "monday sync": {"unit": "monday-sheets-sync",
+                            "name": "Monday sync",
+                            "aliases": ["sheets sync", "monday sheets"]},
+            "dashboard": {"unit": "bot-dashboard", "name": "the dashboard",
+                          "aliases": ["bot dashboard"]},
         },
     },
     # The phone client (jarvis/webapp.py): a page served to a device on the

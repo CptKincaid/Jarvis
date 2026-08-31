@@ -3462,150 +3462,154 @@ All of this rides the health watchdog's existing 30-second tick. There is
 no extra thread and no `nvidia-smi` call — the wedge these features exist
 to warn about is precisely the state in which `nvidia-smi` blocks forever.
 
-## 80. The Oracle box: "how's the game news bot, sir?"
+## 80. The Oracle box: "how are the bots, sir?"
 
-Your Oracle Cloud VM — `opc@170.9.245.136`, the Oracle Linux box running the
-Discord **game-news** bot under pm2 out of `~/Game-News` — can answer for
-itself:
+Your Oracle Cloud VM is **`demon-bot`** — `opc@163.192.101.18`, Oracle Linux
+Server 9.6, up ten weeks, 20 GB of a 30 GB disk used. It runs **nine app
+services under systemd**, behind nginx and fail2ban, with docker and
+containerd alongside:
 
-> **You:** how's the Oracle box?
-> **Jarvis:** game-news has been online 3 days, sir; the box has been up 40
-> days with 0.5 gigabytes free.
+| service | unit | what it is |
+|---|---|---|
+| Haymaker | `haymaker-bot` | Haymaker Discord Bot |
+| Court of Awe | `coa-bot` | Court of Awe Discord Bot |
+| Exoshock | `exoshock-bot` | Exoshock Discord Bot |
+| VRider | `vrider-bot` | VRider Discord Bot |
+| Timecard | `timecard-bot` | Discord Timecard Bot |
+| Knightfall | `knightfall-web` | Knightfall Protocol web — heartbeat endpoint + admin dashboard |
+| the elevation API | `elevation-api` | Ditch Grade elevation-api — projects sync + log sink |
+| Monday sync | `monday-sheets-sync` | Monday.com → Google Sheets sync |
+| the dashboard | `bot-dashboard` | Discord Bot Dashboard |
 
-…with the full sheet on the card beside it: uptime, load, memory, disk and
-every pm2 process with its status, cpu, memory and restart count.
+Ask, and the box answers for itself:
+
+> **You:** how are the bots?
+> **Jarvis:** All nine services are up on demon-bot, sir; ten weeks and a day
+> of uptime and a third of the disk free.
+
+…with the sheet on the card beside it: hostname, uptime, load, memory, disk
+and every one of the nine with its systemd state. When something is not
+running, that leads the sentence instead:
+
+> **Jarvis:** Haymaker is down, sir; the other eight are up.
+
+That is one ssh round trip — it measures **1.0 s** against the real box — and
+it answers the single-service questions too, out of the same roll-call.
 
 This lane is **outbound only**. Jarvis asks the Oracle box questions. Nothing
 opens the other way: there is no tunnel, no reverse tunnel, no port-forward
 and no setting here that exposes the Spark to the internet — deliberately, and
 there is a test that asserts it rather than trusting the comment.
 
-### It is off until you give it a key
+### Switching it on is one line
 
-Everything below is off by default and there is **no key on this machine that
-works**. The one in `~/Downloads/Oracle Cloud Service (2)/Oracle Cloud
-Service/Discord Bot/Keys/ssh-key-2025-08-15.key` is a real RSA key at mode
-0600, and the host is reachable — but the server rejects it:
+There is **no credential problem**. The key already on this machine works:
 
 ```
-$ ssh -i ".../Keys/ssh-key-2025-08-15.key" opc@170.9.245.136
-opc@170.9.245.136: Permission denied (publickey).
+~/Downloads/Oracle Cloud Service (2)/Oracle Cloud Service/Discord Bot/Keys/ssh-key-2025-08-15.key
 ```
 
-Your cheat sheet uses a *different* key called `oracle-key`, which lives on
-your Windows desktop. So step one is getting a working credential onto the
-Spark. There are two ways, and either is fine.
+It is mode 0600 and it logs in as `opc` — verified. `oracle.key_path` in the
+shipped defaults already points at it, along with the right host and user, so
+the whole edit in `~/.config/jarvis/assistant.json` is:
 
-**Either — copy the key that already works.** On the Windows desktop it is at:
-
-```
-C:\Users\h2pey\Desktop\Oracle Cloud Service\XLAB Digital Steam News Bot\Keys\oracle-key
+```json
+"oracle": { "enabled": true }
 ```
 
-From the Spark:
+The rest of the section (host, user, key_path, the nine services) is merged
+in from the defaults, so you do not have to repeat any of it. No restart is
+needed for the voice commands — the config is read fresh on every question —
+but the `oracle_status` tool the local model can call is only registered at
+boot, so restart Jarvis if you want that too.
 
-```bash
-mkdir -p ~/.ssh/oracle && chmod 700 ~/.ssh/oracle
-# copy the file across however you like (USB stick, scp from the desktop,
-# a private paste — it is a private key, so not email and not a chat)
-chmod 600 ~/.ssh/oracle/oracle-key
-ssh -i ~/.ssh/oracle/oracle-key opc@170.9.245.136 'echo ok'
-```
-
-That `echo ok` is the whole test. If it prints `ok`, you are done with step one.
-
-**Or — authorise the key the Spark already has.** From the Windows desktop
-(or anywhere that can already get in), append the *public* half of the key
-that is sitting in your Downloads folder to the server's authorized_keys:
-
-```bash
-# the public half, already next to the private one on the Spark:
-#   ~/Downloads/Oracle Cloud Service (2)/Oracle Cloud Service/Discord Bot/Keys/ssh-key-2025-08-15.key.pub
-# it is one line beginning "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC5OVROXJgx9..."
-ssh -i "<the oracle-key that works>" opc@170.9.245.136 \
-    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys' \
-    < "ssh-key-2025-08-15.key.pub"
-```
-
-Then on the Spark, move the private key somewhere permanent (Downloads is not
-a home for a key) and check it:
+If you would rather the key did not live in `~/Downloads` (it is a private
+key, and that is not a home for one), move it and point `key_path` at the new
+place:
 
 ```bash
 mkdir -p ~/.ssh/oracle && chmod 700 ~/.ssh/oracle
 cp ~/Downloads/"Oracle Cloud Service (2)"/"Oracle Cloud Service"/"Discord Bot"/Keys/ssh-key-2025-08-15.key \
    ~/.ssh/oracle/oracle-key
 chmod 600 ~/.ssh/oracle/oracle-key
-ssh -i ~/.ssh/oracle/oracle-key opc@170.9.245.136 'echo ok'
+ssh -i ~/.ssh/oracle/oracle-key opc@163.192.101.18 'echo ok'
 ```
 
 A key copied off Windows often lands mode 0644, and ssh refuses it outright
 ("UNPROTECTED PRIVATE KEY FILE"). Jarvis checks the mode himself and says so
-in those words rather than blaming authentication, but `chmod 600` first and
-save yourself the trip.
+in those words rather than blaming authentication.
 
-### Then switch it on
+Until `enabled` is true, every phrasing gets one honest line naming exactly
+what is missing, and **nothing opens a socket**:
 
-In `~/.config/jarvis/assistant.json`:
-
-```json
-"oracle": {
-  "enabled": true,
-  "host": "170.9.245.136",
-  "user": "opc",
-  "key_path": "~/.ssh/oracle/oracle-key",
-  "timeout_s": 6,
-  "cache_s": 25,
-  "actions": {
-    "status": "pm2 status --no-color",
-    "logs": "pm2 logs --lines 20 --nostream --no-color",
-    "restart the bot": "pm2 restart game-news"
-  }
-}
-```
-
-`enabled` and `key_path` are the two that matter; the rest already ship with
-these values. No restart is needed for the voice commands — the config is read
-fresh on every question — but the `oracle_status` tool the local model can
-call is only registered at boot, so restart Jarvis if you want that too.
-
-Until then, every phrasing gets one honest line naming exactly what is
-missing, and **nothing opens a socket**:
-
-> I've no key for the Oracle box, sir; set oracle.key_path in
-> ~/.config/jarvis/assistant.json.
+> The Oracle box is switched off in my settings, sir; set oracle.enabled to
+> true in ~/.config/jarvis/assistant.json.
 
 ### What you can say
 
 | say | what happens |
 |---|---|
-| "how's the Oracle box" · "is the game news bot up" · "what's running on Oracle" · "check the Oracle box" · "Oracle status" | the status sentence + the card |
-| "show me the game news bot logs" · "Oracle logs" · "what do the game news bot logs say" | the last 20 lines on a card, and how many of them mention an error |
-| "restart the game news bot" · "Oracle restart the bot" | **read back first** — "Restart the bot on the Oracle box, sir?" — and only a yes runs it |
-| "is the server up" · "how's the bot" · "restart the bot" | the same three, but only once the lane is switched on. With it off these name no box, so they go to the model instead of Jarvis claiming your local dev server |
+| "how are the bots" · "how's the Oracle box" · "are all the services up" · "what's running on Oracle" · "Oracle status" | the roll-call sentence + the card |
+| "how's the haymaker bot" · "is knightfall up" · "how's the elevation api" · "what about monday sync" · "is vrider running" | that one service, out of the same round trip |
+| "show me the haymaker logs" · "what do the knightfall logs say" · "the logs for monday sync" | `journalctl -u <unit> -n 20`, with how many of those lines mention an error |
+| "restart the haymaker bot" · "Oracle restart knightfall" | **read back first** — "Restart Haymaker on the Oracle box, sir?" — and only a yes runs it |
+| "show me the oracle logs" · "restart the bot" | nine journals are not one answer and nine bots are not one bot, so he asks which, with the list on the card |
+| "is the server up" · "how's the bot" | the roll-call, but only once the lane is switched on. With it off these name no box, so they go to the model instead of Jarvis claiming your local dev server |
+
+Naming a service is generous: "haymaker", "the haymaker", "haymaker bot" and
+"haymaker-bot" are one name, and so are "coa" / "court of awe", "monday" /
+"monday sync" / "monday sheets sync", "elevation" / "ditch grade" / "the
+elevation api". A name that matches **more than one** service resolves to
+none of them — restarting the wrong bot because two matched is the failure
+this lane is built to avoid.
+
+Note that a bare service name only answers once the lane is **on**. With it
+off, "how's the haymaker" goes to the model, because `~/haymaker-digest` is a
+job on *this* machine and answering for a server Jarvis has not been told
+about would be a confident wrong answer.
 
 Ask twice in a row and the second answer is instant: the last good reading is
-kept for `cache_s` seconds, so "how's the Oracle box" followed by "and
-how's the game news bot?" is one round trip, not two. Running any action
-throws that reading away — a restart must never be reported off a reading
-taken before it.
+kept for `cache_s` seconds, so "how are the bots" followed by "and
+knightfall?" is one round trip, not two. Running any action throws that
+reading away — a restart must never be reported off a reading taken before it.
 
 ### The rules it keeps
 
-**Named actions only, and nothing from your voice reaches a shell.** The
-`actions` table maps a *spoken name* onto an *exact command*. Jarvis resolves
-what you said against the keys of that table and runs the matching row's
-string verbatim; not one character of the transcript is ever interpolated into
-a command. Anything that is not a row is refused out loud, and told what he
-does know:
+**Three actions, and nothing from your voice reaches a shell.** The only
+things Jarvis does on that box are read the roll-call, tail one journal and
+restart one service. A spoken name is resolved against the `oracle.services`
+table and the command is then *built* from a fixed template plus that row's
+unit name — which had to look like a systemd unit to be loaded at all. Not
+one character of the transcript is ever interpolated into a command. Anything
+else said at the box is refused out loud rather than guessed at or handed to
+the model:
 
 > **You:** run deploy on the Oracle box
-> **Jarvis:** I don't do "deploy" on the Oracle box, sir. I know "status",
-> "logs" and "restart the bot".
+> **Jarvis:** I've nothing called "deploy" on the Oracle box, sir.
 
-Add rows if you want more — `"pull and restart": "cd ~/Game-News && git pull && npm install && pm2 restart game-news"`
-is the obvious one. Anything whose *command* changes state is read back for a
-yes automatically; you do not have to remember to mark it, because the check
-reads the command rather than the name you gave it.
+> **You:** stop haymaker
+> **Jarvis:** I only do status, logs and a restart on the Oracle box, sir.
+
+That second one is refused *aloud* on purpose. Silence would leave you
+believing the bot had been stopped.
+
+**A restart needs sudo, and it has it.** As `opc`, a plain
+`systemctl restart haymaker-bot` over ssh is refused — polkit wants
+interactive authentication and a non-interactive ssh has no agent to give it
+(`pkcheck --action-id org.freedesktop.systemd1.manage-units` says so in as
+many words). `opc` does hold passwordless sudo, so the command Jarvis
+actually sends is:
+
+```
+sudo -n systemctl restart <unit> && systemctl is-active <unit>
+```
+
+The `-n` is load-bearing on its own: if sudo were ever locked down on that
+box, without it this would sit on a password prompt for the whole timeout
+budget. The `is-active` tail is why he can tell you what happened rather than
+just "done":
+
+> Haymaker is back up, sir.
 
 **It cannot hang the turn.** One ssh round trip, `timeout_s` seconds, and the
 child is killed *without being waited for* — the same shape as the
@@ -3616,13 +3620,17 @@ exits. Past the budget he says so:
 
 > The Oracle box didn't answer in 6 seconds, sir; I've stopped waiting on it.
 
-**pm2 needs its PATH.** `ssh host 'pm2 status'` runs a *non-login* shell,
-which never sources the `~/.bashrc` block that puts nvm's node on PATH — so
-the command straight off your cheat sheet answers "pm2: command not found"
-even though it works the moment you ssh in and type it. Every remote command
-is prefixed with a small POSIX prelude that puts `~/.nvm/versions/node/*/bin`
-back on PATH, which is why the config can hold the plain command you already
-know.
+**The memory number is not the one /proc reports.** demon-bot's kernel says
+`MemAvailable: 20512504 kB` on a box with `MemTotal: 5779324 kB` — nineteen
+gigabytes free on a five-and-a-half gigabyte machine. That is a real reading
+from a real OCI aarch64 kernel, and procps' own `free` guards against it by
+falling back to `MemFree`, which is why `free -h` says 1.7 Gi available while
+`/proc/meminfo` says 19.6. Jarvis does the same clamp; without it the card
+would confidently report more free memory than the box has.
+
+**There is no pm2 on that box.** An earlier version of this section described
+a `game-news` bot under pm2 at `170.9.245.136`, out of a PDF cheat sheet. That
+was an *older server*. Everything above was read off `demon-bot` itself.
 
 ## 80. Jarvis on your phone (home Wi-Fi only)
 
