@@ -14,7 +14,9 @@ Four things make him hold his tongue:
                              window; overnight windows wrap midnight)
 * the calendar            -- a timed event running NOW whose title contains
                              one of ``quiet.calendar_keywords``
-                             (class / exam / meeting / busy)
+                             (class / exam / meeting / busy), OR one that is
+                             a recurring course whatever it is called
+                             (``quiet.calendar_courses``, jarvis/courses.py)
 * being away              -- ``services.presence.is_home()`` says the phone
                              left (jarvis/presence.py); off with
                              ``quiet.hold_when_away``
@@ -48,6 +50,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
+from jarvis import courses as courses_mod
 from jarvis.logs import get_logger
 
 log = get_logger("quiet")
@@ -315,7 +318,19 @@ class QuietPolicy:
             log.debug("quiet: calendar unavailable", exc_info=True)
             return None
         kws = self.keywords()
-        if not kws:
+        # His courses are not called "class". The shipped keyword list
+        # (class / exam / meeting / busy) matches none of BIOSENSORS,
+        # MAGNETIC RESONANCE ENGR or ELECTRICAL DESIGN LAB II, so the
+        # calendar leg of quiet hours had never once fired for him. A title
+        # at the same weekday and clock time on two or more weeks IS a
+        # class, whatever it is called (jarvis/courses.py).
+        names: tuple = ()
+        if self._get("quiet.calendar_courses", True):
+            try:
+                names = tuple(courses_mod.recurring_courses(events, now=dt))
+            except Exception:  # noqa: BLE001 - the cache is best-effort
+                log.debug("quiet: course detection failed", exc_info=True)
+        if not kws and not names:
             return None
         for ev in events:
             if getattr(ev, "all_day", False):
@@ -331,7 +346,9 @@ class QuietPolicy:
             except TypeError:
                 continue
             words = re.findall(r"[a-z]+", title.lower())
-            if any(k in words for k in kws):
+            if kws and any(k in words for k in kws):
+                return ev
+            if names and courses_mod.course_for(title, names):
                 return ev
         return None
 
@@ -356,8 +373,13 @@ class QuietPolicy:
             return ""
         return FOCUS_REASON
 
-    def reason(self, now: Optional[float] = None) -> str:
-        """Why he is quiet right now, in his words -- "" when he is not."""
+    def reason(self, now: Optional[float] = None, calendar: bool = True) -> str:
+        """Why he is quiet right now, in his words -- "" when he is not.
+
+        ``calendar=False`` asks the same question WITHOUT the running-event
+        leg, which is what a caller that is itself acting on that event
+        needs (jarvis/classflow.py stages a class the instant it starts, and
+        the class is the quiet window)."""
         ts = self._now() if now is None else float(now)
         try:
             free_until = float(self._get("quiet.free_until", 0) or 0)
@@ -384,7 +406,7 @@ class QuietPolicy:
         hours = self._hours_reason(dt)
         if hours:
             return hours
-        ev = self._calendar_event(dt)
+        ev = self._calendar_event(dt) if calendar else None
         if ev is not None:
             end = getattr(ev, "end", None)
             when = f" until {fmt_clock(end.hour, end.minute)}" if end is not None else ""
