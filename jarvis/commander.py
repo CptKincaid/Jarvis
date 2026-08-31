@@ -3187,6 +3187,81 @@ def _teach_no_material(c, index, topic: str) -> None:
         _deliver(c, quiz_mod.NO_DOCS_LINE)
 
 
+# ---------------------------------------------------------- study ledger
+# focus_session.json is overwritten by the next session, so "three blocks
+# done" used to be spoken once and lost. focus.study_days() merges the
+# durable ledger with the timekeeper's own never-pruned block rows; these
+# two phrases are what read it back.
+_STUDY_TOTAL_RX = re.compile(
+    r"^" + _JV + r"(?:how (?:much|long) (?:did|have) i (?:studied|study|been studying)|"
+    r"how much (?:study|studying|focus|revision)(?: time)? (?:did|have) i (?:do|done|log(?:ged)?)|"
+    r"how much did i (?:get )?(?:study|studied|done)|"
+    r"(?:what's|what is|show me) my (?:study|focus|revision) (?:time|total|hours))"
+    r"(?:\s+(?P<when>today|yesterday|this week|last week|this month))?"
+    r"[.!?\s]*$", re.I)
+_STREAK_RX = re.compile(
+    r"^" + _JV + r"(?:what'?s|what is|how(?:'s| is)|hows)?\s*(?:my|the)?\s*"
+    r"(?:study |focus |revision )?streak(?:\s+(?:at|now|going|looking))?[.!?\s]*$", re.I)
+
+
+def _study_paths(c):
+    """(session-state path, timekeeper db path) -- both from the live
+    services when the app wired them, so a test session's tmp files are
+    used and the real ones are never touched."""
+    focus = c._svc("focus")
+    state = getattr(focus, "_state_path", None) if focus is not None else None
+    tk = c._svc("timekeeper")
+    db = getattr(tk, "db_path", None) if tk is not None else None
+    return state, db
+
+
+def _study_table(c) -> dict:
+    from jarvis import focus as focus_mod
+    state, db = _study_paths(c)
+    days = focus_mod.study_days(state_path=state, db_path=db)
+    # A session running right now is not in the ledger yet (end() writes
+    # it), and "how much did I study today" must still count this morning.
+    focus = c._svc("focus")
+    try:
+        if focus is not None and focus.active and focus.blocks_done > 0:
+            per = int(focus.state.get("block_min") or 0)
+            started = float(focus.state.get("started") or 0.0)
+            if started > 0:
+                day = focus_mod._day(started)
+                cell = days.setdefault(day, {"blocks": 0, "minutes": 0})
+                cell["blocks"] += focus.blocks_done
+                cell["minutes"] += focus.blocks_done * max(0, per)
+    except Exception:                          # noqa: BLE001 - live session boundary
+        log.debug("study ledger: live session unreadable", exc_info=True)
+    return days
+
+
+def _h_study_total(c, t, m):
+    from datetime import date, timedelta
+
+    from jarvis import focus as focus_mod
+    when = (m.group("when") or "this week").strip().lower() if hasattr(m, "group") else "this week"
+    today = date.today()
+    since = {"today": today, "yesterday": today - timedelta(days=1),
+             "this week": focus_mod.week_start(today),
+             "last week": focus_mod.week_start(today) - timedelta(days=7),
+             "this month": today.replace(day=1)}.get(when, focus_mod.week_start(today))
+    days = _study_table(c)
+    if when in ("yesterday", "last week"):
+        # a closed window: drop everything after it, or "yesterday" would
+        # quietly include today
+        stop = (today if when == "yesterday" else focus_mod.week_start(today)).isoformat()
+        days = {d: cell for d, cell in days.items() if d < stop}
+    return CommandResult(handled=True, reply=focus_mod.summary_line(days, since, when),
+                         speak=True, status="Study ledger")
+
+
+def _h_study_streak(c, t, m):
+    from jarvis import focus as focus_mod
+    return CommandResult(handled=True, reply=focus_mod.streak_line(_study_table(c)),
+                         speak=True, status="Study streak")
+
+
 def _h_teach(c, t, m):
     topic = m
     index = c._svc("docs")
@@ -3351,6 +3426,9 @@ REGISTRY: list[Command] = [
     Command("focus start", _m_focus_start, _h_focus_start, needs=("focus",)),
     Command("focus left", _FOCUS_LEFT_RX.match, _h_focus_left),
     Command("focus end", _FOCUS_END_RX.match, _h_focus_end, needs=("focus",)),
+    # the ledger reads files, not the live session: no needs=("focus",)
+    Command("study total", _STUDY_TOTAL_RX.match, _h_study_total),
+    Command("study streak", _STREAK_RX.match, _h_study_streak),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
     Command("list schedule", _LIST_SCHED_RX.match, _h_list_schedule,
@@ -3463,6 +3541,7 @@ ASSISTANT_TIER1: list[Command] = [
     if cmd.name in ("explain document", "quiz", "review flashcards", "stop quiz",
                     "teach me",
                     "focus start", "focus left", "focus end", "lecture notes",
+                    "study total", "study streak",
                     "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "next exam", "greeting", "day review",

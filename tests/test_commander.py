@@ -1478,6 +1478,8 @@ TIER1_SAMPLES = {
     "focus start": "start a focus session",
     "focus left": "how long left",
     "focus end": "end the session",
+    "study total": "how much did i study this week",
+    "study streak": "what's my streak",
     "lecture notes": "notes for biosensors",
     "timer": "set a timer for five minutes",
     "alarm": "set an alarm for seven",
