@@ -30,7 +30,6 @@ import numpy as np
 from jarvis.config import CONFIG
 from jarvis.events import HotwordDetected, Status, bus
 from jarvis.logs import get_logger
-from jarvis.speaker import MIN_AUDIO_SECONDS as SPEAKER_MIN_AUDIO_SECONDS
 
 log = get_logger("hotword")
 
@@ -124,7 +123,10 @@ def wake_hit(predictions, threshold, unverified_threshold):
 # checking who spoke (seen 2026-08-28 16:41:32.959, 0.349 s of audio,
 # "wake speaker check unavailable -- waking anyway"). Waiting the extra
 # fraction of a second costs nothing: the buffer fills in real time.
-WAKE_MIN_AUDIO_SECONDS = SPEAKER_MIN_AUDIO_SECONDS
+# 1.5 s, not speaker.MIN_AUDIO_SECONDS (1.0): the wake buffer is scored on
+# whatever speech it holds, and the 2026-08-31 simulation put false rejects
+# at 19.6% with 1.0 s floors against 6.2% at 1.5 s (+0.6pp false accepts).
+WAKE_MIN_AUDIO_SECONDS = 1.5
 
 
 def wake_audio_sufficient(n_samples: int, native_rate: int,

@@ -7,7 +7,6 @@ audio, no Spotify (the music mode is off).
 """
 import json
 import time
-from datetime import timedelta
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace

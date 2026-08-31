@@ -185,18 +185,35 @@ def test_fail_shut_is_paced_not_silenced(monkeypatch):
     assert len(published) == 2
 
 
-def test_a_clip_too_short_to_judge_is_rejected_without_the_blocked_toast(monkeypatch):
+def test_a_clip_too_short_to_judge_abstains_without_the_blocked_toast(monkeypatch):
     """Live 21:47:33: a 0.5 s manual-stop clip -- long enough to finalize,
     too short for ECAPA -- failed SHUT and toasted "Voice blocked: speaker
-    check unavailable", the line that means the model is down. It is not."""
+    check unavailable", the line that means the model is down. It is not.
+
+    Since 2026-08-31 the short clip ABSTAINS rather than rejecting: measured
+    on Hunter's own clips, FRR@0.30 is 30% at 1.0 s of trimmed speech and 0%
+    at 3.0 s, so a score from half a second is a coin flip, and a coin flip
+    that silently drops his command is the worse of the two errors. Still no
+    embedding, still no toast."""
     import jarvis.speaker as speaker_mod
     published = []
     monkeypatch.setattr(speaker_mod.bus, "publish", published.append)
     v = _verifier_with(lambda audio: (_ for _ in ()).throw(AssertionError("must not embed")))
     v._model_loaded = True
     ok, score = v.verify(_speech(0.5))
-    assert ok is False and score == 0.0
+    assert ok is True and score == 0.0, "too little speech must fail OPEN"
     assert published == [], f"toasted for a short clip: {published}"
+
+
+def test_enough_speech_is_still_judged_on_its_score(monkeypatch):
+    """The abstain window is a floor, not a bypass: past it the score
+    decides exactly as before."""
+    import numpy as np
+    v = _verifier_with(lambda audio: np.ones(192, dtype=np.float32) / np.sqrt(192))
+    v._model_loaded = True
+    v._centroid = -np.ones(192, dtype=np.float32) / np.sqrt(192)   # nothing like him
+    ok, score = v.verify(_speech(3.0))
+    assert ok is False and score < 0.0
 
 
 def test_a_pre_trim_voiceprint_keeps_its_format_until_re_enrolled(tmp_path, monkeypatch):

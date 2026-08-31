@@ -259,7 +259,12 @@ class Transcriber:
 
     # -- full transcription --------------------------------------------
     def transcribe(self, audio) -> TranscribeResult:
-        """Full transcription: beam 5, VAD, vocab prompt, confidence gate.
+        """Full transcription: beam 1, VAD, vocab prompt, confidence gate.
+
+        Beam 1, not 5: measured 2026-08-31 on 12 of Hunter's real clips --
+        byte-identical text and WER at beam 1 vs 5 (1.18% verified, 6/6
+        names), at HALF the latency (median 0.566 s -> 0.289 s). The
+        streaming preview already ran beam 1; this aligns the final pass.
 
         Port of _transcribe_worker's whisper section (2581-2609),
         transcription only — speaker filtering and command routing live in
@@ -279,7 +284,7 @@ class Transcriber:
                     audio,
                     initial_prompt=self._prompt(),
                     language=lang,          # None = auto-detect
-                    beam_size=5,
+                    beam_size=1,
                     fp16=True,
                 )
             try:

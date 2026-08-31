@@ -30,12 +30,14 @@ import numpy as np
 import pytest
 
 from jarvis import hotword as hw
-from jarvis.speaker import MIN_AUDIO_SECONDS
+from jarvis.hotword import WAKE_MIN_AUDIO_SECONDS as MIN_AUDIO_SECONDS
 
 
 def test_the_threshold_is_tied_to_what_the_speaker_gate_needs():
     # If these drift apart, the gate silently starts abstaining again.
-    assert hw.WAKE_MIN_AUDIO_SECONDS >= MIN_AUDIO_SECONDS
+    from jarvis.speaker import MIN_AUDIO_SECONDS as VERIFY_MIN
+    # the wake floor may lead the verifier's, never trail it
+    assert hw.WAKE_MIN_AUDIO_SECONDS >= VERIFY_MIN
 
 
 @pytest.mark.parametrize("rate", [16000, 44100, 48000])
@@ -52,7 +54,11 @@ def test_a_full_buffer_is_accepted(rate):
 
 @pytest.mark.parametrize("rate", [16000, 44100, 48000])
 def test_exactly_the_gate_minimum_is_enough(rate):
+    # The WAKE gate's own floor (1.5 s since 2026-08-31), not the
+    # verifier's 1.0 s: a wake buffer is scored on whatever speech it
+    # holds, and simulated false rejects were 19.6% at 1.0 s vs 6.2% at 1.5.
     assert hw.wake_audio_sufficient(int(rate * MIN_AUDIO_SECONDS), rate)
+    assert not hw.wake_audio_sufficient(int(rate * (MIN_AUDIO_SECONDS - 0.2)), rate)
 
 
 def test_an_empty_buffer_is_never_enough():

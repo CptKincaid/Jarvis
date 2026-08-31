@@ -47,7 +47,9 @@ log = get_logger("recorder")
 # Audio constants — monolith 53-56, 89, 92 (verbatim)
 SAMPLE_RATE = 16000
 CHANNELS = 1
-NOISE_GATE_THRESHOLD = 0.005
+# 0.0025, not 0.005: his surviving speech blocks measure RMS 0.0083-0.0115
+# and quiet word-tails were being zeroed by the old gate (2026-08-31 study).
+NOISE_GATE_THRESHOLD = 0.0025
 WAVEFORM_BARS = 64
 MAX_RECORDING_SECONDS = 60      # monolith 4299 — hard cap to prevent memory issues
 # The longest a follow-up capture may wait for the first word (lecture

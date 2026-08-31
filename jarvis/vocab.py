@@ -246,16 +246,20 @@ def build_prompt() -> str:
 
     picked, seen, total = [], set(), 0
     capped = False
+    # Buildings before titles and courses: they are short tokens he says
+    # OUT LOUD ("how long to Wisenbaker") and were measured to carry the
+    # domain-term win (hard-set WER 3.66% -> 1.08%); a 48-char lecture
+    # title is the worst use of the same budget.
     for term in (_terms(_user_vocab()) + load_names() + _pronounce_keys()
-                 + _terms(DEFAULT_VOCAB) + _calendar_titles()
-                 + _course_names() + _calendar_buildings()):
+                 + _terms(DEFAULT_VOCAB) + _calendar_buildings()
+                 + _calendar_titles() + _course_names()):
         key = term.lower()
         if key in seen:
             continue
         cost = len(term) + (2 if picked else 0)
         if total + cost > PROMPT_CHAR_CAP:
             capped = True
-            break                     # ordered by priority: stop, don't skip
+            continue                  # skip the long term, keep the short ones
         seen.add(key)
         picked.append(term)
         total += cost

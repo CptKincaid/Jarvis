@@ -52,6 +52,10 @@ MAX_EMBEDDINGS = 100
 
 # Minimum audio length (seconds) for a useful embedding
 MIN_AUDIO_SECONDS = 1.0
+# Below this much TRIMMED speech a score is not evidence (see verify): the
+# 2026-08-31 study measured 30% false rejects at 1.0 s against 0% at 3.0 s
+# on Hunter's own voice. Between the two, abstaining beats guessing.
+ABSTAIN_SECONDS = 1.5
 SAMPLE_RATE = 16000
 
 # Silence is not ignored by ECAPA -- it is pooled in like any other frame, so
@@ -261,7 +265,8 @@ class SpeakerVerifier:
                 # Embeddings saved before trim_silence were pooled with the
                 # silence of fixed-length enrolment takes; probes are trimmed
                 # now, and the asymmetry measurably lowers genuine scores.
-                log.warning("voiceprint predates silence trimming (format %d < %d); "
+                log.info("voiceprint format %d < %d (fresh pools measured no "
+                         "better on 2026-08-31; nothing to act on) "
                             "genuine scores run low until you re-enrol: "
                             "scripts/enroll_voice.py --reset", fmt, VOICEPRINT_FORMAT)
         except Exception:
@@ -321,12 +326,16 @@ class SpeakerVerifier:
         """
         if not self._ensure_model():
             return None
-        if len(audio_16k) < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
-            return None
+        # Trim FIRST, then apply the length floor to what remains: a 3 s
+        # capture holding 0.58 s of speech used to pass the raw-length check
+        # and get embedded anyway -- exactly the clip whose score is a coin
+        # flip (measured FRR@0.30: 30% at 1.0 s of speech, 0% at 3.0 s).
         # Every score, verify, enrol and window passes through here, so the
         # trim lands on all of them at once -- including the wake-word gate,
         # which scores a 1 s buffer that is mostly pre-speech silence.
         audio_16k = trim_silence(audio_16k)
+        if len(audio_16k) < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
+            return None
         try:
             import torch
             # SpeechBrain expects (batch, time) tensor
@@ -423,14 +432,18 @@ class SpeakerVerifier:
             self._fail_open("no voiceprint enrolled")
             return True, 1.0
 
-        if len(audio_16k) < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
-            # Too short to judge is a plain rejection, not a broken gate: a
-            # 0.5 s clip (long enough for _finalize_audio, short for ECAPA)
-            # used to fail SHUT here and toast "Voice blocked: speaker check
-            # unavailable" -- the line that means the model is down.
-            log.info("speaker verify: %.2fs is too short to judge; rejected",
-                     len(audio_16k) / SAMPLE_RATE)
-            return False, 0.0
+        speech_s = len(trim_silence(audio_16k)) / SAMPLE_RATE
+        if speech_s < ABSTAIN_SECONDS:
+            # Duration -- not the threshold, not the model -- is what drives
+            # false rejects: measured 2026-08-31 on his own clips, FRR@0.30
+            # is 30% at 1.0 s of trimmed speech and 0% at 3.0 s, and his
+            # genuine scores bottom at 0.330 against a 0.30 threshold. A
+            # score from this little speech is a coin flip, so ABSTAIN --
+            # fail open the way an unenrolled box does, and let the words
+            # themselves be judged -- rather than reject him silently.
+            log.info("speaker verify: %.2fs of speech is too little to judge; "
+                     "abstaining (fail-open)", speech_s)
+            return True, 0.0
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             # Can't extract embedding (model missing, audio too short) — accept
@@ -442,6 +455,10 @@ class SpeakerVerifier:
         with self._lock:
             score = self._cosine_similarity(embedding, self._centroid)
 
+        # Duration beside the score, always: it is the variable that actually
+        # drives rejection, and it was invisible in the log until now.
+        log.info("speaker verify: score=%.3f on %.2fs of speech (threshold %.2f)",
+                 score, speech_s, self.threshold)
         is_match = score >= self.threshold
         log.info("speaker verify: score=%.3f threshold=%s %s",
                  score, self.threshold, "MATCH" if is_match else "REJECT")
