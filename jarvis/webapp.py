@@ -31,6 +31,32 @@ that matter here and are not the typed box's:
   page, off by default, exactly like the intercom's ``--speak``;
 * it never barges in on a reply he is being spoken in the room.
 
+HIS VOICE, OUT OF THE PHONE
+---------------------------
+A reply he cannot hear is half an assistant, and the Spark's speaker is no
+use from a lecture theatre. ``POST /api/say`` hands one reply to
+``tts.Rendition`` and streams back what it renders: the SAME F5 voice, the
+same reference clip, the same sentence split and, above all, the same
+speech cache. A canned line ("Always, sir.") or a repeat is already on disk
+under that key, so it is a file read and a Content-Length -- no synthesis at
+all. A miss is streamed chunked as each sentence lands, so the phone is
+playing the first one while the second is still on the GPU.
+
+The two rooms are two switches on the page and they are not the same
+switch. **Voice** plays the answer out of the phone and is the new one;
+**Aloud** is the old ``speak`` flag and makes the Spark answer the house as
+well. Both are off by default -- Voice because he uses this in lectures,
+Aloud because a question asked from bed should not wake anyone. Voice
+never touches the room: ``Rendition`` reaches the engine and the cache and
+reaches none of ``TTS``'s playback, so the room's silence during a phone
+turn is a property of the code path rather than of a flag being clear.
+
+iOS will not start audio without a user gesture, so the AudioContext is
+created and unlocked on the TAP that enables Voice (and re-armed on each
+send, for a switch remembered in localStorage from last time). A context
+that is still suspended when a clip has been scheduled says so in the
+transcript instead of going quietly silent.
+
 SECURITY -- the reason this file is careful rather than short
 ------------------------------------------------------------
 It is off until he turns it on (``phone.enabled``, false in DEFAULTS), and
@@ -118,6 +144,11 @@ DEFAULT_TIMEOUT_S = 60.0          # shorter than the CLI's 90: a phone waiting
 MAX_TIMEOUT_S = 180.0             # on a spinner is a worse place to wait
 MAX_TEXT_BYTES = 16 * 1024        # a typed question, with room to spare
 DEFAULT_MAX_AUDIO_MB = 8
+# What /api/say sends back. PCM wav rather than anything cleverer because it
+# is what the engines already write, what the speech cache already holds, and
+# what every browser decodes without a codec question -- transcoding a reply
+# would cost more time than it saved bytes on a home link.
+SAY_TYPE = "audio/wav"
 # A sliding window per client address. Sized for a person tapping, not for a
 # script: the point is that a stray loop (or a wedged page) cannot pin the
 # resident Whisper or the local model, not to police his own thumbs.
@@ -130,6 +161,15 @@ SHUTDOWN_POLL_S = 0.4
 # 413 can actually reach the sender (see _Handler._refuse). Nothing is
 # retained; this is a ceiling on wasted socket reads, not on memory.
 DRAIN_SLACK_BYTES = 2 * 1024 * 1024
+
+# No third-party anything is loaded by this page, so the strictest policy
+# that still allows the inline script and style is free. ``media-src`` is
+# here for the voice: the reply audio arrives through fetch (connect-src),
+# and the fallback for a browser with no Web Audio plays it from a blob.
+CSP = ("default-src 'none'; script-src 'unsafe-inline'; "
+       "style-src 'unsafe-inline'; img-src 'self' data:; "
+       "media-src 'self' blob:; connect-src 'self'; manifest-src 'self'; "
+       "form-action 'none'; base-uri 'none'")
 
 NOT_PRIVATE_LINE = ("the phone client refuses to bind %r: it is not a "
                     "private address. This is a LAN-only feature.")
@@ -266,6 +306,7 @@ class PhoneServer:
         self.host = ""
         self.port = 0
         self.served = 0
+        self.spoken = 0                  # replies rendered for a phone's ear
         self.limiter = RateLimiter()
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -481,6 +522,7 @@ class PhoneServer:
         turn_id = uuid.uuid4().hex[:12]
         lines: list[dict] = []
         log.info("phone: %r%s", text, "" if speak else " (quiet)")
+        started = time.monotonic()
         with cmdsock.ReplyCollector(turn_id) as col:
             bus.publish(UserUtterance(text=text, source=SOURCE))
             result = self.app.dispatch_text(text, source=SOURCE,
@@ -488,14 +530,43 @@ class PhoneServer:
             reason = cmdsock.stream_turn(lines.append, col, result, limit,
                                          self.idle_grace_s)
         self.served += 1
-        return {"messages": lines, "reason": reason}
+        ms = _elapsed_ms(started)
+        log.info("phone turn %s: %s in %d ms (server side)", turn_id, reason, ms)
+        return {"messages": lines, "reason": reason, "ms": ms}
 
     def _read(self, attr: str, fallback: str) -> dict:
+        started = time.monotonic()
         fn = getattr(self.app, attr, None)
         line = fn() if callable(fn) else fallback
         self.served += 1
         return {"messages": [{"kind": "reply", "text": line, "speak": False}],
-                "reason": "done"}
+                "reason": "done", "ms": _elapsed_ms(started)}
+
+    # ------------------------------------------------------------ his voice
+    def can_speak(self) -> bool:
+        """True when this box can hand the phone Jarvis's actual voice.
+
+        A plain ``hasattr`` rather than a try-render: the page asks this on
+        every ping to decide whether the Voice switch is offered at all, and
+        a switch that is present but dead is worse than one that is absent.
+        """
+        return hasattr(getattr(self.app, "tts", None), "render")
+
+    def rendition(self, text: str):
+        """Jarvis's voice for one reply, or None when there is no engine.
+
+        This is the whole reason the feature is honest: it goes to
+        ``TTS.render``, which shares the room's engine, reference clip and
+        speech cache and reaches NONE of its playback -- so a reply that
+        comes out of the phone never also comes out of the Spark. The room's
+        silence is a property of the code path, not of a flag.
+        """
+        tts = getattr(self.app, "tts", None)
+        if tts is None or not hasattr(tts, "render"):
+            return None
+        rend = tts.render(text)
+        self.spoken += 1
+        return rend
 
     def voice(self, raw: bytes, speak: bool = False,
               timeout: Optional[float] = None) -> dict:
@@ -543,11 +614,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", cache)
         # No third-party anything is loaded by this page, so the strictest
         # policy that still allows the inline script and style is free.
-        self.send_header("Content-Security-Policy",
-                         "default-src 'none'; script-src 'unsafe-inline'; "
-                         "style-src 'unsafe-inline'; img-src 'self' data:; "
-                         "connect-src 'self'; manifest-src 'self'; "
-                         "form-action 'none'; base-uri 'none'")
+        self.send_header("Content-Security-Policy", CSP)
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("X-Content-Type-Options", "nosniff")
         for key, value in (extra or {}).items():
@@ -680,7 +747,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/ping":
             if not self._gate():
                 return
-            self._json(200, {"ok": True, "mic_note": MIC_NOTE})
+            # The page beats on this every 20 s while it is in front of him,
+            # which is also what holds the connection (and the tailnet's
+            # direct path) open between questions -- see the heartbeat in
+            # PAGE. It must therefore stay the cheapest thing here.
+            self._json(200, {"ok": True, "mic_note": MIC_NOTE,
+                             "voice": self.phone.can_speak()})
             return
         self._error(404, "no such page")
 
@@ -691,6 +763,8 @@ class _Handler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         if path == "/api/ask":
             self._ask()
+        elif path == "/api/say":
+            self._say()
         elif path == "/api/voice":
             self._voice()
         else:
@@ -699,20 +773,10 @@ class _Handler(BaseHTTPRequestHandler):
     def _ask(self):
         if not self._gate():
             return
-        body = self._body(MAX_TEXT_BYTES)
-        if body is None:
+        asked = self._json_text()
+        if asked is None:
             return
-        try:
-            msg = json.loads(body.decode("utf-8", "replace"))
-            if not isinstance(msg, dict):
-                raise ValueError("not an object")
-        except ValueError as exc:
-            self._error(400, f"malformed request: {exc}")
-            return
-        text = str(msg.get("text") or "").strip()
-        if not text:
-            self._error(400, "empty request")
-            return
+        text, msg = asked
         try:
             out = self.phone.ask(text, speak=bool(msg.get("speak", False)),
                                  timeout=_timeout(msg.get("timeout")))
@@ -721,6 +785,176 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(500, "Jarvis could not handle that")
             return
         self._json(200, out)
+
+    # ------------------------------------------------------- his voice
+    def _say(self):
+        """``POST {"text": ...}`` -> that reply, in Jarvis's own voice.
+
+        Deliberately a separate call from ``/api/ask`` rather than audio
+        bolted onto the answer: the page holds the Voice switch off by
+        default (he is often in a lecture), and "off" has to mean nothing
+        is fetched and nothing is rendered, not that a clip was made and
+        thrown away. It also means the audio for a line he can already read
+        is fetched while he is reading it.
+        """
+        if not self._gate():
+            return
+        asked = self._json_text()
+        if asked is None:
+            return
+        # Before the cache lookups, not after: they are part of what the
+        # phone waited for, and a hit that reports itself as free would be
+        # measuring the wrong thing.
+        started = time.monotonic()
+        try:
+            rend = self.phone.rendition(asked[0])
+        except Exception:               # noqa: BLE001 - answer, never 500-silent
+            log.exception("phone say could not be prepared")
+            self._error(503, "his voice is not available just now")
+            return
+        if rend is None:
+            self._error(503, "no speech engine on this box")
+            return
+        if not rend:
+            # A reply that is all markup or all punctuation cleans down to
+            # nothing sayable. That is silence, not a fault: an error here
+            # would put a red line on his screen for a reply he can read
+            # perfectly well.
+            log.info("phone say: %r has nothing to speak", asked[0][:60])
+            self._send(200, b"", SAY_TYPE)
+            return
+        if rend.cached:
+            # Every chunk was already on disk, so the clip is a few file
+            # reads: send it whole, with a real length and byte ranges, so
+            # a media element (or Safari's own probe) is happy too.
+            try:
+                body = rend.body()
+            except Exception:           # noqa: BLE001 - answer, never 500-silent
+                log.exception("phone say: a cached chunk would not read")
+                self._error(503, "his voice is not available just now")
+                return
+            log.info("phone say: %d chunk(s), all cached, %d bytes in %d ms",
+                     len(rend), len(body), _elapsed_ms(started))
+            self._send_clip(body)
+            return
+        self._stream_clip(rend, started)
+
+    def _json_text(self) -> Optional[tuple[str, dict]]:
+        """``(text, the whole message)`` from a JSON body, or None having
+        already answered. Shared by /api/ask and /api/say, which take the
+        same shape and owe the same four errors."""
+        body = self._body(MAX_TEXT_BYTES)
+        if body is None:
+            return None
+        try:
+            msg = json.loads(body.decode("utf-8", "replace"))
+            if not isinstance(msg, dict):
+                raise ValueError("not an object")
+        except ValueError as exc:
+            self._error(400, f"malformed request: {exc}")
+            return None
+        text = str(msg.get("text") or "").strip()
+        if not text:
+            self._error(400, "empty request")
+            return None
+        return text, msg
+
+    def _send_clip(self, body: bytes):
+        """A clip whose length is known: Content-Length, and byte ranges.
+
+        The page itself never asks for a range -- it reads the body as a
+        stream and feeds Web Audio. Ranges are here for the media element
+        underneath: Safari probes an audio source with ``Range: bytes=0-1``
+        before it will play it, and a server that answers 200 to that has
+        been the reason for a silent <audio> tag more than once."""
+        total = len(body)
+        span = self._range(total)
+        extra = {"Accept-Ranges": "bytes"}
+        if span is None:
+            self._send(200, body, SAY_TYPE, extra=extra)
+            return
+        start, end = span
+        extra["Content-Range"] = f"bytes {start}-{end}/{total}"
+        self._send(206, body[start:end + 1], SAY_TYPE, extra=extra)
+
+    def _range(self, total: int) -> Optional[tuple[int, int]]:
+        """``(start, end)`` for a single byte range, or None to send it all.
+
+        Only ``bytes=a-b`` / ``bytes=a-`` / ``bytes=-n`` are understood.
+        Anything else -- a multipart range, a malformed one, one that starts
+        past the end -- returns None, and the whole body goes out with a
+        200. Ignoring a Range is allowed and is the safe way to be wrong."""
+        raw = (self.headers.get("Range") or "").strip()
+        if not raw.startswith("bytes=") or "," in raw or total <= 0:
+            return None
+        spec = raw[6:].strip()
+        first, _, last = spec.partition("-")
+        try:
+            if not first:                      # bytes=-n : the final n bytes
+                n = int(last)
+                if n <= 0:
+                    return None
+                return max(0, total - n), total - 1
+            start = int(first)
+            end = int(last) if last else total - 1
+        except ValueError:
+            return None
+        if start < 0 or start >= total or end < start:
+            return None
+        return start, min(end, total - 1)
+
+    def _stream_clip(self, rend, started: float):
+        """Chunked, so the first sentence is already on the phone while the
+        second is still on the GPU.
+
+        The generator's first item is the wav header, and it does not exist
+        until the first chunk has actually rendered -- which is why it is
+        pulled BEFORE the response line goes out. A render that is going to
+        fail then fails while an error can still be sent, instead of
+        committing a 200 and hanging up in the middle of a clip.
+        """
+        blocks = rend.stream()
+        try:
+            head = next(blocks, None)
+        except Exception:               # noqa: BLE001 - answer, never 500-silent
+            log.exception("phone say: nothing would render")
+            self._error(503, "his voice is not available just now")
+            return
+        if not head:
+            self._error(503, "his voice produced nothing")
+            return
+        first_ms = _elapsed_ms(started)
+        self.send_response(200)
+        self.send_header("Content-Type", SAY_TYPE)
+        # HTTP/1.1 has exactly two framings and the length is not known
+        # here, so the chunks are framed by hand below.
+        self.send_header("Transfer-Encoding", "chunked")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Security-Policy", CSP)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Accept-Ranges", "none")
+        self.end_headers()
+        sent = 0
+        try:
+            for block in _chain(head, blocks):
+                if not block:
+                    continue
+                self.wfile.write(b"%x\r\n" % len(block) + block + b"\r\n")
+                sent += len(block)
+            self.wfile.write(b"0\r\n\r\n")
+        except OSError:
+            # He locked the phone, or walked out of range, mid-sentence.
+            log.debug("phone left mid-clip after %d bytes", sent, exc_info=True)
+            self.close_connection = True
+            return
+        except Exception:               # noqa: BLE001 - a half-sent clip
+            log.exception("phone say failed after %d bytes", sent)
+            self.close_connection = True
+            return
+        log.info("phone say: %d chunk(s), %d cached, first byte %d ms, "
+                 "%d bytes in %d ms", len(rend),
+                 sum(1 for _, p in rend.plan if p), first_ms, sent,
+                 _elapsed_ms(started))
 
     def _voice(self):
         if not self._gate(audio=True):
@@ -751,6 +985,25 @@ def _timeout(value) -> float:
         return max(1.0, min(float(value), MAX_TIMEOUT_S))
     except (TypeError, ValueError):
         return DEFAULT_TIMEOUT_S
+
+
+def _elapsed_ms(started: float) -> int:
+    """Whole milliseconds since a ``time.monotonic()`` mark.
+
+    Every turn carries one back to the page as ``ms``. The point is not
+    vanity: the first question after the phone has been asleep arrives over
+    a relay while the tailnet renegotiates a direct path, and without the
+    server's own half of the clock the page cannot tell "he was slow" from
+    "the link was slow" -- and neither can he."""
+    return int(round((time.monotonic() - started) * 1000))
+
+
+def _chain(first, rest):
+    """``first`` then everything in ``rest``: the streaming clip's header
+    has to be pulled before the response line goes out, and then put back
+    in front of the body it belongs to."""
+    yield first
+    yield from rest
 
 
 # ------------------------------------------------------------- the icon
@@ -1109,7 +1362,7 @@ PAGE = """<!doctype html>
     padding: 11px 18px; font: 600 15px inherit; font-family: inherit;
   }
   button.go:disabled { opacity: .45; }
-  footer { padding: 4px 16px 14px; display: flex; align-items: center;
+  footer { padding: 4px 16px 8px; display: flex; align-items: center;
            gap: 12px; }
   #ptt {
     flex: 1; border-radius: 12px; padding: 12px; font-family: inherit;
@@ -1118,8 +1371,21 @@ PAGE = """<!doctype html>
   }
   #ptt.off { color: var(--dim); border-style: dashed; }
   #ptt.rec { background: var(--bad); color: #180605; border-color: var(--bad); }
-  .toggle { font-size: 12px; color: var(--dim); display: flex; gap: 6px;
-            align-items: center; white-space: nowrap; }
+  #switches { display: flex; gap: 8px; padding: 0 16px 14px; }
+  .sw {
+    flex: 1; display: flex; align-items: center; gap: 8px; min-width: 0;
+    background: var(--slab); color: var(--dim); font: inherit; font-size: 13px;
+    border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px;
+    letter-spacing: .02em; white-space: nowrap;
+  }
+  .sw span.txt { overflow: hidden; text-overflow: ellipsis; }
+  .sw input { accent-color: var(--cyan); margin: 0; flex: none; }
+  .sw:disabled { opacity: .45; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; flex: none;
+         background: var(--line); }
+  #voice.on { color: #041017; background: var(--cyan);
+              border-color: var(--cyan); }
+  #voice.on .dot { background: #041017; }
   #micnote { font-size: 12px; color: var(--warn); padding: 0 16px 12px;
              line-height: 1.5; }
   #keybox { padding: 16px; }
@@ -1155,8 +1421,21 @@ PAGE = """<!doctype html>
 
 <footer>
   <button id="ptt" type="button">Hold to talk</button>
-  <label class="toggle"><input type="checkbox" id="aloud"> aloud</label>
 </footer>
+
+<!-- Two different rooms, and the labels say which. "Voice" plays his answer
+     out of THIS phone; "Aloud" makes the Spark answer the house as well.
+     Both are off to begin with. -->
+<div id="switches">
+  <button id="voice" type="button" class="sw" aria-pressed="false"
+          title="Play his answers through this phone">
+    <span class="dot"></span><span class="txt" id="voicelbl">Voice off</span>
+  </button>
+  <label class="sw" title="Answer out loud on the Spark, in the room">
+    <input type="checkbox" id="aloud">
+    <span class="txt">Aloud in the room</span>
+  </label>
+</div>
 <p id="micnote" hidden></p>
 
 <script>
@@ -1174,6 +1453,8 @@ PAGE = """<!doctype html>
   var micnote = document.getElementById("micnote");
   var keybox = document.getElementById("keybox");
   var keyInput = document.getElementById("key");
+  var voiceBtn = document.getElementById("voice");
+  var voiceLbl = document.getElementById("voicelbl");
   var busy = false;
 
   /* The key rides in the URL so that "Add to Home Screen" bookmarks a
@@ -1197,19 +1478,44 @@ PAGE = """<!doctype html>
   function say(who, txt) { return el("msg " + who, txt); }
   function note(txt, bad) { return el("note" + (bad ? " err" : ""), txt); }
 
-  function render(data) {
+  function render(data, t0) {
     var msgs = (data && data.messages) || [];
     var answered = false;
     for (var i = 0; i < msgs.length; i++) {
       var m = msgs[i];
-      if (m.kind === "reply" && m.text) { say("him", m.text); answered = true; }
-      else if (m.kind === "status" && m.text) { note(m.text); }
+      if (m.kind === "reply" && m.text) {
+        say("him", m.text);
+        /* One /api/say per reply MESSAGE, not per turn: the room caches
+           speech per sentence chunk of one reply, and asking for the same
+           string he said aloud is what turns a repeat into a cache hit. */
+        speak(m.text);
+        answered = true;
+      } else if (m.kind === "status" && m.text) { note(m.text); }
     }
     if (!answered) {
       if (data.reason === "timeout") note("No answer inside the window, sir.", 1);
       else if (data.reason === "idle") note("He has taken that on.");
       else note("Nothing came back.", 1);
     }
+    linkNote(data, t0);
+  }
+
+  /* The first question after the phone has been away is slow, and it is
+     not him: the tailnet sends those packets through a relay while it
+     renegotiates a direct path. The server times its own half of the turn
+     and sends it back as `ms`, so the difference is the link's, and saying
+     which half was slow beats letting him wonder. Silent when it is fine. */
+  function now() {
+    return (window.performance && performance.now) ? performance.now()
+                                                   : Date.now();
+  }
+  function linkNote(data, t0) {
+    if (!t0 || !data || typeof data.ms !== "number") { return; }
+    var lag = Math.round(now() - t0 - data.ms);
+    if (lag < 700) { return; }
+    note("He answered in " + (data.ms / 1000).toFixed(1) + " s; the link " +
+         "added " + (lag / 1000).toFixed(1) + " s. The tailnet is still " +
+         "relaying — it settles once a direct path is up.");
   }
 
   function post(url, body, ctype) {
@@ -1233,11 +1539,17 @@ PAGE = """<!doctype html>
 
   function ask(q) {
     if (busy || !q.trim()) { return; }
+    /* Every caller of ask() is a tap or a keypress, so this runs inside a
+       user gesture -- which is the only place iOS will let an AudioContext
+       out of "suspended". A remembered Voice switch is armed here, on the
+       send, rather than when the answer arrives, which is too late. */
+    if (voiceOn) { hush(); unlock(); }
     say("me", q);
     working(true);
+    var t0 = now();
     post("/api/ask", JSON.stringify({ text: q, speak: aloud.checked }),
          "application/json")
-      .then(render)
+      .then(function (data) { render(data, t0); })
       .catch(function (e) { note(String(e.message || e), 1); })
       .then(function () { working(false); });
   }
@@ -1268,6 +1580,207 @@ PAGE = """<!doctype html>
     taps.appendChild(b);
   });
 
+  /* ---- his voice, in his ear ---------------------------------------
+     The answer is spoken by the SAME engine, reference clip and speech
+     cache the Spark uses (POST /api/say -> tts.Rendition), never by the
+     browser's own speech synthesis: a stock robot reading his assistant's
+     lines would be a different assistant, which defeats the point.
+
+     Web Audio rather than an <audio> element, for one reason that decides
+     it on this phone: a reply that has to be rendered arrives as a chunked
+     stream of unknown length, and iOS Safari's media element wants a
+     length and a byte range before it will commit to one. Reading the body
+     with fetch and scheduling the PCM here plays the first sentence the
+     moment it lands and never asks the question.
+
+     OFF by default and remembered, because half of these turns happen in a
+     lecture theatre. Off means nothing is fetched and nothing is rendered
+     — there is no clip made and discarded. */
+  var VOICE_STORE = "jarvis.phone.voice";
+  var LEAD_S = 0.06;       /* schedule a hair ahead of now: a block that
+                              arrives late must not be told to start in the
+                              past, which plays it at once and stacks it */
+  var MIN_BLOCK_S = 0.15;  /* and don't schedule slivers — a buffer seam
+                              every few KB is audible as a tick */
+  var actx = null, voiceOn = false, playAt = 0, playing = [], inflight = null;
+  var chain = Promise.resolve();
+
+  function unlock() {
+    var Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) { return false; }
+    if (!actx) { try { actx = new Ctx(); } catch (e) { return false; } }
+    if (actx.state === "suspended" && actx.resume) {
+      try { actx.resume(); } catch (e) {}
+    }
+    /* Starting one silent frame is what actually flips iOS out of
+       "suspended"; resume() alone is not always enough. */
+    try {
+      var s = actx.createBufferSource();
+      s.buffer = actx.createBuffer(1, 1, 22050);
+      s.connect(actx.destination);
+      s.start(0);
+    } catch (e) {}
+    return true;
+  }
+
+  function hush() {
+    if (inflight) { try { inflight.abort(); } catch (e) {} inflight = null; }
+    playing.forEach(function (s) { try { s.stop(); } catch (e) {} });
+    playing = [];
+    playAt = 0;
+    chain = Promise.resolve();
+  }
+
+  function speak(t) {
+    if (!voiceOn || !t) { return; }
+    /* Serialised: two replies in one turn must not race each other into
+       the speakers, and the fetches are cheap enough to take in order. */
+    chain = chain.then(function () { return fetchSay(t); })
+                 .catch(function (e) {
+                   if (e && e.name === "AbortError") { return; }
+                   note("His voice did not reach this phone: " +
+                        ((e && e.message) || e), 1);
+                 });
+  }
+
+  function fetchSay(text) {
+    if (!unlock()) {
+      return Promise.reject(new Error("this browser has no Web Audio"));
+    }
+    var ctrl = ("AbortController" in window) ? new AbortController() : null;
+    inflight = ctrl;
+    var head = null, pending = new Uint8Array(0);
+
+    function grow(extra) {
+      var out = new Uint8Array(pending.length + extra.length);
+      out.set(pending);
+      out.set(extra, pending.length);
+      pending = out;
+    }
+    function tag(d, at) {
+      return String.fromCharCode(d[at], d[at + 1], d[at + 2], d[at + 3]);
+    }
+    function header() {
+      /* Walk the RIFF chunks to "data" instead of assuming 44 bytes, and
+         read the rate out of "fmt " instead of assuming 24 kHz — true of
+         F5 and XTTS today, and a silent pitch shift the day it is not. */
+      var d = pending;
+      if (d.length < 12) { return false; }
+      if (tag(d, 0) !== "RIFF" || tag(d, 8) !== "WAVE") {
+        throw new Error("that was not audio");
+      }
+      var dv = new DataView(d.buffer, d.byteOffset, d.byteLength);
+      var at = 12, fmt = null;
+      while (at + 8 <= d.length) {
+        var id = tag(d, at), size = dv.getUint32(at + 4, true);
+        if (id === "fmt ") {
+          if (at + 24 > d.length) { return false; }
+          fmt = { channels: dv.getUint16(at + 10, true),
+                  rate: dv.getUint32(at + 12, true),
+                  bits: dv.getUint16(at + 22, true) };
+        } else if (id === "data") {
+          if (!fmt || fmt.bits !== 16 || !fmt.channels || !fmt.rate) {
+            throw new Error("unexpected audio format");
+          }
+          head = fmt;
+          pending = d.subarray(at + 8);
+          return true;
+        }
+        at += 8 + size + (size % 2);
+      }
+      return false;
+    }
+    function emit(last) {
+      if (!head && !header()) { return; }
+      var frame = head.channels * 2;
+      var want = last ? frame : Math.ceil(head.rate * MIN_BLOCK_S) * frame;
+      if (pending.length < want) { return; }
+      var n = pending.length - (pending.length % frame);
+      if (!n) { return; }
+      var pcm = pending.subarray(0, n);
+      pending = pending.subarray(n);
+      var frames = n / frame;
+      var buf = actx.createBuffer(head.channels, frames, head.rate);
+      var dv = new DataView(pcm.buffer, pcm.byteOffset, pcm.byteLength);
+      for (var c = 0; c < head.channels; c++) {
+        var out = buf.getChannelData(c);
+        for (var i = 0; i < frames; i++) {
+          out[i] = dv.getInt16((i * head.channels + c) * 2, true) / 32768;
+        }
+      }
+      var src = actx.createBufferSource();
+      src.buffer = buf;
+      src.connect(actx.destination);
+      if (playAt < actx.currentTime + LEAD_S) {
+        playAt = actx.currentTime + LEAD_S;
+      }
+      src.start(playAt);
+      playAt += buf.duration;
+      playing.push(src);
+      src.onended = function () {
+        var i = playing.indexOf(src);
+        if (i >= 0) { playing.splice(i, 1); }
+      };
+    }
+    function pump(reader) {
+      return reader.read().then(function (r) {
+        if (r.done) { emit(true); return; }
+        grow(new Uint8Array(r.value));
+        emit(false);
+        return pump(reader);
+      });
+    }
+
+    return fetch("/api/say", {
+      method: "POST", cache: "no-store",
+      signal: ctrl ? ctrl.signal : undefined,
+      headers: { "Authorization": "Bearer " + key,
+                 "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text })
+    }).then(function (r) {
+      if (!r.ok) {
+        return r.json().catch(function () { return {}; })
+                .then(function (j) {
+                  throw new Error(j.error || ("HTTP " + r.status));
+                });
+      }
+      if (r.body && r.body.getReader) { return pump(r.body.getReader()); }
+      /* No streaming body (an older WebKit): take the whole clip and play
+         it in one piece rather than not at all. */
+      return r.arrayBuffer().then(function (b) {
+        grow(new Uint8Array(b));
+        emit(true);
+      });
+    }).then(function () {
+      if (inflight === ctrl) { inflight = null; }
+      /* Blocked audio must SAY it is blocked. A context still suspended
+         here has swallowed the clip, and silence is exactly what a broken
+         toggle looks like too. */
+      if (actx.state !== "running") {
+        note("This phone is holding audio back — tap Voice once more.", 1);
+      }
+    });
+  }
+
+  function setVoice(on, announce) {
+    voiceOn = !!on;
+    voiceBtn.classList.toggle("on", voiceOn);
+    voiceBtn.setAttribute("aria-pressed", voiceOn ? "true" : "false");
+    voiceLbl.textContent = voiceOn ? "Voice on" : "Voice off";
+    try { localStorage.setItem(VOICE_STORE, voiceOn ? "1" : "0"); } catch (e) {}
+    if (!voiceOn) { hush(); return; }
+    if (announce && !unlock()) {
+      note("This browser will not play audio here, sir.", 1);
+    }
+  }
+
+  /* The enabling TAP is the gesture iOS wants, so the AudioContext is
+     built and unlocked right here — never lazily on the first reply, which
+     is precisely the case the phone refuses. */
+  voiceBtn.addEventListener("click", function () { setVoice(!voiceOn, true); });
+  try { setVoice(localStorage.getItem(VOICE_STORE) === "1", false); }
+  catch (e) { setVoice(false, false); }
+
   /* ---- push to talk ------------------------------------------------
      getUserMedia only exists in a secure context. Over http on the LAN
      there is nothing to try, so the button says so instead of failing
@@ -1292,6 +1805,7 @@ PAGE = """<!doctype html>
 
   function startRec() {
     if (!canMic || rec || busy) { return; }
+    if (voiceOn) { unlock(); }        /* a press is a gesture; use it */
     navigator.mediaDevices.getUserMedia({ audio: true }).then(function (s) {
       stream = s;
       chunks = [];
@@ -1308,11 +1822,13 @@ PAGE = """<!doctype html>
         ptt.textContent = "Hold to talk";
         if (blob.size < 1200) { note("Too short to hear, sir."); return; }
         working(true);
+        if (voiceOn) { hush(); }
+        var t0 = now();
         post("/api/voice?speak=" + (aloud.checked ? "1" : "0"), blob,
              blob.type)
           .then(function (data) {
             if (data.heard) { say("me", data.heard); }
-            render(data);
+            render(data, t0);
           })
           .catch(function (e) { note(String(e.message || e), 1); })
           .then(function () { working(false); });
@@ -1356,6 +1872,16 @@ PAGE = """<!doctype html>
     hello();
   });
 
+  function ping() {
+    return fetch("/api/ping", { headers: { "Authorization": "Bearer " + key },
+                                cache: "no-store" })
+      .then(function (r) {
+        if (r.status === 401) { throw new Error("that key was refused"); }
+        if (!r.ok) { throw new Error("HTTP " + r.status); }
+        return r.json().catch(function () { return {}; });
+      });
+  }
+
   function hello() {
     if (!key) {
       keybox.hidden = false;
@@ -1363,14 +1889,18 @@ PAGE = """<!doctype html>
       conn.className = "bad";
       return;
     }
-    fetch("/api/ping", { headers: { "Authorization": "Bearer " + key },
-                         cache: "no-store" })
-      .then(function (r) {
-        if (r.status === 401) { throw new Error("that key was refused"); }
-        if (!r.ok) { throw new Error("HTTP " + r.status); }
+    ping()
+      .then(function (j) {
         keybox.hidden = true;
         conn.textContent = "on the home network";
         conn.className = "";
+        /* A box with no speech engine gets a dead switch that SAYS it is
+           dead, rather than one that looks alive and answers in silence. */
+        if (j && j.voice === false) {
+          setVoice(false, false);
+          voiceBtn.disabled = true;
+          voiceLbl.textContent = "Voice unavailable";
+        }
         text.focus();
       })
       .catch(function (e) {
@@ -1380,6 +1910,25 @@ PAGE = """<!doctype html>
       });
   }
   hello();
+
+  /* ---- holding the path open ---------------------------------------
+     The first question after a spell away is slow for a reason that is
+     not this app: the tailnet's packets go through a relay while NAT
+     traversal renegotiates a direct path, and this server drops an idle
+     keep-alive connection after 30 s. One cheap ping every 20 s while the
+     page is actually in front of him keeps both alive, and one on the way
+     back from the lock screen warms the path BEFORE he types rather than
+     making his first question pay for it. Nothing is reconfigured
+     anywhere; this is only traffic. */
+  var BEAT_MS = 20000;
+  function beat() {
+    if (!key || document.visibilityState === "hidden") { return; }
+    ping().catch(function () {});
+  }
+  setInterval(beat, BEAT_MS);
+  document.addEventListener("visibilitychange", function () {
+    if (document.visibilityState === "visible") { beat(); }
+  });
 })();
 </script>
 </body>

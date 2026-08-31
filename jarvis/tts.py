@@ -48,9 +48,11 @@ import re
 import subprocess
 import json
 import socket
+import struct
 import tempfile
 import threading
 import time
+import wave
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
@@ -1140,6 +1142,36 @@ class TTS:
         except Exception:
             log.exception("speech cache store failed")
 
+    # ------------------------------------------ rendering for another ear
+    def render_engine(self) -> str:
+        """The engine a render will actually use, WITHOUT loading anything.
+
+        ``load()`` rewrites ``_engine`` when it falls back (fish with no
+        credentials becomes f5), and the speech cache is keyed on the engine
+        that rendered the audio -- so a cache lookup has to ask the same
+        question load() answers. It must not answer it by loading: a phone
+        asking for a line Jarvis said an hour ago should cost a stat() and a
+        file read, not an XTTS model load.
+        """
+        if self._engine == "fish":
+            key, model = _fish_creds()
+            return "fish" if (key and model) else FISH_FALLBACK
+        return self._engine
+
+    def render_chunks(self, text: str) -> list[str]:
+        """The sentence chunks ``speak(text)`` would render and cache, in
+        order: clean, pronounce, split -- the same three steps in the same
+        order, so the keys come out byte-identical to the room's and a line
+        already spoken here is already on disk for the phone."""
+        cleaned = self._clean_for_speech(text or "")
+        if not cleaned.strip():
+            return []
+        return self._split_sentences(self._pronounce(cleaned))
+
+    def render(self, text: str) -> "Rendition":
+        """Jarvis's voice for ``text``, for a device that is not this room."""
+        return Rendition(self, text)
+
     def _speak_sync(self, text: str):
         """Synthesize and play one utterance (runs on the worker thread)."""
         if not self.load():
@@ -1763,3 +1795,205 @@ class TTS:
                 text = text[:self.MAX_SPEAK_LENGTH] + "..."
 
         return text
+
+
+# --------------------------------------------- rendering for another ear
+#
+# The phone client (jarvis/webapp.py) answers in Jarvis's own voice: its
+# ``POST /api/say`` hands the reply to this section and streams back what
+# comes out. Everything above the player is shared with the room -- the
+# engine, the reference clip, the pronunciation pass, the sentence split
+# and, above all, the speech cache -- and everything that makes speech
+# LOCAL is deliberately not: nothing here touches ``_q``, ``_play``,
+# ``_start_amp_feeder`` or the mic arbiter. That is the whole feature. A
+# question asked from a lecture theatre is answered in his ear and the
+# Spark's speaker stays silent, and it stays silent because this path
+# physically cannot reach it, not because a flag happened to be set.
+
+STREAM_SIZE = 0xFFFFFFFF          # "length not known yet" in a RIFF field
+
+
+def wav_header(rate: int, channels: int = 1, sampwidth: int = 2,
+               data_bytes: Optional[int] = None) -> bytes:
+    """A canonical 44-byte RIFF/WAVE PCM header.
+
+    ``data_bytes=None`` builds the header for a stream whose length nobody
+    knows yet -- both size fields carry 0xFFFFFFFF, which is what ffmpeg
+    writes when its output is a pipe and what decoders read as "to the end
+    of the stream". The phone page parses this header itself rather than
+    assuming 44 bytes, so it is never guessing at the rate either.
+    """
+    data = STREAM_SIZE if data_bytes is None else int(data_bytes)
+    riff = STREAM_SIZE if data_bytes is None else 36 + int(data_bytes)
+    block = int(channels) * int(sampwidth)
+    return (b"RIFF" + struct.pack("<I", riff) + b"WAVEfmt " +
+            struct.pack("<IHHIIHH", 16, 1, int(channels), int(rate),
+                        int(rate) * block, block, int(sampwidth) * 8) +
+            b"data" + struct.pack("<I", data))
+
+
+def wav_pcm(path: str) -> tuple[tuple[int, int, int], bytes]:
+    """``((rate, channels, sampwidth), pcm)`` for one rendered chunk.
+
+    stdlib ``wave`` first: every local engine writes PCM wav, so reading a
+    chunk is a header parse and a copy -- no decode, no numpy, on a request
+    thread. Edge is the exception, and the exception is invisible from the
+    filename: its cache entries are an MP3 stream in a ``.wav``-suffixed
+    file (see the module docstring). Anything ``wave`` refuses therefore
+    goes to libsndfile, which reads mp3/ogg/flac and hands back PCM16 at
+    the file's own rate.
+    """
+    try:
+        with wave.open(path, "rb") as fh:
+            fmt = (fh.getframerate(), fh.getnchannels(), fh.getsampwidth())
+            if fmt[2] == 2:                     # PCM16: hand the bytes over
+                return fmt, fh.readframes(fh.getnframes())
+    except (wave.Error, EOFError, OSError):
+        pass
+    import soundfile as sf
+
+    data, rate = sf.read(path, dtype="int16", always_2d=True)
+    return (int(rate), int(data.shape[1]), 2), data.tobytes()
+
+
+class Rendition:
+    """One reply, rendered as wav bytes for a client that is not the room.
+
+    Built from the same steps ``speak()`` takes, so the cache keys match the
+    room's exactly: a line Jarvis has already said aloud is already on disk
+    here. When every chunk is a hit, ``cached`` is True and ``body()`` is a
+    few file reads -- the phone gets a real Content-Length and can seek.
+    When it is not, ``stream()`` renders chunk by chunk and yields each one
+    as it lands, so the first sentence is on its way to the phone while the
+    second is still on the GPU.
+    """
+
+    def __init__(self, tts: "TTS", text: str):
+        self.tts = tts
+        self.engine = tts.render_engine()
+        # ONE cache lookup per chunk, here: _cached() also keeps the hit /
+        # miss counters, so asking twice would report a hit rate this
+        # feature did not earn.
+        self.plan: list[tuple[str, Optional[str]]] = [
+            (chunk, tts._cached(self.engine, chunk))
+            for chunk in tts.render_chunks(text)]
+        # The format of the audio actually produced, learned from the first
+        # chunk read; body() needs it to write a header with real sizes in.
+        self._fmt: Optional[tuple[int, int, int]] = None
+
+    def __bool__(self) -> bool:
+        return bool(self.plan)
+
+    def __len__(self) -> int:
+        return len(self.plan)
+
+    @property
+    def chunks(self) -> list[str]:
+        return [chunk for chunk, _ in self.plan]
+
+    @property
+    def cached(self) -> bool:
+        """Every chunk is already on disk: nothing will be synthesized."""
+        return bool(self.plan) and all(path for _, path in self.plan)
+
+    # ------------------------------------------------------------ bytes
+    def body(self) -> bytes:
+        """The whole clip as one wav, sizes filled in.
+
+        Worth calling on a cache hit, where it is a handful of file reads.
+        On a miss it blocks until the last chunk has rendered, which is
+        exactly what ``stream()`` exists to avoid.
+        """
+        blocks = list(self.stream())
+        if not blocks:
+            return b""
+        pcm = b"".join(blocks[1:])
+        rate, channels, width = self._fmt or (24000, 1, 2)
+        return wav_header(rate, channels, width, len(pcm)) + pcm
+
+    def stream(self) -> Iterator[bytes]:
+        """The header, then each chunk's PCM as it becomes available.
+
+        The header is yielded only once the FIRST chunk has been read,
+        because until then nobody knows the sample rate. That is deliberate
+        beyond the arithmetic: it means a render that is going to fail
+        fails before a single byte of the response has been committed, so
+        the caller can still answer with an error instead of a truncated
+        clip.
+        """
+        self._fmt = None
+        if not self.plan:
+            return
+        if not self.cached:
+            if not self.tts.load():
+                raise RuntimeError("no speech engine is available")
+            self._replan()
+        for chunk, cached in self.plan:
+            path, owned = cached, False
+            if path is None:
+                path = self._synth(chunk)
+                if path is None:
+                    continue
+                owned = True
+            try:
+                fmt, pcm = wav_pcm(path)
+            except Exception:
+                log.exception("unreadable speech chunk: %s", path)
+                continue
+            finally:
+                if owned:
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        log.debug("render temp unlink failed: %s", path,
+                                  exc_info=True)
+            if self._fmt is None:
+                self._fmt = fmt
+                yield wav_header(*fmt)
+            elif fmt != self._fmt:
+                # One rendition is one engine and the cache key carries the
+                # engine, so the rates cannot disagree -- unless a cached
+                # file was written by an older build with different output
+                # settings. Drop that chunk rather than splice audio at the
+                # wrong rate, which sounds like a fault in HIM.
+                log.warning("speech chunk %s is %s, not %s; dropped",
+                            path, fmt, self._fmt)
+                continue
+            yield pcm
+
+    # ----------------------------------------------------------- private
+    def _replan(self):
+        """``load()`` may have changed the engine under us (f5 sidecar down
+        -> xtts, fish without credentials -> f5). The cache is keyed on the
+        engine, so a changed engine invalidates every lookup this was built
+        with, and the plan has to be taken again."""
+        engine = self.tts.render_engine()
+        if engine == self.engine:
+            return
+        log.info("render: engine changed %s -> %s; re-reading the cache",
+                 self.engine, engine)
+        self.engine = engine
+        self.plan = [(chunk, self.tts._cached(engine, chunk))
+                     for chunk, _ in self.plan]
+
+    def _synth(self, chunk: str) -> Optional[str]:
+        """Render one chunk to a temp wav and file it in the speech cache
+        under the engine that rendered it -- exactly as _speak_pipelined
+        does, so the next time this line is wanted, in the room or on the
+        phone, neither of them pays for it again."""
+        synth = {"f5": self.tts._synth_f5, "fish": self.tts._synth_fish,
+                 "edge": self.tts._synth_edge}.get(self.engine,
+                                                   self.tts._synth_xtts)
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        try:
+            synth(chunk, tmp.name)
+        except Exception:
+            log.exception("%s render failed: %.60s", self.engine, chunk)
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            return None
+        self.tts._store(self.engine, chunk, tmp.name)
+        return tmp.name

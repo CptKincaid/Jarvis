@@ -3637,8 +3637,8 @@ was an *older server*. Everything above was read off `demon-bot` itself.
 You asked for an app that gets you to him. This is that — a page the Spark
 serves to your phone on the home network, with a text box that goes through
 exactly the same door as the typed box and the `jarvis` command line, quick
-buttons for the things you actually ask for, and an icon on your home screen
-that opens it like an app.
+buttons for the things you actually ask for, his own voice in your ear if
+you want it, and an icon on your home screen that opens it like an app.
 
 It is **off** until you turn it on, and it is **LAN only**: it binds one
 private address and refuses to start on anything routable from outside the
@@ -3701,12 +3701,87 @@ keep in sync.
 sheets the CLI prints, without dispatching a turn, so they are not
 remembered as a conversation and never wake the speaker.
 
-Answers come back **silently** by default. There is an *aloud* switch beside
-the talk button if you want the soundbar to answer as well — the same choice
-`jarvis --send-audio --speak` makes, and off for the same reason: a question
-asked from bed should not answer the house. Speaking aloud is also the only
-thing the switch changes; he never barges in on a reply he is already
-speaking to somebody standing in the room.
+### The two switches, and why they are two
+
+Under the talk button there are two, and they are two rooms, not one
+setting with a volume knob. **Both start off.**
+
+* **Voice** plays his answer out of *this phone*, in his own voice.
+* **Aloud in the room** makes the *Spark* answer the house as well — the
+  same choice `jarvis --send-audio --speak` makes.
+
+With both off you get text, and nothing anywhere makes a sound. With Voice
+on and Aloud off — the useful setting away from the desk — he speaks in
+your ear and the room stays silent. With both on he answers in both places,
+which is what you want standing in the kitchen with the phone in your hand.
+
+Aloud is off by default because a question asked from bed should not answer
+the house. Voice is off by default because half of these turns happen in a
+lecture, and a phone that starts talking on its own in a lecture theatre is
+worse than one that says nothing. Neither switch changes anything else; he
+still never barges in on a reply he is already speaking to somebody
+standing in the room.
+
+### His actual voice, on the phone
+
+Tap **Voice** and the next answer arrives as audio as well as text. It is
+the real thing — the same F5 voice, the same reference clip, the same
+pronunciation dictionary and the same sentence splitting the Spark's
+speaker gets — not the browser's built-in speech synthesis, which would be
+a generic robot reading his lines and would make him sound like somebody
+else.
+
+It is also fast, for a reason worth knowing: the phone shares the Spark's
+**speech cache**. Every line he renders is filed on disk under its engine,
+voice settings and exact text, so anything he has said before — the canned
+replies, a repeated question, a briefing preamble — is already there:
+
+| | to the first audio byte | the whole clip |
+|---|---|---|
+| a line already in the cache | **0.6–1.7 ms** | the same (sent whole) |
+| a fresh one sentence line | **350 ms** | 350 ms |
+| a fresh two sentence reply | **366 ms** | 731 ms |
+| a fresh four sentence reply | **368 ms** | 1589 ms |
+
+Measured over real HTTP against the resident F5 sidecar. The interesting
+column is the first one: a fresh reply is **streamed sentence by sentence**
+rather than rendered, saved and then sent, so the phone starts playing the
+first sentence while the fourth is still on the GPU — a second and a
+quarter earlier, on a long answer, than waiting for the file.
+
+**Tapping the switch is not decoration.** iOS will not let a page start
+audio unless a real finger started it, so the audio pipeline is opened on
+the tap that turns Voice on, and re-armed every time you send a question
+(which is also a tap). That is why the switch exists as a switch instead of
+the page just playing everything. Your choice is remembered on that phone,
+so you tap it once. If the phone refuses anyway, the transcript says
+"holding audio back — tap Voice once more" rather than going quiet and
+leaving you to guess.
+
+Turning Voice **off** cuts whatever is playing and stops any fetch in
+flight, and while it is off nothing is requested and nothing is rendered —
+there is no clip made and thrown away.
+
+If the box has no speech engine at all, the switch renders dead and says
+"Voice unavailable" instead of looking alive and answering in silence.
+
+### "Why is the first question slow?"
+
+It usually is not him. Each answer now carries the server's own timing, and
+the page compares it with the wall clock: when the link added more than
+0.7 s it says so, naming both halves. For reference, a Tier-1 command
+("what time is it", "set a timer for ten minutes") takes **39–120 ms**
+inside the Spark, on about **1 ms** of HTTP.
+
+The rest is the network. Over a tailnet the first packets after a spell
+away go through a relay while NAT traversal negotiates a direct path, and
+that shows up as a slow first question and fast ones after it. Nothing in
+this app configures Tailscale and nothing here should — but the page does
+hold the path open on its own: while it is in front of you it pings once
+every 20 s (and again the moment you come back from the lock screen), which
+keeps both the tailnet's path and this server's 30 s keep-alive warm, so
+the first question after a pause is not the one that pays for the
+handshake.
 
 ### The microphone: the honest version
 
@@ -3739,6 +3814,21 @@ container, and libsndfile cannot read WebM. The page asks for
 `audio/ogg;codecs=opus` first and falls back; if what arrives is
 undecodable you get his own line about wav / ogg / opus / flac rather than
 silence.
+
+**If you are already reaching this page over https** — a reverse proxy in
+front of it that terminates TLS with a certificate the phone trusts, which
+is what a `tailscale serve` in front of `127.0.0.1:8765` gives you — then
+the page *is* a secure context and the talk button comes alive by itself,
+with no change here. That is the "certificate this phone trusts" case
+above, arrived at from the other end. Nothing about it is configured from
+this app, and the server underneath is unchanged: it still binds one
+private address, still refuses a non-private peer, and still wants the key
+on every `/api/*` call.
+
+**Voice does not need any of that.** Playing his answer through the phone
+uses `fetch` and Web Audio, neither of which is gated on a secure context,
+so the Voice switch works over plain http on the Wi-Fi exactly as it does
+over https. It is only the *microphone* that browsers hold back.
 
 Until then, the fast way to talk to him from the phone is still the one in
 §62 — record in Termux and pipe it over the SSH session you already have.
@@ -3776,3 +3866,16 @@ in your network:
   home screen again.
 * The page loads but nothing answers: Jarvis himself is down, or the phone
   has dropped onto cellular. It only answers on the home Wi-Fi.
+* The Voice switch says "Voice unavailable": this Jarvis has no speech
+  engine loaded at all — `grep "f5 sidecar" /tmp/vss_voice/jarvis.log` and
+  `systemctl --user status jarvis-f5.service`.
+* Voice is on and the text arrives but nothing is heard: look in the
+  transcript. "holding audio back" is the phone refusing to start audio —
+  tap Voice off and on again, which gives it the finger-press it wants.
+  "His voice did not reach this phone" carries the server's own reason.
+  `grep "phone say" /tmp/vss_voice/jarvis.log` shows every clip, how many
+  of its sentences came from the cache, and the milliseconds to the first
+  byte.
+* Answers are slow the first time and quick after: read the line the page
+  prints when the link is the slow half. See "Why is the first question
+  slow?" above — it is the tailnet finding a direct path, not Jarvis.

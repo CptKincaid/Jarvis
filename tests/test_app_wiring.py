@@ -30,6 +30,7 @@ import pytest
 import jarvis.app as app_mod
 import jarvis.channels.notify as notify_mod
 import jarvis.tools.timekeeper as tk_mod
+import jarvis.tts as tts_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import (AlarmFired, ApprovalRequested, ApprovalResolved,
                            UncertainResolved, UncertainUtterance,
@@ -54,11 +55,57 @@ class _Stub:
         return _noop
 
 
+class FakeRendition:
+    """What ``TTS.render`` hands back, without an engine behind it.
+
+    Shaped exactly like ``jarvis.tts.Rendition`` -- ``cached`` / ``plan`` /
+    ``body()`` / ``stream()`` -- because the phone client branches on all
+    four, and a fake that only had the one the happy path reads would let
+    the cached branch rot untested. The audio is a fifth of a second of
+    square wave, so it is real wav that a decoder accepts, and NOTHING here
+    is synthesized: a test must never put a sentence on the GPU.
+    """
+
+    RATE = 24000
+    PCM = b"".join(int(6000 * ((i // 60) % 2 * 2 - 1)).to_bytes(
+        2, "little", signed=True) for i in range(RATE // 5))
+
+    def __init__(self, text, cached=True, chunks=None):
+        self.text = text
+        # `chunks=[]` is meaningful (a reply that cleans down to nothing
+        # sayable), so it cannot go through an `or [text]`.
+        self.chunks = [text] if chunks is None else list(chunks)
+        self.cached = bool(cached) and bool(self.chunks)
+        self.plan = [(c, "cached.wav" if self.cached else None)
+                     for c in self.chunks]
+        self.gate = None            # an Event a test can hold a chunk on
+
+    def __bool__(self):
+        return bool(self.chunks)
+
+    def __len__(self):
+        return len(self.chunks)
+
+    def stream(self):
+        yield tts_mod.wav_header(self.RATE)
+        for i, _ in enumerate(self.chunks):
+            if i and self.gate is not None:
+                self.gate.wait(timeout=10)
+            yield self.PCM
+
+    def body(self):
+        pcm = self.PCM * len(self.chunks)
+        return tts_mod.wav_header(self.RATE, data_bytes=len(pcm)) + pcm
+
+
 class FakeTTS(_Stub):
-    """Records what Jarvis says (app._say is the only speech door)."""
+    """Records what Jarvis says (app._say is the only speech door), and
+    what was rendered for somebody who is NOT in the room."""
 
     def __init__(self, *a, **kw):
         self.spoken: list[str] = []
+        self.rendered: list[str] = []
+        self.rendition = FakeRendition          # a test may swap this
 
     def speak(self, text, block=False):
         self.spoken.append(text)
@@ -68,6 +115,13 @@ class FakeTTS(_Stub):
 
     def prewarm(self, phrases):
         self.prewarmed = list(phrases)
+
+    def render(self, text):
+        """The phone client's seam (jarvis/tts.py TTS.render). It records
+        separately from ``spoken`` on purpose: the two lists are how a test
+        proves a phone turn reached the phone and not the soundbar."""
+        self.rendered.append(text)
+        return self.rendition(text)
 
 
 class Sink:

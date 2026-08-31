@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import stat
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -30,7 +31,8 @@ from jarvis.assistant_config import SECRET_KEYS, AssistantConfig
 from jarvis.commander import CommandResult
 from jarvis.events import JarvisReply, Status, bus
 from tests.test_cmdsock import FakeApp
-from tests.test_app_wiring import build, paths, seams  # noqa: F401 - fixtures
+from tests.test_app_wiring import (FakeRendition, FakeTTS, build,  # noqa: F401
+                                   paths, seams)          # - fixtures
 
 
 # ------------------------------------------------------------------ helpers
@@ -43,6 +45,10 @@ class PhoneApp(FakeApp):
         self.assistant = cfg
         self.heard = "what's due this week"
         self.clips: list = []
+        # The voice seam. FakeTTS keeps `spoken` (what the ROOM was asked to
+        # say) apart from `rendered` (what went to the phone), which is how
+        # every test below proves the soundbar stayed out of it.
+        self.tts = FakeTTS()
 
     def decode_clip(self, audio, verify=True):
         self.clips.append((audio, verify))
@@ -636,3 +642,287 @@ def test_a_real_phone_turn_reaches_the_real_commander(build, tmp_path):  # noqa:
         assert app.tts.spoken == [], "a phone turn must not wake the room"
     finally:
         app.stop_assistant()
+
+
+# ------------------------------------------------------- 12. his own voice
+def audio(srv, text, token=None, headers=None):
+    """POST /api/say and give back (status, headers, body). Not `call`:
+    that one parses JSON, and this endpoint is a wav."""
+    conn = http.client.HTTPConnection(srv.host, srv.port, timeout=20)
+    try:
+        head = {"Authorization": "Bearer " + (srv.token if token is None
+                                              else token),
+                "Content-Type": "application/json"}
+        head.update(headers or {})
+        conn.request("POST", "/api/say", body=json.dumps({"text": text}),
+                     headers=head)
+        resp = conn.getresponse()
+        return resp.status, dict(resp.getheaders()), resp.read()
+    finally:
+        conn.close()
+
+
+def test_a_reply_comes_back_as_his_voice_not_the_browsers(server):
+    """The whole point: the audio is rendered by the SAME TTS the room
+    uses. A browser's own speech synthesis would be a different assistant
+    entirely, and would need no server at all."""
+    status, head, body = audio(server.srv, "Two items on Tuesday, sir.")
+    assert status == 200
+    assert head["Content-Type"] == "audio/wav"
+    assert body[:4] == b"RIFF" and body[8:12] == b"WAVE"
+    assert server.app.tts.rendered == ["Two items on Tuesday, sir."]
+
+
+def test_a_cached_reply_is_sent_whole_with_a_length_and_ranges(server):
+    """Everything already on disk means no synthesis at all, so the length
+    is known -- and a known length is what lets a media element seek."""
+    status, head, body = audio(server.srv, "Always, sir.")
+    assert status == 200
+    assert head["Content-Length"] == str(len(body))
+    assert head["Accept-Ranges"] == "bytes"
+    assert "Transfer-Encoding" not in head
+
+
+def test_a_range_request_gets_that_slice_and_says_which(server):
+    """Safari probes an audio source with `Range: bytes=0-1` before it will
+    commit to it, and a 200 to that probe has been the reason for a silent
+    <audio> tag more than once."""
+    _, _, whole = audio(server.srv, "Always, sir.")
+    status, head, body = audio(server.srv, "Always, sir.",
+                               headers={"Range": "bytes=0-1"})
+    assert status == 206
+    assert body == whole[:2]
+    assert head["Content-Range"] == f"bytes 0-1/{len(whole)}"
+    status, _, tail = audio(server.srv, "Always, sir.",
+                            headers={"Range": "bytes=44-"})
+    assert status == 206 and tail == whole[44:]
+
+
+def test_a_range_it_cannot_honour_sends_the_whole_thing(server):
+    """Ignoring a Range is legal; guessing at a multipart one is not."""
+    _, _, whole = audio(server.srv, "Always, sir.")
+    for spec in ("bytes=0-1,4-5", "chickens=0-1", "bytes=99999-", "bytes=x-y"):
+        status, _, body = audio(server.srv, "Always, sir.",
+                                headers={"Range": spec})
+        assert status == 200 and body == whole, spec
+
+
+def test_a_reply_that_must_be_rendered_streams_as_it_lands(server):
+    """The phone plays sentence one while sentence two is still on the GPU,
+    so the bytes must leave before the render is finished."""
+    server.app.tts.rendition = lambda text: FakeRendition(
+        text, cached=False, chunks=["one.", "two."])
+    conn = http.client.HTTPConnection(server.srv.host, server.srv.port,
+                                      timeout=20)
+    try:
+        conn.request("POST", "/api/say", body=json.dumps({"text": "one. two."}),
+                     headers={"Authorization": "Bearer " + server.srv.token,
+                              "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        assert resp.getheader("Transfer-Encoding") == "chunked"
+        assert resp.getheader("Content-Length") is None
+        head = resp.read(44)
+        assert head[:4] == b"RIFF"
+        assert head[40:44] == b"\xff\xff\xff\xff", \
+            "a stream cannot know its length yet, and must not claim one"
+        assert len(resp.read()) > 0
+    finally:
+        conn.close()
+
+
+def test_the_first_bytes_reach_the_phone_before_the_last_chunk_renders(server):
+    """Same property, proved rather than inferred: the header and the first
+    sentence are readable off the socket while chunk two is still blocked."""
+    gate = threading.Event()
+
+    def held(text):
+        rend = FakeRendition(text, cached=False,
+                                    chunks=["one.", "two."])
+        rend.gate = gate
+        return rend
+
+    server.app.tts.rendition = held
+    conn = http.client.HTTPConnection(server.srv.host, server.srv.port,
+                                      timeout=20)
+    try:
+        conn.request("POST", "/api/say", body=json.dumps({"text": "one. two."}),
+                     headers={"Authorization": "Bearer " + server.srv.token,
+                              "Content-Type": "application/json"})
+        resp = conn.getresponse()
+        first = resp.read(44 + len(FakeRendition.PCM))
+        assert len(first) == 44 + len(FakeRendition.PCM), \
+            "sentence one must arrive while sentence two is still rendering"
+        gate.set()
+        assert len(resp.read()) == len(FakeRendition.PCM)
+    finally:
+        gate.set()
+        conn.close()
+
+
+def test_the_voice_needs_the_key_like_everything_else(server):
+    status, _, _ = audio(server.srv, "Always, sir.", token="not-the-key")
+    assert status == 401
+    assert server.app.tts.rendered == []
+
+
+def test_an_empty_reply_is_refused_without_rendering(server):
+    status, _, _ = audio(server.srv, "   ")
+    assert status == 400
+    assert server.app.tts.rendered == []
+
+
+def test_a_reply_with_nothing_sayable_in_it_is_silence_not_an_error(server):
+    """A reply that cleans down to nothing (all markup, all punctuation)
+    should make no sound. A 4xx would put a red line on his screen for a
+    reply he can read perfectly well."""
+    server.app.tts.rendition = lambda text: FakeRendition(text, chunks=[])
+    status, head, body = audio(server.srv, "`x`")
+    assert status == 200
+    assert body == b""
+    assert head["Content-Length"] == "0"
+
+
+def test_a_box_with_no_speech_engine_says_so_rather_than_going_quiet(server):
+    """A dead Voice switch that says it is dead beats one that looks alive
+    and answers in silence -- which is what a broken toggle looks like."""
+    server.app.tts = None
+    status, _, body = audio(server.srv, "Always, sir.")
+    assert status == 503
+    assert b"speech engine" in body
+    status, out = call(server.srv, "GET", "/api/ping", token=server.srv.token)
+    assert out["voice"] is False
+
+
+def test_a_render_that_fails_answers_before_it_commits_to_a_clip(server):
+    """The header is pulled before the response line goes out precisely so
+    a doomed render is a 503 and not a truncated 200."""
+    def doomed(text):
+        raise RuntimeError("the sidecar went away")
+
+    server.app.tts.rendition = doomed
+    status, _, body = audio(server.srv, "Always, sir.")
+    assert status == 503
+    assert b"voice" in body
+
+
+def test_the_ping_says_whether_there_is_a_voice_at_all(server):
+    status, out = call(server.srv, "GET", "/api/ping", token=server.srv.token)
+    assert status == 200 and out["voice"] is True
+
+
+# ------------------------------------------- 13. the room stays out of it
+def test_asking_for_audio_never_wakes_the_room(server):
+    """The Spark's speaker is not on this path at all. `spoken` is what
+    app._say puts into the room; `rendered` is what went to the phone."""
+    audio(server.srv, "Two items on Tuesday, sir.")
+    assert server.app.tts.spoken == [], "the room must stay silent"
+    assert server.app.tts.rendered == ["Two items on Tuesday, sir."]
+
+
+def test_the_two_switches_are_different_rooms_and_say_so(server):
+    """`aloud` is the Spark answering the house; `voice` is this phone.
+    They are separate controls with separate labels, and both start off."""
+    status, page = call(server.srv, "GET", "/")
+    assert status == 200
+    body = page.decode("utf-8")
+    assert 'id="voice"' in body and 'id="aloud"' in body
+    assert "Aloud in the room" in body
+    assert 'type="checkbox" id="aloud">' in body, \
+        "the room switch must not be checked by default"
+    assert 'aria-pressed="false"' in body, "and neither must the phone's"
+
+
+def test_the_page_fetches_nothing_at_all_while_the_voice_is_off(server):
+    """Off has to mean nothing is rendered, not that a clip was made and
+    discarded -- he uses this in lectures."""
+    body = call(server.srv, "GET", "/")[1].decode("utf-8")
+    assert "if (!voiceOn || !t) { return; }" in body
+    assert 'localStorage.setItem(VOICE_STORE' in body
+
+
+def test_the_gesture_that_enables_the_voice_is_the_one_ios_needs(server):
+    """iOS only lets an AudioContext out of 'suspended' inside a user
+    gesture, so the context is built on the enabling TAP -- and re-armed on
+    every send, for a switch remembered from last time."""
+    body = call(server.srv, "GET", "/")[1].decode("utf-8")
+    assert 'voiceBtn.addEventListener("click"' in body
+    assert "if (voiceOn) { hush(); unlock(); }" in body
+    assert 'note("This phone is holding audio back' in body
+
+
+# ------------------------------------------------- 14. honest about the link
+def test_a_turn_reports_how_long_the_server_half_took(server):
+    """Without it the page cannot tell "he was slow" from "the link was
+    slow", and neither can he."""
+    status, out = ask(server.srv, "what time is it")
+    assert status == 200
+    assert isinstance(out["ms"], int) and out["ms"] >= 0
+    assert out["ms"] < 20000
+    status, out = ask(server.srv, "diagnostics")
+    assert isinstance(out["ms"], int), "a read is timed too"
+
+
+def test_the_page_holds_the_path_open_between_questions(server):
+    """A ping every 20 s while the page is in front of him keeps this
+    server's keep-alive (30 s) and the tailnet's direct path alive, so the
+    first question after a pause does not pay for a relay."""
+    body = call(server.srv, "GET", "/")[1].decode("utf-8")
+    assert "setInterval(beat, BEAT_MS)" in body
+    assert 'document.addEventListener("visibilitychange"' in body
+    assert "var BEAT_MS = 20000;" in body
+
+
+# --------------------------------------------------- 15. through the app
+def test_the_real_app_speaks_to_the_phone_and_not_to_the_room(build,  # noqa: F811
+                                                              tmp_path):
+    """The turn and its audio, both through the real JarvisApp: a reply on
+    the phone's screen, the same reply in his ear, and a soundbar that
+    never made a sound."""
+    app = build()
+    app.assistant.update({"phone.enabled": True, "phone.bind": "127.0.0.1",
+                          "phone.port": 0,
+                          "phone.link_file": str(tmp_path / "l.txt"),
+                          "phone.qr_file": str(tmp_path / "l.svg")})
+    app.start_assistant()
+    try:
+        status, out = call(app.webapp, "POST", "/api/ask",
+                           json.dumps({"text": "what time is it"}),
+                           token=app.webapp.token, ctype="application/json")
+        assert status == 200
+        reply = [m["text"] for m in out["messages"] if m["kind"] == "reply"][0]
+        status, head, body = audio(app.webapp, reply, token=app.webapp.token)
+        assert status == 200 and body[:4] == b"RIFF"
+        assert head["Content-Type"] == "audio/wav"
+        assert app.tts.rendered == [reply]
+        assert app.tts.spoken == [], "the room must not hear a phone turn"
+    finally:
+        app.stop_assistant()
+
+
+def test_a_streamed_clip_leaves_the_connection_reusable(server):
+    """A hand-framed chunked body has to terminate correctly or the next
+    request on that connection parses audio as a request line. It matters
+    here more than usual: holding ONE connection open across a turn is
+    what keeps the tailnet from re-negotiating a path for every tap."""
+    server.app.tts.rendition = lambda text: FakeRendition(
+        text, cached=False, chunks=["one.", "two."])
+    conn = http.client.HTTPConnection(server.srv.host, server.srv.port,
+                                      timeout=20)
+    try:
+        for _ in range(2):
+            conn.request("POST", "/api/say",
+                         body=json.dumps({"text": "one. two."}),
+                         headers={"Authorization": "Bearer " + server.srv.token,
+                                  "Content-Type": "application/json"})
+            resp = conn.getresponse()
+            assert resp.status == 200
+            assert resp.read()[:4] == b"RIFF"
+        # …and a plain JSON call still works on the same socket afterwards
+        conn.request("GET", "/api/ping",
+                     headers={"Authorization": "Bearer " + server.srv.token})
+        resp = conn.getresponse()
+        assert resp.status == 200
+        assert json.loads(resp.read())["ok"] is True
+    finally:
+        conn.close()
