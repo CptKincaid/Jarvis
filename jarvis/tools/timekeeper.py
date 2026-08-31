@@ -69,7 +69,19 @@ KINDS = ("reminder", "timer", "alarm")
 SILENT_PREFIX = "focus:"
 ACTIVE_STATES = ("pending", "ringing", "snoozed")
 STATES = ACTIVE_STATES + ("done", "missed", "cancelled")
-REPEATS = ("", "daily", "weekdays")
+REPEATS = ("", "daily", "weekdays")     # the FIXED repeats; intervals are "<N>m"
+# Interval nudges: "remind me to drink water every 45 minutes" stores its
+# repeat as "45m" and is re-filed from NOW on every fire, so a late boot
+# advances one step instead of firing a burst. Bounds keep a mis-heard
+# "every two seconds" out of the store and stop an "interval" that is really
+# a daily from pretending to be one.
+MIN_INTERVAL_MIN = 1
+MAX_INTERVAL_MIN = 24 * 60
+_INTERVAL_RX = re.compile(r"^(\d{1,4})m$")
+# Its fired line carries kind="nudge" so quiet.py can EXPIRE it while held:
+# a stand-up nudge read back after a two-hour meeting is noise, and five of
+# them is worse.
+NUDGE_KIND = "nudge"
 
 # Persona lines (spec 3.4) — fixed strings the app prewarms.
 REMINDER_LINE = "Sir, this is your reminder. {text}"
@@ -565,12 +577,84 @@ def _find_duration(sc: _Scan):
     return None
 
 
+def _find_interval(sc: _Scan):
+    """'every 45 minutes' / 'every two hours' -> seconds (tokens consumed).
+
+    Out-of-range readings are left UNCONSUMED on purpose: "every 5 seconds"
+    is a mis-hear, and swallowing the words would turn it into a reminder
+    labelled "drink water" with no time at all."""
+    for i, t in enumerate(sc.norm):
+        if sc.used[i] or t not in ("every", "each"):
+            continue
+        # allow_bare=False: "every 20" is not an interval, it is a
+        # half-heard sentence.
+        got = _duration_at(sc.norm, sc.used, i + 1, allow_bare=False)
+        if not got:
+            # "every hour" / "every minute": a bare unit means one of them
+            # ("every day" never reaches here -- _REPEAT_RE claims it first).
+            j = i + 1
+            if j >= len(sc.norm) or sc.used[j] or sc.norm[j] not in _UNIT_S:
+                continue
+            got = (float(_UNIT_S[sc.norm[j]]), j + 1)
+        secs = got[0]
+        if not (MIN_INTERVAL_MIN * 60 <= secs <= MAX_INTERVAL_MIN * 60):
+            continue
+        sc.use(i, got[1])
+        return secs
+    return None
+
+
+def interval_minutes(repeat) -> Optional[int]:
+    """45 from the repeat token "45m"; None for anything else."""
+    m = _INTERVAL_RX.match(str(repeat or "").strip().lower())
+    if not m:
+        return None
+    n = int(m.group(1))
+    return n if MIN_INTERVAL_MIN <= n <= MAX_INTERVAL_MIN else None
+
+
+def interval_token(seconds: float) -> str:
+    """Seconds -> the stored repeat token ("45m"); "" when out of range."""
+    mins = int(round(float(seconds) / 60.0))
+    return f"{mins}m" if MIN_INTERVAL_MIN <= mins <= MAX_INTERVAL_MIN else ""
+
+
+def is_repeating(repeat) -> bool:
+    """Does this item come back? (fixed repeat or an interval)"""
+    return str(repeat or "") in ("daily", "weekdays") or \
+        interval_minutes(repeat) is not None
+
+
+def interval_words(minutes: int) -> str:
+    """The words after "every": 'hour', '45 minutes', 'two hours'."""
+    minutes = int(minutes)
+    if minutes >= 60 and minutes % 60 == 0:
+        h = minutes // 60
+        return "hour" if h == 1 else f"{count_words(h) if h <= 12 else h} hours"
+    if minutes == 1:
+        return "minute"
+    return f"{count_words(minutes) if minutes <= 12 else minutes} minutes"
+
+
+def repeat_suffix(repeat) -> str:
+    """The spoken tail on a set/list line: ', every day' / ', weekdays' /
+    ', every 45 minutes'."""
+    fixed = {"daily": ", every day", "weekdays": ", weekdays"}.get(str(repeat or ""), "")
+    if fixed:
+        return fixed
+    mins = interval_minutes(repeat)
+    return f", every {interval_words(mins)}" if mins is not None else ""
+
+
 def repeat_from_text(text: str) -> str:
-    """'' | 'daily' | 'weekdays' from 'every day', 'daily', 'every weekday',
-    'weekdays', 'every morning'."""
+    """'' | 'daily' | 'weekdays' | '<N>m' from 'every day', 'daily', 'every
+    weekday', 'weekdays', 'every morning', 'every 45 minutes'."""
     m = _REPEAT_RE.search((text or "").lower())
     if not m:
-        return ""
+        # An interval is the only other thing "every ..." can mean.
+        sc = _Scan(text or "")
+        secs = _find_interval(sc)
+        return interval_token(secs) if secs is not None else ""
     what = (m.group("what") or "").replace(" ", "")
     if m.group("wk") or what in ("weekday", "weekdays"):
         return "weekdays"
@@ -581,6 +665,8 @@ def normalize_repeat(value) -> str:
     v = str(value or "").strip().lower()
     if v in ("", "once", "no", "none", "never", "false", "0"):
         return ""
+    if interval_minutes(v) is not None:
+        return v                              # already a token ("45m")
     if "weekday" in v or "week day" in v or v in ("mon-fri", "monday to friday"):
         return "weekdays"
     if v in ("daily", "every day", "everyday", "each day", "day", "true", "yes",
@@ -622,7 +708,21 @@ def parse_when_full(text: str, now: datetime, prefer: str = "next"):
         if what in _PERIOD_HOUR:
             period = what
 
+    # "every 45 minutes" must be read BEFORE _find_duration, which would
+    # otherwise eat the 45 minutes as the one-off due time and leave a bare
+    # "every" in the label.
+    interval_s = None
+    if not repeat:
+        interval_s = _find_interval(sc)
+        if interval_s is not None:
+            repeat = interval_token(interval_s)
+
     duration = _find_duration(sc)
+    if duration is None and interval_s is not None:
+        # No separate start given: the first nudge is one interval from now,
+        # not immediately (a "water every 45 minutes" that fires the instant
+        # you ask for it is a bug report).
+        duration = interval_s
 
     # -- time of day ------------------------------------------------------
     hour = minute = None
@@ -1247,13 +1347,13 @@ class Timekeeper:
         due = describe_due(it.effective_due, now)
         if it.kind == "alarm":
             head = it.label if it.label else "an alarm"
-            tail = {"daily": ", every day", "weekdays": ", weekdays"}.get(it.repeat, "")
+            tail = repeat_suffix(it.repeat)
             if it.state == "snoozed":
                 return f"{head} snoozed until {_time_words(_to_dt(it.effective_due))}{tail}"
             return f"{head} {due}{tail}"
         if it.kind == "timer":
             return f"{display_label(it.label) or 'the ' + duration_words(it.duration) + ' timer'} {due}"
-        return f"{it.label} {due}"
+        return f"{it.label} {due}{repeat_suffix(it.repeat)}"
 
     def list_text(self, kind: str = "all", now=None) -> str:
         kind = normalize_kind(kind)
@@ -1329,7 +1429,7 @@ class Timekeeper:
 
     def _finish_alarm(self, item: Item, now: float, state: str):
         """Dismiss/timeout: repeat alarms come back tomorrow, others end."""
-        if item.repeat in ("daily", "weekdays"):
+        if is_repeating(item.repeat):
             nxt = next_repeat(item.due, item.repeat, now)
             self._update(item.id, state="pending", due=nxt, snooze_until=None, fired_at=None)
             log.info("timekeeper: alarm %r rescheduled for %s", item.label,
@@ -1427,7 +1527,10 @@ class Timekeeper:
                 line = REMINDER_LINE.format(text=sentence_case(item.label))
             text = item.label
             title = "Jarvis reminder"
-        if item.repeat in ("daily", "weekdays"):
+        # An interval reminder speaks as a NUDGE so quiet.py can expire it
+        # instead of stacking five "drink water" lines into the digest.
+        kind = NUDGE_KIND if interval_minutes(item.repeat) is not None else item.kind
+        if is_repeating(item.repeat):
             nxt = next_repeat(item.due, item.repeat, now)
             self._update(item.id, state="pending", due=nxt, fired_at=now,
                          snooze_until=None)
@@ -1445,7 +1548,7 @@ class Timekeeper:
             log.info("timekeeper: silent %s fired %r%s", item.kind, item.label,
                      " (late)" if late else "")
             return True
-        effects.append(lambda: self._speak(line, proactive=True, kind=item.kind))
+        effects.append(lambda: self._speak(line, proactive=True, kind=kind))
         effects.append(lambda: self._toast(title, text, "normal"))
         effects.append(lambda: bus.publish(ReminderFired(
             text=text, item_id=item.id, kind=item.kind)))
@@ -1560,6 +1663,16 @@ class Timekeeper:
                 self._update(it.id, state="pending")
             for it in self._due_items(now):
                 late = now - it.effective_due
+                if interval_minutes(it.repeat) is not None:
+                    # An interval nudge is about NOW, never about a moment
+                    # that has passed. Announcing "drink water, due at 3:15"
+                    # (or five of them) at boot is exactly the backlog this
+                    # kind exists to avoid, so it is silently re-filed.
+                    nxt = next_repeat(it.due, it.repeat, now)
+                    self._update(it.id, state="pending", due=nxt, snooze_until=None)
+                    log.info("timekeeper: nudge %r re-filed for %s", it.label,
+                             datetime.fromtimestamp(nxt).strftime("%a %H:%M"))
+                    continue
                 if late < LATE_GRACE_S:
                     if self._fire(it, now, True, effects):
                         handled.append(it)
@@ -1651,8 +1764,15 @@ class Timekeeper:
 
 
 def next_repeat(due: float, repeat: str, now: float) -> float:
-    """The next wall-clock occurrence after ``now`` for a daily / weekdays
-    alarm originally due at ``due`` (keeps the hour across DST)."""
+    """The next occurrence after ``now``.
+
+    Daily / weekdays keep their wall-clock hour (DST included) and walk
+    forward from ``due``. An interval walks forward from NOW instead: after
+    a two-hour outage a 45-minute nudge is due in 45 minutes, not three
+    times in the next ten seconds."""
+    mins = interval_minutes(repeat)
+    if mins is not None:
+        return float(now) + mins * 60.0
     d = _to_dt(due)
     n = _to_dt(now)
     while True:
@@ -1721,7 +1841,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             text = rest or "your reminder"
         rep = normalize_repeat(repeat) or rep_text or repeat_from_text(text)
         item = t.add_reminder(dt.timestamp(), text, rep)
-        suffix = {"daily": ", every day", "weekdays": ", weekdays"}.get(item.repeat, "")
+        suffix = repeat_suffix(item.repeat)
         line = _set_line("Reminder", describe_due(item.due, epoch), suffix)
         return ToolResult(text=line, speak=line)
 
@@ -1752,7 +1872,7 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                               speak=CANT_PARSE_LINE)
         rep = normalize_repeat(repeat) or rep_text
         item = t.add_alarm(dt.timestamp(), str(label or "").strip(), rep)
-        suffix = {"daily": ", every day", "weekdays": ", weekdays"}.get(item.repeat, "")
+        suffix = repeat_suffix(item.repeat)
         line = _set_line("Alarm", describe_due(item.due, epoch), suffix)
         return ToolResult(text=line, speak=line)
 
@@ -1798,14 +1918,15 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     return [
         ToolSpec(
             name="set_reminder",
-            description="Set a spoken reminder at a natural-language time.",
+            description="Set a spoken reminder at a natural-language time; repeats daily, on weekdays, or on an interval ('every 45 minutes').",
             parameters={"type": "object",
                         "properties": {
                             "when": {"type": "string",
                                      "description": "e.g. 'in 10 minutes', 'at 3 pm', 'tomorrow morning'"},
                             "text": {"type": "string", "description": "what to remind"},
                             "repeat": {"type": "string",
-                                       "enum": ["once", "daily", "weekdays"]}},
+                                       "description": "'once', 'daily', 'weekdays', or an "
+                                                      "interval like 'every 45 minutes'"}},
                         "required": ["when", "text"]},
             handler=set_reminder),
         ToolSpec(
@@ -1825,7 +1946,9 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                             "when": {"type": "string",
                                      "description": "e.g. 'at 7', '6:30 am', 'tomorrow at 8'"},
                             "label": {"type": "string"},
-                            "repeat": {"type": "string", "enum": ["once", "daily", "weekdays"]}},
+                            "repeat": {"type": "string",
+                                       "description": "'once', 'daily', 'weekdays', or an "
+                                                      "interval like 'every 90 minutes'"}},
                         "required": ["when"]},
             handler=set_alarm),
         ToolSpec(

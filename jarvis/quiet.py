@@ -34,7 +34,10 @@ questions never come through here at all: the gate is keyed on the caller's
 ``proactive=True`` flag, not on ``_say`` itself.
 
 Held lines are capped (``HOLD_MAX``): a night of watchdog warnings must not
-become a ten-minute monologue at seven in the morning.
+become a ten-minute monologue at seven in the morning. Some kinds are not
+held at all: an interval nudge (``kind="nudge"``, jarvis/tools/timekeeper.py)
+EXPIRES when the window is closed, because "stand up, sir" is only true at
+the moment it was due.
 """
 from __future__ import annotations
 
@@ -66,8 +69,16 @@ QUIET_STATUS_QUIET_LINE = "I'm holding my tongue, sir: {reason}."
 QUIET_STATUS_FREE_LINE = "I'm not holding anything back, sir."
 FREE_LINE = "Very good, sir."
 
+# A kind that is only worth hearing AT its moment. A stand-up nudge read
+# back after a two-hour meeting is noise, and a 45-minute water nudge held
+# through a three-hour block would arrive five deep. Held -> expired.
+EPHEMERAL_KINDS = ("nudge",)
+
 _KIND_NOUNS = {
     "reminder": ("reminder", "reminders"),
+    # A nudge normally never reaches a digest (hold() expires it); the entry
+    # keeps a stray one from reading as "one message".
+    "nudge": ("nudge", "nudges"),
     "timer": ("timer", "timers"),
     "warning": ("warning", "warnings"),
     "message": ("message", "messages"),
@@ -421,13 +432,21 @@ class QuietPolicy:
             return FREE_LINE if was else DND_ALREADY_FREE_LINE
 
     # ------------------------------------------------------------- hold
-    def hold(self, text: str, kind: str = "message") -> None:
+    def hold(self, text: str, kind: str = "message") -> bool:
+        """Park a line for the digest. False when it was DROPPED instead --
+        an ephemeral kind (a nudge) is only worth hearing at its moment, so
+        it expires rather than queueing behind the window."""
         text = (text or "").strip()
         if not text:
-            return
+            return False
+        kind = kind or "message"
+        if kind in EPHEMERAL_KINDS:
+            log.info("quiet: expired (%s): %.80s", kind, text)
+            return False
         with self._lock:
-            self._held.append((self._now(), text, kind or "message"))
+            self._held.append((self._now(), text, kind))
         log.info("quiet: held (%s): %.80s", kind, text)
+        return True
 
     @property
     def held(self) -> list:

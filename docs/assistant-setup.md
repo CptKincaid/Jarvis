@@ -1290,3 +1290,38 @@ also ends the hold early and reads the digest immediately.
 
 Ordering note: an explicit *"do not disturb for an hour"* outranks the block when
 he is asked *why* he is quiet, but either one holds.
+
+## 41. Interval nudges: "every 45 minutes"
+
+Reminders have always repeated *daily* or *on weekdays*. They now also repeat on
+an interval:
+
+> *"Remind me to drink water every 45 minutes."*
+> *"Stand up every hour."*
+> *"Every two hours check the oven."*
+> *"Take a break every 90 minutes."*
+
+Anything from **one minute to twenty-four hours**. The first nudge is one
+interval away, not immediate, and each one re-files itself as it fires. They
+list and cancel like any other reminder:
+
+> *"Any reminders?"* — "Drink water in 40 minutes, every 45 minutes, sir."
+> *"Cancel the water reminder."*
+
+Nothing to configure.
+
+**They know when to shut up.** A nudge is only true at the moment it is due, so
+when Jarvis is holding his tongue — quiet hours, do not disturb, a meeting on the
+calendar, a study block (section 40), or simply because you are out of the house —
+a nudge that comes due **expires** instead of joining the catch-up digest. Come
+back from a two-hour meeting and you get your reminders and warnings, not four
+stacked "drink water" lines. Real reminders, timers, alarms and warnings are held
+as before; a nudge never takes up one of the twelve backlog slots either.
+
+Two phrasings he deliberately refuses, because they are almost always a mis-hear:
+
+- *"every 5 seconds"* — below the one-minute floor.
+- *"every week"* — above the twenty-four-hour ceiling.
+
+He says "I couldn't make out the time, sir" rather than quietly setting something
+odd.

@@ -502,8 +502,11 @@ class JarvisApp:
         if proactive and quiet is not None:
             try:
                 if quiet.should_hold():
-                    quiet.hold(text, kind)
-                    bus.publish(Status(text=f"Held ({quiet.reason() or 'quiet'}): "
+                    # False = dropped, not parked (an interval nudge expires
+                    # rather than joining the digest); say which happened.
+                    kept = quiet.hold(text, kind) is not False
+                    bus.publish(Status(text=f"{'Held' if kept else 'Expired'} "
+                                       f"({quiet.reason() or 'quiet'}): "
                                        f"{text[:60]}", kind="info"))
                     return
             except Exception:

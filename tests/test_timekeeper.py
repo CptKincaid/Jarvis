@@ -692,8 +692,13 @@ def test_tool_specs(tools):
     props = tools.schemas()[3]["function"]["parameters"]["properties"]
     assert props["action"]["enum"] == ["list", "cancel", "stop", "snooze"]
     assert props["kind"]["enum"] == ["reminder", "timer", "alarm", "all"]
-    assert tools.schemas()[2]["function"]["parameters"]["properties"]["repeat"]["enum"] == \
-        ["once", "daily", "weekdays"]
+    # `repeat` lost its enum when interval nudges arrived: no closed list can
+    # hold "every 45 minutes". The description has to carry the shape instead.
+    for i in (0, 2):
+        rep = tools.schemas()[i]["function"]["parameters"]["properties"]["repeat"]
+        assert "enum" not in rep
+        for word in ("once", "daily", "weekdays", "every"):
+            assert word in rep["description"]
 
 
 def test_tool_set_reminder(tools, tk):
@@ -807,3 +812,115 @@ def test_missed_alarms_reach_the_quiet_digest_as_alarms(tmp_path):
         assert missed == ["alarm"], rec
     finally:
         t.close()
+
+
+# ------------------------------------------------- interval nudges (n=24)
+@pytest.mark.parametrize("text,repeat,due,label", [
+    ("drink water every 45 minutes", "45m", D(2026, 8, 26, 9, 45), "drink water"),
+    ("stand up every hour", "60m", D(2026, 8, 26, 10, 0), "stand up"),
+    ("every two hours check the oven", "120m", D(2026, 8, 26, 11, 0), "check the oven"),
+    ("take a break every 90 minutes", "90m", D(2026, 8, 26, 10, 30), "take a break"),
+    ("every half an hour look away", "30m", D(2026, 8, 26, 9, 30), "look away"),
+    ("stretch every minute", "1m", D(2026, 8, 26, 9, 1), "stretch"),
+    # unchanged: the fixed repeats still win, and a plain duration is a one-off
+    ("call mum every day at 6", "daily", D(2026, 8, 26, 18, 0), "call mum"),
+    ("stretch in 10 minutes", "", D(2026, 8, 26, 9, 10), "stretch"),
+])
+def test_every_n_minutes_parses_as_an_interval(text, repeat, due, label):
+    dt, rep, rest = parse_when_full(text, NOW)
+    assert (dt, rep, rest) == (due, repeat, label)
+
+
+@pytest.mark.parametrize("text", [
+    "water every 5 seconds",          # a mis-hear, not a nudge
+    "ping me every week",             # longer than the 24 h ceiling
+    "every 20 the thing",             # a bare number is a half-heard sentence
+])
+def test_an_out_of_range_every_is_left_alone(text):
+    """Rejected intervals must not CONSUME their words either: swallowing
+    them would leave a reminder with a label and no time at all."""
+    dt, rep, rest = parse_when_full(text, NOW)
+    assert rep == "" and dt is None and rest == text
+
+
+def test_an_interval_is_re_filed_from_now_not_from_the_due_time():
+    """Walking forward from `due` after a two-hour outage would fire the
+    nudge three times in ten seconds."""
+    due = NOW.timestamp()
+    late = due + 3 * 3600
+    assert tkm.next_repeat(due, "45m", late) == late + 45 * 60
+    # daily still walks from the due hour, DST and all
+    assert tkm.next_repeat(due, "daily", late) == (NOW + timedelta(days=1)).timestamp()
+
+
+@pytest.mark.parametrize("repeat,words", [
+    ("45m", ", every 45 minutes"), ("60m", ", every hour"),
+    ("120m", ", every two hours"), ("1m", ", every minute"),
+    ("daily", ", every day"), ("weekdays", ", weekdays"), ("", ""),
+])
+def test_repeat_suffix_reads_back(repeat, words):
+    assert tkm.repeat_suffix(repeat) == words
+
+
+def test_interval_token_round_trips_and_bounds():
+    assert tkm.interval_token(45 * 60) == "45m"
+    assert tkm.interval_token(30) == ""                    # under a minute
+    assert tkm.interval_token(25 * 3600) == ""             # over a day
+    assert tkm.interval_minutes("45m") == 45
+    assert tkm.interval_minutes("1441m") is None
+    assert tkm.interval_minutes("daily") is None
+    assert tkm.is_repeating("45m") and tkm.is_repeating("daily")
+    assert not tkm.is_repeating("") and not tkm.is_repeating("5000m")
+    assert tkm.normalize_repeat("45m") == "45m"
+    assert tkm.normalize_repeat("every 2 hours") == "120m"
+
+
+def test_a_nudge_fires_again_and_again_on_the_interval(tk):
+    it = tk.add_reminder(tk.clock.now() + 45 * 60, "drink water", repeat="45m")
+    for _ in range(3):
+        tk.clock.advance(45 * 60 + 1)
+        assert tk.tick() == 1
+    assert len(tk.said) == 3 and all("drink water" in s.lower() for s in tk.said)
+    again = tk.get(it.id)
+    assert again.state == "pending"
+    assert again.due == pytest.approx(tk.clock.now() + 45 * 60, abs=1)
+
+
+def test_a_nudge_missed_during_downtime_is_re_filed_silently(tmp_path):
+    """catch_up() reads a missed reminder back ("You missed … at 3:15").
+    For a nudge that is precisely the stale backlog it exists to avoid."""
+    clock = FakeClock(NOW)
+    rec = []
+
+    def say(line, proactive=True, kind="reminder"):
+        rec.append((line, kind))
+    t = Timekeeper(tmp_path / "tk.db", say=say, cfg={}, now=clock.now,
+                   run=lambda *a, **k: None, ring=False, notify=False,
+                   cache_dir=tmp_path / "cache")
+    try:
+        it = t.add_reminder(clock.now() + 60, "drink water", repeat="45m")
+        clock.advance(3 * 3600)               # three hours down: four nudges owed
+        t.catch_up()
+        assert rec == []
+        again = t.get(it.id)
+        assert again.state == "pending"
+        assert again.due == pytest.approx(clock.now() + 45 * 60, abs=1)
+    finally:
+        t.close()
+
+
+def test_a_nudge_is_listed_with_its_interval(tk):
+    tk.add_reminder(tk.clock.now() + 45 * 60, "drink water", repeat="45m")
+    assert ", every 45 minutes" in tk.list_text("reminder")
+
+
+def test_the_tool_takes_an_interval_repeat(tools, tk):
+    r = tools.call("set_reminder", {"when": "every 45 minutes", "text": "drink water"})
+    assert r.ok and ", every 45 minutes" in r.text
+    item = tk.list("reminder")[0]
+    assert item.repeat == "45m" and item.label == "drink water"
+    r = tools.call("set_reminder", {"when": "in 20 minutes", "text": "stand up",
+                                    "repeat": "every 30 minutes"})
+    assert r.ok and ", every 30 minutes" in r.text
+    by_label = {i.label: i.repeat for i in tk.list("reminder")}
+    assert by_label == {"drink water": "45m", "stand up": "30m"}

@@ -674,6 +674,77 @@ def test_i_am_free_pierces_a_focus_block():
     assert p.reason() == ""
 
 
+# -------------------------------------------------- nudges expire (n=24)
+def test_a_nudge_expires_instead_of_joining_the_digest():
+    """"Stand up, sir" read back after a two-hour meeting is noise, and
+    five of them is worse -- so a held nudge is dropped, not queued."""
+    p = _policy()
+    p.set_dnd(600)
+    assert p.hold("Sir, this is your reminder. Drink water.", "nudge") is False
+    assert p.hold("Sir, this is your reminder. Drink water.", "nudge") is False
+    assert p.held == []
+    assert p.hold("Sir, your lab report is due in three hours.", "reminder") is True
+    p.clock.tick(minutes=11)
+    text = p.tick()
+    assert "one reminder" in text and "drink water" not in text.lower()
+
+
+def test_a_nudge_never_eats_a_slot_in_the_capped_backlog():
+    p = _policy(hold_max=3)
+    p.set_dnd(600)
+    for i in range(10):
+        p.hold(f"nudge {i}", "nudge")
+    for i in range(3):
+        p.hold(f"warning {i}", "warning")
+    assert [t for _, t, _ in p.held] == ["warning 0", "warning 1", "warning 2"]
+
+
+def test_an_unheld_nudge_is_spoken_normally(monkeypatch):
+    """Expiry is a QUIET-hours rule, not a mute: with the window open the
+    nudge goes straight to the TTS like anything else."""
+    a = _app(monkeypatch, quiet=_policy())
+    a._say("Sir, this is your reminder. Drink water.", proactive=True, kind="nudge")
+    assert a.tts.spoken == ["Sir, this is your reminder. Drink water."]
+
+
+def test_the_status_line_says_expired_not_held(monkeypatch):
+    p = _policy()
+    p.set_dnd(600)
+    a = _app(monkeypatch, quiet=p)
+    seen = []
+    unsub = bus.subscribe(Status, seen.append)
+    try:
+        a._say("Drink water.", proactive=True, kind="nudge")
+        a._say("Memory is tight.", proactive=True, kind="warning")
+    finally:
+        bus.unsubscribe(Status, unsub)
+    kinds = [s.text.split(" ", 1)[0] for s in seen]
+    assert kinds == ["Expired", "Held"] and a.tts.spoken == []
+
+
+def test_timekeeper_tags_an_interval_reminder_as_a_nudge(tmp_path, monkeypatch):
+    """The whole chain: 'every 45 minutes' -> repeat '45m' -> kind 'nudge'
+    -> the quiet policy expires it."""
+    import jarvis.tools.timekeeper as tk_mod
+    monkeypatch.setattr(tk_mod, "_run", lambda argv, **kw: None)
+    calls = []
+
+    def say(text, proactive=False, kind=""):
+        calls.append((text, proactive, kind))
+    clock = Clock(NOON)
+    t = Timekeeper(tmp_path / "tk.db", say=say, cfg={}, now=clock.now, tick_s=0.01,
+                   ring=False, cache_dir=tmp_path / "cache", notify=False)
+    try:
+        t.add_reminder(clock.now() + 60, "drink water", repeat="45m")
+        t.add_reminder(clock.now() + 60, "call mum")
+        clock.tick(minutes=2)
+        t.tick()
+        flags = {kind: proactive for _, proactive, kind in calls}
+        assert flags == {"nudge": True, "reminder": True}
+    finally:
+        t.close()
+
+
 def test_real_app_asks_its_own_focus_session(build, monkeypatch):  # noqa: F811
     """The probe must be LATE-bound: app._make_quiet runs before
     _make_focus, so a policy holding the object itself would hold None."""
