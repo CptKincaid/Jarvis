@@ -1258,3 +1258,99 @@ print("missing:", cfg.missing_sections())
 import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •••
 EOF
 ```
+
+## 40. The room: display light, level and scenes
+
+There are no bulbs in this room, so the 43-inch panel is the light. Jarvis moves two
+things and says so honestly — *"Dimming the display, sir."* The screen dims; the room
+does not.
+
+- *"Dim it a little"* / *"dim the screen"* / *"lights down"* / *"it's too bright"* —
+  one step darker (0.15 of `xrandr --brightness`, an X **gamma scale**, not a backlight).
+- *"Brighter"* / *"brighten the display"* — one step back up.
+- *"Lights up"* / *"full brightness"* — everything back where you had it, in one word.
+- *"Warmer"* / *"warm the screen"* / *"night light on"* — GNOME's night light, forced on
+  whatever the hour; *"cooler"* / *"back to daylight"* walks it back.
+- *"Power down the workshop"* / *"lights out"* / *"call it a night"* — the **wind-down
+  scene**: screen warm and dim, Spotify paused, quiet hours armed, and a dry line.
+- *"Wake up the workshop"* / *"good morning"* / *"lights up"* — the reverse, every knob.
+
+The brightness floor is **0.55, never black**: Jarvis's own console lives on this panel,
+so blanking it would take the cards, the reactor and any alarm prompt with it. Nothing
+here touches DPMS or `xset`, which is also the answer to "what happens if a reminder
+fires while the room is down" — the panel is dimmed, not off, so the card is still
+readable. `ddcutil` (a real backlight) is not an option on this box: `/dev/i2c-*` is
+root-only and there is no `i2c` group at all.
+
+Everything is reversible, and the reversal is remembered on disk
+(`~/.aiws_trainer/jarvis_memory/room_state.json` and `scene_state.json`, written
+*before* the first change): Jarvis puts the display back at *"lights up"*, at **boot**
+(so a crash at 0.55 heals at the next start), at quit, and immediately if any command
+fails. Two ordering rules are load-bearing and are why this is a module rather than two
+one-liners: night light and `--brightness` are the **same knob** (both end up in the CRTC
+gamma ramp), so the night-light keys are written first and brightness is re-asserted
+after them; and `night-light-schedule-automatic` is `true` by default, so forcing warmth
+at three in the afternoon also means writing `automatic=false` plus a from/to window and
+restoring all three afterwards.
+
+Scenes are **data**. Edit `room.scenes` to add your own — the steps are `brightness`,
+`temperature`, `music` (`pause` / `resume`), `quiet_hours` and `say`, applied in order,
+and each one is reversed by *"good morning"*. A step that cannot run (no Spotify
+credentials, no display) is skipped and logged; the rest of the scene still applies.
+
+```json
+"room": {
+  "enabled": true,
+  "wind_down_on_goodnight": false,
+  "scenes": {
+    "wind down": [
+      {"do": "temperature", "kelvin": 2700},
+      {"do": "brightness", "level": 0.6},
+      {"do": "music", "action": "pause"},
+      {"do": "quiet_hours", "start": "22:00", "end": "07:00"},
+      {"do": "say", "line": "Powering down the workshop, sir."}
+    ]
+  }
+}
+```
+
+`wind_down_on_goodnight` is **off** by default: *"good night"* already has its own
+handler (the wind-down preview and tomorrow in one breath), and a scene is a change to
+your desktop you did not ask for by saying good night. Turn it on and *"good night"*
+runs the scene as well. `room.enabled: false` switches the spoken verbs off entirely,
+and `JARVIS_ROOM_CONTROL=0` in the environment blocks every real `xrandr` / `gsettings` /
+`pactl` call (the test suite sets it, because those commands act on your live session).
+
+## 41. The Room Mixer (music bows under his voice)
+
+While Jarvis speaks — and while he is listening — every stream on the box that is not
+his own slides down to 30 % over about 200 ms, and slides back afterwards. Nothing to
+configure to get it; it is on by default.
+
+Two reasons it is worth having, and the second is the better one: he can answer at
+conversational volume without shouting over the soundbar, and the microphone stops
+hearing the music, which measurably helps Whisper, the endpoint detector and the speaker
+gate.
+
+- `audio.duck` — `false` turns it off entirely.
+- `audio.duck_level` — the floor as a percentage of each stream's own volume (default
+  30, clamped to 5–95).
+- `audio.duck_ramp_ms` — how long the slide takes (default 200).
+
+```json
+"audio": {"duck": true, "duck_level": 30, "duck_ramp_ms": 200}
+```
+
+It only ever moves **individual streams** (`pactl set-sink-input-volume`), never the
+sink: the default sink here is the Bluetooth soundbar, which is where Jarvis's own voice
+comes out, so turning the sink down would turn him down with it. His own players are
+recognised by **process ID**, not by name — librespot pipes through `pacat` and so does
+`paplay`, so a name-based rule would either duck his voice or miss the music. That is
+also why the alarm never bows under the spoken alarm line.
+
+If the volume of a stream is ever left low by a Jarvis that died mid-sentence, the next
+start puts it back: PipeWire remembers written volumes by application name, so the mixer
+records what it moved before it moves it and heals it later — even a librespot restarted
+the following day. When Spotify is playing on your phone or another Connect device there
+is no local stream to duck, and the mixer stands down silently rather than pretending to
+work.
