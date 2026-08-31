@@ -1581,6 +1581,7 @@ TIER1_SAMPLES = {
     "leave time amend": "make that ten next time",
     "leave time query": "how long to wisenbaker",
     "greeting": "good morning",
+    "courtesy": "good night",
     "day review": "how did yesterday go",
     "list add": "add milk to the shopping list",
     "list read": "read my packing list",
@@ -1769,3 +1770,40 @@ def test_feedback_log_is_bounded(rich, tmp_path, monkeypatch):
     rich._feedback_line("the text", "the status", True, "card")
     lines = fl.read_text().splitlines()
     assert len(lines) == 1000 and '"how": "card"' in lines[-1]
+
+
+# ------------------------------------------ spoken "good night" (2026-08-31)
+# The hotword eats the wake word, so a courtesy arrives bare: strip_jarvis_prefix
+# returns None, the whole prefixed-registry pass is skipped, and the intent gate
+# called two words background chat and dropped the turn in silence. That left
+# the entire wind-down (music fade, screen dim, do-not-disturb) unreachable by
+# voice -- _h_courtesy on "goodnight" is its only call site. "good morning" was
+# never affected, because "greeting" was in ASSISTANT_TIER1 and "courtesy" was
+# not: the asymmetry is the whole bug.
+def test_the_intent_gate_alone_would_drop_a_spoken_good_night(tmp_path,
+                                                              monkeypatch):
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "l.json")
+    verdict, _conf = IntentClassifier().classify("good night")
+    assert verdict == IntentClassifier.NO         # why the bypass has to exist
+
+
+def test_a_spoken_good_night_reaches_the_wind_down(rich):
+    wd = MagicMock()
+    wd.start.return_value = True
+    rich.services.winddown = wd
+    res = rich.handle("good night", source="voice")
+    assert wd.start.called
+    assert res.handled and res.status != "Ignored (background chat)"
+
+
+def test_the_courtesy_bypasses_the_gate_by_name(rich):
+    """The bypass is a Tier-1 probe, so it is the same rung "good morning"
+    has always used -- and it must not swallow anything else."""
+    assert rich._match_assistant("good night") == "courtesy"
+    assert rich._match_assistant("thank you") == "courtesy"
+    assert rich._match_assistant("the roof is leaking") is None
+
+
+def test_a_spoken_thank_you_is_still_answered_not_dropped(rich):
+    res = rich.handle("thank you", source="voice")
+    assert res.status == "Courtesy" and res.speak

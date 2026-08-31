@@ -420,3 +420,75 @@ def test_scratch_that_by_voice_never_reaches_the_classifier(rich, monkeypatch):
     res = c.handle("scratch that", source="voice")
     svc.timekeeper.cancel.assert_called_once_with(which="tm-1", kind="timer")
     assert res.reply == "Timer scrapped, sir."
+
+
+# =========================================== compound turns (review 2026-08-31)
+# _try_multi runs two Tier-1 clauses in one turn, and it built its combined
+# CommandResult by hand -- copying reply/speak/status/done/ack and dropping
+# both clauses' undo closures, while the ONE _pending_destructive slot was
+# overwritten by whichever clause read back last. Two separate silent losses.
+def test_scratch_that_takes_back_a_whole_compound_turn(rich):
+    """Both halves come back, last thing created first."""
+    c, svc = rich
+    res = c.handle("set a timer for ten minutes and add milk to my todo list",
+                   source="typed")
+    assert res.handled and res.undo is not None
+    assert svc.notes.count("todo") == 1
+
+    res = c.handle("scratch that", source="typed")
+    svc.timekeeper.cancel.assert_called_once_with(which="tm-1", kind="timer")
+    assert svc.notes.count("todo") == 0
+    assert res.status == "Undone"
+    assert "Timer scrapped, sir." in res.reply
+
+
+def test_a_compound_does_not_leave_the_previous_turns_undo_armed(rich):
+    """The regression: a compound carried no undo, so handle() left the
+    PREVIOUS turn's closure armed for the rest of UNDO_WINDOW_S and
+    "scratch that" struck out the note from a turn ago while the two things
+    just created stayed."""
+    c, svc = rich
+    c.handle("take a note that the boiler is broken", source="typed")
+    assert svc.notes.count("note") == 1
+    c.handle("set a timer for ten minutes and add milk to my todo list",
+             source="typed")
+    c.handle("scratch that", source="typed")
+    assert svc.notes.count("note") == 1        # NOT what the undo was about
+    assert svc.notes.count("todo") == 0
+    svc.timekeeper.cancel.assert_called_once_with(which="tm-1", kind="timer")
+
+
+def test_a_compound_of_two_read_backs_asks_once_and_one_yes_runs_both(rich):
+    """Two clauses, one _pending_destructive slot: the second stash used to
+    discard the first, so the single "yes" cancelled the alarms and the
+    shopping list was never cleared -- with both questions read aloud."""
+    c, svc = rich
+    for item in ("milk", "eggs", "bread"):
+        svc.notes.add("list:shopping", item)
+    svc.timekeeper.list.return_value = [object(), object(), object()]
+    svc.timekeeper.cancel.return_value = 3
+
+    res = c.handle("clear the shopping list and cancel all the alarms",
+                   source="typed")
+    assert res.reply == ("Clear all three off your shopping list, sir? "
+                         "Cancel all three alarms, sir?")
+    assert svc.notes.count("list:shopping") == 3      # nothing done yet
+    svc.timekeeper.cancel.assert_not_called()
+
+    res = c.handle("yes", source="typed")
+    assert svc.notes.count("list:shopping") == 0
+    svc.timekeeper.cancel.assert_called_once_with("all", "alarm")
+    assert res.reply == "The shopping list is clear, sir. Cancelled 3, sir."
+
+
+def test_a_compound_that_ran_nothing_leaves_a_standing_question_alone(rich):
+    """_try_multi clears the slot to read each clause's stash; if no clause
+    ran it must put back whatever question was already on the table."""
+    c, svc = rich
+    stash = (lambda: None, "Cancel the timer, sir?", 0.0)
+    c._pending_destructive = stash
+    # both clauses are Tier-1 (so the split is taken) but the ladder hands
+    # back nothing for either
+    said = "clear the shopping list and cancel all the alarms"
+    assert c._try_multi(said, lambda part: None) is None
+    assert c._pending_destructive is stash

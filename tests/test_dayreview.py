@@ -368,3 +368,21 @@ def test_the_reviewer_thread_is_joinable_and_restartable(files):
     r.start()                                  # a fresh thread, cleared stop
     assert r._thread is not t1 and r._thread.is_alive()
     r.stop()
+
+
+def test_the_asides_counter_matches_a_line_repr_quoted_with_doubles():
+    """Regression: aside.py logs the spoken line with %r, and repr switches
+    to double quotes as soon as the text holds an apostrophe -- so a
+    counter anchored on `^aside: '` missed every possessive/contraction
+    aside and deflated only the volunteered half of the ratio the day
+    review prints beside "asides silenced"."""
+    rx = dict(dr.COUNTERS)["asides"]
+    plain = "aside: " + repr("the seminar is due at 5")
+    apostrophe = "aside: " + repr("Newton's laws quiz is due at 11:59 pm")
+    assert '"' in apostrophe and "'" in plain     # repr really does switch
+    assert rx.search(plain) and rx.search(apostrophe)
+    # ...and the sibling lines still belong to their own counters.
+    silenced = "aside: silenced for the day by " + repr("no more asides")
+    assert not rx.search(silenced)
+    assert dict(dr.COUNTERS)["asides_silenced"].search(silenced)
+    assert not rx.search("aside: quiet this turn (busy)")

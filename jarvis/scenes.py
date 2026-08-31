@@ -23,6 +23,16 @@ scene is a change to his desktop and he did not ask for one by saying good
 night.  The new spoken verbs are "power down the workshop", "lights down"
 and "lights up".
 
+More precisely, **there is exactly ONE owner per good night.**
+jarvis/winddown.py reaches for the same xrandr output, the same Spotify and
+the same quiet window, over a 60 s fade.  Run both and the scene's instant
+``pause`` lands a minute before the fade's last step -- the fade is
+defeated -- while the two snapshot the same brightness in whichever order
+the scheduler picks, so the loser records an already-dimmed screen as the
+level to go back to.  So: the commander runs the scene only when
+``WindDown.start()`` DECLINED the night, and ``apply()`` stands down here
+too whenever ``services.winddown.holding`` says the wind-down has the room.
+
 **The panel is never blanked.**  DPMS off would take Jarvis's own console
 with it -- the cards, the reactor, an alarm prompt -- so the down scene
 dims to ``room.MIN_BRIGHTNESS`` and stops.  Nothing here touches ``xset``.
@@ -62,9 +72,15 @@ CONFIG_KEY = "room.scenes"
 
 APPLIED_LINE = "Powering down the workshop, sir."
 RESTORED_LINE = "The workshop's back up, sir."
+# Half the reversal took. Never RESTORED_LINE: the legs that failed are kept
+# in the state file so the next "good morning" can finish the job, and
+# saying "the workshop's back up" over a still-paused stereo is the lie the
+# unconditional _save({}) used to tell.
+PARTLY_RESTORED_LINE = "I couldn't put all of it back, sir; I'll try again."
 NOTHING_TO_RESTORE_LINE = "Nothing to bring back, sir."
 UNKNOWN_LINE = "I've no scene by that name, sir."
 DISABLED_LINE = "The room controls are switched off, sir."
+WIND_DOWN_HELD_LINE = "The wind-down has the room, sir."
 
 STEPS = ("brightness", "temperature", "music", "quiet_hours", "say")
 _CLOCK_RX = re.compile(r"^(?P<h>\d{1,2}):(?P<m>\d{2})$")
@@ -246,6 +262,24 @@ class Scenes:
     def active(self) -> str:
         return str(self._load().get("name") or "")
 
+    def winddown_holds(self) -> bool:
+        """True while jarvis/winddown.py deliberately owns the room.
+
+        The other half of the ONE-owner rule in the module note. Read
+        through getattr so a box without winddown.py -- or an older one
+        with only ``active`` -- still answers."""
+        wd = self._svc("winddown")
+        if wd is None:
+            return False
+        try:
+            held = getattr(wd, "holding", None)
+            if held is None:
+                held = getattr(wd, "active", False)
+            return bool(held)
+        except Exception:  # noqa: BLE001 - a wind-down hiccup is not fatal
+            log.debug("scenes: wind-down state unreadable", exc_info=True)
+            return False
+
     # ------------------------------------------------------------- apply
     def apply(self, name: str = WIND_DOWN) -> SceneResult:
         with self._lock:
@@ -254,6 +288,12 @@ class Scenes:
             steps = self.steps(name)
             if not steps:
                 return SceneResult(name=name, line=UNKNOWN_LINE, ok=False)
+            if self.winddown_holds():
+                # ONE owner per night (see the module note): applying over a
+                # live wind-down defeats its fade and races its snapshot.
+                log.info("scene %r stood down: the wind-down has the room", name)
+                return SceneResult(name=name, line=WIND_DOWN_HELD_LINE,
+                                   failed=["winddown"], ok=False)
             res = SceneResult(name=name, line=scene_line(steps) or APPLIED_LINE)
             # Written BEFORE the first change: a crash halfway through must
             # still leave "good morning" something to reverse.
@@ -333,7 +373,12 @@ class Scenes:
 
     # ----------------------------------------------------------- restore
     def restore(self) -> SceneResult:
-        """"Good morning" / "lights up": every knob back where he had it."""
+        """"Good morning" / "lights up": every knob back where he had it.
+
+        A leg that did NOT come back stays in the state file (and costs the
+        result ``PARTLY_RESTORED_LINE``), so the next morning finishes the
+        job instead of the record being thrown away with the music still
+        paused and the scene's quiet window still written to config."""
         with self._lock:
             state = self._load()
             light_held = self.light is not None and self.light.changed
@@ -375,6 +420,28 @@ class Scenes:
                 except Exception:  # noqa: BLE001
                     log.exception("scene: quiet hours restore failed")
                     res.failed.append("quiet_hours")
-            self._save({})
-            log.info("scene %r restored: %s", res.name, ", ".join(res.applied))
+            # Only forget what actually came back. `_save({})` unlinks the
+            # file, so the old unconditional call destroyed the record of a
+            # leg that had NOT been reversed: a failed resume left the music
+            # genuinely paused, and a failed quiet write left the scene's
+            # 22:00-07:00 window persisted into assistant.json with his own
+            # window deleted alongside it -- with nothing left to undo
+            # either, and "The workshop's back up, sir." spoken over it.
+            keep: dict = {}
+            if "music" in res.failed and state.get("music"):
+                keep["music"] = state["music"]
+            if "quiet_hours" in res.failed and isinstance(prior, dict):
+                keep["quiet_hours_prior"] = prior
+            if keep:
+                # _load() requires a name, so the retry can find this at all.
+                keep["name"] = state.get("name") or res.name or WIND_DOWN
+                keep["t"] = state.get("t") or self._now()
+            if res.failed:
+                # The light keeps its own baseline (jarvis/room.py), so it
+                # needs no entry in `keep` -- but it still costs the line.
+                res.ok = False
+                res.line = PARTLY_RESTORED_LINE
+            self._save(keep)
+            log.info("scene %r restored: %s%s", res.name, ", ".join(res.applied),
+                     f" (failed: {', '.join(res.failed)})" if res.failed else "")
             return res

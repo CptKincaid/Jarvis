@@ -45,6 +45,7 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -374,6 +375,104 @@ class DebriefWatch:
                 log.exception("debrief tick failed")
             if self._stop.wait(INTERVAL_S):
                 return
+
+
+# --------------------------------------------- who owns the next words
+# The debrief is the ONE pending question hoisted ABOVE commander.handle:
+# app._dispatch runs _debrief_reply first, so unlike approvals, the quiz,
+# the read-backs and the leave-time answer -- which all queue behind each
+# other inside Commander._handle_inner, below _try_ringing -- the debrief
+# does not queue, it jumps. Two live failures came out of that seam, and
+# they are the same defect from two angles:
+#
+#   * an alarm ringing inside the 120 s debrief window swallowed the bare
+#     "stop": _try_ringing sits BELOW the debrief filter and "stop" is in
+#     no ASSISTANT_TIER1 matcher, so the escape hatch did not fire and the
+#     word was filed as how the midterm went while the alarm kept ringing;
+#   * a flashcard answer said mid-quiz was filed the same way, because the
+#     5-minute debrief tick and QuizSession's 300 s answer window overlap
+#     by design and nothing stopped the tick arming over a live question.
+#
+# So the debrief YIELDS. It refuses to arm while something else holds the
+# floor, and it stands down (WITHOUT clearing itself -- the question can
+# still be answered afterwards) when a holder appears mid-window.
+#
+# The predicate lives here rather than in app.py so the rule is testable
+# without a JarvisApp, and so it can name the holder: a question withheld
+# for an unnamed reason is a question that looks like a bug in the log.
+FLOOR_FREE = ""
+# Fallback only; the real window is commander.LEAVE_ANSWER_WINDOW_S, read
+# lazily below so this module keeps its one-way dependency on nothing.
+_LEAVE_WINDOW_S = 180.0
+
+
+def _leave_window() -> float:
+    try:
+        from jarvis.commander import LEAVE_ANSWER_WINDOW_S
+        return float(LEAVE_ANSWER_WINDOW_S)
+    except Exception:  # noqa: BLE001 - a partial import must not cost a turn
+        return _LEAVE_WINDOW_S
+
+
+def floor_holder(app) -> str:
+    """What already owns the next words, or "" when the floor is free.
+
+    Every probe is defensive by design: this runs both on the debrief's own
+    tick thread and inside the dispatch path, and a service that raises
+    must cost neither the question nor the turn.  A raising probe reads as
+    "free" -- the failure mode of a spurious hold is a debrief that never
+    gets asked at all, which is worse than one asked at a bad moment.
+    """
+    if app is None:
+        return FLOOR_FREE
+    # 1. A ringing alarm outranks every question in the app (spec 5.2 a):
+    #    the next word is "stop" or "snooze" and it must reach _try_ringing.
+    try:
+        tk = getattr(app, "timekeeper", None)
+        if tk is None:
+            tk = getattr(getattr(app, "services", None), "timekeeper", None)
+        if tk is not None and getattr(tk, "ringing", None):
+            return "a ringing alarm"
+    except Exception:  # noqa: BLE001 - a store hiccup is not a held floor
+        log.debug("debrief: ringing probe failed", exc_info=True)
+    # 2. "Was that for me?" is a yes/no already on the screen.
+    try:
+        if getattr(app, "_pending_uncertain", None):
+            return "the was-that-for-me prompt"
+    except Exception:  # noqa: BLE001
+        log.debug("debrief: uncertain probe failed", exc_info=True)
+    commander = getattr(app, "commander", None)
+    # 3. A working session (jarvis/dialogue.py) is a multi-turn floor: the
+    #    next utterance is its answer, not an exam post-mortem.
+    try:
+        session = getattr(commander, "_pending_session", None)
+        if session is not None and not getattr(session, "finished", False):
+            return "a working session"
+    except Exception:  # noqa: BLE001
+        log.debug("debrief: session probe failed", exc_info=True)
+    # 4. The leave-time question ("How long do you need to get to X, sir?")
+    #    is answered with a bare duration -- exactly the shape of a debrief
+    #    answer, so whichever filter runs first wins the wrong one.
+    try:
+        pend = getattr(commander, "_pending_leave", None)
+        if isinstance(pend, tuple) and len(pend) == 3:
+            if time.monotonic() - float(pend[2]) <= _leave_window():
+                return "the leave-time question"
+    except (TypeError, ValueError):
+        pass
+    except Exception:  # noqa: BLE001
+        log.debug("debrief: leave probe failed", exc_info=True)
+    # 5. Everything app.py already knows how to ask about: a live flashcard,
+    #    a destructive read-back inside its TTL, the wake-alarm offer. That
+    #    predicate is TTL-aware and exception-guarded internally; it was
+    #    wired into the mic window and never into the debrief gate.
+    try:
+        probe = getattr(app, "_question_open", None)
+        if callable(probe) and probe(commander):
+            return "an open question"
+    except Exception:  # noqa: BLE001
+        log.debug("debrief: open-question probe failed", exc_info=True)
+    return FLOOR_FREE
 
 
 # ------------------------------------------------------------- the filer

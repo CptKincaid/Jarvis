@@ -343,6 +343,14 @@ class Services:
     # last input at the desk, or None when nothing can see the keyboard.
     room_state: Optional[Callable] = None
     desk_idle_s: Optional[Callable] = None
+    # Alt+F4 / WM close on the Board. The app owns the BoardFeed (a 5 s poll
+    # that spawns nvidia-smi and walks tmux), so only the app can stop it —
+    # without this seam a WM close withdrew the window and left that thread
+    # running until quit, with "bring up the board" answering "Already up,
+    # sir." for a window nobody could see. app.ui_service_kwargs should wire
+    # this to JarvisApp._board_hide; build_ui_services drops it harmlessly
+    # while that side is unwired.
+    board_closed: Optional[Callable] = None
 
 
 # ------------------------------------------------------------------ tray
@@ -1371,11 +1379,36 @@ class MainWindow:
             log.info("board disabled by console.board")
             return None
         try:
-            self.board = BoardWindow(self.root, console_w=self.root.winfo_width())
+            self.board = BoardWindow(self.root,
+                                     console_w=self.root.winfo_width(),
+                                     on_close=self._board_closed)
         except tk.TclError:
             log.exception("board window could not be built")
             self.board = None
         return self.board
+
+    def _board_closed(self) -> None:
+        """WM close on the Board (Alt+F4). The window is already withdrawn;
+        this is the half only the app can do — stop the 5 s BoardFeed and
+        clear `_board_feed`, so the feed is not left spawning nvidia-smi for
+        an invisible window and "bring up the board" does not answer
+        "Already up, sir.".
+
+        No recursion: BoardWindow.hide() clears `_visible` BEFORE calling us,
+        so the BoardCommand(action="hide") the app publishes re-enters hide()
+        and returns immediately."""
+        fn = getattr(self.services, "board_closed", None)
+        if not callable(fn):
+            # Older/partial wiring: the commander-shaped services object
+            # carries the same teardown as services.board.hide.
+            fn = getattr(getattr(self.services, "board", None), "hide", None)
+        if not callable(fn):
+            log.warning("board WM close is unwired; its feed keeps polling")
+            return
+        try:
+            fn()
+        except Exception:
+            log.exception("board hide on WM close failed")
 
     def _ev_board(self, ev: BoardCommand):
         board = self._ensure_board()

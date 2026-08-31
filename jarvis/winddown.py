@@ -13,6 +13,15 @@ physical, on the three things Jarvis can already reach without sudo:
 "Good morning" -- and, failing that, the next app start after the window --
 puts all of it back.
 
+**This module owns "good night" whenever it is enabled.**  jarvis/scenes.py
+ships a "wind down" scene that reaches for the same xrandr output, the same
+Spotify and the same quiet window, and running both defeats the fade (the
+scene's instant pause lands 60 s before the fade's last step) while one of
+the two records the OTHER's already-dimmed screen as the level to restore.
+So the commander runs the scene only when ``start()`` declined, ``start()``
+stands down while a scene holds the room, and ``holding`` is the flag every
+other module asks before touching the light.
+
 **Everything is reversible and nothing is guessed.** The state that will be
 restored is snapshotted and written to disk BEFORE the first thing changes,
 so a crash mid-fade still restores; any failure in the desktop half restores
@@ -139,6 +148,12 @@ class WindDown:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # start() is asynchronous -- the snapshot and the state file are a
+        # worker away -- so a caller that asks "did the wind-down take the
+        # night?" one line later would race the thread and get False. This
+        # is raised synchronously inside start() and lowered as soon as the
+        # state file can answer for it.
+        self._pending = False
 
     # ------------------------------------------------------------ config
     def _svc(self, name):
@@ -162,6 +177,26 @@ class WindDown:
     @property
     def active(self) -> bool:
         return self._read_state() is not None
+
+    @property
+    def holding(self) -> bool:
+        """True while this wind-down deliberately owns the room.
+
+        Narrower than ``active``: a state file left by a restore that could
+        not reach the desktop, or one from some forgotten night, is NOT a
+        hold -- those must still heal. This is exactly "the window is still
+        open", the same decision ``restore(expired_only=True)`` makes, and
+        it is what jarvis/room.py's boot and quit heals and jarvis/scenes.py
+        ask before moving the same panel."""
+        if self._pending:
+            return True
+        state = self._read_state()
+        if state is None:
+            return False
+        now = self._now()
+        if now - float(state.get("at") or 0) > MAX_STATE_AGE_S:
+            return False                  # forgotten, not held
+        return now < float(state.get("until") or 0)
 
     # ------------------------------------------------------------- state
     def _read_state(self) -> Optional[dict]:
@@ -200,12 +235,21 @@ class WindDown:
 
         Nothing blocking happens here -- reading the screen costs an xrandr
         and the Spotify device costs a round trip, and the good-night line
-        should not wait for either. False when it is off or already wound
-        down."""
+        should not wait for either. False when it is off, already wound
+        down, or a room scene is already holding the same knobs -- the
+        caller uses that False to run the scene instead, so exactly one of
+        the two owns the night."""
         if not self.enabled:
             return False
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
+                return False
+            if self._scene_holds():
+                # A "power down the workshop" earlier in the evening already
+                # dimmed this panel through jarvis/scenes.py. Snapshotting
+                # now would record ITS dimmed screen as the brightness to go
+                # back to -- the same hazard as a second "good night".
+                log.info("wind-down: a scene already has the room; standing down")
                 return False
             if self._read_state() is not None:
                 # A second "good night". Snapshotting now would record the
@@ -214,10 +258,29 @@ class WindDown:
                 log.info("wind-down: already wound down; nothing to do")
                 return False
             self._stop.clear()
+            # Raised BEFORE the thread exists: the commander asks `holding`
+            # on the very next line to decide whether the scene should also
+            # run, and the worker has not snapshotted anything yet.
+            self._pending = True
             self._thread = threading.Thread(target=self._wind, daemon=True,
                                             name="winddown")
             self._thread.start()
         return True
+
+    def _scene_holds(self) -> bool:
+        """True while jarvis/scenes.py has a scene applied.
+
+        Read through getattr so a box without the scenes module (or an
+        older one) simply says no."""
+        scenes = self._svc("scenes")
+        active = getattr(scenes, "active", None)
+        if not callable(active):
+            return False
+        try:
+            return bool(active())
+        except Exception:  # noqa: BLE001 - a scene hiccup is not a bedtime
+            log.debug("wind-down: scene state unreadable", exc_info=True)
+            return False
 
     def _snapshot(self) -> dict:
         now = self._now()
@@ -243,6 +306,7 @@ class WindDown:
         Do-not-disturb first (it is instant and it is the half that must not
         wait for a fade), then the screen, then the slow music fade."""
         if self._stop.is_set():
+            self._pending = False
             return                        # the app quit between start and here
         try:
             state = self._snapshot()
@@ -250,7 +314,11 @@ class WindDown:
         except Exception:                 # noqa: BLE001 - no record, no changes
             log.exception("wind-down: nothing could be saved; not touching "
                           "the desktop")
+            self._pending = False
             return
+        # The state file can answer for the hold now, so the synchronous
+        # flag start() raised comes down.
+        self._pending = False
         try:
             self._arm_dnd(state)
             self._dim(state)
@@ -340,7 +408,13 @@ class WindDown:
         """Put the screen (and the volume) back. Idempotent: no state means
         nothing to undo. `expired_only` is app startup's -- a restart at two
         in the morning must not brighten the room, but a restart after the
-        window, or with a state file from some forgotten night, must."""
+        window, or with a state file from some forgotten night, must.
+
+        True ONLY when the desktop actually came back. False covers three
+        honest cases -- nothing to restore, still inside the window, and a
+        put-back that failed -- and the snapshot survives all three, so the
+        caller may always ask again. `holding` is what separates "declined,
+        still held" from "tried and failed"."""
         with self._lock:
             state = self._read_state()
             if state is None:
@@ -352,14 +426,24 @@ class WindDown:
                 log.info("wind-down: still inside its window; leaving the "
                          "screen as it is")
                 return False
+            # Every desktop result is BOUND, not discarded. Both setters
+            # return _run's success flag, and throwing it away meant a
+            # restore against a dead X (app start before the session is up,
+            # an output renamed since last night, no gsettings) deleted the
+            # only record of his brightness and reported success -- leaving
+            # the screen held dim with nothing left to put it back.
+            failed: dict = {}
             for output, value in (state.get("brightness") or {}).items():
                 try:
-                    set_brightness(output, max(0.0, min(1.0, float(value))))
+                    level = max(0.0, min(1.0, float(value)))
                 except (TypeError, ValueError):
-                    set_brightness(output, 1.0)
+                    level = 1.0
+                if not set_brightness(output, level):
+                    failed[output] = value
+            night_ok = True
             was = state.get("night_light")
             if was is not None and bool(self._cfg("night_light", True)):
-                set_night_light(bool(was))
+                night_ok = set_night_light(bool(was))
             volume = state.get("volume")
             spotify = self._svc("spotify")
             if spotify is not None and volume is not None:
@@ -368,7 +452,28 @@ class WindDown:
                 except Exception as exc:  # noqa: BLE001 - SpotifyError or worse
                     log.info("wind-down: volume not restored: %s",
                              getattr(exc, "text", exc))
+            if failed or not night_ok:
+                # KEEP the snapshot -- pruned to the legs that did not come
+                # back, so the retry is minimal and cannot drift -- and say
+                # so. "Good morning" and the next app start both call this
+                # again; a forgotten record is the one unrecoverable state.
+                keep = dict(state)
+                keep["brightness"] = failed
+                keep["volume"] = None     # the volume is back, or gone for good
+                if night_ok:
+                    keep.pop("night_light", None)
+                try:
+                    self._write_state(keep)
+                except Exception:         # noqa: BLE001 - the old file stands
+                    log.debug("wind-down: pruned state not written",
+                              exc_info=True)
+                log.warning("wind-down: the desktop did not come back (%s); "
+                            "keeping the record so the next start retries",
+                            ", ".join(sorted(failed)) or "night light")
+                self._pending = False
+                return False
             self._clear_state()
+            self._pending = False
         log.info("wind-down: restored")
         return True
 
@@ -378,6 +483,7 @@ class WindDown:
         (a quit at midnight must not light the room), and the state file
         stays so the next start or "good morning" puts it back."""
         self._stop.set()
+        self._pending = False             # the state file speaks from here on
         thread, self._thread = self._thread, None
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=2)
@@ -398,9 +504,18 @@ def main(argv=None) -> int:
     state = wd._read_state()
     if args.restore:
         # No config here, so night_light() decides for itself and the
-        # brightness in the file is authoritative.
-        print("restored" if wd.restore() else "nothing to restore")
-        return 0
+        # brightness in the file is authoritative. This is the door most
+        # likely to be used from a TTY with no DISPLAY, so the three
+        # outcomes are told apart rather than all printed as success.
+        if wd.restore():
+            print("restored")
+            return 0
+        if state is None:
+            print("nothing to restore")
+            return 0
+        print("NOT restored: the desktop would not take it (is DISPLAY set?)."
+              "\nThe snapshot has been kept; try again with a session up.")
+        return 1
     print(json.dumps(state, indent=2) if state else "no wind-down is active")
     print(f"screen: {screen_brightness()}  night light: {night_light()}")
     if not args.status:

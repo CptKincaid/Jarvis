@@ -371,3 +371,145 @@ def test_no_display_is_admitted_rather_than_faked(tmp_path, monkeypatch):
     services.room_light, services.scenes = light, sc
     res = Commander(services).handle("dim it a little", source="voice")
     assert res.reply == room.NO_DISPLAY_LINE
+
+
+# --------------------------------------------- a restore that half failed
+def test_a_failed_resume_keeps_the_scene_state_and_stops_claiming_success(tmp_path):
+    """The regression: restore() recorded the failure in res.failed and then
+    called _save({}) -- which UNLINKS the file -- outside any success check,
+    while still answering RESTORED_LINE. The music really is still paused
+    (state["music"] is only written when the pause took), so that deleted
+    the one record that could ever resume it."""
+    spotify = FakeSpotify()
+    sc, services, _ = make(tmp_path, spotify=spotify)
+    sc.apply()
+    assert sc.active() == scenes.WIND_DOWN
+    spotify.boom = True                       # Spotify falls over overnight
+    res = sc.restore()
+    assert "music" in res.failed and res.ok is False
+    assert res.line == scenes.PARTLY_RESTORED_LINE, "do not claim a clean restore"
+    assert sc.active() == scenes.WIND_DOWN, "the morning must keep something to retry"
+
+    spotify.boom = False                      # ...and the retry finishes it
+    res = sc.restore()
+    assert res.ok and res.line == scenes.RESTORED_LINE
+    assert spotify.calls[-1] == "resume" and sc.active() == ""
+
+
+def test_a_failed_quiet_write_keeps_the_window_he_had(tmp_path):
+    """quiet.set_hours persists to assistant.json, so a failed restore left
+    the scene's 22:00-07:00 window written there with his own deleted."""
+    class Flaky(FakeQuiet):
+        boom = False
+
+        def set_hours(self, start, end):
+            if self.boom:
+                raise RuntimeError("config is read-only")
+            super().set_hours(start, end)
+
+    quiet = Flaky()
+    sc, _, _ = make(tmp_path, quiet=quiet,
+                    cfg={"quiet.hours": {"start": "23:30", "end": "06:30"}})
+    sc.apply()
+    quiet.boom = True
+    res = sc.restore()
+    assert "quiet_hours" in res.failed and not res.ok
+    kept = sc._load()
+    assert kept["quiet_hours_prior"] == {"start": "23:30", "end": "06:30"}
+    assert kept["name"] == scenes.WIND_DOWN, "_load needs a name to find it"
+
+    quiet.boom = False
+    assert sc.restore().ok
+    assert quiet.hours[-1] == ((23, 30), (6, 30))
+    assert sc.active() == ""
+
+
+def test_a_clean_restore_still_forgets_everything(tmp_path):
+    sc, _, _ = make(tmp_path)
+    sc.apply()
+    res = sc.restore()
+    assert res.ok and res.line == scenes.RESTORED_LINE
+    assert not (tmp_path / "scene.json").exists()
+
+
+# ------------------------------------------- one owner per "good night"
+def _winddown(tmp_path, services, monkeypatch, **cfg):
+    """A REAL jarvis.winddown.WindDown on the same services namespace the
+    app gives it, with its one subprocess seam stubbed."""
+    import jarvis.winddown as wd_mod
+
+    def fake_run(argv, timeout=5.0):
+        if argv[0] == "xrandr" and "--verbose" in argv:
+            return True, ("HDMI-0 connected primary 3840x2160+0+0 normal\n"
+                          "\tBrightness: 1.0\n")
+        return True, "false\n"
+
+    monkeypatch.setattr(wd_mod, "_run", fake_run)
+    wd = wd_mod.WindDown(services, state_path=tmp_path / "winddown.json")
+    services.winddown = wd
+    return wd
+
+
+def test_the_wind_down_and_the_scene_never_both_take_the_night(tmp_path,
+                                                               monkeypatch):
+    """ONE owner. jarvis/winddown.py fades Spotify to nothing over 60 s and
+    only THEN pauses; the scene pauses instantly. With both switched on the
+    scene's pause used to land a minute before the fade's first step --
+    deterministically defeating the fade the user configured -- and the two
+    modules raced to snapshot the same xrandr brightness into two separate
+    state files, so the loser recorded an already-dimmed screen as the
+    level to restore."""
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "intent.json")
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    sc, services, light = make(tmp_path, cfg={
+        "room.wind_down_on_goodnight": True,
+        "wind_down.enabled": True, "wind_down.fade_s": 60})
+    services.desktop = MagicMock()
+    services.desktop.parse_action = lambda part: None
+    services.room_light, services.scenes = light, sc
+    wd = _winddown(tmp_path, services, monkeypatch)
+    try:
+        res = Commander(services).handle("jarvis good night", source="voice")
+        assert wd.holding is True, "the wind-down took the night"
+        # ...so the scene stood down: no instant pause over the fade, and no
+        # second snapshot of the same brightness.
+        assert services.spotify.calls == []
+        assert sc.active() == ""
+        assert not (tmp_path / "scene.json").exists()
+        assert "Powering down" not in (res.reply or "")
+    finally:
+        wd.stop()
+
+
+def test_the_scene_still_runs_when_the_wind_down_is_switched_off(tmp_path,
+                                                                monkeypatch):
+    """The other half of the rule: exactly ONE of the two, never neither."""
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "intent.json")
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    sc, services, light = make(tmp_path, cfg={
+        "room.wind_down_on_goodnight": True, "wind_down.enabled": False})
+    services.desktop = MagicMock()
+    services.desktop.parse_action = lambda part: None
+    services.room_light, services.scenes = light, sc
+    wd = _winddown(tmp_path, services, monkeypatch)
+    try:
+        res = Commander(services).handle("jarvis good night", source="voice")
+        assert sc.active() == scenes.WIND_DOWN
+        assert services.spotify.calls == ["pause"]
+        assert res.reply.startswith("Powering down")
+    finally:
+        wd.stop()
+
+
+def test_an_explicit_scene_over_a_live_wind_down_is_refused_out_loud(tmp_path,
+                                                                    monkeypatch):
+    sc, services, _ = make(tmp_path, cfg={"wind_down.enabled": True})
+    wd = _winddown(tmp_path, services, monkeypatch)
+    try:
+        assert wd.start() is True
+        res = sc.apply()
+        assert not res.ok and res.failed == ["winddown"]
+        assert res.line == scenes.WIND_DOWN_HELD_LINE
+        assert services.spotify.calls == [] and sc.active() == ""
+    finally:
+        wd.stop()

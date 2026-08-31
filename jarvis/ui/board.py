@@ -273,7 +273,13 @@ class BoardWindow:
         except tk.TclError:
             log.debug("board withdraw on a dead window", exc_info=True)
         if callable(self.on_close):
-            self.on_close()
+            # Callback boundary: on_close reaches back into the app to stop
+            # the 5 s BoardFeed. A raise here would escape into Tk's
+            # WM_DELETE_WINDOW handler and leave the board half-closed.
+            try:
+                self.on_close()
+            except Exception:               # noqa: BLE001 - callback boundary
+                log.exception("board on_close failed")
 
     def destroy(self):
         bus.unsubscribe(BoardUpdate, self._on_update)

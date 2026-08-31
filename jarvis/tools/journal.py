@@ -243,8 +243,6 @@ def digest(rows, label="today", max_chars=DIGEST_CHARS) -> str:
 # last time you met her".  The wording below says "you said" / "you had X
 # open" for exactly that reason.
 MENTION_KEEP_DAYS = DEFAULT_KEEP_DAYS
-_ORDINAL_SUFFIX = {1: "st", 2: "nd", 3: "rd", 21: "st", 22: "nd", 23: "rd",
-                   31: "st"}
 # Leading words that are the question's grammar, not the thing looked for:
 # "when did I last talk to my advisor" searches for "my advisor".
 _MENTION_VERB_RX = re.compile(
@@ -395,10 +393,6 @@ def _part_of_day(when: datetime) -> str:
     return "evening"
 
 
-def _ordinal(n: int) -> str:
-    return f"{n}{_ORDINAL_SUFFIX.get(n, 'th')}"
-
-
 def when_words(when: datetime, now: Optional[datetime] = None) -> str:
     """'this afternoon' / 'yesterday evening' / 'Tuesday afternoon' /
     'last Tuesday' / 'on the 3rd of August'.  Spoken words, no digits
@@ -533,6 +527,15 @@ CONTINUITY_RULE = ("Those counts are background: let them colour the reply, "
 
 
 def _ordinal(n: int) -> str:
+    """"41" -> "41st".  THE ONLY _ordinal in this module.
+
+    A second, table-driven copy used to sit above ``when_words`` and was
+    silently shadowed by this one (the fourth shadowed-def merge seam on
+    this branch), leaving its ``_ORDINAL_SUFFIX`` table unreachable.  The
+    table only knew 1-31, so had the shadowing ever gone the other way
+    ``_tool_clause`` -- which passes an unbounded repeat count -- would
+    have said "32th".  Keep one definition; ``test_journal`` asserts it.
+    """
     suffix = "th" if 10 <= n % 100 <= 20 else \
         {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
     return f"{n}{suffix}"

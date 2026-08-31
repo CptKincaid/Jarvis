@@ -1670,3 +1670,140 @@ def test_the_two_calendar_watches_are_started_and_joined(app):
     assert not app.calwatch._thread.is_alive()
     assert app.leavetime._thread is None or not app.leavetime._thread.is_alive()
     assert not app.desk.running
+
+
+# ------------------- 21. the greeter, the desk seam, and the 5 s probes
+#
+# Regression sites, all four found by review after the arrival/desk merge:
+# the shared greeter was deleted while a caller still named it, the
+# desk-idle seam was read off the wrong object in two places, and both 5 s
+# providers paid for a network / nvidia-smi round trip they already had.
+def test_a_desk_return_is_actually_greeted(app):
+    """`_on_desk` called `self._greet_return`, which the arrival rework had
+    deleted: every desk return raised AttributeError inside the bus
+    subscriber (swallowed there), so the room stayed silent."""
+    from jarvis.events import DeskState
+    from jarvis.presence import WELCOME_LINE
+    _quiet_open(app)
+    bus.publish(DeskState(at_desk=True, idle_s=1.0, returned=True))
+    bus.drain()
+    assert app.tts.spoken.count(WELCOME_LINE) == 1
+
+
+def test_the_phone_path_honours_the_greeting_damper_too(app):
+    """The damper is shared or it is nothing: `_on_presence` greeted
+    without consulting `_last_greeted`, so two returned events inside
+    GREET_DAMPER_S said "Welcome back, sir" twice."""
+    from jarvis.events import Presence
+    from jarvis.presence import WELCOME_LINE
+    _quiet_open(app)
+    bus.publish(Presence(home=True, returned=True))
+    bus.drain()
+    bus.publish(Presence(home=True, returned=True))
+    bus.drain()
+    assert app.tts.spoken.count(WELCOME_LINE) == 1
+    assert app._last_greeted > 0.0          # the damper was actually stamped
+
+
+def test_a_return_after_the_damper_is_greeted_again(app):
+    """The damper suppresses the SECOND probe on one walk through the
+    door, not the next time he comes home."""
+    from jarvis.events import DeskState
+    from jarvis.presence import WELCOME_LINE
+    _quiet_open(app)
+    bus.publish(DeskState(at_desk=True, idle_s=1.0, returned=True))
+    bus.drain()
+    app._last_greeted = time.monotonic() - app_mod.GREET_DAMPER_S - 1.0
+    bus.publish(DeskState(at_desk=True, idle_s=1.0, returned=True))
+    bus.drain()
+    assert app.tts.spoken.count(WELCOME_LINE) == 2
+
+
+def test_the_power_up_sweep_applies_the_overnight_gap_gate(app):
+    """`_maybe_power_up` probed `getattr(self, "desk_idle_s")` — a name the
+    app has never had — so `idle` was always None and the "left alone for
+    gap_h hours" gate was skipped on every box."""
+    from jarvis.events import PowerUp
+    seen = []
+    bus.subscribe(PowerUp, seen.append)
+    try:
+        app.desk.last_idle = 600.0             # ten minutes: not a night
+        assert app._maybe_power_up("hotword") is False
+        assert seen == []
+        app.desk.last_idle = 8 * 3600.0        # a night
+        assert app._maybe_power_up("hotword") is True
+    finally:
+        bus.unsubscribe(PowerUp, seen.append)
+    assert len(seen) == 1 and round(seen[0].gap_h) == 8
+
+
+def test_the_console_is_handed_the_live_desk_probe(app, monkeypatch):
+    """`ui_service_kwargs` passed `getattr(self, "desk_idle_s", None)` —
+    always None — so console_mode.resolve_idle_fn fell through to its
+    XScreenSaver probe and the console's idle clock diverged from the
+    app's."""
+    monkeypatch.delenv("JARVIS_DESK_PRESENCE", raising=False)
+    assert app.desk.enabled
+    fn = app.ui_service_kwargs()["desk_idle_s"]
+    assert callable(fn)
+    app.desk.last_idle = 42.0
+    assert fn() == 42.0
+
+
+def test_a_switched_off_sentinel_leaves_the_console_its_own_probe(app):
+    """A disabled sentinel answers None forever and resolve_idle_fn takes
+    ANY callable: handing it over would kill the console's fallback, so the
+    seam is None (conftest forces JARVIS_DESK_PRESENCE=0 for the suite)."""
+    assert not app.desk.enabled
+    assert app.ui_service_kwargs()["desk_idle_s"] is None
+
+
+def test_an_empty_canvas_answer_is_cached_like_any_other(app, monkeypatch):
+    """The TTL tested the payload, not the timestamp, so "nothing due" —
+    which has already paid for the REST call — re-fetched on every 5 s
+    Board tick, ~720 round trips an hour."""
+    calls = []
+
+    def fake_due(registry):
+        calls.append(1)
+        return []
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines", fake_due)
+    assert app._board_canvas_lines() == []
+    app._board_canvas_lines()
+    app._board_canvas_lines()
+    assert calls == [1]
+
+
+def test_the_slab_takes_the_gpu_reading_the_probe_already_has(app, monkeypatch):
+    """room_state() ran health.snapshot(gpu=True) — a second nvidia-smi
+    plus two /proc walks — on the very pass that had just forked
+    nvidia-smi for the temps row."""
+    from jarvis.tools import health
+    snaps, smis = [], []
+    monkeypatch.setattr(health, "snapshot",
+                        lambda *a, **kw: snaps.append(1))
+    monkeypatch.setattr(health, "run_nvidia_smi",
+                        lambda *a, **kw: (smis.append(1), "40, 2400, 90, 55")[1])
+    assert app.room_state(gpu_pct=42)["gpu"] == pytest.approx(0.42)
+    assert snaps == [] and smis == []        # the caller's number, no fork
+    assert app.room_state()["gpu"] == pytest.approx(0.55)
+    app.room_state()
+    assert snaps == [] and smis == [1]       # cached, and never the snapshot
+
+
+def test_a_quiet_hours_panel_does_not_arm_the_greeting_damper(app):
+    """A deferred arrival is panel-only (arrival.arrival_plan): nothing was
+    said, so the damper must not swallow the greeting the policy lifts into
+    minutes later."""
+    from jarvis.events import Presence
+    from jarvis.presence import WELCOME_LINE
+    app.quiet.reason = lambda *a, **kw: "quiet hours until 7:00 am"
+    app.quiet.release = lambda *a, **kw: ""
+    bus.publish(Presence(home=True, returned=True))
+    bus.drain()
+    assert WELCOME_LINE not in app.tts.spoken
+    assert app._last_greeted == 0.0
+    _quiet_open(app)
+    bus.publish(Presence(home=True, returned=True))
+    bus.drain()
+    assert app.tts.spoken.count(WELCOME_LINE) == 1

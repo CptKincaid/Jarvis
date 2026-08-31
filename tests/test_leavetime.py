@@ -9,10 +9,13 @@ off it.
 from __future__ import annotations
 
 import json
+import time
+import types
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from jarvis import commander
 from jarvis import leavetime as lt_mod
 from jarvis.commander import (ASSISTANT_TIER1, LEAVE_ANSWER_WINDOW_S,
                               LEAVE_DROPPED_LINE, REGISTRY, Commander,
@@ -408,9 +411,12 @@ def test_teaching_by_voice_stores_the_walk(tmp_path):
 
 
 def test_make_that_ten_next_time_edits_the_last_building(tmp_path):
+    """Taught by voice, then amended in the same breath -- the amend only
+    reaches back over a building THIS conversation named (see
+    test_a_stale_last_key_is_never_amended)."""
     w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
-    w.learn("Wisenbaker Engineering Bldg", 12)
     c = _commander(w)
+    c.handle("it takes twelve minutes to get to wisenbaker", source="voice")
     res = c.handle("make that ten next time", source="voice")
     assert res.handled and w.table.get("Wisenbaker Engineering Bldg") == 10
 
@@ -488,4 +494,178 @@ def test_the_question_expires(tmp_path, monkeypatch):
     key, place, ts = c._pending_leave
     c._pending_leave = (key, place, ts - LEAVE_ANSWER_WINDOW_S - 1)
     assert c._try_leave_answer("twelve minutes") is None
+    assert c._pending_leave is None
+
+
+# ----------------------------------------------------- forgetting a walk
+# A walk is taught from a half-heard spoken number, so a wrong one is
+# routine. FORGOT_LINE and LeadTable.forget() shipped with no matcher and
+# no command at all, which made a mistaught lead unrevocable by voice.
+@pytest.mark.parametrize("text,place", [
+    ("forget the walk to Wisenbaker", "Wisenbaker"),
+    ("Forget the walk to the ETB.", "the ETB"),
+    ("forget the drive to Zachry", "Zachry"),
+    ("forget how long to Wisenbaker", "Wisenbaker"),
+    ("forget how long it takes to get to Zachry", "Zachry"),
+])
+def test_the_forget_matcher_names_the_building(text, place):
+    assert lt_mod.leave_forget_kind(text) == place
+
+
+@pytest.mark.parametrize("text", [
+    "forget it", "forget that", "scratch that", "forget the last one",
+    "forget what you filed", "never mind", "how long to Wisenbaker",
+    "it takes ten minutes to get to Wisenbaker",
+])
+def test_the_forget_matcher_leaves_every_other_dismissal_alone(text):
+    """The bare undo words belong to _UNDO_RX and the no-phrases; a matcher
+    that swallowed them would eat every dismissal in the app."""
+    assert lt_mod.leave_forget_kind(text) is None
+
+
+def test_forgetting_drops_the_walk_and_re_arms_the_ask(tmp_path):
+    """LeadTable.forget() alone leaves the building unknown AND unaskable:
+    `_asked` is what stops the proactive question from ever firing twice,
+    so the walk could never be re-learned in passing."""
+    asked = []
+    table = LeadTable(FakeMemory())
+    table.set("Wisenbaker Engineering Bldg", 12)
+    w = _watch([event(8, LIVE_LOCATIONS[0])], tmp_path, table=table,
+               ask=lambda key, place: (asked.append(key), True)[1])
+    w.tick()
+    assert asked == []                          # known walks are never asked about
+    w.forget("Wisenbaker Engineering Bldg")
+    assert table.get("Wisenbaker Engineering Bldg") is None
+    assert "Wisenbaker Engineering Bldg" not in w._asked
+    w2 = _watch([event(8, LIVE_LOCATIONS[0])], tmp_path, table=table,
+                ask=lambda key, place: (asked.append(key), True)[1])
+    assert w2._asked == {}                      # survives the restart, too
+    w2.tick()
+    assert asked == ["Wisenbaker Engineering Bldg"]
+
+
+def test_nothing_else_in_the_registry_claims_forget_the_walk():
+    """Guard for the pending wiring: "forget the walk to X" must reach the
+    leave-time door, not the garden undo, the undo window or the generic
+    "forget it" dismissal."""
+    from jarvis.commander import parse_yes_no, undo_kind
+    text = "forget the walk to wisenbaker"
+
+    def _hit(cmd):
+        if cmd.matcher(text) is True:
+            return False                        # the catch-all handlers self-select
+        try:
+            return bool(cmd.matcher(text))
+        except Exception:                       # noqa: BLE001 - a picky matcher
+            return False
+    hits = {cmd.name for cmd in REGISTRY if _hit(cmd)}
+    assert hits <= {"leave time forget"}, f"claimed by {sorted(hits)}"
+    assert not undo_kind(text) and parse_yes_no(text) is None
+    # ...and the three existing leave-time matchers keep their hands off it.
+    assert leave_set_kind(text) is None and leave_query_kind(text) is None
+    assert leave_amend_kind(text) is None
+
+
+# ------------------------------------------- the amend's recency window
+# "make that ten" carries no building of its own: it amends LeaveTimes.last_key,
+# which is RESTORED FROM DISK at construction and is also re-pointed by the
+# background reminder tick and by _maybe_ask, neither of which is a user turn.
+# Without a window, a bare "make it twenty" said after a timer -- or on a fresh
+# boot -- silently rewrote a stored walk for a building last touched days ago.
+def test_a_stale_last_key_is_never_amended(tmp_path):
+    """A disk-loaded last_key is not a subject: nothing was said about it."""
+    (tmp_path / "leave.json").write_text(
+        json.dumps({"last_key": "Wisenbaker Engineering Bldg"}))
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    w.table.set("Wisenbaker Engineering Bldg", 12)
+    assert w.last_key == "Wisenbaker Engineering Bldg"      # loaded, not spoken
+    c = _commander(w)
+    c.handle("make it twenty", source="voice")
+    assert w.table.get("Wisenbaker Engineering Bldg") == 12  # untouched
+
+
+def test_a_background_tick_repointing_the_key_does_not_arm_the_amend(tmp_path):
+    """leavetime._file_reminder / _maybe_ask call note_key from a thread with
+    no user turn behind it. That must not make "make it twenty" mean that
+    building."""
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    w.table.set("Zachry Engineering Ed. Complex", 9)
+    c = _commander(w)
+    w.note_key("Zachry Engineering Ed. Complex")            # the tick, not him
+    c.handle("make it twenty", source="voice")
+    assert w.table.get("Zachry Engineering Ed. Complex") == 9
+
+
+def test_asking_how_long_arms_the_amend_that_follows(tmp_path):
+    """The query names the building out loud, so the amend right after it is
+    plainly about that one."""
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    w.table.set("Wisenbaker Engineering Bldg", 12)
+    c = _commander(w)
+    c.handle("how long to wisenbaker", source="voice")
+    res = c.handle("make that ten next time", source="voice")
+    assert res.handled and w.table.get("Wisenbaker Engineering Bldg") == 10
+
+
+def test_the_amend_window_expires(tmp_path, monkeypatch):
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    c = _commander(w)
+    c.handle("it takes twelve minutes to get to wisenbaker", source="voice")
+    c._leave_touch -= commander.LEAVE_AMEND_WINDOW_S + 1
+    c.handle("make that ten next time", source="voice")
+    assert w.table.get("Wisenbaker Engineering Bldg") == 12
+
+
+def test_a_leavetime_last_touch_stamp_is_honoured_if_the_store_grows_one(tmp_path):
+    """Seam for jarvis/leavetime.py: the store sees the touches the commander
+    never handles (an answered heads-up filed from the tick). If it ever
+    stamps its own monotonic last_touch, that counts too."""
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    w.table.set("Wisenbaker Engineering Bldg", 12)
+    w.note_key("Wisenbaker Engineering Bldg")
+    c = _commander(w)
+    c.handle("make that ten next time", source="voice")
+    assert w.table.get("Wisenbaker Engineering Bldg") == 12   # no stamp: refused
+    w.last_touch = time.monotonic()
+    c.handle("make that ten next time", source="voice")
+    assert w.table.get("Wisenbaker Engineering Bldg") == 10
+
+
+# --------------------------------------- one question on the table at a time
+# _try_leave_answer is the LAST pending rung, so a duration said while a quiz
+# or a working session is open is graded as THAT answer -- a flashcard marked
+# wrong and the walk never learned. Worse, leavetime._maybe_ask burns its
+# once-ever ask the moment the asker returns True, so the collision spent the
+# question for good rather than delaying it.
+def _open_session():
+    return types.SimpleNamespace(finished=False, stale=lambda: False,
+                                 name="week plan")
+
+
+def test_a_leave_question_is_not_armed_while_a_session_is_open(tmp_path):
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    c = _commander(w)
+    c._pending_session = _open_session()
+    assert c.question_open() is True
+    assert c.ask_leave_time("Wisenbaker Engineering Bldg", "Wisenbaker") is False
+    assert c._pending_leave is None
+
+
+def test_a_leave_question_is_armed_when_the_floor_is_free(tmp_path):
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    c = _commander(w)
+    assert c.ask_leave_time("Wisenbaker Engineering Bldg", "Wisenbaker") is True
+    assert c._pending_leave[0] == "Wisenbaker Engineering Bldg"
+    res = c.handle("about twelve minutes", source="voice")
+    assert res.handled and w.table.get("Wisenbaker Engineering Bldg") == 12
+
+
+def test_the_query_does_not_ask_back_when_another_question_owns_the_floor(tmp_path):
+    """Asking a question nothing is listening for is the dead end this repo
+    has been bitten by before: say what he asked and stop."""
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    c = _commander(w)
+    c._pending_session = _open_session()
+    res = _h_of("leave time query")(c, "how long to wisenbaker", "wisenbaker")
+    assert res.reply == lt_mod.UNKNOWN_LINE
     assert c._pending_leave is None

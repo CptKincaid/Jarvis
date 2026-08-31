@@ -48,6 +48,7 @@ Four decisions worth knowing about, all made against the corrections:
 """
 from __future__ import annotations
 
+import importlib
 import math
 import threading
 import time
@@ -315,24 +316,36 @@ def resolve_idle_fn(services=None) -> Optional[Callable]:
     """The desk-idle provider, in preference order:
 
       1. `services.desk_idle_s` — the seam the desk-presence group exposes
-      2. `jarvis.desk.desk_idle_s` — the same module, imported directly
-      3. the XScreenSaver probe above
+      2. `jarvis.deskpresence.desk_idle_s` — the gdbus probe, imported direct
+      3. `jarvis.desk.idle_seconds` — the X/turn-ledger probe, same idea
+      4. the XScreenSaver probe above
 
     getattr/ImportError defensively at every step so this lands whichever
     order the two changes merge in, and so a box without either still gets
-    a room clock."""
+    a room clock.
+
+    REGRESSION SITE: step 2 used to read `desk_idle_s` off `jarvis.desk`,
+    which exports `idle_seconds` and has never had that name — the probe
+    called `desk_idle_s` lives in `jarvis.deskpresence`. Both documented
+    preferences were therefore dead and every standby decision silently
+    fell through to XScreenSaver. Each candidate below is named after the
+    module that actually exports it; keep them that way."""
     fn = getattr(services, "desk_idle_s", None)
     if callable(fn):
         return fn
-    try:
-        from jarvis import desk as desk_mod       # may not exist yet
-        fn = getattr(desk_mod, "desk_idle_s", None)
+    for mod_name, attr in (("deskpresence", "desk_idle_s"),
+                           ("desk", "idle_seconds")):
+        try:
+            mod = importlib.import_module(f"jarvis.{mod_name}")
+        except ImportError:
+            continue                        # may not exist yet
+        except Exception:                   # noqa: BLE001 - import boundary
+            log.debug("jarvis.%s import failed", mod_name, exc_info=True)
+            continue
+        fn = getattr(mod, attr, None)
         if callable(fn):
             return fn
-    except ImportError:
-        pass
-    except Exception:                       # noqa: BLE001 - import boundary
-        log.debug("jarvis.desk import failed", exc_info=True)
+        log.debug("jarvis.%s has no %s", mod_name, attr)
     return xss_idle_s
 
 
@@ -404,9 +417,20 @@ class ConsoleModes:
     def note_activity(self) -> None:
         """Anything he did: a wake word, an utterance, a keystroke. Wakes
         the console instantly and bumps the generation, which no-ops every
-        pending power-up stage — "the reply wins" without tracking ids."""
+        pending power-up stage — "the reply wins" without tracking ids.
+
+        REGRESSION SITE: bumping the generation also swallows the sweep's
+        terminal `(delay, None)` stage, so the last partial count stayed
+        latched in BoardWindow._revealed / RoomSlab._reveal and the Board
+        drew only the first N panels until the NEXT DAY's once-a-day sweep.
+        A cancelled sweep can no longer deliver its own settle, so cancel
+        delivers it here. Guarded on `sweeping`: note_activity runs on every
+        utterance and an unconditional emit would redraw the Board and the
+        room slab each time."""
         self.generation += 1
-        self.sweeping = False
+        if self.sweeping:
+            self.sweeping = False
+            self._emit_stage(None)
         if self.mode != ACTIVE:
             self._set_mode(ACTIVE)
         else:
@@ -557,11 +581,19 @@ class ConsoleModes:
             return                          # he spoke; the sweep is over
         if count is None:
             self.sweeping = False
-        if callable(self._on_stage):
-            try:
-                self._on_stage(count)
-            except Exception:               # noqa: BLE001 - callback boundary
-                log.exception("power-up stage callback failed")
+        self._emit_stage(count)
+
+    def _emit_stage(self, count) -> None:
+        """The one callback boundary for the reveal latch. `None` means
+        "show everything again" and is the only thing that clears the
+        partial reveal, so every path that ends a sweep — settled or
+        cancelled — must come through here."""
+        if not callable(self._on_stage):
+            return
+        try:
+            self._on_stage(count)
+        except Exception:                   # noqa: BLE001 - callback boundary
+            log.exception("power-up stage callback failed")
 
 
 __all__ = ["ACTIVE", "AMBIENT", "STANDBY", "MODES", "ConsoleModes", "DeskWatch",

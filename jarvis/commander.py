@@ -4778,6 +4778,31 @@ def _h_board_focus(c, t, m):
 # correction_kind() does NOT match), and asking what he has. Every one of
 # them returns None rather than inventing a building: an unresolvable place
 # belongs to the model, not to a table of walks.
+def _note_leave_touch(c) -> None:
+    """Stamp the moment THIS conversation last named a building.
+
+    In-memory and monotonic on purpose: LeaveTimes.last_key is restored from
+    disk, and a background tick (leavetime._file_reminder / _maybe_ask) can
+    re-point it with no user turn at all. Neither of those may make "make
+    that ten" mean a building from days ago.
+    """
+    c._leave_touch = time.monotonic()
+
+
+def _leave_key_fresh(c, lt) -> bool:
+    """Is ``lt.last_key`` still the building he is talking about?"""
+    stamp = getattr(c, "_leave_touch", 0.0) or 0.0
+    # Seam: if jarvis/leavetime.py ever stamps its own touches (last_touch,
+    # monotonic), honour whichever is newer -- it sees the ones the
+    # commander never handles.
+    other = getattr(lt, "last_touch", None)
+    if isinstance(other, (int, float)) and not isinstance(other, bool):
+        stamp = max(float(stamp), float(other))
+    if not stamp:
+        return False
+    return time.monotonic() - float(stamp) <= LEAVE_AMEND_WINDOW_S
+
+
 def _h_leave_set(c, t, m):
     lt = c._svc("leavetime")
     place, minutes = m
@@ -4785,6 +4810,7 @@ def _h_leave_set(c, t, m):
     if key is None:
         return None                              # not a building he has: the model's
     value = lt.learn(key, minutes)
+    _note_leave_touch(c)
     return CommandResult(handled=True, speak=True,
                          reply=leave_mod.LEARNED_LINE.format(
                              place=leave_mod.speech_name(key), minutes=value),
@@ -4796,7 +4822,15 @@ def _h_leave_amend(c, t, m):
     key = lt.last_key
     if not key:
         return None                              # nothing to amend: the model's
+    if not _leave_key_fresh(c, lt):
+        # No building has been on the table this conversation, so "make it
+        # twenty" is about something else entirely (a timer, a volume, a
+        # recipe). Overwriting a persisted walk off a disk-loaded key is
+        # the silent damage; the model can have the words.
+        log.info("leavetime: refusing a stale amend of %s", key)
+        return None
     value = lt.learn(key, m)
+    _note_leave_touch(c)
     return CommandResult(handled=True, speak=True,
                          reply=leave_mod.LEARNED_LINE.format(
                              place=leave_mod.speech_name(key), minutes=value),
@@ -4811,12 +4845,18 @@ def _h_leave_query(c, t, m):
     place = leave_mod.speech_name(key)
     minutes = lt.table.get(key)
     lt.note_key(key)
+    _note_leave_touch(c)                         # he named it: "make that ten" may follow
     if minutes is None:
         # Asking back and then dropping the answer on the floor is the
         # dead-end this repo has been bitten by before ("Was that for me?"
         # was a toast nothing listened to). Arm the SAME pending slot the
         # proactive ask uses, so "about twelve minutes" lands in the table.
-        c.ask_leave_time(key, place)
+        # A refusal means another question owns the floor and the answer
+        # would be eaten by its rung -- say what he asked and stop there
+        # rather than asking a question nothing is listening for.
+        if c.ask_leave_time(key, place) is False:
+            return CommandResult(handled=True, speak=True, status="Walk unknown",
+                                 reply=leave_mod.UNKNOWN_LINE)
         return CommandResult(handled=True, speak=True, status="Walk unknown",
                              reply=f"{leave_mod.UNKNOWN_LINE} "
                                    f"{leave_mod.ASK_LINE.format(place=place)}")
@@ -5074,7 +5114,14 @@ ASSISTANT_TIER1: list[Command] = [
                     "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "register", "next exam",
-                    "greeting", "day review",
+                    # "good night" is the other half of "good morning": the
+                    # hotword eats the wake word, so the courtesy arrives
+                    # bare, the prefixed registry pass is skipped and the
+                    # intent gate called two words background chat -- which
+                    # left the whole wind-down (music fade, screen dim, DND)
+                    # unreachable by voice, its only call site being
+                    # _h_courtesy on "goodnight".
+                    "greeting", "courtesy", "day review",
                     # the weekly self-review and the memory garden's two
                     # answers: all three are asked without the wake word
                     "week review", "garden report", "garden undo",
@@ -5326,6 +5373,13 @@ def forced_call(reason: str, text: str) -> Optional[tuple]:
 # sir?") stays answerable for a few minutes -- he is usually packing a bag
 # when it lands -- but only a duration-shaped reply answers it.
 LEAVE_ANSWER_WINDOW_S = 180.0
+# "make that ten next time" amends the building last talked about, and that
+# subject goes stale like every other pending state here. LeaveTimes.last_key
+# is LOADED FROM DISK at construction, so without a window a bare "make it
+# twenty" on a fresh boot -- or hours after a timer, an alarm, or the
+# background reminder tick quietly re-pointed the key -- silently rewrote a
+# stored walk for a building nobody had mentioned that day.
+LEAVE_AMEND_WINDOW_S = 180.0
 LEAVE_DROPPED_LINE = "As you wish, sir; I'll not ask again."
 _LEAVE_DECLINE_RX = re.compile(
     r"^(?:no|nope|nah|never\s?mind|forget it|skip it|don'?t worry|"
@@ -5484,6 +5538,9 @@ class Commander:
     _pending_objection: Optional[tuple] = None
     _objection_timer = None
     _objections = None
+    # Monotonic; 0.0 means "no building has been named this session", which
+    # is exactly what a disk-loaded LeaveTimes.last_key must count as.
+    _leave_touch: float = 0.0
 
     # One turn at a time: handle() mutates per-turn fields (_confidence,
     # _raw_text, _last_turn, _pending_*) and is entered from the voice
@@ -5548,6 +5605,9 @@ class Commander:
         # "How long do you need to get to Wisenbaker, sir?" is on the table:
         # (building key, spoken place, monotonic stamp). See ask_leave_time.
         self._pending_leave: Optional[tuple] = None
+        # When a building was last named in conversation, so "make that ten
+        # next time" cannot rewrite a walk restored from disk (_leave_key_fresh).
+        self._leave_touch: float = 0.0
 
     # -- service access ------------------------------------------------
     def _svc(self, name: str):
@@ -5609,10 +5669,81 @@ class Commander:
             floor = -0.7
         return conf < floor
 
-    def ask_leave_time(self, key: str, place: str) -> None:
+    def question_open(self) -> bool:
+        """Jarvis put a question and is waiting on the answer.
+
+        One predicate for every rung of ``handle`` that owns the floor, so
+        callers stop each growing their own half-list. Two bugs came out of
+        that: ``app._question_open`` sized the follow-up mic at 4 s through
+        the study offer and the objection (both spoken yes/no questions
+        Jarvis asked), and ``_ask_leave_time`` armed a leave question on top
+        of a live quiz, where the duration answer is graded as a flashcard.
+
+        Every entry carries its own expiry, so this is only ever True while
+        a question is genuinely live -- an offer the rung would drop is not
+        a question.
+        """
+        quiz = getattr(self, "_pending_quiz", None)
+        if quiz is not None and not getattr(quiz, "finished", True):
+            try:
+                if not quiz.stale():
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed session
+                log.debug("question_open: quiz staleness failed", exc_info=True)
+        session = getattr(self, "_pending_session", None)
+        if session is not None:
+            try:
+                if not (session.finished or session.stale()):
+                    return True
+            except Exception:  # noqa: BLE001 - a bad session
+                log.debug("question_open: session state failed", exc_info=True)
+        # A read-back ("Cancel all three alarms, sir?") and the objection
+        # ("Shall I set it anyway?") both hold the floor for DESTRUCTIVE_TTL_S.
+        for name, size in (("_pending_destructive", 3), ("_pending_objection", 4)):
+            pend = getattr(self, name, None)
+            if isinstance(pend, tuple) and len(pend) == size:
+                try:
+                    if time.monotonic() - float(pend[-1]) <= DESTRUCTIVE_TTL_S:
+                        return True
+                except (TypeError, ValueError):
+                    pass
+        # The wake-alarm offer and the exam-week study offer are parked on
+        # the SERVICES namespace by briefing.make_tools, not on the
+        # commander, and both are stamped in wall-clock seconds.
+        services = getattr(self, "services", None)   # a slim test commander has none
+        for name in ("alarm_offer", "study_offer"):
+            offer = getattr(services, name, None)
+            if isinstance(offer, dict) and offer:
+                try:
+                    made = float(offer.get("made_at") or 0.0)
+                except (TypeError, ValueError):
+                    made = 0.0
+                if not made or time.time() - made <= OFFER_TTL_S:
+                    return True
+        return False
+
+    def ask_leave_time(self, key: str, place: str) -> bool:
         """The leave-time watch asked how long the walk is; the next
-        duration-shaped utterance answers it (``_try_leave_answer``)."""
+        duration-shaped utterance answers it (``_try_leave_answer``).
+
+        False means "not armed, do not ask": another question already owns
+        the floor. ``_try_leave_answer`` is the LAST pending rung on
+        purpose, so a duration said while a quiz or a working session is
+        open is eaten by that rung instead -- a flashcard marked wrong and
+        the walk never learned. Worse, ``leavetime._maybe_ask`` burns its
+        once-ever ask the moment the asker returns True, so the collision
+        would spend the question for good rather than delay it. The watch
+        retries on the next tick.
+        """
+        if self.question_open():
+            log.info("leavetime: not asking about %s -- a question is already "
+                     "on the table", key)
+            return False
         self._pending_leave = (key, place, time.monotonic())
+        # "make that ten next time" is only about this building while the
+        # exchange is fresh (see _leave_key_fresh).
+        self._leave_touch = time.monotonic()
+        return True
 
     def stash_destructive(self, run: Callable[[], CommandResult], line: str):
         """A handler read an action back instead of doing it; the next yes
@@ -6830,6 +6961,7 @@ class Commander:
         except Exception:  # noqa: BLE001 - a store failure must not eat the turn
             log.exception("leavetime: learn(%r) failed", key)
             return None
+        _note_leave_touch(self)     # "make that ten" may follow straight on
         log.info("leavetime: %s answered as %d min", key, value)
         return CommandResult(handled=True, speak=True,
                              reply=leave_mod.LEARNED_LINE.format(
@@ -6976,9 +7108,7 @@ class Commander:
         if self.shaky_transcript():
             # The split is itself a guess about the words. On a transcript
             # that scraped in under confirm.shaky_logprob, running TWO
-            # actions off it is the wrong kind of confident -- and the
-            # creation read-backs cannot help, since a second clause would
-            # overwrite the first one's pending question. The model gets
+            # actions off it is the wrong kind of confident. The model gets
             # the compound whole, as it did before this feature.
             log.info("multi-intent: declining a shaky compound %r", text)
             return None
@@ -6987,6 +7117,15 @@ class Commander:
         # would re-match the compound and take the other clause as the body.
         raw = getattr(self, "_raw_text", "")
         results = []
+        # _pending_destructive is ONE slot and a compound has two clauses:
+        # "clear the shopping list and cancel all the alarms" read both
+        # questions aloud but the second stash overwrote the first, so the
+        # single "yes" ran only the second clause and the first was dropped
+        # in silence. Take each clause's question as it is stashed, then
+        # re-stash the pair as one.
+        before = self._pending_destructive
+        self._pending_destructive = None
+        pending = []
         try:
             for part in parts:
                 self._raw_text = part
@@ -6995,6 +7134,10 @@ class Commander:
                 except Exception:
                     log.exception("multi-intent: clause %r failed", part)
                     res = None
+                stash = self._pending_destructive
+                if stash is not None:
+                    pending.append(stash)
+                    self._pending_destructive = None
                 if res is None or not res.handled:
                     log.warning("multi-intent: clause %r matched but did "
                                 "nothing", part)
@@ -7003,11 +7146,23 @@ class Commander:
         finally:
             self._raw_text = raw
         if not results:
+            self._pending_destructive = before   # nothing ran: leave the floor as it was
             return None
         log.info("multi-intent: %d of %d clauses ran for %r",
                  len(results), len(parts), text)
+        if pending:
+            self._stash_multi_confirm(pending)
         replies = [str(r.reply).strip() for r in results if r.reply]
         statuses = [r.status for r in results if r.status]
+        # Both clauses' undo closures, chained: handle() only replaces
+        # _last_undo when the NEW result carries one, so a compound that
+        # dropped them left the PREVIOUS turn's closure armed and "scratch
+        # that" took back the wrong thing -- while the two things the
+        # compound had just created stayed.
+        undos = [r.undo for r in results if getattr(r, "undo", None) is not None]
+        # aside.py anchors on the structured thing just created; the last
+        # clause is the one "...and make it 9 pm" is about.
+        acts = [r.action for r in results if getattr(r, "action", None) is not None]
         return CommandResult(
             handled=True,
             reply=" ".join(replies) or None,
@@ -7016,7 +7171,55 @@ class Commander:
             # one follow-up window for the pair: it opens once the last
             # clause is done
             done=all(r.done for r in results),
-            ack=any(r.ack for r in results))
+            ack=any(r.ack for r in results),
+            undo=self._chain_undos(undos) if undos else None,
+            action=acts[-1] if acts else None)
+
+    @staticmethod
+    def _chain_undos(undos: list):
+        """One closure that takes back a whole compound turn."""
+        def _undo_all() -> str:
+            # Reverse order: unwind the way a person would, last thing first.
+            lines = []
+            for fn in reversed(undos):
+                try:
+                    line = fn()
+                except Exception:
+                    log.exception("multi-intent: clause undo failed")
+                    continue
+                if line:
+                    lines.append(str(line))
+            return " ".join(lines)
+        return _undo_all
+
+    def _stash_multi_confirm(self, pending: list) -> None:
+        """Re-arm the clauses' read-backs as a single pending question.
+
+        One question, one yes, every clause run: _try_destructive_confirm
+        pops one slot, so anything left unchained is silently lost.
+        """
+        runs = [p[0] for p in pending]
+        lines = [str(p[1]).strip() for p in pending if p[1]]
+
+        def _run_all() -> CommandResult:
+            replies, statuses = [], []
+            for fn in runs:
+                try:
+                    res = fn()
+                except Exception:
+                    log.exception("multi-intent: confirmed clause failed")
+                    continue
+                if res is None:
+                    continue
+                if getattr(res, "reply", None):
+                    replies.append(str(res.reply).strip())
+                if getattr(res, "status", None):
+                    statuses.append(str(res.status))
+            return CommandResult(handled=True,
+                                 reply=" ".join(replies) or None,
+                                 speak=True,
+                                 status=" + ".join(statuses) or "Done")
+        self.stash_destructive(_run_all, " ".join(lines))
 
     def _multi_match(self, text: str) -> list:
         """The clauses of a compound whose EVERY half is a Tier-1 command

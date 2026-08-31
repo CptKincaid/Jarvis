@@ -112,7 +112,12 @@ COUNTERS: tuple[tuple[str, re.Pattern], ...] = (
     ("objections_overruled", re.compile(r"^objection \S.* resolved: overruled=True")),
     # The Aside's kill phrase (jarvis/aside.py). Silenced most days means
     # the feature is wrong, and this line is how that is found out.
-    ("asides", re.compile(r"^aside: '")),
+    # The delimiter is chosen by repr (aside.py:483 logs the line with %r),
+    # which switches to double quotes the moment the text holds an
+    # apostrophe -- so anchoring on ' alone dropped every aside naming a
+    # possessive or a contraction ("Newton's laws...") and deflated only
+    # the volunteered half of the volunteered-vs-silenced ratio below.
+    ("asides", re.compile(r"""^aside: ['"]""")),
     ("asides_silenced", re.compile(r"^aside: silenced for the day")),
     # The debrief (jarvis/debrief.py): asked once, filed, never chat.
     ("debriefs", re.compile(r"^debrief filed for ")),

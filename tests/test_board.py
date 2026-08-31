@@ -342,3 +342,101 @@ def test_spark_points_walk_left_to_right_with_the_peak_at_the_top():
     pts = ui_board.spark_points((0.0, 1.0), x0=0, y0=0, w=10, h=100)
     assert pts[0] == 0 and pts[1] == 100      # zero sits on the baseline
     assert pts[2] == 10 and pts[3] == 0       # the peak reaches the top
+
+
+# ------------------------------------- the WM close seam (review a/b n=23)
+def _window():
+    """A MainWindow shell with no Tk behind it. Only the two attributes the
+    Board hooks touch are populated; nothing here constructs a widget."""
+    from jarvis.ui import main_window as mw
+
+    win = mw.MainWindow.__new__(mw.MainWindow)
+    win.board = None
+    return win
+
+
+def test_closing_the_board_with_the_window_manager_stops_its_feed():
+    """n=23. BoardWindow was built without its on_close hook, so Alt+F4
+    withdrew the window while the app's 5 s BoardFeed kept spawning
+    nvidia-smi, walking tmux and reading turns.jsonl until quit — and
+    "bring up the board" answered "Already up, sir." for a window nobody
+    could see."""
+    from jarvis.ui import main_window as mw
+
+    stopped = []
+    win = _window()
+    win.services = mw.Services(board_closed=lambda: stopped.append("hide"))
+    win._board_closed()
+    assert stopped == ["hide"]
+
+
+def test_the_wm_close_hook_falls_back_to_the_board_service_shape():
+    """The app-side seam may land after this one; the commander-shaped
+    services object carries the same teardown as services.board.hide."""
+    stopped = []
+    win = _window()
+    win.services = SimpleNamespace(
+        board=SimpleNamespace(hide=lambda: stopped.append("hide")))
+    win._board_closed()
+    assert stopped == ["hide"]
+
+
+def test_an_unwired_wm_close_is_survivable_not_fatal():
+    win = _window()
+    win.services = SimpleNamespace()
+    win._board_closed()                 # logs a warning, does not raise
+
+
+def test_a_failing_teardown_never_escapes_the_wm_handler():
+    def boom():
+        raise RuntimeError("the feed is already gone")
+    win = _window()
+    win.services = SimpleNamespace(board_closed=boom)
+    win._board_closed()
+
+
+def test_the_board_is_built_with_the_close_hook_attached(monkeypatch):
+    """The regression was purely at the construction site: the parameter
+    existed, hide() invoked it, and no caller ever passed it."""
+    from jarvis.ui import main_window as mw
+
+    built = {}
+
+    class FakeBoard:
+        def __init__(self, master, console_w=0, on_close=None):
+            built["on_close"] = on_close
+
+    monkeypatch.setattr(mw, "BoardWindow", FakeBoard)
+    monkeypatch.setattr(mw, "board_enabled", lambda _opt: True)
+    win = _window()
+    win.services = mw.Services()
+    win.root = SimpleNamespace(winfo_width=lambda: 1200)
+    board_win = win._ensure_board()
+    assert board_win is not None
+    assert built["on_close"] == win._board_closed
+
+
+def test_hiding_the_board_withdraws_before_it_notifies():
+    """Order matters: hide() clears _visible BEFORE calling on_close, so the
+    app's BoardCommand(action="hide") re-enters hide() and returns instead
+    of recursing."""
+    seen = []
+    shell = SimpleNamespace(
+        _visible=True,
+        top=SimpleNamespace(withdraw=lambda: seen.append("withdraw")),
+        on_close=lambda: seen.append("notify"))
+    ui_board.BoardWindow.hide(shell)
+    assert seen == ["withdraw", "notify"]
+    assert shell._visible is False
+    ui_board.BoardWindow.hide(shell)     # already down: no second notify
+    assert seen == ["withdraw", "notify"]
+
+
+def test_a_raising_close_hook_does_not_leave_the_board_half_closed():
+    def boom():
+        raise RuntimeError("services are torn down")
+    shell = SimpleNamespace(_visible=True,
+                            top=SimpleNamespace(withdraw=lambda: None),
+                            on_close=boom)
+    ui_board.BoardWindow.hide(shell)     # Tk's WM handler must not see it
+    assert shell._visible is False

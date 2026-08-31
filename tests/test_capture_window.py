@@ -122,3 +122,76 @@ def test_the_recorder_clamps_the_longer_window():
 def test_a_commanderless_app_asks_for_nothing(app):
     app.commander = None
     assert app._capture_window() is None
+
+
+# ===================================== Commander.question_open (2026-08-31)
+# _question_open grew its own half-list of pending questions and missed the
+# ones the later waves added: the exam-week study offer ("Shall we run ten
+# now, sir?") and the objection ("Shall I set it anyway?") are both spoken
+# yes/no questions Jarvis asked, and both got the 4 s window instead of 15 s.
+# The predicate now lives on the Commander, where the rungs that own the
+# floor live, so a caller cannot forget one -- app._question_open consults
+# it, and so does Commander.ask_leave_time.
+class _Svc(SimpleNamespace):
+    pass
+
+
+def _commander(**svc):
+    from jarvis.commander import Commander
+    c = object.__new__(Commander)
+    c.services = _Svc(**svc)
+    return c
+
+
+def test_a_bare_commander_has_no_question_open():
+    """object.__new__ shape: every rung is read with getattr, so a slim
+    commander answers False rather than raising -- tests/test_custom_phrases.py
+    builds one with no services namespace at all."""
+    from jarvis.commander import Commander
+    assert _commander().question_open() is False
+    assert object.__new__(Commander).question_open() is False
+
+
+def test_an_open_quiz_is_a_question():
+    c = _commander()
+    c._pending_quiz = _quiz()
+    assert c.question_open() is True
+    c._pending_quiz = _quiz(asked_at=time.time() - 400)     # stale
+    assert c.question_open() is False
+
+
+def test_an_open_working_session_is_a_question():
+    c = _commander()
+    c._pending_session = SimpleNamespace(finished=False, stale=lambda: False)
+    assert c.question_open() is True
+    c._pending_session = SimpleNamespace(finished=True, stale=lambda: False)
+    assert c.question_open() is False
+
+
+def test_a_read_back_and_an_objection_are_both_questions():
+    c = _commander()
+    c._pending_destructive = (lambda: None, "Cancel all three, sir?",
+                              time.monotonic())
+    assert c.question_open() is True
+    c._pending_destructive = None
+    # "Shall I set it anyway?" -- a 4-tuple with its stamp last
+    c._pending_objection = (lambda: None, "Shall I set it anyway, sir?",
+                            object(), time.monotonic())
+    assert c.question_open() is True
+    c._pending_objection = (lambda: None, "line", object(),
+                            time.monotonic() - DESTRUCTIVE_TTL_S - 1)
+    assert c.question_open() is False
+    c._pending_objection = ("junk",)                        # never crash on shape
+    assert c.question_open() is False
+
+
+def test_both_briefing_offers_are_questions():
+    """The wake-alarm offer AND the exam-week study offer are parked on the
+    services namespace by briefing.make_tools; the study one was the miss."""
+    for name in ("alarm_offer", "study_offer"):
+        c = _commander(**{name: {"made_at": time.time(), "n": 10}})
+        assert c.question_open() is True, name
+        getattr(c.services, name)["made_at"] = time.time() - OFFER_TTL_S - 1
+        assert c.question_open() is False, name
+        setattr(c.services, name, {})
+        assert c.question_open() is False, name

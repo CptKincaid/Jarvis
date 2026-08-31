@@ -150,6 +150,7 @@ CANVAS_TTL_S = 300.0          # the Board's Canvas half, cached 5 minutes
 BOARD_SESSIONS = 6            # Claude sessions read off disk per poll
 ROOM_SPOTIFY_ACTIVE_S = 10.0  # playback poll while something IS playing
 ROOM_SPOTIFY_IDLE_S = 60.0    # …and once it has gone quiet
+ROOM_GPU_TTL_S = 30.0         # the slab's GPU reading when nobody hands one in
 SAY_AGAIN_LINE = "Say that again, sir?"
 # The "did not catch that" cue (JarvisApp._nudge): a wake-word turn that
 # captured nothing usable gets this instead of silence.
@@ -1269,6 +1270,44 @@ class JarvisApp:
             return
         self._greet_return("desk")
 
+    def _greet_return(self, source: str) -> None:
+        """One arrival cue per return, shared by the phone and desk probes.
+
+        REGRESSION SITE. The arrival rework moved the choreography into
+        jarvis/arrival.py and deleted this method, but _on_desk kept
+        calling it: every desk return raised AttributeError inside the bus
+        subscriber (swallowed there, so the desk greeting was simply dead),
+        and _on_presence greeted without consulting the damper at all, so
+        GREET_DAMPER_S and _last_greeted were both orphaned. Both probes
+        come through here now: two sentinels crossing their thresholds
+        minutes apart on the same walk through the door is ONE return, and
+        the damper is what makes that true. The ordered steps still run
+        through arrival_mod.run -- the panel/earcon/greeting/catch-up order
+        is the feature, not the line.
+        """
+        now = time.monotonic()
+        last = getattr(self, "_last_greeted", 0.0)
+        if last and now - last < GREET_DAMPER_S:
+            log.info("presence: %s return within the damper; not greeting again",
+                     source)
+            return
+        steps = arrival_mod.arrival_plan(
+            returned=True, home=True, quiet_reason=self._quiet_reason(),
+            cue=bool(self.assistant.get("presence.arrival_cue", True)))
+        if not steps:
+            bus.publish(Status(text="Home", kind="info"))
+            return
+        # Stamped only for a plan that actually SPEAKS. A quiet-hours plan
+        # is panel-only (arrival.arrival_plan), and letting that arm the
+        # damper would swallow the real greeting when the policy lifts
+        # minutes later. Stamped BEFORE run(): it speaks, and the other
+        # probe's event can land on another thread while it is still
+        # talking.
+        if "greeting" in steps:
+            self._last_greeted = now
+        done = arrival_mod.run(steps, self._arrival_actions())
+        log.info("arrival (%s): %s", source, " -> ".join(done) or "(nothing)")
+
     def _arrival_actions(self) -> dict:
         """The callables behind jarvis/arrival.ARRIVAL_STEPS.
 
@@ -1334,14 +1373,14 @@ class JarvisApp:
                 self._maybe_power_up("presence")
             except Exception:                 # noqa: BLE001 - never block a return
                 log.debug("power-up check failed", exc_info=True)
-        cue = bool(self.assistant.get("presence.arrival_cue", True))
-        steps = arrival_mod.arrival_plan(returned=ev.returned, home=ev.home,
-                                         quiet_reason=self._quiet_reason(), cue=cue)
-        if not steps:
-            bus.publish(Status(text="Home", kind="info"))
+            # Through the SAME greeter as the desk probe, so the damper is
+            # actually shared: whichever sentinel notices him second must
+            # not say "Welcome back, sir" a second time.
+            self._greet_return("phone")
             return
-        done = arrival_mod.run(steps, self._arrival_actions())
-        log.info("arrival: %s", " -> ".join(done) or "(nothing)")
+        # Home but not a return (a poll that merely confirms he is here):
+        # the console gets the state, nothing is spoken.
+        bus.publish(Status(text="Home", kind="info"))
 
     # ------------------------------------------------------ departure
     def _cancel_departure(self) -> None:
@@ -1957,7 +1996,8 @@ class JarvisApp:
         # in the app kept them — the UI's tracker is a Tk-thread object).
         self._board_feed = None
         self._board_tasks: dict = {}
-        self._canvas_due_cache = (0.0, [])
+        self._canvas_due_cache = (-1e9, [])   # monotonic; see _last_nudge_ts
+        self._room_gpu_cache = (-1e9, None)   # ditto: the ambient GPU reading
         # The ambient slab's one outbound dependency, on a backoff
         self._room_playing_text = ""
         self._room_playing_ts = -1e9
@@ -2670,8 +2710,15 @@ class JarvisApp:
         tool, exactly as tools/briefing.py calls it. Silent (and empty)
         when the token is unset — a box with no Canvas must not nag."""
         now = time.monotonic()
-        at, lines = getattr(self, "_canvas_due_cache", (0.0, []))
-        if lines and now - at < CANVAS_TTL_S:
+        # The TTL is on the TIMESTAMP, never on the payload: `if lines and
+        # ...` could not be satisfied by a stored EMPTY result, so a Canvas
+        # with nothing due (or one erroring) re-issued a live REST call on
+        # every 5 s Board tick -- ~720 round trips an hour. The sentinel is
+        # -1e9 rather than 0.0 because time.monotonic() is uptime-based: a
+        # 0.0 default would serve the empty cache for the first 300 s after
+        # boot instead of fetching once.
+        at, lines = getattr(self, "_canvas_due_cache", (-1e9, []))
+        if now - at < CANVAS_TTL_S:
             return lines
         from jarvis.tools.briefing import _due_lines
         try:
@@ -2794,7 +2841,7 @@ class JarvisApp:
         lines = self._board_canvas_lines()
         return lines[0] if lines else ""
 
-    def room_state(self) -> dict:
+    def room_state(self, gpu_pct=None) -> dict:
         """Room facts for the console's ambient / standby slab, as
         PRE-COMPUTED STRINGS.
 
@@ -2826,13 +2873,42 @@ class JarvisApp:
             if isinstance(value, str) and value:
                 room["arc"] = value
                 break
+        room["gpu"] = self._room_gpu(gpu_pct)
+        return room
+
+    def _room_gpu(self, gpu_pct=None):
+        """GPU utilisation as 0..1 for the ambient slab, or None.
+
+        The caller's own reading wins. This used to call
+        health.snapshot(gpu=True) on the window's 5 s worker -- the very
+        pass that had ALREADY forked nvidia-smi for the temps row -- so
+        every tick spawned a second nvidia-smi and walked /proc twice more
+        (top_processes + find_trainers) for one number the loop was
+        throwing away: ~720 extra spawns an hour. `gpu_pct` (0-100) is the
+        seam that pass fills; with nothing handed in the reading is a bare
+        nvidia-smi, cached for ROOM_GPU_TTL_S, never the whole snapshot.
+        """
+        if gpu_pct is not None:
+            try:
+                return max(0.0, min(1.0, float(gpu_pct) / 100))
+            except (TypeError, ValueError):        # a caller's bad reading
+                return None
+        now = time.monotonic()
+        at, cached = getattr(self, "_room_gpu_cache", (-1e9, None))
+        if now - at < ROOM_GPU_TTL_S:
+            return cached
+        value = None
         try:
             from jarvis.tools import health
-            gpu = (health.snapshot(gpu=True).gpu or {}).get("util_pct")
-            room["gpu"] = None if gpu is None else max(0.0, min(1.0, gpu / 100))
+            gpu = (health.parse_nvidia_smi(health.run_nvidia_smi())
+                   or {}).get("util_pct")
+            value = None if gpu is None else max(0.0, min(1.0, gpu / 100))
         except Exception:                          # noqa: BLE001 - probe boundary
             log.debug("room: gpu read failed", exc_info=True)
-        return room
+        # The timestamp is stamped even for a failure: a box with no
+        # nvidia-smi must not pay the spawn every 5 s to learn that again.
+        self._room_gpu_cache = (now, value)
+        return value
 
     # ------------------------------------------------------------ power-up
     def _boot_sweep_due(self, idle_s=None) -> bool:
@@ -2882,7 +2958,13 @@ class JarvisApp:
         if not self.assistant.get("console.powerup", True):
             return False
         idle = None
-        fn = getattr(self, "desk_idle_s", None)
+        # REGRESSION SITE: this read `getattr(self, "desk_idle_s", None)`,
+        # an attribute JarvisApp has never had -- the seam is on the
+        # services namespace (_build_services) -- so `idle` was always None
+        # and powerup_due's "the machine really was left alone" gate never
+        # applied. getattr on services too: the probe must not raise on a
+        # half-built app.
+        fn = getattr(getattr(self, "services", None), "desk_idle_s", None)
         if callable(fn):
             try:
                 idle = fn()
@@ -3886,7 +3968,18 @@ class JarvisApp:
             # is resolved defensively so it lands whichever way the
             # desk-presence change merges (jarvis/ui/console_mode.py).
             room_state=self.room_state,
-            desk_idle_s=getattr(self, "desk_idle_s", None),
+            # ONE seam for the desk reading: services.desk_idle_s, the
+            # DeskSentinel's cached poll. This used to read the name off
+            # `self`, where it has never existed, so Services.desk_idle_s
+            # was always None and console_mode.resolve_idle_fn fell all the
+            # way through to its XScreenSaver probe -- the console's idle
+            # clock silently diverged from the rest of the app. Handed over
+            # only while the sentinel is actually enabled: a disabled
+            # sentinel answers None forever, and resolve_idle_fn accepts
+            # ANY callable, which would kill the fallback instead.
+            desk_idle_s=(getattr(self.services, "desk_idle_s", None)
+                         if getattr(getattr(self, "desk", None), "enabled", False)
+                         else None),
         )
 
 

@@ -339,3 +339,120 @@ def test_the_journal_renders_and_pins_a_debrief():
               "user": "x" * 200, "jarvis": "y" * 200} for m in range(200)]
     tight = digest(rows + noise, max_chars=2000)
     assert "debrief — BIOSENSORS Midterm 1" in tight
+
+
+# ------------------------------------------- who owns the next words
+# The debrief is the one pending question hoisted ABOVE commander.handle,
+# so it jumps the queue every other open question waits in. Two failures
+# came out of that: a bare "stop" said to a ringing alarm inside the 120 s
+# debrief window was filed as how the midterm went (commander._try_ringing
+# runs BELOW the debrief filter and "stop" is in no ASSISTANT_TIER1
+# matcher), and a flashcard answer said mid-quiz was filed the same way
+# while the quiz never advanced. floor_holder is the debrief's side of the
+# yield: it must name every holder, and it must never invent one.
+import jarvis.app as _app_mod                                    # noqa: E402
+from jarvis.debrief import FLOOR_FREE, floor_holder              # noqa: E402
+
+
+class _FloorApp:
+    """The slice of JarvisApp floor_holder actually probes, with the REAL
+    _question_open bound in -- the TTL-aware predicate app.py already owned
+    and wired into the mic window but never into the debrief gate."""
+    _question_open = _app_mod.JarvisApp._question_open
+
+    def __init__(self, **kw):
+        self.timekeeper = kw.pop("timekeeper", None)
+        self._pending_uncertain = kw.pop("uncertain", None)
+        self.commander = kw.pop("commander", SimpleNamespace(
+            _pending_session=None, _pending_leave=None,
+            _pending_quiz=None, _pending_destructive=None))
+        self.services = kw.pop("services", SimpleNamespace(alarm_offer=None))
+        assert not kw, kw
+
+
+def test_a_free_floor_is_free():
+    assert floor_holder(_FloorApp()) == FLOOR_FREE
+    assert floor_holder(None) == FLOOR_FREE
+
+
+def test_a_ringing_alarm_owns_the_next_words():
+    """The regression: "stop" inside the debrief window was written into
+    the episodic record while the alarm went on ringing."""
+    app = _FloorApp(timekeeper=SimpleNamespace(ringing=SimpleNamespace(id=1)))
+    assert floor_holder(app) == "a ringing alarm"
+    app.timekeeper = SimpleNamespace(ringing=None)
+    assert floor_holder(app) == FLOOR_FREE
+
+
+def test_the_timekeeper_is_also_found_on_the_services_namespace():
+    app = _FloorApp()
+    app.timekeeper = None
+    app.services = SimpleNamespace(alarm_offer=None,
+                                   timekeeper=SimpleNamespace(ringing=object()))
+    assert floor_holder(app) == "a ringing alarm"
+
+
+def test_a_live_flashcard_owns_the_next_words():
+    """debrief.INTERVAL_S (300 s) and quiz ANSWER_WINDOW_S (300 s) overlap
+    by design, so a tick landing on a card on the table is routine."""
+    quiz = SimpleNamespace(finished=False, stale=lambda: False)
+    app = _FloorApp(commander=SimpleNamespace(
+        _pending_session=None, _pending_leave=None,
+        _pending_quiz=quiz, _pending_destructive=None))
+    assert floor_holder(app) == "an open question"
+    quiz.stale = lambda: True                    # expired: the floor is free
+    assert floor_holder(app) == FLOOR_FREE
+
+
+def test_a_destructive_read_back_owns_the_next_words():
+    import time as _t
+    pend = ("delete", object(), _t.monotonic())
+    app = _FloorApp(commander=SimpleNamespace(
+        _pending_session=None, _pending_leave=None,
+        _pending_quiz=None, _pending_destructive=pend))
+    assert floor_holder(app) == "an open question"
+    app.commander._pending_destructive = ("delete", object(), _t.monotonic() - 10_000)
+    assert floor_holder(app) == FLOOR_FREE       # stale: no longer a floor
+
+
+def test_a_working_session_and_the_leave_question_own_the_next_words():
+    import time as _t
+    from jarvis.commander import LEAVE_ANSWER_WINDOW_S
+    cmdr = SimpleNamespace(_pending_session=SimpleNamespace(finished=False),
+                           _pending_leave=None, _pending_quiz=None,
+                           _pending_destructive=None)
+    app = _FloorApp(commander=cmdr)
+    assert floor_holder(app) == "a working session"
+    cmdr._pending_session = SimpleNamespace(finished=True)
+    assert floor_holder(app) == FLOOR_FREE
+    # "twelve minutes" is the shape of BOTH answers, so whichever filter
+    # runs first wins the wrong one.
+    cmdr._pending_leave = ("Wisenbaker", "Wisenbaker", _t.monotonic())
+    assert floor_holder(app) == "the leave-time question"
+    cmdr._pending_leave = ("Wisenbaker", "Wisenbaker",
+                           _t.monotonic() - LEAVE_ANSWER_WINDOW_S - 1)
+    assert floor_holder(app) == FLOOR_FREE
+
+
+def test_the_was_that_for_me_prompt_owns_the_next_words():
+    assert floor_holder(_FloorApp(uncertain={"text": "hello"})) == \
+        "the was-that-for-me prompt"
+
+
+def test_a_raising_probe_reads_as_a_free_floor():
+    """A spurious hold means the debrief is never asked at all, which is
+    worse than one asked at a bad moment -- so every probe fails open."""
+    class Boom:
+        @property
+        def ringing(self):
+            raise RuntimeError("db on fire")
+
+    class Angry:
+        def __getattr__(self, name):
+            raise RuntimeError("commander on fire")
+
+    app = _FloorApp(timekeeper=Boom(), commander=Angry())
+    assert floor_holder(app) == FLOOR_FREE
+    app2 = _FloorApp()
+    app2._question_open = lambda c: (_ for _ in ()).throw(RuntimeError("boom"))
+    assert floor_holder(app2) == FLOOR_FREE

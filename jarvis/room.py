@@ -36,8 +36,14 @@ light ARE that hazard, so:
 
 * the values in force before the FIRST change are written atomically to a
   state file, and ``restore()`` puts them back;
-* the app calls ``restore()`` at boot, so a crash at 0.55 heals at the next
-  start, and again at quit;
+* the app calls ``restore(healing=True)`` at boot, so a crash at 0.55 heals
+  at the next start, and again at quit -- and those two automatic calls
+  stand down while jarvis/winddown.py is deliberately holding the same
+  panel dim (``held_by``), because a restart at two in the morning must not
+  light the room;
+* a restore that did NOT take keeps the baseline and says so
+  (``FAILED_RESTORE_LINE``), so the next heal retries rather than leaving
+  the display held dim with nothing left to undo it;
 * any failure mid-plan restores immediately;
 * the floor is ``MIN_BRIGHTNESS`` (0.55), well clear of black.  Jarvis's own
   console lives on this panel: a black screen would take the cards, the
@@ -96,6 +102,11 @@ AT_FULL_LINE = "The display is already at full, sir."
 AT_WARMEST_LINE = "The screen is as warm as it goes, sir."
 AT_COOLEST_LINE = "The screen is back to daylight, sir."
 RESTORED_LINE = "Display restored, sir."
+# Said when the put-back itself did not take (X not up yet at boot, the
+# output renamed, gsettings missing). Never RESTORED_LINE: the baseline is
+# kept for the next attempt, and claiming success is what used to leave him
+# holding a dim screen with nothing left to undo it.
+FAILED_RESTORE_LINE = "I couldn't put the display back, sir; I'll try again."
 NOTHING_TO_RESTORE_LINE = "The display is as you left it, sir."
 NO_DISPLAY_LINE = "I've no display to work with, sir."
 FAILED_LINE = "The display wouldn't take that, sir; I've put it back."
@@ -301,10 +312,19 @@ class RoomLight:
 
     def __init__(self, run: Optional[Callable] = None,
                  state_path: Optional[Path] = None,
-                 now: Callable[[], float] = time.time):
+                 now: Callable[[], float] = time.time,
+                 held_by: Optional[Callable[[], bool]] = None):
         self._run = run or _run
         self._state_path = Path(state_path) if state_path else None
         self._now = now
+        # "Is somebody else deliberately holding this display?" -- the
+        # bedtime wind-down (jarvis/winddown.py) dims the SAME xrandr output
+        # through its own state file, and the automatic heals below (boot
+        # and quit) would otherwise drive the brightness straight back up at
+        # two in the morning, undoing a guard winddown.restore() had just
+        # honoured. Only the healing paths consult it; "lights up" is a
+        # deliberate request and always wins.
+        self._held_by = held_by
         self._lock = threading.RLock()
         self._output = ""
 
@@ -484,15 +504,39 @@ class RoomLight:
         return bool(now) != bool(was)
 
     # ----------------------------------------------------------- restore
-    def restore(self) -> tuple[bool, str]:
+    def held_elsewhere(self) -> bool:
+        """True while another module is deliberately holding the display.
+
+        Reads the ``held_by`` seam defensively: a probe that raises must
+        never stop the light coming back."""
+        probe = self._held_by
+        if probe is None:
+            return False
+        try:
+            return bool(probe())
+        except Exception:  # noqa: BLE001 - a broken probe must not hold him
+            log.debug("room: display-hold probe failed", exc_info=True)
+            return False
+
+    def restore(self, healing: bool = False) -> tuple[bool, str]:
         """Put back what he had before Jarvis touched the light.
 
         Called at "lights up", at boot (so a crash at 0.55 heals), at quit,
-        and by ``apply`` when a command fails."""
+        and by ``apply`` when a command fails.
+
+        ``healing`` marks the two AUTOMATIC calls (boot and quit). Those
+        stand down while the bedtime wind-down still holds the room: a
+        restart at two in the morning must not light it back up, which is
+        the very decision ``winddown.restore(expired_only=True)`` had just
+        made one screenful earlier in ``start_assistant``."""
         with self._lock:
             base = self.baseline()
             if base is None:
                 return True, NOTHING_TO_RESTORE_LINE
+            if healing and self.held_elsewhere():
+                log.info("room: the wind-down still holds the display; "
+                         "leaving the baseline for the morning")
+                return False, NOTHING_TO_RESTORE_LINE
             output = str(base.get("output") or "") or self.output()
             night = base.get("night_light") or {}
             ok = True
@@ -507,6 +551,14 @@ class RoomLight:
             if output and brightness is not None:
                 if self._cmd(brightness_argv(output, brightness)) is None:
                     ok = False
-            self._forget()
-            log.info("room: display restored (%s)", "ok" if ok else "partly")
-            return ok, RESTORED_LINE
+            # Keep the baseline when the put-back did not take, and stop
+            # claiming it did. Forgetting here used to destroy the ONLY
+            # record of his brightness the moment a restore ran against a
+            # dead X -- and every retry path (the boot heal, the quit heal,
+            # "lights up", scenes.restore) gates on `changed`, so the screen
+            # stayed held dim with nothing left to put it back.
+            if ok:
+                self._forget()
+            log.info("room: display %s", "restored" if ok else
+                     "NOT restored; keeping the baseline to retry")
+            return ok, RESTORED_LINE if ok else FAILED_RESTORE_LINE

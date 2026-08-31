@@ -208,7 +208,12 @@ def test_a_failure_to_dim_puts_the_screen_straight_back(tmp_path, monkeypatch):
     # ...and the half-dimmed screen went back to what it was
     dims = [a for a in calls if a[:2] == ["xrandr", "--output"]]
     assert ["xrandr", "--output", "HDMI-0", "--brightness", "1.00"] in dims
-    assert not (tmp_path / "winddown.json").exists()
+    # DP-1 refuses the put-back as well, so the record is KEPT -- pruned to
+    # the one output that did not come back. Deleting it here (the old
+    # unconditional _clear_state) is what made a failed restore
+    # unrecoverable and still reported it as a success.
+    kept = json.loads((tmp_path / "winddown.json").read_text())
+    assert kept["brightness"] == {"DP-1": 0.8}
     # the fade never started; the only Spotify call is the restore's own
     assert spotify.calls == [("volume", 63)]
 
@@ -413,3 +418,120 @@ def test_the_state_file_lives_under_the_memory_dir(build):  # noqa: F811
     from jarvis.config import PATHS
     app = build()
     assert app.winddown._state_path == PATHS.MEMORY_DIR / "winddown.json"
+
+
+# ------------------------------------------- a restore that did not take
+def test_a_restore_the_desktop_refuses_keeps_the_snapshot(tmp_path, monkeypatch):
+    """The regression: restore() discarded both setters' booleans, called
+    _clear_state() unconditionally and returned True, so ONE attempt made
+    against a dead X -- the app-start call runs before the session is
+    necessarily up, and `--restore` is usually typed from a TTY -- deleted
+    the snapshot the module's docstring promises and left the screen dim
+    with nothing left to put it back."""
+    live = {"up": True}
+    seen: list[list] = []
+
+    def flaky(argv, timeout=5.0):
+        seen.append(list(argv))
+        if not live["up"]:
+            return False, ""
+        if argv[0] == "xrandr" and "--verbose" in argv:
+            return True, XRANDR_OUT
+        if argv[0] == "gsettings" and argv[1] == "get":
+            return True, "false\n"
+        return True, ""
+
+    monkeypatch.setattr(wd_mod, "_run", flaky)
+    spotify = FakeSpotify(volume=70)
+    wd = make(tmp_path, spotify=spotify)
+    assert wd.start() and wait_idle(wd)
+    before = json.loads((tmp_path / "winddown.json").read_text())
+
+    live["up"] = False                      # X is gone: a TTY, or a boot
+    assert wd.restore() is False, "a restore that did not take must say so"
+    kept = json.loads((tmp_path / "winddown.json").read_text())
+    assert kept["brightness"] == before["brightness"]
+    assert kept["night_light"] is False
+
+    live["up"] = True                       # the session comes back
+    del seen[:]
+    assert wd.restore() is True
+    assert {a[2]: a[4] for a in argv_of(seen, "xrandr", "--output")} == \
+        {"HDMI-0": "1.00", "DP-1": "0.80"}
+    assert not (tmp_path / "winddown.json").exists()
+
+
+def test_the_kept_snapshot_is_pruned_to_what_failed(tmp_path, monkeypatch):
+    """Only DP-1 refuses, so only DP-1 is left to retry -- the record can
+    never drift back over an output that already came home."""
+    def one_bad(argv, timeout=5.0):
+        if argv[0] == "xrandr" and "--verbose" in argv:
+            return True, XRANDR_OUT
+        if argv[0] == "gsettings" and argv[1] == "get":
+            return True, "false\n"
+        if argv[:2] == ["xrandr", "--output"] and argv[2] == "DP-1":
+            return False, ""
+        return True, ""
+
+    monkeypatch.setattr(wd_mod, "_run", one_bad)
+    (tmp_path / "winddown.json").write_text(json.dumps({
+        "at": time.time(), "until": time.time() - 1,
+        "brightness": {"HDMI-0": 1.0, "DP-1": 0.8},
+        "night_light": False, "volume": None}))
+    wd = make(tmp_path)
+    assert wd.restore() is False
+    kept = json.loads((tmp_path / "winddown.json").read_text())
+    assert kept["brightness"] == {"DP-1": 0.8}
+    assert "night_light" not in kept, "the gsettings write did come back"
+
+
+# ------------------------------------------------------- who owns the room
+def test_holding_is_the_open_window_not_merely_a_state_file(tmp_path, runs):
+    """`holding` is the seam jarvis/room.py's boot and quit heals and
+    jarvis/scenes.py ask before touching the same panel, so it has to mean
+    "deliberately held", not "a file exists"."""
+    wd = make(tmp_path, spotify=None, quiet=FakeQuiet(end=time.time() + 6 * 3600))
+    assert wd.holding is False
+    assert wd.start() is True
+    # Raised synchronously inside start(): the caller decides on the very
+    # next line whether the scene should also run, and the worker has not
+    # snapshotted anything yet.
+    assert wd.holding is True
+    assert wait_idle(wd)
+    assert wd.holding is True and wd.active is True
+
+    wd._now = lambda: time.time() + 7 * 3600          # the next morning
+    assert wd.holding is False, "an expired window is not a hold"
+    assert wd.active is True, "...but there is still something to put back"
+
+
+def test_a_forgotten_state_file_is_not_a_hold(tmp_path, runs):
+    (tmp_path / "winddown.json").write_text(json.dumps({
+        "at": time.time() - 5 * 86400, "until": time.time() + 10 * 86400,
+        "brightness": {"HDMI-0": 1.0}, "night_light": False, "volume": None}))
+    wd = make(tmp_path)
+    assert wd.active is True and wd.holding is False
+
+
+def test_a_scene_that_already_has_the_room_stands_the_wind_down_down(tmp_path,
+                                                                    runs):
+    """ONE owner. A "power down the workshop" earlier in the evening already
+    dimmed this panel through jarvis/scenes.py; snapshotting now would
+    record ITS dimmed screen as the brightness to go back to."""
+    wd = make(tmp_path, spotify=FakeSpotify())
+    wd.services.scenes = SimpleNamespace(active=lambda: "wind down")
+    assert wd.start() is False
+    assert runs == [] and not (tmp_path / "winddown.json").exists()
+
+    wd.services.scenes = SimpleNamespace(active=lambda: "")
+    assert wd.start() is True and wait_idle(wd)
+    assert (tmp_path / "winddown.json").exists()
+
+
+def test_a_broken_scene_probe_never_costs_him_his_bedtime(tmp_path, runs):
+    def boom():
+        raise RuntimeError("scene state unreadable")
+
+    wd = make(tmp_path, spotify=None)
+    wd.services.scenes = SimpleNamespace(active=boom)
+    assert wd.start() is True and wait_idle(wd)

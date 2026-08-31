@@ -286,7 +286,11 @@ def test_a_failed_command_restores_immediately(tmp_path):
     lt = light(tmp_path, run)
     state, line = lt.dim()
     assert state is None and line == room.FAILED_LINE
-    assert lt.baseline() is None, "a failed change must not stay held"
+    # The put-back's own --brightness write failed too (the same command is
+    # refused), so the baseline is KEPT for the boot heal to retry. Dropping
+    # it here was how a display held dim lost the only record of his level.
+    assert lt.baseline() is not None
+    assert lt.restore()[0] is False
 
 
 def test_returning_to_full_stops_holding_the_baseline(tmp_path):
@@ -317,3 +321,76 @@ def test_an_unreadable_state_file_is_ignored(tmp_path):
     lt = light(tmp_path, FakeRun())
     assert lt.baseline() is None
     assert lt.restore()[1] == room.NOTHING_TO_RESTORE_LINE
+
+
+# ------------------------------------------------- a restore that failed
+def test_a_restore_that_did_not_take_keeps_the_baseline_and_says_so(tmp_path):
+    """The regression: restore() used to _forget() unconditionally and
+    always answer RESTORED_LINE, so one attempt against a dead X (the boot
+    heal runs before the session is necessarily up) destroyed the only
+    record of his brightness AND reported success -- leaving the panel held
+    at 0.55 with every retry path dead, because they all gate on
+    ``changed``."""
+    run = FakeRun()
+    lt = light(tmp_path, run)
+    lt.dim()
+    assert lt.changed
+    # X goes away between the dim and the put-back.
+    run.fail_on = "--brightness"
+    ok, line = lt.restore()
+    assert ok is False
+    assert line == room.FAILED_RESTORE_LINE, "a failed restore must not claim one"
+    assert lt.changed, "the baseline is the retry; it must survive"
+    # ...and the retry, once the display answers again, actually works.
+    run.fail_on = ""
+    ok, line = lt.restore()
+    assert ok and line == room.RESTORED_LINE and not lt.changed
+
+
+def test_a_failed_night_light_write_also_keeps_the_baseline(tmp_path):
+    run = FakeRun()
+    lt = light(tmp_path, run)
+    lt.warmer()
+    run.fail_on = "gsettings set"
+    ok, line = lt.restore()
+    assert ok is False and line == room.FAILED_RESTORE_LINE
+    assert lt.baseline() is not None
+
+
+# ------------------------------------------ the wind-down's hold on boot
+def test_the_boot_heal_stands_down_while_the_wind_down_holds_the_room(tmp_path):
+    """The regression: start_assistant honours winddown.restore(
+    expired_only=True)'s "still inside the window, leave it dark" and then,
+    ninety lines later, healed the room light anyway -- driving the same
+    xrandr brightness straight back up at two in the morning."""
+    held = {"now": True}
+    run = FakeRun()
+    lt = room.RoomLight(run=run, state_path=tmp_path / "room.json",
+                        now=lambda: 1000.0, held_by=lambda: held["now"])
+    lt.dim()
+    del run.calls[:]
+
+    ok, _ = lt.restore(healing=True)
+    assert ok is False
+    assert run.writes == [], "the boot heal must not touch a held display"
+    assert lt.changed, "and it must leave the baseline for the morning"
+
+    # A deliberate "lights up" is NOT a heal and always wins, even at 2 a.m.
+    ok, line = lt.restore()
+    assert ok and line == room.RESTORED_LINE and not lt.changed
+
+
+def test_without_a_hold_the_heal_behaves_exactly_as_before(tmp_path):
+    lt = light(tmp_path)                      # no held_by seam at all
+    lt.dim()
+    assert lt.restore(healing=True)[0] is True and not lt.changed
+
+
+def test_a_hold_probe_that_raises_never_strands_the_display(tmp_path):
+    def boom():
+        raise RuntimeError("winddown is not built on this box")
+
+    lt = room.RoomLight(run=FakeRun(), state_path=tmp_path / "room.json",
+                        now=lambda: 1000.0, held_by=boom)
+    lt.dim()
+    assert lt.restore(healing=True)[0] is True and not lt.changed

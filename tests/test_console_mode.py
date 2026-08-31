@@ -170,9 +170,9 @@ def test_a_desk_watch_with_no_probe_never_starts_a_thread():
 
 
 def test_without_the_seam_a_provider_is_still_resolved():
-    """Either jarvis.desk (the desk-presence group's module) or the
-    XScreenSaver fallback — the feature must not be dark on the real box
-    because two changes landed in the other order."""
+    """Either a desk module or the XScreenSaver fallback — the feature must
+    not be dark on the real box because two changes landed in the other
+    order."""
     fn = cm.resolve_idle_fn(SimpleNamespace())
     assert callable(fn)
 
@@ -274,7 +274,9 @@ def test_the_first_thing_he_says_cancels_the_rest_of_the_sweep():
     modes.power_up(4)
     modes.note_activity()               # the reply wins
     after.run_all()
-    assert seen["stage"] == []
+    # The cancel itself delivers the settle (None); every stage the sweep
+    # had still queued is swallowed by the generation bump.
+    assert seen["stage"] == [None]
     assert modes.sweeping is False
 
 
@@ -365,3 +367,84 @@ def test_an_empty_room_renders_nothing_rather_than_placeholder_dashes():
     assert ambient.room_rows({}) == []
     assert ambient.standby_rows(None) == []
     assert ambient.slab_tone(None) == "normal"
+
+
+# ---------------------------------------------- regressions (review a/b)
+def test_the_desk_idle_fallback_finds_the_module_that_exports_the_probe():
+    """n=15. The fallback used to read `desk_idle_s` off `jarvis.desk`, a
+    module that has only ever exported `idle_seconds`; the gdbus probe of
+    that name lives in `jarvis.deskpresence`. Both documented preferences
+    were therefore dead and every standby decision silently fell through to
+    XScreenSaver."""
+    from jarvis import deskpresence
+
+    fn = cm.resolve_idle_fn(SimpleNamespace())
+    assert fn is deskpresence.desk_idle_s
+    assert fn is not cm.xss_idle_s
+
+
+def test_the_second_module_answers_when_deskpresence_is_missing(monkeypatch):
+    """n=15. The chain must survive either merge order, so jarvis.desk's
+    own probe is the next candidate — under its real name."""
+    from jarvis import desk
+
+    real = cm.importlib.import_module
+
+    def only_desk(name):
+        if name == "jarvis.deskpresence":
+            raise ImportError("not merged yet")
+        return real(name)
+    monkeypatch.setattr(cm.importlib, "import_module", only_desk)
+    assert cm.resolve_idle_fn(SimpleNamespace()) is desk.idle_seconds
+
+
+def test_with_no_desk_module_at_all_the_room_clock_still_ticks(monkeypatch):
+    def nothing(name):
+        raise ImportError(name)
+    monkeypatch.setattr(cm.importlib, "import_module", nothing)
+    assert cm.resolve_idle_fn(SimpleNamespace()) is cm.xss_idle_s
+
+
+def test_a_barge_in_mid_sweep_unlatches_the_partial_reveal():
+    """n=24. The reveal count is a latch: BoardWindow._revealed and the room
+    slab's _reveal keep drawing only the first N panels until someone sends
+    None. Cancelling the sweep by bumping the generation swallowed the
+    schedule's terminal None along with everything else, so a barge-in
+    halfway through the power-up left the Board short of panels until the
+    NEXT DAY's once-a-day sweep."""
+    modes, after, seen = driver()
+    modes.power_up(4)
+    jobs, after.jobs = after.jobs, []
+    jobs[0][1]()                        # the first panel is revealed
+    jobs[1][1]()                        # and the second
+    assert seen["stage"] == [1, 2]
+    modes.note_activity()               # he speaks over the sweep
+    for _ms, fn in jobs[2:]:
+        fn()
+    after.run_all()
+    assert seen["stage"][-1] is None    # the latch is released
+    assert seen["stage"] == [1, 2, None]
+    assert modes.sweeping is False
+
+
+def test_ordinary_utterances_do_not_redraw_the_board_every_time():
+    """n=24. note_activity runs on EVERY utterance; emitting the settle
+    unconditionally would force a Board + room-slab redraw each turn."""
+    modes, after, seen = driver()
+    modes.power_up(2)
+    after.run_all()
+    assert seen["stage"] == [1, 2, None]
+    modes.note_activity()
+    modes.note_activity()
+    assert seen["stage"] == [1, 2, None]
+
+
+def test_a_raising_stage_callback_never_escapes_a_cancel():
+    def boom(_count):
+        raise RuntimeError("the board is gone")
+    after = FakeAfter()
+    modes = cm.ConsoleModes(after=after, on_stage=boom,
+                            option=lambda k, d=None: d)
+    modes.power_up(3)
+    modes.note_activity()               # must not raise through the cancel
+    assert modes.sweeping is False

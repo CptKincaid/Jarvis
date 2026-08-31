@@ -345,3 +345,29 @@ def test_the_tool_loop_journals_each_call():
     assert b._context.rows == [("get_mail", {"limit": 1}, True, "1 unread"),
                                ("x", None, False, "")]
     JarvisBrain(SimpleNamespace(), None)._journal_tool("y", {}, ToolResult(text=""))  # no hook: fine
+
+
+# ------------------------------------------------------- shadowed defs
+def test_ordinal_is_defined_exactly_once_at_module_scope():
+    """Regression: a table-driven `_ordinal` sat above `when_words` and was
+    silently shadowed by the modulo one below it, orphaning
+    `_ORDINAL_SUFFIX`.  Two bodies that agree today diverge on the next
+    edit, and this branch has taken that merge seam four times."""
+    import ast
+    import inspect
+    tree = ast.parse(inspect.getsource(journal_mod))
+    defs = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
+    dupes = sorted({n for n in defs if defs.count(n) > 1})
+    assert dupes == [], f"shadowed module-level defs: {dupes}"
+    assert not hasattr(journal_mod, "_ORDINAL_SUFFIX"), \
+        "the orphaned lookup table is back; it only knows 1-31"
+
+
+def test_ordinal_survives_an_unbounded_repeat_count():
+    """`_tool_clause` passes a repeat count, not a day of the month: the
+    deleted table copy answered "32th" / "41th" past 31."""
+    assert journal_mod._ordinal(32) == "32nd"
+    assert journal_mod._ordinal(41) == "41st"
+    assert journal_mod._ordinal(111) == "111th"
+    assert [journal_mod._ordinal(n) for n in (1, 2, 3, 11, 12, 13, 21)] == \
+        ["1st", "2nd", "3rd", "11th", "12th", "13th", "21st"]

@@ -261,6 +261,30 @@ def leave_query_kind(text: str) -> Optional[str]:
     return m.group("place").strip(" .,") if m else None
 
 
+# "forget the walk to Wisenbaker" -- the way OUT of the table. A walk is
+# taught by voice from a half-heard number ("it takes ten minutes to get to
+# Wisenbaker"), so a wrong one is entirely routine, and until this matcher
+# existed FORGOT_LINE and LeadTable.forget() were both dead: there was no
+# command, so a mistaught lead could only be overwritten, never revoked,
+# and a building learned as "2 minutes" kept its silent-and-wrong heads-up
+# forever. "the walk"/"how long" both appear because they are the two
+# phrasings the set and query commands already teach him to say.
+_FORGET_RX = re.compile(
+    r"^forget\s+(?:the\s+)?(?:walk\s+to\s+|ride\s+to\s+|drive\s+to\s+"
+    r"|how\s+long\s+(?:it\s+takes\s+)?to\s+(?:get\s+to\s+|walk\s+to\s+)?)"
+    r"(?P<place>[a-z][^?]{1,40})$", re.I)
+
+
+def leave_forget_kind(text: str) -> Optional[str]:
+    """"forget the walk to Wisenbaker" -> "Wisenbaker".
+
+    Deliberately narrow: the bare undo words ("forget it", "scratch that")
+    belong to _UNDO_RX / the no-phrases in commander.py, and a matcher that
+    swallowed them would eat every dismissal in the app."""
+    m = _FORGET_RX.match(" ".join(str(text or "").split()).strip(" .!?"))
+    return m.group("place").strip(" .,") if m else None
+
+
 def leave_line(notice_min: int, place: str, lead_min: int) -> str:
     """The heads-up itself. ``notice_min`` 0 means "right now"."""
     walk = f"{place} is a {lead_min} minute walk" if lead_min else place
@@ -465,6 +489,21 @@ class LeaveTimes:
         self._save()
         log.info("leavetime: %s learned as %d min", key, value)
         return value
+
+    def forget(self, key: str) -> None:
+        """Drop a learned walk and let it be asked about again.
+
+        `LeadTable.forget` alone is not enough: `_asked` is what stops the
+        proactive "How long do you need to get to X, sir?" from ever firing
+        twice, so forgetting without clearing it left the building unknown
+        AND unaskable -- no leave line and no way back to one short of an
+        outright "it takes N minutes to get to X". `_filed` is keyed by
+        event, not by building, and those reminders are already in the
+        timekeeper's hands, so they are left alone."""
+        self.table.forget(key)
+        self._asked.pop(key, None)
+        self._save()
+        log.info("leavetime: %s forgotten", key)
 
     # -------------------------------------------------------------- tick
     def _events(self) -> list:
