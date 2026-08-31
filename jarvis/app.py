@@ -61,6 +61,7 @@ from jarvis.events import (
     SpeakingState)
 from jarvis.logs import get_logger
 
+from jarvis import address as address_mod
 from jarvis import board as board_mod
 from jarvis import brain as brain_mod
 from jarvis import debrief as debrief_mod
@@ -270,6 +271,12 @@ class JarvisApp:
     def __init__(self):
         # ---- assistant config first: everything below reads it ------------
         self.assistant = AssistantConfig.load()
+        # How often "sir" lands on the ear (jarvis/address.py). Installed as
+        # module state, the way earcons.set_config is, because the two join
+        # sites that need it -- quiet.digest and speak_queue's watcher -- are
+        # module functions with no config of their own. A config edit needs a
+        # restart: AssistantConfig.reload_if_changed() has no callers.
+        address_mod.set_config(self.assistant)
         self._discord_active_until = 0.0
         self._discord_last_post = ("", 0.0)
         self._last_milestone: dict[str, str] = {}
@@ -708,12 +715,32 @@ class JarvisApp:
         log.info("tools registered: %s", self.tools.names())
 
     # ---------------------------------------------------------------- speech
+    def _thin_address(self, fragments):
+        """The fragments of one spoken burst as they should be SPOKEN: the
+        first "sir" survives, later trailing ones go (jarvis/address.py).
+
+        Takes a LIST, never a finished string. That is the whole lesson of
+        the first attempt: on a rendered line Jarvis's own words and an
+        interpolated mail subject or track title are indistinguishable, and a
+        \bsir\b match eats "Sir Isaac Newton". Guarded end to end -- a
+        failure here speaks the lines as written, because a doubled courtesy
+        is a far smaller bug than a mangled sentence."""
+        try:
+            return address_mod.thin_fragments(fragments)
+        except Exception:
+            log.exception("address thinning failed; speaking as written")
+            return list(fragments)
+
     def _say(self, text, proactive=False, kind="message"):
         """The one door to TTS. ``proactive=True`` marks a line Jarvis
         decided to say on his own (watchdog, reminder, heads-up, narrator);
         quiet hours / DND / a running meeting / an empty room hold those
         for the catch-up digest (jarvis/quiet.py). Answers, alarms and
-        approval questions pass the default False and are never held."""
+        approval questions pass the default False and are never held.
+
+        Nothing is rewritten on the way through this door. Address thinning
+        happens at the JOIN sites, where the fragments of a burst are still
+        separate authored lines (jarvis/address.py)."""
         # A quiet socket turn (python -m jarvis.ask -q, or an intercom clip
         # sent without speak) is answered in text only. Per turn, not a
         # global toggle: a voice turn that lands while the socket answer is
@@ -736,6 +763,8 @@ class JarvisApp:
                     return
             except Exception:
                 log.exception("quiet gate failed; speaking")
+        # Nothing is rewritten here. A line arriving at this door is already
+        # rendered -- third-party text and all -- and is spoken as written.
         self.tts.speak(text)
 
     def _async_reply(self, text, speak=True):
@@ -1125,7 +1154,12 @@ class JarvisApp:
                     if not streamed:          # streamed sentences already spoke
                         self._say(content)
                     if offer:
-                        self._say(offer)
+                        # THE JOIN: the briefing's wake-alarm offer is spoken
+                        # straight after the reply, so the two are one burst
+                        # ("...that's your day, sir. Shall I wake you at
+                        # 7:00, sir?"). The reply is the first fragment and
+                        # is never rewritten (jarvis/address.py).
+                        self._say(self._thin_address([content, offer])[-1])
                         offer = ""
                         # the answer window opens whatever the source: the
                         # question was put to him aloud
@@ -1364,7 +1398,14 @@ class JarvisApp:
         def earcon():
             return earcons.play(arrival_mod.ARRIVAL_EARCON)
 
+        # The arrival cue is ONE burst spoken over two _say calls (welcome,
+        # then the catch-up digest), so the fragments have to be thinned
+        # against each other rather than one at a time. This is that burst's
+        # ledger; it lives for the length of one cue.
+        burst: list = []
+
         def greeting():
+            burst.append(WELCOME_LINE)
             self._say(WELCOME_LINE)
             return True
 
@@ -1374,9 +1415,22 @@ class JarvisApp:
                 return False
             # release() drains atomically: the policy's own tick would read
             # the same backlog, and whichever gets there first says it.
-            digest = quiet.release()
+            frags = quiet.release_fragments()
+            if not frags:
+                return False
+            # THE JOIN (7 sentences, 5 sirs measured): "Welcome back, sir."
+            # has already addressed him, so the digest's own later vocatives
+            # are the ones that go. The digest arrives as FRAGMENTS and is
+            # thinned exactly once, here, against the welcome in front of it
+            # -- release() would have joined it into one finished string
+            # first, and thinning a finished string is the mode that killed
+            # the first attempt (jarvis/address.py). Then both shown and
+            # spoken, so the card he reads and the voice he hears agree.
+            thinned = self._thin_address(burst + list(frags))
+            digest = address_mod.join_thinned(thinned[len(burst):])
             if not digest:
                 return False
+            burst[:] = thinned
             bus.publish(JarvisReply(text=digest, speak=True))
             self._say(digest)
             return True
@@ -2440,17 +2494,42 @@ class JarvisApp:
         except Exception:
             log.exception("day review for the first wake failed")
             review = ""
-        if review:
-            self._say(review)
+        # THE JOIN, and the longest burst in the live log: measured at
+        # 14:33:49-14:34:29 as 40 seconds of unbroken speech over seven TTS
+        # segments carrying FOUR sirs. The review, the weekly lines and the
+        # hand-over below are four _say calls with nothing between them, so
+        # they are ONE burst and have to be thinned against each other the
+        # way the arrival cue is -- fragments, never a joined string.
+        burst: list = []
+
+        def say_in_burst(line):
+            """Speak ``line`` as the next fragment of this burst."""
+            if not line:
+                return
+            burst.append(line)
+            # Stable by construction: the pass reads left to right and never
+            # rewrites the first fragment, so re-thinning what was already
+            # spoken cannot change it (jarvis/address.py, invariant 1).
+            burst[:] = self._thin_address(burst)
+            spoken = burst[-1]
+            if address_mod.is_speakable(spoken):
+                self._say(spoken)
+
+        say_in_burst(review)
         # Then the two weekly lines, if either is owed. Both are produced
         # in the small hours by their own threads and deliberately NOT
         # spoken there: this path is the quiet-gated one (_briefing_due
         # refuses inside quiet hours), so a report written at 3 am is
         # heard at breakfast and never at 3 am.
         for line in (self._pending_week_line(), self._pending_garden_line()):
-            if line:
-                self._say(line)
-        self._say("Your briefing for today, sir.")
+            say_in_burst(line)
+        # The model's own reply lands after this through brain.chat and is
+        # NOT in the ledger: it is one authored-shaped line with exactly one
+        # sir (24/24 measured), and catching it would mean rewriting at the
+        # TTS door, which is the thing this design does not do. Four sirs
+        # become two: the review keeps the burst's first, the reply keeps
+        # its own.
+        say_in_burst("Your briefing for today, sir.")
         try:
             brain.chat("my morning briefing", force_tool="get_briefing")
         except Exception:

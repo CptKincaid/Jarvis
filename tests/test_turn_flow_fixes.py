@@ -35,7 +35,10 @@ def _app(monkeypatch, tmp_path, **over):
     a._turn_filler_pending = False
     a._last_source, a._last_user_text = "voice", "hello"
     a.said = []
-    a._say = a.said.append
+    # Shaped like the real door (app._say), keywords and all: callers pass
+    # proactive/kind, and a fake that only took the text would swallow a
+    # signature change as an arrival step "failing".
+    a._say = lambda text, proactive=False, kind="message": a.said.append(text)
     a._wake_chime_enabled = lambda: False   # chime timing is not under test
     a.context = SimpleNamespace(add_exchange=lambda u, j: a.exchanges.append((u, j)))
     a.exchanges = []
@@ -335,12 +338,14 @@ def test_a_barge_mute_dies_with_the_next_dispatch(monkeypatch, tmp_path):
 def test_welcome_back_defers_only_for_a_non_away_reason(monkeypatch, tmp_path):
     from jarvis.presence import WELCOME_LINE
     a = _app(monkeypatch, tmp_path)
+    # release_fragments, not release: the catch-up is thinned against the
+    # welcome in front of it while both are still fragments (jarvis/address.py).
     a.quiet = SimpleNamespace(reason=lambda: "quiet hours until 7:00 am",
-                              release=lambda: "held stuff")
+                              release_fragments=lambda: ["held stuff"])
     a._on_presence(SimpleNamespace(home=True, returned=True))
     assert a.said == [], "the greeting must wait out quiet hours"
     a.quiet = SimpleNamespace(reason=lambda: "you're out",   # stale away reading
-                              release=lambda: "held stuff")
+                              release_fragments=lambda: ["held stuff"])
     a._on_presence(SimpleNamespace(home=True, returned=True))
     assert a.said == [WELCOME_LINE, "held stuff"]
 

@@ -248,7 +248,9 @@ def test_digest_counts_by_kind_and_reads_every_line():
              (0, "Memory is getting tight, sir: 12 GB free.", "warning")]
     text = digest(items)
     assert text.startswith(BUSY_PREFIX + ": two reminders and one warning. ")
-    assert "Call mum. Sir, this is your reminder. Submit the lab. Memory" in text
+    # One summons announces the list; the second copy of it is the chant the
+    # address pass thins (jarvis/address.py, defect D4).
+    assert "Call mum. This is your reminder. Submit the lab. Memory" in text
     assert digest([]) == ""
 
 
@@ -275,7 +277,10 @@ def test_free_ends_the_window_early_and_reads_the_digest():
     assert p.should_hold()
     p.hold("Memory is getting tight, sir.", "warning")
     line = p.free()
-    assert line.startswith(FREE_LINE + " " + BUSY_PREFIX + ": one warning.")
+    # "Very good, sir." has already addressed him, so the digest behind it
+    # opens "While you were busy:" -- the join thins across the fragments
+    # (jarvis/address.py, tests/test_address.py).
+    assert line.startswith(FREE_LINE + " While you were busy: one warning.")
     assert not p.is_quiet()
     # ...for the rest of THIS window only
     assert cfg.get("quiet.free_until") == datetime(2026, 9, 1, 7, 0).timestamp()
@@ -499,7 +504,9 @@ def test_welcome_back_once_per_return_with_the_held_lines(monkeypatch):
     home[0] = True
     a._on_presence(Presence(home=True, since=2.0, returned=True))
     assert a.tts.spoken[0] == "Welcome back, sir."
-    assert a.tts.spoken[1].startswith(AWAY_PREFIX + ": one reminder.")
+    # One burst over two _say calls: the welcome keeps the address and the
+    # catch-up behind it drops its own (jarvis/address.py).
+    assert a.tts.spoken[1].startswith("While you were out: one reminder.")
     a._on_presence(Presence(home=True, since=3.0, returned=False))   # boot-time "home"
     assert len(a.tts.spoken) == 2
 
@@ -570,7 +577,7 @@ def test_i_am_free_reads_what_was_held(cmdr):
     cmdr.handle("do not disturb for an hour", source="typed")
     cmdr.policy.hold("Sir, this is your reminder. Call mum", "reminder")
     res = cmdr.handle("I am free", source="typed")
-    assert res.reply.startswith(FREE_LINE + " " + BUSY_PREFIX + ": one reminder.")
+    assert res.reply.startswith(FREE_LINE + " While you were busy: one reminder.")
     assert not cmdr.policy.is_quiet()
     res = cmdr.handle("what did I miss", source="typed")
     assert res.reply == NOTHING_HELD_LINE

@@ -183,7 +183,28 @@ DEFAULTS: dict = {
     # mode", "banter up") and read back at app start. It is baked into the
     # STATIC Tier 2 prompt, so a change costs exactly one prefix reprocess
     # and every turn afterwards is cached again.
-    "persona": {"register": "normal"},
+    # address_per_burst: how many times Jarvis may say "sir" in ONE spoken
+    # burst, where a burst is several already-finished lines JOINED into one
+    # utterance -- the catch-up digest, the arrival welcome plus catch-up,
+    # the first-wake morning briefing, a compound turn's two answers, and
+    # the speak-queue watcher. That join is the only place sirs were ever
+    # measured to stack; a single line already carries exactly one, so this
+    # knob changes nothing about ordinary replies (jarvis/address.py).
+    # 1 is that measured rate; raise it to loosen the cut, or set
+    # address_thinning false to turn the pass off. Only a sign-off is ever
+    # dropped -- one that ends its fragment ("The build passed, sir.") or
+    # ends a clause the same sentence runs on from ("Memory is tight, sir:
+    # 3 gigabytes free."), and never one inside a quotation or with a new
+    # SENTENCE behind it, which is the shape of an interpolated mail subject
+    # or a quoted line. A "Sir, ..." summons goes only
+    # when the SAME summons has already been spoken in that burst ("Sir,
+    # this is your reminder" five times over is the chant; the first one
+    # stays). A lone fragment is never rewritten, the first fragment of a
+    # burst is never rewritten, and a burst that went in with an address
+    # always comes out with one, so this cannot be edited into a Jarvis who
+    # stops saying it. Read at start-up: a change needs a restart.
+    "persona": {"register": "normal", "address_thinning": True,
+                "address_per_burst": 1},
     "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],

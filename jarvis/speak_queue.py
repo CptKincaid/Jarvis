@@ -23,6 +23,7 @@ import threading
 from pathlib import Path
 from typing import Callable, Optional
 
+from jarvis import address
 from jarvis.config import PATHS
 from jarvis.logs import get_logger
 
@@ -144,10 +145,15 @@ class Watcher:
                 f.truncate(0)             # truncate after reading
             self._pos = 0
             # Combine all new lines into one utterance (legacy 4717-4720).
-            combined = " ".join(
+            # THE JOIN, and the worst sir-stacker measured: every queued line
+            # is a finished spoken line that ends ", sir." and this hands ten
+            # of them to the TTS as ONE utterance (10 sentences, 10 sirs
+            # observed live). Thinned across the fragments here, while they
+            # are still separate lines -- see jarvis/address.py.
+            combined = address.join_fragments([
                 line.strip() for line in new_lines.strip().splitlines()
                 if line.strip()
-            )
+            ])
             if not combined:
                 return
             log.info("talk-back queue: %.60s", combined)

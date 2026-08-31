@@ -50,6 +50,7 @@ from collections import deque
 from datetime import datetime, timedelta
 from typing import Callable, Optional
 
+from jarvis import address
 from jarvis import courses as courses_mod
 from jarvis.logs import get_logger
 
@@ -458,9 +459,16 @@ class QuietPolicy:
                 ends.append(ev.end.timestamp())
             if ends:
                 self._set("quiet.free_until", max(ends))
-            digest = self.release(prefix=BUSY_PREFIX)
-            if digest:
-                return f"{FREE_LINE} {digest}"
+            frags = self.release_fragments(prefix=BUSY_PREFIX)
+            if frags:
+                # THE JOIN (7 sentences, 5 sirs measured). "Very good, sir."
+                # in front of a digest that opens "While you were busy, sir:"
+                # says it twice before a held line has been read at all; the
+                # acknowledgement is first, so it is the one that survives.
+                # The digest's own fragments, NOT the string release() would
+                # have joined: thinning a finished multi-sentence string is
+                # the mode that killed the first attempt (jarvis/address.py).
+                return address.join_fragments([FREE_LINE] + frags)
             return FREE_LINE if was else DND_ALREADY_FREE_LINE
 
     # ------------------------------------------------------------- hold
@@ -485,17 +493,29 @@ class QuietPolicy:
         with self._lock:
             return list(self._held)
 
-    def release(self, prefix: Optional[str] = None) -> str:
-        """Drain the held lines into one spoken digest ("" when empty)."""
+    def release_fragments(self, prefix: Optional[str] = None) -> list:
+        """Drain the held lines into the FRAGMENTS of one spoken digest
+        ([] when empty) -- the prefix line and then each held line, still
+        separate.
+
+        This is the primitive and ``release`` is the joined form of it: a
+        burst that is joined and then thinned again as a finished string is
+        exactly what jarvis/address.py refuses to do, so a caller that has
+        more to say in the same burst (the arrival cue, "I am free") takes
+        the fragments and joins once."""
         with self._lock:
             items = list(self._held)
             self._held.clear()
             reason = self._last_reason
         if not items:
-            return ""
+            return []
         if prefix is None:
             prefix = AWAY_PREFIX if reason == "you're out" else BUSY_PREFIX
-        return digest(items, prefix)
+        return digest_fragments(items, prefix)
+
+    def release(self, prefix: Optional[str] = None) -> str:
+        """Drain the held lines into one spoken digest ("" when empty)."""
+        return address.join_fragments(self.release_fragments(prefix))
 
     # ----------------------------------------------------------- thread
     def tick(self) -> str:
@@ -561,11 +581,15 @@ def _hm(ts: float) -> tuple:
     return dt.hour, dt.minute
 
 
-def digest(items, prefix: str = BUSY_PREFIX) -> str:
-    """"While you were busy, sir: two reminders and a warning. <lines>"."""
+def digest_fragments(items, prefix: str = BUSY_PREFIX) -> list:
+    """The digest as SEPARATE fragments: the prefix line, then each held line.
+
+    Every one of them is still a whole authored line here, which is the only
+    state in which they can safely be thinned against each other -- see
+    jarvis/address.py."""
     items = list(items)
     if not items:
-        return ""
+        return []
     counts: dict[str, int] = {}
     for _, _, kind in items:
         counts[kind] = counts.get(kind, 0) + 1
@@ -579,4 +603,23 @@ def digest(items, prefix: str = BUSY_PREFIX) -> str:
         if text and text[-1] not in ".!?":
             text += "."
         lines.append(text)
-    return f"{prefix}: {_join_and(parts)}. " + " ".join(lines)
+    # Every word of the head is quiet.py's own -- the prefix constant and the
+    # counts it just made, no slot anywhere in it -- so it is certified
+    # (jarvis/address.py, Authored). The colon no longer needs the
+    # certificate (a clause the sentence runs on from is droppable on its
+    # own); it is kept because the head is the one fragment in this repo
+    # that is provably Jarvis's end to end, and because the certificate is
+    # what a later prefix ending in a full stop would need.
+    head = address.authored(f"{prefix}: {_join_and(parts)}.")
+    return [head] + lines
+
+
+def digest(items, prefix: str = BUSY_PREFIX) -> str:
+    """"While you were busy, sir: two reminders and a warning. <lines>".
+
+    THE JOIN. Measured at 6 sentences and 4 sirs: the prefix says it once and
+    then every held line says it again -- and with five held reminders it is
+    "Sir, this is your reminder" five times over. The prefix's own "sir" is
+    the first and therefore the survivor; the second and later copies of one
+    summons are thinned to the sentence behind them (jarvis/address.py)."""
+    return address.join_fragments(digest_fragments(items, prefix))
