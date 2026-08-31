@@ -57,6 +57,7 @@ from jarvis.events import (
 from jarvis.logs import get_logger
 
 from jarvis import brain as brain_mod
+from jarvis import debrief as debrief_mod
 from jarvis import desktop as desktop_mod
 from jarvis import speak_queue, standup, voice_check
 from jarvis import vocab as vocab_mod
@@ -65,8 +66,9 @@ from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
 from jarvis import garden as garden_mod
 from jarvis.brain import JarvisBrain
-from jarvis.commander import (COURTESY_REPLIES, DESTRUCTIVE_TTL_S, Commander,
-                              parse_yes_no)
+from jarvis.commander import (COURTESY_REPLIES, DESTRUCTIVE_TTL_S,
+                              CommandResult, Commander, parse_yes_no,
+                              strip_jarvis_prefix)
 from jarvis.context import ContextEngine
 from jarvis.history import TypedHistory
 from jarvis.hotword import Hotword
@@ -220,6 +222,15 @@ class _Speculation:
 
 
 class JarvisApp:
+    # Class-level defaults for the state __init__ sets, so a test that
+    # builds a partial app (tests/test_destructive_readback.py uses
+    # object.__new__ and fills in only the commander) still has them. The
+    # two features that hang off a turn are optional by construction:
+    # without a debrief watch or an aside engine they are simply absent.
+    _pending_debrief = None
+    aside = None
+    debrief = None
+
     def __init__(self):
         # ---- assistant config first: everything below reads it ------------
         self.assistant = AssistantConfig.load()
@@ -341,6 +352,11 @@ class JarvisApp:
         self.commander.on_uncertain = self._on_uncertain
         self.commander.claim_uncertain = self._claim_uncertain
         self._pending_uncertain: dict = {}      # request_id -> utterance
+        # The open debrief question (jarvis/debrief.py), modelled on
+        # _pending_uncertain: a context dict the NEXT transcript is filed
+        # against instead of being routed to commander.handle. Cleared on
+        # a wake word, and on anything that is plainly a command.
+        self._pending_debrief = None
         self._uncertain_lock = threading.Lock()
         # Set while a captured clip is being transcribed. recorder.recording
         # is already False by then, so it cannot serve as the guard.
@@ -806,6 +822,14 @@ class JarvisApp:
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
             quiet=self.quiet, presence=self.presence,
+            # Reasoned dissent + the Aside (jarvis/objections.py,
+            # jarvis/aside.py). Both are parked here rather than reached
+            # for by import so a stand-in services namespace in the tests
+            # simply has neither and both features go quiet. `deadlines`
+            # is the DeadlineHeadsUp itself, read ONLY through its
+            # snapshot() -- never its fetch.
+            aside=None, deadlines=None,
+            journal_objection=self._journal_objection,
         )
 
     # ------------------------------------------------------- brain executor
@@ -946,6 +970,19 @@ class JarvisApp:
         elif ev.state == "cancelled":
             self._last_milestone.pop(ev.task_id, None)
             bus.publish(Status(text="Claude task cancelled", kind="info"))
+
+    def _journal_objection(self, source, reason, row):
+        """An objection, in the episodic record. The nightly self-review
+        reads the LOG rather than this (dayreview.py parses jarvis.log and
+        turns.jsonl and has never touched the journal); this is what makes
+        "why did you argue with me about that alarm" answerable later."""
+        journal = getattr(self.context, "journal_tool", None)
+        if journal is None:
+            return
+        try:
+            journal("objection", {"source": source, "row": row}, True, reason)
+        except Exception:
+            log.exception("journal objection failed")
 
     def _journal_claude(self, project, state, text):
         journal = getattr(self.context, "journal_claude", None)
@@ -1248,6 +1285,10 @@ class JarvisApp:
                 log.exception("barge-in interrupt failed")
         self.turns.mark("wake")            # accepted: this turn starts now
         self._followup_after_speech = False   # a wake supersedes any follow-up
+        # A wake word means he has come back with something of his own; the
+        # open debrief question is over, and treating "Jarvis, set a timer"
+        # as an answer about the midterm would file nonsense forever.
+        self._pending_debrief = None
         self._turn_filler_pending = False     # a stale flag would label this answer a filler
         self._say_again_count = 0
         self._wake_pending = True             # the capture about to open answers a wake word
@@ -1555,6 +1596,11 @@ class JarvisApp:
             self.context.add_exchange(text, reply)
             if source == "voice" and result.speak and CONFIG.talkback:
                 self._followup_after_speech = True
+        if done and getattr(result, "speak", False):
+            # After the answer, never inside it. _emit_result has already
+            # queued the reply, and TTS.speak is FIFO, so this lands as its
+            # own beat behind it (jarvis/aside.py).
+            self._consider_aside(text, result)
         if source == "voice":
             if status.startswith("Briefing"):
                 self._mark_briefing_delivered()
@@ -1562,6 +1608,103 @@ class JarvisApp:
                 pass        # no answer here: the briefing waits for a real turn
             elif (reply or not done) and self._briefing_due():
                 self._briefing_pending = True
+
+    # ------------------------------------------------------- the debrief
+    DEBRIEF_TTL_S = 120.0
+    DEBRIEF_FILED_LINE = "Noted, sir."
+    DEBRIEF_DECLINED_LINE = "Of course, sir."
+
+    def _ask_debrief(self, cand):
+        """DebriefWatch found something that ended: ask, once.
+
+        Called from the watch's own thread. Deliberately NOT proactive: the
+        quiet gate was already checked inside tick(), and holding this line
+        for the catch-up digest would ask how last night's exam went over
+        breakfast, hours after the moment it belonged to."""
+        if not CONFIG.talkback:
+            return
+        if self._turn_busy.is_set() or self._audio_busy.is_set() \
+                or getattr(self.recorder, "recording", False):
+            return                          # mid-turn: he is talking already
+        tts = getattr(self, "tts", None)
+        if getattr(tts, "is_speaking", False) or getattr(tts, "pending", 0):
+            return
+        if self._pending_debrief or getattr(self, "_pending_uncertain", None):
+            return                          # one open question at a time
+        watch = getattr(self, "debrief", None)
+        if watch is not None:
+            # Written when the question is PUT, not when it is answered: an
+            # unanswered debrief has still been asked, and asking twice is
+            # the one thing this feature must never do.
+            watch.mark_asked(cand.key)
+        self._pending_debrief = {"key": cand.key, "cand": cand,
+                                 "at": time.monotonic()}
+        log.info("debrief asked: %r", cand.question)
+        bus.publish(JarvisReply(text=cand.question, speak=True))
+        self._followup_after_speech = True   # answer it without the wake word
+        self._say(cand.question)
+
+    def _debrief_reply(self, text, source):
+        """The open debrief owns this transcript -- or gives it up.
+
+        Gives it up for anything that is plainly a command (a Tier-1 match,
+        a "jarvis" prefix) and for anything that arrives more than
+        DEBRIEF_TTL_S later: "set a timer for five minutes" is not how the
+        midterm went, and filing it as such would poison the record he is
+        meant to be able to trust months from now."""
+        pending = self._pending_debrief
+        if pending is None or source not in ("voice", "typed"):
+            return None
+        if time.monotonic() - pending["at"] > self.DEBRIEF_TTL_S:
+            self._pending_debrief = None
+            return None
+        commander = getattr(self, "commander", None)
+        try:
+            addressed = strip_jarvis_prefix(text) is not None or \
+                bool(commander and commander._match_assistant(text))
+        except Exception:  # noqa: BLE001 - a matcher failure must not eat the turn
+            addressed = False
+        if addressed:
+            self._pending_debrief = None
+            return None
+        self._pending_debrief = None
+        cand = pending["cand"]
+        if parse_yes_no(text) is False:
+            # "Not now" / "never mind": he has been asked, and the ledger
+            # already says so, so he is never asked again. Nothing is filed.
+            log.info("debrief declined for %r", cand.title)
+            return CommandResult(handled=True, reply=self.DEBRIEF_DECLINED_LINE,
+                                 speak=True, status="Debrief declined")
+        filed = debrief_mod.file_answer(text, cand, memory=self.memory,
+                                        context=self.context)
+        if not filed:
+            return None
+        return CommandResult(handled=True, reply=self.DEBRIEF_FILED_LINE,
+                             speak=True, status=f"Debrief filed: {cand.word}")
+
+    # ------------------------------------------------------------ asides
+    def _consider_aside(self, text, result):
+        """One volunteered sentence after the answer, or nothing.
+
+        Queued as a SEPARATE utterance behind the reply, not spliced into
+        it: TTS.speak is a FIFO worker, so the answer plays first and the
+        aside follows it as its own beat -- which is what makes it read as
+        an afterthought rather than as part of the sentence he asked for.
+        The engine owns every gate (quiet, budget, the shared said-keys
+        ledger); this only carries the structured action result across."""
+        engine = getattr(self, "aside", None)
+        action = getattr(result, "action", None)
+        if engine is None or action is None:
+            return
+        try:
+            line = engine.consider(text, getattr(result, "reply", "") or "", action)
+        except Exception:
+            log.exception("aside consider failed")
+            return
+        if not line:
+            return
+        bus.publish(JarvisReply(text=line, speak=True))
+        self._say(line)                  # never proactive: see jarvis/aside.py
 
     def _after_speech(self):
         """Jarvis just finished a spoken burst: deliver a pending first-wake
@@ -2273,7 +2416,13 @@ class JarvisApp:
         # text has none, and a stand-in commander need not take the keyword.
         kw = {} if confidence is None else {"confidence": confidence}
         try:
-            result = self._emit_result(self.commander.handle(text, source, **kw))
+            # An open debrief question owns this transcript unless it is
+            # plainly a command -- the answer is FILED, never routed to the
+            # model as chat (jarvis/debrief.py).
+            filed = self._debrief_reply(text, source)
+            result = self._emit_result(
+                filed if filed is not None
+                else self.commander.handle(text, source, **kw))
             corrected = getattr(result, "corrected", None)
             if corrected:
                 self._last_user_text = corrected
@@ -2638,6 +2787,10 @@ class JarvisApp:
                 get_calendar=lambda: getattr(self.services, "calendar", None))
             if self.timekeeper is not None:
                 self.deadlines.start()
+            # Read ONLY through snapshot(): jarvis/aside.py and
+            # jarvis/objections.py both run inside a spoken turn, where a
+            # live canvas.fetch_due would put the network on the reply path.
+            self.services.deadlines = self.deadlines
         except Exception:
             log.exception("deadline heads-up failed to start")
         # The three pollers of jarvis/watchers.py. Each is dark-safe (no
@@ -2668,6 +2821,32 @@ class JarvisApp:
             self.keyword_watch.start()
         except Exception:
             log.exception("keyword watch failed to start")
+        try:
+            from jarvis.aside import AsideEngine
+            self.aside = AsideEngine(
+                cfg=self.assistant,
+                get_calendar=lambda: getattr(self.services, "calendar", None),
+                get_deadlines=lambda: getattr(self.services, "deadlines", None),
+                quiet=self.quiet,
+                state_path=PATHS.MEMORY_DIR / "aside_state.json",
+                # The keys the OTHER two doors have already filed a spoken
+                # reminder under: whatever is in here is not volunteered.
+                filed_paths=(PATHS.MEMORY_DIR / "deadlines_state.json",
+                             PATHS.MEMORY_DIR / "headsup_state.json"))
+            self.services.aside = self.aside
+        except Exception:
+            log.exception("aside engine failed to start")
+        try:
+            from jarvis.debrief import DebriefWatch
+            self.debrief = DebriefWatch(
+                cfg=self.assistant,
+                get_calendar=lambda: getattr(self.services, "calendar", None),
+                quiet=self.quiet, presence=self.presence,
+                state_path=PATHS.MEMORY_DIR / "debrief_state.json",
+                on_candidate=self._ask_debrief)
+            self.debrief.start()
+        except Exception:
+            log.exception("debrief watch failed to start")
         if residency:
             try:
                 # boot warm-up on its own daemon thread, then every 5 min
@@ -2801,6 +2980,7 @@ class JarvisApp:
                           ("gradewatch", getattr(self, "gradewatch", None)),
                           ("mailwatch", getattr(self, "mailwatch", None)),
                           ("keyword_watch", getattr(self, "keyword_watch", None)),
+                          ("debrief", getattr(self, "debrief", None)),
                           ("focus", getattr(self, "focus", None)),
                           ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),

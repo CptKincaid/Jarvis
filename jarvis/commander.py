@@ -78,11 +78,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from jarvis import aside as aside_mod
 from jarvis import lecture as lecture_mod
 from jarvis import mathspeak
+from jarvis import objections as objections_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
 from jarvis.config import CONFIG, PATHS
+from jarvis.tools.location import clock_words
 from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
@@ -201,6 +204,11 @@ class IntentClassifier:
         # these words it is the same silent NO the media and study words
         # were before it.
         "syllabus", "syllabi", "due dates", "exam schedule",
+        # --- the Aside's kill phrase (2026-08-30, jarvis/aside.py) ---
+        # The Tier-1 matcher bypasses this gate, so these are the belt to
+        # its braces: "no more asides" is three short words and every
+        # one-to-three-word phrase used to classify NO and vanish.
+        "aside", "asides", "no more",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -591,6 +599,13 @@ class CommandResult:
     # run it. None means the turn cannot be undone, and "scratch that"
     # keeps its old dictation meaning.
     undo: Optional[Callable[[], str]] = None
+    # The STRUCTURED thing the handler actually created -- a timekeeper Item
+    # with its epoch, a calendar Event. jarvis/aside.py anchors on this and
+    # on nothing else: "set for seven" only becomes "…due at 11:59 that
+    # night" if "seven" is a real datetime, and re-parsing it out of the
+    # reply text is how an aside lands on the wrong day. Display code must
+    # ignore it; it is never spoken or shown.
+    action: Any = None
 
 
 @dataclass
@@ -2306,8 +2321,11 @@ def _h_timer(c, t, m):                                     # 3217-3231
             line = f"{words} for {what}, sir; I'll let you know."
         def _run():
             item = tk.add_timer(seconds, label or f"{words} timer")
+            # action=item so the aside engine sees the structured result; it
+            # then declines a timer on purpose (aside.SKIP_KINDS) -- a
+            # countdown is a kitchen device, not a point in the day.
             return CommandResult(handled=True, reply=line, speak=True,
-                                 status=f"Timer set: {words}",
+                                 status=f"Timer set: {words}", action=item,
                                  undo=_undo_timekeeper(tk, item, "timer",
                                                        "Timer scrapped, sir."))
         # A shaky transcript reads the parsed timer back first (_confirm_or_run)
@@ -2346,16 +2364,56 @@ def _h_alarm(c, t, m):
     desc = _describe(tk, due, now, when)
     tail = {"daily": " Every day.", "weekdays": " Weekdays."}.get(repeat, "")
 
-    def _run():
+    # Split so the whole "set it" half is a callable: an objection stashes
+    # THIS and runs it unchanged on a yes, so the reply, the speak flag and
+    # the status of an overruled alarm are byte-identical to one that was
+    # never objected to (tests/test_objections.py asserts exactly that).
+    def _do_set_alarm() -> CommandResult:
         item = tk.add_alarm(due, label, repeat)
         return CommandResult(handled=True, reply=f"Alarm {desc}, sir.{tail}",
-                             speak=True, status=f"Alarm {desc}",
+                             speak=True, status=f"Alarm {desc}", action=item,
                              undo=_undo_timekeeper(tk, item, "alarm",
                                                    "Alarm cancelled, sir."))
+
+    def _run():
+        # The objection is raised INSIDE the read-back's callable, never
+        # beside it: _confirm_or_run's pending slot has already been
+        # resolved by the time this runs, so a shaky-transcript read-back
+        # and a dissent offer can never be live at the same time
+        # (spec 2 correction 5).
+        obj = c.objection_for_alarm(due, now)
+        if obj is None:
+            return _do_set_alarm()
+        line = obj.line(f"a {clock_words(datetime.fromtimestamp(due))} alarm")
+        c.stash_objection(_do_set_alarm, line, obj)
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status="Advising against")
+
     # A misheard hour is the daily cost of a confident guess: on a shaky
     # transcript the parsed time is read back before anything is set.
     asked = {"daily": ", every day", "weekdays": ", weekdays"}.get(repeat, "")
     return _confirm_or_run(c, _run, f"An alarm {desc}{asked}, sir?")
+
+
+def _m_no_asides(t):
+    """The aside kill, and ONLY the aside kill.
+
+    Deliberately its own matcher rather than a widening of _QUIET_RX: "stop
+    that" already means barge-in and read-aloud steering, and a kill the
+    router can confuse with either of those is worse than no kill at all
+    (jarvis/aside.py, KILL_PHRASES)."""
+    return aside_mod.kill_phrase(t)
+
+
+def _h_no_asides(c, t, m):
+    engine = c._svc("aside")
+    if engine is None:
+        # Nothing to silence, but never argue about it: the user asked for
+        # quiet and getting a lecture back is the joke writing itself.
+        return CommandResult(handled=True, reply=aside_mod.KILL_LINE, speak=True,
+                             status="Asides off")
+    return CommandResult(handled=True, reply=engine.silence(t), speak=True,
+                         status="Asides off for today")
 
 
 def _h_list_schedule(c, t, m):
@@ -3390,9 +3448,13 @@ def _h_remind_me(c, t, m):                                 # 3465-3483
 
     def _run():
         item = tk.add_reminder(due, task)
+        # action=item is the aside's anchor: "remind me to hand in the lab at
+        # nine" resolves to a real datetime here, and jarvis/aside.py refuses
+        # to volunteer anything without one rather than re-parse the words.
         return CommandResult(handled=True,
                              reply=f"Very good, sir; I'll remind you {what} {desc}.",
                              speak=True, status=f"Reminder {desc}: {task[:30]}",
+                             action=item,
                              undo=_undo_timekeeper(tk, item, "reminder",
                                                    "Reminder cancelled, sir."))
     # Both halves can be misheard here -- the hour and the errand itself --
@@ -4059,6 +4121,7 @@ REGISTRY: list[Command] = [
     Command("study streak", _STREAK_RX.match, _h_study_streak),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
+    Command("no asides", _m_no_asides, _h_no_asides),
     Command("list schedule", _LIST_SCHED_RX.match, _h_list_schedule,
             needs=("timekeeper",)),
     Command("cancel schedule", _CANCEL_SCHED_RX.match, _h_cancel_schedule,
@@ -4185,7 +4248,8 @@ ASSISTANT_TIER1: list[Command] = [
                     "review flashcards", "stop quiz",
                     "focus start", "focus left", "focus end", "lecture notes",
                     "study total", "study streak",
-                    "timer", "alarm", "list schedule", "cancel schedule",
+                    "timer", "alarm", "no asides",
+                    "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "next exam", "greeting", "day review",
                     # the weekly self-review and the memory garden's two
@@ -4578,6 +4642,9 @@ class Commander:
     _last_undo: Optional[tuple] = None
     _confidence: Optional[float] = None
     _pending_destructive: Optional[tuple] = None
+    _pending_objection: Optional[tuple] = None
+    _objection_timer = None
+    _objections = None
 
     # One turn at a time: handle() mutates per-turn fields (_confidence,
     # _raw_text, _last_turn, _pending_*) and is entered from the voice
@@ -4628,6 +4695,13 @@ class Commander:
         self._confidence: Optional[float] = None
         # A read-back waiting for a yes: (run, spoken line, stamp).
         self._pending_destructive: Optional[tuple] = None
+        # He advised against something and asked "shall I set it anyway?":
+        # (run, spoken line, Objection, stamp). Its own slot because its
+        # default on ambiguity is the OPPOSITE of the read-back's -- see
+        # _try_objection_confirm.
+        self._pending_objection: Optional[tuple] = None
+        self._objection_timer = None
+        self._objections = None
 
     # -- service access ------------------------------------------------
     def _svc(self, name: str):
@@ -4693,6 +4767,191 @@ class Commander:
         """A handler read an action back instead of doing it; the next yes
         runs it (``_try_destructive_confirm``)."""
         self._pending_destructive = (run, line, time.monotonic())
+
+    # -- reasoned dissent (jarvis/objections.py) -----------------------
+    def _objection_ledger(self):
+        """One ledger per process, built lazily: a Commander made with
+        __new__ (tests/test_custom_phrases.py) has no __init__ state."""
+        ledger = getattr(self, "_objections", None)
+        if ledger is None:
+            ledger = objections_mod.ObjectionLedger(
+                state_path=PATHS.MEMORY_DIR / "objections_state.json")
+            self._objections = ledger
+        return ledger
+
+    def objection_for_alarm(self, due: float, now: datetime):
+        """The reason to advise against this alarm, or None.
+
+        Every gate that keeps dissent from becoming insufferable is here
+        rather than in the predicates: the switch (``confirm.dissent``), the
+        once-a-day-per-thing ledger, and the rule that an offer already on
+        the floor (a destructive read-back, the evening preview's "shall I
+        wake you at seven?") is never talked over by a second question."""
+        if not _assistant_get(self, "confirm.dissent", True):
+            return None
+        if self._pending_destructive is not None or self._svc("alarm_offer"):
+            return None
+        try:
+            due_dt = datetime.fromtimestamp(float(due)).astimezone()
+        except (TypeError, ValueError, OSError):
+            return None
+        cal = self._svc("calendar")
+        events = []
+        if cal is not None:
+            try:
+                conf = getattr(cal, "configured", True)
+                if callable(conf):
+                    conf = conf()
+                # events() is the CACHE and says so in its own docstring; a
+                # fetch here would put the network inside "wake me at two".
+                events = list(cal.events()) if conf else []
+            except Exception:  # noqa: BLE001 - source boundary
+                log.debug("objections: calendar unavailable", exc_info=True)
+        deadlines = self._svc("deadlines")
+        items = []
+        if deadlines is not None:
+            try:
+                items = list(deadlines.snapshot())   # never canvas.fetch_due
+            except Exception:  # noqa: BLE001 - source boundary
+                log.debug("objections: deadline snapshot unavailable", exc_info=True)
+        tk, pending = self._svc("timekeeper"), []
+        if tk is not None:
+            try:
+                pending = list(tk.list("alarm"))
+            except Exception:  # noqa: BLE001 - source boundary
+                log.debug("objections: timekeeper list failed", exc_info=True)
+        try:
+            floor = float(_assistant_get(self, "confirm.sleep_floor_h",
+                                         objections_mod.DEFAULT_SLEEP_FLOOR_H))
+        except (TypeError, ValueError):
+            floor = objections_mod.DEFAULT_SLEEP_FLOOR_H
+        obj = objections_mod.for_alarm(due_dt, now.astimezone(), events=events,
+                                       items=items, pending=pending,
+                                       quiet=self._svc("quiet"),
+                                       sleep_floor_h=floor)
+        if obj is None:
+            return None
+        ledger = self._objection_ledger()
+        if ledger.already_said(obj):
+            # Said once today. A second "wake me at two" is a man who has
+            # heard the reason and wants the alarm.
+            log.info("objection %s suppressed: already said today (%s)",
+                     obj.source, obj.row)
+            return None
+        return obj
+
+    def stash_objection(self, run: Callable[[], CommandResult], line: str, obj):
+        """He advised against it; the pending slot decides what happens next.
+
+        A slot of its own, NOT ``_pending_destructive``: that one drops the
+        action on anything but a clear yes, which is right when doing
+        nothing is the safe end (a delete) and wrong here -- the user asked
+        for this alarm out loud, so an unclear answer must not silently
+        leave him without one."""
+        self._objection_cancel_timer()
+        self._pending_objection = (run, line, obj, time.monotonic())
+        self._objection_ledger().record(obj)
+        log.info("objection %s: %s (row: %s)", obj.source, obj.reason, obj.row)
+        journal = self._svc("journal_objection")
+        if callable(journal):
+            try:
+                journal(obj.source, obj.reason, obj.row)
+            except Exception:  # noqa: BLE001 - the journal is best-effort
+                log.debug("objection journal failed", exc_info=True)
+        # Silence must not lose the alarm either. Without this the pending
+        # slot only resolves when the user next says ANYTHING, so a man who
+        # heard the objection, agreed with it and went to bed would wake up
+        # to no alarm at all -- the failure the objection was warning about.
+        timer = threading.Timer(DESTRUCTIVE_TTL_S, self.objection_timeout)
+        timer.daemon = True
+        self._objection_timer = timer
+        timer.start()
+
+    def _objection_cancel_timer(self):
+        timer, self._objection_timer = getattr(self, "_objection_timer", None), None
+        if timer is not None:
+            timer.cancel()
+
+    def _speak_now(self, text: str) -> bool:
+        """One line through the app's own TTS door (services.speak ->
+        JarvisApp._say), explicitly NOT proactive: this is the direct
+        consequence of something the user just asked for, so quiet hours
+        must not hold it back for a digest hours later."""
+        speak = self._svc("speak")
+        if not callable(speak) or not text:
+            return False
+        try:
+            speak(text, proactive=False, kind="message")
+            return True
+        except Exception:  # noqa: BLE001 - speech must not break the turn
+            log.exception("objection ack failed to speak")
+            return False
+
+    def _run_objection(self, pend, why: str) -> Optional[CommandResult]:
+        run, _line, obj, _stamp = pend
+        log.info("objection %s resolved: overruled=True (%s)", obj.source, why)
+        try:
+            return run()
+        except Exception:
+            log.exception("overruled objection failed to run")
+            return None
+
+    def _try_objection_confirm(self, text: str) -> Optional[CommandResult]:
+        """Resolve "Shall I set it anyway?" -- the default is RUN.
+
+        The inverted default is the whole point. ``_try_destructive_confirm``
+        drops its pending action on anything that is not a clear yes and on
+        expiry, because refusing to delete something is the safe end of a
+        delete. Dissent is the other way round: the alarm was ASKED for and
+        the objection was only an opinion, so a mumbled reply must not
+        silently leave him without one.
+
+        Three outcomes, and only the first two consume the utterance:
+          * an explicit no -> drop it;
+          * a yes or an override ("set it anyway", "I know") -> run it and
+            answer exactly as an unobjected alarm would have;
+          * anything else -- a changed subject, a shrug, an expired offer --
+            -> run it, SAY so, and let the words he actually said have their
+            own turn. Swallowing "play some jazz" as an answer about an
+            alarm would be the second mistake after the objection itself.
+        """
+        pend, self._pending_objection = getattr(self, "_pending_objection", None), None
+        if pend is None:
+            return None
+        self._objection_cancel_timer()
+        obj, stamp = pend[2], pend[3]
+        answer = parse_yes_no(text)
+        if answer is None and objections_mod.is_override(text):
+            answer = True
+        if time.monotonic() - stamp > DESTRUCTIVE_TTL_S:
+            answer = None            # a minute later, those words are not an answer
+        if answer is False:
+            log.info("objection %s resolved: overruled=False (declined)", obj.source)
+            return CommandResult(handled=True, reply=objections_mod.DROPPED_LINE,
+                                 speak=True, status="Dropped")
+        result = self._run_objection(pend, f"heard {text[:40]!r}")
+        if result is None:
+            return CommandResult(handled=True, reply="I couldn't manage that, sir.",
+                                 speak=True, status="error")
+        if answer is True:
+            return result
+        self._speak_now(f"{objections_mod.RUN_ANYWAY_LINE} {result.reply or ''}".strip())
+        bus.publish(Status(text=result.status or "Set anyway", kind="info"))
+        return None                  # his sentence keeps its own meaning
+
+    def objection_timeout(self) -> Optional[CommandResult]:
+        """Nothing was said at all. Same default: set it, and say so."""
+        with self._turn_lock:
+            pend, self._pending_objection = getattr(self, "_pending_objection", None), None
+            self._objection_timer = None
+            if pend is None:
+                return None
+            result = self._run_objection(pend, "no reply")
+        if result is None:
+            return None
+        self._speak_now(f"{objections_mod.RUN_ANYWAY_LINE} {result.reply or ''}".strip())
+        bus.publish(Status(text=result.status or "Set anyway", kind="info"))
+        return result
 
     def _handle_inner(self, text: str, source: str, gate: bool = True) -> CommandResult:
         log.info("handle %r source=%s", text, source)
@@ -4776,6 +5035,15 @@ class Commander:
         # 3e. A destructive action was read back ("Cancel all three alarms,
         #     sir?"): a plain yes runs it, anything else drops it.
         res = self._try_destructive_confirm(text)
+        if res is not None:
+            return res
+        # 3f. He advised against something ("Shall I set it anyway?"). AFTER
+        #     the read-back on purpose: that one drops on ambiguity, this one
+        #     runs on ambiguity, and the two can never be live together
+        #     (objection_for_alarm refuses while a read-back is pending). It
+        #     returns None when the reply was neither a yes nor a no -- the
+        #     alarm is set by then and the words keep their own meaning.
+        res = self._try_objection_confirm(text)
         if res is not None:
             return res
         # 4. A pending router question: resolve it and dispatch the

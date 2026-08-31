@@ -181,7 +181,38 @@ DEFAULTS: dict = {
     # whole-list cancel. Calibrated 2026-08-30 from the live log (n=32
     # accepted turns: p10 -0.61, median -0.41; the garbled ones sat at
     # -0.94/-0.95), so -0.7 flags the doubtful tail without nagging.
-    "confirm": {"read_back": True, "shaky_logprob": -0.7},
+    # dissent (jarvis/objections.py): before setting an alarm he checks four
+    # cache-only rules -- a duplicate alarm, a small-hours alarm that leaves
+    # under sleep_floor_h with something on the calendar later that day, a
+    # quiet window it lands inside, a Canvas deadline it falls after -- and
+    # names the row it objected from ("your BIOSENSORS lecture is at 9:10
+    # am"). "Shall I set it anyway?" defaults to YES: an unclear reply, a
+    # changed subject and silence all set the alarm, because the alarm was
+    # asked for and only the opinion was volunteered. Never twice for the
+    # same thing in a day, never for a timer.
+    "confirm": {"read_back": True, "shaky_logprob": -0.7, "dissent": True,
+                "sleep_floor_h": 5},
+    # The Aside (jarvis/aside.py): one volunteered sentence after an answer,
+    # hung off the datetime an alarm or reminder just resolved to ("Alarm for
+    # 7:00 am, sir. Incidentally, Lab 3 report for BIOSENSORS is due at 11:59
+    # pm that night"). Off for the first day on purpose -- the budget is the
+    # product, and per_day/gap_min are here so tuning it never needs a code
+    # edit. "No more asides" zeros the day's bucket. Snapshot data only: it
+    # reads the deadline thread's last Canvas result and the calendar cache,
+    # never a fetch, because it runs inside a spoken turn.
+    "aside": {"enabled": False, "per_day": 2, "gap_min": 45,
+              "horizon_hours": 18},
+    # The debrief (jarvis/debrief.py): when a calendar event whose title
+    # carries one of these words has ended between after_min and within_min
+    # ago, and he is not out and not in a quiet window, Jarvis asks once --
+    # "How did the midterm go, sir?" -- and FILES the answer to the journal
+    # and to memory instead of routing it to the model as chat. A quiet
+    # window postpones rather than cancels, up to hold_hours.
+    "debrief": {"enabled": True, "after_min": 15, "within_min": 180,
+                "hold_hours": 14,
+                "keywords": ["exam", "midterm", "final", "finals", "interview",
+                             "viva", "defense", "defence", "quiz", "test",
+                             "presentation", "audition"]},
     # "No, I said X": re-dispatch X, drop the misheard exchange, log the
     # pair to corrections.json. learn_vocab additionally appends new
     # capitalised words from X to the Whisper vocabulary prompt -- off by

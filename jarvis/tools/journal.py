@@ -159,6 +159,14 @@ def _render_hours(rows, snippet=SNIPPET_CHARS, windows=True) -> list[str]:
                 name = r.get("name", "tool")
                 flag = "" if r.get("ok", True) else " (failed)"
                 lines.append(f"  {when} ran {name}{flag}")
+            elif kind == "debrief":
+                # Never snipped by the `snippet` budget: a debrief is one
+                # short line a day and it is the most valuable row in the
+                # file. Snipping "it went badly, I ran out of time on the
+                # last question" to "it went badly, I ran…" throws away the
+                # only part worth reading back months later.
+                what = _title(r.get("title", "")) or r.get("word", "") or "it"
+                lines.append(f"  {when} debrief — {what}: {r.get('text', '')}")
             elif kind == "claude":
                 state = r.get("state", "done")
                 proj = r.get("project") or "a task"
@@ -201,14 +209,25 @@ def digest(rows, label="today", max_chars=DIGEST_CHARS) -> str:
         text = head + "\n" + "\n".join(blocks)
         if len(text) <= max_chars:
             return text
-    # Still too long: drop the oldest hour blocks, say so.
+    # Still too long: drop the oldest hour blocks, say so. Debriefs are
+    # PINNED across that trim: they arrive in the evening but they are the
+    # one row a busy day cannot afford to lose, and the collapse takes the
+    # oldest hours first -- which is exactly where an early-afternoon exam
+    # sits. Re-rendered on their own so they survive their hour block.
+    pinned = _render_hours([r for r in rows if r.get("kind") == "debrief"],
+                           snippet=SNIPPET_CHARS, windows=False)
     dropped = 0
-    while blocks and len(head + "\n" + "\n".join(blocks)) > max_chars - 60:
+    budget = max_chars - 60 - len("\n".join(pinned))
+    while blocks and len(head + "\n" + "\n".join(blocks)) > budget:
         blocks.pop(0)
         dropped += 1
     note = f"(earlier: {dropped} hour{'s' if dropped != 1 else ''} not shown)\n" \
         if dropped else ""
-    return (head + "\n" + note + "\n".join(blocks))[:max_chars]
+    # Only the debrief hours that the trim actually took: a pinned block
+    # whose hour is still in `blocks` would print the line twice.
+    kept_hours = {b.split(":", 1)[0] for b in blocks}
+    rescued = [b for b in pinned if b.split(":", 1)[0] not in kept_hours]
+    return (head + "\n" + note + "\n".join(rescued + blocks))[:max_chars]
 
 
 # -------------------------------------------------- episodic recall
