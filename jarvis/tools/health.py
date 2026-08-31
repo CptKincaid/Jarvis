@@ -33,7 +33,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
-from jarvis.events import Status, bus
+from jarvis.events import FaultRaised, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.registry import ToolResult, ToolSpec
 
@@ -51,6 +51,11 @@ DEFAULT_WARN_GB = 16.0
 DEFAULT_CRITICAL_GB = 8.0
 DEFAULT_HOG_GB = 20.0
 HOG_COUNT = 2                      # "two trainers": this many hogs at once
+# The actual 2026-08-28 incident: TWO trainers on the unified pool at once.
+# hogs() is any two processes over hog_gb -- ollama plus a browser trips it
+# and is not the incident. snap.trainers already knows which processes are
+# training runs, so this rule can name the thing that wedged the box.
+TRAINER_COUNT = 2
 REARM_MARGIN_GB = 4.0              # hysteresis above warn_gb before re-arming
 DEFAULT_INTERVAL_S = 30.0
 # Interpreter names that say nothing about the job; the first script /
@@ -73,6 +78,13 @@ CRITICAL_LINE = ("Memory is critical, sir: {free} gigabytes free{hogs}. "
                  "I'd stop something before the box does.")
 HOGS_LINE = ("Two processes each hold more than {hog} gigabytes, sir: {hogs}. "
              "Last time that ended in a hard power-off.")
+TRAINERS_LINE = ("{n} trainers are on the pool at once, sir: {names}. "
+                 "The last time that happened the box needed a hard power-off.")
+# The rules whose alerts are FAULTS (jarvis/faults.py): they light the
+# board's FAULT lane and are de-duplicated across restarts. "trainer" (the
+# GPU-yield lend/reclaim) is deliberately absent -- lending the GPU is
+# routine, not a fault.
+FAULT_RULES = ("memory", "hogs", "trainers")
 LENT_LINE = ("I have lent the GPU to your trainer, sir; quick answers only "
              "until it is done.")
 RECLAIMED_LINE = "Your trainer has finished, sir; I'm loading my model again."
@@ -458,13 +470,39 @@ def hogs_line(procs: list[Proc], hog_gb: float) -> str:
     return HOGS_LINE.format(hog=f"{hog_gb:.0f}", hogs=_spoken_hogs(procs))
 
 
+def distinct_runs(procs: list[Proc]) -> list[Proc]:
+    """One Proc per training RUN, largest first. torchrun / accelerate /
+    DDP fan a single run out into one interpreter process per GPU worker,
+    and every one of them matches is_trainer -- counting processes would
+    report "4 trainers on the pool" for one job and the warning would be
+    a lie the first time he saw it. Runs are keyed by the script the
+    interpreter is running, which is what distinguishes the 2026-08-28
+    incident (train.py AND finetune_piper.py) from a fanned-out job."""
+    seen: dict = {}
+    for proc in sorted(procs, key=lambda p: -p.rss_gb):
+        seen.setdefault(proc.hint or proc.name, proc)
+    return list(seen.values())
+
+
+def trainers_line(procs: list[Proc]) -> str:
+    """"2 trainers are on the pool at once, sir: train.py and finetune.py."
+    Named by their hint (the script), which is what he recognises -- both
+    are "python" by process name."""
+    names = [p.hint or p.name for p in procs[:3]]
+    if len(names) > 1:
+        joined = ", ".join(names[:-1]) + f" and {names[-1]}"
+    else:
+        joined = names[0] if names else "unknown"
+    return TRAINERS_LINE.format(n=len(procs), names=joined)
+
+
 # ------------------------------------------------------------ watchdog
 @dataclass
 class Alert:
     kind: str                          # warn | error
     line: str                          # what he says
     status: str                        # the status-bar chip
-    rule: str = "memory"               # memory | hogs
+    rule: str = "memory"               # memory | hogs | trainers | trainer
 
 
 class Watchdog:
@@ -477,7 +515,7 @@ class Watchdog:
 
     def __init__(self, cfg=None, speak: Optional[Callable[[str], None]] = None,
                  services=None, publish: Optional[Callable] = None,
-                 interval: Optional[float] = None, brain=None):
+                 interval: Optional[float] = None, brain=None, faults=None):
         # GPU yield (health.yield_to_trainer): ``brain`` is anything with
         # release() / reclaim() / is_lent(); None means jarvis.brain itself,
         # imported at fire time (tests pass a fake).
@@ -503,6 +541,15 @@ class Watchdog:
         self._publish = publish or bus.publish
         self._level = 0                # 0 ok | 1 warned | 2 critical
         self._hogs_alerted = False
+        self._trainers_alerted = False
+        # jarvis.faults.FaultLog when the integrator wires one: the spoken
+        # -once state file, so a restart INTO a still-tight pool does not
+        # announce the same episode a second time. None keeps the old
+        # behaviour (speak every time a rule newly trips).
+        self._faults = faults
+        # rule -> the fault tokens spoken for it, so a recovery can clear
+        # exactly those entries from the state file (and no others).
+        self._fault_tokens: dict = {}
         self._unreadable_logged = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -535,6 +582,7 @@ class Watchdog:
                 # once, not every 30 s.
                 self._level = 0
                 log.info("health watchdog: memory recovered (%.1f GB free)", avail)
+                self._clear_fault("memory")
                 self._safe_publish(Status(text=f"Memory recovered: {_gb(avail)} GB free",
                                           kind="ok"))
         heavy = hogs(snap, self.hog_gb)
@@ -550,6 +598,23 @@ class Watchdog:
             # not re-speak "last time that ended in a hard power-off" every
             # other tick.
             self._hogs_alerted = False
+            self._clear_fault("hogs")
+        # Two trainers on the pool: the 2026-08-28 incident by name. Latched
+        # like the others, and cleared the moment one of them exits -- the
+        # clear is what re-arms the warning for the next run.
+        runners = distinct_runs(snap.trainers or [])
+        if len(runners) >= TRAINER_COUNT:
+            if not self._trainers_alerted:
+                fired.append(Alert(kind="error", line=trainers_line(runners),
+                                   status=f"{len(runners)} trainers on the pool",
+                                   rule="trainers"))
+                self._trainers_alerted = True
+        elif self._trainers_alerted:
+            self._trainers_alerted = False
+            log.info("health watchdog: back to %d trainer run(s) on the pool",
+                     len(runners))
+            self._clear_fault("trainers")
+            self._safe_publish(Status(text="One trainer on the pool", kind="ok"))
         if self.yield_to_trainer:
             self._trainer_rule(snap, fired)
         for alert in fired:
@@ -626,9 +691,38 @@ class Watchdog:
             log.exception("health watchdog: manual reclaim failed")
             return False
 
+    def _clear_fault(self, rule: str) -> None:
+        """The episode ended: lift the board's FAULT lane and make the next
+        occurrence news again. The board takes its clear from HERE -- a
+        second latch in the UI drifts out of sync on recovery."""
+        self._safe_publish(FaultRaised(rule=rule, cleared=True))
+        tokens = self._fault_tokens.pop(rule, ())
+        if self._faults is None:
+            return
+        for token in tokens:
+            try:
+                self._faults.clear(f"{rule}:{token}")
+            except Exception:  # noqa: BLE001
+                log.exception("fault log clear failed")
+
     def _fire(self, alert: Alert) -> None:
         log.warning("health watchdog [%s/%s]: %s", alert.rule, alert.kind, alert.status)
         self._safe_publish(Status(text=alert.status, kind=alert.kind))
+        speak_it = True
+        if alert.rule in FAULT_RULES:
+            from jarvis.faults import token_for      # late: faults reads config
+            token = token_for(alert.rule, alert.status)
+            if self._faults is not None:
+                try:
+                    speak_it = bool(self._faults.should_speak(f"{alert.rule}:{token}"))
+                except Exception:  # noqa: BLE001 - dedupe must not cost the alarm
+                    log.exception("fault log read failed; speaking anyway")
+            self._fault_tokens.setdefault(alert.rule, set()).add(token)
+            self._safe_publish(FaultRaised(rule=alert.rule, kind=alert.kind,
+                                           token=token, text=alert.status,
+                                           line=alert.line))
+        if not speak_it:
+            return                    # already said once; the board still shows it
         speak = self._speak or (getattr(self._services, "speak", None)
                                 if self._services is not None else None)
         if not callable(speak):

@@ -64,6 +64,7 @@ from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
 from jarvis.dialogue import SESSION_WINDOW_S
+from jarvis.faults import FaultBoard, FaultLog
 from jarvis.brain import JarvisBrain
 from jarvis.commander import COURTESY_REPLIES, Commander, parse_yes_no
 from jarvis.context import ContextEngine
@@ -245,6 +246,10 @@ class JarvisApp:
         # built further down; both are started in start_assistant.
         self.presence = self._construct("presence", self._make_presence)
         self.quiet = self._construct("quiet", self._make_quiet)
+        # The fault lane (jarvis/faults.py): the live fault, held past the
+        # 4-6 s Status chip so "what's wrong" can still answer and the
+        # board's FAULT row stays lit. Subscribes to FaultRaised itself.
+        self.faults = FaultBoard(subscribe=True)
 
         # ---- speech -------------------------------------------------------
         # The arbiter is built here, ahead of the mic consumers below, because
@@ -768,6 +773,8 @@ class JarvisApp:
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
             quiet=self.quiet, presence=self.presence,
+            # "what's wrong": the live fault, else the log triage below
+            faults=self.faults,
         )
 
     # ------------------------------------------------------- brain executor
@@ -2314,6 +2321,16 @@ class JarvisApp:
                 log.exception("calendar refresh start failed")
         wd = getattr(self.services, "health_watchdog", None)
         if wd is not None:
+            try:
+                # The fault lane's spoken-once state file (jarvis/faults.py):
+                # the watchdog's own latches die with the process, so a
+                # restart into a still-tight pool would announce the same
+                # episode a second time. Wired HERE rather than in
+                # make_tools so a test that builds the tools does not start
+                # writing state.
+                wd._faults = FaultLog()
+            except Exception:
+                log.exception("fault state unavailable; alerts will repeat")
             try:
                 wd.start()
             except Exception:

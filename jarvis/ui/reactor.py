@@ -128,8 +128,14 @@ CARD_W = 176
 CARD_PAD = 12
 CARD_ROW = 26
 CARD_ROWS = (("HEAR", "asr"), ("SPEAK", "tts"), ("THINK", "llm"),
-             ("DEVICE", "dev"))     # DEVICE, not GPU: the status bar's
+             ("DEVICE", "dev"),     # DEVICE, not GPU: the status bar's
                                     # 'GPU 39°C' is a different datum
+             ("FAULT", "fault"))    # the fault lane (jarvis/faults.py): "--"
+                                    # almost always, "2 TRAINERS" when it is
+                                    # not. Values are drawn in one colour and
+                                    # ellipsized to ~10 mono characters, so
+                                    # the TOKEN is the whole signal -- the
+                                    # sentence stays in the spoken alert.
 CARD_MOOD = {"listening": "asr", "thinking": "llm", "speaking": "tts"}
 
 
@@ -1389,7 +1395,8 @@ class Reactor(tk.Canvas):
         budget = self._decor.get("card_budget", px(104))
         vf = ui_mono(theme.SIZE_CAPTION)
         values = {"asr": info.get("asr"), "tts": info.get("tts"),
-                  "llm": fmt_llm(info.get("llm")), "dev": info.get("dev")}
+                  "llm": fmt_llm(info.get("llm")), "dev": info.get("dev"),
+                  "fault": info.get("fault")}
         for key, raw in values.items():
             txt = (raw or "--").upper()
             if self._telem_cache.get(key) != txt:

@@ -1514,6 +1514,7 @@ TIER1_SAMPLES = {
     "gpu reclaim": "take the gpu back",
     "gpu lend": "lend the gpu",
     "log triage": "anything wrong in your log",
+    "whats wrong": "what's wrong",
     "slow turn": "why was that slow",
     "clip to claude": "have claude fix what i copied",
     "read control": "skip",

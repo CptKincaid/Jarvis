@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from jarvis import dialogue as dialogue_mod
+from jarvis import faults as faults_mod
 from jarvis import lecture as lecture_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
@@ -2395,6 +2396,38 @@ def _h_log_triage(c, t, m):
     return CommandResult(handled=True, reply=spoken, speak=True, status="Log triage")
 
 
+# "What's wrong?" -- the fault lane's drill-down. The live fault first
+# (jarvis/faults.py holds it long after the 4-6 s Status chip is gone),
+# and when the board is clear it falls straight through to the existing
+# log triage rather than answering "nothing" without looking.
+_WHATS_WRONG_RX = re.compile(
+    r"^(?:so )?(?:what(?:'s| is| has)? (?:wrong|the matter|the problem|broken)|"
+    r"is (?:anything|something) (?:wrong|the matter|up)|"
+    r"anything wrong|what went wrong|"
+    r"(?:what|how)(?:'s| is) (?:the )?(?:fault|trouble))"
+    r"(?: with (?:you|the box|the spark|the machine|it))?"
+    r"(?:[,]?\s*(?:sir|jarvis))?[?.!\s]*$", re.I)
+
+
+def _h_whats_wrong(c, t, m):
+    """The live fault in his own words; when nothing is latched, the log
+    triage answers instead (the drill-down the fault lane promises)."""
+    board = c._svc("faults")
+    line = ""
+    if board is not None:
+        try:
+            line = board.describe()
+        except Exception:
+            log.exception("fault board read failed")
+    if line:
+        return CommandResult(handled=True, reply=line, speak=True, status="Fault")
+    res = _h_log_triage(c, t, m)
+    if res is not None:
+        return res
+    return CommandResult(handled=True, reply=faults_mod.NOTHING_WRONG_LINE,
+                         speak=True, status="No faults")
+
+
 def _h_slow_turn(c, t, m):
     """"Why was that slow?": the last real turn on the ledger, by stage."""
     fn = c._svc("slow_turn")
@@ -3352,6 +3385,7 @@ REGISTRY: list[Command] = [
     Command("next exam", _NEXT_EXAM_RX.match, _h_next_exam),
     Command("day review", _DAYREVIEW_RX.match, _h_dayreview),
 
+    Command("whats wrong", _WHATS_WRONG_RX.match, _h_whats_wrong),
     Command("log triage", _LOGTRIAGE_RX.match, _h_log_triage),
     Command("slow turn", _SLOW_RX.match, _h_slow_turn),
     # After the briefing: "good morning" is a briefing trigger first.
@@ -3459,7 +3493,7 @@ ASSISTANT_TIER1: list[Command] = [
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free",
                     "standup", "gpu reclaim", "gpu lend",
-                    "log triage", "slow turn",
+                    "log triage", "whats wrong", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router
                     # would hand Claude the bare words "fix what i copied".

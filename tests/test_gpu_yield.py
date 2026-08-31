@@ -258,14 +258,18 @@ def test_watchdog_manual_reclaim_holds_off_the_running_trainer():
     assert wd.check(_snap([(7, 30.0, "train.py")])) == []
     assert wd.check(_snap([(7, 30.0, "train.py")])) == []
     assert fb.calls == [("release", "trainer pid 7 train.py"), ("reclaim",)]
-    # a different trainer alongside it IS lent to
+    # a different trainer alongside it IS lent to. Two DIFFERENT runs also
+    # trip the fault lane's trainers rule (health.TRAINER_COUNT), so filter
+    # to the yield rule -- that alert is what this test is about.
     fired = wd.check(_snap([(7, 30.0, "train.py"), (8, 3.0, "finetune.py")]))
-    assert len(fired) == 1 and wd.lent_to == 8
+    assert [a.rule for a in fired] == ["trainers", "trainer"]
+    assert len([a for a in fired if a.rule == "trainer"]) == 1 and wd.lent_to == 8
     # once the held run is gone and a new one appears later, the hold is over
     wd.check(_snap([(8, 3.0, "finetune.py")]))
     wd.manual_reclaim()
     assert wd.check(_snap()) == [] and wd.check(_snap()) == []
-    assert len(wd.check(_snap([(7, 1.0, "train.py")]))) == 1   # pid reused: lent again
+    fired = wd.check(_snap([(7, 1.0, "train.py")]))           # pid reused: lent again
+    assert [a.rule for a in fired] == ["trainer"]
     # manual reclaim when nothing is lent is just a warm-up
     wd2, _, _ = _wd()
     assert wd2.manual_reclaim() is True and wd2._brain_obj.calls == [("reclaim",)]
