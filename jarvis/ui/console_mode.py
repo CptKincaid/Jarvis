@@ -343,6 +343,17 @@ class ConsoleModes:
         else:
             self._apply_dim()
 
+    def note_output(self) -> None:
+        """Something to SHOW arrived — a reply, a briefing card, an alarm
+        modal, a Claude progress line. The surface comes down so the card is
+        not drawn behind it, but the power-up sweep is NOT cancelled: the
+        sweep is meant to play while the morning briefing is delivered over
+        the top of it. Only what HE did cancels it (note_activity)."""
+        if self.sweeping:
+            return                  # the sweep already holds an ACTIVE console
+        if self.mode != ACTIVE:
+            self._set_mode(ACTIVE)
+
     def idle_seconds(self) -> Optional[float]:
         if not callable(self._idle_fn):
             return None

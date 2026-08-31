@@ -1205,11 +1205,20 @@ class MainWindow:
         return bool(self._recording or self._speaking or self._thinking)
 
     def _note_activity(self):
-        """Anything he did reaches the mode machine here, so the surfaces
-        come back inside one frame rather than at the next 4 s tick."""
+        """Anything HE did — a wake word, an utterance, the mic opening.
+        The surfaces come back inside one frame rather than at the next 4 s
+        tick, and the power-up sweep is cancelled: the reply wins."""
         modes = getattr(self, "modes", None)
         if modes is not None:
             modes.note_activity()
+
+    def _note_output(self):
+        """Something to SHOW arrived. Wakes the console so the card is not
+        drawn behind the ambient slab, but does NOT cancel a power-up sweep
+        — the sweep is meant to play under the morning briefing."""
+        modes = getattr(self, "modes", None)
+        if modes is not None:
+            modes.note_output()
 
     def _on_console_mode(self, mode: str):
         """The console changes surface. Everything here is reversible and
@@ -1391,6 +1400,10 @@ class MainWindow:
 
     def _ev_reply(self, ev: JarvisReply):
         if ev.text:
+            # Proactive replies (a heads-up, a watchdog warning) arrive with
+            # no utterance before them, so the ambient slab has to come down
+            # here too or the card lands behind it.
+            self._note_output()
             self.transcript.add_jarvis(ev.text, rtt=self._take_rtt())
 
     def _ev_brain(self, ev: BrainState):
@@ -1422,6 +1435,7 @@ class MainWindow:
         self._note_activity()
 
     def _ev_reminder(self, ev: ReminderFired):
+        self._note_output()
         self.toast.show(f"Reminder: {ev.text}", kind="warn", ms=6000)
         self.transcript.add_jarvis(f"Reminder: {ev.text}")
 
@@ -1456,6 +1470,7 @@ class MainWindow:
         self._refresh_terminal()
 
     def _ev_claude_progress(self, ev: ClaudeProgress):
+        self._note_output()
         self.transcript.add_progress(ev.line)
 
     def _ev_active_project(self, ev: ActiveProject):
@@ -1464,6 +1479,7 @@ class MainWindow:
         self._refresh_terminal()
 
     def _ev_approval(self, ev: ApprovalRequested):
+        self._note_output()
         # the question is what this turn produced: consume the utterance
         # stamp so a later spontaneous reply cannot wear its round trip
         self._utter_ts = None
@@ -1477,6 +1493,7 @@ class MainWindow:
         """"Was that for me?" as a card that WAITS. The old behaviour was a
         4 s toast plus a text-free info Status, so the question vanished
         before it could be read, and nothing could answer it."""
+        self._note_output()
         self._utter_ts = None
         self.transcript.add_approval(ev.request_id, ev.question,
                                      self._answer_uncertain,
@@ -1517,6 +1534,7 @@ class MainWindow:
         # the briefing ("what's on Monday, and give me my daily brief", live
         # 2026-08-29) the Monday half was spoken and never shown. The spoken
         # line goes first, with the turn's RTT, then the card.
+        self._note_output()
         spoken = (ev.spoken or "").strip()
         rtt = self._take_rtt()
         if spoken:
@@ -1529,6 +1547,9 @@ class MainWindow:
         SIZE_LABEL semibold), time (mono SIZE_BODY), DISMISS / SNOOZE 10.
         The reactor keeps animating beneath; the window is brought back
         from the tray so the alarm is seen."""
+        # An alarm ringing behind a room clock is a bug: wake the console
+        # NOW rather than at the mode machine's next four-second tick.
+        self._note_output()
         self._hide_alarm()
         title, when = alarm_modal_text(ev.label, ev.kind, ev.due_text)
         card = Card(self.reactor, fill=theme.RAISED, pad=12, bg=theme.BG)

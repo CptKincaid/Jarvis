@@ -240,6 +240,22 @@ def test_the_first_thing_he_says_cancels_the_rest_of_the_sweep():
     assert modes.sweeping is False
 
 
+def test_something_to_show_wakes_the_console_without_killing_the_sweep():
+    """A reply, a briefing card or an alarm modal must not be drawn behind
+    the ambient slab — but the sweep is MEANT to play under the morning
+    briefing, so only what he did cancels it."""
+    modes, after, seen = driver(idle=9999)
+    modes.tick()
+    assert modes.mode == cm.STANDBY
+    gen = modes.generation
+    modes.note_output()
+    assert modes.mode == cm.ACTIVE and modes.generation == gen
+    modes.power_up(2)
+    modes.note_output()                 # the briefing lands mid-sweep
+    after.run_all()
+    assert seen["stage"] == [1, 2, None]
+
+
 def test_the_sweep_can_be_switched_off():
     modes, after, seen = driver(opts={"console.powerup": False})
     modes.power_up(3)
