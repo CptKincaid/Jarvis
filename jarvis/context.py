@@ -50,7 +50,7 @@ _LEGACY_LOG = PATHS.LOG_DIR / "gui_debug.log"
 # 200-char cap is for the prompt window, not the record), but a pasted
 # document or a Claude transcript must not turn the day file into a dump.
 JOURNAL_TEXT_CAP = 4000
-JOURNAL_KINDS = ("exchange", "tool", "claude", "window")
+JOURNAL_KINDS = ("exchange", "tool", "claude", "window", "debrief")
 
 
 def _git(repo_dir, *args, timeout=5):
@@ -230,6 +230,20 @@ class ContextEngine:
             args = {"args": str(args)}
         self._journal_write("tool", name=str(name), args=args, ok=bool(ok),
                             text=(text or "")[:600])
+
+    def journal_debrief(self, title, word, text, ended=None):
+        """How something that ended actually went (jarvis/debrief.py).
+
+        Its own kind rather than an exchange: an exchange is a question and
+        an answer, and this is the other way round -- Jarvis asked, and what
+        came back is a fact about the day rather than a turn of
+        conversation. tools/journal.py renders it separately and pins it
+        when the digest has to shed lines."""
+        self._journal_write("debrief", title=str(title or ""),
+                            word=str(word or ""),
+                            ended=(ended.isoformat() if hasattr(ended, "isoformat")
+                                   else str(ended or "")),
+                            text=text or "")
 
     def journal_claude(self, project, state, text=""):
         """A Claude task reached a terminal state (done / failed)."""
