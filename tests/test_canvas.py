@@ -33,8 +33,17 @@ def _firewall(tmp_path, monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _no_network)
     monkeypatch.setattr(cv, "_now", lambda: NOW)
     monkeypatch.setattr(cv, "_clock", lambda: 1000.0)
+    # The coursework adapter mirrors its deep parse to disk; give each test
+    # its own file so rows cannot leak from one test into the next.
+    from pathlib import Path
+
+    from jarvis.tools import canvas_ical
+    monkeypatch.setattr(canvas_ical, "_cache_path",
+                        lambda path=None: Path(path) if path else tmp_path / "cw.json")
+    canvas_ical.clear_cache()
     cv.clear_cache()
     yield
+    canvas_ical.clear_cache()
     cv.clear_cache()
 
 
@@ -660,3 +669,127 @@ def test_cached_course_names_tidies_and_dedupes(monkeypatch):
                                             "MAGNETIC RESONANCE ENGR"]
     finally:
         cv.clear_cache()
+
+
+# ------------------------------------------------- coursework from the feed
+# His university blocks personal Canvas access tokens, so the REST half above
+# can never answer on his box. The same coursework rides the Canvas calendar
+# subscription (jarvis/tools/canvas_ical.py); these are the real title shapes.
+LAB1 = ("Lab 1:  Introduction to the AD2 SDK [BMEN-427:501,502,503,504,"
+        "BMEN-627:600,601,602,603]")
+HW1 = "HW#1 [MSEN-222:599,M99]"
+ETHICS = "Ethics Quiz - Professional Engineering [ECEN-404:901,902,903]"
+
+
+def _all_day(day_offset):
+    return _local(day_offset, 0, 0)
+
+
+def _feed_cal(*events, configured=True):
+    return _Cal(list(events), configured=configured)
+
+
+def _services(cal):
+    from types import SimpleNamespace
+    return SimpleNamespace(calendar=cal)
+
+
+def test_canvas_due_answers_from_the_feed_with_no_token(monkeypatch):
+    """The whole point of the adapter: "what's due this week" answered
+    without a token, in the same sheet the REST reading produces."""
+    fetch = FakeFetch({})
+    cal = _feed_cal(_ev(LAB1, _all_day(5), all_day=True),
+                    _ev(HW1, _all_day(6), all_day=True),
+                    _ev("Chiro", _local(1, 16, 0)))
+    monkeypatch.setattr(cv, "_fetch", fetch)
+    reg = ToolRegistry()
+    reg.register_many(cv.make_tools(_cfg(token=""), _services(cal)))
+    r = reg.call("canvas_due", {"days": 7})
+    assert r.ok and cv.SETUP_LINE not in r.text
+    assert r.text.splitlines() == [
+        "Due this week (2):",
+        "1) BMEN 427 - Lab 1: Introduction to the AD2 SDK, Sat 11:59 pm",
+        "2) MSEN 222 - HW#1, Sun 11:59 pm"]
+    assert fetch.calls == [], "no token means nothing on the wire"
+
+
+def test_an_empty_feed_window_is_an_answer_not_a_request_for_a_token(monkeypatch):
+    """A calendar that carries coursework is a SOURCE. Nothing due in the
+    next two days is then a real "nothing", and the token is not mentioned
+    -- it is only mentioned when neither source exists at all."""
+    fetch = FakeFetch({})
+    cal = _feed_cal(_ev(LAB1, _all_day(20), all_day=True))   # outside 7 days
+    monkeypatch.setattr(cv, "_fetch", fetch)
+    reg = ToolRegistry()
+    reg.register_many(cv.make_tools(_cfg(token=""), _services(cal)))
+    r = reg.call("canvas_due", {"days": 7})
+    assert r.ok and r.speak == cv.NOTHING_DUE_LINE
+    # ... and with NEITHER source, the setup line is still what he hears
+    bare = ToolRegistry()
+    bare.register_many(cv.make_tools(_cfg(token=""), _services(_feed_cal())))
+    assert bare.call("canvas_due", {"days": 7}).speak == cv.SETUP_LINE
+
+
+def test_read_due_merges_the_two_sources_and_rest_wins_a_duplicate(monkeypatch):
+    """With a token AND a feed, one shape comes out: the planner row wins a
+    duplicate because it knows the course's real name and whether the work
+    was handed in."""
+    fetch = FakeFetch(canned())
+    cal = _feed_cal(_ev("Lab 3 report [BMEN-420:500]", _local(1, 0, 0), all_day=True),
+                    _ev(HW1, _all_day(6), all_day=True))
+    read = cv.read_due(_cfg(), 7, cal, NOW, fetch)
+    assert read.canvas and read.feed and read.error is None
+    titles = [(r["course"], r["title"]) for r in read.items]
+    assert ("BIOSENSORS", "Lab 3 report") in titles
+    assert ("BMEN 420", "Lab 3 report") not in titles
+    assert ("MSEN 222", "HW#1") in titles
+
+
+def test_a_canvas_outage_falls_back_to_the_feed_rather_than_an_excuse(monkeypatch):
+    fetch = FakeFetch({PLANNER_URL + "?": OSError("down"),
+                       COURSES_URL: OSError("down")})
+    cal = _feed_cal(_ev(HW1, _all_day(2), all_day=True))
+    monkeypatch.setattr(cv, "_fetch", fetch)
+    reg = ToolRegistry()
+    reg.register_many(cv.make_tools(_cfg(), _services(cal)))
+    r = reg.call("canvas_due", {"days": 7})
+    assert r.ok and "MSEN 222 - HW#1" in r.text
+    # with no feed rows to fall back on, the excuse is still the answer
+    bare = ToolRegistry()
+    bare.register_many(cv.make_tools(_cfg(), _services(_feed_cal())))
+    assert bare.call("canvas_due", {}).speak == cv.UNREACHABLE_LINE
+
+
+def test_find_next_exam_reaches_an_exam_word_in_a_feed_title():
+    """"Ethics Quiz - ... [ECEN-404:...]" is a quiz in the feed, and the
+    course code rides along; the raw VEVENT must not ALSO show up as a
+    candidate carrying its bracket of section numbers."""
+    cal = _feed_cal(_ev(ETHICS, _all_day(9), all_day=True),
+                    _ev(LAB1, _all_day(5), all_day=True))
+    exam, checked = cv.find_next_exam(_cfg(token=""), cal, "next quiz", now=NOW)
+    assert checked, "the feed IS a Canvas source; nothing to set up"
+    assert exam["course"] == "ECEN 404"
+    assert exam["title"] == "Ethics Quiz - Professional Engineering"
+    assert exam["source"] == "canvas" and exam["kind"] == "quiz"
+    assert cv.exam_words(exam, NOW).startswith(
+        "Ethics Quiz - Professional Engineering for ECEN 404, in 9 days")
+    # a quiz never answers "next exam", feed or not
+    assert cv.find_next_exam(_cfg(token=""), cal, "next exam", now=NOW)[0] is None
+
+
+def test_the_feed_leaves_a_plain_calendar_exam_alone():
+    """Non-coursework events keep coming through the calendar leg exactly
+    as before -- the adapter only claims titles with the bracket."""
+    cal = _feed_cal(_ev("Physics exam", _local(3, 13, 0)))
+    exam, checked = cv.find_next_exam(_cfg(token=""), cal, "exam", now=NOW)
+    assert exam["title"] == "Physics exam" and exam["source"] == "calendar"
+    assert checked is False, "a calendar with no coursework is not Canvas"
+
+
+def test_feed_due_is_the_fetch_due_shape():
+    cal = _feed_cal(_ev(HW1, _all_day(3), all_day=True))
+    rows = cv.feed_due(cal, 7, NOW)
+    assert [sorted(r) for r in rows] == [["course", "due", "title"]]
+    assert rows[0]["due"] == _local(3, 23, 59)
+    assert cv.due_sheet(rows, 7, NOW) == \
+        "Due this week (1):\n1) MSEN 222 - HW#1, Thu 11:59 pm"

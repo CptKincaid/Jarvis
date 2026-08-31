@@ -4818,10 +4818,11 @@ def _plan_items(c) -> list:
     to-do list."""
     deadlines: list = []
     try:
-        from jarvis.tools.canvas import canvas_settings, fetch_due
-        settings = canvas_settings(c._svc("assistant"))
-        if settings:
-            deadlines = list(fetch_due(settings, PLAN_DUE_DAYS))
+        from jarvis.tools.canvas import read_due
+        # read_due, not fetch_due: without a token the coursework still
+        # arrives, from the Canvas calendar feed (jarvis/tools/canvas_ical.py).
+        deadlines = list(read_due(c._svc("assistant"), PLAN_DUE_DAYS,
+                                  c._svc("calendar")).items)
     except Exception:                       # noqa: BLE001 - outage, bad token
         log.info("plan the week: Canvas unavailable", exc_info=True)
     todos: list = []

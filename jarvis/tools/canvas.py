@@ -24,6 +24,14 @@ announcements both need it and a course roster changes once a term.
 
 The token is a secret: it is never logged, never in a URL, only in the
 Authorization header; log lines carry the host and counts.
+
+A university that blocks personal access tokens (his does) leaves this
+whole path dark, so "what is due" has a SECOND source: the Canvas calendar
+feed, adapted to these same rows by ``jarvis/tools/canvas_ical.py``.
+``read_due`` merges the two and says which existed, and every caller that
+would otherwise ask for a token goes through it -- ``SETUP_LINE`` is spoken
+only when neither source has anything at all. Grades and announcements
+have no feed equivalent and still need the token.
 """
 from __future__ import annotations
 
@@ -36,9 +44,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 
 from jarvis.logs import get_logger
+from jarvis.tools import canvas_ical
 from jarvis.tools.location import clock_words
 from jarvis.tools.registry import ToolResult, ToolSpec
 
@@ -492,6 +501,53 @@ def fetch_due(settings: dict, days: int, fetch: Fetch = None,
     return items
 
 
+class DueRead(NamedTuple):
+    """What one "what's due" reading found, and from where.
+
+    ``canvas`` / ``feed`` are the two SOURCES: a caller says "I'll need a
+    Canvas access token set up" only when neither of them exists, because a
+    box whose university blocks tokens still has the coursework -- it is in
+    the calendar feed (jarvis/tools/canvas_ical.py)."""
+    items: list                      # merged rows, soonest first
+    canvas: bool                     # the REST API was read successfully
+    feed: bool                       # the calendar feed carries coursework
+    error: Optional[CanvasError]     # why the REST read failed, if it did
+
+
+def feed_due(calendar, days: Optional[int] = None,
+             now: Optional[datetime] = None) -> list[dict]:
+    """fetch_due-shaped rows from the Canvas calendar feed. Never fetches:
+    the CalendarSource's cached events are the input."""
+    return canvas_ical.rows_from_events(_calendar_events(calendar), days, now)
+
+
+def read_due(cfg, days: int, calendar=None, now: Optional[datetime] = None,
+             fetch: Fetch = None) -> DueRead:
+    """The one "what is due" reading: Canvas REST when a token is set,
+    merged with the calendar feed's coursework, in ONE shape.
+
+    The REST rows go first into the merge because they know the course's
+    real name and whether the work was handed in; a feed row is only
+    dropped when the REST reading already has that title on that day."""
+    now = now or _now()
+    events = _calendar_events(calendar)
+    feed_items = canvas_ical.rows_from_events(events, days, now)
+    feed = bool(feed_items) or canvas_ical.has_coursework(events)
+    settings = canvas_settings(cfg)
+    rest: list[dict] = []
+    ok = False
+    err: Optional[CanvasError] = None
+    if settings is not None:
+        try:
+            rest = fetch_due(settings, days, fetch or _fetch, now)
+            ok = True
+        except CanvasError as exc:
+            err = exc
+            log.info("canvas: REST due unavailable (%s); the feed has %d row(s)",
+                     exc.kind, len(feed_items))
+    return DueRead(canvas_ical.merge_rows(rest, feed_items), ok, feed, err)
+
+
 def due_sheet(items: list[dict], days: int, now: datetime) -> str:
     span = _span_words(days)
     head = f"Due in the next {span} ({len(items)}):" if days != 7 else \
@@ -642,9 +698,10 @@ def find_next_exam(cfg, calendar=None, query: str = "", now: Optional[datetime] 
                    fetch: Fetch = None) -> tuple[Optional[dict], bool]:
     """(exam or None, canvas_checked). Canvas items (when the token is set;
     a CanvasError is swallowed and logged -- the calendar half still
-    answers) merged with the calendar's cached events. ``canvas_checked``
-    is False when the token is unset so a caller can fall back to the
-    canvas_due tool turn, whose setup line explains what is missing."""
+    answers) merged with the coursework in the calendar FEED and with the
+    calendar's own events. ``canvas_checked`` is False only when NEITHER
+    Canvas source exists, so a caller can fall back to the canvas_due tool
+    turn, whose setup line explains what is missing."""
     now = now or _now()
     settings = canvas_settings(cfg)
     items: list = []
@@ -654,6 +711,22 @@ def find_next_exam(cfg, calendar=None, query: str = "", now: Optional[datetime] 
             items = fetch_due(settings, EXAM_LOOKAHEAD_DAYS, fetch or _fetch, now)
         except CanvasError as exc:
             log.info("canvas: exam lookup skipped Canvas (%s)", exc.kind)
+    # The feed's coursework, over a TERM rather than the calendar cache's
+    # fortnight -- a midterm is nearly always further out than 14 days, so
+    # reading only the cached events would answer "nothing on the books"
+    # about an exam that is plainly in the feed. deep_rows re-parses bytes
+    # the calendar already fetched; [] falls back to the cached fortnight.
+    events = _calendar_events(calendar)
+    feed_items = canvas_ical.deep_rows(calendar, now=now) or \
+        canvas_ical.rows_from_events(events, EXAM_LOOKAHEAD_DAYS, now)
+    if feed_items or canvas_ical.has_coursework(events):
+        checked = True
+    items = canvas_ical.merge_rows(items, feed_items)
+    # Coursework now arrives as ITEMS, with a clean title and a course; the
+    # raw VEVENT it came from must not also arrive as an event or every
+    # assignment would be a candidate twice, once with its bracket of
+    # section numbers still attached.
+    events = canvas_ical.other_events(events)
     # The third source: exams accepted from a syllabus scan (jarvis/syllabus.py).
     # It has to be merged HERE and not only in deadlines.tick, or he would
     # call an exam eve for a midterm and then deny having one when asked --
@@ -665,7 +738,7 @@ def find_next_exam(cfg, calendar=None, query: str = "", now: Optional[datetime] 
         items = syllabus_mod.merge_items(items, syllabus_mod.stored_items(now))
     except Exception:                          # noqa: BLE001 - source boundary
         log.debug("canvas: syllabus items unavailable", exc_info=True)
-    return next_exam(items, _calendar_events(calendar), now, query), checked
+    return next_exam(items, events, now, query), checked
 
 
 # -------------------------------------------------------------- grades
@@ -773,21 +846,29 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     def _settings():
         return canvas_settings(cfg)
 
+    def _calendar():
+        # Resolved at CALL time, not here: calendar.make_tools parks the
+        # CalendarSource on services during the same boot loop and the
+        # order of TOOL_MODULES is not this module's business.
+        return getattr(services, "calendar", None) if services is not None else None
+
     def canvas_due(days=DEFAULT_DUE_DAYS, **_) -> ToolResult:
         days = _days_arg(days, DEFAULT_DUE_DAYS)
-        settings = _settings()
-        if settings is None:
-            return ToolResult(text=SETUP_LINE, ok=False, speak=SETUP_LINE)
         now = _now()
-        try:
-            items = fetch_due(settings, days, _fetch, now)
-        except CanvasError as exc:
-            return _excuse(exc)
-        if not items:
+        read = read_due(cfg, days, _calendar(), now)
+        if read.items:
+            return ToolResult(text=due_sheet(read.items, days, now),
+                              max_sentences=MAX_SENTENCES)
+        if read.error is not None and not read.feed:
+            return _excuse(read.error)
+        if read.canvas or read.feed:
+            # A source was read and it is empty: that is an answer.
             line = NOTHING_DUE_LINE if days == 7 else \
                 f"Nothing due in the next {_span_words(days)}, sir."
             return ToolResult(text=f"nothing due in the next {days} days", speak=line)
-        return ToolResult(text=due_sheet(items, days, now), max_sentences=MAX_SENTENCES)
+        # Neither Canvas nor a coursework feed exists -- only NOW is the
+        # token worth mentioning.
+        return ToolResult(text=SETUP_LINE, ok=False, speak=SETUP_LINE)
 
     def canvas_grades(**_) -> ToolResult:
         settings = _settings()

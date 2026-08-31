@@ -619,3 +619,44 @@ def test_the_app_asks_the_wake_offer_after_the_spoken_preview():
         assert a.said == ["Sunny, sir."] and not a._followup_after_speech
     finally:
         bus.unsubscribe(BriefingReady, cards.append)
+
+
+# ---------------------------------------------- Canvas without a token
+# The preview and the week forecast used to gate on `canvas.token` alone,
+# so on a box whose university blocks personal tokens (his does) they went
+# dark while the coursework sat in a calendar he had already subscribed to.
+# The gate is about a SOURCE now (briefing._canvas_source).
+LAB1 = ("Lab 1:  Introduction to the AD2 SDK [BMEN-427:501,502,503,504,"
+        "BMEN-627:600,601,602,603]")
+
+
+def _coursework_cal(*titles):
+    events = [Event(start=_at(TOMORROW, 0), end=_at(TOMORROW + timedelta(days=1), 0),
+                    all_day=True, title=t) for t in titles]
+    return SimpleNamespace(configured=True, events=lambda: events)
+
+
+def test_canvas_source_is_the_token_or_a_coursework_feed():
+    with_token = cfg()
+    assert br._canvas_source(with_token, services()) is True
+    no_token = cfg()
+    no_token["canvas"]["token"] = ""
+    assert br._canvas_source(no_token, services()) is False
+    assert br._canvas_source(no_token, services(calendar=_coursework_cal("Chiro"))) is False
+    assert br._canvas_source(no_token, services(calendar=_coursework_cal(LAB1))) is True
+
+
+def test_preview_and_week_read_canvas_from_the_feed_without_a_token():
+    c = cfg()
+    c["canvas"]["token"] = ""
+    reg = Reg()
+    cal = _coursework_cal(LAB1)
+    sections, sheet, _offer = build_preview(c, reg, services(reg, Notes(), TK(), cal), NOW)
+    assert sections["canvas"] == ["CSCE 421 - Lab 3, tomorrow 11:59 pm"]
+    assert "Canvas due tomorrow: CSCE 421 - Lab 3, tomorrow 11:59 pm" in sheet
+    assert ("canvas_due", {"days": 1}) in reg.calls
+    reg = Reg()
+    sections, sheet = build_week(c, reg, services(reg, Notes([]), TK(), cal), NOW)
+    assert any("due: CSCE 421 - Lab report" in i
+               for d in sections["days"] for i in d["items"])
+    assert ("canvas_due", {"days": 7}) in reg.calls

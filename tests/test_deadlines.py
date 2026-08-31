@@ -268,3 +268,65 @@ def test_the_meeting_heads_up_thread_is_joinable_and_restartable(tmp_path):
     h.start()
     assert h._thread is not t1 and h._thread.is_alive()
     h.stop()
+
+
+# ---------------------------------------------- coursework from the FEED
+# His university blocks personal Canvas access tokens, so without the feed
+# adapter this whole thread was dark on his box: no token, no rows, no
+# heads-up for an 11:59 pm deadline sitting in plain sight in his calendar.
+LAB1 = ("Lab 1:  Introduction to the AD2 SDK [BMEN-427:501,502,503,504,"
+        "BMEN-627:600,601,602,603]")
+ETHICS = "Ethics Quiz - Professional Engineering [ECEN-404:901,902,903]"
+
+
+def test_a_feed_deadline_gets_a_heads_up_without_a_token(tmp_path):
+    now = datetime(2026, 9, 5, 21, 29, tzinfo=TZ)            # 2.5 h before 11:59
+    midnight = now.replace(hour=0, minute=0)
+    cal = _Cal([_ev(LAB1, midnight, all_day=True),
+                _ev("HW#1 [MSEN-222:599,M99]", midnight + timedelta(days=1),
+                    all_day=True),                          # 26 h out: not yet
+                _ev("Chiro", now + timedelta(hours=1))])     # not coursework
+    h, filed = _make(tmp_path, now, cfg=NO_TOKEN, cal=cal)
+    assert h.tick() == 1
+    (_due, text), = filed
+    assert text == ("Lab 1: Introduction to the AD2 SDK for BMEN 427 "
+                    "is due in 2 and a half hours")
+    assert h.tick() == 0, "filed twice"
+    # the snapshot the spoken path reads carries both feed rows
+    assert [(r["course"], r["title"]) for r in h.snapshot()] == [
+        ("BMEN 427", "Lab 1: Introduction to the AD2 SDK"),
+        ("MSEN 222", "HW#1")]
+
+
+def test_a_feed_exam_eve_is_filed_once_not_twice(tmp_path):
+    """The coursework arrives as an ITEM now; its raw VEVENT must not also
+    be a candidate, or the evening call would go out twice -- once under a
+    title still carrying its bracket of section numbers."""
+    now = datetime(2026, 11, 30, 19, 0, tzinfo=TZ)           # 7 pm, the eve
+    exam_day = datetime(2026, 12, 1, 0, 0, tzinfo=TZ)
+    cal = _Cal([_ev(ETHICS, exam_day, all_day=True)])
+    h, filed = _make(tmp_path, now, cfg=NO_TOKEN, cal=cal)
+    assert h.tick() == 1
+    (_due, text), = filed
+    assert text == ("Ethics Quiz - Professional Engineering for ECEN 404 "
+                    "is tomorrow at 11:59 pm")
+
+
+def test_the_token_still_wins_a_duplicate_of_a_feed_row(tmp_path):
+    """With both sources the planner row is the one filed: it knows the
+    course's real name and whether the work was already handed in."""
+    now = datetime(2026, 9, 5, 21, 29, tzinfo=TZ)
+    due = now.replace(hour=23, minute=59)
+    cal = _Cal([_ev("Lab 3 report [BMEN-420:500]", now.replace(hour=0, minute=0),
+                    all_day=True)])
+    h, filed = _make(tmp_path, now, [_item("Lab 3 report", due)], cal=cal)
+    assert h.tick() == 1
+    assert filed[0][1].startswith("Lab 3 report for BIOSENSORS is due in")
+
+
+def test_still_silent_when_neither_a_token_nor_coursework_exists(tmp_path):
+    now = datetime(2026, 8, 31, 20, 30, tzinfo=TZ)
+    cal = _Cal([_ev("Chiro", now + timedelta(hours=1))])
+    h, filed = _make(tmp_path, now, cfg=NO_TOKEN, cal=cal)
+    assert h.tick() == 0 and filed == []
+    assert not (tmp_path / "deadlines.json").exists()

@@ -227,8 +227,9 @@ toggle is in settings under Briefing."
 
 With `briefing.enabled` on, "good night" answers "Good night, sir. Tomorrow,
 briefly." and then reads tomorrow in one breath: the weather, the first
-event and where, Canvas work due within a day (only once `canvas.token` is
-set), open to-dos and the alarm that is set. If the first event starts by
+event and where, Canvas work due within a day (once there is a Canvas source at
+all: `canvas.token` OR a Canvas calendar feed, §13), open to-dos and the alarm
+that is set. If the first event starts by
 `early_before` (09:00) and no alarm rings before it, he asks **"Shall I wake
 you at 7:00 am, sir?"** — a plain "yes" in the follow-up window sets it
 (`wake_lead_min` = 60 minutes before the event, on the quarter hour); "no",
@@ -563,12 +564,35 @@ copy the token once, then in `assistant.json`:
 ```
 
 Then: *"what's due this week?"*, *"any new grades?"*, *"any announcements?"*,
-*"when's the biosensors midterm?"* The token is redacted from every log and repr. Unset:
-"I'll need a Canvas access token set up, sir; the notes are in docs/assistant-setup.md."
+*"when's the biosensors midterm?"* The token is redacted from every log and repr.
+
+### If your university blocks personal access tokens
+
+Ours does, and no token can be minted at all — but Canvas will still hand you a **calendar
+feed**, and it carries the same coursework. In Canvas: **Calendar → Calendar Feed**, copy
+the `.ics` link, and add it to `google_ical_urls` alongside your other subscriptions
+(section 4). Nothing else to configure: Jarvis recognises Canvas assignments by the bracket
+of course codes Canvas appends to every title —
+
+```
+Lab 1: Introduction to the AD2 SDK [BMEN-427:501,502,503,504,BMEN-627:600,...]
+HW#1 [MSEN-222:599,M99]
+```
+
+— and reads them as coursework (an all-day one is due 11:59 pm that day, which is what
+Canvas means by it). *"What's due this week"*, *"when's my next exam"*, the briefing's
+**Due** line, the week forecast and the deadline heads-ups below all work from the feed
+alone. Two things the feed cannot carry: whether you already handed something in (a row
+stands until its due time passes) and the course's spoken NAME, so it says "BMEN 427"
+where a token would say "BIOSENSORS". **Grades and announcements** are the only features
+that genuinely need the token.
+
+With neither a token nor a Canvas feed: "I'll need a Canvas access token set up, sir; the
+notes are in docs/assistant-setup.md." — and only then.
 
 ### Deadlines in the briefing, and a heads-up before each one
 
-With the token set, the briefing gains a **Due** section (the next two days: *"Due:
+With a Canvas source in place (token or feed), the briefing gains a **Due** section (the next two days: *"Due:
 Lab 3 report for BIOSENSORS today 11:59 pm; Quiz 2 for CIRCUITS tomorrow 5:00 pm"*) and,
 a few hours before every Canvas deadline, Jarvis says so unprompted, the way he does for
 meetings — *"Sir, this is your reminder. Lab 3 report for BIOSENSORS is due in 3 hours."*
@@ -581,22 +605,25 @@ meetings — *"Sir, this is your reminder. Lab 3 report for BIOSENSORS is due in
 `heads_up_hours` is the lead (the meeting heads-up's ten minutes is no use for an 11:59 pm
 deadline). He checks Canvas every fifteen minutes and files each reminder only once its
 time is near, so work you hand in during the day is never announced; a restart never
-repeats one (`~/.aiws_trainer/jarvis_memory/deadlines_state.json`). Without a token all of
-this is silent: no Due line in the briefing, no nagging about the missing token.
+repeats one (`~/.aiws_trainer/jarvis_memory/deadlines_state.json`). The calendar feed feeds
+this too, so the Due line and the heads-ups work without a token; with BOTH, the token's
+reading wins a duplicate, since it alone knows whether the work went in. With neither, all
+of this is silent: no Due line in the briefing, no nagging about the missing token.
 
 ### Exams: "when's my next exam?"
 
 *"When's my next exam?"*, *"when is my next quiz"*, *"how long until the biosensors
 midterm?"*, *"how many days until my final?"* are answered instantly, without the model,
-from Canvas (30 days ahead) merged with the calendar cache (14 days) — so the calendar half
-works before the token exists, and an exam that only the iCloud "Canvas" subscription
-carries is found too. Anything titled exam / midterm / final is an exam, a quiz is a quiz;
+from Canvas (30 days ahead), the Canvas calendar feed (a whole term — the calendar cache
+only keeps a fortnight, and a final is further out than that) and the calendar cache
+(14 days) — so this works before the token exists, or without one ever, and an exam that
+only the iCloud "Canvas" subscription carries is found too. Anything titled exam / midterm / final is an exam, a quiz is a quiz;
 *"next exam"* never answers with a quiz, and *"final"* / *"midterm"* must be in the title.
 The briefing adds an **Exam** countdown (*"Midterm 1 for BIOSENSORS, in 6 days, Tuesday at
 9:00 am"*), and at 7 pm the evening before he says *"Midterm 1 for BIOSENSORS is tomorrow
 at 9:00 am"*. With Canvas read and nothing found: *"Nothing that looks like an exam on the
-books, sir."* With no token and nothing on the calendar the question goes to the model,
-which reaches `canvas_due` and its setup line.
+books, sir."* Only with no token, no Canvas feed and nothing on the calendar does the
+question go to the model, which reaches `canvas_due` and its setup line.
 
 ## 14. Your own documents (fully local)
 

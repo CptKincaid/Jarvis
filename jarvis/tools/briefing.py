@@ -864,6 +864,20 @@ def _calendar_events(services) -> Optional[list]:
         return None
 
 
+def _canvas_source(cfg, services) -> bool:
+    """True when there is ANY Canvas coursework to read: a REST token, or a
+    Canvas calendar feed among the subscriptions.
+
+    The preview and the week forecast used to gate on ``canvas.token``
+    alone, so on a box whose university blocks personal tokens (his does)
+    they stayed dark while the coursework sat in a calendar he had already
+    subscribed to. The gate is about a SOURCE, not about the token."""
+    if _cfg_get(cfg, "canvas.token", ""):
+        return True
+    from jarvis.tools import canvas_ical
+    return canvas_ical.has_coursework(_calendar_events(services) or [])
+
+
 def _event_line(ev) -> str:
     title = (getattr(ev, "title", "") or "").strip() or "an event"
     if getattr(ev, "all_day", False):
@@ -1026,7 +1040,7 @@ def build_preview(cfg, registry, services=None, now=None) -> tuple[dict, str, Op
                 first_start = _first_clock(text, tomorrow, now_dt.tzinfo)
             else:
                 notes["calendar"] = text or "unavailable"
-    if section_on(cfg, "canvas") and _cfg_get(cfg, "canvas.token", ""):
+    if section_on(cfg, "canvas") and _canvas_source(cfg, services):
         ok, text = _registry_text(registry, "canvas_due", {"days": 1})
         if ok and text:
             sections["canvas"] = [item for _day, item in _canvas_items(text, today)]
@@ -1059,7 +1073,7 @@ def build_preview(cfg, registry, services=None, now=None) -> tuple[dict, str, Op
             lines.append("First up: " + " ".join(sections["calendar"]))
         else:
             lines.append(f"Calendar: {notes.get('calendar', 'nothing')}")
-    if section_on(cfg, "canvas") and _cfg_get(cfg, "canvas.token", ""):
+    if section_on(cfg, "canvas") and _canvas_source(cfg, services):
         if sections["canvas"]:
             lines.append("Canvas due tomorrow: " + "; ".join(sections["canvas"]))
         else:
@@ -1105,7 +1119,7 @@ def build_week(cfg, registry, services=None, now=None, days: int = WEEK_DAYS) ->
                         buckets[d].append(item)
             else:
                 notes["calendar"] = text or "unavailable"
-    if section_on(cfg, "canvas") and _cfg_get(cfg, "canvas.token", ""):
+    if section_on(cfg, "canvas") and _canvas_source(cfg, services):
         ok, text = _registry_text(registry, "canvas_due", {"days": days})
         if ok and text:
             for d, item in _canvas_items(text, today):
