@@ -407,9 +407,13 @@ class JarvisApp:
             get_calendar=lambda: getattr(getattr(self, "services", None), "calendar", None),
             is_home=(presence.is_home if presence is not None else None),
             say=self._say)                  # the digest is an answer, never held
+        # Lazy: self.focus is constructed AFTER the policy, so this must be a
+        # late lookup, not the object.
+        extra = dict(can_speak=_can_speak,
+                     get_focus=lambda: getattr(self, "focus", None))
         try:
-            policy = mod.QuietPolicy(self.assistant, can_speak=_can_speak, **kwargs)
-        except TypeError:                   # quiet.py without the predicate yet
+            policy = mod.QuietPolicy(self.assistant, **extra, **kwargs)
+        except TypeError:                   # quiet.py without the predicates yet
             policy = mod.QuietPolicy(self.assistant, **kwargs)
         try:
             from jarvis.channels import notify

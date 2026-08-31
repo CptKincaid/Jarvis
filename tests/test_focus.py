@@ -487,3 +487,50 @@ def test_focus_lines_carry_the_message_kind(tmp_path):
     finally:
         fs.stop()
         tk.close()
+
+
+def test_focus_lines_are_not_proactive_so_they_pierce_the_block_hold(tmp_path):
+    """A block holds proactive speech (quiet.py FOCUS_REASON). If the
+    session's own "Time for a break, sir" were proactive it would be held
+    by the very block it is trying to end -- and the break never announced."""
+    clock = FakeClock()
+    tk = Timekeeper(tmp_path / "tk.db", say=lambda s: None, cfg={}, now=clock.now,
+                    run=lambda *a, **k: None, ring=False, notify=False,
+                    cache_dir=tmp_path / "cache")
+    calls = []
+
+    def speak(line, proactive=True, kind="warning"):
+        calls.append((line, proactive, kind))
+    services = SimpleNamespace(timekeeper=tk, speak=speak, assistant=Cfg(),
+                               spotify=None)
+    fs = FocusSession(services, state_path=tmp_path / "focus.json",
+                      now=clock.now, bg=lambda fn: fn())
+    try:
+        fs.start("biosensors")
+        clock.advance(25 * 60 + 1)
+        tk.tick()
+        assert calls and all(p is False for _, p, _ in calls)
+        assert any(line.startswith("Time for a break") for line, _, _ in calls)
+    finally:
+        fs.stop()
+        tk.close()
+
+
+def test_a_one_argument_speak_seam_still_works(tmp_path):
+    """The proactive kwarg is tried first, then kind, then bare text: a
+    test double taking only the line must not break the session."""
+    clock = FakeClock()
+    tk = Timekeeper(tmp_path / "tk.db", say=lambda s: None, cfg={}, now=clock.now,
+                    run=lambda *a, **k: None, ring=False, notify=False,
+                    cache_dir=tmp_path / "cache")
+    said = []
+    services = SimpleNamespace(timekeeper=tk, speak=said.append, assistant=Cfg(),
+                               spotify=None)
+    fs = FocusSession(services, state_path=tmp_path / "focus.json",
+                      now=clock.now, bg=lambda fn: fn())
+    try:
+        fs._speak("Halfway, sir.")
+        assert said == ["Halfway, sir."]
+    finally:
+        fs.stop()
+        tk.close()

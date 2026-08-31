@@ -678,7 +678,9 @@ over, sir: three blocks of 25 minutes." — or until `max_blocks` blocks are don
   came due while the app was down moves into its break at boot; one missed by more
   than an hour is closed with the count. State: `~/.aiws_trainer/jarvis_memory/focus_session.json`.
 - *"Any timers running?"* lists them as "focus block 1 in 20 minutes".
-- There is no do-not-disturb: heads-ups and reminders still speak during a block.
+- A block is a do-not-disturb window (`focus.dnd`, on by default): heads-ups,
+  deadline warnings and the hooks narrator are held and read back as the usual
+  catch-up digest when the break starts. See section 40.
 
 ## 18. Lecture notes by voice
 
@@ -1258,3 +1260,33 @@ print("missing:", cfg.missing_sections())
 import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •••
 EOF
 ```
+
+## 40. Do not disturb during a study block
+
+```json
+"focus": {"block_min": 25, "break_min": 5, "dnd": true}
+```
+
+Section 17's study sessions now hold Jarvis's tongue while a block is running.
+Anything he decided to say on his own — a Canvas deadline heads-up, a memory
+warning, a line from your Claude Code hooks, a reminder — is parked instead of
+spoken, and read back at the break as the catch-up digest of section 34:
+
+> "While you were busy, sir: one reminder and one warning. Your biosensors lab
+> report is due in three hours. Memory is getting tight, sir."
+
+What still gets through mid-block:
+
+- **The session's own lines** — "Halfway, sir.", "Time for a break, sir", "Break's
+  over, sir." They are marked non-proactive, exactly as alarms are, so the block
+  can never silence the announcement that ends it.
+- **Answers to you.** Asking him something is not an interruption.
+- **Alarms**, as always.
+
+The break is not held — that is the whole point of the break — so a session with
+`break_min` of 5 gives him a five-minute window to read the backlog every block.
+Set `"dnd": false` to go back to hearing everything as it happens; `"I am free"`
+also ends the hold early and reads the digest immediately.
+
+Ordering note: an explicit *"do not disturb for an hour"* outranks the block when
+he is asked *why* he is quiet, but either one holds.

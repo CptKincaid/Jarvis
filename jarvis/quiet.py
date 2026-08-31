@@ -18,6 +18,12 @@ Four things make him hold his tongue:
 * being away              -- ``services.presence.is_home()`` says the phone
                              left (jarvis/presence.py); off with
                              ``quiet.hold_when_away``
+* a focus block           -- ``services.focus`` is mid-pomodoro
+                             (jarvis/focus.py); off with ``focus.dnd``.
+                             Only the BLOCK holds: the break is exactly
+                             when the digest should be read, and the
+                             session's own "time for a break" lines pierce
+                             the hold by being non-proactive.
 
 "I am free" ends the current window early (``quiet.free_until`` = the end of
 whatever was blocking) and reads the digest. Otherwise the policy's own
@@ -46,6 +52,7 @@ log = get_logger("quiet")
 HOLD_MAX = 12
 TICK_S = 30.0
 DEFAULT_KEYWORDS = ("class", "exam", "meeting", "busy")
+FOCUS_REASON = "your study block"
 
 # Persona lines (the app prewarms the fixed ones).
 BUSY_PREFIX = "While you were busy, sir"
@@ -176,6 +183,7 @@ class QuietPolicy:
 
     def __init__(self, cfg, get_calendar: Optional[Callable] = None,
                  is_home: Optional[Callable[[], bool]] = None,
+                 get_focus: Optional[Callable] = None,
                  say: Optional[Callable[[str], None]] = None,
                  can_speak: Optional[Callable[[], bool]] = None,
                  now: Callable[[], float] = time.time,
@@ -183,6 +191,7 @@ class QuietPolicy:
         self._cfg = cfg
         self._get_calendar = get_calendar
         self._is_home = is_home
+        self._get_focus = get_focus
         self._say = say
         self._can_speak = can_speak
         self._now = now
@@ -305,6 +314,27 @@ class QuietPolicy:
                 return ev
         return None
 
+    def _focus_reason(self) -> str:
+        """"your study block" while a focus session is mid-block.
+
+        Only ``phase == "block"``. A break is precisely when the backlog
+        SHOULD be read, so the policy goes free there and the existing
+        ``tick()`` speaks the digest for free. The session's own lines
+        ("Time for a break, sir") pierce this because ``FocusSession._speak``
+        marks them ``proactive=False`` -- the gate keys on proactive, never
+        on kind.
+        """
+        if self._get_focus is None or not self._get("focus.dnd", True):
+            return ""
+        try:
+            focus = self._get_focus() if callable(self._get_focus) else self._get_focus
+            if focus is None or str(getattr(focus, "phase", "") or "") != "block":
+                return ""
+        except Exception:  # noqa: BLE001 - a focus hiccup must not mute him
+            log.debug("quiet: focus probe failed", exc_info=True)
+            return ""
+        return FOCUS_REASON
+
     def reason(self, now: Optional[float] = None) -> str:
         """Why he is quiet right now, in his words -- "" when he is not."""
         ts = self._now() if now is None else float(now)
@@ -321,6 +351,9 @@ class QuietPolicy:
         until = self.dnd_until()
         if until > ts:
             return f"do not disturb until {fmt_clock(*_hm(until))}"
+        focus = self._focus_reason()
+        if focus:
+            return focus
         if self._is_home is not None and self._get("quiet.hold_when_away", True):
             try:
                 if not self._is_home():
