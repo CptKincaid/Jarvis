@@ -33,7 +33,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
-from jarvis.events import FaultRaised, Status, bus
+from jarvis.events import FaultRaised, RunProgress, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.registry import ToolResult, ToolSpec
 
@@ -88,6 +88,10 @@ FAULT_RULES = ("memory", "hogs", "trainers")
 LENT_LINE = ("I have lent the GPU to your trainer, sir; quick answers only "
              "until it is done.")
 RECLAIMED_LINE = "Your trainer has finished, sir; I'm loading my model again."
+# The run ledger's duration, folded ONTO the reclaim line rather than
+# spoken beside it: the count of spoken lines per run must not go up.
+RECLAIMED_ELAPSED_LINE = ("Your trainer has finished, sir; that took {elapsed}. "
+                          "I'm loading my model again.")
 
 
 # ------------------------------------------------------------- config
@@ -515,7 +519,8 @@ class Watchdog:
 
     def __init__(self, cfg=None, speak: Optional[Callable[[str], None]] = None,
                  services=None, publish: Optional[Callable] = None,
-                 interval: Optional[float] = None, brain=None, faults=None):
+                 interval: Optional[float] = None, brain=None, faults=None,
+                 runs=None):
         # GPU yield (health.yield_to_trainer): ``brain`` is anything with
         # release() / reclaim() / is_lent(); None means jarvis.brain itself,
         # imported at fire time (tests pass a fake).
@@ -550,6 +555,12 @@ class Watchdog:
         # rule -> the fault tokens spoken for it, so a recovery can clear
         # exactly those entries from the state file (and no others).
         self._fault_tokens: dict = {}
+        # jarvis.runwatch.RunLedger when the integrator wires one: the
+        # start/finish beats and the opt-in epoch progress, driven off THIS
+        # tick (no second thread, and no nvidia-smi -- the wedge the run
+        # ledger narrates around is exactly when nvidia-smi blocks).
+        self.runs = runs
+        self._run_finished = None      # the ledger's finish, for RECLAIMED_LINE
         self._unreadable_logged = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -615,11 +626,52 @@ class Watchdog:
                      len(runners))
             self._clear_fault("trainers")
             self._safe_publish(Status(text="One trainer on the pool", kind="ok"))
+        self._run_ledger(snap, fired)
         if self.yield_to_trainer:
             self._trainer_rule(snap, fired)
         for alert in fired:
             self._fire(alert)
         return fired
+
+    # ------------------------------------------------------ run ledger
+    def _run_ledger(self, snap: Snapshot, fired: list) -> None:
+        """Drive the run ledger off this tick and turn its beats into
+        spoken lines and RunProgress events.
+
+        When the GPU-yield rule is on it owns the two lifecycle beats
+        already (LENT_LINE on appear, RECLAIMED_LINE on vanish, which
+        picks up the duration below), so the ledger stays silent and only
+        publishes -- the spoken line count per run must not go up. With
+        yield off, the ledger's own two beats are the whole feature.
+        """
+        self._run_finished = None
+        ledger = self.runs
+        if ledger is None:
+            return
+        try:
+            events = ledger.apply(list(snap.trainers or []))
+        except Exception:  # noqa: BLE001 - the tick must survive anything
+            log.exception("run ledger failed")
+            return
+        for ev in events:
+            if ev.kind == "finished":
+                self._run_finished = ev
+            quiet = getattr(ledger, "muted", False) or \
+                not getattr(ledger, "narrate", True)
+            line = "" if quiet else ev.line()
+            # The lend/reclaim lines already cover appear and vanish.
+            if self.yield_to_trainer and ev.kind in ("started", "finished"):
+                line = ""
+            self._safe_publish(RunProgress(
+                kind=ev.kind, pid=ev.pid, label=ev.label,
+                elapsed_s=ev.elapsed_s, epoch=ev.epoch,
+                loss=float(ev.loss or 0.0), line=line))
+            # Spoken directly, NOT through _fire: an alert would publish a
+            # Status, and an ok/info Status clears main_window's held ERROR
+            # pill -- a routine "epoch four, sir" must never wipe a fault
+            # off the board.
+            if line:
+                self._speak_line(line)
 
     # ---------------------------------------------------- trainer yield
     def _brain(self):
@@ -674,7 +726,15 @@ class Watchdog:
             ok = False
         self._lent_to = None
         self._absent_ticks = 0
-        fired.append(Alert(kind="ok" if ok else "warn", line=RECLAIMED_LINE,
+        # The run ledger's finish for this tick, folded in: "that took 22
+        # minutes" belongs ON this line, not spoken after it.
+        done = self._run_finished
+        line = RECLAIMED_LINE
+        if done is not None and not done.brief:
+            from jarvis.runwatch import elapsed_words
+            line = RECLAIMED_ELAPSED_LINE.format(
+                elapsed=elapsed_words(done.elapsed_s))
+        fired.append(Alert(kind="ok" if ok else "warn", line=line,
                            status="GPU reclaimed" if ok else "GPU reclaimed; model failed to load",
                            rule="trainer"))
 
@@ -723,12 +783,19 @@ class Watchdog:
                                            line=alert.line))
         if not speak_it:
             return                    # already said once; the board still shows it
+        self._speak_line(alert.line)
+
+    def _speak_line(self, line: str) -> None:
+        """Say one line through whatever speak callback exists. Resolved at
+        fire time from services.speak so boot order does not matter, and
+        that door is proactive=True -- quiet hours hold it for the digest
+        rather than narrating a 3 am run."""
         speak = self._speak or (getattr(self._services, "speak", None)
                                 if self._services is not None else None)
-        if not callable(speak):
+        if not callable(speak) or not line:
             return
         try:
-            speak(alert.line)
+            speak(line)
         except Exception:  # noqa: BLE001 - a TTS failure must not kill the loop
             log.exception("health watchdog: speak failed")
 
@@ -770,6 +837,24 @@ class Watchdog:
         return self._thread is not None and self._thread.is_alive()
 
 
+def make_run_ledger(cfg):
+    """The run ledger from config, or None when it cannot be built. Reads
+    nothing here: log_dir is only opened once runwatch.progress is on AND
+    a run is going, so the default costs a dict lookup per tick."""
+    try:
+        from jarvis.runwatch import RunLedger
+        log_dir = _cfg_get(cfg, "runwatch.log_dir", "") \
+            if _cfg_get(cfg, "runwatch.progress", False) else ""
+        return RunLedger(log_dir=log_dir or None,
+                         narrate=bool(_cfg_get(cfg, "runwatch.narrate", True)),
+                         min_run_s=_cfg_float(cfg, "runwatch.min_run_s", 60.0),
+                         progress_gap_s=_cfg_float(cfg, "runwatch.progress_gap_s",
+                                                   300.0))
+    except Exception:  # noqa: BLE001 - no ledger is better than no watchdog
+        log.exception("run ledger unavailable")
+        return None
+
+
 # --------------------------------------------------------------- tool
 def make_tools(cfg, services) -> list[ToolSpec]:
     warn_gb = _cfg_float(cfg, "health.warn_gb", DEFAULT_WARN_GB)
@@ -779,7 +864,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     # once services.speak exists (the same idiom as calendar.make_tools).
     if services is not None and getattr(services, "health_watchdog", None) is None:
         try:
-            services.health_watchdog = Watchdog(cfg, services=services)
+            services.health_watchdog = Watchdog(cfg, services=services,
+                                                runs=make_run_ledger(cfg))
         except (AttributeError, TypeError):
             log.debug("services does not accept health_watchdog")
 

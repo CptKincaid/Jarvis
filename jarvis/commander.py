@@ -178,6 +178,19 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- dialogue board (2026-08-30): working sessions, faults, runs ---
+        # The Tier-1 probe above bypasses the gate for an EXACT match, but
+        # these reach the classifier the moment they are said loosely
+        # ("sort out my week for me"), and a dropped session opener is
+        # worse than most: it is the first turn of a conversation, so the
+        # silence reads as him ignoring you rather than mishearing.
+        # "plan the week" is spelt out per verb rather than as a bare
+        # "plan", which would call "we should plan a trip" a command.
+        "plan the week", "plan my week", "sort out my week", "my week",
+        "map out the week", "block out the week", "the week ahead",
+        "anything wrong", "what went wrong", "the matter", "the fault",
+        "quietly", "narrat", "keep it down", "fewer updates",
+        "less updates", "how's the run", "the training", "the trainer",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -193,6 +206,12 @@ class IntentClassifier:
         "volume", "repeat", "again",
         # review round 2026-08-30: 1-3-word Tier-1 phrases
         "quiz", "review", "standup", "drill", "recap", "triage", "explain",
+        # dialogue board 2026-08-30: the OPENERS "plan my week" and
+        # "quietly please". A session's own answers ("Thursday", "skip
+        # it") never reach the classifier -- _try_session is rung 3a at
+        # _handle_inner:4025, well above the gate at :4126 -- so the bare
+        # weekdays deliberately stay out of this tuple.
+        "plan", "quietly", "narrate",
     )
 
     _NEGATIVE_PATTERNS = [
@@ -2428,6 +2447,34 @@ def _h_whats_wrong(c, t, m):
                          speak=True, status="No faults")
 
 
+# "Quietly, please" -- the run ledger's narration toggle (jarvis/runwatch.py).
+# Deliberately NOT part of quiet_kind: "quiet" is barge-in (cut the speech
+# now), this holds the epoch beats for the run that is going and lifts by
+# itself when that run ends, so there is nothing left switched off.
+_QUIETLY_RX = re.compile(
+    r"^(?:narrate quietly|quietly(?:,)? please|quietly|keep it down|"
+    r"(?:stop|no more) narrating|don'?t narrate(?: the run| that)?|"
+    r"(?:less|fewer) updates)"
+    r"(?:[,]?\s*(?:please|sir|jarvis))*[.!\s]*$", re.I)
+QUIETLY_LINE = "Quietly it is, sir; I'll tell you when it's done."
+QUIETLY_IDLE_LINE = "Nothing is running to narrate, sir."
+
+
+def _h_quietly(c, t, m):
+    """Hold the run narration for the run in progress."""
+    wd = c._svc("health_watchdog")
+    ledger = getattr(wd, "runs", None)
+    if ledger is None:
+        return None                      # no ledger: "quietly" is the model's
+    if not getattr(ledger, "active", None):
+        return CommandResult(handled=True, reply=QUIETLY_IDLE_LINE, speak=True,
+                             status="Nothing running")
+    ledger.muted = True
+    log.info("run narration muted for the current run")
+    return CommandResult(handled=True, reply=QUIETLY_LINE, speak=True,
+                         status="Narration quiet")
+
+
 def _h_slow_turn(c, t, m):
     """"Why was that slow?": the last real turn on the ledger, by stage."""
     fn = c._svc("slow_turn")
@@ -3385,6 +3432,7 @@ REGISTRY: list[Command] = [
     Command("next exam", _NEXT_EXAM_RX.match, _h_next_exam),
     Command("day review", _DAYREVIEW_RX.match, _h_dayreview),
 
+    Command("quietly", _QUIETLY_RX.match, _h_quietly, needs=("health_watchdog",)),
     Command("whats wrong", _WHATS_WRONG_RX.match, _h_whats_wrong),
     Command("log triage", _LOGTRIAGE_RX.match, _h_log_triage),
     Command("slow turn", _SLOW_RX.match, _h_slow_turn),
@@ -3493,7 +3541,7 @@ ASSISTANT_TIER1: list[Command] = [
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free",
                     "standup", "gpu reclaim", "gpu lend",
-                    "log triage", "whats wrong", "slow turn",
+                    "log triage", "whats wrong", "quietly", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router
                     # would hand Claude the bare words "fix what i copied".

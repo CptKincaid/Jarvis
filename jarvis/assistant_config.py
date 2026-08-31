@@ -123,6 +123,16 @@ DEFAULTS: dict = {
     # the local model, so a multi-hour run leaves Jarvis with Tier 1 only.
     "health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30,
                "yield_to_trainer": False},
+    # The run ledger (jarvis/runwatch.py), driven off the health tick: two
+    # spoken beats per training run (started / finished, with an honest
+    # duration read from /proc). narrate=false keeps the board lane and the
+    # log line but says nothing. progress needs scripts/runlog.sh, which
+    # tees the trainer's stdout to log_dir/<pid>.log -- without the wrapper
+    # there is nothing to read, so it is opt-in; epochs are narrated at
+    # most once per progress_gap_s and only when the number CHANGES.
+    "runwatch": {"narrate": True, "progress": False,
+                 "log_dir": "~/.cache/jarvis/runs",
+                 "min_run_s": 60, "progress_gap_s": 300},
     # Long-term memory (jarvis/memory.py): facts are also indexed with
     # nomic-embed-text so "who's my dentist" finds "my dentist is Dr Patel";
     # semantic=false keeps the substring store only.

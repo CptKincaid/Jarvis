@@ -260,6 +260,30 @@ class ApprovalResolved(Event):
 
 
 @dataclass
+class RunProgress(Event):
+    """A training run's lifecycle, from the run ledger (jarvis/runwatch.py).
+
+    `kind`: started | progress | finished. Published on CHANGE ONLY --
+    never a heartbeat -- from the health watchdog's existing 30 s tick.
+    `label` is the script ("finetune_piper.py"), `elapsed_s` the run's
+    true age (read from /proc/<pid>/stat, so it survives a Jarvis restart
+    mid-run), `line` the sentence he said about it (empty when he stayed
+    quiet: a brief run, or "quietly, please").
+
+    This is the board's live-tail lane contract. The lane is OPTIONAL: the
+    default degrade path is the spoken beats alone, so a renderer that
+    never appears costs nothing.
+    """
+    kind: str = "started"             # started | progress | finished
+    pid: int = 0
+    label: str = ""
+    elapsed_s: float = 0.0
+    epoch: int = 0
+    loss: float = 0.0                 # 0.0 when the tail carried none
+    line: str = ""
+
+
+@dataclass
 class FaultRaised(Event):
     """Something is wrong with the box and it is NEW (jarvis/faults.py).
 
