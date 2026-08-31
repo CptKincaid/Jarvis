@@ -504,5 +504,6 @@ def test_grade_answer_payload_and_fallbacks(monkeypatch):
 
 def test_the_quiz_config_defaults_exist():
     from jarvis.assistant_config import DEFAULTS
-    assert DEFAULTS["quiz"] == {"questions": 5, "chunks": 6}
+    # window_s: how long the mic stays open for the ANSWER (app._capture_window)
+    assert DEFAULTS["quiz"] == {"questions": 5, "chunks": 6, "window_s": 15}
     assert commander._int_setting(SimpleNamespace(_svc=lambda n: None), "quiz.questions", 5) == 5
