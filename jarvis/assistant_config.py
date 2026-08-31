@@ -283,7 +283,18 @@ DEFAULTS: dict = {
     # every non-Jarvis stream slides to duck_level % over duck_ramp_ms and
     # slides back. Per STREAM (pactl set-sink-input-volume), never the sink
     # -- the default sink is the soundbar his own voice comes out of.
-    "audio": {"duck": True, "duck_level": 30, "duck_ramp_ms": 200},
+    # The Room Mixer's settings, and the sink sentinel's (jarvis/soundbar.py).
+    # sink_watch: notice when the speaker his voice lands on changes, and say
+    # so ONCE -- the soundbar's battery died on 2026-08-30 and Jarvis talked
+    # into the HDMI monitor for hours. preferred_sink is a PipeWire sink name
+    # or any fragment of one ("bluez", a MAC fragment); left empty the
+    # sentinel learns the box's Bluetooth sink, since a monitor does not drop.
+    # restore_sink is the ONE state change it may make -- pactl
+    # set-default-sink back to the preferred sink -- and it is OFF because
+    # that changes his desktop, not merely Jarvis's voice.
+    "audio": {"duck": True, "duck_level": 30, "duck_ramp_ms": 200,
+              "sink_watch": True, "preferred_sink": "", "restore_sink": False,
+              "sink_poll_s": 30},
     # The room's light (jarvis/room.py) and scenes (jarvis/scenes.py).
     # There are no bulbs here: this is the 4K panel's brightness (an xrandr
     # gamma scale, floored at 0.55 -- Jarvis's own console lives on it) and

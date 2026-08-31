@@ -1,0 +1,2 @@
+54	alsa_output.platform-NVDA2014_00.hdmi-stereo	PipeWire	s32le 2ch 48000Hz	RUNNING
+58	bluez_output.FC_58_FA_31_9C_2B.1	PipeWire	s16le 2ch 48000Hz	SUSPENDED

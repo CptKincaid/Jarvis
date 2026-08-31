@@ -88,6 +88,7 @@ from jarvis import objections as objections_mod
 from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
+from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.tools.location import clock_words
 from jarvis.events import JarvisReply, Status, bus
@@ -256,6 +257,13 @@ class IntentClassifier:
         "anything wrong", "what went wrong", "the matter", "the fault",
         "quietly", "narrat", "keep it down", "fewer updates",
         "less updates", "how's the run", "the training", "the trainer",
+        # --- the sink sentinel (2026-08-31, jarvis/soundbar.py) ---
+        # Asked while staring at a speaker that has gone quiet, which is
+        # when the wake word is least likely to have been heard: "where's
+        # your voice coming out", "which speaker are you on". The Tier-1
+        # probe covers the exact phrasings; these carry the loose ones.
+        "coming out of", "which speaker", "what speaker", "the soundbar",
+        "the speakers", "audio output", "sound output", "the monitor's",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -3214,6 +3222,37 @@ def _h_garden_undo(c, t, m):
                          status="Garden undone")
 
 
+# The sink sentinel (jarvis/soundbar.py). Asked at the desk, staring at a
+# speaker that is not playing, so it must answer without the wake word --
+# and it is a QUESTION only: nothing here moves a sink.
+_AUDIO_OUT_RX = re.compile(
+    r"^(?:where(?:'s| is| are)? (?:your |my |the )?"
+    r"(?:voice|audio|sound|speech|you) (?:coming out|going|playing|coming from)"
+    r"(?: of| from| to)?"
+    r"|which (?:speaker|sink|output|device) (?:are you|is that|is it) (?:on|using)"
+    r"|what (?:speaker|sink|output) (?:are you|is that) (?:on|using)"
+    r"|(?:what|which) (?:is |are )?(?:my |your )?(?:audio|sound) output)\W*$", re.I)
+
+
+def _h_audio_out(c, t, m):
+    """"Where's your voice coming out?" -- the sentinel's last reading.
+
+    Returns None with no sentinel wired rather than an invented answer: on
+    a box without pactl the honest reply is the model's shrug, not a
+    confident sentence about a speaker nobody probed.
+    """
+    sentinel = c._svc("soundbar")
+    if sentinel is None:
+        return None
+    try:
+        line = sentinel.status_line()
+    except Exception:
+        log.exception("soundbar status failed")
+        line = soundbar_mod.BLIND_LINE
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Audio output")
+
+
 # Jarvis reading his own log (jarvis/logtriage.py): the developer's fastest
 # bug report.  Log-specific words only -- "what went wrong" alone is the
 # persona's, and "any errors" without "log" could be about a build.
@@ -5039,6 +5078,10 @@ REGISTRY: list[Command] = [
     Command("garden undo", _GARDEN_UNDO_RX.match, _h_garden_undo),
     Command("garden report", _GARDEN_REPORT_RX.match, _h_garden_report),
 
+    # Before "whats wrong": "where's your voice coming out" is a question
+    # about the speaker, not about the fault lane.
+    Command("audio out", _AUDIO_OUT_RX.match, _h_audio_out, needs=("soundbar",)),
+
     Command("quietly", _QUIETLY_RX.match, _h_quietly, needs=("health_watchdog",)),
     Command("whats wrong", _WHATS_WRONG_RX.match, _h_whats_wrong),
     Command("log triage", _LOGTRIAGE_RX.match, _h_log_triage),
@@ -5189,6 +5232,10 @@ ASSISTANT_TIER1: list[Command] = [
                     "person", "remember", "recall", "last seen", "who is", "recap",
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free", "room tone",
+                    # "where's your voice coming out" is asked AT the dead
+                    # speaker, which is exactly when the wake word is least
+                    # likely to have been heard.
+                    "audio out",
                     # room control: "dim it a little" / "lights up" / "power
                     # down the workshop" arrive by voice with the wake word
                     # already consumed, so they need the unprefixed pass too

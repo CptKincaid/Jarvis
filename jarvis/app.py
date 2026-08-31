@@ -1021,6 +1021,10 @@ class JarvisApp:
             # is the DeadlineHeadsUp itself, read ONLY through its
             # snapshot() -- never its fetch.
             aside=None, deadlines=None,
+            # The sink sentinel (jarvis/soundbar.py), filled in
+            # start_assistant. Answers "where's my voice coming out" from
+            # its LAST tick -- never a pactl call on the reply path.
+            soundbar=None,
             journal_objection=self._journal_objection,
             # the arc (a state source; nothing calls it, they subscribe) and
             # the room tone the "room tone on/off" command switches
@@ -3785,6 +3789,20 @@ class JarvisApp:
             self.calwatch.start()
         except Exception:
             log.exception("calendar anomaly watch failed to start")
+        try:
+            # The sink sentinel (jarvis/soundbar.py). `speaking` is tts.busy
+            # rather than is_speaking: the sink must not move while a burst
+            # is still queued either, or the rest of the sentence arrives in
+            # a different speaker.
+            from jarvis.soundbar import SoundbarSentinel
+            self.soundbar = SoundbarSentinel(
+                cfg=self.assistant, say=self._say, quiet=self.quiet,
+                state_path=PATHS.MEMORY_DIR / "soundbar_state.json",
+                speaking=lambda: bool(getattr(self.tts, "busy", False)))
+            self.services.soundbar = self.soundbar
+            self.soundbar.start()
+        except Exception:
+            log.exception("sink sentinel failed to start")
         if residency:
             try:
                 # boot warm-up on its own daemon thread, then every 5 min
@@ -3933,6 +3951,7 @@ class JarvisApp:
                           ("debrief", getattr(self, "debrief", None)),
                           ("leavetime", getattr(self, "leavetime", None)),
                           ("calwatch", getattr(self, "calwatch", None)),
+                          ("soundbar", getattr(self, "soundbar", None)),
                           ("dossier", getattr(self, "dossier", None)),
                           # stop() also puts the music back and closes any
                           # auto-armed lecture notes: quit must not leave
