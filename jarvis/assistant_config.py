@@ -178,6 +178,13 @@ DEFAULTS: dict = {
     "quiet": {"hours": {"start": "", "end": ""}, "dnd_until": 0, "free_until": 0,
               "calendar": True, "calendar_keywords": ["class", "exam", "meeting", "busy"],
               "hold_when_away": True},
+    # Background watchers (jarvis/grades.py, mailwatch.py, keyword_watch.py):
+    # unprompted lines, all held by the quiet policy. grades diffs the Canvas
+    # course totals every 15 min; people_mail speaks unread mail from someone
+    # in the people book every 10; keywords is a list of words or phrases to
+    # watch for across unread mail and Canvas announcements -- empty means the
+    # keyword watch never runs. All three are silent without their credentials.
+    "watch": {"grades": True, "people_mail": True, "keywords": []},
     # Presence (jarvis/presence.py): the phone's Wi-Fi address and/or MAC.
     # away_after_min is the grace before "out" -- iPhones nap off Wi-Fi for
     # minutes at a time, so anything under ~10 flaps.

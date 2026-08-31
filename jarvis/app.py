@@ -875,6 +875,14 @@ class JarvisApp:
         except Exception:
             log.exception("alert %s failed", kind)
 
+    def _announce(self, title, text):
+        """One unprompted watcher line (jarvis/watchers.py). Both doors, the
+        way _on_claude_progress does it: _say(proactive=True) so quiet hours,
+        DND and a running lecture hold it for the catch-up digest, and the
+        alerts hub so it still reaches Discord when he is out of the room."""
+        self._say(text, proactive=True)
+        self._alert("milestone", title, text)
+
     def _on_claude_progress(self, ev):
         if ev.milestone and ev.line:
             self._last_milestone[ev.task_id] = ev.line
@@ -2344,6 +2352,34 @@ class JarvisApp:
                 self.deadlines.start()
         except Exception:
             log.exception("deadline heads-up failed to start")
+        # The three pollers of jarvis/watchers.py. Each is dark-safe (no
+        # token / no mailbox / no keywords -> a tick that touches nothing),
+        # so they start unconditionally and answer to their watch.* switch.
+        try:
+            from jarvis.grades import GradeWatch
+            self.gradewatch = GradeWatch(
+                self.assistant, announce=self._announce,
+                state_path=PATHS.MEMORY_DIR / "grades_state.json")
+            self.gradewatch.start()
+        except Exception:
+            log.exception("grade watch failed to start")
+        try:
+            from jarvis.mailwatch import PeopleMailHeadsUp
+            self.mailwatch = PeopleMailHeadsUp(
+                self.assistant, people=lambda: self.memory.people(),
+                announce=self._announce,
+                state_path=PATHS.MEMORY_DIR / "mailwatch_state.json")
+            self.mailwatch.start()
+        except Exception:
+            log.exception("people mail heads-up failed to start")
+        try:
+            from jarvis.keyword_watch import KeywordWatch
+            self.keyword_watch = KeywordWatch(
+                self.assistant, announce=self._announce,
+                state_path=PATHS.MEMORY_DIR / "keyword_watch_state.json")
+            self.keyword_watch.start()
+        except Exception:
+            log.exception("keyword watch failed to start")
         if residency:
             try:
                 # boot warm-up on its own daemon thread, then every 5 min
@@ -2474,6 +2510,9 @@ class JarvisApp:
                           ("activity_sampler", getattr(self.services, "activity_sampler", None)),
                           ("headsup", getattr(self, "headsup", None)),
                           ("deadlines", getattr(self, "deadlines", None)),
+                          ("gradewatch", getattr(self, "gradewatch", None)),
+                          ("mailwatch", getattr(self, "mailwatch", None)),
+                          ("keyword_watch", getattr(self, "keyword_watch", None)),
                           ("focus", getattr(self, "focus", None)),
                           ("presence", getattr(self, "presence", None)),
                           ("quiet", getattr(self, "quiet", None)),
