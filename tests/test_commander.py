@@ -1474,6 +1474,7 @@ def test_a_manager_refusal_is_spoken_as_is(rich, services, clip_project):
 TIER1_SAMPLES = {
     "explain document": "explain the biosensors lab handout",
     "quiz": "quiz me on chapter three",
+    "scan syllabus": "scan my syllabus for dates",
     "review flashcards": "review my flashcards",
     "stop quiz": "stop the quiz",
     "teach me": "teach me biosensors",

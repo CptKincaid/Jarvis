@@ -654,6 +654,17 @@ def find_next_exam(cfg, calendar=None, query: str = "", now: Optional[datetime] 
             items = fetch_due(settings, EXAM_LOOKAHEAD_DAYS, fetch or _fetch, now)
         except CanvasError as exc:
             log.info("canvas: exam lookup skipped Canvas (%s)", exc.kind)
+    # The third source: exams accepted from a syllabus scan (jarvis/syllabus.py).
+    # It has to be merged HERE and not only in deadlines.tick, or he would
+    # call an exam eve for a midterm and then deny having one when asked --
+    # the reminder and the answer must come from the same set. Imported
+    # lazily because syllabus.py reads the documents index, which this
+    # module has no business pulling in on a grades lookup.
+    try:
+        from jarvis import syllabus as syllabus_mod
+        items = syllabus_mod.merge_items(items, syllabus_mod.stored_items(now))
+    except Exception:                          # noqa: BLE001 - source boundary
+        log.debug("canvas: syllabus items unavailable", exc_info=True)
     return next_exam(items, _calendar_events(calendar), now, query), checked
 
 

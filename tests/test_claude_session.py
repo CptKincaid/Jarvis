@@ -1773,3 +1773,37 @@ def test_milestones_and_questions_are_kept_on_the_task():
     lines = cs.parse_stream_event(edit, t, now=130.0)
     assert any(p.milestone and p.line == "Editing b.py and c.py, sir." for p in lines)
     assert t.last_spoken == "Editing b.py and c.py, sir."
+
+
+# ------------------------------------------- the system suffix as a contract
+def test_system_suffix_teaches_the_jarvis_cli():
+    """Every driven pane is told Jarvis himself is queryable (backlog 6).
+
+    The suffix is the ONLY channel that reaches a pane before its first
+    prompt, so the CLI contract lives here or nowhere. Asserted, not just
+    eyeballed, because the shell client's exit codes (jarvis/ask.py) and the
+    -q flag are load-bearing: a pane that dropped -q would speak over him,
+    and one that retried on exit 2 would spin against a dead socket.
+    """
+    s = cs.SYSTEM_SUFFIX
+    assert 'jarvis -q "' in s                      # the quiet shell client
+    assert "exit 2" in s.lower()                   # Jarvis is not running
+    assert "remember" in s.lower()                 # writes into shared memory
+    # the recursion guard: Jarvis routes coding work back to submit(), so a
+    # pane that delegated would queue a task from inside a task
+    assert "delegate" in s.lower()
+    # read aloud: the original contract must survive the additions
+    assert "read aloud" in s
+    # it rides --append-system-prompt-file into a real prompt; keep it short
+    assert len(s.splitlines()) <= 12
+
+
+def test_system_suffix_file_is_rewritten_when_the_constant_changes(work):
+    """_system_suffix() must not leave a stale file from an older release:
+    the file is written once and reused, so a pane would otherwise be taught
+    last release's contract until someone deleted it by hand."""
+    m = make_manager(work, Recorder())
+    path = m._system_suffix()
+    assert path.read_text() == cs.SYSTEM_SUFFIX
+    path.write_text("an older suffix", encoding="utf-8")
+    assert m._system_suffix().read_text() == cs.SYSTEM_SUFFIX

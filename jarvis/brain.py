@@ -1085,6 +1085,16 @@ GRADE_FORMAT = {
     "type": "object",
     "properties": {"correct": {"type": "boolean"}, "note": {"type": "string"}},
     "required": ["correct", "note"]}
+SYLLABUS_FORMAT = {
+    "type": "object",
+    "properties": {"rows": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"title": {"type": "string"}, "course": {"type": "string"},
+                       "due": {"type": "string"}},
+        "required": ["title", "due"]}}},
+    "required": ["rows"]}
+SYLLABUS_TIMEOUT_S = 60.0
+SYLLABUS_MAX_CHARS = 6000
 
 
 def _json_request(instruction, fmt, timeout, num_predict, temperature=0.2):
@@ -1224,6 +1234,47 @@ def extract_facts(journal_text, known=None, limit=GARDEN_MAX_FACTS,
         seen.add(key)
         out.append({"key": key, "value": value[:GARDEN_VALUE_CHARS]})
     return out[:n]
+
+
+def read_syllabus(text, today="", timeout=SYLLABUS_TIMEOUT_S):
+    """[{title, course, due}] of dated work found in syllabus text; [] on
+    failure. ``due`` is asked for as a plain ISO string because every
+    other date format a model invents ("Oct 3", "week 5") has to be
+    guessed at, and a guessed exam date is worse than a dropped one.
+
+    The year is the trap: a syllabus writes "October 3" and the model
+    supplies a year, so it is told today's date and told to pick the year
+    that puts the date in the next twelve months. jarvis/syllabus.py drops
+    anything more than MAX_AHEAD_DAYS out as the hallucination it is, and
+    the spoken read-back is the second net."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    when = f"Today is {today}. " if today else ""
+    instruction = (
+        f"Instruction for Jarvis (not a question from Hunter): {when}extract "
+        f"every dated exam, quiz, project or assignment from the course "
+        f"material below. Reply with JSON only. \"title\" is what it is called "
+        f"(\"Midterm 1\", \"Lab 3 report\"); \"course\" is the course it belongs "
+        f"to, or an empty string when the material does not say; \"due\" is the "
+        f"date as YYYY-MM-DD, or YYYY-MM-DDTHH:MM when a time of day is given. "
+        f"If the year is not written down, choose the year that puts the date "
+        f"within the next twelve months of today. Skip anything with no date "
+        f"at all -- never invent one, and never turn a week number into a "
+        f"date. No markdown.\n\nCourse material:\n{text[:SYLLABUS_MAX_CHARS]}")
+    obj = _json_request(instruction, SYLLABUS_FORMAT, timeout, num_predict=600,
+                        temperature=0.0)
+    out = []
+    for item in (obj or {}).get("rows") or []:
+        if not isinstance(item, dict):
+            continue
+        title = " ".join(str(item.get("title") or "").split())
+        due = " ".join(str(item.get("due") or "").split())
+        if title and due:
+            out.append({"title": title,
+                        "course": " ".join(str(item.get("course") or "").split()),
+                        "due": due})
+    return out
 
 
 def grade_answer(question, expected, given, timeout=GRADE_TIMEOUT_S):
@@ -1410,6 +1461,9 @@ class JarvisBrain:
 
     def grade_answer(self, question, expected, given, timeout=GRADE_TIMEOUT_S):
         return grade_answer(question, expected, given, timeout=timeout)
+
+    def read_syllabus(self, text, today="", timeout=SYLLABUS_TIMEOUT_S):
+        return read_syllabus(text, today=today, timeout=timeout)
 
     def think(self, user_input, callback=None):
         """Legacy entry (deploy/autonomous era): a local question goes to

@@ -67,10 +67,37 @@ DEFAULT_BIG_MODEL = "fable"
 DEFAULT_PROJECTS_ROOT = str(Path.home() / "projects")
 RESUME_PROMPT = ("Pick up where we left off; summarise the state in two "
                  "sentences first, then continue.")
+# Every Jarvis-driven pane gets this via --append-system-prompt-file, so it is
+# also the only place a session learns that the assistant driving it is itself
+# queryable. `jarvis` is the shell client (scripts/jarvis -> jarvis/ask.py) and
+# it reaches the SAME commander the voice path uses, over the command socket —
+# so a session can look up his calendar, Canvas due dates, notes and semantic
+# memory instead of guessing or asking him to repeat himself, and can file what
+# it learned back into that one shared memory. Two guards are load-bearing:
+# -q keeps the soundbar silent (a pane that speaks would talk over him), and
+# "do not delegate" stops the obvious recursion — Jarvis routes coding work to
+# claude_session.submit(), which would queue a task from inside a task.
 SYSTEM_SUFFIX = ("You are being driven by Jarvis, Hunter's voice assistant. "
                  "Your final message is read aloud: end with one or two plain-"
                  "prose sentences saying what you did and anything he must "
-                 "decide.")
+                 "decide.\n"
+                 "\n"
+                 "Jarvis is also a tool you may use. `jarvis -q \"...\"` asks the "
+                 "running assistant a question from any shell and prints his "
+                 "answer; -q keeps it silent so you never talk over him.\n"
+                 "- Personal context you cannot read from the repo: "
+                 "`jarvis -q \"when is my next exam\"`, `jarvis -q \"what's due "
+                 "this week\"`, `jarvis -q \"what's on my list\"`, "
+                 "`jarvis -q \"what did I tell you about the venv\"`.\n"
+                 "- File a durable discovery into his memory (the voice "
+                 "assistant recalls it too): "
+                 "`jarvis -q \"remember the F5 socket lives in /tmp/vss_voice\"`. "
+                 "Facts about his life and setup only — never code notes that "
+                 "belong in the repo.\n"
+                 "- Exit 2 means Jarvis is not running: carry on without him, "
+                 "do not retry in a loop. Exit 3 means the turn gave no reply.\n"
+                 "Do NOT use it to delegate coding, editing or web work back to "
+                 "him; you are the one doing that work.")
 
 # ------------------------------------------------------------ lines (3.4)
 BUSY_LINE = "Claude's still on the last one for {project}, sir; I've queued it."

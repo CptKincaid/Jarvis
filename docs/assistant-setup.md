@@ -1212,6 +1212,11 @@ by hand if you prefer):
 `UserPromptSubmit` only stamps when the turn began (for the 45 s gate); without it,
 "finished" is spoken only after a test run.
 
+These hooks are the *outbound* half — your sessions telling you what happened.
+The inbound half (a session asking Jarvis for your calendar, due dates or memory
+with `jarvis -q "..."`) is section 40; panes Jarvis starts get it automatically,
+your own terminals need four lines in `~/.claude/CLAUDE.md`.
+
 ---
 
 ## What Jarvis says when something is missing
@@ -1261,6 +1266,7 @@ import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •
 EOF
 ```
 
+<<<<<<< HEAD
 <<<<<<< HEAD
 <<<<<<< HEAD
 ## 40. New-grade watch ("a grade just posted")
@@ -1840,3 +1846,173 @@ the model is ever asked.
 Note that *"five pounds in kilos"* is a weight (2.27 kg) while *"five pounds in
 dollars"* is the currency refusal — the weight reading is tried first.
 >>>>>>> worktree-wf_a20f39d5-c33-6
+=======
+## 40. Claude Code sessions can ask Jarvis back
+
+Section 37 gave you `jarvis -q "..."` from a shell. Section 39 made your own
+Claude terminals talk to you through Jarvis. This closes the loop the other way:
+every pane **Jarvis** starts is now told that the assistant driving it is itself
+queryable, so a coding session can look up your calendar, Canvas due dates, notes
+and long-term memory instead of guessing — or asking you to type it again.
+
+Nothing to install: the note rides `--append-system-prompt-file` on the launch
+line (the same file the "your final message is read aloud" rule already used),
+and `Bash(*)` is already in the session allowlist, so no permission prompt. It
+needs only the symlink from section 37:
+
+```bash
+ln -s ~/Jarvis/scripts/jarvis ~/.local/bin/jarvis      # once, if you haven't
+```
+
+What the session is told, in short:
+
+- `jarvis -q "when is my next exam"` / `"what's due this week"` / `"what's on my
+  list"` / `"what did I tell you about the venv"` — personal context it cannot
+  read out of the repo;
+- `jarvis -q "remember the F5 socket lives in /tmp/vss_voice"` — files a durable
+  fact into the **same** semantic memory the voice assistant recalls from. Facts
+  about your life and setup only; code notes belong in the repo;
+- exit 2 means Jarvis is not running (carry on without him, do not retry in a
+  loop), exit 3 means the turn produced no reply;
+- it must **not** delegate coding, editing or web work back to Jarvis — he would
+  route that straight back to `ClaudeSessionManager.submit()` and queue a task
+  from inside a task.
+
+`-q` is not decoration: without it the pane's lookup would be spoken aloud, on
+the soundbar, over whatever Jarvis was saying at the time.
+
+The suffix file under `/tmp/vss_voice/claude/system_suffix.txt` is rewritten
+whenever the constant in `jarvis/claude_session.py` changes, so a pane can never
+be launched with a stale contract; there is nothing to clear by hand.
+
+**Your own terminals** (the `~/.bashrc` tmux wrapper, any plain `claude`) never
+pass through Jarvis and so never see this suffix — the same reason the narration
+hooks in section 39 exist. If you want the same behaviour there, paste the four
+lines into `~/.claude/CLAUDE.md` yourself:
+
+```markdown
+Jarvis (Hunter's voice assistant) is queryable: `jarvis -q "..."` asks the
+running assistant and prints his answer (-q keeps the soundbar silent).
+Use it for personal context — calendar, Canvas due dates, notes, memory — and
+`jarvis -q "remember <fact>"` to file a discovery. Exit 2 means he is not
+running: carry on, do not retry. Never delegate coding or web work to him.
+```
+
+Jarvis never edits that file for you, for the same reason `install.py` is a
+manual step: your Claude configuration is yours.
+
+## 41. Ask him where something is in your own code
+
+> "Jarvis, where does the mic arbiter live?"
+> "It's in Jarvis, jarvis/recorder.py, lines 120 to 168, sir."
+
+That question used to cost a twelve-second `claude -p` session and your
+credits, for what is a lookup. It is now answered locally in about two
+seconds from an embedding index over your own repositories — the same
+machinery as the documents index in section 14, pointed at source instead
+of PDFs.
+
+**Setup: none, if Claude is already configured.** The folders come from
+`claude.allowed_dirs`, because those already are your repos:
+
+```json
+"claude": {"allowed_dirs": ["~/Jarvis", "~/haymaker-digest"]},
+"code": {"paths": [], "index_dir": "", "max_files": 3000}
+```
+
+Set `code.paths` only if you want a different list; leave `index_dir` empty
+and the store lives in `~/.aiws_trainer/jarvis_memory/code_index` (a chroma
+collection called `jarvis_code`, kept separate from the documents one so
+quiz mode never draws a flashcard out of `app.py`).
+
+`.py`, `.md` and `.sh` are indexed. `repo/`, `.git/`, `node_modules`,
+`site-packages`, virtualenvs, caches and build output never are — the first
+of those matters most here, since `~/Jarvis/repo/` holds 140 MB of StyleTTS2
+weights. Files over 300 kB are skipped as generated rather than written.
+
+Chunks are cut where a reader would start — at a `def`, a `class`, a
+markdown heading, a shell function — and carry their line numbers, which is
+where the `file:120-168` citation comes from. The first index of ~200 files
+takes about a minute and a half in the background (measured on this box,
+2026-08-30); after that each question is 20-30 ms of search, and the index
+refreshes itself incrementally every fifteen minutes so a day of editing is
+never invisible.
+
+**What still goes to Claude.** The router only keeps a question local when
+it is a *lookup*:
+
+| stays local (`ask_code`) | still Claude |
+|---|---|
+| "where does the mic arbiter live" | "where should I add the new tool" |
+| "which file has the speaker gate" | "why is the recorder test failing" |
+| "what module holds the tool registry" | "refactor the module that owns the mic" |
+| "show me the file that starts the tmux session" | "ask claude where the mic arbiter lives" |
+
+The index can say where things are; it cannot say where they belong or why
+they broke. Saying "ask Claude" explicitly always wins.
+
+## 42. Syllabus dates: the exam that never reached Canvas
+
+Canvas carries assignments. The midterm dates live in a PDF, and at TAMU
+that PDF is often the only place they exist — so "when's my next exam" said
+nothing, the evening-before heads-up never fired, and the briefing had
+nothing to count down to.
+
+Drop the syllabus into the documents folder from section 14 and say:
+
+> "Jarvis, scan my syllabus."
+>
+> "I found 2 dates in your syllabus, sir: Midterm 1 for CS 101, in 30 days,
+> Wednesday 1 Oct at 9:00 am; Final exam for CS 101, in 100 days, Wed 10 Dec.
+> Shall I put them on the books?"
+>
+> "Yes." — "Filed, sir; 2 on the books."
+
+Also: "read my syllabus", "go through my syllabus", "check my syllabus for
+dates", "add my syllabus dates", "what's on my syllabus". No wake word
+needed in jarvis mode.
+
+**Nothing is filed until you say yes**, and every date is read back in full
+rather than counted. That is deliberate: a model reading dates out of a PDF
+is exactly where a wrong *year* files a reminder for the wrong week, and the
+read-back is the only moment you can catch it. Saying anything other than a
+clear yes or no drops the offer, as with any other read-back (section 30).
+
+Three guards run before you even hear the question. A date the model could
+not write as a plain `YYYY-MM-DD` is dropped rather than guessed at; a date
+already in the past is dropped (scanning in October must not file
+September's midterm); and a date more than 400 days out is dropped as the
+hallucinated year it is.
+
+Once accepted, the dates are a **third source** beside Canvas and your
+calendar, and they are merged in both places that matter:
+
+- `deadlines.tick` — the lead-hours reminder ("Lab 3 report for CS 101 is
+  due in 3 hours") and the 7 pm evening-before exam call;
+- `canvas.find_next_exam` — "when's my next exam" and the briefing's exam
+  countdown.
+
+Merging only the first would have him call an exam eve for a midterm he
+would then deny having when asked, which is worse than no exam eve at all.
+If a professor posts the midterm to Canvas *and* lists it in the syllabus,
+Canvas wins: its due time is the authoritative one, and you get one
+reminder rather than two.
+
+Re-scanning the same syllabus is safe — already-known dates are recognised
+and he says "Already on the books, sir."
+
+```
+~/.aiws_trainer/jarvis_memory/syllabus_deadlines.json   the accepted rows
+```
+
+Written atomically, one row per date (`title`, `course`, `due`, `all_day`).
+Delete the file to forget everything a scan ever filed; the reminders
+already handed to the timekeeper are separate and are cancelled the usual
+way.
+
+**When it says nothing useful.** "I can't find a syllabus in your documents,
+sir" means the folder has nothing syllabus-shaped in it (or nothing at all);
+"I'm indexing your documents now" means the file is there but not embedded
+yet — ask again in a moment; "My document index isn't answering" means
+Ollama is down, not that the folder is wrong.
+>>>>>>> worktree-wf_a20f39d5-c33-7

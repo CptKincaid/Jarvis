@@ -784,3 +784,49 @@ def test_a_bare_status_stays_with_the_persona():
                  "have claude check the status page"):
         d = r.route(text, "jarvis")
         assert d.action != "status_text", (text, d)
+
+
+# ------------------------------------------ code lookups stay local (15)
+def test_a_lookup_in_his_own_code_stays_local():
+    """"Where does the mic arbiter live" wore a coding cue and was billed
+    as a twelve-second `claude -p` session; ask_code answers it from the
+    local embedding index in about two seconds, so rule 4 gives way."""
+    r = Router(None, classify=None)
+    for text in ("where does the mic arbiter live in the code",
+                 "where is the speaker verification module",
+                 "which file has the wake word gate",
+                 "what function handles the transcription",
+                 "what module holds the tool registry",
+                 "show me the file that starts the tmux session",
+                 "where in the codebase is the intent classifier"):
+        d = r.route(text, "jarvis")
+        assert d.kind == "local" and d.reason == "local:code-lookup", (text, d)
+
+
+def test_a_design_question_is_not_a_lookup():
+    """"Where SHOULD I add the handler" wears the same opening words and is
+    Claude's: the index can say where things are, not where they belong."""
+    r = Router(None, classify=lambda t: ("claude", 0.99))
+    for text in ("where should I add the new tool",
+                 "where should we put the retry logic",
+                 "why is the recorder test failing",
+                 "refactor the module that owns the mic"):
+        d = r.route(text, "jarvis")
+        assert d.reason != "local:code-lookup", (text, d)
+
+
+def test_saying_ask_claude_still_overrides_the_lookup():
+    """Rule 3 (explicit cue) binds before rule 4, so the carve-out cannot
+    trap a question he deliberately handed over."""
+    r = Router(None, classify=None)
+    d = r.route("ask claude where the mic arbiter lives in the code", "jarvis")
+    assert d.kind == "claude" and d.reason == "explicit"
+
+
+def test_a_local_errand_that_starts_with_where_is_untouched():
+    """"Where's my next meeting" is the calendar's, not the code index's:
+    a strong local cue is checked before the carve-out."""
+    r = Router(None, classify=None)
+    for text in ("where's my next meeting", "where is my 3pm appointment"):
+        d = r.route(text, "jarvis")
+        assert d.kind == "local" and d.reason != "local:code-lookup", (text, d)

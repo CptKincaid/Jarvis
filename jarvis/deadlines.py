@@ -10,6 +10,13 @@ evening-before heads-up for anything that looks like an exam (Canvas
 items and calendar events alike, see tools/canvas.exam_candidates): "Midterm
 1 for BIOSENSORS is tomorrow at 9:00 am" at EXAM_EVE_HOUR the day before.
 
+A THIRD source joins the two: dates a syllabus scan proposed and Hunter
+accepted (jarvis/syllabus.py), which is how an exam a professor never put
+in Canvas gets the same heads-up. Canvas wins a duplicate, since its due
+time is the authoritative one. canvas.find_next_exam merges the same
+source, deliberately -- an exam eve for something "when's my next exam"
+would then deny is worse than no exam eve at all.
+
 Silent by design when the token is unset: canvas_settings() answers None
 and tick() returns 0 without a log line, so a box without a token never
 nags. A CanvasError (outage, bad token) is logged at debug and the tick
@@ -59,8 +66,10 @@ def _hours_words(delta: timedelta) -> str:
 class DeadlineHeadsUp:
     def __init__(self, cfg, timekeeper, lead_hours: float = DEFAULT_LEAD_HOURS,
                  state_path: Optional[Path] = None, now: Callable = None,
-                 get_calendar: Callable = None, fetch_due: Callable = None):
+                 get_calendar: Callable = None, fetch_due: Callable = None,
+                 syllabus_path: Optional[Path] = None):
         self._cfg = cfg
+        self._syllabus_path = Path(syllabus_path) if syllabus_path else None
         self._tk = timekeeper
         try:
             self.lead_hours = max(0.25, float(lead_hours))
@@ -118,13 +127,27 @@ class DeadlineHeadsUp:
         cal = self._get_calendar() if callable(self._get_calendar) else self._get_calendar
         return canvas_mod._calendar_events(cal)
 
+    def _syllabus_items(self, now: datetime) -> list[dict]:
+        """The third source: dates accepted from a syllabus scan. Canvas
+        wins a tie (its due time is authoritative), so a professor who
+        posts the midterm AND lists it in the syllabus is not reminded
+        about it twice."""
+        try:
+            from jarvis import syllabus as syllabus_mod
+            return syllabus_mod.stored_items(now, self._syllabus_path)
+        except Exception:                         # noqa: BLE001 - source boundary
+            log.debug("deadlines: syllabus items unavailable", exc_info=True)
+            return []
+
     # ------------------------------------------------------------- tick
     def tick(self) -> int:
         """File the reminders that are due to be filed; returns how many."""
         if self._tk is None:
             return 0
         now = self._now()
-        items = self._canvas_items(now)
+        from jarvis import syllabus as syllabus_mod
+        items = syllabus_mod.merge_items(self._canvas_items(now),
+                                         self._syllabus_items(now))
         events = self._calendar_events()
         filed = 0
         filed += self._file_deadlines(items, now)

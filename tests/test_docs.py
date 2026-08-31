@@ -116,6 +116,9 @@ def _fresh_env_index(tmp_path, monkeypatch):
     cfg by design, so every test here would share ONE chromadb store and
     bleed state. Each test gets its own."""
     monkeypatch.setenv("JARVIS_DOCS_INDEX_DIR", str(tmp_path / "env_index"))
+    # Same story for the code index: its default is PATHS.MEMORY_DIR/code_index,
+    # which conftest firewalls per SESSION, not per test.
+    monkeypatch.setenv("JARVIS_CODE_INDEX_DIR", str(tmp_path / "env_code_index"))
 
 
 @pytest.fixture
@@ -139,7 +142,7 @@ def _tools(cfg, embed):
 # ---------------------------------------------------------- contract
 def test_descriptions_within_word_cap(cfg, embed):
     specs = make_tools(cfg, None, embed=embed)
-    assert [s.name for s in specs] == ["ask_docs", "docs_reindex"]
+    assert [s.name for s in specs] == ["ask_docs", "docs_reindex", "ask_code"]
     for spec in specs:
         assert spec.description_words() <= DESCRIPTION_WORD_CAP, spec.name
     assert "question" in specs[0].parameters["properties"]
@@ -464,3 +467,270 @@ def test_config_defaults_and_overrides(tmp_path, monkeypatch):
                                           "ollama_url": "http://h:1"}})
     assert (idx.max_files, idx.model, idx.base_url) == (7, "x", "http://h:1")
     assert isinstance(idx, DocsIndex)
+
+
+# ===================================================== the code index (15)
+RECORDER_PY = '''"""Recorder: capture, silence auto-stop, calibration."""
+import sounddevice
+
+
+class MicArbiter:
+    """The mic arbiter is the single owner of the microphone."""
+
+    def acquire(self, owner):
+        """Pause the hotword while owner holds the mic."""
+        self.depth += 1
+        return self
+
+
+def calibrate(seconds=2.0):
+    """Measure the room noise floor."""
+    return 0.01
+'''
+
+HOTWORD_PY = '''"""Wake word detection with openWakeWord."""
+
+
+class Hotword:
+    def predict(self, frame):
+        """Score one audio frame against the wake model."""
+        return 0.0
+'''
+
+README_MD = """# Jarvis
+
+## Running
+Start it with python -m jarvis.app.
+
+## Layout
+Modules live under jarvis/.
+"""
+
+INSTALL_SH = """#!/usr/bin/env bash
+set -euo pipefail
+
+install_units() {
+  echo installing the systemd units
+}
+
+install_units
+"""
+
+
+@pytest.fixture
+def repo(tmp_path):
+    """A miniature repo with the two traps: a repo/ full of weights and a
+    .git/ full of hooks."""
+    root = tmp_path / "Jarvis"
+    (root / "jarvis").mkdir(parents=True)
+    (root / "jarvis" / "recorder.py").write_text(RECORDER_PY)
+    (root / "jarvis" / "hotword.py").write_text(HOTWORD_PY)
+    (root / "README.md").write_text(README_MD)
+    (root / "scripts").mkdir()
+    (root / "scripts" / "install.sh").write_text(INSTALL_SH)
+    (root / "repo").mkdir()
+    (root / "repo" / "styletts2.py").write_text("WEIGHTS = 'do not index me'\n")
+    (root / ".git").mkdir()
+    (root / ".git" / "hook.sh").write_text("echo do not index me\n")
+    (root / "jarvis" / "__pycache__").mkdir()
+    (root / "jarvis" / "__pycache__" / "recorder.py").write_text("cached\n")
+    return root
+
+
+@pytest.fixture
+def code_cfg(tmp_path, repo, folder):
+    return {"docs": {"paths": [str(folder)], "index_dir": str(tmp_path / "index")},
+            "code": {"paths": [str(repo)]}}
+
+
+class _Services:
+    """Where make_tools parks its indexes (jarvis/app.py builds the real one)."""
+    docs_index = None
+    docs = None
+    code_index = None
+
+
+def _code_index(code_cfg, embed):
+    idx = docs_mod.build_code_index(code_cfg, embed)
+    idx.reindex()
+    return idx
+
+
+def _code_tools(code_cfg, embed):
+    """A registry whose code index is already FILLED. There is no
+    code_reindex tool to prime it with (the tool budget is tight and the
+    index refreshes itself), so the synchronous pass goes through the
+    instance make_tools parks on services."""
+    services = _Services()
+    reg = ToolRegistry()
+    reg.register_many(make_tools(code_cfg, services, embed=embed))
+    services.code_index.reindex()
+    return reg, services.code_index
+
+
+# ------------------------------------------------------------- chunking
+def test_chunk_code_cuts_at_definitions_and_keeps_line_numbers():
+    pieces = docs_mod.chunk_code(RECORDER_PY, ".py", size=200, max_lines=50)
+    assert len(pieces) >= 3
+    # every chunk starts on a line a reader would start on
+    starts = [p["text"].splitlines()[0] for p in pieces[1:]]
+    assert all(re.match(r"(?:@|class |def |if __name__)", ln) for ln in starts), starts
+    # line numbers are 1-based, inclusive and point at the real line
+    lines = RECORDER_PY.splitlines()
+    for piece in pieces:
+        assert lines[piece["start"] - 1] == piece["text"].splitlines()[0]
+        assert lines[piece["end"] - 1] == piece["text"].splitlines()[-1]
+        assert piece["text"].splitlines()[-1].strip(), "a citation ending on a blank line"
+
+
+def test_chunk_code_never_overlaps_and_loses_no_code():
+    """Unlike prose, code chunks must not overlap: the same lines under two
+    citations would let him "find" one function in two places. And nothing
+    with content may fall between two chunks."""
+    pieces = docs_mod.chunk_code(RECORDER_PY, ".py", size=200, max_lines=50)
+    prev, covered = 0, set()
+    for piece in pieces:
+        assert piece["start"] > prev, piece
+        prev = piece["end"]
+        covered |= set(range(piece["start"], piece["end"] + 1))
+    lines = RECORDER_PY.splitlines()
+    assert {i + 1 for i, ln in enumerate(lines) if ln.strip()} <= covered
+
+
+def test_chunk_code_packs_small_definitions_together():
+    """A file of eight tiny helpers must not become eight embeddings."""
+    src = "".join(f"def helper_{i}():\n    return {i}\n\n" for i in range(8))
+    assert len(docs_mod.chunk_code(src, ".py")) == 1
+
+
+def test_chunk_code_splits_one_enormous_function():
+    src = "def huge():\n" + "".join(f"    x = {i}\n" for i in range(300))
+    pieces = docs_mod.chunk_code(src, ".py", size=10 ** 6, max_lines=100)
+    assert len(pieces) == 4 and all(p["end"] - p["start"] < 100 for p in pieces)
+
+
+def test_chunk_code_markdown_headings_and_shell_functions():
+    md = docs_mod.chunk_code(README_MD, ".md", size=10)
+    assert [p["text"].splitlines()[0] for p in md] == ["# Jarvis", "## Running", "## Layout"]
+    sh = docs_mod.chunk_code(INSTALL_SH, ".sh", size=10)
+    assert any(p["text"].startswith("install_units() {") for p in sh)
+
+
+def test_chunk_code_ignores_an_empty_file():
+    assert docs_mod.chunk_code("   \n\n  ", ".py") == []
+
+
+# ----------------------------------------------------------------- scan
+def test_scan_never_descends_into_repo_or_git(code_cfg, embed):
+    """repo/ holds 140 MB of StyleTTS2 weights in the real repository, and
+    .git holds hooks; walking either wastes minutes and indexes noise."""
+    idx = docs_mod.build_code_index(code_cfg, embed)
+    found = {p.name for p in idx.scan()}
+    assert found == {"recorder.py", "hotword.py", "README.md", "install.sh"}
+    assert all("repo" not in p.parts and ".git" not in p.parts
+               and "__pycache__" not in p.parts for p in idx.scan())
+
+
+def test_scan_skips_a_file_over_the_size_cap(code_cfg, embed, repo):
+    (repo / "jarvis" / "generated.py").write_text("x = 1\n" * 200_000)
+    idx = docs_mod.build_code_index(code_cfg, embed)
+    assert "generated.py" not in {p.name for p in idx.scan()}
+
+
+# ------------------------------------------------------------ ask_code
+def test_ask_code_answers_with_a_file_and_a_line_range(code_cfg, embed):
+    reg, _ = _code_tools(code_cfg, embed)
+    res = reg.call("ask_code", {"question": "where does the mic arbiter live"})
+    assert res.ok, res.text
+    first = res.text.splitlines()[0]
+    assert first.startswith("From Jarvis/jarvis/recorder.py:"), res.text
+    # the citation is a real line range, and the chunk it names holds the class
+    ref = first.split(":")[1].split(" ")[0]
+    start, end = (int(x) for x in ref.split("-"))
+    body = "\n".join(RECORDER_PY.splitlines()[start - 1:end])
+    assert "class MicArbiter" in body
+
+
+def test_ask_code_names_the_repo_not_just_the_file(code_cfg, embed):
+    """Two repos with a jarvis/app.py are indistinguishable when spoken, so
+    the citation is relative to the repo's PARENT."""
+    idx = _code_index(code_cfg, embed)
+    hits = idx.query("the mic arbiter", k=1)
+    assert hits[0]["rel"].startswith("Jarvis/")
+
+
+def test_ask_code_and_ask_docs_never_share_a_collection(code_cfg, embed, tmp_path):
+    """Quiz mode and the lecture flows read chunks straight out of the
+    documents store by file name; recorder.py in a flashcard round is a bug."""
+    shared = tmp_path / "shared_store"
+    code = docs_mod.CodeIndex([Path(code_cfg["code"]["paths"][0])], shared, embed=embed)
+    code.reindex()
+    assert code.names()
+    prose = DocsIndex([tmp_path / "nothing"], shared, embed=embed)
+    assert prose.collection().count() == 0
+    assert docs_mod.CODE_COLLECTION != docs_mod.COLLECTION
+
+
+def test_ask_code_with_no_folders_says_so(embed):
+    """No code.paths and no claude.allowed_dirs: "indexing now" would be a
+    lie he never stops telling."""
+    reg = _tools({"code": {"paths": []}}, embed)
+    res = reg.call("ask_code", {"question": "where is the recorder"})
+    assert not res.ok and res.speak == docs_mod.NO_CODE_LINE
+
+
+def test_ask_code_empty_question(code_cfg, embed):
+    res = _tools(code_cfg, embed).call("ask_code", {"question": "  "})
+
+    assert not res.ok and res.speak == docs_mod.NO_CODE_QUESTION_LINE
+
+
+def test_ask_code_ollama_down_line(code_cfg, embed):
+    reg, _ = _code_tools(code_cfg, embed)
+    embed.down = True
+    res = reg.call("ask_code", {"question": "where is the mic arbiter"})
+    assert not res.ok and res.speak == docs_mod.CODE_DOWN_LINE
+
+
+def test_ask_code_is_lazy_at_boot(code_cfg, embed, tmp_path):
+    make_tools(code_cfg, None, embed=embed)
+    assert not (tmp_path / "env_code_index").exists()
+    assert embed.calls == []
+
+
+def test_ask_code_parks_the_index_on_services(code_cfg, embed):
+    services = _Services()
+    make_tools(code_cfg, services, embed=embed)
+    assert isinstance(services.code_index, docs_mod.CodeIndex)
+    assert services.docs is not services.code_index
+
+
+# ------------------------------------------------------------- freshness
+def test_refresh_if_stale_reindexes_a_repo_he_has_been_editing(code_cfg, embed, repo):
+    """start_background latches once per process, which suits a documents
+    folder and not a repo he edits all day."""
+    idx = _code_index(code_cfg, embed)
+    assert idx.refresh_if_stale(10 ** 6) is False        # still fresh
+    (repo / "jarvis" / "endpoint.py").write_text("def endpoint():\n    return 1\n")
+    assert idx.refresh_if_stale(0.0) is True
+    idx.wait(10)
+    assert "endpoint.py" in {Path(p).name for p in idx.indexed()}
+
+
+# ----------------------------------------------------------------- config
+def test_code_paths_fall_back_to_claude_allowed_dirs(tmp_path, monkeypatch):
+    a, b = tmp_path / "Jarvis", tmp_path / "haymaker"
+    a.mkdir()
+    b.mkdir()
+    cfg = {"claude": {"allowed_dirs": [str(a), str(b), "", str(a)]}}
+    assert docs_mod.code_paths(cfg) == [a, b]              # deduped, blanks out
+    assert docs_mod.code_paths({"code": {"paths": [str(b)]},
+                                "claude": {"allowed_dirs": [str(a)]}}) == [b]
+    assert docs_mod.code_paths({}) == []
+    monkeypatch.delenv("JARVIS_CODE_INDEX_DIR", raising=False)
+    assert docs_mod.code_index_dir({"code": {"index_dir": str(tmp_path / "ci")}}) \
+        == tmp_path / "ci"
+    assert docs_mod.code_index_dir({}).name == "code_index"
+    monkeypatch.setenv("JARVIS_CODE_INDEX_DIR", str(tmp_path / "env"))
+    assert docs_mod.code_index_dir({"code": {"index_dir": str(tmp_path / "ci")}}) \
+        == tmp_path / "env"                               # env beats config
