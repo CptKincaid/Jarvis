@@ -19,7 +19,7 @@ from jarvis.commander import Commander, IntentClassifier
 from jarvis.config import CONFIG
 from jarvis.events import Presence, Status, bus
 from jarvis.quiet import (AWAY_PREFIX, BUSY_PREFIX, DND_ALREADY_FREE_LINE,
-                          DND_SET_LINE, FREE_LINE, NOTHING_HELD_LINE,
+                          DND_SET_LINE, FOCUS_REASON, FREE_LINE, NOTHING_HELD_LINE,
                           QUIET_HOURS_OFF_LINE, QUIET_HOURS_SET_LINE,
                           QUIET_STATUS_FREE_LINE, QuietPolicy, digest,
                           parse_clock)
@@ -615,3 +615,145 @@ def test_a_held_alarm_notice_is_digested_as_an_alarm():
     p.hold("You missed your alarm at 7:00 am, sir.", "alarm")
     p.clock.tick(minutes=11)
     assert "one alarm" in p.tick(), "kind='alarm' must not read as 'message'"
+
+
+# --------------------------------------------------- focus-aware DND (n=2)
+class FakeFocus:
+    """The `phase` slice of jarvis.focus.FocusSession."""
+
+    def __init__(self, phase=""):
+        self.phase = phase
+
+
+def test_a_focus_block_holds_proactive_lines_and_the_break_reads_them_back():
+    """assistant-setup.md said outright there was no do-not-disturb for a
+    study block. Now the block holds and the existing tick() digest lands
+    in the break, not mid-pomodoro."""
+    said = []
+    focus = FakeFocus("block")
+    p = _policy(say=said.append, get_focus=lambda: focus)
+    assert p.reason() == FOCUS_REASON and p.should_hold()
+    p.hold("Sir, your Canvas deadline is in three hours.", "reminder")
+    p.hold("Memory is getting tight, sir", "warning")
+    assert p.tick() == "" and said == []            # mid-block: nothing spoken
+    focus.phase = "break"                            # the break IS the moment
+    text = p.tick()
+    assert text.startswith(BUSY_PREFIX + ": one reminder and one warning.")
+    assert said == [text]
+
+
+def test_a_focus_break_and_a_finished_session_are_not_quiet():
+    assert _policy(get_focus=lambda: FakeFocus("break")).reason() == ""
+    assert _policy(get_focus=lambda: FakeFocus("")).reason() == ""
+    assert _policy(get_focus=lambda: None).reason() == ""
+    assert _policy().reason() == ""                   # no probe wired at all
+
+
+def test_focus_dnd_can_be_switched_off():
+    cfg = FakeCfg({"focus": {"dnd": False}})
+    p = _policy(cfg, get_focus=lambda: FakeFocus("block"))
+    assert p.reason() == "" and not p.should_hold()
+
+
+def test_a_broken_focus_probe_never_mutes_him():
+    def boom():
+        raise RuntimeError("focus died")
+    assert _policy(get_focus=boom).reason() == ""
+
+
+def test_dnd_outranks_the_focus_block_in_the_spoken_reason():
+    """Both hold; the explicit one is what he names when asked why."""
+    p = _policy(get_focus=lambda: FakeFocus("block"))
+    p.set_dnd(3600)
+    assert p.reason().startswith("do not disturb until")
+
+
+def test_i_am_free_pierces_a_focus_block():
+    p = _policy(get_focus=lambda: FakeFocus("block"))
+    p._set("quiet.free_until", p.now() + 600)
+    assert p.reason() == ""
+
+
+# -------------------------------------------------- nudges expire (n=24)
+def test_a_nudge_expires_instead_of_joining_the_digest():
+    """"Stand up, sir" read back after a two-hour meeting is noise, and
+    five of them is worse -- so a held nudge is dropped, not queued."""
+    p = _policy()
+    p.set_dnd(600)
+    assert p.hold("Sir, this is your reminder. Drink water.", "nudge") is False
+    assert p.hold("Sir, this is your reminder. Drink water.", "nudge") is False
+    assert p.held == []
+    assert p.hold("Sir, your lab report is due in three hours.", "reminder") is True
+    p.clock.tick(minutes=11)
+    text = p.tick()
+    assert "one reminder" in text and "drink water" not in text.lower()
+
+
+def test_a_nudge_never_eats_a_slot_in_the_capped_backlog():
+    p = _policy(hold_max=3)
+    p.set_dnd(600)
+    for i in range(10):
+        p.hold(f"nudge {i}", "nudge")
+    for i in range(3):
+        p.hold(f"warning {i}", "warning")
+    assert [t for _, t, _ in p.held] == ["warning 0", "warning 1", "warning 2"]
+
+
+def test_an_unheld_nudge_is_spoken_normally(monkeypatch):
+    """Expiry is a QUIET-hours rule, not a mute: with the window open the
+    nudge goes straight to the TTS like anything else."""
+    a = _app(monkeypatch, quiet=_policy())
+    a._say("Sir, this is your reminder. Drink water.", proactive=True, kind="nudge")
+    assert a.tts.spoken == ["Sir, this is your reminder. Drink water."]
+
+
+def test_the_status_line_says_expired_not_held(monkeypatch):
+    p = _policy()
+    p.set_dnd(600)
+    a = _app(monkeypatch, quiet=p)
+    seen = []
+    unsub = bus.subscribe(Status, seen.append)
+    try:
+        a._say("Drink water.", proactive=True, kind="nudge")
+        a._say("Memory is tight.", proactive=True, kind="warning")
+    finally:
+        bus.unsubscribe(Status, unsub)
+    kinds = [s.text.split(" ", 1)[0] for s in seen]
+    assert kinds == ["Expired", "Held"] and a.tts.spoken == []
+
+
+def test_timekeeper_tags_an_interval_reminder_as_a_nudge(tmp_path, monkeypatch):
+    """The whole chain: 'every 45 minutes' -> repeat '45m' -> kind 'nudge'
+    -> the quiet policy expires it."""
+    import jarvis.tools.timekeeper as tk_mod
+    monkeypatch.setattr(tk_mod, "_run", lambda argv, **kw: None)
+    calls = []
+
+    def say(text, proactive=False, kind=""):
+        calls.append((text, proactive, kind))
+    clock = Clock(NOON)
+    t = Timekeeper(tmp_path / "tk.db", say=say, cfg={}, now=clock.now, tick_s=0.01,
+                   ring=False, cache_dir=tmp_path / "cache", notify=False)
+    try:
+        t.add_reminder(clock.now() + 60, "drink water", repeat="45m")
+        t.add_reminder(clock.now() + 60, "call mum")
+        clock.tick(minutes=2)
+        t.tick()
+        flags = {kind: proactive for _, proactive, kind in calls}
+        assert flags == {"nudge": True, "reminder": True}
+    finally:
+        t.close()
+
+
+def test_real_app_asks_its_own_focus_session(build, monkeypatch):  # noqa: F811
+    """The probe must be LATE-bound: app._make_quiet runs before
+    _make_focus, so a policy holding the object itself would hold None."""
+    a = build()
+    assert a.focus is not None and a.assistant.get("focus.dnd") is True
+    assert a.quiet.reason() == ""
+    a.focus.state["phase"] = "block"
+    assert a.quiet.reason() == FOCUS_REASON
+    a.services.speak("Memory is getting tight, sir.")     # the watchdog's door
+    assert a.tts.spoken == [] and len(a.quiet.held) == 1
+    a.focus._speak("Time for a break, sir.")              # the session's own
+    assert a.tts.spoken == ["Time for a break, sir."]

@@ -18,6 +18,12 @@ Four things make him hold his tongue:
 * being away              -- ``services.presence.is_home()`` says the phone
                              left (jarvis/presence.py); off with
                              ``quiet.hold_when_away``
+* a focus block           -- ``services.focus`` is mid-pomodoro
+                             (jarvis/focus.py); off with ``focus.dnd``.
+                             Only the BLOCK holds: the break is exactly
+                             when the digest should be read, and the
+                             session's own "time for a break" lines pierce
+                             the hold by being non-proactive.
 
 "I am free" ends the current window early (``quiet.free_until`` = the end of
 whatever was blocking) and reads the digest. Otherwise the policy's own
@@ -28,7 +34,10 @@ questions never come through here at all: the gate is keyed on the caller's
 ``proactive=True`` flag, not on ``_say`` itself.
 
 Held lines are capped (``HOLD_MAX``): a night of watchdog warnings must not
-become a ten-minute monologue at seven in the morning.
+become a ten-minute monologue at seven in the morning. Some kinds are not
+held at all: an interval nudge (``kind="nudge"``, jarvis/tools/timekeeper.py)
+EXPIRES when the window is closed, because "stand up, sir" is only true at
+the moment it was due.
 """
 from __future__ import annotations
 
@@ -46,6 +55,7 @@ log = get_logger("quiet")
 HOLD_MAX = 12
 TICK_S = 30.0
 DEFAULT_KEYWORDS = ("class", "exam", "meeting", "busy")
+FOCUS_REASON = "your study block"
 
 # Persona lines (the app prewarms the fixed ones).
 BUSY_PREFIX = "While you were busy, sir"
@@ -59,8 +69,18 @@ QUIET_STATUS_QUIET_LINE = "I'm holding my tongue, sir: {reason}."
 QUIET_STATUS_FREE_LINE = "I'm not holding anything back, sir."
 FREE_LINE = "Very good, sir."
 
+# A kind that is only worth hearing AT its moment. A stand-up nudge read
+# back after a two-hour meeting is noise, and a 45-minute water nudge held
+# through a three-hour block would arrive five deep. Held -> expired.
+# "nudge" here is an interval reminder (timekeeper.NUDGE_KIND), not the
+# app's "Sir?" cue -- that one is an answer and never reaches this gate.
+EPHEMERAL_KINDS = ("nudge",)
+
 _KIND_NOUNS = {
     "reminder": ("reminder", "reminders"),
+    # A nudge normally never reaches a digest (hold() expires it); the entry
+    # keeps a stray one from reading as "one message".
+    "nudge": ("nudge", "nudges"),
     "timer": ("timer", "timers"),
     "warning": ("warning", "warnings"),
     "message": ("message", "messages"),
@@ -176,6 +196,7 @@ class QuietPolicy:
 
     def __init__(self, cfg, get_calendar: Optional[Callable] = None,
                  is_home: Optional[Callable[[], bool]] = None,
+                 get_focus: Optional[Callable] = None,
                  say: Optional[Callable[[str], None]] = None,
                  can_speak: Optional[Callable[[], bool]] = None,
                  now: Callable[[], float] = time.time,
@@ -183,6 +204,7 @@ class QuietPolicy:
         self._cfg = cfg
         self._get_calendar = get_calendar
         self._is_home = is_home
+        self._get_focus = get_focus
         self._say = say
         self._can_speak = can_speak
         self._now = now
@@ -305,6 +327,27 @@ class QuietPolicy:
                 return ev
         return None
 
+    def _focus_reason(self) -> str:
+        """"your study block" while a focus session is mid-block.
+
+        Only ``phase == "block"``. A break is precisely when the backlog
+        SHOULD be read, so the policy goes free there and the existing
+        ``tick()`` speaks the digest for free. The session's own lines
+        ("Time for a break, sir") pierce this because ``FocusSession._speak``
+        marks them ``proactive=False`` -- the gate keys on proactive, never
+        on kind.
+        """
+        if self._get_focus is None or not self._get("focus.dnd", True):
+            return ""
+        try:
+            focus = self._get_focus() if callable(self._get_focus) else self._get_focus
+            if focus is None or str(getattr(focus, "phase", "") or "") != "block":
+                return ""
+        except Exception:  # noqa: BLE001 - a focus hiccup must not mute him
+            log.debug("quiet: focus probe failed", exc_info=True)
+            return ""
+        return FOCUS_REASON
+
     def reason(self, now: Optional[float] = None) -> str:
         """Why he is quiet right now, in his words -- "" when he is not."""
         ts = self._now() if now is None else float(now)
@@ -321,6 +364,9 @@ class QuietPolicy:
         until = self.dnd_until()
         if until > ts:
             return f"do not disturb until {fmt_clock(*_hm(until))}"
+        focus = self._focus_reason()
+        if focus:
+            return focus
         if self._is_home is not None and self._get("quiet.hold_when_away", True):
             try:
                 if not self._is_home():
@@ -388,13 +434,21 @@ class QuietPolicy:
             return FREE_LINE if was else DND_ALREADY_FREE_LINE
 
     # ------------------------------------------------------------- hold
-    def hold(self, text: str, kind: str = "message") -> None:
+    def hold(self, text: str, kind: str = "message") -> bool:
+        """Park a line for the digest. False when it was DROPPED instead --
+        an ephemeral kind (a nudge) is only worth hearing at its moment, so
+        it expires rather than queueing behind the window."""
         text = (text or "").strip()
         if not text:
-            return
+            return False
+        kind = kind or "message"
+        if kind in EPHEMERAL_KINDS:
+            log.info("quiet: expired (%s): %.80s", kind, text)
+            return False
         with self._lock:
-            self._held.append((self._now(), text, kind or "message"))
+            self._held.append((self._now(), text, kind))
         log.info("quiet: held (%s): %.80s", kind, text)
+        return True
 
     @property
     def held(self) -> list:

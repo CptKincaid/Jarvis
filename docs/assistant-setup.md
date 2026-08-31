@@ -678,7 +678,9 @@ over, sir: three blocks of 25 minutes." — or until `max_blocks` blocks are don
   came due while the app was down moves into its break at boot; one missed by more
   than an hour is closed with the count. State: `~/.aiws_trainer/jarvis_memory/focus_session.json`.
 - *"Any timers running?"* lists them as "focus block 1 in 20 minutes".
-- There is no do-not-disturb: heads-ups and reminders still speak during a block.
+- A block is a do-not-disturb window (`focus.dnd`, on by default): heads-ups,
+  deadline warnings and the hooks narrator are held and read back as the usual
+  catch-up digest when the break starts. See section 40.
 
 ## 18. Lecture notes by voice
 
@@ -1260,6 +1262,7 @@ EOF
 ```
 
 <<<<<<< HEAD
+<<<<<<< HEAD
 ## 40. New-grade watch ("a grade just posted")
 
 Nothing to set up beyond the Canvas token (section 13). Once it is in place
@@ -1720,3 +1723,120 @@ A "trend" needs the median wait to move by 0.4 s **and** 20%, so a quiet week of
 turns cannot shout. All of it is arithmetic over JSON already on disk: no log
 re-reading, no model, nothing leaving the box.
 >>>>>>> worktree-wf_a20f39d5-c33-5
+=======
+## 40. Do not disturb during a study block
+
+```json
+"focus": {"block_min": 25, "break_min": 5, "dnd": true}
+```
+
+Section 17's study sessions now hold Jarvis's tongue while a block is running.
+Anything he decided to say on his own — a Canvas deadline heads-up, a memory
+warning, a line from your Claude Code hooks, a reminder — is parked instead of
+spoken, and read back at the break as the catch-up digest of section 34:
+
+> "While you were busy, sir: one reminder and one warning. Your biosensors lab
+> report is due in three hours. Memory is getting tight, sir."
+
+What still gets through mid-block:
+
+- **The session's own lines** — "Halfway, sir.", "Time for a break, sir", "Break's
+  over, sir." They are marked non-proactive, exactly as alarms are, so the block
+  can never silence the announcement that ends it.
+- **Answers to you.** Asking him something is not an interruption.
+- **Alarms**, as always.
+
+The break is not held — that is the whole point of the break — so a session with
+`break_min` of 5 gives him a five-minute window to read the backlog every block.
+Set `"dnd": false` to go back to hearing everything as it happens; `"I am free"`
+also ends the hold early and reads the digest immediately.
+
+Ordering note: an explicit *"do not disturb for an hour"* outranks the block when
+he is asked *why* he is quiet, but either one holds.
+
+## 41. Interval nudges: "every 45 minutes"
+
+Reminders have always repeated *daily* or *on weekdays*. They now also repeat on
+an interval:
+
+> *"Remind me to drink water every 45 minutes."*
+> *"Stand up every hour."*
+> *"Every two hours check the oven."*
+> *"Take a break every 90 minutes."*
+
+Anything from **one minute to twenty-four hours**. The first nudge is one
+interval away, not immediate, and each one re-files itself as it fires. They
+list and cancel like any other reminder:
+
+> *"Any reminders?"* — "Drink water in 40 minutes, every 45 minutes, sir."
+> *"Cancel the water reminder."*
+
+Nothing to configure.
+
+**They know when to shut up.** A nudge is only true at the moment it is due, so
+when Jarvis is holding his tongue — quiet hours, do not disturb, a meeting on the
+calendar, a study block (section 40), or simply because you are out of the house —
+a nudge that comes due **expires** instead of joining the catch-up digest. Come
+back from a two-hour meeting and you get your reminders and warnings, not four
+stacked "drink water" lines. Real reminders, timers, alarms and warnings are held
+as before; a nudge never takes up one of the twelve backlog slots either.
+
+Two phrasings he deliberately refuses, because they are almost always a mis-hear:
+
+- *"every 5 seconds"* — below the one-minute floor.
+- *"every week"* — above the twenty-four-hour ceiling.
+
+He says "I couldn't make out the time, sir" rather than quietly setting something
+odd.
+
+## 42. Sums and unit conversions, answered instantly
+
+Nothing to configure — this one just works, and it works with the wake word or
+without it.
+
+> *"What's 18 percent of 74?"* — "18 percent of 74 is 13.32, sir."
+> *"What's 43 times 17?"* — "43 times 17 is 731, sir."
+> *"How many ounces in 300 grams?"* — "300 grams is 10.58 ounces, sir."
+> *"Convert 5 miles to kilometres."* — "5 miles is 8.05 kilometres, sir."
+> *"What's 100 Fahrenheit in Celsius?"*
+> *"What's 15 percent off 80?"* — the discounted price, 68.
+> *"What's the square root of 144?"*
+
+These used to be a full local-model turn: seconds of waiting, and the 26B model
+does not always get the arithmetic right. They are now answered in Python before
+the model is ever asked.
+
+**Numbers** may be spoken or written: *"eighteen percent of seventy-four"*,
+*"a hundred and twenty times two"*, *"three point five"*, and a transcript's
+"1,250" all work.
+
+**Units** he knows:
+
+| kind | units |
+|---|---|
+| mass | mg, g, kg, tonne, ounce, pound, stone |
+| length | mm, cm, metre, km, inch, foot, yard, mile |
+| temperature | Celsius, Fahrenheit, Kelvin |
+| data | kB, MB, GB, TB (powers of 1000) and KiB, MiB, GiB, TiB (powers of 1024) |
+
+**What he refuses out loud, rather than guessing:**
+
+- *"How many ounces in five miles?"* — "Those don't convert, sir: miles is a
+  length and ounces is a mass."
+- *"What's 10 divided by 0?"* — "You can't divide by zero, sir."
+- *"Convert 20 dollars to euros."* — "I can't do currency, sir; I've no exchange
+  rate down here."
+
+**What he hands to the model instead**, deliberately:
+
+- **Volume.** A US pint is 473 ml and a UK pint is 568; fluid ounces differ too.
+  There is no honest single answer, so he does not pretend there is.
+- **Chains** like *"two plus three times four"* — spoken precedence is genuinely
+  ambiguous.
+- Anything else he does not recognise. The rule throughout is that he only claims
+  a question he can actually answer; everything else carries on down the ladder
+  exactly as before.
+
+Note that *"five pounds in kilos"* is a weight (2.27 kg) while *"five pounds in
+dollars"* is the currency refusal — the weight reading is tried first.
+>>>>>>> worktree-wf_a20f39d5-c33-6

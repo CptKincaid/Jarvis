@@ -19,6 +19,11 @@ device or an unlinked account is a session without music, never an
 apology mid-study. A setup/auth failure switches music off for the rest
 of the session so he does not retry it every block.
 
+While a block is running the quiet policy holds proactive lines
+(`focus.dnd`, default on) and reads them back as the usual catch-up digest
+when the break starts -- the session's own lines are non-proactive and speak
+through regardless.
+
 State lives in `focus_session.json` under PATHS.MEMORY_DIR (the app passes
 the path): phase, block number, the item ids, what was done to the music.
 `reconcile()` at boot -- after Timekeeper.start(), whose catch-up may have
@@ -327,12 +332,19 @@ class FocusSession:
             return
         try:
             try:
+                # proactive=False is what makes these lines PIERCE the quiet
+                # hold: quiet.py holds a focus BLOCK (jarvis/quiet.py
+                # _focus_reason), and a session whose own "Time for a break,
+                # sir" got parked in its own digest would never break.
                 # kind reaches the quiet digest ("two messages", not "two
                 # warnings" -- the services speak lambda defaults to the
                 # watchdog's kind).
-                say(line, kind="message")
+                say(line, proactive=False, kind="message")
             except TypeError:
-                say(line)                  # a bare test seam takes text only
+                try:
+                    say(line, kind="message")
+                except TypeError:
+                    say(line)              # a bare test seam takes text only
         except Exception:                  # noqa: BLE001 - speech boundary
             log.exception("focus: speak failed")
 

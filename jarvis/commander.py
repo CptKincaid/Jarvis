@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from jarvis import lecture as lecture_mod
+from jarvis import mathspeak
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
 from jarvis.config import CONFIG, PATHS
@@ -679,6 +680,26 @@ def _h_clock(c, t, m):
     # the answer aloud, exactly as the brain's replies are always spoken.
     return CommandResult(handled=True, reply=clock_reply(datetime.now(), m),
                          speak=True, status="Clock")
+
+
+# ---- Tier 1 arithmetic and unit conversion --------------------------
+# "What's 18 percent of 74" used to be a full gemma turn: router's
+# _QUESTION_RX sends calculate/compute/convert to the brain, which is
+# seconds of wait for something stdlib does exactly (jarvis/mathspeak.py).
+# The matcher IS the evaluator: it returns the finished sentence or None,
+# so an unrecognised phrasing falls through to the model rather than being
+# claimed and half-answered.
+def math_kind(text: str):
+    """The finished ``mathspeak.Answer`` when this is a sum or conversion
+    he can do, else None (the ladder carries on to the router)."""
+    return mathspeak.solve(text)
+
+
+def _h_math(c, t, m):
+    # Spoken regardless of talk-back, like the clock: a sum asked aloud
+    # wants its answer aloud.
+    return CommandResult(handled=True, reply=m.text, speak=True,
+                         status="Maths" if m.ok else "Maths (declined)")
 
 
 # ---- Tier 1 courtesy --------------------------------------------------
@@ -3831,6 +3852,7 @@ REGISTRY: list[Command] = [
             _h_describe_screen, needs=("context",)),
     Command("autonomous", _m_autonomous, _h_autonomous, needs=("brain",)),
     Command("clock", clock_kind, _h_clock),              # Tier 1 clock
+    Command("math", math_kind, _h_math),                 # Tier 1 arithmetic
     Command("courtesy", courtesy_kind, _h_courtesy),     # Tier 1 courtesy
     Command("quiet", quiet_kind, _h_quiet),              # Tier 1 barge-in
     Command("repeat", repeat_kind, _h_repeat),           # Tier 1 say again
@@ -4053,6 +4075,10 @@ ASSISTANT_TIER1: list[Command] = [
                     # reaches the prefixed registry: without this the router
                     # would hand Claude the bare words "fix what i copied".
                     "clip to claude",
+                    # arithmetic and unit conversion answer unprefixed too:
+                    # "what's 18 percent of 74" is a question, not a command,
+                    # and nobody says "jarvis" before a sum.
+                    "math",
                     "read control")
 ]
 

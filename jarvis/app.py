@@ -410,9 +410,13 @@ class JarvisApp:
             get_calendar=lambda: getattr(getattr(self, "services", None), "calendar", None),
             is_home=(presence.is_home if presence is not None else None),
             say=self._say)                  # the digest is an answer, never held
+        # Lazy: self.focus is constructed AFTER the policy, so this must be a
+        # late lookup, not the object.
+        extra = dict(can_speak=_can_speak,
+                     get_focus=lambda: getattr(self, "focus", None))
         try:
-            policy = mod.QuietPolicy(self.assistant, can_speak=_can_speak, **kwargs)
-        except TypeError:                   # quiet.py without the predicate yet
+            policy = mod.QuietPolicy(self.assistant, **extra, **kwargs)
+        except TypeError:                   # quiet.py without the predicates yet
             policy = mod.QuietPolicy(self.assistant, **kwargs)
         try:
             from jarvis.channels import notify
@@ -501,8 +505,11 @@ class JarvisApp:
         if proactive and quiet is not None:
             try:
                 if quiet.should_hold():
-                    quiet.hold(text, kind)
-                    bus.publish(Status(text=f"Held ({quiet.reason() or 'quiet'}): "
+                    # False = dropped, not parked (an interval nudge expires
+                    # rather than joining the digest); say which happened.
+                    kept = quiet.hold(text, kind) is not False
+                    bus.publish(Status(text=f"{'Held' if kept else 'Expired'} "
+                                       f"({quiet.reason() or 'quiet'}): "
                                        f"{text[:60]}", kind="info"))
                     return
             except Exception:
@@ -612,7 +619,8 @@ class JarvisApp:
         # tools registered; a missing module simply contributes nothing).
         for modname, name in (("jarvis.tools.spotify", "PERSONA_LINES"),
                               ("jarvis.tools.canvas", "PERSONA_LINES"),
-                              ("jarvis.focus", "PERSONA_LINES")):
+                              ("jarvis.focus", "PERSONA_LINES"),
+                              ("jarvis.mathspeak", "PERSONA_LINES")):
             lines = getattr(sys.modules.get(modname), name, None)
             if isinstance(lines, (list, tuple)):
                 phrases += [ln for ln in lines if isinstance(ln, str) and ln
