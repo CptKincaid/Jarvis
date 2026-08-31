@@ -51,6 +51,10 @@ _LEGACY_LOG = PATHS.LOG_DIR / "gui_debug.log"
 # document or a Claude transcript must not turn the day file into a dump.
 JOURNAL_TEXT_CAP = 4000
 JOURNAL_KINDS = ("exchange", "tool", "claude", "window", "debrief")
+# continuity_block() re-reads the day file at most this often; a journal
+# write invalidates it outright, so the ceiling only bounds the cost of
+# back-to-back turns that journal nothing.
+CONTINUITY_TTL_S = 30.0
 
 
 def _git(repo_dir, *args, timeout=5):
@@ -149,6 +153,10 @@ class ContextEngine:
         self._journal_lock = threading.Lock()
         self._journal_failed_logged = False
         self._last_journaled_window = None
+        # (built_at, text) for continuity_block(): the day file is re-read
+        # at most once per CONTINUITY_TTL_S, and any journal write drops it
+        # so the timer he just set is counted on the very next turn.
+        self._continuity = None
 
     # ------------------------------------------------------------------
     # Public API
@@ -214,6 +222,7 @@ class ContextEngine:
                 with open(d / f"{date.today():%Y-%m-%d}.jsonl", "a",
                           encoding="utf-8") as fh:
                     fh.write(line + "\n")
+            self._continuity = None      # the day just changed under it
             self._journal_failed_logged = False
         except Exception:
             if not self._journal_failed_logged:
@@ -302,6 +311,30 @@ class ContextEngine:
             day += timedelta(days=1)
         rows.sort(key=lambda r: r["_when"])
         return rows
+
+    def continuity_block(self, now=None) -> str:
+        """The "Earlier today" callback block, or "".
+
+        Repetition counters off today's journal (jarvis/tools/journal.py),
+        rendered into the DYNAMIC user turn by brain._dynamic_context --
+        never the static prefix, which must stay byte-identical for
+        Ollama's cache. Cached for CONTINUITY_TTL_S because it reads the
+        day file and this runs on every Tier 2 turn; a journal write drops
+        the cache, so the third coffee timer counts immediately.
+        """
+        cached = self._continuity
+        if cached is not None and time.monotonic() - cached[0] < CONTINUITY_TTL_S:
+            return cached[1]
+        try:
+            from jarvis.tools.journal import journal_repeats
+            when = now or datetime.now()
+            start = when.replace(hour=0, minute=0, second=0, microsecond=0)
+            text = journal_repeats(self.journal_rows(start, when))
+        except Exception:                          # noqa: BLE001
+            log.debug("continuity block failed", exc_info=True)
+            text = ""
+        self._continuity = (time.monotonic(), text)
+        return text
 
     def forget_exchange(self, user_text) -> bool:
         """Drop the most recent exchange whose user line is ``user_text``.

@@ -3178,3 +3178,102 @@ evs = [Event.from_dict(e) for v in d["sources"].values()
 print(courses.recurring_courses(evs))
 PY
 ```
+## Register, continuity and the self sheet
+
+### "Formal mode" before your advisor arrives
+
+Say **"formal mode"** (or "be more formal", "be serious", "cut the jokes")
+and Jarvis drops the asides and the joke family for good — said once, it is
+still formal tomorrow. **"Banter up"** ("more banter", "loosen up", "dial up
+the wit") goes the other way; **"back to normal"** ("your usual", "banter
+down", "less formal") returns him to the middle.
+
+It is one line in the config, and you can set it by hand:
+
+```jsonc
+"persona": { "register": "normal" }        // "formal" | "normal" | "banter"
+```
+
+Why it is worth knowing about: the register is baked into the **static**
+half of the Tier 2 prompt, which every question re-sends byte-for-byte so
+Ollama can keep it cached. Changing it therefore costs exactly one
+~2700-token reprocess, paid on a background thread the moment you say it,
+while Jarvis answers with a fixed line straight away. The naive version of
+this feature rebuilds the prompt every turn and pays that cost on every
+question you ask. If you ever want to check the invariant yourself:
+
+```bash
+cd ~/Jarvis && JARVIS_SHOT_SEED=1 ~/vss_env/bin/python - <<'EOF'
+from jarvis import brain
+a = brain.static_system()
+print("stable:", all(brain.static_system() == a for _ in range(50)))
+print("changed once:", brain.set_register("formal"), brain.static_system() != a)
+print("and no more:", brain.set_register("formal") is False)
+EOF
+```
+
+Formal also changes the short courtesies ("Yes, sir." rather than "Always,
+sir."), and it gets the plain diagnostics sheet instead of the film-register
+one — the register that bans asides bans that one too. Every variant is a
+fixed string, so they are all prewarmed into the speech cache and the
+register costs no latency at all.
+
+### "That would be the third coffee timer, sir"
+
+Nothing to switch on. Every Tier 2 turn now carries a short **"Earlier
+today"** block in its background: the same tool run with the same argument
+more than once (the third *coffee* timer, the third weather check), and a
+question you asked earlier and have come back to. The counts come from the
+activity journal, which is the only place a tool's argument is kept —
+`~/.aiws_trainer/jarvis_memory/journal/<date>.jsonl`, the same file "recap my day"
+reads.
+
+Two rules keep it tasteful: a count of one is never mentioned, at most two
+clauses appear, and a repeated *question* only counts once the first asking
+has scrolled out of the four recent exchanges the model can already see.
+The block also carries its own instruction — the numbers colour his reply,
+he never reads one aloud unless you ask him how many. If you want the
+number, ask for it.
+
+The block is re-read from disk at most every 30 seconds, and any journal
+write drops that cache, so a timer you set this second is counted on the
+very next thing you say.
+
+### "How are you?" now has an answer
+
+The old reply was one of three canned lines opening with "All systems
+nominal, sir." — the one line in the product that sounded like a toy, and a
+phrase his own voice rules forbid. It is gone from the courtesy and from the
+diagnostics sheet.
+
+"How are you?", "how do you feel?" and "are you busy?" are now answered from
+what he actually is: whether the local model is lent to a trainer, whether
+the GPU is throttled, whether quiet hours is holding messages for you,
+whether your voiceprint was ever enrolled, and how many turns he has taken
+today. It is one clause, it costs no model call, and the variants that carry
+no number are prewarmed so the fastest exchange in the system stays fast.
+
+### "Run diagnostics", in the register of the films
+
+The same probes, spoken rather than read out:
+
+> Power to the local model at full, sir. The GPU is running at 54 degrees,
+> 2424 megahertz, 2 percent busy. 4 terminals of yours on the board, 2
+> mid-turn. 9 turns today, and I've been up 3 hours and 12 minutes.
+
+The plain sheet — the same numbers, in order — goes on the card, and stays
+what `jarvis.ask --status` and the command socket's `status` return, so
+nothing that scripts against it changes.
+
+Four things it now knows that it did not before: the GPU's clock and
+utilisation, whether the model is resident or lent out, how many of *your
+own* `claude` tmux sessions are live (and how many are mid-turn), and the
+kind of output your voice is actually leaving by. The clock is the one that
+matters on this box: a wedged GB10 sits at 611 MHz against a healthy 2400,
+and idle power draw reads about 15 W in both states, so the draw is not a
+tell and is never spoken. Below 1200 MHz he says the GPU is dragging its
+feet.
+
+Nothing here is phrased by the model. Every figure is a reading, and if the
+counters cannot be read he says so in a sentence rather than quietly
+shortening the report.

@@ -161,6 +161,11 @@ DEFAULTS: dict = {
     # keep_days are pruned. enabled=false stops the sampler only -- exchanges
     # and tool calls are always journaled.
     "journal": {"enabled": True, "window_interval_s": 60, "keep_days": 90},
+    # Spoken register (jarvis/brain.py REGISTERS), set by voice ("formal
+    # mode", "banter up") and read back at app start. It is baked into the
+    # STATIC Tier 2 prompt, so a change costs exactly one prefix reprocess
+    # and every turn afterwards is cached again.
+    "persona": {"register": "normal"},
     "briefing": {"enabled": False, "on_first_wake": True, "after": "06:00", "hn_items": 3,
                  "news_feeds": ["https://www.theverge.com/rss/index.xml",
                                 "https://feeds.arstechnica.com/arstechnica/index"],

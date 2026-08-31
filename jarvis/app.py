@@ -67,7 +67,7 @@ from jarvis import debrief as debrief_mod
 from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
 from jarvis import earcons
-from jarvis import speak_queue, standup, voice_check
+from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
@@ -75,7 +75,8 @@ from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
 from jarvis import garden as garden_mod
 from jarvis.brain import JarvisBrain
-from jarvis.commander import (COURTESY_REPLIES, DESTRUCTIVE_TTL_S,
+from jarvis.commander import (COURTESY_BY_REGISTER, COURTESY_REPLIES,
+                              DESTRUCTIVE_TTL_S, REGISTER_LINES,
                               CommandResult, Commander, parse_yes_no,
                               strip_jarvis_prefix)
 from jarvis.context import ContextEngine
@@ -288,6 +289,15 @@ class JarvisApp:
             brain_mod.configure(self.assistant.local_model)
         except Exception:
             log.exception("brain.configure(%s) failed", self.assistant.local_model)
+        # The register he last asked for, before the first static_system()
+        # call: set here it costs nothing, set later it costs a reprocess.
+        # assistant.json is the source of truth (memory's preferences.json
+        # is the record of what he asked for), same rule as the briefing.
+        try:
+            brain_mod.set_register(self.assistant.get("persona.register",
+                                                      brain_mod.DEFAULT_REGISTER))
+        except Exception:
+            log.exception("persona.register could not be applied")
         self.agent = JarvisAgent()          # retained V1 tools (see spec note)
 
         # ---- ambient: quiet hours / DND and presence ----------------------
@@ -752,6 +762,16 @@ class JarvisApp:
         """Short lines Jarvis says verbatim and often — rendered into the
         speech cache at startup so they play instantly."""
         phrases = [p for lines in COURTESY_REPLIES.values() for p in lines]
+        # Every register's courtesy variants, and the register-change
+        # acknowledgements: "formal mode" must answer instantly, because
+        # the one prefix reprocess it triggers is already running behind it.
+        phrases += [p for reg in COURTESY_BY_REGISTER.values()
+                    for lines in reg.values() for p in lines]
+        phrases += list(REGISTER_LINES.values())
+        # The numberless self-state clauses ("how are you?"): a state
+        # sentence carrying a figure is an unavoidable cache miss, these
+        # are not (jarvis/selfstate.py).
+        phrases += list(selfstate.PREWARM_LINES)
         phrases += list(THINKING_LINES)
         phrases += [SAY_AGAIN_LINE, NUDGE_LINE, self._guest_line]
         phrases += [CONTINUE_PROMPT, "Very good, sir.", "Welcome back, sir.",
@@ -918,6 +938,10 @@ class JarvisApp:
             release=lambda: app.brain.release(),
             reclaim=lambda: app.brain.reclaim(),
             is_lent=lambda: app.brain.is_lent(),
+            # register ("formal mode" / "banter up"): the ONE production
+            # caller of reset_static_prompt, re-warmed off the audio path.
+            set_register=lambda name: app.brain.set_register(name),
+            register=lambda: app.brain.register(),
         )
 
         return SimpleNamespace(
@@ -943,6 +967,8 @@ class JarvisApp:
             calendar=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
+            # the one self-state sheet the courtesy and the readout share
+            self_state=self.self_state,
             log_triage=self.log_triage_text,
             slow_turn=self.slow_turn_text,
             # "how did yesterday go": the day review, spoken (dayreview.py)
@@ -2436,18 +2462,39 @@ class JarvisApp:
         return g.undo()
 
     # ------------------------------------------------------- diagnostics
-    def diagnostics_text(self) -> str:
-        """"Run diagnostics": a spoken status in character, from real data."""
+    def self_state(self, full: bool = True) -> dict:
+        """Everything Jarvis knows about himself, as one dict.
+
+        The single source behind "run diagnostics" (plain sheet + film
+        register) and "how are you?" (one clause) -- see jarvis/selfstate.py
+        for the renderers. Two registers off ONE sheet; never a second
+        gatherer that can drift from this one.
+
+        ``full=False`` skips the two probes that cost a subprocess and say
+        nothing about his wellbeing (the output sink, his own Claude
+        panes), so a courtesy stays the fastest exchange in the system.
+        """
         import statistics
-        parts = []
-        up = time.monotonic() - getattr(self, "_app_started", time.monotonic())
-        hours, mins = int(up // 3600), int((up % 3600) // 60)
-        uptime = (f"{hours} hour{'s' if hours != 1 else ''} and {mins} minute{'s' if mins != 1 else ''}"
-                  if hours else f"{mins} minute{'s' if mins != 1 else ''}")
-        engine = getattr(self.tts, "engine", CONFIG.tts_engine)
-        parts.append(f"All systems nominal, sir. Up {uptime}; whisper {CONFIG.model} on the GPU, "
-                     f"{_brain_model_name()} answering, {engine} speaking"
-                     f"{', voice-activity endpointing live' if self.recorder.endpointer else ''}.")
+        # One monotonic read: the two-call form returned a hair BELOW zero
+        # on an app with no _app_started (the fallback is sampled after the
+        # minuend), and a negative uptime is a lie even at 1e-7 seconds.
+        now = time.monotonic()
+        state = {
+            "uptime_s": now - getattr(self, "_app_started", now),
+            "stt_model": CONFIG.model,
+            "brain_model": _brain_model_name(),
+            "tts_engine": getattr(getattr(self, "tts", None), "engine",
+                                  CONFIG.tts_engine),
+            "endpointing": bool(getattr(getattr(self, "recorder", None),
+                                        "endpointer", None)),
+            "turns_today": 0, "median_wait": None,
+            "mem_free_gb": None, "mem_total_gb": None,
+            "gpu_temp_c": None, "gpu_mhz": None, "gpu_util_pct": None,
+            "lent": False, "enrolled": False, "num_samples": 0,
+            "held": 0, "quiet_reason": "",
+            "sink": "", "sink_dummy": False,
+            "claude_panes": 0, "claude_working": 0, "modes": "",
+        }
         try:
             waits, n = [], 0
             day = datetime.now().date()
@@ -2460,9 +2507,9 @@ class JarvisApp:
                 n += 1
                 if rec.get("wait") is not None:
                     waits.append(rec["wait"])
-            if n:
-                med = f", median wait {statistics.median(waits):.1f} seconds" if waits else ""
-                parts.append(f"{n} turn{'s' if n != 1 else ''} today{med}.")
+            state["turns_today"] = n
+            if waits:
+                state["median_wait"] = statistics.median(waits)
         except (OSError, ValueError):
             pass
         try:
@@ -2470,28 +2517,83 @@ class JarvisApp:
             for line in open("/proc/meminfo"):
                 k, v = line.split(":", 1)
                 mem[k] = int(v.split()[0])
-            free = mem["MemAvailable"] / 1048576
-            total = mem["MemTotal"] / 1048576
-            gpu = ""
-            try:
-                # Popen + kill-without-wait (jarvis.tools.health): run() would
-                # wait on an nvidia-smi wedged in D-state under a stuck NVRM
-                # lock, and this is the command asked in exactly that state.
-                from jarvis.tools.health import parse_nvidia_smi, run_nvidia_smi
-                reading = parse_nvidia_smi(run_nvidia_smi()) or {}
-                if reading.get("temp_c") is not None:
-                    gpu = f", GPU at {reading['temp_c']:.0f} degrees"
-            except Exception:
-                pass
-            parts.append(f"Memory {free:.0f} of {total:.0f} gigabytes free{gpu}.")
+            # MemAvailable only: the GB10 pool is unified and nvidia-smi
+            # reads memory.used/total as N/A, so there is no per-device VRAM
+            # figure to quote and inventing one would be a lie.
+            state["mem_free_gb"] = mem["MemAvailable"] / 1048576
+            state["mem_total_gb"] = mem["MemTotal"] / 1048576
         except Exception:
-            pass
-        if self.speaker is not None and self.speaker.enrolled:
-            parts.append(f"Your voiceprint holds {self.speaker.num_samples} samples.")
-        modes = self.open_modes_line()
-        if modes:
-            parts.append(modes)
-        return " ".join(parts)
+            log.debug("meminfo unreadable", exc_info=True)
+        try:
+            # Popen + kill-without-wait (jarvis.tools.health): run() would
+            # wait on an nvidia-smi wedged in D-state under a stuck NVRM
+            # lock, and this is the command asked in exactly that state.
+            from jarvis.tools.health import parse_nvidia_smi, run_nvidia_smi
+            reading = parse_nvidia_smi(run_nvidia_smi()) or {}
+            state["gpu_temp_c"] = reading.get("temp_c")
+            state["gpu_mhz"] = reading.get("sm_mhz")
+            state["gpu_util_pct"] = reading.get("util_pct")
+        except Exception:
+            log.debug("nvidia-smi unreadable", exc_info=True)
+        # getattr throughout: "jarvis status" is answered from a
+        # half-built app in the tests and from a real one in the field, and
+        # a missing collaborator must cost a field, never the whole sheet.
+        brain = getattr(self, "brain", None)
+        if brain is not None:
+            try:
+                state["lent"] = bool(brain.is_lent())
+            except Exception:
+                log.debug("residency unreadable", exc_info=True)
+        speaker = getattr(self, "speaker", None)
+        if speaker is not None and speaker.enrolled:
+            state["enrolled"] = True
+            try:
+                state["num_samples"] = int(speaker.num_samples)
+            except (TypeError, ValueError):
+                log.debug("num_samples unreadable", exc_info=True)
+        quiet = getattr(self, "quiet", None)
+        if quiet is not None:
+            try:
+                state["held"] = len(quiet.held)
+                state["quiet_reason"] = quiet.reason() or ""
+            except Exception:
+                log.debug("quiet state unreadable", exc_info=True)
+        if full:
+            try:
+                from jarvis.voice_check import output_sink_state
+                sinks = output_sink_state()
+                state["sink_dummy"] = bool(sinks.get("probed")) and \
+                    bool(sinks.get("dummy"))
+                suspended = set(sinks.get("suspended") or ())
+                live = [s for s in (sinks.get("sinks") or []) if s not in suspended]
+                state["sink"] = (live or sinks.get("sinks") or [""])[0]
+            except Exception:
+                log.debug("sink probe failed", exc_info=True)
+            try:
+                # own_sessions(), NOT discover_sessions(): the latter globs
+                # transcript FILES, so "four sessions on the board" from it
+                # would be a figure about the disk, not about live panes.
+                claude = getattr(self, "claude", None)
+                own = claude.own_sessions() if claude is not None else []
+                state["claude_panes"] = len(own)
+                state["claude_working"] = sum(1 for _, working in own if working)
+            except Exception:
+                log.debug("claude panes unreadable", exc_info=True)
+        try:
+            # The sticky modes are part of the sheet, not a separate one:
+            # "status" has always named them and the film register wants
+            # them too.
+            state["modes"] = self.open_modes_line()
+        except Exception:
+            log.debug("open modes unreadable", exc_info=True)
+        return state
+
+    def diagnostics_text(self) -> str:
+        """"Run diagnostics": the plain sheet, from real data. The spoken
+        answer is the film-register rendering of the same dict (commander
+        _h_diagnostics); this stays the card, the cmdsock "status" reply
+        and ask.py --status."""
+        return selfstate.diagnostics_line(self.self_state())
 
     def open_modes_line(self) -> str:
         """The sticky modes that are open, or "".

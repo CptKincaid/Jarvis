@@ -92,6 +92,7 @@ from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import parse_person_statement, parse_since
+from jarvis import selfstate
 from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
 from jarvis.tools import quiz as quiz_mod
@@ -234,6 +235,12 @@ class IntentClassifier:
         # exact phrasings and these cover the looser ones.
         "walk to", "how long to", "minutes to get", "make that", "get to",
         "leave for", "walking",
+        # --- persona (2026-08-30): register control and the self answer ---
+        # "formal mode" and "banter up" are two-word utterances with no verb
+        # the gate knows; without these they classify NO and vanish, the
+        # same silent drop as the media and study words before them.
+        "formal", "banter", "less formal", "more formal", "normal mode",
+        "loosen up", "how do you feel", "how are you",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -787,8 +794,11 @@ _GREETING_KINDS = (
         r"^" + _JV + r"(?:hello|hi|hey|hiya|howdy|yo|greetings|"
         r"good (?:morning|afternoon|evening)|morning|afternoon|evening)"
         r"(?:\s+there)?(?:[,]?\s*jarvis)?[?.!\s]*$", re.I)),
+    # "how do you feel" joined the family with the self-state answer: it is
+    # the same question and it used to fall through to a full model turn.
     ("wellbeing", re.compile(
-        r"^" + _JV + r"(?:how are you(?: doing| today| feeling)?|"
+        r"^" + _JV + r"(?:how are you(?: doing| today| feeling| holding up)?|"
+        r"how do you feel(?: today| about it)?|how are you feeling|"
         r"how'?s it going|how are things|how do you do|how goes it|"
         r"what'?s up|you all right|are you (?:ok|okay|well))"
         r"(?:[,]?\s*jarvis)?[?.!\s]*$", re.I)),
@@ -807,18 +817,88 @@ COURTESY_REPLIES = {
     # Picked by the clock rather than at random -- see courtesy_reply().
     "greeting": ["Good morning, sir.", "Good afternoon, sir.",
                  "Good evening, sir."],
-    "wellbeing": ["All systems nominal, sir.", "Very well, sir.",
-                  "Never better, sir."],
+    # "All systems nominal, sir." is gone from here and from the
+    # diagnostics sheet in the same change: brain.VOICE_RULES bans the
+    # phrase "all systems", and it was the one line in the product that
+    # sounded like a toy. Wellbeing is answered from real state now
+    # (jarvis/selfstate.py); these remain the fallback when there is none.
+    "wellbeing": ["Very well, sir.", "Never better, sir.",
+                  "Quite well, sir."],
     "availability": ["Never too busy for you, sir.", "Quite free, sir.",
                      "Nothing pressing, sir."],
 }
 
+# Register variants (brain.REGISTERS). A kind a register does not override
+# falls back to COURTESY_REPLIES. Courtesy is his highest-frequency
+# utterance, so this is where the register is actually felt -- and every
+# line here is fixed, so app._canned_phrases prewarms all of them and the
+# register costs no latency.
+COURTESY_BY_REGISTER = {
+    "formal": {
+        "presence": ["Yes, sir.", "Here, sir.", "At your service, sir."],
+        "thanks": ["Of course, sir.", "My pleasure, sir.", "Not at all, sir."],
+        "goodnight": ["Good night, sir.", "Good night, sir; until tomorrow.",
+                      "Sleep well, sir."],
+        "availability": ["Quite free, sir.", "At your disposal, sir.",
+                         "Nothing pressing, sir."],
+    },
+    "banter": {
+        "presence": ["Always, sir.", "Where else would I be, sir.",
+                     "Still here, sir."],
+        "thanks": ["Any time, sir.", "It's rather what I'm for, sir.",
+                   "Don't mention it, sir."],
+        "goodnight": ["Good night, sir; do try to actually sleep.",
+                      "Good night, sir; I'll keep the lights on.",
+                      "Sleep well, sir."],
+        "availability": ["Never too busy for you, sir.", "Idle as ever, sir.",
+                         "Free as anything, sir."],
+    },
+}
 
-def _greeting_line(now: Optional[datetime] = None) -> str:
-    """The time-appropriate line from COURTESY_REPLIES["greeting"]."""
+# Spoken the instant the register changes -- fixed strings, prewarmed, and
+# said WITHOUT a model turn, because the prefix reprocess the change just
+# triggered is running behind them (brain.set_register -> warm_static).
+REGISTER_LINES = {
+    "formal": "Formal it is, sir.",
+    "normal": "Back to my usual, sir.",
+    "banter": "Very well, sir; I'll be rather less restrained.",
+}
+REGISTER_ALREADY_LINES = {
+    "formal": "I'm already being formal, sir.",
+    "normal": "That is my usual, sir.",
+    "banter": "I'm already at my least restrained, sir.",
+}
+
+
+def _register_name(c=None) -> str:
+    """The spoken register in force; "normal" when the brain is absent."""
+    if c is not None:
+        brain = c._svc("brain")
+        get = getattr(brain, "register", None) if brain is not None else None
+        if callable(get):
+            try:
+                return str(get() or "normal")
+            except Exception:
+                log.debug("register read failed", exc_info=True)
+    try:
+        from jarvis import brain as brain_mod
+        return brain_mod.register()
+    except Exception:                              # noqa: BLE001
+        return "normal"
+
+
+def _register_lines(kind: str, register: Optional[str] = None) -> list:
+    """The variants for one courtesy kind in one register."""
+    over = COURTESY_BY_REGISTER.get(register or "", {})
+    return over.get(kind) or COURTESY_REPLIES[kind]
+
+
+def _greeting_line(now: Optional[datetime] = None,
+                   register: Optional[str] = None) -> str:
+    """The time-appropriate line from the greeting variants."""
     hour = (now or datetime.now()).hour
     idx = 0 if 5 <= hour < 12 else 1 if 12 <= hour < 17 else 2
-    return COURTESY_REPLIES["greeting"][idx]
+    return _register_lines("greeting", register)[idx]
 
 
 def courtesy_kind(text: str) -> Optional[str]:
@@ -830,12 +910,12 @@ def courtesy_kind(text: str) -> Optional[str]:
     return None
 
 
-def courtesy_reply(kind: str, rng=None) -> str:
+def courtesy_reply(kind: str, rng=None, register: Optional[str] = None) -> str:
     # "Good afternoon" answered with "Good morning" is worse than no
     # variation at all, so the greeting is chosen by the clock.
     if kind == "greeting":
-        return _greeting_line()
-    return (rng or random).choice(COURTESY_REPLIES[kind])
+        return _greeting_line(register=register)
+    return (rng or random).choice(_register_lines(kind, register))
 
 
 def _start_winddown(c) -> None:
@@ -878,12 +958,13 @@ def _h_courtesy(c, t, m):
         res = _goodnight_preview(c, t)
         if res is not None:
             return res
-        line = courtesy_reply(m)
+        line = courtesy_reply(m, register=_register_name(c))
         return CommandResult(handled=True,
                              reply=f"{scene} {line}".strip() if scene else line,
                              speak=True, status="Courtesy")
-    return CommandResult(handled=True, reply=courtesy_reply(m), speak=True,
-                         status="Courtesy")
+    return CommandResult(handled=True,
+                         reply=courtesy_reply(m, register=_register_name(c)),
+                         speak=True, status="Courtesy")
 
 
 def greeting_kind(text: str) -> Optional[str]:
@@ -895,7 +976,33 @@ def greeting_kind(text: str) -> Optional[str]:
     return None
 
 
+def _self_state(c, full=True) -> Optional[dict]:
+    """The app's one self-state sheet, or None. Pure Python on the app side
+    (/proc/meminfo, a jsonl scan, a guarded nvidia-smi Popen), so this stays
+    Tier 1 -- it must never be routed to the model."""
+    fn = c._svc("self_state")
+    if fn is None:
+        return None
+    try:
+        return fn(full=full)
+    except TypeError:
+        try:
+            return fn()
+        except Exception:
+            log.exception("self state failed")
+    except Exception:
+        log.exception("self state failed")
+    return None
+
+
 def _h_greeting(c, t, m):
+    """"How are you?" is answered from what he IS, not from a list of three.
+
+    full=False: the sink probe and the tmux pane count say nothing about
+    his wellbeing and would put two subprocesses on the fastest exchange in
+    the system. Availability still falls back to the templated line, which
+    is prewarmed and instant; only wellbeing may pay a cache miss.
+    """
     if m == "greeting":
         # "Good morning" / "hello": undo last night's wind-down. Not for
         # "how are you" or "are you busy", which are said all day.
@@ -904,7 +1011,17 @@ def _h_greeting(c, t, m):
         # scene moved goes back before he has sat down. Silent when no
         # scene is running (the usual case).
         _scene_wake(c)
-    return CommandResult(handled=True, reply=courtesy_reply(m), speak=True,
+    line = None
+    if m in ("wellbeing", "availability"):
+        state = _self_state(c, full=False)
+        if state:
+            if m == "wellbeing":
+                line = selfstate.wellbeing_line(state, register=_register_name(c))
+            else:
+                line = selfstate.availability_line(state)
+    if not line:
+        line = courtesy_reply(m, register=_register_name(c))
+    return CommandResult(handled=True, reply=line, speak=True,
                          status="Greeting")
 
 
@@ -2876,16 +2993,95 @@ def _h_next_exam(c, t, m):
 
 
 def _h_diagnostics(c, t, m):
-    """The film's "run diagnostics": uptime, models, today's turns, the box."""
+    """The film's "run diagnostics": uptime, models, today's turns, the box.
+
+    Two renderings of ONE sheet (jarvis/selfstate.py): the film register is
+    spoken -- clock and utilisation, not power draw, because idle reads
+    ~15 W both wedged and healthy -- and the plain sheet goes on the card
+    so the numbers stay readable. No model turn: routing a fact sheet
+    through gemma4 buys nothing and buys back the hallucination risk, and
+    "never invent a figure" is a prompt, not a guarantee.
+    """
     fn = c._svc("diagnostics")
     if fn is None:
         return None
+    state = _self_state(c)
     try:
-        line = fn()
+        # Both renderings come off the SAME dict when the app can hand one
+        # over, so the spoken line and the card can never disagree -- one
+        # state source in two registers, never a second that drifts. The
+        # `diagnostics` service stays the gate and the fallback.
+        plain = selfstate.diagnostics_line(state) if state else fn()
     except Exception:
         log.exception("diagnostics failed")
-        line = "I'm afraid the diagnostics didn't complete, sir."
-    return CommandResult(handled=True, reply=line, speak=True, status="Diagnostics")
+        return CommandResult(handled=True, speak=True, status="Diagnostics",
+                             reply="I'm afraid the diagnostics didn't complete, sir.")
+    spoken = plain
+    if state and _register_name(c) != "formal":
+        # Formal gets the plain sheet: the film register is an aside, and
+        # the register that bans asides bans this one too.
+        spoken = selfstate.stark_line(state) or plain
+    if spoken != plain:
+        try:
+            bus.publish(JarvisReply(text=plain, speak=False))
+        except Exception:
+            log.debug("diagnostics card publish failed", exc_info=True)
+    return CommandResult(handled=True, reply=spoken, speak=True, status="Diagnostics")
+
+
+# ---- Tier 1 register: "formal mode" / "banter up" ---------------------
+# The preference is persisted to assistant.json AND memory (the same
+# _persist_preference both briefing knobs use) and baked into the STATIC
+# Tier 2 prompt. That is the whole design: one cache miss at change time,
+# paid in the background, never one per turn.
+_REGISTER_RX = re.compile(
+    r"^(?:"
+    r"(?P<formal>(?:be |go |switch to |use |turn on )?(?:more )?formal(?: mode| register| please)?"
+    r"|(?:be |go )?(?:more )?(?:serious|businesslike|professional)(?: mode| please)?"
+    r"|(?:less|no|cut the|drop the|enough) (?:banter|jokes|joking|wit|quips))"
+    r"|(?P<banter>banter up|more banter|(?:be |go )?(?:more )?(?:playful|cheeky|witty)"
+    r"|(?:turn|dial) (?:up|on) the (?:banter|wit|jokes)|loosen up)"
+    r"|(?P<normal>(?:back to |go back to )?(?:your |the )?(?:usual|normal)(?: mode| register| self| voice)?"
+    r"|(?:be |go )?normal again|banter down|less formal|stop being (?:so )?formal"
+    r"|(?:dial|turn) (?:down|off) the (?:banter|wit|jokes))"
+    r")[.!\s]*$", re.I)
+
+
+def register_kind(text: str) -> Optional[str]:
+    """'formal' / 'banter' / 'normal' for a whole-utterance register
+    request, else None."""
+    m = _REGISTER_RX.match((text or "").strip())
+    if not m:
+        return None
+    for name in ("formal", "banter", "normal"):
+        if m.group(name):
+            return name
+    return None
+
+
+def _h_register(c, t, m):
+    """"Formal mode" / "banter up" / "back to normal"."""
+    want = m if isinstance(m, str) else register_kind(t)
+    if want is None:
+        return None
+    brain = c._svc("brain")
+    setter = getattr(brain, "set_register", None) if brain is not None else None
+    if not callable(setter):
+        return None
+    # assistant.json is the source of truth read at app start; memory's
+    # preferences.json is the record of what he asked for. A config service
+    # that will not take it means the preference cannot survive a restart,
+    # and a register that forgets itself overnight is worse than none.
+    if not _persist_preference(c, "persona.register", want):
+        return None
+    try:
+        changed = bool(setter(want))
+    except Exception:
+        log.exception("set_register(%s) failed", want)
+        return None
+    line = REGISTER_LINES[want] if changed else REGISTER_ALREADY_LINES[want]
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"Register: {want}")
 
 
 # "How did yesterday go" -- the nightly self-review (jarvis/dayreview.py),
@@ -4566,6 +4762,7 @@ REGISTRY: list[Command] = [
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
+    Command("register", register_kind, _h_register, needs=("brain",)),
     Command("next exam", _NEXT_EXAM_RX.match, _h_next_exam),
     # The learned walks. Ahead of "answer question" / "quick command", which
     # would swallow "how long to Wisenbaker" as a general question.
@@ -4696,7 +4893,8 @@ ASSISTANT_TIER1: list[Command] = [
                     "timer", "alarm", "no asides",
                     "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
-                    "last mail", "diagnostics", "next exam", "greeting", "day review",
+                    "last mail", "diagnostics", "register", "next exam",
+                    "greeting", "day review",
                     # the weekly self-review and the memory garden's two
                     # answers: all three are asked without the wake word
                     "week review", "garden report", "garden undo",
@@ -6353,75 +6551,6 @@ class Commander:
                              reply=leave_mod.LEARNED_LINE.format(
                                  place=place, minutes=value),
                              status=f"Walk: {place} {value} min")
-
-    def _try_quiz_answer(self, text: str) -> Optional[CommandResult]:
-        """While a quiz question is open, the utterance is the answer.
-
-        Stop words end the quiz with the tally; skip words reveal the
-        answer and move on; a fresh "quiz me" / "review my flashcards"
-        drops the session for the new one; "quiet" ends it silently. A
-        question older than ANSWER_WINDOW_S is not what he is answering:
-        the session is dropped and the text routes as a new subject.
-        Grading: the string match first (no model round trip for "forty
-        percent"), the model only for the unclear ones, and a shrug that
-        names the answer when neither can tell."""
-        session = getattr(self, "_pending_quiz", None)   # a slim test commander has no quiz
-        if session is None:
-            return None
-        t = (strip_jarvis_prefix(text) or text).strip()
-        tl = t.lower().rstrip(".!?")
-        if session.stale() or session.finished or quiz_kind(tl) or review_kind(tl):
-            self._pending_quiz = None
-            return None
-        if quiet_kind(t) or cancel_kind(t):
-            self._pending_quiz = None
-            _cut_speech(self)
-            return CommandResult(handled=True, reply="Very good, sir.", speak=False,
-                                 status="Quiz stopped")
-        if _QUIZ_STOP_RX.match(t):
-            self._pending_quiz = None
-            return CommandResult(handled=True, reply=session.score_line(), speak=True,
-                                 status="Quiz stopped")
-        if source != "voice":
-            return None            # not the answer: route it as a command
-        card = session.current
-        if _QUIZ_SKIP_RX.match(tl):
-            session.settle(None)
-            line = quiz_mod.SKIP_LINE.format(answer=card["answer"])
-        else:
-            verdict = quiz_mod.grade_by_string(card["answer"], t)
-            note = ""
-            if verdict is None:
-                brain = self._svc("brain")
-                if brain is not None and hasattr(brain, "grade_answer"):
-                    try:
-                        graded = brain.grade_answer(card["question"], card["answer"], t)
-                    except Exception:
-                        log.exception("grade_answer failed")
-                        graded = None
-                    if graded:
-                        verdict, note = bool(graded[0]), str(graded[1] or "")
-            if verdict is None:
-                session.settle(None)
-                line = quiz_mod.UNSURE_LINE.format(answer=card["answer"])
-            else:
-                try:
-                    _quiz_store(self).record(card["id"], verdict)
-                except Exception:
-                    log.exception("flashcard record failed")
-                session.settle(verdict)
-                if verdict:
-                    line = random.choice(quiz_mod.CORRECT_LINES)
-                else:
-                    line = note or quiz_mod.WRONG_LINE.format(answer=card["answer"])
-                    if "answer" not in line.lower() and card["answer"].lower() not in line.lower():
-                        line = quiz_mod.WRONG_LINE.format(answer=card["answer"])
-        if session.finished:
-            self._pending_quiz = None
-            return CommandResult(handled=True, reply=f"{line} {session.score_line()}",
-                                 speak=True, status="Quiz finished")
-        return CommandResult(handled=True, reply=f"{line} {session.ask()}", speak=True,
-                             status=f"Quiz {session.index + 1}/{session.total}")
 
     def _try_teach_offer(self, text: str) -> Optional[CommandResult]:
         """Resolve "say quiz me and I'll test you on it, sir" from _h_teach.

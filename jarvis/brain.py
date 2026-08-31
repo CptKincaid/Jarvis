@@ -221,6 +221,44 @@ VOICE_RULES = (
 # because they teach shape rather than content: the deadpan aside, the
 # joke that is a remark and not a riddle, and advice that admits it has
 # not looked at the code.
+# ----------------------------------------------------------------------
+# Register (the spoken manner). "Formal mode" said before his advisor
+# arrives is still formal tomorrow: the preference lives in assistant.json
+# (persona.register) and is baked into the STATIC prompt, never the turn.
+# Changing it is the ONE cache miss of its life — set_register() clears the
+# cached prefix and warm_static() pays the ~2700-token reprocess in the
+# background — and every turn after it re-sends a byte-identical prefix,
+# which is the whole point of the static/dynamic split (module doc, the
+# static-prefix rule).
+#
+# A register's only levers are this clause and, for formal, dropping the
+# joke family from the few-shots. It must never ADD a family: gemma4 lifts
+# an example wholesale rather than learning from it, which is why the pool
+# is down to three (see the FEW_SHOT_POOL note below).
+# ----------------------------------------------------------------------
+REGISTERS = ("formal", "normal", "banter")
+DEFAULT_REGISTER = "normal"
+REGISTER_DROPS = {"formal": ("joke",)}          # families a register refuses
+REGISTER_CLAUSES = {
+    "normal": "",
+    "formal": (
+        "He has asked for the formal register: no asides, no wry remarks "
+        "and no jokes even when he invites one. Answer plainly and "
+        "courteously in one sentence, and call him \"sir\" every time.\n\n"),
+    "banter": (
+        "He has asked you to loosen up a shade: a dry aside is welcome and "
+        "may take a second sentence for itself. Every rule above still "
+        "holds — one remark, never two stacked, and still nothing about "
+        "his screen, his files or his machine unless he asked.\n\n"),
+}
+_REGISTER = {"name": DEFAULT_REGISTER}
+
+
+def register() -> str:
+    """The register in force for this process ("normal" until set)."""
+    return _REGISTER["name"]
+
+
 FEW_SHOT_PINNED = [
     ("Jarvis, you there?", "Always, sir."),
     ("Cheers, Jarvis.", "Not at all, sir."),
@@ -270,12 +308,18 @@ def _shot_rng():
 _SHOT_RNG = _shot_rng()
 
 
-def select_few_shots(rng=None):
+def select_few_shots(rng=None, register=None):
     """One exchange per situation family, in family order, chosen by the
     process RNG (or an explicit one); the pinned "you there" and thank-you
-    lines follow the greeting and the pinned good night comes last."""
+    lines follow the greeting and the pinned good night comes last.
+
+    ``register`` drops the families that register refuses to demonstrate
+    (formal shows no joke); it never adds one."""
     rng = rng or _SHOT_RNG
-    picked = [rng.choice(variants) for _, variants in FEW_SHOT_POOL]
+    drop = REGISTER_DROPS.get(register or _REGISTER["name"], ())
+    pool = [(name, variants) for name, variants in FEW_SHOT_POOL
+            if name not in drop]
+    picked = [rng.choice(variants) for _, variants in pool]
     return ([picked[0], FEW_SHOT_PINNED[0], FEW_SHOT_PINNED[1]]
             + picked[1:] + [FEW_SHOT_PINNED[2]])
 
@@ -306,7 +350,7 @@ Answer as Jarvis only: no "Jarvis:" label, no writing the user's lines, and don'
 Examples of the manner only; every reply is in fresh words for this exact request and names the thing he actually asked for (the pizza, the branch, the hour), never the thing in the example:
 {{examples}}
 
-Now answer Hunter as Jarvis, in your own words, keeping the manner of the examples, and call him sir. One short sentence is the norm; add a second only if it says something new that he asked for, and never describe his screen, files or machine unless he asked. If he asks for a joke, it is one dry remark about his situation, never a question and its answer. The examples are the manner only, never the words: never reuse a sentence, a clause or an object from an example — if an example speaks of a phone and he asks about dinner, the reply is about dinner. Then stop."""
+{{register}}Now answer Hunter as Jarvis, in your own words, keeping the manner of the examples, and call him sir. One short sentence is the norm; add a second only if it says something new that he asked for, and never describe his screen, files or machine unless he asked. If he asks for a joke, it is one dry remark about his situation, never a question and its answer. The examples are the manner only, never the words: never reuse a sentence, a clause or an object from an example — if an example speaks of a phone and he asks about dinner, the reply is about dinner. Then stop."""
 
 # Router tie-breaker (spec 4.2): the instruction rides in the user turn so
 # the request shares the static prefix (system + tools) with chat.
@@ -359,17 +403,22 @@ If something fails, use [SPEAK] to explain and suggest alternatives.
 [SPEAK] and [DONE] lines are read aloud; report only what the previous results show you did. """ + VOICE_RULES
 
 
-def build_ollama_system(context_text="", memory_text="", shots=None):
+def build_ollama_system(context_text="", memory_text="", shots=None,
+                        register=None):
     """Render the Tier 2 STATIC system prompt.
 
     context_text / memory_text are accepted for the older call shape and
     ignored: the dynamic background now lives in the user turn
     (build_user_turn). shots defaults to select_few_shots(); pass an
-    explicit list for a fixed prompt.
+    explicit list for a fixed prompt. ``register`` defaults to the one in
+    force and renders as nothing at all when it is "normal", so a normal
+    prompt is byte-identical to the one before registers existed.
     """
+    name = register if register in REGISTERS else _REGISTER["name"]
     if shots is None:
-        shots = select_few_shots()
-    return JARVIS_SYSTEM.format(examples=format_few_shots(shots))
+        shots = select_few_shots(register=name)
+    return JARVIS_SYSTEM.format(examples=format_few_shots(shots),
+                                register=REGISTER_CLAUSES.get(name, ""))
 
 
 def build_user_turn(context_text="", memory_text="", text=""):
@@ -385,23 +434,76 @@ def build_user_turn(context_text="", memory_text="", text=""):
     return f"Background:\n{background or '(none)'}\n\nHunter: {(text or '').strip()}"
 
 
-# The static prompt is sampled once per process and never changes after.
+# The static prompt is sampled once per process and changes only when the
+# register does. The lock matters: _STATIC is read from the warm-up thread,
+# the streaming path and the tool loop at once, and two threads racing to
+# rebuild it would draw two DIFFERENT few-shot samples — one turn would ship
+# a prefix nothing had cached.
 _STATIC = {}
+_STATIC_LOCK = threading.Lock()
 
 
 def static_system():
     """The system prompt every Tier 2 request sends; byte-identical for the
-    life of the process (few-shots sampled once)."""
+    life of the process (few-shots sampled once) until set_register()."""
     system = _STATIC.get("system")
-    if system is None:
-        system = build_ollama_system()
-        _STATIC["system"] = system
-    return system
+    if system is not None:
+        return system
+    with _STATIC_LOCK:
+        system = _STATIC.get("system")
+        if system is None:
+            system = build_ollama_system()
+            _STATIC["system"] = system
+        return system
 
 
 def reset_static_prompt():
-    """Forget the sampled prompt (tests and the eval harness only)."""
-    _STATIC.clear()
+    """Forget the sampled prompt (set_register, tests, the eval harness)."""
+    with _STATIC_LOCK:
+        _STATIC.clear()
+
+
+def set_register(name):
+    """Install the spoken register and invalidate the ONE cached prefix.
+
+    True when it actually changed — the caller then owes the model a
+    background re-warm (warm_static) so the single ~2700-token reprocess
+    does not land on whatever he asks next, which is the one turn he is
+    listening to. Returns False for an unknown name or a no-op change, so a
+    handler can answer "already formal, sir" without touching the cache.
+    """
+    want = str(name or "").strip().lower()
+    if want not in REGISTERS or want == _REGISTER["name"]:
+        return False
+    log.info("register: %s -> %s", _REGISTER["name"], want)
+    _REGISTER["name"] = want
+    reset_static_prompt()
+    return True
+
+
+def warm_static(timeout=300):
+    """Re-prefill Ollama's prefix cache with the CURRENT static prompt.
+
+    ensure_resident() short-circuits when the model is already loaded, so
+    it cannot do this job: after a register change the model is resident
+    and the PREFIX is the thing that went stale. Never raises; returns True
+    when Ollama accepted the warm-up.
+    """
+    if _RESIDENCY.get("lent"):
+        return False
+    messages = [{"role": "system", "content": static_system()},
+                {"role": "user", "content": ""}]
+    payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
+                            num_predict=1)
+    try:
+        _http("/api/chat", payload, timeout=timeout)
+        log.info("ollama: static prefix re-warmed (register %s)", register())
+        return True
+    except Exception as exc:                       # noqa: BLE001
+        log.warning("ollama: static re-warm failed: %s", exc)
+        return False
+    finally:
+        _unpin_if_lent(payload)
 
 
 # ----------------------------------------------------------------------
@@ -1549,6 +1651,21 @@ class JarvisBrain:
     def is_lent(self):
         return is_lent()
 
+    # Register (spec #16): the ONE production caller of reset_static_prompt.
+    def set_register(self, name, warm=True):
+        """Change the spoken register and re-warm the prefix OFF the audio
+        path. The commander answers with a canned Tier 1 line the instant
+        this returns, so the ~2700-token reprocess runs in a daemon thread
+        rather than in front of his next question."""
+        changed = set_register(name)
+        if changed and warm:
+            threading.Thread(target=warm_static, daemon=True,
+                             name="static-rewarm").start()
+        return changed
+
+    def register(self):
+        return register()
+
     def cancel(self):
         """Kill any in-flight subprocess and clear the busy guard."""
         self._cancelled = True
@@ -1635,6 +1752,18 @@ class JarvisBrain:
         if self._context:
             ctx = self._context.get_context("standard")
             ctx_text = self._context.format_for_prompt(ctx, spoken=True)
+            # Continuity (spec #14): "that would be the third coffee timer".
+            # It goes HERE, in the dynamic half -- the static prefix must
+            # stay byte-identical or every turn pays a full reprocess.
+            block = getattr(self._context, "continuity_block", None)
+            if block is not None:
+                try:
+                    earlier = block() or ""
+                except Exception:                  # noqa: BLE001
+                    log.exception("continuity_block failed")
+                    earlier = ""
+                if earlier:
+                    ctx_text = f"{ctx_text}\n{earlier}".strip()
         mem_text = ""
         if self._memory:
             mem_text = self._memory.format_for_context(text) if text else \
