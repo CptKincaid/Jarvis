@@ -78,6 +78,28 @@ def is_link(location) -> bool:
     return str(location or "").strip().lower().startswith(("http://", "https://"))
 
 
+def _meeting_url(ev, location: str) -> str:
+    """The link for this event: LOCATION if it is one, else the conferencing
+    URL in the body (calendar.Event.meeting_url).
+
+    Reached through getattr because the card is also built from the stored
+    dict in ``_deliver``, where "ev" is a small stand-in rather than a real
+    Event -- and because a cache written before descriptions were carried
+    has no such field at all.
+    """
+    if is_link(location):
+        return location
+    fn = getattr(ev, "meeting_url", None)
+    if callable(fn):
+        try:
+            return str(fn() or "")
+        except Exception:                  # noqa: BLE001 - a stand-in event
+            log.debug("dossier: meeting url unreadable", exc_info=True)
+            return ""
+    from jarvis.tools.calendar import meeting_url
+    return meeting_url(getattr(ev, "description", ""))
+
+
 def clock(dt: datetime) -> str:
     """9:10 -- the bare clock. "Your 9:10 is BIOSENSORS" wants no meridiem:
     a class ten minutes away is not in the other half of the day."""
@@ -164,12 +186,20 @@ def build_dossier(ev, cfg, *, course: str = "", notes=None, due=None,
     location = " ".join(str(getattr(ev, "location", "") or "").split())
     now = now or (start - timedelta(minutes=DEFAULT_LEAD_MIN) if start else datetime.now())
 
+    # The join link: LOCATION when the organiser put it there, otherwise the
+    # one in the body (Event.meeting_url). An online class whose link lives
+    # in the description -- which is most of them, and every Canvas one --
+    # used to get a JOIN row that was simply blank.
+    join = _meeting_url(ev, location)
+
     sections: dict = {}
     if start is not None:
         sections["calendar"] = [f"{clock(start)} — {title}"]
-    if is_link(location):
-        sections["join"] = location
-    elif location:
+    if join:
+        sections["join"] = join
+    if location and not is_link(location):
+        # Both, when the class has a room AND a link: a hybrid lecture is
+        # exactly the case where he needs to know which one is on offer.
         sections["room"] = location
 
     # -- the spoken head. Room first: it is the one thing he has to act on.
@@ -177,7 +207,7 @@ def build_dossier(ev, cfg, *, course: str = "", notes=None, due=None,
     when = clock(start) if start is not None else "next"
     if where:
         head = f"Your {when} is {title}, {where}, sir."
-    elif is_link(location):
+    elif join:
         head = f"Your {when} is {title}, sir; the link's on the card."
     else:
         head = f"Your {when} is {title}, sir."
@@ -461,6 +491,11 @@ class ClassDossier:
                     "key": key, "title": title, "course": course,
                     "start": start.isoformat(),
                     "location": " ".join(str(getattr(ev, "location", "") or "").split()),
+                    # The join link, extracted NOW: the calendar refreshes
+                    # every ten minutes and the event is looked up again at
+                    # T-10 only through this file, so an 800-character body
+                    # is boiled down to the one string the card needs.
+                    "join": _meeting_url(ev, ""),
                 }
                 filed += 1
             log.info("dossier: %r filed for %s (T-%d)", title,
@@ -512,7 +547,12 @@ class ClassDossier:
             from jarvis.tools.calendar import Event
             ev = Event.from_dict({"start": entry["start"], "end": entry["start"],
                                   "all_day": False, "title": entry.get("title", ""),
-                                  "location": entry.get("location", "")})
+                                  "location": entry.get("location", ""),
+                                  # The link tick() already found stands in
+                                  # for the body: meeting_url() re-reads it
+                                  # and hands back the same string, because
+                                  # only an allow-listed host was stored.
+                                  "description": entry.get("join", "")})
         except Exception:                   # noqa: BLE001 - state boundary
             log.exception("dossier: unusable state entry %r", entry)
             return ""

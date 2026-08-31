@@ -60,10 +60,24 @@ class Event:
     title: str = ""
     calendar: str = ""
     location: str = ""
+    # The ICS DESCRIPTION, whitespace-collapsed and capped. Carried for ONE
+    # reason: half the world puts the meeting link in the body and leaves
+    # LOCATION empty (his Canvas feed does), so the dossier's JOIN row was
+    # blank for exactly the classes that need it most.
+    description: str = ""
 
     def key(self) -> tuple:
         return (self.start.isoformat(), self.end.isoformat(), self.title.lower(),
                 self.all_day)
+
+    def meeting_url(self) -> str:
+        """The link to click for this event, or "".
+
+        LOCATION first -- an organiser who put the URL there meant it -- then
+        the description. Never any old URL from the body: see meeting_url()."""
+        if str(self.location or "").strip().lower().startswith(("http://", "https://")):
+            return self.location.strip()
+        return meeting_url(self.description)
 
     def on(self, day: date) -> bool:
         """True when the event touches ``day`` (all-day spans included)."""
@@ -75,7 +89,8 @@ class Event:
     def to_dict(self) -> dict:
         return {"start": self.start.isoformat(), "end": self.end.isoformat(),
                 "all_day": self.all_day, "title": self.title,
-                "calendar": self.calendar, "location": self.location}
+                "calendar": self.calendar, "location": self.location,
+                "description": self.description}
 
     @classmethod
     def from_dict(cls, d: dict, tz=None) -> "Event":
@@ -86,7 +101,45 @@ class Event:
         return cls(start=start, end=end, all_day=bool(d.get("all_day")),
                    title=str(d.get("title") or ""),
                    calendar=str(d.get("calendar") or ""),
-                   location=str(d.get("location") or ""))
+                   location=str(d.get("location") or ""),
+                   # Absent from every cache file written before 2026-08-31;
+                   # a missing key is an event with no body, not a crash.
+                   description=str(d.get("description") or ""))
+
+
+# The hosts a link has to belong to before Jarvis will call it "the join
+# link". An event body is full of URLs -- the Canvas assignment, a syllabus
+# PDF, an unsubscribe footer -- and reading one of those out as the way into
+# a lecture is worse than saying nothing at all, so this is an allow-list of
+# conferencing hosts rather than "the first http:// in the description".
+MEETING_HOSTS = (
+    "zoom.us", "zoom.com", "teams.microsoft.com", "teams.live.com",
+    "meet.google.com", "webex.com", "whereby.com", "gotomeeting.com",
+    "bluejeans.com", "chime.aws", "meet.jit.si",
+)
+# Trailing punctuation an organiser's prose leaves stuck to a URL: "join at
+# https://tamu.zoom.us/j/123." must not carry the full stop into the link.
+# Brackets close pairs, so they are trimmed here too.
+_URL_TAIL = ">).,;:!?\"'”’]}"
+_URL_RX = re.compile(r"https?://[^\s<>\"']+", re.I)
+DESCRIPTION_CHARS = 800        # enough for the join block; not the whole email
+
+
+def meeting_url(text) -> str:
+    """The first conferencing link in ``text``, or "".
+
+    ICS bodies arrive with escaped newlines and commas (RFC 5545 folds and
+    escapes them), and Google/Zoom both wrap the URL in prose, so the
+    matching is done over the raw text and the punctuation is trimmed off
+    the end rather than trying to parse the body's structure.
+    """
+    raw = str(text or "").replace("\\n", " ").replace("\\,", ",")
+    for hit in _URL_RX.findall(raw):
+        url = hit.rstrip(_URL_TAIL)
+        host = url.split("//", 1)[-1].split("/", 1)[0].split("@")[-1].lower()
+        if any(host == h or host.endswith("." + h) for h in MEETING_HOSTS):
+            return url
+    return ""
 
 
 def now_local(tz=None) -> datetime:
@@ -97,6 +150,24 @@ def now_local(tz=None) -> datetime:
 
 def _clean(text) -> str:
     return " ".join(str(text or "").split())
+
+
+def trim_description(text) -> str:
+    """The body, whitespace-collapsed and capped -- with the join link kept
+    even when it falls past the cap.
+
+    A Canvas or Outlook body opens with a paragraph of prose and puts the
+    Zoom block underneath, which is precisely where a blind [:800] would cut
+    the one thing this field is carried for.
+    """
+    body = _clean(text)
+    if len(body) <= DESCRIPTION_CHARS:
+        return body
+    url = meeting_url(body)
+    cut = body[:DESCRIPTION_CHARS]
+    if url and url not in cut:
+        cut = f"{cut[:max(0, DESCRIPTION_CHARS - len(url) - 1)].rstrip()} {url}"
+    return cut
 
 
 def _localize(value, tz) -> datetime:
@@ -147,7 +218,11 @@ def parse_ics(raw, start: datetime, end: datetime, calendar: str = "",
             e = s
         out.append(Event(start=s, end=e, all_day=all_day,
                          title=_clean(comp.get("SUMMARY", "")) or "untitled",
-                         calendar=name, location=_clean(comp.get("LOCATION", ""))))
+                         calendar=name, location=_clean(comp.get("LOCATION", "")),
+                         # Capped: the body can be a whole invitation email,
+                         # and every event of the window is held in memory
+                         # and written to the disk cache.
+                         description=trim_description(comp.get("DESCRIPTION", ""))))
     return out
 
 

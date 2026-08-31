@@ -157,6 +157,33 @@ def test_a_url_location_becomes_a_join_link_not_a_room():
                       "the link's on the card.")
 
 
+def test_a_link_in_the_body_is_the_join_row_too():
+    """His Canvas feed leaves LOCATION empty and puts the Zoom link in the
+    DESCRIPTION, so the JOIN row was blank for the classes that are online."""
+    online = ev("Office hours", 4, 15, 0)
+    online.description = f"Join Zoom Meeting\n{ZOOM}\nPasscode: 123456"
+    sections, spoken = build_dossier(online, Cfg())
+    assert sections["join"] == ZOOM and "room" not in sections
+    assert spoken == "Your 3:00 is Office hours, sir; the link's on the card."
+
+
+def test_a_hybrid_class_gets_the_room_and_the_link():
+    """A room AND a link is exactly when he needs to know both are on offer."""
+    hybrid = ev("BIOSENSORS", 0, 9, 10, BIO_ROOM)
+    hybrid.description = f"Zoom for anyone at home: {ZOOM}"
+    sections, spoken = build_dossier(hybrid, Cfg(), course="BIOSENSORS")
+    assert sections["room"] == BIO_ROOM and sections["join"] == ZOOM
+    # The room still leads the spoken line: it is the thing he has to act on.
+    assert spoken == "Your 9:10 is BIOSENSORS, Wisenbaker 049, sir."
+
+
+def test_an_ordinary_body_is_not_a_join_link():
+    lesson = ev("BIOSENSORS", 0, 9, 10, BIO_ROOM)
+    lesson.description = "Read chapter 4. Assignment: https://canvas.tamu.edu/a/1"
+    sections, _ = build_dossier(lesson, Cfg(), course="BIOSENSORS")
+    assert "join" not in sections
+
+
 def test_the_full_dossier_reads_as_one_sentence_after_the_head():
     lesson = ev("BIOSENSORS", 0, 9, 10, BIO_ROOM)
     now = lesson.start - timedelta(minutes=10)
@@ -303,6 +330,28 @@ def test_the_timer_firing_speaks_the_line_and_publishes_the_card(desk_world):
     card, = desk_world.cards
     assert card.sections["room"] == BIO_ROOM
     assert card.spoken == desk_world.said[0]
+
+
+def test_a_body_link_survives_the_state_file_to_the_card(desk_world, tmp_path):
+    """tick() files a timer and forgets the event; only the state file
+    reaches the delivery ten minutes later, so the link has to be in it."""
+    events = live_events()
+    for e in events:                       # the 09:10 class, moved online
+        if e.title == "BIOSENSORS" and e.start.hour == 9:
+            e.location, e.description = "", f"Join Zoom Meeting {ZOOM}"
+    d = ClassDossier(desk_world.cfg, desk_world.tk,
+                     get_calendar=lambda: FakeCal(events),
+                     services=desk_world.services, state_path=tmp_path / "d2.json",
+                     now=lambda tzinfo=None: desk_world.now,
+                     bg=lambda fn: fn(), publish=desk_world.cards.append,
+                     fetch_due=lambda *a, **k: [])
+    try:
+        assert d.tick() == 1
+        item = desk_world.tk.silent[-1]
+        bus.publish(ReminderFired(text=item.label, item_id=item.id, silent=True))
+    finally:
+        d.stop()
+    assert desk_world.cards[-1].sections["join"] == ZOOM
 
 
 def test_somebody_elses_silent_timer_is_left_alone(desk_world):

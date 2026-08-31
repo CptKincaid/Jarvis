@@ -163,6 +163,78 @@ def test_parse_ics_expands_recurrence_all_day_and_timezones():
     assert all(e.start.tzinfo is not None for e in evs)
 
 
+# ------------------------------------------------- the link in the body
+# His Canvas feed (and every Zoom invitation) leaves LOCATION empty and puts
+# the join link in the DESCRIPTION, so the dossier's JOIN row was blank for
+# exactly the classes that are online.
+ZOOM_URL = "https://tamu.zoom.us/j/94324046592?pwd=Ic6ifN6gKbxvhRCvfFypmo6hSM0kYw.1"
+
+
+def _ics_with_description(body: str) -> bytes:
+    return ("BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:x\r\nBEGIN:VEVENT\r\nUID:z\r\n"
+            "DTSTART:20260826T160000\r\nSUMMARY:Office hours\r\n"
+            f"DESCRIPTION:{body}\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n").encode()
+
+
+def test_parse_ics_carries_the_description_and_finds_the_join_link():
+    raw = _ics_with_description(f"Join Zoom Meeting\\n{ZOOM_URL}\\n\\nPasscode: 12345")
+    ev = parse_ics(raw, NOW - timedelta(days=1), NOW + timedelta(days=2), tz=CHI)[0]
+    assert ZOOM_URL in ev.description
+    assert ev.meeting_url() == ZOOM_URL
+    assert ev.location == ""
+
+
+def test_a_location_url_still_wins_over_the_body():
+    """An organiser who put the URL in LOCATION meant that one."""
+    ev = Event(start=NOW, end=NOW, location="https://meet.google.com/abc-defg-hij",
+               description=f"old link {ZOOM_URL}")
+    assert ev.meeting_url() == "https://meet.google.com/abc-defg-hij"
+
+
+@pytest.mark.parametrize("body, url", [
+    (f"Join: {ZOOM_URL}", ZOOM_URL),
+    ("https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc/0",
+     "https://teams.microsoft.com/l/meetup-join/19%3ameeting_abc/0"),
+    ("Video call: https://meet.google.com/abc-defg-hij.",
+     "https://meet.google.com/abc-defg-hij"),          # the full stop is prose
+    ("(https://tamu.webex.com/meet/hunter)", "https://tamu.webex.com/meet/hunter"),
+    ("", ""),
+])
+def test_meeting_url_takes_conferencing_links(body, url):
+    assert calendar.meeting_url(body) == url
+
+
+@pytest.mark.parametrize("body", [
+    "Read https://canvas.tamu.edu/courses/12345/assignments/9 before class",
+    "Slides at https://drive.google.com/file/d/abc/view",
+    "unsubscribe: https://example.com/u?token=1",
+    "no link at all",
+])
+def test_a_body_full_of_other_links_is_not_a_join_link(body):
+    """Reading the assignment URL out as the way into a lecture is worse
+    than saying nothing, so the hosts are an allow-list."""
+    assert calendar.meeting_url(body) == ""
+
+
+def test_a_long_body_keeps_the_link_past_the_cap():
+    """A Canvas body opens with prose and puts the Zoom block underneath --
+    precisely where a blind truncation would cut the one thing carried."""
+    body = ("lorem ipsum " * 200) + ZOOM_URL
+    trimmed = calendar.trim_description(body)
+    assert len(trimmed) <= calendar.DESCRIPTION_CHARS
+    assert calendar.meeting_url(trimmed) == ZOOM_URL
+
+
+def test_the_description_survives_the_disk_cache(tmp_path):
+    ev = Event(start=NOW, end=NOW, title="Office hours",
+               description=f"Join Zoom Meeting {ZOOM_URL}")
+    back = Event.from_dict(ev.to_dict())
+    assert back.meeting_url() == ZOOM_URL
+    # A cache file written before descriptions existed has no such key.
+    old = {k: v for k, v in ev.to_dict().items() if k != "description"}
+    assert Event.from_dict(old).meeting_url() == ""
+
+
 def test_parse_ics_floating_time_is_local_and_bad_ics_raises():
     floating = (b"BEGIN:VCALENDAR\nVERSION:2.0\nPRODID:x\nBEGIN:VEVENT\nUID:f\n"
                 b"DTSTART:20260826T160000\nSUMMARY:Floating\nEND:VEVENT\nEND:VCALENDAR\n")
