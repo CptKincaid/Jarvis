@@ -7,8 +7,14 @@ a throwaway directory. The session-scoped autouse fixture below then
 re-asserts the redirect on the already-imported modules (belt and braces:
 a test that imports jarvis.* before the env is read, or a module that
 caches a Path, still lands in the throwaway dir) and fails loudly if any
-of them still points at /tmp/vss_voice."""
+of them still points at /tmp/vss_voice.
+
+The same firewall covers the three pieces of shared state that have no
+throwaway equivalent at all -- the user's display, his speakers and the
+single local Ollama server -- by blocking the call rather than redirecting
+it. See _firewall_live_log_dir."""
 import os
+import socket
 import tempfile
 from pathlib import Path
 
@@ -75,6 +81,13 @@ os.environ["JARVIS_ROOM_CONTROL"] = "0"
 # setdefault: a shell that exported it on must not defeat the firewall.
 # tests/test_deskpresence.py clears it for its own cases.
 os.environ["JARVIS_DESK_PRESENCE"] = "0"
+
+
+# Ollama's port. The live server is a single shared process (see the
+# firewall fixture below for why that matters); JARVIS_TEST_ALLOW_OLLAMA=1
+# lets a deliberate live smoke test through.
+_OLLAMA_PORT = 11434
+_ollama_blocked: list = []
 
 
 def _blocked_player(argv) -> bool:
@@ -161,7 +174,45 @@ def _firewall_live_log_dir():
     from jarvis import earcons
     real_spawn = earcons._spawn
     earcons._spawn = _blocked_player
+    # The LOCAL MODEL SERVER. Ollama is one shared process on this box and,
+    # exactly like the display and the sound server above, there is no
+    # per-process instance to point a test at. It also runs under
+    # OLLAMA_MAX_LOADED_MODELS=1 -- the guard added after the 2026-08-28
+    # unified-memory lock-up -- so only ONE model may be resident: a test
+    # that reaches for nomic-embed-text does not ADD a model, it EVICTS the
+    # chat model the running Jarvis pinned with keep_alive -1, and the next
+    # real turn pays a ~7 s reload (brain.RESIDENCY_INTERVAL_S is 300 s, so
+    # the loop may not notice for five minutes).
+    #
+    # Found 2026-08-31, while the user was timing his turns: a full-suite
+    # run fired 24 of these from 11 tests (test_memory, test_webapp,
+    # test_app_wiring), because JarvisMemory defaults to semantic=True with
+    # embed=None -- i.e. the REAL embedder on localhost:11434. He measured
+    # `chat reply (10.01s wall, 7.07s ollama overhead)` on "what's the
+    # weather" against a suite running in another terminal.
+    #
+    # Refused rather than asserted: "Ollama is down" is a state every one of
+    # these call sites already handles (they fall back to the substring
+    # store), so the suite stays green AND hermetic, instead of green and
+    # quietly coupled to whichever model happens to be loaded.
+    real_connect = socket.socket.connect
+
+    def _refuse_ollama(sock, address):
+        port = (address[1] if isinstance(address, tuple) and len(address) > 1
+                else None)
+        if port == _OLLAMA_PORT:
+            _ollama_blocked.append(address)
+            raise ConnectionRefusedError(
+                f"the suite must not reach the live Ollama at {address!r}: "
+                "pass semantic=False or an embed= stub (see "
+                "tests/conftest.py). Set JARVIS_TEST_ALLOW_OLLAMA=1 for a "
+                "deliberate live test.")
+        return real_connect(sock, address)
+
+    if os.environ.get("JARVIS_TEST_ALLOW_OLLAMA") != "1":
+        socket.socket.connect = _refuse_ollama
     try:
         yield
     finally:
         earcons._spawn = real_spawn
+        socket.socket.connect = real_connect

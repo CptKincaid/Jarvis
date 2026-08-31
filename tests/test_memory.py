@@ -18,7 +18,15 @@ def legacy_dir(tmp_path):
 
 
 def make(mem_dir, legacy_dir):
-    return JarvisMemory(memory_dir=mem_dir, legacy_dir=legacy_dir)
+    # semantic=False: this file exercises the substring store, and the
+    # default (semantic=True, embed=None) wires up the REAL embedder on
+    # localhost:11434. Under OLLAMA_MAX_LOADED_MODELS=1 each of those calls
+    # evicted the chat model the running Jarvis had pinned -- 12 of the 24
+    # live requests a full suite made on 2026-08-31 came from here. The
+    # semantic path has its own file (test_semantic_memory.py), with a
+    # stubbed embedder.
+    return JarvisMemory(memory_dir=mem_dir, legacy_dir=legacy_dir,
+                        semantic=False)
 
 
 # ---------------------------------------------------------------- facts

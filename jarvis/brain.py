@@ -105,7 +105,15 @@ NUM_CTX = 8192                 # identical on EVERY request (see module doc)
 CHAT_OPTIONS = {"num_ctx": NUM_CTX, "temperature": 0.7, "num_predict": 160,
                 "stop": ["\nUser:", "\nHunter:"]}
 OLLAMA_OPTIONS = CHAT_OPTIONS  # legacy name
-RESIDENCY_INTERVAL_S = 300.0
+# 30 s, not 300. This loop is the ONLY thing that notices the chat model
+# has fallen out of Ollama's single slot, and at 300 s a turn could pay a
+# ~7 s reload for up to five minutes after any second-model request --
+# which then burns the tool budget and degrades the reply (2026-08-31: the
+# test suite's stray /api/embed calls evicted gemma4 every 40-60 s and
+# Jarvis was effectively never warm). A tick is one /api/ps that early-
+# returns when the model is already there, so the cost of checking often
+# is far below the cost of noticing late.
+RESIDENCY_INTERVAL_S = 30.0
 INCLUDE_GIT_LINE = True        # latency knob (spec 4.3): drop "Git:" lines
 
 # A tool result is text we paste into a NUM_CTX-token prompt. Uncapped, a
