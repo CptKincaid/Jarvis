@@ -1333,6 +1333,44 @@ def test_deadline_heads_up_starts_beside_the_meeting_one_and_stops(app, paths, m
     app.stop_assistant()
     d._thread.join(timeout=5)
     assert not d._thread.is_alive()
+
+
+# ------------------------------------------------------- 11b. watchers
+def test_the_three_watchers_start_dark_and_stop(app, paths):
+    """grades / mailwatch / keyword watch (jarvis/watchers.py): started beside
+    the deadline thread, state under MEMORY_DIR, and on a box with no token,
+    no mailbox and no keywords every tick is a no-op that writes nothing."""
+    app.start_assistant(residency=False)
+    watchers = [(app.gradewatch, "grades_state.json"),
+                (app.mailwatch, "mailwatch_state.json"),
+                (app.keyword_watch, "keyword_watch_state.json")]
+    for w, name in watchers:
+        assert w is not None and w._thread is not None and w._thread.is_alive()
+        assert w._state_path == paths / "memory" / name
+        assert w.tick() == 0 and not w._state_path.exists()
+        assert w._announce == app._announce
+    assert app.mailwatch._contacts() == [] or app.memory.people()
+    app.stop_assistant()
+    for w, _name in watchers:
+        w._thread.join(timeout=5)
+        assert not w._thread.is_alive()
+
+
+def test_announce_speaks_proactively_and_files_an_alert(app):
+    """A watcher line must take BOTH doors: the proactive speech path (so
+    quiet hours hold it for the digest) and the alerts hub (so it reaches
+    Discord when he is out)."""
+    said, alerted = [], []
+    app._say = lambda text, proactive=False, kind="message": \
+        said.append((text, proactive, kind))
+    app._alert = lambda kind, title, text, request_id=None: \
+        alerted.append((kind, title, text))
+    app._announce("Canvas grade", "A grade posted for BIOSENSORS, sir.")
+    assert said == [("A grade posted for BIOSENSORS, sir.", True, "message")]
+    assert alerted == [("milestone", "Canvas grade",
+                        "A grade posted for BIOSENSORS, sir.")]
+
+
 # ---------------------------------------------- 12. study sessions & notes
 def test_focus_session_is_wired_through_the_real_app(app):
     """"study session biosensors" typed into the real app: the session is on

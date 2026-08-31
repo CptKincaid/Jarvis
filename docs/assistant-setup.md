@@ -1258,3 +1258,97 @@ print("missing:", cfg.missing_sections())
 import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •••
 EOF
 ```
+
+## 40. New-grade watch ("a grade just posted")
+
+Nothing to set up beyond the Canvas token (section 13). Once it is in place
+Jarvis reads the course list every fifteen minutes and tells you when a
+total moves:
+
+> "Quiz 2 posted for BIOSENSORS, sir: the course is now 94.2% (A), up from 90%."
+
+The first run after a fresh install is deliberately silent — it only records
+the baseline, because reading out every course's standing at boot is a
+monologue, not news. From then on only changes are spoken.
+
+Naming the assignment ("Quiz 2") costs one extra read-only Canvas call, made
+only when a total has actually moved. If Canvas is slow, the token is
+read-limited, or the newest graded submission is more than three days old,
+the name is dropped and the line is still spoken:
+
+> "A grade posted for Circuits, sir: the course is now 74% (C), down from 81%."
+
+```jsonc
+"watch": { "grades": true }
+```
+
+Set `watch.grades` to `false` to switch it off. Without a Canvas token it is
+silent anyway — it never opens a socket. At most three courses are read out
+per tick; anything beyond that is left in the log
+(`grep 'grades:' /tmp/vss_voice/jarvis.log`). The snapshot lives in
+`~/.aiws_trainer/jarvis_memory/grades_state.json`; delete it to re-baseline.
+
+Like every unprompted line it goes through the quiet policy (section 34), so
+during quiet hours, a do-not-disturb, or a lecture it is held for the
+catch-up digest, and it reaches Discord when you are out (section 35).
+
+## 41. Important-person mail heads-up
+
+Mail was only ever fetched when you asked, so an advisor's email sat unseen.
+This watch reads the unread inbox every ten minutes and speaks a line for
+anything from someone **in the people book**:
+
+> "Mail from Dr. Villalobos, sir — re: thesis draft."
+
+Two things must be in place:
+
+1. A Gmail app password (section 5) — one account or several.
+2. The people themselves, entered by voice:
+
+> "Jarvis, remember that my advisor is Dr. Villalobos, email villalobos@tamu.edu"
+
+Only people in that book announce. That is the point: a poller that read out
+every unread message would be a nuisance within the hour, and the people book
+is the one contact list you have already curated. An entry with only a name
+still works — it matches the sender's display name — but an address is
+sharper.
+
+```jsonc
+"watch": { "people_mail": true }
+```
+
+At most three messages are read out per tick, then "And four more from your
+contacts, sir." Everything matched is remembered for fourteen days
+(`~/.aiws_trainer/jarvis_memory/mailwatch_state.json`), so nothing is said
+twice, including the ones the cap held back. With no mailbox configured, or
+an empty people book, the tick does nothing and no socket is opened.
+
+## 42. Keyword watch ("watch for anything about the biosensors project")
+
+A list of words or phrases to follow across unread mail and Canvas
+announcements. The deadline watch follows due times and the grade watch
+follows scores; this one follows a topic.
+
+```jsonc
+"watch": {
+  "keywords": ["biosensors", "REU application", "Villalobos"]
+}
+```
+
+Edit `~/.config/jarvis/assistant.json`, and hits are spoken on the next tick
+(fifteen minutes):
+
+> "Mail about biosensors, sir: Meeting about biosensors, from Dr. Villalobos."
+> "Canvas announcement about biosensors, sir: BIOSENSORS — Project groups posted."
+
+Matching is whole-word, so `"ai"` does not fire on "again" and `"lab"` does
+not fire on "collaboration"; a multi-word entry matches as a phrase. Matching
+is case-insensitive. An empty list means the watch never runs — it does not
+read the mailbox at all.
+
+It needs the Gmail app password (section 5) and/or the Canvas token
+(section 13), and each source runs on its own: with only Canvas set up, only
+announcements are watched. At most three hits are spoken per tick; the rest
+are marked seen and counted in the log, because a hit read out every fifteen
+minutes is worse than one missed. Seen hits live in
+`~/.aiws_trainer/jarvis_memory/keyword_watch_state.json` for fourteen days.
