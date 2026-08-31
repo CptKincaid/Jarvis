@@ -195,3 +195,20 @@ def test_the_desktop_chain_still_owns_a_mixed_compound(rich):
     res = c.handle("jarvis switch to opera and go back", source="typed")
     assert res.status == "Desktop command"
     svc.desktop.execute_actions.assert_called_once()
+
+
+def test_a_shaky_compound_is_declined(rich, monkeypatch):
+    """Splitting is itself a guess about the words, and the creation
+    read-backs cannot cover a pair (the second clause would overwrite the
+    first one's pending question). Below confirm.shaky_logprob the whole
+    thing goes to the model, as it did before the feature."""
+    c, svc = rich
+    monkeypatch.setattr(c.intent, "classify",
+                        lambda t: (IntentClassifier.YES, 0.9))
+    said = "set a timer for ten minutes and add milk to my todo list"
+    c.handle(said, source="voice", confidence=-0.9)
+    svc.timekeeper.add_timer.assert_not_called()
+    assert _todos(svc) == [] and svc.brain.chat.call_args.args == (said,)
+    # and the same words, heard clearly, still chain
+    c.handle(said, source="voice", confidence=-0.2)
+    assert svc.timekeeper.add_timer.call_count == 1 and _todos(svc) == ["milk"]

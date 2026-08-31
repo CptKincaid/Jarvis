@@ -1382,5 +1382,9 @@ The rules, which are deliberately strict:
   "set a timer for ten minutes and call my mother" runs neither and goes to
   the model whole: half an answer is worse than none.
 
+- **A doubtful transcript is never split.** If the words scraped in under
+  `confirm.shaky_logprob` (§42), the compound goes to the model whole
+  rather than running two actions off a guess.
+
 Nothing to configure. If a pair you expect is not chaining, say each half
 on its own first — if either one needs the model, the pair will too.

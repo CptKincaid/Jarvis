@@ -4744,6 +4744,15 @@ class Commander:
         parts = self._multi_match(text)
         if not parts:
             return None
+        if self.shaky_transcript():
+            # The split is itself a guess about the words. On a transcript
+            # that scraped in under confirm.shaky_logprob, running TWO
+            # actions off it is the wrong kind of confident -- and the
+            # creation read-backs cannot help, since a second clause would
+            # overwrite the first one's pending question. The model gets
+            # the compound whole, as it did before this feature.
+            log.info("multi-intent: declining a shaky compound %r", text)
+            return None
         # Each clause is its own turn for the handlers that re-read the raw
         # utterance (_h_remind_me, _h_lecture_start): left whole, _REMIND_RX
         # would re-match the compound and take the other clause as the body.
