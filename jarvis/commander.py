@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from jarvis import lecture as lecture_mod
+from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
 from jarvis.config import CONFIG, PATHS
@@ -176,6 +177,12 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- learned walks (2026-08-30): jarvis/leavetime.py ---
+        # "it takes ten minutes to get to Wisenbaker" and "make that ten
+        # next time" are teaching, not chat; the Tier-1 probe covers the
+        # exact phrasings and these cover the looser ones.
+        "walk to", "how long to", "minutes to get", "make that", "get to",
+        "leave for", "walking",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -3164,6 +3171,58 @@ def _int_setting(c, key: str, default: int) -> int:
         return default
 
 
+# ------------------------------------------------------------------
+# Time to leave (jarvis/leavetime.py, 2026-08-30)
+# ------------------------------------------------------------------
+# The walk to each building is LEARNED, never guessed: Jarvis asks once in
+# passing after a heads-up and stores the answer in long-term memory. These
+# three commands are the manual doors onto the same table -- teaching a walk
+# outright, amending the last one ("make that ten next time", which
+# correction_kind() does NOT match), and asking what he has. Every one of
+# them returns None rather than inventing a building: an unresolvable place
+# belongs to the model, not to a table of walks.
+def _h_leave_set(c, t, m):
+    lt = c._svc("leavetime")
+    place, minutes = m
+    key = lt.resolve(place)
+    if key is None:
+        return None                              # not a building he has: the model's
+    value = lt.learn(key, minutes)
+    return CommandResult(handled=True, speak=True,
+                         reply=leave_mod.LEARNED_LINE.format(
+                             place=leave_mod.speech_name(key), minutes=value),
+                         status=f"Walk: {leave_mod.speech_name(key)} {value} min")
+
+
+def _h_leave_amend(c, t, m):
+    lt = c._svc("leavetime")
+    key = lt.last_key
+    if not key:
+        return None                              # nothing to amend: the model's
+    value = lt.learn(key, m)
+    return CommandResult(handled=True, speak=True,
+                         reply=leave_mod.LEARNED_LINE.format(
+                             place=leave_mod.speech_name(key), minutes=value),
+                         status=f"Walk: {leave_mod.speech_name(key)} {value} min")
+
+
+def _h_leave_query(c, t, m):
+    lt = c._svc("leavetime")
+    key = lt.resolve(m)
+    if key is None:
+        return None
+    place = leave_mod.speech_name(key)
+    minutes = lt.table.get(key)
+    lt.note_key(key)
+    if minutes is None:
+        return CommandResult(handled=True, speak=True, status="Walk unknown",
+                             reply=f"{leave_mod.UNKNOWN_LINE} "
+                                   f"How long do you need to get to {place}?")
+    return CommandResult(handled=True, speak=True,
+                         reply=f"{place} is a {minutes} minute walk, sir.",
+                         status=f"Walk: {place} {minutes} min")
+
+
 REGISTRY: list[Command] = [
     Command("go back",
             _m_exact("go back", "previous window", "last window"),
@@ -3253,6 +3312,14 @@ REGISTRY: list[Command] = [
             needs=("brain",)),
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
     Command("next exam", _NEXT_EXAM_RX.match, _h_next_exam),
+    # The learned walks. Ahead of "answer question" / "quick command", which
+    # would swallow "how long to Wisenbaker" as a general question.
+    Command("leave time", leave_mod.leave_set_kind, _h_leave_set,
+            needs=("leavetime",)),
+    Command("leave time amend", leave_mod.leave_amend_kind, _h_leave_amend,
+            needs=("leavetime",)),
+    Command("leave time query", leave_mod.leave_query_kind, _h_leave_query,
+            needs=("leavetime",)),
     Command("day review", _DAYREVIEW_RX.match, _h_dayreview),
 
     Command("log triage", _LOGTRIAGE_RX.match, _h_log_triage),
@@ -3350,6 +3417,9 @@ ASSISTANT_TIER1: list[Command] = [
                     "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "next exam", "greeting", "day review",
+                    # the learned walks: "it takes ten minutes to get to
+                    # Wisenbaker" arrives by voice with no prefix left to strip
+                    "leave time", "leave time amend", "leave time query",
                     "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me",
@@ -3579,6 +3649,15 @@ def forced_call(reason: str, text: str) -> Optional[tuple]:
 # and logs the (heard, meant) pair for a later vocab tune. Matched on the
 # raw text ahead of the yes/no stages, which would eat "no, I said X" as
 # a plain decline.
+# The leave-time question ("how long do you need to get to Wisenbaker,
+# sir?") stays answerable for a few minutes -- he is usually packing a bag
+# when it lands -- but only a duration-shaped reply answers it.
+LEAVE_ANSWER_WINDOW_S = 180.0
+LEAVE_DROPPED_LINE = "As you wish, sir; I'll not ask again."
+_LEAVE_DECLINE_RX = re.compile(
+    r"^(?:no|nope|nah|never\s?mind|forget it|skip it|don'?t worry|"
+    r"i (?:don'?t|do not) know|dunno|no idea|not sure|who knows)\b", re.I)
+
 CORRECTION_WINDOW_S = 60.0
 _CORRECTION_RX = re.compile(
     r"^(?:(?:no|nope|nah)[,.!]?\s+)?"
@@ -3740,6 +3819,9 @@ class Commander:
         self._confidence: Optional[float] = None
         # A read-back waiting for a yes: (run, spoken line, stamp).
         self._pending_destructive: Optional[tuple] = None
+        # "How long do you need to get to Wisenbaker, sir?" is on the table:
+        # (building key, spoken place, monotonic stamp). See ask_leave_time.
+        self._pending_leave: Optional[tuple] = None
 
     # -- service access ------------------------------------------------
     def _svc(self, name: str):
@@ -3797,6 +3879,11 @@ class Commander:
         except (TypeError, ValueError):
             floor = -0.7
         return conf < floor
+
+    def ask_leave_time(self, key: str, place: str) -> None:
+        """The leave-time watch asked how long the walk is; the next
+        duration-shaped utterance answers it (``_try_leave_answer``)."""
+        self._pending_leave = (key, place, time.monotonic())
 
     def stash_destructive(self, run: Callable[[], CommandResult], line: str):
         """A handler read an action back instead of doing it; the next yes
@@ -3860,6 +3947,14 @@ class Commander:
         # 4. A pending router question: resolve it and dispatch the
         #    remembered utterance (spec 5.2 c).
         res = self._try_router_answer(text)
+        if res is not None:
+            return res
+        # 4a. "How long do you need to get to Wisenbaker, sir?" is on the
+        #     table. LAST of the pending stages on purpose: it must not eat
+        #     a bare "no" that belongs to the alarm offer or the read-back
+        #     above, and it returns None for anything that is not plainly a
+        #     duration, so an unrelated command in the window still runs.
+        res = self._try_leave_answer(text)
         if res is not None:
             return res
 
@@ -4482,6 +4577,44 @@ class Commander:
             return CommandResult(handled=True, reply=line, speak=True,
                                  status="Add failed")
         return CommandResult(handled=True, reply=line, speak=True, status="Added")
+
+    def _try_leave_answer(self, text: str) -> Optional[CommandResult]:
+        """Answer the once-ever "how long do you need to get to X, sir?".
+
+        Deliberately hard to trigger: only a plainly duration-shaped reply
+        counts (leavetime.answer_minutes), so "set a timer for five
+        minutes" spoken inside the window is still a timer. Anything else
+        leaves the question standing until it expires."""
+        pend = getattr(self, "_pending_leave", None)
+        if not pend:
+            return None
+        key, place, ts = pend
+        if time.monotonic() - ts > LEAVE_ANSWER_WINDOW_S:
+            self._pending_leave = None
+            return None
+        lt = self._svc("leavetime")
+        if lt is None:
+            self._pending_leave = None
+            return None
+        minutes = leave_mod.answer_minutes(text)
+        if minutes is None:
+            if _LEAVE_DECLINE_RX.match(strip_address(text) or text or ""):
+                self._pending_leave = None
+                return CommandResult(handled=True, speak=True,
+                                     reply=LEAVE_DROPPED_LINE,
+                                     status="Walk unknown")
+            return None
+        self._pending_leave = None
+        try:
+            value = lt.learn(key, minutes)
+        except Exception:  # noqa: BLE001 - a store failure must not eat the turn
+            log.exception("leavetime: learn(%r) failed", key)
+            return None
+        log.info("leavetime: %s answered as %d min", key, value)
+        return CommandResult(handled=True, speak=True,
+                             reply=leave_mod.LEARNED_LINE.format(
+                                 place=place, minutes=value),
+                             status=f"Walk: {place} {value} min")
 
     def _try_quiz_answer(self, text: str) -> Optional[CommandResult]:
         """While a quiz question is open, the utterance is the answer.
