@@ -54,7 +54,7 @@ import time
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
 
-from jarvis import pronounce
+from jarvis import mixer, pronounce
 from jarvis.config import CONFIG, PATHS
 from jarvis.events import SpeakingState, Status, bus
 from jarvis.logs import get_logger
@@ -608,7 +608,7 @@ class TTS:
         self._amp_playing = False
         self._amp_gen = 0                # generation token: one per chunk feeder
         self._current_amp = 0.0
-        self._play_proc: subprocess.Popen | None = None
+        self._player: subprocess.Popen | None = None
         self._q: queue.Queue = queue.Queue()   # (text, done_event)
         self._arbiter = arbiter          # MicArbiter; None when standalone
         self._mic_hold = None            # live acquire() for this burst
@@ -624,6 +624,28 @@ class TTS:
         self._worker = threading.Thread(
             target=self._worker_loop, daemon=True, name="tts-worker")
         self._worker.start()
+
+    # ------------------------------------------------------------ player
+    # The live player, behind a property so the Room Mixer (jarvis/mixer.py)
+    # learns its PID wherever in this file it is set. The Mixer exempts
+    # Jarvis's own streams by PID and NEVER by name: paplay and the pacat
+    # librespot pipes music through both report application.name/binary
+    # "pacat", so a name-based exemption would duck his voice under his
+    # voice -- or fail to duck the music at all.
+    @property
+    def _play_proc(self) -> "subprocess.Popen | None":
+        return self._player
+
+    @_play_proc.setter
+    def _play_proc(self, proc: "subprocess.Popen | None") -> None:
+        prev = getattr(self, "_player", None)
+        if prev is not None and prev is not proc:
+            mixer.forget_own_pid(getattr(prev, "pid", None))
+        self._player = proc
+        if proc is not None:
+            # getattr, not proc.pid: the test doubles for the player are
+            # bare objects, and a missing pid must not break playback.
+            mixer.register_own_pid(getattr(proc, "pid", None))
 
     # ------------------------------------------------------------ engine
     @property

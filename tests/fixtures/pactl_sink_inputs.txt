@@ -1,0 +1,100 @@
+Sink Input #92
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 91
+	Sink: 102
+	Sample Specification: s16le 2ch 44100Hz
+	Channel Map: front-left,front-right
+	Format: pcm, format.sample_format = "\"s16le\""  format.rate = "44100"  format.channels = "2"  format.channel_map = "\"front-left,front-right\""
+	Corked: no
+	Mute: no
+	Volume: front-left: 65536 / 100% / 0.00 dB,   front-right: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Buffer Latency: 0 usec
+	Sink Latency: 0 usec
+	Resample method: PipeWire
+	Properties:
+		client.api = "pipewire-pulse"
+		pulse.server.type = "unix"
+		media.name = "Spotify (Spark)"
+		application.name = "pacat"
+		application.process.id = "3132645"
+		application.process.user = "hunterp"
+		application.process.host = "spark-509f"
+		application.process.binary = "pacat"
+		application.language = "en_US.utf8"
+		window.x11.display = ":1"
+		application.process.machine_id = "7af66f30966a49b6886e00e2fce4b42f"
+		node.rate = "1/44100"
+		node.latency = "3528/44100"
+		stream.is-live = "true"
+		node.name = "pacat"
+		node.want-driver = "true"
+		node.autoconnect = "true"
+		media.class = "Stream/Output/Audio"
+		adapt.follower.spa-node = ""
+		object.register = "false"
+		factory.id = "6"
+		clock.quantum-limit = "8192"
+		factory.mode = "split"
+		audio.adapt.follower = ""
+		library.name = "audioconvert/libspa-audioconvert"
+		client.id = "57"
+		object.id = "58"
+		object.serial = "92"
+		pulse.attr.maxlength = "4194304"
+		pulse.attr.tlength = "21168"
+		pulse.attr.prebuf = "17644"
+		pulse.attr.minreq = "3528"
+		module-stream-restore.id = "sink-input-by-application-name:pacat"
+
+Sink Input #2790
+	Driver: PipeWire
+	Owner Module: n/a
+	Client: 2789
+	Sink: 102
+	Sample Specification: s16le 1ch 24000Hz
+	Channel Map: mono
+	Format: pcm, format.sample_format = "\"s16le\""  format.rate = "24000"  format.channels = "1"  format.channel_map = "\"mono\""
+	Corked: no
+	Mute: no
+	Volume: mono: 65536 / 100% / 0.00 dB
+	        balance 0.00
+	Buffer Latency: 0 usec
+	Sink Latency: 0 usec
+	Resample method: PipeWire
+	Properties:
+		client.api = "pipewire-pulse"
+		pulse.server.type = "unix"
+		media.format = "WAV (Microsoft)"
+		application.name = "paplay"
+		media.name = "/home/hunterp/.aiws_trainer/tts_cache/e816c7c28434f889eced0805a7c7ed23ab745986.wav"
+		application.process.id = "3708595"
+		application.process.user = "hunterp"
+		application.process.host = "spark-509f"
+		application.process.binary = "pacat"
+		application.language = "en_US.utf8"
+		window.x11.display = ":1"
+		application.process.machine_id = "7af66f30966a49b6886e00e2fce4b42f"
+		node.rate = "1/24000"
+		node.latency = "8192/24000"
+		stream.is-live = "true"
+		node.name = "paplay"
+		node.want-driver = "true"
+		node.autoconnect = "true"
+		media.class = "Stream/Output/Audio"
+		adapt.follower.spa-node = ""
+		object.register = "false"
+		factory.id = "6"
+		clock.quantum-limit = "8192"
+		factory.mode = "split"
+		audio.adapt.follower = ""
+		library.name = "audioconvert/libspa-audioconvert"
+		client.id = "80"
+		object.id = "81"
+		object.serial = "2790"
+		pulse.attr.maxlength = "4194304"
+		pulse.attr.tlength = "96000"
+		pulse.attr.prebuf = "95042"
+		pulse.attr.minreq = "960"
+		module-stream-restore.id = "sink-input-by-application-name:paplay"

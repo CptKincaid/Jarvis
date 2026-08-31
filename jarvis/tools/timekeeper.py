@@ -35,6 +35,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from jarvis import mixer
 from jarvis.events import AlarmFired, AlarmStopped, ReminderFired, bus
 from jarvis.logs import get_logger
 from jarvis.tools.registry import ToolResult, ToolSpec
@@ -1419,6 +1420,7 @@ class Timekeeper:
         r = self._ring
         self._ring = None
         if r is not None and r.proc is not None:
+            mixer.forget_own_pid(getattr(r.proc, "pid", None))
             for name in ("terminate", "kill"):
                 fn = getattr(r.proc, name, None)
                 if fn is None:
@@ -1598,6 +1600,7 @@ class Timekeeper:
             poll = getattr(r.proc, "poll", None)
             if callable(poll) and poll() is None:
                 return                        # still playing
+            mixer.forget_own_pid(getattr(r.proc, "pid", None))
             r.proc = None
             r.next_play = now + gap
             return
@@ -1605,6 +1608,10 @@ class Timekeeper:
             return
         volume = MAX_VOLUME if r.escalated else self._volume()
         r.proc = self._run(["paplay", f"--volume={volume}", self._sound_path()], background=True)
+        # The Room Mixer exempts Jarvis's own streams by PID. Without this
+        # the alarm -- his own paplay loop -- would be ducked to 30 % under
+        # the spoken alarm line, which is the one sound that must not bow.
+        mixer.register_own_pid(getattr(r.proc, "pid", None))
         r.plays += 1
         if r.proc is None:
             r.next_play = now + gap

@@ -1613,6 +1613,8 @@ TIER1_SAMPLES = {
     "clip to claude": "have claude fix what i copied",
     "read control": "skip",
     "math": "what's 18 percent of 74",
+    "room light": "dim it a little",
+    "scene": "power down the workshop",
 }
 
 
