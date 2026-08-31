@@ -545,6 +545,15 @@ class MainWindow:
         self._tasks = ClaudeTaskTracker()
         self._project = ""
         self._alarm = None               # (alarm_id, Card) while ringing
+        # The console's second surface and its mode machine. Declared HERE,
+        # before _subscribe() attaches the bus: a BoardCommand arriving
+        # between that and the driver's construction must find `None`, not
+        # an AttributeError inside a bus handler.
+        self.board: Optional[BoardWindow] = None
+        self.modes: Optional[ConsoleModes] = None
+        self._room_data: dict = {}
+        self._standby_origin = None      # window position before it drifts
+        self._footer_hidden = False
         self._term_available = terminal_available()
         self._session_seen = False       # a jarvis-* tmux session is alive
         self._term_attached = False      # …and a terminal is watching it
@@ -630,10 +639,6 @@ class MainWindow:
         # Console modes: standby / ambient / power-up as ONE machine (see
         # jarvis/ui/console_mode.py). Started last so every widget it can
         # touch already exists.
-        self.board: Optional[BoardWindow] = None
-        self._room_data: dict = {}
-        self._standby_origin = None       # window position before it drifts
-        self._footer_hidden = False
         self.modes = ConsoleModes(
             after=self._after,
             idle_fn=resolve_idle_fn(self.services),
@@ -1007,7 +1012,8 @@ class MainWindow:
         # window, and saving a drifted position would make the console
         # creep across the desk one quit at a time.
         try:
-            self.modes.stop()
+            if self.modes is not None:
+                self.modes.stop()
         except Exception:
             log.exception("console modes stop failed")
         if self.board is not None:
@@ -1277,10 +1283,12 @@ class MainWindow:
         """First activity of the day after the overnight gap. The app owns
         the date latch (briefing_state.json), so by the time this arrives
         the sweep is already spent for today."""
+        if self.modes is None:
+            return
         panels = self.board.panel_count if self.board is not None else 0
         log.info("power-up (%s, %.1f h idle)", ev.reason, ev.gap_h)
         # With no Board up the sweep still plays over the room slab's rows,
-        # which is why proposal 19 degrades gracefully instead of going dark
+        # so the feature degrades gracefully instead of going dark
         self.modes.power_up(panels or DEFAULT_SWEEP_STAGES)
 
     # ------------------------------------------------------------- the Board

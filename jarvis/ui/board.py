@@ -213,7 +213,6 @@ class BoardWindow:
         self.on_close = on_close
         self._visible = False
         self._state: Optional[BoardState] = None
-        self._items: dict = {}          # key -> {"rows": [...], "title": id}
         self._revealed: Optional[int] = None   # power-up: panels shown so far
         self._highlight = None
         self._geom = ""
@@ -226,7 +225,7 @@ class BoardWindow:
         self._geom = dock_geometry(screen[0], screen[1], px(BOARD_W),
                                    px(MARGIN), console_w)
         self.top.geometry(self._geom)
-        strip_board_decorations(self.top)
+        self._stripped = False        # decorations come off on first show
         # A closed board is withdrawn, not destroyed: see the class docstring
         self.top.protocol("WM_DELETE_WINDOW", self.hide)
         self.canvas = tk.Canvas(self.top, bg=theme.BG, highlightthickness=0,
@@ -256,6 +255,13 @@ class BoardWindow:
             self.top.deiconify()
         except tk.TclError:
             log.debug("board deiconify on a dead window", exc_info=True)
+            return
+        if not self._stripped:
+            # ON FIRST SHOW, not in __init__: the hints are set through the
+            # WM-managed window, and a Toplevel that has never been mapped
+            # has none for xdotool to find.
+            self._stripped = True
+            strip_board_decorations(self.top)
         self._redraw()
 
     def hide(self):
@@ -324,12 +330,15 @@ class BoardWindow:
         if w <= 1 or h <= 1 or state is None:
             return
         panels = list(state.panels)
-        if self._revealed is not None:
-            panels = panels[:max(0, int(self._revealed))]
         if not panels:
             return
+        # The grid is laid out from EVERY panel, then only the revealed ones
+        # are drawn: the power-up sweep must populate a fixed board, not
+        # make each slab shrink as the next one arrives.
+        shown = panels if self._revealed is None \
+            else panels[:max(0, int(self._revealed))]
         boxes = panel_boxes(h, [p.key for p in panels], px(PANEL_PAD))
-        by_key = {p.key: p for p in panels}
+        by_key = {p.key: p for p in shown}
         for key, y0, y1 in boxes:
             panel = by_key.get(key)
             if panel is not None and y1 - y0 > px(HEAD_H) // 2:

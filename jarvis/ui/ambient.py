@@ -44,7 +44,14 @@ from jarvis.ui.widgets import ellipsize, px, ui_display, ui_mono
 
 log = get_logger("ui.ambient")
 
-CLOCK_SIZE = 64             # design units; the standby clock's cap height
+CLOCK_SIZE = 64             # standby clock, in TYPE units (ui_display scales
+                            # these itself -- passing px() here would scale
+                            # them twice, which is the trap widgets.py's
+                            # "fonts are scaled ONLY via set_font_scale"
+                            # comment exists to prevent)
+CLOCK_BOX = 86              # the clock's layout box in DESIGN units (px()),
+                            # ~4/3 of the type size, matching _FONT_SCALE
+AMBIENT_CLOCK = 28          # the ambient band's smaller clock, type units
 ROW_H = 26
 PAD = 20
 TICK_MS = 1000              # the clock has a minute hand to keep honest
@@ -246,20 +253,20 @@ class RoomSlab(tk.Canvas):
         now = datetime.now()
         cy = int(h * 0.36)
         self.create_text(w // 2, cy, anchor="center", text=clock_text(now),
-                         fill=head, font=ui_display(px(CLOCK_SIZE), "semibold"))
-        self.create_text(w // 2, cy + px(CLOCK_SIZE) // 2 + px(14),
+                         fill=head, font=ui_display(CLOCK_SIZE, "semibold"))
+        self.create_text(w // 2, cy + px(CLOCK_BOX) // 2 + px(14),
                          anchor="center", text=f"{meridiem(now)}  ·  "
                                                f"{date_text(now)}",
                          fill=faint, font=ui_display(theme.SIZE_CAPTION))
         rows = standby_rows(self._room)
-        top = cy + px(CLOCK_SIZE) // 2 + px(48)
+        top = cy + px(CLOCK_BOX) // 2 + px(48)
         self._draw_rows(rows, w, h, top, body, faint, centered=True)
 
     def _draw_ambient(self, w, h, head, body, faint) -> None:
         now = datetime.now()
         self.create_text(px(PAD), px(PAD) + px(6), anchor="w",
                          text=clock_text(now), fill=head,
-                         font=ui_display(px(28), "semibold"))
+                         font=ui_display(AMBIENT_CLOCK, "semibold"))
         self.create_text(w - px(PAD), px(PAD) + px(6), anchor="e",
                          text=date_text(now), fill=faint,
                          font=ui_display(theme.SIZE_CAPTION))

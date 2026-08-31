@@ -2155,3 +2155,154 @@ brightness is X's software gamma, not a backlight, so it works over HDMI on a
 desktop monitor. Spotify only does anything when the account is linked
 (section 11) and a device is reachable — otherwise it is a night without
 music and no apology, exactly as in a focus session.
+
+## 40. The Board — mission control on the empty right of the desk
+
+The console is 520x880 on a 3840x2160 panel. The Board fills the rest of the
+right flank with a second borderless panel in the same theme.
+
+Say **"bring up the board"** (or "show me the board", "board up") and it
+slides in. **"Close the board"** takes it down. Both work without the wake
+word, the way every other surface verb does.
+
+Six slabs, top to bottom:
+
+| slab | what it says |
+|---|---|
+| VITALS | memory free of total, GPU load / temperature / power, load average, and any training process. Amber under 16 GB free, red under 8. |
+| TURNS | the turn ledger as a strip chart: the last turn, the **median** wait (a mean is dragged around by one cold model load), the worst, and how many. Amber when anything waited over four seconds. |
+| CLAUDE | live tasks first — RUNNING, QUEUED, WAITING on a permission answer — then the most recent sessions on disk. |
+| DUE | timekeeper items and Canvas deadlines, soonest first, as "in 12m" rather than a clock time you have to subtract from. |
+| FOCUS | the block or break running, in the session's own words. |
+| QUIET | why he is holding his tongue, how many lines are waiting, and where you are (only when presence is actually configured). |
+
+### Asking about one panel
+
+**"Focus on the sessions"** lights that slab *and* says the one-line read
+aloud: "Two tasks running, sir." The other names work too — "the vitals" or
+"the engines", "the turn ledger", "what's due", "the block", "quiet hours".
+A "focus on ..." that names no panel is left alone: "focus on the thesis"
+still means what it always meant.
+
+### Over SSH
+
+```bash
+jarvis board
+```
+
+prints exactly the same state as plain text. That is not a convenience
+bolted on afterwards — the whole state layer was built and proved through
+that command before a single line of drawing code existed.
+
+### What it costs
+
+A 5 s poll thread while the Board is up, and nothing at all while it is
+down. The Canvas half is cached five minutes, so raising the Board never
+turns into a REST call every five seconds. Nothing expensive runs on the
+drawing thread.
+
+### Switching it off
+
+```json
+"console": { "board": false }
+```
+
+### Requirements
+
+`xprop` and `xdotool`, both already present. Without them the panel falls
+back to a "splash" window type — undecorated, but skipped by taskbars, which
+for a docked panel is what you wanted anyway.
+
+
+## 41. Standby and the ambient panel — the console when nobody is talking
+
+Between conversations the console stops being an app.
+
+**After about 45 seconds** of quiet the transcript recedes and one slab of
+room state takes the stage: what is playing, the next thing on the calendar,
+the next deadline, the outside temperature, the hour of the house, and where
+you are. Quiet hours are not a row saying "quiet hours: on" — the whole slab
+goes ember and low-contrast, which reads from across the room in a way a
+label never does. GPU load is a bar for the same reason.
+
+**After about twelve minutes** away from the keyboard the console becomes
+the room's clock: a large soft clock with the day and date, the next
+commitment, the next deadline and the temperature. The command bar and the
+status strip go away. The reactor keeps turning at a third of its speed.
+The whole thing dims on a curve toward the small hours and holds a floor at
+35% — never black, and never below it, whatever the hour.
+
+Touch anything, or say his name, and it is back.
+
+### What it deliberately does not do
+
+* **It never touches the screen's brightness or gamma.** The dimming is a
+  colour blend inside Jarvis's own window. A crash while the desktop gamma
+  is crushed would leave you with a dark screen and no obvious way back;
+  a crash here leaves a normal window.
+* **It never re-renders the reactor.** The avatar's frames are baked at a
+  fixed size, and re-baking them at a mode change is exactly the kind of
+  window churn that froze the desktop on 26 August.
+* **It does not go fullscreen.** The room clock is the console's own
+  window, for the same reason: a 4K standby surface would want the reactor
+  at a new size, and every size change is a full re-bake.
+* **Burn-in is handled by moving the window,** a few pixels a minute on a
+  slow loop, which drifts the brightest thing on the panel — the reactor
+  disc — without redrawing anything. The walk is undone the moment you come
+  back, and again before the window position is saved at quit, so the
+  console cannot creep across the desk one session at a time.
+
+### How it knows you are away
+
+In preference order: the desk-presence probe if it is wired, GNOME's own
+idle monitor if that module is installed, and otherwise the X server's
+screensaver idle counter. If none of them can answer, the console stays
+awake — a machine that cannot see the keyboard should never decide nobody
+is there.
+
+A live turn or a ringing alarm keeps it awake regardless.
+
+### Settings
+
+```json
+"console": {
+  "ambient": true,
+  "ambient_after_s": 45,
+  "standby": true,
+  "standby_after_min": 12,
+  "standby_dim": 0.35,
+  "drift_px_per_min": 3
+}
+```
+
+`standby_dim` is a floor, not a target: 0.35 means it never goes below 35%.
+
+
+## 42. Power-up — the room waking with you
+
+The first time you touch the desk after the night — the phone coming back
+onto the Wi-Fi, or simply the first wake word of the day — the panels
+populate in sequence rather than being there all at once. About a second
+apart, then the finished board holds for a beat and the console settles.
+
+It happens **once a day**, and the moment you say anything the rest of it is
+abandoned mid-sweep: the reply always wins.
+
+It is ten seconds of theatre over data he already had. There is no new
+information in it, and nothing waits on it.
+
+Two triggers, because on this machine one is not enough: the proper one is
+presence noticing you are back, but presence does nothing until `phone_ip`
+is set (section 21), so the first wake word of the day is what actually
+fires it here.
+
+The "once a day" latch is a `boot_sweep` date written into the same
+`briefing_state.json` the morning briefing already uses, so restarting
+Jarvis five times before breakfast still gets you one sweep.
+
+```json
+"console": { "powerup": true, "powerup_gap_h": 6 }
+```
+
+`powerup_gap_h` is how long the machine must have been left alone to count
+as "after the night". Set `powerup` to `false` and nothing sweeps.
