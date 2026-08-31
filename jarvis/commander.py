@@ -1909,14 +1909,21 @@ def _h_timer(c, t, m):                                     # 3217-3231
     words = f"{n} {_unit_word(unit, n)}"
     tk = c._svc("timekeeper")
     if tk is not None:
-        tk.add_timer(seconds, label or f"{words} timer")
         line = f"{words}, sir; I'll let you know."
+        what = ""
         if label:
             what = label if re.match(r"^(?:the|my|a|an|your)\b", label, re.I) \
                 else f"the {label}"
             line = f"{words} for {what}, sir; I'll let you know."
-        return CommandResult(handled=True, reply=line, speak=True,
-                             status=f"Timer set: {words}")
+
+        def _run():
+            tk.add_timer(seconds, label or f"{words} timer")
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status=f"Timer set: {words}")
+        # A shaky transcript reads the parsed timer back first (_confirm_or_run)
+        ask = f"A {words} timer for {what}, sir?" if what \
+            else f"A timer for {words}, sir?"
+        return _confirm_or_run(c, _run, ask)
     workflows = c._svc("workflows")
     if workflows is None:
         return None
@@ -1946,11 +1953,17 @@ def _h_alarm(c, t, m):
     if due is None:
         return CommandResult(handled=True, reply=NO_WHEN_LINE, speak=True,
                              status="Alarm: when?")
-    tk.add_alarm(due, label, repeat)
     desc = _describe(tk, due, now, when)
     tail = {"daily": " Every day.", "weekdays": " Weekdays."}.get(repeat, "")
-    return CommandResult(handled=True, reply=f"Alarm {desc}, sir.{tail}",
-                         speak=True, status=f"Alarm {desc}")
+
+    def _run():
+        tk.add_alarm(due, label, repeat)
+        return CommandResult(handled=True, reply=f"Alarm {desc}, sir.{tail}",
+                             speak=True, status=f"Alarm {desc}")
+    # A misheard hour is the daily cost of a confident guess: on a shaky
+    # transcript the parsed time is read back before anything is set.
+    asked = {"daily": ", every day", "weekdays": ", weekdays"}.get(repeat, "")
+    return _confirm_or_run(c, _run, f"An alarm {desc}{asked}, sir?")
 
 
 def _h_list_schedule(c, t, m):
@@ -1991,6 +2004,28 @@ def _pending_count(tk, kind: str) -> int:
         return len(items)
     except Exception:
         return 0
+
+
+def _confirm_or_run(c, run: Callable[[], CommandResult],
+                    question: str) -> CommandResult:
+    """Commit the creation, or read the PARSED result back first when the
+    transcript scraped in under confirm.shaky_logprob.
+
+    "5:15" and "5:50" differ by one phoneme and the cost of the wrong one
+    lands hours later, in the dark; the same for "remind me at two" heard
+    as "at ten". A confident transcript stays zero-friction -- this branch
+    only fires on the doubtful tail the confidence gate already measures --
+    and the yes costs one second through the follow-up window that any
+    spoken reply opens. Reusing stash_destructive means the answer is
+    resolved by _try_destructive_confirm, so the offer expires after
+    DESTRUCTIVE_TTL_S and a change of subject drops it, exactly like a bulk
+    cancel: an unanswered read-back must never set an alarm later.
+    """
+    if _assistant_get(c, "confirm.read_back", True) and c.shaky_transcript():
+        c.stash_destructive(run, question)
+        return CommandResult(handled=True, reply=question, speak=True,
+                             status="Confirm?")
+    return run()
 
 
 def _wants_read_back(c, n: int) -> bool:
@@ -2877,12 +2912,17 @@ def _h_remind_me(c, t, m):                                 # 3465-3483
     if due is None:
         return CommandResult(handled=True, reply=NO_WHEN_LINE, speak=True,
                              status="Reminder: when?")
-    tk.add_reminder(due, task)
     desc = _describe(tk, due, now, when)
     what = task if re.match(r"^(?:that|about)\b", task, re.I) else f"to {task}"
-    return CommandResult(handled=True,
-                         reply=f"Very good, sir; I'll remind you {what} {desc}.",
-                         speak=True, status=f"Reminder {desc}: {task[:30]}")
+
+    def _run():
+        tk.add_reminder(due, task)
+        return CommandResult(handled=True,
+                             reply=f"Very good, sir; I'll remind you {what} {desc}.",
+                             speak=True, status=f"Reminder {desc}: {task[:30]}")
+    # Both halves can be misheard here -- the hour and the errand itself --
+    # so a shaky transcript reads the whole parse back (_confirm_or_run).
+    return _confirm_or_run(c, _run, f"A reminder {what} {desc}, sir?")
 
 
 # ---- Tier 1 ambient: do not disturb / quiet hours / I am free ------------

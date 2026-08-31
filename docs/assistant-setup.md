@@ -1318,3 +1318,42 @@ below `followup_window`, and the long window only lasts while the question
 does — a finished quiz, a read-back older than 60 s and a wake-alarm offer
 older than three minutes all fall straight back to 4 s. Every follow-up is
 still speaker-verified, so the open mic is still yours alone.
+
+## 42. Read-backs when he isn't sure he heard you
+
+Whisper returns a confidence for every utterance. Below
+`confirm.shaky_logprob` (default -0.7, calibrated from the live log) the
+words are doubtful — and a doubtful alarm is expensive, because "5:15" and
+"5:50" differ by one phoneme and the mistake surfaces hours later.
+
+So on a shaky transcript the three creation commands read the parse back
+instead of committing:
+
+```
+you    "set an alarm for five fifteen"        (heard at -0.91)
+jarvis "An alarm at 5:15 am tomorrow, sir?"
+you    "yes"
+jarvis "Alarm at 5:15 am tomorrow, sir."
+```
+
+- alarms — "An alarm at 5:15 am tomorrow, every day, sir?"
+- timers — "A timer for 5 minutes, sir?"
+- reminders — "A reminder to call mum at 5 pm, sir?"
+
+The question names what he *understood*, not what he heard, which is the
+point: you are checking the parse. A confident transcript is untouched, and
+so are typed and CLI turns, which carry no confidence at all. Calendar adds
+already had their own read-back and are unchanged.
+
+An unanswered question sets nothing: a "no", a change of subject, or 60
+seconds of silence all drop it (the same rule as "cancel all my alarms").
+The yes rides the follow-up window, which is 15 s while a read-back is open
+(§41).
+
+```json
+{ "confirm": { "read_back": true, "shaky_logprob": -0.7 } }
+```
+
+`read_back: false` turns off every read-back, the bulk cancels included.
+Raise `shaky_logprob` toward 0 to be asked more often, lower it (-0.9) to be
+asked only when the transcript is nearly garbled.
