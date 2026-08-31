@@ -354,3 +354,20 @@ def test_main_creates_a_missing_settings_file(tmp_path):
     assert install.main(["--settings", str(settings), "--python", "python3"]) == 0
     data = json.loads(settings.read_text())
     assert data["hooks"]["PostToolUse"][0]["hooks"][0]["command"].startswith("python3 ")
+
+
+def test_a_background_agents_session_is_never_narrated(env):
+    """2026-08-30, 11 pm: eight build agents' pytest runs reached the
+    soundbar as "Tests passed in wf..., sir." A session whose transcript
+    lives under .../subagents/ (workflow builders, spawned agents) is not
+    a terminal Hunter is watching, so the hook stands down."""
+    payload = bash("~/vss_env/bin/python -m pytest tests/test_x.py -q",
+                   stdout="12 passed in 0.1s")
+    payload["transcript_path"] = ("/home/hunterp/.claude/projects/p/"
+                                  "subagents/workflows/wf_x/agent-1.jsonl")
+    run(payload)
+    assert _queue(env) == []
+    # the same verdict from a real terminal still speaks
+    run(bash("~/vss_env/bin/python -m pytest tests/test_x.py -q",
+             stdout="12 passed in 0.1s"))
+    assert _queue(env) == ["Tests passed in Jarvis, sir."]

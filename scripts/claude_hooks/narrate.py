@@ -306,6 +306,13 @@ def _main(stdin, now: float) -> int:
         return 0
     if not isinstance(event, dict):
         return 0
+    # A background agent's session (a workflow builder, a spawned subagent)
+    # is not a terminal Hunter is watching: on 2026-08-30 eight builders'
+    # pytest runs narrated "Tests passed in wf..., sir" to the soundbar at
+    # 11 pm. Their transcripts live under .../subagents/; a session whose
+    # hook payload points there is never narrated.
+    if "/subagents/" in str(event.get("transcript_path") or ""):
+        return 0
 
     session_id = str(event.get("session_id") or "")
     state = load_state(session_id)
