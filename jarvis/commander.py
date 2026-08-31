@@ -3237,8 +3237,11 @@ _AUDIO_OUT_RX = re.compile(
     r"^(?:where(?:'s| is| are)? (?:your |my |the )?"
     r"(?:voice|audio|sound|speech|you) (?:coming out|going|playing|coming from)"
     r"(?: of| from| to)?"
-    r"|which (?:speaker|sink|output|device) (?:are you|is that|is it) (?:on|using)"
-    r"|what (?:speaker|sink|output) (?:are you|is that) (?:on|using)"
+    # "coming out of" belongs here too: it is the phrasing a person actually
+    # uses at a speaker that has gone quiet, and it was in the gate
+    # vocabulary while no matcher accepted it (found live 2026-08-31).
+    r"|(?:which|what) (?:speaker|sink|output|device) (?:are you|is that|is it)"
+    r" (?:on|using|coming out of|playing (?:on|through)|going (?:to|through))"
     r"|(?:what|which) (?:is |are )?(?:my |your )?(?:audio|sound) output)\W*$", re.I)
 
 

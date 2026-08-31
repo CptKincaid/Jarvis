@@ -1703,6 +1703,19 @@ TIER1_SAMPLES = {
 }
 
 
+def test_the_audio_out_question_takes_the_phrasing_people_actually_use():
+    """Live 2026-08-31: "which speaker are you coming out of" fell through to
+    the model while "coming out of" already sat in the gate vocabulary --
+    the words were let past the classifier and then matched nothing."""
+    import jarvis.commander as C
+    for phrase in ("which speaker are you coming out of",
+                   "what speaker are you playing through",
+                   "which speaker are you on",
+                   "where is your voice coming out"):
+        assert C._AUDIO_OUT_RX.match(phrase), phrase
+    assert not C._AUDIO_OUT_RX.match("which speaker do you like")
+
+
 def test_every_tier_one_command_has_a_gate_sample():
     from jarvis.commander import ASSISTANT_TIER1
     names = {c.name for c in ASSISTANT_TIER1}
