@@ -1525,6 +1525,7 @@ TIER1_SAMPLES = {
     "quiet hours": "quiet hours from eleven to seven",
     "do not disturb": "do not disturb for an hour",
     "free": "i am free",
+    "room tone": "room tone on",
     "standup": "standup",
     "gpu reclaim": "take the gpu back",
     "gpu lend": "lend the gpu",

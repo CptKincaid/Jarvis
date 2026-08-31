@@ -60,6 +60,11 @@ class TurnLedger:
         self._marks: dict[str, float] = {}
         self._notes: dict[str, str] = {}
         self._open = False
+        # The last mark of ANY turn, kept across turns. This is the ledger's
+        # answer to "when did the microphone last hear him?", and it is what
+        # the departure cue (jarvis/arrival.py) vetoes on -- a sleeping phone
+        # radio must never settle the room around a man who just spoke.
+        self._last_mark: Optional[float] = None
 
     # ---------------------------------------------------------------- marks
     def mark(self, stage: str, at: Optional[float] = None, **notes: str) -> None:
@@ -87,6 +92,8 @@ class TurnLedger:
             if stage in self._marks and stage != "speech_end":
                 return                       # first mark wins (first audio chunk)
             self._marks[stage] = now         # speech_end: the LAST one wins
+            if self._last_mark is None or now > self._last_mark:
+                self._last_mark = now
             self._notes.update({k: str(v) for k, v in notes.items()})
             if stage == "audio":
                 self._finish_locked("audio")
@@ -101,6 +108,19 @@ class TurnLedger:
     def open(self) -> bool:
         with self._lock:
             return self._open
+
+    @property
+    def last_mark(self) -> Optional[float]:
+        """Clock value of the most recent mark of any turn (None: never)."""
+        with self._lock:
+            return self._last_mark
+
+    def idle_s(self) -> Optional[float]:
+        """Seconds since the microphone last did anything (None: never)."""
+        with self._lock:
+            if self._last_mark is None:
+                return None
+            return max(0.0, self._clock() - self._last_mark)
 
     # -------------------------------------------------------------- report
     def _finish_locked(self, outcome: str) -> None:

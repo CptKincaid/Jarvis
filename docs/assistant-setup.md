@@ -2393,3 +2393,235 @@ Two sinks, and one failing does not lose the other:
 
 Calendar first: Canvas exam rows carry a due time and no end, so there is
 nothing there that can say *it is over*.
+---
+
+## 43. The arc: one named hour for the whole house
+
+Time-of-day logic used to be five clocks that disagreed — quiet's hours, the
+deadline nudges' "not yet evening", hardcoded morning/evening greetings in two
+places, and the briefing's own `after`. `jarvis/arc.py` gives them one truth.
+
+It names the hour as exactly one of:
+
+```
+pre-dawn   waking   working   afternoon   dusk   evening   night
+```
+
+from real sunrise and sunset, plus quiet hours, presence and whether a focus
+block is running. There is nothing to say to it and nothing to configure to
+make it work — it is a **state source**. Anything that wants to behave
+differently at dusk than at ten in the morning reads `services.arc.phase` or
+subscribes to `ArcChanged` on the bus.
+
+**Sunrise and sunset are computed on the box.** Not fetched. The weather tool
+does have them, but they arrive over the network and need `home_location`
+lat/lon, which ships empty — an arc keyed off that degrades to fixed hours on
+every cold boot and every network blip, silently. So the arc runs the NOAA
+sunrise equation itself, stdlib only, accurate to a minute (checked against
+published tables for New York at both solstices). If a forecast is *already*
+cached it may override the local answer; nothing here ever triggers a fetch.
+No coordinates, or a polar day, falls back to fixed hours.
+
+**It never flaps.** A phase has to hold for 20 minutes before another can take
+it, the solar boundaries carry a ±15-minute tolerance band, and within a local
+date the phase only moves forward — so a cached forecast refreshing with a
+sunset twenty minutes later cannot drag dusk back to afternoon. `ArcChanged`
+is published on an accepted transition only, never per tick, so a subscriber
+can treat every event as a real change.
+
+Two overrides jump the queue in both directions: a running focus block pins
+`working` (a man deliberately working at midnight is working), and quiet hours,
+DND, a detected meeting or an empty house collapse it to `night`.
+
+Two things it deliberately does **not** do. It never writes config — in
+particular it will not touch `briefing.verbosity`, which is a preference you
+set by voice and would read as a bug if the clock overwrote it. And it never
+gates speech: `jarvis/quiet.py` is the owner of quiet, and the arc only
+*consumes* `quiet.reason()`. Two policies disagreeing at 23:00 is exactly the
+failure this avoids.
+
+```jsonc
+"arc": { "enabled": true, "tick_s": 60 }
+```
+
+State lives in `MEMORY_DIR/arc_state.json` so a restart does not re-announce
+the hour you were already in.
+
+## 44. The earcon lexicon: six tones in one family
+
+He had three beeps already — the capture opening at 880 Hz, the capture
+closing at 660, and the 440 Hz nudge that means "I heard you, and I have
+nothing to answer". Those three turn out to be a root, a fifth and an octave,
+so the family is *derived* from what the room already sounded like rather than
+invented beside it: 220 / 330 / 440 / 660 / 880 / 1320, one timbre
+(fundamental, a quiet octave, a trace of the twelfth), one 10 ms raised-cosine
+envelope, every tone under 400 ms.
+
+`jarvis/earcons.py` is now the only place a non-speech sound comes from;
+`recorder.play_beep()` delegates to it. Two beep systems with different
+accents is the precise failure a shared voice for the room exists to prevent.
+
+Six names ship:
+
+| tone | means | wired to |
+| --- | --- | --- |
+| `heard-you` | the wake word landed | the wake acknowledgement |
+| `done` | the capture closed | end of recording |
+| `held-back` | heard you, nothing to answer | the nudge policy |
+| `arrival` | he came back | the arrival cue (§45) |
+| `thinking` | — | nothing, on purpose |
+| `warning` | — | nothing, on purpose |
+
+The last two are rendered so the lexicon is complete and auditionable, and
+connected to nothing deliberately. `BrainState` flips constantly and the
+reactor already shows it visually, so a chirp per state transition reads as a
+nervous tic rather than an accent. And the only candidate publisher for a
+grave warning tone is the health watchdog, whose lines are *proactive* and
+therefore held by quiet hours — the tone would sound at 3 a.m. exactly when
+the sentence it accompanies was suppressed. Either gets wired when it has a
+real publisher.
+
+Audition all six back to back before you believe any of this:
+
+```bash
+~/vss_env/bin/python scripts/make_earcons.py --play
+~/vss_env/bin/python scripts/make_earcons.py --out /tmp/tones   # just bake them
+```
+
+```jsonc
+"sound": { "earcons": true, "cooldown_s": 4, "volume": 0.5 }
+```
+
+Note the gate is `sound.earcons` and **not** `CONFIG.sound` in
+`voice_settings.json`: that flag defaults false and means "the old chimes", so
+hanging the lexicon off it would have shipped it mute. Because the wake
+acknowledgement now sounds by default, it earns the existing 200 ms mic guard
+— the bloom fires while the mic is opening and would otherwise be recorded
+straight back through the Snowball.
+
+Rate limiting lives in the generator, per name, plus a 250 ms global gap. One
+shared cooldown across all causes would swallow the `done` that closes a
+capture two seconds after `heard-you` opened it, which is worse than the
+false-wake metronome it prevents.
+
+The WAVs bake deterministically into `MEMORY_DIR/earcons` — not `LOG_DIR`,
+because `/tmp` is wiped at boot on this box.
+
+## 45. Arrival and departure: the room notices the door
+
+"Welcome back, sir" and the catch-up digest already shipped. What was missing
+was that they landed as a bare line into a dead room. Arrival is now a
+composed cue in a fixed order:
+
+```
+panel  ->  earcon  ->  "Welcome back, sir."  ->  the catch-up
+```
+
+The pre-existing quiet rule is kept exactly: `"you're out"` is stale by
+definition on a returned event so it never defers the greeting, while any
+other reason (hours, DND, a meeting) wakes the panel and leaves the voice to
+the quiet policy's own tick.
+
+**Departure is the mirror in the one way that matters: it says nothing at
+all.** And it is asymmetric by construction — arrival fires on first sight,
+because being late to notice him is the whole failure mode, while departure
+clears three gates:
+
+1. the sentinel's own away grace (`presence.away_after_min`, 12 min);
+2. a further confirm window, `presence.departure_confirm_min`, floored at a
+   minute and strictly *additional* to the grace;
+3. a hard veto if the microphone heard him inside
+   `presence.departure_mic_silence_min` — read from the existing turn ledger
+   via `TurnLedger.idle_s()`, not a new field bolted onto the app.
+
+A sleeping phone radio faking a departure while he is sitting in the room is
+the one outcome worth spending latency to avoid.
+
+`presence.poll_s_away` polls fast (10 s, floored at 5) **only while the house
+is empty**. At the 60 s default, "the room notices the door" is in practice
+"the room notices up to a minute after he sat down", by which point he may be
+mid-utterance and a staged four-step cue reads as late rather than composed.
+One ping per ten seconds, and only when nobody is home.
+
+```jsonc
+"presence": {
+  "phone_ip": "192.168.1.42",
+  "poll_s": 60, "poll_s_away": 10,
+  "arrival_cue": true,
+  "departure_confirm_min": 5,
+  "departure_mic_silence_min": 10
+}
+```
+
+Two things are deliberately absent. The **music follow-out** is not built:
+`spotify.transfer_playback` defaults to `force_play=True`, and an unprompted
+cue that *starts* audio in the pocket of a man walking to his car is far worse
+than a paused song. And the panel does not go to standby — the night surface
+is owned elsewhere, and two features writing one surface is how it ends up
+flickering.
+
+**This is dark until `presence.phone_ip` (or `phone_mac`) is set.** Read the
+lease off the router, or find the phone in `ip -4 neigh` while it is on the
+Wi-Fi. Before tuning the confirm windows, it is worth just watching the
+`presence:` log lines for a couple of days of ordinary coming and going —
+that ledger answers how late arrival detection really is, and how often the
+radio naps, better than any guess.
+
+## 46. Room tone: a house that is audibly awake
+
+Under everything, a bed. One near-subliminal 12-second loop per arc phase:
+pre-dawn is almost nothing, the work hours carry a faint HVAC-and-servers hum,
+dusk warms, night thins to a single low drone. You are meant to notice it only
+when it stops.
+
+**It ships off, and it needs a spoken opt-in:**
+
+```
+"jarvis, room tone on"          "room tone off"          "is the room tone on?"
+```
+
+The switch is Tier 1 and reversible in one utterance, because the failure mode
+of ambience is that it is quietly costing you wake words while you wonder why.
+
+**Mic safety is the design here, not a risk section.** There is no AEC on this
+box, the Snowball shares the room with the speaker, and Jarvis is armed for the
+wake word continuously — so a bed enters *every* capture and puts three
+thresholds that were tuned in a quiet room at risk: the openWakeWord threshold
+(0.3), the Silero endpointer (whose own test asserts that room tone is not
+speech), and the ECAPA speaker gate at 0.30, which has caused total rejection
+once already. "Duck during TTS" does not cover any of that. So:
+
+* the mute is **hard and immediate** — the stream is killed from the caller's
+  own thread, not faded — and it is asserted by the wake word *before* the mic
+  opens, then held through every capture and every spoken reply;
+* the default volume is `0.05`, a placeholder for a number you measure at the
+  Snowball: record the room at a few candidate levels, and require no
+  regression in wake-word false rejects or in the ECAPA similarity
+  distribution before raising it;
+* holds are **named, not counted** — `SpeakingState` streams at ~12 Hz while
+  he talks, so a depth counter would take twelve increments and one decrement
+  per reply and latch the bed off for good. A hold nobody released expires
+  after 90 s, because ambience failing silently until the next restart is the
+  worst way for it to fail.
+
+There is no `pactl` ducking on purpose. We own the process, so muting it
+outright is stronger than lowering its volume and leaves no external state to
+restore — which is also why this has no dependency on a mixer and ships
+standalone.
+
+Silence is a policy as much as a mic concern: the bed is quiet whenever
+`quiet.reason()` is non-empty (quiet hours, DND, a calendar-detected class or
+meeting, an empty house), and a long stretch with no microphone activity stops
+it whatever the phone says — which also lets the Bluetooth speaker sleep.
+
+```jsonc
+"ambience": { "room_tone": false, "volume": 0.05, "away_stop_min": 20 }
+```
+
+Loops are baked once to `MEMORY_DIR/roomtone` from a fixed per-phase seed
+(deterministic: a loop cached last month is the loop this code would make
+today) and streamed raw into a single dedicated `paplay`. Nothing is ever
+synthesized on a tick, and certainly not while Whisper is decoding. The loops
+are periodic by construction — the drone rounded to whole cycles, the air
+built in the frequency domain — so there is no crossfade anywhere and no seam
+to hear.

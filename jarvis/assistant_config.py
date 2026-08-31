@@ -255,7 +255,31 @@ DEFAULTS: dict = {
     # away_after_min is the grace before "out" -- iPhones nap off Wi-Fi for
     # minutes at a time, so anything under ~10 flaps.
     "presence": {"enabled": True, "phone_ip": "", "phone_mac": "",
-                 "away_after_min": 12, "poll_s": 60},
+                 "away_after_min": 12, "poll_s": 60,
+                 # Arrival/departure choreography (jarvis/arrival.py). The
+                 # arrival cue is the ordered sequence panel -> earcon ->
+                 # "Welcome back, sir" -> catch-up; departure is silent by
+                 # design and additionally waits confirm_min past the away
+                 # grace with no mic turn in mic_silence_min, because a
+                 # sleeping phone radio fakes a departure and a wrong one
+                 # would settle the room while he is sitting in it.
+                 "poll_s_away": 10, "arrival_cue": True,
+                 "departure_confirm_min": 5, "departure_mic_silence_min": 10},
+    # The arc (jarvis/arc.py): one name for the hour of the house --
+    # pre-dawn / waking / working / afternoon / dusk / evening / night --
+    # from locally computed sunrise/sunset plus quiet, presence and focus.
+    # A state source only; the consumers are what you hear and see.
+    "arc": {"enabled": True, "tick_s": 60},
+    # Earcons (jarvis/earcons.py): the six-tone family that replaced the
+    # scattered beeps. cooldown_s is shared across ALL causes, so a noisy
+    # room cannot turn a false wake into a metronome.
+    "sound": {"earcons": True, "cooldown_s": 4, "volume": 0.5},
+    # Room tone (jarvis/roomtone.py): a near-subliminal generated bed that
+    # follows the arc. OFF by design -- a continuous bed enters every
+    # capture and the wake word, the endpointer and the ECAPA gate were all
+    # tuned in a quiet room. Turn it on by voice ("room tone on") once you
+    # have measured that it costs nothing at the mic.
+    "ambience": {"room_tone": False, "volume": 0.05, "away_stop_min": 20},
     # The voice path's two latency/feedback policies (jarvis/app.py):
     # speculative_stt decodes the clip during the endpoint silence and reuses
     # the result when no more speech followed; nudge is the short spoken /

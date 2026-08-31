@@ -330,12 +330,17 @@ def test_the_ledger_stamps_a_speculative_stt_honestly():
 
 
 def test_the_beep_kinds_include_the_nudge(monkeypatch, tmp_path):
-    """Sanity for the earcon the nudge policy plays (recorder.play_beep)."""
-    monkeypatch.setattr(recorder_mod.PATHS, "LOG_DIR", tmp_path)
+    """Sanity for the earcon the nudge policy plays (recorder.play_beep).
+
+    The three kinds now resolve into the earcon lexicon (2026-08-30): the
+    WAVs live under MEMORY_DIR/earcons under their lexicon names, and the
+    nudge is "held-back"."""
+    from jarvis import earcons
+    monkeypatch.setattr(earcons.PATHS, "MEMORY_DIR", tmp_path)
     monkeypatch.setattr(recorder_mod, "_BEEP_FILES", {})
     recorder_mod._init_beeps()
     assert set(recorder_mod._BEEP_FILES) == {"start", "stop", "nudge"}
-    assert (tmp_path / "beep_nudge.wav").stat().st_size > 44
+    assert (tmp_path / "earcons" / "held-back.wav").stat().st_size > 44
 
 
 def test_recording_stopped_says_how_the_session_opened(monkeypatch):

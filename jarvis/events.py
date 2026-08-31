@@ -312,3 +312,19 @@ class BriefingReady(Event):
     sections: dict = field(default_factory=dict)
     spoken: str = ""
     turn_id: str = ""                 # see JarvisReply.turn_id
+
+
+@dataclass
+class ArcChanged(Event):
+    """The house moved to a new hour (jarvis/arc.py). `phase` is one of
+    arc.PHASES; `forced` says an override (quiet hours, DND, an empty room,
+    a focus block) named it rather than the sun. Published ONLY on an
+    accepted transition -- never per tick -- so a subscriber may treat every
+    event as a real change. The arc itself does nothing with it: everything
+    that is felt lives in a consumer."""
+    phase: str = ""
+    previous: str = ""
+    since: float = 0.0                # time.time() the phase was adopted
+    forced: bool = False
+    sunrise: float = 0.0              # 0.0 when unknown (no coords, polar)
+    sunset: float = 0.0

@@ -3,7 +3,8 @@
 Ports the audio-critical paths of voice_input_gui.py verbatim (this machine has
 no microphone, so the constants and order of operations must move untouched):
 
-- beep synthesis / playback            (monolith 526-573)
+- beep playback                        (monolith 526-573; the synth itself
+  moved to jarvis/earcons.py on 2026-08-30, see the note above _init_beeps)
 - noise calibration                    (monolith 2262-2340)
 - 1s restart debounce                  (monolith 2360-2364)
 - audio callback + silence detection   (monolith 2403-2434)
@@ -22,20 +23,15 @@ Differences from the monolith, per the V3 spec:
 """
 from __future__ import annotations
 
-import io
-import math
-import struct
-import subprocess
 import os
 import threading
 import time
-import wave
 from collections import deque
 from contextlib import contextmanager
 
 import numpy as np
 
-from jarvis.config import CONFIG, MACHINE, PATHS
+from jarvis.config import CONFIG, MACHINE
 from jarvis.events import (
     AudioLevel,
     MicState,
@@ -61,69 +57,50 @@ MAX_FOLLOWUP_WINDOW_S = MAX_RECORDING_SECONDS / 2
 
 
 # ------------------------------------------------------------------
-# Sound generation (no external files needed) — port of monolith 526-573
+# Non-speech cues — the three historical beeps, now the earcon lexicon
+# (jarvis/earcons.py).  The synth that used to live here (port of monolith
+# 526-573) was retired on 2026-08-30: it and earcons.py were two beep
+# systems with different timbres and envelopes, which is exactly the
+# failure a shared "voice for the room" exists to prevent.
 # ------------------------------------------------------------------
-def _generate_beep(freq=880, duration_ms=120, volume=0.3):
-    """Generate a short beep as WAV bytes."""
-    n_samples = int(SAMPLE_RATE * duration_ms / 1000)
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as w:
-        w.setnchannels(1)
-        w.setsampwidth(2)
-        w.setframerate(SAMPLE_RATE)
-        for i in range(n_samples):
-            t = i / SAMPLE_RATE
-            env = min(i / 200, 1.0) * min((n_samples - i) / 200, 1.0)
-            sample = int(volume * env * 32767 * math.sin(2 * math.pi * freq * t))
-            w.writeframes(struct.pack("<h", max(-32767, min(32767, sample))))
-    return buf.getvalue()
-
-
 _BEEP_FILES: dict[str, str] = {}
 _BEEP_LOCK = threading.Lock()
 
 
 def _init_beeps():
-    """Pre-generate beep WAV files to /tmp (module-owned)."""
+    """Resolve the three historical beep kinds to earcon WAVs.
+
+    These three pitches -- start 880, stop 660, nudge 440 -- were the whole
+    of Jarvis's non-speech vocabulary, and they are a root, a fifth and an
+    octave. jarvis/earcons.py adopted them as its family and re-skinned
+    them with one shared timbre and envelope; this function now only maps
+    the old kind names onto it, so there is exactly ONE beep system rather
+    than two with different accents.
+    """
     with _BEEP_LOCK:
         if _BEEP_FILES:
             return
         try:
-            PATHS.LOG_DIR.mkdir(parents=True, exist_ok=True)
-            start_path = PATHS.LOG_DIR / "beep_start.wav"
-            stop_path = PATHS.LOG_DIR / "beep_stop.wav"
-            # "nudge": the non-verbal "I heard nothing usable" cue the app
-            # plays after a wake-word turn that produced no reply (a rejected
-            # speaker, a second garbled clip). Lower and longer than the
-            # start/stop chimes so it cannot be mistaken for either.
-            nudge_path = PATHS.LOG_DIR / "beep_nudge.wav"
-            if not start_path.exists():
-                start_path.write_bytes(_generate_beep(freq=880, duration_ms=100))
-            if not stop_path.exists():
-                stop_path.write_bytes(_generate_beep(freq=660, duration_ms=150))
-            if not nudge_path.exists():
-                nudge_path.write_bytes(_generate_beep(freq=440, duration_ms=220))
-            _BEEP_FILES["start"] = str(start_path)
-            _BEEP_FILES["stop"] = str(stop_path)
-            _BEEP_FILES["nudge"] = str(nudge_path)
+            from jarvis import earcons
+            for kind in ("start", "stop", "nudge"):
+                path = earcons.render(kind)
+                if path is not None:
+                    _BEEP_FILES[kind] = str(path)
         except Exception:
             log.exception("beep init failed")
 
 
 def play_beep(kind: str):
-    """Play the 'start', 'stop' or 'nudge' beep asynchronously via paplay/aplay."""
-    _init_beeps()
-    path = _BEEP_FILES.get(kind)
-    if not path:
-        return
-    for cmd in [["paplay", path], ["aplay", "-q", path]]:
-        try:
-            subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            return
-        except FileNotFoundError:
-            continue
+    """Play the 'start', 'stop' or 'nudge' cue asynchronously.
+
+    Delegates to the earcon lexicon, which owns the rate limiting and the
+    ``sound.earcons`` gate; the paplay -> aplay chain is unchanged.
+    """
+    try:
+        from jarvis import earcons
+        earcons.play(kind)
+    except Exception:
+        log.exception("beep playback failed")
 
 
 # ------------------------------------------------------------------
