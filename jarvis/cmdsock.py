@@ -273,6 +273,16 @@ class CommandSocket:
             _send(conn, {"kind": "reply", "text": line, "speak": False})
             _send(conn, {"kind": "end", "reason": "done"})
             return
+        # `jarvis board`: the mission-control panel as plain text, printed
+        # rather than spoken. Beside the status case for the same reason --
+        # it is a READ of app state, not a turn, so it must not travel the
+        # dispatch path, be remembered as an exchange, or wake the speaker.
+        if text.lower() in ("board", "the board"):
+            fn = getattr(self.app, "board_text", None)
+            line = fn() if callable(fn) else "board unavailable"
+            _send(conn, {"kind": "reply", "text": line, "speak": False})
+            _send(conn, {"kind": "end", "reason": "done"})
+            return
         log.info("%s: %r%s", source, text, " (quiet)" if quiet else "")
         turn_id = uuid.uuid4().hex[:12]
         with ReplyCollector(turn_id) as col:

@@ -202,6 +202,9 @@ class Reactor(tk.Canvas):
         self._decor_job = None
         self._telemetry_fn = None             # provider callable (main_window)
         self._telem_cache: dict = {}
+        # Standby slows the whole rotation (see set_speed_scale). An int 1
+        # keeps the default arithmetic bit-identical to what it was.
+        self._speed_scale = 1
         self._card_mood = None
         self._rng = random.Random(int(time.monotonic() * 1000))
         # -- living-avatar centerpiece machinery ------------------------
@@ -805,7 +808,8 @@ class Reactor(tk.Canvas):
             if not frames:
                 return
             clock = self._clock
-            clock.set_speed(AV_SPEED.get(state, 1), t_abs)
+            clock.set_speed(AV_SPEED.get(state, 1) * self._speed_scale,
+                            t_abs)
             idx = clock.display_index(t_abs)
             if idx is None:
                 # no tier complete yet: show whatever of the coarsest grid
@@ -1326,7 +1330,6 @@ class Reactor(tk.Canvas):
         if not d:
             return
         cx, cy = d["c"]
-        rs = d["rs"]
         r1, r2 = d["sw_r"]
         head = (t * SWEEP_SPEED) % 360.0
         m = math.radians(head - 90.0)
@@ -1354,6 +1357,23 @@ class Reactor(tk.Canvas):
                 mo[2] = y
                 x = (x0 + math.sin(t * ws + ph) * wa) % mw
                 self.coords(mid, x, y - px(4), x + sz, y - px(4) + sz)
+
+    # ------------------------------------------------------------- speed
+    def set_speed_scale(self, scale) -> None:
+        """Multiply the avatar's rotation speed (1 = the designed pace).
+
+        Standby drives this to ~1/3 so the disc turns slowly when nobody is
+        at the desk. It is the ONLY thing standby changes about the
+        reactor: AvatarClock.set_speed rebases phase0/t_speed0, so the
+        change cannot pop a frame, and NOTHING here re-bakes — the bases
+        are size-dependent (_prerender_all, LEVELS per state colour) and
+        re-rendering them at a mode boundary is the churn class behind the
+        2026-08-26 freeze."""
+        try:
+            scale = float(scale)
+        except (TypeError, ValueError):
+            return
+        self._speed_scale = max(0.05, min(4.0, scale))
 
     # -------------------------------------------------------- telemetry
     def set_telemetry(self, fn):

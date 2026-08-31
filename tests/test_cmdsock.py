@@ -35,6 +35,9 @@ class FakeApp:
     def diagnostics_text(self):
         return "All systems nominal, sir."
 
+    def board_text(self):
+        return "VITALS\n  MEMORY     80G free of 120G"
+
     def dispatch_text(self, text, source="typed", quiet=False, turn_id=""):
         self.calls.append((text, source, quiet))
         self.turn_id = turn_id            # the real app stamps replies with it
@@ -87,6 +90,16 @@ def test_status_answers_with_diagnostics_and_no_dispatch(server):
     msgs = _run(server.sock, "status")
     assert msgs == [{"kind": "reply", "text": "All systems nominal, sir.", "speak": False},
                     {"kind": "end", "reason": "done"}]
+    assert server.app.calls == []
+
+
+def test_board_prints_the_panel_and_never_travels_the_turn_path(server):
+    """`jarvis board` is a READ of app state, not a turn: it must not
+    dispatch, be remembered as an exchange or wake the speaker."""
+    msgs = _run(server.sock, "board")
+    assert msgs[0]["kind"] == "reply" and msgs[0]["speak"] is False
+    assert "VITALS" in msgs[0]["text"]
+    assert msgs[-1] == {"kind": "end", "reason": "done"}
     assert server.app.calls == []
 
 

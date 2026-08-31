@@ -238,6 +238,23 @@ def clear_cache() -> None:
         _CACHE.clear()
 
 
+def cached_temperature() -> Optional[str]:
+    """The current temperature ALREADY in the cache ('72°'), else None.
+
+    Read-only and NON-FETCHING on purpose. The console's ambient slab wants
+    a number to show while the room is quiet, not a reason to call
+    open-meteo every time nobody is talking; when nothing has been fetched
+    yet the row simply does not appear. Newest cache entry wins, which on a
+    single-location box is the only entry."""
+    with _CACHE_LOCK:
+        entries = sorted(_CACHE.values(), key=lambda kv: kv[0], reverse=True)
+    for _at, data in entries:
+        temp = _rnd(((data or {}).get("current") or {}).get("temperature_2m"))
+        if temp is not None:
+            return f"{temp}°"
+    return None
+
+
 def coerce_when(value) -> str:
     """Loose model values -> one of WHENS ("this week" -> "week")."""
     text = " ".join(str(value or "").split()).lower().strip(" .?!")

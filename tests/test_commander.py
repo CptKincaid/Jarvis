@@ -1458,6 +1458,82 @@ def test_no_active_project_means_no_file_and_the_project_line(rich, services, cl
     assert _clip_files(clip_project.path) == []
 
 
+# --------------------------------------------------------------- the Board
+@pytest.fixture
+def board_svc(rich, services):
+    """services.board as the app wires it: show/hide reach the window over
+    the bus, read() answers with the panel's one-line spoken state."""
+    svc = types.SimpleNamespace(shown=0, hidden=0, asked=[])
+
+    def show():
+        svc.shown += 1
+        return svc.shown > 1                 # True == it was already up
+
+    def hide():
+        svc.hidden += 1
+        return True
+
+    def read(panel):
+        svc.asked.append(panel)
+        return ("Two tasks running, sir." if "session" in panel else "")
+
+    services.board = types.SimpleNamespace(show=show, hide=hide, read=read)
+    return svc
+
+
+def test_bring_up_the_board_raises_it_and_says_so(rich, board_svc):
+    res = rich.handle("bring up the board", source="voice")
+    assert res.handled and res.speak and board_svc.shown == 1
+    assert res.reply == "The board, sir."
+
+
+def test_asking_twice_does_not_pretend_it_just_appeared(rich, board_svc):
+    rich.handle("show me the board", source="voice")
+    res = rich.handle("board up", source="voice")
+    assert res.reply == "Already up, sir." and board_svc.shown == 2
+
+
+def test_close_the_board_takes_it_down(rich, board_svc):
+    res = rich.handle("close the board", source="voice")
+    assert res.handled and board_svc.hidden == 1
+    assert res.reply == "Board down, sir."
+
+
+def test_focus_on_a_panel_speaks_its_state_rather_than_lighting_it(
+        rich, board_svc):
+    res = rich.handle("focus on the sessions", source="voice")
+    assert res.reply == "Two tasks running, sir." and res.speak
+    assert board_svc.asked == ["sessions"]
+
+
+def test_focus_on_something_that_is_not_a_panel_stays_with_its_old_owner(
+        rich, board_svc):
+    """The bare word "focus" belongs to the voice-targeting chain, and
+    "focus session on the thesis" to the pomodoro. Only a name that
+    RESOLVES to a panel is carved out of that chain, so an unrelated
+    "focus on ..." reaches neither the board nor a wrong answer."""
+    res = rich.handle("focus on the thesis", source="typed")
+    assert board_svc.asked == []
+    assert res.status == "Target: on the thesis"
+
+
+def test_a_board_that_refuses_to_raise_says_so_instead_of_failing(
+        rich, services):
+    def boom():
+        raise RuntimeError("no display")
+    services.board = types.SimpleNamespace(show=boom, hide=lambda: True,
+                                           read=lambda p: "")
+    res = rich.handle("bring up the board", source="voice")
+    assert res.handled and "couldn't raise the board" in res.reply
+
+
+def test_without_the_board_service_the_verb_is_simply_not_claimed(rich,
+                                                                  services):
+    services.board = None
+    res = rich.handle("bring up the board", source="typed")
+    assert res.status != "Board"
+
+
 def test_a_manager_refusal_is_spoken_as_is(rich, services, clip_project):
     services.claude.submit.return_value = "Claude's still on the last one for proj, sir; I've queued it."
     res = rich.handle("have claude fix what i copied", source="typed")
@@ -1478,6 +1554,9 @@ TIER1_SAMPLES = {
     "review flashcards": "review my flashcards",
     "stop quiz": "stop the quiz",
     "teach me": "teach me biosensors",
+    "board show": "bring up the board",
+    "board hide": "close the board",
+    "board focus": "focus on the sessions",
     "focus start": "start a focus session",
     "focus left": "how long left",
     "focus end": "end the session",

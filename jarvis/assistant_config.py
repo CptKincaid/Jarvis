@@ -286,6 +286,22 @@ DEFAULTS: dict = {
     # earcon cue after a wake-word turn that produced nothing to answer,
     # at most once per nudge_cooldown_s.
     "listening": {"speculative_stt": True, "nudge": True, "nudge_cooldown_s": 30},
+    # The console's surfaces (jarvis/ui/console_mode.py, jarvis/ui/board.py).
+    # board: allow "bring up the board", the docked mission-control panel on
+    # the empty right flank. ambient/standby: between conversations the
+    # console shows one room-state slab, and after standby_after_min away
+    # from the keyboard it becomes the room's clock. standby_dim is the
+    # BRIGHTNESS FLOOR, and it is a canvas-colour blend inside our own
+    # window -- nothing here touches xrandr gamma or the desktop's
+    # brightness, so a crash cannot leave the panel dark. drift_px_per_min
+    # walks the window slowly so a static clock cannot burn in. powerup: the
+    # staged sweep the first time he sits down after an overnight gap, at
+    # most once a day (the date latch lives beside the briefing's, in
+    # briefing_state.json).
+    "console": {"board": True, "ambient": True, "standby": True,
+                "ambient_after_s": 45, "standby_after_min": 12,
+                "standby_dim": 0.35, "drift_px_per_min": 3,
+                "powerup": True, "powerup_gap_h": 6},
     # Phone intercom (jarvis/intercom.py): a recorded clip sent over the
     # command socket instead of a wake word. verify_speaker runs the same
     # ECAPA gate the microphone path uses -- off by default because the
