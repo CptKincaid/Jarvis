@@ -3040,4 +3040,141 @@ mem = JarvisMemory()
 print({k: v for k, v in mem.get_all_preferences().items()
        if k.startswith("leave_lead.")})
 EOF
+## 44. The pre-class dossier and class-start staging
+
+Two things that happen on their own around a lecture. Both hang off the
+same idea: **a course is a calendar slot, not a Canvas course**. Canvas
+cannot name your courses here — `canvas.token` is empty, and
+`cached_course_names()` is read-only by design so the transcriber can never
+trigger a fetch — so `jarvis/courses.py` reads identity off the calendar
+instead: a timed title seen at the same weekday and clock time on two or
+more distinct dates is a class. On the live cache that is exactly
+BIOSENSORS, MAGNETIC RESONANCE ENGR and ELECTRICAL DESIGN LAB II, and none
+of the one-off appointments.
+
+### At T-10: the dossier
+
+You used to hear "BIOSENSORS in 10 minutes" and nothing else. Now:
+
+> Your 9:10 is BIOSENSORS, Wisenbaker 049, sir. Last time you noted
+> electrode drift; Lab 3 report is due Thu 11:59 pm, and there's unread
+> mail from Priya.
+
+…and one card on the HUD:
+
+```
+CALENDAR   9:10 — BIOSENSORS
+ROOM       College Station Wisenbaker Engineering Bldg 049
+LAST TIME  electrode drift (biosensors-2026-08-26.md)
+DUE        Lab 3 report — Thu 11:59 pm
+MAIL       Priya — Lab 3 questions
+```
+
+Where the event's location is a URL — your Thursday Zoom is exactly that —
+the card carries a **JOIN** row with the link instead of a room, and he
+says "the link's on the card" rather than reading a URL aloud.
+
+Every section is optional and is simply absent when its source is. Today
+three of the four are dark: `~/Documents` does not exist, so there are no
+previous notes to find, and `canvas.token` is empty, so there are no
+deadlines. The room alone is still worth the line. Fill either one in and
+that section starts appearing with no further setup.
+
+```jsonc
+"dossier": {
+  "enabled": true,      // false: back to the bare "TITLE in ten minutes"
+  "lead_min": 10,       // how early the line lands
+  "notes": true,        // the LAST TIME row (reads the notes folder)
+  "mail": true,         // the MAIL row (one IMAP pass, on a worker thread)
+  "mail_hours": 72,     // how far back an unread message still counts
+  "due_days": 7,        // the Canvas window for the DUE rows
+  "budget_s": 25        // hard cap on the whole gather
+}
+```
+
+Mail has to clear two bars, not one: the sender must be someone in your
+people book ("my advisor", "Mom" — see section 22) **and** the course must
+be named in the subject or the snippet. A newsletter with "biosensors" in
+the subject line is not news.
+
+The line is proactive, so quiet hours and do-not-disturb hold it for the
+catch-up digest like everything else he decides to say on his own (section
+34). The card is published either way.
+
+### At the hour: the desk is already set
+
+The moment the class starts, without a word:
+
+* today's notes file exists at `<docs folder>/notes/<course>-<date>.md`
+  with its dated header — the page is open, nothing is being recorded;
+* the music is paused, and comes back when the class ends;
+* the card reads `BIOSENSORS staged — notes ready`.
+
+```jsonc
+"class_flow": {
+  "enabled": true,
+  "auto_notes": false,  // arm voice capture for the hour (see below)
+  "open_notes": false,  // xdg-open the file as well
+  "duck_music": true,   // pause Spotify for the class, resume at the end
+  "idle_min": 15        // how long away from the keyboard still counts as here
+}
+```
+
+Two of those are off on purpose:
+
+* **`auto_notes`.** `LectureNotes.add()` appends every accepted utterance
+  to disk. Arming that from a calendar tick would record a room you never
+  agreed to record, so it is yours to switch on — and when you do, Jarvis
+  says "Taking notes for BIOSENSORS, sir" out loud, so nobody in the room
+  is being written down silently. It closes itself at the end of the hour.
+* **`open_notes`.** Opening an editor means a new window on `:1`, and
+  window churn is what froze this desktop on 2026-08-26. Everything of
+  value — a primed, dated file and quiet music — costs zero windows.
+
+Neither needs a config edit in the moment: "notes for biosensors" (section
+18) arms capture on the file that is already sitting there, one sentence
+away, and closes it with "end notes".
+
+**Nothing is staged into an empty room.** The phone-presence sentinel
+cannot help here (`presence.phone_ip` is empty, so it never starts), so the
+gate is the real one: `XScreenSaverQueryInfo` on `:1` reports true idle
+milliseconds — keyboard and mouse, no sudo, no extra hardware — and falls
+back to the timestamp of your last turn in `turns.jsonl`. If nothing can
+measure it at all it fails **open** and stages anyway; a gate that says
+"away" on a box it cannot read is the inert gate this replaces. Walk in two
+minutes late and it still stages: a refused gate is not remembered, and the
+offer stands for five minutes.
+
+Do-not-disturb, quiet hours and being out stop it. A running calendar event
+does **not** — because with course detection now feeding `quiet.py` the
+class itself is a quiet window, and a gate the event trips the instant it
+starts would never let the stager run.
+
+Everything it changes is written down and put back: at the end of the
+event, at quit, if the staging itself fails halfway, and at the first wake
+word after the class is over (the safety net for an end tick that never ran
+because Jarvis was down). Never mid-lecture — the music is meant to stay
+down for the hour.
+
+### The bug this fixed on the way past
+
+`quiet.calendar_keywords` is `class / exam / meeting / busy`, matched as
+whole words against the event title. None of your courses is *called* any
+of those, so the calendar leg of quiet hours had never once fired. A
+recurring course now counts as a running class whatever it is named
+(`quiet.calendar_courses`, on by default; set it false for the old
+keyword-only behaviour).
+
+```bash
+# what he thinks your courses are, read-only, no network
+cd ~/Jarvis && ~/vss_env/bin/python - <<'PY'
+import json
+from jarvis import courses
+from jarvis.tools.calendar import Event
+from jarvis.tools.location import cache_dir
+d = json.loads((cache_dir() / "calendar_cache.json").read_text())
+evs = [Event.from_dict(e) for v in d["sources"].values()
+       for e in v.get("events", [])]
+print(courses.recurring_courses(evs))
+PY
 ```

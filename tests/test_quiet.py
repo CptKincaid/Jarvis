@@ -180,6 +180,42 @@ def test_calendar_keywords_match_whole_words_and_skip_all_day_and_future():
     assert _policy(get_calendar=lambda: cal2).is_quiet()
 
 
+def test_a_recurring_course_is_quiet_even_though_it_is_called_no_such_thing():
+    """The shipped keyword list -- class / exam / meeting / busy -- matches
+    none of his course titles, so the calendar leg had never once fired for
+    him. A title at the same weekday and clock time on two weeks IS a class
+    (jarvis/courses.py)."""
+    running = _ev("BIOSENSORS", NOON - timedelta(minutes=30))
+    same_slot_next_week = _ev("BIOSENSORS", NOON - timedelta(minutes=30) +
+                              timedelta(days=7))
+    cal = FakeCal(running, same_slot_next_week)
+    assert _policy(get_calendar=lambda: cal).reason() == "BIOSENSORS until 12:30 pm"
+
+
+def test_a_one_off_appointment_is_still_not_a_class():
+    cal = FakeCal(_ev("Chiro", NOON - timedelta(minutes=30)))
+    assert not _policy(get_calendar=lambda: cal).is_quiet()
+
+
+def test_the_course_leg_can_be_switched_off_on_its_own():
+    cal = FakeCal(_ev("BIOSENSORS", NOON - timedelta(minutes=30)),
+                  _ev("BIOSENSORS", NOON - timedelta(minutes=30) + timedelta(days=7)))
+    off = _policy(FakeCfg({"quiet": {"calendar_courses": False}}),
+                  get_calendar=lambda: cal)
+    assert not off.is_quiet()
+
+
+def test_reason_without_the_calendar_leg_ignores_the_running_event():
+    """What the class stager asks: it is acting ON the running event, so a
+    gate the event itself trips would never let it fire."""
+    cal = FakeCal(_ev("BIOSENSORS class", NOON - timedelta(minutes=30)))
+    p = _policy(get_calendar=lambda: cal)
+    assert p.reason() and p.reason(calendar=False) == ""
+    dnd = _policy(FakeCfg({"quiet": {"dnd_until": NOON.timestamp() + 600}}),
+                  get_calendar=lambda: cal)
+    assert dnd.reason(calendar=False).startswith("do not disturb")
+
+
 def test_calendar_block_can_be_switched_off_and_a_broken_calendar_is_ignored():
     cal = FakeCal(_ev("Exam", NOON - timedelta(minutes=5)))
     off = _policy(FakeCfg({"quiet": {"calendar": False}}), get_calendar=lambda: cal)

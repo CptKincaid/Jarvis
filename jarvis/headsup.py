@@ -28,9 +28,15 @@ HORIZON_MIN = 90
 class MeetingHeadsUp:
     def __init__(self, get_calendar: Callable, timekeeper, lead_min: int = 10,
                  state_path: Optional[Path] = None, now: Callable = None,
-                 horizon_min: int = HORIZON_MIN):
+                 horizon_min: int = HORIZON_MIN,
+                 skip: Optional[Callable] = None):
         self._get_calendar = get_calendar
         self._tk = timekeeper
+        # An event someone else speaks for. The pre-class dossier
+        # (jarvis/dossier.py) says a great deal more than "BIOSENSORS in ten
+        # minutes" at the same moment, and both firing would say the title
+        # twice; when the dossier is off this is None and nothing changes.
+        self._skip = skip
         self.lead_min = max(1, int(lead_min or 10))
         self.horizon_min = horizon_min
         self._state_path = Path(state_path) if state_path else None
@@ -103,6 +109,12 @@ class MeetingHeadsUp:
             key = f"{title}|{start.isoformat()}"
             if key in self._filed:
                 continue
+            if self._skip is not None:
+                try:
+                    if self._skip(ev):
+                        continue
+                except Exception:          # noqa: BLE001 - owner boundary
+                    log.debug("headsup: skip check failed", exc_info=True)
             due = start - lead
             if due <= now:                       # inside the lead already: say so now
                 due = now + timedelta(seconds=5)

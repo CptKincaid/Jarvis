@@ -6249,6 +6249,73 @@ class Commander:
         it as the answer both loses the command and marks a card wrong.
         The stop words are honoured from any source so a terminal can end a
         quiz it can see in "status".
+
+        Stop words end the quiz with the tally; skip words reveal the
+        answer and move on; a fresh "quiz me" / "review my flashcards"
+        drops the session for the new one; "quiet" ends it silently. A
+        question older than ANSWER_WINDOW_S is not what he is answering:
+        the session is dropped and the text routes as a new subject.
+        Grading: the string match first (no model round trip for "forty
+        percent"), the model only for the unclear ones, and a shrug that
+        names the answer when neither can tell."""
+        session = getattr(self, "_pending_quiz", None)   # a slim test commander has no quiz
+        if session is None:
+            return None
+        t = (strip_jarvis_prefix(text) or text).strip()
+        tl = t.lower().rstrip(".!?")
+        if session.stale() or session.finished or quiz_kind(tl) or review_kind(tl):
+            self._pending_quiz = None
+            return None
+        if quiet_kind(t) or cancel_kind(t):
+            self._pending_quiz = None
+            _cut_speech(self)
+            return CommandResult(handled=True, reply="Very good, sir.", speak=False,
+                                 status="Quiz stopped")
+        if _QUIZ_STOP_RX.match(t):
+            self._pending_quiz = None
+            return CommandResult(handled=True, reply=session.score_line(), speak=True,
+                                 status="Quiz stopped")
+        if source != "voice":
+            return None            # not the answer: route it as a command
+        card = session.current
+        if _QUIZ_SKIP_RX.match(tl):
+            session.settle(None)
+            line = quiz_mod.SKIP_LINE.format(answer=card["answer"])
+        else:
+            verdict = quiz_mod.grade_by_string(card["answer"], t)
+            note = ""
+            if verdict is None:
+                brain = self._svc("brain")
+                if brain is not None and hasattr(brain, "grade_answer"):
+                    try:
+                        graded = brain.grade_answer(card["question"], card["answer"], t)
+                    except Exception:
+                        log.exception("grade_answer failed")
+                        graded = None
+                    if graded:
+                        verdict, note = bool(graded[0]), str(graded[1] or "")
+            if verdict is None:
+                session.settle(None)
+                line = quiz_mod.UNSURE_LINE.format(answer=card["answer"])
+            else:
+                try:
+                    _quiz_store(self).record(card["id"], verdict)
+                except Exception:
+                    log.exception("flashcard record failed")
+                session.settle(verdict)
+                if verdict:
+                    line = random.choice(quiz_mod.CORRECT_LINES)
+                else:
+                    line = note or quiz_mod.WRONG_LINE.format(answer=card["answer"])
+                    if "answer" not in line.lower() and card["answer"].lower() not in line.lower():
+                        line = quiz_mod.WRONG_LINE.format(answer=card["answer"])
+        if session.finished:
+            self._pending_quiz = None
+            return CommandResult(handled=True, reply=f"{line} {session.score_line()}",
+                                 speak=True, status="Quiz finished")
+        return CommandResult(handled=True, reply=f"{line} {session.ask()}", speak=True,
+                             status=f"Quiz {session.index + 1}/{session.total}")
+
     def _try_leave_answer(self, text: str) -> Optional[CommandResult]:
         """Answer the once-ever "how long do you need to get to X, sir?".
 

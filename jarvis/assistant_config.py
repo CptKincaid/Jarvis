@@ -240,9 +240,13 @@ DEFAULTS: dict = {
     # timestamps he sets himself ("do not disturb for an hour", "I am free");
     # calendar: a running timed event whose title contains one of the
     # keywords also holds proactive speech; hold_when_away needs presence.
+    # calendar_courses: a recurring course also counts as a running class
+    # even when its title matches no keyword (jarvis/courses.py) -- without
+    # it the calendar leg never fired, because no course of his is CALLED
+    # "class".
     "quiet": {"hours": {"start": "", "end": ""}, "dnd_until": 0, "free_until": 0,
               "calendar": True, "calendar_keywords": ["class", "exam", "meeting", "busy"],
-              "hold_when_away": True},
+              "calendar_courses": True, "hold_when_away": True},
     # Background watchers (jarvis/grades.py, mailwatch.py, keyword_watch.py):
     # unprompted lines, all held by the quiet policy. grades diffs the Canvas
     # course totals every 15 min; people_mail speaks unread mail from someone
@@ -289,6 +293,24 @@ DEFAULTS: dict = {
             ],
         },
     },
+    # The pre-class dossier (jarvis/dossier.py): at lead_min before a class,
+    # ONE spoken line and one card with the room (or the join link), the
+    # last lecture notes, that course's deadlines and the unread mail about
+    # it. Every section is optional; each one is skipped when its source is
+    # missing, so a box with no notes folder and no Canvas token still gets
+    # "Your 9:10 is BIOSENSORS, Wisenbaker 049, sir." budget_s caps the
+    # whole gather (IMAP + Canvas), which runs on a worker thread.
+    "dossier": {"enabled": True, "lead_min": 10, "notes": True, "mail": True,
+                "mail_hours": 72, "due_days": 7, "budget_s": 25},
+    # Class-start staging (jarvis/classflow.py): at the start of a recurring
+    # class, prime today's notes file, put the music down and show a card.
+    # auto_notes arms voice capture for the hour and is OFF by default --
+    # it records the room, so it is his to switch on; open_notes shells out
+    # to xdg-open and is off because window churn froze the desktop once.
+    # idle_min is how long he may have been away from the keyboard and
+    # still count as at the desk (jarvis/desk.py).
+    "class_flow": {"enabled": True, "auto_notes": False, "open_notes": False,
+                   "duck_music": True, "idle_min": 15},
     # Presence (jarvis/presence.py): the phone's Wi-Fi address and/or MAC.
     # away_after_min is the grace before "out" -- iPhones nap off Wi-Fi for
     # minutes at a time, so anything under ~10 flaps.

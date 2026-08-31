@@ -3354,14 +3354,13 @@ class JarvisApp:
                     sampler.start()
                 except Exception:
                     log.exception("activity sampler failed to start")
-        for name, obj in (("presence", self.presence), ("quiet", self.quiet),
-                          # arc after both: its first tick should see the
+        for name, obj in (("presence", self.presence), ("desk", self.desk),
+                          ("quiet", self.quiet),
+                          # arc after those: its first tick should see the
                           # real quiet reason and presence state, not the
                           # "unknown" a sentinel reports before its first probe.
                           ("arc", self.arc), ("roomtone", self.roomtone),
                           ("mixer", self.mixer)):
-        for name, obj in (("presence", self.presence), ("desk", self.desk),
-                          ("quiet", self.quiet)):
             if obj is None:
                 continue
             try:
@@ -3378,16 +3377,46 @@ class JarvisApp:
                 log.info("room: a previous run's display change was restored")
             except Exception:
                 log.exception("room light restore at boot failed")
+        # The pre-class dossier is built BEFORE the meeting heads-up so the
+        # heads-up can stand down for the events it speaks for: both fire at
+        # T-lead, and "BIOSENSORS in ten minutes" on top of the dossier would
+        # say the title twice.
+        try:
+            from jarvis.dossier import ClassDossier
+            self.dossier = ClassDossier(
+                self.assistant, self.timekeeper,
+                get_calendar=lambda: getattr(self.services, "calendar", None),
+                services=self.services,
+                lead_min=int(self.assistant.get("dossier.lead_min", 10) or 10),
+                state_path=PATHS.MEMORY_DIR / "dossier_state.json")
+            if self.timekeeper is not None:
+                self.dossier.start()
+        except Exception:
+            log.exception("class dossier failed to start")
         try:
             from jarvis.headsup import MeetingHeadsUp
             lead = int(self.assistant.get("calendar.heads_up_min", 10) or 10)
+            dossier = getattr(self, "dossier", None)
             self.headsup = MeetingHeadsUp(lambda: getattr(self.services, "calendar", None),
                                           self.timekeeper, lead_min=lead,
-                                          state_path=PATHS.MEMORY_DIR / "headsup_state.json")
+                                          state_path=PATHS.MEMORY_DIR / "headsup_state.json",
+                                          skip=None if dossier is None else dossier.owns)
             if self.timekeeper is not None:
                 self.headsup.start()
         except Exception:
             log.exception("meeting heads-up failed to start")
+        try:
+            from jarvis.classflow import ClassStager
+            self.classflow = ClassStager(
+                self.assistant,
+                get_calendar=lambda: getattr(self.services, "calendar", None),
+                services=self.services,
+                get_commander=lambda: self.commander,
+                state_path=PATHS.MEMORY_DIR / "classflow_state.json",
+                turns_path=PATHS.LOG_DIR / "turns.jsonl")
+            self.classflow.start()
+        except Exception:
+            log.exception("class stager failed to start")
         try:
             from jarvis.deadlines import DeadlineHeadsUp
             hours = self.assistant.get("canvas.heads_up_hours", 3)
@@ -3617,6 +3646,11 @@ class JarvisApp:
                           ("debrief", getattr(self, "debrief", None)),
                           ("leavetime", getattr(self, "leavetime", None)),
                           ("calwatch", getattr(self, "calwatch", None)),
+                          ("dossier", getattr(self, "dossier", None)),
+                          # stop() also puts the music back and closes any
+                          # auto-armed lecture notes: quit must not leave
+                          # the desk staged.
+                          ("classflow", getattr(self, "classflow", None)),
                           ("focus", getattr(self, "focus", None)),
                           ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),
