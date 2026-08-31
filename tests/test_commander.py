@@ -1486,6 +1486,7 @@ TIER1_SAMPLES = {
     "lecture notes": "notes for biosensors",
     "timer": "set a timer for five minutes",
     "alarm": "set an alarm for seven",
+    "no asides": "no more asides",
     "list schedule": "any timers running",
     "cancel schedule": "cancel the timer",
     "briefing": "give me my briefing",
