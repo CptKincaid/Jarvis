@@ -1258,3 +1258,149 @@ print("missing:", cfg.missing_sections())
 import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •••
 EOF
 ```
+
+## 40. Working sessions: "let us plan the week"
+
+Say **"let's plan the week"** (or "plan my week", "sort out my week") and he
+walks this week's Canvas deadlines and open to-dos one at a time, proposing
+a day and an hour for each:
+
+> — Lab 3 report for BIOSENSORS — Tuesday at four?
+> — Move that to Thursday.
+> — Thursday instead. Buy milk — Tuesday at four?
+> — Skip it.
+> — That's enough.
+> — That's the week, sir: Thursday at four, the Lab 3 report. I've set a
+>   reminder for each.
+
+The four answers are **yes** (any of "yes / sure / go on / that works /
+book it"), **a day** ("move that to Thursday", or just "Thursday"), **skip
+it** ("no / skip / leave it / pass") and **that's enough** ("that'll do",
+"we're done"), and none of them needs the wake word. Say anything else —
+"what's the weather?" — and the session ends and your words are answered as
+a normal command; nothing traps you in a dialogue.
+
+What he writes: one **timekeeper reminder** per accepted slot, five minutes
+before the hour, and nothing else. No calendar events — a plan built in
+ninety seconds should stay cheap to undo. Cancel one the usual way
+("cancel the reminder about the lab report").
+
+Two behaviours worth knowing:
+
+- The mic stays open ~18 s between turns of a session, rather than the
+  usual 4 s follow-up window. That is the only reason a two-clause answer
+  like "or push it to Wednesday" is possible at all.
+- If you walk away, the session goes stale after 90 seconds and the next
+  thing you say is a fresh command.
+
+He refuses to start a session while dictation or lecture notes are open
+("I can't plan while I'm taking notes, sir") — those modes swallow every
+utterance, so the question could never be answered.
+
+The machinery underneath (`jarvis/dialogue.py`) is a small protocol —
+`ask` / `settle` / `stop` / `stale` / `finished` — that any future
+multi-turn feature can rent. The week planner is its first tenant.
+
+
+## 41. The fault lane: he tells you once, and the board remembers
+
+The health watchdog already knew when memory was tight or two processes
+were eating the unified pool. The problem was that it said so into a
+four-second toast: a warning raised while you were out of the room left no
+trace at all.
+
+Now the engine card carries a **FAULT** row. It reads `--` almost always,
+and when it does not it holds a short token until the fault actually
+clears:
+
+```
+HEAR    SMALL
+SPEAK   F5 · LOCAL
+THINK   GEMMA4
+DEVICE  GB10
+FAULT   2 TRAINERS
+```
+
+Ask **"what's wrong"** (or "anything wrong", "what's the matter") and he
+reads the live fault back with how long it has been standing. With the
+board clear, that same question falls straight through to the existing log
+triage, so it is never a dead end.
+
+The new rule behind the token: **two distinct training runs on the pool at
+once** — the exact shape of the 2026-08-28 hard power-off. It counts runs,
+not processes, so a `torchrun` job spread over four workers is one run and
+says nothing; `train.py` alongside `finetune_piper.py` is two, and raises
+one error naming both.
+
+He says each fault **once**. The watchdog's own latches handle the repeat
+within a session; `~/.aiws_trainer/jarvis_memory/faults.json` handles it
+across restarts, so starting Jarvis while the pool is still tight does not
+re-announce the same episode. When the fault clears, that entry is dropped
+and the next occurrence is news again.
+
+Thresholds are the existing `health` block — nothing new to configure:
+
+```json
+"health": {"warn_gb": 16, "critical_gb": 8, "hog_gb": 20, "interval_s": 30}
+```
+
+
+## 42. The run ledger: "that's done, sir; twenty-two minutes"
+
+Start a training run and, until now, the room went quiet for the twenty
+minutes that mattered. The run ledger gives a run two beats and an honest
+duration:
+
+> Your finetune_piper.py has started, sir; I'll tell you when it's done.
+> …
+> That's your finetune_piper.py done, sir; 22 minutes.
+
+The start time is read from `/proc/<pid>/stat`, not from when Jarvis
+happened to look — so a run that was already going when you restarted him
+still reports its true age. A run shorter than a minute is recorded but
+not announced (that was a crash or a typo). A trainer that respawns between
+epochs is not announced as finished: it has to be gone for two ticks.
+
+If you have `health.yield_to_trainer` on, the two beats are folded INTO the
+lines you already get, so the count of spoken lines per run does not go up
+— the reclaim line simply carries the duration ("Your trainer has finished,
+sir; that took 22 minutes.").
+
+Say **"quietly please"** (also "keep it down", "stop narrating") to hold
+the narration for the run in progress. It lifts by itself when that run
+ends; there is nothing left switched off.
+
+### Epoch narration (opt-in, needs a wrapper)
+
+He cannot read a trainer's output on his own: `/proc/<pid>/fd/1` on a real
+run is a socket or a pty, and his own log knows nothing about epochs. Start
+runs through the wrapper instead:
+
+```bash
+scripts/runlog.sh python train.py --epochs 20
+```
+
+It tees stdout to `~/.cache/jarvis/runs/<pid>.log` — the trainer keeps the
+wrapper's pid, so the filename is the one Jarvis sees in `/proc` — and
+prunes logs older than a week. Then turn it on:
+
+```json
+"runwatch": {
+  "narrate": true,
+  "progress": true,
+  "log_dir": "~/.cache/jarvis/runs",
+  "min_run_s": 60,
+  "progress_gap_s": 300
+}
+```
+
+> Epoch 4, sir; the loss is still falling.
+
+At most one such line every five minutes, and only when the epoch number
+actually **changed** — never a heartbeat. "The loss is still falling" is
+said only when two readings actually support it. Set `narrate: false` to
+keep the ledger (and the board's lane) while saying nothing at all.
+
+All of this rides the health watchdog's existing 30-second tick. There is
+no extra thread and no `nvidia-smi` call — the wedge these features exist
+to warn about is precisely the state in which `nvidia-smi` blocks forever.
