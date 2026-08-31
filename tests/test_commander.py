@@ -1150,12 +1150,18 @@ def _pending(services, title="Lab presentation"):
     return cal
 
 
+def _fake_add(cal, undo=None):
+    """Stand in for calendar.add_event -> (line, undo)."""
+    def _add(cals, title, s, e, calendar_name=None):
+        cal.written.append(title)
+        return f"Added {title}, sir.", (undo or (lambda: "Taken back, sir."))
+    return _add
+
+
 def test_yes_writes_the_event_that_was_read_back(cmdr, services, monkeypatch):
     cal = _pending(services)
     import jarvis.commander as cmd_mod
-    monkeypatch.setattr(cmd_mod, "write_event",
-                        lambda cals, title, s, e, calendar_name=None:
-                        (cal.written.append(title), f"Added {title}, sir.")[1])
+    monkeypatch.setattr(cmd_mod, "add_event", _fake_add(cal))
 
     res = cmdr.handle("yes", "voice")
 
@@ -1164,10 +1170,76 @@ def test_yes_writes_the_event_that_was_read_back(cmdr, services, monkeypatch):
     assert cal.pending_event is None, "the offer must not linger"
 
 
+def test_scratch_that_takes_the_event_back_off_the_calendar(cmdr, services,
+                                                            monkeypatch):
+    """The add used to be add-only, so "scratch that" fell through in
+    silence -- which reads as success while the event sits in his calendar."""
+    cal = _pending(services)
+    removed = []
+    import jarvis.commander as cmd_mod
+    monkeypatch.setattr(cmd_mod, "add_event",
+                        _fake_add(cal, undo=lambda: removed.append(1) or
+                                  "Taken back off your calendar, sir."))
+    cmdr.handle("yes", "voice")
+
+    res = cmdr.handle("scratch that", "voice")
+
+    assert removed == [1]
+    assert res.handled and "Taken back" in res.reply
+
+
+def test_scratch_that_reaches_an_add_made_through_the_tool(cmdr, services):
+    """The confident path writes from inside the TOOL and parks its undo on
+    the calendar source; a ToolResult has no undo slot to carry one."""
+    import time as _time
+    removed = []
+    services.calendar = types.SimpleNamespace(
+        pending_event=None,
+        last_add={"undo": lambda: removed.append(1) or "Taken back off your "
+                                                       "calendar, sir.",
+                  "at": _time.monotonic(), "title": "Standup"})
+
+    res = cmdr.handle("scratch that", "voice")
+
+    assert removed == [1] and "Taken back" in res.reply
+    assert services.calendar.last_add is None, "a second scratch must not repeat it"
+
+
+def test_a_stale_calendar_add_is_not_undone_by_a_later_scratch(cmdr, services):
+    """A minute later "scratch that" is about something else entirely."""
+    import time as _time
+    removed = []
+    services.calendar = types.SimpleNamespace(
+        pending_event=None,
+        last_add={"undo": lambda: removed.append(1) or "gone",
+                  "at": _time.monotonic() - commander.UNDO_WINDOW_S - 1,
+                  "title": "Standup"})
+
+    cmdr.handle("scratch that", "voice")
+
+    assert removed == []
+
+
+def test_an_add_the_server_cannot_undo_says_so(cmdr, services, monkeypatch):
+    """calendar._undo_add's third outcome: no delete path, so the honest
+    answer is that it cannot be taken back -- never a bare "done"."""
+    from jarvis.tools.calendar import CANNOT_UNDO_LINE
+    cal = _pending(services)
+    import jarvis.commander as cmd_mod
+    monkeypatch.setattr(cmd_mod, "add_event", _fake_add(
+        cal, undo=lambda: CANNOT_UNDO_LINE.format(title="Lab presentation")))
+    cmdr.handle("yes", "voice")
+
+    res = cmdr.handle("scratch that", "voice")
+
+    assert "can't take one back" in res.reply
+    assert "Lab presentation" in res.reply
+
+
 def test_no_drops_it_without_writing(cmdr, services, monkeypatch):
     cal = _pending(services)
     import jarvis.commander as cmd_mod
-    monkeypatch.setattr(cmd_mod, "write_event",
+    monkeypatch.setattr(cmd_mod, "add_event",
                         lambda *a, **kw: cal.written.append("SHOULD NOT HAPPEN"))
 
     res = cmdr.handle("no", "voice")
@@ -1182,7 +1254,7 @@ def test_an_unrelated_utterance_drops_the_offer_rather_than_writing(
     """Changing the subject must never be read as consent."""
     cal = _pending(services)
     import jarvis.commander as cmd_mod
-    monkeypatch.setattr(cmd_mod, "write_event",
+    monkeypatch.setattr(cmd_mod, "add_event",
                         lambda *a, **kw: cal.written.append("SHOULD NOT HAPPEN"))
 
     cmdr.handle("what's the weather tomorrow", "voice")
@@ -1198,7 +1270,7 @@ def test_a_write_failure_is_reported_not_swallowed(cmdr, services, monkeypatch):
     def boom(*a, **kw):
         raise RuntimeError("412 precondition failed")
 
-    monkeypatch.setattr(cmd_mod, "write_event", boom)
+    monkeypatch.setattr(cmd_mod, "add_event", boom)
     res = cmdr.handle("yes", "voice")
 
     assert "couldn't add" in res.reply.lower()
@@ -1612,6 +1684,7 @@ TIER1_SAMPLES = {
     "do not disturb": "do not disturb for an hour",
     "free": "i am free",
     "room tone": "room tone on",
+    "audio out": "where's your voice coming out",
     "standup": "standup",
     "oracle status": "how's the oracle box",
     "oracle logs": "show me the game news bot logs",

@@ -60,10 +60,24 @@ class Event:
     title: str = ""
     calendar: str = ""
     location: str = ""
+    # The ICS DESCRIPTION, whitespace-collapsed and capped. Carried for ONE
+    # reason: half the world puts the meeting link in the body and leaves
+    # LOCATION empty (his Canvas feed does), so the dossier's JOIN row was
+    # blank for exactly the classes that need it most.
+    description: str = ""
 
     def key(self) -> tuple:
         return (self.start.isoformat(), self.end.isoformat(), self.title.lower(),
                 self.all_day)
+
+    def meeting_url(self) -> str:
+        """The link to click for this event, or "".
+
+        LOCATION first -- an organiser who put the URL there meant it -- then
+        the description. Never any old URL from the body: see meeting_url()."""
+        if str(self.location or "").strip().lower().startswith(("http://", "https://")):
+            return self.location.strip()
+        return meeting_url(self.description)
 
     def on(self, day: date) -> bool:
         """True when the event touches ``day`` (all-day spans included)."""
@@ -75,7 +89,8 @@ class Event:
     def to_dict(self) -> dict:
         return {"start": self.start.isoformat(), "end": self.end.isoformat(),
                 "all_day": self.all_day, "title": self.title,
-                "calendar": self.calendar, "location": self.location}
+                "calendar": self.calendar, "location": self.location,
+                "description": self.description}
 
     @classmethod
     def from_dict(cls, d: dict, tz=None) -> "Event":
@@ -86,7 +101,45 @@ class Event:
         return cls(start=start, end=end, all_day=bool(d.get("all_day")),
                    title=str(d.get("title") or ""),
                    calendar=str(d.get("calendar") or ""),
-                   location=str(d.get("location") or ""))
+                   location=str(d.get("location") or ""),
+                   # Absent from every cache file written before 2026-08-31;
+                   # a missing key is an event with no body, not a crash.
+                   description=str(d.get("description") or ""))
+
+
+# The hosts a link has to belong to before Jarvis will call it "the join
+# link". An event body is full of URLs -- the Canvas assignment, a syllabus
+# PDF, an unsubscribe footer -- and reading one of those out as the way into
+# a lecture is worse than saying nothing at all, so this is an allow-list of
+# conferencing hosts rather than "the first http:// in the description".
+MEETING_HOSTS = (
+    "zoom.us", "zoom.com", "teams.microsoft.com", "teams.live.com",
+    "meet.google.com", "webex.com", "whereby.com", "gotomeeting.com",
+    "bluejeans.com", "chime.aws", "meet.jit.si",
+)
+# Trailing punctuation an organiser's prose leaves stuck to a URL: "join at
+# https://tamu.zoom.us/j/123." must not carry the full stop into the link.
+# Brackets close pairs, so they are trimmed here too.
+_URL_TAIL = ">).,;:!?\"'”’]}"
+_URL_RX = re.compile(r"https?://[^\s<>\"']+", re.I)
+DESCRIPTION_CHARS = 800        # enough for the join block; not the whole email
+
+
+def meeting_url(text) -> str:
+    """The first conferencing link in ``text``, or "".
+
+    ICS bodies arrive with escaped newlines and commas (RFC 5545 folds and
+    escapes them), and Google/Zoom both wrap the URL in prose, so the
+    matching is done over the raw text and the punctuation is trimmed off
+    the end rather than trying to parse the body's structure.
+    """
+    raw = str(text or "").replace("\\n", " ").replace("\\,", ",")
+    for hit in _URL_RX.findall(raw):
+        url = hit.rstrip(_URL_TAIL)
+        host = url.split("//", 1)[-1].split("/", 1)[0].split("@")[-1].lower()
+        if any(host == h or host.endswith("." + h) for h in MEETING_HOSTS):
+            return url
+    return ""
 
 
 def now_local(tz=None) -> datetime:
@@ -97,6 +150,24 @@ def now_local(tz=None) -> datetime:
 
 def _clean(text) -> str:
     return " ".join(str(text or "").split())
+
+
+def trim_description(text) -> str:
+    """The body, whitespace-collapsed and capped -- with the join link kept
+    even when it falls past the cap.
+
+    A Canvas or Outlook body opens with a paragraph of prose and puts the
+    Zoom block underneath, which is precisely where a blind [:800] would cut
+    the one thing this field is carried for.
+    """
+    body = _clean(text)
+    if len(body) <= DESCRIPTION_CHARS:
+        return body
+    url = meeting_url(body)
+    cut = body[:DESCRIPTION_CHARS]
+    if url and url not in cut:
+        cut = f"{cut[:max(0, DESCRIPTION_CHARS - len(url) - 1)].rstrip()} {url}"
+    return cut
 
 
 def _localize(value, tz) -> datetime:
@@ -147,7 +218,11 @@ def parse_ics(raw, start: datetime, end: datetime, calendar: str = "",
             e = s
         out.append(Event(start=s, end=e, all_day=all_day,
                          title=_clean(comp.get("SUMMARY", "")) or "untitled",
-                         calendar=name, location=_clean(comp.get("LOCATION", ""))))
+                         calendar=name, location=_clean(comp.get("LOCATION", "")),
+                         # Capped: the body can be a whole invitation email,
+                         # and every event of the window is held in memory
+                         # and written to the disk cache.
+                         description=trim_description(comp.get("DESCRIPTION", ""))))
     return out
 
 
@@ -439,6 +514,13 @@ class CalendarSource:
         return min(stamps) if stamps else None
 
     pending_event = None      # set by add_event when it needs a yes
+    # The last event written and how to take it back: {"undo", "at", "title"}.
+    # Parked here rather than returned because the confident path writes from
+    # inside a TOOL call, whose ToolResult has no undo slot -- and that is
+    # the path most adds take, so without this "scratch that" would still
+    # have nothing to reach for. Commander._try_undo consults it, subject to
+    # the same staleness window as any other undo.
+    last_add = None
 
     def icloud_calendars(self):
         """Live caldav Calendar objects, for writing. Raises when unconfigured."""
@@ -732,24 +814,76 @@ def build_vevent(title: str, start: datetime, end: datetime) -> bytes:
     return cal.to_ical()
 
 
-def write_event(calendars, title: str, start: datetime, end: datetime,
-                calendar_name: Optional[str] = None) -> str:
-    """Add one event. Returns the line to speak; raises on refusal or failure.
+# The undo of an add. Three outcomes, and the third is the point: when the
+# server hands back no deletable object there IS no undo, and saying so is
+# the only honest answer -- "scratch that" used to fall through in silence,
+# which reads as success while the event sits in his calendar.
+UNDONE_LINE = "Taken back off your calendar, sir."
+UNDO_FAILED_LINE = "I couldn't remove {title} from your calendar, sir."
+CANNOT_UNDO_LINE = ("I can put events on your calendar, sir, but I can't take "
+                    "one back off — you'll want to delete {title} yourself.")
 
-    Deliberately add-only -- no edit, no delete. Server errors propagate
-    rather than being smoothed into a success line: telling the user an event
-    was added when it was not is the worst outcome available here.
+
+def _undo_add(saved, title: str):
+    """The closure that removes the event just written, or one that says why
+    it cannot.
+
+    ``caldav``'s ``save_event`` hands back the created Event object, whose
+    ``.delete()`` is the only handle to it we ever get: nothing else knows
+    its UID or its href. A server (or a stand-in) that returns something
+    without a delete gives us nothing to remove, and the caller must be able
+    to tell the difference.
+    """
+    delete = getattr(saved, "delete", None)
+    if not callable(delete):
+        def _cannot() -> str:
+            log.info("calendar: no delete path for %r; undo refused", title)
+            return CANNOT_UNDO_LINE.format(title=title)
+        return _cannot
+
+    def _undo() -> str:
+        try:
+            delete()
+        except Exception:                   # noqa: BLE001 - server boundary
+            log.exception("calendar: deleting %r failed", title)
+            return UNDO_FAILED_LINE.format(title=title)
+        log.info("calendar: %r removed again", title)
+        return UNDONE_LINE
+    return _undo
+
+
+def add_event(calendars, title: str, start: datetime, end: datetime,
+              calendar_name: Optional[str] = None) -> tuple:
+    """Add one event -> (line to speak, undo callable). Raises on refusal or
+    failure.
+
+    Server errors propagate rather than being smoothed into a success line:
+    telling the user an event was added when it was not is the worst outcome
+    available here. The undo callable never raises -- it returns the line to
+    say, including the honest refusal when this server gives no delete path.
     """
     target = pick_write_calendar(calendars, calendar_name)   # raises ValueError
     name = _cal_name(target) or DEFAULT_WRITE_CALENDAR
-    target.save_event(build_vevent(title, start, end))
+    saved = target.save_event(build_vevent(title, start, end))
     log.info("calendar: added %r to %s at %s", title, name, start.isoformat())
     when = start.strftime("%A at %-I:%M %p").replace(" 0", " ")
     # The default list is literally called "Calendar"; "your Calendar calendar"
     # reads like a stutter out loud.
     where = "your calendar" if name.lower() == DEFAULT_WRITE_CALENDAR.lower() \
         else f"your {name} calendar"
-    return f"Added {title}, {when}, to {where}, sir."
+    return f"Added {title}, {when}, to {where}, sir.", _undo_add(saved, title)
+
+
+# The tool handler inside make_tools is ALSO called add_event -- that is the
+# name the model calls -- and shadows this one inside that closure. This
+# alias is how it reaches the real writer.
+_add_event = add_event
+
+
+def write_event(calendars, title: str, start: datetime, end: datetime,
+                calendar_name: Optional[str] = None) -> str:
+    """``add_event`` without the undo, for callers that cannot use one."""
+    return add_event(calendars, title, start, end, calendar_name)[0]
 
 
 def event_confidence(text: str, now: datetime) -> tuple[bool, str]:
@@ -859,14 +993,18 @@ def make_tools(cfg, services) -> list[ToolSpec]:
 
         source.pending_event = None
         try:
-            line = write_event(source.icloud_calendars(), title, when, end,
-                               calendar_name=calendar)
+            line, undo = _add_event(source.icloud_calendars(), title, when, end,
+                                    calendar_name=calendar)
         except ValueError as exc:            # refusal: protected / unknown
             return ToolResult(text=str(exc), ok=False, speak=str(exc))
         except Exception as exc:             # noqa: BLE001 - server trouble
             log.exception("calendar write failed")
             line = f"I couldn't add that, sir — {type(exc).__name__}."
             return ToolResult(text=line, ok=False, speak=line)
+        # Park the way back out: a ToolResult carries no undo slot, and this
+        # is the path a confident add takes, so "scratch that" would
+        # otherwise have nothing to reach for.
+        source.last_add = {"undo": undo, "at": time.monotonic(), "title": title}
         return ToolResult(text=line, speak=line)
 
     return [ToolSpec(

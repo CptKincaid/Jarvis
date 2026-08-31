@@ -283,7 +283,18 @@ DEFAULTS: dict = {
     # every non-Jarvis stream slides to duck_level % over duck_ramp_ms and
     # slides back. Per STREAM (pactl set-sink-input-volume), never the sink
     # -- the default sink is the soundbar his own voice comes out of.
-    "audio": {"duck": True, "duck_level": 30, "duck_ramp_ms": 200},
+    # The Room Mixer's settings, and the sink sentinel's (jarvis/soundbar.py).
+    # sink_watch: notice when the speaker his voice lands on changes, and say
+    # so ONCE -- the soundbar's battery died on 2026-08-30 and Jarvis talked
+    # into the HDMI monitor for hours. preferred_sink is a PipeWire sink name
+    # or any fragment of one ("bluez", a MAC fragment); left empty the
+    # sentinel learns the box's Bluetooth sink, since a monitor does not drop.
+    # restore_sink is the ONE state change it may make -- pactl
+    # set-default-sink back to the preferred sink -- and it is OFF because
+    # that changes his desktop, not merely Jarvis's voice.
+    "audio": {"duck": True, "duck_level": 30, "duck_ramp_ms": 200,
+              "sink_watch": True, "preferred_sink": "", "restore_sink": False,
+              "sink_poll_s": 30},
     # The room's light (jarvis/room.py) and scenes (jarvis/scenes.py).
     # There are no bulbs here: this is the 4K panel's brightness (an xrandr
     # gamma scale, floored at 0.55 -- Jarvis's own console lives on it) and
@@ -317,6 +328,13 @@ DEFAULTS: dict = {
     # whole gather (IMAP + Canvas), which runs on a worker thread.
     "dossier": {"enabled": True, "lead_min": 10, "notes": True, "mail": True,
                 "mail_hours": 72, "due_days": 7, "budget_s": 25},
+    # Nightly flashcards (jarvis/studycards.py): in the small hours, each
+    # course's newest lecture notes become Leitner cards, so the exam-week
+    # briefing has a deck to count instead of "say quiz me and I'll build
+    # one". Skipped whenever the GPU is lent or the model is busy. Silent:
+    # the cards surface at "review my flashcards" and in the briefing.
+    "study_cards": {"enabled": True, "per_course": 5, "max_courses": 3,
+                    "run_before_hour": 5, "max_age_days": 7, "min_lines": 3},
     # Class-start staging (jarvis/classflow.py): at the start of a recurring
     # class, prime today's notes file, put the music down and show a card.
     # auto_notes arms voice capture for the hour and is OFF by default --

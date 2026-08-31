@@ -184,3 +184,66 @@ def test_a_named_calendar_is_still_announced():
     line = write_event([FakeCal("Work")], "Standup", WHEN, WHEN + timedelta(hours=1),
                        calendar_name="Work")
     assert "work" in line.lower()
+
+
+# ------------------------------------------------------------- the undo
+# "Scratch that" after an add used to reach nothing at all: write_event was
+# add-only, so the phrase fell through in silence, which reads as success
+# while the event sits in his calendar.
+from jarvis.tools.calendar import (CANNOT_UNDO_LINE, UNDONE_LINE,   # noqa: E402
+                                   UNDO_FAILED_LINE, add_event)
+
+
+class SavedEvent:
+    """What caldav's save_event hands back: the created object, whose
+    delete() is the only handle to it anyone ever gets."""
+
+    def __init__(self, fail=False):
+        self.deleted = 0
+        self.fail = fail
+
+    def delete(self):
+        if self.fail:
+            raise RuntimeError("404 not found")
+        self.deleted += 1
+
+
+class DeletableCal(FakeCal):
+    def __init__(self, name, saved=None, **kw):
+        super().__init__(name, **kw)
+        self.event = saved if saved is not None else SavedEvent()
+
+    def save_event(self, ical):
+        self.saved.append(ical)
+        return self.event
+
+
+def test_the_undo_deletes_the_event_that_was_added():
+    cal = DeletableCal("Calendar")
+    line, undo = add_event([cal], "Lab presentation", WHEN, WHEN + timedelta(hours=1))
+    assert "Added" in line and cal.event.deleted == 0
+    assert undo() == UNDONE_LINE
+    assert cal.event.deleted == 1
+
+
+def test_a_server_that_gives_no_delete_path_says_so_plainly():
+    """The honest third outcome: a bare "done" here would leave the event
+    in his calendar and tell him it was gone."""
+    cal = FakeCal("Calendar")                # save_event returns a bare object()
+    _line, undo = add_event([cal], "Standup", WHEN, WHEN + timedelta(minutes=15))
+    said = undo()
+    assert said == CANNOT_UNDO_LINE.format(title="Standup")
+    assert "can't take" in said and "Standup" in said
+
+
+def test_a_delete_that_fails_is_not_reported_as_undone():
+    cal = DeletableCal("Calendar", saved=SavedEvent(fail=True))
+    _line, undo = add_event([cal], "Standup", WHEN, WHEN + timedelta(minutes=15))
+    assert undo() == UNDO_FAILED_LINE.format(title="Standup")
+
+
+def test_write_event_is_still_the_line_only():
+    """Every older caller keeps working: it is add_event without the undo."""
+    line = write_event([DeletableCal("Calendar")], "Lab", WHEN,
+                       WHEN + timedelta(hours=1))
+    assert isinstance(line, str) and "Added Lab" in line

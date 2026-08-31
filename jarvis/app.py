@@ -985,6 +985,12 @@ class JarvisApp:
             # CalendarSource on `calendar`; briefing.make_tools reads its
             # news cache path.
             calendar=None,
+            # The one flashcard deck: the commander files cards into it, the
+            # exam-week briefing counts what is due on it, and the nightly
+            # pass (jarvis/studycards.py) fills it from his lecture notes.
+            # Filled in start_assistant so building the tools in a test does
+            # not open a SQLite file.
+            flashcards=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
             # the one self-state sheet the courtesy and the readout share
@@ -1026,6 +1032,10 @@ class JarvisApp:
             # is the DeadlineHeadsUp itself, read ONLY through its
             # snapshot() -- never its fetch.
             aside=None, deadlines=None,
+            # The sink sentinel (jarvis/soundbar.py), filled in
+            # start_assistant. Answers "where's my voice coming out" from
+            # its LAST tick -- never a pactl call on the reply path.
+            soundbar=None,
             journal_objection=self._journal_objection,
             # the arc (a state source; nothing calls it, they subscribe) and
             # the room tone the "room tone on/off" command switches
@@ -3790,6 +3800,45 @@ class JarvisApp:
             self.calwatch.start()
         except Exception:
             log.exception("calendar anomaly watch failed to start")
+        try:
+            # The sink sentinel (jarvis/soundbar.py). `speaking` is tts.busy
+            # rather than is_speaking: the sink must not move while a burst
+            # is still queued either, or the rest of the sentence arrives in
+            # a different speaker.
+            from jarvis.soundbar import SoundbarSentinel
+            self.soundbar = SoundbarSentinel(
+                cfg=self.assistant, say=self._say, quiet=self.quiet,
+                state_path=PATHS.MEMORY_DIR / "soundbar_state.json",
+                speaking=lambda: bool(getattr(self.tts, "busy", False)))
+            self.services.soundbar = self.soundbar
+            self.soundbar.start()
+        except Exception:
+            log.exception("sink sentinel failed to start")
+        try:
+            # The flashcard deck, wired ONCE and shared: the commander built
+            # its own lazily (commander._quiz_store) and the briefing read
+            # services.flashcards, which nothing ever set -- so the exam-week
+            # study section could never see the cards "quiz me" had filed.
+            from jarvis.tools.quiz import FlashcardStore
+            self.services.flashcards = FlashcardStore()
+        except Exception:
+            log.exception("flashcard deck unavailable")
+        try:
+            # Nightly flashcards from his lecture notes (jarvis/studycards.py).
+            # The brain gates are callables so the thread never imports it,
+            # and the pass is skipped -- never queued -- while the GPU is
+            # lent or the model is answering him.
+            from jarvis.studycards import NightlyCards
+            self.studycards = NightlyCards(
+                cfg=self.assistant,
+                store=getattr(self.services, "flashcards", None),
+                make_quiz=brain_mod.make_quiz,
+                busy=lambda: bool(getattr(self.brain, "is_busy", False)),
+                lent=brain_mod.is_lent,
+                state_path=PATHS.MEMORY_DIR / "studycards_state.json")
+            self.studycards.start()
+        except Exception:
+            log.exception("nightly flashcards failed to start")
         if residency:
             try:
                 # boot warm-up on its own daemon thread, then every 5 min
@@ -3938,6 +3987,8 @@ class JarvisApp:
                           ("debrief", getattr(self, "debrief", None)),
                           ("leavetime", getattr(self, "leavetime", None)),
                           ("calwatch", getattr(self, "calwatch", None)),
+                          ("soundbar", getattr(self, "soundbar", None)),
+                          ("studycards", getattr(self, "studycards", None)),
                           ("dossier", getattr(self, "dossier", None)),
                           # stop() also puts the music back and closes any
                           # auto-armed lecture notes: quit must not leave
@@ -3985,7 +4036,10 @@ class JarvisApp:
             notify.set_quiet_gate(None)
         except Exception:
             log.debug("quiet gate not cleared", exc_info=True)
-        for obj in (self.notes, getattr(self.commander, "_flashcards", None)):
+        for obj in (self.notes, getattr(self.commander, "_flashcards", None),
+                    # the shared deck start_assistant opened (the commander's
+                    # lazy one above stays for a services namespace without it)
+                    getattr(self.services, "flashcards", None)):
             fn = getattr(obj, "close", None)
             if callable(fn):
                 try:
