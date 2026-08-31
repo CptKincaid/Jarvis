@@ -78,7 +78,7 @@ MAX_TIMEOUT_S = 600.0
 IDLE_GRACE_S = 3.0            # a done=False turn that never woke the model
 SYNC_REPLY_WAIT_S = 1.0       # the Tk pump delivers the sync reply within 30 ms
 NOT_RUNNING_LINE = "Jarvis is not running (no command socket)."
-INTERCOM_OFF_LINE = "The intercom is switched off, sir."
+INTERCOM_OFF_LINE = intercom.OFF_LINE
 
 
 class ReplyCollector:
@@ -295,76 +295,78 @@ class CommandSocket:
     def _intercom_text(self, msg: dict) -> str:
         """Decode + transcribe one ``{"audio_b64": ...}`` request.
 
+        The switches, the cap and the decode live in jarvis/intercom.py so
+        the phone client (jarvis/webapp.py) reads them from the same place.
         Raises IntercomError carrying the line to send back; anything else
         is left to _client, which answers with the generic error rather
         than leaking a traceback down the socket."""
-        cfg = getattr(self.app, "assistant", None)
-        verify, max_bytes = False, intercom.MAX_AUDIO_BYTES
-        enabled = True
-        if cfg is not None:
-            try:
-                enabled = bool(cfg.get("intercom.enabled", True))
-                verify = bool(cfg.get("intercom.verify_speaker", False))
-                max_bytes = max(1, int(float(cfg.get("intercom.max_mb", 10))
-                                       * 1048576))
-            except Exception:                 # noqa: BLE001 - config boundary
-                log.debug("intercom config unreadable; using defaults",
-                          exc_info=True)
-        if not enabled:
-            raise intercom.IntercomError(INTERCOM_OFF_LINE, "disabled")
-        audio = intercom.clip_from_b64(msg["audio_b64"], max_bytes=max_bytes)
-        return intercom.transcribe(self.app, audio, verify=verify)
+        return intercom.text_from_b64(self.app, msg["audio_b64"])
 
     def _stream(self, conn, col: ReplyCollector, result, timeout: float) -> str:
         """Forward queued events until the turn is over; returns why."""
-        done = result is None or getattr(result, "done", True) is not False
-        sync_reply = getattr(result, "reply", None) or ""
-        sync_seen = not sync_reply
-        thinking = False
-        deadline = time.monotonic() + timeout
-        last_event = time.monotonic()
-        while True:
-            now = time.monotonic()
-            if now >= deadline:
-                return "timeout"
-            if done and sync_seen:
-                # The sync reply landed; anything else queued goes with it.
-                self._flush(conn, col)
-                return "done"
-            if done and now - last_event > SYNC_REPLY_WAIT_S:
-                return "done"          # the bus never delivered it (no pump)
-            if not done and not thinking and now - last_event > self.idle_grace_s:
-                return "idle"          # Claude task / desktop chain: the ack is it
-            try:
-                kind, payload = col.q.get(timeout=0.25)
-            except queue.Empty:
-                continue
-            last_event = time.monotonic()
-            if kind == "state":
-                if payload["state"] == "thinking":
-                    thinking = True
-                elif thinking and payload["state"] == "idle":
-                    self._flush(conn, col)
-                    return "answered"
-                continue
-            _send(conn, payload)
-            if kind == "reply":
-                if not sync_seen and payload["text"] == sync_reply:
-                    sync_seen = True
-                elif not done and not thinking:
-                    self._flush(conn, col)
-                    return "answered"
+        return stream_turn(lambda payload: _send(conn, payload), col, result,
+                           timeout, self.idle_grace_s)
 
-    @staticmethod
-    def _flush(conn, col: ReplyCollector, settle_s: float = 0.1):
-        end = time.monotonic() + settle_s
-        while True:
-            try:
-                kind, payload = col.q.get(timeout=max(0.0, end - time.monotonic()))
-            except queue.Empty:
-                return
-            if kind != "state":
-                _send(conn, payload)
+
+# ------------------------------------------------------- the turn's end
+def stream_turn(send, col: ReplyCollector, result, timeout: float,
+                idle_grace_s: float = IDLE_GRACE_S) -> str:
+    """Hand every event of one turn to ``send`` until the turn is over;
+    returns why it ended (done / answered / idle / timeout).
+
+    The five close conditions are the module docstring's, and they are the
+    hard-won part of this file -- so the transport is a callable rather
+    than a socket, and jarvis/webapp.py (the phone) drives the SAME loop
+    with ``send=lines.append`` instead of writing a second one that would
+    drift out of step with this one."""
+    done = result is None or getattr(result, "done", True) is not False
+    sync_reply = getattr(result, "reply", None) or ""
+    sync_seen = not sync_reply
+    thinking = False
+    deadline = time.monotonic() + timeout
+    last_event = time.monotonic()
+    while True:
+        now = time.monotonic()
+        if now >= deadline:
+            return "timeout"
+        if done and sync_seen:
+            # The sync reply landed; anything else queued goes with it.
+            _flush(send, col)
+            return "done"
+        if done and now - last_event > SYNC_REPLY_WAIT_S:
+            return "done"          # the bus never delivered it (no pump)
+        if not done and not thinking and now - last_event > idle_grace_s:
+            return "idle"          # Claude task / desktop chain: the ack is it
+        try:
+            kind, payload = col.q.get(timeout=0.25)
+        except queue.Empty:
+            continue
+        last_event = time.monotonic()
+        if kind == "state":
+            if payload["state"] == "thinking":
+                thinking = True
+            elif thinking and payload["state"] == "idle":
+                _flush(send, col)
+                return "answered"
+            continue
+        send(payload)
+        if kind == "reply":
+            if not sync_seen and payload["text"] == sync_reply:
+                sync_seen = True
+            elif not done and not thinking:
+                _flush(send, col)
+                return "answered"
+
+
+def _flush(send, col: ReplyCollector, settle_s: float = 0.1):
+    end = time.monotonic() + settle_s
+    while True:
+        try:
+            kind, payload = col.q.get(timeout=max(0.0, end - time.monotonic()))
+        except queue.Empty:
+            return
+        if kind != "state":
+            send(payload)
 
 
 # ------------------------------------------------------------------ wire

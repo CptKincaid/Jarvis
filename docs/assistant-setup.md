@@ -3623,3 +3623,148 @@ even though it works the moment you ssh in and type it. Every remote command
 is prefixed with a small POSIX prelude that puts `~/.nvm/versions/node/*/bin`
 back on PATH, which is why the config can hold the plain command you already
 know.
+
+## 80. Jarvis on your phone (home Wi-Fi only)
+
+You asked for an app that gets you to him. This is that — a page the Spark
+serves to your phone on the home network, with a text box that goes through
+exactly the same door as the typed box and the `jarvis` command line, quick
+buttons for the things you actually ask for, and an icon on your home screen
+that opens it like an app.
+
+It is **off** until you turn it on, and it is **LAN only**: it binds one
+private address and refuses to start on anything routable from outside the
+house. There is no tunnel, no port-forward and no cloud leg anywhere in it.
+Reaching him from off the network is a separate decision and it is yours to
+make deliberately, not something this feature quietly does for you.
+
+### Turning it on — the four steps
+
+1. Open `~/.config/jarvis/assistant.json` and set:
+
+   ```json
+   "phone": {
+     "enabled": true,
+     "bind": "",
+     "port": 8765,
+     "token": "",
+     "max_audio_mb": 8,
+     "link_file": "~/jarvis-phone.txt",
+     "qr_file": "~/jarvis-phone.svg"
+   }
+   ```
+
+   Leave `bind` empty: he works out this box's own address on the home
+   network at start. Leave `token` empty: a key is generated on the first
+   start and written back into this file.
+
+2. Restart Jarvis (`python -m jarvis.app`). The log line to look for is:
+
+   ```
+   phone client listening on http://192.168.50.x:8765/ (LAN only)
+   phone client: the link is in /home/hunterp/jarvis-phone.txt
+   ```
+
+3. `cat ~/jarvis-phone.txt`. It holds the URL with the key in it, and it is
+   mode 0600 — the link *is* the key, so treat that file the way you treat
+   the config it came from. There is a QR beside it at `~/jarvis-phone.svg`;
+   open it on the big panel and point the phone camera at it rather than
+   typing forty-three characters on a phone keyboard.
+
+4. On the phone: open that URL in Safari, wait for it to say "on the home
+   network" at the top right, then **Share → Add to Home Screen**. It gets
+   the roundel icon, opens full-screen with no browser chrome, and remembers
+   the key.
+
+If you ever want a new key: delete the `"token"` value from
+`assistant.json` and restart. The old home-screen link stops working, and
+step 3 gives you a new one.
+
+### What is on the page
+
+A transcript, a text box, and a row of taps for: **what's due**, **next
+exam**, **calendar**, **briefing**, **timer 10m**, **diagnostics**, **the
+board**, **lights up**, **lights down**. Each tap sends the same sentence
+you would say out loud, so a button and your voice take the same route
+through the commander — there is no second set of phone-only commands to
+keep in sync.
+
+`status`, `diagnostics` and `board` are **reads**: they print the same
+sheets the CLI prints, without dispatching a turn, so they are not
+remembered as a conversation and never wake the speaker.
+
+Answers come back **silently** by default. There is an *aloud* switch beside
+the talk button if you want the soundbar to answer as well — the same choice
+`jarvis --send-audio --speak` makes, and off for the same reason: a question
+asked from bed should not answer the house. Speaking aloud is also the only
+thing the switch changes; he never barges in on a reply he is already
+speaking to somebody standing in the room.
+
+### The microphone: the honest version
+
+**Push-to-talk will not work on your iPhone over this link, and that is not
+a bug you can wait out.** Browsers only hand a page the microphone on a
+*secure context*. `http://192.168.50.x` is not one — not in Safari, not in
+Chrome, not in Firefox. On iOS Safari the microphone API is not merely
+refused, `navigator.mediaDevices` does not exist at all.
+
+So the text path is the product here. It is first in the layout, it is what
+the buttons drive, and it works on every device on the network today.
+
+The talk button still ships, and it is wired to a real endpoint that hands
+the clip to the same intercom code the SSH path uses (decode, resample,
+speaker gate, Whisper). When the page is not in a secure context the button
+renders visibly dead, with the reason and the fix written underneath it —
+never a button that looks alive and silently does nothing. Two things would
+bring it to life:
+
+* **A certificate this phone trusts.** Serve the same page over https with a
+  cert you have installed and trusted on the phone. That is a real chunk of
+  work (a local CA, a profile installed on iOS, and a renewal you will
+  forget about), which is why it is not step 5 above.
+* **Opening it on the Spark itself**, at `http://127.0.0.1:8765/`. Localhost
+  *is* a secure context, so the microphone works there — of no use from bed,
+  but useful for testing the leg.
+
+One format note for that day: `MediaRecorder` would rather give you a WebM
+container, and libsndfile cannot read WebM. The page asks for
+`audio/ogg;codecs=opus` first and falls back; if what arrives is
+undecodable you get his own line about wav / ogg / opus / flac rather than
+silence.
+
+Until then, the fast way to talk to him from the phone is still the one in
+§62 — record in Termux and pipe it over the SSH session you already have.
+
+### What is guarding it
+
+Worth knowing, because it is the whole reason this is a page and not a hole
+in your network:
+
+* **Off by default.** `phone.enabled` is false in the shipped config;
+  nothing listens on a port until you change it.
+* **One private address.** Never `0.0.0.0`, never a public interface. The
+  check is "is this address routable on the internet" rather than a list of
+  ranges someone wrote from memory — carrier-grade NAT would have slipped
+  through such a list. A configured address that fails it does not start,
+  and says so in the log.
+* **A bearer key on every acting endpoint**, compared in constant time. The
+  page itself is static markup with no data in it and cannot do anything;
+  every `/api/*` route asks for the key.
+* **Only private peers**, refused before anything is routed.
+* **Rate limits and body caps.** Sixty requests a minute per device, twelve
+  of them audio; 16 KB of text; `max_audio_mb` of audio, never more than the
+  intercom's own ceiling. An oversized body is refused from its declared
+  length, before it is read.
+
+### If it does not come up
+
+* `grep "phone client" /tmp/vss_voice/jarvis.log` — every refusal is a line
+  there. "no private LAN address found" means the box could not work out its
+  own address; set `phone.bind` to it by hand.
+* "could not bind" with the port in it means something else already has
+  8765; change `phone.port`.
+* The page says "no key" or "that key was refused": the key in your
+  home-screen link is stale. Re-read `~/jarvis-phone.txt` and add it to the
+  home screen again.
+* The page loads but nothing answers: Jarvis himself is down, or the phone
+  has dropped onto cellular. It only answers on the home Wi-Fi.

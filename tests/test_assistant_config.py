@@ -132,8 +132,11 @@ def test_defaults_match_spec_10_1():
                                   "max_ring_s": 300, "snooze_min": 10}
     assert DEFAULTS["discord"] == {"bot_token": "", "channel_id": "", "user_id": ""}
     assert DEFAULTS["autostart"] == {"enabled": False}
+    # phone.token joined the list with the phone client (jarvis/webapp.py):
+    # it is that feature's whole authentication, so it must be masked out
+    # of repr(cfg) and scrub() like every other secret here.
     assert SECRET_KEYS == ("icloud.app_password", "gmail.app_password", "discord.bot_token",
-                           "spotify.client_secret", "canvas.token")
+                           "spotify.client_secret", "canvas.token", "phone.token")
     from jarvis.assistant_config import SECRET_LIST_FIELDS
     assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),)
     assert DEFAULTS["alerts"] == {"desktop": True, "discord": True, "claude_hooks": True}
