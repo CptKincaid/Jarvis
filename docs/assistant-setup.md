@@ -1325,3 +1325,54 @@ Two phrasings he deliberately refuses, because they are almost always a mis-hear
 
 He says "I couldn't make out the time, sir" rather than quietly setting something
 odd.
+
+## 42. Sums and unit conversions, answered instantly
+
+Nothing to configure — this one just works, and it works with the wake word or
+without it.
+
+> *"What's 18 percent of 74?"* — "18 percent of 74 is 13.32, sir."
+> *"What's 43 times 17?"* — "43 times 17 is 731, sir."
+> *"How many ounces in 300 grams?"* — "300 grams is 10.58 ounces, sir."
+> *"Convert 5 miles to kilometres."* — "5 miles is 8.05 kilometres, sir."
+> *"What's 100 Fahrenheit in Celsius?"*
+> *"What's 15 percent off 80?"* — the discounted price, 68.
+> *"What's the square root of 144?"*
+
+These used to be a full local-model turn: seconds of waiting, and the 26B model
+does not always get the arithmetic right. They are now answered in Python before
+the model is ever asked.
+
+**Numbers** may be spoken or written: *"eighteen percent of seventy-four"*,
+*"a hundred and twenty times two"*, *"three point five"*, and a transcript's
+"1,250" all work.
+
+**Units** he knows:
+
+| kind | units |
+|---|---|
+| mass | mg, g, kg, tonne, ounce, pound, stone |
+| length | mm, cm, metre, km, inch, foot, yard, mile |
+| temperature | Celsius, Fahrenheit, Kelvin |
+| data | kB, MB, GB, TB (powers of 1000) and KiB, MiB, GiB, TiB (powers of 1024) |
+
+**What he refuses out loud, rather than guessing:**
+
+- *"How many ounces in five miles?"* — "Those don't convert, sir: miles is a
+  length and ounces is a mass."
+- *"What's 10 divided by 0?"* — "You can't divide by zero, sir."
+- *"Convert 20 dollars to euros."* — "I can't do currency, sir; I've no exchange
+  rate down here."
+
+**What he hands to the model instead**, deliberately:
+
+- **Volume.** A US pint is 473 ml and a UK pint is 568; fluid ounces differ too.
+  There is no honest single answer, so he does not pretend there is.
+- **Chains** like *"two plus three times four"* — spoken precedence is genuinely
+  ambiguous.
+- Anything else he does not recognise. The rule throughout is that he only claims
+  a question he can actually answer; everything else carries on down the ladder
+  exactly as before.
+
+Note that *"five pounds in kilos"* is a weight (2.27 kg) while *"five pounds in
+dollars"* is the currency refusal — the weight reading is tried first.

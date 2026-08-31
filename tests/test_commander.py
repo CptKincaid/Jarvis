@@ -1516,6 +1516,7 @@ TIER1_SAMPLES = {
     "slow turn": "why was that slow",
     "clip to claude": "have claude fix what i copied",
     "read control": "skip",
+    "math": "what's 18 percent of 74",
 }
 
 

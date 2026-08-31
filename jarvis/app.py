@@ -616,7 +616,8 @@ class JarvisApp:
         # tools registered; a missing module simply contributes nothing).
         for modname, name in (("jarvis.tools.spotify", "PERSONA_LINES"),
                               ("jarvis.tools.canvas", "PERSONA_LINES"),
-                              ("jarvis.focus", "PERSONA_LINES")):
+                              ("jarvis.focus", "PERSONA_LINES"),
+                              ("jarvis.mathspeak", "PERSONA_LINES")):
             lines = getattr(sys.modules.get(modname), name, None)
             if isinstance(lines, (list, tuple)):
                 phrases += [ln for ln in lines if isinstance(ln, str) and ln
