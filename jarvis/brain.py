@@ -1164,6 +1164,68 @@ def make_quiz(text, n=5, topic="", timeout=QUIZ_TIMEOUT_S):
     return out[:n]
 
 
+# Weekly memory garden (jarvis/garden.py): a week of the activity journal
+# in, durable facts about Hunter out.  Runs on a Sunday-night thread while
+# he sleeps, so the timeout is generous and the temperature low.
+GARDEN_TIMEOUT_S = 180.0
+GARDEN_MAX_FACTS = 6
+GARDEN_KEY_CHARS = 40
+GARDEN_VALUE_CHARS = 200
+GARDEN_JOURNAL_CHARS = 6_000
+GARDEN_FORMAT = {
+    "type": "object",
+    "properties": {"facts": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"key": {"type": "string"}, "value": {"type": "string"}},
+        "required": ["key", "value"]}}},
+    "required": ["facts"]}
+
+
+def extract_facts(journal_text, known=None, limit=GARDEN_MAX_FACTS,
+                  timeout=GARDEN_TIMEOUT_S):
+    """[{key, value}] durable facts about Hunter from a week of journal
+    text; [] when the model is down, lent or says there is nothing.
+
+    The prompt is written against the failure this feature actually has:
+    the model inflating one request into a standing preference. A dry run
+    over a synthetic week (scratchpad/garden_dryrun.py) turned a single
+    "play some jazz while I write" into "Hunter prefers jazz while he
+    writes", so the rules below demand a habit he STATED or a thing that
+    recurs across days, and an empty list is named as a correct answer."""
+    text = (journal_text or "").strip()
+    if not text:
+        return []
+    n = max(1, min(int(limit or GARDEN_MAX_FACTS), GARDEN_MAX_FACTS))
+    known_line = "; ".join(str(k) for k in (known or []))[:1200] or "(nothing yet)"
+    instruction = (
+        f"Instruction for Jarvis (not a question from Hunter): below is a week "
+        f"of your own activity journal. Extract only DURABLE facts about Hunter "
+        f"worth remembering for months: recurring people, courses, projects, "
+        f"habits he stated, preferences he stated. Reply with JSON only. Each "
+        f"fact has \"key\" (two to four lower-case words) and \"value\" (one "
+        f"plain sentence about Hunter, in your own words). Rules: state ONLY "
+        f"what the journal says -- never infer, and never write a name, number "
+        f"or date that is not there. One request on one day is NOT a "
+        f"preference: a habit must either be something he said about himself "
+        f"or something that repeats across several days. Nothing already known. "
+        f"At most {n} facts; fewer is better and an empty list is a correct "
+        f"answer.\n\nAlready known, do not repeat: {known_line}\n\n"
+        f"Journal:\n{text[:GARDEN_JOURNAL_CHARS]}")
+    obj = _json_request(instruction, GARDEN_FORMAT, timeout,
+                        num_predict=90 * n, temperature=0.1)
+    out, seen = [], set()
+    for item in (obj or {}).get("facts") or []:
+        if not isinstance(item, dict):
+            continue
+        key = " ".join(str(item.get("key") or "").split()).lower()[:GARDEN_KEY_CHARS]
+        value = " ".join(strip_markdown(str(item.get("value") or "")).split())
+        if not key or not value or key in seen:
+            continue
+        seen.add(key)
+        out.append({"key": key, "value": value[:GARDEN_VALUE_CHARS]})
+    return out[:n]
+
+
 def grade_answer(question, expected, given, timeout=GRADE_TIMEOUT_S):
     """(correct, note) from the model, or None when it did not answer (the
     caller then falls back to the string match or a shrug)."""

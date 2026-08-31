@@ -131,6 +131,13 @@ DEFAULTS: dict = {
     # nomic-embed-text so "who's my dentist" finds "my dentist is Dr Patel";
     # semantic=false keeps the substring store only.
     "memory": {"semantic": True},
+    # Weekly memory garden (jarvis/garden.py): once the ISO week closes,
+    # the week's activity journal is read by the local model and up to
+    # max_facts durable facts are filed as long-term memory, tagged
+    # source="garden" so "forget the last garden pass" can take them back.
+    # run_before_hour keeps the 26B extraction in the small hours; a week
+    # still ungardened by Wednesday runs at any hour instead.
+    "garden": {"enabled": True, "max_facts": 4, "run_before_hour": 6},
     # Activity journal (jarvis/context.py + tools/journal.py): the focused
     # window is sampled every window_interval_s; day files older than
     # keep_days are pruned. enabled=false stops the sampler only -- exchanges

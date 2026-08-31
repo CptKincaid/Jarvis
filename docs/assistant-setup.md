@@ -1259,6 +1259,7 @@ import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •
 EOF
 ```
 
+<<<<<<< HEAD
 ## 40. New-grade watch ("a grade just posted")
 
 Nothing to set up beyond the Canvas token (section 13). Once it is in place
@@ -1634,3 +1635,88 @@ Calendar events are the exception: `write_event` is deliberately add-only, so
 a calendar add cannot be undone by voice. It has its own read-back before it
 writes; delete the event by hand if the answer was wrong.
 
+=======
+## 40. Episodic recall ("when did I last talk to my advisor?")
+
+The activity journal (section 23) already records every exchange, tool call, Claude
+result and window title for 90 days; this asks it *when*.
+
+- *"when did I last talk to my advisor"*, *"when did I last see Dr Peyrovi"*,
+  *"when was the last time I worked on the thesis"*, *"how long since I emailed my
+  advisor"* — with or without the wake word.
+- The people book (section 22) resolves the alias first, so "my advisor" searches for
+  **advisor**, **Dr Peyrovi** and **Peyrovi** at once.
+- The answer is the day in words and what the row actually was:
+  *"Tuesday afternoon, sir. You said, what did Dr Peyrovi say about the recommendation
+  letter."* — "how long since" gets the gap instead: *"It's been three days, sir. …"*
+- Nothing found → *"Nothing in the journal about my advisor, sir"*, plus any fact you
+  **told** him about the same thing.
+
+The wording is deliberate. The journal only sees what went **through Jarvis** — voice
+and typed turns, tool calls, Claude results, sampled window titles — so it answers
+"the last time you mentioned it here", never "the last time you met her". A meeting
+you never spoke about is invisible to it.
+
+Day files are walked newest-first and the scan stops at the first hit, so the usual
+answer costs one file read rather than ninety. Term matching is whole-word but treats
+`_` and `.` as boundaries, so "thesis" finds `thesis_draft.tex - TeXstudio`.
+
+## 41. The weekly memory garden (what he learns about you on his own)
+
+Nothing ever promoted what Jarvis **observed** into what he **knows** — the journal
+filled up and `facts.json` only ever held what you told him out loud. Once a week it
+does.
+
+At the first tick after the ISO week closes, in the small hours (`garden.run_before_hour`,
+default 06:00; a week still ungardened by Wednesday runs at any hour), the week's journal
+is rendered as a digest, handed to the resident local model with a strict extraction
+prompt, and up to `garden.max_facts` (4) durable facts are filed through the ordinary
+long-term memory path, tagged `source: "garden"`.
+
+```json
+"garden": {"enabled": true, "max_facts": 4, "run_before_hour": 6}
+```
+
+- **Monday's first wake** — after the nightly review: *"I filed three things from this
+  week, sir; say memory report to hear them."* A pass that filed nothing says nothing.
+- *"memory report"* / *"what did you file this week"* reads them back.
+- *"forget the last garden pass"* / *"forget what you filed this week"* takes every one
+  of them out of memory again.
+
+Four rules keep a hallucinating model out of your long-term memory: it **never**
+overwrites a key that already exists (what you said out loud always wins), it files at
+most four a week, every one carries provenance, and the undo is one sentence. A fact you
+have since re-told by voice loses the tag and survives the undo.
+
+It is **skipped, not queued**, whenever the model is lent to a trainer ("lend the GPU")
+or busy with a turn — the week's journal is still there next tick, and a 26B extraction
+must never sit in front of a real question. Delivery rides the first-wake path, which
+already refuses to speak inside quiet hours, so a pass written at 3 am is heard at
+breakfast. Fully local: the journal is a file and the model is Ollama.
+
+## 42. The weekly self-review (the bugs he files about himself)
+
+The nightly digest (section 36) now also records the day's WARNING / ERROR clusters —
+it has to, because `/tmp` is wiped at boot and by Sunday there is nothing left to
+re-read. Once the ISO week closes, the seven digests are aggregated into
+`~/.aiws_trainer/jarvis_memory/reviews/weeks/<year>-W<nn>.json` (26 kept).
+
+- **Monday's first wake** — two sentences: *"Last week: 96 turns over 7 days, median
+  wait 2.1 seconds. The median wait rose from 1.4 to 2.1 seconds, and the speaker gate
+  dropped you 9 times, against 3 last week, sir."* With nothing worsening he names the
+  warning that recurred most nights instead, and with neither, *"Nothing is getting
+  worse that I can see, sir."*
+- *"weekly review"*, *"how was my week"*, *"week in review"*, *"what went wrong last
+  week"* — asks for it on demand, with the full table on a card. (*"how's my week
+  looking"* is still the calendar forecast, section 12.)
+- **Discord** — the table is posted when the report is filed, like the nightly one.
+- **feedback.jsonl** — every recurring warning cluster (2+ days, or 3+ occurrences) and
+  every worsened number is appended to
+  `~/.aiws_trainer/jarvis_memory/feedback.jsonl` as `{"kind": "regression", …}`: a
+  standing bug list Jarvis wrote about himself, ready for the next Claude session. Once
+  per week — the callback only fires on the tick that files the report.
+
+A "trend" needs the median wait to move by 0.4 s **and** 20%, so a quiet week of three
+turns cannot shout. All of it is arithmetic over JSON already on disk: no log
+re-reading, no model, nothing leaving the box.
+>>>>>>> worktree-wf_a20f39d5-c33-5

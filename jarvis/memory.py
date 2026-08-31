@@ -174,6 +174,18 @@ def parse_since(query: str, now: Optional[datetime] = None):
     return cleaned or (query or "").strip(), since
 
 
+def _fact_meta(key: str, when: str, ts: float, source: Optional[str] = None) -> dict:
+    """Chroma metadata for one fact.  ``source`` is provenance: a fact
+    Jarvis promoted himself (the weekly memory garden, jarvis/garden.py)
+    carries one, a fact Hunter told him carries none -- so a bad pass can
+    be found and undone without touching what he said out loud.  Chroma
+    rejects a None value, hence the key is omitted rather than nulled."""
+    meta = {"key": str(key), "time": str(when), "ts": float(ts)}
+    if source:
+        meta["source"] = str(source)
+    return meta
+
+
 def _default_embed():
     """The documents tool's /api/embed seam, keep-alive pinned. Resolved at
     call time so a monkeypatched docs._embed is honoured."""
@@ -274,7 +286,8 @@ class SemanticFacts:
             self._embed_down_logged = True
 
     # ------------------------------------------------------------- write
-    def upsert(self, key: str, value, when: Optional[str] = None) -> bool:
+    def upsert(self, key: str, value, when: Optional[str] = None,
+               source: Optional[str] = None) -> bool:
         col = self.collection()
         if col is None:
             return False
@@ -288,7 +301,7 @@ class SemanticFacts:
         try:
             vec = self._vectors([docs.DOC_PREFIX + text])[0]
             col.upsert(ids=[self._id(key)], embeddings=[vec], documents=[text],
-                       metadatas=[{"key": str(key), "time": when, "ts": float(ts)}])
+                       metadatas=[_fact_meta(key, when, ts, source)])
             return True
         except docs.EmbedError as exc:
             self._log_embed_down(exc)
@@ -356,7 +369,7 @@ class SemanticFacts:
                 ts = time.time()
             ids.append(self._id(k))
             texts.append(str(e.get("value", "")))
-            metas.append({"key": str(k), "time": when, "ts": float(ts)})
+            metas.append(_fact_meta(k, when, ts, e.get("source")))
         try:
             col.upsert(ids=ids, embeddings=vecs, documents=texts, metadatas=metas)
         except Exception:                           # noqa: BLE001
@@ -541,17 +554,25 @@ class JarvisMemory:
     # ------------------------------------------------------------------
     # Facts — key/value store with timestamps
     # ------------------------------------------------------------------
-    def remember(self, key, value):
+    def remember(self, key, value, source=None):
         """Store a fact persistently (facts.json, then the index).
-        Overwrites if key exists."""
+        Overwrites if key exists.
+
+        ``source`` is provenance for a fact Jarvis promoted himself (the
+        weekly memory garden passes "garden"); a fact Hunter told him has
+        none. Only the tagged ones can be listed or undone wholesale."""
         when = datetime.now().isoformat()
-        self._facts[key] = {"value": value, "time": when}
+        entry = {"value": value, "time": when}
+        if source:
+            entry["source"] = str(source)
+        self._facts[key] = entry
         self._save("facts.json", self._facts)
-        log.info("remembered: %s = %s", key, str(value)[:50])
+        log.info("remembered: %s = %s%s", key, str(value)[:50],
+                 f" (from {source})" if source else "")
         if self._index is not None:
             try:
                 self._index.sync(self._facts)      # first-open migration
-                self._index.upsert(key, value, when)
+                self._index.upsert(key, value, when, source=source)
             except Exception:                       # noqa: BLE001
                 log.exception("semantic memory write-through failed")
 
@@ -636,6 +657,20 @@ class JarvisMemory:
     def get_all_facts(self):
         """Return all stored facts."""
         return self._facts
+
+    def facts_from(self, source):
+        """The facts a given writer promoted, newest first: [(key, entry)].
+
+        The memory garden's report and its undo read this rather than
+        trusting their own state file -- a fact Hunter has since replaced
+        by voice loses the tag, and must then survive the undo."""
+        want = str(source or "")
+        if not want:
+            return []
+        rows = [(k, e) for k, e in self._facts.items()
+                if isinstance(e, dict) and str(e.get("source") or "") == want]
+        rows.sort(key=lambda kv: str(kv[1].get("time", "")), reverse=True)
+        return rows
 
     @property
     def semantic_available(self) -> bool:

@@ -11,6 +11,10 @@ back:
   bucketed by hour and bounded so it fits the tool-text budget (the brain
   caps a tool result at 4 000 chars against NUM_CTX); the model then
   speaks a short recap from it and the digest goes on a card;
+* ``find_last_mention`` / ``last_mention_line`` answer "when did I last
+  talk to my advisor?" -- the day files are walked NEWEST first and the
+  scan stops at the first hit, so a term mentioned this morning costs one
+  file read where ``journal_rows`` would have read ninety;
 * ``ActivitySampler`` samples the focused window every minute through the
   context engine's existing xdotool probe (no new subprocess), skipping
   a locked or empty desktop, so "go back" and the recap both get window
@@ -22,11 +26,12 @@ Fully local: the journal is a file, the recap is the local model.
 """
 from __future__ import annotations
 
+import json
 import re
 import threading
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Iterable, Optional
 
 from jarvis.events import JarvisReply, bus
 from jarvis.logs import get_logger
@@ -204,6 +209,255 @@ def digest(rows, label="today", max_chars=DIGEST_CHARS) -> str:
     note = f"(earlier: {dropped} hour{'s' if dropped != 1 else ''} not shown)\n" \
         if dropped else ""
     return (head + "\n" + note + "\n".join(blocks))[:max_chars]
+
+
+# -------------------------------------------------- episodic recall
+# "when did I last talk to my advisor?" / "how long since I worked on the
+# thesis?".  The journal only sees what flowed through Jarvis -- voice and
+# typed turns, tool calls, Claude results and sampled window titles -- so
+# the honest claim is "the last time you mentioned it HERE", never "the
+# last time you met her".  The wording below says "you said" / "you had X
+# open" for exactly that reason.
+MENTION_KEEP_DAYS = DEFAULT_KEEP_DAYS
+_ORDINAL_SUFFIX = {1: "st", 2: "nd", 3: "rd", 21: "st", 22: "nd", 23: "rd",
+                   31: "st"}
+# Leading words that are the question's grammar, not the thing looked for:
+# "when did I last talk to my advisor" searches for "my advisor".
+_MENTION_VERB_RX = re.compile(
+    r"^(?:talk(?:ed)?|speak|spoke|spoken|chat(?:ted)?)\s+(?:to|with|about)\s+"
+    r"|^(?:see|saw|seen|visit(?:ed)?)\s+"
+    r"|^(?:go|gone|went|been)\s+(?:to\s+)?"
+    r"|^(?:hear|heard)\s+(?:from|about)\s+"
+    r"|^(?:work(?:ed|ing)?|focus(?:ed)?)\s+on\s+"
+    r"|^(?:mention(?:ed)?|discuss(?:ed)?|bring|brought)\s+(?:up\s+)?"
+    r"|^(?:ask(?:ed)?)\s+(?:you\s+)?(?:about|for)\s+"
+    r"|^(?:email(?:ed)?|e-mail(?:ed)?|messag(?:e|ed)|writ(?:e|ten)|wrote)\s+(?:to\s+)?"
+    r"|^(?:use[d]?|using|open(?:ed)?|touch(?:ed)?|read|look(?:ed)?\s+at)\s+", re.I)
+_LEADING_ARTICLE_RX = re.compile(r"^(?:my|our|the|a|an)\s+", re.I)
+# A tail that is nothing but the verb ("when did I last see") asks for no
+# thing at all: the handler falls through rather than reporting that the
+# journal has never seen the word "see".
+_MENTION_STOPWORDS = frozenset({
+    "see", "saw", "seen", "talk", "talked", "speak", "spoke", "spoken",
+    "go", "gone", "went", "been", "work", "worked", "working", "use", "used",
+    "open", "opened", "hear", "heard", "read", "look", "looked", "ask",
+    "asked", "email", "emailed", "mention", "mentioned", "do", "did", "it",
+    "that", "this", "one", "some"})
+
+
+def mention_target(tail: str) -> str:
+    """'talked to my advisor about the letter?' -> 'my advisor'.
+
+    The verb phrase is stripped, then anything after an "about"/"regarding"
+    clause: the FIRST noun phrase is what the question is about, and the
+    rest only narrows it (searching the whole tail would match nothing)."""
+    t = " ".join(str(tail or "").split()).strip(" ,.?!")
+    t = _MENTION_VERB_RX.sub("", t, count=1).strip()
+    t = re.split(r"\b(?:about|regarding|concerning)\b", t, maxsplit=1)[0]
+    t = t.strip(" ,.?!")
+    return "" if t.lower() in _MENTION_STOPWORDS else t
+
+
+def mention_terms(target: str, memory=None) -> list[str]:
+    """The strings to look for: the phrase as said, the same phrase without
+    a leading my/the, and -- when the people book knows the alias -- the
+    person's name and surname.  "when did I last talk to my advisor" has to
+    find the journal line that says "Dr Peyrovi"."""
+    out: list[str] = []
+
+    def add(value):
+        value = " ".join(str(value or "").split())
+        if value and value.lower() not in {o.lower() for o in out}:
+            out.append(value)
+
+    add(target)
+    add(_LEADING_ARTICLE_RX.sub("", str(target or "")))
+    if memory is not None:
+        try:
+            person = memory.resolve_person(target)
+        except Exception:                          # noqa: BLE001
+            person = None
+        if isinstance(person, dict):
+            name = str(person.get("name") or "")
+            add(name)
+            if " " in name:
+                add(name.split()[-1])              # "Peyrovi" on its own
+            add(person.get("alias"))
+        else:
+            try:
+                add(memory.expand_aliases(target))
+            except Exception:                      # noqa: BLE001
+                log.debug("alias expansion failed", exc_info=True)
+    return [t for t in out if len(t) >= 2]
+
+
+def _term_rx(term: str):
+    """Whole-phrase, whole-word, case-insensitive; internal runs of spaces
+    match any whitespace so "dr  peyrovi" still matches.
+
+    The boundary is letters-and-digits only, NOT ``\\b``: half the journal
+    is window titles, and `\\bthesis\\b` does not match
+    "thesis_draft.tex - TeXstudio" because an underscore is a word
+    character. "hesis" still fails against "thesis" -- the letter before
+    it is a letter."""
+    words = str(term or "").split()
+    if not words:
+        return None
+    body = r"\s+".join(re.escape(w) for w in words)
+    lead = r"(?<![0-9A-Za-z])" if words[0][0].isalnum() else ""
+    tail = r"(?![0-9A-Za-z])" if words[-1][-1].isalnum() else ""
+    return re.compile(lead + body + tail, re.I)
+
+
+def row_text(row) -> str:
+    """Everything in a journal row that a mention search may match."""
+    kind = row.get("kind")
+    if kind == "exchange":
+        return f"{row.get('user', '')} {row.get('jarvis', '')}"
+    if kind == "tool":
+        return f"{row.get('name', '')} {row.get('args', '')} {row.get('text', '')}"
+    if kind == "claude":
+        return f"{row.get('project', '')} {row.get('text', '')}"
+    if kind == "window":
+        return str(row.get("title", ""))
+    return ""
+
+
+def find_last_mention(journal_dir, terms: Iterable[str], now: Optional[datetime] = None,
+                      max_days: int = MENTION_KEEP_DAYS) -> Optional[dict]:
+    """The newest journal row mentioning any of ``terms``, or None.
+
+    Walks the day files newest-first and returns at the first hit -- the
+    answer is nearly always today's or yesterday's file, and reading ninety
+    days to sort them (journal_rows) would be work thrown away."""
+    patterns = [rx for rx in (_term_rx(t) for t in terms) if rx is not None]
+    if not patterns:
+        return None
+    now = now or datetime.now()
+    d = Path(journal_dir)
+    day = now.date()
+    for _ in range(max(1, int(max_days)) + 1):
+        path = d / f"{day:%Y-%m-%d}.jsonl"
+        if path.exists():
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                log.debug("journal read failed: %s", path, exc_info=True)
+                lines = []
+            for line in reversed(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                    when = datetime.fromisoformat(str(row.get("time", "")))
+                except (ValueError, TypeError):
+                    continue
+                if when > now:
+                    continue                       # a clock skew, not a memory
+                text = row_text(row)
+                if any(rx.search(text) for rx in patterns):
+                    row["_when"] = when
+                    return row
+        day -= timedelta(days=1)
+    return None
+
+
+def _part_of_day(when: datetime) -> str:
+    if when.hour < LUNCH_HOUR:
+        return "morning"
+    if when.hour < EVENING_HOUR:
+        return "afternoon"
+    return "evening"
+
+
+def _ordinal(n: int) -> str:
+    return f"{n}{_ORDINAL_SUFFIX.get(n, 'th')}"
+
+
+def when_words(when: datetime, now: Optional[datetime] = None) -> str:
+    """'this afternoon' / 'yesterday evening' / 'Tuesday afternoon' /
+    'last Tuesday' / 'on the 3rd of August'.  Spoken words, no digits
+    below the month: a date read as "2026-08-25" is unlistenable."""
+    now = now or datetime.now()
+    days = (now.date() - when.date()).days
+    part = _part_of_day(when)
+    if days <= 0:
+        return f"this {part}"
+    if days == 1:
+        return f"yesterday {part}"
+    if days < 7:
+        return f"{when:%A} {part}"
+    if days < 14:
+        return f"last {when:%A}"
+    stem = f"on the {_ordinal(when.day)} of {when:%B}"
+    return stem if when.year == now.year else f"{stem} {when.year}"
+
+
+def elapsed_words(when: datetime, now: Optional[datetime] = None) -> str:
+    """'about two hours' / 'three days' / 'a fortnight' -- the answer to
+    "how long since ...", which wants a duration, not a date."""
+    now = now or datetime.now()
+    secs = max(0.0, (now - when).total_seconds())
+    minutes = int(secs // 60)
+    if minutes < 2:
+        return "barely a minute"
+    if minutes < 60:
+        return f"{minutes} minutes"
+    hours = int(round(secs / 3600))
+    if hours < 24:
+        return "about an hour" if hours == 1 else f"about {hours} hours"
+    days = (now.date() - when.date()).days
+    if days == 1:
+        return "a day"
+    if days < 14:
+        return f"{days} days"
+    weeks = days // 7
+    if weeks == 2:
+        return "a fortnight"
+    if days < 60:
+        return f"{weeks} weeks"
+    return f"{days // 30} months"
+
+
+def mention_snippet(row, n: int = SNIPPET_CHARS) -> str:
+    """What the row was, in the second person -- and never more than the
+    journal actually holds."""
+    kind = row.get("kind")
+    if kind == "exchange":
+        user = _snip(row.get("user", ""), n)
+        if user:
+            return f"you said, {user}"
+        return f"I said, {_snip(row.get('jarvis', ''), n)}"
+    if kind == "tool":
+        return f"you had me run {row.get('name') or 'a tool'}"
+    if kind == "claude":
+        return f"Claude finished {row.get('project') or 'a task'}"
+    if kind == "window":
+        return f"you had {_title(row.get('title', ''))} open"
+    return "there was activity"
+
+
+def last_mention_line(row, target: str, now: Optional[datetime] = None,
+                      duration: bool = False, name: str = "sir") -> str:
+    """The spoken answer.  ``duration=True`` for "how long since I ...",
+    which is asking for the gap rather than the date."""
+    when = row.get("_when")
+    if not isinstance(when, datetime):
+        return ""
+    words = when_words(when, now)
+    snippet = mention_snippet(row)
+    snippet = f"{snippet[0].upper()}{snippet[1:]}" if snippet else ""
+    when_said = f"{words[0].upper()}{words[1:]}"
+    if duration:
+        # "how long since" asks for the gap; the date is the second half.
+        return f"It's been {elapsed_words(when, now)}, {name}. {when_said}: {snippet}."
+    return f"{when_said}, {name}. {snippet}."
+
+
+def no_mention_line(target: str, name: str = "sir") -> str:
+    what = " ".join(str(target or "").split()) or "that"
+    return f"Nothing in the journal about {what}, {name}."
 
 
 # ----------------------------------------------------------- sampler
