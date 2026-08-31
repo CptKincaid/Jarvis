@@ -1266,7 +1266,6 @@ import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •
 EOF
 ```
 
-<<<<<<< HEAD
 ## 40. New-grade watch ("a grade just posted")
 
 Nothing to set up beyond the Canvas token (section 13). Once it is in place
@@ -3278,7 +3277,6 @@ feet.
 Nothing here is phrased by the model. Every figure is a reading, and if the
 counters cannot be read he says so in a sentence rather than quietly
 shortening the report.
-=======
 ## 40. Working sessions: "let us plan the week"
 
 Say **"let's plan the week"** (or "plan my week", "sort out my week") and he
@@ -3424,4 +3422,3 @@ keep the ledger (and the board's lane) while saying nothing at all.
 All of this rides the health watchdog's existing 30-second tick. There is
 no extra thread and no `nvidia-smi` call — the wedge these features exist
 to warn about is precisely the state in which `nvidia-smi` blocks forever.
->>>>>>> worktree-wf_1794aa61-1e7-8
