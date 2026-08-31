@@ -1407,7 +1407,10 @@ def test_lecture_notes_are_wired_through_the_real_app(app, paths, monkeypatch):
     app.assistant.set("docs.paths", [str(folder)])
     result = app.dispatch_text("notes for biosensors")
     assert result.speak and app.commander.lecture_course == "biosensors"
-    result = app.dispatch_text("impedance is the ratio of voltage to current")
+    # source="voice": the mode listens to the microphone only, so that a
+    # `jarvis "..."` from a shell is answered rather than filed
+    result = app.dispatch_text("impedance is the ratio of voltage to current",
+                               source="voice")
     assert result.status.startswith("Noting: biosensors")
     kicks = []
     app.services.docs_index.kick = lambda: kicks.append(1) or True

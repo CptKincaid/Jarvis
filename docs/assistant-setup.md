@@ -1448,3 +1448,132 @@ fold that history into the ledger once:
 
 It is idempotent and never opens `timekeeper.db` for writing. Nothing leaves the box
 and no model is called.
+## 40. Sticky modes and the terminal (voice-CLI handoff)
+
+Three modes are *sticky*: lecture notes, dictation and an open quiz
+question. Once open they claim the next utterance instead of routing it —
+that is the point, since a sentence spoken during a lecture has no other
+meaning.
+
+They claim the **microphone** only. A turn that arrives from the CLI
+socket (`jarvis "…"`, `jarvis.ask`, SSH, a script) or from Discord was
+typed on purpose, so it is answered normally. Before this, notes open on
+the desk meant every `jarvis "what's due today"` from a tmux pane was
+filed as a lecture line, and dictation mode typed it into whatever window
+happened to be focused.
+
+What still works from a terminal while a mode is open:
+
+| from anywhere | effect |
+|---|---|
+| `jarvis "end notes"` | closes the lecture capture (and reindexes the file) |
+| `jarvis "end dictation"` | leaves dictation mode |
+| `jarvis "stop the quiz"` | ends the quiz with the tally |
+| `jarvis "note: the demo is on friday"` | files one deliberate lecture line, verbatim |
+| `jarvis --status` | names the open modes |
+
+`--status` (the same line as "run diagnostics") ends with them:
+
+```
+All systems nominal, sir. Up 2 hours and 10 minutes; … Lecture notes open
+for BIOSENSORS, 12 lines and a quiz open at question 3 of 5.
+```
+
+That line is the only way to notice a mode from a shell now that a CLI
+turn no longer lands in one. Nothing to configure.
+
+## 41. How long the mic waits for your answer
+
+After Jarvis speaks he keeps listening for a few seconds so you can follow
+up without the wake word. That window is `followup_window` in
+jarvis/config.py — 4 seconds, which is right for "…and Tuesday?" and much
+too short for a question he just asked you.
+
+So the window depends on what is open:
+
+| what is open | window | setting |
+|---|---|---|
+| lecture notes | 20 s | `lecture.window_s` |
+| a flashcard question, a read-back ("Cancel all three alarms, sir?"), the good-night "Shall I wake you at seven?" | 15 s | `quiz.window_s` |
+| everything else | 4 s | `followup_window` (jarvis/config.py) |
+
+```json
+{ "quiz": { "questions": 5, "chunks": 6, "window_s": 15 } }
+```
+
+Set it in `~/.config/jarvis/assistant.json`. It is a request, not a
+promise: the recorder clamps any window to 30 s, the value never drops
+below `followup_window`, and the long window only lasts while the question
+does — a finished quiz, a read-back older than 60 s and a wake-alarm offer
+older than three minutes all fall straight back to 4 s. Every follow-up is
+still speaker-verified, so the open mic is still yours alone.
+
+## 42. Read-backs when he isn't sure he heard you
+
+Whisper returns a confidence for every utterance. Below
+`confirm.shaky_logprob` (default -0.7, calibrated from the live log) the
+words are doubtful — and a doubtful alarm is expensive, because "5:15" and
+"5:50" differ by one phoneme and the mistake surfaces hours later.
+
+So on a shaky transcript the three creation commands read the parse back
+instead of committing:
+
+```
+you    "set an alarm for five fifteen"        (heard at -0.91)
+jarvis "An alarm at 5:15 am tomorrow, sir?"
+you    "yes"
+jarvis "Alarm at 5:15 am tomorrow, sir."
+```
+
+- alarms — "An alarm at 5:15 am tomorrow, every day, sir?"
+- timers — "A timer for 5 minutes, sir?"
+- reminders — "A reminder to call mum at 5 pm, sir?"
+
+The question names what he *understood*, not what he heard, which is the
+point: you are checking the parse. A confident transcript is untouched, and
+so are typed and CLI turns, which carry no confidence at all. Calendar adds
+already had their own read-back and are unchanged.
+
+An unanswered question sets nothing: a "no", a change of subject, or 60
+seconds of silence all drop it (the same rule as "cancel all my alarms").
+The yes rides the follow-up window, which is 15 s while a read-back is open
+(§41).
+
+```json
+{ "confirm": { "read_back": true, "shaky_logprob": -0.7 } }
+```
+
+`read_back: false` turns off every read-back, the bulk cancels included.
+Raise `shaky_logprob` toward 0 to be asked more often, lower it (-0.9) to be
+asked only when the transcript is nearly garbled.
+
+## 43. Two things at once
+
+Tier-1 commands can be chained in one utterance, on the same conjunctions
+desktop chains have always used — "and then", "then", "and", a comma:
+
+```
+you    "set a timer for ten minutes and add milk to my todo list"
+jarvis "10 minutes, sir; I'll let you know. Added to your list, sir."
+```
+
+Both halves run, the replies are spoken as one, and the mic re-opens once.
+
+The rules, which are deliberately strict:
+
+- **The whole utterance is tried first.** Only if it means nothing as one
+  command is it split. This is what protects a body that contains "and" —
+  "remind me at 5 pm to buy milk and eggs" is one errand, always.
+- **Two halves, no more.** "add milk, eggs and bread to my todo list" is a
+  list, not three commands, so a three-way split is refused outright.
+- **Both halves must be Tier-1 commands** (timers, alarms, reminders,
+  to-dos, notes, focus, briefings — the ones answered without the model).
+  "set a timer for ten minutes and call my mother" runs neither and goes to
+  the model whole: half an answer is worse than none.
+
+- **A doubtful transcript is never split.** If the words scraped in under
+  `confirm.shaky_logprob` (§42), the compound goes to the model whole
+  rather than running two actions off a guess.
+
+Nothing to configure. If a pair you expect is not chaining, say each half
+on its own first — if either one needs the model, the pair will too.

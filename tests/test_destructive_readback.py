@@ -11,6 +11,7 @@ tmp_path through the real tool. App: the confidence plumbing from
 _process_audio to commander.handle.
 """
 import threading
+from datetime import datetime
 import time
 import types
 from types import SimpleNamespace
@@ -293,3 +294,99 @@ def test_claim_uncertain_settles_every_open_card():
         assert got[0].source == "voice"
     finally:
         bus.unsubscribe(UncertainResolved, got.append)
+
+
+# ------------------------------------ creation actions on a shaky transcript
+# 2026-08-30: shaky_transcript() was consumed only by the bulk cancels above,
+# so a misheard "5:15" vs "5:50" set the wrong alarm silently -- the daily
+# cost of the confidence gate not being wired to the creation paths. Alarms,
+# timers and reminders now read the PARSED result back when the transcript
+# scraped in under confirm.shaky_logprob, through the same stash_destructive /
+# _try_destructive_confirm machinery (so the offer expires and a change of
+# subject drops it). A confident transcript is untouched.
+@pytest.fixture
+def clock(rich):
+    c, svc = rich
+    svc.timekeeper.parse_when.return_value = datetime(2026, 8, 31, 7, 15)
+    svc.timekeeper.describe_due.return_value = "at 7:15 am tomorrow"
+    return c, svc
+
+
+def test_a_shaky_alarm_is_read_back_and_a_yes_sets_it(clock):
+    c, svc = clock
+    res = c.handle("set an alarm for seven fifteen", source="voice", confidence=-0.9)
+    assert res.reply == "An alarm at 7:15 am tomorrow, sir?" and res.speak
+    assert res.status == "Confirm?"
+    svc.timekeeper.add_alarm.assert_not_called()
+
+    res = c.handle("yes", source="voice", confidence=-0.2)
+    svc.timekeeper.add_alarm.assert_called_once()
+    assert res.reply == "Alarm at 7:15 am tomorrow, sir."
+
+
+def test_a_confident_alarm_is_set_outright(clock):
+    c, svc = clock
+    res = c.handle("set an alarm for seven fifteen", source="voice", confidence=-0.3)
+    svc.timekeeper.add_alarm.assert_called_once()
+    assert res.reply == "Alarm at 7:15 am tomorrow, sir."
+    # and a typed turn, which carries no confidence at all
+    svc.timekeeper.add_alarm.reset_mock()
+    c.handle("set an alarm for seven fifteen", source="typed")
+    svc.timekeeper.add_alarm.assert_called_once()
+
+
+def test_a_repeat_is_named_in_the_question(clock):
+    c, svc = clock
+    res = c.handle("set an alarm for seven fifteen every day", source="voice",
+                   confidence=-0.9)
+    assert res.reply == "An alarm at 7:15 am tomorrow, every day, sir?"
+    c.handle("yes", source="voice")
+    assert svc.timekeeper.add_alarm.call_args.args[2] == "daily"
+
+
+def test_a_shaky_timer_is_read_back(clock):
+    c, svc = clock
+    res = c.handle("set a timer for five minutes", source="voice", confidence=-0.9)
+    assert res.reply == "A timer for 5 minutes, sir?"
+    svc.timekeeper.add_timer.assert_not_called()
+    res = c.handle("yes", source="voice")
+    svc.timekeeper.add_timer.assert_called_once()
+    assert res.reply == "5 minutes, sir; I'll let you know."
+
+
+def test_a_shaky_reminder_is_read_back(clock):
+    c, svc = clock
+    res = c.handle("remind me to call mum at 5 pm", source="voice", confidence=-0.9)
+    assert res.reply == "A reminder to call mum at 7:15 am tomorrow, sir?"
+    svc.timekeeper.add_reminder.assert_not_called()
+    res = c.handle("yes", source="voice")
+    svc.timekeeper.add_reminder.assert_called_once_with(
+        datetime(2026, 8, 31, 7, 15).timestamp(), "call mum")
+    assert res.reply.startswith("Very good, sir; I'll remind you to call mum")
+
+
+def test_a_no_sets_nothing(clock):
+    c, svc = clock
+    c.handle("set an alarm for seven fifteen", source="voice", confidence=-0.9)
+    res = c.handle("no", source="voice")
+    assert res.reply == "Very good, sir." and res.status == "Dropped"
+    c.handle("yes", source="voice")
+    svc.timekeeper.add_alarm.assert_not_called()
+
+
+def test_a_new_subject_drops_the_creation_offer(clock):
+    """An unanswered read-back must never set an alarm later: the same rule
+    as a bulk cancel, because it is the same machinery."""
+    c, svc = clock
+    c.handle("set an alarm for seven fifteen", source="voice", confidence=-0.9)
+    c.handle("what's the weather tomorrow", source="typed")
+    c.handle("yes", source="voice")
+    svc.timekeeper.add_alarm.assert_not_called()
+
+
+def test_read_back_off_sets_a_shaky_alarm_anyway(clock):
+    c, svc = clock
+    svc.assistant.data["confirm.read_back"] = False
+    res = c.handle("set an alarm for seven fifteen", source="voice", confidence=-0.9)
+    svc.timekeeper.add_alarm.assert_called_once()
+    assert res.reply == "Alarm at 7:15 am tomorrow, sir."

@@ -525,6 +525,28 @@ def strip_jarvis_prefix(text: str) -> Optional[str]:
     return None
 
 
+# Two commands in one breath ("set a timer for ten minutes and add milk to
+# my to-dos"). The conjunctions are the ones _try_desktop has chained on
+# since the monolith; one regex for both so the splitters cannot drift.
+_CHAIN_SPLIT_RX = re.compile(r"\s+and then\s+|\s+then\s+|\s+and\s+|,\s*", re.I)
+MAX_CLAUSES = 2
+
+
+def split_clauses(text: str) -> list:
+    """The halves of a compound utterance, or [].
+
+    EXACTLY two, and only for a caller that has already failed to match the
+    whole utterance. A three-way split is far more often one command with a
+    list in its body ("add milk, eggs and bread to my to-dos") than three
+    commands, and refusing costs nothing: the model still answers.
+    """
+    parts = [p.strip(" ,.!?") for p in _CHAIN_SPLIT_RX.split(text or "")]
+    parts = [p for p in parts if p]
+    if len(parts) != MAX_CLAUSES:
+        return []
+    return [strip_jarvis_prefix(p) or p for p in parts]
+
+
 # ------------------------------------------------------------------
 # Command result + registry types
 # ------------------------------------------------------------------
@@ -1915,14 +1937,21 @@ def _h_timer(c, t, m):                                     # 3217-3231
     words = f"{n} {_unit_word(unit, n)}"
     tk = c._svc("timekeeper")
     if tk is not None:
-        tk.add_timer(seconds, label or f"{words} timer")
         line = f"{words}, sir; I'll let you know."
+        what = ""
         if label:
             what = label if re.match(r"^(?:the|my|a|an|your)\b", label, re.I) \
                 else f"the {label}"
             line = f"{words} for {what}, sir; I'll let you know."
-        return CommandResult(handled=True, reply=line, speak=True,
-                             status=f"Timer set: {words}")
+
+        def _run():
+            tk.add_timer(seconds, label or f"{words} timer")
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status=f"Timer set: {words}")
+        # A shaky transcript reads the parsed timer back first (_confirm_or_run)
+        ask = f"A {words} timer for {what}, sir?" if what \
+            else f"A timer for {words}, sir?"
+        return _confirm_or_run(c, _run, ask)
     workflows = c._svc("workflows")
     if workflows is None:
         return None
@@ -1952,11 +1981,17 @@ def _h_alarm(c, t, m):
     if due is None:
         return CommandResult(handled=True, reply=NO_WHEN_LINE, speak=True,
                              status="Alarm: when?")
-    tk.add_alarm(due, label, repeat)
     desc = _describe(tk, due, now, when)
     tail = {"daily": " Every day.", "weekdays": " Weekdays."}.get(repeat, "")
-    return CommandResult(handled=True, reply=f"Alarm {desc}, sir.{tail}",
-                         speak=True, status=f"Alarm {desc}")
+
+    def _run():
+        tk.add_alarm(due, label, repeat)
+        return CommandResult(handled=True, reply=f"Alarm {desc}, sir.{tail}",
+                             speak=True, status=f"Alarm {desc}")
+    # A misheard hour is the daily cost of a confident guess: on a shaky
+    # transcript the parsed time is read back before anything is set.
+    asked = {"daily": ", every day", "weekdays": ", weekdays"}.get(repeat, "")
+    return _confirm_or_run(c, _run, f"An alarm {desc}{asked}, sir?")
 
 
 def _h_list_schedule(c, t, m):
@@ -1997,6 +2032,28 @@ def _pending_count(tk, kind: str) -> int:
         return len(items)
     except Exception:
         return 0
+
+
+def _confirm_or_run(c, run: Callable[[], CommandResult],
+                    question: str) -> CommandResult:
+    """Commit the creation, or read the PARSED result back first when the
+    transcript scraped in under confirm.shaky_logprob.
+
+    "5:15" and "5:50" differ by one phoneme and the cost of the wrong one
+    lands hours later, in the dark; the same for "remind me at two" heard
+    as "at ten". A confident transcript stays zero-friction -- this branch
+    only fires on the doubtful tail the confidence gate already measures --
+    and the yes costs one second through the follow-up window that any
+    spoken reply opens. Reusing stash_destructive means the answer is
+    resolved by _try_destructive_confirm, so the offer expires after
+    DESTRUCTIVE_TTL_S and a change of subject drops it, exactly like a bulk
+    cancel: an unanswered read-back must never set an alarm later.
+    """
+    if _assistant_get(c, "confirm.read_back", True) and c.shaky_transcript():
+        c.stash_destructive(run, question)
+        return CommandResult(handled=True, reply=question, speak=True,
+                             status="Confirm?")
+    return run()
 
 
 def _wants_read_back(c, n: int) -> bool:
@@ -2240,6 +2297,28 @@ _LECTURE_RX = re.compile(
 _LECTURE_END_RX = re.compile(
     r"^(?:(?:end|stop|close|finish|save)\s+(?:the\s+|my\s+)?(?:lecture\s+|class\s+)?notes"
     r"|(?:end|stop)\s+(?:the\s+)?note[- ]taking)(?:[, ]+(?:please|now|jarvis))*[.!?]*$", re.I)
+# A deliberate note from a source the mode does not listen to: `jarvis
+# "note: the demo is on friday"` while the lecture runs on the microphone.
+_NOTE_PREFIX_RX = re.compile(r"^note\s*[:\-]\s*(?P<body>\S.*)$", re.I)
+
+
+def _dictation_end(text: str) -> bool:
+    """"end dictation" closes the mode from ANY source. The mode itself is
+    voice-only (_handle_inner), so a terminal that sees it in "status"
+    needs a way to close it."""
+    return "end dictation" in (text or "").lower()
+
+
+def _lecture_end(text: str) -> bool:
+    """Same rule for lecture notes: the end phrase is honoured from any
+    source, so "jarvis 'end notes'" from a shell closes the capture."""
+    return bool(_LECTURE_END_RX.match(strip_address(text).strip().lower()))
+
+
+def _note_prefix(text: str) -> Optional[str]:
+    """"note: the demo is on friday" -> "the demo is on friday", else None."""
+    m = _NOTE_PREFIX_RX.match(strip_address(text).strip())
+    return m.group("body").strip() if m else None
 
 
 def _h_lecture_start(c, t, m):
@@ -2861,12 +2940,17 @@ def _h_remind_me(c, t, m):                                 # 3465-3483
     if due is None:
         return CommandResult(handled=True, reply=NO_WHEN_LINE, speak=True,
                              status="Reminder: when?")
-    tk.add_reminder(due, task)
     desc = _describe(tk, due, now, when)
     what = task if re.match(r"^(?:that|about)\b", task, re.I) else f"to {task}"
-    return CommandResult(handled=True,
-                         reply=f"Very good, sir; I'll remind you {what} {desc}.",
-                         speak=True, status=f"Reminder {desc}: {task[:30]}")
+
+    def _run():
+        tk.add_reminder(due, task)
+        return CommandResult(handled=True,
+                             reply=f"Very good, sir; I'll remind you {what} {desc}.",
+                             speak=True, status=f"Reminder {desc}: {task[:30]}")
+    # Both halves can be misheard here -- the hour and the errand itself --
+    # so a shaky transcript reads the whole parse back (_confirm_or_run).
+    return _confirm_or_run(c, _run, f"A reminder {what} {desc}, sir?")
 
 
 # ---- Tier 1 ambient: do not disturb / quiet hours / I am free ------------
@@ -4015,12 +4099,30 @@ class Commander:
         res = self._try_ringing(text)
         if res is not None:
             return res
-        # 1a. Dictation mode — type directly, don't route (2611-2630)
+        # 1a-1b. The sticky modes belong to the MICROPHONE. Dictation and
+        #    lecture notes swallow every later utterance, and they used to do
+        #    it whatever the source: with notes open, `jarvis "what's the
+        #    weather"` from a tmux shell was filed as a lecture line and a
+        #    Discord message became a quiz answer -- and in dictation mode a
+        #    CLI turn was typed into whatever window happened to be focused.
+        #    A turn that arrives down a socket is a different room, so it
+        #    routes normally. Two escapes keep a terminal in control of a
+        #    mode it cannot see: the explicit end phrase works from ANY
+        #    source (with "status" naming the open modes), and "note: ..."
+        #    files a deliberate line while a lecture is open.
         if self.dictation:
-            return self._handle_dictation(text)
+            if source == "voice" or _dictation_end(text):
+                return self._handle_dictation(text)
         # 1b. Lecture notes open: file it, unless it is "end notes".
         if getattr(self, "lecture_course", None):
-            return self._handle_lecture(text, source)
+            note = None if source == "voice" else _note_prefix(text)
+            # getattr(self, "_lecture", None) is None: the flag outlived its
+            # file (a failed write). That recovery clears the flag and
+            # re-dispatches, so it must run for EVERY source -- otherwise a
+            # box that only ever sees CLI turns keeps a ghost mode forever.
+            if source == "voice" or note is not None or _lecture_end(text) \
+                    or getattr(self, "_lecture", None) is None:
+                return self._handle_lecture(text, source, note=note)
         # 2b. "No, I said X": ahead of every yes/no stage, which would read
         #     it as a bare decline (parse_yes_no: any sentence opening with
         #     "no" is a no).
@@ -4033,7 +4135,7 @@ class Commander:
             return res
         # 3a'. A quiz question is on the table: this is the answer (or
         #      "skip" / "stop the quiz").
-        res = self._try_quiz_answer(text)
+        res = self._try_quiz_answer(text, source)
         if res is not None:
             return res
         # 3a''. "Teach me X" ended with "say quiz me and I'll test you on
@@ -4117,6 +4219,11 @@ class Commander:
             res = self._try_registry(cmd_text)
             if res is not None:
                 return res
+            # 3'. The same table again, per clause, for a compound ask.
+            #     After the whole-utterance attempt, never before it.
+            res = self._try_multi(cmd_text, self._try_registry)
+            if res is not None:
+                return res
 
         # 4. Intent classification — voice only; typed text is deliberate
         #    (2642-2653). "discord" and any other channel count as typed,
@@ -4135,6 +4242,11 @@ class Commander:
         #    vocabulary patches of 08-27 and 08-30 each fixed once.
         if gate and source == "voice" and cmd_text is None:
             name = self._match_assistant(text)
+            # A compound of two Tier-1 commands is addressed to Jarvis for
+            # the same reason each half is: without this the classifier
+            # calls the pair background chat and drops it in silence.
+            if not name and self._multi_match(text):
+                name = "multi-intent"
             if name:
                 log.info("tier-1 match %r bypasses the intent gate: %r",
                          name, text)
@@ -4369,9 +4481,13 @@ class Commander:
             self._type_raw(text + " ")
         return CommandResult(handled=True, reply=text, status="Dictating")
 
-    def _handle_lecture(self, text: str, source: str = "voice") -> CommandResult:
-        body = strip_address(text).strip()
-        if _LECTURE_END_RX.match(body.lower()):
+    def _handle_lecture(self, text: str, source: str = "voice",
+                        note: Optional[str] = None) -> CommandResult:
+        """File one line. ``note`` is the body of an explicit "note: ..."
+        from a source the mode does not otherwise listen to -- it is filed
+        verbatim, so "note: end notes" writes a line instead of closing."""
+        body = note if note is not None else strip_address(text).strip()
+        if note is None and _LECTURE_END_RX.match(body.lower()):
             capture, self._lecture = self._lecture, None
             course, self.lecture_course = self.lecture_course, None
             line = capture.close() if capture is not None else lecture_mod.END_NONE_LINE
@@ -4410,7 +4526,7 @@ class Commander:
             return False
 
         # Split on "and then", "then", "and", commas for chained commands
-        parts = re.split(r"\s+and then\s+|\s+then\s+|\s+and\s+|,\s*", cmd_text)
+        parts = _CHAIN_SPLIT_RX.split(cmd_text)
         parts = [p.strip() for p in parts if p.strip()]
         if not parts:
             return False
@@ -4731,8 +4847,15 @@ class Commander:
                                  status="Add failed")
         return CommandResult(handled=True, reply=line, speak=True, status="Added")
 
-    def _try_quiz_answer(self, text: str) -> Optional[CommandResult]:
-        """While a quiz question is open, the utterance is the answer.
+    def _try_quiz_answer(self, text: str,
+                         source: str = "voice") -> Optional[CommandResult]:
+        """While a quiz question is open, the SPOKEN utterance is the answer.
+
+        Only the spoken one: a `jarvis "..."` from a shell or a Discord
+        message arrives while the quiz sits on the microphone, and grading
+        it as the answer both loses the command and marks a card wrong.
+        The stop words are honoured from any source so a terminal can end a
+        quiz it can see in "status".
 
         Stop words end the quiz with the tally; skip words reveal the
         answer and move on; a fresh "quiz me" / "review my flashcards"
@@ -4759,6 +4882,8 @@ class Commander:
             self._pending_quiz = None
             return CommandResult(handled=True, reply=session.score_line(), speak=True,
                                  status="Quiz stopped")
+        if source != "voice":
+            return None            # not the answer: route it as a command
         card = session.current
         if _QUIZ_SKIP_RX.match(tl):
             session.settle(None)
@@ -4918,6 +5043,75 @@ class Commander:
         log.info("web lookup (%s): %r", model, d.prompt)
         return CommandResult(handled=True, reply=WEB_LOOKUP_LINE, speak=True,
                              ack=True, status="Looking it up…", done=False)
+
+    def _try_multi(self, text: str, run_one) -> Optional[CommandResult]:
+        """Two Tier-1 commands in one utterance.
+
+        Called ONLY after the whole utterance failed to match, and that
+        ordering is the whole safety argument: "remind me to buy milk and
+        eggs" matches _REMIND_RX whole, so its body is never split. What
+        reaches here already had no meaning as one command.
+
+        Every clause must match a Tier-1 command on its own or nothing runs
+        and the compound goes to the model untouched -- half an answer is
+        worse than none, and a clause that is really part of one thought
+        ("...and eggs") matches nothing, which is what keeps this honest.
+        """
+        parts = self._multi_match(text)
+        if not parts:
+            return None
+        if self.shaky_transcript():
+            # The split is itself a guess about the words. On a transcript
+            # that scraped in under confirm.shaky_logprob, running TWO
+            # actions off it is the wrong kind of confident -- and the
+            # creation read-backs cannot help, since a second clause would
+            # overwrite the first one's pending question. The model gets
+            # the compound whole, as it did before this feature.
+            log.info("multi-intent: declining a shaky compound %r", text)
+            return None
+        # Each clause is its own turn for the handlers that re-read the raw
+        # utterance (_h_remind_me, _h_lecture_start): left whole, _REMIND_RX
+        # would re-match the compound and take the other clause as the body.
+        raw = getattr(self, "_raw_text", "")
+        results = []
+        try:
+            for part in parts:
+                self._raw_text = part
+                try:
+                    res = run_one(part)
+                except Exception:
+                    log.exception("multi-intent: clause %r failed", part)
+                    res = None
+                if res is None or not res.handled:
+                    log.warning("multi-intent: clause %r matched but did "
+                                "nothing", part)
+                    continue
+                results.append(res)
+        finally:
+            self._raw_text = raw
+        if not results:
+            return None
+        log.info("multi-intent: %d of %d clauses ran for %r",
+                 len(results), len(parts), text)
+        replies = [str(r.reply).strip() for r in results if r.reply]
+        statuses = [r.status for r in results if r.status]
+        return CommandResult(
+            handled=True,
+            reply=" ".join(replies) or None,
+            speak=any(r.speak for r in results),
+            status=" + ".join(statuses) or None,
+            # one follow-up window for the pair: it opens once the last
+            # clause is done
+            done=all(r.done for r in results),
+            ack=any(r.ack for r in results))
+
+    def _multi_match(self, text: str) -> list:
+        """The clauses of a compound whose EVERY half is a Tier-1 command
+        on its own, else []. A probe: no handler runs."""
+        parts = split_clauses(text)
+        if parts and all(self._match_assistant(p) for p in parts):
+            return parts
+        return []
 
     def _match_assistant(self, text: str) -> Optional[str]:
         """The name of the ASSISTANT_TIER1 command whose matcher accepts
@@ -5230,6 +5424,11 @@ class Commander:
                         return res
             # Assistant Tier 1 (timers, reminders, alarms, notes, briefing).
             res = self._try_assistant(text)
+            if res is not None:
+                return res
+            # ... then the same rung per clause for a compound ask, which
+            # the model would otherwise answer half of.
+            res = self._try_multi(text, self._try_assistant)
             if res is not None:
                 return res
             # Router: local model / Claude / one question / session action.

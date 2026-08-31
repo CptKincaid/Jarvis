@@ -224,7 +224,7 @@ def test_end_phrasings(cmdr, text):
 def test_no_notes_store_still_writes_the_file(cmdr, folder):
     cmdr.services.notes = None
     cmdr.handle("notes for biosensors", "typed")
-    cmdr.handle("a line", "typed")
+    cmdr.handle("a line", "voice")          # the mode files spoken lines only
     assert cmdr.handle("end notes", "typed").reply == END_LINE.format(n="one line",
                                                                        course="biosensors")
     assert "a line" in next((folder / "notes").glob("biosensors-*.md")).read_text()
