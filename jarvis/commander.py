@@ -181,6 +181,8 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- ambient (2026-08-30): the room tone switch ---
+        "room tone", "ambience", "ambient sound", "ambient noise",
         # --- round 2 (2026-08-30): teach-me mode and the study ledger ---
         "teach me", "tutor me", "walk me through", "how much did i study",
         "streak", "study this week",
@@ -3431,6 +3433,26 @@ _QUIET_STATUS_RX = re.compile(
     r"|(?:what|when) are (?:my|the) quiet hours|quiet status|is (?:do not disturb|dnd) on)"
     r"[?.!\s]*$", re.I)
 
+# Room tone (jarvis/roomtone.py). The bed ships OFF and its own proposal
+# requires an explicit SPOKEN opt-in, so this is the switch -- and it has to
+# be reversible in one utterance, because the failure mode of ambience is
+# that it is quietly costing you wake words while you wonder why.
+_ROOM_TONE_NAME = r"(?:room ?tone|ambience|ambient (?:sound|noise)|the bed)"
+_ROOM_TONE_RX = re.compile(
+    r"^" + _JV + r"(?:"
+    r"(?P<status>(?:is|is the|what's|whats)\s+(?:the\s+)?" + _ROOM_TONE_NAME +
+    r"\s*(?:on|off|running|playing)?)"
+    r"|(?:turn|switch|put)\s+(?P<state1>on|off)\s+(?:the\s+|my\s+)?" + _ROOM_TONE_NAME +
+    r"|(?P<verb2>turn|switch|start|stop|kill|end|play|enable|disable)?\s*"
+    r"(?:the\s+|my\s+)?" + _ROOM_TONE_NAME + r"(?:\s+(?P<state2>on|off))?"
+    r")[?.!\s]*$", re.I)
+_ROOM_TONE_ON_VERBS = ("start", "play", "enable")
+_ROOM_TONE_OFF_VERBS = ("stop", "kill", "end", "disable")
+ROOM_TONE_ON_LINE = ("Room tone on, sir. Tell me if it costs me a wake word.")
+ROOM_TONE_OFF_LINE = "Room tone off, sir."
+ROOM_TONE_STATUS_ON = "The room tone is on, sir."
+ROOM_TONE_STATUS_OFF = "The room tone is off, sir."
+
 
 def _dnd_seconds(c, mode: str, when: str, now: datetime) -> Optional[float]:
     """'for an hour' / 'until seven' -> seconds from now; None = unparseable."""
@@ -3529,6 +3551,49 @@ def _h_free(c, t, m):
     line = q.free()
     bus.publish(Status(text="Free", kind="info"))
     return CommandResult(handled=True, reply=line, speak=True, status="Free")
+
+
+def _h_room_tone(c, t, m):
+    """"room tone on" / "stop the room tone" / "is the room tone on".
+
+    Writes ambience.room_tone through _persist_preference, so the switch he
+    speaks survives a restart and is recorded as a preference. The player
+    reads the key every tick, so there is nothing to restart.
+    """
+    cfg = c._svc("assistant")
+    if cfg is None:
+        return None
+    if m.group("status"):
+        on = bool(cfg.get("ambience.room_tone", False))
+        return CommandResult(handled=True, speak=True,
+                             reply=ROOM_TONE_STATUS_ON if on else ROOM_TONE_STATUS_OFF,
+                             status=f"Room tone {'on' if on else 'off'}")
+    state = (m.group("state1") or m.group("state2") or "").lower()
+    verb = (m.group("verb2") or "").lower()
+    if not state:
+        if verb in _ROOM_TONE_ON_VERBS:
+            state = "on"
+        elif verb in _ROOM_TONE_OFF_VERBS:
+            state = "off"
+    if not state:
+        # A bare "room tone" is a question, not an order: acting on it would
+        # start audio he never asked for.
+        on = bool(cfg.get("ambience.room_tone", False))
+        return CommandResult(handled=True, speak=True,
+                             reply=ROOM_TONE_STATUS_ON if on else ROOM_TONE_STATUS_OFF,
+                             status=f"Room tone {'on' if on else 'off'}")
+    want = state == "on"
+    if not _persist_preference(c, "ambience.room_tone", want):
+        return None
+    tone = c._svc("roomtone")
+    if tone is not None and not want:
+        try:
+            tone.settle()        # down now, rather than at the next tick
+        except Exception:
+            log.exception("room tone could not be stopped")
+    return CommandResult(handled=True, speak=True,
+                         reply=ROOM_TONE_ON_LINE if want else ROOM_TONE_OFF_LINE,
+                         status=f"Room tone {'on' if want else 'off'}")
 
 
 def _h_quiet_status(c, t, m):
@@ -4152,6 +4217,9 @@ REGISTRY: list[Command] = [
     Command("remind me", _REMIND_RX.match, _h_remind_me),
     # ambient (jarvis/quiet.py): before "free" so "I'm free until seven"
     # does not read as a DND request, and status before the hours setter.
+    # "room tone" comes first of all: "stop the room tone" must not be read
+    # by the media handlers as "stop", and it needs only the config.
+    Command("room tone", _ROOM_TONE_RX.match, _h_room_tone, needs=("assistant",)),
     Command("quiet status", _QUIET_STATUS_RX.match, _h_quiet_status, needs=("quiet",)),
     Command("quiet hours off", _QUIET_HOURS_OFF_RX.match, _h_quiet_hours_off,
             needs=("quiet",)),
@@ -4188,7 +4256,7 @@ ASSISTANT_TIER1: list[Command] = [
                     # notes tool instead of the memory it was pitched for
                     "person", "remember", "recall", "last seen", "who is", "recap",
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
-                    "free",
+                    "free", "room tone",
                     "standup", "gpu reclaim", "gpu lend",
                     "log triage", "slow turn",
                     # the hotword consumes the wake word, so spoken text never

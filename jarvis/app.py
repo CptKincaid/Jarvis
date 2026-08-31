@@ -37,7 +37,9 @@ from jarvis.events import (
     AlarmFired,
     ApprovalRequested,
     ApprovalResolved,
+    ArcChanged,
     BriefingReady,
+    HotwordDetected,
     ClaudeProgress,
     ClaudeTaskState,
     JarvisReply,
@@ -263,6 +265,12 @@ class JarvisApp:
         # built further down; both are started in start_assistant.
         self.presence = self._construct("presence", self._make_presence)
         self.quiet = self._construct("quiet", self._make_quiet)
+        # The arc names the hour and publishes ArcChanged; it is a state
+        # source with no side effects, so it is safe to build before the
+        # services exist. Room tone is one of its consumers and is OFF
+        # unless he has said otherwise.
+        self.arc = self._construct("arc", self._make_arc)
+        self.roomtone = self._construct("roomtone", self._make_roomtone)
 
         # ---- speech -------------------------------------------------------
         # The arbiter is built here, ahead of the mic consumers below, because
@@ -372,9 +380,30 @@ class JarvisApp:
         bus.subscribe(ReminderFired, self._on_reminder_fired)
         bus.subscribe(JarvisReply, self._on_reply_for_discord)
         bus.subscribe(Presence, self._on_presence)
+        self._wire_roomtone()
 
         if CONFIG.target_name:
             self.desktop.restore_target(CONFIG.target_name)
+
+    def _wire_roomtone(self):
+        """The bed must never be inside a capture or under a reply.
+
+        Mic safety is the room tone's design constraint, not a footnote:
+        there is no AEC on this box and the Snowball shares the room with
+        the speaker, so a bed that is merely QUIET during a capture still
+        reaches Whisper, the Silero endpointer and the ECAPA gate. These
+        subscriptions assert a HARD mute -- the stream is killed, not faded
+        -- for the whole of every capture and every spoken reply, and the
+        wake word mutes it before the mic even opens.
+        """
+        tone = getattr(self, "roomtone", None)
+        if tone is None:
+            return
+        bus.subscribe(HotwordDetected, tone.on_wake)
+        bus.subscribe(RecordingStarted, tone.on_mic_open)
+        bus.subscribe(RecordingStopped, tone.on_mic_close)
+        bus.subscribe(SpeakingState, tone.on_speaking)
+        bus.subscribe(ArcChanged, tone.on_arc)
 
     # ------------------------------------------------------ construction
     def _construct(self, name, factory):
@@ -451,6 +480,27 @@ class JarvisApp:
         except Exception:
             log.exception("quiet: banner gate not installed")
         return policy
+
+    def _make_arc(self):
+        mod = _import_optional("jarvis.arc")
+        if mod is None:
+            return None
+        # Late-bound lambdas: focus is built after the services, and the arc
+        # must not capture a None that never becomes a session.
+        return mod.Arc(self.assistant, quiet=lambda: getattr(self, "quiet", None),
+                       presence=lambda: getattr(self, "presence", None),
+                       focus=lambda: getattr(self, "focus", None),
+                       state_path=PATHS.MEMORY_DIR / mod.STATE_NAME,
+                       tick_s=float(self.assistant.get("arc.tick_s", mod.TICK_S) or mod.TICK_S))
+
+    def _make_roomtone(self):
+        mod = _import_optional("jarvis.roomtone")
+        if mod is None:
+            return None
+        return mod.RoomTone(self.assistant, arc=lambda: getattr(self, "arc", None),
+                            quiet=lambda: getattr(self, "quiet", None),
+                            presence=lambda: getattr(self, "presence", None),
+                            turns=lambda: getattr(self, "turns", None))
 
     def _make_notes(self):
         mod = _import_optional("jarvis.tools.notes")
@@ -813,6 +863,9 @@ class JarvisApp:
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
             quiet=self.quiet, presence=self.presence,
+            # the arc (a state source; nothing calls it, they subscribe) and
+            # the room tone the "room tone on/off" command switches
+            arc=self.arc, roomtone=self.roomtone,
         )
 
     # ------------------------------------------------------- brain executor
@@ -2720,7 +2773,11 @@ class JarvisApp:
                     sampler.start()
                 except Exception:
                     log.exception("activity sampler failed to start")
-        for name, obj in (("presence", self.presence), ("quiet", self.quiet)):
+        for name, obj in (("presence", self.presence), ("quiet", self.quiet),
+                          # arc after both: its first tick should see the
+                          # real quiet reason and presence state, not the
+                          # "unknown" a sentinel reports before its first probe.
+                          ("arc", self.arc), ("roomtone", self.roomtone)):
             if obj is None:
                 continue
             try:
@@ -2916,6 +2973,11 @@ class JarvisApp:
                           ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),
                           ("quiet", getattr(self, "quiet", None)),
+                          # roomtone first of the pair: its stop() takes the
+                          # paplay stream down, and a bed left playing over a
+                          # stopped app is the one failure you can hear.
+                          ("roomtone", getattr(self, "roomtone", None)),
+                          ("arc", getattr(self, "arc", None)),
                           ("dayreviewer", getattr(self, "dayreviewer", None)),
                           ("garden", getattr(self, "garden", None))):
             if obj is None:
