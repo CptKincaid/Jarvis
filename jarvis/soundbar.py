@@ -76,6 +76,11 @@ WORDS = {BLUETOOTH: "the soundbar", HDMI: "the monitor", USB: "the USB speakers"
 DROP_LINE = "I'm coming out of {now}, sir; {preferred} has dropped."
 DROP_LINE_NO_TARGET = "{Preferred} has dropped, sir; I've nowhere to speak from."
 BACK_LINE = "{Preferred} is back, sir; I'm still coming out of {now}."
+# The first sight of a box where the good speaker is ON and unused. Said
+# once, ever: PipeWire does not always follow a soundbar that reconnects,
+# and "why is he coming out of the monitor" is the exact confusion this
+# module exists to end.
+ELSEWHERE_LINE = "{Preferred} is available, sir, but I'm coming out of {now}."
 BACK_MOVED_LINE = "{Preferred} is back, sir; I've moved my voice across."
 DEAD_LINE = "I've no working audio output at all, sir."
 OK_LINE = "I'm coming out of {now}, sir."
@@ -485,6 +490,12 @@ class SoundbarSentinel:
             if reading.get("moved"):
                 return BACK_MOVED_LINE.format(Preferred=_head(pref))
             return BACK_LINE.format(Preferred=_head(pref), now=now_words)
+        if status == "elsewhere" and not previous:
+            # First sight of this box, with the good speaker on and unused.
+            # NOT said on a later ok -> elsewhere: that is him switching the
+            # default himself, and following him around with commentary is
+            # how a warning stops being worth hearing.
+            return ELSEWHERE_LINE.format(Preferred=_head(pref), now=now_words)
         return ""                                  # ok <-> elsewhere is his own doing
 
     @staticmethod
@@ -500,8 +511,14 @@ class SoundbarSentinel:
 
     # ------------------------------------------------------------- answer
     def status_line(self) -> str:
-        """"Where's my audio going" -- from the last tick's reading, never
-        a fresh subprocess: this runs inside a spoken turn."""
+        """"Where's my audio going" -- from the last tick's reading.
+
+        This runs inside a spoken turn, so it does not probe: the watch has
+        a reading at most 30 s old and a sink does not move in between. The
+        one exception is a question asked before the first tick (the watch
+        waits 45 s at boot), where one bounded pactl call beats answering
+        "I can't see this machine's audio devices" about a working box.
+        """
         reading = dict(self._seen)
         if not reading:
             reading = self.read() if self.enabled else {"status": "off"}

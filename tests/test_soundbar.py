@@ -181,6 +181,19 @@ def test_the_soundbar_coming_back_points_at_it(tmp_path):
     assert run.writes == []                     # restore is off by default
 
 
+def test_a_soundbar_that_is_on_and_unused_earns_one_line(tmp_path):
+    """PipeWire does not always follow a soundbar that reconnects, and
+    "why is he coming out of the monitor" is the confusion this ends."""
+    say = Speaker()
+    s = sentinel(tmp_path, run=FakeRun(sinks=BOTH, default=HDMI), say=say,
+                 **{"audio.preferred_sink": "bluez"})
+    assert s.tick()["status"] == "elsewhere"
+    assert say.texts == ["The soundbar is available, sir, but I'm coming out "
+                         "of the monitor."]
+    s.tick()
+    assert len(say.texts) == 1                  # once, not every half minute
+
+
 def test_restore_is_off_by_default_and_never_writes(tmp_path):
     run = FakeRun(sinks=BOTH, default=HDMI)
     s = sentinel(tmp_path, run=run, **{"audio.preferred_sink": "bluez"})
