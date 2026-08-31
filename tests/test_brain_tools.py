@@ -368,7 +368,9 @@ def test_the_render_round_is_offered_once_and_never_speaks_the_result(
                     tool_reply(("get_weather", {"when": "tomorrow"}))]
     tags = b._chat_sync("briefing", force_tool="get_briefing")
     assert tags[0][0] == "BRIEFING"
-    assert tags[1] == ("SPEAK", brain.TOOL_ONLY_LINE)
+    # the SOURCE is named -- "your briefing" is the repo's own word for the
+    # tool -- and not one syllable of what the briefing said
+    assert tags[1] == ("SPEAK", brain.tool_only_line(["get_briefing"]))
     assert "Weather: 72 and sunny" not in tags[1][1]
     # exactly two: the reservation is one round, not an unbounded retry
     assert len(fake.chat_payloads()) == 2
@@ -389,7 +391,7 @@ def test_max_rounds_exhausted_speaks_a_persona_line(brain, setup):
     tags = b._chat_sync("weather", max_rounds=3)
     assert len(fake.chat_payloads()) == 4     # 3 tool rounds + the render
     assert len(record) == 3, "the render round ran a tool"
-    assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
+    assert tags == [("SPEAK", brain.tool_only_line(["get_weather"]))]
 
 
 def test_rounds_exhausted_still_puts_the_result_into_words(brain, setup):
@@ -437,7 +439,8 @@ def test_the_reserved_round_is_the_last_one_over_budget(brain, setup,
                         or clock[0])
     fake.replies = [tool_reply(("get_weather", {"when": "now"}))] * 4
     tags = b._chat_sync("weather", max_rounds=3)
-    assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
+    assert tags == [("SPEAK", brain.tool_only_line(["get_weather"]))]
+    assert "72" not in tags[0][1], "the tool text reached the spoken line"
     assert len(fake.chat_payloads()) == 2
     assert len(record) == 1
 
@@ -491,7 +494,8 @@ def test_timeout_speaks_the_slow_line_or_the_tool_only_line(brain, setup):
     fake.replies = [tool_reply(("get_weather", {"when": "now"})),
                     TimeoutError("read timed out")]
     tags = b._chat_sync("weather")
-    assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
+    assert tags == [("SPEAK", brain.tool_only_line(["get_weather"]))]
+    assert "72" not in tags[0][1], "the tool text reached the spoken line"
 
 
 def test_http_seam_maps_connection_refused(brain, monkeypatch):
@@ -799,8 +803,9 @@ def test_hostile_mail_is_not_spoken_when_the_rounds_run_out(brain,
     b, fake = _mail_brain(brain, monkeypatch)
     fake.replies = [tool_reply(("get_mail", {}))] * 4
     tags = b._chat_sync("any new mail?", max_rounds=2)
-    assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
+    assert tags == [("SPEAK", brain.tool_only_line(["get_mail"]))]
     assert "vault code" not in tags[0][1]
+    assert "Subject" not in tags[0][1]
 
 
 def test_hostile_mail_is_not_spoken_when_the_budget_blows(brain, monkeypatch):
@@ -831,8 +836,9 @@ def test_hostile_mail_is_not_spoken_by_the_reserved_render_round(brain,
                         or clock[0])
     fake.replies = [tool_reply(("get_mail", {})), text_reply("")]
     tags = b._chat_sync("any new mail?")
-    assert tags == [("SPEAK", brain.TOOL_ONLY_LINE)]
+    assert tags == [("SPEAK", brain.tool_only_line(["get_mail"]))]
     assert "vault code" not in tags[0][1]
+    assert "Subject" not in tags[0][1]
 
 
 def test_hostile_mail_is_not_spoken_when_the_model_times_out(brain,
@@ -840,7 +846,8 @@ def test_hostile_mail_is_not_spoken_when_the_model_times_out(brain,
     b, fake = _mail_brain(brain, monkeypatch)
     fake.replies = [tool_reply(("get_mail", {})),
                     TimeoutError("read timed out")]
-    assert b._chat_sync("any new mail?") == [("SPEAK", brain.TOOL_ONLY_LINE)]
+    assert b._chat_sync("any new mail?") == \
+        [("SPEAK", brain.tool_only_line(["get_mail"]))]
 
 
 def test_a_huge_hostile_subject_is_capped_and_the_reply_says_so(brain,
@@ -990,3 +997,198 @@ def test_sequential_mail_would_have_starved_the_calendar(brain, monkeypatch):
                         max_rounds=3)
     assert tags == [("SPEAK", "Jane moved standup to two thirty, sir.")]
     assert ran == ["get_mail"], "a new tool started past the tool deadline"
+
+
+# ========================================== the live 15:14 turn, replayed
+#
+# 2026-08-31, twice by CLI and once by voice: "What's on my calendar and
+# what's on my latest email?" — and Jarvis STILL answered the apology,
+# after the render reservation had been added. The log, warm and resident
+# (/tmp/vss_voice/jarvis.log):
+#
+#   15:14:09.218 brain chat: What's on my calendar and what's on my ...
+#   15:14:21.162 brain tool get_calendar -> ok=True Today: 9:10 am ...
+#   15:14:21.163 brain chat: over the tool budget mid-round
+#   15:14:21.163 brain chat: 5.0s tool budget spent; reserving a render round
+#   15:14:22.596 brain chat: render round asked for 1 more tools; writing
+#                            the answer instead
+#   15:14:22.596 brain chat reply (10.68s wall, 6.95s ollama overhead):
+#                            I have the result, sir, ...
+#
+# Two things are wrong in those six lines and each has a test below.
+#
+# (1) THE CLOCK. get_calendar costs about 5 ms on this box (measured live
+#     at 15:15:56 and 15:20:00), so the 9.24 s between the turn starting
+#     and that tool line is the model's FIRST round — 6.95 s of it Ollama
+#     reloading the 26B. The old deadline (turn start + 5 s) had therefore
+#     expired before a single tool ran, and the mail half of the question
+#     was cut mid-round before it started.
+#
+# (2) THE MUTE ROUND. The reserved round is sent with the schemas
+#     stripped, and it asked for a tool anyway, with empty content —
+#     because the transcript it was handed is a run of tool calls (one of
+#     them left unanswered by (1)) with no instruction to conclude.
+ROUND_WALL_S = 9.24         # a first round on this box, warm
+ROUND_LOAD_S = 6.95         # ...of which this is Ollama's own reload
+BOTH_HALVES = ("Four classes today, sir, starting with Biosensors at ten "
+               "past nine, and your latest mail is from advising.")
+
+
+def _round(reply, load_s):
+    """A scripted reply carrying a specific Ollama load_duration."""
+    return dict(reply, load_duration=int(load_s * 1e9))
+
+
+def _clocked_turn(brain, monkeypatch, round_wall=ROUND_WALL_S,
+                  tools=(("get_calendar", 0.005), ("get_mail", 3.5))):
+    """A brain on a fake clock where every /api/chat round burns
+    ``round_wall`` seconds and each tool burns the seconds it is given.
+    The scripted replies say how much of a round was load_duration."""
+    clock = [0.0]
+    monkeypatch.setattr(brain.time, "monotonic", lambda: clock[0])
+    reg = ToolRegistry()
+    ran = []
+    for name, secs in tools:
+        def handler(_name=name, _secs=secs, **_):
+            ran.append(_name)
+            clock[0] += _secs
+            return ToolResult(text=f"{_name} said something private")
+        reg.register(ToolSpec(name, f"the {name}",
+                              {"type": "object", "properties": {}}, handler))
+    monkeypatch.setattr(brain, "_REGISTRY", reg)
+
+    class Clocked(FakeOllama):
+        def __call__(self, path, payload=None, timeout=None):
+            if path == "/api/chat":
+                clock[0] += round_wall
+            return super().__call__(path, payload, timeout)
+
+    fake = Clocked()
+    monkeypatch.setattr(brain, "_http", fake)
+    return brain.JarvisBrain(context=FakeContext(), memory=None), fake, ran
+
+
+def test_the_1514_turn_runs_both_halves_of_the_question(brain, monkeypatch):
+    """(1) The model's own 9.24 s round must not spend the tool budget.
+
+    Without the fix the deadline (start + 5 s) is already gone when round
+    one returns, so get_calendar runs, get_mail is cut, and the answer can
+    only ever be half of what was asked."""
+    b, fake, ran = _clocked_turn(brain, monkeypatch)
+    fake.replies = [_round(tool_reply(("get_calendar", {}), ("get_mail", {})),
+                           ROUND_LOAD_S),
+                    _round(text_reply(BOTH_HALVES), 0.0)]
+    tags = b._chat_sync("what's on my calendar and what's on my latest email?")
+    assert ran == ["get_calendar", "get_mail"], \
+        "the model's own latency was charged to the tool budget"
+    assert tags == [("SPEAK", BOTH_HALVES)]
+
+
+def test_ollama_overhead_alone_never_spends_the_work_budget(brain,
+                                                            monkeypatch):
+    """The same rule stated on its own: a round that was ALL reload buys
+    the loop a second tool round, because skipping tool work would not
+    have made that reload any shorter."""
+    b, fake, ran = _clocked_turn(brain, monkeypatch,
+                                 tools=(("get_calendar", 0.005),
+                                        ("get_mail", 0.005)))
+    fake.replies = [_round(tool_reply(("get_calendar", {})), ROUND_LOAD_S),
+                    _round(tool_reply(("get_mail", {})), 0.0),
+                    _round(text_reply(BOTH_HALVES), 0.0)]
+    tags = b._chat_sync("calendar and mail", max_rounds=3)
+    assert ran == ["get_calendar", "get_mail"]
+    assert tags == [("SPEAK", BOTH_HALVES)]
+
+
+def test_a_runaway_load_duration_cannot_buy_unlimited_tool_work(brain,
+                                                                monkeypatch):
+    """...and the budget is not simply switched off by a server that
+    reports a load_duration longer than the round itself: the credit is
+    clamped to the round's own wall time."""
+    b, fake, ran = _clocked_turn(brain, monkeypatch, round_wall=1.0,
+                                 tools=(("get_calendar", 6.0),
+                                        ("get_mail", 6.0)))
+    fake.replies = [_round(tool_reply(("get_calendar", {}), ("get_mail", {})),
+                           600.0),
+                    _round(text_reply("Four classes today, sir."), 0.0)]
+    tags = b._chat_sync("calendar and mail")
+    assert ran == ["get_calendar"], "a 600 s load_duration voided the budget"
+    assert tags == [("SPEAK", "Four classes today, sir.")]
+
+
+def test_the_render_round_is_told_to_write_and_answered_about_the_cut_tool(
+        brain, monkeypatch):
+    """(2) Why the reserved round was mute. Stripping the schemas out of
+    the payload leaves the tool-call TRANSCRIPT in the messages — with a
+    call the budget cut left unanswered — and nothing telling the model
+    the results are all it will get. Both are fixed in the per-turn
+    messages; the system prefix must stay byte-identical (module doc)."""
+    b, fake, ran = _clocked_turn(brain, monkeypatch, round_wall=0.0,
+                                 tools=(("get_calendar", 6.0),
+                                        ("get_mail", 6.0)))
+    fake.replies = [_round(tool_reply(("get_calendar", {}), ("get_mail", {})),
+                           0.0),
+                    _round(text_reply(BOTH_HALVES), 0.0)]
+    tags = b._chat_sync("calendar and mail")
+    assert ran == ["get_calendar"], "the 6 s tool did not spend the budget"
+    assert tags == [("SPEAK", BOTH_HALVES)]
+    first, render = fake.chat_payloads()
+    assert "tools" not in render
+    assert render["messages"][0]["role"] == "system"
+    assert render["messages"][0]["content"] == brain.static_system(), \
+        "the instruction landed in the static prefix; every turn now pays "\
+        "a full reprocess (module doc)"
+    assert brain.RENDER_NOW_LINE not in render["messages"][0]["content"]
+    assert first is not render
+    assert render["messages"][-1] == {"role": "user",
+                                      "content": brain.RENDER_NOW_LINE}
+    # the call the budget cut is answered, not left hanging: an unanswered
+    # tool_call is what the model went back and asked for again at 15:14
+    skipped = [m for m in render["messages"]
+               if m.get("content") == brain.TOOL_SKIPPED_TEXT]
+    assert [m["tool_name"] for m in skipped] == ["get_mail"]
+    # ...and it has to SAY it is not a result. Measured against the live
+    # gemma4, a skipped message that read like one ("not run: out of time")
+    # was reported back as the mail in 6 of 6 samples: "your latest email
+    # mentions a run that timed out".
+    assert "no result" in brain.TOOL_SKIPPED_TEXT
+    asked = sum(len(m.get("tool_calls") or []) for m in render["messages"])
+    answered = sum(1 for m in render["messages"] if m["role"] == "tool")
+    assert asked == answered, "a tool call was left with no result beside it"
+
+
+def test_a_mute_render_round_says_what_it_found(brain, monkeypatch):
+    """And when even the instructed round writes nothing — the exact
+    15:14 reply shape, tool_calls with empty content — Jarvis names what
+    he is holding instead of apologising for holding it. H7 stands: the
+    SOURCE comes from the tool's own name, never from its result."""
+    b, fake, ran = _clocked_turn(brain, monkeypatch, round_wall=0.0,
+                                 tools=(("get_calendar", 0.005),
+                                        ("get_mail", 6.0)))
+    fake.replies = [_round(tool_reply(("get_calendar", {}), ("get_mail", {})),
+                           0.0),
+                    _round(tool_reply(("get_mail", {})), 0.0)]
+    tags = b._chat_sync("calendar and mail")
+    assert ran == ["get_calendar", "get_mail"]
+    said = dict(tags)["SPEAK"]
+    assert said == brain.tool_only_line(["get_calendar", "get_mail"])
+    assert "your calendar" in said and "your latest email" in said
+    assert said != brain.TOOL_ONLY_LINE
+    assert "said something private" not in said
+
+
+def test_the_fan_out_cap_also_answers_the_calls_it_trimmed(brain, setup):
+    """MAX_TOOL_CALLS_PER_ROUND trims what RUNS; the calls it trimmed are
+    in the transcript all the same, and an unanswered one is what sends
+    the next round back for more tools."""
+    b, fake, record = setup
+    n = brain.MAX_TOOL_CALLS_PER_ROUND + 3
+    fake.replies = [tool_reply(*[("get_weather", {"when": "now"})] * n),
+                    text_reply("Seventy-two and sunny, sir.")]
+    tags = b._chat_sync("weather")
+    assert tags == [("SPEAK", "Seventy-two and sunny, sir.")]
+    assert len(record) == brain.MAX_TOOL_CALLS_PER_ROUND
+    msgs = fake.chat_payloads()[1]["messages"]
+    asked = sum(len(m.get("tool_calls") or []) for m in msgs)
+    answered = sum(1 for m in msgs if m["role"] == "tool")
+    assert asked == n and answered == n, "a trimmed call was left hanging"

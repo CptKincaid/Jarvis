@@ -82,14 +82,36 @@ def test_add_resolve_and_persist(mem, tmp_path):
 
 
 def test_people_block_is_always_in_context_outside_the_fact_window(mem):
+    """The point of this test is the PEOPLE block, not the fact count: a
+    contact must not drop out behind five later "remember"s.
+
+    Eight facts no longer exercise the window. A store that fits the prompt
+    (memory.CONTEXT_ALL_FACTS_MAX = 12) is now rendered WHOLE and never
+    wakes the embedder -- the one-slot rule, added 2026-08-31 after a
+    /api/embed on the reply path was measured evicting gemma4:26b and
+    costing ~9.4 s of reload per turn. So the window starts above twelve,
+    and this test has to climb past it to test what it says it tests.
+    """
     mem.add_person("mom", "Linda Peyrovi")
-    for i in range(8):
+    for i in range(14):                       # > CONTEXT_ALL_FACTS_MAX
         mem.remember(f"f{i}", f"fact {i}")
     text = mem.format_for_context()
     assert "People (how Hunter refers to them):" in text
     assert "my mom: Linda Peyrovi" in text
-    assert "fact 7" in text and "fact 0" not in text        # the last-five window
+    assert "fact 13" in text and "fact 0" not in text       # the last-five window
     assert "my mom" in mem.format_for_context("what's the weather")
+
+
+def test_a_store_that_fits_the_prompt_is_rendered_whole(mem):
+    """The other side of the same rule: below the budget every fact is in
+    context, because ranking a store that already fits buys nothing and
+    cost a model swap. Guards the boundary in both directions."""
+    mem.add_person("mom", "Linda Peyrovi")
+    for i in range(8):                        # <= CONTEXT_ALL_FACTS_MAX
+        mem.remember(f"f{i}", f"fact {i}")
+    text = mem.format_for_context()
+    assert "fact 0" in text and "fact 7" in text
+    assert "my mom: Linda Peyrovi" in text
 
 
 def test_expand_aliases_whole_words_with_or_without_my(mem):

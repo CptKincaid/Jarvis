@@ -20,12 +20,15 @@ one serving Google's sign-in HTML):
     get_calendar(range="today") -> ok=True
         'Today: 11:00 pm Work standup; nothing else.'
 
-This test asserts the reply admits the gap; it fails today.
+This test asserts the reply admits the gap.
+
+FIXED 2026-08-31: CalendarSource tracks a failing source in ``_failures``
+(back-off, and the last time it did answer), ``Snapshot.down`` carries it
+out, and get_calendar takes back the "; nothing else." claim and names the
+feed.  The xfail marker is gone: this is now a regression test.
 """
 from datetime import date
 from types import SimpleNamespace
-
-import pytest
 
 from jarvis.assistant_config import AssistantConfig
 from jarvis.tools.calendar import CalendarSource, make_tools
@@ -44,8 +47,6 @@ SIGN_IN_HTML = (b"<!DOCTYPE html><html><head><title>Sign in - Google Accounts"
                 b"</title></head><body>...</body></html>")
 
 
-@pytest.mark.xfail(reason="get_calendar ignores CalendarSource.errors when "
-                          "any one source answered", strict=True)
 def test_a_broken_calendar_is_not_answered_as_if_it_were_empty(tmp_path):
     cfg = AssistantConfig({"google_ical_urls": ["https://good.test/a.ics",
                                                 "https://revoked.test/b.ics"]})
@@ -64,3 +65,10 @@ def test_a_broken_calendar_is_not_answered_as_if_it_were_empty(tmp_path):
 
     # either say so, or do not claim the day is accounted for
     assert not (result.ok and "nothing else" in result.text.lower()), result.text
+    # and it says WHICH feed, by the name the feed gives itself
+    assert "Work standup" in result.text                    # what it does know
+    assert "can't reach" in result.text, result.text
+    # a feed that has never answered has never told us its name, so it is
+    # named honestly rather than as "google-2"
+    assert "one of your calendars" in result.text, result.text
+    assert "google" not in result.text.lower(), result.text

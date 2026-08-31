@@ -7,16 +7,28 @@ only logs "17 tools registered (budget 11)" — the app boots over budget
 and ToolRegistry.budget()["ok"] is False.  jarvis/tools/spotify.py alone
 contributes six of the seventeen.
 
-Measured in-process against the live Ollama (gemma4:26b resident,
-load_duration 0.00 s) with the production static system prompt:
+RE-MEASURED 2026-08-31, now 28 tools, against the live Ollama (gemma4:26b
+resident, num_ctx 8192, production static system prompt):
 
-    17 tools  -> tools schema 5262 bytes, prompt_eval_count 2704-2766
-    no tools  -> prompt_eval_count 1503
+    tools   schema bytes   prompt_eval_count   cold prefill of the prefix
+       0              0                 1441                      661 ms
+      11           4814                 2660                     1111 ms
+      28           9489                 3667                     1405 ms
 
-i.e. the tool block costs ~1200 prompt tokens per turn, and a one-tool
-round trip measured 5.8-8.9 s wall against the spec bar of p50 <= 3.0 s
-(spec 4.3 / section 12 check 2).  The spec's own remedy list for a missed
-bar starts with "trim tool descriptions".
+So the tool block is 2226 prompt tokens against the spec's 900, and 294 ms
+of prefill more than the spec's eleven would cost.
+
+What that 294 ms is NOT: the 2026-08-26 note in this file blamed the tool
+block for a 5.8-8.9 s one-tool round trip.  That was the wrong suspect.
+The same round measured 0.48 s wall from a client whose prefix was cached,
+and 9.6 s from the app -- the difference is that every app turn embeds the
+utterance through nomic-embed-text first, OLLAMA_MAX_LOADED_MODELS=1
+evicts gemma4:26b to do it, and the turn then pays 6.97 s reloading the
+model plus a full 1.9 s prefill because the KV cache died with it
+(ollama journal, 15:22:10: "prompt eval time = 1925.17 ms / 4569 tokens").
+The tool count is a real tax on a COLD prefix and close to nothing on a
+warm one, so this budget is worth keeping - but it is not where the
+seconds are.
 
 This test asserts the contract the registry documents; it fails today.
 """

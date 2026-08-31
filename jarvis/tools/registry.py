@@ -6,9 +6,28 @@ and the ToolRegistry method names below are the contract every tool
 module and the brain code against — extend, never rename.
 
 Budget (4.1): at most MAX_TOOLS tools, descriptions of at most
-DESCRIPTION_WORD_CAP words; register() logs a warning when a spec breaks
-either (never refuses — a tool is better than no tool), and budget()
-reports the state so the bench can print it.
+DESCRIPTION_WORD_CAP words, and — the one that actually costs — at most
+MAX_SCHEMA_TOKENS prompt tokens of schema.  register() logs a warning
+when a spec breaks a per-tool rule (never refuses — a tool is better than
+no tool); the whole-set cost is reported ONCE, by schemas(), because that
+is the moment the registry becomes a prompt.
+
+What the budget is FOR, measured on this box 2026-08-31 against the
+resident gemma4:26b (num_ctx 8192, production static prefix):
+
+    tools   schema chars   prompt tokens   cold prefill of the whole prefix
+       0             0            1441                       661 ms
+      11          4814            2660                      1111 ms
+      28          9489            3667                      1405 ms
+
+So the 28 tools the app registers today are 2226 prompt tokens — two and
+a half times the 900 the spec allows — and 294 ms of prefill more than
+the spec's eleven.  That 294 ms is paid ONLY on a cold prefix: with
+Ollama's prefix cache intact the same round costs 0.48 s wall and the
+schemas are free (they are the same bytes every turn, which is the whole
+point of the static-prefix rule in jarvis/brain.py).  So the tool count is
+a real tax on any turn that starts cold, and close to nothing on one that
+does not — trim it, but do not expect it to buy back seconds.
 """
 from __future__ import annotations
 
@@ -22,6 +41,13 @@ log = get_logger("tools.registry")
 
 MAX_TOOLS = 11
 DESCRIPTION_WORD_CAP = 20
+MAX_SCHEMA_TOKENS = 900         # spec 4.1, "total schema tokens <= 900"
+# The schema JSON is mostly ASCII identifiers and prose, which gemma4's
+# tokenizer takes at 3.95 (11 tools) to 4.26 (28 tools) characters each --
+# see the table above, all three points measured through prompt_eval_count.
+# 4.1 keeps the estimate inside 4% either way, which is all a budget check
+# needs; the bench still has the real number.
+CHARS_PER_TOKEN = 4.1
 
 
 @dataclass
@@ -63,6 +89,7 @@ class ToolSpec:
 class ToolRegistry:
     def __init__(self):
         self._tools: dict[str, ToolSpec] = {}
+        self._logged_budget = False
 
     def register(self, spec: ToolSpec) -> ToolSpec:
         if spec.name in self._tools:
@@ -72,9 +99,11 @@ class ToolRegistry:
             log.warning("tool %s description is %d words (cap %d)",
                         spec.name, words, DESCRIPTION_WORD_CAP)
         self._tools[spec.name] = spec
-        if len(self._tools) > MAX_TOOLS:
-            log.warning("%d tools registered (budget %d)",
-                        len(self._tools), MAX_TOOLS)
+        # No per-registration count warning: it used to fire once per tool
+        # past the budget, so a 28-tool boot wrote a 17-line ladder of
+        # WARNINGs that said the same thing 17 times and buried the tool
+        # list between them. The set is reported once, by schemas().
+        self._logged_budget = False
         return spec
 
     def register_many(self, specs) -> None:
@@ -91,7 +120,28 @@ class ToolRegistry:
         return list(self._tools)
 
     def schemas(self) -> list[dict]:
-        return [t.schema() for t in self._tools.values()]
+        """The Ollama ``tools`` block. BYTE-STABLE for a fixed tool set:
+        the model turn caches on it (jarvis/brain.py, the static-prefix
+        rule), so this must never vary with the utterance or the clock."""
+        schemas = [t.schema() for t in self._tools.values()]
+        if not self._logged_budget:
+            self._logged_budget = True
+            state = self.schema_budget()
+            report = log.warning if not state["ok"] else log.info
+            report("tools: %d registered (budget %d), schema ~%d prompt "
+                   "tokens (budget %d)%s", state["tools"], MAX_TOOLS,
+                   state["schema_tokens"], MAX_SCHEMA_TOKENS,
+                   "; over the word cap: " + ", ".join(state["over_word_cap"])
+                   if state["over_word_cap"] else "")
+        return schemas
+
+    def schema_tokens(self) -> int:
+        """Estimated prompt tokens the tool block costs on every turn.
+
+        Built from _tools rather than schemas() so the budget report cannot
+        recurse into the call that asks for it."""
+        payload = json.dumps([t.schema() for t in self._tools.values()])
+        return int(len(payload) / CHARS_PER_TOKEN)
 
     def __len__(self) -> int:
         return len(self._tools)
@@ -100,12 +150,28 @@ class ToolRegistry:
         return name in self._tools
 
     def budget(self) -> dict:
-        """Static budget check (token count is measured by the bench)."""
+        """Static budget check (token count is measured by the bench).
+
+        The dict shape is a contract (tests/test_brain_tools.py compares it
+        whole), so the token figures live in schema_budget() beside it."""
         over = [t.name for t in self._tools.values()
                 if t.description_words() > DESCRIPTION_WORD_CAP]
         return {"tools": len(self._tools), "max_tools": MAX_TOOLS,
                 "over_word_cap": over,
                 "ok": len(self._tools) <= MAX_TOOLS and not over}
+
+    def schema_budget(self) -> dict:
+        """budget() plus what the schemas cost in prompt tokens.
+
+        The count is a proxy; the tokens are the bill. A registry can sit
+        inside MAX_TOOLS and still blow MAX_SCHEMA_TOKENS (the spec's own
+        eleven measure 1219), and that is the number to trim against."""
+        state = self.budget()
+        tokens = self.schema_tokens()
+        state["schema_tokens"] = tokens
+        state["max_schema_tokens"] = MAX_SCHEMA_TOKENS
+        state["ok"] = state["ok"] and tokens <= MAX_SCHEMA_TOKENS
+        return state
 
     def call(self, name: str, args: Optional[dict] = None) -> ToolResult:
         """Never raises: unknown tools and handler exceptions become an

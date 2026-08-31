@@ -301,3 +301,109 @@ def test_index_is_thread_safe_for_concurrent_writes(mem):
     for t in threads:
         t.join(5)
     assert not errors and mem._index.count() == 8
+
+
+# ------------------------------------------------- the one-slot rule (4.3)
+# Ollama here runs OLLAMA_MAX_LOADED_MODELS=1, so an /api/embed on the reply
+# path does not add the embedder, it EVICTS the chat model. Measured live
+# 2026-08-31: the embed 2.5 s, the 26B's forced reload on the next request
+# 6.9-7.2 s -- 9.6 s per turn, on every turn, for a store whose facts all
+# fit in the prompt anyway. These tests hold the rule in place.
+
+def _reply_path_embeds(mem, embed, text="what's on my calendar today"):
+    """Embed calls made by ONE reply turn (the write-through calls from
+    building the fixture are not the reply path's fault)."""
+    before = len(embed.calls)
+    rendered = mem.format_for_context(text)
+    return embed.calls[before:], rendered
+
+
+def test_reply_path_makes_no_embed_call_while_the_store_fits(mem, embed):
+    # Hunter's live store is four one-line facts.
+    mem.remember("training_config", "batch size 16, learning rate 0.001")
+    mem.remember("project", "Jarvis V2 refactor in progress")
+    mem.remember("dentist", "my dentist is Dr Patel on Elm Street")
+    mem.remember("thesis", "the thesis defence is in November")
+    assert mem.facts_fit_context()
+    calls, rendered = _reply_path_embeds(mem, embed)
+    # THE regression: any call here is a 9.6 s model swap on the turn.
+    assert calls == []
+    # ...and the model is handed MORE than ranking gave it, not less: all
+    # four, where the 0.60 floor cleared none of them on the live store.
+    for value in ("batch size 16", "Jarvis V2 refactor", "Dr Patel",
+                  "thesis defence"):
+        assert value in rendered
+
+
+def test_a_store_too_big_to_fit_still_ranks_semantically(mem, embed):
+    for i in range(memory_mod.CONTEXT_ALL_FACTS_MAX + 1):
+        mem.remember(f"filler{i}", f"filler fact number {i} about nothing")
+    mem.remember("dentist", "my dentist is Dr Patel on Elm Street")
+    assert not mem.facts_fit_context()
+    calls, rendered = _reply_path_embeds(mem, embed, "who is my dentist")
+    assert calls == [[QUERY_PREFIX + "who is my dentist"]]
+    assert "Dr Patel" in rendered and "filler fact" not in rendered
+
+
+def test_long_facts_break_the_fit_even_when_few(mem):
+    mem.remember("essay", "x" * (memory_mod.CONTEXT_ALL_FACTS_CHARS + 1))
+    assert not mem.facts_fit_context()
+
+
+def test_repeat_questions_reuse_the_query_vector(mem, embed):
+    for i in range(memory_mod.CONTEXT_ALL_FACTS_MAX + 1):
+        mem.remember(f"filler{i}", f"filler fact number {i} about nothing")
+    mem.remember("dentist", "my dentist is Dr Patel on Elm Street")
+    first, _ = _reply_path_embeds(mem, embed, "who is my dentist")
+    second, rendered = _reply_path_embeds(mem, embed, "who is my dentist")
+    assert len(first) == 1          # the cold query pays one swap
+    assert second == []             # the repeat pays none
+    assert "Dr Patel" in rendered   # ...and still answers
+
+
+def test_query_cache_is_capped(mem, embed):
+    for i in range(memory_mod.CONTEXT_ALL_FACTS_MAX + 1):
+        mem.remember(f"filler{i}", f"filler fact number {i} about nothing")
+    for i in range(memory_mod.QUERY_CACHE_MAX + 5):
+        mem.relevant_facts(f"distinct question number {i}")
+    assert len(mem._index._qcache) <= memory_mod.QUERY_CACHE_MAX
+
+
+def test_no_embed_while_the_chat_model_is_lent_out(tmp_path, embed):
+    # The nightly haymaker digest (qwen2.5:32b, 04:09) is given the GPU by
+    # brain.release(); with one slot, an embed would evict IT mid-run.
+    lent = {"now": True}
+    mem = JarvisMemory(memory_dir=tmp_path / "mem", legacy_dir=tmp_path / "legacy",
+                       embed=embed, gate=lambda: not lent["now"])
+    for i in range(memory_mod.CONTEXT_ALL_FACTS_MAX + 1):
+        mem._facts[f"filler{i}"] = {"value": f"filler fact {i}", "time": "2026-08-31T00:00:00"}
+    before = len(embed.calls)
+    assert mem.relevant_facts("who is my dentist") == []
+    assert embed.calls[before:] == []
+    # A lend ends by itself: no 60 s back-off is armed, the next call goes.
+    lent["now"] = False
+    mem.remember("dentist", "my dentist is Dr Patel on Elm Street")
+    assert len(embed.calls) > before
+
+
+def test_warm_index_does_not_load_the_embedder_for_a_store_that_fits(mem, embed):
+    mem.remember("dentist", "my dentist is Dr Patel on Elm Street")
+    before = len(embed.calls)
+    assert mem.warm_index() is True
+    # Warming exists to preload nomic off the turn path; with the store
+    # fitting, the turn path never asks for it and the preload would only
+    # evict the 26B residency has just warmed.
+    assert embed.calls[before:] == []
+
+
+def test_warm_index_still_preloads_when_ranking_will_run(mem, embed):
+    for i in range(memory_mod.CONTEXT_ALL_FACTS_MAX + 1):
+        mem.remember(f"filler{i}", f"filler fact number {i} about nothing")
+    before = len(embed.calls)
+    assert mem.warm_index() is True
+    assert embed.calls[before:] == [["search_query: hello"]]
+
+
+def test_embedder_hands_the_single_slot_back(mem):
+    # keep_alive -1 pinned nomic in the one slot the chat model needs.
+    assert memory_mod.EMBED_KEEP_ALIVE == 0

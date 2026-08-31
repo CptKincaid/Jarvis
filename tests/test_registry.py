@@ -1,0 +1,88 @@
+"""Tests for jarvis.tools.registry's budget reporting (spec 4.1).
+
+The registry is the one place that knows what the tool block costs, and
+the cost the model actually pays is PROMPT TOKENS, not the tool count:
+measured on this box 2026-08-31 against the resident gemma4:26b, the 28
+tools the app registers are 2226 prompt tokens against a 900-token budget,
+and even the spec's own eleven measure 1219.  These tests pin the two
+things that follow: the report is one line, not one per tool, and the
+schema bytes never vary (jarvis/brain.py's static-prefix rule caches on
+them)."""
+import json
+
+from jarvis.tools.registry import (CHARS_PER_TOKEN, MAX_SCHEMA_TOKENS,
+                                   MAX_TOOLS, ToolRegistry, ToolSpec)
+
+
+def _fill(reg, n, prefix="t"):
+    for i in range(n):
+        reg.register(ToolSpec(f"{prefix}{i}", "Does a thing for Hunter."))
+    return reg
+
+
+def test_the_over_budget_report_is_one_line_not_one_per_tool(caplog):
+    """A 28-tool boot wrote a 17-line WARNING ladder that said the same
+    thing 17 times and buried the tool list between the rungs."""
+    reg = ToolRegistry()
+    with caplog.at_level("INFO"):
+        _fill(reg, MAX_TOOLS + 17)
+        assert [r.message for r in caplog.records] == [], caplog.records
+        reg.schemas()
+        reg.schemas()                       # every turn asks; it reports once
+    lines = [r for r in caplog.records if "registered" in r.message]
+    assert len(lines) == 1, [r.message for r in lines]
+    assert lines[0].levelname == "WARNING"
+    said = lines[0].getMessage()
+    assert "28 registered (budget 11)" in said, said
+    assert f"budget {MAX_SCHEMA_TOKENS}" in said, said
+
+
+def test_a_changed_tool_set_is_reported_again(caplog):
+    reg = ToolRegistry()
+    with caplog.at_level("INFO"):
+        _fill(reg, MAX_TOOLS + 1)
+        assert not [r for r in caplog.records if "registered" in r.getMessage()]
+        reg.schemas()
+        reg.register(ToolSpec("late", "Registered after the first turn."))
+        reg.schemas()
+    said = [r.getMessage() for r in caplog.records if "registered" in r.getMessage()]
+    assert len(said) == 2, said
+    assert "12 registered" in said[0] and "13 registered" in said[1], said
+
+
+def test_schema_budget_counts_tokens_not_only_tools():
+    """A registry can sit inside MAX_TOOLS and still blow the token
+    budget, which is the one that is paid in prefill on every turn."""
+    reg = ToolRegistry()
+    reg.register(ToolSpec("small", "Short."))
+    state = reg.schema_budget()
+    assert state["tools"] == 1 and state["ok"] is True
+    assert state["max_schema_tokens"] == MAX_SCHEMA_TOKENS
+    assert state["schema_tokens"] < MAX_SCHEMA_TOKENS
+
+    reg.register(ToolSpec(
+        "fat", "Short enough to pass the word cap.",
+        {"type": "object", "properties": {
+            "q": {"type": "string", "description": "x" * 4 * MAX_SCHEMA_TOKENS}}}))
+    state = reg.schema_budget()
+    assert state["tools"] == 2 <= MAX_TOOLS         # inside the COUNT budget
+    assert state["over_word_cap"] == []             # and inside the word cap
+    assert state["schema_tokens"] > MAX_SCHEMA_TOKENS
+    assert state["ok"] is False                     # but not inside the bill
+    # budget() keeps its shape: brain's report compares the dict whole
+    assert set(reg.budget()) == {"tools", "max_tools", "over_word_cap", "ok"}
+
+
+def test_the_token_estimate_tracks_the_schema_bytes():
+    reg = _fill(ToolRegistry(), 12)
+    chars = len(json.dumps(reg.schemas()))
+    assert reg.schema_tokens() == int(chars / CHARS_PER_TOKEN)
+
+
+def test_schemas_are_byte_stable_across_calls():
+    """The static-prefix rule (jarvis/brain.py): the tool block is part of
+    the cached prefix, so a set that renders differently between turns
+    costs a full reprocess every turn."""
+    reg = _fill(ToolRegistry(), 6)
+    first = json.dumps(reg.schemas())
+    assert all(json.dumps(reg.schemas()) == first for _ in range(3))

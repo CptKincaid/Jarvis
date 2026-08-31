@@ -373,6 +373,108 @@ def test_get_never_fetches_and_triggers_refresh_when_stale(tmp_path):
     assert snap.stale and triggered == [1, 1] and len(server.calls) == 1
 
 
+# ------------------------------------------------- a source that is down
+#
+# LIVE 2026-08-31: the Canvas subscription ("google-2") timed out on every
+# refresh from 12:40 to 14:54.  Three separate faults fell out of that, one
+# test each.
+class TwoFeeds:
+    """Two ICS urls; the second one always times out."""
+
+    def __init__(self, bad_from=0):
+        self.calls = []
+        self.bad_from = bad_from        # call index after which "b" starts failing
+
+    def __call__(self, url, timeout=8, headers=None):
+        self.calls.append(url)
+        if url.endswith("b.ics") and self.calls.count(url) > self.bad_from:
+            raise TimeoutError("The read operation timed out")
+        r = Response(ICS)
+        r.status, r.headers = 200, {}
+        return r
+
+
+def _two_feed_source(tmp_path, fetch, clock):
+    cfg = FakeCfg(urls=["https://a.test/a.ics", "https://b.test/b.ics"])
+    return CalendarSource(cfg, cache_path=tmp_path / "cal.json", fetch=fetch,
+                          dav_client=FakeDAV, clock=clock, tz=CHI)
+
+
+def test_a_dead_feed_is_backed_off_instead_of_retried_every_cycle(tmp_path):
+    """FETCH_TIMEOUT per cycle per dead feed, for hours, is not a plan."""
+    t = {"now": EPOCH}
+    server = TwoFeeds()
+    src = _two_feed_source(tmp_path, server, lambda: t["now"])
+    for _ in range(6):                       # six refresh cycles
+        src.refresh(NOW)
+        t["now"] += calendar.REFRESH_S
+    good = server.calls.count("https://a.test/a.ics")
+    bad = server.calls.count("https://b.test/b.ics")
+    assert good == 6, server.calls          # the healthy feed is never skipped
+    # back-off 600, then 1200, then 2400: tried on cycles 1, 2 and 4 only.
+    # Without it that is 6 fetches and 6 x FETCH_TIMEOUT of worker time.
+    assert bad == 3, server.calls
+    # and a skipped source still reads as down, never as healthy
+    assert src.errors == ["google-2: TimeoutError"], src.errors
+    assert [d.id for d in src.down()] == ["google-2"]
+
+
+def test_one_dead_feed_does_not_make_the_others_look_stale(tmp_path):
+    """fetched_at was min() over EVERY source, so one dead feed pinned the
+    whole cache to its last success and every answer said "as of ...""" \
+        """ hours ago." """
+    t = {"now": EPOCH}
+    server = TwoFeeds(bad_from=1)            # b answers once, then dies
+    src = _two_feed_source(tmp_path, server, lambda: t["now"])
+    src.refresh(NOW)
+    assert not src.is_stale() and src.down() == []
+    t["now"] = EPOCH + 4 * calendar.REFRESH_S     # much later; b keeps failing
+    src.refresh(NOW)
+    assert src.fetched_at == t["now"], src.fetched_at   # the fresh feed decides
+    assert not src.is_stale()
+    down = src.down()
+    assert [d.id for d in down] == ["google-2"]
+    assert down[0].since == EPOCH            # the last time it DID answer
+
+
+def test_a_stale_cache_kicks_one_refresh_per_period_not_one_per_question(tmp_path):
+    """Every get() used to queue another full refresh -- another
+    FETCH_TIMEOUT on the dead feed -- so asking twice cost twice."""
+    t = {"now": EPOCH + 10 * calendar.REFRESH_S}
+    server = TwoFeeds()
+    src = _two_feed_source(tmp_path, server, lambda: t["now"])
+    triggered = []
+    src.trigger_refresh = lambda: triggered.append(t["now"])
+    for _ in range(5):
+        snap = src.get("today", NOW)
+        assert snap.stale
+    assert triggered == [t["now"]], triggered
+    t["now"] += calendar.REFRESH_S           # a period later, ask again
+    src.get("today", NOW)
+    assert len(triggered) == 2, triggered
+
+
+def test_get_calendar_names_the_feed_that_went_down(tmp_path, monkeypatch):
+    """Hunter's real case: a feed that answered this morning and then
+    stopped. It has told us its name, so Jarvis can use it."""
+    t = {"now": EPOCH}
+    server = TwoFeeds(bad_from=1)
+    src = _two_feed_source(tmp_path, server, lambda: t["now"])
+    src.refresh(NOW)
+    t["now"] = EPOCH + 4 * calendar.REFRESH_S
+    src.refresh(NOW)
+    monkeypatch.setattr(calendar, "now_local", lambda tz=None: NOW)
+    src.trigger_refresh = lambda: None
+    reg = ToolRegistry()
+    reg.register_many(calendar.make_tools(FakeCfg(urls=["u"]), SimpleNamespace(calendar=src)))
+    text = reg.call("get_calendar", {"range": "today"}).text
+    assert "nothing else" not in text.lower(), text     # no completeness claim
+    # "Personal" is X-WR-CALNAME in the fixture: the feed's own name, which
+    # is the only name Hunter would recognise ("google-2" is not one)
+    assert "I can't reach your Personal calendar, sir" in text, text
+    assert "since 9:00 am" in text, text                # when it last answered
+
+
 def test_worker_thread_refreshes_and_stops(tmp_path, monkeypatch):
     # The worker calls refresh() with now=None, so its window comes from the
     # module's wall-clock seam and NOT from the injected `clock` (which is

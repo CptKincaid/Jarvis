@@ -35,6 +35,19 @@ log = get_logger("tools.calendar")
 
 REFRESH_S = 600                 # refresh period and the "stale" threshold
 FETCH_TIMEOUT = 8
+# A feed that has stopped answering must not be retried at full price for
+# the rest of the day.  LIVE 2026-08-31: the Canvas subscription
+# ("google-2") timed out on every refresh from 12:40 to 14:54 -- sixteen
+# times, FETCH_TIMEOUT seconds each.  Six of those sixteen were OFF-cycle,
+# kicked by get_calendar itself: a failed source keeps its old stamp,
+# ``fetched_at`` was the MINIMUM over sources, so one dead feed made the
+# whole cache read stale forever and every calendar answer both triggered
+# another refresh and was labelled "as of 12:40 pm" although the events it
+# named were seconds old.  The back-off doubles from one refresh period,
+# so a blip is retried on the next cycle and an all-day outage is tried
+# once an hour; ONE success clears it.
+SOURCE_BACKOFF_S = REFRESH_S
+MAX_SOURCE_BACKOFF_S = 3600
 WINDOW_DAYS = 14                # how far ahead the cache reaches
 # Named weekdays are ranges too. Without them "what's on my agenda for
 # Monday?" had nowhere to land and the model fell back to "next", which
@@ -389,6 +402,54 @@ def format_events(events, range: str = "today", now: datetime = None) -> str:
     return text + "."
 
 
+_NOTHING_ELSE_RX = re.compile(r";\s*nothing else\.\s*$", re.I)
+_NOTHING_AT_ALL_RX = re.compile(r"^Nothing (on|coming up) (.+), sir\.\s*$", re.I)
+
+
+def drop_completeness(text: str) -> str:
+    """Take back the claim that the day is fully accounted for.
+
+    ``format_events`` closes a list with "; nothing else." and an empty day
+    with "Nothing on today, sir." -- both are true only when every feed
+    answered.  With one subscription unread they are the confident
+    half-answer FOUND 2026-08-26
+    (tests/test_found_calendar_partial_failure.py), so a snapshot with a
+    dead source gets the claim taken back before it is spoken."""
+    text = (text or "").strip()
+    if _NOTHING_ELSE_RX.search(text):
+        return _NOTHING_ELSE_RX.sub(".", text)
+    match = _NOTHING_AT_ALL_RX.match(text)
+    if match:
+        return (f"Nothing {match.group(1)} {match.group(2)} "
+                "in the calendars I can reach, sir.")
+    return text
+
+
+def down_words(down, now: datetime) -> str:
+    """One spoken sentence naming the feeds that are not answering.
+
+    Named from the calendar's OWN name (X-WR-CALNAME, carried on the events
+    it last served) because "google-2" means nothing to anybody; the last
+    time it did answer is the useful half of the news."""
+    if not down:
+        return ""
+    named = [d.name for d in down if d.name]
+    if len(named) == len(down) == 1:
+        subject = f"your {named[0]} calendar"
+    elif named and len(named) == len(down):
+        subject = "your " + ", ".join(named[:-1]) + f" and {named[-1]} calendars"
+    elif len(down) == 1:
+        # A feed that has never answered has never told us its name.
+        subject = "one of your calendars"
+    else:
+        subject = f"{len(down)} of your calendars"
+    since = [d.since for d in down if d.since]
+    if len(down) == 1 and since:
+        return (f"I can't reach {subject}, sir \u2014 nothing from it since "
+                f"{as_of_words(min(since), now)}.")
+    return f"I can't reach {subject}, sir."
+
+
 def as_of_words(fetched_at: float, now: datetime) -> str:
     """"9:10 am" / "9:10 am yesterday" / "9:10 am on Monday"."""
     when = datetime.fromtimestamp(fetched_at, now.tzinfo)
@@ -404,11 +465,21 @@ def as_of_words(fetched_at: float, now: datetime) -> str:
 
 # --------------------------------------------------------------- source
 @dataclass
+class SourceDown:
+    """One configured feed that is not answering."""
+    id: str                                 # google-2 / icloud
+    name: str = ""                          # its own name ("Canvas"), when known
+    since: Optional[float] = None           # last time it DID answer
+    error: str = ""                         # the exception type, never the URL
+
+
+@dataclass
 class Snapshot:
     events: list = field(default_factory=list)
-    fetched_at: Optional[float] = None      # oldest successful source stamp
+    fetched_at: Optional[float] = None      # oldest source that is ANSWERING
     stale: bool = True
     errors: list = field(default_factory=list)
+    down: list = field(default_factory=list)   # SourceDown per dead feed
 
 
 def _default_dav_client(url: str, username: str, password: str):
@@ -434,6 +505,10 @@ class CalendarSource:
         self._lock = threading.Lock()
         self._sources: dict[str, dict] = {}     # id -> {"fetched_at", "events"}
         self._etags: dict[str, dict] = {}       # url -> {"etag", "last_modified", "raw"}
+        # id -> {"count", "since", "error", "until"} for a source that is not
+        # answering; guarded by _lock, cleared by one success (SOURCE_BACKOFF_S).
+        self._failures: dict[str, dict] = {}
+        self._last_trigger: Optional[float] = None
         self.errors: list[str] = []
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -509,9 +584,66 @@ class CalendarSource:
     # -- state -------------------------------------------------------
     @property
     def fetched_at(self) -> Optional[float]:
+        """How fresh the answer is: the oldest source that is ANSWERING.
+
+        A source in back-off keeps its events -- they are still the best we
+        have -- but its stamp may not decide the freshness of the whole
+        cache.  As the minimum over every source, one dead feed made
+        ``is_stale`` true for the rest of the day, which both mislabelled
+        every fresh answer "as of <hours ago>" and put another refresh on
+        the worker for every single calendar question (SOURCE_BACKOFF_S).
+        When nothing is answering the whole set is used again, so a fully
+        offline calendar still says honestly how old it is."""
         with self._lock:
-            stamps = [e["fetched_at"] for e in self._sources.values()]
+            stamps = [e["fetched_at"] for sid, e in self._sources.items()
+                      if sid not in self._failures]
+            if not stamps:
+                stamps = [e["fetched_at"] for e in self._sources.values()]
         return min(stamps) if stamps else None
+
+    def down(self) -> list:
+        """The configured feeds that are not answering, as SourceDown."""
+        with self._lock:
+            return [SourceDown(id=sid, name=self._name_locked(sid),
+                               since=state.get("since"),
+                               error=str(state.get("error") or ""))
+                    for sid, state in self._failures.items()]
+
+    def _name_locked(self, sid: str) -> str:
+        """The feed's own name ("Canvas"), from the events it last served.
+        Caller holds _lock."""
+        entry = self._sources.get(sid) or {}
+        for ev in entry.get("events") or []:
+            if getattr(ev, "calendar", ""):
+                return str(ev.calendar)
+        return ""
+
+    def _held_off(self, sid: str, now: float) -> str:
+        """"" when the source may be fetched, else its remembered error."""
+        with self._lock:
+            state = self._failures.get(sid)
+            if not state or now >= state.get("until", 0):
+                return ""
+            return str(state.get("error") or "unavailable")
+
+    def _record_outcomes(self, wanted, answered, failed, stamp) -> None:
+        """Back-off bookkeeping. Caller holds _lock."""
+        for sid in list(self._failures):
+            if sid not in wanted:
+                del self._failures[sid]        # no longer configured
+        for sid in answered:
+            self._failures.pop(sid, None)      # one answer clears the back-off
+        for sid, error in failed.items():
+            state = self._failures.get(sid) or {"count": 0, "since": None}
+            state["count"] += 1
+            state["error"] = error
+            if state["since"] is None:
+                # the last time it DID answer, for "nothing since 12:40 pm"
+                state["since"] = (self._sources.get(sid) or {}).get("fetched_at")
+            state["until"] = stamp + min(
+                MAX_SOURCE_BACKOFF_S,
+                SOURCE_BACKOFF_S * (2 ** (state["count"] - 1)))
+            self._failures[sid] = state
 
     pending_event = None      # set by add_event when it needs a yes
     # The last event written and how to take it back: {"undo", "at", "title"}.
@@ -619,7 +751,9 @@ class CalendarSource:
         source keeps its previous events; True when at least one source
         answered.  Refreshes are serialised: a caller arriving while one is
         in flight waits for it and then runs its own (cheap: conditional
-        GETs answer 304)."""
+        GETs answer 304).  A source that keeps failing is SKIPPED rather
+        than retried at FETCH_TIMEOUT a cycle (SOURCE_BACKOFF_S); one
+        answer clears the back-off."""
         with self._refresh_lock:
             return self._refresh(now)
 
@@ -627,23 +761,37 @@ class CalendarSource:
         start, end = self._window(now)
         stamp = self._clock()
         errors, fresh, ok_any = [], {}, False
+        failed: dict[str, str] = {}
         for i, url in enumerate(self.ical_urls, 1):
             sid = f"google-{i}"
+            held = self._held_off(sid, stamp)
+            if held:
+                # Still down as far as we know: say so in errors (a skipped
+                # source must not read as a healthy one) but do not spend
+                # another FETCH_TIMEOUT on it.
+                errors.append(f"{sid}: {held}")
+                continue
             try:
                 raw = self._get_ical(url)
                 fresh[sid] = parse_ics(raw, start, end, tz=self.tz)
                 ok_any = True
             except Exception as exc:  # noqa: BLE001 - never log the URL
                 errors.append(f"{sid}: {type(exc).__name__}")
+                failed[sid] = type(exc).__name__
                 log.warning("calendar %s failed: %s", sid, _redact(str(exc), url))
         if self.icloud is not None:
-            try:
-                fresh["icloud"] = self._fetch_icloud(start, end)
-                ok_any = True
-            except Exception as exc:  # noqa: BLE001 - never log the password
-                errors.append(f"icloud: {type(exc).__name__}")
-                log.warning("icloud calendar failed: %s",
-                            _redact(str(exc), self.icloud["password"]))
+            held = self._held_off("icloud", stamp)
+            if held:
+                errors.append(f"icloud: {held}")
+            else:
+                try:
+                    fresh["icloud"] = self._fetch_icloud(start, end)
+                    ok_any = True
+                except Exception as exc:  # noqa: BLE001 - never log the password
+                    errors.append(f"icloud: {type(exc).__name__}")
+                    failed["icloud"] = type(exc).__name__
+                    log.warning("icloud calendar failed: %s",
+                                _redact(str(exc), self.icloud["password"]))
         wanted = {f"google-{i}" for i in builtins.range(1, len(self.ical_urls) + 1)}
         if self.icloud is not None:
             wanted.add("icloud")
@@ -653,6 +801,7 @@ class CalendarSource:
                     del self._sources[sid]
             for sid, events in fresh.items():
                 self._sources[sid] = {"fetched_at": stamp, "events": events}
+            self._record_outcomes(wanted, set(fresh), failed, stamp)
         self.errors = errors
         if fresh:
             self._save_cache()
@@ -696,12 +845,29 @@ class CalendarSource:
 
     def get(self, range: str = "today", now: datetime = None) -> Snapshot:
         """Never fetches: the cached events plus staleness; a stale cache
-        triggers a background refresh."""
+        triggers a background refresh, at most one per refresh period.
+
+        The rate limit is the whole point of ``_last_trigger``: while any
+        source is down the cache reads stale on every call, and without it
+        each calendar question queued another full refresh -- another
+        FETCH_TIMEOUT wait on the dead feed -- on the worker thread.  Six
+        such off-cycle Canvas timeouts are in the log of 2026-08-31."""
         stale = self.is_stale()
         if stale:
-            self.trigger_refresh()
+            self._trigger_if_due()
         return Snapshot(events=self.events(), fetched_at=self.fetched_at,
-                        stale=stale, errors=list(self.errors))
+                        stale=stale, errors=list(self.errors),
+                        down=self.down())
+
+    def _trigger_if_due(self) -> bool:
+        """One background refresh per refresh period, however often asked."""
+        now = self._clock()
+        last = self._last_trigger
+        if last is not None and now - last < self.refresh_s:
+            return False
+        self._last_trigger = now
+        self.trigger_refresh()
+        return True
 
 
 def _redact(text: str, *secrets: str) -> str:
@@ -953,8 +1119,14 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text="calendar still loading, ask again in a moment",
                               ok=False)
         text = format_events(snap.events, rng, now)
+        if snap.down:
+            # A subscription is unread, so the day is NOT accounted for:
+            # take back "; nothing else." before saying which feed is out.
+            text = drop_completeness(text)
         if snap.stale:
             text += f" That's as of {as_of_words(snap.fetched_at, now)}."
+        if snap.down:
+            text += " " + down_words(snap.down, now)
         return ToolResult(text=text, max_sentences=CALENDAR_MAX_SENTENCES)
 
     def add_event(text="", calendar=None, **_) -> ToolResult:

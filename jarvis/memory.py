@@ -17,10 +17,14 @@ fact is also written through to a chromadb collection at
 ``MEMORY_DIR/facts_index`` embedded with Ollama's ``nomic-embed-text`` (the
 same local embedder as the documents tool). ``recall()`` then finds "who's
 my dentist?" from "remember that my dentist is Dr Patel" -- a paraphrase the
-old substring test never matched -- and ``format_for_context(text)`` hands
-the model the facts RELEVANT to the current utterance instead of the last
-five in insertion order. With chromadb or Ollama unavailable both fall back
-to the substring store; nothing here ever raises into a turn.
+old substring test never matched. With chromadb or Ollama unavailable both
+fall back to the substring store; nothing here ever raises into a turn.
+
+``format_for_context(text)`` does NOT rank on the reply path while the whole
+store fits the prompt -- it renders all of it and never wakes the embedder.
+See "The one-slot rule" below: on this box a second model costs a swap of
+the first, so retrieval is only worth running once the store outgrows the
+window it is being retrieved into.
 
 People book: ``people.json`` maps how Hunter refers to someone ("my
 advisor", "mom") to a name, an address and a relation. It is rendered as a
@@ -66,12 +70,51 @@ SCORE_FLOOR_CONTEXT = 0.60
 SCORE_FLOOR_RECALL = 0.50
 CONTEXT_TOP_K = 3
 RECALL_TOP_K = 5
-# Keep the embedder loaded: docs._embed sends no keep_alive, so nomic
-# unloads after Ollama's default five minutes and the first "who's my
-# dentist" after a quiet spell paid the 7.5 s cold load (and could hit the
-# retry). ~270 MB of unified memory is nothing beside the chat model.
-EMBED_KEEP_ALIVE = -1
+# ----------------------------------------------------------------------
+# The one-slot rule (2026-08-31)
+# ----------------------------------------------------------------------
+# Ollama here runs with OLLAMA_MAX_LOADED_MODELS=1 -- the guard added on
+# 2026-08-28 after concurrent model load exhausted the GB10 unified pool
+# and hard-locked the box. ONE model may be resident, so asking for a
+# second one does not add a model, it SWAPS the chat model out.
+#
+# Measured against the live server (scratchpad probe.py, 2026-08-31):
+#
+#   chat gemma4:26b, resident            0.08 s wall, 0.00 s load_duration
+#   /api/embed nomic-embed-text          2.5  s   -- and /api/ps then shows
+#                                                    ONLY nomic: gemma is gone
+#   chat gemma4:26b, next request        7.1  s wall, 6.9 s load_duration
+#
+# So one embedding on the reply path costs ~9.4 s of turn latency. The
+# live log is unambiguous: 36 replies before 14:33 at 0.00 s of reported
+# overhead, then 9 of 9 after it at 6.92-7.41 s, because that is when the
+# embedder came back up and every turn began paying the swap. Worse, the
+# reload burned the whole tool budget, so five of those nine turns
+# answered with the "didn't get to putting it into words" degrade.
+#
+# THE RULE: the reply path may not ask Ollama for a model other than the
+# chat model. Retrieval is not free here; it costs a model swap.
+#
+# It also buys nothing until the fact store outgrows the prompt. Measured
+# on Hunter's live store (4 facts) across five real utterances: the
+# semantic query cleared the 0.60 floor for NONE of them, so the model was
+# handed zero facts -- at 9.57 s per turn. Below the budget the whole
+# store is simply rendered, which is both free and strictly MORE memory
+# than the <=3 that would have cleared the floor. Above it, ranking earns
+# its keep again and the embedder runs (see relevant_facts).
+CONTEXT_ALL_FACTS_MAX = 12
+CONTEXT_ALL_FACTS_CHARS = 1200
+# The embedder must not squat the single slot. keep_alive was -1 here to
+# spare a cold 7.5 s load, which made sense only if two models could be
+# resident at once; with one slot the pin does not stop the eviction (the
+# probe above shows gemma displacing a pinned nomic anyway) and simply
+# leaves the CHAT model out in the cold between turns. 0 = hand the slot
+# straight back.
+EMBED_KEEP_ALIVE = 0
 EMBED_BACKOFF_S = 60.0
+# Repeat questions are the common shape of an above-budget query ("what's
+# on my calendar" many times a day); a cached query vector costs no swap.
+QUERY_CACHE_MAX = 64
 MAX_PEOPLE = 200
 
 _TITLE_RX = r"(?:dr|doctor|mr|mrs|ms|miss|prof|professor)\.?"
@@ -193,6 +236,22 @@ def _default_embed():
     return functools.partial(docs._embed, keep_alive=EMBED_KEEP_ALIVE)
 
 
+def _embedding_allowed() -> bool:
+    """False while the chat model is lent to a trainer.
+
+    Same one-slot rule as above, pointed the other way: during a lend the
+    resident model is the trainer's (the nightly haymaker digest runs
+    qwen2.5:32b at 04:09), and an embed would evict IT mid-run. The lend
+    exists to give the GPU away cleanly; the memory must not take it back
+    through a side door. Imported lazily -- memory.py is deliberately free
+    of a brain dependency -- and a missing brain simply allows it."""
+    try:
+        from jarvis import brain
+        return not brain.is_lent()
+    except Exception:                               # noqa: BLE001
+        return True
+
+
 class SemanticFacts:
     """A chromadb collection of the facts, embedded locally.
 
@@ -204,11 +263,13 @@ class SemanticFacts:
     """
 
     def __init__(self, index_dir: Path, embed: Optional[Callable] = None,
-                 model: Optional[str] = None, base_url: Optional[str] = None):
+                 model: Optional[str] = None, base_url: Optional[str] = None,
+                 gate: Optional[Callable] = None):
         self.index_dir = Path(index_dir)
         self._embed = embed
         self._model = model
         self._base_url = base_url
+        self._gate = gate if gate is not None else _embedding_allowed
         self._client = None
         self._collection = None
         self._lock = threading.Lock()
@@ -216,6 +277,7 @@ class SemanticFacts:
         self._synced = False
         self._embed_down_logged = False
         self._down_until = 0.0
+        self._qcache: dict[str, list[float]] = {}
 
     # ---------------------------------------------------------- plumbing
     def _embedder(self):
@@ -233,6 +295,15 @@ class SemanticFacts:
         from jarvis.tools import docs
         if time.monotonic() < self._down_until:
             raise docs.EmbedError("embedder backing off after a failure")
+        try:
+            allowed = bool(self._gate())
+        except Exception:                           # noqa: BLE001
+            allowed = True
+        if not allowed:
+            # No back-off: a lend ends on its own and the next call should
+            # go straight through, unlike a genuinely dead embedder.
+            raise docs.EmbedError("chat model is lent out; not loading the "
+                                  "embedder over the trainer")
         model, base_url = self._embed_params()
         try:
             vecs = docs._embed_retrying(self._embedder(), texts, model, base_url)
@@ -278,6 +349,23 @@ class SemanticFacts:
     @staticmethod
     def _id(key: str) -> str:
         return hashlib.sha1(str(key).encode("utf-8")).hexdigest()
+
+    def _query_vector(self, prefixed: str) -> list[float]:
+        """The query embedding, remembered. Every miss costs a model swap
+        (the one-slot rule at the top of the module), and Hunter asks the
+        same handful of questions all day, so the same vector is worth
+        keeping. Insertion-ordered dict = FIFO eviction; the entries are
+        768 floats each, so the cap is about 400 kB."""
+        with self._lock:
+            hit = self._qcache.get(prefixed)
+        if hit is not None:
+            return hit
+        vec = self._vectors([prefixed])[0]
+        with self._lock:
+            self._qcache[prefixed] = vec
+            while len(self._qcache) > QUERY_CACHE_MAX:
+                self._qcache.pop(next(iter(self._qcache)))
+        return vec
 
     def _log_embed_down(self, exc):
         if not self._embed_down_logged:
@@ -400,7 +488,7 @@ class SemanticFacts:
             return []
         from jarvis.tools import docs
         try:
-            vec = self._vectors([docs.QUERY_PREFIX + text.strip()])[0]
+            vec = self._query_vector(docs.QUERY_PREFIX + text.strip())
         except docs.EmbedError as exc:
             self._log_embed_down(exc)
             return None
@@ -429,15 +517,22 @@ class SemanticFacts:
                         "time": str(meta.get("time", "")), "score": score})
         return out
 
-    def warm(self, facts: Optional[dict] = None) -> bool:
-        """Load the embedder (and index any missing facts) off the turn
-        path; the app calls this once on a daemon thread at start."""
+    def warm(self, facts: Optional[dict] = None, probe: bool = True) -> bool:
+        """Index any missing facts off the turn path, and with ``probe``
+        load the embedder too; the app calls this once on a daemon thread
+        at start.
+
+        ``probe=False`` when the turn path will never query the index (the
+        store fits the prompt): preloading the embedder would only evict
+        the 26B that residency has just warmed, buying a 7 s reload on
+        Hunter's first question for a model nothing is going to ask."""
         try:
             if facts:
                 self.sync(facts)
             if self.collection() is None:
                 return False
-            self._vectors(["search_query: hello"])
+            if probe:
+                self._vectors(["search_query: hello"])
             return True
         except Exception as exc:                    # noqa: BLE001
             log.debug("semantic memory warm-up failed: %s", exc)
@@ -455,7 +550,8 @@ class JarvisMemory:
                  legacy_dir: Path | str | None = None,
                  index_dir: Path | str | None = None,
                  embed: Optional[Callable] = None,
-                 semantic: bool = True):
+                 semantic: bool = True,
+                 gate: Optional[Callable] = None):
         self._dir = Path(memory_dir) if memory_dir else PATHS.MEMORY_DIR
         self._legacy_dir = (Path(legacy_dir) if legacy_dir
                             else PATHS.LEGACY_AGENT_DIR)
@@ -473,7 +569,7 @@ class JarvisMemory:
         # the boot path. semantic=False keeps a test on the substring store.
         self._index = SemanticFacts(Path(index_dir) if index_dir
                                     else self._dir / "facts_index",
-                                    embed=embed) if semantic else None
+                                    embed=embed, gate=gate) if semantic else None
         self._corrections = self._load("corrections.json", [])
         self._migrate_legacy()
 
@@ -626,7 +722,12 @@ class JarvisMemory:
     def relevant_facts(self, text, k=CONTEXT_TOP_K, floor=None):
         """The facts worth showing the model for THIS utterance, by
         meaning only (a substring of a chat line is not evidence). [] when
-        nothing is close enough or the index is unavailable."""
+        nothing is close enough or the index is unavailable.
+
+        This EMBEDS, which costs a chat-model swap (the one-slot rule at
+        the top of the module), so the caller decides whether ranking is
+        worth it: format_for_context only reaches here once the store no
+        longer fits the prompt."""
         if floor is None:
             floor = SCORE_FLOOR_CONTEXT
         if self._index is None or not (text or "").strip() or not self._facts:
@@ -676,12 +777,30 @@ class JarvisMemory:
     def semantic_available(self) -> bool:
         return self._index is not None and self._index.available
 
+    def facts_fit_context(self) -> bool:
+        """True when every stored fact fits in the per-turn prompt, so
+        ranking them buys nothing worth a model swap (the one-slot rule at
+        the top of the module). Hunter's live store is 4 facts / ~220
+        chars, an order of magnitude inside the budget."""
+        facts = self._facts
+        if not facts or len(facts) > CONTEXT_ALL_FACTS_MAX:
+            return False
+        total = 0
+        for key, entry in facts.items():
+            if not isinstance(entry, dict):
+                return False
+            total += len(str(key)) + len(str(entry.get("value", ""))) + 4
+            if total > CONTEXT_ALL_FACTS_CHARS:
+                return False
+        return True
+
     def warm_index(self) -> bool:
-        """Open the index, migrate facts.json into it and load the embedder
-        -- for a daemon thread at start, never the boot path."""
+        """Open the index, migrate facts.json into it and -- only when the
+        turn path will actually query it -- load the embedder. For a daemon
+        thread at start, never the boot path."""
         if self._index is None:
             return False
-        return self._index.warm(self._facts)
+        return self._index.warm(self._facts, probe=not self.facts_fit_context())
 
     # ------------------------------------------------------------------
     # People book — how Hunter refers to someone -> who they are
@@ -923,22 +1042,31 @@ class JarvisMemory:
     # Full memory dump for context
     # ------------------------------------------------------------------
     def format_for_context(self, text=""):
-        """Memory for the model's user turn. With ``text`` (the current
-        utterance) the facts are the ones RELEVANT to it by meaning; with
-        no text, or no index, the last five stored. The People block is
-        rendered outside that window on every turn, so a contact never
-        drops out after five later "remember"s."""
+        """Memory for the model's user turn.
+
+        A store that FITS the prompt is rendered whole and never touches
+        the embedder -- that is the reply path's half of the one-slot rule
+        at the top of the module, and it hands the model more facts than
+        ranking did, not fewer. Only once the store outgrows the budget is
+        it worth a model swap to rank it: then, with ``text``, the facts
+        are the ones RELEVANT to it by meaning, and with no text (or no
+        index) the last five stored.
+
+        The People block is rendered outside that window on every turn, so
+        a contact never drops out after five later "remember"s."""
         parts = []
 
         if self._facts:
-            relevant = self.relevant_facts(text) if text else []
+            fits = self.facts_fit_context()
+            relevant = self.relevant_facts(text) if (text and not fits) else []
             if relevant:
                 parts.append(f"Facts he told you that bear on this ({len(self._facts)} stored):")
                 for fact in relevant:
                     parts.append(f"  {fact['value']}")
-            elif not text or not self.semantic_available:
+            elif fits or not text or not self.semantic_available:
                 parts.append(f"Known facts ({len(self._facts)}):")
-                for key, entry in list(self._facts.items())[-5:]:
+                rows = list(self._facts.items())
+                for key, entry in (rows if fits else rows[-5:]):
                     parts.append(f"  {key}: {entry['value']}")
 
         people_text = self.format_people()

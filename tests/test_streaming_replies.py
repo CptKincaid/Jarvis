@@ -288,6 +288,27 @@ def test_the_reserved_round_never_reads_the_tool_text_out(monkeypatch):
         seconds=8.1, name="get_mail")
     spoken = []
     tags = b._chat_sync("any new mail?", on_sentence=spoken.append)
-    assert dict(tags)["SPEAK"] == brain_mod.TOOL_ONLY_LINE
+    # the source is named from the TOOL's name, never from its result
+    assert dict(tags)["SPEAK"] == brain_mod.tool_only_line(["get_mail"])
     assert "vault code" not in dict(tags)["SPEAK"]
+    assert "Subject" not in dict(tags)["SPEAK"]
     assert len(payloads) == 2
+
+
+def test_the_streamed_render_round_is_told_to_answer_now(monkeypatch):
+    """The streamed path is the live voice path, so the instruction that
+    stopped the reserved round asking for one more tool (LIVE 15:14) has
+    to reach it too — and it lives in the per-turn messages, because the
+    static system prefix must stay byte-identical (brain.py module doc)."""
+    b, payloads, ran = _slow_tool_brain(
+        monkeypatch, [_tool_round("get_mail"),
+                      _chunks("Twenty messages, sir.")],
+        ToolResult(text="20 messages since yesterday"),
+        seconds=8.1, name="get_mail")
+    b._chat_sync("any new mail?", on_sentence=lambda _s: None)
+    assert len(payloads) == 2 and ran == ["get_mail"]
+    assert "tools" not in payloads[1]
+    assert payloads[1]["messages"][-1] == {
+        "role": "user", "content": brain_mod.RENDER_NOW_LINE}
+    assert payloads[1]["messages"][0]["content"] == brain_mod.static_system(), \
+        "the instruction landed in the static prefix"

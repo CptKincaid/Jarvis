@@ -68,6 +68,29 @@ CHAT_WALL_BUDGET_S = 8.0       # the whole tool loop; beyond it, best text
 # write) is ALWAYS granted. Raising CHAT_WALL_BUDGET_S instead would just
 # hide the slow tool and tax every fast turn.
 RENDER_RESERVE_S = 3.0
+# What the budget above MEASURES, though, is the part that took two goes.
+# It used to be wall clock since the turn started -- which charged the
+# tool half for the model's own latency. LIVE 2026-08-31 15:14 ("what's
+# on my calendar and what's on my latest email?"), warm and resident:
+#
+#   15:14:11.9  round 1 starts          (tool_deadline = 16.9)
+#   15:14:21.2  get_calendar -> ok       9.2 s later: the FIRST round alone
+#   15:14:21.2  "over the tool budget mid-round"   ...had spent all 5 s
+#
+# 6.95 s of that round was Ollama's own load_duration (the memory
+# embedder evicts gemma4, so the 26B reloads on the first round of every
+# turn -- see the note on TURN_WORK_BUDGET_S below). No tool had run when
+# the tool budget expired, so the second half of the question -- the mail
+# -- was skipped before it started, and the reserved round then had
+# nothing to write the mail half from.
+#
+# So the clock now measures WORK the loop can actually spend less of:
+# wall since the turn started MINUS Ollama's reported per-request
+# overhead. Tools are charged for tool time and the model for its own
+# compute; nobody is charged for a model reload. The split is unchanged
+# (5 s of work, then the words), and CHAT_WALL_BUDGET_S is untouched --
+# inflating the total would only make every fast turn slower.
+TURN_WORK_BUDGET_S = CHAT_WALL_BUDGET_S - RENDER_RESERVE_S
 # Spec 4.2 sets 3 s; measured on this machine a classify turn costs
 # 2.4-3.0 s wall (about 1.9 s of that is Ollama's own per-request
 # overhead on a resident model, see 4.3 and scratchpad
@@ -126,6 +149,83 @@ MODEL_LENT_LINE = ("My local model is lent out at the moment, sir; "
 # never spoken as if they were Jarvis's own.
 TOOL_ONLY_LINE = ("I have the result, sir, but the model didn't get to "
                   "putting it into words.")
+# ...and that line apologises for having the answer without saying what it
+# is OF, which is the half Hunter can act on. The SOURCE of a result is
+# Jarvis's own vocabulary -- a tool name the repo chose, never a word the
+# result carried -- so naming it costs nothing against the guarantee
+# above. The results themselves stay unspoken.
+TOOL_SOURCE_NAMES = {
+    "get_calendar": "your calendar",
+    "add_event": "your calendar",
+    "manage_schedule": "your schedule",
+    "get_mail": "your latest email",
+    "get_weather": "the weather",
+    "get_time": "the time",
+    "get_location": "your location",
+    "get_briefing": "your briefing",
+    "notes": "your notes",
+    "recap_day": "your day so far",
+    "system_health": "the machine's health",
+    "canvas_due": "your Canvas deadlines",
+    "canvas_grades": "your Canvas grades",
+    "canvas_announcements": "your Canvas announcements",
+    "ask_docs": "the answer from your documents",
+    "ask_code": "the answer from the code",
+    "screen_qa": "what's on your screen",
+    "spotify_now_playing": "what's playing",
+    "oracle_status": "the Oracle box",
+}
+TOOL_ONLY_NAMED_LINE = ("I have {what}, sir — I couldn't get it into words "
+                        "in time; ask me again and I'll have it ready.")
+
+
+def tool_only_line(names=()):
+    """The degrade when a result is in hand and no model prose is: name
+    what was FETCHED and offer the next step, rather than apologise for
+    having found it. Falls back to TOOL_ONLY_LINE when nothing in
+    ``names`` has a phrase of its own -- an unknown tool is never
+    described from its result."""
+    what, seen = [], set()
+    for name in names or ():
+        phrase = TOOL_SOURCE_NAMES.get(name)
+        if phrase and phrase not in seen:
+            seen.add(phrase)
+            what.append(phrase)
+    if not what:
+        return TOOL_ONLY_LINE
+    joined = what[0] if len(what) == 1 else \
+        ", ".join(what[:-1]) + " and " + what[-1]
+    return TOOL_ONLY_NAMED_LINE.format(what=joined)
+
+
+# The reserved render round is sent with the tools stripped -- and LIVE
+# 2026-08-31 15:14 it STILL came back with a tool call and empty content:
+#
+#   15:14:22.6 chat: render round asked for 1 more tools; writing the
+#              answer instead
+#   15:14:22.6 chat reply: "I have the result, sir, but the model didn't
+#              get to putting it into words."
+#
+# Taking the schemas out of the payload does not take the tool-calling
+# TRANSCRIPT out of the messages, and a model shown one, with no
+# instruction to conclude, simply continues the pattern. The instruction
+# has to live in the per-turn MESSAGES: the system prefix must stay
+# byte-identical or every turn pays a full reprocess (module doc).
+RENDER_NOW_LINE = (
+    "[No more tools will run this turn: the results above are everything "
+    "you have. Answer my question now, in your own words, from those "
+    "results. Do not call a tool.]")
+# A round can also be cut short mid-way, leaving tool calls the model made
+# with no result beside them. An unanswered call is an open invitation to
+# make it again -- so it is answered, honestly, instead of left hanging.
+# The wording is not decoration: measured against the live gemma4 (three
+# samples each, tools stripped, the 15:14 transcript), a bare "not run:
+# this turn ran out of time for it" was read as the MAIL ITSELF in 6 of 6
+# -- "your latest email mentions a run that timed out". Saying plainly
+# that there is no result made all six honest.
+TOOL_SKIPPED_TEXT = ("[this tool did not run and produced no result: the "
+                     "turn ran out of time for it. There is nothing here to "
+                     "report; say you did not get to it.]")
 # Appended when a tool result had to be cut: the answer says so instead of
 # inventing the rest.
 PARTIAL_RESULT_LINE = ("That's only part of it, sir; there was more than I "
@@ -1778,6 +1878,15 @@ class JarvisBrain:
                     ctx_text = f"{ctx_text}\n{earlier}".strip()
         mem_text = ""
         if self._memory:
+            # This runs BEFORE `started`, so its cost never showed up in the
+            # "chat reply (Ns wall)" line -- which is how it hid. Handing it
+            # the utterance used to make it embed one, and under
+            # OLLAMA_MAX_LOADED_MODELS=1 that evicted this very model: 2.5 s
+            # for the embed, then 6.9 s of reload on the request below, on
+            # EVERY turn (measured live 2026-08-31; see "The one-slot rule"
+            # in jarvis/memory.py). format_for_context now ranks only once
+            # the fact store outgrows the prompt, so the common turn asks
+            # Ollama for no model but this one.
             mem_text = self._memory.format_for_context(text) if text else \
                 self._memory.format_for_context()
         return ctx_text, mem_text
@@ -1844,12 +1953,11 @@ class JarvisBrain:
                      "content": build_user_turn(ctx_text, mem_text, text)}]
         tools = _registry_schemas(registry, text)
         started = time.monotonic()
-        # New tool work stops here; the reserve past it is for rendering.
-        tool_deadline = started + max(0.0, CHAT_WALL_BUDGET_S - RENDER_RESERVE_S)
         cap = MAX_SPOKEN_SENTENCES
         card = None
         speak = None
         tool_texts = []
+        tool_names = []            # the OK ones, for the degrade's wording
         tool_budget = MAX_TOOL_TEXT_TOTAL_CHARS
         truncated = False
         final = ""
@@ -1859,12 +1967,29 @@ class JarvisBrain:
         # was slow" when a reply misses the latency bar (spec 4.3).
         server_s = 0.0
 
+        def spent():
+            """Seconds of WORK this turn: tool calls plus the model's own
+            compute, with Ollama's per-request overhead taken back out.
+            That overhead is a 26B reload on the first round of every turn
+            here, and no amount of skipped tool work makes it smaller --
+            billing it to the tool budget is what starved the mail half of
+            the 15:14 turn before a single tool had run."""
+            return max(0.0, time.monotonic() - started - server_s)
+
+        def over_budget():
+            return spent() > TURN_WORK_BUDGET_S
+
         def note(result, name, args=None):
             nonlocal cap, card
             cap = max(cap, int(getattr(result, "max_sentences", 2) or 2))
             if getattr(result, "card", None):
                 card = result.card
             tool_texts.append(result.text or "")
+            if getattr(result, "ok", True):
+                # A failed tool is not something Jarvis "has": claiming
+                # "I have your calendar" off "calendar unreachable" would
+                # be a lie the degrade tells all by itself.
+                tool_names.append(name)
             log.info("tool %s -> ok=%s %s", name, result.ok,
                      (result.text or "")[:80])
             self._journal_tool(name, args, result)
@@ -1893,6 +2018,7 @@ class JarvisBrain:
         rounds_left = max(1, int(max_rounds or 1))
         render_only = False        # next round writes; it may not call tools
         render_granted = False     # the reserved render round, spent once
+        render_told = False        # ...and it is told so, once, in-message
 
         def grant_render_round():
             """Spend the render reservation: one more model round, with
@@ -1904,9 +2030,20 @@ class JarvisBrain:
                 return False
             render_granted = True
             rounds_left = 1        # exactly one, and it can only write
-            log.info("chat: %.1fs tool budget spent; reserving a render round",
-                     max(0.0, CHAT_WALL_BUDGET_S - RENDER_RESERVE_S))
+            log.info("chat: %.1fs of work spent (%.1fs budget); reserving a "
+                     "render round", spent(), TURN_WORK_BUDGET_S)
             return True
+
+        def answer_skipped_calls(calls, ran):
+            """Every call of a cut-short round that never ran gets a tool
+            message saying so. A tool_call with no result beside it reads
+            as unfinished business, and the model's next move is to make
+            it again -- which is exactly what the reserved round did at
+            15:14, with no words to show for the turn."""
+            for call in calls[ran:]:
+                name, _args = self._tool_call_parts(call)
+                messages.append({"role": "tool", "content": TOOL_SKIPPED_TEXT,
+                                 "tool_name": name})
 
         if force_tool and registry is not None and registry.has(force_tool):
             # force_args pins arguments the model gets wrong on its own. It
@@ -1948,7 +2085,17 @@ class JarvisBrain:
                 rounds_left -= 1
                 # A render round is sent WITHOUT tools: asking a model to
                 # stop calling tools never worked, taking them away does.
+                # Taking them away is not enough on its own either -- the
+                # transcript it is answering IS a run of tool calls, so it
+                # is also TOLD, here in the per-turn messages, that the
+                # results are all it will get (LIVE 15:14: the reserved
+                # round came back with a tool call and no words at all).
                 round_tools = [] if render_only else tools
+                if render_only and not render_told:
+                    render_told = True
+                    messages.append({"role": "user",
+                                     "content": RENDER_NOW_LINE})
+                round_started = time.monotonic()
                 if on_sentence is not None:
                     # Each round gets the full spoken cap: what the model
                     # said before a tool call must not eat the answer's.
@@ -1971,7 +2118,11 @@ class JarvisBrain:
                     finally:
                         _unpin_if_lent(payload)
                     content, calls = _message_parts(data)
-                server_s += (data.get("load_duration") or 0) / 1e9
+                # Clamped to the round's own wall time: a bogus (or simply
+                # enormous) load_duration must not buy the loop unlimited
+                # budget, since the budget is wall MINUS this.
+                server_s += min(max(0.0, (data.get("load_duration") or 0) / 1e9),
+                                max(0.0, time.monotonic() - round_started))
                 if render_only and calls:
                     # Some models emit tool_calls even with none offered.
                     log.warning("chat: render round asked for %d more tools; "
@@ -1980,8 +2131,11 @@ class JarvisBrain:
                 if not calls or registry is None:
                     final = content
                     if render_only and tool_texts and not (final or "").strip():
-                        # the reserved round produced no words at all
-                        final = TOOL_ONLY_LINE
+                        # the reserved round produced no words at all: say
+                        # WHAT is in hand rather than only that something is
+                        log.warning("chat: the render round wrote nothing; "
+                                    "naming the sources instead")
+                        final = tool_only_line(tool_names)
                     break
                 if force_tool and tool_texts and rounds_left == 0 and \
                         messages[-1].get("role") == "tool":
@@ -1993,32 +2147,40 @@ class JarvisBrain:
                     # saying what get_mail found instead.
                     if grant_render_round():
                         continue
-                    final = TOOL_ONLY_LINE
+                    final = tool_only_line(tool_names)
                     break
                 messages.append({"role": "assistant", "content": content,
                                  "tool_calls": calls})
+                asked = calls          # what the TRANSCRIPT says he asked for
                 if len(calls) > MAX_TOOL_CALLS_PER_ROUND:
                     log.warning("chat: model asked for %d tools in one "
                                 "round; running the first %d", len(calls),
                                 MAX_TOOL_CALLS_PER_ROUND)
                     calls = calls[:MAX_TOOL_CALLS_PER_ROUND]
+                ran = 0
                 for call in calls:
                     name, args = self._tool_call_parts(call)
                     result = registry.call(name, args)
                     note(result, name, args)
                     messages.append(tool_message(result, name))
+                    ran += 1
                     if result.speak:
                         speak = result.speak
                         break
-                    if time.monotonic() > tool_deadline:
+                    if over_budget():
                         # the budget is checked INSIDE the round: a round
                         # of many calls must not run to the end first
-                        log.warning("chat: over the tool budget mid-round")
+                        log.warning("chat: over the work budget mid-round "
+                                    "(%.1fs)", spent())
                         grant_render_round()
                         break
+                # `asked`, not `calls`: the fan-out cap trims what RUNS, and
+                # the calls it trimmed are in the transcript too.
+                answer_skipped_calls(asked, ran)
                 if speak is None and not render_only and rounds_left > 0 and \
-                        time.monotonic() > tool_deadline:
-                    log.warning("chat: tool loop over the tool budget")
+                        over_budget():
+                    log.warning("chat: tool loop over the work budget (%.1fs)",
+                                spent())
                     rounds_left = 0
                 if speak is None and not render_only and rounds_left == 0 and \
                         tool_texts:
@@ -2030,7 +2192,8 @@ class JarvisBrain:
                     # Never the tool text itself: it can carry a stranger's
                     # words (a mail subject, a calendar title, a web page)
                     # and those are not spoken as if they were Jarvis's own.
-                    final = TOOL_ONLY_LINE if tool_texts else ""
+                    # Only the SOURCE is named, from the tool's own name.
+                    final = tool_only_line(tool_names) if tool_texts else ""
         except OllamaDown:
             log.warning("ollama connection refused")
             bus.publish(Status(text="Ollama isn't running", kind="warn"))
@@ -2050,7 +2213,7 @@ class JarvisBrain:
                 # spoken: keep what was said rather than say it timed out
                 final = " ".join(streamed_sentences)
             elif tool_texts:
-                final = TOOL_ONLY_LINE
+                final = tool_only_line(tool_names)
             else:
                 bus.publish(Status(text="Local model timed out", kind="warn"))
                 return [("SPEAK", MODEL_SLOW_LINE)]
