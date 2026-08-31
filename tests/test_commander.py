@@ -1474,6 +1474,7 @@ TIER1_SAMPLES = {
     "quiz": "quiz me on chapter three",
     "review flashcards": "review my flashcards",
     "stop quiz": "stop the quiz",
+    "plan week": "let's plan the week",
     "focus start": "start a focus session",
     "focus left": "how long left",
     "focus end": "end the session",

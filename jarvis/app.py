@@ -63,6 +63,7 @@ from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
+from jarvis.dialogue import SESSION_WINDOW_S
 from jarvis.brain import JarvisBrain
 from jarvis.commander import COURTESY_REPLIES, Commander, parse_yes_no
 from jarvis.context import ContextEngine
@@ -1550,11 +1551,26 @@ class JarvisApp:
         threading.Timer(0.15, lambda: self.recorder.start(followup=True, **kw)).start()
 
     def _capture_window(self):
-        """A longer wait for the first word while lecture notes are open
-        (`lecture.window_s`, default 20 s), else None for the recorder's
-        own CONFIG.followup_window. The recorder caps it at half its hard
-        cap. This is still one capture per note, not a hands-free mic."""
+        """A longer wait for the first word when something multi-turn is
+        holding the floor, else None for the recorder's own
+        CONFIG.followup_window. The recorder caps it at half its hard cap.
+        This is still one capture per turn, not a hands-free mic.
+
+        Two claimants, session first: a working session (jarvis/dialogue.py)
+        asks for its own `window_s` (~18 s), lecture notes for
+        `lecture.window_s` (20 s). CONFIG.followup_window is 4.0 s, which
+        cannot hold "Tuesday at four, or push it to Wednesday?" -- without
+        this the plan dies between turns. getattr throughout: a slim test
+        commander has neither attribute.
+        """
         commander = getattr(self, "commander", None)
+        session = getattr(commander, "_pending_session", None)
+        if session is not None and not getattr(session, "finished", False):
+            try:
+                window = float(getattr(session, "window_s", SESSION_WINDOW_S))
+            except (TypeError, ValueError):
+                window = SESSION_WINDOW_S
+            return max(window, float(CONFIG.followup_window))
         if not getattr(commander, "lecture_course", None):
             return None
         try:
