@@ -451,6 +451,32 @@ _FAILING_RX = re.compile(
     r"crash(?:es|ing|ed)?|hang(?:s|ing)?|slow|erroring|throwing|red)\b", re.I)
 _STEPWISE_RX = re.compile(r"\bstep by step\b|\bthen\b.*\bthen\b", re.I)
 
+# A LOOKUP question about his own code -- "where does the mic arbiter live",
+# "which file has the speaker gate", "what module handles the wake word" --
+# wants a citation, not a reasoning session.  jarvis/tools/docs.py's
+# CodeIndex answers it from a local embedding index in ~2 s; the same
+# sentence handed to `claude -p` costs ~12 s and his credits, for a lookup.
+# So the code cue is overridden HERE rather than by weakening the cue
+# tables, which would also stop "fix the parser in router.py" reaching Claude.
+_CODE_LOOKUP_RX = re.compile(
+    r"^(?:where\s+(?:is|are|'s|was|does|do|did)\b|"
+    r"where\s+in\s+the\s+(?:code|codebase|repo|repository|project)\b|"
+    r"(?:which|what)\s+(?:file|files|module|modules|function|functions|method|"
+    r"methods|class|classes|script|scripts)\b|"
+    r"(?:show|find|point)\s+me\s+(?:the|where)\b)", re.I)
+# ...but only while it stays a lookup.  "where should I add the handler" and
+# "where do I put the new tool" are design questions -- Claude's, not the
+# index's -- and they wear the same opening words.
+_NOT_LOOKUP_RX = re.compile(
+    r"\b(?:should|would|could|ought to)\s+(?:i|we|you)\b|"
+    r"^\s*where\s+(?:do|does|did|can|should)\s+(?:i|we|you)\b", re.I)
+
+
+def is_code_lookup(text: str) -> bool:
+    """A question the local code index can answer with a file:line."""
+    t = (text or "").strip()
+    return bool(_CODE_LOOKUP_RX.match(t) and not _NOT_LOOKUP_RX.search(t))
+
 
 _VERB_RX = _phrase_rx(CODE_VERBS)
 _OBJECT_RX = _phrase_rx(CODE_OBJECTS)
@@ -860,6 +886,12 @@ class Router:
         if cues.wrapper:
             return RouteDecision("local", f"local:{cues.local_kind or 'wrapper'}")
         if cues.code_strong and not cues.local_strong:
+            # The one carve-out from rule 4: a lookup about his own code is
+            # a two-second local answer (ask_code) rather than a twelve-
+            # second billed session.  An explicit "ask claude" (rule 3)
+            # already returned above, so saying so still overrides this.
+            if is_code_lookup(work):
+                return RouteDecision("local", "local:code-lookup")
             args.setdefault("size", estimate_size(work))
             return RouteDecision("claude", "code-cue", prompt=work,
                                  project=project, args=args)

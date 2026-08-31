@@ -102,6 +102,12 @@ DEFAULTS: dict = {
     "docs": {"paths": ["~/Documents/Jarvis Docs"], "index_dir": "~/.aiws_trainer/docs_index",
              "max_files": 500, "embed_model": "nomic-embed-text",
              "ollama_url": "http://localhost:11434"},
+    # Local code Q&A over his OWN repos (jarvis/tools/docs.py CodeIndex).
+    # paths empty means "the folders in claude.allowed_dirs" -- those already
+    # ARE his repos, and a second list would drift out of sync. index_dir
+    # empty means PATHS.MEMORY_DIR/code_index, a chroma collection separate
+    # from the documents one so quiz mode never draws a flashcard from app.py.
+    "code": {"paths": [], "index_dir": "", "max_files": 3000},
     "screen": {"model": "llama3.2-vision:latest", "max_width": 1280},
     # Study / focus sessions (jarvis/focus.py): block and break lengths in
     # minutes, "Halfway, sir" for blocks of 10+ min, the session ends itself

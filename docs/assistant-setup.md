@@ -1317,3 +1317,53 @@ running: carry on, do not retry. Never delegate coding or web work to him.
 
 Jarvis never edits that file for you, for the same reason `install.py` is a
 manual step: your Claude configuration is yours.
+
+## 41. Ask him where something is in your own code
+
+> "Jarvis, where does the mic arbiter live?"
+> "It's in Jarvis, jarvis/recorder.py, lines 120 to 168, sir."
+
+That question used to cost a twelve-second `claude -p` session and your
+credits, for what is a lookup. It is now answered locally in about two
+seconds from an embedding index over your own repositories — the same
+machinery as the documents index in section 14, pointed at source instead
+of PDFs.
+
+**Setup: none, if Claude is already configured.** The folders come from
+`claude.allowed_dirs`, because those already are your repos:
+
+```json
+"claude": {"allowed_dirs": ["~/Jarvis", "~/haymaker-digest"]},
+"code": {"paths": [], "index_dir": "", "max_files": 3000}
+```
+
+Set `code.paths` only if you want a different list; leave `index_dir` empty
+and the store lives in `~/.aiws_trainer/jarvis_memory/code_index` (a chroma
+collection called `jarvis_code`, kept separate from the documents one so
+quiz mode never draws a flashcard out of `app.py`).
+
+`.py`, `.md` and `.sh` are indexed. `repo/`, `.git/`, `node_modules`,
+`site-packages`, virtualenvs, caches and build output never are — the first
+of those matters most here, since `~/Jarvis/repo/` holds 140 MB of StyleTTS2
+weights. Files over 300 kB are skipped as generated rather than written.
+
+Chunks are cut where a reader would start — at a `def`, a `class`, a
+markdown heading, a shell function — and carry their line numbers, which is
+where the `file:120-168` citation comes from. The first index of ~200 files
+takes about a minute and a half in the background (measured on this box,
+2026-08-30); after that each question is 20-30 ms of search, and the index
+refreshes itself incrementally every fifteen minutes so a day of editing is
+never invisible.
+
+**What still goes to Claude.** The router only keeps a question local when
+it is a *lookup*:
+
+| stays local (`ask_code`) | still Claude |
+|---|---|
+| "where does the mic arbiter live" | "where should I add the new tool" |
+| "which file has the speaker gate" | "why is the recorder test failing" |
+| "what module holds the tool registry" | "refactor the module that owns the mic" |
+| "show me the file that starts the tmux session" | "ask claude where the mic arbiter lives" |
+
+The index can say where things are; it cannot say where they belong or why
+they broke. Saying "ask Claude" explicitly always wins.

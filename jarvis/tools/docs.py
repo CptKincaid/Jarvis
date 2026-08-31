@@ -12,6 +12,14 @@ so a crash between "chunks stored" and "manifest written" cannot leave a
 file half-indexed and forgotten. The first use kicks a background reindex
 so a fresh box answers from whatever it already has while it catches up.
 
+``CodeIndex`` is the same machinery pointed at his own repositories
+(``code.paths``, defaulting to ``claude.allowed_dirs``): .py/.md/.sh cut at
+def/class/heading boundaries with the line numbers kept, in its OWN chroma
+collection under ``PATHS.MEMORY_DIR`` so quiz mode and the lecture flows --
+which read chunks straight out of the documents store -- never see code.
+``ask_code`` answers "where does the mic arbiter live" in ~2 s with a
+file:line citation, where the same question sent to `claude -p` costs ~12 s.
+
 All network I/O goes through the module-level ``_embed`` seam (tests pass
 a deterministic fake); chromadb is imported lazily so a boot without the
 tool never pays for it. PDF text comes from poppler's ``pdftotext`` CLI
@@ -36,6 +44,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable, Optional
 
+from jarvis.config import PATHS
 from jarvis.logs import get_logger
 from jarvis.tools.registry import ToolResult, ToolSpec
 
@@ -73,6 +82,38 @@ INDEXING_LINE = "I'm indexing your documents now, sir; ask me again in a moment.
 INDEXED_LINE = "Indexed {n} documents, sir."
 UNREADABLE_LINE = "I couldn't read any of the documents in {folder}, sir."
 NO_QUESTION_LINE = "What would you like to know from your documents, sir?"
+
+# ------------------------------------------------------ code index (15)
+CODE_COLLECTION = "jarvis_code"
+CODE_SUFFIXES = (".py", ".md", ".sh")
+# Code lines are short: 800 chars is barely fifteen lines, not enough to hold
+# a function AND its docstring, so a hit would cite a body with no signature.
+CODE_CHUNK_CHARS = 1400
+CODE_CHUNK_LINES = 120             # one enormous function is still split
+CODE_TOP_K = 6
+CODE_SHEET_CHARS = 900             # per-chunk cap in the fact sheet
+CODE_MAX_FILES = 3000              # ~31k lines of Jarvis is ~90 files
+CODE_MAX_BYTES = 300_000           # a generated/minified file is not source
+# A repo he edits all day goes stale inside one app run; the pass is
+# incremental, so re-walking an unchanged tree is only stat() calls.
+CODE_REFRESH_S = 900.0
+# Directories that are never HIS code. `repo/` is the load-bearing one: it
+# holds 140 MB of StyleTTS2 weights in this very repository, and walking it
+# would spend minutes indexing binary noise. The rest are caches, vendored
+# dependencies and build output -- indexing site-packages would drown his
+# own 31k lines in a million lines of other people's.
+CODE_SKIP_DIRS = frozenset({
+    "repo", ".git", "node_modules", "__pycache__", "site-packages",
+    ".venv", "venv", "env", "envs", ".tox", ".nox", ".mypy_cache",
+    ".ruff_cache", ".pytest_cache", ".cache", "dist", "build", "target",
+    "htmlcov", ".eggs", ".idea", ".vscode", "coverage", "wandb",
+    "checkpoints", "weights", "runs", "outputs", "data", "datasets"})
+
+NO_CODE_LINE = ("I've no code indexed yet, sir; the folders come from Claude's "
+                "allowed directories.")
+CODE_DOWN_LINE = "My code index isn't answering, sir."
+CODE_INDEXING_LINE = "I'm reading through your code now, sir; ask me again in a moment."
+NO_CODE_QUESTION_LINE = "What would you like me to find in your code, sir?"
 
 # Words a spoken document name carries that its file name never does.
 _NAME_STOPWORDS = frozenset({
@@ -134,6 +175,42 @@ def index_dir(cfg) -> Path:
     raw = os.environ.get("JARVIS_DOCS_INDEX_DIR") or _cfg_get(cfg, "docs.index_dir", "") \
         or DEFAULT_INDEX_DIR
     return Path(os.path.expanduser(str(raw)))
+
+
+def code_paths(cfg) -> list[Path]:
+    """The repositories to index. ``code.paths`` when set, otherwise the
+    folders Hunter already cleared for Claude (``claude.allowed_dirs``):
+    those ARE his repos, and a second list to keep in sync would go stale."""
+    raw = _cfg_get(cfg, "code.paths", None)
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)) or not raw:
+        raw = _cfg_get(cfg, "claude.allowed_dirs", None) or []
+        if isinstance(raw, str):
+            raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return []
+    out, seen = [], set()
+    for entry in raw:
+        if not str(entry).strip():
+            continue
+        path = Path(os.path.expanduser(str(entry))).resolve()
+        if str(path) not in seen:
+            seen.add(str(path))
+            out.append(path)
+    return out
+
+
+def code_index_dir(cfg) -> Path:
+    """env > config > MEMORY_DIR/code_index. MEMORY_DIR rather than beside
+    the documents index because the test suite already firewalls it
+    (conftest sets JARVIS_MEMORY_DIR), so no test can write into the real
+    store just by building the tool."""
+    raw = os.environ.get("JARVIS_CODE_INDEX_DIR") or \
+        _cfg_get(cfg, "code.index_dir", "") or ""
+    if raw:
+        return Path(os.path.expanduser(str(raw)))
+    return PATHS.MEMORY_DIR / "code_index"
 
 
 def _int_cfg(cfg, key: str, default: int) -> int:
@@ -229,11 +306,17 @@ def _docx_text(path: Path) -> str:
     return "\n".join(paras)
 
 
+# Suffixes whose bytes ARE the text. Source files are here rather than in a
+# branch of their own because a .py needs no extraction at all -- only the
+# chunker downstream treats them differently (chunk_code vs chunk_text).
+PLAIN_SUFFIXES = (".txt", ".md", ".py", ".sh", ".bash")
+
+
 def extract_text(path: Path) -> str:
     """Plain text for one supported file ("" when unreadable/unsupported)."""
     suffix = path.suffix.lower()
     try:
-        if suffix in (".txt", ".md"):
+        if suffix in PLAIN_SUFFIXES:
             text = path.read_text(encoding="utf-8", errors="replace")
         elif suffix == ".pdf":
             text = _pdf_text(path)
@@ -278,6 +361,87 @@ def chunk_text(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP)
             break
         start = max(end - overlap, start + 1)
     return chunks
+
+
+# ------------------------------------------------- code chunking (15)
+# A chunk should start where a reader would start: at a def, a class, a
+# decorator above one, a markdown heading or a shell function. Splitting
+# every N characters instead puts the signature in one chunk and the body
+# in the next, and "where does X live" then cites the half without the name.
+_PY_BOUNDARY_RX = re.compile(r"^(?:@\w|(?:async\s+)?def\s|class\s|if __name__)")
+_MD_BOUNDARY_RX = re.compile(r"^#{1,6}\s")
+_SH_BOUNDARY_RX = re.compile(r"^(?:function\s+[\w.-]+|[\w.-]+\s*\(\)\s*\{)")
+_CODE_BOUNDARIES = {".py": _PY_BOUNDARY_RX, ".md": _MD_BOUNDARY_RX,
+                    ".sh": _SH_BOUNDARY_RX, ".bash": _SH_BOUNDARY_RX}
+
+
+def chunk_code(text: str, suffix: str = ".py", size: int = CODE_CHUNK_CHARS,
+               max_lines: int = CODE_CHUNK_LINES) -> list[dict]:
+    """[{text, start, end}] with 1-based, inclusive line numbers.
+
+    Units are cut at the language's own boundaries and then PACKED up to
+    ``size`` so a file of eight-line helpers is not eight chunks (eight
+    embeddings, eight near-identical hits). A unit longer than
+    ``max_lines`` is split on line boundaries.
+
+    Deliberately no overlap, unlike ``chunk_text``: prose needs it because
+    a sentence can straddle a cut, but a function cannot, and an overlap
+    would make the same lines answerable under two different citations."""
+    lines = (text or "").splitlines()
+    if not any(ln.strip() for ln in lines):
+        return []
+    rx = _CODE_BOUNDARIES.get(str(suffix or "").lower())
+    bounds = [0]
+    if rx is not None:
+        for i, line in enumerate(lines):
+            if i and rx.match(line):
+                bounds.append(i)
+    bounds.append(len(lines))
+
+    units: list[tuple[int, int]] = []
+    for a, b in zip(bounds, bounds[1:]):
+        while b - a > max_lines:
+            units.append((a, a + max_lines))
+            a += max_lines
+        if b > a:
+            units.append((a, b))
+
+    out: list[dict] = []
+    cur_a = cur_b = None
+    cur_chars = 0
+    for a, b in units:
+        n = sum(len(lines[i]) + 1 for i in range(a, b))
+        if cur_a is None:
+            cur_a, cur_b, cur_chars = a, b, n
+        elif cur_chars + n <= size and (b - cur_a) <= max_lines:
+            cur_b, cur_chars = b, cur_chars + n
+        else:
+            out.append((cur_a, cur_b))
+            cur_a, cur_b, cur_chars = a, b, n
+    if cur_a is not None:
+        out.append((cur_a, cur_b))
+
+    pieces = []
+    for a, b in out:
+        # Trim the blank lines a unit collects between definitions: the
+        # citation is read aloud and typed into an editor, and "lines
+        # 120-172" pointing at two blank lines is a citation that lies.
+        while a < b and not lines[a].strip():
+            a += 1
+        while b > a and not lines[b - 1].strip():
+            b -= 1
+        if b > a:
+            pieces.append({"text": "\n".join(lines[a:b]),
+                           "start": a + 1, "end": b})
+    return pieces
+
+
+def short_path(path) -> str:
+    """``~``-relative where possible: a citation is read aloud and spelled
+    into a search box, and /home/hunterp/ is four wasted syllables."""
+    text = str(path)
+    home = str(Path.home())
+    return "~" + text[len(home):] if text.startswith(home + "/") else text
 
 
 def _name_tokens(text: str) -> list[str]:
@@ -334,6 +498,14 @@ class DocsIndex:
     """Chunks of every supported file under ``paths`` in a chromadb
     collection at ``index_dir``; ``embed`` is the network seam."""
 
+    # Subclasses point the SAME machinery at a different corpus: their own
+    # chroma collection (never a shared one -- quiz mode and the lecture
+    # flows read chunks straight out of this store by file name, and a
+    # module.py landing in a flashcard round is a bug), their own suffixes
+    # and their own chunker.
+    collection_name = COLLECTION
+    suffixes: tuple = SUFFIXES
+
     def __init__(self, paths: list[Path], index_dir: Path, embed: Embed = _embed,
                  max_files: int = DEFAULT_MAX_FILES, model: str = DEFAULT_EMBED_MODEL,
                  base_url: str = DEFAULT_OLLAMA_URL):
@@ -350,6 +522,7 @@ class DocsIndex:
         self._thread: Optional[threading.Thread] = None
         self._last: Optional[dict] = None      # result of the latest reindex
         self._kicked = False
+        self._last_pass = 0.0                  # monotonic clock of the last finish
 
     # ------------------------------------------------------------ store
     def collection(self):
@@ -364,7 +537,7 @@ class DocsIndex:
                     path=str(self.index_dir),
                     settings=Settings(anonymized_telemetry=False))
                 self._collection = self._client.get_or_create_collection(
-                    COLLECTION, embedding_function=None,
+                    self.collection_name, embedding_function=None,
                     metadata={"hnsw:space": "cosine"})
             return self._collection
 
@@ -412,12 +585,12 @@ class DocsIndex:
             if not root.is_dir():
                 continue
             for p in sorted(root.rglob("*")):
-                if p.is_file() and p.suffix.lower() in SUFFIXES \
+                if p.is_file() and p.suffix.lower() in self.suffixes \
                         and not p.name.startswith("."):
                     found.append(p)
         if len(found) > self.max_files:
-            log.warning("docs: %d files found, indexing the first %d",
-                        len(found), self.max_files)
+            log.warning("%s: %d files found, indexing the first %d",
+                        self.collection_name, len(found), self.max_files)
         return found[:self.max_files]
 
     # ---------------------------------------------------------- reindex
@@ -481,16 +654,23 @@ class DocsIndex:
                      result["skipped"], result["errors"], time.monotonic() - t0,
                      result["documents"])
             self._last = result
+            self._last_pass = time.monotonic()
             if result.get("error"):
                 self._kicked = False      # let the next ask kick a fresh pass
             return result
 
+    def _pieces(self, path: Path, text: str) -> list[tuple[str, dict]]:
+        """(chunk text, extra metadata) for one file. Prose carries no
+        extra metadata; CodeIndex overrides this to keep line numbers."""
+        return [(c, {}) for c in chunk_text(text)]
+
     def _index_file(self, col, path: Path, key: tuple[float, int]) -> bool:
         text = extract_text(path)
-        chunks = chunk_text(text)
-        if not chunks:
+        pieces = self._pieces(path, text)
+        if not pieces:
             log.warning("docs: no text in %s", path.name)
             return False
+        chunks = [c for c, _ in pieces]
         vectors: list[list[float]] = []
         for i in range(0, len(chunks), EMBED_BATCH):
             batch = [DOC_PREFIX + c for c in chunks[i:i + EMBED_BATCH]]
@@ -502,7 +682,8 @@ class DocsIndex:
             ids=[f"{path}::{i}" for i in range(len(chunks))],
             embeddings=vectors, documents=chunks,
             metadatas=[{"path": str(path), "name": path.name, "chunk": i,
-                        "mtime": key[0], "size": key[1]} for i in range(len(chunks))])
+                        "mtime": key[0], "size": key[1], **extra}
+                       for i, (_, extra) in enumerate(pieces)])
         return True
 
     def mark_used(self) -> bool:
@@ -529,6 +710,17 @@ class DocsIndex:
             return False
         self._kicked = False
         return self.start_background()
+
+    def refresh_if_stale(self, max_age_s: float) -> bool:
+        """A background pass when the last one finished over ``max_age_s``
+        ago. ``start_background`` latches once per process, which is right
+        for a documents folder Hunter rarely touches and wrong for a repo
+        he edits all day: without this an app up for a week would answer
+        code questions from Monday's tree. The pass itself is incremental
+        (mtime+size), so a re-run over an unchanged repo is only stats."""
+        if self._last_pass and (time.monotonic() - self._last_pass) < max_age_s:
+            return False
+        return self.kick()
 
     def busy(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
@@ -559,10 +751,15 @@ class DocsIndex:
         out = []
         for doc, meta, dist in zip(docs, metas, dists):
             meta = meta or {}
-            out.append({"name": str(meta.get("name") or Path(str(meta.get("path", ""))).name),
-                        "path": str(meta.get("path", "")), "text": doc or "",
-                        "chunk": int(meta.get("chunk", 0)),
-                        "score": round(1.0 - float(dist), 4)})
+            hit = {"name": str(meta.get("name") or Path(str(meta.get("path", ""))).name),
+                   "path": str(meta.get("path", "")), "text": doc or "",
+                   "chunk": int(meta.get("chunk", 0)),
+                   "score": round(1.0 - float(dist), 4)}
+            # CodeIndex stores these; a prose chunk has no line span.
+            for extra in ("rel", "start", "end"):
+                if meta.get(extra) is not None:
+                    hit[extra] = meta[extra]
+            out.append(hit)
         return out
 
 
@@ -625,6 +822,93 @@ def fact_sheet(hits: list[dict]) -> str:
     return "\n".join(f"From {h['name']}: {_compact(h['text'])}" for h in hits)
 
 
+# ------------------------------------------------------- code index (15)
+class CodeIndex(DocsIndex):
+    """His own repositories in their own chroma collection.
+
+    Everything that made DocsIndex work -- the mtime/size manifest living in
+    chroma's metadata, the background first pass, the single ``embed`` seam,
+    replace-never-append on reindex -- is inherited unchanged. What differs
+    is the corpus (source files, not PDFs), the chunker (line-aware, cut at
+    def/class/heading) and the collection, which MUST be separate: quiz mode
+    and the lecture flows read chunks straight out of the documents store by
+    file name, and recorder.py turning up in a flashcard round is a bug.
+    """
+
+    collection_name = CODE_COLLECTION
+    suffixes = CODE_SUFFIXES
+    skip_dirs = CODE_SKIP_DIRS
+    max_bytes = CODE_MAX_BYTES
+
+    def scan(self) -> list[Path]:
+        """os.walk rather than rglob: rglob cannot PRUNE, so it would
+        descend into repo/ (140 MB of model weights) and .git before
+        filtering by suffix -- minutes of stat() calls per pass."""
+        found: list[Path] = []
+        for root in self.paths:
+            if not root.is_dir():
+                continue
+            for dirpath, dirnames, filenames in os.walk(root):
+                dirnames[:] = sorted(d for d in dirnames
+                                     if d not in self.skip_dirs
+                                     and not d.startswith("."))
+                for name in sorted(filenames):
+                    if name.startswith(".") or \
+                            Path(name).suffix.lower() not in self.suffixes:
+                        continue
+                    path = Path(dirpath) / name
+                    try:
+                        if path.stat().st_size > self.max_bytes:
+                            continue          # generated, vendored or a dump
+                    except OSError:
+                        continue
+                    found.append(path)
+        found.sort()
+        if len(found) > self.max_files:
+            log.warning("code: %d files found, indexing the first %d",
+                        len(found), self.max_files)
+        return found[:self.max_files]
+
+    def rel(self, path: Path) -> str:
+        """"Jarvis/jarvis/recorder.py" -- relative to the repo's PARENT, so
+        the citation names the repo as well as the file. Two repos with a
+        jarvis/app.py would otherwise be indistinguishable when spoken."""
+        for root in self.paths:
+            try:
+                return str(Path(path).relative_to(root.parent))
+            except ValueError:
+                continue
+        return short_path(path)
+
+    def _pieces(self, path: Path, text: str) -> list[tuple[str, dict]]:
+        rel = self.rel(path)
+        out = []
+        for piece in chunk_code(text, Path(path).suffix.lower()):
+            # The path rides INSIDE the chunk text as well as in the
+            # metadata: nomic embeds the text only, so "where does the mic
+            # arbiter live" has to be able to match on "recorder.py" too.
+            body = f"{rel}:{piece['start']}\n{piece['text']}"
+            out.append((body, {"rel": rel, "start": piece["start"],
+                               "end": piece["end"]}))
+        return out
+
+
+def code_ref(hit: dict) -> str:
+    """"Jarvis/jarvis/recorder.py:120-168" for one hit."""
+    rel = str(hit.get("rel") or "") or short_path(hit.get("path", ""))
+    start, end = hit.get("start"), hit.get("end")
+    if start and end:
+        return f"{rel}:{start}-{end}" if int(end) != int(start) else f"{rel}:{start}"
+    return rel
+
+
+def code_sheet(hits: list[dict]) -> str:
+    """One line per chunk, path:lines first, so the model cites file AND
+    line -- the whole point of the code index over `claude -p`."""
+    return "\n".join(f"From {code_ref(h)}: {_compact(h['text'], CODE_SHEET_CHARS)}"
+                      for h in hits)
+
+
 # ---------------------------------------------------------------- tool
 def build_index(cfg, embed: Embed = _embed) -> DocsIndex:
     return DocsIndex(paths=doc_paths(cfg), index_dir=index_dir(cfg), embed=embed,
@@ -633,8 +917,17 @@ def build_index(cfg, embed: Embed = _embed) -> DocsIndex:
                      base_url=str(_cfg_get(cfg, "docs.ollama_url", "") or DEFAULT_OLLAMA_URL))
 
 
+def build_code_index(cfg, embed: Embed = _embed) -> CodeIndex:
+    return CodeIndex(paths=code_paths(cfg), index_dir=code_index_dir(cfg),
+                     embed=embed,
+                     max_files=_int_cfg(cfg, "code.max_files", CODE_MAX_FILES),
+                     model=str(_cfg_get(cfg, "docs.embed_model", "") or DEFAULT_EMBED_MODEL),
+                     base_url=str(_cfg_get(cfg, "docs.ollama_url", "") or DEFAULT_OLLAMA_URL))
+
+
 def make_tools(cfg, services, embed: Embed = _embed) -> list[ToolSpec]:
     index = build_index(cfg, embed)
+    code = build_code_index(cfg, embed)
     # Parked for the commander (lecture notes kick a reindex on "end notes"),
     # the way spotify.make_tools parks its tool on services.spotify.
     try:
@@ -650,6 +943,11 @@ def make_tools(cfg, services, embed: Embed = _embed) -> list[ToolSpec]:
             services.docs = index
         except (AttributeError, TypeError):
             log.debug("services does not accept docs")
+    if services is not None and getattr(services, "code_index", None) is None:
+        try:
+            services.code_index = code
+        except (AttributeError, TypeError):
+            log.debug("services does not accept the code index")
     no_docs = NO_DOCS_LINE.format(folder=folder)
     # Nothing is opened here: chromadb and the index dir are touched on the
     # first tool call, so a boot (or test_app_wiring) costs nothing.
@@ -721,6 +1019,44 @@ def make_tools(cfg, services, embed: Embed = _embed) -> list[ToolSpec]:
         return ToolResult(text=f"indexed {n} documents ({result.get('indexed', 0)} new)",
                           speak=INDEXED_LINE.format(n=n))
 
+    def ask_code(question: str = "", **_) -> ToolResult:
+        question = " ".join(str(question or "").split())
+        if not question:
+            return ToolResult(text="ask_code needs a question", ok=False,
+                              speak=NO_CODE_QUESTION_LINE)
+        if not code.paths:
+            # No allowed_dirs and no code.paths: there is nothing to index,
+            # and "indexing now" would be a lie he never stops telling.
+            return ToolResult(text="no code folders configured", ok=False,
+                              speak=NO_CODE_LINE)
+        first = code.start_background()
+        if not first:
+            # He edits these repos all day; the once-per-process latch that
+            # suits a documents folder would answer from a stale tree.
+            code.refresh_if_stale(CODE_REFRESH_S)
+        try:
+            hits = code.query(question, k=CODE_TOP_K)
+        except EmbedError as exc:
+            log.warning("ask_code: embed failed: %s", exc)
+            return ToolResult(text="code index unreachable", ok=False,
+                              speak=CODE_DOWN_LINE)
+        except Exception:                      # noqa: BLE001 - store boundary
+            log.exception("ask_code failed")
+            return ToolResult(text="code index unreachable", ok=False,
+                              speak=CODE_DOWN_LINE)
+        if not hits:
+            if not code.scan():
+                return ToolResult(text="no code files found", ok=False,
+                                  speak=NO_CODE_LINE)
+            if (code.last_result or {}).get("error"):
+                return ToolResult(text="code index unreachable", ok=False,
+                                  speak=CODE_DOWN_LINE)
+            if first or code.busy():
+                return ToolResult(text="indexing in progress", ok=False,
+                                  speak=CODE_INDEXING_LINE)
+            return ToolResult(text="nothing in the code matches that", ok=False)
+        return ToolResult(text=code_sheet(hits), max_sentences=3)
+
     return [
         ToolSpec(
             name="ask_docs",
@@ -735,4 +1071,12 @@ def make_tools(cfg, services, embed: Embed = _embed) -> list[ToolSpec]:
             description="Re-scan the documents folder and update the index.",
             parameters={"type": "object", "properties": {}},
             handler=docs_reindex),
+        ToolSpec(
+            name="ask_code",
+            description="Find something in Hunter's own repositories and cite the file and lines.",
+            parameters={"type": "object", "properties": {
+                "question": {"type": "string",
+                             "description": "What to find in his code."}},
+                "required": ["question"]},
+            handler=ask_code),
     ]
