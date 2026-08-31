@@ -141,7 +141,12 @@ DEFAULTS: dict = {
                  # halves every briefing view's sentence allowance.
                  "sections": {"weather": True, "calendar": True, "news": True,
                               "sports": True, "stocks": True, "canvas": True,
-                              "todos": True, "alarms": True, "reminders": True},
+                              "todos": True, "alarms": True, "reminders": True,
+                              # exam-week study: the flashcard deck for the
+                              # course whose exam is inside study_days, and
+                              # the offer to run some now
+                              "study": True},
+                 "study_days": 5, "study_offer": True, "study_offer_n": 10,
                  "verbosity": "normal",
                  # The good-night preview offers a wake-up alarm when
                  # tomorrow's first event starts by early_before and no alarm

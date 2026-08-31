@@ -1714,10 +1714,13 @@ _PREF_SECTIONS = {
     "canvas": "canvas", "coursework": "canvas", "todo": "todos", "todos": "todos",
     "to-do": "todos", "to-dos": "todos", "tasks": "todos", "alarm": "alarms",
     "alarms": "alarms", "reminder": "reminders", "reminders": "reminders",
+    "study": "study", "flashcard": "study", "flashcards": "study",
+    "revision": "study",
 }
 _PREF_SECTION_WORDS = {"todos": "the to-dos", "alarms": "the alarms",
                        "reminders": "the reminders", "canvas": "Canvas",
-                       "weather": "the weather", "calendar": "the calendar"}
+                       "weather": "the weather", "calendar": "the calendar",
+                       "study": "the study line"}
 _PREF_SECTION_RX = re.compile(
     r"^(?:(?P<off>no|skip|drop|leave out|lose|without|i don'?t want|i do not want|"
     r"don'?t (?:read|include|give me|do|mention)|stop (?:reading|including|giving me))"
@@ -1725,7 +1728,7 @@ _PREF_SECTION_RX = re.compile(
     r"start (?:reading|including)|mention))"
     r"\s+(?:the\s+|my\s+|any\s+)?"
     r"(?P<section>news|sports?|stocks?|weather|calendar|canvas|coursework|to-?dos?|tasks|"
-    r"alarms?|reminders?)"
+    r"alarms?|reminders?|study|flash ?cards?|revision)"
     r"(?:\s+(?:back|again))?"
     r"\s+(?:(?:in|from|with|on)\s+(?:the|my)\s+(?:morning\s+|daily\s+|evening\s+|nightly\s+|"
     r"weekly\s+)?(?:briefings?|previews?|forecast)|in the mornings?)"
@@ -3234,22 +3237,28 @@ def _h_teach(c, t, m):
                          speak=True, ack=True, done=False, status=f"Teaching {topic}")
 
 
-def _h_review(c, t, m):
+def _start_review(c, n: int, topic: str = "") -> CommandResult:
+    """Open a flashcard session over the cards due now, optionally on one
+    deck. Shared by "review my flashcards" and the briefing's exam-week
+    offer, so both end up in the same _pending_quiz rung."""
     try:
         store = _quiz_store(c)
     except Exception:
         log.exception("flashcard store unavailable")
         return CommandResult(handled=True, reply=quiz_mod.NO_CARDS_LINE, speak=True,
                              status="No store")
-    n = _int_setting(c, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS)
-    cards = store.due(limit=n)
+    cards = store.due(limit=n, topic=topic)
     if not cards:
         line = quiz_mod.NO_CARDS_LINE if store.count() == 0 else quiz_mod.NOTHING_DUE_LINE
         return CommandResult(handled=True, reply=line, speak=True, status="No cards due")
-    session = quiz_mod.QuizSession(cards, topic="review")
+    session = quiz_mod.QuizSession(cards, topic=topic or "review")
     c._pending_quiz = session
     return CommandResult(handled=True, reply=f"{_cards_line(len(cards))} {session.ask()}",
                          speak=True, status=f"Flashcards 1/{len(cards)}")
+
+
+def _h_review(c, t, m):
+    return _start_review(c, _int_setting(c, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS))
 
 
 def _h_quiz_stop(c, t, m):
@@ -3970,6 +3979,11 @@ class Commander:
         res = self._try_alarm_offer(text)
         if res is not None:
             return res
+        # 3d'. The morning briefing asked "Shall we run ten now, sir?" of
+        #      the deck for this week's exam; a plain yes deals those cards.
+        res = self._try_study_offer(text)
+        if res is not None:
+            return res
         # 3e. A destructive action was read back ("Cancel all three alarms,
         #     sir?"): a plain yes runs it, anything else drops it.
         res = self._try_destructive_confirm(text)
@@ -4571,6 +4585,43 @@ class Commander:
         when = offer.get("time") or "then"
         return CommandResult(handled=True, reply=f"Alarm at {when}, sir.", speak=True,
                              status=f"Alarm {when}")
+
+    def _try_study_offer(self, text: str) -> Optional[CommandResult]:
+        """Resolve "Shall we run ten now, sir?" from the exam-week study
+        section (briefing.make_tools parks it on services.study_offer).
+
+        Same rule as _try_alarm_offer: only a clear yes takes it, a no
+        declines, anything else DROPS it, and so does an offer older than
+        OFFER_TTL_S -- the briefing is spoken at breakfast and a "yes" to
+        something else at lunchtime must not start a quiz. The cards come
+        from the deck for the exam's course, so it is revision for THAT
+        exam and not a general review.
+        """
+        offer = getattr(self.services, "study_offer", None)
+        if not isinstance(offer, dict) or not offer:
+            return None
+        try:
+            self.services.study_offer = None
+        except Exception:
+            log.debug("could not clear the study offer", exc_info=True)
+        try:
+            made = float(offer.get("made_at") or 0.0)
+        except (TypeError, ValueError):
+            made = 0.0
+        if made and time.time() - made > OFFER_TTL_S:
+            log.info("study offer expired; %r is a new subject", text[:40])
+            return None
+        answer = parse_yes_no(text)
+        if answer is None:
+            return None
+        if not answer:
+            return CommandResult(handled=True, reply="Very good, sir.", speak=True,
+                                 status="No study")
+        try:
+            n = max(1, int(offer.get("n") or quiz_mod.DEFAULT_QUESTIONS))
+        except (TypeError, ValueError):
+            n = quiz_mod.DEFAULT_QUESTIONS
+        return _start_review(self, n, topic=str(offer.get("course") or ""))
 
     def _try_event_confirm(self, text: str) -> Optional[CommandResult]:
         """Resolve a calendar add that was read back for confirmation.

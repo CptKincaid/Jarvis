@@ -519,6 +519,8 @@ def test_section_preferences_write_the_config_and_the_memory(cmdr):
         "leave out canvas in the evening preview": ("canvas", False),
         "include the to-dos in my briefing again": ("todos", True),
         "drop the reminders from my weekly forecast, please": ("reminders", False),
+        "no study in the morning": ("study", False),
+        "put the flashcards back in my briefing": ("study", True),
     }
     for text, (name, on) in cases.items():
         res = cmdr.handle(text, source="typed")

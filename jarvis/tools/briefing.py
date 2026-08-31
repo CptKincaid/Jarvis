@@ -41,6 +41,7 @@ from typing import Callable, Optional
 
 from jarvis.logs import get_logger
 from jarvis.tools.registry import ToolResult, ToolSpec
+from jarvis.tools.timekeeper import count_words
 
 log = get_logger("tools.briefing")
 
@@ -52,13 +53,22 @@ WHENS = ("today", "tomorrow", "week")
 # drops one (voice: "no news in the morning"); unknown names are ignored
 # so a typo in the file cannot blank the card.
 SECTIONS = ("weather", "calendar", "news", "sports", "stocks",
-            "canvas", "todos", "alarms", "reminders")
+            "canvas", "todos", "alarms", "reminders", "study")
 # Spoken allowance per view; "brief" verbosity halves it (never below 2).
 VIEW_SENTENCES = {"today": 6, "tomorrow": 5, "week": 8}
 WAKE_LABEL = "wake up"
 OFFER_LINE = "Shall I wake you at {time}, sir?"
 OFFER_TTL_S = 180.0            # a bedtime yes is quick; anything later is a new subject
 WEEK_DAYS = 7
+# Exam-week study. Canvas already finds the next exam and the flashcard
+# store already filters by topic; the briefing is where the two meet.
+STUDY_DAYS = 5                     # an exam further out is not this week's problem
+STUDY_OFFER_N = 10                 # cards the "shall we run ten now" offer starts
+STUDY_DUE_CAP = 200                # rows read to size the deck; not a session length
+STUDY_CARDS_LINE = "{cards} due on your {course} deck{weak}."
+STUDY_OFFER_LINE = "Shall we run {n} now, sir?"
+STUDY_NO_DECK_LINE = ("Nothing on your {course} deck yet, sir; say quiz me on "
+                      "{course} and I'll build one.")
 DEFAULT_NEWS_FEEDS = ["https://www.theverge.com/rss/index.xml",
                       "https://feeds.arstechnica.com/arstechnica/index"]
 HN_TOP_URL = "https://hacker-news.firebaseio.com/v0/topstories.json"
@@ -136,6 +146,15 @@ def _truthy(value) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on", "enabled")
     return bool(value)
+
+
+def _int_cfg(cfg, dotted: str, default: int) -> int:
+    """A hand-edited assistant.json can hold "5" or a typo; neither may
+    take the briefing down."""
+    try:
+        return int(_cfg_get(cfg, dotted, default))
+    except (TypeError, ValueError):
+        return default
 
 
 def section_on(cfg, name: str) -> bool:
@@ -537,15 +556,21 @@ def _due_lines(registry) -> list[str]:
     return [_DUE_ITEM_RX.sub("", ln) for ln in lines[1:]]
 
 
-def _exam_line(exam_lookup, now: datetime) -> str:
-    """'Midterm 1 for BIOSENSORS, in 6 days, Friday at 9:00 am' or ''."""
+def _exam_call(exam_lookup) -> Optional[dict]:
+    """The next exam dict, or None. Split out of _exam_line because the
+    study section needs the COURSE off the same lookup and must not pay
+    for a second Canvas round trip to get it."""
     if not callable(exam_lookup):
-        return ""
+        return None
     try:
         exam = exam_lookup()
     except Exception as exc:                  # noqa: BLE001 - source boundary
         log.warning("briefing: exam lookup failed: %s", type(exc).__name__)
-        return ""
+        return None
+    return exam or None
+
+
+def _exam_words(exam: Optional[dict], now: datetime) -> str:
     if not exam:
         return ""
     from jarvis.tools.canvas import exam_words
@@ -555,18 +580,84 @@ def _exam_line(exam_lookup, now: datetime) -> str:
         return ""
 
 
+def _exam_line(exam_lookup, now: datetime) -> str:
+    """'Midterm 1 for BIOSENSORS, in 6 days, Friday at 9:00 am' or ''."""
+    return _exam_words(_exam_call(exam_lookup), now)
+
+
+def _exam_days(exam: Optional[dict], now: datetime) -> Optional[int]:
+    """Whole days from now to the exam, or None when it has no usable
+    date. Day granularity on purpose: an exam at 9 am on Friday and one at
+    5 pm on Friday are the same nights of revision."""
+    when = (exam or {}).get("when")
+    if not isinstance(when, datetime):
+        return None
+    try:
+        local = when.astimezone(now.tzinfo) if now.tzinfo else when
+        return (local.date() - now.date()).days
+    except (ValueError, OverflowError, TypeError):
+        return None
+
+
+def _study_section(cfg, exam: Optional[dict], store, now: datetime) -> tuple:
+    """('14 cards due on your BIOSENSORS deck, 9 of them in box one. Shall
+    we run ten now, sir?', offer) when an exam is close, else ('', {}).
+
+    Silent unless there IS an exam inside study_days carrying a course
+    name: a deck line with no exam behind it is nagging, and with no
+    course there is nothing to filter the deck by -- every card of every
+    subject would be counted as revision for this one.
+    """
+    if store is None or not exam:
+        return "", {}
+    days = _exam_days(exam, now)
+    near = _int_cfg(cfg, "briefing.study_days", STUDY_DAYS)
+    if days is None or days < 0 or days > near:
+        return "", {}
+    course = " ".join(str(exam.get("course") or "").split())
+    if not course:
+        return "", {}
+    try:
+        cards = store.due(limit=STUDY_DUE_CAP, now=now.timestamp(), topic=course)
+    except Exception:                          # noqa: BLE001 - store boundary
+        log.exception("briefing: flashcard deck unreadable")
+        return "", {}
+    if not cards:
+        # An empty deck on the eve of an exam earns one line: it is the
+        # moment he would want cards and has none. (Building them from his
+        # lecture notes overnight is the follow-up, not this.)
+        return STUDY_NO_DECK_LINE.format(course=course), {}
+    weak = sum(1 for c in cards if int(c.get("box") or 0) == 1)
+    n = len(cards)
+    line = STUDY_CARDS_LINE.format(
+        cards="One card" if n == 1 else f"{n} cards", course=course,
+        weak=f", {weak} of them in box one" if weak else "")
+    if not _truthy(_cfg_get(cfg, "briefing.study_offer", True)):
+        return line, {}
+    want = max(1, min(_int_cfg(cfg, "briefing.study_offer_n", STUDY_OFFER_N), n))
+    offer = {"course": course, "n": want, "made_at": time.time()}
+    return f"{line} {STUDY_OFFER_LINE.format(n=count_words(want))}", offer
+
+
 def _day_line(now: datetime) -> str:
     clock = now.strftime("%I:%M %p").lstrip("0").lower()
     return f"Briefing for {now.strftime('%A')} {now.day} {now.strftime('%B')}, {clock}."
 
 
 def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
-                   cache_path=None, exam_lookup: Optional[Callable] = None) -> tuple[dict, str]:
+                   cache_path=None, exam_lookup: Optional[Callable] = None,
+                   flashcards=None,
+                   park_offer: Optional[Callable] = None) -> tuple[dict, str]:
     """-> (sections, fact_sheet). sections = {weather: str, calendar: [str],
-    due: [str], exam: str, news: [{title, source}], sports: [str],
-    stocks: [str]}. ``fetch`` defaults to the module's ``_fetch`` looked up
-    at call time (tests monkeypatch it). ``exam_lookup`` () -> the next
-    exam dict (tools/canvas.find_next_exam) or None; the countdown line."""
+    due: [str], exam: str, study: str, news: [{title, source}], sports:
+    [str], stocks: [str]}. ``fetch`` defaults to the module's ``_fetch``
+    looked up at call time (tests monkeypatch it). ``exam_lookup`` () ->
+    the next exam dict (tools/canvas.find_next_exam) or None; the countdown
+    line and the study section both come off it. ``flashcards`` is a
+    quiz.FlashcardStore; without one there is no study section.
+    ``park_offer(offer)`` receives the "shall we run ten now" offer for
+    Commander._try_study_offer to answer -- a callback rather than a third
+    return value so every existing caller keeps working."""
     fetch = fetch or _fetch
     if now is None:
         now_dt = datetime.now().astimezone()
@@ -579,13 +670,14 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
         cache_path = Path.home() / ".cache" / "jarvis" / "news_cache.json"
 
     sections = {"weather": "", "calendar": [], "due": [], "exam": "",
-                "news": [], "sports": [], "stocks": []}
+                "study": "", "news": [], "sports": [], "stocks": []}
     notes = {}
     # A section switched off by voice is neither fetched nor mentioned:
     # "no news in the morning" must not leave a "News: unavailable" line
     # for the model to apologise about.
     on = {name: section_on(cfg, name) for name in ("weather", "calendar", "news",
-                                                    "sports", "stocks", "canvas")}
+                                                    "sports", "stocks", "canvas",
+                                                    "study")}
 
     sports_feeds = [str(u) for u in (_cfg_get(cfg, "briefing.sports_feeds", []) or [])
                     if str(u).strip()] if on["sports"] else []
@@ -605,7 +697,9 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
         # lines: off means no call at all, not an empty result.
         canvas_on = on.get("canvas", True)
         due_future = pool.submit(_due_lines, registry) if canvas_on else None
-        exam_future = pool.submit(_exam_line, exam_lookup, now_dt) if canvas_on else None
+        # The DICT, not the line: the study section needs the course off
+        # this same lookup (_exam_words turns it into the spoken line).
+        exam_future = pool.submit(_exam_call, exam_lookup) if canvas_on else None
 
         if on["weather"]:
             ok, text = _registry_text(registry, "get_weather", {"when": "today"})
@@ -625,10 +719,20 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
                 sections["due"] = due_future.result()
             except Exception as exc:              # noqa: BLE001 - source boundary
                 log.warning("briefing: due failed: %s", type(exc).__name__)
+            exam = None
             try:
-                sections["exam"] = exam_future.result()
+                exam = exam_future.result()
             except Exception as exc:              # noqa: BLE001
                 log.warning("briefing: exam failed: %s", type(exc).__name__)
+            sections["exam"] = _exam_words(exam, now_dt)
+            if on.get("study", True):
+                line, offer = _study_section(cfg, exam, flashcards, now_dt)
+                sections["study"] = line
+                if offer and callable(park_offer):
+                    try:
+                        park_offer(offer)
+                    except Exception:             # noqa: BLE001 - caller boundary
+                        log.debug("could not park the study offer", exc_info=True)
 
         news, complete = [], True
         if news_future is not None:
@@ -671,6 +775,8 @@ def build_briefing(cfg, registry, fetch: Optional[Fetch] = None, now=None,
             lines.append("Due: " + " ".join(f"{i}) {d}" for i, d in enumerate(sections["due"], 1)))
         if sections["exam"]:
             lines.append(f"Exam: {sections['exam']}")
+        if sections["study"]:
+            lines.append(f"Study: {sections['study']}")
     if on["news"]:
         if sections["news"]:
             items = " ".join(f"{i}) {n['title']} ({n['source']})"
@@ -1101,6 +1207,16 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         exam, _checked = find_next_exam(cfg, cal)
         return exam
 
+    def _park_study_offer(offer):
+        # Answered by Commander._try_study_offer, the same way the wake-up
+        # offer below is answered by _try_alarm_offer.
+        if services is None:
+            return
+        try:
+            services.study_offer = offer
+        except Exception:
+            log.debug("could not park the study offer", exc_info=True)
+
     def _park_offer(offer):
         # The commander answers the "shall I wake you" yes/no from here
         # (Commander._try_alarm_offer), the way a calendar add waits on
@@ -1144,10 +1260,12 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                                   speak=WEEK_NOTHING_LINE)
             return ToolResult(text=sheet, card=sections,
                               max_sentences=verbosity_cap(cfg, VIEW_SENTENCES["week"]))
-        sections, sheet = build_briefing(cfg, registry, cache_path=cache_path,
-                                         exam_lookup=_next_exam)
+        sections, sheet = build_briefing(
+            cfg, registry, cache_path=cache_path, exam_lookup=_next_exam,
+            flashcards=getattr(services, "flashcards", None) if services else None,
+            park_offer=_park_study_offer)
         got_any = bool(sections["weather"] or sections["calendar"] or
-                       sections["due"] or sections["exam"] or
+                       sections["due"] or sections["exam"] or sections["study"] or
                        sections["news"] or sections["sports"] or sections["stocks"])
         if not got_any:
             return ToolResult(text="briefing sources unreachable", ok=False,
