@@ -191,8 +191,10 @@ def briefing_rows(sections) -> list:
     skipped.
 
     The same card carries the evening preview (CANVAS, TO-DOS, ALARM and
-    the wake-up OFFER) and the week forecast (a WEEK summary row, then one
-    row per day labelled by its name). Unknown keys are still dropped."""
+    the wake-up OFFER), the week forecast (a WEEK summary row, then one row
+    per day labelled by its name), the pre-class dossier (ROOM or JOIN,
+    LAST TIME, MAIL) and the class-start stage (CLASS). Unknown keys are
+    still dropped."""
     s = sections or {}
     rows: list = []
     summary = str(s.get("summary") or "").strip()
@@ -203,6 +205,18 @@ def briefing_rows(sections) -> list:
         rows.append(("WEATHER", weather))
     for i, line in enumerate(_as_lines(s.get("calendar"))):
         rows.append(("CALENDAR" if i == 0 else "", line))
+    # The pre-class dossier (jarvis/dossier.py) adds four keys to the same
+    # card: where the class is (a room, or the join link when the event's
+    # location is a URL), what he noted last time, and the unread mail about
+    # it. Additive on purpose -- DUE and EXAM keep their places below, which
+    # the briefing and the evening preview depend on.
+    for key, label in (("room", "ROOM"), ("join", "JOIN")):
+        text = str(s.get(key) or "").strip()
+        if text:
+            rows.append((label, text))
+    last = str(s.get("last") or "").strip()
+    if last:
+        rows.append(("LAST TIME", last))
     # Coursework: DUE (one row per item) and the EXAM countdown, both
     # absent when Canvas is unconfigured or nothing qualifies.
     for i, line in enumerate(_as_lines(s.get("due"))):
@@ -241,7 +255,10 @@ def briefing_rows(sections) -> list:
         for i, line in enumerate(lines):
             rows.append((label if i == 0 else "", line))
     for key, label in (("canvas", "CANVAS"), ("todos", "TO-DOS"),
-                       ("reminders", "REMINDERS")):
+                       ("reminders", "REMINDERS"),
+                       # dossier: unread mail about this class;
+                       # classflow: what was staged at the start of it
+                       ("mail", "MAIL"), ("class", "CLASS")):
         for i, line in enumerate(_as_lines(s.get(key))):
             rows.append((label if i == 0 else "", line))
     for key, label in (("alarm", "ALARM"), ("offer", "OFFER")):
