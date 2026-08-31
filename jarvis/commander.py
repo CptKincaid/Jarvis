@@ -3215,9 +3215,14 @@ def _h_leave_query(c, t, m):
     minutes = lt.table.get(key)
     lt.note_key(key)
     if minutes is None:
+        # Asking back and then dropping the answer on the floor is the
+        # dead-end this repo has been bitten by before ("Was that for me?"
+        # was a toast nothing listened to). Arm the SAME pending slot the
+        # proactive ask uses, so "about twelve minutes" lands in the table.
+        c.ask_leave_time(key, place)
         return CommandResult(handled=True, speak=True, status="Walk unknown",
                              reply=f"{leave_mod.UNKNOWN_LINE} "
-                                   f"How long do you need to get to {place}?")
+                                   f"{leave_mod.ASK_LINE.format(place=place)}")
     return CommandResult(handled=True, speak=True,
                          reply=f"{place} is a {minutes} minute walk, sir.",
                          status=f"Walk: {place} {minutes} min")

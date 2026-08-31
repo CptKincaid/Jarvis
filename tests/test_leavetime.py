@@ -439,6 +439,19 @@ def test_the_query_answers_or_admits_it_does_not_know(tmp_path):
     assert "Wisenbaker is a 12 minute walk, sir." == res.reply
 
 
+def test_asking_back_arms_the_answer_instead_of_dead_ending(tmp_path):
+    """"How long to Wisenbaker?" on an unlearned building asks back -- and
+    the answer must LAND. An unanswerable question is the dead end this
+    repo has been bitten by before."""
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    c = _commander(w)
+    res = c.handle("how long to wisenbaker", source="voice")
+    assert res.handled and "How long do you need to get to Wisenbaker" in res.reply
+    assert c._pending_leave is not None
+    c.handle("about twelve minutes", source="voice")
+    assert w.table.get("Wisenbaker Engineering Bldg") == 12
+
+
 def test_the_asked_question_is_answered_by_a_plain_duration(tmp_path):
     w = _watch([event(8, LIVE_LOCATIONS[0])], tmp_path)
     c = _commander(w)
