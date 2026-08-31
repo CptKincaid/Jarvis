@@ -16,6 +16,17 @@ client's thread and streams back the turn as JSON lines --
 over, then {"kind": "end", "reason"}. `text == "status"` answers with
 diagnostics_text() and no dispatch.
 
+A request may carry a recorded clip instead of text --
+
+    {"audio_b64": "<wav/ogg/opus/flac>", "speak": false, "timeout": 90}
+
+-- which jarvis/intercom.py decodes to the pipeline's own 16 kHz mono
+float32, transcribes with the resident Whisper and dispatches with
+source="intercom". The transcript comes back first as
+{"kind": "heard", "text"}, so a misheard clip is visible as such at the
+far end, and nothing is spoken in the room unless "speak" is true. That
+is the phone intercom: `ssh spark 'jarvis --send-audio -' < clip.ogg`.
+
 Knowing when a turn is over is the whole difficulty. There is no turn id:
 JarvisReply is {text, speak} and the app's _turn_busy is cleared at once
 for every non-voice source, even when the CommandResult says done=False
@@ -38,6 +49,7 @@ push into a queue.Queue; the client thread drains it to the socket.
 """
 from __future__ import annotations
 
+import base64
 import json
 import os
 import queue
@@ -48,18 +60,25 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
+from jarvis import intercom
 from jarvis.events import (BrainState, BriefingReady, JarvisReply, Status,
                            UserUtterance, bus)
 from jarvis.logs import get_logger
 
 log = get_logger("cmdsock")
 
-MAX_LINE = 65536
+# One request is one line. A text ask is a few hundred bytes; an intercom
+# clip (jarvis/intercom.py) is base64, so 10 MB of audio is ~13.4 MB of JSON
+# -- two hundred times the 64 KB this used to allow, which silently truncated
+# the request into a JSON parse error. The cap is the audio cap plus the
+# base64 expansion plus room for the rest of the object.
+MAX_LINE = intercom.MAX_B64_CHARS + 65536
 DEFAULT_TIMEOUT_S = 90.0
 MAX_TIMEOUT_S = 600.0
 IDLE_GRACE_S = 3.0            # a done=False turn that never woke the model
 SYNC_REPLY_WAIT_S = 1.0       # the Tk pump delivers the sync reply within 30 ms
 NOT_RUNNING_LINE = "Jarvis is not running (no command socket)."
+INTERCOM_OFF_LINE = "The intercom is switched off, sir."
 
 
 class ReplyCollector:
@@ -188,6 +207,13 @@ class CommandSocket:
             try:
                 conn.settimeout(10)
                 line = _read_line(conn)
+            except RequestTooLarge as exc:
+                # An oversized clip used to arrive here as a truncated line
+                # and be reported as "malformed request", which sends the
+                # phone hunting for a JSON bug that is not there.
+                _send(conn, {"kind": "error", "text": str(exc)})
+                _send(conn, {"kind": "end", "reason": "error"})
+                return
             except (OSError, ValueError) as exc:
                 log.warning("command client dropped before sending: %s", exc)
                 return
@@ -210,12 +236,31 @@ class CommandSocket:
                 _send(conn, {"kind": "end", "reason": "error"})
 
     def serve_request(self, conn, msg: dict):
-        text = str(msg.get("text") or "").strip()
+        source, quiet = "cli", bool(msg.get("quiet", False))
+        if msg.get("audio_b64"):
+            # The intercom: a clip from the phone. It is transcribed FIRST
+            # (on this client's thread, so the resident Whisper serialises
+            # with the microphone path on its own model lock) and the
+            # transcript then travels the ordinary turn. Silent unless
+            # asked: nobody sending a clip from bed wants the soundbar
+            # answering the room.
+            source, quiet = intercom.SOURCE, not bool(msg.get("speak", False))
+            try:
+                text = self._intercom_text(msg)
+            except intercom.IntercomError as exc:
+                log.info("intercom: %s (%s)", exc.text, exc.kind)
+                _send(conn, {"kind": "error", "text": exc.text})
+                _send(conn, {"kind": "end", "reason": "error"})
+                return
+            # What he heard, before the answer: a misheard clip is otherwise
+            # indistinguishable from a wrong answer at the far end.
+            _send(conn, {"kind": "heard", "text": text})
+        else:
+            text = str(msg.get("text") or "").strip()
         if not text:
             _send(conn, {"kind": "error", "text": "empty request"})
             _send(conn, {"kind": "end", "reason": "error"})
             return
-        quiet = bool(msg.get("quiet", False))
         try:
             timeout = float(msg.get("timeout") or self.timeout_s)
         except (TypeError, ValueError):
@@ -228,14 +273,37 @@ class CommandSocket:
             _send(conn, {"kind": "reply", "text": line, "speak": False})
             _send(conn, {"kind": "end", "reason": "done"})
             return
-        log.info("cli: %r%s", text, " (quiet)" if quiet else "")
+        log.info("%s: %r%s", source, text, " (quiet)" if quiet else "")
         turn_id = uuid.uuid4().hex[:12]
         with ReplyCollector(turn_id) as col:
-            bus.publish(UserUtterance(text=text, source="cli"))
-            result = self.app.dispatch_text(text, source="cli", quiet=quiet,
+            bus.publish(UserUtterance(text=text, source=source))
+            result = self.app.dispatch_text(text, source=source, quiet=quiet,
                                             turn_id=turn_id)
             reason = self._stream(conn, col, result, timeout)
         _send(conn, {"kind": "end", "reason": reason})
+
+    def _intercom_text(self, msg: dict) -> str:
+        """Decode + transcribe one ``{"audio_b64": ...}`` request.
+
+        Raises IntercomError carrying the line to send back; anything else
+        is left to _client, which answers with the generic error rather
+        than leaking a traceback down the socket."""
+        cfg = getattr(self.app, "assistant", None)
+        verify, max_bytes = False, intercom.MAX_AUDIO_BYTES
+        enabled = True
+        if cfg is not None:
+            try:
+                enabled = bool(cfg.get("intercom.enabled", True))
+                verify = bool(cfg.get("intercom.verify_speaker", False))
+                max_bytes = max(1, int(float(cfg.get("intercom.max_mb", 10))
+                                       * 1048576))
+            except Exception:                 # noqa: BLE001 - config boundary
+                log.debug("intercom config unreadable; using defaults",
+                          exc_info=True)
+        if not enabled:
+            raise intercom.IntercomError(INTERCOM_OFF_LINE, "disabled")
+        audio = intercom.clip_from_b64(msg["audio_b64"], max_bytes=max_bytes)
+        return intercom.transcribe(self.app, audio, verify=verify)
 
     def _stream(self, conn, col: ReplyCollector, result, timeout: float) -> str:
         """Forward queued events until the turn is over; returns why."""
@@ -290,6 +358,13 @@ class CommandSocket:
 
 
 # ------------------------------------------------------------------ wire
+class RequestTooLarge(ValueError):
+    """The request ran past MAX_LINE without a newline."""
+
+    def __init__(self, limit: int):
+        super().__init__("request too large (over %d MB)" % (limit // 1048576))
+
+
 def _read_line(conn: socket.socket, limit: int = MAX_LINE) -> str:
     buf = bytearray()
     while len(buf) < limit:
@@ -299,6 +374,8 @@ def _read_line(conn: socket.socket, limit: int = MAX_LINE) -> str:
         buf.extend(chunk)
         if b"\n" in chunk:
             break
+    if len(buf) >= limit and b"\n" not in buf:
+        raise RequestTooLarge(limit)
     line, _, _ = bytes(buf).partition(b"\n")
     return line.decode("utf-8", "replace").strip()
 
@@ -310,10 +387,17 @@ def _send(conn: socket.socket, obj: dict):
         log.warning("command reply not delivered: %s", exc)
 
 
-def ask(sock_path, text: str, quiet: bool = False, timeout: float = DEFAULT_TIMEOUT_S):
+def ask(sock_path, text: str = "", quiet: bool = False,
+        timeout: float = DEFAULT_TIMEOUT_S, audio: bytes = None,
+        speak: bool = False):
     """Client generator: yields each JSON message from the server, ending
     with the {"kind": "end"} line. Raises ConnectionError when Jarvis is
-    not running (no socket, or nobody listening)."""
+    not running (no socket, or nobody listening).
+
+    `audio` sends a recorded clip instead of text (the intercom): the
+    bytes of a wav / ogg / opus / flac file, base64 on the wire. `speak`
+    asks for the answer aloud on the Spark as well -- off by default,
+    because the point of the intercom is a silent house."""
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         s.settimeout(5.0)
@@ -322,8 +406,13 @@ def ask(sock_path, text: str, quiet: bool = False, timeout: float = DEFAULT_TIME
         except OSError as exc:
             raise ConnectionError(NOT_RUNNING_LINE) from exc
         s.settimeout(float(timeout) + 5.0)
-        s.sendall((json.dumps({"text": text, "quiet": bool(quiet),
-                               "timeout": float(timeout)}) + "\n").encode("utf-8"))
+        req = {"quiet": bool(quiet), "timeout": float(timeout)}
+        if audio:
+            req["audio_b64"] = base64.b64encode(bytes(audio)).decode("ascii")
+            req["speak"] = bool(speak)
+        else:
+            req["text"] = text
+        s.sendall((json.dumps(req) + "\n").encode("utf-8"))
         buf = b""
         while True:
             try:

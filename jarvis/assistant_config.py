@@ -189,6 +189,14 @@ DEFAULTS: dict = {
     # earcon cue after a wake-word turn that produced nothing to answer,
     # at most once per nudge_cooldown_s.
     "listening": {"speculative_stt": True, "nudge": True, "nudge_cooldown_s": 30},
+    # Phone intercom (jarvis/intercom.py): a recorded clip sent over the
+    # command socket instead of a wake word. verify_speaker runs the same
+    # ECAPA gate the microphone path uses -- off by default because the
+    # 0600 socket behind the user's own SSH session is already the
+    # authentication, and a phone codec moves the embedding far enough that
+    # the gate (which fails SHUT) would reject his own voice. max_mb caps
+    # one clip; the socket framing allows a little more than this.
+    "intercom": {"enabled": True, "verify_speaker": False, "max_mb": 10},
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",

@@ -3,6 +3,10 @@
 #   ssh spark jarvis 'timer 5 minutes'
 #   jarvis -q "how did yesterday go"      # text only, soundbar silent
 #   jarvis --status                       # the diagnostics line
+# The phone intercom (jarvis/intercom.py) sends a recorded clip instead:
+#   ssh spark 'jarvis --send-audio -' < clip.ogg    # wav/ogg/opus/flac
+#   jarvis --listen 8                     # record 8 s here, then send it
+#   jarvis --send-audio clip.wav --speak  # ...and answer aloud in the room
 # Talks to the running app over /tmp/vss_voice/command.sock (jarvis/cmdsock.py);
 # exit 2 means Jarvis is not running. Symlink it into ~/.local/bin:
 #   ln -s ~/Jarvis/scripts/jarvis ~/.local/bin/jarvis

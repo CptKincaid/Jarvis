@@ -1258,3 +1258,83 @@ print("missing:", cfg.missing_sections())
 import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •••
 EOF
 ```
+
+## 40. Phone intercom: talk to him from bed (no wake word)
+
+The wake word does not reach the next room, and the soundbar's answer would
+wake the house. The intercom sends a *recording* over the command socket
+instead: Jarvis transcribes it with the same Whisper the microphone uses and
+answers in **text** on the phone, silently, unless you ask for speech.
+
+Nothing new is installed on the Spark. On the phone you need Termux and
+`termux-api` (the app AND `pkg install termux-api`), plus the SSH key you
+already use.
+
+```bash
+# on the phone, in Termux
+termux-microphone-record -q >/dev/null 2>&1     # make sure nothing is recording
+termux-microphone-record -d -l 8 -e opus -f $HOME/j.ogg
+sleep 9
+ssh spark 'jarvis --send-audio -' < $HOME/j.ogg
+```
+
+`-e opus` is **not optional**: `termux-microphone-record` writes AAC by
+default and libsndfile cannot read AAC, so the clip would come back
+"I couldn't decode that clip, sir". wav, ogg, opus and flac all work.
+
+Worth putting in a Termux `~/.bashrc` function:
+
+```bash
+ask() {
+  termux-microphone-record -q >/dev/null 2>&1
+  termux-microphone-record -d -l "${2:-8}" -e opus -f "$HOME/j.ogg" >/dev/null
+  sleep "$(( ${2:-8} + 1 ))"
+  ssh spark 'jarvis --send-audio -' < "$HOME/j.ogg"
+}
+```
+
+From any box that has its own microphone (including Termux) the client can
+do both legs itself:
+
+```bash
+jarvis --listen 8                     # record 8 s here, send it, print the answer
+jarvis --send-audio clip.wav          # a clip you already have ("-" = stdin)
+jarvis --send-audio clip.wav --speak  # ...and answer aloud in the room as well
+```
+
+What comes back:
+
+```
+[heard] what's my first thing tomorrow
+Biosensors at nine, sir.
+```
+
+The `[heard]` line goes to stderr and is what he understood — a misheard
+clip is otherwise indistinguishable from a wrong answer. Exit codes are the
+CLI's: 0 answered, 2 Jarvis is not running, 3 no reply, 4 the clip could not
+be recorded or read.
+
+### Settings (`~/.config/jarvis/assistant.json`)
+
+```json
+"intercom": { "enabled": true, "verify_speaker": false, "max_mb": 10 }
+```
+
+| key | what it does |
+|---|---|
+| `enabled` | `false` refuses every clip ("The intercom is switched off, sir.") |
+| `verify_speaker` | run the ECAPA speaker gate on the clip as the microphone path does |
+| `max_mb` | the size of one clip; 10 MB is about five minutes of 16 kHz wav |
+
+`verify_speaker` is **off** on purpose. The socket is mode 0600 and only
+reachable through your own SSH session, which is already the
+authentication; meanwhile the transcript gate *fails shut* once a voiceprint
+exists, and a phone microphone through a lossy codec moves the ECAPA
+embedding far enough that it would reject your own voice. Turn it on if the
+box is shared — a rejected clip answers "That didn't sound like you, sir."
+
+Anything longer than two minutes is truncated rather than refused, so a
+phone left recording cannot park the resident Whisper. A clip arrives as one
+JSON line: the request framing was 64 KB and is now the base64 of a whole
+clip, and a runaway request answers "request too large" instead of looking
+like a JSON bug.
