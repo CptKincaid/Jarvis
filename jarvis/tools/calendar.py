@@ -460,6 +460,16 @@ class CalendarSource:
         return fetched is None or now - fetched > self.refresh_s
 
     # -- fetching ----------------------------------------------------
+    def window(self, now: datetime = None) -> tuple:
+        """The (start, end) the cached events cover, as a public seam.
+
+        jarvis/calwatch.py diffs two snapshots and MUST know this: the
+        window is anchored at yesterday-midnight and slides every day, so
+        without it everything before yesterday reads as a mass
+        cancellation and every new far edge as a new booking, once per
+        midnight."""
+        return self._window(now)
+
     def _window(self, now: datetime = None) -> tuple:
         now = now or now_local(self.tz)
         start = now.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
