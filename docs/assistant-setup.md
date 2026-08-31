@@ -2155,3 +2155,241 @@ brightness is X's software gamma, not a backlight, so it works over HDMI on a
 desktop monitor. Spotify only does anything when the account is linked
 (section 11) and a device is reachable — otherwise it is a night without
 music and no apology, exactly as in a focus session.
+
+## 40. The Aside: one thing you did not ask for
+
+> "Alarm for 7:00 am, sir. Incidentally, Lab 3 report for BIOSENSORS is due
+> at 11:59 pm that night."
+
+Everything else Jarvis says is an answer to something. This is the one door
+that volunteers, and the budget is the whole product: **two a day, forty-five
+minutes apart**, and one phrase ends it.
+
+It ships **off**. Turn it on in `~/.config/jarvis/assistant.json` — this is
+the configuration to use once you want it:
+
+```json
+"aside": {
+  "enabled": true,
+  "per_day": 2,
+  "gap_min": 45,
+  "horizon_hours": 18
+}
+```
+
+| key | what it does |
+|---|---|
+| `enabled` | the whole feature; `false` (the shipped default) means he never volunteers |
+| `per_day` | how many asides a day. Earn the third; do not start there |
+| `gap_min` | the minimum minutes between two of them |
+| `horizon_hours` | how far past the thing you just set still counts as "that night" |
+
+### When he will and will not say something
+
+He hangs an aside off a moment you have just pointed at — an **alarm** or a
+**reminder**, never a timer. A timer is a kitchen device; a lecture an hour
+after it has nothing to do with it, and saying so is exactly the tic this
+budget exists to prevent.
+
+The anchor has to be *real*. "Set for seven" only becomes an aside if "seven"
+resolved to an actual datetime, so he reads the structured result the handler
+produced — the timekeeper item with its epoch — and never re-reads his own
+sentence looking for a time. No resolved anchor, no aside.
+
+Then he looks for one thing between that moment and `horizon_hours` later:
+
+* a Canvas or syllabus deadline, from the snapshot the deadline thread
+  already had (never a fresh Canvas call — that would put the network in the
+  middle of a spoken turn);
+* an **exam** on the calendar. Only an exam. Your Tuesday lecture is not news,
+  and the meeting heads-up is going to mention it ten minutes beforehand
+  anyway.
+
+And he stays quiet when:
+
+* the budget is spent, or the last aside was less than `gap_min` ago;
+* it is **quiet hours** — the line is *dropped*, not saved. An "incidentally"
+  arriving three hours later with no question in front of it is the opposite
+  of the effect, so it costs no budget either;
+* the deadline heads-up is already going to say that item out loud. The two
+  share a ledger, so the same lab report never earns a reminder at 09:00 and
+  an aside at 09:20;
+* he has already volunteered that exact thing.
+
+### Making him stop
+
+Say **"no more asides"** — or "that's enough of that", "enough asides", "stop
+the asides". Deliberately not "stop that": that already means barge-in and
+read-aloud steering, and a kill phrase the router can confuse with either is
+worse than none. It zeroes the day's bucket only; tomorrow he starts again.
+
+Every silencing is counted, and the nightly self-review reports it as a
+problem: *"you told me to stop volunteering things."* If that line shows up
+most days, the feature is wrong — turn `enabled` back to `false`, and the log
+is the evidence for it.
+
+### Reading the templates before you ship them
+
+The correctness is easy; the taste is not. There is an offline harness that
+replays twenty turns across two days against fake calendar and deadline data
+and prints, for each one, either what he would have said or why he stayed
+quiet:
+
+```bash
+~/vss_env/bin/python scripts/aside_dryrun.py
+```
+
+Read the output as a transcript, not as a test. If more than a couple of the
+lines make you wince, the templates are wrong and no amount of ledger
+correctness will save it.
+
+## 41. Reasoned dissent: "I would advise against that, sir"
+
+> "Wake me at two."
+> "I would advise against a 2:00 am alarm, sir; your BIOSENSORS lecture is at
+> 9:10 am and that leaves you under five hours. Shall I set it anyway?"
+> "Set it anyway."
+> "Setting it anyway, sir. Alarm at 2:00 am."
+
+He is allowed to disagree once, out loud, with a reason — and then he does
+what you told him. It is on by default:
+
+```json
+"confirm": {
+  "read_back": true,
+  "shaky_logprob": -0.7,
+  "dissent": true,
+  "sleep_floor_h": 5
+}
+```
+
+| key | what it does |
+|---|---|
+| `dissent` | the whole feature; `false` sets every alarm without comment |
+| `sleep_floor_h` | hours below which a small-hours alarm is worth a word |
+
+### The four things he will object to
+
+Each one names the actual row it read. An objection that cannot name its row
+is a mood, and he does not make those.
+
+| source | the objection |
+|---|---|
+| duplicate alarm | "you already have an alarm at 7:00 am" — one is already set within fifteen minutes |
+| sleep window | "your BIOSENSORS lecture is at 9:10 am and that leaves you under five hours" — an alarm in the small hours, under `sleep_floor_h` away, with something on the calendar later that day |
+| quiet conflict | "you're in BIOSENSORS then" — the alarm lands inside a window you told him to keep clear |
+| deadline clash | "Lab 3 report for BIOSENSORS is due at 11:59 pm, before that" — the alarm is set for *after* something is due |
+
+Only alarms. Never a timer, a track change or a volume nudge: objecting to
+anything you can undo in under a minute is the failure mode itself.
+
+### Answering him
+
+The default is **yes**. This is the opposite of the read-back for a
+destructive action ("Cancel all three alarms, sir?"), which drops on anything
+that is not a clear yes — because there, doing nothing is the safe end. Here
+you *asked* for the alarm and only the opinion was volunteered, so:
+
+* **"no" / "don't"** — the only way to lose the alarm. *"Very good, sir. I'll
+  leave it."*
+* **"yes" / "set it anyway" / "anyway" / "I know" / "regardless" / "that's
+  fine"** — it is set, and the reply is word-for-word what an unobjected alarm
+  would have said.
+* **anything else, including silence** — it is set, he says *"Setting it
+  anyway, sir."*, and if you had actually said something else ("play some
+  jazz") that sentence keeps its own meaning and gets its own turn.
+
+A man who heard the objection, agreed with it and went to bed still wakes up
+to his alarm.
+
+### Not becoming insufferable
+
+* Never twice for the same row in the same day. A second "wake me at two" is
+  someone who has heard the reason and wants the alarm.
+* Never over another open question — a shaky-transcript read-back, or the
+  evening preview's "shall I wake you at seven?", is never talked over.
+* Everything he reads is cached: the calendar's own cache and the deadline
+  thread's snapshot. Nothing here puts the network inside "wake me at two".
+
+Both halves are counted, and the nightly self-review flags the one number that
+matters: if you overruled **all** of his objections, three or more times in a
+day, the rule is simply wrong. "Why did you argue with me about that alarm?"
+is answerable later too — every objection goes into the journal.
+
+## 42. The debrief: "how did the midterm go, sir?"
+
+The calendar says the BIOSENSORS midterm ended forty minutes ago and you are
+not out. He asks. **Once.**
+
+Whatever you say back is *filed* — into the activity journal and as a
+remembered fact — and never routed to the model as chat. That restraint is the
+feature: "it went badly, I ran out of time on the last question" is a fact
+about your year, not a conversational turn to be met with sympathy and
+forgotten when the window closes. It comes back in the day recap, in the
+journal digest, and months later as an aside before the next one.
+
+On by default:
+
+```json
+"debrief": {
+  "enabled": true,
+  "after_min": 15,
+  "within_min": 180,
+  "hold_hours": 14,
+  "keywords": ["exam", "midterm", "final", "finals", "interview", "viva",
+               "defense", "defence", "quiz", "test", "presentation",
+               "audition"]
+}
+```
+
+| key | what it does |
+|---|---|
+| `enabled` | the whole feature |
+| `after_min` | how long after it ends before he asks — under this you may still be walking out of the room |
+| `within_min` | after this the moment has passed and the question is an interrogation |
+| `hold_hours` | how long a question held by quiet hours stays askable |
+| `keywords` | whole words in the event title that make it worth asking about |
+
+`keywords` is matched on **whole words**, so "contest" is not a test and
+"finalise the slides" is not a final. Widen it if you like — but this is the
+one feature that speaks without being spoken to, and "how did your lunch go"
+is the version of it nobody wants.
+
+### The four restraints
+
+* **Never about something that did not happen.** An event only becomes askable
+  if he saw it on the calendar *while it was still in the future*. A row added
+  retroactively this afternoon — a meeting someone logged after the fact, a
+  cancellation that never reached the cache — is never asked about.
+* **Never twice.** The ledger is written the moment the question is asked, not
+  when it is answered, and it survives a restart.
+* **Never while you are out.** Presence gates it. If `presence.phone_ip` is
+  not configured, presence is idle and you count as home — otherwise the
+  feature would never fire at all.
+* **Never in quiet hours** — but a quiet window *postpones* the question, it
+  does not cancel it. An exam that finished at ten past eleven is asked about
+  in the morning, up to `hold_hours` later.
+
+### Answering
+
+The question opens the mic behind it, so you answer without the wake word. He
+files it and says *"Noted, sir."*
+
+Say **"not now"** or "never mind" and nothing is filed — but he has been asked,
+so he will not ask again. Say something that is plainly a command instead
+("jarvis, set a timer for five minutes", or any Tier-1 phrase) and the debrief
+steps aside and the command runs; the window also expires after two minutes.
+Filing "set a timer for five minutes" as how the midterm went would poison a
+record you are meant to be able to trust months from now.
+
+### What you get back
+
+Two sinks, and one failing does not lose the other:
+
+* the activity journal, as its own `debrief` kind — pinned in the digest, so
+  it is never the line the character budget trims away;
+* long-term memory, under a key that reads as English ("how BIOSENSORS Midterm
+  1 went on 14 September 2026"), so asking months later finds it.
+
+Calendar first: Canvas exam rows carry a due time and no end, so there is
+nothing there that can say *it is over*.
