@@ -30,13 +30,15 @@ def env(tmp_path, monkeypatch):
     vocab.clear_cache()
 
 
-def _write_calendar(tmp_path, titles):
+def _write_calendar(tmp_path, titles, locations=()):
     cache = tmp_path / "cache"
     cache.mkdir(exist_ok=True)
+    locations = list(locations) + [""] * (len(titles) - len(list(locations)))
     payload = {"version": 1, "fetched_at": 1.0,
                "sources": {"google-1": {
                    "fetched_at": 1.0,
-                   "events": [{"title": t} for t in titles]}}}
+                   "events": [{"title": t, "location": loc}
+                              for t, loc in zip(titles, locations)]}}}
     (cache / "calendar_cache.json").write_text(json.dumps(payload))
 
 
@@ -86,6 +88,24 @@ def test_calendar_titles_join(env):
     prompt = vocab.build_prompt()
     assert prompt.count("BIOSENSORS") == 1
     assert "Magnetic Resonance Engr" in prompt
+
+
+def test_the_buildings_he_walks_to_are_in_the_prompt(env):
+    """He says "how long to Wisenbaker" out loud to teach a walk
+    (jarvis/leavetime.py), so the building has to be hearable. The two ETB
+    rooms are ONE name, and neither the Zoom URL nor the blank location is
+    a building."""
+    _write_calendar(
+        env, ["BIOSENSORS", "MEEN 361", "SENIOR DESIGN", "Advising"],
+        ["College Station Wisenbaker Engineering Bldg 049",
+         "College Station Emerging Technologies Building 1003",
+         "College Station Emerging Technologies Building 1020",
+         "https://tamu.zoom.us/j/94324046592?pwd=x"])
+    terms = vocab.build_prompt().split(", ")
+    assert "Wisenbaker" in terms
+    assert terms.count("Emerging Technologies") == 1
+    assert not [t for t in terms if "zoom.us" in t]
+    assert not [t for t in terms if t.endswith(" 049") or t.endswith(" 1003")]
 
 
 def test_corrupt_calendar_cache_is_just_a_miss(env):
