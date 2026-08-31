@@ -131,6 +131,44 @@ def test_the_services_seam_wins_over_everything_else():
     assert cm.resolve_idle_fn(services)() == 12.0
 
 
+def test_the_probe_is_cached_off_the_tk_thread_and_read_as_an_attribute():
+    """The desk-presence probe shells out to gdbus; a subprocess spawn on
+    the frame loop is a dropped avatar frame. DeskWatch is what keeps the
+    mode tick to an attribute read."""
+    calls = []
+
+    def probe():
+        calls.append(1)
+        return 42.0
+    watch = cm.DeskWatch(probe, interval=0.05)
+    assert watch.read() is None            # nothing polled yet
+    assert watch.poll() == 42.0
+    assert watch.read() == 42.0 and calls == [1]   # read does NOT probe
+
+
+def test_a_failing_probe_caches_unknown_and_never_away():
+    def boom():
+        raise RuntimeError("gdbus is gone")
+    watch = cm.DeskWatch(boom)
+    assert watch.poll() is None and watch.read() is None
+    assert cm.next_mode(idle_s=watch.read()) == cm.ACTIVE
+
+
+def test_the_desk_watch_starts_and_joins_cleanly():
+    watch = cm.DeskWatch(lambda: 1.0, interval=0.05)
+    watch.start()
+    assert watch.running
+    watch.stop()
+    assert not watch.running
+    watch.stop()                           # idempotent: quit may arrive twice
+
+
+def test_a_desk_watch_with_no_probe_never_starts_a_thread():
+    watch = cm.DeskWatch(None)
+    watch.start()
+    assert not watch.running and watch.read() is None
+
+
 def test_without_the_seam_a_provider_is_still_resolved():
     """Either jarvis.desk (the desk-presence group's module) or the
     XScreenSaver fallback — the feature must not be dark on the real box

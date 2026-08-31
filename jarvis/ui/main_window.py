@@ -75,7 +75,8 @@ from jarvis.logs import get_logger
 from jarvis.ui import theme
 from jarvis.ui.ambient import RoomSlab
 from jarvis.ui.board import BoardWindow, board_enabled
-from jarvis.ui.console_mode import STANDBY, ConsoleModes, resolve_idle_fn
+from jarvis.ui.console_mode import (STANDBY, ConsoleModes, DeskWatch,
+                                    resolve_idle_fn)
 from jarvis.ui.reactor import Reactor
 from jarvis.ui.views import CommandBar, SettingsDrawer, StatusStrip, \
     TranscriptView
@@ -551,6 +552,7 @@ class MainWindow:
         # an AttributeError inside a bus handler.
         self.board: Optional[BoardWindow] = None
         self.modes: Optional[ConsoleModes] = None
+        self.desk: Optional[DeskWatch] = None
         self._room_data: dict = {}
         self._standby_origin = None      # window position before it drifts
         self._footer_hidden = False
@@ -639,9 +641,14 @@ class MainWindow:
         # Console modes: standby / ambient / power-up as ONE machine (see
         # jarvis/ui/console_mode.py). Started last so every widget it can
         # touch already exists.
+        # The probe runs on its own thread and the mode tick reads the cache:
+        # the desk-presence seam may shell out to gdbus, and a subprocess on
+        # the frame loop costs an avatar frame every time it fires.
+        self.desk = DeskWatch(resolve_idle_fn(self.services))
+        self.desk.start()
         self.modes = ConsoleModes(
             after=self._after,
-            idle_fn=resolve_idle_fn(self.services),
+            idle_fn=self.desk.read,
             on_mode=self._on_console_mode,
             on_dim=self._on_console_dim,
             on_drift=self._on_console_drift,
@@ -1016,6 +1023,11 @@ class MainWindow:
                 self.modes.stop()
         except Exception:
             log.exception("console modes stop failed")
+        try:
+            if self.desk is not None:
+                self.desk.stop()
+        except Exception:
+            log.exception("desk watch stop failed")
         if self.board is not None:
             try:
                 self.board.destroy()

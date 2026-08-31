@@ -16,11 +16,17 @@ replays the panels in sequence before dropping into `active`.
 
 Every rule here is a pure function of its inputs (`next_mode`, `dim_factor`,
 `drift_offset`, `powerup_due`, `reveal_schedule`, `dim`); `ConsoleModes` is
-the thin Tk driver that calls them on a 4 s tick. That split is the same one
+the thin Tk driver that calls them once a second. That split is the same one
 jarvis/ui/views.py makes, and it is what lets the whole machine be tested
 with a frozen clock and no display.
 
-Three decisions worth knowing about, all made against the corrections:
+Four decisions worth knowing about, all made against the corrections:
+
+* **The desk-idle probe never runs on the Tk thread.** `DeskWatch` caches
+  it on a thread of its own, so the mode tick is an attribute read. The
+  XScreenSaver fallback would have been cheap enough, but the desk-presence
+  module's probe shells out to `gdbus`, and a subprocess spawn on the frame
+  loop is a dropped avatar frame every time it fires.
 
 * **Dimming is CANVAS COLOUR, never xrandr.** A gamma-crushed desktop left
   behind by a crash is a far worse failure than never dimming, and the
@@ -43,6 +49,7 @@ Three decisions worth knowing about, all made against the corrections:
 from __future__ import annotations
 
 import math
+import threading
 import time
 import tkinter as tk
 from datetime import datetime
@@ -56,7 +63,8 @@ log = get_logger("ui.console_mode")
 ACTIVE, AMBIENT, STANDBY = "active", "ambient", "standby"
 MODES = (ACTIVE, AMBIENT, STANDBY)
 
-TICK_MS = 4000              # idle probe cadence; the desk seam may shell out
+TICK_MS = 1000              # mode tick: an attribute read and some arithmetic
+                            # (the probe itself runs on DeskWatch's thread)
 AMBIENT_AFTER_S = 45.0      # quiet between conversations
 STANDBY_AFTER_S = 720.0     # 12 minutes away from the keyboard
 DIM_FLOOR = 0.35            # never darker than this, at any hour
@@ -240,6 +248,67 @@ def xss_idle_s() -> Optional[float]:
         _XSS_DEAD = True
         _XSS_DISPLAY = None
         return None
+
+
+class DeskWatch:
+    """Poll the desk-idle probe on a thread of its own and cache the answer.
+
+    The probe must NOT run on the Tk thread. The XScreenSaver fallback is a
+    microsecond-scale X round trip, but the desk-presence module's version
+    shells out to `gdbus`, and a ~30 ms subprocess spawn on the frame loop
+    is a dropped avatar frame every time it runs. Caching it here keeps the
+    mode tick to an attribute read while still noticing a keystroke within
+    `interval` — which is what "touch anything and it comes back" needs.
+
+    Joinable, start/stop the same shape as jarvis/deadlines.py."""
+
+    def __init__(self, probe: Optional[Callable] = None,
+                 interval: float = 1.0):
+        self._probe = probe
+        self.interval = max(0.2, float(interval))
+        self.idle: Optional[float] = None
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def read(self) -> Optional[float]:
+        """What the mode tick calls: the last cached reading, or None."""
+        return self.idle
+
+    def poll(self) -> Optional[float]:
+        """One probe. A failure caches None — unknown, never "away"."""
+        if not callable(self._probe):
+            self.idle = None
+            return None
+        try:
+            value = self._probe()
+            self.idle = None if value is None else float(value)
+        except Exception:                   # noqa: BLE001 - probe boundary
+            log.debug("desk idle probe failed", exc_info=True)
+            self.idle = None
+        return self.idle
+
+    def start(self) -> None:
+        if self.running or not callable(self._probe):
+            return
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._run, name="desk-watch",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        t, self._thread = self._thread, None
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=2)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            self.poll()
+            self._stop.wait(self.interval)
 
 
 def resolve_idle_fn(services=None) -> Optional[Callable]:
@@ -495,7 +564,7 @@ class ConsoleModes:
                 log.exception("power-up stage callback failed")
 
 
-__all__ = ["ACTIVE", "AMBIENT", "STANDBY", "MODES", "ConsoleModes",
+__all__ = ["ACTIVE", "AMBIENT", "STANDBY", "MODES", "ConsoleModes", "DeskWatch",
            "dim", "dim_factor", "drift_offset", "next_mode", "night_curve",
            "powerup_due", "resolve_idle_fn", "reveal_schedule", "today_iso",
            "xss_idle_s"]
