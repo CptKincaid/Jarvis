@@ -33,7 +33,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Callable, Iterator, Optional
 
-from jarvis.events import Status, bus
+from jarvis.events import FaultRaised, RunProgress, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.registry import ToolResult, ToolSpec
 
@@ -51,6 +51,11 @@ DEFAULT_WARN_GB = 16.0
 DEFAULT_CRITICAL_GB = 8.0
 DEFAULT_HOG_GB = 20.0
 HOG_COUNT = 2                      # "two trainers": this many hogs at once
+# The actual 2026-08-28 incident: TWO trainers on the unified pool at once.
+# hogs() is any two processes over hog_gb -- ollama plus a browser trips it
+# and is not the incident. snap.trainers already knows which processes are
+# training runs, so this rule can name the thing that wedged the box.
+TRAINER_COUNT = 2
 REARM_MARGIN_GB = 4.0              # hysteresis above warn_gb before re-arming
 DEFAULT_INTERVAL_S = 30.0
 # Interpreter names that say nothing about the job; the first script /
@@ -73,9 +78,20 @@ CRITICAL_LINE = ("Memory is critical, sir: {free} gigabytes free{hogs}. "
                  "I'd stop something before the box does.")
 HOGS_LINE = ("Two processes each hold more than {hog} gigabytes, sir: {hogs}. "
              "Last time that ended in a hard power-off.")
+TRAINERS_LINE = ("{n} trainers are on the pool at once, sir: {names}. "
+                 "The last time that happened the box needed a hard power-off.")
+# The rules whose alerts are FAULTS (jarvis/faults.py): they light the
+# board's FAULT lane and are de-duplicated across restarts. "trainer" (the
+# GPU-yield lend/reclaim) is deliberately absent -- lending the GPU is
+# routine, not a fault.
+FAULT_RULES = ("memory", "hogs", "trainers")
 LENT_LINE = ("I have lent the GPU to your trainer, sir; quick answers only "
              "until it is done.")
 RECLAIMED_LINE = "Your trainer has finished, sir; I'm loading my model again."
+# The run ledger's duration, folded ONTO the reclaim line rather than
+# spoken beside it: the count of spoken lines per run must not go up.
+RECLAIMED_ELAPSED_LINE = ("Your trainer has finished, sir; that took {elapsed}. "
+                          "I'm loading my model again.")
 
 
 # ------------------------------------------------------------- config
@@ -458,13 +474,39 @@ def hogs_line(procs: list[Proc], hog_gb: float) -> str:
     return HOGS_LINE.format(hog=f"{hog_gb:.0f}", hogs=_spoken_hogs(procs))
 
 
+def distinct_runs(procs: list[Proc]) -> list[Proc]:
+    """One Proc per training RUN, largest first. torchrun / accelerate /
+    DDP fan a single run out into one interpreter process per GPU worker,
+    and every one of them matches is_trainer -- counting processes would
+    report "4 trainers on the pool" for one job and the warning would be
+    a lie the first time he saw it. Runs are keyed by the script the
+    interpreter is running, which is what distinguishes the 2026-08-28
+    incident (train.py AND finetune_piper.py) from a fanned-out job."""
+    seen: dict = {}
+    for proc in sorted(procs, key=lambda p: -p.rss_gb):
+        seen.setdefault(proc.hint or proc.name, proc)
+    return list(seen.values())
+
+
+def trainers_line(procs: list[Proc]) -> str:
+    """"2 trainers are on the pool at once, sir: train.py and finetune.py."
+    Named by their hint (the script), which is what he recognises -- both
+    are "python" by process name."""
+    names = [p.hint or p.name for p in procs[:3]]
+    if len(names) > 1:
+        joined = ", ".join(names[:-1]) + f" and {names[-1]}"
+    else:
+        joined = names[0] if names else "unknown"
+    return TRAINERS_LINE.format(n=len(procs), names=joined)
+
+
 # ------------------------------------------------------------ watchdog
 @dataclass
 class Alert:
     kind: str                          # warn | error
     line: str                          # what he says
     status: str                        # the status-bar chip
-    rule: str = "memory"               # memory | hogs
+    rule: str = "memory"               # memory | hogs | trainers | trainer
 
 
 class Watchdog:
@@ -477,7 +519,8 @@ class Watchdog:
 
     def __init__(self, cfg=None, speak: Optional[Callable[[str], None]] = None,
                  services=None, publish: Optional[Callable] = None,
-                 interval: Optional[float] = None, brain=None):
+                 interval: Optional[float] = None, brain=None, faults=None,
+                 runs=None):
         # GPU yield (health.yield_to_trainer): ``brain`` is anything with
         # release() / reclaim() / is_lent(); None means jarvis.brain itself,
         # imported at fire time (tests pass a fake).
@@ -503,6 +546,21 @@ class Watchdog:
         self._publish = publish or bus.publish
         self._level = 0                # 0 ok | 1 warned | 2 critical
         self._hogs_alerted = False
+        self._trainers_alerted = False
+        # jarvis.faults.FaultLog when the integrator wires one: the spoken
+        # -once state file, so a restart INTO a still-tight pool does not
+        # announce the same episode a second time. None keeps the old
+        # behaviour (speak every time a rule newly trips).
+        self._faults = faults
+        # rule -> the fault tokens spoken for it, so a recovery can clear
+        # exactly those entries from the state file (and no others).
+        self._fault_tokens: dict = {}
+        # jarvis.runwatch.RunLedger when the integrator wires one: the
+        # start/finish beats and the opt-in epoch progress, driven off THIS
+        # tick (no second thread, and no nvidia-smi -- the wedge the run
+        # ledger narrates around is exactly when nvidia-smi blocks).
+        self.runs = runs
+        self._run_finished = None      # the ledger's finish, for RECLAIMED_LINE
         self._unreadable_logged = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -535,6 +593,7 @@ class Watchdog:
                 # once, not every 30 s.
                 self._level = 0
                 log.info("health watchdog: memory recovered (%.1f GB free)", avail)
+                self._clear_fault("memory")
                 self._safe_publish(Status(text=f"Memory recovered: {_gb(avail)} GB free",
                                           kind="ok"))
         heavy = hogs(snap, self.hog_gb)
@@ -550,11 +609,69 @@ class Watchdog:
             # not re-speak "last time that ended in a hard power-off" every
             # other tick.
             self._hogs_alerted = False
+            self._clear_fault("hogs")
+        # Two trainers on the pool: the 2026-08-28 incident by name. Latched
+        # like the others, and cleared the moment one of them exits -- the
+        # clear is what re-arms the warning for the next run.
+        runners = distinct_runs(snap.trainers or [])
+        if len(runners) >= TRAINER_COUNT:
+            if not self._trainers_alerted:
+                fired.append(Alert(kind="error", line=trainers_line(runners),
+                                   status=f"{len(runners)} trainers on the pool",
+                                   rule="trainers"))
+                self._trainers_alerted = True
+        elif self._trainers_alerted:
+            self._trainers_alerted = False
+            log.info("health watchdog: back to %d trainer run(s) on the pool",
+                     len(runners))
+            self._clear_fault("trainers")
+            self._safe_publish(Status(text="One trainer on the pool", kind="ok"))
+        self._run_ledger(snap, fired)
         if self.yield_to_trainer:
             self._trainer_rule(snap, fired)
         for alert in fired:
             self._fire(alert)
         return fired
+
+    # ------------------------------------------------------ run ledger
+    def _run_ledger(self, snap: Snapshot, fired: list) -> None:
+        """Drive the run ledger off this tick and turn its beats into
+        spoken lines and RunProgress events.
+
+        When the GPU-yield rule is on it owns the two lifecycle beats
+        already (LENT_LINE on appear, RECLAIMED_LINE on vanish, which
+        picks up the duration below), so the ledger stays silent and only
+        publishes -- the spoken line count per run must not go up. With
+        yield off, the ledger's own two beats are the whole feature.
+        """
+        self._run_finished = None
+        ledger = self.runs
+        if ledger is None:
+            return
+        try:
+            events = ledger.apply(list(snap.trainers or []))
+        except Exception:  # noqa: BLE001 - the tick must survive anything
+            log.exception("run ledger failed")
+            return
+        for ev in events:
+            if ev.kind == "finished":
+                self._run_finished = ev
+            quiet = getattr(ledger, "muted", False) or \
+                not getattr(ledger, "narrate", True)
+            line = "" if quiet else ev.line()
+            # The lend/reclaim lines already cover appear and vanish.
+            if self.yield_to_trainer and ev.kind in ("started", "finished"):
+                line = ""
+            self._safe_publish(RunProgress(
+                kind=ev.kind, pid=ev.pid, label=ev.label,
+                elapsed_s=ev.elapsed_s, epoch=ev.epoch,
+                loss=float(ev.loss or 0.0), line=line))
+            # Spoken directly, NOT through _fire: an alert would publish a
+            # Status, and an ok/info Status clears main_window's held ERROR
+            # pill -- a routine "epoch four, sir" must never wipe a fault
+            # off the board.
+            if line:
+                self._speak_line(line)
 
     # ---------------------------------------------------- trainer yield
     def _brain(self):
@@ -609,7 +726,15 @@ class Watchdog:
             ok = False
         self._lent_to = None
         self._absent_ticks = 0
-        fired.append(Alert(kind="ok" if ok else "warn", line=RECLAIMED_LINE,
+        # The run ledger's finish for this tick, folded in: "that took 22
+        # minutes" belongs ON this line, not spoken after it.
+        done = self._run_finished
+        line = RECLAIMED_LINE
+        if done is not None and not done.brief:
+            from jarvis.runwatch import elapsed_words
+            line = RECLAIMED_ELAPSED_LINE.format(
+                elapsed=elapsed_words(done.elapsed_s))
+        fired.append(Alert(kind="ok" if ok else "warn", line=line,
                            status="GPU reclaimed" if ok else "GPU reclaimed; model failed to load",
                            rule="trainer"))
 
@@ -626,15 +751,51 @@ class Watchdog:
             log.exception("health watchdog: manual reclaim failed")
             return False
 
+    def _clear_fault(self, rule: str) -> None:
+        """The episode ended: lift the board's FAULT lane and make the next
+        occurrence news again. The board takes its clear from HERE -- a
+        second latch in the UI drifts out of sync on recovery."""
+        self._safe_publish(FaultRaised(rule=rule, cleared=True))
+        tokens = self._fault_tokens.pop(rule, ())
+        if self._faults is None:
+            return
+        for token in tokens:
+            try:
+                self._faults.clear(f"{rule}:{token}")
+            except Exception:  # noqa: BLE001
+                log.exception("fault log clear failed")
+
     def _fire(self, alert: Alert) -> None:
         log.warning("health watchdog [%s/%s]: %s", alert.rule, alert.kind, alert.status)
         self._safe_publish(Status(text=alert.status, kind=alert.kind))
+        speak_it = True
+        if alert.rule in FAULT_RULES:
+            from jarvis.faults import token_for      # late: faults reads config
+            token = token_for(alert.rule, alert.status)
+            if self._faults is not None:
+                try:
+                    speak_it = bool(self._faults.should_speak(f"{alert.rule}:{token}"))
+                except Exception:  # noqa: BLE001 - dedupe must not cost the alarm
+                    log.exception("fault log read failed; speaking anyway")
+            self._fault_tokens.setdefault(alert.rule, set()).add(token)
+            self._safe_publish(FaultRaised(rule=alert.rule, kind=alert.kind,
+                                           token=token, text=alert.status,
+                                           line=alert.line))
+        if not speak_it:
+            return                    # already said once; the board still shows it
+        self._speak_line(alert.line)
+
+    def _speak_line(self, line: str) -> None:
+        """Say one line through whatever speak callback exists. Resolved at
+        fire time from services.speak so boot order does not matter, and
+        that door is proactive=True -- quiet hours hold it for the digest
+        rather than narrating a 3 am run."""
         speak = self._speak or (getattr(self._services, "speak", None)
                                 if self._services is not None else None)
-        if not callable(speak):
+        if not callable(speak) or not line:
             return
         try:
-            speak(alert.line)
+            speak(line)
         except Exception:  # noqa: BLE001 - a TTS failure must not kill the loop
             log.exception("health watchdog: speak failed")
 
@@ -676,6 +837,24 @@ class Watchdog:
         return self._thread is not None and self._thread.is_alive()
 
 
+def make_run_ledger(cfg):
+    """The run ledger from config, or None when it cannot be built. Reads
+    nothing here: log_dir is only opened once runwatch.progress is on AND
+    a run is going, so the default costs a dict lookup per tick."""
+    try:
+        from jarvis.runwatch import RunLedger
+        log_dir = _cfg_get(cfg, "runwatch.log_dir", "") \
+            if _cfg_get(cfg, "runwatch.progress", False) else ""
+        return RunLedger(log_dir=log_dir or None,
+                         narrate=bool(_cfg_get(cfg, "runwatch.narrate", True)),
+                         min_run_s=_cfg_float(cfg, "runwatch.min_run_s", 60.0),
+                         progress_gap_s=_cfg_float(cfg, "runwatch.progress_gap_s",
+                                                   300.0))
+    except Exception:  # noqa: BLE001 - no ledger is better than no watchdog
+        log.exception("run ledger unavailable")
+        return None
+
+
 # --------------------------------------------------------------- tool
 def make_tools(cfg, services) -> list[ToolSpec]:
     warn_gb = _cfg_float(cfg, "health.warn_gb", DEFAULT_WARN_GB)
@@ -685,7 +864,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     # once services.speak exists (the same idiom as calendar.make_tools).
     if services is not None and getattr(services, "health_watchdog", None) is None:
         try:
-            services.health_watchdog = Watchdog(cfg, services=services)
+            services.health_watchdog = Watchdog(cfg, services=services,
+                                                runs=make_run_ledger(cfg))
         except (AttributeError, TypeError):
             log.debug("services does not accept health_watchdog")
 

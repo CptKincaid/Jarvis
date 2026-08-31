@@ -74,6 +74,8 @@ from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
 from jarvis import garden as garden_mod
+from jarvis.dialogue import SESSION_WINDOW_S
+from jarvis.faults import FaultBoard, FaultLog
 from jarvis.brain import JarvisBrain
 from jarvis.commander import (COURTESY_BY_REGISTER, COURTESY_REPLIES,
                               DESTRUCTIVE_TTL_S, REGISTER_LINES,
@@ -325,6 +327,10 @@ class JarvisApp:
         self.room_light = self._construct("room light", self._make_room_light)
         self.scenes = self._construct("scenes", self._make_scenes)
         self.mixer = self._construct("mixer", self._make_mixer)
+        # The fault lane (jarvis/faults.py): the live fault, held past the
+        # 4-6 s Status chip so "what's wrong" can still answer and the
+        # board's FAULT row stays lit. Subscribes to FaultRaised itself.
+        self.faults = FaultBoard(subscribe=True)
 
         # ---- speech -------------------------------------------------------
         # The arbiter is built here, ahead of the mic consumers below, because
@@ -991,6 +997,8 @@ class JarvisApp:
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
             quiet=self.quiet, presence=self.presence, desk=self.desk,
+            # "what's wrong": the live fault, else the log triage below
+            faults=self.faults,
             # Seconds since the last keyboard / mouse event, or None when
             # this session has no idle signal. A callable, not a number.
             desk_idle_s=(self.desk.idle_s if self.desk is not None
@@ -2132,12 +2140,20 @@ class JarvisApp:
 
     def _capture_window(self):
         """A longer wait for the first word when the last reply left
-        something open: lecture notes (`lecture.window_s`, 20 s), or a
-        question Jarvis just asked -- a quiz card or a yes/no read-back
-        (`quiz.window_s`, 15 s). Else None for the recorder's own
+        something open: a working session (jarvis/dialogue.py,
+        ``session.window_s`` ~18 s), lecture notes (`lecture.window_s`,
+        20 s), or a question Jarvis just asked -- a flashcard or a yes/no
+        read-back (`quiz.window_s`, 15 s). Else None for the recorder's own
         CONFIG.followup_window. The recorder caps it at half its hard cap.
         This is still one capture per answer, not a hands-free mic."""
         commander = getattr(self, "commander", None)
+        session = getattr(commander, "_pending_session", None)
+        if session is not None and not getattr(session, "finished", False):
+            try:
+                window = float(getattr(session, "window_s", SESSION_WINDOW_S))
+            except (TypeError, ValueError):
+                window = SESSION_WINDOW_S
+            return max(window, float(CONFIG.followup_window))
         if getattr(commander, "lecture_course", None):
             return self._window_setting("lecture.window_s", 20.0)
         if self._question_open(commander):
@@ -3438,6 +3454,16 @@ class JarvisApp:
                 log.exception("calendar refresh start failed")
         wd = getattr(self.services, "health_watchdog", None)
         if wd is not None:
+            try:
+                # The fault lane's spoken-once state file (jarvis/faults.py):
+                # the watchdog's own latches die with the process, so a
+                # restart into a still-tight pool would announce the same
+                # episode a second time. Wired HERE rather than in
+                # make_tools so a test that builds the tools does not start
+                # writing state.
+                wd._faults = FaultLog()
+            except Exception:
+                log.exception("fault state unavailable; alerts will repeat")
             try:
                 wd.start()
             except Exception:

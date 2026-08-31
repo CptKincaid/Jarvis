@@ -69,7 +69,7 @@ import json
 import os
 import random
 import re
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 import subprocess
 import sys
 import threading
@@ -80,6 +80,8 @@ from typing import Any, Callable, Optional
 
 from jarvis import aside as aside_mod
 from jarvis import board as board_mod
+from jarvis import dialogue as dialogue_mod
+from jarvis import faults as faults_mod
 from jarvis import lecture as lecture_mod
 from jarvis import mathspeak
 from jarvis import objections as objections_mod
@@ -241,6 +243,19 @@ class IntentClassifier:
         # same silent drop as the media and study words before them.
         "formal", "banter", "less formal", "more formal", "normal mode",
         "loosen up", "how do you feel", "how are you",
+        # --- dialogue board (2026-08-30): working sessions, faults, runs ---
+        # The Tier-1 probe above bypasses the gate for an EXACT match, but
+        # these reach the classifier the moment they are said loosely
+        # ("sort out my week for me"), and a dropped session opener is
+        # worse than most: it is the first turn of a conversation, so the
+        # silence reads as him ignoring you rather than mishearing.
+        # "plan the week" is spelt out per verb rather than as a bare
+        # "plan", which would call "we should plan a trip" a command.
+        "plan the week", "plan my week", "sort out my week", "my week",
+        "map out the week", "block out the week", "the week ahead",
+        "anything wrong", "what went wrong", "the matter", "the fault",
+        "quietly", "narrat", "keep it down", "fewer updates",
+        "less updates", "how's the run", "the training", "the trainer",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -259,6 +274,12 @@ class IntentClassifier:
         # room control 2026-08-30: "dim it", "lights up", "warmer"
         "dim", "brighten", "warm", "cool", "lights", "brighter", "darker",
         "warmer", "cooler",
+        # dialogue board 2026-08-30: the OPENERS "plan my week" and
+        # "quietly please". A session's own answers ("Thursday", "skip
+        # it") never reach the classifier -- _try_session is rung 3a at
+        # _handle_inner:4025, well above the gate at :4126 -- so the bare
+        # weekdays deliberately stay out of this tuple.
+        "plan", "quietly", "narrate",
     )
 
     _NEGATIVE_PATTERNS = [
@@ -3217,6 +3238,66 @@ def _h_log_triage(c, t, m):
     return CommandResult(handled=True, reply=spoken, speak=True, status="Log triage")
 
 
+# "What's wrong?" -- the fault lane's drill-down. The live fault first
+# (jarvis/faults.py holds it long after the 4-6 s Status chip is gone),
+# and when the board is clear it falls straight through to the existing
+# log triage rather than answering "nothing" without looking.
+_WHATS_WRONG_RX = re.compile(
+    r"^(?:so )?(?:what(?:'s| is| has)? (?:wrong|the matter|the problem|broken)|"
+    r"is (?:anything|something) (?:wrong|the matter|up)|"
+    r"anything wrong|what went wrong|"
+    r"(?:what|how)(?:'s| is) (?:the )?(?:fault|trouble))"
+    r"(?: with (?:you|the box|the spark|the machine|it))?"
+    r"(?:[,]?\s*(?:sir|jarvis))?[?.!\s]*$", re.I)
+
+
+def _h_whats_wrong(c, t, m):
+    """The live fault in his own words; when nothing is latched, the log
+    triage answers instead (the drill-down the fault lane promises)."""
+    board = c._svc("faults")
+    line = ""
+    if board is not None:
+        try:
+            line = board.describe()
+        except Exception:
+            log.exception("fault board read failed")
+    if line:
+        return CommandResult(handled=True, reply=line, speak=True, status="Fault")
+    res = _h_log_triage(c, t, m)
+    if res is not None:
+        return res
+    return CommandResult(handled=True, reply=faults_mod.NOTHING_WRONG_LINE,
+                         speak=True, status="No faults")
+
+
+# "Quietly, please" -- the run ledger's narration toggle (jarvis/runwatch.py).
+# Deliberately NOT part of quiet_kind: "quiet" is barge-in (cut the speech
+# now), this holds the epoch beats for the run that is going and lifts by
+# itself when that run ends, so there is nothing left switched off.
+_QUIETLY_RX = re.compile(
+    r"^(?:narrate quietly|quietly(?:,)? please|quietly|keep it down|"
+    r"(?:stop|no more) narrating|don'?t narrate(?: the run| that)?|"
+    r"(?:less|fewer) updates)"
+    r"(?:[,]?\s*(?:please|sir|jarvis))*[.!\s]*$", re.I)
+QUIETLY_LINE = "Quietly it is, sir; I'll tell you when it's done."
+QUIETLY_IDLE_LINE = "Nothing is running to narrate, sir."
+
+
+def _h_quietly(c, t, m):
+    """Hold the run narration for the run in progress."""
+    wd = c._svc("health_watchdog")
+    ledger = getattr(wd, "runs", None)
+    if ledger is None:
+        return None                      # no ledger: "quietly" is the model's
+    if not getattr(ledger, "active", None):
+        return CommandResult(handled=True, reply=QUIETLY_IDLE_LINE, speak=True,
+                             status="Nothing running")
+    ledger.muted = True
+    log.info("run narration muted for the current run")
+    return CommandResult(handled=True, reply=QUIETLY_LINE, speak=True,
+                         status="Narration quiet")
+
+
 def _h_slow_turn(c, t, m):
     """"Why was that slow?": the last real turn on the ledger, by stage."""
     fn = c._svc("slow_turn")
@@ -4486,6 +4567,101 @@ def _h_quiz_stop(c, t, m):
                          status="Quiz stopped")
 
 
+# ------------------------------------------------------------------
+# Working sessions (jarvis/dialogue.py). The first tenant: "let us plan
+# the week" walks this week's Canvas deadlines and to-dos, proposes one
+# slot each, and takes yes / move that to Thursday / skip it / that's
+# enough. Writes go to timekeeper.add_reminder ONLY -- calendar.add_event
+# exists, but a plan built in ninety seconds should stay cheap to undo.
+# ------------------------------------------------------------------
+_PLAN_WEEK_RX = re.compile(
+    r"^(?:let(?:'s| us)|lets|shall we|can we|help me|i want to|"
+    r"time to|we should)?\s*"
+    r"(?:plan|sort out|map out|lay out|block out|work out|plan out)\s+"
+    r"(?:my |the |this |our )?week(?: ahead| out| together)?"
+    r"(?:[,]?\s*(?:please|sir|jarvis))?[?.!\s]*$", re.I)
+PLAN_PREPARING_LINE = "Let me see what the week is carrying, sir."
+PLAN_BUSY_LINE = "I can't plan while I'm taking notes, sir."
+SESSION_LOST_LINE = "I've lost the thread of that, sir."
+PLAN_DUE_DAYS = 7
+PLAN_TODO_LIMIT = 6
+# Reminders are filed a little before the slot so the nudge lands while
+# there is still time to start; the slot itself is the working hour.
+PLAN_REMINDER_LEAD_MIN = 5
+
+
+def _plan_items(c) -> list:
+    """This week's Canvas deadlines and open to-dos, as PlanItems. Each
+    source fails on its own -- no token, no Canvas, still a plan from the
+    to-do list."""
+    deadlines: list = []
+    try:
+        from jarvis.tools.canvas import canvas_settings, fetch_due
+        settings = canvas_settings(c._svc("assistant"))
+        if settings:
+            deadlines = list(fetch_due(settings, PLAN_DUE_DAYS))
+    except Exception:                       # noqa: BLE001 - outage, bad token
+        log.info("plan the week: Canvas unavailable", exc_info=True)
+    todos: list = []
+    notes = c._svc("notes")
+    if notes is not None:
+        try:
+            todos = list(notes.list("todo", limit=PLAN_TODO_LIMIT))
+        except Exception:                   # noqa: BLE001
+            log.exception("plan the week: to-do read failed")
+    return dialogue_mod.collect_items(deadlines, todos)
+
+
+def _file_plan(c, slots: list) -> bool:
+    """Write the agreed slots as timekeeper reminders. Returns False when
+    nothing could be filed, which changes the read-back line rather than
+    pretending the week is booked."""
+    tk = c._svc("timekeeper")
+    if tk is None or not hasattr(tk, "add_reminder"):
+        return False
+    filed = 0
+    for slot in slots:
+        try:
+            due = slot.when_epoch() - PLAN_REMINDER_LEAD_MIN * 60
+            tk.add_reminder(due, slot.item.title)
+            filed += 1
+        except Exception:                   # noqa: BLE001 - one bad slot only
+            log.exception("plan the week: could not file %r", slot.item.title)
+    log.info("plan the week: filed %d of %d slots", filed, len(slots))
+    return filed > 0
+
+
+def _h_plan_week(c, t, m):
+    """Open the planning session. The gather is a Canvas round trip, so it
+    runs on a worker and the first question arrives through services.reply
+    (_deliver), which closes the turn and arms the follow-up mic -- the
+    same door the first quiz question uses."""
+    if c.dictation or getattr(c, "lecture_course", None):
+        return CommandResult(handled=True, reply=PLAN_BUSY_LINE, speak=True,
+                             status="Plan refused")
+
+    def _work():
+        try:
+            items = _plan_items(c)
+        except Exception:                   # noqa: BLE001
+            log.exception("plan the week: gather failed")
+            items = []
+        if not items:
+            _deliver(c, dialogue_mod.PLAN_NOTHING_LINE)
+            return
+        session = dialogue_mod.WeekPlanner(
+            items=items, today=date.today(),
+            filer=lambda slots: _file_plan(c, slots))
+        if not c.open_session(session):
+            _deliver(c, PLAN_BUSY_LINE)
+            return
+        _deliver(c, f"{dialogue_mod.open_line(len(items))} {session.ask()}")
+
+    c._bg(_work)
+    return CommandResult(handled=True, reply=PLAN_PREPARING_LINE, speak=True,
+                         ack=True, done=False, status="Planning the week")
+
+
 def _int_setting(c, key: str, default: int) -> int:
     try:
         return max(1, int(_assistant_get(c, key, default) or default))
@@ -4680,6 +4856,7 @@ REGISTRY: list[Command] = [
     Command("stop quiz", quiz_stop_kind, _h_quiz_stop),
     # after "quiz": "quiz me on X" is its own verb, not a lesson
     Command("teach me", teach_kind, _h_teach),
+    Command("plan week", _PLAN_WEEK_RX.match, _h_plan_week),
     # Reached only when the reader is idle (handle() gives an active reading
     # first claim on these words before the desktop chains and "go back");
     # the handler then falls through, so the entry documents Tier 1
@@ -4778,6 +4955,8 @@ REGISTRY: list[Command] = [
     Command("garden undo", _GARDEN_UNDO_RX.match, _h_garden_undo),
     Command("garden report", _GARDEN_REPORT_RX.match, _h_garden_report),
 
+    Command("quietly", _QUIETLY_RX.match, _h_quietly, needs=("health_watchdog",)),
+    Command("whats wrong", _WHATS_WRONG_RX.match, _h_whats_wrong),
     Command("log triage", _LOGTRIAGE_RX.match, _h_log_triage),
     Command("slow turn", _SLOW_RX.match, _h_slow_turn),
     # After the briefing: "good morning" is a briefing trigger first.
@@ -4885,6 +5064,8 @@ ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
     if cmd.name in ("explain document", "quiz", "scan syllabus", "teach me",
                     "review flashcards", "stop quiz",
+    if cmd.name in ("explain document", "quiz", "review flashcards", "stop quiz",
+                    "plan week",
                     "focus start", "focus left", "focus end", "lecture notes",
                     "study total", "study streak",
                     # the Board: "bring up the board" is said at the desk
@@ -4920,7 +5101,7 @@ ASSISTANT_TIER1: list[Command] = [
                     # already consumed, so they need the unprefixed pass too
                     "scene", "room light",
                     "standup", "gpu reclaim", "gpu lend",
-                    "log triage", "slow turn",
+                    "log triage", "whats wrong", "quietly", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router
                     # would hand Claude the bare words "fix what i copied".
@@ -5338,6 +5519,10 @@ class Commander:
         # monotonic stamp). The study text is kept so the quiz is built from
         # exactly what was explained, with no second retrieval.
         self._pending_teach = None
+        # Working sessions (jarvis/dialogue.py): the Session whose open
+        # question the next utterance answers. The quiz's pattern
+        # generalised -- see _try_session, one rung above the quiz.
+        self._pending_session = None
         self._flashcards = None
         self._last_document = None
         # UI hook for uncertain intent ("Was this for me?"); wired by the
@@ -5665,6 +5850,15 @@ class Commander:
             return res
         # 3. A pending permission question owns yes / no (spec 5.2 b).
         res = self._try_approval(text, source)
+        if res is not None:
+            return res
+        # 3a. A working session is holding a question open ("Tuesday at
+        #     four?"): this utterance is the answer. Above the quiz because
+        #     a session may itself be a quiz-shaped thing, and below the
+        #     sticky modes for the same reason the quiz is -- dictation and
+        #     lecture notes swallow every utterance, so open_session()
+        #     refuses to start one while either is active.
+        res = self._try_session(text)
         if res is not None:
             return res
         # 3a'. A quiz question is on the table: this is the answer (or
@@ -6447,6 +6641,99 @@ class Commander:
         it as the answer both loses the command and marks a card wrong.
         The stop words are honoured from any source so a terminal can end a
         quiz it can see in "status".
+    def open_session(self, session) -> bool:
+        """Park a working session (jarvis/dialogue.py) so the next
+        utterance answers its question. Refused while dictation or lecture
+        notes are open: those rungs run FIRST and swallow every utterance,
+        so a session opened under them could never be answered.
+
+        Returns False when it was refused; the caller then says something
+        else rather than asking a question into a closed door."""
+        if self.dictation or getattr(self, "lecture_course", None):
+            log.info("session %s refused: a sticky mode owns the mic",
+                     getattr(session, "name", "?"))
+            return False
+        self._pending_session = session
+        return True
+
+    def _try_session(self, text: str) -> Optional[CommandResult]:
+        """While a working session holds a question open, the utterance is
+        its answer.
+
+        The rung, in order: a finished or stale session is dropped and the
+        words route normally; "that's enough" closes it WITH its read-back
+        (dialogue.enough_kind, checked before quiet_kind -- which matches
+        the same words but means barge-in, say nothing); "quiet" / "cancel
+        that" drop it silently, cutting speech, exactly as they end a quiz;
+        anything else goes to settle(). settle() returning None means the
+        session did not recognise the words -- it is dropped and the text
+        routes as a new subject, so nothing is ever trapped in a dialogue.
+
+        Results are always done=True, speak=True: app._after_dispatch arms
+        the follow-up mic only for a done, spoken reply, and without it the
+        next answer would need the wake word.
+        """
+        session = getattr(self, "_pending_session", None)   # slim test commander
+        if session is None:
+            return None
+        name = getattr(session, "name", "session")
+        t = (strip_jarvis_prefix(text) or text).strip()
+        try:
+            if session.finished or session.stale():
+                self._pending_session = None
+                return None
+        except Exception:                       # noqa: BLE001 - a bad session
+            log.exception("session %s state failed", name)
+            self._pending_session = None
+            return None
+        if dialogue_mod.enough_kind(t):
+            self._pending_session = None
+            return CommandResult(handled=True, reply=self._session_stop(session),
+                                 speak=True, status=f"{name} ended")
+        if quiet_kind(t) or cancel_kind(t):
+            self._pending_session = None
+            _cut_speech(self)
+            return CommandResult(handled=True, reply="Very good, sir.", speak=False,
+                                 status=f"{name} stopped")
+        try:
+            line = session.settle(t)
+        except Exception:                       # noqa: BLE001 - tenant boundary
+            log.exception("session %s settle failed", name)
+            self._pending_session = None
+            return CommandResult(handled=True, reply=SESSION_LOST_LINE, speak=True,
+                                 status=f"{name} failed")
+        if line is None:
+            self._pending_session = None       # not an answer: route the words
+            return None
+        if session.finished:
+            self._pending_session = None
+            tail = self._session_stop(session)
+            return CommandResult(handled=True, reply=f"{line} {tail}".strip(),
+                                 speak=True, status=f"{name} finished")
+        try:
+            question = session.ask()
+        except Exception:                       # noqa: BLE001
+            log.exception("session %s ask failed", name)
+            self._pending_session = None
+            return CommandResult(handled=True, reply=line, speak=True,
+                                 status=f"{name} failed")
+        status = f"{name} {session.status_text()}".strip()
+        return CommandResult(handled=True, reply=f"{line} {question}".strip(),
+                             speak=True, status=status)
+
+    @staticmethod
+    def _session_stop(session) -> str:
+        """The closing line, never an exception: stop() is where a tenant
+        writes its results (the planner files its reminders), and a failed
+        write must still leave him with something spoken."""
+        try:
+            return session.stop() or "Very good, sir."
+        except Exception:                       # noqa: BLE001
+            log.exception("session %s stop failed", getattr(session, "name", "?"))
+            return SESSION_LOST_LINE
+
+    def _try_quiz_answer(self, text: str) -> Optional[CommandResult]:
+        """While a quiz question is open, the utterance is the answer.
 
         Stop words end the quiz with the tally; skip words reveal the
         answer and move on; a fresh "quiz me" / "review my flashcards"

@@ -67,11 +67,12 @@ from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            BoardCommand, PowerUp,
                            UncertainResolved, UncertainUtterance,
                            BrainState, BriefingReady, ClaudeProgress,
-                           ClaudeTaskState, DeskState, HotwordDetected,
+                           ClaudeTaskState, DeskState, FaultRaised, HotwordDetected,
                            JarvisReply,
                            MicState, ModelInfo, PartialText, RecordingStarted,
                            RecordingStopped, ReminderFired, SpeakingState,
                            Status, Transcribed, UserUtterance, bus)
+from jarvis.faults import FaultBoard
 from jarvis.logs import get_logger
 from jarvis.ui import theme
 from jarvis.ui.ambient import RoomSlab
@@ -576,6 +577,11 @@ class MainWindow:
             self._llm_name = "?"
         self._llm_text = self._llm_name                 # re-read by _probe_llm
         self._dev_text: Optional[str] = None            # None until probed
+        # The fault lane (jarvis/faults.py). A warn/error Status is a 4-6 s
+        # chip (WARN_HOLD_S / ERROR_HOLD_S), so a fault raised while the
+        # room is empty used to vanish; the board holds it until the
+        # detector says it cleared, and the FAULT card row reads it at 1 Hz.
+        self._faults = FaultBoard()
         self._utter_ts: Optional[float] = None          # UserUtterance → reply
 
         # HiDPI: the V3 design couples a pixel layout (56px header, 44px
@@ -1232,9 +1238,10 @@ class MainWindow:
     def _telemetry(self) -> dict:
         """Provider for Reactor.set_telemetry — cheap attribute reads on
         the Tk thread; every value is real (events, config, ollama,
-        nvidia-smi). Exactly the four engine-card rows."""
+        nvidia-smi, the fault board). Exactly the engine-card rows."""
         return {"asr": self._asr_text, "tts": self._tts_text,
-                "llm": self._llm_text, "dev": self._dev_text}
+                "llm": self._llm_text, "dev": self._dev_text,
+                "fault": self._faults.token}
 
     # ------------------------------------------------- console modes (7/19/21)
     def _console_option(self, key: str, default=None):
@@ -1412,9 +1419,16 @@ class MainWindow:
         bus.subscribe(BoardCommand, self._ev_board)
         bus.subscribe(PowerUp, self._ev_power_up)
         bus.subscribe(DeskState, self._ev_desk)
+        bus.subscribe(FaultRaised, self._ev_fault)
 
     def _ev_status(self, ev: Status):
         self.set_status(ev.text, ev.kind)
+
+    def _ev_fault(self, ev: FaultRaised):
+        """The fault lane. The spoken alert and the toast are already the
+        watchdog's (it publishes a Status beside this); all the board does
+        is HOLD, so the FAULT row is still lit when he walks back in."""
+        self._faults.apply(ev)
 
     def _ev_model(self, ev: ModelInfo):
         self._asr_text = fmt_asr(ev.text)         # 'small · GPU fp16' → SMALL

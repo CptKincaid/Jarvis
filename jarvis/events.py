@@ -260,6 +260,54 @@ class ApprovalResolved(Event):
 
 
 @dataclass
+class RunProgress(Event):
+    """A training run's lifecycle, from the run ledger (jarvis/runwatch.py).
+
+    `kind`: started | progress | finished. Published on CHANGE ONLY --
+    never a heartbeat -- from the health watchdog's existing 30 s tick.
+    `label` is the script ("finetune_piper.py"), `elapsed_s` the run's
+    true age (read from /proc/<pid>/stat, so it survives a Jarvis restart
+    mid-run), `line` the sentence he said about it (empty when he stayed
+    quiet: a brief run, or "quietly, please").
+
+    This is the board's live-tail lane contract. The lane is OPTIONAL: the
+    default degrade path is the spoken beats alone, so a renderer that
+    never appears costs nothing.
+    """
+    kind: str = "started"             # started | progress | finished
+    pid: int = 0
+    label: str = ""
+    elapsed_s: float = 0.0
+    epoch: int = 0
+    loss: float = 0.0                 # 0.0 when the tail carried none
+    line: str = ""
+
+
+@dataclass
+class FaultRaised(Event):
+    """Something is wrong with the box and it is NEW (jarvis/faults.py).
+
+    Published by the health watchdog beside its Status, because a Status
+    is a 4-6 second chip: main_window holds a warn for WARN_HOLD_S and an
+    error for ERROR_HOLD_S, so a fault raised while the room is empty
+    leaves no trace outside jarvis.log. This event is what the board's
+    FAULT lane latches on to.
+
+    `rule` names the detector (memory | hogs | trainers), `token` is the
+    <=10-character card text ("2 TRAINERS"), `text` the status sentence,
+    `line` what he actually said. `cleared=True` lifts the fault for that
+    rule -- the watchdog publishes one on recovery, and the board must
+    take the clear from the detector rather than latching a second time.
+    """
+    rule: str = ""
+    kind: str = "warn"                # warn | error
+    token: str = ""
+    text: str = ""
+    line: str = ""
+    cleared: bool = False
+
+
+@dataclass
 class UncertainUtterance(Event):
     """The commander could not tell whether an utterance was meant for
     Jarvis. He asks aloud and the UI shows a card with YES / NO; the

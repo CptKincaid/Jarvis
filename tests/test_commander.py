@@ -1557,6 +1557,7 @@ TIER1_SAMPLES = {
     "board show": "bring up the board",
     "board hide": "close the board",
     "board focus": "focus on the sessions",
+    "plan week": "let's plan the week",
     "focus start": "start a focus session",
     "focus left": "how long left",
     "focus end": "end the session",
@@ -1613,6 +1614,8 @@ TIER1_SAMPLES = {
     "gpu reclaim": "take the gpu back",
     "gpu lend": "lend the gpu",
     "log triage": "anything wrong in your log",
+    "whats wrong": "what's wrong",
+    "quietly": "quietly please",
     "slow turn": "why was that slow",
     "clip to claude": "have claude fix what i copied",
     "read control": "skip",
@@ -1643,6 +1646,39 @@ def test_tier_one_samples_survive_the_intent_gate(tmp_path, monkeypatch):
             continue
         verdict, conf = ic.classify(phrase)
         assert verdict != IntentClassifier.NO, (name, phrase, conf)
+
+
+# The dialogue-board phrasings that MISS their Tier-1 regex and so fall
+# through to the classifier. The exact-match bypass cannot help here, which
+# is precisely why the vocabulary has to carry them: the silent drop this
+# guards against has already recurred three times (media words 08-27, study
+# words and the review round 08-30). A dropped session opener is the worst
+# of the family -- it is turn one of a conversation, so the silence reads as
+# him ignoring you rather than mishearing you.
+LOOSE_GATE_PHRASES = [
+    "sort out my week for me",
+    "can we plan the week out tonight",
+    "map out the week when you get a chance",
+    "anything wrong over there",
+    "tell me what went wrong last night",
+    "a bit more quietly please",
+    "keep it down while the run is going",
+    "stop narrating the epochs",
+]
+
+
+@pytest.mark.parametrize("phrase", LOOSE_GATE_PHRASES)
+def test_loose_dialogue_phrasings_survive_the_intent_gate(
+        phrase, tmp_path, monkeypatch):
+    """These deliberately do NOT match their Tier-1 regex, so they reach the
+    classifier and only the vocabulary can save them."""
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "l.json")
+    c = object.__new__(Commander)
+    assert not c._match_assistant(phrase), (
+        f"{phrase!r} now matches Tier-1 outright -- it no longer tests the "
+        "vocabulary; pick a phrasing that still falls through")
+    verdict, conf = IntentClassifier().classify(phrase)
+    assert verdict != IntentClassifier.NO, (phrase, verdict, conf)
 
 
 def test_a_tier_one_match_never_consults_the_classifier(rich, monkeypatch):
