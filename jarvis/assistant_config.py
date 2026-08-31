@@ -92,7 +92,16 @@ DEFAULTS: dict = {
     "phrases": [],
     # on_first_wake: deliver the briefing after the first thing you say to
     # Jarvis each day, once it is past `after` (24 h clock, local time).
-    "calendar": {"heads_up_min": 10},
+    # heads_up_min: the meeting heads-up lead (jarvis/headsup.py).
+    # anomaly_watch: diff each successful calendar refresh against the last
+    # one and speak what changed today/tomorrow -- "your 9:10 has just been
+    # cancelled, sir" (jarvis/calwatch.py).
+    # leave_times: the per-building walk heads-up (jarvis/leavetime.py). The
+    # walk itself is LEARNED by asking once and lives in long-term memory,
+    # never in this file; leave_notice_min is how long before the walk
+    # starts he is told ("you want to be walking in 5 minutes, sir").
+    "calendar": {"heads_up_min": 10, "anomaly_watch": True,
+                 "leave_times": True, "leave_notice_min": 5},
     # Canvas LMS: Account > Settings > New Access Token (read-only use).
     # heads_up_hours: the deadline heads-up (jarvis/deadlines.py) speaks
     # this long before each due time; the meeting heads-up's ten minutes
@@ -181,8 +190,16 @@ DEFAULTS: dict = {
     # Presence (jarvis/presence.py): the phone's Wi-Fi address and/or MAC.
     # away_after_min is the grace before "out" -- iPhones nap off Wi-Fi for
     # minutes at a time, so anything under ~10 flaps.
+    # desk* is the second, configuration-free probe (jarvis/deskpresence.py):
+    # GNOME's Mutter idle monitor over the session bus. It only suppresses
+    # (held lines, a dimmed board) and greets the return; it never says
+    # "nobody's home" out loud. desk_away_after_min is generous because idle
+    # time is keyboard/mouse only -- reading at the desk looks like an empty
+    # chair. desk_standby dims the board while the chair is empty.
     "presence": {"enabled": True, "phone_ip": "", "phone_mac": "",
-                 "away_after_min": 12, "poll_s": 60},
+                 "away_after_min": 12, "poll_s": 60,
+                 "desk": True, "desk_away_after_min": 25, "desk_poll_s": 30,
+                 "desk_standby": True, "desk_standby_alpha": 0.45},
     # The voice path's two latency/feedback policies (jarvis/app.py):
     # speculative_stt decodes the clip during the endpoint silence and reuses
     # the result when no more speech followed; nudge is the short spoken /
