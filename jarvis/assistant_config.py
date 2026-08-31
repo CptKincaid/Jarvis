@@ -116,7 +116,11 @@ DEFAULTS: dict = {
     "lecture": {"window_s": 20},
     # Quiz mode over the documents index: questions per round, chunks of
     # study text handed to the model per round (jarvis/tools/quiz.py).
-    "quiz": {"questions": 5, "chunks": 6},
+    # window_s: the mic stays open this long for the ANSWER (and for a
+    # yes/no read-back) instead of CONFIG.followup_window's 4 s, which is
+    # sized for "...and Tuesday?" and not for thinking about a flashcard.
+    # Capped at 30 by the recorder, like lecture.window_s.
+    "quiz": {"questions": 5, "chunks": 6, "window_s": 15},
     # yield_to_trainer: when a training process appears, unload the local
     # model (brain.release) and speak the lent line; reload once the trainer
     # is gone for two ticks. Off by default: every tool answer runs through

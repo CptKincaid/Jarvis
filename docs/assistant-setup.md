@@ -1292,3 +1292,29 @@ for BIOSENSORS, 12 lines and a quiz open at question 3 of 5.
 
 That line is the only way to notice a mode from a shell now that a CLI
 turn no longer lands in one. Nothing to configure.
+
+## 41. How long the mic waits for your answer
+
+After Jarvis speaks he keeps listening for a few seconds so you can follow
+up without the wake word. That window is `followup_window` in
+jarvis/config.py — 4 seconds, which is right for "…and Tuesday?" and much
+too short for a question he just asked you.
+
+So the window depends on what is open:
+
+| what is open | window | setting |
+|---|---|---|
+| lecture notes | 20 s | `lecture.window_s` |
+| a flashcard question, a read-back ("Cancel all three alarms, sir?"), the good-night "Shall I wake you at seven?" | 15 s | `quiz.window_s` |
+| everything else | 4 s | `followup_window` (jarvis/config.py) |
+
+```json
+{ "quiz": { "questions": 5, "chunks": 6, "window_s": 15 } }
+```
+
+Set it in `~/.config/jarvis/assistant.json`. It is a request, not a
+promise: the recorder clamps any window to 30 s, the value never drops
+below `followup_window`, and the long window only lasts while the question
+does — a finished quiz, a read-back older than 60 s and a wake-alarm offer
+older than three minutes all fall straight back to 4 s. Every follow-up is
+still speaker-verified, so the open mic is still yours alone.

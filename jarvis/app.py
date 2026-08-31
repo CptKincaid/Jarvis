@@ -64,13 +64,15 @@ from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
 from jarvis.brain import JarvisBrain
-from jarvis.commander import COURTESY_REPLIES, Commander, parse_yes_no
+from jarvis.commander import (COURTESY_REPLIES, DESTRUCTIVE_TTL_S, Commander,
+                              parse_yes_no)
 from jarvis.context import ContextEngine
 from jarvis.history import TypedHistory
 from jarvis.hotword import Hotword
 from jarvis.jarvis_agent import JarvisAgent
 from jarvis.memory import JarvisMemory
 from jarvis.reader import CONTINUE_PROMPT, ReadAloud
+from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.tools.docs import doc_paths
 from jarvis.recorder import (SAMPLE_RATE, MicArbiter, Recorder,
                              play_beep)
@@ -1550,18 +1552,63 @@ class JarvisApp:
         threading.Timer(0.15, lambda: self.recorder.start(followup=True, **kw)).start()
 
     def _capture_window(self):
-        """A longer wait for the first word while lecture notes are open
-        (`lecture.window_s`, default 20 s), else None for the recorder's
-        own CONFIG.followup_window. The recorder caps it at half its hard
-        cap. This is still one capture per note, not a hands-free mic."""
+        """A longer wait for the first word when the last reply left
+        something open: lecture notes (`lecture.window_s`, 20 s), or a
+        question Jarvis just asked -- a quiz card or a yes/no read-back
+        (`quiz.window_s`, 15 s). Else None for the recorder's own
+        CONFIG.followup_window. The recorder caps it at half its hard cap.
+        This is still one capture per answer, not a hands-free mic."""
         commander = getattr(self, "commander", None)
-        if not getattr(commander, "lecture_course", None):
-            return None
+        if getattr(commander, "lecture_course", None):
+            return self._window_setting("lecture.window_s", 20.0)
+        if self._question_open(commander):
+            return self._window_setting("quiz.window_s", 15.0)
+        return None
+
+    def _window_setting(self, key: str, default: float) -> float:
         try:
-            window = float(self.assistant.get("lecture.window_s", 20) or 20)
+            window = float(self.assistant.get(key, default) or default)
         except (TypeError, ValueError, AttributeError):
-            window = 20.0
+            window = default
         return max(window, float(CONFIG.followup_window))
+
+    def _question_open(self, commander) -> bool:
+        """Jarvis asked something and is waiting on the answer.
+
+        The 4 s follow-up window is sized for "...and Tuesday?" -- it is
+        far too short for a flashcard (QuizSession.ANSWER_WINDOW_S is 300 s,
+        so the session is patient but the mic was not) or for a yes/no the
+        user has to think about. Each of these is dropped the moment it
+        expires, so the longer window only ever covers a live question.
+        """
+        if commander is None:
+            return False
+        quiz = getattr(commander, "_pending_quiz", None)
+        if quiz is not None and not getattr(quiz, "finished", True):
+            try:
+                if not quiz.stale():
+                    return True
+            except Exception:
+                log.debug("quiz staleness check failed", exc_info=True)
+        pend = getattr(commander, "_pending_destructive", None)
+        if isinstance(pend, tuple) and len(pend) == 3:
+            try:
+                if time.monotonic() - float(pend[2]) <= DESTRUCTIVE_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        # The wake-alarm offer lives on the services namespace, not on the
+        # commander: briefing.make_tools parks it there for
+        # _try_alarm_offer.
+        offer = getattr(getattr(self, "services", None), "alarm_offer", None)
+        if isinstance(offer, dict) and offer:
+            try:
+                made = float(offer.get("made_at") or 0.0)
+            except (TypeError, ValueError):
+                made = 0.0
+            if not made or time.time() - made <= OFFER_TTL_S:
+                return True
+        return False
 
     # ---------------------------------------------------- guests, learning
     def _on_guest(self, score):
