@@ -1424,3 +1424,117 @@ def test_lecture_notes_are_wired_through_the_real_app(app, paths, monkeypatch):
     assert len(files) == 1 and "impedance is the ratio" in files[0].read_text()
     assert [n["text"] for n in app.notes.list("note")] == [
         "impedance is the ratio of voltage to current"]
+
+
+# ------------------------------------------------- the Board and the room
+def test_the_board_is_a_real_service_and_composes_from_real_providers(app):
+    """No fakes: the app's own providers answer, and the panels that need
+    something this box does not have (Canvas, a live session) come back
+    honestly dark rather than missing."""
+    from jarvis import board as board_mod
+    state = app.board_state()
+    assert state.keys == board_mod.PANEL_ORDER
+    assert app.board_text()                        # renders over SSH
+    assert callable(app.services.board.show)
+
+
+def test_bringing_the_board_up_starts_one_feed_and_publishes_for_the_window(app):
+    from jarvis.events import BoardCommand
+    seen = []
+    bus.subscribe(BoardCommand, seen.append)
+    try:
+        assert app.services.board.show() is False   # it was not already up
+        feed = app._board_feed
+        assert feed is not None and feed.running
+        assert app.services.board.show() is True    # …and now it is
+        assert app._board_feed is feed              # one feed, not two
+        app.services.board.hide()
+        assert app._board_feed is None and not feed.running
+    finally:
+        bus.unsubscribe(BoardCommand, seen.append)
+    assert [e.action for e in seen] == ["show", "show", "hide"]
+
+
+def test_quitting_stops_the_board_feed(app):
+    app.services.board.show()
+    feed = app._board_feed
+    app.stop_assistant()
+    assert not feed.running
+
+
+def test_focus_on_a_panel_answers_with_that_panels_own_sentence(app):
+    line = app.services.board.read("the vitals")
+    assert line.endswith("sir.")
+    assert app.services.board.read("the fridge") == ""
+
+
+def test_live_claude_states_reach_the_boards_sessions_panel(app):
+    bus.publish(ClaudeTaskState(project="jarvis", task_id="t1",
+                                state="running"))
+    assert app._board_tasks == {"jarvis": "running"}
+    panel = app.board_state().get("sessions")
+    assert ("JARVIS", "RUNNING") in panel.rows
+    bus.publish(ClaudeTaskState(project="jarvis", task_id="t1", state="done"))
+    assert app._board_tasks == {}
+
+
+def test_the_canvas_half_is_cached_rather_than_polled_every_five_seconds(
+        app, monkeypatch):
+    calls = []
+
+    def fake_due(registry):
+        calls.append(1)
+        return ["BIOSEN - Lab 3 report, tonight"]
+    monkeypatch.setattr("jarvis.tools.briefing._due_lines", fake_due)
+    assert app._board_canvas_lines() == ["BIOSEN - Lab 3 report, tonight"]
+    app._board_canvas_lines()
+    app._board_canvas_lines()
+    assert calls == [1]                    # one REST call, not three
+
+
+def test_the_room_state_never_claims_home_when_presence_is_unconfigured(app):
+    """presence.is_home() answers True with no phone_ip set, so the slab
+    must show nothing rather than a confident, false HOME."""
+    room = app.room_state()
+    assert room["presence"] == ""
+    assert set(room) >= {"playing", "next", "due", "temp", "arc", "quiet",
+                         "gpu"}
+
+
+def test_the_room_state_backs_off_spotify_instead_of_a_heartbeat(app):
+    calls = []
+
+    class FakeSpotify:
+        def now_playing(self):
+            calls.append(1)
+            return SimpleNamespace(speak="Kind of Blue, sir.", text="")
+    app.services.spotify = FakeSpotify()
+    assert app._room_playing() == "Kind of Blue, sir."
+    assert app._room_playing() == "Kind of Blue, sir."
+    assert calls == [1]                    # the second read came from cache
+
+
+def test_the_power_up_sweep_fires_once_a_day_off_the_briefing_latch(app):
+    from jarvis.events import PowerUp
+    seen = []
+    bus.subscribe(PowerUp, seen.append)
+    try:
+        assert app._maybe_power_up("hotword") is True
+        assert app._maybe_power_up("presence") is False
+    finally:
+        bus.unsubscribe(PowerUp, seen.append)
+    assert len(seen) == 1 and seen[0].reason == "hotword"
+    state = json.loads(app._briefing_state_path().read_text())
+    assert state["boot_sweep"] == time.strftime("%Y-%m-%d")
+
+
+def test_the_sweep_latch_does_not_eat_the_briefings_own_key(app):
+    app._mark_briefing_delivered()
+    app._maybe_power_up("hotword")
+    state = json.loads(app._briefing_state_path().read_text())
+    assert "delivered" in state and "boot_sweep" in state
+
+
+def test_the_sweep_can_be_switched_off_in_the_config(app):
+    app.assistant.set("console.powerup", False)
+    assert app._maybe_power_up("hotword") is False

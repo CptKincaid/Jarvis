@@ -37,7 +37,9 @@ from jarvis.events import (
     AlarmFired,
     ApprovalRequested,
     ApprovalResolved,
+    BoardCommand,
     BriefingReady,
+    PowerUp,
     ClaudeProgress,
     ClaudeTaskState,
     JarvisReply,
@@ -56,6 +58,7 @@ from jarvis.events import (
     SpeakingState)
 from jarvis.logs import get_logger
 
+from jarvis import board as board_mod
 from jarvis import brain as brain_mod
 from jarvis import desktop as desktop_mod
 from jarvis import speak_queue, standup, voice_check
@@ -128,6 +131,14 @@ THINKING_LINES = [
 # answer immediately queued behind it. The extra second moves the filler clear
 # of the common case, leaving it for lookups that are genuinely slow.
 THINKING_DELAY_S = 4.5
+
+# The Board and the ambient slab (jarvis/board.py, jarvis/ui/*). Canvas is
+# the only network source on the Board and Spotify the only one on the
+# slab, so both are gated here rather than in the surfaces that draw them.
+CANVAS_TTL_S = 300.0          # the Board's Canvas half, cached 5 minutes
+BOARD_SESSIONS = 6            # Claude sessions read off disk per poll
+ROOM_SPOTIFY_ACTIVE_S = 10.0  # playback poll while something IS playing
+ROOM_SPOTIFY_IDLE_S = 60.0    # …and once it has gone quiet
 SAY_AGAIN_LINE = "Say that again, sir?"
 # The "did not catch that" cue (JarvisApp._nudge): a wake-word turn that
 # captured nothing usable gets this instead of silence.
@@ -806,6 +817,13 @@ class JarvisApp:
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
             quiet=self.quiet, presence=self.presence,
+            # "bring up the board" / "focus on the sessions": show and hide
+            # publish a BoardCommand for the window to act on (the commander
+            # runs on worker threads and must never touch Tk); read() answers
+            # with the panel's one-line spoken state, or "" for a name that
+            # is not a panel at all.
+            board=SimpleNamespace(show=self._board_show, hide=self._board_hide,
+                                  read=self._board_read),
         )
 
     # ------------------------------------------------------- brain executor
@@ -930,6 +948,14 @@ class JarvisApp:
             self._alert("milestone", f"Claude · {ev.project}", ev.line)
 
     def _on_claude_state(self, ev):
+        # The Board's sessions panel wants the LIVE states, and this is the
+        # only place they pass through the app. A finished task leaves the
+        # map so the panel falls back to the session row on disk.
+        if ev.project:
+            if ev.state in ("queued", "running", "waiting"):
+                self._board_tasks[ev.project] = ev.state
+            else:
+                self._board_tasks.pop(ev.project, None)
         if ev.state == "done":
             threading.Thread(target=self._finish_claude_task, args=(ev,),
                              daemon=True, name="claude-summary").start()
@@ -1005,6 +1031,14 @@ class JarvisApp:
         bus.publish(Status(text="Home" if ev.home else "Away", kind="info"))
         if not ev.home or not ev.returned:
             return
+        # The power-up sweep's proper trigger: the away->home edge is the
+        # moment he actually sits down. Once a day, latched (see
+        # _maybe_power_up); the wake-word fallback covers a box where
+        # presence is unconfigured.
+        try:
+            self._maybe_power_up("presence")
+        except Exception:                     # noqa: BLE001 - never block a return
+            log.debug("power-up check failed", exc_info=True)
         from jarvis.presence import WELCOME_LINE
         quiet = getattr(self, "quiet", None)
         if quiet is not None:
@@ -1247,6 +1281,14 @@ class JarvisApp:
             except Exception:
                 log.exception("barge-in interrupt failed")
         self.turns.mark("wake")            # accepted: this turn starts now
+        # The power-up sweep's fallback trigger. Presence is idle until
+        # phone_ip is configured (it is not, on this box), so without this
+        # the feature would never fire on the machine that runs it. The date
+        # latch keeps it to once a day whichever trigger gets there first.
+        try:
+            self._maybe_power_up("hotword")
+        except Exception:                     # noqa: BLE001 - never block a wake
+            log.debug("power-up check failed", exc_info=True)
         self._followup_after_speech = False   # a wake supersedes any follow-up
         self._turn_filler_pending = False     # a stale flag would label this answer a filler
         self._say_again_count = 0
@@ -1532,6 +1574,15 @@ class JarvisApp:
         self._wake_pending = False            # a wake word is opening the mic
         self._turn_from_wake = False          # this capture answers a wake word
         self._last_nudge_ts = -1e9            # monotonic; see _last_guest_ts
+        # The Board: the poll thread while it is up, the Canvas cache, and
+        # the live Claude task states the sessions panel reads (nothing else
+        # in the app kept them — the UI's tracker is a Tk-thread object).
+        self._board_feed = None
+        self._board_tasks: dict = {}
+        self._canvas_due_cache = (0.0, [])
+        # The ambient slab's one outbound dependency, on a backoff
+        self._room_playing_text = ""
+        self._room_playing_ts = -1e9
         name = self.assistant.user_name if self.assistant is not None else "Hunter"
         self._guest_line = GUEST_LINE.format(name=name)
 
@@ -2041,6 +2092,245 @@ class JarvisApp:
         into silence / transcription / the answer."""
         from jarvis.logtriage import last_turn, slow_text
         return slow_text(last_turn(PATHS.LOG_DIR / "turns.jsonl"))
+
+    # ------------------------------------------------------------- the Board
+    # Providers for jarvis.board.board_state(). Everything expensive is
+    # cached or gated HERE and never in the pure layer: health.snapshot()
+    # spawns nvidia-smi with a 5 s timeout and canvas_due is a Canvas REST
+    # call, while the Board polls every 5 s.
+    def _board_canvas_lines(self) -> list:
+        """Canvas items due soon, cached for CANVAS_TTL_S.
+
+        Reached through the TOOL REGISTRY, not by import: canvas_due is a
+        closure defined inside tools/canvas.make_tools and registered as a
+        tool, exactly as tools/briefing.py calls it. Silent (and empty)
+        when the token is unset — a box with no Canvas must not nag."""
+        now = time.monotonic()
+        at, lines = getattr(self, "_canvas_due_cache", (0.0, []))
+        if lines and now - at < CANVAS_TTL_S:
+            return lines
+        from jarvis.tools.briefing import _due_lines
+        try:
+            lines = list(_due_lines(self.tools) or [])
+        except Exception:                          # noqa: BLE001 - tool boundary
+            log.debug("board: canvas_due failed", exc_info=True)
+            lines = []
+        self._canvas_due_cache = (now, lines)
+        return lines
+
+    def _board_sessions(self) -> list:
+        from jarvis import claude_session
+        return claude_session.discover_sessions(limit=BOARD_SESSIONS)
+
+    def _board_turns(self) -> list:
+        from jarvis.logtriage import read_turns
+        return read_turns(PATHS.LOG_DIR / "turns.jsonl", board_mod.TURN_WINDOW)
+
+    def _board_schedule(self) -> list:
+        tk = self.timekeeper
+        return list(tk.list("all")) if tk is not None else []
+
+    def board_state(self):
+        """One composed Board. Called on the BoardFeed thread (and on a
+        commander worker for the spoken read) — never on the Tk thread."""
+        from jarvis.tools import health
+        return board_mod.board_state(
+            health=health.snapshot,
+            sessions=self._board_sessions,
+            turns=self._board_turns,
+            focus=lambda: getattr(self, "focus", None),
+            quiet=lambda: getattr(self, "quiet", None),
+            presence=lambda: getattr(self, "presence", None),
+            canvas=self._board_canvas_lines,
+            schedule=self._board_schedule,
+            tasks=lambda: dict(getattr(self, "_board_tasks", {})))
+
+    def board_text(self) -> str:
+        """`jarvis board` over SSH — the same state the panel draws."""
+        return board_mod.board_text(self.board_state())
+
+    def _board_show(self) -> bool:
+        """Raise the Board; True when it was ALREADY up (so the spoken
+        answer can say so rather than pretending it just appeared)."""
+        feed = getattr(self, "_board_feed", None)
+        already = feed is not None and feed.running
+        if not already:
+            feed = board_mod.BoardFeed(self.board_state)
+            feed.start()                  # its first tick is immediate
+            self._board_feed = feed
+        bus.publish(BoardCommand(action="show"))
+        return already
+
+    def _board_hide(self) -> bool:
+        feed, self._board_feed = getattr(self, "_board_feed", None), None
+        if feed is not None:
+            feed.stop()
+        bus.publish(BoardCommand(action="hide"))
+        return True
+
+    def _board_read(self, panel: str) -> str:
+        """"Focus on the sessions": light that panel AND hand back the one
+        sentence to speak. An unresolvable name answers "" so the commander
+        can fall through to whoever really owns those words."""
+        key = board_mod.resolve_panel(panel)
+        if not key:
+            return ""
+        line = board_mod.panel_line(self.board_state(), panel)
+        if line:
+            bus.publish(BoardCommand(action="focus", panel=key))
+        return line
+
+    # ------------------------------------------------ the room (ambient slab)
+    def _room_playing(self) -> str:
+        """What Spotify is playing, on a BACKOFF.
+
+        spotify.now_playing() is a live REST call with no cache behind it
+        (the only cache in that module is the OAuth token), so this is the
+        ambient slab's one outbound dependency and it is gated: ROOM_SPOTIFY
+        _ACTIVE_S while something was playing, ROOM_SPOTIFY_IDLE_S once it
+        went quiet. A permanent 10 s heartbeat to api.spotify.com for a row
+        nobody is reading is not a feature."""
+        spot = getattr(self.services, "spotify", None)
+        if spot is None:
+            return ""
+        now = time.monotonic()
+        gap = ROOM_SPOTIFY_ACTIVE_S if self._room_playing_text \
+            else ROOM_SPOTIFY_IDLE_S
+        if now - self._room_playing_ts < gap:
+            return self._room_playing_text
+        self._room_playing_ts = now
+        try:
+            res = spot.now_playing()
+            text = str(getattr(res, "speak", "") or getattr(res, "text", ""))
+        except Exception:                          # noqa: BLE001 - tool boundary
+            log.debug("room: now_playing failed", exc_info=True)
+            text = ""
+        if "nothing" in text.lower() or "not playing" in text.lower():
+            text = ""
+        self._room_playing_text = text.strip()
+        return self._room_playing_text
+
+    def _room_next_event(self) -> str:
+        cal = getattr(self.services, "calendar", None)
+        if cal is None:
+            return ""
+        try:
+            now = datetime.now().astimezone()
+            upcoming = [e for e in cal.events()
+                        if not e.all_day and e.start > now]
+            if not upcoming:
+                return ""
+            ev = min(upcoming, key=lambda e: e.start)
+            return f"{ev.title} {ev.start.strftime('%-I:%M %p').lower()}"
+        except Exception:                          # noqa: BLE001 - source boundary
+            log.debug("room: calendar read failed", exc_info=True)
+            return ""
+
+    def _room_due(self) -> str:
+        lines = self._board_canvas_lines()
+        return lines[0] if lines else ""
+
+    def room_state(self) -> dict:
+        """Room facts for the console's ambient / standby slab, as
+        PRE-COMPUTED STRINGS.
+
+        Called on the window's existing 5 s off-Tk-thread probe, never on
+        the Tk thread — every value here is a config read, a cached answer
+        or a gated call. `presence` is "" unless the sentinel is actually
+        configured: presence.is_home() answers True when it is not
+        (jarvis/presence.py:159), and a confident false HOME is worse than
+        no row at all. `arc` reads the day-arc phase through a getattr seam
+        so this lands whichever way that change merges."""
+        from jarvis.tools import weather as weather_mod
+        pres = getattr(self, "presence", None)
+        quiet = getattr(self, "quiet", None)
+        arc = getattr(self, "arc", None)
+        room = {"playing": self._room_playing(),
+                "next": self._room_next_event(),
+                "due": self._room_due(),
+                "temp": weather_mod.cached_temperature() or "",
+                "arc": "", "presence": "", "quiet": "", "gpu": None}
+        if pres is not None and getattr(pres, "configured", False):
+            room["presence"] = str(getattr(pres, "state", "") or "")
+        if quiet is not None:
+            try:
+                room["quiet"] = str(quiet.reason() or "")
+            except Exception:                      # noqa: BLE001 - policy boundary
+                log.debug("room: quiet read failed", exc_info=True)
+        for name in ("phase", "state"):
+            value = getattr(arc, name, None) if arc is not None else None
+            if isinstance(value, str) and value:
+                room["arc"] = value
+                break
+        try:
+            from jarvis.tools import health
+            gpu = (health.snapshot(gpu=True).gpu or {}).get("util_pct")
+            room["gpu"] = None if gpu is None else max(0.0, min(1.0, gpu / 100))
+        except Exception:                          # noqa: BLE001 - probe boundary
+            log.debug("room: gpu read failed", exc_info=True)
+        return room
+
+    # ------------------------------------------------------------ power-up
+    def _boot_sweep_due(self, idle_s=None) -> bool:
+        """Has today earned the power-up sweep?
+
+        The date latch is a `boot_sweep` key in the SAME briefing_state.json
+        the first-wake briefing already writes atomically — a second latch
+        file would be a second thing to get wrong, and this one already
+        survives a crash-relaunch."""
+        # Imported here, not at module scope: jarvis.ui.* pulls tkinter, and
+        # nothing else in app.py imports the UI outside main().
+        from jarvis.ui import console_mode
+        try:
+            state = json.loads(self._briefing_state_path().read_text())
+        except (OSError, ValueError):
+            state = {}
+        gap = self.assistant.get("console.powerup_gap_h",
+                                 console_mode.POWERUP_GAP_H)
+        return console_mode.powerup_due(str(state.get("boot_sweep") or ""),
+                                        idle_s=idle_s, gap_h=float(gap or 6))
+
+    def _mark_boot_sweep(self) -> None:
+        p = self._briefing_state_path()
+        try:
+            state = json.loads(p.read_text())
+            if not isinstance(state, dict):
+                state = {}
+        except (OSError, ValueError):
+            state = {}
+        state["boot_sweep"] = datetime.now().date().isoformat()
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")     # a torn write must not eat the day
+            tmp.write_text(json.dumps(state))
+            os.replace(tmp, p)
+        except OSError:
+            log.debug("boot sweep state save failed", exc_info=True)
+
+    def _maybe_power_up(self, reason: str) -> bool:
+        """Fire the sweep on the first activity of the day, once.
+
+        Two triggers, both needed: the presence away->home edge is the
+        proper one, and the first HotwordDetected of the day is the
+        fallback — presence is idle until phone_ip is configured, and it is
+        not configured on this box, so without the fallback the feature
+        would be dark on the only machine that runs it."""
+        if not self.assistant.get("console.powerup", True):
+            return False
+        idle = None
+        fn = getattr(self, "desk_idle_s", None)
+        if callable(fn):
+            try:
+                idle = fn()
+            except Exception:                      # noqa: BLE001 - probe boundary
+                idle = None
+        if not self._boot_sweep_due(idle):
+            return False
+        self._mark_boot_sweep()
+        log.info("power-up sweep (%s)", reason)
+        bus.publish(PowerUp(reason=reason,
+                            gap_h=(idle or 0.0) / 3600.0))
+        return True
 
     # ------------------------------------------------------- turn ledger
     def _wire_turn_clock(self):
@@ -2806,6 +3096,7 @@ class JarvisApp:
                           ("presence", getattr(self, "presence", None)),
                           ("quiet", getattr(self, "quiet", None)),
                           ("dayreviewer", getattr(self, "dayreviewer", None)),
+                          ("board_feed", getattr(self, "_board_feed", None)),
                           ("garden", getattr(self, "garden", None))):
             if obj is None:
                 continue
@@ -2885,6 +3176,13 @@ class JarvisApp:
             uncertain_answer=self.uncertain_answer,
             get_option=self.get_option,
             set_option=self.set_option,
+            # The console's ambient / standby surfaces. room_state is called
+            # on the window's EXISTING 5 s off-Tk-thread probe (the one that
+            # already runs nvidia-smi), never on the Tk thread; desk_idle_s
+            # is resolved defensively so it lands whichever way the
+            # desk-presence change merges (jarvis/ui/console_mode.py).
+            room_state=self.room_state,
+            desk_idle_s=getattr(self, "desk_idle_s", None),
         )
 
 

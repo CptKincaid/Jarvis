@@ -78,6 +78,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from jarvis import board as board_mod
 from jarvis import lecture as lecture_mod
 from jarvis import mathspeak
 from jarvis import pronounce, standup
@@ -201,6 +202,14 @@ class IntentClassifier:
         # these words it is the same silent NO the media and study words
         # were before it.
         "syllabus", "syllabi", "due dates", "exam schedule",
+        # --- the Board (2026-08-30) ---
+        # The Tier-1 probe bypasses the gate for the exact phrasings; these
+        # carry the loose ones ("can you bring the board up?", "anything on
+        # the sessions panel?") past the classifier, which would otherwise
+        # read a three-word surface command as background chat -- the same
+        # silent drop the media, study and quiz words each hit in turn.
+        "the board", "board up", "board down", "focus on the", "panel",
+        "mission control",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -3958,6 +3967,108 @@ def _int_setting(c, key: str, default: int) -> int:
         return default
 
 
+# ------------------------------------------------------------------
+# The Board (jarvis/board.py + jarvis/ui/board.py): the docked
+# mission-control panel on the empty right flank of the 4K display.
+# ------------------------------------------------------------------
+# The commander runs on worker threads and must never hold a reference to a
+# Tk surface, so these three reach the window through services.board, whose
+# methods publish a BoardCommand on the bus. "focus on the sessions" is NOT
+# a highlight animation: it resolves to the one-line SPOKEN read of that
+# panel's state, which is the only version of the verb worth having.
+_BOARD_SHOW_RX = re.compile(
+    r"^(?:bring|put|pull)\s+up\s+(?:the\s+)?board\b"
+    r"|^(?:show|open|raise|give)\s+(?:me\s+)?(?:the\s+)?board\b"
+    r"|^board\s+up\b")
+_BOARD_HIDE_RX = re.compile(
+    r"^(?:close|hide|dismiss|kill|drop)\s+(?:the\s+)?board\b"
+    r"|^(?:take|put)\s+(?:the\s+)?board\s+(?:down|away)\b"
+    r"|^board\s+(?:down|off)\b")
+# "focus on the sessions" / "what's on the vitals panel". The panel NAME is
+# resolved by jarvis.board.resolve_panel, not here: the alias table lives
+# beside the panels it names so a new panel cannot be spoken about before
+# it exists.
+_BOARD_FOCUS_RX = re.compile(
+    r"^focus\s+(?:on\s+)?(?:the\s+)?(.+?)(?:\s+panel)?$"
+    r"|^what'?s?\s+on\s+(?:the\s+)?(.+?)\s+panel$"
+    r"|^read\s+(?:me\s+)?(?:the\s+)?(.+?)\s+panel$")
+
+
+def _board_panel_name(text: str) -> str:
+    """The Board panel key a "focus on ..." names, else "".
+
+    Read by TWO callers: the handler below, and the voice-targeting chain in
+    _handle_inner, which owns the word "focus" (TARGET_PATTERN) and would
+    otherwise turn "focus on the sessions" into a window target before any
+    registry entry ran. That chain already carves out the Claude project
+    switch and the pomodoro for the same reason; this is the third."""
+    m = _BOARD_FOCUS_RX.match(str(text or "").strip().lower().rstrip(".!?"))
+    if not m:
+        return ""
+    for group in m.groups():
+        if group:
+            return board_mod.resolve_panel(group)
+    return ""
+
+
+def _board_svc(c):
+    return c._svc("board")
+
+
+def _h_board_show(c, t, m):
+    board = _board_svc(c)
+    if board is None:
+        return None
+    try:
+        already = bool(board.show())
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("board show failed")
+        return CommandResult(handled=True, status="Board",
+                             reply="I couldn't raise the board, sir.",
+                             speak=True)
+    line = "Already up, sir." if already else "The board, sir."
+    return CommandResult(handled=True, reply=line, speak=True, status="Board")
+
+
+def _h_board_hide(c, t, m):
+    board = _board_svc(c)
+    if board is None:
+        return None
+    try:
+        board.hide()
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("board hide failed")
+    return CommandResult(handled=True, reply="Board down, sir.", speak=True,
+                         status="Board")
+
+
+def _h_board_focus(c, t, m):
+    """"Focus on the sessions" -> that panel lights AND he speaks its state.
+
+    Returns None on a name that resolves to no panel, deliberately: "focus
+    on the thesis" is a study session, not a board verb, and the matcher is
+    loose enough to catch it. Falling through leaves it to the registry
+    entries that own those words."""
+    board = _board_svc(c)
+    if board is None:
+        return None
+    name = ""
+    for group in (m.groups() if hasattr(m, "groups") else ()):
+        if group:
+            name = str(group)
+            break
+    if not name:
+        return None
+    try:
+        line = str(board.read(name) or "")
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("board read failed")
+        return None
+    if not line:
+        return None
+    return CommandResult(handled=True, reply=line, speak=True, status="Board")
+
+
 REGISTRY: list[Command] = [
     Command("go back",
             _m_exact("go back", "previous window", "last window"),
@@ -4041,6 +4152,16 @@ REGISTRY: list[Command] = [
     # the ledger reads files, not the live session: no needs=("focus",)
     Command("study total", _STUDY_TOTAL_RX.match, _h_study_total),
     Command("study streak", _STREAK_RX.match, _h_study_streak),
+    # AFTER the focus family, deliberately: "focus session on the thesis"
+    # is a pomodoro and _BOARD_FOCUS_RX is loose enough to claim it. The
+    # board handler also returns None on a name that resolves to no panel,
+    # so an unrelated "focus on ..." still reaches the model.
+    Command("board show", _BOARD_SHOW_RX.match, _h_board_show,
+            needs=("board",)),
+    Command("board hide", _BOARD_HIDE_RX.match, _h_board_hide,
+            needs=("board",)),
+    Command("board focus", _BOARD_FOCUS_RX.match, _h_board_focus,
+            needs=("board",)),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
     Command("list schedule", _LIST_SCHED_RX.match, _h_list_schedule,
@@ -4169,6 +4290,10 @@ ASSISTANT_TIER1: list[Command] = [
                     "review flashcards", "stop quiz",
                     "focus start", "focus left", "focus end", "lecture notes",
                     "study total", "study streak",
+                    # the Board: "bring up the board" is said at the desk
+                    # without a wake-word prefix, like every other surface
+                    # verb, and "focus on the sessions" even more so
+                    "board show", "board hide", "board focus",
                     "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "next exam", "greeting", "day review",
@@ -5994,8 +6119,11 @@ class Commander:
             match = TARGET_PATTERN.match(tl)
             # "switch to the vss project" is a Claude project switch (router
             # action), not a window target; "focus session on the thesis"
-            # is a study session (jarvis/focus.py), not "focus <window>".
-            if match and not _PROJECT_SWITCH_RX.match(tl) and not _m_focus_start(tl):
+            # is a study session (jarvis/focus.py), not "focus <window>";
+            # and "focus on the sessions" names a Board panel, which is the
+            # third thing this chain's bare "focus" would otherwise eat.
+            if match and not _PROJECT_SWITCH_RX.match(tl) \
+                    and not _m_focus_start(tl) and not _board_panel_name(tl):
                 query = match.group(1).strip().rstrip(".")
                 if desktop is not None:
                     desktop.target_window(query)

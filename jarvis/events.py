@@ -312,3 +312,41 @@ class BriefingReady(Event):
     sections: dict = field(default_factory=dict)
     spoken: str = ""
     turn_id: str = ""                 # see JarvisReply.turn_id
+
+
+# ------------------------------------------------------------------
+# The Board and the console's ambient modes (2026-08-30). The Board is a
+# SECOND borderless surface (jarvis/ui/board.py); its state is composed off
+# the Tk thread by jarvis/board.board_state() and published here so the bus
+# does the thread marshalling it exists for.
+# ------------------------------------------------------------------
+@dataclass
+class BoardUpdate(Event):
+    """A fresh Board state from the 5 s poll thread (BoardFeed). `state` is
+    a jarvis.board.BoardState — typed loosely here so events.py keeps its
+    "no imports from feature modules" shape."""
+    state: object = None
+
+
+@dataclass
+class BoardCommand(Event):
+    """A spoken instruction FOR the Board surface: "bring up the board",
+    "close the board", "focus on the sessions".
+
+    A command rather than a fact, deliberately. The commander runs on a
+    worker thread and the app must never hold a reference to the window
+    (CLAUDE.md: modules publish, the window subscribes), so this is the one
+    honest way for a voice command to reach a Tk surface. The SPOKEN read
+    is composed app-side and is not carried here."""
+    action: str = "show"              # show | hide | focus
+    panel: str = ""                   # focus: the resolved panel key
+
+
+@dataclass
+class PowerUp(Event):
+    """First activity at the desk after a long overnight gap: the console
+    (and the Board, when it is up) play the staged population sweep, once a
+    day. Published by the app, which owns the date latch in
+    briefing_state.json — the UI must never decide what day it is."""
+    reason: str = ""                  # presence | hotword
+    gap_h: float = 0.0                # how long the machine was idle

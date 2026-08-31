@@ -64,6 +64,7 @@ from jarvis import perf
 from jarvis.config import CONFIG, MACHINE
 from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            ApprovalRequested, ApprovalResolved, AudioLevel,
+                           BoardCommand, PowerUp,
                            UncertainResolved, UncertainUtterance,
                            BrainState, BriefingReady, ClaudeProgress,
                            ClaudeTaskState, HotwordDetected, JarvisReply,
@@ -72,6 +73,9 @@ from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            Status, Transcribed, UserUtterance, bus)
 from jarvis.logs import get_logger
 from jarvis.ui import theme
+from jarvis.ui.ambient import RoomSlab
+from jarvis.ui.board import BoardWindow, board_enabled
+from jarvis.ui.console_mode import STANDBY, ConsoleModes, resolve_idle_fn
 from jarvis.ui.reactor import Reactor
 from jarvis.ui.views import CommandBar, SettingsDrawer, StatusStrip, \
     TranscriptView
@@ -100,6 +104,7 @@ SESSION_PROBE_MS = 20000     # gap between `tmux ls` probes (2 retries)
 SESSION_PROBE_RETRIES = 2
 ATTACH_POLL_MS = 5000        # `tmux list-clients` while a session exists
 ALARM_TITLES = {"alarm": "ALARM", "timer": "TIMER", "reminder": "REMINDER"}
+DEFAULT_SWEEP_STAGES = 4     # power-up stages when no Board is up to count
 
 
 def resolve_state(speaking: bool, listening: bool, thinking: bool,
@@ -329,6 +334,12 @@ class Services:
     uncertain_answer: Callable = _noop
     get_option: Callable = _noop
     set_option: Callable = _noop
+    # the console's ambient / standby surfaces (jarvis/ui/console_mode.py).
+    # room_state() is called on the window's OFF-Tk-thread 5 s probe and
+    # returns pre-computed strings; desk_idle_s() answers seconds since the
+    # last input at the desk, or None when nothing can see the keyboard.
+    room_state: Optional[Callable] = None
+    desk_idle_s: Optional[Callable] = None
 
 
 # ------------------------------------------------------------------ tray
@@ -616,6 +627,25 @@ class MainWindow:
         self._refresh_pill()
         self._refresh_terminal()
 
+        # Console modes: standby / ambient / power-up as ONE machine (see
+        # jarvis/ui/console_mode.py). Started last so every widget it can
+        # touch already exists.
+        self.board: Optional[BoardWindow] = None
+        self._room_data: dict = {}
+        self._standby_origin = None       # window position before it drifts
+        self._footer_hidden = False
+        self.modes = ConsoleModes(
+            after=self._after,
+            idle_fn=resolve_idle_fn(self.services),
+            on_mode=self._on_console_mode,
+            on_dim=self._on_console_dim,
+            on_drift=self._on_console_drift,
+            on_stage=self._on_console_stage,
+            busy_fn=self._console_busy,
+            alarm_fn=lambda: self._alarm is not None,
+            option=self._console_option)
+        self.modes.start()
+
         threading.Thread(target=self._temps_worker, daemon=True,
                          name="temps-worker").start()
         self._temps_tick()
@@ -848,6 +878,12 @@ class MainWindow:
         self.transcript = TranscriptView(self.shell, toast=self.toast)
         self.transcript.pack(fill="both", expand=True, side="top")
 
+        # The room slab lives OVER the transcript and is place_forget()ten
+        # the instant a turn starts. It is a child of the transcript so its
+        # relwidth/relheight cover exactly that panel — no fractions of the
+        # shell to drift out of step with the layout.
+        self.room = RoomSlab(self.transcript)
+
     def _build_footer(self):
         self.status_strip = StatusStrip(
             self.shell, on_hotword_click=self._toggle_hotword)
@@ -967,6 +1003,19 @@ class MainWindow:
         if self._closing:
             return
         self._closing = True
+        # BEFORE the geometry save: standby's burn-in walk has moved the
+        # window, and saving a drifted position would make the console
+        # creep across the desk one quit at a time.
+        try:
+            self.modes.stop()
+        except Exception:
+            log.exception("console modes stop failed")
+        if self.board is not None:
+            try:
+                self.board.destroy()
+            except Exception:
+                log.exception("board teardown failed")
+            self.board = None
         try:
             CONFIG.update(window_geometry=self.root.geometry())
         except Exception:
@@ -1128,6 +1177,140 @@ class MainWindow:
         return {"asr": self._asr_text, "tts": self._tts_text,
                 "llm": self._llm_text, "dev": self._dev_text}
 
+    # ------------------------------------------------- console modes (7/19/21)
+    def _console_option(self, key: str, default=None):
+        """assistant.json reader for the mode machine. get_option is a
+        no-op on a bare Services, so a missing reader keeps the defaults
+        rather than switching the surfaces off."""
+        fn = getattr(self.services, "get_option", None)
+        if not callable(fn):
+            return default
+        try:
+            value = fn(key)
+        except Exception:                     # noqa: BLE001 - config boundary
+            log.debug("console option %s unreadable", key, exc_info=True)
+            return default
+        return default if value is None else value
+
+    def _console_busy(self) -> bool:
+        """A turn is live — the console stays awake however idle the desk
+        looks. `_recording` covers the mic being open, and the pill's own
+        inputs cover the rest of the turn."""
+        return bool(self._recording or self._speaking or self._thinking)
+
+    def _note_activity(self):
+        """Anything he did reaches the mode machine here, so the surfaces
+        come back inside one frame rather than at the next 4 s tick."""
+        modes = getattr(self, "modes", None)
+        if modes is not None:
+            modes.note_activity()
+
+    def _on_console_mode(self, mode: str):
+        """The console changes surface. Everything here is reversible and
+        is undone by ConsoleModes.stop() at quit."""
+        self.room.set_mode(mode)
+        # The reactor's ONLY standby change: a third of the rotation speed.
+        # Nothing is re-baked — the bases are size-dependent and re-rendering
+        # them at a mode boundary is the churn behind the 08-26 freeze.
+        try:
+            self.reactor.set_speed_scale(1 / 3 if mode == STANDBY else 1)
+        except AttributeError:
+            log.debug("reactor has no speed scale", exc_info=True)
+        self._set_footer_hidden(mode == STANDBY)
+        if mode == STANDBY:
+            if self._standby_origin is None:
+                try:
+                    self._standby_origin = (self.root.winfo_x(),
+                                            self.root.winfo_y())
+                except tk.TclError:
+                    self._standby_origin = None
+        elif self._standby_origin is not None:
+            self._move_to(*self._standby_origin)      # undo the burn-in walk
+            self._standby_origin = None
+
+    def _set_footer_hidden(self, hidden: bool):
+        """Standby hides the command bar and the status strip so the panel
+        is a clock and nothing else. Re-packed in the ORIGINAL order (status
+        strip first, so it stays bottom-most) on the way back."""
+        if hidden == self._footer_hidden:
+            return
+        self._footer_hidden = hidden
+        try:
+            if hidden:
+                self.command_bar.pack_forget()
+                self.status_strip.pack_forget()
+            else:
+                self.status_strip.pack(fill="x", side="bottom")
+                self.command_bar.pack(fill="x", side="bottom")
+        except tk.TclError:
+            log.debug("footer repack on a dead window", exc_info=True)
+
+    def _on_console_dim(self, factor: float):
+        """Dimming is a canvas-colour blend inside our own window — never
+        xrandr. The baked avatar frames are deliberately untouched."""
+        self.room.set_dim(factor)
+
+    def _on_console_drift(self, dx: int, dy: int):
+        """Burn-in walk: move the WHOLE window, which drifts the brightest
+        thing on the panel (the reactor disc) without re-rendering anything.
+        Drifting inside the canvas would tear the reactor's art away from
+        its decor, which is baked at fixed coordinates."""
+        if self._standby_origin is None:
+            return
+        self._move_to(self._standby_origin[0] + dx,
+                      self._standby_origin[1] + dy)
+
+    def _move_to(self, x: int, y: int):
+        try:
+            self.root.geometry(f"+{int(x)}+{int(y)}")
+        except tk.TclError:
+            log.debug("move on a dead window", exc_info=True)
+
+    def _on_console_stage(self, count):
+        """Power-up: the panels draw in one at a time, on the Board when it
+        is up and on the room slab either way."""
+        self.room.set_reveal(count)
+        if self.board is not None:
+            self.board.reveal(count)
+
+    def _ev_power_up(self, ev: PowerUp):
+        """First activity of the day after the overnight gap. The app owns
+        the date latch (briefing_state.json), so by the time this arrives
+        the sweep is already spent for today."""
+        panels = self.board.panel_count if self.board is not None else 0
+        log.info("power-up (%s, %.1f h idle)", ev.reason, ev.gap_h)
+        # With no Board up the sweep still plays over the room slab's rows,
+        # which is why proposal 19 degrades gracefully instead of going dark
+        self.modes.power_up(panels or DEFAULT_SWEEP_STAGES)
+
+    # ------------------------------------------------------------- the Board
+    def _ensure_board(self) -> Optional[BoardWindow]:
+        """Build the Board once, on first use. Never rebuilt: creating and
+        destroying toplevels on :1 is the window churn that froze the
+        desktop on 2026-08-26."""
+        if self.board is not None:
+            return self.board
+        if not board_enabled(getattr(self.services, "get_option", None)):
+            log.info("board disabled by console.board")
+            return None
+        try:
+            self.board = BoardWindow(self.root, console_w=self.root.winfo_width())
+        except tk.TclError:
+            log.exception("board window could not be built")
+            self.board = None
+        return self.board
+
+    def _ev_board(self, ev: BoardCommand):
+        board = self._ensure_board()
+        if board is None:
+            return
+        if ev.action == "show":
+            board.show()
+        elif ev.action == "hide":
+            board.hide()
+        elif ev.action == "focus":
+            board.highlight(ev.panel)
+
     # ------------------------------------------------------ subscriptions
     def _subscribe(self):
         bus.subscribe(Status, self._ev_status)
@@ -1155,6 +1338,9 @@ class MainWindow:
         bus.subscribe(AlarmFired, self._ev_alarm)
         bus.subscribe(AlarmStopped, self._ev_alarm_stopped)
         bus.subscribe(BriefingReady, self._ev_briefing)
+        # the console's second surface and its power-up choreography
+        bus.subscribe(BoardCommand, self._ev_board)
+        bus.subscribe(PowerUp, self._ev_power_up)
 
     def _ev_status(self, ev: Status):
         self.set_status(ev.text, ev.kind)
@@ -1181,6 +1367,7 @@ class MainWindow:
         conf = self._last_confidence if ev.source == "voice" else None
         self._last_confidence = None
         self._utter_ts = time.monotonic()         # RTT measurement start
+        self._note_activity()
         self.transcript.add_user(ev.text, confidence=conf)
 
     def _take_rtt(self):
@@ -1224,12 +1411,14 @@ class MainWindow:
 
     def _ev_hotword(self, ev: HotwordDetected):
         self.set_status(f"Wake word ({ev.score:.2f})", "ok")
+        self._note_activity()
 
     def _ev_reminder(self, ev: ReminderFired):
         self.toast.show(f"Reminder: {ev.text}", kind="warn", ms=6000)
         self.transcript.add_jarvis(f"Reminder: {ev.text}")
 
     def _ev_rec_start(self, _ev: RecordingStarted):
+        self._note_activity()
         self._recording = True
         self.command_bar.set_mic_state("recording")
         self.tray.update_state(True)
@@ -1425,8 +1614,24 @@ class MainWindow:
             self._mem_text = self._read_mem()
             if beat % 6 == 0:
                 self._probe_llm()
+            self._probe_room()
             beat += 1
             time.sleep(5)
+
+    def _probe_room(self):
+        """Room facts for the ambient / standby slab, on THIS thread.
+
+        Reusing the existing 5 s probe rather than adding a second one is
+        the whole reason the slab is affordable: services.room_state() gates
+        its own Spotify call and reads an already-cached forecast, but it is
+        still not something to do on the Tk thread."""
+        fn = getattr(self.services, "room_state", None)
+        if not callable(fn):
+            return
+        try:
+            self._room_data = dict(fn() or {})
+        except Exception:                     # noqa: BLE001 - provider boundary
+            log.debug("room state probe failed", exc_info=True)
 
     def _probe_devices(self):
         """One-time GPU inventory (worker thread) for the engine card's
@@ -1542,6 +1747,8 @@ class MainWindow:
         perf.mark("temps_tick")
         self.status_strip.set_temps(self._temps_text)
         self.status_strip.set_memory(self._mem_text)
+        # the worker writes a plain dict; this is where it reaches a widget
+        self.room.set_room(self._room_data)
         try:
             self.root.after(2500, self._temps_tick)
         except tk.TclError:
