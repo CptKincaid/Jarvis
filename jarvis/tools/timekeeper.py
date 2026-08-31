@@ -80,7 +80,9 @@ MAX_INTERVAL_MIN = 24 * 60
 _INTERVAL_RX = re.compile(r"^(\d{1,4})m$")
 # Its fired line carries kind="nudge" so quiet.py can EXPIRE it while held:
 # a stand-up nudge read back after a two-hour meeting is noise, and five of
-# them is worse.
+# them is worse. NOT the same "nudge" as JarvisApp._nudge (the "Sir?" cue
+# after a wake word that heard nothing) -- that one is non-proactive and
+# never reaches the quiet gate at all.
 NUDGE_KIND = "nudge"
 
 # Persona lines (spec 3.4) — fixed strings the app prewarms.

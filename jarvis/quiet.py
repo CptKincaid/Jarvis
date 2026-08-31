@@ -72,6 +72,8 @@ FREE_LINE = "Very good, sir."
 # A kind that is only worth hearing AT its moment. A stand-up nudge read
 # back after a two-hour meeting is noise, and a 45-minute water nudge held
 # through a three-hour block would arrive five deep. Held -> expired.
+# "nudge" here is an interval reminder (timekeeper.NUDGE_KIND), not the
+# app's "Sir?" cue -- that one is an answer and never reaches this gate.
 EPHEMERAL_KINDS = ("nudge",)
 
 _KIND_NOUNS = {
