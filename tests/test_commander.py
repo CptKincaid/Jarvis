@@ -1507,6 +1507,7 @@ TIER1_SAMPLES = {
     "garden report": "memory report",
     "garden undo": "forget the last garden pass",
     "last seen": "when did i last talk to my advisor",
+    "register": "formal mode",
     "todo done": "mark buy milk as done",
     "todo add": "add buy milk to my todo list",
     "todo list": "what's on my todo list",

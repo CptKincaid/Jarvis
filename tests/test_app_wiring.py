@@ -1273,11 +1273,22 @@ def test_the_app_report_is_built_from_real_sources(build, tmp_path, monkeypatch)
     (tmp_path / "turns.jsonl").write_text(
         '{"outcome": "audio", "wait": 1.3, "at": %f}\n{"outcome": "audio", "wait": 2.1, "at": %f}\n'
         % (__import__("time").time(), __import__("time").time()))
+    state = app.self_state()
+    assert state["turns_today"] == 2 and round(state["median_wait"], 2) == 1.7
+    assert state["gpu_temp_c"] == 41 and state["gpu_mhz"] == 2418
+    assert state["gpu_util_pct"] == 2
+
     text = app.diagnostics_text()
-    assert text.startswith("All systems nominal, sir.")
+    # "All systems nominal, sir." is gone: brain.VOICE_RULES bans the
+    # phrase "all systems", and app.py hardcoded it anyway.
+    assert "all systems" not in text.lower()
+    assert text.startswith("Everything's where I left it, sir.")
     assert "2 turns today, median wait 1.7 seconds" in text
     assert "Memory 41 of 121 gigabytes free" in text
-    assert "GPU at 41" in text
+    # the clock is the wedge tell, not the draw: 611 MHz vs 2400 MHz is a
+    # 4x hit while idle power reads ~15 W in both states
+    assert "GPU at 41 degrees, 2418 megahertz, 2 percent busy" in text
+    assert "power" not in text.lower() and "watt" not in text.lower()
 
 
 def test_the_app_shows_but_does_not_respeak_a_streamed_reply(build, monkeypatch):
