@@ -45,11 +45,11 @@ import json
 import os
 import threading
 import time
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 
-from datetime import date, datetime, timedelta
-
+from jarvis import music
 from jarvis.events import ReminderFired, bus
 from jarvis.logs import get_logger
 from jarvis.tools.timekeeper import NO_TIMEKEEPER_LINE, SILENT_PREFIX, count_words
@@ -471,25 +471,20 @@ class FocusSession:
         st = self.state
 
         def run():
-            try:
-                if method == "play":
-                    spotify.play(arg, "playlist")
-                else:
-                    spotify.control(arg)
+            # The call itself lives in jarvis/music.py so the class stager
+            # can pause and resume the same way; what is session-shaped --
+            # the write-back and "stop retrying" -- stays here.
+            ok, kind = music.call(spotify, method, arg)
+            if ok:
                 with self._lock:
                     if self.state is st:
                         self.state["music_did"] = remember
                         self._save()
-                log.info("focus: spotify %s %r ok", method, arg)
-            except Exception as exc:       # noqa: BLE001 - SpotifyError or worse
-                kind = getattr(exc, "kind", "")
-                log.info("focus: spotify %s %r skipped: %s", method, arg,
-                         getattr(exc, "text", exc))
-                if kind in ("setup", "auth", "premium"):
-                    with self._lock:
-                        if self.state is st:
-                            self.state["music_off"] = True   # not worth retrying this session
-                            self._save()
+            elif music.permanent(kind):
+                with self._lock:
+                    if self.state is st:
+                        self.state["music_off"] = True   # not worth retrying this session
+                        self._save()
 
         self._bg(run)
 

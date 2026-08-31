@@ -1033,6 +1033,17 @@ class SpotifyTool:
         text = f"{line} {pos} of {dur}" + (f", album {album}." if album else ".")
         return ToolResult(text=text, speak=line)
 
+    def playback_state(self) -> str:
+        """"playing" / "paused" / "idle" — the one machine-readable read of
+        what the speakers are doing. ``now_playing`` answers a sentence, and
+        a caller that must decide whether pausing is worth doing (the class
+        stager, which has to know whether it owes a resume) cannot parse
+        prose. Raises SpotifyError like every other call here."""
+        pb = self._api("current_playback", additional_types="track,episode") or {}
+        if not pb.get("item"):
+            return "idle"
+        return "playing" if pb.get("is_playing") else "paused"
+
     def control(self, action: Any = "", value: Any = None, device: Any = None) -> ToolResult:
         act = _norm(action).replace(" ", "_")
         aliases = {"play": "resume", "unpause": "resume", "continue": "resume",
