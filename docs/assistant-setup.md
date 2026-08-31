@@ -1354,3 +1354,34 @@ records what it moved before it moves it and heals it later — even a librespot
 the following day. When Spotify is playing on your phone or another Connect device there
 is no local stream to duck, and the mixer stands down silently rather than pretending to
 work.
+
+### The first word, and the soundbar that went to sleep
+
+One thing the mixer deliberately does **not** do is keep the Bluetooth link warm. On this
+box WirePlumber suspends an idle node after three seconds
+(`/usr/share/wireplumber/main.lua.d/90-enable-all.lua` loads `suspend-node.lua`), so if
+the room has been quiet for a while the soundbar's A2DP link has to resume before the
+first syllable comes out — and that resume eats the front of the word.
+
+The tempting fix is a silent keepalive stream, and it is the wrong one: a stream that
+plays forever is a stream the mixer then has to exempt from itself, and it holds the
+radio open all night for nothing. The right fix is a WirePlumber drop-in, which is a
+change to **your** session rather than to Jarvis, so Jarvis does not write it for you —
+run it yourself, once (verified present and unprivileged here: WirePlumber 0.4.17, and
+`~/.config/wireplumber/bluetooth.lua.d/` already exists):
+
+```
+mkdir -p ~/.config/wireplumber/bluetooth.lua.d
+cat > ~/.config/wireplumber/bluetooth.lua.d/51-no-suspend.lua <<'LUA'
+table.insert(bluez_monitor.rules, {
+  matches = {{{ "node.name", "matches", "bluez_output.*" }}},
+  apply_properties = { ["session.suspend-timeout-seconds"] = 0 },
+})
+LUA
+systemctl --user restart wireplumber
+```
+
+The cost is honest: the soundbar's radio stays awake, so it will idle a little warmer and
+a battery-powered speaker would drain. Undo it by deleting that one file and restarting
+wireplumber again. Nothing in Jarvis depends on it — without it his first word is
+occasionally clipped after a long silence, and that is all.
