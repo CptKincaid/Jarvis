@@ -522,6 +522,28 @@ def strip_jarvis_prefix(text: str) -> Optional[str]:
     return None
 
 
+# Two commands in one breath ("set a timer for ten minutes and add milk to
+# my to-dos"). The conjunctions are the ones _try_desktop has chained on
+# since the monolith; one regex for both so the splitters cannot drift.
+_CHAIN_SPLIT_RX = re.compile(r"\s+and then\s+|\s+then\s+|\s+and\s+|,\s*", re.I)
+MAX_CLAUSES = 2
+
+
+def split_clauses(text: str) -> list:
+    """The halves of a compound utterance, or [].
+
+    EXACTLY two, and only for a caller that has already failed to match the
+    whole utterance. A three-way split is far more often one command with a
+    list in its body ("add milk, eggs and bread to my to-dos") than three
+    commands, and refusing costs nothing: the model still answers.
+    """
+    parts = [p.strip(" ,.!?") for p in _CHAIN_SPLIT_RX.split(text or "")]
+    parts = [p for p in parts if p]
+    if len(parts) != MAX_CLAUSES:
+        return []
+    return [strip_jarvis_prefix(p) or p for p in parts]
+
+
 # ------------------------------------------------------------------
 # Command result + registry types
 # ------------------------------------------------------------------
@@ -3986,6 +4008,11 @@ class Commander:
             res = self._try_registry(cmd_text)
             if res is not None:
                 return res
+            # 3'. The same table again, per clause, for a compound ask.
+            #     After the whole-utterance attempt, never before it.
+            res = self._try_multi(cmd_text, self._try_registry)
+            if res is not None:
+                return res
 
         # 4. Intent classification — voice only; typed text is deliberate
         #    (2642-2653). "discord" and any other channel count as typed,
@@ -4004,6 +4031,11 @@ class Commander:
         #    vocabulary patches of 08-27 and 08-30 each fixed once.
         if gate and source == "voice" and cmd_text is None:
             name = self._match_assistant(text)
+            # A compound of two Tier-1 commands is addressed to Jarvis for
+            # the same reason each half is: without this the classifier
+            # calls the pair background chat and drops it in silence.
+            if not name and self._multi_match(text):
+                name = "multi-intent"
             if name:
                 log.info("tier-1 match %r bypasses the intent gate: %r",
                          name, text)
@@ -4283,7 +4315,7 @@ class Commander:
             return False
 
         # Split on "and then", "then", "and", commas for chained commands
-        parts = re.split(r"\s+and then\s+|\s+then\s+|\s+and\s+|,\s*", cmd_text)
+        parts = _CHAIN_SPLIT_RX.split(cmd_text)
         parts = [p.strip() for p in parts if p.strip()]
         if not parts:
             return False
@@ -4696,6 +4728,66 @@ class Commander:
         return CommandResult(handled=True, reply=WEB_LOOKUP_LINE, speak=True,
                              ack=True, status="Looking it up…", done=False)
 
+    def _try_multi(self, text: str, run_one) -> Optional[CommandResult]:
+        """Two Tier-1 commands in one utterance.
+
+        Called ONLY after the whole utterance failed to match, and that
+        ordering is the whole safety argument: "remind me to buy milk and
+        eggs" matches _REMIND_RX whole, so its body is never split. What
+        reaches here already had no meaning as one command.
+
+        Every clause must match a Tier-1 command on its own or nothing runs
+        and the compound goes to the model untouched -- half an answer is
+        worse than none, and a clause that is really part of one thought
+        ("...and eggs") matches nothing, which is what keeps this honest.
+        """
+        parts = self._multi_match(text)
+        if not parts:
+            return None
+        # Each clause is its own turn for the handlers that re-read the raw
+        # utterance (_h_remind_me, _h_lecture_start): left whole, _REMIND_RX
+        # would re-match the compound and take the other clause as the body.
+        raw = getattr(self, "_raw_text", "")
+        results = []
+        try:
+            for part in parts:
+                self._raw_text = part
+                try:
+                    res = run_one(part)
+                except Exception:
+                    log.exception("multi-intent: clause %r failed", part)
+                    res = None
+                if res is None or not res.handled:
+                    log.warning("multi-intent: clause %r matched but did "
+                                "nothing", part)
+                    continue
+                results.append(res)
+        finally:
+            self._raw_text = raw
+        if not results:
+            return None
+        log.info("multi-intent: %d of %d clauses ran for %r",
+                 len(results), len(parts), text)
+        replies = [str(r.reply).strip() for r in results if r.reply]
+        statuses = [r.status for r in results if r.status]
+        return CommandResult(
+            handled=True,
+            reply=" ".join(replies) or None,
+            speak=any(r.speak for r in results),
+            status=" + ".join(statuses) or None,
+            # one follow-up window for the pair: it opens once the last
+            # clause is done
+            done=all(r.done for r in results),
+            ack=any(r.ack for r in results))
+
+    def _multi_match(self, text: str) -> list:
+        """The clauses of a compound whose EVERY half is a Tier-1 command
+        on its own, else []. A probe: no handler runs."""
+        parts = split_clauses(text)
+        if parts and all(self._match_assistant(p) for p in parts):
+            return parts
+        return []
+
     def _match_assistant(self, text: str) -> Optional[str]:
         """The name of the ASSISTANT_TIER1 command whose matcher accepts
         the bare utterance, else None. A probe only -- no handler runs, no
@@ -5007,6 +5099,11 @@ class Commander:
                         return res
             # Assistant Tier 1 (timers, reminders, alarms, notes, briefing).
             res = self._try_assistant(text)
+            if res is not None:
+                return res
+            # ... then the same rung per clause for a compound ask, which
+            # the model would otherwise answer half of.
+            res = self._try_multi(text, self._try_assistant)
             if res is not None:
                 return res
             # Router: local model / Claude / one question / session action.

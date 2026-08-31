@@ -1357,3 +1357,30 @@ The yes rides the follow-up window, which is 15 s while a read-back is open
 `read_back: false` turns off every read-back, the bulk cancels included.
 Raise `shaky_logprob` toward 0 to be asked more often, lower it (-0.9) to be
 asked only when the transcript is nearly garbled.
+
+## 43. Two things at once
+
+Tier-1 commands can be chained in one utterance, on the same conjunctions
+desktop chains have always used — "and then", "then", "and", a comma:
+
+```
+you    "set a timer for ten minutes and add milk to my todo list"
+jarvis "10 minutes, sir; I'll let you know. Added to your list, sir."
+```
+
+Both halves run, the replies are spoken as one, and the mic re-opens once.
+
+The rules, which are deliberately strict:
+
+- **The whole utterance is tried first.** Only if it means nothing as one
+  command is it split. This is what protects a body that contains "and" —
+  "remind me at 5 pm to buy milk and eggs" is one errand, always.
+- **Two halves, no more.** "add milk, eggs and bread to my todo list" is a
+  list, not three commands, so a three-way split is refused outright.
+- **Both halves must be Tier-1 commands** (timers, alarms, reminders,
+  to-dos, notes, focus, briefings — the ones answered without the model).
+  "set a timer for ten minutes and call my mother" runs neither and goes to
+  the model whole: half an answer is worse than none.
+
+Nothing to configure. If a pair you expect is not chaining, say each half
+on its own first — if either one needs the model, the pair will too.
