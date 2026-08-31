@@ -285,7 +285,7 @@ def test_build_briefing_sections_and_fact_sheet(tmp_path):
     assert sections == {
         "weather": "72°F and partly cloudy, high 85, low 64, 10% chance of rain.",
         "calendar": ["Today: 10:00 am dentist for an hour, 2:30 pm standup; nothing else."],
-        "due": [], "exam": "",
+        "due": [], "exam": "", "study": "",
         "news": [
             {"title": "AWS Acquires DuckLabs", "source": "Hacker News"},
             {"title": "Nvidia is about to be a hundred-billion-dollar company", "source": "The Verge"},
@@ -338,7 +338,7 @@ def test_build_briefing_degrades_per_section(tmp_path):
     ]
     # no registry at all, every feed down -> everything unavailable, never raises
     sections, sheet = build_briefing(Cfg(), None, FakeFetch({}), NOW, tmp_path / "n2.json")
-    assert sections == {"weather": "", "calendar": [], "due": [], "exam": "",
+    assert sections == {"weather": "", "calendar": [], "due": [], "exam": "", "study": "",
                         "news": [], "sports": [], "stocks": []}
     assert sheet.splitlines()[1:] == ["Weather: not available", "Calendar: not available",
                                       "News: unavailable"]

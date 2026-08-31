@@ -1689,9 +1689,23 @@ class JarvisApp:
             digest = reviewer.review(day)
         else:
             digest = dayreview_mod.summarize_day(PATHS.LOG_DIR / "jarvis.log",
-                                                 PATHS.LOG_DIR / "turns.jsonl", day)
+                                                 PATHS.LOG_DIR / "turns.jsonl", day,
+                                                 study=self._study_table())
         name = "sir"
         return dayreview_mod.spoken_line(digest, label=label, name=name)
+
+    def _study_table(self) -> dict:
+        """focus.study_days() over the live paths, or {} -- the day review
+        and the "how much did I study" answer share this one reader."""
+        try:
+            from jarvis import focus as focus_mod
+            tk = getattr(self.services, "timekeeper", None)
+            return focus_mod.study_days(
+                state_path=PATHS.MEMORY_DIR / "focus_session.json",
+                db_path=getattr(tk, "db_path", None))
+        except Exception:                    # noqa: BLE001 - source boundary
+            log.debug("study ledger unreadable", exc_info=True)
+            return {}
 
     def day_review_text(self, which="yesterday") -> str:
         """"How did yesterday go" / "how is today going": the spoken review."""
@@ -1699,7 +1713,8 @@ class JarvisApp:
         if str(which).lower() == "today":
             # today is still open: never read from a filed digest
             digest = dayreview_mod.summarize_day(PATHS.LOG_DIR / "jarvis.log",
-                                                 PATHS.LOG_DIR / "turns.jsonl", today)
+                                                 PATHS.LOG_DIR / "turns.jsonl", today,
+                                                 study=self._study_table())
             line = dayreview_mod.spoken_line(digest, label="So far today")
             return line or "Nothing to report yet today, sir."
         line = self._review_line(today - timedelta(days=1), label="Yesterday")
@@ -2294,7 +2309,8 @@ class JarvisApp:
             # channel is configured (dayreview.py).
             self.dayreviewer = dayreview_mod.DayReviewer(
                 PATHS.LOG_DIR / "jarvis.log", PATHS.LOG_DIR / "turns.jsonl",
-                PATHS.REVIEWS_DIR, on_filed=self._on_review_filed)
+                PATHS.REVIEWS_DIR, on_filed=self._on_review_filed,
+                study=self._study_table)
             self.dayreviewer.start()
         except Exception:
             log.exception("day reviewer failed to start")

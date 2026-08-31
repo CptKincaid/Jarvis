@@ -566,6 +566,22 @@ class DocsIndex:
         return out
 
 
+def _heading_rx(topic: str):
+    """A regex matching the "chapter N" heading the topic names, or None.
+
+    Shared by topic_chunks and course_chunks so a scoped ask ("teach me
+    chapter three of biosensors") starts at the same heading an unscoped
+    one would."""
+    heading = _CHAPTER_RX.search(topic or "")
+    if not heading:
+        return None
+    num = _NUMBER_WORDS.get(heading.group(2).lower(), heading.group(2))
+    words = {v: k_ for k_, v in _NUMBER_WORDS.items()}.get(num, "")
+    return re.compile(r"\b%s\s*(?:%s%s)\b" % (
+        r"(?:chapter|chap\.?|section|unit|lecture|week|module|part|lab)",
+        re.escape(num), f"|{words}" if words else ""), re.I)
+
+
 def topic_chunks(index: DocsIndex, topic: str, k: int = 6) -> list[dict]:
     """Chunks to study for a spoken topic, in reading order.
 
@@ -580,14 +596,7 @@ def topic_chunks(index: DocsIndex, topic: str, k: int = 6) -> list[dict]:
     if not topic:
         return []
     k = max(1, int(k))
-    heading = _CHAPTER_RX.search(topic)
-    head_rx = None
-    if heading:
-        num = _NUMBER_WORDS.get(heading.group(2).lower(), heading.group(2))
-        words = {v: k_ for k_, v in _NUMBER_WORDS.items()}.get(num, "")
-        head_rx = re.compile(r"\b%s\s*(?:%s%s)\b" % (
-            r"(?:chapter|chap\.?|section|unit|lecture|week|module|part|lab)",
-            re.escape(num), f"|{words}" if words else ""), re.I)
+    head_rx = _heading_rx(topic)
 
     def _from_heading(chunks: list[dict]) -> list[dict]:
         if head_rx is None:
@@ -618,6 +627,117 @@ def topic_chunks(index: DocsIndex, topic: str, k: int = 6) -> list[dict]:
     hits = [h for h in index.query(topic, k=k) if h["score"] >= MIN_TOPIC_SCORE]
     hits.sort(key=lambda h: (h["name"], h["chunk"]))
     return hits
+
+
+# "Week four of signals and systems" and "electrode transducers in
+# biosensors" name a topic AND a course, and only the tail is the course.
+# The tail after one of these words is tried as a course name in its own
+# right, which is what makes the no-Canvas path work at all: resolve_course
+# hands the spoken words straight back, so the whole utterance would have
+# to slugify to a file stem, and it never does.
+_COURSE_TAIL_RX = re.compile(r"\b(?:of|in|for|from|on|about)\b", re.I)
+MAX_COURSE_CANDIDATES = 3          # each one may cost a (cached) roster lookup
+MIN_COURSE_SLUG = 3                # a two-letter slug matches half the folder
+
+
+def _course_candidates(topic: str) -> list[str]:
+    """Readings of the topic that could name a course, longest first: the
+    whole thing, then each tail after "of" / "in" / "for" / ..."""
+    out = [topic]
+    for m in _COURSE_TAIL_RX.finditer(topic):
+        tail = topic[m.end():].strip()
+        if tail and tail not in out:
+            out.append(tail)
+    return out[:MAX_COURSE_CANDIDATES]
+
+
+def _slug_files(names: list[str], slug: str) -> list[str]:
+    """The indexed file names whose stem carries ``slug`` as a whole token.
+
+    Whole-token, not substring: the slug "physics" must find
+    "physics-2026-08-29.md" and "physics_notes.txt" without "cs" finding
+    every file in the folder."""
+    if len(slug) < MIN_COURSE_SLUG:
+        return []
+    rx = re.compile(r"(?:^|[^a-z0-9])%s(?:[^a-z0-9]|$)" % re.escape(slug))
+    out = []
+    for name in names:
+        stem = re.sub(r"[^a-z0-9]+", "-", Path(name).stem.lower())
+        if rx.search(stem):
+            out.append(name)
+    return out
+
+
+def course_chunks(index: DocsIndex, cfg, topic: str, k: int = 6) -> list[dict]:
+    """Chunks for a spoken topic, scoped to ONE course when it names one.
+
+    topic_chunks' last leg is a global embedding query, so "quiz me on
+    biosensors" can and does pull nearest-neighbour chunks out of another
+    course's PDF -- questions about the wrong subject, and a flashcard
+    filed under the wrong topic. Lecture notes are already written as
+    ``<course-slug>-<YYYY-MM-DD>.md`` (jarvis/lecture.py), so when the
+    topic resolves to a course on the Canvas roster -- or, with no token,
+    just slugifies to something a file stem carries -- only that course's
+    files are read, in reading order, and no embedding call is made.
+
+    Falls back to ``topic_chunks`` when the topic names no course, when
+    the course has no indexed file (a PDF saved under its original name is
+    not slug-matchable: real coverage is notes-first, global-second), or
+    when the named chapter is not in the scoped files."""
+    topic = " ".join(str(topic or "").split())
+    if not topic:
+        return []
+    k = max(1, int(k))
+    hits = _course_only_chunks(index, cfg, topic, k)
+    return hits if hits else topic_chunks(index, topic, k=k)
+
+
+def _course_only_chunks(index: DocsIndex, cfg, topic: str, k: int) -> list[dict]:
+    """The scoped leg of course_chunks; [] when the topic names no course
+    this index has a file for. Never raises -- the roster lookup crosses
+    the network and the caller must still get its fallback."""
+    from jarvis.lecture import resolve_course, slugify
+    try:
+        names = index.names()
+    except Exception:                          # noqa: BLE001 - store boundary
+        log.exception("course_chunks: index names unreadable")
+        return []
+    if not names:
+        return []
+    files: list[str] = []
+    for spoken in _course_candidates(topic):
+        # Two readings of each candidate: the roster name Canvas gives
+        # back, and the words as said (all resolve_course returns with no
+        # token set). Longest candidate first, so "electrode transducers
+        # in biosensors" prefers a course actually called that.
+        slugs = []
+        try:
+            slugs.append(slugify(resolve_course(cfg, spoken)))
+        except Exception:                      # noqa: BLE001 - network boundary
+            log.debug("course_chunks: roster lookup failed", exc_info=True)
+        slugs.append(slugify(spoken))
+        for slug in slugs:
+            files = _slug_files(names, slug)
+            if files:
+                log.info("course_chunks: %r scoped to %d file(s) by slug %r",
+                         topic, len(files), slug)
+                break
+        if files:
+            break
+    if not files:
+        return []
+    head_rx = _heading_rx(topic)
+    chunks: list[dict] = []
+    for name in sorted(files):
+        chunks.extend(index.chunks_of(name))
+    if head_rx is None:
+        return chunks[:k]
+    for i, h in enumerate(chunks):
+        if head_rx.search(h["text"]):
+            return chunks[i:i + k]
+    # The course is right but the chapter is not in its files: a scoped
+    # answer about the wrong chapter is worse than the global search.
+    return []
 
 
 def fact_sheet(hits: list[dict]) -> str:

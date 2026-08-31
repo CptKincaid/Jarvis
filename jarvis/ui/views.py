@@ -210,6 +210,9 @@ def briefing_rows(sections) -> list:
     exam = str(s.get("exam") or "").strip()
     if exam:
         rows.append(("EXAM", exam))
+    study = str(s.get("study") or "").strip()
+    if study:
+        rows.append(("STUDY", study))
     items = []
     for item in (s.get("news") or [])[:3]:
         if isinstance(item, dict):

@@ -24,6 +24,15 @@ the path): phase, block number, the item ids, what was done to the music.
 `reconcile()` at boot -- after Timekeeper.start(), whose catch-up may have
 fired a block that came due while the app was down -- closes a session
 whose current item is no longer pending and says how many blocks were done.
+
+That file is OVERWRITTEN by the next session, so the count used to be
+spoken once and lost. `focus_history.jsonl` beside it is the durable half:
+one JSON line per finished session, appended by `end()` and keyed on the
+session's `started` stamp so the boot-time lapsed path cannot double-count
+it. `study_days()` reads that ledger AND the timekeeper's own `focus:
+block N` rows (which are never pruned) and merges them, so blocks from
+before this ledger existed -- or from a session the app died in -- still
+count. It is what "how much did I study this week" answers from.
 """
 from __future__ import annotations
 
@@ -34,9 +43,11 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from datetime import date, datetime, timedelta
+
 from jarvis.events import ReminderFired, bus
 from jarvis.logs import get_logger
-from jarvis.tools.timekeeper import NO_TIMEKEEPER_LINE, count_words
+from jarvis.tools.timekeeper import NO_TIMEKEEPER_LINE, SILENT_PREFIX, count_words
 
 log = get_logger("focus")
 
@@ -64,7 +75,19 @@ NO_SESSION_LINE = "There's no session running, sir."
 ALREADY_LINE = "You're already in a session, sir; {left} left in block {n}."
 ALREADY_BREAK_LINE = "You're on a break, sir; {left} left."
 
-PERSONA_LINES = [HALFWAY_LINE, END_NONE_LINE, NO_SESSION_LINE]
+# ------------------------------------------------------------- the ledger
+HISTORY_NAME = "focus_history.jsonl"
+# A block item is labelled "focus: block N" (timekeeper.add_silent_timer);
+# "halfway" and "break" items share the prefix and must not be counted.
+BLOCK_LABEL_LIKE = f"{SILENT_PREFIX} block%"
+HISTORY_TAIL_BYTES = 256_000       # enough tail to dedupe against; not the whole file
+NO_STUDY_LINE = "You haven't logged any study {when}, sir."
+STUDY_TOTAL_LINE = "{time} {when}, sir, over {blocks} on {days}."
+STREAK_LINE = "{n} days running, sir."
+STREAK_ONE_LINE = "Today, sir; that's the start of one."
+STREAK_NONE_LINE = "No streak at the moment, sir."
+
+PERSONA_LINES = [HALFWAY_LINE, END_NONE_LINE, NO_SESSION_LINE, STREAK_NONE_LINE]
 
 
 def _cfg_get(cfg, key: str, default=None):
@@ -103,6 +126,177 @@ def left_words(seconds: float) -> str:
 def blocks_words(n: int) -> str:
     n = int(n)
     return f"{count_words(n)} block{'' if n == 1 else 's'}"
+
+
+def history_path(state_path) -> Optional[Path]:
+    """The ledger beside the session-state file, or None with no state
+    path (a bare test session keeps no history)."""
+    return Path(state_path).with_name(HISTORY_NAME) if state_path else None
+
+
+def read_history(path) -> list[dict]:
+    """Every well-formed ledger row in the file; [] when it is missing."""
+    try:
+        return read_history_text(Path(path).read_text())
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def read_history_text(text: str) -> list[dict]:
+    """Rows from ledger text. A half-written or hand-mangled line is
+    SKIPPED rather than raising: this file is read to answer a question,
+    and one bad line must not make the whole feature go silent. It is also
+    how the tail read in _log_history tolerates starting mid-line."""
+    out: list[dict] = []
+    for line in str(text or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and row.get("started") is not None:
+            out.append(row)
+    return out
+
+
+def timekeeper_blocks(db_path) -> list[dict]:
+    """[{when, minutes}] for every finished focus BLOCK the timekeeper
+    still holds. Read-only, its own connection, and every failure is an
+    empty list: this is a bonus source, not the ledger.
+
+    The block's length is (due - created), which is exactly what
+    _file_block asked for -- no guess at block_min is needed."""
+    import sqlite3
+    out: list[dict] = []
+    try:
+        if not Path(db_path).exists():
+            return out
+        db = sqlite3.connect(f"file:{Path(db_path)}?mode=ro", uri=True, timeout=2.0)
+    except (sqlite3.Error, OSError, TypeError, ValueError):
+        log.debug("focus: timekeeper history unreadable", exc_info=True)
+        return out
+    try:
+        rows = db.execute(
+            "SELECT fired_at, due, created FROM items WHERE state = 'done' "
+            "AND kind = 'timer' AND lower(label) LIKE ?", (BLOCK_LABEL_LIKE,)).fetchall()
+    except sqlite3.Error:
+        log.debug("focus: timekeeper history query failed", exc_info=True)
+        rows = []
+    finally:
+        db.close()
+    for fired, due, created in rows:
+        try:
+            when = float(fired if fired is not None else due)
+            minutes = int(round((float(due) - float(created)) / 60.0))
+        except (TypeError, ValueError):
+            continue
+        if when > 0 and 0 < minutes <= 600:
+            out.append({"when": when, "minutes": minutes})
+    return out
+
+
+def _day(ts: float) -> str:
+    return datetime.fromtimestamp(float(ts)).date().isoformat()
+
+
+def study_days(state_path=None, db_path=None, rows=None, blocks=None) -> dict:
+    """{"YYYY-MM-DD": {"blocks": n, "minutes": m}} from the ledger plus any
+    timekeeper block the ledger does not already cover.
+
+    A timekeeper block that fired inside a logged session's window is the
+    SAME block seen twice, so it is dropped; one outside every window is a
+    session that ended before this ledger existed, or one the app died in,
+    and it counts as itself. ``rows``/``blocks`` are the seams the tests
+    and the backfill script use instead of the two paths."""
+    if rows is None:
+        path = history_path(state_path)
+        rows = read_history(path) if path else []
+    if blocks is None:
+        blocks = timekeeper_blocks(db_path) if db_path else []
+    out: dict = {}
+    windows = []
+
+    def _add(day: str, n_blocks: int, minutes: int):
+        cell = out.setdefault(day, {"blocks": 0, "minutes": 0})
+        cell["blocks"] += n_blocks
+        cell["minutes"] += minutes
+
+    for row in rows:
+        try:
+            started = float(row.get("started") or 0.0)
+            n = int(row.get("blocks") or 0)
+            per = int(row.get("block_min") or 0)
+        except (TypeError, ValueError):
+            continue
+        if started <= 0 or n <= 0:
+            continue
+        ended = float(row.get("ended") or started)
+        windows.append((started, max(ended, started)))
+        _add(str(row.get("date") or _day(started)), n, n * max(0, per))
+    for blk in blocks:
+        when = float(blk.get("when") or 0.0)
+        if when <= 0 or any(a <= when <= b for a, b in windows):
+            continue
+        _add(_day(when), 1, int(blk.get("minutes") or 0))
+    return out
+
+
+def week_start(now: Optional[date] = None) -> date:
+    """Monday of the current week -- the week a student means by "this
+    week", not a rolling seven days."""
+    today = now or date.today()
+    return today - timedelta(days=today.weekday())
+
+
+def streak_days(days: dict, today: Optional[date] = None) -> int:
+    """Consecutive days of study ending today or yesterday. Yesterday
+    counts as still alive: at 9 am the streak he built last night is not
+    broken yet, and calling it zero would be a lie he acts on."""
+    today = today or date.today()
+    cursor = today if days.get(today.isoformat()) else today - timedelta(days=1)
+    n = 0
+    while days.get(cursor.isoformat()):
+        n += 1
+        cursor -= timedelta(days=1)
+    return n
+
+
+def time_words(minutes: int) -> str:
+    """'two hours and ten minutes' / 'fifty minutes' / 'an hour'."""
+    minutes = max(0, int(minutes))
+    hours, mins = divmod(minutes, 60)
+    parts = []
+    if hours:
+        parts.append("an hour" if hours == 1 else f"{count_words(hours)} hours")
+    if mins or not hours:
+        parts.append("a minute" if mins == 1 else f"{count_words(mins) if mins <= 12 else mins} minutes")
+    return " and ".join(parts)
+
+
+def summary_line(days: dict, since: date, when: str = "this week") -> str:
+    """'Two hours and ten minutes this week, sir, over five blocks on
+    three days.' or the honest nothing."""
+    picked = {d: cell for d, cell in days.items() if d >= since.isoformat()}
+    blocks = sum(int(c["blocks"]) for c in picked.values())
+    minutes = sum(int(c["minutes"]) for c in picked.values())
+    if not blocks:
+        return NO_STUDY_LINE.format(when=when)
+    n_days = len(picked)
+    return STUDY_TOTAL_LINE.format(
+        time=time_words(minutes).capitalize(), when=when,
+        blocks=blocks_words(blocks),
+        days="one day" if n_days == 1 else f"{count_words(n_days)} days")
+
+
+def streak_line(days: dict, today: Optional[date] = None) -> str:
+    n = streak_days(days, today)
+    if n <= 0:
+        return STREAK_NONE_LINE
+    if n == 1:
+        return STREAK_ONE_LINE
+    return STREAK_LINE.format(n=count_words(n))
 
 
 class FocusSession:
@@ -353,6 +547,50 @@ class FocusSession:
             return LEFT_BLOCK_LINE.format(left=left_words(left).capitalize(),
                                           n=self.blocks_done + 1)
 
+    @property
+    def history_path(self) -> Optional[Path]:
+        return history_path(self._state_path)
+
+    def _log_history(self, blocks: int, block_min: int) -> None:
+        """Append this session to focus_history.jsonl. Called from end()
+        under the lock, BEFORE the state file is overwritten -- that write
+        is what used to lose the count.
+
+        Deduped on the session's `started` stamp: reconcile() closes a
+        lapsed session with end("lapsed") at boot, and without the key a
+        crash-and-restart could file the same night twice."""
+        path = self.history_path
+        if path is None or blocks <= 0:
+            return                          # no full block is nothing to log
+        try:
+            started = float(self.state.get("started") or 0.0)
+        except (TypeError, ValueError):
+            started = 0.0
+        if started <= 0:
+            return
+        try:
+            if path.exists():
+                with path.open("rb") as fh:
+                    fh.seek(0, os.SEEK_END)
+                    fh.seek(max(0, fh.tell() - HISTORY_TAIL_BYTES))
+                    tail = fh.read().decode("utf-8", "replace")
+                for row in read_history_text(tail):
+                    if abs(float(row.get("started") or 0.0) - started) < 1.0:
+                        log.info("focus: session %.0f already in the ledger", started)
+                        return
+        except OSError:
+            log.debug("focus: ledger tail unreadable", exc_info=True)
+        row = {"date": _day(started), "started": started, "ended": float(self._now()),
+               "label": self.label, "blocks": int(blocks), "block_min": int(block_min)}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            # One append of one complete line: an interrupted process can
+            # lose the line but never leave half of it in front of the next.
+            with path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            log.warning("focus: could not append to the study ledger", exc_info=True)
+
     def end(self, reason: str = "user") -> str:
         with self._lock:
             if not self.active:
@@ -360,6 +598,7 @@ class FocusSession:
             blocks, n = self.blocks_done, int(self.state.get("block_min") or 0)
             self._cancel_items()
             self._music("end")
+            self._log_history(blocks, n)
             self.state["phase"] = ""
             self._save()
         log.info("focus: session ended (%s) after %d block(s)", reason, blocks)

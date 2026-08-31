@@ -265,9 +265,15 @@ def turn_stats(records: Iterable[dict], day: date) -> dict:
             "answered": len(waits), "turn_records": kept}
 
 
-def summarize_day(log_path, turns_path, day: date, now: Optional[Callable] = None) -> dict:
+def summarize_day(log_path, turns_path, day: date, now: Optional[Callable] = None,
+                  study: Optional[dict] = None) -> dict:
     """The digest for `day`: ledger stats + log counts, or a digest that says
-    so when neither file has anything for that day."""
+    so when neither file has anything for that day.
+
+    ``study`` is focus.study_days()'s table (day -> {blocks, minutes}); the
+    day's row lands on the digest as study_blocks / study_minutes, so the
+    nightly review can say how much was actually studied and not only how
+    the assistant behaved. Optional: without it the digest is unchanged."""
     log_path, turns_path = Path(log_path), Path(turns_path)
     records = read_turn_records(turns_path)
     try:
@@ -285,7 +291,16 @@ def summarize_day(log_path, turns_path, day: date, now: Optional[Callable] = Non
               "has_log": bool(day_lines)}
     digest.update(turn_stats(records, day))
     digest.update(count_events(day_lines))
-    digest["has_data"] = digest["has_log"] or bool(digest["turn_records"])
+    cell = (study or {}).get(day.isoformat()) or {}
+    try:
+        digest["study_blocks"] = int(cell.get("blocks") or 0)
+        digest["study_minutes"] = int(cell.get("minutes") or 0)
+    except (TypeError, ValueError, AttributeError):
+        digest["study_blocks"] = digest["study_minutes"] = 0
+    # A day he studied is a day with data even if Jarvis logged nothing:
+    # the blocks are the point of the review for a student.
+    digest["has_data"] = (digest["has_log"] or bool(digest["turn_records"])
+                          or bool(digest["study_blocks"]))
     return digest
 
 
@@ -333,6 +348,11 @@ def spoken_line(digest: dict, label: str = "Yesterday", name: str = "sir") -> st
         problems.append(f"the model had to be reloaded {_times(digest['residency_reloads'])}")
     if digest.get("timeouts"):
         problems.append(f"{_n(digest['timeouts'], 'answer')} never came")
+    blocks = int(digest.get("study_blocks") or 0)
+    if blocks:
+        from jarvis.focus import blocks_words, time_words
+        first += (f" You studied {blocks_words(blocks)}, "
+                  f"{time_words(int(digest.get('study_minutes') or 0))}.")
     if not problems:
         second = f"Nothing went wrong that I could see, {name}."
     elif len(problems) == 1:
@@ -347,7 +367,9 @@ def spoken_line(digest: dict, label: str = "Yesterday", name: str = "sir") -> st
 def table(digest: dict) -> str:
     """The full digest as fixed-width text (Discord renders it in a code
     block, the transcript shows it as is)."""
-    rows = [("turns", digest.get("turns")),
+    rows = [("study blocks", digest.get("study_blocks")),
+            ("study minutes", digest.get("study_minutes")),
+            ("turns", digest.get("turns")),
             ("answered", digest.get("answered")),
             ("median wait", _secs(digest.get("median_wait_s")) + " s" if digest.get("median_wait_s") is not None else "-"),
             ("worst wait", _secs(digest.get("worst_wait_s")) + " s" if digest.get("worst_wait_s") is not None else "-"),
@@ -431,14 +453,29 @@ class DayReviewer:
 
     def __init__(self, log_path, turns_path, reviews_dir,
                  on_filed: Optional[Callable[[date, dict], None]] = None,
-                 now: Optional[Callable[[], datetime]] = None, lookback: int = 3):
+                 now: Optional[Callable[[], datetime]] = None, lookback: int = 3,
+                 study: Optional[Callable[[], dict]] = None):
         self.log_path, self.turns_path = Path(log_path), Path(turns_path)
         self.reviews_dir = Path(reviews_dir)
         self.on_filed = on_filed
+        # () -> focus.study_days(). A callable, not a table: the reviewer
+        # outlives any one read of the ledger.
+        self.study = study
         self._now = now or datetime.now
         self.lookback = max(1, int(lookback))
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _study_table(self) -> dict:
+        """The ledger, or {} when there is none or it will not read: a
+        study line is a bonus on the review, never a reason it fails."""
+        if not callable(self.study):
+            return {}
+        try:
+            return self.study() or {}
+        except Exception:                    # noqa: BLE001 - source boundary
+            log.debug("dayreview: study ledger unreadable", exc_info=True)
+            return {}
 
     def review(self, day: date, refresh: bool = False) -> dict:
         """The digest for `day`: the filed one when it exists (a finished day
@@ -447,7 +484,8 @@ class DayReviewer:
             filed = load_review(self.reviews_dir, day)
             if filed is not None:
                 return filed
-        digest = summarize_day(self.log_path, self.turns_path, day, now=self._now)
+        digest = summarize_day(self.log_path, self.turns_path, day, now=self._now,
+                               study=self._study_table())
         if day < self._now().date():
             file_review(self.reviews_dir, digest)
         return digest
@@ -459,7 +497,8 @@ class DayReviewer:
             day = today - timedelta(days=back)
             if load_review(self.reviews_dir, day) is not None:
                 continue
-            digest = summarize_day(self.log_path, self.turns_path, day, now=self._now)
+            digest = summarize_day(self.log_path, self.turns_path, day, now=self._now,
+                                   study=self._study_table())
             if file_review(self.reviews_dir, digest) is None:
                 continue
             filed.append(day)

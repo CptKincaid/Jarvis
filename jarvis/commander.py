@@ -88,7 +88,7 @@ from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import parse_person_statement, parse_since
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import write_event
-from jarvis.tools.docs import EmbedError, INDEXING_LINE, topic_chunks
+from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
 from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
 
 log = get_logger("commander")
@@ -176,6 +176,9 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- round 2 (2026-08-30): teach-me mode and the study ledger ---
+        "teach me", "tutor me", "walk me through", "how much did i study",
+        "streak", "study this week",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -1711,10 +1714,13 @@ _PREF_SECTIONS = {
     "canvas": "canvas", "coursework": "canvas", "todo": "todos", "todos": "todos",
     "to-do": "todos", "to-dos": "todos", "tasks": "todos", "alarm": "alarms",
     "alarms": "alarms", "reminder": "reminders", "reminders": "reminders",
+    "study": "study", "flashcard": "study", "flashcards": "study",
+    "revision": "study",
 }
 _PREF_SECTION_WORDS = {"todos": "the to-dos", "alarms": "the alarms",
                        "reminders": "the reminders", "canvas": "Canvas",
-                       "weather": "the weather", "calendar": "the calendar"}
+                       "weather": "the weather", "calendar": "the calendar",
+                       "study": "the study line"}
 _PREF_SECTION_RX = re.compile(
     r"^(?:(?P<off>no|skip|drop|leave out|lose|without|i don'?t want|i do not want|"
     r"don'?t (?:read|include|give me|do|mention)|stop (?:reading|including|giving me))"
@@ -1722,7 +1728,7 @@ _PREF_SECTION_RX = re.compile(
     r"start (?:reading|including)|mention))"
     r"\s+(?:the\s+|my\s+|any\s+)?"
     r"(?P<section>news|sports?|stocks?|weather|calendar|canvas|coursework|to-?dos?|tasks|"
-    r"alarms?|reminders?)"
+    r"alarms?|reminders?|study|flash ?cards?|revision)"
     r"(?:\s+(?:back|again))?"
     r"\s+(?:(?:in|from|with|on)\s+(?:the|my)\s+(?:morning\s+|daily\s+|evening\s+|nightly\s+|"
     r"weekly\s+)?(?:briefings?|previews?|forecast)|in the mornings?)"
@@ -3094,7 +3100,11 @@ def _h_quiz(c, t, m):
 
     def _work():
         try:
-            chunks = topic_chunks(index, topic, k=k)
+            # course_chunks, not topic_chunks: "quiz me on biosensors" must
+            # not be answered out of another course's PDF (the global
+            # embedding leg happily crosses courses). Falls back to
+            # topic_chunks when the topic names no course of his.
+            chunks = course_chunks(index, c._svc("assistant"), topic, k=k)
         except EmbedError as exc:
             log.warning("quiz: embed failed: %s", exc)
             _deliver(c, quiz_mod.INDEX_DOWN_LINE)
@@ -3130,22 +3140,200 @@ def _h_quiz(c, t, m):
                          speak=True, ack=True, done=False, status=f"Quiz: {topic}")
 
 
-def _h_review(c, t, m):
+# ------------------------------------------------------------ teach me
+# "Teach me chapter three" is explain and quiz as one verb: the chunks are
+# retrieved ONCE, explained, and stashed; a yes to the offer builds the
+# quiz from the SAME chunks, so the questions are provably about what was
+# just said (_h_quiz retrieves from scratch, which can land on other text).
+_TEACH_RX = re.compile(
+    r"^" + _JV + r"(?:(?:teach|tutor|coach)\s+me\s+(?:about\s+|on\s+|over\s+)?|"
+    r"walk\s+me\s+through\s+)"
+    r"(?:the\s+|my\s+|some\s+)?(?P<topic>.+?)(?:\s+please)?[.!?\s]*$", re.I)
+# "teach me how to ..." / "teach me why ..." is a question for the router,
+# and "teach me a lesson" is not a request at all.
+_TEACH_NOT_A_TOPIC_RX = re.compile(
+    r"^(?:how|why|what|when|where|who|whether|if)\b|"
+    r"^(?:a\s+)?lessons?$|^(?:something|anything|everything|yourself|nothing)$", re.I)
+TEACH_ACK_LINE = "Let me pull together what I have on {topic}, sir."
+TEACH_OFFER_LINE = "Say quiz me and I'll test you on it, sir."
+TEACH_FAIL_LINE = "I couldn't make sense of what I have on {topic}, sir."
+TEACH_DECLINED_LINE = "Very good, sir."
+# A bare "quiz me" / "go on" takes the teach offer. quiz_kind needs an
+# "on <topic>", so these reach no registry command of their own.
+_TAKE_QUIZ_RX = re.compile(
+    r"^" + _JV + r"(?:(?:quiz|test|drill|grill) me|go on|go ahead|"
+    r"(?:let's |lets )?(?:do|try) it)[.!?\s]*$", re.I)
+
+
+def teach_kind(text: str) -> Optional[str]:
+    m = _TEACH_RX.match((text or "").strip())
+    if not m:
+        return None
+    topic = " ".join(m.group("topic").split())
+    if len(topic) < 3 or _TEACH_NOT_A_TOPIC_RX.match(topic):
+        return None
+    return topic
+
+
+def _teach_no_material(c, index, topic: str) -> None:
+    """The same three honest answers the quiz gives when nothing matched:
+    no such topic, still indexing, or no documents at all."""
+    if index.document_count() > 0:
+        _deliver(c, quiz_mod.NO_TOPIC_LINE.format(topic=topic))
+    elif index.scan():
+        index.start_background()
+        _deliver(c, INDEXING_LINE)
+    else:
+        _deliver(c, quiz_mod.NO_DOCS_LINE)
+
+
+# ---------------------------------------------------------- study ledger
+# focus_session.json is overwritten by the next session, so "three blocks
+# done" used to be spoken once and lost. focus.study_days() merges the
+# durable ledger with the timekeeper's own never-pruned block rows; these
+# two phrases are what read it back.
+_STUDY_TOTAL_RX = re.compile(
+    r"^" + _JV + r"(?:how (?:much|long) (?:did|have) i (?:studied|study|been studying)|"
+    r"how much (?:study|studying|focus|revision)(?: time)? (?:did|have) i (?:do|done|log(?:ged)?)|"
+    r"how much did i (?:get )?(?:study|studied|done)|"
+    r"(?:what's|what is|show me) my (?:study|focus|revision) (?:time|total|hours))"
+    r"(?:\s+(?P<when>today|yesterday|this week|last week|this month))?"
+    r"[.!?\s]*$", re.I)
+_STREAK_RX = re.compile(
+    r"^" + _JV + r"(?:what'?s|what is|how(?:'s| is)|hows)?\s*(?:my|the)?\s*"
+    r"(?:study |focus |revision )?streak(?:\s+(?:at|now|going|looking))?[.!?\s]*$", re.I)
+
+
+def _study_paths(c):
+    """(session-state path, timekeeper db path) -- both from the live
+    services when the app wired them, so a test session's tmp files are
+    used and the real ones are never touched."""
+    focus = c._svc("focus")
+    state = getattr(focus, "_state_path", None) if focus is not None else None
+    tk = c._svc("timekeeper")
+    db = getattr(tk, "db_path", None) if tk is not None else None
+    return state, db
+
+
+def _study_table(c) -> dict:
+    from jarvis import focus as focus_mod
+    state, db = _study_paths(c)
+    days = focus_mod.study_days(state_path=state, db_path=db)
+    # A session running right now is not in the ledger yet (end() writes
+    # it), and "how much did I study today" must still count this morning.
+    focus = c._svc("focus")
+    try:
+        if focus is not None and focus.active and focus.blocks_done > 0:
+            per = int(focus.state.get("block_min") or 0)
+            started = float(focus.state.get("started") or 0.0)
+            if started > 0:
+                day = focus_mod._day(started)
+                cell = days.setdefault(day, {"blocks": 0, "minutes": 0})
+                cell["blocks"] += focus.blocks_done
+                cell["minutes"] += focus.blocks_done * max(0, per)
+    except Exception:                          # noqa: BLE001 - live session boundary
+        log.debug("study ledger: live session unreadable", exc_info=True)
+    return days
+
+
+def _h_study_total(c, t, m):
+    from datetime import date, timedelta
+
+    from jarvis import focus as focus_mod
+    when = (m.group("when") or "this week").strip().lower() if hasattr(m, "group") else "this week"
+    today = date.today()
+    since = {"today": today, "yesterday": today - timedelta(days=1),
+             "this week": focus_mod.week_start(today),
+             "last week": focus_mod.week_start(today) - timedelta(days=7),
+             "this month": today.replace(day=1)}.get(when, focus_mod.week_start(today))
+    days = _study_table(c)
+    if when in ("yesterday", "last week"):
+        # a closed window: drop everything after it, or "yesterday" would
+        # quietly include today
+        stop = (today if when == "yesterday" else focus_mod.week_start(today)).isoformat()
+        days = {d: cell for d, cell in days.items() if d < stop}
+    return CommandResult(handled=True, reply=focus_mod.summary_line(days, since, when),
+                         speak=True, status="Study ledger")
+
+
+def _h_study_streak(c, t, m):
+    from jarvis import focus as focus_mod
+    return CommandResult(handled=True, reply=focus_mod.streak_line(_study_table(c)),
+                         speak=True, status="Study streak")
+
+
+def _h_teach(c, t, m):
+    topic = m
+    index = c._svc("docs")
+    if index is None:
+        return CommandResult(handled=True, reply=quiz_mod.NO_DOCS_LINE, speak=True,
+                             status="No documents")
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "explain_text"):
+        return CommandResult(handled=True, reply=EXPLAIN_NO_MODEL_LINE, speak=True,
+                             status="No model")
+    k = _int_setting(c, "quiz.chunks", quiz_mod.DEFAULT_CHUNKS)
+    c._pending_teach = None                      # a new lesson replaces the old
+
+    def _work():
+        try:
+            chunks = course_chunks(index, c._svc("assistant"), topic, k=k)
+        except EmbedError as exc:
+            log.warning("teach: embed failed: %s", exc)
+            _deliver(c, quiz_mod.INDEX_DOWN_LINE)
+            return
+        except Exception:                        # noqa: BLE001 - store boundary
+            log.exception("teach: index failed")
+            _deliver(c, quiz_mod.INDEX_DOWN_LINE)
+            return
+        if not chunks:
+            _teach_no_material(c, index, topic)
+            return
+        # study_text, not fact_sheet: the quiz half is built from this
+        # exact string, so both halves read the same material.
+        body = quiz_mod.study_text(chunks)
+        try:
+            lead, summary = brain.explain_text(body, name=topic)
+        except Exception:
+            log.exception("teach: explain_text failed")
+            lead, summary = "", ""
+        if not lead:
+            _deliver(c, TEACH_FAIL_LINE.format(topic=topic))
+            return
+        if summary and summary != lead:
+            bus.publish(JarvisReply(text=f"{topic}\n{summary}", speak=False))
+        # Stashed BEFORE the offer is spoken: the reply closes the turn and
+        # opens the follow-up window, and the yes can arrive at once.
+        c._pending_teach = (topic, body, time.monotonic())
+        _deliver(c, f"{lead} {TEACH_OFFER_LINE}")
+
+    c._bg(_work)
+    return CommandResult(handled=True, reply=TEACH_ACK_LINE.format(topic=topic),
+                         speak=True, ack=True, done=False, status=f"Teaching {topic}")
+
+
+def _start_review(c, n: int, topic: str = "") -> CommandResult:
+    """Open a flashcard session over the cards due now, optionally on one
+    deck. Shared by "review my flashcards" and the briefing's exam-week
+    offer, so both end up in the same _pending_quiz rung."""
     try:
         store = _quiz_store(c)
     except Exception:
         log.exception("flashcard store unavailable")
         return CommandResult(handled=True, reply=quiz_mod.NO_CARDS_LINE, speak=True,
                              status="No store")
-    n = _int_setting(c, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS)
-    cards = store.due(limit=n)
+    cards = store.due(limit=n, topic=topic)
     if not cards:
         line = quiz_mod.NO_CARDS_LINE if store.count() == 0 else quiz_mod.NOTHING_DUE_LINE
         return CommandResult(handled=True, reply=line, speak=True, status="No cards due")
-    session = quiz_mod.QuizSession(cards, topic="review")
+    session = quiz_mod.QuizSession(cards, topic=topic or "review")
     c._pending_quiz = session
     return CommandResult(handled=True, reply=f"{_cards_line(len(cards))} {session.ask()}",
                          speak=True, status=f"Flashcards 1/{len(cards)}")
+
+
+def _h_review(c, t, m):
+    return _start_review(c, _int_setting(c, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS))
 
 
 def _h_quiz_stop(c, t, m):
@@ -3191,6 +3379,8 @@ REGISTRY: list[Command] = [
     Command("quiz", quiz_kind, _h_quiz),
     Command("review flashcards", review_kind, _h_review),
     Command("stop quiz", quiz_stop_kind, _h_quiz_stop),
+    # after "quiz": "quiz me on X" is its own verb, not a lesson
+    Command("teach me", teach_kind, _h_teach),
     # Reached only when the reader is idle (handle() gives an active reading
     # first claim on these words before the desktop chains and "go back");
     # the handler then falls through, so the entry documents Tier 1
@@ -3236,6 +3426,9 @@ REGISTRY: list[Command] = [
     Command("focus start", _m_focus_start, _h_focus_start, needs=("focus",)),
     Command("focus left", _FOCUS_LEFT_RX.match, _h_focus_left),
     Command("focus end", _FOCUS_END_RX.match, _h_focus_end, needs=("focus",)),
+    # the ledger reads files, not the live session: no needs=("focus",)
+    Command("study total", _STUDY_TOTAL_RX.match, _h_study_total),
+    Command("study streak", _STREAK_RX.match, _h_study_streak),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
     Command("list schedule", _LIST_SCHED_RX.match, _h_list_schedule,
@@ -3346,7 +3539,9 @@ REGISTRY: list[Command] = [
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
     if cmd.name in ("explain document", "quiz", "review flashcards", "stop quiz",
+                    "teach me",
                     "focus start", "focus left", "focus end", "lecture notes",
+                    "study total", "study streak",
                     "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "next exam", "greeting", "day review",
@@ -3724,6 +3919,10 @@ class Commander:
         # built on first use. The document last explained, for "read it to
         # me": (Path, epoch seconds).
         self._pending_quiz = None
+        # The lesson whose "say quiz me" offer is open: (topic, study text,
+        # monotonic stamp). The study text is kept so the quiz is built from
+        # exactly what was explained, with no second retrieval.
+        self._pending_teach = None
         self._flashcards = None
         self._last_document = None
         # UI hook for uncertain intent ("Was this for me?"); wired by the
@@ -3837,6 +4036,13 @@ class Commander:
         res = self._try_quiz_answer(text)
         if res is not None:
             return res
+        # 3a''. "Teach me X" ended with "say quiz me and I'll test you on
+        #       it": a plain yes -- or a bare "quiz me", which carries no
+        #       topic of its own -- builds that quiz from the chunks the
+        #       lesson already read.
+        res = self._try_teach_offer(text)
+        if res is not None:
+            return res
         # 3b. Claude offered the terminal after refusing an outside-dir
         #     task: "yes" / "open it" opens it.
         res = self._try_terminal_offer(text)
@@ -3850,6 +4056,11 @@ class Commander:
         # 3d. The evening preview asked "Shall I wake you at seven?"; a
         #     plain yes sets THAT alarm rather than becoming a new command.
         res = self._try_alarm_offer(text)
+        if res is not None:
+            return res
+        # 3d'. The morning briefing asked "Shall we run ten now, sir?" of
+        #      the deck for this week's exam; a plain yes deals those cards.
+        res = self._try_study_offer(text)
         if res is not None:
             return res
         # 3e. A destructive action was read back ("Cancel all three alarms,
@@ -4454,6 +4665,43 @@ class Commander:
         return CommandResult(handled=True, reply=f"Alarm at {when}, sir.", speak=True,
                              status=f"Alarm {when}")
 
+    def _try_study_offer(self, text: str) -> Optional[CommandResult]:
+        """Resolve "Shall we run ten now, sir?" from the exam-week study
+        section (briefing.make_tools parks it on services.study_offer).
+
+        Same rule as _try_alarm_offer: only a clear yes takes it, a no
+        declines, anything else DROPS it, and so does an offer older than
+        OFFER_TTL_S -- the briefing is spoken at breakfast and a "yes" to
+        something else at lunchtime must not start a quiz. The cards come
+        from the deck for the exam's course, so it is revision for THAT
+        exam and not a general review.
+        """
+        offer = getattr(self.services, "study_offer", None)
+        if not isinstance(offer, dict) or not offer:
+            return None
+        try:
+            self.services.study_offer = None
+        except Exception:
+            log.debug("could not clear the study offer", exc_info=True)
+        try:
+            made = float(offer.get("made_at") or 0.0)
+        except (TypeError, ValueError):
+            made = 0.0
+        if made and time.time() - made > OFFER_TTL_S:
+            log.info("study offer expired; %r is a new subject", text[:40])
+            return None
+        answer = parse_yes_no(text)
+        if answer is None:
+            return None
+        if not answer:
+            return CommandResult(handled=True, reply="Very good, sir.", speak=True,
+                                 status="No study")
+        try:
+            n = max(1, int(offer.get("n") or quiz_mod.DEFAULT_QUESTIONS))
+        except (TypeError, ValueError):
+            n = quiz_mod.DEFAULT_QUESTIONS
+        return _start_review(self, n, topic=str(offer.get("course") or ""))
+
     def _try_event_confirm(self, text: str) -> Optional[CommandResult]:
         """Resolve a calendar add that was read back for confirmation.
 
@@ -4549,6 +4797,74 @@ class Commander:
                                  speak=True, status="Quiz finished")
         return CommandResult(handled=True, reply=f"{line} {session.ask()}", speak=True,
                              status=f"Quiz {session.index + 1}/{session.total}")
+
+    def _try_teach_offer(self, text: str) -> Optional[CommandResult]:
+        """Resolve "say quiz me and I'll test you on it, sir" from _h_teach.
+
+        The whole point of the lesson is that the quiz comes from the SAME
+        material, so the stashed study text is handed to make_quiz and no
+        second retrieval happens. Same rule as every other offer rung: only
+        a clear yes takes it, a no declines it, anything else DROPS it (a
+        stray yes an hour later must not start a quiz), and so does an
+        offer older than OFFER_TTL_S.
+        """
+        pending = getattr(self, "_pending_teach", None)   # a slim test commander has none
+        if not pending:
+            return None
+        topic, body, made = pending
+        self._pending_teach = None
+        if time.monotonic() - float(made) > OFFER_TTL_S:
+            log.info("teach offer expired; %r is a new subject", text[:40])
+            return None
+        t = (strip_jarvis_prefix(text) or text).strip()
+        answer = parse_yes_no(t)
+        if answer is None:
+            # "quiz me" on its own carries no topic (quiz_kind wants an
+            # "on ..."), so the registry would never route it; here it is
+            # the plainest way to say yes.
+            if not _TAKE_QUIZ_RX.match(t.rstrip(".!?")):
+                return None
+            answer = True
+        if not answer:
+            return CommandResult(handled=True, reply=TEACH_DECLINED_LINE, speak=True,
+                                 status="No quiz")
+        brain = self._svc("brain")
+        if brain is None or not hasattr(brain, "make_quiz"):
+            return CommandResult(handled=True,
+                                 reply=quiz_mod.NO_QUESTIONS_LINE.format(topic=topic),
+                                 speak=True, status="No model")
+        try:
+            store = _quiz_store(self)
+        except Exception:
+            log.exception("flashcard store unavailable")
+            return CommandResult(handled=True,
+                                 reply=quiz_mod.NO_QUESTIONS_LINE.format(topic=topic),
+                                 speak=True, status="No store")
+        n = _int_setting(self, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS)
+        self._pending_quiz = None
+
+        def _work():
+            try:
+                pairs = brain.make_quiz(body, n=n, topic=topic)
+            except Exception:
+                log.exception("teach: make_quiz failed")
+                pairs = []
+            if not pairs:
+                _deliver(self, quiz_mod.NO_QUESTIONS_LINE.format(topic=topic))
+                return
+            # source is the topic, not a file name: the cards came from the
+            # lesson's whole reading, and store.due(topic=) LIKE-matches
+            # either column, so "review my biosensors cards" still finds them.
+            cards = store.add_cards(pairs, source=topic, topic=topic)
+            session = quiz_mod.QuizSession(cards, topic=topic)
+            self._pending_quiz = session
+            _deliver(self, session.ask())
+
+        self._bg(_work)
+        return CommandResult(handled=True,
+                             reply=quiz_mod.PREPARING_LINE.format(topic=topic),
+                             speak=True, ack=True, done=False,
+                             status=f"Quiz: {topic}")
 
     def _try_terminal_offer(self, text: str) -> Optional[CommandResult]:
         """After OUTSIDE_LINE ("...say the word and I'll open the terminal

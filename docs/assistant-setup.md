@@ -1352,3 +1352,99 @@ announcements are watched. At most three hits are spoken per tick; the rest
 are marked seen and counted in the log, because a hit read out every fifteen
 minutes is worse than one missed. Seen hits live in
 `~/.aiws_trainer/jarvis_memory/keyword_watch_state.json` for fourteen days.
+## 40. Per-course scoping (quiz and lessons stay in one subject)
+
+Nothing to configure. Until now *"quiz me on electrode transducers in signals and
+systems"* matched no file by name, so the last resort was a global embedding query
+over every indexed document — and the biosensors notes talk about electrodes and
+transducers too, so the questions came out of the wrong course and the flashcards
+were filed under a topic they were not about.
+
+The topic is now read as a **course** first: the whole utterance, then each tail
+after *of / in / for / from / on / about*, is looked up on the Canvas roster
+(`lecture.resolve_course`; with no token it is simply the words as said), slugified
+the way lecture notes are named — `biosensors-2026-08-29.md` — and matched as a
+whole token against the file names already in the index. On a hit only that
+course's files are read, in reading order, with no embedding call at all.
+
+- **What it covers well**: lecture notes (`"notes for biosensors"` writes the
+  slug-named files this depends on) and any document you name after its course.
+- **What it does not**: a PDF saved under its publisher's name carries no slug, so
+  it still takes the global path — exactly as before, no worse.
+- A slug under three characters never scopes, so "cs" cannot pull in "physics".
+- Naming a chapter the course does not have falls back rather than answering about
+  the wrong week.
+
+## 41. "Teach me X" — a lesson, then a quiz on the same material
+
+> *"Teach me week four of signals and systems."*
+> "Week four covers sampling: a signal sampled at twice its highest frequency can be
+> reconstructed exactly, sir. Say quiz me and I'll test you on it, sir."
+> *"Quiz me."*
+> "Let me put some questions together on week four of signals and systems, sir."
+
+The chunks are retrieved **once**. The lesson explains them and keeps that exact
+study text; taking the offer builds the quiz from the same string, so the questions
+are provably about what was just said (asking "quiz me on ..." separately retrieves
+afresh and may land on other text). The misses go to box one and Leitner brings them
+back tomorrow.
+
+- Say yes with *"quiz me"*, *"go on"*, *"yes"*; decline with *"no"*. Anything else
+  drops the offer, and so does three minutes' silence.
+- *"teach me how to ..."*, *"teach me a lesson"* are not lessons and go to the model.
+- Requires the documents index (section on `docs.paths`) and the local model.
+
+## 42. Exam-week study in the morning briefing
+
+When Canvas or your calendar has an exam inside the next `briefing.study_days`
+days, the briefing adds a line about the deck for **that course**:
+
+> "Exam: Midterm 1 for BIOSENSORS, in 2 days, Tuesday at 9:00 am.
+> Study: 14 cards due on your BIOSENSORS deck, 9 of them in box one.
+> Shall we run ten now, sir?"
+
+*"Yes"* deals those cards straight away; *"no"* declines; anything else drops the
+offer. With no cards yet it says so instead — *"Nothing on your BIOSENSORS deck yet,
+sir; say quiz me on BIOSENSORS and I'll build one."*
+
+```json
+"briefing": {
+  "sections": { "study": true },
+  "study_days": 5,          // how close an exam has to be
+  "study_offer": true,      // false: the line, never the offer
+  "study_offer_n": 10       // cards the offer would start with
+}
+```
+
+By voice: *"no study in the morning"*, *"put the flashcards back in my briefing"*.
+The line is silent unless the exam carries a course name (without one there is
+nothing to filter the deck by), and it rides under the `canvas` switch like the exam
+countdown it depends on.
+
+## 43. Study ledger: "how much did I study this week?"
+
+Every finished focus session (section on focus/pomodoro) now appends one line to
+`~/.aiws_trainer/jarvis_memory/focus_history.jsonl`. Before this, the block count
+lived only in `focus_session.json`, which the next session overwrites — so *"That's
+three blocks done, sir"* was said once and forgotten.
+
+- *"How much did I study this week?"* — "Two hours and five minutes this week, sir,
+  over five blocks on two days." Also *today*, *yesterday*, *last week*, *this month*.
+- *"What's my streak?"* — "Four days running, sir." Yesterday still counts: at nine
+  in the morning last night's streak is not broken yet.
+- The nightly self-review (section 36) gains a line: "You studied four blocks, an
+  hour and 40 minutes."
+
+The answer also reads the timekeeper's own record. Every block was already a silent
+`focus: block N` timer that reached `done` in `timekeeper.db`, which is never pruned,
+so sessions from before this feature existed — or ones the app died in — still count;
+a block that fired inside a session already in the ledger is not counted twice. To
+fold that history into the ledger once:
+
+```bash
+~/vss_env/bin/python scripts/backfill_focus_history.py --dry-run
+~/vss_env/bin/python scripts/backfill_focus_history.py
+```
+
+It is idempotent and never opens `timekeeper.db` for writing. Nothing leaves the box
+and no model is called.
