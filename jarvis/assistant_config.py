@@ -328,6 +328,13 @@ DEFAULTS: dict = {
     # whole gather (IMAP + Canvas), which runs on a worker thread.
     "dossier": {"enabled": True, "lead_min": 10, "notes": True, "mail": True,
                 "mail_hours": 72, "due_days": 7, "budget_s": 25},
+    # Nightly flashcards (jarvis/studycards.py): in the small hours, each
+    # course's newest lecture notes become Leitner cards, so the exam-week
+    # briefing has a deck to count instead of "say quiz me and I'll build
+    # one". Skipped whenever the GPU is lent or the model is busy. Silent:
+    # the cards surface at "review my flashcards" and in the briefing.
+    "study_cards": {"enabled": True, "per_course": 5, "max_courses": 3,
+                    "run_before_hour": 5, "max_age_days": 7, "min_lines": 3},
     # Class-start staging (jarvis/classflow.py): at the start of a recurring
     # class, prime today's notes file, put the music down and show a card.
     # auto_notes arms voice capture for the hour and is OFF by default --
