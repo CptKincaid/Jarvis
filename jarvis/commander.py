@@ -3939,23 +3939,6 @@ def _h_scan_syllabus(c, t, m):
 
 
 def _h_review(c, t, m):
-    try:
-        store = _quiz_store(c)
-    except Exception:
-        log.exception("flashcard store unavailable")
-        return CommandResult(handled=True, reply=quiz_mod.NO_CARDS_LINE, speak=True,
-                             status="No store")
-    cards = store.due(limit=n, topic=topic)
-    if not cards:
-        line = quiz_mod.NO_CARDS_LINE if store.count() == 0 else quiz_mod.NOTHING_DUE_LINE
-        return CommandResult(handled=True, reply=line, speak=True, status="No cards due")
-    session = quiz_mod.QuizSession(cards, topic=topic or "review")
-    c._pending_quiz = session
-    return CommandResult(handled=True, reply=f"{_cards_line(len(cards))} {session.ask()}",
-                         speak=True, status=f"Flashcards 1/{len(cards)}")
-
-
-def _h_review(c, t, m):
     return _start_review(c, _int_setting(c, "quiz.questions", quiz_mod.DEFAULT_QUESTIONS))
 
 
