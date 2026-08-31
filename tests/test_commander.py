@@ -1580,6 +1580,7 @@ TIER1_SAMPLES = {
     "leave time": "it takes ten minutes to get to wisenbaker",
     "leave time amend": "make that ten next time",
     "leave time query": "how long to wisenbaker",
+    "leave time forget": "forget the walk to wisenbaker",
     "greeting": "good morning",
     "courtesy": "good night",
     "day review": "how did yesterday go",

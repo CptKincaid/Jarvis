@@ -40,6 +40,7 @@ import json
 import os
 import re
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
@@ -394,6 +395,16 @@ class LeaveTimes:
         self._filed: dict = state.get("filed", {})
         self._asked: dict = state.get("asked", {})
         self.last_key: str = str(state.get("last_key") or "")
+        # When a walk was last TAUGHT, monotonic and in memory only --
+        # deliberately never restored from disk. `last_key` survives a
+        # restart, so a disk-loaded one is a building nothing has been said
+        # about; commander._leave_key_fresh honours whichever of this and
+        # its own per-turn stamp is newer, and this is the half that covers
+        # a teaching path the commander never handles. NOT stamped by
+        # note_key: the background reminder tick and _maybe_ask both call
+        # that with no user turn behind them, and "make it twenty" must not
+        # come to mean a building a thread re-pointed at.
+        self.last_touch: float = 0.0
         self._stop = threading.Event()
         self._thread = None
 
@@ -485,6 +496,12 @@ class LeaveTimes:
         """Store a walk and stop asking about it."""
         value = self.table.set(key, minutes)
         self._asked[key] = self._now().isoformat()
+        # A walk just taught IS the building on the table, so "make that
+        # ten next time" may follow straight on. Stamped here rather than
+        # in note_key so the amend window opens for every teaching path,
+        # including one that reaches this store without going through a
+        # commander handler.
+        self.last_touch = time.monotonic()
         self.note_key(key)
         self._save()
         log.info("leavetime: %s learned as %d min", key, value)

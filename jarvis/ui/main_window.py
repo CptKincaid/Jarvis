@@ -50,6 +50,7 @@ must NOT attach it a second time.
 """
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import shutil
@@ -567,6 +568,12 @@ class MainWindow:
         self.modes: Optional[ConsoleModes] = None
         self.desk: Optional[DeskWatch] = None
         self._room_data: dict = {}
+        # The GPU utilisation _read_temps already has in hand, handed to
+        # services.room_state() on the SAME 5 s pass so the slab stops
+        # forking a second nvidia-smi (and walking /proc twice) for a
+        # number this loop had just parsed and thrown away.
+        self._gpu_util_pct: Optional[int] = None
+        self._room_state_gpu_kw: Optional[bool] = None   # asked once, by signature
         self._standby_origin = None      # window position before it drifts
         self._footer_hidden = False
         self._term_available = terminal_available()
@@ -1771,9 +1778,28 @@ class MainWindow:
         if not callable(fn):
             return
         try:
-            self._room_data = dict(fn() or {})
+            self._room_data = dict(fn(**self._room_state_kwargs(fn)) or {})
         except Exception:                     # noqa: BLE001 - provider boundary
             log.debug("room state probe failed", exc_info=True)
+
+    def _room_state_kwargs(self, fn) -> dict:
+        """`{"gpu_pct": ...}` when the provider takes it, else `{}`.
+
+        _read_temps ran moments ago on this same pass, so hand its reading
+        over rather than let room_state fork a second nvidia-smi. Asked
+        ONCE, by signature: wrapping the call in `except TypeError` would
+        also swallow one raised INSIDE the provider and silently call it a
+        second time -- the very duplicate probe this removes.
+        """
+        takes = self._room_state_gpu_kw
+        if takes is None:
+            try:
+                inspect.signature(fn).bind(gpu_pct=None)
+                takes = True
+            except (TypeError, ValueError):
+                takes = False              # an older provider: no kwarg
+            self._room_state_gpu_kw = takes
+        return {"gpu_pct": self._gpu_util_pct} if takes else {}
 
     def _probe_devices(self):
         """One-time GPU inventory (worker thread) for the engine card's
@@ -1878,9 +1904,15 @@ class MainWindow:
                     seg = f"gpu {vals[0]}°"
                     if len(vals) > 1 and vals[1].isdigit():
                         seg += f" {vals[1]}%"
+                        # _probe_room, two calls later on this same pass,
+                        # hands this to services.room_state instead of
+                        # spawning its own nvidia-smi for it.
+                        self._gpu_util_pct = int(vals[1])
                     parts.append(seg)
         except (OSError, subprocess.SubprocessError):
             log.debug("gpu temp read failed", exc_info=True)
+            # A failed probe leaves no stale number on the slab.
+            self._gpu_util_pct = None
         return " · ".join(parts)
 
     def _temps_tick(self):

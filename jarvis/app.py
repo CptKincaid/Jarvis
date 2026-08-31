@@ -528,7 +528,15 @@ class JarvisApp:
         mod = _import_optional("jarvis.room")
         if mod is None:
             return None
-        return mod.RoomLight(state_path=PATHS.MEMORY_DIR / "room_state.json")
+        # The bedtime wind-down (jarvis/winddown.py) dims the SAME xrandr
+        # output through its own state file, so the automatic heals at boot
+        # and quit must ask before undoing it. Late-bound on purpose:
+        # self.winddown is built further down (_construct order), and the
+        # getattr default makes the early state safe.
+        return mod.RoomLight(
+            state_path=PATHS.MEMORY_DIR / "room_state.json",
+            held_by=lambda: bool(
+                getattr(getattr(self, "winddown", None), "holding", False)))
 
     def _make_scenes(self):
         mod = _import_optional("jarvis.scenes")
@@ -1457,7 +1465,12 @@ class JarvisApp:
                 log.exception("leavetime: quiet gate failed")
                 return False
         question = leavetime_mod.ASK_LINE.format(place=place)
-        arm(key, place)
+        # A refusal means another question already owns the floor: the
+        # duration would be graded as a flashcard answer or swallowed by a
+        # working session, and leavetime._maybe_ask burns its once-ever ask
+        # the instant this returns True. Say nothing; the watch retries.
+        if arm(key, place) is False:
+            return False
         bus.publish(JarvisReply(text=question, speak=False))
         self._say(question, proactive=True, kind="message")
         return True
@@ -2057,8 +2070,20 @@ class JarvisApp:
         tts = getattr(self, "tts", None)
         if getattr(tts, "is_speaking", False) or getattr(tts, "pending", 0):
             return
-        if self._pending_debrief or getattr(self, "_pending_uncertain", None):
+        if self._pending_debrief:
             return                          # one open question at a time
+        # ...and the debrief is not the only question in the app. It is the
+        # ONE pending stage hoisted ABOVE commander.handle (_dispatch runs
+        # _debrief_reply first), so arming over a live flashcard, a working
+        # session, a destructive read-back or a ringing alarm files THEIR
+        # answer into the episodic record and strands them. This must stay
+        # above mark_asked: that is the once-ever promise, and a question
+        # withheld was never put. The next tick is five minutes away and
+        # the candidate is not consumed by a refusal.
+        held = debrief_mod.floor_holder(self)
+        if held:
+            log.info("debrief held: %s owns the floor", held)
+            return
         watch = getattr(self, "debrief", None)
         if watch is not None:
             # Written when the question is PUT, not when it is answered: an
@@ -2085,6 +2110,17 @@ class JarvisApp:
             return None
         if time.monotonic() - pending["at"] > self.DEBRIEF_TTL_S:
             self._pending_debrief = None
+            return None
+        # A holder that appeared AFTER the question was put outranks it:
+        # commander._try_ringing and every other pending stage sit BELOW
+        # this filter, and the `addressed` escape only probes
+        # ASSISTANT_TIER1 -- which has no ringing-alarm words -- so a bare
+        # "stop" or a flashcard answer was swallowed and filed as how the
+        # midterm went. Return None WITHOUT clearing _pending_debrief: the
+        # question survives and is still answerable once the floor is free.
+        held = debrief_mod.floor_holder(self)
+        if held:
+            log.info("debrief stands down: %s owns this turn", held)
             return None
         commander = getattr(self, "commander", None)
         try:
@@ -2196,6 +2232,19 @@ class JarvisApp:
             return max(window, float(CONFIG.followup_window))
         if getattr(commander, "lecture_course", None):
             return self._window_setting("lecture.window_s", 20.0)
+        # The open debrief ("How did the midterm go, sir?") arms the mic
+        # itself (_followup_after_speech) and is answered in a sentence, not
+        # a word. It is checked HERE and deliberately NOT inside
+        # _question_open: debrief.floor_holder calls that predicate, so the
+        # debrief would name itself as the holder and stand down from its
+        # own answer for the whole 120 s.
+        pending = self._pending_debrief
+        if pending is not None:
+            try:
+                if time.monotonic() - float(pending["at"]) <= self.DEBRIEF_TTL_S:
+                    return self._window_setting("quiz.window_s", 15.0)
+            except (TypeError, ValueError, KeyError):
+                pass
         if self._question_open(commander):
             return self._window_setting("quiz.window_s", 15.0)
         return None
@@ -2218,6 +2267,19 @@ class JarvisApp:
         """
         if commander is None:
             return False
+        # The commander owns the authoritative list -- every rung of
+        # handle() that holds the floor, each with its own expiry -- so the
+        # study offer and the objection get the 15 s quiz window rather
+        # than the 4 s CONFIG.followup_window. The branches below are the
+        # older half-list, kept so a slim/duck-typed commander in a test
+        # still answers; they are redundant, not wrong.
+        probe = getattr(commander, "question_open", None)
+        if callable(probe):
+            try:
+                if probe():
+                    return True
+            except Exception:
+                log.debug("question_open failed", exc_info=True)
         quiz = getattr(commander, "_pending_quiz", None)
         if quiz is not None and not getattr(quiz, "finished", True):
             try:
@@ -3583,7 +3645,13 @@ class JarvisApp:
         # own setting at every start.
         if self.room_light is not None and self.room_light.changed:
             try:
-                self.room_light.restore()
+                # healing=True: a restart at two in the morning must not
+                # light the room back up while the wind-down still holds
+                # it -- the very decision winddown.restore(expired_only=
+                # True) made one screenful earlier. The baseline stays on
+                # disk for the next "good morning"/"lights up", which pass
+                # healing=False and always win.
+                self.room_light.restore(healing=True)
                 log.info("room: a previous run's display change was restored")
             except Exception:
                 log.exception("room light restore at boot failed")
@@ -3841,6 +3909,15 @@ class JarvisApp:
         # Before the members: a departure confirm pending on a Timer would
         # otherwise fire minutes into the teardown and touch a stopped room.
         self._cancel_departure()
+        # Same hazard, other slot: a dissent offer's 60 s Timer RUNS the
+        # deferred action and speaks it, so it must not outlive the room.
+        # Clearing the slot is the belt for a Timer already past cancel():
+        # Commander.objection_timeout returns None on an empty slot.
+        try:
+            self.commander._objection_cancel_timer()
+            self.commander._pending_objection = None
+        except Exception:
+            log.debug("objection timer not cancelled", exc_info=True)
         cal = getattr(self.services, "calendar", None)
         for name, obj in (("discord", self.discord), ("approvals", self.approvals),
                           ("cmdsock", getattr(self, "cmdsock", None)),
@@ -3890,7 +3967,10 @@ class JarvisApp:
         light = getattr(self, "room_light", None)
         if light is not None and light.changed:
             try:
-                light.restore()
+                # ...unless the wind-down deliberately has it: WindDown.stop()
+                # does not brighten the room either, and a quit at midnight
+                # that did would be the same 2 a.m. floodlight as the boot heal.
+                light.restore(healing=True)
             except Exception:
                 log.exception("room light restore at quit failed")
         try:
@@ -3968,6 +4048,12 @@ class JarvisApp:
             # is resolved defensively so it lands whichever way the
             # desk-presence change merges (jarvis/ui/console_mode.py).
             room_state=self.room_state,
+            # The Board's own WM close button: without this the window
+            # manager's X tore down the toplevel while the app still
+            # believed the Board was up, so its feed kept polling. The UI
+            # Services dataclass declares the field; build_ui_services drops
+            # what it does not, so passing it is safe in either merge order.
+            board_closed=self._board_hide,
             # ONE seam for the desk reading: services.desk_idle_s, the
             # DeskSentinel's cached poll. This used to read the name off
             # `self`, where it has never existed, so Services.desk_idle_s

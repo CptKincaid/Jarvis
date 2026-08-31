@@ -1807,3 +1807,163 @@ def test_a_quiet_hours_panel_does_not_arm_the_greeting_damper(app):
     bus.publish(Presence(home=True, returned=True))
     bus.drain()
     assert app.tts.spoken.count(WELCOME_LINE) == 1
+
+
+# ------------------- 22. the cross-lane stitches (review round 3)
+#
+# Every one of these is a seam where two waves' features met: a predicate
+# that grew on one side of the wall and a caller that never learned about
+# it, a heal that overrides a guard made one screenful earlier, a Timer
+# that outlives the room. They are integration bugs by construction, so
+# they are tested against the real app, not a slice of it.
+def test_the_mic_window_asks_the_commander_what_is_open(app):
+    """_question_open grew its own half-list of pending questions while the
+    commander grew the authoritative one, so the study offer and the
+    objection -- both spoken yes/no questions -- got the 4 s follow-up
+    window instead of the 15 s answer window."""
+    assert app._question_open(app.commander) is False
+    app.services.study_offer = {"made_at": time.time(), "n": 10}
+    try:
+        assert app.commander.question_open() is True
+        assert app._question_open(app.commander) is True
+    finally:
+        app.services.study_offer = None
+    assert app._question_open(app.commander) is False
+
+
+def test_the_walk_question_is_not_put_over_another_open_question(app):
+    """leavetime._maybe_ask burns its once-ever ask the instant this
+    returns True, and _try_leave_answer is the LAST pending rung -- so a
+    duration said while another question is open is eaten by that rung and
+    the walk is never learned. Say nothing; the watch retries."""
+    _quiet_open(app)
+    app.quiet.should_hold = lambda *a, **kw: False
+    app.recorder.recording = False        # the stub answers callables, not bools
+    app.services.study_offer = {"made_at": time.time(), "n": 10}
+    said = len(app.tts.spoken)
+    try:
+        assert app._ask_leave_time("Wisenbaker Engineering Bldg",
+                                   "Wisenbaker") is False
+    finally:
+        app.services.study_offer = None
+    assert app.commander._pending_leave is None
+    assert len(app.tts.spoken) == said, "a refused arm must not speak"
+
+
+def _ringing(app, monkeypatch):
+    """Make the real timekeeper answer "an alarm is ringing"."""
+    monkeypatch.setattr(type(app.timekeeper), "ringing",
+                        property(lambda self: SimpleNamespace(id=1)))
+
+
+def test_the_debrief_is_not_asked_over_a_floor_someone_else_owns(app,
+                                                                 monkeypatch):
+    """The debrief is the ONE pending stage hoisted above commander.handle,
+    so arming it over a ringing alarm or a live flashcard files THEIR
+    answer into the episodic record. The withheld question must also not
+    spend the once-ever ask."""
+    from jarvis.debrief import Candidate
+    from datetime import datetime, timedelta
+    _quiet_open(app)
+    app.recorder.recording = False
+    # FakeTTS answers every unknown attribute with a (truthy) callable, so
+    # the busy-speech gate above would otherwise short-circuit this test.
+    app.tts.is_speaking, app.tts.pending = False, 0
+    marked = []
+    app.debrief = SimpleNamespace(mark_asked=marked.append)
+    cand = Candidate(key="k", title="the midterm", word="exam",
+                     end=datetime.now() - timedelta(minutes=30))
+    _ringing(app, monkeypatch)
+    app._ask_debrief(cand)
+    assert app._pending_debrief is None
+    assert marked == [], "a question that was never put must not be marked asked"
+
+
+def test_an_open_debrief_stands_down_for_a_holder_that_appears_after_it(
+        app, monkeypatch):
+    """A bare "stop" to a ringing alarm inside the 120 s window was filed as
+    how the midterm went: commander._try_ringing sits BELOW this filter and
+    "stop" is in no ASSISTANT_TIER1 matcher. The question must survive the
+    stand-down -- it is still answerable once the floor is free."""
+    from jarvis.debrief import Candidate
+    from datetime import datetime, timedelta
+    cand = Candidate(key="k", title="the midterm", word="exam",
+                     end=datetime.now() - timedelta(minutes=30))
+    app._pending_debrief = {"key": "k", "cand": cand, "at": time.monotonic()}
+    _ringing(app, monkeypatch)
+    assert app._debrief_reply("stop", "voice") is None
+    assert app._pending_debrief is not None, "the question is not spent"
+
+
+def test_the_room_light_asks_the_wind_down_before_an_automatic_heal(app):
+    """winddown.py and room.py drive the SAME xrandr output through two
+    separate state files. The boot and quit heals used to override a guard
+    winddown.restore(expired_only=True) had just honoured."""
+    probe = app.room_light._held_by
+    assert callable(probe)
+    assert probe() is False and app.room_light.held_elsewhere() is False
+    app.winddown = SimpleNamespace(holding=True)
+    assert probe() is True and app.room_light.held_elsewhere() is True
+
+
+def test_the_boot_and_quit_heals_are_both_marked_healing(app):
+    """Both automatic calls, and only those: "lights up" passes healing
+    False and always wins. WindDown.stop() does not brighten the room
+    either, so a quit at midnight that did would be the same floodlight."""
+    calls = []
+    app.room_light = SimpleNamespace(
+        changed=True,
+        restore=lambda healing=False: (calls.append(healing), (True, ""))[1])
+    app.start_assistant(residency=False)
+    app.stop_assistant()
+    assert calls == [True, True]
+
+
+def test_a_dissent_timer_does_not_outlive_the_room(app):
+    """The 60 s objection Timer RUNS the deferred action and speaks it, so
+    it must be cancelled beside the departure Timer stop_assistant already
+    cancels -- and the slot cleared, for a Timer already past cancel()."""
+    from jarvis.objections import Objection
+    obj = Objection(source="sleep window", reason="that is in four hours",
+                    row="alarm 7am", key="alarm-7am")
+    app.commander.stash_objection(lambda: None, "Shall I set it anyway?", obj)
+    timer = app.commander._objection_timer
+    assert timer is not None and timer.is_alive()
+    app.stop_assistant()
+    assert app.commander._objection_timer is None
+    assert app.commander._pending_objection is None
+    assert app.commander.objection_timeout() is None
+    assert not timer.is_alive()
+
+
+def test_ui_service_kwargs_carry_the_board_wm_close_hook(app):
+    """MainWindow._board_closed falls back to services.board.hide and,
+    failing that, only logs -- so without this kwarg the Board's WM close
+    left its 5 s feed polling a window nobody can see."""
+    assert app.ui_service_kwargs()["board_closed"] == app._board_hide
+
+
+def test_ui_service_kwargs_hand_over_a_live_desk_reading(app):
+    """services.desk_idle_s, not a name that never existed on self."""
+    fn = app.ui_service_kwargs()["desk_idle_s"]
+    assert callable(fn) is app.desk.enabled
+
+
+def test_the_open_debrief_gets_the_long_answer_window(app):
+    """"How did the midterm go, sir?" is answered in a sentence, so the 4 s
+    follow-up window cut him off mid-answer. Checked in _capture_window and
+    NOT in _question_open: debrief.floor_holder calls that predicate, so the
+    debrief would name itself as the holder and stand down from its own
+    answer for the whole 120 s."""
+    from jarvis.debrief import Candidate
+    from datetime import datetime, timedelta
+    assert app._capture_window() is None
+    cand = Candidate(key="k", title="the midterm", word="exam",
+                     end=datetime.now() - timedelta(minutes=30))
+    app._pending_debrief = {"key": "k", "cand": cand, "at": time.monotonic()}
+    assert app._capture_window() == 15.0
+    # ...and the question is still answerable: it never holds its own floor.
+    assert app._debrief_reply("it went fine", "voice") is not None
+    app._pending_debrief = {"key": "k", "cand": cand,
+                            "at": time.monotonic() - app.DEBRIEF_TTL_S - 1}
+    assert app._capture_window() is None

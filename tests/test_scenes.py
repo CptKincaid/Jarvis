@@ -477,6 +477,10 @@ def test_the_wind_down_and_the_scene_never_both_take_the_night(tmp_path,
         assert sc.active() == ""
         assert not (tmp_path / "scene.json").exists()
         assert "Powering down" not in (res.reply or "")
+        # ...and the courtesy never even reached for the scene: asking a
+        # held Scenes to apply answers with WIND_DOWN_HELD_LINE, which
+        # would then be spoken as if it were the good-night line.
+        assert scenes.WIND_DOWN_HELD_LINE not in (res.reply or "")
     finally:
         wd.stop()
 
@@ -511,5 +515,72 @@ def test_an_explicit_scene_over_a_live_wind_down_is_refused_out_loud(tmp_path,
         assert not res.ok and res.failed == ["winddown"]
         assert res.line == scenes.WIND_DOWN_HELD_LINE
         assert services.spotify.calls == [] and sc.active() == ""
+    finally:
+        wd.stop()
+
+
+# ------------------- the scene line survives the good-night preview
+class _PreviewBrain:
+    """Just enough brain for _goodnight_preview to take the turn."""
+
+    def __init__(self):
+        self.asked = []
+
+    def chat(self, text, force_tool=None, force_args=None):
+        self.asked.append((force_tool, force_args))
+
+
+def _preview_services(tmp_path, monkeypatch, **cfg):
+    settings = {"room.wind_down_on_goodnight": True, "briefing.enabled": True}
+    settings.update(cfg)
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "intent.json")
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    sc, services, light = make(tmp_path, cfg=settings)
+    services.desktop = MagicMock()
+    services.desktop.parse_action = lambda part: None
+    services.room_light, services.scenes = light, sc
+    services.brain = _PreviewBrain()
+    return sc, services, light
+
+
+def test_good_night_preview_still_says_the_scene_moved_the_room(tmp_path,
+                                                               monkeypatch):
+    """The scene line is the ONLY announcement that the desktop moved --
+    _start_winddown is deliberately silent -- so returning the briefing
+    preview unchanged dimmed the screen, paused the music and rearmed quiet
+    hours with nothing said about any of it."""
+    sc, services, _ = _preview_services(tmp_path, monkeypatch)
+    res = Commander(services).handle("jarvis good night", source="voice")
+    assert res.status == "Preview…"
+    assert sc.active() == scenes.WIND_DOWN
+    assert res.reply.startswith("Powering down")
+    assert commander.GOODNIGHT_PREVIEW_LINE in res.reply
+
+
+def test_go_to_sleep_gets_the_same_night_as_good_night(tmp_path, monkeypatch):
+    """"good night"/"goodnight" never reach _h_goodnight -- the courtesy
+    entry matches them first and never returns None -- so the two phrases
+    that DO reach it used to get neither the wind-down nor the scene."""
+    sc, services, _ = _preview_services(tmp_path, monkeypatch)
+    res = Commander(services).handle("jarvis go to sleep", source="voice")
+    assert res.status == "Preview…"
+    assert sc.active() == scenes.WIND_DOWN
+    assert res.reply.startswith("Powering down")
+    assert services.spotify.calls == ["pause"]
+
+
+def test_go_to_sleep_hands_the_night_to_the_wind_down(tmp_path, monkeypatch):
+    """One owner, on this path too: with the wind-down switched on it takes
+    the night and the scene is never reached for."""
+    sc, services, _ = _preview_services(tmp_path, monkeypatch,
+                                        **{"wind_down.enabled": True,
+                                           "briefing.enabled": False})
+    wd = _winddown(tmp_path, services, monkeypatch)
+    try:
+        res = Commander(services).handle("jarvis go to sleep", source="voice")
+        assert wd.holding is True
+        assert sc.active() == "" and services.spotify.calls == []
+        assert scenes.WIND_DOWN_HELD_LINE not in (res.reply or "")
+        assert "Powering down" not in (res.reply or "")
     finally:
         wd.stop()

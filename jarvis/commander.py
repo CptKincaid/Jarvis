@@ -939,19 +939,25 @@ def courtesy_reply(kind: str, rng=None, register: Optional[str] = None) -> str:
     return (rng or random).choice(_register_lines(kind, register))
 
 
-def _start_winddown(c) -> None:
+def _start_winddown(c) -> bool:
     """The physical half of "good night" (jarvis/winddown.py): music down,
     screen warm and dim, do-not-disturb armed. Off by default, and it fires
     BEFORE _goodnight_preview because that one bails when briefings are
-    switched off -- the room should still go to bed."""
+    switched off -- the room should still go to bed.
+
+    Returns True when it actually TOOK the night.  There is exactly one
+    owner per good night: winddown.py and the "wind down" scene reach for
+    the same xrandr output, the same Spotify and the same quiet window."""
     wd = c._svc("winddown")
     if wd is None:
-        return
+        return False
     try:
         if wd.start():
             log.info("wind-down started")
+            return True
     except Exception:
         log.exception("wind-down failed to start")
+    return False
 
 
 def _restore_winddown(c) -> None:
@@ -971,13 +977,22 @@ def _h_courtesy(c, t, m):
         # "Good night" is a courtesy first (this runs ahead of the registry's
         # own good-night entry and again in _route_text): the wind-down
         # preview hangs off it here, and falls back to the plain line.
-        _start_winddown(c)
+        started = _start_winddown(c)
         # The room scene is a side effect of the SAME call site rather than
         # a second good-night handler, and only when he has asked for it
-        # (room.wind_down_on_goodnight, off by default).
-        scene = _maybe_wind_down(c)
+        # (room.wind_down_on_goodnight, off by default).  One owner per
+        # night: when the wind-down took it, the scene reaches for the same
+        # knobs and would only answer with scenes.WIND_DOWN_HELD_LINE.
+        scene = "" if started else _maybe_wind_down(c)
         res = _goodnight_preview(c, t)
         if res is not None:
+            # The scene line is the ONLY announcement that the desktop
+            # moved -- _start_winddown is deliberately silent -- so
+            # returning the preview unchanged dimmed the screen, paused the
+            # music and rearmed quiet hours with nothing said about any of
+            # it.  CommandResult is a plain dataclass; mutate it in place.
+            if scene:
+                res.reply = f"{scene} {res.reply or ''}".strip()
             return res
         line = courtesy_reply(m, register=_register_name(c))
         return CommandResult(handled=True,
@@ -3324,12 +3339,20 @@ def _h_last_mail(c, t, m):
 
 
 def _h_goodnight(c, t, m):                                 # 3233-3238
-    scene = ""
-    if t in ("good night", "goodnight"):
-        scene = _maybe_wind_down(c)        # off unless he asked for it
-        res = _goodnight_preview(c, t)
-        if res is not None:
-            return res
+    # "good night"/"goodnight" never arrive here: the courtesy entry
+    # (REGISTRY index 6) matches them first and never returns None, so only
+    # "go to sleep" and "shut down jarvis" reach this handler -- and they
+    # mean the same thing, so they get the same wind-down, scene and
+    # preview the courtesy path gets.
+    started = _start_winddown(c)
+    scene = "" if started else _maybe_wind_down(c)  # off unless he asked
+    res = _goodnight_preview(c, t)
+    if res is not None:
+        # The scene line is the only word about the moved desktop; the
+        # preview would otherwise swallow it (see _h_courtesy).
+        if scene:
+            res.reply = f"{scene} {res.reply or ''}".strip()
+        return res
     line = "Good night sir. I'll be here when you need me."
     return CommandResult(
         handled=True,
@@ -4865,6 +4888,25 @@ def _h_leave_query(c, t, m):
                          status=f"Walk: {place} {minutes} min")
 
 
+def _h_leave_forget(c, t, m):
+    """"Forget the walk to Wisenbaker" -- the way back out of the table.
+
+    A walk is taught from a half-heard number in passing, so a wrong one is
+    routine; without this the only exit was to overwrite it with another
+    guess. Returns None for anything that is not a building he has taught,
+    so the words go to the model rather than becoming a bogus confirmation.
+    """
+    lt = c._svc("leavetime")
+    key = lt.resolve(m)
+    if key is None or lt.table.get(key) is None:
+        return None                              # not a walk he has: the model's
+    lt.forget(key)
+    place = leave_mod.speech_name(key)
+    return CommandResult(handled=True, speak=True,
+                         reply=leave_mod.FORGOT_LINE.format(place=place),
+                         status=f"Walk forgotten: {place}")
+
+
 REGISTRY: list[Command] = [
     Command("go back",
             _m_exact("go back", "previous window", "last window"),
@@ -4988,6 +5030,8 @@ REGISTRY: list[Command] = [
     Command("leave time amend", leave_mod.leave_amend_kind, _h_leave_amend,
             needs=("leavetime",)),
     Command("leave time query", leave_mod.leave_query_kind, _h_leave_query,
+            needs=("leavetime",)),
+    Command("leave time forget", leave_mod.leave_forget_kind, _h_leave_forget,
             needs=("leavetime",)),
     Command("day review", _DAYREVIEW_RX.match, _h_dayreview),
     # Undo before report: "forget what you filed" must never be read as a
@@ -5128,6 +5172,9 @@ ASSISTANT_TIER1: list[Command] = [
                     # the learned walks: "it takes ten minutes to get to
                     # Wisenbaker" arrives by voice with no prefix left to strip
                     "leave time", "leave time amend", "leave time query",
+                    # ...and the way back out: "forget the walk to
+                    # Wisenbaker" arrives bare like the other three.
+                    "leave time forget",
                     "todo done", "todo add",
                     "todo list",
                     # named lists: spoken in the aisle and read back over

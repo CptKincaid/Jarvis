@@ -14,13 +14,15 @@ os.environ.setdefault("JARVIS_ASSISTANT_CONFIG",
                                    "assistant.json"))
 
 from dataclasses import fields  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
 
 from jarvis.events import ClaudeTaskState  # noqa: E402
 from jarvis.ui import theme  # noqa: E402
 from jarvis.ui.main_window import (STATE_WORDS, ClaudeTaskTracker,  # noqa: E402
-                                   Services, alarm_modal_text, resolve_state,
-                                   session_exists, terminal_attached,
-                                   terminal_button_state, terminal_tooltip)
+                                   MainWindow, Services, alarm_modal_text,
+                                   resolve_state, session_exists,
+                                   terminal_attached, terminal_button_state,
+                                   terminal_tooltip)
 from jarvis.ui.views import (PROGRESS_MAX, CommandBar, briefing_rows,  # noqa: E402
                              command_bar_field_px, fmt_project_chip,
                              plan_strip, progress_card_lines)
@@ -327,3 +329,73 @@ def test_services_gains_assistant_callables_with_noop_defaults():
     assert svc.approval_answer("r1", True) is None
     assert svc.get_option("briefing.enabled") is None
     assert svc.set_option("briefing.enabled", True) is None
+
+
+# ---------------------------------- the 5 s worker's one nvidia-smi
+# The temps row and the ambient slab ran on the SAME 5 s pass and each
+# forked its own nvidia-smi -- ~720 extra spawns an hour (plus two /proc
+# walks inside health.snapshot) for a number the pass had just parsed and
+# thrown away. The pass now hands its reading over.
+class _Pass:
+    """MainWindow's two worker-thread probes, bound with no Tk root."""
+
+    _read_temps = MainWindow._read_temps
+    _probe_room = MainWindow._probe_room
+
+    _room_state_kwargs = MainWindow._room_state_kwargs
+
+    def __init__(self, services):
+        self.services = services
+        self._room_data: dict = {}
+        self._gpu_util_pct = None
+        self._room_state_gpu_kw = None
+
+    def _cpu_percent(self):
+        return None
+
+
+class _Smi:
+    def __init__(self, stdout):
+        self.stdout = stdout
+
+
+def test_the_temps_pass_hands_its_gpu_reading_to_the_room_probe(monkeypatch):
+    import subprocess as sp
+    seen = {}
+    monkeypatch.setattr(sp, "run",
+                        lambda *a, **kw: _Smi("55, 42\n"))
+    def room_state(gpu_pct=None):
+        seen["gpu_pct"] = gpu_pct
+        return {"gpu": 0.42}
+
+    p = _Pass(SimpleNamespace(room_state=room_state))
+    assert "gpu 55° 42%" in p._read_temps()
+    assert p._gpu_util_pct == 42
+    p._probe_room()
+    assert seen["gpu_pct"] == 42
+    assert p._room_data == {"gpu": 0.42}
+
+
+def test_a_failed_gpu_probe_leaves_no_stale_number_on_the_slab(monkeypatch):
+    import subprocess as sp
+    p = _Pass(SimpleNamespace(room_state=lambda gpu_pct=None: {"gpu": None}))
+    monkeypatch.setattr(sp, "run", lambda *a, **kw: _Smi("55, 42\n"))
+    p._read_temps()
+    assert p._gpu_util_pct == 42
+
+    def boom(*a, **kw):
+        raise OSError("no nvidia-smi")
+
+    monkeypatch.setattr(sp, "run", boom)
+    p._read_temps()
+    assert p._gpu_util_pct is None
+
+
+def test_the_room_probe_still_works_against_a_provider_with_no_gpu_arg(
+        monkeypatch):
+    """build_ui_services can hand over an older room_state; losing the slab
+    entirely would be a worse trade than the extra fork."""
+    p = _Pass(SimpleNamespace(room_state=lambda: {"gpu": None, "temp": "72"}))
+    p._gpu_util_pct = 42
+    p._probe_room()
+    assert p._room_data["temp"] == "72"

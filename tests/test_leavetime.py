@@ -611,9 +611,40 @@ def test_the_amend_window_expires(tmp_path, monkeypatch):
     w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
     c = _commander(w)
     c.handle("it takes twelve minutes to get to wisenbaker", source="voice")
+    # There are TWO clocks on this window and the amend needs both to be
+    # stale: the commander stamps the turn, LeaveTimes.learn stamps the
+    # teaching. Winding only one forward is not the passage of time.
     c._leave_touch -= commander.LEAVE_AMEND_WINDOW_S + 1
+    w.last_touch -= commander.LEAVE_AMEND_WINDOW_S + 1
     c.handle("make that ten next time", source="voice")
     assert w.table.get("Wisenbaker Engineering Bldg") == 12
+
+
+def test_teaching_through_the_store_alone_arms_the_amend(tmp_path):
+    """LeaveTimes.learn() is the teaching event, so it stamps last_touch
+    itself. Without that the amend window depended entirely on the
+    commander handler stamping on its way past, and a walk taught through
+    any other path -- a tick, a tool, a test -- left "make that ten next
+    time" refusing an edit to the walk it had just stored."""
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    c = _commander(w)
+    w.learn("Wisenbaker Engineering Bldg", 12)     # no commander turn at all
+    assert w.last_touch > 0.0
+    c.handle("make that ten next time", source="voice")
+    assert w.table.get("Wisenbaker Engineering Bldg") == 10
+
+
+def test_note_key_alone_never_stamps_the_teaching_clock(tmp_path):
+    """The other half: note_key is called by the background reminder tick
+    and by _maybe_ask, so stamping there (rather than in learn) would make
+    "make it twenty" mean whatever building a thread last filed for."""
+    w = _watch([event(40, LIVE_LOCATIONS[0])], tmp_path)
+    w.table.set("Zachry Engineering Ed. Complex", 9)
+    w.note_key("Zachry Engineering Ed. Complex")
+    assert w.last_touch == 0.0
+    c = _commander(w)
+    c.handle("make it twenty", source="voice")
+    assert w.table.get("Zachry Engineering Ed. Complex") == 9
 
 
 def test_a_leavetime_last_touch_stamp_is_honoured_if_the_store_grows_one(tmp_path):
