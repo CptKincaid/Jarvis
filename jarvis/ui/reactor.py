@@ -1330,7 +1330,6 @@ class Reactor(tk.Canvas):
         if not d:
             return
         cx, cy = d["c"]
-        rs = d["rs"]
         r1, r2 = d["sw_r"]
         head = (t * SWEEP_SPEED) % 360.0
         m = math.radians(head - 90.0)

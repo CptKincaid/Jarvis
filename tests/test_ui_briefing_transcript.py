@@ -8,7 +8,9 @@ present (the card is the reply), and _ev_briefing rendered ev.sections and
 dropped ev.spoken, so the Monday half of what he said never appeared.
 
 No Tk here: the handlers are called unbound on a stub window, which is how
-they run anyway -- they touch only self.transcript and self._utter_ts.
+they run anyway -- they touch self.transcript, self._utter_ts and (since the
+ambient slab landed) self._note_output, which brings the slab down so a card
+is never drawn behind it.
 """
 import time
 from types import SimpleNamespace
@@ -29,9 +31,11 @@ class FakeTranscript:
 
 
 def _win(utter_ts=None):
-    """The two attributes the handlers touch, plus the real _take_rtt."""
-    w = SimpleNamespace(transcript=FakeTranscript(), _utter_ts=utter_ts)
+    """The attributes the handlers touch, plus the real _take_rtt."""
+    w = SimpleNamespace(transcript=FakeTranscript(), _utter_ts=utter_ts,
+                        woke=[])
     w._take_rtt = lambda: MainWindow._take_rtt(w)
+    w._note_output = lambda: w.woke.append(1)
     return w
 
 
@@ -47,6 +51,7 @@ def test_the_spoken_sentence_is_shown_before_the_card():
     assert 1.5 < w.transcript.calls[0][2] < 3.0, "the turn's RTT belongs on the spoken line"
     assert w.transcript.calls[1][1] is sections
     assert w._utter_ts is None, "the utterance stamp must be consumed once"
+    assert w.woke == [1], "the ambient slab must come down before the card"
 
 
 def test_a_card_with_nothing_spoken_is_still_just_a_card():
@@ -63,3 +68,4 @@ def test_plain_replies_keep_their_rtt_behaviour():
     assert kind == "jarvis" and text == "Right away, sir." and 0.5 < rtt < 2.0
     MainWindow._ev_reply(w, JarvisReply(text="", speak=False))
     assert len(w.transcript.calls) == 1, "an empty reply adds nothing"
+    assert w.woke == [1], "an empty reply is not a reason to wake the console"
