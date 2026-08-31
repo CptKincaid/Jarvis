@@ -29,6 +29,16 @@ of any day that has ended to MEMORY_DIR/reviews/<date>.json (the log dir is
 tmpfs and is wiped at boot; the review must not be) and hands the table to
 the Alerts hub, which posts it to Discord only when that channel is
 configured. Started in start_assistant, stopped in stop_assistant.
+
+Weekly (2026-08-30): each night's digest also carries the day's WARNING /
+ERROR clusters (`day_clusters`, from jarvis/logtriage.py), because /tmp is
+wiped at boot and a cluster not filed with its digest is gone by Sunday.
+Once the ISO week closes, `week_tick` aggregates its seven digests into
+MEMORY_DIR/reviews/weeks/<year>-W<nn>.json -- `summarize_week` is pure
+arithmetic over already-persisted JSON, `week_spoken` is the two sentences
+Monday's first wake owes him, `week_table` the Discord card, and
+`week_regressions` the actionable list the app appends to feedback.jsonl:
+a standing bug report Jarvis wrote about himself.
 """
 from __future__ import annotations
 
@@ -41,6 +51,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Callable, Iterable, Optional
 
+from jarvis import logtriage
 from jarvis.logs import get_logger
 
 log = get_logger("dayreview")
@@ -55,6 +66,21 @@ _DAY_BREAK_S = 3600.0
 REVIEW_KEEP_DAYS = 60
 TICK_S = 900.0                # nightly timer resolution: a quarter hour
 FIRST_TICK_S = 30.0
+# The nightly digest carries this many of the day's WARNING/ERROR clusters.
+# /tmp is wiped at boot, so what is not filed tonight cannot be clustered
+# on Sunday -- this list IS the week's raw material.
+CLUSTERS_PER_DAY = 8
+WEEK_KEEP = 26                # weekly reports kept: half a year
+WEEKS_DIRNAME = "weeks"
+# A cluster is worth reporting when it recurs: this many occurrences across
+# the week, or on at least this many separate days.
+WEEK_CLUSTER_MIN = 3
+WEEK_CLUSTER_DAYS = 2
+WEEK_CLUSTERS_SHOWN = 6
+# A wait median has to move by BOTH of these to be called a regression:
+# 0.4 s is audible, 20% keeps a quiet week of three turns from shouting.
+WAIT_REGRESSION_S = 0.4
+WAIT_REGRESSION_FRAC = 0.20
 
 # What gets counted, by the exact log lines the modules write. Each is a
 # (key, regex) pair on the message part of the line; the module names are
@@ -265,6 +291,27 @@ def turn_stats(records: Iterable[dict], day: date) -> dict:
             "answered": len(waits), "turn_records": kept}
 
 
+def day_clusters(lines: list[str], limit: int = CLUSTERS_PER_DAY) -> list[dict]:
+    """The day's WARNING/ERROR records grouped by (logger, normalised
+    message), as plain dicts so they survive in the digest JSON.
+
+    This is the ONLY reason the weekly report can cluster at all: the log
+    lives in tmpfs and is wiped at boot, so by Sunday there is nothing left
+    to re-read. `limit=0` on cluster_warnings means the whole day rather
+    than its last 400 lines."""
+    out = []
+    try:
+        clusters = logtriage.cluster_warnings(lines, limit=0)
+    except Exception:                                # noqa: BLE001
+        log.exception("day clustering failed")
+        return out
+    for c in clusters[:max(1, int(limit))]:
+        out.append({"logger": c.short_logger, "level": c.level,
+                    "message": c.message, "count": int(c.count),
+                    "example": c.example[:160], "last_time": c.last_time})
+    return out
+
+
 def summarize_day(log_path, turns_path, day: date, now: Optional[Callable] = None) -> dict:
     """The digest for `day`: ledger stats + log counts, or a digest that says
     so when neither file has anything for that day."""
@@ -285,6 +332,7 @@ def summarize_day(log_path, turns_path, day: date, now: Optional[Callable] = Non
               "has_log": bool(day_lines)}
     digest.update(turn_stats(records, day))
     digest.update(count_events(day_lines))
+    digest["clusters"] = day_clusters(day_lines)
     digest["has_data"] = digest["has_log"] or bool(digest["turn_records"])
     return digest
 
@@ -375,6 +423,232 @@ def table(digest: dict) -> str:
     return "```\n" + "\n".join(lines) + "\n```"
 
 
+# ------------------------------------------------------------- the week
+# Everything below is arithmetic over digests already on disk: no log
+# reading, no model, no clock beyond `now`.
+WEEK_COUNTERS = ("speaker_rejections", "verify_rejects", "wake_suppressed",
+                 "watchdog_releases", "tool_exceptions", "tts_fallbacks",
+                 "uncertain", "ignored", "residency_reloads", "errors",
+                 "warnings", "boots")
+WEEK_TURN_KEYS = ("turns", "answered", "aborts", "rejected", "timeouts",
+                  "uncertain_turns")
+
+
+def week_key(day: date) -> str:
+    """The ISO week that had CLOSED as of `day` -- "2026-W34".
+
+    Monday belongs to a NEW week, so the week to report on is always the
+    one containing the Sunday before this week's Monday. Any day of the
+    current week answers the same key, so a report filed late (the box was
+    off on Monday) still lands under the right name and never twice."""
+    monday = day - timedelta(days=day.weekday())
+    year, week, _ = (monday - timedelta(days=1)).isocalendar()
+    return f"{year}-W{week:02d}"
+
+
+def week_days(day: date) -> list[date]:
+    """The seven dates of the week `week_key(day)` names, Monday first."""
+    monday = day - timedelta(days=day.weekday()) - timedelta(days=7)
+    return [monday + timedelta(days=i) for i in range(7)]
+
+
+def _merge_clusters(digests: Iterable[dict]) -> list[dict]:
+    """The week's clusters, grouped again across days: (logger, message) ->
+    total count plus how many separate days it appeared on. A thing that
+    broke once on Tuesday and a thing that breaks every night look
+    identical in a nightly digest and must not here."""
+    groups: dict[tuple, dict] = {}
+    for digest in digests:
+        for c in digest.get("clusters") or []:
+            if not isinstance(c, dict):
+                continue
+            key = (str(c.get("logger", "")), str(c.get("message", "")))
+            hit = groups.get(key)
+            if hit is None:
+                groups[key] = {"logger": key[0], "message": key[1],
+                               "level": c.get("level", "WARNING"),
+                               "count": int(c.get("count") or 0), "days": 1,
+                               "example": str(c.get("example", ""))}
+            else:
+                hit["count"] += int(c.get("count") or 0)
+                hit["days"] += 1
+                hit["example"] = str(c.get("example", "")) or hit["example"]
+                if c.get("level") in ("ERROR", "CRITICAL"):
+                    hit["level"] = c["level"]
+    rank = {"CRITICAL": 0, "ERROR": 1, "WARNING": 2}
+    return sorted(groups.values(),
+                  key=lambda g: (-g["days"], -g["count"], rank.get(g["level"], 3)))
+
+
+def _totals(digests: list[dict]) -> dict:
+    out = {k: 0 for k in WEEK_COUNTERS + WEEK_TURN_KEYS}
+    medians, worsts = [], []
+    for d in digests:
+        for k in out:
+            try:
+                out[k] += int(d.get(k) or 0)
+            except (TypeError, ValueError):
+                continue
+        med, worst = d.get("median_wait_s"), d.get("worst_wait_s")
+        if isinstance(med, (int, float)):
+            medians.append(float(med))
+        if isinstance(worst, (int, float)):
+            worsts.append(float(worst))
+    out["median_wait_s"] = round(statistics.median(medians), 2) if medians else None
+    out["worst_wait_s"] = round(max(worsts), 2) if worsts else None
+    return out
+
+
+def summarize_week(digests: Iterable[dict], prev: Optional[Iterable[dict]] = None,
+                   key: str = "", now: Optional[Callable] = None) -> dict:
+    """One week's seven daily digests -> the weekly report.
+
+    ``median_wait_s`` is the median of the DAILY medians, not of the week's
+    turns: the daily digests do not keep the raw waits, and a median of
+    medians is the honest thing to compute from what was filed."""
+    days = [d for d in digests if isinstance(d, dict) and d.get("has_data")]
+    week = {"week": key, "days_with_data": len(days),
+            "generated_at": (now or datetime.now)().isoformat(timespec="seconds"),
+            "days": [d.get("day", "") for d in days],
+            "clusters": _merge_clusters(days)}
+    week.update(_totals(days))
+    prev_days = [d for d in (prev or []) if isinstance(d, dict) and d.get("has_data")]
+    week["prev"] = _totals(prev_days) if prev_days else {}
+    week["has_data"] = bool(days)
+    return week
+
+
+def _delta(week: dict, field: str):
+    """(this week, last week) for `field`, or None when there is no last
+    week to compare with."""
+    prev = week.get("prev") or {}
+    if field not in prev or prev.get(field) is None:
+        return None
+    now_val = week.get(field)
+    return None if now_val is None else (now_val, prev[field])
+
+
+def week_trends(week: dict) -> list[str]:
+    """The things that MOVED, in spoken words. Empty on a first week."""
+    out = []
+    pair = _delta(week, "median_wait_s")
+    if pair is not None:
+        now_v, was = pair
+        if abs(now_v - was) >= WAIT_REGRESSION_S and was > 0 and \
+                abs(now_v - was) / was >= WAIT_REGRESSION_FRAC:
+            verb = "rose" if now_v > was else "fell"
+            out.append(f"the median wait {verb} from {_secs(was)} to {_secs(now_v)} seconds")
+    for field, noun in (("speaker_rejections", "the speaker gate dropped you"),
+                        ("tool_exceptions", "tool calls failed"),
+                        ("watchdog_releases", "the turn watchdog let go"),
+                        ("residency_reloads", "the model was reloaded")):
+        pair = _delta(week, field)
+        if pair is None:
+            continue
+        now_v, was = pair
+        if now_v <= was or now_v < 2:
+            continue
+        times = f"{now_v} times" if now_v != 1 else "once"
+        was_words = f"{was}" if was else "none"
+        out.append(f"{noun} {times}, against {was_words} last week")
+    return out
+
+
+def week_spoken(week: dict, name: str = "sir") -> str:
+    """Two sentences: what the week was, then what is getting worse."""
+    if not week.get("has_data"):
+        return ""
+    turns = int(week.get("turns") or 0)
+    days = int(week.get("days_with_data") or 0)
+    first = (f"Last week: {_n(turns, 'turn')} over {_n(days, 'day')}"
+             if turns else f"Last week: no voice turns over {_n(days, 'day')}")
+    med = week.get("median_wait_s")
+    if med is not None:
+        first += f", median wait {_secs(med)} seconds"
+    first += "."
+    trends = week_trends(week)
+    if trends:
+        second = (f"{trends[0][0].upper()}{trends[0][1:]}"
+                  + ("" if len(trends) == 1 else ", and " + trends[1])
+                  + f", {name}.")
+        return f"{first} {second}"
+    recurring = [c for c in week.get("clusters") or []
+                 if c.get("days", 0) >= WEEK_CLUSTER_DAYS]
+    if recurring:
+        top = recurring[0]
+        second = (f"{top['logger']} complained on {_n(top['days'], 'day')} "
+                  f"running, {name}: {_spoken_cluster(top)}.")
+        return f"{first} {second}"
+    return f"{first} Nothing is getting worse that I can see, {name}."
+
+
+def _spoken_cluster(cluster: dict, n: int = 60) -> str:
+    text = re.sub(r"\s+", " ", str(cluster.get("example") or
+                                   cluster.get("message") or "")).strip()
+    text = text.split(" -- ")[0].split(": Traceback")[0]
+    return text if len(text) <= n else text[:n - 1].rstrip() + "…"
+
+
+def week_regressions(week: dict) -> list[dict]:
+    """The actionable list: what a Claude session should be pointed at.
+
+    Two kinds. A "cluster" is a warning that recurs -- across days, or often
+    enough within the week -- with the example line to grep for. A "metric"
+    is a number that got worse than last week. Both carry `text`: one line,
+    already readable in a bug list."""
+    out: list[dict] = []
+    for c in week.get("clusters") or []:
+        if c.get("days", 0) < WEEK_CLUSTER_DAYS and \
+                c.get("count", 0) < WEEK_CLUSTER_MIN:
+            continue
+        out.append({"kind": "cluster", "logger": c.get("logger", ""),
+                    "level": c.get("level", "WARNING"),
+                    "count": int(c.get("count") or 0), "days": int(c.get("days") or 0),
+                    "example": str(c.get("example", "")),
+                    "text": (f"{c.get('logger', '')}: {_spoken_cluster(c, 110)} "
+                             f"({c.get('count', 0)}x on {c.get('days', 0)} days)")})
+    for trend in week_trends(week):
+        out.append({"kind": "metric", "text": trend})
+    return out
+
+
+def week_table(week: dict) -> str:
+    """The full weekly report as fixed-width text (Discord code block)."""
+    rows = [("days with data", week.get("days_with_data")),
+            ("turns", week.get("turns")),
+            ("answered", week.get("answered")),
+            ("median of daily medians",
+             f"{_secs(week.get('median_wait_s'))} s" if week.get("median_wait_s") is not None else "-"),
+            ("worst wait", f"{_secs(week.get('worst_wait_s'))} s"
+             if week.get("worst_wait_s") is not None else "-"),
+            ("aborts (silent follow-ups)", week.get("aborts")),
+            ("uncertain (\"was that for me?\")", week.get("uncertain")),
+            ("speaker-gate rejections", week.get("speaker_rejections")),
+            ("wake words refused", week.get("wake_suppressed")),
+            ("turn timeouts", week.get("timeouts")),
+            ("watchdog releases", week.get("watchdog_releases")),
+            ("tool-handler exceptions", week.get("tool_exceptions")),
+            ("TTS fallbacks", week.get("tts_fallbacks")),
+            ("model reloads", week.get("residency_reloads")),
+            ("app boots", week.get("boots")),
+            ("log errors / warnings",
+             f"{week.get('errors', 0)} / {week.get('warnings', 0)}")]
+    width = max(len(k) for k, _ in rows)
+    lines = [f"Jarvis week review {week.get('week', '')}"]
+    lines += [f"{k.ljust(width)}  {v if v is not None else '-'}" for k, v in rows]
+    trends = week_trends(week)
+    if trends:
+        lines.append("against last week:")
+        lines += [f"  - {t}" for t in trends]
+    clusters = week.get("clusters") or []
+    if clusters:
+        lines.append("recurring in the log:")
+        for c in clusters[:WEEK_CLUSTERS_SHOWN]:
+            lines.append(f"  {c.get('count')}x on {c.get('days')} day(s) "
+                         f"{c.get('logger')} {c.get('level')}: {c.get('example')}")
+    return "```\n" + "\n".join(lines) + "\n```"
+
+
 # ------------------------------------------------------------- persistence
 def review_path(reviews_dir, day: date) -> Path:
     return Path(reviews_dir) / f"{day.isoformat()}.json"
@@ -421,6 +695,85 @@ def prune_reviews(reviews_dir, keep_days: int = REVIEW_KEEP_DAYS,
     return removed
 
 
+def week_path(reviews_dir, key: str) -> Path:
+    """The weekly report lives in a SUBDIRECTORY: prune_reviews globs
+    reviews/*.json and dates every stem, so a "2026-W34.json" beside the
+    daily files would be an unparseable stem forever."""
+    return Path(reviews_dir) / WEEKS_DIRNAME / f"{key}.json"
+
+
+def file_week(reviews_dir, week: dict) -> Optional[Path]:
+    try:
+        path = week_path(reviews_dir, str(week["week"]))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(week, indent=1))
+        os.replace(tmp, path)
+        return path
+    except (OSError, ValueError, KeyError):
+        log.debug("week review save failed", exc_info=True)
+        return None
+
+
+def load_week(reviews_dir, key: str) -> Optional[dict]:
+    try:
+        data = json.loads(week_path(reviews_dir, key).read_text())
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def latest_week(reviews_dir) -> Optional[dict]:
+    """The newest filed weekly report (the "how was my week" answer)."""
+    try:
+        paths = sorted(Path(reviews_dir, WEEKS_DIRNAME).glob("*.json"))
+    except OSError:
+        return None
+    for path in reversed(paths):
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, dict):
+            return data
+    return None
+
+
+def mark_week_spoken(reviews_dir, key: str) -> bool:
+    """The first wake has delivered this week's two sentences. Kept in the
+    report itself rather than a second state file: one write, one truth."""
+    week = load_week(reviews_dir, key)
+    if week is None or week.get("spoken"):
+        return False
+    week["spoken"] = True
+    return file_week(reviews_dir, week) is not None
+
+
+def pending_week(reviews_dir) -> Optional[dict]:
+    """The newest weekly report the first wake still owes him, or None."""
+    week = latest_week(reviews_dir)
+    if week is None or week.get("spoken") or not week.get("has_data"):
+        return None
+    return week
+
+
+def prune_weeks(reviews_dir, keep: int = WEEK_KEEP) -> int:
+    """Keep the newest `keep` weekly reports; the names sort correctly
+    (ISO year then zero-padded week), so sorting IS the ordering."""
+    try:
+        paths = sorted(Path(reviews_dir, WEEKS_DIRNAME).glob("*.json"))
+    except OSError:
+        return 0
+    removed = 0
+    for path in paths[:max(0, len(paths) - max(1, int(keep)))]:
+        try:
+            path.unlink()
+            removed += 1
+        except OSError:
+            log.debug("week prune failed: %s", path, exc_info=True)
+    return removed
+
+
 # --------------------------------------------------------------- reviewer
 class DayReviewer:
     """The nightly timer. `tick()` files the digest of every day in the last
@@ -431,10 +784,12 @@ class DayReviewer:
 
     def __init__(self, log_path, turns_path, reviews_dir,
                  on_filed: Optional[Callable[[date, dict], None]] = None,
-                 now: Optional[Callable[[], datetime]] = None, lookback: int = 3):
+                 now: Optional[Callable[[], datetime]] = None, lookback: int = 3,
+                 on_week: Optional[Callable[[dict], None]] = None):
         self.log_path, self.turns_path = Path(log_path), Path(turns_path)
         self.reviews_dir = Path(reviews_dir)
         self.on_filed = on_filed
+        self.on_week = on_week
         self._now = now or datetime.now
         self.lookback = max(1, int(lookback))
         self._stop = threading.Event()
@@ -471,7 +826,42 @@ class DayReviewer:
                 except Exception:
                     log.exception("day review on_filed failed for %s", day)
         prune_reviews(self.reviews_dir, today=today)
+        # After the daily rung, never before: the week is aggregated from
+        # the filed digests, and the last one may have been written above.
+        try:
+            self.week_tick(today)
+        except Exception:
+            log.exception("week review tick failed")
         return filed
+
+    def week_tick(self, today: Optional[date] = None) -> Optional[dict]:
+        """File the report for the closed ISO week, once. Returns the
+        report when this call is the one that filed it, else None."""
+        today = today or self._now().date()
+        key = week_key(today)
+        if load_week(self.reviews_dir, key) is not None:
+            return None
+        days = week_days(today)
+        digests = [d for d in (load_review(self.reviews_dir, x) for x in days)
+                   if d is not None]
+        if not digests:
+            return None            # the box was off all week; nothing to say
+        prev = [d for d in (load_review(self.reviews_dir, x - timedelta(days=7))
+                            for x in days) if d is not None]
+        week = summarize_week(digests, prev, key=key, now=self._now)
+        week["spoken"] = not week.get("has_data")   # an empty week owes no line
+        if file_week(self.reviews_dir, week) is None:
+            return None
+        prune_weeks(self.reviews_dir)
+        log.info("week review filed for %s: %d turns over %d days, %d regressions",
+                 key, week.get("turns", 0), week.get("days_with_data", 0),
+                 len(week_regressions(week)))
+        if week.get("has_data") and self.on_week is not None:
+            try:
+                self.on_week(week)
+            except Exception:
+                log.exception("week review on_week failed for %s", key)
+        return week
 
     def start(self) -> None:
         # Alive-guard + clear, like presence.py: a stopped instance can be
@@ -505,4 +895,8 @@ class DayReviewer:
 
 __all__ = ["summarize_day", "spoken_line", "table", "DayReviewer", "file_review",
            "load_review", "review_path", "split_days", "date_segments", "boot_cut",
-           "count_events", "turn_stats", "read_log_lines", "BOOT_MARKER"]
+           "count_events", "turn_stats", "read_log_lines", "BOOT_MARKER",
+           "day_clusters", "summarize_week", "week_spoken", "week_table",
+           "week_trends", "week_regressions", "week_key", "week_days",
+           "week_path", "file_week", "load_week", "latest_week", "pending_week",
+           "mark_week_spoken", "prune_weeks"]
