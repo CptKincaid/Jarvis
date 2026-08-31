@@ -289,6 +289,14 @@ class QuietPolicy:
             end += timedelta(days=1)
         return end.timestamp()
 
+    def hours_end(self, now: Optional[float] = None) -> Optional[float]:
+        """When quiet hours next close, as a timestamp -- None when they are
+        off. Public seam for the bedtime wind-down (jarvis/winddown.py),
+        which arms DND for exactly the window it is joining rather than
+        guessing a morning of its own."""
+        ts = self._now() if now is None else float(now)
+        return self._hours_end(datetime.fromtimestamp(ts).astimezone())
+
     def _calendar_event(self, dt: datetime):
         """The running timed event whose title matches, or None."""
         if not self._get("quiet.calendar", True) or self._get_calendar is None:

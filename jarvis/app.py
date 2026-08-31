@@ -135,6 +135,15 @@ NUDGE_LINE = "Sir?"
 GUEST_LINE = "I only answer to {name}, sir."
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
+# The sources that arrive over the command socket (jarvis/cmdsock.py): a
+# shell / SSH / cron client, and a clip sent from the phone
+# (jarvis/intercom.py). They share three rules that the voice, typed and
+# Discord sources do not -- their replies are stamped with a turn_id for
+# the socket stream, `quiet` mutes THAT turn's speech, and neither cuts a
+# reply Jarvis is already speaking to someone in the room.
+SOCKET_SOURCES = ("cli", "intercom")     # intercom.SOURCE, spelled out here
+                                         # so the wiring hub need not import it
+
 _YES_WORDS = frozenset({"yes", "y", "yeah", "yep", "yup", "aye", "allow",
                         "allowed", "approve", "approved", "ok", "okay", "sure",
                         "affirmative", "permit", "proceed", "go", "ahead", "do", "it"})
@@ -320,6 +329,10 @@ class JarvisApp:
         # spotify.make_tools parks on services.spotify.
         self.focus = self._construct("focus", self._make_focus)
         self.services.focus = self.focus
+        # Same shape as focus: it reaches Spotify and the quiet policy
+        # through the services namespace, so it is built after them.
+        self.winddown = self._construct("winddown", self._make_winddown)
+        self.services.winddown = self.winddown
         self.commander = Commander(self.services)
         # Without this hook the commander falls back to a bare warn Status --
         # a 4 s toast with no way to answer it, after which the utterance is
@@ -390,6 +403,13 @@ class JarvisApp:
             return None
         return mod.FocusSession(self.services,
                                 state_path=PATHS.MEMORY_DIR / "focus_session.json")
+
+    def _make_winddown(self):
+        mod = _import_optional("jarvis.winddown")
+        if mod is None:
+            return None
+        return mod.WindDown(self.services,
+                            state_path=PATHS.MEMORY_DIR / "winddown.json")
 
     def _make_presence(self):
         mod = _import_optional("jarvis.presence")
@@ -493,11 +513,12 @@ class JarvisApp:
         quiet hours / DND / a running meeting / an empty room hold those
         for the catch-up digest (jarvis/quiet.py). Answers, alarms and
         approval questions pass the default False and are never held."""
-        # A quiet CLI turn (python -m jarvis.ask -q) is answered in text
-        # only. Per turn, not a global toggle: a voice turn that lands
-        # while the CLI answer is still coming resets _last_source.
+        # A quiet socket turn (python -m jarvis.ask -q, or an intercom clip
+        # sent without speak) is answered in text only. Per turn, not a
+        # global toggle: a voice turn that lands while the socket answer is
+        # still coming resets _last_source.
         if getattr(self, "_quiet_turn", False) and \
-                getattr(self, "_last_source", "") == "cli":
+                getattr(self, "_last_source", "") in SOCKET_SOURCES:
             return
         if not text or not CONFIG.talkback:
             return
@@ -546,8 +567,8 @@ class JarvisApp:
             self._say(text)
             if self._last_source == "voice":
                 self._followup_after_speech = True
-        if getattr(self, "_last_source", "") == "cli":
-            self._quiet_turn = False    # this CLI turn's answer is delivered
+        if getattr(self, "_last_source", "") in SOCKET_SOURCES:
+            self._quiet_turn = False    # this socket turn's answer is delivered
         try:
             self.context.add_exchange(self._last_user_text, text)
         except Exception:
@@ -879,8 +900,8 @@ class JarvisApp:
                 # SILENT (and bare DONE): nothing to do
             except Exception:
                 log.exception("brain tag %s failed", tag)
-        if getattr(self, "_last_source", "") == "cli":
-            self._quiet_turn = False    # this CLI turn's answer is delivered
+        if getattr(self, "_last_source", "") in SOCKET_SOURCES:
+            self._quiet_turn = False    # this socket turn's answer is delivered
         if briefing is not None:                       # a card with no SPEAK
             bus.publish(BriefingReady(sections=briefing, spoken=""))
 
@@ -1360,17 +1381,28 @@ class JarvisApp:
             return default
         return default if value is None else value
 
-    def _decode_clip(self, audio):
+    def _decode_clip(self, audio, verify=True):
         """The one decode path for a captured clip: speaker filter, then the
         full transcribe. Returns (audio, stats, rejected, result); rejected
-        means the speaker gate dropped the whole clip (result is None)."""
+        means the speaker gate dropped the whole clip (result is None).
+
+        `verify=False` is the intercom's (jarvis/intercom.py): a clip that
+        arrived over the 0600 command socket through the user's own SSH
+        session is already authenticated, and a phone codec moves the ECAPA
+        embedding far enough that the transcript gate -- which fails SHUT --
+        would drop his own voice. The microphone path never passes it."""
         stats = {}
-        if CONFIG.speaker_verify and self.speaker.enrolled:
+        if verify and CONFIG.speaker_verify and self.speaker.enrolled:
             filtered, stats = self.speaker.filter_segments(audio)
             if filtered is None:
                 return audio, stats, True, None
             audio = filtered
         return audio, stats, False, self.transcriber.transcribe(audio)
+
+    def decode_clip(self, audio, verify=True):
+        """Public seam for _decode_clip: the command socket's intercom must
+        reach the speaker gate and Whisper without reaching into a private."""
+        return self._decode_clip(audio, verify=verify)
 
     def _maybe_speculate(self) -> bool:
         """Run one speculative decode when the VAD has heard
@@ -1722,6 +1754,14 @@ class JarvisApp:
             log.info("first-wake briefing: model busy; next turn")
             return
         log.info("first wake of the day: delivering the briefing")
+        wd = getattr(self, "winddown", None)
+        if wd is not None:
+            try:
+                # The other end of "good night": the first wake of the day is
+                # the morning even when he never said the word.
+                wd.restore()
+            except Exception:
+                log.exception("wind-down restore at first wake failed")
         # Yesterday's self-review first, as its own line: the briefing is a
         # brain.chat(force_tool="get_briefing") call, so nothing can be
         # folded into it "for free" -- and only when there was a yesterday
@@ -2224,7 +2264,7 @@ class JarvisApp:
         # Every dispatch supersedes older done=False worker replies
         # (_async_reply checks this before speaking a late answer).
         self._dispatch_gen = getattr(self, "_dispatch_gen", 0) + 1
-        if source != "cli":
+        if source not in SOCKET_SOURCES:
             self._active_turn_id = ""
         if source == "voice":
             self._turn_start()
@@ -2433,21 +2473,23 @@ class JarvisApp:
     def dispatch_text(self, text, source="typed", quiet=False, turn_id=""):
         """MainWindow calls this on a worker thread for typed input; the
         Discord channel with source='discord'; the command socket
-        (jarvis/cmdsock.py) with source='cli', on the client's thread.
-        `quiet` (cli only) answers in text and keeps the soundbar silent;
-        `turn_id` (cli) stamps this turn's replies for the socket stream."""
+        (jarvis/cmdsock.py) with source='cli', on the client's thread, and
+        with source='intercom' for a clip sent from the phone.
+        `quiet` (socket sources only) answers in text and keeps the soundbar
+        silent; `turn_id` stamps this turn's replies for the socket stream."""
         text = (text or "").strip()
         if not text:
             return None
         # Barge-in: a typed command while Jarvis is talking cuts him off
         # (the films' JARVIS never talks over Tony), then gets answered.
-        # NOT for cli: an unattended script or cron call must not cut a
-        # reply he is speaking to someone in the room.
-        if source != "cli":
+        # NOT for the socket sources: an unattended script, a cron call or a
+        # clip sent from another room must not cut a reply he is speaking to
+        # someone standing in front of him.
+        if source not in SOCKET_SOURCES:
             self.interrupt_speech()
         if source == "typed":
             self.history.add(text)
-        self._quiet_turn = bool(quiet) and source == "cli"
+        self._quiet_turn = bool(quiet) and source in SOCKET_SOURCES
         self._active_turn_id = turn_id or ""
         result = None
         try:
@@ -2506,6 +2548,17 @@ class JarvisApp:
                 focus.reconcile()
             except Exception:
                 log.exception("focus session reconcile failed")
+        wd = getattr(self, "winddown", None)
+        if wd is not None:
+            try:
+                # A screen dimmed last night by a Jarvis that has since been
+                # restarted has nobody else to brighten it: the autostart
+                # entry is not installed on this box, so app start IS the
+                # login hook. expired_only, because a restart at two in the
+                # morning must not light the room back up.
+                wd.restore(expired_only=True)
+            except Exception:
+                log.exception("wind-down restore at start failed")
         try:
             # The nightly self-review: files yesterday's digest under
             # MEMORY_DIR/reviews and posts the table to Discord when that
@@ -2749,6 +2802,7 @@ class JarvisApp:
                           ("mailwatch", getattr(self, "mailwatch", None)),
                           ("keyword_watch", getattr(self, "keyword_watch", None)),
                           ("focus", getattr(self, "focus", None)),
+                          ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),
                           ("quiet", getattr(self, "quiet", None)),
                           ("dayreviewer", getattr(self, "dayreviewer", None)),

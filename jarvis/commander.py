@@ -91,7 +91,7 @@ from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import write_event
-from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks, topic_chunks
+from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
 from jarvis.tools.notes import number_word
 from jarvis import syllabus as syllabus_mod
 from jarvis.router import ROUTER_QUESTION, WEB_CUE_RX, RouteDecision, estimate_size
@@ -795,11 +795,39 @@ def courtesy_reply(kind: str, rng=None) -> str:
     return (rng or random).choice(COURTESY_REPLIES[kind])
 
 
+def _start_winddown(c) -> None:
+    """The physical half of "good night" (jarvis/winddown.py): music down,
+    screen warm and dim, do-not-disturb armed. Off by default, and it fires
+    BEFORE _goodnight_preview because that one bails when briefings are
+    switched off -- the room should still go to bed."""
+    wd = c._svc("winddown")
+    if wd is None:
+        return
+    try:
+        if wd.start():
+            log.info("wind-down started")
+    except Exception:
+        log.exception("wind-down failed to start")
+
+
+def _restore_winddown(c) -> None:
+    """The morning half: idempotent, so every greeting may call it."""
+    wd = c._svc("winddown")
+    if wd is None:
+        return
+    try:
+        if wd.restore():
+            log.info("wind-down restored")
+    except Exception:
+        log.exception("wind-down restore failed")
+
+
 def _h_courtesy(c, t, m):
     if m == "goodnight":
         # "Good night" is a courtesy first (this runs ahead of the registry's
         # own good-night entry and again in _route_text): the wind-down
         # preview hangs off it here, and falls back to the plain line.
+        _start_winddown(c)
         res = _goodnight_preview(c, t)
         if res is not None:
             return res
@@ -817,6 +845,10 @@ def greeting_kind(text: str) -> Optional[str]:
 
 
 def _h_greeting(c, t, m):
+    if m == "greeting":
+        # "Good morning" / "hello": undo last night's wind-down. Not for
+        # "how are you" or "are you busy", which are said all day.
+        _restore_winddown(c)
     return CommandResult(handled=True, reply=courtesy_reply(m), speak=True,
                          status="Greeting")
 
@@ -2435,6 +2467,12 @@ def _h_cancel_schedule(c, t, m):
 def _h_briefing(c, t, m):
     enabled = bool(_assistant_get(c, "briefing.enabled", False))
     explicit = not re.match(r"^good morning", t, re.I)
+    if not explicit:
+        # "Good morning" reaches the briefing BEFORE the greeting handler,
+        # so the wind-down's morning half has to be undone here too --
+        # ahead of the enabled check, which returns None on a box with
+        # briefings switched off.
+        _restore_winddown(c)
     if not enabled and not explicit:
         return None            # a plain greeting: the local model answers it
     brain = c._svc("brain")
@@ -4144,9 +4182,7 @@ REGISTRY: list[Command] = [
 # typed "timer for 5 minutes" is instant and never a model round trip.
 ASSISTANT_TIER1: list[Command] = [
     cmd for cmd in REGISTRY
-    if cmd.name in ("explain document", "quiz", "review flashcards", "stop quiz",
-                    "teach me",
-    if cmd.name in ("explain document", "quiz", "scan syllabus",
+    if cmd.name in ("explain document", "quiz", "scan syllabus", "teach me",
                     "review flashcards", "stop quiz",
                     "focus start", "focus left", "focus end", "lecture notes",
                     "study total", "study streak",

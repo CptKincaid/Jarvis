@@ -1266,9 +1266,6 @@ import json; print(json.dumps(cfg.redacted(), indent=2))   # secrets show as •
 EOF
 ```
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-<<<<<<< HEAD
 ## 40. New-grade watch ("a grade just posted")
 
 Nothing to set up beyond the Canvas token (section 13). Once it is in place
@@ -1644,7 +1641,6 @@ Calendar events are the exception: `write_event` is deliberately add-only, so
 a calendar add cannot be undone by voice. It has its own read-back before it
 writes; delete the event by hand if the answer was wrong.
 
-=======
 ## 40. Episodic recall ("when did I last talk to my advisor?")
 
 The activity journal (section 23) already records every exchange, tool call, Claude
@@ -1728,8 +1724,6 @@ re-read. Once the ISO week closes, the seven digests are aggregated into
 A "trend" needs the median wait to move by 0.4 s **and** 20%, so a quiet week of three
 turns cannot shout. All of it is arithmetic over JSON already on disk: no log
 re-reading, no model, nothing leaving the box.
->>>>>>> worktree-wf_a20f39d5-c33-5
-=======
 ## 40. Do not disturb during a study block
 
 ```json
@@ -1845,8 +1839,6 @@ the model is ever asked.
 
 Note that *"five pounds in kilos"* is a weight (2.27 kg) while *"five pounds in
 dollars"* is the currency refusal — the weight reading is tried first.
->>>>>>> worktree-wf_a20f39d5-c33-6
-=======
 ## 40. Claude Code sessions can ask Jarvis back
 
 Section 37 gave you `jarvis -q "..."` from a shell. Section 39 made your own
@@ -2015,4 +2007,151 @@ sir" means the folder has nothing syllabus-shaped in it (or nothing at all);
 "I'm indexing your documents now" means the file is there but not embedded
 yet — ask again in a moment; "My document index isn't answering" means
 Ollama is down, not that the folder is wrong.
->>>>>>> worktree-wf_a20f39d5-c33-7
+## 40. Phone intercom: talk to him from bed (no wake word)
+
+The wake word does not reach the next room, and the soundbar's answer would
+wake the house. The intercom sends a *recording* over the command socket
+instead: Jarvis transcribes it with the same Whisper the microphone uses and
+answers in **text** on the phone, silently, unless you ask for speech.
+
+Nothing new is installed on the Spark. On the phone you need Termux and
+`termux-api` (the app AND `pkg install termux-api`), plus the SSH key you
+already use.
+
+```bash
+# on the phone, in Termux
+termux-microphone-record -q >/dev/null 2>&1     # make sure nothing is recording
+termux-microphone-record -d -l 8 -e opus -f $HOME/j.ogg
+sleep 9
+ssh spark 'jarvis --send-audio -' < $HOME/j.ogg
+```
+
+`-e opus` is **not optional**: `termux-microphone-record` writes AAC by
+default and libsndfile cannot read AAC, so the clip would come back
+"I couldn't decode that clip, sir". wav, ogg, opus and flac all work.
+
+Worth putting in a Termux `~/.bashrc` function:
+
+```bash
+ask() {
+  termux-microphone-record -q >/dev/null 2>&1
+  termux-microphone-record -d -l "${2:-8}" -e opus -f "$HOME/j.ogg" >/dev/null
+  sleep "$(( ${2:-8} + 1 ))"
+  ssh spark 'jarvis --send-audio -' < "$HOME/j.ogg"
+}
+```
+
+From any box that has its own microphone (including Termux) the client can
+do both legs itself:
+
+```bash
+jarvis --listen 8                     # record 8 s here, send it, print the answer
+jarvis --send-audio clip.wav          # a clip you already have ("-" = stdin)
+jarvis --send-audio clip.wav --speak  # ...and answer aloud in the room as well
+```
+
+What comes back:
+
+```
+[heard] what's my first thing tomorrow
+Biosensors at nine, sir.
+```
+
+The `[heard]` line goes to stderr and is what he understood — a misheard
+clip is otherwise indistinguishable from a wrong answer. Exit codes are the
+CLI's: 0 answered, 2 Jarvis is not running, 3 no reply, 4 the clip could not
+be recorded or read.
+
+### Settings (`~/.config/jarvis/assistant.json`)
+
+```json
+"intercom": { "enabled": true, "verify_speaker": false, "max_mb": 10 }
+```
+
+| key | what it does |
+|---|---|
+| `enabled` | `false` refuses every clip ("The intercom is switched off, sir.") |
+| `verify_speaker` | run the ECAPA speaker gate on the clip as the microphone path does |
+| `max_mb` | the size of one clip; 10 MB is about five minutes of 16 kHz wav |
+
+`verify_speaker` is **off** on purpose. The socket is mode 0600 and only
+reachable through your own SSH session, which is already the
+authentication; meanwhile the transcript gate *fails shut* once a voiceprint
+exists, and a phone microphone through a lossy codec moves the ECAPA
+embedding far enough that it would reject your own voice. Turn it on if the
+box is shared — a rejected clip answers "That didn't sound like you, sir."
+
+Anything longer than two minutes is truncated rather than refused, so a
+phone left recording cannot park the resident Whisper. A clip arrives as one
+JSON line: the request framing was 64 KB and is now the base64 of a whole
+clip, and a runaway request answers "request too large" instead of looking
+like a JSON bug.
+
+## 41. Bedtime wind-down: "good night" dims the room
+
+"Good night, sir. I'll be here." can be made physical. With the wind-down on,
+saying good night also fades the music out, warms and dims the screen, and
+arms do-not-disturb until quiet hours close. "Good morning" puts it all back.
+
+It is **off by default** and every half has its own switch:
+
+```json
+"wind_down": {
+  "enabled": false,
+  "fade_s": 60,
+  "brightness": 0.5,
+  "night_light": true,
+  "music": true,
+  "dnd": true,
+  "morning": "07:00"
+}
+```
+
+| key | what it does |
+|---|---|
+| `enabled` | the whole thing; `false` leaves "good night" as a spoken line |
+| `fade_s` | how long Spotify takes to reach silence (one volume step per 5 s) |
+| `brightness` | the `xrandr` level for every connected output; floored at 0.2 |
+| `night_light` | GNOME's warm screen (`night-light-enabled`) |
+| `music` | fade and pause Spotify |
+| `dnd` | hold proactive speech until quiet hours end |
+| `morning` | when `dnd` ends if `quiet.hours` is not configured |
+
+Say "good night", "night night" or "off to bed" and, in order: DND is armed,
+the screen warms and dims, and the music fades over `fade_s` and pauses. The
+Spotify **volume is put straight back after the pause** — the lasting effect
+is the pause, and a device left at 0% is indistinguishable from a broken
+speaker to anyone who presses play in the night.
+
+Say "good morning" (or "hello", or let the first-wake briefing run) and the
+screen, the night light and the volume go back to exactly what they were.
+
+### If something goes wrong
+
+Nothing is guessed. The state to restore is written to
+`~/.aiws_trainer/jarvis_memory/winddown.json` **before** the first thing
+changes, so:
+
+* a failure part-way through dimming restores the screen immediately;
+* a crash mid-fade leaves the file, and the next "good morning" undoes it;
+* a second "good night" is a no-op — snapshotting then would record the
+  *dimmed* screen as the brightness to go back to;
+* starting Jarvis again after the window is over restores it (a restart at
+  two in the morning deliberately does not, or the room would light up);
+* a file older than a day and a half is always restored, whatever it says.
+
+And there is a door from outside the app, for a screen left dim by something
+that took Jarvis with it:
+
+```bash
+~/vss_env/bin/python -m jarvis.winddown --status     # what it would put back
+~/vss_env/bin/python -m jarvis.winddown --restore    # put it back now
+```
+
+### Requirements
+
+`xrandr` and `gsettings`, both already present, both without sudo; the screen
+brightness is X's software gamma, not a backlight, so it works over HDMI on a
+desktop monitor. Spotify only does anything when the account is linked
+(section 11) and a device is reachable — otherwise it is a night without
+music and no apology, exactly as in a focus session.
