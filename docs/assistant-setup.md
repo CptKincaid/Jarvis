@@ -3434,3 +3434,165 @@ keep the ledger (and the board's lane) while saying nothing at all.
 All of this rides the health watchdog's existing 30-second tick. There is
 no extra thread and no `nvidia-smi` call — the wedge these features exist
 to warn about is precisely the state in which `nvidia-smi` blocks forever.
+
+## 80. The Oracle box: "how's the game news bot, sir?"
+
+Your Oracle Cloud VM — `opc@170.9.245.136`, the Oracle Linux box running the
+Discord **game-news** bot under pm2 out of `~/Game-News` — can answer for
+itself:
+
+> **You:** how's the Oracle box?
+> **Jarvis:** game-news has been online 3 days, sir; the box has been up 40
+> days with 0.5 gigabytes free.
+
+…with the full sheet on the card beside it: uptime, load, memory, disk and
+every pm2 process with its status, cpu, memory and restart count.
+
+This lane is **outbound only**. Jarvis asks the Oracle box questions. Nothing
+opens the other way: there is no tunnel, no reverse tunnel, no port-forward
+and no setting here that exposes the Spark to the internet — deliberately, and
+there is a test that asserts it rather than trusting the comment.
+
+### It is off until you give it a key
+
+Everything below is off by default and there is **no key on this machine that
+works**. The one in `~/Downloads/Oracle Cloud Service (2)/Oracle Cloud
+Service/Discord Bot/Keys/ssh-key-2025-08-15.key` is a real RSA key at mode
+0600, and the host is reachable — but the server rejects it:
+
+```
+$ ssh -i ".../Keys/ssh-key-2025-08-15.key" opc@170.9.245.136
+opc@170.9.245.136: Permission denied (publickey).
+```
+
+Your cheat sheet uses a *different* key called `oracle-key`, which lives on
+your Windows desktop. So step one is getting a working credential onto the
+Spark. There are two ways, and either is fine.
+
+**Either — copy the key that already works.** On the Windows desktop it is at:
+
+```
+C:\Users\h2pey\Desktop\Oracle Cloud Service\XLAB Digital Steam News Bot\Keys\oracle-key
+```
+
+From the Spark:
+
+```bash
+mkdir -p ~/.ssh/oracle && chmod 700 ~/.ssh/oracle
+# copy the file across however you like (USB stick, scp from the desktop,
+# a private paste — it is a private key, so not email and not a chat)
+chmod 600 ~/.ssh/oracle/oracle-key
+ssh -i ~/.ssh/oracle/oracle-key opc@170.9.245.136 'echo ok'
+```
+
+That `echo ok` is the whole test. If it prints `ok`, you are done with step one.
+
+**Or — authorise the key the Spark already has.** From the Windows desktop
+(or anywhere that can already get in), append the *public* half of the key
+that is sitting in your Downloads folder to the server's authorized_keys:
+
+```bash
+# the public half, already next to the private one on the Spark:
+#   ~/Downloads/Oracle Cloud Service (2)/Oracle Cloud Service/Discord Bot/Keys/ssh-key-2025-08-15.key.pub
+# it is one line beginning "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC5OVROXJgx9..."
+ssh -i "<the oracle-key that works>" opc@170.9.245.136 \
+    'mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys' \
+    < "ssh-key-2025-08-15.key.pub"
+```
+
+Then on the Spark, move the private key somewhere permanent (Downloads is not
+a home for a key) and check it:
+
+```bash
+mkdir -p ~/.ssh/oracle && chmod 700 ~/.ssh/oracle
+cp ~/Downloads/"Oracle Cloud Service (2)"/"Oracle Cloud Service"/"Discord Bot"/Keys/ssh-key-2025-08-15.key \
+   ~/.ssh/oracle/oracle-key
+chmod 600 ~/.ssh/oracle/oracle-key
+ssh -i ~/.ssh/oracle/oracle-key opc@170.9.245.136 'echo ok'
+```
+
+A key copied off Windows often lands mode 0644, and ssh refuses it outright
+("UNPROTECTED PRIVATE KEY FILE"). Jarvis checks the mode himself and says so
+in those words rather than blaming authentication, but `chmod 600` first and
+save yourself the trip.
+
+### Then switch it on
+
+In `~/.config/jarvis/assistant.json`:
+
+```json
+"oracle": {
+  "enabled": true,
+  "host": "170.9.245.136",
+  "user": "opc",
+  "key_path": "~/.ssh/oracle/oracle-key",
+  "timeout_s": 6,
+  "cache_s": 25,
+  "actions": {
+    "status": "pm2 status --no-color",
+    "logs": "pm2 logs --lines 20 --nostream --no-color",
+    "restart the bot": "pm2 restart game-news"
+  }
+}
+```
+
+`enabled` and `key_path` are the two that matter; the rest already ship with
+these values. No restart is needed for the voice commands — the config is read
+fresh on every question — but the `oracle_status` tool the local model can
+call is only registered at boot, so restart Jarvis if you want that too.
+
+Until then, every phrasing gets one honest line naming exactly what is
+missing, and **nothing opens a socket**:
+
+> I've no key for the Oracle box, sir; set oracle.key_path in
+> ~/.config/jarvis/assistant.json.
+
+### What you can say
+
+| say | what happens |
+|---|---|
+| "how's the Oracle box" · "is the game news bot up" · "what's running on Oracle" · "check the Oracle box" · "Oracle status" | the status sentence + the card |
+| "show me the game news bot logs" · "Oracle logs" · "what do the game news bot logs say" | the last 20 lines on a card, and how many of them mention an error |
+| "restart the game news bot" · "Oracle restart the bot" | **read back first** — "Restart the bot on the Oracle box, sir?" — and only a yes runs it |
+| "is the server up" · "how's the bot" · "restart the bot" | the same three, but only once the lane is switched on. With it off these name no box, so they go to the model instead of Jarvis claiming your local dev server |
+
+Ask twice in a row and the second answer is instant: the last good reading is
+kept for `cache_s` seconds, so "how's the Oracle box" followed by "and
+how's the game news bot?" is one round trip, not two. Running any action
+throws that reading away — a restart must never be reported off a reading
+taken before it.
+
+### The rules it keeps
+
+**Named actions only, and nothing from your voice reaches a shell.** The
+`actions` table maps a *spoken name* onto an *exact command*. Jarvis resolves
+what you said against the keys of that table and runs the matching row's
+string verbatim; not one character of the transcript is ever interpolated into
+a command. Anything that is not a row is refused out loud, and told what he
+does know:
+
+> **You:** run deploy on the Oracle box
+> **Jarvis:** I don't do "deploy" on the Oracle box, sir. I know "status",
+> "logs" and "restart the bot".
+
+Add rows if you want more — `"pull and restart": "cd ~/Game-News && git pull && npm install && pm2 restart game-news"`
+is the obvious one. Anything whose *command* changes state is read back for a
+yes automatically; you do not have to remember to mark it, because the check
+reads the command rather than the name you gave it.
+
+**It cannot hang the turn.** One ssh round trip, `timeout_s` seconds, and the
+child is killed *without being waited for* — the same shape as the
+`nvidia-smi` call in the health tool, and for the same reason: a
+`subprocess.run` timeout kills the child and then blocks waiting for it, and
+an ssh stuck in a TCP connect against a host that silently drops packets never
+exits. Past the budget he says so:
+
+> The Oracle box didn't answer in 6 seconds, sir; I've stopped waiting on it.
+
+**pm2 needs its PATH.** `ssh host 'pm2 status'` runs a *non-login* shell,
+which never sources the `~/.bashrc` block that puts nvm's node on PATH — so
+the command straight off your cheat sheet answers "pm2: command not found"
+even though it works the moment you ssh in and type it. Every remote command
+is prefixed with a small POSIX prelude that puts `~/.nvm/versions/node/*/bin`
+back on PATH, which is why the config can hold the plain command you already
+know.

@@ -393,6 +393,35 @@ DEFAULTS: dict = {
     # the gate (which fails SHUT) would reject his own voice. max_mb caps
     # one clip; the socket framing allows a little more than this.
     "intercom": {"enabled": True, "verify_speaker": False, "max_mb": 10},
+    # Hunter's Oracle Cloud VM (jarvis/tools/oracle.py): the Oracle Linux
+    # box running the Discord "game-news" bot under pm2. OUTBOUND ONLY --
+    # Jarvis asks it questions over ssh; nothing here opens anything the
+    # other way, and there is deliberately no tunnel, reverse tunnel or
+    # port-forward setting to turn on.
+    #
+    # OFF and keyless by default: with `key_path` empty every entry point
+    # answers one line naming what is missing and NOTHING opens a socket.
+    # timeout_s is the whole budget for one round trip -- past it he says
+    # the box did not answer rather than holding the turn -- and cache_s is
+    # how long the last good reading answers a second question for free.
+    #
+    # `actions` is an ALLOW-LIST: a spoken name -> the exact command run on
+    # the far side. Nothing from a transcript is ever interpolated into a
+    # command; a misheard word can only fail to match a key. Any command
+    # that changes state (the restart) is read back for a yes first.
+    "oracle": {
+        "enabled": False,
+        "host": "170.9.245.136",
+        "user": "opc",
+        "key_path": "",
+        "timeout_s": 6,
+        "cache_s": 25,
+        "actions": {
+            "status": "pm2 status --no-color",
+            "logs": "pm2 logs --lines 20 --nostream --no-color",
+            "restart the bot": "pm2 restart game-news",
+        },
+    },
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",

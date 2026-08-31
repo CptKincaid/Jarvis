@@ -97,6 +97,7 @@ from jarvis.memory import parse_person_statement, parse_since
 from jarvis import selfstate
 from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
+from jarvis.tools import oracle as oracle_mod
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import write_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
@@ -256,6 +257,13 @@ class IntentClassifier:
         "anything wrong", "what went wrong", "the matter", "the fault",
         "quietly", "narrat", "keep it down", "fewer updates",
         "less updates", "how's the run", "the training", "the trainer",
+        # --- the Oracle box (2026-08-31): jarvis/tools/oracle.py ---
+        # The Tier-1 probe bypasses the gate for an exact match; these carry
+        # the loose phrasings ("is that bot of mine still alive?"). Every
+        # word here NAMES the box, so none of them can drag an unrelated
+        # sentence past the classifier.
+        "oracle", "game news", "game-news", "the bot", "discord bot",
+        "pm2", "still up", "still running", "the server",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -3481,6 +3489,197 @@ def _h_gpu_lend(c, t, m):
                          status="GPU lent")
 
 
+# ---- the Oracle Cloud VM (jarvis/tools/oracle.py) ------------------------
+# OUTBOUND ONLY: three doors out to Hunter's Oracle Linux box, none back in.
+# Every one of them reads the config first and answers ONE honest line when
+# the lane is off or keyless -- so on a fresh install none of this opens a
+# socket. Not a character of the transcript ever reaches a shell: the action
+# handler resolves a spoken NAME against the `oracle.actions` allow-list and
+# runs that row's command verbatim, or refuses out loud.
+_ORACLE_BOX = (r"(?:oracle(?:\s+(?:box|server|vm|cloud))?|"
+               r"game[\s-]*news(?:\s+bot)?|discord\s+bot)")
+_ORACLE_STATUS_RX = re.compile(
+    r"^(?:"
+    r"(?:how(?:'s|s| is| are|'re)|what(?:'s|s| is))\s+(?:the\s+|my\s+)?"
+    + _ORACLE_BOX + r"(?:\s+(?:doing|looking|getting on))?|"
+    r"(?:is|are)\s+(?:the\s+|my\s+)?" + _ORACLE_BOX +
+    r"\s+(?:up|running|alive|ok|okay|online|still up|still running)|"
+    r"what(?:'s|s| is)\s+(?:running|up)\s+on\s+(?:the\s+|my\s+)?"
+    + _ORACLE_BOX + r"|"
+    r"(?:check|check on|look at)\s+(?:the\s+|my\s+)?" + _ORACLE_BOX + r"|"
+    r"oracle\s+status|status\s+of\s+(?:the\s+|my\s+)?" + _ORACLE_BOX +
+    r")\W*$", re.I)
+# "is the server up", "how's the bot", "restart the bot": phrasings that
+# name no box at all. He asked for them and he has exactly one of each, so
+# they answer -- but ONLY once the lane is switched on. With oracle.enabled
+# false every handler returns None on them and the words go to the model,
+# because answering "the Oracle box is switched off in my settings" to a
+# question about a local dev server would be a confident wrong answer, and
+# those are the expensive kind. _ORACLE_NAMED_RX is that test.
+_ORACLE_NAMED_RX = re.compile(_ORACLE_BOX + r"|\bpm2\b", re.I)
+_ORACLE_VAGUE_RX = re.compile(
+    r"^(?:(?:how(?:'s|s| is)|what(?:'s|s| is))\s+(?:the\s+|my\s+)?"
+    r"(?:server|bot)(?:\s+doing)?|"
+    r"(?:is|are)\s+(?:the\s+|my\s+)?(?:server|bot)\s+"
+    r"(?:up|running|alive|ok|okay|online))\W*$", re.I)
+# The box is REQUIRED in every branch: Jarvis has his own log ("anything
+# wrong in your log", _h_log_triage), and a bare "check the logs" belongs to
+# whichever of the two he was just talking about, not to this one.
+_ORACLE_VERB = r"(?:(?:show|read|check|tail|pull up|get|give)\s+(?:me\s+)?)?"
+_ORACLE_LOGS_RX = re.compile(
+    r"^(?:"
+    + _ORACLE_VERB + r"(?:the\s+|my\s+)?" + _ORACLE_BOX + r"(?:'s)?\s+logs?|"
+    + _ORACLE_VERB + r"(?:the\s+|my\s+)?logs?\s+(?:from|for|on)\s+"
+    r"(?:the\s+|my\s+)?" + _ORACLE_BOX + r"|"
+    r"what\s+(?:do|does)\s+(?:the\s+|my\s+)?" + _ORACLE_BOX + r"\s+logs?\s+say"
+    r")\W*$", re.I)
+# The named-action door. Every branch has to name the box, so ordinary talk
+# cannot reach it; the captured words then have to BE a row in the table.
+_ORACLE_ACTION_RX = re.compile(
+    r"^(?:"
+    r"(?P<verb>restart|reboot|reload|stop|start)\s+(?:the\s+|my\s+)?"
+    r"(?:" + _ORACLE_BOX + r"|bot)|"
+    r"(?:on\s+)?(?:the\s+|my\s+)?oracle(?:\s+(?:box|server|vm))?\s*[,:]?\s*"
+    r"(?:please\s+)?(?:run\s+)?(?P<named>[a-z][a-z0-9' -]{0,32}?)|"
+    r"(?:please\s+)?(?:run\s+)?(?P<named2>[a-z][a-z0-9' -]{0,32}?)\s+on\s+"
+    r"(?:the\s+|my\s+)?oracle(?:\s+(?:box|server|vm))?"
+    r")\W*$", re.I)
+ORACLE_LOGS_ACTION = "logs"
+ORACLE_BUSY_STATUS = "Asking Oracle…"
+
+
+def _m_oracle_status(t):
+    return _ORACLE_STATUS_RX.match(t) or _ORACLE_VAGUE_RX.match(t)
+
+
+def _oracle_conf(c):
+    return oracle_mod.read_config(c._svc("assistant"))
+
+
+def _oracle_unnamed_and_off(conf, t: str) -> bool:
+    """True when the words never named the box and the lane is off -- see
+    _ORACLE_NAMED_RX. The handler falls through to the model instead of
+    claiming a server it has not been told about."""
+    return not conf.enabled and not _ORACLE_NAMED_RX.search(t)
+
+
+def _oracle_blocked(conf):
+    """The CommandResult for an unconfigured lane, or None. One line naming
+    exactly what is missing, and no socket opened to find out."""
+    reason = oracle_mod.missing_reason(conf)
+    if reason is None:
+        return None
+    return CommandResult(handled=True, reply=reason, speak=True,
+                         status="Oracle: not set up")
+
+
+def _h_oracle_status(c, t, m):
+    conf = _oracle_conf(c)
+    if _oracle_unnamed_and_off(conf, t):
+        return None                    # bare "is the server up": see above
+    blocked = _oracle_blocked(conf)
+    if blocked is not None:
+        return blocked
+    # A reading from the last few seconds answers on the spot: two questions
+    # in a row are one round trip, and the second is instant rather than a
+    # second done=False turn sitting open for six seconds.
+    hit = oracle_mod.cached(conf)
+    if hit is not None:
+        bus.publish(JarvisReply(text=oracle_mod.card(conf, hit), speak=False))
+        return CommandResult(handled=True, speak=True, status="Oracle",
+                             reply=oracle_mod.speak_line(conf, hit))
+
+    def _run():
+        reading, why = oracle_mod.status(conf)
+        if reading is None:
+            line = oracle_mod.fail_line(conf, why)
+            bus.publish(Status(text="Oracle: no answer", kind="warn"))
+            c._speak(line)
+            bus.publish(JarvisReply(text=line, speak=False))
+            return
+        bus.publish(JarvisReply(text=oracle_mod.card(conf, reading), speak=False))
+        bus.publish(Status(text="Oracle", kind="ok"))
+        c._speak(oracle_mod.speak_line(conf, reading))
+
+    c._bg(_run)
+    return CommandResult(handled=True, status=ORACLE_BUSY_STATUS, done=False)
+
+
+def _oracle_run_action(c, conf, name: str, command: str):
+    """Run one allow-listed row in the background and say what came back.
+    ``command`` is the config's own string; ``name`` is only ever a label."""
+    def _run():
+        ok, text = oracle_mod.run_action(conf, command)
+        if not ok:
+            bus.publish(Status(text="Oracle: no answer", kind="warn"))
+            c._speak(text)
+            bus.publish(JarvisReply(text=text, speak=False))
+            return
+        if oracle_mod.key_tokens(name) == (ORACLE_LOGS_ACTION,):
+            line, sheet = oracle_mod.log_summary(text)
+        else:
+            sheet = text[:oracle_mod.CARD_CHAR_CAP]
+            line = oracle_mod.DONE_LINE if text else oracle_mod.NOTHING_BACK_LINE
+        if sheet:
+            bus.publish(JarvisReply(text=sheet, speak=False))
+        bus.publish(Status(text=f"Oracle: {name}"[:30], kind="ok"))
+        c._speak(line)
+        # The status probe's cache is stale the moment an action ran: a
+        # restart that answers "up 3 seconds" from a 20-second-old reading
+        # would be the one wrong answer this lane must never give.
+        oracle_mod.clear_cache()
+
+    c._bg(_run)
+    return CommandResult(handled=True, status=f"Oracle: {name}"[:30], done=False)
+
+
+def _h_oracle_logs(c, t, m):
+    conf = _oracle_conf(c)
+    if _oracle_unnamed_and_off(conf, t):
+        return None
+    blocked = _oracle_blocked(conf)
+    if blocked is not None:
+        return blocked
+    name, command = oracle_mod.resolve_action(conf, ORACLE_LOGS_ACTION)
+    if command is None:
+        return CommandResult(handled=True, speak=True, status="Not on the list",
+                             reply=oracle_mod.unknown_action_line(
+                                 conf, ORACLE_LOGS_ACTION))
+    return _oracle_run_action(c, conf, name, command)
+
+
+def _h_oracle_action(c, t, m):
+    spoken = (m.group("verb") and f"{m.group('verb')} the bot") \
+        or m.group("named") or m.group("named2") or ""
+    if not oracle_mod.key_tokens(spoken):
+        # Nothing but the box's own name ("the oracle box"): that is not an
+        # instruction, so it goes to the model rather than being refused.
+        return None
+    conf = _oracle_conf(c)
+    if _oracle_unnamed_and_off(conf, t):
+        return None                    # bare "restart the bot": see above
+    blocked = _oracle_blocked(conf)
+    if blocked is not None:
+        return blocked
+    name, command = oracle_mod.resolve_action(conf, spoken)
+    if command is None:
+        # Refused out loud, never guessed at and never fallen through to the
+        # model: "run whatever on the oracle box" must end here.
+        log.info("oracle: %r is not on the allow-list", spoken)
+        return CommandResult(handled=True, speak=True, status="Not on the list",
+                             reply=oracle_mod.unknown_action_line(conf, spoken))
+    if oracle_mod.changes_state(command):
+        # The same rung a bulk cancel uses: read it back, and the next yes
+        # runs it (_try_destructive_confirm). Restarting his bot is not a
+        # thing to do on a maybe-heard word.
+        line = oracle_mod.READ_BACK_LINE.format(spoken=name.capitalize())
+        c.stash_destructive(
+            lambda: _oracle_run_action(c, conf, name, command), line)
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status="Confirm?")
+    return _oracle_run_action(c, conf, name, command)
+
+
 def _h_network(c, t, m):                                   # 3267-3279
     net = c._svc("context").check_connectivity()
     status = "Online" if net.get("internet") else "Offline"
@@ -5055,6 +5254,14 @@ REGISTRY: list[Command] = [
             _h_processes, needs=("context",)),
     # Before "git status": "what did I change today" contains no git-status
     # phrase, but the standup regex is anchored and the safer first match.
+    # The Oracle box, outbound only. Status FIRST: "what's running on the
+    # oracle box" would otherwise be read by the action door as a command
+    # named "what's running" and refused instead of answered. `needs` stays
+    # empty on purpose -- these read the assistant config, not a service, so
+    # they must still be reachable on a box where nothing else is wired.
+    Command("oracle status", _m_oracle_status, _h_oracle_status),
+    Command("oracle logs", _ORACLE_LOGS_RX.match, _h_oracle_logs),
+    Command("oracle action", _ORACLE_ACTION_RX.match, _h_oracle_action),
     Command("standup", standup.STANDUP_RX.match, _h_standup,
             needs=("context",)),
     Command("gpu reclaim", _GPU_RECLAIM_RX.match, _h_gpu_reclaim,
@@ -5194,6 +5401,10 @@ ASSISTANT_TIER1: list[Command] = [
                     # already consumed, so they need the unprefixed pass too
                     "scene", "room light",
                     "standup", "gpu reclaim", "gpu lend",
+                    # the Oracle box: "how's the game news bot" is asked at
+                    # the desk with the wake word already eaten by the
+                    # hotword, like every other surface question
+                    "oracle status", "oracle logs", "oracle action",
                     "log triage", "whats wrong", "quietly", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router

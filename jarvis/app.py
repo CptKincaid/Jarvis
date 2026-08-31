@@ -116,6 +116,11 @@ TOOL_MODULES = (
     "jarvis.tools.screen",
     "jarvis.tools.health",
     "jarvis.tools.journal",
+    # Last, and usually free: oracle.make_tools returns NOTHING unless the
+    # Oracle box is switched on AND has a key, so the default install pays
+    # no schema for it. The registry is already over its 11-tool budget and
+    # every schema is prefill on every model turn.
+    "jarvis.tools.oracle",
 )
 
 # Fixed persona lines the app itself speaks (spec 3.4); prewarmed. The
