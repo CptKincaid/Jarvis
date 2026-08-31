@@ -63,6 +63,7 @@ from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
 from jarvis import dayreview as dayreview_mod
+from jarvis import garden as garden_mod
 from jarvis.brain import JarvisBrain
 from jarvis.commander import COURTESY_REPLIES, Commander, parse_yes_no
 from jarvis.context import ContextEngine
@@ -756,6 +757,13 @@ class JarvisApp:
             slow_turn=self.slow_turn_text,
             # "how did yesterday go": the day review, spoken (dayreview.py)
             dayreview=self.day_review_text,
+            # "how was my week": the cross-day trends (dayreview.week_*),
+            # and the memory garden's two answers (jarvis/garden.py).
+            # Resolved through the app so a garden that has not started
+            # yet answers honestly rather than being absent from Tier 1.
+            week_review=self.week_review_text,
+            garden_report=self.garden_report_text,
+            garden_undo=self.garden_undo_text,
             # the health watchdog resolves this at fire time (talkback-gated).
             # Its warnings are proactive: quiet hours hold them for the digest
             # ("...and a memory warning") instead of waking him at 3 am.
@@ -1663,6 +1671,14 @@ class JarvisApp:
             review = ""
         if review:
             self._say(review)
+        # Then the two weekly lines, if either is owed. Both are produced
+        # in the small hours by their own threads and deliberately NOT
+        # spoken there: this path is the quiet-gated one (_briefing_due
+        # refuses inside quiet hours), so a report written at 3 am is
+        # heard at breakfast and never at 3 am.
+        for line in (self._pending_week_line(), self._pending_garden_line()):
+            if line:
+                self._say(line)
         self._say("Your briefing for today, sir.")
         try:
             brain.chat("my morning briefing", force_tool="get_briefing")
@@ -1703,6 +1719,106 @@ class JarvisApp:
         only posts when the channel is configured)."""
         self._alert("milestone", f"Day review {day.isoformat()}",
                     dayreview_mod.table(digest))
+
+    def _pending_week_line(self) -> str:
+        """The weekly self-review's two sentences, once, and only when a
+        report has been filed that nobody has heard yet."""
+        try:
+            week = dayreview_mod.pending_week(PATHS.REVIEWS_DIR)
+            if week is None:
+                return ""
+            line = dayreview_mod.week_spoken(week)
+            # Marked before speaking, not after: a TTS failure must not
+            # make him deliver last week's review again tomorrow.
+            dayreview_mod.mark_week_spoken(PATHS.REVIEWS_DIR, week.get("week", ""))
+            return line
+        except Exception:
+            log.exception("pending week review failed")
+            return ""
+
+    def _pending_garden_line(self) -> str:
+        """"I filed three things from this week, sir." Once per pass."""
+        g = getattr(self, "garden", None)
+        if g is None:
+            return ""
+        try:
+            line = g.pending_line()
+            if line:
+                g.mark_spoken()
+            return line
+        except Exception:
+            log.exception("pending garden line failed")
+            return ""
+
+    # --------------------------------------------------------- the week
+    def _on_week_filed(self, week):
+        """The weekly self-review was just aggregated: the table goes to
+        Discord like the nightly one, and every recurring warning and
+        worsened number is appended to feedback.jsonl. The two spoken
+        sentences are NOT said here -- the report is filed in the small
+        hours; `pending_week` holds them for the first wake."""
+        self._alert("milestone", f"Week review {week.get('week', '')}",
+                    dayreview_mod.week_table(week))
+        self._file_week_regressions(week)
+
+    def _file_week_regressions(self, week) -> int:
+        """One JSON line per regression in feedback.jsonl -- the standing
+        bug list Jarvis wrote about himself, ready for the next Claude
+        session. `kind: regression` distinguishes these rows from the
+        intent-gate labels the commander appends to the same file; nothing
+        parses it, and one audit trail beats two. Once per week, because
+        week_tick only calls back on the tick that FILED the report."""
+        try:
+            rows = dayreview_mod.week_regressions(week)
+        except Exception:
+            log.exception("weekly regressions failed")
+            return 0
+        if not rows:
+            return 0
+        try:
+            path = Commander.FEEDBACK_LOG
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with open(path, "a") as fh:
+                for row in rows:
+                    fh.write(json.dumps({
+                        "ts": datetime.now().isoformat(timespec="seconds"),
+                        "kind": "regression", "week": week.get("week", ""),
+                        "text": row.get("text", ""), "how": "weekly-review",
+                        "detail": row}) + "\n")
+        except Exception:
+            log.exception("weekly regression log failed")
+            return 0
+        log.info("week review: filed %d regressions to feedback.jsonl", len(rows))
+        return len(rows)
+
+    def week_review_text(self) -> tuple:
+        """"How was my week": (spoken, card) from the newest filed weekly
+        report, or an honest excuse before the first one exists."""
+        week = dayreview_mod.latest_week(PATHS.REVIEWS_DIR)
+        if week is None:
+            reviewer = getattr(self, "dayreviewer", None)
+            if reviewer is not None:
+                try:
+                    week = reviewer.week_tick()
+                except Exception:
+                    log.exception("on-demand week review failed")
+        if week is None or not week.get("has_data"):
+            return ("I've no full week to review yet, sir; the reports start "
+                    "once a week of days has been filed.", "")
+        return dayreview_mod.week_spoken(week), dayreview_mod.week_table(week)
+
+    # ------------------------------------------------------ memory garden
+    def garden_report_text(self) -> str:
+        g = getattr(self, "garden", None)
+        if g is None:
+            return "The memory garden isn't running, sir."
+        return g.report_line()
+
+    def garden_undo_text(self) -> str:
+        g = getattr(self, "garden", None)
+        if g is None:
+            return "The memory garden isn't running, sir."
+        return g.undo()
 
     # ------------------------------------------------------- diagnostics
     def diagnostics_text(self) -> str:
@@ -2286,10 +2402,26 @@ class JarvisApp:
             # channel is configured (dayreview.py).
             self.dayreviewer = dayreview_mod.DayReviewer(
                 PATHS.LOG_DIR / "jarvis.log", PATHS.LOG_DIR / "turns.jsonl",
-                PATHS.REVIEWS_DIR, on_filed=self._on_review_filed)
+                PATHS.REVIEWS_DIR, on_filed=self._on_review_filed,
+                on_week=self._on_week_filed)
             self.dayreviewer.start()
         except Exception:
             log.exception("day reviewer failed to start")
+        try:
+            # The weekly memory garden (jarvis/garden.py): once the ISO week
+            # closes, in the small hours, the week's journal is read by the
+            # local model and what it finds is filed as tagged facts. The
+            # brain gates are passed as callables so the thread never has to
+            # know which brain object is live.
+            self.garden = garden_mod.MemoryGarden(
+                self.memory, context=self.context, cfg=self.assistant,
+                extract=brain_mod.extract_facts,
+                busy=lambda: bool(getattr(self.brain, "is_busy", False)),
+                lent=brain_mod.is_lent)
+            if self.garden.enabled:
+                self.garden.start()
+        except Exception:
+            log.exception("memory garden failed to start")
         cal = getattr(self.services, "calendar", None)
         if cal is not None:
             try:
@@ -2477,7 +2609,8 @@ class JarvisApp:
                           ("focus", getattr(self, "focus", None)),
                           ("presence", getattr(self, "presence", None)),
                           ("quiet", getattr(self, "quiet", None)),
-                          ("dayreviewer", getattr(self, "dayreviewer", None))):
+                          ("dayreviewer", getattr(self, "dayreviewer", None)),
+                          ("garden", getattr(self, "garden", None))):
             if obj is None:
                 continue
             fn = getattr(obj, "stop", None) or getattr(obj, "close", None)
