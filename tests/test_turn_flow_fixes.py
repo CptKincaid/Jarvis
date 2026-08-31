@@ -36,6 +36,7 @@ def _app(monkeypatch, tmp_path, **over):
     a._last_source, a._last_user_text = "voice", "hello"
     a.said = []
     a._say = a.said.append
+    a._wake_chime_enabled = lambda: False   # chime timing is not under test
     a.context = SimpleNamespace(add_exchange=lambda u, j: a.exchanges.append((u, j)))
     a.exchanges = []
     a.services = SimpleNamespace(brain=SimpleNamespace(chat=lambda t, **kw: a.chats.append((t, kw))))

@@ -7,6 +7,7 @@ audio, no Spotify (the music mode is off).
 """
 import json
 import time
+from datetime import timedelta
 from datetime import date, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -266,7 +267,12 @@ def test_streak_phrases(cmdr, text):
     assert cmdr._match_assistant(text) == "study streak"
 
 
-def test_the_answer_reads_the_ledger(cmdr, session):
+def test_the_answer_reads_the_ledger(cmdr, session, monkeypatch):
+    # Boundary-proof: at 00:10 on a Monday, "yesterday" is last ISO week and
+    # the second row silently fell out (caught live 2026-08-31). Widen the
+    # window seam instead of trusting the wall clock's weekday.
+    from jarvis import focus as focus_mod
+    monkeypatch.setattr(focus_mod, "week_start", lambda d: d - timedelta(days=6))
     now = time.time()
     session.history_path.write_text(
         json.dumps(_row(now, blocks=2, block_min=25)) + "\n" +
