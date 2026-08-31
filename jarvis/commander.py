@@ -86,6 +86,7 @@ from jarvis.events import JarvisReply, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import parse_person_statement, parse_since
+from jarvis.tools import journal as journal_mod
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import write_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, topic_chunks
@@ -176,6 +177,13 @@ class IntentClassifier:
         "quiz", "flashcard", "flash card", "standup", "stand-up", "drill",
         "review", "cards", "yesterday go", "your logs", "the logs", "triage",
         "what did i do", "what did i miss",
+        # --- memory round (2026-08-30): episodic recall, the memory garden
+        # and the weekly report. The Tier-1 probe bypasses the gate for an
+        # exact match; these cover the paraphrases that reach the classifier
+        # ("so how long since I looked at the thesis?").
+        "when did i last", "the last time i", "how long since",
+        "you filed", "memory report", "filed this week", "garden",
+        "my week", "week in review", "how was my week",
     ]
 
     # Patterns that suggest casual/side conversation
@@ -1378,6 +1386,69 @@ def _h_remember(c, t, m):                                  # 3109-3118
     return CommandResult(handled=True, reply=f"Remembered: {note}")
 
 
+# "When did I last talk to my advisor?" -- episodic recall over the activity
+# journal (jarvis/tools/journal.py).  ABOVE "recall" in the registry: the
+# recall matcher does not claim these words, but the two are neighbours and
+# the order documents which one owns "when did I last say X".
+_LAST_SEEN_RX = re.compile(
+    r"^(?P<gap>how long (?:has it been |is it |it's been |have i gone )?since)"
+    r"\s+i(?:'ve| have)?\s+(?P<tail1>.+)$"
+    r"|^when did i last\s+(?P<tail2>.+)$"
+    r"|^when(?:'s| was| is) the last time (?:that )?i\s+(?P<tail3>.+)$", re.I)
+
+
+def _h_last_seen(c, t, m):
+    """The last time the JOURNAL saw this — not the last time it happened.
+
+    The journal records what flowed through Jarvis (turns, tool calls,
+    Claude results, sampled window titles), so a meeting he never mentioned
+    aloud is invisible; the wording says "you said" / "you had X open" so
+    the answer never overclaims. A miss falls back to long-term memory,
+    which may hold a fact he TOLD me about the same thing."""
+    memory = c._svc("memory")
+    tail = m.group("tail1") or m.group("tail2") or m.group("tail3") or ""
+    target = journal_mod.mention_target(tail)
+    if not target:
+        return None                    # "when did I last?" — let the model try
+    engine = c._svc("context_engine") or c._svc("conversation")
+    journal_dir = None
+    try:
+        if hasattr(engine, "journal_dir"):
+            journal_dir = engine.journal_dir()
+    except Exception:
+        log.exception("journal dir lookup failed")
+    if journal_dir is None:
+        journal_dir = PATHS.MEMORY_DIR / "journal"
+    now = journal_mod._now()       # the module's clock seam; tests pin it
+    try:
+        row = journal_mod.find_last_mention(
+            journal_dir, journal_mod.mention_terms(target, memory), now=now)
+    except Exception:
+        log.exception("journal mention scan failed")
+        return CommandResult(handled=True, speak=True, status="Last mention failed",
+                             reply="I couldn't read the journal, sir.")
+    if row is not None:
+        line = journal_mod.last_mention_line(row, target, now=now,
+                                             duration=bool(m.group("gap")))
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status="Last mention")
+    hits = []
+    try:
+        if hasattr(memory, "recall"):
+            hits = memory.recall(target)
+    except Exception:
+        log.exception("recall after a journal miss failed")
+    if not isinstance(hits, list):
+        hits = []                      # a stubbed memory must not reach the voice
+    value = str(hits[0].get("value", "")).strip() if hits else ""
+    line = journal_mod.no_mention_line(target)
+    if value:
+        line = (f"Nothing in the journal about {target}, sir, but I have "
+                f"this stored: {value}.")
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Last mention: nothing")
+
+
 def _h_recall(c, t, m):                                    # 3120-3133
     query, since = parse_since(m.group(1).strip())
     memory = c._svc("memory")
@@ -2355,6 +2426,77 @@ def _h_dayreview(c, t, m):
         line = "I'm afraid the review didn't complete, sir."
     return CommandResult(handled=True, reply=line, speak=True, status="Day review")
 
+# The weekly self-review (jarvis/dayreview.py week_*): cross-day trends over
+# the nightly digests. Registered BEFORE the "week" briefing command, which
+# owns "how's my week looking" -- the forecast is about his calendar, this is
+# about Jarvis. Neither regex reaches the other's words; the order says which
+# would win if a future phrasing straddled them.
+_WEEKREVIEW_RX = re.compile(
+    r"^(?:(?:my |the |your )?week(?:ly)? (?:review|report|self[- ]review|digest)"
+    r"|(?:my |the )?week in review"
+    r"|how (?:was|did) (?:my|the|your) week(?:\s+go)?"
+    r"|what went wrong last week"
+    r"|review (?:my |the )?last week)\W*$", re.I)
+# The weekly memory garden (jarvis/garden.py): what Jarvis filed about him
+# out of his own journal, and the one sentence that takes it back.
+_GARDEN_UNDO_RX = re.compile(
+    r"^(?:forget (?:the )?(?:last )?(?:garden|memory) pass"
+    r"|undo (?:the )?(?:last )?(?:garden|memory) pass"
+    r"|forget what you (?:filed|learned)(?: (?:this|last) week)?)\W*$", re.I)
+_GARDEN_REPORT_RX = re.compile(
+    r"^(?:memory report"
+    r"|what (?:did|have) you file[d]?(?: this week| last week| from the journal)?"
+    r"|what did you learn(?: about me)?(?: this week| last week)?"
+    r"|what have you learned about me)\W*$", re.I)
+
+
+def _h_week_review(c, t, m):
+    """"How was my week": the two spoken sentences, the table on a card."""
+    fn = c._svc("week_review")
+    if fn is None:
+        return None
+    card = ""
+    try:
+        out = fn()
+        spoken, card = (out if isinstance(out, tuple) else (str(out), ""))
+    except Exception:
+        log.exception("week review failed")
+        spoken = "I'm afraid the weekly review didn't complete, sir."
+    if card:
+        bus.publish(JarvisReply(text=card, speak=False))
+    return CommandResult(handled=True, reply=spoken, speak=True,
+                         status="Week review")
+
+
+def _h_garden_report(c, t, m):
+    fn = c._svc("garden_report")
+    if fn is None:
+        return None
+    try:
+        line = fn()
+    except Exception:
+        log.exception("memory report failed")
+        line = "I'm afraid I couldn't read what I filed, sir."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Memory report")
+
+
+def _h_garden_undo(c, t, m):
+    """The correction path for the garden. No read-back: everything it
+    removes is something JARVIS wrote, never something Hunter said, and
+    the state file keeps the values so the line can name the damage."""
+    fn = c._svc("garden_undo")
+    if fn is None:
+        return None
+    try:
+        line = fn()
+    except Exception:
+        log.exception("memory garden undo failed")
+        line = "I'm afraid I couldn't undo that, sir."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Garden undone")
+
+
 # Jarvis reading his own log (jarvis/logtriage.py): the developer's fastest
 # bug report.  Log-specific words only -- "what went wrong" alone is the
 # persona's, and "any errors" without "log" could be about a build.
@@ -3211,6 +3353,10 @@ REGISTRY: list[Command] = [
     Command("remember",
             _m_re(r"remember (?:that )?(?!to\b)(.+)"),
             _h_remember, needs=("memory",)),
+    # Before "recall": episodic ("when did I last …") vs semantic ("what did
+    # I say about …"). Neither matcher claims the other's words, but the
+    # pair is read together and the order records which owns "when".
+    Command("last seen", _LAST_SEEN_RX.match, _h_last_seen, needs=("memory",)),
     Command("recall",
             _m_re(r"(?:recall|what did i (?:say|tell you) about|remember about)\s+(.+)"),
             _h_recall, needs=("memory",)),
@@ -3244,6 +3390,9 @@ REGISTRY: list[Command] = [
             needs=("timekeeper",)),
     Command("briefing", _BRIEFING_RX.match, _h_briefing, needs=("brain",)),
     Command("preview", _PREVIEW_RX.match, _h_preview, needs=("brain",)),
+    # Jarvis's own week before Hunter's: "weekly review" is the self-review,
+    # "how's my week looking" the calendar forecast below it.
+    Command("week review", _WEEKREVIEW_RX.match, _h_week_review),
     Command("week", _WEEK_RX.match, _h_week, needs=("brain",)),
     Command("briefing section", _PREF_SECTION_RX.match, _h_pref_section,
             needs=("assistant",)),
@@ -3254,6 +3403,10 @@ REGISTRY: list[Command] = [
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
     Command("next exam", _NEXT_EXAM_RX.match, _h_next_exam),
     Command("day review", _DAYREVIEW_RX.match, _h_dayreview),
+    # Undo before report: "forget what you filed" must never be read as a
+    # question about what was filed.
+    Command("garden undo", _GARDEN_UNDO_RX.match, _h_garden_undo),
+    Command("garden report", _GARDEN_REPORT_RX.match, _h_garden_report),
 
     Command("log triage", _LOGTRIAGE_RX.match, _h_log_triage),
     Command("slow turn", _SLOW_RX.match, _h_slow_turn),
@@ -3350,6 +3503,9 @@ ASSISTANT_TIER1: list[Command] = [
                     "timer", "alarm", "list schedule", "cancel schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "next exam", "greeting", "day review",
+                    # the weekly self-review and the memory garden's two
+                    # answers: all three are asked without the wake word
+                    "week review", "garden report", "garden undo",
                     "todo done", "todo add",
                     "todo list",
                     "take note", "show notes", "answer question", "remind me",
@@ -3357,7 +3513,7 @@ ASSISTANT_TIER1: list[Command] = [
                     # answer without the wake-word prefix too: unprefixed
                     # "remember that ..." used to reach the router and the
                     # notes tool instead of the memory it was pitched for
-                    "person", "remember", "recall", "who is", "recap",
+                    "person", "remember", "recall", "last seen", "who is", "recap",
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free",
                     "standup", "gpu reclaim", "gpu lend",
