@@ -282,6 +282,13 @@ def _day_events(events, day: date) -> list[Event]:
     return [e for e in events if e.on(day)]
 
 
+def day_label(day: date, today: date) -> str:
+    """"today" / "tomorrow" / "Friday". Public because the console's room
+    slab (jarvis/app.py _room_next_event) labels its NEXT row with it: the
+    panel and the spoken answer must not word the same day differently."""
+    return _day_label(day, today)
+
+
 def _day_label(day: date, today: date) -> str:
     if day == today:
         return "today"

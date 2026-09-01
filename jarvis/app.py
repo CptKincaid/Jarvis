@@ -3000,7 +3000,15 @@ class JarvisApp:
             if not upcoming:
                 return ""
             ev = min(upcoming, key=lambda e: e.start)
-            return f"{ev.title} {ev.start.strftime('%-I:%M %p').lower()}"
+            # The day, or the slab reads "BIOSENSORS 12:45 pm" at 8 in the
+            # evening and says nothing about WHICH 12:45 that is. "today" is
+            # left off on purpose: the standby face is a clock, so a row
+            # with no day word can only mean the day it is already showing.
+            from jarvis.tools.calendar import day_label
+            when = ev.start.strftime('%-I:%M %p').lower()
+            day = day_label(ev.start.date(), now.date())
+            return f"{ev.title} {when}" if day == "today" else \
+                f"{ev.title} {day} {when}"
         except Exception:                          # noqa: BLE001 - source boundary
             log.debug("room: calendar read failed", exc_info=True)
             return ""
@@ -3030,7 +3038,11 @@ class JarvisApp:
                 "temp": weather_mod.cached_temperature() or "",
                 "arc": "", "presence": "", "quiet": "", "gpu": None}
         if pres is not None and getattr(pres, "configured", False):
-            room["presence"] = str(getattr(pres, "state", "") or "")
+            state = str(getattr(pres, "state", "") or "")
+            # "unknown" is the state before the first poll answers. A WHERE
+            # row reading "unknown" is worse than no row, for the same
+            # reason the docstring above refuses a confident false HOME.
+            room["presence"] = state if state in ("home", "away") else ""
         if quiet is not None:
             try:
                 room["quiet"] = str(quiet.reason() or "")

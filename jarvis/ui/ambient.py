@@ -63,8 +63,13 @@ QUIET_INK = theme.WARN      # the ember the whole slab takes in quiet hours
 AMBIENT_KEYS = (("playing", "NOW"), ("next", "NEXT"), ("due", "DUE"),
                 ("temp", "OUTSIDE"), ("arc", "HOUR"), ("presence", "WHERE"))
 # Standby drops NOW (nothing is playing at 3 a.m.) and the arc word (the
-# clock already says what hour of the house it is).
-STANDBY_KEYS = (("next", "NEXT"), ("due", "DUE"), ("temp", "OUTSIDE"))
+# clock already says what hour of the house it is). It KEEPS presence: the
+# standby slab is what the room shows when nobody is at the desk, which is
+# exactly when "is he home" is the question worth answering, and it was
+# missing here while the ambient band had it (found 2026-08-31, from the
+# console).
+STANDBY_KEYS = (("next", "NEXT"), ("due", "DUE"), ("temp", "OUTSIDE"),
+                ("presence", "WHERE"))
 
 
 # ------------------------------------------------------------ pure rules

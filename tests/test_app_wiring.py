@@ -1566,6 +1566,53 @@ def test_the_room_state_never_claims_home_when_presence_is_unconfigured(app):
                          "gpu"}
 
 
+def test_the_room_state_shows_where_he_is_once_presence_is_configured(app):
+    """The complement of the test above: with a phone_ip set and a real
+    answer, the slab SAYS it. "unknown" (the state before the first poll
+    answers) is still suppressed -- a WHERE row reading "unknown" is worth
+    no more than a false HOME."""
+    from types import SimpleNamespace
+    for state, shown in (("home", "home"), ("away", "away"), ("unknown", "")):
+        app.presence = SimpleNamespace(configured=True, state=state)
+        assert app.room_state()["presence"] == shown, state
+
+
+def test_the_next_row_names_the_day_it_is_talking_about(app):
+    """Found from the console 2026-08-31: standby read "BIOSENSORS 12:45 pm"
+    at eight in the evening, which says nothing about WHICH 12:45. Today
+    keeps no day word on purpose -- the standby face is a clock."""
+    from datetime import datetime, timedelta
+    from types import SimpleNamespace
+    now = datetime.now().astimezone()
+
+    def cal(at):
+        ev = SimpleNamespace(title="BIOSENSORS", start=at, all_day=False)
+        return SimpleNamespace(events=lambda: [ev])
+
+    app.services.calendar = cal(now + timedelta(hours=2))
+    assert " today " not in app._room_next_event()
+
+    app.services.calendar = cal((now + timedelta(days=1)).replace(hour=12, minute=45))
+    row = app._room_next_event()
+    assert "tomorrow" in row and "12:45 pm" in row and row.startswith("BIOSENSORS")
+
+    later = now + timedelta(days=3)
+    app.services.calendar = cal(later.replace(hour=12, minute=45))
+    assert later.strftime("%A") in app._room_next_event()
+
+
+def test_standby_shows_where_he_is(app):
+    """STANDBY_KEYS had NEXT/DUE/OUTSIDE but not WHERE, so the panel shown
+    when nobody is at the desk was the one panel that could not answer
+    "is he home"."""
+    from jarvis.ui.ambient import AMBIENT_KEYS, STANDBY_KEYS
+    assert ("presence", "WHERE") in STANDBY_KEYS
+    assert ("presence", "WHERE") in AMBIENT_KEYS
+    # standby still drops the two it means to drop
+    keys = {k for k, _ in STANDBY_KEYS}
+    assert "playing" not in keys and "arc" not in keys
+
+
 def test_the_room_state_backs_off_spotify_instead_of_a_heartbeat(app):
     calls = []
 
