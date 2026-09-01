@@ -1491,6 +1491,22 @@ def test_lecture_notes_are_wired_through_the_real_app(app, paths, monkeypatch):
         "impedance is the ratio of voltage to current"]
 
 
+# ------------------------------------------------- #72 the remote duck
+def test_the_mixer_can_reach_the_spotify_tool_for_the_remote_duck(app):
+    """The Connect duck (#72) was built, tested against a fake remote and
+    never wired: RoomMixer.set_remote had no caller, so on the live box the
+    mixer still found nothing local and stood down. The mixer is built
+    before any tool exists, so the handle has to be passed AFTER
+    _register_tools parks the tool on services -- and it must be the same
+    object, not a second SpotifyTool with its own token cache."""
+    assert app.mixer is not None, "no mixer built; the test proves nothing"
+    spotify = getattr(app.services, "spotify", None)
+    assert spotify is not None, "spotify.make_tools never parked its tool"
+    assert app.mixer._remote is spotify
+    assert callable(getattr(app.mixer._remote, "duck", None))
+    assert callable(getattr(app.mixer._remote, "unduck", None))
+
+
 # ------------------------------------------------- the Board and the room
 def test_the_board_is_a_real_service_and_composes_from_real_providers(app):
     """No fakes: the app's own providers answer, and the panels that need
@@ -1616,7 +1632,7 @@ def test_the_slab_reads_in_upper_case(app):
     assert ("WHERE", "HOME") in standby_rows(room)
     assert ("WHERE", "AWAY") in standby_rows({"presence": "away"})
     # an absent value still disappears rather than becoming ""
-    assert [l for l, _ in standby_rows({"presence": ""})] == []
+    assert [label for label, _ in standby_rows({"presence": ""})] == []
 
 
 def test_standby_shows_where_he_is(app):

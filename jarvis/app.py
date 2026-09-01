@@ -444,6 +444,13 @@ class JarvisApp:
         # ---- routing ------------------------------------------------------
         self.services = self._build_services()
         self._register_tools()
+        # The mixer was built at 372, before any tool existed; the Connect
+        # ducker it falls back to when there is nothing local to duck (#72)
+        # is the Spotify tool, which only lands on services in
+        # _register_tools. Without this line the remote duck is dead code
+        # and the mixer stands down exactly as it did before #72.
+        if self.mixer is not None:
+            self.mixer.set_remote(getattr(self.services, "spotify", None))
         # After the tools: the session reaches Spotify through the handle
         # spotify.make_tools parks on services.spotify.
         self.focus = self._construct("focus", self._make_focus)
@@ -3692,7 +3699,7 @@ class JarvisApp:
         """When to speak "one moment" -- scaled to how fast this box answers.
 
         A fixed delay ages badly: 4.5 s was "unusually slow" when the median
-        wait was 10.68 s and is ordinary now that it is 1.30 s. Five times the
+        wait was 10.68 s and is ordinary now that it is 1.30 s. Three times the
         recent median is the same JUDGEMENT at any speed. Falls back to the
         tuned constant until the ledger has enough answered turns to have an
         opinion, and never drops below it -- the filler must not become more
