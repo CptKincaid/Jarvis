@@ -15,6 +15,7 @@ import json
 import logging
 import stat
 import subprocess
+import time
 import urllib.error
 import urllib.request
 
@@ -33,7 +34,12 @@ def _firewall(monkeypatch):
     monkeypatch.setattr(urllib.request, "urlopen", _no_network)
     monkeypatch.delenv(scr.DEBUG_ENV, raising=False)
     monkeypatch.setenv("DISPLAY", ":9")           # never the live :1
+    # model_caps() and the "this model will not load here" verdict are cached
+    # for the process; without this a test that poisons gemma4:26b decides
+    # the NEXT test's outcome (it did, on the first run of this fix).
+    scr.forget_models()
     yield
+    scr.forget_models()
 
 
 def make_image(width=2560, height=1440, mode="RGB"):
@@ -65,9 +71,26 @@ class FakeVision:
                 "message": {"role": "assistant", "content": self.content}}
 
 
+# gemma4:26b's real capabilities, live 2026-09-01 (`ollama show gemma4:26b`).
+GEMMA4_CAPS = ["completion", "vision", "tools", "thinking"]
+
+
+def show(caps=GEMMA4_CAPS, seen=None):
+    """A fake /api/show: capabilities per model, recording who was asked."""
+    def _show(model, timeout=None):
+        if seen is not None:
+            seen.append(model)
+        by_model = caps if isinstance(caps, dict) else None
+        got = by_model.get(model, GEMMA4_CAPS) if by_model else caps
+        if isinstance(got, Exception):
+            raise got
+        return {"capabilities": list(got)}
+    return _show
+
+
 @pytest.fixture
 def wired(monkeypatch):
-    """Both seams faked; returns (vision, grabbed_displays)."""
+    """All three seams faked; returns (vision, grabbed_displays)."""
     vision = FakeVision()
     grabbed = []
 
@@ -76,6 +99,7 @@ def wired(monkeypatch):
         return make_image()
     monkeypatch.setattr(scr, "_grab_screen", grab)
     monkeypatch.setattr(scr, "_ask_vision", vision)
+    monkeypatch.setattr(scr, "_ollama_show", show())
     monkeypatch.setattr(scr, "_window_title", lambda display=None: "hunter@spark: ~/Jarvis")
     return vision, grabbed
 
@@ -122,7 +146,11 @@ def test_screen_qa_sends_downscaled_jpeg_title_and_question(wired):
     assert grabbed == [":9"], "the grab targets the DISPLAY in force"
 
     payload = vision.payloads[-1]
-    assert payload["model"] == scr.DEFAULT_MODEL
+    # DEFAULT_MODEL is "" -- the eyes ride on the model the brain already has
+    # resident, because OLLAMA_MAX_LOADED_MODELS=1 makes a second one an
+    # eviction, not an addition.
+    assert scr.DEFAULT_MODEL == ""
+    assert payload["model"] == scr.chat_model()
     assert payload["stream"] is False
     assert payload["messages"][0]["role"] == "system"
     assert "three short sentences" in payload["messages"][0]["content"]
@@ -276,9 +304,12 @@ def test_grab_cli_skips_gnome_screenshot_and_uses_import(monkeypatch, tmp_path):
 
 def test_vision_error_object_and_empty_answer(wired):
     vision, _ = wired
-    vision.reply = {"error": "model 'llama3.2-vision:latest' not found"}
+    vision.reply = {"error": f"model '{scr.chat_model()}' not found"}
     res = tool().call("screen_qa", {})
-    assert res.ok is False and res.speak == scr.NO_VISION_LINE
+    # A model that is not there is a SETUP failure, and the spoken line says
+    # so: "isn't answering" sent Hunter looking at ollama, not at the pull.
+    assert res.ok is False
+    assert res.speak == scr.NOT_INSTALLED_LINE.format(model="gemma4:26b")
 
     vision.reply = {"message": {"role": "assistant", "content": "   "}}
     res = tool().call("screen_qa", {})
@@ -445,7 +476,10 @@ def test_an_http_error_keeps_ollamas_reason(wired, caplog):
         {}, io.BytesIO(body))
     with caplog.at_level(logging.WARNING, logger="jarvis"):
         res = tool().call("screen_qa", {})
-    assert res.ok is False and res.speak == scr.NO_VISION_LINE   # unchanged aloud
+    assert res.ok is False
+    # Aloud he is told WHICH model this build cannot load, so the fix is
+    # findable without reading the log.
+    assert res.speak == scr.CANNOT_LOAD_LINE.format(model="gemma4:26b")
     for where in (caplog.text, res.text):
         assert "HTTP 500" in where
         assert "unknown model architecture: 'mllama'" in where
@@ -469,3 +503,180 @@ def test_http_error_detail_survives_a_body_that_is_not_json():
     assert "nope" in scr.http_error_detail(err)
     empty = urllib.error.HTTPError("u", 503, "Service Unavailable", {}, None)
     assert scr.http_error_detail(empty) == "Service Unavailable"
+
+
+# ------------------------------------------------- #88: the model choice
+def test_a_thinking_model_is_told_not_to_think(wired):
+    """LIVE 2026-09-01, the whole of bug #88 after the config was pointed at
+    a model this ollama CAN load: gemma4:26b answered /api/chat with
+    ``done_reason "length"``, ``eval_count 200`` and
+
+        message.content  = ''
+        message.thinking = 'The user wants to know what is on their screen...'
+
+    -- the entire 200-token num_predict budget spent reasoning, an empty
+    content, and Hunter heard "My vision model isn't answering, sir." while
+    the model had described his desktop perfectly.  brain.py has sent
+    ``think: false`` on the chat path since it was written; the eyes did
+    not.  With the field set: 0.8 s and a correct three-sentence answer."""
+    vision, _ = wired
+    res = tool().call("screen_qa", {"question": "what is showing"})
+    assert res.ok
+    assert vision.payloads[-1]["think"] is False
+
+
+def test_a_model_that_cannot_think_is_not_sent_the_field(wired, monkeypatch):
+    """think:false is sent from capabilities, never blind: a build that
+    rejects the field on a plain model would turn a WORKING vision model
+    into a 400."""
+    vision, _ = wired
+    monkeypatch.setattr(scr, "_ollama_show", show(["completion", "vision"]))
+    res = tool().call("screen_qa", {})
+    assert res.ok
+    assert "think" not in vision.payloads[-1]
+
+
+def test_an_all_thinking_reply_names_itself_in_the_log(wired, caplog):
+    """If think:false is ever ignored the log must say WHICH emptiness this
+    is -- "empty answer" is what sent this bug to a second fix pass."""
+    vision, _ = wired
+    vision.reply = {"message": {"role": "assistant", "content": "",
+                                "thinking": "The user wants to know..."}}
+    with caplog.at_level(logging.WARNING, logger="jarvis"):
+        res = tool().call("screen_qa", {})
+    assert res.ok is False
+    assert "thinking-only" in res.text and "thinking-only" in caplog.text
+
+
+def test_the_chat_models_own_runner_is_reused(wired):
+    """A screen question must not restart the runner the brain is using.
+
+    Measured 2026-09-01: with no num_ctx the request took ollama's default
+    262144, which spawned a SECOND runner for the same model -- 9.4 s of
+    load_duration -- and left it with the default five-minute keep_alive, so
+    the brain's ``keep_alive: -1`` pin was silently gone and the next spoken
+    turn paid the reload again.  Same num_ctx + keep_alive -1: 0.8 s, and
+    /api/ps unchanged."""
+    from jarvis import brain
+    vision, _ = wired
+    res = tool().call("screen_qa", {})
+    assert res.ok
+    payload = vision.payloads[-1]
+    assert payload["model"] == scr.chat_model() == brain.OLLAMA_MODEL
+    assert payload["keep_alive"] == -1
+    assert payload["options"]["num_ctx"] == brain.NUM_CTX
+
+
+def test_a_second_model_is_unloaded_the_moment_it_has_answered(wired):
+    """OLLAMA_MAX_LOADED_MODELS=1: a model that is not the chat model has
+    just evicted it, so it may not also be PINNED there -- keep_alive 0 lets
+    the brain's residency loop take the slot straight back."""
+    vision, _ = wired
+    res = tool({"screen": {"model": "mistral-small3.2:24b"}}).call("screen_qa", {})
+    assert res.ok
+    payload = vision.payloads[-1]
+    assert payload["model"] == "mistral-small3.2:24b"
+    assert payload["keep_alive"] == 0
+    # not the brain's runner: sending its num_ctx would be a coincidence, not
+    # a reuse, and a wrong context window for a different model.
+    assert "num_ctx" not in payload["options"]
+
+
+def test_an_unloadable_model_falls_back_to_the_chat_model(wired, caplog):
+    """assistant.json on the live box still says llama3.2-vision:latest, and
+    ollama 0.33.1 cannot load 'mllama' at all.  A hand edit + a restart is
+    the real fix, but until then the answer must still arrive: the config
+    model is tried once, refused, remembered, and the chat model answers."""
+    vision, _ = wired
+    broken = "llama3.2-vision:latest"
+
+    def refuse_the_broken_one(payload, timeout=None):
+        vision.payloads.append(payload)
+        if payload["model"] == broken:
+            body = (b'{"error":"error loading model: unknown model '
+                    b"architecture: 'mllama'\"}")
+            raise urllib.error.HTTPError("u", 500, "Internal Server Error",
+                                         {}, io.BytesIO(body))
+        return {"message": {"role": "assistant", "content": "A terminal."}}
+
+    import jarvis.tools.screen as _scr
+    _scr._ask_vision = refuse_the_broken_one          # restored by monkeypatch below
+    try:
+        reg = tool({"screen": {"model": broken}})
+        with caplog.at_level(logging.WARNING, logger="jarvis"):
+            res = reg.call("screen_qa", {})
+        assert res.ok and res.speak == "A terminal."
+        assert [p["model"] for p in vision.payloads] == [broken, scr.chat_model()]
+        assert "mllama" in caplog.text and "screen.model" in caplog.text
+        # ...and the wasted attempt is paid ONCE: the verdict is remembered.
+        res = reg.call("screen_qa", {})
+        assert res.ok
+        assert [p["model"] for p in vision.payloads] == \
+            [broken, scr.chat_model(), scr.chat_model()]
+    finally:
+        _scr._ask_vision = vision
+
+
+def test_a_model_without_vision_is_never_even_asked(wired, monkeypatch):
+    """/api/show reads the manifest and loads nothing, so the capability
+    check is free -- and it keeps a text-only model from being handed an
+    image and blamed for the silence."""
+    vision, _ = wired
+    asked = []
+    monkeypatch.setattr(scr, "_ollama_show",
+                        show({"qwen3:30b-a3b": ["completion", "tools"]}, asked))
+    res = tool({"screen": {"model": "qwen3:30b-a3b"}}).call("screen_qa", {})
+    assert "qwen3:30b-a3b" in asked
+    assert [p["model"] for p in vision.payloads] == [scr.chat_model()], \
+        "the text-only model is skipped, the chat model answers"
+    assert res.ok
+    # ...and with no fallback left, the spoken line names the reason.
+    scr.forget_models()
+    monkeypatch.setattr(scr, "_ollama_show", show(["completion", "tools"]))
+    res = tool().call("screen_qa", {})
+    assert res.ok is False
+    assert res.speak == scr.NOT_VISION_LINE.format(model=scr.chat_model())
+
+
+def test_the_verdict_cache_expires(wired, monkeypatch):
+    """A remembered "this model will not load" must not outlive an `ollama
+    pull` or an ollama upgrade; Jarvis runs for days at a time."""
+    scr.mark_unusable("llama3.2-vision:latest", "HTTP 500: nope")
+    assert scr.unusable_reason("llama3.2-vision") == "HTTP 500: nope"
+    later = time.monotonic() + scr.CACHE_TTL_S + 1
+    monkeypatch.setattr(scr.time, "monotonic", lambda: later)
+    assert scr.unusable_reason("llama3.2-vision:latest") == ""
+
+
+def test_model_caps_reads_api_show_and_reports_a_missing_model(monkeypatch):
+    posted = {}
+
+    class Resp:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return json.dumps({"capabilities": ["completion", "vision"]}).encode()
+
+    def fake_urlopen(req, timeout=None):
+        posted["url"] = req.full_url
+        posted["body"] = json.loads(req.data)
+        return Resp()
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    caps, why = scr.model_caps("gemma4:26b")
+    assert posted["url"].endswith("/api/show"), "show, not generate: it loads nothing"
+    assert posted["body"] == {"model": "gemma4:26b"}
+    assert "vision" in caps and why == ""
+
+    scr.forget_models()
+
+    def missing(req, timeout=None):
+        raise urllib.error.HTTPError(
+            "u", 404, "Not Found", {},
+            io.BytesIO(b'{"error":"model \'moondream\' not found"}'))
+    monkeypatch.setattr(urllib.request, "urlopen", missing)
+    caps, why = scr.model_caps("moondream")
+    assert caps is None and "not found" in why

@@ -1917,6 +1917,25 @@ class JarvisApp:
         One thread for both duties on purpose: the speculative pass is a
         full decode, and running it here means the greedy preview is
         suspended while it holds the model instead of queueing behind it.
+
+        It also RETRACTS the preview when the capture ends, by publishing
+        PartialText(""). Nothing else can: the UI drops the ghost card
+        when a Transcribed or a UserUtterance replaces it, and the two
+        turns that never produce either are exactly the two that leave a
+        preview of pure noise on screen --
+
+          * the follow-up window closing on silence, which is
+            recorder._check_endpoint -> abort() -> RecordingStopped
+            (reason="abort"), and _on_recording_stopped returns on
+            "abort" before it publishes anything;
+          * a clip the recorder gates out ("Too short" / "No audio
+            captured"), which returns there too.
+
+        Both fire after a reply, both run this loop over room noise with
+        no VAD and no noise gate for the whole window, and Whisper duly
+        invents something. That is Hunter's "2- keeps showing up after a
+        response and hes listening back for me": the card was still up
+        because nobody had ever been able to take it down.
         """
         last = ""
         due = 0.0                       # next greedy preview (monotonic)
@@ -1946,6 +1965,7 @@ class JarvisApp:
                     # every event, and whisper often returns the same text.
                     if text and text != last and self.recorder.recording:
                         last = text
+                        self._partial_shown = True
                         bus.publish(PartialText(text=text))
                 # pace from the END of the decode, so a slow pass backs off
                 # instead of queueing up behind itself.
@@ -1953,6 +1973,13 @@ class JarvisApp:
                                              (time.monotonic() - started))
         except Exception:
             log.exception("partial loop died")
+        finally:
+            # In the finally, not after the loop: a preview that outlives
+            # the microphone is the bug, and a died-with-an-exception loop
+            # is the last thread that should get to keep one on screen.
+            if self._partial_shown:
+                self._partial_shown = False
+                bus.publish(PartialText(text=""))
 
     # ------------------------------------------- speculative transcription
     #
@@ -1977,6 +2004,7 @@ class JarvisApp:
     # the app with object.__new__) behaves like an app with no speculation.
     _speculation = None
     _spec_lock = threading.Lock()
+    _partial_shown = False        # a ghost card is up and needs retracting
     _stop_event = None
     _wake_pending = False
     _turn_from_wake = False
@@ -2061,6 +2089,7 @@ class JarvisApp:
         text = (result.text or "").strip() if result is not None else ""
         if text and result.accepted and rec.recording:
             # The speculative text IS the best preview there is.
+            self._partial_shown = True
             bus.publish(PartialText(text=text))
         log.debug("speculative decode at last_speech=%.2fs took %.2fs (%s)",
                   key, spec.finished - spec.started,

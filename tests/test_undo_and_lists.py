@@ -10,10 +10,13 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from jarvis.commander import Commander, IntentClassifier, UNDO_WINDOW_S, undo_kind
+from jarvis.commander import (Commander, IntentClassifier, UNDO_WINDOW_S,
+                              _h_list_strike_anon, _LIST_STRIKE_ANON_RX,
+                              undo_kind)
 from jarvis.config import CONFIG
 from jarvis.router import Router
-from jarvis.tools.notes import NotesStore, canon_list, list_kind, list_name
+from jarvis.tools.notes import (LIST_IN_PLAY_S, NotesStore, canon_list,
+                                list_kind, list_name)
 
 
 class Cfg:
@@ -624,3 +627,106 @@ def test_one_reply_never_speaks_the_same_line_twice():
     app._say.reset_mock()
     app_mod.JarvisApp._on_brain_tags(app, [("SPEAK", line)])
     assert app._say.call_count == 1
+
+
+# ============================================ "cross the second one off the list"
+# His feature #32, 2026-08-31, still failing after two fix passes and
+# reproduced against the running assistant on 2026-09-01:
+#
+#     jarvis --quiet "add milk, eggs and bread to the shopping list"
+#     jarvis --quiet "cross the second one off the list"
+#     -> "Shall I hand that to Claude, sir, or is it a quick one for me?"
+#
+# The ordinal was never the problem -- notes.parse_which/resolve have
+# understood "the second one" all along, and "cross the second one off the
+# SHOPPING list" works (above). What was missing is the unnamed "the list":
+# no rung matched it, so it fell through to the router's Claude offer.
+def test_cross_the_second_one_off_the_list_after_naming_one(rich):
+    c, svc = rich
+    c.handle("add milk, eggs and bread to the shopping list", source="typed")
+    res = c.handle("cross the second one off the list", source="typed")
+    assert res.handled and res.speak
+    assert res.reply == "Off the shopping list, sir; two left."
+    assert [i["text"] for i in svc.notes.list("list:shopping")] == ["milk", "bread"]
+
+
+def test_the_list_means_the_one_he_just_had_read_out(rich):
+    c, svc = rich
+    for item in ("milk", "eggs", "bread"):
+        svc.notes.add("list:shopping", item)
+    c.handle("what's on the shopping list", source="typed")
+    res = c.handle("cross the last one off the list", source="typed")
+    assert res.reply == "Off the shopping list, sir; two left."
+    assert [i["text"] for i in svc.notes.list("list:shopping")] == ["milk", "eggs"]
+
+
+def test_number_two_off_the_list_is_an_ordinal_too(rich):
+    c, svc = rich
+    c.handle("add milk, eggs and bread to the shopping list", source="typed")
+    res = c.handle("cross number two off the list", source="typed")
+    assert res.reply == "Off the shopping list, sir; two left."
+    assert [i["text"] for i in svc.notes.list("list:shopping")] == ["milk", "bread"]
+
+
+def test_an_ordinal_with_no_list_in_play_deletes_nothing(rich):
+    """The rule this rung exists to keep. Nothing has been read or named,
+    so "the second one" indexes into nothing -- ask rather than delete the
+    second item of a list he was not talking about."""
+    c, svc = rich
+    for item in ("milk", "eggs", "bread"):
+        svc.notes.add("list:shopping", item)      # put there, never spoken of
+    svc.notes.add("todo", "email the TA")
+    res = c.handle("cross the second one off the list", source="typed")
+    assert res.handled and "Which list" in res.reply
+    assert svc.notes.count("list:shopping") == 3
+    assert svc.notes.count("todo") == 1
+
+
+def test_a_list_stops_being_in_play_after_ten_minutes(rich):
+    """This morning's shopping list must not answer for an ordinal said
+    tonight."""
+    c, svc = rich
+    c.handle("add milk, eggs and bread to the shopping list", source="typed")
+    kind, ts = svc.notes.last_touch
+    svc.notes.last_touch = (kind, ts - LIST_IN_PLAY_S - 1)
+    res = c.handle("cross the second one off the list", source="typed")
+    assert "Which list" in res.reply
+    assert svc.notes.count("list:shopping") == 3
+
+
+def test_the_todo_list_answers_for_the_list_when_it_is_the_one_in_play(rich):
+    c, svc = rich
+    c.handle("add buy stamps to my task list", source="typed")
+    c.handle("add call the dentist to my task list", source="typed")
+    res = c.handle("cross the first one off the list", source="typed")
+    assert res.reply == "Off the to-do list, sir; one left."
+    assert [i["text"] for i in svc.notes.list("todo")] == ["call the dentist"]
+
+
+def test_a_named_item_with_no_list_in_play_is_left_to_the_model(rich):
+    """"cross bread off the list" says what it means, so it keeps today's
+    behaviour (gemma4's notes tool finds it) rather than being answered
+    against a list nobody named."""
+    c, svc = rich
+    svc.notes.add("list:shopping", "bread")
+    assert _h_list_strike_anon(
+        c, "cross bread off the list",
+        _LIST_STRIKE_ANON_RX.match("cross bread off the list")) is None
+
+
+def test_a_wipe_is_not_smuggled_through_this_rung(rich):
+    """"cross everything off the list" must keep its read-back."""
+    c, svc = rich
+    c.handle("add milk, eggs and bread to the shopping list", source="typed")
+    assert _h_list_strike_anon(
+        c, "cross everything off the list",
+        _LIST_STRIKE_ANON_RX.match("cross everything off the list")) is None
+    assert svc.notes.count("list:shopping") == 3
+
+
+def test_the_named_form_still_wins_the_match(rich):
+    """The anon rung must not eat "off the shopping list"."""
+    assert not _LIST_STRIKE_ANON_RX.match("cross bread off the shopping list")
+    assert _LIST_STRIKE_ANON_RX.match("cross the second one off the list")
+    assert _LIST_STRIKE_ANON_RX.match("take the last one off my list")
+    assert not _LIST_STRIKE_ANON_RX.match("cross the second one off my desk")

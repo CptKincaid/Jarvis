@@ -234,7 +234,17 @@ def test_the_greeting_handler_falls_back_when_there_is_no_sheet(svc):
     assert _h_greeting(svc(self_state=boom), "hello", "greeting").handled
 
 
-def test_diagnostics_speaks_the_film_register_and_cards_the_plain_sheet(svc):
+def test_diagnostics_speaks_the_film_register_and_only_that(svc):
+    """This used to speak the film register AND publish the plain sheet as
+    a "card". The bus has no card: a JarvisReply IS the answer, so both
+    landed in the transcript and on the socket, and he heard one while
+    reading the other -- "(didnt say this but in transcript) said this",
+    2026-08-31, reproduced 2026-09-01 with `jarvis --quiet "run
+    diagnostics"` printing two whole status sentences.
+
+    The film register wins because it is the line the room hears. The
+    plain sheet is not lost: `jarvis status`, ask.py --status, the phone
+    and the formal register all still render it off this same dict."""
     from jarvis.events import JarvisReply, bus
     seen = []
     sub = bus.subscribe(JarvisReply, lambda ev: seen.append((ev.text, ev.speak)))
@@ -246,8 +256,11 @@ def test_diagnostics_speaks_the_film_register_and_cards_the_plain_sheet(svc):
         bus.unsubscribe(JarvisReply, sub)
     assert res.handled and res.speak
     assert res.reply.startswith("Power to the local model at full, sir.")
-    assert seen and seen[0][1] is False
-    assert "Your voiceprint holds 14 samples" in seen[0][0]
+    assert seen == [], f"a second answer went out for one turn: {seen}"
+    # ...and the plain sheet is still a render of the same sheet, for the
+    # readers that ask for it by name.
+    assert "Your voiceprint holds 14 samples" in \
+        selfstate.diagnostics_line(state())
 
 
 def test_one_sheet_feeds_both_renderings(svc):

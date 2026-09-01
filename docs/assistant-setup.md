@@ -638,9 +638,23 @@ leaves the machine.
 ## 15. Screen Q&A (local vision model)
 
 *"What's on my screen?"*, *"what does this error say?"*, *"summarise what I'm looking at."*
-A screenshot of `DISPLAY=:1` goes to the local `llama3.2-vision` model through Ollama; the
-answer is spoken directly. Nothing is written to disk unless `JARVIS_DEBUG_SCREEN=1`. The
-first call after a while loads the model (~10 s); `screen.model` and `screen.max_width` tune it.
+A screenshot of `DISPLAY=:1` goes to a local vision model through Ollama; the answer is
+spoken directly. Nothing is written to disk unless `JARVIS_DEBUG_SCREEN=1`.
+
+**Which model.** `screen.model` defaults to `""`, meaning *the chat model* (`local_model`,
+gemma4:26b) — and that is the only free choice on this box: `OLLAMA_MAX_LOADED_MODELS=1`,
+so naming any second vision model here evicts the chat model and costs ~7 s on the next
+spoken turn. gemma4 carries a clip projector and reports the `vision` capability, so the
+eyes are the model that is already resident. Measured 2026-09-01: 1.3 s per question once
+warm, ~8 s on the first one (the projector loads into the running model).
+
+`llama3.2-vision:latest` is pulled here (7.8 GiB) but **ollama 0.33.1 cannot load it at
+all** — `/api/chat` answers 500 `unknown model architecture: 'mllama'`. If `screen.model`
+still names it, the tool tries it once, remembers the refusal for ten minutes, falls back
+to the chat model and logs `set screen.model … ("" = the chat model)`; the answer still
+arrives. Loading mllama would need a newer ollama build. Any model ollama reports with the
+`vision` capability works here (`ollama show <model>`); a model that is missing, text-only,
+or unloadable is said aloud by name instead of a blanket "my vision model isn't answering".
 
 ## 16. Spark health and the memory watchdog
 

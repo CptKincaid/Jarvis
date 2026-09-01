@@ -91,6 +91,54 @@ def you_card_width(text_px: int, usable: int, pad: int,
     want = int(text_px) + 2 * pad + 4
     return max(lo, min(hi, want))
 
+# ------------------------------------------------------- the ghost card
+#
+# The partial ("ghost") card is a LISTENING indicator: italic, muted, YOU
+# geometry, no head row. Two symptoms from the 2026-08-31 voice test come
+# straight out of what it was willing to render and how long it kept it:
+#
+#   * "2- presentation or just 2- keeps showing up after a response and hes
+#     listening back for me" -- a preview left standing after the mic shut.
+#   * a card holding "2,000,000,000,000,000,..." (100+ digits) at 20:47,
+#     right after "set a reminder to drink water every 45 minutes".
+#
+# Neither is the number formatter or the interval parser: nothing on the
+# reply path ever produced those strings. Transcriber.partial() decodes a
+# SHORT buffer with no VAD and no noise gate every 0.9 s, and on room noise
+# Whisper babbles -- digit runs and dangling fragments are its house style.
+# The decoder cannot be made honest, so the card refuses to draw the two
+# shapes that are never a command in progress, and takes itself down on "".
+PARTIAL_MAX_CHARS = 200     # a preview is a glance, not a document
+PARTIAL_MAX_DIGITS = 9      # "2,000,000,000" is already past anything spoken
+_DIGIT_RUN_RE = re.compile(r"\d(?:[\d,. \u00a0]*\d)?")
+_LETTER_RE = re.compile(r"[^\W\d_]", re.UNICODE)
+
+
+def partial_display_text(text) -> str:
+    """What the ghost card should show for a raw partial decode; "" means
+    take the card DOWN (pure — unit tested).
+
+    Drops, in order: blank text; text with no letter at all ("2-", "...",
+    "2,000,000" — a preview made only of digits and punctuation is noise
+    babble, and a real command is never worth previewing as one); text
+    carrying a run of more than PARTIAL_MAX_DIGITS digits (the 20:47
+    card, which is also unbreakable by Tk's word wrap and so spills past
+    the card edge). Anything longer than PARTIAL_MAX_CHARS keeps its TAIL,
+    since the newest words are the point of a live preview.
+    """
+    text = " ".join((text or "").split())
+    if not text:
+        return ""
+    if not _LETTER_RE.search(text):
+        return ""
+    for run in _DIGIT_RUN_RE.findall(text):
+        if sum(ch.isdigit() for ch in run) > PARTIAL_MAX_DIGITS:
+            return ""
+    if len(text) > PARTIAL_MAX_CHARS:
+        text = "…" + text[-(PARTIAL_MAX_CHARS - 1):]
+    return text
+
+
 _TEMP_RE = re.compile(r"(\d+)\s*°(?:\s+(\d+)\s*%)?")
 
 
@@ -747,8 +795,16 @@ class TranscriptView(tk.Frame):
 
     def show_partial(self, text: str):
         """Streaming preview: a ghost card (YOU geometry) that updates in
-        place until Transcribed/UserUtterance replaces it."""
+        place until Transcribed/UserUtterance replaces it.
+
+        Empty (or noise-only, see partial_display_text) text RETRACTS the
+        card instead of being ignored. That is the only way the producer
+        can take its own preview down: it is the one that knows the mic
+        has shut, and a ghost outliving the capture reads as "he is
+        listening back for me" when Jarvis is not listening at all."""
+        text = partial_display_text(text)
         if not text:
+            self.clear_partial()
             return
         if self._partial is None:
             x, cw, wrap = self._card_geo("you", None, text)

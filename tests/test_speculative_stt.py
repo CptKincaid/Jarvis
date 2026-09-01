@@ -302,7 +302,9 @@ def test_the_partial_loop_runs_the_pass_and_rests_the_preview(monkeypatch):
     assert len(a.transcriber.calls) == 1
     assert ticks["n"] == 2, "the preview kept decoding through the pass"
     texts = [e.text for e in a.events if isinstance(e, PartialText)]
-    assert texts == ["partial preview", "what time is it"], texts
+    # the trailing "" is the loop retracting its own ghost card as the
+    # capture ends -- see test_the_ghost_card_is_retracted_when_the_mic_shuts
+    assert texts == ["partial preview", "what time is it", ""], texts
 
 
 def test_the_ledger_stamps_a_speculative_stt_honestly():

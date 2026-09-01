@@ -4,6 +4,7 @@ The notes files are written exactly as jarvis/lecture.py writes them
 (HEADER + LINE), so a change to that format breaks these tests rather than
 silently producing cards about nothing.
 """
+import time
 import json
 from datetime import datetime
 from types import SimpleNamespace
@@ -124,9 +125,17 @@ def test_the_pass_turns_each_courses_notes_into_cards(tmp_path, notes, deck):
 
 
 def test_the_cards_carry_the_course_the_briefing_filters_by(tmp_path, notes, deck):
+    """Queried from AFTER the pass, not from a fixed NIGHT.
+
+    run_pass() files cards at the real wall clock, so asking `due(now=NIGHT)`
+    only worked while NIGHT (2026-09-01 03:30) was still in the future. It
+    went red the moment the date rolled over mid-session, which is a time
+    bomb, not a regression -- the same class as the Sunday-midnight flake in
+    test_study_ledger.
+    """
     write_notes(notes, "BIOSENSORS", "2026-08-31", ["a", "b", "c"])
     cards(tmp_path, notes, deck).run_pass()
-    due = deck.due(limit=50, now=NIGHT.timestamp(), topic="BIOSENSORS")
+    due = deck.due(limit=50, now=time.time() + 60, topic="BIOSENSORS")
     assert len(due) == 3
     assert due[0]["source"].startswith(sc.SOURCE_PREFIX)
 

@@ -1659,6 +1659,7 @@ TIER1_SAMPLES = {
     "list add": "add milk to the shopping list",
     "list read": "read my packing list",
     "list strike": "take milk off the shopping list",
+    "list strike anon": "cross the second one off the list",
     "list clear": "clear the shopping list",
     "lists": "what lists do i have",
     "week review": "how was my week",

@@ -76,6 +76,11 @@ _NUMBER_WORDS = ["no", "one", "two", "three", "four", "five", "six", "seven",
                  "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
                  "nineteen", "twenty"]
 _LAST_WORDS = {"last", "latest", "newest", "recent", "previous", "that"}
+# How long a list stays "the list" after he reads it, adds to it or names
+# it (NotesStore.last_touch). Long enough to cover reading a list and then
+# working through it, short enough that this morning's shopping list does
+# not answer for a to-do said tonight.
+LIST_IN_PLAY_S = 600.0
 _ITEM_CHARS = 100          # spoken length cap per item
 
 _SCHEMA = """
@@ -266,6 +271,22 @@ class NotesStore:
     # set by the tool and consumed by Commander._try_destructive_confirm.
     pending_clear = None
 
+    # The list "the list" means right now: (kind, wall-clock stamp), or
+    # None. "Cross the second one off the list" names no list, so there is
+    # nothing in the words to resolve an ordinal against -- it has to be
+    # the one he last read, added to or named.
+    #
+    # Parked on the STORE, not on the Commander, because the two seams that
+    # count are the commander's list handlers and the `notes` tool the
+    # local model calls, and services.notes is the one object both hold
+    # (the same reason pending_clear lives here).
+    #
+    # Stamped only by those CONVERSATIONAL seams -- deliberately not inside
+    # list()/add()/remove(), because jarvis/tools/briefing.py lists his
+    # to-dos every morning on its own and a background read must never
+    # decide what "the second one" deletes.
+    last_touch = None
+
     def __init__(self, db_path):
         self.db_path = Path(db_path).expanduser()
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -275,6 +296,30 @@ class NotesStore:
         with self._lock:
             self._db.executescript(_SCHEMA)
             self._db.commit()
+
+    def touch(self, kind) -> None:
+        """Mark a list as the one in play (see ``last_touch``).
+
+        Notes are not a list -- nobody crosses the second one off them --
+        so "note" is ignored rather than becoming the thing an ordinal
+        resolves against."""
+        k = _kind(kind)
+        if k and (k == "todo" or k.startswith(LIST_PREFIX)):
+            self.last_touch = (k, time.time())
+
+    def in_play(self, ttl: float = LIST_IN_PLAY_S) -> Optional[str]:
+        """The kind an unqualified "the list" refers to, or None when no
+        list has been in the conversation recently enough to guess."""
+        touch = self.last_touch
+        if not isinstance(touch, tuple) or len(touch) != 2:
+            return None
+        kind, ts = touch
+        try:
+            if time.time() - float(ts) > float(ttl):
+                return None
+        except (TypeError, ValueError):
+            return None
+        return kind or None
 
     def close(self):
         with self._lock:
@@ -769,6 +814,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         else:
             k = _kind_for(kind, act, text)
         lname = list_name(k)
+        # A tool call IS the conversation: whichever list the model just
+        # read or wrote is the one "cross the second one off the list"
+        # means next (NotesStore.last_touch).
+        s.touch(k)
         if act == "add":
             if not text:
                 line = "What shall I note down, sir?" if k == "note" else \

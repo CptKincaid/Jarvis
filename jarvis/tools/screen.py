@@ -7,17 +7,35 @@ the brain's model turn then phrases the reply.  The active window title
 (xdotool) rides along in the prompt as context, because a screenshot of a
 terminal says nothing about WHICH terminal.
 
-``screen.model`` must be a model THIS ollama can load, not merely one that
-is pulled.  LIVE 2026-08-31: llama3.2-vision:latest is on disk (7.27 GiB)
-and ollama 0.33.1 answers /api/chat with 500 "unknown model architecture:
-'mllama'" for it.  gemma4:26b ships a projector layer and is already the
-resident chat model, so pointing screen.model at it also dodges the
-OLLAMA_MAX_LOADED_MODELS=1 eviction a separate vision model causes.
+The model is the CHAT model by default (``screen.model: ""``), because
+``OLLAMA_MAX_LOADED_MODELS=1``: any other vision model evicts the resident
+chat model and costs ~7 s on the next spoken turn.  gemma4:26b carries a
+clip projector and reports the ``vision`` capability, so the eyes are free.
+Two live findings from 2026-08-31/09-01 shaped the rest of this module:
 
-Two seams, both module-level so tests replace them:
-``_grab_screen(display)`` -> PIL image (PIL.ImageGrab first, then
-``gnome-screenshot -f`` / ImageMagick ``import`` when the XCB grab fails)
-and ``_ask_vision(payload, timeout)`` -> the decoded /api/chat reply.
+* llama3.2-vision:latest is pulled (7.8 GiB) but ollama 0.33.1 cannot load
+  ``mllama`` AT ALL -- /api/chat answers 500 "unknown model architecture:
+  'mllama'".  A configured model that this build refuses is remembered in
+  ``_UNUSABLE`` and the next candidate (the chat model) is used, so the
+  answer arrives anyway and the log names the config key to fix.
+* gemma4 is a THINKING model, and with ``think`` unset it spent all 200
+  num_predict tokens reasoning: ``message.content`` came back EMPTY and the
+  tool said "My vision model isn't answering, sir." while the model had in
+  fact described the screen perfectly inside ``message.thinking``.  So the
+  payload sends ``think: false`` for any model whose capabilities include
+  thinking, exactly as brain.py does on the chat path.
+
+The payload also mirrors the brain's ``keep_alive: -1`` and ``num_ctx``
+when it is talking to the chat model: a request with a different num_ctx
+makes ollama restart the runner (measured: 9.4 s, and it drops the
+brain's keep_alive pin with it), which is the very stall this tool is
+supposed to avoid.
+
+Three seams, all module-level so tests replace them: ``_grab_screen(display)``
+-> PIL image (PIL.ImageGrab first, then ImageMagick ``import`` when the XCB
+grab fails), ``_ask_vision(payload, timeout)`` -> the decoded /api/chat
+reply, and ``_ollama_show(model)`` -> the decoded /api/show body (manifest
+only -- it never loads a model, so it cannot evict anything).
 
 Privacy: the screenshot lives only in memory; it is written to disk ONLY
 with JARVIS_DEBUG_SCREEN=1 (``~/.cache/jarvis/screen_last.jpg``, 0600),
@@ -47,11 +65,15 @@ from jarvis.tools.registry import ToolResult, ToolSpec
 log = get_logger("tools.screen")
 
 OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "llama3.2-vision:latest"
+# "" = "whatever model the brain keeps resident"; see chat_model().  Naming a
+# second model here is legal but costs the chat model its slot.
+DEFAULT_MODEL = ""
+FALLBACK_CHAT_MODEL = "gemma4:26b"   # only if jarvis.brain will not import
 DEFAULT_MAX_WIDTH = 1280
 DEFAULT_DISPLAY = ":1"             # the Spark's desktop; DISPLAY env wins
 DEFAULT_QUESTION = "what's on my screen"
-VISION_TIMEOUT_S = 25.0            # a cold llama3.2-vision load is ~10 s
+VISION_TIMEOUT_S = 25.0            # a cold projector load is ~9 s
+SHOW_TIMEOUT_S = 5.0               # /api/show reads a manifest; it is instant
 GRAB_TIMEOUT_S = 8.0               # the CLI screenshot fallbacks
 WINDOW_TIMEOUT_S = 2.0             # xdotool
 JPEG_QUALITY = 80
@@ -62,7 +84,16 @@ DEBUG_ENV = "JARVIS_DEBUG_SCREEN"
 DEBUG_FILE = "screen_last.jpg"
 
 NO_SCREEN_LINE = "I couldn't get a look at the screen, sir."
+# The generic line is for a model that is present and simply did not answer
+# (ollama down, a timeout).  A SETUP failure gets a line that names the model
+# and the reason -- "My vision model isn't answering, sir." sent Hunter
+# looking at the wrong thing twice on 2026-08-31.
 NO_VISION_LINE = "My vision model isn't answering, sir."
+NOT_INSTALLED_LINE = "I can't see, sir. The vision model {model} isn't installed."
+NOT_VISION_LINE = "I can't see, sir. {model} isn't a vision model."
+CANNOT_LOAD_LINE = "I can't see, sir. This Ollama build can't load {model}."
+SETUP_HINT = ("set screen.model in ~/.config/jarvis/assistant.json to a "
+              "vision-capable model this ollama can load (\"\" = the chat model)")
 SYSTEM_PROMPT = (
     "You are the eyes of JARVIS, a voice assistant. You are shown a "
     "screenshot of the user's desktop. Answer the question about it in "
@@ -199,6 +230,135 @@ def capture(display: Optional[str] = None, max_width: int = DEFAULT_MAX_WIDTH) -
     return base64.b64encode(jpeg).decode("ascii"), orig, tuple(small.size)
 
 
+# --------------------------------------------------------------- model
+def normalise_model(name) -> str:
+    """``gemma4`` and ``gemma4:latest`` are the same model to ollama."""
+    name = str(name or "").strip()
+    return name if (not name or ":" in name) else f"{name}:latest"
+
+
+def same_model(a, b) -> bool:
+    return bool(a) and normalise_model(a) == normalise_model(b)
+
+
+def chat_model() -> str:
+    """The model the brain keeps resident.  Imported lazily: tools/ is built
+    before brain in some entry points, and a missing brain must not cost the
+    tool its default."""
+    try:
+        from jarvis.brain import OLLAMA_MODEL
+        return str(OLLAMA_MODEL or "") or FALLBACK_CHAT_MODEL
+    except Exception:                            # noqa: BLE001 - import order
+        return FALLBACK_CHAT_MODEL
+
+
+def chat_num_ctx() -> Optional[int]:
+    """The brain's num_ctx.  Sending a DIFFERENT one restarts the runner --
+    measured 2026-09-01: a screen question with ollama's default 262144
+    reloaded gemma4 (9.4 s) and dropped its keep_alive pin to five minutes."""
+    try:
+        from jarvis.brain import NUM_CTX
+        return int(NUM_CTX)
+    except Exception:                            # noqa: BLE001 - import order
+        return None
+
+
+def _ollama_show(model: str, timeout: float = SHOW_TIMEOUT_S) -> dict:
+    """Seam 3: POST /api/show -> decoded JSON.  Manifest only: this never
+    loads a model, so it cannot evict the chat model."""
+    data = json.dumps({"model": model}).encode()
+    req = urllib.request.Request(f"{OLLAMA_URL}/api/show", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        body = resp.read()
+    return json.loads(body or b"{}")
+
+
+# Both caches expire. A verdict that outlived the process would be right
+# for the wrong reason: `ollama pull`, an ollama upgrade, or a restarted
+# server all change the answer, and Jarvis can run for days.
+CACHE_TTL_S = 600.0
+
+_CAPS_CACHE: dict = {}          # model -> ((capabilities|None, reason), when)
+
+
+def _cached(store: dict, key: str):
+    hit = store.get(key)
+    if hit is None or time.monotonic() - hit[1] > CACHE_TTL_S:
+        store.pop(key, None)
+        return None
+    return hit[0]
+
+
+def model_caps(model: str):
+    """``(frozenset(capabilities), "")`` or ``(None, reason)`` when ollama
+    could not say -- a model that is not pulled answers 404 with
+    ``model "x" not found``, which is the difference between "install it"
+    and "it is broken".  Cached: this rides on every spoken screen question.
+    """
+    key = normalise_model(model)
+    hit = _cached(_CAPS_CACHE, key)
+    if hit is not None:
+        return hit
+    try:
+        info = _ollama_show(model)
+        caps = info.get("capabilities") if isinstance(info, dict) else None
+        result = (frozenset(str(c) for c in caps), "") if isinstance(caps, list) \
+            else (None, "no capabilities in /api/show")
+    except urllib.error.HTTPError as exc:
+        result = (None, f"HTTP {exc.code}: {http_error_detail(exc)}")
+    except Exception as exc:                     # noqa: BLE001 - ollama down
+        result = (None, type(exc).__name__)
+    _CAPS_CACHE[key] = (result, time.monotonic())
+    return result
+
+
+_UNUSABLE: dict = {}            # model -> (why, when)
+
+
+def mark_unusable(model: str, why: str) -> None:
+    _UNUSABLE[normalise_model(model)] = (why, time.monotonic())
+
+
+def unusable_reason(model: str) -> str:
+    return _cached(_UNUSABLE, normalise_model(model)) or ""
+
+
+def forget_models() -> None:
+    """Drop both verdict caches (tests, and anything that re-pulls a model)."""
+    _CAPS_CACHE.clear()
+    _UNUSABLE.clear()
+
+
+def candidate_models(cfg) -> list:
+    """The configured model first, then the chat model as the fallback.
+
+    The fallback is not politeness: llama3.2-vision:latest is what
+    assistant.json still says on this box and ollama 0.33.1 cannot load it,
+    so without a second candidate every "what's on my screen?" is a spoken
+    apology until someone hand-edits the config and restarts."""
+    configured = str(cfg_get(cfg, "screen.model", DEFAULT_MODEL) or "").strip()
+    chat = chat_model()
+    out: list = []
+    for name in (configured or chat, chat):
+        if name and not any(same_model(name, seen) for seen in out):
+            out.append(name)
+    return out
+
+
+def setup_line(model: str, reason: str) -> str:
+    """The spoken excuse, naming the model and what is wrong with it."""
+    spoken = normalise_model(model).replace(":latest", "")
+    low = (reason or "").lower()
+    if "not found" in low or "404" in low:
+        return NOT_INSTALLED_LINE.format(model=spoken)
+    if "not a vision model" in low:
+        return NOT_VISION_LINE.format(model=spoken)
+    if low.startswith("http"):
+        return CANNOT_LOAD_LINE.format(model=spoken)
+    return NO_VISION_LINE
+
+
 # -------------------------------------------------------------- vision
 def _ask_vision(payload: dict, timeout: float = VISION_TIMEOUT_S) -> dict:
     """Seam 2: POST /api/chat -> decoded JSON.  Raises on transport errors,
@@ -211,16 +371,40 @@ def _ask_vision(payload: dict, timeout: float = VISION_TIMEOUT_S) -> dict:
     return json.loads(body or b"{}")
 
 
-def vision_payload(model: str, b64: str, question: str, title: str) -> dict:
+def vision_payload(model: str, b64: str, question: str, title: str,
+                   suppress_thinking: bool = True, resident: bool = False,
+                   num_ctx: Optional[int] = None) -> dict:
+    """The /api/chat body.
+
+    ``suppress_thinking`` sends ``think: false``.  It is not cosmetic: with
+    it unset gemma4 spent all 200 num_predict tokens in ``message.thinking``
+    and returned an EMPTY ``content`` (measured 2026-09-01: done_reason
+    "length", eval_count 200, a perfect description of the desktop stuck in
+    the reasoning block) -- which surfaced as "My vision model isn't
+    answering, sir."  It is sent only for models whose capabilities include
+    thinking, since a build that rejects the field on a plain model would
+    turn a working model into a 400.
+
+    ``resident`` means "this IS the brain's model": keep_alive -1 and the
+    brain's num_ctx keep the SAME runner, so the screen question costs no
+    reload and does not silently drop the brain's pin.  For any other model
+    keep_alive 0 unloads it the moment it has answered, so the chat model
+    can come straight back (OLLAMA_MAX_LOADED_MODELS=1)."""
     user = f"Question: {question}"
     if title:
         user = f"Active window: {title}\n{user}"
-    return {"model": model, "stream": False,
-            "messages": [{"role": "system", "content": SYSTEM_PROMPT},
-                         {"role": "user", "content": user, "images": [b64]}],
-            # Low temperature: reading text off a screen wants no invention.
-            # num_predict bounds the wait; the answer is capped in words anyway.
-            "options": {"temperature": 0.2, "num_predict": 200}}
+    payload = {"model": model, "stream": False,
+               "messages": [{"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": user, "images": [b64]}],
+               # Low temperature: reading text off a screen wants no invention.
+               # num_predict bounds the wait; the answer is word-capped anyway.
+               "options": {"temperature": 0.2, "num_predict": 200},
+               "keep_alive": -1 if resident else 0}
+    if suppress_thinking:
+        payload["think"] = False
+    if resident and num_ctx:
+        payload["options"]["num_ctx"] = int(num_ctx)
+    return payload
 
 
 def tidy_answer(text, cap: int = ANSWER_WORD_CAP) -> str:
@@ -270,9 +454,16 @@ def http_error_detail(exc) -> str:
 
 
 def ask_screen(question: str, model: str, b64: str, title: str,
-               timeout: float = VISION_TIMEOUT_S) -> str:
+               timeout: float = VISION_TIMEOUT_S,
+               caps: Optional[frozenset] = None) -> str:
     """The vision model's answer; raises VisionUnavailable on any failure."""
-    payload = vision_payload(model, b64, question, title)
+    # caps unknown (ollama would not say) -> still send think:false: a
+    # thinking model that eats its whole budget reasoning is the failure we
+    # have actually seen, and every model here that takes the field is one.
+    payload = vision_payload(model, b64, question, title,
+                             suppress_thinking=caps is None or "thinking" in caps,
+                             resident=same_model(model, chat_model()),
+                             num_ctx=chat_num_ctx())
     try:
         reply = _ask_vision(payload, timeout=timeout)
     except urllib.error.HTTPError as exc:
@@ -297,15 +488,61 @@ def ask_screen(question: str, model: str, b64: str, title: str,
     content = message.get("content") if isinstance(message, dict) else None
     answer = tidy_answer(content)
     if not answer:
-        raise VisionUnavailable("empty answer")
+        # Name the shape of the emptiness. An answer that is all reasoning
+        # means think:false did not take (an old ollama, or a model that
+        # ignores the field), and that is a one-word difference in the log
+        # between "the model is mute" and "the model is thinking at me".
+        thinking = isinstance(message, dict) and message.get("thinking")
+        raise VisionUnavailable("thinking-only reply (think:false ignored)"
+                                if thinking else "empty answer")
     return answer
+
+
+def look(question: str, b64: str, title: str, cfg) -> tuple:
+    """Ask the first candidate model that can actually answer.
+
+    Returns ``(answer, model)``; raises VisionUnavailable carrying the last
+    reason when none could.  A model that ollama REFUSES (404, or the 500
+    "unknown model architecture: \'mllama\'" that llama3.2-vision gives on
+    this build) is remembered in _UNUSABLE, so the wasted attempt is paid
+    once per process and every later question goes straight to the fallback.
+    """
+    reason = "no vision model configured"
+    model = ""
+    for model in candidate_models(cfg):
+        reason = unusable_reason(model)
+        if reason:
+            continue
+        caps, why = model_caps(model)
+        if caps is not None and "vision" not in caps:
+            reason = f"{model} is not a vision model (capabilities: " \
+                     f"{', '.join(sorted(caps)) or 'none'})"
+            mark_unusable(model, reason)
+            continue
+        if caps is None and ("not found" in why.lower() or "404" in why):
+            reason = why
+            mark_unusable(model, reason)
+            continue
+        try:
+            return ask_screen(question, model, b64, title, caps=caps), model
+        except VisionUnavailable as exc:
+            reason = str(exc)
+            # An HTTP status is ollama refusing THIS model (it cannot load
+            # the architecture, or it is gone); a timeout or a socket error
+            # is the server, and trying a second model would only stall
+            # Hunter twice.
+            if not reason.startswith("HTTP "):
+                raise
+            mark_unusable(model, reason)
+            log.warning("screen: ollama will not load %s (%s); %s", model,
+                        reason, SETUP_HINT)
+    raise VisionUnavailable(reason or f"{model} unusable")
 
 
 # --------------------------------------------------------------- tools
 def make_tools(cfg, services) -> list[ToolSpec]:
     def screen_qa(question=DEFAULT_QUESTION, **_) -> ToolResult:
         question = " ".join(str(question or "").split()) or DEFAULT_QUESTION
-        model = str(cfg_get(cfg, "screen.model", DEFAULT_MODEL) or DEFAULT_MODEL)
         max_width = coerce_width(cfg_get(cfg, "screen.max_width", DEFAULT_MAX_WIDTH))
         display = display_name()
         t0 = time.monotonic()
@@ -317,19 +554,27 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text="could not capture the screen", ok=False,
                               speak=NO_SCREEN_LINE)
         title = _window_title(display)
+        wanted = (candidate_models(cfg) or [""])[0]
         try:
-            answer = ask_screen(question, model, b64, title)
+            answer, model = look(question, b64, title, cfg)
         except VisionUnavailable as exc:
-            log.warning("screen: %s did not answer: %s", model, exc)
+            log.warning("screen: %s did not answer: %s; %s", wanted, exc,
+                        SETUP_HINT)
             # The reason rides in the tool text too: ok=False + speak= means
             # the spoken line is fixed, so without this the recorded answer
             # to "why can't he see?" is nowhere at all.
-            return ToolResult(text=f"vision model {model} unavailable: {exc}",
-                              ok=False, speak=NO_VISION_LINE)
+            return ToolResult(text=f"vision model {wanted} unavailable: {exc}"
+                                   f" -- {SETUP_HINT}",
+                              ok=False, speak=setup_line(wanted, str(exc)))
         except Exception as exc:  # noqa: BLE001 - tool boundary
             log.exception("screen: unexpected failure")
             return ToolResult(text=f"vision failed: {str(exc)[:60]}", ok=False,
                               speak=NO_VISION_LINE)
+        if not same_model(model, wanted):
+            # Loud, once per process per model: the answer arrived, but the
+            # config is still pointing at something this ollama cannot use.
+            log.warning("screen: %s is unusable here, answered with %s "
+                        "instead; %s", wanted, model, SETUP_HINT)
         # Sizes and timing only -- never the image, never the answer text.
         log.info("screen: %dx%d -> %dx%d, %d KB, %s answered in %.1fs",
                  orig[0], orig[1], small[0], small[1], len(b64) * 3 // 4096,

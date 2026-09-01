@@ -2111,6 +2111,19 @@ _LIST_STRIKE_RX = re.compile(
     r"^(?:take|cross|scratch|strike|knock|tick|check|rub)\s+(?:off\s+)?"
     r"(?P<item>.+?)\s+(?:off(?:\s+of)?|from|out of)\s+(?:my|the|our)\s+"
     + _LIST_NAME + r"\s+list[.!]*$", re.I)
+# "Cross the second one off THE LIST" -- no name, so _LIST_STRIKE_RX (which
+# requires "<name> list") cannot see it, no other rung matched either, and
+# the utterance fell all the way to the router, which classified it
+# "claude" with low confidence and offered the handoff: "Shall I hand that
+# to Claude, sir, or is it a quick one for me?" (his feature #32, still
+# there after two fix passes; reproduced 2026-09-01). The plain form only
+# LOOKED fine because "cross bread off the list" is five words and the
+# router's SHORT_WORDS prior sends it to gemma4's notes tool -- one word
+# longer and it would have failed the same way, so this rung answers both.
+_LIST_STRIKE_ANON_RX = re.compile(
+    r"^(?:take|cross|scratch|strike|knock|tick|check|rub)\s+(?:off\s+)?"
+    r"(?P<item>.+?)\s+(?:off(?:\s+of)?|from|out of)\s+(?:my|the|our)\s+"
+    r"list[.!]*$", re.I)
 _LIST_CLEAR_RX = re.compile(
     r"^(?:clear|empty|wipe|reset|erase|bin|delete)\s+(?:out\s+)?"
     r"(?:everything\s+(?:off|from)\s+)?(?:my|the|our)\s+"
@@ -2165,6 +2178,31 @@ def _list_target(c, m, create: bool = False):
     return store, name, notes_mod.list_kind(name)
 
 
+def _touch_list(store, kind) -> None:
+    """Remember which list is in play, so a later ordinal has something to
+    resolve against ("cross the second one off the list"). Guarded: a
+    duck-typed/stub store in a test has no touch()."""
+    fn = getattr(store, "touch", None)
+    if callable(fn):
+        try:
+            fn(kind)
+        except Exception:                       # noqa: BLE001 - a stub store
+            log.debug("list touch failed", exc_info=True)
+
+
+def _list_in_play(store):
+    """The kind an unqualified "the list" means, or None when nothing has
+    been read or named recently enough to say."""
+    fn = getattr(store, "in_play", None)
+    if not callable(fn):
+        return None
+    try:
+        return fn()
+    except Exception:                           # noqa: BLE001 - a stub store
+        log.debug("list in_play failed", exc_info=True)
+        return None
+
+
 def _no_such_list(name: str) -> CommandResult:
     return CommandResult(handled=True, reply=f"You haven't a {name} list, sir.",
                          speak=True, status="No such list")
@@ -2178,6 +2216,7 @@ def _h_list_add(c, t, m):
     store, name, kind = _list_target(c, mm, create=True)
     if kind is None:
         return None
+    _touch_list(store, kind)          # "...and cross the second one off the list"
     items = _split_items(mm.group("item"))
     if not items:
         return None
@@ -2216,6 +2255,9 @@ def _h_list_read(c, t, m):
         return None
     if not kind:
         return _no_such_list(name)
+    # The list he just heard read out is the list "the second one" counts
+    # down -- the ordinals index exactly this order (NotesStore.list).
+    _touch_list(store, kind)
     return CommandResult(handled=True,
                          reply=store.list_text(kind, LIST_SPOKEN_LIMIT),
                          speak=True, status=f"{name} list")
@@ -2227,7 +2269,58 @@ def _h_list_strike(c, t, m):
         return None
     if not kind:
         return _no_such_list(name)
+    _touch_list(store, kind)
     which = (m.group("item") or "").strip(" .")
+    removed = store.remove(kind, which)
+    if not removed:
+        return CommandResult(
+            handled=True, status="Not on the list", speak=True,
+            reply=f"I couldn't find that on your {name} list, sir.")
+    left = store.count(kind)
+    line = f"Off the {name} list, sir; {number_word(left)} left." if left else \
+        f"Off the {name} list, sir; that's it clear."
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"{name}: struck {removed[0]['text'][:30]}",
+                         undo=_undo_restore(store, kind, removed,
+                                            f"Back on the {name} list, sir."))
+
+
+def _h_list_strike_anon(c, t, m):
+    """"Cross the second one off the list" -- the list is not named.
+
+    Resolves against the list most recently read, added to or named
+    (NotesStore.last_touch, stamped by the handlers above and by the
+    `notes` tool). ``store.remove`` already understands "the second one",
+    "the last one" and "number two" -- notes.parse_which/resolve index the
+    same order list_text speaks -- so the ONLY thing missing was which
+    list they were ordinals INTO.
+
+    The safety rule this rung exists to keep: a positional reference with
+    no list in play asks rather than guesses. Guessing would delete the
+    second item of some list he was not talking about, silently, and the
+    undo only helps if he notices.
+    """
+    store = c._svc("notes")
+    if store is None:
+        return None
+    which = (m.group("item") or "").strip(" .")
+    if not which:
+        return None
+    mode, _ = notes_mod.parse_which(which)
+    if mode == "all":
+        # "cross everything off the list" is a wipe: leave it to the clear
+        # path, which reads it back before doing it.
+        return None
+    kind = _list_in_play(store)
+    if kind is None:
+        if mode not in ("index", "last"):
+            # A named item ("cross bread off the list") still says what it
+            # means, so let the model's notes tool find it as it does now.
+            return None
+        return CommandResult(
+            handled=True, speak=True, status="Which list?",
+            reply="Which list, sir? I've lost track of the one you mean.")
+    name = notes_mod.list_name(kind) or "to-do"
     removed = store.remove(kind, which)
     if not removed:
         return CommandResult(
@@ -2259,6 +2352,7 @@ def _h_list_clear(c, t, m):
         return None
     if not kind:
         return _no_such_list(name)
+    _touch_list(store, kind)
     n = store.count(kind)
     if not n:
         return CommandResult(handled=True, status="Empty", speak=True,
@@ -3098,12 +3192,25 @@ def _h_next_exam(c, t, m):
 def _h_diagnostics(c, t, m):
     """The film's "run diagnostics": uptime, models, today's turns, the box.
 
-    Two renderings of ONE sheet (jarvis/selfstate.py): the film register is
-    spoken -- clock and utilisation, not power draw, because idle reads
-    ~15 W both wedged and healthy -- and the plain sheet goes on the card
-    so the numbers stay readable. No model turn: routing a fact sheet
-    through gemma4 buys nothing and buys back the hallucination risk, and
-    "never invent a figure" is a prompt, not a guarantee.
+    ONE answer per turn. This used to speak the film register AND publish
+    the plain sheet as a "card", which is not a thing the bus has: a
+    JarvisReply IS the answer, so the UI drew both as Jarvis bubbles and
+    cmdsock streamed both as {"kind": "reply"}. He heard the film line and
+    read the plain one, reported 2026-08-31 as "(didnt say this but in
+    transcript) said this", and `jarvis --quiet "run diagnostics"` printed
+    two whole different status sentences on 2026-09-01.
+
+    The film register is the answer, in every register but formal: it was
+    written for the Iron-Man round, it is what the room hears, and it
+    carries the numbers that matter (clock and utilisation, not power
+    draw -- idle reads ~15 W both wedged and healthy). Nothing is lost by
+    dropping the second line: the plain sheet is still what `jarvis
+    status`, ask.py --status, the phone (webapp) and the formal register
+    render, all off this same selfstate dict.
+
+    No model turn either: routing a fact sheet through gemma4 buys nothing
+    and buys back the hallucination risk, and "never invent a figure" is a
+    prompt, not a guarantee.
     """
     fn = c._svc("diagnostics")
     if fn is None:
@@ -3124,11 +3231,9 @@ def _h_diagnostics(c, t, m):
         # Formal gets the plain sheet: the film register is an aside, and
         # the register that bans asides bans this one too.
         spoken = selfstate.stark_line(state) or plain
-    if spoken != plain:
-        try:
-            bus.publish(JarvisReply(text=plain, speak=False))
-        except Exception:
-            log.debug("diagnostics card publish failed", exc_info=True)
+    # Deliberately NO second publish here. See the docstring: the plain
+    # sheet as a companion "card" was a second answer to the same
+    # question, in a different voice, on the same bus.
     return CommandResult(handled=True, reply=spoken, speak=True, status="Diagnostics")
 
 
@@ -3997,6 +4102,7 @@ def _h_todo_add(c, t, m):
     if not text:
         return None
     todo_id = notes.add("todo", text)
+    _touch_list(notes, "todo")        # "...and cross the second one off the list"
     return CommandResult(handled=True, reply="Added to your list, sir.",
                          speak=True, status=f"To-do: {text[:40]}",
                          undo=_undo_notes(notes, "todo", todo_id,
@@ -4007,6 +4113,7 @@ def _h_todo_list(c, t, m):
     notes = c._svc("notes")
     if notes is None:
         return None
+    _touch_list(notes, "todo")
     return CommandResult(handled=True, reply=notes.list_text("todo"),
                          speak=True, status="To-dos")
 
@@ -4016,6 +4123,7 @@ def _h_todo_done(c, t, m):
     if notes is None or not hasattr(notes, "complete"):
         return None
     which = (m.group("w1") or m.group("w2") or m.group("w3") or "last").strip()
+    _touch_list(notes, "todo")
     done = notes.complete(which)
     if not done:
         return CommandResult(handled=True,
@@ -5530,6 +5638,10 @@ REGISTRY: list[Command] = [
     Command("list read", _LIST_READ_RX.match, _h_list_read, needs=("notes",)),
     Command("list strike", _LIST_STRIKE_RX.match, _h_list_strike,
             needs=("notes",)),
+    # After the named form (which is the more specific match) and before
+    # the to-do commands, which never see "... off the list" at all.
+    Command("list strike anon", _LIST_STRIKE_ANON_RX.match,
+            _h_list_strike_anon, needs=("notes",)),
     Command("list clear", _LIST_CLEAR_RX.match, _h_list_clear, needs=("notes",)),
     Command("lists", _LISTS_RX.match, _h_lists, needs=("notes",)),
     Command("todo done", _TODO_DONE_RX.match, _h_todo_done, needs=("notes",)),
@@ -5622,6 +5734,13 @@ ASSISTANT_TIER1: list[Command] = [
                     # named lists: spoken in the aisle and read back over
                     # SSH from the phone, neither with a wake-word prefix
                     "list add", "list read", "list strike", "list clear",
+                    # ...and the unnamed form, for the same reason: "cross
+                    # the second one off the list" is said straight after
+                    # the list was read out, with the wake word already
+                    # eaten. Without this name it is a REGISTRY entry only,
+                    # which unprefixed text never reaches -- which is why
+                    # his #32 still ended at the Claude offer.
+                    "list strike anon",
                     "lists",
                     "take note", "show notes", "answer question", "remind me",
                     # long-term memory, the people book and the day recap

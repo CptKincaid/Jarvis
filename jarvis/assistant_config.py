@@ -117,7 +117,13 @@ DEFAULTS: dict = {
     # empty means PATHS.MEMORY_DIR/code_index, a chroma collection separate
     # from the documents one so quiz mode never draws a flashcard from app.py.
     "code": {"paths": [], "index_dir": "", "max_files": 3000},
-    "screen": {"model": "llama3.2-vision:latest", "max_width": 1280},
+    # Screen Q&A ("what's on my screen?"). model "" = the local_model above,
+    # which is the ONLY free choice: OLLAMA_MAX_LOADED_MODELS=1, so naming a
+    # second vision model here evicts the chat model and costs ~7 s on the
+    # next spoken turn. It was llama3.2-vision:latest until 2026-09-01, and
+    # that is pulled but unloadable -- ollama 0.33.1 answers 500 "unknown
+    # model architecture: 'mllama'" -- so screen Q&A only ever apologised.
+    "screen": {"model": "", "max_width": 1280},
     # Study / focus sessions (jarvis/focus.py): block and break lengths in
     # minutes, "Halfway, sir" for blocks of 10+ min, the session ends itself
     # after max_blocks (0 = until "end the session"). music: "pause" pauses
