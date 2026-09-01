@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections import deque
+from statistics import median
 from typing import Callable, Optional
 
 from jarvis.logs import get_logger
@@ -32,6 +34,14 @@ log = get_logger("turn")
 # rejected clip never reaches "handle"), so the report prints what it has.
 STAGES = ("wake", "mic", "speech_end", "stop", "stt", "handle", "filler", "audio")
 STALE_S = 90.0          # a turn that never produced audio is dropped at the next wake
+
+# How many completed turns the ledger remembers so the app can ask "how fast
+# is this box TODAY?". The slow-answer filler (jarvis/app.py _say_thinking)
+# was tuned when the median wait was 10.68 s; it is 1.30 s now, and a delay
+# frozen at that old scale fires on turns that are about to answer anyway
+# ("had the answer then said checking one moment sir", 2026-08-31 21:36).
+RECENT_WAITS = 12
+MIN_WAIT_SAMPLES = 5    # below this the median is noise; the caller's default wins
 
 
 def _fmt(seconds: Optional[float]) -> str:
@@ -60,6 +70,8 @@ class TurnLedger:
         self._marks: dict[str, float] = {}
         self._notes: dict[str, str] = {}
         self._open = False
+        # Completed waits (last word -> first audio), newest last.
+        self._waits: deque[float] = deque(maxlen=RECENT_WAITS)
         # The last mark of ANY turn, kept across turns. This is the ledger's
         # answer to "when did the microphone last hear him?", and it is what
         # the departure cue (jarvis/arrival.py) vetoes on -- a sleeping phone
@@ -115,6 +127,19 @@ class TurnLedger:
         with self._lock:
             return self._last_mark
 
+    def typical_wait_s(self, min_samples: int = MIN_WAIT_SAMPLES) -> Optional[float]:
+        """Median wait over the last ``RECENT_WAITS`` answered turns, or None
+        until ``min_samples`` of them exist.
+
+        The median, not the mean: one 24 s Claude session must not drag the
+        estimate of what a normal turn costs. Used to scale the slow-answer
+        filler -- see jarvis/app.py _filler_delay_s."""
+        with self._lock:
+            waits = list(self._waits)
+        if len(waits) < max(1, min_samples):
+            return None
+        return float(median(waits))
+
     def idle_s(self) -> Optional[float]:
         """Seconds since the microphone last did anything (None: never)."""
         with self._lock:
@@ -127,6 +152,11 @@ class TurnLedger:
         m = self._marks
         self._open = False
         rec = self.compute(m, outcome, self._notes)
+        # Only a turn that actually produced audio has a wait worth keeping;
+        # a rejection or a watchdog abandon says nothing about how fast the
+        # box answers.
+        if outcome == "audio" and rec.get("wait") is not None:
+            self._waits.append(float(rec["wait"]))
         try:
             self._emit(rec)
         except Exception:

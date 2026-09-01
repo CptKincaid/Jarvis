@@ -98,8 +98,10 @@ def test_a_compound_runs_both_halves(rich, said):
     assert svc.timekeeper.add_timer.call_args.args[0] == 600
     assert _todos(svc) == ["milk"]
     assert res.handled and res.speak
+    # ONE burst, one sign-off: the two clauses' finished lines are thinned
+    # against each other at the join (jarvis/address.py).
     assert res.reply == ("10 minutes, sir; I'll let you know. "
-                         "Added to your list, sir.")
+                         "Added to your list.")
     svc.brain.chat.assert_not_called()
 
 

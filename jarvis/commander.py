@@ -78,6 +78,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from jarvis import address
 from jarvis import aside as aside_mod
 from jarvis import board as board_mod
 from jarvis import dialogue as dialogue_mod
@@ -2120,7 +2121,15 @@ _LISTS_RX = re.compile(
     r"|what are (?:my|the) lists)[?.!]*$", re.I)
 # "milk, eggs and bread" is three items; "pick up the dry cleaning and post
 # the forms" is ONE errand. Only short, list-shaped text is split.
-_ITEM_SPLIT_RX = re.compile(r"\s*,\s*|\s+and\s+", re.I)
+# The comma alternative used to win the race on "milk, eggs, and bread":
+# ", " matched first and left "and bread" standing as an ITEM, so the list
+# read back "eggs, and ... and bread" (reported 2026-08-31, feature #31 --
+# "it kept the and bread i said"). The Oxford "and" belongs to the
+# SEPARATOR, so it is matched with the comma, before the bare-"and" arm.
+_ITEM_SPLIT_RX = re.compile(r"\s*,\s*(?:and\s+|&\s*)?|\s+and\s+|\s*&\s*", re.I)
+# Belt and braces for a transcript the splitter above cannot un-pick
+# ("milk and, eggs"): no item he dictates starts with a bare conjunction.
+_LEADING_CONJ_RX = re.compile(r"^(?:and|&)\s+", re.I)
 LIST_SPLIT_CHARS = 60
 LIST_SPOKEN_LIMIT = 10          # == NotesStore.resolve's ordinal window
 
@@ -2131,7 +2140,8 @@ def _split_items(text: str) -> list:
         return []
     if len(text) > LIST_SPLIT_CHARS:
         return [text]
-    parts = [p.strip(" .,") for p in _ITEM_SPLIT_RX.split(text)]
+    parts = [_LEADING_CONJ_RX.sub("", p.strip(" .,")).strip()
+             for p in _ITEM_SPLIT_RX.split(text)]
     parts = [p for p in parts if p]
     if len(parts) > 1 and all(len(p.split()) <= 3 for p in parts):
         return parts
@@ -2171,11 +2181,31 @@ def _h_list_add(c, t, m):
     items = _split_items(mm.group("item"))
     if not items:
         return None
-    ids = [store.add(kind, i) for i in items]
-    line = f"Added to your {name} list, sir." if len(items) == 1 else \
-        f"{number_word(len(items)).capitalize()} added to your {name} list, sir."
+    # add_items, not a bare add() per item: a thing already on the list is
+    # not added again (feature #31 -- "milk, milk"). It reports what it
+    # skipped so the confirmation stays honest about the count.
+    adder = getattr(store, "add_items", None)
+    if callable(adder):
+        ids, added, dups = adder(kind, items)
+    else:                                   # duck-typed / stub store
+        ids, added, dups = [store.add(kind, i) for i in items], list(items), []
+    if not added:
+        # Every one of them was already there: say so rather than claim an
+        # add that did not happen.
+        subject = notes_mod.join_spoken(dups)
+        subject = subject[:1].upper() + subject[1:]
+        verb = "is" if len(dups) == 1 else "are"
+        return CommandResult(
+            handled=True, speak=True,
+            reply=f"{subject} {verb} already on your {name} list, sir.",
+            status=f"{name}: already there")
+    line = f"Added to your {name} list, sir." if len(added) == 1 else \
+        f"{number_word(len(added)).capitalize()} added to your {name} list, sir."
+    if dups:
+        line = line[:-1] + (f"; {notes_mod.join_spoken(dups)} "
+                            f"{'was' if len(dups) == 1 else 'were'} already there.")
     return CommandResult(handled=True, reply=line, speak=True,
-                         status=f"{name}: {', '.join(items)[:40]}",
+                         status=f"{name}: {', '.join(added)[:40]}",
                          undo=_undo_notes(store, kind, ids,
                                           f"Off the {name} list again, sir."))
 
@@ -5983,6 +6013,30 @@ class LastTurn:
     ts: float
 
 
+def _merge_acks(replies: list) -> Optional[str]:
+    """One acknowledgement for a compound whose clauses answered alike.
+
+    "Noted, sir: your mom is Heather." + "Noted, sir: your dad is Ali."
+    -> "Noted, sir: your mom is Heather and your dad is Ali." Only when
+    every clause used the SAME lead-in (the text before the first colon)
+    and every one has a tail; anything else is two different answers and
+    is joined as two sentences, as before.
+    """
+    if len(replies) < 2:
+        return None
+    heads, tails = [], []
+    for reply in replies:
+        head, sep, tail = str(reply).partition(":")
+        tail = tail.strip().rstrip(".")
+        if not sep or not tail or "." in head:
+            return None            # no lead-in, or the "head" is a sentence
+        heads.append(head.strip())
+        tails.append(tail)
+    if len(set(heads)) != 1 or len(set(tails)) != len(tails):
+        return None                # different answers, or the same fact twice
+    return f"{heads[0]}: {notes_mod.join_spoken(tails)}."
+
+
 class Commander:
     """Routes a user utterance (voice or typed) through the V3 pipeline:
 
@@ -6085,7 +6139,20 @@ class Commander:
         threading.Thread(target=fn, daemon=True).start()
 
     def _speak(self, text: str):
-        """Speak via the TTS service when talk-back is enabled."""
+        """Speak via the TTS service when talk-back is enabled.
+
+        While ``_try_multi`` is running the clauses of ONE compound
+        utterance the line is diverted into ``_suppress_speak`` instead of
+        spoken on the spot: two clauses that each speak for themselves are
+        two utterances for one breath ("Noted, sir: your mom is Heather."
+        then "Noted: your dad is Ali." -- reported 2026-08-31, feature #57,
+        "two noted said though"). The JOIN speaks the pair once.
+        """
+        held = getattr(self, "_suppress_speak", None)
+        if held is not None:
+            if text:
+                held.append(text)
+            return
         if not CONFIG.talkback or not text:
             return
         tts = self._svc("tts")
@@ -6095,6 +6162,10 @@ class Commander:
             tts.speak(text)
         except Exception:
             log.exception("tts speak failed")
+
+    # None = speak now; a list = a compound is running, park the lines
+    # (see _speak / _try_multi).
+    _suppress_speak = None
 
     def _type_raw(self, text: str):
         """Type raw text into the active window (monolith 3176-3181)."""
@@ -6175,6 +6246,22 @@ class Commander:
                         return True
                 except (TypeError, ValueError):
                     pass
+        # "Shall I hand that to Claude, sir, or is it a quick one for me?"
+        # is a question Jarvis asked too. The router owns it (its own
+        # ASK_TTL_S, and .pending() self-expires), and it was missing here:
+        # on 2026-08-31 "Cross the second one off the list" ended in that
+        # question, and the yes/no that answers it got the 4 s window and
+        # the strict confidence gate rather than the 15 s question window
+        # and the salvage (app._salvage_low_confidence).
+        # getattr, not _svc: a slim test commander has no .services at all.
+        router = getattr(getattr(self, "services", None), "router", None)
+        probe = getattr(router, "pending", None)
+        if callable(probe):
+            try:
+                if probe() is not None:
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed router
+                log.debug("question_open: router pending failed", exc_info=True)
         # The wake-alarm offer and the exam-week study offer are parked on
         # the SERVICES namespace by briefing.make_tools, not on the
         # commander, and both are stamped in wall-clock seconds.
@@ -7642,6 +7729,11 @@ class Commander:
         before = self._pending_destructive
         self._pending_destructive = None
         pending = []
+        # Handlers that speak for themselves (_h_add_person, _h_who_is,
+        # _h_remember) are diverted here for the length of the compound so
+        # the pair is spoken ONCE, by the JOIN below. #57.
+        held_speech: list = []
+        self._suppress_speak = held_speech
         try:
             for part in parts:
                 self._raw_text = part
@@ -7661,6 +7753,7 @@ class Commander:
                 results.append(res)
         finally:
             self._raw_text = raw
+            self._suppress_speak = None
         if not results:
             self._pending_destructive = before   # nothing ran: leave the floor as it was
             return None
@@ -7669,6 +7762,12 @@ class Commander:
         if pending:
             self._stash_multi_confirm(pending)
         replies = [str(r.reply).strip() for r in results if r.reply]
+        # A handler that spoke eagerly returned reply without speak=True
+        # (it had already said it). Now that its line was diverted, the
+        # joined result has to carry it, or the turn goes silent.
+        spoke_eagerly = bool(held_speech)
+        if not replies and held_speech:
+            replies = [t.strip() for t in held_speech if t and t.strip()]
         statuses = [r.status for r in results if r.status]
         # Both clauses' undo closures, chained: handle() only replaces
         # _last_undo when the NEW result carries one, so a compound that
@@ -7679,10 +7778,19 @@ class Commander:
         # aside.py anchors on the structured thing just created; the last
         # clause is the one "...and make it 9 pm" is about.
         acts = [r.action for r in results if getattr(r, "action", None) is not None]
+        # THE JOIN: a compound turn ("set a ten minute timer and add milk to
+        # the list") speaks two finished authored lines as one burst, and
+        # each of them signs off. Thinned while they are still separate
+        # fragments -- jarvis/address.py.
+        # ONE acknowledgement for one breath: "Noted, sir: your mom is
+        # Heather" + "Noted, sir: your dad is Ali" is a single sentence
+        # with two facts, not two announcements. #57 -- and combining is
+        # deliberately preferred over dropping the second fact.
+        merged = _merge_acks(replies)
         return CommandResult(
             handled=True,
-            reply=" ".join(replies) or None,
-            speak=any(r.speak for r in results),
+            reply=merged or address.join_fragments(replies) or None,
+            speak=any(r.speak for r in results) or spoke_eagerly,
             status=" + ".join(statuses) or None,
             # one follow-up window for the pair: it opens once the last
             # clause is done
@@ -7705,7 +7813,7 @@ class Commander:
                     continue
                 if line:
                     lines.append(str(line))
-            return " ".join(lines)
+            return address.join_fragments(lines)
         return _undo_all
 
     def _stash_multi_confirm(self, pending: list) -> None:
@@ -7732,10 +7840,10 @@ class Commander:
                 if getattr(res, "status", None):
                     statuses.append(str(res.status))
             return CommandResult(handled=True,
-                                 reply=" ".join(replies) or None,
+                                 reply=address.join_fragments(replies) or None,
                                  speak=True,
                                  status=" + ".join(statuses) or "Done")
-        self.stash_destructive(_run_all, " ".join(lines))
+        self.stash_destructive(_run_all, address.join_fragments(lines))
 
     def _multi_match(self, text: str) -> list:
         """The clauses of a compound whose EVERY half is a Tier-1 command

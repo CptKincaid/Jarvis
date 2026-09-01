@@ -200,19 +200,26 @@ def _process(a, monkeypatch, accepted, text="by Agenda 4.2.6"):
     a._process_audio(b"\x00" * 32000)
 
 
-def test_say_that_again_is_asked_once_then_jarvis_goes_quiet(monkeypatch, tmp_path):
+def test_say_that_again_is_asked_once_then_the_mic_stays_shut(monkeypatch, tmp_path):
+    """The second garbled clip in a row no longer re-opens the mic -- that is
+    what stopped a television looping the exchange. It is no longer SILENT
+    either: the mute second strike is how #33 read to Hunter on 2026-08-31
+    ("Yes (low confidence, didnt do it)"), so he gets NOT_CAUGHT_LINE, which
+    does not arm a follow-up window."""
     a = _app(monkeypatch, tmp_path)
     _process(a, monkeypatch, accepted=False)
     assert a.said == [app_mod.SAY_AGAIN_LINE] and a._followup_after_speech
     a._followup_after_speech = False
     _process(a, monkeypatch, accepted=False)
-    assert a.said == [app_mod.SAY_AGAIN_LINE], "no second ask: the room is talking"
+    assert a.said == [app_mod.SAY_AGAIN_LINE, app_mod.NOT_CAUGHT_LINE], \
+        "no second ask, but he must not be left in silence either"
     assert not a._followup_after_speech
     assert ("abandon", "rejected:confidence") in a.marks
     a._on_hotword.__func__  # a wake resets the counter (see _on_hotword)
     a._say_again_count = 0
     _process(a, monkeypatch, accepted=False)
-    assert a.said == [app_mod.SAY_AGAIN_LINE] * 2
+    assert a.said == [app_mod.SAY_AGAIN_LINE, app_mod.NOT_CAUGHT_LINE,
+                      app_mod.SAY_AGAIN_LINE]
 
 
 # --------------------------------------------------------- guests, memory

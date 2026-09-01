@@ -1,0 +1,149 @@
+# Jarvis room sensor -- ESP32 + HLK-LD2410 mmWave presence radar.
+#
+# Flash this with ESPHome, then put the device's URL in
+# ~/.config/jarvis/assistant.json under presence.room_sensor_url.
+# Full walkthrough: docs/room-sensor.md
+#
+#   pip install esphome                     # in ANY venv/pipx, not vss_env
+#   esphome run scripts/esphome/jarvis-room-sensor.yaml
+#
+# EVERYTHING YOU MUST CHANGE IS IN `substitutions` BELOW AND MARKED
+# "<-- CHANGE ME". Nothing else needs editing to work.
+#
+# WIRING (LD2410C 5-pin header -> ESP32 DevKit):
+#     LD2410 VCC -> ESP32 5V / VIN      (the radar wants 5 V, not 3.3 V)
+#     LD2410 GND -> ESP32 GND
+#     LD2410 TX  -> ESP32 GPIO16        CROSSED: their TX is our RX
+#     LD2410 RX  -> ESP32 GPIO17        CROSSED: their RX is our TX
+#     LD2410 OUT -> nothing             (the raw presence line; UART tells
+#                                        us more, so it stays unconnected)
+# Data pins are 3.3 V logic on both sides, so no level shifter.
+# On an ESP32-WROVER (the one with PSRAM) GPIO16/17 are taken by the PSRAM:
+# use GPIO32 (rx) and GPIO33 (tx) instead and change them below too.
+
+substitutions:
+  device_name: jarvis-room
+  wifi_ssid: "YOUR_WIFI_SSID"                 # <-- CHANGE ME
+  wifi_password: "YOUR_WIFI_PASSWORD"         # <-- CHANGE ME
+  ota_password: "pick-something"              # <-- CHANGE ME (any string)
+  # A fixed address means the URL in assistant.json never goes stale. Pick
+  # one OUTSIDE the router's DHCP pool, on the Spark's subnet. If you would
+  # rather use a DHCP reservation, delete the whole manual_ip: block.
+  static_ip: 192.168.50.60                    # <-- CHANGE ME
+  gateway: 192.168.50.1                       # <-- CHANGE ME (your router)
+  subnet: 255.255.255.0
+
+esphome:
+  name: ${device_name}
+
+esp32:
+  board: esp32dev            # a plain ESP32-WROOM DevKitC / NodeMCU-32S
+  framework:
+    type: arduino            # web_server is best-supported here
+
+logger:
+  # UART0 (the USB cable). The radar is on a different UART, see below.
+  baud_rate: 115200
+
+# NOTE: THERE IS DELIBERATELY NO `api:` BLOCK.
+# The native API is for Home Assistant, and with `api:` enabled and no
+# client ever connecting, ESPHome REBOOTS THE DEVICE EVERY 15 MINUTES by
+# design. Jarvis reads the HTTP endpoint instead, so the API is not just
+# unnecessary here, it would put a reboot hole in presence every quarter
+# hour. Leave it out.
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+wifi:
+  ssid: ${wifi_ssid}
+  password: ${wifi_password}
+  manual_ip:
+    static_ip: ${static_ip}
+    gateway: ${gateway}
+    subnet: ${subnet}
+  # If the Wi-Fi is down at boot the device serves its own network so you
+  # can still reach it: join "jarvis-room setup" and browse to 192.168.4.1
+  ap:
+    ssid: "${device_name} setup"
+    password: "jarvisroom"
+
+captive_portal:
+
+# THE BIT JARVIS TALKS TO. One GET, no broker, no dependency:
+#   curl http://192.168.50.60/binary_sensor/presence
+#   {"id":"binary_sensor-presence","value":true,"state":"ON"}
+# Browsing to http://192.168.50.60/ lists every entity and its live state.
+web_server:
+  port: 80
+  version: 2
+
+uart:
+  id: ld2410_uart
+  tx_pin: GPIO17             # -> LD2410 RX
+  rx_pin: GPIO16             # <- LD2410 TX
+  baud_rate: 256000          # the LD2410's factory rate; do not change
+  parity: NONE
+  stop_bits: 1
+
+ld2410:
+  id: radar
+  uart_id: ld2410_uart
+  # Part of the arrival latency budget: how often the radar's state may be
+  # republished. The default is 1 s; 250 ms costs nothing on a LAN and
+  # takes a quarter-second off "he walked in" -> "the endpoint says ON".
+  throttle: 250ms
+
+binary_sensor:
+  - platform: ld2410
+    ld2410_id: radar
+    # THE ENTITY JARVIS READS. Its name is what makes the URL
+    # /binary_sensor/presence -- rename it and you must change
+    # presence.room_sensor_url to match.
+    #
+    # has_target is PRESENCE, not motion: the LD2410 reports a still
+    # target from chest movement and breathing, so this stays ON while he
+    # sits reading. That is the entire reason this is not a PIR.
+    has_target:
+      name: Presence
+      id: room_presence
+    has_moving_target:
+      name: Moving target
+    has_still_target:
+      name: Still target
+
+sensor:
+  - platform: ld2410
+    ld2410_id: radar
+    moving_distance:
+      name: Moving distance
+    still_distance:
+      name: Still distance
+    detection_distance:
+      name: Detection distance
+  - platform: uptime
+    name: Uptime
+  - platform: wifi_signal
+    name: WiFi signal
+    update_interval: 60s
+
+# Optional conveniences: tuning knobs on the device's own web page. If a
+# future ESPHome renames one of these and the compile fails, delete this
+# block -- nothing Jarvis reads depends on it.
+number:
+  - platform: ld2410
+    ld2410_id: radar
+    # "Absence delay": how long the radar holds ON after the last sign of
+    # life. This is a DEPARTURE knob, not an arrival one. The factory 5 s
+    # is fine; raise it if a still target flickers off while he reads.
+    timeout:
+      name: Absence delay
+    max_move_distance_gate:
+      name: Max move gate
+    max_still_distance_gate:
+      name: Max still gate
+
+button:
+  - platform: restart
+    name: Restart

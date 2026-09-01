@@ -11,6 +11,17 @@ Bluetooth is deliberately not a leg: no phone is paired to the Spark and a
 phone does not stay "Connected: yes" to a Linux host unless an audio or HID
 profile is in use, so ``bluetoothctl info`` would say "away" all day.
 
+A SECOND LEG, off by default: ``presence.room_sensor_url`` points at an
+ESP32 + LD2410 mmWave module over plain HTTP (``jarvis/roomsensor.py``,
+``docs/room-sensor.md``). The two legs compose as an OR with one asymmetry
+that IS the design: **the room seeing someone is positive evidence and
+beats a sleeping phone; the room seeing nobody is not absence** -- he may
+be in the kitchen -- so an empty room never overrides a phone that
+answers. Absence therefore remains exactly what it was, the phone's
+verdict on the same grace, and the sensor can only ever make him home
+sooner. With no URL configured the sentinel polls the same ``probe``
+function object it always did.
+
 ``PresenceSentinel`` polls the probe on a daemon thread (health.Watchdog's
 start / stop-with-join form so a ping in flight cannot outlive quit) and
 publishes ``Presence`` on the bus at each transition. Away has hysteresis:
@@ -102,14 +113,97 @@ def _cfg_get(cfg, key, default=None):
     return default
 
 
+def _make_sensor(cfg):
+    """The room-sensor leg from config, or None. Never raises, never polls.
+
+    Built ONCE, at construction: ``AssistantConfig.reload_if_changed`` has
+    no callers, so a config edit needs a restart -- and a sensor that
+    appeared mid-run would want a state re-evaluation nobody asked for.
+    """
+    raw = str(_cfg_get(cfg, "presence.room_sensor_url", "") or "").strip()
+    if not bool(_cfg_get(cfg, "presence.room_sensor_enabled", False)):
+        if raw:
+            log.info("presence: room_sensor_url is set but "
+                     "presence.room_sensor_enabled is false; phone probe only")
+        return None
+    if not raw:
+        return None
+    try:
+        from jarvis import roomsensor
+        sensor = roomsensor.RoomSensor(
+            raw, timeout_s=_cfg_get(cfg, "presence.room_sensor_timeout_s",
+                                    roomsensor.DEFAULT_TIMEOUT_S))
+    except Exception:  # noqa: BLE001 - a missing module must not cost the phone leg
+        log.exception("presence: room sensor could not be built")
+        return None
+    if not sensor.configured:
+        log.warning("presence: room_sensor_url %r is not an http(s) URL; "
+                    "phone probe only", raw)
+        return None
+    log.info("presence: room sensor %s", sensor.url)
+    return sensor
+
+
+class RoomOrPhone:
+    """``(ip, mac) -> True | False | None`` -- the two legs, composed.
+
+    The room is asked FIRST because it is the cheap one (a LAN GET, ~5 ms,
+    against a ``ping`` that costs up to a second) and because a hit there
+    ends the tick: while he is in the room the phone is never probed at
+    all. Then:
+
+    * room says someone -> ``True``, and the phone is not consulted. This
+      is the arrival win: the radar sees him on the doorstep whether or
+      not his phone's radio has woken up to answer an ARP.
+    * room says nobody -> the phone decides, unchanged. An empty room is
+      not an empty flat.
+    * room has no opinion (offline, garbage, breaker open) -> the phone
+      decides, unchanged. THIS is the dark-safe path, and it is why
+      ``RoomSensor.read`` returns None rather than False.
+    * room says nobody AND there is no phone leg to fall back to ->
+      ``False``, the honest answer for a sensor-only install.
+    * no opinion AND no phone leg -> ``None``, meaning "this tick knows
+      nothing". ``tick`` holds the state rather than counting it towards
+      the away grace: a sensor-only install whose sensor died must never
+      drift into "away" and mute him.
+    """
+
+    def __init__(self, sensor, phone: Callable = probe):
+        self.sensor, self.phone = sensor, phone
+
+    def __call__(self, ip: str = "", mac: str = "") -> Optional[bool]:
+        seen = None
+        try:
+            seen = self.sensor.read()
+        except Exception:  # noqa: BLE001 - the room must not break the phone leg
+            log.debug("presence: room sensor read failed", exc_info=True)
+        if seen:
+            return True
+        if ip or mac:
+            return bool(self.phone(ip, mac))
+        return False if seen is False else None
+
+
+def make_probe(sensor, phone: Callable = probe) -> Callable:
+    """The probe the sentinel polls. No sensor -> the phone probe ITSELF,
+    so an unconfigured box runs the identical code path it ran before this
+    module existed."""
+    return phone if sensor is None else RoomOrPhone(sensor, phone)
+
+
 class PresenceSentinel:
     """See the module docstring. ``state`` is 'home' | 'away' | 'unknown'."""
 
-    def __init__(self, cfg, publish: Callable = bus.publish, probe_fn: Callable = probe,
+    def __init__(self, cfg, publish: Callable = bus.publish,
+                 probe_fn: Optional[Callable] = None,
                  now: Callable[[], float] = time.time, poll_s: Optional[float] = None):
         self._cfg = cfg
         self._publish = publish
-        self._probe = probe_fn
+        # The room sensor is composed IN here rather than wired in app.py:
+        # probe_fn was always the injection point, and an explicit one
+        # (every test) still wins outright.
+        self.sensor = _make_sensor(cfg)
+        self._probe = probe_fn if probe_fn is not None else make_probe(self.sensor)
         self._now = now
         self._poll_s = poll_s
         self.home: Optional[bool] = None
@@ -131,8 +225,9 @@ class PresenceSentinel:
 
     @property
     def configured(self) -> bool:
+        """Enabled, and at least one leg to stand on."""
         return bool(_cfg_get(self._cfg, "presence.enabled", True)) and \
-            bool(self.phone_ip or self.phone_mac)
+            bool(self.phone_ip or self.phone_mac or self.sensor is not None)
 
     @property
     def away_after_s(self) -> float:
@@ -181,10 +276,17 @@ class PresenceSentinel:
             return None
         now = self._now()
         try:
-            present = bool(self._probe(self.phone_ip, self.phone_mac))
+            answer = self._probe(self.phone_ip, self.phone_mac)
         except Exception:  # noqa: BLE001 - the loop must survive anything
             log.exception("presence: probe failed")
             return None
+        if answer is None:
+            # No evidence AT ALL this tick (a sensor-only install whose
+            # sensor is offline). Hold everything -- including the boot
+            # grace clock, which must start when the first real answer
+            # arrives, not when the first blank one does.
+            return None
+        present = bool(answer)
         event = None
         with self._lock:
             if self._started_at is None:
@@ -218,7 +320,8 @@ class PresenceSentinel:
         if self._thread is not None and self._thread.is_alive():
             return
         if not self.configured:
-            log.info("presence: no phone_ip / phone_mac configured; sentinel idle")
+            log.info("presence: no phone_ip / phone_mac / room sensor configured; "
+                     "sentinel idle")
             return
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="presence",

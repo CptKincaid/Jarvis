@@ -79,6 +79,98 @@ _ENGINE_NEEDS_TIME_REWRITE = {"edge": True, "xtts": True, "f5": True,
 _ENGINE_NEEDS_UNSHOUT = {"edge": True, "xtts": True, "f5": True,
                          "fish": True}
 
+# Which engines need a TERSE line padded into a sentence before they can
+# pace it. F5 alone: see SHORT_LINE_BYTES. Edge and fish normalise their own
+# duration from the text, and XTTS derives it from the mel decoder, so
+# neither has the byte-count cliff this works around.
+_ENGINE_NEEDS_SHORT_PAD = {"edge": False, "xtts": False, "f5": True,
+                           "fish": False}
+
+# -------------------------------------------------- the terse-line problem
+#
+# Hunter, 2026-08-31, on four features he otherwise passed: the note ack, the
+# to-do read-back and the note search were all "said really fast".
+#
+# MEASURED on the live sidecar before changing anything (11 lines, 9-108
+# bytes, plus the exact cached wavs he heard): the articulation rate is NOT
+# higher on a short line. Voiced pace is flat at ~19 bytes/s -- 195-233 ms
+# per syllable end to end -- and the short lines sit at the SLOW end of that.
+# So "spoken too fast" is not a rate defect, and there was no rate to fix.
+#
+# What is actually wrong is that a short line has no rate CONTROL at all.
+# scripts/f5_server.py's duration_floor pins a short utterance's length to
+#
+#     0.45 + 0.04988 * bytes        (no speed term)
+#
+# and fix_duration overrides infer()'s own speed handling, so below ~41 bytes
+# the blind-validated speed=0.85 is inert. Measured: "Noted, sir." renders to
+# exactly 0.99 s at speed 0.85, 0.80, 0.75 AND 0.70 -- identical audio. The
+# ONLY thing that decides how long Jarvis takes over a short reply is how
+# many bytes it is, so the only lever this module has is the words.
+#
+# Two thresholds matter, both verified against the sidecar's own report
+# ("floor binds below 41 bytes" at reference 528 frames / 109 bytes):
+#
+#   < 10 bytes   F5's utils_infer sets local_speed = 0.3, which inflates the
+#                native allotment so far that duration_floor returns None and
+#                the line renders on the UNVALIDATED upstream path. Measured
+#                "Buy milk." (9 B): 1.53 s of which 0.93 s is leading silence
+#                and only 0.58 s is voice -- 62% dead air.
+#   >= 10 bytes  the floor engages; this is the regime the round 1-5 blind
+#                listening tests actually validated.
+#
+# Padding with the address is the fix and whitespace is NOT, which had to be
+# measured rather than assumed. Both buy bytes; only the address buys SPEECH:
+#
+#   "Buy milk."        9 B  1.53 s  0.58 s voiced  62% dead  floor OFF
+#   "Buy milk.   "    12 B  1.03 s  0.60 s voiced  42% dead  floor on
+#   "Buy milk, sir."  14 B  1.14 s  0.77 s voiced  33% dead  floor on
+#
+# i.e. trailing spaces lengthen the clip with silence and leave the words
+# exactly as clipped as before, while the address adds a third more voice.
+# So a two-word answer is padded into a small sentence -- "Buy milk, sir."
+# rather than "buy milk" -- which is also simply how Jarvis talks.
+SHORT_LINE_BYTES = 16     # pad below this: 0.45 + 0.04988*16 = ~1.25 s of air
+F5_FLOOR_MIN_BYTES = 10   # below this the floor is a no-op (local_speed 0.3)
+
+# Already addressed? Then it is a sentence already and adding a second "sir"
+# would read as a stammer ("Noted, sir, sir.").
+_ADDRESSED = re.compile(r"\bsir\b", re.I)
+_TERMINAL = re.compile(r"[.!?;:,\u2026]+$")
+
+
+def pad_short_line(text: str) -> str:
+    """A terse line padded into a small addressed sentence, else unchanged.
+
+    Only the byte count can lengthen a floored utterance (the floor ignores
+    speed), so this is the whole of the pacing fix for short replies. It is
+    deliberately a no-op at or above SHORT_LINE_BYTES: every long-form reply
+    renders byte-for-byte as before, and so does its cache entry.
+    """
+    if not text or len(text.encode("utf-8")) >= SHORT_LINE_BYTES:
+        return text
+    if _ADDRESSED.search(text):
+        return text
+    body = text.strip()
+    m = _TERMINAL.search(body)
+    tail = m.group(0) if m else ""
+    body = body[:m.start()].rstrip() if m else body
+    if not body:
+        return text
+    # A comma before the address, and keep whatever the line ended with so a
+    # question stays a question ("Which one, sir?").
+    #
+    # The address is worth +6 bytes, so any body of 4 characters or more
+    # clears F5_FLOOR_MIN_BYTES. A body of three ("Yes" -> "Yes, sir.", 9 B)
+    # still renders on the sub-10-byte branch, and is LEFT there deliberately:
+    # that branch's measured failure is a long lead-in (0.93 s of silence on
+    # "Buy milk."), i.e. too SLOW to start, never Hunter's "too fast". Buying
+    # the last byte with trailing whitespace does not work either -- the
+    # sentence splitter strips each chunk before synthesis -- and buying it
+    # with another word would be inventing speech to satisfy a threshold.
+    return f"{body}, sir{tail if tail not in ('', ',') else '.'}"
+
+
 # Voice parameters (unchanged from the V1 engine); they are part of the
 # speech-cache key so a tuning change never replays stale audio.
 EDGE_VOICE = "en-GB-RyanNeural"
@@ -1793,6 +1885,16 @@ class TTS:
                 text = text[:cut + 1]
             else:
                 text = text[:self.MAX_SPEAK_LENGTH] + "..."
+
+        # Last, so the pad is measured against the text that will actually be
+        # rendered and lands in the cache key with it. Hunter's "said buy milk
+        # really fast": below ~41 bytes the F5 floor fixes the duration and
+        # ignores speed, so words are the only lever left (see pad_short_line).
+        # getattr, not self._engine: test_tts_speak_queue builds a bare
+        # TTS.__new__(TTS) to exercise this cleaner without a worker thread,
+        # and an un-__init__'d instance has no engine yet. No engine, no pad.
+        if _ENGINE_NEEDS_SHORT_PAD.get(getattr(self, "_engine", ""), False):
+            text = pad_short_line(text)
 
         return text
 

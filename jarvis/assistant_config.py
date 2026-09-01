@@ -394,7 +394,17 @@ DEFAULTS: dict = {
                  "poll_s_away": 10, "arrival_cue": True,
                  "departure_confirm_min": 5, "departure_mic_silence_min": 10,
                  "desk": True, "desk_away_after_min": 25, "desk_poll_s": 30,
-                 "desk_standby": True, "desk_standby_alpha": 0.45},
+                 "desk_standby": True, "desk_standby_alpha": 0.45,
+                 # The room sensor (jarvis/roomsensor.py, docs/room-sensor.md):
+                 # an ESP32 + LD2410 mmWave module read over plain HTTP from
+                 # ESPHome's web_server. OFF until both keys are set, and it
+                 # only ever ADDS presence: the room seeing someone makes him
+                 # home immediately even with a sleeping phone, the room
+                 # seeing nobody never makes him away while the phone
+                 # answers. A restart is required after editing these --
+                 # reload_if_changed has no callers.
+                 "room_sensor_enabled": False, "room_sensor_url": "",
+                 "room_sensor_timeout_s": 1.5},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

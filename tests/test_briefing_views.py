@@ -606,8 +606,10 @@ def test_the_app_asks_the_wake_offer_after_the_spoken_preview():
                 "offer": "Shall I wake you at 7:00 am, sir?"}
         a._on_brain_tags([("BRIEFING", json.dumps(card)),
                           ("SPEAK", "Biosensors at eight, sir; no alarm set.")])
+        # The offer is spoken straight after the preview, so the two are one
+        # burst and the second sign-off goes (jarvis/address.py).
         assert a.said == ["Biosensors at eight, sir; no alarm set.",
-                          "Shall I wake you at 7:00 am, sir?"]
+                          "Shall I wake you at 7:00 am?"]
         assert a._followup_after_speech, "the answer window opens for the yes/no"
         assert len(cards) == 1 and cards[0].sections["offer"].startswith("Shall I")
         # a card without an offer asks nothing

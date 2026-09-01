@@ -37,6 +37,9 @@ from jarvis.tools.registry import ToolResult, ToolSpec
 log = get_logger("tools.notes")
 
 KINDS = ("note", "todo")
+# How far back add_items looks for a duplicate. Big enough to mean
+# "the whole list" in practice; a constant so the query stays bounded.
+_DEDUPE_WINDOW = 500
 _KIND_WORDS = {"note": "note", "notes": "note", "memo": "note", "memos": "note",
                "todo": "todo", "todos": "todo", "to-do": "todo", "to-dos": "todo",
                "to do": "todo", "to dos": "todo", "task": "todo", "tasks": "todo",
@@ -169,6 +172,49 @@ def _spoken_item(text: str) -> str:
         cut = text[:_ITEM_CHARS].rsplit(" ", 1)[0]
         text = cut + "…"
     return text
+
+
+_DEDUPE_ARTICLE_RX = re.compile(r"^(?:a|an|the|some)\s+", re.I)
+
+
+def dedupe_key(text) -> str:
+    """The identity of a list item for "is this already on the list?".
+
+    Case, surrounding punctuation and a leading article are noise: he
+    dictated "milk" once and "Milk," the next time and meant the one
+    carton. Nothing cleverer (no stemming, no plurals) -- "battery" and
+    "batteries" stay two lines, because merging them wrongly is silent
+    data loss while a duplicate is only a wart.
+    """
+    t = " ".join(str(text or "").split()).lower().strip(" .,;:!?\"'")
+    return _DEDUPE_ARTICLE_RX.sub("", t)
+
+
+# ------------------------------------------------- pacing a read-back aloud
+#
+# Hunter, 2026-08-31, on three features he otherwise passed: the note
+# read-back, the to-do read-back and the note search all "said it really
+# fast" -- "said buy milk really fast", "said note fast". Every one of them
+# is this shape: a count, the noun, then the CONTENT at the very end.
+#
+# It is not a rate defect. Measured on the live F5 sidecar (see the
+# terse-line note in jarvis/tts.py), the articulation rate is flat at
+# ~19 bytes of text per voiced second from 9 bytes to 108, and short lines
+# sit at the SLOW end of it. The problem is that the whole reply is over too
+# soon for the payload to land: "One to-do, sir: a buy milk." is 1.78 s end
+# to end, of which the part he asked for -- "a buy milk" -- is the last
+# 0.6 s. And it cannot be fixed by slowing down, because below ~41 bytes the
+# sidecar's duration floor pins the length and discards the speed setting
+# entirely (0.85, 0.80, 0.75 and 0.70 all render "Noted, sir." to the same
+# 0.99 s, byte for byte). Words are the only lever left.
+#
+# So a SINGULAR read-back head is widened. Measured, same content:
+#   "One to-do, sir: buy milk."            25 B  1.69 s
+#   "You have one to-do, sir: buy milk."   34 B  2.13 s   (+26% air)
+# The listener is oriented before the payload arrives instead of alongside
+# it. Plural heads already carry enough words and are left alone.
+def _one_head(noun_phrase: str) -> str:
+    return f"You have one {noun_phrase}, sir"
 
 
 def join_spoken(items: list[str]) -> str:
@@ -344,6 +390,46 @@ class NotesStore:
             self._db.commit()
             log.info("%s added (#%d, %d chars)", k, cur.lastrowid, len(text))
             return int(cur.lastrowid)
+
+    # A whole dictated breath at once, deduped. Reported 2026-08-31
+    # (feature #31): "add milk to the shopping list" followed by "add milk,
+    # eggs, and bread to the shopping list" stored milk TWICE, and the
+    # read-back was "Four on your shopping list, sir: milk, milk, eggs,
+    # and ... bread." A list is the set of things still to buy, not a
+    # transcript of everything he has ever said to it.
+    def add_items(self, kind: str, texts, created: Optional[float] = None
+                  ) -> tuple[list[int], list[str], list[str]]:
+        """Add several items, skipping any already on the list.
+
+        Deduped against what is already there AND within the batch itself,
+        so "milk, milk, eggs" in one breath stores two things. Returns
+        ``(new ids, texts added, texts skipped as already present)``; the
+        ids are only the NEW rows, so an undo takes back exactly what this
+        call created and never a row that was there before.
+        """
+        # _DEDUPE_WINDOW, not the spoken `limit=10`: the duplicate he heard
+        # could be item #1 on a list that had grown past the spoken window.
+        seen = {dedupe_key(row.get("text", ""))
+                for row in self.list(kind, limit=_DEDUPE_WINDOW)}
+        seen.discard("")
+        ids: list[int] = []
+        added: list[str] = []
+        skipped: list[str] = []
+        for raw in texts or []:
+            text = " ".join(str(raw or "").split())
+            if not text:
+                continue
+            key = dedupe_key(text)
+            if key and key in seen:
+                skipped.append(text)
+                continue
+            seen.add(key)
+            ids.append(self.add(kind, text, created=created))
+            added.append(text)
+        if skipped:
+            log.info("%s: %d duplicate(s) skipped (%s)", _kind(kind),
+                     len(skipped), ", ".join(skipped)[:60])
+        return ids, added, skipped
 
     def delete(self, kind: str, item_id) -> bool:
         """Delete exactly one row by id -- the undo path. No matching and
@@ -522,14 +608,16 @@ class NotesStore:
         if name is not None:
             n = len(items)
             body = join_spoken([_spoken_item(i["text"]) for i in items])
-            head = f"{number_word(n).capitalize()} on your {name} list, sir"
+            head = (_one_head(f"{_plural(k, 1)} on your {name} list") if n == 1
+                    else f"{number_word(n).capitalize()} on your {name} list, sir")
             if total > n:
                 head = (f"{number_word(total).capitalize()} on your {name} "
                         f"list, sir; the latest {number_word(n)}")
             return f"{head}: {body}."
         n = len(items)
         count_word = number_word(n).capitalize()
-        head = f"{count_word} {_plural(k, n)}, sir"
+        head = (_one_head(_plural(k, 1)) if n == 1
+                else f"{count_word} {_plural(k, n)}, sir")
         if total > n:
             head = f"{number_word(total).capitalize()} {_plural(k, total)}, " \
                    f"sir; the latest {number_word(n)}"
@@ -547,7 +635,9 @@ class NotesStore:
         n = len(hits)
         body = join_spoken([_spoken_item(h["text"]) for h in hits])
         if n == 1:
-            return f"One {_plural(k, 1)} mentions {q}, sir: {body}."
+            # The address goes AFTER the subject, never inside it:
+            # _one_head("note") + " about x" reads "one note, sir about x".
+            return f"{_one_head(f'{_plural(k, 1)} about {q}')}: {body}."
         return f"{number_word(n).capitalize()} {_plural(k, n)} mention {q}, " \
                f"sir: {body}."
 

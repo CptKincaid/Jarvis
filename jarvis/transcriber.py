@@ -18,6 +18,7 @@ audio here), no widget access. Pure API — callers publish bus events.
 """
 from __future__ import annotations
 
+import re
 import threading
 from dataclasses import dataclass, field
 
@@ -33,10 +34,47 @@ SAMPLE_RATE = 16000
 STREAMING_INTERVAL = 2.0
 
 # Confidence gate: reject transcriptions whose mean segment avg_logprob is
-# below this (port: 2602-2604). Was -1.5, which accepted "by Agenda 4.2.6"
-# at -0.94 and routed it; genuine utterances on this mic score -0.2..-0.6.
-# A rejection is spoken ("Say that again, sir?") and re-opens the mic.
-MIN_AVG_LOGPROB = -0.85
+# below this (port: 2602-2604). A rejection is spoken ("Say that again,
+# sir?") and re-opens the mic; a SECOND one in a row is silent.
+#
+# -0.85 (set from "genuine utterances on this mic score -0.2..-0.6") was
+# measured against long sentences only, and Whisper's avg_logprob is
+# length-biased: a two-word clip has few tokens, so the end-of-text token
+# dominates the mean and a PERFECT transcript lands near -1. That cost
+# Hunter nine features in the 2026-08-31 session -- "belay that" (-0.88),
+# "scratch that" (-0.89), "volume 40" (-0.87), "Play my liked songs."
+# (-0.97), "max volume" (-2.08), "Full brightness" (-0.99) and, worst, a
+# plain "Yes." (-0.95) answering Jarvis's own "Clear all three off your
+# shopping list, sir?" -- every one of them transcribed CORRECTLY and
+# thrown away.
+#
+# Re-measured on all 196 `Transcribed:` lines in that session's
+# /tmp/vss_voice/jarvis.log (scripts/measure_confidence_gate.py):
+#   band              n    real utterance   hallucination
+#   >= -0.85        156         156                0
+#   -2.90..-0.85     19          18                1   <- ALL rejected before
+#   <  -2.90         21           0               21
+# The band the old gate threw away holds 15 verbatim commands ("volume
+# 40", "Belay that", "scratch that", "Cancel.", "Yes.", "max volume",
+# "Play my liked songs.", "Full brightness", ...), 3 imperfect renderings
+# of something he really said ("whether tomorrow whether tomorrow"), and
+# exactly ONE hallucination: "by Agenda 4.2.6" at -0.94, the clip this
+# threshold was tightened for in the first place. Below -2.90 there is not
+# one actionable utterance -- two empty strings, repeated-token loops
+# ("certain seal seal seal seal seal"), and character salad ("mmmен-4222,
+# 902", "쪽 km2mmh gleichzeitig").
+#
+# So no threshold can separate "Play my liked songs." (-0.97) from "by
+# Agenda 4.2.6" (-0.94); they are the same score. -2.90 is the midpoint of
+# the real gap in the data (worst true transcript "Yes" at -2.64, best
+# hallucination the empty string at -3.15) and it trades that one stray
+# noun phrase -- which routes to chat and earns a harmless "I don't
+# follow, sir" -- for the 18 real commands the old gate ate.
+#
+# The gate is also no longer the last word -- app._salvage_low_confidence
+# runs a sub-threshold transcript anyway when Jarvis asked the question or
+# the words are an exact Tier-1 command.
+MIN_AVG_LOGPROB = -2.90
 
 # Default vocabulary prompt — biases Whisper toward the assistant's own
 # domain. Replaces the warehouse list ported verbatim from
@@ -83,6 +121,42 @@ LANG_MAP = dict(LANGUAGES)   # name -> whisper code (None = auto-detect)
 # ------------------------------------------------------------------
 # Custom vocabulary (persisted to voice_vocab.txt; port: 579-595)
 # ------------------------------------------------------------------
+# Whisper's stutter. On a short clip it sometimes emits the SAME sentence
+# twice ("What are on both lists? What are on both lists?" -- reported
+# 2026-08-31, feature #31: his question came back at him twice before the
+# answer). It is a decode artefact, not speech: nobody says a five-word
+# question twice with no pause. Collapsed here, at the one place both the
+# speculative pass and the final pass come through, so the card, the log,
+# the model and the tier-1 matchers all see the sentence once.
+_SENTENCE_RX = re.compile(r"[^.!?]+(?:[.!?]+|$)")
+_REPEAT_MIN_WORDS = 3          # "No. No." is emphasis; leave it alone
+
+
+def collapse_repeats(text: str) -> str:
+    """Drop a sentence that is an immediate repeat of the one before it."""
+    raw = (text or "").strip()
+    if not raw:
+        return raw
+    parts = [p.strip() for p in _SENTENCE_RX.findall(raw)]
+    parts = [p for p in parts if p]
+    if len(parts) < 2:
+        return raw
+    kept, dropped = [], 0
+    for part in parts:
+        key = re.sub(r"[^a-z0-9 ]+", "", part.lower())
+        key = " ".join(key.split())
+        prev = kept[-1][1] if kept else None
+        if key and key == prev and len(key.split()) >= _REPEAT_MIN_WORDS:
+            dropped += 1
+            continue
+        kept.append((part, key))
+    if not dropped:
+        return raw
+    out = " ".join(p for p, _ in kept)
+    log.info("collapsed %d repeated sentence(s): %r -> %r", dropped, raw, out)
+    return out
+
+
 def load_vocab() -> str:
     """Load domain vocabulary from user file, or return default."""
     if PATHS.VOCAB_FILE.exists():
@@ -313,6 +387,8 @@ class Transcriber:
             text = " ".join(seg.text.strip() for seg in seg_list).strip()
             seg_data = [(seg.text, seg.avg_logprob) for seg in seg_list]
             language = getattr(info, "language", None)
+
+        text = collapse_repeats(text)
 
         if seg_data:
             avg_conf = sum(lp for _, lp in seg_data) / len(seg_data)

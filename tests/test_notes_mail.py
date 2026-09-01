@@ -98,14 +98,14 @@ def test_list_text_wording(store):
     assert store.list_text("note") == "No notes yet, sir."
     assert store.list_text("todo") == "Nothing on your list, sir."
     store.add("todo", "buy milk")
-    assert store.list_text("todo") == "One to-do, sir: buy milk."
+    assert store.list_text("todo") == "You have one to-do, sir: buy milk."
     store.add("todo", "call the dentist")
     assert store.list_text("todo") == "Two to-dos, sir: buy milk and call the dentist."
     store.add("todo", "fix the bike.")
     assert store.list_text("todo") == \
         "Three to-dos, sir: buy milk, call the dentist, and fix the bike."
     store.add("note", "the wifi password is on the fridge")
-    assert store.list_text("note") == "One note, sir: the wifi password is on the fridge."
+    assert store.list_text("note") == "You have one note, sir: the wifi password is on the fridge."
 
 
 def test_list_text_more_than_window(store):
@@ -218,7 +218,7 @@ def test_search(store):
     assert [n["text"] for n in store.search("note", "dentist")] == ["The dentist is on Friday"]
     assert store.search("note", "") == []
     assert store.search_text("note", "dentist") == \
-        "One note mentions dentist, sir: The dentist is on Friday."
+        "You have one note about dentist, sir: The dentist is on Friday."
     assert store.search_text("todo", "plumber") == "Nothing about plumber in your to-dos, sir."
     store.add("note", "dentist bill paid")
     assert store.search_text("note", "dentist") == \
@@ -272,7 +272,7 @@ def test_notes_tool_confirmations_and_loose_values(store):
     r = reg.call("notes", {"action": "done", "kind": "todo", "which": "bike"})
     assert not r.ok and r.speak == "I couldn't find that one on the list, sir."
     r = reg.call("notes", {"action": "search", "kind": "note", "text": "car"})
-    assert r.speak == "One note mentions car, sir: the car is due a service."
+    assert r.speak == "You have one note about car, sir: the car is due a service."
     r = reg.call("notes", {"action": "remove", "kind": "note", "which": "last"})
     assert r.speak == "Forgotten, sir."
     r = reg.call("notes", {"action": "list", "kind": "note"})
@@ -815,3 +815,51 @@ def test_one_dead_mailbox_loses_only_its_own_rows_when_concurrent(
     monkeypatch.setattr(fake_imap, "login", selective_login)
     mails = fetch_unread(FakeCfg(THREE_CFG), imap=fake_imap, now=NOW)
     assert {m.account for m in mails} == {"personal", "school"}
+
+
+# ==================================== list dedupe (feature #31, 2026-08-31)
+# "Four on your shopping list, sir: milk, milk, eggs, and ... bread." --
+# milk was dictated on two separate turns and stored twice.
+
+def test_dedupe_key_ignores_case_punctuation_and_a_leading_article():
+    key = notes_mod.dedupe_key
+    assert key("Milk") == key("milk") == key("  milk. ") == key("the milk")
+    assert key("a battery") == "battery"
+    # and nothing cleverer: a plural is a different thing, not a duplicate
+    assert key("battery") != key("batteries")
+
+
+def test_add_items_skips_what_is_already_on_the_list(store):
+    store.add("list:shopping", "milk")
+    ids, added, skipped = store.add_items("list:shopping",
+                                          ["milk", "eggs", "bread"])
+    assert added == ["eggs", "bread"] and skipped == ["milk"]
+    assert len(ids) == 2                      # only the NEW rows
+    assert [r["text"] for r in store.list("list:shopping", limit=20)] == \
+        ["milk", "eggs", "bread"]
+
+
+def test_add_items_dedupes_within_one_breath(store):
+    ids, added, skipped = store.add_items("list:shopping",
+                                          ["milk", "Milk", "eggs"])
+    assert added == ["milk", "eggs"] and skipped == ["Milk"] and len(ids) == 2
+
+
+def test_add_items_looks_past_the_spoken_window(store):
+    """The read-back speaks ten items; the duplicate he heard was #1 on a
+    longer list, so the dedupe must not use the same window."""
+    for n in range(15):
+        store.add("list:shopping", f"item {n}")
+    _ids, added, skipped = store.add_items("list:shopping", ["item 0"])
+    assert added == [] and skipped == ["item 0"]
+
+
+def test_add_items_on_a_list_that_does_not_exist_yet_creates_it(store):
+    ids, added, skipped = store.add_items("list:packing", ["socks", "socks"])
+    assert added == ["socks"] and skipped == ["socks"] and len(ids) == 1
+    assert store.list_names() == ["packing"]
+
+
+def test_add_items_ignores_blanks(store):
+    ids, added, skipped = store.add_items("list:shopping", ["", "  ", "milk"])
+    assert added == ["milk"] and skipped == [] and len(ids) == 1

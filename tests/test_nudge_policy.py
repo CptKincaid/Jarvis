@@ -21,7 +21,7 @@ import numpy as np
 
 import jarvis.app as app_mod
 import jarvis.events as events_mod
-from jarvis.app import NUDGE_LINE, SAY_AGAIN_LINE
+from jarvis.app import NOT_CAUGHT_LINE, NUDGE_LINE, SAY_AGAIN_LINE
 from jarvis.config import CONFIG
 from jarvis.events import RecordingStarted, RecordingStopped, Transcribed
 
@@ -189,9 +189,17 @@ def test_a_speaker_rejection_gets_an_earcon_not_a_line(monkeypatch):
     assert (ev.accepted, ev.reject_reason) == (False, "speaker")
 
 
-def test_the_second_garbled_clip_gets_an_earcon(monkeypatch):
+def test_the_second_garbled_clip_is_told_so_and_the_mic_stays_shut(monkeypatch):
     """The first is asked again (SAY_AGAIN_LINE); the second in a row is the
-    room reaching the mic, so no re-opened window -- but not silence either."""
+    room reaching the mic, so no re-opened window.
+
+    It used to be an EARCON, which _nudge rate-limits on a 30 s cooldown --
+    so the honest outcome was usually nothing at all, indistinguishable from
+    being ignored. That is how #33 read to Hunter on 2026-08-31 ("Yes (low
+    confidence, didnt do it)"). He is told instead. The thing that stopped
+    the television loop was never the silence, it was the shut mic, and that
+    is what this still pins.
+    """
     a = _app(monkeypatch)
     a.transcriber = FakeTranscriber(text="by agenda four point two", accepted=False)
     _wake_capture(a)
@@ -199,11 +207,12 @@ def test_the_second_garbled_clip_gets_an_earcon(monkeypatch):
     a._process_audio(_clip())
     assert a.said == [SAY_AGAIN_LINE] and a.beeps == []
     a._followup_after_speech = False
+    a._last_nudge_ts = time.monotonic()      # an earcon here would be suppressed
     _wake_capture(a)
     _stopped_with_audio(a)
     a._process_audio(_clip())
-    assert a.beeped.wait(2.0) and a.beeps == ["nudge"]
-    assert a.said == [SAY_AGAIN_LINE] and not a._followup_after_speech
+    assert a.said == [SAY_AGAIN_LINE, NOT_CAUGHT_LINE], "he was left with silence"
+    assert not a._followup_after_speech, "the mic was re-opened; a TV can loop that"
     assert ("abandon", "rejected:confidence") in a.marks
 
 
@@ -257,6 +266,7 @@ def test_the_cue_line_is_prewarmed():
     a._guest_line = "I only answer to Hunter, sir."
     phrases = a._canned_phrases()
     assert NUDGE_LINE in phrases and SAY_AGAIN_LINE in phrases
+    assert NOT_CAUGHT_LINE in phrases
 
 
 def test_the_hotword_arms_the_wake_flag_after_its_refusal_checks(monkeypatch):

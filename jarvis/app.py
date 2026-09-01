@@ -147,7 +147,29 @@ THINKING_LINES = [
 # tool-backed lookups land right around 3.5 s, so the filler started and the
 # answer immediately queued behind it. The extra second moves the filler clear
 # of the common case, leaving it for lookups that are genuinely slow.
+#
+# 2026-08-31: 4.5 s is now only the FLOOR and the cold-start default. Every
+# tuning above was done against a box whose median wait was 10.68 s, so a
+# fixed 4.5 s no longer means "unusually slow", it means "the tail of
+# normal". Three of Hunter's reports are that collision:
+#   21:02:13 calendar  filler at +4.50 s, answer READY at +5.15 s and queued
+#                      behind it -- spoken at +6.92 s, 1.77 s late (#144)
+#   21:22:36 Claude MD answer at +0.54 s, filler at +4.50 s -- 3.97 s AFTER
+#                      the answer, the moment its audio ended (#89)
+#   21:36:36 Oracle    answer at +1.20 s, filler at +5.57 s -- "had the answer
+#                      then said checking one moment sir" (#154)
+# So the delay now scales with what this box actually costs per turn: speak
+# only once a turn is FILLER_WAIT_MULTIPLE times the recent median wait.
 THINKING_DELAY_S = 4.5
+# x3, from the 105 answered turns in turns.jsonl for 2026-08-31: median wait
+# 2.07 s, p90 4.45 s, max 24.6 s. x3 puts the filler at 6.2 s -- clear of the
+# p90 and of the 5.15 s calendar answer it used to trample, still ten seconds
+# ahead of the 16.5 s mail lookup it exists for. Over that day it would have
+# spoken on 4 of 105 turns instead of 10, and the six it drops are the ones
+# that were about to answer anyway.
+FILLER_WAIT_MULTIPLE = 3.0
+# ...and never later than this, or a genuinely stuck turn is just silence.
+FILLER_DELAY_MAX_S = 8.0
 
 # The Board and the ambient slab (jarvis/board.py, jarvis/ui/*). Canvas is
 # the only network source on the Board and Spotify the only one on the
@@ -161,6 +183,10 @@ SAY_AGAIN_LINE = "Say that again, sir?"
 # The "did not catch that" cue (JarvisApp._nudge): a wake-word turn that
 # captured nothing usable gets this instead of silence.
 NUDGE_LINE = "Sir?"
+# The SECOND garbled clip in a row. Distinct from SAY_AGAIN_LINE because it
+# is not an invitation: the mic is not re-opened, so it must tell him the
+# turn is over and that a wake word is how he retries.
+NOT_CAUGHT_LINE = "I did not catch that, sir. Do try me again."
 GUEST_LINE = "I only answer to {name}, sir."
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
@@ -455,6 +481,15 @@ class JarvisApp:
         self._turn_busy = threading.Event()
         self._turn_timer = None          # slow-answer filler
         self._turn_watchdog = None
+        # The filler's own state, guarded because the timer fires on its own
+        # thread while the answer lands on another. _turn_busy is NOT enough:
+        # it means "the router has not reported done", and the Oracle turn at
+        # 21:36:36 on 2026-08-31 spoke its answer and left the turn open until
+        # the 60 s watchdog -- so the filler passed that guard and spoke
+        # "Checking right now, sir" 4.4 s after the answer (#154).
+        self._filler_lock = threading.Lock()
+        self._turn_seq = 0               # bumped per turn; a stale timer is dropped
+        self._turn_answered = False      # this turn has already put audio in the queue
 
         self._wire_turn_clock()
         self._init_assistant_state()
@@ -765,6 +800,14 @@ class JarvisApp:
                 log.exception("quiet gate failed; speaking")
         # Nothing is rewritten here. A line arriving at this door is already
         # rendered -- third-party text and all -- and is spoken as written.
+        #
+        # This is also the only place that sees EVERY spoken line, so it is
+        # where the slow-answer filler is disarmed. Individual routes used to
+        # cancel the timer themselves (_on_stream_sentence, the ack branch of
+        # _emit_result) and every route that forgot -- the Oracle tool, a
+        # Claude session ack -- got "Checking right now, sir. One moment."
+        # on top of an answer the user had already heard.
+        self._note_spoke()
         self.tts.speak(text)
 
     def _async_reply(self, text, speak=True):
@@ -834,7 +877,7 @@ class JarvisApp:
         # are not (jarvis/selfstate.py).
         phrases += list(selfstate.PREWARM_LINES)
         phrases += list(THINKING_LINES)
-        phrases += [SAY_AGAIN_LINE, NUDGE_LINE, self._guest_line]
+        phrases += [SAY_AGAIN_LINE, NUDGE_LINE, NOT_CAUGHT_LINE, self._guest_line]
         phrases += [CONTINUE_PROMPT, "Very good, sir.", "Welcome back, sir.",
                     "I haven't said anything yet, sir.",
                     "The clipboard is empty, sir.",
@@ -1102,10 +1145,9 @@ class JarvisApp:
             return                  # barged in: the rest of this reply is dropped
         # The answer has started, so no "thinking" line is warranted -- and
         # one queued now would play BETWEEN the answer's sentences (the TTS
-        # queue is FIFO). Disarm the filler; the watchdog stays.
-        t, self._turn_timer = getattr(self, "_turn_timer", None), None
-        if t is not None:
-            t.cancel()
+        # queue is FIFO). Disarm the filler; the watchdog stays. _say latches
+        # it too; this is the earlier of the two.
+        self._disarm_filler()
         if self._last_source == "voice":
             self._followup_after_speech = True
         self._say(sentence)
@@ -1116,6 +1158,26 @@ class JarvisApp:
         BriefingReady card (no separate JarvisReply) — still spoken."""
         # Whatever else these tags mean, their arrival ends the turn.
         self._turn_finished()
+        # ONE reply never says the same sentence twice. #144: the calendar
+        # confirmation ("Added hello, Tuesday at 4:30 PM, to your calendar,
+        # sir.") was SPOKEN TWICE -- the add_event tool's own confirmation
+        # and the model's reply are the same authored sentence (both are in
+        # the log at 21:02:18.205), and a batch carrying both spoke both.
+        # Scoped to this one batch of tags on purpose: the same line in a
+        # later turn still speaks, and nothing outside a model reply -- a
+        # greeting, a timer, a reminder -- is touched by this.
+        spoken_here: set = set()
+        kept = []
+        for tag, content in tags:
+            if tag in ("SPEAK", "DONE"):
+                line = " ".join(str(content or "").split())
+                if line and line in spoken_here:
+                    log.info("dropped a repeat of a line this reply already "
+                             "speaks: %.60s", content)
+                    continue
+                spoken_here.add(line)
+            kept.append((tag, content))
+        tags = kept
         briefing = None
         offer = ""
         streamed = any(tag == "STREAMED" for tag, _ in tags)
@@ -3258,18 +3320,32 @@ class JarvisApp:
                     speculative=spec is not None))
                 self._nudge("speaker")
                 return
+            text = result.text.strip()
+            # The confidence gate is no longer the last word. It used to
+            # fire BEFORE the commander saw a syllable, so a plain "Yes."
+            # answering Jarvis's own "Clear all three off your shopping
+            # list, sir?" was dropped and nothing happened (2026-08-31,
+            # 20:58:35, avg_logprob -0.95). _salvage_low_confidence names
+            # the reason to run it anyway, or "".
+            accepted = result.accepted
+            salvage = ""
+            if not accepted and text:
+                salvage = self._salvage_low_confidence(text, result.confidence)
+                if salvage:
+                    log.info("low confidence (%.2f) overridden -- %s: %r",
+                             result.confidence, salvage, text)
+                    accepted = True
             bus.publish(Transcribed(
                 text=result.text, confidence=result.confidence,
-                accepted=result.accepted,
-                reject_reason="" if result.accepted else "confidence",
+                accepted=accepted,
+                reject_reason="" if accepted else "confidence",
                 speculative=spec is not None))
-            text = result.text.strip()
-            if result.accepted and text:
+            if accepted and text:
                 self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))
                 self._dispatch(text, "voice", confidence=result.confidence)
-            elif not result.accepted and text:
+            elif text:
                 # Garbled, not silent: say so and re-open the mic rather
                 # than routing "by Agenda 4.2.6" or going quiet -- once.
                 # Twice in a row is not the user mumbling, it is the room
@@ -3277,10 +3353,18 @@ class JarvisApp:
                 # asking again re-opens that mic without end.
                 self._say_again_count = getattr(self, "_say_again_count", 0) + 1
                 if self._say_again_count > 1:
-                    log.info("low confidence again (%.2f): %r -> staying quiet",
+                    # ...but the second strike used to be an EARCON, and
+                    # the earcon is cooldown-suppressed, so the honest
+                    # outcome was often nothing at all -- indistinguishable
+                    # from Jarvis ignoring him (2026-08-31: "Yes (low
+                    # confidence, didnt do it)"). Say it out loud instead,
+                    # and pointedly WITHOUT _followup_after_speech: it is
+                    # the re-opened mic, not the sentence, that lets a
+                    # television loop the exchange.
+                    log.info("low confidence again (%.2f): %r -> saying so, mic stays shut",
                              result.confidence, text)
                     self.turns.abandon("rejected:confidence")
-                    self._nudge("confidence")
+                    self._say(NOT_CAUGHT_LINE)
                 else:
                     log.info("low confidence (%.2f): %r -> asking again",
                              result.confidence, text)
@@ -3298,6 +3382,75 @@ class JarvisApp:
             # Must run on every path: a leaked flag makes every future wake
             # word a no-op, which looks exactly like a dead microphone.
             self._audio_busy.clear()
+
+    # The Tier-1 probe is a whole-utterance matcher ("volume 40",
+    # "cancel my alarm", "full brightness"), not a keyword search, so a
+    # character-salad transcript cannot match one by accident.
+    def _salvage_low_confidence(self, text: str, confidence: float = 0.0) -> str:
+        """Why a sub-threshold transcript is being run anyway, or "".
+
+        Whisper's avg_logprob is length-biased, so the very utterances the
+        gate is worst at are the SHORT ones -- and short is what an answer
+        and a command both look like. On 2026-08-31 that cost Hunter nine
+        features at once (his #20/#24/#32/#33/#67/#68/#87/#101/#144), all
+        with the same symptom: "low confidence", nothing happened.
+
+        Two rescues, both narrow:
+
+        * **Jarvis asked.** A yes/no read-back ("Clear all three off your
+          shopping list, sir?"), an objection, a flashcard, a working
+          session or the router's "Shall I hand that to Claude, sir?" is
+          on the table. Dropping the answer is the worst failure of the
+          set: he already committed to acting on the next word, and the
+          rungs that read it (``_try_destructive_confirm`` and friends)
+          each demand a CLEAR yes or no and let anything else fall through
+          as a fresh subject -- so a genuinely garbled answer is still
+          safe, it just stops being invisible.
+
+          Deliberately not the open debrief: that one FILES the words as
+          the memory of how his midterm went, and filing a garble there is
+          worse than asking again (see ``_debrief_reply``).
+
+        * **It is a Tier-1 command verbatim.** ``_match_assistant`` is the
+          same probe the intent gate uses to spare exact matches from the
+          classifier's guess. If the words ARE "cancel my alarm", a
+          confidence score has no business second-guessing them.
+        """
+        commander = getattr(self, "commander", None)
+        # A live flashcard FILES the answer -- _quiz_store.record marks the
+        # card wrong and session.settle() burns it -- which is exactly the
+        # objection that already excludes the open debrief. Found in review
+        # before this shipped: with a card parked (a 300 s window) the
+        # session's own character salad at -5.68 would have reached the
+        # grader and cost him a permanent wrong mark.
+        #
+        # Note what is NOT here: a score floor. The danger was never the
+        # number, it is what CONSUMES the words. A destructive read-back
+        # demands a clear yes or no and lets anything else fall through as
+        # a fresh subject, so salvaging a garble there costs a puzzled
+        # reply; the rungs that FILE are the ones that must be excluded by
+        # name, and they are.
+        if getattr(commander, "_pending_quiz", None):
+            return ""
+        try:
+            if self._question_open(commander):
+                return "answering a question Jarvis asked"
+        except Exception:  # noqa: BLE001 - a slim/duck-typed commander
+            log.debug("salvage: question_open failed", exc_info=True)
+        # The "Was that for me?" card is app-side, not a commander rung,
+        # and its whole point is that the next word resolves it.
+        if getattr(self, "_pending_uncertain", None):
+            return "answering the uncertain-intent prompt"
+        probe = getattr(commander, "_match_assistant", None)
+        if callable(probe):
+            try:
+                name = probe(text)
+            except Exception:  # noqa: BLE001 - a matcher blew up
+                log.debug("salvage: tier-1 probe failed", exc_info=True)
+                name = None
+            if name:
+                return f"exact tier-1 command ({name})"
+        return ""
 
     def _nudge(self, reason: str):
         """The "did not catch that" policy: a cue instead of silence.
@@ -3359,9 +3512,7 @@ class JarvisApp:
                     # now, sir" followed it live. Disarm the thinking timer
                     # and leave the watchdog.
                     self._turn_filler_pending = True
-                    t, self._turn_timer = getattr(self, "_turn_timer", None), None
-                    if t is not None:
-                        t.cancel()
+                    self._disarm_filler()
                 self._say(result.reply)
         if result.status:
             bus.publish(Status(text=result.status, kind="info"))
@@ -3369,6 +3520,12 @@ class JarvisApp:
 
     _thinking_delay_s = THINKING_DELAY_S
     _turn_timeout_s = TURN_TIMEOUT_S
+    # The filler's guards as CLASS defaults, not only __init__ ones. Several
+    # test suites build an app with object.__new__ and call _dispatch/_say on
+    # it; __init__ shadows all three with per-instance state.
+    _filler_lock = threading.Lock()
+    _turn_seq = 0
+    _turn_answered = False
 
     def _dispatch(self, text, source, confidence=None):
         # Voice only: a typed answer is visible as it arrives, so being told to
@@ -3430,9 +3587,16 @@ class JarvisApp:
         self._turn_cancel_timers()
         self._stream_muted = False
         self._turn_busy.set()
+        # A new turn: nothing has been said for it yet, and any filler timer
+        # still in flight from the previous turn belongs to a turn that is
+        # over -- it carries the old sequence number and drops itself.
+        with self._filler_lock:
+            self._turn_seq += 1
+            self._turn_answered = False
+            seq = self._turn_seq
         if CONFIG.talkback:
-            self._turn_timer = threading.Timer(self._thinking_delay_s,
-                                               self._say_thinking)
+            self._turn_timer = threading.Timer(self._filler_delay_s(),
+                                               self._say_thinking, args=(seq,))
             self._turn_timer.daemon = True
             self._turn_timer.start()
         # Without this a reply that never arrives would hold _turn_busy for
@@ -3459,13 +3623,80 @@ class JarvisApp:
                     log.debug("timer cancel failed", exc_info=True)
                 setattr(self, name, None)
 
+    def _disarm_filler(self):
+        """Cancel the pending "one moment" line, leaving the watchdog armed.
+
+        Timer.cancel() only wins the race it can see: once _say_thinking has
+        started running on the timer thread this is a no-op, which is why the
+        latch below exists as well."""
+        t, self._turn_timer = getattr(self, "_turn_timer", None), None
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                log.debug("filler cancel failed", exc_info=True)
+
+    def _note_spoke(self):
+        """Record that this turn has already put a line in the TTS queue, so
+        no filler may follow it. Called from _say, the one door to speech."""
+        with self._filler_lock:
+            self._turn_answered = True
+        self._disarm_filler()
+
+    @staticmethod
+    def _is_busy_tts(tts) -> bool:
+        """True only on a REAL busy signal: TTS.is_speaking is a bool and
+        TTS.pending an int (jarvis/tts.py). Typed strictly because the test
+        doubles are duck-typed stubs whose __getattr__ hands back a callable
+        for every name it does not define -- and a bound method is truthy,
+        which would silence the filler everywhere instead of only when
+        something really is queued ahead of it."""
+        if getattr(tts, "is_speaking", False) is True:
+            return True
+        pending = getattr(tts, "pending", 0)
+        return type(pending) is int and pending > 0
+
+    def _tts_busy(self) -> bool:
+        return self._is_busy_tts(getattr(self, "tts", None))
+
+    def _filler_delay_s(self) -> float:
+        """When to speak "one moment" -- scaled to how fast this box answers.
+
+        A fixed delay ages badly: 4.5 s was "unusually slow" when the median
+        wait was 10.68 s and is ordinary now that it is 1.30 s. Five times the
+        recent median is the same JUDGEMENT at any speed. Falls back to the
+        tuned constant until the ledger has enough answered turns to have an
+        opinion, and never drops below it -- the filler must not become more
+        eager than the value that was measured by hand."""
+        floor = self._thinking_delay_s
+        typical = None
+        turns = getattr(self, "turns", None)
+        if turns is not None:
+            try:
+                typical = turns.typical_wait_s()
+            except Exception:           # noqa: BLE001 - a probe, never fatal
+                typical = None
+        if typical is None:
+            return floor
+        return max(floor, min(FILLER_DELAY_MAX_S, typical * FILLER_WAIT_MULTIPLE))
+
     def _turn_finished(self):
         """The answer landed (or gave up). Also called from the brain callback."""
         self._turn_cancel_timers()
         self._turn_busy.clear()
 
-    def _say_thinking(self):
-        """Acknowledge a slow lookup. Rotates so it does not become a tic."""
+    def _say_thinking(self, seq=None):
+        """Acknowledge a slow lookup. Rotates so it does not become a tic.
+
+        Every guard here is a LAST-MOMENT one, checked on the timer thread
+        microseconds before speaking, because threading.Timer.cancel() cannot
+        recall a callback that has already started -- and the TTS queue is
+        FIFO, so a filler that queues even one millisecond late is spoken
+        AFTER the answer instead of ahead of it. That is exactly what Hunter
+        heard on 2026-08-31: the Oracle answer at 21:36:37.322 played to
+        completion and "Checking right now, sir. One moment." began at
+        21:36:41.696, on the very next slot in the queue.
+        """
         if not self._turn_busy.is_set():
             return          # the answer landed while this timer was firing
         with self._uncertain_lock:
@@ -3479,6 +3710,26 @@ class JarvisApp:
             # than a mutex, so Jarvis talked into his own yes/no window.
             log.info("thinking line held: waiting on an answer, not on work")
             return
+        with self._filler_lock:
+            if seq is not None and seq != self._turn_seq:
+                # This timer belongs to a turn that has already been replaced.
+                log.info("thinking line dropped: a newer turn is open")
+                return
+            if self._turn_answered:
+                # _say already ran for this turn: the user HAS the answer
+                # (#154 "had the answer then said checking one moment sir").
+                log.info("thinking line dropped: the answer is already out")
+                return
+            if self._tts_busy():
+                # Something is mid-burst or queued ahead of us, so this line
+                # could only land after it. A filler that arrives late is
+                # worse than no filler at all.
+                log.info("thinking line dropped: speech is already in the queue")
+                return
+            # Claim the turn before releasing the lock: an answer arriving now
+            # disarms nothing (we are past cancel), but it also must not make
+            # a SECOND line think it is still first.
+            self._turn_answered = True
         try:
             line = THINKING_LINES[self._thinking_i % len(THINKING_LINES)]
             self._thinking_i += 1

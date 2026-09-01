@@ -478,8 +478,8 @@ class TestThirdPartyTextAtTheEndOfAFragment:
     @pytest.mark.parametrize("line", [
         # quoted speech in anything read back
         'He said, "Thank you, sir." and left.',
-        # tools/notes.py:550 and :552 -- the note body is interpolated LAST
-        "One note mentions milk, sir: buy milk, sir.",
+        # tools/notes.py search_text / list_text -- the body is interpolated LAST
+        "You have one note about milk, sir: buy milk, sir.",
         "Two notes mention milk, sir: buy milk, sir; and call the dairy.",
         # tools/spotify.py LIKE_LINE -- the track title
         "Saved Yes, Sir! to your Liked Songs, sir.",
@@ -606,7 +606,7 @@ def test_the_invariant_holds_across_the_fuzz():
         "That is sir's coffee, sir.",
         'He said, "Thank you, sir." and left.',
         'He wrote "yes, sir; the parcel arrived" in the ticket.',
-        "One note mentions milk, sir: buy milk, sir.",
+        "You have one note about milk, sir: buy milk, sir.",
         "I'm coming out of the monitor, sir; the soundbar has dropped.",
         "Mail from Bob, sir — re: Thank you, sir.",
         "Now playing Yes, Sir! by Baccara.",

@@ -229,7 +229,7 @@ def test_the_phone_path_needs_no_wake_word(rich):
     c, svc = rich
     svc.notes.add("list:shopping", "milk")
     res = c.handle("what's on the shopping list", source="cli")
-    assert res.reply == "One on your shopping list, sir: milk."
+    assert res.reply == "You have one item on your shopping list, sir: milk."
     svc.brain.chat.assert_not_called()
 
 
@@ -342,9 +342,9 @@ def test_the_built_in_notes_and_todos_are_untouched(rich):
     svc.notes.add("todo", "call the bank")
     svc.notes.add("note", "the boiler is broken")
     assert c.handle("what's on my todo list", source="typed").reply == \
-        "One to-do, sir: call the bank."
+        "You have one to-do, sir: call the bank."
     assert c.handle("show my notes", source="typed").reply == \
-        "One note, sir: the boiler is broken."
+        "You have one note, sir: the boiler is broken."
     assert svc.notes.count("list:shopping") == 1
 
 
@@ -363,7 +363,7 @@ def test_the_notes_tool_reaches_named_lists(tmp_path):
     assert store.count("list:shopping") == 1 and store.count("todo") == 0
 
     res = spec.handler(action="list", list="shopping")
-    assert res.speak == "One on your shopping list, sir: milk."
+    assert res.speak == "You have one item on your shopping list, sir: milk."
 
     # reading one that does not exist neither invents it nor lies
     res = spec.handler(action="list", list="packing")
@@ -406,7 +406,7 @@ def test_a_spoken_list_command_is_never_called_background_chat(rich, monkeypatch
     c.handle("add milk to the shopping list", source="voice")
     assert svc.notes.count("list:shopping") == 1
     res = c.handle("what's on the shopping list", source="voice")
-    assert res.reply == "One on your shopping list, sir: milk."
+    assert res.reply == "You have one item on your shopping list, sir: milk."
 
 
 def test_scratch_that_by_voice_never_reaches_the_classifier(rich, monkeypatch):
@@ -439,7 +439,9 @@ def test_scratch_that_takes_back_a_whole_compound_turn(rich):
     svc.timekeeper.cancel.assert_called_once_with(which="tm-1", kind="timer")
     assert svc.notes.count("todo") == 0
     assert res.status == "Undone"
-    assert "Timer scrapped, sir." in res.reply
+    # One burst, one sign-off: the two clauses' undo lines are joined and
+    # thinned together (jarvis/address.py).
+    assert "Timer scrapped." in res.reply
 
 
 def test_a_compound_does_not_leave_the_previous_turns_undo_armed(rich):
@@ -470,15 +472,16 @@ def test_a_compound_of_two_read_backs_asks_once_and_one_yes_runs_both(rich):
 
     res = c.handle("clear the shopping list and cancel all the alarms",
                    source="typed")
+    # One question, asked once: the two read-backs are one burst.
     assert res.reply == ("Clear all three off your shopping list, sir? "
-                         "Cancel all three alarms, sir?")
+                         "Cancel all three alarms?")
     assert svc.notes.count("list:shopping") == 3      # nothing done yet
     svc.timekeeper.cancel.assert_not_called()
 
     res = c.handle("yes", source="typed")
     assert svc.notes.count("list:shopping") == 0
     svc.timekeeper.cancel.assert_called_once_with("all", "alarm")
-    assert res.reply == "The shopping list is clear, sir. Cancelled 3, sir."
+    assert res.reply == "The shopping list is clear, sir. Cancelled 3."
 
 
 def test_a_compound_that_ran_nothing_leaves_a_standing_question_alone(rich):
@@ -492,3 +495,132 @@ def test_a_compound_that_ran_nothing_leaves_a_standing_question_alone(rich):
     said = "clear the shopping list and cancel all the alarms"
     assert c._try_multi(said, lambda part: None) is None
     assert c._pending_destructive is stash
+
+
+# ================================================ double-speech (2026-08-31)
+# Three separate doublings from one test session, three separate causes.
+# Kept together because they were reported as one symptom: "it said it twice".
+
+def test_an_item_already_on_the_list_is_not_added_again(rich):
+    """#31: "add milk to the shopping list" then "add milk, eggs, and bread
+    to the shopping list" read back as "milk, milk, eggs, ...".
+    """
+    c, svc = rich
+    c.handle("add milk to the shopping list", source="typed")
+    res = c.handle("add milk, eggs, and bread to the shopping list",
+                   source="typed")
+    assert [r["text"] for r in svc.notes.list("list:shopping", limit=20)] == \
+        ["milk", "eggs", "bread"]
+    assert res.reply == ("Two added to your shopping list, sir; "
+                         "milk was already there.")
+
+
+def test_the_oxford_comma_is_a_separator_not_an_item(rich):
+    """#31: "it kept the and bread i said" -- the list held "and bread"."""
+    c, svc = rich
+    c.handle("add milk, eggs, and bread to the shopping list", source="typed")
+    assert [r["text"] for r in svc.notes.list("list:shopping", limit=20)] == \
+        ["milk", "eggs", "bread"]
+    # read back as three things, with the conjunction only where it belongs
+    res = c.handle("what's on the shopping list", source="typed")
+    assert res.reply.endswith(": milk, eggs, and bread.")
+    assert "and and" not in res.reply
+
+
+def test_a_duplicate_inside_one_breath_is_stored_once(rich):
+    c, svc = rich
+    res = c.handle("add milk, milk, and eggs to the shopping list",
+                   source="typed")
+    assert [r["text"] for r in svc.notes.list("list:shopping", limit=20)] == \
+        ["milk", "eggs"]
+    assert res.reply == ("Two added to your shopping list, sir; "
+                         "milk was already there.")
+
+
+def test_adding_only_things_already_there_says_so(rich):
+    c, svc = rich
+    svc.notes.add("list:shopping", "milk")
+    res = c.handle("add milk to the shopping list", source="typed")
+    assert res.reply == "Milk is already on your shopping list, sir."
+    assert svc.notes.count("list:shopping") == 1
+
+
+def test_undo_after_a_deduped_add_takes_back_only_the_new_items(rich):
+    """The undo must not strike the milk that was already on the list."""
+    c, svc = rich
+    svc.notes.add("list:shopping", "milk")
+    c.handle("add milk, eggs, and bread to the shopping list", source="typed")
+    assert [r["text"] for r in svc.notes.list("list:shopping", limit=20)] == \
+        ["milk", "eggs", "bread"]
+    c.handle("scratch that", source="typed")
+    assert [r["text"] for r in svc.notes.list("list:shopping", limit=20)] == \
+        ["milk"]
+
+
+def test_one_compound_utterance_gets_one_acknowledgement(rich, monkeypatch):
+    """#57 "two noted said though": "My mom is Heather and my dad is Ali."
+    spoke "Noted, sir: your mom is Heather." and then "Noted: your dad is
+    Ali." -- two utterances for one breath."""
+    c, svc = rich
+    monkeypatch.setattr(CONFIG, "talkback", True)   # or _speak returns early
+    svc.memory.add_person.side_effect = lambda alias, name, email=None: {
+        "alias": alias, "name": name, "email": email}
+    res = c.handle("my mom is Heather and my dad is Ali", source="typed")
+    assert svc.memory.add_person.call_count == 2        # both facts kept
+    assert res.reply == "Noted, sir: your mom is Heather and your dad is Ali."
+    assert res.speak                                    # spoken by the JOIN
+    # and NOT spoken by the handlers themselves: two eager _speak calls for
+    # one breath is exactly the "two noted said" he heard.
+    assert svc.tts.speak.call_args_list == []
+
+
+def test_merge_acks_leaves_two_different_answers_alone():
+    from jarvis.commander import _merge_acks
+    assert _merge_acks(["Noted, sir: your mom is Heather.",
+                        "Noted, sir: your dad is Ali."]) == \
+        "Noted, sir: your mom is Heather and your dad is Ali."
+    # different lead-ins are two answers, not one
+    assert _merge_acks(["Noted, sir: your mom is Heather.",
+                        "Timer set, sir: ten minutes."]) is None
+    # no lead-in at all
+    assert _merge_acks(["Done, sir.", "Done, sir."]) is None
+    assert _merge_acks(["Noted, sir: your mom is Heather."]) is None
+
+
+def test_whisper_stutter_is_not_asked_twice():
+    """#31 verbatim: 'What are on both lists? What are on both lists?' --
+    one question, decoded twice by Whisper."""
+    from jarvis.transcriber import collapse_repeats
+    assert collapse_repeats("What are on both lists? What are on both lists?") \
+        == "What are on both lists?"
+    assert collapse_repeats("Set a timer. Set a timer. Then call mom.") == \
+        "Set a timer. Then call mom."
+    # emphasis is left alone: short repeats are speech, not a decode artefact
+    assert collapse_repeats("No. No.") == "No. No."
+    assert collapse_repeats("Add milk to the shopping list") == \
+        "Add milk to the shopping list"
+
+
+def test_one_reply_never_speaks_the_same_line_twice():
+    """#144: the calendar confirmation was SPOKEN TWICE -- the add_event
+    tool's own confirmation and the model's reply are the same authored
+    sentence, and a tag batch carrying both spoke both."""
+    import jarvis.app as app_mod
+    line = "Added hello, Tuesday at 4:30 PM, to your calendar, sir."
+    app = types.SimpleNamespace(
+        _turn_finished=lambda: None, _say=MagicMock(), _last_source="voice",
+        _active_turn_id="", _quiet_turn=False, context=MagicMock(),
+        _followup_after_speech=False, _thin_address=lambda frags: list(frags))
+    app_mod.JarvisApp._on_brain_tags(app, [("SPEAK", line), ("SPEAK", line)])
+    assert app._say.call_args_list == [((line,),)]
+
+    # two DIFFERENT lines in one reply are both still spoken
+    app._say.reset_mock()
+    app_mod.JarvisApp._on_brain_tags(
+        app, [("SPEAK", line), ("SPEAK", "Anything else, sir?")])
+    assert app._say.call_count == 2
+
+    # and the same line in a LATER reply speaks again
+    app._say.reset_mock()
+    app_mod.JarvisApp._on_brain_tags(app, [("SPEAK", line)])
+    assert app._say.call_count == 1

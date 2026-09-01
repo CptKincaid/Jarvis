@@ -1077,6 +1077,15 @@ return he says *"Welcome back, sir."* and reads anything held while you were out
 the first probe answers he assumes you are home. Check the log for
 `presence: home` / `presence: away`.
 
+**Faster, if you want it: a room sensor.** The phone leg is slow and lies when the phone
+sleeps. An ESP32 + LD2410 mmWave module (~$25, an evening) sits in the room and answers in
+seconds — presence, not motion, so it does not decide you left because you sat still. It
+composes with the phone rather than replacing it: the room seeing someone beats a sleeping
+phone, the room seeing nobody never makes you away while the phone answers, and an
+unplugged sensor is treated as no sensor at all. Off until configured. Parts list, wiring,
+the ready-to-flash ESPHome file and a no-hardware test mode:
+[docs/room-sensor.md](room-sensor.md).
+
 ## 36. Nightly self-review ("how did yesterday go")
 
 Every quarter hour a small thread checks whether a day has ended without a review

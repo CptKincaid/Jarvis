@@ -273,9 +273,11 @@ def test_first_wake_speaks_the_review_before_the_briefing(monkeypatch, tmp_path)
               "speaker_rejections": 2}
     a = _app(monkeypatch, tmp_path, digest)
     a._deliver_first_wake_briefing()
+    # The review and the hand-over are ONE burst (40 s of unbroken speech in
+    # the live log), so the second sign-off goes -- jarvis/address.py.
     assert a.said == ["Yesterday: 4 turns, median wait 1.2 seconds, worst 3.0. "
                       "I dropped 2 clips of yours at the speaker gate, sir.",
-                      "Your briefing for today, sir."]
+                      "Your briefing for today."]
     assert len(a.chats) == 1 and a.chats[0][1] == {"force_tool": "get_briefing"}
 
 

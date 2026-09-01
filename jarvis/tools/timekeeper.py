@@ -90,6 +90,15 @@ NUDGE_KIND = "nudge"
 REMINDER_LINE = "Sir, this is your reminder. {text}"
 TIMER_LINE = "Sir, your {n} timer is up."
 TIMER_LABEL_LINE = "Sir, your {n} {label} timer is up."
+# "Set a timer for 30 seconds" arrives with the label already filled in as
+# "30 seconds timer", and TIMER_LABEL_LINE then stutters it back:
+# "Sir, your 30-second 30 seconds timer timer is up." (jarvis.log 20:42:40).
+# That never reached Hunter's ear only because the line was being held (see
+# _fire); with the hold lifted it would, so an auto-derived label is
+# recognised here and the plain TIMER_LINE is used instead.
+_AUTO_TIMER_LABEL = re.compile(
+    r"^\s*[\d.]+\s*(?:s|sec|secs|second|seconds|m|min|mins|minute|minutes|"
+    r"h|hr|hrs|hour|hours)\s*timer\s*$", re.I)
 ALARM_LINE = "Sir, it's {time}. {label}"
 ALARM_DEFAULT_LABEL = "Time to get up."
 LATE_LINE = "While I was down, sir: {label}, due at {time}."
@@ -1518,7 +1527,7 @@ class Timekeeper:
             n = duration_words(item.duration)
             if late:
                 line = LATE_LINE.format(label=item.spoken_label(), time=_when_words(due_dt, now_dt))
-            elif item.label:
+            elif item.label and not _AUTO_TIMER_LABEL.match(item.label):
                 line = TIMER_LABEL_LINE.format(n=n, label=item.label)
             else:
                 line = TIMER_LINE.format(n=n)
@@ -1552,7 +1561,28 @@ class Timekeeper:
             log.info("timekeeper: silent %s fired %r%s", item.kind, item.label,
                      " (late)" if late else "")
             return True
-        effects.append(lambda: self._speak(line, proactive=True, kind=kind))
+        # #15, 2026-08-31 -- "Reminder: 30 seconds timer on transcript
+        # activated but no noise or speech." The line was never dropped, it
+        # was HELD: timers went out proactive=True, so app._say handed it
+        # straight to the quiet gate, which was inside a calendar course
+        # window. jarvis.log 20:42:40 has the whole story --
+        #   timekeeper: timer fired '30 seconds timer'
+        #   quiet: held (timer): Sir, your ... timer is up.
+        #   status: Held (MAGNETIC RESONANCE ENGR until 8:50 pm): ...
+        # -- a transcript line and nothing else. Nothing covered for it
+        # either: only ALARMS ring, alarms.sound is "" and sound.earcons is
+        # off, so a held timer is total silence.
+        #
+        # A timer is not proactive. Hunter set it thirty seconds earlier and
+        # asked to be told; it is an answer he requested arriving late, not
+        # something Jarvis decided to bring up, and a countdown read back
+        # after the window closes is worthless. This is the same call the
+        # alarm arm above already makes (proactive=False) for the same
+        # reason. Reminders stay proactive -- "call the dentist in an hour"
+        # landing mid-lecture is exactly what the digest is for.
+        speak_proactive = item.kind != "timer"
+        effects.append(lambda: self._speak(line, proactive=speak_proactive,
+                                           kind=kind))
         effects.append(lambda: self._toast(title, text, "normal"))
         effects.append(lambda: bus.publish(ReminderFired(
             text=text, item_id=item.id, kind=item.kind)))
