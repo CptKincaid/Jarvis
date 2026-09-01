@@ -4446,6 +4446,26 @@ class JarvisApp:
             start_recording=self.recorder.start,
             stop_recording=lambda: threading.Thread(
                 target=self.recorder.stop, daemon=True).start(),
+            # The on-screen mic button turns into a STOP glyph while a
+            # capture is open, and he read it as a cancel: "if i press
+            # cancel button on the screen when he is waiting on a response
+            # he will say i didnt quite get that sir" (2026-08-31). It was
+            # wired to recorder.stop, so the half-second of room it had
+            # went to Whisper and came back as salad -- live at 20:46:37
+            # ("Stopped (manual)" on a 1.2 s clip -> -4.44 -> "Say that
+            # again, sir?"), again at 20:46:56 and again at 21:26:06.
+            # abort() discards the audio instead: _on_recording_stopped
+            # and _turn_on_stop both return early on reason == "abort", so
+            # nothing is transcribed, nothing is spoken and the turn is
+            # simply abandoned. Cancelling is silent.
+            cancel_recording=lambda: threading.Thread(
+                target=self.recorder.abort, daemon=True).start(),
+            # #135, typed-command history: TypedHistory.prev/next were
+            # written FOR the command bar's Up/Down ("arrow keys do
+            # nothing") and never wired to it -- the consumer side of the
+            # feature was missing, not broken.
+            history_prev=self.history.prev,
+            history_next=self.history.next,
             dispatch_text=self.dispatch_text,
             toggle_hotword=self.toggle_hotword,
             quit=self.quit,

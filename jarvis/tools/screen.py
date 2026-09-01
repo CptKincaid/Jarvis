@@ -7,6 +7,13 @@ the brain's model turn then phrases the reply.  The active window title
 (xdotool) rides along in the prompt as context, because a screenshot of a
 terminal says nothing about WHICH terminal.
 
+``screen.model`` must be a model THIS ollama can load, not merely one that
+is pulled.  LIVE 2026-08-31: llama3.2-vision:latest is on disk (7.27 GiB)
+and ollama 0.33.1 answers /api/chat with 500 "unknown model architecture:
+'mllama'" for it.  gemma4:26b ships a projector layer and is already the
+resident chat model, so pointing screen.model at it also dodges the
+OLLAMA_MAX_LOADED_MODELS=1 eviction a separate vision model causes.
+
 Two seams, both module-level so tests replace them:
 ``_grab_screen(display)`` -> PIL image (PIL.ImageGrab first, then
 ``gnome-screenshot -f`` / ImageMagick ``import`` when the XCB grab fails)
@@ -241,12 +248,44 @@ def tidy_answer(text, cap: int = ANSWER_WORD_CAP) -> str:
     return out
 
 
+def http_error_detail(exc) -> str:
+    """Ollama's own words out of an HTTPError body, else the HTTP reason.
+
+    ``{"error": "... unknown model architecture: 'mllama'"}`` is the entire
+    difference between "the box is broken" and "pull a model this build can
+    load", and it is only ever in the body."""
+    try:
+        body = exc.read()
+    except Exception:                            # noqa: BLE001 - body gone
+        body = b""
+    try:
+        parsed = json.loads(body or b"{}")
+        detail = parsed.get("error") if isinstance(parsed, dict) else ""
+    except Exception:                            # noqa: BLE001 - not JSON
+        detail = ""
+    if not detail:
+        detail = (body or b"").decode("utf-8", "replace")
+    detail = " ".join(str(detail or getattr(exc, "reason", "") or "").split())
+    return detail[:160]
+
+
 def ask_screen(question: str, model: str, b64: str, title: str,
                timeout: float = VISION_TIMEOUT_S) -> str:
     """The vision model's answer; raises VisionUnavailable on any failure."""
     payload = vision_payload(model, b64, question, title)
     try:
         reply = _ask_vision(payload, timeout=timeout)
+    except urllib.error.HTTPError as exc:
+        # HTTPError is a URLError subclass, so this clause MUST come first.
+        # LIVE 2026-08-31 21:22 and 21:27: "What's on my screen?" twice, and
+        # both times the whole record of it was ``screen:
+        # llama3.2-vision:latest did not answer: HTTPError`` -- the class
+        # name, nothing else -- while Hunter heard "My vision model isn't
+        # answering, sir." Ollama had returned 500 with "unknown model
+        # architecture: 'mllama'": the model is pulled, this build's
+        # llama-server simply cannot load it. That is a one-line fix to
+        # screen.model, and it was invisible.
+        raise VisionUnavailable(f"HTTP {exc.code}: {http_error_detail(exc)}") from exc
     except (urllib.error.URLError, OSError, ValueError, TimeoutError) as exc:
         # socket.timeout is an OSError; a proxy's HTML page is the ValueError
         raise VisionUnavailable(type(exc).__name__) from exc
@@ -282,8 +321,11 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             answer = ask_screen(question, model, b64, title)
         except VisionUnavailable as exc:
             log.warning("screen: %s did not answer: %s", model, exc)
-            return ToolResult(text=f"vision model {model} unavailable", ok=False,
-                              speak=NO_VISION_LINE)
+            # The reason rides in the tool text too: ok=False + speak= means
+            # the spoken line is fixed, so without this the recorded answer
+            # to "why can't he see?" is nowhere at all.
+            return ToolResult(text=f"vision model {model} unavailable: {exc}",
+                              ok=False, speak=NO_VISION_LINE)
         except Exception as exc:  # noqa: BLE001 - tool boundary
             log.exception("screen: unexpected failure")
             return ToolResult(text=f"vision failed: {str(exc)[:60]}", ok=False,

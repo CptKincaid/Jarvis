@@ -254,10 +254,22 @@ def merge_events(*groups) -> list[Event]:
 
 
 # --------------------------------------------------------------- wording
+# Below this an event is a marker, not a booking, and "for 1 minute" is
+# noise. Anything from a quarter of an hour up is a real length.
+MIN_DURATION_MINUTES = 5
+
+
 def _duration_words(ev: Event) -> str:
     minutes = int((ev.end - ev.start).total_seconds() // 60)
-    if minutes < 60:
+    if minutes < MIN_DURATION_MINUTES:
         return ""
+    # A sub-hour event used to return "" -- so "how long is my biosensors
+    # lab?" had NOTHING to answer from for a 50-minute class (his 9:10 am
+    # BIOSENSORS lecture is 9:10-10:00), and Jarvis said "I'm afraid I don't
+    # have that information, sir" about a length both ends of which were in
+    # the event. The duration is derivable from start and end; say it.
+    if minutes < 60:
+        return f" for {minutes} minutes"
     hours, rem = divmod(minutes, 60)
     if rem == 0:
         return " for an hour" if hours == 1 else f" for {hours} hours"
@@ -329,6 +341,21 @@ def _suffix(n: int) -> str:
     return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
 
 
+# Every way "tomorrow" reaches this function, INCLUDING typed shorthand.
+# LIVE 2026-08-31 20:38: "whats on tmws calendar" was coerced to "today",
+# commander logged ``route short-cut: get_calendar({'range': 'today'})``,
+# the tool handed the model TODAY's four events and Jarvis answered "I'm
+# afraid I can't see tomorrow's schedule, sir; I only have access to your
+# entries for today" -- about a day that is squarely inside the 14-day
+# cache. The old test was ``text in ("tmrw", "tmr")``: an EQUALITY check on
+# a string that is the whole utterance (commander.calendar_range passes the
+# sentence, not a word), so the abbreviation branch could never fire in a
+# sentence. A word-boundary search is the whole fix.
+_TOMORROW_RX = re.compile(
+    r"\b(?:tomorrow|tomorow|tomarrow|2morrow|tmrw|tmrws|tmrrw|tmrs|tmr|"
+    r"tmws|tmw|tmoro|tmoros)\b", re.I)
+
+
 def coerce_range(value) -> str:
     """Loose model values -> one of RANGES ("this week" -> "week")."""
     text = _clean(value).lower().strip(" .?!")
@@ -340,7 +367,7 @@ def coerce_range(value) -> str:
     for day in WEEKDAYS:
         if re.search(rf"\b{day}\b", text):
             return day
-    if "tomorrow" in text or text in ("tmrw", "tmr"):
+    if _TOMORROW_RX.search(text):
         return "tomorrow"
     if "week" in text or "7 day" in text or "seven day" in text:
         return "week"
@@ -1205,8 +1232,13 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         # event list from the composed morning summary, so the day word the
         # user actually says has to sit in THIS one. <= 20 words: the
         # description rides in the cached static prefix on every turn.
+        # "; how long they last" is the hint that makes the model reach for
+        # THIS tool on "how long is my biosensors lab tomorrow?" -- a
+        # question that got "I'm afraid I don't have that information, sir"
+        # because nothing in the tool list mentioned duration.
         description=("Events on Hunter's calendar: what's on today, "
-                     "tomorrow, a named weekday, the week, or next."),
+                     "tomorrow, a named weekday, the week, or next; "
+                     "how long they last."),
         parameters={"type": "object", "properties": {
             "range": {"type": "string", "enum": list(RANGES),
                       "description": "today, tomorrow, week or next"}},

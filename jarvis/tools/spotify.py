@@ -99,10 +99,18 @@ DOCS_HINT = "docs/assistant-setup.md"
 PAGE = 50                  # /me/tracks and /me/playlists page size
 LIKED_CAP = 500            # most Liked Songs paged per request
 LIKED_CHUNK = 100          # uris per start_playback (Spotify's practical limit)
-LIKED_QUEUE_AHEAD = 20     # add_to_queue calls made lazily after the chunk
+# 0, deliberately.  This used to be 20: after "play my liked songs" a worker
+# pushed 20 more tracks into Spotify's USER QUEUE, so a later "queue Save Your
+# Tears next" landed 21st and never played next -- "Queueing does not work"
+# (#70).  The 100-uri chunk above is the session; the queue belongs to him.
+LIKED_QUEUE_AHEAD = 0      # add_to_queue calls made lazily after the chunk
 OWN_PLAYLIST_CAP = 200
 PLAYLIST_CACHE_S = 300.0
 SETTLE_AFTER_TRANSFER_S = 0.4
+# Remote duck (#72): percentage OF the Connect device's current volume, not an
+# absolute level.  A Connect device's 0-100 is its own hardware slider, so
+# "set it to 30" on a laptop already sitting at 40 is not a duck at all.
+DUCK_TO_PCT_OF_CURRENT = 30
 API_TIMEOUT_S = 8
 MARKET = "from_token"      # relative to the user token; overridable with spotify.market
 FALLBACK_COUNTRY = "US"    # artist_top_tracks needs a real country code
@@ -132,6 +140,9 @@ PLAY_LINE = "{what}, sir — on {device}."
 ARTIST_LINE = "{artist}'s top tracks, sir — on {device}."
 ALBUM_LINE = "{album} by {artist}, sir — the whole album on {device}."
 LIKED_URIS_LINE = "Your Liked Songs on shuffle, sir — {n} of them, on {device}."
+# The DEFAULT wording now: "the default should be last added to liked songs
+# and then go down, only shuffle if i sp[ecify]" (#66).
+LIKED_ORDER_LINE = "Your Liked Songs, sir — newest first, {n} of them, on {device}."
 LIKED_COLLECTION_LINE = "Your Liked Songs on shuffle, sir — on {device}."
 NOW_LINE = "{track} by {artist}, sir — on {device}."
 NOW_PAUSED_LINE = "{track} by {artist}, sir, paused on {device}."
@@ -175,7 +186,32 @@ _DEVICE_TYPES = {  # utterance word -> Spotify device type
     "car": "automobile", "console": "game_console", "playstation": "game_console",
     "xbox": "game_console"}
 _DEVICE_SUFFIX = re.compile(
-    r"\s+on\s+(?:my\s+|the\s+)?([\w' -]{2,40})$", re.I)
+    r"\s+(on|onto|to|over to)\s+(?:my\s+|the\s+)?([\w' -]{2,40})$", re.I)
+# "play it on my phone" is a Connect handover, not a search for a song called
+# "it".  Without this the tool searched Spotify for the pronoun and the model
+# learned to answer "I have no way of reaching it" instead of calling at all
+# (#69).  Deliberately narrow: "something"/"anything" are real play queries.
+# The lead verb is optional because this is checked on BOTH the raw query and
+# the one infer_kind has already cleaned.
+_PRONOUN_RX = re.compile(
+    r"^(?:(?:please\s+)?(?:play|put on|start|move|switch|send|transfer)\s+)?"
+    r"(?:it|this|that|music|the music|the song|the track|"
+    r"this song|this track|whatever\'?s playing)$", re.I)
+# Order matters where these are used: "I don't want them shuffled" contains
+# the word "shuffled", so the in-order phrasings must be tested FIRST.
+_INORDER_RX = re.compile(
+    r"\b(?:in order|in sequence|in the order|newest first|latest first|"
+    r"most recent(?:ly)?(?: added)?|last added|recently added|chronological(?:ly)?|"
+    r"unshuffled|not shuffled|no shuffle|without shuffl(?:e|ing)|"
+    r"stop shuffling|"
+    # "I don't want them shuffled" -- his exact words, and the reason the
+    # in-order patterns are tested BEFORE the shuffle ones: this phrase
+    # contains "shuffled" and would otherwise read as a request for it.
+    r"(?:don'?t|do not|never|no longer)\s+(?:want\s+)?(?:\w+\s+){0,2}shuffl\w*)\b",
+    re.I)
+_SHUFFLE_RX = re.compile(
+    r"\b(?:shuffle|shuffled|shuffling|random|randomly|randomised|randomized|"
+    r"on shuffle|mixed up)\b", re.I)
 
 
 # ------------------------------------------------------------ pure helpers
@@ -262,7 +298,12 @@ def infer_kind(query: Any) -> tuple[str, str]:
     low = q.lower()
     if not low:
         return "auto", ""
-    if re.search(r"\b(my )?(liked songs|likes|library|saved songs|favou?rites?)\b", low):
+    # "liked?" because Whisper drops the d: his 21:14:37 utterance came out as
+    # "Play my like songs playlist in order", which missed this test, fell into
+    # the "my <x> playlist" branch below and started a stranger's public
+    # playlist called "All my liked songs" instead of his library (#66).
+    if re.search(r"\b(?:my\s+)?(?:liked?\s+songs|likes|library|saved\s+songs|"
+                 r"favou?rites?)\b", low):
         return "liked", q
     for hint in _OWN_PLAYLIST_HINTS:
         if hint in low:
@@ -291,6 +332,20 @@ def infer_kind(query: Any) -> tuple[str, str]:
     return "auto", q
 
 
+def wants_shuffle(text: Any, default: Optional[bool] = None) -> Optional[bool]:
+    """Did the utterance ASK for shuffle?  True / False / ``default``.
+
+    Liked Songs used to shuffle unconditionally; he wants "the default should
+    be last added to liked songs and then go down, only shuffle if i
+    sp[ecify]" (#66).  Pure; table-tested."""
+    t = str(text or "")
+    if _INORDER_RX.search(t):
+        return False
+    if _SHUFFLE_RX.search(t):
+        return True
+    return default
+
+
 def split_device(query: Any) -> tuple[str, Optional[str]]:
     """Peel a trailing 'on my phone' / 'on HPCOMPUTER' off a query when the
     model left it in.  Only known device words or a device-looking token."""
@@ -298,9 +353,16 @@ def split_device(query: Any) -> tuple[str, Optional[str]]:
     m = _DEVICE_SUFFIX.search(q)
     if not m:
         return q, None
-    cand = m.group(1).strip()
+    prep, cand = m.group(1).lower(), m.group(2).strip()
     words = _norm(cand).split()
     if not words:
+        return q, None
+    if prep != "on":
+        # "move it TO my phone" (#69).  Stricter than "on": only the last word
+        # may name the device, so "Fly Me To The Moon" and "add it to the car
+        # playlist" are still song titles, not handovers.
+        if words[-1] in _DEVICE_TYPES or cand.isupper():
+            return q[:m.start()].strip(), cand
         return q, None
     if words[-1] in _DEVICE_TYPES or any(w in _DEVICE_TYPES for w in words) \
             or cand.isupper():
@@ -524,11 +586,21 @@ class SpotifyTool:
         self._playlists_at = 0.0
         self._user_id: Optional[str] = None
         self._market_bad = False
+        # (device_id, volume_percent) of a remote duck in flight -- see duck().
+        self._ducked_from: Optional[tuple[str, int]] = None
 
     # ---------------------------------------------------------- config
     @property
     def default_device(self) -> str:
         return str(_cfg_get(self.cfg, "spotify.default_device") or DEFAULT_DEVICE)
+
+    @property
+    def liked_shuffle(self) -> bool:
+        """Whether Liked Songs shuffle when he does not say.  FALSE by
+        default: /me/tracks pages newest-added first, which is exactly the
+        order he asked for (#66).  ``spotify.liked_shuffle: true`` restores
+        the old behaviour."""
+        return bool(_cfg_get(self.cfg, "spotify.liked_shuffle", False))
 
     @property
     def liked_strategy(self) -> str:
@@ -795,6 +867,53 @@ class SpotifyTool:
             device.is_active = True
         return device
 
+    # ------------------------------------------------------- remote duck
+    def duck(self, to_pct: int = DUCK_TO_PCT_OF_CURRENT) -> bool:
+        """Lower the ACTIVE Connect device's volume through the Web API.
+
+        The Room Mixer can only reach PipeWire streams on this box.  When the
+        music is on HPCOMPUTER or his phone there is no local sink-input at
+        all, so `pactl` moves nothing and the duck is theatre -- which is why
+        "he cant discern my voice from the vocalists in the music" (#72) with
+        "mixer: ducked 1 stream(s) to 30%" sitting in the log next to it (the
+        one stream it found was the idle librespot pipe).  Spotify's own
+        volume endpoint is the only handle on a remote device there is.
+
+        Returns True when a volume was actually moved.  Never raises: a
+        failed duck must cost him nothing but the duck."""
+        with self._lock:
+            if self._ducked_from is not None:
+                return False
+        try:
+            self.ensure_ready()
+            dev = next((d for d in self.devices() if d.is_active), None)
+            if dev is None or dev.id is None or not isinstance(dev.volume, int):
+                return False
+            floor = max(0, min(100, int(to_pct)))
+            want = int(round(dev.volume * floor / 100.0))
+            if want >= dev.volume:
+                return False
+            self._api("volume", want, device_id=dev.id)
+        except SpotifyError as exc:
+            log.debug("spotify: remote duck skipped (%s)", exc.text)
+            return False
+        with self._lock:
+            self._ducked_from = (dev.id, dev.volume)
+        return True
+
+    def unduck(self) -> bool:
+        """Put the remote device back where he had it.  Idempotent."""
+        with self._lock:
+            saved, self._ducked_from = self._ducked_from, None
+        if saved is None:
+            return False
+        try:
+            self._api("volume", int(saved[1]), device_id=saved[0])
+        except SpotifyError as exc:
+            log.debug("spotify: remote unduck failed (%s)", exc.text)
+            return False
+        return True
+
     # ----------------------------------------------------------- search
     def _user_id_(self) -> str:
         if not self._user_id:
@@ -918,6 +1037,7 @@ class SpotifyTool:
 
     def play(self, query: Any = "", kind: Any = "auto", device: Any = None) -> ToolResult:
         query = str(query or "").strip()
+        spoken = query                 # kept for the shuffle hint below (#66)
         device = clean_device_name(device)
         if not device:
             query, device = split_device(query)
@@ -925,8 +1045,16 @@ class SpotifyTool:
         if k == "auto":
             k, query = infer_kind(query)
         if k == "liked":
-            return self.liked(device)
+            return self.liked(device, shuffle=wants_shuffle(spoken))
+        if device and _PRONOUN_RX.match(query.strip(" .!?,")):
+            # "play it on my phone" -> a Connect handover, not a search for a
+            # song called "it".  Spotify Connect supports the handover; the
+            # search is what made it look like it did not (#69).
+            query = ""
         if not query:
+            if device:
+                # He named a device and nothing to play: move the music there.
+                return self.control("transfer", value=device)
             return self.control("resume", device=device)
         dev = self.resolve_device(device)
         if k == "auto":
@@ -958,10 +1086,25 @@ class SpotifyTool:
             offset += PAGE
         return out[:cap]
 
-    def _liked_by_uris(self, device: Device, uris: list[str]) -> int:
+    def _set_shuffle(self, device: Device, state: bool) -> None:
+        """Best effort: a device that refuses the toggle must not cost him
+        the music, so this warns and carries on."""
+        try:
+            self._api("shuffle", bool(state), device_id=device.id)
+        except SpotifyError as exc:
+            log.warning("liked songs: could not set shuffle=%s (%s)", state, exc.text)
+
+    def _liked_by_uris(self, device: Device, uris: list[str],
+                       shuffled: bool = True) -> int:
         chunk = max(1, min(LIKED_CHUNK, self._opt("liked_chunk", LIKED_CHUNK)))
         first, rest = uris[:chunk], uris[chunk:]
-        self._start(device, uris=first)
+        self._ensure_on(device)
+        if not shuffled:
+            # Spotify's shuffle flag is STICKY per device and outranks the
+            # order of `uris`: an ordered list started while the flag is on
+            # comes back out random, which is exactly what he heard (#66).
+            self._set_shuffle(device, False)
+        self._api("start_playback", device_id=device.id, uris=first)
         ahead = self._opt("liked_queue_ahead", LIKED_QUEUE_AHEAD)
         if rest and ahead > 0:
             self._spawn(lambda: self._queue_rest(device, rest[:ahead]))
@@ -987,14 +1130,32 @@ class SpotifyTool:
         self._api("start_playback", device_id=device.id,
                   context_uri=f"spotify:user:{uid}:collection")
 
-    def liked(self, device: Any = None) -> ToolResult:
+    def liked(self, device: Any = None, shuffle: Any = None) -> ToolResult:
+        """Liked Songs.  NEWEST ADDED FIRST unless he asks for shuffle.
+
+        ``shuffle=None`` means "he did not say", which falls to
+        ``spotify.liked_shuffle`` (False).  /me/tracks already pages
+        most-recently-added first, so the untouched order IS "last added to
+        liked songs and then go down" (#66)."""
         dev = self.resolve_device(clean_device_name(device))
+        # An empty string is the model declining to fill the field, not a
+        # request: it must read as "he did not say", never as shuffle=on.
+        said = shuffle is not None and not (isinstance(shuffle, str)
+                                            and not shuffle.strip())
+        shuffled = bool(parse_onoff(shuffle, default=True)) if said \
+            else self.liked_shuffle
         uris = self._liked_uris()
         if not uris:
             raise SpotifyError(LIKED_EMPTY_LINE, "api", "spotify: no saved tracks")
-        self._rng.shuffle(uris)
+        if shuffled:
+            self._rng.shuffle(uris)
         order = ("uris", "collection") if self.liked_strategy == "uris" \
             else ("collection", "uris")
+        if not shuffled:
+            # spotify:user:<id>:collection is a server-SHUFFLED context by
+            # construction, so it can never honour an order: it is not a
+            # fallback when he asked for newest-first.
+            order = ("uris",)
         last: Optional[SpotifyError] = None
         for how in order:
             try:
@@ -1002,8 +1163,9 @@ class SpotifyTool:
                     self._liked_by_collection(dev)
                     line = LIKED_COLLECTION_LINE.format(device=dev.name)
                 else:
-                    n = self._liked_by_uris(dev, uris)
-                    line = LIKED_URIS_LINE.format(n=n, device=dev.name)
+                    n = self._liked_by_uris(dev, uris, shuffled)
+                    line = (LIKED_URIS_LINE if shuffled else
+                            LIKED_ORDER_LINE).format(n=n, device=dev.name)
                 if last is not None:
                     log.info("liked songs: %s failed (%s); %s worked", order[0],
                              last.text, how)
@@ -1214,8 +1376,8 @@ class SpotifyTool:
         def play(query="", kind="auto", device="", **_):
             return self.play(query, kind, device)
 
-        def liked(device="", **_):
-            return self.liked(device)
+        def liked(device="", shuffle=None, **_):
+            return self.liked(device, shuffle)
 
         def control(action="", value=None, device="", **_):
             return self.control(action, value, device)
@@ -1238,15 +1400,28 @@ class SpotifyTool:
                                      "device": {"type": "string"}},
                       "required": ["query"]},
                      self._guard(play)),
-            ToolSpec("spotify_liked", "Shuffle Hunter's Liked Songs on Spotify.",
-                     {"type": "object", "properties": {"device": {"type": "string"}}},
+            # The old description was "Shuffle Hunter's Liked Songs on Spotify."
+            # -- the model read that as an instruction and every request came
+            # back shuffled, which is half of #66.  Order is the default now
+            # and shuffle is opt-in, in the wording as well as the code.
+            ToolSpec("spotify_liked",
+                     "Play Hunter's Liked Songs on Spotify, newest added first; "
+                     "shuffle=true only if he asks.",
+                     {"type": "object",
+                      "properties": {"device": {"type": "string"},
+                                     "shuffle": {"type": "boolean"}}},
                      self._guard(liked)),
+            # "device" was missing from this schema, so the model had no way
+            # to see that moving playback was on offer; asked to "play it on my
+            # phone" it invented "I have no way of reaching it" instead of
+            # calling transfer, which Spotify Connect supports fine (#69).
             ToolSpec("spotify_control",
                      "Spotify transport: pause, resume, next, previous, volume, shuffle, "
-                     "repeat, seek, like, transfer.",
+                     "repeat, seek, like, and transfer (move playback to another device).",
                      {"type": "object",
                       "properties": {"action": {"type": "string", "enum": list(ACTIONS)},
-                                     "value": {"type": "string"}},
+                                     "value": {"type": "string"},
+                                     "device": {"type": "string"}},
                       "required": ["action"]},
                      self._guard(control)),
             ToolSpec("spotify_now_playing", "What is playing on Spotify right now.",

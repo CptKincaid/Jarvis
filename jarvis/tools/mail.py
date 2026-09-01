@@ -36,6 +36,13 @@ BODY_BYTES = 2000                      # partial body fetch (never the whole mai
 # not open a dozen sockets at once.
 MAX_MAIL_WORKERS = 4
 SNIPPET_CHARS = 200
+SHEET_SNIPPET_CHARS = 120    # what a browse-the-inbox listing shows per item
+# A search BY NAME is not inbox triage. LIVE 2026-08-31 21:07: "Any emails
+# from Evolving AI Insights?" was answered "I'm afraid there are no emails
+# from Evolving AI Insights, sir" -- the newsletter had arrived at 5:47 am
+# that morning and had simply been READ, so the UNSEEN + 24 h default hid
+# it. A named search looks a week back and counts read mail.
+NAMED_SEARCH_HOURS = 24 * 7
 NOTHING_NEW_LINE = "Nothing new in the inbox, sir."
 UNREACHABLE_LINE = "I can't reach your mailbox, sir."
 FALLBACK_SETUP_LINE = ("I'll need your Gmail app password set up, sir; "
@@ -485,20 +492,34 @@ def when_text(dt: Optional[datetime], now: Optional[datetime] = None) -> str:
     return f"{dt.strftime('%a')} {clock}"
 
 
+def window_words(since_hours: int) -> str:
+    """"24 hours" / "7 days" -- what the model repeats back. A named search
+    looks 168 hours back and "in the last 168 hours" is not English."""
+    hours = int(since_hours)
+    if hours % 24 == 0 and hours >= 48:
+        return f"{hours // 24} days"
+    return f"{hours} hours"
+
+
 def fact_sheet(mails: list[Mail], total: int, since_hours: int = 24,
-               now: Optional[datetime] = None, unread: bool = True) -> str:
+               now: Optional[datetime] = None, unread: bool = True,
+               snippet_chars: int = SHEET_SNIPPET_CHARS) -> str:
     """'5 unread since yesterday: 1) Jane Doe — Invoice 4471 due Friday
     (2:10 pm): snippet …' — plain text for the model, one item per line.
 
     ``unread=False`` when the search included read mail: the model renders
     this sheet as fact, so calling twenty read messages "unread" had Jarvis
     reporting a full inbox of new mail the user had already seen."""
-    since = "yesterday" if since_hours <= 24 else f"{since_hours // 24} days"
+    # "since yesterday" is English; "since 7 days" is not, and the model
+    # repeats this head back as fact -- a named search defaults to a week now,
+    # so the long window is no longer the rare case.
+    since = ("since yesterday" if since_hours <= 24
+             else f"in the last {window_words(since_hours)}")
     kind = "unread" if unread else "messages"
     if total > len(mails):
-        head = f"{total} {kind} since {since}, latest {len(mails)}:"
+        head = f"{total} {kind} {since}, latest {len(mails)}:"
     else:
-        head = f"{total} {kind} since {since}:"
+        head = f"{total} {kind} {since}:"
     lines = [head]
     for i, m in enumerate(mails, 1):
         when = when_text(m.date, now)
@@ -506,7 +527,12 @@ def fact_sheet(mails: list[Mail], total: int, since_hours: int = 24,
         if when:
             item += f" ({when})"
         if m.snippet:
-            item += f": {m.snippet[:120]}"
+            # A narrowed search (a sender or a subject) passes the FULL
+            # snippet: "What specifically was the undergrad engineering
+            # update about?" cannot be answered from 120 characters, and
+            # Jarvis answered "I only have the subject line and sender"
+            # about a body that had already been fetched.
+            item += f": {m.snippet[:snippet_chars]}"
         lines.append(item)
     return "\n".join(lines)
 
@@ -531,6 +557,27 @@ def sender_matches(mail: Mail, wanted: str) -> bool:
     if "@" in w:
         return addr == w or addr.endswith("<" + w + ">") or w in addr
     return w in name or w in addr
+
+
+# Filler in "what was the undergrad engineering update about" that must
+# not become a required keyword.
+_SUBJECT_STOP = {"the", "a", "an", "my", "about", "email", "e-mail", "mail",
+                 "message", "from", "of", "on", "for", "was", "is", "what",
+                 "whats", "what's", "specifically", "sir", "jarvis", "that",
+                 "this", "it", "and", "to", "in", "one", "last", "latest"}
+_SUBJECT_WORD_RX = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+
+
+def subject_matches(mail: Mail, wanted: str) -> bool:
+    """Every content word of ``wanted`` somewhere in the subject or the
+    snippet. Substring, not whole-word: "undergrad" has to find
+    "Undergraduate Advising", which is how Hunter refers to that sender."""
+    words = [w for w in _SUBJECT_WORD_RX.findall((wanted or "").lower())
+             if w not in _SUBJECT_STOP and len(w) > 2]
+    if not words:
+        return True
+    hay = f"{mail.subject} {mail.snippet}".lower()
+    return all(w in hay or w.rstrip("s") in hay for w in words)
 
 
 def resolve_sender(services, sender: str) -> tuple[str, str]:
@@ -558,17 +605,25 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     imap_cls = getattr(services, "imap", None) if services is not None else None
     imap_cls = imap_cls or imaplib.IMAP4_SSL
 
-    def get_mail(limit=5, since_hours=24, unread_only=True, sender="",
-                 **_) -> ToolResult:
+    def get_mail(limit=5, since_hours=None, unread_only=None, sender="",
+                 subject="", **_) -> ToolResult:
         try:
             limit = max(1, min(20, int(float(str(limit)))))
         except (TypeError, ValueError):
             limit = 5
+        wanted, who = resolve_sender(services, str(sender or ""))
+        about = " ".join(str(subject or "").split())
+        # A NAMED search -- "any emails from X", "what was the Y about" --
+        # is a lookup, not a look at what is new, so read mail counts and a
+        # day is too short a memory. Only the DEFAULTS move: an explicit
+        # unread_only / since_hours from the model still wins.
+        named = bool(wanted or about)
+        if since_hours is None:
+            since_hours = NAMED_SEARCH_HOURS if named else 24
         try:
             since_hours = max(1, min(24 * 14, int(float(str(since_hours)))))
         except (TypeError, ValueError):
-            since_hours = 24
-        wanted, who = resolve_sender(services, str(sender or ""))
+            since_hours = NAMED_SEARCH_HOURS if named else 24
         # mail_accounts(), NOT gmail_settings(): the latter only knows the
         # LEGACY top-level gmail.address / gmail.app_password pair, so on a
         # multi-account config (gmail.accounts) it returns None and Jarvis
@@ -577,10 +632,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         if not mail_accounts(cfg):
             line = setup_line(cfg, "gmail")
             return ToolResult(text=line, ok=False, speak=line)
-        unread = _truthy_flag(unread_only)
+        unread = (not named) if unread_only is None else _truthy_flag(unread_only)
         try:
             mails = fetch_unread(cfg, since_hours=since_hours,
-                                 limit=SENDER_FETCH_LIMIT if wanted else 20,
+                                 limit=SENDER_FETCH_LIMIT if named else 20,
                                  imap=imap_cls, unread_only=unread)
         except MailNotConfigured:
             line = setup_line(cfg, "gmail")
@@ -590,26 +645,36 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             return ToolResult(text="mailbox unreachable: IMAP login or "
                                    "connection failed", ok=False,
                               speak=UNREACHABLE_LINE)
-        if wanted:
-            mails = [m for m in mails if sender_matches(m, wanted)]
+        if named:
+            if wanted:
+                mails = [m for m in mails if sender_matches(m, wanted)]
+            if about:
+                mails = [m for m in mails if subject_matches(m, about)]
             if not mails:
                 # The model says it from the fact: "nothing from Dr Peyrovi
                 # this week, sir" -- NOTHING_NEW_LINE would claim an empty
                 # inbox.
                 kind = "unread mail" if unread else "mail"
-                return ToolResult(text=f"no {kind} from {who} in the last "
-                                       f"{since_hours} hours", max_sentences=2)
+                scope = f"from {who}" if who else f"about {about}"
+                if who and about:
+                    scope = f"from {who} about {about}"
+                return ToolResult(text=f"no {kind} {scope} in the last "
+                                       f"{window_words(since_hours)}",
+                                  max_sentences=2)
         if not mails:
             if unread:
-                return ToolResult(text=f"no unread mail in the last {since_hours} hours",
+                return ToolResult(text="no unread mail in the last "
+                                       f"{window_words(since_hours)}",
                                   speak=NOTHING_NEW_LINE)
             # "Nothing new in the inbox" would be the wrong claim here: this
             # search included read mail, so the inbox is simply empty for the
             # period. Let the model say that from the fact.
-            return ToolResult(text=f"no mail at all, read or unread, in the last "
-                                   f"{since_hours} hours", max_sentences=2)
-        sheet = fact_sheet(mails[:limit], len(mails), since_hours, unread=unread)
-        if wanted:
+            return ToolResult(text="no mail at all, read or unread, in the last "
+                                   f"{window_words(since_hours)}", max_sentences=2)
+        sheet = fact_sheet(mails[:limit], len(mails), since_hours, unread=unread,
+                           snippet_chars=SNIPPET_CHARS if named
+                           else SHEET_SNIPPET_CHARS)
+        if who:
             sheet = f"From {who}: " + sheet
         return ToolResult(text=sheet, max_sentences=4)
 
@@ -617,9 +682,8 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         name="get_mail",
         # <= 20 words: this rides in every prompt (test_get_mail_tool).
         # The per-parameter descriptions carry the detail.
-        description=("Gmail: sender, subject, snippet. Unread from the last "
-                     "day by default; unread_only=false for the latest "
-                     "read mail."),
+        description=("Gmail: sender, subject, body snippet. Unread from the "
+                     "last day, or search by sender or subject."),
         parameters={
             "type": "object",
             "properties": {
@@ -631,14 +695,20 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                                     "(default 24, max 336)")},
                 "unread_only": {
                     "type": "boolean",
-                    "description": ("true = unread only (default); false = "
-                                    "include already-read mail, which is "
-                                    "what answers 'my last email'")},
+                    "description": ("true = unread only (the default for a "
+                                    "bare 'any mail?'); false = include "
+                                    "already-read mail. A sender or subject "
+                                    "search already includes read mail")},
                 "sender": {
                     "type": "string",
                     "description": ("only mail from this person: a name, an "
                                     "address, or how Hunter refers to them "
                                     "('my advisor')")},
+                "subject": {
+                    "type": "string",
+                    "description": ("keywords the message is about; use it "
+                                    "to fetch the body of a message already "
+                                    "mentioned ('undergrad engineering')")},
             },
         },
         handler=get_mail,

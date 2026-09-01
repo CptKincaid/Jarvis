@@ -28,9 +28,13 @@ from jarvis.tools.docs import DOC_PREFIX, QUERY_PREFIX, EmbedError
 DIM = 64
 # Function words carry no meaning for a bag-of-words fake; a real embedder
 # discounts them on its own.
-_STOP = frozenset("search query document is my the a an what did i say about who "
-                  "on do does for to with of in and was were tell me you this that "
-                  "it at are am be".split())
+# "your" joined "my" on 2026-08-31, when facts began being filed in the
+# second person (memory.to_second_person). It is a function word like the
+# rest -- and in a 64-bucket bag-of-words fake it collides with "thesis"
+# and "patel", which made the dentist fact win a query about the thesis.
+_STOP = frozenset("search query document is my your the a an what did i say "
+                  "about who on do does for to with of in and was were tell "
+                  "me you this that it at are am be".split())
 
 
 class FakeEmbed:
@@ -91,13 +95,17 @@ def mem(tmp_path, embed):
 
 # ------------------------------------------------------------ write-through
 def test_remember_writes_facts_json_and_the_index(mem, tmp_path, embed):
+    # Filed in the second person since 2026-08-31 (memory.to_second_person):
+    # a fact is rendered straight into the model's prompt, where "my" would
+    # be the assistant's.
     mem.remember("dentist", "my dentist is Dr Patel on Elm Street")
+    filed = "your dentist is Dr Patel on Elm Street"
     facts = json.loads((tmp_path / "mem" / "facts.json").read_text())
-    assert facts["dentist"]["value"] == "my dentist is Dr Patel on Elm Street"
+    assert facts["dentist"]["value"] == filed
     assert mem._index.count() == 1
     assert (tmp_path / "mem" / "facts_index").is_dir()
     # embedded with the document prefix, queried with the query prefix
-    assert embed.calls[-1] == [DOC_PREFIX + "my dentist is Dr Patel on Elm Street"]
+    assert embed.calls[-1] == [DOC_PREFIX + filed]
     mem.recall("who is my dentist")
     assert embed.calls[-1][0].startswith(QUERY_PREFIX)
 

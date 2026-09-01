@@ -15,6 +15,7 @@ import json
 import logging
 import stat
 import subprocess
+import urllib.error
 import urllib.request
 
 import pytest
@@ -421,3 +422,50 @@ def test_persona_lines_are_film_jarvis():
     for line in (scr.NO_SCREEN_LINE, scr.NO_VISION_LINE):
         assert line.endswith(", sir.")
         assert len(line.split()) <= 12
+
+
+def test_an_http_error_keeps_ollamas_reason(wired, caplog):
+    """LIVE 2026-08-31, 21:22 and 21:27: "What's on my screen?" twice, and
+    both times the entire record was
+
+        screen: llama3.2-vision:latest did not answer: HTTPError
+
+    -- the exception CLASS NAME -- while Hunter heard "My vision model isn't
+    answering, sir."  Ollama had answered 500 with
+    {"error": "... unknown model architecture: 'mllama'"}: the model is
+    pulled and 7.27 GiB of it is on disk, this build's llama-server simply
+    cannot load that architecture.  That is a one-line change to
+    screen.model and it was nowhere in the log, so the reason has to survive
+    the HTTPError: urlopen raises it, and the body is where it lives."""
+    vision, _grabbed = wired
+    body = (b'{"error":"llama runner process has terminated: exit status 1: '
+            b'error loading model: unknown model architecture: \'mllama\'"}')
+    vision.fail = urllib.error.HTTPError(
+        "http://localhost:11434/api/chat", 500, "Internal Server Error",
+        {}, io.BytesIO(body))
+    with caplog.at_level(logging.WARNING, logger="jarvis"):
+        res = tool().call("screen_qa", {})
+    assert res.ok is False and res.speak == scr.NO_VISION_LINE   # unchanged aloud
+    for where in (caplog.text, res.text):
+        assert "HTTP 500" in where
+        assert "unknown model architecture: 'mllama'" in where
+
+
+def test_a_dead_ollama_is_still_just_the_class_name(wired):
+    """The HTTPError clause must not swallow the plain-transport case: a
+    refused connection has no body and no status to report."""
+    vision, _grabbed = wired
+    vision.fail = urllib.error.URLError("connection refused")
+    res = tool().call("screen_qa", {})
+    assert res.ok is False and res.speak == scr.NO_VISION_LINE
+    assert "URLError" in res.text
+
+
+def test_http_error_detail_survives_a_body_that_is_not_json():
+    """A proxy's HTML page, or a body already read: never a second failure
+    inside the error path."""
+    err = urllib.error.HTTPError("u", 502, "Bad Gateway", {},
+                                 io.BytesIO(b"<html>nope</html>"))
+    assert "nope" in scr.http_error_detail(err)
+    empty = urllib.error.HTTPError("u", 503, "Service Unavailable", {}, None)
+    assert scr.http_error_detail(empty) == "Service Unavailable"

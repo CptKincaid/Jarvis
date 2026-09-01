@@ -59,6 +59,65 @@ from jarvis.logs import get_logger
 
 log = get_logger("memory")
 
+# ----------------------------------------------------------------------
+# Filing a fact in the second person
+# ----------------------------------------------------------------------
+# SYMPTOM, 2026-08-31. "Remember that it is Mara and I's birthday" was
+# stored, and read back, as
+#
+#     it is mara and i's birthday on = it is mara and i's birthday on
+#
+# and he said: "does not context I's as me, probably should just be Mara
+# and your anniversary on September 20th".
+#
+# facts.json is not a quote book. Every fact in it is rendered STRAIGHT into
+# the model's prompt by format_for_context, under "Known facts", where the
+# model is Jarvis and "I" is therefore Jarvis -- so a fact filed in the
+# first person tells him the anniversary is HIS. He got away with it that
+# evening only because the model guessed; the fact on disk still says the
+# wrong thing, and every later recall re-rolls that guess.
+#
+# So a fact is turned around ON THE WAY IN, where it is written once, rather
+# than on every read. "Mara and I's" is the one that has to be handled
+# specially: it is not standard English, and the possessive belongs to the
+# pair, so it becomes "Mara and your" -- his own wording for what he wanted.
+#
+# POSSESSIVES ONLY -- his words were "normalise first-person possessives",
+# and the narrower rule is also the safe one. Turning every "I" and "me"
+# around as well rewrites sentences that are not about him: the memory
+# garden files notes in JARVIS's voice ("he told me this himself"), and
+# "me" there is Jarvis. A possessive cannot mean that.
+#
+# Order matters: the "and I's" form has to go before the bare "I's", or the
+# conjunction is left behind.
+_SECOND_PERSON_RULES = [
+    # "Mara and I's anniversary" -> "Mara and your anniversary"
+    (re.compile(r"\b(and|&)\s+I(?:'|’)s\b", re.I), r"\1 your"),
+    (re.compile(r"\bI(?:'|’)s\b", re.I), "your"),
+    (re.compile(r"\bmyself\b", re.I), "yourself"),
+    (re.compile(r"\bmine\b", re.I), "yours"),
+    (re.compile(r"\bmy\b", re.I), "your"),
+]
+
+
+def to_second_person(text):
+    """A fact as Jarvis should read it back: "my" -> "your", "Mara and I's"
+    -> "Mara and your".
+
+    Idempotent -- second-person text has nothing left to rewrite -- so it is
+    safe on facts that arrive already turned around (the memory garden's
+    own promotions, a debrief line), and safe to run on a QUERY as well:
+    the store is written in the second person, so "who is my dentist" has
+    to be asked in the second person too or the substring search misses the
+    fact it just filed."""
+    if not isinstance(text, str) or not text:
+        return text
+    out = text
+    for rx, repl in _SECOND_PERSON_RULES:
+        out = rx.sub(repl, out)
+    return out
+
+
 FACTS_COLLECTION = "jarvis_memory"
 # Measured 2026-08-30 against nomic-embed-text with the task prefixes: a
 # matching fact scores 0.60-0.87 ("who's my dentist" vs "my dentist is Dr
@@ -652,11 +711,17 @@ class JarvisMemory:
     # ------------------------------------------------------------------
     def remember(self, key, value, source=None):
         """Store a fact persistently (facts.json, then the index).
-        Overwrites if key exists.
+        Overwrites if key exists. Returns the key it was filed under.
 
         ``source`` is provenance for a fact Jarvis promoted himself (the
         weekly memory garden passes "garden"); a fact Hunter told him has
-        none. Only the tagged ones can be listed or undone wholesale."""
+        none. Only the tagged ones can be listed or undone wholesale.
+
+        Key and value are filed in the SECOND person -- see
+        ``to_second_person``. A fact is written down for Jarvis to read
+        back, not quoted."""
+        key = to_second_person(key)
+        value = to_second_person(value) if isinstance(value, str) else value
         when = datetime.now().isoformat()
         entry = {"value": value, "time": when}
         if source:
@@ -671,9 +736,14 @@ class JarvisMemory:
                 self._index.upsert(key, value, when, source=source)
             except Exception:                       # noqa: BLE001
                 log.exception("semantic memory write-through failed")
+        return key
 
     def _substring_recall(self, query, since=None):
-        q = (query or "").lower().strip()
+        # Asked in the second person, because that is the language the
+        # store is written in (see to_second_person): "my dentist" has to
+        # match the fact filed as "your dentist is Dr Patel", or filing a
+        # fact correctly would make it unfindable.
+        q = to_second_person((query or "").lower().strip())
         matches = []
         if not q:
             return matches

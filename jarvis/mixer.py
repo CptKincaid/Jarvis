@@ -31,8 +31,16 @@ included.  ``heal()`` therefore keeps unmatched entries in the file until
 the stream they belong to reappears, instead of clearing them at boot.
 
 When nothing local is playing (Spotify on his phone or the HPCOMPUTER
-Connect target) there are no non-Jarvis sink-inputs at all: the Mixer
-stands down silently rather than pretending to work.
+Connect target) there are no non-Jarvis sink-inputs at all.  That case is
+not rare -- it is his NORMAL one, and it is why "he cant discern my voice
+from the vocalists in the music" (#72) sits in the log right beside
+``mixer: ducked 1 stream(s) to 30%``: the one stream pactl could see was
+the idle librespot pipe, and the music he could actually hear was coming
+out of HPCOMPUTER's own speakers, where pactl has no reach.  So when there
+is nothing local to duck the Mixer now asks the ``remote`` ducker (the
+Spotify tool -- ``duck()`` / ``unduck()`` over the Connect volume endpoint)
+instead of standing down.  ``remote`` is None until something wires it, and
+a remote that fails is ignored.
 
 Seams for tests: ``run`` (the one subprocess call), ``sleep``, ``ppid_of``
 and ``state_path``.  The parsing and planning halves are pure functions.
@@ -309,7 +317,8 @@ class RoomMixer:
                  registry: Optional[PidRegistry] = None,
                  ppid_of: Optional[Callable] = None,
                  sleep: Optional[Callable] = None,
-                 now: Callable[[], float] = time.time):
+                 now: Callable[[], float] = time.time,
+                 remote: Optional[object] = None):
         self._cfg = cfg
         self._run = run or _run
         self._state_path = Path(state_path) if state_path else None
@@ -317,6 +326,10 @@ class RoomMixer:
         self._ppid_of = ppid_of or _proc_ppid
         self._sleep = sleep or time.sleep
         self._now = now
+        # Anything with duck(pct)/unduck(); jarvis.tools.spotify.SpotifyTool is
+        # the one that exists.  See the module docstring (#72).
+        self._remote = remote
+        self._remote_ducked = False
         self._lock = threading.RLock()
         self._holds: set[str] = set()          # "speaking" | "recording"
         self._ducked: list[dict] = []          # what we moved, with originals
@@ -485,14 +498,51 @@ class RoomMixer:
         self._set_hold("recording", False)
 
     # -------------------------------------------------------------- work
+    def set_remote(self, remote) -> None:
+        """Wire the Connect ducker after construction.
+
+        app.py builds the mixer at line 372 but the tools only at 446, so
+        ``services.spotify`` does not exist yet at __init__ time.  This is the
+        seam for the single line that connects them (#72):
+        ``self.mixer.set_remote(getattr(self.services, "spotify", None))``
+        after ``_register_tools()``."""
+        self._remote = remote
+
+    def _remote_duck(self, floor: int) -> None:
+        """Duck the Spotify Connect device when there is no local stream.
+
+        Guarded by blocked() as well as by ``remote`` being None: a test that
+        wired a real SpotifyTool must not reach across the network and turn
+        down music he is actually listening to."""
+        if self._remote is None or self._remote_ducked or blocked():
+            return
+        try:
+            self._remote_ducked = bool(self._remote.duck(floor))
+        except Exception:  # noqa: BLE001 - a remote hiccup must not break the duck
+            log.debug("mixer: remote duck failed", exc_info=True)
+            return
+        if self._remote_ducked:
+            log.info("mixer: ducked the Spotify Connect device to %d%% of its volume",
+                     floor)
+
+    def _remote_restore(self) -> None:
+        if self._remote is None or not self._remote_ducked:
+            return
+        self._remote_ducked = False
+        try:
+            self._remote.unduck()
+        except Exception:  # noqa: BLE001 - see _remote_duck
+            log.debug("mixer: remote unduck failed", exc_info=True)
+
     def _duck(self, generation: int) -> None:
         floor = self.floor_pct
         inputs = self.sink_inputs()
         targets = duck_targets(inputs, self.exempt_pids(inputs), floor)
         if not targets:
             # Spotify on his phone or the Connect target: nothing local to
-            # duck. Stand down silently rather than look broken.
+            # duck, which on this box is the usual case (#72).
             log.debug("mixer: nothing local to duck")
+            self._remote_duck(floor)
             return
         saved = [{"index": t["index"], "volume_pct": t["volume_pct"],
                   "restore_key": t.get("restore_key", ""),
@@ -507,6 +557,7 @@ class RoomMixer:
         log.info("mixer: ducked %d stream(s) to %d%%", len(saved), floor)
 
     def _restore(self, generation: int) -> None:
+        self._remote_restore()
         with self._lock:
             saved = list(self._ducked)
             self._ducked = []
@@ -562,6 +613,10 @@ class RoomMixer:
             want = bool(self._holds)
             generation = self._generation
             ducked = bool(self._ducked)
+        # A remote-only duck moves nothing local, so self._ducked stays
+        # empty; without this the restore edge never fires and his Spotify
+        # volume stays at 30% of where he left it.
+        ducked = ducked or self._remote_ducked
         if not self.enabled:
             if ducked:
                 self._restore(generation)

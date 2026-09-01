@@ -34,12 +34,13 @@ URL = "https://calendar.google.com/calendar/ical/placeholder-secret-token/basic.
 FIXTURES = Path(__file__).parent / "fixtures"
 ICS = (FIXTURES / "calendar_sample.ics").read_bytes()
 
-TODAY_TEXT = ("Today: 7:00 am Run, 10:00 am Dentist for an hour at Main Street Dental, "
-              "2:30 pm Standup; nothing else.")
-WEEK_TEXT = ("This week: today 7:00 am Run, 10:00 am Dentist for an hour at Main Street "
-             "Dental, 2:30 pm Standup; tomorrow all day: Mum's birthday; Friday 10:00 am "
-             "UTC call for an hour and a half; Saturday all day: Conference; Sunday all "
-             "day: Conference; Monday 3:00 am Sync with London; nothing else.")
+TODAY_TEXT = ("Today: 7:00 am Run for 30 minutes, 10:00 am Dentist for an hour at Main "
+              "Street Dental, 2:30 pm Standup for 15 minutes; nothing else.")
+WEEK_TEXT = ("This week: today 7:00 am Run for 30 minutes, 10:00 am Dentist for an hour "
+             "at Main Street Dental, 2:30 pm Standup for 15 minutes; tomorrow all day: "
+             "Mum's birthday; Friday 10:00 am UTC call for an hour and a half; Saturday "
+             "all day: Conference; Sunday all day: Conference; Monday 3:00 am Sync with "
+             "London for 30 minutes; nothing else.")
 
 
 # ------------------------------------------------------------- fixtures
@@ -267,9 +268,11 @@ def test_format_events_exact_strings():
     assert format_events(evs, "next", late) == \
         "Next: UTC call at 10:00 am tomorrow, for an hour and a half."
     sunday = datetime(2026, 8, 30, 12, 0, tzinfo=CHI)
-    assert format_events(evs, "next", sunday) == "Next: Sync with London at 3:00 am tomorrow."
+    assert format_events(evs, "next", sunday) == \
+        "Next: Sync with London at 3:00 am tomorrow, for 30 minutes."
     monday = datetime(2026, 8, 31, 12, 0, tzinfo=CHI)
-    assert format_events(evs, "next", monday) == "Next: Standup on Wednesday at 2:30 pm."
+    assert format_events(evs, "next", monday) == \
+        "Next: Standup on Wednesday at 2:30 pm, for 15 minutes."
     next_week = datetime(2026, 9, 2, 15, 0, tzinfo=CHI)
     assert format_events(evs, "next", next_week) == \
         "Next: Board meeting at 10:00 am tomorrow, for 2 hours."
@@ -282,10 +285,10 @@ def test_format_events_empty_and_all_day_first():
     assert format_events([], "next", NOW) == "Nothing coming up in the next two weeks, sir."
     evs = [Event(NOW.replace(hour=8), NOW.replace(hour=8, minute=30), False, "Coffee"),
            Event(NOW.replace(hour=0), NOW.replace(hour=0) + timedelta(days=1), True, "Holiday")]
-    assert format_events(evs, "today", NOW) == "Today: all day: Holiday, 8:00 am Coffee; nothing else."
+    assert format_events(evs, "today", NOW) == "Today: all day: Holiday, 8:00 am Coffee for 30 minutes; nothing else."
     # duplicates from two sources collapse
     assert format_events(evs + evs, "today", NOW) == \
-        "Today: all day: Holiday, 8:00 am Coffee; nothing else."
+        "Today: all day: Holiday, 8:00 am Coffee for 30 minutes; nothing else."
 
 
 def test_describe_due_table():
@@ -523,8 +526,9 @@ def test_icloud_path_with_fake_client(tmp_path):
     gym = [e for e in src.events() if e.title == "Gym"][0]
     assert gym.calendar == "Work" and gym.start == datetime(2026, 8, 26, 18, 0, tzinfo=CHI)
     assert format_events(src.events(), "today", NOW) == (
-        "Today: 7:00 am Run, 10:00 am Dentist for an hour at Main Street Dental, "
-        "2:30 pm Standup, 6:00 pm Gym for an hour; nothing else.")
+        "Today: 7:00 am Run for 30 minutes, 10:00 am Dentist for an hour at Main "
+        "Street Dental, 2:30 pm Standup for 15 minutes, 6:00 pm Gym for an hour; "
+        "nothing else.")
     assert src.errors == []                     # one broken calendar is only logged
     assert "placeholder-app-password" not in (tmp_path / "cal.json").read_text()
     # the iCloud login failing keeps the Google events and reports the source
@@ -768,3 +772,63 @@ def test_get_calendar_owns_the_bare_day_question():
     assert "today" not in brief_d
     # Still inside the budget register() warns above; these ship on every turn.
     assert cal.description_words() <= 20 and brief.description_words() <= 20
+
+
+# ------------------------------------------------- 2026-08-31 evening bugs
+def test_tomorrow_shorthand_in_a_whole_sentence_is_not_today():
+    """LIVE 2026-08-31 20:38, typed: "whats on tmws calendar".
+
+    commander.calendar_range hands coerce_range the WHOLE utterance, and the
+    abbreviation branch was an equality test (``text in ("tmrw", "tmr")``),
+    so it could only ever fire for a bare word.  The sentence fell through
+    to the "today" default, the log shows ``route short-cut:
+    get_calendar({'range': 'today'})``, the tool handed the model today's
+    four events, and Jarvis answered: "I'm afraid I can't see tomorrow's
+    schedule, sir; I only have access to your entries for today." -- about
+    a day that is inside the 14-day cache the whole time."""
+    for said in ("whats on tmws calendar", "what's on my calendar tmrw",
+                 "anything on tmw?", "do i have anything tomorrow",
+                 "what's on my calendar tomorrow?", "tmr"):
+        assert coerce_range(said) == "tomorrow", said
+    # ...and a sentence with no day word still means today, as before.
+    assert coerce_range("whats on my calendar") == "today"
+    # A weekday still wins over a stray abbreviation-looking token.
+    assert coerce_range("what's on Monday") == "monday"
+
+
+def test_a_fifty_minute_class_reports_its_length():
+    """LIVE 2026-08-31 21:00: "How long is my biosensors lab tomorrow?" ->
+    "I'm afraid I don't have that information, sir."
+
+    _duration_words returned "" for anything under an hour, so three of his
+    four daily classes (all 50-minute lectures -- 9:10-10:00 BIOSENSORS) went
+    into the tool text with no length at all and the question was genuinely
+    unanswerable.  The duration is derivable from start and end; say it."""
+    start = NOW.replace(hour=9, minute=10)
+    fifty = calendar.Event(start=start, end=start + timedelta(minutes=50),
+                           title="BIOSENSORS")
+    assert format_events([fifty], "today", NOW) == \
+        "Today: 9:10 am BIOSENSORS for 50 minutes; nothing else."
+    quarter = calendar.Event(start=start, end=start + timedelta(minutes=15),
+                             title="Standup")
+    assert "for 15 minutes" in format_events([quarter], "today", NOW)
+    # A zero-length marker is not a booking: still no length.
+    marker = calendar.Event(start=start, end=start, title="Rent due")
+    assert format_events([marker], "today", NOW) == \
+        "Today: 9:10 am Rent due; nothing else."
+    # The hour-and-over wording is untouched.
+    two = calendar.Event(start=start, end=start + timedelta(minutes=110),
+                         title="BIOSENSORS")
+    assert "for about 2 hours" in format_events([two], "today", NOW)
+
+
+def test_get_calendar_description_offers_duration():
+    """The model picks the tool from its description alone.  Nothing in the
+    tool list mentioned how long anything lasts, so "how long is my
+    biosensors lab tomorrow?" was routed local:question and answered from
+    nothing rather than from get_calendar."""
+    cal = next(sp for sp in calendar.make_tools(FakeCfg(), SimpleNamespace())
+               if sp.name == "get_calendar")
+    assert "how long" in cal.description.lower()
+    assert "what's on today" in cal.description.lower()   # still wins the day word
+    assert cal.description_words() <= 20

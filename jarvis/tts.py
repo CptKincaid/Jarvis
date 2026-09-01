@@ -664,18 +664,171 @@ def retire_own_f5_sidecar() -> bool:
         _f5_lock.release()
 
 
-OUTPUT_GAIN = 1.34               # ~+2.5 dB; peak 0.72 -> ~0.97
+# Per-engine OUTPUT gain. Level is fixed HERE, on the render, and never on
+# the reference clip -- loudness-normalising the reference lost a listening
+# test twice (tests/test_found_quiet_and_fast_voice.py).
+#
+# SYMPTOM, 2026-08-31: "his voice is quiet for some reason now". The reason
+# is the 08-30 cutover from the hosted Fish voice to the local F5 sidecar.
+# XTTS was the only engine whose render ever passed through
+# apply_output_gain, and F5 took its place without inheriting it. F5 clones
+# the reference's LEVEL along with its timbre, and reference clip 0341 sits
+# at peak 0.303 / -26.8 dBFS RMS -- so every reply came out there too.
+# Measured across all 400 renders sitting in his live speech cache:
+#
+#     peak  p50 0.273   p95 0.329   p99 0.347   MAX 0.353
+#
+# against the ~0.97 peak the XTTS path was tuned to hit. That is ~9 dB of
+# missing level and it is the whole regression; nothing about the voice
+# itself changed.
+#
+# 2.8 is the largest gain that never reaches the ceiling on that measured
+# corpus (0.353 * 2.8 = 0.988), so no chunk is ever pulled back and the
+# level cannot pump between chunks of one sentence -- the constant-gain rule
+# above, kept.
+#
+# fish and edge stay at 1.0: the hosted Fish render is the one that was
+# blind-approved at its own level, and neither has been measured from here.
+ENGINE_OUTPUT_GAIN = {"xtts": 1.34, "f5": 2.8}
+OUTPUT_GAIN = ENGINE_OUTPUT_GAIN["xtts"]   # ~+2.5 dB; peak 0.72 -> ~0.97
 _CEILING = 0.99
 
 
-def apply_output_gain(wav):
+def output_gain_for(engine: str) -> float:
+    """The constant output gain for ``engine``; 1.0 means leave it alone."""
+    return ENGINE_OUTPUT_GAIN.get(engine, 1.0)
+
+
+def apply_output_gain(wav, gain: float | None = None):
     """Raise the rendered level without touching timbre or dynamics."""
     import numpy as np
-    out = np.asarray(wav, dtype=np.float32) * OUTPUT_GAIN
+    out = np.asarray(wav, dtype=np.float32) * (
+        OUTPUT_GAIN if gain is None else gain)
     peak = float(np.abs(out).max()) if out.size else 0.0
     if peak > _CEILING:          # rare outlier: scale it just under the rail
         out *= _CEILING / peak
     return out
+
+
+def gain_wav_file(path: str, gain: float) -> bool:
+    """Apply a constant output gain to a rendered wav in place.
+
+    For engines that hand back a FILE rather than samples (the F5 sidecar
+    writes the wav itself). Best-effort: a level that could not be raised is
+    a quiet reply, but a raised exception here would be silence, and silence
+    from Jarvis reads as a broken assistant."""
+    if gain == 1.0:
+        return False
+    try:
+        import soundfile as sf
+        data, rate = sf.read(path, dtype="float32", always_2d=False)
+        if data.size == 0:
+            return False
+        sf.write(path, apply_output_gain(data, gain), rate)
+        return True
+    except Exception:
+        log.exception("output gain failed for %s; playing it as rendered",
+                      path)
+        return False
+
+
+# ------------------------------------------- transcript vs what is spoken
+#
+# HIS OWN REQUEST, 2026-08-31: "Set up a way to catch what the transcript
+# says vs what he actually says and compare the two and do a bunch of runs
+# on that."
+#
+# The card shows the reply as authored. The room hears it after
+# _clean_for_speech and the pronunciation pass have rewritten it. Most of
+# that gap is deliberate ("18%" -> "18 percent"), but three of the defects
+# he hit in one evening lived in exactly this gap and NOTHING logged them:
+#
+#   "Four on your shopping list, sir: milk, milk, eggs, and and bread."
+#   "Sir, your 30-second 30 seconds timer timer is up."
+#   a reply silently cut at MAX_SPEAK_LENGTH, with the card still showing
+#   the whole thing.
+#
+# They were invisible because the only record was `speaking (f5): %.60s`,
+# which prints 60 characters of the text BEFORE the rewrite -- not what was
+# said. So the comparison lives here, runs on the live path, and is the same
+# code scripts/speech_diff.py runs over a corpus of his own phrasings.
+
+_SPEECH_WORD_RX = re.compile(r"[A-Za-z0-9']+")
+
+# Doubling a word is nearly always a bug ("timer timer"), but English does
+# it on purpose in a few places, and flagging those would train him to
+# ignore the warning.
+_LEGIT_DOUBLES = frozenset({"had", "that", "very", "no", "so", "long"})
+
+
+def speech_words(text: str) -> list[str]:
+    """The words of ``text`` as spoken: lowercase, punctuation dropped."""
+    return [w for w in (m.group(0).lower().strip("'")
+                        for m in _SPEECH_WORD_RX.finditer(text or "")) if w]
+
+
+def _stem(word: str) -> str:
+    """Crude singular stem: ONE trailing "s" only.
+
+    Enough to see that "30-second" and "30 seconds" are the same phrase said
+    twice, and short enough not to collapse "process"/"processes" into a
+    false stutter."""
+    return word[:-1] if len(word) > 3 and word.endswith("s") else word
+
+
+def stutters(text: str, max_phrase: int = 3) -> list[str]:
+    """Phrases said twice in a row -- the "timer timer" family.
+
+    A property of ONE line, not of a diff: the shopping-list reply carried
+    "milk, milk" and "and and" all the way from the tool that built it, so
+    the card and the speech agreed and only this catches it. Compared on
+    stems, because the real timer line was "your 30-second 30 seconds timer
+    timer is up" -- the same phrase twice in two spellings.
+
+    Longest repeat first, and a phrase is reported once: "30 second 30
+    seconds" is one fault, not one per word."""
+    words = speech_words(text)
+    stems = [_stem(w) for w in words]
+    found: list[str] = []
+    covered: set[int] = set()
+    for n in range(max_phrase, 0, -1):
+        for i in range(len(stems) - 2 * n + 1):
+            if covered & set(range(i, i + 2 * n)):
+                continue
+            if stems[i:i + n] != stems[i + n:i + 2 * n]:
+                continue
+            if n == 1 and (words[i] in _LEGIT_DOUBLES or len(words[i]) == 1):
+                # A single repeated letter is the pronunciation pass
+                # spelling something out -- "XTTS" becomes "X T T S", and
+                # the doubled T there is correct.
+                continue
+            found.append(" ".join(words[i:i + 2 * n]))
+            covered |= set(range(i, i + 2 * n))
+    return found
+
+
+def speech_divergence(shown: str, spoken: str) -> list[str]:
+    """How the SPOKEN form differs from the text on the card, in words.
+
+    Empty when the room hears what the transcript says. Substitutions are
+    not reported -- rewriting "18%" as "18 percent" is the point of the
+    pronunciation pass. What is reported is content that only one side has:
+    words the card shows and the room never hears (the dangerous direction),
+    and words spoken that the card never showed."""
+    import difflib
+    shown_w, spoken_w = speech_words(shown), speech_words(spoken)
+    if shown_w and not spoken_w:
+        return ["nothing is spoken at all"]
+    notes: list[str] = []
+    matcher = difflib.SequenceMatcher(a=shown_w, b=spoken_w, autojunk=False)
+    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+        if tag == "delete":
+            gone = shown_w[i1:i2]
+            where = "the tail is" if i2 == len(shown_w) else "dropped:"
+            notes.append(f"{where} not spoken: {' '.join(gone)}")
+        elif tag == "insert":
+            notes.append(f"spoken but not shown: {' '.join(spoken_w[j1:j2])}")
+    return notes
 
 
 class TTS:
@@ -714,6 +867,7 @@ class TTS:
         self._prewarm_thread: threading.Thread | None = None
         self._f5_warm_thread: threading.Thread | None = None
         self.last_text = ""                    # last cleaned utterance queued
+        self.last_shown = ""                   # ...as the transcript showed it
         self.interrupts = 0                    # barge-ins that cut speech
         self._worker = threading.Thread(
             target=self._worker_loop, daemon=True, name="tts-worker")
@@ -949,9 +1103,14 @@ class TTS:
         """
         if not text or not text.strip():
             return None
+        shown = text                      # what the transcript card shows
         text = self._clean_for_speech(text)
         if not text:
+            log.warning("nothing survived cleaning; saying nothing: %.120s",
+                        shown)
             return None
+        self.last_shown = shown
+        self._note_divergence(shown, text, "cleaning")
         self.last_text = text
         done = threading.Event()
         self._q.put((text, done))
@@ -1194,25 +1353,65 @@ class TTS:
             log.exception("pronunciation apply failed")
             return text
 
+    def _note_divergence(self, shown: str, spoken: str, stage: str) -> None:
+        """Log it when the room will not hear what the card says.
+
+        WARNING only for the dangerous direction -- content the transcript
+        shows and the speech drops. The other direction is usually the
+        engine pads and the pronunciation pass doing their job, so it is
+        DEBUG: warning on it would train him to ignore the warning."""
+        try:
+            notes = speech_divergence(shown, spoken)
+        except Exception:
+            log.exception("divergence check failed")
+            return
+        if not notes:
+            return
+        lost = [n for n in notes if "not spoken" in n]
+        if lost:
+            log.warning("speech diverges from the transcript (%s): %s "
+                        "| shown=%r spoken=%r",
+                        stage, "; ".join(lost), shown, spoken)
+        else:
+            log.debug("speech differs from the transcript (%s): %s",
+                      stage, "; ".join(notes))
+
+    def spoken_form(self, text: str) -> str:
+        """Exactly the text the engine will be handed for ``text``.
+
+        The room's own two steps, in the room's own order, with nothing
+        that touches audio -- so a harness can compare the transcript
+        against the speech without a GPU, a speaker or a running app."""
+        cleaned = self._clean_for_speech(text or "")
+        return self._pronounce(cleaned) if cleaned else ""
+
     def _cache_key(self, engine: str, spoken: str) -> str:
         if engine == "fish":
             _key, model = _fish_creds()
             return SpeechCache.key("fish", spoken, model=model or "none",
                                    backend=FISH_BACKEND)
+        # gain= is in the key for the same reason nfe_step and speed are: it
+        # changes the AUDIO. Without it the 400 pre-fix renders in his cache
+        # would have gone on playing at the old quiet level for every line
+        # he had already heard once, and the fix would have looked like it
+        # only half worked.
         if engine == "f5":
             try:
                 st = F5_REF.stat()
                 ref = f"{st.st_size}:{int(st.st_mtime)}"
             except OSError:
                 ref = "none"
-            return SpeechCache.key("f5", spoken, ref=ref, **F5_PARAMS)
+            return SpeechCache.key("f5", spoken, ref=ref,
+                                   gain=output_gain_for("f5"), **F5_PARAMS)
         if engine == "xtts":
             try:
                 st = VOICE_REF.stat()
                 ref = f"{st.st_size}:{int(st.st_mtime)}"
             except OSError:
                 ref = "none"
-            return SpeechCache.key("xtts", spoken, ref=ref, **XTTS_PARAMS)
+            return SpeechCache.key("xtts", spoken, ref=ref,
+                                   gain=output_gain_for("xtts"),
+                                   **XTTS_PARAMS)
         return SpeechCache.key("edge", spoken, voice=EDGE_VOICE,
                                rate=EDGE_RATE, pitch=EDGE_PITCH)
 
@@ -1258,7 +1457,8 @@ class TTS:
         cleaned = self._clean_for_speech(text or "")
         if not cleaned.strip():
             return []
-        return self._split_sentences(self._pronounce(cleaned))
+        return self._split_sentences(self._pronounce(cleaned),
+                                     engine=self.render_engine())
 
     def render(self, text: str) -> "Rendition":
         """Jarvis's voice for ``text``, for a device that is not this room."""
@@ -1271,18 +1471,27 @@ class TTS:
         self._stop_flag = False
 
         spoken = self._pronounce(text)
+        # The engine gets `spoken`, so that is what the log prints. It used
+        # to print `text` (pre-pronunciation) truncated to 60 characters,
+        # which is why a whole evening of divergences left no trace.
+        self._note_divergence(text, spoken, "pronunciation")
+        doubled = stutters(spoken)
+        if doubled:
+            log.warning("said twice in a row: %s -- in %r",
+                        "; ".join(doubled), spoken)
         # load() may have fallen back to edge, so re-check the engine here.
         if self._engine in ("f5", "fish"):
-            log.info("speaking (%s): %.60s", self._engine, text)
+            log.info("speaking (%s): %.120s", self._engine, spoken)
             self._speak_pipelined(spoken, self._engine)
             return
         if self._engine == "xtts" and self._xtts is not None:
-            log.info("speaking (xtts): %.60s", text)
+            log.info("speaking (xtts): %.120s", spoken)
             self._speak_pipelined(spoken, "xtts")
             return
 
         cached = self._cached("edge", spoken)
-        log.info("speaking (edge%s): %.60s", ", cached" if cached else "", text)
+        log.info("speaking (edge%s): %.120s",
+                 ", cached" if cached else "", spoken)
         path = cached
         tmp_name = None
         try:
@@ -1332,7 +1541,7 @@ class TTS:
         """
         synth = {"f5": self._synth_f5, "fish": self._synth_fish}.get(
             engine, self._synth_xtts)
-        chunks = self._split_sentences(text)
+        chunks = self._split_sentences(text, engine=engine)
         wav_q: queue.Queue = queue.Queue()
         _DONE = object()
         streaming = engine == "fish" and FISH_STREAM_PLAYBACK
@@ -1510,8 +1719,56 @@ class TTS:
     # keeps a margin for XTTS's run-to-run sampling variance.
     _CHUNK_GROWTH = 2.5
 
+    # SYMPTOM, 2026-08-31: "Jarvis gets monotone with long sentences or
+    # lists." Both numbers above were fitted to XTTS, and the second pass
+    # they drive cuts a sentence apart AT ITS COMMAS. On his own calendar
+    # line that means the list is rendered as two independent utterances:
+    #
+    #   "There is BIOSENSORS at 9:10 am, MAGNETIC RESONANCE ENGR at 12:40 pm,"
+    #   "an ELECTRICAL DESIGN LAB II presentation at 4:10 pm, and a BMEN 427
+    #    lab due Saturday."
+    #
+    # Each one is a fresh utterance to the engine, so the pitch RESETS at the
+    # comma. Measured against the live sidecar (autocorrelation F0, 2026-08-31):
+    #
+    #   chunk 2 alone      head 128 Hz  tail 126 Hz  F0 IQR 17.3   (flat)
+    #   chunk 3 alone      head 171 Hz  tail 120 Hz  F0 IQR 35.8   (restarts)
+    #   whole sentence     head 125 Hz  tail 100 Hz  F0 IQR 22.7   (declines)
+    #
+    # i.e. splitting throws away the sentence's declination, flattens the
+    # first half, and jumps +45 Hz mid-clause going into the second. That is
+    # the "monotone on lists" he heard, and it is chunking, not the voice:
+    # scripts/f5_server.py already records that the same seed produced both
+    # the clips heard as varied and the clips heard as monotone.
+    #
+    # The split is not wrong, it is calibrated for the WRONG ENGINE. Measured
+    # against the resident F5 sidecar (2026-08-31, 3 renders):
+    #
+    #   68 chars -> 0.42 s wall / 4.09 s audio      RTF 0.103
+    #   85 chars -> 0.47 s wall / 5.11 s audio      RTF 0.092
+    #  162 chars -> 0.61 s wall / 9.74 s audio      RTF 0.063
+    #
+    # F5 is ~3-4x faster than real time per character than XTTS, so its
+    # break-even growth is ~11x, not 3.44x, and a whole 162-char sentence
+    # renders in 0.61 s. The comma pass buys F5 nothing and costs it the
+    # prosody. 240/6.0 keeps one ordinary sentence whole (his longest real
+    # calendar line is 162 chars) while leaving the mechanism in place for a
+    # genuinely runaway paragraph. XTTS, edge and fish keep the numbers that
+    # were measured for them.
+    _ENGINE_CHUNKING = {"f5": (240, 6.0)}
+
+    def _chunk_limits(self, engine: str | None = None) -> tuple[int, float]:
+        """(max_chars, growth) for ``engine``. getattr, not self._engine:
+        test_tts_speak_queue exercises the text path on a bare
+        TTS.__new__(TTS) that has no engine yet."""
+        if engine is None:
+            engine = getattr(self, "_engine", "") and self.render_engine()
+        return self._ENGINE_CHUNKING.get(
+            engine, (self._MAX_CHUNK_CHARS, self._CHUNK_GROWTH))
+
     def _split_sentences(self, text: str, min_chars: int = 20,
-                         max_chars: int | None = None) -> list[str]:
+                         max_chars: int | None = None,
+                         engine: str | None = None) -> list[str]:
         """Split text into chunks for pipelined synthesis.
 
         Splits on [.!?;]+whitespace, keeps common abbreviations (Mr. / e.g. /
@@ -1525,7 +1782,8 @@ class TTS:
         (2026-08-28 13:02). Smaller chunks keep the producer ahead.
         """
         parts = re.split(r'(?<=[.!?;])\s+', text)
-        max_chars = self._MAX_CHUNK_CHARS if max_chars is None else max_chars
+        engine_max, growth = self._chunk_limits(engine)
+        max_chars = engine_max if max_chars is None else max_chars
         chunks: list[str] = []
         buf = ""
         for part in parts:
@@ -1557,7 +1815,7 @@ class TTS:
             if prev is None:
                 return max_chars
             return max(min_chars, min(max_chars,
-                                      int(self._CHUNK_GROWTH * len(prev))))
+                                      int(growth * len(prev))))
 
         out: list[str] = []
         for chunk in chunks:
@@ -1811,6 +2069,11 @@ class TTS:
                             "speed": F5_PARAMS["speed"]})
         if not resp.get("ok"):
             raise RuntimeError(f"f5 synthesis failed: {resp.get('error')}")
+        # The sidecar renders at the reference clip's level (~ -27 dBFS), so
+        # the gain is applied to the file it just wrote -- see
+        # ENGINE_OUTPUT_GAIN. It happens before _store(), so the cache holds
+        # the audio that will actually be played.
+        gain_wav_file(out_path, output_gain_for("f5"))
         return resp
 
     def _synth_edge(self, text: str, out_path: str):
@@ -1863,7 +2126,9 @@ class TTS:
                 pass
 
         if all_wav:
-            sf.write(out_path, apply_output_gain(np.concatenate(all_wav)),
+            sf.write(out_path,
+                     apply_output_gain(np.concatenate(all_wav),
+                                       output_gain_for("xtts")),
                      24000)
 
     # ---------------------------------------------------------- cleaning

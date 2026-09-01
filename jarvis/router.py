@@ -89,7 +89,23 @@ _WEB_CUE_RX = re.compile(
     r".+? open (?:right )?(?:today|now|tonight|tomorrow|at the moment)\b|"
     r"when (?:does|is|did|will) (?!(?:my |the |our |that )?(?:next )?"
     r"(?:meeting|class|call|appointment|lecture|standup|event|timer|alarm|reminder|session|build)\b)"
-    r".+? (?:come out|release|premiere|air)\b)",
+    r".+? (?:come out|release|premiere|air)\b|"
+    # A fixture: "When is Texas A&M playing Arizona?" (live, 2026-08-31
+    # 21:24). It routed local:question and gemma answered "I'm afraid I
+    # don't know when those teams are playing, sir" -- twice -- until he
+    # said "you should be able to look that up", which is the only reason
+    # the web ever ran. A kickoff time is a current fact no local tool
+    # holds, so the shape itself is the cue. The same exclusion list as
+    # the release branch keeps his OWN diary ("when is my next class")
+    # out of it, and "who is playing" needs an object so a bare
+    # "what's playing" stays with Spotify (local_strong wins anyway).
+    r"when (?:is|are|do|does|did|will) "
+    r"(?!(?:my |the |our |that )?(?:next )?"
+    r"(?:meeting|class|call|appointment|lecture|standup|event|timer|alarm|"
+    r"reminder|session|build|song|track|album|playlist)\b)"
+    r".+?\bplay(?:ing|s)?\b|"
+    r"who (?:is|are|do|does|will) (?!i\b)"
+    r".+?\bplay(?:ing|s)?\b\s+\S)",
     re.I)
 WEB_CUE_RX = _WEB_CUE_RX          # the commander's intent gate reads it too
 

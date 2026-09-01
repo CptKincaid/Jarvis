@@ -793,3 +793,27 @@ def test_feed_due_is_the_fetch_due_shape():
     assert rows[0]["due"] == _local(3, 23, 59)
     assert cv.due_sheet(rows, 7, NOW) == \
         "Due this week (1):\n1) MSEN 222 - HW#1, Thu 11:59 pm"
+
+
+def test_a_possessive_course_name_still_finds_the_exam():
+    """LIVE 2026-08-31 21:00, word for word: "How many days until my
+    biosensor's midterm?"
+
+    Whisper writes the apostrophe he says, so the needle came out as
+    "biosensor's" -- not a substring of "ECEN 414 BIOSENSORS" -- and
+    next_exam returned None for an exam that was on the books.  He then
+    asked "When is my next quiz?" and got the Prelab, which is not a
+    midterm, and wrote the pair down as one bug.  The possessive and a
+    trailing plural both come off before the substring test."""
+    items = [_due_item("Midterm 1", _local(6, 9, 0), course="ECEN 414 BIOSENSORS")]
+    for said in ("how many days until my biosensor's midterm",
+                 "biosensors midterm", "biosensor midterm",
+                 "when's my biosensors' midterm"):
+        got = cv.next_exam(items, [], NOW, said)
+        assert got and got["title"] == "Midterm 1", said
+    # The needle still has to be about THIS course.
+    assert cv.next_exam(items, [], NOW, "chemistry midterm") is None
+    # And a kind word with a possessive still names its kind.
+    quiz = [_due_item("Quiz 2", _local(2, 9, 0), course="ECEN 414 BIOSENSORS")]
+    assert cv.next_exam(quiz, [], NOW, "my biosensor's quiz")["title"] == "Quiz 2"
+    assert cv.next_exam(quiz, [], NOW, "my biosensor's midterm") is None

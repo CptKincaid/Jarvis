@@ -39,7 +39,7 @@ class FakeRun:
         return [c for c in self.calls if "set-sink-input-volume" in c]
 
 
-def mixer(tmp_path, run=None, **cfg):
+def mixer(tmp_path, run=None, remote=None, **cfg):
     settings = {"audio.duck": True, "audio.duck_level": 30,
                 "audio.duck_ramp_ms": 0}
     settings.update(cfg)
@@ -48,7 +48,27 @@ def mixer(tmp_path, run=None, **cfg):
                         state_path=tmp_path / "mixer.json",
                         registry=mx.PidRegistry(),
                         ppid_of=lambda pid: None,
-                        sleep=lambda s: None, now=lambda: 1000.0)
+                        sleep=lambda s: None, now=lambda: 1000.0,
+                        remote=remote)
+
+
+class FakeRemote:
+    """A stand-in for jarvis.tools.spotify.SpotifyTool's duck()/unduck()."""
+
+    def __init__(self, ok=True, boom=False):
+        self.ok, self.boom = ok, boom
+        self.ducked: list = []
+        self.unducked = 0
+
+    def duck(self, pct):
+        if self.boom:
+            raise RuntimeError("spotify is down")
+        self.ducked.append(pct)
+        return self.ok
+
+    def unduck(self):
+        self.unducked += 1
+        return True
 
 
 # ---------------------------------------------------------------- parsing
@@ -350,3 +370,106 @@ def test_registry_ignores_rubbish(pid):
     reg.add(pid)
     reg.discard(pid)
     assert reg.snapshot() == set()
+
+
+# ------------------------------------------------- #72 the remote Connect duck
+# "He also cant discern my voice from the vocalists in the music."  On the
+# evening of the test the ONLY local sink-input was the idle librespot pipe --
+# the music he could hear was on HPCOMPUTER, a Spotify Connect device, where
+# pactl reaches nothing.  So `mixer: ducked 1 stream(s) to 30%` sat in the log
+# while the music stayed exactly where it was.  When there is nothing local
+# worth ducking, the Connect device's own volume is the only handle left.
+def test_remote_duck_fires_when_there_is_nothing_local(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote()
+    run = FakeRun(dump="")                       # no sink-inputs at all
+    m = mixer(tmp_path, run=run, remote=remote)
+    m.on_recording_started()
+    m.pump()
+    assert remote.ducked == [30]
+    assert run.writes == []                      # nothing local was touched
+    m.on_recording_stopped()
+    m.pump()
+    assert remote.unducked == 1
+
+
+def test_remote_duck_restore_edge_fires_without_a_local_duck(tmp_path, monkeypatch):
+    """A remote-only duck leaves self._ducked empty; without the remote flag
+    in pump() the restore edge never fires and his Spotify volume stays at
+    30% of where he left it."""
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote()
+    m = mixer(tmp_path, run=FakeRun(dump=""), remote=remote)
+    m.on_speaking(SimpleNamespace(active=True))
+    m.pump()
+    m.pump()                                     # a second pass must not re-duck
+    assert remote.ducked == [30]
+    m.on_speaking(SimpleNamespace(active=False))
+    m.pump()
+    assert remote.unducked == 1
+
+
+def test_local_streams_still_win_over_the_remote(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote()
+    run = FakeRun()                              # the real dump: 2 streams
+    m = mixer(tmp_path, run=run, remote=remote)
+    m.on_recording_started()
+    m.pump()
+    assert run.writes and remote.ducked == []
+
+
+def test_remote_duck_is_suppressed_by_room_control_off(tmp_path, monkeypatch):
+    """conftest sets JARVIS_ROOM_CONTROL=0 because the suite builds the REAL
+    app; a remote duck must not reach across the network and turn down music
+    he is actually listening to."""
+    monkeypatch.setenv("JARVIS_ROOM_CONTROL", "0")
+    remote = FakeRemote()
+    m = mixer(tmp_path, run=FakeRun(dump=""), remote=remote)
+    m.on_recording_started()
+    m.pump()
+    assert remote.ducked == []
+
+
+def test_a_broken_remote_never_breaks_the_mixer(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote(boom=True)
+    m = mixer(tmp_path, run=FakeRun(dump=""), remote=remote)
+    m.on_recording_started()
+    m.pump()
+    m.on_recording_stopped()
+    m.pump()
+    assert remote.unducked == 0                  # nothing to put back
+
+
+def test_stop_restores_the_remote_too(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote()
+    m = mixer(tmp_path, run=FakeRun(dump=""), remote=remote)
+    m.on_recording_started()
+    m.pump()
+    m.stop()
+    assert remote.unducked == 1
+
+
+def test_no_remote_configured_is_the_old_stand_down(tmp_path, monkeypatch):
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    run = FakeRun(dump="")
+    m = mixer(tmp_path, run=run)
+    m.on_recording_started()
+    m.pump()
+    m.on_recording_stopped()
+    m.pump()
+    assert run.writes == []
+
+
+def test_set_remote_wires_the_ducker_after_construction(tmp_path, monkeypatch):
+    """app.py builds the mixer before the tools, so services.spotify cannot be
+    passed to __init__; the wiring has to be a post-hoc call (#72)."""
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote()
+    m = mixer(tmp_path, run=FakeRun(dump=""))
+    m.set_remote(remote)
+    m.on_recording_started()
+    m.pump()
+    assert remote.ducked == [30]

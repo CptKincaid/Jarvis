@@ -979,10 +979,13 @@ class CommandBar(tk.Frame):
     44px circular mic button (the terminal sits LEFT of the mic).
 
     Enter publishes UserUtterance(text, source='typed') on the bus and
-    calls on_submit(text) when provided. The mic button calls on_mic() and
-    supports states idle / recording / disabled (set_mic_state). The
-    terminal button calls on_terminal() and supports idle / open /
-    working / waiting / disabled (set_terminal_state)."""
+    calls on_submit(text) when provided. Up/Down walk the typed-command
+    history through on_history(-1) / on_history(+1) (shell semantics: Up
+    from the newest backwards, Down forwards, None past the newest = an
+    empty field). The mic button calls on_mic() and supports states idle /
+    recording / disabled (set_mic_state). The terminal button calls
+    on_terminal() and supports idle / open / working / waiting / disabled
+    (set_terminal_state)."""
 
     PLACEHOLDER = "Type a command"                         # hotword off / no mic
     PLACEHOLDER_HOT = "Type a command — or say “Jarvis”"    # hotword on
@@ -994,12 +997,14 @@ class CommandBar(tk.Frame):
     def __init__(self, parent, on_submit: Optional[Callable] = None,
                  on_mic: Optional[Callable] = None,
                  on_terminal: Optional[Callable] = None,
+                 on_history: Optional[Callable] = None,
                  terminal_available: bool = True, **kw):
         super().__init__(parent, bg=theme.SURFACE, height=px(64), **kw)
         self.pack_propagate(False)
         self.on_submit = on_submit
         self.on_mic = on_mic
         self.on_terminal = on_terminal
+        self.on_history = on_history
         self._mic_state = "idle"
         self._term_state = "idle" if terminal_available else "disabled"
         self._term_available = terminal_available
@@ -1028,6 +1033,7 @@ class CommandBar(tk.Frame):
         self.entry.bind("<FocusIn>", self._focus_in, add=True)
         self.entry.bind("<FocusOut>", self._focus_out, add=True)
         self.entry.bind("<Return>", self._submit, add=True)
+        self._bind_history(self.entry)
 
         # --- circular mic button (44px design) -----------------------
         self.mic = tk.Canvas(self, width=px(44), height=px(44),
@@ -1124,6 +1130,65 @@ class CommandBar(tk.Frame):
         if self._showing_placeholder:
             self.entry.delete(0, "end")
             self.entry.insert(0, self._placeholder)
+
+    # -------------------------------------------------------- history
+    def _bind_history(self, entry):
+        """#135 "typed-command history — arrow keys do nothing".
+
+        jarvis/history.py's prev()/next() were written for exactly these
+        two keys ("the command bar's Up/Down navigation" is in its module
+        docstring) and nothing was ever bound to them: the store, the
+        cursor and the JSONL file all worked, the feature had no consumer.
+
+        A method rather than two lines in __init__ so the wire can be
+        asserted without a display (tests/test_ui_turn_control.py)."""
+        entry.bind("<Up>", self._history_prev, add=True)
+        entry.bind("<Down>", self._history_next, add=True)
+
+    def _history_prev(self, _e=None):
+        return self._history_step(-1)
+
+    def _history_next(self, _e=None):
+        return self._history_step(1)
+
+    def _history_step(self, delta: int):
+        """Put the neighbouring history entry in the field.
+
+        Returns "break" whenever a provider is wired, so Tk's own Entry
+        binding (Up/Down move the insert cursor to the start/end of the
+        line) cannot also fire and leave the caret somewhere surprising.
+        With nothing wired it returns None and the default behaviour is
+        untouched."""
+        if self.on_history is None:
+            return None
+        try:
+            text = self.on_history(delta)
+        except Exception:
+            log.exception("on_history failed")
+            return "break"
+        self.set_text(text or "")
+        return "break"
+
+    def set_text(self, text: str):
+        """Replace the field's contents (history recall).
+
+        An empty string CLEARS the field without putting the grey
+        placeholder back -- that is Down past the newest entry, where the
+        caret is still in the box and hint text under a live caret reads
+        as content he would have to delete. _focus_out restores the
+        placeholder when he leaves the field, as it always did."""
+        self.entry.delete(0, "end")
+        if text:
+            self.entry.configure(fg=theme.INK)
+            self._showing_placeholder = False
+            self.entry.insert(0, text)
+            self.entry.icursor("end")
+        else:
+            # Not the placeholder unless the field has also lost focus:
+            # showing grey hint text under a live caret reads as content
+            # he would then have to delete.
+            self._showing_placeholder = False
+            self.entry.configure(fg=theme.INK)
 
     def _submit(self, _e=None):
         if self._showing_placeholder:

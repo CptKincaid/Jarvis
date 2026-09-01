@@ -569,6 +569,25 @@ _EXAM_KINDS = {"exam": ("exam", "exams", "midterm", "midterms", "final", "finals
                "quiz": ("quiz", "quizzes")}
 _EXAM_WORDS = {w: k for k, words in _EXAM_KINDS.items() for w in words}
 _SPECIFIC = {"midterm": "midterm", "midterms": "midterm", "final": "final", "finals": "final"}
+# Whisper writes what he says, apostrophe and all. LIVE 2026-08-31 21:00:
+# "How many days until my biosensor's midterm?" -- the needle came out as
+# "biosensor's", which is not a substring of "ECEN 414 BIOSENSORS", so
+# next_exam matched nothing while "biosensors midterm" matched fine. The
+# possessive and a trailing plural both have to come off before the
+# substring test, and off the kind words too ("my finals'").
+_POSSESSIVE_RX = re.compile(r"(?:'s|s'|')$")
+
+
+def _bare(word: str) -> str:
+    """A query word without its possessive: "biosensor's" -> "biosensor"."""
+    return _POSSESSIVE_RX.sub("", word)
+
+
+def _stem(word: str) -> str:
+    """``_bare`` plus a trailing plural, for substring matching only:
+    "biosensors" -> "biosensor", which is still inside "BIOSENSORS"."""
+    w = _bare(word)
+    return w[:-1] if len(w) > 3 and w.endswith("s") else w
 _WORD_RX = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
 # Question filler that must not become a title filter ("how long until
 # the biosensors midterm" -> just "biosensors").
@@ -635,10 +654,10 @@ def next_exam(items: list, events: list, now: datetime, query: str = "") -> Opti
     midterm", "quiz"), or None. Kind words in the query pick the kind
     (exam words never match a quiz and vice versa; no kind word -> exams
     only); every other content word must appear in the course or title."""
-    words = _WORD_RX.findall(str(query or "").lower())
+    words = [_bare(w) for w in _WORD_RX.findall(str(query or "").lower())]
     kinds = {_EXAM_WORDS[w] for w in words if w in _EXAM_WORDS} or {"exam"}
-    needles = [w for w in words if w not in _EXAM_WORDS and w not in _QUERY_STOP
-               and len(w) > 1]
+    needles = [_stem(w) for w in words
+               if w not in _EXAM_WORDS and w not in _QUERY_STOP and len(w) > 1]
     # "final" and "midterm" name a particular exam: "when's my next final"
     # must not answer with the midterm. "exam" alone is generic.
     specific = {_SPECIFIC[w] for w in words if w in _SPECIFIC}

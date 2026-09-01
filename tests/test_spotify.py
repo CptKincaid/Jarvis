@@ -325,6 +325,12 @@ def test_coerce_kind(value, kind):
     ("Blinding Lights", "Blinding Lights", None),
     ("Dancing on My Own", "Dancing on My Own", None),     # not a device word
     ("Living on a Prayer", "Living on a Prayer", None),
+    # "move it TO my phone" -- #69.  The "to" form is stricter than "on":
+    # only the LAST word may name a device, or these become handovers.
+    ("move it to my phone", "move it", "phone"),
+    ("play it over to the tv", "play it", "tv"),
+    ("Fly Me to the Moon", "Fly Me to the Moon", None),
+    ("add it to the car playlist", "add it to the car playlist", None),
 ])
 def test_split_device(query, rest, device):
     assert sp.split_device(query) == (rest, device)
@@ -650,7 +656,7 @@ def test_play_with_empty_query_resumes(reg, fake):
 
 def test_play_liked_songs_phrase_routes_to_liked(reg, fake):
     res = reg.call("spotify_play", {"query": "my liked songs"})
-    assert res.speak == "Your Liked Songs on shuffle, sir — 4 of them, on HPCOMPUTER."
+    assert res.speak == "Your Liked Songs, sir — newest first, 4 of them, on HPCOMPUTER."
 
 
 def test_track_with_two_artists_names_both():
@@ -660,22 +666,117 @@ def test_track_with_two_artists_names_both():
 
 
 # ------------------------------------------------------- liked songs
-def test_liked_uris_strategy_pages_shuffles_chunks_and_queues(tmp_path):
+# #66 -- "play my liked songs" came back SHUFFLED every time; he wants "the
+# default should be last added to liked songs and then go down, only shuffle
+# if i sp[ecify]".  /me/tracks already pages newest-added first, so the fix is
+# to stop scrambling it -- and to clear Spotify's own sticky shuffle flag,
+# which outranks the order of the uris we hand it.
+def test_liked_defaults_to_newest_added_first_and_clears_spotify_shuffle(tmp_path):
+    fake = FakeSpotify(n_saved=230)
+    res = make_tool(tmp_path, fake).liked()
+    assert res.speak == "Your Liked Songs, sir — newest first, 230 of them, on HPCOMPUTER."
+    starts = start_calls(fake)
+    assert len(starts) == 1
+    # Untouched paging order: liked-0 is the most recently added.
+    assert starts[0]["uris"] == [f"spotify:track:liked-{i}" for i in range(100)]
+    assert fake.named("shuffle") == [((False,), {"device_id": "dev-hp"})]
+
+
+def test_liked_shuffles_only_when_asked(tmp_path):
     fake = FakeSpotify(n_saved=230)
     tool = make_tool(tmp_path, fake)
-    res = tool.liked()
+    res = tool.liked(shuffle=True)
     assert res.speak == "Your Liked Songs on shuffle, sir — 230 of them, on HPCOMPUTER."
-    pages = fake.named("current_user_saved_tracks")
-    assert len(pages) == 5 and all(kw["limit"] == 50 for _, kw in pages)
     starts = start_calls(fake)
     assert len(starts) == 1 and len(starts[0]["uris"]) == 100
-    assert starts[0]["uris"] != [f"spotify:track:liked-{i}" for i in range(100)]  # shuffled
+    assert starts[0]["uris"] != [f"spotify:track:liked-{i}" for i in range(100)]
     assert len(set(starts[0]["uris"])) == 100
-    queued = fake.named("add_to_queue")
-    assert len(queued) == sp.LIKED_QUEUE_AHEAD
-    assert all(kw["device_id"] == "dev-hp" for _, kw in queued)
-    assert not set(a[0] for a, _ in queued) & set(starts[0]["uris"])
     assert fake.named("shuffle") == []                 # client-side shuffle only
+
+
+def test_liked_pages_and_chunks(tmp_path):
+    fake = FakeSpotify(n_saved=230)
+    make_tool(tmp_path, fake).liked()
+    pages = fake.named("current_user_saved_tracks")
+    assert len(pages) == 5 and all(kw["limit"] == 50 for _, kw in pages)
+
+
+# #66/#70 -- the shuffle hint has to survive the trip through spotify_play,
+# and "I don't want them shuffled" must read as ORDER even though the word
+# "shuffled" is in it.
+@pytest.mark.parametrize("text, want", [
+    ("play my liked songs", None),
+    ("play my liked songs shuffled", True),
+    ("shuffle my liked songs", True),
+    ("play my liked songs on shuffle", True),
+    ("play them randomly", True),
+    ("play my liked songs in order", False),
+    ("play my like songs playlist in order", False),
+    ("newest first please", False),
+    ("last added first", False),
+    ("I don't want them shuffled", False),
+    ("dont shuffle them", False),
+    ("no shuffle", False),
+    ("what's the weather", None),
+])
+def test_wants_shuffle(text, want):
+    assert sp.wants_shuffle(text) is want
+
+
+def test_play_liked_songs_shuffled_phrase_shuffles(tmp_path):
+    fake = FakeSpotify(n_saved=30)
+    reg = registry(make_tool(tmp_path, fake))
+    res = reg.call("spotify_play", {"query": "play my liked songs shuffled"})
+    assert res.speak == "Your Liked Songs on shuffle, sir — 30 of them, on HPCOMPUTER."
+    assert fake.named("shuffle") == []
+
+
+@pytest.mark.parametrize("query", [
+    "Play my liked songs playlist in order",
+    # Whisper's actual transcript at 21:14:37 -- note the missing "d".  It
+    # missed the liked-songs test, fell through to the playlist branch and
+    # started a stranger's public playlist called "All my liked songs".
+    "Play my like songs playlist in order",
+    "play my like songs",
+])
+def test_play_liked_songs_in_order_phrase_keeps_order(tmp_path, query):
+    fake = FakeSpotify(n_saved=30)
+    reg = registry(make_tool(tmp_path, fake))
+    res = reg.call("spotify_play", {"query": query})
+    assert res.speak == "Your Liked Songs, sir — newest first, 30 of them, on HPCOMPUTER."
+    assert start_calls(fake)[0]["uris"] == [f"spotify:track:liked-{i}" for i in range(30)]
+    assert fake.named("current_user_playlists") == []   # never a playlist search
+
+
+def test_liked_shuffle_flag_from_the_tool_schema(tmp_path):
+    fake = FakeSpotify(n_saved=30)
+    reg = registry(make_tool(tmp_path, fake))
+    spec = next(s for s in make_tool(tmp_path, fake).tools() if s.name == "spotify_liked")
+    # The old description said "Shuffle Hunter's Liked Songs" -- the model read
+    # that as the instruction it was, so every call came back shuffled (#66).
+    assert "shuffle" not in spec.description.lower().split(";")[0]
+    assert spec.parameters["properties"]["shuffle"] == {"type": "boolean"}
+    assert reg.call("spotify_liked", {"shuffle": True}).speak.startswith(
+        "Your Liked Songs on shuffle")
+    assert reg.call("spotify_liked", {}).speak.startswith("Your Liked Songs, sir")
+
+
+@pytest.mark.parametrize("value, shuffled", [
+    (None, False), ("", False), ("  ", False),   # "he did not say"
+    (True, True), ("true", True), ("on", True), ("yes", True),
+    (False, False), ("false", False), ("off", False), ("no", False),
+])
+def test_liked_shuffle_argument_forms(tmp_path, value, shuffled):
+    fake = FakeSpotify(n_saved=30)
+    res = make_tool(tmp_path, fake).liked(shuffle=value)
+    assert res.speak.startswith("Your Liked Songs on shuffle") is shuffled
+
+
+def test_liked_config_can_restore_shuffle_by_default(tmp_path):
+    cfg = {"spotify": {**CFG["spotify"], "liked_shuffle": True}}
+    fake = FakeSpotify(n_saved=30)
+    assert make_tool(tmp_path, fake, cfg=cfg).liked().speak.startswith(
+        "Your Liked Songs on shuffle")
 
 
 def test_liked_caps_at_500_and_skips_local_files(tmp_path):
@@ -692,7 +793,7 @@ def test_liked_caps_at_500_and_skips_local_files(tmp_path):
 def test_liked_collection_strategy(tmp_path):
     fake = FakeSpotify(n_saved=230)
     cfg = {"spotify": {**CFG["spotify"], "liked_strategy": "collection"}}
-    res = make_tool(tmp_path, fake, cfg=cfg).liked()
+    res = make_tool(tmp_path, fake, cfg=cfg).liked(shuffle=True)
     assert res.speak == "Your Liked Songs on shuffle, sir — on HPCOMPUTER."
     assert fake.named("shuffle") == [((True,), {"device_id": "dev-hp"})]
     assert start_calls(fake) == [{"device_id": "dev-hp",
@@ -704,19 +805,48 @@ def test_liked_collection_strategy(tmp_path):
 def test_liked_collection_falls_back_to_uris(tmp_path):
     fake = FakeSpotify(n_saved=120, collection_ok=False)
     cfg = {"spotify": {**CFG["spotify"], "liked_strategy": "collection"}}
-    res = make_tool(tmp_path, fake, cfg=cfg).liked()
+    res = make_tool(tmp_path, fake, cfg=cfg).liked(shuffle=True)
     assert res.speak == "Your Liked Songs on shuffle, sir — 120 of them, on HPCOMPUTER."
     starts = start_calls(fake)
     assert starts[0]["context_uri"] == "spotify:user:hunter:collection"
     assert len(starts) == 2 and len(starts[1]["uris"]) == 100
 
 
-def test_liked_uris_falls_back_to_collection(tmp_path):
+def test_liked_uris_falls_back_to_collection_only_when_shuffling(tmp_path):
     fake = FakeSpotify(n_saved=120, max_uris=10)        # the 100-chunk is rejected
-    res = make_tool(tmp_path, fake).liked()
+    res = make_tool(tmp_path, fake).liked(shuffle=True)
     assert res.speak == "Your Liked Songs on shuffle, sir — on HPCOMPUTER."
     starts = start_calls(fake)
     assert len(starts) == 2 and starts[1]["context_uri"] == "spotify:user:hunter:collection"
+
+    # ...but spotify:user:<id>:collection is a server-SHUFFLED context, so it
+    # can never honour "newest first": falling back to it would hand him the
+    # shuffle he just said he did not want (#66).  Fail out loud instead.
+    fake2 = FakeSpotify(n_saved=120, max_uris=10)
+    res = registry(make_tool(tmp_path, fake2)).call("spotify_liked", {})
+    assert res.ok is False
+    assert not [k for k in start_calls(fake2) if k["context_uri"]]
+
+
+# #70 -- "Queueing does not work."  The Liked Songs worker used to push 20
+# tracks into Spotify's USER queue behind the 100 it started, so his later
+# "Cue Save Your Tears next" (21:17:31) landed 21st in that queue and never
+# played next.  The queue is his; nothing here may pre-fill it.
+def test_liked_does_not_pre_fill_the_user_queue(tmp_path):
+    fake = FakeSpotify(n_saved=230)
+    make_tool(tmp_path, fake).liked()
+    assert fake.named("add_to_queue") == []
+    assert sp.LIKED_QUEUE_AHEAD == 0
+
+
+def test_queued_song_is_first_in_the_queue_after_liked_songs(tmp_path):
+    fake = FakeSpotify(n_saved=230)
+    tool = make_tool(tmp_path, fake)
+    tool.liked()
+    res = registry(tool).call("spotify_queue", {"query": "Save Your Tears"})
+    assert res.speak == "Save Your Tears by The Weeknd is up next, sir."
+    queued = [a[0] for a, _ in fake.named("add_to_queue")]
+    assert queued == ["spotify:track:t-save"]            # nothing ahead of it
 
 
 def test_liked_chunk_and_queue_ahead_are_configurable(tmp_path):
@@ -729,9 +859,10 @@ def test_liked_chunk_and_queue_ahead_are_configurable(tmp_path):
     assert len(fake.named("add_to_queue")) == 5
 
 
-def test_liked_queue_runs_on_a_worker_by_default(tmp_path):
+def test_liked_queue_runs_on_a_worker_when_enabled(tmp_path):
     fake = FakeSpotify(n_saved=130)
-    tool = sp.SpotifyTool(CFG, client=fake, token_path=tmp_path / "t.json",
+    cfg = {"spotify": {**CFG["spotify"], "liked_queue_ahead": 20}}
+    tool = sp.SpotifyTool(cfg, client=fake, token_path=tmp_path / "t.json",
                           rng=random.Random(0), settle=lambda s: None)
     import threading
     started = []
@@ -748,7 +879,7 @@ def test_liked_queue_runs_on_a_worker_by_default(tmp_path):
     for t in threading.enumerate():
         if t.name == "spotify-queue":
             t.join(timeout=2)
-    assert len(fake.named("add_to_queue")) == sp.LIKED_QUEUE_AHEAD
+    assert len(fake.named("add_to_queue")) == 20
 
 
 def test_liked_queue_stops_quietly_on_error(tmp_path):
@@ -757,6 +888,23 @@ def test_liked_queue_stops_quietly_on_error(tmp_path):
     dev = tool.resolve_device()
     fake.fail = sp.SpotifyException(500, -1, "boom")
     assert tool._queue_rest(dev, ["spotify:track:a", "spotify:track:b"]) == 0
+
+
+def test_liked_shuffle_toggle_failure_still_plays(tmp_path):
+    """A device that refuses the shuffle toggle must not cost him the music."""
+    fake = FakeSpotify(n_saved=30)
+    tool = make_tool(tmp_path, fake)
+    real = fake.shuffle
+
+    def refuse(state, device_id=None):
+        fake.calls.append(("shuffle", (state,), {"device_id": device_id}))
+        raise sp.SpotifyException(403, -1, "Player command failed: Restriction violated")
+
+    fake.shuffle = refuse
+    res = tool.liked()
+    assert res.speak.startswith("Your Liked Songs, sir — newest first")
+    assert len(start_calls(fake)) == 1
+    fake.shuffle = real
 
 
 def test_liked_empty_and_premium_is_fatal(tmp_path):
@@ -773,7 +921,8 @@ def test_liked_empty_and_premium_is_fatal(tmp_path):
 def test_liked_on_a_named_device(tmp_path):
     fake = FakeSpotify(n_saved=3)
     res = registry(make_tool(tmp_path, fake)).call("spotify_liked", {"device": "phone"})
-    assert res.speak == "Your Liked Songs on shuffle, sir — 3 of them, on Hunter's iPhone."
+    assert res.speak == \
+        "Your Liked Songs, sir — newest first, 3 of them, on Hunter's iPhone."
 
 
 # --------------------------------------------------------- transport
@@ -1260,3 +1409,95 @@ def test_live_read_only_devices_and_now_playing():
     assert res.speak and "sir" in res.speak
     if devs:
         assert tool.resolve_device(prefer_active=True).name
+
+
+# ---------------------------------------------------- #69 device transfer
+# 21:17:09 "play it on my phone" -> "I'm afraid I cannot transfer the music to
+# your phone, sir; I have no way of reaching it."  The log shows NO tool line
+# for that turn: the model answered from nothing.  Spotify Connect transfer is
+# supported and implemented; these tests pin that it is reachable from the
+# phrasing he actually used, and that the schema advertises it.
+def test_play_it_on_my_phone_transfers_instead_of_searching(tmp_path):
+    fake = FakeSpotify(devices=[
+        {"id": "dev-hp", "is_active": True, "is_restricted": False,
+         "name": "HPCOMPUTER", "type": "Computer", "volume_percent": 60},
+        {"id": "dev-phone", "is_active": False, "is_restricted": False,
+         "name": "Hunter's iPhone", "type": "Smartphone", "volume_percent": 40}])
+    res = registry(make_tool(tmp_path, fake)).call(
+        "spotify_play", {"query": "play it on my phone"})
+    assert res.ok is True
+    assert res.speak == "Moved to Hunter's iPhone, sir."
+    assert fake.named("transfer_playback") == [(("dev-phone",), {"force_play": True})]
+    # and NOT a hunt for a song called "it"
+    assert fake.named("search") == []
+
+
+@pytest.mark.parametrize("query", [
+    "play it on my phone", "play this on my phone", "move it to my phone",
+    "play the music on my phone", "it on my phone"])
+def test_pronoun_plus_device_is_always_a_handover(tmp_path, query):
+    fake = FakeSpotify(devices=[
+        {"id": "dev-hp", "is_active": True, "is_restricted": False,
+         "name": "HPCOMPUTER", "type": "Computer", "volume_percent": 60},
+        {"id": "dev-phone", "is_active": False, "is_restricted": False,
+         "name": "Hunter's iPhone", "type": "Smartphone", "volume_percent": 40}])
+    res = registry(make_tool(tmp_path, fake)).call("spotify_play", {"query": query})
+    assert res.speak == "Moved to Hunter's iPhone, sir."
+    assert fake.named("search") == []
+
+
+def test_control_schema_advertises_the_device_field(tmp_path):
+    """The model could not see that moving playback was on offer: `device` was
+    missing from spotify_control's schema entirely (#69)."""
+    spec = next(s for s in make_tool(tmp_path, FakeSpotify()).tools()
+                if s.name == "spotify_control")
+    assert spec.parameters["properties"]["device"] == {"type": "string"}
+    assert "transfer" in spec.description
+
+
+def test_transfer_to_a_device_spotify_cannot_see_is_honest(tmp_path):
+    """The honest limitation, worded as such: the phone has to be showing in
+    Spotify Connect before anything -- Jarvis or otherwise -- can reach it."""
+    fake = FakeSpotify(devices=[
+        {"id": "dev-hp", "is_active": True, "is_restricted": False,
+         "name": "HPCOMPUTER", "type": "Computer", "volume_percent": 60}])
+    res = registry(make_tool(tmp_path, fake)).call(
+        "spotify_play", {"query": "play it on my phone"})
+    assert res.ok is False
+    assert res.speak == "I can't see phone on Spotify, sir; I can see HPCOMPUTER."
+
+
+# ------------------------------------------------- #72 remote duck (Connect)
+# "He also cant discern my voice from the vocalists in the music."  The Room
+# Mixer only reaches PipeWire sink-inputs; his music was on HPCOMPUTER, where
+# pactl has no reach at all.  Spotify's own volume endpoint is the only handle.
+def test_duck_lowers_the_active_connect_device_and_restores_it(tmp_path):
+    fake = FakeSpotify()                       # dev-phone active at 40%
+    tool = make_tool(tmp_path, fake)
+    assert tool.duck(30) is True
+    assert fake.named("volume") == [((12,), {"device_id": "dev-phone"})]   # 30% of 40
+    assert tool.duck(30) is False              # already ducked; no second write
+    assert tool.unduck() is True
+    assert fake.named("volume")[-1] == ((40,), {"device_id": "dev-phone"})
+    assert tool.unduck() is False              # idempotent
+
+
+def test_duck_stands_down_when_nothing_is_active_or_already_quiet(tmp_path):
+    quiet = FakeSpotify(devices=[
+        {"id": "dev-hp", "is_active": True, "is_restricted": False,
+         "name": "HPCOMPUTER", "type": "Computer", "volume_percent": 0}])
+    tool = make_tool(tmp_path, quiet)
+    assert tool.duck(30) is False and quiet.named("volume") == []
+    idle = FakeSpotify(devices=[
+        {"id": "dev-hp", "is_active": False, "is_restricted": False,
+         "name": "HPCOMPUTER", "type": "Computer", "volume_percent": 60}])
+    assert make_tool(tmp_path, idle).duck(30) is False
+
+
+def test_duck_never_raises_and_never_strands_the_volume(tmp_path):
+    """A duck that fails must leave nothing to restore; a Free account or a
+    restricted device must cost him the duck and nothing else."""
+    fake = FakeSpotify(premium=False)
+    tool = make_tool(tmp_path, fake)
+    assert tool.duck(30) is False
+    assert tool.unduck() is False

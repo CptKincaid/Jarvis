@@ -12,6 +12,16 @@ with its callables and passes it to MainWindow(root, services):
 
     start_recording()        begin a mic recording session
     stop_recording()         stop + transcribe the current session
+    cancel_recording()       DISCARD the current session (recorder.abort):
+                             no transcript, no spoken line, no nudge. What
+                             the mic button's stop glyph does when the
+                             capture was opened by Jarvis rather than by
+                             the button (see _toggle_recording)
+    history_prev() / history_next()
+                             typed-command history for the command bar's
+                             Up/Down arrows; each returns a command string
+                             or None (None from history_next means "past
+                             the newest", i.e. an empty field)
     dispatch_text(text)      route a typed command (called off the Tk
                              thread; CommandBar ALSO publishes
                              UserUtterance(source='typed') — wire exactly
@@ -325,6 +335,13 @@ class Services:
     """Callables the app wires into the UI. See module docstring."""
     start_recording: Callable = _noop
     stop_recording: Callable = _noop
+    # A press that CANCELS the open capture instead of transcribing it.
+    # Separate from stop_recording on purpose: the two differ by whether
+    # anything is spoken afterwards, and that is the whole bug report.
+    cancel_recording: Callable = _noop
+    # Typed-command history (jarvis/history.py), for Up/Down in the entry.
+    history_prev: Optional[Callable] = None
+    history_next: Optional[Callable] = None
     dispatch_text: Optional[Callable] = None
     toggle_hotword: Callable = _noop
     quit: Optional[Callable] = None
@@ -542,6 +559,11 @@ class MainWindow:
         self.root = root
         self.services = services or Services()
         self._recording = False
+        # True only while the capture now open was started from this
+        # window (mic button / space / F5 / push-to-talk). A wake word or
+        # a follow-up window leaves it False, which is what makes the stop
+        # glyph a cancel there (_toggle_recording).
+        self._mic_opened_here = False
         self._mic_available = MACHINE.has_mic
         self._last_confidence: Optional[float] = None
         self._temps_text = ""     # written by worker thread, read by Tk loop
@@ -930,6 +952,12 @@ class MainWindow:
                                       on_submit=self._on_typed,
                                       on_mic=self._toggle_recording,
                                       on_terminal=self._open_terminal,
+                                      # None when the app half is older
+                                      # than these hooks: the bar then
+                                      # leaves Up/Down to Tk rather than
+                                      # clearing the line he is typing.
+                                      on_history=self._history_step
+                                      if self._history_available() else None,
                                       terminal_available=self._term_available)
         self.command_bar.pack(fill="x", side="bottom")
         if not self._term_available:
@@ -954,19 +982,45 @@ class MainWindow:
         self.drawer.toggle()
 
     def _toggle_recording(self):
+        """The mic button, <space> and <F5>.
+
+        While a capture is open the button is a filled disc with a STOP
+        glyph, and what that press MEANS depends on who opened the mic:
+
+        * he opened it (button / space / the daemon's synthetic F5, and
+          push-to-talk's key-up, which calls _stop_recording directly) --
+          the second press is "done, take it", so stop + transcribe;
+        * JARVIS opened it (a wake word, or the follow-up window after a
+          question) -- there is nothing to submit and the press is a
+          cancel. Hunter, 2026-08-31: "if i press cancel button on the
+          screen when he is waiting on a response he will say i didnt
+          quite get that sir". Both presses used to transcribe, so the
+          fraction of a second of room noise came back as character salad
+          and Jarvis answered it out loud -- live at 20:46:37 (1.2 s
+          clip, -4.44, "Say that again, sir?"), 20:46:56 (0.3 s, -5.84)
+          and 21:26:06 (1.0 s, -4.85). Cancelling must be silent.
+        """
         if not self._mic_available:
             self.set_status("No microphone detected", "warn")
             return
         if self._recording:
-            self._stop_recording()
+            if self._mic_opened_here:
+                self._stop_recording()
+            else:
+                self._cancel_recording()
         else:
             self._start_recording()
 
     def _start_recording(self):
+        # Set BEFORE the call: services.start_recording() publishes
+        # RecordingStarted synchronously, so _ev_rec_start can already be
+        # running by the time this returns.
+        self._mic_opened_here = True
         try:
             self.services.start_recording()
         except Exception:
             log.exception("start_recording failed")
+            self._mic_opened_here = False
             self.set_status("Recording failed to start", "error")
 
     def _stop_recording(self):
@@ -974,6 +1028,38 @@ class MainWindow:
             self.services.stop_recording()
         except Exception:
             log.exception("stop_recording failed")
+
+    def _cancel_recording(self):
+        """Discard the open capture. Nothing is transcribed and nothing is
+        said -- recorder.abort() publishes RecordingStopped(reason="abort"),
+        which app._on_recording_stopped and app._turn_on_stop both return
+        early on."""
+        log.info("capture cancelled from the mic button (not transcribed)")
+        try:
+            self.services.cancel_recording()
+        except Exception:
+            log.exception("cancel_recording failed")
+
+    def _history_available(self) -> bool:
+        """True when the app wired at least one side of the history."""
+        return bool(self.services.history_prev or self.services.history_next)
+
+    def _history_step(self, delta: int):
+        """Up/Down in the command bar (#135, "arrow keys do nothing").
+
+        delta < 0 walks toward older entries, delta > 0 toward newer;
+        returns the command to show, or "" for an empty field. Runs on the
+        Tk thread — jarvis.history.TypedHistory keeps its items in memory
+        and only touches disk on add(), so there is nothing to block on."""
+        fn = self.services.history_prev if delta < 0 else \
+            self.services.history_next
+        if fn is None:
+            return ""
+        try:
+            return fn() or ""
+        except Exception:
+            log.exception("typed history step failed")
+            return ""
 
     def _on_typed(self, text: str):
         # CommandBar already published UserUtterance(source='typed').
@@ -1569,6 +1655,11 @@ class MainWindow:
 
     def _ev_rec_stop(self, ev: RecordingStopped):
         self._recording = False
+        # Whoever opened THIS capture no longer owns the next one: a wake
+        # word or a follow-up window arriving after a button-started turn
+        # must not inherit "he pressed the button", or its stop press
+        # would transcribe the room again.
+        self._mic_opened_here = False
         self.command_bar.set_mic_state(
             "idle" if self._mic_available else "disabled")
         self.tray.update_state(False)

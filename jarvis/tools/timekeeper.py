@@ -569,6 +569,29 @@ def _duration_at(norm, used, i, allow_bare=True):
     return total, j
 
 
+def _lone_clock_hour(sc: _Scan) -> bool:
+    """Is the whole utterance one number that reads as a time of day?
+
+    #17, 2026-08-31 -- "Set an alarm for six" reached the parser as the single
+    word "six" (the commander's _norm_when only prefixes "at " to text that
+    starts with a DIGIT, so "6" was already safe and "six" was not).  A lone
+    number then went down the bare-duration path below and became SIX MINUTES:
+      20:43:26 objection ... "I would advise against a 8:49 pm alarm, sir"
+      20:43:39 timekeeper: alarm '' due 2026-08-31 20:49 (once)
+    Nobody setting an alarm "for six" at twenty to nine means six minutes, so
+    a lone 0-24 falls through to the time-of-day scan and is read as an hour.
+    Anything that cannot BE an hour ("45", "1.5") keeps the minutes reading.
+
+    Durations did not move: "in six", "six minutes" and "10 minutes" all go
+    down other branches, and a bare LENGTH ("How long for, sir?" -> "five")
+    is parse_duration's job, not this one -- it never calls _find_duration.
+    """
+    if len(sc.norm) != 1:
+        return False
+    n = _num(sc.norm[0])
+    return n is not None and float(n).is_integer() and 0 <= n <= 24
+
+
 def _find_duration(sc: _Scan):
     """'in <dur>' / 'after <dur>' / leading '<dur>' (+ 'from now')."""
     for i, t in enumerate(sc.norm):
@@ -579,7 +602,8 @@ def _find_duration(sc: _Scan):
             if got:
                 sc.use(i, got[1])
                 return got[0]
-    got = _duration_at(sc.norm, sc.used, 0, allow_bare=(len(sc.norm) == 1))
+    got = _duration_at(sc.norm, sc.used, 0,
+                       allow_bare=(len(sc.norm) == 1 and not _lone_clock_hour(sc)))
     if got:
         sc.use(0, got[1])
         j = got[1]
@@ -756,7 +780,11 @@ def parse_when_full(text: str, now: datetime, prefer: str = "next"):
                 break
             bare = not (cand.group("at") or cand.group("ap") or cand.group("oc")
                         or cand.group("m") is not None)
-            if bare:
+            # A bare hour needs a lead-in ("at seven") EXCEPT when it is the
+            # only thing left to read: "Set an alarm for six" strips down to
+            # "six", and the alternative reading -- six minutes -- is the #17
+            # bug this whole clause exists to stop (see _lone_clock_hour).
+            if bare and cand.group(0) != text_now.strip():
                 continue
             h = int(cand.group("h"))
             if h > 24 or (cand.group("ap") and h > 12):
@@ -1862,6 +1890,24 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         epoch = float(t._now())
         return epoch, datetime.fromtimestamp(epoch)
 
+    def interval_start(repeat, now: datetime) -> Optional[datetime]:
+        """When the first nudge of an interval `repeat` lands, or None.
+
+        #22, 2026-08-31 -- "Set a reminder to drink water every 45 minutes"
+        was heard perfectly and still died on "I couldn't make out the time,
+        sir".  The model had split the sentence across the arguments and put
+        the interval where it belongs, in `repeat`, with nothing left for the
+        time (jarvis_memory/journal/2026-08-31.jsonl, 20:47:24):
+          set_reminder {"repeat": "every 45 minutes", "text": "drink water",
+                        "when": "now"} -> could not understand the time 'now'
+        `when` was the only argument consulted, so a perfectly good interval
+        sat unread in the next field along.  An interval already says when
+        the first one is due -- one interval from now, the same rule
+        parse_when_full applies when the words arrive inside `when`.
+        """
+        mins = interval_minutes(normalize_repeat(repeat))
+        return None if mins is None else now + timedelta(minutes=mins)
+
     def set_reminder(when="", text="", repeat="once", **_) -> ToolResult:
         t = tk()
         if t is None:
@@ -1873,6 +1919,10 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             dt, rep_text, rest2 = parse_when_full(text, now)
             if dt is not None:
                 text = rest2 or when
+        if dt is None:
+            # Last resort before the apology: the interval in `repeat`.
+            dt = interval_start(repeat, now)
+            rest = ""            # "now" is not a label for the reminder
         if dt is None:
             return ToolResult(text=f"could not understand the time '{when}'", ok=False,
                               speak=CANT_PARSE_LINE)
@@ -1906,6 +1956,11 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         epoch, now = now_of(t)
         when = str(when or "").strip()
         dt, rep_text, _rest = parse_when_full(when, now, prefer="morning")
+        if dt is None:
+            # Same split as #22 on set_reminder: the schema offers set_alarm
+            # "an interval like 'every 90 minutes'" too, so the same model
+            # can leave the interval in `repeat` and nothing usable in `when`.
+            dt = interval_start(repeat, now)
         if dt is None:
             return ToolResult(text=f"could not understand the time '{when}'", ok=False,
                               speak=CANT_PARSE_LINE)

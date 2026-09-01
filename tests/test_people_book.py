@@ -217,7 +217,14 @@ def test_get_mail_sender_filter_resolves_an_alias_to_the_address(fake_imap, mem)
     r = reg.call("get_mail", {"sender": "müller"})
     assert "Invoice" in r.text and "Standup" not in r.text
     r = reg.call("get_mail", {"sender": "my dentist"})
-    assert r.ok and r.speak is None and r.text == "no unread mail from my dentist in the last 24 hours"
+    # A NAMED search is a lookup, not inbox triage: read mail counts and the
+    # window is a week, so the fact says "no mail", not "no unread mail".
+    # See test_a_named_search_includes_read_mail (tests/test_notes_mail.py):
+    # "Any emails from Evolving AI Insights?" was answered "there are no
+    # emails from Evolving AI Insights, sir" about a newsletter that had
+    # arrived that morning and had simply been read.
+    assert r.ok and r.speak is None and \
+        r.text == "no mail from my dentist in the last 7 days"
 
 
 def test_sender_matches_rules():

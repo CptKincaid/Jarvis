@@ -5857,6 +5857,88 @@ def forced_call(reason: str, text: str) -> Optional[tuple]:
 
 
 # ------------------------------------------------------------------
+# Day-shift follow-ups: "and the next day" (2026-08-31)
+# ------------------------------------------------------------------
+# Live, 21:30:37: "What do I have going on tomorrow?" was answered from
+# get_calendar. 21:30:50: "and the next day" -- four words, no subject, no
+# day of its own -- reached the model as itself (route local (short)), the
+# model never called get_calendar again, and it read TOMORROW'S list back
+# verbatim. The very next utterance, "and what about the day after that?",
+# went through the classifier instead (route local (classify)), DID call
+# get_calendar and answered Wednesday correctly: the model can resolve the
+# day when it bothers to look, so the defect is that a bare fragment is
+# handed over with nothing to look at.
+#
+# The repair is anaphora, not a new tool: take the day word out of the
+# question he just asked, move it on by one, and re-dispatch HIS OWN
+# sentence with the new day in it. That keeps the subject ("what do I have
+# going on", "what's the weather") instead of guessing that every
+# follow-up is about the calendar, and it hands the router a full question
+# with an explicit day, which is what makes the tool call happen.
+FOLLOWUP_DAY_WINDOW_S = 180.0
+_WEEKDAY_NAMES = ("monday", "tuesday", "wednesday", "thursday", "friday",
+                  "saturday", "sunday")
+# The fragment must BE the whole utterance -- "the next day I'm free" is a
+# sentence, not a follow-up.
+_DAY_SHIFT_RX = re.compile(
+    r"^(?:and|so|ok(?:ay)?|well)?[,\s]*"
+    r"(?:what|how)\s+about\s+|"
+    r"^(?:and|so|ok(?:ay)?|well)?[,\s]*", re.I)
+_DAY_SHIFT_TAIL_RX = re.compile(
+    r"^(?:the\s+)?(?:next|following)\s+day$|"
+    r"^(?:the\s+)?day\s+after(?:\s+that)?$", re.I)
+_DAY_ANCHOR_RX = re.compile(
+    r"\b(today|tonight|tomorrow|monday|tuesday|wednesday|thursday|friday|"
+    r"saturday|sunday)\b", re.I)
+
+
+def day_shift_followup(prev_text: str, text: str,
+                       today=None) -> Optional[str]:
+    """His previous question re-asked one day later, or None.
+
+    ``None`` means "not this shape" and the caller carries on exactly as
+    before: either the utterance is not a bare day-shift fragment, or the
+    question before it named no day to move.
+    """
+    t = (text or "").strip().strip("?.!,")
+    if not t:
+        return None
+    tail = _DAY_SHIFT_RX.sub("", t, count=1).strip()
+    if not _DAY_SHIFT_TAIL_RX.match(tail):
+        return None
+    prev = (prev_text or "").strip()
+    if not prev:
+        return None
+    hits = list(_DAY_ANCHOR_RX.finditer(prev))
+    if not hits:
+        return None
+    m = hits[-1]                      # the day he ended on
+    word = m.group(1).lower()
+    today = today or date.today()
+    if word in ("today", "tonight"):
+        base = today
+    elif word == "tomorrow":
+        base = today + timedelta(days=1)
+    else:
+        # The NEXT such day counting today -- the same rule
+        # tools.calendar.format_events uses, so the two cannot drift.
+        want = _WEEKDAY_NAMES.index(word)
+        base = today + timedelta(days=(want - today.weekday()) % 7)
+    target = base + timedelta(days=1)
+    delta = (target - today).days
+    if delta == 1:
+        label = "tomorrow"
+    elif 2 <= delta <= 6:
+        # A weekday name inside a week is unambiguous; at 7 days out it
+        # would name TODAY to every downstream parser, so refuse instead
+        # of answering about the wrong day.
+        label = _WEEKDAY_NAMES[target.weekday()].capitalize()
+    else:
+        return None
+    return prev[:m.start()] + label + prev[m.end():]
+
+
+# ------------------------------------------------------------------
 # Corrections: "no, I said ..." (2026-08-30)
 # ------------------------------------------------------------------
 # A misheard transcript used to stay in the model's window paired with
@@ -6663,6 +6745,57 @@ class Commander:
             if res is not None:
                 return res
 
+        # 3''. Barge-in, said WITHOUT the address. "quiet" / "hush" / "be
+        #      quiet" / "stop talking" (#9, 2026-08-31: "does not
+        #      understand"). Every one of these is a one- or two-word
+        #      phrase, so with no "jarvis" prefix cmd_text is None, the
+        #      registry above never runs, and the intent gate below calls
+        #      them background chat and drops them in SILENCE -- measured:
+        #      classify("quiet") = ("no", 0.80), and only the three-word
+        #      "stop talking" scraped through. Nobody prefixes the word
+        #      they are using to interrupt, so this is the one Tier-1
+        #      command that can never be addressed.
+        #      _QUIET_RX is anchored to the whole utterance, so this fires
+        #      only when the words ARE the interruption -- "why are you
+        #      being quiet?" (also live, 20:33) still goes to the model.
+        #      Placed after the pending yes/no stages and the custom
+        #      phrases (both of which own "cancel that" / may shadow a
+        #      built-in) and before the gate, exactly like read_control.
+        if quiet_kind(text):
+            return _h_quiet(self, text, True)
+
+        # 3''a. "Say again", the other half of the same hole, and the same
+        #       silence -- his #8, "doesnt understand say again. or any of
+        #       these". From the log, twice, thirty seconds apart:
+        #         20:36:36 handle 'Say again' source=voice
+        #         20:36:36 Ignored (background chat, conf=0.80): 'Say again'
+        #         20:37:01 the same two lines, verbatim
+        #       Correctly transcribed both times, then thrown away. Nobody
+        #       says "jarvis" before asking for a repeat any more than
+        #       before an interruption, so cmd_text is None, the prefixed
+        #       registry pass (which owns Command("repeat", ...)) is
+        #       skipped, and the Tier-1 voice-I/O block that answers it
+        #       lives in _route_text, one rung BELOW the gate.
+        #       ASSISTANT_TIER1 could not save it either: it is a
+        #       name-filtered view of REGISTRY and "repeat" is not in the
+        #       list. ("say that again" and "what was that" happened to
+        #       survive by matching read_control_kind -- an accident, not a
+        #       design, and it does not cover "say again" or "repeat
+        #       that".) _REPEAT_RX is anchored like _QUIET_RX, so this
+        #       fires only when the words ARE the request.
+        if repeat_kind(text):
+            return _h_repeat(self, text, True)
+
+        # 3''b. "and the next day": re-ask HIS previous question one day
+        #       on. Before the gate, which called this four-word fragment
+        #       UNCERTAIN and made him click a card (live, 21:30:50), and
+        #       before the router, whose "short" rule handed it to the
+        #       model as itself -- which answered with tomorrow's list
+        #       again, word for word.
+        res = self._try_day_shift(text, source)
+        if res is not None:
+            return res
+
         # 4. Intent classification — voice only; typed text is deliberate
         #    (2642-2653). "discord" and any other channel count as typed,
         #    and so does anything spoken with the "jarvis" address: the
@@ -6760,6 +6893,35 @@ class Commander:
                 log.exception("log_correction failed")
         self._learn_vocab(heard, meant)
         res = self._handle_inner(meant, source, gate=False)
+        res.corrected = meant
+        return res
+
+    def _try_day_shift(self, text: str,
+                       source: str) -> Optional[CommandResult]:
+        """"and the next day" -> the last question with the next day in it.
+
+        None unless the utterance is a bare day-shift fragment AND the
+        question before it named a day; every other utterance routes
+        exactly as it did before.
+        """
+        prev = self._last_turn
+        if prev is None:
+            return None
+        # A fragment this small is only a follow-up while the exchange is
+        # still live -- said cold it is the room talking, and the gate
+        # below is the right place for it.
+        if time.monotonic() - prev.ts > FOLLOWUP_DAY_WINDOW_S:
+            return None
+        meant = day_shift_followup(prev.text, strip_address(text))
+        if not meant:
+            return None
+        log.info("day-shift follow-up: %r + %r -> %r", prev.text, text, meant)
+        # gate=False: a follow-up to a question Jarvis just answered is
+        # addressed to Jarvis, the same reason a correction bypasses it.
+        res = self._handle_inner(meant, source, gate=False)
+        # The app records the exchange under the resolved sentence, which
+        # is also what _last_turn keeps -- so a SECOND "and the next day"
+        # has a day to move instead of a fragment with none.
         res.corrected = meant
         return res
 

@@ -863,3 +863,134 @@ def test_add_items_on_a_list_that_does_not_exist_yet_creates_it(store):
 def test_add_items_ignores_blanks(store):
     ids, added, skipped = store.add_items("list:shopping", ["", "  ", "milk"])
     assert added == ["milk"] and skipped == [] and len(ids) == 1
+
+
+# --------------------------------------------- 2026-08-31 evening: mail bugs
+def _evening_messages(now=None):
+    """The two the evening turned on: a READ newsletter from that morning and
+    an advising note whose body is the answer to "what was it about?".
+
+    Dated off the REAL clock: get_mail's window is measured from now, so a
+    fixed 2026-08-26 would quietly fall out of the 24-hour default."""
+    now = now or datetime.now().astimezone()
+    d = email.utils.format_datetime
+    news = (_hdr({"From": "Evolving AI Insights <evolvingai@mail.beehiiv.com>",
+                  "Subject": "Australia Becomes the First Country to Ban AI Music",
+                  "Date": d(now - timedelta(hours=15)),
+                  "Content-Type": "text/plain; charset=utf-8"}),
+            b"In partnership with. Australia has become the first country to "
+            b"ban AI-generated music from its national charts, a decision the "
+            b"industry has been arguing over for a year.\r\n")
+    advising = (_hdr({"From": "ECEN Undergraduate Advising <notifications@instructure.com>",
+                      "Subject": "INTERNSHIP OPPORTUNITY: Relegance : ECEN Undergraduate Advising",
+                      "Date": d(now - timedelta(hours=7)),
+                      "Content-Type": "text/plain; charset=utf-8"}),
+                b"Howdy Students! Relegance is looking for a Computer Engineering "
+                b"Student to hire as an intern. Apply here before the deadline on "
+                b"the fifteenth of September.\r\n")
+    return [news, advising]
+
+
+def _mail_registry(fake_imap, **services):
+    from types import SimpleNamespace
+
+    reg = ToolRegistry()
+    reg.register_many(mail_mod.make_tools(FakeCfg(GMAIL_CFG),
+                                          SimpleNamespace(imap=fake_imap, **services)))
+    return reg
+
+
+def _search_criteria(fake_imap):
+    return [c for inst in fake_imap.instances for c in inst.calls if c[0] == "search"]
+
+
+def test_a_named_search_includes_read_mail(fake_imap):
+    """LIVE 2026-08-31 21:07: "Any emails from Evolving AI Insights?" ->
+    "I'm afraid there are no emails from Evolving AI Insights, sir."
+
+    The newsletter had arrived at 5:47 that morning; the log shows the tool
+    answering "no unread mail from Evolving AI Insights in the last 24
+    hours".  He had READ it, so UNSEEN hid it, and the model dropped the word
+    "unread" on the way out.  A search BY NAME is a lookup, not a look at
+    what is new: read mail counts, and a day is too short a memory."""
+    fake_imap.messages = _evening_messages()
+    reg = _mail_registry(fake_imap)
+    r = reg.call("get_mail", {"sender": "Evolving AI Insights"})
+    assert r.ok and "Evolving AI Insights" in r.text
+    assert "Ban AI Music" in r.text
+    # The mechanism: no UNSEEN in the IMAP search, and a week-wide SINCE.
+    for call in _search_criteria(fake_imap):
+        assert "UNSEEN" not in call, call
+        assert any(str(c).startswith("SINCE") for c in call), call
+    assert "168 hours" not in r.text          # the fact reads back as English
+
+
+def test_a_bare_any_mail_question_is_still_unread_only(fake_imap):
+    """The default only moves for a NAMED search: "any mail?" must still be
+    what is new, or every morning would report the same read inbox."""
+    fake_imap.messages = _evening_messages()
+    reg = _mail_registry(fake_imap)
+    reg.call("get_mail", {})
+    assert any("UNSEEN" in call for call in _search_criteria(fake_imap))
+
+
+def test_an_explicit_unread_only_still_wins_over_the_named_default(fake_imap):
+    """Only the DEFAULT moved. When the model actually asks for unread mail
+    from someone, it gets unread mail from someone."""
+    fake_imap.messages = _evening_messages()
+    reg = _mail_registry(fake_imap)
+    reg.call("get_mail", {"sender": "Evolving AI Insights", "unread_only": True})
+    assert any("UNSEEN" in call for call in _search_criteria(fake_imap))
+
+
+def test_a_subject_search_reaches_the_body(fake_imap):
+    """LIVE 2026-08-31 21:06: "What specifically was the undergrad engineering
+    update about?" -> "I'm afraid I don't have the contents of that email,
+    sir; I only have the subject line and sender."
+
+    The body HAD been fetched a minute earlier (get_mail carries a snippet),
+    but the fact sheet is not kept in the conversation, so the follow-up had
+    only the spoken summary to work from and there was no way to ask for one
+    message again.  ``subject`` is that way, and a narrowed search keeps the
+    whole snippet rather than the 120 characters a browse listing shows."""
+    fake_imap.messages = _evening_messages()
+    reg = _mail_registry(fake_imap)
+    r = reg.call("get_mail", {"subject": "undergrad engineering"})
+    assert r.ok and "Relegance" in r.text
+    # The BODY, not just the subject line: the answer to "about what?".
+    assert "Computer Engineering Student to hire as an intern" in r.text
+    # ...past the 120 characters a browse listing shows: this tail is at 120+.
+    assert "fifteenth of September" in r.text
+    assert "Australia" not in r.text                     # the other one is out
+    schema = reg.schemas()[0]["function"]
+    assert "subject" in schema["parameters"]["properties"]
+    assert len(schema["description"].split()) <= 20
+
+
+def test_a_browse_listing_keeps_its_short_snippets(fake_imap):
+    """The full snippet is for a NARROWED search only -- "read me my email"
+    lists five messages and must not turn into five paragraphs."""
+    fake_imap.messages = _evening_messages()
+    reg = _mail_registry(fake_imap)
+    r = reg.call("get_mail", {"unread_only": False})
+    assert "Relegance" in r.text                          # the listing is there
+    assert "fifteenth of September" not in r.text         # ...but trimmed at 120
+
+
+def test_nothing_from_a_named_search_says_days_not_168_hours(fake_imap):
+    fake_imap.messages = _evening_messages()
+    reg = _mail_registry(fake_imap)
+    r = reg.call("get_mail", {"sender": "Blinn"})
+    assert r.ok and r.text == "no mail from Blinn in the last 7 days"
+    assert mail_mod.window_words(24) == "24 hours"
+    assert mail_mod.window_words(24 * 7) == "7 days"
+
+
+def test_the_window_reads_back_as_english():
+    """A named search defaults to a week, so "20 messages since 7 days" --
+    which the model repeats back as fact -- stopped being the rare case."""
+    now = datetime.now().astimezone()
+    m = Mail(from_name="Jane", from_addr="j@x", subject="s", date=now, snippet="")
+    assert fact_sheet([m], 1, 24, now=now).startswith("1 unread since yesterday:")
+    assert fact_sheet([m], 1, 24 * 7, now=now).startswith(
+        "1 unread in the last 7 days:")
