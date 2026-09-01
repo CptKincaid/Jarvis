@@ -79,6 +79,31 @@ look better than a clean install.
 `vad_filter` exists only on the CPU faster-whisper branch, so there is no VAD
 on the GPU path. ctranslate2 has no aarch64 CUDA wheel, hence the fallback.
 
+**Ollama runs ONE model at a time.** `OLLAMA_MAX_LOADED_MODELS=1` in
+`/etc/systemd/system/ollama.service.d/10-residency.conf` — the guard added
+after the 2026-08-28 unified-memory power-off. So asking for a SECOND model
+does not add one, it EVICTS the chat model, and gemma4:26b then costs ~7 s to
+reload. Nothing logs an "unload", which makes this invisible from Jarvis's
+side. Two real bugs came from it in one day: memory recall embedding every
+query on the reply path, and the test suite firing 24 `/api/embed` calls per
+run straight at the live server. **The reply path may not ask Ollama for any
+model other than the chat model**, and `tests/conftest.py` now refuses
+connections to port 11434 outright.
+
+**The test suite runs against the LIVE box, so conftest is a firewall.** It
+already redirects every writable path (log dir, memory dir, assistant config,
+cache, intent log, docs index) and blocks the room controls, because a scene
+test would dim the screen he is reading. Two more were added on 2026-08-31
+after both reached him: audio out (four tests spawned a real `paplay` into his
+speakers — `earcons.play` resolves its runner at CALL time so the firewall can
+replace it) and Ollama (above). **Anything that can reach hardware, the
+network or his desktop belongs in that fixture before it belongs in a test.**
+
+**A hand edit to `assistant.json` does NOTHING until Jarvis restarts.**
+`AssistantConfig.reload_if_changed()` exists and has no callers, so the
+running process keeps its boot-time copy. Change a setting, restart, verify —
+in that order, or you will debug a setting that was never applied.
+
 ## State lives outside the repo
 ```
 ~/.aiws_trainer/voice_settings.json   engine, thresholds, speaker_verify
@@ -87,7 +112,15 @@ on the GPU path. ctranslate2 has no aarch64 CUDA wheel, hence the fallback.
 ~/.config/jarvis/assistant.json       user, location, calendar/mail/spotify creds
 /tmp/vss_voice/jarvis.log             the log worth reading first
 /tmp/vss_voice/speak_queue.txt        write a line here to make Jarvis speak
+~/.aiws_trainer/jarvis_memory/        timekeeper.db, notes.db, dossier/headsup state
+~/.config/autostart/jarvis.desktop    starts Jarvis 15 s after login
 ```
+`/tmp` is WIPED AT BOOT on this box (a tmpfiles `D /tmp` rule), so everything
+under `/tmp/vss_voice` is scratch: the log, the pid file, the sockets and the
+speak queue are all recreated. Nothing that must survive a reboot may live
+there. What DOES survive: the autostart entry above plus the user units
+`jarvis-f5`, `jarvis-spotify`, `tailscaled` and `haymaker-digest.timer`, all
+enabled with lingering on, and `ollama` as a system service.
 
 ## Conventions
 - Tests use the real modules; only hardware is stubbed (see
