@@ -603,6 +603,11 @@ class Hotword:
                          "short to verify, speaker gate abstains",
                          len(utterance) / native_rate, score)
 
+            # The buffer is fed from PortAudio's thread, so it can cross the
+            # line between the `pending` check above and the snapshot here.
+            # This IS the held wake, arriving on its own audio: disarm it, or
+            # the deadline fires it a second time after the debounce.
+            pending = None
             _fire(utterance, score)
 
 

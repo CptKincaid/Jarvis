@@ -427,3 +427,36 @@ def test_no_wake_is_ever_invented(monkeypatch):
     h = Harness(monkeypatch, hit_after=None, budget=5.0).run()
     assert not h.detected
     assert h.model.predicts > 10, "the loop really did run"
+
+
+def test_a_held_wake_that_fills_mid_frame_fires_exactly_once(monkeypatch):
+    """The ring buffer is fed from PortAudio's thread, so it can cross the
+    1.5 s line between the loop's top-of-iteration check on `pending` and the
+    snapshot it takes after predict. When it does, the bottom of the loop
+    fires the wake on its own audio -- correct -- but `pending` was still
+    armed, so 1.5 s later (the debounce) the SAME wake fired a second time on
+    whatever he was saying by then: two HotwordDetected, a second speaker
+    verdict on his command, and "One moment -- still on the last one" if the
+    first capture had already closed. One wake word is one wake.
+    """
+    h = Harness(monkeypatch, hit_after=12, budget=12.0)
+    h.hw._on_detect = h.detected.append        # keep listening after a wake
+    injected = {}
+
+    def mic_lands_between_check_and_snapshot(n):
+        # the hold begins at predict 14 (1.12 s buffered); predict 18 is the
+        # agreeing frame with 1.44 s at the top of the iteration...
+        if n == 18:
+            st = h.sd.streams[-1]
+            st.callback(np.zeros((1280, 1), np.float32), 1280, None, None)
+            injected["at"] = n                 # ...and 1.52 s by the snapshot
+        if n > 18:
+            h.model.hit_after = None           # he said it once
+
+    h.model.on_predict = mic_lands_between_check_and_snapshot
+    h.run()
+
+    assert injected, "the race was never set up; the test proves nothing"
+    assert len(h.detected) == 1, \
+        f"one wake word fired {len(h.detected)} times: the held copy was " \
+        "not cleared when the wake fired on its own audio"
