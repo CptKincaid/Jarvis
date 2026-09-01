@@ -1463,9 +1463,22 @@ def test_the_workspace_trust_dialog_is_answered_only_for_a_cleared_folder(work, 
         join_runners(m)
         assert task.state == "done"
         assert "alpha" in rec.trusted
-        # a bare Enter, with no -l before it: the dialog's default is
-        # "1. Yes, I trust this folder"
-        assert ["tmux", "send-keys", "-t", "jarvis-alpha", "Enter"] in rec.calls
+        # Down THEN Enter, in that order and adjacent. The comment here used
+        # to say the default was "1. Yes, I trust this folder" -- true of an
+        # older Claude. On 2.1.252 the options are unnumbered and REVERSED:
+        #     > No, exit
+        #       Yes, I trust this folder
+        # so a bare Enter refuses, Claude exits, and the pane is left at a
+        # shell (Hunter, 2026-08-31 00:34, ten accept attempts then "I
+        # couldn't get Claude started in the terminal, sir").
+        down = ["tmux", "send-keys", "-t", "jarvis-alpha", "Down"]
+        enter = ["tmux", "send-keys", "-t", "jarvis-alpha", "Enter"]
+        assert down in rec.calls, "the dialog was answered without moving off 'No, exit'"
+        # Adjacency, not first-index: an earlier bare Enter is the LAUNCH
+        # line's confirm (send-keys -l <cmd>, then Enter), not the dialog's.
+        i = rec.calls.index(down)
+        assert rec.calls[i + 1] == enter, \
+            "Down must be followed immediately by Enter to pick 'Yes, I trust this folder'"
     finally:
         m.close()
 

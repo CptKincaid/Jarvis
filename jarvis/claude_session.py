@@ -1935,6 +1935,17 @@ class ClaudeSessionManager:
                     return False
                 log.info("accepting Claude's workspace-trust dialog for %s",
                          proj.path)
+                # Down FIRST. The dialog's default selection is "No, exit" --
+                #     > No, exit
+                #       Yes, I trust this folder
+                #     Enter to confirm . Esc to cancel
+                # so a bare Enter picks the REFUSAL, Claude quits, and every
+                # later Enter lands on the bare shell it left behind. That is
+                # what Hunter saw on 2026-08-31 at 00:34: ten "accepting"
+                # lines a second apart, a pane full of empty prompts, then
+                # "I couldn't get Claude started in the terminal, sir."
+                # Verified against claude 2.1.252: Down then Enter starts it.
+                self._tmux("send-keys", "-t", f"jarvis-{proj.slug}", "Down")
                 self._tmux("send-keys", "-t", f"jarvis-{proj.slug}", "Enter")
                 stable = 0
                 time.sleep(min(1.0, self.poll_s * 4))
