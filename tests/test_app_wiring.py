@@ -1601,6 +1601,24 @@ def test_the_next_row_names_the_day_it_is_talking_about(app):
     assert later.strftime("%A") in app._room_next_event()
 
 
+def test_the_slab_reads_in_upper_case(app):
+    """His request, 2026-08-31: "i want all of the things to be
+    capatalized, like HOME". The labels always were; the values were not,
+    so the panel read as a caption with a sentence after it."""
+    from jarvis.ui.ambient import room_rows, standby_rows
+    room = {"presence": "home", "next": "BIOSENSORS tomorrow 12:45 pm",
+            "due": "Lab 3 report", "temp": "84\u00b0F", "playing": "Blinding Lights",
+            "arc": "evening"}
+    for rows in (room_rows(room), standby_rows(room)):
+        assert rows, "no rows rendered"
+        for label, value in rows:
+            assert value == value.upper(), f"{label} value not upper: {value!r}"
+    assert ("WHERE", "HOME") in standby_rows(room)
+    assert ("WHERE", "AWAY") in standby_rows({"presence": "away"})
+    # an absent value still disappears rather than becoming ""
+    assert [l for l, _ in standby_rows({"presence": ""})] == []
+
+
 def test_standby_shows_where_he_is(app):
     """STANDBY_KEYS had NEXT/DUE/OUTSIDE but not WHERE, so the panel shown
     when nobody is at the desk was the one panel that could not answer

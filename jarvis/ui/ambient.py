@@ -74,12 +74,22 @@ STANDBY_KEYS = (("next", "NEXT"), ("due", "DUE"), ("temp", "OUTSIDE"),
 
 # ------------------------------------------------------------ pure rules
 def _rows(room, keys) -> list:
+    """(LABEL, VALUE) pairs, both upper case.
+
+    The labels were always upper case and the values were not, so the slab
+    read as a caption with a sentence after it. Upper case throughout is
+    what makes it a PANEL -- readable across a room at a glance, which is
+    the only way this surface is ever read. Cased here, in the one place
+    every row passes through, and BEFORE the renderer ellipsizes: upper
+    case is wider, so truncation has to measure the text that is actually
+    drawn.
+    """
     room = room or {}
     out = []
     for key, label in keys:
         value = str(room.get(key) or "").strip()
         if value:
-            out.append((label, value))
+            out.append((label, value.upper()))
     return out
 
 
@@ -91,8 +101,8 @@ def room_rows(room) -> list:
 
 
 def standby_rows(room) -> list:
-    """The three lines under the room clock: next commitment, next
-    deadline, outside temperature."""
+    """The lines under the room clock: next commitment, next deadline,
+    outside temperature, and where he is."""
     return _rows(room, STANDBY_KEYS)
 
 

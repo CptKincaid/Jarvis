@@ -320,7 +320,10 @@ def room(**kw):
 
 def test_the_ambient_band_shows_the_room_and_hides_what_is_not_known():
     rows = dict(ambient.room_rows(room()))
-    assert rows["NOW"].startswith("Kind of Blue")
+    # Upper case on purpose since 2026-08-31 (his request): the labels
+    # always were, and a panel read across a room wants both halves the
+    # same weight.
+    assert rows["NOW"].startswith("KIND OF BLUE")
     assert "WHERE" not in rows              # presence is unconfigured
 
 
