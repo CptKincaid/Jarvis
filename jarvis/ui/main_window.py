@@ -88,7 +88,7 @@ from jarvis.logs import get_logger
 from jarvis.ui import theme
 from jarvis.ui.ambient import RoomSlab
 from jarvis.ui.board import BoardWindow, board_enabled
-from jarvis.ui.console_mode import (STANDBY, ConsoleModes, DeskWatch,
+from jarvis.ui.console_mode import (ACTIVE, STANDBY, ConsoleModes, DeskWatch,
                                     resolve_idle_fn)
 from jarvis.ui.reactor import Reactor
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
@@ -1385,13 +1385,22 @@ class MainWindow:
         """The console changes surface. Everything here is reversible and
         is undone by ConsoleModes.stop() at quit."""
         self.room.set_mode(mode)
-        # The reactor's ONLY standby change: a third of the rotation speed.
+        # The reactor's ONLY standby change: half the rotation speed — a new
+        # frame every 2 slots = 30 unique fps at 18°/s. It was 1/3, which at
+        # the old 300-frame cycle meant a new frame every 100 ms: the 10 fps
+        # standby clock is the screen Hunter called "really laggy" (09-01).
         # Nothing is re-baked — the bases are size-dependent and re-rendering
         # them at a mode boundary is the churn behind the 08-26 freeze.
         try:
-            self.reactor.set_speed_scale(1 / 3 if mode == STANDBY else 1)
+            self.reactor.set_speed_scale(1 / 2 if mode == STANDBY else 1)
         except AttributeError:
             log.debug("reactor has no speed scale", exc_info=True)
+        # the slab hides the transcript in ambient AND standby: its 30 fps
+        # atmosphere loop would be moving motes nobody can see
+        try:
+            self.transcript.pause_atmo(mode != ACTIVE)
+        except AttributeError:
+            log.debug("transcript has no atmosphere loop", exc_info=True)
         self._set_footer_hidden(mode == STANDBY)
         if mode == STANDBY:
             if self._standby_origin is None:

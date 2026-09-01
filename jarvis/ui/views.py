@@ -55,7 +55,10 @@ GRAD_EXP = 1.7              # falloff exponent — lower carries light deeper
 TV_MOTES = 8                # sparser + dimmer than the reactor stage
 DOME_MOTES = 8              # slow drifters INSIDE the projection dome,
                             # with an occasional brightness pulse
-ATMO_MS = 100               # ~10fps coords-only atmosphere updates
+ATMO_MS = 33                # ~30fps coords-only atmosphere updates (was
+                            # 100: a 10 fps drift under a 60 fps sphere read
+                            # as stutter). The physics steps by ATMO_MS, so
+                            # the drift SPEED does not change with the rate.
 
 # Ghost projection dome: an EXTREMELY faint, UNLABELED background behind
 # the conversation — light pool, floor grid, concentric arcs with a 1px
@@ -397,7 +400,7 @@ class TranscriptView(tk.Frame):
         self._wrap_w = None
         self._wrap_job = None
         # atmosphere: pre-rendered vertical gradient beneath the dot grid,
-        # sparse motes moved at ~10fps (coords only)
+        # sparse motes moved at ~30fps (coords only, ATMO_MS)
         self._grad_key = None
         self._grad_photo = None
         self._grad_id = None
@@ -405,6 +408,8 @@ class TranscriptView(tk.Frame):
         self._dome_motes: list = []
         self._motes_init = False
         self._t0 = time.monotonic()
+        self._atmo_job = None
+        self._atmo_paused = False
 
         self.canvas = tk.Canvas(self, bg=theme.TV_BG, highlightthickness=0,
                                 bd=0)
@@ -413,7 +418,7 @@ class TranscriptView(tk.Frame):
         # X11 wheel events, scoped to pointer-over
         self.canvas.bind("<Enter>", self._grab_wheel, add=True)
         self.canvas.bind("<Leave>", self._drop_wheel, add=True)
-        self.after(400, self._atmo_tick)
+        self._atmo_job = self.after(400, self._atmo_tick)
 
     # ----------------------------------------------------------- scrolling
     def _grab_wheel(self, _e):
@@ -581,15 +586,35 @@ class TranscriptView(tk.Frame):
 
     # ------------------------------------------------------- atmosphere
     def _atmo_tick(self):
-        """~10fps loop: native coords moves for the dust motes — no
-        redraws, no PIL, ~16 canvas calls per pass."""
-        if not self.winfo_exists():
+        """~30fps loop (ATMO_MS): native coords moves for the dust motes —
+        no redraws, no PIL, ~16 canvas calls per pass."""
+        self._atmo_job = None
+        if self._atmo_paused or not self.winfo_exists():
             return
         try:
             self._update_atmo()
         except tk.TclError:
             return
-        self.after(ATMO_MS, self._atmo_tick)
+        self._atmo_job = self.after(ATMO_MS, self._atmo_tick)
+
+    def pause_atmo(self, paused: bool) -> None:
+        """Stop (or resume) the atmosphere loop. The room slab covers this
+        canvas completely in ambient/standby, so at 30 fps the loop would
+        otherwise spend ~1 ms x 30/s all night moving motes nobody can
+        see. Paused motes simply hold; the loop restarts on resume."""
+        paused = bool(paused)
+        if paused == self._atmo_paused:
+            return
+        self._atmo_paused = paused
+        if paused:
+            if self._atmo_job is not None:
+                try:
+                    self.after_cancel(self._atmo_job)
+                except tk.TclError:
+                    pass
+                self._atmo_job = None
+        elif self._atmo_job is None:
+            self._atmo_tick()
 
     def _update_atmo(self):
         c = self.canvas

@@ -24,3 +24,7 @@ build/
 repo/
 *.pth
 *.t7
+
+# Claude Code session state and scratch
+.claude/
+scratchpad/

@@ -16,23 +16,27 @@ Centerpiece (the living particulate SPHERE): CENTERPIECE selects the
   Mark I–III arc-reactor disc (`_build_base`), retained intact.
 
 Motion (clock-indexed, boundary-scheduled — see jarvis.ui.avatar_clock):
-  AV_FRAMES=300 over AV_PERIOD=10 s = 30 unique frames/s, one frame per
-  two 60 Hz refreshes. The frame shown at any instant is a pure function
-  of a monotonic clock (no counter is incremented, so timer jitter never
-  accumulates) and every tick is scheduled for the NEXT SLOT BOUNDARY
-  rather than a fixed after(33). Everything else animated on the stage
-  (instrument arcs, sweep, orbits, sparks, motes) samples the same slot
-  time, so nothing churns off-grid between frame swaps.
+  AV_FRAMES=600 over AV_PERIOD=10 s = 60 unique frames/s, one frame per
+  60 Hz refresh (the rotation RATE is unchanged from the 300-frame days —
+  36°/s idle, 72°/s thinking/speaking — only the temporal resolution
+  doubled; 30 fps was what read as "laggy" on a 60 Hz panel). The frame
+  shown at any instant is a pure function of a monotonic clock (no
+  counter is incremented, so timer jitter never accumulates) and every
+  tick is scheduled for the NEXT SLOT BOUNDARY rather than a fixed
+  after(16). Everything else animated on the stage (instrument arcs,
+  sweep, orbits, sparks, motes) samples the same slot time, so nothing
+  churns off-grid between frame swaps.
 
 Bake (out of process): the reactor launches AV_WORKERS
   `python -m jarvis.ui.avatar_bake` subprocesses (never multiprocessing —
   spawn would re-import jarvis.app → torch, fork is unsafe in a threaded
   Tk+CUDA process). Frames stream back as raw RGB over pipes, read by
   plain threads into a SimpleQueue, and are converted to PhotoImages on
-  the Tk thread inside the frame loop's spare time (<= 2 per tick, only
-  when >= 15 ms remain before the next boundary). Frames land
-  PROGRESSIVELY on nested grids (every 12th → 6th → 3rd → all) so a
-  coarse 25-frame cycle plays within seconds of boot; the upgrade to each
+  the Tk thread inside the frame loop's spare time — as many per tick as
+  the MEASURED conversion cost says fit before the next boundary with
+  2 ms to spare (avatar_clock.drain_budget; <= 3). Frames land
+  PROGRESSIVELY on nested grids (every 24th → 12th → 6th → 3rd → all) so
+  a coarse 25-frame cycle plays within seconds of boot; the upgrade to each
   finer tier crosses over on a frame both grids contain (same phase
   angle), so it never pops. Never-mapped Labels pin each photo's Tk
   display instance so a swap is a refcount op, not an XImage rebuild.
@@ -66,8 +70,8 @@ from jarvis.events import (AudioLevel, BrainState, RecordingStarted,
 from jarvis.logs import get_logger
 from jarvis.ui import theme
 from jarvis.ui.avatar_bake import BakeRunner, pool_ground
-from jarvis.ui.avatar_clock import (TIER_STEPS, AvatarClock, LateCounter,
-                                    tier_order)
+from jarvis.ui.avatar_clock import (TIER_STEPS, AvatarClock, ConvCost,
+                                    LateCounter, drain_budget, tier_order)
 from jarvis.ui.widgets import ellipsize, get_scale, px, ui_display, ui_mono
 
 log = get_logger("ui.reactor")
@@ -102,17 +106,19 @@ VIGNETTE = 0.20            # max darkening toward black in extreme corners
 VIGNETTE_START = 0.82      # normalized corner distance where it begins
 MOTES = 16                 # dust motes on the stage (two brightness tiers)
 MOTE_BRIGHT = 5            # of which this many are the brighter tier
-MOTE_EVERY = 3             # coords update every 3rd tick (~10fps)
+MOTE_EVERY = 1             # coords update every tick (60 fps): the
+                           # 16-mote pass is ~0.1 ms, and a 10 fps drift
+                           # next to a 60 fps sphere read as stutter
 
 # Living particulate avatar. CENTERPIECE switches the base art: "avatar"
 # is the film JARVIS presence; "reactor" restores the arc-reactor disc.
 CENTERPIECE = "avatar"
-AV_FRAMES = 300            # baked rotation frames — a seamless loop; 300
-                           # over 10 s = 30 unique frames/s = exactly two
-                           # 60 Hz refreshes per frame. N % 12 == 0 (tier
-                           # grids) and N / P == 30 are asserted by tests.
+AV_FRAMES = 600            # baked rotation frames — a seamless loop; 600
+                           # over 10 s = 60 unique frames/s = exactly one
+                           # 60 Hz refresh per frame. N % 24 == 0 (tier
+                           # grids) and N / P == 60 are asserted by tests.
 AV_PERIOD = 10.0           # seconds per loop at 1x (idle)
-AV_TICK = AV_PERIOD / AV_FRAMES        # 33.333 ms — the reactor loop slot
+AV_TICK = AV_PERIOD / AV_FRAMES        # 16.667 ms — the reactor loop slot
 AV_ELLIPSE = 0.46          # overlay-plane squash for the spark orbits:
                            # they ride the tilted EQUATOR plane, so the
                            # native overlay shares the sphere's geometry
@@ -224,6 +230,7 @@ class Reactor(tk.Canvas):
         self._bake = None                # (gen, size, BakeRunner)
         self._bake_t0 = 0.0
         self._drain_starve = 0
+        self._conv_cost = ConvCost()     # measured PhotoImage cost/frame
         self._spark_beat = 0
         # -- atmospheric backdrop (glow pool + vignette) + dust motes ---
         self._backdrop_id = None
@@ -425,6 +432,7 @@ class Reactor(tk.Canvas):
         self._bake = (gen, size, runner)
         self._bake_t0 = time.monotonic()
         self._render_busy = True
+        self._conv_cost.reset()          # a new size has new per-frame costs
         log.info("avatar: bake started (%s) — %d frames @ %dpx, gen %d",
                  runner.mode, AV_FRAMES, size, gen)
 
@@ -454,6 +462,11 @@ class Reactor(tk.Canvas):
             done += 1
             if gen != self._photo_gen or not self._alive:
                 continue
+            # the generation switch (destroying 600 holders of the old
+            # cycle) is a one-off, not a per-frame cost: keep it out of
+            # the timed region or it pins the budget estimate
+            self._begin_av_generation(gen)
+            t_conv = time.perf_counter()
             try:
                 img = Image.frombuffer("RGB", (size, size), buf,
                                        "raw", "RGB", 0, 1)
@@ -463,25 +476,37 @@ class Reactor(tk.Canvas):
                           exc_info=True)
                 continue
             self._install_av_frame(gen, k, photo)
+            # the per-frame cost on the Tk thread (PIL copy, Tk master,
+            # pinned display instance) is what the next slot's drain
+            # budget has to fit into its spare time
+            self._conv_cost.add(time.perf_counter() - t_conv)
         return done
 
+    def _begin_av_generation(self, gen: int) -> None:
+        """The first frame of a new generation swaps in a fresh frame
+        list (a resize re-bake replaces the cycle only as its frames
+        land), drops the OLD generation's pinned holders — their photos
+        are then unreferenced and Tk frees the masters — and resets the
+        tier clock. Idempotent for the current generation."""
+        if self._av_gen_applied == gen:
+            return
+        self._av_gen_applied = gen
+        self._av_frames = [None] * AV_FRAMES
+        self._av_have = 0
+        self._tier_counts = {s: 0 for s in TIER_STEPS}
+        self._clock.reset_tiers()
+        for holder in self._av_holders:
+            try:
+                holder.destroy()
+            except tk.TclError:
+                pass
+        self._av_holders = []
+        self.after_idle(self._draw_decor)   # ruler tracks the new size
+
     def _install_av_frame(self, gen: int, k: int, photo):
-        """One baked frame on the grid. The first frame of a new
-        generation swaps in a fresh frame list (a resize re-bake replaces
-        the cycle only as its frames land) and resets the tier clock."""
-        if self._av_gen_applied != gen:
-            self._av_gen_applied = gen
-            self._av_frames = [None] * AV_FRAMES
-            self._av_have = 0
-            self._tier_counts = {s: 0 for s in TIER_STEPS}
-            self._clock.reset_tiers()
-            for holder in self._av_holders:
-                try:
-                    holder.destroy()
-                except tk.TclError:
-                    pass
-            self._av_holders = []
-            self.after_idle(self._draw_decor)   # ruler tracks the new size
+        """One baked frame on the grid (see _begin_av_generation for the
+        first frame of a generation)."""
+        self._begin_av_generation(gen)
         if self._av_frames[k] is None:
             self._av_have += 1
             for step in TIER_STEPS:
@@ -494,13 +519,17 @@ class Reactor(tk.Canvas):
                 if step == 1:
                     self._render_busy = False
                     # frame store: Tk keeps a 32-bit master copy per photo
-                    # (the pinned X pixmaps live server-side on top)
+                    # AND a 24-bit client-side XImage per pinned display
+                    # instance (measured 0.59 + 0.45 MB/frame at 392 px on
+                    # 09-01; the X pixmaps live server-side on top)
                     size = photo.width()
                     log.info("avatar: full %d-frame cycle live (%.1fs) — "
-                             "frame store %d x %dpx, ~%.0f MB tk masters",
+                             "frame store %d x %dpx, ~%.0f MB tk masters "
+                             "+ ~%.0f MB pinned instances",
                              AV_FRAMES, time.monotonic() - self._bake_t0,
                              AV_FRAMES, size,
-                             AV_FRAMES * size * size * 4 / 1048576.0)
+                             AV_FRAMES * size * size * 4 / 1048576.0,
+                             AV_FRAMES * size * size * 3 / 1048576.0)
                     _perf.on_full_cycle(self)
                     # the workers have streamed every frame: drop the
                     # runner so the loop stops polling its queue
@@ -765,7 +794,8 @@ class Reactor(tk.Canvas):
         """One slot of the frame loop. The slot k is derived from the
         clock (never counted), everything renders at the slot's grid time
         t_k, the canvas is flushed BEFORE any other pending timer can run,
-        spare time converts <= 2 baked frames, and the next tick is
+        spare time converts as many baked frames as the measured
+        conversion cost says fit (drain_budget), and the next tick is
         scheduled for the next boundary AFTER rendering so render cost
         never shifts the grid."""
         if not self._alive:
@@ -787,10 +817,12 @@ class Reactor(tk.Canvas):
             self._render(t_k)
             self.update_idletasks()
             if self._bake is not None:
+                self._conv_cost.tick()      # samples expire by slot age
                 spare = clock.slot_time(k + 1) - time.monotonic()
-                if spare >= 0.015:
+                budget = drain_budget(spare, self._conv_cost.estimate)
+                if budget > 0:
                     self._drain_starve = 0
-                    self._drain_bake(2)
+                    self._drain_bake(budget)
                 else:
                     # never let a permanently short slot starve the bake
                     self._drain_starve += 1
@@ -1266,7 +1298,7 @@ class Reactor(tk.Canvas):
 
         # dust motes: two brightness tiers drifting slowly upward with
         # slight lateral wander, wrapping at the stage edges (coords-only
-        # updates every 3rd tick — see _update_decor)
+        # updates every MOTE_EVERY-th tick — see _update_decor)
         motes = []
         for i in range(MOTES):
             bright = i < MOTE_BRIGHT
@@ -1331,7 +1363,8 @@ class Reactor(tk.Canvas):
 
     def _update_decor(self, t: float):
         """Per-slot decor dynamics: ~10 native canvas calls, plus 16 mote
-        coords every 3rd slot. Everything samples the slot time t."""
+        coords every MOTE_EVERY-th slot. Everything samples the slot time
+        t."""
         d = self._decor
         if not d:
             return
@@ -1350,7 +1383,8 @@ class Reactor(tk.Canvas):
             a = math.radians(phase + t * speed - 90.0)
             x, y = cx + math.cos(a) * r, cy + math.sin(a) * r
             self.coords(oid, x - sz, y - sz, x + sz, y + sz)
-        # dust motes: coords-only, every 3rd slot, dt from the slot clock
+        # dust motes: coords-only, every MOTE_EVERY-th slot, dt from the
+        # slot clock (so the drift speed is rate-independent)
         self._mote_beat = (self._mote_beat + 1) % MOTE_EVERY
         if self._mote_beat == 0 and "motes" in d:
             mw, mh = d["wh"]
@@ -1368,7 +1402,7 @@ class Reactor(tk.Canvas):
     def set_speed_scale(self, scale) -> None:
         """Multiply the avatar's rotation speed (1 = the designed pace).
 
-        Standby drives this to ~1/3 so the disc turns slowly when nobody is
+        Standby drives this to 1/2 so the disc turns slowly when nobody is
         at the desk. It is the ONLY thing standby changes about the
         reactor: AvatarClock.set_speed rebases phase0/t_speed0, so the
         change cannot pop a frame, and NOTHING here re-bakes — the bases

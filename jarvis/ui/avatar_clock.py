@@ -9,18 +9,27 @@ next tick is scheduled for the next SLOT boundary (t0 + k·tick), so timer
 jitter never accumulates: a late callback recomputes the current slot.
 
 Progressive tiers: the bake lands coarse-to-fine on nested grids (step
-12 → 6 → 3 → 1 for N = 300). `display_index` snaps to the active tier and
-crosses to a finer tier only on a frame both grids contain (same phase
+24 → 12 → 6 → 3 → 1 for N = 600). `display_index` snaps to the active tier
+and crosses to a finer tier only on a frame both grids contain (same phase
 angle), so the upgrade never pops.
+
+Drain budget: the frame loop converts baked frames to PhotoImages in the
+spare time before the next slot boundary. `drain_budget` turns the
+measured spare and a running estimate of the conversion cost (`ConvCost`)
+into a frame count, so a 16.7 ms slot with ~14 ms spare drains several
+frames instead of tripping a fixed "need 15 ms" threshold every slot.
 """
 from __future__ import annotations
 
 import math
 import time
 
-TIER_STEPS = (12, 6, 3, 1)      # nested grids, coarse → fine; every hold
+TIER_STEPS = (24, 12, 6, 3, 1)  # nested grids, coarse → fine; every hold
                                 # is an integer number of 60 Hz refreshes
-                                # (400 / 200 / 100 / 33.3 ms)
+                                # (400 / 200 / 100 / 50 / 16.7 ms at N=600,
+                                # so the first coarse cycle is still 25
+                                # frames — motion arrives as early as it
+                                # did at 300 frames)
 
 
 def tier_order(n_frames: int) -> list:
@@ -111,22 +120,115 @@ class AvatarClock:
         if self.active_step == 0:
             self.active_step = step
 
+    def frames_per_slot(self) -> float:
+        """How far the index advances per slot at the current speed (1 at
+        idle, 2 thinking/speaking, 0.5 in standby)."""
+        return self.speed * self.tick * self.N / self.P
+
     def display_index(self, t: float):
         """Index to show at t, snapped to the active tier; None while no
         tier is complete. Crosses to a finer available tier only on a
-        frame that lies on BOTH grids (idx % active_step == 0), so the
-        upgrade lands on the same phase angle — no pop."""
+        slot where the COARSE tier itself swaps frames — idx has just
+        passed a multiple of active_step (idx % active_step is less than
+        the frames the index advances per slot) — so the upgrade lands
+        within one frame of the phase angle the coarse grid would have
+        shown anyway: no pop. Requiring idx % active_step == 0 exactly
+        would stall the upgrade for as long as speed 2 (thinking/speaking)
+        keeps the index on the parity it was entered with — an odd index
+        is never ≡ 0 mod 24."""
         if self.active_step == 0:
             return None
         idx = self.index_at(t)
         if self.active_step != self.available_step and \
-                idx % self.active_step == 0:
+                idx % self.active_step < max(1.0, self.frames_per_slot()):
             self.active_step = self.available_step
         return idx - idx % self.active_step
 
 
+DRAIN_MARGIN_S = 0.002          # spare time left untouched after a drain
+                                # so the next tick still starts on time
+DRAIN_CAP = 3                   # frames per slot at most (bounds the worst
+                                # case if the cost estimate is stale)
+CONV_PRIOR_S = 0.004            # assumed conversion cost until measured
+
+
+def drain_budget(spare_s: float, conv_s: float, cap: int = DRAIN_CAP,
+                 margin_s: float = DRAIN_MARGIN_S) -> int:
+    """How many baked frames fit in `spare_s` seconds before the next slot
+    boundary, each costing `conv_s` (a running estimate of the measured
+    PhotoImage conversion), leaving `margin_s` untouched. 0 when even one
+    frame would not fit; never above `cap`. A non-positive `conv_s` (no
+    measurement yet, or a clock glitch) is treated as CONV_PRIOR_S."""
+    if conv_s <= 0.0:
+        conv_s = CONV_PRIOR_S
+    room = spare_s - margin_s
+    if room < conv_s:
+        return 0
+    return max(0, min(int(cap), int(room // conv_s)))
+
+
+class ConvCost:
+    """Running estimate of a per-frame cost for `drain_budget`: the MAX of
+    the last `keep` samples (pessimistic, so one slow conversion shrinks
+    the next slots' budget instead of letting them overrun), `prior_s`
+    until the first sample lands.
+
+    Samples also EXPIRE by age: `tick()` is called once per slot and a
+    sample `keep` slots old is dropped whether or not anything was drained
+    since. Without that, a single outlier at or above the spare time (the
+    FIRST frame of a generation measures 10-16 ms in the full window
+    against ~2 ms for every later one — Tk's first-image one-offs plus the
+    bake's start-up burst; a GIL-contended boot measured 17.7 ms) would
+    return budget 0 on every slot, and the only thing that could ever push
+    it out of the window — the starvation fallback's 1 frame per 10 slots
+    — would take 160 slots (2.7 s) to do so. With expiry the outlier is
+    gone within `keep` slots (0.27 s at 16.67 ms)."""
+
+    def __init__(self, prior_s: float = CONV_PRIOR_S, keep: int = 16):
+        self.prior_s = float(prior_s)
+        self.keep = max(1, int(keep))
+        self._samples: list = []            # (slot added, seconds)
+        self._slot = 0
+
+    def reset(self) -> None:
+        """A new generation (re-bake at another size) starts from the
+        prior: the old size's costs — and the last frame's sample, which
+        carried the full-cycle bookkeeping — are not its costs."""
+        self._samples = []
+        self._slot = 0
+
+    def tick(self) -> None:
+        """One slot elapsed; a sample `keep` slots old falls out."""
+        self._slot += 1
+        self._expire()
+
+    def add(self, seconds: float) -> None:
+        self._samples.append((self._slot, max(0.0, float(seconds))))
+        if len(self._samples) > self.keep:
+            del self._samples[0]
+
+    def _expire(self) -> None:
+        horizon = self._slot - self.keep
+        while self._samples and self._samples[0][0] <= horizon:
+            del self._samples[0]
+
+    @property
+    def estimate(self) -> float:
+        self._expire()
+        return max(s for _, s in self._samples) if self._samples \
+            else self.prior_s
+
+    @property
+    def n(self) -> int:
+        self._expire()
+        return len(self._samples)
+
+
 LATE_MS = 8.0                   # a slot is late when its tick starts this
-                                # long after the slot boundary
+                                # long after the slot boundary: ~half a
+                                # 16.67 ms slot (it was a quarter of the
+                                # old 33 ms slot; half a slot is where a
+                                # frame visibly lands on the wrong refresh)
 LATE_WINDOW_S = 30.0            # summary line cadence
 
 

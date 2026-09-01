@@ -12,9 +12,9 @@ Import rules (tested): nothing from jarvis.events / jarvis.logs /
 jarvis.config / tkinter — colours are PARAMETERS (the CLI takes --bg and
 --cyan), so importing this module never pulls in the app or a display.
 
-    python -m jarvis.ui.avatar_bake --size 392 --sup 2 --frames 300 \
+    python -m jarvis.ui.avatar_bake --size 392 --sup 2 --frames 600 \
         --pool-peak 0.22 --pool-r 832 --bg 0d1b2a --cyan 35e0ff \
-        --ks 0,12,24,…  > frames.bin
+        --ks 0,24,48,…  > frames.bin
 """
 from __future__ import annotations
 
