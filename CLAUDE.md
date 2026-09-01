@@ -11,12 +11,32 @@ openWakeWord 0.4.0 | Whisper | SpeechBrain ECAPA-TDNN | edge-tts / XTTS v2
 
 ## Running
 ```bash
-python -m jarvis.app                 # the app (needs DISPLAY, uses :1 here)
-python -m pytest -q                  # 1506 tests, ~75 s
+cd ~/Jarvis && ~/vss_env/bin/python -m jarvis.app   # the app (needs DISPLAY, :1 here)
+~/vss_env/bin/python -m pytest -q                   # ~5.3k tests, ~3 min
 ruff check jarvis/ scripts/ tests/
+jarvis --quiet "what time is it"                    # drive it without speaking
 ```
 Always the venv: `~/vss_env/bin/python`. Never system python — PIL/ImageTk,
-torch and speechbrain all live in the venv.
+torch and speechbrain all live in the venv. **cd into the repo first**: `-m
+jarvis.app` from elsewhere is a ModuleNotFoundError.
+
+**Restarting it** — needed after ANY code or config change, and the only way
+a config edit takes effect at all:
+```bash
+PID=$(cat /tmp/vss_voice/jarvis.pid)      # NEVER match the process by cmdline
+kill -TERM $PID                            # text: that self-kills the shell
+cd ~/Jarvis && DISPLAY=:1 XAUTHORITY=/run/user/1000/gdm/Xauthority \
+  XDG_RUNTIME_DIR=/run/user/1000 \
+  DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus \
+  setsid nohup ~/vss_env/bin/python -m jarvis.app >/dev/null 2>&1 &
+```
+It is a Tk app, so it needs the desktop session and is NOT a systemd unit;
+`~/.config/autostart/jarvis.desktop` starts it 15 s after login (installed
+with `python -m jarvis.autostart --install`).
+
+`jarvis --quiet` reaches the running app over the command socket and takes
+the TEXT path, so it can never exercise the wake word or the Whisper
+confidence gate. Those two need a real voice at the mic.
 
 ## Architecture (V3)
 ~31k lines across 32 top-level modules plus `tools/`, `ui/`, `channels/`,
@@ -78,6 +98,18 @@ look better than a clean install.
 **Whisper backend differs by device.** GPU takes the openai-whisper path;
 `vad_filter` exists only on the CPU faster-whisper branch, so there is no VAD
 on the GPU path. ctranslate2 has no aarch64 CUDA wheel, hence the fallback.
+
+**F5's voice is the reference clip, not the settings.** The local voice
+clones its prosody wholesale from `~/.aiws_trainer/jarvis_voice_ref_f5.wav`
+(ref 0341, -26.8 dBFS). Chunking, speed and seed cannot add intonation the
+clip does not contain — measured 2026-09-01, giving F5 its own longer chunk
+limits moved voiced-frame pitch spread 39.3 -> 38.3 Hz, i.e. not at all,
+against a real complaint that he "gets monotone with long sentences or
+lists". If the brief is about how he SOUNDS, the reference clip is the
+lever. Never settle a voice change by argument: the 08-29/08-30 rounds are
+the template — a BLIND listening test, comparisons only WITHIN one round,
+and identical clips embedded as a noise probe. Loudness-normalising the
+reference lost that test twice.
 
 **Ollama runs ONE model at a time.** `OLLAMA_MAX_LOADED_MODELS=1` in
 `/etc/systemd/system/ollama.service.d/10-residency.conf` — the guard added
