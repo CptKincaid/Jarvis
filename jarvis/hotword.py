@@ -115,24 +115,125 @@ def wake_hit(predictions, threshold, unverified_threshold):
     return hit, max(jarvis, mycroft)
 
 
-# The wake decision must not be made on a buffer that has just been cleared:
-# jarvis/app.py releases the mic to record, and on resume the listener clears
-# its ring buffer and resets the model. Below speaker.MIN_AUDIO_SECONDS the
-# speaker gate cannot score at all -- _extract_embedding returns None, and
-# _speaker_ok fails OPEN -- so a wake in that window is accepted with nobody
-# checking who spoke (seen 2026-08-28 16:41:32.959, 0.349 s of audio,
-# "wake speaker check unavailable -- waking anyway"). Waiting the extra
-# fraction of a second costs nothing: the buffer fills in real time.
-# 1.5 s, not speaker.MIN_AUDIO_SECONDS (1.0): the wake buffer is scored on
-# whatever speech it holds, and the 2026-08-31 simulation put false rejects
-# at 19.6% with 1.0 s floors against 6.2% at 1.5 s (+0.6pp false accepts).
+# How much buffered audio the speaker gate wants before it will judge a wake.
+# Below speaker.MIN_AUDIO_SECONDS it cannot score at all -- _extract_embedding
+# returns None, score() returns None, and _speaker_ok fails OPEN. 1.5 s, not
+# the verifier's 1.0: the wake buffer is scored on whatever speech it holds,
+# and the 2026-08-31 simulation put false rejects at 19.6% with a 1.0 s floor
+# against 6.2% at 1.5 s (+0.6pp false accepts).
+#
+# This is a preference, NOT a veto. It was written as one on 2026-08-28 after
+# a wake fired on 0.349 s of audio at 16:41:32.959 -- but that wake was not a
+# person. It was openWakeWord re-firing the PREVIOUS wake word out of feature
+# state a pause does not clear (see reset_oww_stream), which is why it landed
+# at 0.349 s: the arithmetic, not a speaker. Vetoing short wakes suppressed
+# that symptom and cost real ones instead -- 52 logged "wake held" lines, none
+# of which ever recovered.
 WAKE_MIN_AUDIO_SECONDS = 1.5
+
+# How long a detected wake may be HELD BACK waiting for the ring buffer to
+# reach WAKE_MIN_AUDIO_SECONDS, so the speaker gate scores real audio instead
+# of abstaining. Only ever paid when the shortfall fits inside it: a wake on a
+# freshly cleared buffer is admitted at once. Holding one indefinitely -- which
+# is what the 2026-08-28 `continue` did -- is a fail-SHUT decision in the one
+# layer CLAUDE.md documents as fail-OPEN, and openWakeWord's activation decays
+# within a few 80 ms frames, so a wake not acted on quickly is simply lost.
+WAKE_HOLD_MAX_SECONDS = 0.6
 
 
 def wake_audio_sufficient(n_samples: int, native_rate: int,
                           min_seconds: float = WAKE_MIN_AUDIO_SECONDS) -> bool:
     """Is there enough buffered audio for the speaker gate to judge a wake?"""
     return n_samples >= int(native_rate * min_seconds)
+
+
+def wake_hold_seconds(n_samples: int, native_rate: int,
+                      min_seconds: float = WAKE_MIN_AUDIO_SECONDS,
+                      max_wait: float = WAKE_HOLD_MAX_SECONDS) -> float:
+    """How long to wait for the buffer to fill, or 0.0 to decide NOW.
+
+    The ring buffer fills in real time, so the wait is exactly the shortfall.
+    Waiting is worth it only when that shortfall fits inside `max_wait`, which
+    is set to cover the near-misses actually seen in jarvis.log -- the 0.88 s
+    and 0.96 s holds, the only two of 52 that were a genuinely part-filled
+    buffer rather than a freshly cleared one. (The 0.96 s hold at 15:44:11
+    completed 107 ms later against the 1.0 s floor of the day and scored
+    -0.053, a real verdict on a real voice.) Past `max_wait` the wake is
+    admitted immediately with the speaker gate abstaining: an unwakeable
+    assistant is worse than an over-eager one, and the transcript gate
+    (app._process_audio -> speaker.filter_segments) still fails SHUT behind it.
+    """
+    shortfall = int(native_rate * min_seconds) - int(n_samples)
+    if shortfall <= 0:
+        return 0.0                       # already enough: decide now
+    wait = shortfall / float(native_rate)
+    return wait if wait <= max_wait else 0.0    # too far short: admit now
+
+
+# ----------------------------------------------------------------------
+# openWakeWord stream state
+# ----------------------------------------------------------------------
+def capture_oww_blank(model):
+    """Snapshot an oww model's pristine, silence-filled feature state.
+
+    Taken once, straight after ``Model()`` and before any microphone audio has
+    reached it, so it is exactly what a cold start scores against
+    (``AudioFeatures.__init__`` seeds the buffer with embeddings OF SILENCE,
+    not zeros -- copying it is the only cheap way to get them back).
+    Returns None when the model has no 0.4.0-shaped preprocessor, in which
+    case ``reset_oww_stream`` degrades to a plain ``Model.reset()``.
+    """
+    pre = getattr(model, "preprocessor", None)
+    if pre is None:
+        return None
+    try:
+        return {
+            "feature_buffer": np.array(pre.feature_buffer, copy=True),
+            "melspectrogram_buffer": np.array(
+                pre.melspectrogram_buffer, copy=True),
+        }
+    except Exception:
+        log.exception("could not snapshot openWakeWord feature state")
+        return None
+
+
+def reset_oww_stream(model, blank=None) -> bool:
+    """Forget every trace of PRE-PAUSE audio, not just the score history.
+
+    ``Model.reset()`` clears ONLY ``prediction_buffer`` (openwakeword 0.4.0
+    model.py:152-154). The audio itself lives in ``preprocessor.feature_buffer``
+    (120 frames, ~10 s) and ``melspectrogram_buffer``, and neither is touched
+    by a pause: the stream closes and our ring buffer is cleared, but oww's own
+    window is not. Four fresh 80 ms frames after the resume, the 16-frame
+    window `hey_jarvis` scores is 12 frames of pre-pause audio plus 4 new ones
+    -- the wake word the user said BEFORE the pause -- and it re-fires at 0.98
+    with nobody having spoken.
+
+    Measured 2026-08-31 by replaying his own ~/.aiws_trainer/wakeword_training
+    clips through the real model: 10 of 30 pause/resume replays re-fired, every
+    one at +0.32 s, which is the exact figure in 47 of the 52 "wake held" lines
+    in jarvis.log. Returns True when the audio state was really cleared.
+    """
+    try:
+        model.reset()
+    except Exception:
+        log.exception("openWakeWord reset failed")
+    pre = getattr(model, "preprocessor", None)
+    if pre is None or not blank:
+        return False
+    try:
+        pre.feature_buffer = np.array(blank["feature_buffer"], copy=True)
+        pre.melspectrogram_buffer = np.array(
+            blank["melspectrogram_buffer"], copy=True)
+        # The melspectrogram is computed from the tail of raw_data_buffer, so
+        # stale samples there would bleed three frames of pre-pause audio back
+        # into the very first post-resume feature.
+        pre.raw_data_buffer.clear()
+        pre.accumulated_samples = 0
+    except Exception:
+        log.exception("could not clear openWakeWord audio state")
+        return False
+    return True
 
 
 def frames_agree(history, window, required):
@@ -178,7 +279,9 @@ class Hotword:
         self._reopen = False
         self._paused = False
         self._predict_failures = 0
-        self._short_wake_logged = False
+        # Pristine oww feature state, snapshotted once the model exists; see
+        # reset_oww_stream for why Model.reset() alone is not enough.
+        self._oww_blank = None
         if arbiter is not None:
             try:
                 arbiter.register_hotword(self.pause, self.resume)
@@ -307,6 +410,13 @@ class Hotword:
                 self.active = False
                 return
 
+        # Snapshot the model's silence-filled feature state while it is
+        # still pristine -- before the stream opens, so not one microphone
+        # sample has reached it. Only once: a later capture would preserve
+        # whatever audio was in flight rather than silence.
+        if self._oww_blank is None:
+            self._oww_blank = capture_oww_blank(self._model)
+
         self._reopen = False
         mic_idx = self._get_mic_index()
 
@@ -346,9 +456,42 @@ class Hotword:
                 self._stream = None
                 return False
 
+        def _fire(utterance, score):
+            """Act on a wake the loop has accepted, then re-arm.
+
+            Clears the ring buffer BEFORE the debounce so it refills during
+            it, and the oww stream AFTER, because the gap itself is what
+            makes oww's window stale (see reset_oww_stream)."""
+            buf.clear()
+            recent.clear()
+            if not self._speaker_ok(utterance, native_rate):
+                log.info("Hotword suppressed (score=%.3f): not the enrolled "
+                         "speaker", score)
+                if self._on_guest is not None:
+                    try:
+                        self._on_guest(float(score))   # a guest, politely
+                    except Exception:
+                        log.exception("on_guest callback failed")
+                time.sleep(0.5)      # shorter than a real wake's debounce
+            else:
+                log.info("Hotword detected (score=%.3f)", score)
+                bus.publish(HotwordDetected(score=float(score)))
+                try:
+                    self._on_detect(float(score))
+                except Exception:
+                    log.exception("on_detect callback failed")
+                time.sleep(1.5)  # Debounce
+            reset_oww_stream(self._model, self._oww_blank)
+            recent.clear()
+
         if not _open_stream():
             self.active = False
             return
+
+        # A wake whose buffer is nearly long enough to verify, remembered
+        # as (deadline, score) while it fills. Never a way to DROP a wake:
+        # every pending one is fired below, on its audio or on its deadline.
+        pending = None
 
         while self.active:
             time.sleep(0.08)  # Check every 80ms (matches OWW chunk size)
@@ -357,14 +500,33 @@ class Hotword:
             if self._reopen and not self._paused and not self._stream:
                 self._reopen = False
                 buf.clear()
+                pending = None          # a wake held across a pause is stale
                 _open_stream()
                 log.info("Hotword stream resumed")
-                # Reset OWW model state after pause
+                # NOT self._model.reset(): that clears the score history only,
+                # and oww's ~10 s of audio features survive the pause and
+                # re-fire the pre-pause wake word 0.32 s from now.
                 if self._model:
-                    self._model.reset()
+                    reset_oww_stream(self._model, self._oww_blank)
 
             if self._paused or not self._stream:
                 continue
+
+            # Honour a held wake the moment its audio is enough OR its grace
+            # runs out -- BEFORE the next predict, because openWakeWord's
+            # activation decays within a few frames and the old `continue`
+            # simply lost it (0 of 50 held wakes in jarvis.log ever recovered
+            # within a second; the median gap to the next detection was 46 s).
+            if pending is not None:
+                deadline, held_score = pending
+                if (wake_audio_sufficient(len(buf), native_rate)
+                        or time.monotonic() >= deadline):
+                    pending = None
+                    held = np.array(buf, dtype=np.float32)
+                    log.info("wake released on %.2f s of audio (score=%.3f)",
+                             len(held) / native_rate, held_score)
+                    _fire(held, held_score)
+                    continue
 
             # Need at least 80ms of audio
             if len(buf) < chunk_samples:
@@ -412,41 +574,36 @@ class Hotword:
             # Snapshot the ring buffer BEFORE clearing it -- it holds the
             # utterance that fired, which is what the speaker gate judges.
             utterance = np.array(buf, dtype=np.float32)
-            if not wake_audio_sufficient(len(utterance), native_rate):
-                # Not enough audio for the speaker gate, which abstains (and
-                # so admits) rather than rejects. Keep filling -- do NOT clear
-                # the buffer here, or the wait can never end.
-                if not self._short_wake_logged:
-                    log.info("wake held: %.2f s buffered since the stream "
-                             "reopened, speaker gate needs %.1f s",
-                             len(utterance) / native_rate,
+            wait = wake_hold_seconds(len(utterance), native_rate)
+            if wait > 0.0:
+                # Nearly enough: wait the shortfall out so the gate gets a
+                # real score instead of abstaining. The wake is remembered,
+                # not dropped, and `recent` is cleared so the same frames
+                # cannot queue a second one behind it.
+                if pending is None:
+                    pending = (time.monotonic() + wait, score)
+                    log.info("wake held %.2f s: %.2f s buffered, speaker gate "
+                             "wants %.1f s", wait, len(utterance) / native_rate,
                              WAKE_MIN_AUDIO_SECONDS)
-                    self._short_wake_logged = True
+                # An activation that stays up across several frames must NOT
+                # re-arm the deadline -- it is the same wake word, and pushing
+                # the deadline forward on every frame is an unbounded wait,
+                # which is the bug this whole path exists to remove.
+                recent.clear()
                 continue
-            self._short_wake_logged = False
+            if not wake_audio_sufficient(len(utterance), native_rate):
+                # Too little to ever verify in time. ADMIT it: the speaker
+                # gate abstains, exactly as its docstring and CLAUDE.md say
+                # this layer must behave. Dropping it here is what cost the
+                # user his first "Jarvis" after a reply -- and the transcript
+                # gate (app._process_audio -> speaker.filter_segments) still
+                # fails SHUT, so this admits a wake, never a stranger's
+                # command.
+                log.info("wake admitted on %.2f s of audio (score=%.3f): too "
+                         "short to verify, speaker gate abstains",
+                         len(utterance) / native_rate, score)
 
-            buf.clear()
-            self._model.reset()
-            recent.clear()
-
-            if not self._speaker_ok(utterance, native_rate):
-                log.info("Hotword suppressed (score=%.3f): not the enrolled "
-                         "speaker", score)
-                if self._on_guest is not None:
-                    try:
-                        self._on_guest(float(score))   # a guest, politely
-                    except Exception:
-                        log.exception("on_guest callback failed")
-                time.sleep(0.5)      # shorter than a real wake's debounce
-                continue
-
-            log.info("Hotword detected (score=%.3f)", score)
-            bus.publish(HotwordDetected(score=float(score)))
-            try:
-                self._on_detect(float(score))
-            except Exception:
-                log.exception("on_detect callback failed")
-            time.sleep(1.5)  # Debounce
+            _fire(utterance, score)
 
 
 # ----------------------------------------------------------------------

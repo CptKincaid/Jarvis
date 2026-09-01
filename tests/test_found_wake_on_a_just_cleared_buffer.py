@@ -2,11 +2,11 @@
 
 DEFECT (jarvis/hotword.py _listen_loop):
 
-The listener clears its rolling buffer and resets the OWW model whenever the
-mic stream reopens after recording. The wake decision that follows judges
-whatever little audio has accumulated since, and the speaker gate behind it
-CANNOT run below jarvis.speaker.MIN_AUDIO_SECONDS (1.0 s): _extract_embedding
-returns None, score() returns None, and _speaker_ok deliberately fails OPEN.
+The listener clears its rolling buffer whenever the mic stream reopens after
+recording. The wake decision that follows judges whatever little audio has
+accumulated since, and the speaker gate behind it CANNOT run below
+jarvis.speaker.MIN_AUDIO_SECONDS (1.0 s): _extract_embedding returns None,
+score() returns None, and _speaker_ok deliberately fails OPEN.
 
 So in the window right after a resume, the one gate that checks WHO spoke is
 structurally bypassed -- it does not reject, it abstains, and abstention means
@@ -18,13 +18,23 @@ yes. From /tmp/vss_voice/jarvis.log, 2026-08-28:
     16:41:32.959  Hotword detected (score=0.977)
     16:41:32.959  hotword ignored: still transcribing the previous clip
 
-0.349 s of audio -- barely a third of what the gate needs. The app then
-correctly refused the wake as busy and put "One moment — still on the last
-one" on screen, which is how the user noticed.
+0.349 s of audio -- barely a third of what the gate needs.
 
-The fix is not to make the gate fail shut (a wake word that cannot fire is
-worse; see test_hotword_gating) but to refuse to DECIDE until there is enough
-audio for the existing gate to do its job.
+WHAT THAT EVENT ACTUALLY WAS (established 2026-08-31, see
+tests/test_wake_after_resume.py): not a person at all. openwakeword 0.4.0's
+Model.reset() clears only prediction_buffer; preprocessor.feature_buffer keeps
+~10 s of audio features straight through the pause, so four frames after the
+resume the model re-scores the PREVIOUS wake word and fires at ~0.98. That is
+why it landed at 0.349 s and why the score was so high -- it is arithmetic,
+not a speaker. The real repair is reset_oww_stream(), which clears the audio
+state the pause leaves behind.
+
+These length assertions still stand, but as the speaker gate's PREFERENCE, not
+as a veto: WAKE_MIN_AUDIO_SECONDS is how much audio the gate wants before it
+will judge, and hotword.wake_hold_seconds decides whether waiting for it is
+affordable. Turning it into a veto (a bare `continue`) is what cost the user
+52 real wake words -- a wake word that cannot fire is worse than one that
+fires too often, and the transcript gate still fails shut behind it.
 """
 import numpy as np
 import pytest
