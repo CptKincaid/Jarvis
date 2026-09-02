@@ -245,7 +245,7 @@ def test_a_pre_trim_voiceprint_keeps_its_format_until_re_enrolled(tmp_path, monk
 
 
 # ---------------------------------------------- a per-caller length floor
-def _fake_model_verifier(monkeypatch):
+def _fake_model_verifier(monkeypatch, tmp_path):
     import torch
 
     import jarvis.speaker as speaker_mod
@@ -254,6 +254,13 @@ def _fake_model_verifier(monkeypatch):
         def encode_batch(self, waveform):
             return torch.ones(1, 1, 192) / np.sqrt(192)
 
+    # enroll_from_audio -> save() writes speaker_mod.VOICEPRINT_FILE. On
+    # 2026-09-02 this fixture lacked the redirect and the enrolment case below
+    # replaced Hunter's live 6-sample pool with two copies of the constant
+    # vector above; his own clips then scored 0.055-0.125 against a 0.30
+    # threshold. tests/conftest.py now redirects PATHS.VOICEPRINT as well --
+    # this is the per-test half of the same guard.
+    monkeypatch.setattr(speaker_mod, "VOICEPRINT_FILE", tmp_path / "voiceprint.npz")
     v = speaker_mod.SpeakerVerifier()
     monkeypatch.setattr(v, "_ensure_model", lambda: True)
     monkeypatch.setattr(v, "_model", FakeModel(), raising=False)
@@ -263,12 +270,12 @@ def _fake_model_verifier(monkeypatch):
     return v
 
 
-def test_a_short_wake_word_can_be_scored_when_the_caller_asks(monkeypatch):
+def test_a_short_wake_word_can_be_scored_when_the_caller_asks(monkeypatch, tmp_path):
     """The wake gate scores a 2 s ring buffer, and a lone "Jarvis" in a quiet
     room is 0.4-0.9 s of it: measured 2026-09-02 against his own voiceprint,
     6 of his 10 wake clips return None at the 1.0 s floor and 0 of 10 at
     0.35 s. The floor is therefore a per-call argument, not a module fact."""
-    v = _fake_model_verifier(monkeypatch)
+    v = _fake_model_verifier(monkeypatch, tmp_path)
     clip = np.concatenate([_silence(0.7), _speech(0.6, seed=3), _silence(0.7)])
 
     assert v.score(clip) is None, "the default floor must be unchanged"
@@ -276,18 +283,18 @@ def test_a_short_wake_word_can_be_scored_when_the_caller_asks(monkeypatch):
     assert v._extract_embedding(clip, min_seconds=MIN_SPEECH_SECONDS) is not None
 
 
-def test_the_lowered_floor_still_refuses_what_it_cannot_judge(monkeypatch):
+def test_the_lowered_floor_still_refuses_what_it_cannot_judge(monkeypatch, tmp_path):
     """MIN_SPEECH_SECONDS is the module's own "below this we cannot tell"
     line, so it is a floor and not an off switch. The 0.349 s wake of
     2026-08-28 16:41:32.959 is the buffer this turns away."""
-    v = _fake_model_verifier(monkeypatch)
+    v = _fake_model_verifier(monkeypatch, tmp_path)
     assert v.score(_speech(0.2, seed=4), min_seconds=MIN_SPEECH_SECONDS) is None
 
 
-def test_every_other_caller_keeps_the_full_second(monkeypatch):
+def test_every_other_caller_keeps_the_full_second(monkeypatch, tmp_path):
     """verify, enrol, add_sample and filter_segments are transcript-length
     paths; the short-buffer relief is the wake gate's alone."""
-    v = _fake_model_verifier(monkeypatch)
+    v = _fake_model_verifier(monkeypatch, tmp_path)
     seen = []
     real = v._extract_embedding
     monkeypatch.setattr(v, "_extract_embedding",
@@ -295,3 +302,26 @@ def test_every_other_caller_keeps_the_full_second(monkeypatch):
     v.verify(np.concatenate([_speech(2.0, seed=5), _silence(0.5)]))
     v.enroll_from_audio(_speech(2.0, seed=6))
     assert seen == [MIN_AUDIO_SECONDS, MIN_AUDIO_SECONDS]
+    # the enrolment above must have landed in tmp_path, not on his real pool
+    assert (tmp_path / "voiceprint.npz").exists(), "enrol wrote somewhere else"
+
+
+def test_the_suite_never_targets_his_enrolled_voice():
+    """The one shared file in this module with no undo.
+
+    2026-09-02: the fixture above was written without a VOICEPRINT_FILE
+    redirect, so its enrolment case ran save() against
+    ~/.aiws_trainer/voiceprint.npz on every suite run and replaced his
+    6-sample pool with two copies of np.ones(192)/sqrt(192). Measured against
+    that pool with real ECAPA, his own enrolment clips score 0.055-0.125 under
+    a 0.30 threshold, and app._decode_clip -> filter_segments fails SHUT, so
+    the next restart would have dropped every command he spoke. A monkeypatch
+    inside one fixture is not a firewall; this pins the redirect that is.
+    """
+    import jarvis.speaker as speaker_mod
+    from pathlib import Path
+    from jarvis.config import PATHS
+    live = Path.home() / ".aiws_trainer" / "voiceprint.npz"
+    assert PATHS.VOICEPRINT != live, "PATHS.VOICEPRINT is the live file"
+    assert speaker_mod.VOICEPRINT_FILE != live, \
+        "speaker.VOICEPRINT_FILE is the live file: any enrol in the suite eats it"

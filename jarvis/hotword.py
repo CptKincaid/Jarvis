@@ -126,7 +126,9 @@ def wake_hit(predictions, threshold, unverified_threshold):
 # "Jarvis" in a quiet room is 0.40-0.88 s of it on 6 of his 10 recorded wake
 # clips.  Those used to score None and pass on the fail-open; since 2026-09-02
 # _speaker_ok asks for a number at MIN_SPEECH_SECONDS instead, so the gate
-# sees them (10 of 10 scored, was 4 of 10) rather than waving them through.
+# SEES them (10 of 10 scored, was 4 of 10).  It still waves them through --
+# under MIN_AUDIO_SECONDS of isolated speech both branches wake him -- so what
+# the lower floor changed is the log, not the verdict; see _speaker_ok.
 #
 # This is a preference, NOT a veto. It was written as one on 2026-08-28 after
 # a wake fired on 0.349 s of audio at 16:41:32.959 -- but that wake was not a
@@ -255,12 +257,16 @@ def frames_agree(history, window, required):
 def ambient_dbfs(audio, rate: int, frame_s: float = 0.02) -> tuple[float, float]:
     """(whole-buffer RMS, 20th-percentile 20 ms frame RMS) in dBFS.
 
-    Calibration data for the music gate, nothing decides on it.  The whole
-    buffer says how loud the room was while he said the word; the low
-    percentile of short frames is the bed under his voice -- with music on it
-    sits far above a quiet room's -60 dBFS, and it is that number the
-    SPEAKER_WAKE_MIN_MUSIC evidence needs next to each score.  -120 dBFS
-    stands for digital silence so the line stays parseable.
+    Calibration data, nothing decides on it.  The whole buffer says how loud
+    the room was while he said the word; the low percentile of short frames is
+    the bed under his voice.  That floor is the one honest bed detector on the
+    line -- measured 2026-09-02 on his own 2 s wake buffers, quiet room
+    -49.9..-45.2 dBFS, the same buffers under a x2 room bed -44.0..-38.6 and
+    under x4 -39.5..-34.4 -- and it is what _speaker_ok's remaining hole needs
+    to close.  It stays calibration and not a threshold because x1 already
+    overlaps the quiet room (-47.1..-41.8), so the line wants field data, not
+    a constant read off mixes made here.  -120 dBFS stands for digital silence
+    so the line stays parseable.
     """
     a = np.asarray(audio, dtype=np.float32).ravel()
     if a.size == 0:
@@ -293,17 +299,31 @@ class Hotword:
                                  # measured near 0.0, leaving ample room.
     # There is deliberately no second, softer bar for music.  One was tried
     # (SPEAKER_WAKE_MIN_MUSIC = 0.10, 2026-09-01) and it was a threshold
-    # placed inside an overlap.  Measured 2026-09-02, his own wake word over a
-    # room bed scores -0.074..0.321 while the bed ALONE scores -0.114..0.156;
-    # 6 of his 10 land inside the bed's range.  Sweeping every bar from -0.20
-    # to 0.45, the BEST one anywhere is 0.090 and it still refuses 4 of his 10
-    # while admitting 1 of 12 beds -- 0.10 scores exactly the same, so the
-    # shipped bar was already optimal and optimal is not good enough.
-    # Widening the evidence separates no better: best-of-1 s-windows over the
-    # buffer admits his 1/10 and the bed 0/12, identical to the pooled score,
-    # and each buffer's best window against its own median gives his
-    # 0.019..0.270 (median 0.079) against the bed's 0.016..0.138 (median
-    # 0.076).  So the gate does not guess: see _speaker_ok.
+    # placed inside an overlap -- but only at a LOUD bed, and the first
+    # writing of this comment left that out.  Re-derived 2026-09-02 with the
+    # mix stated, so it can be falsified: the last 2 s of each of his 10
+    # ~/.aiws_trainer/wakeword_training/positive/hey_jarvis_*.wav, mixed with
+    # ~/.aiws_trainer/threshold_clips/room tiled at gain g, scored against a
+    # 10-sample pool built from ~/.aiws_trainer/threshold_clips/me.  The bed
+    # ALONE (12 buffers) scores -0.035..0.154 at every g -- speechbrain
+    # normalises, so bed-only scores are gain-invariant -- and he scores:
+    #
+    #   g    bed floor        his range        best bar  refuses  admits
+    #   x1   -47.1..-41.8   -0.095..0.461        0.155     3/10    0/12
+    #   x2   -44.0..-38.6   -0.053..0.393        0.155     3/10    0/12
+    #   x4   -39.5..-34.4   -0.040..0.384        0.065     3/10    2/12
+    #   x8   -35.8..-28.8   -0.049..0.395        0.065     4/10    2/12
+    #
+    # (best bar = the one minimising refusals+admissions over -0.20..0.45.)
+    # So a bar DOES separate under a quiet bed and stops separating around x4,
+    # where 4 of his 10 fall inside the bed's own range.  The abstention is
+    # chosen for the loud-bed case, which is the one that actually refused him
+    # on 2026-09-01 -- not because no bar ever works.  Widening the evidence
+    # did not rescue the loud case either: best-of-1 s-windows over the buffer
+    # admits his 1/10 and the bed 0/12, identical to the pooled score, and
+    # each buffer's best window against its own median gives his 0.019..0.270
+    # (median 0.079) against the bed's 0.016..0.138 (median 0.076).  So the
+    # gate does not guess: see _speaker_ok.
 
     def __init__(self, arbiter, get_mic_index: Callable, on_detect: Callable,
                  speaker=None, on_guest: Callable = None,
@@ -357,53 +377,79 @@ class Hotword:
         transcript gate still fails shut behind this. Each layer fails the
         safe way for its own position.
 
-        So a REJECTION needs evidence that a rejection is warranted, not just
-        a number under the bar.  A score is evidence only when the buffer
-        could carry it, and two buffers cannot (both measured 2026-09-02
-        against his own voiceprint):
+        So a REJECTION should need evidence that a rejection is warranted,
+        not just a number under the bar.  Two buffers cannot carry that
+        evidence; the gate catches one of them and, honestly, only PART of
+        the other.  All numbers measured 2026-09-02 against a pool built from
+        his own ~/.aiws_trainer/threshold_clips/me.
 
         Too little speech.  The verifier is asked for a number at
         speaker.MIN_SPEECH_SECONDS rather than its 1.0 s default, because the
         2 s ring buffer holds only 0.40-0.88 s of trimmed speech on 6 of his
         10 recorded wake clips and the default returned None on every one --
         the gate was blind on most wakes and waved them through on the
-        fail-open.  At 0.35 s those six score -0.059..0.273, so the gate can
+        fail-open.  At 0.35 s those six score -0.057..0.280, so the gate can
         finally see them.  Only one of the six clears 0.25, and the worst is
         why the number alone still cannot justify a refusal: hey_jarvis_04 is
-        0.66 s of HIS voice at -0.059, deep in the impostor band.  Under
-        MIN_AUDIO_SECONDS of speech the gate therefore accepts a good score
-        and abstains on a bad one, exactly as speaker.verify does at its own
-        ABSTAIN_SECONDS.  Net over his 10 clips: he still wakes 9/10, and the
-        gate now has a real number on 10 of 10 instead of 4 of 10.
+        0.66 s of HIS voice at -0.057, deep in the impostor band.  Under
+        MIN_AUDIO_SECONDS of isolated speech the gate therefore abstains on a
+        bad score, exactly as speaker.verify does at its own ABSTAIN_SECONDS.
+        Net over his 10 clips: he still wakes 9/10, and the gate now has a
+        real number on 10 of 10 instead of 4 of 10.
 
-        A competing bed.  Over music the verifier cannot trim the bed away
-        (trim_silence finds no threshold in a flat clip), so the whole buffer
-        is embedded and his own voice scores like a stranger: 0.135 and 0.158
-        on 2026-09-01, refused, and answered with the guest line twice.  No
-        bar fixes that -- the best one that exists still refuses 4 of his 10
-        (see SPEAKER_WAKE_MIN) -- so while music is known playing a failing
-        score is an abstention.  Measured over a bed, that takes him from
-        6/10 to 10/10 with a confident wake word and from 1/10 to 10/10 with
-        a marginal one, which matters because hey_jarvis fires from 0.3 and 9
+        Be precise about what the lowered floor bought, because it is easy to
+        overclaim: on the short-buffer path it changes no VERDICT.  Below
+        MIN_AUDIO_SECONDS the accept branch and the abstain branch both
+        return True, so a 0.30 and a -0.30 are the same wake; the argument
+        buys the log line a number where it used to print "none", and that
+        number is the only calibration data this gate will ever have.  Above
+        MIN_AUDIO_SECONDS the 1.0 s default would have produced the same
+        score anyway.  Instrumentation, not a decision.
+
+        A competing bed.  Over music the verifier cannot trim the bed away,
+        so the whole buffer is embedded and his own voice scores like a
+        stranger: 0.135 and 0.158 on 2026-09-01, refused, and answered with
+        the guest line twice.  Under a loud bed no bar fixes that (see
+        SPEAKER_WAKE_MIN), so while music is KNOWN playing a failing score is
+        an abstention.  Measured over a bed, that takes him from 6/10 to
+        10/10 with a confident wake word and from 1/10 to 10/10 with a
+        marginal one, which matters because hey_jarvis fires from 0.3 and 9
         of the 30 suppressions on record sat under the old oww>=0.6
         precondition.  The cost is stated rather than hidden: a bed that
-        trips oww on its own went from 4 of 12 waking him to 12 of 12.  That
-        is the right way round for a wake word in his own home, and the
-        transcript gate in app.py still fails shut behind this one.
+        trips oww on its own went from 4 of 12 waking him to 12 of 12.  The
+        transcript gate in app.py still fails shut behind this one -- and
+        that, not "he is listening to music anyway", is what makes the trade
+        payable, because music_playing is a CACHE: tools/spotify refreshes it
+        every POLL_PLAYING_S (30 s) and only expires it after PLAYING_TTL_S
+        (150 s), so for up to half a minute in normal running -- and up to
+        two and a half minutes while the poller is backing off -- the gate is
+        wide open in a room that has already gone silent.
 
+        THE HOLE, stated because the invariant above does not fully hold.
         The media signal is Spotify's cache and nothing else (app.py ->
         mixer.music_playing -> tools/spotify), so a TV, a browser or a phone
-        leaves the full bar in place: measured, he wakes 1/10 over an
-        unflagged bed, before and after.  The buffer's own noise floor is the
-        honest second source and is already on the log line below -- his
-        quiet-room wake buffers floor at -49.9..-45.2 dBFS, so a raised floor
-        is visible -- but where to put the line needs field data, not a
-        constant guessed from mixes made here.
+        leaves the full bar in place: he wakes 1/10 over an unflagged bed,
+        before and after.  In that case the too-little-speech abstention
+        ALSO disengages, because a bed lifts every frame past the trim's
+        adaptive threshold and the bounds widen to cover the room.  Measured:
+        hey_jarvis_05 holds 0.52 s of speech dry and scores 0.277 -> accept;
+        the same clip under a x4 room bed reports 1.46 s and scores 0.183 ->
+        suppress, on exactly the same 0.52 s of him.  So over an unflagged
+        bed the gate can still refuse him on a number no buffer could carry.
+        This is not a regression (the old code suppressed those buffers too),
+        but it is the remaining gap, and the log below no longer hides it:
+        `trimmed=` prints only when the trim actually cut something, so a
+        widened or absent trim reads `trimmed=none` instead of claiming two
+        seconds of speech.  Closing the gap properly wants the buffer's own
+        noise floor, which is already on the line (ambient_dbfs: quiet room
+        -49.9..-45.2 dBFS, x2 bed -44.0..-38.6) -- but the two overlap at x1,
+        so where to put that line needs field data, not a constant guessed
+        from mixes made here.
 
-        Every candidate is logged on ONE line -- speaker score, seconds of
-        speech it was taken over, oww score, music state, ambient level --
-        because half of these verdicts turn on the seconds, and that term was
-        missing from the line until 2026-09-02.
+        Every candidate is logged on ONE line -- speaker score, the seconds
+        the trim isolated, oww score, music state, ambient level -- because
+        half of these verdicts turn on the seconds, and that term was missing
+        from the line until 2026-09-02.
         """
         speaker = getattr(self, "_speaker", None)
         if speaker is None or not getattr(speaker, "is_enrolled", False):
@@ -416,16 +462,23 @@ class Hotword:
             rms, floor = ambient_dbfs(audio, native_rate)
         except Exception:  # noqa: BLE001 - calibration must never block a wake
             rms, floor = float("nan"), float("nan")
-        speech_s = float("nan")
+        trimmed_s = None
         try:
             if native_rate != 16000:
                 from scipy.signal import resample
                 audio = resample(
                     audio, int(len(audio) * 16000 / native_rate)).astype("float32")
-            # The seconds the embedding is actually taken over, by the same
-            # trim the verifier applies -- not the buffer length.
-            speech_s = (len(speaker_mod.trim_silence(audio))
-                        / speaker_mod.SAMPLE_RATE)
+            # What the verifier's own trim isolated inside the buffer -- and
+            # whether it isolated ANYTHING, which is the part that was wrong
+            # until 2026-09-02.  trim_silence returns the buffer unchanged
+            # when it cannot find endpoints, so a flat clip used to print
+            # "2.00s of speech" for digital silence, and a bed that lifts
+            # every frame past the adaptive threshold printed the room.  None
+            # means "the trim could not cut this", which is not a speech
+            # measurement and must never be read as one (see the docstring).
+            trimmed = speaker_mod.trim_silence(audio)
+            if len(trimmed) < len(audio):
+                trimmed_s = len(trimmed) / speaker_mod.SAMPLE_RATE
             score = speaker.score(audio,
                                   min_seconds=speaker_mod.MIN_SPEECH_SECONDS)
         except Exception:
@@ -436,21 +489,28 @@ class Hotword:
             verdict, ok = "abstain", True
         elif score >= wake_min:
             verdict, ok = "accept", True
-        elif speech_s < speaker_mod.MIN_AUDIO_SECONDS:
+        elif trimmed_s is not None and trimmed_s < speaker_mod.MIN_AUDIO_SECONDS:
+            # Only a MEASURED shortfall abstains.  An uncut buffer is not
+            # evidence of too little speech -- it is no evidence either way --
+            # so digital silence and a television still fall through to the
+            # bar rather than being waved past it.
             verdict, ok = "abstain (too little speech)", True
         elif music:
             verdict, ok = "abstain (music)", True
         else:
             verdict, ok = "suppress", False
-        log.info("wake candidate: speaker=%s speech=%.2fs oww=%.3f music=%s "
+        log.info("wake candidate: speaker=%s trimmed=%s oww=%.3f music=%s "
                  "rms=%.1f dBFS floor=%.1f dBFS gate=%.2f -> %s",
-                 "none" if score is None else "%.3f" % score, speech_s,
+                 "none" if score is None else "%.3f" % score,
+                 "none" if trimmed_s is None else "%.2fs" % trimmed_s,
                  float(oww_score), music, rms, floor, wake_min, verdict)
         if score is None:
             log.warning("wake speaker check unavailable -- waking anyway")
         elif not ok:
-            log.info("wake suppressed: speaker score %.3f < %.2f on %.2fs of "
-                     "speech", score, wake_min, speech_s)
+            log.info("wake suppressed: speaker score %.3f < %.2f on %s",
+                     score, wake_min,
+                     "an untrimmable buffer" if trimmed_s is None
+                     else "%.2fs of speech" % trimmed_s)
         return ok
 
     def _warm_speaker(self):

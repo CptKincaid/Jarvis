@@ -83,10 +83,21 @@ class FakeSpeaker:
         self.floors = []
 
     def score(self, audio_16k, min_seconds=None):
+        """Faithful about the ONE thing the gate's change turns on: the real
+        SpeakerVerifier returns None when the TRIMMED audio is shorter than
+        the caller's floor, which defaults to MIN_AUDIO_SECONDS.  A stub that
+        always hands back a number cannot tell the new gate from a414152 --
+        every short buffer scores there too, and a test asserting only the
+        bool passes on both trees."""
+        import jarvis.speaker as speaker_mod
         self.calls += 1
         self.floors.append(min_seconds)
         if isinstance(self._value, Exception):
             raise self._value
+        floor = (speaker_mod.MIN_AUDIO_SECONDS if min_seconds is None
+                 else min_seconds)
+        if len(speaker_mod.trim_silence(audio_16k)) < 16000 * floor:
+            return None
         return self._value
 
 
@@ -164,11 +175,16 @@ def test_disabling_speaker_verify_disables_the_wake_gate(audio):
 #   deep inside the impostor band.  Scoring those and rejecting on the result
 #   would cost him real wakes.
 #
-#   a competing bed -- over room noise his own wake word scores -0.074..0.321
-#   while the bed ALONE scores -0.114..0.156, and 6 of his 10 land inside the
-#   bed's range.  The best bar that exists anywhere is 0.090 and it still
-#   refuses 4 of his 10; best-of-windows and a per-buffer lift statistic were
-#   both measured and separate no better.
+#   a competing bed -- but only a LOUD one, and the first writing of this
+#   comment left the mix out.  His 10 wake clips mixed with
+#   ~/.aiws_trainer/threshold_clips/room, scored against a pool built from
+#   ~/.aiws_trainer/threshold_clips/me: the bed ALONE scores -0.035..0.154 at
+#   every gain, while he scores -0.095..0.461 at x1 (1 of 10 inside the bed's
+#   range, best bar 0.155 refusing 3/10 and admitting 0/12) and -0.040..0.384
+#   at x4 (4 of 10 inside, best bar 0.065 refusing 3/10 and admitting 2/12).
+#   So a bar separates under a quiet bed and stops separating around x4.  The
+#   abstention is chosen for the loud case -- the one that actually refused
+#   him on 2026-09-01 -- not because no bar ever works.
 def _speech(seconds, amp=0.2, seed=0):
     """Syllable-like speech: broadband noise under a 4 Hz envelope, so
     speaker.trim_silence can find its endpoints (flat noise it cannot)."""
@@ -196,6 +212,32 @@ def gate_with(speaker, audio, music, oww, native_rate=16000):
     return h._speaker_ok(audio, native_rate, oww_score=oww)
 
 
+def verdict_of(caplog, speaker, audio, music, oww, native_rate=16000):
+    """(wake?, the one candidate line).  A bare True is not enough to tell
+    "that is him" from "I could not tell": below MIN_AUDIO_SECONDS both
+    branches return True, so a test that only asserts the bool passes on the
+    code that had no accept branch at all (checked against a414152)."""
+    caplog.clear()
+    with caplog.at_level("INFO", logger="jarvis.hotword"):
+        ok = gate_with(speaker, audio, music, oww, native_rate)
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith("wake candidate:")]
+    assert len(lines) == 1, lines
+    return ok, lines[0]
+
+
+def _bed(n, amp=0.02, seed=7):
+    """A room bed: broadband noise under a slow, uneven envelope, so its
+    per-frame RMS has the spread real room noise has and flat noise has not.
+    That spread is what defeats speaker.trim_silence -- the threshold is
+    max(peak*0.08, p10*3), so a bed whose quiet tenth stays low while its
+    body clears 8% of his peak lifts the trim's endpoints out to the room."""
+    rng = np.random.default_rng(seed)
+    t = np.arange(n) / 16000
+    env = 0.15 + np.abs(np.sin(2 * np.pi * 0.7 * t) * np.sin(2 * np.pi * 0.23 * t + 1.0))
+    return (rng.normal(0, amp, n) * env).astype(np.float32)
+
+
 def test_the_gate_asks_for_a_number_on_a_short_buffer(audio):
     """It used to take the module default and get None back on 6 of his 10
     own wake clips, so the gate was blind on most wakes and fell open."""
@@ -205,25 +247,75 @@ def test_the_gate_asks_for_a_number_on_a_short_buffer(audio):
     assert spk.floors == [speaker_mod.MIN_SPEECH_SECONDS]
 
 
-def test_too_little_speech_abstains_instead_of_refusing_him(audio):
-    """hey_jarvis_04: 0.66 s of his own voice scoring -0.059.  Rejecting on
+def test_too_little_speech_abstains_instead_of_refusing_him(caplog):
+    """hey_jarvis_04: 0.66 s of his own voice scoring -0.057.  Rejecting on
     that number is rejecting on noise."""
-    short = _buffer(0.66)
-    assert gate_with(FakeSpeaker(-0.059), short, music=False, oww=0.9) is True
+    ok, line = verdict_of(caplog, FakeSpeaker(-0.057), _buffer(0.66),
+                          music=False, oww=0.9)
+    assert ok is True and "-> abstain (too little speech)" in line
 
 
-def test_enough_speech_is_still_judged_on_the_score(audio):
-    """hey_jarvis_09: 2.0 s of trimmed speech at -0.134.  That much audio is
+def test_enough_speech_is_still_judged_on_the_score(caplog):
+    """hey_jarvis_09: 2.0 s of trimmed speech at -0.122.  That much audio is
     evidence, so the refusal stands."""
-    assert gate_with(FakeSpeaker(-0.134), audio, music=False, oww=0.9) is False
+    ok, line = verdict_of(caplog, FakeSpeaker(-0.122), _buffer(1.6),
+                          music=False, oww=0.9)
+    assert ok is False and "-> suppress" in line and "trimmed=1.64s" in line
 
 
-def test_a_good_score_on_a_short_buffer_is_a_positive_recognition(audio):
+def test_a_good_score_on_a_short_buffer_is_a_positive_recognition(caplog):
     """The point of the lower floor: the 6 buffers that used to score None
-    land at -0.059..0.273, so the gate can say "that is him" instead of only
-    ever failing open on a None."""
-    short = _buffer(0.52)
-    assert gate_with(FakeSpeaker(0.273), short, music=False, oww=0.9) is True
+    land at -0.057..0.280, so the gate can say "that is him" instead of only
+    ever failing open on a None.
+
+    Asserted on the VERDICT, because the bool cannot see it: this buffer
+    abstains at any score, so `is True` alone passed unchanged on a414152,
+    where there was no accept branch to reach."""
+    ok, line = verdict_of(caplog, FakeSpeaker(0.273), _buffer(0.52),
+                          music=False, oww=0.9)
+    assert ok is True and "-> accept" in line
+
+
+def test_the_lower_floor_bought_a_log_field_not_a_verdict(caplog):
+    """Stated so nobody sells it as more than it is (2026-09-02 review).
+
+    Under MIN_AUDIO_SECONDS of isolated speech the accept branch and the
+    abstain branch both wake him, so the score changes only what the line
+    says.  That IS worth having -- it is the only calibration record this
+    gate will ever produce -- but it is not a decision."""
+    good, gline = verdict_of(caplog, FakeSpeaker(0.30), _buffer(0.52),
+                             music=False, oww=0.9)
+    bad, bline = verdict_of(caplog, FakeSpeaker(-0.30), _buffer(0.52),
+                            music=False, oww=0.9)
+    assert good is bad is True, "the verdict must not depend on the score here"
+    assert "-> accept" in gline and "-> abstain (too little speech)" in bline
+    assert "speaker=0.300" in gline and "speaker=-0.300" in bline
+
+
+def test_a_bed_can_still_refuse_him_on_speech_the_gate_never_measured(caplog):
+    """The hole in the invariant, pinned rather than papered over.
+
+    trim_silence's threshold is relative to the clip's own peak and floor, so
+    an unflagged bed (a TV, a browser, a phone -- the media signal is Spotify
+    ONLY) lifts the endpoints out to the room and the too-little-speech
+    abstention quietly disengages.  Measured 2026-09-02 on his own clips:
+    hey_jarvis_05 holds 0.52 s of speech and scores 0.277 dry, and reports
+    1.46 s at 0.183 under a x4 room bed.  Same speech, opposite verdict.
+
+    Not a regression -- a414152 suppressed these buffers too -- so this test
+    pins the CURRENT truth, and fails the day someone closes the gap (the
+    floor on the same log line is how: -49.9..-45.2 dBFS quiet against
+    -44.0..-38.6 under a x2 bed)."""
+    speech = _buffer(0.52)
+    bedded = (speech + _bed(len(speech))).astype(np.float32)
+    dry_ok, dry_line = verdict_of(caplog, FakeSpeaker(0.183), speech,
+                                  music=False, oww=0.9)
+    bed_ok, bed_line = verdict_of(caplog, FakeSpeaker(0.183), bedded,
+                                  music=False, oww=0.9)
+    assert dry_ok is True and "trimmed=0.56s" in dry_line
+    assert bed_ok is False and "-> suppress" in bed_line
+    assert "trimmed=1.12s" in bed_line, \
+        "the bed doubled the reported seconds without adding any speech"
 
 
 # ------------------------------------------------- the gate while music plays
@@ -282,25 +374,44 @@ def test_there_is_one_bar_and_no_second_one():
     assert hw.Hotword.SPEAKER_WAKE_MIN == 0.25
 
 
-def test_every_scored_candidate_is_logged_on_one_line(audio, caplog):
-    """The calibration record: speaker score, oww score, music state and the
-    buffer's ambient level together, so the bar can be re-derived from the
-    log instead of from memory."""
-    audio = (np.random.default_rng(0).standard_normal(32000) * 0.03).astype(np.float32)
+def test_every_scored_candidate_is_logged_on_one_line(caplog):
+    """The calibration record: speaker score, the seconds the trim isolated,
+    oww score, music state and the buffer's ambient level together, so the
+    bar can be re-derived from the log instead of from memory."""
+    flat = (np.random.default_rng(0).standard_normal(32000) * 0.03).astype(np.float32)
     with caplog.at_level("INFO", logger="jarvis.hotword"):
-        gate_with(FakeSpeaker(0.135), audio, music=True, oww=0.713)
-        gate_with(FakeSpeaker(0.135), audio, music=False, oww=0.713)
-        gate_with(FakeSpeaker(None), audio, music=False, oww=0.713)
+        gate_with(FakeSpeaker(0.135), flat, music=True, oww=0.713)
+        gate_with(FakeSpeaker(0.135), flat, music=False, oww=0.713)
+        gate_with(FakeSpeaker(None), flat, music=False, oww=0.713)
     lines = [r.getMessage() for r in caplog.records
              if r.getMessage().startswith("wake candidate:")]
     assert len(lines) == 3
-    assert ("speaker=0.135 speech=2.00s oww=0.713 music=True rms=-30." in lines[0]
+    assert ("speaker=0.135 trimmed=none oww=0.713 music=True rms=-30." in lines[0]
             and "-> abstain (music)" in lines[0])
     assert "music=False" in lines[1] and "gate=0.25 -> suppress" in lines[1]
     assert "speaker=none" in lines[2] and "-> abstain" in lines[2]
-    # The seconds of speech the score was taken over decide half these
-    # verdicts and were invisible until now; that omission cost a day.
-    assert all("speech=2.00s" in ln for ln in lines)
+
+
+def test_a_buffer_the_trim_could_not_cut_is_not_seconds_of_speech(caplog):
+    """speaker.trim_silence returns the audio UNCHANGED when speech_bounds
+    finds no endpoints, so the first version of this field printed
+    "speech=2.00s" for digital silence and for a sustained tone -- and a
+    calibration field that reports a trim failure as two seconds of speech is
+    worse than no field.  It now reports what happened: nothing was cut.
+
+    The VERDICT is deliberately unchanged.  An uncut buffer is not evidence
+    of too little speech, so silence and a television still fall through to
+    the bar instead of being waved past it."""
+    for name, buf in (("silence", np.zeros(32000, dtype=np.float32)),
+                      ("tone", (0.1 * np.sin(2 * np.pi * 440 *
+                                             np.arange(32000) / 16000)
+                                ).astype(np.float32))):
+        ok, line = verdict_of(caplog, FakeSpeaker(-0.034), buf,
+                              music=False, oww=0.9)
+        assert "trimmed=none" in line, f"{name}: {line}"
+        assert ok is False and "-> suppress" in line, f"{name}: {line}"
+        assert "an untrimmable buffer" in caplog.text, \
+            "the suppression line must not claim seconds it never measured"
 
 
 def test_ambient_dbfs_reads_the_bed_under_the_voice():

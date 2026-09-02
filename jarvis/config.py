@@ -43,7 +43,15 @@ class PATHS:
     # user's real ~/.aiws_trainer/jarvis_data.
     LEGACY_AGENT_DIR = Path(os.environ.get("JARVIS_LEGACY_DIR") or
                             (AIWS / "jarvis_data"))
-    VOICEPRINT = AIWS / "voiceprint.npz"
+    # JARVIS_VOICEPRINT keeps the suite off the user's enrolled voice.
+    # On 2026-09-02 a test built a real SpeakerVerifier and called
+    # enroll_from_audio, whose save() writes this global: it replaced his
+    # 6-sample pool with two copies of the fixture's constant vector
+    # (every element 0.07216878), against which his own enrolment clips
+    # score 0.055-0.125 under a 0.30 threshold -- voice dead at the next
+    # restart. Unset in production, so the live app is unaffected.
+    VOICEPRINT = Path(os.environ.get("JARVIS_VOICEPRINT") or
+                      (AIWS / "voiceprint.npz"))
     HEY_JARVIS_VERIFIER = AIWS / "hey_jarvis_verifier.pkl"
     SPEAK_QUEUE = LOG_DIR / "speak_queue.txt"
     # Chosen by ear 2026-08-28: 35.8s built from three different Fish

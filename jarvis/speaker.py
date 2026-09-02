@@ -413,8 +413,11 @@ class SpeakerVerifier:
 
         min_seconds lets such a caller trade a weaker number for having one at
         all. It is the caller's job to then treat a weak number as weak: the
-        wake gate scores at MIN_SPEECH_SECONDS and refuses to REJECT on
-        anything under MIN_AUDIO_SECONDS.
+        wake gate scores at MIN_SPEECH_SECONDS and, where it can MEASURE that
+        the buffer held less than MIN_AUDIO_SECONDS of speech, refuses to
+        reject on the result. Measured 2026-09-02, that relief is confined to
+        the log on the wake path -- both of its branches wake him below the
+        floor -- so this argument is instrumentation, not a policy hook.
         """
         if not self.is_enrolled:
             return None
