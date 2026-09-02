@@ -66,10 +66,35 @@ def test_am_pm_spelling_variants_are_all_caught():
         assert said.startswith("six pee em"), (suffix, said)
 
 
+# 2026-09-02: this test used to assert that a bare "3:15" and a bare
+# "Wisenbaker 049" were left alone, on the reasoning that without an am/pm
+# marker a colon number is more likely a ratio or a score. That reasoning
+# cost him a rushed line -- "Your 9:10 is Biosensors, Wisenbaker 049" at
+# 08:55 -- because F5 allocates duration BY THE BYTE, so digits are
+# systematically under-timed and the model compresses to fit. Both are now
+# rewritten; the module comment carries the arithmetic and the evidence (18
+# of 18 bare "h:mm" strings spoken across two boots were clock readings).
+# What is still hands-off is what the narrowed shapes exclude.
 def test_things_that_merely_look_like_times_are_left_alone():
-    # no am/pm marker -> not confidently a clock time, so hands off
-    for text in ("a 16:9 aspect ratio", "the score was 3:15", "Wisenbaker 049"):
+    for text in (
+            "a 16:9 aspect ratio",    # 1-digit minute: not a clock shape
+            "a 4:3 crop",
+            "08:56:15",               # a timestamp is not a reading
+            "ETB 1035",               # no leading zero: not a room, to us
+            "78 days",                # a quantity, and it must stay one
+            "10 minutes",
+    ):
         assert pronounce.apply(text) == text
+
+
+def test_the_numbers_that_rushed_him_are_now_words():
+    """2026-09-02 08:55:50, the exact string F5 was handed."""
+    said = pronounce.apply(
+        "While you were out, sir: one message. "
+        "Your 9:10 is Biosensors, Wisenbaker 049.")
+    assert said == ("While you were out, sir: one message. "
+                    "Your nine ten is Biosensors, "
+                    "Wisenbaker zero four nine.")
 
 
 def test_it_still_does_its_original_vocabulary_job():

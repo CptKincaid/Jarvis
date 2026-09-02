@@ -243,3 +243,159 @@ def test_shouted_three_letter_words(raw, out):
 def test_shouted_calendar_title_end_to_end(table):
     assert table.apply("9:10 am BIOSENSORS LAB II") == \
         "nine ten ay em Biosensors Lab II"
+
+
+# ------------------------------------------------------- bare clock times
+#
+# 2026-09-02 08:55, heard: "Your 9:10 is Biosensors, Wisenbaker 049" was
+# rattled off. Nothing rewrote either number, so F5 was handed a 40-byte
+# chunk and F5 buys time by the BYTE (scripts/f5_server.py: floor
+# 0.45 + 0.04988*bytes below 41.3 bytes, native K = 0.06079 s/byte above it,
+# and the floor ignores speed). 2.44 s allocated against 3.00 s of speech.
+# Expanding the numbers is the whole fix: it is what the hyphen fix was, one
+# layer along -- the transcript and the card keep the digits and only the
+# engine sees the words.
+@pytest.mark.parametrize("raw,spoken", [
+    ("Your 9:10 is Biosensors.", "Your nine ten is Biosensors."),
+    ("Your 12:45 is Biosensors.", "Your twelve forty five is Biosensors."),
+    ("Tomorrow's 4:30.", "Tomorrow's four thirty."),
+    ("At 9:05.", "At nine oh five."),
+    ("At 10:15.", "At ten fifteen."),
+    ("At 8:22.", "At eight twenty two."),        # and no hyphen, per round 10
+    # On the hour: "Your four is Biosensors" is not English.
+    ("Your 4:00 is Biosensors.", "Your four o'clock is Biosensors."),
+    ("Your 12:00 is Biosensors.", "Your twelve o'clock is Biosensors."),
+    # a 24-hour hour still reads as the clock it is
+    ("At 09:10.", "At nine ten."),
+])
+def test_bare_clock_times_are_spoken(table, raw, spoken):
+    assert table.apply(raw) == spoken
+
+
+@pytest.mark.parametrize("raw", [
+    # Ratios and scores: the reason bare times were left alone until now. A
+    # two-digit minute and an hour of 1-12 is what rules every one of these
+    # out, and it is exactly the shape jarvis/dossier.py clock() emits.
+    "16:9",
+    "4:3",
+    "21:9",
+    "a 2:1 margin",
+    # a log timestamp is not a reading
+    "08:56:15",
+    "at 12:45:30 exactly",
+    # not a clock at all: glued to a word, or mid-number
+    "9:10ish",
+    "112:45",
+    "9:1",
+    "9:60",
+])
+def test_non_clock_colon_numbers_are_left_alone(table, raw):
+    assert table.apply(raw) == raw
+
+
+def test_bare_pass_never_invents_a_meridiem(table):
+    """He did not say am or pm, so neither does Jarvis."""
+    out = table.apply("Your 9:10 is Biosensors.")
+    assert "ay em" not in out and "pee em" not in out
+    assert "colon" not in out
+
+
+def test_marked_times_still_win_over_the_bare_pass(table):
+    """The bare pass runs second; a marked time keeps its marker."""
+    assert table.apply("It is 9:10 am. The inbox is quiet.") == \
+        "It is nine ten ay em. The inbox is quiet."
+    assert table.apply("Booked for 4:10 p.m. and again later.") == \
+        "Booked for four ten pee em and again later."
+    assert table.apply("Ready at 7:30 pm.") == "Ready at seven thirty pee em."
+
+
+# ---------------------------------------------------------- room numbers
+#
+# THE RULE: a 2-4 digit run with a LEADING ZERO is an identifier and is said
+# digit by digit. Nothing else. A leading zero is the one written form that
+# cannot be a quantity, so the rule has no ambiguous side; the quantities
+# below are pinned untouched. "ETB 1035" / "Ecen 404" / "731A" are real and
+# still wrong, and are left alone on purpose -- see the module comment.
+@pytest.mark.parametrize("raw,spoken", [
+    ("Wisenbaker 049", "Wisenbaker zero four nine"),
+    ("Wisenbaker 049.", "Wisenbaker zero four nine."),
+    ("in 049, sir", "in zero four nine, sir"),
+    ("room 07", "room zero seven"),
+    ("0800", "zero eight zero zero"),
+])
+def test_leading_zero_runs_are_spoken_digit_by_digit(table, raw, spoken):
+    assert table.apply(raw) == spoken
+
+
+@pytest.mark.parametrize("raw", [
+    # QUANTITIES. "10 minutes" must never become "one zero minutes".
+    "10 minutes",
+    "30 minutes",
+    "about 10 minutes",
+    "due in 78 days",
+    "a high of 95 degrees",
+    "500 of them",
+    "Volume 100, sir.",
+    "Yesterday: 179 turns",
+    "the 2025 championship",
+    # IDENTIFIERS WITHOUT A LEADING ZERO: out of scope, deliberately.
+    "ETB 1035",
+    "Ecen 404",
+    "PHYS 208",
+    "Jack E. Brown 731A",
+    # a leading zero that belongs to something else: dates, versions, decimals
+    "2026-09-02",
+    "1.049",
+    "0.5 seconds",
+    "v0.99",
+])
+def test_number_runs_that_are_not_room_numbers_are_left_alone(table, raw):
+    assert table.apply(raw) == raw
+
+
+def test_the_incident_line_end_to_end(table):
+    """The exact string F5 was handed at 08:55:50 on 2026-09-02.
+
+    The log prints the POST-pronunciation text (jarvis/tts.py _speak_sync),
+    which is how we know "BIOSENSORS" had already been un-shouted and the two
+    numbers had not been touched at all.
+    """
+    heard = ("While you were out, sir: one message. "
+             "Your 9:10 is Biosensors, Wisenbaker 049.")
+    assert table.apply(heard) == (
+        "While you were out, sir: one message. "
+        "Your nine ten is Biosensors, Wisenbaker zero four nine.")
+
+
+def test_the_incident_sentence_clears_the_f5_duration_floor(table):
+    """Why the expansion is the fix and not a rate setting.
+
+    scripts/f5_server.py pins a chunk under ~41 bytes to
+    0.45 + 0.04988*bytes and IGNORES speed there, so the only lever on how
+    long Jarvis takes over this sentence is how many bytes it is. At 40 bytes
+    it was floored at 2.44 s for 3.00 s of speech; expanded it is over the
+    threshold and takes F5's own (still byte-proportional) allotment.
+    """
+    said = table.apply("Your 9:10 is Biosensors, Wisenbaker 049.")
+    assert len("Your 9:10 is Biosensors, Wisenbaker 049.".encode()) < 41
+    assert len(said.encode()) > 41
+
+
+def test_the_card_keeps_the_digits():
+    """dossier.py composes the digits on purpose; only the engine sees words.
+
+    clock() and room_words() are what the card and the transcript show, so
+    they must be untouched by any of this.
+    """
+    from datetime import datetime
+    from jarvis import dossier
+    assert dossier.clock(datetime(2026, 9, 2, 9, 10)) == "9:10"
+    assert dossier.room_words(
+        "College Station Wisenbaker Engineering Bldg 049") == "Wisenbaker 049"
+
+
+def test_fish_gets_neither_rewrite(table):
+    """s2.1-pro normalises numbers itself; the rewrites ride the same flag
+    the meridiem rewrite already rides (jarvis/tts.py per-engine table)."""
+    raw = "Your 9:10 is Biosensors, Wisenbaker 049."
+    assert table.apply(raw, rewrite_times=False) == raw
