@@ -30,6 +30,17 @@ from tests.test_app_wiring import build, paths, seams  # noqa: F401  (fixtures)
 from tests.test_brain_tools import (FakeContext, FakeMemory, FakeOllama,  # noqa: F401
                                     brain, make_registry, text_reply, tool_reply)
 
+@pytest.fixture(autouse=True)
+def _evening(monkeypatch):
+    """These fixtures are the 20:56 transcript verbatim, so the hour is
+    part of the evidence. brain.ground_greeting reads the wall clock now
+    (jarvis/arc.py greeting_word, added for the 2026-09-02 14:29 "Good
+    evening" at 2:29 pm), so 20:56 is pinned rather than left to whenever
+    the suite happens to run."""
+    from jarvis import arc as arc_mod
+    monkeypatch.setattr(arc_mod, "greeting_word", lambda now=None: "evening")
+
+
 GREETING = "Good evening, Ali and Heather — lovely to have you both."
 CLAIM = ("I've added milk to your shopping list, sir, and I'm starting "
          "your music now.")

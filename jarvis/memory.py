@@ -1041,11 +1041,23 @@ class JarvisMemory:
         return self._sessions[-n:]
 
     def format_sessions_for_prompt(self):
-        """Format session summaries for context injection."""
+        """Format session summaries for context injection.
+
+        The header earns its words. LIVE 2026-09-02 14:29:24: this block
+        carried the PREVIOUS EVENING's answer to "Say hello to my family"
+        -- cut at 100 characters, so it ended mid-clause -- and gemma4
+        copied the opening straight back out at 2:29 in the afternoon
+        ("Good evening, Ali and Heather; ... a lovely afternoon, sir").
+        Rendered as a bare list of exchanges it reads like a draft to
+        finish, so it now says what it is. The greeting itself is no
+        longer left to the prompt either: brain.ground_greeting reads the
+        word off the clock (jarvis/arc.py, greeting_word).
+        """
         sessions = self.get_recent_sessions()
         if not sessions:
             return ""
-        parts = ["Previous sessions:"]
+        parts = ["Previous sessions (older conversations, for recall only; "
+                 "never reuse their wording):"]
         for s in sessions:
             parts.append(f"  [{s['time'][:16]}] {s['summary'][:100]}")
         return "\n".join(parts)

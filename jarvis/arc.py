@@ -252,6 +252,41 @@ def _band_start(now: datetime, phase: str, sunrise, sunset):
     return None, False
 
 
+# ----------------------------------------------------------------------
+# The SPOKEN name of the hour -- a pure function of the wall clock, and
+# deliberately NOT phase().
+#
+# "Good morning / afternoon / evening" is a claim about what o'clock it is,
+# and the phase is not: the phase is the mood of the house, and
+# forced_phase() collapses it to "night" whenever the house is empty or
+# hushed. /tmp/vss_voice/jarvis.log, 2026-09-02:
+#
+#   14:06:07.816 jarvis.arc INFO arc: afternoon -> night (forced by you're out)
+#
+# A greeting keyed off the phase would have wished him good night at six
+# minutes past two. So this reads the clock, on the same three bands
+# commander._greeting_line has always used (which now calls it, so the
+# canned courtesy and the guard on the model's words cannot disagree).
+# ----------------------------------------------------------------------
+GREETINGS = ("morning", "afternoon", "evening")
+MORNING_UNTIL = 12          # 05:00-11:59
+AFTERNOON_UNTIL = 17        # 12:00-16:59; everything else is "evening"
+MORNING_FROM = 5
+
+
+def greeting_index(now: Optional[datetime] = None) -> int:
+    """0 morning / 1 afternoon / 2 evening for the hour of ``now``."""
+    hour = (now or datetime.now()).hour
+    if MORNING_FROM <= hour < MORNING_UNTIL:
+        return 0
+    return 1 if MORNING_UNTIL <= hour < AFTERNOON_UNTIL else 2
+
+
+def greeting_word(now: Optional[datetime] = None) -> str:
+    """"morning" / "afternoon" / "evening" for the hour of ``now``."""
+    return GREETINGS[greeting_index(now)]
+
+
 def forced_phase(quiet_reason: str = "", presence_state: str = "",
                  focus_phase: str = "") -> str:
     """The phase an override demands, or "" when the clock may decide.
