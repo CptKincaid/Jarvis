@@ -1312,3 +1312,199 @@ def test_tool_bring_forward_while_it_rings_says_it_is_ringing(tools, tk):
     r = tools.call("manage_schedule", {"action": "shorten", "kind": "alarm",
                                        "minutes": 5})
     assert r.text == "No alarm to bring forward, sir."
+
+
+# ======================= adjust: a repeating alarm moves ONE occurrence (2026-09-02)
+# "Push my alarm back 30 minutes" on a daily 7 am wake-up moved the whole
+# series: tomorrow rang at 7:30 and so did every morning after it. The
+# series keeps its own wall-clock time; only the next ring moves.
+def test_pushing_back_a_daily_alarm_moves_tomorrow_only(tk):
+    tk.clock.set(D(2026, 8, 26, 22, 0))                  # Wednesday evening
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    moved = tk.adjust("last", "alarm", 1800)
+    assert _ids(moved) == [alarm.id]
+    assert moved[0].effective_due == pytest.approx(D(2026, 8, 27, 7, 30).timestamp())
+
+    tk.clock.set(D(2026, 8, 27, 7, 0))                   # the series time: silent
+    tk.tick()
+    assert tk.ringing is None
+    tk.clock.set(D(2026, 8, 27, 7, 30))                  # the pushed-back ring
+    tk.tick()
+    assert tk.ringing is not None and tk.ringing.id == alarm.id
+    tk.stop_ringing()
+
+    nxt = tk.get(alarm.id)
+    assert nxt.state == "pending"
+    assert datetime.fromtimestamp(nxt.effective_due) == D(2026, 8, 28, 7, 0)
+
+
+def test_pushing_back_a_weekdays_alarm_hands_monday_back_to_the_series(tk):
+    tk.clock.set(D(2026, 8, 27, 21, 0))                  # Thursday evening
+    alarm = tk.add_alarm(D(2026, 8, 28, 6, 30).timestamp(), "Gym", "weekdays")
+    assert tk.adjust("last", "alarm", 900)               # Friday, a quarter later
+    tk.clock.set(D(2026, 8, 28, 6, 30))
+    tk.tick()
+    assert tk.ringing is None
+    tk.clock.set(D(2026, 8, 28, 6, 45))
+    tk.tick()
+    assert tk.ringing is not None
+    tk.stop_ringing()
+    nxt = tk.get(alarm.id)
+    assert nxt.snooze_until is None
+    assert datetime.fromtimestamp(nxt.effective_due) == D(2026, 8, 31, 6, 30)  # Monday
+
+
+def test_bringing_a_daily_alarm_forward_moves_tomorrow_only(tk):
+    """A negative delta puts the occurrence EARLIER than the series time --
+    which is why the shift cannot be a snooze in anything but the column."""
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    moved = tk.adjust("last", "alarm", -1800)
+    assert moved[0].snooze_until == pytest.approx(D(2026, 8, 27, 6, 30).timestamp())
+    assert moved[0].snooze_until < moved[0].due          # never true of a snooze
+    assert moved[0].state == "pending" and moved[0].shifted
+    tk.clock.set(D(2026, 8, 27, 6, 30))
+    tk.tick()
+    assert tk.ringing is not None
+    tk.stop_ringing()
+    assert datetime.fromtimestamp(tk.get(alarm.id).effective_due) == D(2026, 8, 28, 7, 0)
+
+
+def test_two_push_backs_accumulate_on_the_same_morning(tk):
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    series = tk.get(alarm.id).due
+    tk.adjust("last", "alarm", 1800)
+    second = tk.adjust("last", "alarm", 900)
+    assert second[0].applied == pytest.approx(900)       # on top of the first
+    assert second[0].effective_due == pytest.approx(D(2026, 8, 27, 7, 45).timestamp())
+    assert second[0].due == pytest.approx(series)        # the series never moves
+    tk.clock.set(D(2026, 8, 27, 7, 45))
+    tk.tick()
+    assert tk.ringing is not None
+    tk.stop_ringing()
+    assert datetime.fromtimestamp(tk.get(alarm.id).due) == D(2026, 8, 28, 7, 0)
+
+
+def test_a_push_back_across_the_following_occurrence_skips_it(tk):
+    """"Push it back a day and an hour": the morning it lands past is the
+    one that got moved, so tomorrow does not ring on its own account."""
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    tk.adjust("last", "alarm", 25 * 3600)
+    for silent in (D(2026, 8, 27, 7, 0), D(2026, 8, 28, 7, 0)):
+        tk.clock.set(silent)
+        tk.tick()
+        assert tk.ringing is None, silent
+    tk.clock.set(D(2026, 8, 28, 8, 0))
+    tk.tick()
+    assert tk.ringing is not None
+    tk.stop_ringing()
+    assert datetime.fromtimestamp(tk.get(alarm.id).due) == D(2026, 8, 29, 7, 0)
+
+
+def test_bringing_a_daily_alarm_forward_past_now_clamps_and_keeps_the_series(tk):
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    moved = tk.adjust("last", "alarm", -100 * 3600)
+    assert moved[0].effective_due == pytest.approx(tk.clock.now())    # now, not the past
+    assert moved[0].applied == pytest.approx(-9 * 3600)               # what came off
+    tk.tick()
+    assert tk.ringing is not None
+    tk.stop_ringing()
+    # Tomorrow's ring is the one he moved, and it has now happened, so the
+    # series picks up the morning after it.
+    assert datetime.fromtimestamp(tk.get(alarm.id).effective_due) == D(2026, 8, 28, 7, 0)
+
+
+def test_an_interval_repeat_is_still_moved_by_its_due(tk):
+    """An interval walks from NOW when it fires, so it was never dragged by
+    a moved due and keeps the plain behaviour: no shift, no snooze_until."""
+    t0 = tk.clock.now()
+    tk.add_reminder(t0 + 600, "drink water", repeat="every 45 minutes")
+    moved = tk.adjust("water", "reminder", 300)
+    assert moved[0].due == pytest.approx(t0 + 900)
+    assert moved[0].snooze_until is None and not moved[0].shifted
+    assert "drink water in 15 minutes, every 45 minutes" in tk.list_text("reminder")
+
+
+def test_a_one_off_alarm_still_moves_its_own_due(tk):
+    t0 = tk.clock.now()
+    alarm = tk.add_alarm(t0 + 3600, "dentist")
+    moved = tk.adjust("last", "alarm", 600)
+    assert moved[0].due == pytest.approx(t0 + 4200)
+    assert moved[0].snooze_until is None and not moved[0].shifted
+    assert tk.get(alarm.id).due == pytest.approx(t0 + 4200)
+
+
+def test_restore_puts_a_pushed_back_repeating_alarm_back_on_the_series(tk):
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    moved = tk.adjust("last", "alarm", 1800)
+    assert tk.restore(alarm.id, moved[0].previous)
+    back = tk.get(alarm.id)
+    assert back.snooze_until is None and back.state == "pending"
+    assert datetime.fromtimestamp(back.effective_due) == D(2026, 8, 27, 7, 0)
+    tk.clock.set(D(2026, 8, 27, 7, 0))
+    tk.tick()
+    assert tk.ringing is not None                       # back on the series time
+
+
+def test_a_push_back_survives_a_restart(tmp_path, capture):
+    """He is restarted constantly; an alarm pushed back at midnight must
+    still be pushed back at 6 am, so the shift lives in the database."""
+    clock = FakeClock(D(2026, 8, 26, 22, 0))
+    db = tmp_path / "tk.db"
+    first = Timekeeper(db, say=lambda s: None, cfg=FakeAssistantConfig(), now=clock.now,
+                       run=Recorder(), cache_dir=tmp_path / "c")
+    alarm = first.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    assert first.adjust("last", "alarm", 1800)
+    first.close()
+
+    second = Timekeeper(db, say=lambda s: None, cfg=FakeAssistantConfig(), now=clock.now,
+                        run=Recorder(), cache_dir=tmp_path / "c")
+    try:
+        clock.set(D(2026, 8, 27, 7, 0))
+        second.tick()
+        assert second.ringing is None                   # the series time is not it
+        clock.set(D(2026, 8, 27, 7, 30))
+        second.tick()
+        assert second.ringing is not None and second.ringing.id == alarm.id
+        second.stop_ringing()
+        assert datetime.fromtimestamp(second.get(alarm.id).due) == D(2026, 8, 28, 7, 0)
+    finally:
+        second.close()
+
+
+def test_a_pushed_back_alarm_never_reads_back_as_snoozed(tk):
+    """He pushed it back; nothing rang. "snoozed until 7:30 am" would be a
+    lie, and ", every day" beside the moved time reads as though the whole
+    wake-up had shifted -- so the series time is named instead."""
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    assert tk.list_text("alarm") == "One alarm, sir: wake up at 7:00 am tomorrow, every day."
+    tk.adjust("last", "alarm", 1800)
+    line = tk.list_text("alarm")
+    assert line == ("One alarm, sir: wake up at 7:30 am tomorrow, "
+                    "then back to 7:00 am.")
+    assert "snooze" not in line and tk.list("alarm")[0].state == "pending"
+    # and it says so once, not twice
+    assert "every day" not in line
+
+
+def test_a_pushed_back_repeating_reminder_reads_the_same_way(tk):
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    tk.add_reminder(D(2026, 8, 27, 7, 0).timestamp(), "take the pills", repeat="daily")
+    tk.adjust("pills", "reminder", 1800)
+    assert tk.list_text("reminder") == ("One reminder, sir: take the pills at 7:30 am "
+                                        "tomorrow, then back to 7:00 am.")
+
+
+def test_tool_push_back_says_the_new_ring_and_the_series(tools, tk):
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    r = tools.call("manage_schedule", {"action": "push back", "kind": "alarm",
+                                       "minutes": 30})
+    assert r.ok
+    assert r.text == ("30 minutes added, sir: wake up at 7:30 am tomorrow, "
+                      "then back to 7:00 am.")
