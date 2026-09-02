@@ -25,6 +25,7 @@ Usage:
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import threading
@@ -130,8 +131,10 @@ DEFAULT_SYMBOLS: dict[str, str] = {
 #
 # BARE times are rewritten too, since 2026-09-02 -- see _BARE_TIME_RX below,
 # which is where the reasoning for that (and the shape it is narrowed to)
-# lives. It has to run AFTER the meridiem pass: a bare pass that got there
-# first would leave "9:10 am" as "nine ten am" with the marker unspelled.
+# lives. It still runs after the meridiem pass, but no longer DEPENDS on
+# that: the two became separately switchable per engine (ENGINE_RULES), so
+# the bare pattern carries its own "not a meridiem" lookahead rather than
+# relying on the marked pass having eaten those digits first.
 _ONES = ("twelve", "one", "two", "three", "four", "five", "six", "seven",
          "eight", "nine", "ten", "eleven")
 _TENS = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty"}
@@ -235,7 +238,18 @@ def _spoken_time(match: "re.Match") -> str:
 # is not English, and "o'clock" is also 8 bytes of the time this line was
 # short of. The marked path keeps its own shape ("six pee em"), where the
 # marker already carries the sentence.
-_BARE_TIME_RX = re.compile(r"(?<![\w:])(0?[1-9]|1[0-2]):([0-5]\d)(?![\w:])")
+#
+# The trailing "not a meridiem" lookahead is what makes this rule STANDALONE.
+# Ordering used to be the only thing keeping it honest: speak_times ran the
+# marked pass first, so by the time this pattern ran there was no "6:00 pm"
+# left to find. Once the two became separately switchable (ENGINE_RULES) an
+# engine could ask for the bare rule alone, and this pattern would then eat
+# the digits out from under the marker -- "at 6:00 pm" became "at six
+# o'clock pm", inventing an o'clock and stranding an unspoken abbreviation.
+# On every engine that runs both passes the lookahead is a no-op, because
+# the marked pass has already consumed those digits.
+_BARE_TIME_RX = re.compile(
+    r"(?<![\w:])(0?[1-9]|1[0-2]):([0-5]\d)(?![\w:])(?!\s*[apAP]\.?\s?[mM])")
 
 
 def _spoken_bare_time(match: "re.Match") -> str:
@@ -251,13 +265,18 @@ def speak_bare_times(text: str) -> str:
     return _BARE_TIME_RX.sub(_spoken_bare_time, text)
 
 
-def speak_times(text: str) -> str:
+def speak_times(text: str, *, marked: bool = True, bare: bool = True) -> str:
     """Rewrite "6:00 pm" as "six pm" so the engine does not spell the colon.
 
     Marked times first, then bare ones: the marked pattern has to see its
-    "am"/"pm" still attached to the digits it belongs to.
+    "am"/"pm" still attached to the digits it belongs to. The two are
+    separable because they answer different questions -- whether the engine
+    spells a colon, and whether it needs bytes bought against F5's duration
+    floor -- and Breeze-TTS-2 needs neither for different measured reasons.
     """
-    return speak_bare_times(_TIME_RX.sub(_spoken_time, text))
+    if marked:
+        text = _TIME_RX.sub(_spoken_time, text)
+    return speak_bare_times(text) if bare else text
 
 
 # ---------------------------------------------------- room numbers
@@ -421,6 +440,106 @@ def space_number_hyphens(text: str) -> str:
     return _NUMBER_HYPHEN_RX.sub(r"\1 \2", text)
 
 
+# ------------------------------------------------ per-engine rule sets
+#
+# Every rewrite above is a COMPENSATION for one engine's defect, never an
+# improvement in itself, and ``TTS._pronounce`` has always passed the engine's
+# needs in -- it just passed them as two booleans, and ``rewrite_times`` gated
+# three unrelated rules at once. They are unrelated: the meridiem rewrite is
+# "the engine spells the colon" (XTTS said "six zero pm", 2026-08-28), while
+# the bare-clock and leading-zero rules are F5 BYTE-FLOOR arithmetic -- they
+# buy bytes against 0.45 + 0.04988*bytes, which is a property of
+# scripts/f5_server.py and of no other engine. One flag could not say "reads a
+# colon fine but has a duration floor", and Breeze-TTS-2 needed the split.
+#
+# BREEZE, measured 2026-09-02 on the pinned Q4 checkpoint (int4 all MLPs,
+# group-32 depth, bf16 attention/text encoder, ref_edit_tata, cfg 4.0, temp
+# 0.9, ref jarvis_voice_ref_f5.wav), every probe rendered at 3-10 seeds and
+# read back by three judges: whisper-large-v3-turbo (the round-11 gate),
+# wav2vec2-base-960h greedy CTC (no language model), and
+# wav2vec2-lv-60-espeak-cv-ft (IPA). Whisper is USELESS on this question --
+# it wrote "4pm" for every arm including the broken ones, because its decoder
+# is a language model that repairs the abbreviation it expects. The IPA head
+# is what settled it:
+#
+#   marked_times  OFF. Hunter's round-11 note on the Breeze clip of text 12
+#     was "he said pm as pey or pay he did not say p em", and the respelling
+#     this rule emits is the CAUSE, not the victim. Clean meridiem out of 10
+#     renders each: "four P M" 10, "four PM" 7, "four p.m." 7, the untouched
+#     "4:00 pm" 6, and the respelling this rule emits, "four pee em", 3 --
+#     last of five. Pooled with the am probes it is 6 of 16 against 42 of 52
+#     for every other spelling (Fisher two-tailed p=0.0033); against the
+#     untouched form ALONE it is 6/16 vs 12/16, p=0.073, i.e. suggestive
+#     rather than proven, and the qualitative split is what carries it: the
+#     untouched form's only failure is a lax /p ɪ ɛ m/, still audibly "p em",
+#     while the respelling fails by COLLAPSING a vowel -- /p iː ə m/,
+#     "pee-um", in 6 of 10 -- which is the complaint he actually made. The am
+#     side is the fish defect verbatim: "nine ten ay em" came out /aɪ ɪ m/ or
+#     /aɪ ə m/ -- "I'm" -- in 3 of 6 seeds, while "9:10 am" and "nine ten AM"
+#     were clean in 12 of 12 (p=0.0245). And Breeze reads the written form
+#     correctly on its own: text 12's "9:10 am ... 12:40 pm ... 4:10 pm"
+#     transcribed identically to the round-11 respelled arm on all 5 seeds.
+#   bare_times    OFF. "Your 9:10 lecture is in Wisenbaker" came back as
+#     "NINE TEN" from the prior-free CTC head on every seed, so there is
+#     nothing to fix; and the rule's only justification is F5's byte floor,
+#     which Breeze -- a 12.5 Hz multi-codebook LM whose duration is generated,
+#     not allocated -- does not have.
+#   id_digits     OFF. Same two reasons. "Wisenbaker 049" came back as
+#     "ZERO FOUR NINE" unprompted on every seed.
+#   unshout       ON. Not an F5 rule and not a duration rule: it is the
+#     acronym rule, and it stays on for every engine including fish. Breeze
+#     read "BIOSENSORS LAB II" as words rather than letters, so the rule is a
+#     no-op here rather than a fix -- but a no-op that has been measured both
+#     ways is a better default than an unmeasured change.
+#
+# NOT TAKEN, deliberately, and this is the interesting one: "four P M"
+# (spaced capitals) rendered a clean /p iː ɛ m/ in 10 of 10 seeds, beating the
+# untouched "4:00 pm" at 6 of 10. That is a real lead, but it is two-tailed
+# p=0.087 at n=10, the difference is a tense-vs-lax vowel in the letter P that
+# nobody has HEARD, and this project has already paid for exactly that
+# mistake: respelling "reply" as "ree ply" won on ASR confidence for F5 and
+# LOST by ear. Swapping one unheard respelling for another is not what the
+# complaint asked for. If it is ever wanted it is a one-line row here and a
+# blind round, in that order.
+#
+# EDGE and XTTS keep all four, which is what shipped. Nothing measured says
+# they need the two byte-floor rules either -- neither has a duration floor --
+# but nobody has listened to those two engines without them, and the split is
+# here to make that a separate, testable question rather than a side effect.
+@dataclasses.dataclass(frozen=True)
+class RuleSet:
+    """Which of the per-engine rewrites one engine actually needs."""
+
+    marked_times: bool = True     # "6:00 pm" -> "six pee em"
+    bare_times: bool = True       # "9:10" -> "nine ten"
+    id_digits: bool = True        # "049" -> "zero four nine"
+    unshout: bool = True          # "BIOSENSORS" -> "Biosensors"
+
+
+# Fish's s2.1-pro and Breeze-TTS-2 both normalise their own text; the two
+# arrived at the same row by separate measurement, not by copying.
+_SELF_NORMALISING = RuleSet(marked_times=False, bare_times=False,
+                            id_digits=False)
+
+ENGINE_RULES: dict[str, RuleSet] = {
+    "edge": RuleSet(),
+    "xtts": RuleSet(),
+    "f5": RuleSet(),
+    "fish": _SELF_NORMALISING,
+    "breeze": _SELF_NORMALISING,
+}
+
+
+def rules_for(engine: Optional[str]) -> RuleSet:
+    """The rule set for ``engine``; everything on for an unknown name.
+
+    Defaulting ON is the safe direction: an engine nobody has measured is
+    assumed to be as weak as XTTS was, so it gets the help. The opposite
+    default would silently ship raw "6:00 pm" to a new engine.
+    """
+    return ENGINE_RULES.get(engine or "", RuleSet())
+
+
 class Pronunciations:
     """A pronunciation table: shipped defaults + a user JSON file."""
 
@@ -537,27 +656,42 @@ class Pronunciations:
             return self._table[token]
         return self._lower.get(token.lower())
 
-    def apply(self, text: str, *, rewrite_times: bool = True,
-              unshout_words: bool = True) -> str:
+    def apply(self, text: str, *, engine: Optional[str] = None,
+              rewrite_times: Optional[bool] = None,
+              unshout_words: Optional[bool] = None) -> str:
         """Rewrite tokens/symbols in ``text`` into their spoken forms.
 
-        The two rewrites are OPTIONAL because they are compensations for a
-        weak engine, not universal improvements. XTTS spelled "6:00 pm" as
-        "six zero pm" and read ALL-CAPS as an acronym, so both were added.
-        Fish's s2.1-pro normalises text itself, and there the rewrites make
-        things WORSE -- "ay em" comes out as "I'm" (heard 2026-08-28). The
-        caller passes what its engine actually needs.
+        The rewrites are OPTIONAL because they are compensations for a weak
+        engine, not universal improvements. XTTS spelled "6:00 pm" as "six
+        zero pm" and read ALL-CAPS as an acronym, so both were added. Fish's
+        s2.1-pro normalises text itself, and there the rewrites make things
+        WORSE -- "ay em" comes out as "I'm" (heard 2026-08-28); Breeze-TTS-2
+        does the same, measured (see ENGINE_RULES). So ``engine`` picks the
+        rule set and the engine's own row decides.
+
+        ``rewrite_times`` and ``unshout_words`` remain as overrides for
+        callers that know better than the table -- passing rewrite_times
+        False switches off all three clock/number rules together, which is
+        what that flag always meant.
         """
         if not text:
             return text
+        rules = rules_for(engine)
+        if rewrite_times is not None:
+            rules = dataclasses.replace(rules, marked_times=rewrite_times,
+                                        bare_times=rewrite_times,
+                                        id_digits=rewrite_times)
+        if unshout_words is not None:
+            rules = dataclasses.replace(rules, unshout=unshout_words)
         self._maybe_reload()
         # Times first: the vocabulary pass is token-based and would happily
         # leave "6:00" intact for the engine to spell out.
-        if rewrite_times:
-            text = speak_times(text)
-            # Same flag, same reason: these exist because the engine cannot
-            # read a number itself. Fish's s2.1-pro normalises its own text
-            # and is the engine the flag is False for.
+        if rules.marked_times or rules.bare_times:
+            text = speak_times(text, marked=rules.marked_times,
+                               bare=rules.bare_times)
+        if rules.id_digits:
+            # A separate rule from the clock ones despite riding the same
+            # flag for a year: this one is pure F5 byte arithmetic.
             text = speak_room_numbers(text)
         rx = self._rx
         if rx is not None:
@@ -571,7 +705,7 @@ class Pronunciations:
         # Last: known jargon has already been substituted, so whatever is
         # still shouting is Hunter's own text rather than something the
         # table wanted spelled.
-        if unshout_words:
+        if rules.unshout:
             text = unshout(text)
         # Last, on whatever every other pass produced (unshout title-cases a
         # shouted "TWENTY-FIVE" but leaves its hyphen). Unconditional, unlike
@@ -595,7 +729,8 @@ def get() -> Pronunciations:
         return _default
 
 
-def apply(text: str, *, rewrite_times: bool = True,
-          unshout_words: bool = True) -> str:
-    return get().apply(text, rewrite_times=rewrite_times,
+def apply(text: str, *, engine: Optional[str] = None,
+          rewrite_times: Optional[bool] = None,
+          unshout_words: Optional[bool] = None) -> str:
+    return get().apply(text, engine=engine, rewrite_times=rewrite_times,
                        unshout_words=unshout_words)

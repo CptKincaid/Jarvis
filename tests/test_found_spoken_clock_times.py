@@ -112,9 +112,12 @@ def test_the_rewrites_can_be_switched_off_per_engine():
 
 
 def test_a_strong_engine_gets_the_raw_text():
-    from jarvis import tts as tts_mod
-    assert tts_mod._ENGINE_NEEDS_TIME_REWRITE["fish"] is False
-    assert tts_mod._ENGINE_NEEDS_TIME_REWRITE["xtts"] is True
+    # The per-engine table moved from jarvis/tts.py to pronounce.ENGINE_RULES
+    # on 2026-09-02, where one boolean became four -- Breeze-TTS-2 reads a
+    # colon fine but has no duration floor, which the old flag could not say.
+    # The claim this test has always made is unchanged.
+    assert pronounce.rules_for("fish").marked_times is False
+    assert pronounce.rules_for("xtts").marked_times is True
 
 
 def test_the_engine_decides_what_pronounce_does(tmp_path):
