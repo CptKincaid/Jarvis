@@ -21,6 +21,12 @@ checks are what make that true in both directions:
 * the second means offline set *mid-pipeline* discards the frame already in
   flight instead of recognising a face captured a millisecond earlier.
 
+A deny also fires ``on_blind`` on the EDGE, which is how ``SessionIdentity``'s
+"dropped the instant the room empties" bound acquires an owner: offline mode
+and the curfew are unbounded blind windows, and a body anchor that survives
+one vouches for whoever is in the chair when the lens re-opens. It also means
+the body vector does not sit in RAM after he has said "offline mode".
+
 FAIL TO OFFLINE, which he chose over persisting state and over failing online.
 ``allow`` returning anything but exactly ``True`` -- False, None, a truthy 1, a
 missing callable, or an exception out of the owner -- is a NO. A camera that
@@ -69,9 +75,23 @@ MAX_AGE_S = 1.5
 # morning says nothing this afternoon. Fifteen minutes is short enough that he
 # has not plausibly changed and left and come back unseen.
 BODY_TTL_S = 900.0
-# Cosine over the 768-D YoutuReID vector. Deliberately high: this signal is
-# only ever used to CARRY an identity a face already established, never to
-# establish one, so a miss costs a re-look and a false match costs trust.
+# Cosine over the 768-D YoutuReID vector, WHICH IS THE ONLY VECTOR THIS
+# NUMBER IS FOR. Deliberately high: this signal is only ever used to CARRY an
+# identity a face already established, never to establish one, so a miss costs
+# a re-look and a false match costs trust.
+#
+# It does NOT transfer to the colour histogram docs/vision.md section 4 offers
+# as the phase-1 stand-in, and the arithmetic says so exactly. Cosine over
+# NON-NEGATIVE vectors lives in a compressed range: for iid uniform components
+# the expected cosine of two UNRELATED vectors is E[x]^2/E[x^2] = 0.25/(1/3) =
+# 0.750 -- measured here 2026-09-02 over 2000 pairs at d=256/768/4096, mean
+# 0.750 every time, and 50% of unrelated pairs at or above 0.75. A histogram
+# anchor at this bar is a coin flip. Sparse HSV histograms of nine unlike
+# shirts did better (median 0.000) but still put 3 of 36 unlike pairs over
+# 0.75 -- and, worse in the other direction, the SAME shirt under a changed
+# desk lamp scored 0.692-0.706, i.e. BELOW the bar. The histogram is
+# miscalibrated both ways, which is why ``match_min`` is required rather than
+# defaulted: a caller must state which vector it is holding.
 BODY_MATCH_MIN = 0.75
 
 
@@ -124,13 +144,19 @@ class Eye:
     a one-liner."""
 
     def __init__(self, allow: Optional[Callable[[], bool]],
-                 open_device: Callable[[], object]):
+                 open_device: Callable[[], object],
+                 on_blind: Optional[Callable[[], None]] = None):
         self._allow = allow
         self._open_device = open_device
+        self._on_blind = on_blind
         self._device = None
+        # True until a frame is actually returned: nothing has been seen yet,
+        # so there is nothing for a first deny to invalidate.
+        self._blind = True
         self.opens = 0        # devices actually opened; the UI lamp reads this
         self.denials = 0
         self.reads_dropped = 0    # frames grabbed and then thrown away
+        self.blind_edges = 0      # deny transitions; on_blind fired this often
 
     # ------------------------------------------------------------ the gate
     def permitted(self) -> bool:
@@ -167,6 +193,41 @@ class Eye:
         except Exception:
             log.debug("device release failed", exc_info=True)
 
+    def _go_blind(self) -> None:
+        """Release the device and, on the EDGE only, tell the consumer.
+
+        WHY THIS EXISTS. ``SessionIdentity`` holds a body vector that a face
+        vouched for, and its own bound -- "dropped the instant the room
+        empties" -- had no owner: ``room_empty()`` had no caller anywhere
+        outside its tests. Offline mode and the 21:00-07:00 curfew are exactly
+        the unbounded blind windows the bound was written for, and they are
+        the two this class is the sole witness to. So the deny edge is where
+        the call belongs.
+
+        The EDGE, not every frame: at the armed tier a standing deny would
+        otherwise fire this eight times a second for no new information.
+
+        A failed grab is deliberately NOT a blind edge. One dropped frame is a
+        hiccup, not an absence, and clearing the anchor on every hiccup would
+        make the anchor useless; the TTL is the backstop for a camera that
+        quietly stops working. A deny is different in kind -- somebody, or the
+        clock, said stop, and nobody says how long for."""
+        self.close()
+        if self._blind:
+            return
+        self._blind = True
+        self.blind_edges += 1
+        cb = self._on_blind
+        if cb is None:
+            return
+        try:
+            cb()
+        except Exception:
+            # A consumer that raises must not keep the device open or turn a
+            # deny into an exception out of capture(). Fail to offline.
+            log.warning("on_blind consumer raised; the device is closed "
+                        "regardless", exc_info=True)
+
     # --------------------------------------------------------- the capture
     def capture(self):
         """One frame, or None meaning NO OPINION.
@@ -178,7 +239,7 @@ class Eye:
         camera."""
         if not self.permitted():
             self.denials += 1
-            self.close()       # a deny closes a device that is already open
+            self._go_blind()   # a deny closes a device that is already open
             return None
 
         if self._device is None:
@@ -207,9 +268,10 @@ class Eye:
         if not self.permitted():
             self.denials += 1
             self.reads_dropped += 1
-            self.close()
+            self._go_blind()
             log.info("offline set mid-capture: frame dropped, device released")
             return None
+        self._blind = False
         return frame
 
 
@@ -242,7 +304,18 @@ def resolve_wake(verdict: str, ok: bool, eye: Optional[Attention],
     the promotion needs ``faces == 1`` (a second person could be the one who
     spoke), a real dwell (a glance past the lens is not an address), and -- as
     soon as the gallery exists -- an identity that is not someone else's. The
-    transcript gate in jarvis/app.py still fails shut behind all of it."""
+    transcript gate in jarvis/app.py still fails shut behind all of it.
+
+    SO THE TIEBREAKER DIES WITH THE MOUNT, and docs/vision.md section 11.1
+    used to say otherwise. ``attending`` is a hard requirement above, not a
+    bonus term: if the $0 tape-and-photos test in section 9 shows the geometry
+    cannot separate "looking at Jarvis" from "reading the tab bar", this
+    function promotes nothing and there is no weaker version of it worth
+    having. A faces-only promotion would wake Jarvis for anyone whose face is
+    in frame while he is suppressed -- which is the cost paragraph above with
+    its only mitigation removed. What survives an unusable mount is presence,
+    not the tiebreaker. Pinned by
+    tests/test_eye.py::test_the_tiebreaker_promotes_nothing_without_attention."""
     out = WakeVerdict(verdict=verdict, ok=ok)
     if eye is None or not eye.usable(max_age_s):
         return out       # no opinion: today's behaviour, byte for byte
@@ -295,14 +368,24 @@ class SessionIdentity:
     * ``ttl_s`` -- an anchor expires, because clothes change;
     * ``room_empty()`` -- an anchor is dropped the moment nobody is in frame,
       because that is precisely the window in which a different person can sit
-      down wearing anything at all.
+      down wearing anything at all. ``Eye`` calls it on the deny edge (see
+      ``on_blind``): offline mode and the curfew are unbounded blind windows,
+      and an anchor that survives one is an anchor vouching for whoever is
+      sitting there when the lens re-opens.
 
     Nothing is persisted. A body vector never reaches the disk; there is no
-    body gallery to leak, back up or delete."""
+    body gallery to leak, back up or delete -- and after a deny there is none
+    in memory either."""
 
-    def __init__(self, ttl_s: float = BODY_TTL_S,
-                 match_min: float = BODY_MATCH_MIN,
+    def __init__(self, ttl_s: float = BODY_TTL_S, *,
+                 match_min: float,
                  now: Callable[[], float] = time.monotonic):
+        # match_min is keyword-only and has NO default on purpose. The one
+        # number here that cannot be chosen without knowing which vector the
+        # sidecar is producing is this one (see BODY_MATCH_MIN above: 0.75 is
+        # right for YoutuReID and a coin flip for a colour histogram), and a
+        # default is how a threshold calibrated for one vector ends up
+        # silently applied to another.
         self.ttl_s = float(ttl_s)
         self.match_min = float(match_min)
         self._now = now

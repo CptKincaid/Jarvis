@@ -275,3 +275,167 @@ def test_match_returns_the_nearest_label_and_its_score(tmp_path):
 def test_an_empty_gallery_matches_nothing_rather_than_guessing():
     g = FaceGallery(root=None)
     assert g.match(vec(17)) == ("", 0.0)
+
+
+# ------------------------------------------ the holes an adversarial read found
+# Five defects, all reproduced against the first version of this file before
+# being fixed. Each one let the 2026-09-02 shape recur through a door the
+# module docstring claimed was shut.
+def test_the_shrink_guard_covers_a_gallery_THAT_NEVER_LOADED(tmp_path):
+    """The incident's own shape, which the first guard missed.
+
+    ``enroll_from_audio`` built a fresh SpeakerVerifier and saved; it never
+    loaded. A shrink baseline taken only from ``self._loaded_n`` is therefore 0
+    on precisely the caller that caused the loss, and measured 2026-09-02 a
+    fresh FaceGallery wrote a 2-sample generation over a 6-sample one without
+    a word. The baseline has to come off the disk."""
+    root = tmp_path / "g"
+    first = FaceGallery(root=root)
+    base = vec(1)
+    for i in range(6):
+        first.add("hunter", near(base, 10 + i))
+    assert first.save("real enrolment, 6 takes") == 1
+
+    stray = FaceGallery(root=root)          # fresh object: loaded nothing
+    stray.add("hunter", vec(20))
+    stray.add("hunter", vec(21))
+    with pytest.raises(ValueError, match="refusing to shrink"):
+        stray.save("a stray test")
+    assert FaceGallery(root=root).generations() == [1]
+
+    # and it is still a guard, not a wall: saying so out loud still works
+    assert stray.save("deliberate re-enrolment", allow_shrink=True) == 2
+
+
+def test_repetition_cannot_evict_the_best_enrolment(tmp_path):
+    """The generations are the backup only if repetition cannot delete them.
+
+    KEEP_GENERATIONS is 5 and the first ``_prune`` deleted oldest-first, so
+    five saves of any size at all evicted a six-take enrolment and left the
+    store holding nothing but the bad writes -- the state the incident left,
+    reached again five writes later. Measured 2026-09-02: [4,5,6,7,8], every
+    one n=2."""
+    root = tmp_path / "g"
+    good = FaceGallery(root=root)
+    base = vec(2)
+    for i in range(6):
+        good.add("hunter", near(base, 30 + i))
+    good.save("real enrolment, 6 takes")
+
+    for run in range(8):                    # well past the five-deep window
+        k = FaceGallery(root=root)
+        k.add("hunter", vec(40 + run))
+        k.add("hunter", vec(60 + run))
+        k.save("runaway %d" % run, allow_shrink=True)
+
+    kept = FaceGallery(root=root)
+    gens = kept.generations()
+    assert len(gens) == fg.KEEP_GENERATIONS      # the window is still a window
+    assert 1 in gens, "the six-take enrolment was pruned away: %r" % (gens,)
+    assert kept.load(1) and kept.total() == 6
+
+
+def test_a_tie_prunes_exactly_as_before_so_the_window_still_moves(tmp_path):
+    """Protecting the richest must not freeze the window in the normal case.
+
+    When every save is the same size the richest IS the newest, so the oldest
+    still falls out -- otherwise the store would grow without bound."""
+    root = tmp_path / "g"
+    for run in range(9):
+        k = FaceGallery(root=root)
+        for i in range(3):
+            k.add("hunter", vec(100 + run * 10 + i))
+        k.save("even save %d" % run)
+    gens = FaceGallery(root=root).generations()
+    assert gens == [5, 6, 7, 8, 9]
+
+
+def test_the_embedding_file_is_never_briefly_world_readable(tmp_path):
+    """0600 from creation, not 0600 after np.savez returns.
+
+    His umask is 0002, so ``open(tmp, "wb")`` creates the file 0664 and it
+    stays 0664 for the whole write. This is the one module whose stated job is
+    a stricter standard for data that cannot be re-issued, so the window is
+    the bug, not just the end state."""
+    import os
+
+    root = tmp_path / "g"
+    g = FaceGallery(root=root)
+    base = vec(3)
+    for i in range(3):
+        g.add("hunter", near(base, 70 + i))
+
+    seen = {}
+    real_open = os.open
+
+    def spy(path, *a, **kw):
+        fd = real_open(path, *a, **kw)
+        if str(path).endswith(".tmp"):
+            seen["tmp"] = os.stat(path).st_mode & 0o777
+            seen["dir"] = root.stat().st_mode & 0o777
+        return fd
+
+    os.open = spy
+    try:
+        g.save("first")
+    finally:
+        os.open = real_open
+
+    assert seen["tmp"] == 0o600, "tmp was %s mid-write" % oct(seen.get("tmp", 0))
+    assert seen["dir"] == 0o700, "dir was %s" % oct(seen.get("dir", 0))
+    assert g.path_for(1).stat().st_mode & 0o777 == 0o600
+
+
+def test_a_crashed_save_leaves_no_embeddings_behind(tmp_path):
+    """``gen-00002.npz.tmp`` holds a full set of face embeddings and does not
+    match the generation pattern, so the first ``purge()`` reported success and
+    left one on disk at 0600 -- deleted, in the sense that nothing looked."""
+    import os
+
+    root = tmp_path / "g"
+    g = FaceGallery(root=root)
+    base = vec(4)
+    for i in range(4):
+        g.add("hunter", near(base, 80 + i))
+    g.save("first")
+    g.add("hunter", near(base, 90))
+
+    real_replace = os.replace
+    os.replace = lambda a, b: (_ for _ in ()).throw(OSError("disk full"))
+    try:
+        with pytest.raises(OSError):
+            g.save("second")
+    finally:
+        os.replace = real_replace
+
+    # the failed save cleaned up after itself
+    assert sorted(p.name for p in root.iterdir()) == ["gen-00001.npz"]
+
+    # and belt and braces: a tmp that somehow survives is still purged
+    stray = root / "gen-00007.npz.tmp"
+    stray.write_bytes(b"pretend embeddings")
+    assert g.purge() == 2
+    assert list(root.iterdir()) == []
+
+
+def test_rollback_reports_the_generation_it_is_actually_holding(tmp_path):
+    """``load()`` falls back down the stack when the predecessor is also
+    corrupt, but the return value was hard-coded to ``gens[-2]``. Measured
+    2026-09-02: rollback() returned 2 while loaded_generation was 1. An
+    enrolment script printing "rolled back to generation 2" while holding
+    generation 1 is exactly the quiet mismatch this module exists to prevent."""
+    root = tmp_path / "g"
+    g = FaceGallery(root=root)
+    base = vec(5)
+    for i in range(6):
+        g.add("hunter", near(base, 200 + i))
+    g.save("gen1")
+    g.add("hunter", near(base, 210))
+    g.save("gen2")
+    g.add("hunter", near(base, 211))
+    g.save("gen3")
+
+    g.path_for(2).write_bytes(b"not an npz at all")   # the predecessor is bad too
+    got = g.rollback()
+    assert got == g.loaded_generation == 1
+    assert g.total() == 6

@@ -76,15 +76,26 @@ timed over 200-300 iterations after warm-up, median and 95th percentile in milli
 | **SFace** @112×112 | 38,696,353 | **Apache-2.0** | **19.63** / 19.98 | 10.36 | **5.85** | 20.05 |
 | SFace `alignCrop` | " | " | 0.17 / 0.18 | — | — | — |
 | **YoutuReID** @128×256 | 106,878,407 | **Apache-2.0** | **105.3** / 106.7 | — | **30.8** | 93.58 |
-| MJPEG decode 1920×1080 | — | — | **6.36** / 6.65 | — | — | — |
-| MJPEG decode 1280×720 | — | — | **1.61** / 1.63 | — | — | — |
-| resize 1080p→320×240, `INTER_LINEAR` | — | — | **0.21** | — | — | — |
-| resize 1080p→320×240, `INTER_AREA` | — | — | **2.57** | — | — | — |
+| **YuNet** @320×180 (the shipped detect size) | " | " | **2.24** | 1.36 | **1.00** | — |
+| MJPEG decode 1920×1080, *smooth upscale* | — | — | **3.42** | — | — | — |
+| MJPEG decode 1920×1080, *detail-preserving* | — | — | **5.45** | — | — | — |
+| MJPEG decode 1280×720, detail-preserving | — | — | **2.16** | — | — | — |
+| resize 1080p→320×240, `INTER_AREA` | — | — | — | **2.54** | — | — |
+| resize 1080p→320×180, `INTER_AREA` | — | — | — | **1.30** | — | — |
 
 Sizes are the exact git-lfs object sizes from `opencv/opencv_zoo@main`; licences are the
 per-model `LICENSE` files in that repo, read today.
 
-**Two findings worth more than the raw numbers.**
+**The decode row is two rows because the first one was measured wrong.** The original
+1080p figure came from a 512 px photo upscaled to 1080p, which encodes to 226 KB and decodes in
+3.42 ms; a frame that actually carries 1080p worth of detail encodes to 544 KB and decodes in
+**5.45 ms**, ~1.6× more. And the whole line item is an assumption about a part nobody has: I could
+not confirm that the recommended Arducam streams **MJPEG** at 1080p rather than uncompressed
+**YUY2** over USB 3.0 (arducam.com returns 403, the Amazon listing is JS-rendered). **If it is
+YUY2 the decode term disappears entirely.** Check with `v4l2-ctl --list-formats-ext` on the day it
+arrives, before trusting any budget below.
+
+**Three findings worth more than the raw numbers.**
 
 - **YuNet is 3× faster here than on an Orin Nano CPU (0.86 vs 2.59 ms); SFace is not faster at
   all (19.63 vs 20.05).** A tiny detector is compute-bound and rides the X925's clock; a 38 MB
@@ -97,10 +108,24 @@ per-model `LICENSE` files in that repo, read today.
   small face is not cheaper, it is only worse** — which is what makes the capture-resolution
   arithmetic in §9 load-bearing rather than fussy.
 
-**Frame budget, armed tier, 1080p capture, 4 threads:**
-decode 6.36 + downscale 2.57 + YuNet@320 1.65 + alignCrop 0.17 + SFace 5.85 ≈ **16.6 ms**.
-At 8 fps that is **133 ms/s — about 13 % of one core of twenty.**
-**Idle tier, 720p, 1.5 fps, detection only:** (1.61 + 0.21 + 1.65) × 1.5 ≈ **5 ms/s, 0.5 %.**
+- **Threads buy latency and cost CPU, and the headline number used to confuse the two.** This
+  document first summed a 4-thread budget and called it "13 % of one core", which is wall time
+  presented as core occupancy. Measured directly: SFace at 1 thread is **22.13 ms wall / 22.13
+  CPU-ms** (1.00×); at 2 threads **12.12 / 24.15** (1.99×); at 4 threads **7.00 / 25.93** (3.71×).
+  More threads is *more* total CPU, not less. **That is why `camera.threads` ships at 2, not the 4
+  first advised here** — the armed tier's frame period is 125 ms and the whole chain is ~20 ms even
+  at 2, so latency is not the binding constraint; contention with the live Jarvis, ollama and F5 on
+  a box that has already had one unified-memory power-off is.
+
+**Frame budget, armed tier, 1080p capture, 320×180 detect, 2 threads — wall *and* CPU, because
+they are different questions:**
+decode 5.45 + downscale 1.30 + YuNet@320×180 1.36 + alignCrop 0.17 + SFace 12.12 ≈ **20.4 ms of
+wall latency**, and ≈ **35 CPU-ms**. At 8 fps that is **≈280 CPU-ms/s — about 28 % of one core of
+twenty**, not 13 %. The wall figure is the right one for latency; the CPU figure is the right one
+for contention. **The conclusion survives — it is affordable on a 20-core box — but the old number
+did not.** With `identity: False` (the phase-1 default) SFace never runs and the armed tier is
+≈8 ms wall / ≈11 CPU-ms.
+**Idle tier, 720p, 1.5 fps, detection only:** (2.16 + 0.15 + 1.36) × 1.5 ≈ **6 ms/s, well under 1 %.**
 
 ---
 
@@ -176,7 +201,10 @@ to his question:
 
 - **"Is this the same body as 200 ms ago?"** — yes, reliably. But that question does not need a
   106 MB network. **An IoU tracker plus a torso colour histogram answers it for well under
-  0.1 ms**, and is not meaningfully worse at a fixed camera watching one chair.
+  0.1 ms** — measured 2026-09-02 rather than asserted: a 16×16 HSV histogram of a 128×256 torso
+  crop is **p50 0.054 ms / p95 0.055 ms** on two threads, against YoutuReID's 30.8 ms on four —
+  and is not meaningfully worse at a fixed camera watching one chair. *The cost was never the
+  problem with the histogram; the threshold is, see below.*
 - **"Is this Hunter or a stranger, from the body alone?"** — **no**, not dependably. Same-day, a
   stranger in a similar dark hoodie will match; next-day in a different shirt he will not. A
   system that says "welcome back" to a visitor in the right jumper is worse than one that says
@@ -198,6 +226,23 @@ That gives him the behaviour he wanted without pretending to an accuracy nobody 
 **phase 1 needs no re-ID model at all**: the anchor can be a colour histogram to start, and be
 upgraded to YoutuReID later without changing a single consumer, because the interface is
 "vector in, label out".
+
+**One thing does change, and this document first got it wrong: the threshold.** `BODY_MATCH_MIN
+= 0.75` is a cosine over the 768-D YoutuReID vector. It does **not** transfer to a histogram, and
+the reason is arithmetic rather than tuning. Cosine over **non-negative** vectors lives in a
+compressed range: for iid uniform components, two *completely unrelated* vectors have expected
+cosine `E[x]²/E[x²] = 0.25/(1/3) = 0.750` — **exactly the shipped bar**. Measured here 2026-09-02
+over 2000 pairs at d = 256, 768 and 4096: mean 0.750 every time, ~50 % at or above 0.75. Sparse
+HSV histograms do better than that worst case (nine unlike shirts, 36 pairs, median 0.000) but
+still put **3 of 36 unlike pairs over the bar** — and, in the other direction, **the same shirt
+under a changed desk lamp scored 0.692–0.706, i.e. *under* it.** A histogram at 0.75 both welcomes
+strangers and forgets him when the lamp changes.
+
+So `SessionIdentity.match_min` is now a **required keyword argument with no default**: a caller
+must state which vector it is holding. And the honest phase-1 position is that **the histogram
+anchor is not calibrated** — there is no number here that separates those two distributions, and
+finding one needs his room, his lamps and his wardrobe, not more arithmetic. Until then the
+tiebreaker's identity term stays `""` and the anchor carries nothing.
 
 ---
 
@@ -231,7 +276,12 @@ together. `PATHS.FACE_GALLERY` (`jarvis/config.py`) reads **`JARVIS_FACE_GALLERY
 down the stack when it does not. **The old generations are the backup** — there is no separate
 `.bak` that can quietly come to hold the same bad data the live file does, which is exactly the
 shape the voiceprint's backup had. Five are kept, never fewer than two: one generation is no
-backup at all.
+backup at all — **and the richest generation is never one of the five that fall out.** That last
+clause is a correction: oldest-first pruning alone made the claim false, because five saves of any
+size evicted the enrolment and reproduced the incident's end state one loop later (measured: one
+6-sample enrolment plus six 2-sample saves left generations [4,5,6,7,8], every one n=2). Ties go
+to the newest, so in the normal case — saves the same size or growing — pruning behaves exactly as
+it did and the window still moves.
 
 **Three guards, each refusing the shape the incident actually had:**
 
@@ -239,11 +289,18 @@ backup at all.
 |---|---|---|
 | `degenerate_reason()` at `add()` | a **constant vector**, a wrong dimension, a non-finite element | the fixture that destroyed the voiceprint was a constant vector; a real SFace embedding never is |
 | `_check_not_collapsed()` at `save()` | a pool whose samples are all the **same vector** | two copies of one vector is what the incident *left behind*, and it is indistinguishable from a working enrolment until the day it refuses him |
-| the **shrink guard** at `save()` | going from N samples to fewer without `allow_shrink=True` | six became two and nothing objected |
+| the **shrink guard** at `save()` | going from N samples to fewer without `allow_shrink=True`, measured against **the larger of what this object loaded and what is on disk** | six became two and nothing objected — and the caller that did it had loaded nothing, so an in-memory baseline abstains on its own motivating case |
+| `_prune()` protecting `max(n)` | evicting the **richest** generation, ever | oldest-first pruning made five ordinary saves enough to delete a six-take enrolment and leave the store holding only the bad writes |
 
 **`rollback()`** deletes the newest generation and reloads the one before — the step that did not
-exist today. **`purge()`** deletes *every* generation, not just the newest: a store whose "delete"
-leaves an older copy of his face on disk has not deleted anything.
+exist today — and **reports the generation it is actually holding**, which is not the same thing
+when the predecessor is corrupt too (measured: it returned 2 while holding 1). **`purge()`**
+deletes *every* generation, not just the newest, **and any `gen-NNNNN.npz.tmp` a crashed save left
+behind**: a tmp holds a full set of embeddings under a name the generation pattern does not match,
+so the first version reported success and left one on disk at 0600. A store whose "delete" leaves
+an older copy of his face on disk has not deleted anything. `save()` also unlinks its own tmp on
+failure, and creates it `0600` **from the open() call** rather than chmod-ing after `np.savez`
+returns — under his 0002 umask the plain form is 0664 for the whole write.
 
 **Versioning.** `FORMAT = 1` is stored in the file and a *future* format is refused rather than
 misread — reading a newer pool as if it were this one is how embeddings silently stop comparing,
@@ -252,9 +309,14 @@ carries **provenance**: `created_ns`, sample count, and a **`reason` string** th
 pass. When a gallery turns out to be wrong the only question that matters is what wrote it, and
 today nothing on disk could answer that.
 
-**Backup.** `restic` is already in `~/.local/bin`. `~/.aiws_trainer/face_gallery/` should be in
-the same set as `voiceprint.npz` — and if it is not, note that neither is, which is the more
-urgent finding.
+**Backup — checked, and the answer is worse than "should be".** `restic` is in `~/.local/bin`
+(28 MB, 30 Jun). **There is no backup set for the gallery to join.** No `~/.config/restic`, no
+`~/.cache/restic`, no `RESTIC_*` in `~/.bashrc` or `~/.profile`, no restic reference in any user
+systemd unit, no backup script, and the only user timer on the box is `haymaker-digest.timer`.
+**Nothing under `~/.aiws_trainer/` is backed up today — which is why this morning's loss was
+unrecoverable.** A set has to be *created* before the gallery exists, not joined. (Also:
+`voiceprint.npz` is currently mode 0664; the gallery is 0600.) This is no longer open question 3;
+it is a finding, and it is the most urgent item in this document.
 
 **The test firewall.** `tests/conftest.py` now forces `JARVIS_FACE_GALLERY` into the throwaway
 directory, forced rather than `setdefault`, exactly as it now does for `JARVIS_VOICEPRINT`. **A
@@ -297,6 +359,13 @@ Promotion requires `faces == 1` (a second person could be the one who spoke), a 
 not *someone else's*. **The cost is stated rather than hidden:** a stranger at his desk, facing
 the camera, whose voice scores under the bar, now wakes Jarvis. The transcript gate in `app.py`
 still fails shut behind it.
+
+**And so the whole of rule 1 rests on the yaw proxy, which is the untested part.** "A television
+cannot put a face in his chair" is a *presence* argument, but this is implemented as an
+*attention* gate — `attending` is a hard requirement, not a bonus term. If §9's tape-and-photos
+test shows the mount cannot separate "looking at Jarvis" from "reading the tab bar", rule 1
+promotes nothing and there is no weaker version to fall back to (§11.1). Rules 2 and 3 survive
+that outcome; rule 1 does not.
 
 A smaller correction while here: **`camera.md`'s "Rule 2" is stale.** It targets
 `SPEAKER_WAKE_MIN_MUSIC = 0.10`, which no longer exists — `2df866c` replaced it with an
@@ -466,10 +535,42 @@ from the screen is **≈95 cm from that face**, spanning ≈191 cm horizontally.
 | 1280×720 | 6.7 | **107 px** | just under SFace's 112 |
 | **1920×1080** | **10.1** | **161 px** | **comfortable** |
 
-**So: capture 1080p, detect on a 320×240 downscale, and crop the face for SFace from the
-full-resolution frame.** Measured cost of that choice: 6.36 ms decode + 2.57 ms downscale, inside
-the 16.6 ms armed-tier budget in §2. Had the mount been on the monitor at 58° FOV, 720p would
-have done — **the mount decision changes the camera you buy.**
+**So: capture 1080p, detect on a 320×180 downscale, and crop the face for SFace from the
+full-resolution frame.** Measured cost: 5.45 ms decode + 1.30 ms downscale, inside the 20.4 ms
+armed-tier budget in §2. Had the mount been on the monitor at 58° FOV, 720p would have done —
+**the mount decision changes the camera you buy.**
+
+**320×180, not 320×240, and the reason is aspect rather than pixels.** This document originally
+recommended a 4:3 detect target for a 16:9 capture, which is a **1.33× anisotropic horizontal
+squash** of every face in the frame — it spent 1080p on 161 px of face in §9 and then threw the
+shape of it away at the downscale. Measured 2026-09-02 with the real YuNet weights, on a 1080p
+frame carrying exactly the 161 px face the table above produces, 4 threads:
+
+| Detect target | Aspect | YuNet score | resize + detect |
+|---|---|---|---|
+| 320×240 | 4:3 — **squashed** | **0.703** | 2.54 + 1.74 ms |
+| **320×180** | **16:9** | **0.840** | **1.30 + 1.00 ms** |
+| 416×234 | 16:9 | 0.839 | — + 2.10 ms |
+| 640×360 | 16:9 | 0.894 | 1.06 + 2.97 ms |
+
+**The aspect-correct target scores better on fewer pixels and costs 2.0 ms less**, because
+1920×1080 → 320×180 is an exact 6:1 in both axes while → 320×240 is 6:1 and 4.5:1. And 0.703
+against the old 0.700 `min_conf` is not a margin: two independent reconstructions of the same
+scene put 320×240 at **0.62** and at **no detection at all**. `min_conf` therefore drops to
+**0.6** as well, for the asymmetry — **a miss is silent and disables the feature outright**, while
+a false face still has to survive `faces == 1` and 0.6 s of dwell before it can promote anything.
+
+**One more thing the detect size moves, and it is not free either.** The five-point yaw proxy —
+the discriminant the `cone_deg` threshold is applied to — is **not resolution-invariant**. On one
+face, `yaw_u = (nose_x − eye_mid_x) / eye_span` measured 0.293 at 320×240, 0.281 at 320×180, 0.289
+at 640×360 and **0.207 at 960×540**. Across the sizes actually in play it moves ~3 %, which is
+tolerable; across the full range it moves 29 %. **So `cone_deg = 20` cannot be calibrated once and
+reused at a different detect size** — whatever the $0 test measures, it measures at one size.
+Write the size down beside the number.
+
+All of these are synthetic frames. **The $0 test below is what settles them**, and
+`tests/test_eye.py` now pins the *ratio* rather than the numbers so the capture and detect
+settings cannot drift apart again.
 
 ### Parts
 
@@ -504,8 +605,30 @@ mount implies. That answers the resolution table above with his room instead of 
 
 ## 10. What was built today
 
-TDD, camera-free, display-free, network-free. **53 new tests, all green;** whole suite 6297 passed
+TDD, camera-free, display-free, network-free. **67 new tests, all green;** whole suite passing
 with only the known worktree-only `test_autostart.py` failure; ruff unchanged at 6.
+
+**Then an adversarial read found nine real defects in it, and they are fixed** — five in the
+store, three in the camera interface, one in the config, each with a test that fails against the
+version before it. They are worth listing because every one of them let the 2026-09-02 shape recur
+through a door this document claimed was shut:
+
+| # | Where | What was wrong |
+|---|---|---|
+| 1 | `facegallery._prune` | oldest-first pruning meant **five ordinary saves deleted a six-take enrolment**, reproducing the incident's end state one loop later. The richest generation is now never pruned |
+| 2 | `facegallery.save` | the shrink guard measured against what *this object* loaded, which is 0 for a freshly constructed caller — **the incident's own shape**. The baseline now also comes off the disk |
+| 3 | `facegallery.save` | the tmp file was created **0664** under his umask and chmod-ed to 0600 only after `np.savez` returned. It is now 0600 from the `open()` |
+| 4 | `facegallery.purge` | a crashed save's `gen-NNNNN.npz.tmp` holds a full set of embeddings and did not match the generation pattern, so **purge reported success and left one on disk**. Both purge and save now handle it |
+| 5 | `facegallery.rollback` | returned `gens[-2]` regardless of what `load()` actually recovered — it reported 2 while holding 1 |
+| 6 | `assistant_config` | **the shipped detect size could not resolve the face §9's own arithmetic produces**: 4:3 for a 16:9 capture, scoring 0.703 against a 0.700 bar. Now 320×180 + `min_conf` 0.6, and a test pins the ratio |
+| 7 | `assistant_config` | capture defaulted to 640×480, which §9 itself calls "far too small" (a 53 px face against SFace's 112). Now 1920×1080 |
+| 8 | `eye.SessionIdentity` | `room_empty()` had **no caller anywhere**, so its bound was unowned and a body vector outlived "offline mode" in RAM. `Eye` now fires `on_blind` on the deny edge |
+| 9 | `eye.SessionIdentity` | `match_min` defaulted to a YoutuReID threshold that is **a coin flip for the phase-1 colour histogram** (§4). It is now a required keyword argument |
+
+Three of the document's own numbers were also wrong and are corrected in place: the "13 % of one
+core" budget (wall time presented as CPU occupancy — it is ~28 %), the 1080p MJPEG decode
+(measured on an upscaled photo, ~1.6× optimistic), and "restic … should be in the same set"
+(there is no set).
 
 | File | What |
 |---|---|
@@ -514,7 +637,7 @@ with only the known worktree-only `test_autostart.py` failure; ruff unchanged at
 | `jarvis/config.py` | `PATHS.FACE_GALLERY`, honouring `JARVIS_FACE_GALLERY` |
 | `jarvis/assistant_config.py` | the `camera` section — and deliberately no schedule |
 | `tests/conftest.py` | `JARVIS_FACE_GALLERY` forced into the throwaway dir |
-| `tests/test_facegallery.py`, `tests/test_eye.py` | 17 + 36 tests |
+| `tests/test_facegallery.py`, `tests/test_eye.py` | 23 + 44 tests |
 
 **Not built, deliberately:** the sidecar itself, any model download, any cv2 inference, any wiring
 into `hotword.py` or `app.py`. All of it needs a camera to be worth anything, and
@@ -524,8 +647,14 @@ into `hotword.py` or `app.py`. All of it needs a camera to be worth anything, an
 
 ## 11. What could go wrong
 
-1. **The geometry kills the attention half.** Free to test (§9). If he refuses an off-axis mount,
-   build the wake tiebreaker and presence only — still worth the money.
+1. **The geometry kills the attention half.** Free to test (§9). **The tiebreaker dies with the
+   mount** — an earlier version of this line said to "build the wake tiebreaker and presence only",
+   and the code does not support that: `resolve_wake` hard-requires `attending`
+   (`jarvis/eye.py`), so with no usable attention signal it promotes nothing. A faces-only
+   promotion is not the weaker version of it — it is the cost paragraph in `resolve_wake`'s
+   docstring (*a stranger at his desk whose voice scores under the bar now wakes Jarvis*) with its
+   only mitigation deleted. What survives an unusable mount is **presence**, which is worth the
+   money on its own. Pinned by `test_the_tiebreaker_promotes_nothing_without_attention`.
 2. **`pip install mediapipe` into `~/vss_env` replaces `cv2`** and takes down Jarvis and VSS
    simultaneously, silently, at install time. This design needs no new package at all.
 3. **A second always-on process on a box that has already had one unified-memory power-off.**
@@ -533,7 +662,8 @@ into `hotword.py` or `app.py`. All of it needs a camera to be worth anything, an
    onnxruntime), `cv2.setNumThreads(4)` not 20, and a `StartLimitBurst` like `jarvis-f5.service`.
 4. **Passive face learning drifts onto a visitor.** Mitigation: there is none in the design, and
    §5 says why there must not be.
-5. **The gallery is not in the backup set — and neither is the voiceprint.** Check today.
+5. **The gallery is not in the backup set — and neither is the voiceprint.** *Checked: there is no
+   backup set at all* (§5). This is the live one.
 6. **"No face" silently reads as "not attending".** `Attention.usable()` and the `None` return
    from `capture()` exist for this; the test that catches a regression is unplugging the camera
    mid-session and confirming wake behaviour is unchanged.
@@ -553,8 +683,11 @@ into `hotword.py` or `app.py`. All of it needs a camera to be worth anything, an
    `faces == 1` + attending, with no gallery and **nothing about his face written down anywhere**.
    Turn `camera.identity` on only once a second person in frame demonstrably causes a false
    accept. The store is built so that day is cheap; that is not a reason to bring it forward.
-3. **Is `~/.aiws_trainer/` in the restic set?** If the voiceprint was not backed up today, that is
-   the more urgent finding, and the face gallery should join it before it exists rather than after.
+3. ~~**Is `~/.aiws_trainer/` in the restic set?**~~ **Answered, and the answer is no** — see §5.
+   There is no restic set at all on this box: the binary, and nothing else. This is a finding, not
+   a question, and it is the most urgent item here. **A set has to be created before the gallery
+   exists.** It needs one decision from him: where the repository lives (a second disk, or
+   somewhere off this machine).
 4. **Who owns the "close your eyes" phrasing?** The offline lane owns the command family. The
    camera-side requirement is only that stopping it stops **the sidecar**, not merely the
    consumer — stopping the consumer while the device stays open is the dishonest version, and the

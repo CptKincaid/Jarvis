@@ -26,6 +26,14 @@ atomicity does not give you:
    bad write costs one generation, not the enrolment; ``rollback()`` undoes
    it. Old generations ARE the backup -- there is no separate ".bak" that can
    quietly come to hold the same bad data the live file does.
+
+   That claim was FALSE in the first version of this file and the correction
+   is ``_prune()``. Keeping the newest five oldest-first means five bad writes
+   evict the good enrolment and leave exactly the state the incident left --
+   measured 2026-09-02: one 6-sample enrolment plus six 2-sample saves left
+   generations [4,5,6,7,8], every one holding n=2 and the enrolment gone. So
+   the RICHEST generation is never pruned. A backup you can delete by
+   repetition is not a backup.
 2. **A degenerate-vector guard.** The fixture was a constant vector. A real
    embedding never is (measured on this box 2026-09-02: cv2.FaceRecognizerSF
    returns 128 float32 with L2 = 10.41 and per-element spread), so the exact
@@ -35,6 +43,14 @@ atomicity does not give you:
 4. **A shrink guard.** Six samples became two and nothing objected. Dropping
    samples now needs ``allow_shrink=True``, which the enrolment script says
    out loud and a stray test does not.
+
+   The baseline is the LARGER of what this object loaded and what is already
+   on disk. Comparing only against what this object loaded is the version
+   that misses the incident: ``enroll_from_audio`` built a fresh verifier and
+   saved without ever loading, so an in-memory baseline is 0 and the guard
+   abstains on precisely its own motivating case (measured 2026-09-02: a
+   never-loaded gallery wrote a 2-sample generation over a 6-sample one
+   without a word).
 
 And, belt and braces, the store obeys the test firewall the same way the
 voiceprint now does: ``PATHS.FACE_GALLERY`` reads ``JARVIS_FACE_GALLERY``,
@@ -47,8 +63,11 @@ plus ``_format``, ``_created_ns`` and ``_reason``. Labels live in the key
 because a face gallery holds more than one person the moment a second person
 sits down -- distinguishing "someone" from "him" is the point.
 
-DELETION is ``purge()``: every generation, not just the newest. A store whose
-"delete" leaves an older copy of his face on disk has not deleted anything.
+DELETION is ``purge()``: every generation, not just the newest, AND any
+``.tmp`` a crashed save left behind -- which is a full set of embeddings under
+a name the generation pattern does not match, so the first version of purge()
+reported success and left one on disk. A store whose "delete" leaves an older
+copy of his face on disk has not deleted anything.
 
 Nothing here imports cv2, torch or a model. It is arithmetic over arrays, so
 it runs in the test suite with no camera, no display and no GPU.
@@ -84,6 +103,10 @@ MIN_GENERATIONS = 2
 SFACE_COSINE_SAME = 0.363
 
 _GEN_RE = re.compile(r"^gen-(\d{5})\.npz$")
+# A crashed save leaves gen-00002.npz.tmp, which _GEN_RE does not match -- so
+# the first purge() reported success and left a full set of his embeddings on
+# disk under a name nothing looked for. Deletion has to mean deletion.
+_TMP_RE = re.compile(r"^gen-(\d{5})\.npz\.tmp$")
 _KEY_RE = re.compile(r"^emb_(.+)_(\d{4})$")
 # A label goes into an npz key and a log line, so keep it boring.
 _LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
@@ -206,6 +229,13 @@ class FaceGallery:
                 out.append(int(m.group(1)))
         return sorted(out)
 
+    def _tmp_paths(self) -> List[Path]:
+        """Any ``gen-NNNNN.npz.tmp`` a crashed save left. These hold a full
+        set of embeddings and are invisible to ``_GEN_RE``."""
+        if self.root is None or not self.root.is_dir():
+            return []
+        return sorted(p for p in self.root.iterdir() if _TMP_RE.match(p.name))
+
     def load(self, generation: Optional[int] = None) -> bool:
         """Load one generation, defaulting to the newest that parses.
 
@@ -267,15 +297,20 @@ class FaceGallery:
         if n == 0:
             raise ValueError("refusing to save an empty gallery")
         self._check_not_collapsed()
-        if not allow_shrink and self._loaded_n and n < self._loaded_n:
+        baseline = max(self._loaded_n, self._on_disk_n())
+        if not allow_shrink and baseline and n < baseline:
             raise ValueError(
                 "refusing to shrink the gallery from %d samples to %d; pass "
                 "allow_shrink=True if you mean it (this guard exists because "
                 "the voiceprint went 6 -> 2 unnoticed on 2026-09-02)"
-                % (self._loaded_n, n))
+                % (baseline, n))
 
-        self.root.mkdir(parents=True, exist_ok=True)
-        os.chmod(self.root, 0o700)
+        # mode=0o700 on the mkdir itself, not only the chmod after it: with
+        # his umask of 0002 a plain mkdir creates 0775 and stays group- and
+        # world-readable until the chmod lands. A window is small, not absent,
+        # and this is the one module whose stated job is the stricter standard.
+        self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(self.root, 0o700)     # belt and braces for a pre-existing dir
         gen = (self.generations() or [0])[-1] + 1
         arrays: Dict[str, np.ndarray] = {}
         for label, pool in self._pool.items():
@@ -289,10 +324,29 @@ class FaceGallery:
         tmp = path.with_name(path.name + ".tmp")
         # savez appends ".npz" to a bare path, so hand it a file handle and
         # keep the exact tmp name -- the same trap speaker.py:288-292 hit.
-        with open(tmp, "wb") as fh:
-            np.savez(fh, **arrays)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, path)
+        #
+        # os.open with an explicit 0o600 rather than open() then chmod: under
+        # his umask of 0002 the plain form creates the file 0664 and it stays
+        # 0664 for the whole of np.savez, which for 12 embeddings is not an
+        # instant. chmod-after closes the door on a file others could already
+        # have opened. No O_EXCL: a tmp left by an earlier hard crash would
+        # then wedge every future save, and a store whose failure mode is
+        # "cannot write" has lost the argument it exists to win.
+        try:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "wb") as fh:
+                np.savez(fh, **arrays)
+            os.chmod(tmp, 0o600)       # if it already existed, at any mode
+            os.replace(tmp, path)
+        except Exception:
+            # A half-written tmp holds real embeddings. Leaving it is both a
+            # leak and a file purge() used not to find.
+            try:
+                tmp.unlink()
+            except OSError:
+                log.warning("could not remove a failed save's %s", tmp.name,
+                            exc_info=True)
+            raise
         self.loaded_generation = gen
         self._loaded_n = n
         self._provenance = {"format": FORMAT, "created_ns": time.time_ns(),
@@ -300,6 +354,32 @@ class FaceGallery:
         self._prune()
         log.info("face gallery saved: generation %d, %d samples (%s)", gen, n, reason)
         return gen
+
+    def _sample_count(self, generation: int) -> int:
+        """How many usable embeddings one generation holds, without loading it.
+
+        Provenance already carries ``n``; this reads the file for it rather
+        than trusting a number in memory, because the whole point of the two
+        callers is to defend against a caller whose memory is empty."""
+        try:
+            _pool, prov = self._read(self.path_for(generation))
+        except Exception:
+            return 0          # unreadable: it defends nothing and protects nothing
+        return int(prov.get("n") or 0)
+
+    def _on_disk_n(self) -> int:
+        """The newest generation that parses, in samples. 0 if there is none.
+
+        THIS IS THE FIX FOR THE INCIDENT'S OWN SHAPE. ``enroll_from_audio``
+        built a fresh verifier and saved; a fresh object has loaded nothing,
+        so a purely in-memory baseline is 0 and the shrink guard abstains on
+        exactly the case it was written for. Asking the disk costs one small
+        npz read on a path that runs at most a dozen times a year."""
+        for gen in reversed(self.generations()):
+            n = self._sample_count(gen)
+            if n:
+                return n
+        return 0
 
     def _check_not_collapsed(self) -> None:
         """Every sample of a label being the same vector is the state the
@@ -314,9 +394,36 @@ class FaceGallery:
                     "are the same vector" % (label, len(pool)))
 
     def _prune(self) -> None:
+        """Drop the oldest generations past the window -- but NEVER the richest.
+
+        Oldest-first alone makes the generations self-destructing: five saves
+        of any size at all evict a six-take enrolment, and the store lands in
+        the state the incident left, one loop later. Measured 2026-09-02: one
+        6-sample enrolment plus six 2-sample saves left [4,5,6,7,8], all n=2.
+
+        Protecting ``max(n)`` costs nothing in the normal case -- when saves
+        are the same size or growing, the richest IS the newest and is kept
+        anyway, so this changes the outcome only when a bigger generation is
+        about to fall out of the window, which is the only case that matters.
+        Ties go to the newest, so a steady state prunes exactly as before."""
         gens = self.generations()
         keep = max(KEEP_GENERATIONS, MIN_GENERATIONS)
-        for gen in gens[:-keep] if len(gens) > keep else []:
+        for tmp in self._tmp_paths():
+            # A crashed save's leftovers are not a generation and hold no
+            # history worth keeping; they are just embeddings lying around.
+            try:
+                tmp.unlink()
+            except OSError:
+                log.debug("could not remove %s", tmp.name, exc_info=True)
+        if len(gens) <= keep:
+            return
+        richest, richest_n = gens[-1], -1
+        for gen in gens:
+            n = self._sample_count(gen)
+            if n >= richest_n:          # >= so a tie protects the NEWEST
+                richest, richest_n = gen, n
+        doomed = [g for g in gens if g != richest][:len(gens) - keep]
+        for gen in doomed:
             try:
                 self.path_for(gen).unlink()
             except OSError:
@@ -333,21 +440,30 @@ class FaceGallery:
         self.path_for(gens[-1]).unlink()
         self.loaded_generation = 0
         self._loaded_n = 0
-        return gens[-2] if self.load() else 0
+        # load() falls back down the stack when gens[-2] is ALSO corrupt, so
+        # returning gens[-2] reports a generation this object may not be
+        # holding. Measured 2026-09-02: with gen 2 corrupted, rollback()
+        # returned 2 while loaded_generation was 1 -- an enrolment script
+        # printing "rolled back to generation 2" over generation 1 is the
+        # quiet mismatch this whole module exists to prevent.
+        return self.loaded_generation if self.load() else 0
 
     def purge(self) -> int:
-        """Delete EVERY generation and empty the pool; return files removed.
+        """Delete every generation AND every crashed save's tmp; return files
+        removed.
 
         "Deleted" has to mean deleted. Removing only the newest leaves an
         older measurement of his face on the disk, which answers the wrong
-        question."""
+        question -- and so does removing only the files whose names match the
+        generation pattern, because ``gen-00002.npz.tmp`` does not and holds
+        the same embeddings."""
         removed = 0
-        for gen in self.generations():
+        for path in [self.path_for(g) for g in self.generations()] + self._tmp_paths():
             try:
-                self.path_for(gen).unlink()
+                path.unlink()
                 removed += 1
             except OSError:
-                log.warning("could not delete face gallery generation %d", gen,
+                log.warning("could not delete face gallery file %s", path.name,
                             exc_info=True)
         self._pool = {}
         self.loaded_generation = 0

@@ -296,7 +296,7 @@ def bvec(seed: int, dim: int = 768) -> np.ndarray:
 
 def test_a_body_is_only_who_a_face_recently_said_it_was():
     clock = {"t": 100.0}
-    s = SessionIdentity(ttl_s=600.0, now=lambda: clock["t"])
+    s = SessionIdentity(ttl_s=600.0, match_min=eye_mod.BODY_MATCH_MIN, now=lambda: clock["t"])
     body = bvec(1)
     assert s.identify(body) == ("", 0.0)          # nothing vouched yet
     s.anchor("hunter", body)
@@ -308,7 +308,7 @@ def test_the_body_anchor_expires_because_clothes_change():
     """Body re-ID is dominated by clothing. An anchor that outlives the outfit
     it was taken from is a confident wrong answer, so it has a clock."""
     clock = {"t": 0.0}
-    s = SessionIdentity(ttl_s=600.0, now=lambda: clock["t"])
+    s = SessionIdentity(ttl_s=600.0, match_min=eye_mod.BODY_MATCH_MIN, now=lambda: clock["t"])
     body = bvec(3)
     s.anchor("hunter", body)
     clock["t"] = 599.0
@@ -320,7 +320,7 @@ def test_the_body_anchor_expires_because_clothes_change():
 def test_the_room_emptying_drops_the_anchor_immediately():
     """The window in which a different person can sit down wearing anything is
     exactly the window in which nobody was in frame."""
-    s = SessionIdentity(ttl_s=600.0, now=lambda: 0.0)
+    s = SessionIdentity(ttl_s=600.0, match_min=eye_mod.BODY_MATCH_MIN, now=lambda: 0.0)
     body = bvec(4)
     s.anchor("hunter", body)
     s.room_empty()
@@ -328,13 +328,13 @@ def test_the_room_emptying_drops_the_anchor_immediately():
 
 
 def test_a_different_body_is_not_him_even_inside_the_ttl():
-    s = SessionIdentity(ttl_s=600.0, now=lambda: 0.0)
+    s = SessionIdentity(ttl_s=600.0, match_min=eye_mod.BODY_MATCH_MIN, now=lambda: 0.0)
     s.anchor("hunter", bvec(5))
     assert s.identify(bvec(6)) == ("", 0.0)
 
 
 def test_a_degenerate_body_vector_is_refused():
-    s = SessionIdentity(ttl_s=600.0, now=lambda: 0.0)
+    s = SessionIdentity(ttl_s=600.0, match_min=eye_mod.BODY_MATCH_MIN, now=lambda: 0.0)
     s.anchor("hunter", bvec(7))
     assert s.identify(np.zeros(768, dtype=np.float32)) == ("", 0.0)
     with pytest.raises(ValueError):
@@ -361,10 +361,168 @@ def test_the_camera_section_carries_no_schedule_of_its_own():
                 or "offline" in k or "start" in k or "end" in k}
 
 
-def test_the_detector_defaults_to_the_size_that_was_measured():
-    """320x240 measured on this box 2026-09-02, single-threaded: YuNet p50
-    3.19 ms / p95 3.50 ms. 640x480 is p50 12.63 / p95 14.97 for a face that is
-    already large at desk distance."""
+def test_the_detect_size_cannot_drift_from_the_capture_aspect():
+    """The defect this replaces: 320x240 (4:3) shipped as the detect target
+    for a 1080p (16:9) capture, which is a 1.33x anisotropic horizontal squash
+    of every face in the frame.
+
+    Measured 2026-09-02 on a 1080p frame carrying the 161 px face that
+    docs/vision.md section 9's own arithmetic produces at the recommended
+    mount: 320x240 scored 0.703 against the then-default 0.700 bar, while the
+    aspect-correct 320x180 scored 0.840 on FEWER pixels and 2.0 ms less
+    resize+detect (1920x1080 -> 320x180 is an exact 6:1 in both axes). Two
+    other reconstructions of the same scene put 320x240 at 0.62 and at no
+    detection at all -- the old default straddled its own threshold.
+
+    Pinning the RATIO rather than the number is the point: the two settings
+    are one decision and the first version let them drift apart silently.
+    This is the no-drift half of the guard and it passes on the OLD defaults
+    too (640x480 with 320x240 is consistently 4:3); the defect itself is
+    caught by the capture-resolution test below. They are complementary: one
+    fixes the scale, the other forbids the squash."""
     from jarvis.assistant_config import DEFAULTS
-    assert DEFAULTS["camera"]["detect_width"] == 320
+    cam = DEFAULTS["camera"]
+    cap = cam["width"] / cam["height"]
+    det = cam["detect_width"] / cam["detect_height"]
+    assert abs(cap - det) < 0.01, "detect %dx%d squashes a %dx%d capture" % (
+        cam["detect_width"], cam["detect_height"], cam["width"], cam["height"])
     assert DEFAULTS["camera"]["idle_fps"] < DEFAULTS["camera"]["armed_fps"]
+
+
+def test_the_capture_resolution_is_the_one_the_mount_arithmetic_needs():
+    """docs/vision.md section 9: ~90 deg horizontal at 95 cm spans 191 cm, so
+    1920 px gives 10.05 px/cm and a 16 cm face is 161 px. 640x480 -- which
+    shipped first, uncommented -- makes that same face 53 px against SFace's
+    112x112 input, which section 9 itself calls "far too small"."""
+    from jarvis.assistant_config import DEFAULTS
+    cam = DEFAULTS["camera"]
+    span_cm = 191.0
+    face_px = cam["width"] / span_cm * 16.0
+    assert face_px >= 112.0, "a 16 cm face is %.0f px at %dx%d" % (
+        face_px, cam["width"], cam["height"])
+
+
+def test_the_confidence_bar_leaves_the_measured_face_a_margin():
+    """0.7 was not a bar the recommended mount clears. At the aspect-correct
+    detect size the same face scores 0.840, so 0.6 leaves 0.24 of margin
+    rather than 0.003 -- and the asymmetry is why the margin goes on this
+    side: a miss is SILENT and disables the feature outright, while a false
+    face still has to survive faces==1 and dwell_s >= camera.dwell_s before it
+    can promote anything."""
+    from jarvis.assistant_config import DEFAULTS
+    assert DEFAULTS["camera"]["min_conf"] <= 0.65
+
+
+# --------------------------------------- the holes an adversarial read found
+def test_a_deny_tells_the_consumer_it_has_gone_blind_once_per_edge():
+    """``SessionIdentity.room_empty()`` had no caller anywhere outside its own
+    tests, so its stated bound -- "dropped the instant the room empties" -- was
+    unowned. Offline mode and the 21:00-07:00 curfew are the unbounded blind
+    windows that bound exists for, and ``Eye`` is the only witness to them.
+
+    The EDGE, not every frame: at 8 fps a standing deny would otherwise fire
+    this eight times a second saying nothing new."""
+    gate = {"ok": True}
+    blinds = []
+    e = Eye(lambda: gate["ok"], lambda: FakeDevice(), on_blind=lambda: blinds.append(1))
+
+    assert e.capture() is not None
+    gate["ok"] = False
+    for _ in range(8):                      # a whole second of armed-tier ticks
+        assert e.capture() is None
+    assert len(blinds) == 1, "fired %d times for one deny" % len(blinds)
+    assert e.device_open is False
+
+    gate["ok"] = True                        # he comes back
+    assert e.capture() is not None
+    gate["ok"] = False
+    assert e.capture() is None
+    assert len(blinds) == 2 and e.blind_edges == 2
+
+
+def test_a_dropped_frame_is_a_hiccup_and_does_not_drop_the_anchor():
+    """A failed grab is deliberately NOT a blind edge. Clearing the body
+    anchor on every transient read failure would make the anchor useless; the
+    TTL is the backstop for a camera that quietly stops working. A deny is
+    different in kind -- somebody, or the clock, said stop."""
+    blinds = []
+    e = Eye(lambda: True, lambda: FakeDevice(fail_read=True),
+            on_blind=lambda: blinds.append(1))
+    for _ in range(5):
+        assert e.capture() is None
+    assert blinds == []
+
+
+def test_a_blind_consumer_that_raises_still_leaves_the_device_shut():
+    """Fail to offline: a broken consumer is not a reason to keep watching,
+    and must not turn a deny into an exception out of capture()."""
+    def boom():
+        raise RuntimeError("the sidecar died")
+
+    gate = {"ok": True}
+    e = Eye(lambda: gate["ok"], lambda: FakeDevice(), on_blind=boom)
+    assert e.capture() is not None
+    gate["ok"] = False
+    assert e.capture() is None               # no exception escapes
+    assert e.device_open is False
+
+
+def test_going_offline_clears_the_body_vector_from_memory_too():
+    """The end-to-end shape of the two fixes above: after "offline mode" there
+    is no body vector left in RAM vouching for whoever is in the chair when
+    the lens re-opens."""
+    s = SessionIdentity(ttl_s=900.0, match_min=eye_mod.BODY_MATCH_MIN,
+                        now=lambda: 0.0)
+    gate = {"ok": True}
+    e = Eye(lambda: gate["ok"], lambda: FakeDevice(), on_blind=s.room_empty)
+    e.capture()
+    body = bvec(11)
+    s.anchor("hunter", body)
+    assert s.identify(body)[0] == "hunter"
+
+    gate["ok"] = False                       # "Jarvis, offline mode"
+    assert e.capture() is None
+    assert s.identify(body) == ("", 0.0)
+
+
+def test_the_body_threshold_must_be_stated_not_inherited():
+    """0.75 is right for the 768-D YoutuReID vector and a coin flip for the
+    colour histogram docs/vision.md section 4 offers as the phase-1 stand-in.
+
+    The arithmetic, not an opinion: cosine over NON-NEGATIVE vectors is
+    compressed, and for iid uniform components two UNRELATED vectors have
+    expected cosine E[x]^2/E[x^2] = 0.25/(1/3) = 0.750 exactly -- measured
+    2026-09-02 over 2000 pairs at d=256, 768 and 4096, mean 0.750 every time
+    with ~50% at or above 0.75. Sparse HSV histograms of nine unlike shirts
+    still put 3 of 36 unlike pairs over the bar, and the same shirt under a
+    changed desk lamp scored 0.692-0.706, i.e. UNDER it. Miscalibrated both
+    ways, so the caller has to say which vector it is holding."""
+    with pytest.raises(TypeError):
+        SessionIdentity(ttl_s=600.0, now=lambda: 0.0)      # no match_min
+
+    d = 768
+    rng = np.random.default_rng(5)
+    from jarvis.facegallery import cosine
+    unrelated = [cosine(rng.random(d), rng.random(d)) for _ in range(400)]
+    assert abs(float(np.mean(unrelated)) - 0.75) < 0.02, (
+        "the compressed range this guard is about has moved: %.3f"
+        % float(np.mean(unrelated)))
+    assert eye_mod.BODY_MATCH_MIN == 0.75      # the YoutuReID number, unchanged
+
+
+def test_the_tiebreaker_promotes_nothing_without_attention():
+    """docs/vision.md section 11.1 used to offer "build the wake tiebreaker and
+    presence only" as the fallback if the mount geometry cannot separate
+    "looking at Jarvis" from "reading the tab bar". It cannot: ``attending``
+    is a hard requirement, so with no usable attention signal this function
+    promotes nothing, and a faces-only version would be the cost paragraph in
+    resolve_wake's docstring with its only mitigation removed.
+
+    Pinned exhaustively so the fallback cannot be quietly re-invented."""
+    for faces, dwell, ident, age in itertools.product(
+            (0, 1, 2, 5), (0.0, 0.5, 5.0, 900.0), ("", "hunter"), (0.0, 1.4)):
+        eye = att(faces=faces, attending=False, dwell_s=dwell,
+                  identity=ident, age_s=age)
+        out = resolve_wake("suppress", False, eye)
+        assert out.ok is False, (faces, dwell, ident, age)
+        assert out.evidence == ""
