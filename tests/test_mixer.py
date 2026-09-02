@@ -53,22 +53,36 @@ def mixer(tmp_path, run=None, remote=None, **cfg):
 
 
 class FakeRemote:
-    """A stand-in for jarvis.tools.spotify.SpotifyTool's duck()/unduck()."""
+    """A stand-in for jarvis.tools.spotify.SpotifyTool's duck()/unduck(),
+    plus the two read-only bits the mixer takes from it: the name of the
+    device it ducked and its cached music state."""
 
-    def __init__(self, ok=True, boom=False):
+    def __init__(self, ok=True, boom=False, name="HPCOMPUTER", playing=False,
+                 during_duck=None):
         self.ok, self.boom = ok, boom
+        self.name, self.playing = name, playing
+        self.during_duck = during_duck       # runs INSIDE duck(): the latency seam
         self.ducked: list = []
         self.unducked = 0
 
     def duck(self, pct):
         if self.boom:
             raise RuntimeError("spotify is down")
+        if self.during_duck is not None:
+            self.during_duck()
         self.ducked.append(pct)
         return self.ok
 
     def unduck(self):
         self.unducked += 1
         return True
+
+    @property
+    def ducked_device(self):
+        return self.name if len(self.ducked) > self.unducked else None
+
+    def music_playing(self):
+        return self.playing
 
 
 # ---------------------------------------------------------------- parsing
@@ -83,6 +97,9 @@ def test_parse_sink_inputs_reads_both_live_streams():
     assert spotify["restore_key"] == "sink-input-by-application-name:pacat"
     assert jarvis["pid"] == JARVIS_PID and jarvis["app_name"] == "paplay"
     assert jarvis["sink"] == spotify["sink"] == "102"
+    # node.name is what the filter-chain's playback stream is known by
+    # (see AEC_PLAYBACK_NAME); on these two it merely echoes the binary.
+    assert spotify["node_name"] == "pacat" and jarvis["node_name"] == "paplay"
 
 
 def test_parse_sink_inputs_empty_and_garbage():
@@ -114,6 +131,30 @@ def test_duck_targets_skips_corked_and_already_quiet():
               {"index": 2, "pid": 11, "volume_pct": 20, "corked": False},
               {"index": 3, "pid": 12, "volume_pct": 55, "corked": False}]
     assert [i["index"] for i in mx.duck_targets(inputs, (), 30)] == [3]
+
+
+def _stream(index, pid, **props):
+    base = {"index": index, "pid": pid, "volume_pct": 100, "corked": False,
+            "app_name": "", "media_name": "", "node_name": ""}
+    base.update(props)
+    return base
+
+
+@pytest.mark.parametrize("field", ["node_name", "media_name", "app_name"])
+def test_duck_targets_exempts_the_aec_playback_stream_by_name(field):
+    """With echo cancellation on, Jarvis's voice leaves the box as a
+    sink-input owned by the filter-chain's pipewire process, NOT by Jarvis
+    or any PID he spawned, so the PID registry cannot see it -- and a
+    30 % Jarvis is the one thing the mixer exists to prevent.  The stream
+    is known only by its name, which may land in any of the three name
+    properties depending on how the chain was declared."""
+    aec = _stream(7, 1234, **{field: mx.AEC_PLAYBACK_NAME})
+    music = _stream(8, 5678, app_name="pacat", media_name="Spotify (Spark)")
+    assert [i["index"] for i in mx.duck_targets([aec, music], (), 30)] == [8]
+    # Exact name only: a stream merely mentioning it is somebody else's.
+    near = _stream(9, 1234, **{field: mx.AEC_PLAYBACK_NAME + ".monitor"})
+    assert [i["index"] for i in mx.duck_targets([near], (), 30)] == [9]
+    assert mx.AEC_PLAYBACK_NAME == "jarvis_aec_playback"
 
 
 def test_plan_restore_puts_the_original_back():
@@ -377,8 +418,9 @@ def test_registry_ignores_rubbish(pid):
 # evening of the test the ONLY local sink-input was the idle librespot pipe --
 # the music he could hear was on HPCOMPUTER, a Spotify Connect device, where
 # pactl reaches nothing.  So `mixer: ducked 1 stream(s) to 30%` sat in the log
-# while the music stayed exactly where it was.  When there is nothing local
-# worth ducking, the Connect device's own volume is the only handle left.
+# while the music stayed exactly where it was.  The Connect device's own
+# volume is the only handle on that music, and pactl cannot tell the mixer
+# whether it is needed -- so it is pulled on every hold, local duck or not.
 def test_remote_duck_fires_when_there_is_nothing_local(tmp_path, monkeypatch):
     monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
     remote = FakeRemote()
@@ -409,14 +451,114 @@ def test_remote_duck_restore_edge_fires_without_a_local_duck(tmp_path, monkeypat
     assert remote.unducked == 1
 
 
-def test_local_streams_still_win_over_the_remote(tmp_path, monkeypatch):
+def test_remote_duck_fires_despite_an_uncorked_local_target(tmp_path, monkeypatch,
+                                                            caplog):
+    """The 2026-09-01 incident in one test.  The real dump has the librespot
+    pipe (#92: pacat, uncorked, 100%) even though the Spark had never been
+    picked as a device and the pipe carried silence; "local streams win"
+    meant the remote duck never fired ONCE that evening.  Both must go down,
+    both must come back."""
     monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
     remote = FakeRemote()
     run = FakeRun()                              # the real dump: 2 streams
     m = mixer(tmp_path, run=run, remote=remote)
+    m._registry.add(JARVIS_PID)                  # the paplay is Jarvis himself
+    m.on_recording_started()
+    with caplog.at_level("INFO", logger="jarvis.mixer"):
+        m.pump()
+    assert {w[2] for w in run.writes} == {"92"}  # the pipe was ducked locally...
+    assert remote.ducked == [30]                 # ...AND the Connect device
+    assert ("mixer: ducked the Spotify Connect device HPCOMPUTER to 30% of its "
+            "volume") in caplog.text
+    m.on_recording_stopped()
+    with caplog.at_level("INFO", logger="jarvis.mixer"):
+        m.pump()
+    assert remote.unducked == 1
+    assert run.writes[-1] == ["pactl", "set-sink-input-volume", "92", "100%"]
+    assert "mixer: restored the Spotify Connect device HPCOMPUTER" in caplog.text
+
+
+def test_remote_duck_fires_on_speaking_as_well_as_recording(tmp_path, monkeypatch):
+    """Both edges hold the room; the vocalist is as much a problem for his
+    reply being heard as for his question being understood."""
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote()
+    m = mixer(tmp_path, run=FakeRun(), remote=remote)
+    m.on_speaking(SimpleNamespace(active=True))
+    m.pump()
+    assert remote.ducked == [30]
+    m.on_speaking(SimpleNamespace(active=False))
+    m.pump()
+    assert remote.unducked == 1
+
+
+def test_remote_is_asked_once_per_hold_not_once_per_second(tmp_path, monkeypatch):
+    """No active Connect device -> duck() says False.  The worker wakes every
+    second while a hold is up, and the two Web API calls a remote duck costs
+    must not be repeated on each wake-up; a NEW hold may ask again."""
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    remote = FakeRemote(ok=False)
+    m = mixer(tmp_path, run=FakeRun(dump=""), remote=remote)
+    m.on_recording_started()
+    for _ in range(4):
+        m.pump()
+    assert remote.ducked == [30]
+    m.on_recording_stopped()
+    m.pump()
     m.on_recording_started()
     m.pump()
-    assert run.writes and remote.ducked == []
+    assert remote.ducked == [30, 30]
+
+
+def test_a_duck_that_lands_after_the_hold_ended_is_restored(tmp_path, monkeypatch):
+    """The two API calls take 0.3-0.6 s; a short "Jarvis, stop" can be over
+    before they return.  The edge that ended the hold already woke the
+    worker, so the very next pump has to see the late duck and lift it."""
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    m = mixer(tmp_path, run=FakeRun(dump=""))
+    remote = FakeRemote(during_duck=m.on_recording_stopped)
+    m.set_remote(remote)
+    m.on_recording_started()
+    m.pump()                                     # duck lands, hold already gone
+    assert remote.ducked == [30] and remote.unducked == 0
+    assert m.music_playing()                     # a duck in force IS music
+    m.pump()                                     # the wake the edge queued
+    assert remote.unducked == 1
+    assert not m.music_playing()
+
+
+def test_a_duck_that_lands_during_stop_is_restored(tmp_path, monkeypatch):
+    """stop() restores before raising the flag, so a duck still in flight is
+    invisible to it; whoever finishes last must put the device back."""
+    monkeypatch.delenv("JARVIS_ROOM_CONTROL", raising=False)
+    m = mixer(tmp_path, run=FakeRun(dump=""))
+    remote = FakeRemote(during_duck=m.stop)
+    m.set_remote(remote)
+    m.on_recording_started()
+    m.pump()
+    assert remote.ducked == [30]
+    assert remote.unducked == 1
+
+
+def test_music_playing_is_the_remotes_cache_or_a_duck_in_force(tmp_path):
+    """The wake gate asks this ~10 times a second when a wake fires; it must
+    be a cache read, never a request, and False when nothing is wired."""
+    assert mixer(tmp_path).music_playing() is False
+    remote = FakeRemote(playing=True)
+    m = mixer(tmp_path, remote=remote)
+    assert m.music_playing() is True
+    remote.playing = False
+    assert m.music_playing() is False
+
+
+def test_music_playing_survives_a_broken_remote(tmp_path):
+    class Broken:
+        def music_playing(self):
+            raise RuntimeError("token expired")
+    m = mixer(tmp_path, remote=Broken())
+    assert m.music_playing() is False
+    m = mixer(tmp_path, remote=object())         # no such method at all
+    assert m.music_playing() is False
 
 
 def test_remote_duck_is_suppressed_by_room_control_off(tmp_path, monkeypatch):

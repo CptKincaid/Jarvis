@@ -1507,6 +1507,48 @@ def test_the_mixer_can_reach_the_spotify_tool_for_the_remote_duck(app):
     assert callable(getattr(app.mixer._remote, "unduck", None))
 
 
+def test_the_wake_gate_learns_about_music_from_the_same_spotify_tool(build):
+    """The music-aware wake bar (2026-09-01) is three hand-offs: SpotifyTool
+    caches what it knows about playback, the mixer reads that cache, and the
+    Hotword is handed a callable that reaches the mixer.  Each piece has a
+    unit test against a fake; this one flips the cache on the REAL tool the
+    app parked on services and watches the answer arrive at the callable
+    the app actually gave Hotword -- because #72 was a duck built, tested,
+    and never wired."""
+    class RecordingHotword(_Stub):
+        made: list = []
+
+        def __init__(self, *a, **kw):
+            RecordingHotword.made.append(kw)
+
+    app = build(Hotword=RecordingHotword)
+    assert RecordingHotword.made, "the app never built a Hotword"
+    kw = RecordingHotword.made[-1]
+    music = kw.get("music_playing")
+    assert callable(music), "Hotword was not handed a music_playing callable"
+    assert kw.get("on_guest") == app._on_guest
+    spotify = getattr(app.services, "spotify", None)
+    assert spotify is not None and app.mixer._remote is spotify
+    assert music() is False                      # a fresh box: nothing known
+    spotify._note_music(True)                    # what a play command records
+    assert music() is True
+    assert app._music_playing() is True
+    spotify._note_music(False)                   # ...and a pause
+    assert music() is False
+    # The play above also started the bounded playback poller -- the one
+    # piece of this that could reach the network -- and quitting must stop
+    # it: a poller outliving the app is a request against a room nobody is
+    # in (and, in this suite, a stray thread in a later test).
+    t = spotify._poll_thread
+    assert t is not None and t.name == "spotify-poll"
+    # stop_assistant resolves stop() before close(); the tool must keep
+    # having only close(), or a transport stop() would pause his music on
+    # every quit.
+    assert getattr(spotify, "stop", None) is None
+    app.stop_assistant()
+    assert not t.is_alive() and spotify._poll_enabled is False
+
+
 # ------------------------------------------------- the Board and the room
 def test_the_board_is_a_real_service_and_composes_from_real_providers(app):
     """No fakes: the app's own providers answer, and the panels that need

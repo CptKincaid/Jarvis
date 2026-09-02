@@ -150,3 +150,116 @@ def test_disabling_speaker_verify_disables_the_wake_gate(audio):
     spk = FakeSpeaker(0.0)
     assert gate(spk, audio, enabled=False) is True
     assert spk.calls == 0
+
+
+# ------------------------------------------------- the gate while music plays
+# 2026-09-01, Spotify on HPCOMPUTER: his own "Jarvis" scored 0.135 (oww 0.713)
+# and 0.158 (oww 0.864) against the 0.25 bar, was refused, and got "I only
+# answer to Hunter, sir" -- twice.  The verifier cannot trim the bed under his
+# voice (no silence to find), so the whole buffer is embedded and he scores
+# like a stranger.  Music that tripped oww on its own scored -0.084 / -0.098.
+# The bar drops to 0.10 ONLY when music is known playing AND oww is at the
+# unverified bar; the transcript gate behind it is untouched.
+def gate_with(speaker, audio, music, oww, native_rate=16000):
+    hw.CONFIG.speaker_verify = True
+    h = hw.Hotword.__new__(hw.Hotword)
+    h._speaker = speaker
+    h._music_playing = (lambda: music) if music is not None else None
+    return h._speaker_ok(audio, native_rate, oww_score=oww)
+
+
+def test_his_voice_over_music_is_accepted(audio):
+    assert gate_with(FakeSpeaker(0.135), audio, music=True, oww=0.713) is True
+    assert gate_with(FakeSpeaker(0.158), audio, music=True, oww=0.864) is True
+
+
+def test_the_same_score_without_music_is_still_a_stranger(audio):
+    """The relaxed bar is a property of the room, not the default."""
+    assert gate_with(FakeSpeaker(0.135), audio, music=False, oww=0.713) is False
+    assert gate_with(FakeSpeaker(0.135), audio, music=None, oww=0.713) is False
+
+
+def test_music_alone_is_rejected_with_or_without_the_relaxed_bar(audio):
+    assert gate_with(FakeSpeaker(-0.084), audio, music=True, oww=0.9) is False
+    assert gate_with(FakeSpeaker(-0.084), audio, music=False, oww=0.9) is False
+
+
+def test_a_marginal_wake_word_over_music_keeps_the_normal_bar(audio):
+    """oww 0.5 is under the unverified bar: a vocalist's near-miss must not
+    ALSO get the softer speaker check.  Both must be confident, not either."""
+    assert gate_with(FakeSpeaker(0.135), audio, music=True, oww=0.5) is False
+    assert gate_with(FakeSpeaker(0.135), audio, music=True,
+                     oww=hw.Hotword.UNVERIFIED_THRESHOLD) is True
+
+
+def test_abstention_still_fails_open_over_music(audio):
+    assert gate_with(FakeSpeaker(None), audio, music=True, oww=0.9) is True
+
+
+def test_a_broken_music_source_means_no_music(audio):
+    def boom():
+        raise RuntimeError("spotify token expired")
+    hw.CONFIG.speaker_verify = True
+    h = hw.Hotword.__new__(hw.Hotword)
+    h._speaker = FakeSpeaker(0.135)
+    h._music_playing = boom
+    assert h._speaker_ok(audio, 16000, oww_score=0.9) is False
+
+
+def test_the_music_bar_sits_between_the_measured_clusters():
+    """Pin the evidence: above every music-only score seen, below every one
+    of his.  Move the numbers here when the log says otherwise."""
+    assert -0.084 < hw.Hotword.SPEAKER_WAKE_MIN_MUSIC < 0.135
+    assert hw.Hotword.SPEAKER_WAKE_MIN_MUSIC < hw.Hotword.SPEAKER_WAKE_MIN
+
+
+def test_every_scored_candidate_is_logged_on_one_line(audio, caplog):
+    """The calibration record: speaker score, oww score, music state and the
+    buffer's ambient level together, so the bar can be re-derived from the
+    log instead of from memory."""
+    audio = (np.random.default_rng(0).standard_normal(32000) * 0.03).astype(np.float32)
+    with caplog.at_level("INFO", logger="jarvis.hotword"):
+        gate_with(FakeSpeaker(0.135), audio, music=True, oww=0.713)
+        gate_with(FakeSpeaker(0.135), audio, music=False, oww=0.713)
+        gate_with(FakeSpeaker(None), audio, music=False, oww=0.713)
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith("wake candidate:")]
+    assert len(lines) == 3
+    assert ("speaker=0.135 oww=0.713 music=True rms=-30." in lines[0]
+            and "gate=0.10 -> accept" in lines[0])
+    assert "music=False" in lines[1] and "gate=0.25 -> suppress" in lines[1]
+    assert "speaker=none" in lines[2] and "-> abstain" in lines[2]
+
+
+def test_ambient_dbfs_reads_the_bed_under_the_voice():
+    """Whole-buffer RMS vs the 20th-percentile frame: a word over silence has
+    a floor near digital zero, a word over music has a floor near the music."""
+    rng = np.random.default_rng(1)
+    word = np.zeros(32000, np.float32)
+    word[12000:20000] = (rng.standard_normal(8000) * 0.1).astype(np.float32)
+    rms, floor = hw.ambient_dbfs(word, 16000)
+    assert -30.0 < rms < -20.0
+    assert floor == -120.0                       # silence between the words
+    bed = (rng.standard_normal(32000) * 0.01).astype(np.float32)
+    rms, floor = hw.ambient_dbfs(word + bed, 16000)
+    assert -42.0 < floor < -38.0                 # the music, not the word
+    assert hw.ambient_dbfs(np.zeros(0, np.float32), 16000) == (-120.0, -120.0)
+
+
+def test_his_voice_over_music_wakes_him_through_the_real_loop(monkeypatch):
+    """End to end through _listen_loop: the 0.135 that was refused on
+    2026-09-01, with music known playing, reaches on_detect and never
+    on_guest; the same run with the music flag off is the old refusal."""
+    from tests.test_wake_after_resume import Harness, _Speaker
+
+    h = Harness(monkeypatch, hit_after=25, speaker=_Speaker(0.135), budget=6.0)
+    h.hw._music_playing = lambda: True
+    h.run()
+    assert h.detected == [pytest.approx(0.95)]
+    assert not h.guests
+
+    quiet = Harness(monkeypatch, hit_after=25, speaker=_Speaker(0.135), budget=6.0)
+    quiet.hw._music_playing = lambda: False
+    quiet.run()
+    assert not quiet.detected
+    assert quiet.guests

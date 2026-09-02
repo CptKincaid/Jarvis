@@ -20,7 +20,10 @@ Two rules make this safe on THIS box, and both are load-bearing:
   ``tests/fixtures/pactl_sink_inputs.txt`` has BOTH, each with
   ``application.process.binary = "pacat"``.  Only the PID tells them
   apart, so tts.py and tools/timekeeper.py register the players they spawn
-  (``register_own_pid``), and their descendants are exempt too.
+  (``register_own_pid``), and their descendants are exempt too.  The one
+  exception is ``AEC_PLAYBACK_NAME``: the echo canceller's playback leg is
+  his voice too, but it belongs to the pipewire process, so it can only be
+  known by name.
 
 The stream-restore hazard is why this module writes a state file.  A ducked
 stream carries ``module-stream-restore.id =
@@ -30,17 +33,27 @@ every FUTURE pacat stream at 30 % -- a librespot restarted tomorrow
 included.  ``heal()`` therefore keeps unmatched entries in the file until
 the stream they belong to reappears, instead of clearing them at boot.
 
-When nothing local is playing (Spotify on his phone or the HPCOMPUTER
-Connect target) there are no non-Jarvis sink-inputs at all.  That case is
-not rare -- it is his NORMAL one, and it is why "he cant discern my voice
-from the vocalists in the music" (#72) sits in the log right beside
-``mixer: ducked 1 stream(s) to 30%``: the one stream pactl could see was
-the idle librespot pipe, and the music he could actually hear was coming
-out of HPCOMPUTER's own speakers, where pactl has no reach.  So when there
-is nothing local to duck the Mixer now asks the ``remote`` ducker (the
-Spotify tool -- ``duck()`` / ``unduck()`` over the Connect volume endpoint)
-instead of standing down.  ``remote`` is None until something wires it, and
-a remote that fails is ignored.
+When the music is on his phone or the HPCOMPUTER Connect target, pactl
+cannot reach it.  That case is not rare -- it is his NORMAL one, and it is
+why "he cant discern my voice from the vocalists in the music" (#72) sits
+in the log right beside ``mixer: ducked 1 stream(s) to 30%``: the one
+stream pactl could see was the idle librespot pipe, and the music he could
+actually hear was coming out of HPCOMPUTER's own speakers.  So the Mixer
+also asks the ``remote`` ducker (the Spotify tool -- ``duck()`` /
+``unduck()`` over the Connect volume endpoint) on every hold, WHETHER OR
+NOT a local stream was found.  It used to ask only when pactl found
+nothing, and on 2026-09-01 that decided the whole incident: the librespot
+pipe is an always-open, uncorked, SILENT sink-input (the Spark has never
+been picked as a device), so pactl always found exactly one stream, ducked
+it -- theatre -- and the remote duck never fired once.  The remote side
+skips the case where the active device IS this box's librespot, so local
+music is never ducked twice.  ``remote`` is None until something wires it,
+and a remote that fails is ignored.
+
+The remote duck also feeds ``music_playing()``: the wake gate in hotword.py
+relaxes its speaker threshold while music is known to be playing, because a
+"Jarvis" said over a vocalist scores like a stranger (0.135 and 0.158
+against a 0.25 bar in that same log) and the guest line answered him.
 
 Seams for tests: ``run`` (the one subprocess call), ``sleep``, ``ppid_of``
 and ``state_path``.  The parsing and planning halves are pure functions.
@@ -72,6 +85,16 @@ MIN_TOUCH_PCT = 5
 # the volume he is looking at is one he set himself.
 STALE_MAX_S = 7 * 24 * 3600.0
 PACTL_TIMEOUT_S = 5.0
+# The ONE exemption by name.  With echo cancellation on, Jarvis's own speech
+# no longer reaches the sink from a paplay he spawned: it goes into the
+# filter-chain's capture side and comes back out as a sink-input owned by the
+# pipewire process, named as the chain declares it.  That PID is not his and
+# never descends from him, so the registry cannot see it, and a PID-only
+# rule would duck his own voice to 30 % under his own voice -- the failure
+# this whole module exists to prevent.  Matched exactly against node.name,
+# media.name and application.name, because which of the three carries the
+# name depends on how the chain was declared.
+AEC_PLAYBACK_NAME = "jarvis_aec_playback"
 
 _INDEX_RX = re.compile(r"^Sink Input #(\d+)")
 _PROP_RX = re.compile(r'^\s+([\w.-]+) = "(.*)"\s*$')
@@ -92,7 +115,8 @@ def parse_sink_inputs(text: str) -> list[dict]:
         if m:
             cur = {"index": int(m.group(1)), "sink": "", "corked": False,
                    "mute": False, "volume_pct": None, "app_name": "",
-                   "media_name": "", "pid": None, "restore_key": ""}
+                   "media_name": "", "node_name": "", "pid": None,
+                   "restore_key": ""}
             out.append(cur)
             continue
         if cur is None:
@@ -119,6 +143,8 @@ def parse_sink_inputs(text: str) -> list[dict]:
                 cur["app_name"] = value
             elif key == "media.name":
                 cur["media_name"] = value
+            elif key == "node.name":
+                cur["node_name"] = value
             elif key == "module-stream-restore.id":
                 cur["restore_key"] = value
             elif key == "application.process.id":
@@ -158,10 +184,18 @@ def descends_from(pid, root: int, ppid_of: Callable, max_depth: int = 8) -> bool
     return False
 
 
+def is_aec_playback(inp: dict) -> bool:
+    """Is this sink-input the echo canceller's playback leg (Jarvis's own
+    voice, see AEC_PLAYBACK_NAME)?  Name match only, exact, any of the three
+    name properties."""
+    return any(inp.get(k) == AEC_PLAYBACK_NAME
+               for k in ("node_name", "media_name", "app_name"))
+
+
 def duck_targets(inputs: Iterable[dict], exempt_pids: Iterable,
                  floor_pct: int = DEFAULT_FLOOR_PCT) -> list[dict]:
-    """The streams worth moving: not Jarvis's, not corked, not already at
-    or below the floor."""
+    """The streams worth moving: not Jarvis's (by PID, or the AEC leg by
+    name), not corked, not already at or below the floor."""
     pids = set()
     for p in exempt_pids or ():
         try:
@@ -174,6 +208,8 @@ def duck_targets(inputs: Iterable[dict], exempt_pids: Iterable,
         if not isinstance(inp, dict):
             continue
         if inp.get("pid") in pids:
+            continue
+        if is_aec_playback(inp):
             continue
         if inp.get("corked"):
             continue
@@ -330,6 +366,10 @@ class RoomMixer:
         # the one that exists.  See the module docstring (#72).
         self._remote = remote
         self._remote_ducked = False
+        # The hold generation the remote was last asked on.  Without it a
+        # hold with no active Connect device would re-ask every second (the
+        # worker wakes on a 1 s timeout), two Web API calls a time.
+        self._remote_tried = -1
         self._lock = threading.RLock()
         self._holds: set[str] = set()          # "speaking" | "recording"
         self._ducked: list[dict] = []          # what we moved, with originals
@@ -508,53 +548,91 @@ class RoomMixer:
         after ``_register_tools()``."""
         self._remote = remote
 
-    def _remote_duck(self, floor: int) -> None:
-        """Duck the Spotify Connect device when there is no local stream.
+    def _remote_duck(self, floor: int, generation: int) -> None:
+        """Duck the Spotify Connect device, once per hold.
 
         Guarded by blocked() as well as by ``remote`` being None: a test that
         wired a real SpotifyTool must not reach across the network and turn
-        down music he is actually listening to."""
+        down music he is actually listening to.  Runs on the mixer thread --
+        the two Web API calls take 0.3-0.6 s, which is why the local ramp
+        goes first and why the hold is re-checked afterwards: a duck that
+        lands after he has stopped talking is put straight back.  The cost
+        of sharing the worker is that a hung call delays the LOCAL restore
+        too, bounded by spotify.API_TIMEOUT_S per call; on this box the local
+        stream is the silent librespot pipe, so that delay is inaudible."""
         if self._remote is None or self._remote_ducked or blocked():
             return
+        if self._remote_tried == generation:
+            return
+        self._remote_tried = generation
         try:
-            self._remote_ducked = bool(self._remote.duck(floor))
+            ok = bool(self._remote.duck(floor))
         except Exception:  # noqa: BLE001 - a remote hiccup must not break the duck
             log.debug("mixer: remote duck failed", exc_info=True)
             return
-        if self._remote_ducked:
-            log.info("mixer: ducked the Spotify Connect device to %d%% of its volume",
-                     floor)
+        if not ok:
+            return
+        self._remote_ducked = True
+        name = getattr(self._remote, "ducked_device", None) or "(unnamed)"
+        log.info("mixer: ducked the Spotify Connect device %s to %d%% of its volume",
+                 name, floor)
+        if self._stop.is_set():
+            # stop() restored while this call was in flight and the worker
+            # is about to exit: nobody else will lift it.  A hold that merely
+            # ended is handled by the next pump, which the edge already woke.
+            self._remote_restore()
 
     def _remote_restore(self) -> None:
         if self._remote is None or not self._remote_ducked:
             return
         self._remote_ducked = False
+        name = getattr(self._remote, "ducked_device", None) or "(unnamed)"
         try:
             self._remote.unduck()
         except Exception:  # noqa: BLE001 - see _remote_duck
             log.debug("mixer: remote unduck failed", exc_info=True)
+            return
+        log.info("mixer: restored the Spotify Connect device %s", name)
+
+    def music_playing(self) -> bool:
+        """Is music known to be playing?  For the wake gate (hotword.py):
+        a cache read on the remote, never a request, and False without one.
+        A remote duck in force is the one thing this object knows itself."""
+        if self._remote_ducked:
+            return True
+        fn = getattr(self._remote, "music_playing", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:  # noqa: BLE001 - a broken remote is not music
+            log.debug("mixer: remote music_playing failed", exc_info=True)
+            return False
 
     def _duck(self, generation: int) -> None:
         floor = self.floor_pct
         inputs = self.sink_inputs()
         targets = duck_targets(inputs, self.exempt_pids(inputs), floor)
-        if not targets:
-            # Spotify on his phone or the Connect target: nothing local to
-            # duck, which on this box is the usual case (#72).
+        if targets:
+            saved = [{"index": t["index"], "volume_pct": t["volume_pct"],
+                      "restore_key": t.get("restore_key", ""),
+                      "app_name": t.get("app_name", ""), "t": self._now()}
+                     for t in targets]
+            with self._lock:
+                self._ducked = saved
+            # Written BEFORE the first pactl call: a crash between the write
+            # and the restore is exactly what heal() exists for.
+            self._save(self._merge_stale(saved))
+            self._ramp_to(saved, floor, generation)
+            log.info("mixer: ducked %d stream(s) to %d%%", len(saved), floor)
+        else:
             log.debug("mixer: nothing local to duck")
-            self._remote_duck(floor)
-            return
-        saved = [{"index": t["index"], "volume_pct": t["volume_pct"],
-                  "restore_key": t.get("restore_key", ""),
-                  "app_name": t.get("app_name", ""), "t": self._now()}
-                 for t in targets]
-        with self._lock:
-            self._ducked = saved
-        # Written BEFORE the first pactl call: a crash between the write and
-        # the restore is exactly what heal() exists for.
-        self._save(self._merge_stale(saved))
-        self._ramp_to(saved, floor, generation)
-        log.info("mixer: ducked %d stream(s) to %d%%", len(saved), floor)
+        # The Connect device as well, not instead: pactl cannot tell the idle
+        # librespot pipe (uncorked, silent) from music, so "found a local
+        # stream" says nothing about where the music he hears is coming from
+        # (#72, 2026-09-01).  Local first because it is 200 ms and never
+        # waits on the network.
+        self._remote_duck(floor, generation)
 
     def _restore(self, generation: int) -> None:
         self._remote_restore()
@@ -678,3 +756,11 @@ class RoomMixer:
         t = self._thread
         if t is not None and t is not threading.current_thread():
             t.join(timeout=2.0)
+        # A remote duck that was in flight on the worker during the restore
+        # above landed after it; _remote_duck lifts it itself when it sees the
+        # stop flag, but the flag can be set between its check and ours, so
+        # the worker having exited is the one moment both sides agree.
+        try:
+            self._remote_restore()
+        except Exception:
+            log.exception("mixer remote restore on stop failed")

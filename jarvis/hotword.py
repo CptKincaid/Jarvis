@@ -120,7 +120,11 @@ def wake_hit(predictions, threshold, unverified_threshold):
 # returns None, score() returns None, and _speaker_ok fails OPEN. 1.5 s, not
 # the verifier's 1.0: the wake buffer is scored on whatever speech it holds,
 # and the 2026-08-31 simulation put false rejects at 19.6% with a 1.0 s floor
-# against 6.2% at 1.5 s (+0.6pp false accepts).
+# against 6.2% at 1.5 s (+0.6pp false accepts).  1.5 s of BUFFER is not 1.5 s
+# of SPEECH: the verifier trims the silence around the word first, and a lone
+# "Jarvis" in a quiet room is ~0.6 s of it, so the first wake of a session
+# usually logs "wake speaker check unavailable -- waking anyway" (score None)
+# and passes on the fail-open.  Expected, checked 2026-09-01, not a fault.
 #
 # This is a preference, NOT a veto. It was written as one on 2026-08-28 after
 # a wake fired on 0.349 s of audio at 16:41:32.959 -- but that wake was not a
@@ -246,6 +250,30 @@ def frames_agree(history, window, required):
     return sum(1 for h in recent if h) >= required
 
 
+def ambient_dbfs(audio, rate: int, frame_s: float = 0.02) -> tuple[float, float]:
+    """(whole-buffer RMS, 20th-percentile 20 ms frame RMS) in dBFS.
+
+    Calibration data for the music gate, nothing decides on it.  The whole
+    buffer says how loud the room was while he said the word; the low
+    percentile of short frames is the bed under his voice -- with music on it
+    sits far above a quiet room's -60 dBFS, and it is that number the
+    SPEAKER_WAKE_MIN_MUSIC evidence needs next to each score.  -120 dBFS
+    stands for digital silence so the line stays parseable.
+    """
+    a = np.asarray(audio, dtype=np.float32).ravel()
+    if a.size == 0:
+        return -120.0, -120.0
+
+    def db(x: float) -> float:
+        return float(20.0 * np.log10(x)) if x > 1e-6 else -120.0
+
+    whole = db(float(np.sqrt(np.mean(a * a))))
+    n = max(1, int(rate * frame_s))
+    frames = a[: (a.size // n) * n].reshape(-1, n) if a.size >= n else a[None, :]
+    floor = db(float(np.percentile(np.sqrt(np.mean(frames * frames, axis=1)), 20)))
+    return whole, floor
+
+
 class Hotword:
     """Always-on wake word listener using OpenWakeWord (CPU, ~1.5ms/prediction).
 
@@ -261,14 +289,32 @@ class Hotword:
                                  # wake audio is short and partial, so it scores
                                  # lower than a full utterance. Background voices
                                  # measured near 0.0, leaving ample room.
+    # The bar while music is known to be playing.  Over a vocalist the
+    # verifier cannot trim the bed away (speaker.trim_silence finds no
+    # threshold in a flat clip), so the whole 2 s buffer is embedded and HIS
+    # OWN voice scores like a stranger's.  Evidence is n=3 from the
+    # 2026-09-01 log, all over Spotify on HPCOMPUTER: his "Jarvis" scored
+    # 0.135 (oww 0.713) and 0.158 (oww 0.864) and was refused, then answered
+    # with the guest line; pure music that tripped oww scored -0.084 and
+    # -0.098.  0.10 sits between those clusters with more room below his
+    # scores than above the music's, and it only applies when oww itself is
+    # at the unverified bar (0.6) -- a confident wake word AND a plausible
+    # speaker, not either alone.  To recalibrate: grep "wake candidate" in
+    # jarvis.log, keep the music=True lines, and place the bar between the
+    # highest score music alone produced and the lowest he did.
+    SPEAKER_WAKE_MIN_MUSIC = 0.10
 
     def __init__(self, arbiter, get_mic_index: Callable, on_detect: Callable,
-                 speaker=None, on_guest: Callable = None):
+                 speaker=None, on_guest: Callable = None,
+                 music_playing: Callable = None):
         """arbiter: jarvis.recorder.MicArbiter (or None for standalone use).
         get_mic_index: () -> int | None (sounddevice input device index).
         on_detect: (score: float) -> None, called from the listener thread.
+        music_playing: () -> bool, a CACHE READ (the mixer's), consulted on
+        every wake candidate from the listener thread; None = never playing.
         """
         self._on_guest = on_guest
+        self._music_playing = music_playing
         self._arbiter = arbiter
         self._get_mic_index = get_mic_index
         self._on_detect = on_detect
@@ -289,7 +335,27 @@ class Hotword:
                 log.exception("could not register with MicArbiter")
 
     # -- speaker gate --------------------------------------------------
-    def _speaker_ok(self, audio, native_rate) -> bool:
+    def music_playing(self) -> bool:
+        """Is music known to be playing?  False without a source or when the
+        source breaks: the relaxed bar must never be the default."""
+        fn = getattr(self, "_music_playing", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            log.debug("music_playing callback failed", exc_info=True)
+            return False
+
+    def _wake_min(self, music: bool, oww_score: float) -> float:
+        """The speaker bar for this candidate.  Relaxed only when music is
+        known playing AND oww is at the unverified bar; a marginal wake word
+        over music is exactly what a vocalist produces."""
+        if music and oww_score >= self.UNVERIFIED_THRESHOLD:
+            return self.SPEAKER_WAKE_MIN_MUSIC
+        return self.SPEAKER_WAKE_MIN
+
+    def _speaker_ok(self, audio, native_rate, oww_score: float = 0.0) -> bool:
         """Is the buffered utterance the enrolled speaker?
 
         Fails OPEN, which is the OPPOSITE of the transcript gate in
@@ -297,12 +363,22 @@ class Hotword:
         triggered is worse than one that triggers too often, and the
         transcript gate still fails shut behind this. Each layer fails the
         safe way for its own position.
+
+        Every candidate that reaches the verifier is logged on ONE line with
+        its speaker score, oww score, music state and the buffer's ambient
+        level: that line is the only calibration data the music bar has.
         """
         speaker = getattr(self, "_speaker", None)
         if speaker is None or not getattr(speaker, "is_enrolled", False):
             return True
         if not CONFIG.speaker_verify:
             return True          # one switch governs all speaker gating
+        music = self.music_playing()
+        wake_min = self._wake_min(music, float(oww_score))
+        try:
+            rms, floor = ambient_dbfs(audio, native_rate)
+        except Exception:  # noqa: BLE001 - calibration must never block a wake
+            rms, floor = float("nan"), float("nan")
         try:
             if native_rate != 16000:
                 from scipy.signal import resample
@@ -312,12 +388,18 @@ class Hotword:
         except Exception:
             log.exception("wake speaker check failed -- waking anyway")
             return True
+        ok = score is None or score >= wake_min
+        log.info("wake candidate: speaker=%s oww=%.3f music=%s rms=%.1f dBFS "
+                 "floor=%.1f dBFS gate=%.2f -> %s",
+                 "none" if score is None else "%.3f" % score, float(oww_score),
+                 music, rms, floor, wake_min,
+                 "abstain" if score is None else ("accept" if ok else "suppress"))
         if score is None:
             log.warning("wake speaker check unavailable -- waking anyway")
             return True
-        if score < self.SPEAKER_WAKE_MIN:
+        if not ok:
             log.info("wake suppressed: speaker score %.3f < %.2f",
-                     score, self.SPEAKER_WAKE_MIN)
+                     score, wake_min)
             return False
         return True
 
@@ -464,7 +546,7 @@ class Hotword:
             makes oww's window stale (see reset_oww_stream)."""
             buf.clear()
             recent.clear()
-            if not self._speaker_ok(utterance, native_rate):
+            if not self._speaker_ok(utterance, native_rate, oww_score=score):
                 log.info("Hotword suppressed (score=%.3f): not the enrolled "
                          "speaker", score)
                 if self._on_guest is not None:
