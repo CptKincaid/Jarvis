@@ -345,6 +345,16 @@ class JarvisApp:
             log.exception("persona.register could not be applied")
         self.agent = JarvisAgent()          # retained V1 tools (see spec note)
 
+        # ---- offline mode: the ONE sensing authority (jarvis/sensing.py) --
+        # BEFORE presence, because the room sensor is built inside the
+        # sentinel and has to be handed this policy at construction: the
+        # enforcement point is the sensor's own read(), not a check in a
+        # consumer. On a state file that cannot be read this comes up
+        # OFFLINE by design -- his ruling, and the reason the switch does
+        # not live in assistant.json, whose loader recreates a corrupt file
+        # from DEFAULTS and would therefore fail ONLINE.
+        self.sensing = self._construct("sensing", self._make_sensing)
+
         # ---- ambient: quiet hours / DND and presence ----------------------
         # Both read services lazily (calendar, presence) because services is
         # built further down; both are started in start_assistant.
@@ -585,9 +595,17 @@ class JarvisApp:
         return mod.WindDown(self.services,
                             state_path=PATHS.MEMORY_DIR / "winddown.json")
 
+    def _make_sensing(self):
+        mod = _import_optional("jarvis.sensing")
+        if mod is None:
+            return None
+        return mod.SensingPolicy(cfg=self.assistant,
+                                 path=PATHS.MEMORY_DIR / "sensing.json")
+
     def _make_presence(self):
         mod = _import_optional("jarvis.presence")
-        return None if mod is None else mod.PresenceSentinel(self.assistant)
+        return None if mod is None else mod.PresenceSentinel(
+            self.assistant, policy=getattr(self, "sensing", None))
 
     def _make_room_light(self):
         mod = _import_optional("jarvis.room")
@@ -1114,6 +1132,10 @@ class JarvisApp:
             docs=None,
             # quiet hours / DND and the presence sentinel (commander, tools)
             quiet=self.quiet, presence=self.presence, desk=self.desk,
+            # offline mode: the object the spoken switch and the settings
+            # drawer both act on, so there is exactly one path that can
+            # take a sensor down (jarvis/sensing.py)
+            sensing=self.sensing,
             # "what's wrong": the live fault, else the log triage below
             faults=self.faults,
             # Seconds since the last keyboard / mouse event, or None when
@@ -4640,6 +4662,11 @@ class JarvisApp:
             # is resolved defensively so it lands whichever way the
             # desk-presence change merges (jarvis/ui/console_mode.py).
             room_state=self.room_state,
+            # Offline mode: the POLICY, not a callable. The header badge
+            # re-reads it on the same 5 s pass as room_state (the curfew
+            # edge arrives on the clock, with nothing published), and the
+            # drawer's curfew pickers write through it.
+            sensing=self.sensing,
             # The Board's own WM close button: without this the window
             # manager's X tore down the toplevel while the app still
             # believed the Board was up, so its feed kept polling. The UI

@@ -69,7 +69,7 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from jarvis import perf
 from jarvis.config import CONFIG, MACHINE
@@ -81,7 +81,8 @@ from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            ClaudeTaskState, DeskState, FaultRaised, HotwordDetected,
                            JarvisReply,
                            MicState, ModelInfo, PartialText, RecordingStarted,
-                           RecordingStopped, ReminderFired, SpeakingState,
+                           RecordingStopped, ReminderFired, SensingChanged,
+                           SpeakingState,
                            Status, Transcribed, UserUtterance, bus)
 from jarvis.faults import FaultBoard
 from jarvis.logs import get_logger
@@ -91,10 +92,12 @@ from jarvis.ui.board import BoardWindow, board_enabled
 from jarvis.ui.console_mode import (ACTIVE, STANDBY, ConsoleModes, DeskWatch,
                                     resolve_idle_fn)
 from jarvis.ui.reactor import Reactor
+from jarvis.ui.sensing_badge import SensingBadge
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
                              TranscriptView, standby_alpha)
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, StatePill,
-                               Toast, px, set_scale, ui_display, ui_mono)
+                               Toast, Tooltip, px, set_scale, ui_display,
+                               ui_mono)
 
 log = get_logger("ui.main_window")
 
@@ -361,6 +364,11 @@ class Services:
     # last input at the desk, or None when nothing can see the keyboard.
     room_state: Optional[Callable] = None
     desk_idle_s: Optional[Callable] = None
+    # Offline mode (jarvis/sensing.py). The POLICY OBJECT, not a callable:
+    # the drawer's curfew pickers set the window through it and the header
+    # badge reads state() off the same 5 s pass room_state uses. Optional,
+    # so a stand-in Services in the tests simply has no badge to update.
+    sensing: Optional[Any] = None
     # Alt+F4 / WM close on the Board. The app owns the BoardFeed (a 5 s poll
     # that spawns nvidia-smi and walks tmux), so only the app can stop it —
     # without this seam a WM close withdrew the window and left that thread
@@ -917,6 +925,17 @@ class MainWindow:
         # left of the gear. Between the wordmark and the pill: nothing.
         self.pill = StatePill(header, bg=theme.BG)
         self.pill.pack(side="right", padx=(0, theme.PAD_S))
+
+        # ...and immediately left of it, the sensing badge. It is in the
+        # HEADER rather than the status strip because "am I being watched"
+        # is not telemetry: it belongs beside the app state, at the one
+        # place his eye already goes, and it is never hidden by the strip's
+        # elision plan. Present in every state -- an absent badge and a
+        # badge reading SENSING must not look the same from across the room.
+        self.sensing_badge = SensingBadge(header, bg=theme.BG)
+        self.sensing_badge.pack(side="right", padx=(0, theme.PAD_S))
+        self._sensing_tip = Tooltip(self.sensing_badge, "Sensing state")
+        self._refresh_sensing()
 
         # atmosphere: the header ground is a soft gradient (sheen behind
         # the wordmark, settling flat to the right) — flat-bg children are
@@ -1674,6 +1693,7 @@ class MainWindow:
         bus.subscribe(BoardCommand, self._ev_board)
         bus.subscribe(PowerUp, self._ev_power_up)
         bus.subscribe(DeskState, self._ev_desk)
+        bus.subscribe(SensingChanged, self._ev_sensing)
         bus.subscribe(FaultRaised, self._ev_fault)
 
     def _ev_status(self, ev: Status):
@@ -1761,6 +1781,36 @@ class MainWindow:
         self._wake_board()
         self.set_status(f"Wake word ({ev.score:.2f})", "ok")
         self._note_activity()
+
+    def _ev_sensing(self, ev: SensingChanged):
+        """A spoken switch, echoed on the console in the same breath. The
+        5 s pass ALSO refreshes the badge, because the 21:00 curfew edge
+        arrives with nobody having said anything."""
+        try:
+            self.sensing_badge.set_state(ev)
+            self._sensing_tip.set_text(self.sensing_badge.caption)
+        except tk.TclError:
+            pass                       # the window is going away
+
+    def _refresh_sensing(self, state=None):
+        """Paint the badge from `state`, or from the policy when it is
+        wired. Tk thread only."""
+        if state is None:
+            policy = getattr(self.services, "sensing", None)
+            if policy is None:
+                return
+            try:
+                state = policy.state()
+            except Exception:          # noqa: BLE001 - provider boundary
+                log.debug("sensing state read failed", exc_info=True)
+                return
+        try:
+            self.sensing_badge.set_state(state)
+            tip = getattr(self, "_sensing_tip", None)
+            if tip is not None:
+                tip.set_text(self.sensing_badge.caption)
+        except tk.TclError:
+            pass
 
     def _ev_desk(self, ev: DeskState):
         """He walked away from (or back to) the keyboard: the board goes
@@ -2005,6 +2055,7 @@ class MainWindow:
             if beat % 6 == 0:
                 self._probe_llm()
             self._probe_room()
+            self._probe_sensing()
             beat += 1
             time.sleep(5)
 
@@ -2022,6 +2073,26 @@ class MainWindow:
             self._room_data = dict(fn(**self._room_state_kwargs(fn)) or {})
         except Exception:                     # noqa: BLE001 - provider boundary
             log.debug("room state probe failed", exc_info=True)
+
+    def _probe_sensing(self):
+        """Re-read the sensing policy on the SAME 5 s pass as the room.
+
+        The badge cannot live on bus events alone: the curfew opens and
+        closes on the clock, with nothing published and nobody speaking, and
+        a badge that still read SENSING at 21:01 would be the exact lie this
+        feature exists to prevent. state() is a dict read plus a clock
+        comparison, but it is behind a lock, so it stays off the Tk thread
+        like every other probe here.
+        """
+        policy = getattr(self.services, "sensing", None)
+        if policy is None:
+            return
+        try:
+            state = policy.state()
+        except Exception:                     # noqa: BLE001 - provider boundary
+            log.debug("sensing probe failed", exc_info=True)
+            return
+        self._after(0, lambda: self._refresh_sensing(state))
 
     def _room_state_kwargs(self, fn) -> dict:
         """`{"gpu_pct": ...}` when the provider takes it, else `{}`.

@@ -22,6 +22,16 @@ verdict on the same grace, and the sensor can only ever make him home
 sooner. With no URL configured the sentinel polls the same ``probe``
 function object it always did.
 
+OFFLINE MODE (jarvis/sensing.py) takes the radar leg away and NOTHING
+else: ``RoomSensor.read`` returns None while sensing is denied, which is
+the module's existing "no opinion" path, so the composition degrades to
+exactly what it was before the sensor was bought -- the phone's verdict on
+the same grace. It does NOT start reporting an empty room, and on a
+sensor-only box the tick returns None and the sentinel HOLDS its state
+rather than drifting into "away" and muting him for the evening. The
+phone probe itself is not governed: it reads the kernel's ARP table for an
+address he configured, and is not a sensor pointed at the room.
+
 ``PresenceSentinel`` polls the probe on a daemon thread (health.Watchdog's
 start / stop-with-join form so a ping in flight cannot outlive quit) and
 publishes ``Presence`` on the bus at each transition. Away has hysteresis:
@@ -113,12 +123,17 @@ def _cfg_get(cfg, key, default=None):
     return default
 
 
-def _make_sensor(cfg):
+def _make_sensor(cfg, policy=None):
     """The room-sensor leg from config, or None. Never raises, never polls.
 
     Built ONCE, at construction: ``AssistantConfig.reload_if_changed`` has
     no callers, so a config edit needs a restart -- and a sensor that
     appeared mid-run would want a state re-evaluation nobody asked for.
+
+    ``policy`` is the sensing owner (jarvis/sensing.py). It is handed to
+    the SENSOR, not consulted here: offline mode has to stop the poll at
+    the wire, and a check in this function would only decide whether the
+    leg exists at start-up.
     """
     raw = str(_cfg_get(cfg, "presence.room_sensor_url", "") or "").strip()
     if not bool(_cfg_get(cfg, "presence.room_sensor_enabled", False)):
@@ -132,7 +147,10 @@ def _make_sensor(cfg):
         from jarvis import roomsensor
         sensor = roomsensor.RoomSensor(
             raw, timeout_s=_cfg_get(cfg, "presence.room_sensor_timeout_s",
-                                    roomsensor.DEFAULT_TIMEOUT_S))
+                                    roomsensor.DEFAULT_TIMEOUT_S),
+            policy=policy,
+            power_url=str(_cfg_get(cfg, "presence.room_sensor_power_url",
+                                   "") or "").strip())
     except Exception:  # noqa: BLE001 - a missing module must not cost the phone leg
         log.exception("presence: room sensor could not be built")
         return None
@@ -196,13 +214,14 @@ class PresenceSentinel:
 
     def __init__(self, cfg, publish: Callable = bus.publish,
                  probe_fn: Optional[Callable] = None,
-                 now: Callable[[], float] = time.time, poll_s: Optional[float] = None):
+                 now: Callable[[], float] = time.time, poll_s: Optional[float] = None,
+                 policy=None):
         self._cfg = cfg
         self._publish = publish
         # The room sensor is composed IN here rather than wired in app.py:
         # probe_fn was always the injection point, and an explicit one
         # (every test) still wins outright.
-        self.sensor = _make_sensor(cfg)
+        self.sensor = _make_sensor(cfg, policy)
         self._probe = probe_fn if probe_fn is not None else make_probe(self.sensor)
         self._now = now
         self._poll_s = poll_s

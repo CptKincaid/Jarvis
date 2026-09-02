@@ -235,6 +235,20 @@ def plan_strip(total_w: int, left_w: int, project_fixed_w: int, char_w: int,
         return 0, hidden
 
 
+def curfew_choice_values(curfew) -> tuple:
+    """The two picker values for a curfew window (pure).
+
+    ``None`` -- the curfew switched off -- still shows the SHIPPED window
+    rather than a blank: a picker with no value in it reads as "there is no
+    such setting", and the toggle beside it is what says whether it is on.
+    """
+    from jarvis.sensing import (DEFAULT_CURFEW_END, DEFAULT_CURFEW_START,
+                                fmt_hhmm)
+    if not curfew:
+        return fmt_hhmm(DEFAULT_CURFEW_START), fmt_hhmm(DEFAULT_CURFEW_END)
+    return fmt_hhmm(curfew[0]), fmt_hhmm(curfew[1])
+
+
 def fmt_temps_compact(seg: str) -> str:
     """Compact status-bar value from one temps segment: 'cpu 53° 7%' →
     '53°' (the load percentage is the first thing to go when the strip is
@@ -1997,6 +2011,19 @@ class SettingsDrawer(tk.Frame):
                          self._service("open_terminal"))
         self._option_toggle_row(box, "Start at login", "autostart.enabled")
 
+        # Privacy (jarvis/sensing.py). His ruling of 2026-09-02 was that the
+        # curfew window must be changeable "with voice command or UI
+        # settings buttons" -- this is the second half of that. The offline
+        # switch is here too because a control he can only reach by SAYING
+        # it is one bad transcript away from being unreachable.
+        box = self._section("Privacy")
+        self._sensing_toggle = self._sensing_toggle_row(
+            box, "Offline (camera + radar off)")
+        self._curfew_start = self._curfew_row(box, "Camera curfew from", 0)
+        self._curfew_end = self._curfew_row(box, "…until", 1)
+        self._info_row(box, "The microphone stays on while offline — say "
+                            "“come back online” to switch sensing back on.")
+
         # System
         box = self._section("System")
         self._toggle_row(box, "Wake word", "hotword", self._hotword_changed)
@@ -2004,6 +2031,106 @@ class SettingsDrawer(tk.Frame):
         self._toggle_row(box, "Auto-enter", "auto_enter")
         self._toggle_row(box, "Continuous listen", "continuous")
         tk.Frame(self._inner, bg=theme.RAISED, height=theme.PAD_L).pack()
+
+    # ------------------------------------------------- offline mode rows
+    def _sensing(self):
+        return getattr(self.services, "sensing", None) if self.services else None
+
+    def _sensing_toggle_row(self, box, label: str):
+        row = self._row(box, label)
+        tog = Toggle(row, bg=theme.RAISED)
+        tog.pack(side="right")
+        pol = self._sensing()
+        try:
+            tog.set(bool(pol is not None and pol.state().offline), animate=False)
+        except Exception:  # noqa: BLE001 - provider boundary
+            log.exception("sensing state read failed")
+        tog.command = self._sensing_toggled
+        return tog
+
+    def _sensing_toggled(self, offline):
+        """The switch, from the drawer. Same call the voice family makes,
+        so there is exactly one code path that can take a sensor down."""
+        pol = self._sensing()
+        if pol is None:
+            if self.toast:
+                self.toast.show("Offline mode not wired", kind="warn")
+            return
+        try:
+            out = pol.disable(source="settings") if offline \
+                else pol.enable(source="settings")
+        except Exception:  # noqa: BLE001 - provider boundary
+            log.exception("sensing switch failed")
+            if self.toast:
+                self.toast.show("Sensing switch failed", kind="error")
+            return
+        # The toast SAYS what happened, like the spoken line: a device that
+        # refused to stop is the one thing he must not have to guess at.
+        if out.failed:
+            if self.toast:
+                self.toast.show("Could not stop: %s" % ", ".join(out.failed),
+                                kind="error")
+        elif not out.persisted and self.toast:
+            self.toast.show("Saved in memory only — it won't survive a restart",
+                            kind="warn")
+        elif self.toast:
+            self.toast.show("Sensing offline" if offline else "Sensing on",
+                            kind="ok")
+
+    def _curfew_row(self, box, label: str, index: int):
+        """One end of the camera curfew, as a picker of half-hours.
+
+        A picker, not a text field: the value has to parse as HH:MM and a
+        free-text box in a slide-over is how "9pm" ends up in a privacy
+        schedule that then silently reads as no curfew at all.
+        """
+        from jarvis.sensing import CURFEW_END_CHOICES, CURFEW_START_CHOICES
+        options = CURFEW_START_CHOICES if index == 0 else CURFEW_END_CHOICES
+        row = self._row(box, label)
+        var = tk.StringVar()
+        pol = self._sensing()
+        current = None
+        if pol is not None:
+            try:
+                current = pol.curfew()
+            except Exception:  # noqa: BLE001 - provider boundary
+                log.exception("curfew read failed")
+        var.set(curfew_choice_values(current)[index])
+        menu = tk.OptionMenu(row, var, *options)
+        menu.configure(bg=theme.RAISED, fg=theme.INK,
+                       activebackground=theme.CYAN_SOFT,
+                       activeforeground=theme.CYAN, bd=0,
+                       highlightthickness=1,
+                       highlightbackground=theme.RAISED,
+                       highlightcolor=theme.CYAN_DIM, relief="flat",
+                       font=ui_font(theme.SIZE_LABEL))
+        menu["menu"].configure(bg=theme.RAISED, fg=theme.INK,
+                               activebackground=theme.CYAN_SOFT,
+                               activeforeground=theme.CYAN, bd=0,
+                               font=ui_font(theme.SIZE_LABEL))
+        menu.pack(side="right")
+        var.trace_add("write", lambda *_a: self._curfew_changed())
+        return var
+
+    def _curfew_changed(self):
+        from jarvis.sensing import parse_hhmm
+        pol = self._sensing()
+        start = parse_hhmm(getattr(self, "_curfew_start", None)
+                           and self._curfew_start.get())
+        end = parse_hhmm(getattr(self, "_curfew_end", None)
+                         and self._curfew_end.get())
+        if pol is None or start is None or end is None or start == end:
+            return
+        try:
+            ok = pol.set_curfew(start, end)
+        except Exception:  # noqa: BLE001 - provider boundary
+            log.exception("curfew save failed")
+            ok = False
+        if self.toast:
+            self.toast.show("Camera curfew %s–%s" % (self._curfew_start.get(),
+                                                     self._curfew_end.get())
+                            if ok else "Could not save the curfew",
+                            kind="ok" if ok else "error")
 
     def _hotword_changed(self, enabled):
         fn = getattr(self.services, "toggle_hotword", None) if self.services \

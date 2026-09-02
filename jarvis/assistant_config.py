@@ -409,8 +409,25 @@ DEFAULTS: dict = {
                  # seeing nobody never makes him away while the phone
                  # answers. A restart is required after editing these --
                  # reload_if_changed has no callers.
+                 # room_sensor_power_url is the OPTIONAL ESPHome switch
+                 # that holds the LD2410's supply (the commented block in
+                 # scripts/esphome/jarvis-room-sensor.yaml). With it set,
+                 # offline mode CUTS the radar
+                 # (POST <url>/turn_off) instead of merely not polling it.
                  "room_sensor_enabled": False, "room_sensor_url": "",
+                 "room_sensor_power_url": "",
                  "room_sensor_timeout_s": 1.5},
+    # Offline mode and the camera curfew (jarvis/sensing.py). ONE object
+    # answers "may this sensor run", combining the manual switch (spoken:
+    # "offline mode", "deactivate presence", "stop watching"), this daily
+    # camera window, and the fail-safe. The switch itself is NOT here --
+    # it lives in a state file under MEMORY_DIR, because a config this
+    # file's own loader recreates from DEFAULTS on a corrupt read would
+    # fail ONLINE, and the whole ruling is that it must fail OFFLINE.
+    # The curfew closes the LENS only: the radar makes no image, so
+    # switching it off at night would cost presence for no privacy.
+    # start/end are "HH:MM" 24 h and wrap midnight, like quiet.hours.
+    "sensing": {"curfew": {"enabled": True, "start": "21:00", "end": "07:00"}},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

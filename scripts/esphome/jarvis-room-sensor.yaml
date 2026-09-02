@@ -147,3 +147,36 @@ number:
 button:
   - platform: restart
     name: Restart
+
+# ---------------------------------------------------------------------------
+# OPTIONAL: A REAL POWER KILL FOR OFFLINE MODE.
+#
+# Jarvis's offline mode (jarvis/sensing.py, "offline mode" / "stop
+# watching") always stops POLLING the radar. Without the wiring below that
+# is the honest limit -- the LD2410 keeps radiating and nobody listens --
+# and Jarvis says exactly that. With it, offline mode CUTS the module's
+# supply: jarvis/roomsensor.py POSTs <power_url>/turn_off, ESPHome drops
+# the GPIO, and the radar stops.
+#
+# EXTRA WIRING (do this only if you want the physical kill):
+#   Put a LOW-SIDE N-channel MOSFET (e.g. AO3400 / 2N7002 on a breakout, or
+#   any 5 V logic-level switch module) between the LD2410's GND and the
+#   ESP32's GND, and drive its gate from GPIO25 through a 100R resistor
+#   with a 100k pull-DOWN to GND -- the pull-down is what makes the radar
+#   stay OFF while the ESP32 boots, which is the direction a privacy
+#   switch must fail in. LD2410 VCC still goes to 5V/VIN.
+#   Do NOT switch VCC from a GPIO directly: the module pulls ~80 mA.
+#
+# Then set presence.room_sensor_power_url in ~/.config/jarvis/assistant.json:
+#   "room_sensor_power_url": "http://192.168.50.60/switch/radar_power"
+#
+# switch:
+#   - platform: gpio
+#     pin: GPIO25
+#     # THE NAME MAKES THE URL: "Radar power" -> /switch/radar_power
+#     name: Radar power
+#     id: radar_power
+#     # OFF at boot, then Jarvis turns it on when it comes online. A crash
+#     # while offline therefore leaves the radar DOWN, which is the
+#     # fail-to-offline rule reaching all the way into the firmware.
+#     restore_mode: ALWAYS_OFF

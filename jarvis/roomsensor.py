@@ -40,6 +40,19 @@ THREE RULES the rest of the app depends on.
   has been unplugged for a week must not write a line a minute into the
   log the user reads first.
 
+OFFLINE MODE (2026-09-02, jarvis/sensing.py). A ``policy`` may be handed
+in, and then it is asked BEFORE the socket: while sensing is denied
+``read()`` issues no request at all, which is why ``reads`` is the
+assertion the test makes -- "the readings are ignored" is not the same
+promise as "the radar was not polled", and only the second one is worth
+anything to him. ``power_url`` goes one step further and cuts the device:
+ESPHome serves a switch at ``POST /switch/<name>/turn_off``, so with a
+GPIO holding the LD2410's supply (the optional block in
+scripts/esphome/jarvis-room-sensor.yaml) "offline" means the radar stops
+radiating, not merely that nobody is listening. Without that wire the
+honest limit is that we stop asking -- and ``stop()`` says which of the
+two actually happened, so the spoken line can too.
+
 Nothing here knows about presence, hysteresis or the bus: this module
 answers one question and holds no history, so the composition (and the
 decision about what to do when the two legs disagree) lives in
@@ -54,6 +67,7 @@ import urllib.request
 from typing import Any, Callable, Optional
 
 from jarvis.logs import get_logger
+from jarvis.sensing import RADAR
 
 log = get_logger("roomsensor")
 
@@ -158,6 +172,16 @@ def _get_default(url: str, timeout: float) -> str:
         return resp.read(MAX_BYTES).decode("utf-8", "replace")
 
 
+def _post_default(url: str, timeout: float) -> None:
+    """ESPHome switches take a POST with no body. ``RoomSensor(post=...)``
+    is the seam; a failure RAISES so the caller can say the radar may
+    still be powered."""
+    req = urllib.request.Request(url, data=b"", method="POST",
+                                 headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - LAN http
+        resp.read(MAX_BYTES)
+
+
 class RoomSensor:
     """One mmWave endpoint. ``read()`` is the whole interface."""
 
@@ -165,7 +189,9 @@ class RoomSensor:
                  get: Callable[[str, float], Any] = _get_default,
                  now: Optional[Callable[[], float]] = None,
                  fail_after: int = DEFAULT_FAIL_AFTER,
-                 cooldown_s: float = DEFAULT_COOLDOWN_S):
+                 cooldown_s: float = DEFAULT_COOLDOWN_S,
+                 policy: Any = None, power_url: str = "",
+                 post: Optional[Callable[[str, float], Any]] = None):
         self.url = normalize_url(url)
         try:
             self.timeout_s = max(0.1, float(timeout_s))
@@ -182,15 +208,72 @@ class RoomSensor:
         self.last_value: Optional[bool] = None
         self.last_ok: Optional[float] = None
         self.reads = 0                  # requests actually sent (the breaker's proof)
+        # Offline mode. The policy is the ONE authority (jarvis/sensing.py);
+        # _stopped is only the no-policy case, so a stop() on a bare sensor
+        # still means something.
+        self._policy = policy
+        self._stopped = False
+        self.power_url = str(power_url or "").strip().rstrip("/")
+        self._post = post or _post_default
+        attach = getattr(policy, "attach", None)
+        if callable(attach):
+            attach(RADAR, self.stop, present=lambda: self.configured,
+                   resume=self.resume)
 
     @property
     def configured(self) -> bool:
         return bool(self.url)
 
     @property
+    def blocked(self) -> str:
+        """Why sensing is forbidden right now ("" = it is not).
+
+        A policy that RAISES counts as forbidden. That is the fail-safe
+        reaching the wire: a decision we could not make is not permission.
+        """
+        policy = self._policy
+        if policy is not None:
+            try:
+                return "" if policy.allowed(RADAR) else "offline"
+            except Exception:  # noqa: BLE001 - a broken policy is not a yes
+                log.exception("room sensor: the sensing policy failed; "
+                              "treating the radar as offline")
+                return "policy"
+        return "stopped" if self._stopped else ""
+
+    @property
     def paused(self) -> bool:
-        """True while the breaker is open: read() will not touch the network."""
-        return self._skip_until > self._now()
+        """True while read() will not touch the network -- the breaker is
+        open, or offline mode forbids the radar entirely."""
+        return bool(self.blocked) or self._skip_until > self._now()
+
+    # ------------------------------------------------------ offline mode
+    def _power(self, on: bool) -> bool:
+        """Flip the device's own power switch, when one is wired."""
+        url = "%s/turn_%s" % (self.power_url, "on" if on else "off")
+        try:
+            self._post(url, self.timeout_s)
+        except Exception:  # noqa: BLE001 - every transport failure is a NO
+            log.exception("room sensor: %s failed", url)
+            return False
+        log.info("room sensor: radar powered %s via %s",
+                 "on" if on else "off", url)
+        return True
+
+    def stop(self) -> bool:
+        """Stop sensing. True when the radar is actually down.
+
+        With no ``power_url`` the most this process can do is never ask
+        again -- said plainly here rather than dressed up as a device stop,
+        because the difference is exactly what he would want to hear.
+        """
+        self._stopped = True
+        return self._power(False) if self.power_url else True
+
+    def resume(self) -> bool:
+        """Undo stop(). True when the radar is back."""
+        self._stopped = False
+        return self._power(True) if self.power_url else True
 
     def read(self) -> Optional[bool]:
         """True (someone is in the room) / False (nobody) / None (no opinion)."""
@@ -243,4 +326,6 @@ class RoomSensor:
         """For the console / a diagnostic script; never parsed by the app."""
         return {"url": self.url, "value": self.last_value, "fails": self._fails,
                 "paused": self.paused, "cooldown_s": self._cooldown,
-                "reads": self.reads, "last_ok": self.last_ok}
+                "reads": self.reads, "last_ok": self.last_ok,
+                "blocked": self.blocked,
+                "power_url": self.power_url}
