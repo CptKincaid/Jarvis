@@ -772,11 +772,15 @@ class MainWindow:
             off = px(4) + k * px(5)
             grip.create_line(off, g, g, off, fill=theme.FAINT,
                              width=max(1, px(1)))
-        # SE window-frame bracket lives here (the grip owns this corner)
-        lw = max(1, px(1))
+        # SE window-frame bracket lives here (the grip owns this corner);
+        # holo: a 1px BRIGHT hairline with the longer arm (the ref HUD's
+        # frame corners are thin and lit), classic: EDGE at px(1)
+        holo = theme.LOOK == "holo"
+        lw = 1 if holo else max(1, px(1))
+        arm = px(16) if holo else px(14)
         e = g - 1 - lw // 2
-        grip.create_line(e - px(14), e, e, e, e, e - px(14),
-                         fill=theme.EDGE, width=lw)
+        grip.create_line(e - arm, e, e, e, e, e - arm,
+                         fill=theme.BRIGHT if holo else theme.EDGE, width=lw)
         grip.place(relx=1.0, rely=1.0, anchor="se")
         grip.bind("<B1-Motion>", self._grip_drag)
         tk.Misc.lift(grip)   # Canvas.lift is tag_raise; use the widget form
@@ -787,8 +791,13 @@ class MainWindow:
         on the header ground, bottom-left on the status strip, bottom-
         right inside the resize grip) — with the 1px shell outline they
         make the whole app read as one projected panel."""
-        arm = px(14)
-        lw = max(1, px(1))
+        holo = theme.LOOK == "holo"
+        # holo: thinner (1px whatever the scale) and brighter, longer arms
+        # — px(16) at most: the status strip's wake-word ring starts at
+        # PAD (px(16)) and the SW bracket canvas must not sit on top of it
+        arm = px(16) if holo else px(14)
+        lw = 1 if holo else max(1, px(1))
+        color = theme.BRIGHT if holo else theme.EDGE
         o = lw // 2
         e = arm - 1 - o
         for corner, parent in (("nw", self._header), ("ne", self._header),
@@ -798,7 +807,7 @@ class MainWindow:
             pts = {"nw": (o, arm, o, o, arm, o),
                    "ne": (0, o, e, o, e, arm),
                    "sw": (o, 0, o, e, arm, e)}[corner]
-            c.create_line(*pts, fill=theme.EDGE, width=lw)
+            c.create_line(*pts, fill=color, width=lw)
             place = {"nw": dict(x=0, y=0, anchor="nw"),
                      "ne": dict(relx=1.0, y=0, anchor="ne"),
                      "sw": dict(x=0, rely=1.0, anchor="sw")}[corner]
@@ -869,12 +878,18 @@ class MainWindow:
             header, theme.BG, [(0.0, 0.022), (0.28, 0.075), (1.0, 0.015)])
 
         # Hairline rule under the header with three brighter dash segments
-        # (classic HUD detail); redrawn only on width change.
-        rule = tk.Canvas(self.shell, height=px(3), bg=theme.BG,
-                         highlightthickness=0, bd=0)
+        # (classic HUD detail); redrawn only on width change. Holo: the
+        # rule grows into the SEGMENTED status bar of the ref HUD — a
+        # chain of thin ticks across the width (drawn once per width
+        # settle, a few brighter, the leading three in the app-state
+        # colour, recoloured from _refresh_pill — no loop of its own).
+        rule = tk.Canvas(self.shell,
+                         height=px(9) if theme.LOOK == "holo" else px(3),
+                         bg=theme.BG, highlightthickness=0, bd=0)
         rule.pack(fill="x", side="top")
         self._rule = rule
         self._rule_w = None
+        self._bar_state_color = theme.CYAN_DIM
         rule.bind("<Configure>", self._draw_header_rule, add=True)
 
         # Borderless window: the ENTIRE header strip is the drag handle.
@@ -919,11 +934,46 @@ class MainWindow:
         rule.delete("all")
         y = px(1)
         rule.create_line(0, y, event.width, y, fill=theme.HOLO_DIM)
+        if theme.LOOK == "holo":
+            self._draw_holo_bar(event.width)
+            return
         x = theme.PAD
         for seg in (px(28), px(12), px(5)):
             rule.create_line(x, y, x + seg, y, fill=theme.CYAN_DIM,
                              width=px(2))
             x += seg + px(7)
+
+    # tick lengths (design px) of the holo bar, cycled across the width:
+    # a rhythm of long / long / short / long / longer, the SHORT ones lit
+    # brighter — the ref HUD's segmented top bar (ref2_hud.png)
+    HOLO_BAR_TICKS = (24, 24, 8, 24, 48)
+
+    def _draw_holo_bar(self, width: int):
+        """The segmented status bar under the header (holo). Static
+        geometry, drawn ONCE per width settle; the first three ticks carry
+        the "state" tag and take the app-state colour from _refresh_pill
+        (event-driven), everything else is FRAME with the short ticks in
+        EDGE. Nothing here runs per frame."""
+        rule = self._rule
+        y = px(5)
+        lw = max(1, px(2))
+        gap = px(5)
+        x, i = theme.PAD, 0
+        right = width - theme.PAD
+        while x < right:
+            seg = px(self.HOLO_BAR_TICKS[i % len(self.HOLO_BAR_TICKS)])
+            seg = min(seg, right - x)
+            if seg <= 0:
+                break
+            if i < 3:
+                fill, tags = self._bar_state_color, ("state",)
+            elif self.HOLO_BAR_TICKS[i % len(self.HOLO_BAR_TICKS)] == 8:
+                fill, tags = theme.EDGE, ()
+            else:
+                fill, tags = theme.FRAME, ()
+            rule.create_line(x, y, x + seg, y, fill=fill, width=lw, tags=tags)
+            x += seg + gap
+            i += 1
 
     def _build_stage(self):
         self.reactor = Reactor(self.shell, height=px(300))
@@ -1238,6 +1288,16 @@ class MainWindow:
         word_color = theme.FOCAL if state in theme.FOCAL_WORD_STATES else color
         dot = theme.WARN if time.monotonic() < self._warn_until else color
         self.pill.set_state(STATE_WORDS[state], dot, word_color)
+        if theme.LOOK == "holo" and dot != self._bar_state_color:
+            # the leading ticks of the segmented bar follow the state dot
+            # (recoloured on state events only — never a timer of its own)
+            self._bar_state_color = dot
+            rule = getattr(self, "_rule", None)
+            if rule is not None:
+                try:
+                    rule.itemconfigure("state", fill=dot)
+                except tk.TclError:
+                    pass
 
     def _refresh_terminal(self):
         """Terminal button ring from the task tracker; tooltip names the
@@ -1772,27 +1832,38 @@ class MainWindow:
         self._note_output()
         self._hide_alarm()
         title, when = alarm_modal_text(ev.label, ev.kind, ev.due_text)
-        card = Card(self.reactor, fill=theme.RAISED, pad=12, bg=theme.BG)
+        if theme.LOOK == "holo":
+            # holo: a thin bright frame on the stage ground, not a slab
+            fill = theme.BG
+            card = Card(self.reactor, fill=fill, pad=12, bg=theme.BG,
+                        style="frame", edge=theme.GLASS_EDGE,
+                        accent=theme.BRIGHT)
+        else:
+            fill = theme.RAISED
+            card = Card(self.reactor, fill=fill, pad=12, bg=theme.BG)
         body = card.body
         tk.Label(body, text=title, font=ui_display(theme.SIZE_LABEL, "semibold"),
-                 fg=theme.INK, bg=theme.RAISED, anchor="w", justify="left",
+                 fg=theme.INK, bg=fill, anchor="w", justify="left",
                  wraplength=px(300 - 2 * 12 - 4)).pack(fill="x")
         if when:
             tk.Label(body, text=when, font=ui_mono(theme.SIZE_BODY),
-                     fg=theme.FOCAL, bg=theme.RAISED,
+                     fg=theme.FOCAL, bg=fill,
                      anchor="w").pack(fill="x", pady=(px(4), 0))
-        row = tk.Frame(body, bg=theme.RAISED)
+        row = tk.Frame(body, bg=fill)
         row.pack(fill="x", pady=(px(12), 0))
         alarm_id = ev.alarm_id
         buttons = (
-            RoundButton(row, text="DISMISS", kind="accent", bg=theme.RAISED,
+            RoundButton(row, text="DISMISS", kind="accent", bg=fill,
                         command=lambda: self._alarm_action(alarm_id, "dismiss")),
             RoundButton(row, text=f"SNOOZE {SNOOZE_MIN}", kind="default",
-                        bg=theme.RAISED,
+                        bg=fill,
                         command=lambda: self._alarm_action(alarm_id, "snooze")))
         buttons[0].pack(side="left")
         buttons[1].pack(side="left", padx=(theme.PAD_S, 0))
-        card.set_edge_glow()
+        if theme.LOOK == "holo":
+            card.set_edge_glow((theme.ARC_BRIGHT,))
+        else:
+            card.set_edge_glow()
         card.place(in_=self.reactor, relx=0.5, rely=0.5, anchor="center",
                    width=px(300))
         tk.Misc.lift(card)
@@ -2124,5 +2195,13 @@ def _strip_decorations(root) -> bool:
 def create(services: Optional[Services] = None) -> MainWindow:
     """Convenience for the app: build the root + MainWindow. The caller
     still runs root.mainloop()."""
+    # The look is settled BEFORE the root exists: every widget reads its
+    # theme tokens as it is built, so a switch after this point would leave
+    # the window half in each look. JARVIS_LOOK (env) beats console.look
+    # (assistant.json, what "switch to classic visuals" writes) beats the
+    # holo default -- resolve_look owns that precedence, not this file.
+    get_option = getattr(services, "get_option", None) if services else None
+    theme.select_look(theme.resolve_look(os.environ, get_option))
+    log.info("ui look: %s", theme.LOOK)
     root = tk.Tk(className="jarvis")   # WM_CLASS for the .desktop launcher
     return MainWindow(root, services)

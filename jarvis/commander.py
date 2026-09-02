@@ -4387,6 +4387,64 @@ ROOM_TONE_OFF_LINE = "Room tone off, sir."
 ROOM_TONE_STATUS_ON = "The room tone is on, sir."
 ROOM_TONE_STATUS_OFF = "The room tone is off, sir."
 
+# The window's LOOK (jarvis/ui/theme.py, 2026-09-01): "holo" is the
+# blue-holographic overhaul, "classic" is the 08-31 console kept token for
+# token as the fallback he asked for. The switch is a config write that the
+# window reads ONCE at create(), so the line says "after a restart" out
+# loud: a look that half-applies mid-session is the only way this can look
+# broken. Either a verb ("switch to classic") or a surface noun ("classic
+# visuals") is required -- a bare "classic" or "hologram" is not an order.
+_UI_LOOK_WORD = r"(?P<look%s>classic|holo(?:graphic|gram)?)"   # one name per branch
+_UI_LOOK_NOUN = r"(?:visuals?|look|theme|ui|skin|style|console|interface|display|graphics)"
+_UI_LOOK_RX = re.compile(
+    r"^" + _JV + r"(?:"
+    # "switch to (the) classic (look)", "go back to the holographic visuals",
+    # "use the holo look", "give me the classic visuals"
+    r"(?:(?:switch|change|go|flip|set|put|take)(?:\s+(?:it|me|us))?(?:\s+back)?(?:\s+over)?"
+    r"\s+to|use|give me|show me|i want|i'd like|i would like|let's have|lets have)"
+    r"\s+(?:the\s+)?" + _UI_LOOK_WORD % 1 + r"(?:\s+mode)?(?:\s+" + _UI_LOOK_NOUN + r")?"
+    # "switch the visuals to classic", "change the look to holographic"
+    r"|(?:switch|change|set|flip|put|turn)\s+(?:the\s+|your\s+|my\s+)?" + _UI_LOOK_NOUN +
+    r"(?:\s+back)?\s+(?:to|over to|into)\s+(?:the\s+)?" + _UI_LOOK_WORD % 2 + r"(?:\s+(?:mode|one))?"
+    # "classic mode visuals", "holographic visuals", "classic look please"
+    r"|(?:the\s+)?" + _UI_LOOK_WORD % 3 + r"(?:\s+mode)?\s+" + _UI_LOOK_NOUN +
+    # Whisper writes the vocative with a comma ("..., please"), so the tail
+    # takes [,\s] not just whitespace.
+    r")(?:[,\s]+(?:please|now|sir))*[.!\s]*$", re.I)
+UI_LOOK_OPTION = "console.look"          # == jarvis.ui.theme.OPTION_KEY (tested)
+UI_LOOK_LINES = {
+    "classic": "Classic visuals, sir \u2014 it applies after a restart.",
+    "holo": "Holographic visuals, sir \u2014 after a restart.",
+}
+UI_LOOK_NO_CONFIG_LINE = ("I can't reach the settings to change the visuals, "
+                          "sir \u2014 the assistant config isn't wired.")
+UI_LOOK_SAVE_FAILED_LINE = "I couldn't save the visuals setting, sir."
+
+
+def _h_ui_look(c, t, m):
+    """"Switch to classic visuals" / "holographic visuals".
+
+    Writes console.look for the NEXT start (main_window.create reads it
+    through theme.resolve_look) and says so. Not gated by needs=: with no
+    assistant service the honest answer is spoken, not a silent fall-through
+    to the router, which would hand "switch to classic visuals" to a model
+    that cannot do it.
+    """
+    word = (m.group("look1") or m.group("look2") or m.group("look3") or "").lower()
+    name = "classic" if word.startswith("classic") else "holo"
+    cfg = c._svc("assistant")
+    if cfg is None or not hasattr(cfg, "set"):
+        return CommandResult(handled=True, speak=True, reply=UI_LOOK_NO_CONFIG_LINE,
+                             status="Visuals: no config")
+    try:
+        cfg.set(UI_LOOK_OPTION, name)
+    except Exception:
+        log.exception("%s could not be saved", UI_LOOK_OPTION)
+        return CommandResult(handled=True, speak=True, reply=UI_LOOK_SAVE_FAILED_LINE,
+                             status="Visuals: save failed")
+    return CommandResult(handled=True, speak=True, reply=UI_LOOK_LINES[name],
+                         status=f"Visuals: {name} (restart)")
+
 
 def _dnd_seconds(c, mode: str, when: str, now: datetime) -> Optional[float]:
     """'for an hour' / 'until seven' -> seconds from now; None = unparseable."""
@@ -5683,6 +5741,9 @@ REGISTRY: list[Command] = [
     # "room tone" comes first of all: "stop the room tone" must not be read
     # by the media handlers as "stop", and it needs only the config.
     Command("room tone", _ROOM_TONE_RX.match, _h_room_tone, needs=("assistant",)),
+    # the window look (jarvis/ui/theme.py): a config write, spoken with its
+    # "after a restart" caveat; no needs= so a missing config is SAID.
+    Command("ui look", _UI_LOOK_RX.match, _h_ui_look),
     Command("quiet status", _QUIET_STATUS_RX.match, _h_quiet_status, needs=("quiet",)),
     Command("quiet hours off", _QUIET_HOURS_OFF_RX.match, _h_quiet_hours_off,
             needs=("quiet",)),
@@ -5750,6 +5811,9 @@ ASSISTANT_TIER1: list[Command] = [
                     "person", "remember", "recall", "last seen", "who is", "recap",
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free", "room tone",
+                    # "switch to classic visuals" is said AT the window he
+                    # is looking at, wake word already eaten like the rest
+                    "ui look",
                     # "where's your voice coming out" is asked AT the dead
                     # speaker, which is exactly when the wake word is least
                     # likely to have been heard.
@@ -7312,6 +7376,11 @@ class Commander:
         desktop = self._svc("desktop")
         if desktop is None:
             return False
+        # "switch to classic visuals" is the window LOOK, not a window
+        # called "classic visuals": the desktop parser owns every "switch
+        # to X" and would target a window that does not exist (2026-09-01).
+        if _UI_LOOK_RX.match(cmd_text):
+            return False
 
         # Split on "and then", "then", "and", commas for chained commands
         parts = _CHAIN_SPLIT_RX.split(cmd_text)
@@ -8469,10 +8538,13 @@ class Commander:
             # "switch to the vss project" is a Claude project switch (router
             # action), not a window target; "focus session on the thesis"
             # is a study session (jarvis/focus.py), not "focus <window>";
-            # and "focus on the sessions" names a Board panel, which is the
-            # third thing this chain's bare "focus" would otherwise eat.
+            # "focus on the sessions" names a Board panel, which is the
+            # third thing this chain's bare "focus" would otherwise eat;
+            # and "switch to classic visuals" is the window's own look
+            # (Tier 1 "ui look", further down this same path).
             if match and not _PROJECT_SWITCH_RX.match(tl) \
-                    and not _m_focus_start(tl) and not _board_panel_name(tl):
+                    and not _m_focus_start(tl) and not _board_panel_name(tl) \
+                    and not _UI_LOOK_RX.match(tl):
                 query = match.group(1).strip().rstrip(".")
                 if desktop is not None:
                     desktop.target_window(query)

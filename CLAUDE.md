@@ -38,6 +38,17 @@ with `python -m jarvis.autostart --install`).
 the TEXT path, so it can never exercise the wake word or the Whisper
 confidence gate. Those two need a real voice at the mic.
 
+**UI look** (2026-09-01): the window has two looks, `holo` (the blue
+holographic overhaul, default) and `classic` (the 08-31 console, token for
+token). `JARVIS_LOOK=classic` in the environment beats `console.look` in
+`assistant.json`, which the voice command "switch to classic visuals" /
+"use the holographic look" writes. All of it is read ONCE in
+`main_window.create()` (`theme.select_look(theme.resolve_look(...))`, logs
+`ui look: <name>`), so a change applies after a restart, never mid-session.
+UI modules must read `theme.X` at call time — a def-time capture (a default
+argument, a class-body dict) freezes the import-time look;
+`tests/test_theme_look.py` fails on new ones.
+
 ## Architecture (V3)
 ~31k lines across 32 top-level modules plus `tools/`, `ui/`, `channels/`,
 communicating over an event bus (`jarvis/events.py`). Nothing calls the UI

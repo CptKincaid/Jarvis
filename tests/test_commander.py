@@ -1685,6 +1685,7 @@ TIER1_SAMPLES = {
     "do not disturb": "do not disturb for an hour",
     "free": "i am free",
     "room tone": "room tone on",
+    "ui look": "switch to classic visuals",
     "audio out": "where's your voice coming out",
     "standup": "standup",
     "oracle status": "how's the oracle box",
@@ -1900,3 +1901,113 @@ def test_the_courtesy_bypasses_the_gate_by_name(rich):
 def test_a_spoken_thank_you_is_still_answered_not_dropped(rich):
     res = rich.handle("thank you", source="voice")
     assert res.status == "Courtesy" and res.speak
+
+
+# --------------------------------------------- the window look (2026-09-01)
+# "Switch to classic visuals" writes console.look for the NEXT start (the
+# window reads it once in main_window.create) and says so. Two grabs already
+# own every "switch to X": the desktop chain on the prefixed path and
+# TARGET_PATTERN on the bare one -- both would have targeted a window called
+# "classic visuals", so both carve the look phrases out.
+class _LookCfg(FakeAssistantCfg):
+    def __init__(self, **over):
+        super().__init__(**over)
+        self.sets = []
+
+    def set(self, key, value):
+        self.sets.append((key, value))
+        self.data[key] = value
+        return True
+
+
+@pytest.mark.parametrize("text, name, line", [
+    ("switch to classic visuals", "classic", commander.UI_LOOK_LINES["classic"]),
+    ("switch to the classic look", "classic", commander.UI_LOOK_LINES["classic"]),
+    ("classic mode visuals", "classic", commander.UI_LOOK_LINES["classic"]),
+    ("go back to the classic look, please", "classic", commander.UI_LOOK_LINES["classic"]),
+    ("switch the visuals to classic", "classic", commander.UI_LOOK_LINES["classic"]),
+    ("use the holo visuals", "holo", commander.UI_LOOK_LINES["holo"]),
+    ("use the holographic look", "holo", commander.UI_LOOK_LINES["holo"]),
+    ("holographic visuals", "holo", commander.UI_LOOK_LINES["holo"]),
+    ("change the look to holographic", "holo", commander.UI_LOOK_LINES["holo"]),
+    ("Switch to holo mode.", "holo", commander.UI_LOOK_LINES["holo"]),
+])
+def test_look_phrases_write_the_option_and_speak_the_restart_line(rich, text, name, line):
+    rich.services.assistant = _LookCfg()
+    for source in ("typed", "voice"):
+        rich.services.assistant.sets.clear()
+        res = rich.handle(text, source=source)
+        assert res.handled and res.speak and res.reply == line, (text, source)
+        assert rich.services.assistant.sets == [("console.look", name)], (text, source)
+        assert "restart" in res.reply
+        assert res.status == f"Visuals: {name} (restart)"
+    rich.services.desktop.target_window.assert_not_called()
+    rich.services.brain.chat.assert_not_called()
+    rich.services.claude.submit.assert_not_called()
+
+
+def test_a_prefixed_look_switch_is_not_a_window_target(rich):
+    """The registry pass runs AFTER the desktop chain, whose parser owns
+    "switch to X". With the real parser this became target_window("classic
+    visuals"); the chain now steps aside for the look phrases."""
+    from jarvis.desktop import parse_desktop_action
+    rich.services.desktop.parse_action = parse_desktop_action
+    rich.services.assistant = _LookCfg()
+    res = rich.handle("jarvis, switch to classic visuals", source="voice")
+    assert res.reply == commander.UI_LOOK_LINES["classic"]
+    assert rich.services.assistant.sets == [("console.look", "classic")]
+    rich.services.desktop.execute_actions.assert_not_called()
+    rich.services.desktop.target_window.assert_not_called()
+    # ...while an actual window switch still is one
+    rich.handle("jarvis, switch to firefox", source="voice")
+    assert rich.services.desktop.execute_actions.called
+
+
+def test_a_bare_look_switch_is_not_a_window_target_either(rich):
+    """TARGET_PATTERN in _route_text grabs every bare "switch to X" before
+    Tier 1 runs; the look phrases are exempted like the project switch."""
+    rich.services.assistant = _LookCfg()
+    res = rich.handle("switch to the holographic look", source="typed")
+    assert res.reply == commander.UI_LOOK_LINES["holo"]
+    rich.services.desktop.target_window.assert_not_called()
+    res = rich.handle("switch to opera", source="typed")
+    assert res.status == "Target: opera"
+    rich.services.desktop.target_window.assert_called_once_with("opera")
+
+
+def test_look_switch_without_a_config_says_so_aloud(rich):
+    """No needs=("assistant",): a silent fall-through would hand "switch to
+    classic visuals" to the model, which cannot do it."""
+    rich.services.assistant = None
+    res = rich.handle("classic visuals", source="typed")
+    assert res.handled and res.speak
+    assert res.reply == commander.UI_LOOK_NO_CONFIG_LINE
+    assert res.status == "Visuals: no config"
+    rich.services.brain.chat.assert_not_called()
+    # a config that cannot take the write is reported, not swallowed
+    broken = _LookCfg()
+
+    def boom(key, value):
+        raise OSError("disk full")
+    broken.set = boom
+    rich.services.assistant = broken
+    res = rich.handle("holographic visuals", source="typed")
+    assert res.reply == commander.UI_LOOK_SAVE_FAILED_LINE and res.speak
+
+
+@pytest.mark.parametrize("text", [
+    "play classic rock", "switch to classic rock", "what is a hologram",
+    "classic", "holographic", "look at the screen", "switch to the other monitor",
+    "use the classic rock playlist", "look up holograms", "set the visuals",
+    "take a look", "switch to the vss project",
+])
+def test_look_regex_leaves_everything_else_alone(text):
+    assert commander._UI_LOOK_RX.match(text) is None, text
+
+
+def test_ui_look_is_a_tier_one_command_and_precedes_the_router(rich):
+    assert rich._match_assistant("switch to classic visuals") == "ui look"
+    assert rich._match_assistant("holographic visuals") == "ui look"
+    names = [c.name for c in REGISTRY]
+    assert "ui look" in names
+    assert names.index("ui look") < names.index("quiet status")
