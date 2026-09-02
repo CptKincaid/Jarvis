@@ -200,7 +200,8 @@ def test_fish_bytes_reach_the_player_before_the_stream_ends(fish, monkeypatch, t
     # a player exists while the stream is still open (the gate is shut)
     assert wait_until(lambda: bool(FakeProc.spawned))
     proc = FakeProc.spawned[0]
-    assert proc.cmd[0] == "paplay" and len(proc.cmd) == 1   # reads stdin
+    # reads stdin; the client name keeps the timer chime's saved volume off speech
+    assert proc.cmd == ["paplay", f"--client-name={tts_mod.SPEECH_CLIENT_NAME}"]
     assert wait_until(lambda: len(proc.fed) >= len(head) + len(body))
     assert not done.is_set()
     gate.set()

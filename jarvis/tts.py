@@ -86,6 +86,19 @@ _ENGINE_NEEDS_UNSHOUT = {"edge": True, "xtts": True, "f5": True,
 _ENGINE_NEEDS_SHORT_PAD = {"edge": False, "xtts": False, "f5": True,
                            "fish": False}
 
+# ------------------------------------------- the stream-restore hazard
+# PipeWire remembers a stream's volume keyed by application.name, and every
+# paplay on the box is called "paplay". The timer chime (tools/timekeeper.py)
+# and the earcons play at --volume=32768: 50 % on PulseAudio's cubic scale is
+# 0.125 linear, and WirePlumber saved exactly that under the shared key, then
+# restored 12.5 % (-18 dB) onto every speech stream that followed -- Hunter's
+# "he sounds quiet compared to Spotify" (restore-stream held
+# application.name:paplay:channelVolumes=0.125 while pacat sat at 1.0; the
+# renders themselves measured fine). Speech therefore announces itself under
+# its own name: nothing else's --volume can land on it, and a per-app slider
+# he sets for it sticks. The Mixer still knows his streams by PID (below).
+SPEECH_CLIENT_NAME = "jarvis-speech"
+
 # -------------------------------------------------- the terse-line problem
 #
 # Hunter, 2026-08-31, on four features he otherwise passed: the note ack, the
@@ -1899,7 +1912,8 @@ class TTS:
         dev = (CONFIG.playback_device or "").strip()
         # An explicit sink (the echo-cancelling one) for the two players
         # that can take one; aplay is the no-PipeWire fallback.
-        for cmd in [["paplay", *(["--device", dev] if dev else []), wav_path],
+        for cmd in [["paplay", f"--client-name={SPEECH_CLIENT_NAME}",
+                     *(["--device", dev] if dev else []), wav_path],
                     ["pw-play", *(["--target", dev] if dev else []), wav_path],
                     ["aplay", "-q", wav_path]]:
             if self._stop_flag:
@@ -1957,7 +1971,8 @@ class TTS:
             if first is None:            # closed with no audio at all
                 return
         dev = (CONFIG.playback_device or "").strip()
-        cmd = ["paplay", *(["--device", dev] if dev else [])]
+        cmd = ["paplay", f"--client-name={SPEECH_CLIENT_NAME}",
+               *(["--device", dev] if dev else [])]
         started = time.monotonic()
         self._mark_audio()
         try:
