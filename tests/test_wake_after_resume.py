@@ -252,7 +252,8 @@ class _ScriptedModel:
 
 
 class _Speaker:
-    """Mirrors SpeakerVerifier: abstains (None) below MIN_AUDIO_SECONDS."""
+    """Mirrors SpeakerVerifier: abstains (None) below the caller's floor,
+    which the wake gate drops to MIN_SPEECH_SECONDS."""
 
     MIN = 1.0
 
@@ -261,9 +262,9 @@ class _Speaker:
         self.value = value
         self.scored = []
 
-    def score(self, audio_16k):
+    def score(self, audio_16k, min_seconds=MIN):
         self.scored.append(len(audio_16k) / 16000.0)
-        if len(audio_16k) < int(16000 * self.MIN):
+        if len(audio_16k) < int(16000 * min_seconds):
             return None                    # too short to embed: abstain
         return self.value
 

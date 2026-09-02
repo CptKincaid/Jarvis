@@ -80,9 +80,11 @@ class FakeSpeaker:
         self.is_enrolled = enrolled
         self._value = value
         self.calls = 0
+        self.floors = []
 
-    def score(self, audio_16k):
+    def score(self, audio_16k, min_seconds=None):
         self.calls += 1
+        self.floors.append(min_seconds)
         if isinstance(self._value, Exception):
             raise self._value
         return self._value
@@ -152,14 +154,40 @@ def test_disabling_speaker_verify_disables_the_wake_gate(audio):
     assert spk.calls == 0
 
 
-# ------------------------------------------------- the gate while music plays
-# 2026-09-01, Spotify on HPCOMPUTER: his own "Jarvis" scored 0.135 (oww 0.713)
-# and 0.158 (oww 0.864) against the 0.25 bar, was refused, and got "I only
-# answer to Hunter, sir" -- twice.  The verifier cannot trim the bed under his
-# voice (no silence to find), so the whole buffer is embedded and he scores
-# like a stranger.  Music that tripped oww on its own scored -0.084 / -0.098.
-# The bar drops to 0.10 ONLY when music is known playing AND oww is at the
-# unverified bar; the transcript gate behind it is untouched.
+# ---------------------------------- a rejection needs evidence to reject on
+# The gate may only REFUSE him for "that is not you", never for "I could not
+# tell".  Two buffers cannot carry that evidence, both measured 2026-09-02
+# against his own voiceprint on this box:
+#
+#   too little speech -- his wake clips hold 0.40-0.88 s of trimmed speech in
+#   the 2 s buffer, and one of them (hey_jarvis_04, 0.66 s) scores -0.059,
+#   deep inside the impostor band.  Scoring those and rejecting on the result
+#   would cost him real wakes.
+#
+#   a competing bed -- over room noise his own wake word scores -0.074..0.321
+#   while the bed ALONE scores -0.114..0.156, and 6 of his 10 land inside the
+#   bed's range.  The best bar that exists anywhere is 0.090 and it still
+#   refuses 4 of his 10; best-of-windows and a per-buffer lift statistic were
+#   both measured and separate no better.
+def _speech(seconds, amp=0.2, seed=0):
+    """Syllable-like speech: broadband noise under a 4 Hz envelope, so
+    speaker.trim_silence can find its endpoints (flat noise it cannot)."""
+    rng = np.random.default_rng(seed)
+    n = int(16000 * seconds)
+    t = np.arange(n) / 16000
+    env = np.where(np.cos(2 * np.pi * 4 * t) >= 0, 1.0, 0.1)
+    return (rng.normal(0, amp, n) * env).astype(np.float32)
+
+
+def _buffer(speech_s, seed=0):
+    """A 2 s wake buffer holding `speech_s` of speech, the shape the ring
+    buffer hands the gate."""
+    pad = (2.0 - speech_s) / 2
+    quiet = (np.random.default_rng(99).normal(0, 1e-4, int(16000 * pad))
+             .astype(np.float32))
+    return np.concatenate([quiet, _speech(speech_s, seed=seed), quiet])
+
+
 def gate_with(speaker, audio, music, oww, native_rate=16000):
     hw.CONFIG.speaker_verify = True
     h = hw.Hotword.__new__(hw.Hotword)
@@ -168,28 +196,69 @@ def gate_with(speaker, audio, music, oww, native_rate=16000):
     return h._speaker_ok(audio, native_rate, oww_score=oww)
 
 
+def test_the_gate_asks_for_a_number_on_a_short_buffer(audio):
+    """It used to take the module default and get None back on 6 of his 10
+    own wake clips, so the gate was blind on most wakes and fell open."""
+    import jarvis.speaker as speaker_mod
+    spk = FakeSpeaker(0.4)
+    gate_with(spk, audio, music=False, oww=0.9)
+    assert spk.floors == [speaker_mod.MIN_SPEECH_SECONDS]
+
+
+def test_too_little_speech_abstains_instead_of_refusing_him(audio):
+    """hey_jarvis_04: 0.66 s of his own voice scoring -0.059.  Rejecting on
+    that number is rejecting on noise."""
+    short = _buffer(0.66)
+    assert gate_with(FakeSpeaker(-0.059), short, music=False, oww=0.9) is True
+
+
+def test_enough_speech_is_still_judged_on_the_score(audio):
+    """hey_jarvis_09: 2.0 s of trimmed speech at -0.134.  That much audio is
+    evidence, so the refusal stands."""
+    assert gate_with(FakeSpeaker(-0.134), audio, music=False, oww=0.9) is False
+
+
+def test_a_good_score_on_a_short_buffer_is_a_positive_recognition(audio):
+    """The point of the lower floor: the 6 buffers that used to score None
+    land at -0.059..0.273, so the gate can say "that is him" instead of only
+    ever failing open on a None."""
+    short = _buffer(0.52)
+    assert gate_with(FakeSpeaker(0.273), short, music=False, oww=0.9) is True
+
+
+# ------------------------------------------------- the gate while music plays
+# 2026-09-01, Spotify on HPCOMPUTER: his own "Jarvis" scored 0.135 (oww 0.713)
+# and 0.158 (oww 0.864) against the 0.25 bar, was refused, and got "I only
+# answer to Hunter, sir" -- twice.  The first fix for that was a second bar at
+# 0.10; it was wrong, because the bed alone reaches 0.156 and he falls to
+# -0.074 over one.  0.10 is in fact the best bar that exists -- and it still
+# refuses 4 of his 10.  There is no bar.  There is only "I cannot tell".
 def test_his_voice_over_music_is_accepted(audio):
     assert gate_with(FakeSpeaker(0.135), audio, music=True, oww=0.713) is True
     assert gate_with(FakeSpeaker(0.158), audio, music=True, oww=0.864) is True
 
 
 def test_the_same_score_without_music_is_still_a_stranger(audio):
-    """The relaxed bar is a property of the room, not the default."""
+    """The relief is a property of the room, not the default."""
     assert gate_with(FakeSpeaker(0.135), audio, music=False, oww=0.713) is False
     assert gate_with(FakeSpeaker(0.135), audio, music=None, oww=0.713) is False
 
 
-def test_music_alone_is_rejected_with_or_without_the_relaxed_bar(audio):
-    assert gate_with(FakeSpeaker(-0.084), audio, music=True, oww=0.9) is False
+def test_music_relief_does_not_wait_for_a_confident_wake_word(audio):
+    """The 0.10 bar only applied when oww also cleared 0.6, and 9 of the 30
+    suppressions on record sat below that -- hey_jarvis fires from 0.3.  A
+    marginal wake word over music is still a wake word the gate cannot judge."""
+    assert gate_with(FakeSpeaker(0.135), audio, music=True, oww=0.31) is True
+    assert gate_with(FakeSpeaker(-0.098), audio, music=True, oww=0.31) is True
+
+
+def test_the_cost_of_abstaining_over_music_is_a_false_wake_not_a_refusal(audio):
+    """Stated plainly so nobody re-derives the 0.10 bar: music that trips oww
+    on its own (-0.084, -0.098) now WAKES him instead of being suppressed.
+    That is the trade -- the transcript gate in app.py still fails shut behind
+    this one, and an untriggerable wake word is the worse failure."""
+    assert gate_with(FakeSpeaker(-0.084), audio, music=True, oww=0.9) is True
     assert gate_with(FakeSpeaker(-0.084), audio, music=False, oww=0.9) is False
-
-
-def test_a_marginal_wake_word_over_music_keeps_the_normal_bar(audio):
-    """oww 0.5 is under the unverified bar: a vocalist's near-miss must not
-    ALSO get the softer speaker check.  Both must be confident, not either."""
-    assert gate_with(FakeSpeaker(0.135), audio, music=True, oww=0.5) is False
-    assert gate_with(FakeSpeaker(0.135), audio, music=True,
-                     oww=hw.Hotword.UNVERIFIED_THRESHOLD) is True
 
 
 def test_abstention_still_fails_open_over_music(audio):
@@ -206,11 +275,11 @@ def test_a_broken_music_source_means_no_music(audio):
     assert h._speaker_ok(audio, 16000, oww_score=0.9) is False
 
 
-def test_the_music_bar_sits_between_the_measured_clusters():
-    """Pin the evidence: above every music-only score seen, below every one
-    of his.  Move the numbers here when the log says otherwise."""
-    assert -0.084 < hw.Hotword.SPEAKER_WAKE_MIN_MUSIC < 0.135
-    assert hw.Hotword.SPEAKER_WAKE_MIN_MUSIC < hw.Hotword.SPEAKER_WAKE_MIN
+def test_there_is_one_bar_and_no_second_one():
+    """The music bar was a threshold placed inside an overlap; a reader
+    reaching for it again should find nothing there."""
+    assert not hasattr(hw.Hotword, "SPEAKER_WAKE_MIN_MUSIC")
+    assert hw.Hotword.SPEAKER_WAKE_MIN == 0.25
 
 
 def test_every_scored_candidate_is_logged_on_one_line(audio, caplog):
@@ -225,10 +294,13 @@ def test_every_scored_candidate_is_logged_on_one_line(audio, caplog):
     lines = [r.getMessage() for r in caplog.records
              if r.getMessage().startswith("wake candidate:")]
     assert len(lines) == 3
-    assert ("speaker=0.135 oww=0.713 music=True rms=-30." in lines[0]
-            and "gate=0.10 -> accept" in lines[0])
+    assert ("speaker=0.135 speech=2.00s oww=0.713 music=True rms=-30." in lines[0]
+            and "-> abstain (music)" in lines[0])
     assert "music=False" in lines[1] and "gate=0.25 -> suppress" in lines[1]
     assert "speaker=none" in lines[2] and "-> abstain" in lines[2]
+    # The seconds of speech the score was taken over decide half these
+    # verdicts and were invisible until now; that omission cost a day.
+    assert all("speech=2.00s" in ln for ln in lines)
 
 
 def test_ambient_dbfs_reads_the_bed_under_the_voice():
