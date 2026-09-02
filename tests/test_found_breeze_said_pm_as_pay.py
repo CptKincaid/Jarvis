@@ -48,7 +48,19 @@ Against the untouched text ALONE it is 6/16 vs 12/16, p=0.073 -- suggestive,
 not proven -- and what carries the decision there is the SHAPE of the
 failures rather than their count: the untouched form's only failure is a lax
 /p ɪ ɛ m/, still audibly "p em", while the respelling collapses a vowel
-("pee-um", "I'm"), which is the complaint he actually made.
+("pee-um", "I'm"). That is a plausible source of the percept he reported, and
+no stronger than that on these probes -- across all 52 of them the respelling
+never once produced the /eɪ/ he named.
+
+It is stronger on the CLIP HE GRADED, which had to be phonemised separately
+because the first pass over it used the wrong instrument. Text 12 was
+rendered both ways at 5 seeds, but only wav2vec2-base-960h -- the letter head
+this docstring already says is deaf to this -- had read those wavs back. Re-read
+by the IPA head, the respelled arm's 10 "pee em" tokens contain one outright
+/p eɪ m/, "pay em", his words, on seed 22; the untouched arm's 10 contain
+none, its worst being a short /p i ɛ m/. One token is not a result on its
+own, but it is measured on the exact clip he rated rather than inferred from
+the probe set, and it points the same way.
 
 The other two rules are unnecessary for a different reason: Breeze read "Your
 9:10 lecture" as "NINE TEN" and "Wisenbaker 049" as "ZERO FOUR NINE"
@@ -244,6 +256,68 @@ def test_only_the_engine_sees_the_rewrite(tmp_path, monkeypatch):
 
 
 # ------------------------------------------------------ no F5 change
+#
+# This section is the fence, and the first version of it was too short to be
+# one. It pinned two hand-written strings, and the regression review found a
+# real F5 change it could not see: the bare-clock lookahead added alongside
+# this split declined on any word merely STARTING a/p and reaching an m (see
+# test_found_spoken_clock_times.py), so 7223 dictionary words silently turned
+# the byte-floor rewrite off. Both arms of that bug pass the two literals
+# below, because neither has a word after the clock.
+#
+# So the fence is now a table, and the strings in F5_PINS are Hunter's own --
+# every one is a complete "chat reply" line from /tmp/vss_voice/jarvis.log*,
+# with the F5 output the shipping code produced for it. A shared-regex edit
+# that changes the voice now has to change this table, which means arguing
+# with two days of what he actually heard rather than with an invented case.
+F5_PINS = [
+    ("Added hello, Tuesday at 4:30 PM, to your calendar, sir.",
+     "Added hello, Tuesday at four thirty pee em, to your calendar, sir."),
+    ("It is 5:44 am in London, sir; they are currently waking up to a Sunday.",
+     "It is five forty four ay em in London, sir; they are currently waking "
+     "up to a Sunday."),
+    ("It's 2:31 in the morning on Tuesday the 1st of September, sir.",
+     "It's two thirty one in the morning on Tuesday the 1st of September, "
+     "sir."),
+    ("Your last email was a receipt from Hanabi AI Inc. sent yesterday at "
+     "8:50 pm.",
+     "Your last email was a receipt from Hanabi AI Inc. sent yesterday at "
+     "eight fifty pee em."),
+    ("On Monday, you have BIOSENSORS at 9:10 am, MAGNETIC RESONANCE ENGR at "
+     "12:40 pm.",
+     "On Monday, you have Biosensors at nine ten ay em, Magnetic Resonance "
+     "Engineering at twelve forty pee em."),
+    ("You had Biosensors at 9:10 am, Magnetic Resonance Engr at 12:40 pm "
+     "and 6:00 pm.",
+     "You had Biosensors at nine ten ay em, Magnetic Resonance Engineering "
+     "at twelve forty pee em and six pee em."),
+    ("Your Liked Songs on shuffle, sir - 500 of them, on HPCOMPUTER.",
+     "Your Liked Songs on shuffle, sir - 500 of them, on Hpcomputer."),
+]
+
+# Constructed, not from the log: the shape the shared regex can reach and his
+# text happens never to have contained. Zero of the 891 distinct real strings
+# in two days of jarvis.log put an "am"-like word after a bare clock, which is
+# why the defect shipped unnoticed -- so the fence has to carry the case the
+# corpus does not.
+F5_PINS_CONSTRUCTED = [
+    ("Your 9:10 among friends, sir.", "Your nine ten among friends, sir."),
+    ("Your 9:00 Amsterdam flight, sir.",
+     "Your nine o'clock Amsterdam flight, sir."),
+    ("The 6:00 ambulance drill is on.",
+     "The six o'clock ambulance drill is on."),
+    ("Your 4:30 America/Chicago slot.", "Your four thirty America/Chicago "
+     "slot."),
+    ("Your 9:10 amounts to a full morning, sir.",
+     "Your nine ten amounts to a full morning, sir."),
+]
+
+
+@pytest.mark.parametrize("raw,said", F5_PINS + F5_PINS_CONSTRUCTED)
+def test_f5_says_exactly_what_it_said_before(raw, said):
+    assert pronounce.apply(raw, engine="f5") == said
+
+
 def test_f5_is_untouched():
     """The shipped voice. Every rule it has ever had, byte for byte."""
     assert pronounce.rules_for("f5") == pronounce.RuleSet()

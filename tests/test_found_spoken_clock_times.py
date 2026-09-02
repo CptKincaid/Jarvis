@@ -101,6 +101,67 @@ def test_it_still_does_its_original_vocabulary_job():
     assert pronounce.apply("ENGR") != "ENGR"
 
 
+# 2026-09-02, found in review, one day old. When the marked and bare clock
+# passes became separately switchable the bare pattern grew a "not a
+# meridiem" lookahead so it could run alone without eating "6:00 pm" out from
+# under the marker. The lookahead ended in a bare [mM] where _TIME_RX ends in
+# m(\.?)(?![a-z]) -- so it also declined on every ordinary word that starts
+# a/p and reaches an m within \.?\s?. "amber", "amount", "among", "America",
+# "a moment", "pms": 7223 of the words in /usr/share/dict/*. Neither pass
+# then matched, and F5 was handed a raw "The 6:00 amber drill" where the day
+# before it got "The six o'clock amber drill" -- a silent revert of the
+# byte-floor fix, on the digit-dense lines the fix exists for.
+#
+# The invariant is not "the lookahead is narrow", it is that the two patterns
+# PARTITION the clock strings: whatever the marked pass takes, the bare pass
+# must decline, and whatever it declines, the bare pass must take. That is
+# what makes the lookahead a no-op on an engine running both passes, and it
+# is checkable without rendering anything.
+_AFTER_THE_CLOCK = [
+    # the marked pass owns these
+    "am", "pm", "AM", "PM", "a.m.", "p.m.", "A.M.", "P.M.",
+    "a m", "p m", "am.", "pm,", "pm. Then we leave.",
+    # ...and every one of these is an ordinary word, not a marker
+    "amber", "ambulance", "amount", "amounts", "ambient", "among", "amid",
+    "America/Chicago", "American", "amazing", "ampere", "amps", "ambition",
+    "Amsterdam", "amp", "amnesty", "a moment", "a minute", "a mile",
+    "AMBER", "PMS", "pms", "AMD", "p mail",
+    # and these reach neither pattern at all
+    "lecture", "sir", "meeting", "drill",
+]
+
+
+@pytest.mark.parametrize("after", _AFTER_THE_CLOCK)
+def test_the_two_clock_passes_partition_the_string(after):
+    """Exactly one of them claims a clock -- never both, never neither."""
+    line = f"The 6:00 {after} thing."
+    marked = bool(pronounce._TIME_RX.search(line))
+    bare = bool(pronounce._BARE_TIME_RX.search(line))
+    assert marked != bare, (
+        f"{line!r}: marked={marked} bare={bare}; a clock claimed twice is a "
+        "double rewrite, a clock claimed by neither is raw digits at the "
+        "engine")
+
+
+@pytest.mark.parametrize("after,spoken", [
+    ("amber", "six o'clock"),        # not a meridiem: expand, as before
+    ("amounts", "six o'clock"),
+    ("among", "six o'clock"),
+    ("America/Chicago", "six o'clock"),
+    ("a moment", "six o'clock"),
+    ("PMS", "six o'clock"),          # speak_times runs BEFORE unshout, so
+    ("AMBER", "six o'clock"),        # the shouted spelling is what it sees
+    ("pms", "six o'clock"),
+    ("am", "six ay em"),             # ...but a real marker still wins, and
+    ("pm", "six pee em"),            # keeps the marked pass's own shape
+])
+def test_a_word_that_merely_starts_like_a_meridiem_does_not_suppress_the_clock(
+        after, spoken):
+    said = pronounce.apply(f"The 6:00 {after} thing.", engine="f5")
+    assert "6:00" not in said, "raw digits reached the engine"
+    assert spoken in said
+
+
 # 2026-08-28, later the same day: the rewrites above are XTTS COMPENSATIONS,
 # not universal improvements. Fish's s2.1-pro normalises "9:10 am" correctly
 # on its own, and voices the "ay em" spelling as "I'm" — the user heard it.

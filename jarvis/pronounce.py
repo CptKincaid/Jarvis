@@ -246,10 +246,31 @@ def _spoken_time(match: "re.Match") -> str:
 # engine could ask for the bare rule alone, and this pattern would then eat
 # the digits out from under the marker -- "at 6:00 pm" became "at six
 # o'clock pm", inventing an o'clock and stranding an unspoken abbreviation.
-# On every engine that runs both passes the lookahead is a no-op, because
-# the marked pass has already consumed those digits.
+#
+# The inner (?![A-Za-z]) is the whole of the lookahead's correctness and was
+# MISSING for a day: without it the lookahead says "not a meridiem" about any
+# word that merely starts a/p and reaches an m within \.?\s?, which is
+# "amber", "amount", "America", "among", "a moment", "pms" -- 7223 of the
+# words in /usr/share/dict. _TIME_RX declines those too (it ends
+# m(\.?)(?![a-z]), IGNORECASE), so BOTH passes refused and F5 was handed a
+# raw "The 6:00 amber drill" where a941dfa gave it "The six o'clock amber
+# drill" -- a silent revert, on exactly the byte-floor starvation this rule
+# was added to fix. Mirroring _TIME_RX's own terminator here makes the
+# lookahead fire precisely when the marked pass would have matched, which is
+# what "no-op on an engine that runs both passes" actually requires. That
+# partition is now asserted directly -- test_the_two_clock_passes_partition_
+# the_string -- and the F5 output it protects is pinned against two days of
+# his own log lines in test_f5_says_exactly_what_it_said_before. The first
+# version of this claim was a comment and nothing else, which is how it got
+# to be wrong.
+#
+# [A-Za-z], not [a-z]: this pattern has no IGNORECASE (it needs none, the
+# body is digits), so a bare [a-z] would still let "6:00 PMS" and "6:00
+# AMBER" suppress the rule -- and speak_times runs BEFORE unshout, so a
+# shouted word is exactly what this sees.
 _BARE_TIME_RX = re.compile(
-    r"(?<![\w:])(0?[1-9]|1[0-2]):([0-5]\d)(?![\w:])(?!\s*[apAP]\.?\s?[mM])")
+    r"(?<![\w:])(0?[1-9]|1[0-2]):([0-5]\d)(?![\w:])"
+    r"(?!\s*[apAP]\.?\s?[mM](?![A-Za-z]))")
 
 
 def _spoken_bare_time(match: "re.Match") -> str:
@@ -473,12 +494,24 @@ def space_number_hyphens(text: str) -> str:
 #     rather than proven, and the qualitative split is what carries it: the
 #     untouched form's only failure is a lax /p ɪ ɛ m/, still audibly "p em",
 #     while the respelling fails by COLLAPSING a vowel -- /p iː ə m/,
-#     "pee-um", in 6 of 10 -- which is the complaint he actually made. The am
-#     side is the fish defect verbatim: "nine ten ay em" came out /aɪ ɪ m/ or
-#     /aɪ ə m/ -- "I'm" -- in 3 of 6 seeds, while "9:10 am" and "nine ten AM"
-#     were clean in 12 of 12 (p=0.0245). And Breeze reads the written form
-#     correctly on its own: text 12's "9:10 am ... 12:40 pm ... 4:10 pm"
-#     transcribed identically to the round-11 respelled arm on all 5 seeds.
+#     "pee-um", in 6 of 10. The am side is the fish defect verbatim: "nine
+#     ten ay em" came out /aɪ ɪ m/ or /aɪ ə m/ -- "I'm" -- in 3 of 6
+#     seeds, while "9:10 am" and "nine ten AM" were clean in 12 of 12
+#     (p=0.0245).
+#
+#     THE CLIP HE ACTUALLY GRADED, phonemised separately because the first
+#     pass over it used the wrong instrument: text 12 was rendered both ways
+#     at 5 seeds, but only the LETTER head (wav2vec2-base-960h) had ever read
+#     those wavs back, and that head is deaf to this by construction -- the
+#     name of the letter P *is* /piː/. Re-read by the IPA head, the
+#     respelled arm's 10 "pee em" tokens include one outright /p eɪ m/ --
+#     "pay em", his words -- on seed 22, against 0 of 10 on the untouched
+#     arm, whose worst is a short /p i ɛ m/. That single token is the only
+#     direct evidence that the collapsed vowel above and his percept are the
+#     same failure; on its own n it proves nothing, but it is measured on
+#     the exact clip rather than inferred from the probe set. And Breeze
+#     reads the written form correctly: text 12's "9:10 am ... 12:40 pm ...
+#     4:10 pm" transcribed identically to the respelled arm on all 5 seeds.
 #   bare_times    OFF. "Your 9:10 lecture is in Wisenbaker" came back as
 #     "NINE TEN" from the prior-free CTC head on every seed, so there is
 #     nothing to fix; and the rule's only justification is F5's byte floor,
