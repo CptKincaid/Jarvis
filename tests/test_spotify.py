@@ -17,6 +17,7 @@ import os
 import random
 import re
 import stat
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -258,6 +259,9 @@ def make_tool(tmp_path, client=None, cfg=CFG, **kw):
     kw.setdefault("spawn", lambda fn: fn())
     kw.setdefault("rng", random.Random(0))
     kw.setdefault("settle", lambda s: None)
+    # No music poller by default: a play here would otherwise leave a daemon
+    # thread per test sleeping on the fake. The poller has its own tests.
+    kw.setdefault("poll", False)
     return sp.SpotifyTool(cfg, client=client, token_path=tmp_path / "spotify_token.json", **kw)
 
 
@@ -895,7 +899,7 @@ def test_liked_queue_runs_on_a_worker_when_enabled(tmp_path):
     fake = FakeSpotify(n_saved=130)
     cfg = {"spotify": {**CFG["spotify"], "liked_queue_ahead": 20}}
     tool = sp.SpotifyTool(cfg, client=fake, token_path=tmp_path / "t.json",
-                          rng=random.Random(0), settle=lambda s: None)
+                          rng=random.Random(0), settle=lambda s: None, poll=False)
     import threading
     started = []
     orig = threading.Thread.start
@@ -1533,3 +1537,241 @@ def test_duck_never_raises_and_never_strands_the_volume(tmp_path):
     tool = make_tool(tmp_path, fake)
     assert tool.duck(30) is False
     assert tool.unduck() is False
+
+
+def _active(name, volume=60, dev_id="dev-x"):
+    return [{"id": dev_id, "is_active": True, "is_restricted": False,
+             "name": name, "type": "Computer", "volume_percent": volume}]
+
+
+def test_duck_skips_this_boxs_own_librespot(tmp_path, caplog):
+    """When the active device IS the Spark, the music is a local sink-input
+    and the Room Mixer already has it by PID; a Connect duck on top would
+    take the same stream to 30% of 30%.  Skipped, not ducked."""
+    fake = FakeSpotify(devices=_active("Spark"))
+    tool = make_tool(tmp_path, fake)
+    with caplog.at_level("DEBUG", logger="jarvis.tools.spotify"):
+        assert tool.duck(30) is False
+    assert fake.named("volume") == []
+    assert tool.ducked_device is None
+    assert "Spark is this box's librespot" in caplog.text
+
+
+def test_the_librespot_name_follows_the_config_and_the_script_default(tmp_path):
+    """scripts/jarvis-spotify-device advertises LIBRESPOT_NAME, default
+    "Spark"; a box that renamed it says so in spotify.local_device."""
+    assert sp.LIBRESPOT_NAME == "Spark"
+    cfg = copy.deepcopy(CFG)
+    cfg["spotify"]["local_device"] = "Den Speaker"
+    renamed = FakeSpotify(devices=_active("den speaker"))    # _norm: case-blind
+    assert make_tool(tmp_path, renamed, cfg=cfg).duck(30) is False
+    spark = FakeSpotify(devices=_active("Spark"))
+    tool = make_tool(tmp_path, spark, cfg=cfg)               # Spark is now remote
+    assert tool.duck(30) is True and tool.ducked_device == "Spark"
+
+
+def test_ducked_device_names_what_is_held_down(tmp_path):
+    tool = make_tool(tmp_path, FakeSpotify())
+    assert tool.ducked_device is None
+    tool.duck(30)
+    assert tool.ducked_device == "Hunter's iPhone"
+    tool.unduck()
+    assert tool.ducked_device is None
+
+
+def test_a_failed_unduck_keeps_his_volume_for_the_retry(tmp_path):
+    """One transient 5xx on the way back used to discard the saved level
+    BEFORE the write was attempted, leaving the device at 30% of his volume
+    with nothing left that remembered the other 70%.  While the remote duck
+    never fired (the librespot pipe always made a local target) that was
+    unreachable; it fires on every hold now, so every turn was a chance to
+    strand his phone.  The level stands until the write is confirmed."""
+    fake = FakeSpotify()
+    tool = make_tool(tmp_path, fake)
+    assert tool.duck(30) is True
+    assert fake.named("volume") == [((12,), {"device_id": "dev-phone"})]
+    fake.fail = sp.SpotifyException(503, -1, "Service unavailable")
+    assert tool.unduck() is False
+    assert tool.ducked_device == "Hunter's iPhone"       # still on the books
+    assert tool.ducked_state == {"device": "dev-phone", "volume_pct": 40,
+                                 "name": "Hunter's iPhone"}
+    fake.fail = None
+    assert tool.unduck() is True                          # the retry lands
+    assert fake.named("volume")[-1] == ((40,), {"device_id": "dev-phone"})
+    assert tool.ducked_device is None and tool.ducked_state is None
+    assert tool.unduck() is False                         # idempotent again
+
+
+def test_restore_volume_heals_a_device_a_crash_left_down(tmp_path):
+    """The remote half of mixer.heal().  A run that died between the duck
+    and the restore leaves the Connect volume down and no stream-restore
+    database to notice; the mixer's state file is the only memory of it, and
+    this is the call that acts on it -- under the same rule as the local
+    heal, that only a device still at the floor can still be ours."""
+    down = FakeSpotify(devices=_active("HPCOMPUTER", volume=12, dev_id="dev-hp"))
+    assert make_tool(tmp_path, down).restore_volume("dev-hp", 40,
+                                                    at_or_below=32) is True
+    assert down.named("volume") == [((40,), {"device_id": "dev-hp"})]
+    loud = FakeSpotify(devices=_active("HPCOMPUTER", volume=70, dev_id="dev-hp"))
+    assert make_tool(tmp_path, loud).restore_volume("dev-hp", 40,
+                                                    at_or_below=32) is False
+    assert loud.named("volume") == []                     # his own volume, left
+    gone = FakeSpotify(devices=[])
+    assert make_tool(tmp_path, gone).restore_volume("dev-hp", 40,
+                                                    at_or_below=32) is None
+    blip = FakeSpotify(devices=_active("HPCOMPUTER", volume=12, dev_id="dev-hp"),
+                       fail=sp.SpotifyException(503, -1, "Service unavailable"))
+    assert make_tool(tmp_path, blip).restore_volume("dev-hp", 40) is None
+
+
+# ------------------------------------------ the wake gate's music cache
+# hotword.py relaxes its speaker bar while music is KNOWN playing.  Known
+# means a cache this tool fills from every call that learns something about
+# the speakers -- never a request on the wake path.
+def test_music_playing_follows_play_pause_and_the_player_state(tmp_path):
+    fake = FakeSpotify()
+    tool = make_tool(tmp_path, fake)
+    assert tool.music_playing() is False                 # nothing known yet
+    tool.play("gym mix")
+    assert tool.music_playing() is True
+    tool.control("pause")
+    assert tool.music_playing() is False
+    tool.control("resume")
+    assert tool.music_playing() is True
+    fake.now_playing = "paused"
+    assert tool.playback_state() == "paused"
+    assert tool.music_playing() is False
+    fake.now_playing = "playing"
+    tool.now_playing()
+    assert tool.music_playing() is True
+    tool.control("pause")
+    tool.control("transfer", "iPhone")               # force_play=True: it plays
+    assert tool.music_playing() is True
+
+
+def test_a_lingering_active_device_is_not_music(tmp_path):
+    """THE REGRESSION THIS GUARDS.  The duck's device lookup used to write
+    "playing" into the cache whenever Spotify listed an active device, and
+    the duck fires on EVERY hold -- so after any turn at all, with Spotify
+    paused and HPCOMPUTER merely still listed (exactly the state in the
+    2026-09-01 log), the wake bar would drop from 0.25 to 0.10 in a silent
+    room.  An active device is not music.  Only /me/player may say so."""
+    fake = FakeSpotify(now_playing="paused")
+    tool = make_tool(tmp_path, fake)
+    assert tool.playback_state() == "paused"
+    assert tool.duck(30) is True                 # it still ducks the device
+    assert tool.music_playing() is False         # ...and still knows nothing
+    tool.unduck()
+    # And the honest source keeps its answer even after another duck.
+    assert tool.duck(30) is True
+    assert tool.music_playing() is False
+
+
+def test_the_duck_lookup_is_a_reason_to_ask_not_an_answer(tmp_path):
+    """What the lookup DOES buy: the poller now has a reason to run, so
+    music he started on his phone without telling Jarvis is known one
+    refresh later instead of never."""
+    fake = FakeSpotify()                          # really playing
+    tool = make_tool(tmp_path, fake)              # poll=False: _poll_once by hand
+    assert tool._poll_once() is None              # no reason yet
+    tool.duck(30)
+    assert tool.music_playing() is False          # not yet known...
+    assert tool._poll_once() == sp.POLL_PLAYING_S
+    assert tool.music_playing() is True           # ...and now it is
+    idle = FakeSpotify(devices=[
+        {"id": "dev-hp", "is_active": False, "is_restricted": False,
+         "name": "HPCOMPUTER", "type": "Computer", "volume_percent": 60}])
+    tool = make_tool(tmp_path, idle)
+    tool.duck(30)
+    assert tool._poll_once() is None              # nothing active: no reason
+    assert tool.music_playing() is False
+
+
+def test_a_stale_playing_answer_ages_out(tmp_path):
+    """The relaxed wake bar must not outlive the album: a "playing" nobody
+    has refreshed for PLAYING_TTL_S is treated as unknown, i.e. strict."""
+    clock = [1000.0]
+    tool = make_tool(tmp_path, FakeSpotify(), now=lambda: clock[0])
+    tool.play("gym mix")
+    clock[0] += sp.PLAYING_TTL_S
+    assert tool.music_playing() is True
+    clock[0] += 1.0
+    assert tool.music_playing() is False
+
+
+def test_the_poller_runs_only_while_it_has_a_reason(tmp_path):
+    """_poll_once is the poller's whole policy, made synchronous: nothing to
+    do on a fresh tool; while playing every POLL_PLAYING_S; once the player
+    says paused, slower, but still for POLL_AFTER_PLAY_S after his play
+    command (Connect can take a moment to report); then it stands down."""
+    clock = [1000.0]
+    fake = FakeSpotify()
+    tool = make_tool(tmp_path, fake, now=lambda: clock[0])
+    assert tool._poll_once() is None                     # nothing known
+    tool.play("gym mix")
+    assert tool._poll_once() == sp.POLL_PLAYING_S
+    fake.now_playing = "paused"
+    assert tool._poll_once() == sp.POLL_IDLE_S
+    assert tool.music_playing() is False
+    clock[0] += sp.POLL_AFTER_PLAY_S + 1
+    assert tool._poll_once() is None
+
+
+def test_the_poller_backs_off_on_errors_instead_of_dying(tmp_path):
+    fake = FakeSpotify()
+    tool = make_tool(tmp_path, fake)
+    tool.play("gym mix")
+    fake.fail = sp.SpotifyException(503, -1, "Service unavailable")
+    waits = [tool._poll_once() for _ in range(5)]
+    assert waits[0] == sp.POLL_PLAYING_S
+    assert waits == sorted(waits) and waits[-1] == sp.POLL_BACKOFF_MAX_S
+    fake.fail = None
+    assert tool._poll_once() == sp.POLL_PLAYING_S      # recovered, reset
+
+
+def test_the_poller_refreshes_before_its_first_wait(tmp_path):
+    """It used to wait a whole POLL_PLAYING_S before its first read, so the
+    cache it exists to correct stood uncorrected for 30 s -- longer than most
+    conversations with him, and long enough that the cheap guess that started
+    it was the answer the wake gate actually used.  Read, then wait."""
+    fake = FakeSpotify()
+    tool = make_tool(tmp_path, fake, poll=False)      # the loop is driven here
+    seen = []
+
+    class Recorder:                    # stands in for the stop Event
+        def is_set(self):
+            return sum(1 for s in seen if s[0] == "wait") >= 2
+        def wait(self, seconds):
+            seen.append(("wait", seconds))
+            return self.is_set()
+
+    read = tool.playback_state
+    tool.playback_state = lambda: (seen.append(("read", None)), read())[1]
+    tool._poll_stop = Recorder()
+    tool._note_play_command()                         # the poller's reason
+    tool._poll_loop()
+    assert seen == [("read", None), ("wait", sp.POLL_PLAYING_S),
+                    ("read", None), ("wait", sp.POLL_PLAYING_S)]
+
+
+def test_a_play_command_starts_the_poller_and_close_stops_it(tmp_path):
+    """The thread is real: it refreshes once straight away, then sleeps on
+    the fake.  Quit must stop it, and a stopped tool must not start another."""
+    fake = FakeSpotify()
+    tool = make_tool(tmp_path, fake, poll=True)
+    assert tool._poll_thread is None
+    tool.play("gym mix")
+    t = tool._poll_thread
+    assert t is not None and t.name == "spotify-poll" and t.daemon
+    for _ in range(500):                              # its one immediate read
+        if fake.named("current_playback"):
+            break
+        time.sleep(0.01)
+    assert fake.named("current_playback"), "the poller never refreshed"
+    assert t.is_alive()                               # ...then it waits
+    tool.close()
+    assert not t.is_alive()
+    reads = len(fake.named("current_playback"))
+    tool._note_music(True)
+    assert tool._poll_thread is t                     # nothing new started
+    assert len(fake.named("current_playback")) == reads   # and nothing polled

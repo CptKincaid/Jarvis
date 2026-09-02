@@ -410,8 +410,13 @@ class JarvisApp:
         self.transcriber = Transcriber(prompt_provider=vocab_mod.build_prompt)
         # speaker= gates the wake word itself: a non-enrolled voice never
         # reaches _on_hotword, so the TV no longer opens a recording at all.
+        # music_playing= lets that gate relax while Spotify is on: over a
+        # vocalist his own "Jarvis" scored 0.135 against the 0.25 bar and got
+        # the guest line (2026-09-01).  It is a bound method, not the mixer's,
+        # because the mixer is built before this and swapped in tests.
         self.hotword = Hotword(self.arbiter, self._mic_index, self._on_hotword,
-                               speaker=self.speaker, on_guest=self._on_guest)
+                               speaker=self.speaker, on_guest=self._on_guest,
+                               music_playing=self._music_playing)
 
         # ---- actions ------------------------------------------------------
         self.desktop = desktop_mod.DesktopControl()
@@ -445,10 +450,11 @@ class JarvisApp:
         self.services = self._build_services()
         self._register_tools()
         # The mixer was built at 372, before any tool existed; the Connect
-        # ducker it falls back to when there is nothing local to duck (#72)
-        # is the Spotify tool, which only lands on services in
-        # _register_tools. Without this line the remote duck is dead code
-        # and the mixer stands down exactly as it did before #72.
+        # ducker it asks on every hold alongside the local one (#72) is the
+        # Spotify tool, which only lands on services in _register_tools.
+        # Without this line the remote duck is dead code and the mixer ducks
+        # only what pactl can see -- on this box, the idle librespot pipe.
+        # The same handle is where _music_playing's answer comes from.
         if self.mixer is not None:
             self.mixer.set_remote(getattr(self.services, "spotify", None))
         # After the tools: the session reaches Spotify through the handle
@@ -2487,6 +2493,19 @@ class JarvisApp:
         return False
 
     # ---------------------------------------------------- guests, learning
+    def _music_playing(self) -> bool:
+        """Is music known to be playing?  The mixer's cache read (it holds
+        the Spotify tool); False whenever there is no mixer or it breaks, so
+        the relaxed wake bar can never become the default by accident."""
+        fn = getattr(getattr(self, "mixer", None), "music_playing", None)
+        if not callable(fn):
+            return False
+        try:
+            return bool(fn())
+        except Exception:
+            log.debug("music_playing lookup failed", exc_info=True)
+            return False
+
     def _on_guest(self, score):
         """A clear wake word in a voice that is not the enrolled one."""
         if score < 0.85 or not CONFIG.talkback:
@@ -2494,6 +2513,15 @@ class JarvisApp:
         if getattr(getattr(self, "tts", None), "busy", False) is True or \
                 getattr(self, "_tts_active", False):
             return          # under barge-in the listener hears his own voice
+        if self._music_playing():
+            # A "guest" over music is far more often HIM, scored down by the
+            # bed under his voice (0.135 and 0.158 on 2026-09-01), or the
+            # vocalist tripping oww.  "I only answer to Hunter, sir" said to
+            # either is wrong, and said to him twice in a minute was the
+            # complaint.  Stay quiet; the cooldown is not spent.
+            log.info("guest-like wake over music, staying quiet (score=%.2f)",
+                     score)
+            return
         now = time.monotonic()
         if now - self._last_guest_ts < 180.0:
             return
@@ -4399,6 +4427,14 @@ class JarvisApp:
                           ("arc", getattr(self, "arc", None)),
                           # mixer stop() restores every stream it ducked
                           ("mixer", getattr(self, "mixer", None)),
+                          # ...and after it the Spotify tool's playback
+                          # poller, which the mixer's remote duck may have
+                          # started, is stopped before it polls a quit app.
+                          # Resolved as close(): the tool has no stop(), and
+                          # must not grow one -- a transport stop() here
+                          # would pause his music every time Jarvis quit.
+                          ("spotify", getattr(getattr(self, "services", None),
+                                              "spotify", None)),
                           ("dayreviewer", getattr(self, "dayreviewer", None)),
                           ("board_feed", getattr(self, "_board_feed", None)),
                           ("garden", getattr(self, "garden", None))):

@@ -157,6 +157,41 @@ def test_a_guest_is_declined_politely_and_not_nagged(monkeypatch, tmp_path):
     assert len(a.said) == 1
 
 
+def test_a_guest_like_wake_over_music_stays_quiet(monkeypatch, tmp_path, caplog):
+    """2026-09-01: Spotify on HPCOMPUTER, his own "Jarvis" scored 0.135 and
+    0.158 against the voiceprint, and the guest line answered HIM, twice.
+    Over music a "guest" is usually him scored down by the bed, or the
+    vocalist; the line is wrong for both, so it is not said -- and the
+    180 s cooldown is not spent, so a real guest once the music stops is
+    still declined."""
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    a = _app(monkeypatch, state=tmp_path / "b.json")
+    a._last_guest_ts = -1e9
+    playing = {"on": True}
+    a.mixer = SimpleNamespace(music_playing=lambda: playing["on"])
+    with caplog.at_level("INFO", logger="jarvis.app"):
+        a._on_guest(0.95)
+    assert a.said == []
+    assert "guest-like wake over music, staying quiet" in caplog.text
+    playing["on"] = False
+    a._on_guest(0.95)                                    # music off: the old path
+    assert a.said == ["I only answer to Hunter, sir."]
+
+
+def test_the_guest_line_survives_a_mixer_that_cannot_say(monkeypatch, tmp_path):
+    """No mixer, or one that raises, means "not playing" -- never a crash
+    and never a quiet Jarvis by default."""
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    a = _app(monkeypatch, state=tmp_path / "b.json")
+    a._last_guest_ts = -1e9
+    def boom():
+        raise RuntimeError("spotify down")
+    a.mixer = SimpleNamespace(music_playing=boom)
+    a._on_guest(0.95)
+    assert a.said == ["I only answer to Hunter, sir."]
+    assert _app(monkeypatch, state=tmp_path / "b.json")._music_playing() is False
+
+
 # ------------------------------------------------------ passive learning
 def test_passive_learning_takes_a_clear_match_once_in_a_while(monkeypatch, tmp_path):
     monkeypatch.setattr(CONFIG, "speaker_verify", True)
