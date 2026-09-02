@@ -37,6 +37,16 @@ ExecStart=%h/voice-training/engines/breeze/venv/bin/python %h/Jarvis/scripts/bre
 # the server reads both at start: swap either, restart the unit.
 Restart=always
 RestartSec=30
+# A DELIBERATE REFUSAL IS TERMINAL. breeze_server.py returns 2 when a path is
+# missing, when MemFree/MemAvailable are under the floor, or when a live
+# sidecar already owns the socket -- none of which a restart can fix. Without
+# this, systemd counted each refusal as a start attempt, so three of them in
+# ten minutes replaced the (legible, actionable) MemFree message with "start
+# request repeated too quickly" and left the unit failed until someone ran
+# `systemctl --user reset-failed jarvis-breeze.service` -- and the obvious
+# recovery sequence (start, read the message, free some memory, start again)
+# is exactly what hit that.
+RestartPreventExitStatus=2
 # The load holds the GPU flock and can queue behind another job; SIGTERM at
 # any point is safe, the server holds no state worth flushing.
 TimeoutStopSec=20

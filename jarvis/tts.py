@@ -391,7 +391,8 @@ class _AudioStream:
     trip the fish timeout for no reason.
     """
 
-    def __init__(self, path: str, timeout: float = FISH_TIMEOUT_S):
+    def __init__(self, path: str, timeout: float = FISH_TIMEOUT_S,
+                 min_heard: int = _WAV_HEADER_BYTES):
         self.path = path
         # How long the CONSUMER may wait on this producer. It travels with
         # the stream because the consumer loop, _play_stream and
@@ -401,9 +402,17 @@ class _AudioStream:
         # more, because at RTF 0.742 a 320-character chunk is ~14 s of
         # rendering and the no-paplay fallback path waits for ALL of it.
         self.timeout = float(timeout)
+        # How many bytes must have reached the player before a cut chunk
+        # counts as HEARD (and so must not be re-rendered by another engine,
+        # which would say the first half twice in a different voice). The
+        # default is the header alone, which is what fish has always used and
+        # keeps byte-identical; see BREEZE_MIN_HEARD_BYTES for why a header
+        # plus a handful of samples is not "heard" by any ear.
+        self.min_heard = int(min_heard)
         self.nbytes = 0
         self.failed = False
         self.done = threading.Event()
+        self._ended = False
         self._q: queue.Queue = queue.Queue()
 
     def feed(self, data: bytes) -> None:
@@ -412,10 +421,30 @@ class _AudioStream:
         self.nbytes += len(data)
         self._q.put(data)
 
+    def end_audio(self) -> None:
+        """No more audio is coming: let the player finish and the NEXT chunk
+        start. Idempotent.
+
+        Deliberately separate from close(), because a producer can still have
+        work to do after its last byte. Breeze does: it asks the sidecar, on a
+        second connection, whether the chunk it just streamed was complete.
+        Measured before this split, with the status query blocked for 6 s and
+        the receipt deadline patched down to 4 s to keep the test short: a
+        two-sentence reply spawned player 1 at t=0.00 s and player 2 at
+        t=6.00 s, a six-second hole in the middle of 0.4 s of audio. The
+        sentinel below is the only thing that closes paplay's stdin, and
+        _play_stream holds it open until it arrives, so end-of-producer was
+        end-of-playback for every later chunk too.
+        """
+        if self._ended:
+            return
+        self._ended = True
+        self._q.put(None)
+
     def close(self, failed: bool = False) -> None:
         self.failed = failed
+        self.end_audio()
         self.done.set()
-        self._q.put(None)
 
     def get(self, timeout: float | None = None) -> bytes | None:
         """Next bytes, ``None`` at end of stream; ``queue.Empty`` on timeout."""
@@ -423,8 +452,8 @@ class _AudioStream:
 
     @property
     def heard(self) -> bool:
-        """True once audio (not just a header) has been handed to the player."""
-        return self.nbytes > _WAV_HEADER_BYTES
+        """True once AUDIBLE audio (not just a header) reached the player."""
+        return self.nbytes > self.min_heard
 
 
 class _LiveEnvelope:
@@ -758,13 +787,55 @@ BREEZE_FALLBACK = "f5"        # must stay LOCAL, and must stay RESIDENT
 # (measured RTF 1.868) without letting a wedged sidecar hang the TTS worker.
 BREEZE_TIMEOUT_S = 60.0
 
-# How long to wait for the completion receipt after a stream has ended. It
-# is a fresh connection and the sidecar serves one request at a time, so on
-# the room's own path it is answered instantly -- but the phone renderer or
-# prewarm can slip a whole-chunk render in between, and that is ~14 s for a
-# 320-character chunk. A receipt that never arrives is read as "truncated",
-# which only costs a cache entry: the audio has already been heard.
-BREEZE_RECEIPT_TIMEOUT_S = 15.0
+# How long to wait for the completion receipt after a stream has ended.
+#
+# It was 15 s, and 15 s of SILENCE: the receipt is a second connection made by
+# the generator's tail, so the producer sat in it before rendering the next
+# sentence and the consumer sat in it (stream.done) before taking the next
+# chunk off the queue. Measured with a sidecar whose status query was blocked
+# for 6 s and this cut to 4 s to keep the test short: player 1 at t=0.00 s,
+# player 2 at t=6.00 s, for 0.4 s of audio in between.
+#
+# Three things fix it, and the deadline is the smallest of them. The CAUSE was
+# a sidecar that served one connection at a time, so a receipt could queue
+# behind a ~14 s phone render; it now answers pings and receipts off its
+# render lock, on their own threads (scripts/breeze_server.py serve()). The
+# room is decoupled from the answer (_AudioStream.end_audio) and so is the
+# next sentence (_confirm_breeze runs the round-trip on its own thread, in
+# parallel with the current chunk's playback and the next chunk's render).
+# What is left for this number to bound is one pathological case: a chunk
+# whose playback is SHORTER than a hung receipt. 2 s is over a thousand times
+# what an OrderedDict lookup over AF_UNIX costs, and "no receipt" already
+# means "do not cache", which is the safe default -- the audio has been heard
+# either way.
+BREEZE_RECEIPT_TIMEOUT_S = 2.0
+
+# The speak path's whole budget for asking whether the sidecar is there. Paid
+# on EVERY utterance -- load() has no "already adopted" short-circuit and must
+# not grow one, because a sidecar can die between two replies -- so it has to
+# be small. It can be: the ping is answered off the render lock.
+BREEZE_PING_TIMEOUT_S = 2.0
+
+# How long a sidecar that is STARTING is waited for, and it is only ever spent
+# on a background thread (TTS.warm_breeze), never on the speak path.
+#
+# NOT F5's 180 s. That number is F5's own ~180 s cold start; Breeze's unit
+# measures this one at ~30 s (7.3 s load + 22.0 s capture + two warm renders).
+# What made 180 s dangerous here is that Breeze holds ~/voice-training/.gpu.lock
+# across all of it, so a start QUEUED BEHIND ANOTHER GPU JOB is a normal state
+# -- Type=simple, systemd says `active`, no socket -- and inheriting F5's
+# budget on the audible path turned that into three minutes of silence before
+# landing on the F5 that was available in 0.53 s.
+BREEZE_STARTUP_TIMEOUT_S = 90.0
+
+# A stream cut just past the header was still never audible, so re-rendering
+# it on F5 cannot produce a doubled fragment. The threshold has to be a
+# DURATION and not the header length: at 44 bytes exactly the fallback fires
+# correctly, but a 46-byte stream (the header and ONE sample, 0.04 ms)
+# counted as "heard" and the clause was dropped with nothing said -- measured,
+# f5=[] and no cache file. 20 ms of PCM16 at 24 kHz is 960 bytes: shorter than
+# any phoneme, far longer than a short first read off the socket.
+BREEZE_MIN_HEARD_BYTES = _WAV_HEADER_BYTES + int(24000 * 2 * 0.02)
 
 # The rig the round-11 blind test rated, pinned. Every value is in the speech
 # cache key, so changing one can never replay stale audio, and every value
@@ -820,7 +891,7 @@ def _breeze_request(payload: dict, timeout: float = BREEZE_TIMEOUT_S) -> dict:
     return json.loads(buf.decode("utf-8") or "{}")
 
 
-def _breeze_ping(timeout: float = 5) -> dict:
+def _breeze_ping(timeout: float = BREEZE_PING_TIMEOUT_S) -> dict:
     try:
         return _breeze_request({"ping": True}, timeout=timeout)
     except Exception:
@@ -854,15 +925,29 @@ def _breeze_config_drift(reply: dict) -> list[str]:
             if k in BREEZE_PARAMS and theirs[k] != BREEZE_PARAMS[k]]
 
 
-def _ensure_breeze_server(startup_timeout: float = 180) -> bool:
+def _ensure_breeze_server(startup_timeout: float = 0.0) -> bool:
     """Adopt a running Breeze sidecar. NEVER starts one -- see note 1 above.
 
-    Two cases: the socket already answers a ready+graphs ping (adopted as
-    is), or the unit is active but not yet answering (it is loading and
-    capturing, which takes ~30 s -- wait for it). Anything else is False,
-    and the caller falls back to F5.
+    THE DEFAULT IS ZERO WAIT, and that is a fix for a measured stall. This
+    used to inherit F5's 180 s and hold _breeze_lock for all of it, on the
+    audible path: TTS.speak -> load() -> here. A sidecar that was merely
+    QUEUED BEHIND ANOTHER GPU JOB puts the unit in exactly the state this
+    waited on -- Type=simple, so systemd reports `active` while the process
+    sits on ~/voice-training/.gpu.lock with no socket bound -- and that is a
+    normal state, not an error. Measured with the budget patched to 4 s: the
+    first reply was 4.0 s of silence and then rendered on F5, which had been
+    available in 0.53 s the whole time; shipped, it would have been 180.
+
+    So waiting is now the background thread's job (TTS.warm_breeze) and the
+    speak path asks once and moves on. ``startup_timeout`` > 0 is that thread.
     """
-    with _breeze_lock:
+    # Bounded, and never held across the wait: warm_breeze can be inside this
+    # for its whole budget and the speak path must not queue behind it.
+    if not _breeze_lock.acquire(timeout=BREEZE_PING_TIMEOUT_S + 1):
+        log.info("a breeze sidecar probe is already in flight; using %s "
+                 "for this utterance", BREEZE_FALLBACK)
+        return False
+    try:
         reply = _breeze_ping()
         if reply.get("ready") and reply.get("graphs"):
             drift = _breeze_config_drift(reply)
@@ -879,11 +964,19 @@ def _ensure_breeze_server(startup_timeout: float = 180) -> bool:
                       reply.get("error") or reply.get("detail"),
                       BREEZE_FALLBACK)
             return False
-        if _breeze_unit_active():
-            return _wait_for_breeze_unit(startup_timeout)
-        log.error("breeze sidecar is not running (%s is not active); "
-                  "install it with scripts/setup_breeze_service.sh", BREEZE_UNIT)
+        if not _breeze_unit_active():
+            log.error("breeze sidecar is not running (%s is not active); "
+                      "install it with scripts/setup_breeze_service.sh",
+                      BREEZE_UNIT)
+            return False
+    finally:
+        _breeze_lock.release()
+    if startup_timeout <= 0:
+        log.info("%s is active but not answering yet (it loads for ~30 s, and "
+                 "may still be queued on the GPU lock); using %s until it is",
+                 BREEZE_UNIT, BREEZE_FALLBACK)
         return False
+    return _wait_for_breeze_unit(startup_timeout)
 
 
 def _wait_for_breeze_unit(startup_timeout: float) -> bool:
@@ -909,8 +1002,34 @@ def _wait_for_breeze_unit(startup_timeout: float) -> bool:
     return False
 
 
+def _breeze_receipt(request_id: str, timeout: float | None = None) -> None:
+    """Raise unless the sidecar POSITIVELY says that stream was complete.
+
+    A separate function, and not just the tail of _breeze_iter, because it is
+    a second connection and the room must be able to run it somewhere other
+    than on the path between two sentences (see _speak_pipelined's
+    _confirm_breeze). NO RECEIPT MEANS INCOMPLETE: a sidecar that died
+    mid-chunk answers nothing at all.
+    """
+    receipt = _breeze_request(
+        {"status": request_id},
+        # Read at call time, not bound as a default: a listening test -- or a
+        # deliberately slow sidecar -- must be able to move this.
+        timeout=BREEZE_RECEIPT_TIMEOUT_S if timeout is None else timeout)
+    if not receipt.get("complete"):
+        raise RuntimeError(
+            "breeze stream truncated: "
+            f"{receipt.get('error') or 'no completion receipt'}")
+
+
+def _breeze_request_id() -> str:
+    return f"jarvis-{uuid.uuid4().hex}"
+
+
 def _breeze_iter(text: str, gain: float,
-                 timeout: float = BREEZE_TIMEOUT_S) -> Iterator[bytes]:
+                 timeout: float = BREEZE_TIMEOUT_S, *,
+                 request_id: str | None = None,
+                 verify: bool = True) -> Iterator[bytes]:
     """Yield one chunk's wav bytes from the sidecar as they arrive.
 
     HEADER INCLUDED, and that is the seam that would otherwise break the
@@ -932,8 +1051,13 @@ def _breeze_iter(text: str, gain: float,
     carries an id and the sidecar keeps a receipt for it. NO RECEIPT MEANS
     INCOMPLETE: a sidecar that died mid-chunk answers nothing, and caching a
     clipped sentence should take a positive assertion that it is whole.
+
+    ``verify=False`` ends this generator at end of AUDIO and leaves the
+    receipt to the caller, who passes the same ``request_id`` to
+    _breeze_receipt whenever it suits the room -- which is how the streaming
+    path keeps a second network round-trip out from between two sentences.
     """
-    request_id = f"jarvis-{uuid.uuid4().hex}"
+    request_id = request_id or _breeze_request_id()
     sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     sock.settimeout(timeout)
     try:
@@ -966,12 +1090,8 @@ def _breeze_iter(text: str, gain: float,
             sock.close()
         except OSError:
             pass
-    receipt = _breeze_request({"status": request_id},
-                              timeout=BREEZE_RECEIPT_TIMEOUT_S)
-    if not receipt.get("complete"):
-        raise RuntimeError(
-            "breeze stream truncated: "
-            f"{receipt.get('error') or 'no completion receipt'}")
+    if verify:
+        _breeze_receipt(request_id)
 
 
 def _breeze_stream(text: str, gain: float, out_path: str,
@@ -1200,6 +1320,7 @@ class TTS:
         self._load_lock = threading.Lock()     # one XTTS LOAD at a time
         self._prewarm_thread: threading.Thread | None = None
         self._f5_warm_thread: threading.Thread | None = None
+        self._breeze_warm_thread: threading.Thread | None = None
         self.last_text = ""                    # last cleaned utterance queued
         self.last_shown = ""                   # ...as the transcript showed it
         self.interrupts = 0                    # barge-ins that cut speech
@@ -1274,6 +1395,14 @@ class TTS:
                 # socket, which is the normal case.
                 self.warm_f5_fallback()
                 return True
+            if _breeze_unit_active():
+                # It exists and is coming up (loading, capturing, or queued on
+                # the GPU lock). Speak THIS reply in F5 at 0.53 s and let a
+                # background thread put the good voice back when it answers,
+                # rather than spending the startup budget in silence to reach
+                # the same F5. One extra `systemctl is-active` on the way
+                # down, once per session -- _engine is f5 after this.
+                self.warm_breeze()
             return self._breeze_unavailable()
         if self._engine == "f5":
             if _ensure_f5_server():
@@ -1315,6 +1444,44 @@ class TTS:
 
         t = threading.Thread(target=_run, daemon=True, name="tts-f5-warm")
         self._f5_warm_thread = t
+        t.start()
+        return t
+
+    def warm_breeze(self) -> Optional[threading.Thread]:
+        """Adopt the Breeze sidecar in the background once it answers.
+
+        The wait belongs here and nowhere near an utterance. The unit is
+        Type=simple, so systemd calls it active from the moment python starts
+        -- which is before the GPU flock, before the memory gate, and before
+        7.3 s of load and 22.0 s of capture; and because the sidecar holds
+        ~/voice-training/.gpu.lock across all of that, "active with no socket"
+        is also what a start queued behind another GPU job looks like, for as
+        long as that job runs. Waiting for it inside load() cost the reply the
+        whole budget in silence and then fell back to F5 anyway.
+
+        Daemon, one per instance, and it only ever RESTORES a choice Hunter
+        already made: it sets the engine back to "breeze" if and only if we
+        are the ones who demoted it.
+        """
+        t = self._breeze_warm_thread
+        if t is not None and t.is_alive():
+            return t
+
+        def _run():
+            if not _ensure_breeze_server(BREEZE_STARTUP_TIMEOUT_S):
+                log.warning("breeze sidecar did not come up within %.0fs; "
+                            "staying on %s for this session",
+                            BREEZE_STARTUP_TIMEOUT_S, BREEZE_FALLBACK)
+                return
+            if self._engine != BREEZE_FALLBACK:
+                # He changed the engine while we waited. His choice wins.
+                return
+            log.info("breeze sidecar is up — the next reply uses it")
+            self._engine = "breeze"
+            bus.publish(Status(text="Breeze voice is back", kind="ok"))
+
+        t = threading.Thread(target=_run, daemon=True, name="tts-breeze-warm")
+        self._breeze_warm_thread = t
         t.start()
         return t
 
@@ -1968,16 +2135,53 @@ class TTS:
             stream.close()
             return True
 
+        def _confirm_breeze(request_id: str, sent: str, tmp_name: str,
+                            stream: _AudioStream) -> None:
+            """Ask whether that chunk was whole, then cache it -- on its own
+            thread, in parallel with the current chunk's playback and the next
+            chunk's render.
+
+            The receipt is a SECOND connection (everything after the header is
+            raw PCM, so no in-band trailer is possible) and it used to be the
+            tail of the producer's generator, which put it between two
+            sentences twice over: the producer waited for it before rendering
+            the next chunk, and the consumer waited for it again on
+            stream.done before taking that chunk off the queue. Measured with
+            a sidecar whose status query was blocked for 6 s: player 1 at
+            t=0.00 s, player 2 at t=6.00 s, for 0.4 s of audio.
+
+            Nothing the room does depends on the answer -- the audio has
+            already been heard either way. It decides ONE thing: whether this
+            chunk may go in the speech cache. Store before close(), because
+            close() is what releases the consumer to unlink the tee file.
+            """
+            failed = False
+            try:
+                _breeze_receipt(request_id)
+                if not self._stop_flag:
+                    self._store(engine, sent, tmp_name)
+            except Exception as exc:
+                failed = True
+                log.warning("breeze chunk not confirmed complete (%s) — "
+                            "not caching: %.60s", exc, sent)
+            finally:
+                stream.close(failed=failed)
+
         def _stream_breeze(sent: str, tmp_name: str) -> bool:
             """Play-while-rendering for one breeze chunk. Same contract as
             _stream_fish: hand the consumer an _AudioStream BEFORE the first
             byte exists, tee every byte into ``tmp_name`` for the cache,
             return False only when the chunk must be rendered by the fallback
             engine (it failed before ANY audio reached the player)."""
-            stream = _AudioStream(tmp_name, timeout=BREEZE_TIMEOUT_S)
+            stream = _AudioStream(tmp_name, timeout=BREEZE_TIMEOUT_S,
+                                  min_heard=BREEZE_MIN_HEARD_BYTES)
             wav_q.put(stream)
+            request_id = _breeze_request_id()
+            # verify=False: this generator now ends at end of AUDIO, and the
+            # completion receipt is _confirm_breeze's job.
             it = _breeze_iter(sent, output_gain_for("breeze"),
-                              BREEZE_TIMEOUT_S)
+                              BREEZE_TIMEOUT_S, request_id=request_id,
+                              verify=False)
             try:
                 with open(tmp_name, "wb") as fh:
                     for data in it:
@@ -1988,10 +2192,9 @@ class TTS:
             except Exception:
                 log.exception("breeze stream failed: %.60s", sent)
                 stream.close(failed=True)
-                # Audio already reached the ear (the chunk was truncated,
-                # or its completion receipt never came): re-rendering the
-                # sentence on F5 would say the first half twice, in a
-                # different voice. Lose the tail of this one chunk instead.
+                # Audio already reached the ear: re-rendering the sentence on
+                # F5 would say the first half twice, in a different voice.
+                # Lose the tail of this one chunk instead.
                 if stream.heard:
                     log.warning("breeze stream cut mid-chunk; not re-speaking")
                     return True
@@ -2003,11 +2206,27 @@ class TTS:
                 close = getattr(it, "close", None)
                 if close is not None:
                     close()
-            if not self._stop_flag:
-                # Store before close(): the consumer unlinks the tee file as
-                # soon as it has played, and close() is what lets it finish.
-                self._store(engine, sent, tmp_name)
-            stream.close()
+            # END OF AUDIO -- release the player now, before the round-trip.
+            stream.end_audio()
+            if not stream.heard:
+                # The socket ended cleanly, but nothing audible came out of
+                # it: a header, or a header and a sample. That is not a
+                # rendition, and because nothing was heard there is no
+                # fragment for F5 to double -- so re-render the clause rather
+                # than dropping it. (44 bytes exactly always fell back
+                # correctly; 46 -- 0.04 ms -- used to count as "heard" and the
+                # clause vanished with nothing said and nothing cached.)
+                log.warning("breeze sent %d bytes for %.60s — nothing audible; "
+                            "rendering it on %s", stream.nbytes, sent,
+                            BREEZE_FALLBACK)
+                stream.close(failed=True)
+                return False
+            if self._stop_flag:
+                stream.close()       # a stopped chunk is never cached anyway
+                return True
+            threading.Thread(target=_confirm_breeze, daemon=True,
+                             name="tts-breeze-receipt",
+                             args=(request_id, sent, tmp_name, stream)).start()
             return True
 
         def _fallback_chunk(sent: str) -> bool:

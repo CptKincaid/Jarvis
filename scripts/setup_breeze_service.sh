@@ -54,9 +54,18 @@ cat <<MSG
 installed $DEST_DIR/$UNIT (NOT enabled, NOT started).
 
 Turn the voice on -- three steps, in this order:
-  1. start the sidecar (needs MemFree >= 35 GB; it refuses otherwise and says so):
+  1. start the sidecar. It needs MemFree >= 33 GB AND MemAvailable >= 60 GB and
+     refuses otherwise, with the numbers, on one line. MemFree measured
+     19.2-29.2 GB on 2026-09-02 with ollama, F5, Jarvis and the desktop up, so
+     expect the refusal until you free some: the 18.6 GB ollama pins at
+     keep_alive -1 is the lever (\`ollama stop <model>\`), not the floor.
+       grep -e MemFree -e MemAvailable /proc/meminfo
        systemctl --user start $UNIT
        journalctl --user -u $UNIT -f     # "breeze: listening on ... (ready=True)"
+     A refusal exits 2 and the unit sets RestartPreventExitStatus=2, so it
+     stops cleanly rather than looping -- but if you ever do see "start request
+     repeated too quickly", clear it with:
+       systemctl --user reset-failed $UNIT
   2. check it is ready AND its CUDA graphs are captured:
        python3 -c 'import json,socket; s=socket.socket(socket.AF_UNIX); s.connect("/tmp/vss_voice/breeze.sock"); s.sendall(b"{\\"ping\\": true}\\n"); print(s.recv(65536).decode())'
   3. point Jarvis at it and restart him:

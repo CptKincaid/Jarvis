@@ -83,6 +83,7 @@ import os
 import socket
 import struct
 import sys
+import threading
 import time
 import traceback
 import wave
@@ -146,11 +147,23 @@ FAST_CONFIG = "configs/fast.json"
 # that counts the 18.2 GiB transient but not the 13.5 GiB the model has
 # already taken by the time capture runs, and would land at -6.)
 #
-# Idle MemFree on this box is 33.5-34.7 GiB, so this gate is genuinely close
-# to the line and will refuse on a busy afternoon. That is the intended
-# behaviour -- Jarvis keeps speaking through F5 -- and the lever when it
-# refuses is the 18.6 GiB ollama has pinned at keep_alive -1, not this
-# number.
+# MEASURED AGAIN 2026-09-02 16:22-16:23 (13 samples, 5 s apart, with ollama,
+# the F5 sidecar, Jarvis and the desktop up): MemFree 19.2-29.2 GiB,
+# MemAvailable 63.5-73.5 GiB. An earlier note here claimed idle MemFree was
+# 33.5-34.7 GiB; it is not, and the honest consequence is that THIS GATE
+# REFUSES ON THE BOX AS IT STANDS TODAY. That is the intended behaviour --
+# Jarvis keeps speaking through F5 -- and the number is not the thing to file
+# down: 33 is the level a real start was measured surviving from (33.88 GiB
+# in, trough 2.39 GiB), and the trough is what the 2026-08-28 power-off was.
+# The lever is the 18.6 GiB ollama holds pinned at keep_alive -1
+# (`ollama stop <model>`), not this floor.
+#
+# A refusal is ``return 2``, and the unit sets RestartPreventExitStatus=2 so
+# that a deliberate refusal is terminal and legible instead of burning the
+# three restarts StartLimitBurst allows and replacing this message with
+# "start request repeated too quickly" -- which is what happened to the
+# obvious recovery sequence (start, read the message, free memory, start
+# again). See scripts/systemd/jarvis-breeze.service.
 #
 # MemAvailable is the second gate for two reasons: it is the box's standing
 # rule for any GPU job here, and it is what says there is page cache left to
@@ -163,9 +176,29 @@ MIN_AVAILABLE_GB = 60
 # output is a pipe. Kept identical to jarvis/tts.py's STREAM_SIZE.
 STREAM_SIZE = 0xFFFFFFFF
 
-# One request at a time, but a long line is minutes of generation if the
-# client stops reading; the socket deadline only bites when nobody is there.
-CONN_TIMEOUT_S = 900.0
+# TWO deadlines, because the two phases fail differently and one number for
+# both was a quarter of an hour of nothing.
+#
+# READ is short. Every client connects and writes its request line in the same
+# breath (jarvis/tts.py _breeze_iter and _breeze_request both connect+sendall),
+# so a peer that has connected and written nothing is dead or hostile, not
+# slow. Reproduced with the old single 900 s deadline: a client that sent
+# b'{"pi' and then held blocked read_request, and -- on the old single-threaded
+# accept loop -- every other request queued behind it.
+#
+# SEND is scripts/f5_server.py's number, and it bounds ONE blocked sendall,
+# not a whole generation: the gaps between blocks are the GPU, not the socket,
+# and never count against it. 64 KB to a client that is reading is instant, so
+# 120 s without progress means the peer stopped reading.
+READ_TIMEOUT_S = 15.0
+SEND_TIMEOUT_S = 120.0
+
+# Connections are served on their own threads (see serve()) so that a ping or
+# a completion receipt is never queued behind a 14 s render. This bounds how
+# many may pile up: Jarvis opens one at a time and the phone renderer one
+# more, so anything near this is a leak or an attack, and refusing beats
+# growing threads without bound.
+MAX_CONNECTIONS = 8
 
 # How many stream outcomes to remember for the receipt query above. The
 # caller asks for one the moment its stream ends, and only one stream runs
@@ -275,7 +308,21 @@ def gpu_lock(path):
     path.parent.mkdir(parents=True, exist_ok=True)
     fh = open(path, "a+")
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            # SAY SO. This is entered before the only other output in main(),
+            # and the unit is Type=simple -- so systemd reports it `active`
+            # and Jarvis sees an active unit with no socket, while journalctl
+            # shows nothing at all between ExecStartPre and the memory gate
+            # for as long as another GPU job holds the lock. Silent-and-queued
+            # and hung look identical without this line.
+            print(f"breeze: waiting for the GPU lock ({path}) -- another GPU "
+                  f"job holds it", flush=True)
+            waited = time.perf_counter()
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            print(f"breeze: got the GPU lock after "
+                  f"{time.perf_counter() - waited:.0f}s", flush=True)
         yield
     finally:
         try:
@@ -303,6 +350,14 @@ class BreezeService:
         # module docstring: EOF alone cannot say whether a stream finished.
         self._receipts: "collections.OrderedDict[str, dict]" = (
             collections.OrderedDict())
+        # Connections are served on their own threads now, so both of these
+        # are reached concurrently. _render_lock keeps the one resident model
+        # to ONE generation at a time -- which is what the old accept-then-
+        # handle loop gave for free, and the only part of that serialisation
+        # worth keeping. _receipt_lock guards the OrderedDict a receipt query
+        # reads while a stream is writing it.
+        self._render_lock = threading.Lock()
+        self._receipt_lock = threading.Lock()
         # Reported on every ping so Jarvis can WARN when the running sidecar
         # does not match the parameters its speech cache is keyed on: the
         # sidecar applies the voice, tts.BREEZE_PARAMS only records it, and a
@@ -326,7 +381,8 @@ class BreezeService:
 
     def receipt(self, request_id: str) -> dict:
         """Did that streamed chunk finish? See the module docstring."""
-        got = self._receipts.get(request_id)
+        with self._receipt_lock:
+            got = self._receipts.get(request_id)
         if got is None:
             return {"ok": False, "id": request_id,
                     "error": "unknown request id"}
@@ -335,9 +391,10 @@ class BreezeService:
     def _remember(self, request_id, outcome: dict) -> None:
         if not request_id:
             return
-        self._receipts[str(request_id)] = outcome
-        while len(self._receipts) > RECEIPTS:
-            self._receipts.popitem(last=False)
+        with self._receipt_lock:
+            self._receipts[str(request_id)] = outcome
+            while len(self._receipts) > RECEIPTS:
+                self._receipts.popitem(last=False)
 
     def _not_ready(self) -> dict:
         return {"ok": False, "error": self.error or
@@ -345,9 +402,27 @@ class BreezeService:
 
     # ------------------------------------------------------------ dispatch
     def handle(self, conn) -> None:
-        """Serve exactly one request on ``conn``. Never raises."""
+        """Serve exactly one request on ``conn``. Never raises -- and the code
+        now says so, not just this line.
+
+        The previous version put only read_request inside a try. Everything
+        after it ran bare, so four bytes killed a 13.5 GB resident model with
+        no reply to the client. A body of 5, of [], of "x" or of true all
+        reached req.get("ping") on a non-dict; {"text": 5} reached .strip() on
+        an int; and {"gain": "loud"}, {"gain": null} and {"gain": [1]} all
+        reached float(). All eight were reproduced against the real serve()
+        loop over a real AF_UNIX socket: no reply, process dead, every later
+        connect ECONNREFUSED. With Restart=always/RestartSec=30 each kill
+        re-entered the 22 s CUDA-graph capture and its ~18.3 GB transient, and
+        three of them left the unit failed until someone ran
+        `systemctl --user reset-failed`.
+
+        scripts/f5_server.py -- the file this is modelled on -- opens its try
+        BEFORE the first req.get() and answers all of these with
+        {"ok": false}. This is that, plus a net in serve() underneath.
+        """
         try:
-            conn.settimeout(CONN_TIMEOUT_S)
+            conn.settimeout(READ_TIMEOUT_S)
         except (AttributeError, OSError):
             pass
         try:
@@ -358,6 +433,24 @@ class BreezeService:
             return
         if req is None:
             return
+        try:
+            self._dispatch(conn, req)
+        except Exception as exc:
+            # _serve_stream and _serve_file swallow their own failures (the
+            # streaming one MUST: half a sentence is already in the room and
+            # no JSON line can follow raw PCM), so anything arriving here came
+            # from the type checks below, before a byte of audio -- where a
+            # refusal line is still exactly the right answer.
+            traceback.print_exc()
+            _send_json(conn, {"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+
+    def _dispatch(self, conn, req) -> None:
+        """Route one parsed request. Every field is type-checked before it is
+        used, because json.loads returns whatever the peer sent."""
+        if not isinstance(req, dict):
+            _send_json(conn, {"ok": False,
+                              "error": "request must be a JSON object"})
+            return
         if req.get("ping"):
             _send_json(conn, self.ping())
             return
@@ -367,15 +460,34 @@ class BreezeService:
         if not self.ready:
             _send_json(conn, self._not_ready())
             return
-        text = (req.get("text") or "").strip()
-        if not text:
+        text = req.get("text")
+        if not isinstance(text, str) or not text.strip():
             _send_json(conn, {"ok": False, "error": "no text"})
             return
-        gain = float(req.get("gain", 1.0))
-        if req.get("stream"):
-            self._serve_stream(conn, text, gain, req.get("id"))
-        else:
-            self._serve_file(conn, text, req.get("out"), gain)
+        gain = req.get("gain", 1.0)
+        # bool first: it is an int subclass, and {"gain": true} is a mistake,
+        # not a request to render at unity.
+        if isinstance(gain, bool) or not isinstance(gain, (int, float)):
+            _send_json(conn, {"ok": False, "error": "gain must be a number"})
+            return
+        # Past here the connection generates and sends for as long as the
+        # model takes, so the short read deadline is replaced by the send one.
+        try:
+            conn.settimeout(SEND_TIMEOUT_S)
+        except (AttributeError, OSError):
+            pass
+        # ONE generation at a time on the one resident model. A ping or a
+        # receipt query never reaches this, which is the point: measured
+        # before the split, a 6 s in-flight render made Jarvis's
+        # _ensure_breeze_server cost 6.0 s on the speak path because its ping
+        # was stuck behind the render in the accept queue.
+        with self._render_lock:
+            if req.get("stream"):
+                self._serve_stream(conn, text.strip(), float(gain),
+                                   req.get("id"))
+            else:
+                self._serve_file(conn, text.strip(), req.get("out"),
+                                 float(gain))
 
     # -------------------------------------------------------------- modes
     def _serve_stream(self, conn, text: str, gain: float,
@@ -438,7 +550,11 @@ class BreezeService:
             conn.shutdown(socket.SHUT_WR)            # end of audio
 
     def _serve_file(self, conn, text: str, out, gain: float) -> None:
-        if not out:
+        # isinstance, not just truthiness: wave.open(str(out)) turned
+        # {"out": 5} into {"ok": true} plus a file literally named `5` in the
+        # server's cwd -- which load_engine has chdir'd to the Breeze source
+        # tree. A wrong-typed path is a refusal, not a stray file.
+        if not isinstance(out, str) or not out:
             _send_json(conn, {"ok": False, "error": "no out path"})
             return
         started = time.perf_counter()
@@ -457,7 +573,7 @@ class BreezeService:
             pcm = b"".join(parts)
             if not pcm:
                 raise RuntimeError("breeze produced no audio")
-            with wave.open(str(out), "wb") as fh:
+            with wave.open(out, "wb") as fh:
                 fh.setnchannels(1)
                 fh.setsampwidth(2)
                 fh.setframerate(self.sample_rate)
@@ -641,24 +757,140 @@ def load_engine(args):
     except Exception as exc:
         traceback.print_exc()
         return None, graphs, f"warm render failed: {type(exc).__name__}: {exc}", config
+
+    # WHAT THIS THING ACTUALLY COSTS, on one line in journalctl, after the
+    # warm renders rather than before them -- the KV caches and codec buffers
+    # are allocated by those, so the print inside the capture block above
+    # describes a smaller program. Every other comment in this build quotes
+    # 13.5 GB and 18.3 GB from render_q.py's external MemFree deltas, not from
+    # this server; MEASUREMENTS.json's own peak_gpu_alloc_gb for this exact Q4
+    # config is 6.322. This is the number that settles it.
+    #
+    # empty_cache() first, and not only for the print: on GB10 the GPU memory
+    # IS the system memory, and torch's caching allocator never returns
+    # reserved-but-free blocks to the OS on its own -- so whatever the 22 s
+    # graph capture left reserved would stay charged against MemFree, and
+    # against every other tenant, for the life of the process.
+    torch.cuda.empty_cache()
+    print(f"breeze: resident free={free_mem_gb():.1f}GB "
+          f"alloc={torch.cuda.memory_allocated() / 1024 ** 3:.2f}GB "
+          f"reserved={torch.cuda.memory_reserved() / 1024 ** 3:.2f}GB "
+          f"peak={torch.cuda.max_memory_allocated() / 1024 ** 3:.2f}GB",
+          flush=True)
     return render, graphs, None, config
 
 
 # ------------------------------------------------------------------- serve
-def serve(sock_path, service: BreezeService) -> None:
+def socket_owner(sock_path, timeout: float = 2.0):
+    """The ping reply from a sidecar ALREADY listening on ``sock_path``; ``{}``
+    when one is listening but did not answer; ``None`` when nothing is there.
+
+    connect() on AF_UNIX succeeds only against a bound, listening socket, so
+    this separates a live owner from the stale socket FILE that a wiped /tmp
+    and an unclean exit leave behind -- and that distinction is the whole
+    point. serve() used to unlink and rebind unconditionally, so a second
+    instance silently stole the socket and left the first one alive, resident
+    and unreachable: no pidfile, and no way to find it that this box's rules
+    permit (matching a process by cmdline text is what caused five self-kills).
+    The GPU flock is no defence, because main() releases it at the end of
+    load_engine -- so the second instance takes it freely and loads a second
+    copy of a 13.5 GB model before it ever reaches the bind.
+    """
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(str(sock_path))
+    except OSError:
+        return None                      # ENOENT or ECONNREFUSED: nobody home
+    try:
+        sock.sendall(b'{"ping": true}\n')
+        buf = b""
+        while not buf.endswith(b"\n"):
+            part = sock.recv(65536)
+            if not part:
+                break
+            buf += part
+        return json.loads(buf.decode("utf-8") or "{}")
+    except Exception:
+        return {}                        # listening but wedged -- still not ours
+    finally:
+        with contextlib.suppress(OSError):
+            sock.close()
+
+
+def _refuse_second_instance(sock_path, where: str) -> bool:
+    """True (and says why) when a live sidecar already owns ``sock_path``."""
+    owner = socket_owner(sock_path)
+    if owner is None:
+        return False
+    print(f"breeze: REFUSING to {where} -- a live sidecar already answers on "
+          f"{sock_path} ({owner or 'it did not answer a ping'}). Two instances "
+          f"mean two resident copies of a 13.5 GB model and an orphan that "
+          f"nothing on this box may go looking for. Stop that one first: "
+          f"systemctl --user status jarvis-breeze.service", file=sys.stderr,
+          flush=True)
+    return True
+
+
+def _serve_conn(service: BreezeService, conn, live: threading.Semaphore) -> None:
+    """One connection, on its own thread -- the last net under handle().
+
+    handle() is supposed to swallow everything; before it did, a malformed
+    request line propagated through the bare accept loop and out of main(),
+    taking the resident model with it. This catch means no future handler bug
+    can do that again.
+    """
+    try:
+        service.handle(conn)
+    except Exception:
+        traceback.print_exc()
+    finally:
+        with contextlib.suppress(OSError):
+            conn.close()
+        live.release()
+
+
+def serve(sock_path, service: BreezeService) -> int:
+    """Accept forever, one THREAD per connection.
+
+    Thread-per-connection rather than the accept-then-handle loop this started
+    as, for two measured reasons. A ping or a completion receipt used to queue
+    behind an in-flight render -- a 6 s render made Jarvis's
+    _ensure_breeze_server cost 6.0 s on the speak path -- and a peer that
+    connected and never finished its request line wedged the entire sidecar
+    for the connection deadline. Generation itself is still serialised, by
+    BreezeService._render_lock, because there is only one resident model.
+    """
+    if _refuse_second_instance(sock_path, "bind"):
+        return 2
     with contextlib.suppress(FileNotFoundError):
         os.unlink(sock_path)
     Path(sock_path).parent.mkdir(parents=True, exist_ok=True)
     srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     srv.bind(str(sock_path))
     os.chmod(sock_path, 0o600)
-    srv.listen(4)
+    srv.listen(MAX_CONNECTIONS)
     print(f"breeze: listening on {sock_path} (ready={service.ready})", flush=True)
+    live = threading.Semaphore(MAX_CONNECTIONS)
     while True:
-        conn, _ = srv.accept()
         try:
-            service.handle(conn)
-        finally:
+            conn, _ = srv.accept()
+        except OSError:
+            traceback.print_exc()
+            print("breeze: the listening socket is gone", file=sys.stderr,
+                  flush=True)
+            return 1
+        if not live.acquire(blocking=False):
+            _send_json(conn, {"ok": False, "error": "too many connections"})
+            with contextlib.suppress(OSError):
+                conn.close()
+            continue
+        try:
+            threading.Thread(target=_serve_conn, args=(service, conn, live),
+                             daemon=True, name="breeze-conn").start()
+        except RuntimeError:                 # out of threads: do not leak the slot
+            traceback.print_exc()
+            live.release()
             with contextlib.suppress(OSError):
                 conn.close()
 
@@ -692,6 +924,12 @@ def main(argv=None) -> int:
             print(f"breeze: cannot start, missing {path}", file=sys.stderr)
             return 2
 
+    # Before the load, not merely before the bind: main() releases the GPU
+    # flock at the end of load_engine, so a second instance takes it freely
+    # and pays for a whole second resident model before serve() would notice.
+    if _refuse_second_instance(args.socket, "start"):
+        return 2
+
     render = graphs = error = config = None
     # The lock covers load AND capture AND both warm renders; only the
     # serving loop runs outside it.
@@ -708,6 +946,14 @@ def main(argv=None) -> int:
             return 2
         print(f"breeze: MemFree {free:.1f}GB MemAvailable {avail:.1f}GB at start",
               flush=True)
+        # Again, now that the lock is ours. The check above can pass while the
+        # other instance is still LOADING -- it holds this flock and has not
+        # bound its socket yet -- and without this we would wait out its whole
+        # ~30 s start and then load a second 13.5 GB copy before serve()
+        # noticed. serve() still checks once more, for the milliseconds
+        # between its release of this lock and its bind.
+        if _refuse_second_instance(args.socket, "start"):
+            return 2
         render, graphs, error, config = load_engine(args)
 
     service = BreezeService(render=render, sample_rate=SAMPLE_RATE,
@@ -715,8 +961,7 @@ def main(argv=None) -> int:
                             error=error, config=config)
     if not service.ready:
         print(f"breeze: NOT READY -- {error}", file=sys.stderr, flush=True)
-    serve(args.socket, service)
-    return 0
+    return serve(args.socket, service)
 
 
 if __name__ == "__main__":
