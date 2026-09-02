@@ -597,6 +597,13 @@ class MainWindow:
         self._gpu_util_pct: Optional[int] = None
         self._room_state_gpu_kw: Optional[bool] = None   # asked once, by signature
         self._standby_origin = None      # window position before it drifts
+        # …and the burn-in offset currently ON the window, i.e. the last
+        # (dx, dy) _on_console_drift actually applied. Not recomputed from
+        # console_mode at read time on purpose: that would be the offset for
+        # NOW, while the window is still holding the one from the last 1 Hz
+        # tick. What re-anchoring a drag needs is the displacement that is
+        # really baked into the geometry, and only the mover knows that.
+        self._standby_drift = (0, 0)
         self._footer_hidden = False
         self._term_available = terminal_available()
         self._session_seen = False       # a jarvis-* tmux session is alive
@@ -761,7 +768,21 @@ class MainWindow:
             return
         self._geom_ts = now
         dx, dy = self._drag_off
-        self.root.geometry(f"+{event.x_root - dx}+{event.y_root - dy}")
+        x, y = event.x_root - dx, event.y_root - dy
+        self.root.geometry(f"+{x}+{y}")
+        # Re-anchor the burn-in walk (2026-09-02: "if jarvis is in standby
+        # mode and i try and drag him he jumps back to where he was being
+        # dragged from"). Every drift tick sets origin + offset from
+        # scratch, so a drag that moved the window without moving the origin
+        # was undone one second later. The new origin is where he dropped it
+        # MINUS the drift already on the window — anchoring to the raw
+        # position would make the next tick jump by the whole accumulated
+        # offset instead. This is the only user-move path; _move_to is ours
+        # and must not re-anchor, which is why the signal is taken from the
+        # drag handler rather than from a <Configure> binding.
+        if self._standby_origin is not None:
+            drift_x, drift_y = self._standby_drift
+            self._standby_origin = (x - drift_x, y - drift_y)
 
     def _build_grip(self):
         g = px(18)
@@ -1467,11 +1488,19 @@ class MainWindow:
                 try:
                     self._standby_origin = (self.root.winfo_x(),
                                             self.root.winfo_y())
+                    self._standby_drift = (0, 0)   # nothing applied yet
                 except tk.TclError:
                     self._standby_origin = None
         elif self._standby_origin is not None:
-            self._move_to(*self._standby_origin)      # undo the burn-in walk
+            # Undo the burn-in walk — and ONLY the walk. A drag during
+            # standby moved the origin with it (_move_drag), so what comes
+            # off here is the drift this program applied and never the
+            # reposition he applied. _on_close saves root.geometry() after
+            # modes.stop() has come through here, so his standby drag
+            # persists exactly the way an active-mode drag does.
+            self._move_to(*self._standby_origin)
             self._standby_origin = None
+            self._standby_drift = (0, 0)
 
     def _set_footer_hidden(self, hidden: bool):
         """Standby hides the command bar and the status strip so the panel
@@ -1502,6 +1531,10 @@ class MainWindow:
         its decor, which is baked at fixed coordinates."""
         if self._standby_origin is None:
             return
+        # Recorded BEFORE the move: _move_drag re-anchors against it, and a
+        # drag that arrives between two ticks must subtract the offset the
+        # window is actually wearing.
+        self._standby_drift = (dx, dy)
         self._move_to(self._standby_origin[0] + dx,
                       self._standby_origin[1] + dy)
 
