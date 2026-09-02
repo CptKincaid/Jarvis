@@ -756,7 +756,8 @@ dictation. Speaker verification still gates the mic.
   "what about tomorrow?" follows a calendar question.
 - **Interrupt him** — say the wake word while he is talking ("Jarvis, stop"). `barge_in`
   keeps the wake word live during speech; his own voice cannot wake him (the speaker gate
-  scores it at −0.03..−0.06). Echo cancellation: `scripts/audio/aec-install.sh`.
+  scores it at −0.03..−0.06). Echo cancellation is packaged but not enabled or measured —
+  `docs/echo-cancellation.md` before `scripts/audio/aec-install.sh`.
 - **"Say that again, sir?"** — a garbled transcription (confidence gate) is asked again
   instead of being routed.
 - **First-wake briefing** — after the first thing you say each day past `briefing.after`
