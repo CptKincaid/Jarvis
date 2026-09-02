@@ -14,7 +14,10 @@
 #
 # Idempotent: an identical conf with the AEC nodes already present is a
 # no-op (a needless filter-chain restart would yank jarvis_aec_source out
-# from under a running Jarvis).  Reversible with aec-uninstall.sh.
+# from under a running Jarvis).  Refuses without the Snowball: WirePlumber
+# destroys a dont-reconnect capture whose target is absent and the module
+# goes down with it, so that install could only roll itself back.
+# Reversible with aec-uninstall.sh.
 #
 # Usage: aec-install.sh [--default-source]
 set -eu
@@ -68,9 +71,18 @@ fi
 
 have_node() { pactl list short "$1" 2>/dev/null | awk '{print $2}' | grep -qx "$2"; }
 
+# node.dont-reconnect does NOT make the capture wait for the Snowball.
+# WirePlumber 0.4.17 (policy-node.lua, "... target not found") destroys a
+# dont-reconnect stream whose target.object is absent, and module-echo-cancel
+# then destroys the whole module -- all four nodes -- on "capture
+# unconnected".  So with the mic missing the install can only end in the
+# rollback below; stop here, before anything on the box has changed.
 if ! have_node sources "$MIC"; then
-    echo "warning: $MIC is not in the source roster; the canceller will have" >&2
-    echo "  no mic until it appears (node.dont-reconnect keeps it waiting)." >&2
+    echo "refusing: $MIC is not in the source roster." >&2
+    echo "  WirePlumber destroys a dont-reconnect capture whose target is absent," >&2
+    echo "  and module-echo-cancel takes all its nodes down with it, so this conf" >&2
+    echo "  cannot come up without the Snowball. Plug it in and re-run." >&2
+    exit 1
 fi
 
 if [ -f "$DEST" ] && cmp -s "$SRC" "$DEST" && have_node sources "$SOURCE_NODE" && have_node sinks "$SINK_NODE"; then
@@ -120,8 +132,21 @@ if [ "$SET_DEFAULT" = 1 ]; then
     # name" entry pins an index and the switch above never reaches Jarvis.
     echo "  (this reaches Jarvis only while voice_settings.json has \"mic\": \"Default\")"
 else
-    echo "default source left as $(pactl get-default-source 2>/dev/null || echo '?');"
-    echo "  re-run with --default-source to route Jarvis's mic through the canceller"
+    CUR="$(pactl get-default-source 2>/dev/null || true)"
+    if [ "$CUR" = "$SOURCE_NODE" ]; then
+        # WirePlumber keeps the configured defaults as a most-recent-first
+        # stack (default.configured.audio.source.N in
+        # ~/.local/state/wireplumber/default-nodes) and re-applies a stacked
+        # node the moment it reappears.  An earlier --default-source that was
+        # not undone with aec-uninstall.sh has just routed Jarvis unasked;
+        # say so rather than advise a flag that would change nothing.
+        echo "default source is already $SOURCE_NODE: WirePlumber remembered an earlier"
+        echo "  --default-source, so Jarvis IS routed through the canceller once restarted."
+        echo "  (pactl set-default-source $MIC puts the Snowball back; so does aec-uninstall.sh)"
+    else
+        echo "default source left as ${CUR:-?};"
+        echo "  re-run with --default-source to route Jarvis's mic through the canceller"
+    fi
 fi
 echo "then: set playback_device to $SINK_NODE in ~/.aiws_trainer/voice_settings.json,"
 echo "  systemctl --user restart jarvis-spotify (it picks the sink up at start),"

@@ -13,6 +13,7 @@ anything: spa-json-dump parses a file, bash -n parses a script.
 """
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -30,6 +31,10 @@ MEASURE = AUDIO / "aec_measure.py"
 DOC = REPO / "docs" / "echo-cancellation.md"
 
 SNOWBALL = "alsa_input.usb-BLUE_MICROPHONE_Blue_Snowball_201506-00.analog-stereo"
+HDMI_MON = "alsa_output.platform-NVDA2014_00.hdmi-stereo.monitor"
+SOUNDBAR = "bluez_output.F4_4E_FC_95_BA_CB.1"
+AEC_SOURCE = "jarvis_aec_source"
+AEC_SINK = "jarvis_aec_sink"
 
 
 def _measure():
@@ -152,6 +157,222 @@ def test_scripts_never_play_audio():
             assert player not in body, f"{path.name} runs {player}"
 
 
+# ------------------------------------------------ the scripts, actually run
+
+_FAKE_PACTL = r"""#!/usr/bin/env bash
+# Stub pactl: rosters and the default source live in $FAKEBOX; every call is
+# logged.  Anything the scripts do not need is an error, so a new pactl verb
+# in a script shows up here instead of reaching the real server.
+echo "pactl $*" >> "$FAKEBOX/calls"
+case "$1 $2 $3" in
+    "list short sources") cat "$FAKEBOX/sources" ;;
+    "list short sinks")   cat "$FAKEBOX/sinks" ;;
+    "get-default-source"*) cat "$FAKEBOX/default-source" ;;
+    "set-default-source"*) printf '%s\n' "$2" > "$FAKEBOX/default-source" ;;
+    *) echo "fake pactl: unexpected: $*" >&2; exit 99 ;;
+esac
+"""
+
+_FAKE_SYSTEMCTL = r"""#!/usr/bin/env bash
+# Stub systemctl: a filter-chain restart swaps in the post-reload rosters the
+# test staged (*.after), which is all a reload does that the scripts can see.
+echo "systemctl $*" >> "$FAKEBOX/calls"
+case "$*" in
+    "--user is-enabled --quiet filter-chain") exit 0 ;;
+    "--user restart filter-chain")
+        for f in sources sinks default-source; do
+            [ -f "$FAKEBOX/$f.after" ] && cp "$FAKEBOX/$f.after" "$FAKEBOX/$f"
+        done
+        exit 0 ;;
+    *) echo "fake systemctl: unexpected: $*" >&2; exit 99 ;;
+esac
+"""
+
+
+class FakeBox:
+    """Runs aec-install.sh / aec-uninstall.sh for real, against stub pactl,
+    systemctl and sleep on PATH and a HOME under tmp_path.  Those three are the
+    scripts' entire hardware boundary, so the real PipeWire is never consulted
+    or changed and the conf lands under tmp_path.  A test stages the rosters
+    the stubs answer with (and what they become after the filter-chain
+    reload), runs a script, and reads back `calls`."""
+
+    def __init__(self, tmp_path: Path):
+        self.home = tmp_path / "home"
+        self.box = tmp_path / "fakebox"
+        self.bin = tmp_path / "bin"
+        for d in (self.home, self.box, self.bin):
+            d.mkdir()
+        for name, body in (("pactl", _FAKE_PACTL), ("systemctl", _FAKE_SYSTEMCTL),
+                           ("sleep", "#!/usr/bin/env bash\nexit 0\n")):  # the 10 s wait, instantly
+            f = self.bin / name
+            f.write_text(body)
+            f.chmod(0o755)
+        self.dest = self.home / ".config" / "pipewire" / "filter-chain.conf.d" / CONF.name
+        self.sources()
+        self.sinks(SOUNDBAR)
+        self.default_source(SNOWBALL)
+
+    @staticmethod
+    def _roster(names):
+        # `pactl list short` shape: id, name, driver, format, state.
+        return "".join(f"{50 + i}\t{n}\tPipeWire\ts16le 2ch 48000Hz\tIDLE\n"
+                       for i, n in enumerate(names))
+
+    def sources(self, *names, after=None):
+        (self.box / "sources").write_text(self._roster(names))
+        if after is not None:
+            (self.box / "sources.after").write_text(self._roster(after))
+
+    def sinks(self, *names, after=None):
+        (self.box / "sinks").write_text(self._roster(names))
+        if after is not None:
+            (self.box / "sinks.after").write_text(self._roster(after))
+
+    def default_source(self, name, after=None):
+        (self.box / "default-source").write_text(name + "\n")
+        if after is not None:
+            (self.box / "default-source.after").write_text(after + "\n")
+
+    def preinstall(self):
+        """The conf already installed, as after a successful aec-install.sh."""
+        self.dest.parent.mkdir(parents=True)
+        shutil.copy(CONF, self.dest)
+
+    @property
+    def calls(self) -> list[str]:
+        f = self.box / "calls"
+        return f.read_text().splitlines() if f.exists() else []
+
+    def run(self, script: Path, *args: str) -> subprocess.CompletedProcess:
+        env = dict(os.environ, PATH=f"{self.bin}:{os.environ['PATH']}",
+                   HOME=str(self.home), XDG_CONFIG_HOME=str(self.home / ".config"),
+                   FAKEBOX=str(self.box))
+        return subprocess.run([str(script), *args], capture_output=True, text=True,
+                              env=env, timeout=60)
+
+
+@pytest.fixture
+def fakebox(tmp_path):
+    return FakeBox(tmp_path)
+
+
+def test_install_brings_the_nodes_up_and_leaves_the_default_source_alone(fakebox):
+    fakebox.sources(SNOWBALL, HDMI_MON, after=[SNOWBALL, HDMI_MON, AEC_SOURCE])
+    fakebox.sinks(SOUNDBAR, after=[SOUNDBAR, AEC_SINK])
+    r = fakebox.run(INSTALL)
+    assert r.returncode == 0, r.stderr
+    assert fakebox.dest.read_bytes() == CONF.read_bytes()
+    assert "systemctl --user restart filter-chain" in fakebox.calls
+    assert not any("set-default-source" in c for c in fakebox.calls)
+    assert f"up: source {AEC_SOURCE}, sink {AEC_SINK}" in r.stdout
+    # Second run: identical conf, nodes present -> nothing restarted again.
+    before = len(fakebox.calls)
+    r = fakebox.run(INSTALL)
+    assert r.returncode == 0, r.stderr
+    assert "already installed" in r.stdout
+    assert not any("systemctl" in c for c in fakebox.calls[before:])
+
+
+def test_install_default_source_flag_routes_jarvis(fakebox):
+    fakebox.sources(SNOWBALL, after=[SNOWBALL, AEC_SOURCE])
+    fakebox.sinks(SOUNDBAR, after=[SOUNDBAR, AEC_SINK])
+    r = fakebox.run(INSTALL, "--default-source")
+    assert r.returncode == 0, r.stderr
+    assert f"pactl set-default-source {AEC_SOURCE}" in fakebox.calls
+    assert f"{SNOWBALL} -> {AEC_SOURCE}" in r.stdout
+
+
+def test_install_backs_the_conf_out_when_the_nodes_never_appear(fakebox):
+    # A conf module-echo-cancel rejects: the reload changes nothing.
+    fakebox.sources(SNOWBALL, after=[SNOWBALL])
+    fakebox.sinks(SOUNDBAR, after=[SOUNDBAR])
+    r = fakebox.run(INSTALL)
+    assert r.returncode == 1
+    assert not fakebox.dest.exists()
+    assert fakebox.calls.count("systemctl --user restart filter-chain") == 2
+    assert "did not appear" in r.stderr
+
+
+def test_install_refuses_without_the_snowball(fakebox):
+    """WirePlumber 0.4.17 destroys a dont-reconnect stream whose target is
+    absent (policy-node.lua: `... target not found` -> `node:request_destroy()`
+    -- the `waiting reconnect` branch is the one dont-reconnect opts out of),
+    and module-echo-cancel then destroys itself on `capture unconnected`.  An
+    install with the Snowball missing therefore cannot come up; the installer
+    must stop before touching the box, not warn and roll back 10 s later."""
+    fakebox.sources(HDMI_MON)
+    r = fakebox.run(INSTALL)
+    assert r.returncode == 1
+    assert "refusing" in r.stderr and "destroy" in r.stderr
+    assert not fakebox.dest.exists()
+    assert not any(c.startswith("systemctl") for c in fakebox.calls)
+
+
+def test_install_says_so_when_wireplumber_restores_the_canceller_as_default(fakebox):
+    """No --default-source, yet after the reload the default IS the canceller:
+    WirePlumber re-applied a remembered `default.configured.audio.source` from
+    an earlier --default-source.  The closing message must report the routing
+    that is in force, not advise re-running with a flag that changes nothing."""
+    fakebox.sources(SNOWBALL, after=[SNOWBALL, AEC_SOURCE])
+    fakebox.sinks(SOUNDBAR, after=[SOUNDBAR, AEC_SINK])
+    fakebox.default_source(SNOWBALL, after=AEC_SOURCE)
+    r = fakebox.run(INSTALL)
+    assert r.returncode == 0, r.stderr
+    assert not any("set-default-source" in c for c in fakebox.calls)
+    assert f"default source is already {AEC_SOURCE}" in r.stdout
+    assert "re-run with --default-source" not in r.stdout
+
+
+def test_uninstall_removes_the_conf_and_repins_the_snowball(fakebox):
+    fakebox.preinstall()
+    fakebox.sources(SNOWBALL, AEC_SOURCE, after=[SNOWBALL])
+    fakebox.default_source(AEC_SOURCE, after=SNOWBALL)
+    r = fakebox.run(UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert not fakebox.dest.exists()
+    assert "systemctl --user restart filter-chain" in fakebox.calls
+    assert f"pactl set-default-source {SNOWBALL}" in fakebox.calls
+
+
+def test_uninstall_repins_the_snowball_even_when_it_already_reads_as_default(fakebox):
+    """`pactl get-default-source` reports WirePlumber's EFFECTIVE default;
+    `pactl set-default-source` writes the CONFIGURED one, which WirePlumber
+    0.4.17 keeps as a most-recent-first stack
+    (~/.local/state/wireplumber/default-nodes, default.configured.audio.source.N)
+    and re-applies the moment a stacked node reappears.  After
+    --default-source, removing the canceller makes the effective default fall
+    back to the Snowball while jarvis_aec_source stays on top of the stack, so
+    the next plain install would flip Jarvis onto the canceller unasked.  The
+    uninstaller must write the Snowball even when it already reads as the
+    default -- that is what puts it back on top."""
+    fakebox.sources(SNOWBALL)          # canceller already gone, nothing installed
+    fakebox.default_source(SNOWBALL)
+    r = fakebox.run(UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert f"pactl set-default-source {SNOWBALL}" in fakebox.calls
+
+
+def test_uninstall_leaves_someone_elses_default_alone(fakebox):
+    # WirePlumber parked the default on the HDMI monitor: not the canceller's
+    # doing, not ours to move.
+    fakebox.sources(SNOWBALL, HDMI_MON)
+    fakebox.default_source(HDMI_MON)
+    r = fakebox.run(UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert not any("set-default-source" in c for c in fakebox.calls)
+    assert "not ours to move" in r.stdout
+
+
+def test_uninstall_will_not_pin_a_snowball_that_is_unplugged(fakebox):
+    fakebox.sources(HDMI_MON)
+    fakebox.default_source(HDMI_MON)
+    r = fakebox.run(UNINSTALL)
+    assert r.returncode == 0, r.stderr
+    assert not any("set-default-source" in c for c in fakebox.calls)
+    assert "Snowball not in the source roster" in r.stderr
+
+
 # ------------------------------------------------------------- aec_measure.py
 
 def test_measure_help_runs_without_touching_audio():
@@ -250,3 +471,11 @@ def test_doc_states_the_measured_facts_and_the_limits():
     # says mic "Default"; a pinned "[N] name" mic would silently bypass the
     # canceller, so the doc has to say so next to the switch.
     assert '`"Default"`' in text
+    # The two ways the canceller silently stops applying, both found by review
+    # on 2026-09-01: WirePlumber destroying the dont-reconnect capture when the
+    # Snowball is gone (and the module with it), and the configured-default
+    # stack re-applying jarvis_aec_source after an uninstall that did not
+    # re-pin.  Each needs the mechanism named and a recovery line.
+    assert "request_destroy" in text and "capture unconnected" in text
+    assert "default.configured.audio.source" in text
+    assert "systemctl --user restart filter-chain" in text

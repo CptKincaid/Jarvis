@@ -6,7 +6,7 @@
 # Mirror of aec-install.sh with the same rule: only the filter-chain unit
 # is restarted, never pipewire/pipewire-pulse/wireplumber (a pipewire
 # restart drops the Bluetooth soundbar).  Idempotent -- run it twice and the
-# second run says there was nothing to do.  A legacy conf in
+# second run removes nothing and re-pins the same Snowball.  A legacy conf in
 # pipewire.conf.d (the old design) is reported, not removed: deleting the
 # file does not unload a module the pipewire daemon already holds, so that
 # is a decision for a person with the soundbar in mind.
@@ -54,12 +54,22 @@ fi
 
 # WirePlumber picks SOME source when the default vanishes, not necessarily
 # the Snowball -- the HDMI monitor is a candidate on this box.  Only move the
-# default when it points at the canceller (or at nothing that exists), and
-# only onto a Snowball that is really there.
+# default when it points at the canceller, at nothing that exists, or at the
+# Snowball itself, and only onto a Snowball that is really there.
+#
+# The Snowball case is NOT a no-op.  `pactl get-default-source` reports the
+# EFFECTIVE default; `pactl set-default-source` writes the CONFIGURED one,
+# which WirePlumber 0.4.17 keeps as a most-recent-first stack
+# (default.configured.audio.source.N in ~/.local/state/wireplumber/
+# default-nodes) and re-applies the moment a stacked node reappears.  Right
+# after the canceller vanishes the effective default has fallen back to the
+# Snowball while jarvis_aec_source still sits on top of that stack, and the
+# next plain aec-install.sh would flip Jarvis onto the canceller unasked.
+# Writing the Snowball is what puts it back on top.
 CUR="$(pactl get-default-source 2>/dev/null || true)"
 if [ -n "$MIC" ] && have_node sources "$MIC"; then
     if [ "$CUR" = "$MIC" ]; then
-        echo "default source already $MIC"
+        pactl set-default-source "$MIC" && echo "default source $MIC re-pinned (configured stack, not just the effective default)"
     elif [ "$CUR" = "$SOURCE_NODE" ] || [ -z "$CUR" ] || ! have_node sources "$CUR"; then
         pactl set-default-source "$MIC" && echo "default source: ${CUR:-none} -> $MIC"
     else

@@ -70,10 +70,32 @@ paplay / pacat ──► jarvis_aec_sink ┘   └────► jarvis_aec_pla
 
 | node | role |
 | --- | --- |
-| `jarvis_aec_capture` | pinned to the Snowball (`target.object`, `node.dont-reconnect = true`) so it never follows the default source — which is about to become the canceller's own output |
+| `jarvis_aec_capture` | pinned to the Snowball (`target.object`, `node.dont-reconnect = true`) so it never follows the default source — which is about to become the canceller's own output. The pin has a failure mode of its own, below |
 | `jarvis_aec_source` | the cancelled mic; what Jarvis should capture from |
 | `jarvis_aec_sink` | the reference: anything played here is subtracted from the mic. `priority.session = 100` keeps it from ever becoming the default sink |
 | `jarvis_aec_playback` | forwards the sink's audio to the default output, so the soundbar still hears everything |
+
+**The pin's failure mode: an unplugged Snowball takes the whole canceller down, silently.**
+`node.dont-reconnect` does not make the capture *wait* for its target. WirePlumber 0.4.17's
+`policy-node.lua` handles a stream whose `target.object` is not in the graph by logging
+`... target not found, reconnect:false` and calling `node:request_destroy()` — the
+`... waiting reconnect` branch is the one `dont-reconnect` opts *out* of. The capture
+stream then goes unconnected, and `module-echo-cancel` answers `capture unconnected` with
+`pw_impl_module_schedule_destroy`: all four nodes vanish. Two consequences:
+
+- an install with the Snowball absent can only end in the installer's 10 s rollback, so
+  `aec-install.sh` refuses outright when the mic is not in the source roster;
+- once enabled, a USB drop/replug of the Snowball kills `jarvis_aec_source` and
+  `jarvis_aec_sink` **for good**: the `filter-chain` *process* stays up, so
+  `Restart=on-failure` never fires, WirePlumber falls the default source back to the raw
+  Snowball, and Jarvis is on the raw mic with nothing in his log saying so — until someone
+  runs `systemctl --user restart filter-chain` (section 7). That is the "setting that
+  silently stopped applying" trap, and section 8 says what has to exist before this goes
+  live. The same mechanism is a plausible login-time race, untested: `filter-chain.service`
+  is ordered `After=pipewire-session-manager.service`, but WirePlumber enumerates the USB
+  Snowball asynchronously, so a capture handled before that node exists is destroyed the
+  same way. Until that is observed either way, `pactl list short sources | grep jarvis_aec`
+  after each login is the check.
 
 Who has to play into `jarvis_aec_sink` for it to be a reference:
 
@@ -113,7 +135,16 @@ pactl list short sinks   | grep jarvis_aec    # jarvis_aec_sink present, NOT the
 pactl get-default-sink                        # still the soundbar
 ```
 
-That alone changes nothing Jarvis hears. To route him through the canceller:
+That alone changes nothing Jarvis hears — *provided* the configured default source is
+not already the canceller. `pactl get-default-source` shows WirePlumber's **effective**
+default, but `pactl set-default-source` writes the **configured** one, and WirePlumber
+0.4.17 keeps those as a most-recent-first stack (`default.configured.audio.source.N` in
+`~/.local/state/wireplumber/default-nodes`; `.1 = jarvis_aec_source` is already there from
+the 09-01 attempt) that it re-applies the moment a stacked node reappears. If an earlier
+`--default-source` was undone by anything other than `aec-uninstall.sh`, the plain install
+above brings the node back and WirePlumber flips the default onto it unasked; the
+installer checks for this and says `default source is already jarvis_aec_source` instead
+of advising the flag. To route him through the canceller on purpose:
 
 ```bash
 scripts/audio/aec-install.sh --default-source # default source -> jarvis_aec_source
@@ -123,9 +154,10 @@ systemctl --user restart jarvis-spotify       # librespot picks up --device=jarv
 ```
 
 The installer is idempotent (identical conf + nodes present = no restart), refuses to
-run beside a legacy `pipewire.conf.d/99-jarvis-echo-cancel.conf`, and backs the conf out
-again if the AEC nodes do not appear within 10 s (a rejected conf would otherwise leave
-`filter-chain` in its `Restart=on-failure` loop).
+run beside a legacy `pipewire.conf.d/99-jarvis-echo-cancel.conf`, refuses when the
+Snowball is not in the source roster (the conf cannot come up without it — section 3),
+and backs the conf out again if the AEC nodes do not appear within 10 s (a rejected conf
+would otherwise leave `filter-chain` in its `Restart=on-failure` loop).
 
 ## 5. Measure — the step that has not been done
 
@@ -187,11 +219,39 @@ systemctl --user restart jarvis-spotify
 # restart Jarvis
 ```
 
-The uninstaller only moves the default source when it points at the canceller or at a
-node that no longer exists, and only onto a Snowball that is really in the roster —
-WirePlumber may have parked the default on the HDMI monitor in between.
+The uninstaller moves the default source only onto a Snowball that is really in the
+roster, and only when the default points at the canceller, at a node that no longer
+exists, **or at the Snowball itself** — that last case is not a no-op: right after the
+canceller vanishes the effective default has already fallen back to the Snowball while
+`jarvis_aec_source` still sits on top of WirePlumber's configured stack (section 4), and
+re-writing the Snowball is what puts it back on top. A default WirePlumber parked on the
+HDMI monitor in between is left alone (not the canceller's doing, not ours to move).
 
-## 8. Known interaction to settle BEFORE enabling: the Room Mixer
+**Recovery, not revert — the Snowball was unplugged while the canceller was live** (the
+failure mode in section 3): the nodes are gone but the conf is still installed. With the
+mic back in the roster (`pactl list short sources | grep Snowball`):
+
+```bash
+systemctl --user restart filter-chain          # module-echo-cancel reloads; nodes return
+pactl get-default-source                       # jarvis_aec_source again, if --default-source had been run
+# restart Jarvis: his capture re-opened on the raw mic when the default fell back
+```
+
+## 8. Known interactions to settle BEFORE enabling
+
+### 8.1 Nothing in Jarvis's log says which source he is on
+
+Two independent paths put Jarvis on the raw Snowball with the canceller apparently
+running: a `[N] name` mic pin in `voice_settings.json` (section 3) and the mic-unplug
+failure mode (section 3, recovery in section 7). Neither produces a log line today. Before
+`--default-source` is run for real, the recorder or the wake gate needs one that names the
+capture source at open time and complains when the default source is not
+`jarvis_aec_source` while `~/.config/pipewire/filter-chain.conf.d/99-jarvis-echo-cancel.conf`
+is installed — the same shape as `voiceprint loaded: N samples`, which exists because a
+silently dead gate was worse than a loud one. Not done in this change (recorder.py is not
+this lane's file).
+
+### 8.2 The Room Mixer would duck Jarvis under his own voice
 
 `jarvis/mixer.py` ducks every sink-input that is not Jarvis's, and it knows Jarvis's
 streams **by PID** (`register_own_pid` plus descendants of the app). With the canceller
@@ -217,4 +277,4 @@ how a wiring gets lost.
 | `scripts/audio/aec-install.sh` | install + reload filter-chain; `--default-source` routes Jarvis |
 | `scripts/audio/aec-uninstall.sh` | remove + reload + Snowball back |
 | `scripts/audio/aec_measure.py` | `record` / `attenuation` / `lag`; records only, never plays |
-| `tests/test_aec_prep.py` | the conf parses (spa-json-dump) and says what section 3 says; the scripts never restart pipewire |
+| `tests/test_aec_prep.py` | the conf parses (spa-json-dump) and says what section 3 says; the scripts never restart pipewire; both scripts run for real against stub `pactl`/`systemctl` under a tmp HOME — refusal without the Snowball, rollback, the re-pin, the remembered-default message |
