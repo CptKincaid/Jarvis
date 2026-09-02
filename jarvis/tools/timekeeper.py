@@ -332,6 +332,47 @@ def _rel_words(seconds: float) -> str:
     return f"{h} hours and {r} minutes"
 
 
+def adjust_amount_words(delta_seconds) -> str:
+    """The magnitude of an adjustment as spoken: 'Ten minutes', 'Five
+    minutes', 'Thirty seconds', 'An hour', 'Ninety minutes'."""
+    s = abs(int(round(float(delta_seconds or 0))))
+    if s >= 3600 and s % 3600 == 0:
+        h = s // 3600
+        return "An hour" if h == 1 else f"{count_words(h).capitalize()} hours"
+    if s >= 60 and s % 60 == 0:
+        m = s // 60
+        return "A minute" if m == 1 else f"{count_words(m).capitalize()} minutes"
+    return "A second" if s == 1 else f"{count_words(s).capitalize()} seconds"
+
+
+def adjust_line(delta_seconds, described) -> str:
+    """The success line for an extend / shorten: the amount, then the item
+    with its NEW due, so he hears the new remaining time and not just an
+    acknowledgement -- 'Ten minutes added, sir: pack up the chicken in 20
+    minutes.' / 'Five minutes off, sir: the tea timer in 3 minutes.'
+    ``described`` is one or more _describe_item strings."""
+    parts = [described] if isinstance(described, str) else list(described)
+    verb = "added" if float(delta_seconds or 0) > 0 else "off"
+    return f"{adjust_amount_words(delta_seconds)} {verb}, sir: {join_and(parts)}."
+
+
+def nothing_to_adjust_line(kind, delta_seconds) -> str:
+    """Kind-aware 'nothing matched' for an extend / shorten, modelled on
+    list_text's empty wording: 'No timer to extend, sir.' / 'No reminders
+    to push back, sir.'"""
+    kind = normalize_kind(kind)
+    later = float(delta_seconds or 0) > 0
+    if kind == "timer":
+        return "No timer to extend, sir." if later else "No timer to shorten, sir."
+    if kind == "reminder":
+        return "No reminders to push back, sir." if later else \
+            "No reminders to bring forward, sir."
+    if kind == "alarm":
+        return "No alarm to push back, sir." if later else \
+            "No alarm to bring forward, sir."
+    return "Nothing to extend, sir." if later else "Nothing to shorten, sir."
+
+
 def describe_due(due, now=None) -> str:
     """'in 10 minutes' / 'at 3:00 pm' / 'at 7:00 am tomorrow' / 'at 9:00 am
     on Friday' / '10 minutes ago'."""
@@ -1414,13 +1455,18 @@ class Timekeeper:
             sentences.append(head + join_and(self._describe_item(i, now) for i in group) + ".")
         return " ".join(sentences)
 
-    # -------------------------------------------------------- cancelling
-    def cancel(self, which="last", kind: str = "all") -> int:
+    # ------------------------------------------------------- targeting
+    def _resolve(self, which="last", kind: str = "all") -> list[Item]:
+        """The live items ``which`` names, in ``kind``: "last"/"that"/"it"
+        (most recently created), "all", "next"/"first" (soonest), an exact
+        id, or label words ("the chicken timer" -> needle "chicken").
+        Shared by cancel and adjust so "extend that timer" and "cancel
+        that timer" always land on the same item."""
         which = str(which if which is not None else "last").strip()
         w = which.lower()
         items = self.list(kind)
         if not items:
-            return 0
+            return []
         if w in ("", "last", "latest", "the last one", "last one", "most recent",
                  "the latest", "that", "it", "that one", "this one"):
             targets = [max(items, key=lambda i: (i.created, i.seq))]
@@ -1439,6 +1485,11 @@ class Timekeeper:
             if not targets and needle:
                 words = set(needle.split())
                 targets = [i for i in items if words & set(i.label.lower().split())]
+        return targets
+
+    # -------------------------------------------------------- cancelling
+    def cancel(self, which="last", kind: str = "all") -> int:
+        targets = self._resolve(which, kind)
         effects = []
         with self._lock:
             for it in targets:
@@ -1451,6 +1502,71 @@ class Timekeeper:
         for fx in effects:
             fx()
         return len(targets)
+
+    # -------------------------------------------------------- adjusting
+    def adjust(self, which="last", kind: str = "all", delta_seconds=0.0) -> list[Item]:
+        """Move the due time of the items ``which`` names by ``delta_seconds``
+        (positive = later, negative = sooner). Returns the UPDATED items,
+        re-read from the store so a caller can describe the new due; []
+        when nothing matched or the delta is zero.
+
+        2026-09-01 20:41 -- "Extend that timer by 10 minutes." had no
+        home: the timekeeper could add, list, cancel and snooze, so the
+        model picked ``list`` and read the timer back instead of moving it.
+
+        Per item:
+          pending  -> due += delta. A repeating item shifts only this
+                      occurrence; ``repeat`` (the interval) is untouched.
+                      (An interval nudge walks from NOW when it fires, so
+                      later nudges are unaffected; a daily/weekdays alarm
+                      walks from ``due`` day by day, so its later wall-clock
+                      time follows this shift -- see next_repeat.)
+          snoozed  -> snooze_until += delta (the original due is kept).
+          ringing  -> a positive delta is "give me N more minutes": the same
+                      as snooze(delta / 60) for that item (ring killed,
+                      state snoozed, AlarmStopped(snooze) published). A
+                      negative delta on a ringing item is a no-op: it is
+                      already as early as it gets.
+        A due moved below now is clamped TO now, so it fires on the next
+        tick; the store never holds a due in the past by this route."""
+        try:
+            delta = float(delta_seconds or 0.0)
+        except (TypeError, ValueError):
+            return []
+        if delta == 0.0:
+            return []
+        targets = self._resolve(which, kind)
+        updated: list[Item] = []
+        effects = []
+        with self._lock:
+            now = float(self._now())
+            for it in targets:
+                if it.state == "ringing":
+                    if delta <= 0:
+                        continue
+                    if self._ring is not None and self._ring.item_id == it.id:
+                        self._kill_ring()
+                    new_due = now + delta
+                    self._update(it.id, state="snoozed", snooze_until=new_due)
+                    mins = int(round(delta / 60.0))
+                    effects.append(lambda it=it, mins=mins: bus.publish(
+                        AlarmStopped(alarm_id=it.id, action="snooze", snooze_min=mins)))
+                elif it.state == "snoozed" and it.snooze_until:
+                    new_due = max(now, float(it.snooze_until) + delta)
+                    self._update(it.id, snooze_until=new_due)
+                else:
+                    new_due = max(now, float(it.due) + delta)
+                    self._update(it.id, due=new_due)
+                log.info("timekeeper: %s %s %r by %d min -> %s",
+                         "extended" if delta > 0 else "shortened", it.kind, it.label,
+                         int(round(abs(delta) / 60.0)),
+                         datetime.fromtimestamp(new_due).strftime("%H:%M"))
+                fresh = self._get(it.id)
+                if fresh is not None:
+                    updated.append(fresh)
+        for fx in effects:
+            fx()
+        return updated
 
     # ------------------------------------------------------ ring control
     def _kill_ring(self):
@@ -1556,7 +1672,11 @@ class Timekeeper:
             if late:
                 line = LATE_LINE.format(label=item.spoken_label(), time=_when_words(due_dt, now_dt))
             elif item.label and not _AUTO_TIMER_LABEL.match(item.label):
-                line = TIMER_LABEL_LINE.format(n=n, label=item.label)
+                # duration is due - created; a timer shortened all the way
+                # to now (adjust clamps there) would read "your 0-second tea
+                # timer is up", so the length is dropped when it says nothing.
+                line = TIMER_LABEL_LINE.format(n=n, label=item.label) \
+                    if item.duration >= 1 else f"Sir, your {item.label} timer is up."
             else:
                 line = TIMER_LINE.format(n=n)
             text = f"{item.label or n + ' timer'}"
@@ -1981,9 +2101,39 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             a = "cancel"
         elif a in ("stop", "dismiss", "off", "silence", "quiet", "turn off", "shut up"):
             a = "stop"
-        elif a in ("snooze", "later", "postpone"):
+        elif a == "snooze":
             a = "snooze"
+        elif a in ("later", "postpone"):
+            # Both used to mean snooze outright, which answered "Nothing's
+            # ringing, sir." to "postpone the timer by ten minutes" said
+            # while it was still counting down. Snooze only when something
+            # IS ringing; otherwise it is a push-back of a pending item.
+            a = "snooze" if t.ringing is not None else "extend"
+        elif a in ("extend", "add", "more", "longer", "push back", "push", "delay",
+                   "defer", "prolong", "lengthen", "push_back", "pushback"):
+            a = "extend"
+        elif a in ("shorten", "reduce", "cut", "less", "shorter", "bring forward",
+                   "earlier", "sooner", "subtract", "take off", "bring_forward",
+                   "take_off", "takeoff"):
+            a = "shorten"
         kind = normalize_kind(kind)
+        if a in ("extend", "shorten"):
+            # 2026-09-01 20:41 -- "Extend that timer by 10 minutes." The enum
+            # had no such action, so the model chose `list` and read the
+            # timer back. `minutes` is the MAGNITUDE; the sign is the action.
+            mins = _coerce_int(minutes)
+            mins = abs(mins) if mins else 0
+            if not mins:
+                return ToolResult(text="By how many minutes, sir?", ok=False,
+                                  speak="By how many minutes, sir?")
+            delta = float(mins * 60 if a == "extend" else -mins * 60)
+            items = t.adjust(which if which not in (None, "") else "last", kind, delta)
+            if not items:
+                line = nothing_to_adjust_line(kind, delta)
+                return ToolResult(text=line, ok=False, speak=line)
+            epoch = float(t._now())
+            line = adjust_line(delta, [t._describe_item(i, epoch) for i in items])
+            return ToolResult(text=line, speak=line)
         if a == "list":
             text = t.list_text(kind)
             return ToolResult(text=text, speak=text, max_sentences=3)
@@ -2047,14 +2197,19 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             handler=set_alarm),
         ToolSpec(
             name="manage_schedule",
-            description="List or cancel reminders, timers and alarms; stop or snooze a ringing alarm.",
+            description="List, cancel, extend or shorten reminders, timers and alarms; "
+                        "stop or snooze a ringing alarm.",
             parameters={"type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["list", "cancel", "stop", "snooze"]},
+                            "action": {"type": "string",
+                                       "enum": ["list", "cancel", "extend", "shorten",
+                                                "stop", "snooze"]},
                             "kind": {"type": "string", "enum": ["reminder", "timer", "alarm", "all"]},
                             "which": {"type": "string",
                                       "description": "'last', 'all' or words from the item"},
-                            "minutes": {"type": "number"}},
+                            "minutes": {"type": "number",
+                                        "description": "how much to add (extend), take off "
+                                                       "(shorten) or snooze for"}},
                         "required": ["action"]},
             handler=manage_schedule),
     ]

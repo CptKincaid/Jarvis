@@ -1641,6 +1641,7 @@ TIER1_SAMPLES = {
     "no asides": "no more asides",
     "list schedule": "any timers running",
     "cancel schedule": "cancel the timer",
+    "adjust schedule": "extend that timer by ten minutes",
     "briefing": "give me my briefing",
     "preview": "what does tomorrow look like",
     "week": "how's my week looking",
@@ -1900,3 +1901,401 @@ def test_the_courtesy_bypasses_the_gate_by_name(rich):
 def test_a_spoken_thank_you_is_still_answered_not_dropped(rich):
     res = rich.handle("thank you", source="voice")
     assert res.status == "Courtesy" and res.speak
+
+
+# =========================================================================
+# Extend / shorten a timer, reminder or alarm (live 2026-09-01 20:41)
+# =========================================================================
+# 20:40:54 "Set a timer for 10 minutes to pack up the chicken." -> Tier-1.
+# 20:41:49 "Extend that timer by 10 minutes." -> "route local" -> the model,
+# whose manage_schedule had no extend action, picked `list` and read the
+# timer back: "One timer, sir: pack up the chicken in 9 minutes." The route
+# is now a Tier-1 regex ("adjust schedule"), so it never depends on the
+# model's choice again.
+def _adjusted_item(**over):
+    base = dict(id="tm-9", kind="timer", label="pack up the chicken",
+                due=1_800_000_000.0, effective_due=1_800_000_000.0, state="pending")
+    base.update(over)
+    return types.SimpleNamespace(**base)
+
+
+@pytest.mark.parametrize("text,which,kind,delta", [
+    ("extend that timer by 10 minutes", "last", "timer", 600),
+    ("extend the timer by ten minutes", "last", "timer", 600),
+    ("extend my alarm by 15 minutes", "last", "alarm", 900),
+    ("extend it by 5 minutes", "last", "all", 300),
+    ("extend that by ten minutes", "last", "all", 600),
+    ("extend the timer for the chicken by 10 minutes", "the chicken", "timer", 600),
+    ("add 10 minutes to the timer", "last", "timer", 600),
+    ("add ten minutes to that timer", "last", "timer", 600),
+    ("add 5 minutes to my reminder", "last", "reminder", 300),
+    ("put another 10 minutes on the timer", "last", "timer", 600),
+    ("give the timer another 10 minutes", "last", "timer", 600),
+    ("give me 10 more minutes on the timer", "last", "timer", 600),
+    ("10 more minutes on the timer", "last", "timer", 600),
+    ("push the timer back 10 minutes", "last", "timer", 600),
+    ("push back my alarm by 15 minutes", "last", "alarm", 900),
+    ("push that back ten minutes", "last", "all", 600),
+    ("delay the reminder by 20 minutes", "last", "reminder", 1200),
+    ("move my alarm back 30 minutes", "last", "alarm", 1800),
+    ("make it 10 minutes longer", "last", "all", 600),
+    ("make the timer ten minutes longer", "last", "timer", 600),
+    ("shorten the timer by 5 minutes", "last", "timer", -300),
+    ("shorten that by five minutes", "last", "all", -300),
+    ("cut the timer by 2 minutes", "last", "timer", -120),
+    ("take 5 minutes off the timer", "last", "timer", -300),
+    ("take five minutes off that", "last", "all", -300),
+    ("knock 5 minutes off the timer", "last", "timer", -300),
+    ("bring the alarm forward 15 minutes", "last", "alarm", -900),
+    ("bring my alarm forward by fifteen minutes", "last", "alarm", -900),
+    ("make it 5 minutes shorter", "last", "all", -300),
+    ("make the timer five minutes earlier", "last", "timer", -300),
+    ("move the alarm up 10 minutes", "last", "alarm", -600),
+    # punctuation, address and courtesy tails; other units
+    ("Extend that timer by 10 minutes.", "last", "timer", 600),
+    ("extend the timer by ten minutes, jarvis", "last", "timer", 600),
+    ("extend the timer by 30 seconds please", "last", "timer", 30),
+    ("push the alarm back an hour", "last", "alarm", 3600),
+    ("extend my timers by 5 minutes", "all", "timer", 300),
+])
+def test_adjust_schedule_phrasings_reach_the_timekeeper(rich, services, text,
+                                                        which, kind, delta):
+    tk = services.timekeeper
+    tk.adjust.return_value = [_adjusted_item(kind=kind if kind != "all" else "timer")]
+    assert rich._match_assistant(text) == "adjust schedule", text
+    res = rich.handle(text, source="typed")
+    tk.adjust.assert_called_once_with(which, kind, float(delta))
+    assert res.handled and res.speak
+    assert res.reply.endswith(".") and "sir" in res.reply
+    assert ("added" in res.reply) == (delta > 0)
+    assert ("off" in res.reply) == (delta < 0)
+    assert res.status.endswith("extended" if delta > 0 else "shortened")
+    assert res.undo is not None
+    services.brain.chat.assert_not_called()
+    services.claude.submit.assert_not_called()
+    tk.add_timer.assert_not_called()
+    tk.cancel.assert_not_called()
+
+
+def test_adjust_schedule_by_voice_bypasses_the_intent_gate(rich, services, monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("the classifier was consulted")
+    monkeypatch.setattr(rich.intent, "classify", boom)
+    services.timekeeper.adjust.return_value = [_adjusted_item()]
+    res = rich.handle("Extend that timer by 10 minutes.", source="voice")
+    services.timekeeper.adjust.assert_called_once_with("last", "timer", 600.0)
+    assert res.handled and res.speak and res.status == "Timer extended"
+    services.brain.chat.assert_not_called()
+
+
+@pytest.mark.parametrize("text", [
+    "set a timer for 10 minutes",
+    "extend the deadline by a week",
+    "add milk to the shopping list",
+    "10 more minutes",
+    "give me 10 more minutes",
+    "remind me in 10 minutes to extend the lease",
+    "how long is left on the timer",
+    "did they extend the timer",
+])
+def test_adjust_schedule_leaves_other_utterances_alone(rich, services, text):
+    assert rich._match_assistant(text) != "adjust schedule", text
+    rich.handle(text, source="typed")
+    services.timekeeper.adjust.assert_not_called()
+
+
+def test_the_timer_route_still_wins_for_setting_one(rich, services):
+    res = rich.handle("set a timer for 10 minutes", source="typed")
+    services.timekeeper.add_timer.assert_called_once_with(600, "10 minutes timer")
+    services.timekeeper.adjust.assert_not_called()
+    assert res.reply.startswith("10 minutes, sir")
+    names = [c.name for c in REGISTRY]
+    assert names.index("timer") < names.index("adjust schedule")
+    assert names.index("cancel schedule") + 1 == names.index("adjust schedule")
+
+
+def test_adjust_schedule_with_nothing_to_move_says_so(rich, services):
+    services.timekeeper.adjust.return_value = []
+    res = rich.handle("extend the timer by ten minutes", source="typed")
+    assert res.handled and res.speak
+    assert res.reply == "No timer to extend, sir." and res.status == "Nothing to adjust"
+    assert res.undo is None
+    res = rich.handle("bring my alarm forward 5 minutes", source="typed")
+    assert res.reply == "No alarm to bring forward, sir."
+    res = rich.handle("shorten it by five minutes", source="typed")
+    assert res.reply == "Nothing to shorten, sir."
+    services.brain.chat.assert_not_called()
+
+
+def test_adjust_schedule_undo_moves_it_back_by_id(rich, services):
+    tk = services.timekeeper
+    tk.adjust.return_value = [_adjusted_item(id="tm-9", kind="timer")]
+    res = rich.handle("extend that timer by 10 minutes", source="typed")
+    assert res.undo is not None
+    tk.adjust.reset_mock()
+    tk.adjust.return_value = [_adjusted_item(id="tm-9")]
+    res = rich.handle("scratch that", source="typed")
+    tk.adjust.assert_called_once_with("tm-9", "timer", -600)
+    assert res.reply == "Back to where it was, sir." and res.status == "Undone"
+
+
+def test_adjust_schedule_speaks_the_new_due(rich, services):
+    """A MagicMock's _describe_item is not a string, so the handler falls
+    back to the label plus describe_due -- the reply still carries the due."""
+    services.timekeeper.adjust.return_value = [_adjusted_item(kind="alarm", label="Gym")]
+    services.timekeeper.describe_due.return_value = "at 7:10 am tomorrow"
+    res = rich.handle("push my alarm back 10 minutes", source="typed")
+    assert res.reply == "Ten minutes added, sir: Gym at 7:10 am tomorrow."
+    assert res.status == "Alarm extended"
+
+
+# ------------------------------------------------------ the incident, replayed
+class _Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def now(self):
+        return self.t
+
+
+@pytest.fixture
+def real_tk(rich, services, tmp_path):
+    """The rich commander with a REAL Timekeeper on a tmp db: fake clock,
+    no ringer, no notifications, no subprocesses (run= records)."""
+    from jarvis.tools.timekeeper import Timekeeper
+    clock = _Clock(datetime(2026, 9, 1, 20, 40, 54).timestamp())
+    runs = []
+    tk = Timekeeper(tmp_path / "tk.db", say=lambda *a, **k: None,
+                    cfg=services.assistant, now=clock.now,
+                    run=lambda argv, **k: runs.append(list(argv)),
+                    tick_s=0.01, ring=False, cache_dir=tmp_path / "cache",
+                    notify=False)
+    services.timekeeper = tk
+    yield rich, tk, clock
+    tk.close()
+
+
+def test_incident_replay_extend_that_timer_by_ten_minutes(real_tk, services, monkeypatch):
+    c, tk, clock = real_tk
+
+    def boom(*a, **k):
+        raise AssertionError("the classifier was consulted")
+    monkeypatch.setattr(c.intent, "classify", boom)
+
+    res = c.handle("Set a timer for 10 minutes to pack up the chicken.", source="voice")
+    assert res.handled and res.speak
+    assert res.reply == "10 minutes to pack up the chicken, sir; I'll let you know."
+    items = tk.list("timer")
+    assert len(items) == 1 and items[0].label == "pack up the chicken"
+    assert items[0].due == pytest.approx(clock.now() + 600)
+
+    clock.t += 55                                            # 20:41:49
+    res = c.handle("Extend that timer by 10 minutes.", source="voice")
+    assert res.handled and res.speak
+    assert res.status == "Timer extended"
+    assert res.reply == "Ten minutes added, sir: pack up the chicken in 19 minutes."
+    assert re.search(r"\b(19|nineteen)\b", res.reply)
+    services.brain.chat.assert_not_called()
+    services.claude.submit.assert_not_called()
+    item = tk.list("timer")[0]
+    assert item.due == pytest.approx(item.created + 1200, abs=2)
+    assert item.state == "pending"
+
+    # ...and "scratch that" puts it back where it was
+    res = c.handle("scratch that", source="voice")
+    assert res.reply == "Back to where it was, sir."
+    item = tk.list("timer")[0]
+    assert item.due == pytest.approx(item.created + 600, abs=2)
+
+
+def test_incident_replay_add_minutes_to_a_named_timer(real_tk, services):
+    c, tk, clock = real_tk
+    c.handle("set a timer for 5 minutes for the tea", source="typed")
+    c.handle("set a timer for 10 minutes to pack up the chicken", source="typed")
+    res = c.handle("add 5 minutes to the timer for the tea", source="typed")
+    assert res.reply == "Five minutes added, sir: the tea in 10 minutes."
+    by_label = {i.label: i for i in tk.list("timer")}
+    assert by_label["the tea"].due == pytest.approx(clock.now() + 600)
+    assert by_label["pack up the chicken"].due == pytest.approx(clock.now() + 600)
+    res = c.handle("take 4 minutes off the timer for the chicken", source="typed")
+    assert res.reply == "Four minutes off, sir: pack up the chicken in 6 minutes."
+
+
+# =========================================================================
+# Timer label grammar (live 2026-09-01 20:40 and 21:03)
+# =========================================================================
+# "Set a timer for 8 minutes to put chicken away." was answered "8 minutes
+# for the put chicken away, sir": the label was always framed as a thing.
+@pytest.mark.parametrize("text,seconds,label,spoken", [
+    ("Set a timer for 8 minutes to put chicken away.", 480, "put chicken away",
+     "8 minutes to put chicken away, sir; I'll let you know."),
+    ("Set a timer for 10 minutes to pack up the chicken.", 600, "pack up the chicken",
+     "10 minutes to pack up the chicken, sir; I'll let you know."),
+    ("set a timer for 5 minutes for the tea", 300, "the tea",
+     "5 minutes for the tea, sir; I'll let you know."),
+    ("5 minute timer called laundry", 300, "laundry",
+     "5 minutes for the laundry, sir; I'll let you know."),
+    ("timer for 3 minutes to flip the steak", 180, "flip the steak",
+     "3 minutes to flip the steak, sir; I'll let you know."),
+    # the connector was heard as "for" but the label is plainly an action
+    ("set a timer for 2 minutes for stir the sauce", 120, "stir the sauce",
+     "2 minutes to stir the sauce, sir; I'll let you know."),
+])
+def test_timer_label_grammar(rich, services, text, seconds, label, spoken):
+    res = rich.handle(text, source="typed")
+    services.timekeeper.add_timer.assert_called_once_with(seconds, label)
+    assert res.reply == spoken and res.speak
+
+
+def test_timer_label_grammar_in_the_shaky_read_back(rich, services, monkeypatch):
+    monkeypatch.setattr(rich, "shaky_transcript", lambda: True)
+    res = rich.handle("Set a timer for 8 minutes to put chicken away.", source="typed")
+    assert res.reply == "An 8-minute timer to put chicken away, sir?"
+    assert res.status == "Confirm?"
+    services.timekeeper.add_timer.assert_not_called()
+    res = rich.handle("yes", source="typed")
+    services.timekeeper.add_timer.assert_called_once_with(480, "put chicken away")
+    assert res.reply == "8 minutes to put chicken away, sir; I'll let you know."
+    services.timekeeper.add_timer.reset_mock()
+    res = rich.handle("set a timer for 5 minutes for the tea", source="typed")
+    assert res.reply == "A 5-minute timer for the tea, sir?"
+
+
+def test_timer_label_phrase_helper():
+    from jarvis.commander import timer_label_phrase
+    assert timer_label_phrase("to", "put chicken away") == "to put chicken away"
+    assert timer_label_phrase("for", "the tea") == "for the tea"
+    assert timer_label_phrase("for", "tea") == "for the tea"
+    assert timer_label_phrase("called", "laundry") == "for the laundry"
+    assert timer_label_phrase("called", "make tea") == "to make tea"
+    assert timer_label_phrase("for", "my eggs") == "for my eggs"
+    assert timer_label_phrase("to", "") == ""
+
+
+# =========================================================================
+# "Belay that last order" (live 2026-09-01 21:10:23)
+# =========================================================================
+# Whisper wrote "BELAY THAT LAST Uhhh... ORDER". undo_kind took "belay that"
+# only with an empty tail, so the object noun and the filler sent it to the
+# intent classifier (Uncertain, 0.50), "Was that for me?", yes -- and the
+# MODEL answered "Understood, sir; I'll stand down." and did nothing. He had
+# to say "JARVIS, CANCEL TIMER!".
+def test_strip_fillers():
+    from jarvis.commander import strip_fillers
+    assert strip_fillers("BELAY THAT LAST Uhhh... ORDER") == "BELAY THAT LAST ORDER"
+    assert strip_fillers("scratch, um, that") == "scratch that"
+    assert strip_fillers("undo that… please") == "undo that please"
+    assert strip_fillers("erm belay that hmm") == "belay that"
+    assert strip_fillers("the umbrella is here") == "the umbrella is here"   # not a filler
+    assert strip_fillers("") == ""
+
+
+@pytest.mark.parametrize("text", [
+    "BELAY THAT LAST Uhhh... ORDER",
+    "belay that last order",
+    "scratch that last command",
+    "cancel that last one",
+    "belay that order",
+    "undo my last request",
+    "belay the last instruction",
+    "belay that last order, jarvis",
+    "um, belay that last order please",
+    # the phrases that already worked
+    "scratch that", "undo that", "undo", "no, scratch that", "scratch that last one",
+    "take that back", "belay that", "actually, scratch that", "undo the last one",
+])
+def test_undo_kind_accepts_the_object_nouns_and_fillers(text):
+    assert commander.undo_kind(text), text
+
+
+@pytest.mark.parametrize("text", [
+    "did they belay that climb",
+    "belay that climb",
+    "cancel the timer",
+    "scratch my head",
+    "undo the last commit",
+    "never mind",
+    "scratch buy milk off the list",
+    "cancel that meeting",
+    "",
+])
+def test_undo_kind_still_leaves_the_rest_alone(text):
+    assert not commander.undo_kind(text), text
+
+
+def test_undo_explicit_names_its_object():
+    assert commander.undo_explicit("belay that last order")
+    assert commander.undo_explicit("cancel that last one")
+    assert commander.undo_explicit("undo my last request")
+    assert not commander.undo_explicit("scratch that")
+    assert not commander.undo_explicit("undo")
+    assert not commander.undo_explicit("cancel the timer")
+
+
+def test_belay_that_last_order_by_voice_never_reaches_the_classifier(rich, services,
+                                                                     monkeypatch):
+    services.timekeeper.add_timer.return_value = types.SimpleNamespace(id="tm-1")
+    rich.handle("set a timer for 8 minutes to put chicken away", source="voice")
+
+    def boom(*a, **k):
+        raise AssertionError("the classifier was consulted")
+    monkeypatch.setattr(rich.intent, "classify", boom)
+    res = rich.handle("BELAY THAT LAST Uhhh... ORDER", source="voice")
+    services.timekeeper.cancel.assert_called_once_with(which="tm-1", kind="timer")
+    assert res.reply == "Timer scrapped, sir." and res.speak and res.status == "Undone"
+    services.brain.chat.assert_not_called()
+
+
+def test_an_explicit_undo_outlives_the_bare_window(rich, services, monkeypatch):
+    """Set at 21:03:18, belayed at 21:10:23: seven minutes. A bare "scratch
+    that" that old is a stray transcript; "belay that last order" is not."""
+    import time as _time
+    services.timekeeper.add_timer.return_value = types.SimpleNamespace(id="tm-1")
+    rich.handle("set a timer for 8 minutes to put chicken away", source="voice")
+    undo, at = rich._last_undo
+    rich._last_undo = (undo, at - 7 * 60)                    # seven minutes ago
+    res = rich.handle("BELAY THAT LAST Uhhh... ORDER", source="voice")
+    services.timekeeper.cancel.assert_called_once_with(which="tm-1", kind="timer")
+    assert res.reply == "Timer scrapped, sir."
+    # ...but not for ever, and a bare "scratch that" keeps the short window
+    services.timekeeper.cancel.reset_mock()
+    rich.handle("set a timer for 8 minutes to put chicken away", source="voice")
+    undo, at = rich._last_undo
+    rich._last_undo = (undo, at - 7 * 60)
+    res = rich.handle("scratch that", source="voice")
+    services.timekeeper.cancel.assert_not_called()
+    assert _time.monotonic() > 0 and res.status != "Undone"
+    rich._last_undo = (undo, at - commander.UNDO_EXPLICIT_WINDOW_S - 5)
+    res = rich.handle("belay that last order", source="voice")
+    services.timekeeper.cancel.assert_not_called()
+    assert res.reply == "Nothing to take back, sir." and res.speak
+
+
+def test_an_explicit_undo_with_nothing_to_undo_is_answered_not_handed_on(rich, services,
+                                                                          monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("the classifier was consulted")
+    monkeypatch.setattr(rich.intent, "classify", boom)
+    res = rich.handle("belay that last order", source="voice")
+    assert res.handled and res.reply == "Nothing to take back, sir." and res.speak
+    services.brain.chat.assert_not_called()
+    services.claude.submit.assert_not_called()
+
+
+def test_incident_replay_belay_that_last_order(real_tk, services, monkeypatch):
+    c, tk, clock = real_tk
+
+    def boom(*a, **k):
+        raise AssertionError("the classifier was consulted")
+    monkeypatch.setattr(c.intent, "classify", boom)
+    res = c.handle("Set a timer for 8 minutes to put chicken away.", source="voice")
+    assert res.reply == "8 minutes to put chicken away, sir; I'll let you know."
+    assert len(tk.list("timer")) == 1
+    res = c.handle("BELAY THAT LAST Uhhh... ORDER", source="voice")
+    assert res.handled and res.reply == "Timer scrapped, sir." and res.speak
+    assert tk.list("timer") == []
+    assert tk.list(include_done=True)[0].state == "cancelled"
+    services.brain.chat.assert_not_called()
+    # a "belay" inside a sentence about something else is not an undo
+    res = c.handle("did they belay that climb", source="typed")
+    assert res.status != "Undone"

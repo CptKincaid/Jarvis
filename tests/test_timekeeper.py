@@ -690,7 +690,8 @@ def test_tool_specs(tools):
         assert len(fn["description"].split()) <= 20
         assert fn["parameters"]["type"] == "object"
     props = tools.schemas()[3]["function"]["parameters"]["properties"]
-    assert props["action"]["enum"] == ["list", "cancel", "stop", "snooze"]
+    assert props["action"]["enum"] == ["list", "cancel", "extend", "shorten",
+                                       "stop", "snooze"]
     assert props["kind"]["enum"] == ["reminder", "timer", "alarm", "all"]
     # `repeat` lost its enum when interval nudges arrived: no closed list can
     # hold "every 45 minutes". The description has to carry the shape instead.
@@ -924,3 +925,250 @@ def test_the_tool_takes_an_interval_repeat(tools, tk):
     assert r.ok and ", every 30 minutes" in r.text
     by_label = {i.label: i.repeat for i in tk.list("reminder")}
     assert by_label == {"drink water": "45m", "stand up": "30m"}
+
+
+# ============================================ adjust: extend / shorten (2026-09-01)
+# 20:41:49 "Extend that timer by 10 minutes." -> the model picked `list` and
+# read the timer back, because the timekeeper had no way to move a due time.
+def _ids(items):
+    return [i.id for i in items]
+
+
+def test_adjust_pending_timer_moves_the_due_and_nothing_else(tk):
+    t0 = tk.clock.now()
+    timer = tk.add_timer(600, "pack up the chicken")
+    got = tk.adjust("last", "timer", 600)
+    assert _ids(got) == [timer.id]
+    fresh = got[0]
+    assert fresh.due == pytest.approx(t0 + 1200)
+    assert fresh.created == timer.created and fresh.state == "pending"
+    assert fresh.snooze_until is None and fresh.repeat == ""
+    assert tk.get(timer.id).due == pytest.approx(t0 + 1200)     # persisted
+    assert "pack up the chicken in 20 minutes" in tk.list_text("timer")
+
+
+def test_adjust_snoozed_alarm_moves_snooze_until_only(tk):
+    tk.clock.set(D(2026, 8, 26, 7, 0))
+    alarm = tk.add_alarm(tk.clock.now(), "Gym")
+    tk.tick()
+    assert tk.snooze(5)
+    before = tk.get(alarm.id)
+    got = tk.adjust("last", "alarm", 300)
+    assert _ids(got) == [alarm.id]
+    assert got[0].state == "snoozed"
+    assert got[0].snooze_until == pytest.approx(before.snooze_until + 300)
+    assert got[0].due == before.due                        # the original due is kept
+    assert "snoozed until 7:10 am" in tk.list_text("alarm")
+
+
+def test_adjust_shortening_past_now_clamps_to_now_and_fires_next_tick(tk):
+    t0 = tk.clock.now()
+    tk.add_timer(120, "tea")
+    got = tk.adjust("last", "timer", -600)
+    assert len(got) == 1 and got[0].due == pytest.approx(t0)  # never in the past
+    assert not kinds(tk.events, events.ReminderFired)
+    tk.tick()
+    fired = kinds(tk.events, events.ReminderFired)
+    assert len(fired) == 1 and fired[0].kind == "timer"
+    assert tk.said[-1] == "Sir, your tea timer is up."
+    assert tk.list("timer") == []
+
+
+def test_adjust_repeating_reminder_shifts_this_occurrence_only(tk):
+    t0 = tk.clock.now()
+    rem = tk.add_reminder(t0 + 600, "drink water", repeat="every 45 minutes")
+    assert tkm.interval_minutes(rem.repeat) == 45
+    got = tk.adjust("water", "reminder", 300)
+    assert _ids(got) == [rem.id]
+    assert got[0].due == pytest.approx(t0 + 900)
+    assert got[0].repeat == rem.repeat                    # the interval is untouched
+    tk.clock.advance(900)
+    tk.tick()
+    again = tk.get(rem.id)
+    assert again.state == "pending" and again.due == pytest.approx(tk.clock.now() + 45 * 60)
+
+
+def test_adjust_by_label_words_hits_the_right_timer(tk):
+    t0 = tk.clock.now()
+    pasta = tk.add_timer(300, "pasta")
+    chicken = tk.add_timer(600, "pack up the chicken")
+    got = tk.adjust("the chicken timer", "timer", 60)
+    assert _ids(got) == [chicken.id]
+    assert tk.get(chicken.id).due == pytest.approx(t0 + 660)
+    assert tk.get(pasta.id).due == pytest.approx(t0 + 300)
+
+
+def test_adjust_last_is_the_most_recently_created(tk):
+    t0 = tk.clock.now()
+    late = tk.add_timer(3600, "slow roast")                  # created first, due last
+    tk.clock.advance(1)
+    quick = tk.add_timer(60, "eggs")                         # created last, due first
+    got = tk.adjust("last", "all", 120)
+    assert _ids(got) == [quick.id]
+    assert tk.get(quick.id).due == pytest.approx(t0 + 1 + 180)
+    assert tk.get(late.id).due == pytest.approx(t0 + 3600)
+    # "that" / "it" are the same item
+    assert _ids(tk.adjust("that", "timer", 60)) == [quick.id]
+    assert _ids(tk.adjust("it", "timer", 60)) == [quick.id]
+
+
+def test_adjust_ringing_alarm_with_a_positive_delta_snoozes_it(tk):
+    tk.clock.set(D(2026, 8, 26, 7, 0))
+    alarm = tk.add_alarm(tk.clock.now(), "Gym")
+    tk.tick()
+    assert tk.ringing is not None
+    n_plays = len(tk.run_rec.of("paplay"))
+    got = tk.adjust("last", "alarm", 600)
+    assert _ids(got) == [alarm.id]
+    assert got[0].state == "snoozed"
+    assert got[0].snooze_until == pytest.approx(tk.clock.now() + 600)
+    assert tk.ringing is None                                # ring killed
+    stopped = kinds(tk.events, events.AlarmStopped)
+    assert stopped[-1].action == "snooze" and stopped[-1].snooze_min == 10
+    assert stopped[-1].alarm_id == alarm.id
+    tk.clock.advance(5)
+    tk.tick()
+    assert len(tk.run_rec.of("paplay")) == n_plays           # stays quiet
+    tk.clock.advance(600)
+    tk.tick()
+    assert tk.ringing is not None and tk.ringing.id == alarm.id
+
+
+def test_adjust_ringing_alarm_with_a_negative_delta_is_left_alone(tk):
+    tk.clock.set(D(2026, 8, 26, 7, 0))
+    alarm = tk.add_alarm(tk.clock.now(), "Gym")
+    tk.tick()
+    before = tk.get(alarm.id)
+    n_events = len(tk.events)
+    assert tk.adjust("last", "alarm", -300) == []
+    after = tk.get(alarm.id)
+    assert after.state == "ringing" and after.due == before.due
+    assert tk.ringing is not None and len(tk.events) == n_events
+
+
+def test_adjust_empty_store_and_zero_delta_return_nothing(tk):
+    assert tk.adjust("last", "all", 600) == []
+    tk.add_timer(300, "tea")
+    assert tk.adjust("last", "timer", 0) == []
+    assert tk.adjust("last", "timer", None) == []
+    assert tk.adjust("last", "timer", "soon") == []
+    assert tk.adjust("last", "alarm", 600) == []             # wrong kind
+    assert tk.adjust("laundry", "timer", 600) == []          # no such label
+
+
+def test_cancel_and_adjust_share_one_targeting_rule(tk):
+    """_resolve is the one place that reads "which"; cancel's own behaviour
+    is pinned by test_cancel_variants above."""
+    t0 = tk.clock.now()
+    a = tk.add_reminder(t0 + 100, "call the dentist")
+    b = tk.add_timer(300, "pasta")
+    assert _ids(tk._resolve("dentist", "all")) == [a.id]
+    assert _ids(tk._resolve("last", "all")) == [b.id]
+    assert set(_ids(tk._resolve("all", "all"))) == {a.id, b.id}
+    assert _ids(tk._resolve("next", "all")) == [a.id]
+    assert _ids(tk._resolve(b.id, "all")) == [b.id]
+    assert tk._resolve("nothing like this", "all") == []
+
+
+def test_adjust_wording_helpers():
+    assert tkm.adjust_amount_words(600) == "Ten minutes"
+    assert tkm.adjust_amount_words(-300) == "Five minutes"
+    assert tkm.adjust_amount_words(60) == "A minute"
+    assert tkm.adjust_amount_words(3600) == "An hour"
+    assert tkm.adjust_amount_words(900) == "15 minutes"
+    assert tkm.adjust_amount_words(30) == "Thirty seconds" or \
+        tkm.adjust_amount_words(30) == "30 seconds"
+    assert tkm.adjust_line(600, "pack up the chicken in 20 minutes") == \
+        "Ten minutes added, sir: pack up the chicken in 20 minutes."
+    assert tkm.adjust_line(-300, ["the tea timer in 3 minutes"]) == \
+        "Five minutes off, sir: the tea timer in 3 minutes."
+    assert tkm.nothing_to_adjust_line("timer", 600) == "No timer to extend, sir."
+    assert tkm.nothing_to_adjust_line("timer", -600) == "No timer to shorten, sir."
+    assert tkm.nothing_to_adjust_line("reminder", 600) == "No reminders to push back, sir."
+    assert tkm.nothing_to_adjust_line("alarm", -60) == "No alarm to bring forward, sir."
+    assert tkm.nothing_to_adjust_line("all", 60) == "Nothing to extend, sir."
+
+
+# --------------------------------------------- manage_schedule: extend / shorten
+def test_tool_manage_schedule_extend_and_shorten(tools, tk):
+    t0 = tk.clock.now()
+    tools.call("set_timer", {"minutes": 10, "label": "pack up the chicken"})
+    r = tools.call("manage_schedule", {"action": "extend", "kind": "timer", "minutes": 10})
+    assert r.ok and r.speak == r.text
+    assert r.text == "Ten minutes added, sir: pack up the chicken in 20 minutes."
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 1200)
+    r = tools.call("manage_schedule", {"action": "shorten", "kind": "timer", "minutes": "5"})
+    assert r.ok and r.text == "Five minutes off, sir: pack up the chicken in 15 minutes."
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 900)
+    # the magnitude is what counts: a negative "minutes" with extend still adds
+    r = tools.call("manage_schedule", {"action": "extend", "which": "chicken", "minutes": -5})
+    assert r.ok and r.text.startswith("Five minutes added, sir:")
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 1200)
+    # label words reach the same resolution as cancel
+    tools.call("set_timer", {"minutes": 3, "label": "tea"})
+    r = tools.call("manage_schedule", {"action": "extend", "which": "the tea timer",
+                                       "minutes": 2})
+    assert r.text == "Two minutes added, sir: tea in 5 minutes."
+
+
+def test_tool_manage_schedule_extend_asks_for_the_amount(tools, tk):
+    tools.call("set_timer", {"minutes": 10})
+    for minutes in (None, 0, "", "0"):
+        r = tools.call("manage_schedule", {"action": "extend", "minutes": minutes})
+        assert not r.ok and r.text == "By how many minutes, sir?" and r.speak == r.text
+    r = tools.call("manage_schedule", {"action": "shorten"})
+    assert not r.ok and r.speak == "By how many minutes, sir?"
+    assert tk.list("timer")[0].duration == 600                 # nothing moved
+
+
+def test_tool_manage_schedule_extend_with_nothing_to_extend(tools, tk):
+    r = tools.call("manage_schedule", {"action": "extend", "kind": "timer", "minutes": 10})
+    assert not r.ok and r.text == "No timer to extend, sir." and r.speak == r.text
+    r = tools.call("manage_schedule", {"action": "shorten", "kind": "reminder", "minutes": 5})
+    assert r.text == "No reminders to bring forward, sir."
+    r = tools.call("manage_schedule", {"action": "extend", "minutes": 5})
+    assert r.text == "Nothing to extend, sir."
+
+
+@pytest.mark.parametrize("alias,sign", [
+    ("add", 1), ("more", 1), ("longer", 1), ("push back", 1), ("push", 1),
+    ("delay", 1), ("defer", 1), ("prolong", 1), ("lengthen", 1),
+    ("reduce", -1), ("cut", -1), ("less", -1), ("shorter", -1),
+    ("bring forward", -1), ("earlier", -1), ("sooner", -1), ("subtract", -1),
+    ("take off", -1),
+])
+def test_tool_manage_schedule_aliases(tools, tk, alias, sign):
+    t0 = tk.clock.now()
+    tools.call("set_timer", {"minutes": 10, "label": "tea"})
+    r = tools.call("manage_schedule", {"action": alias, "kind": "timer", "minutes": 2})
+    assert r.ok, (alias, r.text)
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 600 + sign * 120)
+
+
+def test_tool_postpone_extends_when_nothing_rings_and_snoozes_when_it_does(tools, tk):
+    t0 = tk.clock.now()
+    tools.call("set_timer", {"minutes": 10, "label": "tea"})
+    r = tools.call("manage_schedule", {"action": "postpone", "minutes": 5})
+    assert r.ok and r.text == "Five minutes added, sir: tea in 15 minutes."
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 900)
+    r = tools.call("manage_schedule", {"action": "later", "minutes": 5})
+    assert r.ok and tk.list("timer")[0].due == pytest.approx(t0 + 1200)
+    # ...and while an alarm rings, "postpone" is the snooze it always was
+    tk.add_alarm(tk.clock.now(), "Gym")
+    tk.tick()
+    assert tk.ringing is not None
+    r = tools.call("manage_schedule", {"action": "postpone", "minutes": "5"})
+    assert r.ok and r.text == "Snoozed for five minutes, sir."
+    assert tk.ringing is None and tk.list("alarm")[0].state == "snoozed"
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 1200)  # the timer was not touched
+    # "snooze" itself is unchanged: nothing ringing -> the old line
+    r = tools.call("manage_schedule", {"action": "snooze"})
+    assert not r.ok and r.speak == NOTHING_RINGING_LINE
+
+
+def test_tool_manage_schedule_unknown_action_and_description(tools):
+    r = tools.call("manage_schedule", {"action": "fly", "minutes": 5})
+    assert not r.ok and r.text == "unknown action 'fly'"
+    fn = tools.schemas()[3]["function"]
+    assert "extend" in fn["description"] and "shorten" in fn["description"]
+    assert "extend" in fn["parameters"]["properties"]["minutes"]["description"]

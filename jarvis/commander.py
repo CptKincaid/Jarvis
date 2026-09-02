@@ -2038,7 +2038,31 @@ _TIMER_RX = re.compile(
     r"^(?:(?:set|start|put on|run|create|make|give me)\s+(?:a\s+|an\s+|the\s+)?)?"
     r"(?:(?P<n1>" + _NUM_ALT + r")\s*[- ]?(?P<u1>" + _UNIT_ALT + r")\s+timer"
     r"|timer\s+(?:for\s+)?(?P<n2>" + _NUM_ALT + r")\s*(?P<u2>" + _UNIT_ALT + r"))"
-    r"(?:\s+(?:for|to|called|named|labell?ed)\s+(?P<label>.+?))?[.!]*$", re.I)
+    r"(?:\s+(?P<conn>for|to|called|named|labell?ed)\s+(?P<label>.+?))?[.!]*$", re.I)
+# A timer label that is a VERB PHRASE ("to put chicken away") is spoken as
+# "8 minutes to put chicken away", never "for the put chicken away" (live
+# 2026-09-01 20:40 and 21:03). The connector word decides; this list catches
+# the same shape when the transcript dropped the "to".
+_VERB_LEAD_RX = re.compile(
+    r"^(?:put|pack|take|check|flip|turn|call|get|go|move|stir|start|stop|pull|"
+    r"pick|feed|let|bring|wake|change|drain|remove|add|send|text|email|finish|"
+    r"switch|grab|make)\b", re.I)
+
+
+def timer_label_phrase(conn: str, label: str) -> str:
+    """How a timer's label reads after the duration: 'to put chicken away'
+    for an action, 'for the tea' for a thing. '' with no label."""
+    label = (label or "").strip()
+    if not label:
+        return ""
+    conn = (conn or "").strip().lower()
+    if conn == "to" or _VERB_LEAD_RX.match(label):
+        return f"to {label}"
+    if re.match(r"^(?:the|my|a|an|your)\b", label, re.I):
+        return f"for {label}"
+    return f"for the {label}"
+
+
 _DAYS = r"monday|tuesday|wednesday|thursday|friday|saturday|sunday"
 _CLOCK_T = r"\d{1,2}(?::\d{2})?\s*(?:am|pm|a\.m\.|p\.m\.|o'?clock)?"
 _WHEN_RX = re.compile(
@@ -2076,6 +2100,70 @@ _CANCEL_SCHED_RX = re.compile(
     r"(?P<all>all\s+(?:of\s+)?(?:my\s+|the\s+)?|every\s+)?(?:the\s+|my\s+|that\s+|this\s+)?"
     r"(?P<kind>reminders?|timers?|alarms?)"
     r"(?:\s+(?:for|about|to|called|named)\s+(?P<which>.+?))?[.!]*$", re.I)
+
+
+# ---- Tier 1 extend / shorten (2026-09-01) --------------------------------
+# 20:40:54 "Set a timer for 10 minutes to pack up the chicken." -> Tier-1.
+# 20:41:49 "Extend that timer by 10 minutes." -> nothing here matched, so it
+# went to the model, whose manage_schedule tool had no extend action; it
+# picked `list` and read the timer back ("One timer, sir: pack up the
+# chicken in 9 minutes."). The tool now has extend/shorten, but the route
+# must not depend on the model's choice again: every phrasing below lands
+# here deterministically, like set/list/cancel do.
+#
+# Python's re forbids a group name twice, so each alternative numbers its
+# own groups (k1/n1/u1 ...) and _adj_group() coalesces them: v* the verb,
+# d* a direction word (back/later/longer = later; up/earlier/forward/
+# shorter/sooner = sooner), n*/u* the amount, k* the kind word, p* a
+# pronoun standing in for it ("that" / "it" -> kind all, which last), l*
+# label words after for/about/to/called/named.
+def _adj_obj(i: int) -> str:
+    return (r"(?:(?:(?:the|my|that|this|our)\s+)?(?P<k%d>timers?|reminders?|alarms?)"
+            r"(?:\s+(?:for|about|to|called|named)\s+(?P<l%d>.+?))?"
+            r"|(?P<p%d>that|it|this)(?:\s+one)?)" % (i, i, i))
+
+
+def _adj_amt(i: int, more: bool = False) -> str:
+    mid = r"(?:(?P<v%d>more|extra)\s+)?" % i if more else r"(?:(?:more|extra)\s+)?"
+    return (r"(?:another\s+|an\s+extra\s+)?(?P<n%d>" % i + _NUM_ALT + r")\s*[- ]?" + mid
+            + r"(?P<u%d>" % i + _UNIT_ALT + r")")
+
+
+_ADJ_BY = r"(?:by|for|with)?\s*"
+_ADJ_TAIL = r"(?:[, ]+(?:jarvis|please|sir|thanks|thank you))*[.!?]*$"
+_ADJUST_SCHED_RX = re.compile(
+    r"^(?:(?:please|jarvis)[, ]+)?(?:"
+    # extend / shorten <obj> by <amount>
+    r"(?P<v1>extend|lengthen|prolong|delay|postpone|shorten|cut|reduce)\s+"
+    + _adj_obj(1) + r"\s+" + _ADJ_BY + _adj_amt(1)
+    # add / put <amount> to / on <obj>
+    + r"|(?P<v2>add|put)\s+" + _adj_amt(2) + r"(?:\s+more)?\s+(?:to|on|onto)\s+" + _adj_obj(2)
+    # give <obj> another <amount> | give me <amount> more on <obj>
+    + r"|(?P<v3>give)\s+(?:me\s+)?(?:" + _adj_obj(3) + r"\s+" + _adj_amt(3) + r"(?:\s+more)?"
+    + r"|" + _adj_amt(4) + r"(?:\s+more)?\s+(?:on|for|to|onto)\s+" + _adj_obj(4) + r")"
+    # <n> more <unit> on <obj>  (the bare "10 more minutes" is the ringing
+    # branch's snooze and, with nothing ringing, the model's: no object, no
+    # match here)
+    + r"|" + _adj_amt(5, more=True) + r"\s+(?:on|for|to|onto)\s+" + _adj_obj(5)
+    # push / move / bump <obj> back|later|up|earlier <amount>
+    + r"|(?P<v6>push|move|bump)\s+" + _adj_obj(6)
+    + r"\s+(?P<d6>back|later|up|earlier)\s+" + _ADJ_BY + _adj_amt(6)
+    # push back <obj> <amount>
+    + r"|(?P<v7>push back|move back)\s+" + _adj_obj(7) + r"\s+" + _ADJ_BY + _adj_amt(7)
+    # bring <obj> forward <amount> | bring forward <obj> <amount>
+    + r"|(?P<v8>bring)\s+(?:" + _adj_obj(8) + r"\s+forward|forward\s+" + _adj_obj(9) + r")\s+"
+    + _ADJ_BY + _adj_amt(8)
+    # make <obj> <amount> longer|shorter|later|earlier|sooner
+    + r"|make\s+" + _adj_obj(10) + r"\s+" + _adj_amt(10)
+    + r"\s+(?P<d10>longer|later|shorter|earlier|sooner)"
+    # take / knock / shave / cut <amount> off <obj>
+    + r"|(?P<v11>take|knock|shave|cut)\s+" + _adj_amt(11)
+    + r"\s+(?:off|from)\s+(?:of\s+)?" + _adj_obj(11)
+    + r")" + _ADJ_TAIL, re.I)
+# Words that move an item SOONER; everything else in the table moves it later.
+_ADJ_SOONER = frozenset((
+    "shorten", "cut", "reduce", "take", "knock", "shave", "bring",
+    "forward", "up", "earlier", "sooner", "shorter"))
 _NOTE_RX = re.compile(
     r"^(?:take a note|make a note|note that|note down|jot down|write (?:this |that )?down|"
     r"note)[:,]?\s+(?:that\s+)?(?P<text>.+?)[.!]*$", re.I)
@@ -2668,11 +2756,14 @@ def _h_timer(c, t, m):                                     # 3217-3231
     tk = c._svc("timekeeper")
     if tk is not None:
         line = f"{words}, sir; I'll let you know."
-        what = ""
-        if label:
-            what = label if re.match(r"^(?:the|my|a|an|your)\b", label, re.I) \
-                else f"the {label}"
-            line = f"{words} for {what}, sir; I'll let you know."
+        # "8 minutes to put chicken away" / "5 minutes for the tea": the
+        # connector he used decides the grammar (live 2026-09-01 21:03:
+        # "8 minutes for the put chicken away, sir"). The stored label is
+        # the phrase as spoken, so the fire line and "extend the timer for
+        # the chicken" keep working on it.
+        what = timer_label_phrase(m.group("conn"), label)
+        if what:
+            line = f"{words} {what}, sir; I'll let you know."
         def _run():
             item = tk.add_timer(seconds, label or f"{words} timer")
             # action=item so the aside engine sees the structured result; it
@@ -2683,7 +2774,10 @@ def _h_timer(c, t, m):                                     # 3217-3231
                                  undo=_undo_timekeeper(tk, item, "timer",
                                                        "Timer scrapped, sir."))
         # A shaky transcript reads the parsed timer back first (_confirm_or_run)
-        ask = f"A {words} timer for {what}, sir?" if what \
+        # "An 8-minute timer to put chicken away, sir?" -- "an" before a
+        # spoken 8 / 11 / 18 / 80..., "a" otherwise.
+        article = "An" if str(n).startswith("8") or n in (11, 18) else "A"
+        ask = f"{article} {n}-{_unit_word(unit, 1)} timer {what}, sir?" if what \
             else f"A timer for {words}, sir?"
         return _confirm_or_run(c, _run, ask)
     workflows = c._svc("workflows")
@@ -2874,6 +2968,134 @@ def _h_cancel_schedule(c, t, m):
             return CommandResult(handled=True, reply=line, speak=True,
                                  status="Confirm?")
     return _do_cancel_schedule(tk, which, kind)
+
+
+def _adj_group(m, prefix: str) -> Optional[str]:
+    """The first non-None group whose name starts with ``prefix`` -- the
+    numbered alternatives of _ADJUST_SCHED_RX share one meaning per letter."""
+    for name, val in m.groupdict().items():
+        if name.startswith(prefix) and val is not None:
+            return val
+    return None
+
+
+def _tk_now(tk) -> float:
+    """The timekeeper's clock when it has one (tests drive a fake), else
+    the wall clock."""
+    fn = getattr(tk, "_now", None)
+    if callable(fn):
+        try:
+            return float(fn())
+        except (TypeError, ValueError):
+            pass
+    return time.time()
+
+
+def _describe_adjusted(tk, items, now: float) -> list[str]:
+    """One '<label> in 20 minutes' per adjusted item: the timekeeper's own
+    _describe_item when it has one (a MagicMock's answer is not a str and
+    is skipped), else the label plus describe_due."""
+    out = []
+    fn = getattr(tk, "_describe_item", None)
+    for it in items:
+        text = None
+        if callable(fn):
+            try:
+                got = fn(it, now)
+                if isinstance(got, str) and got.strip():
+                    text = got.strip()
+            except Exception:
+                log.exception("_describe_item failed")
+        if text is None:
+            label = getattr(it, "label", None)
+            label = str(label).strip() if isinstance(label, str) and label.strip() else "it"
+            due = getattr(it, "effective_due", None)
+            if not isinstance(due, (int, float)):
+                due = getattr(it, "due", None)
+            if isinstance(due, (int, float)):
+                text = f"{label} {_describe(tk, float(due), datetime.fromtimestamp(now), 'later')}"
+            else:
+                text = label
+        out.append(text)
+    return out
+
+
+def _undo_adjust(tk, items, kind: str, delta: int):
+    """Move each adjusted item back by the same amount, by id."""
+    ids = [(getattr(i, "id", None), getattr(i, "kind", None)) for i in items]
+    ids = [(i, k if isinstance(k, str) and k else kind) for i, k in ids if i]
+    if tk is None or not ids:
+        return None
+
+    def _undo() -> str:
+        back = 0
+        for item_id, item_kind in ids:
+            try:
+                if tk.adjust(item_id, item_kind, -delta):
+                    back += 1
+            except Exception:
+                log.exception("undo adjust failed")
+        return "Back to where it was, sir." if back else "That one had gone already, sir."
+    return _undo
+
+
+def _h_adjust_schedule(c, t, m):
+    """"Extend that timer by 10 minutes" (live 2026-09-01 20:41). No
+    read-back even on a shaky transcript: the change is reversible by
+    "scratch that" (undo=), and the reply speaks the new due, so a misheard
+    number is heard straight away. A RINGING item reached here with a
+    positive delta is snoozed by Timekeeper.adjust (that is what "give me
+    ten more minutes on the alarm" means while it rings); the ringing
+    branch's own "10 more minutes" / "snooze" words are untouched."""
+    tk = c._svc("timekeeper")
+    if tk is None or not callable(getattr(tk, "adjust", None)):
+        return None
+    n = _num(_adj_group(m, "n"))
+    if n is None:
+        return None
+    unit = (_adj_group(m, "u") or "minutes").lower()
+    word = (_adj_group(m, "d") or _adj_group(m, "v") or "").lower()
+    sign = -1 if word in _ADJ_SOONER else 1
+    delta = sign * _seconds(n, unit)
+    if delta == 0:
+        return None
+    kind_word = (_adj_group(m, "k") or "").lower()
+    kind = "reminder" if kind_word.startswith("remind") else \
+        "timer" if kind_word.startswith("timer") else \
+        "alarm" if kind_word.startswith("alarm") else "all"
+    which = (_adj_group(m, "l") or "").strip()
+    if not which:
+        # "extend my timers by ten minutes": the plural is all of them, as
+        # it is for cancel; the singular or a pronoun is the latest one.
+        which = "all" if kind_word.endswith("s") else "last"
+    try:
+        from jarvis.tools.timekeeper import adjust_line, nothing_to_adjust_line
+    except Exception:                                 # pragma: no cover
+        adjust_line = nothing_to_adjust_line = None
+    items = tk.adjust(which, kind, float(delta))
+    items = list(items) if isinstance(items, (list, tuple)) else []
+    later = delta > 0
+    if not items:
+        line = nothing_to_adjust_line(kind, delta) if nothing_to_adjust_line else \
+            ("Nothing to extend, sir." if later else "Nothing to shorten, sir.")
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status="Nothing to adjust")
+    now = _tk_now(tk)
+    described = _describe_adjusted(tk, items, now)
+    if adjust_line is not None:
+        line = adjust_line(delta, described)
+    else:                                             # pragma: no cover
+        amount = f"{n} {_unit_word(unit, n)}"
+        line = f"{amount} {'added' if later else 'off'}, sir: {'; '.join(described)}."
+    noun = kind if kind != "all" else \
+        (getattr(items[0], "kind", None) if isinstance(getattr(items[0], "kind", None), str)
+         else "schedule")
+    status = f"{str(noun).capitalize()} {'extended' if later else 'shortened'}"
+    log.info("tier-1 adjust: %s %s %r by %+d s -> %s", kind, which,
+             [getattr(i, "id", None) for i in items], delta, line)
+    return CommandResult(handled=True, reply=line, speak=True, status=status,
+                         action=items[0] if len(items) == 1 else items,
+                         undo=_undo_adjust(tk, items, kind, delta))
 
 
 def _h_briefing(c, t, m):
@@ -5537,6 +5759,10 @@ REGISTRY: list[Command] = [
             needs=("timekeeper",)),
     Command("cancel schedule", _CANCEL_SCHED_RX.match, _h_cancel_schedule,
             needs=("timekeeper",)),
+    # After set/list/cancel, so "set a timer for 10 minutes" is untouched;
+    # "extend that timer by 10 minutes" never reaches the model (2026-09-01).
+    Command("adjust schedule", _ADJUST_SCHED_RX.match, _h_adjust_schedule,
+            needs=("timekeeper",)),
     Command("briefing", _BRIEFING_RX.match, _h_briefing, needs=("brain",)),
     Command("preview", _PREVIEW_RX.match, _h_preview, needs=("brain",)),
     # Jarvis's own week before Hunter's: "weekly review" is the self-review,
@@ -5709,7 +5935,7 @@ ASSISTANT_TIER1: list[Command] = [
                     # without a wake-word prefix, like every other surface verb
                     "board show", "board hide", "board focus",
                     "timer", "alarm", "no asides",
-                    "list schedule", "cancel schedule",
+                    "list schedule", "cancel schedule", "adjust schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "register", "next exam",
                     # "good night" is the other half of "good morning": the
@@ -6188,23 +6414,64 @@ def feedback_kind(text: str) -> Optional[bool]:
 # The window is the correction window: an undo older than that is more
 # likely a stray transcript than a change of mind.
 UNDO_WINDOW_S = 60.0
+# "Belay that last order" NAMES the thing it takes back; it is not a stray
+# two-word transcript, so it is honoured for longer than a bare "scratch
+# that". Live 2026-09-01: the timer was set at 21:03:18 and the belay came
+# at 21:10:23 -- seven minutes, and he meant it.
+UNDO_EXPLICIT_WINDOW_S = 15 * 60.0
+_UNDO_OBJECT = r"(?:order|command|instruction|request|thing|one|action|step)"
 _UNDO_RX = re.compile(
     r"^(?:(?:no|nope)[,.!]?\s+)?"
     r"(?:scratch|undo|cancel|forget|belay|take back)\s+"
-    r"(?:that last one|the last(?: one| thing)?|that|it|this)"
+    r"(?:(?P<x1>(?:that|the|my)\s+last(?:\s+" + _UNDO_OBJECT + r")?"
+    r"|that\s+" + _UNDO_OBJECT + r")"
+    r"|the last(?: one| thing)?|that|it|this)"
     r"|^(?:scratch|undo|belay) that"
     r"|^undo(?: the)?(?: last)?(?: one| thing| action)?"
     r"|^take that back"
     r"|^(?:on second thought[s]?|actually)[,.]?\s+(?:scratch|undo|cancel) that",
     re.I)
 _UNDO_TAIL_RX = re.compile(r"^[\s,.!]*(?:please|jarvis|sir|instead)?[\s,.!]*$", re.I)
+# Spoken fillers Whisper writes down: "BELAY THAT LAST Uhhh... ORDER" (live
+# 2026-09-01 21:10:23) was a perfect undo with a hesitation in it, and the
+# hesitation sent it to the intent classifier, which asked "Was that for
+# me?" and then let the model answer "I'll stand down" -- doing nothing.
+_FILLER_RX = re.compile(
+    r",?\s*(?<![a-z])(?:uh+m*|um+|er+m?|ah+|hmm+|mm+|like)(?![a-z])[,.!?…]*", re.I)
+_ELLIPSIS_RX = re.compile(r"\.{2,}|…")
+
+
+def strip_fillers(text: str) -> str:
+    """The utterance without its ums, uhs and ellipses, whitespace
+    collapsed. Case-insensitive and punctuation-tolerant; used only where
+    a filler can carry no meaning (the undo phrase)."""
+    t = _ELLIPSIS_RX.sub(" ", str(text or ""))
+    t = _FILLER_RX.sub(" ", t)
+    return re.sub(r"\s+", " ", t).strip(" ,")
+
+
+def _undo_match(text: str):
+    """The _UNDO_RX match for a whole-utterance undo, else None."""
+    t = strip_fillers(text)
+    m = _UNDO_RX.match(t)
+    if m and _UNDO_TAIL_RX.match(t[m.end():]):
+        return m
+    return None
 
 
 def undo_kind(text: str) -> bool:
     """True when the utterance asks for the last action to be taken back."""
-    t = (text or "").strip()
-    m = _UNDO_RX.match(t)
-    return bool(m) and bool(_UNDO_TAIL_RX.match(t[m.end():]))
+    return _undo_match(text) is not None
+
+
+def undo_explicit(text: str) -> bool:
+    """True for an undo that names its object -- "belay that last order",
+    "cancel that last one", "undo my last request" -- as opposed to the
+    bare "scratch that". The explicit form is honoured for
+    UNDO_EXPLICIT_WINDOW_S and, with nothing to take back, is answered
+    rather than handed on."""
+    m = _undo_match(text)
+    return bool(m) and m.group("x1") is not None
 
 
 @dataclass
@@ -7148,6 +7415,16 @@ class Commander:
         undoable happened, or when what did happen has gone stale."""
         if not undo_kind(text):
             return None
+        # This rung sits AHEAD of the intent gate (step 3a' in
+        # _handle_inner), so an undo is a Tier-1 match by construction: it
+        # never reaches the classifier or the model. Live 2026-09-01
+        # 21:10:23, "BELAY THAT LAST Uhhh... ORDER": the filler kept
+        # undo_kind from matching, the classifier called it Uncertain, and
+        # after his "yes" the MODEL said "I'll stand down" and did nothing.
+        explicit = undo_explicit(text)
+        log.info("undo phrase %r bypasses the intent gate%s", text,
+                 " (explicit)" if explicit else "")
+        window = UNDO_EXPLICIT_WINDOW_S if explicit else UNDO_WINDOW_S
         pend, self._last_undo = self._last_undo, None
         if pend is None:
             # A calendar add made through the TOOL (the confident path, which
@@ -7158,9 +7435,17 @@ class Commander:
             if parked is not None:
                 return parked
             log.info("undo asked for with nothing to undo: %r", text)
+            if explicit:
+                # "Belay that last order" with nothing on the books is still
+                # addressed to Jarvis; it must not fall through to the model.
+                return CommandResult(handled=True, speak=True, status="Nothing to undo",
+                                     reply="Nothing to take back, sir.")
             return None
-        if time.monotonic() - pend[1] > UNDO_WINDOW_S:
+        if time.monotonic() - pend[1] > window:
             log.info("undo expired (%.0fs)", time.monotonic() - pend[1])
+            if explicit:
+                return CommandResult(handled=True, speak=True, status="Nothing to undo",
+                                     reply="Nothing to take back, sir.")
             return None
         try:
             line = pend[0]()
