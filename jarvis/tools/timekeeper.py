@@ -115,6 +115,11 @@ CORRUPT_RECOVERED_LINE = (
 NO_TIMEKEEPER_LINE = "I'm afraid my timekeeper isn't running, sir."
 NOTHING_RINGING_LINE = "Nothing's ringing, sir."
 HOW_LONG_LINE = "How long for, sir?"
+ASK_HOW_MUCH_LINE = "By how many minutes, sir?"
+# "Bring the alarm forward five minutes" while it IS ringing: adjust leaves
+# a ringing item alone on a negative delta, and answering "No alarm to
+# bring forward, sir." over the ringing is nonsense.
+RINGING_NOW_LINE = "It's ringing now, sir."
 
 _COUNT_WORDS = ["no", "one", "two", "three", "four", "five", "six", "seven",
                 "eight", "nine", "ten", "eleven", "twelve"]
@@ -330,6 +335,77 @@ def _rel_words(seconds: float) -> str:
     if r == 30:
         return f"{h} and a half hours"
     return f"{h} hours and {r} minutes"
+
+
+def adjust_amount_words(delta_seconds) -> str:
+    """The magnitude of an adjustment as spoken: 'Ten minutes', 'Five
+    minutes', 'Thirty seconds', 'An hour', 'Ninety minutes'."""
+    s = abs(int(round(float(delta_seconds or 0))))
+    if s >= 3600 and s % 3600 == 0:
+        h = s // 3600
+        return "An hour" if h == 1 else f"{count_words(h).capitalize()} hours"
+    if s >= 60 and s % 60 == 0:
+        m = s // 60
+        return "A minute" if m == 1 else f"{count_words(m).capitalize()} minutes"
+    if s > 120:
+        # An odd amount -- a shorten clamped to now says what actually came
+        # off -- reads as a duration, not as "4110 seconds off, sir".
+        words = _rel_words(s)
+        return words[0].upper() + words[1:]
+    return "A second" if s == 1 else f"{count_words(s).capitalize()} seconds"
+
+
+def adjust_line(delta_seconds, described) -> str:
+    """The success line for an extend / shorten: the amount, then the item
+    with its NEW due, so he hears the new remaining time and not just an
+    acknowledgement -- 'Ten minutes added, sir: pack up the chicken in 20
+    minutes.' / 'Five minutes off, sir: the tea timer in 3 minutes.'
+    ``described`` is one or more _describe_item strings."""
+    parts = [described] if isinstance(described, str) else list(described)
+    verb = "added" if float(delta_seconds or 0) > 0 else "off"
+    return f"{adjust_amount_words(delta_seconds)} {verb}, sir: {join_and(parts)}."
+
+
+def nothing_to_adjust_line(kind, delta_seconds) -> str:
+    """Kind-aware 'nothing matched' for an extend / shorten, modelled on
+    list_text's empty wording: 'No timer to extend, sir.' / 'No reminders
+    to push back, sir.'"""
+    kind = normalize_kind(kind)
+    later = float(delta_seconds or 0) > 0
+    if kind == "timer":
+        return "No timer to extend, sir." if later else "No timer to shorten, sir."
+    if kind == "reminder":
+        return "No reminders to push back, sir." if later else \
+            "No reminders to bring forward, sir."
+    if kind == "alarm":
+        return "No alarm to push back, sir." if later else \
+            "No alarm to bring forward, sir."
+    return "Nothing to extend, sir." if later else "Nothing to shorten, sir."
+
+
+def adjust_empty_line(tk, kind, delta_seconds) -> str:
+    """What to say when an extend / shorten moved nothing: the kind-aware
+    "No timer to extend, sir.", unless the item he means is ringing right
+    now (a negative delta on a ringing item is a no-op)."""
+    if float(delta_seconds or 0) < 0:
+        ring = getattr(tk, "ringing", None)
+        ring_kind = getattr(ring, "kind", None)
+        if isinstance(ring_kind, str) and normalize_kind(kind) in ("all", ring_kind):
+            return RINGING_NOW_LINE
+    return nothing_to_adjust_line(kind, delta_seconds)
+
+
+def applied_delta(items, requested) -> float:
+    """The amount to SAY an adjust moved something by. Normally the amount
+    asked for; when a single item was clamped (a shorten past now), the
+    amount that actually came off -- "999 minutes off, sir: the tea now"
+    was a lie twice over."""
+    requested = float(requested or 0.0)
+    vals = [getattr(i, "applied", None) for i in items]
+    vals = [float(v) for v in vals if isinstance(v, (int, float))]
+    if len(vals) == 1 and vals[0] and abs(vals[0] - requested) > 1.0:
+        return vals[0]
+    return requested
 
 
 def describe_due(due, now=None) -> str:
@@ -1104,6 +1180,9 @@ class Timekeeper:
         self._db: Optional[sqlite3.Connection] = None
         self.quarantined: Optional[Path] = None   # set if the store was corrupt
         self.recovered = 0
+        # Timer ids whose due `adjust` moved: a timer's spoken length is
+        # due - created, which the move invalidates (see _fire).
+        self._adjusted: set = set()
         self._open()
 
     # ---------------------------------------------------------- storage
@@ -1392,7 +1471,14 @@ class Timekeeper:
                 return f"{head} snoozed until {_time_words(_to_dt(it.effective_due))}{tail}"
             return f"{head} {due}{tail}"
         if it.kind == "timer":
-            return f"{display_label(it.label) or 'the ' + duration_words(it.duration) + ' timer'} {due}"
+            label = display_label(it.label)
+            if _AUTO_TIMER_LABEL.match(label or ""):
+                # "10 minutes timer" is what the commander stores for an
+                # unlabelled timer; read back beside the new due after an
+                # extend it contradicts itself -- "10 minutes timer in 20
+                # minutes" -- so it is treated as no label at all.
+                label = ""
+            return f"{label or 'the ' + duration_words(it.duration) + ' timer'} {due}"
         return f"{it.label} {due}{repeat_suffix(it.repeat)}"
 
     def list_text(self, kind: str = "all", now=None) -> str:
@@ -1414,13 +1500,18 @@ class Timekeeper:
             sentences.append(head + join_and(self._describe_item(i, now) for i in group) + ".")
         return " ".join(sentences)
 
-    # -------------------------------------------------------- cancelling
-    def cancel(self, which="last", kind: str = "all") -> int:
+    # ------------------------------------------------------- targeting
+    def _resolve(self, which="last", kind: str = "all") -> list[Item]:
+        """The live items ``which`` names, in ``kind``: "last"/"that"/"it"
+        (most recently created), "all", "next"/"first" (soonest), an exact
+        id, or label words ("the chicken timer" -> needle "chicken").
+        Shared by cancel and adjust so "extend that timer" and "cancel
+        that timer" always land on the same item."""
         which = str(which if which is not None else "last").strip()
         w = which.lower()
         items = self.list(kind)
         if not items:
-            return 0
+            return []
         if w in ("", "last", "latest", "the last one", "last one", "most recent",
                  "the latest", "that", "it", "that one", "this one"):
             targets = [max(items, key=lambda i: (i.created, i.seq))]
@@ -1439,6 +1530,11 @@ class Timekeeper:
             if not targets and needle:
                 words = set(needle.split())
                 targets = [i for i in items if words & set(i.label.lower().split())]
+        return targets
+
+    # -------------------------------------------------------- cancelling
+    def cancel(self, which="last", kind: str = "all") -> int:
+        targets = self._resolve(which, kind)
         effects = []
         with self._lock:
             for it in targets:
@@ -1451,6 +1547,126 @@ class Timekeeper:
         for fx in effects:
             fx()
         return len(targets)
+
+    # -------------------------------------------------------- adjusting
+    def adjust(self, which="last", kind: str = "all", delta_seconds=0.0) -> list[Item]:
+        """Move the due time of the items ``which`` names by ``delta_seconds``
+        (positive = later, negative = sooner). Returns the UPDATED items,
+        re-read from the store so a caller can describe the new due; []
+        when nothing matched or the delta is zero.
+
+        2026-09-01 20:41 -- "Extend that timer by 10 minutes." had no
+        home: the timekeeper could add, list, cancel and snooze, so the
+        model picked ``list`` and read the timer back instead of moving it.
+
+        Per item:
+          pending  -> due += delta. A repeating item shifts only this
+                      occurrence; ``repeat`` (the interval) is untouched.
+                      (An interval nudge walks from NOW when it fires, so
+                      later nudges are unaffected; a daily/weekdays alarm
+                      walks from ``due`` day by day, so its later wall-clock
+                      time follows this shift -- see next_repeat.)
+          snoozed  -> snooze_until += delta (the original due is kept).
+          ringing  -> a positive delta is "give me N more minutes": the same
+                      as snooze(delta / 60) for that item (ring killed,
+                      state snoozed, AlarmStopped(snooze) published). A
+                      negative delta on a ringing item is a no-op: it is
+                      already as early as it gets.
+        A due moved below now is clamped TO now, so it fires on the next
+        tick; the store never holds a due in the past by this route."""
+        try:
+            delta = float(delta_seconds or 0.0)
+        except (TypeError, ValueError):
+            return []
+        if delta == 0.0:
+            return []
+        targets = self._resolve(which, kind)
+        updated: list[Item] = []
+        effects = []
+        with self._lock:
+            now = float(self._now())
+            for stale in targets:
+                # Re-read under the lock. _resolve ran outside it, so the
+                # tick thread may have fired, rung or finished the item in
+                # between; deciding on the snapshot moved the due of an
+                # item that was already done, or left a ringing alarm
+                # ringing with its due ten minutes out.
+                it = self._get(stale.id)
+                if it is None or it.state not in ACTIVE_STATES:
+                    continue
+                # What the item was, for restore(): re-applying the
+                # opposite delta is NOT an undo once a due was clamped.
+                prev = (float(it.due), it.snooze_until, it.state)
+                if it.state == "ringing":
+                    if delta <= 0:
+                        continue
+                    if self._ring is not None and self._ring.item_id == it.id:
+                        self._kill_ring()
+                    new_due = now + delta
+                    applied = delta
+                    self._update(it.id, state="snoozed", snooze_until=new_due)
+                    # A sub-minute "give me thirty more seconds" used to
+                    # publish snooze_min=0; the event is in minutes, so it
+                    # floors at one.
+                    mins = max(1, int(round(delta / 60.0)))
+                    effects.append(lambda it=it, mins=mins: bus.publish(
+                        AlarmStopped(alarm_id=it.id, action="snooze", snooze_min=mins)))
+                    prev = None            # a killed ring cannot be put back
+                elif it.state == "snoozed" and it.snooze_until:
+                    was = float(it.snooze_until)
+                    new_due = max(now, was + delta)
+                    applied = new_due - was
+                    self._update(it.id, snooze_until=new_due)
+                else:
+                    was = float(it.due)
+                    new_due = max(now, was + delta)
+                    applied = new_due - was
+                    self._update(it.id, due=new_due)
+                if it.kind == "timer":
+                    self._adjusted.add(it.id)
+                log.info("timekeeper: %s %s %r by %+d s -> %s",
+                         "extended" if delta > 0 else "shortened", it.kind, it.label,
+                         int(round(applied)),
+                         datetime.fromtimestamp(new_due).strftime("%H:%M"))
+                fresh = self._get(it.id)
+                if fresh is not None:
+                    # Two attributes the store knows nothing about: where
+                    # the item was (restore()) and how far it actually
+                    # moved, which is less than asked for when the clamp
+                    # bit -- the caller must not claim thirty minutes came
+                    # off a five-minute timer.
+                    fresh.previous = prev
+                    fresh.applied = float(applied)
+                    updated.append(fresh)
+        for fx in effects:
+            fx()
+        return updated
+
+    def restore(self, item_id: str, previous) -> bool:
+        """Put one item back exactly where ``adjust`` found it -- the undo
+        of an adjust. ``previous`` is the tuple adjust hangs on each item
+        it returns; a re-applied opposite delta is NOT the same thing,
+        because a shorten past now is clamped to now and adding the delta
+        back would leave the item LATER than it started."""
+        if not item_id or not previous:
+            return False
+        try:
+            due, snooze_until, state = previous
+            due = float(due)
+        except (TypeError, ValueError):
+            return False
+        with self._lock:
+            it = self._get(str(item_id))
+            if it is None or it.state not in ACTIVE_STATES:
+                return False
+            fields = {"due": due, "snooze_until": snooze_until}
+            if isinstance(state, str) and state in ("pending", "snoozed"):
+                fields["state"] = state
+            self._update(it.id, **fields)
+            self._adjusted.discard(it.id)
+        log.info("timekeeper: %s %r put back to %s", it.kind, it.label,
+                 datetime.fromtimestamp(due).strftime("%H:%M"))
+        return True
 
     # ------------------------------------------------------ ring control
     def _kill_ring(self):
@@ -1556,7 +1772,14 @@ class Timekeeper:
             if late:
                 line = LATE_LINE.format(label=item.spoken_label(), time=_when_words(due_dt, now_dt))
             elif item.label and not _AUTO_TIMER_LABEL.match(item.label):
-                line = TIMER_LABEL_LINE.format(n=n, label=item.label)
+                # duration is due - created, which an adjust invalidates: a
+                # ten-minute timer shortened to now (adjust clamps there)
+                # read "your 1-minute pack up the chicken timer is up", and
+                # one clamped exactly reads "0-second". The length is
+                # dropped for any timer whose due was moved.
+                line = TIMER_LABEL_LINE.format(n=n, label=item.label) \
+                    if item.duration >= 1 and item.id not in self._adjusted else \
+                    f"Sir, your {item.label} timer is up."
             else:
                 line = TIMER_LINE.format(n=n)
             text = f"{item.label or n + ' timer'}"
@@ -1981,9 +2204,47 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             a = "cancel"
         elif a in ("stop", "dismiss", "off", "silence", "quiet", "turn off", "shut up"):
             a = "stop"
-        elif a in ("snooze", "later", "postpone"):
+        elif a == "snooze":
             a = "snooze"
+        elif a in ("later", "postpone"):
+            # Both used to mean snooze outright, which answered "Nothing's
+            # ringing, sir." to "postpone the timer by ten minutes" said
+            # while it was still counting down. Snooze only when something
+            # IS ringing; otherwise it is a push-back of a pending item.
+            a = "snooze" if t.ringing is not None else "extend"
+        elif a in ("extend", "add", "more", "longer", "push back", "push", "delay",
+                   "defer", "prolong", "lengthen", "push_back", "pushback"):
+            a = "extend"
+        elif a in ("shorten", "reduce", "cut", "less", "shorter", "bring forward",
+                   "earlier", "sooner", "subtract", "take off", "bring_forward",
+                   "take_off", "takeoff"):
+            a = "shorten"
         kind = normalize_kind(kind)
+        if a in ("extend", "shorten"):
+            # 2026-09-01 20:41 -- "Extend that timer by 10 minutes." The enum
+            # had no such action, so the model chose `list` and read the
+            # timer back. `minutes` is the MAGNITUDE; the sign is the action.
+            # The model does write "1 hour" and "90 seconds" into a
+            # parameter the schema calls minutes, and _coerce_int read
+            # those as 1 minute and 90 minutes. parse_duration knows the
+            # units; a bare number is still minutes.
+            secs = parse_duration(minutes)
+            if secs is None:
+                mins = _coerce_int(minutes)
+                secs = abs(mins) * 60.0 if mins else None
+            secs = abs(float(secs)) if secs else 0.0
+            if not secs:
+                return ToolResult(text=ASK_HOW_MUCH_LINE, ok=False,
+                                  speak=ASK_HOW_MUCH_LINE)
+            delta = secs if a == "extend" else -secs
+            items = t.adjust(which if which not in (None, "") else "last", kind, delta)
+            if not items:
+                line = adjust_empty_line(t, kind, delta)
+                return ToolResult(text=line, ok=False, speak=line)
+            epoch = float(t._now())
+            line = adjust_line(applied_delta(items, delta),
+                               [t._describe_item(i, epoch) for i in items])
+            return ToolResult(text=line, speak=line)
         if a == "list":
             text = t.list_text(kind)
             return ToolResult(text=text, speak=text, max_sentences=3)
@@ -2047,14 +2308,19 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             handler=set_alarm),
         ToolSpec(
             name="manage_schedule",
-            description="List or cancel reminders, timers and alarms; stop or snooze a ringing alarm.",
+            description="List, cancel, extend or shorten reminders, timers and alarms; "
+                        "stop or snooze a ringing alarm.",
             parameters={"type": "object",
                         "properties": {
-                            "action": {"type": "string", "enum": ["list", "cancel", "stop", "snooze"]},
+                            "action": {"type": "string",
+                                       "enum": ["list", "cancel", "extend", "shorten",
+                                                "stop", "snooze"]},
                             "kind": {"type": "string", "enum": ["reminder", "timer", "alarm", "all"]},
                             "which": {"type": "string",
                                       "description": "'last', 'all' or words from the item"},
-                            "minutes": {"type": "number"}},
+                            "minutes": {"type": "number",
+                                        "description": "how much to add (extend), take off "
+                                                       "(shorten) or snooze for"}},
                         "required": ["action"]},
             handler=manage_schedule),
     ]
