@@ -383,6 +383,20 @@ class SensingChanged(Event):
 
 
 @dataclass
+class RoomChanged(Event):
+    """He moved between rooms (jarvis/roomfabric.py). Published only when the
+    ACTIVE room changes, never on every reading -- the fabric polls three
+    radars every two seconds and a per-tick event would be a metronome on
+    the bus. `previous` is "" on the first sighting of a session, and the
+    change has already survived the enter hold and the switch floor, so a
+    subscriber may treat it as settled rather than debouncing it again."""
+    room: str = ""                    # the room name from presence.rooms[].name
+    label: str = ""                   # what to say out loud
+    previous: str = ""
+    at: float = 0.0                   # time.time() of the change
+
+
+@dataclass
 class DeskState(Event):
     """He sat down at / walked away from the keyboard (jarvis/deskpresence.py,
     GNOME's Mutter idle monitor). Published only on a threshold crossing;
