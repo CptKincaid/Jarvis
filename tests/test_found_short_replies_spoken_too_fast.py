@@ -138,7 +138,7 @@ def test_only_f5_is_padded():
     derives it from the mel decoder; none of them has the byte-count cliff,
     and rewriting their text would be a change nobody measured."""
     assert tts_mod._ENGINE_NEEDS_SHORT_PAD["f5"] is True
-    for engine in ("edge", "xtts", "fish"):
+    for engine in ("edge", "xtts", "fish", "breeze"):
         assert tts_mod._ENGINE_NEEDS_SHORT_PAD[engine] is False
         assert _tts(engine)._clean_for_speech("Buy milk.") == "Buy milk."
 

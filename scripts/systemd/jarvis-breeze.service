@@ -1,0 +1,55 @@
+[Unit]
+Description=Breeze-TTS-2 (Q4) sidecar (resident local voice) for Jarvis
+# Keeps the quantized Breeze model resident so the voice never pays its cold
+# start at the moment it is needed: measured 7.3 s to load ckpt-q4 plus
+# 22.0 s of CUDA-graph capture, then a first render at RTF 1.868 -- ~30.8 s
+# to first audio on demand, against a 1.390 s hard ceiling. Resident it is
+# 0.27 s to first audio at RTF 0.742.
+#
+# Install with scripts/setup_breeze_service.sh, which deliberately does NOT
+# enable or start it: the first start puts a 13.5 GB resident model onto a
+# GPU whose memory is the system memory, so that moment is chosen by a
+# person. Jarvis works exactly as it does today until then.
+#
+# A crash loop here is far more dangerous than F5's: every restart re-enters
+# graph capture, which transiently demands ~18.3 GB above steady state and
+# was measured driving system-wide MemFree to 2.39 GiB. Three attempts in
+# ten minutes, thirty seconds apart, then it stays down and Jarvis uses F5.
+StartLimitIntervalSec=600
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Without ptxas the depth decoder's torch.compile inside the graph path
+# fails on sm_121a (Triton bundles 12.8, which does not know it) and you get
+# the working-but-too-slow server: int4 with no graphs is RTF 1.131, above
+# real time, so it underruns mid-utterance. BREEZE_TEXT_ENCODER_ATTN=sdpa
+# reproduces the arm Hunter rated 4.71 in the round-11 blind test.
+Environment=TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
+Environment=BREEZE_TEXT_ENCODER_ATTN=sdpa
+# /tmp is wiped at boot (tmpfiles `D /tmp`), so the socket directory is
+# recreated here rather than assumed. Paths mirror jarvis/config.py PATHS:
+# BREEZE_PYTHON, BREEZE_CKPT, BREEZE_REPO, VOICE_REF_F5, VOICE_REF_F5_TEXT
+# and BREEZE_SOCK (LOG_DIR/breeze.sock).
+ExecStartPre=/usr/bin/mkdir -p /tmp/vss_voice
+ExecStart=%h/voice-training/engines/breeze/venv/bin/python %h/Jarvis/scripts/breeze_server.py --socket /tmp/vss_voice/breeze.sock --model %h/voice-training/engines/breeze-q4/ckpt-q4 --repo %h/voice-training/engines/breeze-q4/repo --ref %h/.aiws_trainer/jarvis_voice_ref_f5.wav --ref-text %h/.aiws_trainer/jarvis_voice_ref_f5.txt --gpu-lock %h/voice-training/.gpu.lock
+# The reference clip and its transcript are what give Breeze this voice, and
+# the server reads both at start: swap either, restart the unit.
+Restart=always
+RestartSec=30
+# A DELIBERATE REFUSAL IS TERMINAL. breeze_server.py returns 2 when a path is
+# missing, when MemFree/MemAvailable are under the floor, or when a live
+# sidecar already owns the socket -- none of which a restart can fix. Without
+# this, systemd counted each refusal as a start attempt, so three of them in
+# ten minutes replaced the (legible, actionable) MemFree message with "start
+# request repeated too quickly" and left the unit failed until someone ran
+# `systemctl --user reset-failed jarvis-breeze.service` -- and the obvious
+# recovery sequence (start, read the message, free some memory, start again)
+# is exactly what hit that.
+RestartPreventExitStatus=2
+# The load holds the GPU flock and can queue behind another job; SIGTERM at
+# any point is safe, the server holds no state worth flushing.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

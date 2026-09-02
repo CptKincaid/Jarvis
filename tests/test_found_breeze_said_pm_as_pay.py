@@ -211,12 +211,13 @@ def test_the_old_flags_still_gate_what_they_always_gated():
 def test_the_engine_decides_and_the_wiring_carries_the_engine(tmp_path):
     """``TTS._pronounce`` must ask for its OWN engine's row.
 
-    ``_engine`` is set directly rather than through the constructor because
-    "breeze" is not in ``_ENGINES`` on this branch -- registering it belongs
-    with the synth and the sidecar, and registering it here without them
-    would route breeze to the XTTS default and file the result under the
-    breeze cache key. The pronunciation seam is independent of that, and
-    this pins it so the two land already agreeing.
+    ``_engine`` is set directly rather than through the constructor, which
+    is how this was written when "breeze" was not yet in ``_ENGINES``: the
+    pronunciation seam landed first, deliberately independent of the synth
+    and the sidecar, so the two would meet already agreeing. They have now
+    met -- breeze IS registered -- and the direct assignment stays because
+    what this test is about is the seam, not the registration, and it must
+    keep working if either side is ever lifted out again.
     """
     from jarvis.tts import TTS
     line = "Your 9:10 is Biosensors at 6:00 pm, Wisenbaker 049."
