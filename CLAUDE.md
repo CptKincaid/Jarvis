@@ -47,7 +47,12 @@ token). `JARVIS_LOOK=classic` in the environment beats `console.look` in
 `ui look: <name>`), so a change applies after a restart, never mid-session.
 UI modules must read `theme.X` at call time — a def-time capture (a default
 argument, a class-body dict) freezes the import-time look;
-`tests/test_theme_look.py` fails on new ones.
+`tests/test_theme_look.py` fails on new ones (the classic oracle is
+`tests/fixtures/theme_tokens_85d5066.json`). Classic is exact to the pixel,
+warts included: the 920-px status-strip wake-word/CPU overprint and the
+clipped command-bar placeholder at scale 2.0 are fixed in holo only
+(`StatusStrip._layout`, `CommandBar._placeholder_for`), each behind a
+one-line `theme.LOOK != "holo"` guard should he want them in classic too.
 
 ## Architecture (V3)
 ~31k lines across 32 top-level modules plus `tools/`, `ui/`, `channels/`,

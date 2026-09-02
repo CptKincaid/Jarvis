@@ -443,11 +443,15 @@ DEFAULTS: dict = {
     # walks the window slowly so a static clock cannot burn in. powerup: the
     # staged sweep the first time he sits down after an overnight gap, at
     # most once a day (the date latch lives beside the briefing's, in
-    # briefing_state.json).
+    # briefing_state.json). look: "holo" (the 2026-09-01 blue-holographic
+    # overhaul) or "classic" (the 08-31 console, token for token -- the
+    # fallback); read ONCE at window creation, so it applies after a
+    # restart. The voice command "switch to classic visuals" writes it; a
+    # JARVIS_LOOK in the environment outranks it (jarvis/ui/theme.py).
     "console": {"board": True, "ambient": True, "standby": True,
                 "ambient_after_s": 45, "standby_after_min": 12,
                 "standby_dim": 0.35, "drift_px_per_min": 3,
-                "powerup": True, "powerup_gap_h": 6},
+                "powerup": True, "powerup_gap_h": 6, "look": "holo"},
     # Phone intercom (jarvis/intercom.py): a recorded clip sent over the
     # command socket instead of a wake word. verify_speaker runs the same
     # ECAPA gate the microphone path uses -- off by default because the

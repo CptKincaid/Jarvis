@@ -4392,17 +4392,27 @@ ROOM_TONE_STATUS_OFF = "The room tone is off, sir."
 # token as the fallback he asked for. The switch is a config write that the
 # window reads ONCE at create(), so the line says "after a restart" out
 # loud: a look that half-applies mid-session is the only way this can look
-# broken. Either a verb ("switch to classic") or a surface noun ("classic
-# visuals") is required -- a bare "classic" or "hologram" is not an order.
+# broken. Either a switching verb ("switch to classic") or a surface noun
+# ("classic visuals") is required -- a bare "classic" or "hologram" is not
+# an order. "ui look" is Tier 1 and so BYPASSES the intent gate; the review
+# of 09-01 found "give me classic" / "i want the classic" / "use classic"
+# matching the noun-less path, and an overheard sentence in an open
+# listening window would have rewritten the config. So only the four verbs
+# that cannot mean anything else with a look name after "to" may drop the
+# noun; every softer opener needs it.
 _UI_LOOK_WORD = r"(?P<look%s>classic|holo(?:graphic|gram)?)"   # one name per branch
 _UI_LOOK_NOUN = r"(?:visuals?|look|theme|ui|skin|style|console|interface|display|graphics)"
+_UI_LOOK_TO = r"(?:\s+(?:it|me|us))?(?:\s+back)?(?:\s+over)?\s+to"
 _UI_LOOK_RX = re.compile(
     r"^" + _JV + r"(?:"
-    # "switch to (the) classic (look)", "go back to the holographic visuals",
-    # "use the holo look", "give me the classic visuals"
-    r"(?:(?:switch|change|go|flip|set|put|take)(?:\s+(?:it|me|us))?(?:\s+back)?(?:\s+over)?"
-    r"\s+to|use|give me|show me|i want|i'd like|i would like|let's have|lets have)"
+    # "switch to (the) classic (look)", "flip back to holo", "set it to classic mode"
+    r"(?:switch|change|set|flip)" + _UI_LOOK_TO +
     r"\s+(?:the\s+)?" + _UI_LOOK_WORD % 1 + r"(?:\s+mode)?(?:\s+" + _UI_LOOK_NOUN + r")?"
+    # "go back to the holographic visuals", "use the holo look", "give me the
+    # classic visuals" -- the noun is mandatory here
+    r"|(?:(?:go|put|take)" + _UI_LOOK_TO +
+    r"|use|give me|show me|i want|i'd like|i would like|let's have|lets have)"
+    r"\s+(?:the\s+)?" + _UI_LOOK_WORD % 4 + r"(?:\s+mode)?\s+" + _UI_LOOK_NOUN +
     # "switch the visuals to classic", "change the look to holographic"
     r"|(?:switch|change|set|flip|put|turn)\s+(?:the\s+|your\s+|my\s+)?" + _UI_LOOK_NOUN +
     r"(?:\s+back)?\s+(?:to|over to|into)\s+(?:the\s+)?" + _UI_LOOK_WORD % 2 + r"(?:\s+(?:mode|one))?"
@@ -4412,10 +4422,17 @@ _UI_LOOK_RX = re.compile(
     # takes [,\s] not just whitespace.
     r")(?:[,\s]+(?:please|now|sir))*[.!\s]*$", re.I)
 UI_LOOK_OPTION = "console.look"          # == jarvis.ui.theme.OPTION_KEY (tested)
+UI_LOOK_ENV = "JARVIS_LOOK"              # == jarvis.ui.theme.ENV_KEY (tested)
 UI_LOOK_LINES = {
     "classic": "Classic visuals, sir \u2014 it applies after a restart.",
     "holo": "Holographic visuals, sir \u2014 after a restart.",
 }
+# The env var outranks the saved option in theme.resolve_look (a one-off
+# run, the judge harness), so a launcher that exports it would make the
+# restart promise above a lie. Say so instead of promising.
+UI_LOOK_PINNED_LINE = ("Saved, sir \u2014 but the environment pins the look to "
+                       "{pinned} until the {env} variable is removed.")
+_UI_LOOK_SPOKEN = {"classic": "classic", "holo": "holographic"}
 UI_LOOK_NO_CONFIG_LINE = ("I can't reach the settings to change the visuals, "
                           "sir \u2014 the assistant config isn't wired.")
 UI_LOOK_SAVE_FAILED_LINE = "I couldn't save the visuals setting, sir."
@@ -4430,7 +4447,8 @@ def _h_ui_look(c, t, m):
     to the router, which would hand "switch to classic visuals" to a model
     that cannot do it.
     """
-    word = (m.group("look1") or m.group("look2") or m.group("look3") or "").lower()
+    word = next((v for k, v in m.groupdict().items()
+                 if k.startswith("look") and v), "").lower()
     name = "classic" if word.startswith("classic") else "holo"
     cfg = c._svc("assistant")
     if cfg is None or not hasattr(cfg, "set"):
@@ -4442,6 +4460,17 @@ def _h_ui_look(c, t, m):
         log.exception("%s could not be saved", UI_LOOK_OPTION)
         return CommandResult(handled=True, speak=True, reply=UI_LOOK_SAVE_FAILED_LINE,
                              status="Visuals: save failed")
+    # Our own environment is the one the restart inherits (the autostart
+    # entry re-runs the same launcher), so a valid JARVIS_LOOK here that
+    # disagrees with the write means resolve_look will ignore the write.
+    pinned = (os.environ.get(UI_LOOK_ENV) or "").strip().lower()
+    if pinned in UI_LOOK_LINES and pinned != name:
+        log.info("%s=%s overrides the saved %s=%s at the next start",
+                 UI_LOOK_ENV, pinned, UI_LOOK_OPTION, name)
+        return CommandResult(handled=True, speak=True,
+                             reply=UI_LOOK_PINNED_LINE.format(
+                                 pinned=_UI_LOOK_SPOKEN[pinned], env=UI_LOOK_ENV),
+                             status=f"Visuals: {name} saved, env pins {pinned}")
     return CommandResult(handled=True, speak=True, reply=UI_LOOK_LINES[name],
                          status=f"Visuals: {name} (restart)")
 

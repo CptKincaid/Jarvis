@@ -20,7 +20,11 @@ import pytest
 from jarvis.ui import theme
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
-ORACLE = REPO / "scratchpad" / "holo" / "classic" / "theme_tokens_85d5066.json"
+# Tracked next to the other fixtures: the first cut pointed at
+# scratchpad/holo/classic/, which .gitignore drops, so on any other clone the
+# exactness guard hard-failed -- and anyone could re-dump a drifted classic
+# and the test would have blessed it (09-01 review).
+ORACLE = REPO / "tests" / "fixtures" / "theme_tokens_85d5066.json"
 
 
 @pytest.fixture(autouse=True)
@@ -53,7 +57,7 @@ def test_looks_and_default():
 
 
 def test_classic_reproduces_every_oracle_token():
-    assert ORACLE.exists(), "the classic oracle JSON is part of the repo"
+    assert ORACLE.exists(), "the classic oracle JSON is a tracked fixture"
     oracle = _oracle()
     assert len(oracle) == 62
     assert theme.select_look("classic") == "classic"
@@ -136,6 +140,26 @@ def test_holo_is_glass_over_film_black():
     # secondary text lifted ~10%
     for k in ("MUTED", "FAINT"):
         assert 1.05 < lum(holo[k]) / lum(classic[k]) < 1.20, k
+
+
+def test_holo_transcript_ground_is_flat_so_frame_cards_match_it():
+    """Tk has no alpha: a card's interior is ONE colour, card_look makes it
+    TV_BG, and the 09-01 review measured the pool/gradient behind the holo
+    cards turning each into a 7-25 level darker slab. So in holo the top
+    lift is zero (the stage seam lands on TV_BG) and the transcript draws
+    no pool/floor/gradient; classic keeps them (oracle)."""
+    from jarvis.ui.views import card_look, ground_is_flat
+    assert theme.LOOK == "holo"
+    assert theme.TV_TOP == theme.TV_BG
+    assert theme.SEAM_STEPS[-1] == theme.TV_BG and theme.SEAM_STEPS[0] != theme.TV_BG
+    assert ground_is_flat() is True and ground_is_flat("classic") is False
+    for role in ("jarvis", "user", "partial", "progress", "briefing"):
+        assert card_look(role)["fill"] == theme.TV_BG, role
+    theme.select_look("classic")
+    assert ground_is_flat() is False
+    assert theme.TV_TOP != theme.TV_BG
+    assert theme.TV_TOP == _oracle()["TV_TOP"]
+    assert list(theme.SEAM_STEPS) == list(_oracle()["SEAM_STEPS"])
 
 
 # ------------------------------------------------------------ resolve_look
@@ -231,6 +255,19 @@ def test_spacing_and_type_scale_are_look_independent():
 def test_commander_writes_the_key_theme_reads():
     import jarvis.commander as commander
     assert commander.UI_LOOK_OPTION == theme.OPTION_KEY == "console.look"
+    # ...and checks the same env var resolve_look lets outrank that key
+    assert commander.UI_LOOK_ENV == theme.ENV_KEY == "JARVIS_LOOK"
+
+
+def test_the_option_is_discoverable_in_the_config_defaults():
+    """Only the voice command ever created console.look, so a hand-editing
+    user had nothing to find in assistant.json (09-01 review). The default
+    must resolve exactly as an absent key does."""
+    from jarvis.assistant_config import DEFAULTS
+    section, key = theme.OPTION_KEY.split(".")
+    assert DEFAULTS[section][key] == theme.DEFAULT_LOOK
+    assert theme.resolve_look({}, lambda k, d=None: DEFAULTS[section][key]) \
+        == theme.resolve_look({}, lambda k, d=None: None) == theme.DEFAULT_LOOK
 
 
 # ------------------------------------------------------------ call-time guard

@@ -1,0 +1,133 @@
+{
+ "ARC_BRIGHT": "#55d0e8",
+ "BG": "#0d1b2a",
+ "BRIGHT": "#2fc6e3",
+ "CHAMFER": 10,
+ "CORE_BANDS": [
+  "#ffffff",
+  "#d4f4ff",
+  "#a8e9ff",
+  "#7de4ff",
+  "#2591a9"
+ ],
+ "CYAN": "#35e0ff",
+ "CYAN_DIM": "#1899bd",
+ "CYAN_SOFT": "#174e61",
+ "EDGE": "#2591a9",
+ "ERR": "#f8556d",
+ "FAINT": "#61788f",
+ "FOCAL": "#eaf7ff",
+ "FOCAL_WORD_STATES": [
+  "idle",
+  "working",
+  "waiting"
+ ],
+ "FRAME": "#175063",
+ "GLASS_EDGE": "#4b7b8a",
+ "GLOW_UNDER": "#1d4f61",
+ "GRID": "#123445",
+ "HOLO": "#1b6176",
+ "HOLO_DIM": "#154658",
+ "INK": "#e8f0f8",
+ "LINE": "#154456",
+ "MUTED": "#93a9be",
+ "OK": "#eaf7ff",
+ "PAD": 16,
+ "PAD_L": 24,
+ "PAD_S": 8,
+ "RADIUS": 10,
+ "RAIL": "#478c9e",
+ "RAISED": "#183748",
+ "RAMP13": "#123445",
+ "RAMP20": "#154254",
+ "RAMP27": "#175063",
+ "RAMP33": "#1a5c70",
+ "RAMP40": "#1d697f",
+ "RAMP47": "#1f778e",
+ "RAMP60": "#2591a9",
+ "SCAN": "#133a4c",
+ "SEAM_STEPS": [
+  "#0d1b2a",
+  "#0d1c2c",
+  "#0d1e2d",
+  "#0d1f2e",
+  "#0e2030",
+  "#0e2231",
+  "#0e2333",
+  "#0e2535",
+  "#0f2737",
+  "#0f2839",
+  "#0f2a3b",
+  "#102c3d",
+  "#102e3f",
+  "#103041",
+  "#113243",
+  "#113345",
+  "#113547",
+  "#123749",
+  "#12394b",
+  "#133c4e"
+ ],
+ "SIZE_BODY": 15,
+ "SIZE_CAPTION": 9,
+ "SIZE_LABEL": 13,
+ "SIZE_WORDMARK": 22,
+ "SURFACE": "#122838",
+ "TV_BG": "#0f2434",
+ "TV_FLOOR": "#123344",
+ "TV_GRID": "#1c4b5d",
+ "TV_NODE": "#81d5e6",
+ "TV_POOL": [
+  "#0f2738",
+  "#102c3d",
+  "#113142",
+  "#123547"
+ ],
+ "TV_RING": "#163e4f",
+ "TV_RING_GHOST": "#102d3e",
+ "TV_SCANLINE": "#102b3c",
+ "TV_TOP": "#133c4e",
+ "TV_WIRE": "#113142",
+ "TV_WIRE2": "#154254",
+ "WARN": "#ffb454",
+ "_BASE_SPACING": [
+  16,
+  8,
+  24,
+  10,
+  10
+ ],
+ "_BG_RGB": [
+  13,
+  27,
+  42
+ ],
+ "_CY_RGB": [
+  53,
+  224,
+  255
+ ],
+ "_DISPLAY_FACES": [
+  [
+   "Chakra Petch",
+   "Chakra Petch Medium",
+   "Chakra Petch SemiBold"
+  ],
+  [
+   "Rajdhani",
+   "Rajdhani Medium",
+   "Rajdhani SemiBold"
+  ]
+ ],
+ "_HAS_DISPLAY": false,
+ "_TV_RGB": [
+  15,
+  36,
+  52
+ ],
+ "_WHITE": [
+  255,
+  255,
+  255
+ ]
+}

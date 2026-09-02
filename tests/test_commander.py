@@ -2000,9 +2000,55 @@ def test_look_switch_without_a_config_says_so_aloud(rich):
     "classic", "holographic", "look at the screen", "switch to the other monitor",
     "use the classic rock playlist", "look up holograms", "set the visuals",
     "take a look", "switch to the vss project",
+    # 09-01 review: the soft openers matched WITHOUT a surface noun, and
+    # "ui look" is Tier 1 (no intent gate), so an overheard "give me classic"
+    # in an open listening window rewrote the config. Only switch/change/
+    # set/flip + "to" may drop the noun.
+    "give me classic", "i want the classic", "use classic", "show me the classic",
+    "go to classic", "take me to classic", "put it to classic", "i'd like holo",
+    "let's have classic",
 ])
 def test_look_regex_leaves_everything_else_alone(text):
     assert commander._UI_LOOK_RX.match(text) is None, text
+
+
+@pytest.mark.parametrize("text, name", [
+    ("switch to classic", "classic"), ("flip back to holo", "holo"),
+    ("set it to classic mode", "classic"), ("change to the holographic", "holo"),
+    ("give me the classic visuals", "classic"), ("i want the holo look", "holo"),
+    ("take me back to the classic visuals", "classic"),
+])
+def test_switching_verbs_may_drop_the_noun_but_soft_openers_may_not(rich, text, name):
+    rich.services.assistant = _LookCfg()
+    res = rich.handle(text, source="voice")
+    assert res.reply == commander.UI_LOOK_LINES[name], text
+    assert rich.services.assistant.sets == [("console.look", name)]
+
+
+def test_a_pinning_env_var_is_confessed_not_promised_away(rich, monkeypatch):
+    """theme.resolve_look lets JARVIS_LOOK outrank console.look, so with the
+    env exported the "applies after a restart" line would be false. The
+    write still happens (the pin may be lifted later); the reply says why
+    nothing will change."""
+    rich.services.assistant = _LookCfg()
+    monkeypatch.setenv(commander.UI_LOOK_ENV, "holo")
+    res = rich.handle("switch to classic visuals", source="voice")
+    assert rich.services.assistant.sets == [("console.look", "classic")]
+    assert res.handled and res.speak
+    assert res.reply == commander.UI_LOOK_PINNED_LINE.format(
+        pinned="holographic", env="JARVIS_LOOK")
+    assert "restart" not in res.reply
+    assert res.status == "Visuals: classic saved, env pins holo"
+    # an env that agrees with the write, or that names junk, is not a pin
+    rich.services.assistant.sets.clear()
+    res = rich.handle("switch to holo visuals", source="voice")
+    assert res.reply == commander.UI_LOOK_LINES["holo"]
+    monkeypatch.setenv(commander.UI_LOOK_ENV, "neon")
+    res = rich.handle("switch to classic visuals", source="voice")
+    assert res.reply == commander.UI_LOOK_LINES["classic"]
+    monkeypatch.delenv(commander.UI_LOOK_ENV)
+    res = rich.handle("switch to classic visuals", source="voice")
+    assert res.reply == commander.UI_LOOK_LINES["classic"]
 
 
 def test_ui_look_is_a_tier_one_command_and_precedes_the_router(rich):
