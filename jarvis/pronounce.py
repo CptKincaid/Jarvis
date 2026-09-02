@@ -128,9 +128,10 @@ DEFAULT_SYMBOLS: dict[str, str] = {
 # 2026-08-28 answering a calendar question). The calendar, alarm, reminder
 # and briefing tools all emit times in exactly this shape.
 #
-# Only times carrying an am/pm marker are rewritten. A bare "16:9" or "3:15"
-# is far more likely to be a ratio or a score than a clock reading, and a
-# wrong rewrite there is worse than the digits.
+# BARE times are rewritten too, since 2026-09-02 -- see _BARE_TIME_RX below,
+# which is where the reasoning for that (and the shape it is narrowed to)
+# lives. It has to run AFTER the meridiem pass: a bare pass that got there
+# first would leave "9:10 am" as "nine ten am" with the marker unspelled.
 _ONES = ("twelve", "one", "two", "three", "four", "five", "six", "seven",
          "eight", "nine", "ten", "eleven")
 _TENS = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty"}
@@ -193,9 +194,114 @@ def _spoken_time(match: "re.Match") -> str:
     return spoken
 
 
+# --------------------------------------------------- bare clock times
+#
+# 2026-09-02 08:55, heard: "Your 9:10 is Biosensors, Wisenbaker 049" was
+# rattled off. _TIME_RX above needs an am/pm marker, so a bare "9:10" reached
+# F5 as four literal characters -- and F5 buys time BY THE BYTE, not by the
+# word. scripts/f5_server.py allocates
+#
+#     native = ref_frames / ref_text_bytes * gen_bytes / speed   (bytes)
+#     floor  = 0.45 + 0.04988 * gen_bytes                        (bytes)
+#
+# so at the shipped reference (528 frames / 109 bytes, speed 0.85, i.e.
+# K = 0.06079 s/byte, floor binding below 41.3 bytes) that sentence -- 40
+# bytes, one chunk -- was given 2.44 s. What it has to SAY is "Your nine ten
+# is Biosensors, Wisenbaker zero four nine": 16 syllables, 3.12-3.73 s at the
+# 195-233 ms/syllable this voice measures, or 3.00 s by this speaker's own
+# affine law (sec = 0.2540 + 0.04988*bytes, n=400, r=0.960). A shortfall of
+# 0.55-1.29 s, and the model compresses to fit. It is not a rate setting: the
+# floor ignores speed entirely (jarvis/tts.py, SHORT_LINE_BYTES).
+#
+# Measured over every distinct chunk Jarvis spoke this boot (n=42): all 10
+# chunks with a negative margin contain a digit, and all 25 chunks without a
+# digit have a positive one. Digits are the whole of the effect. So the fix is
+# spending bytes on the digits -- the same "the character has to not reach the
+# engine" move as the hyphen above -- and once expanded the sentence is 55
+# bytes, clears the 41.3-byte floor into the native regime, and gets 3.34 s
+# against a 3.00 s need: a +0.35 s margin, in line with the +0.19 s and
+# +0.20 s the healthy lines have. No engine-side change is needed for it.
+#
+# The shape is narrow ON PURPOSE. The old note here was right that a bare
+# "16:9" is a ratio, not a clock, so: hours 1-12 only (which is exactly what
+# every composer emits -- jarvis/dossier.py clock() is "{h%12 or 12}:{mm:02d}")
+# and a two-digit minute, which rules out "16:9", "21:9" and "4:3"; and the
+# lookarounds keep it off a timestamp ("08:56:15") and out of the middle of a
+# longer number. EVIDENCE that this is safe on his text: of the 18 distinct
+# "h:mm" strings spoken across this boot and the previous one, all 18 are
+# clock readings and none is a ratio or a score.
+#
+# On the hour gets "o'clock", not a bare hour word: "Your four is Biosensors"
+# is not English, and "o'clock" is also 8 bytes of the time this line was
+# short of. The marked path keeps its own shape ("six pee em"), where the
+# marker already carries the sentence.
+_BARE_TIME_RX = re.compile(r"(?<![\w:])(0?[1-9]|1[0-2]):([0-5]\d)(?![\w:])")
+
+
+def _spoken_bare_time(match: "re.Match") -> str:
+    hour, minute = int(match.group(1)), int(match.group(2))
+    spoken = _ONES[hour % 12]
+    if not minute:
+        return f"{spoken} o'clock"
+    return f"{spoken} {_minutes_in_words(minute)}"
+
+
+def speak_bare_times(text: str) -> str:
+    """Rewrite a bare "9:10" as "nine ten" (no meridiem is invented)."""
+    return _BARE_TIME_RX.sub(_spoken_bare_time, text)
+
+
 def speak_times(text: str) -> str:
-    """Rewrite "6:00 pm" as "six pm" so the engine does not spell the colon."""
-    return _TIME_RX.sub(_spoken_time, text)
+    """Rewrite "6:00 pm" as "six pm" so the engine does not spell the colon.
+
+    Marked times first, then bare ones: the marked pattern has to see its
+    "am"/"pm" still attached to the digits it belongs to.
+    """
+    return speak_bare_times(_TIME_RX.sub(_spoken_time, text))
+
+
+# ---------------------------------------------------- room numbers
+#
+# The other half of the 2026-09-02 line. "049" is three bytes carrying four
+# syllables ("zero four nine"), and by the arithmetic above every byte is
+# 60 ms of the sentence's air, so the room number alone was starving it of
+# ~0.67 s. jarvis/dossier.py room_words() deliberately keeps the digits --
+# the card shows the room the way the calendar wrote it -- so this is the
+# only place it can be said out loud.
+#
+# THE RULE, and it is deliberately one rule and not a clever one: a run of
+# 2-4 digits WITH A LEADING ZERO is an identifier, and is said digit by
+# digit. Nothing else is touched. A leading zero is the one thing in written
+# English that cannot be a quantity -- nobody writes "049 minutes" -- so this
+# limb has no false-positive shape at all, and the tests pin the quantities
+# ("10 minutes", "30 minutes", "78 days", "95 degrees") unchanged.
+#
+# WHAT IS DELIBERATELY NOT DONE, having tried it: the other identifiers in
+# his calendar -- "ETB 1035", "Ecen 404", "Jack E. Brown 731A" -- have no
+# leading zero, and every shape rule that reaches them also reaches a real
+# quantity he has actually been told. "a capitalised word then 3-4 digits"
+# eats "Volume 100, sir." (spoken 2026-09-01); "digits then a capital letter"
+# eats the model sizes "70B" and "32B". It is the LAB-versus-CPU problem from
+# _SHOUTED_WORDS again: shape cannot separate them. "Ecen 404" is the worst
+# margin in the whole boot (-0.94 s) and IS still wrong; it wants either a
+# building/course list drawn from his own calendar or the expansion done at
+# the composer, where the string is known to be a room. Measured, written
+# down, and left for a decision rather than guessed at here.
+#
+# The lookarounds keep it off an ISO date ("2026-09-02"), a version ("1.049"),
+# a decimal, and a clock (which the pass above has already consumed anyway).
+_DIGIT_WORDS = ("zero", "one", "two", "three", "four", "five", "six",
+                "seven", "eight", "nine")
+_ID_DIGITS_RX = re.compile(r"(?<![\w:./-])0\d{1,3}(?![\w:/-])(?!\.\d)")
+
+
+def _spoken_digits(match: "re.Match") -> str:
+    return " ".join(_DIGIT_WORDS[int(c)] for c in match.group(0))
+
+
+def speak_room_numbers(text: str) -> str:
+    """Say a leading-zero identifier ("049") digit by digit."""
+    return _ID_DIGITS_RX.sub(_spoken_digits, text)
 
 
 # ------------------------------------------------------- shouted words
@@ -419,6 +525,10 @@ class Pronunciations:
         # leave "6:00" intact for the engine to spell out.
         if rewrite_times:
             text = speak_times(text)
+            # Same flag, same reason: these exist because the engine cannot
+            # read a number itself. Fish's s2.1-pro normalises its own text
+            # and is the engine the flag is False for.
+            text = speak_room_numbers(text)
         rx = self._rx
         if rx is not None:
             def _sub(m):
