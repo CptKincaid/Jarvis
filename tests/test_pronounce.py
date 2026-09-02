@@ -113,3 +113,133 @@ def test_expansion_is_whole_token_only():
     p = Pronunciations(path=None)
     assert "Building" in p.apply("Bldg 049")
     assert p.apply("Engrave the plate") == "Engrave the plate"
+
+
+# ------------------------------------------------- number-compound hyphens
+#
+# Round 10, text 09: every F5 arm read "twenty-five minutes" as
+# "twenty ... five minutes". The hyphen is entry 13 of F5's character
+# vocabulary and the base weights render it as a prosodic break -- it is not
+# a chunk boundary (F5's chunk_text splits on ";:,.!?" + whitespace only), so
+# no amount of chunking config would have helped. The character has to not
+# reach the engine, and the transcript keeps the English spelling.
+@pytest.mark.parametrize("raw,spoken", [
+    ("twenty-five minutes", "twenty five minutes"),
+    ("seventy-eight", "seventy eight"),
+    ("forty-two", "forty two"),
+    ("ninety-nine", "ninety nine"),
+    ("sixty-one degrees", "sixty one degrees"),
+    ("thirty-three and eighty-seven", "thirty three and eighty seven"),
+    # case is not the number's business: only the hyphen goes.
+    ("Twenty-Five", "Twenty Five"),
+    # ...even when unshout has already title-cased a shouted compound.
+    ("TWENTY-FIVE MINUTES", "Twenty Five Minutes"),
+])
+def test_number_hyphens_become_spaces(table, raw, spoken):
+    assert table.apply(raw) == spoken
+
+
+@pytest.mark.parametrize("raw", [
+    # Every other hyphen Jarvis speaks earns its pause, or is load-bearing.
+    "re-enrol before Friday",
+    "a well-known problem",
+    "check your e-mail",
+    "ETB-1035",
+    "self-hosted",
+    "twenty-something people",     # "something" is not a ones word
+    "twenty-fivers",               # glued to more letters: not a compound
+    "five-twenty",                 # ones-tens is not the compound shape
+    # "and" is not a number word, so an and-chain is deliberately untouched:
+    # the shape has never been measured and the narrow rule cannot surprise.
+    "a hundred-and-five",
+])
+def test_non_number_hyphens_are_left_alone(table, raw):
+    assert table.apply(raw) == raw
+
+
+def test_a_hyphen_the_table_rewrites_around_still_survives(table):
+    """The table spells TTS out; the hyphen between them is not ours."""
+    assert table.apply("F5-TTS is the engine") == "F5-T T S is the engine"
+
+
+def test_minutes_in_words_emits_a_space_not_a_hyphen():
+    from jarvis.pronounce import _minutes_in_words
+    assert _minutes_in_words(22) == "twenty two"
+    assert _minutes_in_words(45) == "forty five"
+    assert _minutes_in_words(5) == "oh five"       # unchanged
+    assert _minutes_in_words(15) == "fifteen"      # unchanged
+    assert _minutes_in_words(30) == "thirty"       # no trailing space
+
+
+def test_clock_minutes_reach_the_engine_without_a_hyphen(table):
+    assert table.apply("Your timer ends at 6:22 pm") == \
+        "Your timer ends at six twenty two pee em"
+
+
+# ---------------------------------------------- the sentence-final full stop
+#
+# Round 10: _TIME_RX ended "([ap])\.?\s?m\.?" and swallowed the trailing dot
+# unconditionally, so "at 6:00 pm. Then we leave" reached F5 as
+# "six pee em Then we leave" -- the sentence boundary gone, rendered as a
+# run-on. The dot is the layer's to eat only when it is the abbreviation's
+# own AND the sentence carries on.
+@pytest.mark.parametrize("raw,spoken", [
+    # bare "pm" + a full stop: the dot is punctuation, never ours.
+    ("Tomorrow at 6:00 pm. Then we leave.",
+     "Tomorrow at six pee em. Then we leave."),
+    ("It is 9:10 am. The inbox is quiet.",
+     "It is nine ten ay em. The inbox is quiet."),
+    ("Ready at 7:30 pm.", "Ready at seven thirty pee em."),
+    # "p.m." mid-sentence: that dot IS the abbreviation's, and goes.
+    ("Booked for 4:10 p.m. and again later.",
+     "Booked for four ten pee em and again later."),
+    # "p.m." doing double duty as the full stop: the sentence keeps it.
+    ("Tomorrow at 6:00 p.m. Then we leave.",
+     "Tomorrow at six pee em. Then we leave."),
+    ("The last one is at 4:10 p.m.", "The last one is at four ten pee em."),
+    # no dot at all, and a comma is not a dot.
+    ("Ready at 7:30 pm", "Ready at seven thirty pee em"),
+    ("At 9:10 am, then lunch.", "At nine ten ay em, then lunch."),
+    # the round-10 briefing line, which had to be reordered to dodge this.
+    ("at 4:10 pm. The inbox is quiet, for once.",
+     "at four ten pee em. The inbox is quiet, for once."),
+])
+def test_time_marker_keeps_the_sentence_boundary(table, raw, spoken):
+    assert table.apply(raw) == spoken
+
+
+# ------------------------------------------------ three-letter shouted words
+#
+# Round 10 defect 2: _SHOUT_RX wanted 4+ characters and the vowel rule wants
+# 2 vowels, so the real calendar title "BIOSENSORS LAB II" became
+# "Biosensors LAB II" and the engine spelled L-A-B. Three letters cannot be
+# decided by shape -- "LAB" and "CPU" are the same shape, "GYM" has one vowel
+# like "ETB" -- so it is decided by name.
+@pytest.mark.parametrize("raw,out", [
+    ("BIOSENSORS LAB II", "Biosensors Lab II"),
+    ("GYM at four", "Gym at four"),
+    ("ART HISTORY", "Art History"),
+    ("BIO", "Bio"),
+    ("SEM", "Sem"),
+    ("REC", "Rec"),
+    ("MED", "Med"),
+    # initialisms stay for the table or the engine to spell.
+    ("ENG 101", "ENG 101"),            # an abbreviation, not a word
+    ("ETB 1035", "ETB 1035"),
+    ("CPU", "CPU"),
+    ("HDMI", "HDMI"),
+    ("PHYS 208", "PHYS 208"),
+    # roman numerals are left as they are: "II" is not a word and "Ii" would
+    # be worse. Revisit only with a measurement.
+    ("II", "II"),
+    ("III", "III"),
+    ("LAB III", "Lab III"),
+])
+def test_shouted_three_letter_words(raw, out):
+    from jarvis.pronounce import unshout
+    assert unshout(raw) == out
+
+
+def test_shouted_calendar_title_end_to_end(table):
+    assert table.apply("9:10 am BIOSENSORS LAB II") == \
+        "nine ten ay em Biosensors Lab II"

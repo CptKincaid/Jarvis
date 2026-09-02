@@ -135,14 +135,27 @@ _ONES = ("twelve", "one", "two", "three", "four", "five", "six", "seven",
          "eight", "nine", "ten", "eleven")
 _TENS = {2: "twenty", 3: "thirty", 4: "forty", 5: "fifty"}
 
+# Group 4 is the abbreviation's inner dot ("p.m."), group 5 the trailing one.
+# The trailing dot is NOT always ours to eat -- see _spoken_time.
 _TIME_RX = re.compile(
     r"\b(1[0-2]|0?[1-9]|[01]\d|2[0-3]):([0-5]\d)\s*"
-    r"([ap])\.?\s?m\.?(?![a-z])",
+    r"([ap])(\.?)\s?m(\.?)(?![a-z])",
     re.IGNORECASE)
+
+# What follows the marker when its dot is doing double duty as the full stop:
+# whitespace then a capital (the next sentence), or nothing at all.
+_SENTENCE_END_RX = re.compile(r"\s+[A-Z]|\s*$")
 
 
 def _minutes_in_words(m: int) -> str:
-    """1-59 as English minutes past the hour ("oh five", "twenty-two")."""
+    """1-59 as English minutes past the hour ("oh five", "twenty two").
+
+    A SPACE between the tens and the ones, not the hyphen English spelling
+    wants: F5 hears "twenty-five" as "twenty ... five" (round 10, every F5
+    arm on text 09). ``space_number_hyphens`` below would catch this anyway
+    -- emitting the space here means the clock path never depends on it,
+    and the mechanism is written up there.
+    """
     if m < 10:
         return f"oh {_ONES[m]}"          # "oh five", never bare "five"
     if m < 20:
@@ -150,7 +163,7 @@ def _minutes_in_words(m: int) -> str:
                 "sixteen", "seventeen", "eighteen", "nineteen")[m - 10]
     tens, ones = divmod(m, 10)
     word = _TENS[tens]
-    return word if not ones else f"{word}-{_ONES[ones]}"
+    return word if not ones else f"{word} {_ONES[ones]}"
 
 
 # "am"/"pm" left as letters came out of XTTS as a spelled "A M" (heard
@@ -165,7 +178,19 @@ def _spoken_time(match: "re.Match") -> str:
     spoken = _ONES[hour]
     if minute:
         spoken = f"{spoken} {_minutes_in_words(minute)}"
-    return f"{spoken} {_HALF[half.lower()]}"
+    spoken = f"{spoken} {_HALF[half.lower()]}"
+    # The trailing dot. The old pattern swallowed it unconditionally, so
+    # "at 6:00 pm. Then we leave" reached F5 as "six pee em Then we leave"
+    # -- the sentence boundary gone, rendered as a run-on (round 10). The
+    # dot is ours to eat only when it is the abbreviation's own ("p.m.")
+    # AND the sentence carries on; a dot after the bare "pm" is punctuation,
+    # and an abbreviation dot that also ends the sentence stays a full stop.
+    if match.group(5):
+        inner_dot = bool(match.group(4))
+        rest = match.string[match.end():]
+        if not inner_dot or _SENTENCE_END_RX.match(rest):
+            spoken += "."
+    return spoken
 
 
 def speak_times(text: str) -> str:
@@ -186,12 +211,31 @@ def speak_times(text: str) -> str:
 # "PHYS", "ETB") is an initialism and is left alone for the table or the
 # engine to spell. Known jargon is substituted before this runs, so entries
 # like VSS -> "V S S" are already gone by the time we get here.
-_SHOUT_RX = re.compile(r"\b[A-Z][A-Z'&-]{3,}\b")
+#
+# The two rules above cannot see a three-letter word at all. The length gate
+# wanted 4+ characters and the vowel gate wants 2 vowels, so the real calendar
+# title "BIOSENSORS LAB II" came out as "Biosensors LAB II" and the engine
+# spelled L-A-B (round 10 write-up, defect 2). Shape cannot separate these:
+# "LAB" and "CPU" are the same shape, "GYM" has one vowel like "ETB", and
+# "USA" has two like "AIR". So three letters is decided BY NAME -- the short
+# list of real words that have actually turned up shouted in one of his course
+# titles. Keep it to words. "ENG" is an abbreviation of Engineering, not a
+# word, and belongs with ETB/CPU/HDMI/PHYS where the engine spells it out.
+# Roman numerals after such a word ("LAB II") are left as they are: "II" is
+# not a word, title-casing it would produce "Ii", and nothing measured yet
+# says what F5 does with it.
+_SHOUTED_WORDS = frozenset({"LAB", "GYM", "ART", "BIO", "SEM", "REC", "MED"})
+
+_SHOUT_RX = re.compile(r"\b[A-Z][A-Z'&-]{2,}\b")
 _VOWELS = set("AEIOUY")
 
 
 def _unshout(match: "re.Match") -> str:
     word = match.group(0)
+    if word in _SHOUTED_WORDS:
+        return word.title()
+    if len(word) < 4:
+        return word                       # only the list above rescues these
     letters = [c for c in word if c.isalpha()]
     if sum(1 for c in letters if c in _VOWELS) < 2:
         return word                       # an initialism, not a word
@@ -201,6 +245,44 @@ def _unshout(match: "re.Match") -> str:
 def unshout(text: str) -> str:
     """Title-case shouted WORDS, leaving initialisms for the engine."""
     return _SHOUT_RX.sub(_unshout, text)
+
+
+# --------------------------------------------------- number compounds
+#
+# Round 10, text 09: EVERY F5 arm read "twenty-five minutes" as
+# "twenty ... five minutes" -- a beat of silence where the hyphen is.
+#
+# The hyphen is not a chunk boundary anywhere in the path. scripts/f5_server.py
+# hands req["text"] to F5Api.infer() verbatim, and F5's own splitter
+# (f5_tts/infer/utils_infer.py chunk_text) splits on ";:,.!?" followed by
+# whitespace and on CJK punctuation -- never on "-". With the shipped
+# reference clip (5.805 s, 108 B) max_chars comes out at 256, so a one-line
+# answer is a single batch regardless. What the hyphen IS: entry 13 of the
+# model's character vocabulary (f5_tts/infer/examples/vocab.txt), a token the
+# base weights learned as a prosodic break. The pause is F5 reading the
+# character, so the fix is the character not reaching it.
+#
+# It lives here rather than in the tools that emit the text so the card still
+# shows the English spelling and only the engine sees the space.
+#
+# Number words ONLY, and only a tens word joined to a ones word. A hyphen
+# earns its pause everywhere else Jarvis speaks -- "re-enrol", "well-known",
+# "e-mail", "F5-TTS", "ETB-1035" -- and the tests pin those untouched.
+# "a hundred-and-five" is deliberately out of scope: "and" is not a number
+# word, the shape has never been measured, and a narrow rule is the one that
+# cannot surprise him.
+_TENS_WORDS = ("twenty", "thirty", "forty", "fifty", "sixty", "seventy",
+               "eighty", "ninety")
+_ONES_WORDS = ("one", "two", "three", "four", "five", "six", "seven",
+               "eight", "nine")
+_NUMBER_HYPHEN_RX = re.compile(
+    r"(?<!\w)(%s)-(%s)(?!\w)" % ("|".join(_TENS_WORDS), "|".join(_ONES_WORDS)),
+    re.IGNORECASE)
+
+
+def space_number_hyphens(text: str) -> str:
+    """Space the hyphen in "twenty-five" so F5 does not pause mid-number."""
+    return _NUMBER_HYPHEN_RX.sub(r"\1 \2", text)
 
 
 class Pronunciations:
@@ -351,6 +433,12 @@ class Pronunciations:
         # table wanted spelled.
         if unshout_words:
             text = unshout(text)
+        # Last, on whatever every other pass produced (unshout title-cases a
+        # shouted "TWENTY-FIVE" but leaves its hyphen). Unconditional, unlike
+        # the two flags above: a number compound written with a space reads
+        # the same to every engine, so there is nothing here for a
+        # self-normalising engine to get wrong.
+        text = space_number_hyphens(text)
         return re.sub(r"[ \t]{2,}", " ", text).strip()
 
 
