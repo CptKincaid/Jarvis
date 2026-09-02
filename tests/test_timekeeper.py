@@ -1172,3 +1172,143 @@ def test_tool_manage_schedule_unknown_action_and_description(tools):
     fn = tools.schemas()[3]["function"]
     assert "extend" in fn["description"] and "shorten" in fn["description"]
     assert "extend" in fn["parameters"]["properties"]["minutes"]["description"]
+
+
+# =========================================================================
+# Review pass 2026-09-02: honesty and safety of adjust
+# =========================================================================
+def test_restore_puts_a_clamped_shorten_back_where_it_was(tk):
+    """The opposite delta is NOT an undo: shorten a 2-minute timer by 5 and
+    the due is clamped to now, so adding 5 back lands 5 minutes LATER than
+    it started -- under a reply that says "back to where it was"."""
+    t0 = tk.clock.now()
+    item = tk.add_timer(120, "the eggs")
+    moved = tk.adjust("last", "timer", -300)
+    assert len(moved) == 1
+    assert moved[0].due == pytest.approx(t0)              # clamped to now
+    assert moved[0].previous[0] == pytest.approx(t0 + 120)
+    assert moved[0].applied == pytest.approx(-120)        # not -300
+    assert tk.restore(item.id, moved[0].previous)
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 120)
+    # unknown / cancelled items are not resurrected
+    assert not tk.restore("nope", moved[0].previous)
+    assert not tk.restore(item.id, None)
+
+
+def test_restore_undoes_a_snooze_move_and_forgets_the_adjustment(tk):
+    t0 = tk.clock.now()
+    tk.add_alarm(t0 + 600, "Gym")
+    tk.tick()                                    # nothing due yet
+    tk.clock.advance(600)
+    tk.tick()
+    assert tk.ringing is not None
+    tk.snooze(5)
+    snoozed = tk.list("alarm")[0]
+    moved = tk.adjust("last", "alarm", 300)
+    assert moved[0].snooze_until == pytest.approx(snoozed.snooze_until + 300)
+    assert tk.restore(moved[0].id, moved[0].previous)
+    assert tk.list("alarm")[0].snooze_until == pytest.approx(snoozed.snooze_until)
+
+
+def test_adjust_re_reads_each_item_under_the_lock(tk):
+    """The tick thread can fire an item between _resolve and the write; a
+    decision made on the stale snapshot extended something already done."""
+    t0 = tk.clock.now()
+    tk.add_timer(120, "the eggs")
+    real = tk._resolve
+
+    def racy(which="last", kind="all"):
+        items = real(which, kind)
+        tk.clock.advance(121)
+        tk.tick()                                # it fires here
+        return items
+
+    tk._resolve = racy
+    assert tk.adjust("last", "timer", 600) == []
+    tk._resolve = real
+    done = tk.list("timer", include_done=True)[0]
+    assert done.state == "done" and done.due == pytest.approx(t0 + 120)
+
+
+def test_adjust_of_a_ringing_alarm_never_publishes_a_zero_minute_snooze(tk):
+    tk.add_alarm(tk.clock.now(), "Gym")
+    tk.tick()
+    assert tk.ringing is not None
+    moved = tk.adjust("last", "alarm", 30)       # "thirty more seconds"
+    assert len(moved) == 1 and moved[0].state == "snoozed"
+    ev = kinds(tk.events, events.AlarmStopped)[-1]
+    assert ev.action == "snooze" and ev.snooze_min == 1
+
+
+def test_describe_item_does_not_read_an_auto_timer_label_back(tk):
+    """The commander stores an unlabelled timer as "10 minutes timer"; read
+    back beside the new due it said "10 minutes timer in 20 minutes"."""
+    tk.add_timer(600, "10 minutes timer")
+    tk.adjust("last", "timer", 600)
+    line = tk._describe_item(tk.list("timer")[0], tk.clock.now())
+    assert line == "the 20-minute timer in 20 minutes"
+
+
+def test_a_moved_timer_does_not_announce_a_length_it_never_had(tk):
+    """duration is due - created, which an adjust invalidates: a ten-minute
+    timer cut short fired as "your 1-minute pack up the chicken timer"."""
+    tk.add_timer(600, "pack up the chicken")
+    tk.adjust("last", "timer", -60_000)          # clamped to now
+    tk.clock.advance(1)
+    tk.tick()
+    assert tk.said == ["Sir, your pack up the chicken timer is up."]
+
+
+def test_adjust_amount_words_reads_odd_amounts_as_a_duration():
+    assert tkm.adjust_amount_words(600) == "Ten minutes"
+    assert tkm.adjust_amount_words(3600) == "An hour"
+    assert tkm.adjust_amount_words(90) == "90 seconds"
+    assert tkm.adjust_amount_words(4110) == "An hour and 8 minutes"
+
+
+def test_applied_delta_reports_what_actually_moved():
+    one = SimpleNamespace(applied=-120.0)
+    assert tkm.applied_delta([one], -300) == pytest.approx(-120)
+    assert tkm.applied_delta([SimpleNamespace(applied=-300.0)], -300) == pytest.approx(-300)
+    # two items, or a stub with no `applied`: say what was asked for
+    assert tkm.applied_delta([one, one], -300) == pytest.approx(-300)
+    assert tkm.applied_delta([SimpleNamespace()], -300) == pytest.approx(-300)
+
+
+def test_tool_shorten_past_now_says_what_actually_came_off(tools, tk):
+    tools.call("set_timer", {"minutes": 10, "label": "pack up the chicken"})
+    r = tools.call("manage_schedule", {"action": "shorten", "kind": "timer",
+                                       "minutes": 999})
+    assert r.ok and r.text == "Ten minutes off, sir: pack up the chicken now."
+    assert tk.list("timer")[0].due == pytest.approx(tk.clock.now())
+
+
+def test_tool_extend_understands_a_unit_in_the_minutes_field(tools, tk):
+    """The model does write "1 hour" into a field the schema calls minutes;
+    _coerce_int read that as one minute and "90 seconds" as 90 minutes."""
+    t0 = tk.clock.now()
+    tools.call("set_timer", {"minutes": 10, "label": "tea"})
+    assert tools.call("manage_schedule", {"action": "extend", "minutes": "1 hour"}).ok
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 600 + 3600)
+    assert tools.call("manage_schedule", {"action": "shorten", "minutes": "90 seconds"}).ok
+    assert tk.list("timer")[0].due == pytest.approx(t0 + 600 + 3600 - 90)
+    # still an honest question when there is no number in it at all
+    r = tools.call("manage_schedule", {"action": "extend", "minutes": "a few"})
+    assert not r.ok and r.text == "By how many minutes, sir?"
+
+
+def test_tool_bring_forward_while_it_rings_says_it_is_ringing(tools, tk):
+    """adjust leaves a ringing item alone on a negative delta, so the reply
+    was "No alarm to bring forward, sir." over an alarm that was ringing."""
+    tk.add_alarm(tk.clock.now(), "Gym")
+    tk.tick()
+    assert tk.ringing is not None
+    r = tools.call("manage_schedule", {"action": "shorten", "kind": "alarm",
+                                       "minutes": 5})
+    assert not r.ok and r.text == tkm.RINGING_NOW_LINE
+    assert tk.ringing is not None                # untouched
+    # with nothing ringing the kind-aware line is unchanged
+    tk.stop_ringing()
+    r = tools.call("manage_schedule", {"action": "shorten", "kind": "alarm",
+                                       "minutes": 5})
+    assert r.text == "No alarm to bring forward, sir."

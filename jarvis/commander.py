@@ -2118,15 +2118,30 @@ _CANCEL_SCHED_RX = re.compile(
 # pronoun standing in for it ("that" / "it" -> kind all, which last), l*
 # label words after for/about/to/called/named.
 def _adj_obj(i: int) -> str:
-    return (r"(?:(?:(?:the|my|that|this|our)\s+)?(?P<k%d>timers?|reminders?|alarms?)"
+    # Three shapes of object: "[all] [the] <kind> [for <label>]", the label
+    # BEFORE the kind word ("the chicken timer" -- at least as natural in
+    # speech as "the timer for the chicken", and missing it sent the
+    # utterance down the very path that failed on 09-01), and a bare
+    # pronoun.
+    return (r"(?:(?:all\s+(?:of\s+)?|every\s+)?(?:(?:the|my|that|this|our)\s+)?"
+            r"(?P<k%d>timers?|reminders?|alarms?)"
             r"(?:\s+(?:for|about|to|called|named)\s+(?P<l%d>.+?))?"
-            r"|(?P<p%d>that|it|this)(?:\s+one)?)" % (i, i, i))
+            r"|(?:the|my|that|this|our)\s+(?P<l%dz>[\w'’-]+(?:\s+[\w'’-]+){0,3}?)\s+"
+            r"(?P<k%dz>timers?|reminders?|alarms?)"
+            r"|(?P<p%d>that|it|this)(?:\s+one)?)" % (i, i, i, i, i))
 
 
-def _adj_amt(i: int, more: bool = False) -> str:
+def _adj_amt(i: int, more: bool = False, opt_unit: bool = False) -> str:
+    """The amount. ``opt_unit`` lets the unit be left off -- "extend the
+    timer by five" is a common voice shape and minutes is the only sane
+    reading; it is allowed only after a verb that can mean nothing else
+    (extend / shorten / ...), never after "add" or "put"."""
     mid = r"(?:(?P<v%d>more|extra)\s+)?" % i if more else r"(?:(?:more|extra)\s+)?"
-    return (r"(?:another\s+|an\s+extra\s+)?(?P<n%d>" % i + _NUM_ALT + r")\s*[- ]?" + mid
-            + r"(?P<u%d>" % i + _UNIT_ALT + r")")
+    unit = r"(?P<u%d>" % i + _UNIT_ALT + r")"
+    if opt_unit:
+        unit = r"(?:" + unit + r")?"
+    return (r"(?:another\s+|an\s+extra\s+)?(?P<n%d>" % i + _NUM_ALT + r")\s*[- ]?"
+            + mid + unit)
 
 
 _ADJ_BY = r"(?:by|for|with)?\s*"
@@ -2135,7 +2150,7 @@ _ADJUST_SCHED_RX = re.compile(
     r"^(?:(?:please|jarvis)[, ]+)?(?:"
     # extend / shorten <obj> by <amount>
     r"(?P<v1>extend|lengthen|prolong|delay|postpone|shorten|cut|reduce)\s+"
-    + _adj_obj(1) + r"\s+" + _ADJ_BY + _adj_amt(1)
+    + _adj_obj(1) + r"\s+" + _ADJ_BY + _adj_amt(1, opt_unit=True)
     # add / put <amount> to / on <obj>
     + r"|(?P<v2>add|put)\s+" + _adj_amt(2) + r"(?:\s+more)?\s+(?:to|on|onto)\s+" + _adj_obj(2)
     # give <obj> another <amount> | give me <amount> more on <obj>
@@ -2160,6 +2175,12 @@ _ADJUST_SCHED_RX = re.compile(
     + r"|(?P<v11>take|knock|shave|cut)\s+" + _adj_amt(11)
     + r"\s+(?:off|from)\s+(?:of\s+)?" + _adj_obj(11)
     + r")" + _ADJ_TAIL, re.I)
+# Verbs that can mean nothing but "move a scheduled thing": with a bare
+# pronoun for an object ("give IT another five minutes") and nothing on the
+# books, everything else is far more likely to be about a download, a song
+# or a meeting, and must reach the model rather than be answered with a
+# schedule negative.
+_ADJ_SCHEDULE_VERBS = frozenset(("extend", "shorten", "lengthen", "prolong", "postpone"))
 # Words that move an item SOONER; everything else in the table moves it later.
 _ADJ_SOONER = frozenset((
     "shorten", "cut", "reduce", "take", "knock", "shave", "bring",
@@ -3021,16 +3042,38 @@ def _describe_adjusted(tk, items, now: float) -> list[str]:
 
 
 def _undo_adjust(tk, items, kind: str, delta: int):
-    """Move each adjusted item back by the same amount, by id."""
-    ids = [(getattr(i, "id", None), getattr(i, "kind", None)) for i in items]
-    ids = [(i, k if isinstance(k, str) and k else kind) for i, k in ids if i]
-    if tk is None or not ids:
+    """Put each adjusted item back.
+
+    Exactly where it was when Timekeeper.adjust handed back a ``previous``
+    snapshot: re-applying the opposite delta is NOT an undo once a due was
+    clamped to now (take five minutes off a two-minute timer and adding
+    five back leaves it LATER than it started, under a reply that claims
+    otherwise). Without a snapshot -- a stubbed timekeeper, or a ring that
+    cannot be un-killed -- the opposite delta is still the best there is."""
+    marks = []
+    for i in items:
+        item_id = getattr(i, "id", None)
+        if not isinstance(item_id, str) or not item_id:
+            continue
+        item_kind = getattr(i, "kind", None)
+        prev = getattr(i, "previous", None)
+        if not (isinstance(prev, tuple) and len(prev) == 3
+                and isinstance(prev[0], (int, float))):
+            prev = None
+        marks.append((item_id,
+                      item_kind if isinstance(item_kind, str) and item_kind else kind,
+                      prev))
+    if tk is None or not marks:
         return None
 
     def _undo() -> str:
         back = 0
-        for item_id, item_kind in ids:
+        restore = getattr(tk, "restore", None)
+        for item_id, item_kind, prev in marks:
             try:
+                if prev is not None and callable(restore) and restore(item_id, prev):
+                    back += 1
+                    continue
                 if tk.adjust(item_id, item_kind, -delta):
                     back += 1
             except Exception:
@@ -3054,7 +3097,9 @@ def _h_adjust_schedule(c, t, m):
     if n is None:
         return None
     unit = (_adj_group(m, "u") or "minutes").lower()
-    word = (_adj_group(m, "d") or _adj_group(m, "v") or "").lower()
+    verb = (_adj_group(m, "v") or "").lower()
+    direction = (_adj_group(m, "d") or "").lower()
+    word = direction or verb
     sign = -1 if word in _ADJ_SOONER else 1
     delta = sign * _seconds(n, unit)
     if delta == 0:
@@ -3063,27 +3108,44 @@ def _h_adjust_schedule(c, t, m):
     kind = "reminder" if kind_word.startswith("remind") else \
         "timer" if kind_word.startswith("timer") else \
         "alarm" if kind_word.startswith("alarm") else "all"
+    pronoun = _adj_group(m, "p") is not None
+    if direction == "up" and (pronoun or kind == "timer"):
+        # "Move the ALARM up ten minutes" is the calendar idiom -- earlier.
+        # "Bump that timer up five minutes" is at least as often "give it
+        # five more", so the confident opposite is worse than no Tier-1
+        # match at all: it falls to the model.
+        return None
     which = (_adj_group(m, "l") or "").strip()
     if not which:
         # "extend my timers by ten minutes": the plural is all of them, as
         # it is for cancel; the singular or a pronoun is the latest one.
         which = "all" if kind_word.endswith("s") else "last"
     try:
-        from jarvis.tools.timekeeper import adjust_line, nothing_to_adjust_line
+        from jarvis.tools.timekeeper import adjust_empty_line, adjust_line, applied_delta
     except Exception:                                 # pragma: no cover
-        adjust_line = nothing_to_adjust_line = None
+        adjust_line = adjust_empty_line = None
+
+        def applied_delta(items, requested):
+            return requested
     items = tk.adjust(which, kind, float(delta))
     items = list(items) if isinstance(items, (list, tuple)) else []
     later = delta > 0
     if not items:
-        line = nothing_to_adjust_line(kind, delta) if nothing_to_adjust_line else \
+        if pronoun and not kind_word and verb not in _ADJ_SCHEDULE_VERBS:
+            # "Give it another five minutes" with an empty schedule is
+            # almost certainly about something else; only the unambiguous
+            # schedule verbs answer for the schedule here.
+            return None
+        line = adjust_empty_line(tk, kind, delta) if adjust_empty_line else \
             ("Nothing to extend, sir." if later else "Nothing to shorten, sir.")
         return CommandResult(handled=True, reply=line, speak=True,
                              status="Nothing to adjust")
     now = _tk_now(tk)
     described = _describe_adjusted(tk, items, now)
     if adjust_line is not None:
-        line = adjust_line(delta, described)
+        # applied_delta, not delta: a shorten past now is clamped to now,
+        # and "999 minutes off, sir: the tea now" was wrong twice.
+        line = adjust_line(applied_delta(items, delta), described)
     else:                                             # pragma: no cover
         amount = f"{n} {_unit_word(unit, n)}"
         line = f"{amount} {'added' if later else 'off'}, sir: {'; '.join(described)}."
@@ -6420,12 +6482,22 @@ UNDO_WINDOW_S = 60.0
 # at 21:10:23 -- seven minutes, and he meant it.
 UNDO_EXPLICIT_WINDOW_S = 15 * 60.0
 _UNDO_OBJECT = r"(?:order|command|instruction|request|thing|one|action|step)"
+_UNDO_LAST = r"(?:that|the|my)\s+last(?:\s+" + _UNDO_OBJECT + r")?"
+# Two classes of verb. "Scratch", "undo", "belay" and "take back" mean
+# nothing but undo, so they may name their object outright ("belay that
+# order"). "Cancel" and "forget" have a life of their own -- "cancel that
+# one" right after a read-out of the timers is a cancellation, not a
+# rewind, and it reached the model at d38b493 -- so they take back only the
+# forms that say LAST, and with nothing to take back they still fall
+# through to the model (see undo_explicit / _try_undo).
 _UNDO_RX = re.compile(
-    r"^(?:(?:no|nope)[,.!]?\s+)?"
-    r"(?:scratch|undo|cancel|forget|belay|take back)\s+"
-    r"(?:(?P<x1>(?:that|the|my)\s+last(?:\s+" + _UNDO_OBJECT + r")?"
-    r"|that\s+" + _UNDO_OBJECT + r")"
+    r"^(?:(?:no|nope)[,.!]?\s+)?(?:"
+    r"(?:scratch|undo|belay|take back)\s+"
+    r"(?:(?P<x1>" + _UNDO_LAST + r"|that\s+" + _UNDO_OBJECT + r")"
     r"|the last(?: one| thing)?|that|it|this)"
+    r"|(?:cancel|forget)\s+"
+    r"(?:" + _UNDO_LAST + r"|the last(?: one| thing)?|that|it|this)"
+    r")"
     r"|^(?:scratch|undo|belay) that"
     r"|^undo(?: the)?(?: last)?(?: one| thing| action)?"
     r"|^take that back"
@@ -6465,11 +6537,14 @@ def undo_kind(text: str) -> bool:
 
 
 def undo_explicit(text: str) -> bool:
-    """True for an undo that names its object -- "belay that last order",
-    "cancel that last one", "undo my last request" -- as opposed to the
-    bare "scratch that". The explicit form is honoured for
+    """True for an undo that names its object with a verb that can mean
+    nothing else -- "belay that last order", "scratch that last command",
+    "undo my last request" -- as opposed to the bare "scratch that" or
+    anything led by "cancel"/"forget". The explicit form is honoured for
     UNDO_EXPLICIT_WINDOW_S and, with nothing to take back, is answered
-    rather than handed on."""
+    rather than handed on; "cancel that last one" with nothing to take
+    back keeps falling through to the model, which can still cancel the
+    schedule item he means."""
     m = _undo_match(text)
     return bool(m) and m.group("x1") is not None
 

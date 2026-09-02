@@ -2225,11 +2225,17 @@ def test_undo_kind_still_leaves_the_rest_alone(text):
 
 def test_undo_explicit_names_its_object():
     assert commander.undo_explicit("belay that last order")
-    assert commander.undo_explicit("cancel that last one")
+    assert commander.undo_explicit("scratch that last command")
     assert commander.undo_explicit("undo my last request")
     assert not commander.undo_explicit("scratch that")
     assert not commander.undo_explicit("undo")
     assert not commander.undo_explicit("cancel the timer")
+    # "cancel"/"forget" are not pure undo words: they are still HEARD as an
+    # undo ("cancel that last one"), but they never short-circuit the model
+    # when there is nothing to take back -- he may well mean the schedule.
+    assert commander.undo_kind("cancel that last one")
+    assert not commander.undo_explicit("cancel that last one")
+    assert not commander.undo_explicit("forget the last one")
 
 
 def test_belay_that_last_order_by_voice_never_reaches_the_classifier(rich, services,
@@ -2299,3 +2305,158 @@ def test_incident_replay_belay_that_last_order(real_tk, services, monkeypatch):
     # a "belay" inside a sentence about something else is not an undo
     res = c.handle("did they belay that climb", source="typed")
     assert res.status != "Undone"
+
+
+# =========================================================================
+# Review pass 2026-09-02: the holes the first cut of the route left
+# =========================================================================
+@pytest.mark.parametrize("text,which,kind,delta", [
+    # the label BEFORE the kind word -- as natural in speech as "the timer
+    # for the chicken", and it went to the model, the path that failed
+    ("extend the chicken timer by five minutes", "chicken", "timer", 300),
+    ("shorten the tea timer by 2 minutes", "tea", "timer", -120),
+    ("give me 5 more minutes on the tea timer", "tea", "timer", 300),
+    ("10 more minutes on the chicken timer", "chicken", "timer", 600),
+    ("put 5 minutes on the chicken timer", "chicken", "timer", 300),
+    ("take 4 minutes off the chicken timer", "chicken", "timer", -240),
+    ("push my 7 am alarm back 10 minutes", "7 am", "alarm", 600),
+    ("give the pack up the chicken timer another 5 minutes",
+     "pack up the chicken", "timer", 300),
+    # "all my timers" is the plural cancel already understands
+    ("extend all my timers by 5 minutes", "all", "timer", 300),
+    ("push back all of my alarms by ten minutes", "all", "alarm", 600),
+    # the unit left off after a verb that can mean nothing else
+    ("extend the timer by 5", "last", "timer", 300),
+    ("extend that by five", "last", "all", 300),
+    ("shorten the timer by 2", "last", "timer", -120),
+])
+def test_adjust_schedule_second_pass_phrasings(rich, services, text, which, kind, delta):
+    tk = services.timekeeper
+    tk.adjust.return_value = [_adjusted_item(kind=kind if kind != "all" else "timer")]
+    assert rich._match_assistant(text) == "adjust schedule", text
+    res = rich.handle(text, source="typed")
+    tk.adjust.assert_called_once_with(which, kind, float(delta))
+    assert res.handled and res.speak
+    services.brain.chat.assert_not_called()
+
+
+@pytest.mark.parametrize("text", [
+    # "bump it up five minutes" is as often "five MORE" as it is "sooner":
+    # the confident opposite is worse than no Tier-1 match
+    "bump that timer up 5 minutes",
+    "move the timer up 10 minutes",
+    "bump it up five minutes",
+    # a pronoun with a verb that is not a schedule verb, nothing scheduled
+    "give it another 5 minutes",
+    "add 5 minutes to that",
+    "make that 5 minutes longer",
+    "put 30 seconds on it",
+    "10 more minutes on it",
+])
+def test_adjust_schedule_leaves_the_ambiguous_ones_to_the_model(rich, services, text):
+    services.timekeeper.adjust.return_value = []
+    res = rich.handle(text, source="typed")
+    assert res is None or res.status != "Nothing to adjust", text
+    assert not (res and res.status and res.status.endswith(("extended", "shortened")))
+
+
+def test_move_the_alarm_up_is_still_the_calendar_idiom(rich, services):
+    services.timekeeper.adjust.return_value = [_adjusted_item(kind="alarm")]
+    rich.handle("move the alarm up 10 minutes", source="typed")
+    services.timekeeper.adjust.assert_called_once_with("last", "alarm", -600.0)
+
+
+def test_an_unambiguous_verb_with_a_pronoun_still_answers_for_the_schedule(rich, services):
+    """"Extend that by five" names no object but can mean nothing else."""
+    services.timekeeper.adjust.return_value = []
+    res = rich.handle("extend that by five minutes", source="typed")
+    assert res.handled and res.reply == "Nothing to extend, sir."
+    res = rich.handle("shorten it by five minutes", source="typed")
+    assert res.reply == "Nothing to shorten, sir."
+
+
+def test_adjust_undo_restores_the_snapshot_when_there_is_one(rich, services):
+    """A shorten clamped to now cannot be undone by adding the delta back."""
+    tk = services.timekeeper
+    prev = (1_800_000_000.0, None, "pending")
+    tk.adjust.return_value = [_adjusted_item(id="tm-9", previous=prev, applied=-120.0)]
+    tk.restore.return_value = True
+    res = rich.handle("take 5 minutes off the timer", source="typed")
+    assert res.undo is not None
+    tk.adjust.reset_mock()
+    res = rich.handle("scratch that", source="typed")
+    tk.restore.assert_called_once_with("tm-9", prev)
+    tk.adjust.assert_not_called()
+    assert res.reply == "Back to where it was, sir."
+
+
+def test_adjust_undo_still_falls_back_to_the_opposite_delta(rich, services):
+    """No snapshot (an older timekeeper, or a ring that cannot be un-killed):
+    the opposite delta is still the best there is."""
+    tk = services.timekeeper
+    tk.adjust.return_value = [_adjusted_item(id="tm-9")]
+    rich.handle("extend that timer by 10 minutes", source="typed")
+    tk.adjust.reset_mock()
+    tk.restore.reset_mock()
+    tk.adjust.return_value = [_adjusted_item(id="tm-9")]
+    res = rich.handle("scratch that", source="typed")
+    tk.restore.assert_not_called()
+    tk.adjust.assert_called_once_with("tm-9", "timer", -600)
+    assert res.reply == "Back to where it was, sir."
+
+
+@pytest.mark.parametrize("text", [
+    "cancel that one", "cancel that request", "cancel that step",
+    "cancel that action", "forget that thing",
+])
+def test_cancel_that_one_is_not_an_undo(rich, services, text):
+    """d38b493 sent these to the model (manage_schedule cancel); the widened
+    undo grammar turned "cancel that one" -- a natural way to pick an item
+    out of a read-out -- into a rewind of the last action."""
+    assert not commander.undo_kind(text), text
+    services.timekeeper.add_timer.return_value = types.SimpleNamespace(
+        id="tm-1", label="the tea", due=1_800_000_000.0, duration=600)
+    rich.handle("set a timer for 10 minutes for the tea", source="typed")
+    res = rich.handle(text, source="typed")
+    assert res is None or res.status != "Undone", text
+
+
+def test_a_weak_undo_with_nothing_to_take_back_reaches_the_model(rich, services):
+    """"Belay that last order" with nothing on the books is still addressed
+    to Jarvis and is answered; "cancel the last one" is not -- he may mean
+    the schedule, and the model can still cancel it."""
+    res = rich.handle("cancel that last one", source="typed")
+    assert res is None or res.status != "Nothing to undo"
+    res = rich.handle("belay that last order", source="voice")
+    assert res.handled and res.reply == "Nothing to take back, sir."
+
+
+def test_incident_replay_undo_of_a_clamped_shorten(real_tk, services):
+    """Real wiring: take five minutes off a two-minute timer and "scratch
+    that" claimed "back to where it was" while leaving it five minutes out."""
+    c, tk, clock = real_tk
+    c.handle("set a timer for 2 minutes for the eggs", source="typed")
+    created = tk.list("timer")[0].created
+    res = c.handle("take 5 minutes off the timer", source="typed")
+    assert res.reply == "Two minutes off, sir: the eggs now."   # not "five minutes off"
+    assert tk.list("timer")[0].due == pytest.approx(clock.now())
+    res = c.handle("scratch that", source="typed")
+    assert res.reply == "Back to where it was, sir."
+    assert tk.list("timer")[0].due == pytest.approx(created + 120)
+
+
+def test_incident_replay_extend_a_timer_named_before_the_kind_word(real_tk, services,
+                                                                   monkeypatch):
+    c, tk, clock = real_tk
+
+    def boom(*a, **k):
+        raise AssertionError("the classifier was consulted")
+    monkeypatch.setattr(c.intent, "classify", boom)
+    c.handle("set a timer for 30 minutes to pack up the chicken", source="voice")
+    c.handle("set a timer for 5 minutes for the tea", source="voice")
+    res = c.handle("extend the chicken timer by five minutes", source="voice")
+    assert res.status == "Timer extended"
+    assert res.reply == "Five minutes added, sir: pack up the chicken in 35 minutes."
+    res = c.handle("shorten the tea timer by 2 minutes", source="voice")
+    assert res.reply == "Two minutes off, sir: the tea in 3 minutes."
+    services.brain.chat.assert_not_called()
