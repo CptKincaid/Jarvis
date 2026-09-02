@@ -312,14 +312,24 @@ def test_marked_times_still_win_over_the_bare_pass(table):
 # ---------------------------------------------------------- room numbers
 #
 # THE RULE: a 2-4 digit run with a LEADING ZERO is an identifier and is said
-# digit by digit. Nothing else. A leading zero is the one written form that
-# cannot be a quantity, so the rule has no ambiguous side; the quantities
-# below are pinned untouched. "ETB 1035" / "Ecen 404" / "731A" are real and
-# still wrong, and are left alone on purpose -- see the module comment.
+# digit by digit. Nothing else. The quantities below are pinned untouched.
+# "ETB 1035" / "Ecen 404" / "731A" are real and still wrong, and are left
+# alone on purpose -- see the module comment.
+#
+# A leading zero is nearly the one written form that cannot be a quantity,
+# with ONE exception the first cut of this rule shipped with: the group
+# after a THOUSANDS COMMA. "1,000 songs" became "1,zero zero zero songs" and
+# "$1,050" became "$1,zero five zero", silently (a substitution, not a loss,
+# so speech_divergence never sees it). The separator cases are pinned in the
+# negative list below and the comma is in the lookbehind now. It must NOT be
+# in the trailing lookahead: "Wisenbaker 049, sir" still has to expand.
 @pytest.mark.parametrize("raw,spoken", [
     ("Wisenbaker 049", "Wisenbaker zero four nine"),
     ("Wisenbaker 049.", "Wisenbaker zero four nine."),
     ("in 049, sir", "in zero four nine, sir"),
+    # the trailing comma must stay OUT of the lookahead (the regression fix
+    # for the thousands separator is a lookBEHIND change only)
+    ("Wisenbaker 049, sir.", "Wisenbaker zero four nine, sir."),
     ("room 07", "room zero seven"),
     ("0800", "zero eight zero zero"),
 ])
@@ -336,8 +346,27 @@ def test_leading_zero_runs_are_spoken_digit_by_digit(table, raw, spoken):
     "a high of 95 degrees",
     "500 of them",
     "Volume 100, sir.",
+    # THE WORST RESIDUAL IN THE 2026-09-02 BOOT, and it is not a course
+    # code: replayed through _split_sentences + f5_server.duration_floor +
+    # this speaker's affine law, the dayreview line below is at -1.92 s,
+    # twice as starved as "Ecen 404" (-0.95 s), and jarvis/dayreview.py
+    # says it EVERY DAY. It is plain cardinals and decimals, so the fix is
+    # the cardinal class, not this identifier rule -- see the module
+    # comment. Pinned untouched so the next edit here is a deliberate one.
+    "Yesterday: 179 turns, median wait 2.1 seconds, worst 24.6.",
     "Yesterday: 179 turns",
     "the 2025 championship",
+    # THOUSANDS SEPARATORS. The 3-digit group after a comma is a quantity
+    # and it CAN start with a zero -- the one false-positive shape the
+    # leading-zero rule has. Regression from the first cut of this rule.
+    "1,000 songs, sir.",
+    "10,000 steps",
+    "2,048 tokens",
+    "$1,050 remaining",
+    "You have 1,035 unread messages, sir.",
+    "The repo has 1,004 tests, sir.",
+    "You walked 3,090 steps.",
+    "1,024,000 people",
     # IDENTIFIERS WITHOUT A LEADING ZERO: out of scope, deliberately.
     "ETB 1035",
     "Ecen 404",

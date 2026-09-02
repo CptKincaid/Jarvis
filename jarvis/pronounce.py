@@ -271,10 +271,22 @@ def speak_times(text: str) -> str:
 #
 # THE RULE, and it is deliberately one rule and not a clever one: a run of
 # 2-4 digits WITH A LEADING ZERO is an identifier, and is said digit by
-# digit. Nothing else is touched. A leading zero is the one thing in written
-# English that cannot be a quantity -- nobody writes "049 minutes" -- so this
-# limb has no false-positive shape at all, and the tests pin the quantities
-# ("10 minutes", "30 minutes", "78 days", "95 degrees") unchanged.
+# digit. Nothing else is touched. A leading zero is nearly the one thing in
+# written English that cannot be a quantity -- nobody writes "049 minutes" --
+# and the tests pin the quantities ("10 minutes", "30 minutes", "78 days",
+# "95 degrees") unchanged.
+#
+# THERE IS EXACTLY ONE EXCEPTION, and the first cut of this rule shipped
+# with it: the three-digit group AFTER A THOUSANDS COMMA is a quantity and
+# it can begin with a zero. The lookbehind was (?<![\w:./-]), which has no
+# comma in it, so "1,000 songs" came out "1,zero zero zero songs" and
+# "$1,050" came out "$1,zero five zero" -- strictly worse than the digits
+# F5 was given before, and silent (speech_divergence sees a substitution,
+# not a loss). Every comma-grouped number Jarvis QUOTES rather than formats
+# reaches this: an LLM answer, a headline, a note or mail read back.
+# jarvis/mathspeak.py strips thousands commas itself, which is why the
+# calculator path never showed it. The comma is in the lookbehind now, and
+# NOT in the trailing lookahead -- "Wisenbaker 049, sir" must still expand.
 #
 # WHAT IS DELIBERATELY NOT DONE, having tried it: the other identifiers in
 # his calendar -- "ETB 1035", "Ecen 404", "Jack E. Brown 731A" -- have no
@@ -282,17 +294,35 @@ def speak_times(text: str) -> str:
 # quantity he has actually been told. "a capitalised word then 3-4 digits"
 # eats "Volume 100, sir." (spoken 2026-09-01); "digits then a capital letter"
 # eats the model sizes "70B" and "32B". It is the LAB-versus-CPU problem from
-# _SHOUTED_WORDS again: shape cannot separate them. "Ecen 404" is the worst
-# margin in the whole boot (-0.94 s) and IS still wrong; it wants either a
-# building/course list drawn from his own calendar or the expansion done at
-# the composer, where the string is known to be a room. Measured, written
-# down, and left for a decision rather than guessed at here.
+# _SHOUTED_WORDS again: shape cannot separate them. "Ecen 404" (-0.95 s) IS
+# still wrong; it wants either a building/course list drawn from his own
+# calendar or the expansion done at the composer, where the string is known
+# to be a room.
+#
+# AND THE RESIDUAL IS NOT THAT ONE COURSE CODE. Replaying every
+# `speaking (f5):` line of the 2026-09-02 boot through _split_sentences,
+# scripts/f5_server.duration_floor (ref 528 frames / 109 bytes at speed
+# 0.85) and this speaker's affine law with each digit run expanded to the
+# words it must say: 10 chunks negative before this commit, 9 after -- this
+# rule flips exactly ONE, his (-0.50 -> positive). The WORST margin in the
+# boot is not a course code at all but
+#     "Yesterday: 179 turns, median wait 2.1 seconds, worst 24.6."
+# at -1.92 s, twice as starved as "Ecen 404", plain cardinals and decimals,
+# and a line jarvis/dayreview.py speaks EVERY DAY. Also still negative:
+# "45 minutes" / "your 45-minute timer is up" (-0.15), "a high of 95
+# degrees" (-0.04), "Chiro in 30 minutes" (-0.00).
+#
+# So the real remaining work is the CARDINAL class, not the identifier one:
+# "30" -> "thirty" is +4 bytes = +0.20 s, "2.1" -> "two point one" is +11.
+# Unlike an identifier a cardinal has no ambiguous side at all -- a cardinal
+# is a cardinal -- so it is a SMALLER decision than the course-code list
+# above, not a larger one. It is left out of this commit only for scope.
 #
 # The lookarounds keep it off an ISO date ("2026-09-02"), a version ("1.049"),
 # a decimal, and a clock (which the pass above has already consumed anyway).
 _DIGIT_WORDS = ("zero", "one", "two", "three", "four", "five", "six",
                 "seven", "eight", "nine")
-_ID_DIGITS_RX = re.compile(r"(?<![\w:./-])0\d{1,3}(?![\w:/-])(?!\.\d)")
+_ID_DIGITS_RX = re.compile(r"(?<![\w:.,/-])0\d{1,3}(?![\w:/-])(?!\.\d)")
 
 
 def _spoken_digits(match: "re.Match") -> str:
