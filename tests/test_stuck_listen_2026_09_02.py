@@ -49,17 +49,33 @@ a capture -- may hold the room or the mic down past a maximum without saying
 so at WARNING and putting the world back; and a question with no mic behind
 it says so on the board instead of looking like speech.
 
-STILL OPEN, deliberately not touched here (both outside this branch's files):
+SECOND PASS (review).  The first cut of this branch fixed what the orphan
+tick HELD DOWN and left the tick itself in the tree, so the headline symptom
+-- the pill reading "Speaking" -- was still true, and two more level-readers
+were still latching.  Both are now fixed at the source:
 
-  * jarvis/tts.py:1900 is the SOURCE.  ``_feed_amp`` signs off with
-    ``bus.publish(SpeakingState(active=True, amplitude=0.0))``; the value
-    that belongs there is ``active=self._speaking``, or nothing at all --
-    the falling edge is the worker's to publish, not the feeder's.  Until
-    that lands, the watchdogs below are what stands between a lost tick and
-    a room left at 30 %.
-  * jarvis/ui/main_window.py:1678 ``_ev_speaking`` reads ``ev.active`` as a
-    level, so the pill latches on "Speaking" from the same tick -- which is
-    literally the thing he reported seeing.
+  * ``SpeakingState`` grew ``amplitude_only``.  The feeder's sign-off sets
+    it; the five subscribers that keep ``active`` as a level (mixer,
+    roomtone, reactor, the window's pill, ``app._tts_active``) ignore such a
+    tick.  ``active=self._speaking`` was rejected as the fix: the feeder
+    reads that flag on one thread and publishes on another, so the same race
+    survives in a narrower window, and only a lock held across a
+    ``bus.publish`` would close it -- which deadlocks headless, where
+    ``publish`` delivers inline on the caller's thread.
+  * ``app._question_open`` sized the leave rung at LEAVE_ANSWER_WINDOW_S
+    (180 s) rather than the mic window it was added for.  That predicate
+    also gates ``_salvage_low_confidence``, and ``_try_leave_answer`` FILES
+    (``leavetime.learn``), so for three minutes after a question he may
+    never have heard, a sub-threshold garble reading as a bare numeral would
+    have become his permanent walk time.  The rung is now measured against
+    ``quiz.window_s``, and the salvage excludes a live leave question by
+    name -- the rule its own docstring states.
+
+STILL OPEN, and NOT this branch's (it is the sibling ``speak-numbers`` lane,
+fixed there at 7628e76): incident 1, the rushed 08:55:50 line.  F5 allocates
+duration by BYTE LENGTH, so "Your 9:10 is Biosensors, Wisenbaker 049." (40 B)
+is given the time for 40 bytes and spoken as 55 ("nine ten ... zero four
+nine").  Nothing in this file touches jarvis/pronounce.py.
 """
 from __future__ import annotations
 
@@ -470,3 +486,218 @@ def test_the_orphan_duck_is_the_only_one_in_the_whole_boot():
                and not any(k in ("SPEAK", "REC") and 0 <= sec(t) - sec(u) < 2.0
                            for u, k in window[:i])]
     assert orphans == ["08:56:19.079"]
+
+
+# ====================================================================
+# SECOND PASS 1: the tick that latched five subscribers
+# ====================================================================
+def _incident_edges():
+    """The three real SpeakingState edges of 08:56, in order.
+
+    Rising at ~16.000 (the duck), the worker's falling edge at 18.754
+    ("speech complete"), and the amplitude feeder's sign-off at 19.079 --
+    325 ms late, because ~34 chunks x 80 ms of sleep outran 2.75 s of audio.
+    """
+    from jarvis.events import SpeakingState
+    return [SpeakingState(active=True, amplitude=0.4),
+            SpeakingState(active=False, amplitude=0.0),
+            SpeakingState(active=True, amplitude=0.0, amplitude_only=True)]
+
+
+def test_the_feeder_sign_off_is_flagged_amplitude_only():
+    """The SOURCE. _feed_amp must not publish anything a subscriber can
+    mistake for an edge. It cannot send active=False either -- mid-burst
+    that is a spurious end-of-speech and _after_speech would open the
+    follow-up mic under the next chunk's playback -- so it says what it is.
+    """
+    from jarvis import tts as tts_mod
+    from jarvis.events import SpeakingState, bus
+
+    seen = []
+    f = bus.subscribe(SpeakingState, seen.append)
+    try:
+        eng = object.__new__(tts_mod.TTS)
+        eng._amp_gen = 0
+        eng._amp_playing = False
+        eng._current_amp = 0.0
+        eng._stop_flag = False
+        eng._burst_announced = True          # the burst already announced
+        eng._run_amp_feeder(iter([0.5, 0.4]))
+        deadline = time.monotonic() + 3.0
+        while time.monotonic() < deadline and len(seen) < 3:
+            time.sleep(0.01)
+    finally:
+        bus.unsubscribe(SpeakingState, f)
+
+    assert len(seen) == 3, f"expected two ticks and a sign-off, got {seen}"
+    assert [e.amplitude_only for e in seen] == [False, False, True], \
+        "only the sign-off is amplitude-only; the ~12 Hz ticks are the " \
+        "mixer's proof of life and must keep stamping the hold"
+    assert seen[-1].amplitude == 0.0
+
+
+@pytest.mark.parametrize("name", ["mixer", "roomtone", "reactor",
+                                  "main_window", "app"])
+def test_no_level_reader_latches_on_the_orphan_tick(name, tmp_path):
+    """His sentence, as five assertions: "was stuck at speaking".
+
+    Each of these keeps ``ev.active`` as a level. Replay the incident's
+    exact three edges and the level must be DOWN at the end -- before this,
+    every one of them latched True with no falling edge left in the world.
+    """
+    edges = _incident_edges()
+
+    if name == "mixer":
+        m = _mixer(tmp_path)
+        for ev in edges:
+            m.on_speaking(ev)
+        assert m.holds == set(), \
+            "his music sat at 30 % because the hold was taken again"
+
+    elif name == "roomtone":
+        from jarvis.roomtone import RoomTone
+        tone = object.__new__(RoomTone)
+        tone._lock = threading.RLock()
+        tone._muted = {}
+        tone._now = time.monotonic
+        tone._stop_stream = lambda *_a, **_k: None
+        for ev in edges:
+            tone.on_speaking(ev)
+        assert tone.muted is False, "the bed would never have come back"
+
+    elif name == "reactor":
+        from jarvis.ui import reactor as rx
+        r = object.__new__(rx.Reactor) if hasattr(rx, "Reactor") else None
+        if r is None:                        # class renamed: guard, not skip
+            pytest.skip("no Reactor class to drive")
+        r._speaking = False
+        r._speak_amp = 0.0
+        r._ripples = []
+        r._last_ripple = 0.0
+        r._t0 = time.monotonic()
+        for ev in edges:
+            r._on_speaking(ev)
+        assert r._speaking is False
+        assert r._speak_amp == 0.0
+
+    elif name == "main_window":
+        # The pill, read without importing Tk: _speaking is written from
+        # exactly one place and this is that function, unbound.
+        from jarvis.ui import main_window as mw
+        w = SimpleNamespace(_speaking=False, _refresh_pill=lambda: None)
+        for ev in edges:
+            mw.MainWindow._ev_speaking(w, ev)
+        assert w._speaking is False, \
+            'the board read "Speaking" for 17 s while he typed'
+
+    else:
+        a = object.__new__(app_mod.JarvisApp)
+        a._tts_active = False
+        a._turn_filler_pending = False
+        fired = []
+        a._after_speech = lambda: fired.append(1)
+        a.turns = SimpleNamespace(mark=lambda *x, **k: None,
+                                  abandon=lambda *x, **k: None)
+        for ev in edges:
+            a._turn_on_speaking(ev)
+        assert a._tts_active is False, \
+            "a latched _tts_active disables _nudge and the guest decline " \
+            "for the rest of the boot"
+        assert fired == [1], "and the burst must still close exactly once"
+
+
+def test_an_amplitude_only_tick_never_closes_a_burst_mid_read():
+    """The reason the sign-off could not simply carry active=False.
+
+    Chunk 1 of a multi-chunk read signs off while chunk 2 is still
+    rendering. If that looked like a falling edge, _after_speech would open
+    the follow-up mic under the next chunk's playback and the room would
+    come back up in the middle of a sentence.
+    """
+    from jarvis.events import SpeakingState
+
+    a = object.__new__(app_mod.JarvisApp)
+    a._tts_active = False
+    a._turn_filler_pending = False
+    fired = []
+    a._after_speech = lambda: fired.append(1)
+    a.turns = SimpleNamespace(mark=lambda *x, **k: None,
+                              abandon=lambda *x, **k: None)
+    a._turn_on_speaking(SpeakingState(active=True, amplitude=0.4))
+    a._turn_on_speaking(SpeakingState(active=True, amplitude=0.0,
+                                      amplitude_only=True))
+    assert a._tts_active is True and fired == [], \
+        "the read is still going; nothing may end the turn here"
+    a._turn_on_speaking(SpeakingState(active=False))
+    assert fired == [1]
+
+
+# ====================================================================
+# SECOND PASS 2: the leave rung reached further than the mic it sized
+# ====================================================================
+def test_the_leave_rung_does_not_open_the_salvage_gate(tmp_path, monkeypatch):
+    """Found in review. _question_open is not only read by _capture_window:
+    _salvage_low_confidence force-accepts a sub-threshold transcript
+    whenever it is True, and _try_leave_answer FILES -- leavetime.learn is
+    a permanent walk time, and answer_minutes reads "uh ten minute" as ten.
+
+    So a leave rung inside that predicate meant that for the whole of
+    LEAVE_ANSWER_WINDOW_S (180 s) after a question Jarvis asked on its own
+    initiative, any garbled numeral became his walk time to Wisenbaker.
+    """
+    from jarvis import leavetime as lt_mod
+    from jarvis.commander import LEAVE_ANSWER_WINDOW_S
+
+    # provenance: the shapes the filer really accepts
+    assert lt_mod.answer_minutes("uh ten minute") == 10
+    assert LEAVE_ANSWER_WINDOW_S >= 180.0
+
+    a = _leave_app(tmp_path, monkeypatch)
+    a._pending_uncertain = None
+    a._pending_debrief = None
+    for age in (1.0, 100.0):
+        a.commander._pending_leave = ("Wisenbaker Engineering Bldg",
+                                      "Wisenbaker", time.monotonic() - age)
+        assert a._salvage_low_confidence("ten", -1.2) == "", \
+            f"a {age:.0f}s-old walk question must not run a garble"
+
+
+def test_the_leave_rung_is_sized_by_the_mic_it_was_added_for(
+        tmp_path, monkeypatch):
+    """It is the follow-up window that needed widening, not the confidence
+    gate. The rung keeps its own 180 s inside _try_leave_answer -- an answer
+    on a later wake word is still taken -- but the predicate that sizes the
+    mic reaches only as far as the mic does.
+    """
+    a = _leave_app(tmp_path, monkeypatch)
+    window = a._window_setting("quiz.window_s", 15.0)
+
+    a.commander._pending_leave = ("Wisenbaker Engineering Bldg",
+                                  "Wisenbaker", time.monotonic())
+    assert a._question_open(a.commander) is True
+    assert (a._capture_window() or 0) >= 15.0
+
+    a.commander._pending_leave = ("Wisenbaker Engineering Bldg", "Wisenbaker",
+                                  time.monotonic() - (window + 1.0))
+    assert a._question_open(a.commander) is False, \
+        "past the window it sizes, this rung is nobody's business"
+
+
+def test_a_stale_leave_tuple_cannot_gate_the_salvage_for_ever(
+        tmp_path, monkeypatch):
+    """_pending_leave is cleared LAZILY -- _try_leave_answer only drops it on
+    the next utterance -- so an unanswered walk question sits on the
+    commander until then. Excluding it by truthiness would have switched the
+    low-confidence salvage off for the rest of the day.
+    """
+    from jarvis.commander import LEAVE_ANSWER_WINDOW_S
+
+    a = _leave_app(tmp_path, monkeypatch)
+    a._pending_uncertain = None
+    a._pending_debrief = None
+    a.commander._pending_leave = (
+        "Wisenbaker Engineering Bldg", "Wisenbaker",
+        time.monotonic() - (LEAVE_ANSWER_WINDOW_S + 60.0))
+    a.commander._pending_destructive = ("delete", "x", time.monotonic())
+    assert a._salvage_low_confidence("yes", -1.2) != "", \
+        "a dead leave tuple must not veto a live destructive read-back"

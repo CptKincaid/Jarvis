@@ -2469,6 +2469,26 @@ class JarvisApp:
             window = default
         return max(window, float(CONFIG.followup_window))
 
+    @staticmethod
+    def _leave_pending_age(commander):
+        """How long ago the walk question was asked, or None if none stands.
+
+        ``commander._pending_leave`` is ``(key, place, monotonic)`` and is
+        cleared lazily -- ``_try_leave_answer`` only drops it on the next
+        utterance -- so a stale tuple can sit on the commander for hours.
+        Every caller therefore wants the AGE, never the truthiness, and each
+        one measures it against its own window: the mic against
+        ``quiz.window_s``, the salvage gate against the rung's real
+        LEAVE_ANSWER_WINDOW_S.
+        """
+        pend = getattr(commander, "_pending_leave", None)
+        if not isinstance(pend, tuple) or len(pend) != 3:
+            return None
+        try:
+            return time.monotonic() - float(pend[2])
+        except (TypeError, ValueError):
+            return None
+
     def _question_open(self, commander) -> bool:
         """Jarvis asked something and is waiting on the answer.
 
@@ -2511,16 +2531,20 @@ class JarvisApp:
         # Jarvis asked too, and commander.question_open() does not count it
         # (it is the one rung that arms itself from outside handle()). Its
         # answer is a sentence -- "about ten minutes" -- not a word, and the
-        # 4 s follow-up window is sized for "...and Tuesday?". The expiry is
-        # the rung's own: while _try_leave_answer would still take the
-        # answer, the mic that carries it should be the long one.
-        leave = getattr(commander, "_pending_leave", None)
-        if isinstance(leave, tuple) and len(leave) == 3:
-            try:
-                if time.monotonic() - float(leave[2]) <= LEAVE_ANSWER_WINDOW_S:
-                    return True
-            except (TypeError, ValueError):
-                pass
+        # 4 s follow-up window is sized for "...and Tuesday?".
+        #
+        # The expiry here is the MIC's, not the rung's. _pending_leave lives
+        # for LEAVE_ANSWER_WINDOW_S (180 s), and review caught what that
+        # would have meant: this predicate is not only read by
+        # _capture_window, it also gates _salvage_low_confidence, so a
+        # three-minute rung would have force-accepted sub-threshold garble
+        # for three minutes after a question he may never have heard. The
+        # window this branch exists to size is quiz.window_s, so that is
+        # what it is measured against; _try_leave_answer keeps its own 180 s
+        # for an answer that arrives on a later wake word.
+        age = self._leave_pending_age(commander)
+        if age is not None and age <= self._window_setting("quiz.window_s", 15.0):
+            return True
         # The wake-alarm offer lives on the services namespace, not on the
         # commander: briefing.make_tools parks it there for
         # _try_alarm_offer.
@@ -3360,6 +3384,11 @@ class JarvisApp:
             self.turns.abandon("empty")
 
     def _turn_on_speaking(self, ev):
+        if getattr(ev, "amplitude_only", False):
+            # The feeder's mouth-close tick. It carries no edge, and taking
+            # it as one latched _tts_active True for the rest of the boot --
+            # which silently disables the nudge and the guest decline.
+            return
         # Rising edge only: SpeakingState(active=True) repeats at ~12 Hz for
         # amplitude, and a turn opened while a previous reply is still
         # playing must not be closed by those ticks. A filler line ("Looking
@@ -3537,6 +3566,19 @@ class JarvisApp:
         # reply; the rungs that FILE are the ones that must be excluded by
         # name, and they are.
         if getattr(commander, "_pending_quiz", None):
+            return ""
+        # And the walk question FILES too: _try_leave_answer runs
+        # leavetime.learn(key, minutes) -- a permanent walk time -- on
+        # anything leavetime.answer_minutes reads as a duration, and it
+        # reads "a bow ten minutes" and "uh ten minute" as ten. Its rung
+        # stands for LEAVE_ANSWER_WINDOW_S (180 s) after a question Jarvis
+        # asked on its own initiative and he may never have heard, so for
+        # three minutes any sub-threshold garble containing a numeral would
+        # have been run instead of dropped. Excluded BY NAME, per the rule
+        # above; the age is checked because _pending_leave is cleared
+        # lazily and a stale tuple must not gate the salvage for ever.
+        age = self._leave_pending_age(commander)
+        if age is not None and age <= LEAVE_ANSWER_WINDOW_S:
             return ""
         try:
             if self._question_open(commander):

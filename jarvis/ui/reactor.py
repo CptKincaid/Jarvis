@@ -434,7 +434,10 @@ class Reactor(tk.Canvas):
         self._thinking = (ev.state == "thinking")
 
     def _on_speaking(self, ev: SpeakingState):
-        self._speaking = ev.active
+        # An amplitude-only tick still shapes the mouth -- that is the whole
+        # point of it -- but it must not move the speaking flag.
+        if not getattr(ev, "amplitude_only", False):
+            self._speaking = ev.active
         self._speak_amp = max(0.0, min(1.0, ev.amplitude))
         if CENTERPIECE != "avatar":      # ripples are a reactor-disc overlay
             now = time.monotonic() - self._t0

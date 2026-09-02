@@ -631,6 +631,8 @@ class RoomMixer:
 
     def on_speaking(self, ev) -> None:
         """SpeakingState arrives ~12 Hz while he talks; only the edge counts."""
+        if getattr(ev, "amplitude_only", False):
+            return          # a mouth-shape tick, not a claim about speech
         self._set_hold("speaking", bool(getattr(ev, "active", False)))
 
     def on_recording_started(self, ev=None) -> None:
