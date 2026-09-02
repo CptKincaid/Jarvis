@@ -1,0 +1,1197 @@
+"""The Breeze-TTS-2 sidecar, its protocol, and the client that streams from it.
+
+WHY. In the round-11 BLIND listening test Hunter rated Breeze 4.71 against a
+hidden hosted-Fish control at 4.64 while the shipped F5 voice scored 2.79, and
+a blind A/B of the quantized build against the bf16 one came out inside the
+round's noise floor. So this is the best voice available and it is local --
+but it is also a 13.5 GB resident model whose one-time CUDA-graph capture
+transiently demands ~18.3 GB on a box where GPU memory IS system memory.
+
+Two properties are therefore load-bearing and are what most of this file
+asserts:
+
+  * IT IS OFF UNTIL HE TURNS IT ON. With tts_engine anything but "breeze",
+    every number, table and cache key on the F5 path is what it was before
+    (the last section proves it), and nothing here spawns, loads or pings
+    anything.
+  * READY MEANS THE CUDA GRAPHS WERE CAPTURED. int4 without them measures
+    RTF 1.131 -- above real time, so it underruns mid-utterance -- against
+    0.742 with them. A sidecar that loaded but did not capture must be
+    refused, and Jarvis must speak in the 2.79 voice rather than a broken
+    4.71 one.
+
+No GPU, no audio, no display, no network: the server's protocol is driven
+through a fake render callable, the client through a real AF_UNIX server in
+tmp_path that speaks the protocol, and the players are faked at the Popen
+seam.
+"""
+import importlib.util
+import io
+import json
+import os
+import socket
+import subprocess
+import threading
+import time
+import wave
+from pathlib import Path
+
+import pytest
+
+from jarvis import tts as tts_mod
+from jarvis.config import CONFIG, PATHS
+from jarvis.tts import TTS
+
+REPO = Path(__file__).resolve().parent.parent
+UNIT = REPO / "scripts" / "systemd" / "jarvis-breeze.service"
+SETUP = REPO / "scripts" / "setup_breeze_service.sh"
+
+
+def _load_server():
+    """scripts/breeze_server.py, imported by path.
+
+    It keeps every heavy import (torch, the breeze source tree) inside
+    main()/load_engine() precisely so this works: the protocol and its
+    failure paths are testable with no GPU and no venv switch.
+    """
+    spec = importlib.util.spec_from_file_location(
+        "breeze_server", REPO / "scripts" / "breeze_server.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+bs = _load_server()
+
+
+# ===========================================================================
+# helpers
+# ===========================================================================
+def pcm(nframes: int, value: int = 1000) -> bytes:
+    return b"".join(int(value).to_bytes(2, "little", signed=True)
+                    for _ in range(nframes))
+
+
+def wav_bytes(seconds=0.4, rate=24000, amp=8000) -> bytes:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(rate)
+        n = int(rate * seconds)
+        w.writeframes(b"".join(int(amp * ((i // 40) % 2 * 2 - 1)).to_bytes(
+            2, "little", signed=True) for i in range(n)))
+    return buf.getvalue()
+
+
+def wait_until(pred, timeout=5.0):
+    deadline = time.time() + timeout
+    while not pred() and time.time() < deadline:
+        time.sleep(0.01)
+    return pred()
+
+
+ALL_GRAPHS = {"fast_enabled": True, "backbone_decode": True,
+              "depth_decoder": True, "codec": True}
+
+
+class FakeProc:
+    """A player that 'exits' once its stdin is closed (or at once for the
+    file chain), recording when it was spawned and what it was fed."""
+    spawned: list = []
+
+    def __init__(self, cmd, **kw):
+        self.cmd = cmd
+        self.t = time.monotonic()
+        self.fed = bytearray()
+        self.returncode = None
+        self._closed = kw.get("stdin") is None
+        proc = self
+
+        class _Stdin:
+            def write(self_, data):
+                proc.fed += data
+
+            def close(self_):
+                proc._closed = True
+
+        self.stdin = _Stdin()
+        FakeProc.spawned.append(self)
+
+    def poll(self):
+        if self._closed and self.returncode is None:
+            self.returncode = 0
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = -15
+        self._closed = True
+
+    kill = terminate
+
+    def wait(self, timeout=None):
+        return self.returncode
+
+
+@pytest.fixture(autouse=True)
+def _fresh_spawns():
+    FakeProc.spawned = []
+    yield
+    FakeProc.spawned = []
+
+
+# ===========================================================================
+# 1. the wire format
+# ===========================================================================
+def test_the_two_wav_header_builders_agree_byte_for_byte():
+    """The sidecar writes this header and jarvis/tts.py's _LiveEnvelope
+    parses it; paplay decodes the same bytes from stdin. A disagreement here
+    is silence with no error anywhere, so it is asserted rather than trusted
+    to two copies of the same struct format."""
+    for rate in (24000, 16000):
+        assert bs.wav_header(rate) == tts_mod.wav_header(rate, 1, 2, None)
+        assert bs.wav_header(rate, 1, 2, 400) == tts_mod.wav_header(rate, 1, 2, 400)
+    assert len(bs.wav_header(24000)) == tts_mod._WAV_HEADER_BYTES == 44
+
+
+def test_pcm16_applies_the_gain_and_clips_instead_of_normalising():
+    """Per-chunk peak normalisation would make the level pump audibly inside
+    one sentence, which is why apply_output_gain is a constant too."""
+    quiet = bs.pcm16([0.0, 0.25, -0.25], gain=2.0)
+    assert quiet == b"".join(int(v).to_bytes(2, "little", signed=True)
+                             for v in (0, 16383, -16383))
+    # a hot sample is clipped, not scaled -- and does not drag the chunk down
+    hot = bs.pcm16([0.9, 0.1], gain=2.0)
+    assert hot[:2] == (32767).to_bytes(2, "little", signed=True)
+    assert hot[2:] == (6553).to_bytes(2, "little", signed=True)
+
+
+def test_the_memory_gate_reads_memfree_not_memavailable(tmp_path):
+    """MemAvailable never dropped below 41.7 GiB during a real graph capture
+    while actual free pages hit 2.39 GiB, because ~39 GiB of it was
+    reclaimable page cache. render_q.py's own gate reads MemAvailable and
+    would have waved that through."""
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text("MemTotal:       127606644 kB\n"
+                       "MemFree:          2097152 kB\n"
+                       "MemAvailable:    73400320 kB\n")
+    assert bs.free_mem_gb(str(meminfo)) == pytest.approx(2.0, abs=0.01)
+    assert bs.mem_gb("MemAvailable", str(meminfo)) == pytest.approx(70.0, abs=0.01)
+    assert bs.free_mem_gb(str(tmp_path / "nope")) == -1.0
+
+
+def test_the_free_page_floor_covers_the_model_and_the_capture():
+    """13.5 GiB for the resident model plus 18.2 GiB of capture transient is
+    31.7 GiB before the trough reaches zero, so the floor cannot be below
+    that -- and a companion analysis proposing 25 would have landed at -6."""
+    assert bs.MIN_FREE_GB >= 32
+    assert bs.MIN_AVAILABLE_GB >= 60      # the box's standing rule for GPU jobs
+
+
+# ===========================================================================
+# 2. the readiness gate
+# ===========================================================================
+class _Graph:
+    def __init__(self, captured):
+        self.captured = captured
+
+
+class _Lane:
+    def __init__(self, graph):
+        self.cuda_graph = graph
+
+
+class _Codec:
+    def __init__(self, lanes):
+        self.lanes = lanes
+
+
+class _Runtime:
+    """Only the attributes graphs_captured() reads."""
+    def __init__(self, backbone=(True, True), depth=True, codec=(object(),),
+                 fast=True):
+        self._backbone_graphs = {i + 1: _Graph(c) for i, c in enumerate(backbone)}
+        self._depth_decoder_graph = _Graph(depth)
+        self._codec_runtime = _Codec([_Lane(g) for g in codec])
+        self.fast_enabled = fast
+
+
+def test_graphs_captured_reads_the_objects_not_the_config():
+    """fast_enabled is only the REQUEST -- it is any() over the config flags,
+    and _ensure_graphs quietly calls prepare_eager() for any lane whose flag
+    is off. Only the graph objects know what actually happened."""
+    assert bs.all_graphs_captured(bs.graphs_captured(_Runtime()))
+    # one backbone bucket captured eagerly
+    assert not bs.all_graphs_captured(
+        bs.graphs_captured(_Runtime(backbone=(True, False))))
+    assert not bs.all_graphs_captured(bs.graphs_captured(_Runtime(depth=False)))
+    assert not bs.all_graphs_captured(bs.graphs_captured(_Runtime(codec=(None,))))
+    assert not bs.all_graphs_captured(bs.graphs_captured(_Runtime(fast=False)))
+
+
+def test_graphs_captured_degrades_rather_than_raising_on_a_library_change():
+    """A renamed attribute must read as 'not captured' at ping time, not
+    explode when Jarvis asks."""
+    detail = bs.graphs_captured(object())
+    assert detail == {"fast_enabled": False, "backbone_decode": False,
+                      "depth_decoder": False, "codec": False}
+
+
+def test_ready_is_false_without_every_graph():
+    """int4 with no graphs is RTF 1.131 -- above real time, so it underruns
+    mid-utterance. A model that merely loaded is not ready."""
+    svc = bs.BreezeService(render=lambda t, g: iter(()), ready=True,
+                           graphs={**ALL_GRAPHS, "codec": False})
+    assert svc.ready is False
+    assert svc.ping()["graphs"] is False
+    assert svc.ping()["ready"] is False
+    # and with everything captured it is
+    good = bs.BreezeService(render=lambda t, g: iter(()), ready=True,
+                            graphs=ALL_GRAPHS)
+    assert good.ready is True and good.ping()["graphs"] is True
+
+
+def test_ready_is_false_without_a_renderer():
+    assert bs.BreezeService(render=None, ready=True, graphs=ALL_GRAPHS).ready is False
+
+
+# ===========================================================================
+# 3. the protocol, driven through a fake renderer over a real socketpair
+# ===========================================================================
+def serve_once(service, request: dict) -> tuple[bytes, list]:
+    """Send ``request`` to ``service`` over a socketpair, return every byte
+    it wrote back. The service side is a real socket, so the failure paths
+    exercise the real sendall/shutdown."""
+    a, b = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+    done = threading.Event()
+
+    def _run():
+        try:
+            service.handle(b)
+        finally:
+            b.close()
+            done.set()
+
+    threading.Thread(target=_run, daemon=True).start()
+    a.sendall(json.dumps(request).encode() + b"\n")
+    out = b""
+    a.settimeout(5)
+    while True:
+        try:
+            part = a.recv(65536)
+        except (OSError, socket.timeout):
+            break
+        if not part:
+            break
+        out += part
+    a.close()
+    done.wait(5)
+    return out
+
+
+def split_reply(raw: bytes) -> tuple[dict, bytes]:
+    line, _, rest = raw.partition(b"\n")
+    return json.loads(line.decode() or "{}"), rest
+
+
+def blocks_render(*blocks, fail_after=None):
+    """A fake ``render(text, gain)``: yields ``blocks``, optionally raising
+    after ``fail_after`` of them."""
+    def _render(text, gain=1.0):
+        for i, block in enumerate(blocks):
+            if fail_after is not None and i == fail_after:
+                raise RuntimeError("cuda blew up")
+            yield block
+    return _render
+
+
+def ready_service(render):
+    return bs.BreezeService(render=render, ready=True, graphs=ALL_GRAPHS,
+                            config={"cfg_scale": 4.0})
+
+
+def test_ping_carries_the_graph_detail_and_the_pinned_config():
+    svc = ready_service(blocks_render(pcm(10)))
+    head, rest = split_reply(serve_once(svc, {"ping": True}))
+    assert head == {"ok": True, "ready": True, "graphs": True,
+                    "detail": ALL_GRAPHS, "sr": 24000,
+                    "config": {"cfg_scale": 4.0}}
+    assert rest == b""
+
+
+def test_a_render_request_on_a_degraded_sidecar_is_refused_with_no_audio():
+    svc = bs.BreezeService(render=blocks_render(pcm(10)), ready=True,
+                           graphs={**ALL_GRAPHS, "depth_decoder": False},
+                           error="graph capture failed: boom")
+    head, rest = split_reply(serve_once(svc, {"text": "Hello.", "stream": True}))
+    assert head["ok"] is False
+    assert "boom" in head["error"]
+    assert rest == b""              # not one byte: the caller uses F5 instead
+
+
+def test_streaming_sends_the_json_line_then_a_riff_header_then_pcm():
+    svc = ready_service(blocks_render(pcm(4), pcm(6)))
+    head, rest = split_reply(
+        serve_once(svc, {"text": "Good evening.", "stream": True, "id": "r1"}))
+    assert head["ok"] is True and head["stream"] is True
+    assert head["sr"] == 24000 and head["channels"] == 1 and head["sampwidth"] == 2
+    assert rest[:44] == tts_mod.wav_header(24000, 1, 2, None)
+    assert rest[44:] == pcm(4) + pcm(6)
+    assert svc.receipt("r1") == {"ok": True, "id": "r1", "complete": True,
+                                 "bytes": 20, "seconds": 20 / 2 / 24000,
+                                 "wall": pytest.approx(svc._receipts["r1"]["wall"]),
+                                 "first_audio": pytest.approx(
+                                     svc._receipts["r1"]["first_audio"])}
+
+
+def test_the_json_line_is_withheld_until_the_first_audio_exists():
+    """A failure during prepare must cost an error line and NOTHING else, so
+    the caller can render that chunk on F5 rather than speaking half a
+    sentence twice."""
+    svc = ready_service(blocks_render(pcm(4), fail_after=0))
+    head, rest = split_reply(
+        serve_once(svc, {"text": "Good evening.", "stream": True, "id": "r2"}))
+    assert head == {"ok": False, "error": "RuntimeError: cuda blew up"}
+    assert rest == b""
+    assert svc.receipt("r2")["complete"] is False
+
+
+def test_a_failure_after_audio_sends_no_error_line_and_leaves_a_receipt():
+    """Half a sentence is already in the room. Nothing useful can be said on
+    that connection -- everything after the header is raw PCM -- so the
+    receipt is how the caller learns not to cache it."""
+    svc = ready_service(blocks_render(pcm(4), pcm(4), fail_after=1))
+    head, rest = split_reply(
+        serve_once(svc, {"text": "Half of this.", "stream": True, "id": "r3"}))
+    assert head["ok"] is True                     # audio had already started
+    assert rest == tts_mod.wav_header(24000, 1, 2, None) + pcm(4)
+    assert svc.receipt("r3")["complete"] is False
+    assert "cuda blew up" in svc.receipt("r3")["error"]
+
+
+def test_a_forgotten_request_id_is_not_a_completion():
+    """NO RECEIPT MEANS INCOMPLETE: a sidecar that died mid-chunk answers
+    nothing at all, so the safe reading has to be the default one."""
+    svc = ready_service(blocks_render(pcm(4)))
+    assert svc.receipt("never-seen") == {"ok": False, "id": "never-seen",
+                                         "error": "unknown request id"}
+
+
+def test_receipts_are_bounded():
+    svc = ready_service(blocks_render(pcm(2)))
+    for i in range(bs.RECEIPTS + 5):
+        serve_once(svc, {"text": "x", "stream": True, "id": f"r{i}"})
+    assert len(svc._receipts) == bs.RECEIPTS
+    assert svc.receipt("r0")["ok"] is False          # evicted, so incomplete
+    assert svc.receipt(f"r{bs.RECEIPTS + 4}")["complete"] is True
+
+
+def test_the_compatible_mode_writes_a_pcm16_wav_the_cache_can_read(tmp_path):
+    out = tmp_path / "chunk.wav"
+    svc = ready_service(blocks_render(pcm(240), pcm(240)))
+    head, rest = split_reply(
+        serve_once(svc, {"text": "Always, sir.", "out": str(out)}))
+    assert head["ok"] is True and rest == b""
+    assert head["seconds"] == pytest.approx(480 / 24000)
+    with wave.open(str(out), "rb") as fh:
+        assert (fh.getnchannels(), fh.getsampwidth(), fh.getframerate()) == (1, 2, 24000)
+        assert fh.getnframes() == 480
+    # the phone renderer reads it through the same helper the room does
+    assert tts_mod.wav_pcm(str(out))[0] == (24000, 1, 2)
+
+
+def test_the_compatible_mode_reports_a_failure_instead_of_a_half_file(tmp_path):
+    out = tmp_path / "chunk.wav"
+    svc = ready_service(blocks_render(pcm(10), fail_after=0))
+    head, _ = split_reply(serve_once(svc, {"text": "x", "out": str(out)}))
+    assert head["ok"] is False and "cuda blew up" in head["error"]
+
+
+def test_a_request_with_no_text_or_no_out_is_refused_not_crashed(tmp_path):
+    svc = ready_service(blocks_render(pcm(4)))
+    assert split_reply(serve_once(svc, {"text": "   "}))[0]["ok"] is False
+    assert split_reply(serve_once(svc, {"text": "hi"}))[0]["ok"] is False
+    assert split_reply(serve_once(svc, {"nonsense": 1}))[0]["ok"] is False
+
+
+def test_the_gain_reaches_the_renderer():
+    seen = []
+
+    def render(text, gain=1.0):
+        seen.append(gain)
+        yield pcm(2)
+
+    serve_once(ready_service(render), {"text": "x", "stream": True, "gain": 2.8})
+    assert seen == [2.8]
+
+
+# ===========================================================================
+# 4. the pinned rig, in two files
+# ===========================================================================
+def test_the_rated_configuration_is_the_same_on_both_sides():
+    """The sidecar APPLIES these; tts.BREEZE_PARAMS only records them in the
+    speech-cache key. A silent disagreement would file one voice under
+    another voice's key."""
+    p = tts_mod.BREEZE_PARAMS
+    assert p["instruction"] == bs.INSTRUCTION == tts_mod.BREEZE_INSTRUCTION
+    assert p["template"] == bs.TEMPLATE == "ref_edit_tata"
+    assert p["cfg_scale"] == bs.CFG_SCALE == 4.0
+    assert p["seed"] == bs.SEED == 1234
+    assert p["temperature"] == bs.TEMPERATURE == 0.9
+    assert p["repetition_penalty"] == bs.REPETITION_PENALTY == 1.1
+    assert p["max_new_tokens"] == bs.MAX_NEW_TOKENS == 1500
+    assert p["sr"] == bs.SAMPLE_RATE == 24000
+    assert p["attn"] == bs.ATTN == "eager"
+
+
+def test_cfg_scale_is_not_a_speed_knob():
+    """With the graphs on, lowering it buys 0.4% and is what makes the voice
+    direction fire at all. Pinned so a future latency pass cannot take it."""
+    assert tts_mod.BREEZE_PARAMS["cfg_scale"] == 4.0
+
+
+# ===========================================================================
+# 5. the unit and its installer
+# ===========================================================================
+def _unit_fields():
+    fields = {}
+    for line in UNIT.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith(("#", "[")):
+            continue
+        k, _, v = line.partition("=")
+        fields.setdefault(k.strip(), []).append(v.strip())
+    return fields
+
+
+def _home(path: str) -> str:
+    return path.replace("%h", str(Path.home()))
+
+
+def test_the_unit_limits_its_restarts_harder_than_f5s():
+    """Every restart re-enters graph capture, which was measured driving
+    system-wide MemFree to 2.39 GiB. A Restart=always loop through that is
+    how this box gets powered off."""
+    f = _unit_fields()
+    assert f["Type"] == ["simple"] and f["Restart"] == ["always"]
+    assert f["WantedBy"] == ["default.target"]
+    assert int(f["StartLimitBurst"][0]) <= 5
+    assert int(f["StartLimitIntervalSec"][0]) >= 600
+    assert int(f["RestartSec"][0]) >= 30
+
+
+def test_the_unit_pins_the_env_graph_capture_needs():
+    """Without ptxas the depth decoder's compile fails on sm_121a and you get
+    the working-but-too-slow server (RTF 1.131). sdpa reproduces the arm that
+    was blind-rated."""
+    env = dict(e.split("=", 1) for e in _unit_fields()["Environment"])
+    assert env["TRITON_PTXAS_PATH"] == "/usr/local/cuda/bin/ptxas"
+    assert env["BREEZE_TEXT_ENCODER_ATTN"] == "sdpa"
+
+
+def test_the_unit_recreates_the_socket_dir_because_tmp_is_wiped_at_boot():
+    pre = _unit_fields()["ExecStartPre"]
+    assert any("mkdir -p /tmp/vss_voice" in p for p in pre), pre
+
+
+def test_the_unit_uses_the_same_paths_as_tts_py():
+    """One sidecar, one set of paths. If the unit and PATHS drift apart,
+    Jarvis pings one socket while the unit serves another."""
+    argv = _home(_unit_fields()["ExecStart"][0]).split()
+    assert argv[0] == str(PATHS.BREEZE_PYTHON)
+    assert argv[1] == str(Path.home() / "Jarvis" / "scripts" / "breeze_server.py")
+    opts = dict(zip(argv[2::2], argv[3::2]))
+    assert opts["--model"] == str(PATHS.BREEZE_CKPT)
+    assert opts["--repo"] == str(PATHS.BREEZE_REPO)
+    assert opts["--ref"] == str(PATHS.VOICE_REF_F5)
+    assert opts["--ref-text"] == str(PATHS.VOICE_REF_F5_TEXT)
+    # PATHS.BREEZE_SOCK is redirected by conftest; the unit targets the LIVE dir
+    assert opts["--socket"] == "/tmp/vss_voice/" + PATHS.BREEZE_SOCK.name
+    assert opts["--gpu-lock"].endswith("voice-training/.gpu.lock")
+
+
+def test_every_unit_flag_is_one_breeze_server_accepts():
+    argv = _unit_fields()["ExecStart"][0].split()
+    accepted = {a.option_strings[0]
+                for a in bs.build_parser()._actions if a.option_strings}
+    for flag in argv[2::2]:
+        assert flag in accepted, f"breeze_server.py does not take {flag}"
+
+
+def test_the_installer_does_not_enable_or_start_the_unit():
+    """Turning it on means putting a 13.5 GB resident model on the GPU. That
+    moment is chosen by a person, which is also what keeps this feature
+    opt-in on a box that reboots."""
+    src = SETUP.read_text()
+    assert "daemon-reload" in src
+    # Only what the script RUNS: the closing message quotes both commands on
+    # purpose, and a substring search over the whole file would read them as
+    # if they were executed.
+    ran = "\n".join(ln for ln in src.split("cat <<MSG")[0].splitlines()
+                    if not ln.lstrip().startswith("#"))
+    assert "systemctl --user enable" not in ran
+    assert "systemctl --user start" not in ran
+    # ...but it must TELL him both commands, and how to get back
+    assert "systemctl --user start $UNIT" in src
+    assert "systemctl --user stop $UNIT" in src
+    assert 'tts_engine"]="breeze"' in src and 'tts_engine"]="f5"' in src
+
+
+def test_the_installer_is_executable_and_syntactically_valid():
+    assert os.access(SETUP, os.X_OK)
+    subprocess.run(["bash", "-n", str(SETUP)], check=True)
+
+
+# ===========================================================================
+# 6. the client: a real AF_UNIX sidecar in tmp_path
+# ===========================================================================
+class FakeSidecar:
+    """A unix-socket server that speaks the breeze protocol.
+
+    ``handler(self, conn, req)`` writes the reply; the helpers below are the
+    handlers the tests use. Everything runs in-process on AF_UNIX -- no
+    network, no GPU, no venv.
+    """
+
+    def __init__(self, path, handler):
+        self.path = str(path)
+        self.handler = handler
+        self.requests: list = []
+        self.receipts: dict = {}
+        self.srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.srv.bind(self.path)
+        self.srv.listen(8)
+        self.thread = threading.Thread(target=self._loop, daemon=True)
+        self.thread.start()
+
+    def _loop(self):
+        while True:
+            try:
+                conn, _ = self.srv.accept()
+            except OSError:
+                return
+            try:
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    part = conn.recv(65536)
+                    if not part:
+                        break
+                    buf += part
+                if buf.strip():
+                    req = json.loads(buf.decode())
+                    self.requests.append(req)
+                    self.handler(self, conn, req)
+            except Exception:
+                pass
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+    def send(self, conn, payload):
+        conn.sendall(json.dumps(payload).encode() + b"\n")
+
+    def close(self):
+        self.srv.close()
+        try:
+            os.unlink(self.path)
+        except OSError:
+            pass
+
+
+def sidecar_handler(blocks, ping=None, fail_after=None, gate=None,
+                    refuse=None):
+    """The standard handler: answers ping and status, streams ``blocks``.
+
+    ``gate`` is waited on before the LAST block, so a test can prove that
+    playback began while the stream was still open.
+    """
+    reply = ping if ping is not None else {"ok": True, "ready": True,
+                                           "graphs": True, "detail": ALL_GRAPHS,
+                                           "sr": 24000, "config": {}}
+
+    def handler(srv, conn, req):
+        if req.get("ping"):
+            srv.send(conn, reply)
+            return
+        if req.get("status"):
+            got = srv.receipts.get(req["status"])
+            srv.send(conn, {"ok": True, **got} if got else
+                     {"ok": False, "error": "unknown request id"})
+            return
+        rid = req.get("id")
+        if refuse is not None:
+            srv.receipts[rid] = {"complete": False, "error": refuse}
+            srv.send(conn, {"ok": False, "error": refuse})
+            return
+        if not req.get("stream"):
+            with wave.open(req["out"], "wb") as fh:
+                fh.setnchannels(1)
+                fh.setsampwidth(2)
+                fh.setframerate(24000)
+                fh.writeframes(b"".join(blocks))
+            srv.send(conn, {"ok": True, "seconds": 0.1, "wall": 0.05})
+            return
+        srv.send(conn, {"ok": True, "stream": True, "sr": 24000,
+                        "channels": 1, "sampwidth": 2, "first_audio": 0.01})
+        conn.sendall(tts_mod.wav_header(24000, 1, 2, None))
+        n = 44
+        for i, block in enumerate(blocks):
+            if fail_after is not None and i == fail_after:
+                srv.receipts[rid] = {"complete": False, "bytes": n,
+                                     "error": "RuntimeError: cuda blew up"}
+                return
+            if gate is not None and i == len(blocks) - 1:
+                gate.wait(5)
+            conn.sendall(block)
+            n += len(block)
+        srv.receipts[rid] = {"complete": True, "bytes": n}
+        conn.shutdown(socket.SHUT_WR)
+
+    return handler
+
+
+@pytest.fixture
+def sock_path(tmp_path, monkeypatch):
+    path = tmp_path / "breeze.sock"
+    monkeypatch.setattr(tts_mod, "BREEZE_SOCK", path)
+    return path
+
+
+@pytest.fixture
+def no_spawn(monkeypatch):
+    """Jarvis must NEVER start a Breeze sidecar itself: the load costs 7.3 s
+    plus 22.0 s of graph capture whose transient was measured at ~18.3 GB.
+    That belongs under the GPU flock in the unit, not in a Tk app."""
+    calls = []
+
+    def _boom(*a, **kw):
+        calls.append(a)
+        raise AssertionError("Jarvis must not spawn the breeze sidecar")
+
+    monkeypatch.setattr(tts_mod.subprocess, "Popen", _boom)
+    return calls
+
+
+# ----------------------------------------------------------- discovery
+def test_alive_needs_the_graphs_not_just_ready(sock_path):
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [], ping={"ok": True, "ready": True, "graphs": False,
+                  "detail": {**ALL_GRAPHS, "codec": False}}))
+    try:
+        assert tts_mod._breeze_alive() is False
+    finally:
+        srv.close()
+    srv = FakeSidecar(sock_path, sidecar_handler([]))
+    try:
+        assert tts_mod._breeze_alive() is True
+    finally:
+        srv.close()
+
+
+def test_alive_is_false_with_no_socket_at_all(sock_path):
+    assert tts_mod._breeze_alive() is False
+
+
+def test_a_running_sidecar_is_adopted_and_never_respawned(sock_path, no_spawn,
+                                                          monkeypatch):
+    unit_asked = []
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active",
+                        lambda: unit_asked.append(1) or False)
+    srv = FakeSidecar(sock_path, sidecar_handler([]))
+    try:
+        assert tts_mod._ensure_breeze_server() is True
+    finally:
+        srv.close()
+    assert unit_asked == []          # a live socket answers the question
+    assert no_spawn == []
+
+
+def test_a_degraded_sidecar_is_refused_without_waiting_on_systemd(
+        sock_path, no_spawn, monkeypatch):
+    """It answered and said its graphs are gone. Waiting for a unit that is
+    already up and already wrong would just delay the fallback."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active",
+                        lambda: pytest.fail("must not ask systemd"))
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [], ping={"ok": True, "ready": False, "graphs": False,
+                  "error": "CUDA graphs were not captured"}))
+    try:
+        assert tts_mod._ensure_breeze_server() is False
+    finally:
+        srv.close()
+
+
+def test_an_activating_unit_is_waited_for_never_raced(sock_path, no_spawn,
+                                                      monkeypatch):
+    """Type=simple means the unit is 'active' ~30 s before the graphs exist."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: True)
+    holder = {}
+
+    def _late():
+        time.sleep(0.4)
+        holder["srv"] = FakeSidecar(sock_path, sidecar_handler([]))
+
+    t = threading.Thread(target=_late, daemon=True)
+    t.start()
+    try:
+        assert tts_mod._ensure_breeze_server(startup_timeout=10) is True
+    finally:
+        t.join(5)
+        holder["srv"].close()
+    assert no_spawn == []
+
+
+def test_a_unit_that_dies_while_we_wait_stops_the_wait(sock_path, no_spawn,
+                                                       monkeypatch):
+    states = [True]
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: states[0])
+
+    def _die():
+        time.sleep(0.2)
+        states[0] = False
+
+    threading.Thread(target=_die, daemon=True).start()
+    assert tts_mod._wait_for_breeze_unit(30) is False
+
+
+def test_no_sidecar_and_no_unit_is_a_clean_no(sock_path, no_spawn, monkeypatch):
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: False)
+    assert tts_mod._ensure_breeze_server() is False
+
+
+def test_a_sidecar_whose_config_drifted_is_adopted_but_warned_about(
+        sock_path, no_spawn, monkeypatch, caplog):
+    """The sidecar applies the voice; BREEZE_PARAMS only keys the cache on
+    it. A unit hand-started with --cfg-scale 2 would otherwise file a
+    different voice under this voice's key in silence."""
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [], ping={"ok": True, "ready": True, "graphs": True,
+                  "config": {"cfg_scale": 2.0, "seed": 1234}}))
+    try:
+        with caplog.at_level("WARNING"):
+            assert tts_mod._ensure_breeze_server() is True
+    finally:
+        srv.close()
+    assert any("cfg_scale=2.0" in r.getMessage() for r in caplog.records)
+
+
+# --------------------------------------------------------- load / fallback
+def test_load_falls_back_to_f5_and_does_not_persist_it(sock_path, no_spawn,
+                                                       monkeypatch, tmp_path):
+    """A cold sidecar recovers on the next start. Writing "f5" to
+    voice_settings.json here would silently un-choose Breeze forever after
+    one bad boot -- he turned it on with one setting, only he turns it off."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: False)
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    saved = []
+    monkeypatch.setattr(CONFIG, "save", lambda: saved.append(CONFIG.tts_engine))
+    before = CONFIG.tts_engine
+    t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+    assert t.load() is True
+    assert t.engine == "f5"
+    assert saved == [] and CONFIG.tts_engine == before
+
+
+def test_load_adopts_a_ready_sidecar_and_keeps_the_engine(sock_path, no_spawn,
+                                                          tmp_path, monkeypatch):
+    warmed = []
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback",
+                        lambda self: warmed.append(1))
+    srv = FakeSidecar(sock_path, sidecar_handler([]))
+    try:
+        t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+        assert t.load() is True
+        assert t.engine == "breeze"
+    finally:
+        srv.close()
+    # The chunk fallback is F5, and an outage plan that has to cold-start is
+    # not a plan: fish learned that on 2026-08-30 at ~180 s a chunk.
+    assert warmed == [1]
+
+
+# ------------------------------------------------------------- streaming
+@pytest.fixture
+def breeze(tmp_path, sock_path, monkeypatch, no_spawn):
+    monkeypatch.setattr(tts_mod, "BREEZE_STREAM_PLAYBACK", True)
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: False)
+    # The F5 fallback is adopted, never probed: these tests own the Popen
+    # seam for the PLAYER, and _ensure_f5_server's systemctl call would land
+    # in the same fake. It has its own tests (test_f5_service.py).
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
+    monkeypatch.setattr(tts_mod.subprocess, "Popen", FakeProc)
+    return TTS(engine="breeze", cache_dir=tmp_path / "cache")
+
+
+def test_bytes_reach_the_player_before_the_stream_ends(breeze, sock_path,
+                                                       tmp_path):
+    """Breeze's 0.268 s engine time-to-first-audio only reaches the ear if
+    the first bytes go to paplay's stdin while the rest is still on the GPU.
+    Rendering the whole chunk first is 2.12 s at his median utterance."""
+    audio = wav_bytes(0.4)[44:]
+    body, tail = audio[:2000], audio[2000:]
+    gate = threading.Event()
+    srv = FakeSidecar(sock_path, sidecar_handler([body, tail], gate=gate))
+    try:
+        done = breeze.speak("Good evening, sir.")
+        assert wait_until(lambda: bool(FakeProc.spawned))
+        proc = FakeProc.spawned[0]
+        assert proc.cmd == ["paplay", f"--client-name={tts_mod.SPEECH_CLIENT_NAME}"]
+        assert wait_until(lambda: len(proc.fed) >= 44 + len(body))
+        assert not done.is_set()          # still streaming
+        gate.set()
+        assert done.wait(10)
+        assert bytes(proc.fed) == tts_mod.wav_header(24000, 1, 2, None) + audio
+        assert breeze.cache.stats()["files"] == 1
+    finally:
+        srv.close()
+    # cached under the BREEZE key, not some default engine's
+    assert breeze.cache.get(breeze._cache_key("breeze", "Good evening, sir.")) \
+        is not None
+    assert not [p for p in tmp_path.glob("**/*.wav") if "cache" not in str(p)]
+
+
+def test_a_two_sentence_reply_streams_both_chunks_in_order(breeze, sock_path):
+    """Chunk N+1 renders while chunk N plays, and the consumer still hands
+    them to the player in order -- the producer runs ahead at RTF 0.742."""
+    first, second = wav_bytes(0.2)[44:], wav_bytes(0.3)[44:]
+    order = []
+
+    def handler(srv, conn, req):
+        if req.get("ping"):
+            srv.send(conn, {"ok": True, "ready": True, "graphs": True})
+            return
+        if req.get("status"):
+            srv.send(conn, {"ok": True, "complete": True})
+            return
+        order.append(req["text"])
+        block = first if len(order) == 1 else second
+        srv.send(conn, {"ok": True, "stream": True, "sr": 24000})
+        conn.sendall(tts_mod.wav_header(24000, 1, 2, None) + block)
+        conn.shutdown(socket.SHUT_WR)
+
+    srv = FakeSidecar(sock_path, handler)
+    try:
+        breeze.speak("The reactor is holding steady this evening. "
+                     "The workshop is quiet and the coffee is fresh.",
+                     block=True)
+    finally:
+        srv.close()
+    assert order == ["The reactor is holding steady this evening.",
+                     "The workshop is quiet and the coffee is fresh."]
+    assert len(FakeProc.spawned) == 2
+    assert bytes(FakeProc.spawned[0].fed).endswith(first)
+    assert bytes(FakeProc.spawned[1].fed).endswith(second)
+    assert breeze.cache.stats()["files"] == 2
+
+
+def test_a_long_sentence_is_not_comma_split_the_way_f5s_is():
+    """The comma pass is what flattens a list into two utterances (measured:
+    the pitch RESETS at the comma, +45 Hz mid-clause). Streaming at RTF 0.742
+    cannot underrun, so there is nothing to buy by splitting."""
+    t = TTS.__new__(TTS)
+    t.cache = None
+    assert t._chunk_limits("breeze") == (320, 8.0)
+    line = ("On the calendar you have Biosensors at nine ten ay em, Magnetic "
+            "Resonance Engineering at twelve forty pee em, and at four ten "
+            "pee em your Electrical Design Lab presentation.")
+    assert t._split_sentences(line, engine="breeze") == [line]
+
+
+def test_a_refusal_before_any_audio_renders_that_chunk_on_f5(breeze, sock_path):
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [], refuse="not ready (CUDA graphs were not captured)"))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (f5.append(text),
+                                              open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak("Good evening, sir.", block=True)
+    finally:
+        srv.close()
+    assert f5 == ["Good evening, sir."]
+    # filed under the engine that RENDERED it, or it would replay in the
+    # wrong voice once breeze is back
+    assert breeze.cache.get(breeze._cache_key("f5", "Good evening, sir.")) is not None
+    assert breeze.cache.get(breeze._cache_key("breeze", "Good evening, sir.")) is None
+
+
+def test_a_failure_mid_stream_is_not_re_spoken_and_is_not_cached(breeze,
+                                                                 sock_path):
+    """Half a sentence has already been heard. Re-rendering it on F5 would
+    say the first half twice, in a different voice."""
+    audio = wav_bytes(0.4)[44:]
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [audio[:3000], audio[3000:]], fail_after=1))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: f5.append(text)
+        breeze.speak("Half of this was heard.", block=True)
+    finally:
+        srv.close()
+    assert f5 == []
+    assert breeze.cache.stats()["files"] == 0
+    assert breeze.engine == "breeze"          # a blip does not retire it
+
+
+def test_a_stream_with_no_receipt_counts_as_truncated(breeze, sock_path):
+    """A sidecar that died mid-chunk answers nothing at all, so 'the socket
+    reached EOF' cannot mean 'the sentence finished' -- on AF_UNIX an
+    abortive close is indistinguishable from a clean one."""
+    audio = wav_bytes(0.3)[44:]
+
+    def handler(srv, conn, req):
+        if req.get("ping"):
+            srv.send(conn, {"ok": True, "ready": True, "graphs": True})
+            return
+        if req.get("status"):
+            srv.send(conn, {"ok": False, "error": "unknown request id"})
+            return
+        srv.send(conn, {"ok": True, "stream": True, "sr": 24000})
+        conn.sendall(tts_mod.wav_header(24000, 1, 2, None) + audio)
+        conn.shutdown(socket.SHUT_WR)      # looks exactly like success
+
+    srv = FakeSidecar(sock_path, handler)
+    try:
+        breeze.speak("Was that the whole thing?", block=True)
+    finally:
+        srv.close()
+    assert breeze.cache.stats()["files"] == 0
+
+
+def test_a_sidecar_that_vanishes_mid_stream_does_not_wedge_the_worker(
+        breeze, sock_path):
+    audio = wav_bytes(0.3)[44:]
+    holder = {}
+
+    def handler(srv, conn, req):
+        if req.get("ping"):
+            srv.send(conn, {"ok": True, "ready": True, "graphs": True})
+            return
+        if req.get("status"):
+            srv.send(conn, {"ok": False, "error": "gone"})
+            return
+        srv.send(conn, {"ok": True, "stream": True, "sr": 24000})
+        conn.sendall(tts_mod.wav_header(24000, 1, 2, None) + audio[:1000])
+        holder["srv"].close()             # the socket file disappears
+        conn.close()
+
+    srv = holder["srv"] = FakeSidecar(sock_path, handler)
+    try:
+        done = breeze.speak("The sidecar is about to die.")
+        assert done.wait(20), "the TTS worker wedged"
+    finally:
+        srv.close()
+    assert breeze.cache.stats()["files"] == 0
+
+
+def test_a_repeat_plays_from_cache_without_touching_the_socket(breeze, sock_path,
+                                                               monkeypatch):
+    srv = FakeSidecar(sock_path, sidecar_handler([wav_bytes(0.1)[44:]]))
+    played = []
+    try:
+        monkeypatch.setattr(breeze, "_play", lambda p: played.append(p))
+        monkeypatch.setattr(breeze, "_start_amp_feeder", lambda p: None)
+        breeze.speak("Always, sir.", block=True)
+        n = len([r for r in srv.requests if r.get("stream")])
+        breeze.speak("Always, sir.", block=True)
+        assert len([r for r in srv.requests if r.get("stream")]) == n == 1
+    finally:
+        srv.close()
+    assert len(played) == 1 and "cache" in played[0]
+
+
+def test_the_whole_chunk_path_still_works_when_streaming_is_off(
+        breeze, sock_path, monkeypatch):
+    """Not a shipping configuration -- 2.12 s to first audio at his median,
+    a 4x regression -- but it is how a listener compares the two paths."""
+    monkeypatch.setattr(tts_mod, "BREEZE_STREAM_PLAYBACK", False)
+    monkeypatch.setattr(breeze, "_start_amp_feeder", lambda p: None)
+    played = []
+    monkeypatch.setattr(breeze, "_play", lambda p: played.append(p))
+    srv = FakeSidecar(sock_path, sidecar_handler([pcm(2400)]))
+    try:
+        breeze.speak("Good evening, sir.", block=True)
+    finally:
+        srv.close()
+    assert len(played) == 1
+    assert [r for r in srv.requests if r.get("out")]      # the file mode
+    assert breeze.cache.stats()["files"] == 1
+
+
+def test_a_whole_chunk_failure_also_falls_back_to_f5(breeze, sock_path,
+                                                     monkeypatch):
+    monkeypatch.setattr(tts_mod, "BREEZE_STREAM_PLAYBACK", False)
+    monkeypatch.setattr(breeze, "_start_amp_feeder", lambda p: None)
+    monkeypatch.setattr(breeze, "_play", lambda p: None)
+    f5 = []
+    srv = FakeSidecar(sock_path, sidecar_handler([], refuse="boom"))
+    try:
+        breeze._synth_f5 = lambda text, out: (f5.append(text),
+                                              open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak("Good evening, sir.", block=True)
+    finally:
+        srv.close()
+    assert f5 == ["Good evening, sir."]
+
+
+def test_the_gain_jarvis_keys_on_is_the_gain_the_sidecar_is_told(breeze,
+                                                                 sock_path):
+    srv = FakeSidecar(sock_path, sidecar_handler([wav_bytes(0.1)[44:]]))
+    try:
+        breeze.speak("Good evening, sir.", block=True)
+    finally:
+        srv.close()
+    streamed = [r for r in srv.requests if r.get("stream")]
+    assert streamed and streamed[0]["gain"] == tts_mod.output_gain_for("breeze")
+
+
+# ===========================================================================
+# 7. the speech cache
+# ===========================================================================
+def _key(voice, text="Always, sir."):
+    return voice._cache_key("breeze", text)
+
+
+def test_the_breeze_key_carries_everything_that_changes_the_audio(monkeypatch):
+    t = TTS.__new__(TTS)
+    t.cache = None
+    base = _key(t)
+    for attr, value in (("cfg_scale", 2.0), ("seed", 7), ("temperature", 0.7),
+                        ("repetition_penalty", 1.5), ("max_new_tokens", 900),
+                        ("template", "tts_instruction"), ("sr", 16000),
+                        ("text_encoder_attn", "eager"),
+                        ("instruction", "Speak like a pirate.")):
+        params = dict(tts_mod.BREEZE_PARAMS, **{attr: value})
+        monkeypatch.setattr(tts_mod, "BREEZE_PARAMS", params)
+        assert _key(t) != base, f"{attr} is not in the key"
+        monkeypatch.undo()
+
+
+def test_the_breeze_key_changes_with_the_gain(monkeypatch):
+    t = TTS.__new__(TTS)
+    t.cache = None
+    base = _key(t)
+    monkeypatch.setitem(tts_mod.ENGINE_OUTPUT_GAIN, "breeze", 1.9)
+    assert _key(t) != base
+
+
+def test_the_breeze_key_changes_with_the_checkpoint_and_the_reference(
+        monkeypatch, tmp_path):
+    """int4, group-32 depth and bf16 attention are baked into the export, so
+    the manifest's identity IS the quantization; the clip and its transcript
+    are the voice."""
+    t = TTS.__new__(TTS)
+    t.cache = None
+    base = _key(t)
+    for attr, name in (("BREEZE_CKPT_MANIFEST", "quant_manifest.json"),
+                       ("BREEZE_REF", "ref.wav"),
+                       ("BREEZE_REF_TEXT", "ref.txt")):
+        path = tmp_path / name
+        path.write_text("x" * 11)
+        monkeypatch.setattr(tts_mod, attr, path)
+        assert _key(t) != base, f"{attr} is not in the key"
+        monkeypatch.undo()
+
+
+def test_the_breeze_key_is_not_the_f5_key_for_the_same_line():
+    """They share a reference clip, so nothing but the engine name keeps
+    F5 audio from replaying as Breeze."""
+    t = TTS.__new__(TTS)
+    t.cache = None
+    assert t._cache_key("breeze", "Always, sir.") != \
+        t._cache_key("f5", "Always, sir.")
+
+
+# ===========================================================================
+# 8. OFF BY DEFAULT: the F5 path is what it was
+# ===========================================================================
+def test_nothing_selects_breeze_on_its_own():
+    """It ships opt-in. The engine is only ever "breeze" because
+    voice_settings.json says so."""
+    from dataclasses import fields
+    default = {f.name: f.default for f in fields(type(CONFIG))}["tts_engine"]
+    assert default == "edge"
+    assert tts_mod.FISH_FALLBACK == "f5"          # fish still retires to F5
+    assert tts_mod.BREEZE_FALLBACK == "f5"
+
+
+def test_the_f5_cache_key_formula_is_unchanged():
+    """Recomputed from first principles rather than compared to itself: the
+    f5 namespace must still be engine + ref stat + gain + nfe/speed and
+    nothing else, or every render already on his disk goes stale."""
+    from jarvis.speech_cache import SpeechCache
+    t = TTS.__new__(TTS)
+    t.cache = None
+    try:
+        st = tts_mod.F5_REF.stat()
+        ref = f"{st.st_size}:{int(st.st_mtime)}"
+    except OSError:
+        ref = "none"
+    for line in ("Always, sir.", "Good evening, sir.", "Noted, sir."):
+        assert t._cache_key("f5", line) == SpeechCache.key(
+            "f5", line, ref=ref, gain=2.8, nfe_step=10, speed=0.85)
+
+
+def test_the_f5_engine_tables_are_unchanged():
+    assert tts_mod.F5_PARAMS == {"nfe_step": 10, "speed": 0.85}
+    assert tts_mod.output_gain_for("f5") == 2.8
+    assert tts_mod.output_gain_for("xtts") == 1.34
+    assert tts_mod.output_gain_for("edge") == 1.0
+    assert tts_mod.output_gain_for("fish") == 1.0
+    for table, expected in (
+            (tts_mod._ENGINE_NEEDS_TIME_REWRITE,
+             {"edge": True, "xtts": True, "f5": True, "fish": False}),
+            (tts_mod._ENGINE_NEEDS_UNSHOUT,
+             {"edge": True, "xtts": True, "f5": True, "fish": True}),
+            (tts_mod._ENGINE_NEEDS_SHORT_PAD,
+             {"edge": False, "xtts": False, "f5": True, "fish": False})):
+        for engine, value in expected.items():
+            assert table[engine] is value
+
+
+def test_the_f5_chunking_and_split_are_unchanged():
+    t = TTS.__new__(TTS)
+    t.cache = None
+    assert t._chunk_limits("f5") == (240, 6.0)
+    assert t._chunk_limits("edge") == (160, 2.5)
+    assert t._chunk_limits("xtts") == (160, 2.5)
+    line = ("Your briefing for today, sir. It is overcast and quite warm, "
+            "with a high of ninety-seven. On the calendar you have Biosensors "
+            "at nine ten ay em, Magnetic Resonance Engineering at twelve "
+            "forty pee em, and at four ten pee em your Electrical Design Lab "
+            "presentation. The inbox is quiet, for once.")
+    assert t._split_sentences(line, engine="f5") == [
+        "Your briefing for today, sir.",
+        "It is overcast and quite warm, with a high of ninety-seven.",
+        "On the calendar you have Biosensors at nine ten ay em, Magnetic "
+        "Resonance Engineering at twelve forty pee em, and at four ten pee em "
+        "your Electrical Design Lab presentation.",
+        "The inbox is quiet, for once."]
+
+
+def test_the_fish_stream_deadlines_are_unchanged():
+    """The three shared consumer deadlines now travel on the stream so a
+    Breeze chunk can have its own. Fish's must still be exactly what they
+    were: FISH_TIMEOUT_S."""
+    assert tts_mod._AudioStream("x").timeout == tts_mod.FISH_TIMEOUT_S == 10.0
+    assert tts_mod._AudioStream("x", timeout=60.0).timeout == 60.0
+
+
+def test_an_f5_reply_never_touches_the_breeze_code(tmp_path, monkeypatch):
+    """The whole feature is inert with the flag unset -- no ping, no socket,
+    no systemd query, no import."""
+    for name in ("_breeze_request", "_breeze_iter", "_ensure_breeze_server",
+                 "_breeze_unit_active", "_breeze_alive"):
+        monkeypatch.setattr(tts_mod, name,
+                            lambda *a, **k: pytest.fail(f"{name} was called"))
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.subprocess, "Popen", FakeProc)
+    t = TTS(engine="f5", cache_dir=tmp_path / "cache")
+    monkeypatch.setattr(t, "_start_amp_feeder", lambda p: None)
+    monkeypatch.setattr(t, "_synth_f5",
+                        lambda text, out: open(out, "wb").write(wav_bytes(0.05)))
+    t.speak("Good evening, sir.", block=True)
+    assert t.engine == "f5"
+    assert t.cache.get(t._cache_key("f5", "Good evening, sir.")) is not None

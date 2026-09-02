@@ -66,6 +66,18 @@ class PATHS:
     # which VSS's own api.py needs. It gets its own venv and a sidecar.
     F5_PYTHON = Path.home() / ".local/share/jarvis-f5/venv/bin/python"
     F5_SOCK = LOG_DIR / "f5.sock"
+    # Breeze-TTS-2, quantized (int4 MLPs, group-32 depth, bf16 attention and
+    # text encoder), pre-quantized so it loads in 7.9 s instead of 38 s. Its
+    # own venv and source tree for the same reason F5 has them, and its own
+    # sidecar for a stronger one: the one-time CUDA-graph capture transiently
+    # demands ~18.3 GB, which must never happen inside the Tk app. It shares
+    # F5's reference clip and transcript (VOICE_REF_F5 / VOICE_REF_F5_TEXT) --
+    # that is the pair the round-11 blind test rated 4.71.
+    BREEZE_PYTHON = (Path.home() /
+                     "voice-training/engines/breeze/venv/bin/python")
+    BREEZE_REPO = Path.home() / "voice-training/engines/breeze-q4/repo"
+    BREEZE_CKPT = Path.home() / "voice-training/engines/breeze-q4/ckpt-q4"
+    BREEZE_SOCK = LOG_DIR / "breeze.sock"
     VSS_ENV = Path.home() / "vss_env"
     REMINDERS = MEMORY_DIR / "reminders.json"
     # -- personal assistant (spec 2026-08-26, section 3.2) --------------

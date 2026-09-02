@@ -52,6 +52,7 @@ import struct
 import tempfile
 import threading
 import time
+import uuid
 import wave
 from pathlib import Path
 from typing import Iterable, Iterator, Optional
@@ -66,7 +67,7 @@ log = get_logger("tts")
 
 VOICE_REF = PATHS.VOICE_REF          # ~/.aiws_trainer/jarvis_voice_ref.wav
 
-_ENGINES = ("edge", "xtts", "f5", "fish")
+_ENGINES = ("edge", "xtts", "f5", "fish", "breeze")
 
 # Which engines need the text massaged before they can say it properly.
 # The time and shouted-word rewrites in jarvis/pronounce.py exist because
@@ -74,17 +75,34 @@ _ENGINES = ("edge", "xtts", "f5", "fish")
 # Fish s2.1-pro normalises both itself, and the rewrites HURT there: "ay em"
 # is voiced as "I'm" (heard 2026-08-28). Verified per engine by listening,
 # never assumed.
+#
+# breeze: True/True, and that is a MEASURED choice rather than the default
+# the .get() would have given it. Breeze-TTS-2 is a 3.5B LM with its own
+# text frontend, which is the property that makes fish worse under these
+# rewrites -- so the default was not obviously right either way. What
+# settles it is that the round-11 blind test Hunter scored 4.71 was rendered
+# from round10/texts.json, whose lines are already in the form this pass
+# produces ("nine ten ay em", "twelve forty-five pee em", "ninety-seven",
+# "Biosensors" rather than BIOSENSORS). Leaving the rewrites ON reproduces
+# the arm that was actually rated; turning them off would ship text no
+# blind round has ever heard.
 _ENGINE_NEEDS_TIME_REWRITE = {"edge": True, "xtts": True, "f5": True,
-                              "fish": False}
+                              "fish": False, "breeze": True}
 _ENGINE_NEEDS_UNSHOUT = {"edge": True, "xtts": True, "f5": True,
-                         "fish": True}
+                         "fish": True, "breeze": True}
 
 # Which engines need a TERSE line padded into a sentence before they can
 # pace it. F5 alone: see SHORT_LINE_BYTES. Edge and fish normalise their own
 # duration from the text, and XTTS derives it from the mel decoder, so
 # neither has the byte-count cliff this works around.
+#
+# breeze is False and that one is not a close call: the pad INVENTS WORDS
+# ("Buy milk." -> "Buy milk, sir.") to buy bytes against a duration floor
+# that only F5 has. Breeze is autoregressive, so its duration is emergent,
+# and every line in the rated set is already above SHORT_LINE_BYTES -- the
+# pad would have been a no-op on all of them anyway.
 _ENGINE_NEEDS_SHORT_PAD = {"edge": False, "xtts": False, "f5": True,
-                           "fish": False}
+                           "fish": False, "breeze": False}
 
 # ------------------------------------------- the stream-restore hazard
 # PipeWire remembers a stream's volume keyed by application.name, and every
@@ -373,8 +391,16 @@ class _AudioStream:
     trip the fish timeout for no reason.
     """
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, timeout: float = FISH_TIMEOUT_S):
         self.path = path
+        # How long the CONSUMER may wait on this producer. It travels with
+        # the stream because the consumer loop, _play_stream and
+        # _play_stream_from_file are shared by every streaming engine and
+        # must not each know who made it. Fish keeps FISH_TIMEOUT_S, so its
+        # three deadlines are unchanged to the byte; a Breeze chunk needs
+        # more, because at RTF 0.742 a 320-character chunk is ~14 s of
+        # rendering and the no-paplay fallback path waits for ALL of it.
+        self.timeout = float(timeout)
         self.nbytes = 0
         self.failed = False
         self.done = threading.Event()
@@ -677,6 +703,291 @@ def retire_own_f5_sidecar() -> bool:
         _f5_lock.release()
 
 
+# ---------------------------------------------------------------- Breeze-TTS-2
+#
+# The quantized local voice. In the round-11 BLIND listening test Hunter
+# rated it 4.71 against a hidden hosted-Fish control at 4.64 -- a tie -- while
+# the currently shipped F5 voice scored 2.79; a 6-clip blind A/B of this
+# quantized build against the bf16 one he had scored 4.73 came out at mean
+# -0.33, inside the round's 1.00 noise floor. So this is the best voice
+# available and it is fully local.
+#
+# It is OPT-IN and OFF by default. Nothing here runs until
+# ``CONFIG.tts_engine == "breeze"``; with any other engine this module
+# behaves exactly as it did before, which tests/test_breeze_sidecar.py
+# asserts rather than assumes.
+#
+# THREE THINGS DIFFER FROM THE F5 SIDECAR, and each of them is measured:
+#
+# 1. Jarvis NEVER SPAWNS IT. _ensure_f5_server will start its own copy when
+#    the unit is not running; this will not. Bringing Breeze up costs 7.3 s
+#    of load plus 22.0 s of CUDA-graph capture, and the capture transiently
+#    demands ~18.3 GB above steady state -- it was measured driving
+#    system-wide MemFree to 2.39 GiB while 25.4 GiB of other tenants were
+#    resident, which is the shape of the 2026-08-28 power-off. That belongs
+#    under the GPU flock and behind a MemFree gate, both of which live in
+#    scripts/breeze_server.py and its unit, not in a Tk app's startup
+#    thread. No sidecar -> F5.
+#
+# 2. READINESS IS GRAPH CAPTURE, not "the model loaded". int4 WITHOUT CUDA
+#    graphs measures RTF 1.131 -- above real time, so it underruns
+#    mid-utterance -- against 0.742 with them. A missing ptxas or a CUDA
+#    upgrade gives a server that loads, speaks, and stutters. _breeze_alive
+#    therefore requires the ping's "graphs" field, not just "ready".
+#
+# 3. STREAMING IS THE WHOLE POINT. Breeze's engine time-to-first-audio is
+#    0.268 s, which with the 0.124 s player spawn beats the shipped F5's
+#    0.530 s. On the whole-chunk path the same engine is 2.12 s at his
+#    median utterance -- a 4x REGRESSION. So BREEZE_STREAM_PLAYBACK and the
+#    chunk limits below are a coupled pair; see _chunk_limits.
+BREEZE_SOCK = PATHS.BREEZE_SOCK
+BREEZE_CKPT = PATHS.BREEZE_CKPT
+# The manifest, not the 5 GB weights file: a stat() of it is the checkpoint's
+# identity for the cache key, and it is rewritten whenever the export is.
+BREEZE_CKPT_MANIFEST = BREEZE_CKPT / "quant_manifest.json"
+# Breeze clones its voice from the SAME reference pair as F5 -- that is the
+# pair round 11 rated.
+BREEZE_REF = PATHS.VOICE_REF_F5
+BREEZE_REF_TEXT = PATHS.VOICE_REF_F5_TEXT
+BREEZE_UNIT = "jarvis-breeze.service"
+BREEZE_FALLBACK = "f5"        # must stay LOCAL, and must stay RESIDENT
+
+# Per-chunk deadline. Not FISH_TIMEOUT_S: that is 10 s for a hosted API, and
+# a 320-character Breeze chunk is ~19 s of audio at RTF 0.742, i.e. ~14 s of
+# rendering. 60 s covers even the slow first render after a graph capture
+# (measured RTF 1.868) without letting a wedged sidecar hang the TTS worker.
+BREEZE_TIMEOUT_S = 60.0
+
+# How long to wait for the completion receipt after a stream has ended. It
+# is a fresh connection and the sidecar serves one request at a time, so on
+# the room's own path it is answered instantly -- but the phone renderer or
+# prewarm can slip a whole-chunk render in between, and that is ~14 s for a
+# 320-character chunk. A receipt that never arrives is read as "truncated",
+# which only costs a cache entry: the audio has already been heard.
+BREEZE_RECEIPT_TIMEOUT_S = 15.0
+
+# The rig the round-11 blind test rated, pinned. Every value is in the speech
+# cache key, so changing one can never replay stale audio, and every value
+# also lives in scripts/breeze_server.py -- tests/test_breeze_sidecar.py
+# asserts the two agree, because the sidecar is the one that actually applies
+# them and a silent disagreement would file one voice under another's key.
+#
+# DO NOT LOWER cfg_scale FOR SPEED: with the graphs on it buys 0.4%, and 4.0
+# is what makes the voice-direction instruction fire at all.
+BREEZE_INSTRUCTION = ("A calm, articulate British assistant speaking "
+                      "conversationally, with natural variation from sentence "
+                      "to sentence; questions rise at the end.")
+BREEZE_PARAMS = dict(template="ref_edit_tata", instruction=BREEZE_INSTRUCTION,
+                     cfg_scale=4.0, seed=1234, temperature=0.9,
+                     repetition_penalty=1.1, max_new_tokens=1500,
+                     sr=24000, attn="eager", text_encoder_attn="sdpa")
+
+# Play a breeze chunk while it is still rendering. Module-level so a test --
+# or an ear -- can switch the whole-chunk path back on for comparison; it is
+# 4x slower to first audio and is not a shipping configuration.
+BREEZE_STREAM_PLAYBACK = True
+
+_breeze_lock = threading.Lock()
+
+
+def _breeze_unit_active() -> bool:
+    """True when systemd --user reports the sidecar unit up (or coming up).
+
+    Same contract as _f5_unit_active, including "activating" counting: with
+    Type=simple the unit is active the moment python exists, ~30 s before
+    the graphs are captured.
+    """
+    try:
+        res = subprocess.run(["systemctl", "--user", "is-active", BREEZE_UNIT],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return res.stdout.strip() in ("active", "activating", "reloading")
+
+
+def _breeze_request(payload: dict, timeout: float = BREEZE_TIMEOUT_S) -> dict:
+    """One request/response over the sidecar socket (the non-streaming mode)."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+        sock.settimeout(timeout)
+        sock.connect(str(BREEZE_SOCK))
+        sock.sendall(json.dumps(payload).encode() + b"\n")
+        buf = b""
+        while not buf.endswith(b"\n"):
+            part = sock.recv(65536)
+            if not part:
+                break
+            buf += part
+    return json.loads(buf.decode("utf-8") or "{}")
+
+
+def _breeze_ping(timeout: float = 5) -> dict:
+    try:
+        return _breeze_request({"ping": True}, timeout=timeout)
+    except Exception:
+        return {}
+
+
+def _breeze_alive() -> bool:
+    """Ready AND its CUDA graphs are genuinely captured.
+
+    The second half is the load-bearing one: a sidecar that loaded but did
+    not capture answers every request, at RTF 1.131, and stutters. Jarvis
+    would rather speak in the 2.79 voice than in a broken 4.71 one.
+    """
+    reply = _breeze_ping()
+    return bool(reply.get("ready")) and bool(reply.get("graphs"))
+
+
+def _breeze_config_drift(reply: dict) -> list[str]:
+    """Which pinned values the running sidecar does not share with us.
+
+    The sidecar applies the voice parameters; BREEZE_PARAMS only records them
+    in the cache key. A unit started by hand with, say, --cfg-scale 2 would
+    file a different voice under this voice's key, and nothing else would
+    ever say so.
+    """
+    theirs = reply.get("config") or {}
+    if not isinstance(theirs, dict):
+        return []
+    return [f"{k}={theirs[k]!r} (we key on {BREEZE_PARAMS[k]!r})"
+            for k in sorted(theirs)
+            if k in BREEZE_PARAMS and theirs[k] != BREEZE_PARAMS[k]]
+
+
+def _ensure_breeze_server(startup_timeout: float = 180) -> bool:
+    """Adopt a running Breeze sidecar. NEVER starts one -- see note 1 above.
+
+    Two cases: the socket already answers a ready+graphs ping (adopted as
+    is), or the unit is active but not yet answering (it is loading and
+    capturing, which takes ~30 s -- wait for it). Anything else is False,
+    and the caller falls back to F5.
+    """
+    with _breeze_lock:
+        reply = _breeze_ping()
+        if reply.get("ready") and reply.get("graphs"):
+            drift = _breeze_config_drift(reply)
+            if drift:
+                log.warning("breeze sidecar config differs from ours: %s -- "
+                            "cached audio may not match what it renders",
+                            "; ".join(drift))
+            return True
+        if reply and not reply.get("graphs"):
+            # It answered and told us it is degraded. Do not wait for a unit
+            # that is already up and already wrong.
+            log.error("breeze sidecar is up but its CUDA graphs are NOT "
+                      "captured (%s) -- it would stutter; using %s",
+                      reply.get("error") or reply.get("detail"),
+                      BREEZE_FALLBACK)
+            return False
+        if _breeze_unit_active():
+            return _wait_for_breeze_unit(startup_timeout)
+        log.error("breeze sidecar is not running (%s is not active); "
+                  "install it with scripts/setup_breeze_service.sh", BREEZE_UNIT)
+        return False
+
+
+def _wait_for_breeze_unit(startup_timeout: float) -> bool:
+    """The unit owns the socket: poll until it answers or dies.
+
+    Re-checks the unit every few seconds so a unit that crashed during graph
+    capture does not cost the whole startup budget.
+    """
+    log.info("breeze sidecar is owned by %s; waiting for it", BREEZE_UNIT)
+    deadline = time.monotonic() + startup_timeout
+    next_unit_check = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if _breeze_alive():
+            log.info("breeze sidecar ready (%s)", BREEZE_UNIT)
+            return True
+        if time.monotonic() >= next_unit_check:
+            if not _breeze_unit_active():
+                log.error("%s stopped while we were waiting for it", BREEZE_UNIT)
+                return False
+            next_unit_check = time.monotonic() + 5
+        time.sleep(0.5)
+    log.error("%s did not answer in %.0fs", BREEZE_UNIT, startup_timeout)
+    return False
+
+
+def _breeze_iter(text: str, gain: float,
+                 timeout: float = BREEZE_TIMEOUT_S) -> Iterator[bytes]:
+    """Yield one chunk's wav bytes from the sidecar as they arrive.
+
+    HEADER INCLUDED, and that is the seam that would otherwise break the
+    room silently: runtime.iter_audio_chunks yields HEADERLESS float32
+    arrays, while _LiveEnvelope._parse_header needs a RIFF/WAVE with a fmt
+    and a data chunk in the first 4096 bytes and paplay's stdin decoder needs
+    the same. The sidecar therefore writes wav_header(24000, 1, 2, None)
+    before the first PCM block and this just forwards bytes.
+
+    Raises BEFORE yielding anything when the sidecar refused (not ready, no
+    text, a failure during prepare) -- that is the caller's cue to render
+    this chunk on F5.
+
+    Raises AFTER yielding when the chunk was truncated, which takes a second
+    connection to find out: everything after the header is raw PCM, so no
+    in-band trailer is possible, and on AF_UNIX an abortive close is NOT
+    distinguishable from a clean one either (SO_LINGER 0 gives the peer a
+    plain EOF -- measured on this box rather than assumed). So the request
+    carries an id and the sidecar keeps a receipt for it. NO RECEIPT MEANS
+    INCOMPLETE: a sidecar that died mid-chunk answers nothing, and caching a
+    clipped sentence should take a positive assertion that it is whole.
+    """
+    request_id = f"jarvis-{uuid.uuid4().hex}"
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        sock.connect(str(BREEZE_SOCK))
+        sock.sendall(json.dumps({"text": text, "stream": True, "gain": gain,
+                                 "id": request_id}).encode() + b"\n")
+        buf = b""
+        while b"\n" not in buf:
+            part = sock.recv(65536)
+            if not part:
+                raise RuntimeError("breeze sidecar closed before answering")
+            buf += part
+        line, _, rest = buf.partition(b"\n")
+        head = json.loads(line.decode("utf-8") or "{}")
+        if not head.get("ok"):
+            raise RuntimeError(f"breeze refused: {head.get('error')}")
+        if rest:
+            yield rest
+        while True:
+            part = sock.recv(65536)
+            if not part:
+                break
+            yield part
+    finally:
+        # Closing the socket is what tells the sidecar to stop generating
+        # when we stopped listening (barge-in, or Jarvis exiting). On that
+        # path the generator is closed at a yield, so the receipt below is
+        # never asked for -- which is right: we stopped it, it did not fail.
+        try:
+            sock.close()
+        except OSError:
+            pass
+    receipt = _breeze_request({"status": request_id},
+                              timeout=BREEZE_RECEIPT_TIMEOUT_S)
+    if not receipt.get("complete"):
+        raise RuntimeError(
+            "breeze stream truncated: "
+            f"{receipt.get('error') or 'no completion receipt'}")
+
+
+def _breeze_stream(text: str, gain: float, out_path: str,
+                   timeout: float = BREEZE_TIMEOUT_S) -> dict:
+    """Render one chunk into a file over the streaming mode. Tests patch this
+    or _breeze_iter, exactly as they do the two fish seams."""
+    started = time.monotonic()
+    first = None
+    with open(out_path, "wb") as fh:
+        for chunk in _breeze_iter(text, gain, timeout):
+            if first is None:
+                first = time.monotonic() - started
+            fh.write(chunk)
+    return {"ok": True, "ttfa": first}
+
+
 # Per-engine OUTPUT gain. Level is fixed HERE, on the render, and never on
 # the reference clip -- loudness-normalising the reference lost a listening
 # test twice (tests/test_found_quiet_and_fast_voice.py).
@@ -702,7 +1013,17 @@ def retire_own_f5_sidecar() -> bool:
 #
 # fish and edge stay at 1.0: the hosted Fish render is the one that was
 # blind-approved at its own level, and neither has been measured from here.
-ENGINE_OUTPUT_GAIN = {"xtts": 1.34, "f5": 2.8}
+#
+# breeze: 2.8 as well, and it is measured, not copied. Breeze clones the
+# SAME reference clip as F5 (jarvis_voice_ref_f5.wav, peak 0.303 / -26.8
+# dBFS RMS), so it inherits the same quiet level -- across the 14 rated
+# round-11 renders its peaks run 0.210-0.337, entirely inside the 0.353 max
+# of the 400 F5 renders 2.8 was fitted to (0.337 * 2.8 = 0.944, still under
+# the rail). Matching F5 exactly is also what a blind A/B needs: the
+# cutover then changes the voice and not the volume. The gain is applied in
+# the SIDECAR (it is sent with each request) so a streamed chunk and the
+# cached file of the same line come out level-identical.
+ENGINE_OUTPUT_GAIN = {"xtts": 1.34, "f5": 2.8, "breeze": 2.8}
 OUTPUT_GAIN = ENGINE_OUTPUT_GAIN["xtts"]   # ~+2.5 dB; peak 0.72 -> ~0.97
 _CEILING = 0.99
 
@@ -943,6 +1264,17 @@ class TTS:
                         FISH_KEY_FILE, FISH_FALLBACK)
             self._engine = FISH_FALLBACK
             return self.load()
+        if self._engine == "breeze":
+            if _ensure_breeze_server():
+                # Its fallback must be warm NOW, not at the first failure.
+                # The same lesson fish taught on 2026-08-30: _ensure_f5_server
+                # was first called by the first FAILING chunk, which then paid
+                # the sidecar's ~180 s cold start -- i.e. the outage plan was
+                # itself an outage. A no-op when the unit already owns the
+                # socket, which is the normal case.
+                self.warm_f5_fallback()
+                return True
+            return self._breeze_unavailable()
         if self._engine == "f5":
             if _ensure_f5_server():
                 return True
@@ -985,6 +1317,28 @@ class TTS:
         self._f5_warm_thread = t
         t.start()
         return t
+
+    def _breeze_unavailable(self) -> bool:
+        """The Breeze sidecar is absent, degraded, or refused. Drop to F5.
+
+        One rung, not a ladder: F5 is local, already resident, and shares
+        Breeze's reference clip, so it is the closest voice there is. Its own
+        _f5_unavailable ladder (xtts, then edge) runs underneath if F5 is
+        down too.
+
+        NOT PERSISTED, and that is the difference from retire_fish. An
+        exhausted Fish balance fails every future chunk, so persisting is
+        right; a cold sidecar recovers on the next start, and writing "f5"
+        to voice_settings.json here would silently un-choose Breeze forever
+        after one bad boot. He turned it on with one setting; only he turns
+        it off.
+        """
+        log.error("breeze sidecar unavailable — falling back to %s (local)",
+                  BREEZE_FALLBACK)
+        bus.publish(Status(text="Breeze voice down — using F5 (local)",
+                           kind="warn"))
+        self._engine = BREEZE_FALLBACK
+        return self.load()
 
     def _f5_unavailable(self) -> bool:
         """The configured local voice will not come up. Degrade LOUDLY and
@@ -1236,6 +1590,8 @@ class TTS:
                     try:
                         if engine == "fish":
                             self._synth_fish(item, tmp.name)
+                        elif engine == "breeze":
+                            self._synth_breeze(item, tmp.name)
                         elif engine == "f5":
                             self._synth_f5(item, tmp.name)
                         elif engine == "xtts" and self._xtts is not None:
@@ -1416,6 +1772,24 @@ class TTS:
                 ref = "none"
             return SpeechCache.key("f5", spoken, ref=ref,
                                    gain=output_gain_for("f5"), **F5_PARAMS)
+        if engine == "breeze":
+            # Everything that decides the AUDIO, so a config change can never
+            # replay a stale clip: the checkpoint's identity (int4, group-32
+            # depth, bf16 attention and text encoder are all baked into the
+            # export, so the manifest's stat IS the quantization), the
+            # reference clip AND its transcript (both are the voice), the
+            # output gain, and the whole pinned rig.
+            def _stat(path: Path) -> str:
+                try:
+                    st = path.stat()
+                    return f"{st.st_size}:{int(st.st_mtime)}"
+                except OSError:
+                    return "none"
+            return SpeechCache.key(
+                "breeze", spoken,
+                ref=f"{_stat(BREEZE_REF)}|{_stat(BREEZE_REF_TEXT)}",
+                ckpt=f"{BREEZE_CKPT.name}:{_stat(BREEZE_CKPT_MANIFEST)}",
+                gain=output_gain_for("breeze"), **BREEZE_PARAMS)
         if engine == "xtts":
             try:
                 st = VOICE_REF.stat()
@@ -1493,7 +1867,7 @@ class TTS:
             log.warning("said twice in a row: %s -- in %r",
                         "; ".join(doubled), spoken)
         # load() may have fallen back to edge, so re-check the engine here.
-        if self._engine in ("f5", "fish"):
+        if self._engine in ("f5", "fish", "breeze"):
             log.info("speaking (%s): %.120s", self._engine, spoken)
             self._speak_pipelined(spoken, self._engine)
             return
@@ -1552,12 +1926,13 @@ class TTS:
         (cached files are never unlinked). Returns only after the LAST chunk
         finishes (blocking semantics).
         """
-        synth = {"f5": self._synth_f5, "fish": self._synth_fish}.get(
-            engine, self._synth_xtts)
+        synth = {"f5": self._synth_f5, "fish": self._synth_fish,
+                 "breeze": self._synth_breeze}.get(engine, self._synth_xtts)
         chunks = self._split_sentences(text, engine=engine)
         wav_q: queue.Queue = queue.Queue()
         _DONE = object()
-        streaming = engine == "fish" and FISH_STREAM_PLAYBACK
+        streaming = ((engine == "fish" and FISH_STREAM_PLAYBACK)
+                     or (engine == "breeze" and BREEZE_STREAM_PLAYBACK))
 
         def _stream_fish(sent: str, tmp_name: str) -> bool:
             """Play-while-rendering for one fish chunk. Hands an _AudioStream
@@ -1593,6 +1968,76 @@ class TTS:
             stream.close()
             return True
 
+        def _stream_breeze(sent: str, tmp_name: str) -> bool:
+            """Play-while-rendering for one breeze chunk. Same contract as
+            _stream_fish: hand the consumer an _AudioStream BEFORE the first
+            byte exists, tee every byte into ``tmp_name`` for the cache,
+            return False only when the chunk must be rendered by the fallback
+            engine (it failed before ANY audio reached the player)."""
+            stream = _AudioStream(tmp_name, timeout=BREEZE_TIMEOUT_S)
+            wav_q.put(stream)
+            it = _breeze_iter(sent, output_gain_for("breeze"),
+                              BREEZE_TIMEOUT_S)
+            try:
+                with open(tmp_name, "wb") as fh:
+                    for data in it:
+                        if self._stop_flag:
+                            break
+                        fh.write(data)
+                        stream.feed(data)
+            except Exception:
+                log.exception("breeze stream failed: %.60s", sent)
+                stream.close(failed=True)
+                # Audio already reached the ear (the chunk was truncated,
+                # or its completion receipt never came): re-rendering the
+                # sentence on F5 would say the first half twice, in a
+                # different voice. Lose the tail of this one chunk instead.
+                if stream.heard:
+                    log.warning("breeze stream cut mid-chunk; not re-speaking")
+                    return True
+                return False
+            finally:
+                # Stopped early? Close the generator so the socket shuts and
+                # the sidecar stops generating for nobody. getattr, because a
+                # test may hand back any iterable.
+                close = getattr(it, "close", None)
+                if close is not None:
+                    close()
+            if not self._stop_flag:
+                # Store before close(): the consumer unlinks the tee file as
+                # soon as it has played, and close() is what lets it finish.
+                self._store(engine, sent, tmp_name)
+            stream.close()
+            return True
+
+        def _fallback_chunk(sent: str) -> bool:
+            """Render one chunk on F5 and queue it. True when it was queued.
+
+            Used when Breeze fails before any audio: a dropped chunk is a
+            hole in the sentence, and Jarvis in the 2.79 voice is better than
+            Jarvis missing a clause.
+            """
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            tmp.close()
+            try:
+                log.warning("falling back to %s for this chunk",
+                            BREEZE_FALLBACK)
+                if self.load_breeze_fallback():
+                    self._synth_f5(sent, tmp.name)
+                    if not self._stop_flag:
+                        # under the RENDERING engine's key: breeze-keyed F5
+                        # audio would replay in the wrong voice from cache
+                        self._store(BREEZE_FALLBACK, sent, tmp.name)
+                    wav_q.put((tmp.name, True))
+                    return True
+            except Exception:
+                log.exception("fallback synth failed too")
+            try:
+                os.unlink(tmp.name)
+            except OSError:
+                pass
+            return False
+
         def _producer():
             try:
                 for sent in chunks:
@@ -1605,6 +2050,13 @@ class TTS:
                     tmp = tempfile.NamedTemporaryFile(
                         suffix=".wav", delete=False)
                     tmp.close()
+                    if streaming and self._engine == "breeze":
+                        if _stream_breeze(sent, tmp.name):
+                            continue
+                        # failed before any audio: the consumer owns the
+                        # first temp file, so the fallback gets a fresh one
+                        _fallback_chunk(sent)
+                        continue
                     if streaming and self._engine == "fish":
                         if _stream_fish(sent, tmp.name):
                             continue
@@ -1639,6 +2091,13 @@ class TTS:
                     except Exception as exc:
                         log.exception("%s chunk synth failed: %.60s",
                                       engine, sent)
+                        if engine == "breeze":
+                            try:
+                                os.unlink(tmp.name)
+                            except OSError:
+                                pass
+                            _fallback_chunk(sent)
+                            continue
                         if engine == "fish":
                             # the network died mid-reply: finish locally
                             # rather than dropping the rest of the sentence.
@@ -1690,7 +2149,7 @@ class TTS:
                         # still holds open is fine, and a stopped chunk is
                         # never stored anyway.
                         if not self._stop_flag:
-                            item.done.wait(timeout=FISH_TIMEOUT_S + 5)
+                            item.done.wait(timeout=item.timeout + 5)
                         try:
                             os.unlink(item.path)
                         except FileNotFoundError:
@@ -1770,12 +2229,37 @@ class TTS:
     # were measured for them.
     _ENGINE_CHUNKING = {"f5": (240, 6.0)}
 
+    # breeze, and ONLY while it is streaming. The two are a coupled pair and
+    # copying F5's numbers here would be wrong twice over.
+    #
+    # What this bounds is the SECOND pass -- breaking one long sentence apart
+    # at its commas. (Sentences are always split; that pass only merges the
+    # short ones.) Streaming inverts what that bound is for. Everywhere else
+    # a chunk is limited by the playback its predecessor buys, because the
+    # whole chunk must render before a byte of it sounds. Breeze streams, and
+    # its sustained RTF is 0.742 -- below 1.0, so the buffer only ever grows
+    # and a streamed chunk cannot underrun at any length. What is left to
+    # optimise is prosody, and the comment block above measured what
+    # comma-splitting costs: the sentence loses its declination (head 125 Hz
+    # / tail 100 Hz whole, against a +45 Hz jump mid-clause when split),
+    # which is exactly the "monotone on lists" complaint. His longest real
+    # calendar sentence is 167 characters and his longest reply is capped at
+    # MAX_SPEAK_LENGTH=500, so 320 leaves every ordinary sentence whole while
+    # still breaking a runaway paragraph.
+    #
+    # With BREEZE_STREAM_PLAYBACK off it falls back to the module default,
+    # NOT to this: on the whole-chunk path a 320-character chunk would be
+    # ~14 s of silence before the first word.
+    _BREEZE_STREAM_CHUNKING = (320, 8.0)
+
     def _chunk_limits(self, engine: str | None = None) -> tuple[int, float]:
         """(max_chars, growth) for ``engine``. getattr, not self._engine:
         test_tts_speak_queue exercises the text path on a bare
         TTS.__new__(TTS) that has no engine yet."""
         if engine is None:
             engine = getattr(self, "_engine", "") and self.render_engine()
+        if engine == "breeze" and BREEZE_STREAM_PLAYBACK:
+            return self._BREEZE_STREAM_CHUNKING
         return self._ENGINE_CHUNKING.get(
             engine, (self._MAX_CHUNK_CHARS, self._CHUNK_GROWTH))
 
@@ -2020,7 +2504,7 @@ class TTS:
                 pass
             # Deadline covers the buffered audio still in the sound server
             # plus a slow stream; the file path allows 30 s per player.
-            cut = not self._wait_player(proc, deadline_s=FISH_TIMEOUT_S + 30)
+            cut = not self._wait_player(proc, deadline_s=stream.timeout + 30)
         finally:
             self._play_proc = None
             envelope.close()
@@ -2036,7 +2520,7 @@ class TTS:
     def _play_stream_from_file(self, stream: _AudioStream):
         """Fallback: wait for the tee file to be complete, then play it
         exactly like a rendered chunk."""
-        if not stream.done.wait(timeout=FISH_TIMEOUT_S + 5):
+        if not stream.done.wait(timeout=stream.timeout + 5):
             return
         while True:                      # drain what the pipe path would have
             try:
@@ -2077,6 +2561,18 @@ class TTS:
             return _ensure_f5_server()
         return True
 
+    def load_breeze_fallback(self) -> bool:
+        """Bring up the engine one failed Breeze chunk falls back to.
+
+        Separate from load_fallback because the two failures are different
+        engines' problems, and because this one must NOT be reached via
+        _ensure_breeze_server: the point is to leave Breeze alone and speak
+        this chunk somewhere else.
+        """
+        if BREEZE_FALLBACK == "f5":
+            return _ensure_f5_server()
+        return True
+
     def _synth_fish(self, text: str, out_path: str):
         """Render one chunk through the hosted API. Raises on failure so the
         caller can fall back locally rather than emitting silence."""
@@ -2099,6 +2595,26 @@ class TTS:
         # ENGINE_OUTPUT_GAIN. It happens before _store(), so the cache holds
         # the audio that will actually be played.
         gain_wav_file(out_path, output_gain_for("f5"))
+        return resp
+
+    def _synth_breeze(self, text: str, out_path: str):
+        """Render one chunk through the sidecar's non-streaming mode.
+
+        The speech cache, prewarm and the phone renderer all want a finished
+        file rather than a stream. Raises on failure so the caller can fall
+        back locally rather than emitting silence.
+
+        No gain_wav_file here, unlike _synth_f5: the gain is sent WITH the
+        request and applied inside the sidecar, in the one place both socket
+        modes pass through, so a streamed chunk and the cached file of the
+        same line are level-identical.
+        """
+        resp = _breeze_request({"text": text, "out": out_path,
+                                "gain": output_gain_for("breeze")})
+        if not resp.get("ok"):
+            raise RuntimeError(f"breeze synthesis failed: {resp.get('error')}")
+        if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+            raise RuntimeError("breeze returned no audio")
         return resp
 
     def _synth_edge(self, text: str, out_path: str):
@@ -2374,6 +2890,7 @@ class Rendition:
         does, so the next time this line is wanted, in the room or on the
         phone, neither of them pays for it again."""
         synth = {"f5": self.tts._synth_f5, "fish": self.tts._synth_fish,
+                 "breeze": self.tts._synth_breeze,
                  "edge": self.tts._synth_edge}.get(self.engine,
                                                    self.tts._synth_xtts)
         tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
