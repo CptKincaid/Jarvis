@@ -246,3 +246,7 @@ def test_doc_states_the_measured_facts_and_the_limits():
     assert "jarvis_aec_playback" in text and "mixer" in text.lower()
     for name in ("aec-install.sh", "aec-uninstall.sh", "aec_measure.py", "playback_device"):
         assert name in text
+    # The default-source switch only reaches Jarvis while voice_settings.json
+    # says mic "Default"; a pinned "[N] name" mic would silently bypass the
+    # canceller, so the doc has to say so next to the switch.
+    assert '`"Default"`' in text

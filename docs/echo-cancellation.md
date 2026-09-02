@@ -94,7 +94,12 @@ Who has to play into `jarvis_aec_sink` for it to be a reference:
 Jarvis's **capture** side needs no config change: the recorder and hotword open the
 PipeWire default source (PortAudio only sees `pipewire`/`default` while PipeWire holds
 the USB mic — see CLAUDE.md), so `pactl set-default-source jarvis_aec_source` is the
-switch, and `aec-install.sh --default-source` is what flips it.
+switch, and `aec-install.sh --default-source` is what flips it. That holds only while
+`mic` in `voice_settings.json` is `"Default"` (it is, as of 2026-09-01): both
+`Recorder._resolve_mic` and `JarvisApp._mic_index` map that name to PortAudio's default
+device, whereas a `[N] name` entry pins a PortAudio index and the default-source switch
+never reaches Jarvis — he would keep capturing the raw Snowball with the canceller
+running beside him, and nothing in the log would say so.
 
 ## 4. Enable
 

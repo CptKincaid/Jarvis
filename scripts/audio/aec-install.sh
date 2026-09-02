@@ -116,6 +116,9 @@ if [ "$SET_DEFAULT" = 1 ]; then
         echo "default source: $CUR -> $SOURCE_NODE"
     fi
     echo "restart Jarvis so its capture re-opens on the new default source"
+    # The recorder maps mic "Default" to PortAudio's default device; a "[N]
+    # name" entry pins an index and the switch above never reaches Jarvis.
+    echo "  (this reaches Jarvis only while voice_settings.json has \"mic\": \"Default\")"
 else
     echo "default source left as $(pactl get-default-source 2>/dev/null || echo '?');"
     echo "  re-run with --default-source to route Jarvis's mic through the canceller"
