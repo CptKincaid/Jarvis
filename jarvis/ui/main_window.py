@@ -743,7 +743,20 @@ class MainWindow:
         the scaled minimum comes from a pre-HiDPI run — replace it with
         the scaled default (keeping the saved position)."""
         saved = CONFIG.window_geometry or ""
-        m = re.fullmatch(r"(\d+)x(\d+)([+-]\d+[+-]\d+)?", saved)
+        # `[+-]-?\d+`, not `[+-]\d+`: Tk spells a negative position with the
+        # gravity sign FIRST and the coordinate after it — "+-37+-17" — and
+        # that is verbatim what `wm geometry` hands back for the string our
+        # own writers produce (measured on a scratch Xvfb: geometry("+-34+-21")
+        # is accepted, echoes "520x880+-34+-21", winfo_x() == -34). Both
+        # writers can reach it: `_move_drag` whenever he drags the panel's
+        # top-left past the top or left edge, and standby's re-anchor from a
+        # drop made entirely on screen while the burn-in walk was pushing
+        # right. Rejecting it cost him his saved SIZE as well as his
+        # position. Note "-37-17" is a different geometry, not a tidier
+        # spelling of the same one — that is right/bottom gravity and lands
+        # near the far corner — so the pattern is widened here and the string
+        # is never rewritten.
+        m = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+[+-]-?\d+)?", saved)
         if not m:
             if saved:
                 log.warning("bad saved geometry %r; using default", saved)
@@ -777,9 +790,23 @@ class MainWindow:
         # was undone one second later. The new origin is where he dropped it
         # MINUS the drift already on the window — anchoring to the raw
         # position would make the next tick jump by the whole accumulated
-        # offset instead. This is the only user-move path; _move_to is ours
-        # and must not re-anchor, which is why the signal is taken from the
-        # drag handler rather than from a <Configure> binding.
+        # offset instead. This is the only user-move path: _move_to is ours
+        # and must not re-anchor.
+        #
+        # The signal is taken here and NOT from a <Configure> binding —
+        # though not because our own moves would be indistinguishable from
+        # his. Since this fix, `_standby_origin + _standby_drift` IS the
+        # position we last asked for, and a Configure handler could tell the
+        # two apart by comparing against it, with no extra state. The real
+        # reason is timing: <Configure> arrives only once the WM has acted,
+        # so mid-drag it reports a position one or more writes behind this
+        # 60 Hz stream and would re-anchor to a stale one — and a WM that
+        # clamps or snaps OUR _move_to would look exactly like a move he
+        # made. What staying here costs: a WM-initiated move (GNOME
+        # Super+drag, a keyboard move, a tiling snap) never reaches this
+        # handler, so it is still yanked back by the next drift tick. The
+        # header drag is the gesture a borderless window offers, and it is
+        # the one he reported.
         if self._standby_origin is not None:
             drift_x, drift_y = self._standby_drift
             self._standby_origin = (x - drift_x, y - drift_y)

@@ -29,6 +29,14 @@ makes the very next tick jump by the whole accumulated offset.  The anchor
 has to be `dropped position - the drift currently baked into the window`,
 which is precisely the last offset `_on_console_drift` applied.
 
+That subtraction has a consequence a reviewer caught on the way in: a drop
+made ENTIRELY on screen can anchor at a NEGATIVE coordinate (park it flush
+in the corner while the walk is at its rightmost and the un-drifted home is
+off the edge).  The anchor is right to go there and is deliberately not
+clamped -- see the corner-park test below -- but the position it saves is
+spelled "+-37+-17", and `_pick_geometry` rejected exactly that, handing him
+the default window back.  The last four tests cover that round trip.
+
 Display-free, the way tests/test_holo_geometry.py is: the shipping methods
 are taken UNBOUND off MainWindow and driven against a fake root that
 records geometry strings.  No Tk root is created -- a real toplevel on the
@@ -40,6 +48,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from jarvis.config import CONFIG
 from jarvis.ui import console_mode as cm
 from jarvis.ui.main_window import MainWindow
 
@@ -47,11 +56,19 @@ from jarvis.ui.main_window import MainWindow
 START = (100, 200)
 SIZE = (520, 880)
 
-_GEOM = re.compile(r"(?:(\d+)x(\d+))?(?:([+-]\d+)([+-]\d+))?$")
+# Only the form BOTH writers actually produce -- `f"+{x}+{y}"` -- with the
+# coordinates allowed to be negative, because that is what real Tk takes:
+# measured on a scratch Xvfb, `geometry("+-34+-21")` is accepted, `geometry()`
+# echoes "520x880+-34+-21" and `winfo_x()` is -34.  "-34-21" is deliberately
+# NOT accepted here: to Tk that is right/bottom gravity and lands near the far
+# corner (846, 699 on a 1400x1600 screen), so a writer that ever emitted it
+# would be moving the window somewhere else entirely and must fail loudly.
+_GEOM = re.compile(r"(?:(\d+)x(\d+))?(?:\+(-?\d+)\+(-?\d+))?$")
 
 
 class _Root:
-    """The four calls the drag/standby path makes on `self.root`.
+    """The handful of calls the drag/standby/geometry path makes on
+    `self.root`.
 
     `geometry()` splits size from position the way the real Tk geometry
     manager does -- "+x+y" moves without resizing, "WxH" resizes without
@@ -73,15 +90,18 @@ class _Root:
     winfo_rootx = winfo_x                # borderless: no frame offset
     winfo_rooty = winfo_y
 
+    def winfo_screenheight(self):
+        return 1600                      # _default_geometry clamps h to 90%
+
     def geometry(self, spec=None):
         if spec is None:
             return f"{self.w}x{self.h}+{self.x}+{self.y}"
         self.specs.append(spec)
         m = _GEOM.fullmatch(spec)
         assert m, f"not a Tk geometry string: {spec!r}"
-        if m.group(1):
+        if m.group(1) is not None:
             self.w, self.h = int(m.group(1)), int(m.group(2))
-        if m.group(3):
+        if m.group(3) is not None:       # "0" is a legal coordinate
             self.x, self.y = int(m.group(3)), int(m.group(4))
 
     @property
@@ -114,6 +134,8 @@ class _Console:
     _move_to = MainWindow._move_to
     _on_console_drift = MainWindow._on_console_drift
     _on_console_mode = MainWindow._on_console_mode
+    _pick_geometry = MainWindow._pick_geometry
+    _default_geometry = MainWindow._default_geometry
 
     def __init__(self):
         self.root = _Root()
@@ -126,10 +148,10 @@ class _Console:
         self.room = SimpleNamespace(set_mode=lambda mode: None)
         self.reactor = object()
         self.transcript = object()
-        self.modes_seen = []
 
     def _set_footer_hidden(self, hidden):
-        self.modes_seen.append(hidden)
+        """Stubbed, not recorded: the real one pack_forgets two widgets and
+        nothing on the drag/anchor path reads it back."""
 
     # ---------------------------------------------------------- helpers
     def drag_to(self, x, y):
@@ -322,6 +344,82 @@ def test_the_real_console_walks_on_from_where_he_put_it():
     modes.stop()
     assert modes.mode == cm.ACTIVE
     assert con.root.pos == (160, 230)
+
+
+# ------------------------------ the anchor may legitimately land off-screen
+def test_a_corner_park_anchors_off_screen_and_still_reloads_next_launch(
+        monkeypatch):
+    r"""The re-anchor subtracts the drift, so a drop made ENTIRELY on screen
+    can put the anchor at a negative coordinate: parked flush at (5, 4) while
+    the walk stood at its rightmost (+42, +21), the un-drifted home is
+    (-37, -17).
+
+    That anchor is deliberately NOT clamped. Clamping it to (0, 0) would
+    desynchronise it from the drift the window is actually wearing and the
+    very next tick would jump the window by the difference -- the snap-back
+    this whole file is about, in miniature. Clamping the WAKE instead would
+    break a console he has deliberately parked half off the edge, which
+    a414152 preserves across standby. So the negative position is allowed to
+    exist, and the job is to make it survive a quit.
+
+    `_on_close` saves it in Tk's own spelling -- sign of the gravity first,
+    then the coordinate, "+-37+-17" (measured on a scratch Xvfb:
+    `geometry("+-34+-21")` is accepted, echoes "520x880+-34+-21",
+    `winfo_x()` is -34). `_pick_geometry` used to reject exactly that string,
+    because `[+-]\d+` cannot match "+-37", and fall back to the DEFAULT
+    geometry -- so one corner park cost him his saved SIZE as well as his
+    position at the next launch.
+    """
+    peak = cm.drift_offset(1190.0)               # the walk at its rightmost
+    assert peak == (42, 21)
+    assert peak[0] == cm.DRIFT_RADIUS == max(          # …genuinely the far
+        cm.drift_offset(t)[0] for t in range(0, 6000))  # side of the circle
+    con = _standby_at(peak)
+    assert con.root.pos == (142, 221)
+    con._geom_ts = 0.0                           # …on a panel he had resized
+    con._grip_drag(_Event(con.root.x + 700, con.root.y + 1000))
+
+    con.drag_to(5, 4)                            # flush into the corner
+    assert con._standby_origin == (-37, -17)     # his drop minus the walk
+
+    con._on_console_mode(cm.ACTIVE)              # what _on_close does first
+    saved = con.root.geometry()
+    assert saved == "700x1000+-37+-17"
+
+    monkeypatch.setattr(CONFIG, "window_geometry", saved)
+    assert con._pick_geometry() == saved         # verbatim: size AND position
+    assert saved != con._default_geometry()      # …which the fallback loses
+
+
+def test_a_left_edge_drag_while_awake_reloads_with_his_size(monkeypatch):
+    """The same `_pick_geometry` hole, reached the way a414152 already could:
+    `_move_drag` writes "+-20+300" the moment he drags the panel's left edge
+    past x=0 with the console awake, and that is what gets saved. Nothing to
+    do with standby -- which is why the fix is in the reader, not the writer.
+    """
+    con = _Console()
+    con.drag_to(-20, 300)
+    assert con.root.specs == ["+-20+300"]        # verbatim, as Tk wants it
+    monkeypatch.setattr(CONFIG, "window_geometry", con.root.geometry())
+    assert con._pick_geometry() == "520x880+-20+300"
+
+
+def test_a_negative_position_survives_the_pre_hidpi_rescale(monkeypatch):
+    """A pre-HiDPI size is replaced by the scaled default and the POSITION is
+    kept -- the negative form has to come through that branch intact too."""
+    con = _Console()
+    monkeypatch.setattr(CONFIG, "window_geometry", "300x400+-37+-17")
+    assert con._pick_geometry() == con._default_geometry() + "+-37+-17"
+
+
+def test_geometry_that_is_not_a_geometry_still_falls_back(monkeypatch):
+    """The negative control for the widened pattern: it must not have turned
+    into "accept anything"."""
+    con = _Console()
+    for junk in ("", "garbage", "520x880+", "520x880+-+3", "520x-880+1+2",
+                 "520x880+1+2 "):
+        monkeypatch.setattr(CONFIG, "window_geometry", junk)
+        assert con._pick_geometry() == con._default_geometry(), junk
 
 
 if __name__ == "__main__":                      # pragma: no cover
