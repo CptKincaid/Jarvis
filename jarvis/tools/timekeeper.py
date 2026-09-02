@@ -731,10 +731,24 @@ def interval_token(seconds: float) -> str:
     return f"{mins}m" if MIN_INTERVAL_MIN <= mins <= MAX_INTERVAL_MIN else ""
 
 
+# The repeats next_repeat walks day by day FROM ``due`` -- the ones a
+# moved due would drag with it. ONE list: keeps_wall_clock, Item.shifted
+# and the _due_items query all read it, so a third fixed repeat added here
+# cannot end up shifted by adjust but still fired at the series time.
+WALL_CLOCK_REPEATS = ("daily", "weekdays")
+
+
+def keeps_wall_clock(repeat) -> bool:
+    """Does this repeat keep its own wall-clock hour? daily / weekdays do:
+    next_repeat walks day by day FROM ``due``, so moving that due moves
+    every morning after it too. An interval walks from NOW instead and
+    cannot be dragged that way -- see Item.shifted and Timekeeper.adjust."""
+    return str(repeat or "") in WALL_CLOCK_REPEATS
+
+
 def is_repeating(repeat) -> bool:
     """Does this item come back? (fixed repeat or an interval)"""
-    return str(repeat or "") in ("daily", "weekdays") or \
-        interval_minutes(repeat) is not None
+    return keeps_wall_clock(repeat) or interval_minutes(repeat) is not None
 
 
 def interval_words(minutes: int) -> str:
@@ -746,6 +760,22 @@ def interval_words(minutes: int) -> str:
     if minutes == 1:
         return "minute"
     return f"{count_words(minutes) if minutes <= 12 else minutes} minutes"
+
+
+def shift_suffix(it) -> str:
+    """', then back to 7:00 am' -- the tail on an item whose next
+    occurrence alone was moved (Item.shifted). It REPLACES ', every day':
+    "wake up at 7:30 am tomorrow, every day" reads as though the whole
+    series had moved, which is precisely the thing that is not happening.
+
+    A whole-day shift ("skip tomorrow") lands the occurrence back on the
+    series time of day, and "at 7:00 am on Thursday, then back to 7:00 am"
+    names one time twice and says nothing; there the plain repeat tail is
+    both true and shorter."""
+    series = _time_words(_to_dt(it.due))
+    if _time_words(_to_dt(it.effective_due)) == series:
+        return repeat_suffix(it.repeat)
+    return f", then back to {series}"
 
 
 def repeat_suffix(repeat) -> str:
@@ -1067,8 +1097,39 @@ class Item:
     seq: int = 0                       # sqlite rowid: insertion order
 
     @property
+    def shifted(self) -> bool:
+        """Has the NEXT occurrence alone been moved off the series?
+
+        2026-09-02 -- "Push my alarm back thirty minutes" on a daily 7 am
+        wake-up moved every morning after it as well, because next_repeat
+        walks day by day from ``due`` (keeps_wall_clock). So the push-back
+        is NOT written to ``due``: it goes in ``snooze_until``, which
+        already persists across a restart and already wins in
+        effective_due, and ``due`` stays on the series wall clock for
+        _fire / _finish_alarm to re-file from.
+
+        The state stays "pending" on purpose. This is not a snooze --
+        nothing rang, and a bring-forward puts snooze_until EARLIER than
+        ``due``, which a snooze never does -- so no listing, briefing or
+        focus check reads it back as one (they all branch on the state).
+        Only the three places that must know look here: effective_due,
+        _due_items and _describe_item.
+
+        A ringing alarm counts too: the shift is what it rang AT, so
+        "rang out" and a crash-mid-ring catch-up quote the right time.
+
+        A shift back onto the series time is no shift: adjust clears the
+        column in that case, and an old row that still carries an equal
+        value must not read as moved either (it would lose ", every day"
+        from every listing and say "at 7:00 am tomorrow, then back to
+        7:00 am")."""
+        return (self.state in ("pending", "ringing") and bool(self.snooze_until)
+                and float(self.snooze_until) != float(self.due)
+                and keeps_wall_clock(self.repeat))
+
+    @property
     def effective_due(self) -> float:
-        if self.state == "snoozed" and self.snooze_until:
+        if self.snooze_until and (self.state == "snoozed" or self.shifted):
             return float(self.snooze_until)
         return float(self.due)
 
@@ -1469,6 +1530,8 @@ class Timekeeper:
             tail = repeat_suffix(it.repeat)
             if it.state == "snoozed":
                 return f"{head} snoozed until {_time_words(_to_dt(it.effective_due))}{tail}"
+            if it.shifted:                    # never "snoozed": nothing rang
+                return f"{head} {due}{shift_suffix(it)}"
             return f"{head} {due}{tail}"
         if it.kind == "timer":
             label = display_label(it.label)
@@ -1479,6 +1542,8 @@ class Timekeeper:
                 # minutes" -- so it is treated as no label at all.
                 label = ""
             return f"{label or 'the ' + duration_words(it.duration) + ' timer'} {due}"
+        if it.shifted:
+            return f"{it.label} {due}{shift_suffix(it)}"
         return f"{it.label} {due}{repeat_suffix(it.repeat)}"
 
     def list_text(self, kind: str = "all", now=None) -> str:
@@ -1560,12 +1625,15 @@ class Timekeeper:
         model picked ``list`` and read the timer back instead of moving it.
 
         Per item:
-          pending  -> due += delta. A repeating item shifts only this
-                      occurrence; ``repeat`` (the interval) is untouched.
-                      (An interval nudge walks from NOW when it fires, so
-                      later nudges are unaffected; a daily/weekdays alarm
-                      walks from ``due`` day by day, so its later wall-clock
-                      time follows this shift -- see next_repeat.)
+          pending  -> due += delta, and ``repeat`` is untouched.
+                      A daily/weekdays item shifts ONLY THE NEXT
+                      occurrence: the delta goes to snooze_until and
+                      ``due`` keeps the series wall clock, because
+                      next_repeat walks day by day from ``due`` and a moved
+                      due dragged every morning after it with it
+                      (2026-09-02 -- see Item.shifted). An interval nudge
+                      already walks from NOW when it fires, so its due is
+                      moved directly and later nudges are unaffected.
           snoozed  -> snooze_until += delta (the original due is kept).
           ringing  -> a positive delta is "give me N more minutes": the same
                       as snooze(delta / 60) for that item (ring killed,
@@ -1617,8 +1685,22 @@ class Timekeeper:
                     new_due = max(now, was + delta)
                     applied = new_due - was
                     self._update(it.id, snooze_until=new_due)
+                elif keeps_wall_clock(it.repeat):
+                    # This occurrence only. `due` stays on the series wall
+                    # clock (next_repeat walks from it), the shift lives in
+                    # snooze_until -- Item.shifted. A second adjust reads
+                    # effective_due, so two push-backs accumulate on the
+                    # same morning and the series still never moves.
+                    was = float(it.effective_due)
+                    new_due = max(now, was + delta)
+                    applied = new_due - was
+                    # "...actually, bring it forward thirty again": the
+                    # occurrence is back ON the series, so the column goes
+                    # back to NULL and the item stops reading as moved.
+                    self._update(it.id, snooze_until=(
+                        None if new_due == float(it.due) else new_due))
                 else:
-                    was = float(it.due)
+                    was = float(it.effective_due)
                     new_due = max(now, was + delta)
                     applied = new_due - was
                     self._update(it.id, due=new_due)
@@ -1746,7 +1828,11 @@ class Timekeeper:
     def _fire(self, item: Item, now: float, late: bool, effects: list) -> bool:
         """Fire one due item.  Called under the lock; speech / events are
         appended to ``effects`` and run after the lock is released."""
-        due_dt = _to_dt(item.due)
+        # A shifted occurrence rang at its snooze_until, not at the series
+        # `due` it still carries. A genuine snooze is NOT included: the
+        # "while I was down" line and the alarm card have always quoted the
+        # original due there, and that is not this commit's business.
+        due_dt = _to_dt(item.effective_due if item.shifted else item.due)
         now_dt = _to_dt(now)
         if item.kind == "alarm":
             if self._ring is not None or self._select("state='ringing'"):
@@ -1756,7 +1842,13 @@ class Timekeeper:
                 line = LATE_LINE.format(label=item.spoken_label(), time=_when_words(due_dt, now_dt))
             else:
                 line = ALARM_LINE.format(time=fmt_clock(now_dt), label=label)
-            self._update(item.id, state="ringing", fired_at=now, snooze_until=None)
+            # A shifted occurrence (Item.shifted) keeps its snooze_until
+            # while it rings: that is the time it rang at, so a ring-out
+            # line and a crash-mid-ring catch-up quote 7:30 and not the 7:00
+            # the series still sits on. _finish_alarm clears it on the way
+            # out; `due` is untouched either way.
+            self._update(item.id, state="ringing", fired_at=now,
+                         snooze_until=item.snooze_until if item.shifted else None)
             if self.ring_enabled:
                 self._ring = _Ring(item.id, now)
                 self._service_ring(now, effects)      # first paplay right away
@@ -1841,8 +1933,16 @@ class Timekeeper:
         return True
 
     def _due_items(self, now: float) -> list[Item]:
+        # The CASE is Item.shifted in SQL: a repeating item whose next
+        # occurrence was pushed back is due at its snooze_until, NOT at the
+        # series `due` it still carries, so 7 am passes in silence and the
+        # 7:30 he asked for rings.
+        wall = ",".join("'%s'" % r for r in WALL_CLOCK_REPEATS)
         items = self._select(
-            "(state='pending' AND due<=?) OR (state='snoozed' AND snooze_until<=?)",
+            "(state='pending' AND (CASE WHEN snooze_until IS NOT NULL "
+            f"AND snooze_until>0 AND repeat IN ({wall}) "
+            "THEN snooze_until ELSE due END)<=?) "
+            "OR (state='snoozed' AND snooze_until<=?)",
             (now, now))
         items.sort(key=lambda i: (i.effective_due, i.created))
         return items
@@ -1851,7 +1951,8 @@ class Timekeeper:
         self._kill_ring()
         self._finish_alarm(item, now, "missed")
         line = RING_TIMEOUT_LINE.format(label=item.spoken_label(),
-                                        time=_when_words(_to_dt(item.due), _to_dt(now)))
+                                        time=_when_words(_to_dt(item.effective_due),
+                                                         _to_dt(now)))
         # kind="alarm": in a quiet-hours digest a missed alarm must read as
         # an alarm, not a "reminder" (the ring itself at fire time already
         # goes out proactive=False).
