@@ -19,7 +19,16 @@ from jarvis.tools.briefing import (OFFER_TTL_S, STUDY_NO_DECK_LINE, _exam_days,
                                    _study_section, build_briefing)
 from jarvis.tools.quiz import NOTHING_DUE_LINE, FlashcardStore
 
-NOW = datetime(2026, 8, 30, 7, 5).astimezone()
+# Off the REAL clock, not a frozen date. This file reads TWO clocks: the
+# _study_section/build_briefing tests are handed NOW, but the commander
+# tests below read back through cmdr.handle("yes") -> commander.py:5564
+# store.due(limit=n, topic=topic), which takes no now= and falls through to
+# time.time(). A frozen NOW writes cards at a fixed epoch the real clock
+# eventually crosses: the box-3 deck was due 1788350699.0 = 2026-09-02
+# 07:04:59, and test_a_deck_that_emptied_since_breakfast_says_so went red at
+# breakfast that morning. Same rule as tests/test_notes_mail.py:872 -- the
+# fixture must write with whichever clock the code under test reads.
+NOW = datetime.now().astimezone()
 
 
 @pytest.fixture(autouse=True)
