@@ -3463,8 +3463,16 @@ class JarvisApp:
             # 20:58:35, avg_logprob -0.95). _salvage_low_confidence names
             # the reason to run it anyway, or "".
             accepted = result.accepted
+            # A repetition loop is not a length-biased short transcript, and
+            # the salvage exists only for those: with a yes/no read-back
+            # parked, "yes, yes, yes, yes, yes" would otherwise be salvaged
+            # into a destructive confirm. See transcriber.MAX_COMPRESSION_RATIO.
+            # getattr: decode_clip() is a public seam (jarvis/intercom.py
+            # hands a clip in over the command socket) and its result only
+            # has to quack like a TranscribeResult.
+            looping = bool(getattr(result, "looping", False))
             salvage = ""
-            if not accepted and text:
+            if not accepted and text and not looping:
                 salvage = self._salvage_low_confidence(text, result.confidence)
                 if salvage:
                     log.info("low confidence (%.2f) overridden -- %s: %r",
@@ -3473,7 +3481,8 @@ class JarvisApp:
             bus.publish(Transcribed(
                 text=result.text, confidence=result.confidence,
                 accepted=accepted,
-                reject_reason="" if accepted else "confidence",
+                reject_reason=("" if accepted else
+                               "looping" if looping else "confidence"),
                 speculative=spec is not None))
             if accepted and text:
                 self._say_again_count = 0
@@ -4400,6 +4409,17 @@ class JarvisApp:
         except Exception:
             log.exception("speaker model load failed")
         self._install_endpointer()
+        # One throwaway decode before the user's first word. The weights are
+        # already resident (start_preload), but no whisper kernel has run,
+        # and the first inference of a process costs 0.95 s against 0.25 s
+        # for every one after it (measured 2026-09-02, one 3.3 s capture,
+        # fresh process each way). Here rather than earlier so the mic path
+        # -- the endpointer above, the speaker model before it -- is in
+        # place first; nobody is waiting on this thread for the 0.85 s.
+        try:
+            self.transcriber.warmup()
+        except Exception:
+            log.exception("whisper warm-up failed")
         # Honest failure for the speakers: with only a dummy/null sink the
         # playback chain "succeeds" into silence (seen on this machine with
         # no HDMI audio device attached).

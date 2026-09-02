@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from dataclasses import dataclass, field
 
 from jarvis.config import CONFIG, MACHINE, PATHS
@@ -75,6 +76,104 @@ STREAMING_INTERVAL = 2.0
 # runs a sub-threshold transcript anyway when Jarvis asked the question or
 # the words are an exact Tier-1 command.
 MIN_AVG_LOGPROB = -2.90
+
+# ------------------------------------------------------------------
+# The bound on the decode
+# ------------------------------------------------------------------
+# Whisper's decode is unbounded in two directions, and on 2026-09-02 both
+# of them landed on Hunter as a nine-second turn -- /tmp/vss_voice/jarvis.log
+# 14:44:00.099, "stt 5.23s ... wait 9.22s", against 63-132 ms of stt on the
+# good turns the night before.
+#
+#  * THE TEMPERATURE LADDER. openai-whisper re-decodes a window at
+#    (0.0, 0.2, 0.4, 0.6, 0.8, 1.0) whenever the greedy pass trips
+#    logprob_threshold=-1.0 or compression_ratio_threshold=2.4, and returns
+#    whichever rung first passes -- or the temperature-1.0 SAMPLE when none
+#    does. Six full decodes of the same audio.
+#  * SAMPLE_LEN. Each of those passes may emit n_text_ctx // 2 = 224 tokens,
+#    so a repetition loop runs to the cap rather than to the end of the
+#    sentence.
+#
+# Measured here (whisper "turbo", cuda, fp16, GB10) over 20 non-speech clips
+# through the real Transcriber.transcribe():
+#
+#    whisper's own defaults    total 49.5 s   worst single decode 9.70 s
+#    the bounds below          total  9.1 s   worst single decode 1.00 s
+#
+# which is the shape of every slow decode in his log (9.55 s, 5.52 s,
+# 5.18 s, 3.48 s -- four of the six returning character salad) against
+# 0.02-0.45 s for every clean one.
+#
+# THE LADDER IS NOT A TRADE. It was measured against the accuracy it is
+# supposed to buy, on his own failure shape: 180 corpus clips cut to
+# 0.55 s / 0.85 s -- the length that makes avg_logprob collapse, see
+# MIN_AVG_LOGPROB above -- and mixed to 0 dB SNR. 34 of them tripped
+# logprob_threshold and went up the ladder. WER against the same cut
+# decoded clean:
+#
+#    rungs              WER (all 180)   WER (the 34)   their decode time
+#    6 (whisper stock)      0.4609         1.5216         40.19 s
+#    2                      0.6257         2.3941         15.25 s
+#    1 (greedy only)        0.3882         1.1368          7.15 s
+#
+# One rung is the most ACCURATE as well as the fastest, and two is the
+# worst of the three: a short clip's greedy transcript is usually right and
+# merely scores badly, so replacing it with one temperature-0.2 draw is a
+# straight loss, while six draws only claw part of it back. Whisper is
+# throwing away the right answer because a length-biased mean says so --
+# the identical mistake the old -0.85 confidence gate made.
+#
+# On speech that does NOT trip it there is nothing to trade at all. Over 113
+# real clips (the voice corpus, his own mic captures, a 20 s dictation run)
+# the bounded decode returned the IDENTICAL transcript 113/113 with the same
+# median/p95/max time; over 160 of those degraded to 0 dB and -3 dB SNR the
+# ladder fired ZERO times -- every one passed at temperature 0.0, which makes
+# one rung and six the same decode by construction -- and WER was 0.1843
+# either way.
+DECODE_TEMPERATURES = (0.0,)
+
+# Tokens a real utterance can contain. The fastest of those 113 clips
+# emitted 8.89 tokens/second ("That didn't work, sir" cut to 0.9 s); the
+# longest run needed 69 tokens for 20 s of continuous speech. 12/s plus a
+# 32-token allowance for the sot sequence, the timestamps and the odd long
+# word keeps at least 1.7x headroom at every length -- and from ~16 s up the
+# budget IS Whisper's own 224, so dictation of a full window is untouched.
+WHISPER_SAMPLE_LEN = 224        # openai-whisper's n_text_ctx // 2 for turbo
+TOKENS_PER_SECOND = 12
+TOKEN_FLOOR = 32
+
+# Whisper's own "too repetitive" threshold, and it has to be read out HERE
+# now that the ladder is gone -- compression_ratio_threshold was the trigger
+# that used to send a looping window back for another draw, and the
+# confidence gate was living off the wreckage: an exhausted ladder returns
+# the temperature-1.0 sample, whose avg_logprob is deeply negative, which is
+# how some loops fell below MIN_AVG_LOGPROB.
+#
+# On one greedy pass the same non-speech clip comes back as "and the rest of
+# the day, the rest of the day, ..." at avg_logprob -0.31, and the -2.90
+# gate waves that straight through. So the loop is rejected on the signal
+# Whisper designed for it instead: compression_ratio, 1.64 at worst across
+# 113 real clips and every decode setting tried, 7.55-13.14 on the loops.
+#
+# This is a gate the old code did not have, and it closes a hole rather than
+# opening one: of the eight non-speech clips that decoded slowly under
+# whisper's own settings, FIVE came back accepted -- "Thank you." and "has
+# already been done." at avg_logprob -0.77 to -2.58, comfortably above -2.90
+# -- and were handed to the commander. Bounded, all eight are rejected.
+MAX_COMPRESSION_RATIO = 2.4
+
+
+def token_budget(seconds: float) -> int:
+    """Cap on the tokens one decode pass may emit, from the clip's length."""
+    return int(min(WHISPER_SAMPLE_LEN,
+                   TOKEN_FLOOR + TOKENS_PER_SECOND * max(0.0, seconds)))
+
+
+def _seconds(audio) -> float:
+    try:
+        return len(audio) / float(SAMPLE_RATE)
+    except Exception:
+        return 0.0
 
 # Default vocabulary prompt — biases Whisper toward the assistant's own
 # domain. Replaces the warehouse list ported verbatim from
@@ -193,11 +292,24 @@ class TranscribeResult:
     confidence: float = 0.0            # mean segment avg_logprob (0.0 if no segments)
     segments: list = field(default_factory=list)   # [(seg_text, avg_logprob), ...]
     language: str | None = None        # detected/forced language code
+    # WORST segment compression ratio, not the mean: one looping segment
+    # poisons the turn even when the others are clean, and a mean hides it.
+    # 0.0 when the backend does not report one -- the gate fails OPEN.
+    compression_ratio: float = 0.0
+
+    @property
+    def looping(self) -> bool:
+        """Whisper ran away repeating itself. See MAX_COMPRESSION_RATIO:
+        real speech peaked at 1.64 over 113 measured clips, the loops at
+        8.81-26.19, and their avg_logprob (-0.42) is no help at all."""
+        return self.compression_ratio > MAX_COMPRESSION_RATIO
 
     @property
     def accepted(self) -> bool:
         """Confidence gate (port: 2599-2607). No segments -> accept as-is
         (legacy skipped the gate when seg_data was empty)."""
+        if self.looping:
+            return False
         if not self.segments:
             return True
         return self.confidence >= MIN_AVG_LOGPROB
@@ -325,6 +437,63 @@ class Transcriber:
             log.info("Model loaded on %s", backend)
             return backend
 
+    # -- cold start -----------------------------------------------------
+    # 0.5 s: whisper pads every clip to 30 s anyway, so the length buys
+    # nothing; this only has to be long enough to be a legal clip.
+    WARMUP_SECONDS = 0.5
+
+    def warmup(self) -> bool:
+        """Run one throwaway decode so the USER never pays the cold start.
+
+        The weights are already resident by here (app._preload_heavy_imports
+        logs "preloaded torch/whisper + CUDA in 1.2s"), but nothing has run
+        a whisper kernel, so the first real inference of the process pays
+        autotune and the caching allocator's first fill. A/B on one 3.3 s
+        mic capture, fresh process each way, twice:
+
+            no warm-up   first user turn  0.951 s   (0.944 / 0.870 / 0.927)
+            warm-up      first user turn  0.252 s   (0.285 / 0.258 / 0.247)
+
+        ~0.70 s off the first turn after every launch, for the 0.85 s this
+        costs on the model-loader thread where nobody is waiting.
+
+        Silence, never microphone audio, and NOT through transcribe(): that
+        would log "Transcribed: 'Thank you.'" -- whisper's stock
+        hallucination on silence -- into the log directly above his real
+        turn. Nothing is published, nothing is returned, and a failure is
+        swallowed: a box that cannot warm up must still be able to listen.
+
+        Returns True when a decode actually ran.
+        """
+        model = self._model
+        if model is None:
+            return False
+        import numpy as np       # only the warm-up needs it in this module
+
+        audio = np.zeros(int(SAMPLE_RATE * self.WARMUP_SECONDS),
+                         dtype=np.float32)
+        budget = token_budget(self.WARMUP_SECONDS)
+        t0 = time.monotonic()
+        try:
+            with self._lock:
+                if self._gpu:
+                    model.transcribe(
+                        audio, initial_prompt=self._prompt(),
+                        language=self._language(), beam_size=1, fp16=True,
+                        temperature=DECODE_TEMPERATURES, sample_len=budget)
+                else:
+                    segments, _ = model.transcribe(
+                        audio, beam_size=5, initial_prompt=self._prompt(),
+                        temperature=DECODE_TEMPERATURES,
+                        max_new_tokens=budget)
+                    list(segments)          # faster-whisper decodes lazily
+        except Exception:
+            log.exception("whisper warm-up decode failed")
+            return False
+        log.info("whisper warm-up decode: %.2fs (%s)",
+                 time.monotonic() - t0, self._backend or "?")
+        return True
+
     # -- language -------------------------------------------------------
     def _language(self) -> str | None:
         """Whisper language code for the configured language
@@ -349,6 +518,8 @@ class Transcriber:
 
         lang = self._language()
 
+        budget = token_budget(_seconds(audio))
+
         if self._gpu:
             # openai-whisper: expects float32 numpy @16k (exactly what the
             # recorder delivers — no resample). Segments carry avg_logprob
@@ -360,6 +531,8 @@ class Transcriber:
                     language=lang,          # None = auto-detect
                     beam_size=1,
                     fp16=True,
+                    temperature=DECODE_TEMPERATURES,
+                    sample_len=budget,
                 )
             try:
                 import torch
@@ -369,6 +542,8 @@ class Transcriber:
             seg_list = result.get("segments") or []
             text = " ".join(s["text"].strip() for s in seg_list).strip()
             seg_data = [(s["text"], s["avg_logprob"]) for s in seg_list]
+            ratio = max((s.get("compression_ratio", 0.0) for s in seg_list),
+                        default=0.0)
             language = result.get("language")
         else:
             kwargs = dict(
@@ -376,6 +551,8 @@ class Transcriber:
                 initial_prompt=self._prompt(),
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
+                temperature=DECODE_TEMPERATURES,
+                max_new_tokens=budget,   # faster-whisper's spelling of the cap
             )
             if lang is not None:
                 kwargs["language"] = lang
@@ -386,6 +563,8 @@ class Transcriber:
                 seg_list = list(segments)
             text = " ".join(seg.text.strip() for seg in seg_list).strip()
             seg_data = [(seg.text, seg.avg_logprob) for seg in seg_list]
+            ratio = max((getattr(seg, "compression_ratio", 0.0) or 0.0
+                         for seg in seg_list), default=0.0)
             language = getattr(info, "language", None)
 
         text = collapse_repeats(text)
@@ -399,12 +578,18 @@ class Transcriber:
         else:
             avg_conf = 0.0
             log.info("Transcribed: %r", text)
+        if ratio > MAX_COMPRESSION_RATIO:
+            # Says the number, because this is the gate that replaced the
+            # deep-negative avg_logprob the six-rung ladder used to produce.
+            log.info("Rejected: repetition loop (compression_ratio=%.2f > %s)",
+                     ratio, MAX_COMPRESSION_RATIO)
 
         return TranscribeResult(
             text=text,
             confidence=avg_conf,
             segments=seg_data,
             language=language,
+            compression_ratio=ratio,
         )
 
     # -- streaming preview ---------------------------------------------
@@ -423,10 +608,15 @@ class Transcriber:
             try:
                 lang = self._language()
 
+                budget = token_budget(_seconds(audio))
+
                 if self._gpu:
                     # Greedy decode, no context carry-over, single
                     # temperature (no fallback retries), no timestamp
-                    # tokens — fast text-only preview.
+                    # tokens — fast text-only preview. The token cap is new:
+                    # the preview runs several times a second while he is
+                    # still talking, and an unbounded pass here holds the
+                    # model lock the final decode is waiting on.
                     result = self._model.transcribe(
                         audio,
                         initial_prompt=self._prompt(),
@@ -435,10 +625,12 @@ class Transcriber:
                         temperature=0.0,
                         without_timestamps=True,
                         fp16=True,
+                        sample_len=budget,
                     )
                     return (result.get("text") or "").strip()
 
-                kwargs = dict(beam_size=1, initial_prompt=self._prompt())
+                kwargs = dict(beam_size=1, initial_prompt=self._prompt(),
+                              max_new_tokens=budget)
                 if lang is not None:
                     kwargs["language"] = lang
 
