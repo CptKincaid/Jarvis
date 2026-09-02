@@ -21,9 +21,12 @@ Only when zero tools ran in the turn: a turn that ran a tool is trusted.
 Real JarvisBrain over the FakeOllama seam (tests/test_brain_tools.py),
 both the plain and the streamed paths. No Ollama, no network, no audio.
 """
+import time
+
 import pytest
 
 import jarvis.brain as brain_mod
+from tests.test_app_wiring import build, paths, seams  # noqa: F401  (fixtures)
 from tests.test_brain_tools import (FakeContext, FakeMemory, FakeOllama,  # noqa: F401
                                     brain, make_registry, text_reply, tool_reply)
 
@@ -77,9 +80,38 @@ def test_action_claims_are_recognised(line, claim):
     "Resumed, sir.",                                 # a tool's own line
     "I've been meaning to ask about the thesis.",    # 've + not an action verb
     "I'm afraid I can't reach Spotify, sir.",
+    # ---- the shapes that WEAR a claim and make none (2026-09-02 review).
+    # A false positive costs a wasted model round and, when the retry says
+    # the same thing, replaces a TRUE sentence with the apology -- so the
+    # negation, the hedge and the idiom are all vetoes.
+    "Nothing has been added to your list, sir.",      # the claim, negated
+    "No music is on, sir.",
+    "I don't think the music is on, sir.",
+    "Nothing is added to your calendar yet.",
+    "I'm moving on to the next point, sir.",         # idiom, acts on nothing
+    "I'm moving on.",
+    "I'm turning forty this year, sir.",
+    "I'm setting aside the question of cost.",
+    "I'm stopping there, sir.",
+    "I'm starting afresh, sir.",
+    "In the film, he's playing now at the Odeon.",   # not Jarvis, not music
+    "I've added a note about it in my head.",        # hedged: nothing done
+    "I've cleared my afternoon in theory.",
 ])
 def test_ordinary_replies_are_not_claims(line):
     assert brain_mod.unbacked_claim(line) is None
+
+
+@pytest.mark.parametrize("line, claim", [
+    # the vetoes are narrow: the same verbs on a real object still count
+    ("I'm turning on the lights, sir.", "I'm turning"),
+    ("I'm putting on some jazz.", "I'm putting"),
+    ("I'm moving your three o'clock to four.", "I'm moving"),
+    ("I've cleared your afternoon, sir.", "I've cleared"),
+    ("Milk is added to your shopping list.", "added to your"),
+])
+def test_the_vetoes_do_not_swallow_real_claims(line, claim):
+    assert brain_mod.unbacked_claim(line) == claim
 
 
 def test_the_claiming_sentences_are_replaced_and_the_rest_kept():
@@ -158,6 +190,63 @@ def test_a_reply_with_no_claim_costs_nothing(setup, caplog):
     assert tags == [("SPEAK", "Good evening, Ali and Heather; a pleasure.")]
     assert len(fake.chat_payloads()) == 1
     assert _warnings(caplog) == []
+
+
+# ------------------------------------------------ a question is not an order
+# 2026-09-02 review, on the real brain: the guard was armed on EVERY turn
+# that had tools, so a QUESTION whose honest answer is a past-tense report
+# ("did you set my timer?" -> "Yes, sir, I've set your timer") tripped it,
+# and the retry -- told "use the tools now" -- went and did the thing. A
+# question that performs the action it asks about is worse than the
+# narration this guard exists to catch, so the guard now stands down
+# whenever the utterance ASKS (router.is_question) instead of ordering.
+@pytest.mark.parametrize("asked", [
+    "did you already add milk to my list?",
+    "did you set my timer for ten minutes",
+    "have you sent that email?",
+    "is the music still on?",
+    "is there anything on my list?",
+    "what did you do with my shopping list",
+])
+def test_a_question_is_answered_never_acted_on(setup, caplog, asked):
+    """The model answers a question by narrating what it believes already
+    happened; a retry must not turn that answer into a write."""
+    b, fake, record = setup
+    fake.replies = [text_reply("Yes, sir. I've added milk to your list already."),
+                    tool_reply(("notes", {"action": "add", "text": "milk"}))]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(asked)
+    assert record == []                       # nothing was written
+    assert tags == [("SPEAK", "Yes, sir. I've added milk to your list already.")]
+    assert len(fake.chat_payloads()) == 1     # no retry was spent
+    assert _warnings(caplog) == []
+
+
+def test_a_polite_request_in_question_form_is_still_an_order(setup, caplog):
+    """"Can you add milk to my list?" is an instruction wearing a question
+    mark -- the router's own rule -- so the guard stays armed for it."""
+    b, fake, record = setup
+    fake.replies = [text_reply(REPLY),
+                    tool_reply(("notes", {"action": "add", "text": "milk"}))]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync("Can you add milk to my shopping list?")
+    assert record == [("notes", "add", "milk")]
+    assert tags == [("SPEAK", "Noted, sir.")]
+    assert _warnings(caplog) == [
+        "brain: unbacked action claim \"I've added\" (no tool ran)"]
+
+
+def test_a_true_negative_answer_is_not_replaced(setup, caplog):
+    """An ORDER whose honest answer contains "added to your" -- negated.
+    The claim table must not fire on it: the retry would cost a round and
+    the apology would replace a true sentence."""
+    b, fake, record = setup
+    line = "Nothing has been added to your list yet, sir."
+    fake.replies = [text_reply(line)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync("read me my shopping list")
+    assert tags == [("SPEAK", line)]
+    assert len(fake.chat_payloads()) == 1 and _warnings(caplog) == []
 
 
 def test_a_turn_that_ran_a_tool_is_trusted(setup, caplog):
@@ -284,3 +373,34 @@ def test_a_streamed_reply_with_no_claim_is_untouched(streamed, caplog):
     assert tags == [("STREAMED", "2"),
                     ("SPEAK", "It is ten past nine, sir. The evening is clear.")]
     assert fake.chat_payloads() == [] and _warnings(caplog) == []
+
+
+# ------------------------------------------------------------- the app
+def test_a_question_writes_nothing_on_the_real_app(build, monkeypatch):  # noqa: F811
+    """The blocker, on the REAL wiring: a real JarvisApp, a real
+    Timekeeper, a real registry, and only Ollama's HTTP seam scripted.
+    "did you set my timer for ten minutes" is a READ; the model answers it
+    by narrating, and the model would gladly call set_timer if the guard
+    asked it to. Nothing may be scheduled by a question."""
+    app = build()
+    del app.brain.chat                    # the wiring fixture stubs it
+    replies = [{"content": "Yes, sir. I've set your timer for ten minutes."},
+               {"content": "", "tool_calls": [{"function": {
+                   "name": "set_timer",
+                   "arguments": {"minutes": 10, "label": "timer"}}}]}]
+    seen = []
+
+    def fake_http(path, payload=None, timeout=None):
+        seen.append(payload)
+        return {"message": replies[min(len(seen) - 1, len(replies) - 1)]}
+    monkeypatch.setattr(brain_mod, "_http", fake_http)
+
+    app.brain.chat("did you set my timer for ten minutes",
+                   callback=app._on_brain_tags)
+    end = time.time() + 10
+    while time.time() < end and not app.tts.spoken:
+        time.sleep(0.02)
+    time.sleep(0.05)
+    assert app.tts.spoken == ["Yes, sir. I've set your timer for ten minutes."]
+    assert app.timekeeper.list("timer") == []          # nothing was scheduled
+    assert len(seen) == 1                              # and no retry was spent

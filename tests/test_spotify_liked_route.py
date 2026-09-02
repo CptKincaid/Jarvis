@@ -77,6 +77,18 @@ def _only_forced(svc):
     ("play my liked songs shuffled", True),
     ("play my liked songs randomly", True),
     ("play my liked songs in shuffle mode", True),
+    # 2026-09-02 review: these ASK for shuffle and missed the matcher, and
+    # a miss is not neutral any more -- the model's shuffle is reserved, so
+    # the fall-through played them in order and said "newest first". The
+    # verb list and the tail vocabulary now cover them.
+    ("put my liked songs on shuffle please", True),
+    ("shuffle play my liked songs", True),
+    ("play my liked songs but shuffle them", True),
+    ("play my liked songs in a random order", True),
+    ("play my liked songs in random order", True),
+    ("queue my liked songs", False),
+    ("stick my liked songs on", False),
+    ("throw on my liked songs", False),
 ])
 @pytest.mark.parametrize("source", ["voice", "typed"])
 def test_liked_songs_phrasings_force_the_tool_with_shuffle_from_the_words(
@@ -223,6 +235,49 @@ def test_a_model_that_sends_shuffle_true_still_plays_newest_first(liked_brain, c
     assert f'tool spotify_liked {{"shuffle": true}} -> ok=True {ORDER_LINE[:80]}' in said
 
 
+@pytest.mark.parametrize("said,shuffled", [
+    # phrasings the Tier-1 matcher does not claim (a question, a compound,
+    # a shape nobody thought of): the model picks the tool, and the WORDS
+    # still decide the mode -- the model's own guess never does.
+    ("put on the songs I like, shuffled, and tell me the weather", True),
+    ("I'd love to hear my liked songs at random", True),
+    ("what's in my liked songs? play them, newest first", False),
+    ("I'd love to hear my liked songs", False),
+])
+def test_the_model_path_reads_shuffle_off_the_utterance(liked_brain, said, shuffled):
+    """2026-09-02 review: reserving ``shuffle`` closed the model's vote on
+    it, so a phrasing the Tier-1 route missed played newest-first however
+    plainly he asked for shuffle. The spec's deriver reads his words on the
+    model path too, so a missed match can no longer invert the mode."""
+    b, ollama, fake_sp, reg = liked_brain
+    from jarvis.commander import liked_songs_kind as kind
+    assert not kind(said.lower()), "this phrasing must MISS the Tier-1 route"
+    ollama.replies = [tool_reply(("spotify_liked", {"shuffle": not shuffled}))]
+    tags = b._chat_sync(said)
+    assert tags == [("SPEAK", SHUFFLE_LINE if shuffled else ORDER_LINE)]
+    # in-order play clears the player's sticky shuffle first; shuffled play
+    # is client-side (the URIs are shuffled) and leaves the flag alone
+    assert fake_sp.named("shuffle") == ([] if shuffled else
+                                        [((False,), {"device_id": "dev-hp"})])
+
+
+def test_the_configured_default_still_answers_when_he_says_neither(liked_brain, tmp_path):
+    """No shuffle word either way on the model path: the deriver says
+    nothing and spotify.liked_shuffle decides, as it always did."""
+    b, ollama, fake_sp, reg = liked_brain
+    ollama.replies = [tool_reply(("spotify_liked", {}))]
+    assert b._chat_sync("I'd love to hear my liked songs") == [("SPEAK", ORDER_LINE)]
+    # the same turn with the old habit configured back on
+    reg2 = ToolRegistry()
+    reg2.register_many(make_tool(
+        tmp_path, fake_sp,
+        cfg={"spotify": {**CFG["spotify"], "liked_shuffle": True}}).tools())
+    fake_sp.calls.clear()
+    ollama.replies = [tool_reply(("spotify_liked", {}))]
+    assert reg2.call("spotify_liked", {}, from_model=True,
+                     utterance="I'd love to hear my liked songs").speak == SHUFFLE_LINE
+
+
 def test_the_forced_call_keeps_the_commanders_shuffle(liked_brain):
     """force_args are the utterance's, so they are trusted whole: "shuffle
     my liked songs" shuffles, "play my liked songs" does not, and neither
@@ -282,3 +337,9 @@ def test_the_spoken_command_reaches_the_forced_call_through_the_app(build):  # n
     assert spec is not None and spec.reserved == frozenset({"shuffle"})
     assert "shuffle" not in spec.parameters["properties"]
     assert "shuffle" not in spec.description.lower()
+    # ...and the model path that the route does not claim reads his words
+    # itself: the registered spec carries the deriver, not just the ban
+    assert spec.derive is not None
+    assert spec.derive("play my liked songs shuffled") == {"shuffle": True}
+    assert spec.derive("play my liked songs newest first") == {"shuffle": False}
+    assert spec.derive("play my liked songs") == {}

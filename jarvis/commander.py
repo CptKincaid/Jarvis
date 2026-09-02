@@ -3640,7 +3640,16 @@ _LIKED_WHAT_RX = (
     r"(?:songs|tracks|music)\s+(?:that\s+)?i(?:'ve|\s+have)?\s+(?:liked|saved))")
 _LIKED_RX = re.compile(
     r"^(?:(?:please|can you|could you|would you|go ahead and)[\s,]+)*"
-    r"(?:(?:play|put on|start|shuffle|queue up|stick on|throw on)\s+)?"
+    # The verb list is a door, not a filter: a phrasing that misses it does
+    # NOT fall back to a model that can honour "on shuffle" -- the model's
+    # shuffle is reserved -- so "put my liked songs on shuffle" landed on
+    # the newest-first default and was announced as such (2026-09-02
+    # review).  Bare "put"/"queue"/"stick"/"throw", the trailing particle,
+    # and a leading "shuffle play" are all in now; the utterance-derived
+    # fallback in the tool spec (jarvis/tools/spotify.py) covers the rest.
+    r"(?:(?:shuffle|randomly)\s+)?"
+    r"(?:(?:play|put|start|shuffle|queue|stick|throw|fire\s+up)"
+    r"(?:\s+(?:on|up))?\s+)?"
     r"(?:(?:all\s+)?(?:of\s+)?(?:my|the|our)\s+)?(?:spotify\s+)?"
     + _LIKED_WHAT_RX +
     r"(?:\s+(?:playlist|collection))?(?:\s+on\s+spotify)?"
@@ -3650,9 +3659,15 @@ _LIKED_RX = re.compile(
 # one phrase here, where _INORDER_RX would take "in the order" and leave
 # "i added them" behind as a stranger.
 _LIKED_FILLER_RX = re.compile(
-    r"\b(?:please|now|for me|thanks|thank you|and|then|them|it|from the top|"
+    r"\b(?:please|now|for me|thanks|thank you|and|but|then|them|it|from the top|"
     r"from the start|from the beginning|"
     r"in the order (?:that )?(?:i|they were) (?:added|saved|liked)(?: them)?|"
+    # "in a random order": the shuffle word is read off the WHOLE utterance
+    # by wants_shuffle, so the phrase only has to leave the tail empty
+    r"in\s+(?:a|an|any)?\s*(?:random|shuffled|mixed[- ]up)\s+order|"
+    # "stick my liked songs ON", "turn them back ON" -- a trailing particle,
+    # never the "on" of "on my phone" (the device match runs after this)
+    r"(?:back\s+)?on(?=\s*$)|"
     r"(?:on|in|with)\s+(?:shuffle|random)(?:\s+mode)?|shuffle mode)\b", re.I)
 # "on my phone" / "on hpcomputer" / "on the computer": the device is
 # matched case-insensitively by the tool (_match_device runs _norm), so the

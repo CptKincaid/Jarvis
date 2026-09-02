@@ -83,6 +83,16 @@ class ToolSpec:
     # the args came from the model, so a model that guesses them anyway
     # still cannot override the caller's default.
     reserved: frozenset = frozenset()
+    # derive(utterance) -> dict: arguments read off HIS WORDS rather than
+    # off the model's guess, applied to model calls only (call() below).
+    # Reserving a key takes the model's vote away, which makes the
+    # commander's Tier-1 route the only thing left that can say yes -- so a
+    # phrasing the matcher misses gets the default in silence. spotify_liked
+    # is the case: "put my liked songs on shuffle please" missed the route,
+    # the model's shuffle=true was dropped, and it played newest-first and
+    # SAID so (2026-09-02 review). With a deriver the words decide either
+    # way, whichever door the turn came through.
+    derive: Optional[Callable[[str], dict]] = None
 
     def schema(self) -> dict:
         """Ollama /api/chat `tools` entry."""
@@ -190,16 +200,18 @@ class ToolRegistry:
         return state
 
     def call(self, name: str, args: Optional[dict] = None, *,
-             from_model: bool = False) -> ToolResult:
+             from_model: bool = False,
+             utterance: str = "") -> ToolResult:
         """Never raises: unknown tools and handler exceptions become an
         ok=False result the model can explain. args may arrive as a JSON
         string (some models emit arguments that way).
 
         ``from_model=True`` marks args the model wrote (the brain's tool
-        loop); the spec's ``reserved`` keys are dropped from those. Forced
-        calls from the commander leave it False and keep every key -- the
-        commander decided them from the utterance, which is the one thing
-        the model never gets to see (registry.call carries args only)."""
+        loop); the spec's ``reserved`` keys are dropped from those and its
+        ``derive`` reads ``utterance`` in their place. Forced calls from the
+        commander leave it False and keep every key -- the commander already
+        decided them from the utterance, and a second reading must not
+        overrule the first."""
         spec = self._tools.get(name)
         if spec is None or spec.handler is None:
             return ToolResult(text=f"no such tool: {name}", ok=False)
@@ -220,6 +232,20 @@ class ToolRegistry:
                          name, json.dumps(dropped, default=str)[:120])
                 args = {k: v for k, v in args.items()
                         if k not in spec.reserved}
+        if from_model and spec.derive is not None:
+            # After the strip, so a deriver always wins over the model --
+            # and it runs even with no utterance in hand, where it answers
+            # for "he said nothing" (spotify_liked: shuffle=None, the
+            # configured default).
+            try:
+                extra = spec.derive(utterance or "") or {}
+            except Exception:               # noqa: BLE001 - tool boundary
+                log.exception("tool %s: derive failed", name)
+                extra = {}
+            if extra:
+                log.info("tool %s: %s from the utterance", name,
+                         json.dumps(extra, default=str)[:120])
+                args = {**args, **extra}
         try:
             result = spec.handler(**args)
         except TypeError as exc:           # bad/missing arguments

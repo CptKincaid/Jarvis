@@ -625,6 +625,27 @@ _QUESTION_RX = re.compile(
     r"module|file|error|traceback|test|tests|script|bug|change|changes|diff|"
     r"repo|codebase|pr))|recommend|suggest|convert \d|calculate|compute|"
     r"translate|spell|pronounce|i wonder|i'm curious|curious)\b", re.I)
+# "Can you add milk to my list?" wears a question mark and means DO IT --
+# the same exclusion _QUESTION_RX opens with, spelled out here so a caller
+# can apply it to a sentence that ends in '?' without a leading wh-word.
+_POLITE_ORDER_RX = re.compile(
+    r"^\s*(?:please\s+|jarvis[\s,]+)*(?:can|could|would|will|should)\s+you\b",
+    re.I)
+
+
+def is_question(text: str) -> bool:
+    """Does the utterance ASK rather than ORDER?
+
+    ``analyse().question`` answers the same thing for ROUTING and must keep
+    doing it exactly as it does; this is the utterance-level rule callers
+    outside the router want (jarvis/brain.py's unbacked-action guard, which
+    must never retry -- and so never execute -- a question). It adds the
+    trailing '?' that routing does not need: "you already added milk?" is a
+    question with no wh-word in front of it."""
+    t = str(text or "").strip()
+    if not t or _POLITE_ORDER_RX.match(t):
+        return False
+    return bool(_QUESTION_RX.match(t) or t.endswith("?"))
 
 
 @dataclass

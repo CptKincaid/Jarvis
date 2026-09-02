@@ -50,6 +50,7 @@ from pathlib import Path
 from jarvis.config import MACHINE
 from jarvis.events import BrainState, Status, bus
 from jarvis.logs import get_logger
+from jarvis.router import is_question
 from jarvis.tts import TTS as _TTS
 
 log = get_logger("brain")
@@ -250,15 +251,25 @@ PARTIAL_RESULT_LINE = ("That's only part of it, sir; there was more than I "
 # confidence.
 #
 # The guard below is deliberately narrow: it looks only at a turn in which
-# NO tool ran, and only for a first-person claim to have done something.
+# NO tool ran, only at a turn where he ORDERED something rather than asked
+# (the retry EXECUTES, and a question that performs the action it asks
+# about is worse than the narration this catches), and only for a
+# first-person claim to have done something -- with the negation, the
+# hedge and the idiom vetoed, since a claim wrongly found costs a model
+# round and replaces a true sentence with an apology.
 # A turn that ran a tool is trusted -- the tool did what it did and the
 # model is reading from its result. On a hit the model gets ONE more round
 # with this line appended (the same per-turn-messages mechanism as
 # RENDER_NOW_LINE: the system prefix must stay byte-identical); a retry
 # that still runs no tool has its claiming sentences replaced with
 # UNBACKED_LINE, the honest sentences (the greeting) kept.
-UNBACKED_NUDGE = ("[You described actions you did not perform. Use the "
-                  "tools now; do not narrate actions.]")
+# The nudge names the two ways out, and the second one is deliberate: a
+# model told only "use the tools now" will find SOMETHING to run, and the
+# turn that earned the nudge is the wrong place to invent work.
+UNBACKED_NUDGE = ("[You described actions you did not perform. If I asked "
+                  "you to do something, use the tools and do it now. If I "
+                  "only asked a question, answer it without saying you did "
+                  "anything.]")
 UNBACKED_LINE = "I couldn't do that part, sir."
 _ACTION_CLAIM_RX = re.compile(
     r"\b(?:"
@@ -276,18 +287,65 @@ _ACTION_CLAIM_RX = re.compile(
     # "your timer is set", "the music is on", "playing now". Kept to the
     # shapes of a DONE action: this guard is for actions the model says it
     # took, not for answers ("now playing: ...") it may have got wrong.
+    # "playing now" only at the head of a sentence -- bare, it also caught
+    # "In the film, he's playing now at the Odeon."
     r"|\badded to (?:your|the)\b|\b(?:your|the) (?:timer|alarm|reminder) is "
     r"(?:set|going|running)\b|\b(?:the |your )?music is (?:on|playing|back on)\b|"
-    r"\bplaying now\b"
+    r"(?:^|(?<=[.!?] ))playing now\b"
     r")", re.I)
+# Three vetoes, all found by replaying ordinary English through the table
+# (2026-09-02 review). A false positive is not free: it spends an extra
+# model round on a turn that had already answered, and if the retry says
+# the same true thing, UNBACKED_LINE replaces a TRUE sentence.
+#
+# 1. NEGATION earlier in the same sentence scopes the claim -- "Nothing has
+#    been added to your list, sir." is the ANSWER to "what's on my list",
+#    and it was being called a lie.
+_CLAIM_NEGATED_RX = re.compile(
+    r"\b(?:no|not|nothing|nobody|none|never|neither|nor|without|yet to|"
+    r"(?:do|does|did|have|has|had|is|are|was|were|wo|ca|could|would|should)"
+    r"n['’]t)\b", re.I)
+# 2. A HEDGE unsays it in the same breath: nothing was done and the model
+#    is not pretending otherwise.
+_CLAIM_HEDGE_RX = re.compile(
+    r"\b(?:in my head|in theory|in principle|hypothetically|figuratively|"
+    r"so to speak|in a manner of speaking|on paper)\b", re.I)
+# 3. An IDIOM wears the verb and acts on nothing: "I'm moving on to the
+#    next point", "I'm turning forty", "I'm setting aside the question",
+#    "I'm stopping there". Matched against what FOLLOWS the claim, so the
+#    same verbs with a real object still count ("I'm turning on the
+#    lights", "I'm putting on some jazz", "I'm moving your three o'clock").
+_CLAIM_IDIOM_RX = re.compile(
+    r"^\s*(?:on(?:to|\s+to|\s+from)\b|on[\s,.;!]*$|onwards?\b|aside\b|"
+    r"ahead\b|forwards?\b|afresh\b|anew\b|short\b|there\b|here\b|"
+    r"(?:\d+|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b)", re.I)
+
+
+def _sentence_claim(sent):
+    """The action claim in ONE sentence, or None: a table hit that none of
+    the three vetoes above disqualifies."""
+    if _CLAIM_HEDGE_RX.search(sent or ""):
+        return None
+    for m in _ACTION_CLAIM_RX.finditer(sent or ""):
+        if _CLAIM_NEGATED_RX.search(sent[:m.start()]):
+            continue
+        if _CLAIM_IDIOM_RX.match(sent[m.end():]):
+            continue
+        return m.group(0)
+    return None
 
 
 def unbacked_claim(text):
     """The first first-person action claim in ``text`` ("I've added ...",
     "I'm starting ..."), else None. Pure; the caller decides whether a
-    tool backs it."""
-    m = _ACTION_CLAIM_RX.search(text or "")
-    return m.group(0) if m else None
+    tool backs it. Judged one sentence at a time, because both the
+    negation that cancels a claim and the idiom that was never one live
+    inside the sentence that carries them."""
+    for sent in split_sentences(text or ""):
+        claim = _sentence_claim(sent)
+        if claim:
+            return claim
+    return None
 
 
 def strip_unbacked_claims(text, n=None):
@@ -299,7 +357,7 @@ def strip_unbacked_claims(text, n=None):
     Unchanged text when nothing claims anything."""
     kept, said = [], False
     for sent in split_sentences(text):
-        if _ACTION_CLAIM_RX.search(sent):
+        if _sentence_claim(sent):
             if not said:
                 kept.append(UNBACKED_LINE)
                 said = True
@@ -2176,11 +2234,24 @@ class JarvisBrain:
         # The unbacked-action guard (UNBACKED_NUDGE): armed only when the
         # model HAS tools to act with -- a claim in a turn with no tools on
         # offer is not something a retry can fix, and the forced path above
-        # already ran one. `unbacked_first` holds the reply the retry was
-        # asked to make good on; `plain_round` takes the retry off the
-        # stream, because the first reply's honest sentences were already
-        # spoken and the retry's words are either tool calls or discarded.
-        unbacked_armed = registry is not None and bool(tools)
+        # already ran one -- and only when he ORDERED something.
+        #
+        # The question half is not a nicety: the retry EXECUTES. "Did you
+        # already add milk to my list?" answered "Yes, sir, I've added
+        # milk" is a correct answer to a question, and arming the guard on
+        # it made the retry go and add the milk -- the question performing
+        # the action it asked about (2026-09-02 review, on the real brain).
+        # A model that narrates instead of acting on a QUESTION has told
+        # him something possibly wrong; a guard that writes on a question
+        # is worse than the thing it was built to catch, so questions get
+        # the reply as it stands.
+        #
+        # `unbacked_first` holds the reply the retry was asked to make good
+        # on; `plain_round` takes the retry off the stream, because the
+        # first reply's honest sentences were already spoken and the
+        # retry's words are either tool calls or discarded.
+        unbacked_armed = (registry is not None and bool(tools)
+                          and not is_question(text))
         unbacked_first = None
         plain_round = False
 
@@ -2328,7 +2399,12 @@ class JarvisBrain:
                     # from_model: the registry strips each spec's reserved
                     # keys here and ONLY here -- the forced path above is
                     # the commander's, and its args are the utterance's.
-                    result = registry.call(name, args, from_model=True)
+                    # The utterance rides along so a spec that reserves a
+                    # key can still read it off HIS words (ToolSpec.derive):
+                    # taking a knob away from the model must not mean the
+                    # words lose it too.
+                    result = registry.call(name, args, from_model=True,
+                                           utterance=text)
                     note(result, name, args)
                     messages.append(tool_message(result, name))
                     ran += 1

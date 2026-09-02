@@ -346,6 +346,16 @@ def wants_shuffle(text: Any, default: Optional[bool] = None) -> Optional[bool]:
     return default
 
 
+def _liked_from_words(utterance: Any) -> dict:
+    """``{"shuffle": ...}`` when the utterance says which way, else ``{}``.
+
+    ToolSpec.derive for spotify_liked: the model-path twin of the
+    commander's force_args, so a Liked-Songs turn that reaches the model
+    still shuffles when (and only when) he asked."""
+    said = wants_shuffle(utterance)
+    return {} if said is None else {"shuffle": said}
+
+
 def split_device(query: Any) -> tuple[str, Optional[str]]:
     """Peel a trailing 'on my phone' / 'on HPCOMPUTER' off a query when the
     model left it in.  Only known device words or a device-looking token."""
@@ -1417,12 +1427,25 @@ class SpotifyTool:
             # the one place that sets it, from wants_shuffle(<what he said>),
             # through force_args, which the registry does not filter.  The
             # handler keeps the keyword for exactly that caller.
+            #
+            # ...and ``derive`` is the same rule for the turns that route
+            # never sees.  Taking the knob off the model left a hole: a
+            # phrasing the matcher missed ("put my liked songs on shuffle
+            # please", a compound, a question that ends in "play them")
+            # played newest-first and ANNOUNCED newest-first, however
+            # plainly he had asked -- the reported bug, mirrored
+            # (2026-09-02 review).  The registry calls this with the
+            # utterance on model calls only, after the reserved strip, so
+            # his words decide the mode whichever door the turn came
+            # through, and the model's guess decides nothing anywhere.
+            # Nothing said either way -> no key -> spotify.liked_shuffle.
             ToolSpec("spotify_liked",
                      "Play Hunter's Liked Songs on Spotify, newest added first.",
                      {"type": "object",
                       "properties": {"device": {"type": "string"}}},
                      self._guard(liked),
-                     reserved=frozenset({"shuffle"})),
+                     reserved=frozenset({"shuffle"}),
+                     derive=_liked_from_words),
             # "device" was missing from this schema, so the model had no way
             # to see that moving playback was on offer; asked to "play it on my
             # phone" it invented "I have no way of reaching it" instead of

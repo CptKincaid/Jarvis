@@ -142,6 +142,66 @@ def test_reserved_args_are_dropped_from_json_string_model_calls(caplog):
     assert not [r for r in caplog.records if "reserved" in r.getMessage()]
 
 
+# ------------------------------------------- args derived from the words
+# Reserving a key closes the model's vote on it, which leaves a hole: the
+# COMMANDER route is then the only thing that can say yes, and a phrasing
+# its matcher misses silently gets the default (2026-09-02 review -- "put
+# my liked songs on shuffle please" played in order and said "newest
+# first"). ``derive`` fills that hole: on a model call the spec reads the
+# utterance itself, after the reserved keys are stripped.
+def _derive_reg(seen, derive):
+    reg = ToolRegistry()
+
+    def handler(device="", shuffle=None, **_):
+        seen.append({"device": device, "shuffle": shuffle})
+        return ToolResult(text="ok")
+
+    reg.register(ToolSpec("liked", "Play the liked songs.",
+                          {"type": "object",
+                           "properties": {"device": {"type": "string"}}},
+                          handler, reserved=frozenset({"shuffle"}),
+                          derive=derive))
+    return reg
+
+
+def test_derived_args_replace_the_models_on_model_calls(caplog):
+    seen = []
+    reg = _derive_reg(seen, lambda t: {"shuffle": "shuffle" in (t or "")})
+    with caplog.at_level("INFO"):
+        reg.call("liked", {"shuffle": False}, from_model=True,
+                 utterance="put my liked songs on shuffle please")
+    assert seen == [{"device": "", "shuffle": True}]
+    said = [r.getMessage() for r in caplog.records if "utterance" in r.getMessage()]
+    assert said == ['tool liked: {"shuffle": true} from the utterance']
+    # no utterance to read (a channel that has none): the handler's own
+    # default stands, exactly as before
+    seen.clear()
+    reg.call("liked", {}, from_model=True)
+    assert seen == [{"device": "", "shuffle": False}]
+
+
+def test_derive_never_touches_a_forced_call():
+    """force_args ARE the utterance's, decided by the commander: a second
+    reading of the words must not overrule the first."""
+    seen = []
+    reg = _derive_reg(seen, lambda t: {"shuffle": True})
+    reg.call("liked", {"shuffle": False}, utterance="shuffle my liked songs")
+    assert seen == [{"device": "", "shuffle": False}]
+
+
+def test_a_deriver_that_raises_is_not_a_failed_tool_call(caplog):
+    seen = []
+
+    def boom(_text):
+        raise RuntimeError("kaboom")
+
+    reg = _derive_reg(seen, boom)
+    with caplog.at_level("ERROR"):
+        res = reg.call("liked", {}, from_model=True, utterance="anything")
+    assert res.ok and seen == [{"device": "", "shuffle": None}]
+    assert any("derive" in r.getMessage() for r in caplog.records)
+
+
 def test_a_spec_that_advertises_a_reserved_arg_is_a_warned_drift(caplog):
     """Reserved AND in the schema invites the model to send an argument
     call() will drop -- register() says so once, at boot."""
