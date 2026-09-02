@@ -5371,12 +5371,24 @@ def _h_room_tone(c, t, m):
 # (tests/test_offline_mode.py asserts it by reading their source): the
 # switch is spoken off again, so gating the mic would make it one-way.
 _SENSE_NOUN = (r"(?:the\s+|my\s+|your\s+)?"
-               r"(?:cameras?|webcams?|web\s?cams?|sensors?|radar|"
+               r"(?:cameras?|webcams?|web\s?cams?|sensors?|sensing|radar|"
                r"presence(?:\s+(?:sensor|sensing|detection))?|"
                r"lens(?:es)?|eyes)")
+# "Turn off the camera and the radar" is ONE order, not a sentence this
+# family may drop on the floor because it names both sensors.
+_SENSE_NOUNS = _SENSE_NOUN + r"(?:\s+and\s+" + _SENSE_NOUN + r")?"
 _SENSE_MODE = r"(?:offline|privacy)"
+# He puts the politeness in FRONT at least as often as behind ("please stop
+# watching", "can you stop watching"), and the whole reason this family is
+# Tier 1 is that a privacy order must never reach a model that cannot
+# switch a sensor. A leading modal is the cheapest way to lose one.
+_SENSE_ASK = r"(?:please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
 # Whisper writes the vocative with a comma, so the tail takes [,\s].
 _SENSE_TAIL = r"(?:[,\s]+(?:please|now|sir))*[?.!\s]*$"
+# "No sensors tonight" is the same order as "no sensors": off until he says
+# otherwise. Deliberately NOT read as a window -- inventing an end time is
+# the one direction that puts a lens back on by itself.
+_SENSE_OFF_TAIL = r"(?:[,\s]+(?:please|now|sir|tonight|today))*[?.!\s]*$"
 
 _SENSING_STATUS_RX = re.compile(
     r"^" + _JV + r"(?:"
@@ -5410,51 +5422,62 @@ _SENSING_CURFEW_RX = re.compile(
     r")" + _SENSE_TAIL, re.I)
 
 _SENSING_HOLD_RX = re.compile(
-    r"^" + _JV + r"(?:"
+    r"^" + _JV + _SENSE_ASK + r"(?:"
     r"(?:keep|leave)\s+" + _SENSE_NOUN + r"\s+(?:off|down)\s+"
     r"(?P<mode1>for|until|till|through)\s+(?P<when1>.+?)"
     r"|no\s+(?:more\s+)?(?:cameras?|sensors?|radar|watching)\s+"
     r"(?P<mode2>for|until|till|through)\s+(?P<when2>.+?)"
     r"|(?:turn|switch|shut)\s+(?:off\s+)?" + _SENSE_NOUN + r"(?:\s+off)?\s+"
     r"(?P<mode3>for|until|till|through)\s+(?P<when3>.+?)"
-    r"|(?:go\s+offline|offline\s+mode|privacy\s+mode)\s+"
+    r"|(?:go\s+offline|offline(?:\s+mode)?|privacy\s+mode)\s+"
     r"(?P<mode4>for|until|till|through)\s+(?P<when4>.+?)"
+    # "stop watching for ten minutes" -- the bare verb already goes off
+    # open-endedly, so without this the BOUNDED form was the one that fell
+    # through to the router.
+    r"|stop\s+(?:watching|looking|sensing|spying|staring)"
+    r"(?:\s+(?:at\s+)?(?:me|us|the\s+room|the\s+office))?\s+"
+    r"(?P<mode5>for|until|till|through)\s+(?P<when5>.+?)"
+    # ...and the verbless "camera off for an hour".
+    r"|(?:cameras?|sensors?|radar|presence|sensing)\s+(?:off|down)\s+"
+    r"(?P<mode6>for|until|till|through)\s+(?P<when6>.+?)"
     r")" + _SENSE_TAIL, re.I)
 
 _SENSING_OFF_RX = re.compile(
-    r"^" + _JV + r"(?:"
+    r"^" + _JV + _SENSE_ASK + r"(?:"
     r"go(?:ing)?\s+offline"
+    r"|go\s+dark"
     r"|" + _SENSE_MODE + r"\s+mode(?:\s+on)?"
     r"|(?:turn|switch|flip)\s+on\s+" + _SENSE_MODE + r"\s+mode"
     r"|(?:enable|activate|engage|start)\s+" + _SENSE_MODE + r"\s+mode"
     r"|(?:go|switch|drop|flip)\s+(?:in)?to\s+" + _SENSE_MODE + r"\s+mode"
     r"|(?:deactivate|disable|kill|stop|shut\s+down|shut\s+off|turn\s+off|"
-    r"switch\s+off|power\s+down|cut)\s+" + _SENSE_NOUN +
-    r"|(?:turn|switch|shut|power)\s+" + _SENSE_NOUN + r"\s+(?:off|down)"
+    r"switch\s+off|power\s+down|cut)\s+" + _SENSE_NOUNS +
+    r"|(?:turn|switch|shut|power)\s+" + _SENSE_NOUNS + r"\s+(?:off|down)"
     r"|stop\s+(?:watching|looking|sensing|spying|staring)"
     r"(?:\s+(?:at\s+)?(?:me|us|the\s+room|the\s+office))?"
     r"|(?:don'?t|do\s+not)\s+watch\s+(?:me|us|the\s+room)"
     r"|(?:close|shut)\s+your\s+eyes"
     r"|look\s+away"
     r"|no\s+(?:more\s+)?(?:cameras?|sensors?|watching|radar)"
-    r"|(?:cameras?|sensors?|radar|presence)\s+off"
-    r")" + _SENSE_TAIL, re.I)
+    r"|(?:cameras?|sensors?|radar|presence|sensing)\s+(?:off|down)"
+    r")" + _SENSE_OFF_TAIL, re.I)
 
 _SENSING_ON_RX = re.compile(
-    r"^" + _JV + r"(?:"
+    r"^" + _JV + _SENSE_ASK + r"(?:"
     r"(?:(?:come|go|get)\s+)?back\s+online"
     r"|(?:come|go|get)\s+online"
     r"|online\s+mode"
     r"|(?:turn|switch)\s+off\s+" + _SENSE_MODE + r"\s+mode"
     r"|(?:exit|leave|end|cancel|disable|stop|quit)\s+" + _SENSE_MODE + r"\s+mode"
     r"|" + _SENSE_MODE + r"\s+mode\s+off"
-    r"|(?:re-?activate|re-?enable|enable|resume|restore)\s+" + _SENSE_NOUN +
-    r"|(?:turn|switch|power)\s+on\s+" + _SENSE_NOUN +
-    r"|(?:turn|switch|power)\s+" + _SENSE_NOUN + r"\s+(?:back\s+)?on"
+    r"|(?:re-?activate|re-?enable|enable|resume|restore|start|wake)"
+    r"(?:\s+up)?\s+" + _SENSE_NOUNS +
+    r"|(?:turn|switch|power)\s+on\s+" + _SENSE_NOUNS +
+    r"|(?:turn|switch|power)\s+" + _SENSE_NOUNS + r"\s+(?:back\s+)?on"
     r"|start\s+watching(?:\s+(?:again|me|us|the\s+room|the\s+office))?"
     r"|(?:open|use)\s+your\s+eyes"
-    r"|(?:cameras?|sensors?|radar|presence)\s+(?:back\s+)?on"
-    r"|you\s+can\s+watch\s+(?:me|us|the\s+room)\s+again"
+    r"|(?:cameras?|sensors?|radar|presence|sensing)\s+(?:back\s+)?on"
+    r"|you\s+can\s+watch(?:\s+(?:me|us|the\s+room|the\s+office))?\s+again"
     r")" + _SENSE_TAIL, re.I)
 
 SENSING_NO_POLICY_LINE = ("I can't reach the sensing switch, sir — offline "
@@ -5464,6 +5487,7 @@ SENSING_NOTHING_LINE = "Nothing was sensing to stop."
 SENSING_UNSAVED_LINE = "I couldn't save that, so it won't hold if I restart."
 SENSING_CURFEW_SET_LINE = "Camera curfew is now {start} to {end}, sir."
 SENSING_CURFEW_OFF_LINE = "The camera curfew is off, sir."
+SENSING_CURFEW_OFF_FAIL_LINE = "I couldn't switch the curfew off, sir."
 SENSING_CURFEW_CLAUSE = "The camera stays off until {end} for the curfew."
 
 
@@ -5485,21 +5509,32 @@ def _sensing_end_words(hm) -> str:
 def _sensing_off_line(out, when_text: str = "") -> str:
     """What OFFLINE actually did -- never what it intended.
 
-    The three clauses that can appear are all failures he would otherwise
-    only discover by finding a camera light on: a device that did not
-    stop, a state file that did not save (so the next start comes up
-    online), and the honest "there was nothing to stop" on a box where
-    nothing is wired yet.
+    The clauses that can appear are all things he would otherwise only
+    discover by finding a camera light on: a device that did not stop, a
+    device that was only stopped as far as this process reaches (the
+    radar's live configuration -- no power switch wired, so it keeps
+    radiating and Jarvis merely stops asking), a state file that did not
+    save (so the next start comes up online), and the honest "there was
+    nothing to stop" on a box where nothing is wired yet.
     """
-    head = ("Offline, sir." if not when_text
-            else "Offline until %s, sir." % when_text)
-    parts = [head]
+    # The bound comes from the OUTCOME, not from what the caller asked
+    # for: disable() drops an 'until' that is not in the future, and a
+    # head reading "offline until 2:47" over an open-ended switch would be
+    # the one lie the whole family exists to avoid.
+    bounded = bool(when_text) and out.state.until is not None
+    parts = ["Offline until %s, sir." % when_text if bounded else "Offline, sir."]
     if out.stopped:
         names = _sensing_join(out.stopped)
         parts.append("%s%s %s down." % (names[0].upper(), names[1:],
                                         "are" if len(out.stopped) > 1 else "is"))
-    elif not out.failed:
+    elif not out.failed and not out.partial:
         parts.append(SENSING_NOTHING_LINE)
+    if out.partial:
+        parts.append("I've stopped reading %s, but %s power isn't switched, "
+                     "so %s still sensing the room." % (
+                         _sensing_join(out.partial),
+                         "their" if len(out.partial) > 1 else "its",
+                         "they're" if len(out.partial) > 1 else "it's"))
     if out.failed:
         parts.append("I couldn't stop %s, so %s still be running." % (
             _sensing_join(out.failed),
@@ -5687,7 +5722,11 @@ def _h_sensing_curfew(c, t, m):
     if pol is None:
         return _sensing_result(SENSING_NO_POLICY_LINE, "Offline mode: not wired")
     if m.group("off"):
-        pol.set_curfew(None, None)
+        # Checked, exactly like the set-window branch twenty lines below: a
+        # config that refused the write must not be spoken back as done.
+        if not pol.set_curfew(None, None):
+            return _sensing_result(SENSING_CURFEW_OFF_FAIL_LINE,
+                                   "Camera curfew: save failed")
         _sensing_publish(pol.state())
         return _sensing_result(SENSING_CURFEW_OFF_LINE, "Camera curfew off")
     current = pol.curfew() or (sensing_mod.DEFAULT_CURFEW_START,

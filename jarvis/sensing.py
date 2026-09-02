@@ -48,14 +48,30 @@ instruction and not a guess.
 Full walkthrough, including the wiring for a real radar power cut:
 ``docs/offline-mode.md``.
 
-ENFORCEMENT IS AT THE DEVICE. ``CameraGate`` never calls the opener while
-sensing is denied (a consumer that merely dropped frames would still have
-a lit camera light in the room), and ``RoomSensor.read`` issues no HTTP
-request at all -- its ``reads`` counter is the proof. ``disable()`` also
-STOPS what is already running, through the stoppers each device attached,
-and reports which ones actually stopped, which failed, and which were
-never there, so the spoken confirmation states what happened instead of
-what was intended.
+ENFORCEMENT IS AT THE DEVICE, AND IT RUNS ON THE CLOCK. ``CameraGate``
+never calls the opener while sensing is denied (a consumer that merely
+dropped frames would still have a lit camera light in the room), and
+``RoomSensor.read`` issues no HTTP request at all -- its ``reads`` counter
+is the proof. ``disable()`` also STOPS what is already running, through
+the stoppers each device attached.
+
+But the 21:00 curfew edge arrives with NOBODY having said anything, and a
+lens opened at 20:59 is still a lit camera at 21:01 if the only guard is
+``open()``. So ``enforce()`` walks the attached devices and stops the ones
+whose permission has just gone away (and resumes the ones it stopped once
+it comes back), and ``start()`` runs it on a daemon thread owned by this
+object -- deliberately NOT from the console's 5 s pass, because a lens
+must not stay open because the UI thread died or the window was never
+built.
+
+WHAT THE SPOKEN LINE MAY CLAIM. A switch reports which devices actually
+stopped, which failed, which were never there -- and which could only be
+stopped AS FAR AS THIS PROCESS REACHES (``POLLING_ONLY``). That last
+bucket is the live configuration today: with no ESPHome power switch
+wired, "offline" means Jarvis stops asking the radar, while the LD2410
+keeps radiating and keeps serving presence to the LAN. Saying "the radar
+is down" for that would be the exact overclaim this module exists to
+prevent.
 """
 from __future__ import annotations
 
@@ -101,6 +117,34 @@ CURFEW_END_CHOICES = ("05:00", "05:30", "06:00", "06:30", "07:00",
 
 STATE_VERSION = 1
 MAX_STATE_BYTES = 4096         # the record is ~120 bytes; anything else is wrong
+
+# How often the clock-driven guard walks the devices. The curfew is
+# minute-granular, so this bounds how long a lens opened at 20:59 can stay
+# open past 21:00; the pass itself is a clock read and a dict lookup, so
+# the cost of making that bound small is nil.
+DEFAULT_ENFORCE_S = 15.0
+
+
+class _PollingOnly:
+    """The return value of a ``stop()`` that could only stop the POLLING.
+
+    TRUTHY, so a caller that just wants "did the stop work" still reads it
+    as yes, but distinguishable from ``True`` where the difference is the
+    whole point: the radar has no power switch wired on this box, so
+    "offline" stops Jarvis asking and leaves the LD2410 radiating. The
+    spoken line has to be able to say which of the two happened.
+    """
+
+    __slots__ = ()
+
+    def __bool__(self) -> bool:
+        return True
+
+    def __repr__(self) -> str:            # pragma: no cover - debugging aid
+        return "POLLING_ONLY"
+
+
+POLLING_ONLY = _PollingOnly()
 
 
 # ------------------------------------------------------------ clock helpers
@@ -168,6 +212,11 @@ class Outcome:
     resumed: tuple = ()               # devices brought back by enable()
     failed: tuple = ()                # present, and the switch did not work
     absent: tuple = ()                # attached but not physically there
+    # Stopped only as far as this process reaches: the polling stopped, the
+    # device is still powered and still sensing the room. NOT a success --
+    # it is the live radar configuration, and the one the spoken line would
+    # otherwise dress up as "the radar is down".
+    partial: tuple = ()
     persisted: bool = True
 
 
@@ -194,8 +243,23 @@ class SensingPolicy:
         self._cfg = cfg
         self._now = now
         self._lock = threading.RLock()
+        # A SECOND lock, held only while device callbacks run and always
+        # taken BEFORE _lock, never with _lock already held. It stops a
+        # spoken switch and the clock guard interleaving their stops and
+        # resumes on the same device, and it is separate from _lock
+        # precisely because CameraGate.release must not be called under the
+        # lock CameraGate.open asks for (that pair deadlocks).
+        self._switch_lock = threading.RLock()
         self._devices: list[_Device] = []
+        # name -> "we believe this device is running". enforce() acts only
+        # on a CHANGE, so a device that refused to stop is retried on the
+        # next pass instead of being written off as done.
+        self._driven: dict[str, bool] = {}
+        self._last_failed: tuple = ()
         self._persisted = True
+        self._thread: Optional[threading.Thread] = None
+        self._stop_ev = threading.Event()
+        self._interval_s = DEFAULT_ENFORCE_S
         if path is None:
             from jarvis.config import PATHS
             path = PATHS.MEMORY_DIR / "sensing.json"
@@ -211,9 +275,17 @@ class SensingPolicy:
             log.info("sensing: no state at %s; starting OFFLINE until told "
                      "otherwise", self.path)
             return True, None, True
-        except OSError as exc:
-            log.warning("sensing: state %s unreadable (%s); starting OFFLINE",
-                        self.path, exc)
+        except Exception as exc:  # noqa: BLE001 - see below; NOTHING may escape
+            # Deliberately blanket. A state file whose bytes are not valid
+            # UTF-8 (an interrupted write, a bad block) raises
+            # UnicodeDecodeError, which is a ValueError and slipped past an
+            # `except OSError` -- and a constructor that raises is caught by
+            # app._construct, leaving self.sensing None, the radar polling
+            # ungoverned and the badge reading SENSING. That is a fail-ONLINE
+            # on exactly the corrupt input his ruling names, so every way
+            # this read can go wrong lands on the same fail-safe.
+            log.warning("sensing: state %s unreadable (%s: %s); starting "
+                        "OFFLINE", self.path, type(exc).__name__, exc)
             return True, None, True
         try:
             data = json.loads(raw)
@@ -300,23 +372,38 @@ class SensingPolicy:
         dt = datetime.fromtimestamp(self._now() if now is None else now)
         return in_window(win[0], win[1], (dt.hour, dt.minute))
 
-    def set_curfew(self, start: Optional[tuple], end: Optional[tuple]) -> bool:
-        """Both ends at once, or ``(None, None)`` to switch the curfew off.
-        Returns True when the config took the write."""
+    def _cfg_write(self, values: dict) -> bool:
+        """Write several dotted keys and REPORT whether the file took them.
+
+        ``AssistantConfig.set`` returns False rather than raising when the
+        save fails, so the old three-``set`` version confirmed a window it
+        may never have written -- and a refusal in the middle left the
+        persisted start and end disagreeing. ``update`` is one save, so the
+        pair cannot land half-written.
+        """
+        update = getattr(self._cfg, "update", None)
+        if callable(update):
+            return bool(update(dict(values)))
         setter = getattr(self._cfg, "set", None)
         if not callable(setter):
             return False
+        ok = True
+        for key, value in values.items():
+            ok = (setter(key, value) is not False) and ok
+        return ok
+
+    def set_curfew(self, start: Optional[tuple], end: Optional[tuple]) -> bool:
+        """Both ends at once, or ``(None, None)`` to switch the curfew off.
+        Returns True when the config took the write."""
         try:
             if start is None or end is None:
-                setter(CURFEW_ENABLED_KEY, False)
-                return True
-            setter(CURFEW_START_KEY, fmt_hhmm(start))
-            setter(CURFEW_END_KEY, fmt_hhmm(end))
-            setter(CURFEW_ENABLED_KEY, True)
+                return self._cfg_write({CURFEW_ENABLED_KEY: False})
+            return self._cfg_write({CURFEW_START_KEY: fmt_hhmm(start),
+                                    CURFEW_END_KEY: fmt_hhmm(end),
+                                    CURFEW_ENABLED_KEY: True})
         except Exception:  # noqa: BLE001
             log.exception("sensing: the curfew window could not be saved")
             return False
-        return True
 
     # --------------------------------------------------------------- state
     def _expire(self) -> None:
@@ -380,11 +467,34 @@ class SensingPolicy:
             self._devices.append(
                 _Device(name, stop, present or (lambda: True), resume))
 
-    def _switch_devices(self, on: bool) -> tuple:
-        """Stop (or resume) every attached device. Returns
-        (acted, failed, absent) -- the material for an honest spoken line."""
-        acted, failed, absent = [], [], []
-        for dev in list(self._devices):
+    def _may_run(self, state: SensingState, name: str) -> bool:
+        """May the device attached under ``name`` run in ``state``?
+
+        An attached name this module has never heard of is governed by the
+        manual switch ALONE. That is deliberately not the rule ``allowed()``
+        uses for an unknown sensor KIND (which is denied): there, "deny"
+        costs nothing, whereas here it would stop a device the nightly
+        camera window was never meant to touch and never resume it.
+        """
+        if name == CAMERA:
+            return state.camera
+        if name == RADAR:
+            return state.radar
+        return not state.offline
+
+    def _switch_devices(self, on: bool, devices=None,
+                        state: Optional[SensingState] = None) -> tuple:
+        """Stop (or resume) devices. Returns (acted, failed, absent, partial)
+        -- the material for a line that says what happened.
+
+        NEVER call this while holding ``self._lock``: the stoppers are
+        other objects' methods and they take their own locks (CameraGate
+        takes its gate lock and then asks the policy), so running them
+        under this one is the gate->policy / policy->gate cycle that
+        deadlocked a camera open against a spoken "offline mode".
+        """
+        acted, failed, absent, partial = [], [], [], []
+        for dev in list(self._devices if devices is None else devices):
             try:
                 here = bool(dev.present())
             except Exception:  # noqa: BLE001
@@ -393,6 +503,11 @@ class SensingPolicy:
                 here = True            # assume it is there and try anyway
             if not here:
                 absent.append(dev.name)
+                continue
+            if on and state is not None and not self._may_run(state, dev.name):
+                # "Back online" does not mean "open the lens": the nightly
+                # curfew can still be running, and this is the one place a
+                # privacy window could be silently overridden.
                 continue
             fn = dev.resume if on else dev.stop
             if fn is None:
@@ -404,26 +519,66 @@ class SensingPolicy:
                               "resumed" if on else "stopped")
                 failed.append(dev.name)
                 continue
-            (acted if ok is not False else failed).append(dev.name)
-        if failed:
+            if ok is False:
+                failed.append(dev.name)
+            elif isinstance(ok, _PollingOnly):
+                partial.append(dev.name)
+            else:
+                acted.append(dev.name)
+        if failed and tuple(failed) != self._last_failed:
+            # Once per CHANGE of the failing set: enforce() retries a failed
+            # stop every pass (privacy), and a warning a pass would bury the
+            # log a dead radar is supposed to stay quiet in.
             log.warning("sensing: %s, but these did not follow: %s",
                         "online" if on else "offline", ", ".join(failed))
-        return tuple(acted), tuple(failed), tuple(absent)
+        self._last_failed = tuple(failed)
+        return tuple(acted), tuple(failed), tuple(absent), tuple(partial)
+
+    def _remember(self, devices, wanted, failed) -> None:
+        """Record what each device was driven to, so ``enforce`` acts on
+        transitions. A device that FAILED keeps its old value, which is what
+        makes the next pass retry it."""
+        with self._lock:
+            for dev in devices:
+                if dev.name in failed:
+                    continue
+                self._driven[dev.name] = bool(wanted(dev.name))
 
     # -------------------------------------------------------------- switch
     def disable(self, until: Optional[float] = None,
                 source: str = "voice") -> Outcome:
         """Go offline. ``until`` is an epoch second for a bounded request."""
-        with self._lock:
-            self._offline, self._failsafe = True, False
-            self._until = float(until) if until else None
-            persisted = self._save()
-            stopped, failed, absent = self._switch_devices(False)
-        log.info("sensing: OFFLINE (%s%s); stopped=%s failed=%s", source,
-                 "" if self._until is None else " until %.0f" % self._until,
-                 stopped, failed)
-        return Outcome(self.state(), stopped=stopped, failed=failed,
-                       absent=absent, persisted=persisted)
+        with self._switch_lock:
+            with self._lock:
+                end = None
+                if until:
+                    try:
+                        end = float(until)
+                    except (TypeError, ValueError):
+                        end = None
+                if end is not None and end <= self._now():
+                    # An end already past would be expired by the very next
+                    # state() read, so this method would DENY and then
+                    # report "allowed" in the same breath. Fail toward
+                    # privacy: off open-endedly, and the spoken line reads
+                    # out.state.until to say the bound was dropped.
+                    log.warning("sensing: 'until %.0f' is not in the future; "
+                                "going offline open-endedly", end)
+                    end = None
+                self._offline, self._failsafe, self._until = True, False, end
+                persisted = self._save()
+                # Taken HERE, under the lock, so a concurrent enable()
+                # cannot interleave into the outcome "go offline" reports.
+                state = self.state()
+                devices = list(self._devices)
+            stopped, failed, absent, partial = self._switch_devices(False,
+                                                                    devices)
+            self._remember(devices, lambda _n: False, failed)
+        log.info("sensing: OFFLINE (%s%s); stopped=%s partial=%s failed=%s",
+                 source, "" if end is None else " until %.0f" % end,
+                 stopped, partial, failed)
+        return Outcome(state, stopped=stopped, failed=failed, absent=absent,
+                       partial=partial, persisted=persisted)
 
     def enable(self, source: str = "voice") -> Outcome:
         """Come back online, clearing the fail-safe as well as the switch.
@@ -433,14 +588,96 @@ class SensingPolicy:
         spoken -- "back online" with a dead radar is the same class of lie
         as "offline" with a live one.
         """
-        with self._lock:
-            self._offline, self._until, self._failsafe = False, None, False
-            persisted = self._save()
-            resumed, failed, absent = self._switch_devices(True)
+        with self._switch_lock:
+            with self._lock:
+                self._offline, self._until, self._failsafe = False, None, False
+                persisted = self._save()
+                state = self.state()
+                devices = list(self._devices)
+            resumed, failed, absent, _p = self._switch_devices(True, devices,
+                                                              state)
+            self._remember(devices, lambda n: self._may_run(state, n), failed)
         log.info("sensing: ONLINE (%s); resumed=%s failed=%s", source,
                  resumed, failed)
-        return Outcome(self.state(), resumed=resumed, failed=failed,
-                       absent=absent, persisted=persisted)
+        return Outcome(state, resumed=resumed, failed=failed, absent=absent,
+                       persisted=persisted)
+
+    # --------------------------------------------------- the clock-driven guard
+    def enforce(self) -> Outcome:
+        """Make the devices match the CURRENT verdict, whoever changed it.
+
+        This is the half of enforcement that does not need anyone to speak.
+        ``CameraGate`` only re-checks permission inside ``open()``, so a
+        lens opened at 20:59 is still a lit camera at 21:01 unless something
+        walks the devices on the clock; that is this. It stops what has just
+        lost permission and resumes what has just got it back, and it acts
+        only on the CHANGE, so a device already down is not re-stopped every
+        pass.
+        """
+        with self._switch_lock:
+            with self._lock:
+                state = self.state()
+                devices = list(self._devices)
+                want = {d.name: self._may_run(state, d.name) for d in devices}
+                off = [d for d in devices
+                       if self._driven.get(d.name, True) and not want[d.name]]
+                on = [d for d in devices
+                      if not self._driven.get(d.name, True) and want[d.name]]
+            stopped = resumed = absent = partial = ()
+            failed: tuple = ()
+            if off:
+                stopped, failed, absent, partial = self._switch_devices(False,
+                                                                        off)
+            if on:
+                resumed, f2, a2, _p = self._switch_devices(True, on, state)
+                failed, absent = failed + f2, absent + a2
+            if off or on:
+                self._remember(off + on, lambda n: want[n], failed)
+                log.info("sensing: enforced %s; stopped=%s resumed=%s "
+                         "partial=%s failed=%s", state.reason or "clear",
+                         stopped, resumed, partial, failed)
+        return Outcome(state, stopped=stopped, resumed=resumed, failed=failed,
+                       absent=absent, partial=partial,
+                       persisted=self._persisted)
+
+    def start(self, interval_s: float = DEFAULT_ENFORCE_S) -> None:
+        """Run ``enforce()`` on a daemon thread until ``stop()``.
+
+        Owned here rather than driven from ``MainWindow``'s 5 s pass on
+        purpose: the curfew has to close a lens whether or not the console
+        is up, and a privacy control that depends on a Tk thread being
+        alive is not one.
+        """
+        if self._thread is not None and self._thread.is_alive():
+            return
+        try:
+            self._interval_s = max(0.01, float(interval_s))
+        except (TypeError, ValueError):
+            self._interval_s = DEFAULT_ENFORCE_S
+        self._stop_ev.clear()
+        self._thread = threading.Thread(target=self._watch, name="sensing",
+                                        daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Stop the guard thread. Does NOT come back online: quitting is not
+        consent, and the state file is what the next start reads."""
+        self._stop_ev.set()
+        t = self._thread
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=2.0)
+
+    @property
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _watch(self) -> None:
+        while not self._stop_ev.is_set():
+            try:
+                self.enforce()
+            except Exception:  # noqa: BLE001 - the guard must outlive anything
+                log.exception("sensing: enforcement pass failed")
+            self._stop_ev.wait(self._interval_s)
 
 
 # --------------------------------------------------------------- the camera
@@ -485,8 +722,14 @@ class CameraGate:
             return False
 
     def open(self):
-        """The device, or None when sensing is denied. Never opens while
-        denied, and closes an already-open device the moment it is."""
+        """The device, or None when sensing is denied.
+
+        Never opens while denied, and closes a device this gate is still
+        holding. It cannot close one on its OWN, though -- nothing here
+        runs between two calls -- so the guard that shuts a lens when the
+        21:00 curfew arrives with nobody speaking is ``SensingPolicy.enforce``
+        on the policy's thread, which calls ``release`` below.
+        """
         with self._lock:
             if not self.allowed():
                 if self._device is not None:
@@ -519,3 +762,36 @@ class CameraGate:
     def status(self) -> dict:
         return {"name": self.name, "open": self.is_open,
                 "allowed": self.allowed()}
+
+
+# ------------------------------------------------- when there is no policy
+class _DeniedPolicy:
+    """The stand-in for a policy that could not be built AT ALL.
+
+    ``app._construct`` swallows a constructor failure and hands back None,
+    and a governed sensor whose ``policy`` is None falls back to "nobody is
+    stopping me" -- a fail-ONLINE reached by the one path the fail-safe
+    inside SensingPolicy cannot cover, because SensingPolicy is the thing
+    that did not exist. So a sensor is handed THIS instead: it denies
+    everything, for good, and only a restart that builds a real policy
+    changes that.
+    """
+
+    def allowed(self, kind: Optional[str]) -> bool:
+        return False
+
+    def state(self) -> SensingState:
+        return SensingState(camera=False, radar=False, offline=True,
+                            reason=REASON_FAILSAFE, failsafe=True)
+
+    def status(self) -> dict:
+        return SensingPolicy.status(self)
+
+    def attach(self, name, stop, present=None, resume=None) -> None:
+        """Accepted and dropped: there is no owner to run the stoppers."""
+
+    def curfew(self):
+        return None
+
+
+DENIED = _DeniedPolicy()

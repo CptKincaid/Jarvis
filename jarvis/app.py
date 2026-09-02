@@ -604,8 +604,18 @@ class JarvisApp:
 
     def _make_presence(self):
         mod = _import_optional("jarvis.presence")
-        return None if mod is None else mod.PresenceSentinel(
-            self.assistant, policy=getattr(self, "sensing", None))
+        if mod is None:
+            return None
+        policy = getattr(self, "sensing", None)
+        if policy is None:
+            # _construct swallows a constructor failure and hands back None,
+            # and a governed sensor whose policy is None decides for itself
+            # that nobody is stopping it -- the radar would poll on, with the
+            # header badge reading SENSING because there is no state to read.
+            # A sensor with no owner does not sense: that is the ruling.
+            sens = _import_optional("jarvis.sensing")
+            policy = None if sens is None else sens.DENIED
+        return mod.PresenceSentinel(self.assistant, policy=policy)
 
     def _make_room_light(self):
         mod = _import_optional("jarvis.room")
@@ -4167,7 +4177,10 @@ class JarvisApp:
                     sampler.start()
                 except Exception:
                     log.exception("activity sampler failed to start")
-        for name, obj in (("presence", self.presence), ("desk", self.desk),
+        # sensing first: the clock-driven privacy guard (jarvis/sensing.py)
+        # has to be walking the devices before the legs that poll them run.
+        for name, obj in (("sensing", getattr(self, "sensing", None)),
+                          ("presence", self.presence), ("desk", self.desk),
                           ("quiet", self.quiet),
                           # arc after those: its first tick should see the
                           # real quiet reason and presence state, not the
@@ -4524,6 +4537,10 @@ class JarvisApp:
                           ("focus", getattr(self, "focus", None)),
                           ("winddown", getattr(self, "winddown", None)),
                           ("presence", getattr(self, "presence", None)),
+                          # Stops the enforcement thread only: quitting is
+                          # not consent, so the switch itself is left where
+                          # the state file has it.
+                          ("sensing", getattr(self, "sensing", None)),
                           ("desk", getattr(self, "desk", None)),
                           ("quiet", getattr(self, "quiet", None)),
                           # roomtone first of the pair: its stop() takes the

@@ -87,6 +87,19 @@ OFF_PHRASES = [
     "no more cameras",
     "cameras off",
     "sensors off",
+    # 2026-09-02 review: natural neighbours of his own phrasings that fell
+    # through to the router and did nothing. A privacy order must never
+    # reach a model that cannot switch a sensor, so a leading politeness
+    # word is not allowed to cost him the switch.
+    "please stop watching",
+    "can you stop watching",
+    "could you turn off the camera",
+    "turn off the camera and the radar",
+    "cameras down",
+    "sensors down",
+    "go dark",
+    "no sensors tonight",
+    "no cameras today",
 ]
 
 # Every one of these is something he plausibly says, and every one of them
@@ -118,6 +131,19 @@ NOT_OFF_PHRASES = [
     "turn off my morning briefing",
     "what's off camera in that photo",
     "turn off the screen",
+    # ...and the blast radius of the leading-politeness and "and" widenings
+    "please stop",
+    "please stop the timer",
+    "can you stop the music",
+    "can you turn off the lights",
+    "could you turn the lights down",
+    "please turn off do not disturb",
+    "turn off the lights and the music",
+    "go dark mode",
+    "screen down",
+    "music off",
+    "tonight",
+    "today",
 ]
 
 
@@ -153,6 +179,12 @@ ON_PHRASES = [
     "start watching the room",
     "open your eyes",
     "sensors back on",
+    "resume sensing",
+    "start sensing",
+    "wake the sensors",
+    "wake up the camera",
+    "you can watch again",
+    "please turn the camera back on",
 ]
 
 NOT_ON_PHRASES = [
@@ -160,9 +192,14 @@ NOT_ON_PHRASES = [
     "turn the music back on",
     "start watching the game",
     "wake up the workshop",
+    "wake me at seven",
     "resume the timer",
+    "resume the music",
     "start a focus session",
+    "start the timer",
+    "start the music",
     "turn on my morning briefing",
+    "turn on the lights and the fan",
 ]
 
 
@@ -245,6 +282,70 @@ def test_going_offline_with_nothing_attached_says_so(policy):
     assert "nothing" in res.reply.lower()
 
 
+def _wire_radar(policy, power_url="", posts=None):
+    """A real RoomSensor attached to `policy`, with or without the optional
+    ESPHome power switch."""
+    from jarvis import roomsensor
+    return roomsensor.RoomSensor(
+        "http://10.0.0.9/binary_sensor/presence",
+        get=lambda url, timeout: '{"value": true}', policy=policy,
+        power_url=power_url,
+        post=lambda url, timeout: (posts if posts is not None else []).append(url))
+
+
+def test_the_line_tells_a_radar_that_is_down_from_one_that_is_merely_unpolled(
+        policy, tmp_path):
+    """He has NOT flashed the ESP32 and has not run a MOSFET, so the
+    unpowered case is the ONLY one that exists on his box today -- and it
+    used to produce the byte-identical "The radar is down." Stopping the
+    polling is not stopping the radar: the LD2410 keeps radiating and keeps
+    serving presence to anyone on the LAN.
+    """
+    _wire_radar(policy)                      # no power switch: the live case
+    unpolled = _run("sensing off", _commander(policy), "offline mode").reply
+
+    posts = []
+    wired = sensing.SensingPolicy(cfg=FakeCfg(), path=tmp_path / "s2.json",
+                                  now=lambda: _clock(12))
+    wired.enable()
+    _wire_radar(wired, "http://10.0.0.9/switch/radar_power", posts)
+    powered = _run("sensing off", _commander(wired), "offline mode").reply
+
+    assert posts == ["http://10.0.0.9/switch/radar_power/turn_off"]
+    assert unpolled != powered, "the two configurations must not sound alike"
+    assert "the radar is down" in powered.lower()
+    assert "the radar is down" not in unpolled.lower()
+    assert "power isn't switched" in unpolled.lower()
+    assert "still sensing the room" in unpolled.lower()
+    assert "nothing was sensing" not in unpolled.lower()
+
+
+def test_a_bound_that_was_dropped_is_not_spoken_as_one(policy):
+    """disable() refuses an `until` that is not in the future (the next
+    state() read would expire it), so the head has to follow the OUTCOME
+    and not the request -- otherwise "offline until 11 am" is said over a
+    switch with no end at all."""
+    out = policy.disable(until=_clock(12) - 5)
+    line = C._sensing_off_line(out, when_text="11 am")
+    assert "until" not in line.lower()
+    assert line.startswith("Offline, sir.")
+
+
+def test_switching_the_curfew_off_reports_a_refused_write(policy, tmp_path):
+    """Same honesty rule as the set-window branch twenty lines below it:
+    set_curfew returns False when the config did not take the write."""
+    class Refusing(FakeCfg):
+        def set(self, dotted, value):
+            return False
+
+    p = sensing.SensingPolicy(cfg=Refusing(), path=tmp_path / "s.json",
+                              now=lambda: _clock(12))
+    p.enable()
+    res = _run("sensing curfew", _commander(p), "turn off the camera curfew")
+    low = res.reply.lower()
+    assert "couldn't" in low or "could not" in low
+
+
 def test_a_switch_that_could_not_be_saved_is_spoken(tmp_path):
     """A write that failed means the next start reads the OLD file, i.e.
     online. He has to hear that, not a bare "offline, sir"."""
@@ -290,6 +391,15 @@ HOLD_PHRASES = {
     "go offline for thirty minutes": "for",
     "offline mode until ten": "until",
     "leave the sensors off until six": "until",
+    # the bounded forms of phrasings whose BARE form already worked -- the
+    # gap the review found, and the one where falling through to the router
+    # is worst: he asked for a window and got nothing at all.
+    "stop watching for ten minutes": "for",
+    "stop watching me for an hour": "for",
+    "camera off for an hour": "for",
+    "sensors off for the night": "for",
+    "offline until morning": "until",
+    "please stop watching for ten minutes": "for",
 }
 
 

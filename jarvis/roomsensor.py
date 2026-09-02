@@ -49,9 +49,16 @@ anything to him. ``power_url`` goes one step further and cuts the device:
 ESPHome serves a switch at ``POST /switch/<name>/turn_off``, so with a
 GPIO holding the LD2410's supply (the optional block in
 scripts/esphome/jarvis-room-sensor.yaml) "offline" means the radar stops
-radiating, not merely that nobody is listening. Without that wire the
-honest limit is that we stop asking -- and ``stop()`` says which of the
-two actually happened, so the spoken line can too.
+radiating, not merely that nobody is listening.
+
+**Without that wire the honest limit is that we stop asking**, and that is
+the configuration on this box today: nothing is flashed, no MOSFET is
+wired, so ``stop()`` returns ``sensing.POLLING_ONLY`` -- truthy, because
+the stop did everything this process can do, and NOT ``True``, because the
+LD2410 keeps radiating and keeps serving presence to anyone on the LAN.
+The spoken confirmation renders that bucket as "I've stopped reading the
+radar, but its power isn't switched", which is the sentence he would
+actually want at 11pm; "the radar is down" would be a promise.
 
 Nothing here knows about presence, hysteresis or the bus: this module
 answers one question and holds no history, so the composition (and the
@@ -67,7 +74,7 @@ import urllib.request
 from typing import Any, Callable, Optional
 
 from jarvis.logs import get_logger
-from jarvis.sensing import RADAR
+from jarvis.sensing import POLLING_ONLY, RADAR
 
 log = get_logger("roomsensor")
 
@@ -215,6 +222,7 @@ class RoomSensor:
         self._stopped = False
         self.power_url = str(power_url or "").strip().rstrip("/")
         self._post = post or _post_default
+        self._power_warned = False      # one loud line per outage, not per retry
         attach = getattr(policy, "attach", None)
         if callable(attach):
             attach(RADAR, self.stop, present=lambda: self.configured,
@@ -254,21 +262,32 @@ class RoomSensor:
         try:
             self._post(url, self.timeout_s)
         except Exception:  # noqa: BLE001 - every transport failure is a NO
-            log.exception("room sensor: %s failed", url)
+            if not self._power_warned:
+                # SensingPolicy.enforce retries a failed stop on every pass,
+                # so a traceback per attempt would bury the log this module
+                # promises to stay quiet in when the device is unreachable.
+                log.exception("room sensor: %s failed; the radar may still "
+                              "be powered", url)
+                self._power_warned = True
+            else:
+                log.debug("room sensor: %s failed again", url, exc_info=True)
             return False
+        self._power_warned = False
         log.info("room sensor: radar powered %s via %s",
                  "on" if on else "off", url)
         return True
 
-    def stop(self) -> bool:
-        """Stop sensing. True when the radar is actually down.
+    def stop(self):
+        """Stop sensing. ``True`` only when the radar is ACTUALLY down.
 
         With no ``power_url`` the most this process can do is never ask
-        again -- said plainly here rather than dressed up as a device stop,
-        because the difference is exactly what he would want to hear.
+        again, and that is reported as ``sensing.POLLING_ONLY`` rather than
+        as success: the module keeps radiating and keeps answering the LAN,
+        and "the radar is down" would be a promise nobody kept. Truthy, so a
+        caller that only wants "did the stop work" still reads yes.
         """
         self._stopped = True
-        return self._power(False) if self.power_url else True
+        return self._power(False) if self.power_url else POLLING_ONLY
 
     def resume(self) -> bool:
         """Undo stop(). True when the radar is back."""

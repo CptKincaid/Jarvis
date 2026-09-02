@@ -122,6 +122,50 @@ def test_a_corrupt_state_file_starts_offline(tmp_path, body):
     assert p.allowed(CAMERA) is False and p.allowed(RADAR) is False
 
 
+def test_a_state_file_that_is_not_valid_utf8_starts_offline(tmp_path):
+    """An interrupted write or a bad block leaves bytes that are not UTF-8.
+
+    UnicodeDecodeError is a ValueError, so it escaped the `except OSError`
+    around the read, escaped __init__, and was swallowed by app._construct
+    -- leaving no policy at all, the radar polling ungoverned and the badge
+    reading SENSING. A fail-ONLINE on exactly the corrupt input his ruling
+    names, reached by the one path a fail-safe inside the object cannot
+    cover: the object not existing.
+    """
+    (tmp_path / "sensing.json").write_bytes(b'\xff\xfe\x00\x01{"offline": true}')
+    p = _policy(tmp_path)
+    assert p.state().failsafe is True
+    assert p.allowed(CAMERA) is False and p.allowed(RADAR) is False
+
+
+def test_a_sensor_whose_owner_could_not_be_built_does_not_sense():
+    """The belt for the same failure: app._construct hands back None, and a
+    RoomSensor with policy=None falls through to "nobody is stopping me".
+    The app hands it sensing.DENIED instead, which never says yes."""
+    tr = _Transport()
+    s = _sensor(sensing.DENIED, tr)
+    assert s.read() is None and tr.calls == []
+    assert s.blocked == "offline"
+    dev = FakeCamera()
+    assert CameraGate(sensing.DENIED, dev.open).open() is None
+    assert dev.opens == 0
+    assert sensing.DENIED.status()["offline"] is True
+
+
+def test_the_app_gives_the_room_sensor_a_denying_policy_when_the_owner_is_gone():
+    """Driven through app's own construction path, with no `sensing`
+    attribute at all -- which is exactly what _construct leaves behind."""
+    import types
+
+    from jarvis.app import JarvisApp
+    cfg = FakeCfg({"presence.room_sensor_enabled": True,
+                   "presence.room_sensor_url": "http://10.0.0.9"})
+    sentinel = JarvisApp._make_presence(types.SimpleNamespace(assistant=cfg))
+    assert sentinel is not None and sentinel.sensor is not None
+    assert sentinel.sensor.blocked == "offline"
+    assert sentinel.sensor.read() is None
+
+
 def test_an_unreadable_state_file_starts_offline(tmp_path):
     path = tmp_path / "sensing.json"
     path.write_text(json.dumps({"offline": False}))
@@ -209,6 +253,44 @@ def test_set_curfew_writes_both_ends(tmp_path):
     assert p.curfew() == ((22, 0), (6, 30))
 
 
+def test_set_curfew_reports_a_write_the_config_refused(tmp_path):
+    """AssistantConfig.set / update return False rather than raising when
+    the file was not written. Confirming a window that never reached the
+    disk is a fail-ONLINE by the slow route: he widens the curfew by voice,
+    is told it took, and the camera comes back at the old hour on the next
+    restart."""
+    class Refusing(FakeCfg):
+        def set(self, dotted, value):
+            self.writes.append((dotted, value))
+            return False
+
+    cfg = Refusing()
+    p = _policy(tmp_path, cfg=cfg)
+    assert p.set_curfew((22, 0), (6, 0)) is False
+    assert p.set_curfew(None, None) is False, "the off branch reports too"
+
+
+def test_set_curfew_writes_the_whole_window_in_one_save(tmp_path):
+    """Three separate saves could be refused in the middle and leave the
+    persisted start and end disagreeing, which is a privacy window nobody
+    chose."""
+    class Updating(FakeCfg):
+        saves = 0
+
+        def update(self, values):
+            type(self).saves += 1
+            self.data.update(values)
+            self.writes.extend(values.items())
+            return True
+
+    Updating.saves = 0
+    cfg = Updating()
+    p = _policy(tmp_path, cfg=cfg)
+    assert p.set_curfew((22, 0), (6, 30)) is True
+    assert Updating.saves == 1
+    assert p.curfew() == ((22, 0), (6, 30))
+
+
 def test_the_manual_switch_outranks_the_curfew(tmp_path):
     p = _policy(tmp_path, now=lambda: _clock(12))
     p.disable()
@@ -278,6 +360,22 @@ def test_nothing_in_the_voice_path_consults_the_policy():
         assert "sensing" not in text, f"{name} must not gate the mic"
 
 
+def test_disable_never_reports_that_sensing_is_allowed(tmp_path):
+    """A method whose contract is "deny" must not be able to answer
+    "allowed". The outcome used to be built from a state() call made
+    OUTSIDE the lock, and state() expires a timed offline -- so a hold
+    whose end passed during the call (disable can block for the ESPHome
+    timeout) re-enabled everything while the line still said "offline
+    until"."""
+    now = _clock(12)
+    p = _policy(tmp_path, now=lambda: now)
+    p.enable()
+    out = p.disable(until=now - 5)
+    assert out.state.offline is True and out.state.camera is False
+    assert out.state.until is None, "a bound already past is dropped, not honoured"
+    assert p.allowed(CAMERA) is False and p.allowed(RADAR) is False
+
+
 # ------------------------------------------------------------ device stops
 def test_disable_stops_the_attached_devices_and_names_the_failures(tmp_path):
     p = _policy(tmp_path)
@@ -338,9 +436,9 @@ def test_the_camera_device_is_never_opened_during_the_curfew(tmp_path):
     assert dev.opens == 0
 
 
-def test_going_offline_closes_a_camera_that_is_already_open(tmp_path):
-    """The curfew arriving at 21:00 has to shut a lens that opened at
-    20:59; a gate that only guards open() would leave it streaming."""
+def test_the_spoken_switch_closes_a_camera_that_is_already_open(tmp_path):
+    """"Offline mode" has to shut a lens that is already streaming, not
+    merely refuse the next open()."""
     dev = FakeCamera()
     p = _policy(tmp_path)
     p.enable()
@@ -350,6 +448,143 @@ def test_going_offline_closes_a_camera_that_is_already_open(tmp_path):
     out = p.disable()
     assert dev.open_now is False and dev.closes == 1
     assert "camera" in out.stopped
+
+
+# ------------------------------------------------- the curfew, on the clock
+def test_the_curfew_closes_a_camera_that_is_already_open(tmp_path):
+    """21:00 arrives with NOBODY having said anything.
+
+    This is the control that runs unattended every night, and CameraGate
+    only re-checks permission inside open(): a lens opened at 20:59 is
+    still physically open at 21:00 unless something walks the devices on
+    the clock. Meanwhile the badge has already flipped to CAMERA OFF --
+    the exact lie the feature exists to prevent.
+    """
+    dev = FakeCamera()
+    clock = {"t": _clock(20, 59)}
+    p = _policy(tmp_path, now=lambda: clock["t"])
+    p.enable()
+    gate = CameraGate(p, dev.open, closer=lambda d: d.close())
+    assert gate.open() is dev and dev.open_now is True
+    clock["t"] = _clock(21, 0)
+    assert p.allowed(CAMERA) is False       # the verdict has already turned
+    assert gate.is_open is True             # ...and nothing has run yet
+    out = p.enforce()
+    assert dev.open_now is False and dev.closes == 1
+    assert gate.is_open is False, "the lens was still open inside the curfew"
+    assert out.stopped == ("camera",)
+
+
+def test_the_curfew_edge_leaves_the_radar_running(tmp_path):
+    """The curfew is about a LENS. The radar makes no image, so stopping it
+    at night would cost presence for no privacy."""
+    acted = []
+    clock = {"t": _clock(20, 59)}
+    p = _policy(tmp_path, now=lambda: clock["t"])
+    p.enable()
+    p.attach(RADAR, lambda: acted.append("stop") or True)
+    clock["t"] = _clock(21, 0)
+    p.enforce()
+    assert acted == []
+
+
+def test_the_guard_puts_the_camera_back_when_the_curfew_ends(tmp_path):
+    """...and acts only on the CHANGE, so a device already down is not
+    re-stopped every pass (which for a wired radar would be an HTTP POST
+    every few seconds, all night)."""
+    acted = []
+    clock = {"t": _clock(22)}
+    p = _policy(tmp_path, now=lambda: clock["t"])
+    p.enable()
+    p.attach(CAMERA, lambda: acted.append("stop") or True,
+             resume=lambda: acted.append("resume") or True)
+    p.enforce()
+    assert acted == ["stop"]
+    p.enforce()
+    assert acted == ["stop"]
+    clock["t"] = _clock(8)                  # morning, outside 21:00-07:00
+    p.enforce()
+    assert acted == ["stop", "resume"]
+
+
+def test_a_stop_that_failed_is_retried_on_the_next_pass(tmp_path):
+    """Privacy, not tidiness: a device that refused to stop keeps being
+    asked, because the alternative is a lens left open until he speaks."""
+    tries = {"n": 0}
+
+    def flaky():
+        tries["n"] += 1
+        return tries["n"] > 2
+
+    clock = {"t": _clock(22)}
+    p = _policy(tmp_path, now=lambda: clock["t"])
+    p.enable()
+    p.attach(CAMERA, flaky)
+    assert p.enforce().failed == ("camera",)
+    assert p.enforce().failed == ("camera",)
+    assert p.enforce().stopped == ("camera",)
+    p.enforce()
+    assert tries["n"] == 3, "a device that DID stop is not asked again"
+
+
+def test_the_enforcement_runs_without_the_console(tmp_path):
+    """The guard is the policy's own thread on purpose. A privacy control
+    that stops working because the Tk window was never built, or its thread
+    died, is not a privacy control."""
+    import threading
+    shut = threading.Event()
+    clock = {"t": _clock(20, 59)}
+    p = _policy(tmp_path, now=lambda: clock["t"])
+    p.enable()
+    p.attach(CAMERA, lambda: shut.set() or True)
+    clock["t"] = _clock(21, 0)
+    p.start(interval_s=0.01)
+    try:
+        assert shut.wait(5.0), "nothing closed the lens at the curfew edge"
+    finally:
+        p.stop()
+    assert p.running is False
+
+
+def test_coming_back_online_does_not_resume_what_the_curfew_still_denies(tmp_path):
+    """"Back online" at ten at night must not open the lens: the nightly
+    window is still running, and this is the one place it could be
+    silently overridden."""
+    acted = []
+    p = _policy(tmp_path, now=lambda: _clock(22))
+    p.disable()
+    p.attach(CAMERA, lambda: True, resume=lambda: acted.append("camera") or True)
+    p.attach(RADAR, lambda: True, resume=lambda: acted.append("radar") or True)
+    out = p.enable()
+    assert acted == ["radar"]
+    assert out.resumed == ("radar",)
+
+
+def test_a_camera_open_racing_a_spoken_offline_does_not_deadlock(tmp_path):
+    """CameraGate takes its own lock and THEN asks the policy, so the policy
+    must never run a device's stopper while holding its own lock -- the two
+    orders meet and take out the vision thread and the voice thread
+    together, permanently. The save inside the switch is a real window."""
+    import threading
+    import time as _time
+    dev = FakeCamera()
+    p = _policy(tmp_path)
+    p.enable()
+    gate = CameraGate(p, dev.open, closer=lambda d: d.close())
+    gate.open()
+    real_save = p._save
+    p._save = lambda: (_time.sleep(0.3), real_save())[1]
+    done = []
+    voice = threading.Thread(target=lambda: (p.disable(), done.append("voice")),
+                             daemon=True)
+    vision = threading.Thread(target=lambda: (gate.open(), done.append("vision")),
+                              daemon=True)
+    voice.start()
+    _time.sleep(0.05)                 # voice is inside the lock, mid-save
+    vision.start()
+    voice.join(10)
+    vision.join(10)
+    assert sorted(done) == ["vision", "voice"], "the two lock orders deadlocked"
 
 
 def test_a_camera_gate_refuses_when_the_policy_itself_is_broken(tmp_path):
@@ -448,8 +683,26 @@ def test_the_radar_registers_its_own_stop_with_the_policy(tmp_path):
     tr = _Transport()
     s = _sensor(p, tr)
     out = p.disable()
-    assert "radar" in out.stopped
+    assert "radar" in out.partial       # no power switch wired: see below
     assert s.read() is None and tr.calls == []
+
+
+def test_a_radar_with_no_power_switch_is_not_claimed_as_stopped(tmp_path):
+    """THE LIVE CONFIGURATION. Nothing is flashed and no MOSFET is wired,
+    so "offline" stops Jarvis asking while the LD2410 keeps radiating and
+    keeps serving presence to anyone on the LAN. Bucketing that as
+    `stopped` is what turns the spoken report into a promise -- and this is
+    the only case that exists on his box today.
+    """
+    p = _policy(tmp_path)
+    p.enable()
+    tr = _Transport()
+    s = _sensor(p, tr)
+    assert s.power_url == ""
+    out = p.disable()
+    assert out.partial == ("radar",)
+    assert out.stopped == () and out.failed == ()
+    assert s.read() is None and tr.calls == [], "the POLLING really did stop"
 
 
 def test_an_unconfigured_radar_is_absent_not_stopped(tmp_path):
@@ -540,6 +793,82 @@ def test_the_sentinel_holds_unknown_instead_of_drifting_away(tmp_path):
     assert s.state == "unknown"
     assert s.is_home() is True, "an unknown room is not an empty one"
     assert s.sensor.reads == 0, "the radar was polled while offline"
+
+
+def _radar_only_sentinel(tmp_path, policy, body):
+    """A box whose ONLY presence leg is the radar -- the shape his is."""
+    from jarvis.presence import PresenceSentinel
+    cfg = FakeCfg({"presence.room_sensor_enabled": True,
+                   "presence.room_sensor_url": "http://10.0.0.9",
+                   "presence.phone_ip": "", "presence.phone_mac": ""})
+    published, clock = [], {"t": 1_000_000.0}
+    s = PresenceSentinel(cfg, publish=published.append,
+                         now=lambda: clock["t"], poll_s=1.0, policy=policy)
+    s.sensor._get = _Transport(body)
+    return s, published, clock
+
+
+def test_offline_stops_the_sentinel_asserting_away(tmp_path):
+    """The frozen verdict, in the direction that MUTES him.
+
+    The radar reports an empty room long enough to run the away grace out;
+    then sensing goes off and the leg is gone. Holding "away" for the whole
+    blackout makes jarvis/quiet.py answer "you're out" and swallow every
+    proactive line while he is sitting in the room, and publishes
+    presence: away to the ambient slab -- a state nobody can verify.
+    """
+    p = _policy(tmp_path)
+    p.enable()
+    s, published, clock = _radar_only_sentinel(tmp_path, p, '{"value": false}')
+    for _ in range(4):
+        clock["t"] += 600.0
+        s.tick()
+    assert s.state == "away" and s.is_home() is False
+    assert len(published) == 1
+    p.disable()
+    clock["t"] += 600.0
+    assert s.tick() is None
+    assert s.state == "unknown", "a room nobody can see is not an empty one"
+    assert s.is_home() is True, "an unknown room must not hold his speech"
+    assert len(published) == 1, "no transition was invented on the way out"
+    assert s.sensor.reads == 4, "and the radar was not polled while offline"
+
+
+def test_offline_stops_the_sentinel_asserting_home(tmp_path):
+    """The mirror, in the direction that talks to an empty room: a frozen
+    "home" speaks proactive lines at nobody and then never says "welcome
+    back", because there is no transition left to make."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, published, clock = _radar_only_sentinel(tmp_path, p, '{"value": true}')
+    clock["t"] += 600.0
+    s.tick()
+    assert s.state == "home"
+    p.disable()
+    clock["t"] += 600.0
+    assert s.tick() is None
+    assert s.state == "unknown" and s.is_home() is True
+
+
+def test_a_breaker_outage_still_HOLDS_rather_than_forgetting(tmp_path):
+    """The distinction the fix turns on. A dead ESP32 is out for 30 s and
+    comes back; holding the last verdict across that is right, and dropping
+    to unknown on every transient would flap the ambient row."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, _published, clock = _radar_only_sentinel(tmp_path, p, '{"value": true}')
+    clock["t"] += 600.0
+    s.tick()
+    assert s.state == "home"
+
+    def dead(url, timeout):
+        raise OSError("no route to host")
+
+    s.sensor._get = dead
+    for _ in range(6):                 # trips the breaker and keeps going
+        clock["t"] += 600.0
+        s.tick()
+    assert s.state == "home", "a transient outage is not a privacy blackout"
 
 
 def test_the_quiet_policy_and_the_desk_probe_are_left_alone():

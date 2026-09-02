@@ -66,6 +66,20 @@ def normalise(obj: Any) -> dict:
             "persisted": bool(get("persisted", True))}
 
 
+def sensing_failsafe_state() -> dict:
+    """What the badge shows when there is NO policy to ask.
+
+    A header that still reads SENSING because the owner failed to
+    construct is the console asserting the one thing nobody can check.
+    The app hands a denying stand-in to the sensors in that case
+    (jarvis/sensing.py ``DENIED``), so the honest badge is the same
+    fail-safe: everything off, and the caption says why.
+    """
+    return {"camera": False, "radar": False, "offline": True,
+            "reason": "failsafe", "until": None, "curfew": None,
+            "persisted": True}
+
+
 def badge_tone(state: Any) -> str:
     s = normalise(state)
     if s["offline"] or not (s["camera"] or s["radar"]):

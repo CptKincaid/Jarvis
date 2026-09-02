@@ -11,7 +11,8 @@ import pytest
 from jarvis.ui import theme
 from jarvis.ui.sensing_badge import (TONE_CURFEW, TONE_OFF, TONE_ON,
                                      badge_caption, badge_colors, badge_tone,
-                                     badge_word, normalise)
+                                     badge_word, normalise,
+                                     sensing_failsafe_state)
 
 
 @pytest.fixture(autouse=True)
@@ -125,7 +126,86 @@ def test_an_unsaved_switch_is_visible_on_the_console_too():
     assert "not saved" in cap.lower()
 
 
+def test_with_no_policy_at_all_the_badge_reads_offline():
+    """A header still reading SENSING because the owner failed to construct
+    would be the console asserting the one thing nobody can check -- and
+    the app hands the sensors a denying stand-in in exactly that case, so
+    OFFLINE is also the truth."""
+    st = sensing_failsafe_state()
+    assert badge_tone(st) == TONE_OFF
+    assert badge_word(st) == "OFFLINE"
+    assert "state" in badge_caption(st).lower()
+
+
 # ------------------------------------------------------ the settings window
+def test_the_privacy_rows_are_re_read_every_time_the_drawer_opens():
+    """Every OTHER row in the drawer is only ever changed from the drawer,
+    so building it once is enough. This one is not: offline mode's primary
+    control is VOICE, so the switch flips with the drawer shut and a toggle
+    read at construction then shows the opposite of the badge two inches
+    away in the same header.
+    """
+    import inspect
+    import types
+
+    from jarvis.sensing import SensingState
+    from jarvis.ui.views import SettingsDrawer
+
+    assert "_refresh_privacy" in inspect.getsource(SettingsDrawer.open), \
+        "the refresh has to run on open(), not only at construction"
+
+    class Var:
+        def __init__(self, value):
+            self.value = value
+
+        def get(self):
+            return self.value
+
+        def set(self, value):
+            self.value = value
+
+    class Tog:
+        value = None
+        animated = None
+
+        def set(self, value, animate=True):
+            self.value, self.animated = bool(value), animate
+
+    class Pol:
+        def state(self):
+            return SensingState(camera=False, radar=False, offline=True,
+                                reason="offline")
+
+        def curfew(self):
+            return ((22, 0), (6, 30))
+
+    drawer = types.SimpleNamespace(
+        _sensing=Pol, _sensing_toggle=Tog(), _curfew_quiet=False,
+        _curfew_start=Var("21:00"), _curfew_end=Var("07:00"))
+    SettingsDrawer._refresh_privacy(drawer)
+    assert drawer._sensing_toggle.value is True
+    assert drawer._sensing_toggle.animated is False, \
+        "animate=False is also what stops the read-back writing the switch"
+    assert drawer._curfew_start.get() == "22:00"
+    assert drawer._curfew_end.get() == "06:30"
+    assert drawer._curfew_quiet is False, "the guard has to be put back"
+
+
+def test_the_read_back_does_not_write_the_curfew_it_just_read():
+    """Setting a picker's StringVar fires its write trace, so the refresh
+    would save the window straight back -- and toast about it."""
+    import types
+
+    from jarvis.ui.views import SettingsDrawer
+
+    def boom():
+        raise AssertionError("the read-back wrote the config back")
+
+    SettingsDrawer._curfew_changed(
+        types.SimpleNamespace(_curfew_quiet=True, _sensing=boom))
+
+
+
 def test_the_settings_choices_cover_the_hours_a_curfew_is_worth_setting():
     from jarvis.sensing import (CURFEW_END_CHOICES, CURFEW_START_CHOICES,
                                 DEFAULT_CURFEW_END, DEFAULT_CURFEW_START,

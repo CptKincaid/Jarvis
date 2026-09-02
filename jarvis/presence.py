@@ -26,11 +26,20 @@ OFFLINE MODE (jarvis/sensing.py) takes the radar leg away and NOTHING
 else: ``RoomSensor.read`` returns None while sensing is denied, which is
 the module's existing "no opinion" path, so the composition degrades to
 exactly what it was before the sensor was bought -- the phone's verdict on
-the same grace. It does NOT start reporting an empty room, and on a
-sensor-only box the tick returns None and the sentinel HOLDS its state
-rather than drifting into "away" and muting him for the evening. The
-phone probe itself is not governed: it reads the kernel's ARP table for an
-address he configured, and is not a sensor pointed at the room.
+the same grace. The phone probe itself is not governed: it reads the
+kernel's ARP table for an address he configured, and is not a sensor
+pointed at the room.
+
+On a SENSOR-ONLY box, though, "no opinion" leaves nothing at all, and the
+sentinel goes to **unknown** rather than holding its last verdict. Holding
+is right for a breaker outage measured in seconds; an offline-mode
+blackout lasts until he speaks, and a verdict frozen that long is being
+asserted, not held. A frozen "away" makes jarvis/quiet.py answer "you're
+out" and swallow every proactive line while he is sitting in the room; a
+frozen "home" speaks into an empty one and then never says "welcome back".
+Unknown is the state both of those consumers already blank (the ambient
+WHERE row prints nothing, ``is_home()`` answers True), so nothing new has
+to learn about offline mode to degrade honestly.
 
 ``PresenceSentinel`` polls the probe on a daemon thread (health.Watchdog's
 start / stop-with-join form so a ping in flight cannot outlive quit) and
@@ -301,9 +310,12 @@ class PresenceSentinel:
             return None
         if answer is None:
             # No evidence AT ALL this tick (a sensor-only install whose
-            # sensor is offline). Hold everything -- including the boot
-            # grace clock, which must start when the first real answer
-            # arrives, not when the first blank one does.
+            # sensor is down). Hold everything -- including the boot grace
+            # clock, which must start when the first real answer arrives,
+            # not when the first blank one does. The one exception is a
+            # blackout with no end: see _blacked_out.
+            if self._blacked_out():
+                self._forget()
             return None
         present = bool(answer)
         event = None
@@ -333,6 +345,42 @@ class PresenceSentinel:
             except Exception:  # noqa: BLE001
                 log.exception("presence: publish failed")
         return event
+
+    def _blacked_out(self) -> bool:
+        """True while the ONLY leg is a sensor that offline mode switched off.
+
+        A breaker-open sensor is deliberately NOT this: that outage lasts
+        30 s and holding the last verdict across it is correct. Offline mode
+        lasts until he says otherwise, and there is no honest way to keep
+        answering a question nothing has been able to observe for hours.
+        """
+        if self.phone_ip or self.phone_mac:
+            return False
+        sensor = self.sensor
+        try:
+            return bool(sensor is not None and sensor.blocked)
+        except Exception:  # noqa: BLE001 - provider boundary
+            log.debug("presence: sensor block check failed", exc_info=True)
+            return False
+
+    def _forget(self) -> None:
+        """Back to "no opinion", without publishing a transition.
+
+        There is no ``Presence(unknown)`` to publish -- ``home`` is a bool
+        on the wire -- and inventing one would be the confident false away
+        this module exists to avoid. Consumers read ``state`` and
+        ``is_home()``, and both already read unknown as "say nothing".
+        """
+        with self._lock:
+            if self.home is None and self._started_at is None:
+                return                 # already unknown; say it once
+            log.info("presence: sensing is off and there is no phone leg; "
+                     "presence is unknown until it is back")
+            # The grace clock goes too: nothing was learned during the
+            # blackout, so "away" must be earned again from the first real
+            # answer rather than from a last_seen older than the switch.
+            self.home, self.since = None, 0.0
+            self.last_seen, self._started_at = None, None
 
     # ------------------------------------------------------------ thread
     def start(self) -> None:

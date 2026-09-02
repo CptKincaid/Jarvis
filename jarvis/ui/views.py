@@ -1719,6 +1719,9 @@ class SettingsDrawer(tk.Frame):
         self.close() if self._open else self.open()
 
     def open(self):
+        # Privacy first: it is the ONE section whose controls change while
+        # the drawer is shut, because offline mode's primary path is voice.
+        self._refresh_privacy()
         self._open = True
         self.place(in_=self.host, relx=1.0, y=0, x=self._x,
                    anchor="ne", relheight=1.0, width=self.WIDTH)
@@ -2066,10 +2069,17 @@ class SettingsDrawer(tk.Frame):
             return
         # The toast SAYS what happened, like the spoken line: a device that
         # refused to stop is the one thing he must not have to guess at.
+        partial = getattr(out, "partial", ())
         if out.failed:
             if self.toast:
                 self.toast.show("Could not stop: %s" % ", ".join(out.failed),
                                 kind="error")
+        elif partial and self.toast:
+            # Same honesty as the spoken line: with no power switch wired
+            # the radar is still powered and still sensing the room, and
+            # "Sensing offline" would be the promise, not the report.
+            self.toast.show("Stopped reading %s — still powered"
+                            % ", ".join(partial), kind="warn")
         elif not out.persisted and self.toast:
             self.toast.show("Saved in memory only — it won't survive a restart",
                             kind="warn")
@@ -2112,8 +2122,42 @@ class SettingsDrawer(tk.Frame):
         var.trace_add("write", lambda *_a: self._curfew_changed())
         return var
 
+    def _refresh_privacy(self):
+        """Re-read the policy into the Privacy rows.
+
+        Every other row in this drawer is only ever changed FROM the
+        drawer, so building it once was enough. This one is not: he says
+        "offline mode" and the switch flips with the drawer shut, and a
+        toggle built at construction then shows the OPPOSITE of the truth
+        the header badge is showing two inches away.
+        """
+        pol = self._sensing()
+        if pol is None:
+            return
+        try:
+            offline, window = bool(pol.state().offline), pol.curfew()
+        except Exception:  # noqa: BLE001 - provider boundary
+            log.exception("sensing state read failed")
+            return
+        tog = getattr(self, "_sensing_toggle", None)
+        if tog is not None:
+            # animate=False also means Toggle.command is NOT called: this
+            # is a read-back, and it must not write the switch it just read.
+            tog.set(offline, animate=False)
+        values = curfew_choice_values(window)
+        self._curfew_quiet = True
+        try:
+            for var, value in ((getattr(self, "_curfew_start", None), values[0]),
+                               (getattr(self, "_curfew_end", None), values[1])):
+                if var is not None and var.get() != value:
+                    var.set(value)     # fires the trace; _curfew_quiet eats it
+        finally:
+            self._curfew_quiet = False
+
     def _curfew_changed(self):
         from jarvis.sensing import parse_hhmm
+        if getattr(self, "_curfew_quiet", False):
+            return                     # a read-back, not his edit
         pol = self._sensing()
         start = parse_hhmm(getattr(self, "_curfew_start", None)
                            and self._curfew_start.get())

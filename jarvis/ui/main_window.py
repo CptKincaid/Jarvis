@@ -92,7 +92,7 @@ from jarvis.ui.board import BoardWindow, board_enabled
 from jarvis.ui.console_mode import (ACTIVE, STANDBY, ConsoleModes, DeskWatch,
                                     resolve_idle_fn)
 from jarvis.ui.reactor import Reactor
-from jarvis.ui.sensing_badge import SensingBadge
+from jarvis.ui.sensing_badge import SensingBadge, sensing_failsafe_state
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
                              TranscriptView, standby_alpha)
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, StatePill,
@@ -1794,13 +1794,19 @@ class MainWindow:
 
     def _refresh_sensing(self, state=None):
         """Paint the badge from `state`, or from the policy when it is
-        wired. Tk thread only."""
+        wired. Tk thread only.
+
+        With NO policy the badge shows the fail-safe rather than its
+        constructor default: the app builds a denying stand-in when the
+        real owner could not be constructed (jarvis/app.py), so a header
+        still reading SENSING would be the console disagreeing with the
+        only thing that is actually true about the sensors.
+        """
         if state is None:
             policy = getattr(self.services, "sensing", None)
-            if policy is None:
-                return
             try:
-                state = policy.state()
+                state = (sensing_failsafe_state() if policy is None
+                         else policy.state())
             except Exception:          # noqa: BLE001 - provider boundary
                 log.debug("sensing state read failed", exc_info=True)
                 return
@@ -2077,6 +2083,11 @@ class MainWindow:
     def _probe_sensing(self):
         """Re-read the sensing policy on the SAME 5 s pass as the room.
 
+        This paints the BADGE only. The enforcement that closes a lens at
+        the 21:00 edge is SensingPolicy's own thread, deliberately not this
+        one: a privacy control that stops working because the console was
+        never built is not a privacy control.
+
         The badge cannot live on bus events alone: the curfew opens and
         closes on the clock, with nothing published and nobody speaking, and
         a badge that still read SENSING at 21:01 would be the exact lie this
@@ -2085,10 +2096,9 @@ class MainWindow:
         like every other probe here.
         """
         policy = getattr(self.services, "sensing", None)
-        if policy is None:
-            return
         try:
-            state = policy.state()
+            state = (sensing_failsafe_state() if policy is None
+                     else policy.state())
         except Exception:                     # noqa: BLE001 - provider boundary
             log.debug("sensing probe failed", exc_info=True)
             return

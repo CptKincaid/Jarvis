@@ -153,10 +153,16 @@ button:
 #
 # Jarvis's offline mode (jarvis/sensing.py, "offline mode" / "stop
 # watching") always stops POLLING the radar. Without the wiring below that
-# is the honest limit -- the LD2410 keeps radiating and nobody listens --
-# and Jarvis says exactly that. With it, offline mode CUTS the module's
-# supply: jarvis/roomsensor.py POSTs <power_url>/turn_off, ESPHome drops
-# the GPIO, and the radar stops.
+# is the honest limit -- the LD2410 keeps radiating, keeps serving this
+# web_server to the LAN, and nobody listens -- and Jarvis says exactly
+# that, in these words:
+#
+#   "I've stopped reading the radar, but its power isn't switched, so it's
+#    still sensing the room."
+#
+# With the wiring, offline mode CUTS the module's supply: jarvis/roomsensor.py
+# POSTs <power_url>/turn_off, ESPHome drops the GPIO, the radar stops, and
+# the spoken line becomes "The radar is down."
 #
 # EXTRA WIRING (do this only if you want the physical kill):
 #   Put a LOW-SIDE N-channel MOSFET (e.g. AO3400 / 2N7002 on a breakout, or
