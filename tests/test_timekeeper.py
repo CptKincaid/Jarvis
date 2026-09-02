@@ -1508,3 +1508,123 @@ def test_tool_push_back_says_the_new_ring_and_the_series(tools, tk):
     assert r.ok
     assert r.text == ("30 minutes added, sir: wake up at 7:30 am tomorrow, "
                       "then back to 7:00 am.")
+
+
+# ------------- review 2026-09-02: the shift must not outlive itself, and a
+# genuine snooze is none of its business.
+def test_pushing_back_then_pulling_forward_leaves_no_shift_behind(tk):
+    """"Push it back thirty... no, bring it forward thirty again." The
+    occurrence is back ON the series, so it must stop reading as moved --
+    it used to keep saying "at 7:00 am tomorrow, then back to 7:00 am" and
+    lose ", every day" from every listing until it next rang."""
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    tk.adjust("last", "alarm", 1800)
+    back = tk.adjust("last", "alarm", -1800)[0]
+    assert back.snooze_until is None and not back.shifted
+    assert tk.list_text("alarm") == "One alarm, sir: wake up at 7:00 am tomorrow, every day."
+    tk.clock.set(D(2026, 8, 27, 7, 0))
+    tk.tick()
+    assert tk.ringing is not None                      # back on the series time
+    tk.stop_ringing()
+    assert datetime.fromtimestamp(tk.get(alarm.id).effective_due) == D(2026, 8, 28, 7, 0)
+
+
+def test_a_snooze_until_equal_to_the_due_is_not_a_shift(tk):
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    tk._update(alarm.id, snooze_until=D(2026, 8, 27, 7, 0).timestamp())
+    assert not tk.get(alarm.id).shifted
+    assert tk.list_text("alarm") == "One alarm, sir: wake up at 7:00 am tomorrow, every day."
+
+
+def test_a_whole_day_skip_still_says_the_alarm_repeats(tk):
+    """A day-sized delta lands back on the series time of day: "at 7:00 am
+    on Friday, then back to 7:00 am" names one time twice and drops the
+    fact that it repeats at all."""
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    tk.adjust("last", "alarm", 86400)
+    assert tk.list_text("alarm") == "One alarm, sir: wake up at 7:00 am on Friday, every day."
+
+
+def test_a_zero_snooze_until_never_fires_an_alarm_early(tk):
+    """Item.shifted (truthiness) and the _due_items CASE (IS NOT NULL) once
+    disagreed about 0.0, and the query won: the alarm rang at 10 pm."""
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    tk._update(alarm.id, snooze_until=0.0)
+    assert not tk.get(alarm.id).shifted
+    assert tk._due_items(tk.clock.now()) == []
+    tk.tick()
+    assert tk.ringing is None
+
+
+def test_the_due_query_follows_wall_clock_repeats(tk, monkeypatch):
+    """keeps_wall_clock and the query read ONE list, so a fixed repeat added
+    to it cannot be shifted by adjust and still fired at the series time."""
+    monkeypatch.setattr(tkm, "WALL_CLOCK_REPEATS", ("daily", "weekdays", "weekends"))
+    tk.clock.set(D(2026, 8, 26, 22, 0))
+    alarm = tk.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    tk._update(alarm.id, repeat="weekends")     # normalize_repeat knows only today's
+    assert tk.adjust("last", "alarm", 1800)[0].shifted
+    tk.clock.set(D(2026, 8, 27, 7, 0))
+    tk.tick()
+    assert tk.ringing is None
+    tk.clock.set(D(2026, 8, 27, 7, 30))
+    tk.tick()
+    assert tk.ringing is not None
+    tk.stop_ringing()
+
+
+def _boot(db, tmp_path, clock, said):
+    return Timekeeper(db, say=said.append, cfg=FakeAssistantConfig(), now=clock.now,
+                      run=Recorder(), cache_dir=tmp_path / "c")
+
+
+def test_a_snoozed_alarm_still_reads_back_at_its_original_due(tmp_path, capture):
+    """He snoozed a 7 o'clock alarm; the "while I was down" line and the
+    alarm card have always named 7:00 am, and a non-repeating alarm is no
+    part of the shifted-occurrence change."""
+    clock = FakeClock(D(2026, 8, 27, 6, 59))
+    db, said = tmp_path / "tk.db", []
+    first = _boot(db, tmp_path, clock, said)
+    first.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up")
+    clock.set(D(2026, 8, 27, 7, 0))
+    first.tick()
+    assert first.snooze(10)
+    first.close()
+    said.clear()
+    del capture[:]
+
+    clock.set(D(2026, 8, 27, 7, 40))
+    second = _boot(db, tmp_path, clock, said)
+    try:
+        second.catch_up()
+        assert said == ["While I was down, sir: wake up, due at 7:00 am."]
+        assert [e.due_text for e in kinds(capture, events.AlarmFired)] == ["7:00 am"]
+    finally:
+        second.close()
+
+
+def test_a_crash_mid_ring_on_a_shifted_alarm_quotes_the_time_it_rang_at(tmp_path, capture):
+    clock = FakeClock(D(2026, 8, 26, 22, 0))
+    db, said = tmp_path / "tk.db", []
+    first = _boot(db, tmp_path, clock, said)
+    first.add_alarm(D(2026, 8, 27, 7, 0).timestamp(), "wake up", "daily")
+    assert first.adjust("last", "alarm", 1800)
+    clock.set(D(2026, 8, 27, 7, 30))
+    first.tick()
+    assert first.ringing is not None                   # crashed here
+    first.close()
+    said.clear()
+    del capture[:]
+
+    clock.set(D(2026, 8, 27, 7, 50))
+    second = _boot(db, tmp_path, clock, said)
+    try:
+        second.catch_up()
+        assert said == ["While I was down, sir: wake up, due at 7:30 am."]
+        assert [e.due_text for e in kinds(capture, events.AlarmFired)] == ["7:30 am"]
+    finally:
+        second.close()

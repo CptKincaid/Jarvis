@@ -2617,3 +2617,20 @@ def test_incident_replay_extend_a_timer_named_before_the_kind_word(real_tk, serv
     res = c.handle("shorten the tea timer by 2 minutes", source="voice")
     assert res.reply == "Two minutes off, sir: the tea in 3 minutes."
     services.brain.chat.assert_not_called()
+
+
+def test_incident_replay_push_back_then_forward_leaves_the_series_alone(real_tk, services):
+    """2026-09-02 review: "push my alarm back thirty... no, bring it forward
+    thirty" left the wake-up reading "at 7:00 am tomorrow, then back to
+    7:00 am" -- self-contradictory, and ", every day" was gone from every
+    listing and briefing until it next rang."""
+    c, tk, clock = real_tk
+    tk.add_alarm(datetime(2026, 9, 2, 7, 0).timestamp(), "wake up", "daily")
+    res = c.handle("push my alarm back 30 minutes", source="voice")
+    assert res.reply == ("30 minutes added, sir: wake up at 7:30 am tomorrow, "
+                         "then back to 7:00 am.")
+    res = c.handle("bring my alarm forward 30 minutes", source="voice")
+    assert res.reply == "30 minutes off, sir: wake up at 7:00 am tomorrow, every day."
+    it = tk.list("alarm")[0]
+    assert it.snooze_until is None and not it.shifted
+    assert tk.list_text("alarm") == "One alarm, sir: wake up at 7:00 am tomorrow, every day."
