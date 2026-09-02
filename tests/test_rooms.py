@@ -17,7 +17,7 @@ import pytest
 
 from jarvis import rooms
 from jarvis.rooms import (ABSENT, ALLOW, DENY, DISAGREE, LIVE, MIC, OFF,
-                          UNKNOWN, HouseView, RoomMesh, RoomSpec, Satellite,
+                          UNKNOWN, PrivacyView, RoomMesh, RoomSpec, Satellite,
                           SensorView, caption, check_url, chip, derive_state,
                           is_private_ip, make_transport, mesh_probe,
                           spec_from_dict, specs_from_config, spoken_status)
@@ -212,7 +212,7 @@ def test_absent_is_not_off():
 
 # -------------------------------------------------------------- the view
 def _rows(*pairs):
-    return HouseView(rows=tuple(SensorView(r, k, s) for r, k, s in pairs))
+    return PrivacyView(rows=tuple(SensorView(r, k, s) for r, k, s in pairs))
 
 
 def test_worst_prefers_the_uncomfortable_answer():
@@ -230,11 +230,11 @@ def test_trustworthy_only_when_every_room_answered():
                      ("kitchen", RADAR, UNKNOWN)).trustworthy()
     assert _rows(("office", RADAR, OFF),
                  ("kitchen", CAMERA, ABSENT)).trustworthy()
-    assert not HouseView().trustworthy()
+    assert not PrivacyView().trustworthy()
 
 
 def test_spoken_status_names_the_room_it_cannot_reach_first():
-    view = HouseView(rows=(
+    view = PrivacyView(rows=(
         SensorView("office", CAMERA, OFF, intent=DENY, age_s=2.0),
         SensorView("office", RADAR, OFF, intent=DENY, age_s=2.0),
         SensorView("kitchen", RADAR, UNKNOWN, intent=DENY, age_s=240.0,
@@ -246,7 +246,7 @@ def test_spoken_status_names_the_room_it_cannot_reach_first():
 
 
 def test_spoken_status_flags_a_device_that_ignored_the_order():
-    view = HouseView(rows=(
+    view = PrivacyView(rows=(
         SensorView("bedroom", RADAR, DISAGREE, intent=DENY, age_s=3.0),))
     line = spoken_status(view)
     assert "still reporting on" in line
@@ -254,7 +254,7 @@ def test_spoken_status_flags_a_device_that_ignored_the_order():
 
 
 def test_spoken_status_with_nothing_configured():
-    assert "no rooms configured" in spoken_status(HouseView())
+    assert "no rooms configured" in spoken_status(PrivacyView())
 
 
 # ------------------------------------------------------------- satellite

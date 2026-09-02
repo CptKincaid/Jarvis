@@ -60,10 +60,15 @@ HOW IT COMPOSES WITH WHAT IS ALREADY THERE, without touching it.
   under a room-qualified name, ``"kitchen radar"``. That name is what the
   spoken confirmation already says out loud: "I couldn't stop the bedroom
   radar, so it may still be running."
-* presence fuses the same way ``RoomOrPhone`` fuses, extended to N rooms:
-  ANY room seeing someone is True and ends the tick; nobody-anywhere is
-  False only when every room answered; a room with no opinion never makes
-  the house empty.
+* the PRESENCE fusion is not here. ``jarvis/roomfabric.py`` owns it -- N
+  named rooms, four timers argued from the LD2410's late OFF edge, and the
+  refusal to answer "is someone ELSE here" from a sensor that reports one
+  bit. A ``Satellite`` wears ``read() -> True | False | None``, which is
+  the only shape that fabric wants, so it drops straight in as a room's
+  reader. ``RoomMesh.read`` / ``mesh_probe`` below are the degenerate
+  one-line version for a box with no fabric wired; prefer the fabric.
+  ``PrivacyView`` here is deliberately NOT ``roomfabric.HouseView``: that
+  one answers "who is where", this one answers "what is allowed to look".
 
 TRUST. A satellite is untrusted input. A URL must be ``http://`` plus a
 PRIVATE IP LITERAL: no hostnames (an mDNS answer is one poisoned packet
@@ -417,7 +422,7 @@ def caption(view: SensorView) -> str:
 
 
 @dataclass(frozen=True)
-class HouseView:
+class PrivacyView:
     """Every room, every sensor, one snapshot. ``rows`` is ordered: the
     local room first, then satellites in config order, so the console does
     not reshuffle between passes."""
@@ -476,7 +481,7 @@ def _phrase(rows: tuple) -> str:
     return ", ".join(parts[:-1]) + " and " + parts[-1]
 
 
-def spoken_status(view: HouseView) -> str:
+def spoken_status(view: PrivacyView) -> str:
     """"Are you watching?", answered per room.
 
     The unreachable rooms are named FIRST and never rounded down to "off":
@@ -822,13 +827,13 @@ class RoomMesh:
             # never see it.
             sat.confirm(kind)
 
-    def view(self) -> HouseView:
+    def view(self) -> PrivacyView:
         rows = []
         for sat in self.satellites:
             for kind in KINDS:
                 if sat.has(kind):
                     rows.append(sat.view(kind, self.stale_after_s))
-        return HouseView(rows=tuple(rows), at=self._now())
+        return PrivacyView(rows=tuple(rows), at=self._now())
 
     # ------------------------------------------------------------- read
     def read(self) -> Optional[bool]:
@@ -886,11 +891,15 @@ class RoomMesh:
 def mesh_probe(mesh: "RoomMesh", phone: Optional[Callable] = None) -> Callable:
     """The probe ``PresenceSentinel`` polls, extended to N rooms.
 
+    THE FALLBACK, not the recommendation. ``jarvis/roomfabric.py`` does
+    this properly -- enter/leave holds, a doorway anti-flap, a stuck-room
+    guard -- and a ``Satellite`` plugs into it directly because it already
+    wears ``read() -> True | False | None``. Use this only on a box where
+    the fabric is not wired.
+
     Same asymmetry as ``jarvis.presence.RoomOrPhone`` and for the same
     reason: a room seeing someone is positive evidence and beats a sleeping
-    phone; a room seeing nobody is not an empty flat. This wraps rather
-    than replaces that class so the office keeps the exact code path it has
-    today when no satellite is configured.
+    phone; a room seeing nobody is not an empty flat.
     """
     from jarvis import presence as presence_mod
     phone_fn = phone if phone is not None else presence_mod.probe
