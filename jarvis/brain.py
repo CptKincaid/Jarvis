@@ -50,6 +50,7 @@ from pathlib import Path
 from jarvis.config import MACHINE
 from jarvis.events import BrainState, Status, bus
 from jarvis.logs import get_logger
+from jarvis.router import is_question
 from jarvis.tts import TTS as _TTS
 
 log = get_logger("brain")
@@ -125,6 +126,7 @@ INCLUDE_GIT_LINE = True        # latency knob (spec 4.3): drop "Git:" lines
 # allowed 8 000, leaving room for the ~2 700-token static prefix.
 MAX_TOOL_TEXT_CHARS = 4000       # one tool result
 MAX_TOOL_TEXT_TOTAL_CHARS = 8000  # every tool result in one turn
+TOOL_ARGS_LOG_CHARS = 200        # tool args in the "tool X -> ok" log line
 MAX_TOOL_CALLS_PER_ROUND = 8     # one confused turn may not fan out forever
 # A tool may raise the spoken cap (calendar, mail, briefing all hold lists).
 # That number used to reach only the post-trim, while the system prompt went
@@ -238,6 +240,137 @@ TOOL_SKIPPED_TEXT = ("[this tool did not run and produced no result: the "
 # inventing the rest.
 PARTIAL_RESULT_LINE = ("That's only part of it, sir; there was more than I "
                        "could take in at once.")
+# LIVE 2026-09-01 20:56:42: "Say hello to my family and then add milk to my
+# shopping list and then start playing my Spotify." reached the model whole
+# (the greeting clause is not Tier-1, so the commander's all-or-nothing
+# compound rule let it through) and gemma4 answered "Good evening, Ali and
+# Heather ... I've added milk to your shopping list, sir, and I'm starting
+# your music now." with ZERO tool calls -- no 'tool' line in the log at
+# all. Nothing was added and nothing played; the model NARRATED the actions
+# instead of taking them, and the narration was spoken with full
+# confidence.
+#
+# The guard below is deliberately narrow: it looks only at a turn in which
+# NO tool ran, only at a turn where he ORDERED something rather than asked
+# (the retry EXECUTES, and a question that performs the action it asks
+# about is worse than the narration this catches), and only for a
+# first-person claim to have done something -- with the negation, the
+# hedge and the idiom vetoed, since a claim wrongly found costs a model
+# round and replaces a true sentence with an apology.
+# A turn that ran a tool is trusted -- the tool did what it did and the
+# model is reading from its result. On a hit the model gets ONE more round
+# with this line appended (the same per-turn-messages mechanism as
+# RENDER_NOW_LINE: the system prefix must stay byte-identical); a retry
+# that still runs no tool has its claiming sentences replaced with
+# UNBACKED_LINE, the honest sentences (the greeting) kept.
+# The nudge names the two ways out, and the second one is deliberate: a
+# model told only "use the tools now" will find SOMETHING to run, and the
+# turn that earned the nudge is the wrong place to invent work.
+UNBACKED_NUDGE = ("[You described actions you did not perform. If I asked "
+                  "you to do something, use the tools and do it now. If I "
+                  "only asked a question, answer it without saying you did "
+                  "anything.]")
+UNBACKED_LINE = "I couldn't do that part, sir."
+_ACTION_CLAIM_RX = re.compile(
+    r"\b(?:"
+    # "I've added milk", "I have set a timer", "I've just started it"
+    r"i(?:'ve| have)(?: just| now| already)? (?:added|set|started|cancell?ed|"
+    r"removed|sent|queued|scheduled|saved|created|deleted|paused|resumed|"
+    r"turned (?:on|off|up|down)|switched|moved|booked|cleared|stopped|"
+    r"muted|skipped|dimmed|put)\b"
+    # "I'm starting your music now", "I am adding it to the list"
+    r"|i(?:'m| am)(?: now| just)? (?:starting|playing|adding|setting|cancell?ing|"
+    r"removing|sending|queuing|queueing|scheduling|saving|creating|"
+    r"deleting|pausing|resuming|turning|switching|moving|booking|clearing|"
+    r"stopping|muting|skipping|dimming|putting)\b"
+    # the passive and the state claims: "milk is added to your list",
+    # "your timer is set", "the music is on", "playing now". Kept to the
+    # shapes of a DONE action: this guard is for actions the model says it
+    # took, not for answers ("now playing: ...") it may have got wrong.
+    # "playing now" only at the head of a sentence -- bare, it also caught
+    # "In the film, he's playing now at the Odeon."
+    r"|\badded to (?:your|the)\b|\b(?:your|the) (?:timer|alarm|reminder) is "
+    r"(?:set|going|running)\b|\b(?:the |your )?music is (?:on|playing|back on)\b|"
+    r"(?:^|(?<=[.!?] ))playing now\b"
+    r")", re.I)
+# Three vetoes, all found by replaying ordinary English through the table
+# (2026-09-02 review). A false positive is not free: it spends an extra
+# model round on a turn that had already answered, and if the retry says
+# the same true thing, UNBACKED_LINE replaces a TRUE sentence.
+#
+# 1. NEGATION earlier in the same sentence scopes the claim -- "Nothing has
+#    been added to your list, sir." is the ANSWER to "what's on my list",
+#    and it was being called a lie.
+_CLAIM_NEGATED_RX = re.compile(
+    r"\b(?:no|not|nothing|nobody|none|never|neither|nor|without|yet to|"
+    r"(?:do|does|did|have|has|had|is|are|was|were|wo|ca|could|would|should)"
+    r"n['’]t)\b", re.I)
+# 2. A HEDGE unsays it in the same breath: nothing was done and the model
+#    is not pretending otherwise.
+_CLAIM_HEDGE_RX = re.compile(
+    r"\b(?:in my head|in theory|in principle|hypothetically|figuratively|"
+    r"so to speak|in a manner of speaking|on paper)\b", re.I)
+# 3. An IDIOM wears the verb and acts on nothing: "I'm moving on to the
+#    next point", "I'm turning forty", "I'm setting aside the question",
+#    "I'm stopping there". Matched against what FOLLOWS the claim, so the
+#    same verbs with a real object still count ("I'm turning on the
+#    lights", "I'm putting on some jazz", "I'm moving your three o'clock").
+_CLAIM_IDIOM_RX = re.compile(
+    r"^\s*(?:on(?:to|\s+to|\s+from)\b|on[\s,.;!]*$|onwards?\b|aside\b|"
+    r"ahead\b|forwards?\b|afresh\b|anew\b|short\b|there\b|here\b|"
+    r"(?:\d+|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b)", re.I)
+
+
+def _sentence_claim(sent):
+    """The action claim in ONE sentence, or None: a table hit that none of
+    the three vetoes above disqualifies."""
+    if _CLAIM_HEDGE_RX.search(sent or ""):
+        return None
+    for m in _ACTION_CLAIM_RX.finditer(sent or ""):
+        if _CLAIM_NEGATED_RX.search(sent[:m.start()]):
+            continue
+        if _CLAIM_IDIOM_RX.match(sent[m.end():]):
+            continue
+        return m.group(0)
+    return None
+
+
+def unbacked_claim(text):
+    """The first first-person action claim in ``text`` ("I've added ...",
+    "I'm starting ..."), else None. Pure; the caller decides whether a
+    tool backs it. Judged one sentence at a time, because both the
+    negation that cancels a claim and the idiom that was never one live
+    inside the sentence that carries them."""
+    for sent in split_sentences(text or ""):
+        claim = _sentence_claim(sent)
+        if claim:
+            return claim
+    return None
+
+
+def strip_unbacked_claims(text, n=None):
+    """``text`` with every sentence that claims an action replaced by ONE
+    UNBACKED_LINE, in the place of the first, the other sentences kept:
+    the greeting survives, the invented actions do not. ``n`` is the
+    spoken-sentence cap the reply will meet later; the apology is kept
+    inside it, since it is the one sentence here that must be heard.
+    Unchanged text when nothing claims anything."""
+    kept, said = [], False
+    for sent in split_sentences(text):
+        if _sentence_claim(sent):
+            if not said:
+                kept.append(UNBACKED_LINE)
+                said = True
+            continue
+        kept.append(sent)
+    if not said:
+        return text
+    if n is not None and len(kept) > n:
+        head = kept[:max(1, int(n))]
+        if UNBACKED_LINE not in head:
+            head = head[:-1] + [UNBACKED_LINE]
+        kept = head
+    return " ".join(kept)
 # Spoken when something inside the brain raised. Never the exception text.
 INTERNAL_ERROR_LINE = "I'm afraid something went wrong on my end, sir."
 # Web lookups run as a one-shot `claude -p` with search allowed (the CLI has
@@ -717,6 +850,24 @@ def cap_tool_text(text, cap=MAX_TOOL_TEXT_CHARS):
         head = head[:nl]
     marker = TOOL_TRUNCATED_MARKER.format(shown=len(head), total=len(text))
     return head.rstrip() + marker, True
+
+
+def _args_for_log(args, cap=TOOL_ARGS_LOG_CHARS):
+    """The tool args as they appear in the "tool X -> ok" log line: ``""``
+    for none, else a space and the JSON, cut at `cap` with an ellipsis so
+    a pasted note body cannot flood the log. Non-JSON values (a Device
+    dataclass, a datetime) go through str(), never raise — this runs
+    inside the tool loop and a logging failure must not kill the turn."""
+    if not args:
+        return ""
+    try:
+        body = json.dumps(args, default=str, ensure_ascii=False,
+                          sort_keys=True)
+    except (TypeError, ValueError):
+        body = repr(args)
+    if len(body) > cap:
+        body = body[:cap - 1].rstrip() + "…"
+    return " " + body
 
 
 def _http(path, payload=None, timeout=OLLAMA_TIMEOUT_S):
@@ -2001,8 +2152,12 @@ class JarvisBrain:
                 # "I have your calendar" off "calendar unreachable" would
                 # be a lie the degrade tells all by itself.
                 tool_names.append(name)
-            log.info("tool %s -> ok=%s %s", name, result.ok,
-                     (result.text or "")[:80])
+            # The args ride along because the text alone hid a real bug:
+            # "spotify_liked -> ok=True ...on shuffle" (2026-09-01 19:59)
+            # could not say whether the shuffle was Hunter's or the
+            # model's. Capped so a long note body cannot flood the log.
+            log.info("tool %s%s -> ok=%s %s", name, _args_for_log(args),
+                     result.ok, (result.text or "")[:80])
             self._journal_tool(name, args, result)
 
         def tool_message(result, name):
@@ -2076,12 +2231,41 @@ class JarvisBrain:
 
         streamed_sentences = []           # what on_sentence already received
         clock_line_said = []
+        # The unbacked-action guard (UNBACKED_NUDGE): armed only when the
+        # model HAS tools to act with -- a claim in a turn with no tools on
+        # offer is not something a retry can fix, and the forced path above
+        # already ran one -- and only when he ORDERED something.
+        #
+        # The question half is not a nicety: the retry EXECUTES. "Did you
+        # already add milk to my list?" answered "Yes, sir, I've added
+        # milk" is a correct answer to a question, and arming the guard on
+        # it made the retry go and add the milk -- the question performing
+        # the action it asked about (2026-09-02 review, on the real brain).
+        # A model that narrates instead of acting on a QUESTION has told
+        # him something possibly wrong; a guard that writes on a question
+        # is worse than the thing it was built to catch, so questions get
+        # the reply as it stands.
+        #
+        # `unbacked_first` holds the reply the retry was asked to make good
+        # on; `plain_round` takes the retry off the stream, because the
+        # first reply's honest sentences were already spoken and the
+        # retry's words are either tool calls or discarded.
+        unbacked_armed = (registry is not None and bool(tools)
+                          and not is_question(text))
+        unbacked_first = None
+        plain_round = False
 
         def guard(sentence):
             # The guards _finish_spoken applies to the whole reply, per
             # sentence: a streamed sentence is spoken before the reply
             # exists, so it must not carry an ungrounded clock claim or
             # a leaked context line the full reply would have lost.
+            if unbacked_armed and not tool_texts and unbacked_claim(sentence):
+                # Withheld, not spoken: with no tool run yet, "I'm starting
+                # your music now" is a claim the round has not earned. The
+                # whole reply is judged once the round ends -- the retry or
+                # UNBACKED_LINE speaks for this sentence, never the model.
+                return ""
             line = clean_ollama_reply(strip_markdown(clean_ollama_reply(sentence)))
             guarded = guard_clock_claims(
                 line, "\n".join([ctx_text, mem_text] + tool_texts), text)
@@ -2107,7 +2291,9 @@ class JarvisBrain:
                     messages.append({"role": "user",
                                      "content": RENDER_NOW_LINE})
                 round_started = time.monotonic()
-                if on_sentence is not None:
+                streaming = on_sentence is not None and not plain_round
+                plain_round = False
+                if streaming:
                     # Each round gets the full spoken cap: what the model
                     # said before a tool call must not eat the answer's.
                     round_sentences = []
@@ -2141,6 +2327,45 @@ class JarvisBrain:
                     calls = []
                 if not calls or registry is None:
                     final = content
+                    if unbacked_armed and not tool_texts:
+                        # ZERO tools ran this turn and the model is done
+                        # talking: did it claim to have done something?
+                        claim = unbacked_claim(final)
+                        if claim and unbacked_first is None:
+                            log.warning("brain: unbacked action claim %r "
+                                        "(no tool ran)", claim)
+                            unbacked_first = final
+                            messages.append({"role": "assistant",
+                                             "content": content})
+                            messages.append({"role": "user",
+                                             "content": UNBACKED_NUDGE})
+                            # ONE retry, with a round of its own: the
+                            # reply that earned it was the model's whole
+                            # answer, and max_rounds counted it.
+                            rounds_left = max(rounds_left, 1)
+                            plain_round = True
+                            continue
+                        if unbacked_first is not None:
+                            # The retry ran no tool either. Its words are
+                            # not trusted over the first reply's -- the
+                            # same model, the same nothing behind it -- so
+                            # the FIRST reply is what he hears, with the
+                            # claims taken out and the rest (the greeting)
+                            # left standing.
+                            log.warning("brain: unbacked action claim stands "
+                                        "after the retry (no tool ran); "
+                                        "replacing it")
+                            final = strip_unbacked_claims(unbacked_first, cap)
+                            if on_sentence is not None and \
+                                    not self._stale(gen):
+                                # the honest sentences were streamed as they
+                                # landed and the claims withheld: the line
+                                # standing in for them is spoken now, once
+                                streamed_sentences.append(UNBACKED_LINE)
+                                try:
+                                    on_sentence(UNBACKED_LINE)
+                                except Exception:
+                                    log.exception("on_sentence failed")
                     if render_only and tool_texts and not (final or "").strip():
                         # the reserved round produced no words at all: say
                         # WHAT is in hand rather than only that something is
@@ -2171,7 +2396,15 @@ class JarvisBrain:
                 ran = 0
                 for call in calls:
                     name, args = self._tool_call_parts(call)
-                    result = registry.call(name, args)
+                    # from_model: the registry strips each spec's reserved
+                    # keys here and ONLY here -- the forced path above is
+                    # the commander's, and its args are the utterance's.
+                    # The utterance rides along so a spec that reserves a
+                    # key can still read it off HIS words (ToolSpec.derive):
+                    # taking a knob away from the model must not mean the
+                    # words lose it too.
+                    result = registry.call(name, args, from_model=True,
+                                           utterance=text)
                     note(result, name, args)
                     messages.append(tool_message(result, name))
                     ran += 1

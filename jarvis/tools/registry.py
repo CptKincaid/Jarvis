@@ -74,6 +74,25 @@ class ToolSpec:
     parameters: dict = field(default_factory=lambda: {
         "type": "object", "properties": {}})
     handler: Callable[..., ToolResult] = None   # handler(**args) -> ToolResult
+    # Argument names the MODEL may not set. A handler can accept a keyword
+    # that only trusted code (a commander force_args) is allowed to fill:
+    # spotify_liked's ``shuffle`` is the case that earned this -- the model
+    # sent shuffle=true unasked for "Play my like songs." and the newest-
+    # first default was lost (live log 2026-09-01 19:59). Reserved keys are
+    # kept OUT of the schema (nothing to invite) and stripped by call() when
+    # the args came from the model, so a model that guesses them anyway
+    # still cannot override the caller's default.
+    reserved: frozenset = frozenset()
+    # derive(utterance) -> dict: arguments read off HIS WORDS rather than
+    # off the model's guess, applied to model calls only (call() below).
+    # Reserving a key takes the model's vote away, which makes the
+    # commander's Tier-1 route the only thing left that can say yes -- so a
+    # phrasing the matcher misses gets the default in silence. spotify_liked
+    # is the case: "put my liked songs on shuffle please" missed the route,
+    # the model's shuffle=true was dropped, and it played newest-first and
+    # SAID so (2026-09-02 review). With a deriver the words decide either
+    # way, whichever door the turn came through.
+    derive: Optional[Callable[[str], dict]] = None
 
     def schema(self) -> dict:
         """Ollama /api/chat `tools` entry."""
@@ -98,6 +117,13 @@ class ToolRegistry:
         if words > DESCRIPTION_WORD_CAP:
             log.warning("tool %s description is %d words (cap %d)",
                         spec.name, words, DESCRIPTION_WORD_CAP)
+        # A reserved key that is also advertised in the schema is a drift
+        # bug: the model is invited to send an argument call() will drop.
+        offered = set((spec.parameters or {}).get("properties") or {})
+        leaked = sorted(set(spec.reserved) & offered)
+        if leaked:
+            log.warning("tool %s advertises reserved argument(s) %s in its "
+                        "schema", spec.name, ", ".join(leaked))
         self._tools[spec.name] = spec
         # No per-registration count warning: it used to fire once per tool
         # past the budget, so a 28-tool boot wrote a 17-line ladder of
@@ -173,10 +199,19 @@ class ToolRegistry:
         state["ok"] = state["ok"] and tokens <= MAX_SCHEMA_TOKENS
         return state
 
-    def call(self, name: str, args: Optional[dict] = None) -> ToolResult:
+    def call(self, name: str, args: Optional[dict] = None, *,
+             from_model: bool = False,
+             utterance: str = "") -> ToolResult:
         """Never raises: unknown tools and handler exceptions become an
         ok=False result the model can explain. args may arrive as a JSON
-        string (some models emit arguments that way)."""
+        string (some models emit arguments that way).
+
+        ``from_model=True`` marks args the model wrote (the brain's tool
+        loop); the spec's ``reserved`` keys are dropped from those and its
+        ``derive`` reads ``utterance`` in their place. Forced calls from the
+        commander leave it False and keep every key -- the commander already
+        decided them from the utterance, and a second reading must not
+        overrule the first."""
         spec = self._tools.get(name)
         if spec is None or spec.handler is None:
             return ToolResult(text=f"no such tool: {name}", ok=False)
@@ -188,6 +223,29 @@ class ToolRegistry:
                 args = {}
         if not isinstance(args, dict):
             args = {}
+        if from_model and spec.reserved:
+            dropped = {k: v for k, v in args.items() if k in spec.reserved}
+            if dropped:
+                # Info, not warning: the model guessing here is expected
+                # and harmless now; the line is the audit trail for #66.
+                log.info("tool %s: dropped model-supplied reserved args %s",
+                         name, json.dumps(dropped, default=str)[:120])
+                args = {k: v for k, v in args.items()
+                        if k not in spec.reserved}
+        if from_model and spec.derive is not None:
+            # After the strip, so a deriver always wins over the model --
+            # and it runs even with no utterance in hand, where it answers
+            # for "he said nothing" (spotify_liked: shuffle=None, the
+            # configured default).
+            try:
+                extra = spec.derive(utterance or "") or {}
+            except Exception:               # noqa: BLE001 - tool boundary
+                log.exception("tool %s: derive failed", name)
+                extra = {}
+            if extra:
+                log.info("tool %s: %s from the utterance", name,
+                         json.dumps(extra, default=str)[:120])
+                args = {**args, **extra}
         try:
             result = spec.handler(**args)
         except TypeError as exc:           # bad/missing arguments

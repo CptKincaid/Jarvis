@@ -748,17 +748,49 @@ def test_play_liked_songs_in_order_phrase_keeps_order(tmp_path, query):
     assert fake.named("current_user_playlists") == []   # never a playlist search
 
 
-def test_liked_shuffle_flag_from_the_tool_schema(tmp_path):
+def test_liked_shuffle_is_not_the_models_to_set(tmp_path):
+    """The model is not offered ``shuffle`` and cannot smuggle it in.
+
+    The old description said "Shuffle Hunter's Liked Songs" and every call
+    came back shuffled (#66); the rewording ("shuffle=true only if he asks")
+    did not hold either -- gemma4 sent {"shuffle": true} for "Play my like
+    songs." (live, 2026-09-01 19:59:26).  So the knob is off the schema and
+    reserved: a model-originated call is played newest-first whatever it
+    says, and only the commander's forced call (from_model=False) shuffles."""
     fake = FakeSpotify(n_saved=30)
     reg = registry(make_tool(tmp_path, fake))
     spec = next(s for s in make_tool(tmp_path, fake).tools() if s.name == "spotify_liked")
-    # The old description said "Shuffle Hunter's Liked Songs" -- the model read
-    # that as the instruction it was, so every call came back shuffled (#66).
-    assert "shuffle" not in spec.description.lower().split(";")[0]
-    assert spec.parameters["properties"]["shuffle"] == {"type": "boolean"}
+    assert "shuffle" not in spec.description.lower()
+    assert "shuffle" not in spec.parameters["properties"]
+    assert spec.reserved == frozenset({"shuffle"})
+    assert "shuffle" not in json.dumps(spec.schema())
+    # the model's guess is dropped...
+    res = reg.call("spotify_liked", {"shuffle": True}, from_model=True)
+    assert res.speak == "Your Liked Songs, sir — newest first, 30 of them, on HPCOMPUTER."
+    assert fake.named("shuffle") == [((False,), {"device_id": "dev-hp"})]
+    # ...the commander's word is kept, and "he did not say" stays in order
     assert reg.call("spotify_liked", {"shuffle": True}).speak.startswith(
         "Your Liked Songs on shuffle")
     assert reg.call("spotify_liked", {}).speak.startswith("Your Liked Songs, sir")
+
+
+def test_liked_in_order_clears_shuffle_before_it_starts_and_says_so(tmp_path):
+    """The spoken line must match what the player does: newest first means
+    the sticky flag is cleared BEFORE start_playback (after it, the first
+    chunk would already be playing at random) and the line says "newest
+    first", never "on shuffle"."""
+    fake = FakeSpotify(n_saved=230)
+    res = make_tool(tmp_path, fake).liked(shuffle=False)
+    assert res.speak == sp.LIKED_ORDER_LINE.format(n=230, device="HPCOMPUTER")
+    assert "shuffle" not in res.speak.lower()
+    order = [m for m, _, _ in fake.calls if m in ("shuffle", "start_playback")]
+    assert order == ["shuffle", "start_playback"]
+    assert fake.named("shuffle") == [((False,), {"device_id": "dev-hp"})]
+    # and the shuffled path is the only one that says so
+    fake2 = FakeSpotify(n_saved=230)
+    res2 = make_tool(tmp_path, fake2).liked(shuffle=True)
+    assert res2.speak == sp.LIKED_URIS_LINE.format(n=230, device="HPCOMPUTER")
+    assert fake2.named("shuffle") == []
 
 
 @pytest.mark.parametrize("value, shuffled", [

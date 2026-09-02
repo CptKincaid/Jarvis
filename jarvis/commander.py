@@ -104,6 +104,7 @@ from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import add_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
 from jarvis.tools.notes import number_word
+from jarvis.tools import spotify as spotify_mod
 from jarvis import syllabus as syllabus_mod
 from jarvis.router import (ROUTER_QUESTION, WEB_CUE_RX, RouteDecision,
                            estimate_size, local_cues, normalise)
@@ -3898,6 +3899,191 @@ def _h_standup(c, t, m):
     return CommandResult(handled=True, reply=line, speak=True, status="Standup")
 
 
+# ---- Tier 1 Spotify: "play my liked songs" (jarvis/tools/spotify.py) -----
+# LIVE 2026-09-01 19:59:26, by voice: "Play my like songs." went
+# local:music -> brain -> gemma4, which picked spotify_liked AND filled
+# shuffle=true on its own, and Jarvis announced "Your Liked Songs on
+# shuffle, sir" for a request that never said the word.  Two faults in
+# that one turn, and this route removes both: a 3-4 s model round trip
+# for a request whose shape is fixed, and a model deciding a knob that
+# only the utterance may decide.  The tool is forced (force_tool /
+# force_args -- the recap / briefing / last-mail pattern) and ``shuffle``
+# is wants_shuffle(<what he said>, default=spotify.liked_shuffle), the same
+# rule the regex play() path applies, and comes from nowhere else.  The
+# model never sees the turn.
+#
+# Anchored, and the tail may hold only things this route understands (an
+# order word, a shuffle word, a Connect device, "please"): "play my liked
+# songs by Drake" or "what's in my liked songs" fall through to the router
+# and the model -- which cannot set shuffle either any more, because the
+# tool schema no longer offers it and the registry drops it when guessed.
+_LIKED_WHAT_RX = (
+    # "like songs": Whisper drops the d (his 21:14:37 and 19:59:26 turns).
+    r"(?:liked?\s+(?:songs|tracks|music)|likes|"
+    r"saved\s+(?:songs|tracks|music)|favou?rites?|library|"
+    r"(?:songs|tracks|music)\s+(?:that\s+)?i(?:'ve|\s+have)?\s+(?:liked|saved))")
+_LIKED_RX = re.compile(
+    r"^(?:(?:please|can you|could you|would you|go ahead and)[\s,]+)*"
+    # The verb list is a door, not a filter: a phrasing that misses it does
+    # NOT fall back to a model that can honour "on shuffle" -- the model's
+    # shuffle is reserved -- so "put my liked songs on shuffle" landed on
+    # the newest-first default and was announced as such (2026-09-02
+    # review).  Bare "put"/"queue"/"stick"/"throw", the trailing particle,
+    # and a leading "shuffle play" are all in now; the utterance-derived
+    # fallback in the tool spec (jarvis/tools/spotify.py) covers the rest.
+    r"(?:(?:shuffle|randomly)\s+)?"
+    r"(?:(?:play|put|start|shuffle|queue|stick|throw|fire\s+up)"
+    r"(?:\s+(?:on|up))?\s+)?"
+    r"(?:(?:all\s+)?(?:of\s+)?(?:my|the|our)\s+)?(?:spotify\s+)?"
+    + _LIKED_WHAT_RX +
+    r"(?:\s+(?:playlist|collection))?(?:\s+on\s+spotify)?"
+    r"(?P<tail>(?:[\s,]+.*)?)$", re.I)
+# Tail words that mean nothing to the tool but everything to a sentence.
+# Removed BEFORE the order/shuffle words: "in the order I added them" is
+# one phrase here, where _INORDER_RX would take "in the order" and leave
+# "i added them" behind as a stranger.
+_LIKED_FILLER_RX = re.compile(
+    r"\b(?:please|now|for me|thanks|thank you|and|but|then|them|it|from the top|"
+    r"from the start|from the beginning|"
+    r"in the order (?:that )?(?:i|they were) (?:added|saved|liked)(?: them)?|"
+    # "in a random order": the shuffle word is read off the WHOLE utterance
+    # by wants_shuffle, so the phrase only has to leave the tail empty
+    r"in\s+(?:a|an|any)?\s*(?:random|shuffled|mixed[- ]up)\s+order|"
+    # "stick my liked songs ON", "turn them back ON" -- a trailing particle,
+    # never the "on" of "on my phone" (the device match runs after this)
+    r"(?:back\s+)?on(?=\s*$)|"
+    r"(?:on|in|with)\s+(?:shuffle|random)(?:\s+mode)?|shuffle mode)\b", re.I)
+# "on my phone" / "on hpcomputer" / "on the computer": the device is
+# matched case-insensitively by the tool (_match_device runs _norm), so the
+# lowercased form the matchers see is enough.  "on repeat" is a mode the
+# tool cannot honour here, not a speaker called Repeat.
+_LIKED_DEVICE_RX = re.compile(
+    r"^(?:on|onto|to|over to|through)\s+(?:my\s+|the\s+)?"
+    r"(?P<dev>(?!(?:repeat|loop|spotify)\b)[\w' -]{2,40})$", re.I)
+
+
+def _liked_tail(tail: str) -> Optional[tuple[str, Optional[str]]]:
+    """(leftover, device) for the words after the noun, or None when the
+    tail holds something this route does not understand."""
+    rest = " " + (tail or "") + " "
+    rest = _LIKED_FILLER_RX.sub(" ", rest)
+    rest = spotify_mod._INORDER_RX.sub(" ", rest)
+    rest = spotify_mod._SHUFFLE_RX.sub(" ", rest)
+    rest = re.sub(r"[,\s]+", " ", rest).strip()
+    if not rest:
+        return "", None
+    m = _LIKED_DEVICE_RX.match(rest)
+    if not m:
+        return None
+    return "", m.group("dev").strip(" '-")
+
+
+def liked_songs_kind(text: str):
+    """The match for a Liked-Songs request, else None (falsy)."""
+    m = _LIKED_RX.match(str(text or "").strip().rstrip(".!?"))
+    if not m:
+        return None
+    return m if _liked_tail(m.group("tail")) is not None else None
+
+
+def _h_liked_songs(c, t, m):
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "chat"):
+        return None
+    # The tool's own reading of spotify.liked_shuffle when it is wired
+    # (services.spotify), the config directly when it is not: either way
+    # ONE default, and "he did not say" resolves to it here, not in the
+    # model.
+    default = getattr(c._svc("spotify"), "liked_shuffle", None)
+    if not isinstance(default, bool):
+        default = bool(_assistant_get(c, "spotify.liked_shuffle", False))
+    args = {"shuffle": bool(spotify_mod.wants_shuffle(t, default=default))}
+    parsed = _liked_tail(m.group("tail"))
+    device = parsed[1] if parsed else None
+    if device:
+        args["device"] = device
+    log.info("liked songs: forcing spotify_liked %s for %r", args, t)
+    brain.chat(t, force_tool="spotify_liked", force_args=args)
+    return CommandResult(handled=True, status="Liked Songs…", done=False)
+
+
+# ---- Tier 1 Spotify: "start my music" (spotify_control resume) -----------
+# LIVE 2026-09-01 20:56:42, by voice: "Say hello to my family and then add
+# milk to my shopping list and then start playing my Spotify."  The
+# greeting clause is not Tier-1, so _try_multi's all-or-nothing rule sent
+# the compound to gemma4 whole -- which answered "I've added milk to your
+# shopping list, sir, and I'm starting your music now" and called NO tool
+# (no 'brain INFO tool' line in the log).  The brain's unbacked-action
+# guard (jarvis/brain.py) is the fix for the narration; this route is the
+# fix for the request itself: "start playing my Spotify" has one meaning
+# and one tool action, spotify_control resume, and the model was the only
+# thing between the words and the call.  Forced (force_tool/force_args),
+# like liked songs above, so the tool's own "Resumed, sir." is spoken and
+# no model turn runs.  Extends the transport-word vocabulary the read-aloud
+# steering (_READ_CTL_RX) and the media keys (desktop.MEDIA_PLAY_EXACT)
+# already share: those keep bare "play"/"pause"/"resume", this takes the
+# forms that NAME the music.
+#
+# Anchored and narrow: an artist, a genre, a playlist, "liked songs" or any
+# tail the route does not understand falls through to the router as
+# before ("play Drake", "play some jazz", "play my liked songs" -- the
+# route above -- and "play my playlist" are all still the model's).
+_MUSIC_NOUN = r"(?:music|tunes|spotify|jams|playback)"
+_MUSIC_RESUME_RX = re.compile(
+    r"^(?:(?:please|can you|could you|would you|go ahead and|jarvis)[\s,]+)*"
+    r"(?:"
+    # "start playing my Spotify", "resume my music", "play me some music",
+    # "start up the music", "unpause the music" -- a determiner names the
+    # music as HIS, which is what separates "start my Spotify" from "start
+    # Spotify" (launching the app, the desktop's word)
+    r"(?:start|resume|play|unpause|continue|restart|fire up|start up|turn on|put on)"
+    r"(?:\s+playing)?(?:\s+me)?\s+(?:my|the|some|our)(?:\s+spotify)?\s+" + _MUSIC_NOUN +
+    r"(?:\s+(?:back\s+)?(?:on|up|again))?"
+    # "put my music on", "put some music on", "turn the music back on"
+    r"|(?:put|turn|switch)(?:\s+me)?\s+(?:my|the|some|our)\s+" + _MUSIC_NOUN +
+    r"\s+(?:back\s+)?on"
+    # the bare noun after a transport verb: "play music", "play spotify",
+    # "resume playback", "start playing spotify"
+    r"|(?:play|resume|unpause|continue|start\s+playing|keep\s+playing)\s+" + _MUSIC_NOUN +
+    r"|start\s+(?:music|tunes|playback)"
+    r")"
+    r"(?:[\s,]+(?:please|now|for me|thanks|thank you|again|would you|will you))*"
+    r"(?:\s+(?:on|through|over)\s+(?:my\s+|the\s+)?(?P<dev>[\w' -]{2,40}))?$", re.I)
+# Words a device cannot be called: "play my music on shuffle" and "put the
+# music on repeat" are modes, and the route does not set modes.
+_MUSIC_NOT_A_DEVICE_RX = re.compile(
+    r"^(?:shuffle|repeat|loop|random|spotify|full|max|low|quiet|mute)\b", re.I)
+
+
+def music_resume_kind(text: str):
+    """The match for a bare "start/resume/play my music" request (no
+    artist, no playlist, no Liked Songs), else None (falsy)."""
+    t = str(text or "").strip().rstrip(".!?")
+    if _LIKED_RX.match(t):
+        return None                       # Liked Songs is the route above
+    m = _MUSIC_RESUME_RX.match(t)
+    if not m:
+        return None
+    dev = m.group("dev")
+    if dev and _MUSIC_NOT_A_DEVICE_RX.match(dev.strip()):
+        return None
+    return m
+
+
+def _h_music_resume(c, t, m):
+    brain = c._svc("brain")
+    if brain is None or not hasattr(brain, "chat"):
+        return None
+    args = {"action": "resume"}
+    dev = (m.group("dev") or "").strip(" '-")
+    if dev:
+        # matched case-insensitively by the tool (_match_device runs _norm)
+        args["device"] = dev
+    log.info("music: forcing spotify_control %s for %r", args, t)
+    brain.chat(t, force_tool="spotify_control", force_args=args)
+    return CommandResult(handled=True, status="Music…", done=False)
+
+
 # ---- GPU yield (jarvis/brain.py release/reclaim) -------------------------
 # The watchdog lends the model to a trainer on its own (health.yield_to_trainer);
 # these two are the manual doors. "Take the GPU back" while the trainer still
@@ -5924,6 +6110,14 @@ REGISTRY: list[Command] = [
             needs=("assistant",)),
     Command("last mail", _LAST_MAIL_RX.search, _h_last_mail,
             needs=("brain",)),
+    # Liked Songs, forced onto the tool with shuffle decided from the words
+    # (never by the model). needs only the brain: the tool is registered
+    # with it, and services.spotify is a convenience, not a requirement.
+    Command("liked songs", liked_songs_kind, _h_liked_songs, needs=("brain",)),
+    # "start playing my Spotify": one meaning, one tool action, forced the
+    # same way. After "liked songs" so "play my liked songs" is never read
+    # as a bare resume (the matcher also refuses it, belt and braces).
+    Command("music resume", music_resume_kind, _h_music_resume, needs=("brain",)),
     Command("diagnostics", _DIAG_RX.match, _h_diagnostics),
     Command("register", register_kind, _h_register, needs=("brain",)),
     Command("next exam", _NEXT_EXAM_RX.match, _h_next_exam),
@@ -6090,6 +6284,14 @@ ASSISTANT_TIER1: list[Command] = [
                     "list schedule", "cancel schedule", "adjust schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "register", "next exam",
+                    # "play my liked songs" arrives by voice with the wake
+                    # word already eaten; without this name it would reach
+                    # the router and the model round trip it exists to skip
+                    "liked songs",
+                    # "start playing my Spotify" (20:56:42) arrived the same
+                    # way -- and as a clause of a compound, which _try_multi
+                    # can only run when every clause is a Tier-1 name
+                    "music resume",
                     # "good night" is the other half of "good morning": the
                     # hotword eats the wake word, so the courtesy arrives
                     # bare, the prefixed registry pass is skipped and the
