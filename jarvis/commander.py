@@ -760,8 +760,20 @@ _CLOCK_PLACE_RX = re.compile(
 # morning, sir." -- because _CLOCK_KINDS' "time" branch only needs the
 # words "what time". The answer is the timetable (Command("next class"))
 # or the calendar; it is never the current time.
+#
+# ANCHORED to the clock clause, not the sentence. An earlier `.*?` between
+# "what time" and the possessive let any later mention of a room disable
+# the wall clock: measured, "what time is it in the lab" and "what time is
+# it now that the lab is over" both went from 'time' to None and lost the
+# 0-latency answer to a question that really was about the current time.
+# The determiner has to follow "what <kind>" within one copula.
+#
+# Built from the same time|date|day alternation _CLOCK_KINDS carries,
+# because "what date is my exam" answered with today's wall date -- one
+# word away from "what time is my exam", which this guard already caught.
 _CLOCK_MINE_RX = re.compile(
-    r"\bwhat\s+time\b.*?\b(?:my|our|the|this|that)\s+(?:[a-z][\w'-]*\s+){0,3}?"
+    r"\bwhat\s+(?:time|date|day)\s*(?:'s|s|is|are|was|were)?\s+"
+    r"(?:my|our|the|this|that)\s+(?:[a-z][\w'-]*\s+){0,3}?"
     r"(?:class(?:es)?|lectures?|labs?|seminars?|tutorials?|lessons?|"
     r"exams?|midterms?|finals?|quiz(?:zes)?|meetings?|appointments?|"
     r"flights?|trains?|bus|shift)\b", re.I)
@@ -832,19 +844,70 @@ CLASS_LOOKAHEAD_DAYS = 14
 _CLASS_KIND = (r"class(?:es)?|lectures?|labs?|seminars?|tutorials?|"
                r"recitations?|lessons?")
 # The words between "my" and the noun are the course he named, if any:
-# "my biosensors class", "my electrical design lab".
+# "my biosensors class", "my electrical design lab"; the noun ITSELF is
+# captured too (k1/k2/k3), because throwing it away answered "when is my
+# next lab" with the 12:40 lecture -- measured on his own cache, where he
+# owns a course called ELECTRICAL DESIGN LAB II at 16:10.
+#
+# NO day qualifier. It used to accept a trailing today/tonight/tomorrow and
+# then ignore it: frozen at Wed 2026-09-02 08:00 against his real cache,
+# "when is my class tomorrow" answered 'BIOSENSORS in an hour, at 9:10 am'
+# -- a class that is TODAY -- and frozen on Saturday "when is my class
+# today" named Monday's. A day-scoped question is the router's new
+# local:calendar route and get_calendar, which honours a range.
+#
+# NO "are" either: "what are my classes today" asks for a LIST and was
+# answered with one row.
 _NEXT_CLASS_RX = re.compile(
-    r"^(?:what\s+time|when|where|what|which)\s*(?:'s|s|is|are|was)?\s+"
+    r"^(?:what\s+time|when|where|what|which)\s*(?:'s|s|is|was)?\s+"
     r"(?:my|our)\s+(?:(?:next|upcoming)\s+)?(?P<c1>(?:[a-z][\w'-]*\s+){0,3}?)"
-    r"(?:" + _CLASS_KIND + r")(?:\s+(?:session|period|block))?"
-    r"(?:\s+(?:today|tonight|tomorrow|this\s+(?:morning|afternoon|evening)))?"
+    r"(?P<k1>" + _CLASS_KIND + r")(?:\s+(?:session|period|block))?"
     r"\W*$"
     r"|^(?:what|which)\s+(?P<c2>(?:[a-z][\w'-]*\s+){0,2}?)"
-    r"(?:" + _CLASS_KIND + r")\s+(?:do\s+i\s+have|have\s+i\s+got|is|'s|s)\s+"
+    r"(?P<k2>" + _CLASS_KIND + r")\s+(?:do\s+i\s+have|have\s+i\s+got|is|'s|s)\s+"
     r"(?:up\s+)?next\W*$"
     r"|^when\s+(?:does|do|will)\s+(?:my|our)\s+(?:(?:next|upcoming)\s+)?"
-    r"(?P<c3>(?:[a-z][\w'-]*\s+){0,3}?)(?:" + _CLASS_KIND + r")\s+"
+    r"(?P<c3>(?:[a-z][\w'-]*\s+){0,3}?)(?P<k3>" + _CLASS_KIND + r")\s+"
     r"(?:start|begin|kick\s+off)\W*$", re.I)
+
+# "lab" has to reach ELECTRICAL DESIGN LAB II, whose folded title is
+# 'electrical design lab ii'; the rest of the nouns appear in a title the
+# way they are said.
+_KIND_TITLE = {"lab": r"labs?|laborator(?:y|ies)"}
+# A one-off sitting is invisible to courses.recurring_courses (MIN_DATES =
+# 2), so a make-up lab or the first meeting of a term is silently dropped
+# and a LATER class is named "your next class". Probed: a single SENIOR
+# DESIGN SEMINAR at now+1h beside a recurring lecture at now+2h answered
+# with the lecture and never mentioned the seminar. When something that
+# reads like a session sits in the gap, the honest move is the model and
+# get_calendar, which lists everything.
+_CLASS_TITLE_RX = re.compile(
+    r"\b(?:class|lecture|lab|seminar|recitation|tutorial|lesson|studio|"
+    r"discussion)\b", re.I)
+# ...except a Canvas row, which is coursework and never a sitting. Every
+# one of them in his cache wears the section tag: 'Prelab for Lab 3 (canvas
+# quiz) [BMEN-427:501,502,503,504,BME...]', 'HW#1 [MSEN-222:599,M99]',
+# 'Update Presentation #1 [ECEN-404:901,902,903]'. Without this the Prelab
+# row -- timed 12:40 on 2026-09-14, before his 16:10 lab -- sent "when is
+# my next lab" to the model for no reason.
+_CANVAS_TAG_RX = re.compile(r"\[[A-Z]{2,6}-\d{3}")
+_EXPLICIT_NEXT_RX = re.compile(r"\b(?:next|upcoming)\b", re.I)
+
+
+def _class_kind(word: str) -> str:
+    """The narrowing noun the question keyed on -- 'lab' from "my next lab"
+    -- or "" for the generic class / classes, which means any course."""
+    w = " ".join((word or "").lower().split())
+    if w.startswith("class"):
+        return ""
+    return w[:-1] if w.endswith("s") else w
+
+
+def _kinded_courses(kind: str, names, fold) -> list:
+    """``names`` narrowed to the courses whose title carries ``kind``."""
+    rx = re.compile(r"\b(?:" + _KIND_TITLE.get(kind, kind + r"s?") + r")\b",
+                    re.I)
+    return [n for n in names if rx.search(fold(n))]
 
 
 def _h_next_class(c, t, m):
@@ -863,6 +926,7 @@ def _h_next_class(c, t, m):
         return None          # no repeating slot in the cache: not a timetable
     query = " ".join((m.group("c1") or m.group("c2") or
                       m.group("c3") or "").split())
+    kind = _class_kind(m.group("k1") or m.group("k2") or m.group("k3") or "")
     course = ""
     if query:
         # "when is my thermodynamics class" for a course he does not take
@@ -870,13 +934,39 @@ def _h_next_class(c, t, m):
         course = courses_mod.course_for(query, list(names))
         if not course:
             return None
+        cand = [course]
+    elif kind:
+        # He said "lab", not "class": naming a lecture here is the confident
+        # wrong answer this command exists to remove. No course of that kind
+        # means the model looks, exactly as an unknown course name does.
+        cand = _kinded_courses(kind, names, courses_mod.fold)
+        if not cand:
+            return None
+    else:
+        cand = list(names)
     now = datetime.now().astimezone()
+    if not _EXPLICIT_NEXT_RX.search(t or ""):
+        # Asked mid-lecture, "where is my class" used to answer with the
+        # 16:10 lab: frozen at Wed 12:50, ten minutes into his 12:40-13:30
+        # slot in ETB 1003, it said 'ELECTRICAL DESIGN LAB II ... in
+        # Emerging Technologies 1020'. He is asking about the room he is
+        # standing in.
+        live, live_course = _class_in_progress(events, cand, now, courses_mod)
+        if live is not None:
+            where = room_words(getattr(live, "location", ""))
+            room = f", in {where}" if where else ""
+            return CommandResult(
+                handled=True, speak=True,
+                reply=f"{live_course} is on now until "
+                      f"{clock_words(live.end)}{room}, sir.",
+                status=f"{live_course[:24]} now")
     ev, found = courses_mod.next_class(
-        events, [course] if course else list(names), now,
-        within=timedelta(days=CLASS_LOOKAHEAD_DAYS))
+        events, cand, now, within=timedelta(days=CLASS_LOOKAHEAD_DAYS))
     if ev is None:
         return CommandResult(handled=True, reply=NO_CLASS_LINE, speak=True,
                              status="No class")
+    if not course and _unlisted_session(events, names, now, ev, courses_mod):
+        return None          # something class-shaped is sooner: let it list
     when = describe_due(ev.start, now)
     if when.startswith("in ") or when == "now":
         # format_events words its "next" the same way: the countdown alone
@@ -884,10 +974,47 @@ def _h_next_class(c, t, m):
         when = f"{when}, at {clock_words(ev.start)}"
     where = room_words(getattr(ev, "location", ""))
     room = f", in {where}" if where else ""
-    head = f"Your next {found} is" if course else f"Your next class is {found}"
+    noun = kind or "class"
+    head = f"Your next {found} is" if course else f"Your next {noun} is {found}"
     return CommandResult(handled=True, speak=True,
                          reply=f"{head} {when}{room}, sir.",
                          status=f"{found[:24]} {when[:24]}")
+
+
+def _class_in_progress(events, cand, now, courses_mod):
+    """(event, course) for a class of ``cand`` running right now."""
+    for ev in events:
+        end = getattr(ev, "end", None)
+        if end is None or courses_mod.slot(ev) is None:
+            continue
+        try:
+            if not (ev.start <= now < end):
+                continue
+        except TypeError:            # a naive start in a hand-built feed
+            continue
+        name = courses_mod.course_for(ev.title, cand)
+        if name:
+            return ev, name
+    return None, ""
+
+
+def _unlisted_session(events, names, now, chosen, courses_mod) -> bool:
+    """Is a class-shaped event he does NOT have a recurring slot for due
+    before ``chosen``?  See _CLASS_TITLE_RX for why this is worth a turn."""
+    for ev in events:
+        if courses_mod.slot(ev) is None:
+            continue
+        try:
+            if not (now < ev.start < chosen.start):
+                continue
+        except TypeError:
+            continue
+        if courses_mod.course_for(ev.title, names):
+            continue
+        title = str(getattr(ev, "title", "") or "")
+        if _CLASS_TITLE_RX.search(title) and not _CANVAS_TAG_RX.search(title):
+            return True
+    return False
 
 
 def _course_names(c, events) -> tuple:
@@ -905,7 +1032,16 @@ def _course_names(c, events) -> tuple:
         except Exception:            # noqa: BLE001 - source boundary
             log.debug("next class: dossier course list unavailable",
                       exc_info=True)
-    return tuple(courses_mod.recurring_courses(events))
+    try:
+        # recurring_courses sorts on the first start of each slot, so ONE
+        # naive datetime in a hand-built or future feed raises TypeError
+        # straight out of Commander.handle (reproduced: two naive-start
+        # rows beside the 30 real cache events). A source that cannot be
+        # read is the model's problem, not a traceback on the spoken path.
+        return tuple(courses_mod.recurring_courses(events))
+    except Exception:                # noqa: BLE001 - source boundary
+        log.debug("next class: course list unavailable", exc_info=True)
+        return ()
 
 
 def _h_clock(c, t, m):

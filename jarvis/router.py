@@ -525,21 +525,40 @@ _CLASS_MINE_RX = re.compile(
     r"(?:is|'s|do\s+i\s+have|have\s+i\s+got)\b"
     # "what do I have after this class"
     r"|\bafter\s+(?:this|that|my|the)\s+(?:" + _CLASS_NOUN + r")\b", re.I)
+# The frame has to be an INDEPENDENT signal, so "do i have" is NOT in it:
+# three branches of _CLASS_MINE_RX are built on those very words, and one
+# substring cannot be both halves of a two-part test.  It was: measured
+# base -> HEAD, "do I have a class for the mixer", "do I have a class for
+# that yet" and "do I have any classes without tests" all flipped from
+# `claude code-cue` to `local local:calendar`.  Nothing is lost -- every
+# diary phrasing of his that uses it carries a real frame word too ("do I
+# have class TOMORROW", "how many classes do I have TODAY").
 _CLASS_WHEN_RX = re.compile(
     r"\b(?:when|what\s+time|where|which\s+room|what\s+room|today|tonight|"
     r"tomorrow|this\s+(?:morning|afternoon|evening|week)|next\s+week|next|"
     r"after|before|starts?|starting|begins?|ends?|ending|finish(?:es|ing)?|"
-    r"over|cancell?ed|how\s+many|how\s+long|do\s+i\s+have|have\s+i\s+got|"
-    r"free)\b", re.I)
+    r"over|cancell?ed|how\s+many|how\s+long|free)\b", re.I)
 # ...and the words that make it software after all.  These are what keep
 # "how long do my tests take" and "why is my test failing" on the coding
 # route: both wear a possessive, and neither is about a room at 12:40.
+#
+# The NOUNS matter as much as the verbs, because the class_diary early
+# return in code_cues fires before verbs, objects or paths are examined, so
+# these are the only vote they get.  Measured base -> HEAD, all of these
+# had flipped to `local local:calendar`: "how many classes do I have in
+# this FILE", "how long is my class in LINES", "what do I have after this
+# class in the MODULE", "is my class cancelled by the DECORATOR", "how many
+# labs do I have in the REPO", "which classes do I have that SUBCLASS
+# Command", "do I have any classes to CLEAN UP today".
 _CLASS_CODE_RX = re.compile(
     r"\b(?:fix|write|implement|refactor|debug|rename|delete|remove|add|"
     r"run|rerun|re-run|lint|commit|push|merge|rebase|patch|mock|stub|"
     r"profile|assert|import|install|deploy|pytest|unittest|coverage|"
     r"traceback|suite|fails?|failed|failing|broken|crash(?:es|ing|ed)?|"
-    r"flaky|passes|passing|green|red)\b", re.I)
+    r"flaky|passes|passing|green|red|clean\s*up|cleanup|"
+    r"files?|modules?|repos?|repository|codebase|lines?|functions?|"
+    r"methods?|subclass(?:es)?|superclass(?:es)?|inherits?|inheritance|"
+    r"decorators?|packages?|directory|folder|docstrings?)\b", re.I)
 
 
 def class_diary(text: str) -> bool:
@@ -782,12 +801,20 @@ _CODE_HEAD_RX = re.compile(
 
 def local_cues(text: str) -> tuple[bool, bool, str, int]:
     """(strong, weak, kind, position) local cues for a normalised utterance."""
-    if class_diary(text):
+    if class_diary(text) and not _LOCAL_WRAPPER_RX.match(text):
         # Strong, so rule 4 cannot claim it back, and "calendar" so a class
         # clause of a compound reads as a diary intent (local_tool_clause).
         # forced_call still declines: _CAL_READ_RX wants the word calendar /
         # schedule / meeting, which none of these carry, so the class
         # questions Tier 1 does not answer get the full tool loop.
+        #
+        # A WRAPPER keeps its own table: "remind me to email my professor
+        # after my class" is a reminder whose tail happens to name a class,
+        # and this return relabelled it local:timekeeper -> local:calendar
+        # (measured base -> HEAD). local_tool_clause reads that reason, and
+        # _compound_hijack makes a Tier-1 command stand down when the other
+        # clause names a local tool, so the mislabel would have handed a
+        # two-clause timer to the model.
         return True, True, "calendar", 0
     best = None
     for kind, rx in _LOCAL_STRONG:
