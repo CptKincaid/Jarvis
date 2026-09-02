@@ -488,6 +488,68 @@ _NOT_LOOKUP_RX = re.compile(
     r"^\s*where\s+(?:do|does|did|can|should)\s+(?:i|we|you)\b", re.I)
 
 
+# HIS TIMETABLE, not Python.  LIVE 2026-09-02, twice in five seconds
+# (10:10:33.886 and 10:10:38.290, /tmp/vss_voice/jarvis.log):
+#     route claude (code-cue) 'what is my next class'
+#     jarvis.claude_session task 20260902-101033-f268e2 [test] model=opus
+# a billed Opus session for a lecture question, which then told him it
+# could not see his schedule.  An engineering student's diary is written
+# in CODE_OBJECTS -- class, classes, lab -- and the pos=0 rule in
+# code_cues below needs only ONE of them plus the wh-word every question
+# opens with, so "what is my next class" was a coding question with no
+# coding verb anywhere in it.  Nine phrasings went to Claude, four to the
+# code index (which would have answered out of ~/Jarvis: code_paths falls
+# back to claude.allowed_dirs) and three to the tie-break.
+#
+# The nouns cannot come out of the tables: "what does this class do" and
+# "what is in that module" have no other cue and would collapse to the
+# tie-break.  What separates the readings is POSSESSION plus a DIARY
+# FRAME -- it is HIS class, and he is asking when, where or whether he
+# has it.  "fix my failing test" has the possessive and no frame; "what
+# does this class do" has neither.
+_CLASS_NOUN = (r"class(?:es)?|lectures?|labs?|courses?|seminars?|"
+               r"tutorials?|recitations?|lessons?|timetable")
+_CLASS_MINE_RX = re.compile(
+    # "my next class", "my biosensors lab", "my electrical design lab"
+    r"\b(?:my|our)\s+(?:[a-z][\w'-]*\s+){0,3}?(?:" + _CLASS_NOUN + r")\b"
+    # the exam family only in the one shape that is never pytest: nobody
+    # says "my next test" about a suite, and "my tests" is never a sitting
+    r"|\b(?:my|our)\s+next\s+(?:test|exam|midterm|final|quiz)\b"
+    # "do I have class tomorrow", "do I have any classes today"
+    r"|\bdo(?:es)?\s+(?:i|we)\s+have\s+(?:a|an|any|another|the)?\s*"
+    r"(?:" + _CLASS_NOUN + r")\b"
+    # "how many classes do I have today"
+    r"|\b(?:" + _CLASS_NOUN + r")\s+(?:do|did)\s+(?:i|we)\s+have\b"
+    # "what class is next", "what class do I have next"
+    r"|\b(?:what|which)\s+(?:" + _CLASS_NOUN + r")\s+"
+    r"(?:is|'s|do\s+i\s+have|have\s+i\s+got)\b"
+    # "what do I have after this class"
+    r"|\bafter\s+(?:this|that|my|the)\s+(?:" + _CLASS_NOUN + r")\b", re.I)
+_CLASS_WHEN_RX = re.compile(
+    r"\b(?:when|what\s+time|where|which\s+room|what\s+room|today|tonight|"
+    r"tomorrow|this\s+(?:morning|afternoon|evening|week)|next\s+week|next|"
+    r"after|before|starts?|starting|begins?|ends?|ending|finish(?:es|ing)?|"
+    r"over|cancell?ed|how\s+many|how\s+long|do\s+i\s+have|have\s+i\s+got|"
+    r"free)\b", re.I)
+# ...and the words that make it software after all.  These are what keep
+# "how long do my tests take" and "why is my test failing" on the coding
+# route: both wear a possessive, and neither is about a room at 12:40.
+_CLASS_CODE_RX = re.compile(
+    r"\b(?:fix|write|implement|refactor|debug|rename|delete|remove|add|"
+    r"run|rerun|re-run|lint|commit|push|merge|rebase|patch|mock|stub|"
+    r"profile|assert|import|install|deploy|pytest|unittest|coverage|"
+    r"traceback|suite|fails?|failed|failing|broken|crash(?:es|ing|ed)?|"
+    r"flaky|passes|passing|green|red)\b", re.I)
+
+
+def class_diary(text: str) -> bool:
+    """True when the class / lab / lecture noun is his TIMETABLE."""
+    t = text or ""
+    if _CLASS_CODE_RX.search(t) or _PATH_RX.search(t):
+        return False
+    return bool(_CLASS_MINE_RX.search(t) and _CLASS_WHEN_RX.search(t))
+
+
 def is_code_lookup(text: str) -> bool:
     """A question the local code index can answer with a file:line."""
     t = (text or "").strip()
@@ -680,6 +742,8 @@ def _first_nonoverlapping(a_spans, b_spans):
 
 def code_cues(text: str) -> tuple[bool, bool, int]:
     """(strong, weak, position) coding cues for a normalised utterance."""
+    if class_diary(text):
+        return False, False, 10 ** 6      # his 12:40 lecture, not a Python class
     verbs = [m.span() for m in _VERB_RX.finditer(text)]
     objs = [m.span() for m in _OBJECT_RX.finditer(text)]
     paths = [m.span() for m in _PATH_RX.finditer(text)]
@@ -718,6 +782,13 @@ _CODE_HEAD_RX = re.compile(
 
 def local_cues(text: str) -> tuple[bool, bool, str, int]:
     """(strong, weak, kind, position) local cues for a normalised utterance."""
+    if class_diary(text):
+        # Strong, so rule 4 cannot claim it back, and "calendar" so a class
+        # clause of a compound reads as a diary intent (local_tool_clause).
+        # forced_call still declines: _CAL_READ_RX wants the word calendar /
+        # schedule / meeting, which none of these carry, so the class
+        # questions Tier 1 does not answer get the full tool loop.
+        return True, True, "calendar", 0
     best = None
     for kind, rx in _LOCAL_STRONG:
         m = rx.search(text)

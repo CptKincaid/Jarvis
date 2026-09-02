@@ -755,13 +755,28 @@ _CLOCK_PLACE_RX = re.compile(
     r"\b(?:time|date|day)\b.*?\b(?:in|at|over in|for)\s+(?!the\b|a\b|an\b)[a-z]", re.I)
 
 
+# ...and "what time is my class" names something in his DIARY. The wall
+# clock answered it live on 2026-09-02 10:10 -- "It's 10:25 in the
+# morning, sir." -- because _CLOCK_KINDS' "time" branch only needs the
+# words "what time". The answer is the timetable (Command("next class"))
+# or the calendar; it is never the current time.
+_CLOCK_MINE_RX = re.compile(
+    r"\bwhat\s+time\b.*?\b(?:my|our|the|this|that)\s+(?:[a-z][\w'-]*\s+){0,3}?"
+    r"(?:class(?:es)?|lectures?|labs?|seminars?|tutorials?|lessons?|"
+    r"exams?|midterms?|finals?|quiz(?:zes)?|meetings?|appointments?|"
+    r"flights?|trains?|bus|shift)\b", re.I)
+
+
 def clock_kind(text: str) -> Optional[str]:
     """'time' / 'date' / 'day' when the text asks for the clock, else None.
-    A question that names a place is left to the router and get_time."""
+    A question that names a place is left to the router and get_time; one
+    that names something of his is left to the timetable / the calendar."""
     text = text or ""
     for kind, rx in _CLOCK_KINDS:
         if rx.search(text):
-            return None if _CLOCK_PLACE_RX.search(text) else kind
+            if _CLOCK_PLACE_RX.search(text) or _CLOCK_MINE_RX.search(text):
+                return None
+            return kind
     return None
 
 
@@ -789,6 +804,108 @@ def clock_reply(now: datetime, kind: str = "time") -> str:
     else:
         part = "at night"
     return f"It's {hour % 12 or 12}:{now.minute:02d} {part}, sir."
+
+
+# ---- Tier 1 next class ----------------------------------------------
+# "What's my next class?" answered from the calendar cache with no model
+# turn, the way _h_next_exam answers "when's my next exam" from the same
+# sources.  LIVE 2026-09-02 10:10:33 and again at 10:10:38 it was
+# `route claude (code-cue)` instead -- a billed Opus session that then
+# said it could not see his schedule.  jarvis/router.class_diary stops the
+# misroute; this is the answer, and the answer was always there: run
+# against the live cache that morning, recurring_courses + next_class gave
+# ("MAGNETIC RESONANCE ENGR", 12:40, ETB 1003).
+#
+# NOT a get_calendar path.  range="next" is the next EVENT of any kind:
+# measured on the same cache at 09:00 the following day it answers with an
+# MBA admissions Zoom while next_class answers ELECTRICAL DESIGN LAB II.
+# courses.next_class (jarvis/courses.py) had no caller in the repo at all;
+# this is its first one.
+#
+# Registered AHEAD of Command("clock", ...) -- REGISTRY index 4, and the
+# first thing _route_text tries in jarvis mode -- because clock_kind
+# matches "what time is my class" and answered it "It's 10:25 in the
+# morning, sir.".
+NO_CLASS_LINE = "Nothing on your timetable for the next two weeks, sir."
+CLASS_LOOKAHEAD_DAYS = 14
+
+_CLASS_KIND = (r"class(?:es)?|lectures?|labs?|seminars?|tutorials?|"
+               r"recitations?|lessons?")
+# The words between "my" and the noun are the course he named, if any:
+# "my biosensors class", "my electrical design lab".
+_NEXT_CLASS_RX = re.compile(
+    r"^(?:what\s+time|when|where|what|which)\s*(?:'s|s|is|are|was)?\s+"
+    r"(?:my|our)\s+(?:(?:next|upcoming)\s+)?(?P<c1>(?:[a-z][\w'-]*\s+){0,3}?)"
+    r"(?:" + _CLASS_KIND + r")(?:\s+(?:session|period|block))?"
+    r"(?:\s+(?:today|tonight|tomorrow|this\s+(?:morning|afternoon|evening)))?"
+    r"\W*$"
+    r"|^(?:what|which)\s+(?P<c2>(?:[a-z][\w'-]*\s+){0,2}?)"
+    r"(?:" + _CLASS_KIND + r")\s+(?:do\s+i\s+have|have\s+i\s+got|is|'s|s)\s+"
+    r"(?:up\s+)?next\W*$"
+    r"|^when\s+(?:does|do|will)\s+(?:my|our)\s+(?:(?:next|upcoming)\s+)?"
+    r"(?P<c3>(?:[a-z][\w'-]*\s+){0,3}?)(?:" + _CLASS_KIND + r")\s+"
+    r"(?:start|begin|kick\s+off)\W*$", re.I)
+
+
+def _h_next_class(c, t, m):
+    from jarvis import courses as courses_mod
+    from jarvis.dossier import room_words
+    from jarvis.tools.calendar import describe_due
+    from jarvis.tools.location import clock_words
+    # The same source boundary the exam lookup crosses: a feed that is
+    # unconfigured or down is [] and never an exception on the spoken path.
+    from jarvis.tools.canvas import _calendar_events
+    events = _calendar_events(c._svc("calendar"))
+    if not events:
+        return None          # nothing READ is not nothing on: let the model
+    names = _course_names(c, events)
+    if not names:
+        return None          # no repeating slot in the cache: not a timetable
+    query = " ".join((m.group("c1") or m.group("c2") or
+                      m.group("c3") or "").split())
+    course = ""
+    if query:
+        # "when is my thermodynamics class" for a course he does not take
+        # falls through rather than answering with a different one.
+        course = courses_mod.course_for(query, list(names))
+        if not course:
+            return None
+    now = datetime.now().astimezone()
+    ev, found = courses_mod.next_class(
+        events, [course] if course else list(names), now,
+        within=timedelta(days=CLASS_LOOKAHEAD_DAYS))
+    if ev is None:
+        return CommandResult(handled=True, reply=NO_CLASS_LINE, speak=True,
+                             status="No class")
+    when = describe_due(ev.start, now)
+    if when.startswith("in ") or when == "now":
+        # format_events words its "next" the same way: the countdown alone
+        # ("in 2 hours") is not a time he can write down.
+        when = f"{when}, at {clock_words(ev.start)}"
+    where = room_words(getattr(ev, "location", ""))
+    room = f", in {where}" if where else ""
+    head = f"Your next {found} is" if course else f"Your next class is {found}"
+    return CommandResult(handled=True, speak=True,
+                         reply=f"{head} {when}{room}, sir.",
+                         status=f"{found[:24]} {when[:24]}")
+
+
+def _course_names(c, events) -> tuple:
+    """His course titles: the dossier's memoised list when it is running
+    (it also folds in any Canvas names already cached), else derived from
+    the events -- jarvis/courses.recurring_courses is the only source that
+    works on this box, where canvas.token is empty."""
+    from jarvis import courses as courses_mod
+    dossier = c._svc("dossier")
+    if dossier is not None:
+        try:
+            names = tuple(dossier.courses(events))
+            if names:
+                return names
+        except Exception:            # noqa: BLE001 - source boundary
+            log.debug("next class: dossier course list unavailable",
+                      exc_info=True)
+    return tuple(courses_mod.recurring_courses(events))
 
 
 def _h_clock(c, t, m):
@@ -6005,6 +6122,11 @@ REGISTRY: list[Command] = [
                         "what do you see", "look at screen"),
             _h_describe_screen, needs=("context",)),
     Command("autonomous", _m_autonomous, _h_autonomous, needs=("brain",)),
+    # BEFORE the clock: clock_kind matches "what time is my class" and
+    # answered it with the wall clock (live 2026-09-02, "It's 10:25 in the
+    # morning, sir."). The handler returns None when the calendar was
+    # never read, so an unconfigured box still falls through to the model.
+    Command("next class", _NEXT_CLASS_RX.match, _h_next_class),
     Command("clock", clock_kind, _h_clock),              # Tier 1 clock
     Command("math", math_kind, _h_math),                 # Tier 1 arithmetic
     Command("courtesy", courtesy_kind, _h_courtesy),     # Tier 1 courtesy
@@ -6284,6 +6406,9 @@ ASSISTANT_TIER1: list[Command] = [
                     "list schedule", "cancel schedule", "adjust schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "register", "next exam",
+                    # "what's my next class" arrives with the wake word
+                    # already eaten, like every other question at the desk
+                    "next class",
                     # "play my liked songs" arrives by voice with the wake
                     # word already eaten; without this name it would reach
                     # the router and the model round trip it exists to skip
@@ -9164,6 +9289,14 @@ class Commander:
         # three courtesies are answered locally first, so Tier 2 never
         # guesses a time or muddles a good night.
         if CONFIG.jarvis_mode:
+            # Ahead of the clock, for the same reason the registry entry
+            # is: clock_kind claims "what time is my class" and this is
+            # the rung it would be claimed on when he says it bare.
+            cm = _NEXT_CLASS_RX.match(text.strip())
+            if cm:
+                res = _h_next_class(self, text, cm)
+                if res is not None:
+                    return res
             kind = clock_kind(text)
             if kind:
                 return _h_clock(self, text, kind)

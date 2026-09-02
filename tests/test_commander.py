@@ -1652,6 +1652,7 @@ TIER1_SAMPLES = {
     "music resume": "start playing my spotify",   # the 20:56:42 clause
     "diagnostics": "run diagnostics",
     "next exam": "when's my next exam",
+    "next class": "what's my next class",       # the 10:10:33 misroute
     "leave time": "it takes ten minutes to get to wisenbaker",
     "leave time amend": "make that ten next time",
     "leave time query": "how long to wisenbaker",
