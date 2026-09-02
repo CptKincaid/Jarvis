@@ -61,7 +61,7 @@ def test_unconfigured_filter_passes_audio_through(audio):
 def test_enrolled_but_embedding_fails_now_rejects(audio, monkeypatch):
     """The regression: a broken model used to admit every voice."""
     v = make(enrolled=True)
-    monkeypatch.setattr(v, "_extract_embedding", lambda a: None)
+    monkeypatch.setattr(v, "_extract_embedding", lambda a, min_seconds=1.0: None)
 
     ok, score = v.verify(audio)
 
@@ -99,7 +99,7 @@ def test_model_merely_not_loaded_YET_is_loaded_on_demand(audio, monkeypatch):
     monkeypatch.setattr(v, "load_model", fake_load)
     emb = np.zeros(192, dtype=np.float32)
     emb[0] = 1.0
-    monkeypatch.setattr(v, "_extract_embedding", lambda a: emb)
+    monkeypatch.setattr(v, "_extract_embedding", lambda a, min_seconds=1.0: emb)
 
     filtered, _ = v.filter_segments(audio)
 
@@ -121,7 +121,7 @@ def test_a_failed_load_is_not_retried_every_utterance(audio, monkeypatch):
 
 
 def test_error_mid_filter_drops_everything(audio, monkeypatch):
-    def boom(chunk):
+    def boom(chunk, min_seconds=1.0):
         raise RuntimeError("cuda gone")
 
     v = make(enrolled=True)
@@ -137,7 +137,7 @@ def test_score_returns_none_when_it_cannot_be_computed(audio, monkeypatch):
     """Callers that want their own fallback need to distinguish 'not you'
     from 'could not tell' -- verify() collapses both into False."""
     v = make(enrolled=True)
-    monkeypatch.setattr(v, "_extract_embedding", lambda a: None)
+    monkeypatch.setattr(v, "_extract_embedding", lambda a, min_seconds=1.0: None)
     assert v.score(audio) is None
 
 
@@ -145,7 +145,7 @@ def test_score_returns_similarity_without_applying_a_policy(audio, monkeypatch):
     v = make(enrolled=True, threshold=0.99)
     emb = np.zeros(192, dtype=np.float32)
     emb[0] = 1.0
-    monkeypatch.setattr(v, "_extract_embedding", lambda a: emb)
+    monkeypatch.setattr(v, "_extract_embedding", lambda a, min_seconds=1.0: emb)
 
     s = v.score(audio)
 

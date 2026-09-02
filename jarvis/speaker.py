@@ -315,11 +315,17 @@ class SpeakerVerifier:
         return False
 
     # ------------------------------------------------------ embeddings
-    def _extract_embedding(self, audio_16k):
+    def _extract_embedding(self, audio_16k, min_seconds=MIN_AUDIO_SECONDS):
         """Extract a 192-dim speaker embedding from 16kHz audio.
 
         Args:
             audio_16k: numpy array, mono, 16kHz float32
+            min_seconds: trimmed speech below which no embedding is taken.
+                The default is the transcript-length floor every caller here
+                wants; the wake gate passes MIN_SPEECH_SECONDS, because its
+                2 s ring buffer holds 0.40-0.88 s of speech on 6 of his 10
+                own wake clips (measured 2026-09-02) and a None there leaves
+                the gate blind on most wakes.
 
         Returns:
             numpy array of shape (192,) or None on failure
@@ -334,7 +340,7 @@ class SpeakerVerifier:
         # trim lands on all of them at once -- including the wake-word gate,
         # which scores a 1 s buffer that is mostly pre-speech silence.
         audio_16k = trim_silence(audio_16k)
-        if len(audio_16k) < int(SAMPLE_RATE * MIN_AUDIO_SECONDS):
+        if len(audio_16k) < int(SAMPLE_RATE * min_seconds):
             return None
         try:
             import torch
@@ -397,17 +403,25 @@ class SpeakerVerifier:
     enroll = enroll_from_audio
 
     # ---------------------------------------------------- verification
-    def score(self, audio_16k):
+    def score(self, audio_16k, min_seconds=MIN_AUDIO_SECONDS):
         """Cosine similarity to the voiceprint, or None if it cannot be computed.
 
         Applies no accept/reject policy, unlike verify(), which collapses "not
         you" and "could not tell" into the same False. Callers needing their
         own fallback use this -- the wake-word gate fails OPEN where the
         transcript gate fails SHUT, so it cannot reuse verify()'s verdict.
+
+        min_seconds lets such a caller trade a weaker number for having one at
+        all. It is the caller's job to then treat a weak number as weak: the
+        wake gate scores at MIN_SPEECH_SECONDS and, where it can MEASURE that
+        the buffer held less than MIN_AUDIO_SECONDS of speech, refuses to
+        reject on the result. Measured 2026-09-02, that relief is confined to
+        the log on the wake path -- both of its branches wake him below the
+        floor -- so this argument is instrumentation, not a policy hook.
         """
         if not self.is_enrolled:
             return None
-        embedding = self._extract_embedding(audio_16k)
+        embedding = self._extract_embedding(audio_16k, min_seconds)
         if embedding is None:
             return None
         with self._lock:

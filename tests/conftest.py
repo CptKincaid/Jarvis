@@ -60,6 +60,15 @@ os.environ["JARVIS_SPOTIFY_TOKEN"] = str(_TEST_SPOTIFY_TOKEN)
 # ~/.aiws_trainer/intent_log.json (found 2026-08-30). Forced, not
 # setdefault: a preset pointing at the live file would defeat the firewall.
 os.environ["JARVIS_INTENT_LOG"] = str(_TEST_LOG_DIR / "intent_log.json")
+# The enrolled VOICEPRINT (jarvis/speaker.py reads PATHS.VOICEPRINT at import
+# and save() writes that global). On 2026-09-02 a test that built a real
+# SpeakerVerifier and called enroll_from_audio overwrote his 6-sample pool with
+# two copies of its fixture's constant vector; his own enrolment clips then
+# scored 0.055-0.125 against a 0.30 threshold, i.e. the transcript gate --
+# which fails SHUT -- would have dropped every command he spoke after the next
+# restart. Forced, not setdefault: a shell pointing at the live file must not
+# defeat this.
+os.environ["JARVIS_VOICEPRINT"] = str(_TEST_LOG_DIR / "voiceprint.npz")
 # The docs embedding index (jarvis/tools/docs.py: env > config > default):
 # without this a test building the real App indexes into the user's
 # ~/.aiws_trainer/docs_index.
@@ -116,6 +125,11 @@ def _firewall_live_log_dir():
     from jarvis import mixer as _mixer
     assert _mixer.blocked(), \
         "the room controls could reach the user's live display and audio"
+    from jarvis import speaker as _speaker
+    real_voiceprint = Path.home() / ".aiws_trainer" / "voiceprint.npz"
+    assert _speaker.VOICEPRINT_FILE != real_voiceprint, \
+        "speaker.VOICEPRINT_FILE still targets the user's enrolled voice"
+    assert config.PATHS.VOICEPRINT != real_voiceprint, "PATHS.VOICEPRINT still live"
     try:
         from jarvis import jarvis_agent
         assert jarvis_agent.LOG_DIR != live, "jarvis_agent LOG_DIR still live"
