@@ -597,6 +597,13 @@ class MainWindow:
         self._gpu_util_pct: Optional[int] = None
         self._room_state_gpu_kw: Optional[bool] = None   # asked once, by signature
         self._standby_origin = None      # window position before it drifts
+        # …and the burn-in offset currently ON the window, i.e. the last
+        # (dx, dy) _on_console_drift actually applied. Not recomputed from
+        # console_mode at read time on purpose: that would be the offset for
+        # NOW, while the window is still holding the one from the last 1 Hz
+        # tick. What re-anchoring a drag needs is the displacement that is
+        # really baked into the geometry, and only the mover knows that.
+        self._standby_drift = (0, 0)
         self._footer_hidden = False
         self._term_available = terminal_available()
         self._session_seen = False       # a jarvis-* tmux session is alive
@@ -736,7 +743,20 @@ class MainWindow:
         the scaled minimum comes from a pre-HiDPI run — replace it with
         the scaled default (keeping the saved position)."""
         saved = CONFIG.window_geometry or ""
-        m = re.fullmatch(r"(\d+)x(\d+)([+-]\d+[+-]\d+)?", saved)
+        # `[+-]-?\d+`, not `[+-]\d+`: Tk spells a negative position with the
+        # gravity sign FIRST and the coordinate after it — "+-37+-17" — and
+        # that is verbatim what `wm geometry` hands back for the string our
+        # own writers produce (measured on a scratch Xvfb: geometry("+-34+-21")
+        # is accepted, echoes "520x880+-34+-21", winfo_x() == -34). Both
+        # writers can reach it: `_move_drag` whenever he drags the panel's
+        # top-left past the top or left edge, and standby's re-anchor from a
+        # drop made entirely on screen while the burn-in walk was pushing
+        # right. Rejecting it cost him his saved SIZE as well as his
+        # position. Note "-37-17" is a different geometry, not a tidier
+        # spelling of the same one — that is right/bottom gravity and lands
+        # near the far corner — so the pattern is widened here and the string
+        # is never rewritten.
+        m = re.fullmatch(r"(\d+)x(\d+)([+-]-?\d+[+-]-?\d+)?", saved)
         if not m:
             if saved:
                 log.warning("bad saved geometry %r; using default", saved)
@@ -761,7 +781,35 @@ class MainWindow:
             return
         self._geom_ts = now
         dx, dy = self._drag_off
-        self.root.geometry(f"+{event.x_root - dx}+{event.y_root - dy}")
+        x, y = event.x_root - dx, event.y_root - dy
+        self.root.geometry(f"+{x}+{y}")
+        # Re-anchor the burn-in walk (2026-09-02: "if jarvis is in standby
+        # mode and i try and drag him he jumps back to where he was being
+        # dragged from"). Every drift tick sets origin + offset from
+        # scratch, so a drag that moved the window without moving the origin
+        # was undone one second later. The new origin is where he dropped it
+        # MINUS the drift already on the window — anchoring to the raw
+        # position would make the next tick jump by the whole accumulated
+        # offset instead. This is the only user-move path: _move_to is ours
+        # and must not re-anchor.
+        #
+        # The signal is taken here and NOT from a <Configure> binding —
+        # though not because our own moves would be indistinguishable from
+        # his. Since this fix, `_standby_origin + _standby_drift` IS the
+        # position we last asked for, and a Configure handler could tell the
+        # two apart by comparing against it, with no extra state. The real
+        # reason is timing: <Configure> arrives only once the WM has acted,
+        # so mid-drag it reports a position one or more writes behind this
+        # 60 Hz stream and would re-anchor to a stale one — and a WM that
+        # clamps or snaps OUR _move_to would look exactly like a move he
+        # made. What staying here costs: a WM-initiated move (GNOME
+        # Super+drag, a keyboard move, a tiling snap) never reaches this
+        # handler, so it is still yanked back by the next drift tick. The
+        # header drag is the gesture a borderless window offers, and it is
+        # the one he reported.
+        if self._standby_origin is not None:
+            drift_x, drift_y = self._standby_drift
+            self._standby_origin = (x - drift_x, y - drift_y)
 
     def _build_grip(self):
         g = px(18)
@@ -1467,11 +1515,19 @@ class MainWindow:
                 try:
                     self._standby_origin = (self.root.winfo_x(),
                                             self.root.winfo_y())
+                    self._standby_drift = (0, 0)   # nothing applied yet
                 except tk.TclError:
                     self._standby_origin = None
         elif self._standby_origin is not None:
-            self._move_to(*self._standby_origin)      # undo the burn-in walk
+            # Undo the burn-in walk — and ONLY the walk. A drag during
+            # standby moved the origin with it (_move_drag), so what comes
+            # off here is the drift this program applied and never the
+            # reposition he applied. _on_close saves root.geometry() after
+            # modes.stop() has come through here, so his standby drag
+            # persists exactly the way an active-mode drag does.
+            self._move_to(*self._standby_origin)
             self._standby_origin = None
+            self._standby_drift = (0, 0)
 
     def _set_footer_hidden(self, hidden: bool):
         """Standby hides the command bar and the status strip so the panel
@@ -1502,6 +1558,10 @@ class MainWindow:
         its decor, which is baked at fixed coordinates."""
         if self._standby_origin is None:
             return
+        # Recorded BEFORE the move: _move_drag re-anchors against it, and a
+        # drag that arrives between two ticks must subtract the offset the
+        # window is actually wearing.
+        self._standby_drift = (dx, dy)
         self._move_to(self._standby_origin[0] + dx,
                       self._standby_origin[1] + dy)
 
