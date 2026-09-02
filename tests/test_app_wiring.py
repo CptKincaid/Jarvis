@@ -1527,6 +1527,15 @@ def test_the_wake_gate_learns_about_music_from_the_same_spotify_tool(build):
     music = kw.get("music_playing")
     assert callable(music), "Hotword was not handed a music_playing callable"
     assert kw.get("on_guest") == app._on_guest
+    # The stub above swallows anything; the REAL class has to take exactly
+    # what the app hands it, or every keyword here is a keyword into the void.
+    # (tests/test_hotword_gating.py then drives the real constructor's
+    # music_playing through _listen_loop.)
+    import inspect as _inspect
+
+    import jarvis.hotword as hw_mod
+    takes = set(_inspect.signature(hw_mod.Hotword.__init__).parameters)
+    assert set(kw) <= takes, f"Hotword does not accept {set(kw) - takes}"
     spotify = getattr(app.services, "spotify", None)
     assert spotify is not None and app.mixer._remote is spotify
     assert music() is False                      # a fresh box: nothing known

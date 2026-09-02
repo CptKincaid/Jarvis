@@ -249,17 +249,29 @@ def test_ambient_dbfs_reads_the_bed_under_the_voice():
 def test_his_voice_over_music_wakes_him_through_the_real_loop(monkeypatch):
     """End to end through _listen_loop: the 0.135 that was refused on
     2026-09-01, with music known playing, reaches on_detect and never
-    on_guest; the same run with the music flag off is the old refusal."""
+    on_guest; the same run with the music flag off is the old refusal.
+
+    The callable is passed to the real Hotword CONSTRUCTOR, the way app.py
+    passes it, rather than poked onto the instance -- a kwarg the class
+    silently ignored would otherwise look exactly like a pass here."""
     from tests.test_wake_after_resume import Harness, _Speaker
 
-    h = Harness(monkeypatch, hit_after=25, speaker=_Speaker(0.135), budget=6.0)
-    h.hw._music_playing = lambda: True
+    asked = []
+    h = Harness(monkeypatch, hit_after=25, speaker=_Speaker(0.135), budget=6.0,
+                music_playing=lambda: bool(asked.append(1) or True))
     h.run()
     assert h.detected == [pytest.approx(0.95)]
     assert not h.guests
+    assert asked, "the constructor's music_playing was never consulted"
 
-    quiet = Harness(monkeypatch, hit_after=25, speaker=_Speaker(0.135), budget=6.0)
-    quiet.hw._music_playing = lambda: False
+    quiet = Harness(monkeypatch, hit_after=25, speaker=_Speaker(0.135),
+                    budget=6.0, music_playing=lambda: False)
     quiet.run()
     assert not quiet.detected
     assert quiet.guests
+
+    # And with nothing wired at all -- a box with no Spotify -- the gate is
+    # the strict one it has always been.
+    none = Harness(monkeypatch, hit_after=25, speaker=_Speaker(0.135), budget=6.0)
+    none.run()
+    assert not none.detected and none.guests

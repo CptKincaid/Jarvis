@@ -121,14 +121,23 @@ LIBRESPOT_NAME = "Spark"
 # threshold reads it).  A "playing" older than PLAYING_TTL_S is not evidence:
 # an album ends, a phone leaves the house, and a gate relaxed on stale news
 # is a gate relaxed for a stranger.  The poller keeps it fresh -- every
-# POLL_PLAYING_S while playing, POLL_IDLE_S once paused -- and runs ONLY while
-# the cache says playing or a play command is under POLL_AFTER_PLAY_S old, so
-# a Spotify nobody is using costs no requests at all.  ~2 requests a minute
-# while playing, against a rate limit measured in requests per second.
+# POLL_PLAYING_S while playing, POLL_IDLE_S once paused.
+#
+# ONLY /me/player may write "playing" into that cache.  The obvious cheaper
+# signal -- "Spotify lists an active Connect device", which the remote duck
+# already fetches on every hold -- is NOT the same question: Spotify leaves
+# the last device active long after a pause (HPCOMPUTER was still listed
+# active all evening on 2026-09-01), so reading it as music would arm the
+# relaxed wake bar after every single turn, in a silent room, for as long as
+# Spotify stays linked.  An active device is only a REASON TO ASK: it starts
+# the poller (POLL_AFTER_DEVICE_S), and the poller's honest answer is what
+# lands in the cache.  That also covers music he started on his phone
+# without telling Jarvis -- one hold, one poll, and the gate knows.
 PLAYING_TTL_S = 150.0
 POLL_PLAYING_S = 30.0
 POLL_IDLE_S = 60.0
 POLL_AFTER_PLAY_S = 600.0
+POLL_AFTER_DEVICE_S = 600.0
 POLL_BACKOFF_MAX_S = 300.0
 API_TIMEOUT_S = 8
 MARKET = "from_token"      # relative to the user token; overridable with spotify.market
@@ -616,6 +625,7 @@ class SpotifyTool:
         self._music_playing = False
         self._music_at = -1e9          # when the cache was last written
         self._played_at = -1e9         # his last play/resume command
+        self._device_at = -1e9         # last time a Connect device was active
         self._poll_enabled = bool(poll)
         self._poll_thread: Optional[threading.Thread] = None
         self._poll_stop = threading.Event()
@@ -928,15 +938,14 @@ class SpotifyTool:
         try:
             self.ensure_ready()
             dev = next((d for d in self.devices() if d.is_active), None)
-            # The device lookup doubles as the music probe: an active Connect
-            # device is the one thing the wake gate can learn about between
-            # turns without a request of its own (see music_playing).  It
-            # over-approximates -- Spotify keeps a device "active" for a while
-            # after a pause -- and that is accepted rather than spending a
-            # third request on /me/player inside a duck he is waiting on: the
-            # relaxed bar it unlocks still sits above every non-Hunter score
-            # measured, and the poller corrects it within POLL_PLAYING_S.
-            self._note_music(dev is not None)
+            # The device lookup is a REASON TO ASK, never an answer.  An
+            # active Connect device is not playing music: Spotify keeps the
+            # last one active long after a pause, and this duck runs on every
+            # hold, so calling it music would leave the wake gate's relaxed
+            # bar armed after every turn with nothing coming out of any
+            # speaker.  Arm the poller instead and let /me/player say.
+            if dev is not None:
+                self._note_device_active()
             if dev is None or dev.id is None or not isinstance(dev.volume, int):
                 return False
             if _norm(dev.name) == _norm(self.local_device):
@@ -956,16 +965,28 @@ class SpotifyTool:
         return True
 
     def unduck(self) -> bool:
-        """Put the remote device back where he had it.  Idempotent."""
+        """Put the remote device back where he had it.  Idempotent.
+
+        His original volume is kept until the write CONFIRMS.  It used to be
+        popped first, so one transient 5xx on the way back discarded the only
+        record of where he had it and left the device at 30 % of his volume
+        for good; that was unreachable while the remote duck never fired, and
+        this branch fires it on every hold.  The Room Mixer retries on its
+        next pump and once more at stop(), and what is still held down is in
+        its state file for the next start to heal."""
         with self._lock:
-            saved, self._ducked_from = self._ducked_from, None
+            saved = self._ducked_from
         if saved is None:
             return False
         try:
             self._api("volume", int(saved[1]), device_id=saved[0])
         except SpotifyError as exc:
-            log.debug("spotify: remote unduck failed (%s)", exc.text)
+            log.debug("spotify: remote unduck failed (%s); keeping %s at %d%% "
+                      "for a retry", exc.text, saved[2], saved[1])
             return False
+        with self._lock:
+            if self._ducked_from == saved:
+                self._ducked_from = None
         return True
 
     @property
@@ -973,6 +994,50 @@ class SpotifyTool:
         """Name of the Connect device a duck is holding down, else None."""
         with self._lock:
             return self._ducked_from[2] if self._ducked_from else None
+
+    @property
+    def ducked_state(self) -> Optional[dict]:
+        """What a duck is holding down, as the Room Mixer persists it: the
+        device, HIS volume, and the name for the log.  The remote has no
+        stream-restore database and no pactl, so that file is the only thing
+        that survives a crash between the duck and the restore."""
+        with self._lock:
+            saved = self._ducked_from
+        if saved is None:
+            return None
+        return {"device": saved[0], "volume_pct": int(saved[1]), "name": saved[2]}
+
+    def restore_volume(self, device_id: str, volume_pct: int,
+                       at_or_below: Optional[int] = None) -> Optional[bool]:
+        """Put a device back to a volume a previous run left it away from.
+
+        The heal path, called by the Room Mixer from its state file.  Returns
+        True when the volume was written, False when the device is there but
+        must be left alone, and None when it is not listed at all -- the
+        caller keeps the record and asks again, exactly as heal() keeps a
+        sink-input entry until its stream reappears.
+
+        ``at_or_below`` is the local heal's rule in remote form: only a device
+        still sitting at (or under) the duck floor can still be ours.  Anything
+        louder is a volume he has since chosen himself, and moving it would be
+        the mixer overruling him."""
+        try:
+            self.ensure_ready()
+            dev = next((d for d in self.devices() if d.id == device_id), None)
+            if dev is None:
+                return None
+            if at_or_below is not None and isinstance(dev.volume, int) and \
+                    dev.volume > at_or_below:
+                log.debug("spotify: %s is at %d%%, above the %d%% floor -- his "
+                          "own volume, left alone", dev.name, dev.volume,
+                          at_or_below)
+                return False
+            self._api("volume", max(0, min(100, int(volume_pct))),
+                      device_id=device_id)
+        except SpotifyError as exc:
+            log.debug("spotify: remote heal failed (%s)", exc.text)
+            return None
+        return True
 
     # ------------------------------------------------------- music state
     def music_playing(self) -> bool:
@@ -1004,13 +1069,26 @@ class SpotifyTool:
             self._played_at = self._now()
         self._note_music(True)
 
+    def _note_device_active(self) -> None:
+        """A Connect device is active.  NOT music -- Spotify keeps the last
+        device active long after a pause -- so this writes no state the wake
+        gate reads.  It only buys the poller a reason to ask /me/player,
+        which is the one source allowed to say "playing"."""
+        with self._music_lock:
+            self._device_at = self._now()
+        self._ensure_poll()
+
     def _poll_wanted(self) -> bool:
         """Under _music_lock.  The poller runs only while it has a reason:
-        the cache says playing, or he pressed play within POLL_AFTER_PLAY_S."""
+        the cache says playing, he pressed play within POLL_AFTER_PLAY_S, or
+        a Connect device was active within POLL_AFTER_DEVICE_S.  A Spotify
+        with nothing linked and nothing active still costs no requests."""
         now = self._now()
         if self._music_playing and now - self._music_at <= PLAYING_TTL_S:
             return True
-        return now - self._played_at <= POLL_AFTER_PLAY_S
+        if now - self._played_at <= POLL_AFTER_PLAY_S:
+            return True
+        return now - self._device_at <= POLL_AFTER_DEVICE_S
 
     def _poll_once(self) -> Optional[float]:
         """One refresh of the cache: the seconds until the next, or None
@@ -1034,8 +1112,12 @@ class SpotifyTool:
         return POLL_PLAYING_S if state == "playing" else POLL_IDLE_S
 
     def _poll_loop(self) -> None:
-        interval = POLL_PLAYING_S
-        while not self._poll_stop.wait(interval):
+        # Refresh FIRST, then wait.  A leading sleep made the poller useless
+        # for the thing it exists to do: the duck's device probe starts it,
+        # and a 30 s wait before the first read left that guess standing for
+        # longer than most conversations.  It is also how music he started on
+        # his phone becomes known within one interval instead of two.
+        while not self._poll_stop.is_set():
             nxt = self._poll_once()
             if nxt is None:
                 # Hand the slot back under the lock, so a play command that
@@ -1046,7 +1128,8 @@ class SpotifyTool:
                         self._poll_thread = None
                         return
                 nxt = POLL_IDLE_S
-            interval = nxt
+            if self._poll_stop.wait(nxt):
+                return
 
     def _ensure_poll(self) -> None:
         if not self._poll_enabled:

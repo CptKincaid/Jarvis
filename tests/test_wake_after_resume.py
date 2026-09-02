@@ -278,7 +278,7 @@ class Harness:
 
     def __init__(self, monkeypatch, rate=16000, hit_after=None,
                  speaker=None, budget=60.0, pause_after=None,
-                 on_pause=None):
+                 on_pause=None, music_playing=None):
         self.sd = _FakeSD(rate)
         self.clock = _Clock(self.sd, budget)
         self.model = _ScriptedModel(hit_after)
@@ -293,8 +293,13 @@ class Harness:
                             raising=False)
         monkeypatch.setattr(hw.CONFIG, "speaker_verify", True)
         self.speaker = speaker if speaker is not None else _Speaker()
+        # music_playing goes through the CONSTRUCTOR, not onto the instance
+        # afterwards: app.py hands it in as a keyword, and a keyword the real
+        # class quietly stopped accepting is exactly the kind of dead wiring
+        # #72 was (built, fake-tested, never connected).
         self.hw = hw.Hotword(None, lambda: 0, self._on_detect,
-                             speaker=self.speaker, on_guest=self.guests.append)
+                             speaker=self.speaker, on_guest=self.guests.append,
+                             music_playing=music_playing)
         self.hw._model = self.model        # skip the real oww load entirely
         self.hw.active = True
         if pause_after is not None:
