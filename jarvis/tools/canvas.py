@@ -374,19 +374,27 @@ def _parse_iso(text) -> Optional[datetime]:
     return dt
 
 
+def in_local(dt: datetime, now: datetime) -> datetime:
+    """``dt`` read on the same clock ``now`` is written on.
+
+    datetime.now().astimezone() hands back a FIXED offset, not a zone; a due
+    date on the other side of a DST change (inside every 30-day window in
+    March and November) renders an hour off and often a day off. Measured at
+    now = 2026-10-30 07:05 CDT, an exam at 2026-11-01 23:59 CST came out
+    "Monday at 12:59 am", three days away instead of two. A bare
+    astimezone() follows the system zone through the change; an explicit
+    zone (a test's ZoneInfo) is still honoured."""
+    if now.tzinfo is None:
+        return dt
+    if isinstance(now.tzinfo, timezone):
+        return dt.astimezone()
+    return dt.astimezone(now.tzinfo)
+
+
 def when_words(dt: datetime, now: datetime) -> str:
     """today 11:59 pm / tomorrow 11:59 pm / Tue 11:59 pm / Tue 15 Sep 11:59 pm,
     in ``now``'s timezone (the local one at call time)."""
-    # datetime.now().astimezone() hands back a FIXED offset; a due date on
-    # the other side of a DST change (inside every 30-day window in March
-    # and November) would render an hour off and often a day off. A bare
-    # astimezone() follows the system zone through the change.
-    if now.tzinfo is None:
-        local = dt
-    elif isinstance(now.tzinfo, timezone):
-        local = dt.astimezone()
-    else:
-        local = dt.astimezone(now.tzinfo)
+    local = in_local(dt, now)
     today = now.date()
     day = local.date()
     clock = clock_words(local)
@@ -675,7 +683,7 @@ def next_exam(items: list, events: list, now: datetime, query: str = "") -> Opti
 def countdown_words(when: datetime, now: datetime, all_day: bool = False) -> str:
     """'today at 2:00 pm' / 'tomorrow at 9:00 am' / 'in 6 days, Friday at
     9:00 am' / 'in 19 days, Wed 15 Oct at 9:00 am', in ``now``'s zone."""
-    local = when.astimezone(now.tzinfo) if now.tzinfo else when
+    local = in_local(when, now)
     days = (local.date() - now.date()).days
     clock = "" if all_day else f" at {clock_words(local)}"
     if days <= 0:

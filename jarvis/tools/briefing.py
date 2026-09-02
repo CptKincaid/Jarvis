@@ -592,9 +592,15 @@ def _exam_days(exam: Optional[dict], now: datetime) -> Optional[int]:
     when = (exam or {}).get("when")
     if not isinstance(when, datetime):
         return None
+    # The same conversion the spoken line uses. now.tzinfo is build_briefing's
+    # datetime.now().astimezone() -- a fixed offset, not a zone -- so applying
+    # it to an exam past the next DST change counted 6 days to an exam 5 days
+    # out (now 2026-10-27 07:05 CDT, exam 2026-11-01 23:59 CST): one day over
+    # briefing.study_days, and the deck line AND the offer went silent on the
+    # morning they should first be spoken.
+    from jarvis.tools.canvas import in_local
     try:
-        local = when.astimezone(now.tzinfo) if now.tzinfo else when
-        return (local.date() - now.date()).days
+        return (in_local(when, now).date() - now.date()).days
     except (ValueError, OverflowError, TypeError):
         return None
 

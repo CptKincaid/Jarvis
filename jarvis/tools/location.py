@@ -27,7 +27,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jarvis.logs import get_logger
 from jarvis.tools.registry import ToolResult, ToolSpec
@@ -205,16 +205,7 @@ class Location:
         return loc
 
 
-def system_tz():
-    """The machine's zone (America/Chicago on the Spark) as a tzinfo."""
-    return datetime.now().astimezone().tzinfo
-
-
-def _system_tz_name() -> str:
-    tz = system_tz()
-    key = getattr(tz, "key", "")
-    if key:
-        return key
+def _localtime_key() -> str:
     try:
         target = os.readlink("/etc/localtime")
         if "zoneinfo/" in target:
@@ -222,6 +213,43 @@ def _system_tz_name() -> str:
     except OSError:
         pass
     return ""
+
+
+def system_tz():
+    """The machine's zone (America/Chicago on the Spark) as a tzinfo.
+
+    A real ZoneInfo, not datetime.now().astimezone().tzinfo: that returns a
+    FIXED-offset snapshot of today's offset (timezone(-6h, 'CST') in winter),
+    so callers that stamp a naive wall time with it -- calendar.py:202
+    expanding a recurring event, arc's sun times -- are an hour wrong for any
+    day on the other side of a DST boundary. Falls back to the snapshot only
+    when the zone key cannot be resolved."""
+    key = os.environ.get("TZ") or _localtime_key()
+    if key:
+        try:
+            zone = ZoneInfo(key)
+        except (ZoneInfoNotFoundError, ValueError):
+            log.debug("location: unusable zone key %r", key)
+        else:
+            # TZ is read WITHOUT time.tzset(), so a process that changed it
+            # after start is still running on the zone it started with, while
+            # bare "UTC"/"CST6CDT"/"EST5EDT" ARE real tzdata keys and resolve
+            # happily (measured: TZ=EST5EDT gave ZoneInfo('EST5EDT') while
+            # datetime.now().astimezone() in the same process still read
+            # -05:00). Trusted only while it still agrees with the offset the
+            # interpreter itself is using, so system_tz() cannot contradict
+            # the bare .astimezone() the rest of this module relies on. Two
+            # zones sharing today's offset but not its rules would still slip
+            # through; that needs tzset(), which a read has no business calling.
+            local = datetime.now()
+            if zone.utcoffset(local) == local.astimezone().utcoffset():
+                return zone
+            log.debug("location: zone key %r disagrees with the process zone", key)
+    return datetime.now().astimezone().tzinfo
+
+
+def _system_tz_name() -> str:
+    return getattr(system_tz(), "key", "") or _localtime_key()
 
 
 def _num(value) -> Optional[float]:
@@ -430,7 +458,12 @@ def now_in(loc: Optional[Location], now: datetime = None) -> datetime:
         return datetime.now(tz) if tz is not None else datetime.now().astimezone()
     if now.tzinfo is None:
         now = now.astimezone()
-    return now.astimezone(tz) if tz is not None else now.astimezone(system_tz())
+    # Bare astimezone() for the home leg, never astimezone(system_tz()): this
+    # converts an INSTANT, so the platform's own rules give the right offset
+    # for that instant even if the zone key could not be resolved above. With
+    # a snapshot tzinfo, "the time at home" for 2026-08-26 09:00 CDT read back
+    # in November came out 08:00 CST.
+    return now.astimezone(tz) if tz is not None else now.astimezone()
 
 
 def is_home_word(text) -> bool:

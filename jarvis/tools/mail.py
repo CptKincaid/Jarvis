@@ -217,10 +217,6 @@ def _parse_fetch(data) -> list[tuple[bytes, bytes]]:
     return out
 
 
-def _local_tz():
-    return datetime.now().astimezone().tzinfo
-
-
 def _parse_date(value: str) -> Optional[datetime]:
     if not value:
         return None
@@ -232,7 +228,11 @@ def _parse_date(value: str) -> Optional[datetime]:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
-    return dt.astimezone(_local_tz())
+    # Bare astimezone(), never astimezone(datetime.now().astimezone().tzinfo):
+    # that tzinfo is a FIXED-offset snapshot of today's offset, so a message
+    # sent 2026-08-26 14:10 CDT read back in November came out 13:10 "CST".
+    # This converts an instant, so the platform's rules for THAT instant win.
+    return dt.astimezone()
 
 
 _TAG = re.compile(r"<[^>]+>")

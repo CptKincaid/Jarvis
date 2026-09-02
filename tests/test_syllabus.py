@@ -24,8 +24,20 @@ from jarvis.tools.canvas import find_next_exam
 from jarvis.tools.docs import EmbedError
 from tests.test_docs import RECIPE, SYLLABUS, FakeEmbed
 
-# A local-zone "now" every date in this file is measured from.
-NOW = datetime(2026, 9, 1, 9, 0).astimezone()
+# A local-zone "now" every date in this file is measured from, taken off the
+# REAL clock rather than frozen: parse_rows() is handed NOW by the unit tests
+# below, but the commander's scan rung reads its own datetime.now()
+# (commander.py:5643) and parse_rows drops rows already past. A frozen
+# 2026-09-01 would have started dropping _iso(30) on 2026-10-01 09:00 --
+# "Filed, sir; one on the books." instead of two -- and every row by
+# 2026-12-10. The fixture must date off whichever clock the rung reads.
+#
+# Today's DATE at a pinned 09:00, not the bare wall clock: every date here is
+# a whole day or more from NOW, so the hour buys nothing, and leaving it free
+# breaks test_merge_items_lets_canvas_win_a_duplicate between 23:00 and
+# midnight -- merge_items dedupes on due.date() (syllabus.py:275, "the same
+# local day"), so its NOW + 30d + 1h would land on the following date.
+NOW = datetime.now().astimezone().replace(hour=9, minute=0, second=0, microsecond=0)
 
 
 def _iso(days, clock="09:00"):

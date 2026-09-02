@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from datetime import date, datetime, time as dtime, timedelta
+from datetime import date, datetime, time as dtime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -118,6 +118,19 @@ def source_text(chunks: list[dict], limit: int = MAX_SOURCE_CHARS) -> str:
 
 # ----------------------------------------------------------------- parsing
 def _local(dt: datetime, now: datetime) -> datetime:
+    """``dt`` as a local instant on the clock ``now`` is written on.
+
+    The scan rung hands a fixed-offset snapshot (commander.py:5643
+    ``datetime.now().astimezone()``), not a zone, so stamping the naive
+    ``datetime.combine(day, clock)`` below with it puts the row an hour off
+    whenever the date is on the other side of a DST change -- measured on a
+    scan dated 2026-10-02 CDT, a row "2026-11-15T09:00" stored 08:00 local
+    while read_back_line still said "9:00 am", so the yes he gives is to a
+    time the reminder will not fire at. The no-argument astimezone() uses the
+    platform's rules for that wall time (and, for an already-aware ``dt`` out
+    of the store, for that instant). An explicit zone is still honoured."""
+    if isinstance(now.tzinfo, timezone):
+        return dt.astimezone()
     return dt.replace(tzinfo=now.tzinfo) if dt.tzinfo is None else dt.astimezone(now.tzinfo)
 
 
