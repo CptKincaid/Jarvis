@@ -47,6 +47,8 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from jarvis import address as address_mod
+from jarvis import arc as arc_mod
 from jarvis.config import MACHINE
 from jarvis.events import BrainState, Status, bus
 from jarvis.logs import get_logger
@@ -1129,6 +1131,80 @@ NO_CLOCK_LINE = "I'm afraid I haven't a clock in front of me just now, sir."
 # it — claiming to have no clock would be the second false statement.
 UNSURE_CLOCK_LINE = "Let me check the time again, sir; that didn't look right."
 
+# ----------------------------------------------------------------------
+# Reasoning scaffolding — control tokens that must never be spoken
+#
+# LIVE 2026-09-02 14:43:59, jarvis.log 6724, the whole line as the room
+# heard it:
+#
+#   speaking (f5): thought <channel, >Good afternoon, Ali and Heather; ...
+#
+# "<channel, >" is this module's own doing: strip_markdown turns a table's
+# cell pipes into clause breaks, so the model's "thought\n<channel|>"
+# arrives at TTS with the pipe already read as a comma. Which is exactly
+# why the scrub runs FIRST inside clean_ollama_reply, on the RAW text
+# (spoken_from_ollama's order) — one pass later the token is no longer a
+# token and there is nothing left to recognise.
+#
+# _chat_payload has sent think:false on every request since the port, the
+# same field tools/screen.py needs for gemma4 on the vision path, and it
+# is the only request-level lever there is (a `stop` string cannot help:
+# the scaffolding arrives BEFORE the words, so stopping on it would throw
+# away the reply and keep nothing). On 2026-09-02 it did not hold, and the
+# failure mode of this class of bug is by definition garbage read aloud,
+# so the request keeps its guard and the speech path gets its own.
+#
+# The bare label words (thought / analysis / final ...) are cut ONLY where
+# they sit against a token: "I thought so, sir" is ordinary English and
+# survives untouched.
+_REASONING_BLOCK_RX = re.compile(
+    r"<\s*(think|thinking|reasoning|analysis|scratchpad)\s*>.*?"
+    r"<\s*/\s*\1\s*>", re.I | re.S)
+_REASONING_TAG_RX = re.compile(
+    r"<\s*/?\s*(?:think|thinking|reasoning|analysis|scratchpad)\s*>", re.I)
+# A harmony-style reasoning channel takes its CONTENTS with it, up to the
+# next turn token — the words in an "analysis" channel are the model
+# talking to itself, not to the room. An unterminated one (the stream cut
+# mid-thought) runs to the end, which is the same judgement.
+_REASONING_CHANNEL_RX = re.compile(
+    r"<\|channel\|>[ \t]*(?:analysis|analyses|thought|thinking|reasoning|"
+    r"commentary|scratchpad)\b.*?(?:<\|(?:end|return|start)\|>|$)",
+    re.I | re.S)
+# A channel label, and the roles a turn header names.
+_SCAFFOLD_LABEL = (r"(?:thought|thinking|analysis|commentary|final|message|"
+                   r"channel|assistant|model|system|user)")
+# <|channel|>, <|end|>, <|im_start|>, and the half-forms a template can
+# leave behind (<channel|>). A pipe inside angle brackets is never prose.
+_SPECIAL_TOKEN = r"(?:<\|[A-Za-z0-9_.\-]{0,32}\|?>|<[A-Za-z0-9_.\-]{0,32}\|>)"
+# Gemma/Llama/ChatML turn markers, which carry no pipe at all.
+_TURN_TOKEN = (r"(?:<\s*/?\s*(?:s|bos|eos|pad|unk|start_of_turn|end_of_turn|"
+               r"end_of_text|eot_id|begin_of_text|start_header_id|"
+               r"end_header_id|im_start|im_end)\s*>)")
+_SCAFFOLD_RX = re.compile(
+    rf"(?:\b{_SCAFFOLD_LABEL}\b[ \t]*\n?[ \t]*)?"
+    rf"(?:{_SPECIAL_TOKEN}|{_TURN_TOKEN})"
+    rf"(?:[ \t]*\n?[ \t]*\b{_SCAFFOLD_LABEL}\b)?", re.I)
+
+
+def strip_model_scaffolding(text):
+    """Reasoning-channel and turn-template tokens out of a model reply.
+
+    Returns the text unchanged when there is none, which is the normal
+    case; a reply that WAS scrubbed is logged, because "the assistant read
+    control tokens to the room" has to be greppable next time.
+    """
+    raw = text or ""
+    out = _REASONING_BLOCK_RX.sub(" ", raw)
+    out = _REASONING_CHANNEL_RX.sub(" ", out)
+    out = _REASONING_TAG_RX.sub(" ", out)
+    out = _SCAFFOLD_RX.sub(" ", out)
+    if out == raw:
+        return raw
+    out = re.sub(r"[ \t]{2,}", " ", out).strip()
+    log.warning("scrubbed model scaffolding from the reply: %r", raw[:80])
+    return out
+
+
 _LABEL_RX = re.compile(r"^\s*(?:jarvis|assistant)\s*:\s*", re.I)
 _TURN_RX = re.compile(r"\n\s*(?:user|hunter)\s*:.*", re.I | re.S)
 _STAGE_RX = re.compile(
@@ -1175,7 +1251,12 @@ def clean_ollama_reply(text):
     """Strip artefacts before the reply reaches TTS: a leading "Jarvis:"
     label, a run-on "User:" turn, stage directions, bullet markers, emoji
     and file extensions. Markdown emphasis and headings are handled by
-    strip_markdown."""
+    strip_markdown.
+
+    The scaffolding scrub is FIRST and it has to be: strip_markdown, which
+    runs after this, rewrites a pipe as a comma and destroys the very
+    thing this recognises (see _SCAFFOLD_RX)."""
+    text = strip_model_scaffolding(text)
     text = _LABEL_RX.sub("", (text or "").strip())
     text = _TURN_RX.sub("", text)
     text = _STAGE_RX.sub("", text)
@@ -1284,6 +1365,157 @@ def guard_clock_claims(text, context_text="", user_text=""):
     return UNSURE_CLOCK_LINE if allowed else NO_CLOCK_LINE
 
 
+# ----------------------------------------------------------------------
+# Who is being spoken to, and what o'clock it is
+#
+# LIVE 2026-09-02 14:29:24, jarvis.log 6520. "Say hello to my family."
+# was answered, out loud, with:
+#
+#   Good evening, Ali and Heather; I do hope you're both having a lovely
+#   afternoon, sir.
+#
+# Two separate faults in one sentence.
+#
+# (a) THE HONORIFIC IS AIMED AT THE WRONG PEOPLE. The greeting addresses
+#     Ali and Heather -- "you're BOTH" -- and signs off to a third person
+#     who is not in the room. Nothing in the persona knows there is an
+#     audience: VOICE_RULES says call him sir, JARVIS_SYSTEM's closing
+#     line says call him sir, and the formal register says every time.
+#     "sir" IS the character, so this is deliberately the narrowest rule
+#     that covers the case, and BOTH halves must hold: Hunter asked for a
+#     relay to a named person who is not himself, AND the line being
+#     spoken opens by greeting that person. The second half is what keeps
+#     "Tell my professor I'll be late." -> "I'm afraid I can't send
+#     messages, sir." intact -- that sentence is spoken TO him.
+#
+# (b) THE TIME OF DAY WAS RECALLED, NOT READ. "Good evening" at 2:29 pm,
+#     with "Current time: 02:29 PM" in the same prompt. Verified cause:
+#     ~/.aiws_trainer/jarvis_memory/sessions.json held the previous
+#     EVENING's answer to this same request, twice, and
+#     Memory.format_sessions_for_prompt renders the last three sessions
+#     into every user turn cut at 100 characters --
+#
+#       [2026-09-01T20:55] You: Say hello to my family. / Jarvis: Good
+#       evening, Ali and Heather; I do hope you're both having a
+#
+#     -- so the model was handed its own opening for this exact request,
+#     dangling mid-clause, and completed it against the clock it could
+#     see. Hence "a lovely afternoon" behind "Good evening". It is
+#     intermittent because it needs the request to be worded the way the
+#     stored one was; at 14:43 it was not, and the reply was correct.
+#
+#     The fix is to ground the word rather than trust the recall:
+#     arc.greeting_word() reads the wall clock on the same bands
+#     commander._greeting_line has always used. Grounded on the clock and
+#     NOT on arc.phase(), because the phase is forced to "night" for an
+#     empty or hushed house -- jarvis.log 14:06:07, "arc: afternoon ->
+#     night (forced by you're out)" -- and a greeting keyed off that would
+#     have said "Good night" at six minutes past two.
+# ----------------------------------------------------------------------
+# Whom Jarvis is being asked to speak to. "my brother", "the family",
+# "Ali and Heather" -- but never "me", which is what makes "tell me a
+# joke" and "what did you say to me?" ordinary turns.
+# Case-SENSITIVE on purpose: a bare capitalised word is the only signal
+# that "Ali" is a person and "me" is not, and re.I would throw it away
+# ("Tell me a joke" matched [A-Z][a-z]+ under re.I, 2026-09-02).
+_AUDIENCE = (r"(?:(?:[Mm]y|[Oo]ur|[Hh]is|[Hh]er|[Tt]heir)\s+\w+|"
+             r"[Tt]he\s+(?:family|kids|children|boys|girls|others)|"
+             r"them|everyone|everybody|"
+             r"[A-Z][a-z]+(?:\s*(?:,|and)\s*[A-Z][a-z]+)*)")
+_RELAY_RX = re.compile(
+    rf"\b(?:[Ss]ay|[Ss]aid|[Pp]ass\s+on|[Rr]elay)\b[^.?!]{{0,60}}?"
+    rf"\bto\s+{_AUDIENCE}\b|"
+    rf"\b(?:[Tt]ell|[Ww]ish|[Gg]reet)\s+{_AUDIENCE}\b")
+# Hunter is not a third party. His name is hard-coded in the persona
+# prompts above ("Now answer Hunter as Jarvis"), so it is hard-coded here
+# too rather than invented a second time.
+_NOT_A_THIRD_PARTY = frozenset({"hunter", "sir", "jarvis"})
+_GREETS_BY_NAME_RX = re.compile(
+    r"^\s*(?:good\s+(?:morning|afternoon|evening|day|night)|hello|hi|hey|"
+    r"greetings|welcome)\b[,\s]+(?P<who>[A-Z][a-z]+"
+    r"(?:\s*(?:,|and)\s*[A-Z][a-z]+)*)\b", re.I)
+# The other half of the live line: "I do hope you're BOTH having a lovely
+# afternoon". A plural second person cannot be Hunter on his own, so the
+# sentence carrying it is aimed at the audience even though it names
+# nobody. Anything vaguer keeps its sir -- a compound request ("say hi to
+# my family and then give me my daily briefing", 14:43) turns back to him
+# mid-reply, and the briefing is his.
+_ADDRESSES_A_GROUP_RX = re.compile(
+    r"\byou(?:'re|\s+are)?\s+(?:both|two|all)\b|\bboth\s+of\s+you\b", re.I)
+
+
+def relay_request(user_text) -> bool:
+    """True when Hunter asked Jarvis to say something TO SOMEBODY ELSE."""
+    return bool(_RELAY_RX.search((user_text or "").strip()))
+
+
+def _addressed_to_a_third_party(sentence) -> bool:
+    """True when THIS sentence is spoken to someone other than Hunter.
+
+    Judged sentence by sentence and never carried forward, which is the
+    conservative half of the rule: streaming speaks sentence one before
+    sentence two exists, so a decision that persisted would have to be
+    made on sentence one alone -- and "say hi to my family and then give
+    me my daily briefing" (LIVE 14:43) turns back to him mid-reply. A
+    sentence that does not say who it is for keeps its sir.
+    """
+    sentence = sentence or ""
+    m = _GREETS_BY_NAME_RX.match(sentence)
+    if m is not None:
+        names = re.split(r"\s*(?:,|and)\s*", m.group("who"))
+        if any(name.strip().lower() not in _NOT_A_THIRD_PARTY
+               for name in names if name.strip()):
+            return True
+    return bool(_ADDRESSES_A_GROUP_RX.search(sentence))
+
+
+def strip_relay_address(text, user_text):
+    """Drop "sir" from the sentences of ``text`` that are addressed to
+    somebody else -- and only when Hunter asked for a relay in the first
+    place (relay_request). Both gates, every time."""
+    if not text or not relay_request(user_text):
+        return text
+    return " ".join(
+        address_mod.drop_addresses(s) if _addressed_to_a_third_party(s) else s
+        for s in split_sentences(text))
+
+
+# A greeting opening a sentence AND signing off into one -- the trailing
+# lookahead is what keeps "Good Morning America is at nine, sir." out of
+# it: a title is followed by more of its own name, a greeting by a comma,
+# a stop or nothing.
+_GREETING_OPEN_RX = re.compile(
+    r"(?:(?<=^)|(?<=[.!?;]\s)|(?<=[.!?;]\n))(\s*)(Good)\s+"
+    r"(morning|afternoon|evening)\b(?=[,.;:!?]|\s*$)")
+
+
+def ground_greeting(text, user_text="", now=None):
+    """Rewrite a greeting's time-of-day word to the one the clock says.
+
+    Only at a sentence opening -- "I'll wish them a good evening later" is
+    about a later hour, not a claim about this one -- and never "good
+    night", which is a sign-off and is right whenever he says it. If
+    Hunter used the word himself, Jarvis echoing him is politeness, not a
+    stale memory, and it stands.
+    """
+    if not text or "good" not in text.lower():
+        return text
+    want = arc_mod.greeting_word(now)
+    said = (user_text or "").lower()
+
+    def fix(m):
+        lead, good, word = m.group(1), m.group(2), m.group(3)
+        if word.lower() == want or f"good {word.lower()}" in said:
+            return m.group(0)
+        return f"{lead}{good} {want}"
+
+    out = _GREETING_OPEN_RX.sub(fix, text)
+    if out != text:
+        log.info("grounded a stale greeting in the clock: %r -> %r",
+                 text[:60], out[:60])
+    return out
+
+
 def spoken_from_ollama(raw, context_text="", user_text="",
                        n=MAX_SPOKEN_SENTENCES):
     """The full Tier 2 reply pipeline: clean, strip markdown, guard, cap
@@ -1296,6 +1528,8 @@ def spoken_from_ollama(raw, context_text="", user_text="",
     text = clean_ollama_reply(raw)
     text = clean_ollama_reply(strip_markdown(text))
     text = guard_clock_claims(text, context_text, user_text)
+    text = ground_greeting(text, user_text)
+    text = strip_relay_address(text, user_text)
     return limit_sentences(text, n)
 
 
@@ -2273,6 +2507,13 @@ class JarvisBrain:
                 if clock_line_said:
                     return ""             # the honest line once, not per sentence
                 clock_line_said.append(True)
+            else:
+                # The same two guards spoken_from_ollama runs on the whole
+                # reply, per sentence -- a streamed sentence is spoken
+                # before the reply exists. Skipped on the clock-guard's own
+                # replacement line, which is authored and addressed to him.
+                guarded = ground_greeting(guarded, text)
+                guarded = strip_relay_address(guarded, text)
             return trim_spoken(guarded.strip())
 
         try:

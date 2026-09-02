@@ -445,6 +445,43 @@ def _drop_summons(text: str, start: int, end: int) -> str:
     return _tidy(text[:start] + tail)
 
 
+# Of 263 complete spoken lines in the live log, zero carried more than one
+# form of address (module doc); this only bounds the re-read loop.
+_MAX_ADDRESSES_PER_LINE = 8
+
+
+def drop_addresses(text: str) -> str:
+    """Every form of address cut out of ONE line, all of them.
+
+    This is NOT the per-line thinning the module doc refuses, and the
+    difference is who is being spoken to. Thinning asks "has he been
+    called sir too often in this burst?" -- a question about frequency,
+    which a single line cannot answer, which is why there is no per-line
+    thinner. This asks "is the man being addressed even in the room?" and
+    the caller already knows the answer: brain.strip_relay_address uses it
+    when the line is aimed at somebody else entirely (LIVE 2026-09-02
+    14:29:24, "Good evening, Ali and Heather; ... , sir.").
+
+    It is the removal only. Every rule about WHAT counts as an address
+    still comes from vocative_spans, so "Sir Isaac Newton", "sir's coffee"
+    and a sir inside a quotation are untouched here as everywhere else.
+    One span at a time, re-read after each cut: the removers run _tidy(),
+    which strips and collapses whitespace, so indices taken before a cut
+    cannot be trusted after it.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    out = text
+    for _ in range(_MAX_ADDRESSES_PER_LINE):
+        spans = vocative_spans(out)
+        if not spans:
+            return out
+        start, end, kind = spans[0]
+        out = (_drop_trailing(out, start, end) if kind == TRAILING
+               else _drop_summons(out, start, end))
+    return out
+
+
 # ----------------------------------------------------------------------
 # The join
 # ----------------------------------------------------------------------

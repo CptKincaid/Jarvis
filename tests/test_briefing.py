@@ -470,6 +470,17 @@ def _brain_with_briefing(tmp_path, monkeypatch, enabled, reply):
     return brain_mod.JarvisBrain(None, None, registry=reg), payloads
 
 
+@pytest.fixture(autouse=True)
+def _morning(monkeypatch):
+    """BRIEF_REPLY below opens "Good morning, sir." and the assertions are
+    on the exact string. brain.ground_greeting reads the wall clock now
+    (jarvis/arc.py greeting_word, added for the 2026-09-02 14:29 "Good
+    evening" at 2:29 pm), so the hour these fixtures mean is pinned rather
+    than left to whenever the suite happens to run."""
+    from jarvis import arc as arc_mod
+    monkeypatch.setattr(arc_mod, "greeting_word", lambda now=None: "morning")
+
+
 BRIEF_REPLY = (
     "Good morning, sir. Seventy-two and partly cloudy today, high of eighty-five "
     "with a ten per cent chance of rain. You have the dentist at ten and standup "

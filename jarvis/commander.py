@@ -79,6 +79,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from jarvis import address
+from jarvis import arc as arc_mod
 from jarvis import aside as aside_mod
 from jarvis import board as board_mod
 from jarvis import dialogue as dialogue_mod
@@ -1208,10 +1209,14 @@ def _register_lines(kind: str, register: Optional[str] = None) -> list:
 
 def _greeting_line(now: Optional[datetime] = None,
                    register: Optional[str] = None) -> str:
-    """The time-appropriate line from the greeting variants."""
-    hour = (now or datetime.now()).hour
-    idx = 0 if 5 <= hour < 12 else 1 if 12 <= hour < 17 else 2
-    return _register_lines("greeting", register)[idx]
+    """The time-appropriate line from the greeting variants.
+
+    The bands live in jarvis/arc.py now, not here: brain.ground_greeting
+    corrects the MODEL's greeting against the same three, and the canned
+    courtesy and the guard disagreeing about what hour it is would be a
+    quieter version of the 2026-09-02 14:29 defect ("Good evening" at
+    2:29 pm), not a fix for it."""
+    return _register_lines("greeting", register)[arc_mod.greeting_index(now)]
 
 
 def courtesy_kind(text: str) -> Optional[str]:
