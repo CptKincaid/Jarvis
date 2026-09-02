@@ -411,6 +411,43 @@ DEFAULTS: dict = {
                  # reload_if_changed has no callers.
                  "room_sensor_enabled": False, "room_sensor_url": "",
                  "room_sensor_timeout_s": 1.5},
+    # The camera (jarvis/eye.py, scratchpad/ideas/vision.md). OFF until he
+    # turns it on, and there is deliberately NO SCHEDULE HERE: offline mode
+    # and the 21:00-07:00 curfew belong to the single sensing-state owner,
+    # which is the only place they can be enforced at the device. A second
+    # copy of the window in this file is a copy that can disagree with the
+    # first, and the one that disagrees quietly is the one that leaves the
+    # lens open at 22:00.
+    #
+    # detect_width/height is the size YuNet actually sees, not the capture
+    # size: measured on this box 2026-09-02 with cv2.setNumThreads(1), YuNet
+    # runs p50 3.19 ms / p95 3.50 ms at 320x240 against p50 12.63 / p95 14.97
+    # at 640x480, for a face that is already several hundred pixels across at
+    # desk distance. Two frame rates because "is anyone there" and "is he
+    # addressing me" are different questions with different budgets.
+    #
+    # identity=False is the phase gate: with it off, nothing about his face is
+    # ever written down (jarvis/facegallery.py is not constructed at all).
+    "camera": {"enabled": False, "device": "", "width": 640, "height": 480,
+               "detect_width": 320, "detect_height": 240, "threads": 2,
+               "idle_fps": 1.5, "armed_fps": 8.0, "min_conf": 0.7,
+               # The attention cone, in degrees off the lens axis. 20 deg is
+               # generous against the 47 deg separation an off-axis mount
+               # gives (scratchpad/ideas/camera.md section 4) and useless on a
+               # monitor-top mount, where the screen's own top edge is 1.8 deg
+               # away.  Hysteresis on release so a blink does not drop it.
+               "cone_deg": 20.0, "cone_hysteresis_deg": 5.0, "dwell_s": 0.6,
+               # Fold the camera into the wake gate (jarvis/eye.py
+               # resolve_wake). It can only ever promote a suppressed wake,
+               # never suppress an accepted one.
+               "wake_tiebreak": True,
+               # Face identity: a gallery of HIS FACE on disk. Opt-in, and the
+               # threshold is OpenCV's own documented SFace cosine for "same
+               # person".
+               "identity": False, "identity_min": 0.363,
+               # One JPEG at 0600, overwritten each time, for diagnosing a
+               # mount. The only path by which a frame reaches the disk.
+               "debug_frame": False},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

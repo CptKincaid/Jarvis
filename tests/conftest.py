@@ -69,6 +69,12 @@ os.environ["JARVIS_INTENT_LOG"] = str(_TEST_LOG_DIR / "intent_log.json")
 # restart. Forced, not setdefault: a shell pointing at the live file must not
 # defeat this.
 os.environ["JARVIS_VOICEPRINT"] = str(_TEST_LOG_DIR / "voiceprint.npz")
+# The enrolled FACE gallery (jarvis/facegallery.py, PATHS.FACE_GALLERY). Set
+# before the same class of accident can happen a second time: the voiceprint
+# was destroyed by a test that built the real object and saved, and a face
+# embedding is the same kind of irreplaceable measurement of one person.
+# Forced, not setdefault, for the same reason as the line above.
+os.environ["JARVIS_FACE_GALLERY"] = str(_TEST_LOG_DIR / "face_gallery")
 # The docs embedding index (jarvis/tools/docs.py: env > config > default):
 # without this a test building the real App indexes into the user's
 # ~/.aiws_trainer/docs_index.
