@@ -131,3 +131,77 @@ def test_a_title_that_begins_with_a_greeting_is_not_rewritten():
     """"Good Morning America" is a programme, not a claim about the hour."""
     line = "Good Morning America is at nine, sir."
     assert ground_greeting(line, now=AT_1429) == line
+
+
+# ----------------------------------------------------------------------
+# The rest of the sentence -- the 2026-09-02 over-reach review
+#
+# Grounding only the opening WORD leaves a recalled clause contradicting
+# itself instead of the clock, which is the same shape of defect the fix
+# was written to remove. On the real logged line, replayed at 11:59:
+#
+#   IN : "Good evening, Ali and Heather; I do hope you're both having a
+#         pleasant evening."
+#   OUT: "Good morning, Ali and Heather; I do hope you're both having a
+#         pleasant evening."
+#
+# The live 14:29 line was the lucky case: its tail already said
+# "afternoon", so grounding the opening happened to finish the sentence.
+# ----------------------------------------------------------------------
+AT_1159 = datetime(2026, 9, 2, 11, 59)
+
+
+def test_a_recalled_well_wish_is_grounded_with_its_greeting():
+    line = ("Good evening, Ali and Heather; I do hope you're both having a "
+            "pleasant evening.")
+    assert ground_greeting(line, now=AT_1159) == (
+        "Good morning, Ali and Heather; I do hope you're both having a "
+        "pleasant morning.")
+
+
+def test_the_live_line_keeps_the_tail_that_was_already_right():
+    """It said "a lovely afternoon" at 2:29 pm, and that was correct."""
+    assert ground_greeting(STALE, now=AT_1429) == (
+        "Good afternoon, Ali and Heather; I do hope you're both having a "
+        "lovely afternoon, sir.")
+
+
+@pytest.mark.parametrize("line", [
+    "Good evening, sir; your first meeting is this afternoon.",
+    "Good evening, sir. I hope your afternoon meeting goes well.",
+    "Good evening, sir; the evening train is cancelled.",
+])
+def test_a_later_hour_in_the_sentence_is_not_a_claim_about_this_one(line):
+    """Only a well-wish that ENDS on the word is grounded. A fact about
+    another part of the day is left exactly as the model wrote it."""
+    out = ground_greeting(line, now=AT_1159)
+    assert out == line.replace("Good evening", "Good morning", 1)
+
+
+def test_a_tail_is_only_touched_when_its_opening_was_corrected():
+    """"Good afternoon ... have a pleasant evening" at 2 pm is a wish for
+    later, not a contradiction, and it stands."""
+    line = "Good afternoon, sir. I hope you have a pleasant evening."
+    assert ground_greeting(line, now=AT_1429) == line
+
+
+# ------------------------------------------------------- somebody's words
+@pytest.mark.parametrize("line", [
+    "Your message reads as follows. Good morning, the meeting moved to "
+    "three, sir.",
+    "He wrote back. Good evening; the shipment is delayed, sir.",
+    "Her note said this. Good morning, I'll be in at ten, sir.",
+])
+def test_a_greeting_the_reply_is_quoting_is_not_rewritten(line):
+    """ground_greeting reaches summarize() and local_line() too
+    (_finish_spoken with an empty user_text), which is how a mail digest
+    is read out -- and a quoted "Good morning" is somebody else's hour,
+    not a claim Jarvis is making."""
+    assert ground_greeting(line, now=AT_1429) == line
+
+
+def test_an_ordinary_second_sentence_is_still_grounded():
+    """The reporting cue has to be a cue, not merely a previous sentence."""
+    assert ground_greeting("It is overcast today. Good morning, sir.",
+                           now=AT_1429) == \
+        "It is overcast today. Good afternoon, sir."

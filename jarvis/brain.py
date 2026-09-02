@@ -1157,19 +1157,29 @@ UNSURE_CLOCK_LINE = "Let me check the time again, sir; that didn't look right."
 # The bare label words (thought / analysis / final ...) are cut ONLY where
 # they sit against a token: "I thought so, sir" is ordinary English and
 # survives untouched.
-_REASONING_BLOCK_RX = re.compile(
-    r"<\s*(think|thinking|reasoning|analysis|scratchpad)\s*>.*?"
-    r"<\s*/\s*\1\s*>", re.I | re.S)
-_REASONING_TAG_RX = re.compile(
-    r"<\s*/?\s*(?:think|thinking|reasoning|analysis|scratchpad)\s*>", re.I)
+_REASONING_TAGS = r"think|thinking|reasoning|analysis|scratchpad"
 # A harmony-style reasoning channel takes its CONTENTS with it, up to the
 # next turn token — the words in an "analysis" channel are the model
-# talking to itself, not to the room. An unterminated one (the stream cut
-# mid-thought) runs to the end, which is the same judgement.
-_REASONING_CHANNEL_RX = re.compile(
-    r"<\|channel\|>[ \t]*(?:analysis|analyses|thought|thinking|reasoning|"
-    r"commentary|scratchpad)\b.*?(?:<\|(?:end|return|start)\|>|$)",
-    re.I | re.S)
+# talking to itself, not to the room.
+_CHANNEL_OPEN = (r"<\|channel\|>[ \t]*(?:analysis|analyses|thought|thinking|"
+                 r"reasoning|commentary|scratchpad)\b")
+_CHANNEL_END = r"<\|(?:end|return|start)\|>"
+# A block that has both ends. This is the ONLY form that may be cut out of
+# a half-arrived stream buffer, where "no terminator yet" means "still
+# coming", not "runs to the end of the reply".
+_CLOSED_REASONING_RX = re.compile(
+    rf"<\s*({_REASONING_TAGS})\s*>.*?<\s*/\s*\1\s*>|"
+    rf"{_CHANNEL_OPEN}.*?{_CHANNEL_END}", re.I | re.S)
+# An opener with nothing closing it. On a WHOLE reply that is the end of
+# the stream, so the rest of the text is thinking and goes with it; the
+# alternative is reading the model's monologue to the room, which is the
+# defect this whole section exists for.
+_UNCLOSED_REASONING_RX = re.compile(
+    rf"(?:<\s*(?:{_REASONING_TAGS})\s*>|{_CHANNEL_OPEN}).*$", re.I | re.S)
+_REASONING_OPEN_RX = re.compile(
+    rf"<\s*(?:{_REASONING_TAGS})\s*>|{_CHANNEL_OPEN}", re.I)
+_REASONING_TAG_RX = re.compile(
+    rf"<\s*/?\s*(?:{_REASONING_TAGS})\s*>", re.I)
 # A channel label, and the roles a turn header names.
 _SCAFFOLD_LABEL = (r"(?:thought|thinking|analysis|commentary|final|message|"
                    r"channel|assistant|model|system|user)")
@@ -1194,15 +1204,37 @@ def strip_model_scaffolding(text):
     control tokens to the room" has to be greppable next time.
     """
     raw = text or ""
-    out = _REASONING_BLOCK_RX.sub(" ", raw)
-    out = _REASONING_CHANNEL_RX.sub(" ", out)
+    out = _CLOSED_REASONING_RX.sub(" ", raw)
+    out = _UNCLOSED_REASONING_RX.sub(" ", out)
     out = _REASONING_TAG_RX.sub(" ", out)
     out = _SCAFFOLD_RX.sub(" ", out)
     if out == raw:
         return raw
     out = re.sub(r"[ \t]{2,}", " ", out).strip()
-    log.warning("scrubbed model scaffolding from the reply: %r", raw[:80])
+    if raw.strip() and not out:
+        # The other outcome, and it needs its own line: chat() turns an
+        # empty reply into MODEL_EMPTY_LINE, so the room hears an honest
+        # sentence rather than silence — but with no WARNING carrying the
+        # raw text, a truncated reasoning stream that ate a real answer is
+        # invisible in the log (2026-09-02 review).
+        log.warning("the scaffolding scrub emptied the reply: %r", raw[:120])
+    else:
+        log.warning("scrubbed model scaffolding from the reply: %r", raw[:80])
     return out
+
+
+def reasoning_block_open(text) -> bool:
+    """True while a reasoning block has been opened and not yet closed.
+
+    For the STREAM, which sees the reply a few characters at a time. The
+    per-sentence scrub cannot see a block that spans a sentence break —
+    "<think>He wants a greeting. It is 2 pm.</think>Good afternoon, sir."
+    streamed "He wants a greeting." to TTS (2026-09-02 review, driven
+    through the real loop) because that sentence carries an opener and no
+    closer, and _REASONING_TAG_RX then dropped the tag and kept the words.
+    """
+    return bool(_REASONING_OPEN_RX.search(
+        _CLOSED_REASONING_RX.sub(" ", text or "")))
 
 
 _LABEL_RX = re.compile(r"^\s*(?:jarvis|assistant)\s*:\s*", re.I)
@@ -1430,18 +1462,49 @@ _RELAY_RX = re.compile(
 # prompts above ("Now answer Hunter as Jarvis"), so it is hard-coded here
 # too rather than invented a second time.
 _NOT_A_THIRD_PARTY = frozenset({"hunter", "sir", "jarvis"})
+# The case-insensitivity is scoped to the GREETING WORDS and stops there.
+# The name class is the same [A-Z][a-z]+ as _AUDIENCE above and for the
+# same reason -- a capital is the only signal that "Heather" is a person --
+# so a blanket re.I here made it match any lowercase word at all, and the
+# rule then read every "hello"/"welcome" sentence as third-party speech:
+#
+#   'Welcome back, sir.'                     who='back, sir'
+#   'Hi there, sir.'                         who='there, sir'
+#   'hello has been added to tomorrow at 4:30 pm, sir.'   who='has'
+#
+# The first is presence.WELCOME_LINE and the third is a real gemma4 line
+# from jarvis.log.1 21:02:50 -- both would have lost Hunter's honorific on
+# any relay turn, which is the outcome this rule exists to avoid
+# (2026-09-02 review, seven measured). (?i:...) keeps "hello"/"HELLO"
+# case-blind; the name stays case-sensitive.
 _GREETS_BY_NAME_RX = re.compile(
-    r"^\s*(?:good\s+(?:morning|afternoon|evening|day|night)|hello|hi|hey|"
+    r"^\s*(?i:good\s+(?:morning|afternoon|evening|day|night)|hello|hi|hey|"
     r"greetings|welcome)\b[,\s]+(?P<who>[A-Z][a-z]+"
-    r"(?:\s*(?:,|and)\s*[A-Z][a-z]+)*)\b", re.I)
+    r"(?:\s*(?:,|and)\s*[A-Z][a-z]+)*)\b")
 # The other half of the live line: "I do hope you're BOTH having a lovely
 # afternoon". A plural second person cannot be Hunter on his own, so the
 # sentence carrying it is aimed at the audience even though it names
 # nobody. Anything vaguer keeps its sir -- a compound request ("say hi to
 # my family and then give me my daily briefing", 14:43) turns back to him
 # mid-reply, and the briefing is his.
+#
+# "both"/"two"/"all" are only a plural YOU when a clause boundary or a verb
+# follows. With a noun behind them they are an ordinary singular "you" plus
+# a quantity, and the loose form took his sir out of all of these
+# (2026-09-02 review, measured through strip_relay_address):
+#
+#   'Are you all set, sir?'   'Thank you all the same, sir.'
+#   "I'll send you two reminders, sir."   'That leaves you two options, sir.'
+#
+# "you're both" / "you are both" / "both of you" need no such test: there
+# is no singular reading of either.
+_PLURAL_VERB = (r"are|were|have|has|had|will|would|can|could|shall|should|"
+                r"may|might|must|do|did|does|need|want|seem|look|sound|"
+                r"enjoy|keep|deserve|get")
 _ADDRESSES_A_GROUP_RX = re.compile(
-    r"\byou(?:'re|\s+are)?\s+(?:both|two|all)\b|\bboth\s+of\s+you\b", re.I)
+    r"\byou(?:'re|\s+are)\s+both\b|\bboth\s+of\s+you\b|"
+    rf"\byou\s+(?:both|two|all)\b(?=[,.;:!?]|\s*$|\s+(?:{_PLURAL_VERB})\b)",
+    re.I)
 
 
 def relay_request(user_text) -> bool:
@@ -1487,6 +1550,33 @@ def strip_relay_address(text, user_text):
 _GREETING_OPEN_RX = re.compile(
     r"(?:(?<=^)|(?<=[.!?;]\s)|(?<=[.!?;]\n))(\s*)(Good)\s+"
     r"(morning|afternoon|evening)\b(?=[,.;:!?]|\s*$)")
+# A SECOND time-of-day word later in the same sentence, inside a well-wish.
+# The whole clause was recalled together, so grounding only the opening
+# swaps one contradiction for another: at 11:59 the real logged line "Good
+# evening, Ali and Heather; I do hope you're both having a pleasant
+# evening." came out "Good morning ... a pleasant evening" (2026-09-02
+# review). Anchored on hope/wish/have/enjoy and on the word ENDING its
+# clause, because "I hope your afternoon meeting goes well" is about a
+# later hour and is not a claim about this one.
+_GREETING_TAIL_RX = re.compile(
+    r"(\b(?:hope|hoping|wish|wishing|have|having|had|enjoy|enjoying)\b"
+    r"[^.!?]{0,60}?\b(?:a|an|the|your)\s+(?:\w+\s+){0,2})"
+    r"(?:morning|afternoon|evening)\b(?=[,.;:!?]|\s*$)", re.I)
+# A greeting the reply is REPORTING rather than making. ground_greeting
+# reaches summarize() and local_line() too (_finish_spoken with an empty
+# user_text), which is how a mail digest or a Claude result gets read out,
+# and those are exactly the places somebody else's "Good morning" appears.
+# Rewriting a quoted hour is the same class of false claim the grounding
+# was built to remove.
+_REPORTING_CUE_RX = re.compile(
+    r"\b(?:reads|read|wrote|writes|written|said|says|replied|replies|"
+    r"quoted|quotes|message|note|follows|asked|asks)\b"
+    r"[^.!?;]{0,24}[.!?;]\s*$", re.I)
+# NB the name. _SENTENCE_END_RX is already taken, by the stream splitter
+# that _split_complete_sentences uses, and shadowing it here silently cut
+# the terminator off every streamed sentence ("The build passed, sir" for
+# "The build passed, sir.") -- caught by the suite, not by review.
+_GREETING_SENTENCE_END_RX = re.compile(r"[.!?]")
 
 
 def ground_greeting(text, user_text="", now=None):
@@ -1496,24 +1586,41 @@ def ground_greeting(text, user_text="", now=None):
     about a later hour, not a claim about this one -- and never "good
     night", which is a sign-off and is right whenever he says it. If
     Hunter used the word himself, Jarvis echoing him is politeness, not a
-    stale memory, and it stands.
+    stale memory, and it stands; if the reply is quoting somebody else's
+    greeting ("your message reads as follows. Good morning, ..."), the
+    hour in it is not Jarvis's claim to make right.
+
+    When the opening IS corrected, a well-wish later in the SAME sentence
+    is corrected with it -- the clause was recalled as one piece, so
+    grounding the first word alone leaves the sentence contradicting
+    itself instead of the clock.
     """
     if not text or "good" not in text.lower():
         return text
     want = arc_mod.greeting_word(now)
     said = (user_text or "").lower()
-
-    def fix(m):
-        lead, good, word = m.group(1), m.group(2), m.group(3)
-        if word.lower() == want or f"good {word.lower()}" in said:
-            return m.group(0)
-        return f"{lead}{good} {want}"
-
-    out = _GREETING_OPEN_RX.sub(fix, text)
-    if out != text:
+    out, pos = [], 0
+    for m in _GREETING_OPEN_RX.finditer(text):
+        if m.start() < pos:
+            continue                  # inside a tail already rewritten
+        out.append(text[pos:m.start()])
+        pos = m.end()
+        word = m.group(3).lower()
+        if (word == want or f"good {word}" in said
+                or _REPORTING_CUE_RX.search(text[:m.start()])):
+            out.append(m.group(0))
+            continue
+        out.append(f"{m.group(1)}{m.group(2)} {want}")
+        stop = _GREETING_SENTENCE_END_RX.search(text, pos)
+        stop = stop.end() if stop else len(text)
+        out.append(_GREETING_TAIL_RX.sub(rf"\g<1>{want}", text[pos:stop]))
+        pos = stop
+    out.append(text[pos:])
+    new = "".join(out)
+    if new != text:
         log.info("grounded a stale greeting in the clock: %r -> %r",
-                 text[:60], out[:60])
-    return out
+                 text[:60], new[:60])
+    return new
 
 
 def spoken_from_ollama(raw, context_text="", user_text="",
@@ -2781,6 +2888,20 @@ class JarvisBrain:
                     calls.append(call)
                 if calls:
                     continue                  # a tool round: never spoken
+                if reasoning_block_open(buf):
+                    # Hold: guard() scrubs ONE sentence, so a reasoning
+                    # block spanning a sentence break gets its opener
+                    # deleted and its CONTENTS spoken. Measured on the
+                    # real loop, 2026-09-02: "<think>He wants a greeting.
+                    # It is 2 pm.</think>Good afternoon, sir." streamed
+                    # "He wants a greeting." to TTS. Nothing goes out
+                    # until the block closes and can be cut whole; the
+                    # cost is that a finished sentence sitting in front of
+                    # an open block waits for it, which is a few hundred
+                    # milliseconds against reading the model's monologue
+                    # to the room.
+                    continue
+                buf = _CLOSED_REASONING_RX.sub(" ", buf)
                 done, buf = _split_complete_sentences(buf)
                 for sent in done:
                     self._emit_sentence(sent, cap, on_sentence, streamed, guard)

@@ -151,3 +151,97 @@ def test_a_streamed_reply_to_hunter_keeps_its_sir(monkeypatch):
     spoken = []
     b._chat_sync("how did the build go", on_sentence=spoken.append)
     assert spoken == ["The build passed, sir.", "Nothing to do."]
+
+
+# ----------------------------------------------------------------------
+# Gate 2's name class -- the 2026-09-02 over-reach review
+#
+# _GREETS_BY_NAME_RX was compiled with a blanket re.I, which made its
+# [A-Z][a-z]+ "name" class match ANY lowercase word: every sentence opening
+# with a greeting word was read as third-party speech and lost Hunter's
+# honorific. Measured captures at the time:
+#
+#   'Welcome back, sir.'                                who='back, sir'
+#   'Hi there, sir.'                                    who='there, sir'
+#   'hello has been added to tomorrow at 4:30 pm, sir.' who='has'
+#
+# The first is presence.WELCOME_LINE verbatim and the third is a real
+# gemma4 line from jarvis.log.1 21:02:50.994, so this was not hypothetical
+# vocabulary. The case-insensitivity is now scoped to the greeting words.
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("line", [
+    "Welcome back, sir.",
+    "Welcome home, sir.",
+    "Hello again, sir.",
+    "Hi there, sir.",
+    "Hey now, sir.",
+    "Greetings from the calendar, sir.",
+    "Hello there, sir; the tests are running.",
+    "Hi, the session is open, sir.",
+    "Hey, that's done, sir.",
+    "Good morning, everything is quiet, sir.",
+])
+def test_a_greeting_followed_by_an_ordinary_word_is_not_a_name(line):
+    """The word after "hello" has to look like a name, not merely exist."""
+    for asked in ("Say hello to my family.", "Tell my brother I'll be late.",
+                  "Tell Claude to run the tests."):
+        assert strip_relay_address(line, asked) == line
+
+
+def test_the_welcome_line_jarvis_really_says_keeps_its_sir():
+    """presence.WELCOME_LINE is authored and spoken to HIM. It does not
+    traverse this guard in production, but a model reply of the same shape
+    does, and under the loose regex both lost their sir."""
+    from jarvis.presence import WELCOME_LINE
+
+    assert WELCOME_LINE == "Welcome back, sir."
+    assert strip_relay_address(WELCOME_LINE, "Say hello to my family.") == \
+        WELCOME_LINE
+
+
+def test_a_real_logged_calendar_line_keeps_its_sir():
+    """jarvis.log.1 21:02:50.994, a line gemma4 actually produced. Under
+    the loose regex it captured who='has' and was judged third-party."""
+    line = "hello has been added to tomorrow at 4:30 pm, sir."
+    assert strip_relay_address(line, "Say hi to my family.") == line
+
+
+def test_the_second_sentence_of_a_relay_reply_keeps_the_sir_that_is_his():
+    """The shape a relay turn actually produces: the greeting is theirs,
+    what follows is his. Sentence two opens with a greeting WORD and is
+    still addressed to Hunter, which is the case the first version of this
+    file never exercised."""
+    line = ("Good afternoon, Ali and Heather. Welcome back, sir. You have "
+            "three items today, sir.")
+    out = strip_relay_address(
+        line, "say hi to my family and then tell me what's on my calendar")
+    assert out == ("Good afternoon, Ali and Heather. Welcome back, sir. "
+                   "You have three items today, sir.")
+
+
+# ------------------------------------------------- "you all" is not plural
+@pytest.mark.parametrize("line", [
+    "You are all caught up, sir.",
+    "Are you all set for the day, sir?",
+    "Thank you all the same, sir.",
+    "Is that you all right, sir?",
+    "I'll send you two reminders, sir.",
+    "I'll get you all set up, sir.",
+    "That leaves you two options, sir.",
+])
+def test_a_quantity_after_you_is_not_a_plural_second_person(line):
+    """"you two reminders" is one listener and two reminders. Only a
+    clause boundary or a verb behind the quantity makes it an audience."""
+    assert strip_relay_address(line, "Tell my brother I'll be late.") == line
+
+
+@pytest.mark.parametrize("line", [
+    "I do hope you're both having a lovely day, sir.",
+    "I hope you are both well, sir.",
+    "Both of you are very welcome, sir.",
+    "You two are expected at seven, sir.",
+    "I hope you both have a pleasant evening, sir.",
+])
+def test_a_genuine_plural_second_person_still_loses_it(line):
+    out = strip_relay_address(line, "Say hello to my family.")
+    assert "sir" not in out.lower()

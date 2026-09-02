@@ -136,3 +136,100 @@ def test_a_streamed_sentence_is_scrubbed_before_it_is_spoken(monkeypatch):
     spoken = []
     b._chat_sync("say hi", on_sentence=spoken.append)
     assert spoken == ["Good afternoon, sir.", "All is quiet."]
+
+
+# ----------------------------------------------------------------------
+# The STREAM -- the path that actually spoke the 14:43:59 line
+#
+# 2026-09-02 over-reach review, driven through the real _chat_sync loop
+# with _http_stream faked: guard() scrubs ONE sentence, so a reasoning
+# block whose contents span a sentence boundary had its opener deleted by
+# _REASONING_TAG_RX and its CONTENTS read to the room --
+#
+#   raw      '<think>He wants a greeting. It is 2 pm and the family is
+#             home.</think>Good afternoon, sir.'
+#   STREAMED ['He wants a greeting.',
+#             'It is 2 pm and the family is home. Good afternoon, sir.']
+#   whole    'Good afternoon, sir.'
+#
+# The whole-reply path was right all along; only the streamed one leaked,
+# and only when the block spanned a break, which is why the original
+# streamed test (a prefix on a single sentence) never saw it.
+# ----------------------------------------------------------------------
+@pytest.mark.parametrize("raw", [
+    "<think>He wants a greeting. It is 2 pm and the family is home."
+    "</think>Good afternoon, sir.",
+    "<|channel|>analysis<|message|>He wants a greeting. It is 2 pm."
+    "<|end|>Good afternoon, sir.",
+    "<thinking>\nOne. Two. Three.\n</thinking>\nGood afternoon, sir.",
+])
+@pytest.mark.parametrize("chunk", [1, 7, 500])
+def test_a_reasoning_block_spanning_a_sentence_break_is_never_streamed(
+        monkeypatch, raw, chunk):
+    """Also at one character per chunk: a half-arrived closing tag must
+    read as "still open", not as "no block here"."""
+    from tests.test_streaming_replies import _brain, _chunks
+
+    b = _brain(monkeypatch, _chunks(raw)
+               if chunk == 7 else
+               [{"message": {"role": "assistant", "content": raw[i:i + chunk]},
+                 "done": False} for i in range(0, len(raw), chunk)] +
+               [{"message": {"role": "assistant", "content": ""},
+                 "done": True, "load_duration": 0}])
+    spoken = []
+    b._chat_sync("say hi", on_sentence=spoken.append)
+    assert spoken == ["Good afternoon, sir."]
+
+
+def test_an_unterminated_reasoning_block_speaks_nothing(monkeypatch):
+    """The stream died mid-thought. Everything after the opener is the
+    model talking to itself, so none of it goes out; _chat_sync answers
+    with MODEL_EMPTY_LINE, which is an honest sentence."""
+    from jarvis.brain import MODEL_EMPTY_LINE
+    from tests.test_streaming_replies import _brain, _chunks
+
+    b = _brain(monkeypatch,
+               _chunks("<think>He wants a greeting. It is 2 pm and nothing "
+                       "closes this."))
+    spoken = []
+    tags = b._chat_sync("say hi", on_sentence=spoken.append)
+    assert spoken == []
+    assert dict(tags)["SPEAK"] == MODEL_EMPTY_LINE
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("<think>He wants a greeting.", True),
+    ("<think>He wants a greeting.</think>Good afternoon, sir.", False),
+    ("<think>a</think> and now <thinking>b", True),
+    ("<|channel|>analysis<|message|>He wants", True),
+    ("<|channel|>analysis<|message|>x<|end|>Good afternoon, sir.", False),
+    ("<|channel|>final<|message|>Good afternoon, sir.", False),
+    ("thought\n<channel|>Good afternoon, sir.", False),
+    ("Good afternoon, sir.", False),
+    ("", False),
+])
+def test_reasoning_block_open_reads_a_half_arrived_buffer(text, expected):
+    from jarvis.brain import reasoning_block_open
+
+    assert reasoning_block_open(text) is expected
+
+
+def test_an_unterminated_block_that_ate_the_reply_says_so_in_the_log(caplog):
+    """The scrub's other outcome needs its own WARNING. A truncated
+    reasoning stream can swallow a usable answer, and with only the
+    "scrubbed ..." line to grep for, the fail-quiet case was invisible --
+    the reply becomes MODEL_EMPTY_LINE and nothing says why."""
+    import logging
+
+    with caplog.at_level(logging.WARNING, logger="jarvis.brain"):
+        out = strip_model_scaffolding(
+            "<|channel|>analysis<|message|>thinking hard. Good afternoon, sir.")
+    assert out == ""
+    assert any("emptied the reply" in r.message for r in caplog.records)
+
+
+def test_an_unterminated_think_block_does_not_leak_its_contents():
+    """The mirror of the channel case. _REASONING_TAG_RX alone would have
+    dropped "<think>" and kept the monologue behind it."""
+    assert strip_model_scaffolding("<think>He wants a greeting. It is 2 pm.") \
+        == ""
