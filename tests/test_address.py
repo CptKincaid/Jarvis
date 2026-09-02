@@ -835,7 +835,7 @@ def test_the_shipped_default_is_on():
 # ======================================================================
 # D3 -- the first-wake morning briefing is a join too
 # ======================================================================
-def _briefing_app(tmp_path, review):
+def _briefing_app(tmp_path, week="", garden=""):
     a = object.__new__(app_mod.JarvisApp)
     a.assistant = SimpleNamespace(
         get=lambda k, d=None: {"briefing.on_first_wake": True,
@@ -849,33 +849,36 @@ def _briefing_app(tmp_path, review):
     a.services = SimpleNamespace(
         brain=SimpleNamespace(chat=lambda t, **kw: a.chats.append((t, kw))))
     a._briefing_state_path = lambda: tmp_path / "briefing.json"
-    a._review_line = lambda day, label="Yesterday": review
+    a._pending_week_line = lambda: week
+    a._pending_garden_line = lambda: garden
     return a
 
 
 class TestTheMorningBriefingBurst:
-    """The longest burst in the live log: 14:33:49-14:34:29, seven TTS
-    segments over 40 seconds, four sirs. Same shape as the arrival cue."""
+    """Once the longest burst in the live log: 14:33:49-14:34:29, seven TTS
+    segments over 40 seconds, four sirs. Two of those segments have gone --
+    the day review left the path on 2026-09-02 and the whole thing now
+    waits on a yes -- but what remains is still consecutive _say calls with
+    nothing between them, so it is still ONE burst and still thinned."""
 
-    REVIEW = ("Yesterday: 4 turns, median wait 1.2 seconds. "
-              "I dropped 2 clips of yours at the speaker gate, sir.")
+    WEEK = "Last week: 41 turns, median wait 1.3 seconds, sir."
 
-    def test_the_briefing_hand_over_is_thinned_against_the_review(self, tmp_path):
-        a = _briefing_app(tmp_path, self.REVIEW)
+    def test_the_hand_over_is_thinned_against_the_weekly_line(self, tmp_path):
+        a = _briefing_app(tmp_path, week=self.WEEK)
         a._deliver_first_wake_briefing()
-        assert a.said == [self.REVIEW, "Your briefing for today."]
+        assert a.said == [self.WEEK, "Your briefing for today."]
+        assert sirs(" ".join(a.said)) == 1
         assert len(a.chats) == 1
 
-    def test_with_nothing_to_review_the_hand_over_keeps_its_own(self, tmp_path):
-        a = _briefing_app(tmp_path, "")
+    def test_with_nothing_owed_the_hand_over_keeps_its_own(self, tmp_path):
+        a = _briefing_app(tmp_path)
         a._deliver_first_wake_briefing()
         assert a.said == ["Your briefing for today, sir."]
 
-    def test_the_weekly_lines_are_in_the_same_burst(self, tmp_path):
-        a = _briefing_app(tmp_path, self.REVIEW)
-        a._pending_week_line = lambda: "Last week: 41 turns, sir."
-        a._pending_garden_line = lambda: ""
+    def test_the_garden_line_is_in_the_same_burst(self, tmp_path):
+        a = _briefing_app(tmp_path, week=self.WEEK,
+                          garden="I filed three things from this week, sir.")
         a._deliver_first_wake_briefing()
-        assert a.said == [self.REVIEW, "Last week: 41 turns.",
+        assert a.said == [self.WEEK, "I filed three things from this week.",
                           "Your briefing for today."]
         assert sirs(" ".join(a.said)) == 1

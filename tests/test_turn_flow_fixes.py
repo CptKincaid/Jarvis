@@ -93,10 +93,12 @@ def test_a_bursts_falling_edge_clears_the_filler_label(monkeypatch, tmp_path):
 
 
 # -------------------------------------------------------------- briefing
-def test_the_briefing_waits_for_the_answers_own_falling_edge(monkeypatch, tmp_path):
+def test_the_briefing_offer_waits_for_the_answers_own_falling_edge(monkeypatch, tmp_path):
     """An ack ("Looking that up, sir") ends in a falling edge while the
-    brain is still busy; delivering there collided with the in-flight call
-    and marked the day delivered for a briefing nobody heard."""
+    brain is still busy; speaking there collided with the in-flight call
+    and marked the day for a briefing nobody heard. Since 2026-09-02 what
+    lands on the settled edge is the OFFER, not 40 seconds of briefing --
+    the timing rule is the same one."""
     monkeypatch.setattr(CONFIG, "talkback", True)
     a = _app(monkeypatch, tmp_path)
     _due(monkeypatch, a)
@@ -106,10 +108,11 @@ def test_the_briefing_waits_for_the_answers_own_falling_edge(monkeypatch, tmp_pa
     assert a._briefing_pending
     a._turn_busy.set()                                  # the answer is still coming
     a._after_speech()                                   # the ack's falling edge
-    assert a.chats == [] and a._briefing_pending
+    assert a.said == [] and a._briefing_pending
     a._turn_busy.clear()
     a._after_speech()                                   # the answer's falling edge
-    assert [t for t, _ in a.chats] == ["my morning briefing"]
+    assert a.said == ["Shall I run your morning briefing, sir?"]
+    assert a.chats == [], "the briefing itself waits for a yes"
     assert not a._briefing_pending
     assert json.loads((tmp_path / "briefing.json").read_text())["delivered"] == "2026-08-30"
 

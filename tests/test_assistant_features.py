@@ -241,9 +241,12 @@ def test_first_wake_briefing_is_due_once_a_day_after_the_hour(monkeypatch, tmp_p
                       SimpleNamespace(reply="x", speak=True, done=True, ack=False, status=""))
     assert a._briefing_pending is True
     a._after_speech()
-    assert a.chats == [("my morning briefing", {"force_tool": "get_briefing"})]
-    assert a.said[0].startswith("Your briefing")
-    assert a._briefing_due(_Clock.fixed) is False, "delivered today: not again"
+    # 2026-09-02: the burst OFFERS and stops there (tests/test_briefing_offer.py).
+    # The day closes on the question being put, so the once-a-day latch is
+    # unchanged -- it is now "asked once", not "read out once".
+    assert a.chats == [], "nothing is read out until he says yes"
+    assert a.said == ["Shall I run your morning briefing, sir?"]
+    assert a._briefing_due(_Clock.fixed) is False, "raised today: not again"
 
 
 def test_asking_for_the_briefing_counts_as_delivered(monkeypatch, tmp_path):

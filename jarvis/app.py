@@ -62,6 +62,7 @@ from jarvis.events import (
 from jarvis.logs import get_logger
 
 from jarvis import address as address_mod
+from jarvis import arc as arc_mod
 from jarvis import board as board_mod
 from jarvis import brain as brain_mod
 from jarvis import debrief as debrief_mod
@@ -188,6 +189,11 @@ NUDGE_LINE = "Sir?"
 # turn is over and that a wake word is how he retries.
 NOT_CAUGHT_LINE = "I did not catch that, sir. Do try me again."
 GUEST_LINE = "I only answer to {name}, sir."
+# The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
+# offer"). {when} is arc.greeting_word() so the question names the hour it
+# is actually asked in: all three deliveries in the retained logs landed in
+# the afternoon while the code said "morning".
+BRIEFING_OFFER_LINE = "Shall I run your {when} briefing, sir?"
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
 # The sources that arrive from somewhere other than this desk: a shell /
@@ -1088,6 +1094,10 @@ class JarvisApp:
             # Filled in start_assistant so building the tools in a test does
             # not open a SQLite file.
             flashcards=None,
+            # Parked by app._offer_first_wake_briefing, answered by
+            # Commander._try_briefing_offer -- declared here so the
+            # namespace says the slot exists.
+            briefing_offer=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
             # the one self-state sheet the courtesy and the readout share
@@ -2383,9 +2393,21 @@ class JarvisApp:
         if getattr(tts, "is_speaking", False) or getattr(tts, "pending", 0):
             return                          # more speech is queued behind this burst
         if self._briefing_pending:
+            # An OFFER, not the briefing (Hunter, 2026-09-02). Still here,
+            # on the settled burst, rather than on some later "natural
+            # gap": the only gap this code can actually observe is silence,
+            # and speaking into silence out of nowhere is a bigger
+            # interruption than one short question at the end of an
+            # exchange he started. What it can also observe is another open
+            # question -- a flashcard, a read-back, a router ask -- and two
+            # questions on the table is how a "yes" lands on the wrong one,
+            # so the offer waits for that instead.
+            if self._question_open(getattr(self, "commander", None)):
+                log.debug("briefing offer held: another question is open")
+                return
             self._briefing_pending = False
             self._followup_after_speech = False
-            self._deliver_first_wake_briefing()
+            self._offer_first_wake_briefing()
             return
         if self._followup_after_speech:
             self._followup_after_speech = False
@@ -2545,11 +2567,15 @@ class JarvisApp:
         age = self._leave_pending_age(commander)
         if age is not None and age <= self._window_setting("quiz.window_s", 15.0):
             return True
-        # The wake-alarm offer lives on the services namespace, not on the
-        # commander: briefing.make_tools parks it there for
-        # _try_alarm_offer.
-        offer = getattr(getattr(self, "services", None), "alarm_offer", None)
-        if isinstance(offer, dict) and offer:
+        # The wake-alarm offer and the first-wake briefing offer live on
+        # the services namespace, not on the commander: briefing.make_tools
+        # parks one there for _try_alarm_offer and
+        # app._offer_first_wake_briefing the other for _try_briefing_offer.
+        services = getattr(self, "services", None)
+        for name in ("alarm_offer", "briefing_offer"):
+            offer = getattr(services, name, None)
+            if not isinstance(offer, dict) or not offer:
+                continue
             try:
                 made = float(offer.get("made_at") or 0.0)
             except (TypeError, ValueError):
@@ -2623,30 +2649,85 @@ class JarvisApp:
         # that builds a real app cannot mark the user's real day delivered.
         return PATHS.MEMORY_DIR / "briefing_state.json"
 
-    def _briefing_due(self, now=None):
+    def _briefing_gates(self):
+        """The conditions the first-wake briefing must pass, cheapest first.
+
+        A LIST of named gates rather than a chain of ifs because Hunter's
+        2026-09-02 ruling was "he should offer -- we will have auto
+        briefing changed later with presence and camera stuff". That
+        rework wants "he is here, he is awake, and it is morning", which
+        is one more entry here and one more line in the log that says
+        which gate refused. Nothing outside this method knows what the
+        gates ARE, so adding one changes no caller.
+
+        Each gate takes ``now`` and returns True to let the briefing
+        through, and each swallows its OWN failure in the direction that
+        was already established here: an unreadable config refuses (never
+        speak on a guess), a broken quiet policy lets through (a bad
+        sensor must not silently switch the feature off).
+        """
+        return (("switched off", self._gate_switched_on),
+                ("before the hour", self._gate_after_hour),
+                ("quiet hours", self._gate_not_quiet),
+                ("already raised today", self._gate_not_raised_today))
+
+    def _gate_switched_on(self, now):
         try:
-            if not self.assistant.get("briefing.on_first_wake", True):
-                return False
+            return bool(self.assistant.get("briefing.on_first_wake", True))
+        except Exception:
+            log.debug("briefing.on_first_wake unreadable", exc_info=True)
+            return False
+
+    def _gate_after_hour(self, now):
+        try:
             after = str(self.assistant.get("briefing.after", "06:00") or "06:00")
             hh, mm = (int(x) for x in after.split(":")[:2])
         except Exception:
+            # A typo'd briefing.after must not free-run the day: 06:00 is
+            # the DEFAULT, not a floor to fall back to.
+            log.debug("briefing.after unreadable", exc_info=True)
             return False
-        now = now or datetime.now()
-        if (now.hour, now.minute) < (hh, mm):
-            return False
-        # Quiet hours / a running class: the day stays unmarked, so the first
-        # answered turn after the window delivers it instead.
+        return (now.hour, now.minute) >= (hh, mm)
+
+    def _gate_not_quiet(self, now):
+        # Quiet hours / a running class: the day stays unraised, so the
+        # first answered turn after the window makes the offer instead.
         quiet = getattr(self, "quiet", None)
         try:
-            if quiet is not None and quiet.is_quiet():
-                return False
+            return quiet is None or not quiet.is_quiet()
         except Exception:
             log.debug("quiet check failed; briefing proceeds", exc_info=True)
+            return True
+
+    def _gate_not_raised_today(self, now):
         try:
             state = json.loads(self._briefing_state_path().read_text())
         except (OSError, ValueError):
             state = {}
         return state.get("delivered") != now.date().isoformat()
+
+    def _briefing_block(self, now=None) -> str:
+        """"" when the briefing may be raised, else the name of the first
+        gate that refuses it (a log line, not a UI string)."""
+        now = now or datetime.now()
+        for name, gate in self._briefing_gates():
+            try:
+                if not gate(now):
+                    return name
+            except Exception:
+                # Belt and braces: every gate above already swallows its
+                # own failure, so reaching here means a NEW gate does not.
+                # It refuses, because an unbidden 40-second monologue is
+                # the thing this whole path exists to stop.
+                log.exception("briefing gate %r raised", name)
+                return name
+        return ""
+
+    def _briefing_due(self, now=None):
+        blocked = self._briefing_block(now)
+        if blocked:
+            log.debug("briefing not due: %s", blocked)
+        return not blocked
 
     def _mark_briefing_delivered(self):
         try:
@@ -2658,40 +2739,95 @@ class JarvisApp:
         except OSError:
             log.debug("briefing state save failed", exc_info=True)
 
-    def _deliver_first_wake_briefing(self):
+    def _offer_first_wake_briefing(self):
+        """Ask, once, in one short line -- and stop there.
+
+        THE INCIDENT (2026-09-02 14:29:30): "Say hello to my family." was
+        answered with a greeting, then yesterday's turn metrics, then a
+        full weather/calendar/deadlines/news briefing. About 40 seconds of
+        monologue off five words that had nothing to do with any of it.
+        Hunter: "He should offer."
+
+        The offer is parked on ``services.briefing_offer`` and answered by
+        ``Commander._try_briefing_offer``, exactly as the wake-alarm and
+        exam-week study offers are -- ONE offer protocol, so a yes cannot
+        mean different things on different rungs.
+
+        The day is closed HERE, when the question is put, not when it is
+        answered. ``_after_dispatch`` re-arms behind every answered turn,
+        so an offer that only closed the day on delivery would ask again
+        seconds after each decline, and nagging is precisely the failure
+        mode being fixed. Asked-and-declined costs him nothing: "my
+        briefing" reaches ``_h_briefing`` at any hour.
+        """
+        offer = {"made_at": time.time(),
+                 # The commander cannot reach the app; the callback is how
+                 # the wake-alarm offer's park_offer seam works too.
+                 "deliver": self._deliver_first_wake_briefing}
+        try:
+            self.services.briefing_offer = offer
+        except Exception:
+            log.exception("could not park the briefing offer")
+            return
+        # The other end of "good night", and it belongs HERE rather than on
+        # the delivery: the first wake of the day is the morning whether or
+        # not he wants the news read to him, and hanging it off the yes
+        # would leave the house in night mode all day on a "no".
+        wd = getattr(self, "winddown", None)
+        if wd is not None:
+            try:
+                wd.restore()
+            except Exception:
+                log.exception("wind-down restore at first wake failed")
+        line = BRIEFING_OFFER_LINE.format(when=arc_mod.greeting_word(datetime.now()))
+        log.info("first wake of the day: offering the briefing")
+        # Marked BEFORE speaking, as the weekly review is: a TTS failure
+        # must not turn one question a day into one per utterance.
+        self._mark_briefing_delivered()
+        # Not proactive=True: _gate_not_quiet already asked the quiet policy,
+        # and holding this for the catch-up digest would put a breakfast
+        # question to him at lunchtime (the same rule as _ask_debrief).
+        bus.publish(JarvisReply(text=line, speak=True))
+        self._say(line)
+        # A question nobody listens for is the 2026-09-02 stuck-listen bug
+        # in miniature: arm the follow-up window so "yes" needs no wake
+        # word. _after_speech runs again on THIS line's falling edge and
+        # opens the mic there, once the offer itself has finished playing.
+        self._followup_after_speech = True
+
+    def _deliver_first_wake_briefing(self) -> bool:
+        """He said yes: read the briefing. True when the model was asked.
+
+        False means nothing was said and nothing was marked -- the caller
+        owns telling him so, because a yes that vanishes is worse than a
+        refusal (Commander._try_briefing_offer).
+        """
         brain = getattr(self.services, "brain", None)
         if brain is None or not hasattr(brain, "chat"):
-            return
+            return False
         if getattr(getattr(self, "brain", None), "is_busy", False):
             # chat() would only say "Still on the last one, sir": leave the
             # day unmarked so the next answered turn delivers it.
             log.info("first-wake briefing: model busy; next turn")
-            return
+            return False
         log.info("first wake of the day: delivering the briefing")
-        wd = getattr(self, "winddown", None)
-        if wd is not None:
-            try:
-                # The other end of "good night": the first wake of the day is
-                # the morning even when he never said the word.
-                wd.restore()
-            except Exception:
-                log.exception("wind-down restore at first wake failed")
-        # Yesterday's self-review first, as its own line: the briefing is a
-        # brain.chat(force_tool="get_briefing") call, so nothing can be
-        # folded into it "for free" -- and only when there was a yesterday
-        # to review (nothing said on a fresh box, or after a day off).
-        try:
-            review = self._review_line(datetime.now().date() - timedelta(days=1),
-                                       label="Yesterday")
-        except Exception:
-            log.exception("day review for the first wake failed")
-            review = ""
-        # THE JOIN, and the longest burst in the live log: measured at
+        # NO DAY REVIEW HERE. It used to open this burst -- "Yesterday: 24
+        # turns, median wait 1.4 seconds, worst 6.1. I dropped 7 clips of
+        # yours at the speaker gate" -- and it is instrumentation, not
+        # news: turn counts and speaker-gate rejections are how the
+        # ASSISTANT is doing, which is a thing to ask for and never a thing
+        # to be handed. He asked for a briefing; he gets a briefing. It
+        # stays one sentence away: "how did yesterday go" (the "day review"
+        # command -> services.dayreview -> app.day_review_text) reads the
+        # same digest, and the nightly file and the Discord post are
+        # untouched.
+        # THE JOIN, and once the longest burst in the live log: measured at
         # 14:33:49-14:34:29 as 40 seconds of unbroken speech over seven TTS
-        # segments carrying FOUR sirs. The review, the weekly lines and the
-        # hand-over below are four _say calls with nothing between them, so
-        # they are ONE burst and have to be thinned against each other the
-        # way the arrival cue is -- fragments, never a joined string.
+        # segments carrying FOUR sirs. What is left -- the weekly lines and
+        # the hand-over -- is still consecutive _say calls with nothing
+        # between them, so it is ONE burst and has to be thinned against
+        # itself the way the arrival cue is: fragments, never a joined
+        # string.
         burst: list = []
 
         def say_in_burst(line):
@@ -2707,27 +2843,35 @@ class JarvisApp:
             if address_mod.is_speakable(spoken):
                 self._say(spoken)
 
-        say_in_burst(review)
-        # Then the two weekly lines, if either is owed. Both are produced
-        # in the small hours by their own threads and deliberately NOT
-        # spoken there: this path is the quiet-gated one (_briefing_due
-        # refuses inside quiet hours), so a report written at 3 am is
-        # heard at breakfast and never at 3 am.
+        # The two weekly lines, if either is owed. Both are produced in the
+        # small hours by their own threads and deliberately NOT spoken
+        # there: this is the path the quiet gate stands in front of (the
+        # offer that leads here refuses inside quiet hours), so a report
+        # written at 3 am is heard at breakfast and never at 3 am. On a
+        # declined day neither is spoken and neither is lost -- each stays
+        # pending until a day he says yes.
         for line in (self._pending_week_line(), self._pending_garden_line()):
             say_in_burst(line)
         # The model's own reply lands after this through brain.chat and is
         # NOT in the ledger: it is one authored-shaped line with exactly one
         # sir (24/24 measured), and catching it would mean rewriting at the
-        # TTS door, which is the thing this design does not do. Four sirs
-        # become two: the review keeps the burst's first, the reply keeps
-        # its own.
+        # TTS door, which is the thing this design does not do. So the
+        # burst keeps exactly one sir of its own and the reply keeps its.
         say_in_burst("Your briefing for today, sir.")
+        # arc.greeting_word, not the literal "morning": every delivery in
+        # the two retained logs (08-31 14:33, 09-01 15:00, 09-02 14:29)
+        # asked the model for "my morning briefing" in the AFTERNOON,
+        # because briefing.after has a floor and no ceiling. One
+        # time-of-day rule for the house (jarvis/arc.py), not a second one
+        # here.
+        when = arc_mod.greeting_word(datetime.now())
         try:
-            brain.chat("my morning briefing", force_tool="get_briefing")
+            brain.chat(f"my {when} briefing", force_tool="get_briefing")
         except Exception:
             log.exception("first-wake briefing failed")
-            return
+            return False
         self._mark_briefing_delivered()     # after the ask, not before
+        return True
 
     # -------------------------------------------------------- day review
     def _review_line(self, day, label="Yesterday") -> str:

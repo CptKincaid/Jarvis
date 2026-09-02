@@ -268,16 +268,19 @@ def _app(monkeypatch, tmp_path, digest, busy=False):
     return a
 
 
-def test_first_wake_speaks_the_review_before_the_briefing(monkeypatch, tmp_path):
+def test_the_first_wake_briefing_no_longer_reads_the_review_out(monkeypatch, tmp_path):
+    """2026-09-02: "Yesterday: 24 turns, median wait 1.4 seconds ... I
+    dropped 7 clips of yours at the speaker gate" opened a briefing Hunter
+    had not asked for, and he called the lot "a bunch of nonsense". Turn
+    counts and gate rejections are instrumentation: reachable by asking
+    (below), never handed over unprompted."""
     digest = {"has_data": True, "turns": 4, "median_wait_s": 1.2, "worst_wait_s": 3.0,
               "speaker_rejections": 2}
     a = _app(monkeypatch, tmp_path, digest)
     a._deliver_first_wake_briefing()
-    # The review and the hand-over are ONE burst (40 s of unbroken speech in
-    # the live log), so the second sign-off goes -- jarvis/address.py.
-    assert a.said == ["Yesterday: 4 turns, median wait 1.2 seconds, worst 3.0. "
-                      "I dropped 2 clips of yours at the speaker gate, sir.",
-                      "Your briefing for today."]
+    assert a.said == ["Your briefing for today, sir."]
+    assert "speaker gate" in a.day_review_text("yesterday"), \
+        "the digest must still be one question away"
     assert len(a.chats) == 1 and a.chats[0][1] == {"force_tool": "get_briefing"}
 
 
@@ -287,10 +290,13 @@ def test_first_wake_says_nothing_about_a_day_with_no_data(monkeypatch, tmp_path)
     assert a.said == ["Your briefing for today, sir."]
 
 
-def test_a_broken_review_does_not_block_the_briefing(monkeypatch, tmp_path):
+def test_the_briefing_never_reads_the_digest_at_all(monkeypatch, tmp_path):
+    """A reviewer that explodes on being asked proves the delivery path
+    does not ask -- the day review is on request only now, and this is the
+    regression test for putting it back."""
     a = _app(monkeypatch, tmp_path, {})
     def boom(day):
-        raise RuntimeError("disk")
+        raise RuntimeError("the briefing consulted the day review")
     a.dayreviewer = SimpleNamespace(review=boom)
     a._deliver_first_wake_briefing()
     assert a.said == ["Your briefing for today, sir."] and len(a.chats) == 1

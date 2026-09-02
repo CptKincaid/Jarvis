@@ -2814,6 +2814,21 @@ BRIEFER_LINE = "Briefer it is, sir."
 FULL_LENGTH_LINE = "Very good, sir; the full briefing again."
 NO_ALARM_LINE = "Very good, sir; no alarm."
 ALARM_FAILED_LINE = "I couldn't set that alarm, sir."
+# The first-wake briefing's offer (app._offer_first_wake_briefing) is
+# answered here. The decline is the study offer's word for word: one
+# protocol, one sound.
+BRIEFING_DECLINED_LINE = "Very good, sir."
+BRIEFING_BUSY_LINE = "I'm still on the last one, sir; ask me for it in a moment."
+# "not now" / "later" carry no yes and no no, so parse_yes_no reads them as
+# a NEW SUBJECT and the offer is dropped silently -- which would leave the
+# words to route on into the model as a command. On this one offer they are
+# plainly a decline, so they are read as one HERE rather than in the shared
+# vocabulary, where "later" would start meaning no to a destructive
+# read-back and to every other yes/no rung in the ladder.
+_BRIEFING_LATER_RX = re.compile(
+    r"^(?:no[,\s]+)?(?:not (?:now|today|right now)|later|maybe later|"
+    r"another time|some other time|in a bit|skip(?: it| that)?|"
+    r"leave it|not just now)\b", re.I)
 # While an alarm rings (spec 5.2 a): these words stop it, "snooze [N]" snoozes.
 _RING_STOP_RX = re.compile(
     r"^(?:stop|dismiss|okay|ok|i'?m up|i am up|shut it off|shut up|enough|"
@@ -7367,10 +7382,11 @@ class Commander:
             except Exception:  # noqa: BLE001 - a slim/duck-typed router
                 log.debug("question_open: router pending failed", exc_info=True)
         # The wake-alarm offer and the exam-week study offer are parked on
-        # the SERVICES namespace by briefing.make_tools, not on the
-        # commander, and both are stamped in wall-clock seconds.
+        # the SERVICES namespace by briefing.make_tools, and the first-wake
+        # briefing offer by app._offer_first_wake_briefing -- not on the
+        # commander, and all three are stamped in wall-clock seconds.
         services = getattr(self, "services", None)   # a slim test commander has none
-        for name in ("alarm_offer", "study_offer"):
+        for name in ("alarm_offer", "study_offer", "briefing_offer"):
             offer = getattr(services, name, None)
             if isinstance(offer, dict) and offer:
                 try:
@@ -7680,6 +7696,15 @@ class Commander:
         # 3d'. The morning briefing asked "Shall we run ten now, sir?" of
         #      the deck for this week's exam; a plain yes deals those cards.
         res = self._try_study_offer(text)
+        if res is not None:
+            return res
+        # 3d''. The first wake of the day asked "Shall I run your morning
+        #       briefing, sir?"; a plain yes runs THAT, and is not a new
+        #       command. Below the study offer because that is the narrower
+        #       question; the two can never be live together anyway, since
+        #       this rung clears its own offer BEFORE the delivery that
+        #       parks a study one.
+        res = self._try_briefing_offer(text)
         if res is not None:
             return res
         # 3e. A destructive action was read back ("Cancel all three alarms,
@@ -8537,6 +8562,65 @@ class Commander:
         except (TypeError, ValueError):
             n = quiz_mod.DEFAULT_QUESTIONS
         return _start_review(self, n, topic=str(offer.get("course") or ""))
+
+    def _try_briefing_offer(self, text: str) -> Optional[CommandResult]:
+        """Resolve "Shall I run your morning briefing, sir?" -- the offer
+        that replaced 40 seconds of unbidden monologue on 2026-09-02
+        (app._offer_first_wake_briefing parks it on services.briefing_offer).
+
+        Same rule as _try_study_offer: a clear yes runs it, a no declines,
+        ANYTHING else drops the offer and routes as a new subject, and so
+        does an offer older than OFFER_TTL_S. That last one is what keeps
+        an unrelated "no" -- he says no to a great many things -- from
+        being swallowed by a question he was asked minutes ago.
+
+        The delivery is a callback carried in the offer: the commander has
+        no handle on the app, and the app is where brain.chat and the
+        day's state file live.
+        """
+        offer = getattr(self.services, "briefing_offer", None)
+        if not isinstance(offer, dict) or not offer:
+            return None
+        try:
+            self.services.briefing_offer = None
+        except Exception:
+            log.debug("could not clear the briefing offer", exc_info=True)
+        try:
+            made = float(offer.get("made_at") or 0.0)
+        except (TypeError, ValueError):
+            made = 0.0
+        if made and time.time() - made > OFFER_TTL_S:
+            log.info("briefing offer expired; %r is a new subject", text[:40])
+            return None
+        answer = parse_yes_no(text)
+        if answer is None:
+            if not _BRIEFING_LATER_RX.match(str(text or "").strip()):
+                return None                  # a new subject: the offer is gone
+            answer = False
+        if not answer:
+            # The day is already closed (the offer closed it when it was
+            # put), so this is the end of it until tomorrow -- he can still
+            # say "my briefing" at any hour and get one.
+            return CommandResult(handled=True, reply=BRIEFING_DECLINED_LINE,
+                                 speak=True, status="Briefing declined")
+        deliver = offer.get("deliver")
+        if not callable(deliver):
+            log.warning("briefing offer had no deliver callback")
+            return None
+        try:
+            ran = bool(deliver())
+        except Exception:
+            log.exception("briefing offer: delivery failed")
+            ran = False
+        if not ran:
+            # A yes that vanishes is worse than a refusal: the model was
+            # busy (or the app threw), so nothing was said and nothing was
+            # marked. Tell him, and let him ask again.
+            return CommandResult(handled=True, reply=BRIEFING_BUSY_LINE,
+                                 speak=True, status="Briefing held")
+        # done=False, like _h_briefing: the spoken briefing is the model's
+        # reply and lands on a later beat.
+        return CommandResult(handled=True, status="Briefing…", done=False)
 
     def _try_event_confirm(self, text: str) -> Optional[CommandResult]:
         """Resolve a calendar add that was read back for confirmation.
