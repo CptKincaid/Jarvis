@@ -370,6 +370,19 @@ class Presence(Event):
 
 
 @dataclass
+class SensingChanged(Event):
+    """Offline mode changed (jarvis/sensing.py). Published by the spoken
+    switch so the console badge turns over in the same breath as the reply;
+    the window ALSO re-reads the policy on its own 5 s pass, because the
+    21:00 curfew edge arrives with nobody saying anything."""
+    camera: bool = True
+    radar: bool = True
+    offline: bool = False
+    reason: str = ""                  # "" | offline | timed | curfew | failsafe
+    until: float | None = None        # a timed offline's end, epoch seconds
+
+
+@dataclass
 class DeskState(Event):
     """He sat down at / walked away from the keyboard (jarvis/deskpresence.py,
     GNOME's Mutter idle monitor). Published only on a threshold crossing;

@@ -1689,6 +1689,12 @@ TIER1_SAMPLES = {
     "do not disturb": "do not disturb for an hour",
     "free": "i am free",
     "room tone": "room tone on",
+    # offline mode (jarvis/sensing.py) -- his own words for four of these
+    "sensing off": "offline mode",
+    "sensing on": "come back online",
+    "sensing status": "are you watching",
+    "sensing hold": "no cameras for the next two hours",
+    "sensing curfew": "camera curfew from nine to seven",
     "ui look": "switch to classic visuals",
     "audio out": "where's your voice coming out",
     "standup": "standup",

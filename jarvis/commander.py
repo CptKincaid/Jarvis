@@ -93,7 +93,7 @@ from jarvis import reader as reader_mod
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.tools.location import clock_words
-from jarvis.events import JarvisReply, Status, bus
+from jarvis.events import JarvisReply, SensingChanged, Status, bus
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import parse_person_statement, parse_since
@@ -5345,6 +5345,416 @@ def _h_room_tone(c, t, m):
                          status=f"Room tone {'on' if want else 'off'}")
 
 
+# ------------------------------------------------------------------
+# Offline mode -- the privacy switch, spoken (jarvis/sensing.py)
+# ------------------------------------------------------------------
+# His ruling of 2026-09-02: "It also needs to have a Jarvis offline mode
+# and it will shutdown/disable sensors and cameras", worked "by a voice
+# command that says offline mode or deactivate presence or something of
+# that nature", and the curfew window changeable "with voice command or UI
+# settings buttons". So this is a FAMILY, not one blessed phrase.
+#
+# WHAT IS TIER 1 HERE, AND WHY THE REST IS NOT.
+#   Tier 1: the switch (on / off), the status question, a BOUNDED offline
+#   whose end is a duration or a clock time, and the daily window given as
+#   two clock times or one moved edge. All four are closed vocabularies
+#   over an unambiguous time token, they are what he actually says, and --
+#   the deciding reason -- they have to work when the GPU is lent out and
+#   the local model is unloaded. A privacy switch that needs a 26B model
+#   resident is not a privacy switch.
+#   NOT Tier 1: any end that refers to an event rather than a clock ("keep
+#   it off until I'm back from class", "no cameras while my brother's
+#   here"). A regex cannot ask a clarifying question, and a mis-parsed
+#   time silently rewrites a privacy schedule; those fall to the router,
+#   which can ask.
+#   And when a Tier-1 SHAPE matches but the TIME does not parse, the
+#   sensors go off NOW, open-endedly, and the line says the "until" was
+#   not caught. Failing toward more privacy and saying so out loud beats
+#   both guessing and refusing.
+#
+# The microphone is deliberately absent from every one of these handlers
+# (tests/test_offline_mode.py asserts it by reading their source): the
+# switch is spoken off again, so gating the mic would make it one-way.
+_SENSE_NOUN = (r"(?:the\s+|my\s+|your\s+)?"
+               r"(?:cameras?|webcams?|web\s?cams?|sensors?|sensing|radar|"
+               r"presence(?:\s+(?:sensor|sensing|detection))?|"
+               r"lens(?:es)?|eyes)")
+# "Turn off the camera and the radar" is ONE order, not a sentence this
+# family may drop on the floor because it names both sensors.
+_SENSE_NOUNS = _SENSE_NOUN + r"(?:\s+and\s+" + _SENSE_NOUN + r")?"
+_SENSE_MODE = r"(?:offline|privacy)"
+# He puts the politeness in FRONT at least as often as behind ("please stop
+# watching", "can you stop watching"), and the whole reason this family is
+# Tier 1 is that a privacy order must never reach a model that cannot
+# switch a sensor. A leading modal is the cheapest way to lose one.
+_SENSE_ASK = r"(?:please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
+# Whisper writes the vocative with a comma, so the tail takes [,\s].
+_SENSE_TAIL = r"(?:[,\s]+(?:please|now|sir))*[?.!\s]*$"
+# "No sensors tonight" is the same order as "no sensors": off until he says
+# otherwise. Deliberately NOT read as a window -- inventing an end time is
+# the one direction that puts a lens back on by itself.
+_SENSE_OFF_TAIL = r"(?:[,\s]+(?:please|now|sir|tonight|today))*[?.!\s]*$"
+
+_SENSING_STATUS_RX = re.compile(
+    r"^" + _JV + r"(?:"
+    r"(?:are|is)\s+(?:you|we|it)\s+(?:in\s+)?" + _SENSE_MODE + r"(?:\s+mode)?"
+    r"|is\s+" + _SENSE_MODE + r"\s+mode(?:\s+(?:on|off|active|running))?"
+    r"|(?:are|is)\s+you\s+(?:watching|looking|recording|filming|seeing)"
+    r"(?:\s+(?:at\s+)?(?:me|us|the\s+room|the\s+office))?"
+    r"|(?:are|is)\s+" + _SENSE_NOUN + r"\s+(?:on|off|running|live|active|up)"
+    r"|(?:what(?:'s| is)?\s+)?(?:the\s+)?"
+    r"(?:sensing|sensor|camera|privacy)\s+status"
+    r"|(?:when|what)\s+(?:is|are|time is)\s+(?:the\s+|my\s+)?"
+    r"(?:camera\s+)?curfew"
+    r")" + _SENSE_TAIL, re.I)
+
+_SENSING_CURFEW_RX = re.compile(
+    r"^" + _JV + r"(?:"
+    r"(?P<off>(?:turn\s+off|switch\s+off|cancel|remove|disable|drop|delete|"
+    r"no\s+more)\s+(?:the\s+|my\s+)?(?:cameras?\s+)?curfew)"
+    # a whole window: "camera curfew from nine to seven"
+    r"|(?:(?:set|change|move|make|put)\s+(?:the\s+|my\s+)?(?:cameras?\s+)?"
+    r"curfew\s+(?:to\s+|at\s+)?(?:from\s+)?"
+    r"|(?:the\s+)?(?:cameras?\s+)?curfew\s+(?:is\s+)?(?:from\s+)?"
+    r"|no\s+cameras?\s+from\s+|cameras?\s+off\s+from\s+)"
+    r"(?P<a>.+?)\s+(?:to|until|till|through)\s+(?P<b>.+?)"
+    # one edge: "start the camera curfew at ten tonight"
+    r"|(?:start|begin|move)\s+(?:the\s+|my\s+)?(?:cameras?\s+)?curfew\s+"
+    r"(?:at|to)\s+(?P<start>.+?)"
+    # the other edge: "extend the camera curfew until noon"
+    r"|(?:extend|push|end|lift|stretch)\s+(?:the\s+|my\s+)?(?:cameras?\s+)?"
+    r"curfew\s+(?:to|until|till|at)\s+(?P<end>.+?)"
+    r")" + _SENSE_TAIL, re.I)
+
+_SENSING_HOLD_RX = re.compile(
+    r"^" + _JV + _SENSE_ASK + r"(?:"
+    r"(?:keep|leave)\s+" + _SENSE_NOUN + r"\s+(?:off|down)\s+"
+    r"(?P<mode1>for|until|till|through)\s+(?P<when1>.+?)"
+    r"|no\s+(?:more\s+)?(?:cameras?|sensors?|radar|watching)\s+"
+    r"(?P<mode2>for|until|till|through)\s+(?P<when2>.+?)"
+    r"|(?:turn|switch|shut)\s+(?:off\s+)?" + _SENSE_NOUN + r"(?:\s+off)?\s+"
+    r"(?P<mode3>for|until|till|through)\s+(?P<when3>.+?)"
+    r"|(?:go\s+offline|offline(?:\s+mode)?|privacy\s+mode)\s+"
+    r"(?P<mode4>for|until|till|through)\s+(?P<when4>.+?)"
+    # "stop watching for ten minutes" -- the bare verb already goes off
+    # open-endedly, so without this the BOUNDED form was the one that fell
+    # through to the router.
+    r"|stop\s+(?:watching|looking|sensing|spying|staring)"
+    r"(?:\s+(?:at\s+)?(?:me|us|the\s+room|the\s+office))?\s+"
+    r"(?P<mode5>for|until|till|through)\s+(?P<when5>.+?)"
+    # ...and the verbless "camera off for an hour".
+    r"|(?:cameras?|sensors?|radar|presence|sensing)\s+(?:off|down)\s+"
+    r"(?P<mode6>for|until|till|through)\s+(?P<when6>.+?)"
+    r")" + _SENSE_TAIL, re.I)
+
+_SENSING_OFF_RX = re.compile(
+    r"^" + _JV + _SENSE_ASK + r"(?:"
+    r"go(?:ing)?\s+offline"
+    r"|go\s+dark"
+    r"|" + _SENSE_MODE + r"\s+mode(?:\s+on)?"
+    r"|(?:turn|switch|flip)\s+on\s+" + _SENSE_MODE + r"\s+mode"
+    r"|(?:enable|activate|engage|start)\s+" + _SENSE_MODE + r"\s+mode"
+    r"|(?:go|switch|drop|flip)\s+(?:in)?to\s+" + _SENSE_MODE + r"\s+mode"
+    r"|(?:deactivate|disable|kill|stop|shut\s+down|shut\s+off|turn\s+off|"
+    r"switch\s+off|power\s+down|cut)\s+" + _SENSE_NOUNS +
+    r"|(?:turn|switch|shut|power)\s+" + _SENSE_NOUNS + r"\s+(?:off|down)"
+    r"|stop\s+(?:watching|looking|sensing|spying|staring)"
+    r"(?:\s+(?:at\s+)?(?:me|us|the\s+room|the\s+office))?"
+    r"|(?:don'?t|do\s+not)\s+watch\s+(?:me|us|the\s+room)"
+    r"|(?:close|shut)\s+your\s+eyes"
+    r"|look\s+away"
+    r"|no\s+(?:more\s+)?(?:cameras?|sensors?|watching|radar)"
+    r"|(?:cameras?|sensors?|radar|presence|sensing)\s+(?:off|down)"
+    r")" + _SENSE_OFF_TAIL, re.I)
+
+_SENSING_ON_RX = re.compile(
+    r"^" + _JV + _SENSE_ASK + r"(?:"
+    r"(?:(?:come|go|get)\s+)?back\s+online"
+    r"|(?:come|go|get)\s+online"
+    r"|online\s+mode"
+    r"|(?:turn|switch)\s+off\s+" + _SENSE_MODE + r"\s+mode"
+    r"|(?:exit|leave|end|cancel|disable|stop|quit)\s+" + _SENSE_MODE + r"\s+mode"
+    r"|" + _SENSE_MODE + r"\s+mode\s+off"
+    r"|(?:re-?activate|re-?enable|enable|resume|restore|start|wake)"
+    r"(?:\s+up)?\s+" + _SENSE_NOUNS +
+    r"|(?:turn|switch|power)\s+on\s+" + _SENSE_NOUNS +
+    r"|(?:turn|switch|power)\s+" + _SENSE_NOUNS + r"\s+(?:back\s+)?on"
+    r"|start\s+watching(?:\s+(?:again|me|us|the\s+room|the\s+office))?"
+    r"|(?:open|use)\s+your\s+eyes"
+    r"|(?:cameras?|sensors?|radar|presence|sensing)\s+(?:back\s+)?on"
+    r"|you\s+can\s+watch(?:\s+(?:me|us|the\s+room|the\s+office))?\s+again"
+    r")" + _SENSE_TAIL, re.I)
+
+SENSING_NO_POLICY_LINE = ("I can't reach the sensing switch, sir — offline "
+                          "mode isn't wired in this build.")
+SENSING_MIC_LINE = "The microphone stays on."
+SENSING_NOTHING_LINE = "Nothing was sensing to stop."
+SENSING_UNSAVED_LINE = "I couldn't save that, so it won't hold if I restart."
+SENSING_CURFEW_SET_LINE = "Camera curfew is now {start} to {end}, sir."
+SENSING_CURFEW_OFF_LINE = "The camera curfew is off, sir."
+SENSING_CURFEW_OFF_FAIL_LINE = "I couldn't switch the curfew off, sir."
+SENSING_CURFEW_CLAUSE = "The camera stays off until {end} for the curfew."
+
+
+def _sensing_join(names) -> str:
+    """('camera', 'radar') -> 'the camera and the radar'."""
+    parts = ["the %s" % n for n in names]
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+    return ", ".join(parts[:-1]) + " and " + parts[-1]
+
+
+def _sensing_end_words(hm) -> str:
+    from jarvis.quiet import fmt_clock
+    return fmt_clock(hm[0], hm[1])
+
+
+def _sensing_off_line(out, when_text: str = "") -> str:
+    """What OFFLINE actually did -- never what it intended.
+
+    The clauses that can appear are all things he would otherwise only
+    discover by finding a camera light on: a device that did not stop, a
+    device that was only stopped as far as this process reaches (the
+    radar's live configuration -- no power switch wired, so it keeps
+    radiating and Jarvis merely stops asking), a state file that did not
+    save (so the next start comes up online), and the honest "there was
+    nothing to stop" on a box where nothing is wired yet.
+    """
+    # The bound comes from the OUTCOME, not from what the caller asked
+    # for: disable() drops an 'until' that is not in the future, and a
+    # head reading "offline until 2:47" over an open-ended switch would be
+    # the one lie the whole family exists to avoid.
+    bounded = bool(when_text) and out.state.until is not None
+    parts = ["Offline until %s, sir." % when_text if bounded else "Offline, sir."]
+    if out.stopped:
+        names = _sensing_join(out.stopped)
+        parts.append("%s%s %s down." % (names[0].upper(), names[1:],
+                                        "are" if len(out.stopped) > 1 else "is"))
+    elif not out.failed and not out.partial:
+        parts.append(SENSING_NOTHING_LINE)
+    if out.partial:
+        parts.append("I've stopped reading %s, but %s power isn't switched, "
+                     "so %s still sensing the room." % (
+                         _sensing_join(out.partial),
+                         "their" if len(out.partial) > 1 else "its",
+                         "they're" if len(out.partial) > 1 else "it's"))
+    if out.failed:
+        parts.append("I couldn't stop %s, so %s still be running." % (
+            _sensing_join(out.failed),
+            "they may" if len(out.failed) > 1 else "it may"))
+    if not out.persisted:
+        parts.append(SENSING_UNSAVED_LINE)
+    parts.append(SENSING_MIC_LINE)
+    return " ".join(parts)
+
+
+def _sensing_on_line(out) -> str:
+    st = out.state
+    parts = ["Back online, sir."]
+    if out.failed:
+        parts.append("I couldn't bring %s back." % _sensing_join(out.failed))
+    if st.reason == "curfew" and st.curfew:
+        parts.append(SENSING_CURFEW_CLAUSE.format(
+            end=_sensing_end_words(st.curfew[1])))
+    elif st.camera and st.radar:
+        parts.append("Camera and radar are live.")
+    if not out.persisted:
+        parts.append(SENSING_UNSAVED_LINE)
+    return " ".join(parts)
+
+
+def _sensing_status_line(state) -> str:
+    """Reads the state back in his own terms; never changes it."""
+    from jarvis import sensing as sensing_mod
+    if state.reason == sensing_mod.REASON_FAILSAFE:
+        return ("I'm offline, sir: I couldn't read my last sensing state, so "
+                "I've stayed off. Say “come back online” when you want "
+                "me watching.")
+    if state.reason == sensing_mod.REASON_TIMED and state.until:
+        end = datetime.fromtimestamp(state.until)
+        return ("I'm offline, sir — camera and radar are off until %s."
+                % _sensing_end_words((end.hour, end.minute)))
+    if state.offline:
+        return ("I'm offline, sir — camera and radar are off, and they "
+                "stay off until you tell me otherwise.")
+    if state.reason == sensing_mod.REASON_CURFEW and state.curfew:
+        return ("The camera's off until %s for the curfew, sir; the radar's on."
+                % _sensing_end_words(state.curfew[1]))
+    if state.curfew:
+        return ("Camera and radar are on, sir. The camera goes off at %s."
+                % _sensing_end_words(state.curfew[0]))
+    return "Camera and radar are on, sir. There's no curfew set."
+
+
+def _sensing_seconds(mode: str, when: str, now: datetime):
+    """'for two hours' / 'until noon' -> seconds from now; None = no idea.
+
+    Deliberately narrower than the do-not-disturb parser: no timekeeper
+    fallback, so the ONLY things that resolve here are a duration and a
+    clock time. Everything else is handed back as "I didn't catch when",
+    which the caller turns into an open-ended offline rather than a guess.
+    """
+    when = (when or "").strip()
+    if not when:
+        return None
+    if mode in ("until", "till", "through"):
+        from jarvis.quiet import parse_clock
+        ends = []
+        for default in ("am", "pm"):
+            hm = parse_clock(when, default=default)
+            if hm is None:
+                continue
+            end = now.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+            if end <= now:
+                end += timedelta(days=1)
+            ends.append(end)
+        return (min(ends) - now).total_seconds() if ends else None
+    try:
+        from jarvis.tools.timekeeper import parse_duration
+        return parse_duration(when)
+    except Exception:  # noqa: BLE001 - an unparseable duration is "no idea"
+        log.debug("sensing: %r is not a duration", when, exc_info=True)
+        return None
+
+
+def _sensing_group(m, prefix: str) -> str:
+    for key, value in m.groupdict().items():
+        if key.startswith(prefix) and value:
+            return value
+    return ""
+
+
+def _sensing_hold_mode(m) -> str:
+    return _sensing_group(m, "mode").lower()
+
+
+def _sensing_hold_when(m) -> str:
+    """The 'when' with the filler his speech carries stripped: "for the
+    next two hours" is a duration once "the next" is gone."""
+    when = _sensing_group(m, "when").strip()
+    when = re.sub(r"^(?:the\s+)?next\s+", "", when, flags=re.I)
+    return re.sub(r"^the\s+", "", when, flags=re.I).strip()
+
+
+def _sensing_publish(state) -> None:
+    bus.publish(SensingChanged(camera=state.camera, radar=state.radar,
+                               offline=state.offline, reason=state.reason,
+                               until=state.until))
+
+
+def _sensing_result(reply: str, status: str) -> "CommandResult":
+    return CommandResult(handled=True, speak=True, reply=reply, status=status)
+
+
+def _h_sensing_off(c, t, m, until=None, when_text=""):
+    """"Offline mode" / "deactivate presence" / "stop watching".
+
+    Not gated by needs=: with no policy the honest answer is SPOKEN. A
+    privacy order that falls through to a language model is a privacy
+    order that did nothing, and he would have no way to tell.
+    """
+    pol = c._svc("sensing")
+    if pol is None:
+        return _sensing_result(SENSING_NO_POLICY_LINE, "Offline mode: not wired")
+    out = pol.disable(until=until, source="voice")
+    _sensing_publish(out.state)
+    bus.publish(Status(text="Sensing offline", kind="warn"))
+    return _sensing_result(_sensing_off_line(out, when_text), "Sensing offline")
+
+
+def _h_sensing_on(c, t, m):
+    """"Come back online" / "reactivate presence" / "start watching again"."""
+    pol = c._svc("sensing")
+    if pol is None:
+        return _sensing_result(SENSING_NO_POLICY_LINE, "Offline mode: not wired")
+    out = pol.enable(source="voice")
+    _sensing_publish(out.state)
+    bus.publish(Status(text="Sensing on", kind="info"))
+    return _sensing_result(_sensing_on_line(out), "Sensing on")
+
+
+def _h_sensing_status(c, t, m):
+    """"Are you watching?" -- a question, and it changes nothing."""
+    pol = c._svc("sensing")
+    if pol is None:
+        return _sensing_result(SENSING_NO_POLICY_LINE, "Offline mode: not wired")
+    state = pol.state()
+    return _sensing_result(_sensing_status_line(state),
+                           "Sensing off" if state.offline else "Sensing on")
+
+
+def _h_sensing_hold(c, t, m):
+    """"No cameras for the next two hours" / "keep the camera off until noon".
+
+    An end he gave that this cannot parse does NOT become a guess and does
+    not become a refusal: everything goes off open-endedly and the line
+    says the "until" was missed, which is the only failure direction that
+    cannot leave a lens open by accident.
+    """
+    pol = c._svc("sensing")
+    if pol is None:
+        return _sensing_result(SENSING_NO_POLICY_LINE, "Offline mode: not wired")
+    now = datetime.now()
+    secs = _sensing_seconds(_sensing_hold_mode(m), _sensing_hold_when(m), now)
+    if secs is None or secs <= 0:
+        out = pol.disable(source="voice")
+        _sensing_publish(out.state)
+        line = _sensing_off_line(out)
+        return _sensing_result(
+            line.replace("Offline, sir.",
+                         "Offline, sir — I didn't catch until when, so it "
+                         "stays off until you say otherwise.", 1),
+            "Sensing offline")
+    end = now + timedelta(seconds=secs)
+    return _h_sensing_off(c, t, m, until=end.timestamp(),
+                          when_text=_sensing_end_words((end.hour, end.minute)))
+
+
+def _h_sensing_curfew(c, t, m):
+    """The nightly camera window, by voice: "camera curfew from nine to
+    seven", "start the camera curfew at ten tonight", "extend it to noon".
+
+    Overnight by convention, exactly like quiet hours: a bare start hour
+    is pm and a bare end hour is am, so "nine to seven" is 21:00-07:00 and
+    not the working day.
+    """
+    from jarvis.quiet import parse_clock
+    from jarvis.tools.timekeeper import CANT_PARSE_LINE
+    from jarvis import sensing as sensing_mod
+    pol = c._svc("sensing")
+    if pol is None:
+        return _sensing_result(SENSING_NO_POLICY_LINE, "Offline mode: not wired")
+    if m.group("off"):
+        # Checked, exactly like the set-window branch twenty lines below: a
+        # config that refused the write must not be spoken back as done.
+        if not pol.set_curfew(None, None):
+            return _sensing_result(SENSING_CURFEW_OFF_FAIL_LINE,
+                                   "Camera curfew: save failed")
+        _sensing_publish(pol.state())
+        return _sensing_result(SENSING_CURFEW_OFF_LINE, "Camera curfew off")
+    current = pol.curfew() or (sensing_mod.DEFAULT_CURFEW_START,
+                               sensing_mod.DEFAULT_CURFEW_END)
+    if m.group("a"):
+        start = parse_clock(m.group("a"), default="pm")
+        end = parse_clock(m.group("b"), default="am")
+    elif m.group("start"):
+        start, end = parse_clock(m.group("start"), default="pm"), current[1]
+    else:
+        start, end = current[0], parse_clock(m.group("end"), default="am")
+    if start is None or end is None or start == end:
+        return _sensing_result(CANT_PARSE_LINE, "Camera curfew: when?")
+    if not pol.set_curfew(start, end):
+        return _sensing_result("I couldn't save the curfew window, sir.",
+                               "Camera curfew: save failed")
+    _sensing_publish(pol.state())
+    words = (_sensing_end_words(start), _sensing_end_words(end))
+    return _sensing_result(
+        SENSING_CURFEW_SET_LINE.format(start=words[0], end=words[1]),
+        "Camera curfew %s–%s" % words)
+
+
 def _h_quiet_status(c, t, m):
     q = c._svc("quiet")
     if q is None:
@@ -6252,6 +6662,19 @@ def _h_leave_forget(c, t, m):
 
 
 REGISTRY: list[Command] = [
+    # Offline mode FIRST, ahead of everything (jarvis/sensing.py). Not for
+    # ambiguity -- every one of these matchers is a whole-utterance regex
+    # over a closed vocabulary -- but because "stop watching" and "turn off
+    # the sensors" are the two orders in this app that must never be
+    # shadowed by a future entry that starts claiming "stop" or "turn off".
+    # Status before the setters, so "are the sensors off" is a question.
+    Command("sensing status", _SENSING_STATUS_RX.match, _h_sensing_status),
+    # ...and the schedule before the switch, so "no cameras for two hours"
+    # is a bounded offline and not an open-ended one.
+    Command("sensing curfew", _SENSING_CURFEW_RX.match, _h_sensing_curfew),
+    Command("sensing hold", _SENSING_HOLD_RX.match, _h_sensing_hold),
+    Command("sensing on", _SENSING_ON_RX.match, _h_sensing_on),
+    Command("sensing off", _SENSING_OFF_RX.match, _h_sensing_off),
     Command("go back",
             _m_exact("go back", "previous window", "last window"),
             _h_go_back, needs=("context", "desktop")),
@@ -6596,6 +7019,13 @@ ASSISTANT_TIER1: list[Command] = [
                     "person", "remember", "recall", "last seen", "who is", "recap",
                     "quiet status", "quiet hours off", "quiet hours", "do not disturb",
                     "free", "room tone",
+                    # offline mode: the hotword eats the wake word, so
+                    # "stop watching" arrives bare. Without Tier 1 it would
+                    # reach the router and be answered by a model that
+                    # cannot switch a sensor off -- the one failure this
+                    # feature cannot survive.
+                    "sensing status", "sensing curfew", "sensing hold",
+                    "sensing on", "sensing off",
                     # "switch to classic visuals" is said AT the window he
                     # is looking at, wake word already eaten like the rest
                     "ui look",
