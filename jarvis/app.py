@@ -79,9 +79,9 @@ from jarvis.dialogue import SESSION_WINDOW_S
 from jarvis.faults import FaultBoard, FaultLog
 from jarvis.brain import JarvisBrain
 from jarvis.commander import (COURTESY_BY_REGISTER, COURTESY_REPLIES,
-                              DESTRUCTIVE_TTL_S, REGISTER_LINES,
-                              CommandResult, Commander, parse_yes_no,
-                              strip_jarvis_prefix)
+                              DESTRUCTIVE_TTL_S, LEAVE_ANSWER_WINDOW_S,
+                              REGISTER_LINES, CommandResult, Commander,
+                              parse_yes_no, strip_jarvis_prefix)
 from jarvis.context import ContextEngine
 from jarvis.history import TypedHistory
 from jarvis.hotword import Hotword
@@ -1629,6 +1629,15 @@ class JarvisApp:
             return False
         bus.publish(JarvisReply(text=question, speak=False))
         self._say(question, proactive=True, kind="message")
+        # ...and OPEN THE MIC THAT ANSWERS IT. Alone among every question
+        # Jarvis asks, this one did not: on 2026-09-02 08:56:15 he asked
+        # about the walk to Wisenbaker, no capture was ever opened (no
+        # "Recording started", no "Listening…" in the log), and Hunter had
+        # to type his answer 21 s later -- "was stuck at speaking and
+        # wouldnt let me respond". A question with no mic behind it is not
+        # a question. _after_speech opens the window on this burst's own
+        # falling edge, sized by _question_open below.
+        self._followup_after_speech = True
         return True
 
     # --------------------------------------------------------- approvals
@@ -2384,11 +2393,30 @@ class JarvisApp:
 
     def _start_followup(self):
         """Listen for a follow-up without the wake word (CONFIG.followup_window)."""
-        if CONFIG.followup_window <= 0 or not MACHINE.has_mic:
-            return
-        if self.recorder.endpointer is None:
-            return                      # without a VAD nothing can say "nothing was said"
-        if self.recorder.recording or self._audio_busy.is_set() or self._turn_busy.is_set():
+        why = ""
+        if not MACHINE.has_mic:
+            why = "no microphone"
+        elif CONFIG.followup_window <= 0:
+            why = "the follow-up window is switched off"
+        elif self.recorder.endpointer is None:
+            # without a VAD nothing can say "nothing was said"
+            why = "no VAD to close the window"
+        elif self.recorder.recording or self._audio_busy.is_set() \
+                or self._turn_busy.is_set():
+            why = "the last turn still has the floor"
+        if why:
+            # LAYER 3 of the 2026-09-02 stuck listen. All four of these used
+            # to be a bare `return`: Jarvis asked a question, no mic opened,
+            # no status changed, and the board went on reading whatever it
+            # last said -- "Speaking". A question waiting on an answer that
+            # nothing is listening for must be visible in one glance.
+            if self._question_open(getattr(self, "commander", None)):
+                log.warning("follow-up window NOT opened (%s) while a question "
+                            "is on the table: the answer can only be typed", why)
+                bus.publish(Status(text=f"Waiting for your answer — "
+                                        f"mic not open ({why})", kind="warn"))
+            else:
+                log.debug("follow-up window not opened: %s", why)
             return
         window = self._capture_window()
         log.info("follow-up window: listening %.1fs without a wake word",
@@ -2476,6 +2504,20 @@ class JarvisApp:
         if isinstance(pend, tuple) and len(pend) == 3:
             try:
                 if time.monotonic() - float(pend[2]) <= DESTRUCTIVE_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        # "How long do you need to get to Wisenbaker, sir?" is a question
+        # Jarvis asked too, and commander.question_open() does not count it
+        # (it is the one rung that arms itself from outside handle()). Its
+        # answer is a sentence -- "about ten minutes" -- not a word, and the
+        # 4 s follow-up window is sized for "...and Tuesday?". The expiry is
+        # the rung's own: while _try_leave_answer would still take the
+        # answer, the mic that carries it should be the long one.
+        leave = getattr(commander, "_pending_leave", None)
+        if isinstance(leave, tuple) and len(leave) == 3:
+            try:
+                if time.monotonic() - float(leave[2]) <= LEAVE_ANSWER_WINDOW_S:
                     return True
             except (TypeError, ValueError):
                 pass

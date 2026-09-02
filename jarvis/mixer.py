@@ -94,6 +94,22 @@ MIN_TOUCH_PCT = 5
 # the volume he is looking at is one he set himself.
 STALE_MAX_S = 7 * 24 * 3600.0
 PACTL_TIMEOUT_S = 5.0
+# THE BACKSTOP (2026-09-02).  A hold is a promise that something is going to
+# lift it, and on 08:56:19 nothing did: the TTS amplitude feeder's last tick
+# is published as SpeakingState(active=True) (jarvis/tts.py:1900) and drifted
+# 325 ms PAST the worker's active=False, so the "speaking" hold was taken
+# again with no falling edge left in the world.  His music sat at 30 % and
+# the board read "Speaking" while he typed his answer.
+#
+# So: no hold may hold the room down longer than this without saying so.
+# The "speaking" hold is refreshed by every one of its ~12 Hz ticks, so this
+# measures SILENCE, not the length of a burst -- a half-hour read-aloud is
+# never cut short, and a hold whose publisher has stopped talking to us is
+# always let go.  The "recording" hold has no such heartbeat, so for it this
+# is an absolute cap; it sits above the recorder's own watchdog
+# (recorder.MAX_RECORDING_SECONDS + WATCHDOG_GRACE_S = 65 s), which should
+# always get there first.
+HOLD_MAX_S = 90.0
 # The remote's version of the three numbers above.  A Connect device left
 # down by a crash cannot be healed for free: every attempt is a Web API
 # request, and a device that is switched off never answers.  So the remote
@@ -401,6 +417,8 @@ class RoomMixer:
         self._remote_retry_s = REMOTE_RETRY_S
         self._lock = threading.RLock()
         self._holds: set[str] = set()          # "speaking" | "recording"
+        # When each hold was last vouched for.  See HOLD_MAX_S.
+        self._hold_at: dict[str, float] = {}
         self._ducked: list[dict] = []          # what we moved, with originals
         self._generation = 0                   # bumped on every edge
         self._wake = threading.Event()
@@ -570,12 +588,46 @@ class RoomMixer:
             before = bool(self._holds)
             if on:
                 self._holds.add(name)
+                # Stamped on EVERY tick, not only on the edge: this is the
+                # hold's proof of life for _expire_holds, and SpeakingState
+                # repeats at ~12 Hz for the whole of a burst.
+                self._hold_at[name] = self._now()
             else:
                 self._holds.discard(name)
+                self._hold_at.pop(name, None)
             if before == bool(self._holds):
                 return
             self._generation += 1
         self._wake.set()
+
+    def _expire_holds(self) -> None:
+        """Let go of any hold nothing has vouched for in HOLD_MAX_S.
+
+        WARNING, and it names the hold: an unbounded wait that says nothing
+        is worse than a short one that does.  This is the last line between
+        a publisher that stops publishing and a room left at 30 % for the
+        rest of the day (2026-09-02 08:56:19)."""
+        now = self._now()
+        with self._lock:
+            stale = sorted(n for n in self._holds
+                           if now - self._hold_at.get(n, now) > HOLD_MAX_S)
+            if not stale:
+                return
+            ages = {n: now - self._hold_at.get(n, now) for n in stale}
+            for name in stale:
+                self._holds.discard(name)
+                self._hold_at.pop(name, None)
+            self._generation += 1
+        for name in stale:
+            log.warning("mixer: the %r hold has said nothing for %.0fs; "
+                        "letting the room back up (nothing lifted it)",
+                        name, ages[name])
+
+    @property
+    def holds(self) -> set:
+        """What is holding the room down right now (read-only)."""
+        with self._lock:
+            return set(self._holds)
 
     def on_speaking(self, ev) -> None:
         """SpeakingState arrives ~12 Hz while he talks; only the edge counts."""
@@ -822,6 +874,10 @@ class RoomMixer:
         # must be read back at HIS volume, not at the 30 % a new duck would
         # mistake for it.
         self._remote_heal()
+        # Before deciding anything: a hold nobody is going to lift is not a
+        # reason to keep his music down.  The worker wakes at least once a
+        # second, so this is checked at ~1 Hz for free.
+        self._expire_holds()
         with self._lock:
             want = bool(self._holds)
             generation = self._generation
@@ -878,6 +934,7 @@ class RoomMixer:
             self._subscribed = False
         with self._lock:
             self._holds.clear()
+            self._hold_at.clear()
             self._generation += 1
             generation = self._generation
         # Restore BEFORE the stop flag is set: quitting with the room at

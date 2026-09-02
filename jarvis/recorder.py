@@ -56,6 +56,15 @@ MAX_RECORDING_SECONDS = 60      # monolith 4299 — hard cap to prevent memory i
 # notes): half the hard cap, so a sentence started at the end of the wait
 # still has 30 s before the cap cuts it.
 MAX_FOLLOWUP_WINDOW_S = MAX_RECORDING_SECONDS / 2
+# THE BACKSTOP (2026-09-02).  Every ordinary exit a capture has -- the VAD
+# endpoint, the energy timer, the follow-up window, even the 60 s cap above
+# -- is checked on ONE thread, _poll_loop.  There is no second one.  If that
+# thread dies, is starved, or never starts, the mic stays open, the arbiter
+# stays held (which pauses the wake word: Jarvis goes deaf), the mixer stays
+# ducked and the board stays on "Listening…" -- with nothing logged.  This
+# timer is the only exit that does not depend on that thread.  The grace
+# keeps it strictly a backstop: the 60 s cap always gets there first.
+WATCHDOG_GRACE_S = 5.0
 
 
 # ------------------------------------------------------------------
@@ -235,6 +244,10 @@ class Recorder:
         self._poll_thread: threading.Thread | None = None
         self._stop_lock = threading.Lock()
         self._session_ctx = None                 # held arbiter context
+        # The backstop timer and its cap (see WATCHDOG_GRACE_S). An attribute
+        # rather than a constant so a test can shorten it.
+        self.watchdog_cap_s = MAX_RECORDING_SECONDS + WATCHDOG_GRACE_S
+        self._watchdog: threading.Timer | None = None
 
         self._mic_devices: dict[str, int | None] = {"Default": None}
         self._detect_mics()
@@ -421,6 +434,7 @@ class Recorder:
         # Set recording state BEFORE opening mic (mic open can block briefly)
         self.recording = True
         self._record_start_time = time.monotonic()
+        self._arm_watchdog()
         bus.publish(RecordingStarted())
         bus.publish(Status(text="Listening...", kind="busy"))
 
@@ -445,6 +459,7 @@ class Recorder:
         except Exception as e:
             log.exception("Mic open error")
             self.recording = False
+            self._cancel_watchdog()
             bus.publish(Status(text=f"Mic error: {str(e)[:50]}", kind="error"))
             self._join_poll_thread()
             self._release_session()
@@ -452,6 +467,73 @@ class Recorder:
             return
 
         log.info("Recording started")
+
+    # -- the backstop ----------------------------------------------------
+    def _arm_watchdog(self):
+        """One timer per session, off the poll thread (see WATCHDOG_GRACE_S)."""
+        self._cancel_watchdog()
+        try:
+            cap = float(self.watchdog_cap_s)
+        except (TypeError, ValueError):
+            cap = MAX_RECORDING_SECONDS + WATCHDOG_GRACE_S
+        if cap <= 0:
+            return
+        timer = threading.Timer(cap, self._watchdog_fire)
+        timer.daemon = True
+        timer.name = "recorder-watchdog"
+        self._watchdog = timer
+        timer.start()
+
+    def _cancel_watchdog(self):
+        timer, self._watchdog = self._watchdog, None
+        if timer is not None:
+            try:
+                timer.cancel()
+            except Exception:                    # noqa: BLE001
+                log.debug("watchdog cancel failed", exc_info=True)
+
+    def _watchdog_fire(self):
+        """Nothing ended this capture. End it here, and say so out loud."""
+        if not self.recording:
+            return
+        held = self._arbiter.held_by or "recorder"
+        elapsed = time.monotonic() - (self._record_start_time or time.monotonic())
+        log.warning("recorder watchdog: the capture held by %r has run %.0fs "
+                    "with no endpoint, no timer and no cap; forcing it shut",
+                    held, elapsed)
+        try:
+            self.stop(reason="watchdog", endpoint="watchdog")
+        except Exception:                        # noqa: BLE001
+            log.exception("recorder watchdog: stop() failed; forcing the release")
+        finally:
+            # stop() clears both of these on every path it survives; if it
+            # did not get that far, this does it by hand.
+            if self.recording or self._session_ctx is not None:
+                self._force_release("watchdog")
+
+    def _force_release(self, reason: str = "watchdog"):
+        """Put the world back with no dependence on anything above.
+
+        The mic is shut, the arbiter handed back (a stranded acquire leaves
+        Jarvis permanently deaf) and RecordingStopped published -- that one
+        event is what lifts the mixer's duck and clears "Listening…" from
+        the board.  Never a happy path: every step is independently guarded.
+        """
+        self.recording = False
+        self._audio_level = 0.0
+        stream, self._stream = self._stream, None
+        if stream is not None:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:                    # noqa: BLE001
+                log.warning("mic stream close failed", exc_info=True)
+        try:
+            self._release_session()
+        except Exception:                        # noqa: BLE001
+            log.exception("arbiter release failed")
+        bus.publish(RecordingStopped(reason=reason, endpoint=reason,
+                                     followup=self._followup))
 
     def stop(self, reason: str = "manual", endpoint: str = "",
              dead_air: float | None = None) -> np.ndarray | None:
@@ -474,38 +556,50 @@ class Recorder:
             self._stop_dead_air = dead_air
             t_stop = time.monotonic()        # the decision, not the teardown
 
+        self._cancel_watchdog()
         self._audio_level = 0.0
         self._voice_stopped = True
-
-        if CONFIG.sound:
-            threading.Thread(target=play_beep, args=("stop",), daemon=True).start()
-
-        if self._stream:
-            try:
-                self._stream.stop()
-                self._stream.close()
-            except Exception:
-                log.warning("mic stream close failed", exc_info=True)
-            self._stream = None
-
-        self._join_poll_thread()
-
-        # Finalise BEFORE handing the mic back. Releasing first resumed the
-        # wake word while the clip it had just captured was still being
-        # assembled -- log 2026-08-27: "Hotword stream resumed" at 58.229,
-        # "Stopped: 28.2s audio" at 58.397. try/finally because a release
-        # skipped by a raising _finalize_audio would leave Jarvis deaf.
+        audio = None
+        # EVERYTHING below is inside a finally. Before 2026-09-02 it was a
+        # happy path: anything that raised (a thread that cannot be spawned,
+        # a raising _finalize_audio) skipped the publish, and RecordingStopped
+        # is the ONE event that lifts the mixer's duck and clears "Listening…"
+        # from the board. A capture that ends without it looks, from every
+        # seat in the room, exactly like one that never ended.
         try:
-            audio = self._finalize_audio()
+            if CONFIG.sound:
+                threading.Thread(target=play_beep, args=("stop",),
+                                 daemon=True).start()
+
+            if self._stream:
+                try:
+                    self._stream.stop()
+                    self._stream.close()
+                except Exception:
+                    log.warning("mic stream close failed", exc_info=True)
+                self._stream = None
+
+            self._join_poll_thread()
+
+            # Finalise BEFORE handing the mic back. Releasing first resumed
+            # the wake word while the clip it had just captured was still
+            # being assembled -- log 2026-08-27: "Hotword stream resumed" at
+            # 58.229, "Stopped: 28.2s audio" at 58.397. try/finally because a
+            # release skipped by a raising _finalize_audio would leave Jarvis
+            # deaf.
+            try:
+                audio = self._finalize_audio()
+            finally:
+                self._release_session()
+            self.last_audio = audio
+            if audio is not None and os.environ.get("JARVIS_DEBUG_AUDIO") == "1":
+                self._dump_capture(audio)
         finally:
-            self._release_session()
-        self.last_audio = audio
-        if audio is not None and os.environ.get("JARVIS_DEBUG_AUDIO") == "1":
-            self._dump_capture(audio)
-        bus.publish(RecordingStopped(reason=reason,
-                                     endpoint=self._stop_endpoint or reason,
-                                     dead_air_s=self._stop_dead_air, t=t_stop,
-                                     followup=self._followup))
+            self._release_session()          # idempotent; a no-op above
+            bus.publish(RecordingStopped(reason=reason,
+                                         endpoint=self._stop_endpoint or reason,
+                                         dead_air_s=self._stop_dead_air,
+                                         t=t_stop, followup=self._followup))
         return audio
 
     def abort(self):
@@ -515,6 +609,7 @@ class Recorder:
                 return
             self.recording = False
 
+        self._cancel_watchdog()
         self._audio_level = 0.0
         self._voice_stopped = True
 
