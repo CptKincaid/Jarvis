@@ -428,6 +428,80 @@ DEFAULTS: dict = {
     # switching it off at night would cost presence for no privacy.
     # start/end are "HH:MM" 24 h and wrap midnight, like quiet.hours.
     "sensing": {"curfew": {"enabled": True, "start": "21:00", "end": "07:00"}},
+    # The camera (jarvis/eye.py, scratchpad/ideas/vision.md). OFF until he
+    # turns it on, and there is deliberately NO SCHEDULE HERE: offline mode
+    # and the 21:00-07:00 curfew belong to the single sensing-state owner,
+    # which is the only place they can be enforced at the device. A second
+    # copy of the window in this file is a copy that can disagree with the
+    # first, and the one that disagrees quietly is the one that leaves the
+    # lens open at 22:00.
+    #
+    # THE RESOLUTION CHAIN, written out because the first version of this
+    # section shipped a detect size that could not resolve the face the mount
+    # arithmetic produces, and nothing connected the two numbers.
+    #
+    # docs/vision.md section 9: a 98 deg diagonal lens on 16:9 gives ~90 deg
+    # horizontally; the recommended mount is ~95 cm from his face and so spans
+    # 2*95*tan(45) = 191 cm. At 1920 px that is 10.05 px/cm, so a 16 cm face is
+    # 161 px -- 8.4% of the frame width. THAT is the face the detector has to
+    # find, and it is why width/height is 1080p and not the 640x480 that
+    # shipped first: at 640x480 the same face is 53 px, against SFace's 112.
+    #
+    # detect_width/height is the size YuNet actually sees. 320x180, not the
+    # 320x240 that shipped first, and the reason is aspect, not pixels: a
+    # 16:9 frame squeezed into 4:3 is a 1.33x anisotropic horizontal squash of
+    # every face in it. Measured on this box 2026-09-02 on a 1080p frame
+    # carrying exactly the 161 px face above, 4 threads --
+    #
+    #   detect    YuNet score   resize+detect
+    #   320x240      0.703        2.54 + 1.74 ms
+    #   320x180      0.840        1.30 + 1.00 ms
+    #   640x360      0.894        1.06 + 2.97 ms
+    #
+    # -- so the aspect-correct target scores better on FEWER pixels and costs
+    # 2.0 ms less per frame, because 1920x1080 -> 320x180 is an exact 6:1 in
+    # both axes while ->320x240 is 6:1 and 4.5:1. 0.703 against a 0.700 bar is
+    # not a margin; two other reconstructions of the same scene put 320x240 at
+    # 0.62 and at no detection at all.
+    #
+    # min_conf 0.6, down from 0.7, for the asymmetry: a miss is SILENT and
+    # disables the whole feature, while a false face has to survive faces==1
+    # and 0.6 s of dwell before it can promote anything. Re-measure both with
+    # a tape and a real camera (section 9's $0 test) before trusting them.
+    #
+    # threads 2, not the 4 that docs/vision.md section 2 first advised. 4 is
+    # the latency win (SFace 22.1 -> 7.0 ms wall) but it costs MORE total CPU,
+    # not less -- measured 22.13 CPU-ms at 1 thread against 25.93 at 4. At the
+    # armed tier's 8 fps the frame period is 125 ms and the whole chain is
+    # ~20 ms even at 2, so latency is not the binding constraint; contention
+    # with live Jarvis, ollama and F5 on a box that has already had one
+    # unified-memory power-off is.
+    #
+    # Two frame rates because "is anyone there" and "is he addressing me" are
+    # different questions with different budgets.
+    #
+    # identity=False is the phase gate: with it off, nothing about his face is
+    # ever written down (jarvis/facegallery.py is not constructed at all).
+    "camera": {"enabled": False, "device": "", "width": 1920, "height": 1080,
+               "detect_width": 320, "detect_height": 180, "threads": 2,
+               "idle_fps": 1.5, "armed_fps": 8.0, "min_conf": 0.6,
+               # The attention cone, in degrees off the lens axis. 20 deg is
+               # generous against the 47 deg separation an off-axis mount
+               # gives (scratchpad/ideas/camera.md section 4) and useless on a
+               # monitor-top mount, where the screen's own top edge is 1.8 deg
+               # away.  Hysteresis on release so a blink does not drop it.
+               "cone_deg": 20.0, "cone_hysteresis_deg": 5.0, "dwell_s": 0.6,
+               # Fold the camera into the wake gate (jarvis/eye.py
+               # resolve_wake). It can only ever promote a suppressed wake,
+               # never suppress an accepted one.
+               "wake_tiebreak": True,
+               # Face identity: a gallery of HIS FACE on disk. Opt-in, and the
+               # threshold is OpenCV's own documented SFace cosine for "same
+               # person".
+               "identity": False, "identity_min": 0.363,
+               # One JPEG at 0600, overwritten each time, for diagnosing a
+               # mount. The only path by which a frame reaches the disk.
+               "debug_frame": False},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

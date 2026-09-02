@@ -52,6 +52,15 @@ class PATHS:
     # restart. Unset in production, so the live app is unaffected.
     VOICEPRINT = Path(os.environ.get("JARVIS_VOICEPRINT") or
                       (AIWS / "voiceprint.npz"))
+    # JARVIS_FACE_GALLERY keeps the suite off his enrolled FACE, for exactly
+    # the reason the line above exists: a face embedding is biometric data
+    # about one person and, unlike a password, cannot be re-issued. A
+    # DIRECTORY rather than a file because the gallery is generational --
+    # jarvis/facegallery.py never overwrites, so a bad write costs one
+    # generation instead of the enrolment, which is the part the voiceprint
+    # did not have on 2026-09-02. Unset in production.
+    FACE_GALLERY = Path(os.environ.get("JARVIS_FACE_GALLERY") or
+                        (AIWS / "face_gallery"))
     HEY_JARVIS_VERIFIER = AIWS / "hey_jarvis_verifier.pkl"
     SPEAK_QUEUE = LOG_DIR / "speak_queue.txt"
     # Chosen by ear 2026-08-28: 35.8s built from three different Fish
