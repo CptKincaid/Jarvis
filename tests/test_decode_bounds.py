@@ -1,14 +1,26 @@
-"""Whisper's decode was unbounded, and both halves of it cost Hunter a
-nine-second turn.
+"""Whisper's decode was unbounded on bad audio, and cold on the first turn.
 
-The ledger line he complained about (/tmp/vss_voice/jarvis.log, 2026-09-02):
+NEITHER OF THOSE IS THE TURN THEY WERE WRITTEN FOR, which is the first thing
+to know before trusting the numbers below. The ledger line Hunter complained
+about (/tmp/vss_voice/jarvis.log, 2026-09-02):
 
     14:44:00.099 turn: wake->mic 58ms . speech 3.65s . dead-air 800ms
                  . stt 5.23s . route 3.19s . wait 9.22s (stop=vad decode=speculative)
 
 Against the good turns from the night before -- stt 63-132 ms, wait
-1.30-1.43 s -- the whole difference is stt. Two causes, both measured on
-this box through the real Transcriber (whisper "turbo", cuda, fp16, GB10).
+1.30-1.43 s -- the whole difference is stt. But THAT decode returned a
+correct transcript at avg_logprob -0.62, and whisper only re-decodes below
+-1.0 or above compression_ratio 2.4, so no ladder ran on it; measured, the
+ladder fires on 0 of 61 real clips and the cold start is 0.65 s, not 5.5 s.
+What does stretch a clean 0.27 s decode into seconds is interpreter
+contention -- one competing pure-Python spin thread makes it 34.2 s, eight
+make it 347 s, transcript byte-identical -- and the reactor logged
+"avatar: late slots 219/1801 (max lateness 1793.2 ms)" in the same boot
+window. That turn is still open; transcriber._log_slow_decode exists to
+settle the next one from its own log line.
+
+What IS measured, on this box through the real Transcriber (whisper
+"turbo", cuda, fp16, GB10), are two costs on other turns:
 
 1. THE FIRST INFERENCE OF EVERY PROCESS. The weights are preloaded
    ("preloaded torch/whisper + CUDA in 1.2s") but nothing runs a kernel
@@ -56,14 +68,17 @@ transcript that arrives fast is no better than a slow one.
 What removing the ladder DOES take away is an accident the confidence gate
 was living off: an exhausted ladder returns the temperature-1.0 sample,
 whose avg_logprob is deeply negative, and that is how some repetition loops
-used to land below MIN_AVG_LOGPROB. On one greedy pass the same clip comes
-back at avg_logprob -0.31 and would be dispatched, so the loop is rejected
-on Whisper's own designed signal instead -- compression_ratio, 1.64 at worst
-over those 113 real clips against 7.55-13.14 on the loops. That gate closes
-a hole rather than opening one: whisper's stock decode ACCEPTED five of the
-same 20 non-speech clips as "Thank you." / "has already been done."
-(avg_logprob -0.69 to -0.98, comfortably above -2.90) and handed them to
-the commander.
+and some plain misrecognitions used to land below MIN_AVG_LOGPROB. It cuts
+BOTH ways and the honest count is in transcriber.py above
+DECODE_TEMPERATURES: on 180 clips cut to 0.55/0.85 s at 0 dB SNR, labelled
+against the same cut decoded clean, the ladder rejected 24 results and all
+24 were garbage; one rung rejects 0 of them. The loop gate recovers the
+repetition half of that and nothing else -- 26 of 28 non-speech clips still
+come back "Thank you." at compression_ratio 0.56 and are still accepted,
+exactly as before this change. The other half cannot be recovered: at one
+rung garbage and faithful transcripts overlap completely (garbage median
+-0.83 against a worst faithful -1.04), and no_speech_prob, the obvious
+replacement signal, is identically 0.0 on turbo.
 """
 from __future__ import annotations
 
@@ -76,13 +91,15 @@ import pytest
 
 import jarvis.app as app_mod
 from jarvis.config import CONFIG, PATHS
+from jarvis import transcriber as tr_mod
 from jarvis.transcriber import (
-    MAX_COMPRESSION_RATIO,
     DECODE_TEMPERATURES,
+    LOOP_RATIO_CEILING,
     SAMPLE_RATE,
     WHISPER_SAMPLE_LEN,
     TranscribeResult,
     Transcriber,
+    loop_ratio_limit,
     token_budget,
 )
 from tests.test_app_wiring import build, paths, seams  # noqa: F401  (fixtures)
@@ -233,12 +250,11 @@ def test_a_repetition_loop_is_rejected_even_when_its_logprob_looks_healthy():
 
 @pytest.mark.parametrize("ratio", [0.53, 0.72, 1.20, 1.57, 1.64])
 def test_real_speech_compression_ratios_are_nowhere_near_the_gate(ratio):
-    """1.64 is the worst of 113 real clips across five decode settings;
-    Whisper's own threshold is 2.4."""
-    assert ratio < MAX_COMPRESSION_RATIO
+    """1.64 is the worst of 113 real clips across five decode settings."""
     res = TranscribeResult(text="set a timer for eight minutes", confidence=-0.5,
-                           compression_ratio=ratio,
+                           compression_ratio=ratio, audio_seconds=2.0,
                            segments=[("set a timer for eight minutes", -0.5)])
+    assert ratio < loop_ratio_limit(2.0)
     assert res.looping is False and res.accepted is True
 
 
@@ -408,3 +424,232 @@ def test_the_model_loader_warms_whisper_before_the_first_turn():
     assert "whisper-warmup" in order, \
         "nothing runs a whisper kernel until the user speaks"
     assert order.index("whisper-load") < order.index("whisper-warmup")
+
+
+# ================================== the loop gate scales with the clip
+# compression_ratio is gzip over a whole decoded window, so it grows with
+# the amount of text in the window: measured on real continuous speech
+# through this model, 10 s -> 1.25, 22 s -> 1.66, 28 s -> 1.82, 58 s -> 1.86.
+# A flat 2.4 is therefore a different gate on a two-word command than on a
+# dictation window, and it is tight enough to reject real insistent speech.
+@pytest.mark.parametrize("seconds,ratio,is_loop,what", [
+    # loops actually produced by this model, at the length that produced them
+    (0.40, 4.63, True,  "clean 0.4s cut -> 'do not disturb, but' x N"),
+    (0.40, 3.17, True,  "the same runaway, milder"),
+    (0.55, 4.16, True,  "0 dB cut -> 'the rest of the day' x N"),
+    (0.85, 3.04, True,  "0 dB cut -> 'TAMU, CUDA' x 6"),
+    (0.85, 6.20, True,  "0 dB cut -> 'book' x 11"),
+    (2.40, 6.71, True,  "white noise -> 'the rest of the day' x N"),
+    (30.0, 6.20, True,  "11 repeated sentences inside one window"),
+    # real speech, at the length that produced it
+    (0.55, 1.71, False, "worst of 90 clean 0.55s cuts"),
+    (0.85, 0.75, False, "worst of 90 clean 0.85s cuts"),
+    (2.40, 1.22, False, "worst of 90 clean corpus clips"),
+    (28.0, 1.82, False, "28 s of continuous real speech"),
+    (58.0, 1.86, False, "58 s of continuous real speech"),
+    # a person repeating himself at an assistant that is ignoring him
+    (4.00, 2.46, False, "'Turn it up,' five times -- over whisper's own 2.4"),
+    (3.50, 3.06, False, "'stop' ten times"),
+])
+def test_the_loop_gate_reads_real_speech_and_real_loops_apart(
+        seconds, ratio, is_loop, what):
+    res = TranscribeResult(text="...", confidence=-0.4, audio_seconds=seconds,
+                           compression_ratio=ratio, segments=[("...", -0.4)])
+    assert res.looping is is_loop, what
+    assert res.accepted is not is_loop
+
+
+def test_the_limit_grows_with_the_clip_and_stops_growing():
+    """It has to grow (long windows compress better) and it has to stop
+    (a 60 s recording is two windows, not one long ratio)."""
+    values = [loop_ratio_limit(s) for s in (0.4, 0.55, 0.85, 2.0, 4.0)]
+    assert values == sorted(values)
+    assert loop_ratio_limit(4.0) == LOOP_RATIO_CEILING
+    assert loop_ratio_limit(60.0) == LOOP_RATIO_CEILING
+
+
+def test_an_unknown_length_fails_open():
+    """decode_clip() is a public seam (jarvis/intercom.py hands a clip in
+    over the command socket) and callers build TranscribeResult by hand; a
+    missing length must not tighten the gate on them."""
+    assert loop_ratio_limit(0.0) == LOOP_RATIO_CEILING
+    assert loop_ratio_limit(-3.0) == LOOP_RATIO_CEILING
+    res = TranscribeResult(text="turn it up, turn it up, turn it up",
+                           confidence=-0.4, compression_ratio=3.0,
+                           segments=[("turn it up", -0.4)])
+    assert res.looping is False
+
+
+def test_the_gpu_path_carries_the_clip_length_out(firewall):
+    """The gate cannot scale with a length the result never carried."""
+    tr = _gpu()
+    assert tr.transcribe(_audio(3.25)).audio_seconds == pytest.approx(3.25)
+
+
+def test_the_cpu_path_carries_the_clip_length_out(firewall):
+    tr = _cpu()
+    assert tr.transcribe(_audio(3.25)).audio_seconds == pytest.approx(3.25)
+
+
+def test_a_short_loop_and_a_long_insistent_utterance_do_not_collide(firewall):
+    """The one pair a flat threshold cannot separate: a 3.04 loop on a
+    0.85 s clip and a 3.06 legitimate ten-fold 'stop' over 3.5 s."""
+    tr = _gpu(FakeGpuWhisper(segments=[
+        {"text": "TAMU, CUDA, TAMU, CUDA", "avg_logprob": -0.4,
+         "compression_ratio": 3.04}]))
+    assert tr.transcribe(_audio(0.85)).looping is True
+    tr = _gpu(FakeGpuWhisper(segments=[
+        {"text": "stop stop stop stop stop", "avg_logprob": -0.4,
+         "compression_ratio": 3.06}]))
+    assert tr.transcribe(_audio(3.5)).looping is False
+
+
+def test_the_rejection_log_names_the_limit_it_used(firewall, caplog):
+    """The limit moves with the clip now, so the ratio alone is not enough
+    to retune from -- the log line has to carry the pair."""
+    tr = _gpu(FakeGpuWhisper(segments=[
+        {"text": "book book book", "avg_logprob": -0.4,
+         "compression_ratio": 6.2}]))
+    with caplog.at_level("INFO"):
+        tr.transcribe(_audio(0.85))
+    assert "compression_ratio=6.20" in caplog.text
+    assert "> 2.42 for 0.8s of audio" in caplog.text
+
+
+# ======================= whisper's loop-contagion guard, with one rung
+# whisper/transcribe.py:503 -- `if not condition_on_previous_text or
+# result.temperature > 0.5: prompt_reset_since = len(all_tokens)`. With
+# DECODE_TEMPERATURES=(0.0,) the second half can never fire, so without the
+# first half a looping window is fed verbatim as the prompt for the next
+# one. recorder.MAX_RECORDING_SECONDS is 60: two windows.
+def test_the_gpu_decode_does_not_feed_a_looping_window_to_the_next(firewall):
+    tr = _gpu()
+    tr.transcribe(_audio(45.0))
+    kw = tr._model.calls[0]
+    assert kw["condition_on_previous_text"] is False
+    assert kw["carry_initial_prompt"] is True, (
+        "turning the conditioning off also drops the vocab prompt from every "
+        "window after the first unless it is carried explicitly")
+
+
+def test_the_cpu_decode_does_not_either(firewall):
+    tr = _cpu()
+    tr.transcribe(_audio(45.0))
+    assert tr._model.calls[0]["condition_on_previous_text"] is False
+
+
+def test_the_preview_keeps_the_vocab_prompt_across_windows(firewall):
+    tr = _gpu()
+    tr.partial(_audio(45.0))
+    assert tr._model.calls[0]["carry_initial_prompt"] is True
+
+
+def test_the_cpu_preview_never_climbs_the_ladder_either(firewall):
+    """faster_whisper's own default temperature is the SIX-rung ladder, so
+    the preview -- which runs several times a second holding the lock the
+    final decode waits on -- is unbounded unless it is told otherwise."""
+    tr = _cpu()
+    tr.partial(_audio(2.0))
+    assert tr._model.calls[0]["temperature"] == DECODE_TEMPERATURES
+
+
+# ============================ the warm-up must give way to a real turn
+# app.main() calls start_background() -- which starts the hotword -- before
+# when_cycle_live(start_models), and warmup() is the last step of
+# _load_models. transcribe() and partial() take the same lock. Seen live:
+# jarvis.log.1 "20:56:40.277 Model loaded on GPU fp16" then a decode at
+# 20:56:42.395, inside that window.
+def test_warmup_does_nothing_once_a_real_decode_has_run(firewall):
+    tr = _gpu()
+    tr.transcribe(_audio(2.0))
+    assert tr._decoded is True
+    calls = len(tr._model.calls)
+    assert tr.warmup() is False
+    assert len(tr._model.calls) == calls, \
+        "the kernels are warm; a second decode only costs the user time"
+
+
+def test_a_preview_also_counts_as_warm(firewall):
+    tr = _gpu()
+    tr.partial(_audio(2.0))
+    assert tr._decoded is True
+    assert tr.warmup() is False
+
+
+def test_warmup_gives_up_rather_than_making_the_mic_path_wait(firewall):
+    tr = _gpu()
+    assert tr._lock.acquire(blocking=False) is True   # stand in for a turn
+    try:
+        assert tr.warmup() is False
+        assert tr._model.calls == []
+    finally:
+        tr._lock.release()
+
+
+def test_warmup_hands_the_lock_back(firewall):
+    tr = _gpu()
+    assert tr.warmup() is True
+    assert tr._lock.acquire(blocking=False) is True, \
+        "a warm-up that kept the lock would deadlock the first real turn"
+    tr._lock.release()
+
+
+def test_a_raising_warmup_hands_the_lock_back_too(firewall):
+    class Boom:
+        def transcribe(self, audio, **kw):
+            raise RuntimeError("CUDA out of memory")
+
+    tr = _gpu(Boom())
+    assert tr.warmup() is False
+    assert tr._lock.acquire(blocking=False) is True
+    tr._lock.release()
+
+
+# ============================== telling a starved decode from a slow one
+def test_a_slow_decode_says_whether_the_process_was_starved(caplog):
+    """One competing spin thread turns a 0.27 s decode into 34 s with the
+    same transcript; whisper doing six re-decodes burns CPU on this thread
+    the whole time. "stt 5.23s" cannot tell those apart -- this can."""
+    with caplog.at_level("WARNING"):
+        tr_mod._log_slow_decode(wall=5.58, lock_wait=0.0, cpu=0.06,
+                                seconds=3.3)
+    assert "slow decode" in caplog.text
+    assert "5.58s wall" in caplog.text and "0.06s cpu" in caplog.text
+    assert "starved" in caplog.text
+
+
+@pytest.mark.parametrize("wall,seconds", [
+    (0.31, 3.0),      # warm decode of a real turn
+    (0.53, 10.0),     # 10 s of continuous speech
+    (0.86, 28.0),     # 28 s
+    (2.28, 58.0),     # a full 60 s recording, two windows
+])
+def test_a_clean_decode_never_cries_wolf(wall, seconds, caplog):
+    with caplog.at_level("WARNING"):
+        tr_mod._log_slow_decode(wall=wall, lock_wait=0.0, cpu=wall,
+                                seconds=seconds)
+    assert caplog.text == ""
+
+
+def test_the_real_decode_is_the_one_being_timed(firewall, monkeypatch):
+    """The diagnostic is worthless if it is wired to the wrong number."""
+    seen: list = []
+    monkeypatch.setattr(tr_mod, "_log_slow_decode",
+                        lambda wall, lock_wait, cpu, seconds:
+                        seen.append((wall, lock_wait, cpu, seconds)))
+    tr = _gpu()
+    tr.transcribe(_audio(4.0))
+    assert len(seen) == 1
+    wall, lock_wait, cpu, seconds = seen[0]
+    assert seconds == pytest.approx(4.0)
+    assert wall >= 0.0 and lock_wait >= 0.0 and cpu >= 0.0
+    assert lock_wait <= wall
+
+
+def test_warmup_does_not_warm_up_twice(firewall):
+    """_load_models calls it once, but the flag means "a kernel has run" --
+    a second call has nothing to do and must not take the lock to find out."""
+    tr = _gpu()
+    assert tr.warmup() is True
+    assert tr.warmup() is False
+    assert len(tr._model.calls) == 1

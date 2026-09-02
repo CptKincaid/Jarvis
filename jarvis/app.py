@@ -3466,7 +3466,7 @@ class JarvisApp:
             # A repetition loop is not a length-biased short transcript, and
             # the salvage exists only for those: with a yes/no read-back
             # parked, "yes, yes, yes, yes, yes" would otherwise be salvaged
-            # into a destructive confirm. See transcriber.MAX_COMPRESSION_RATIO.
+            # into a destructive confirm. See transcriber.loop_ratio_limit.
             # getattr: decode_clip() is a public seam (jarvis/intercom.py
             # hands a clip in over the command socket) and its result only
             # has to quack like a TranscribeResult.
@@ -4411,11 +4411,15 @@ class JarvisApp:
         self._install_endpointer()
         # One throwaway decode before the user's first word. The weights are
         # already resident (start_preload), but no whisper kernel has run,
-        # and the first inference of a process costs 0.95 s against 0.25 s
+        # and the first inference of a process costs 0.92 s against 0.27 s
         # for every one after it (measured 2026-09-02, one 3.3 s capture,
         # fresh process each way). Here rather than earlier so the mic path
         # -- the endpointer above, the speaker model before it -- is in
-        # place first; nobody is waiting on this thread for the 0.85 s.
+        # place first. It is NOT free: 0.84 s spent here to save 0.65 s on
+        # his first turn, and the prewarm and gc.freeze below land ~0.85 s
+        # later because of it. The hotword is already listening by now
+        # (start_background runs before start_models), so warmup() gives way
+        # to a real turn rather than making it wait -- see its docstring.
         try:
             self.transcriber.warmup()
         except Exception:
