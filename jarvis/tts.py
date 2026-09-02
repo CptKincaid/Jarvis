@@ -68,23 +68,35 @@ VOICE_REF = PATHS.VOICE_REF          # ~/.aiws_trainer/jarvis_voice_ref.wav
 
 _ENGINES = ("edge", "xtts", "f5", "fish")
 
-# Which engines need the text massaged before they can say it properly.
-# The time and shouted-word rewrites in jarvis/pronounce.py exist because
-# XTTS said "six zero pm" for "6:00 pm" and read BIOSENSORS as an acronym.
-# Fish s2.1-pro normalises both itself, and the rewrites HURT there: "ay em"
-# is voiced as "I'm" (heard 2026-08-28). Verified per engine by listening,
-# never assumed.
-_ENGINE_NEEDS_TIME_REWRITE = {"edge": True, "xtts": True, "f5": True,
-                              "fish": False}
-_ENGINE_NEEDS_UNSHOUT = {"edge": True, "xtts": True, "f5": True,
-                         "fish": True}
+# Which engines need the text massaged before they can say it properly used
+# to live here as two booleans. It is now one row per engine in
+# jarvis/pronounce.ENGINE_RULES, because "does this engine need the rewrites"
+# turned out to be four questions, not two: the meridiem rewrite exists
+# because XTTS spelled the colon, while the bare-clock and leading-zero rules
+# are F5 duration-floor arithmetic that no other engine has. Breeze-TTS-2 is
+# what forced the split (measured 2026-09-02); the evidence for every row is
+# with the rules, in that module.
 
 # Which engines need a TERSE line padded into a sentence before they can
 # pace it. F5 alone: see SHORT_LINE_BYTES. Edge and fish normalise their own
 # duration from the text, and XTTS derives it from the mel decoder, so
 # neither has the byte-count cliff this works around.
+#
+# The "breeze" row is the .get() default WRITTEN DOWN, not a measurement, and
+# it is deliberately the weaker claim of the two available. Every Breeze
+# probe rendered on 2026-09-02 is a full sentence -- the shortest is 34 bytes
+# against SHORT_LINE_BYTES = 16 -- so no short line has ever been through
+# this voice and the pad has never been exercised on it either way. The
+# reason to EXPECT no floor is architectural (its duration comes out of a
+# 12.5 Hz codec LM rather than being allocated from the byte count, which is
+# how F5's floor arises), and architecture is exactly the kind of argument
+# the rest of this file refuses to ship on. It costs nothing to be wrong
+# here -- the lookup below is .get(engine, False), so the row changes no
+# behaviour and exists to say which way it was left and on what. If Breeze
+# ever ships, render "Nine ten, sir." against its padded form and replace
+# this paragraph with the durations.
 _ENGINE_NEEDS_SHORT_PAD = {"edge": False, "xtts": False, "f5": True,
-                           "fish": False}
+                           "fish": False, "breeze": False}
 
 # ------------------------------------------- the stream-restore hazard
 # PipeWire remembers a stream's volume keyed by application.name, and every
@@ -1357,11 +1369,10 @@ class TTS:
         if not self._pronunciation:
             return text
         try:
-            eng = self._engine
-            return pronounce.apply(
-                text,
-                rewrite_times=_ENGINE_NEEDS_TIME_REWRITE.get(eng, True),
-                unshout_words=_ENGINE_NEEDS_UNSHOUT.get(eng, True)) or text
+            # The ENGINE decides, not this call site: an engine that reads
+            # "9:10 am" correctly is made WORSE by being handed "nine ten ay
+            # em" (fish voiced it as "I'm"; Breeze does the same, measured).
+            return pronounce.apply(text, engine=self._engine) or text
         except Exception:
             log.exception("pronunciation apply failed")
             return text
