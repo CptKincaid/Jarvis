@@ -41,23 +41,44 @@ Bake (out of process): the reactor launches AV_WORKERS
   angle), so it never pops. Never-mapped Labels pin each photo's Tk
   display instance so a swap is a refcount op, not an XImage rebuild.
 
-HUD scene: static decor (rebuilt only on size settle): the 72-tick degree
-  ruler (no numbers), six unequal instrument arcs on ONE radius, a
-  12-dash halo ring, two guide circles, corner brackets, split scanlines,
-  the seam dissolve into the transcript, and the ENGINE CARD on the right
-  flank — the only text on the stage: four rows HEAR / SPEAK / THINK /
-  GPU (label MUTED, value FOCAL), fed at 1 Hz by a provider callable
-  (set_telemetry) — the reactor never imports app modules. Dynamic: the
-  radar sweep + trail, three orbit dots, dust motes, the spark overlay.
+HUD scene: static decor (rebuilt only on size settle), two looks
+  (theme.LOOK, read at call time — never captured at def time):
+  "classic" is the 08-31 stage token for token: the 72-tick degree ruler
+  (no numbers), six unequal instrument arcs on ONE radius, a 12-dash halo
+  ring, two guide circles, corner brackets, split scanlines, and the
+  ENGINE CARD as a lit glass slab. "holo" (2026-09-01, the blue
+  holographic overhaul — the film JARVIS HUD, gold-on-black turned blue)
+  is a FILM-STYLE STAGE instead: 1px frame lines bounding the stage with
+  notched (chamfered) corners and an open bottom, a segmented status
+  ruler along the top, a rail of tick marks down the right frame line, a
+  small 270° dial gauge bottom-right whose needle reads the REAL 1-minute
+  load average per core (/proc/loadavg, sampled on the existing 1 Hz
+  telemetry tick — one coords() call), and the engine card redrawn as an
+  outlined thin frame (1px GLASS_EDGE, transparent fill — no slab) with
+  tracked-caps captions. Nothing filled, nothing that shimmers: the
+  sphere is the only light. Both looks share the seam dissolve into the
+  transcript, the engine card rows HEAR / SPEAK / THINK / DEVICE / FAULT
+  (label MUTED, value FOCAL) fed at 1 Hz by a provider callable
+  (set_telemetry) — the reactor never imports app modules — and the
+  dynamic layer: radar sweep + trail, three orbit dots, dust motes, the
+  spark overlay.
 
 Atmosphere: a full-stage backdrop PhotoImage (worker-rendered, rebuilt
   only on size settle) carries a soft radial glow pool centered on the
-  ring cluster plus a darker vignette in the corners; the base squares
-  bake the SAME analytic pool into their ground so the images seam.
+  ring cluster; the base squares bake the SAME analytic pool into their
+  ground so the images seam. In holo the backdrop IS avatar_bake.pool_shade
+  of the integer distance from the cluster centre with the pool the bases
+  actually carry (_pool_used) and no vignette, so the square's border and
+  the stage agree to the byte (probe: scratchpad/holo/w2/A2/seam_probe.py,
+  step 0/255 in holo). Classic keeps its corner vignette, its h/2.0
+  centre and the current-width pool radius — and therefore its faint
+  tile (1.93/255 measured) — because classic must render exactly as it
+  did.
 """
 from __future__ import annotations
 
 import math
+import os
 import queue
 import random
 import threading
@@ -69,10 +90,11 @@ from jarvis.events import (AudioLevel, BrainState, RecordingStarted,
                            RecordingStopped, SpeakingState, bus)
 from jarvis.logs import get_logger
 from jarvis.ui import theme
-from jarvis.ui.avatar_bake import BakeRunner, pool_ground
+from jarvis.ui.avatar_bake import BakeRunner, pool_ground, pool_shade
 from jarvis.ui.avatar_clock import (TIER_STEPS, AvatarClock, ConvCost,
                                     LateCounter, drain_budget, tier_order)
-from jarvis.ui.widgets import ellipsize, get_scale, px, ui_display, ui_mono
+from jarvis.ui.widgets import (ellipsize, get_scale, measure, px,
+                               ui_display, ui_mono)
 
 log = get_logger("ui.reactor")
 
@@ -144,6 +166,69 @@ CARD_ROWS = (("HEAR", "asr"), ("SPEAK", "tts"), ("THINK", "llm"),
                                     # sentence stays in the spoken alert.
 CARD_MOOD = {"listening": "asr", "thinking": "llm", "speaking": "tts"}
 
+# Holo stage (design units; theme.LOOK == "holo" only — classic never sees
+# these). Film law for the frame: thin, open, notched; captions tiny.
+FRAME_INSET = 10           # frame lines this far inside the stage edges
+FRAME_NOTCH = 10           # sides stop this short of a corner; a 45°
+                           # chamfer joins them (the notched corner)
+FRAME_FOOT = 28            # open bottom: the side lines turn inward this
+                           # far and stop (the seam dissolve owns the rest)
+TOP_RULER_FRAC = 0.44      # top status ruler spans this fraction of the
+                           # frame width from the left notch
+RAIL_PITCH = 6             # right-hand rail: a tick every RAIL_PITCH,
+                           # long every 5th (the film 5/1 rhythm)
+RAIL_TICK = (3, 5)         # (short, long) tick lengths — the card's right
+                           # edge is PAD from the stage edge, the frame
+                           # FRAME_INSET, so 6 design px is all the room
+                           # a tick has; both lengths fit inside it
+GAUGE_R = 13               # dial radius
+GAUGE_START = 225.0        # visual degrees (clockwise from 12): the dial
+GAUGE_SWEEP = 270.0        # opens at the bottom, 7:30 → 4:30
+GAUGE_TICKS = 9            # ticks along the sweep (ends + every 33.75°)
+GAUGE_LABEL = "LOAD"       # what the needle reads: 1-min loadavg / cpus
+CARD_LIFT = 10             # holo card sits AT LEAST this much above the
+                           # ring centre; _draw_card lifts it further when
+                           # the dial's top tick would touch its bottom
+                           # edge (it did at 520 px stage, 2026-09-01)
+CARD_GAP = 8               # design px kept between card bottom and dial
+LOADAVG_PATH = "/proc/loadavg"
+
+
+def tracked(text: str) -> str:
+    """Tracked caps the way the film HUD letters its captions — Tk cannot
+    letter-space a font, so a plain space between glyphs does it
+    ('HEAR' -> 'H E A R'); an inner space becomes three."""
+    return " ".join(text.strip())
+
+
+def read_load_fraction(path: str = LOADAVG_PATH, ncpu=None):
+    """The gauge's REAL signal: 1-minute load average as a fraction of the
+    CPU count, clamped to [0, 1]; None when unreadable (the needle then
+    rests at the dial's start). A ~20 µs file read — cheap enough for the
+    1 Hz telemetry tick it rides."""
+    try:
+        with open(path) as f:
+            load1 = float(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+    n = ncpu or os.cpu_count() or 1
+    return max(0.0, min(1.0, load1 / float(n)))
+
+
+def gauge_angle(value) -> float:
+    """Needle angle in visual degrees for a [0, 1] reading (None -> the
+    dial's start)."""
+    v = 0.0 if value is None else max(0.0, min(1.0, float(value)))
+    return (GAUGE_START + GAUGE_SWEEP * v) % 360.0
+
+
+def needle_xy(gx: float, gy: float, r: float, value) -> tuple:
+    """Needle line coords for a dial centred on (gx, gy) with radius r:
+    from 0.22 r (clear of the hub dot) to 0.86 r along gauge_angle."""
+    m = math.radians(gauge_angle(value) - 90.0)
+    return (gx + math.cos(m) * r * 0.22, gy + math.sin(m) * r * 0.22,
+            gx + math.cos(m) * r * 0.86, gy + math.sin(m) * r * 0.86)
+
 
 def _hex_rgb(color: str) -> tuple:
     color = color.lstrip("#")
@@ -176,7 +261,12 @@ class Reactor(tk.Canvas):
     """Borderless canvas stage; subscribes to bus events itself (the bus
     delivers on the Tk thread once attached, so handlers only set fields)."""
 
-    def __init__(self, parent, bg=theme.BG, **kw):
+    def __init__(self, parent, bg=None, **kw):
+        # theme.BG resolved HERE, not in the signature: a default argument
+        # is evaluated at import, i.e. under whichever look theme booted
+        # with, and main_window.create() selects the real look after that
+        # (2026-09-01: classic stages were rendering on the holo BG)
+        bg = bg or theme.BG
         super().__init__(parent, bg=bg, highlightthickness=0, bd=0, **kw)
         self._bg_rgb = _hex_rgb(bg)
         # -- live state fed by events (Tk thread) -----------------------
@@ -427,7 +517,7 @@ class Reactor(tk.Canvas):
         sup = SUPER if size <= SUPER_DROP else 1
         runner = BakeRunner(size, sup, AV_FRAMES, tier_order(AV_FRAMES),
                             pool, self._bg_rgb, _hex_rgb(theme.CYAN),
-                            workers=AV_WORKERS)
+                            workers=AV_WORKERS, look=theme.LOOK)
         runner.start()
         self._bake = (gen, size, runner)
         self._bake_t0 = time.monotonic()
@@ -1089,44 +1179,67 @@ class Reactor(tk.Canvas):
 
     def _rebuild_backdrop(self, w: int, h: int):
         """Kick a worker render of the full-stage ambience image. Runs on
-        size settle only (keyed on (w, h)); stale generations abort."""
-        key = (w, h)
+        size settle only; stale generations abort. Classic keys on (w, h)
+        and paints the CURRENT width's pool, as it always did. Holo keys
+        on (w, h, cluster centre, the pool the bases CARRY): a re-bake at
+        a new pool radius, or a centre shift from a size change, must move
+        the backdrop with it or the seam re-opens (_begin_av_generation
+        reaches here through _draw_decor when the new generation's first
+        frame lands, so old frames keep the old ground until then)."""
+        centre = self._cluster_xy(w, h)
+        flat = theme.LOOK == "holo"
+        pool = self._pool_used if flat else self._pool_params()
+        key = (w, h, centre, pool) if flat else (w, h)
         if self._bd_key == key:
             return
         self._bd_key = key
         self._bd_gen += 1
         threading.Thread(target=self._render_backdrop,
-                         args=(w, h, self._bd_gen, self._pool_params(),
-                               self._cluster_xy(w, h)),
+                         args=(w, h, self._bd_gen, pool, centre, flat),
                          daemon=True, name="backdrop-render").start()
 
     def _render_backdrop(self, w: int, h: int, gen: int, pool: tuple,
-                         centre: tuple):
-        """Worker: soft radial glow pool centered on the ring cluster
-        (analytic falloff to BG at the stage edges) + a darker vignette in
-        the extreme corners."""
+                         centre: tuple, flat: bool = False):
+        """Worker. `flat` (holo): the stage ground IS the bases' ground —
+        avatar_bake.pool_shade of the integer pixel offset from the anchor
+        pixel the canvas places the square on, nothing else — so the
+        square's pure-ground border matches the stage to the byte
+        wherever it lands. Classic: the same soft radial pool with a
+        float centre (h/2.0) + a darker vignette in the extreme corners,
+        untouched."""
         try:
             import numpy as np
             from PIL import Image
 
-            peak, rp = pool
-            ccx, ccy = float(centre[0]), h / 2.0
-            y, x = np.ogrid[0:h, 0:w]
-            dx = (x - ccx).astype(np.float32)
-            dy = (y - ccy).astype(np.float32)
-            d = np.sqrt(dx * dx + dy * dy)
-            pf = peak * np.clip(1.0 - d / rp, 0.0, 1.0) ** 2
-            nx = (x - w / 2.0).astype(np.float32) / max(w / 2.0, 1.0)
-            ny = dy / max(ccy, 1.0)
-            dn = np.sqrt(nx * nx + ny * ny) / math.sqrt(2.0)
-            dark = VIGNETTE * np.clip(
-                (dn - VIGNETTE_START) / (1.0 - VIGNETTE_START), 0.0, 1.0) ** 1.5
             cyan = _hex_rgb(theme.CYAN)
-            img = np.empty((h, w, 3), dtype=np.uint8)
-            for ch in range(3):
-                base = self._bg_rgb[ch]
-                v = base + (cyan[ch] - base) * pf
-                img[..., ch] = (v * (1.0 - dark)).astype(np.uint8)
+            if flat:
+                ccx, ccy = int(centre[0]), int(centre[1])
+                y, x = np.ogrid[0:h, 0:w]
+                dx = x - ccx
+                dy = y - ccy
+                # same ops as pool_ground(size, 1, ...): int64 squares →
+                # float32 → sqrt; the float32 / 1 there is exact
+                d = np.sqrt((dx * dx + dy * dy).astype(np.float32))
+                img = pool_shade(d, pool, self._bg_rgb, cyan)
+            else:
+                peak, rp = pool
+                ccx, ccy = float(centre[0]), h / 2.0
+                y, x = np.ogrid[0:h, 0:w]
+                dx = (x - ccx).astype(np.float32)
+                dy = (y - ccy).astype(np.float32)
+                d = np.sqrt(dx * dx + dy * dy)
+                pf = peak * np.clip(1.0 - d / rp, 0.0, 1.0) ** 2
+                nx = (x - w / 2.0).astype(np.float32) / max(w / 2.0, 1.0)
+                ny = dy / max(ccy, 1.0)
+                dn = np.sqrt(nx * nx + ny * ny) / math.sqrt(2.0)
+                dark = VIGNETTE * np.clip(
+                    (dn - VIGNETTE_START) / (1.0 - VIGNETTE_START),
+                    0.0, 1.0) ** 1.5
+                img = np.empty((h, w, 3), dtype=np.uint8)
+                for ch in range(3):
+                    base = self._bg_rgb[ch]
+                    v = base + (cyan[ch] - base) * pf
+                    img[..., ch] = (v * (1.0 - dark)).astype(np.uint8)
             pil = Image.fromarray(img, "RGB")
         except Exception:
             log.exception("backdrop render failed")
@@ -1172,11 +1285,15 @@ class Reactor(tk.Canvas):
         w, h = self.winfo_width(), self.winfo_height()
         if w < px(140) or h < px(120):
             return
+        # holo keys on the pool the bases carry too: a pool-only re-bake
+        # (same size, width drifted >15%) has to reach _rebuild_backdrop
         key = (w, h, self._size)
+        if theme.LOOK == "holo":
+            key += (self._pool_used,)
         if self._decor_key == key:
             return
         self._decor_key = key
-        self._rebuild_backdrop(w, h)       # keyed (w, h) internally
+        self._rebuild_backdrop(w, h)       # keyed internally
         self.delete("decor")
         d = self._decor = {}
         cx, cy = self._cluster_xy(w, h)
@@ -1196,6 +1313,77 @@ class Reactor(tk.Canvas):
             self.create_line(0, y, w, y, fill=seam_c, width=thin,
                              tags=("decor",))
 
+        if theme.LOOK == "holo":
+            self._draw_holo_decor(w, h, cx, cy)
+        else:
+            self._draw_classic_decor(w, h, cx, cy, Rr, lw, thin)
+
+        # radar sweep: leading radial edge (Rr+8 .. Rr+20) + trailing arcs
+        # at Rr+12 (dynamic). The bright lead gets the two-stroke
+        # treatment: a wide dim underlay created first (below).
+        d["sw_r"] = (Rr + px(8), min(Rr + px(20), r_lim))
+        rs = min(Rr + px(12), r_lim)
+        d["rs"] = rs
+        d["sweep_u"] = self.create_line(
+            0, 0, 0, 0, fill=theme.RAMP33, width=px(3), tags=("decor",))
+        d["sweep"] = self.create_line(
+            0, 0, 0, 0, fill=theme.EDGE, width=lw, tags=("decor",))
+        trail_cols = (theme.HOLO, theme.HOLO, theme.HOLO_DIM,
+                      theme.HOLO_DIM, theme.SCAN, theme.SCAN)[:SWEEP_TRAIL]
+        d["trail"] = [
+            self.create_arc(cx - rs, cy - rs, cx + rs, cy + rs, style="arc",
+                            start=0, extent=7, outline=c, width=lw,
+                            tags=("decor",))
+            for c in trail_cols]
+
+        # satellite dots on separate orbits (dynamic): Rr+2 / +10 / +18
+        orbits = []
+        for off, speed, phase, color, sz in (
+                (2, 14.0, 0.0, theme.EDGE, 2.4),
+                (10, -9.0, 130.0, theme.HOLO, 1.9),
+                (18, 23.0, 255.0, theme.EDGE, 1.5)):
+            szp = max(2, round(sz * get_scale()))
+            r = min(Rr + px(off), r_lim - szp)
+            oid = self.create_oval(0, 0, 0, 0, fill=color, outline="",
+                                   tags=("decor",))
+            orbits.append((oid, r, speed, phase, szp))
+        d["orbits"] = orbits
+
+        # dust motes: two brightness tiers drifting slowly upward with
+        # slight lateral wander, wrapping at the stage edges (coords-only
+        # updates every MOTE_EVERY-th tick — see _update_decor)
+        motes = []
+        for i in range(MOTES):
+            bright = i < MOTE_BRIGHT
+            sz = px(2) if bright else max(1, px(1))
+            mid = self.create_rectangle(
+                0, 0, 0, 0, outline="",
+                fill=theme.HOLO if bright else theme.HOLO_DIM,
+                tags=("decor",))
+            motes.append([mid,
+                          self._rng.uniform(0, w),          # anchor x
+                          self._rng.uniform(0, h),          # y
+                          self._rng.uniform(px(3), px(7)),  # rise px/s
+                          self._rng.uniform(0.0, math.tau),  # wander phase
+                          self._rng.uniform(px(2), px(7)),  # wander amp
+                          self._rng.uniform(0.25, 0.7),     # wander rad/s
+                          sz])
+        d["motes"] = motes
+        d["wh"] = (w, h)
+
+        self._draw_card(w, cy)
+        self._telem_cache = {}
+        self._apply_telemetry()
+        self._update_gauge()
+        self._set_card_mood(self.state(), force=True)
+        self._fix_layers()
+
+    def _draw_classic_decor(self, w: int, h: int, cx: int, cy: int,
+                            Rr: float, lw: int, thin: int):
+        """theme.LOOK == "classic": the 08-31 static scene, item for item
+        in the order it was always created (z-order is part of the look).
+        Moved out of _draw_decor unchanged on 2026-09-01 when the holo
+        stage arrived."""
         # two concentric guide circles, reactor → stage edges (clip freely)
         for off in (68, 118):
             r = Rr + px(off)
@@ -1265,96 +1453,170 @@ class Reactor(tk.Canvas):
                     self.create_line(x0, y, x1, y, fill=theme.SCAN,
                                      width=thin, tags=("decor",))
 
-        # radar sweep: leading radial edge (Rr+8 .. Rr+20) + trailing arcs
-        # at Rr+12 (dynamic). The bright lead gets the two-stroke
-        # treatment: a wide dim underlay created first (below).
-        d["sw_r"] = (Rr + px(8), min(Rr + px(20), r_lim))
-        rs = min(Rr + px(12), r_lim)
-        d["rs"] = rs
-        d["sweep_u"] = self.create_line(
-            0, 0, 0, 0, fill=theme.RAMP33, width=px(3), tags=("decor",))
-        d["sweep"] = self.create_line(
-            0, 0, 0, 0, fill=theme.EDGE, width=lw, tags=("decor",))
-        trail_cols = (theme.HOLO, theme.HOLO, theme.HOLO_DIM,
-                      theme.HOLO_DIM, theme.SCAN, theme.SCAN)[:SWEEP_TRAIL]
-        d["trail"] = [
-            self.create_arc(cx - rs, cy - rs, cx + rs, cy + rs, style="arc",
-                            start=0, extent=7, outline=c, width=lw,
-                            tags=("decor",))
-            for c in trail_cols]
+    def _draw_holo_decor(self, w: int, h: int, cx: int, cy: int):
+        """theme.LOOK == "holo": the film-style stage. Thin 1px strokes in
+        the FRAME family, nothing filled but the gauge hub; the frame is
+        open at the bottom (the seam dissolve owns those rows) and every
+        corner is notched with a 45° chamfer. Static except the gauge
+        needle (_update_gauge, 1 Hz, one coords())."""
+        d = self._decor
+        thin = 1
+        fc = theme.FRAME
+        ins, notch = px(FRAME_INSET), px(FRAME_NOTCH)
+        fx0, fy0, fx1 = ins, ins, w - ins
+        fy1 = h - 2 * len(theme.SEAM_STEPS) - px(6)   # above the dissolve
+        foot = px(FRAME_FOOT)
 
-        # satellite dots on separate orbits (dynamic): Rr+2 / +10 / +18
-        orbits = []
-        for off, speed, phase, color, sz in (
-                (2, 14.0, 0.0, theme.EDGE, 2.4),
-                (10, -9.0, 130.0, theme.HOLO, 1.9),
-                (18, 23.0, 255.0, theme.EDGE, 1.5)):
-            szp = max(2, round(sz * get_scale()))
-            r = min(Rr + px(off), r_lim - szp)
-            oid = self.create_oval(0, 0, 0, 0, fill=color, outline="",
-                                   tags=("decor",))
-            orbits.append((oid, r, speed, phase, szp))
-        d["orbits"] = orbits
+        def line(*xy, fill=fc, width=thin):
+            return self.create_line(*xy, fill=fill, width=width,
+                                    tags=("decor",))
 
-        # dust motes: two brightness tiers drifting slowly upward with
-        # slight lateral wander, wrapping at the stage edges (coords-only
-        # updates every MOTE_EVERY-th tick — see _update_decor)
-        motes = []
-        for i in range(MOTES):
-            bright = i < MOTE_BRIGHT
-            sz = px(2) if bright else max(1, px(1))
-            mid = self.create_rectangle(
-                0, 0, 0, 0, outline="",
-                fill=theme.HOLO if bright else theme.HOLO_DIM,
-                tags=("decor",))
-            motes.append([mid,
-                          self._rng.uniform(0, w),          # anchor x
-                          self._rng.uniform(0, h),          # y
-                          self._rng.uniform(px(3), px(7)),  # rise px/s
-                          self._rng.uniform(0.0, math.tau),  # wander phase
-                          self._rng.uniform(px(2), px(7)),  # wander amp
-                          self._rng.uniform(0.25, 0.7),     # wander rad/s
-                          sz])
-        d["motes"] = motes
-        d["wh"] = (w, h)
+        # frame: top + sides stop FRAME_NOTCH short of each corner and a
+        # chamfer joins them; the sides end in short inward feet
+        line(fx0 + notch, fy0, fx1 - notch, fy0)
+        line(fx0, fy0 + notch, fx0, fy1)
+        line(fx1, fy0 + notch, fx1, fy1)
+        line(fx0 + notch, fy0, fx0, fy0 + notch)
+        line(fx1 - notch, fy0, fx1, fy0 + notch)
+        line(fx0, fy1, fx0 + foot, fy1)
+        line(fx1, fy1, fx1 - foot, fy1)
 
-        self._draw_card(w, cy)
-        self._telem_cache = {}
-        self._apply_telemetry()
-        self._set_card_mood(self.state(), force=True)
-        self._fix_layers()
+        # top status ruler: baseline + downward ticks (long every 4th) and
+        # a short lit cap at its right end — the segmented bar of the film
+        # frame, drawn as a ruler so it claims nothing it does not measure
+        ry = fy0 + px(7)
+        rx0 = fx0 + notch + px(4)
+        rx1 = rx0 + int((fx1 - fx0) * TOP_RULER_FRAC)
+        line(rx0, ry, rx1, ry)
+        x, i = rx0, 0
+        while x <= rx1:
+            long_ = i % 4 == 0
+            line(x, ry, x, ry + (px(4) if long_ else px(2)),
+                 fill=theme.HOLO if long_ else theme.HOLO_DIM)
+            x += px(8)
+            i += 1
+        line(rx1 - px(14), ry, rx1, ry, fill=theme.RAIL, width=max(1, px(2)))
+        # frame-rate caption at the ruler's right: the baked cycle, which
+        # is a fact of this build (AV_FRAMES over AV_PERIOD)
+        self.create_text(rx1 + px(8), ry, anchor="w",
+                         text="%d F  ·  %d HZ" % (AV_FRAMES,
+                                                  round(AV_FRAMES / AV_PERIOD)),
+                         fill=theme.FAINT, font=ui_mono(theme.SIZE_CAPTION),
+                         tags=("decor",))
+
+        # right-hand rail: a tick every RAIL_PITCH down the right frame
+        # line, long every 5th, pointing inward; the engine card's right
+        # edge sits PAD from the stage edge so the ticks stop short of it
+        t_short, t_long = px(RAIL_TICK[0]), px(RAIL_TICK[1])
+        y, i = fy0 + notch + px(RAIL_PITCH), 0
+        while y < fy1 - px(4):
+            long_ = i % 5 == 0
+            line(fx1 - (t_long if long_ else t_short), y, fx1, y,
+                 fill=theme.HOLO if long_ else theme.HOLO_DIM)
+            y += px(RAIL_PITCH)
+            i += 1
+
+        # dial gauge, bottom-right inside the frame: a 270° arc open at
+        # the bottom, GAUGE_TICKS ticks (major at the ends and the middle),
+        # a hub dot, the needle (dynamic) and a tracked-caps label
+        r = px(GAUGE_R)
+        gx = fx1 - t_long - px(8) - r
+        gy = fy1 - px(6) - r
+        # Tk arcs: start = 90 - visual; the sweep runs visual 225 → 495,
+        # i.e. Tk 315 going CCW through 12 o'clock for 270°
+        self.create_arc(gx - r, gy - r, gx + r, gy + r, style="arc",
+                        start=315, extent=GAUGE_SWEEP, outline=fc,
+                        width=thin, tags=("decor",))
+        for i in range(GAUGE_TICKS):
+            v = GAUGE_START + GAUGE_SWEEP * i / (GAUGE_TICKS - 1)
+            m = math.radians(v - 90.0)
+            major = i % ((GAUGE_TICKS - 1) // 2) == 0
+            ln = px(3) if major else px(2)
+            line(gx + math.cos(m) * r, gy + math.sin(m) * r,
+                 gx + math.cos(m) * (r + ln), gy + math.sin(m) * (r + ln),
+                 fill=theme.HOLO if major else theme.HOLO_DIM)
+        hub = max(1, px(1))
+        self.create_oval(gx - hub, gy - hub, gx + hub, gy + hub,
+                         fill=theme.GLASS_EDGE, outline="", tags=("decor",))
+        d["gauge"] = (gx, gy, r)
+        d["needle"] = line(*needle_xy(gx, gy, r, None),
+                           fill=theme.ARC_BRIGHT, width=max(1, px(1)))
+        self.create_text(gx - r - px(8), gy, anchor="e",
+                         text=tracked(GAUGE_LABEL), fill=theme.FAINT,
+                         font=ui_display(theme.SIZE_CAPTION, "semibold"),
+                         tags=("decor",))
 
     def _draw_card(self, w: int, cy: int):
         """Engine card: the only text on the stage. Right flank, right
         edge on PAD, vertically centred on the ring centre; four rows
         label (display SIZE_CAPTION semibold MUTED, anchor w) / value
-        (mono SIZE_CAPTION FOCAL, anchor e). No leaders, no ring dots."""
+        (mono SIZE_CAPTION FOCAL, anchor e). No leaders, no ring dots.
+        Classic: a lit glass slab. Holo: an outlined thin frame — 1px
+        GLASS_EDGE strokes, NO fill (Tk has no alpha and any flat tint
+        would sit as a slab on the pool gradient), the same chamfered
+        corners, labels in tracked caps, lifted CARD_LIFT or more so the
+        dial below clears it by CARD_GAP."""
         d = self._decor
         thin = 1
+        holo = theme.LOOK == "holo"
         x1 = w - theme.PAD
         x0 = x1 - px(CARD_W)
         ch = 2 * px(14) + len(CARD_ROWS) * px(CARD_ROW)
-        y0 = cy - ch // 2
+        lift = 0
+        if holo:
+            # clear the dial below (drawn first, so its geometry is known):
+            # CARD_GAP above its top tick, but never up into the ruler
+            # caption at the frame top
+            lift = px(CARD_LIFT)
+            g = d.get("gauge")
+            if g:
+                gauge_top = g[1] - g[2] - px(3)
+                lift = max(lift, (cy + ch // 2) - (gauge_top - px(CARD_GAP)))
+            lift = min(lift, max(0, cy - ch // 2 - px(FRAME_INSET + 7 + 14)))
+        y0 = cy - ch // 2 - lift
         y1 = y0 + ch
         cut = px(8)
-        # lit glass slab: chamfer top-left / bottom-right, hairline
-        # outline, 1px inner top-edge catch-light
-        self.create_polygon(
-            x0 + cut, y0, x1, y0, x1, y1 - cut, x1 - cut, y1,
-            x0, y1, x0, y0 + cut,
-            fill=theme.RAISED, outline=theme.RAMP33, width=thin,
-            tags=("decor",))
-        self.create_line(x0 + cut + 1, y0 + 1, x1 - 1, y0 + 1,
-                         fill=theme.GLASS_EDGE, width=thin, tags=("decor",))
+        if holo:
+            ge = theme.GLASS_EDGE
+            for xy in ((x0 + cut, y0, x1, y0), (x1, y0, x1, y1 - cut),
+                       (x1, y1 - cut, x1 - cut, y1), (x1 - cut, y1, x0, y1),
+                       (x0, y1, x0, y0 + cut), (x0, y0 + cut, x0 + cut, y0)):
+                self.create_line(*xy, fill=ge, width=thin, tags=("decor",))
+        else:
+            # lit glass slab: chamfer top-left / bottom-right, hairline
+            # outline, 1px inner top-edge catch-light
+            self.create_polygon(
+                x0 + cut, y0, x1, y0, x1, y1 - cut, x1 - cut, y1,
+                x0, y1, x0, y0 + cut,
+                fill=theme.RAISED, outline=theme.RAMP33, width=thin,
+                tags=("decor",))
+            self.create_line(x0 + cut + 1, y0 + 1, x1 - 1, y0 + 1,
+                             fill=theme.GLASS_EDGE, width=thin,
+                             tags=("decor",))
         d["card"] = {}
         d["card_lbl"] = {}
-        d["card_budget"] = px(CARD_W - 2 * CARD_PAD - 40 - 8)
         lf = ui_display(theme.SIZE_CAPTION, "semibold")
         vf = ui_mono(theme.SIZE_CAPTION)
+        labels = {key: (tracked(lab) if holo else lab)
+                  for lab, key in CARD_ROWS}
+        if holo:
+            # tracked labels are wider than the 40 design px the classic
+            # budget assumes, and unevenly so ("D E V I C E" is 20 px
+            # wider than "H E A R" at scale 1): a single budget cut from
+            # the widest label ellipsized "WHISPER TURBO" on the HEAR row
+            # (seen 2026-09-01 on :97), so holo budgets per row — each
+            # value gets the card's inner width minus ITS label and an
+            # 8 design px gutter, never less than 48
+            inner = px(CARD_W - 2 * CARD_PAD)
+            d["card_budget"] = {
+                key: max(px(48), inner - measure(lf, text) - px(8))
+                for key, text in labels.items()}
+        else:
+            d["card_budget"] = px(CARD_W - 2 * CARD_PAD - 40 - 8)
         for i, (lab, key) in enumerate(CARD_ROWS):
             ry = y0 + px(27) + i * px(CARD_ROW)
             d["card_lbl"][key] = self.create_text(
-                x0 + px(CARD_PAD), ry, anchor="w", text=lab,
+                x0 + px(CARD_PAD), ry, anchor="w", text=labels[key],
                 fill=theme.MUTED, font=lf, tags=("decor",))
             d["card"][key] = self.create_text(
                 x1 - px(CARD_PAD), ry, anchor="e", text="",
@@ -1430,11 +1692,23 @@ class Reactor(tk.Canvas):
         _perf.mark("telem")
         try:
             self._apply_telemetry()
+            self._update_gauge()
         except tk.TclError:
             return
         except Exception:
             log.exception("telemetry update failed")
         self.after(1000, self._telem_tick)
+
+    def _update_gauge(self):
+        """Holo dial needle: the 1-minute load per core, one coords() per
+        telemetry tick (1 Hz). No gauge (classic, or decor not built yet)
+        -> nothing to do."""
+        g = self._decor.get("gauge")
+        if not g:
+            return
+        gx, gy, r = g
+        self.coords(self._decor["needle"],
+                    *needle_xy(gx, gy, r, read_load_fraction()))
 
     def _apply_telemetry(self):
         card = self._decor.get("card")
@@ -1446,6 +1720,7 @@ class Reactor(tk.Canvas):
                 info = self._telemetry_fn() or {}
             except Exception:
                 log.debug("telemetry provider failed", exc_info=True)
+        # one int (classic) or a per-row dict (holo, see _draw_card)
         budget = self._decor.get("card_budget", px(104))
         vf = ui_mono(theme.SIZE_CAPTION)
         values = {"asr": info.get("asr"), "tts": info.get("tts"),
@@ -1455,4 +1730,5 @@ class Reactor(tk.Canvas):
             txt = (raw or "--").upper()
             if self._telem_cache.get(key) != txt:
                 self._telem_cache[key] = txt
-                self.itemconfigure(card[key], text=ellipsize(txt, vf, budget))
+                b = budget[key] if isinstance(budget, dict) else budget
+                self.itemconfigure(card[key], text=ellipsize(txt, vf, b))

@@ -8,13 +8,22 @@ stream `4-byte little-endian k + size²·3 raw RGB` per frame. The reactor
 reads them on plain threads (blocking reads release the GIL) and converts
 to PhotoImages on the Tk thread inside the frame loop's spare time.
 
+Two kernels, selected by `look` (2026-09-01, the blue-holographic
+overhaul): "holo" (default) is jarvis.ui.holo_kernel.HoloKernel, the frozen
+ship sphere; "classic" is the pre-overhaul streak cloud below, kept
+byte-identical (tests hash its frames) so JARVIS_LOOK=classic is the exact
+fallback Hunter asked for. The look is a PARAMETER like the colours — this
+module never reads theme; the reactor passes theme.LOOK through BakeRunner
+and the CLI.
+
 Import rules (tested): nothing from jarvis.events / jarvis.logs /
-jarvis.config / tkinter — colours are PARAMETERS (the CLI takes --bg and
---cyan), so importing this module never pulls in the app or a display.
+jarvis.config / tkinter / jarvis.ui.theme — colours are PARAMETERS (the CLI
+takes --bg and --cyan), so importing this module never pulls in the app or
+a display.
 
     python -m jarvis.ui.avatar_bake --size 392 --sup 2 --frames 600 \
         --pool-peak 0.22 --pool-r 832 --bg 0d1b2a --cyan 35e0ff \
-        --ks 0,24,48,…  > frames.bin
+        --look holo --ks 0,24,48,…  > frames.bin
 """
 from __future__ import annotations
 
@@ -30,6 +39,8 @@ import time
 
 log = logging.getLogger("jarvis.ui.avatar_bake")
 
+LOOKS = ("holo", "classic")
+DEFAULT_LOOK = "holo"       # mirrors theme.DEFAULT_LOOK without importing it
 AV_SEED = 7                 # the particle field is identical every boot
 AV_TILT = 22.0              # spin-axis tilt toward the viewer, degrees
 AV_BACK_LUM = (0.38, 0.14)  # back-hemisphere brightness: lo + span*(1+Z)
@@ -45,6 +56,17 @@ def _blend(c1: tuple, c2: tuple, f: float) -> tuple:
 def hex_rgb(color: str) -> tuple:
     color = color.lstrip("#")
     return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def check_look(look) -> str:
+    """Normalise a look name; unknown names fall back to DEFAULT_LOOK with
+    a warning (the same lenience as theme.select_look — a bad value must
+    not kill a bake worker AND its in-process fallback)."""
+    name = str(look or "").strip().lower()
+    if name in LOOKS:
+        return name
+    log.warning("avatar bake: unknown look %r, using %r", look, DEFAULT_LOOK)
+    return DEFAULT_LOOK
 
 
 # ------------------------------------------------------------------ field
@@ -203,23 +225,41 @@ def project(rho, lat, theta, sin_t, cos_t):
     return u, v * sin_t - a * cos_t, v * cos_t + a * sin_t
 
 
+def pool_shade(d, pool: tuple, bg_rgb: tuple, cyan_rgb: tuple):
+    """THE glow-pool ground: distance-from-cluster-centre (float32 array,
+    stage pixels) -> uint8 RGB, BG tinted toward cyan by
+    peak * (1 - d/r)^2. Both the baked square's ground (pool_ground) and
+    the reactor's full-stage backdrop call this one function, so wherever
+    the square sits the two are equal to the byte BY CONSTRUCTION — the
+    2026-09-01 seam audit found the square showing as a tile because the
+    backdrop re-derived the same formula with its own centre (h/2.0, not
+    the integer anchor), a corner vignette the bake never saw, and the pool
+    radius of the CURRENT width while the bases carried the radius of the
+    width at bake time. Same ops in the same order as the pre-overhaul
+    pool_ground: classic frames hash identically (tests)."""
+    import numpy as np
+    peak, rp = pool
+    pf = peak * np.clip(1.0 - d / rp, 0.0, 1.0) ** 2
+    out = np.empty(d.shape + (3,), dtype=np.uint8)
+    for ch in range(3):
+        base = bg_rgb[ch]
+        out[..., ch] = (base + (cyan_rgb[ch] - base) * pf).astype(np.uint8)
+    return out
+
+
 def pool_ground(size: int, sup: int, pool: tuple, bg_rgb: tuple,
                 cyan_rgb: tuple):
     """Ground array for the base square: BG + the analytic glow pool
     sampled around the stage center (built once per bake, shared by
-    every frame)."""
+    every frame). The square's centre pixel is index S2 // 2 — the same
+    integer the Tk canvas uses for an anchor="center" image, so pixel i
+    sits at stage offset i - size // 2 from the cluster centre."""
     import numpy as np
-    peak, rp = pool
     S2 = size * sup
     c = S2 // 2
     y, x = np.ogrid[-c:S2 - c, -c:S2 - c]
     d = np.sqrt((x * x + y * y).astype(np.float32)) / sup
-    pf = peak * np.clip(1.0 - d / rp, 0.0, 1.0) ** 2
-    ground = np.empty((S2, S2, 3), dtype=np.uint8)
-    for ch in range(3):
-        base = bg_rgb[ch]
-        ground[..., ch] = (base + (cyan_rgb[ch] - base) * pf).astype(np.uint8)
-    return ground
+    return pool_shade(d, pool, bg_rgb, cyan_rgb)
 
 
 def knot_glow(size: int, sup: int):
@@ -370,12 +410,26 @@ def build_frame(k: int, n_frames: int, size: int, sup: int, field: dict,
 
 
 class BakeKernel:
-    """Everything a frame needs besides k — built once per bake."""
+    """Everything a frame needs besides k — built once per bake. `look`
+    picks the renderer: "holo" delegates to holo_kernel.HoloKernel (the
+    judged ship sphere), "classic" is the streak cloud above, untouched —
+    its frames must stay byte-identical to the pre-overhaul bake."""
 
     def __init__(self, size: int, sup: int, n_frames: int, pool: tuple,
-                 bg_rgb: tuple, cyan_rgb: tuple, seed: int = AV_SEED):
+                 bg_rgb: tuple, cyan_rgb: tuple, seed: int = AV_SEED,
+                 look: str = DEFAULT_LOOK):
         import numpy as np
         self.size, self.sup, self.n = int(size), int(sup), int(n_frames)
+        self.look = check_look(look)
+        self._holo = None
+        if self.look == "holo":
+            # imported here, not at module top: holo_kernel imports
+            # pool_ground from THIS module, and the classic path should
+            # not pay for numpy/PIL at import either
+            from jarvis.ui.holo_kernel import HoloKernel
+            self._holo = HoloKernel(size, sup, n_frames, pool, bg_rgb,
+                                    cyan_rgb, seed)
+            return
         self.field = build_field(seed)
         self.ground16 = pool_ground(size, sup, pool, bg_rgb,
                                     cyan_rgb).astype(np.int16)
@@ -383,6 +437,8 @@ class BakeKernel:
         self.table = lut(cyan_rgb)
 
     def frame(self, k: int):
+        if self._holo is not None:
+            return self._holo.frame(k)
         return build_frame(k, self.n, self.size, self.sup, self.field,
                            self.ground16, self.glow, self.table)
 
@@ -420,7 +476,7 @@ class BakeRunner:
     def __init__(self, size: int, sup: int, n_frames: int, order: list,
                  pool: tuple, bg_rgb: tuple, cyan_rgb: tuple,
                  workers: int = 4, python: str = None, seed: int = AV_SEED,
-                 nice: int = 5):
+                 nice: int = 5, look: str = DEFAULT_LOOK):
         self.size, self.sup, self.n = int(size), int(sup), int(n_frames)
         self.order = list(order)
         self.pool = (float(pool[0]), float(pool[1]))
@@ -429,6 +485,7 @@ class BakeRunner:
         self.python = python or sys.executable
         self.seed = seed
         self.nice = nice
+        self.look = check_look(look)
         self.queue: queue.SimpleQueue = queue.SimpleQueue()
         self.mode = None
         self._procs: list = []
@@ -483,6 +540,7 @@ class BakeRunner:
                 "--bg", "%02x%02x%02x" % self.bg_rgb,
                 "--cyan", "%02x%02x%02x" % self.cyan_rgb,
                 "--seed", str(self.seed), "--nice", str(self.nice),
+                "--look", self.look,
                 "--ks", ",".join(str(k) for k in ks)]
 
     def _spawn(self) -> None:
@@ -548,7 +606,8 @@ class BakeRunner:
     def _bake_inline(self, ks: list) -> None:
         try:
             kernel = BakeKernel(self.size, self.sup, self.n, self.pool,
-                                self.bg_rgb, self.cyan_rgb, self.seed)
+                                self.bg_rgb, self.cyan_rgb, self.seed,
+                                look=self.look)
             for k in ks:
                 if self._stop.is_set():
                     return
@@ -574,6 +633,9 @@ def _parse_args(argv):
     p.add_argument("--cyan", default="35e0ff")
     p.add_argument("--seed", type=int, default=AV_SEED)
     p.add_argument("--nice", type=int, default=0)
+    p.add_argument("--look", choices=LOOKS, default=DEFAULT_LOOK,
+                   help="sphere kernel: holo (ship sphere) | classic "
+                        "(pre-overhaul streak cloud, byte-identical)")
     p.add_argument("--ks", required=True,
                    help="comma-separated frame indices to bake, in order")
     return p.parse_args(argv)
@@ -589,7 +651,8 @@ def main(argv=None) -> int:
     ks = [int(k) for k in args.ks.split(",") if k.strip()]
     kernel = BakeKernel(args.size, args.sup, args.frames,
                         (args.pool_peak, args.pool_r),
-                        hex_rgb(args.bg), hex_rgb(args.cyan), args.seed)
+                        hex_rgb(args.bg), hex_rgb(args.cyan), args.seed,
+                        look=args.look)
     out = sys.stdout.buffer
     try:
         for k in ks:
