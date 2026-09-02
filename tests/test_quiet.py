@@ -66,8 +66,13 @@ class Clock:
 
 
 def _ev(title, start: datetime, hours=1.0, all_day=False):
-    tz = datetime.now().astimezone().tzinfo
-    s = start.replace(tzinfo=tz)
+    # The offset in force AT `start`, not today's: Clock.now() resolves the
+    # naive NOON with August's own offset (CDT), so stamping the event with a
+    # November tzinfo (CST) put it an hour off and reddened four tests here for
+    # the whole of standard time. astimezone() on a naive value keeps the wall
+    # clock and picks the right offset for that instant, which is what
+    # self.dt.timestamp() above already does.
+    s = start.astimezone() if start.tzinfo is None else start
     return SimpleNamespace(title=title, start=s, end=s + timedelta(hours=hours),
                            all_day=all_day)
 
