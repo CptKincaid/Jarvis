@@ -35,7 +35,7 @@ bed works. A box on the nightstand beside your pillow does not, and §2a is the 
 adjustable"* **[datasheet]**. Closer than that and the module is blind, full stop.
 
 **2. No still-target detection inside 1.5 m.** Table 7 of the serial-protocol PDF lists
-*"Rest sensitivity for distance gate 0"* and *"…gate 1"* as **"(cannot be set)"** — not a
+*"Rest sensitivity for distance gate 0"* and *"…gate 1"* as **"-(not settable)"** — not a
 threshold of zero, but not implemented. **[datasheet]** Inside 1.5 m the module is a
 motion sensor, i.e. a PIR, i.e. the thing you rejected.
 
@@ -211,7 +211,7 @@ Sleep further from the edge and you cross into gate 1, which is the next paragra
 **[datasheet]**
 
 **The far nightstand, across a 1.4 m double:** horizontal ≈ 0.10 + 1.4 − 0.45 =
-**1.05 m** → **gate 1**, where rest sensitivity *"cannot be set"*. Moving targets only. It
+**1.05 m** → **gate 1**, where rest sensitivity *"-(not settable)"*. Moving targets only. It
 will hold you while you read and drop you the minute you settle. **[datasheet]**
 
 **To clear the 1.55 m working minimum you need 1.55 m of horizontal separation from your
@@ -330,8 +330,8 @@ number:
   - platform: ld2410
     ld2410_id: radar
     # ...keep timeout / max_move_distance_gate / max_still_distance_gate...
-    g2: {still_threshold: {name: g2 still threshold}}
-    g3: {still_threshold: {name: g3 still threshold}}
+    g2: {move_threshold: {name: g2 move threshold}, still_threshold: {name: g2 still threshold}}
+    g3: {move_threshold: {name: g3 move threshold}, still_threshold: {name: g3 still threshold}}
 ```
 
 ⚠️ **The file already contains a commented-out `switch:` block** (the MOSFET power kill at
@@ -712,7 +712,7 @@ to expect.
    bullets, not data. **[vendor doc]** Phase 1 is the only thing that converts the stand-in
    into a fact about you.
 3. **The 1.5 m still floor is documented but unconfirmed in the field.** It is Hi-Link's own
-   *"(cannot be set)"* table entry, which is strong, but no community report independently
+   *"-(not settable)"* table entry, which is strong, but no community report independently
    confirms *"the LD2410 will not hold a still person inside 1.5 m"*. If it turns out to be
    a UI restriction rather than a detection limit, the headboard and far-nightstand mounts
    come back and §2 changes. **Phase 1 tests it directly in ten minutes.** The 0.75 m blind
