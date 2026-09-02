@@ -64,7 +64,14 @@ class Cfg:
 
 
 def exam(days=2, course="BIOSENSORS", title="Midterm 1"):
-    return {"course": course, "title": title, "when": NOW + timedelta(days=days),
+    # ``days`` WHOLE LOCAL DAYS out, built off the wall clock rather than as
+    # NOW + days * 24 h: _exam_days now converts with the platform's rules
+    # for the instant (canvas.in_local), so an instant-based fixture lands an
+    # hour early across a DST change and counts a day short. A run at 00:30
+    # on any of the six mornings before 2026-11-01 would have read exam(6) as
+    # 5 days out. Naive wall time + astimezone() pins the local date exactly.
+    when = (NOW.replace(tzinfo=None) + timedelta(days=days)).astimezone()
+    return {"course": course, "title": title, "when": when,
             "kind": "exam", "all_day": False, "source": "canvas"}
 
 

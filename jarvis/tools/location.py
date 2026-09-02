@@ -227,9 +227,24 @@ def system_tz():
     key = os.environ.get("TZ") or _localtime_key()
     if key:
         try:
-            return ZoneInfo(key)
+            zone = ZoneInfo(key)
         except (ZoneInfoNotFoundError, ValueError):
             log.debug("location: unusable zone key %r", key)
+        else:
+            # TZ is read WITHOUT time.tzset(), so a process that changed it
+            # after start is still running on the zone it started with, while
+            # bare "UTC"/"CST6CDT"/"EST5EDT" ARE real tzdata keys and resolve
+            # happily (measured: TZ=EST5EDT gave ZoneInfo('EST5EDT') while
+            # datetime.now().astimezone() in the same process still read
+            # -05:00). Trusted only while it still agrees with the offset the
+            # interpreter itself is using, so system_tz() cannot contradict
+            # the bare .astimezone() the rest of this module relies on. Two
+            # zones sharing today's offset but not its rules would still slip
+            # through; that needs tzset(), which a read has no business calling.
+            local = datetime.now()
+            if zone.utcoffset(local) == local.astimezone().utcoffset():
+                return zone
+            log.debug("location: zone key %r disagrees with the process zone", key)
     return datetime.now().astimezone().tzinfo
 
 
