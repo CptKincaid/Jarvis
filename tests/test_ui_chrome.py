@@ -19,8 +19,8 @@ os.environ.setdefault("JARVIS_ASSISTANT_CONFIG",
 from jarvis.ui import theme  # noqa: E402
 from jarvis.ui.views import (CommandBar, StatusStrip, card_look,  # noqa: E402
                              fit_placeholder, fmt_temps_compact,
-                             plan_strip, plan_telemetry, telemetry_segments,
-                             tracked)
+                             levels_for_look, plan_strip, plan_telemetry,
+                             telemetry_segments, tracked)
 from jarvis.ui.widgets import (Card, Chip, Meter, RoundButton,  # noqa: E402
                                Toast)
 
@@ -111,6 +111,24 @@ def test_plan_telemetry_leaves_every_layout_that_fitted_before_alone():
     old = plan_strip(920, WAKE_END_AT_920, 130, 14, 6, LEVEL0)
     assert old == (6, ["MEMORY"])
     assert plan_telemetry(920, WAKE_END_AT_920, 130, 14, 6, LEVELS) == (0,) + old
+
+
+def test_classic_plans_with_level_zero_only_so_it_renders_as_today():
+    """The 09-01 review's same-minute A/B found the elision to be the ONE
+    classic pixel change outside the sphere; classic is the exact fallback,
+    so it keeps the old plan_strip answer -- collision included (the FOUND
+    08-26 xfail in test_found_status_strip_overlap.py stays open for it)."""
+    theme.select_look("classic")
+    assert levels_for_look(LEVELS) == [LEVEL0]
+    assert plan_telemetry(920, WAKE_END_AT_920, 130, 14, 0,
+                          levels_for_look(LEVELS)) == (0, 0, [])   # as d38b493
+    theme.select_look("holo")
+    assert levels_for_look(LEVELS) == LEVELS
+    assert plan_telemetry(920, WAKE_END_AT_920, 130, 14, 0,
+                          levels_for_look(LEVELS)) == (1, 0, [])
+    # explicit look beats the module state; empty survives
+    assert levels_for_look(LEVELS, "classic") == [LEVEL0]
+    assert levels_for_look([], "classic") == [] and levels_for_look(None) == []
 
 
 def test_telemetry_segments_per_level():
@@ -207,7 +225,7 @@ def test_card_meter_chip_defaults_resolve_from_the_selected_look(monkeypatch):
     assert Meter.resolve_color("#abcdef") == "#abcdef"
     assert Chip.resolve_style("#111111", "#222222", 9) == ("#111111", "#222222", 9)
     # the classic values are the 08-31 tokens from the oracle
-    # (scratchpad/holo/classic/theme_tokens_85d5066.json)
+    # (tests/fixtures/theme_tokens_85d5066.json)
     assert c_fill == "#183748" and c_color == "#35e0ff"
     assert c_chip[0] == "#61788f"
 

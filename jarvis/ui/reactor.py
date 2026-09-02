@@ -90,7 +90,8 @@ from jarvis.events import (AudioLevel, BrainState, RecordingStarted,
                            RecordingStopped, SpeakingState, bus)
 from jarvis.logs import get_logger
 from jarvis.ui import theme
-from jarvis.ui.avatar_bake import BakeRunner, pool_ground, pool_shade
+from jarvis.ui.avatar_bake import (BakeRunner, pool_ground, pool_shade,
+                                   pool_shade_point)
 from jarvis.ui.avatar_clock import (TIER_STEPS, AvatarClock, ConvCost,
                                     LateCounter, drain_budget, tier_order)
 from jarvis.ui.widgets import (ellipsize, get_scale, measure, px,
@@ -177,10 +178,18 @@ TOP_RULER_FRAC = 0.44      # top status ruler spans this fraction of the
                            # frame width from the left notch
 RAIL_PITCH = 6             # right-hand rail: a tick every RAIL_PITCH,
                            # long every 5th (the film 5/1 rhythm)
-RAIL_TICK = (3, 5)         # (short, long) tick lengths — the card's right
-                           # edge is PAD from the stage edge, the frame
-                           # FRAME_INSET, so 6 design px is all the room
-                           # a tick has; both lengths fit inside it
+RAIL_TICK = (3, 5)         # (short, long) tick lengths — the frame is
+                           # FRAME_INSET from the stage edge; in holo the
+                           # card's right edge sits CARD_RAIL_GAP inside
+                           # the long tips (engine_card_x1) so the ticks
+                           # read as a rail, not a comb glued to the card
+CARD_RAIL_GAP = 4          # holo: design px between long-tick tips and the
+                           # card's right edge (the 09-01 review saw them
+                           # end 1 px short of the frame, a toothed edge)
+FRAME_KEEP = 3             # holo: design px the dynamic ring band keeps
+                           # clear of the frame's left rule
+SWEEP_LEAD = 12            # radial length of the sweep's bright lead
+RULER_CAPTION = "%d FRAMES  ·  %d HZ"   # the baked cycle; '%d F' read as °F
 GAUGE_R = 13               # dial radius
 GAUGE_START = 225.0        # visual degrees (clockwise from 12): the dial
 GAUGE_SWEEP = 270.0        # opens at the bottom, 7:30 → 4:30
@@ -228,6 +237,60 @@ def needle_xy(gx: float, gy: float, r: float, value) -> tuple:
     m = math.radians(gauge_angle(value) - 90.0)
     return (gx + math.cos(m) * r * 0.22, gy + math.sin(m) * r * 0.22,
             gx + math.cos(m) * r * 0.86, gy + math.sin(m) * r * 0.86)
+
+
+def engine_card_x1(w: int, look: str | None = None) -> int:
+    """Right edge of the engine card on a stage `w` wide (pure). Classic:
+    PAD from the edge, as always. Holo: CARD_RAIL_GAP inside the rail's
+    long-tick tips, so the ticks stop clear of the card frame instead of
+    1 design px short of it. _cluster_xy clamps the ring cluster against
+    this same edge, so the 12 px clearance rule follows the card."""
+    look = theme.LOOK if look is None else look
+    if look == "holo":
+        return w - px(FRAME_INSET) - px(RAIL_TICK[1]) - px(CARD_RAIL_GAP)
+    return w - theme.PAD
+
+
+def ruler_caption(frames: int = None, period: float = None) -> str:
+    """The top-ruler caption: '600 FRAMES  ·  60 HZ' (pure). It used to be
+    '600 F', which next to the strip's 'CPU 76°' read as a temperature."""
+    frames = AV_FRAMES if frames is None else frames
+    period = AV_PERIOD if period is None else period
+    return RULER_CAPTION % (frames, round(frames / period))
+
+
+def dynamic_r_limit(h: int, cx: int, r_min: float,
+                    look: str | None = None) -> float:
+    """Ceiling for the DYNAMIC ring radii — sweep lead, trail arcs, orbit
+    dots (pure). Always h/2 - 4 design px so nothing clips the stage top
+    or bottom, and in holo also FRAME_KEEP inside the frame's left rule.
+
+    Why the second clamp: _cluster_xy pulls the cluster left until it
+    clears the engine card, and at the shipped 918x520 stage that lands
+    the centre at cx=252 with the frame line at x=20 — the sweep tip
+    reached x=4, i.e. the blade crossed a 1px hairline once a revolution
+    and read as a glitch, not as depth (09-01 review). Classic has no
+    frame, so it keeps the old ceiling to the pixel. Never below r_min
+    (the lead's inner radius) or the segment would invert on a narrow
+    stage."""
+    r_lim = h // 2 - px(4)
+    if (theme.LOOK if look is None else look) != "holo":
+        return r_lim
+    return min(r_lim, max(r_min, cx - px(FRAME_INSET) - px(FRAME_KEEP)))
+
+
+def sweep_radii(rr: float, r_lim: float, look: str | None = None) -> tuple:
+    """(inner, outer) of the radar sweep's bright lead (pure). Classic:
+    Rr+8 .. Rr+20, clamped outward only — byte for byte what it always
+    was. Holo: when dynamic_r_limit pulls the outer radius in off the
+    frame, the inner follows so the blade keeps its SWEEP_LEAD length —
+    clamping the outer alone left a 5 design px stub, which is the other
+    way to lose this fight."""
+    hi = min(rr + px(20), r_lim)
+    lo = rr + px(8)
+    if (theme.LOOK if look is None else look) == "holo":
+        lo = min(lo, hi - px(SWEEP_LEAD))
+    return lo, hi
 
 
 def _hex_rgb(color: str) -> tuple:
@@ -425,9 +488,23 @@ class Reactor(tk.Canvas):
         clears the outermost ring element by 12 design px."""
         cy = h // 2
         r_out = self._size * 0.5 + px(6) + px(22)
-        card_x0 = w - theme.PAD - px(CARD_W)
+        card_x0 = engine_card_x1(w) - px(CARD_W)
         cx = min(round(w * STAGE_CX), int(card_x0 - px(12) - r_out))
         return cx, cy
+
+    def ground_at(self, x: float, y: float) -> str:
+        """The stage ground colour under stage pixel (x, y) as hex. Holo:
+        the analytic pool (avatar_bake.pool_shade) the backdrop and the
+        bases carry, evaluated at that point; classic: BG. For a flat
+        widget that must sit on the stage (the alarm modal) -- Tk has no
+        alpha, so matching the ground under it is the only way it is not a
+        darker slab."""
+        if theme.LOOK != "holo":
+            return theme.BG
+        w, h = self.winfo_width(), self.winfo_height()
+        cx, cy = self._cluster_xy(w, h)
+        return pool_shade_point(math.hypot(x - cx, y - cy), self._pool_used,
+                                self._bg_rgb, _hex_rgb(theme.CYAN))
 
     # ----------------------------------------------------------- resizing
     def _on_configure(self, event):
@@ -1277,8 +1354,9 @@ class Reactor(tk.Canvas):
         """(Re)build the static HUD scene + the engine card. Runs on size
         settle only (debounced, keyed on (w, h, base size)). Invariant:
         every DYNAMIC element (halo dashes, sweep, orbits, arcs) stays
-        inside h/2 - 4 design px of the cluster centre — nothing clips at
-        the stage top/bottom edge."""
+        inside r_lim of the cluster centre — h/2 - 4 design px, so nothing
+        clips at the stage top/bottom edge, and in holo also clear of the
+        frame's left rule (dynamic_r_limit)."""
         self._decor_job = None
         if not self._alive:
             return
@@ -1301,7 +1379,9 @@ class Reactor(tk.Canvas):
         thin = 1
         lw = max(1, px(1))
         Rr = self._size * 0.5 + px(6)          # degree ruler radius
-        r_lim = h // 2 - px(4)                 # dynamic-radius ceiling
+        # dynamic-radius ceiling: the stage in classic, the stage AND the
+        # holo frame's left rule in holo (dynamic_r_limit)
+        r_lim = dynamic_r_limit(h, cx, Rr + px(8))
 
         # seam dissolve: 1px full-width lines stepping the stage ground
         # into the transcript's lit top tone (every 2nd row keeps the
@@ -1318,10 +1398,11 @@ class Reactor(tk.Canvas):
         else:
             self._draw_classic_decor(w, h, cx, cy, Rr, lw, thin)
 
-        # radar sweep: leading radial edge (Rr+8 .. Rr+20) + trailing arcs
-        # at Rr+12 (dynamic). The bright lead gets the two-stroke
-        # treatment: a wide dim underlay created first (below).
-        d["sw_r"] = (Rr + px(8), min(Rr + px(20), r_lim))
+        # radar sweep: leading radial edge (Rr+8 .. Rr+20, slid inward as
+        # one piece when holo's frame clamps r_lim — see sweep_radii) +
+        # trailing arcs at Rr+12 (dynamic). The bright lead gets the
+        # two-stroke treatment: a wide dim underlay created first (below).
+        d["sw_r"] = sweep_radii(Rr, r_lim)
         rs = min(Rr + px(12), r_lim)
         d["rs"] = rs
         d["sweep_u"] = self.create_line(
@@ -1498,15 +1579,13 @@ class Reactor(tk.Canvas):
         line(rx1 - px(14), ry, rx1, ry, fill=theme.RAIL, width=max(1, px(2)))
         # frame-rate caption at the ruler's right: the baked cycle, which
         # is a fact of this build (AV_FRAMES over AV_PERIOD)
-        self.create_text(rx1 + px(8), ry, anchor="w",
-                         text="%d F  ·  %d HZ" % (AV_FRAMES,
-                                                  round(AV_FRAMES / AV_PERIOD)),
+        self.create_text(rx1 + px(8), ry, anchor="w", text=ruler_caption(),
                          fill=theme.FAINT, font=ui_mono(theme.SIZE_CAPTION),
                          tags=("decor",))
 
         # right-hand rail: a tick every RAIL_PITCH down the right frame
         # line, long every 5th, pointing inward; the engine card's right
-        # edge sits PAD from the stage edge so the ticks stop short of it
+        # edge sits CARD_RAIL_GAP inside the long tips (engine_card_x1)
         t_short, t_long = px(RAIL_TICK[0]), px(RAIL_TICK[1])
         y, i = fy0 + notch + px(RAIL_PITCH), 0
         while y < fy1 - px(4):
@@ -1559,7 +1638,7 @@ class Reactor(tk.Canvas):
         d = self._decor
         thin = 1
         holo = theme.LOOK == "holo"
-        x1 = w - theme.PAD
+        x1 = engine_card_x1(w)
         x0 = x1 - px(CARD_W)
         ch = 2 * px(14) + len(CARD_ROWS) * px(CARD_ROW)
         lift = 0

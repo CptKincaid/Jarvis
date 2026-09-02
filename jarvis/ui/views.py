@@ -287,6 +287,20 @@ def plan_telemetry(total_w: int, left_w: int, project_fixed_w: int,
     return result
 
 
+def levels_for_look(levels, look: Optional[str] = None) -> list:
+    """The elision levels StatusStrip may plan with (pure). Holo: all of
+    them. Classic: level 0 alone, which makes plan_telemetry exactly the
+    old plan_strip call -- classic is the 08-31 console token for token,
+    so the FOUND 08-26 wake-word/CPU overprint at 920 px survives there by
+    contract, the same call _placeholder_for makes for the clipped
+    placeholder. The 09-01 review measured the elision as the ONE classic
+    pixel change outside the sphere and we chose exact; drop the guard
+    here to give classic the fix too."""
+    look = theme.LOOK if look is None else look
+    levels = list(levels or [])
+    return levels if look == "holo" else levels[:1]
+
+
 def fit_placeholder(avail_px: int, options) -> str:
     """The longest placeholder that fits the entry (pure). `options` =
     [(text, measured_px)] longest first; returns the first that fits, else
@@ -307,6 +321,20 @@ def tracked(text: str) -> str:
     no letter-spacing, so we space the glyphs by hand — the ref HUD's
     labels are small, wide-set capitals."""
     return " ".join((text or "").upper().replace(" ", ""))
+
+
+def ground_is_flat(look: Optional[str] = None) -> bool:
+    """Whether the transcript ground is one flat colour (pure). Holo: yes.
+    Tk canvas windows have no alpha, so a card's interior can only ever be
+    ONE colour, and card_look() makes it the ground (TV_BG) so the frame
+    reads as drawn on the display. That only holds if the ground really is
+    TV_BG everywhere a card can sit: the 09-01 review measured the pool
+    ovals, floor grid and top gradient turning every holo card into a
+    7-25 level darker slab -- the homemade look the brief asked us to
+    remove. So in holo TranscriptView draws none of them (theme.TV_LIFT
+    0.0 lands the stage seam on TV_BG too); the 1-step scanlines and dot
+    grid stay. Classic keeps its lit pool and gradient (pixel oracle)."""
+    return (theme.LOOK if look is None else look) == "holo"
 
 
 def card_look(role: str) -> dict:
@@ -612,10 +640,11 @@ class TranscriptView(tk.Frame):
             return
         cx, cy = w * RING_CX, top + h * RING_CY
         lw1 = max(1, px(1))
+        flat = ground_is_flat()           # holo: cards need one ground colour
 
         # faint radial light pool: concentric pre-blended ovals, outermost
         # first so smaller/lighter ones stack on top
-        for rf, col in zip(POOL_FRACS, theme.TV_POOL):
+        for rf, col in (() if flat else zip(POOL_FRACS, theme.TV_POOL)):
             r = w * rf
             c.create_oval(cx - r, cy - r, cx + r, cy + r, fill=col,
                           outline="", tags="holopool")
@@ -624,7 +653,7 @@ class TranscriptView(tk.Frame):
         # base + verticals converging on the dome center
         fy0 = cy + px(2)
         fy1 = top + h - px(4)
-        if fy1 - fy0 > px(30):
+        if fy1 - fy0 > px(30) and not flat:
             rows = 6
             y_first = fy0 + (fy1 - fy0) * (1 / rows) ** 1.75
             for k in range(1, rows + 1):
@@ -660,8 +689,11 @@ class TranscriptView(tk.Frame):
         """Pre-rendered vertical ambience beneath the dot grid: slightly
         lit at the top (the reactor stage sits directly above), settling
         to BG. Rebuilt only when the canvas size settles at a new value;
-        repositioned to the viewport top on scroll settle."""
+        repositioned to the viewport top on scroll settle. Not drawn on a
+        flat ground (holo, see ground_is_flat)."""
         c = self.canvas
+        if ground_is_flat():
+            return                        # the look is fixed for the session
         if self._grad_key != (w, h):
             try:
                 from PIL import Image, ImageTk
@@ -2170,7 +2202,8 @@ class StatusStrip(tk.Frame):
                       + theme.PAD_S)
         char_w = max(1, self._measure(self._vf, "M"))
         level, chars, hidden = plan_telemetry(w, x, proj_fixed, char_w,
-                                              len(self._project), levels)
+                                              len(self._project),
+                                              levels_for_look(levels))
         self._level = level
         seg_txt = texts[level]
         hidden = list(hidden) + [n for n in self.SEGMENTS if n not in seg_txt]

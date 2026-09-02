@@ -164,3 +164,23 @@ def test_cli_look_flag_selects_the_classic_kernel():
     bad = subprocess.run(cmd[:-3] + ["neon", "--ks", "0"], capture_output=True,
                          cwd=avatar_bake._repo_root(), timeout=60)
     assert bad.returncode != 0
+
+
+def test_pool_shade_point_matches_the_array_path_to_the_byte():
+    """The holo alarm modal fills itself with the stage ground under its
+    own centre (Reactor.ground_at -> pool_shade_point) while the backdrop
+    behind it is rendered by pool_shade; if the two formulas drifted by a
+    level the modal would show as a faint tile -- the very slab defect
+    that sampling the ground was meant to remove (09-01 review)."""
+    from jarvis.ui.avatar_bake import pool_shade, pool_shade_point
+    for pool in (POOL, (0.22, 734.4), (0.18, 500.0)):
+        d = np.arange(0, 1200, dtype=np.float32)
+        arr = pool_shade(d, pool, BG, CYAN)
+        for i in range(0, len(d), 7):
+            assert pool_shade_point(float(d[i]), pool, BG, CYAN) == \
+                "#%02x%02x%02x" % tuple(int(v) for v in arr[i]), (pool, d[i])
+    # outside the pool it is the ground itself; a negative distance (a
+    # widget centre landing on the cluster) clamps to the peak, not past it
+    assert pool_shade_point(5000, POOL, BG, CYAN) == "#%02x%02x%02x" % BG
+    assert pool_shade_point(-3, POOL, BG, CYAN) == \
+        pool_shade_point(0, POOL, BG, CYAN)

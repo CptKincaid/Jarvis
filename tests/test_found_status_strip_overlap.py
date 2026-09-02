@@ -19,6 +19,13 @@ the collision — at 920 the CPU label is drawn on top of "OFF"
 
 Fix belongs in plan_strip: the no-project path must still be allowed to
 hide MEMORY (and then GPU) when left_w + right > total_w.
+
+2026-09-01: the holo look sidesteps it in StatusStrip._layout with
+plan_telemetry (a compact 'CPU 53° | GPU 44° | 47.5 GB' level when the
+full cluster would run under the wake word; tests/test_ui_chrome.py). The
+classic look deliberately keeps level 0 only -- it is the fallback that
+must render exactly as the 08-31 console did, this collision included --
+so the plan_strip path below is still the open defect for classic.
 """
 import pytest
 

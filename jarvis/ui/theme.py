@@ -9,7 +9,7 @@ Two LOOKS share one derivation (2026-09-01, the blue-holographic overhaul):
   classic  the 08-31 "luminous hologram" — a visibly lit cold-blue ground,
            glassy panel fills, cyan structure linework. Kept token-for-token
            as the FALLBACK he asked for ("create a fallback if I don't like
-           the visuals"): scratchpad/holo/classic/theme_tokens_85d5066.json
+           the visuals"): tests/fixtures/theme_tokens_85d5066.json
            is the oracle and tests/test_theme_look.py holds us to it.
 
 Every pre-blended ramp/tint is COMPUTED against the look's BG by _derive()
@@ -74,6 +74,7 @@ _LOOKS = {
         RAIL=(0.45, 0.18),        # side-rail micro-labels (~#478c9e)
         FRAME=0.27,               # 1px window outline
         GRID=0.13, SCAN=0.16, HOLO_DIM=0.22, HOLO=0.36,
+        TV_LIFT=0.13,             # transcript top-row cyan lift (views.GRAD_PEAK)
     ),
     # Ground — film black with a navy cast (ref2_hud: the HUD is thin gold
     # strokes on BLACK; ours is the same on blue). The sphere kernel is
@@ -100,6 +101,13 @@ _LOOKS = {
         RAIL=(0.55, 0.20),
         FRAME=0.36,
         GRID=0.15, SCAN=0.17, HOLO_DIM=0.25, HOLO=0.40,
+        # FLAT transcript ground: no top lift, so the seam dissolve lands
+        # on TV_BG itself. The holo cards are frames whose interior IS the
+        # ground (views.card_look), and Tk has no alpha -- a gradient or
+        # pool behind them would show every card as a darker slab (the
+        # 09-01 review measured a ~7-25 level step). The pool ovals and
+        # floor grid are not drawn in holo either (views.ground_is_flat).
+        TV_LIFT=0.0,
     ),
 }
 
@@ -236,7 +244,7 @@ def _derive(name: str) -> None:
     # (mirrors views.GRAD_PEAK over TV_BG) and pre-blended 1px line steps
     # walking the reactor ground down into it so the glow bleeds across
     # the panel boundary instead of stopping at a hard edge.
-    TV_TOP = _hex(_mix(_TV_RGB, _CY_RGB, 0.13))
+    TV_TOP = _hex(_mix(_TV_RGB, _CY_RGB, a["TV_LIFT"]))   # == TV_BG in holo
     t["TV_TOP"] = TV_TOP
     t["SEAM_STEPS"] = tuple(
         _hex(_mix(_BG_RGB, _rgb(TV_TOP), ((i + 1) / 20) ** 1.25))

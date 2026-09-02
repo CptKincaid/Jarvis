@@ -247,6 +247,20 @@ def pool_shade(d, pool: tuple, bg_rgb: tuple, cyan_rgb: tuple):
     return out
 
 
+def pool_shade_point(d: float, pool: tuple, bg_rgb: tuple,
+                     cyan_rgb: tuple) -> str:
+    """pool_shade for ONE stage pixel at distance `d` from the cluster
+    centre, as a Tk hex colour -- the same clip/square/truncate steps, so
+    it agrees with the array path to the byte (tests). For the odd widget
+    that has to sit ON the holo stage with a flat interior (the alarm
+    modal, 2026-09-01): Tk has no alpha, so the nearest thing to glass is
+    filling it with the ground colour under its centre."""
+    peak, rp = pool
+    pf = peak * max(0.0, min(1.0, 1.0 - float(d) / rp)) ** 2
+    return "#%02x%02x%02x" % tuple(
+        int(bg_rgb[ch] + (cyan_rgb[ch] - bg_rgb[ch]) * pf) for ch in range(3))
+
+
 def pool_ground(size: int, sup: int, pool: tuple, bg_rgb: tuple,
                 cyan_rgb: tuple):
     """Ground array for the base square: BG + the analytic glow pool

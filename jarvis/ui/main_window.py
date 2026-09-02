@@ -1833,9 +1833,17 @@ class MainWindow:
         self._hide_alarm()
         title, when = alarm_modal_text(ev.label, ev.kind, ev.due_text)
         if theme.LOOK == "holo":
-            # holo: a thin bright frame on the stage ground, not a slab
-            fill = theme.BG
-            card = Card(self.reactor, fill=fill, pad=12, bg=theme.BG,
+            # holo: a thin bright frame on the stage ground, not a slab.
+            # The ground under it is the reactor's glow pool, not BG: at
+            # the stage centre those are ~20 levels apart, so filling with
+            # theme.BG drew the modal as a dark rectangle over the pool --
+            # the same slab defect the transcript cards had (09-01
+            # review). Tk has no alpha, so the closest we get is the pool
+            # sampled under the card's own centre (Reactor.ground_at); the
+            # card is centred on the stage, hence relx/rely 0.5 here too.
+            fill = self.reactor.ground_at(self.reactor.winfo_width() / 2,
+                                          self.reactor.winfo_height() / 2)
+            card = Card(self.reactor, fill=fill, pad=12, bg=fill,
                         style="frame", edge=theme.GLASS_EDGE,
                         accent=theme.BRIGHT)
         else:
