@@ -1676,6 +1676,8 @@ class MainWindow:
                         "busy" if self._thinking else "ok")
 
     def _ev_speaking(self, ev: SpeakingState):
+        if getattr(ev, "amplitude_only", False):
+            return          # the pill reads edges only; this is not one
         if ev.active != self._speaking:
             self._speaking = ev.active
             self._refresh_pill()

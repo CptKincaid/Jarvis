@@ -1897,7 +1897,17 @@ class TTS:
             if gen == self._amp_gen:     # don't stomp a newer chunk's feeder
                 self._current_amp = 0.0
                 self._amp_playing = False
-                bus.publish(SpeakingState(active=True, amplitude=0.0))
+                # amplitude_only: close the mouth, touch nobody's idea of
+                # whether he is still speaking. This publish used to carry
+                # active=True (it cannot carry False -- mid-burst that is a
+                # spurious end-of-speech, and _after_speech would open the
+                # follow-up mic under the next chunk's playback), and the
+                # 80 ms sleeps here drift behind the player, so on a long
+                # line it arrived AFTER the worker's active=False and
+                # latched every level-reader True for good. 2026-09-02
+                # 08:56:19: the one orphan duck in a boot of 65.
+                bus.publish(SpeakingState(active=True, amplitude=0.0,
+                                          amplitude_only=True))
 
         threading.Thread(target=_feed_amp, daemon=True,
                          name="tts-amp-feeder").start()

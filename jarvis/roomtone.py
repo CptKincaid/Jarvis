@@ -472,6 +472,8 @@ class RoomTone:
     def on_speaking(self, ev) -> None:
         # Its own hold name: a reply that starts mid-capture must not
         # release the capture's hold when it ends.
+        if getattr(ev, "amplitude_only", False):
+            return          # a mouth-shape tick, not a claim about speech
         if getattr(ev, "active", False):
             self.mute("tts")
         else:

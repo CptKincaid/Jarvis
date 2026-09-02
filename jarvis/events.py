@@ -119,6 +119,23 @@ class BrainState(Event):
 class SpeakingState(Event):
     active: bool = False
     amplitude: float = 0.0            # 0..1, streamed ~12Hz while active
+    # An amplitude-only tick: read `amplitude`, IGNORE `active`.
+    #
+    # 2026-09-02 08:56:19. The TTS amplitude feeder signs a chunk off by
+    # publishing amplitude 0.0 so the mouth closes in the gap before the
+    # next chunk renders; it had to send active=True to avoid handing every
+    # subscriber a false end-of-speech mid-burst. Its 80 ms sleeps drift
+    # ~1 %/chunk behind the player, so on a long line that sign-off landed
+    # AFTER the worker's real active=False -- and all five subscribers that
+    # keep `active` as a level (mixer, roomtone, reactor, main_window's
+    # pill, app._tts_active) latched True with no falling edge left in the
+    # world. His music stayed at 30 %, the board read "Speaking" while he
+    # typed, and _tts_active being stuck True disables the nudge and the
+    # guest decline for the rest of the boot.
+    #
+    # The tick is neither a rising nor a falling edge, so it now says so and
+    # nobody has to guess. Only the TTS worker publishes edges.
+    amplitude_only: bool = False
     # Publisher-side clock: the bus queues events for the Tk thread when
     # the UI is attached, so a subscriber's own clock reads drain time.
     t: float = field(default_factory=time.monotonic)
