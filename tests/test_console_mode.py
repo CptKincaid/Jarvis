@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 from jarvis.ui import ambient
 from jarvis.ui import console_mode as cm
+from jarvis.ui import theme
 
 
 # ------------------------------------------------------------ next_mode
@@ -70,6 +71,26 @@ def test_dimming_blends_toward_the_ground_and_never_touches_a_photo():
     assert cm.dim("#ffffff", 0.0, ground="#000000") == "#000000"
     assert cm.dim("#ffffff", 0.5, ground="#000000") == "#7f7f7f"
     assert cm.dim("not a colour", 0.5) == "not a colour"
+
+
+def test_dim_blends_toward_the_ground_of_the_look_selected_at_call_time():
+    """W2 lane C, 2026-09-01. `dim(..., ground=theme.BG)` as a default
+    argument froze the import-time ground: with the holo look selected at
+    start-up every standby colour would have blended toward the classic
+    navy (or vice versa), a cast the eye reads as "the wrong blue" without
+    knowing why. The default now resolves theme.BG when dim() runs."""
+    try:
+        theme.select_look("classic")
+        classic = cm.dim("#ffffff", 0.5)
+        assert classic == cm.dim("#ffffff", 0.5, ground=theme.BG)
+        theme.select_look("holo")
+        holo = cm.dim("#ffffff", 0.5)
+        assert holo == cm.dim("#ffffff", 0.5, ground=theme.BG)
+        assert holo != classic                  # the two grounds differ
+        # an explicit ground still beats the look
+        assert cm.dim("#ffffff", 0.5, ground="#000000") == "#7f7f7f"
+    finally:
+        theme.select_look(theme.DEFAULT_LOOK)
 
 
 # ---------------------------------------------------------------- drift

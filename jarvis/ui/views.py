@@ -33,7 +33,7 @@ from jarvis.events import UserUtterance, bus
 from jarvis.logs import get_logger
 from jarvis.ui import theme
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, Toast, Toggle,
-                               Tooltip, chamfer_rect, measure, px,
+                               Tooltip, chamfer_rect, frame_rect, measure, px,
                                ui_display, ui_font, ui_mono)
 
 log = get_logger("ui.views")
@@ -233,6 +233,109 @@ def plan_strip(total_w: int, left_w: int, project_fixed_w: int, char_w: int,
             hidden.append(yield_order.pop(0))
             continue
         return 0, hidden
+
+
+def fmt_temps_compact(seg: str) -> str:
+    """Compact status-bar value from one temps segment: 'cpu 53° 7%' →
+    '53°' (the load percentage is the first thing to go when the strip is
+    tight), unparsable → '--'."""
+    m = _TEMP_RE.search(seg or "")
+    return f"{m.group(1)}°" if m else "--"
+
+
+def telemetry_segments(temps_text: str, mem_text: str, level: int) -> list:
+    """The telemetry cluster at an elision `level` as [(label, value)]:
+    level 0 = full ('CPU' '53°C · 7%', 'GPU' '44°C · 0%', 'MEMORY' '47.5 GB'),
+    level 1 = compact ('CPU' '53°', 'GPU' '44°', '' '47.5 GB'), level 2 =
+    minimal ('' '47.5 GB'). Pure; the strip picks the level with
+    plan_telemetry from measured widths."""
+    temps = split_temps(temps_text)
+    mem = (mem_text or "").strip() or "--"
+    if level <= 0:
+        return [("CPU", fmt_temps(temps.get("cpu", ""))),
+                ("GPU", fmt_temps(temps.get("gpu", ""))),
+                ("MEMORY", mem)]
+    if level == 1:
+        return [("CPU", fmt_temps_compact(temps.get("cpu", ""))),
+                ("GPU", fmt_temps_compact(temps.get("gpu", ""))),
+                ("", mem)]
+    return [("", mem)]
+
+
+def plan_telemetry(total_w: int, left_w: int, project_fixed_w: int,
+                   char_w: int, slug_len: int, levels,
+                   min_chars: int = PROJECT_MIN_CHARS):
+    """Which elision level the telemetry cluster renders at (pure).
+    `levels` = [seg_ws per level] as plan_strip takes them, widest
+    (level 0, today's full cluster) first. Each level is planned with
+    plan_strip exactly as today; the first whose left side (wake word +
+    PROJECT chip) ends before its telemetry starts wins, so every layout
+    that fitted before is unchanged and only a real collision elides.
+    Returns (level, value_chars, hidden). 2026-09-01: at JARVIS_UI_SCALE
+    2.0 on the 920-px window the wake-word text ended at 256 px and the
+    full cluster started at 210 px — a 46-px overlap plan_strip could not
+    see because, with no project, it has nothing to yield."""
+    result = (0, 0, [])
+    for i, seg_ws in enumerate(levels):
+        chars, hidden = plan_strip(total_w, left_w, project_fixed_w, char_w,
+                                   slug_len, seg_ws, min_chars)
+        right = sum(w for name, w in seg_ws if name not in hidden)
+        left_end = left_w + (project_fixed_w + chars * char_w if chars else 0)
+        result = (i, chars, hidden)
+        if left_end <= total_w - right:
+            break
+    return result
+
+
+def fit_placeholder(avail_px: int, options) -> str:
+    """The longest placeholder that fits the entry (pure). `options` =
+    [(text, measured_px)] longest first; returns the first that fits, else
+    the last (shortest) — a placeholder that truncates to 'Type a command
+    — or say “Ja' (today's at scale 2.0: 631 px into 548) tells him
+    nothing. Empty options → ''."""
+    options = list(options or [])
+    if not options:
+        return ""
+    for text, w in options:
+        if w <= avail_px:
+            return text
+    return options[-1][0]
+
+
+def tracked(text: str) -> str:
+    """Tracked caps for the holo captions: 'JARVIS' → 'J A R V I S'. Tk has
+    no letter-spacing, so we space the glyphs by hand — the ref HUD's
+    labels are small, wide-set capitals."""
+    return " ".join((text or "").upper().replace(" ", ""))
+
+
+def card_look(role: str) -> dict:
+    """Card construction kwargs per look and turn role (pure, call-time).
+    Classic: the filled RAISED slab every role uses today, byte for byte.
+    Holo: a thin frame on the transcript ground — JARVIS turns carry the
+    bright GLASS_EDGE outline and BRIGHT corner brackets, YOU turns a
+    dimmer LINE outline, the listening ghost a dashed LINE frame, and
+    progress/briefing the quiet FRAME outline. The fill is the transcript
+    ground (TV_BG) so the frame reads as drawn ON the display, not as a
+    panel laid over it; labels inside use the same fill."""
+    if theme.LOOK != "holo":
+        fill = theme.SURFACE if role in ("partial", "progress") else theme.RAISED
+        return dict(fill=fill, style="slab")
+    ground = theme.TV_BG
+    if role == "jarvis":
+        return dict(fill=ground, style="frame", edge=theme.GLASS_EDGE,
+                    accent=theme.BRIGHT)
+    if role == "user":
+        return dict(fill=ground, style="frame", edge=theme.LINE,
+                    accent=theme.RAMP60)
+    if role == "partial":
+        return dict(fill=ground, style="frame", edge=theme.LINE,
+                    accent=theme.LINE, dash=(4, 4))
+    if role == "approval":
+        return dict(fill=ground, style="frame", edge=theme.GLASS_EDGE,
+                    accent=theme.BRIGHT)
+    return dict(fill=ground, style="frame", edge=theme.FRAME,
+                accent=theme.GLASS_EDGE)
 
 
 def progress_card_lines(lines, max_visible: int = PROGRESS_MAX) -> list:
@@ -815,7 +918,11 @@ class TranscriptView(tk.Frame):
         """Reply card. `rtt` (seconds, utterance → reply) renders ONCE,
         muted, in the head row: 'HH:MM · 1.2 s' — the only RTT site."""
         card = self._make_card("JARVIS", theme.CYAN_DIM, text, rtt=rtt)
-        card.set_edge_glow()
+        if theme.LOOK == "holo":
+            # frame cards draw ONE short bright bracket from _glow[0]
+            card.set_edge_glow((theme.ARC_BRIGHT,))
+        else:
+            card.set_edge_glow()
         return card
 
     def show_partial(self, text: str):
@@ -833,10 +940,11 @@ class TranscriptView(tk.Frame):
             return
         if self._partial is None:
             x, cw, wrap = self._card_geo("you", None, text)
-            card = Card(self.canvas, fill=theme.SURFACE, pad=CARD_PAD)
+            look = card_look("partial")
+            card = Card(self.canvas, pad=CARD_PAD, **look)
             lbl = tk.Label(card.body, text=text,
                            font=ui_font(theme.SIZE_BODY, "italic"),
-                           fg=theme.MUTED, bg=theme.SURFACE, justify="left",
+                           fg=theme.MUTED, bg=look["fill"], justify="left",
                            anchor="w", wraplength=wrap)
             lbl.pack(fill="x")
             win = self.canvas.create_window(x, 0, anchor="nw", window=card,
@@ -865,16 +973,21 @@ class TranscriptView(tk.Frame):
         """Head row: speaker label (display SIZE_CAPTION semibold) left,
         'HH:MM[ · N.N s]' (mono SIZE_CAPTION FAINT) right. Returns the
         stamp label (approval cards append '· allowed' to it)."""
-        head = tk.Frame(card.body, bg=theme.RAISED)
+        # bg follows the card fill (holo cards sit on the transcript
+        # ground, classic on RAISED); the speaker label is tracked caps
+        # in holo — the ref HUD's wide-set captions — plain in classic.
+        fill = card.body.cget("bg")
+        head = tk.Frame(card.body, bg=fill)
         head.pack(fill="x")
-        tk.Label(head, text=who,
+        who_text = tracked(who) if theme.LOOK == "holo" else who
+        tk.Label(head, text=who_text,
                  font=ui_display(theme.SIZE_CAPTION, "semibold"),
-                 fg=who_color, bg=theme.RAISED).pack(side="left")
+                 fg=who_color, bg=fill).pack(side="left")
         stamp = datetime.now().strftime("%H:%M")
         if rtt is not None:
             stamp = f"{stamp} · {rtt:.1f} s"
         lbl = tk.Label(head, text=stamp, font=ui_mono(theme.SIZE_CAPTION),
-                       fg=theme.FAINT, bg=theme.RAISED)
+                       fg=theme.FAINT, bg=fill)
         lbl.pack(side="right")
         return lbl
 
@@ -905,10 +1018,11 @@ class TranscriptView(tk.Frame):
         self._progress = None
         role = "you" if who == "YOU" else "jarvis"
         x, cw, wrap = self._card_geo(role, None, text)
-        card = Card(self.canvas, fill=theme.RAISED, pad=CARD_PAD)
+        look = card_look("user" if role == "you" else "jarvis")
+        card = Card(self.canvas, pad=CARD_PAD, **look)
         self._card_head(card, who, who_color, rtt)
         body = tk.Label(card.body, text=text, font=ui_font(theme.SIZE_BODY),
-                        fg=theme.INK, bg=theme.RAISED, justify="left",
+                        fg=theme.INK, bg=look["fill"], justify="left",
                         anchor="w", wraplength=wrap)
         body.pack(fill="x", pady=(px(4), 0))
         _bind_tree(card, "<Button-1>", lambda e, t=text: self._copy(t))
@@ -927,9 +1041,10 @@ class TranscriptView(tk.Frame):
             return
         if self._progress is None:
             x, cw, wrap = self._card_geo("jarvis", None, line)
-            card = Card(self.canvas, fill=theme.SURFACE, pad=CARD_PAD_S)
+            look = card_look("progress")
+            card = Card(self.canvas, pad=CARD_PAD_S, **look)
             lbl = tk.Label(card.body, text="", font=ui_mono(theme.SIZE_CAPTION),
-                           fg=theme.MUTED, bg=theme.SURFACE, justify="left",
+                           fg=theme.MUTED, bg=look["fill"], justify="left",
                            anchor="w", wraplength=wrap)
             lbl.pack(fill="x")
             lines: list = []
@@ -955,14 +1070,16 @@ class TranscriptView(tk.Frame):
             return None
         self._progress = None
         x, cw, wrap = self._card_geo("jarvis", None, question)
-        card = Card(self.canvas, fill=theme.RAISED, pad=CARD_PAD)
+        look = card_look("approval")
+        fill = look["fill"]
+        card = Card(self.canvas, pad=CARD_PAD, **look)
         stamp = self._card_head(card, "JARVIS", theme.CYAN_DIM)
         body = tk.Label(card.body, text=question, font=ui_font(theme.SIZE_BODY),
-                        fg=theme.INK, bg=theme.RAISED, justify="left",
+                        fg=theme.INK, bg=fill, justify="left",
                         anchor="w", wraplength=wrap)
         body.pack(fill="x", pady=(px(4), 0))
         body.bind("<Button-1>", lambda e, t=question: self._copy(t), add=True)
-        row = tk.Frame(card.body, bg=theme.RAISED)
+        row = tk.Frame(card.body, bg=fill)
         row.pack(fill="x", pady=(px(8), 0))
 
         def answer(allowed: bool, rid=request_id):
@@ -973,13 +1090,16 @@ class TranscriptView(tk.Frame):
                 except Exception:
                     log.exception("approval answer failed")
 
-        allow = RoundButton(row, text=yes_text, kind="accent", bg=theme.RAISED,
+        allow = RoundButton(row, text=yes_text, kind="accent", bg=fill,
                             command=lambda: answer(True))
         allow.pack(side="left")
-        deny = RoundButton(row, text=no_text, kind="default", bg=theme.RAISED,
+        deny = RoundButton(row, text=no_text, kind="default", bg=fill,
                            command=lambda: answer(False))
         deny.pack(side="left", padx=(theme.PAD_S, 0))
-        card.set_edge_glow()
+        if theme.LOOK == "holo":
+            card.set_edge_glow((theme.ARC_BRIGHT,))
+        else:
+            card.set_edge_glow()
         self._approvals[request_id] = {"stamp": stamp, "stamp_text": stamp.cget("text"),
                                        "buttons": (allow, deny), "done": False}
         self._push_entry(card, body, "jarvis", x, cw)
@@ -1015,7 +1135,9 @@ class TranscriptView(tk.Frame):
         self._progress = None
         rows = briefing_rows(sections)
         x, cw, wrap = self._card_geo("jarvis", None, "")
-        card = Card(self.canvas, fill=theme.RAISED, pad=CARD_PAD)
+        look = card_look("briefing")
+        fill = look["fill"]
+        card = Card(self.canvas, pad=CARD_PAD, **look)
         self._card_head(card, "JARVIS", theme.CYAN_DIM)
         lf = ui_display(theme.SIZE_CAPTION, "semibold")
         try:
@@ -1023,21 +1145,24 @@ class TranscriptView(tk.Frame):
         except Exception:
             col_w = px(60)
         col_w += theme.PAD_S
-        grid = tk.Frame(card.body, bg=theme.RAISED)
+        grid = tk.Frame(card.body, bg=fill)
         grid.pack(fill="x", pady=(px(4), 0))
         grid.grid_columnconfigure(0, minsize=col_w)
         grid.grid_columnconfigure(1, weight=1)
         values = []
         for i, (lab, text) in enumerate(rows):
-            tk.Label(grid, text=lab, font=lf, fg=theme.MUTED, bg=theme.RAISED,
+            tk.Label(grid, text=lab, font=lf, fg=theme.MUTED, bg=fill,
                      anchor="nw").grid(row=i, column=0, sticky="nw",
                                        pady=(px(3), 0))
             val = tk.Label(grid, text=text, font=ui_font(theme.SIZE_BODY),
-                           fg=theme.INK, bg=theme.RAISED, justify="left",
+                           fg=theme.INK, bg=fill, justify="left",
                            anchor="w", wraplength=max(px(80), wrap - col_w))
             val.grid(row=i, column=1, sticky="w", pady=(0, px(2)))
             values.append(val)
-        card.set_edge_glow()
+        if theme.LOOK == "holo":
+            card.set_edge_glow((theme.ARC_BRIGHT,))
+        else:
+            card.set_edge_glow()
         plain = "\n".join(f"{lab} {text}".strip() for lab, text in rows)
         _bind_tree(card, "<Button-1>", lambda e, t=plain: self._copy(t))
         self._push_entry(card, _WrapGroup(values, col_w), "jarvis", x, cw)
@@ -1070,6 +1195,7 @@ class CommandBar(tk.Frame):
 
     PLACEHOLDER = "Type a command"                         # hotword off / no mic
     PLACEHOLDER_HOT = "Type a command — or say “Jarvis”"    # hotword on
+    PLACEHOLDER_HOT_SHORT = "Type or say “Jarvis”"          # hotword on, narrow
     TERMINAL_STATES = ("idle", "open", "working", "waiting", "no_project",
                        "disabled")
     TIP_NO_PROJECT = "No project yet"
@@ -1101,13 +1227,17 @@ class CommandBar(tk.Frame):
         field.pack(side="left", fill="x", expand=True,
                    padx=(theme.PAD, theme.PAD_S), pady=px(12))
         self._field = field
-        self.entry = tk.Entry(field, bd=0, bg=theme.RAISED, fg=theme.FAINT,
+        # holo: the field is a hairline frame with a dark inset interior
+        # (BG) so the strip reads as a recessed display, not a lit slab
+        self._field_fill = theme.BG if theme.LOOK == "holo" else theme.RAISED
+        self.entry = tk.Entry(field, bd=0, bg=self._field_fill, fg=theme.FAINT,
                               insertbackground=theme.CYAN,
                               font=ui_display(theme.SIZE_BODY), relief="flat",
                               highlightthickness=0)
         self._entry_win = field.create_window(px(34), px(20), anchor="w",
                                               window=self.entry)
         field.bind("<Configure>", self._draw_field, add=True)
+        self._hotword = True
         self._placeholder = self.PLACEHOLDER_HOT
         self._showing_placeholder = True
         self.entry.insert(0, self._placeholder)
@@ -1160,6 +1290,9 @@ class CommandBar(tk.Frame):
             return
         self._field_last = (w, h)
         self._field.delete("chrome")
+        if theme.LOOK == "holo":
+            self._draw_field_holo(w, h)
+            return
         # dim hairline outline; brightness only in the corner brackets
         item = chamfer_rect(self._field, 1, 1, w - 2, h - 2,
                             fill=theme.RAISED, outline=theme.RAMP47, width=1,
@@ -1191,6 +1324,61 @@ class CommandBar(tk.Frame):
         self._field.coords(self._entry_win, px(34), h // 2)
         self._field.itemconfigure(self._entry_win, width=w - px(50))
 
+    def _draw_field_holo(self, w: int, h: int):
+        """Holo command strip: a 1px GLASS_EDGE frame with corner notches
+        over the dark inset, ONE bright CYAN '[' bracket on the left edge
+        (the ref HUD marks its input line with a single bright corner,
+        never a lit border) and a crisp chevron — no ghost-glow copies,
+        which read as blur at 2x. The entry's width follows the frame and
+        the placeholder is re-fitted to it (fit_placeholder)."""
+        f = self._field
+        item = frame_rect(f, 1, 1, w - 2, h - 2, fill=self._field_fill,
+                          outline=theme.GLASS_EDGE, accent=theme.GLASS_EDGE,
+                          tags="chrome")
+        f.tag_lower(item)
+        bw = max(1, px(2))
+        tick = px(10)
+        f.create_line(1 + tick, 1, 1, 1, 1, h - 2, 1 + tick, h - 2,
+                      fill=theme.CYAN, width=bw, tags="chrome",
+                      capstyle="projecting", joinstyle="miter")
+        f.create_text(px(18), h // 2, text="❯", fill=theme.CYAN,
+                      font=ui_display(theme.SIZE_BODY, "semibold"),
+                      tags="chrome")
+        f.coords(self._entry_win, px(34), h // 2)
+        f.itemconfigure(self._entry_win, width=w - px(50))
+        self._apply_placeholder()
+
+    def _placeholder_for(self, hotword: bool) -> str:
+        """The placeholder text for the hotword state. Classic: today's
+        two strings, untouched. Holo: the longest of the three that fits
+        the measured entry width — at JARVIS_UI_SCALE 2.0 the long form
+        (631 px) never fitted the 548-px entry and clipped to 'Type a
+        command — or say “Ja'."""
+        long = self.PLACEHOLDER_HOT if hotword else self.PLACEHOLDER
+        if theme.LOOK != "holo" or not hotword:
+            return long
+        last = getattr(self, "_field_last", None)
+        if not last:
+            return long
+        avail = last[0] - px(50) - px(6)      # entry width less a breath
+        try:
+            font = ui_display(theme.SIZE_BODY)
+            options = [(t, measure(font, t)) for t in
+                       (self.PLACEHOLDER_HOT, self.PLACEHOLDER_HOT_SHORT,
+                        self.PLACEHOLDER)]
+        except Exception:
+            return long
+        return fit_placeholder(avail, options)
+
+    def _apply_placeholder(self):
+        text = self._placeholder_for(self._hotword)
+        if text == self._placeholder:
+            return
+        self._placeholder = text
+        if self._showing_placeholder:
+            self.entry.delete(0, "end")
+            self.entry.insert(0, self._placeholder)
+
     def _focus_in(self, _e):
         if self._showing_placeholder:
             self.entry.delete(0, "end")
@@ -1207,7 +1395,8 @@ class CommandBar(tk.Frame):
     def set_placeholder(self, hotword: bool):
         """Truthful idle hint: mention the wake word only when the
         listener is actually on (and a mic exists)."""
-        self._placeholder = self.PLACEHOLDER_HOT if hotword else self.PLACEHOLDER
+        self._hotword = bool(hotword)
+        self._placeholder = self._placeholder_for(self._hotword)
         if self._showing_placeholder:
             self.entry.delete(0, "end")
             self.entry.insert(0, self._placeholder)
@@ -1313,13 +1502,14 @@ class CommandBar(tk.Frame):
         # 4 arc segments (gaps on the diagonals) that close into a full
         # ring while recording
         box = (p(2), p(2), p(42), p(42))
+        holo = theme.LOOK == "holo"
         for k in range(4):
             if recording:
                 start, extent = 90 * k - 45, 90
             else:
                 start, extent = 90 * k - 33, 66
             c.create_arc(*box, start=start, extent=extent, style="arc",
-                         outline=ring, width=p(2))
+                         outline=ring, width=max(1, p(1)) if holo else p(2))
         if recording:
             # filled CYAN disc with a stop glyph inside the closed ring
             c.create_oval(p(7), p(7), p(37), p(37), fill=theme.CYAN,
@@ -1328,8 +1518,11 @@ class CommandBar(tk.Frame):
                                outline="")
             return
         glyph = ring
-        c.create_oval(p(7), p(7), p(37), p(37), fill=theme.RAISED,
-                      outline="")
+        if not holo:
+            # classic: the glyph sits on a RAISED disc; holo is an open
+            # ring of light on the bar ground (no filled disc)
+            c.create_oval(p(7), p(7), p(37), p(37), fill=theme.RAISED,
+                          outline="")
         # mic glyph (capsule + cradle arc + stem) — shape from the tray
         # icon drawing at voice_input_gui.py 673-680, scaled to 44px
         c.create_oval(p(18), p(11), p(26), p(19), fill=glyph, outline="")
@@ -1390,15 +1583,17 @@ class CommandBar(tk.Frame):
             ring, glyph = theme.CYAN, theme.CYAN
         closed = state in ("open", "working", "waiting")
         box = (p(2), p(2), p(42), p(42))
+        holo = theme.LOOK == "holo"
         for k in range(4):
             if closed:
                 start, extent = 90 * k - 45, 90
             else:
                 start, extent = 90 * k - 33, 66
             c.create_arc(*box, start=start, extent=extent, style="arc",
-                         outline=ring, width=p(2))
-        c.create_oval(p(7), p(7), p(37), p(37), fill=theme.RAISED,
-                      outline="")
+                         outline=ring, width=max(1, p(1)) if holo else p(2))
+        if not holo:
+            c.create_oval(p(7), p(7), p(37), p(37), fill=theme.RAISED,
+                          outline="")
         # chamfered 18x14 screen outline (cut 2 on every corner)
         x0, y0, x1, y1, cut = 13, 15, 31, 29, 2
         pts = [x0 + cut, y0, x1 - cut, y0, x1, y0 + cut, x1, y1 - cut,
@@ -1462,6 +1657,16 @@ class SettingsDrawer(tk.Frame):
         self.bind("<Escape>", lambda e: self.close(), add=True)
 
         self._build_sections()
+        if theme.LOOK == "holo":
+            # a 1px GLASS_EDGE rule on the drawer's leading edge with a
+            # short bright bracket at the top: the panel slides in as a
+            # framed pane, not an unbounded RAISED slab (holo only)
+            edge = tk.Frame(self, bg=theme.GLASS_EDGE, width=max(1, px(1)))
+            edge.place(x=0, y=0, relheight=1.0)
+            tk.Frame(self, bg=theme.BRIGHT, width=max(1, px(2)),
+                     height=px(28)).place(x=0, y=0)
+            tk.Frame(self, bg=theme.BRIGHT, width=px(18),
+                     height=max(1, px(2))).place(x=0, y=0)
 
     # -------------------------------------------------------- open/close
     def toggle(self):
@@ -1856,6 +2061,9 @@ class StatusStrip(tk.Frame):
         self._vf = ui_mono(theme.SIZE_CAPTION)
         self._hot_text = ""
         self._values = {name: "--" for name in self.SEGMENTS}
+        self._temps_text = ""
+        self._mem_text = ""
+        self._level = 0            # telemetry elision level (plan_telemetry)
         self._project = ""
         self._project_text = ""
 
@@ -1866,6 +2074,16 @@ class StatusStrip(tk.Frame):
         self._grad = BarGradient(self, theme.SURFACE,
                                  [(0.0, 0.055), (0.30, 0.0), (1.0, 0.0)])
         c = self.canvas = self._grad.canvas
+        # holo: the wake-word state is a small ring (lit dot inside while
+        # listening) beside a caps label, instead of the ●/○ glyph in the
+        # text; the ring shares the "hot" tag so it toggles too
+        self._hot_ring = None
+        if theme.LOOK == "holo":
+            self._hot_ring = (c.create_oval(0, 0, 0, 0, outline=theme.FAINT,
+                                            fill="", width=max(1, px(1)),
+                                            tags=("hot",)),
+                              c.create_oval(0, 0, 0, 0, outline="", fill="",
+                                            tags=("hot",)))
         self._hot = c.create_text(theme.PAD, 0, anchor="w", text="",
                                   font=self._lf, fill=theme.FAINT,
                                   tags=("hot",))
@@ -1875,7 +2093,10 @@ class StatusStrip(tk.Frame):
         c.tag_bind("hot", "<Leave>",
                    lambda e: c.configure(cursor=""), add=True)
         Tooltip(c, "Click to toggle the wake word listener", tag="hot")
-        self._hot_line = c.create_line(0, 0, 0, 0, fill=theme.LINE)
+        # separators: LINE hairlines in classic; holo draws them a shade
+        # brighter (GLASS_EDGE) and shorter — the ref HUD's thin ticks
+        sep = theme.GLASS_EDGE if theme.LOOK == "holo" else theme.LINE
+        self._hot_line = c.create_line(0, 0, 0, 0, fill=sep)
         # PROJECT chip items (hidden until set_project)
         self._proj_lbl = c.create_text(0, 0, anchor="w", text="PROJECT",
                                        font=self._lf, fill=theme.MUTED,
@@ -1883,7 +2104,7 @@ class StatusStrip(tk.Frame):
         self._proj_val = c.create_text(0, 0, anchor="w", text="",
                                        font=self._vf, fill=theme.FOCAL,
                                        state="hidden")
-        self._proj_line = c.create_line(0, 0, 0, 0, fill=theme.LINE,
+        self._proj_line = c.create_line(0, 0, 0, 0, fill=sep,
                                         state="hidden")
         self._segs = {}
         for name in self.SEGMENTS:
@@ -1891,7 +2112,7 @@ class StatusStrip(tk.Frame):
                                 fill=theme.MUTED)
             vid = c.create_text(0, 0, anchor="e", text="--", font=self._vf,
                                 fill=theme.FOCAL)
-            hid = c.create_line(0, 0, 0, 0, fill=theme.LINE)
+            hid = c.create_line(0, 0, 0, 0, fill=sep)
             self._segs[name] = (lid, vid, hid)
         c.bind("<Configure>", lambda e: self._layout(), add=True)
 
@@ -1914,24 +2135,45 @@ class StatusStrip(tk.Frame):
         if w < 4 or h < 4:
             return
         cy = h // 2
-        y0, y1 = px(6), h - px(6)
+        holo = theme.LOOK == "holo"
+        y0, y1 = (px(8), h - px(8)) if holo else (px(6), h - px(6))
         gap = px(6)
-        c.coords(self._hot, theme.PAD, cy)
-        x = theme.PAD + self._measure(self._lf, self._hot_text) + theme.PAD_S
+        hx = theme.PAD
+        if self._hot_ring is not None:
+            d = px(8)
+            ring, dot = self._hot_ring
+            c.coords(ring, hx, cy - d // 2, hx + d, cy + d // 2)
+            c.coords(dot, hx + d // 4, cy - d // 4, hx + d - d // 4,
+                     cy + d // 4)
+            hx += d + gap
+        c.coords(self._hot, hx, cy)
+        x = hx + self._measure(self._lf, self._hot_text) + theme.PAD_S
         c.coords(self._hot_line, x, y0, x, y1)
 
-        seg_ws = []
-        for i, name in enumerate(self.SEGMENTS):
-            sw = (theme.PAD_S + self._measure(self._lf, name) + gap
-                  + self._measure(self._vf, self._values[name]) + theme.PAD_S)
-            if name == self.SEGMENTS[-1]:
-                sw += theme.PAD                    # right margin (grip)
-            seg_ws.append((name, sw))
+        # telemetry per elision level (pure: telemetry_segments); the
+        # widest level that leaves the left side clear wins
+        levels, texts = [], []
+        for level in range(3):
+            segs = telemetry_segments(self._temps_text, self._mem_text, level)
+            seg_ws, seg_txt = [], {}
+            for name, (label, value) in zip(self.SEGMENTS[-len(segs):], segs):
+                sw = theme.PAD_S + self._measure(self._vf, value) + theme.PAD_S
+                if label:
+                    sw += self._measure(self._lf, label) + gap
+                if name == self.SEGMENTS[-1]:
+                    sw += theme.PAD                # right margin (grip)
+                seg_ws.append((name, sw))
+                seg_txt[name] = (label, value)
+            levels.append(seg_ws)
+            texts.append(seg_txt)
         proj_fixed = (theme.PAD_S + self._measure(self._lf, "PROJECT") + gap
                       + theme.PAD_S)
         char_w = max(1, self._measure(self._vf, "M"))
-        chars, hidden = plan_strip(w, x, proj_fixed, char_w,
-                                   len(self._project), seg_ws)
+        level, chars, hidden = plan_telemetry(w, x, proj_fixed, char_w,
+                                              len(self._project), levels)
+        self._level = level
+        seg_txt = texts[level]
+        hidden = list(hidden) + [n for n in self.SEGMENTS if n not in seg_txt]
         self._project_text = fmt_project_chip(self._project, chars)
         if self._project_text:
             lx = x + theme.PAD_S
@@ -1955,10 +2197,13 @@ class StatusStrip(tk.Frame):
                 c.itemconfigure(item, state="normal" if shown else "hidden")
             if not shown:
                 continue
+            label, value = seg_txt[name]
+            c.itemconfigure(lid, text=label)
+            c.itemconfigure(vid, text=value)
             c.coords(vid, xr, cy)
-            lx = xr - self._measure(self._vf, self._values[name]) - gap
+            lx = xr - self._measure(self._vf, value) - (gap if label else 0)
             c.coords(lid, lx, cy)
-            hx = lx - self._measure(self._lf, name) - theme.PAD_S
+            hx = lx - self._measure(self._lf, label) - theme.PAD_S
             c.coords(hid, hx, y0, hx, y1)
             xr = hx - theme.PAD_S
 
@@ -1970,6 +2215,12 @@ class StatusStrip(tk.Frame):
         self.canvas.itemconfigure(self._segs[name][1], text=text)
         self._layout()
 
+    @property
+    def telemetry_level(self) -> int:
+        """0 full, 1 compact ('CPU 53° · GPU 44° · 47.5 GB'), 2 minimal
+        ('47.5 GB') — what the last layout chose."""
+        return self._level
+
     def _hot_clicked(self, _e):
         if self.on_hotword_click:
             try:
@@ -1978,21 +2229,28 @@ class StatusStrip(tk.Frame):
                 log.exception("hotword click failed")
 
     def set_hotword(self, on: bool):
-        self._hot_text = "● WAKE WORD ON" if on else "○ WAKE WORD OFF"
-        self.canvas.itemconfigure(
-            self._hot, text=self._hot_text,
-            fill=theme.CYAN_DIM if on else theme.FAINT)
+        color = theme.CYAN_DIM if on else theme.FAINT
+        if self._hot_ring is not None:
+            self._hot_text = "WAKE WORD ON" if on else "WAKE WORD OFF"
+            ring, dot = self._hot_ring
+            self.canvas.itemconfigure(ring, outline=color)
+            self.canvas.itemconfigure(dot, fill=theme.CYAN if on else "")
+        else:
+            self._hot_text = "● WAKE WORD ON" if on else "○ WAKE WORD OFF"
+        self.canvas.itemconfigure(self._hot, text=self._hot_text, fill=color)
         self._layout()
 
     def set_temps(self, text: str):
         """Parse the temps line ('cpu 45° 12% · gpu 38° 5%') into the CPU
         and GPU values ('45°C · 12%' / '38°C · 5%'; '--' when absent)."""
+        self._temps_text = text or ""
         segs = split_temps(text)
         self._set_value("CPU", fmt_temps(segs.get("cpu", "")))
         self._set_value("GPU", fmt_temps(segs.get("gpu", "")))
 
     def set_memory(self, text: str):
         """Used system RAM, e.g. '26.8 GB' ('--' when unknown)."""
+        self._mem_text = text or ""
         self._set_value("MEMORY", text or "--")
 
     def set_project(self, slug: str):

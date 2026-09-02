@@ -322,3 +322,97 @@ def test_the_bar_gets_no_history_hook_when_the_app_half_is_missing():
     assert MainWindow._history_available(win) is False
     win.services = Services(history_prev=lambda: "standup")
     assert MainWindow._history_available(win) is True
+
+
+# ------------------------------------------------ the placeholder (holo)
+# 2026-09-01 blue-holographic overhaul: at JARVIS_UI_SCALE 2.0 the hint
+# 'Type a command — or say “Jarvis”' (631 px) never fitted the 548-px entry
+# and clipped to 'Type a command — or say “Ja'. In holo the bar picks the
+# longest variant that fits the measured field; classic keeps today's two
+# strings whatever the width. Same stand-in as the history tests, with the
+# font measure replaced by the widths measured on :99.
+from jarvis.ui import theme                             # noqa: E402
+from jarvis.ui import views as views_mod                # noqa: E402
+
+PLACEHOLDER_PX = {CommandBar.PLACEHOLDER_HOT: 631,
+                  CommandBar.PLACEHOLDER_HOT_SHORT: 369,
+                  CommandBar.PLACEHOLDER: 315}
+
+
+class _FitBar(_CmdBar):
+    PLACEHOLDER = CommandBar.PLACEHOLDER
+    PLACEHOLDER_HOT = CommandBar.PLACEHOLDER_HOT
+    PLACEHOLDER_HOT_SHORT = CommandBar.PLACEHOLDER_HOT_SHORT
+    _placeholder_for = CommandBar._placeholder_for
+    _apply_placeholder = CommandBar._apply_placeholder
+    set_placeholder = CommandBar.set_placeholder
+
+    def __init__(self, field_w=None):
+        super().__init__()
+        self._hotword = True
+        self._placeholder = CommandBar.PLACEHOLDER_HOT
+        self._field_last = (field_w, 80) if field_w else None
+        self.entry.insert(0, self._placeholder)
+
+
+@pytest.fixture
+def _measured(monkeypatch):
+    monkeypatch.setattr(views_mod, "measure",
+                        lambda font, text: PLACEHOLDER_PX[text])
+    yield
+    theme.select_look(theme.DEFAULT_LOOK)
+
+
+def test_holo_picks_the_placeholder_that_fits_the_field(_measured):
+    theme.select_look("holo")
+    # today's 920-px window: field 648 → entry 548 → the short form
+    bar = _FitBar(field_w=648)
+    bar.set_placeholder(True)
+    assert bar.entry.get() == CommandBar.PLACEHOLDER_HOT_SHORT
+    # a wide window keeps the whole sentence
+    bar._field_last = (900, 80)
+    bar._apply_placeholder()
+    assert bar.entry.get() == CommandBar.PLACEHOLDER_HOT
+    # hotword off never mentions the wake word, at any width
+    bar.set_placeholder(False)
+    assert bar.entry.get() == CommandBar.PLACEHOLDER
+    bar._field_last = (300, 80)
+    bar.set_placeholder(False)
+    assert bar.entry.get() == CommandBar.PLACEHOLDER
+
+
+def test_classic_placeholder_is_todays_string_at_every_width(_measured):
+    theme.select_look("classic")
+    bar = _FitBar(field_w=648)
+    bar.set_placeholder(True)
+    assert bar.entry.get() == CommandBar.PLACEHOLDER_HOT      # clips, as today
+    bar._field_last = (200, 80)
+    bar._apply_placeholder()
+    assert bar.entry.get() == CommandBar.PLACEHOLDER_HOT
+    bar.set_placeholder(False)
+    assert bar.entry.get() == CommandBar.PLACEHOLDER
+
+
+def test_refitting_the_placeholder_never_touches_typed_text(_measured):
+    """A resize re-fits the hint; if he is mid-sentence the entry holds
+    HIS text and the refit must leave it alone (only the remembered
+    placeholder changes, for the next focus-out)."""
+    theme.select_look("holo")
+    bar = _FitBar(field_w=900)
+    bar.set_placeholder(True)
+    assert bar.entry.get() == CommandBar.PLACEHOLDER_HOT
+    bar._showing_placeholder = False
+    bar.entry.insert(0, "set a timer for")
+    bar._field_last = (648, 80)
+    bar._apply_placeholder()
+    assert bar.entry.get() == "set a timer for"
+    assert bar._placeholder == CommandBar.PLACEHOLDER_HOT_SHORT
+
+
+def test_placeholder_falls_back_to_the_long_form_before_the_first_layout(_measured):
+    # no <Configure> yet (field_last None) → the long hint, as today;
+    # the first _draw_field re-fits it once the width is known
+    theme.select_look("holo")
+    bar = _FitBar(field_w=None)
+    assert bar._placeholder_for(True) == CommandBar.PLACEHOLDER_HOT
+    assert bar._placeholder_for(False) == CommandBar.PLACEHOLDER

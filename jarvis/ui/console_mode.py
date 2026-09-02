@@ -157,16 +157,24 @@ def _rgb(color: str) -> tuple:
     return tuple(int(color[i:i + 2], 16) for i in (0, 2, 4))
 
 
-def dim(color: str, factor: float, ground: str = theme.BG) -> str:
+def dim(color: str, factor: float, ground: Optional[str] = None) -> str:
     """`color` blended toward `ground` by `factor` (1.0 = untouched).
 
     Canvas items have no alpha, so every dim in this UI is a pre-blend —
     the same trick theme.py uses to build its ramps. Never applied to a
     PhotoImage: re-baking the avatar at a mode change is exactly the churn
-    the 08-26 freeze came from."""
+    the 08-26 freeze came from.
+
+    `ground` defaults to theme.BG AT CALL TIME (None here, resolved below):
+    a `ground=theme.BG` default froze the import-time look, so after
+    theme.select_look("classic") every dim still blended toward the holo
+    ground and the classic standby came out a shade too dark (W2 lane C,
+    2026-09-01; tests/test_theme_look.py scans for the pattern)."""
     f = max(0.0, min(1.0, float(factor)))
     if f >= 1.0:
         return color
+    if ground is None:
+        ground = theme.BG
     try:
         c, g = _rgb(color), _rgb(ground)
     except (ValueError, IndexError):

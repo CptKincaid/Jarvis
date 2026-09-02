@@ -1,8 +1,11 @@
 """Canvas-drawn flat widgets for the Jarvis V3 UI.
 
-Primitives: round_rect / RoundedField, Card, RoundButton, Toggle (animated),
-Meter, Chip, Tooltip (timing ported from voice_input_gui.py 968-1009), Toast,
-ellipsize helper. All colors and fonts come from jarvis.ui.theme tokens ONLY.
+Primitives: round_rect / RoundedField, frame_rect (the holo thin frame),
+Card (slab | frame), RoundButton, Toggle (animated), Meter, Chip, Tooltip
+(timing ported from voice_input_gui.py 968-1009), Toast, ellipsize helper.
+All colors and fonts come from jarvis.ui.theme tokens ONLY — and are read at
+CALL time (never a def default or class-body dict), so theme.select_look()
+reaches every widget built after it.
 
 Nothing in this module constructs a Tk root; widgets are created under a
 parent the caller owns, so importing this file never requires a display.
@@ -115,6 +118,31 @@ def chamfer_rect(canvas: tk.Canvas, x1, y1, x2, y2, cut=None, **kw):
         x1, y1 + cut,
     ]
     return canvas.create_polygon(pts, smooth=False, **kw)
+
+
+def frame_rect(canvas: tk.Canvas, x1, y1, x2, y2, fill="", outline=None,
+               accent=None, notch=None, width=1, dash=None, tags="chrome"):
+    """The holo thin-frame primitive (2026-09-01): a 1px outline over a
+    near-transparent fill with SMALL corner brackets — the ref HUD
+    (scratchpad/holo/ref/ref2_hud.png) carries its panels as hairlines
+    on black, never as filled slabs. Colours resolve at CALL time so the
+    look switch reaches them. Returns the rectangle item id (callers
+    tag_lower it under their content)."""
+    outline = outline or theme.GLASS_EDGE
+    accent = accent or theme.BRIGHT
+    notch = px(6) if notch is None else notch
+    kw = dict(fill=fill, outline=outline, width=width, tags=tags)
+    if dash:
+        kw["dash"] = dash
+    rect = canvas.create_rectangle(x1, y1, x2, y2, **kw)
+    lw = max(1, px(1))
+    n = max(2, min(notch, (x2 - x1) // 3, (y2 - y1) // 3))
+    for pts in ((x1, y1 + n, x1, y1, x1 + n, y1),
+                (x2 - n, y1, x2, y1, x2, y1 + n),
+                (x2, y2 - n, x2, y2, x2 - n, y2),
+                (x1 + n, y2, x1, y2, x1, y2 - n)):
+        canvas.create_line(*pts, fill=accent, width=lw, tags=tags)
+    return rect
 
 
 def measure(font_spec, text: str) -> int:
@@ -305,15 +333,32 @@ class Card(tk.Canvas):
     (JARVIS reply cards).
     """
 
-    def __init__(self, parent, fill=theme.RAISED, radius=None,
-                 pad=12, bg=None, **kw):
+    @staticmethod
+    def resolve_fill(fill=None) -> str:
+        """The card ground for a caller that passed none: theme.RAISED read
+        NOW. A staticmethod (not inline in __init__) so the Tk-free tests
+        can prove the default follows theme.select_look()."""
+        return theme.RAISED if fill is None else fill
+
+    def __init__(self, parent, fill=None, radius=None,
+                 pad=12, bg=None, style="slab", edge=None, accent=None,
+                 dash=None, **kw):
         bg = bg or parent.cget("bg")
+        # fill/edge/accent resolve HERE, not in the signature: a def-time
+        # theme.RAISED froze the import-time look (test_theme_look.py).
+        fill = self.resolve_fill(fill)
         # explicit size: Tk's canvas defaults are "10c"x"7c" (640x447 on
         # HiDPI), which distorts layout before the first sync
         kw.setdefault("width", px(100))
         kw.setdefault("height", px(40))
         super().__init__(parent, bg=bg, highlightthickness=0, bd=0, **kw)
         self._fill = fill
+        # style "slab" is the chamfered lit-glass panel (classic, byte for
+        # byte); "frame" is the holo thin outline (frame_rect) — `edge` is
+        # its outline colour, `accent` its corner-bracket colour, `dash`
+        # makes the outline dashed (the listening ghost card).
+        self._style = style if style in ("slab", "frame") else "slab"
+        self._edge, self._accent, self._dash = edge, accent, dash
         # radius kept for API compat; chamfer cut comes from theme.CHAMFER
         self._radius = theme.RADIUS if radius is None else radius
         self._pad = px(pad)
@@ -380,6 +425,9 @@ class Card(tk.Canvas):
             return
         self._last = (w, h)
         self.delete("chrome")
+        if self._style == "frame":
+            self._redraw_frame(w, h)
+            return
         cut = theme.CHAMFER
         # Film rule: never a full bright border (the neon-box tell). The
         # panel outline is a dim hairline; brightness lives only in the
@@ -411,12 +459,34 @@ class Card(tk.Canvas):
                 self.create_line(x, 1 + cut, x, h - 2 - cut,
                                  fill=color, width=2, tags="chrome")
         if self._rule:
-            color, frac = self._rule
-            rule_h = int((h - 2 * self._pad) * frac)
-            if rule_h > 2:
-                y0 = (h - rule_h) // 2
-                self.create_rectangle(0, y0, max(2, px(2)), y0 + rule_h,
-                                      fill=color, outline="", tags="chrome")
+            self._draw_rule(h)
+
+    def _draw_rule(self, h: int):
+        color, frac = self._rule
+        rule_h = int((h - 2 * self._pad) * frac)
+        if rule_h > 2:
+            y0 = (h - rule_h) // 2
+            self.create_rectangle(0, y0, max(2, px(2)), y0 + rule_h,
+                                  fill=color, outline="", tags="chrome")
+
+    def _redraw_frame(self, w: int, h: int):
+        """Holo card: a hairline frame with small corner brackets over the
+        ground-toned fill. A glowing card (JARVIS turns, set_edge_glow)
+        carries ONE short bright bracket at the top-left instead of the
+        slab's stacked edge strokes — the reference's panels are marked
+        by a single bright corner, not lit along a side."""
+        item = frame_rect(self, 1, 1, w - 2, h - 2, fill=self._fill,
+                          outline=self._edge, accent=self._accent,
+                          dash=self._dash)
+        self.tag_lower(item)
+        if self._glow:
+            bright = self._glow[0]
+            bw = max(1, px(2))
+            self.create_line(1, 1 + px(14), 1, 1, 1 + px(28), 1,
+                             fill=bright, width=bw, tags="chrome",
+                             capstyle="projecting")
+        if self._rule:
+            self._draw_rule(h)
 
 
 # ------------------------------------------------------------- RoundButton
@@ -427,21 +497,41 @@ class RoundButton(tk.Canvas):
     text), "ghost" (transparent, MUTED text). Pass text or a glyph char.
     """
 
-    _KINDS = {
-        "default": dict(fill=theme.RAISED, hover=theme.LINE,
-                        active=theme.CYAN_SOFT, fg=theme.INK),
-        "accent": dict(fill=theme.CYAN_SOFT, hover=theme.CYAN_SOFT,
-                       active=theme.CYAN_SOFT, fg=theme.CYAN),
-        "ghost": dict(fill="", hover=theme.RAISED,
-                      active=theme.CYAN_SOFT, fg=theme.MUTED),
-    }
     BARGRAD_SLICE = False      # redraws with delete("all"); small + on the
                                # flat part of the bar ground anyway
 
+    @staticmethod
+    def _kinds() -> dict:
+        """Kind → colours, built per call (a class-body dict froze the
+        import-time look). In holo the default/accent buttons are
+        OUTLINED — `outline` set, `fill` empty until hover — so a button
+        is a ring of light on the ground, not a filled pill."""
+        if theme.LOOK == "holo":
+            return {
+                "default": dict(fill="", hover=theme.RAISED,
+                                active=theme.CYAN_SOFT, fg=theme.INK,
+                                outline=theme.GLASS_EDGE),
+                "accent": dict(fill="", hover=theme.CYAN_SOFT,
+                               active=theme.CYAN_SOFT, fg=theme.CYAN,
+                               outline=theme.CYAN_DIM),
+                "ghost": dict(fill="", hover=theme.RAISED,
+                              active=theme.CYAN_SOFT, fg=theme.MUTED,
+                              outline=""),
+            }
+        return {
+            "default": dict(fill=theme.RAISED, hover=theme.LINE,
+                            active=theme.CYAN_SOFT, fg=theme.INK, outline=""),
+            "accent": dict(fill=theme.CYAN_SOFT, hover=theme.CYAN_SOFT,
+                           active=theme.CYAN_SOFT, fg=theme.CYAN, outline=""),
+            "ghost": dict(fill="", hover=theme.RAISED,
+                          active=theme.CYAN_SOFT, fg=theme.MUTED, outline=""),
+        }
+
     def __init__(self, parent, text="", command: Optional[Callable] = None,
-                 kind="default", size=theme.SIZE_LABEL, weight="normal",
+                 kind="default", size=None, weight="normal",
                  width=None, height=None, pad_x=14, pad_y=7, bg=None):
         bg = bg or parent.cget("bg")
+        size = theme.SIZE_LABEL if size is None else size
         self._font = ui_font(size, weight)
         pad_x, pad_y = px(pad_x), px(pad_y)      # callers pass design units
         try:
@@ -454,7 +544,8 @@ class RoundButton(tk.Canvas):
         super().__init__(parent, width=self._btn_w, height=self._btn_h, bg=bg,
                          highlightthickness=1, bd=0, takefocus=1, cursor="hand2")
         _focus_ring(self, bg)
-        self._spec = dict(self._KINDS.get(kind, self._KINDS["default"]))
+        kinds = self._kinds()
+        self._spec = dict(kinds.get(kind, kinds["default"]))
         self._text = text
         self.command = command
         self._state = "normal"
@@ -513,18 +604,21 @@ class RoundButton(tk.Canvas):
         self.delete("all")
         w = max(self.winfo_width(), self._btn_w)
         h = max(self.winfo_height(), self._btn_h)
+        outline = self._spec.get("outline", "")
         if self._state == "disabled":
-            fill, fg = theme.RAISED, theme.FAINT
+            fill, fg = ("" if outline else theme.RAISED), theme.FAINT
+            outline = theme.LINE if outline else ""
         elif self._pressed:
             fill, fg = self._spec["active"], self._spec["fg"]
         elif self._hovered:
             fill, fg = self._spec["hover"], self._spec["fg"]
         else:
             fill, fg = self._spec["fill"], self._spec["fg"]
-        if fill:
+        if fill or outline:
             inset = max(1, px(1))
             round_rect(self, inset, inset, w - inset - 1, h - inset - 1,
-                       theme.RADIUS, fill=fill, outline="")
+                       theme.RADIUS, fill=fill, outline=outline,
+                       width=max(1, px(1)) if outline else 1)
         self.create_text(w // 2, h // 2, text=self._text, fill=fg,
                          font=self._font)
 
@@ -616,11 +710,17 @@ class Toggle(tk.Canvas):
 class Meter(tk.Canvas):
     """Thin horizontal level bar. set(value 0..1)."""
 
-    def __init__(self, parent, width=120, height=4, color=theme.CYAN, bg=None):
+    @staticmethod
+    def resolve_color(color=None) -> str:
+        """Bar colour for a caller that passed none: theme.CYAN read NOW
+        (the look switch); exposed for the Tk-free tests."""
+        return color or theme.CYAN
+
+    def __init__(self, parent, width=120, height=4, color=None, bg=None):
         bg = bg or parent.cget("bg")
         super().__init__(parent, width=px(width), height=px(height), bg=bg,
                          highlightthickness=0, bd=0)
-        self._color = color
+        self._color = self.resolve_color(color)
         self._value = 0.0
         self.bind("<Configure>", self._on_configure)
         self._draw()
@@ -652,12 +752,20 @@ class Meter(tk.Canvas):
 class Chip(tk.Canvas):
     """Small RAISED pill with caption text (e.g. the model chip)."""
 
-    def __init__(self, parent, text="", fg=theme.FAINT, fill=theme.RAISED,
-                 size=theme.SIZE_CAPTION, mono=False, bg=None):
+    @staticmethod
+    def resolve_style(fg=None, fill=None, size=None) -> tuple:
+        """(fg, fill, size) with the theme read NOW for whatever the caller
+        left unset — never in the signature, where theme.FAINT/RAISED
+        froze the import-time look. SIZE_CAPTION is look-invariant but
+        rides along so one call settles the chip."""
+        return (fg or theme.FAINT, fill or theme.RAISED,
+                theme.SIZE_CAPTION if size is None else size)
+
+    def __init__(self, parent, text="", fg=None, fill=None,
+                 size=None, mono=False, bg=None):
         bg = bg or parent.cget("bg")
+        self._fg, self._fill, size = self.resolve_style(fg, fill, size)
         self._font = ui_mono(size) if mono else ui_display(size)
-        self._fg = fg
-        self._fill = fill
         self._text = text
         super().__init__(parent, bg=bg, highlightthickness=0, bd=0)
         self._draw()
@@ -728,10 +836,20 @@ class StatePill(tk.Canvas):
         self._pill_w = pill_w
         self.delete("pill")        # keeps the bar-gradient ground slice
         self.configure(width=pill_w)
-        chamfer_rect(self, 0, 0, pill_w - 1, pill_h - 1, cut=px(6),
-                     fill=theme.RAISED, outline="", tags=("pill",))
-        self.create_line(px(6) + 1, 1, pill_w - px(6) - 2, 1,
-                         fill=theme.GLASS_EDGE, width=1, tags=("pill",))
+        if theme.LOOK == "holo":
+            # outlined capsule: a hairline chamfered outline over the bar
+            # ground (the gradient slice shows through the empty fill), a
+            # brighter tick on the left cut — no slab, per the ref HUD
+            chamfer_rect(self, 0, 0, pill_w - 1, pill_h - 1, cut=px(6),
+                         fill="", outline=theme.GLASS_EDGE, width=1,
+                         tags=("pill",))
+            self.create_line(0, px(6), px(6), 0, fill=theme.BRIGHT,
+                             width=max(1, px(1)), tags=("pill",))
+        else:
+            chamfer_rect(self, 0, 0, pill_w - 1, pill_h - 1, cut=px(6),
+                         fill=theme.RAISED, outline="", tags=("pill",))
+            self.create_line(px(6) + 1, 1, pill_w - px(6) - 2, 1,
+                             fill=theme.GLASS_EDGE, width=1, tags=("pill",))
         r = px(self.DOT) / 2.0
         dx, dy = px(self.PAD_X) + r, pill_h / 2.0
         self._dot = self.create_oval(dx - r, dy - r, dx + r, dy + r,
@@ -826,17 +944,21 @@ class Tooltip:
 class Toast:
     """Transient bottom-center notice on a container (usually the root)."""
 
-    _KIND_FG = {"ok": theme.OK, "info": theme.INK,
-                "warn": theme.WARN, "error": theme.ERR}
-
     def __init__(self, container):
         self.container = container
         self._frame = None
         self._after_id = None
 
+    @staticmethod
+    def _kind_fg(kind: str) -> str:
+        """Text colour per kind, read at call time (a class-body dict
+        would freeze the import-time look)."""
+        return {"ok": theme.OK, "info": theme.INK,
+                "warn": theme.WARN, "error": theme.ERR}.get(kind, theme.INK)
+
     def show(self, text: str, kind: str = "info", ms: int = 1800):
         self.hide()
-        fg = self._KIND_FG.get(kind, theme.INK)
+        fg = self._kind_fg(kind)
         self._frame = tk.Frame(self.container, bg=theme.LINE)
         tk.Label(self._frame, text=text, font=ui_font(theme.SIZE_LABEL),
                  bg=theme.RAISED, fg=fg, padx=px(14), pady=px(7)).pack(

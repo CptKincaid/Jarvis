@@ -1,9 +1,12 @@
 """The Board — a second borderless surface docked down the right flank.
 
 The console is 520x880 on a 3840x2160 panel; 93% of the desk is black. The
-Board fills the right flank with the same holo theme as the reactor's
-engine card: chamfered glass slabs, display-face labels at SIZE_CAPTION,
-mono values, one hairline rule per panel tinted by its state.
+Board fills the right flank with the same theme as the reactor's engine
+card: chamfered slabs, display-face labels at SIZE_CAPTION, mono values, one
+hairline rule per panel tinted by its state. In the classic look the slabs
+are lit glass tiles (the 08-31 console, kept exactly); in holo (2026-09-01)
+they are OUTLINED 1px frames with corner brackets over the black ground —
+the room slab's chrome (jarvis/ui/ambient.py), so the two surfaces match.
 
 Division of labour, deliberately:
 
@@ -43,6 +46,7 @@ from jarvis.board import BoardState
 from jarvis.events import BoardUpdate, bus
 from jarvis.logs import get_logger
 from jarvis.ui import theme
+from jarvis.ui.ambient import hud_bracket_points, hud_frame_points, tracked
 from jarvis.ui.widgets import ellipsize, px, ui_display, ui_mono
 
 log = get_logger("ui.board")
@@ -57,14 +61,25 @@ HEAD_H = 30                       # panel title + hairline
 SPARK_H = 46                      # the turn ledger's strip chart
 TALL_PANELS = frozenset({"turns"})   # panels that earn extra height
 HIGHLIGHT_MS = 2600               # "focus on the sessions" — how long it lights
+BRACKET_LEN = 14                  # holo: bright corner-bracket arm, design units
 
-TONE_COLORS = {
-    "ok": theme.FOCAL,
-    "warn": theme.WARN,
-    "error": theme.ERR,
-    "idle": theme.CYAN_DIM,
-    "off": theme.FAINT,
+# Panel tone -> theme token NAME. Resolved by tone_color() at draw time: the
+# old `TONE_COLORS = {"ok": theme.FOCAL, ...}` dict evaluated the tokens at
+# import and froze whichever look was current then, so a runtime
+# select_look() left the tone rails in the other palette (W2, 2026-09-01).
+TONE_TOKENS = {
+    "ok": "FOCAL",
+    "warn": "WARN",
+    "error": "ERR",
+    "idle": "CYAN_DIM",
+    "off": "FAINT",
 }
+
+
+def tone_color(tone: str) -> str:
+    """The rail colour for a panel tone, read from theme at CALL time; an
+    unknown tone is drawn idle rather than raising in the render loop."""
+    return getattr(theme, TONE_TOKENS.get(str(tone), "CYAN_DIM"))
 
 
 # ------------------------------------------------------------ pure layout
@@ -354,19 +369,38 @@ class BoardWindow:
     def _draw_panel(self, panel, x: int, y: int, w: int, h: int):
         c = self.canvas
         cut = px(8)
-        tone = TONE_COLORS.get(panel.tone, theme.CYAN_DIM)
+        tone = tone_color(panel.tone)
         lit = panel.key == self._highlight
-        outline = theme.BRIGHT if lit else theme.RAMP33
-        c.create_polygon(x + cut, y, x + w, y, x + w, y + h - cut,
-                         x + w - cut, y + h, x, y + h, x, y + cut,
-                         fill=theme.RAISED, outline=outline, width=1)
-        c.create_line(x + cut + 1, y + 1, x + w - 1, y + 1,
-                      fill=theme.GLASS_EDGE, width=1)
-        # tone rule: the panel's STATE, carried by colour rather than a word
-        c.create_line(x + 1, y + cut, x + 1, y + h - 1, fill=tone,
-                      width=max(1, px(2)))
+        title = panel.title
+        if theme.LOOK == "holo":
+            # Holo: an OUTLINED frame, not a lit glass tile — on the film-
+            # black ground the 1px strokes are the panel (ref2_hud), and a
+            # filled slab is exactly the "homemade" read the overhaul is
+            # for. Four chamfered corners with bright brackets, the same
+            # frame the room slab draws (jarvis/ui/ambient.py), and the
+            # tone rail thinned to a hairline down the left edge.
+            outline = theme.BRIGHT if lit else theme.LINE
+            c.create_polygon(*hud_frame_points(x, y, x + w, y + h, cut),
+                             fill="", outline=outline, width=1)
+            for pts in hud_bracket_points(x, y, x + w, y + h, cut,
+                                          px(BRACKET_LEN)):
+                c.create_line(*pts, fill=theme.EDGE, width=1)
+            c.create_line(x, y + cut, x, y + h - cut, fill=tone,
+                          width=max(1, px(1)))
+            title = tracked(title)
+        else:
+            outline = theme.BRIGHT if lit else theme.RAMP33
+            c.create_polygon(x + cut, y, x + w, y, x + w, y + h - cut,
+                             x + w - cut, y + h, x, y + h, x, y + cut,
+                             fill=theme.RAISED, outline=outline, width=1)
+            c.create_line(x + cut + 1, y + 1, x + w - 1, y + 1,
+                          fill=theme.GLASS_EDGE, width=1)
+            # tone rule: the panel's STATE, carried by colour rather than
+            # a word
+            c.create_line(x + 1, y + cut, x + 1, y + h - 1, fill=tone,
+                          width=max(1, px(2)))
         pad = px(12)
-        c.create_text(x + pad, y + px(16), anchor="w", text=panel.title,
+        c.create_text(x + pad, y + px(16), anchor="w", text=title,
                       fill=theme.FOCAL if lit else theme.MUTED,
                       font=ui_display(theme.SIZE_CAPTION, "semibold"))
         c.create_line(x + pad, y + px(26), x + w - pad, y + px(26),
