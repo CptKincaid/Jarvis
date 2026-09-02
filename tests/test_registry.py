@@ -11,7 +11,8 @@ them)."""
 import json
 
 from jarvis.tools.registry import (CHARS_PER_TOKEN, MAX_SCHEMA_TOKENS,
-                                   MAX_TOOLS, ToolRegistry, ToolSpec)
+                                   MAX_TOOLS, ToolRegistry, ToolResult,
+                                   ToolSpec)
 
 
 def _fill(reg, n, prefix="t"):
@@ -86,3 +87,72 @@ def test_schemas_are_byte_stable_across_calls():
     reg = _fill(ToolRegistry(), 6)
     first = json.dumps(reg.schemas())
     assert all(json.dumps(reg.schemas()) == first for _ in range(3))
+
+
+# ------------------------------------------------------- reserved args
+# A handler may accept a keyword only trusted code (a commander force_args)
+# is allowed to fill. spotify_liked's ``shuffle`` earned this: gemma4 sent
+# shuffle=true unasked for "Play my like songs." (live, 2026-09-01 19:59)
+# and the newest-first default was lost. registry.call carries the model's
+# args and nothing else, so the utterance cannot be checked in the handler;
+# the registry strips the reserved keys from model-originated calls instead.
+def _reserved_reg(seen):
+    reg = ToolRegistry()
+
+    def handler(device="", shuffle=None, **_):
+        seen.append({"device": device, "shuffle": shuffle})
+        return ToolResult(text="ok")
+
+    reg.register(ToolSpec("liked", "Play the liked songs.",
+                          {"type": "object",
+                           "properties": {"device": {"type": "string"}}},
+                          handler, reserved=frozenset({"shuffle"})))
+    return reg
+
+
+def test_reserved_args_are_dropped_from_model_calls_only(caplog):
+    seen = []
+    reg = _reserved_reg(seen)
+    with caplog.at_level("INFO"):
+        res = reg.call("liked", {"shuffle": True, "device": "phone"}, from_model=True)
+    assert res.ok and seen == [{"device": "phone", "shuffle": None}]
+    said = [r.getMessage() for r in caplog.records if "reserved" in r.getMessage()]
+    assert said == ['tool liked: dropped model-supplied reserved args {"shuffle": true}']
+    # the commander's forced call is trusted: every key reaches the handler
+    reg.call("liked", {"shuffle": True, "device": "phone"})
+    assert seen[-1] == {"device": "phone", "shuffle": True}
+    # ...and the default (from_model=False) is the trusted path, so no
+    # existing caller changes behaviour
+    reg.call("liked", {"shuffle": False})
+    assert seen[-1] == {"device": "", "shuffle": False}
+
+
+def test_reserved_args_are_dropped_from_json_string_model_calls(caplog):
+    """Some models emit arguments as a JSON string; the filter runs after
+    the parse, so the string form is not a way around it."""
+    seen = []
+    reg = _reserved_reg(seen)
+    with caplog.at_level("INFO"):
+        reg.call("liked", '{"shuffle": true}', from_model=True)
+    assert seen == [{"device": "", "shuffle": None}]
+    # nothing dropped -> nothing logged: the line is an audit trail, not noise
+    caplog.clear()
+    with caplog.at_level("INFO"):
+        reg.call("liked", {"device": "phone"}, from_model=True)
+    assert not [r for r in caplog.records if "reserved" in r.getMessage()]
+
+
+def test_a_spec_that_advertises_a_reserved_arg_is_a_warned_drift(caplog):
+    """Reserved AND in the schema invites the model to send an argument
+    call() will drop -- register() says so once, at boot."""
+    reg = ToolRegistry()
+    with caplog.at_level("WARNING"):
+        reg.register(ToolSpec("drift", "Advertises what it drops.",
+                              {"type": "object",
+                               "properties": {"shuffle": {"type": "boolean"}}},
+                              lambda **_: ToolResult(text="ok"),
+                              reserved=frozenset({"shuffle"})))
+    said = [r.getMessage() for r in caplog.records]
+    assert said == ["tool drift advertises reserved argument(s) shuffle in its schema"]
+    # the default spec reserves nothing and the schema is untouched
+    assert ToolSpec("plain", "Plain.").reserved == frozenset()

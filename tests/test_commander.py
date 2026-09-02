@@ -1647,6 +1647,8 @@ TIER1_SAMPLES = {
     "briefing section": "no news in the morning",
     "verbosity": "shorter briefings",
     "last mail": "what was my last email",
+    "liked songs": "play my liked songs",
+    "music resume": "start playing my spotify",   # the 20:56:42 clause
     "diagnostics": "run diagnostics",
     "next exam": "when's my next exam",
     "leave time": "it takes ten minutes to get to wisenbaker",

@@ -1404,13 +1404,25 @@ class SpotifyTool:
             # -- the model read that as an instruction and every request came
             # back shuffled, which is half of #66.  Order is the default now
             # and shuffle is opt-in, in the wording as well as the code.
+            #
+            # The rewording was not enough: with "shuffle=true only if he asks"
+            # in front of it gemma4 still sent {"shuffle": true} for "Play my
+            # like songs." (live log 2026-09-01 19:59:26) and Jarvis announced
+            # "on shuffle" for a request that never said the word.  A tool
+            # handler cannot check the utterance -- registry.call carries the
+            # model's args and nothing else -- so the model is no longer
+            # offered the knob at all: ``shuffle`` is off the schema and
+            # RESERVED, which makes the registry drop it from any model call
+            # that guesses it.  The commander's Tier-1 "liked songs" route is
+            # the one place that sets it, from wants_shuffle(<what he said>),
+            # through force_args, which the registry does not filter.  The
+            # handler keeps the keyword for exactly that caller.
             ToolSpec("spotify_liked",
-                     "Play Hunter's Liked Songs on Spotify, newest added first; "
-                     "shuffle=true only if he asks.",
+                     "Play Hunter's Liked Songs on Spotify, newest added first.",
                      {"type": "object",
-                      "properties": {"device": {"type": "string"},
-                                     "shuffle": {"type": "boolean"}}},
-                     self._guard(liked)),
+                      "properties": {"device": {"type": "string"}}},
+                     self._guard(liked),
+                     reserved=frozenset({"shuffle"})),
             # "device" was missing from this schema, so the model had no way
             # to see that moving playback was on offer; asked to "play it on my
             # phone" it invented "I have no way of reaching it" instead of
