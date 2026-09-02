@@ -2819,16 +2819,52 @@ ALARM_FAILED_LINE = "I couldn't set that alarm, sir."
 # protocol, one sound.
 BRIEFING_DECLINED_LINE = "Very good, sir."
 BRIEFING_BUSY_LINE = "I'm still on the last one, sir; ask me for it in a moment."
-# "not now" / "later" carry no yes and no no, so parse_yes_no reads them as
-# a NEW SUBJECT and the offer is dropped silently -- which would leave the
-# words to route on into the model as a command. On this one offer they are
-# plainly a decline, so they are read as one HERE rather than in the shared
-# vocabulary, where "later" would start meaning no to a destructive
-# read-back and to every other yes/no rung in the ladder.
-_BRIEFING_LATER_RX = re.compile(
-    r"^(?:no[,\s]+)?(?:not (?:now|today|right now)|later|maybe later|"
-    r"another time|some other time|in a bit|skip(?: it| that)?|"
-    r"leave it|not just now)\b", re.I)
+# This offer is answered by its OWN end-anchored grammar and NOT by
+# parse_yes_no, which is a word BAG: it waives its own overheard-speech
+# guard whenever the first word is a yes/no word, so the ten-word
+# "Yeah, so you should be able to look that up." -- a real line from
+# jarvis.log.1:19499 that was not an answer to anything and routed to a web
+# lookup -- read as a yes and delivered the whole briefing, and "no, turn
+# the lights off" was answered "Very good, sir." with the lights still on.
+# An answer to a yes/no question is the word and a courtesy and nothing
+# else, which is the shape _RING_STOP_RX below already uses.
+#
+# The vocabulary is wider than parse_yes_no's on BOTH sides and is kept
+# local for the same reason the decline was: "later" must not start
+# meaning no to a destructive read-back, and "okay" -- absent from
+# _YES_WORDS, so "okay" used to answer this question with total silence --
+# must not start meaning yes to one.
+_BRIEFING_TAIL = r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|then|now))*[?.!]*$"
+_BRIEFING_YES_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?"
+    r"(?:yes|yeah|yep|yup|aye|affirmative|certainly|absolutely|definitely|"
+    r"of course|sure(?: thing)?|ok(?:ay)?|alright|all right|sounds good|"
+    r"very well|please do|do it|do that|run it|go ahead|let'?s hear it|"
+    r"i would|if you would)" + _BRIEFING_TAIL, re.I)
+# "go on" / "carry on" / "continue" are deliberately NOT here and neither
+# is a bare "skip": _READ_CTL_RX owns the first three and "skip" alone is
+# in the live log as a real command routed to local:music
+# (jarvis.log.1:20928). "skip it" / "skip that" are declines, but only when
+# nothing is being read -- see the read-control guard in
+# _try_briefing_offer, which this rung sits ABOVE.
+_BRIEFING_NO_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:no[,\s]+)?"
+    r"(?:no|nope|nah|negative|not now|not today|not right now|not just now|"
+    r"later|maybe later|another time|some other time|in a bit|"
+    r"skip it|skip that|leave it|never mind|nevermind|forget it|no need|"
+    r"i'?m good|i'?m fine)" + _BRIEFING_TAIL, re.I)
+# The wake alarm's 180 s OFFER_TTL_S is the wrong size for THIS offer twice
+# over. It arms its own microphone (app._offer_first_wake_briefing sets
+# _followup_after_speech), so the answer lands inside the follow-up window
+# the question itself opened -- quiz.window_s, 15 s -- and an answer two
+# minutes later is not an answer. And app._question_open reads the same
+# stamp; that predicate also gates _salvage_low_confidence, so a
+# three-minute offer force-accepted sub-threshold garble for three minutes
+# after a question he may never have heard. That argument is already
+# written out against _pending_leave in app._question_open; this is the
+# same one. 60 s: the offer's own line, the 15 s window it opens, and room
+# for one wake-word retry on top.
+BRIEFING_OFFER_TTL_S = 60.0
 # While an alarm rings (spec 5.2 a): these words stop it, "snooze [N]" snoozes.
 _RING_STOP_RX = re.compile(
     r"^(?:stop|dismiss|okay|ok|i'?m up|i am up|shut it off|shut up|enough|"
@@ -7384,16 +7420,20 @@ class Commander:
         # The wake-alarm offer and the exam-week study offer are parked on
         # the SERVICES namespace by briefing.make_tools, and the first-wake
         # briefing offer by app._offer_first_wake_briefing -- not on the
-        # commander, and all three are stamped in wall-clock seconds.
+        # commander, and all three are stamped in wall-clock seconds. The
+        # briefing one carries a shorter life than the other two because it
+        # opens the microphone for its own answer (BRIEFING_OFFER_TTL_S).
         services = getattr(self, "services", None)   # a slim test commander has none
-        for name in ("alarm_offer", "study_offer", "briefing_offer"):
+        for name, ttl in (("alarm_offer", OFFER_TTL_S),
+                          ("study_offer", OFFER_TTL_S),
+                          ("briefing_offer", BRIEFING_OFFER_TTL_S)):
             offer = getattr(services, name, None)
             if isinstance(offer, dict) and offer:
                 try:
                     made = float(offer.get("made_at") or 0.0)
                 except (TypeError, ValueError):
                     made = 0.0
-                if not made or time.time() - made <= OFFER_TTL_S:
+                if not made or time.time() - made <= ttl:
                     return True
         return False
 
@@ -7698,13 +7738,14 @@ class Commander:
         res = self._try_study_offer(text)
         if res is not None:
             return res
-        # 3d''. The first wake of the day asked "Shall I run your morning
-        #       briefing, sir?"; a plain yes runs THAT, and is not a new
-        #       command. Below the study offer because that is the narrower
+        # 3d''. The first wake of the day asked "Shall I run your briefing,
+        #       sir?"; a plain yes runs THAT, and is not a new command.
+        #       Below the study offer because that is the narrower
         #       question; the two can never be live together anyway, since
         #       this rung clears its own offer BEFORE the delivery that
-        #       parks a study one.
-        res = self._try_briefing_offer(text)
+        #       parks a study one. It takes the SOURCE because a spoken
+        #       question cannot be answered from Discord or a tmux shell.
+        res = self._try_briefing_offer(text, source)
         if res is not None:
             return res
         # 3e. A destructive action was read back ("Cancel all three alarms,
@@ -8563,16 +8604,24 @@ class Commander:
             n = quiz_mod.DEFAULT_QUESTIONS
         return _start_review(self, n, topic=str(offer.get("course") or ""))
 
-    def _try_briefing_offer(self, text: str) -> Optional[CommandResult]:
-        """Resolve "Shall I run your morning briefing, sir?" -- the offer
-        that replaced 40 seconds of unbidden monologue on 2026-09-02
+    def _try_briefing_offer(self, text: str,
+                            source: str = "voice") -> Optional[CommandResult]:
+        """Resolve "Shall I run your briefing, sir?" -- the offer that
+        replaced 40 seconds of unbidden monologue on 2026-09-02
         (app._offer_first_wake_briefing parks it on services.briefing_offer).
 
         Same rule as _try_study_offer: a clear yes runs it, a no declines,
         ANYTHING else drops the offer and routes as a new subject, and so
-        does an offer older than OFFER_TTL_S. That last one is what keeps
-        an unrelated "no" -- he says no to a great many things -- from
-        being swallowed by a question he was asked minutes ago.
+        does an offer older than BRIEFING_OFFER_TTL_S.
+
+        What is NOT the same is what counts as a clear yes or no. The other
+        offers ride parse_yes_no; this one has _BRIEFING_YES_RX /
+        _BRIEFING_NO_RX, which are end-anchored, because this offer is put
+        once a day behind an ARBITRARY first request rather than inside a
+        briefing he just heard, and it holds an open microphone. A word bag
+        at that exposure swallowed commands ("skip this song", "later today
+        remind me to call mom", "no, turn the lights off") and delivered
+        the briefing to overheard speech that merely opened with "yeah".
 
         The delivery is a callback carried in the offer: the commander has
         no handle on the app, and the app is where brain.chat and the
@@ -8580,6 +8629,27 @@ class Commander:
         """
         offer = getattr(self.services, "briefing_offer", None)
         if not isinstance(offer, dict) or not offer:
+            return None
+        # A Discord message or a `jarvis "..."` shell turn is a different
+        # room -- app._handle_inner runs this rung for every source -- and
+        # it cannot be the answer to a question that was SPOKEN here. It
+        # used to consume the offer anyway, and because the day is closed
+        # when the question is PUT that spent his only briefing offer of
+        # the day. The offer is LEFT parked: it is not this turn's subject
+        # either. Same line the debrief draws (app._debrief_reply).
+        if source not in ("voice", "typed"):
+            log.debug("briefing offer: %s turn is not its answer", source)
+            return None
+        # "skip it" / "skip that" are declines here and read controls at
+        # rung 4b, which is BELOW this one. Rung 4b's own comment says the
+        # read control must outrank the chains that "would otherwise eat
+        # 'skip' / 'back' / 'pause' / 'go on'" -- so while something is
+        # actually being read, those words belong to the reader and this
+        # rung stands aside with the offer still parked. Narrow on purpose:
+        # a "yes" is not a read control and still answers the question.
+        if read_control_kind(text) is not None and \
+                getattr(self._svc("reader"), "active", False) is True:
+            log.debug("briefing offer: a reading owns %r", text[:40])
             return None
         try:
             self.services.briefing_offer = None
@@ -8589,14 +8659,19 @@ class Commander:
             made = float(offer.get("made_at") or 0.0)
         except (TypeError, ValueError):
             made = 0.0
-        if made and time.time() - made > OFFER_TTL_S:
+        if made and time.time() - made > BRIEFING_OFFER_TTL_S:
             log.info("briefing offer expired; %r is a new subject", text[:40])
             return None
-        answer = parse_yes_no(text)
-        if answer is None:
-            if not _BRIEFING_LATER_RX.match(str(text or "").strip()):
-                return None                  # a new subject: the offer is gone
+        stripped = str(text or "").strip()
+        if _BRIEFING_YES_RX.match(stripped):
+            answer = True
+        elif _BRIEFING_NO_RX.match(stripped):
             answer = False
+        else:
+            # Not answer-SHAPED, so not an answer: the offer is gone and
+            # the words keep their own meaning.
+            log.info("briefing offer: %r is a new subject", text[:40])
+            return None
         if not answer:
             # The day is already closed (the offer closed it when it was
             # put), so this is the end of it until tomorrow -- he can still

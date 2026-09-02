@@ -24,8 +24,8 @@ from unittest.mock import MagicMock
 import pytest
 
 import jarvis.app as app_mod
-from jarvis.commander import (BRIEFING_DECLINED_LINE, Commander,
-                              IntentClassifier)
+from jarvis.commander import (BRIEFING_DECLINED_LINE, BRIEFING_OFFER_TTL_S,
+                              Commander, IntentClassifier)
 from jarvis.config import CONFIG
 from jarvis.tools.briefing import OFFER_TTL_S
 
@@ -88,7 +88,7 @@ class TestTheOfferReplacesTheDelivery:
         _arm(a)
         assert a._briefing_pending
         a._after_speech()
-        assert a.said == ["Shall I run your afternoon briefing, sir?"], a.said
+        assert a.said == ["Shall I run your briefing, sir?"], a.said
         assert a.chats == [], "nothing may be read out until he says yes"
         assert not a._briefing_pending
 
@@ -101,14 +101,21 @@ class TestTheOfferReplacesTheDelivery:
         assert isinstance(a.services.briefing_offer, dict)
         assert callable(a.services.briefing_offer.get("deliver"))
 
-    def test_the_offer_names_the_hour_it_is_actually_made_in(self, monkeypatch, tmp_path):
-        for hour, word in ((7, "morning"), (14, "afternoon"), (19, "evening")):
+    def test_the_offer_says_the_same_hour_free_line_whenever_it_is_put(
+            self, monkeypatch, tmp_path):
+        """The hour word belongs to the MODEL ask, not to the spoken
+        question. Jarvis must not offer a phrase his own grammar refuses:
+        "run my afternoon briefing" reaches nothing and "my evening
+        briefing" is the TOMORROW preview (both measured below)."""
+        for hour in (7, 14, 19):
             a = _app(monkeypatch, tmp_path)
             _clock(monkeypatch, hour)
             (tmp_path / "briefing.json").unlink(missing_ok=True)
             _arm(a)
             a._after_speech()
-            assert a.said == [f"Shall I run your {word} briefing, sir?"], (hour, a.said)
+            assert a.said == ["Shall I run your briefing, sir?"], (hour, a.said)
+        for word in ("morning", "afternoon", "evening"):
+            assert word not in app_mod.BRIEFING_OFFER_LINE
 
     def test_the_wind_down_is_undone_by_the_offer_not_by_the_yes(self, monkeypatch, tmp_path):
         """"The first wake of the day is the morning even when he never
@@ -133,7 +140,7 @@ class TestTheOfferReplacesTheDelivery:
             "two open questions at once is how a yes lands on the wrong one"
         a.commander = SimpleNamespace(question_open=lambda: False)
         a._after_speech()
-        assert a.said == ["Shall I run your afternoon briefing, sir?"]
+        assert a.said == ["Shall I run your briefing, sir?"]
 
 
 class TestAskedOnceIsTheDay:
@@ -181,6 +188,22 @@ class TestAskedOnceIsTheDay:
                          "already raised today"]
         a._briefing_gates = lambda: (("nobody home", lambda now: False),)
         assert a._briefing_block() == "nobody home" and not a._briefing_due()
+
+
+class TestTheOfferDoesNotHoldTheFloorForThreeMinutes:
+    def test_the_open_question_expires_with_the_window_it_opened(
+            self, monkeypatch, tmp_path):
+        """_question_open gates _salvage_low_confidence as well as the mic
+        window (the argument app.py already writes out against
+        _pending_leave). The offer opens a 15 s follow-up window, so
+        holding the floor for the wake alarm's 180 s meant three minutes of
+        force-accepted sub-threshold garble after one question a day."""
+        a = _app(monkeypatch, tmp_path)
+        slim = SimpleNamespace()          # no commander.question_open
+        a.services.briefing_offer = {"made_at": _t.time(), "deliver": lambda: True}
+        assert a._question_open(slim)
+        a.services.briefing_offer["made_at"] = _t.time() - BRIEFING_OFFER_TTL_S - 5
+        assert not a._question_open(slim)
 
 
 class TestWhatIsActuallyDelivered:
@@ -244,7 +267,17 @@ def _offer(cmdr, made=None, ok=True):
 
 
 class TestAnsweringTheOffer:
-    @pytest.mark.parametrize("said", ["yes", "yes please", "go ahead", "please do"])
+    # "okay" / "ok" / "alright" are the commonest casual yesses in the live
+    # log ("jarvis ok delete my last email") and are absent from
+    # commander._YES_WORDS, so they used to answer this question with
+    # COMPLETE SILENCE -- and the day was already closed, so there was no
+    # second ask. They are widened HERE, on this rung, exactly as the
+    # decline side already was.
+    @pytest.mark.parametrize("said", [
+        "yes", "yes please", "yes, sir", "yeah", "yep", "sure", "sure thing",
+        "go ahead", "please do", "do it", "okay", "ok", "OK.", "alright",
+        "all right", "sounds good", "absolutely", "of course", "certainly",
+        "let's hear it", "run it", "okay then", "yes jarvis"])
     def test_a_yes_delivers_it(self, cmdr, said):
         ran = _offer(cmdr)
         res = cmdr.handle(said, "voice")
@@ -252,8 +285,12 @@ class TestAnsweringTheOffer:
         assert res.status.startswith("Briefing")
         assert cmdr.services.briefing_offer is None
 
-    @pytest.mark.parametrize("said", ["no", "no thanks", "not now", "later",
-                                      "maybe later", "skip it"])
+    @pytest.mark.parametrize("said", ["no", "no thanks", "no thank you",
+                                      "not now", "not today", "not just now",
+                                      "later", "later, jarvis", "maybe later",
+                                      "another time", "in a bit", "skip it",
+                                      "skip that", "leave it", "never mind",
+                                      "forget it", "no, not now", "nope"])
     def test_a_no_declines_without_reading_anything(self, cmdr, said):
         ran = _offer(cmdr)
         res = cmdr.handle(said, "voice")
@@ -261,10 +298,78 @@ class TestAnsweringTheOffer:
         assert res.reply == BRIEFING_DECLINED_LINE
         assert cmdr.services.briefing_offer is None
 
+    # THE REGRESSION. The decline regex was start-anchored only, so it
+    # matched as a PREFIX and every one of these was answered "Very good,
+    # sir." with the command inside it lost. "skip" is in the live log
+    # verbatim (jarvis.log.1:20928, routed to local:music), and rung 4b's
+    # own comment says the read control must outrank the chains that would
+    # "otherwise eat 'skip' / 'back' / 'pause' / 'go on'" -- this rung sits
+    # above it and was eating them first.
+    @pytest.mark.parametrize("said", [
+        "skip", "skip this song", "skip the intro", "skip to the next track",
+        "later today remind me to call mom",
+        "later on set a timer for ten minutes", "later gator",
+        "leave it alone", "leave it running",
+        "no, turn the lights off", "no, set a timer for ten minutes",
+        "no, delete my last email", "no music please", "no way",
+        "no problem", "no worries"])
+    def test_a_command_that_merely_begins_with_a_decline_is_not_swallowed(
+            self, cmdr, said):
+        ran = _offer(cmdr)
+        res = cmdr.handle(said, "voice")
+        assert ran == [], said
+        assert res is None or res.reply != BRIEFING_DECLINED_LINE, said
+        assert res is None or not str(res.status or "").startswith("Briefing"), said
+
+    # The other half of the same defect: parse_yes_no waives its own
+    # >6-word overheard-speech guard when the first word is a yes/no word,
+    # so a sentence that merely OPENS with "yeah" delivered the whole
+    # 40-second briefing. The first line here is real: jarvis.log.1:19499,
+    # handle 'Yeah, so you should be able to look that up.' source=voice --
+    # not an answer to anything; it routed to a web lookup.
+    @pytest.mark.parametrize("said", [
+        "Yeah, so you should be able to look that up.",
+        "yes I already told him it was fine this morning",
+        "no I do not think that is what she meant at all",
+        "sure but only after the presentation on Thursday"])
+    def test_overheard_speech_that_opens_with_yes_or_no_is_not_an_answer(
+            self, cmdr, said):
+        ran = _offer(cmdr)
+        res = cmdr.handle(said, "voice")
+        assert ran == [], said
+        assert res is None or res.reply != BRIEFING_DECLINED_LINE, said
+
     def test_a_new_subject_silently_drops_the_offer(self, cmdr):
         ran = _offer(cmdr)
         cmdr.handle("what's the time", "voice")
         assert cmdr.services.briefing_offer is None and ran == []
+
+    @pytest.mark.parametrize("source", ["discord", "cli", "api"])
+    def test_a_turn_from_another_room_neither_answers_nor_eats_the_offer(
+            self, cmdr, source):
+        """_handle_inner runs this rung for EVERY source, and it used to
+        clear the offer whatever the source. The day is closed when the
+        question is put, so a Discord message inside the window spent the
+        only briefing offer of the day."""
+        ran = _offer(cmdr)
+        cmdr.handle("what's the weather", source)
+        assert isinstance(cmdr.services.briefing_offer, dict), source
+        assert ran == []
+        res = cmdr.handle("yes", "voice")       # still answerable by voice
+        assert ran == [1] and res.status.startswith("Briefing")
+
+    def test_a_reading_in_progress_keeps_its_own_skip(self, cmdr):
+        """"skip it" is a decline here and a read control at rung 4b, which
+        is BELOW this one. While something is actually being read the
+        reader owns it, and the offer is left standing."""
+        cmdr.services.reader = SimpleNamespace(
+            active=True, skip=lambda: SimpleNamespace(ok=True, message="Skipped."))
+        ran = _offer(cmdr)
+        res = cmdr.handle("skip it", "voice")
+        assert ran == []
+        assert res is not None and res.reply != BRIEFING_DECLINED_LINE
+        assert isinstance(cmdr.services.briefing_offer, dict), "the offer still stands"
+        assert cmdr.handle("yes", "voice").status.startswith("Briefing")
 
     def test_a_stale_offer_is_not_taken(self, cmdr):
         ran = _offer(cmdr, made=_t.time() - OFFER_TTL_S - 10)
@@ -272,9 +377,22 @@ class TestAnsweringTheOffer:
         assert ran == []
         assert res is None or res.status != "Briefing…"
 
-    def test_an_unrelated_no_is_not_swallowed(self, cmdr):
+    def test_it_goes_stale_with_its_own_window_not_the_wake_alarms(self, cmdr):
+        """The offer opens the mic for its own answer (quiz.window_s, 15 s).
+        An answer that arrives a minute and a half later is not an answer,
+        and the wake alarm's 180 s is what made the false-yes window large."""
+        assert BRIEFING_OFFER_TTL_S < OFFER_TTL_S
+        ran = _offer(cmdr, made=_t.time() - BRIEFING_OFFER_TTL_S - 5)
+        res = cmdr.handle("yes", "voice")
+        assert ran == []
+        assert res is None or res.status != "Briefing…"
+        assert not cmdr.question_open()
+
+    def test_a_bare_no_outside_a_live_offer_reaches_what_comes_next(self, cmdr):
         """He says no to a great many things. With no offer armed -- and
-        with a stale one -- a bare "no" must reach whatever comes next."""
+        with a stale one -- a bare "no" must reach whatever comes next.
+        (A bare "no" to a LIVE offer IS the decline; it is
+        "no, <command>" that must survive, above.)"""
         assert cmdr.services.briefing_offer is None
         res = cmdr.handle("no", "voice")
         assert res is None or res.reply != BRIEFING_DECLINED_LINE
@@ -292,3 +410,39 @@ class TestAnsweringTheOffer:
         assert cmdr.question_open()
         cmdr.services.briefing_offer = None
         assert not cmdr.question_open()
+
+
+class TestTheOfferSaysSomethingHeCanRepeat:
+    """Finding from review, verified against a real Commander: the line
+    Jarvis spoke was not a phrase his own command grammar accepts.
+
+    After a decline -- or after the offer is dropped by a new subject --
+    echoing his own words back at him is the natural retry, and it landed
+    on nothing (afternoon) or on TOMORROW's preview (evening).
+    """
+
+    def test_the_offer_can_be_echoed_straight_back_and_runs_the_briefing(self, cmdr):
+        echo = (app_mod.BRIEFING_OFFER_LINE.lower()
+                .replace("shall i ", "").replace("your ", "my ")
+                .replace(", sir?", "").strip())
+        res = cmdr.handle(echo, "voice")
+        assert res is not None and res.status == "Briefing…", (echo, res)
+        cmdr.services.brain.chat.assert_called_once()
+        assert cmdr.services.brain.chat.call_args.kwargs.get("force_tool") == "get_briefing"
+
+    @pytest.mark.parametrize("said", ["my briefing", "run my briefing", "briefing"])
+    def test_the_briefing_is_still_one_sentence_away_after_a_decline(self, cmdr, said):
+        _offer(cmdr)
+        assert cmdr.handle("no thanks", "voice").reply == BRIEFING_DECLINED_LINE
+        assert cmdr.handle(said, "voice").status == "Briefing…", said
+
+    @pytest.mark.parametrize("word", ["morning", "afternoon", "evening"])
+    def test_an_hour_worded_offer_would_not_have_reached_todays_briefing(
+            self, cmdr, word):
+        """Why the arc word is not in the spoken line. "my afternoon
+        briefing" matches nothing (_BRIEFING_RX carries no arc words) and
+        "my evening briefing" is _PREVIEW_RX, which forces when=tomorrow --
+        registered BELOW _BRIEFING_RX, so widening that one to take the arc
+        words would steal the evening preview instead."""
+        res = cmdr.handle(f"my {word} briefing", "voice")
+        assert res is None or res.status != "Briefing…", word

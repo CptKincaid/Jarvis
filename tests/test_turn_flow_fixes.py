@@ -111,7 +111,7 @@ def test_the_briefing_offer_waits_for_the_answers_own_falling_edge(monkeypatch, 
     assert a.said == [] and a._briefing_pending
     a._turn_busy.clear()
     a._after_speech()                                   # the answer's falling edge
-    assert a.said == ["Shall I run your morning briefing, sir?"]
+    assert a.said == ["Shall I run your briefing, sir?"]
     assert a.chats == [], "the briefing itself waits for a yes"
     assert not a._briefing_pending
     assert json.loads((tmp_path / "briefing.json").read_text())["delivered"] == "2026-08-30"

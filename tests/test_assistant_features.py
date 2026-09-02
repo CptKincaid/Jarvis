@@ -245,7 +245,7 @@ def test_first_wake_briefing_is_due_once_a_day_after_the_hour(monkeypatch, tmp_p
     # The day closes on the question being put, so the once-a-day latch is
     # unchanged -- it is now "asked once", not "read out once".
     assert a.chats == [], "nothing is read out until he says yes"
-    assert a.said == ["Shall I run your morning briefing, sir?"]
+    assert a.said == ["Shall I run your briefing, sir?"]
     assert a._briefing_due(_Clock.fixed) is False, "raised today: not again"
 
 

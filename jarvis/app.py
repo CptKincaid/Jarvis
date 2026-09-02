@@ -79,10 +79,11 @@ from jarvis import garden as garden_mod
 from jarvis.dialogue import SESSION_WINDOW_S
 from jarvis.faults import FaultBoard, FaultLog
 from jarvis.brain import JarvisBrain
-from jarvis.commander import (COURTESY_BY_REGISTER, COURTESY_REPLIES,
-                              DESTRUCTIVE_TTL_S, LEAVE_ANSWER_WINDOW_S,
-                              REGISTER_LINES, CommandResult, Commander,
-                              parse_yes_no, strip_jarvis_prefix)
+from jarvis.commander import (BRIEFING_OFFER_TTL_S, COURTESY_BY_REGISTER,
+                              COURTESY_REPLIES, DESTRUCTIVE_TTL_S,
+                              LEAVE_ANSWER_WINDOW_S, REGISTER_LINES,
+                              CommandResult, Commander, parse_yes_no,
+                              strip_jarvis_prefix)
 from jarvis.context import ContextEngine
 from jarvis.history import TypedHistory
 from jarvis.hotword import Hotword
@@ -190,10 +191,18 @@ NUDGE_LINE = "Sir?"
 NOT_CAUGHT_LINE = "I did not catch that, sir. Do try me again."
 GUEST_LINE = "I only answer to {name}, sir."
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
-# offer"). {when} is arc.greeting_word() so the question names the hour it
-# is actually asked in: all three deliveries in the retained logs landed in
-# the afternoon while the code said "morning".
-BRIEFING_OFFER_LINE = "Shall I run your {when} briefing, sir?"
+# offer").
+#
+# No hour word in it, though the MODEL is still asked for the briefing of
+# the hour (_deliver_first_wake_briefing). Jarvis must not say a phrase his
+# own grammar refuses: measured against a real Commander, "run my afternoon
+# briefing" reaches nothing at all (_BRIEFING_RX, commander.py, has no arc
+# words) and "my evening briefing" is _PREVIEW_RX -- TOMORROW's preview,
+# the wrong day. All three real incidents landed between 14:29 and 15:00,
+# so "your afternoon briefing" is the wording he would have echoed back to
+# silence. "my briefing" and "run my briefing" both reach _h_briefing, so
+# that is what he is offered.
+BRIEFING_OFFER_LINE = "Shall I run your briefing, sir?"
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
 # The sources that arrive from somewhere other than this desk: a shell /
@@ -2571,8 +2580,17 @@ class JarvisApp:
         # the services namespace, not on the commander: briefing.make_tools
         # parks one there for _try_alarm_offer and
         # app._offer_first_wake_briefing the other for _try_briefing_offer.
+        #
+        # The briefing offer's life here is BRIEFING_OFFER_TTL_S, not the
+        # wake alarm's 180 s, for the reason written two paragraphs up
+        # about _pending_leave: this predicate gates _salvage_low_confidence
+        # as well as the mic window, and the briefing offer is put once
+        # EVERY day behind an arbitrary request, so three minutes of
+        # force-accepted garble after it was the largest instance of
+        # exactly that bug.
         services = getattr(self, "services", None)
-        for name in ("alarm_offer", "briefing_offer"):
+        for name, ttl in (("alarm_offer", OFFER_TTL_S),
+                          ("briefing_offer", BRIEFING_OFFER_TTL_S)):
             offer = getattr(services, name, None)
             if not isinstance(offer, dict) or not offer:
                 continue
@@ -2580,7 +2598,7 @@ class JarvisApp:
                 made = float(offer.get("made_at") or 0.0)
             except (TypeError, ValueError):
                 made = 0.0
-            if not made or time.time() - made <= OFFER_TTL_S:
+            if not made or time.time() - made <= ttl:
                 return True
         return False
 
@@ -2779,7 +2797,7 @@ class JarvisApp:
                 wd.restore()
             except Exception:
                 log.exception("wind-down restore at first wake failed")
-        line = BRIEFING_OFFER_LINE.format(when=arc_mod.greeting_word(datetime.now()))
+        line = BRIEFING_OFFER_LINE
         log.info("first wake of the day: offering the briefing")
         # Marked BEFORE speaking, as the weekly review is: a TTS failure
         # must not turn one question a day into one per utterance.

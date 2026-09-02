@@ -21,7 +21,7 @@ import pytest
 
 import jarvis.app as app_mod
 import jarvis.recorder as recorder_mod
-from jarvis.commander import DESTRUCTIVE_TTL_S
+from jarvis.commander import BRIEFING_OFFER_TTL_S, DESTRUCTIVE_TTL_S
 from jarvis.config import CONFIG
 from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.tools.quiz import QuizSession
@@ -187,11 +187,16 @@ def test_a_read_back_and_an_objection_are_both_questions():
 
 def test_both_briefing_offers_are_questions():
     """The wake-alarm offer AND the exam-week study offer are parked on the
-    services namespace by briefing.make_tools; the study one was the miss."""
-    for name in ("alarm_offer", "study_offer"):
+    services namespace by briefing.make_tools; the study one was the miss.
+
+    The first-wake briefing offer is a third, and it holds the floor for
+    its OWN, shorter life: it opens the microphone for its answer, and this
+    predicate gates _salvage_low_confidence as well as the mic window."""
+    for name, ttl in (("alarm_offer", OFFER_TTL_S), ("study_offer", OFFER_TTL_S),
+                      ("briefing_offer", BRIEFING_OFFER_TTL_S)):
         c = _commander(**{name: {"made_at": time.time(), "n": 10}})
         assert c.question_open() is True, name
-        getattr(c.services, name)["made_at"] = time.time() - OFFER_TTL_S - 1
+        getattr(c.services, name)["made_at"] = time.time() - ttl - 1
         assert c.question_open() is False, name
         setattr(c.services, name, {})
         assert c.question_open() is False, name
