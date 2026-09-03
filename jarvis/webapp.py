@@ -915,14 +915,18 @@ class _Handler(BaseHTTPRequestHandler):
         return start, min(end, total - 1)
 
     def _stream_clip(self, rend, started: float):
-        """Chunked, so the first sentence is already on the phone while the
-        second is still on the GPU.
+        """Chunked, so the phone is playing while the Spark is still
+        rendering: on a streaming engine that is the first BLOCK of the
+        first chunk (~0.3 s in, whatever the reply's length), and on one
+        that renders whole chunks it is the first chunk. See tts.Rendition.
 
         The generator's first item is the wav header, and it does not exist
-        until the first chunk has actually rendered -- which is why it is
-        pulled BEFORE the response line goes out. A render that is going to
-        fail then fails while an error can still be sent, instead of
-        committing a 200 and hanging up in the middle of a clip.
+        until that first audio does -- which is why it is pulled BEFORE the
+        response line goes out. A render that is going to fail then fails
+        while an error can still be sent, instead of committing a 200 and
+        hanging up in the middle of a clip. It is also why the wait for it
+        has to stay short: nothing at all reaches the phone until it
+        returns.
         """
         blocks = rend.stream()
         try:
