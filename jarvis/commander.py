@@ -5282,18 +5282,110 @@ def _h_ui_look(c, t, m):
 # file; they are accepted only AFTER a pane noun, where "clear the chat
 # history" can mean nothing else.
 _TRANSCRIPT_NOUN = r"(?:transcript|screen|display|console|chat|conversation)"
+# THE LEFT EDGE (added 2026-09-03, review).  _JV alone is the house
+# convention -- 41 rungs open with it and exactly one, _ADJUST_SCHED_RX,
+# also takes a leading "please" -- but on THIS rung that convention lands
+# his ordinary phrasing in the very silent drop the rung was built to end:
+# measured through the shipping ladder, "please clear the transcript",
+# "can you clear the transcript", "go ahead and clear the transcript" and
+# even the explicitly-addressed "jarvis please clear the transcript" all
+# reached NO rung and were handed to a model that has no tool to clear
+# anything.  Repeated (`*`) because "please can you" and "jarvis, go ahead
+# and" are each one breath; every alternative eats a whole word plus its
+# space, so the group cannot spin on an empty match.  It sits on BOTH
+# sides of _JV -- he says "jarvis, please clear..." and "please, jarvis,
+# clear..." interchangeably.
+#
+# Widening the LEFT edge cannot reach his lists.  The language is still
+# end-anchored on the closed pane-noun set below, and "list" is in neither
+# that set nor the trailing words, so "please clear the shopping list"
+# still cannot match at all -- the negative table in
+# tests/test_clear_transcript.py asserts every one of his logged list
+# utterances against the shipping dispatch order, not against this regex
+# alone.
+_LEAD_COURTESY = (r"(?:(?:please|can you|could you|would you|will you|just|"
+                  r"go ahead and|let's|lets),?\s+)*")
 _TRANSCRIPT_CLEAR_RX = re.compile(
-    r"^" + _JV +
+    r"^" + _LEAD_COURTESY + _JV + _LEAD_COURTESY +
     r"(?:clear|wipe|erase|empty|blank|clean|scrub|reset)\s+(?:out\s+)?"
-    r"(?:the|my|this|your)?\s*" + _TRANSCRIPT_NOUN +
+    # "that" was missing while "this" and "your" were in, so "clear that
+    # transcript" was dropped in silence -- the same class of miss as the
+    # 23:26:01 log line this rung answers.  The set is now the union of
+    # this one and _LIST_CLEAR_RX's (my|the|our), so the two no longer
+    # differ for no stated reason; a determiner cannot cause a collision,
+    # the noun after it can, and that set is closed.
+    r"(?:the|my|this|that|your|our)?\s*(?:(?:whole|entire|full)\s+)?"
+    + _TRANSCRIPT_NOUN +
     r"(?:\s+(?:pane|panel|window|view|log|history|area))?"
     r"(?:\s+(?:clean|out|off))?"
+    r"(?:\s+(?:right\s+)?now)?"
     r"(?:[, ]+(?:please|jarvis|sir|for me|would you|will you|thanks))*"
     r"[?.!]*$", re.I)
 # Both facts in one breath: the memory is untouched, and the cards do not
 # come back. No read-back and no undo= go with it -- see _h_transcript_clear.
 TRANSCRIPT_CLEAR_LINE = ("Screen's clear, sir. Nothing forgotten — "
                          "and nothing to bring back.")
+
+
+def _standing_questions(c) -> int:
+    """How many approval questions are still waiting on him.
+
+    TranscriptView.clear_all deliberately KEEPS an unanswered approval
+    card -- it carries the only hand-answerable ALLOW / DENY for a Claude
+    run that is blocked on it -- so in that one case the pane is NOT clear
+    when the wipe lands, and "Screen's clear, sir" would be the wrong
+    thing to say.  The wipe itself is fire-and-forget (the commander runs
+    on worker threads and must never touch a Tk surface), so the fact is
+    read from the approvals SERVICE, which is the same fact the pane is
+    keying on: ApprovalService.pending() holds exactly the requests whose
+    cards are unanswered, and answer()/_resolve() is the only thing that
+    empties it.
+
+    Reading it here rather than reporting it back from the window is also
+    the only version that cannot lose a race: a Status published from
+    inside _ev_transcript_clear lands BEFORE the CommandResult's own
+    status (the bus is a queue, and _emit_result publishes the reply and
+    the status after the wipe was queued), so the window's correction
+    would be overwritten by the flat "Transcript cleared".
+
+    Never raises and never blocks the wipe: with no approvals service, or
+    a service that throws, this answers 0 and the plain line is spoken.
+    """
+    ap = c._svc("approvals") if hasattr(c, "_svc") else None
+    if ap is None:
+        return 0
+    try:
+        return len(ap.pending() or ())
+    except Exception:                           # noqa: BLE001 - cosmetic
+        log.exception("approvals.pending failed; reporting a plain wipe")
+        return 0
+
+
+def transcript_clear_line(held: int) -> str:
+    """The spoken confirmation, told plainly: what he actually got.
+
+    The brief's rule for this rung was to say what happened rather than
+    leave it to be guessed at, which is why the plain line names both the
+    memory and the missing undo.  The held case is the same rule: he hears
+    that one card stayed and why, instead of hearing "Screen's clear" and
+    seeing a card, with an 1800 ms toast as the only correction.
+    """
+    if held <= 0:
+        return TRANSCRIPT_CLEAR_LINE
+    what = "one question" if held == 1 else f"{held} questions"
+    those = "that card" if held == 1 else "those cards"
+    return (f"Screen's clear bar {what} still waiting on you, sir — "
+            f"I've left {those} up. Nothing forgotten, and nothing to "
+            f"bring back.")
+
+
+def transcript_clear_status(held: int) -> str:
+    """The status strip's line -- it outlives the toast, which is the
+    point: the toast under the held card is gone in 1.8 s."""
+    if held <= 0:
+        return "Transcript cleared"
+    s = "" if held == 1 else "s"
+    return f"Transcript cleared — {held} question{s} left standing"
 
 
 def _h_transcript_clear(c, t, m):
@@ -5315,10 +5407,16 @@ def _h_transcript_clear(c, t, m):
     screen wipe would only stand between him and an empty pane. undo=None
     leaves "scratch that" its old meaning rather than offering a restore
     this rung cannot honour -- which is exactly why the line says so.
+
+    The one case where the pane does NOT come out empty -- a question still
+    waiting on him, which clear_all keeps on purpose -- is counted BEFORE
+    the wipe is queued and said out loud, so the reply and the status strip
+    both match the glass. See _standing_questions.
     """
+    held = _standing_questions(c)
     bus.publish(ClearTranscript())
-    return CommandResult(handled=True, reply=TRANSCRIPT_CLEAR_LINE, speak=True,
-                         status="Transcript cleared")
+    return CommandResult(handled=True, reply=transcript_clear_line(held),
+                         speak=True, status=transcript_clear_status(held))
 
 
 def _dnd_seconds(c, mode: str, when: str, now: datetime) -> Optional[float]:

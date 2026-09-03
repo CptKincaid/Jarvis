@@ -36,7 +36,8 @@ import pytest
 
 from jarvis.commander import (ASSISTANT_TIER1, REGISTRY, Commander,
                               IntentClassifier, TRANSCRIPT_CLEAR_LINE,
-                              _TRANSCRIPT_CLEAR_RX)
+                              _TRANSCRIPT_CLEAR_RX, transcript_clear_line,
+                              transcript_clear_status)
 from jarvis.config import CONFIG
 from jarvis.events import ClearTranscript, bus
 from jarvis.router import Router
@@ -68,6 +69,30 @@ SAYS_CLEAR_IT = (
     "wipe the screen clean",
     "clear the transcript window",
     "clear the screen for me",
+    # The LEFT edge (review, 2026-09-03).  Every one of these reached NO
+    # rung before the courtesy prefix went in: the first eight ended at
+    # "Thinking...", handed to a model with no tool to clear anything, and
+    # the rest at "Was that for me?".  "jarvis please ..." is on the list
+    # because being explicitly ADDRESSED did not save it either.
+    "please clear the transcript",
+    "jarvis please clear the transcript",
+    "jarvis, please clear the transcript",
+    "please, jarvis, clear the transcript",
+    "can you clear the transcript",
+    "can you please clear the screen",
+    "could you clear the transcript",
+    "would you clear the transcript",
+    "go ahead and clear the transcript",
+    "let's clear the transcript",
+    "just clear the transcript",
+    "clear the transcript now",
+    "clear the whole transcript",
+    "wipe that display right now",
+    # "that" was missing while "this" and "your" were in.
+    "clear that transcript",
+    "clear that screen",
+    "clear this transcript",
+    "clear our chat",
 )
 
 # Negatives.  The first four are HIS, off the log; the rest are ordinary
@@ -97,6 +122,27 @@ MEANS_SOMETHING_ELSE = (
     "clear the log",
     "clear the history",
     "clear the screen list",
+    # The same courtesies on the other side of the collision: widening the
+    # LEFT edge must not have bought his lists a way in.  It cannot --
+    # the language is still end-anchored on the pane nouns, and "list" is
+    # in neither that set nor the tail -- and these say so out loud.
+    "please clear the shopping list",
+    "jarvis please clear the shopping list",
+    "can you clear my grocery list",
+    "could you clear the to do list",
+    "go ahead and clear the shopping list",
+    "just clear my shopping list",
+    "clear that shopping list",
+    "clear the whole shopping list",
+    "clear that list",
+    "clear our list",
+    "clear the shopping list now",
+    # ...and ordinary speech that now opens with an accepted courtesy.
+    "let's clear the air",
+    "just clear my head",
+    "can you clear that up",
+    "please clear my calendar",
+    "go ahead and clear the garage",
 )
 
 
@@ -279,6 +325,86 @@ def test_a_screen_wipe_is_not_read_back_and_is_not_undoable(commander, cleared):
     assert commander._pending_destructive is None
     assert res.undo is None
     assert len(cleared) == 1                    # ran now, not on a "yes"
+
+
+def _standing(commander, n: int):
+    """Make the approvals service report n questions waiting on him."""
+    commander._svc("approvals").pending.return_value = [object()] * n
+
+
+def test_a_question_left_standing_changes_the_words_he_hears(
+        commander, cleared):
+    """clear_all KEEPS an unanswered approval card on purpose -- it holds
+    the only hand-answerable ALLOW / DENY for a blocked Claude run -- so
+    in that one case the pane is not clear when the wipe lands.  He used
+    to hear "Screen's clear, sir" and see a card, with an 1800 ms toast as
+    the only correction."""
+    _standing(commander, 1)
+    res = commander.handle("clear the transcript", source="voice")
+    assert len(cleared) == 1                    # the wipe still happens
+    assert res.reply != TRANSCRIPT_CLEAR_LINE
+    low = res.reply.lower()
+    assert "one question" in low and "still waiting" in low
+    # ...and the two facts the plain line carries are still both in it.
+    assert "forgotten" in low and "bring back" in low
+
+
+def test_the_status_strip_says_it_too_because_the_toast_does_not_last(
+        commander, cleared):
+    """The pane's own notice is a Toast, gone in 1800 ms (widgets.py).
+    The status strip is where a correction can still be read afterwards,
+    so the flat "Transcript cleared" is not what goes there."""
+    _standing(commander, 1)
+    res = commander.handle("clear the transcript", source="voice")
+    assert res.status != "Transcript cleared"
+    assert "1 question" in res.status and "standing" in res.status
+    _standing(commander, 3)
+    res = commander.handle("clear the transcript", source="voice")
+    assert "3 questions" in res.status
+
+
+def test_two_questions_left_standing_are_counted_not_pluralised_wrongly(
+        commander, cleared):
+    _standing(commander, 2)
+    res = commander.handle("clear the transcript", source="voice")
+    low = res.reply.lower()
+    assert "2 questions" in low and "those cards" in low
+    assert "one question" not in low
+
+
+def test_nothing_waiting_still_gets_the_plain_line(commander, cleared):
+    _standing(commander, 0)
+    res = commander.handle("clear the transcript", source="voice")
+    assert res.reply == TRANSCRIPT_CLEAR_LINE
+    assert res.status == "Transcript cleared"
+
+
+def test_a_broken_or_absent_approvals_service_never_holds_up_the_wipe(
+        commander, cleared):
+    """The count is a courtesy on top of the wipe, never a precondition
+    for it: a service that throws, or is not there at all, must still
+    empty the pane and say the plain line."""
+    commander._svc("approvals").pending.side_effect = RuntimeError("down")
+    res = commander.handle("clear the transcript", source="voice")
+    assert res.reply == TRANSCRIPT_CLEAR_LINE
+    assert len(cleared) == 1
+    commander.services.approvals = None
+    res = commander.handle("clear the transcript", source="voice")
+    assert res.reply == TRANSCRIPT_CLEAR_LINE
+    assert len(cleared) == 2
+
+
+def test_the_spoken_count_is_the_count_the_pane_actually_keeps():
+    """The two ends of the same fact, tied together: ApprovalService
+    .pending() is what the commander counts, and `not answered` is what
+    TranscriptView.clear_all keeps.  One unanswered request, one card left
+    on the glass, one question in the line he hears."""
+    pane = _Pane(cards=2)
+    pane.add_approval_stub("req-1")             # unanswered == still pending
+    pane.clear_all()
+    assert len(pane._cards) == 1
+    assert "one question" in transcript_clear_line(len(pane._cards)).lower()
+    assert "1 question" in transcript_clear_status(len(pane._cards))
 
 
 def test_his_shopping_list_still_gets_its_read_back_not_a_screen_wipe(
