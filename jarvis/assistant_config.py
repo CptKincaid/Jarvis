@@ -52,8 +52,12 @@ DEFAULTS: dict = {
     "google_ical_urls": [],
     "icloud": {"apple_id": "", "app_password": "",
                "url": "https://caldav.icloud.com"},
+    # Reading uses imap_host; SENDING uses smtp_host (jarvis/outbox.py). A
+    # per-account entry in `accounts` may carry its own smtp_host; without
+    # one, mail.smtp_host() rewrites imap.x -> smtp.x, which is right for
+    # Gmail and for everything else that names its servers that way.
     "gmail": {"address": "", "app_password": "", "imap_host": "imap.gmail.com",
-              "accounts": []},
+              "smtp_host": "smtp.gmail.com", "accounts": []},
     "claude": {
         "allowed_dirs": ["/home/hunterp/Jarvis", "/home/hunterp/haymaker-digest"],
         "projects_root": "/home/hunterp/projects",
@@ -683,6 +687,34 @@ DEFAULTS: dict = {
     "phone": {"enabled": False, "bind": "", "port": 8765, "token": "",
               "max_audio_mb": 8, "link_file": "~/jarvis-phone.txt",
               "qr_file": "~/jarvis-phone.svg"},
+    # "Email this file to this person" (jarvis/outbox.py). Nothing here
+    # switches the feature on or off: it is on, and what makes it safe is
+    # the spoken read-back and the yes, not a flag.
+    #
+    # `roots` are the ONLY folders a spoken file NAME may resolve inside --
+    # ~ is a whole filesystem and "the lab report" must not be able to reach
+    # a README three levels down a checkout. An absolute path he gives
+    # outright is allowed outside them (filephrase.DENY_ROOTS says what is
+    # still refused there: anything behind a leading dot, anything under a
+    # system tree).
+    #
+    # `max_mb` may only be lowered. 18 MB is what Gmail will actually
+    # deliver once base64 has inflated the file by 4/3 inside a 25 MB
+    # limit; a bigger number here would not send a bigger file, it would
+    # move the refusal to the SMTP server AFTER the read-back had promised
+    # the thing went.
+    #
+    # `contacts` is a name -> address map, checked before the people book
+    # in jarvis/memory.py. Both are consulted and NEITHER is guessed at: an
+    # unknown name is a question, never a plausible address.
+    #
+    # `from` is a label from gmail.accounts. Blank with more than one
+    # account configured means Jarvis asks which identity to send as, which
+    # is the right default -- personal, work and school are three different
+    # people to whoever receives the mail.
+    "send_file": {"roots": ["~/Desktop", "~/Downloads", "~/Documents"],
+                  "max_mb": 18, "from": "", "contacts": {},
+                  "body": "Sent from Jarvis."},
     # HPCOMPUTER -- files both ways and a short allow-list of read-only
     # questions (jarvis/tools/remote.py).  Ships OFF and EMPTY because as of
     # 2026-09-02 the host is not on the tailnet at all, has no sshd

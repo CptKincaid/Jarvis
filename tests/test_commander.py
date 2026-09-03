@@ -1648,6 +1648,10 @@ TIER1_SAMPLES = {
     "briefing section": "no news in the morning",
     "verbosity": "shorter briefings",
     "last mail": "what was my last email",
+    # The send-a-file family. The sample is his own phrasing from the
+    # brief; it arms a read-back and never a send, so the gate test can
+    # run it safely.
+    "send file": "email the lab report to heather",
     "liked songs": "play my liked songs",
     "music resume": "start playing my spotify",   # the 20:56:42 clause
     "diagnostics": "run diagnostics",

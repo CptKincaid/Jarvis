@@ -158,9 +158,21 @@ Passwords section).
 "gmail": {"address": "<you@gmail.com>", "app_password": "<16-char-app-password>", "imap_host": "imap.gmail.com"}
 ```
 
-Jarvis only reads: `SELECT INBOX` read-only, `BODY.PEEK`, so nothing is
-marked read and nothing is sent. Message bodies are never logged. A Google
+Reading is read-only by construction: `SELECT INBOX` read-only, `BODY.PEEK`,
+so nothing is ever marked read. Message bodies are never logged. A Google
 Workspace account uses the same host.
+
+Jarvis can also **send** a file (section 81 below). Sending uses the same
+app password over SMTP and adds one key:
+
+```json
+"gmail": {"address": "<you@gmail.com>", "app_password": "<16-char-app-password>",
+          "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com"}
+```
+
+Leave `smtp_host` out and it is worked out from `imap_host`
+(`imap.x` -> `smtp.x`). Nothing is ever sent without you saying yes out
+loud first.
 
 ## 6. Discord (away alerts, two-way)
 
@@ -3903,3 +3915,88 @@ in your network:
 * Answers are slow the first time and quick after: read the line the page
   prints when the link is the slow half. See "Why is the first question
   slow?" above — it is the tailnet finding a direct path, not Jarvis.
+
+
+## 81. Emailing a file: "email the lab report to Heather"
+
+Say it the way you would say it to a person:
+
+```
+"Jarvis, email the lab report to Heather"
+"send the PDF I just downloaded to my brother"
+"email that file on my desktop to heather@example.com from my school account"
+"send Heather the biosensors handout"
+```
+
+**Nothing is sent by the first sentence.** Jarvis finds the file, works out
+who you mean and which of your accounts to use, and then reads the whole
+thing back:
+
+> "Biosensors Lab Handout v2.pdf, 5 kilobytes, to Heather, at heather at
+> example dot com, from your school account. Send it, sir?"
+
+Say **yes** (or "send it", "go ahead", "do it") and it goes. Say **no**
+(or "not that one", "wrong file", "hold on") and it is dropped. Say
+anything else — change the subject, ask a different question — and the draft
+is thrown away and your sentence keeps its own meaning. A vague "okay" or
+"sure" gets asked once more rather than obeyed: this is the one question in
+the app where "probably yes" is not enough, because an email cannot be
+recalled.
+
+### When it asks instead of guessing
+
+| What happened | What you hear |
+|---|---|
+| Two files fit the name | "I've 2 that could be the lab report, sir: lab report.pdf or lab report final.pdf. Which one?" |
+| Nothing fits | "I can't find a file by that name, sir." |
+| You did not name a file at all | "Which file, sir?" |
+| The person is not in the book | "I've no address for Dana, sir. What is it?" |
+| More than one account, and you did not say which | "Which account should I send from, sir — personal, work or school?" |
+
+It never guesses an address from a name, and it never picks between two
+files that fit equally well.
+
+### When it refuses
+
+* the file is a folder, is unreadable, or has gone;
+* it is over **18 MB** — Gmail will not carry more once the attachment is
+  encoded, so a bigger limit would only turn a spoken refusal into a bounce
+  after Jarvis had already said it went;
+* the name resolves **outside** `~/Desktop`, `~/Downloads` and
+  `~/Documents` — a symlink on the desktop pointing somewhere else is
+  refused, not followed;
+* an explicit path you give outright (`~/projects/thesis.pdf`) **is**
+  allowed outside those folders, but never into a dot-folder (`~/.ssh`,
+  `~/.gnupg`, `~/.config`) or a system tree (`/etc`, `/usr`, ...).
+
+### Configuration
+
+```json
+"send_file": {
+  "roots": ["~/Desktop", "~/Downloads", "~/Documents"],
+  "max_mb": 18,
+  "from": "",
+  "contacts": {"heather": "heather@example.com", "brother": "sam@example.com"},
+  "body": "Sent from Jarvis."
+}
+```
+
+* `roots` — the only folders a spoken file *name* may resolve inside.
+* `max_mb` — may only be lowered; 18 is the Gmail ceiling.
+* `from` — a label from `gmail.accounts`. Leave it blank with more than one
+  account and Jarvis asks which identity to send as, which is usually what
+  you want: personal, work and school are three different people to whoever
+  receives the mail.
+* `contacts` — a plain name-to-address map, checked before the people book
+  ("my advisor is Dr Peyrovi"). Both are consulted; neither is guessed at.
+
+### Things it deliberately will not do
+
+* **Texts and calls.** Out of scope by decision, not by omission —
+  "send Heather a text" is recognised and left alone.
+* **Reply, forward, delete.** This makes a new message with an attachment
+  and nothing else.
+* **Anything the model decides.** There is no tool the local model can call
+  to send mail; the only path is a sentence you said and a yes you gave.
+
+Restart Jarvis after editing `assistant.json`, as with every other setting.

@@ -1,11 +1,19 @@
-"""Gmail summaries over IMAP (spec section 6.6).
+"""Gmail over IMAP (reading, spec 6.6) and SMTP (sending, 2026-09-02).
 
-Read-only by construction: ``SELECT INBOX`` readonly, ``BODY.PEEK`` for
-every fetch, so nothing is ever marked read. Stdlib only (``imaplib``,
-``email``). The IMAP class is an argument (``imap=imaplib.IMAP4_SSL``) so
-tests drive it with a fake returning canned RFC 822 bytes.
+The READ side is read-only by construction: ``SELECT INBOX`` readonly,
+``BODY.PEEK`` for every fetch, so nothing is ever marked read. Stdlib only
+(``imaplib``, ``email``). The IMAP class is an argument
+(``imap=imaplib.IMAP4_SSL``) so tests drive it with a fake returning canned
+RFC 822 bytes.
 
-Never logs the password or message bodies — only counts and the host.
+The SEND side (``send_message``, at the bottom) is the one thing in this
+module that cannot be undone, and it is reachable only from
+jarvis/outbox.py behind a spoken read-back — never from a ToolSpec, so the
+model can never decide to send anything. Its transport is an argument too
+(``smtp=smtplib.SMTP_SSL``).
+
+Never logs the password or message bodies — only counts, hosts and masked
+addresses.
 """
 from __future__ import annotations
 
@@ -13,13 +21,18 @@ import email
 import email.utils
 import html as _html
 import imaplib
+import mimetypes
 import re
+import smtplib
 import socket
 import ssl
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from email import policy
+from email.message import EmailMessage
+from email.utils import formataddr
+from pathlib import Path
 from typing import Optional
 
 from jarvis.logs import get_logger
@@ -118,7 +131,12 @@ def gmail_settings(cfg) -> Optional[dict]:
         return None
     host = _cfg_get(cfg, "gmail.imap_host", "") or DEFAULT_IMAP_HOST
     return {"address": address.strip(), "password": password,
-            "host": str(host).strip()}
+            "host": str(host).strip(),
+            # Carried even on the read path so a caller that later sends
+            # from this account does not have to re-read the config; blank
+            # is fine, smtp_host() derives one from the IMAP host.
+            "smtp_host": str(_cfg_get(cfg, "gmail.smtp_host", "") or "").strip(),
+            "from_name": str(_cfg_get(cfg, "gmail.from_name", "") or "").strip()}
 
 
 def mail_accounts(cfg) -> list[dict]:
@@ -132,6 +150,7 @@ def mail_accounts(cfg) -> list[dict]:
     """
     raw = _cfg_get(cfg, "gmail.accounts", None)
     default_host = _cfg_get(cfg, "gmail.imap_host", "") or DEFAULT_IMAP_HOST
+    default_smtp = str(_cfg_get(cfg, "gmail.smtp_host", "") or "").strip()
     if not isinstance(raw, (list, tuple)) or not raw:
         single = gmail_settings(cfg)
         if single is None:
@@ -154,6 +173,10 @@ def mail_accounts(cfg) -> list[dict]:
             "address": address,
             "password": password,
             "host": str(entry.get("imap_host") or default_host).strip(),
+            # Per-account submission host and display name, for the SEND
+            # path. Blank smtp_host is derived from the IMAP host below.
+            "smtp_host": str(entry.get("smtp_host") or default_smtp).strip(),
+            "from_name": str(entry.get("from_name") or "").strip(),
         })
     return out
 
@@ -535,6 +558,184 @@ def fact_sheet(mails: list[Mail], total: int, since_hours: int = 24,
             item += f": {m.snippet[:snippet_chars]}"
         lines.append(item)
     return "\n".join(lines)
+
+
+# ------------------------------------------------------------ sending
+# Everything above this line is READ-ONLY by construction (readonly SELECT,
+# BODY.PEEK). Everything below it leaves the machine and cannot be taken
+# back, so it is deliberately kept off the model's path: there is NO
+# ToolSpec for send_mail and there never should be one. The only caller is
+# jarvis/outbox.py, behind a spoken read-back and an explicit yes
+# (commander._try_send_confirm). A tool the model can call is a tool the
+# model can call by mistake, and "sorry, I sent your transcript to the
+# wrong Heather" has no undo.
+SMTP_HOST_DEFAULT = "smtp.gmail.com"
+SMTP_PORT = 465                    # implicit TLS; never 25, never STARTTLS
+SMTP_TIMEOUT = 30.0                # an attachment is slower than a header fetch
+SEND_FAILED_LINE = "I couldn't send that, sir."
+NO_ACCOUNT_LINE = "I'm not sure which account to send from, sir."
+
+
+class MailSendFailed(RuntimeError):
+    """SMTP refused, or the attachment could not be read."""
+
+
+def smtp_host(account: dict) -> str:
+    """The submission host for an account.
+
+    An explicit ``smtp_host`` wins; otherwise the IMAP host is rewritten
+    (imap.gmail.com -> smtp.gmail.com), which is right for Gmail and for
+    every provider that follows the same naming. A host that fits neither
+    falls back to Gmail's, because these are Gmail app passwords.
+    """
+    explicit = str((account or {}).get("smtp_host") or "").strip()
+    if explicit:
+        return explicit
+    host = str((account or {}).get("host") or "").strip()
+    if host.startswith("imap."):
+        return "smtp." + host[len("imap."):]
+    return SMTP_HOST_DEFAULT
+
+
+def account_label(account: dict) -> str:
+    return str((account or {}).get("label") or "").strip() or \
+        str((account or {}).get("address") or "").partition("@")[0]
+
+
+def account_by_label(accounts: list[dict], hint: str) -> Optional[dict]:
+    """The account a spoken hint names, or None.
+
+    Matches the label ("work"), the address, or the local part -- exactly,
+    then as a prefix. Never fuzzily: sending from the wrong identity is one
+    of the two irreversible halves of this feature, so an unrecognised hint
+    must produce a question, not a near miss.
+    """
+    want = " ".join(str(hint or "").split()).lower()
+    if not want or not accounts:
+        return None
+    for account in accounts:
+        label = account_label(account).lower()
+        addr = str(account.get("address") or "").lower()
+        if want in (label, addr, addr.partition("@")[0]):
+            return account
+    for account in accounts:
+        label = account_label(account).lower()
+        if label and (label.startswith(want) or want.startswith(label)):
+            return account
+    return None
+
+
+def choose_account(accounts: list[dict], hint: str = "",
+                   default_label: str = "") -> tuple[Optional[dict], str]:
+    """(account, why-there-is-none).
+
+    Order: what he SAID, then what he CONFIGURED, then -- only when there
+    is no choice to get wrong -- the single account. With three identities
+    configured and nothing said, this returns None and the caller asks;
+    guessing from the recipient's domain was considered and rejected,
+    because "it looked like a university address" is not a reason to put
+    his school identity on a message he meant to send as himself.
+    """
+    if not accounts:
+        return None, "no mailbox is configured"
+    if hint:
+        picked = account_by_label(accounts, hint)
+        if picked is not None:
+            return picked, ""
+        return None, f"no account called {hint}"
+    if default_label:
+        picked = account_by_label(accounts, default_label)
+        if picked is not None:
+            return picked, ""
+    if len(accounts) == 1:
+        return accounts[0], ""
+    names = ", ".join(account_label(a) for a in accounts)
+    return None, f"which account: {names}"
+
+
+def _attachment_parts(path) -> tuple[bytes, str, str, str]:
+    """(bytes, maintype, subtype, filename). Raises MailSendFailed."""
+    p = Path(path)
+    try:
+        data = p.read_bytes()
+    except OSError as exc:
+        raise MailSendFailed(f"cannot read {p.name}") from exc
+    if not data:
+        raise MailSendFailed(f"{p.name} is empty")
+    ctype, _ = mimetypes.guess_type(p.name)
+    maintype, _, subtype = (ctype or "application/octet-stream").partition("/")
+    return data, maintype, subtype or "octet-stream", p.name
+
+
+def build_message(from_addr: str, to_addr: str, subject: str, body: str,
+                  attachment=None, from_name: str = "") -> EmailMessage:
+    """The RFC 822 message, attachment included. No network."""
+    msg = EmailMessage()
+    msg["From"] = formataddr((from_name, from_addr)) if from_name else from_addr
+    msg["To"] = to_addr
+    msg["Subject"] = subject or "(no subject)"
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    # A real Message-ID, from the SENDING domain: Gmail supplies one when a
+    # message has none, but the value is what the caller logs and reports,
+    # so it is generated here where the address is known.
+    msg["Message-ID"] = email.utils.make_msgid(
+        domain=from_addr.partition("@")[2] or None)
+    msg.set_content(body or "")
+    if attachment is not None:
+        data, maintype, subtype, filename = _attachment_parts(attachment)
+        msg.add_attachment(data, maintype=maintype, subtype=subtype,
+                           filename=filename)
+    return msg
+
+
+def send_message(account: dict, to_addr: str, subject: str, body: str,
+                 attachment=None, smtp=None, timeout: float = SMTP_TIMEOUT,
+                 host: str = "", port: int = SMTP_PORT) -> str:
+    """Send one message. Returns its Message-ID.
+
+    ``smtp`` is the class, exactly as ``imap`` is on the read side, so the
+    tests drive a fake and NOTHING in the suite can reach a mail server
+    (tests/conftest.py refuses the submission ports as well, belt and
+    braces). Raises MailSendFailed for anything that goes wrong; the
+    password is never logged, and neither is the body.
+    """
+    if not account:
+        raise MailSendFailed("no account")
+    to_addr = str(to_addr or "").strip()
+    if "@" not in to_addr:
+        raise MailSendFailed(f"not an address: {to_addr!r}")
+    smtp = smtp or smtplib.SMTP_SSL
+    host = host or smtp_host(account)
+    msg = build_message(account["address"], to_addr, subject, body,
+                        attachment=attachment,
+                        from_name=str(account.get("from_name") or ""))
+    label = account_label(account)
+    log.info("mail: sending to %s from %s (%s), attachment %s",
+             _mask_address(to_addr), _mask_address(account["address"]), label,
+             Path(attachment).name if attachment is not None else "none")
+    try:
+        conn = smtp(host, port, timeout=timeout)
+    except Exception as exc:                       # noqa: BLE001 - transport
+        raise MailSendFailed(f"cannot reach {host}") from exc
+    try:
+        conn.login(account["address"], account["password"])
+        conn.send_message(msg)
+    except Exception as exc:                       # noqa: BLE001 - transport
+        # str(exc) on an SMTPAuthenticationError carries the server's reply,
+        # never the credential, so this is safe to log -- but the exception
+        # is re-raised with the TYPE only, because it travels into a spoken
+        # line and a server that echoes the username would put it there.
+        log.warning("mail: send failed (%s)", type(exc).__name__)
+        raise MailSendFailed(type(exc).__name__) from exc
+    finally:
+        for closer in (getattr(conn, "quit", None),):
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:
+                    log.debug("smtp quit failed", exc_info=True)
+    log.info("mail: sent %s", msg["Message-ID"])
+    return str(msg["Message-ID"])
 
 
 # ---------------------------------------------------------------- tool

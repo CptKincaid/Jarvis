@@ -87,6 +87,7 @@ from jarvis import faults as faults_mod
 from jarvis import lecture as lecture_mod
 from jarvis import mathspeak
 from jarvis import objections as objections_mod
+from jarvis import outbox
 from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
@@ -100,6 +101,7 @@ from jarvis.memory import parse_person_statement, parse_since
 from jarvis import selfstate
 from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
+from jarvis.tools import mail as mail_mod
 from jarvis.tools import filepick
 from jarvis.tools import oracle as oracle_mod
 from jarvis.tools import remote as remote_mod
@@ -5074,6 +5076,171 @@ def _h_remote_freeform(c, t, m):
                              name=conf.name))
 
 
+# ---- Email a file (jarvis/outbox.py, 2026-09-02) --------------------------
+# "Email this file to this person from this location on my desktop", which is
+# how he asked for it. Two irreversible things happen at once -- a file
+# leaves the machine, and it leaves it wearing one of his three identities --
+# so this family arms NOTHING on the first utterance. It builds a draft,
+# reads back the file, the size, the address and the account, and waits
+# (_try_send_confirm). Anything it is not sure of becomes a question.
+#
+# Placed AFTER the HPCOMPUTER family on purpose. "Send the budget to
+# HPCOMPUTER" is a transfer, not an email, and _REMOTE_PUSH_RX must have the
+# first claim on it; _SEND_NOT_RX repeats the guard by name so the ordering
+# is belt and braces rather than the only thing holding it.
+_SEND_OPENER = (r"^(?:jarvis[,\s]+)?"
+                r"(?:(?:please|can you|could you|would you|will you|"
+                r"i(?:'d| would) like you to|i want you to|"
+                r"go ahead and)[,\s]+)*")
+_SEND_VERB = r"(?:e-?mail|send|share|forward on|shoot|fire)"
+# Two shapes, and only two:
+#   A  "email <the lab report> to <Heather> [from my <school> account]"
+#      ("share <X> WITH <Y>" is the same shape; "with" is in the
+#      preposition list because that is how a share is phrased, and the
+#      worst it can do is make an odd sentence ask who the recipient is.)
+#   B  "send <Heather> <the lab report>"
+# B is the loose one -- "send me the weather" fits it perfectly -- so its
+# handler refuses to act unless the recipient RESOLVES to a real address in
+# the people book or the contacts map. A is anchored by an explicit "to".
+_SEND_FILE_RX = re.compile(
+    _SEND_OPENER + _SEND_VERB + r"\s+"
+    r"(?:(?P<file_a>\S.*?)\s+(?:to|over to|across to|with)\s+(?P<who_a>\S.*?)"
+    r"|(?P<who_b>[a-z][\w'.\-]*(?:\s+[a-z][\w'.\-]*)?)\s+"
+    r"(?P<file_b>(?:the|my|that|this|a|an)\s+\S.*?))"
+    r"(?:\s+(?:from|using|via|out of|off)\s+(?:my\s+|the\s+)?"
+    r"(?P<acct>[\w'\-]+(?:\s+[\w'\-]+)?)\s+"
+    r"(?:account|address|mailbox|e-?mail))?"
+    r"[\s,.!?]*$", re.I)
+
+# The NEGATIVE table. He says "send", "email" and "file" in ordinary
+# sentences all day, and every line here is one of those sentences. A hit
+# returns None, so the utterance keeps whatever meaning it already had --
+# usually the model's.
+_SEND_NOT_RX = re.compile(
+    # 1. A QUESTION or a report about sending, not an order to send. The
+    #    polite openers (can you / could you / would you / please) are
+    #    consumed by _SEND_OPENER above and are deliberately absent here.
+    r"^(?:did|do|does|has|have|had|is|are|was|were|should|shall|am|ain'?t|"
+    r"when|what|why|how|who|whom|whose|where|which)\b"
+    # 2. NARRATION. "I need to send the lab report to Heather" is him
+    #    thinking out loud about a chore, not handing it to me.
+    r"|^(?:i|we)\s+(?:need|want|have|had|ought|meant|forgot|should|must|"
+    r"will|'ll|am|was|might|may|could|would|still|just)\b"
+    r"|\b(?:already |just )?(?:sent|emailed|e-mailed|forwarded|mailed)\b"
+    # 3. ANOTHER CHANNEL. Texts and calls were ruled OUT of this queue by
+    #    name ("email send with read-back, NO texts/calls"), and Discord
+    #    and Spotify are other lanes in this same file.
+    r"|" + _SEND_VERB + r"\s+(?:\w+\s+){0,3}?"
+    r"(?:a |an |the |my |him |her |them |me )?"
+    r"(?:text|texts|sms|imessage|dm|voicemail|whatsapp)\b"
+    r"|\bto\s+(?:discord|slack|whatsapp|my\s+phone|the\s+group\s+chat)\b"
+    # 4. HPCOMPUTER. The remote lane owns every phrasing that names the
+    #    other machine; _HPC is its own definition, shared so the two
+    #    cannot drift apart.
+    r"|\b(?:to|onto|on|over to|across to)\s+" + _HPC +
+    # 5. MAIL VERBS THIS IS NOT. Replying, forwarding and unsubscribing all
+    #    act on a message that already exists; this feature makes a new one.
+    r"|^(?:reply|respond|forward|unsubscribe|archive)\b"
+    r"|\breply\s+to\b|\brespond\s+to\b"
+    # 6. "file" as a VERB. "File that away", "file a report".
+    r"|\bfile\s+(?:it|that|this|them|these)?\s*(?:away|under|a |an )\b"
+    # 7. Objects that are not files. Each of these fits shape A perfectly
+    #    ("send my location to Heather") and none of them is an attachment.
+    r"|" + _SEND_VERB + r"\s+(?:\w+\s+){0,2}?"
+    r"(?:a |an |the |my |your )?"
+    r"(?:reminder|invite|invitation|meeting|link|url|password|money|"
+    r"payment|song|track|playlist|location|weather|apolog|regards|love|"
+    r"thanks|note to self)\b",
+    re.I)
+
+# The read-back's answer, with its OWN end-anchored grammar and NOT
+# parse_yes_no. parse_yes_no is a word BAG that waives its overheard-speech
+# guard whenever the first word is a yes word, which is how the ten-word
+# "Yeah, so you should be able to look that up." (jarvis.log.1:19499, a real
+# line that answered nothing) read as a yes and delivered a whole briefing.
+# Delivering a briefing by accident costs a briefing. Sending a file by
+# accident cannot be undone, so this grammar is the briefing offer's shape
+# and a NARROWER vocabulary: an answer here is the word, a courtesy, and
+# nothing else.
+_SEND_TAIL = (r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|"
+              r"it|that|send it|send that|go ahead|do it))*[?.!]*$")
+# "ok" / "okay" / "sure" / "alright" are deliberately ABSENT. They are the
+# words a man says while still reading the read-back, and this is the one
+# question in the app where "probably yes" must not be enough. They are
+# caught by _SEND_MAYBE_RX below and asked again rather than dropped in
+# silence -- silence is how he learns the feature does not work.
+_SEND_YES_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?"
+    r"(?:yes|yeah|yep|yup|aye|affirmative|correct|confirmed?|certainly|"
+    r"absolutely|definitely|of course|go ahead|do it|send it|send that|"
+    r"send it now|please do|that'?s right|fire away|off you go)"
+    + _SEND_TAIL, re.I)
+_SEND_NO_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:no[,\s]+)?"
+    r"(?:no|nope|nah|negative|don'?t|do not|stop|cancel|abort|"
+    r"not now|not yet|not that one|wrong one|wrong file|wrong person|"
+    r"hold on|hold off|wait|never ?mind|forget it|scratch that|leave it|"
+    r"no thanks|no thank you|that'?s wrong)" + _SEND_TAIL, re.I)
+_SEND_MAYBE_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?"
+    r"(?:ok(?:ay)?|alright|all right|sure|fine|right|very well|mhm|mm|"
+    r"uh huh|i guess|i suppose|maybe|probably|whatever|sounds good|"
+    r"i think so|if you like|why not)" + _SEND_TAIL, re.I)
+
+
+def parse_send_answer(text) -> Optional[bool]:
+    """True / False / None for a read-back answer. None is "not an answer".
+
+    NO is tested first: "no, send it" is a contradictory sentence and the
+    safe reading of it is the one where nothing leaves the machine.
+    """
+    t = " ".join(str(text or "").split())
+    if not t:
+        return None
+    if _SEND_NO_RX.match(t):
+        return False
+    if _SEND_YES_RX.match(t):
+        return True
+    return None
+
+
+def _h_send_file(c, t, m):
+    """Arm a file send and read it back. Nothing is sent from here."""
+    if _SEND_NOT_RX.search(t):
+        log.info("send-file: %r is not a send-a-file request", t)
+        return None
+    cfg = c._svc("assistant")
+    if cfg is None:
+        return None
+    # The lower-cased match gives the SHAPE; the file name has to come back
+    # from the original casing, or "Lab_Report.pdf" is looked for as
+    # "lab_report.pdf" -- which is a different file on a case-sensitive
+    # filesystem and no file at all on the day he has both.
+    raw = _raw_cmd_text(c)
+    rm = _SEND_FILE_RX.match(raw) or m
+    shape_a = bool(m.group("file_a"))
+    said_file = (rm.group("file_a") or rm.group("file_b") or "").strip()
+    who = (rm.group("who_a") or rm.group("who_b") or "").strip()
+    hint = (rm.group("acct") or "").strip()
+    memory = c._svc("memory")
+    if not shape_a:
+        # Shape B is loose enough to swallow "send me the weather". Only a
+        # recipient Jarvis can actually address makes it a file send; for
+        # anyone else the utterance keeps its own meaning and goes on to
+        # the router, which is where "send me the weather" belongs.
+        addr, _ = outbox.resolve_recipient(cfg, memory, who)
+        if not addr:
+            log.info("send-file: %r names no one I can write to", who)
+            return None
+    prep = outbox.prepare(cfg, memory, said_file, who, account_hint=hint)
+    if prep.draft is None:
+        return CommandResult(handled=True, reply=prep.ask, speak=True,
+                             status=prep.status)
+    c.stash_send(prep.draft)
+    return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
+                         speak=True, status=prep.status)
+
+
 def _h_network(c, t, m):                                   # 3267-3279
     net = c._svc("context").check_connectivity()
     status = "Online" if net.get("internet") else "Offline"
@@ -7212,6 +7379,13 @@ REGISTRY: list[Command] = [
     Command("remote status", _REMOTE_STATUS_RX.match, _h_remote_status),
     Command("remote query", _REMOTE_QUERY_RX.match, _h_remote_query),
     Command("remote freeform", _REMOTE_FREEFORM_RX.match, _h_remote_freeform),
+    # Email a file (jarvis/outbox.py). AFTER the HPCOMPUTER family: "send
+    # the budget to HPCOMPUTER" is a transfer and `remote push` must have
+    # it, and _SEND_NOT_RX names _HPC again so the two guards are
+    # independent. The handler returns None for everything the negative
+    # table catches, so an ordinary sentence with "send" in it falls
+    # through to the router exactly as it did before.
+    Command("send file", _SEND_FILE_RX.match, _h_send_file),
     Command("standup", standup.STANDUP_RX.match, _h_standup,
             needs=("context",)),
     Command("gpu reclaim", _GPU_RECLAIM_RX.match, _h_gpu_reclaim,
@@ -7322,6 +7496,12 @@ ASSISTANT_TIER1: list[Command] = [
                     "list schedule", "cancel schedule", "adjust schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "register", "next exam",
+                    # "email the lab report to Heather" arrives at the desk
+                    # with the wake word already eaten, like every other
+                    # instruction he gives standing up. Without this name
+                    # the registry pass never runs on it and the intent
+                    # gate calls it background chat.
+                    "send file",
                     # "what's my next class" arrives with the wake word
                     # already eaten, like every other question at the desk
                     "next class",
@@ -7944,6 +8124,7 @@ class Commander:
     _confidence: Optional[float] = None
     _pending_destructive: Optional[tuple] = None
     _pending_objection: Optional[tuple] = None
+    _pending_send: Any = None                 # outbox.Draft awaiting a yes
     _objection_timer = None
     _objections = None
     # Monotonic; 0.0 means "no building has been named this session", which
@@ -8003,6 +8184,7 @@ class Commander:
         self._confidence: Optional[float] = None
         # A read-back waiting for a yes: (run, spoken line, stamp).
         self._pending_destructive: Optional[tuple] = None
+        self._pending_send = None
         # He advised against something and asked "shall I set it anyway?":
         # (run, spoken line, Objection, stamp). Its own slot because its
         # default on ambiguity is the OPPOSITE of the read-back's -- see
@@ -8122,6 +8304,17 @@ class Commander:
                     return True
             except Exception:  # noqa: BLE001 - a bad session
                 log.debug("question_open: session state failed", exc_info=True)
+        # A file send read back and not yet answered ("...Send it, sir?").
+        # Its own expiry, outbox.DRAFT_TTL_S, which is longer than the
+        # destructive read-back's because there are four facts to check.
+        draft = getattr(self, "_pending_send", None)
+        if draft is not None:
+            try:
+                if not draft.stale():
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed draft
+                log.debug("question_open: send draft staleness failed",
+                          exc_info=True)
         # A read-back ("Cancel all three alarms, sir?") and the objection
         # ("Shall I set it anyway?") both hold the floor for DESTRUCTIVE_TTL_S.
         for name, size in (("_pending_destructive", 3), ("_pending_objection", 4)):
@@ -8195,6 +8388,23 @@ class Commander:
         """A handler read an action back instead of doing it; the next yes
         runs it (``_try_destructive_confirm``)."""
         self._pending_destructive = (run, line, time.monotonic())
+
+    def stash_send(self, draft):
+        """A file send was read back; only an explicit yes spends it.
+
+        Its own slot, NOT ``_pending_destructive``: that one is answered by
+        ``parse_yes_no``, a word bag wide enough that a passing "yeah" in a
+        ten-word sentence counts. Cancelling three alarms by accident is a
+        bad afternoon; sending a file by accident is permanent, so this slot
+        has a narrower grammar of its own (``parse_send_answer``) and one
+        re-ask for a vague answer.
+        """
+        self._pending_send = draft
+        # A new question replaces the old one, the way a new quiz replaces
+        # the last: without this a remote-push read-back armed a moment
+        # earlier would still be sitting in _pending_destructive, and the
+        # yes that sends the email would leave IT armed for the next one.
+        self._pending_destructive = None
 
     # -- reasoned dissent (jarvis/objections.py) -----------------------
     def _objection_ledger(self):
@@ -8477,6 +8687,16 @@ class Commander:
         #       parks a study one. It takes the SOURCE because a spoken
         #       question cannot be answered from Discord or a tmux shell.
         res = self._try_briefing_offer(text, source)
+        if res is not None:
+            return res
+        # 3d'''. A FILE SEND was read back ("lab report.pdf, 2.4
+        #       megabytes, to Heather ... Send it, sir?"). Above the
+        #       destructive rung because it is the stricter question of
+        #       the two -- its yes is an end-anchored grammar of its own,
+        #       not parse_yes_no -- and because the two can never be live
+        #       together anyway: a send arms its own slot and nothing in
+        #       the app arms both.
+        res = self._try_send_confirm(text)
         if res is not None:
             return res
         # 3e. A destructive action was read back ("Cancel all three alarms,
@@ -8920,6 +9140,78 @@ class Commander:
             line = "I couldn't take that back, sir."
         return CommandResult(handled=True, reply=str(line), speak=True,
                              status="Undone")
+
+    def _try_send_confirm(self, text: str) -> Optional[CommandResult]:
+        """Resolve a file-send read-back ("...Send it, sir?").
+
+        Four answers, and the difference between them is the whole feature:
+
+        * a clear YES sends it, in the background, because an attachment is
+          the one tool result in this app whose transfer can take seconds;
+        * a clear NO drops it and says so;
+        * a VAGUE answer ("okay", "sure", "mhm") is asked once more rather
+          than obeyed or ignored. Obeying it is how a file reaches the wrong
+          person; ignoring it in silence is how he concludes the feature
+          does not work. The second vague answer spends the draft;
+        * ANYTHING ELSE -- a new command, a changed subject -- drops the
+          draft and keeps its own meaning, exactly as the destructive
+          read-back does. Changing the subject is not consent.
+
+        The slot is cleared FIRST, before any of that, so no path through
+        this method can leave a live draft behind for a later stray yes.
+        """
+        draft, self._pending_send = getattr(self, "_pending_send", None), None
+        if draft is None:
+            return None
+        if draft.stale():
+            log.info("send read-back expired: %s", draft.path.name)
+            return None
+        answer = parse_send_answer(text)
+        if answer is None:
+            if _SEND_MAYBE_RX.match(" ".join(str(text or "").split())) \
+                    and not draft.reasked:
+                draft.reasked = True
+                self._pending_send = draft
+                log.info("send read-back: %r is not a yes; asking again", text)
+                return CommandResult(handled=True, reply=outbox.UNSURE_LINE,
+                                     speak=True, status="Confirm?")
+            log.info("send draft dropped, the subject changed: %r", text)
+            return None
+        if not answer:
+            log.info("send declined: %s", draft.path.name)
+            return CommandResult(handled=True, reply=outbox.DROPPED_LINE,
+                                 speak=True, status="Not sent")
+
+        smtp = self._svc("smtp")
+        cap = outbox.max_mb(self._svc("assistant"))
+        name = draft.path.name
+
+        def _run():
+            try:
+                line = outbox.send(draft, smtp=smtp, cap_mb=cap)
+                kind, status = "ok", "Sent"
+            except outbox.DraftChanged as exc:
+                # Its message IS the sentence: the file moved between the
+                # read-back and the yes, and he needs to hear which.
+                line, kind, status = str(exc), "error", "Not sent"
+            except mail_mod.MailSendFailed as exc:
+                # A transport failure's text is a class name, never a line.
+                log.warning("send failed for %s (%s)", name, exc)
+                line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
+            except Exception:                          # noqa: BLE001 - source
+                log.exception("send blew up for %s", name)
+                line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
+            bus.publish(JarvisReply(text=line))
+            bus.publish(Status(text=status, kind=kind))
+            self._speak_now(line)
+
+        self._bg(_run)
+        # ack=True: "Sending it now" is an acknowledgement, and the result
+        # follows on its own event. done=False keeps the turn open so the
+        # UI does not call it finished while the file is still on the wire.
+        return CommandResult(handled=True, reply="Sending it now, sir.",
+                             speak=True, ack=True, done=False,
+                             status=f"Sending {name}")
 
     def _try_destructive_confirm(self, text: str) -> Optional[CommandResult]:
         """Resolve a read-back ("Cancel all three alarms, sir?").
