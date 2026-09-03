@@ -894,8 +894,11 @@ class StatePill(tk.Canvas):
         self.delete("pill")        # keeps the bar-gradient ground slice
         self.configure(width=pill_w)
         # GLASS_EDGE is the pill's edge in both looks; SensingBadge keeps
-        # to its own edge tokens (sensing_badge.badge_colors) so the two
-        # chips, now one face and one geometry, are never chrome twins.
+        # to its own edge tokens (sensing_badge.badge_colors), a hue apart
+        # on a hairline. In holo the BRIGHT tick below is the glance-level
+        # tell between the two chips -- the badge draws none, on purpose:
+        # a tick in its tokens would be 1.2-1.3:1 from this one (computed;
+        # the sensing_badge module docstring has the numbers).
         if theme.LOOK == "holo":
             # outlined capsule: a hairline chamfered outline over the bar
             # ground (the gradient slice shows through the empty fill), a

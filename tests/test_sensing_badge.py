@@ -125,11 +125,13 @@ def test_the_dot_is_full_half_or_empty_by_how_much_is_lit():
 @pytest.mark.parametrize("look", theme.LOOKS)
 def test_the_badge_never_wears_the_pills_edge(look):
     """The two header chips are one face and one geometry since
-    2026-09-03, so the edge is the badge's one chrome channel of its
-    own: the capsule outline in holo, the 1px catch-light in classic
-    (widgets.StatePill._fit draws GLASS_EDGE for the pill in both). A
-    badge that shared it would be the pill's twin, and "which chip is
-    the privacy one" would be a question only the word could answer."""
+    2026-09-03, so the badge's edge -- the capsule outline in holo, the
+    1 px catch-light in classic -- is its own token, never the pill's
+    GLASS_EDGE (widgets.StatePill._fit draws GLASS_EDGE in both looks).
+    Honest about its weight: live, CYAN_DIM sits 1.17:1 (holo) / 1.41:1
+    (classic) from GLASS_EDGE, a hue on a hairline that this token-level
+    test can read and a glance cannot; restricted, WARN is plain. The
+    glance-level tell in holo is the pill's corner tick (next test)."""
     theme.select_look(look)
     for tone in (TONE_ON, TONE_CURFEW, TONE_OFF):
         edge = badge_colors(tone)["edge"]
@@ -138,6 +140,45 @@ def test_the_badge_never_wears_the_pills_edge(look):
     assert badge_colors(TONE_ON)["edge"] == theme.CYAN_DIM
     assert badge_colors(TONE_CURFEW)["edge"] == theme.WARN
     assert badge_colors(TONE_OFF)["edge"] == theme.WARN
+    assert _contrast(theme.CYAN_DIM, theme.GLASS_EDGE) < 1.5    # hue-only
+    assert _contrast(theme.WARN, theme.GLASS_EDGE) > 2          # amber reads
+
+
+def _contrast(a: str, b: str) -> float:
+    """WCAG relative-luminance contrast of two #rrggbb tokens."""
+    def lum(h):
+        def ch(i):
+            c = int(h[i:i + 2], 16) / 255
+            return c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+        return 0.2126 * ch(1) + 0.7152 * ch(3) + 0.0722 * ch(5)
+    hi, lo = sorted((lum(a), lum(b)), reverse=True)
+    return (hi + 0.05) / (lo + 0.05)
+
+
+def test_in_holo_the_pills_corner_tick_is_the_glance_tell_and_the_badge_draws_none():
+    """Reviewed 2026-09-03: the badge's CYAN_DIM outline against the pill's
+    GLASS_EDGE is a hue shift (1.17:1 in holo), so what tells the chips
+    apart at a glance is the BRIGHT tick on the pill's left cut, which
+    the badge does not draw. That absence is DELIBERATE and pinned here:
+    a tick in any token the badge owns would sit a hue from the pill's
+    (BRIGHT vs CYAN 1.31:1, vs WARN 1.18:1, computed from the tokens; the
+    cut pixels confirmed off a private Xvfb at S=1 and S=2), and two
+    near-equal ticks would erase the one luminance-level asymmetry, not
+    add a channel. Source-inspected, the house way: no window is made."""
+    import inspect
+
+    from jarvis.ui.sensing_badge import SensingBadge
+    from jarvis.ui.widgets import StatePill
+    theme.select_look("holo")
+    assert "theme.BRIGHT" in inspect.getsource(StatePill._fit)
+    assert "theme.BRIGHT" not in inspect.getsource(SensingBadge._fit)
+    for tone in (TONE_ON, TONE_CURFEW, TONE_OFF):
+        assert theme.BRIGHT not in badge_colors(tone).values(), tone
+    # the tick is a real mark against the ground, and nothing the badge
+    # owns would be a real mark against the tick
+    assert _contrast(theme.BRIGHT, theme.BG) > 9
+    for own in (theme.CYAN, theme.WARN, theme.CYAN_DIM):
+        assert _contrast(theme.BRIGHT, own) < 1.7, own
 
 
 def test_the_colours_follow_the_look_at_call_time():
