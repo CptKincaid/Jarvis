@@ -4,9 +4,17 @@
 His instruction was "just log it first", so this is the instrument that
 gathers the evidence before any behaviour is wired to it. It polls ONE
 room radar read-only through ``jarvis.roomsensor`` -- the same module, the
-same URL rule, the same circuit breaker and the same offline-mode policy
-Jarvis itself uses -- fuses each reading through ``jarvis.zones`` and
-appends one JSONL line per COMMITTED zone change.
+same URL rule, the same circuit breaker -- fuses each reading through
+``jarvis.zones`` and appends one JSONL line per COMMITTED zone change.
+
+IT IS GOVERNED BY OFFLINE MODE, and that is not a decoration: it builds the
+same ``jarvis.sensing.SensingPolicy`` the app builds and hands it to the
+sensor, so while sensing is denied no request leaves this process and
+``reads`` stays at 0. The first pass claimed that and then constructed a
+policy-less ``RoomSensor``, which meant an unattended ``--for 3600`` run
+would have gone on polling the radar through a switch that was off. A
+policy with no state file starts OFFLINE (the fail-safe), so an unexpected
+"radar sensing is DENIED" line at start-up means the switch, not a bug.
 
     scripts/zone_log.py --describe              # the ladder, no network
     scripts/zone_log.py --room office           # poll until Ctrl-C
@@ -43,8 +51,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from jarvis import zones as zn                                   # noqa: E402
 from jarvis.assistant_config import AssistantConfig              # noqa: E402
 from jarvis.roomsensor import RoomSensor                         # noqa: E402
+from jarvis.sensing import SensingPolicy                         # noqa: E402
 
 DEFAULT_POLL_S = 2.0            # presence.rooms_poll_s, the fabric's cadence
+
+
+def build_sensor(cfg, url: str, policy_path=None) -> RoomSensor:
+    """A RoomSensor under the SAME sensing policy the app puts it under.
+
+    ``scripts/vision_selfcheck.py`` and ``scripts/gesture_selfcheck.py``
+    build their policy exactly this way. Without it the offline switch
+    simply does not reach this process -- ``RoomSensor.blocked`` answers ""
+    when there is no policy -- and this instrument is meant to be left
+    running for an hour.
+
+    A policy that cannot be built at all is fatal here rather than
+    ignored: an ungoverned poll loop is the thing being avoided, so the
+    caller gets the exception instead of a sensor that quietly ignores the
+    switch. ``policy_path`` is the state-file seam the tests drive.
+    """
+    policy = SensingPolicy(cfg=cfg, path=policy_path)
+    return RoomSensor(url, policy=policy)
 
 
 def room_url(cfg, room: str) -> str:
@@ -83,12 +110,27 @@ def main(argv=None) -> int:
     cfg = AssistantConfig.load()
     room = " ".join(str(args.room).split()).lower()
     zmap = zn.zone_map_for(cfg, room)
+    refused = zn.rejected_rooms(cfg)
     if zmap is None:
-        print("no zones for %r. zones.enabled is %r; configured rooms: %s"
-              % (room, cfg.get("zones.enabled", True),
+        # LOUD, and it records nothing. A bad ladder is refused by name
+        # rather than replaced by the built-in one, because a log written
+        # against the bands he thought he had replaced looks like it
+        # worked. See jarvis/zones.py: zone_map_for.
+        print("no zones for %r -- NOTHING will be recorded." % room,
+              file=sys.stderr)
+        if room in refused:
+            print("  refused: %s" % refused[room], file=sys.stderr)
+        print("  zones.enabled is %r; usable rooms: %s"
+              % (cfg.get("zones.enabled", True),
                  ", ".join(sorted(zn.zone_maps(cfg))) or "(none)"),
               file=sys.stderr)
+        for name in sorted(k for k in refused if k != room):
+            print("  also refused: %s -- %s" % (name, refused[name]),
+                  file=sys.stderr)
         return 2
+    for name in sorted(refused):
+        print("WARNING: %s records nothing: %s" % (name, refused[name]),
+              file=sys.stderr)
 
     print("%s -- the ladder:" % room)
     print(zmap.describe())
@@ -105,10 +147,17 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
-    sensor = RoomSensor(url)
+    sensor = build_sensor(cfg, url)
     if not sensor.configured:
         print("%r is not an http(s) URL." % url, file=sys.stderr)
         return 2
+    if sensor.blocked:
+        # Not fatal: offline mode can be lifted mid-run and the loop picks
+        # it up. But it must be said, or an hour of "no opinion" reads as
+        # a dead radar rather than a switch that is off.
+        print("NOTE: radar sensing is DENIED right now (%s); no request will "
+              "leave this process until that changes." % sensor.blocked,
+              file=sys.stderr)
     dwell = args.dwell if args.dwell is not None else zn.dwell_s(cfg)
     log_file = zn.ZoneLog(Path(args.log) if args.log else zn.log_path(cfg),
                           max_bytes=zn.log_max_bytes(cfg),

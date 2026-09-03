@@ -84,7 +84,7 @@ import re
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from jarvis.logs import get_logger
 from jarvis.sensing import POLLING_ONLY, RADAR
@@ -324,9 +324,15 @@ class RoomSensor:
         # module exists to provide. So a bad distance costs the distance
         # and nothing else: three failures in a row and it stops asking for
         # a cooldown, with one warning line.
-        self._dist_fails = 0
-        self._dist_skip_until = 0.0
-        self._dist_down = False
+        #
+        # Counted PER ENTITY, not once for all three. One shared counter was
+        # reset by any successful read, so a permanently 404ing entity -- a
+        # renamed one, a firmware without still_distance -- was re-asked on
+        # every single poll for ever, its neighbours zeroing the count each
+        # time, and the backoff this comment promises never happened.
+        self._dist_fails: Dict[str, int] = {}
+        self._dist_skip_until: Dict[str, float] = {}
+        self._dist_down: Dict[str, bool] = {}
         attach = getattr(policy, "attach", None)
         if callable(attach):
             attach(RADAR, self.stop, present=lambda: self.configured,
@@ -438,7 +444,7 @@ class RoomSensor:
         """
         if not self.configured or self.paused:
             return None
-        if self._dist_skip_until > self._now():
+        if self._dist_skip_until.get(entity, 0.0) > self._now():
             return None
         url = urllib.parse.urlunsplit(
             urllib.parse.urlsplit(self.url)._replace(
@@ -454,25 +460,26 @@ class RoomSensor:
         if cm is None:
             self._dist_failed(entity, repr(body)[:120])
             return None
-        self._dist_fails, self._dist_skip_until = 0, 0.0
-        if self._dist_down:
+        self._dist_fails.pop(entity, None)
+        self._dist_skip_until.pop(entity, None)
+        if self._dist_down.pop(entity, False):
             log.info("room sensor %s: %s is back", self.url, entity)
-            self._dist_down = False
         return cm / 100.0
 
     def _dist_failed(self, entity: str, detail: Any) -> None:
         """Counts against the DISTANCE leg only -- never the presence
         breaker. See the note in __init__."""
-        self._dist_fails += 1
-        if self._dist_fails < self.fail_after:
+        fails = self._dist_fails.get(entity, 0) + 1
+        self._dist_fails[entity] = fails
+        if fails < self.fail_after:
             log.debug("room sensor distance %s: %s (%s)", entity, self.url, detail)
             return
-        self._dist_skip_until = self._now() + self._base_cooldown
-        if not self._dist_down:
+        self._dist_skip_until[entity] = self._now() + self._base_cooldown
+        if not self._dist_down.get(entity):
             log.warning("room sensor %s: %r is unreadable (%s); zones will be "
                         "unplaced, presence is unaffected",
                         self.url, entity, detail)
-            self._dist_down = True
+            self._dist_down[entity] = True
         else:
             log.debug("room sensor distance %s: %s; retrying in %.0fs",
                       entity, self.url, self._base_cooldown)

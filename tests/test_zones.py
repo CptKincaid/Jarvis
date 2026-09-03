@@ -616,3 +616,200 @@ def test_the_ladder_describes_itself_with_its_gaps_named(tmp_path):
     assert "at the desk" in text and "camera" in text
     assert text.count("gap") == 2               # the blind zone and past 4.5 m
     assert "0.75 -  1.50 m   just off the desk" in text
+
+
+# --------------------------------------------------- the repairs (review 2)
+# A verifier found eight problems with the first pass. These pin the two
+# that mattered: a config error that silently kept recording against the
+# OLD bands, and a still target the fallback never reached.
+
+def test_a_room_whose_bands_are_broken_is_refused_not_quietly_replaced():
+    # THE FAILURE THE WHOLE LOG EXISTS TO AVOID. He edits the office
+    # ladder, mistypes it, and the record goes on being written against
+    # the bands he thought he had replaced -- and looks like it worked.
+    # A rejected room must record NOTHING.
+    broken = _Cfg({"zones": {"rooms": [
+        {"name": "office", "bands": [{"name": "mine", "near_m": 3.0,
+                                      "far_m": 1.0}]}]}})
+    assert zn.zone_maps(broken) == {}
+    assert zn.zone_map_for(broken, "office") is None
+    assert "office" in zn.rejected_rooms(broken)
+
+
+def test_a_rejected_room_names_the_config_key_that_is_wrong():
+    broken = _Cfg({"zones": {"rooms": [
+        {"name": "kitchen", "bands": [{"name": "a", "near_m": 0.75}]}]}})
+    why = zn.rejected_rooms(broken)["kitchen"]
+    assert "zones.rooms[0].bands" in why
+
+
+def test_a_room_switched_off_in_its_own_entry_is_refused_not_replaced():
+    off = _Cfg({"zones": {"rooms": [
+        {"name": "office", "enabled": False,
+         "bands": [{"name": "a", "near_m": 0.75, "far_m": 4.5}]}]}})
+    assert zn.zone_map_for(off, "office") is None
+    assert "zones.rooms[0].enabled" in zn.rejected_rooms(off)["office"]
+
+
+def test_a_config_that_lists_rooms_at_all_gets_no_built_in_ladder():
+    # The built-in office ladder is a bridge for a config written BEFORE
+    # this section existed. Once zones.rooms is there, the config is the
+    # only authority -- otherwise deleting the office entry silently
+    # reinstates the shipped bands.
+    listed = _Cfg({"zones": {"rooms": [
+        {"name": "kitchen", "bands": [{"name": "a", "near_m": 0.75,
+                                       "far_m": 4.5}]}]}})
+    assert zn.zone_map_for(listed, "office") is None
+    assert zn.zone_map_for(_Cfg({}), "office") is not None   # still bridged
+
+
+def test_a_room_named_twice_is_refused_because_two_ladders_cannot_both_win():
+    twice = _Cfg({"zones": {"rooms": [
+        {"name": "office", "bands": [{"name": "a", "near_m": 0.75, "far_m": 4.5}]},
+        {"name": "office", "bands": [{"name": "b", "near_m": 0.75, "far_m": 2.0}]}]}})
+    assert zn.zone_map_for(twice, "office") is None
+    assert "twice" in zn.rejected_rooms(twice)["office"]
+
+
+def _zero_http(detection, **rest):
+    answers = {"http://10.0.0.9/binary_sensor/Presence": ESPHOME_ON,
+               "http://10.0.0.9/sensor/Detection%20distance": detection}
+    answers.update(rest)
+    return Http(answers)
+
+
+def test_a_detection_distance_of_zero_falls_through_to_the_still_distance(tmp_path):
+    # 0 is a REAL reading meaning "no target of this kind" (parse_cm), not
+    # a man standing on the module. The unverified still-only case is
+    # exactly what the fallback was written for, and `if distance is None`
+    # never reached it.
+    http = _zero_http(
+        '{"id":"sensor/Detection distance","value":0,"state":"0 cm"}',
+        **{"http://10.0.0.9/sensor/Moving%20distance": '{"value":0}',
+           "http://10.0.0.9/sensor/Still%20distance": '{"value":180}'})
+    w = _watcher(http, tmp_path)
+    change = w.poll()
+    assert change.new == "the middle of the room"
+    assert change.distance_m == pytest.approx(1.8)
+    assert change.still is True and change.moving is False
+
+
+def test_a_zero_from_every_distance_entity_is_no_distance_not_zero_metres(tmp_path):
+    http = _zero_http('{"value":0}',
+                      **{"http://10.0.0.9/sensor/Moving%20distance": '{"value":0}',
+                         "http://10.0.0.9/sensor/Still%20distance": '{"value":0}'})
+    w = _watcher(http, tmp_path)
+    change = w.poll()
+    assert change.new == UNPLACED
+    assert change.distance_m is None        # never 0.0, which reads as a place
+
+
+def test_a_detection_distance_of_zero_is_not_a_place_without_the_bits_either(tmp_path):
+    http = _zero_http('{"value":0}')
+    w = _watcher(http, tmp_path, read_bits=False)
+    change = w.poll()
+    assert change.new == UNPLACED
+    assert change.distance_m is None
+
+
+def test_a_healthy_distance_entity_does_not_reset_a_broken_one(tmp_path):
+    # One counter shared by three entities meant a permanently 404ing
+    # entity was re-asked on every single poll for ever.
+    http = Http({"http://10.0.0.9/binary_sensor/Presence": ESPHOME_ON,
+                 "http://10.0.0.9/sensor/Detection%20distance": '{"value":242}',
+                 "http://10.0.0.9/sensor/Moving%20distance": '{"value":242}',
+                 "http://10.0.0.9/sensor/Still%20distance": "<html>404</html>"})
+    sensor = RoomSensor("http://10.0.0.9/binary_sensor/Presence", get=http)
+    w = ZoneWatcher("office", sensor, office_map(), dwell_s=0.0,
+                    log_file=ZoneLog(tmp_path / "zones.jsonl"))
+    for _ in range(8):
+        w.poll()
+    asked = [u for u in http.urls if u.endswith("Still%20distance")]
+    assert len(asked) == sensor.fail_after      # then it backs off
+    assert w.zone == "the middle of the room"   # and the good ones carry on
+
+
+def test_a_presence_value_that_is_not_a_bool_is_no_opinion_not_an_empty_chair():
+    # RoomSensor.read() only ever answers True/False/None today. This is
+    # the guard for the next reader: "" or 0 from a future source must not
+    # become "not in the room", which is how Jarvis goes quiet on a man
+    # sitting three feet away.
+    for odd in (0, 0.0, "", [], {}, "unknown", "unavailable", 1, "ON"):
+        v = verdict(office_map(), presence=odd, distance_m=2.0)
+        assert (v.zone, v.rule) == (NO_OPINION, RULE_SILENT), odd
+    assert verdict(office_map(), presence=False).zone == ABSENT
+    assert verdict(office_map(), presence=True, distance_m=2.0).zone == \
+        "the middle of the room"
+
+
+def test_the_worst_line_over_the_office_vocabulary_is_measured_not_assumed():
+    # The first pass quoted 242/272/330 bytes as a "ceiling"; they were
+    # three particular transitions. This enumerates every old/new pair the
+    # office can produce and pins the real maximum under the one-line
+    # floor, so the (keep+1)*max_bytes ceiling holds.
+    vocab = [b.name for b in office_map().bands] + \
+            [UNPLACED, ABSENT, NO_OPINION, office_map().camera_zone]
+    cams = [None, CameraOpinion(known=False),
+            CameraOpinion(known=True, label="x" * zn.MAX_LABEL_CHARS)]
+    worst = 0
+    for old in vocab:
+        for new in vocab:
+            for cam in cams:
+                t = zn.Transition(
+                    room="office", old=old, new=new, rule=RULE_UNPLACED,
+                    at=1_756_000_000.125, iso="2026-09-03T12:34:56",
+                    held_s=1234.56, distance_m=4.44, presence=True,
+                    moving=True, still=False, camera=cam)
+                worst = max(worst, len(json.dumps(t.as_record()).encode()) + 1)
+    assert worst <= zn.MAX_LINE_BYTES
+    assert 1_000_000 // worst >= 2_850      # the claim in the docstring
+
+
+def test_a_room_with_enormous_names_still_cannot_write_past_its_cap(tmp_path):
+    # Room and band names are arbitrary config strings; MAX_LINE_BYTES is
+    # only a real floor if a record cannot exceed it.
+    cfg = _Cfg({"zones": {"rooms": [
+        {"name": "k" * 300,
+         "bands": [{"name": "b" * 300, "near_m": 0.75, "far_m": 2.0},
+                   {"name": "c" * 300, "near_m": 2.0, "far_m": 4.5}]}]}})
+    zmap = list(zn.zone_maps(cfg).values())[0]
+    log_file = ZoneLog(tmp_path / "zones.jsonl", max_bytes=zn.MAX_LINE_BYTES)
+    t = ZoneTracker(zmap.room, zmap, dwell_s=0.0, log=log_file)
+    # known=False so the label lands in the record without the camera rule
+    # taking over the zone: the worst line is a long room, two long band
+    # names and a long label all at once.
+    for i in range(20):
+        t.observe(presence=True, distance_m=[1.0, 3.0][i % 2],
+                  camera=CameraOpinion(known=False, label="c" * 300))
+    rolled = log_file.path.with_name(log_file.path.name + ".1")
+    assert log_file.writes == 20
+    assert log_file.path.stat().st_size <= zn.MAX_LINE_BYTES
+    assert not rolled.exists() or rolled.stat().st_size <= zn.MAX_LINE_BYTES
+
+
+def _zone_log_script():
+    """scripts/zone_log.py, imported by path (scripts/ is not a package)."""
+    import importlib.util
+    import sys
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    path = os.path.join(here, "scripts", "zone_log.py")
+    spec = importlib.util.spec_from_file_location("zone_log_script", path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["zone_log_script"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_the_instrument_is_governed_by_offline_mode_like_the_app(tmp_path):
+    # scripts/zone_log.py is meant to be left running for an hour. It said
+    # it polled "under the same offline-mode policy Jarvis itself uses" and
+    # then built a RoomSensor with no policy at all, so the sensing switch
+    # did not reach it. A SensingPolicy with no state file starts OFFLINE
+    # (the fail-safe), so this asserts at the wire: nothing is sent.
+    zl = _zone_log_script()
+    sensor = zl.build_sensor(None, "http://10.0.0.9/binary_sensor/Presence",
+                             policy_path=tmp_path / "sensing.json")
+    assert sensor.blocked == "offline"
+    assert sensor.read() is None
+    assert sensor.read_distance() is None
+    assert sensor.reads == 0

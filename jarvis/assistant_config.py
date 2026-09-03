@@ -491,8 +491,15 @@ DEFAULTS: dict = {
     # narrowest band, and well inside the radar's own 10 s absence delay.
     # log_path "" means ~/.local/state/jarvis/zones.jsonl (0600 in a 0700
     # directory). The file rotates at log_max_bytes keeping one generation,
-    # so 2 MB is the ceiling; a record measures 242-330 bytes (measured),
-    # so 1 MB is 3,000-4,100 transitions.
+    # so 2 MB is the ceiling; an office record measures 234-350 bytes
+    # (measured across every old/new pair, 2026-09-03), so 1 MB is at
+    # least 2,850 transitions.
+    #
+    # EDIT THESE BANDS AND MIND THE TYPO. A rooms entry that does not parse,
+    # or one with enabled false, is REFUSED BY NAME and records nothing --
+    # it does not fall back to the ladder built into jarvis/zones.py. That
+    # is deliberate: a log written against the bands you thought you had
+    # replaced looks exactly like a log that worked.
     "zones": {"enabled": True, "dwell_s": 3.0, "log_path": "",
               "log_max_bytes": 1000000, "log_keep": 1,
               "rooms": [

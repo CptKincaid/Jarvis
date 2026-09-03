@@ -68,6 +68,18 @@ a 10 s absence delay (measured 2026-09-03).
 Both gaps are declared rather than accidental (``ZoneMap.gaps()``), and a
 reading in one is "in the room, unplaced" -- a real answer, not an error.
 
+A BAD LADDER IS REFUSED, NOT SUBSTITUTED. The ladder above is the built-in
+one, and it stands in for exactly one case: a config written before this
+section existed (no ``zones.rooms`` key at all). It never stands in for a
+config that HAS the section -- not for a room whose bands do not parse, not
+for one switched off in its own entry, not for one named twice, and not for
+one simply missing from the list. ``zone_map_for`` returns None for all of
+those and names the offending key (``rejected_rooms``), and None means
+RECORD NOTHING. The alternative is the one failure this whole log exists to
+avoid: he edits his bands, mistypes them, and the record goes on being
+written against the bands he thought he had replaced -- looking, line after
+plausible line, like it worked.
+
 HYSTERESIS, because a band edge WILL chatter. A body straddling the 1.50 m
 edge crosses it many times a minute, and a memoryless model would write a
 line per sample. A change therefore commits only after the new zone has
@@ -95,9 +107,23 @@ THE RECORD. ``ZoneLog`` appends one JSON object per committed change to
 because /tmp is wiped at every boot on this box and the point of a record
 is that it outlives one. The directory is 0700 and the file 0600. It
 rotates at ``log_max_bytes`` (1 MB) keeping one generation, so 2 MB is the
-hard ceiling. MEASURED line sizes: 242 bytes with no camera opinion, 272
-with one, 330 at the 64-character label ceiling -- so 1 MB is 3,000 to
-4,100 transitions, which at the dwell above is far more than a day.
+hard ceiling.
+
+MEASURED line sizes, and the first pass got these wrong by quoting three
+particular transitions as if they were the maximum. Enumerating EVERY
+old/new pair the office vocabulary can produce (the three bands plus
+"unplaced", "not in the room", "no opinion" and "at the desk") against no
+camera opinion, a short label and a label at the 64-character cap, a line
+on disk is **234 to 350 bytes** including its newline -- so 1 MB is at
+least 2,850 transitions, which at the dwell above is far more than a day.
+The three figures the first pass quoted (242 / 272 / 330) are real, but
+they are typical lines, not the ceiling.
+
+The true ceiling is 499 bytes, and it only exists because every name that
+reaches a record is capped at ``MAX_NAME_CHARS``: room and band names come
+out of the config and are otherwise arbitrary strings, and a 120-character
+band name would have rotated the file on every write while each generation
+sat ABOVE the stated ``(keep + 1) * max_bytes``.
 
 **NO CAMERA FRAME, NO CROP AND NO EMBEDDING EVER GOES IN THAT FILE.** The
 record is built from a fixed tuple of fields (``RECORD_FIELDS``), the
@@ -162,12 +188,21 @@ OFFICE_BANDS: Tuple[Tuple[str, float, float], ...] = (
 )
 
 DEFAULT_DWELL_S = 3.0
-DEFAULT_MAX_BYTES = 1_000_000     # 3,000-4,100 records; measured, see above
+DEFAULT_MAX_BYTES = 1_000_000     # >= 2,850 records; measured, see above
 DEFAULT_KEEP = 1                  # so the ceiling is 2 x DEFAULT_MAX_BYTES
-MAX_LINE_BYTES = 512              # the worst measured line is 330; this is
-                                  # the floor under max_bytes, so a cap can
-                                  # never be set below one record
 MAX_LABEL_CHARS = 64              # a NAME. Nothing the lens saw, ever.
+# Room and band names come out of the config and are arbitrary strings, so
+# they are capped at the same 64 characters as the face label. Without that
+# cap MAX_LINE_BYTES below is an estimate rather than a ceiling, and a
+# 120-character band name would rotate the file on every single write.
+MAX_NAME_CHARS = 64
+MAX_LINE_BYTES = 640              # the worst record CAPPED names can make
+                                  # measures 499 B (measured 2026-09-03,
+                                  # every name at its cap and every number
+                                  # at its widest); this is that with
+                                  # headroom, and it is the floor under
+                                  # max_bytes, so a cap can never be set
+                                  # below one record.
 
 # The exact keys a record may carry. A fixed tuple rather than whatever the
 # caller passed, so there is nowhere for a frame, a crop or an embedding to
@@ -179,6 +214,16 @@ RECORD_FIELDS = ("at", "iso", "room", "old", "new", "rule", "distance_m",
 def default_log_path() -> Path:
     """``~/.local/state/jarvis/zones.jsonl`` (JARVIS_STATE_DIR in tests)."""
     return PATHS.STATE_DIR / "zones.jsonl"
+
+
+def _short(text: Any, limit: int = MAX_NAME_CHARS) -> str:
+    """One collapsed line of at most ``limit`` characters.
+
+    EVERY name that can reach a record goes through here -- the room, the
+    band, the face label -- which is what makes a record's maximum size
+    computable instead of estimated.
+    """
+    return " ".join(str(text or "").split())[:limit]
 
 
 # ------------------------------------------------------------------ camera
@@ -238,6 +283,9 @@ class Band:
     near_m: float
     far_m: float
 
+    def __post_init__(self):
+        object.__setattr__(self, "name", _short(self.name))
+
     def holds(self, metres: Optional[float]) -> bool:
         if metres is None:
             return False
@@ -282,8 +330,9 @@ class ZoneMap:
                                  % (self.room, lo.name, hi.name,
                                     hi.near_m, lo.far_m))
         object.__setattr__(self, "bands", bands)
+        object.__setattr__(self, "room", _short(self.room))
         object.__setattr__(self, "camera_zone",
-                           str(self.camera_zone or DEFAULT_CAMERA_ZONE))
+                           _short(self.camera_zone or DEFAULT_CAMERA_ZONE))
 
     @classmethod
     def office(cls) -> "ZoneMap":
@@ -365,10 +414,16 @@ def verdict(zmap: ZoneMap, *, presence: Optional[bool],
                   moving=moving, still=still, camera=camera)
     if camera is not None and camera.known:
         return Verdict(zone=zmap.camera_zone, rule=RULE_CAMERA, **common)
-    if presence is None:
-        return Verdict(zone=NO_OPINION, rule=RULE_SILENT, **common)
-    if not presence:
+    if presence is False:
         return Verdict(zone=ABSENT, rule=RULE_EMPTY, **common)
+    if presence is not True:
+        # None, "", 0, "unknown" -- anything that is not a straight yes or
+        # no. Only an explicit False may say the room is empty; everything
+        # else is "no opinion", because collapsing a non-answer into
+        # absence is how Jarvis goes quiet on a man sitting three feet
+        # away. RoomSensor.read() only ever gives True/False/None today;
+        # this is the guard for the next reader.
+        return Verdict(zone=NO_OPINION, rule=RULE_SILENT, **common)
     name = zmap.place(distance_m)
     if name is None:
         return Verdict(zone=UNPLACED, rule=RULE_UNPLACED, **common)
@@ -419,8 +474,10 @@ class ZoneLog:
     Rotation is a single ``os.replace`` to ``<name>.1`` when the next line
     would take the file past ``max_bytes``; the previous generation is
     overwritten, so the total on disk is at most ``(keep + 1) * max_bytes``
-    -- 2 MB at the defaults. Records measure 242-330 bytes (measured, see
-    the module docstring), so 1 MB is 3,000-4,100 of them.
+    -- 2 MB at the defaults. That bound is real only because every name in
+    a record is capped (``MAX_NAME_CHARS``), which puts 499 bytes under
+    ``MAX_LINE_BYTES`` as a measured ceiling rather than an estimate.
+    Office lines measure 234-350 bytes, so 1 MB is at least 2,850 of them.
 
     Every failure -- an unwritable directory, a full disk -- is counted and
     logged once at debug, and ``append`` returns False. A logging feature
@@ -516,7 +573,7 @@ class ZoneTracker:
                  now: Optional[Callable[[], float]] = None,
                  wall: Optional[Callable[[], float]] = None,
                  log: Optional[ZoneLog] = None):
-        self.room = str(room or zmap.room)
+        self.room = _short(room or zmap.room)
         self.zmap = zmap
         try:
             self.dwell_s = max(0.0, float(dwell_s))
@@ -591,7 +648,7 @@ class ZoneWatcher:
                  now: Optional[Callable[[], float]] = None,
                  wall: Optional[Callable[[], float]] = None,
                  read_bits: bool = True):
-        self.room = str(room or zmap.room)
+        self.room = _short(room or zmap.room)
         self.sensor = sensor
         self.zmap = zmap
         self.read_bits = bool(read_bits)
@@ -605,23 +662,45 @@ class ZoneWatcher:
         return self.tracker.zone
 
     def poll(self) -> Optional[Transition]:
-        """One reading. Returns a Transition only on a committed change."""
+        """One reading. Returns a Transition only on a committed change.
+
+        **ZERO IS NOT A PLACE.** ``parse_cm`` says so in as many words: 0
+        is a real reading meaning "no target of THIS kind", so it is
+        treated here exactly like a missing one -- it falls through to the
+        next entity, and if nothing is left it is recorded as no distance
+        at all rather than as a man standing on the module. The first pass
+        guarded the fallback with ``distance is None`` and so skipped it
+        for a detection entity publishing 0, which is precisely the case
+        below.
+
+        UNVERIFIED, and it must stay labelled that way until the hardware
+        answers: what the office LD2410 actually publishes on "Detection
+        distance" when only a STILL target is present. The device was off
+        the network when this was written (2026-09-03), so whether that
+        entity goes null, goes 0 or keeps the last value has NOT been
+        measured. All three are handled -- null and 0 both fall through to
+        the still distance -- but "handled" here means "reasoned about",
+        not "observed". ``scripts/zone_log.py`` is the instrument that
+        settles it.
+        """
         presence = self.sensor.read()
         distance = moving = still = None
-        if presence:
+        if presence is True:
             distance = self.sensor.read_distance(DETECTION_ENTITY)
             if self.read_bits:
                 moving_m = self.sensor.read_distance(MOVING_ENTITY)
                 still_m = self.sensor.read_distance(STILL_ENTITY)
                 moving = None if moving_m is None else moving_m > 0.0
                 still = None if still_m is None else still_m > 0.0
-                if distance is None:
+                if not distance:
                     # The detection entity is the primary, but a firmware
-                    # that does not publish it must not cost the band: the
-                    # STILL distance comes first because a man sitting is
-                    # the case the zones exist for.
+                    # that publishes neither a number nor anything at all
+                    # for it must not cost the band: the STILL distance
+                    # comes first because a man sitting is the case the
+                    # zones exist for.
                     distance = (still_m if still_m else None) or \
                                (moving_m if moving_m else None)
+            distance = distance or None       # 0.0 is "no target", not 0 m
         return self.tracker.observe(presence=presence, distance_m=distance,
                                     camera=self._camera_opinion(),
                                     moving=moving, still=still)
@@ -678,65 +757,150 @@ def log_path(cfg) -> Path:
     return Path(text).expanduser() if text else default_log_path()
 
 
-def zone_maps(cfg) -> Dict[str, ZoneMap]:
-    """Every configured room's ladder, in config order.
+def _room_key(name: Any) -> str:
+    """A room's lookup name: collapsed, lower-cased and capped.
 
-    Shaped after ``roomfabric.room_specs``: a LIST of labelled entries, and
-    a broken one is SKIPPED with a warning rather than raised on -- one
-    room with a typo in it must not take the others down. ``zones.enabled``
-    is the master switch and turns the whole record off.
+    The same function builds the key in ``read_rooms`` and looks it up in
+    ``zone_map_for``, so the two cannot disagree about what counts as the
+    same room.
     """
-    if not bool(_cfg_get(cfg, "zones.enabled", True)):
-        return {}
+    return _short(name).lower()
+
+
+def _rooms_raw(cfg):
+    """The ``zones.rooms`` list, or None when the config has no such key.
+
+    The difference decides the fallback. A config written BEFORE this
+    section existed has no list and still gets the built-in office ladder;
+    a config that HAS the list is the only authority for every room in it.
+    """
     raw = _cfg_get(cfg, "zones.rooms", None)
-    if not isinstance(raw, (list, tuple)):
-        return {}
-    out: Dict[str, ZoneMap] = {}
-    for entry in raw:
+    return raw if isinstance(raw, (list, tuple)) else None
+
+
+def read_rooms(cfg) -> Tuple[Dict[str, ZoneMap], Dict[str, str]]:
+    """``(the usable ladders, the rooms this REFUSES to record and why)``.
+
+    A broken entry is not quietly dropped. It is named, with the config key
+    that is wrong, so ``zone_map_for`` can refuse that room outright rather
+    than hand back a built-in ladder -- because a record written against
+    the bands he THOUGHT he had replaced is worse than no record at all: it
+    looks like it worked. Refusing costs him one room, and the log he then
+    reads is the log of the ladder he wrote.
+
+    One bad room still does not take the others down, exactly as in
+    ``roomfabric.room_specs``: it only takes itself.
+    """
+    maps: Dict[str, ZoneMap] = {}
+    refused: Dict[str, str] = {}
+    if not bool(_cfg_get(cfg, "zones.enabled", True)):
+        return maps, refused
+    raw = _rooms_raw(cfg)
+    if raw is None:
+        return maps, refused
+    for i, entry in enumerate(raw):
+        where = "zones.rooms[%d]" % i
         if not isinstance(entry, dict):
+            refused[where] = "%s is not a room entry" % where
+            log.warning("zones: %s is not a room entry; it records nothing",
+                        where)
+            continue
+        name = _room_key(entry.get("name"))
+        if not name:
+            refused[where] = "%s.name is empty" % where
+            log.warning("zones: %s has no name; it records nothing", where)
+            continue
+        if name in maps or name in refused:
+            # Two ladders both claiming one room have no defensible answer,
+            # so neither is used and the room is named as refused.
+            maps.pop(name, None)
+            refused[name] = ("zones.rooms names %r twice; two ladders cannot "
+                             "both be the room" % name)
+            log.warning("zones: %r is named twice in zones.rooms; that room "
+                        "records nothing until one entry goes", name)
             continue
         if not bool(entry.get("enabled", True)):
-            continue
-        name = " ".join(str(entry.get("name") or "").split()).lower()
-        if not name or name in out:
-            log.warning("zones: a room entry has no name, or repeats one; "
-                        "skipped")
+            refused[name] = "%s.enabled is false" % where
+            log.info("zones: %r is switched off at %s.enabled; it records "
+                     "nothing", name, where)
             continue
         try:
             bands = tuple(Band(str(b["name"]), float(b["near_m"]),
                                float(b["far_m"]))
                           for b in (entry.get("bands") or []))
-            out[name] = ZoneMap(name, bands,
-                                str(entry.get("camera_zone") or
-                                    DEFAULT_CAMERA_ZONE))
+            maps[name] = ZoneMap(name, bands,
+                                 str(entry.get("camera_zone") or
+                                     DEFAULT_CAMERA_ZONE))
         except (KeyError, TypeError, ValueError) as exc:
-            log.warning("zones: %s has unusable bands (%s); skipped", name, exc)
-    return out
+            refused[name] = "%s.bands is unusable (%s)" % (where, exc)
+            log.warning("zones: %s.bands is unusable (%s); %r records nothing "
+                        "until that is fixed -- it is NOT falling back to the "
+                        "built-in ladder", where, exc, name)
+    return maps, refused
+
+
+def zone_maps(cfg) -> Dict[str, ZoneMap]:
+    """Every configured room's USABLE ladder, in config order.
+
+    A room the config names but this module refuses is absent from here and
+    present in ``rejected_rooms``; the two together are the whole picture.
+    """
+    return read_rooms(cfg)[0]
+
+
+def rejected_rooms(cfg) -> Dict[str, str]:
+    """The rooms the config names that will record NOTHING, and the key
+    that is wrong. Empty is the healthy answer, and anything in here is
+    worth printing at the top of a run."""
+    return read_rooms(cfg)[1]
 
 
 def zone_map_for(cfg, room: str) -> Optional[ZoneMap]:
-    """The ladder for ONE room, or None.
+    """The ladder for ONE room, or None -- and None means RECORD NOTHING.
 
-    The config's entry wins; a box whose config predates this section still
-    gets the built-in office ladder, the same way roomfabric falls back to
-    the singular ``presence.room_sensor_*`` keys. ``zones.enabled`` False
-    is None for every room, the fallback included -- an off switch a
-    built-in default could walk around would not be one.
+    Four different Nones, every one of them deliberate:
+
+    * ``zones.enabled`` is false -- the master switch, and an off switch a
+      built-in default could walk around would not be one;
+    * the room's own entry says ``enabled: false``;
+    * the room's entry is malformed or duplicated -- it is REFUSED BY NAME,
+      never replaced by the shipped ladder. A typo in his band list must
+      not leave the log being written against the old bands and looking
+      like it worked;
+    * the config HAS a ``zones.rooms`` list and this room is not in it.
+
+    The single fallback left is a config written BEFORE this section
+    existed: no ``zones.rooms`` key at all still gets the built-in office
+    ladder, the same way roomfabric falls back to the singular
+    ``presence.room_sensor_*`` keys. Note that ``AssistantConfig`` serves
+    the ``zones`` block out of DEFAULTS, so in the running app that bridge
+    is never the path taken -- the office ladder always arrives through the
+    config, which is exactly why an edit to it has to be refused loudly
+    rather than replaced.
     """
     if not bool(_cfg_get(cfg, "zones.enabled", True)):
         return None
-    name = " ".join(str(room or "").split()).lower()
-    got = zone_maps(cfg).get(name)
+    name = _room_key(room)
+    maps, refused = read_rooms(cfg)
+    got = maps.get(name)
     if got is not None:
         return got
+    why = refused.get(name)
+    if why is not None:
+        log.error("zones: %r records nothing: %s", name, why)
+        return None
+    if _rooms_raw(cfg) is not None:
+        log.warning("zones: %r is not in zones.rooms; it records nothing",
+                    name)
+        return None
     return ZoneMap.office() if name == "office" else None
 
 
 __all__ = ["ABSENT", "BLIND_M", "Band", "CameraOpinion", "DEFAULT_DWELL_S",
-           "GATE_M", "MAX_LABEL_CHARS", "MAX_LINE_BYTES", "NO_OPINION",
-           "OFFICE_BANDS", "RECORD_FIELDS", "RULE_BAND", "RULE_CAMERA",
-           "RULE_EMPTY", "RULE_SILENT", "RULE_UNPLACED", "STILL_FLOOR_M",
-           "Transition", "UNPLACED", "Verdict", "ZoneLog", "ZoneMap",
-           "ZoneTracker", "ZoneWatcher", "default_log_path", "dwell_s",
-           "log_keep", "log_max_bytes", "log_path", "verdict",
-           "zone_map_for", "zone_maps"]
+           "GATE_M", "MAX_LABEL_CHARS", "MAX_LINE_BYTES", "MAX_NAME_CHARS",
+           "NO_OPINION", "OFFICE_BANDS", "RECORD_FIELDS", "RULE_BAND",
+           "RULE_CAMERA", "RULE_EMPTY", "RULE_SILENT", "RULE_UNPLACED",
+           "STILL_FLOOR_M", "Transition", "UNPLACED", "Verdict", "ZoneLog",
+           "ZoneMap", "ZoneTracker", "ZoneWatcher", "default_log_path",
+           "dwell_s", "log_keep", "log_max_bytes", "log_path", "read_rooms",
+           "rejected_rooms", "verdict", "zone_map_for", "zone_maps"]
