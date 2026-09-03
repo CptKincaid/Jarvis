@@ -420,7 +420,37 @@ DEFAULTS: dict = {
                  # (POST <url>/turn_off) instead of merely not polling it.
                  "room_sensor_enabled": False, "room_sensor_url": "",
                  "room_sensor_power_url": "",
-                 "room_sensor_timeout_s": 1.5},
+                 "room_sensor_timeout_s": 1.5,
+                 # THREE ROOMS (jarvis/roomfabric.py). The plural
+                 # of the four keys above, shaped exactly like
+                 # gmail.accounts: a LIST of labelled entries, and while it
+                 # is empty the singular keys above are used instead, so a
+                 # config written before this existed keeps working with no
+                 # edit. room_sensor_enabled stays the master switch over
+                 # the whole fabric. Each entry is
+                 #   {"name": "office",              # the identifier
+                 #    "label": "the office",         # what gets spoken
+                 #    "url": "http://192.168.50.60",
+                 #    "power_url": "",               # optional; see above
+                 #    "primary": true,               # where the Spark is
+                 #    "enabled": true}
+                 # An entry with no url or no name is skipped rather than
+                 # fatal: one unfinished room must not take the others down.
+                 "rooms": [],
+                 # The fabric's four timers, argued in jarvis/roomfabric.py.
+                 # enter: how long a new room must hold occupied before it
+                 # takes over (a doorway pass-through is ~1 s in the beam).
+                 # leave: how long the current room may read empty and still
+                 # be believed -- the LD2410's own absence delay is already
+                 # 5 s, so anything under that re-litigates the device.
+                 # switch: the floor between room changes, the doorway
+                 # anti-flap. stale: when the last known room stops being
+                 # named at all. stuck: a room reading occupied this long
+                 # without a break is a fan, not a man, and is dropped from
+                 # the picture until it clears.
+                 "rooms_poll_s": 2.0, "rooms_enter_hold_s": 2.0,
+                 "rooms_leave_hold_s": 8.0, "rooms_switch_min_s": 6.0,
+                 "rooms_stale_after_s": 90.0, "rooms_stuck_after_h": 12.0},
     # Offline mode and the camera curfew (jarvis/sensing.py). ONE object
     # answers "may this sensor run", combining the manual switch (spoken:
     # "offline mode", "deactivate presence", "stop watching"), this daily
