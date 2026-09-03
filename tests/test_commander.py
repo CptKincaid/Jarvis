@@ -1770,6 +1770,54 @@ def test_tier_one_samples_survive_the_intent_gate(tmp_path, monkeypatch):
         assert verdict != IntentClassifier.NO, (name, phrase, conf)
 
 
+# The two Tier-1 families that landed in the same merge (integration-0903):
+# enrol-in-app's face rungs sit HIGH in the registry so "remember Heather's
+# face" beats "remember", "forget Heather's face" beats "leave time forget"
+# and "add Heather's face" beats "list add"; file-and-remote's send/remote
+# rungs sit LOWER and key on send/email/put/get verbs with a file or a
+# machine. Each branch proved its own ladder; nobody had run the UNION. The
+# gate test above only asks that a sample matches *some* rung, which would
+# not notice "forget heather's face" being swallowed by "leave time forget",
+# so this one asks which rung answers FIRST -- the rung that actually runs.
+UNION_FIRST_RUNG = {
+    # face family, incl. the verbs it shares with older rungs
+    "enrol my face": "face enrol",
+    "add heather's face to the gallery": "face enrol",
+    "remember heather's face": "face enrol",
+    "register me": "face enrol",
+    "forget heather's face": "face forget",
+    "delete heather's face": "face forget",
+    "remove ali's face from the gallery": "face forget",
+    "who do you recognise": "face gallery",
+    "am i enrolled": "face gallery",
+    # send/remote family
+    "email the lab report to heather": "send file",
+    "put the budget on hpcomputer": "remote push",
+    "copy the lab report to hpcomputer": "remote push",
+    "get the budget from hpcomputer": "remote pull",
+    "is hpcomputer up": "remote status",
+    "what's the disk on hpcomputer": "remote query",
+    "run the build on hpcomputer": "remote freeform",
+    # a sentence with BOTH families' words in it is a transfer, not an
+    # enrolment: the verb decides, and the send/remote claim rules then
+    # judge whether "face" names a file at all
+    "send heather's face to hpcomputer": "remote push",
+    "email my face to heather": "send file",
+    # ...and the neighbours each family had to beat still answer their own
+    "forget the walk to wisenbaker": "leave time forget",
+    "remember that the lab is on tuesday": "remember",
+    "add milk to the shopping list": "list add",
+}
+
+
+@pytest.mark.parametrize("phrase,expected", sorted(UNION_FIRST_RUNG.items()))
+def test_face_and_remote_families_do_not_shadow_each_other(phrase, expected):
+    from jarvis.commander import ASSISTANT_TIER1
+    t = phrase.strip().lower().rstrip(".!?")
+    first = next((c.name for c in ASSISTANT_TIER1 if c.matcher(t)), None)
+    assert first == expected, (phrase, first)
+
+
 # The dialogue-board phrasings that MISS their Tier-1 regex and so fall
 # through to the classifier. The exact-match bypass cannot help here, which
 # is precisely why the vocabulary has to carry them: the silent drop this
