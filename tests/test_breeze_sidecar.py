@@ -1297,6 +1297,86 @@ def test_a_refusal_before_any_audio_renders_that_chunk_on_f5(breeze, sock_path):
     assert breeze.cache.get(breeze._cache_key("breeze", "Good evening, sir.")) is None
 
 
+FOUR_SENTENCES = ("I'm afraid the processing of your request took a moment "
+                  "longer than expected, sir. It seems my new voice is still "
+                  "finding its footing. The inbox is quiet, for once, and the "
+                  "calendar shows nothing before noon tomorrow. I shall let "
+                  "you know if that changes, sir.")
+
+
+def test_a_chunk_that_falls_back_to_f5_gets_f5s_own_text(breeze, sock_path):
+    """The chunk was prepared for BREEZE: no short-line pad
+    (_ENGINE_NEEDS_SHORT_PAD["breeze"] is False; the floor it works around
+    is F5's) and Breeze's self-normalising rule set (no "6:00 pm" -> "six
+    pee em"). When the sidecar refused it before audio, _fallback_chunk
+    handed that same text to F5, which rendered a 14-byte line with no pad
+    -- the measured floor case, "said buy milk really fast", 0.55-1.29 s
+    short -- and raw clock digits F5 was never listened to on, and filed
+    the audio under a key no native F5 reply looks up.
+
+    F5 now gets the text its own rules were measured on: the pad first,
+    then F5's rules over the Breeze form, which matched the native F5 form
+    on 17 of 17 of his real lines (calendar, rooms, clock times, shouted
+    course codes, terse acks) -- so the cache key is the native one too."""
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [], refuse="not ready (CUDA graphs were not captured)"))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (
+            f5.append(text), open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak("It is 6:00 pm.", block=True)
+    finally:
+        srv.close()
+    want = TTS(engine="f5", cache=False).spoken_form("It is 6:00 pm.")
+    assert want == "It is six pee em, sir."      # the pad AND the meridiem rule
+    assert f5 == [want]
+    assert breeze.cache.get(breeze._cache_key("f5", want)) is not None
+    assert breeze.cache.get(breeze._cache_key("f5", "It is 6:00 pm.")) is None
+    assert breeze.cache.get(breeze._cache_key("breeze", "It is 6:00 pm.")) is None
+
+
+def test_a_refused_reply_is_rendered_in_f5s_own_chunks_and_cached_as_such(
+        breeze, sock_path):
+    """Since the join a Breeze chunk is the whole reply, so the fallback
+    handed F5 one 260-character render: one cache entry under a key that a
+    native F5 reply -- split at 240, sentence by sentence -- would never
+    look up, and ~2 s to its first byte where the first sentence alone is
+    ~0.5 s (F5 renders at RTF 0.063). F5 now gets its own split, each piece
+    looked up and filed exactly as a native F5 utterance would be, so the
+    next time the room says any of it on F5 it is on disk."""
+    srv = FakeSidecar(sock_path, sidecar_handler([], refuse="not ready"))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (
+            f5.append(text), open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak(FOUR_SENTENCES, block=True)
+    finally:
+        srv.close()
+    want = TTS(engine="f5", cache=False).render_chunks(FOUR_SENTENCES)
+    assert len(want) >= 3, want
+    assert f5 == want
+    assert len(FakeProc.spawned) == len(want)          # every piece, in order
+    assert all(breeze._cached("f5", piece) for piece in want)
+    assert breeze.cache.stats()["files"] == len(want)
+
+
+def test_a_fallback_piece_already_on_disk_is_not_rendered_again(breeze,
+                                                                sock_path):
+    """A line the room has said on F5 before is a hit for the fallback too --
+    the whole point of filing it under the native key."""
+    srv = FakeSidecar(sock_path, sidecar_handler([], refuse="not ready"))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (
+            f5.append(text), open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak("Good evening, sir.", block=True)
+        breeze.speak("Good evening, sir.", block=True)
+    finally:
+        srv.close()
+    assert f5 == ["Good evening, sir."]               # rendered once
+    assert len(FakeProc.spawned) == 2                 # played twice
+
+
 def test_a_failure_mid_stream_is_not_re_spoken_and_is_not_cached(breeze,
                                                                  sock_path):
     """Half a sentence has already been heard. Re-rendering it on F5 would
@@ -1430,12 +1510,17 @@ def test_a_refusal_on_the_second_chunk_does_not_re_speak_the_first(
     finally:
         srv.close()
     assert seen == TWO_CHUNKS                   # breeze was asked for both
-    assert f5 == [TWO_CHUNKS[1]]                # F5 rendered ONLY the second
-    assert len(FakeProc.spawned) == 2           # two players, one per sentence
+    # F5 rendered ONLY the second -- as its own pieces (TTS._refit), which
+    # here are four identical sentences: one render, three cache hits, four
+    # players. Not a word of sentence 1 reached it.
+    pieces = breeze._split_sentences(TWO_CHUNKS[1], engine="f5")
+    assert f5 == pieces[:1]
+    assert len(FakeProc.spawned) == 1 + len(pieces)
     assert bytes(FakeProc.spawned[0].fed).endswith(first)
     # each sentence filed under the engine that RENDERED it
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[0])) is not None
-    assert breeze.cache.get(breeze._cache_key("f5", TWO_CHUNKS[1])) is not None
+    assert all(breeze.cache.get(breeze._cache_key("f5", p)) is not None
+               for p in pieces)
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[1])) is None
     assert breeze.engine == "breeze"            # one bad chunk does not retire it
 
@@ -1467,12 +1552,14 @@ def test_a_cut_first_chunk_keeps_its_heard_half_and_recovers_the_rest(
     assert seen == TWO_CHUNKS
     pieces = breeze._split_sentences(TWO_CHUNKS[0], engine="f5")
     # a COUNT, because these 13 sentences are deliberately identical: what
-    # is asserted is how much came back, not which words
-    assert 0 < len(f5) < len(pieces), "the unheard tail was dropped"
-    assert f5 == pieces[len(pieces) - len(f5):], "and only the tail, in order"
-    assert len(f5) <= len(pieces) // 2, "half of it was HEARD; do not repeat it"
-    # chunk 1's cut audio, then its recovered tail, then chunk 2
-    assert len(FakeProc.spawned) == 2 + len(f5)
+    # is asserted is how much came back, not which words. Identical also
+    # means the fallback renders the tail ONCE and replays it from the cache
+    # (TTS._refit looks each piece up first), so the count is of PLAYERS:
+    # chunk 1's cut audio, then the recovered tail, then chunk 2.
+    recovered = len(FakeProc.spawned) - 2
+    assert 0 < recovered < len(pieces), "the unheard tail was dropped"
+    assert f5 == pieces[:1], "and only the tail's text, rendered once"
+    assert recovered <= len(pieces) // 2, "half of it was HEARD; do not repeat it"
     assert bytes(FakeProc.spawned[0].fed).endswith(first[:len(first) // 2])
     assert bytes(FakeProc.spawned[-1].fed).endswith(second)
     # the truncated one is not cached; the whole one is; the tail is filed
@@ -1541,10 +1628,13 @@ def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(
     assert seen == TWO_CHUNKS
     pieces = breeze._split_sentences(TWO_CHUNKS[0], engine="f5")
     # a COUNT, because these 13 sentences are deliberately identical: what
-    # is asserted is how much came back, not which words
-    assert 0 < len(f5) <= len(pieces) // 2, "the heard half was re-rendered"
-    assert f5 == pieces[len(pieces) - len(f5):], "only the unheard tail"
-    assert len(FakeProc.spawned) == 2 + len(f5), "chunk 2 was dropped"
+    # is asserted is how much came back, not which words -- and, being
+    # identical, the tail is one F5 render replayed from the cache, so the
+    # count is of PLAYERS (see the cut-chunk test above).
+    recovered = len(FakeProc.spawned) - 2
+    assert 0 < recovered <= len(pieces) // 2, "the heard half was re-rendered"
+    assert f5 == pieces[:1], "only the unheard tail's text, rendered once"
+    assert bytes(FakeProc.spawned[-1].fed).endswith(second), "chunk 2 was dropped"
     assert bytes(FakeProc.spawned[0].fed).endswith(first[:len(first) // 2])
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[0])) is None
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[1])) is not None
@@ -1590,10 +1680,16 @@ def test_the_sidecar_dying_between_two_sentences_finishes_the_reply_on_f5(
     finally:
         srv.close()
     assert seen == [TWO_CHUNKS[0]]
-    assert f5 == [TWO_CHUNKS[1]], "the rest of the reply was dropped"
-    assert len(FakeProc.spawned) == 2
+    # All of chunk 2, once, in order -- as F5's OWN pieces: the fallback
+    # re-splits a Breeze chunk the way a native F5 reply is split and files
+    # each piece under the key that reply would look up (TTS._refit). Four
+    # identical sentences here, so one render, three cache hits, four
+    # players after chunk 1's.
+    pieces = breeze._split_sentences(TWO_CHUNKS[1], engine="f5")
+    assert f5 == pieces[:1], "the rest of the reply was dropped"
+    assert len(FakeProc.spawned) == 1 + len(pieces)
     assert bytes(FakeProc.spawned[0].fed).endswith(first)   # said once, whole
-    assert breeze.cache.get(breeze._cache_key("f5", TWO_CHUNKS[1])) is not None
+    assert breeze.cache.get(breeze._cache_key("f5", pieces[0])) is not None
 
 
 def test_the_phone_falls_back_to_f5_when_the_sidecar_is_gone(tmp_path,

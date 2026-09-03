@@ -1993,15 +1993,20 @@ class TTS:
         self._burst_announced = True
         bus.publish(SpeakingState(active=True, amplitude=0.0))
 
-    def _pronounce(self, text: str) -> str:
-        """Apply the pronunciation dictionary (never fails speech)."""
+    def _pronounce(self, text: str, engine: str | None = None) -> str:
+        """Apply the pronunciation dictionary (never fails speech).
+
+        ``engine`` defaults to the current one; the F5 fallback for a
+        refused Breeze chunk names its own (see _refit)."""
         if not self._pronunciation:
             return text
         try:
             # The ENGINE decides, not this call site: an engine that reads
             # "9:10 am" correctly is made WORSE by being handed "nine ten ay
             # em" (fish voiced it as "I'm"; Breeze does the same, measured).
-            return pronounce.apply(text, engine=self._engine) or text
+            return pronounce.apply(
+                text, engine=self._engine if engine is None else engine
+            ) or text
         except Exception:
             log.exception("pronunciation apply failed")
             return text
@@ -2037,6 +2042,37 @@ class TTS:
         against the speech without a GPU, a speaker or a running app."""
         cleaned = self._clean_for_speech(text or "")
         return self._pronounce(cleaned) if cleaned else ""
+
+    def _refit(self, text: str, engine: str) -> list[str]:
+        """``text``, prepared for the engine that refused it, re-prepared as
+        ``engine``'s own chunks: the text its rules were measured on, split
+        the way it splits, keyed the way it keys.
+
+        WHY. A chunk reaches the F5 fallback carrying Breeze's preparation:
+        no short-line pad (_ENGINE_NEEDS_SHORT_PAD["breeze"] is False -- the
+        floor the pad works around is F5's) and Breeze's self-normalising
+        rule set (no "6:00 pm" -> "six pee em", no "049" -> "zero four
+        nine"). F5 then rendered a 14-byte line with no pad, which is the
+        measured floor case ("said buy milk really fast", 0.55-1.29 s short),
+        and raw clock digits it was never listened to on; and it filed the
+        audio under a key no native F5 reply looks up, so a later F5
+        utterance of the same line simply missed.
+
+        The order is the room's own. The pad runs BEFORE the pronunciation
+        pass because that is where _clean_for_speech runs it, so the key
+        comes out byte-identical to a native F5 utterance of the same line.
+        Measured on 17 of his real lines (calendar, rooms, clock times,
+        shouted course codes, terse acks): pad-then-F5-rules over the Breeze
+        form matched the native F5 form on all 17. The split is F5's too
+        (240 chars, _ENGINE_CHUNKING): since the join a Breeze chunk is the
+        whole reply, and a 560-character F5 render was one cache entry
+        nothing would ever hit and ~2 s to its first byte where the first
+        sentence alone is ~0.5 s.
+        """
+        line = (pad_short_line(text)
+                if _ENGINE_NEEDS_SHORT_PAD.get(engine, False) else text)
+        line = self._pronounce(line, engine=engine)
+        return self._split_sentences(line, engine=engine)
 
     def _cache_key(self, engine: str, spoken: str) -> str:
         if engine == "fish":
@@ -2406,32 +2442,52 @@ class TTS:
             return True
 
         def _fallback_chunk(sent: str) -> bool:
-            """Render one chunk on F5 and queue it. True when it was queued.
+            """Render one chunk on F5 and queue it. True when any of it was.
 
             Used when Breeze fails before any audio: a dropped chunk is a
             hole in the sentence, and Jarvis in the 2.79 voice is better than
             Jarvis missing a clause.
+
+            ``sent`` was prepared for Breeze. F5 gets it re-prepared as its
+            own pieces (TTS._refit), each looked up in the cache and filed
+            under F5's key exactly as a native F5 reply would be -- so the
+            fallback voice speaks the text its rules were measured on, and
+            the next F5 utterance of the same line is a hit.
             """
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.close()
+            log.warning("falling back to %s for this chunk", BREEZE_FALLBACK)
             try:
-                log.warning("falling back to %s for this chunk",
-                            BREEZE_FALLBACK)
-                if self.load_breeze_fallback():
-                    self._synth_f5(sent, tmp.name)
-                    if not self._stop_flag:
-                        # under the RENDERING engine's key: breeze-keyed F5
-                        # audio would replay in the wrong voice from cache
-                        self._store(BREEZE_FALLBACK, sent, tmp.name)
-                    wav_q.put((tmp.name, True))
-                    return True
+                if not self.load_breeze_fallback():
+                    return False
             except Exception:
                 log.exception("fallback synth failed too")
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            return False
+                return False
+            queued = False
+            for piece in self._refit(sent, BREEZE_FALLBACK):
+                if self._stop_flag:
+                    break
+                cached = self._cached(BREEZE_FALLBACK, piece)
+                if cached is not None:
+                    wav_q.put((cached, False))
+                    queued = True
+                    continue
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.close()
+                try:
+                    self._synth_f5(piece, tmp.name)
+                except Exception:
+                    log.exception("fallback synth failed too")
+                    try:
+                        os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                    break
+                if not self._stop_flag:
+                    # under the RENDERING engine's key: breeze-keyed F5
+                    # audio would replay in the wrong voice from cache
+                    self._store(BREEZE_FALLBACK, piece, tmp.name)
+                wav_q.put((tmp.name, True))
+                queued = True
+            return queued
 
         def _producer():
             try:
