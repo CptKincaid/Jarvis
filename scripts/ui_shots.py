@@ -98,6 +98,10 @@ tests/test_ui_shots.py pins ``STATES`` to it.
                       radar unreachable long enough to trip the breaker, and
                       the camera off for the curfew. Every unknown reads NO
                       OPINION with a reason, never "nobody there"
+  28  standby-over-sensors  the console goes quiet with the SENSORS page
+                      still open: the tab row goes with the footer, the page
+                      is shut, and the note carries the number of radar
+                      requests sent across the standby dwell (it is zero)
 """
 from __future__ import annotations
 
@@ -151,6 +155,7 @@ STATES = (
     ("25", "header-worst", None),
     ("26", "sensors", None),
     ("27", "sensors-fault", None),
+    ("28", "standby-over-sensors", None),
 )
 
 
@@ -411,8 +416,12 @@ class RigRadar:
         # host -> (presence bit, detection distance in cm), or None for a
         # host that answers nothing at all (the kitchen ESP32 is unflashed)
         self.rooms = {self.OFFICE: (True, 142), self.KITCHEN: None}
+        # Every attempt, reachable or not: state 28 asserts that a page shut
+        # by standby sends none, and a raise is still a request.
+        self.calls = 0
 
     def __call__(self, url: str, timeout: float) -> str:
+        self.calls += 1
         host = urllib.parse.urlsplit(url).hostname or ""
         answer = self.rooms.get(host)
         if answer is None:
@@ -1068,8 +1077,29 @@ class Rig:
             "rooms read NO OPINION with the retry in the fault line and the "
             "round trip a dash (no request was sent); the camera row carries "
             "the curfew sentence. Nothing here reads 'nobody there'")), 0)
-        S(lambda: (win.sensors_toggle(),
-                   OPTIONS.__setitem__("camera.preview", False),
+        # 28 standby WITH the page open ------------------------------------
+        # main_window._set_footer_hidden's own words: in standby the panel is
+        # "a clock and nothing else". The tab row is packed above the stage,
+        # so it was untouched by that and shipped lit and clickable over the
+        # dimmed clock. Hiding the row is only half: a page left open would
+        # keep POLLING behind the clock, at a radar the curfew may just have
+        # powered down. The note carries the request count for the dwell.
+        S(lambda: (self.begin("28", "standby-over-sensors"),
+                   setattr(self.radar, "calls", 0),
+                   setattr(self.desk, "idle", 99999.0),
+                   self.publish(DeskState(at_desk=False, idle_s=99999.0))), 0)
+        S(lambda: self.wait_until(lambda: win.modes.mode == STANDBY, 6000), None)
+        S(lambda: None, 2500)
+        S(lambda: self.capture("28", "standby-over-sensors", note=(
+            "the SENSORS page was open when the console went quiet: the tab "
+            "row is gone with the footer, the page is shut, and the radar "
+            "transport was called %d times across the standby dwell"
+            % self.radar.calls)), 0)
+        S(lambda: (setattr(self.desk, "idle", 0.0),
+                   self.publish(DeskState(at_desk=True, idle_s=0.0,
+                                          returned=True))), 0)
+        S(lambda: self.wait_until(lambda: win.modes.mode == ACTIVE, 4000), None)
+        S(lambda: (OPTIONS.__setitem__("camera.preview", False),
                    win._on_config_change(CAMERA_PREVIEW_OPTION, False)), 400)
 
         S(self.teardown, 200)

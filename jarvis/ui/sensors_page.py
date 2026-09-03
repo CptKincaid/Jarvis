@@ -20,7 +20,11 @@ The tab row is a MODULE OF ITS OWN, one row under the wordmark, and this
 page draws none of it: 2026-09-03, his words, "make a little tab to click
 thats underneath jarvis, that can be the area that has multiple tabs".
 The strip owns show()/hide(), which is also what keeps "polls only while
-it is on screen" true now that flipping in and out is one click.
+it is on screen" true now that flipping in and out is one click -- and
+STANDBY goes through the same seam: the console hides the row and selects
+CHAT (main_window._set_tabs_hidden), so a page left open when he walks
+away is shut rather than polling behind the clock (measured on the photo
+rig, state 28: 0 requests across the standby dwell).
 
 WHAT THE HARDWARE CAN ACTUALLY TELL HIM, because the page must not imply
 more. The office sensor is an HLK-LD2410C on an ESP32 behind ESPHome's
@@ -417,19 +421,44 @@ def camera_room_name(get_option: Optional[Callable], specs) -> str:
                  if getattr(s, "primary", False)), "")
 
 
-def read_overrules(get_option: Optional[Callable]) -> bool:
-    """Whether the camera is allowed to overrule the radar. Defaults to
-    TRUE: it is what he asked for in the first place, and the toggle exists
-    so he can watch the fusion with it off, not because off is the norm."""
+def read_overrules_noted(get_option: Optional[Callable]) -> tuple:
+    """(whether the camera may overrule the radar) and (what the config
+    lost getting there). Never raises.
+
+    Defaults to TRUE: it is what he asked for in the first place, and the
+    toggle exists so he can watch the fusion with it off, not because off
+    is the norm. Absent is not a complaint, so it carries no note.
+
+    ONLY A REAL BOOLEAN COUNTS, and that is the repair. ``bool(value)`` on
+    anything else is the same silent coercion the bands had: a hand edit of
+    ``"presence.camera_overrules": "false"`` is TRUE to bool(), so the
+    toggle rendered ON, showed him his own setting inverted, and one press
+    of SAVE wrote ``true`` over the word he typed. A number is refused for
+    the same reason -- 0/1 for a switch is a guess about which of the two
+    he meant, and this page destroys the original on SAVE.
+    """
     if not callable(get_option):
-        return True
+        return True, ""
     try:
-        value = get_option(OPTION_CAMERA_OVERRULES, True)
+        value = get_option(OPTION_CAMERA_OVERRULES, None)
     except Exception:                     # noqa: BLE001 - config boundary
         log.debug("sensors page: %s unreadable", OPTION_CAMERA_OVERRULES,
                   exc_info=True)
-        return True
-    return True if value is None else bool(value)
+        return True, ""
+    if value is None:                     # absent: the default, silently
+        return True, ""
+    if isinstance(value, bool):
+        return value, ""
+    log.warning("sensors page: %s is not usable (%s); using true",
+                OPTION_CAMERA_OVERRULES, _short(value))
+    return True, ("camera overrules radar: %s in assistant.json is not "
+                  "usable (true or false) — showing the default on, and "
+                  "SAVE would write that over it" % _short(value))
+
+
+def read_overrules(get_option: Optional[Callable]) -> bool:
+    """Whether the camera is allowed to overrule the radar. Never raises."""
+    return read_overrules_noted(get_option)[0]
 
 
 def zone_for_distance(metres, bands: Bands) -> str:
@@ -953,6 +982,12 @@ class SensorPoller:
     1186 ms, that is not free. ``start()``/``stop()`` are called from
     show()/hide() and nowhere else.
 
+    ONE THREAD AT A TIME, and it is an invariant rather than a hope: a run
+    is a generation number, the thread that is still finishing the last
+    run's request ADOPTS the next one, and only that thread ever releases
+    its own handle. See ``start()`` for the two shapes of the bug this
+    replaces -- both measured, both on this branch.
+
     ``get`` is the transport seam (the same one ``RoomSensor`` exposes);
     the default is roomsensor's own, so there is exactly ONE HTTP client in
     the tree for these devices, with one 4 KB cap and one parser to review.
@@ -967,11 +1002,21 @@ class SensorPoller:
         self._get = get
         self.timeout_s = float(timeout_s)
         self._now = now or time.perf_counter
+        # Keyed by room and deliberately OUTLIVING a run: the breaker state
+        # of a radar that is unplugged is worth keeping across a tab flip.
+        # That is only safe because exactly one thread ever touches them --
+        # see start(); when two did, one round of failures doubled the
+        # cooldown twice (measured 30 s -> 120 s, 2026-09-03).
         self._sensors: dict = {}
-        self._lock = threading.Lock()
+        # ONE condition guards the whole run state. A Condition and not a
+        # Lock because stop() has to be able to cut the loop's sleep short.
+        self._cond = threading.Condition(threading.Lock())
         self._thread: Optional[threading.Thread] = None
-        # A stop flag PER RUN, not one shared Event -- see stop().
-        self._stop: Optional[threading.Event] = None
+        self._armed = False               # is a run on?
+        self._gen = 0                     # which run; bumped by start/stop
+        self._on_rows: Optional[Callable] = None
+        self._post: Optional[Callable] = None
+        self._interval = POLL_S
         self.post_failed = False
 
     # ------------------------------------------------------------ one pass
@@ -1000,10 +1045,19 @@ class SensorPoller:
         cm = parse_distance_cm(body)
         return None if cm is None else cm / 100.0
 
-    def poll_once(self) -> tuple:
-        """One pass over every room. Never raises."""
+    def poll_once(self, alive: Optional[Callable] = None) -> tuple:
+        """One pass over every room. Never raises.
+
+        ``alive`` is the poll thread's own "is my run still the current
+        one". It is checked before every request, not once per pass, so a
+        stop costs at most the ONE read already in flight. MEASURED with
+        his two rooms and a transport parked inside the first read: 4
+        requests went out after the stop before this, 1 after.
+        """
         rows = []
         for spec in self.specs:
+            if alive is not None and not alive():
+                break
             sensor = self._sensor(spec)
             blocked = blocked_reason(self.policy)
             status = dict(sensor.status())
@@ -1020,7 +1074,12 @@ class SensorPoller:
             present = sensor.read()
             sent = sensor.reads > before
             rtt = (self._now() - t0) * 1000.0 if sent else None
-            distance = self._distance(spec) if present is not None else None
+            # The SECOND request of the room, and gated by the same run
+            # check: a stop that lands inside the presence read must not be
+            # followed by a distance read nobody will ever paint.
+            distance = (self._distance(spec)
+                        if present is not None
+                        and (alive is None or alive()) else None)
             status = dict(sensor.status())
             status["blocked"] = ""
             rows.append(Reading(name=spec.name, label=_spoken(spec),
@@ -1035,28 +1094,55 @@ class SensorPoller:
         """Poll on a thread of our own; hand results back through ``post``
         (the Tk thread hop). Idempotent.
 
-        The stop flag is created HERE, per run, and captured by the loop.
-        The old code shared one Event and cleared it on every start, so a
-        thread still inside a blocking ``get(url, 3.0)`` had its stop flag
-        taken away from under it and looped forever: four open/close cycles
-        measured 4 threads all polling one ESP32 at once. A tab is far
-        easier to flip in and out of than F9, so that only got worse.
+        THE RUN IS A NUMBER, NOT A THREAD. ``start()`` arms a new
+        generation; the poll thread reads that generation at the top of
+        every pass. So when a start arrives while the last run's thread is
+        still inside ``get(url, 3.0)``, that thread ADOPTS the new run --
+        no second thread is created, and the two of them can never hold
+        one ``RoomSensor``. The handle is released by the thread itself,
+        under this same lock, so start() sees either a live thread (hand
+        it the run) or none (make one) and never a gap between the two.
+
+        TWO MEASURED BUGS THIS REPLACES, both on this branch.
+        d41b52a shared ONE stop Event and cleared it on every start, so a
+        thread inside a blocking read had its flag taken away and looped
+        forever: 6 live "sensors-page" threads that never drained.
+        dddaeeb gave each run its own Event but ``stop()`` released the
+        Thread handle BEFORE joining it, so this guard read None while the
+        old thread was still in the request and built a second loop beside
+        it: peak 4 concurrent threads on one ESP32 while flipping the tab,
+        and one round of failures doubled that room's breaker twice --
+        cooldown 30 s -> 120 s where the design says 60 s.
         """
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            stop = threading.Event()
-            self._stop = stop
+        with self._cond:
+            if (self._armed and self._thread is not None
+                    and self._thread.is_alive()):
+                return                    # already running: idempotent
+            self._on_rows = on_rows
+            self._post = post
+            self._interval = max(0.2, float(interval_s))
+            self._gen += 1
+            self._armed = True
             self.post_failed = False
-            thread = threading.Thread(target=self._loop, daemon=True,
-                                      name=POLL_THREAD_NAME,
-                                      args=(stop, on_rows, post, interval_s))
+            if self._thread is not None and self._thread.is_alive():
+                # Still finishing the previous run's request. It picks this
+                # run up on its way round rather than dying beside a
+                # replacement that polls the same sensor at the same time.
+                self._cond.notify_all()
+                return
+            thread = threading.Thread(target=self._worker, daemon=True,
+                                      name=POLL_THREAD_NAME)
             self._thread = thread
         thread.start()
 
-    def _loop(self, stop: threading.Event, on_rows: Callable,
-              post: Optional[Callable], interval_s: float) -> None:
-        """One run of the poll loop, bound to the flag it was started with.
+    def _worker(self) -> None:
+        """The one poll thread. It serves RUNS, not one run.
+
+        It exits -- and releases its own handle, under the lock ``start()``
+        holds -- the moment it comes round to find no run armed. That is
+        the whole of the lifecycle: there is no handle for stop() to drop
+        early and no Event for start() to clear out from under a blocking
+        read.
 
         ``post`` failing twice in a row ENDS the run, loudly. The hop is
         the only way to the Tk thread, so a loop that cannot make it can
@@ -1065,43 +1151,91 @@ class SensorPoller:
         saying why (measured: every self.after() raising "main thread is
         not in main loop" while the page kept polling).
         """
-        misses = 0
-        while not stop.is_set():
+        try:
+            self._serve()
+        finally:
+            # Belt and braces for a way out this loop has no name for (an
+            # unexpected raise): the handle must not outlive the thread, or
+            # `running` would say yes with nobody polling. Guarded on
+            # identity so it cannot clobber a thread start() has already
+            # put in its place.
+            with self._cond:
+                if self._thread is threading.current_thread():
+                    self._thread = None
+
+    def _serve(self) -> None:
+        misses, served = 0, None
+        while True:
+            with self._cond:
+                if not self._armed:
+                    # The handle goes back HERE and nowhere else, so a
+                    # start() under this lock can never mistake a thread on
+                    # its way out for a live one, or a live one for gone.
+                    self._thread = None
+                    return
+                gen = self._gen
+                on_rows, post, interval = self._on_rows, self._post, self._interval
+            if gen != served:             # a new run: its own miss count
+                misses, served = 0, gen
             try:
-                rows = self.poll_once()
+                rows = self.poll_once(alive=lambda g=gen: self._current(g))
             except Exception:             # noqa: BLE001 - a diagnostic page
                 log.exception("sensors page: poll failed")
                 rows = ()
-            if stop.is_set():
-                return
+            if not self._current(gen):
+                continue                  # stopped or replaced mid-pass
             try:
                 (post or (lambda fn: fn()))(lambda r=rows: on_rows(r))
                 misses = 0
             except Exception:             # noqa: BLE001 - a dead widget
                 misses += 1
                 if misses >= POST_FAILS_MAX:
-                    self.post_failed = True
                     log.warning("sensors page: %d repaints in a row could not "
                                 "reach the Tk thread; the poll loop is "
                                 "stopping rather than polling behind a frozen "
                                 "surface", misses, exc_info=True)
-                    return
+                    # BOTH under the gen check: post_failed belongs to the
+                    # RUN that could not reach Tk. If a start() has already
+                    # armed a newer run (he reopened the page while this
+                    # pass was in the hop), that run has its own hop and its
+                    # own flag -- raising this one would put "the poll loop
+                    # stopped -- reopen the page" (SensorsPage._tick) on a
+                    # surface that is polling perfectly well.
+                    with self._cond:
+                        if self._gen == gen:
+                            self.post_failed = True
+                            self._armed = False
+                    continue              # round to the top, which exits
                 log.debug("sensors page: repaint failed", exc_info=True)
-            stop.wait(max(0.2, float(interval_s)))
+            with self._cond:
+                if self._armed and self._gen == gen:
+                    self._cond.wait(interval)   # a stop cuts this short
+
+    def _current(self, gen: int) -> bool:
+        """Is the run this pass belongs to still the one that is armed?"""
+        with self._cond:
+            return self._armed and self._gen == gen
 
     def stop(self, timeout_s: float = JOIN_S) -> bool:
-        """End the run. True when the thread was gone by ``timeout_s``.
+        """End the run. True when the poll thread was gone by ``timeout_s``.
 
-        The handle is kept until it has been joined, and the flag the loop
-        holds is set rather than replaced, so a later ``start()`` cannot
-        resurrect an orphan: the worst case is one thread finishing the
-        HTTP read it was already inside and then exiting on its next check.
+        The run is disarmed and its generation retired under the lock, and
+        the thread reads that generation rather than an Event of its own,
+        so there is nothing here to clear out from under a blocking read.
+        ``stop()`` does NOT clear ``self._thread``: the thread does that
+        itself on its way out, which is what lets a start() arriving mid
+        request find the live thread and hand it the new run instead of
+        starting a second one beside it.
+
+        False is not a leak. The thread is bounded by the one request it is
+        already inside (``poll_once`` re-checks the run between rooms), it
+        cannot poll again for this run, and the next run reuses it.
         """
-        with self._lock:
-            thread, stop = self._thread, self._stop
-            self._thread, self._stop = None, None
-        if stop is not None:
-            stop.set()
+        with self._cond:
+            self._armed = False
+            self._gen += 1
+            thread = self._thread
+            self._cond.notify_all()
         if thread is None:
             return True
         if thread is threading.current_thread():
@@ -1109,17 +1243,19 @@ class SensorPoller:
         thread.join(max(0.0, float(timeout_s)))
         alive = thread.is_alive()
         if alive:
-            # Bounded and harmless: it cannot poll again (its own flag is
-            # set) and cannot be restarted. Said out loud so a wedged
-            # transport is visible rather than inferred.
+            # Said out loud so a wedged transport is visible rather than
+            # inferred. It sends at most the request it is already in.
             log.info("sensors page: the poll thread is still inside a "
                      "request; it will exit when that returns")
         return not alive
 
     @property
     def running(self) -> bool:
-        thread = self._thread
-        return thread is not None and thread.is_alive()
+        """Is a run ARMED -- i.e. will another poll go out? Not "is a
+        thread alive": after stop() the thread may still be finishing the
+        request it was in, and that is not the page polling."""
+        with self._cond:
+            return self._armed
 
 
 def _spoken(spec) -> str:
@@ -1259,15 +1395,25 @@ class SensorsPage(tk.Frame):
     photo rig pass showed exactly that. ``cover`` is the widgets whose
     union it should span (the reactor and the transcript); the reactor is
     decoration, and a man reading a sensor page is not looking at it.
-    MEASURED 2026-09-03 with the strip in: the stage spans 1044 device px
-    and this page asks 773 of them, 271 to spare -- MORE headroom than
-    before, because dropping its own tab row (95 px) paid for the strip
-    (80 px) with 15 px over.
+    MEASURED 2026-09-03 on the real window at 920x1440, S=2.0, in BOTH
+    looks (the earlier note gave holo's numbers and called them both)::
+
+                 stage span      this page      spare
+        holo     1124 -> 1044    868 -> 773     256 -> 271
+        classic  1136 -> 1056    868 -> 773     268 -> 283
+
+    So there is MORE headroom than before the strip, in both: dropping
+    this page's own tab row (95 px) paid for the strip (80 px, identical
+    in the two looks) with 15 px over.
 
     Nothing here polls until ``show()`` and nothing keeps polling after
-    ``hide()`` -- and after 09-03 that is enforced by a per-run stop flag
-    rather than by a shared one, because a tab is far easier to flip in
-    and out of than a function key was.
+    ``hide()``. After 09-03 that is a generation number rather than a stop
+    flag, and there is exactly ONE poll thread at a time (see
+    ``SensorPoller.start``) -- a tab is far easier to flip in and out of
+    than a function key was, and two loops on one RoomSensor doubled that
+    room's breaker twice. STANDBY shuts the page as well: the console
+    hides the tab row with the footer and selects CHAT on the way
+    (main_window._set_tabs_hidden), so nothing polls behind the clock.
     """
 
     def __init__(self, host, services=None, camera_status=None,
@@ -1286,7 +1432,12 @@ class SensorsPage(tk.Frame):
 
         self.specs = self._room_specs()
         self.bands, self.config_notes = read_bands_noted(self._get_option)
-        self.overrules = read_overrules(self._get_option)
+        # The toggle gets the same treatment as the bands: a value the file
+        # holds that this page cannot use is NAMED, because SAVE writes the
+        # substitute over it.
+        self.overrules, overrule_note = read_overrules_noted(self._get_option)
+        if overrule_note:
+            self.config_notes = tuple(self.config_notes) + (overrule_note,)
         # camera.room, falling back to the primary room -- NOT primary
         # alone, which was geometry inferred from an unrelated key.
         self.camera_room = camera_room_name(self._get_option, self.specs)

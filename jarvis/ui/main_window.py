@@ -661,6 +661,7 @@ class MainWindow:
         # really baked into the geometry, and only the mover knows that.
         self._standby_drift = (0, 0)
         self._footer_hidden = False
+        self._tabs_hidden = False        # the tab row goes with the footer
         self._term_available = terminal_available()
         self._session_seen = False       # a jarvis-* tmux session is alive
         self._term_attached = False      # …and a terminal is watching it
@@ -2017,6 +2018,10 @@ class MainWindow:
         except AttributeError:
             log.debug("transcript has no atmosphere loop", exc_info=True)
         self._set_footer_hidden(mode == STANDBY)
+        # …and the tab row goes with it. It is packed ABOVE the stage, so
+        # _set_footer_hidden never reached it: the quiet mode shipped with a
+        # row of lit, clickable tabs over the dimmed clock.
+        self._set_tabs_hidden(mode == STANDBY)
         # The camera pane is an ACTIVE-console widget only, and going quiet
         # STOPS the capture rather than hiding it (jarvis/ui/preview.py).
         self._preview_apply(mode)
@@ -2055,6 +2060,49 @@ class MainWindow:
                 self.command_bar.pack(fill="x", side="bottom")
         except tk.TclError:
             log.debug("footer repack on a dead window", exc_info=True)
+
+    def _set_tabs_hidden(self, hidden: bool):
+        """Standby takes the tab row away too, and shuts whatever surface
+        it had open on the way out.
+
+        _set_footer_hidden's own words: in standby the panel is "a clock
+        and nothing else". The strip is packed into the shell ABOVE the
+        stage (see _build_stage), so nothing the footer does reaches it --
+        photographed 2026-09-03 as CHAT and SENSORS at full brightness over
+        the dimmed clock, with one click on SENSORS enough to start the
+        poll thread behind it. F9 could always do that; a tab makes it a
+        one-click accident.
+
+        Selecting CHAT is what actually stops the poll: the strip owns the
+        page's show()/hide() (jarvis/ui/tab_strip.py), so a SENSORS surface
+        that was open when the console went quiet is hidden and its thread
+        ends, rather than polling a radar the curfew may just have powered
+        down. With no strip at all (it is optional chrome and F9 still
+        works without it) the page is hidden directly, for the same reason.
+        """
+        if hidden == self._tabs_hidden:
+            return
+        self._tabs_hidden = hidden
+        strip = getattr(self, "tabs", None)
+        if hidden:
+            page = getattr(self, "sensors", None)
+            if strip is not None and "chat" in strip.keys:
+                strip.select("chat")      # runs leave() -> the page hides
+            elif page is not None:
+                page.hide()
+        if strip is None:
+            return
+        try:
+            if hidden:
+                strip.pack_forget()
+            else:
+                # before=: the row's whole point is that it sits directly
+                # under the header rule. pack() with no anchor APPENDS to
+                # the shell's side="top" stack, which would put the row
+                # back under the transcript.
+                strip.pack(fill="x", side="top", before=self.reactor)
+        except tk.TclError:
+            log.debug("tab strip repack on a dead window", exc_info=True)
 
     def _on_console_dim(self, factor: float):
         """Dimming is a canvas-colour blend inside our own window — never

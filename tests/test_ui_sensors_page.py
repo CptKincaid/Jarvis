@@ -741,6 +741,12 @@ def test_closing_and_reopening_the_page_leaves_one_poll_loop_not_four():
     Nothing is settled between the toggles ON PURPOSE: letting each
     orphan notice the flag and exit is precisely what does not happen
     when he flips the tab quickly, and the bug would not reproduce.
+
+    What this one asserts is CONVERGENCE and silence -- one loop left
+    over, and no request at all once the page is shut. The stronger
+    property, that there is never a second loop even for an instant, is
+    test_flipping_the_tab_never_puts_two_poll_loops_on_one_sensor: the
+    first repair passed this test while running four loops at once.
     """
     before = _live_poll_threads()
     slow = _Slow(delay=0.4)
@@ -750,6 +756,8 @@ def test_closing_and_reopening_the_page_leaves_one_poll_loop_not_four():
             slow.entered.clear()
             poller.start(lambda rows: None, post=lambda fn: None)
             assert slow.entered.wait(5.0), "the poll thread never started"
+            assert _live_poll_threads() <= before + 1, (
+                "a second poll loop started beside the one still in a request")
             poller.stop()
         # ... and now he leaves it open, which is the state that costs him
         slow.entered.clear()
@@ -958,3 +966,258 @@ def test_a_status_dict_with_junk_in_it_cannot_blank_the_whole_page():
     line = sp.fault_line({"url": OFFICE.url, "fails": "x"})
     assert line and "opinion" in line.lower()
     assert sp.fault_line({"url": OFFICE.url, "fails": 2.9})
+
+
+# ------------- MAJOR (round 2): the leak was terminal, but not singular
+class _Counting:
+    """A slow transport that counts how many poll threads are inside a
+    request AT THE SAME TIME -- the number that matters to the ESP32,
+    which does not care whether the extra caller will eventually die."""
+
+    def __init__(self, delay: float = 0.4):
+        self.delay = float(delay)
+        self.calls = 0
+        self.inside = 0
+        self.peak = 0
+        self.entered = threading.Event()
+        self._lock = threading.Lock()
+
+    def __call__(self, url, timeout):
+        with self._lock:
+            self.calls += 1
+            self.inside += 1
+            self.peak = max(self.peak, self.inside)
+        self.entered.set()
+        time.sleep(self.delay)
+        with self._lock:
+            self.inside -= 1
+        return '{"value": true, "state": "ON"}'
+
+
+class _PeakThreads:
+    """Samples the live poll-thread count from the side, because the
+    interesting moment is DURING the flipping, not after it settles."""
+
+    def __init__(self, hz: float = 400.0):
+        self.peak = _live_poll_threads()
+        self._gap = 1.0 / float(hz)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="poll-thread-sampler")
+
+    def _run(self):
+        while not self._stop.is_set():
+            self.peak = max(self.peak, _live_poll_threads())
+            self._stop.wait(self._gap)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(2.0)
+        self.peak = max(self.peak, _live_poll_threads())
+        return False
+
+
+def test_flipping_the_tab_never_puts_two_poll_loops_on_one_sensor():
+    """MEASURED on the first repair, which is why this test exists: the
+    per-run stop flag made the orphans TERMINAL but not absent. stop()
+    released the Thread handle under the lock and joined afterwards, so
+    start()'s "is a thread already alive" guard read None while the old
+    thread was still inside get() and built a second loop beside it --
+    four concurrent "sensors-page" threads while flipping, six with a
+    request that never returns.
+
+    The assertion is CONCURRENCY, not convergence: one thread in the
+    transport at a time, and one live poll thread at a time, sampled
+    while the flipping happens rather than after it stops.
+    """
+    before = _live_poll_threads()
+    tap = _Counting(delay=0.4)
+    poller = sp.SensorPoller([OFFICE], get=tap)
+    try:
+        with _PeakThreads() as peak:
+            for _flip in range(5):
+                tap.entered.clear()
+                poller.start(lambda rows: None, post=lambda fn: None)
+                assert tap.entered.wait(5.0), "the poll thread never started"
+                poller.stop()             # nothing settles: that is the point
+            tap.entered.clear()
+            poller.start(lambda rows: None, post=lambda fn: None)
+            assert tap.entered.wait(5.0)
+            time.sleep(0.6)               # a pass and a bit, still flipping-fresh
+        assert tap.peak == 1, (
+            "%d poll threads were inside the transport at once" % tap.peak)
+        assert peak.peak <= before + 1, (
+            "%d live poll threads, only %d may exist"
+            % (peak.peak, before + 1))
+    finally:
+        poller.stop()
+    assert _settle(before) == before
+
+
+class _FailingGate:
+    """Parks inside the request and then fails -- the state the office
+    radar is in today, and the one that arms the breaker."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.block = True
+        self.calls = 0
+
+    def __call__(self, url, timeout):
+        self.calls += 1
+        self.entered.set()
+        if self.block:
+            self.release.wait(5.0)
+        raise OSError("unreachable")
+
+
+def test_a_flip_during_an_outage_trips_the_breaker_once_not_twice():
+    """MEASURED on the first repair: ``_sensors`` is keyed by room name and
+    outlives a run, so an orphan and its replacement held the SAME
+    RoomSensor. One round of failures then doubled the cooldown twice --
+    30 s -> 120 s where the design says 60 s -- and roomsensor._failed()
+    takes no lock, so the "N in a row" the fault line quotes was inflated
+    too. The office radar is unplugged today, which is exactly the state
+    that reaches this.
+    """
+    gate = _FailingGate()
+    poller = sp.SensorPoller([OFFICE], get=gate)
+    gate.block = False
+    row = None
+    for _pass in range(2):                # two of the three it takes
+        row = poller.poll_once()[0]
+    status = row.status
+    assert status["fails"] == 2, status
+    assert status["cooldown_s"] == 30.0, status
+    assert gate.calls == 2
+
+    gate.block = True
+    gate.entered.clear()
+    try:
+        poller.start(lambda rows: None, post=lambda fn: None)
+        assert gate.entered.wait(5.0), "the poll thread never started"
+        poller.stop()                     # he flips to CHAT...
+        poller.start(lambda rows: None, post=lambda fn: None)   # ...and back
+        time.sleep(0.3)                   # long enough for a second loop to enter
+        gate.release.set()
+        time.sleep(0.5)
+    finally:
+        poller.stop()
+    _settle(0)
+    status = poller.poll_once()[0].status
+    assert status["cooldown_s"] == 60.0, (
+        "one round of failures doubled the breaker to %.0f s" %
+        status["cooldown_s"])
+
+
+# ---------- NIT (round 2): the bands were repaired, this key was not
+def test_a_camera_overrules_value_the_page_cannot_use_is_named_not_coerced():
+    """The same silent coercion the bands had, left on the one other key
+    this page WRITES. `return True if value is None else bool(value)` makes
+    the string "false" True -- bool("false") is True -- so a hand edit of
+    `"presence.camera_overrules": "false"` rendered the toggle ON, showed
+    him the opposite of what he had typed, and one press of SAVE wrote
+    `true` over it. The bands got a second return value and a named note
+    for exactly this; this key now gets the same.
+    """
+    assert bool("false") is True          # the coercion, stated
+    assert sp.read_overrules_noted(lambda k, d=None: {}.get(k, d)) == (True, "")
+    for value in (True, False):
+        assert sp.read_overrules_noted(
+            lambda k, d=None, v=value: {sp.OPTION_CAMERA_OVERRULES: v}.get(k, d)
+        ) == (value, "")
+    for junk in ("false", "off", 0, 1, [], "yes"):
+        got, note = sp.read_overrules_noted(
+            lambda k, d=None, v=junk: {sp.OPTION_CAMERA_OVERRULES: v}.get(k, d))
+        assert got is True, junk
+        assert note and "SAVE" in note and repr(junk)[:20] in note, junk
+    # and it reaches the screen the way a bad band does
+    assert sp.read_overrules(lambda k, d=None:
+                             {sp.OPTION_CAMERA_OVERRULES: "false"}.get(k, d)) is True
+
+
+def test_a_broken_overrules_note_rides_with_the_band_notes():
+    """The page's own notes list is what carries it to the screen: the
+    band repair put its sentence in config_notes, and this one has to land
+    in the same place or nothing renders it."""
+    src = open(sp.__file__, encoding="utf-8").read()
+    init = src[src.index("    def __init__(self, host, services=None"):
+               src.index("    # ------------------------------------------------------------- config")]
+    assert "read_overrules_noted(" in init
+    assert "self.config_notes" in init.split("read_overrules_noted(")[1]
+
+
+def test_a_stop_lands_inside_one_request_not_at_the_end_of_the_pass():
+    """What an orphan still costs, as a number. The run check used to be
+    once per pass, so a stop that landed inside the office presence read
+    was still followed by the office DISTANCE read and both of the
+    kitchen's -- four requests to devices nobody was going to paint, one
+    of which is unplugged. MEASURED with the transport parked inside the
+    first read: 4 requests after the stop before this, 1 after.
+    """
+    gate = _Blocking()
+    poller = sp.SensorPoller([OFFICE, KITCHEN], get=gate)
+    try:
+        poller.start(lambda rows: None, post=lambda fn: None)
+        assert gate.entered.wait(5.0), "the poll thread never started"
+        assert gate.calls == 1, "the parked request is the office presence read"
+        poller.stop()                     # he flips to CHAT mid-request
+        gate.release.set()
+    finally:
+        _settle(0)
+        poller.stop()
+    time.sleep(0.4)
+    assert gate.calls == 1, (
+        "%d requests went out after the stop" % gate.calls)
+
+
+def test_a_reopen_inside_a_dead_hop_does_not_label_the_new_run_stopped():
+    """One level up from "the loop stops when it cannot reach Tk".
+
+    ``post_failed`` is what puts "the poll loop stopped — reopen the page"
+    on the age line (SensorsPage._tick), so it belongs to the RUN whose hop
+    died. Raising it unconditionally while disarming only the matching run
+    meant a reopen that landed INSIDE the failing hop -- stop() then
+    start(), which is one flip of the tab -- left the flag set over a run
+    that was polling and repainting perfectly well: the page read STOPPED
+    at a live surface.
+
+    Deterministic, not timed: the reopen happens on a helper thread that
+    is JOINED before the hop raises, so the interleaving is not a race the
+    test hopes for.
+    """
+    painted, hops = [], []
+
+    def reopen():
+        poller.stop(timeout_s=0.0)        # he flips to CHAT...
+        poller.start(lambda rows: painted.append(rows),
+                     post=lambda fn: fn(), interval_s=0.2)   # ...and back
+
+    def dying_post(fn):
+        hops.append(1)
+        if len(hops) == sp.POST_FAILS_MAX:
+            hand = threading.Thread(target=reopen, name="reopen")
+            hand.start()
+            hand.join(5.0)
+            assert not hand.is_alive(), "the reopen never finished"
+        raise RuntimeError("main thread is not in main loop")
+
+    poller = sp.SensorPoller([OFFICE], get=lambda u, t: '{"value": true}')
+    try:
+        poller.start(lambda rows: None, post=dying_post, interval_s=0.2)
+        deadline = time.time() + 5.0
+        while time.time() < deadline and not painted:
+            time.sleep(0.02)
+        assert painted, "the reopened run never repainted"
+        assert poller.running, "the old run's failure disarmed the new one"
+        assert poller.post_failed is False, (
+            "the age line would read 'the poll loop stopped' at a surface "
+            "that is polling")
+    finally:
+        poller.stop()
+    assert _settle(0) == 0

@@ -43,9 +43,17 @@ Right walk the row, Return and space select. Selecting is explicit rather
 than automatic on focus, so arrowing past SENSORS does not start its poll
 thread on the way by.
 
+NOT IN STANDBY. The console hides the whole row with the footer and
+selects CHAT on the way in (main_window._set_tabs_hidden): the quiet mode
+is "a clock and nothing else", and a lit tab over that clock is one click
+from starting a poll thread behind it.
+
 Everything above the widget is a pure function of MEASURED text widths, so
-the row's fit is tested with no display at all (tests/test_tab_strip.py),
-the same split jarvis/ui/views.py and tests/test_header_fit.py make.
+the row's FIT is answered with no display at all -- the same split
+jarvis/ui/views.py and tests/test_header_fit.py make. Its BEHAVIOUR is
+not: tests/test_tab_strip.py starts a private Xvfb of its own, builds the
+real row on it and drives it, because a grep for "<Return>" passes on code
+whose binding has been deleted.
 """
 from __future__ import annotations
 
