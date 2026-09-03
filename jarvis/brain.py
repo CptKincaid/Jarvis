@@ -227,6 +227,23 @@ RENDER_NOW_LINE = (
     "[No more tools will run this turn: the results above are everything "
     "you have. Answer my question now, in your own words, from those "
     "results. Do not call a tool.]")
+# ...and when the round it is repairing was holding a tool's own authored
+# confirmation, the round is TOLD so. Without this the render round is
+# given no reason to know the write already happened, and its reply is
+# free to be about the read alone -- which trades one dropped half of his
+# request for the other half. It is told not to repeat the line rather
+# than to include it, because the line is appended to the reply here, by
+# the code, whatever the model writes: a guarantee is not something to ask
+# a model for. The acknowledgement clause is the escape hatch for a lookup
+# that was only ever used to DO the thing (read the calendar to place an
+# appointment): there is nothing left to report, so "Very good, sir." plus
+# the confirmation is the whole right answer.
+HELD_LINE_NOTE = (
+    " [That is already done, and he is already being told so in these "
+    "exact words, which are spoken with your reply: \"{lines}\" Do not "
+    "repeat them or contradict them -- say only what the results above "
+    "still owe him. If they owe him nothing beyond it, a word of "
+    "acknowledgement is enough.]")
 # A round can also be cut short mid-way, leaving tool calls the model made
 # with no result beside them. An unanswered call is an open invitation to
 # make it again -- so it is answered, honestly, instead of left hanging.
@@ -238,6 +255,16 @@ RENDER_NOW_LINE = (
 TOOL_SKIPPED_TEXT = ("[this tool did not run and produced no result: the "
                      "turn ran out of time for it. There is nothing here to "
                      "report; say you did not get to it.]")
+# A round used to stop at the first tool that authored its own line, which
+# hid a second, IDENTICAL call behind it. The round runs to the end now
+# (the reply-coverage check below), so that call would EXECUTE -- and a
+# second "notes add milk" is a second item on his list off one sentence of
+# his. Same tool, same arguments, same round is always the model repeating
+# itself, never him asking twice, so it is answered from the result it
+# already has. Different arguments still run: "add milk and bread" is two.
+TOOL_REPEAT_TEXT = ("[this is the same call with the same arguments again "
+                    "in this turn: it already ran and its result is above. "
+                    "It was not run a second time.]")
 # Appended when a tool result had to be cut: the answer says so instead of
 # inventing the rest.
 PARTIAL_RESULT_LINE = ("That's only part of it, sir; there was more than I "
@@ -373,6 +400,133 @@ def strip_unbacked_claims(text, n=None):
             head = head[:-1] + [UNBACKED_LINE]
         kept = head
     return " ".join(kept)
+
+
+# ----------------------------------------------------------------------
+# The reply-coverage check — the guard's mirror image
+# ----------------------------------------------------------------------
+# The guard above is for a reply that CLAIMS what no tool did. This one is
+# for the opposite: every claim true, every tool run, and an ANSWER
+# missing.
+#
+# LIVE 2026-09-02 23:20:41, one compound question -- "What's on my
+# calendar tomorrow and then can you add milk to my shopping list?":
+#
+#   23:20:42.640  tool get_calendar {"range": "tomorrow"} -> ok=True
+#                 "Tomorrow: 11:15 am Hunter Peyrovi and ValerieAnne
+#                  Staffeldt for 30 minutes at ..."
+#   23:20:42.659  tool notes {"action":"add",...,"text":"milk"} -> ok=True
+#   23:20:42.660  chat reply: "Added to your shopping list, sir."
+#
+# One millisecond after the second tool, and 0.00 s of Ollama overhead: no
+# model round ran after the tools at all. That reply is the notes tool's
+# own authored speak= line, and the loop's `if result.speak: break` ended
+# the turn on it. The calendar answer was fetched, was right, and was
+# dropped. He concluded Jarvis had ignored half the request; it had done
+# the work and thrown the answer away.
+#
+# WHAT "COVERED" MEANS. Not keyword overlap in either direction: "You have
+# a meeting at 11:15" answers "Tomorrow: 11:15 am Hunter Peyrovi and
+# ValerieAnne Staffeldt" while sharing almost no words, and the live log's
+# good turns share less still ("You have four items on Monday, sir."). So
+# coverage is judged by PROVENANCE, which the loop already knows for
+# certain: prose only ever comes out of a model round that had the results
+# in its transcript, and the only way a result misses that round is the
+# authored-line short-circuit above. What is owed, then, is a plain fact
+# about the results in hand rather than a guess about the words.
+#
+# A tool that hands back speak= has already said its piece in Jarvis's own
+# authored English. A tool that hands back only text= has handed back
+# DATA, and data is not an answer until a model round writes it into a
+# sentence. So: no speak, some text = a sentence he is still owed.
+#
+# A FAILED read is owed one too, and the first cut of this check was wrong
+# to exempt it. The rationale was that a failure's excuse is the model's
+# to phrase -- but the short-circuit is exactly what stops any model round
+# from ever seeing it, so "get_calendar unreachable" beside a successful
+# notes write came out as "Added to your shopping list, sir." and he was
+# never told the calendar half had failed. Owed and IN HAND are therefore
+# two different questions: owed decides whether a round is spent, in hand
+# decides what the degrade may claim to HAVE. A probe that produced no
+# text is neither.
+#
+# THE CONVENTION THIS TRUSTS, stated honestly. Reads hand back text and
+# leave the phrasing to a round; writes and controls (notes, spotify,
+# add_event, timers) author their own confirmation. There is ONE read that
+# authors its success line, deliberately: screen_qa (jarvis/tools/screen.py
+# -- the vision call can take 25 s and a second model turn to phrase it
+# would be refused). It is not exempted here. When screen_qa is the only
+# tool of the turn nothing else is owed and it still answers in one round;
+# when he asked for something else beside it, that something else IS owed
+# a sentence and the round is worth its cost. Nothing at register time
+# enforces the convention, and a future read that authors a success line
+# would go invisible to this check the way screen_qa's own answer does.
+def answer_owed(result) -> bool:
+    """True when ``result`` is something he is still owed a sentence
+    about: it carries no authored line of its own, and it actually says
+    something. Failures included -- "I couldn't reach your calendar, sir"
+    is exactly the sentence the short-circuit was eating."""
+    return (not (getattr(result, "speak", None) or "")
+            and bool((getattr(result, "text", "") or "").strip()))
+
+
+def answer_in_hand(result) -> bool:
+    """``answer_owed`` and the answer is actually HERE: only a result that
+    succeeded may be named as something Jarvis has."""
+    return bool(getattr(result, "ok", True)) and answer_owed(result)
+
+
+def answers_owed(ran, in_hand=False) -> list:
+    """The tool names in ``ran`` (a sequence of ``(name, result)``, in the
+    order they ran) whose answer nothing has put into words yet. With
+    ``in_hand``, only the ones that succeeded -- what the degrade is
+    allowed to say it HAS."""
+    test = answer_in_hand if in_hand else answer_owed
+    return [name for name, result in ran or () if test(result)]
+
+
+# Spoken when the repair round could not be had: the authored lines he
+# earned, plus tool_only_line naming the sources that went unspoken. The
+# result's own words never appear -- the rule above TOOL_SOURCE_NAMES --
+# and neither does a source that FAILED, which is why `names` is the
+# in-hand list: "I have your calendar, sir" off "calendar unreachable"
+# would be the degrade lying all by itself.
+def coverage_degrade(lines, names) -> str:
+    """The authored confirmations in ``lines`` followed by an honest word
+    about the answers that never got written."""
+    if isinstance(lines, str):
+        lines = [lines]
+    said = " ".join(line for line in lines or () if line).strip()
+    return f"{said} {tool_only_line(names)}".strip() if names else said
+
+
+def held_lines_missing(spoken, lines) -> list:
+    """Which of ``lines`` ``spoken`` does not already carry. The match is
+    on the WHOLE authored sentence -- Jarvis's own words, not a keyword
+    overlap with a result -- so it is exact, and a miss costs him a
+    sentence he hears twice rather than a write he never hears about."""
+    have = " ".join((spoken or "").split()).casefold()
+    missing = []
+    for line in lines or ():
+        norm = " ".join((line or "").split()).casefold()
+        if norm and norm not in have:
+            have = f"{have} {norm}"
+            missing.append(line)
+    return missing
+
+
+def append_spoken_lines(spoken, lines, cap=None) -> str:
+    """``lines`` appended to ``spoken`` as trailing sentences, EXEMPT from
+    the spoken-sentence cap: they report actions that really happened, and
+    the cap is a rule about how much prose he wants, not a licence to drop
+    the news of a write. The head gives up the room instead."""
+    tail = " ".join(line for line in lines or () if line).strip()
+    if not tail:
+        return spoken or ""
+    cap = HARD_SPOKEN_CHARS if cap is None else cap
+    budget = max(120, cap - len(tail) - 1)
+    head = trim_spoken((spoken or "").strip(), cap=budget, hard=budget)
+    return f"{head} {tail}".strip()
 # Spoken when something inside the brain raised. Never the exception text.
 INTERNAL_ERROR_LINE = "I'm afraid something went wrong on my end, sir."
 # Web lookups run as a one-shot `claude -p` with search allowed (the CLI has
@@ -2461,6 +2615,19 @@ class JarvisBrain:
         speak = None
         tool_texts = []
         tool_names = []            # the OK ones, for the degrade's wording
+        # The reply-coverage check (answers_owed): every (name, result) of
+        # the turn, so when an authored speak= line tries to end it the
+        # loop can see whether an ANSWER is still owed.
+        ran_results = []
+        held_lines = []            # authored lines the check held back
+        held_said = False          # ...and whether the reply carries them yet
+        # How much of ran_results has already been put into SPOKEN words.
+        # A round that streams prose before asking for a tool has already
+        # answered everything that ran before it -- the prose came out of a
+        # round with those results in its transcript, which is the whole
+        # provenance argument -- so the check must not repair what he has
+        # already heard.
+        answered_upto = 0
         tool_budget = MAX_TOOL_TEXT_TOTAL_CHARS
         truncated = False
         final = ""
@@ -2488,6 +2655,7 @@ class JarvisBrain:
             if getattr(result, "card", None):
                 card = result.card
             tool_texts.append(result.text or "")
+            ran_results.append((name, result))
             if getattr(result, "ok", True):
                 # A failed tool is not something Jarvis "has": claiming
                 # "I have your calendar" off "calendar unreachable" would
@@ -2527,7 +2695,7 @@ class JarvisBrain:
         render_granted = False     # the reserved render round, spent once
         render_told = False        # ...and it is told so, once, in-message
 
-        def grant_render_round():
+        def grant_render_round(why=None):
             """Spend the render reservation: one more model round, with
             the tools stripped. False once already spent -- the reserve is
             one round, not an escape from max_rounds."""
@@ -2537,8 +2705,11 @@ class JarvisBrain:
                 return False
             render_granted = True
             rounds_left = 1        # exactly one, and it can only write
-            log.info("chat: %.1fs of work spent (%.1fs budget); reserving a "
-                     "render round", spent(), TURN_WORK_BUDGET_S)
+            if why:
+                log.warning("chat: %s; spending the render round on it", why)
+            else:
+                log.info("chat: %.1fs of work spent (%.1fs budget); reserving "
+                         "a render round", spent(), TURN_WORK_BUDGET_S)
             return True
 
         def answer_skipped_calls(calls, ran):
@@ -2551,6 +2722,27 @@ class JarvisBrain:
                 name, _args = self._tool_call_parts(call)
                 messages.append({"role": "tool", "content": TOOL_SKIPPED_TEXT,
                                  "tool_name": name})
+
+        def degrade():
+            """What to say with results in hand and no prose for them.
+            Lines the coverage check held back are spoken here rather than
+            lost: the writes they report really happened, and only the
+            answers beside them went unwritten. Only sources actually IN
+            HAND are named -- a read that failed is not something to claim
+            to have."""
+            nonlocal held_said
+            if held_lines:
+                held_said = True
+                return coverage_degrade(
+                    held_lines, answers_owed(ran_results, in_hand=True))
+            return tool_only_line(tool_names)
+
+        def render_round_available(why):
+            """True when a writing-only round can still run this turn:
+            either the reserve is spent on this, or something already
+            spent it this round (the work budget) and its round is still
+            ahead. Never a round WITH tools -- that is the timer bug."""
+            return grant_render_round(why) or (render_only and rounds_left > 0)
 
         if force_tool and registry is not None and registry.has(force_tool):
             # force_args pins arguments the model gets wrong on its own. It
@@ -2636,8 +2828,11 @@ class JarvisBrain:
                 round_tools = [] if render_only else tools
                 if render_only and not render_told:
                     render_told = True
-                    messages.append({"role": "user",
-                                     "content": RENDER_NOW_LINE})
+                    told = RENDER_NOW_LINE
+                    if held_lines:
+                        told += HELD_LINE_NOTE.format(
+                            lines=" ".join(held_lines))
+                    messages.append({"role": "user", "content": told})
                 round_started = time.monotonic()
                 streaming = on_sentence is not None and not plain_round
                 plain_round = False
@@ -2655,6 +2850,14 @@ class JarvisBrain:
                     if self._stale(gen):
                         final = ""            # barged in: nothing more to say
                         break
+                    if round_sentences:
+                        # Prose went to TTS this round, written from the
+                        # results already in the transcript: he has HEARD
+                        # them. _stream_round only silences a round after
+                        # its first tool_call chunk, so a round that talks
+                        # and then calls a tool lands here -- and repairing
+                        # it would say the same answer a second time.
+                        answered_upto = len(ran_results)
                 else:
                     payload = _chat_payload(messages, round_tools)
                     try:
@@ -2719,7 +2922,7 @@ class JarvisBrain:
                         # WHAT is in hand rather than only that something is
                         log.warning("chat: the render round wrote nothing; "
                                     "naming the sources instead")
-                        final = tool_only_line(tool_names)
+                        final = degrade()
                     break
                 if force_tool and tool_texts and rounds_left == 0 and \
                         messages[-1].get("role") == "tool":
@@ -2731,7 +2934,7 @@ class JarvisBrain:
                     # saying what get_mail found instead.
                     if grant_render_round():
                         continue
-                    final = tool_only_line(tool_names)
+                    final = degrade()
                     break
                 messages.append({"role": "assistant", "content": content,
                                  "tool_calls": calls})
@@ -2742,8 +2945,29 @@ class JarvisBrain:
                                 MAX_TOOL_CALLS_PER_ROUND)
                     calls = calls[:MAX_TOOL_CALLS_PER_ROUND]
                 ran = 0
+                authored = []      # this round's authored speak= lines
+                done_calls = set()          # (name, args) already run here
                 for call in calls:
                     name, args = self._tool_call_parts(call)
+                    try:
+                        key = (name, json.dumps(args, sort_keys=True,
+                                                default=str))
+                    except (TypeError, ValueError):
+                        key = (name, repr(args))
+                    if key in done_calls:
+                        # NEVER TWICE. See TOOL_REPEAT_TEXT: the round runs
+                        # to its end now, so a repeated call would really
+                        # act. The transcript still gets an answer for it,
+                        # because an unanswered tool_call is an invitation
+                        # to make it again.
+                        log.warning("chat: %s asked for twice with the same "
+                                    "arguments; running it once", name)
+                        messages.append({"role": "tool",
+                                         "content": TOOL_REPEAT_TEXT,
+                                         "tool_name": name})
+                        ran += 1
+                        continue
+                    done_calls.add(key)
                     # from_model: the registry strips each spec's reserved
                     # keys here and ONLY here -- the forced path above is
                     # the commander's, and its args are the utterance's.
@@ -2756,9 +2980,25 @@ class JarvisBrain:
                     note(result, name, args)
                     messages.append(tool_message(result, name))
                     ran += 1
-                    if result.speak:
-                        speak = result.speak
-                        break
+                    if result.speak and result.speak not in authored:
+                        # COLLECTED, NOT ACTED ON. This used to `break` the
+                        # round the moment any tool authored a line, which
+                        # made the whole turn depend on the ORDER the model
+                        # emitted its calls in -- and gemma4 emits them in
+                        # the order of his clauses, every one of the live
+                        # multi-tool turns. "Add milk to my list and what's
+                        # on my calendar?" ran the notes write, stopped
+                        # there, and never called get_calendar at all: the
+                        # 23:20 incident again, one phrasing away, with the
+                        # answer not merely unspoken but unfetched. Worse,
+                        # the same break dropped WRITES he had asked for --
+                        # notes + set_reminder ran the note, skipped the
+                        # timer, and told him only about the note. So the
+                        # round now finishes the calls the model asked for
+                        # (the fan-out cap and the work budget still bound
+                        # it) and the decision is made once, below, with
+                        # every result of the round in hand.
+                        authored.append(result.speak)
                     if over_budget():
                         # the budget is checked INSIDE the round: a round
                         # of many calls must not run to the end first
@@ -2769,6 +3009,34 @@ class JarvisBrain:
                 # `asked`, not `calls`: the fan-out cap trims what RUNS, and
                 # the calls it trimmed are in the transcript too.
                 answer_skipped_calls(asked, ran)
+                if authored:
+                    # THE COVERAGE CHECK. An authored line ends the turn on
+                    # the spot -- which is the whole latency win of speak=
+                    # -- but it speaks for ONE tool, and 23:20:41 it ended a
+                    # turn holding a calendar answer nobody had put into
+                    # words. When a result is still owed a sentence, the
+                    # lines are HELD and the reserved render round writes
+                    # the reply from every result instead. That round is
+                    # offered no tools and its tool_calls are dropped, so
+                    # unlike the unbacked guard's retry it cannot act --
+                    # which is why it may run on a question, and it must:
+                    # the live turn was one.
+                    #
+                    # Held, never lost: they are appended to whatever that
+                    # round writes (see held_lines_missing below), because
+                    # a write that really happened may not go unreported
+                    # on the model's say-so.
+                    owed = answers_owed(ran_results[answered_upto:])
+                    if owed and render_round_available(
+                            "the reply would drop the answer from "
+                            + ", ".join(owed)):
+                        held_lines = authored
+                    else:
+                        # Every authored line, not just the first: two
+                        # writes in one round are two things he did and
+                        # must hear about. The cap makes room for them.
+                        speak = " ".join(authored)
+                        cap = max(cap, len(authored))
                 if speak is None and not render_only and rounds_left > 0 and \
                         over_budget():
                     log.warning("chat: tool loop over the work budget (%.1fs)",
@@ -2785,10 +3053,16 @@ class JarvisBrain:
                     # words (a mail subject, a calendar title, a web page)
                     # and those are not spoken as if they were Jarvis's own.
                     # Only the SOURCE is named, from the tool's own name.
-                    final = tool_only_line(tool_names) if tool_texts else ""
+                    final = degrade() if tool_texts else ""
         except OllamaDown:
             log.warning("ollama connection refused")
             bus.publish(Status(text="Ollama isn't running", kind="warn"))
+            # A model that dies DURING the repair round must not cost him
+            # the news of a write that already happened: these two early
+            # returns dropped the held lines on the floor and answered
+            # "my local model is down, sir." about a note that was added.
+            if held_lines:
+                return [("SPEAK", degrade())]
             return [("SPEAK", MODEL_DOWN_LINE)]
         except (MalformedReply, ValueError) as exc:
             # a proxy's HTML error page, OpenAI-style content blocks, a
@@ -2797,6 +3071,8 @@ class JarvisBrain:
             log.warning("ollama reply was malformed: %s", exc)
             bus.publish(Status(text="Local model reply was unreadable",
                                kind="warn"))
+            if held_lines:
+                return [("SPEAK", degrade())]
             return [("SPEAK", MODEL_EMPTY_LINE)]
         except (TimeoutError, urllib.error.URLError, OSError) as exc:
             log.warning("ollama request failed: %s", exc)
@@ -2805,7 +3081,7 @@ class JarvisBrain:
                 # spoken: keep what was said rather than say it timed out
                 final = " ".join(streamed_sentences)
             elif tool_texts:
-                final = tool_only_line(tool_names)
+                final = degrade()
             else:
                 bus.publish(Status(text="Local model timed out", kind="warn"))
                 return [("SPEAK", MODEL_SLOW_LINE)]
@@ -2819,7 +3095,10 @@ class JarvisBrain:
         else:
             spoken = _finish_spoken(final, guard_ctx, text, cap)
         if not spoken:
-            spoken = MODEL_EMPTY_LINE
+            # with a held confirmation in hand this is the degrade's case,
+            # not an empty turn: he keeps the write and hears what went
+            # unspoken beside it
+            spoken = degrade() if held_lines else MODEL_EMPTY_LINE
         elif truncated and not _PARTIAL_RX.search(spoken):
             # The model answered from a result it only half saw: say so
             # rather than let a confident half-answer stand. The notice
@@ -2840,6 +3119,38 @@ class JarvisBrain:
                     on_sentence(PARTIAL_RESULT_LINE)
                 except Exception:
                     log.exception("on_sentence failed")
+        if held_lines and not held_said:
+            # THE WRITE IS NOT THE MODEL'S TO DROP. The first cut of this
+            # check held the confirmation only for the degrade -- if the
+            # render round wrote ANY prose the held line was discarded and
+            # the write survived only if the model chose to mention it. It
+            # need not: "You have a meeting with ValerieAnne at 11:15
+            # tomorrow, sir." was a legal render of the 23:20 turn, and
+            # milk went on the list with nobody telling him. The spoken cap
+            # could eat it even when the model DID write it (cap 4 on a
+            # five-sentence calendar render trims the tail, which is
+            # exactly where a confirmation lands).
+            #
+            # So it is appended here, after the cap, by the code. Skipped
+            # only when the reply already carries the line VERBATIM -- the
+            # model copying a tool's authored sentence is the common case
+            # (app.py's #144 was that same duplicate) -- and a miss costs a
+            # repeat, never a silence.
+            missing = held_lines_missing(spoken, held_lines)
+            if missing:
+                spoken = append_spoken_lines(spoken, missing)
+                if streamed_sentences and on_sentence is not None \
+                        and not self._stale(gen):
+                    # The render round's prose went out sentence by
+                    # sentence and SPEAK will not be spoken again (the
+                    # STREAMED tag): the confirmation has to go to TTS
+                    # itself or it is written and never said.
+                    for line in missing:
+                        streamed_sentences.append(line)
+                        try:
+                            on_sentence(line)
+                        except Exception:
+                            log.exception("on_sentence failed")
         log.info("chat reply (%.2fs wall, %.2fs ollama overhead): %s",
                  time.monotonic() - started, server_s, spoken[:80])
         tags = []
