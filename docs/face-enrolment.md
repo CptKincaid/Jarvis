@@ -13,7 +13,16 @@ states the incident this design answers.*
 ~/vss_env/bin/python scripts/face_enrol.py --delete        # destroy it
 ~/vss_env/bin/python scripts/face_enrol.py --append        # add to the pool
 ~/vss_env/bin/python scripts/face_enrol.py --reset         # replace the pool
+~/vss_env/bin/python scripts/face_enrol.py --pose "looking at my phone"
+~/vss_env/bin/python scripts/face_enrol.py --label heather # somebody else
+~/vss_env/bin/python scripts/face_enrol.py --delete --label heather
 ```
+
+From inside Jarvis: **"enrol my face"**, **"add Heather's face"**, **"who do you
+recognise"**, **"which pose is weakest"**, **"forget Heather's face"**. The first,
+second and last hand over the exact command and put it on the clipboard; the
+questions are answered in full, because they read a file and open nothing. See
+*The way in, from inside Jarvis* below.
 
 ---
 
@@ -389,14 +398,179 @@ nothing to work with (no camera, no models, no gallery).
 
 ---
 
-## Him only
+## A note on every take
 
-`camera.identity` is the phase gate: with it false, nothing about his face is
-written down at all, and `--enable-identity` is the deliberate act that turns it
-on. The label written is his, derived from `user.name`, and there is no
-`--label` flag. **Enrol him only — no family.** That is his ruling from the
-09-02 decisions, and the reason is the one above: the rule that identity may
-never grant capability gets harder to hold the more names exist.
+*Added 2026-09-03, from his request: "with a note on what i am doing in the take
+or something."*
+
+Each accepted sample stores **his own words for the pose** beside the embedding
+— `note_<label>_<nnnn>` — and the head angle it was captured at,
+`yaw_<label>_<nnnn>`. The five default stations carry one note each, so a first
+enrolment is never a note-less one, and `--pose "looking at my phone"` (repeatable,
+`--pose-samples` for how many frames each wants) adds a station of his own.
+
+**Why it is worth the two keys.** 128 floats cannot answer the only question a
+bad match actually raises. `faceenrol.note_rows` groups the pool's own
+per-sample cohesion by note and sorts worst-first, so `--status` turns *"the
+gallery medians 0.62"* into:
+
+```
+  by take    weakest first -- this is where to add takes
+    looking at my phone           3 takes  cohesion p50 0.019  worst 0.015  yaw +45.0..+47.0
+    looking at my screen          3 takes  cohesion p50 0.787  worst 0.783  yaw +50.0..+52.0
+    looking at the lens           3 takes  cohesion p50 0.808  worst 0.803  yaw  +3.0.. +5.0
+  WEAKEST    your 'looking at my phone' takes cohere least with the rest of your pool
+```
+
+*Say the limit.* A low row is not proof the pose is bad — a genuinely distinct
+pose **should** cohere less with a frontal pool, and that spread is what the
+enrolment asks for. What the row says is where the pool is **thin**. The floor
+for "this is not the same person at all" is still the cohesion check.
+
+### The format did not change, and that is the point
+
+`_read` refuses a `_format` number it does not know, correctly. So notes are
+**optional keys at format 1**, not a format bump. Bumping it would have made his
+live enrolment — `gen-00001.npz`, 13 embeddings, written 23:29 on 2026-09-02 and
+verified at 120 of 120 frames matched — unreadable by the build that added the
+feature, which is precisely the class of loss this whole store exists to
+prevent. A pool with no notes writes byte-for-byte the file it wrote before.
+Pinned by `test_his_note_less_generation_still_loads_and_still_matches` and
+`test_a_take_with_no_note_writes_no_note_key`.
+
+A note key is paired to its embedding **by index**, so a vector dropped for
+being degenerate takes its note with it — otherwise every note after it
+describes the wrong face.
+
+### The side he has never given
+
+`pose_spread` counts `abs(yaw)`, so it cannot tell 13 takes spread from +2° to
++55° from 13 spread across both sides — and **his are the first kind**. Every
+sample of both his enrolment and his verification carried a *positive* yaw. He
+has no coverage at all on the other side and no number the old report printed
+said so.
+
+`coverage()` counts the two sides separately, `coverage_lines()` names the empty
+one, and `missing_stations()` asks the next run for exactly the gap rather than
+reading the same five instructions back at him. **Nothing recorded falls back to
+the five stations** — his generation 1 records no angles, and silence is not
+evidence of coverage.
+
+**The gap is measured against what the run KEEPS.** A plain re-run and `--reset`
+replace this label's pool, so the new pool has to stand on its own and the plan
+is the full script; only `--append` carries the stored takes forward, and only
+there does "the station you are missing" mean anything.
+
+### One rule was relaxed, and the old reason for it had gone
+
+`pose_spread` used to be a statement about **this run alone**, with the stated
+reason that *"no yaw is stored with an embedding, so an append has to earn the
+spread again rather than inherit a claim nothing can verify"*. Yaw is stored
+now, so the claim is verifiable — and refusing to look at it had a real cost: an
+append that runs only the missing station covers one pose *by definition* and
+could never pass a spread computed from the run alone, which would have made the
+gap feature unusable.
+
+A take with **no** recorded angle still contributes nothing, so the old
+guarantee holds exactly where the old reason still applies: appending onto
+generation 1 earns the spread from this run or not at all. Evidence is used
+where it exists and assumed nowhere. Pinned both ways by
+`test_a_recorded_earlier_take_is_what_makes_the_gap_append_possible`.
+
+---
+
+## Other people — and their consent
+
+*This reverses the earlier "him only" ruling, at his request on 2026-09-03: "so i
+can enroll others". The ruling that did **not** change is the one in "What a
+name may do" above, and it is what makes this safe.*
+
+`--label heather` enrols a second person. It stores **their** biometric data,
+which is theirs to agree to and not his, so the flow is a consent step and not a
+comment:
+
+* the run prints what is stored (128 numbers per take, at 0600 in a 0700
+  directory, no photograph, no video, no crop, nothing leaving the machine),
+  what it can never do, and the one command that deletes it;
+* it then **stops until that person types their own name**;
+* `--yes` cannot give it — that is his flag, and this is not his consent to
+  give — and `--json` cannot either, because in JSON mode stdout is a
+  machine-readable document and the consent text nobody can see is a consent
+  nobody gave. A pipe is exactly how "enrol whoever is in frame" would get
+  automated.
+
+Consent is asked **after sensing and before anything is opened or turned on**, so
+a refused run leaves nothing switched on behind it — and a run sensing denied
+never takes somebody's consent for a capture that cannot happen.
+
+`--delete --label heather` removes that one person from **every** generation, not
+just the newest. `forget()` plus a save would leave her in every older one, one
+`--rollback` from coming back and still lying on the disk as 128 floats a take.
+`FaceGallery.purge_label` writes what is left as a new generation **first**, then
+shreds every generation that held her — including any that will not parse,
+because nothing can prove those do not hold her either and a delete that leaves a
+maybe on the disk has not deleted anything. It then reads the store back and
+says whether it worked. `camera.identity` is untouched: it is the switch on his
+own face being written down, and removing somebody else must not turn his own
+recognition off.
+
+**Everyone else survives a run that is not about them.** `save()` writes the
+whole in-memory pool, so a run that started from an empty object would write a
+generation holding one label and silently drop the rest. The gallery is now
+always loaded first, and only *this* label is dropped (for anything but
+`--append`).
+
+---
+
+## The way in, from inside Jarvis
+
+*`jarvis/enrolentry.py`, reached by three Tier-1 voice commands.*
+
+It is an **entry point, not a capture surface**, and it says so out loud. The
+guided run needs the camera device the running Jarvis owns, a key press between
+stations, and produces thirty lines of numbers he *pastes* — three things a
+spoken assistant is the wrong shell for. So "enrol my face" / "add Heather's
+face" hand over the exact command, with his named poses and the right label
+already in it, and put it on the clipboard (`xclip`, best-effort; if it does not
+land, the command goes into the reply instead).
+
+**"Who do you recognise" and "which pose is weakest" are answered in full**,
+because they read a gallery file and open nothing — and they are the questions
+the notes were added for.
+
+**"Forget Heather's face" deletes nothing.** It arrives as a speech-recognition
+result, and a misheard word may not destroy biometric data; it names what would
+go and hands over the command, and the typed confirmation stays in a terminal.
+
+Nothing in that module can open a lens — pinned by a test that reads its import
+lines.
+
+---
+
+## Him, and everyone else
+
+`camera.identity` is the phase gate: with it false, nothing about anyone's face
+is written down at all, and `--enable-identity` is the deliberate act that turns
+it on.
+
+**The owner label is read from his config (`user.name`) and never from the
+gallery.** That is where the ruling above is anchored on this side: the set of
+*enrolled* names can grow without the set of *privileged* names growing by one,
+because a recognised face cannot write the config. `resolve_wake` asks
+`eye.identity in ("", owner)`, so:
+
+| who is in frame | what the camera does to the wake gate |
+|---|---|
+| nobody enrolled / not confident | today's behaviour, byte for byte |
+| **him** | exactly the same outcome — only the log line differs |
+| **Heather** | **withholds** a promotion an anonymous face would have got |
+
+Enrolling somebody can therefore only ever make Jarvis do **less**. Pinned as a
+matrix (`test_enrolling_a_second_person_can_only_TAKE_a_promotion_AWAY`), as a
+body-anchor test (a second label never anchors `SessionIdentity`), and
+mechanically — `test_only_eye_reads_the_identity_at_all` scans every `.py` under
+`jarvis/` and asserts that `eye.py` is the **only** file that reads
+`Attention.identity` at all.
 
 ---
 

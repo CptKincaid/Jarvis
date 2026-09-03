@@ -5806,6 +5806,107 @@ def _h_sensing_curfew(c, t, m):
         "Camera curfew %s–%s" % words)
 
 
+# ---- Tier 1 face enrolment: the way in, and what the gallery knows -------
+# THE ENTRY POINT HE ASKED FOR ("add the enrollment option into Jarvis"),
+# and it is deliberately an entry point rather than a capture surface. The
+# guided run needs the camera device the running Jarvis owns, a key press
+# between stations, and produces thirty lines of numbers he PASTES -- three
+# things a spoken assistant is the wrong shell for. So "enrol my face" hands
+# over the exact command with his poses and label already in it and puts it
+# on the clipboard, while "who do you recognise" is answered in full, here,
+# because none of that needs a lens. See jarvis/enrolentry.py.
+#
+# DELETING IS HANDED OVER TOO. "Forget Heather's face" arrives as a
+# speech-recognition result, and a misheard word may not destroy biometric
+# data; the typed confirmation stays in the terminal.
+_FACE_WHO = r"(?P<who>[a-z][a-z0-9 '\u2019_-]{0,30}?)"
+_FACE_TAIL = r"(?:[,\s]+(?:please|now|sir))*[?.!\s]*$"
+_FACE_ENROL_RX = re.compile(
+    r"^(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:enroll?|register|add)\s+" + _FACE_WHO + r"(?:'s|\u2019s)?\s+face"
+    r"(?:\s+(?:in|into|to)\s+(?:the\s+)?(?:gallery|camera))?" + _FACE_TAIL,
+    re.I)
+_FACE_FORGET_RX = re.compile(
+    r"^(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:forget|delete|remove|unenrol|unenroll)\s+" + _FACE_WHO +
+    r"(?:'s|\u2019s)?\s+face"
+    r"(?:\s+from\s+(?:the\s+)?gallery)?" + _FACE_TAIL, re.I)
+_FACE_GALLERY_RX = re.compile(
+    r"^(?:"
+    r"who(?:se)?\s+faces?\s+do\s+you\s+(?:know|recogni[sz]e|have)"
+    r"|who\s+do\s+you\s+recogni[sz]e"
+    r"|(?:what(?:'s| is)\s+)?(?:in\s+)?(?:the\s+)?face\s+gallery"
+    r"|(?:whose\s+)?faces?\s+(?:are\s+)?enrol(?:l)?ed"
+    r"|face\s+enrol(?:l)?ment\s+status"
+    r"|which\s+(?:of\s+my\s+)?(?:pose|take)s?\s+is\s+(?:the\s+)?weak(?:est)?"
+    r")" + _FACE_TAIL, re.I)
+
+
+def _face_owner(c) -> str:
+    """His label, from HIS config -- never from the gallery.
+
+    This is where the ruling is anchored on this side too: the set of
+    enrolled names may grow without the set of privileged names growing by
+    one, because "owner" is a config value and a recognised face cannot
+    write the config."""
+    cfg = c._svc("assistant")
+    name = ""
+    if cfg is not None:
+        try:
+            name = str(cfg.get("user.name", "") or "")
+        except Exception:  # noqa: BLE001 - a config that cannot say is not
+            log.debug("face: could not read user.name", exc_info=True)
+    name = name.strip().lower()
+    keep = "".join(ch for ch in name if ch.isalnum() or ch in "-_")
+    return keep or "hunter"
+
+
+def _face_gallery():
+    from jarvis.facegallery import default_gallery
+    return default_gallery()
+
+
+def _h_face_enrol(c, t, m):
+    """"Enrol my face" / "add Heather's face to the gallery"."""
+    from jarvis import enrolentry as ee
+    owner = _face_owner(c)
+    who = ee.spoken_label(m.group("who") or "", owner)
+    if not who:
+        return CommandResult(
+            handled=True, speak=True,
+            reply="Whose face, sir? Say \"enrol my face\", or give me the "
+                  "name to store it under.",
+            status="Enrolment: whose?")
+    out = ee.enrol_answer(_face_gallery(), who, owner=owner)
+    return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         status=out["status"])
+
+
+def _h_face_forget(c, t, m):
+    """"Forget Heather's face" -- which deletes nothing. See the block
+    comment above: a misheard word may not destroy biometric data."""
+    from jarvis import enrolentry as ee
+    owner = _face_owner(c)
+    who = ee.spoken_label(m.group("who") or "", owner)
+    if not who:
+        return CommandResult(handled=True, speak=True,
+                             reply="Whose face, sir?",
+                             status="Face gallery: whose?")
+    out = ee.forget_answer(_face_gallery(), who, owner=owner)
+    return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         status=out["status"])
+
+
+def _h_face_gallery(c, t, m):
+    """"Who do you recognise?" / "which pose is weakest?" -- the half of
+    this feature that genuinely belongs in the window, because it reads a
+    file and opens nothing."""
+    from jarvis import enrolentry as ee
+    out = ee.gallery_answer(_face_gallery(), owner=_face_owner(c))
+    return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         status=out["status"])
+
+
 def _h_quiet_status(c, t, m):
     q = c._svc("quiet")
     if q is None:
@@ -6726,6 +6827,15 @@ REGISTRY: list[Command] = [
     Command("sensing hold", _SENSING_HOLD_RX.match, _h_sensing_hold),
     Command("sensing on", _SENSING_ON_RX.match, _h_sensing_on),
     Command("sensing off", _SENSING_OFF_RX.match, _h_sensing_off),
+    # Face enrolment, in the same family and for the same reason: it is
+    # about the lens and about biometric data, and it must never be shadowed
+    # by a later entry that starts claiming "add" or "forget". All three
+    # matchers are whole-utterance regexes ending in "face" or "gallery", so
+    # they shadow nothing themselves. The QUESTION goes first, so "who do
+    # you recognise" is never read as an instruction.
+    Command("face gallery", _FACE_GALLERY_RX.match, _h_face_gallery),
+    Command("face forget", _FACE_FORGET_RX.match, _h_face_forget),
+    Command("face enrol", _FACE_ENROL_RX.match, _h_face_enrol),
     Command("go back",
             _m_exact("go back", "previous window", "last window"),
             _h_go_back, needs=("context", "desktop")),
@@ -7077,6 +7187,12 @@ ASSISTANT_TIER1: list[Command] = [
                     # feature cannot survive.
                     "sensing status", "sensing curfew", "sensing hold",
                     "sensing on", "sensing off",
+                    # "enrol my face" and "who do you recognise" are said at
+                    # the desk with the wake word already eaten, like every
+                    # other surface verb -- and without Tier 1 they would
+                    # reach a model that cannot open a gallery and would
+                    # answer the question by inventing an answer.
+                    "face gallery", "face forget", "face enrol",
                     # "switch to classic visuals" is said AT the window he
                     # is looking at, wake word already eaten like the rest
                     "ui look",

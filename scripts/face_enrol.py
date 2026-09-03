@@ -10,6 +10,9 @@
     ~/vss_env/bin/python scripts/face_enrol.py --delete        # destroy it
     ~/vss_env/bin/python scripts/face_enrol.py --append        # add to it
     ~/vss_env/bin/python scripts/face_enrol.py --reset         # replace it
+    ~/vss_env/bin/python scripts/face_enrol.py --pose "looking at my phone"
+    ~/vss_env/bin/python scripts/face_enrol.py --label heather # somebody else
+    ~/vss_env/bin/python scripts/face_enrol.py --delete --label heather
 
 NO IMAGE DATA LEAVES THIS SCRIPT. It prints no pixels, saves no frame, opens
 no window, writes no crop and shows nothing. Every line it prints is a count,
@@ -72,6 +75,34 @@ ENROLLING AGAIN, THREE WAYS, AND WHAT EACH ONE DESTROYS.
   generations that predate the new one. It asks you to type "reset", it says
   how many are going, and if the run fails a check it destroys NOTHING.
 
+A NOTE ON EVERY TAKE, AND TAKES YOU NAME YOURSELF. Each accepted sample
+stores your own words for what you were doing -- the five default stations
+carry one each ("looking at the lens", "looking at my screen", ...), and
+``--pose "looking at my phone"`` adds a station of your own. The notes are
+the only thing that can answer the question a bad match actually raises:
+``--status`` groups the pool's own cohesion by note, worst first, so "it did
+not know me just then" gets "your looking-at-my-phone takes cohere least"
+instead of a shrug. Repeat ``--pose`` for as many takes as you want;
+``--pose-samples`` sets how many frames each one wants.
+
+THE GAP, RATHER THAN THE LIST AGAIN. ``pose_spread`` counts abs(yaw), so it
+cannot see that every sample of both your enrolment and your verification
+carried a POSITIVE yaw -- you have no coverage on the other side at all. The
+report and ``--status`` now count the two sides separately and say which one
+is empty, and the next run asks for exactly the missing station instead of
+reading the same five instructions back at you. A gallery that records no
+angles (generation 1 does not) supports no inference, so that case runs the
+five stations, which were chosen against your measured geometry.
+
+SOMEBODY ELSE, AND THEIR CONSENT. ``--label heather`` enrols a second person.
+It stores THEIR biometric data, which is theirs to agree to and not yours, so
+the run prints what is stored, what it can never do (a recognised face
+commands nothing and unlocks nothing -- see ``owner_label``), and how to
+delete it, and then stops until THEY type their own name. ``--yes`` is your
+flag and cannot give it; ``--json`` cannot either, because the text would be
+invisible. ``--delete --label heather`` removes that one person from EVERY
+generation -- not just the newest -- and leaves everybody else's alone.
+
 Exit codes: 0 ok, 1 something failed a check, 2 sensing said no, 3 there is
 nothing to work with (no camera, no models, no gallery).
 """
@@ -92,7 +123,7 @@ from jarvis.assistant_config import AssistantConfig       # noqa: E402
 from jarvis.config import PATHS                           # noqa: E402
 from jarvis.eye import FaceIdentifier                     # noqa: E402
 from jarvis.facegallery import (SFACE_COSINE_SAME,        # noqa: E402
-                                FaceGallery)
+                                FaceGallery, label_ok)
 from jarvis.sensing import SensingPolicy                   # noqa: E402
 
 BANNER = (
@@ -160,17 +191,108 @@ def build_feed(cfg, policy):
 
 
 def owner_label(cfg) -> str:
-    """The one label this script will ever write.
+    """HIS label -- the one name that means "the owner" anywhere downstream.
 
-    HIS RULING, not a limitation: enrol HIM only, no family. A second face in
-    the gallery is a second person the wake gate can be asked about, and the
-    governing rule is that identity may REMOVE capability or ADD a name and
-    must never GRANT capability the existing gates do not already grant -- a
-    rule that gets harder to hold the more names exist.
+    THE RULING THAT CHANGED, AND THE ONE THAT DID NOT. He asked on
+    2026-09-02 to enrol other people ("so i can enroll others"), which
+    reverses the earlier him-only rule; ``--label`` is that, and it takes the
+    other person's typed consent. What has NOT changed is the governing rule:
+    identity may REMOVE capability or ADD a name, and must NEVER GRANT
+    capability the existing gates do not already grant.
+
+    This function is where that rule is anchored. ``owner`` is read from HIS
+    CONFIG and never from the gallery, so the set of enrolled names can grow
+    without the set of privileged names growing by one. ``jarvis/eye.py``'s
+    wake fusion asks ``eye.identity in ("", owner)``: an unknown face is
+    exactly today's behaviour, HIS face is exactly today's behaviour, and any
+    other enrolled name WITHHOLDS a promotion an anonymous face would have
+    got. Enrolling Heather can only ever make Jarvis more careful. Pinned by
+    tests/test_faceenrol_notes.py::test_enrolling_a_second_person_can_only_TAKE_a_promotion_AWAY.
     """
     name = str(cfg.get("user.name", "") or "hunter").strip().lower()
     keep = "".join(c if (c.isalnum() or c in "-_") else "" for c in name)
     return keep or "hunter"
+
+
+def target_label(cfg, args) -> tuple:
+    """``(label, why)`` -- who this run is about. ``why`` is "" when it is
+    fine and the refusal text when it is not.
+
+    The label goes into an npz key, a log line and a report he pastes, so it
+    is checked against ``facegallery``'s own pattern BEFORE anything is
+    opened: a name that cannot be stored must cost the run at the argument,
+    not after a minute in front of the camera."""
+    want = str(getattr(args, "label", "") or "").strip().lower()
+    if not want:
+        return owner_label(cfg), ""
+    if not label_ok(want):
+        return "", ("%r is not a usable label: lowercase letters, digits, - "
+                    "and _ only, up to 31 characters. It becomes a key in "
+                    "the gallery file and a word in every report."
+                    % str(getattr(args, "label", "")))
+    return want, ""
+
+
+CONSENT_LINES = (
+    "CONSENT -- this is %(who)s's data, not yours.",
+    "",
+    "Enrolling %(who)s stores a measurement of %(who)s's FACE: 128 numbers",
+    "per take, in %(root)s, at 0600 in a 0700",
+    "directory. No photograph, no video and no crop is stored, nothing is",
+    "displayed, and nothing leaves this machine. It cannot be re-issued if",
+    "it leaks, which is why it is treated like the voiceprint and not like",
+    "a setting.",
+    "",
+    "What it is FOR: Jarvis can say %(who)s is here, and can keep something",
+    "private when somebody else is in the room. What it never does: a",
+    "recognised face cannot command Jarvis, cannot unlock anything and",
+    "cannot pass the voice gate. Recognising a face may only ever make",
+    "Jarvis do LESS, never more.",
+    "",
+    "Deleting it, at any time, and it takes about a second:",
+    "    %(python)s %(script)s --delete --label %(who)s",
+    "which destroys every generation that holds %(who)s -- including the",
+    "older ones -- and leaves everybody else's alone.",
+    "",
+    "%(who)s must type their own name below. Nobody may type it for them,",
+    "and --yes cannot do it either: it is his flag, and this is not his",
+    "consent to give.",
+)
+
+
+def consent(label: str, owner: str, root, say, args) -> tuple:
+    """``(ok, how)``. Enrolling somebody else takes THEIR agreement.
+
+    NOT A COMMENT AND NOT A README LINE. Storing a second person's biometric
+    data without them knowing is the failure this flow exists to prevent, so
+    the words are printed, the person is named, and the run stops until they
+    type their own name.
+
+    ``--json`` CANNOT GIVE IT. In JSON mode ``say`` is a no-op and stdout is
+    a machine-readable document, so the consent text is invisible and the
+    prompt would land in the middle of it -- a consent nobody could read is
+    not a consent, and a pipe is exactly how "enrol whoever is in frame"
+    would get automated.
+    """
+    if label == owner:
+        return True, "owner"
+    fields = {"who": label, "root": str(root), "python": sys.executable,
+              "script": os.path.abspath(__file__)}
+    if args.json:
+        return False, ("consent for %r cannot be taken through --json: the "
+                       "person being enrolled has to read what is stored "
+                       "and type their own name" % label)
+    say("")
+    for line in CONSENT_LINES:
+        say(line % fields)
+    try:
+        answer = input('Type "%s" to agree: ' % label).strip().lower()
+    except EOFError:
+        answer = ""
+    if answer != label:
+        return False, ("consent was not given for %r -- nothing was "
+                       "captured and nothing was written" % label)
+    return True, "typed"
 
 
 # -------------------------------------------------------------- the modes
@@ -217,8 +339,11 @@ def do_status(cfg, gallery: FaceGallery, say) -> tuple:
     say("loaded     generation %d, %d embeddings, labels %s"
         % (gallery.loaded_generation, gallery.total(),
            ", ".join(gallery.labels()) or "-"))
+    payload["notes"] = []
+    payload["coverage"] = {}
     for label in gallery.labels():
         embs = gallery.embeddings(label)
+        takes = gallery.takes(label)
         pairs = fe.pairwise_cosines(embs)
         coh = fe.cohesion(embs)
         payload["pairs"] = len(pairs)
@@ -231,6 +356,29 @@ def do_status(cfg, gallery: FaceGallery, say) -> tuple:
             % (label, len(embs), len(pairs),
                payload["cos_min"], payload["cos_p50"], payload["cos_max"],
                payload["cohesion_min"]))
+        # WHAT EACH POSE IS WORTH. The notes exist to answer one question --
+        # "which pose is letting me down" -- and --status is where he asks
+        # it, because it is the mode that needs no camera and no minute of
+        # his time.
+        cov = fe.coverage(takes)
+        payload["coverage"][label] = dict(cov)
+        for line in fe.coverage_lines(cov):
+            say("  " + line)
+        rows = fe.note_rows(embs, takes)
+        if rows:
+            say("  by take    weakest first -- this is where to add takes")
+            for row in rows:
+                say("  " + row.line())
+            payload["notes"].extend([label] + list(row.as_tuple())
+                                    for row in rows)
+        weakest = fe.weakest_note(rows)
+        if weakest:
+            mine = label == owner_label(cfg)
+            say("  WEAKEST    %s %r takes cohere least with the rest of %s "
+                "pool -- that is where to add takes, not to the pose that "
+                "is already strong."
+                % ("your" if mine else "%s's" % label, weakest,
+                   "your" if mine else "their"))
     say("")
     say("identity   camera.identity=%s  camera.identity_min=%.3f"
         % (payload["identity_enabled"], payload["identity_min"]))
@@ -268,14 +416,29 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
         say("Fix camera.min_conf in ~/.config/jarvis/assistant.json.")
         return 1, {"reason": str(exc)}
 
-    label = owner_label(cfg)
-    if not bool(cfg.get("camera.identity", False)):
-        if not args.enable_identity:
-            say("STOPPED: camera.identity is false, and it is the phase gate "
-                "for writing anything about your face down at all.")
-            say("Re-run with --enable-identity to turn it on and enrol, or "
-                "set camera.identity true in ~/.config/jarvis/assistant.json.")
-            return 1, {"reason": "camera.identity is false"}
+    owner = owner_label(cfg)
+    label, why = target_label(cfg, args)
+    if why:
+        say("STOPPED: %s" % why)
+        return 1, {"reason": why}
+    # THE PHASE GATE IS SPLIT IN TWO AROUND THE CONSENT STEP, ON PURPOSE.
+    # The READ half runs first, so a person is never asked to agree to a
+    # capture that was going to stop anyway; the WRITE half runs after, so a
+    # consent that was REFUSED cannot have left the switch that says faces
+    # may be written down flipped on behind it. Neither ordering gives both
+    # properties on its own.
+    identity_on = bool(cfg.get("camera.identity", False))
+    if not identity_on and not args.enable_identity:
+        say("STOPPED: camera.identity is false, and it is the phase gate "
+            "for writing anything about your face down at all.")
+        say("Re-run with --enable-identity to turn it on and enrol, or "
+            "set camera.identity true in ~/.config/jarvis/assistant.json.")
+        return 1, {"reason": "camera.identity is false"}
+    ok, how = consent(label, owner, gallery.root, say, args)
+    if not ok:
+        say("STOPPED: %s" % how)
+        return 1, {"reason": how, "label": label}
+    if not identity_on:
         if cfg.set("camera.identity", True) is False:
             say("STOPPED: camera.identity could not be written to the config.")
             return 1, {"reason": "camera.identity could not be set"}
@@ -334,19 +497,77 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
                 say("Not resetting. Nothing has been captured and nothing "
                     "was destroyed.")
                 return 1, {"reason": "reset not confirmed", "removed": 0}
-    elif args.append and gallery.load():
-        say("--append: starting from generation %d, %d embeddings. The "
-            "checks below judge the MERGED pool -- the %d already stored "
-            "plus whatever this run adds -- because that is what gets saved."
-            % (gallery.loaded_generation, gallery.total(), gallery.total()))
+
+    # THE GALLERY IS ALWAYS LOADED FIRST, AND THAT IS NOT AN --append.
+    # save() writes the WHOLE in-memory pool as the next generation, so a
+    # run that started from an empty object would write a generation holding
+    # this label alone -- and every other enrolled person would silently stop
+    # being recognised the moment it landed, while still sitting in the
+    # generation underneath. Loading first and then dropping THIS label (for
+    # anything but --append) keeps the old meaning of a plain re-run -- a
+    # fresh pool for him -- while leaving everybody else exactly where they
+    # were.
+    gallery.load()
+    others = [x for x in gallery.labels() if x != label]
+    stored_takes = gallery.takes(label)
+    if args.append:
+        if gallery.count(label):
+            say("--append: starting from generation %d, %d embeddings under "
+                "%r. The checks below judge the MERGED pool -- the %d "
+                "already stored plus whatever this run adds -- because that "
+                "is what gets saved."
+                % (gallery.loaded_generation, gallery.count(label), label,
+                   gallery.count(label)))
+    else:
+        gallery.forget(label)
+    if others:
+        say("keeping    %d other label(s) untouched: %s"
+            % (len(others), ", ".join(others)))
+
+    # THE GAP IS RELATIVE TO WHAT SURVIVES THIS RUN, not to what is on disk.
+    # A plain re-run and --reset both REPLACE this label's pool, so the new
+    # pool has to stand on its own and the plan is the full script; only
+    # --append carries the stored takes forward, and only there does "the
+    # station you are missing" mean anything. Asking a replacing run for the
+    # gap alone would write a three-sample gallery over a thirteen-sample
+    # one and call it coverage.
+    plan_takes = stored_takes if args.append else []
+    plan, plan_why = fe.choose_plan(plan_takes, poses=args.pose,
+                                    pose_samples=int(args.pose_samples),
+                                    mode=args.plan)
+    if not plan:
+        say("STOPPED: %s. Name a take with --pose \"looking at my phone\", "
+            "or --plan full to run the five stations again." % plan_why)
+        return 1, {"reason": plan_why, "label": label}
 
     session = fe.EnrolmentSession(gallery, label, feed.lens, detector,
                                   recogniser, limits,
                                   head=cam.head_from_config(cfg))
     say("")
-    say("Enrolling %r. %d stations, %d samples wanted."
-        % (label, len(fe.DEFAULT_PLAN),
-           sum(s.samples for s in fe.DEFAULT_PLAN)))
+    say("Enrolling %r. %d stations, %d samples wanted -- %s."
+        % (label, len(plan), sum(st.samples for st in plan), plan_why))
+    # The coverage of what is STORED, said before the run whether or not it
+    # is carried forward: "you have never given the other side of your face"
+    # is worth knowing when you are about to sit down for a minute.
+    if stored_takes:
+        for line in fe.coverage_lines(fe.coverage(stored_takes)):
+            head, rest = (line.split(None, 1) + [""])[:2]
+            say("stored     %s" % rest if head == "coverage" else line)
+    # NAMING POSES IS ADDITIVE BY INTENT -- "more ways for me to be
+    # recognised" -- and a plain run REPLACES. Said BEFORE the capture,
+    # because learning it afterwards costs the minute plus a refusal he
+    # could not have predicted: a two-pose run is six takes, under the
+    # eight-sample floor, so it captures, fails and saves nothing.
+    wanted = sum(st.samples for st in plan)
+    if args.pose and not args.append and stored_takes:
+        say("WARNING    these %d take(s) will REPLACE the %d already stored "
+            "under %r. Add --append to keep what is there."
+            % (wanted, len(stored_takes), label))
+        if wanted < fe.MIN_SAMPLES:
+            say("           %d is under the %d-sample floor, so this run "
+                "would be refused after the capture. --append is almost "
+                "certainly what you want."
+                % (wanted, fe.MIN_SAMPLES))
     say("Sit where you normally sit. Nothing you see is shown to anybody, "
         "because nothing is shown at all.")
     def wait(prompt):
@@ -356,7 +577,7 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
         wait = None
     try:
         rep, _run = fe.run_enrolment(
-            session, cam.FeedSource(feed), say=say, wait=wait,
+            session, cam.FeedSource(feed), plan=plan, say=say, wait=wait,
             frames_per_station=int(args.frames_per_station),
             gap_s=float(args.gap_s),
             identity_min=float(cfg.get("camera.identity_min",
@@ -367,9 +588,13 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     removed = 0
     if rep.ok or args.force:
         try:
-            gen = gallery.save(reason="face_enrol%s" % (" --force"
-                                                        if not rep.ok else ""),
-                               allow_shrink=bool(args.allow_shrink))
+            gen = gallery.save(
+                reason="face_enrol %s%s%s"
+                % (label,
+                   " (consent typed at the keyboard)" if how == "typed"
+                   else "",
+                   " --force" if not rep.ok else ""),
+                allow_shrink=bool(args.allow_shrink))
             rep.saved_generation = gen
             rep.gallery_total = gallery.total()
             if superseded:
@@ -380,6 +605,9 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
             rep.reason = rep.reason or str(exc)
     payload = rep.to_dict()
     payload["reset_removed"] = removed
+    payload["consent"] = how
+    payload["plan"] = plan_why
+    payload["kept_labels"] = list(others)
     vr.assert_numbers_only(payload)
     say("")
     for line in rep.lines():
@@ -510,13 +738,103 @@ def do_rollback(gallery: FaceGallery, say) -> tuple:
     return 0, {"generation": gen, "total": gallery.total()}
 
 
+def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
+    """Destroy ONE person's embeddings, everywhere, and leave the rest.
+
+    THE HALF OF CONSENT THAT IS NOT THE PROMPT. Agreeing to be enrolled is
+    only meaningful if withdrawing is one command, so this is one command --
+    and it has to mean it: ``forget()`` plus a save would leave her in every
+    older generation, one --rollback from coming back and still lying on the
+    disk as 128 floats a take. ``purge_label`` writes what is left FIRST and
+    then shreds every generation that held her.
+
+    ``camera.identity`` is NOT touched here. It is the switch on his own
+    face being written down at all; removing somebody else must not turn his
+    recognition off behind his back."""
+    gallery.load()
+    out = gallery.purge_label(label, reason="face_enrol --delete --label %s"
+                              % label)
+    if not out["generations_with"] and not out["unreadable_removed"]:
+        say("Nothing enrolled under %r at %s (labels: %s)"
+            % (label, gallery.root, ", ".join(gallery.labels()) or "-"))
+        return 3, out
+    if out["reason"]:
+        say("STOPPED: %s" % out["reason"])
+        say("Nothing was destroyed -- what is left could not be written, and "
+            "deleting one person may not cost another person's enrolment.")
+        return 1, out
+    say("deleted    %r from %d generation(s); %d file(s) overwritten and "
+        "unlinked" % (label, len(out["generations_with"]), out["removed"]))
+    if out["unreadable_removed"]:
+        say("           %d unreadable generation(s) destroyed as well: "
+            "nothing can prove they do not hold %r either, and a delete "
+            "that leaves a maybe on the disk has not deleted anything."
+            % (out["unreadable_removed"], label))
+    if out["generation"]:
+        say("           what is left is generation %d: %d embeddings over "
+            "%s" % (out["generation"], out["left"],
+                    ", ".join(out["labels_left"]) or "nobody"))
+    else:
+        say("           nothing is left; the gallery is empty.")
+        # camera.identity stays as it is, and that is said rather than left
+        # to be discovered: this command's job is one person, and the flag
+        # is the switch on the whole feature. A --delete with no --label is
+        # the one that turns it off.
+        say("           camera.identity is untouched -- run --delete with "
+            "no --label to turn the feature off as well.")
+    # Read it back rather than claim it. A delete that reports success over a
+    # file that still parses with her in it is the whole failure mode.
+    back = FaceGallery(root=gallery.root)
+    back.load()
+    still = [g for g in back.generations()
+             if _generation_holds(back.root, g, label)]
+    if still:
+        say("           FAILED: generation(s) %s still hold %r"
+            % (", ".join(str(g) for g in still), label))
+        return 1, out
+    say("           verified: no generation on disk holds %r any more."
+        % label)
+    say("Copies you made with --backup are NOT touched by this -- if you "
+        "made one, delete it yourself. The bytes here were overwritten and "
+        "unlinked, which puts them beyond the filesystem, not beyond the "
+        "device.")
+    return 0, out
+
+
+def _generation_holds(root, generation: int, label: str) -> bool:
+    one = FaceGallery(root=root)
+    return bool(one.load(generation=generation)) and label in one.labels()
+
+
 def do_delete(cfg, gallery: FaceGallery, args, say) -> tuple:
     """Destroy the biometric data. Every generation, and the crashed-save
-    leftovers that are invisible to the generation pattern."""
+    leftovers that are invisible to the generation pattern.
+
+    With ``--label`` it is one person instead of everybody; see
+    ``do_delete_label``."""
     gens = gallery.generations()
     if not gens and not gallery.root.exists():
         say("Nothing to delete at %s" % gallery.root)
         return 3, {"removed": 0}
+    if args.label:
+        label, why = target_label(cfg, args)
+        if why:
+            say("STOPPED: %s" % why)
+            return 1, {"reason": why}
+        if not args.yes:
+            say("About to permanently destroy every embedding of %r at %s, "
+                "in every generation that holds them. Everybody else's are "
+                "left alone." % (label, gallery.root))
+            say("This cannot be undone and there is no backup unless you "
+                "made one with --backup.")
+            try:
+                answer = input('Type "%s" to confirm: ' % label).strip().lower()
+            except EOFError:
+                answer = ""
+            if answer != label:
+                say("Not deleted.")
+                return 1, {"removed": 0, "label": label}
+        return do_delete_label(gallery, label, args, say)
     if not args.yes:
         say("About to permanently destroy %d generation(s) of face "
             "embeddings at %s." % (len(gens), gallery.root))
@@ -553,7 +871,13 @@ def do_delete(cfg, gallery: FaceGallery, args, say) -> tuple:
 
 
 # ------------------------------------------------------------------- main
-def main(argv=None) -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """The arguments, as an object.
+
+    Split out of ``main`` so the in-app entry point can PARSE the command
+    line it hands him before he runs it (jarvis/enrolentry.py). A command
+    Jarvis dictated that argparse then rejects is worse than no command, and
+    a test can only catch that if there is something to hand it to."""
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--status", action="store_true",
                     help="what is enrolled, in numbers. Opens no device")
@@ -606,7 +930,32 @@ def main(argv=None) -> int:
                     help="do not ask for confirmation on --delete or --reset")
     ap.add_argument("--json", action="store_true",
                     help="machine-readable, and just as pixel-free")
-    args = ap.parse_args(argv)
+    ap.add_argument("--label", metavar="NAME",
+                    help="who this is about. Defaults to you (user.name). "
+                         "Enrolling anybody else takes THEIR typed consent, "
+                         "which --yes and --json cannot give for them. With "
+                         "--delete it removes that one person from every "
+                         "generation and leaves everybody else's alone")
+    ap.add_argument("--pose", action="append", default=[], metavar="TEXT",
+                    help="a take in your own words -- \"looking at my "
+                         "phone\", \"looking away\", \"with my glasses "
+                         "off\". Repeatable; each one is a station, and the "
+                         "words are stored beside every embedding it "
+                         "produces so a later report can say which pose is "
+                         "weak")
+    ap.add_argument("--pose-samples", type=int, default=3,
+                    help="samples per --pose station (default 3)")
+    ap.add_argument("--plan", choices=("auto", "full", "missing"),
+                    default="auto",
+                    help="auto: run the stations your gallery is MISSING "
+                         "when it records enough to say, else the five. "
+                         "full: the five stations. missing: the gaps only, "
+                         "and stop if there are none")
+    return ap
+
+
+def main(argv=None) -> int:
+    args = build_parser().parse_args(argv)
 
     say = (lambda *a: None) if args.json else print
     say(BANNER)

@@ -69,6 +69,25 @@ WHAT THE TWO REFUSALS MEAN.
   embedding), the one-label rule, and judging the pool that will actually be
   written rather than the batch (see ``EnrolmentSession.pool``).
 
+A NOTE ON EVERY TAKE, which is what he asked for on 2026-09-02: "with a note
+on what i am doing in the take". Each accepted sample stores his own words
+beside the embedding -- "looking at my phone", "looking away", "with glasses"
+-- and ``note_rows`` groups the pool's own per-sample cohesion by those words,
+worst first. That turns the one number a bad match gives you ("0.41") into the
+one sentence you can act on ("your looking-at-my-phone takes are the thin
+ones"). The five default stations each carry a note, so a first enrolment is
+never a note-less one, and ``custom_stations`` turns anything else he names
+into a station of its own.
+
+AND THE SIDE HE HAS NEVER GIVEN. ``pose_spread`` counts ``abs(yaw)``, so it
+cannot tell 13 takes from +2 to +55 deg from 13 spread across both sides --
+and his are the first kind: every sample in his enrolment AND in his
+verification was a POSITIVE yaw. ``coverage`` counts the two sides
+separately, ``coverage_lines`` says which one is empty, and
+``missing_stations`` asks the NEXT run for exactly the gap instead of reading
+the same five instructions back at him. Nothing recorded falls back to the
+five stations, because silence is not evidence of coverage.
+
 Nothing here imports cv2, torch or a model. The detector, the recogniser and
 the frame source are all seams, so the whole module runs in the suite with no
 camera, no weights, no display and no GPU.
@@ -77,14 +96,15 @@ from __future__ import annotations
 
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from jarvis.facedetect import PROBE_THRESHOLD
-from jarvis.facegallery import SFACE_COSINE_SAME, FaceGallery, cosine
+from jarvis.facegallery import (SFACE_COSINE_SAME, FaceGallery, Take,
+                                clean_note, cosine)
 from jarvis.logs import get_logger
 from jarvis.visionrig import IDX_SCORE, Check, HeadModel, _pct, observe
 
@@ -215,6 +235,12 @@ class Station:
     yaw_lo: float          # signed, inclusive
     yaw_hi: float
     samples: int
+    # WHAT HE WAS DOING, in his own words, stored beside every embedding this
+    # station produces. The five below carry one each, so a first enrolment
+    # is not a note-less one -- the notes are the thing that lets a bad match
+    # six weeks from now be answered with "your looking-at-my-phone takes are
+    # the weak ones" instead of a shrug.
+    note: str = ""
 
     def wants(self, yaw_deg: float) -> bool:
         return self.yaw_lo <= float(yaw_deg) <= self.yaw_hi
@@ -228,20 +254,23 @@ class Station:
 # printed, so a plan that produced no distance variation is visible even
 # though nothing refuses it.
 DEFAULT_PLAN: Tuple[Station, ...] = (
-    Station("lens", "Look straight into the camera lens.", -15.0, 15.0, 3),
+    Station("lens", "Look straight into the camera lens.", -15.0, 15.0, 3,
+            note="looking at the lens"),
     Station("screen",
             "Now look at your screen exactly as you do when you are working.",
-            18.0, 62.0, 3),
+            18.0, 62.0, 3, note="looking at my screen"),
     Station("across",
             "Turn your head the OTHER way -- as if looking at the far side "
-            "of the desk.", -62.0, -18.0, 3),
+            "of the desk.", -62.0, -18.0, 3,
+            note="turned the other way"),
     Station("back",
             "Back to the camera, but sit back -- further away than usual.",
-            -15.0, 15.0, 2),
+            -15.0, 15.0, 2, note="sitting back from the camera"),
     Station("close",
             "Lean in closer than usual, still looking at the camera.",
-            -15.0, 15.0, 2),
+            -15.0, 15.0, 2, note="leaning in close"),
 )
+_BY_KEY = {s.key: s for s in DEFAULT_PLAN}
 
 
 @dataclass(frozen=True)
@@ -263,6 +292,10 @@ class Sample:
     sharpness: float
     accepted: bool
     reason: str
+    # Defaulted, and last, so every existing construction of this dataclass
+    # -- including the ``Sample(**{**sample.as_dict(), ...})`` rebuilds in
+    # ``offer`` -- keeps working unchanged.
+    note: str = ""
 
     def as_dict(self) -> dict:
         return {"index": self.index, "station": self.station,
@@ -271,15 +304,16 @@ class Sample:
                 "yaw_deg": self.yaw_deg, "roll_deg": self.roll_deg,
                 "bearing_deg": self.bearing_deg,
                 "sharpness": self.sharpness, "accepted": self.accepted,
-                "reason": self.reason}
+                "reason": self.reason, "note": self.note}
 
     def line(self) -> str:
         return ("  %2d %-7s %s conf %.2f  face %4.0fpx  eyes %3.0fpx  "
-                "yaw %+5.1f  roll %+5.1f  sharp %.3f  %s"
+                "yaw %+5.1f  roll %+5.1f  sharp %.3f  %s%s"
                 % (self.index, self.station,
                    "KEEP" if self.accepted else "drop", self.conf,
                    self.face_px, self.eye_px, self.yaw_deg, self.roll_deg,
-                   self.sharpness, self.reason))
+                   self.sharpness, self.reason,
+                   ("  [%s]" % self.note) if self.note else ""))
 
 
 # ------------------------------------------------------------- the measures
@@ -398,6 +432,271 @@ def cohesion(embs: Sequence) -> List[float]:
     return out
 
 
+# --------------------------------------------- what the takes say they were
+# The label a take with no note is printed under. A count under a name is a
+# thing he can act on; a blank cell is a thing he ignores.
+NO_NOTE = "(no note)"
+# How many takes a side wants before it stops being a gap. Two, the same
+# number ``MIN_FRONTAL`` and ``MIN_OFFAXIS`` already use, because one sample
+# of a pose is one sample of one instant of that pose.
+COVERAGE_WANT = 2
+
+
+@dataclass(frozen=True)
+class NoteRow:
+    """One pose, as a row he can read: how many takes carry that note, and
+    how well they cohere with the rest of the pool."""
+
+    note: str
+    count: int
+    cohesion_p50: float
+    cohesion_min: float
+    yaw_min: float
+    yaw_max: float
+    recorded: int
+
+    def as_tuple(self) -> tuple:
+        return (self.note, self.count, self.cohesion_p50, self.cohesion_min,
+                self.yaw_min, self.yaw_max, self.recorded)
+
+    def line(self) -> str:
+        yaw = ("yaw %+5.1f..%+5.1f" % (self.yaw_min, self.yaw_max)
+               if self.recorded else "no angle recorded")
+        return ("  %-28s %2d takes  cohesion p50 %.3f  worst %.3f  %s"
+                % (self.note[:28], self.count, self.cohesion_p50,
+                   self.cohesion_min, yaw))
+
+
+def note_rows(embs: Sequence, takes: Sequence[Take]) -> Tuple[NoteRow, ...]:
+    """The pool grouped by what he said he was doing, WEAKEST FIRST.
+
+    THIS IS THE WHOLE POINT OF STORING A NOTE. 128 floats cannot answer "why
+    did it not know me just then"; a note can, because the pool's own
+    cohesion is already computed per sample (``cohesion`` above) and grouping
+    those numbers by note turns "the gallery medians 0.62" into "your
+    looking-at-my-phone takes median 0.41 and everything else medians 0.78".
+
+    Sorted ascending by median cohesion so the first row is the answer to the
+    question he will actually ask. Ties break on the smaller group, because a
+    weak pose with two takes is a thinner claim than a weak pose with eight.
+
+    SAY THE LIMIT. A low row is not proof that pose is bad -- a genuinely
+    distinct pose SHOULD cohere less with a frontal pool, which is exactly
+    the spread the enrolment asks for. What the row tells him is where the
+    pool is thin, which is where to add takes; the absolute floor for "this
+    is not the same person at all" is the cohesion check, not this."""
+    coh = cohesion(list(embs))
+    takes = list(takes)
+    groups: dict = {}
+    for i, take in enumerate(takes[:len(coh)]):
+        key = take.note or NO_NOTE
+        groups.setdefault(key, []).append(i)
+    rows = []
+    for note, idx in groups.items():
+        scores = [coh[i] for i in idx]
+        yaws = [float(takes[i].yaw_deg) for i in idx
+                if takes[i].yaw_deg is not None]
+        rows.append(NoteRow(note=note, count=len(idx),
+                            cohesion_p50=_pct(scores, 0.5),
+                            cohesion_min=min(scores) if scores else 0.0,
+                            yaw_min=min(yaws) if yaws else 0.0,
+                            yaw_max=max(yaws) if yaws else 0.0,
+                            recorded=len(yaws)))
+    rows.sort(key=lambda r: (r.cohesion_p50, r.count))
+    return tuple(rows)
+
+
+def weakest_note(rows: Sequence[NoteRow]) -> str:
+    """The note of the weakest group, or "" when there is nothing to say.
+
+    A single group is not a comparison, so it is not an answer: with one
+    note there is no "worst" pose, there is just the pool."""
+    rows = [r for r in rows if r.note != NO_NOTE]
+    return rows[0].note if len(rows) > 1 else ""
+
+
+def coverage(takes: Sequence[Take]) -> dict:
+    """How many takes sit on each SIDE of the lens, and how many say nothing.
+
+    WHY THE SIDES ARE COUNTED SEPARATELY, which ``pose_spread`` does not do.
+    That check counts ``abs(yaw)``, so 13 takes spread from +2 to +55 deg
+    look identical to 13 spread from -55 to +55 -- and his are the first
+    kind: every sample in his enrolment AND in his verification carried a
+    POSITIVE yaw. He has no coverage at all on the other side, and no number
+    the existing report prints says so.
+
+    ``unrecorded`` is its own count and is NEVER folded into frontal. His
+    live generation carries no angles, and treating "not measured" as "0 deg"
+    would report thirteen perfectly frontal takes he never gave. A yaw
+    between ``FRONTAL_MAX_DEG`` and ``OFFAXIS_MIN_DEG`` lands in no bucket on
+    purpose: that band is the existing dead zone between "at the lens" and
+    "at the screen", and inventing a third name for it would make the counts
+    stop adding up to the thing they are compared against."""
+    out = {"recorded": 0, "unrecorded": 0, "negative": 0, "frontal": 0,
+           "positive": 0, "yaw_min": 0.0, "yaw_max": 0.0, "total": 0}
+    yaws: List[float] = []
+    for take in takes:
+        out["total"] += 1
+        if take.yaw_deg is None:
+            out["unrecorded"] += 1
+            continue
+        out["recorded"] += 1
+        yaw = float(take.yaw_deg)
+        yaws.append(yaw)
+        if yaw <= -OFFAXIS_MIN_DEG:
+            out["negative"] += 1
+        elif abs(yaw) <= FRONTAL_MAX_DEG:
+            out["frontal"] += 1
+        elif yaw >= OFFAXIS_MIN_DEG:
+            out["positive"] += 1
+    if yaws:
+        out["yaw_min"], out["yaw_max"] = min(yaws), max(yaws)
+    return out
+
+
+def coverage_lines(cov: dict) -> List[str]:
+    """The coverage as he should read it, including the gap."""
+    out = ["coverage   %d frontal (|yaw| <= %.0f), %d toward the screen "
+           "(yaw >= +%.0f), %d turned the other way (yaw <= -%.0f); "
+           "%d with no pose record"
+           % (cov["frontal"], FRONTAL_MAX_DEG, cov["positive"],
+              OFFAXIS_MIN_DEG, cov["negative"], OFFAXIS_MIN_DEG,
+              cov["unrecorded"])]
+    if cov["recorded"] and not cov["negative"]:
+        out.append(
+            "NOTE       no takes at all turned the OTHER way (negative yaw). "
+            "Measured on his camera 2026-09-02, every sample of both his "
+            "enrolment and his verification was a POSITIVE yaw -- so a "
+            "gallery like this has never seen that side of his face and "
+            "will fail on it silently. Run again with the 'across' station, "
+            "or --pose \"turned the other way\".")
+    if cov["recorded"] and not cov["positive"]:
+        out.append(
+            "NOTE       no takes toward the screen (positive yaw), which is "
+            "the pose he is in most of the working day.")
+    if cov["unrecorded"] and not cov["recorded"]:
+        out.append(
+            "NOTE       not one take carries a pose record, so this gallery "
+            "cannot say which poses it covers. That is what his generation "
+            "1 is: 13 embeddings written before takes were recorded. Enrol "
+            "again, or --append, to start recording them.")
+    return out
+
+
+def missing_stations(takes: Sequence[Take],
+                     want: int = COVERAGE_WANT) -> Tuple[Station, ...]:
+    """Ask for what the gallery is MISSING, rather than for the list again.
+
+    Better than another fixed script, and it is the difference between a tool
+    that repeats itself and one that reads what is already there: if he has
+    six frontal takes and six at his screen, the only thing worth another
+    minute of his time is the side he has never given.
+
+    NOTHING RECORDED FALLS BACK TO THE FIVE. A gallery that says nothing
+    about its poses supports no inference at all -- and the five stations
+    were chosen against his measured geometry (~+6 deg at the lens, ~+55 at
+    his screen), so they are the right thing to run when there is nothing to
+    reason from. Silence is not evidence of coverage."""
+    cov = coverage(takes)
+    if not cov["recorded"]:
+        return DEFAULT_PLAN
+    out: List[Station] = []
+    for key, have in (("lens", cov["frontal"]),
+                      ("screen", cov["positive"]),
+                      ("across", cov["negative"])):
+        if have < int(want):
+            out.append(replace(_BY_KEY[key], samples=int(want) - have))
+    return tuple(out)
+
+
+def _slug(text: str) -> str:
+    """A short key for the report's station column, from his own words.
+
+    The column is 7 characters wide and holds a name he has to recognise at a
+    glance, so the longest word that is not a filler wins -- "looking at my
+    phone" is "phone", not "looking"."""
+    stop = {"a", "an", "the", "at", "in", "on", "my", "me", "with", "to",
+            "of", "and", "is", "am", "looking", "look", "while", "when"}
+    plain = "".join(c.lower() if (c.isalnum() or c.isspace()) else " "
+                    for c in str(text))
+    words = plain.split()
+    keep = [w for w in words if w not in stop] or words
+    return (keep[0][:7] if keep else "take")
+
+
+def custom_stations(poses: Sequence[str],
+                    samples: int = 3) -> Tuple[Station, ...]:
+    """One station per take he named, in his own words.
+
+    A NAMED TAKE JUDGES NO HEAD ANGLE. The five default stations have yaw
+    windows because they were written against his measured geometry; "with my
+    glasses off" and "looking at my phone" make no claim about yaw at all, so
+    the window is the full range the sample gate already allows and the
+    station never tells him he is in the wrong position. What it does instead
+    is record what he said, which is the thing he asked for.
+
+    An empty pose is a ValueError rather than a blank note: a take stored
+    under "" is indistinguishable from the takes that predate notes, so it
+    would silently become part of the "no pose record" count."""
+    out: List[Station] = []
+    used: set = set()
+    for i, text in enumerate(poses):
+        note = clean_note(text)
+        if not note:
+            raise ValueError(
+                "pose %d is empty. A take needs words on it -- that is the "
+                "whole point of naming one." % (i + 1))
+        key = _slug(note)
+        while key in used:
+            key = ("%s%d" % (key[:6], i + 1))[:7]
+        used.add(key)
+        out.append(Station(key=key,
+                           prompt="Now: %s. Hold it." % note,
+                           yaw_lo=-MAX_YAW_DEG, yaw_hi=MAX_YAW_DEG,
+                           samples=int(samples), note=note))
+    return tuple(out)
+
+
+def choose_plan(takes: Sequence[Take], poses: Sequence[str] = (),
+                pose_samples: int = 3,
+                mode: str = "auto") -> Tuple[Tuple[Station, ...], str]:
+    """``(plan, why)`` -- and the ``why`` is printed, because a run that
+    quietly did something other than the five stations is a run whose numbers
+    he will misread later."""
+    if poses:
+        return (custom_stations(poses, pose_samples),
+                "the %d take%s you named"
+                % (len(poses), "" if len(poses) == 1 else "s"))
+    if mode == "full":
+        return DEFAULT_PLAN, "the full five-station script (--plan full)"
+    gaps = missing_stations(takes)
+    cov = coverage(takes)
+    if not cov["recorded"]:
+        if mode == "missing":
+            return (), ("there is no recorded coverage to be missing from. "
+                        "The gap is measured against the takes this run "
+                        "KEEPS, and a run without --append replaces them")
+        if not cov["total"]:
+            return (DEFAULT_PLAN,
+                    "the full five-station script -- this run replaces the "
+                    "pool, so it has to stand on its own")
+        return (DEFAULT_PLAN,
+                "the full five-station script -- %d stored take%s carry no "
+                "pose record, so there is nothing to reason from"
+                % (cov["total"], "" if cov["total"] == 1 else "s"))
+    if not gaps:
+        if mode == "missing":
+            return (), ("nothing is missing: %d frontal, %d toward the "
+                        "screen, %d the other way, all at or above %d"
+                        % (cov["frontal"], cov["positive"], cov["negative"],
+                           COVERAGE_WANT))
+        return (DEFAULT_PLAN,
+                "the full five-station script -- your recorded coverage is "
+                "already complete, so this is a refresh rather than a gap")
+    return (gaps, "the %d station%s your gallery is missing"
+            % (len(gaps), "" if len(gaps) == 1 else "s"))
+
+
 def member_name(index: int, stored: int, kept: Sequence[Sample]) -> str:
     """What to call pool member ``index`` in a line he will paste.
 
@@ -420,7 +719,8 @@ def member_name(index: int, stored: int, kept: Sequence[Sample]) -> str:
 def judge_gallery(samples: Sequence[Sample], embs: Sequence,
                   identity_min: float = SFACE_COSINE_SAME,
                   min_samples: int = MIN_SAMPLES,
-                  pool: Optional[Sequence] = None) -> Tuple[Check, ...]:
+                  pool: Optional[Sequence] = None,
+                  takes: Optional[Sequence[Take]] = None) -> Tuple[Check, ...]:
     """The pass/fail lines that decide whether this gallery may be saved.
 
     A gallery that is too tight fails him in every pose but one; a gallery
@@ -434,9 +734,25 @@ def judge_gallery(samples: Sequence[Sample], embs: Sequence,
     batch there meant a whole appended batch of a DIFFERENT PERSON passed
     every check and was written under his label, while re-running these same
     checks over the 26 embeddings that actually landed said [FAIL] cohesion.
-    The pose spread stays a statement about THIS RUN, because no yaw is
-    stored with an embedding -- so an append has to earn the spread again
-    rather than inherit a claim nothing can verify.
+
+    THE POSE SPREAD IS JUDGED OVER RECORDED ANGLES, WHICH IS A CHANGE, AND
+    THE OLD REASON FOR NOT DOING IT HAS GONE. It used to be a statement
+    about THIS RUN alone, with the stated reason that "no yaw is stored with
+    an embedding -- so an append has to earn the spread again rather than
+    inherit a claim nothing can verify". Yaw IS stored now (``Take.yaw_deg``,
+    written since the notes landed), so the claim is verifiable for every
+    take that carries one, and refusing to look at it had a real cost: an
+    append that runs ONLY the station his gallery is missing -- the whole
+    point of ``missing_stations`` -- covers one pose by definition and could
+    never pass a spread computed from the run alone. It would have made the
+    feature that reads his gaps unusable.
+
+    A take with NO recorded angle still contributes NOTHING, which keeps the
+    old guarantee exactly where the old reason still applies: appending onto
+    his generation 1 -- 13 embeddings written before takes were recorded --
+    earns the spread from this run or not at all, because there is no
+    evidence to inherit. Evidence is used where it exists and assumed
+    nowhere.
     """
     kept = [s for s in samples if s.accepted]
     pool = list(embs) if pool is None else list(pool)
@@ -458,7 +774,11 @@ def judge_gallery(samples: Sequence[Sample], embs: Sequence,
         checks.append(Check("cohesion", None, "no samples to compare"))
         return tuple(checks)
 
-    yaws = [s.yaw_deg for s in kept]
+    run_yaws = [s.yaw_deg for s in kept]
+    stored_takes = list(takes or ())[:stored]
+    kept_yaws = [float(t.yaw_deg) for t in stored_takes
+                 if t.yaw_deg is not None]
+    yaws = kept_yaws + run_yaws
     spread = (max(yaws) - min(yaws)) if yaws else 0.0
     frontal = sum(1 for y in yaws if abs(y) <= FRONTAL_MAX_DEG)
     offaxis = sum(1 for y in yaws if abs(y) >= OFFAXIS_MIN_DEG)
@@ -467,12 +787,15 @@ def judge_gallery(samples: Sequence[Sample], embs: Sequence,
         (spread >= MIN_YAW_SPREAD_DEG and frontal >= MIN_FRONTAL
          and offaxis >= MIN_OFFAXIS),
         "yaw %+.1f..%+.1f deg (%.1f deg of spread, want %.0f), %d frontal "
-        "(<=%.0f deg, want %d), %d off-axis (>=%.0f deg, want %d). He is at "
+        "(<=%.0f deg, want %d), %d off-axis (>=%.0f deg, want %d), over %d "
+        "angle(s) from this run plus %d recorded with earlier takes (%d "
+        "stored take(s) carry no angle and count for nothing). He is at "
         "~14 deg looking at the lens and ~54 at his screen, so a gallery "
         "without both fails the moment he turns to work."
         % (min(yaws) if yaws else 0.0, max(yaws) if yaws else 0.0, spread,
            MIN_YAW_SPREAD_DEG, frontal, FRONTAL_MAX_DEG, MIN_FRONTAL,
-           offaxis, OFFAXIS_MIN_DEG, MIN_OFFAXIS)))
+           offaxis, OFFAXIS_MIN_DEG, MIN_OFFAXIS, len(run_yaws),
+           len(kept_yaws), len(stored_takes) - len(kept_yaws))))
 
     pairs = pairwise_cosines(pool)
     p50 = _pct(pairs, 0.5)
@@ -567,6 +890,16 @@ class EnrolmentReport:
     # above describe the MERGED gallery and not just this run's batch.
     pool_total: int = 0
     pool_stored: int = 0
+    # What the pool says its takes were, and where it is thin. Both are read
+    # off the SAVED pool, not off this run's batch, for the same reason the
+    # cosines are: the numbers printed have to be the numbers judged.
+    cov_frontal: int = 0
+    cov_positive: int = 0
+    cov_negative: int = 0
+    cov_unrecorded: int = 0
+    weakest: str = ""
+    notes: tuple = ()            # NoteRow, worst cohesion first
+    coverage_notes: tuple = ()   # the prose lines for the gaps
     rejects: tuple = ()          # (reason-word, count) pairs
     samples: tuple = ()
     checks: tuple = ()
@@ -580,11 +913,14 @@ class EnrolmentReport:
 
     def to_dict(self) -> dict:
         out = {k: v for k, v in vars(self).items()
-               if k not in ("checks", "samples", "rejects")}
+               if k not in ("checks", "samples", "rejects", "notes",
+                            "coverage_notes")}
         out["ok"] = self.ok
         out["checks"] = [list(c.as_tuple()) for c in self.checks]
         out["samples"] = [s.as_dict() for s in self.samples]
         out["rejects"] = [[str(k), int(v)] for k, v in self.rejects]
+        out["notes"] = [list(r.as_tuple()) for r in self.notes]
+        out["coverage_notes"] = [str(x) for x in self.coverage_notes]
         return out
 
     def lines(self) -> list:
@@ -622,6 +958,23 @@ class EnrolmentReport:
             "bar" % (self.cohesion_min, self.cohesion_p50,
                      self.identity_min),
         ]
+        out.extend(coverage_lines({"frontal": self.cov_frontal,
+                                   "positive": self.cov_positive,
+                                   "negative": self.cov_negative,
+                                   "unrecorded": self.cov_unrecorded,
+                                   "recorded": (self.cov_frontal
+                                                + self.cov_positive
+                                                + self.cov_negative),
+                                   "total": self.pool_total}))
+        if self.notes:
+            out.append("by take    what each pose is worth, weakest first. "
+                       "This is what the notes are FOR: when a match scores "
+                       "badly, the first row is the answer.")
+            out.extend(r.line() for r in self.notes)
+        if self.weakest:
+            out.append("WEAKEST    the %r takes -- that is where to add "
+                       "more, not to the pose that is already strong."
+                       % self.weakest)
         if self.min_conf < DEFAULT_MIN_CONF:
             # The one setting that can turn the gate this module is built on
             # into a formality, said where he cannot miss it rather than left
@@ -656,7 +1009,8 @@ def _reject_word(reason: str) -> str:
 
 def summarise(report: EnrolmentReport, samples: Sequence[Sample],
               embs: Sequence, embed_ms: Sequence[float],
-              identity_min: float, pool: Optional[Sequence] = None) -> None:
+              identity_min: float, pool: Optional[Sequence] = None,
+              takes: Optional[Sequence[Take]] = None) -> None:
     """Fill the distributions. Split out so a caller that assembled samples
     some other way -- a re-scoring of an existing gallery, say -- gets the
     identical arithmetic rather than a second version of it.
@@ -718,7 +1072,23 @@ def summarise(report: EnrolmentReport, samples: Sequence[Sample],
         tally[key] = tally.get(key, 0) + 1
     report.rejects = tuple(sorted(tally.items(), key=lambda kv: -kv[1]))
     report.samples = tuple(samples)
-    report.checks = judge_gallery(samples, embs, identity_min, pool=pool)
+    # The takes belong to the POOL, so a caller that could not supply them
+    # (a re-scoring of raw vectors) gets one blank take per member rather
+    # than a mismatch -- which reads as "no pose record", which is true.
+    tks = list(takes) if takes is not None else []
+    if len(tks) < len(pool):
+        tks = tks + [Take()] * (len(pool) - len(tks))
+    tks = tks[:len(pool)]
+    report.checks = judge_gallery(samples, embs, identity_min, pool=pool,
+                                  takes=tks)
+    cov = coverage(tks)
+    report.cov_frontal = cov["frontal"]
+    report.cov_positive = cov["positive"]
+    report.cov_negative = cov["negative"]
+    report.cov_unrecorded = cov["unrecorded"]
+    report.coverage_notes = tuple(coverage_lines(cov)[1:])
+    report.notes = note_rows(pool, tks)
+    report.weakest = weakest_note(report.notes)
 
 
 # -------------------------------------------------------------- the session
@@ -760,8 +1130,14 @@ class EnrolmentSession:
     def kept(self) -> int:
         return len(self.embs)
 
-    def offer(self, frame, station: str = "") -> Optional[Sample]:
+    def offer(self, frame, station: str = "",
+              note: str = "") -> Optional[Sample]:
         """Detect, judge, and embed only if judged good.
+
+        ``note`` is what he said he was doing -- "looking at my phone" -- and
+        it is stored beside the embedding, never instead of anything. It has
+        no effect on whether the sample is accepted: a note is a label on a
+        measurement, not evidence about it.
 
         Returns None when the detector saw NO face at all -- which is not a
         rejected sample, it is a frame with nobody in it, and counting it as
@@ -777,7 +1153,7 @@ class EnrolmentSession:
                 index=len(self.samples), station=station, faces=0, conf=0.0,
                 face_px=0.0, eye_px=0.0, yaw_deg=0.0, roll_deg=0.0,
                 bearing_deg=0.0, sharpness=0.0, accepted=False,
-                reason="detector raised: %s" % exc))
+                reason="detector raised: %s" % exc, note=note))
         rows = [] if rows is None else list(rows)
         if not len(rows):
             return None
@@ -793,7 +1169,8 @@ class EnrolmentSession:
                         conf=obs.conf, face_px=obs.face_px,
                         eye_px=obs.eye_px, yaw_deg=obs.yaw_deg,
                         roll_deg=obs.roll_deg, bearing_deg=obs.bearing_deg,
-                        sharpness=sharp, accepted=False, reason=why)
+                        sharpness=sharp, accepted=False, reason=why,
+                        note=note)
         if not ok:
             # NO EMBEDDING IS COMPUTED. This is the rule, in code: SFace
             # answers confidently on inputs that are not faces, so an
@@ -811,7 +1188,8 @@ class EnrolmentSession:
                    "reason": "recogniser refused: %s" % exc}))
         self.embed_ms.append((self._now() - t0) * 1000.0)
         try:
-            self.gallery.add(self.label, vec)
+            self.gallery.add(self.label, vec, note=note,
+                             yaw_deg=obs.yaw_deg)
         except ValueError as exc:
             # facegallery's own degenerate-vector guard. It has never fired
             # on a real embedding; if it does, that is a finding and it
@@ -850,13 +1228,23 @@ class EnrolmentSession:
                       exc_info=True)
             return list(self.embs)
 
+    def pool_takes(self) -> List[Take]:
+        """The takes for ``pool()``, index for index. Same fallback: a
+        gallery that cannot say gets blanks, which read as "no record"."""
+        try:
+            return self.gallery.takes(self.label)
+        except Exception:  # noqa: BLE001 - see pool()
+            log.debug("faceenrol: gallery could not report its takes",
+                      exc_info=True)
+            return []
+
     def report(self, identity_min: float = SFACE_COSINE_SAME
                ) -> EnrolmentReport:
         rep = EnrolmentReport(label=self.label, frames=self.frames,
                               detector_ok=True,
                               min_conf=self.limits.min_conf)
         summarise(rep, self.samples, self.embs, self.embed_ms, identity_min,
-                  pool=self.pool())
+                  pool=self.pool(), takes=self.pool_takes())
         return rep
 
 
@@ -907,7 +1295,8 @@ def run_enrolment(session: EnrolmentSession, source, *,
                 stopped = ("the frame source stopped delivering -- sensing "
                            "denied the camera, or the device went away")
                 break
-            sample = session.offer(frame, station.key)
+            sample = session.offer(frame, station.key,
+                                   note=station.note or station.key)
             frame = None            # the frame does not outlive the loop
             if sample is None:
                 continue
@@ -1109,8 +1498,12 @@ def restore(gallery: FaceGallery, src: Path, reason: str) -> dict:
     # are untouched, so the thing being replaced is still on disk.
     gallery.reset()
     for label in holding.labels():
-        for emb in holding.embeddings(label):
-            gallery.add(label, emb)
+        # zip, not two loops: a restore that dropped the notes would quietly
+        # turn a gallery that knows which poses it covers into one that does
+        # not, and nothing about the restored gallery would look wrong.
+        for emb, take in zip(holding.embeddings(label),
+                             holding.takes(label)):
+            gallery.add(label, emb, note=take.note, yaw_deg=take.yaw_deg)
             out["restored"] += 1
     if not out["restored"]:
         out["reason"] = "the newest generation in %s holds no embeddings" % src
