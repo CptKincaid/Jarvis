@@ -2908,10 +2908,13 @@ class TTS:
     def _play(self, wav_path: str):
         """Play a wav via paplay → pw-play → aplay (chain order unchanged).
 
-        Uses Popen + poll so stop() can interrupt playback; per-player
-        timeout stays 30s, non-zero exit falls through to the next player.
+        Uses Popen + poll so stop() can interrupt playback; non-zero exit
+        falls through to the next player. The per-player deadline is the
+        file's own length plus PLAYER_GRACE_S -- it was a flat 30 s, which a
+        joined Breeze chunk's replay outlived (see PLAYER_GRACE_S).
         """
         dev = (CONFIG.playback_device or "").strip()
+        deadline_s = _player_deadline(wav_path)
         # An explicit sink (the echo-cancelling one) for the two players
         # that can take one; aplay is the no-PipeWire fallback.
         for cmd in [["paplay", f"--client-name={SPEECH_CLIENT_NAME}",
@@ -2928,7 +2931,7 @@ class TTS:
                 continue
             self._play_proc = proc
             try:
-                if not self._wait_player(proc, deadline_s=30):
+                if not self._wait_player(proc, deadline_s=deadline_s):
                     return
             finally:
                 self._play_proc = None
@@ -2942,6 +2945,11 @@ class TTS:
         deadline = time.monotonic() + deadline_s
         while proc.poll() is None:
             if self._stop_flag or time.monotonic() > deadline:
+                if not self._stop_flag:
+                    # Loud, because it was not: a chunk cut here used to
+                    # leave "speech complete" as its only trace.
+                    log.warning("player cut at its %.0f s deadline -- the "
+                                "rest of that chunk was not heard", deadline_s)
                 proc.terminate()
                 try:
                     proc.wait(timeout=2)
@@ -3295,6 +3303,60 @@ def wav_pcm(path: str) -> tuple[tuple[int, int, int], bytes]:
 
     data, rate = sf.read(path, dtype="int16", always_2d=True)
     return (int(rate), int(data.shape[1]), 2), data.tobytes()
+
+
+# What the file-chain player (paplay / pw-play / aplay handed a FINISHED wav)
+# is allowed BEYOND the audio in that file before it is terminated.
+#
+# It used to be a flat 30 s per player, and a flat number was fine while the
+# largest chunk any engine produced was ~320 characters (~19 s of audio).
+# _BREEZE_STREAM_JOIN_CHARS then made a Breeze chunk the whole reply, 560
+# characters, and only the STREAM path's deadline was revisited
+# (stream.timeout + 30 in _play_stream). The first hearing of a long reply
+# was therefore whole and every other road to the speaker was cut: the same
+# reply said again is a cache hit through _play(), a refusal before audio
+# sends the whole one-chunk reply to F5 through _play(), and so does
+# _play_stream_from_file. At 0.0594 s/char (BREEZE_TIMEOUT_S's arithmetic) a
+# 560-char chunk is 33.2 s and a capped 522-char reply 31.0 s; at F5's
+# measured 0.060 s/char the fallback render of the same reply is 31.4 s. All
+# of them past 30, terminated in silence, with "speech complete" in the log.
+#
+# So the deadline is now the file's own length plus this. 30 is kept as the
+# grace because it is what the number always bounded in practice: the sound
+# server's buffered tail, a slow start, and a player that has genuinely
+# wedged. See _wav_seconds for why the length is read off the file's SIZE
+# and not its header.
+PLAYER_GRACE_S = 30.0
+
+
+def _wav_seconds(path: str) -> Optional[float]:
+    """Seconds of audio in a PCM wav, or None when it is not one.
+
+    From the file's SIZE, bounded by the header's frame count, and not the
+    header alone: a Breeze cache entry is the tee of a stream, so its header
+    carries STREAM_SIZE in both length fields -- which wave reads as
+    2147483647 frames, 89478 s at 24 kHz (measured). A deadline built on
+    that would be no deadline at all. Edge writes an MP3 into a .wav-suffixed
+    file (module docstring), which wave refuses: that returns None and the
+    player keeps the flat grace it always had.
+    """
+    try:
+        size = os.path.getsize(path)
+        with wave.open(path, "rb") as fh:
+            rate = fh.getframerate()
+            frame = fh.getnchannels() * fh.getsampwidth()
+            if not rate or not frame:
+                return None
+            frames = min(fh.getnframes(),
+                         max(0, size - _WAV_HEADER_BYTES) // frame)
+    except (wave.Error, EOFError, OSError):
+        return None
+    return frames / float(rate)
+
+
+def _player_deadline(path: str) -> float:
+    """How long _play may wait on one player for ``path``."""
+    return PLAYER_GRACE_S + (_wav_seconds(path) or 0.0)
 
 
 class Rendition:

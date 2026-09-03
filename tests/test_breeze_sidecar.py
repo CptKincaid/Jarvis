@@ -3068,6 +3068,146 @@ def test_the_consumer_deadline_is_the_render_one_not_the_read_one(breeze,
     assert seen and seen[0].timeout == tts_mod.BREEZE_RENDER_TIMEOUT_S
 
 
+def _silence_wav(seconds: float, streaming: bool = False) -> bytes:
+    """``seconds`` of PCM16 silence at 24 kHz, headed as a finished file or
+    as the tee of a STREAM (both size fields 0xFFFFFFFF, which is what a
+    Breeze cache entry carries)."""
+    n = int(24000 * 2 * seconds)
+    return tts_mod.wav_header(24000, 1, 2, None if streaming else n) + bytes(n)
+
+
+class _FakeClock:
+    """time.* for _wait_player: sleep() advances the clock instead of
+    waiting, so a 31 s playback costs nothing."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+    time = perf_counter = monotonic
+
+
+def _player_needing(clock, seconds, events):
+    """A Popen double that 'exits' once ``seconds`` of the fake clock have
+    passed, recording when it is terminated."""
+
+    class Proc:
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd
+            self.returncode = None
+            self.start = clock.t
+
+        def poll(self):
+            if self.returncode is None and clock.t - self.start >= seconds:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            events.append(("terminate", round(clock.t - self.start, 2)))
+            self.returncode = -15
+
+        kill = terminate
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    return Proc
+
+
+def _bare_player(monkeypatch, clock, proc_cls):
+    monkeypatch.setattr(tts_mod, "time", clock)
+    monkeypatch.setattr(tts_mod.subprocess, "Popen", proc_cls)
+    monkeypatch.setattr(tts_mod.CONFIG, "playback_device", "")
+    t = TTS.__new__(TTS)
+    t._stop_flag = False
+    t._burst_announced = True
+    t._player = None
+    return t
+
+
+def test_a_replayed_joined_chunk_is_not_cut_at_thirty_seconds(tmp_path,
+                                                              monkeypatch):
+    """The stream path allows stream.timeout + 30 s, so the FIRST hearing of
+    a joined reply was whole. Every other road to the speaker -- the same
+    reply said again (a cache hit), the F5 fallback for a refused chunk,
+    _play_stream_from_file -- goes through _play(), which gave each player a
+    flat 30 s and terminated it with no log line. A joined chunk is 560
+    characters: 33.2 s of audio at the 0.0594 s/char BREEZE_TIMEOUT_S's own
+    comment uses, and a capped 522-char reply is 31.0 s. Before the join the
+    largest chunk was ~320 characters (~19 s) and the 30 s was unreachable.
+
+    Measured on b6b8079 with this clock: a player that needs 31 s was
+    terminated at t=30.00. The deadline is now the file's own length plus
+    the grace."""
+    clock, events = _FakeClock(), []
+    t = _bare_player(monkeypatch, clock, _player_needing(clock, 31.0, events))
+    wav = tmp_path / "replay.wav"
+    wav.write_bytes(_silence_wav(31.0, streaming=True))   # a Breeze cache hit
+    t._play(str(wav))
+    assert events == [], "the player was terminated before the audio ended"
+    assert clock.t >= 31.0
+
+
+def test_a_player_that_never_exits_is_still_cut_and_now_says_so(
+        tmp_path, monkeypatch, caplog):
+    """The grace is still a deadline: a wedged paplay is terminated the
+    file's length plus PLAYER_GRACE_S after it started. And it is LOGGED --
+    before, the only trace of a chunk whose tail was never heard was
+    'speech complete'."""
+    clock, events = _FakeClock(), []
+    t = _bare_player(monkeypatch, clock, _player_needing(clock, 10 ** 9, events))
+    wav = tmp_path / "short.wav"
+    wav.write_bytes(_silence_wav(0.5))
+    with caplog.at_level("WARNING", logger="jarvis.tts"):
+        t._play(str(wav))
+    assert len(events) == 1 and events[0][0] == "terminate"
+    assert abs(events[0][1] - (tts_mod.PLAYER_GRACE_S + 0.5)) < 0.2
+    assert any("deadline" in r.getMessage() for r in caplog.records)
+
+
+def test_the_players_deadline_is_measured_off_the_file_not_its_header(
+        tmp_path):
+    """A Breeze cache entry is the tee of a stream, so its header says
+    0xFFFFFFFF bytes -- which wave reads as 2147483647 frames, 89478 s at
+    24 kHz (measured). A deadline taken from that would be no deadline at
+    all, so the file's SIZE bounds it. Edge's cache entries are an MP3 in a
+    .wav-suffixed file, which wave refuses: those keep the flat grace they
+    always had."""
+    streamed = tmp_path / "streamed.wav"
+    streamed.write_bytes(_silence_wav(31.0, streaming=True))
+    whole = tmp_path / "whole.wav"
+    whole.write_bytes(_silence_wav(31.0))
+    mp3 = tmp_path / "edge.wav"
+    mp3.write_bytes(b"ID3\x04\x00" + bytes(200))
+    assert abs(tts_mod._wav_seconds(str(streamed)) - 31.0) < 0.001
+    assert abs(tts_mod._wav_seconds(str(whole)) - 31.0) < 0.001
+    assert tts_mod._wav_seconds(str(mp3)) is None
+    assert tts_mod._wav_seconds(str(tmp_path / "missing.wav")) is None
+    assert tts_mod._player_deadline(str(streamed)) == pytest.approx(
+        31.0 + tts_mod.PLAYER_GRACE_S)
+    assert tts_mod._player_deadline(str(mp3)) == tts_mod.PLAYER_GRACE_S
+
+
+def test_the_file_chain_deadline_covers_the_longest_chunk_the_join_can_make(
+        tmp_path):
+    """The relation, at both rates a fallen-back chunk can be rendered at:
+    Breeze's 0.0594 s/char (BREEZE_TIMEOUT_S's arithmetic) and F5's
+    0.060 s/char (162 chars -> 9.74 s, the _ENGINE_CHUNKING measurement).
+    The flat grace is UNDER a joined chunk at both -- that was the bug --
+    and the deadline for a file of that length is over it."""
+    for s_per_char in (19.0 / 320, 9.74 / 162):
+        audio = TTS._BREEZE_STREAM_JOIN_CHARS * s_per_char
+        assert audio > tts_mod.PLAYER_GRACE_S, "the flat number was not the bug"
+        wav = tmp_path / f"{s_per_char:.4f}.wav"
+        wav.write_bytes(_silence_wav(audio))
+        assert tts_mod._player_deadline(str(wav)) > audio + 10
+
+
 # ===========================================================================
 # 13. starting up without stalling the room
 # ===========================================================================
