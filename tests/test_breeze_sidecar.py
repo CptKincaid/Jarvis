@@ -527,13 +527,20 @@ def test_the_installer_does_not_enable_or_start_the_unit():
     opt-in on a box that reboots."""
     src = SETUP.read_text()
     assert "daemon-reload" in src
-    # Only what the script RUNS: the closing message quotes both commands on
-    # purpose, and a substring search over the whole file would read them as
-    # if they were executed.
-    ran = "\n".join(ln for ln in src.split("cat <<MSG")[0].splitlines()
-                    if not ln.lstrip().startswith("#"))
+    # Only what the DEFAULT invocation runs. Two slices, because two parts of
+    # the file quote commands they do not execute: the closing message, and
+    # the --enable-at-boot branch, which is boot ordering and is reached only
+    # by a flag he types. tests/test_breeze_boot_window.py runs the installer
+    # for real against a sandbox HOME and asserts the call list.
+    ran = "\n".join(
+        ln for ln in src.split('if [ "$MODE" = enable ]')[0]
+                        .split("cat <<MSG")[0].splitlines()
+        if not ln.lstrip().startswith("#"))
     assert "systemctl --user enable" not in ran
     assert "systemctl --user start" not in ran
+    # and the enable path is behind an explicit flag, never the default
+    assert 'MODE=install' in src
+    assert '--enable-at-boot) MODE=enable' in src
     # ...but it must TELL him both commands, and how to get back
     assert "systemctl --user start $UNIT" in src
     assert "systemctl --user stop $UNIT" in src
