@@ -194,6 +194,8 @@ class Profile:
     password: str = ""
     ota_password: str = ""
     ip: str = ""
+    dhcp: bool = False              # the router reserves it; no manual_ip block
+    mac: str = ""                   # what the router matches the reservation on
     gateway: str = DEFAULT_GATEWAY
     subnet: str = DEFAULT_SUBNET
     board: str = "esp32dev"
@@ -265,7 +267,10 @@ class Profile:
         near, far = self.nearest_m, self.range_m
         lines = [
             "  room            %s   (device %s)" % (self.room, self.device_name),
-            "  address         %s   gateway %s" % (self.ip or "(unset)", self.gateway),
+            "  address         %s   %s" % (
+            self.ip or "(from DHCP)",
+            ("DHCP reservation on %s" % self.mac) if self.dhcp
+            else "static, gateway %s" % self.gateway),
             "  mount preset    %s -- %s" % (self.preset,
                                             PRESETS[self.preset].blurb
                                             if self.preset in PRESETS else "custom"),
@@ -459,9 +464,11 @@ def cmd_init(args) -> int:
                       ("ota_password", args.ota_password), ("ip", args.ip),
                       ("gateway", args.gateway), ("subnet", args.subnet),
                       ("board", args.board), ("serial_port", args.port),
-                      ("notes", args.note)):
+                      ("mac", args.mac), ("notes", args.note)):
         if val:
             setattr(prof, attr, val)
+    if args.dhcp:
+        prof.dhcp = True
     if args.wrover:
         prof.board, prof.rx_pin, prof.tx_pin = "esp-wrover-kit", "GPIO32", "GPIO33"
 
@@ -487,12 +494,18 @@ def cmd_init(args) -> int:
               "another address -- a collision looks exactly like a dead sensor."
               % prof.ip)
 
-    missing = [k for k in ("ssid", "password", "ip") if not getattr(prof, k)]
+    # With a reservation the ADDRESS is the router's to give, so it is not
+    # needed to flash -- only to talk to the device afterwards.
+    needed = ("ssid", "password") + (() if prof.dhcp else ("ip",))
+    missing = [k for k in needed if not getattr(prof, k)]
     path = prof.save()
     print("\nprofile written: %s (0600)\n%s" % (path, prof.describe()))
     if missing:
         print("\nstill needed before flashing: %s" % ", ".join("--" + m for m in missing))
         return 1
+    if prof.dhcp and not prof.ip:
+        print("\nDHCP: flash it, note the address it reports, then reserve %s on the "
+              "router and re-run init with --ip <that address>." % (prof.mac or "its MAC"))
     print("\nMount it as follows before you trust the numbers:\n  %s"
           % preset.mount.replace(". ", ".\n  "))
     print("\nNext:  %s flash %s" % (sys.argv[0], prof.room))
@@ -532,6 +545,24 @@ def render_yaml(prof: Profile) -> str:
             else:
                 continue                 # drop the template's placeholder lines
         out.append(line)
+    if prof.dhcp:
+        # A DHCP RESERVATION and a manual_ip block are two answers to one
+        # question. Keeping both means the router hands out the reserved
+        # address and the device ignores it -- which looks exactly like a
+        # reservation that did not take. The reservation wins; the block goes.
+        kept, drop_at = [], None
+        for line in out:
+            indent = len(line) - len(line.lstrip())
+            if line.strip().startswith("manual_ip:"):
+                drop_at = indent
+                continue
+            if drop_at is not None:
+                if line.strip() and indent <= drop_at:
+                    drop_at = None          # the block ended
+                else:
+                    continue
+            kept.append(line)
+        out = kept
     body = "\n".join(out) + "\n"
     if prof.board != "esp32dev":
         body = body.replace("  board: esp32dev", "  board: %s" % prof.board, 1)
@@ -557,7 +588,7 @@ def write_build(prof: Profile) -> Path:
 
 def cmd_build(args) -> int:
     prof = Profile.load(args.room)
-    for key in ("ssid", "password", "ip"):
+    for key in ("ssid", "password") + (() if prof.dhcp else ("ip",)):
         if not getattr(prof, key):
             raise SystemExit("profile %r has no %s; re-run init with --%s"
                              % (prof.room, key, key))
@@ -620,8 +651,12 @@ def cmd_flash(args) -> int:
         target = prof.serial_port
 
     print("flashing %s via %s ..." % (prof.device_name, target))
-    res = subprocess.run([str(binary), "run", str(path), "--device", target,
-                          "--no-logs" if args.no_logs else "--verbose"][:4 + (0 if args.no_logs else 0)])
+    argv = [str(binary), "run", str(path), "--device", target]
+    if args.no_logs:
+        # Without this esphome tails the device log forever, which is right at
+        # a keyboard and a hang anywhere else.
+        argv.append("--no-logs")
+    res = subprocess.run(argv)
     if res.returncode != 0:
         print("\nesphome exited %d." % res.returncode)
         if not over_air:
@@ -806,6 +841,36 @@ def cmd_install_config(args) -> int:
 
 
 # ---------------------------------------------------------------------- main
+def cmd_mac(args) -> int:
+    """The Wi-Fi station MAC, read over USB before anything is flashed.
+
+    It is the base MAC esptool prints; the AP, Bluetooth and Ethernet MACs are
+    that plus 1, 2 and 3, and the one a router matches a DHCP reservation on
+    is the station MAC, i.e. this one.
+    """
+    py = ESPHOME_VENV / "bin" / "python"
+    if not py.exists():
+        raise SystemExit("esphome (which brings esptool) is not installed; run: "
+                         "%s install-esphome" % sys.argv[0])
+    exists, writable, detail = _port_state(args.port)
+    if not writable:
+        raise SystemExit("%s: %s -- run `%s doctor`" % (args.port, detail, sys.argv[0]))
+    res = subprocess.run([str(py), "-m", "esptool", "--port", args.port, "read-mac"],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    macs = re.findall(r"MAC:\s+([0-9a-f:]{17})", res.stdout)
+    if not macs:
+        print(res.stdout[-2000:])
+        return res.returncode or 1
+    mac = macs[-1]
+    print("station MAC: %s" % mac)
+    if args.room:
+        prof = Profile.load(args.room)
+        prof.mac = mac
+        prof.save()
+        print("saved to the %r profile" % args.room)
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(
         prog="room_sensor.py", description=__doc__.splitlines()[0],
@@ -829,6 +894,9 @@ def build_parser() -> argparse.ArgumentParser:
     n.add_argument("--ssid"), n.add_argument("--password")
     n.add_argument("--ota-password")
     n.add_argument("--ip"), n.add_argument("--gateway"), n.add_argument("--subnet")
+    n.add_argument("--dhcp", action="store_true",
+                   help="the router reserves the address (drops the manual_ip block)")
+    n.add_argument("--mac", help="the device MAC, for the reservation (see: mac)")
     n.add_argument("--nearest", type=float,
                    help="metres to the NEAREST body it must hold (the chair, the bed)")
     n.add_argument("--range", type=float,
@@ -875,6 +943,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--fast", action="store_true",
                    help="also set poll_s_away 5 (arrival 2.7 s mean instead of 5.7)")
     g.set_defaults(func=cmd_install_config)
+
+    m = sub.add_parser("mac", help="read the station MAC over USB (for a DHCP reservation)")
+    m.add_argument("room", nargs="?")
+    m.add_argument("--port", default="/dev/ttyUSB0")
+    m.set_defaults(func=cmd_mac)
 
     s = sub.add_parser("show", help="print a profile")
     s.add_argument("room")

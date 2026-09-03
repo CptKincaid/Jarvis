@@ -152,7 +152,12 @@ def test_the_rendered_yaml_carries_this_room_and_keeps_every_ruling():
     # The decisions the template documents must all still be in the render.
     assert "\napi:" not in out, "the api: block reboots the device every 15 min"
     assert "has_target:" in out and "name: Presence" in out
-    assert "throttle: 250ms" in out
+    # `throttle:` was REMOVED from the ld2410 component upstream; it must not
+    # come back on the component, and the presence bit must stay unthrottled
+    # because that delay is arrival latency Jarvis pays.
+    assert "throttle: 250ms" not in out
+    presence_block = out.split("binary_sensor:")[1].split("sensor:")[0]
+    assert "throttle" not in presence_block
     assert "baud_rate: 256000" in out
     assert "tx_pin: GPIO17" in out and "rx_pin: GPIO16" in out
 
@@ -176,6 +181,31 @@ def test_the_build_path_is_outside_the_repo(tmp_path, monkeypatch):
     monkeypatch.setattr(rs, "BUILD_DIR", tmp_path / "build")
     p = rs.Profile(room="office", ip="192.168.50.60")
     assert rs.REPO not in rs.build_path(p).parents
+
+
+def test_a_dhcp_reservation_drops_the_manual_ip_block():
+    """A reservation and a manual_ip block are two answers to one question:
+    the router hands out the reserved address and the device ignores it,
+    which looks exactly like a reservation that never took."""
+    p = rs.Profile(room="office", ssid="n", password="p", ip="192.168.50.60",
+                   dhcp=True, mac="5c:01:3b:be:ef:78")
+    out = rs.render_yaml(p)
+    assert "manual_ip:" not in out
+    assert "static_ip:" not in out.split("wifi:")[1].split("captive_portal")[0]
+    assert "ap:" in out and "captive_portal:" in out, "the rest of wifi: survived"
+    assert "ssid: ${wifi_ssid}" in out
+
+
+def test_a_static_address_keeps_the_block():
+    p = rs.Profile(room="office", ssid="n", password="p", ip="192.168.50.60")
+    out = rs.render_yaml(p)
+    assert "manual_ip:" in out and "static_ip: ${static_ip}" in out
+
+
+def test_describe_names_the_reservation_it_depends_on():
+    p = rs.Profile(room="office", ip="192.168.50.60", dhcp=True,
+                   mac="5c:01:3b:be:ef:78")
+    assert "5c:01:3b:be:ef:78" in p.describe()
 
 
 # ------------------------------------------------------------------- presets
