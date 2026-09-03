@@ -619,15 +619,21 @@ DEFAULTS: dict = {
                # sensing.py on top, so offline mode and the curfew shut it
                # whatever this says.
                #
-               # preview_fps is CAPTURE rate, and 6 is deliberately under the
-               # ~7.5 the device delivers. The console animates on 16.67 ms
-               # slot boundaries in the same process (jarvis/ui/reactor.py),
-               # so the capture runs on its own thread and the pane repaints
-               # at twice this rate off a latest-wins slot; asking for 30
-               # here would not produce 30 frames, it would produce a thread
-               # that is always inside a 130 ms blocking read and a curfew
-               # edge that has to wait it out.
-               "preview": False, "preview_fps": 6.0},
+               # preview_fps is the PICTURE rate. It was 6, under a measured
+               # ~7.5 fps device -- and that measurement was an artefact of
+               # asking a LifeCam Cinema for 1920x1080, a mode it does not
+               # have (v4l2 grants a different one silently and the cost shows
+               # up as grab latency). At the corrected 1280x720 the grab is
+               # 11 ms, so 6 fps was leaving the pane at a 167 ms step for no
+               # reason and he said so: "it lags a ton" (2026-09-03).
+               #
+               # 15 is capped at 30 in jarvis/campreview.py -- the nominal
+               # rate of the mode -- and the boxes and the name have their own
+               # slower cadences, which is what keeps the whole thing at ~12%
+               # of one core instead of 75%. The console animates on 16.67 ms
+               # slot boundaries in the same process, so the capture runs on
+               # its own thread and the pane repaints off a latest-wins slot.
+               "preview": False, "preview_fps": 15.0},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

@@ -41,9 +41,11 @@ def _restore():
 
 
 def face(x=100.0, y=50.0, w=300.0, h=300.0, conf=0.93, yaw=14.1,
-         attending=True, landmarks_ok=True):
+         attending=True, landmarks_ok=True, name="", id_score=0.0,
+         id_ran=False):
     return cp.PreviewFace(conf=conf, x=x, y=y, w=w, h=h, yaw_deg=yaw,
-                          attending=attending, landmarks_ok=landmarks_ok)
+                          attending=attending, landmarks_ok=landmarks_ok,
+                          name=name, id_score=id_score, id_ran=id_ran)
 
 
 def live(*faces, cap=(1280, 720)):
@@ -327,6 +329,13 @@ def test_the_band_scales_with_the_ui_scale():
 class FakeCanvas:
     """Every canvas call the pane makes, recorded. No Tk anywhere."""
 
+    # A made-up but FIXED text metric, so a test can say where a chip's
+    # ground should land without measuring a real font. The pane asks the
+    # canvas for the bbox of the text it just set precisely so it does not
+    # have to guess this itself; what is under test is what it does with the
+    # answer, not the answer.
+    CHAR_W, LINE_H = 6, 12
+
     def __init__(self):
         self.state = {}
         self.coords_of = {}
@@ -340,6 +349,18 @@ class FakeCanvas:
 
     def coords(self, item, *args):
         self.coords_of[item] = tuple(args)
+
+    def bbox(self, item):
+        """Tk's ``bbox`` for a text item, at this canvas's fake metric."""
+        at = self.coords_of.get(item)
+        conf = self.state.get(item, {})
+        if not at or not conf.get("text"):
+            return None
+        x, y = at[0], at[1]
+        w = len(conf["text"]) * self.CHAR_W
+        if conf.get("anchor") == "sw":
+            return (x, y - self.LINE_H, x + w, y)
+        return (x, y, x + w, y + self.LINE_H)
 
     def shown(self, item) -> bool:
         return self.state.get(item, {}).get("state") == "normal"
@@ -394,9 +415,12 @@ def pane(scale=1.0, shown=True):
         _rows=[("l0", "v0"), ("l1", "v1")],
         _shadows=["s0", "s1", "s2"], _boxes=["b0", "b1", "b2"],
         _brackets=["k0", "k1", "k2", "k3"],
+        _name="name", _namebg="namebg",
         images=[])
     ns._clear_picture = lambda: CameraPreview._clear_picture(ns)
     ns._draw_faces = lambda shot: CameraPreview._draw_faces(ns, shot)
+    ns._draw_name = lambda f, rect: CameraPreview._draw_name(ns, f, rect)
+    ns._place_name = lambda t, x, y: CameraPreview._place_name(ns, t, x, y)
     ns._fit_text = lambda text: CameraPreview._fit_text(ns, text)
     ns._col_x = ns._origin[0] + box[0] + px(pv.COL_GAP)
 
@@ -489,6 +513,269 @@ def test_a_frame_that_will_not_convert_leaves_the_pane_dark_not_stale():
     assert c.state["img"]["state"] == "hidden"
     for item in ns._boxes:
         assert c.state[item]["state"] == "hidden"
+
+
+# --------------------------------------------------- who it is looking at
+def test_the_tracked_face_is_labelled_with_who_it_is():
+    """His words, 2026-09-03: "lets have the identity of the person its
+    tracking next to their name, small but readable"."""
+    ns = pane()
+    c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    assert c.state["name"]["text"] == "HUNTER 0.74"
+    assert c.shown("name") and c.shown("namebg")
+    assert c.state["name"]["fill"] == theme.FOCAL
+
+
+def test_a_face_that_matched_nothing_says_unknown_rather_than_going_blank():
+    """Three states, not two: no chip is "identity is not running", UNKNOWN
+    is "it ran and nobody in the gallery is this person". Drawing them the
+    same way would leave him unable to tell one from the other."""
+    ns = pane()
+    c = paint(ns, live(face(name="", id_score=0.21, id_ran=True)))
+    assert c.state["name"]["text"] == "UNKNOWN 0.21"
+    assert c.state["name"]["fill"] == theme.MUTED     # a lesser claim
+    assert c.shown("name")
+
+
+def test_a_face_nobody_asked_about_gets_no_chip_at_all():
+    ns = pane()
+    c = paint(ns, live(face()))
+    assert not c.shown("name") and not c.shown("namebg")
+
+
+def test_only_the_tracked_face_is_named():
+    """One subject, the same rule the attention verdict follows: one
+    embedding per identity tick, on the face at the desk."""
+    ns = pane()
+    c = paint(ns, live(face(w=300, name="hunter", id_score=0.74, id_ran=True),
+                       face(x=0, y=0, w=80, h=80)))
+    assert c.state["name"]["text"] == "HUNTER 0.74"
+    assert len([1 for item in ("name", "namebg") if c.shown(item)]) == 2
+
+
+def test_the_chip_carries_its_own_ground_under_its_word():
+    """Text over live video is text over an unknown background -- the rule
+    this pane already made when it put the numbers BESIDE the picture. He
+    asked for this one next to the face, so it brings a ground with it."""
+    ns = pane()
+    c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    bg = c.coords_of["namebg"]
+    text = c.coords_of["name"]
+    pad = px(pv.NAME_PAD)
+    assert bg[0] == text[0] - pad and bg[1] <= text[1]
+    assert bg[2] > text[0] and bg[3] > bg[1]          # it encloses the word
+
+
+def test_the_chip_sits_under_the_box_it_belongs_to():
+    ns = pane()
+    named = face(x=100, y=50, w=200, h=200, name="hunter", id_score=0.74,
+                 id_ran=True)
+    c = paint(ns, live(named))
+    box = c.coords_of["b0"]
+    text = c.coords_of["name"]
+    assert text[0] == box[0]                          # left-aligned to it
+    assert text[1] >= box[3]                          # …and below it
+
+
+def test_the_chip_flips_above_a_box_that_is_against_the_bottom():
+    """A caption that ran off the picture would be a readout with no ground
+    under it, which is the one thing the chip exists to prevent."""
+    box = (px(pv.PANE_W), px(pv.PANE_H))
+    picture = (10, 8, box[0], box[1])
+    rect = (20, box[1] - 4, 60, box[1] + 8)           # hard against the floor
+    x, y, anchor = pv.name_anchor(rect, picture, 3, 12)
+    assert anchor == "sw" and y <= rect[1]
+
+
+def test_a_face_that_fills_the_frame_tucks_the_chip_inside_the_bottom():
+    """At a desk the person nearest the lens IS the box that fills the
+    frame, so this is the common case rather than an edge one."""
+    picture = (0, 0, 200, 100)
+    x, y, anchor = pv.name_anchor((0, 0, 200, 100), picture, 3, 12)
+    assert anchor == "sw"
+    assert 0 <= y <= 100
+
+
+def test_the_chip_is_pulled_back_inside_the_picture():
+    """A chip anchored to a face at the right edge would otherwise run into
+    the readout column, where the pane's OTHER numbers live."""
+    ns = pane()
+    named = face(x=1200, y=50, w=80, h=80, name="hunter", id_score=0.74,
+                 id_ran=True)
+    c = paint(ns, live(named))
+    ox, _oy = ns._origin
+    right = ox + ns._fit[0] + ns._fit[2]
+    assert c.coords_of["namebg"][2] <= right
+    assert c.coords_of["name"][0] < c.coords_of["b0"][0]   # it moved left
+
+
+def test_the_same_chip_at_the_same_place_is_not_re_set_or_re_measured():
+    """Between two detections the boxes are carried forward, so the chip
+    lands at the same point picture after picture. Re-setting the text and
+    asking the canvas to measure it again was two canvas operations per
+    repaint for an answer it already had."""
+    ns = pane()
+    measured = []
+    real_bbox = ns.canvas.bbox
+    ns.canvas.bbox = lambda item: measured.append(item) or real_bbox(item)
+    shot = live(face(name="hunter", id_score=0.74, id_ran=True))
+
+    def text_sets():
+        return [kw for item, kw in ns.canvas.calls
+                if item == "name" and "text" in kw]
+
+    paint(ns, shot)
+    sets, meas = len(text_sets()), len(measured)
+    assert sets >= 1 and meas >= 1
+    first = (ns.canvas.coords_of["name"], ns.canvas.coords_of["namebg"])
+    paint(ns, shot)                              # the carried box
+    assert len(text_sets()) == sets              # nothing re-set
+    assert len(measured) == meas                 # nothing re-measured
+    assert ns.canvas.shown("name") and ns.canvas.shown("namebg")
+    assert (ns.canvas.coords_of["name"], ns.canvas.coords_of["namebg"]) \
+        == first
+    paint(ns, live(face(x=140, name="hunter", id_score=0.74, id_ran=True)))
+    assert len(measured) > meas                  # a moved face: measured
+    paint(ns, live(face(name="hunter", id_score=0.31, id_ran=True)))
+    assert len(text_sets()) > sets + 1           # a new score: re-set
+
+
+def test_a_chip_shifted_off_the_edge_is_put_back_when_the_shift_goes():
+    """A cached placement puts nothing down, so the item stays where the
+    LAST frame's edge shift moved it. The shift is tracked so the next frame
+    that needs none puts the word back under its ground."""
+    ns = pane()
+    edge = face(x=1200, y=50, w=80, h=80, name="hunter", id_score=0.74,
+                id_ran=True)
+    paint(ns, live(edge))
+    shifted = ns.canvas.coords_of["name"][0]
+    assert shifted < ns.canvas.coords_of["b0"][0]        # it moved left
+    # The same chip, same anchor point, but the picture is now wider than
+    # the box fit allowed before: no shift is needed, and the item must be
+    # placed at the unshifted x rather than left where the shift put it.
+    ns._name_last = ((ns._name_last[0][0], ns._name_last[0][1],
+                      ns._name_last[0][2]), ns._name_last[1])
+    ns._fit = (0, 0, ns._box[0] * 4, ns._box[1])
+    paint(ns, live(edge))
+    x = ns.canvas.coords_of["name"][0]
+    bg = ns.canvas.coords_of["namebg"]
+    assert bg[0] <= x <= bg[2]                           # word on its ground
+
+
+def test_no_ground_means_no_word():
+    """Before there is a window the canvas cannot measure, so there is no
+    ground to draw -- and a word without one is a word over live video."""
+    ns = pane()
+    ns.canvas.bbox = lambda _item: None
+    c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    assert not c.shown("name") and not c.shown("namebg")
+
+
+def test_a_dark_pane_takes_the_name_with_it():
+    """A name left over a picture the pane is claiming not to have would be
+    the console asserting who is in a room it says it cannot see."""
+    ns = pane()
+    paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    c = paint(ns, cp.blank(cp.REASON_SENSING, "offline mode"))
+    assert not c.shown("name") and not c.shown("namebg")
+
+
+def test_an_empty_frame_takes_the_name_with_it_too():
+    ns = pane()
+    paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    c = paint(ns, live())
+    assert not c.shown("name") and not c.shown("namebg")
+
+
+@pytest.mark.parametrize("look", theme.LOOKS)
+def test_the_name_is_legible_over_its_own_ground_in_both_looks(look):
+    """Small but READABLE, and in classic too. 4.5:1 is the WCAG AA bar for
+    normal text; the chip's ground is the darkest value in the palette
+    precisely so both inks clear it whatever is behind the picture."""
+    theme.select_look(look)
+    known = face(name="hunter", id_score=0.74, id_ran=True)
+    unknown = face(name="", id_score=0.21, id_ran=True)
+    for f in (known, unknown):
+        assert _contrast(pv.identity_ink(f), pv.chip_ink()) >= 4.5, look
+    # …and the two are told apart by brightness as well as by the word, the
+    # same three-ways rule the attention verdict follows.
+    assert _lum(pv.identity_ink(known)) > _lum(pv.identity_ink(unknown))
+
+
+def test_the_chips_colours_are_read_at_call_time_and_not_frozen():
+    theme.select_look("holo")
+    holo = pv.chip_ink()
+    theme.select_look("classic")
+    assert pv.chip_ink() != holo
+
+
+def test_the_chip_scales_with_the_ui_scale():
+    """"Small but readable" is a statement about apparent size, so the chip
+    is derived from the FONT rather than from a design constant that could
+    drift out of step with it at a scale nobody measured at."""
+    set_scale(1.0)
+    theme.apply_scale(1.0)
+    one = pv.name_line_h()
+    set_scale(2.0)
+    theme.apply_scale(2.0)
+    assert pv.name_line_h() > one
+
+
+def test_a_chip_that_would_cover_the_face_sheds_its_score_first():
+    """Measured on the real font files: "HUNTER 0.74" is 45% of the picture
+    in the console's condensed display face but 66% in the DejaVu fallback,
+    and this pane cannot guarantee which one Tk resolved. So the rule is a
+    measurement, not a font -- and the SCORE goes before the NAME does,
+    because the name is what he asked for."""
+    ns = pane()
+    ns.canvas.CHAR_W = 12                        # a wide fallback face
+    c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    assert c.state["name"]["text"] == "HUNTER"   # the score, not the name
+    assert c.shown("name") and c.shown("namebg")
+
+
+def test_the_score_survives_when_there_is_room_for_it():
+    ns = pane()
+    c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    assert c.state["name"]["text"] == "HUNTER 0.74"
+
+
+def test_a_name_too_wide_even_on_its_own_is_trimmed_not_run_off_the_edge(
+        monkeypatch):
+    """A long enrolled label at a large UI scale. Half a name he can see
+    beats a whole one he cannot."""
+    wide = 40                                    # px per character
+    monkeypatch.setattr(pv, "ellipsize",
+                        lambda t, _f, room: t[:max(0, room // wide - 1)] + "…")
+    ns = pane()
+    ns.canvas.CHAR_W = wide
+    c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+    assert c.state["name"]["text"] == "HU…"      # trimmed, not clipped
+    ox, _oy = ns._origin
+    left, right = ox + ns._fit[0], ox + ns._fit[0] + ns._fit[2]
+    assert left <= c.coords_of["namebg"][0]
+    assert c.coords_of["namebg"][2] <= right     # …and it fits the picture
+
+
+def test_the_chip_is_a_caption_not_a_banner():
+    """"Small but readable" cuts both ways. The picture is 76 design units
+    tall and 136 wide, so a chip that took a third of it would hide the face
+    it is naming -- which is why it is the pane's CONDENSED display face at
+    the one annotation size, not the wider UI face."""
+    assert pv.name_font() == pv.ui_display(theme.SIZE_CAPTION, "semibold")
+    for scale in (1.0, 2.0):
+        set_scale(scale)
+        theme.apply_scale(scale)
+        assert pv.name_line_h() <= px(pv.PANE_H) // 3, scale
+
+
+def test_the_score_he_reads_is_the_one_that_was_measured():
+    """He reads this pane to understand behaviour. 0.74 against his measured
+    p50 of 0.739 and a 0.363 bar is checkable; a bare name is not."""
+    assert pv.identity_text(face(name="hunter", id_score=0.739,
+                                 id_ran=True)) == "HUNTER 0.74"
+    assert pv.identity_text(face(id_ran=False)) == ""
+    assert pv.identity_text(None) == ""
 
 
 # ------------------------------------- letting go of the last frame
@@ -766,7 +1053,10 @@ def test_the_pane_polls_at_twice_the_configured_capture_rate():
     ns2._job = None
     ns2._tick = lambda: None
     CameraPreview.start(ns2)
-    assert ns2._interval == cp.poll_ms(6.0)
+    # …and a worker that cannot say falls back to the CONFIGURED default
+    # rather than to a literal, which is how the pane ended up polling for
+    # 6 fps under a capture that had been raised.
+    assert ns2._interval == cp.poll_ms(cp.DEFAULT_FPS)
 
 
 # --------------------------------------------------- the settings row
