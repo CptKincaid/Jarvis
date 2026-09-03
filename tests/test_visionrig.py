@@ -458,3 +458,93 @@ def test_a_recognisers_failure_is_not_reported_on_the_detector_line():
     assert checks["errors"].ok is False
     assert "alignCrop" in checks["errors"].detail
     assert report.ok is False
+
+
+# ------------------------------------------------- a fist is not a face
+def _row(box, eye_r, eye_l, nose, mouth_r, mouth_l, score):
+    """One detector row, built by hand. No image, no camera, no permission."""
+    r = [0.0] * vr.DETECT_COLS
+    r[0], r[1], r[2], r[3] = box
+    r[vr.IDX_EYE_R], r[vr.IDX_EYE_R + 1] = eye_r
+    r[vr.IDX_EYE_L], r[vr.IDX_EYE_L + 1] = eye_l
+    r[vr.IDX_NOSE], r[vr.IDX_NOSE + 1] = nose
+    r[vr.IDX_MOUTH_R], r[vr.IDX_MOUTH_R + 1] = mouth_r
+    r[vr.IDX_MOUTH_L], r[vr.IDX_MOUTH_L + 1] = mouth_l
+    r[vr.IDX_SCORE] = score
+    return r
+
+
+def _face_row(score=0.93):
+    """A 100x120 box with anatomically ordinary landmarks."""
+    return _row((0, 0, 100, 120), (31, 40), (69, 40), (50, 62),
+                (36, 88), (64, 88), score)
+
+
+def test_an_ordinary_face_row_is_plausible():
+    ratio, drop, ok = vr.landmark_plausibility(_face_row())
+    assert ok
+    assert 0.30 < ratio < 0.55, ratio          # interocular over box width
+    assert 1.0 < drop < 1.6, drop              # mouth below eyes, in eye-widths
+
+
+def test_a_mouth_above_the_eyes_is_refused_however_confident():
+    """The failure Hunter hit: a closed fist scored 0.71 -- over camera.min_conf
+    0.6 -- and was accepted as a face. Before this gate the ONLY rejection was
+    two eye landmarks at literally the same point, so any row with two distinct
+    bright spots passed and was drawn, named and counted as a face."""
+    fist = _row((0, 0, 100, 120), (46, 60), (54, 60), (50, 55),
+                (47, 30), (53, 30), 0.71)      # "mouth" 30 px ABOVE the "eyes"
+    _ratio, drop, ok = vr.landmark_plausibility(fist)
+    assert drop < 0, drop
+    assert not ok
+    # and the old check would have waved it straight through
+    assert vr.landmark_geometry(fist)[3] is True
+
+
+def test_the_plausibility_gate_is_roll_invariant():
+    """A head tilted over is a tilted head, not a rejected one. The drop is
+    projected onto the face's own down axis, so it must not move with roll."""
+    import math as _m
+    upright = vr.landmark_plausibility(_face_row())[1]
+    for roll in (-75.0, -30.0, 30.0, 75.0):
+        a = _m.radians(roll)
+        cos_a, sin_a = _m.cos(a), _m.sin(a)
+
+        def spin(pt, cx=50.0, cy=60.0):
+            dx, dy = pt[0] - cx, pt[1] - cy
+            return (cx + dx * cos_a - dy * sin_a, cy + dx * sin_a + dy * cos_a)
+
+        tilted = _row((0, 0, 100, 120), spin((31, 40)), spin((69, 40)),
+                      spin((50, 62)), spin((36, 88)), spin((64, 88)), 0.93)
+        ratio, drop, ok = vr.landmark_plausibility(tilted)
+        assert ok, roll
+        assert abs(drop - upright) < 1e-6, (roll, drop, upright)
+
+
+def test_observe_refuses_the_fist_and_reports_the_numbers():
+    """observe() requires BOTH halves: a well-defined angle on a row that is
+    not a face at all is still not a face."""
+    lens = LIFECAM_CINEMA
+    head = vr.HeadModel()
+    good = vr.observe(_face_row(), lens, 1.0, 1.0, head)
+    assert good.landmarks_ok
+    assert good.mouth_drop_u > 1.0 and good.eye_box_ratio > 0.3
+
+    fist = _row((0, 0, 100, 120), (46, 60), (54, 60), (50, 55),
+                (47, 30), (53, 30), 0.71)
+    bad = vr.observe(fist, lens, 1.0, 1.0, head)
+    assert not bad.landmarks_ok
+    assert bad.yaw_deg == 0.0          # no invented angle off a non-face
+    assert bad.mouth_drop_u < 0
+
+
+def test_a_row_with_no_mouth_landmarks_abstains_rather_than_refusing():
+    """Absent evidence is not evidence of a fist. A row whose mouth corners are
+    both at the origin reported no mouth at all; refusing it would be the same
+    error as reading an unreachable sensor as 'nobody there'."""
+    r = _face_row()
+    r[vr.IDX_MOUTH_R] = r[vr.IDX_MOUTH_R + 1] = 0.0
+    r[vr.IDX_MOUTH_L] = r[vr.IDX_MOUTH_L + 1] = 0.0
+    ratio, drop, ok = vr.landmark_plausibility(r)
+    assert ok and drop == 0.0
+    assert ratio > 0.3, "the interocular ratio is still measured and reported"

@@ -62,6 +62,28 @@ log = get_logger("visionrig")
 DETECT_COLS = 15
 IDX_SCORE = 14
 IDX_EYE_R, IDX_EYE_L, IDX_NOSE = 4, 6, 8
+IDX_MOUTH_R, IDX_MOUTH_L = 10, 12
+
+# THE MOUTH IS BELOW THE EYES. Anatomy, not a tuning parameter, and the one
+# thing a hallucinated row cannot honour by construction. Measured in units of
+# the interocular distance along the FACE's own down axis (so a rolled head is
+# not a rejected head); a real face lands around 1.1-1.6. This floor sits far
+# below any face and catches only the impossible.
+#
+# WHY IT EXISTS: landmark_geometry called a row good whenever the two eye
+# landmarks were not literally identical (eye_px < 1e-6). Nothing else was
+# checked, so a detector firing on a closed FIST above camera.min_conf 0.6 was
+# accepted as a face, drawn as one and counted as one -- it only lost its yaw
+# opinion. Hunter hit exactly that in the preview on 2026-09-03.
+MOUTH_DROP_MIN_U = 0.15
+
+# The interocular distance over the detector's own box width. A frontal face is
+# around 0.38 and yaw shrinks it by cos(yaw). It is a strong signal against a
+# hallucinated row, but NOTHING IS BOUNDED ON IT HERE: the distribution has not
+# been measured on his cameras, and a floor guessed from the literature would
+# start rejecting real profile views with no way to see that it had. It is
+# reported on every observation so it can be calibrated from his own numbers.
+EYE_BOX_RATIO_UNMEASURED = None
 
 # YuNet's documented working range starts around 10 px across. At detect
 # width 320 the LifeCam puts a 16 cm face at 95 cm at 42 px and the 90 deg
@@ -137,6 +159,10 @@ def landmark_geometry(row: Sequence[float]) -> tuple:
 
     ``ok`` is False when the two eye landmarks coincide -- a degenerate row
     from a bad detection, where every downstream angle would be invented.
+
+    This is the ANGLE half only: an angle can be perfectly well defined on a
+    row that is not a face at all. Whether it is face-SHAPED is
+    ``landmark_plausibility``, and ``observe`` requires both.
     """
     ex = float(row[IDX_EYE_L]) - float(row[IDX_EYE_R])
     ey = float(row[IDX_EYE_L + 1]) - float(row[IDX_EYE_R + 1])
@@ -196,6 +222,51 @@ class FaceObservation:
     roll_deg: float
     eye_px: float
     landmarks_ok: bool
+    # Reported for calibration, bounding nothing. Defaulted so any older
+    # construction of this object keeps working.
+    eye_box_ratio: float = 0.0
+    mouth_drop_u: float = 0.0
+
+
+def landmark_plausibility(row: Sequence[float]) -> tuple:
+    """``(eye_box_ratio, mouth_drop_u, ok)`` -- is this row shaped like a face?
+
+    Pure geometry over the five landmarks. No image is read, so it is testable
+    on synthetic rows and needs no camera and no permission.
+
+    ``mouth_drop_u`` is the mouth midpoint's displacement from the eye
+    midpoint, projected onto the face's OWN down axis and divided by the
+    interocular distance. The down axis is the interocular direction turned a
+    quarter turn, which is what makes the number roll-invariant: a head tilted
+    40 degrees has the same mouth drop as an upright one, where a naive
+    image-y comparison would not.
+    """
+    ex = float(row[IDX_EYE_L]) - float(row[IDX_EYE_R])
+    ey = float(row[IDX_EYE_L + 1]) - float(row[IDX_EYE_R + 1])
+    eye_px = math.hypot(ex, ey)
+    box_w = float(row[2])
+    ratio = (eye_px / box_w) if box_w > 1e-6 else 0.0
+    if eye_px < 1e-6:
+        return ratio, 0.0, False
+    ux, uy = ex / eye_px, ey / eye_px
+    # Image coordinates grow downward, so (ux, uy) -> (-uy, ux) points from the
+    # eye line toward the chin at any roll.
+    dnx, dny = -uy, ux
+    eye_mx = (float(row[IDX_EYE_L]) + float(row[IDX_EYE_R])) / 2.0
+    eye_my = (float(row[IDX_EYE_L + 1]) + float(row[IDX_EYE_R + 1])) / 2.0
+    mr = (float(row[IDX_MOUTH_R]), float(row[IDX_MOUTH_R + 1]))
+    ml = (float(row[IDX_MOUTH_L]), float(row[IDX_MOUTH_L + 1]))
+    if mr == (0.0, 0.0) or ml == (0.0, 0.0):
+        # NO MOUTH WAS REPORTED, so there is nothing to disbelieve. Absent
+        # evidence is not evidence of a fist: refusing here would be the same
+        # error as reading an unreachable sensor as "nobody there". A real
+        # five-point row always fills these; a row that does not is a partial
+        # detector or a hand-built fixture, and both get the benefit of the
+        # doubt with a drop of 0.0 recorded so the abstention is visible.
+        return ratio, 0.0, True
+    mouth_mx, mouth_my = (ml[0] + mr[0]) / 2.0, (ml[1] + mr[1]) / 2.0
+    drop = ((mouth_mx - eye_mx) * dnx + (mouth_my - eye_my) * dny) / eye_px
+    return ratio, drop, bool(drop >= MOUTH_DROP_MIN_U)
 
 
 def observe(row: Sequence[float], lens, scale_x: float, scale_y: float,
@@ -212,6 +283,9 @@ def observe(row: Sequence[float], lens, scale_x: float, scale_y: float,
     w, h = float(row[2]) * scale_x, float(row[3]) * scale_y
     cx, cy = x + w / 2.0, y + h / 2.0
     t, roll, eye_px, ok = landmark_geometry(row)
+    # BOTH halves: two knuckle shadows make a perfectly good "interocular axis".
+    eye_box_ratio, mouth_drop_u, shaped = landmark_plausibility(row)
+    ok = bool(ok and shaped)
     return FaceObservation(
         conf=conf, x=x, y=y, w=w, h=h, cx=cx, cy=cy,
         detect_px=float(row[2]), face_px=w,
@@ -221,7 +295,8 @@ def observe(row: Sequence[float], lens, scale_x: float, scale_y: float,
         # wrong for no gain.
         elevation_deg=lens.offset_deg(cy - lens.height_px / 2.0),
         yaw_t=t, yaw_deg=head.yaw_deg(t) if ok else 0.0,
-        roll_deg=roll, eye_px=eye_px * scale_x, landmarks_ok=ok)
+        roll_deg=roll, eye_px=eye_px * scale_x, landmarks_ok=ok,
+        eye_box_ratio=eye_box_ratio, mouth_drop_u=mouth_drop_u)
 
 
 # --------------------------------------------------------- the attention cone
