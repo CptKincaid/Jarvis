@@ -462,6 +462,61 @@ DEFAULTS: dict = {
     # switching it off at night would cost presence for no privacy.
     # start/end are "HH:MM" 24 h and wrap midnight, like quiet.hours.
     "sensing": {"curfew": {"enabled": True, "start": "21:00", "end": "07:00"}},
+    # ZONES (jarvis/zones.py): WHERE in a room, and a written record of it
+    # before anything is allowed to act on it -- his words, "just log it
+    # first". Nothing reads this to decide what Jarvis says; the only
+    # effect of turning it on is a JSONL file.
+    #
+    # A zone is a named DISTANCE BAND on one radar, because an LD2410C
+    # reports range and no angle. The camera OVERRULES it: if the eye
+    # recognises him in its cone he is at the desk whatever the range says.
+    # camera_zone is what that verdict is called, and it defaults to "at
+    # the desk" because the office is the only room with a lens -- a room
+    # whose camera watches something else must set its own.
+    #
+    # The office ladder is the real geometry and is NOT a naive
+    # "desk = nearest band". The profile in ~/.config/jarvis/room-sensors/
+    # office.json records the module as sitting on the desk at the BACK
+    # edge aimed OUT across the room at the door, so sitting in the chair
+    # he is behind it and inside its 0.75 m blind zone, and the first 1.5 m
+    # in front of it has no still-target sensitivity at all. The nearest
+    # band is therefore the floor IN FRONT of the desk; the chair belongs
+    # to the camera. Edges are multiples of one 0.75 m distance gate --
+    # anything finer is a fiction the sensor cannot support -- and the
+    # ladder stops at 4.5 m, the device's tuned far gate.
+    #
+    # dwell_s is the anti-chatter hold: a zone change commits only after it
+    # has held this long. 3.0 s is three consecutive reads at the 2.0 s
+    # poll cadence, longer than the ~0.6 s a walker spends inside the
+    # narrowest band, and well inside the radar's own 10 s absence delay.
+    # log_path "" means ~/.local/state/jarvis/zones.jsonl (0600 in a 0700
+    # directory). The file rotates at log_max_bytes keeping one generation,
+    # so 2 MB is the ceiling. No line may exceed jarvis/zones.py's
+    # MAX_LINE_BYTES (640) -- append refuses one that would -- so 1 MB is
+    # at least 1,562 transitions of any shape. What a real day writes is
+    # not measured; earlier comments here quoted a per-record average that
+    # would not reproduce, so it has been removed rather than restated.
+    #
+    # EDIT THIS SECTION AND MIND THE TYPO. Anything here of the wrong SHAPE
+    # -- a rooms that is not a list, an entry that is not an object, a
+    # near_m that is text, an enabled that is the STRING "false" -- is
+    # REFUSED BY NAME and records nothing. It does NOT fall back to the
+    # ladder built into jarvis/zones.py, and only a key that is absent
+    # altogether falls back to anything. That is deliberate: a log written
+    # against the bands you thought you had replaced looks exactly like a
+    # log that worked.
+    "zones": {"enabled": True, "dwell_s": 3.0, "log_path": "",
+              "log_max_bytes": 1000000, "log_keep": 1,
+              "rooms": [
+                  {"name": "office", "enabled": True,
+                   "camera_zone": "at the desk",
+                   "bands": [
+                       {"name": "just off the desk",
+                        "near_m": 0.75, "far_m": 1.5},
+                       {"name": "the middle of the room",
+                        "near_m": 1.5, "far_m": 3.0},
+                       {"name": "by the door",
+                        "near_m": 3.0, "far_m": 4.5}]}]},
     # The camera (jarvis/eye.py, scratchpad/ideas/vision.md). OFF until he
     # turns it on, and there is deliberately NO SCHEDULE HERE: offline mode
     # and the 21:00-07:00 curfew belong to the single sensing-state owner,
