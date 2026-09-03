@@ -82,6 +82,7 @@ from jarvis import address
 from jarvis import arc as arc_mod
 from jarvis import aside as aside_mod
 from jarvis import board as board_mod
+from jarvis import cast as cast_mod
 from jarvis import dialogue as dialogue_mod
 from jarvis import faults as faults_mod
 from jarvis import lecture as lecture_mod
@@ -6545,6 +6546,111 @@ def _board_svc(c):
     return c._svc("board")
 
 
+# ---- the cast: grab-and-throw by voice (jarvis/gesturecast.py) ---------
+# Hunter, 2026-09-03: "reach out and grab at the screen ... throwing the
+# cast onto the HPCOMPUTER". The gesture itself is the camera's; these are
+# the same verbs by voice, with the camera off, and the cancel for a live
+# carry. EVERY pattern is whole-utterance and ends in a KNOWN target (the
+# alias table lives in jarvis/cast.py beside the sinks), because the words
+# collide with half the registry otherwise: "put milk on the shopping list"
+# (list add), "throw" in the list-add opener, "drop the board" (board hide),
+# "drop" in the cancel-schedule family, "let go" in ordinary speech. An
+# unanchored "put it on" was exactly the class of Tier-1 hijack that ate
+# longer utterances before, so the object is pinned to this/it/that and the
+# target to the table.
+_CAST_SINK = (
+    r"(?P<sink>hp\s*computer|the\s+hp|the\s+pc|my\s+pc|the\s+desktop|"
+    r"my\s+desktop|the\s+windows\s+(?:machine|box)|"
+    r"the\s+other\s+(?:computer|machine)|(?:the\s+)?board|(?:the\s+)?spark|"
+    r"(?:my|this)\s+screen|the\s+console|(?:the\s+)?handoff(?:\s+page)?|"
+    r"the\s+page)")
+_CAST_THROW_RX = re.compile(
+    r"^(?:throw|cast|fling|toss|chuck|send)\s+(?:this|it|that)(?:\s+one)?\s+"
+    r"(?:on|onto|at|to|over\s+to|up\s+on|across\s+to)\s+" + _CAST_SINK
+    + r"[.!]*$", re.I)
+_CAST_PUT_RX = re.compile(
+    r"^put\s+(?:this|it|that)(?:\s+one)?\s+(?:on|onto|up\s+on)\s+"
+    + _CAST_SINK + r"[.!]*$", re.I)
+_CAST_DROP_RX = re.compile(
+    r"^(?:drop\s+(?:it|that|this)|put\s+(?:it|that|this)\s+(?:down|back)|"
+    r"let\s+(?:it|that)\s+go|let\s+go(?:\s+of\s+(?:it|that))?)[.!]*$", re.I)
+_CAST_HOLDING_RX = re.compile(
+    r"^(?:what\s+(?:am\s+i|are\s+you)\s+holding|"
+    r"what(?:'s|\s+is)\s+in\s+(?:your|my)\s+hand)[?.!]*$", re.I)
+_CAST_SIDE_RX = re.compile(
+    r"^(?:which|what)\s+side\s+(?:is\s+)?" + _CAST_SINK
+    + r"(?:\s+on)?[?.!]*$", re.I)
+# The whole family, for the one rule that a sentence outranks a gesture:
+# any OTHER utterance puts a live carry down (Commander._cast_spoken_over).
+_CAST_FAMILY_RX = re.compile("|".join(
+    "(?:%s)" % rx.pattern.replace("(?P<sink>", "(?:")
+    for rx in (_CAST_THROW_RX, _CAST_PUT_RX, _CAST_DROP_RX,
+               _CAST_HOLDING_RX, _CAST_SIDE_RX)), re.I)
+
+
+def _cast_svc(c):
+    return c._svc("gesture")
+
+
+def _h_cast_throw(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    try:
+        line, status = courier.throw_by_voice(m.group("sink"))
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("cast by voice failed")
+        return CommandResult(handled=True, status="Cast",
+                             reply="I couldn't manage that throw, sir.",
+                             speak=True)
+    return CommandResult(handled=True, reply=line or None, speak=bool(line),
+                         status="Cast: %s" % status)
+
+
+def _h_cast_drop(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    try:
+        line = courier.drop_by_voice()
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("cast drop failed")
+        return None
+    return CommandResult(handled=True, reply=line, speak=True, status="Cast")
+
+
+def _h_cast_holding(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    return CommandResult(handled=True, reply=courier.holding_line(),
+                         speak=True, status="Cast")
+
+
+def _h_cast_teach(c, t, m):
+    """"HPCOMPUTER is on my right": m is (side, sink) from
+    cast.parse_side_teaching, which only parses a KNOWN target."""
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    side, sink = m
+    try:
+        line = courier.teach(side, sink)
+    except Exception:                            # noqa: BLE001 - config boundary
+        log.exception("cast teach failed")
+        line = cast_mod.TAUGHT_FAILED_LINE
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Cast: %s is %s" % (side, sink))
+
+
+def _h_cast_side(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    return CommandResult(handled=True, reply=courier.side_line(m.group("sink")),
+                         speak=True, status="Cast")
+
+
 def _h_board_show(c, t, m):
     board = _board_svc(c)
     if board is None:
@@ -6824,6 +6930,23 @@ REGISTRY: list[Command] = [
             needs=("board",)),
     Command("board focus", _BOARD_FOCUS_RX.match, _h_board_focus,
             needs=("board",)),
+    # Grab and throw by voice (jarvis/gesturecast.py). BEFORE the list
+    # family: "put it on the board" and "add milk to the shopping list"
+    # share an opener, and each pattern here ends in a known target so the
+    # list's "<name> list" tail can never match it -- the collision tests
+    # in tests/test_commander.py pin both directions.
+    Command("cast throw", _CAST_THROW_RX.match, _h_cast_throw,
+            needs=("gesture",)),
+    Command("cast put", _CAST_PUT_RX.match, _h_cast_throw,
+            needs=("gesture",)),
+    Command("cast drop", _CAST_DROP_RX.match, _h_cast_drop,
+            needs=("gesture",)),
+    Command("cast holding", _CAST_HOLDING_RX.match, _h_cast_holding,
+            needs=("gesture",)),
+    Command("cast side", _CAST_SIDE_RX.match, _h_cast_side,
+            needs=("gesture",)),
+    Command("cast teach", cast_mod.parse_side_teaching, _h_cast_teach,
+            needs=("gesture",)),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
     Command("no asides", _m_no_asides, _h_no_asides),
@@ -7017,6 +7140,11 @@ ASSISTANT_TIER1: list[Command] = [
                     # the Board: "bring up the board" is said at the desk
                     # without a wake-word prefix, like every other surface verb
                     "board show", "board hide", "board focus",
+                    # the cast: "throw this on HPCOMPUTER" / "drop it" /
+                    # "HPCOMPUTER is on my right" are said at the desk,
+                    # mid-gesture, with no wake word left to strip
+                    "cast throw", "cast put", "cast drop", "cast holding",
+                    "cast side", "cast teach",
                     "timer", "alarm", "no asides",
                     "list schedule", "cancel schedule", "adjust schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
@@ -7768,6 +7896,7 @@ class Commander:
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
+        self._cast_spoken_over(text)
         with self._turn_lock:
             self._confidence = confidence
             result = self._handle_inner(text, source)
@@ -7781,6 +7910,24 @@ class Commander:
             if undo is not None:
                 self._last_undo = (undo, time.monotonic())
         return result
+
+    def _cast_spoken_over(self, text: str) -> None:
+        """A sentence outranks a gesture: any utterance that is not itself
+        one of the cast verbs puts a LIVE carry down, quietly
+        (jarvis/gesturecast.GestureCast.spoken_over). The cast verbs are
+        exempt because "throw this on the board" while carrying IS the
+        throw. getattr chains, not _svc: a slim test commander made with
+        __new__ has no services at all."""
+        courier = getattr(getattr(self, "services", None), "gesture", None)
+        if courier is None:
+            return
+        t = text.strip().lower().rstrip(".!?")
+        if _CAST_FAMILY_RX.match(t) or cast_mod.parse_side_teaching(t):
+            return
+        try:
+            courier.spoken_over()
+        except Exception:                        # noqa: BLE001 - service boundary
+            log.debug("cast spoken_over failed", exc_info=True)
 
     def shaky_transcript(self) -> bool:
         """The utterance being handled scraped in under confirm.shaky_logprob."""

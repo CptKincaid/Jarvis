@@ -111,28 +111,14 @@ class ConfigOverlay:
 
 # ----------------------------------------------------------- thresholds
 def thresholds_from_config(cfg) -> g.CastThresholds:
-    """``camera.gesture.<field>`` overrides on top of the design defaults.
+    """``gesture.<field>`` overrides on top of the design defaults.
 
-    The wiring branch owns the config block; this reads whatever of it
-    exists so the self-check measures the same machine Jarvis would run,
-    and falls back to the design numbers key by key when it does not.
+    The same reader Jarvis runs (jarvis/handstage.thresholds_from_options),
+    so the self-check measures the machine he would actually be driving and
+    falls back to the design numbers key by key when the block is absent.
     """
-    base = g.CastThresholds()
-    over = {}
-    for field in dataclasses.fields(base):
-        raw = cfg.get("camera.gesture." + field.name, None)
-        if raw is None:
-            continue
-        default = getattr(base, field.name)
-        if isinstance(default, tuple):
-            over[field.name] = tuple(str(s) for s in raw)
-        elif isinstance(default, bool):
-            over[field.name] = bool(raw)
-        elif isinstance(default, int):
-            over[field.name] = int(raw)
-        else:
-            over[field.name] = float(raw)
-    return dataclasses.replace(base, **over) if over else base
+    from jarvis.handstage import thresholds_from_options
+    return thresholds_from_options(cfg.get)
 
 
 def threshold_lines(t: g.CastThresholds, fps: float) -> list:
@@ -435,7 +421,7 @@ def main(argv=None) -> int:
            status.get("curfew", "") or "-"))
 
     # ------------------------------------------------------- 2. hand models
-    model_dir = str(cfg.get("camera.gesture.model_dir", "") or "") or None
+    model_dir = str(cfg.get("gesture.model_dir", "") or "") or None
     probe = hp.probe(model_dir=model_dir, deep=args.deep)
     report["hand_models"] = probe
     say("")
@@ -501,7 +487,7 @@ def main(argv=None) -> int:
     try:
         tracker = hp.HandTracker(
             model_dir=model_dir,
-            threads=int(cfg.get("camera.gesture.threads",
+            threads=int(cfg.get("gesture.hand_threads",
                                 cfg.get("camera.threads", 2))),
             deep=args.deep)
     except hp.HandModelUnavailable as exc:

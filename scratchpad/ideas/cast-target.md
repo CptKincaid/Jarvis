@@ -197,3 +197,37 @@ connection from the Spark must go through the SOCKS5 proxy on
 - `REFUSAL_REPEAT_S = 60` — when the refusal shortens.
 - `HELD_TTL_S = 1800`, `HELD_CAPACITY = 3` — how long/many held casts are kept.
 - `HANDOFF_TTL_S = 900` — how long a served URL stays live.
+
+---
+
+## Wired 2026-09-03 (branch gesture-cast)
+
+The gesture, the sinks and the console are joined: `jarvis/handstage.py`
+runs the hand tracker inside `PreviewPipeline.grab()` (one lens, one
+consumer), `jarvis/gesturecast.py` is the courier (tones, chip, spoken
+lines, the read-back through `commander.stash_destructive`, the voice API),
+`jarvis/ui/carry_chip.py` is the header chip, `jarvis/board.py` grew a CAST
+slab, and `jarvis/commander.py` has the voice verbs. Config: the `gesture`
+block in `jarvis/assistant_config.py`, OFF by default, `sinks` EMPTY.
+
+**HPCOMPUTER facts, corrected and as wired.** The 13-port list an earlier
+note claimed was never probed. What WAS probed: 22/445/3389/5900/8008/2343
+at 00:45 (no answer), 22/445/3389 at 02:40 and 07:21 (no answer). ARP
+REACHABLE throughout; ping 100% loss; not on the tailnet. `HpcomputerSink`
+probes 22/445/3389 live (0.35 s, cached 15 s) at throw time, never at
+construction; a non-track throw is HELD and said, the payload falls back to
+the board; a Spotify track lands by `control("transfer")`. The SSH transport
+is `HpcomputerSink(transport=...)` with NOTHING behind it: `_make_gesture`
+in jarvis/app.py passes `transfer=` only. When `ssh hpcomputer whoami`
+answers, the transport is the next change, and its first live run is
+Hunter's.
+
+**Which side.** Unknown, and the default is the safe one: `gesture.sinks`
+ships `{}`, every throw lands on the board, and `UNTAUGHT_LINE` is said
+once per session. "HPCOMPUTER is on my right" writes `{"right":
+"hpcomputer"}`.
+
+**Identity.** `app._eye_identity` reads `services.camera_feed.eye.state`
+when a feed is attached; nothing attaches one on this tree, so it answers
+"" (no opinion) today. `HpcomputerSink` keeps `needs_identity=True`, the
+handoff `False` -- both his to overrule (decision 4 above).

@@ -673,9 +673,9 @@ class TestSelfCheck:
         sc = _load_selfcheck()
         assert sc.thresholds_from_config(FakeCfg({})) == g.CastThresholds()
         t = sc.thresholds_from_config(FakeCfg({
-            "camera.gesture.reach_min": 2.5, "camera.gesture.dwell_frames": 4,
-            "camera.gesture.target_sectors": ["left"],
-            "camera.gesture.carry_max_s": 6}))
+            "gesture.reach_min": 2.5, "gesture.dwell_frames": 4,
+            "gesture.target_sectors": ["left"],
+            "gesture.carry_max_s": 6}))
         assert t.reach_min == 2.5 and t.dwell_frames == 4
         assert t.target_sectors == ("left",) and t.carry_max_s == 6.0
         assert isinstance(t.dwell_frames, int)

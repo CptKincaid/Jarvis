@@ -172,12 +172,17 @@ class PreviewFace:
     yaw_deg: float = 0.0
     attending: bool = False
     landmarks_ok: bool = True
+    # Interocular distance in CAPTURE px -- the one face scalar the hand
+    # stage needs (gesture.observe_hand's reach ratio is palm_diag / this),
+    # carried here so the stage reads it off the SAME frame's face rather
+    # than re-deriving it from a box width. 0.0 when the landmarks failed.
+    eye_px: float = 0.0
 
     def as_dict(self) -> dict:
         return {"conf": self.conf, "x": self.x, "y": self.y, "w": self.w,
                 "h": self.h, "yaw_deg": self.yaw_deg,
                 "attending": self.attending,
-                "landmarks_ok": self.landmarks_ok}
+                "landmarks_ok": self.landmarks_ok, "eye_px": self.eye_px}
 
 
 @dataclass(frozen=True)
@@ -200,6 +205,10 @@ class PreviewShot:
     at: float = 0.0
     fps: float = 0.0                 # measured delivery rate, not the target
     grab_ms: float = 0.0             # p50-ish cost of the last cycle
+    # The hand stage's verdict for this frame (jarvis/handstage.HandShot),
+    # SCALARS ONLY, or None for no opinion -- the stage is off, has no
+    # models, or raised. Never a landmark array, never a crop.
+    hand: Any = None
 
     @property
     def live(self) -> bool:
@@ -231,7 +240,8 @@ class PreviewShot:
                 "cap_h": self.cap_h, "reason": self.reason,
                 "detail": self.detail, "seq": self.seq, "fps": self.fps,
                 "grab_ms": self.grab_ms, "live": self.live,
-                "face": self.primary.as_dict() if self.primary else {}}
+                "face": self.primary.as_dict() if self.primary else {},
+                "hand": self.hand.as_dict() if self.hand is not None else {}}
 
 
 def blank(reason: str, detail: str = "", seq: int = 0,
@@ -365,7 +375,7 @@ class PreviewPipeline:
     def __init__(self, feed, detector=None, lens=None, head=None,
                  tracker=None, reason: str = "", observe=None,
                  now: Callable[[], float] = time.monotonic,
-                 owned: bool = True):
+                 owned: bool = True, hands=None):
         self.feed = feed
         self.owned = bool(owned)
         self.detector = detector
@@ -373,6 +383,10 @@ class PreviewPipeline:
         self.head = head
         self.tracker = tracker
         self.reason = reason
+        # The hand stage (jarvis/handstage.HandStage), or None. It runs on
+        # THIS frame on THIS thread inside grab() -- the one place a frame
+        # exists -- and answers scalars. Not a second consumer of the lens.
+        self.hands = hands
         # ``visionrig.observe`` by default, resolved lazily so this module
         # loads on a tree where that lane has not landed. A seam rather than
         # an import because it lets the suite exercise THIS class's own
@@ -443,7 +457,9 @@ class PreviewPipeline:
                                    y=float(obs.y), w=float(obs.w),
                                    h=float(obs.h),
                                    yaw_deg=float(obs.yaw_deg),
-                                   landmarks_ok=bool(obs.landmarks_ok)))
+                                   landmarks_ok=bool(obs.landmarks_ok),
+                                   eye_px=float(getattr(obs, "eye_px", 0.0)
+                                                or 0.0)))
         out.sort(key=lambda f: f.w * f.h, reverse=True)
         return tuple(self._attend(out[:MAX_FACES]))
 
@@ -474,8 +490,27 @@ class PreviewPipeline:
         faces[0] = PreviewFace(conf=head.conf, x=head.x, y=head.y, w=head.w,
                                h=head.h, yaw_deg=head.yaw_deg,
                                attending=inside,
-                               landmarks_ok=head.landmarks_ok)
+                               landmarks_ok=head.landmarks_ok,
+                               eye_px=head.eye_px)
         return faces
+
+    def _hand(self, frame, faces, frame_w: int, frame_h: int, seq: int):
+        """The gesture stage, on this frame, on this thread. Scalars out.
+
+        None is NO OPINION -- no stage, or the stage raised -- and is
+        deliberately not ``HandShot(present=False)``, which would assert
+        there is no hand in the room. Its own try/except, separate from the
+        detector's: a tracker that raises must leave the face path and the
+        picture untouched.
+        """
+        stage = self.hands
+        if stage is None:
+            return None
+        try:
+            return stage.observe(frame, faces, frame_w, frame_h, seq)
+        except Exception:                          # noqa: BLE001 - the stage
+            log.debug("campreview: the hand stage raised", exc_info=True)
+            return None
 
     # ----------------------------------------------------------- capture
     def grab(self, box: tuple, seq: int = 0) -> PreviewShot:
@@ -511,6 +546,9 @@ class PreviewPipeline:
                 log.debug("campreview: the detector raised", exc_info=True)
                 rows = None
         faces = self._faces(frame, rows, frame_w, frame_h)
+        # After the faces (attention gates the hand stage), before shrink
+        # (the last use of the full frame). One capture, one consumer.
+        hand = self._hand(frame, faces, frame_w, frame_h, seq)
 
         # LETTERBOXED HERE, on this thread, so what crosses over is the
         # picture at exactly the size it will be drawn. Stretching a 4:3
@@ -524,7 +562,7 @@ class PreviewPipeline:
         return PreviewShot(image=image, faces=faces, cap_w=frame_w,
                            cap_h=frame_h, reason=REASON_LIVE, detail=detail,
                            seq=seq, at=time.time(),
-                           grab_ms=(self._now() - t0) * 1000.0)
+                           grab_ms=(self._now() - t0) * 1000.0, hand=hand)
 
     def close(self) -> None:
         """Stop reading the device -- and shut it only if it is OURS.
@@ -667,7 +705,7 @@ class _CfgView:
 
 def build_pipeline(services=None, get_option: Optional[Callable] = None,
                    policy=None, feed=None, build=None,
-                   owned: bool = True) -> PreviewPipeline:
+                   owned: bool = True, hands=None) -> PreviewPipeline:
     """The pipeline, or one whose ``feed`` is None and whose ``reason`` says
     why. Never raises: a camera must not be able to take the console down,
     and a console that failed to build because a webcam was unplugged would
@@ -682,7 +720,8 @@ def build_pipeline(services=None, get_option: Optional[Callable] = None,
         feed, reason, owned = resolve_feed(services, get_option, policy,
                                            build)
     if feed is None:
-        return PreviewPipeline(None, reason=reason or "no camera feed")
+        return PreviewPipeline(None, reason=reason or "no camera feed",
+                               hands=hands)
 
     detector = lens = head = tracker = None
     try:
@@ -700,7 +739,8 @@ def build_pipeline(services=None, get_option: Optional[Callable] = None,
                  type(exc).__name__, exc)
         reason = reason or "%s: %s" % (type(exc).__name__, exc)
     return PreviewPipeline(feed, detector=detector, lens=lens, head=head,
-                           tracker=tracker, reason=reason, owned=owned)
+                           tracker=tracker, reason=reason, owned=owned,
+                           hands=hands)
 
 
 # --------------------------------------------------------------- the loop
@@ -732,14 +772,19 @@ class PreviewWorker:
                  sensing=None, services=None, box=(160, 90),
                  pipeline=None, make_pipeline=None,
                  now: Callable[[], float] = time.monotonic,
-                 sleep: Optional[Callable[[float], None]] = None):
+                 sleep: Optional[Callable[[float], None]] = None,
+                 hands=None):
         self.get_option = get_option
         self.sensing = sensing
         self.services = services
         self.box = (int(box[0]), int(box[1]))
         self._pipeline = pipeline
+        # The hand stage outlives any one pipeline (a pipeline is rebuilt
+        # on every start); its state machine resets itself on a stall.
+        self.hands = hands
         self._make = make_pipeline or (
-            lambda: build_pipeline(services, get_option, sensing))
+            lambda: build_pipeline(services, get_option, sensing,
+                                   hands=hands))
         self._now = now
         self._sleep = sleep
         self._lock = threading.Lock()            # guards self._shot
@@ -890,6 +935,12 @@ class PreviewWorker:
         out = shot.numbers_only()
         out.update({"running": self.running, "cycles": self.cycles,
                     "box_w": self.box[0], "box_h": self.box[1]})
+        stage = self.hands
+        if stage is not None and hasattr(stage, "status"):
+            try:
+                out["gesture"] = stage.status()
+            except Exception:                 # noqa: BLE001 - a diagnostic
+                out["gesture"] = {}
         return out
 
     # ------------------------------------------------------------- guts
@@ -1020,7 +1071,7 @@ class PreviewWorker:
                                reason=shot.reason, detail=shot.detail,
                                seq=shot.seq, at=shot.at,
                                fps=self._measure_fps(self._now()),
-                               grab_ms=shot.grab_ms)
+                               grab_ms=shot.grab_ms, hand=shot.hand)
         self._publish(shot, stop)
         return shot
 

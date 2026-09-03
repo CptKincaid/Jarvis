@@ -594,6 +594,98 @@ DEFAULTS: dict = {
                # that is always inside a 130 ms blocking read and a curfew
                # edge that has to wait it out.
                "preview": False, "preview_fps": 6.0},
+    # Grab and throw (jarvis/gesture.py, jarvis/handstage.py,
+    # jarvis/cast.py, jarvis/gesturecast.py). His words, 2026-09-03: "reach
+    # out and grab at the screen (in the air) where the camera is and then
+    # gesture towards almost throwing the cast onto the HPCOMPUTER".
+    #
+    # OFF by default, like every other lens key. It RIDES THE CAMERA
+    # PREVIEW: the hand stage runs inside the preview's own capture, on the
+    # frame it already pulled, so camera.preview must be on and the console
+    # active for a gesture to be seen at all -- there is no second device,
+    # no second thread, and every way the preview shuts (curfew, offline,
+    # standby, the toggle, quit) shuts this too. The models are the two
+    # opencv_zoo MediaPipe hand graphs under ~/.aiws_trainer/models/hand
+    # (Apache-2.0, sha-verified by jarvis/handpose.py); never in the repo.
+    #
+    # sinks: which side is which machine, taught by voice ("HPCOMPUTER is
+    # on my right") and SHIPPED EMPTY -- nobody but Hunter can see the
+    # room, so until he says, every throw lands on the board and Jarvis
+    # tells him once how to teach a side. Keys are "left" / "right";
+    # values are "board", "hpcomputer" or "handoff".
+    #
+    # EVERY NUMBER BELOW IS A CALIBRATED STARTING POINT, measured on a
+    # synthetic hand with his own lens constants and never on his hand
+    # (jarvis/gesture.py CastThresholds carries the measurements). The
+    # self-check prints what his hand actually measures:
+    #   ~/vss_env/bin/python scripts/gesture_selfcheck.py --seconds 30
+    "gesture": {"enabled": False, "sinks": {},
+                # ORT intra-op threads for the two hand graphs, SEPARATE
+                # from camera.threads (cv2's global). 2 matches it: the
+                # latency win of 4 costs total CPU on a box that has had
+                # one unified-memory power-off already. model_dir empty
+                # means ~/.aiws_trainer/models/hand. mirrored: the LifeCam
+                # feed is NOT mirrored (cv2.flip appears nowhere), so image
+                # +x is his LEFT; set true only if the feed is ever flipped.
+                "hand_threads": 2, "model_dir": "", "mirrored": False,
+                # Say "Holding <thing>, sir." on the grab (the tone plays
+                # either way, and the chip names it either way).
+                "speak_grab": True,
+                # Attention is LATCHED, not sampled: one face attending
+                # within attend_latch_s arms the hand stage, then a reach or
+                # a carry keeps it armed -- the reaching arm crosses the face
+                # at exactly the moment it matters. GUESSED (the design pass
+                # offered 1.0 and 3.0). The reach ratio's scale is a rolling
+                # MEDIAN of the interocular distance over face_window_s
+                # with at least face_min_samples faces seen; no baseline
+                # means no grab, stated as a refusal, never a default.
+                "attend_latch_s": 3.0, "face_window_s": 5.0,
+                "face_min_samples": 3,
+                # The hand: C = mean fingertip-to-wrist / palm_diag. A fist
+                # reads <= 0.680 and an open hand >= 0.919 over the pose
+                # envelope; the two bars sit inside that gap with a dead
+                # band between so a hand at the boundary cannot chatter.
+                "closed_max": 0.70, "open_min": 0.85,
+                # The reach: R = palm_diag / interocular. A hand at the FACE
+                # PLANE never exceeded 2.03; 2.35 was the first bar with zero
+                # false grabs in 288 everyday motions and full lateral
+                # recall. reach_arm is where the stage starts preparing the
+                # subject so the grab feels instant.
+                "reach_min": 2.35, "reach_arm": 1.60,
+                # FRAMES, not seconds, deliberately: at 7.5 fps a "300 ms
+                # dwell" is 2.25 frames and the rounding decides whether it
+                # works. dwell 3 = 400 ms of a still fist at reach; the hand
+                # must have been seen OPEN within open_lookback_frames (1.6 s)
+                # or a resting fist drifting into the zone becomes a grab;
+                # anchor_drift_u is how still "still" is, in hand-units
+                # (~7x the 0.05-0.09 landmark noise floor).
+                "dwell_frames": 3, "open_lookback_frames": 12,
+                "open_frames_req": 1, "anchor_drift_u": 0.60,
+                # The throw, in hand-units of travel from the anchor: opened
+                # in frame needs a full hand-width (he opens his hand
+                # hundreds of times an hour); left the picture within
+                # edge_frac of a half-field needs only 0.25 (leaving is the
+                # evidence); vanished in open space needs 0.50 AND a last
+                # step of exit_step_u. Anything less is a DROP -- the cheap,
+                # reversible outcome.
+                "throw_release_u": 1.00, "throw_exit_u": 0.25,
+                "throw_lost_u": 0.50, "exit_step_u": 0.35, "edge_frac": 0.30,
+                # A carry survives lost_grace_frames of missed detection,
+                # and ends at carry_max_frames OR carry_max_s, whichever
+                # first (the seconds are the wall-clock backstop for a
+                # starved frame rate). cooldown_frames after any carry end.
+                "lost_grace_frames": 2, "carry_max_frames": 30,
+                "carry_max_s": 8.0, "cooldown_frames": 8,
+                # Direction: four +/-sector_half_deg sectors in HIS frame
+                # with 20 deg of "ambiguous" between them -- an unnameable
+                # fling is a drop. Only left and right THROW (measured:
+                # vertical throws scored 12/12 or 2/12 on finger direction
+                # alone); down is the cancel, up is not a target. A second
+                # hand at reach depth at least second_hand_frac the size of
+                # the first makes the frame ambiguous: two hands out at the
+                # lens is not this gesture.
+                "sector_half_deg": 35.0, "target_sectors": ["left", "right"],
+                "second_hand_frac": 0.70},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

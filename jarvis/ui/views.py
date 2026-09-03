@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from jarvis.campreview import OPTION_ENABLED as CAMERA_PREVIEW_OPTION
+from jarvis.handstage import OPTION_ENABLED as GESTURE_OPTION
 from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import UserUtterance, bus
 from jarvis.logs import get_logger
@@ -2062,6 +2063,15 @@ class SettingsDrawer(tk.Frame):
         # the pane says which, and no device is opened.
         self._preview_toggle = self._option_toggle_row(
             box, "Camera preview", CAMERA_PREVIEW_OPTION, echo=True)
+        # Grab and throw (jarvis/gesturecast.py). Beside the preview
+        # because it RIDES the preview: the hand stage runs inside the
+        # pane's own capture, so with the row above off there is no frame
+        # for it to read and nothing here opens one. No echo: the stage
+        # reads the switch on every frame, so it takes effect at once.
+        self._gesture_toggle = self._option_toggle_row(
+            box, "Grab and throw", GESTURE_OPTION)
+        self._info_row(box, "Reach at the lens, close your hand, fling it "
+                            "left or right. Needs the camera preview on.")
         self._info_row(box, "The microphone stays on while offline — say "
                             "“come back online” to switch sensing back on.")
 
@@ -2177,6 +2187,10 @@ class SettingsDrawer(tk.Frame):
         tog = getattr(self, "_preview_toggle", None)
         if tog is not None:
             tog.set(bool(self._get_option(CAMERA_PREVIEW_OPTION, False)),
+                    animate=False)
+        tog = getattr(self, "_gesture_toggle", None)
+        if tog is not None:
+            tog.set(bool(self._get_option(GESTURE_OPTION, False)),
                     animate=False)
         pol = self._sensing()
         if pol is None:
