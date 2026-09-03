@@ -1696,6 +1696,8 @@ TIER1_SAMPLES = {
     "sensing hold": "no cameras for the next two hours",
     "sensing curfew": "camera curfew from nine to seven",
     "ui look": "switch to classic visuals",
+    # 2026-09-02 23:26, verbatim -- the gate called it background chat
+    "clear transcript": "clear the transcript",
     "audio out": "where's your voice coming out",
     "standup": "standup",
     "oracle status": "how's the oracle box",
