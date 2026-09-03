@@ -440,12 +440,25 @@ DEFAULTS: dict = {
     # section shipped a detect size that could not resolve the face the mount
     # arithmetic produces, and nothing connected the two numbers.
     #
-    # docs/vision.md section 9: a 98 deg diagonal lens on 16:9 gives ~90 deg
-    # horizontally; the recommended mount is ~95 cm from his face and so spans
-    # 2*95*tan(45) = 191 cm. At 1920 px that is 10.05 px/cm, so a 16 cm face is
-    # 161 px -- 8.4% of the frame width. THAT is the face the detector has to
-    # find, and it is why width/height is 1080p and not the 640x480 that
-    # shipped first: at 640x480 the same face is 53 px, against SFace's 112.
+    # width/height is 1280x720 BECAUSE THAT IS A MODE THE CAMERA HAS. 1920x1080
+    # sat here until 2026-09-02 and the LifeCam Cinema does not have it: asked
+    # for a mode it lacks, v4l2 does not error, it silently grants the nearest
+    # one. Measured on /dev/video0 that night, the driver grants 1280x720 MJPG
+    # at 30 fps nominal and delivers a frame every 130 ms (p50) -- ~7.5 fps.
+    # So every number below is a 720p number, and camera.preview_fps is capped
+    # under 7.5 because asking for more buys a thread permanently inside a
+    # blocking read, not more pictures.
+    #
+    # THE FACE THAT FOLLOWS FROM IT, at the ~95 cm mount section 9 recommends.
+    # A 65.6 deg field spans 2*95*tan(32.82) = 122 cm, so 1280 px is 10.4
+    # px/cm and a 16 cm face is 167 px -- 13% of the frame width. (The 90 deg
+    # Arducam spans 191 cm, so its 1920 px is 10.05 px/cm and the same face is
+    # 162 px: the narrower field and the lower resolution very nearly cancel
+    # at full frame.) They do NOT cancel after the downscale below: 1280->320
+    # is 4x against 1920->320's 6x, so the detector sees 42 px here and 27 px
+    # there. Both clear YuNet's documented 10-300 px range; only one has
+    # margin. 640x480, which shipped first, would put the same face at 53 px
+    # against SFace's 112x112 input, which section 9 calls "far too small".
     #
     # detect_width/height is the size YuNet actually sees. 320x180, not the
     # 320x240 that shipped first, and the reason is aspect, not pixels: a
@@ -482,7 +495,24 @@ DEFAULTS: dict = {
     #
     # identity=False is the phase gate: with it off, nothing about his face is
     # ever written down (jarvis/facegallery.py is not constructed at all).
-    "camera": {"enabled": False, "device": "", "width": 1920, "height": 1080,
+    "camera": {"enabled": False, "device": "", "width": 1280, "height": 720,
+               # THE LENS, AS A NUMBER RATHER THAN AS A COMMENT. hfov_deg is
+               # the HORIZONTAL field of the camera actually plugged in.
+               # Until 2026-09-02 the ~90 deg the arithmetic above reasons
+               # from lived only in prose, which is exactly how it came to be
+               # applied to a camera that does not have it.
+               #
+               # 65.6 is his LifeCam Cinema. Its spec sheet says 73 deg, which
+               # is the DIAGONAL; the conversion is a ratio of TANGENTS, not
+               # of numbers -- for 16:9, tan(H/2) = tan(D/2) * 16/hypot(16,9)
+               # = tan(36.5) * 0.87157 = 0.6449, so H = 2*atan(0.6449) =
+               # 65.64 deg. Treating 73 as horizontal would overstate every
+               # off-axis angle by 11%, which at the edge of a 20 deg
+               # attention cone is most of the cone. A C930e is 82.2 deg; the
+               # 98 deg-diagonal Arducam docs/vision.md section 9 recommends
+               # buying is 90.1 -- the one camera the old comment was right
+               # about, and it is not the one on the desk.
+               "hfov_deg": 65.6,
                "detect_width": 320, "detect_height": 180, "threads": 2,
                "idle_fps": 1.5, "armed_fps": 8.0, "min_conf": 0.6,
                # The attention cone, in degrees off the lens axis. 20 deg is
@@ -500,8 +530,31 @@ DEFAULTS: dict = {
                # person".
                "identity": False, "identity_min": 0.363,
                # One JPEG at 0600, overwritten each time, for diagnosing a
-               # mount. The only path by which a frame reaches the disk.
-               "debug_frame": False},
+               # mount. The only path by which a frame reaches the disk --
+               # and note that the console's camera preview is NOT one:
+               # jarvis/campreview.py never writes a frame anywhere.
+               "debug_frame": False,
+               # The console's camera pane (jarvis/campreview.py,
+               # jarvis/ui/preview.py). His words, 2026-09-02: "lets add a
+               # small camera with visable tracking on the jarvis app but
+               # make me be able to turn if off in settings" -- this is the
+               # settings half, and the Privacy row in the drawer writes it.
+               #
+               # OFF by default, like every other lens key here. A pane that
+               # switched itself on would be this feature introducing itself
+               # by breaking the rule it lives under; and it is gated by
+               # sensing.py on top, so offline mode and the curfew shut it
+               # whatever this says.
+               #
+               # preview_fps is CAPTURE rate, and 6 is deliberately under the
+               # ~7.5 the device delivers. The console animates on 16.67 ms
+               # slot boundaries in the same process (jarvis/ui/reactor.py),
+               # so the capture runs on its own thread and the pane repaints
+               # at twice this rate off a latest-wins slot; asking for 30
+               # here would not produce 30 frames, it would produce a thread
+               # that is always inside a 130 ms blocking read and a curfew
+               # edge that has to wait it out.
+               "preview": False, "preview_fps": 6.0},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

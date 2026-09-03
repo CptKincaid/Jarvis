@@ -28,6 +28,7 @@ import tkinter as tk
 from datetime import datetime
 from typing import Callable, Optional
 
+from jarvis.campreview import OPTION_ENABLED as CAMERA_PREVIEW_OPTION
 from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import UserUtterance, bus
 from jarvis.logs import get_logger
@@ -1928,13 +1929,39 @@ class SettingsDrawer(tk.Frame):
                 log.exception("set_option %s failed", key)
         threading.Thread(target=run, daemon=True, name="set-option").start()
 
-    def _option_toggle_row(self, box, label: str, key: str):
+    def _option_toggle_row(self, box, label: str, key: str,
+                           echo: bool = False):
+        """An assistant.json toggle. ``echo`` also reports the new value
+        through ``on_config_change``, which is the console's "a setting
+        changed, react now" seam.
+
+        Off by default because most of these only matter at the next start
+        (autostart, the morning briefing). It is on for the camera preview
+        because that switch governs a LENS: a privacy control that appears
+        to do nothing until a restart is one he would reasonably conclude
+        was broken, and then work around.
+        """
         row = self._row(box, label)
         tog = Toggle(row, bg=theme.RAISED)
         tog.pack(side="right")
         tog.set(bool(self._get_option(key, False)), animate=False)
-        tog.command = lambda v, k=key: self._set_option(k, bool(v))
+
+        def changed(value, k=key, tell=echo):
+            self._set_option(k, bool(value))
+            if tell:
+                self._echo(k, bool(value))
+        tog.command = changed
         return tog
+
+    def _echo(self, name: str, value):
+        """Tell the window a setting changed. Same callback the CONFIG
+        rows use (bind_config), so there is one path into the console."""
+        if not self.on_config_change:
+            return
+        try:
+            self.on_config_change(name, value)
+        except Exception:
+            log.exception("on_config_change failed")
 
     def _service(self, name):
         fn = getattr(self.services, name, None) if self.services else None
@@ -2024,6 +2051,17 @@ class SettingsDrawer(tk.Frame):
             box, "Offline (camera + radar off)")
         self._curfew_start = self._curfew_row(box, "Camera curfew from", 0)
         self._curfew_end = self._curfew_row(box, "…until", 1)
+        # The camera preview (jarvis/campreview.py). In Privacy rather than
+        # in Assistant because what it switches on is a LENS, and the two
+        # rows above are the other two answers to "is the camera running" --
+        # a preview toggle three sections away from the offline switch would
+        # be a camera control he has to remember lives somewhere else.
+        # OFF by default: a pane that turned itself on would be the feature
+        # introducing itself by breaking the rule it lives under. It also
+        # obeys the rows above -- with offline mode or the curfew in force
+        # the pane says which, and no device is opened.
+        self._preview_toggle = self._option_toggle_row(
+            box, "Camera preview", CAMERA_PREVIEW_OPTION, echo=True)
         self._info_row(box, "The microphone stays on while offline — say "
                             "“come back online” to switch sensing back on.")
 
@@ -2131,6 +2169,15 @@ class SettingsDrawer(tk.Frame):
         toggle built at construction then shows the OPPOSITE of the truth
         the header badge is showing two inches away.
         """
+        # BEFORE the policy guard: the preview switch is an assistant.json
+        # option and does not need a sensing owner to be read, so a box
+        # where the policy failed to construct must still show the truth
+        # about the pane. animate=False also means Toggle.command is not
+        # called, so opening the drawer cannot write the switch it read.
+        tog = getattr(self, "_preview_toggle", None)
+        if tog is not None:
+            tog.set(bool(self._get_option(CAMERA_PREVIEW_OPTION, False)),
+                    animate=False)
         pol = self._sensing()
         if pol is None:
             return

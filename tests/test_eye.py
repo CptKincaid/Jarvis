@@ -390,16 +390,29 @@ def test_the_detect_size_cannot_drift_from_the_capture_aspect():
 
 
 def test_the_capture_resolution_is_the_one_the_mount_arithmetic_needs():
-    """docs/vision.md section 9: ~90 deg horizontal at 95 cm spans 191 cm, so
-    1920 px gives 10.05 px/cm and a 16 cm face is 161 px. 640x480 -- which
-    shipped first, uncommented -- makes that same face 53 px against SFace's
-    112x112 input, which section 9 itself calls "far too small"."""
+    """A 16 cm face at the ~95 cm mount has to clear SFace's 112x112 input.
+
+    THE SPAN IS DERIVED FROM THE CONFIGURED FIELD OF VIEW, not from a
+    constant. This test used to hard-code 191 cm, which is the span of a
+    90 deg lens -- the 98 deg-diagonal Arducam docs/vision.md section 9
+    recommends BUYING, and not the LifeCam Cinema that is actually plugged
+    in (65.6 deg horizontal; its 73 deg spec figure is the diagonal). With
+    the field of view now a config key (camera.hfov_deg, added 2026-09-02
+    with the console's camera preview), the arithmetic can use the real
+    number: 2*95*tan(32.82) = 122 cm, so 1280 px is 10.4 px/cm and the same
+    face is 168 px. 640x480, which shipped first and uncommented, would make
+    it 84 px -- what section 9 calls "far too small".
+    """
+    import math
+
     from jarvis.assistant_config import DEFAULTS
     cam = DEFAULTS["camera"]
-    span_cm = 191.0
+    hfov = float(cam["hfov_deg"])
+    assert 0.0 < hfov < 180.0, "camera.hfov_deg must state a real lens"
+    span_cm = 2 * 95.0 * math.tan(math.radians(hfov) / 2.0)
     face_px = cam["width"] / span_cm * 16.0
-    assert face_px >= 112.0, "a 16 cm face is %.0f px at %dx%d" % (
-        face_px, cam["width"], cam["height"])
+    assert face_px >= 112.0, "a 16 cm face is %.0f px at %dx%d (%.1f deg)" % (
+        face_px, cam["width"], cam["height"], hfov)
 
 
 def test_the_confidence_bar_leaves_the_measured_face_a_margin():
