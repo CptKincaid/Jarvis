@@ -48,7 +48,7 @@ operations are invoked on daemon threads by the drawer; start/stop/quit are
 called on the Tk thread and must return quickly.
 
 Assistant events (jarvis.events) the window renders: ClaudeTaskState →
-header pill WORK / WAIT + terminal-button ring (which also draws
+header pill WORKING / WAITING + terminal-button ring (which also draws
 `open` while a terminal is attached to a jarvis-* session); ClaudeProgress
 → compact progress card; ActiveProject → status-bar PROJECT chip +
 terminal tooltip; ApprovalRequested / ApprovalResolved → approval card;
@@ -115,18 +115,22 @@ DEFAULT_GEOMETRY = f"{DEFAULT_W}x{DEFAULT_H}"
 WORDMARK = "J A R V I S"
 MIN_W, MIN_H = 460, 720
 
-# StatePill words (uppercase, <= 6 chars, never ellipsized). SHORT since
-# 2026-09-03: the header keeps 312 px for the pill and the sensing badge
-# together at his 920-px window, and 'LISTENING…' alone was 271 of them —
-# Tk paid for that by shearing the badge, the one readout whose absence
-# must not look like its resting state. The word here only has to NAME
-# the state: the dot beside it carries the colour, the reactor carries
-# the motion, and the transcript carries the content. WORK / WAIT come
-# from ClaudeTaskState (a Claude task running / blocked on a permission
-# question).
-STATE_WORDS = {"idle": "READY", "listening": "LISTEN",
-               "thinking": "THINK", "speaking": "SPEAK",
-               "waiting": "WAIT", "working": "WORK",
+# StatePill words (uppercase, <= 9 chars, never ellipsized). The header
+# keeps 312 px for the pill and the sensing badge together at his 920-px
+# window, and 'LISTENING…' alone was 271 of them on 2026-09-02 — Tk paid
+# for that by shearing the badge, the one readout whose absence must not
+# look like its resting state. The first 09-03 cut answered with bare
+# imperatives (LISTEN / THINK / SPEAK), which on a voice console read as
+# orders to the user; his words were "smaller, not reworded", and
+# MEASURED on Xvfb the full participles fit once both chips drop to
+# PAD_X 4 / GAP 4 (LISTENING 158 + CAM OFF 141 = 299 of 312 at S=2, and
+# >= 6 px to spare at every scale 1.0-3.0; tests/test_header_fit.py).
+# Only the ellipsis went: the reactor carries the motion. WORKING /
+# WAITING come from ClaudeTaskState (a Claude task running / blocked on
+# a permission question).
+STATE_WORDS = {"idle": "READY", "listening": "LISTENING",
+               "thinking": "THINKING", "speaking": "SPEAKING",
+               "waiting": "WAITING", "working": "WORKING",
                "error": "ERROR"}
 WARN_HOLD_S = 4.0            # warn Status: pill dot amber for this long
 ERROR_HOLD_S = 6.0           # error Status: pill ERROR until ok/info or this
@@ -965,10 +969,13 @@ class MainWindow:
         # 41 px of 214 in his worst state. Nothing is misaligned (both
         # chips declare the same 26-unit height and pack centres them);
         # the bar was simply over-subscribed. It no longer is: the two
-        # chips were compressed to 280 px of the 312 the wordmark and the
+        # chips were compressed to 299 px of the 312 the wordmark and the
         # window chrome leave (tests/test_header_fit.py). Nothing here
         # resizes anything any more — the binding only NOTICES, in the
-        # log, if a header child added later spends that 32-px margin.
+        # log, once per width, when the bar is narrower than the wordmark
+        # plus the cluster at its widest, i.e. exactly when Tk would
+        # start cutting the badge (the cliff is 905 px at S=2, measured;
+        # his window is 918).
         self._header_short = None
         header.bind("<Configure>", self._on_header_resize, add=True)
         self._check_header_fit()
@@ -1094,10 +1101,16 @@ class MainWindow:
             widest[str(self.pill)] = StatePill.widest_w(STATE_WORDS.values())
         if getattr(self, "sensing_badge", None) is not None:
             widest[str(self.sensing_badge)] = SensingBadge.widest_w()
-        # theme.PAD_S is ALREADY device pixels here -- theme.apply_scale()
-        # mutates the spacing tokens once at startup, before any widget is
-        # built, so px() over them would scale S twice.
-        total = theme.PAD_S            # never flush against the badge
+        # No reserve seeded in: this is the pixel at which Tk starts to
+        # clip, nothing softer. The first cut seeded PAD_S "so the badge
+        # is never flush against the wordmark", which made the warning
+        # fire 16 px BEFORE anything was cut -- and once the chips left
+        # only 13 px of slack at his window (tests/test_header_fit.py)
+        # that would have been a warning at his own window, about a bar
+        # that fits. (The pack pads below are ALREADY device pixels:
+        # theme.apply_scale() mutates the spacing tokens once at startup,
+        # so px() over them would scale S twice.)
+        total = 0
         for child in self._header.pack_slaves():
             if child is self._wordmark:
                 continue
@@ -1115,10 +1128,12 @@ class MainWindow:
         This is all that is left of the 2026-09-02 remedy, and
         deliberately so: the wordmark used to SHRINK here, and he
         rejected that ("dont make jarvis smaller"). The chips were made
-        to fit instead, with 32 px to spare at his window, so there is
-        nothing to negotiate at runtime — only something to notice, once
-        per width, if a header child added later spends that margin and
-        puts the privacy badge back under Tk's knife.
+        to fit instead, with 13 px to spare at his window (measured, S=2),
+        so there is nothing to negotiate at runtime — only something to
+        notice, once per width, if a header child added later spends
+        that margin and puts the privacy badge back under Tk's knife.
+        `spare` < 0 IS the knife: _cluster_w seeds no reserve, so the
+        line fires at the clipping cliff itself, not 16 px early.
         """
         try:
             width = int(header_w if header_w else self._header.winfo_width())
@@ -1490,7 +1505,7 @@ class MainWindow:
 
     def _refresh_pill(self):
         """Recompute the StatePill from the event-derived state machine
-        (called on every state-changing event). Idle / WORK / WAIT:
+        (called on every state-changing event). Idle / WORKING / WAITING:
         FOCAL word, the dot carries the colour; other states take
         STATE_COLORS for both; a live warn hold turns only the dot amber."""
         state = self._app_state()

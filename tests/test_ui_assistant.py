@@ -43,13 +43,14 @@ def test_resolve_state_precedence_with_claude_states():
 
 
 def test_state_words_and_colours():
-    assert STATE_WORDS["working"] == "WORK"
-    assert STATE_WORDS["waiting"] == "WAIT"
-    # <= 6, not <= 10, since 2026-09-03: the header keeps 312 px for this
-    # chip and the sensing badge together at his 920-px window and the
-    # wordmark is not allowed to yield (tests/test_header_fit.py).
+    assert STATE_WORDS["working"] == "WORKING"
+    assert STATE_WORDS["waiting"] == "WAITING"
+    # <= 9 and no ellipsis since 2026-09-03: the header keeps 312 px for
+    # this chip and the sensing badge together at his 920-px window and
+    # the wordmark is not allowed to yield; the participles stay, the
+    # padding and the '…' went (tests/test_header_fit.py).
     for word in STATE_WORDS.values():
-        assert word.isupper() and len(word) <= 6
+        assert word.isupper() and len(word) <= 9 and "…" not in word
     assert theme.STATE_COLORS["working"] == theme.CYAN_DIM
     assert theme.STATE_COLORS["waiting"] == theme.WARN
     # the word stays FOCAL for idle / working / waiting (dot carries colour)

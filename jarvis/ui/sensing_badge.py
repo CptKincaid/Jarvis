@@ -9,22 +9,34 @@ indistinguishable from across the room.
 
 THREE STATES, TOLD APART THREE WAYS. The word carries it in text
 ("SENSING" / "CAM OFF" / "OFFLINE"), the dot carries it in colour
-(cyan live, amber restricted), and OFFLINE additionally carries it in
-SHAPE -- a hollow dot, i.e. nothing lit. Colour alone would not survive a
-dimmed monitor or a colour-blind glance, and this is the one readout in
-the app where being wrong is not a cosmetic bug.
+(cyan live, amber restricted), and the dot carries it AGAIN in SHAPE:
+a full disc when everything is lit, a HALF disc under the curfew (half
+the sensors lit -- the radar is on, the camera is not), a hollow ring
+when nothing is. Colour alone would not survive a dimmed monitor or a
+colour-blind glance; and CAM OFF and OFFLINE are both amber and both
+seven glyphs, so without the shape the only thing telling them apart
+across the room was the word. This is the one readout in the app where
+being wrong is not a cosmetic bug.
 
 WHAT 2026-09-03 TOOK, AND WHAT IT REFUSED TO TAKE. The header ran out of
 room (tests/test_header_fit.py: 312 px for this chip and the state pill
 together, 485 asked) and he ruled the wordmark out of paying for it. So
-this chip gave up chip padding and one word -- "CAMERA OFF" -> "CAM OFF",
-seven glyphs like the other two -- and NOTHING else: same SIZE_CAPTION
-face, same dot, same capsule, all three tell-apart channels intact, so
-what a glance from across the room sees is unchanged. The unabbreviated
-reason ("camera off until 7 am (curfew)") stays on ``badge_caption``,
-which MainWindow feeds the badge's tooltip on every refresh. The pill
-paid the rest of the bill; its state is also on the reactor, the
-transcript and its own dot, and this one is not.
+this chip gave up chip padding (PAD_X 10 -> 4, GAP 6 -> 4, measured on
+Xvfb as the geometry at which the pill's full words still fit at every
+scale) and one word -- "CAMERA OFF" -> "CAM OFF", seven glyphs like the
+other two -- and NOTHING else: same SIZE_CAPTION face, same dot, same
+capsule, all three tell-apart channels intact, so what a glance from
+across the room sees is unchanged. The unabbreviated reason ("camera off
+until 7 am (curfew)") stays on ``badge_caption``, which MainWindow feeds
+the badge's tooltip on every refresh. The pill paid the rest of the
+bill; its state is also on the reactor, the transcript and its own dot,
+and this one is not.
+
+The two chips now share a face and a geometry, so the badge keeps ONE
+chrome channel of its own: its edge (the capsule outline in holo, the
+1px catch-light in classic) is never the pill's GLASS_EDGE -- CYAN_DIM
+while live, WARN while restricted -- so "which chip is the privacy one"
+does not become a question the word has to answer.
 
 Everything a screenshot review would argue about is a pure function here
 (``badge_tone`` / ``badge_word`` / ``badge_colors`` / ``badge_caption``),
@@ -107,22 +119,36 @@ def badge_word(state: Any) -> str:
     return WORDS[badge_tone(state)]
 
 
+DOT_DISC = "disc"      # everything lit
+DOT_HALF = "half"      # half the sensors lit (radar on, camera off)
+DOT_RING = "ring"      # nothing lit
+
+
 def badge_colors(tone: str) -> dict:
-    """dot / ink / edge for a tone, in the CURRENT look.
+    """dot / ink / edge / shape for a tone, in the CURRENT look.
 
     The ink is always a light text token (FOCAL or INK) because both looks
     ground on a dark blue: cyan here would be structure colour used as
     text, which the film budget reserves for chrome and which loses against
     classic's lifted ground.
+
+    The edge is never StatePill's GLASS_EDGE: the pill and the badge share
+    a face and a geometry, and the edge is the one channel that says which
+    of the two is the privacy readout (CYAN_DIM is the accent outline the
+    holo buttons already use, so it is vocabulary the eye has met).
+
+    ``shape`` is the third tell-apart channel, per tone: DISC / HALF /
+    RING. CAM OFF and OFFLINE are both amber and both seven glyphs, so
+    the shape is what separates them without reading.
     """
     if tone == TONE_OFF:
         return {"dot": theme.WARN, "ink": theme.FOCAL, "edge": theme.WARN,
-                "filled": False}
+                "shape": DOT_RING}
     if tone == TONE_CURFEW:
         return {"dot": theme.WARN, "ink": theme.INK, "edge": theme.WARN,
-                "filled": True}
-    return {"dot": theme.CYAN, "ink": theme.FOCAL, "edge": theme.GLASS_EDGE,
-            "filled": True}
+                "shape": DOT_HALF}
+    return {"dot": theme.CYAN, "ink": theme.FOCAL, "edge": theme.CYAN_DIM,
+            "shape": DOT_DISC}
 
 
 def _clock_words(hm) -> str:
@@ -131,8 +157,9 @@ def _clock_words(hm) -> str:
 
 
 def badge_caption(state: Any) -> str:
-    """The second line -- the tooltip, and the status strip's detail. Says
-    WHY and, when there is one, until when."""
+    """The badge's tooltip (its only consumer: MainWindow feeds it to
+    Tooltip.set_text on every refresh). Says WHY and, when there is one,
+    until when."""
     s = normalise(state)
     parts = []
     if s["reason"] == "failsafe":
@@ -160,7 +187,7 @@ class SensingBadge(tk.Canvas):
     in holo, filled slab in classic) so it cannot be the one widget in the
     header that renders wrong in one of the looks."""
 
-    HEIGHT, PAD_X, DOT, GAP = 26, 6, 8, 5       # design units, == StatePill
+    HEIGHT, PAD_X, DOT, GAP = 26, 4, 8, 4       # design units, == StatePill
 
     def __init__(self, parent, bg=None):
         bg = bg or parent.cget("bg")
@@ -236,11 +263,19 @@ class SensingBadge(tk.Canvas):
                              fill=colors["edge"], width=1, tags=("badge",))
         r = px(self.DOT) / 2.0
         dx, dy = px(self.PAD_X) + r, pill_h / 2.0
+        shape = colors["shape"]
+        # disc: a filled dot. ring: the outline only. half: the outline
+        # plus its left half filled (a chord from 12 o'clock round to 6),
+        # so the three shapes read full / half / empty at any size.
         self._dot = self.create_oval(
             dx - r, dy - r, dx + r, dy + r,
-            fill=colors["dot"] if colors["filled"] else "",
-            outline="" if colors["filled"] else colors["dot"],
+            fill=colors["dot"] if shape == DOT_DISC else "",
+            outline="" if shape == DOT_DISC else colors["dot"],
             width=max(1, px(1)), tags=("badge",))
+        if shape == DOT_HALF:
+            self.create_arc(dx - r, dy - r, dx + r, dy + r, start=90,
+                            extent=180, style="chord", fill=colors["dot"],
+                            outline="", tags=("badge",))
         self._word = self.create_text(
             px(self.PAD_X) + px(self.DOT) + px(self.GAP), pill_h // 2,
             anchor="w", text=self._word_text, fill=colors["ink"],

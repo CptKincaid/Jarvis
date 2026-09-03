@@ -9,7 +9,8 @@ glance -- is asserted here without ever creating a toplevel window. The
 import pytest
 
 from jarvis.ui import theme
-from jarvis.ui.sensing_badge import (TONE_CURFEW, TONE_OFF, TONE_ON,
+from jarvis.ui.sensing_badge import (DOT_DISC, DOT_HALF, DOT_RING,
+                                     TONE_CURFEW, TONE_OFF, TONE_ON,
                                      badge_caption, badge_colors, badge_tone,
                                      badge_word, normalise,
                                      sensing_failsafe_state)
@@ -48,8 +49,9 @@ def test_the_word_says_the_state_not_the_feature_name():
 def test_every_word_is_seven_glyphs_so_the_chip_does_not_twitch():
     """'CAMERA OFF' became 'CAM OFF' on 2026-09-03 to fit a header that
     may not shrink its wordmark. Seven glyphs in every tone means the
-    capsule barely changes width between states (145/150/151 px at S=2),
-    so it reads as one steady mark rather than a thing that jumps -- and
+    capsule barely changes width between states (135/140/141 px at S=2,
+    measured on Xvfb through the real widget), so it reads as one steady
+    mark rather than a thing that jumps -- and
     it is still a WORD, not a bare dot, which is the whole reason this
     readout is in the header. The unabbreviated reason stays reachable on
     badge_caption, which MainWindow feeds the badge's tooltip."""
@@ -95,18 +97,47 @@ def test_every_tone_is_legible_in_both_looks(look):
 
 @pytest.mark.parametrize("look", theme.LOOKS)
 def test_the_three_tones_are_told_apart_without_reading_the_word(look):
+    """Each channel on its own separates at least two of the three, and
+    the SHAPE separates all three by itself: CAM OFF and OFFLINE are both
+    amber and both seven glyphs, so with colour gone the dot's shape is
+    the only tell left that is not the word."""
     theme.select_look(look)
-    signatures = {(badge_colors(t)["dot"], badge_colors(t)["filled"])
-                  for t in (TONE_ON, TONE_CURFEW, TONE_OFF)}
-    assert len(signatures) == 3, look
+    tones = (TONE_ON, TONE_CURFEW, TONE_OFF)
+    assert len({badge_colors(t)["shape"] for t in tones}) == 3, look
+    assert len({badge_colors(t)["dot"] for t in tones}) == 2, look
+    assert len({(badge_colors(t)["dot"], badge_colors(t)["shape"])
+                for t in tones}) == 3, look
 
 
-def test_offline_is_the_only_hollow_dot():
+def test_the_dot_is_full_half_or_empty_by_how_much_is_lit():
     """Colour alone would not survive a bad monitor or a colour-blind
-    glance; "nothing is lit" is the shape that carries it."""
-    assert badge_colors(TONE_OFF)["filled"] is False
-    assert badge_colors(TONE_ON)["filled"] is True
-    assert badge_colors(TONE_CURFEW)["filled"] is True
+    glance. Everything lit is a disc; the curfew -- radar on, camera off
+    -- is HALF a disc, half the sensors lit; offline is a hollow ring,
+    nothing lit. Before 2026-09-03 the curfew dot was a full amber disc,
+    6 px of chip width and one word away from OFFLINE's ring."""
+    assert badge_colors(TONE_ON)["shape"] == DOT_DISC
+    assert badge_colors(TONE_CURFEW)["shape"] == DOT_HALF
+    assert badge_colors(TONE_OFF)["shape"] == DOT_RING
+    assert len({DOT_DISC, DOT_HALF, DOT_RING}) == 3
+    assert "filled" not in badge_colors(TONE_ON)      # the old bool is gone
+
+
+@pytest.mark.parametrize("look", theme.LOOKS)
+def test_the_badge_never_wears_the_pills_edge(look):
+    """The two header chips are one face and one geometry since
+    2026-09-03, so the edge is the badge's one chrome channel of its
+    own: the capsule outline in holo, the 1px catch-light in classic
+    (widgets.StatePill._fit draws GLASS_EDGE for the pill in both). A
+    badge that shared it would be the pill's twin, and "which chip is
+    the privacy one" would be a question only the word could answer."""
+    theme.select_look(look)
+    for tone in (TONE_ON, TONE_CURFEW, TONE_OFF):
+        edge = badge_colors(tone)["edge"]
+        assert edge != theme.GLASS_EDGE, (look, tone)
+        assert edge != theme.BG, (look, tone)
+    assert badge_colors(TONE_ON)["edge"] == theme.CYAN_DIM
+    assert badge_colors(TONE_CURFEW)["edge"] == theme.WARN
+    assert badge_colors(TONE_OFF)["edge"] == theme.WARN
 
 
 def test_the_colours_follow_the_look_at_call_time():
