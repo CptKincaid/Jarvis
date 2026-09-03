@@ -743,6 +743,65 @@ def test_a_degraded_sidecar_is_refused_without_waiting_on_systemd(
     finally:
         srv.close()
 
+WORKER_GONE_PING = {"ok": True, "ready": False, "graphs": True,
+                    "detail": ALL_GRAPHS, "error": bs.WORKER_GONE, "config": {}}
+
+
+def test_a_sidecar_whose_render_thread_died_is_refused_at_once_and_named(
+        sock_path, no_spawn, monkeypatch, caplog):
+    """The server answers ready:false, graphs:true, error=WORKER_GONE once
+    its render thread has died (test_a_dead_render_worker_makes_the_sidecar_
+    not_ready). The only 'degraded' branch here was keyed on graphs, so that
+    reply fell through: the speak path logged 'active but not answering yet
+    (it loads for ~30 s ...)' for a sidecar that had answered in under a
+    millisecond, the warm thread polled it for the whole startup budget
+    (measured with 3 s standing in for 90: 8 pings, then 'did not answer'),
+    and the error text was never logged.
+
+    Any answer that is not ready is TERMINAL for that process -- the socket
+    is bound only after load and capture -- so it is refused at once, once,
+    with its reason."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active",
+                        lambda: pytest.fail("must not ask systemd"))
+    srv = FakeSidecar(sock_path, sidecar_handler([], ping=WORKER_GONE_PING))
+    try:
+        with caplog.at_level("ERROR", logger="jarvis.tts"):
+            started = time.monotonic()
+            assert tts_mod._ensure_breeze_server() is False
+            assert tts_mod._ensure_breeze_server(startup_timeout=10) is False
+        assert time.monotonic() - started < 2.0
+        assert len([r for r in srv.requests if r.get("ping")]) == 2
+    finally:
+        srv.close()
+    assert any(bs.WORKER_GONE in r.getMessage() for r in caplog.records)
+    assert not any("not answering yet" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_a_sidecar_that_comes_up_not_ready_during_the_wait_ends_the_wait(
+        sock_path, no_spawn, monkeypatch):
+    """The same reply landing mid-wait: the unit was active with no socket,
+    the warm thread was polling, and the socket that then appears answers
+    not-ready (its capture failed). Polling it for the rest of the budget
+    bought nothing but a late fallback."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: True)
+    holder = {}
+
+    def _late():
+        time.sleep(0.3)
+        holder["srv"] = FakeSidecar(sock_path, sidecar_handler(
+            [], ping={"ok": True, "ready": False, "graphs": False,
+                      "error": "CUDA graphs were not captured"}))
+
+    threading.Thread(target=_late, daemon=True).start()
+    started = time.monotonic()
+    try:
+        assert tts_mod._ensure_breeze_server(startup_timeout=10) is False
+        assert time.monotonic() - started < 3.0
+    finally:
+        wait_until(lambda: "srv" in holder)
+        holder["srv"].close()
+
 
 def test_an_activating_unit_is_waited_for_never_raced(sock_path, no_spawn,
                                                       monkeypatch):

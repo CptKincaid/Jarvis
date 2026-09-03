@@ -1074,13 +1074,20 @@ def _ensure_breeze_server(startup_timeout: float = 0.0) -> bool:
                             "cached audio may not match what it renders",
                             "; ".join(drift))
             return True
-        if reply and not reply.get("graphs"):
-            # It answered and told us it is degraded. Do not wait for a unit
-            # that is already up and already wrong.
-            log.error("breeze sidecar is up but its CUDA graphs are NOT "
-                      "captured (%s) -- it would stutter; using %s",
-                      reply.get("error") or reply.get("detail"),
-                      BREEZE_FALLBACK)
+        if reply:
+            # It answered, and it is not ready. That is TERMINAL for this
+            # process, not a phase of starting: the sidecar binds its socket
+            # only after load and capture, so a not-ready answer means the
+            # graphs were not captured (it would stutter) or the render
+            # thread has since died. Waiting on a unit that is already up
+            # and already wrong only delays the fallback. The dead-worker
+            # reply (ready:false, graphs:true) used to fall through this
+            # branch, which was keyed on graphs alone: the speak path logged
+            # "not answering yet" for a sidecar that had answered in under a
+            # millisecond and the warm thread polled it for the whole
+            # startup budget -- measured, 8 pings over a 3 s stand-in for
+            # the 90 -- with its reason never logged.
+            _breeze_refused(reply)
             return False
         if not _breeze_unit_active():
             log.error("breeze sidecar is not running (%s is not active); "
@@ -1097,19 +1104,40 @@ def _ensure_breeze_server(startup_timeout: float = 0.0) -> bool:
     return _wait_for_breeze_unit(startup_timeout)
 
 
+def _breeze_refused(reply: dict) -> None:
+    """Say WHY a sidecar that answered is being refused, quoting its reason:
+    the error text is the one line that tells him which of the two
+    terminal states it is in."""
+    why = reply.get("error") or reply.get("detail")
+    if not reply.get("graphs"):
+        log.error("breeze sidecar is up but its CUDA graphs are NOT "
+                  "captured (%s) -- it would stutter; using %s",
+                  why, BREEZE_FALLBACK)
+    else:
+        log.error("breeze sidecar is up but not ready (%s); using %s until "
+                  "%s is restarted", why, BREEZE_FALLBACK, BREEZE_UNIT)
+
+
 def _wait_for_breeze_unit(startup_timeout: float) -> bool:
     """The unit owns the socket: poll until it answers or dies.
 
     Re-checks the unit every few seconds so a unit that crashed during graph
-    capture does not cost the whole startup budget.
+    capture does not cost the whole startup budget. A socket that appears
+    and answers NOT READY ends the wait the same way: that answer is
+    terminal for the process (see _ensure_breeze_server), so the rest of
+    the budget would be spent polling a sidecar that cannot change its mind.
     """
     log.info("breeze sidecar is owned by %s; waiting for it", BREEZE_UNIT)
     deadline = time.monotonic() + startup_timeout
     next_unit_check = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if _breeze_alive():
+        reply = _breeze_ping()
+        if reply.get("ready") and reply.get("graphs"):
             log.info("breeze sidecar ready (%s)", BREEZE_UNIT)
             return True
+        if reply:
+            _breeze_refused(reply)
+            return False
         if time.monotonic() >= next_unit_check:
             if not _breeze_unit_active():
                 log.error("%s stopped while we were waiting for it", BREEZE_UNIT)
