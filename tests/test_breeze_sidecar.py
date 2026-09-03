@@ -860,6 +860,28 @@ TWO_CHUNKS = [" ".join(["The reactor is holding steady this evening."] * 13),
 TWO = " ".join(TWO_CHUNKS)
 
 
+def audio_worth(monkeypatch, text: str, seconds: float):
+    """Tell TTS._unspoken_tail what a second of the FAKE sidecar's audio is
+    worth in characters of text.
+
+    Its blocks are tokens: 0.2-0.4 s of square wave standing in for a
+    sentence the real engine would take half a minute over. _unspoken_tail
+    places a cut by turning bytes of audio into a position in the text at
+    BREEZE_CHARS_PER_SECOND, so a token stream that ran to the end has to be
+    told that it did -- otherwise 0.2 s of square wave reads as "four
+    characters were spoken" and a COMPLETE render looks like a cut one.
+    Rendering 30 s of real PCM in each of these tests to keep that honest
+    would cost far more than it proves.
+
+    ``seconds`` is what the whole of ``text`` is worth. The x1.5 headroom
+    the shipped constant carries over the fastest rate ever measured is
+    applied here too, so these tests run against the same margin the room
+    does rather than against a knife edge.
+    """
+    monkeypatch.setattr(tts_mod, "BREEZE_CHARS_PER_SECOND",
+                        1.5 * len(text) / float(seconds))
+
+
 @pytest.fixture
 def long_reading(monkeypatch):
     """Let a test hand TTS more than one reply's worth of text.
@@ -990,12 +1012,28 @@ def test_a_long_sentence_is_not_comma_split_the_way_f5s_is():
 # start a stream until prebuf is met, which a file fills in milliseconds and
 # a 1.3x-real-time render does not.
 #
-# Two things follow, and this section asserts both.
-#   1. Bound the player's buffer on the streaming path (BREEZE_PLAYER_LATENCY_MS).
+# Two things follow, and this section asserts both. They are NOT equal
+# halves, and the commit that introduced them read as though they were.
+#
+#   1. Bound the player's buffer on the streaming path
+#      (BREEZE_PLAYER_LATENCY_MS). THIS is what closes the gap he heard at
+#      23:17: the split there was upstream, in brain.py's streaming reply
+#      path, which hands TTS one sentence per speak() call, so the join
+#      below removes no boundary at all on that reply. The flag returns
+#      1.28 s per utterance, i.e. ~2.56 s of his 11.07 s.
+#
 #   2. Stop making boundaries. Every chunk boundary pays that startup again
 #      AND resets the sentence's pitch (see _ENGINE_CHUNKING). Breeze reaches
 #      first audio in 0.268 s on a WHOLE utterance, so a boundary buys it
-#      nothing at all.
+#      nothing at all. Measured on his OWN traffic rather than a synthetic
+#      corpus -- both splitters over the 27 Breeze utterances in that
+#      evening's log -- this removes 5 of 32 boundaries, 15.6%, every one of
+#      them a semicolon split inside a single sentence ("It sounds quite
+#      distinct, sir;" | "I trust it meets your approval."). That is a real
+#      prosody win worth ~1.3 s each and it is what makes prewarm hit, but
+#      it is a smaller and different claim than "76.5% of its boundaries",
+#      which was a 307-text synthetic corpus and should not have been the
+#      headline.
 # ===========================================================================
 def _recording_handler(order, blocks_for=None):
     """The standard sidecar, recording the text of every render asked for."""
@@ -1058,6 +1096,31 @@ def test_the_same_reply_is_still_four_chunks_on_f5(breeze):
     # and every non-streaming engine keeps the merge it has always had
     for engine in ("f5", "xtts", "edge", "fish"):
         assert breeze._join_chars(engine) == 0, engine
+
+
+def test_the_boundaries_this_removes_on_his_own_traffic_are_semicolons():
+    """What the join actually buys HIM, stated against his traffic.
+
+    Both splitters over the 27 Breeze utterances in the 2026-09-02 log give
+    32 chunks old and 27 new: 5 boundaries removed, 15.6% -- not the 76.5%
+    of the 307-text synthetic corpus the commit led with. Every one of the 5
+    is a semicolon split inside a SINGLE sentence, and all five are below,
+    verbatim. That is a real prosody win (the F0 reset above _ENGINE_CHUNKING)
+    worth ~1.3 s of player startup each, and it is what makes a prewarmed
+    line hit -- but it is a different and smaller claim, and it is not what
+    fixed 23:17, where the split was upstream in brain.py."""
+    t = TTS.__new__(TTS)
+    for line in (
+            "It sounds quite distinct, sir; I trust it meets your approval.",
+            "I'm afraid I'm not programmed for madness, sir; I'm far too busy "
+            "keeping your files in order.",
+            "Good evening, Ali and Heather; I do hope you're both having a "
+            "lovely night.",
+            "I have noted that, sir; December 10th for your electrical "
+            "engineering graduation.",
+            "I'm indexing your documents now, sir; ask me again in a moment."):
+        assert t._split_sentences(line, engine="breeze") == [line]
+        assert len(t._split_sentences(line, engine="f5")) == 2, line
 
 
 def test_the_join_is_off_when_breeze_is_not_streaming(monkeypatch):
@@ -1377,16 +1440,19 @@ def test_a_refusal_on_the_second_chunk_does_not_re_speak_the_first(
     assert breeze.engine == "breeze"            # one bad chunk does not retire it
 
 
-def test_a_cut_first_chunk_is_not_re_spoken_and_the_reply_still_finishes(
-        breeze, sock_path, long_reading):
-    """Sentence 1 is cut mid-stream after part of it was HEARD; sentence 2 is
-    fine.
+def test_a_cut_first_chunk_keeps_its_heard_half_and_recovers_the_rest(
+        breeze, sock_path, monkeypatch, long_reading):
+    """Chunk 1 is cut mid-stream after part of it was HEARD; chunk 2 is fine.
 
-    Two things have to hold at once and they pull opposite ways: the heard
-    fragment must NOT be re-rendered on F5 (that is the doubled half
-    sentence), and the reply must not stop there either -- a dropped
-    sentence 2 is a hole. So: no F5 at all, both players, and only the whole
-    sentence is cached."""
+    Three things have to hold at once and the first two pull opposite ways.
+    The heard fragment must NOT be re-rendered on F5 (that is the doubled
+    half sentence, in the other voice). The reply must not stop there either
+    -- a dropped chunk 2 is a hole. And what the cut chunk did NOT reach is
+    owed to him as well: since a chunk became a whole reply, dropping it
+    with the fragment means dropping most of the reply, so the sentences
+    that lie past the cut come back on F5, in their own place, before chunk
+    2 rather than after it."""
+    audio_worth(monkeypatch, TWO_CHUNKS[0], 0.4)
     first, second = wav_bytes(0.4)[44:], wav_bytes(0.3)[44:]
     handler, seen = _two_chunk_handler(first, second, cut_nth=1)
     srv = FakeSidecar(sock_path, handler)
@@ -1399,13 +1465,21 @@ def test_a_cut_first_chunk_is_not_re_spoken_and_the_reply_still_finishes(
     finally:
         srv.close()
     assert seen == TWO_CHUNKS
-    assert f5 == [], "the heard half sentence must never be re-rendered"
-    assert len(FakeProc.spawned) == 2, "sentence 2 was dropped"
+    pieces = breeze._split_sentences(TWO_CHUNKS[0], engine="f5")
+    # a COUNT, because these 13 sentences are deliberately identical: what
+    # is asserted is how much came back, not which words
+    assert 0 < len(f5) < len(pieces), "the unheard tail was dropped"
+    assert f5 == pieces[len(pieces) - len(f5):], "and only the tail, in order"
+    assert len(f5) <= len(pieces) // 2, "half of it was HEARD; do not repeat it"
+    # chunk 1's cut audio, then its recovered tail, then chunk 2
+    assert len(FakeProc.spawned) == 2 + len(f5)
     assert bytes(FakeProc.spawned[0].fed).endswith(first[:len(first) // 2])
-    assert bytes(FakeProc.spawned[1].fed).endswith(second)
-    # the truncated one is not cached; the whole one is
+    assert bytes(FakeProc.spawned[-1].fed).endswith(second)
+    # the truncated one is not cached; the whole one is; the tail is filed
+    # under the engine that RENDERED it
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[0])) is None
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[1])) is not None
+    assert breeze.cache.get(breeze._cache_key("f5", f5[0])) is not None
 
 
 def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(
@@ -1415,10 +1489,10 @@ def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(
     _stream_breeze has two ways out after audio has been heard: the stream
     ENDS and the completion receipt says it was truncated (the test above),
     or the read itself RAISES. Only the first was covered, and the second is
-    the one with the guard in it -- ``if stream.heard: return True`` -- which
-    means the branch that actually stops a doubled half sentence had never
-    been executed. Verified by mutation: deleting that guard left the whole
-    suite green.
+    the one with the guard in it -- ``if stream.heard`` -- which means the
+    branch that actually stops a doubled half sentence had never been
+    executed. Verified by mutation: deleting that guard left the whole suite
+    green.
 
     Getting there needs a raise, and on AF_UNIX a peer that dies cannot
     supply one: the module docstring's own measurement is that even SO_LINGER
@@ -1427,6 +1501,7 @@ def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(
     -- a sidecar wedged mid-render (a GPU that stopped answering) rather than
     one that exited. The deadline is dropped to 1 s so the test is not 60."""
     monkeypatch.setattr(tts_mod, "BREEZE_TIMEOUT_S", 1.0)
+    audio_worth(monkeypatch, TWO_CHUNKS[0], 0.4)
     first, second = wav_bytes(0.4)[44:], wav_bytes(0.3)[44:]
     seen = []
     wedged = threading.Event()
@@ -1464,19 +1539,31 @@ def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(
         wedged.set()
         srv.close()
     assert seen == TWO_CHUNKS
-    assert f5 == [], "the heard half sentence must never be re-rendered"
-    assert len(FakeProc.spawned) == 2, "sentence 2 was dropped"
+    pieces = breeze._split_sentences(TWO_CHUNKS[0], engine="f5")
+    # a COUNT, because these 13 sentences are deliberately identical: what
+    # is asserted is how much came back, not which words
+    assert 0 < len(f5) <= len(pieces) // 2, "the heard half was re-rendered"
+    assert f5 == pieces[len(pieces) - len(f5):], "only the unheard tail"
+    assert len(FakeProc.spawned) == 2 + len(f5), "chunk 2 was dropped"
     assert bytes(FakeProc.spawned[0].fed).endswith(first[:len(first) // 2])
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[0])) is None
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[1])) is not None
 
 
 def test_the_sidecar_dying_between_two_sentences_finishes_the_reply_on_f5(
-        breeze, sock_path, long_reading):
-    """The whole sidecar goes away after sentence 1 -- the socket file with
-    it. Sentence 2 has to be spoken by F5, not dropped, and sentence 1 must
-    not be repeated."""
-    first = wav_bytes(0.2)[44:]      # sentence 2 is never rendered by breeze
+        breeze, sock_path, monkeypatch, long_reading):
+    """The whole sidecar goes away after chunk 1 -- the socket file with it.
+    Chunk 2 has to be spoken by F5, not dropped, and chunk 1 must not be
+    repeated.
+
+    Chunk 1 STREAMED IN FULL and only its receipt is unobtainable, which is
+    the ambiguous case the tail recovery has to get right: no positive
+    'complete', but a full utterance's worth of audio was heard, so the
+    arithmetic must recover nothing. That is what BREEZE_CHARS_PER_SECOND's
+    deliberate overstatement buys, and it is the whole reason the recovery
+    can run on a missing receipt at all."""
+    audio_worth(monkeypatch, TWO_CHUNKS[0], 0.2)
+    first = wav_bytes(0.2)[44:]      # chunk 2 is never rendered by breeze
     holder = {}
     seen = []
 
@@ -2633,6 +2720,9 @@ def test_a_slow_completion_receipt_does_not_stall_the_reply(
     never answers it at all.
     """
     monkeypatch.setattr(tts_mod, "BREEZE_RECEIPT_TIMEOUT_S", 1.0)
+    # Both chunks stream IN FULL here; only the answer is missing, so the
+    # tail recovery must find nothing to re-render.
+    audio_worth(monkeypatch, TWO_CHUNKS[0], 0.2)
     audio = wav_bytes(0.2)[44:]
     blocked = threading.Event()
     order, asked = [], {}
@@ -2695,6 +2785,287 @@ def test_a_truncated_chunk_is_still_never_cached(breeze, sock_path):
         srv.close()
     assert f5 == []
     assert breeze.cache.stats()["files"] == 0
+
+
+# ===========================================================================
+# 12b. what a cut stream costs, now that a chunk is a whole reply
+#
+# The rule "a stream cut after its first audible byte is never re-spoken" was
+# written when a chunk was a SENTENCE, and the loss it accepted was that
+# sentence. _BREEZE_STREAM_JOIN_CHARS made a chunk the whole reply and the
+# rule did not move, so the same code path went from losing a clause to
+# losing everything after the cut -- and BREEZE_MIN_HEARD_BYTES is 20 ms of
+# audio, so a sidecar that died a fifth of a second into a 27 s briefing took
+# the whole briefing with it, behind a log.warning.
+#
+# What must NOT change is the guard itself: the fragment that was heard is
+# never said again, in the other voice. So the loss is bounded by arithmetic
+# instead -- TTS._unspoken_tail turns bytes of audio into a position in the
+# text at BREEZE_CHARS_PER_SECOND, deliberately overstated, and only whole
+# sentences past that come back on F5.
+# ===========================================================================
+CUT = ("I'm afraid the processing of your request took a moment longer than "
+       "expected, sir. It seems my new voice is still finding its footing. "
+       "The inbox is quiet, for once. I shall let you know if that changes.")
+
+
+def _dying_handler(audio, *, receipt=None):
+    """Stream ``audio`` in full, then take the whole sidecar away, so the
+    completion receipt cannot be had at all -- which is what a sidecar that
+    CRASHED mid-render looks like from here."""
+    holder = {}
+
+    def handler(srv, conn, req):
+        holder["srv"] = srv
+        if req.get("ping"):
+            srv.send(conn, {"ok": True, "ready": True, "graphs": True})
+            return
+        if req.get("status"):
+            if receipt is None:
+                srv.send(conn, {"ok": False, "error": "unknown request id"})
+            else:
+                srv.send(conn, {"ok": True, **receipt})
+            return
+        srv.send(conn, {"ok": True, "stream": True, "sr": 24000})
+        conn.sendall(tts_mod.wav_header(24000, 1, 2, None) + audio)
+        if receipt is None:
+            srv.close()                 # the socket file goes with it
+        conn.close()
+
+    return handler
+
+
+def test_the_unheard_rest_of_a_cut_reply_is_spoken_not_dropped(breeze,
+                                                               sock_path):
+    """The reply is ONE chunk (it is 202 characters, under the join bound),
+    the sidecar dies 0.42 s into it, and 0.42 s is enough to count as heard.
+
+    Before the tail recovery that dropped 87% of the reply and said so only
+    in a log line. The shipped BREEZE_CHARS_PER_SECOND is used here, against
+    audio whose length is what the engine would really have produced by that
+    point, because the arithmetic is the whole guard."""
+    srv = FakeSidecar(sock_path, _dying_handler(wav_bytes(0.42)[44:]))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (
+            f5.append(text), open(out, "wb").write(wav_bytes(0.1)))
+        done = breeze.speak(CUT)
+        assert done.wait(20), "the TTS worker wedged on the dead sidecar"
+    finally:
+        srv.close()
+    pieces = breeze._split_sentences(CUT, engine="f5")
+    assert len(breeze._split_sentences(CUT, engine="breeze")) == 1
+    assert f5 == pieces[1:], "everything past the cut, and nothing before it"
+    assert pieces[0] not in f5, "the heard sentence must never be repeated"
+    assert len(FakeProc.spawned) == 1 + len(f5)
+    # each filed under the engine that RENDERED it; the cut one not at all
+    assert breeze.cache.get(breeze._cache_key("breeze", CUT)) is None
+    assert breeze.cache.get(breeze._cache_key("f5", pieces[1])) is not None
+
+
+def test_a_complete_reply_whose_receipt_is_lost_is_never_re_spoken(breeze,
+                                                                   sock_path):
+    """The same door, the ambiguous case, and the one that could make him
+    hear a sentence twice.
+
+    The sidecar streamed the WHOLE reply and only then went away, so there is
+    no positive 'complete' -- but every word was heard. Nothing may be
+    re-rendered. That is what BREEZE_CHARS_PER_SECOND's x1.5 overstatement
+    buys: a complete render estimates past its own last character. The audio
+    here is the length the engine really produces for 202 characters (his own
+    log: 18.1 - 19.5 characters per second)."""
+    whole = wav_bytes(len(CUT) / 19.0)[44:]
+    srv = FakeSidecar(sock_path, _dying_handler(whole))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: f5.append(text)
+        done = breeze.speak(CUT)
+        assert done.wait(20)
+    finally:
+        srv.close()
+    assert f5 == [], "the whole reply was heard; F5 must not repeat any of it"
+    assert len(FakeProc.spawned) == 1
+    assert breeze.cache.stats()["files"] == 0    # still no receipt, no cache
+
+
+def test_the_cut_estimate_errs_towards_saying_less_never_twice():
+    """_unspoken_tail on its own. The first piece is never returned whatever
+    the arithmetic says -- audio was heard, so it was started -- and a one
+    piece chunk has nothing to salvage."""
+    t = TTS.__new__(TTS)
+    audible = tts_mod.BREEZE_MIN_HEARD_BYTES
+    pieces = t._split_sentences(CUT, engine="f5")
+    assert len(pieces) == 4
+    # cut at the audible floor: everything but the sentence in progress
+    assert t._unspoken_tail(CUT, audible) == pieces[1:]
+    # a complete render at his measured rate: nothing at all
+    complete = 44 + int(len(CUT) / 19.0 * 24000 * 2)
+    assert t._unspoken_tail(CUT, complete) == []
+    # and it is monotone in between -- more audio can only mean less to say
+    lengths = [len(t._unspoken_tail(CUT, 44 + n))
+               for n in range(0, complete, 20000)]
+    assert lengths == sorted(lengths, reverse=True)
+    # one sentence: there is no tail that was not started
+    assert t._unspoken_tail("A single clause, sir.", audible) == []
+
+
+def test_the_recovered_tail_is_not_spoken_after_he_interrupts(breeze,
+                                                              sock_path):
+    """Barge-in outranks it. A cut chunk whose tail is owed to him is still a
+    chunk he told to stop, and neither the recovery nor anything else may
+    start a player in the silence he just asked for. Every path that can
+    reach F5 here is behind a _stop_flag check; this is the one that proves
+    the new one did not slip past."""
+    gate = threading.Event()
+    audio = wav_bytes(0.42)[44:]
+
+    def handler(srv, conn, req):
+        if req.get("ping"):
+            srv.send(conn, {"ok": True, "ready": True, "graphs": True})
+            return
+        if req.get("status"):
+            srv.send(conn, {"ok": False, "error": "unknown request id"})
+            return
+        srv.send(conn, {"ok": True, "stream": True, "sr": 24000})
+        conn.sendall(tts_mod.wav_header(24000, 1, 2, None) + audio[:2000])
+        gate.wait(10)
+        conn.close()                     # it dies while he is talking over it
+
+    srv = FakeSidecar(sock_path, handler)
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: f5.append(text)
+        done = breeze.speak(CUT)
+        assert wait_until(lambda: bool(FakeProc.spawned))
+        assert wait_until(lambda: len(FakeProc.spawned[0].fed) >= 44 + 2000)
+        breeze.stop()                    # barge-in, mid-stream
+        gate.set()
+        assert done.wait(10)
+    finally:
+        gate.set()
+        srv.close()
+    assert f5 == [], "F5 spoke into the silence he asked for"
+    assert len(FakeProc.spawned) == 1
+    assert breeze.cache.stats()["files"] == 0
+
+
+# ===========================================================================
+# 12c. the phone renders through the same seam, and streams too
+#
+# Rendition shares the room's chunking on purpose -- the cache key IS the
+# chunk text, so a phone that split differently would miss every line the
+# room had already paid for. What it does NOT share is the room's player, so
+# when a chunk became a whole reply the phone's time to first byte went with
+# it: _synth_breeze waits for a finished file, and webapp's _stream_clip
+# holds the HTTP status line back until the first block exists. Measured at
+# his own rate (18.5 ch/s, RTF 0.8), a 218-character reply went from 1.35 s
+# to first byte to 9.49 s, and a capped 500-character one to 21.67 s.
+#
+# The sidecar already streams. So the phone streams.
+# ===========================================================================
+def test_the_phone_hears_the_first_block_before_the_render_is_finished(
+        breeze, sock_path):
+    line = "Two items tomorrow, sir. The first is at nine."
+    gate = threading.Event()
+    blocks = [wav_bytes(0.2)[44:], wav_bytes(0.2)[44:]]
+    srv = FakeSidecar(sock_path, sidecar_handler(blocks, gate=gate))
+    try:
+        rend = tts_mod.Rendition(breeze, line)
+        assert len(rend) == 1, "one chunk, exactly as the room would have it"
+        it = rend.stream()
+        head = next(it)
+        first = next(it)
+        # The sidecar is still holding block 2, so this cannot have waited
+        # for the render: that is the whole property.
+        assert head == tts_mod.wav_header(24000, 1, 2, None)
+        assert first and blocks[0].startswith(first)
+        gate.set()
+        assert first + b"".join(it) == blocks[0] + blocks[1]
+    finally:
+        gate.set()
+        srv.close()
+    assert FakeProc.spawned == [], "the phone must not play in the room"
+    assert breeze.cache.get(breeze._cache_key("breeze", line)) is not None
+
+
+def test_a_streamed_phone_chunk_is_cached_only_on_a_receipt(breeze,
+                                                            sock_path):
+    """The room's rule, applied at the other renderer: a clipped sentence
+    must never be filed under the finished one's key. The phone still hears
+    what was rendered -- those bytes have already left -- it simply does not
+    become the cached copy of the line."""
+    line = "Two items tomorrow, sir."
+    srv = FakeSidecar(sock_path, _dying_handler(wav_bytes(0.2)[44:]))
+    try:
+        raw = tts_mod.Rendition(breeze, line).body()
+    finally:
+        srv.close()
+    assert len(raw) > tts_mod._WAV_HEADER_BYTES, "the phone got the audio"
+    assert breeze.cache.stats()["files"] == 0
+
+
+def test_a_line_the_room_said_is_a_phone_cache_hit_and_the_reverse(
+        breeze, sock_path):
+    """Why the phone keeps the room's chunking even though a boundary is
+    worth something to it. One reply, said aloud, then asked for by the
+    phone: no socket, no GPU, no second rendering."""
+    line = ("I'm afraid my repertoire for idle chatter is somewhat limited, "
+            "sir. Perhaps we could focus on something more productive?")
+    srv = FakeSidecar(sock_path, sidecar_handler([wav_bytes(0.2)[44:]]))
+    try:
+        breeze.speak(line, block=True)
+        rend = tts_mod.Rendition(breeze, line)
+        assert rend.chunks == breeze._split_sentences(line, engine="breeze")
+        assert rend.cached is True, "the phone re-rendered what he just heard"
+        n = len(srv.requests)
+        assert len(rend.body()) > tts_mod._WAV_HEADER_BYTES
+        assert len(srv.requests) == n, "a hit must not touch the socket"
+    finally:
+        srv.close()
+
+
+def test_the_render_deadline_covers_the_longest_chunk_the_join_can_make():
+    """BREEZE_TIMEOUT_S was sized in its own comment for a 320-character
+    chunk and was not revisited when _BREEZE_STREAM_JOIN_CHARS went to 560.
+    On the NON-streaming path the socket timeout is a TOTAL deadline --
+    _breeze_request blocks in one recv until the whole render exists -- so at
+    the new ceiling a cold render would have raised instead of returning:
+    560 x 0.0594 s of audio per character x RTF 1.868 = 62.1 s, against 60.
+
+    The relation is asserted, not the number, so raising the join bound again
+    cannot quietly outgrow the deadline the way it just did."""
+    audio_per_char = 19.0 / 320          # BREEZE_TIMEOUT_S's own arithmetic
+    cold_rtf = 1.868                     # measured, first render after capture
+    worst = TTS._BREEZE_STREAM_JOIN_CHARS * audio_per_char * cold_rtf
+    assert worst > tts_mod.BREEZE_TIMEOUT_S, "the old number was not the bug"
+    assert tts_mod.BREEZE_RENDER_TIMEOUT_S > worst * 2
+    # and still well inside the sidecar's own stall deadline
+    assert tts_mod.BREEZE_RENDER_TIMEOUT_S < bs.RENDER_STALL_S
+
+
+def test_the_consumer_deadline_is_the_render_one_not_the_read_one(breeze,
+                                                                  sock_path):
+    """_play_stream_from_file (no paplay) waits stream.timeout + 5 for the
+    COMPLETE tee file, so the stream's deadline has to be the whole render's,
+    not the 60 s allowed for one read off the socket."""
+    srv = FakeSidecar(sock_path, sidecar_handler([wav_bytes(0.1)[44:]]))
+    seen = []
+    try:
+        real = tts_mod._AudioStream
+
+        def spy(*a, **kw):
+            stream = real(*a, **kw)
+            seen.append(stream)
+            return stream
+
+        tts_mod._AudioStream = spy
+        try:
+            breeze.speak("Always, sir.", block=True)
+        finally:
+            tts_mod._AudioStream = real
+    finally:
+        srv.close()
+    assert seen and seen[0].timeout == tts_mod.BREEZE_RENDER_TIMEOUT_S
 
 
 # ===========================================================================

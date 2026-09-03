@@ -803,11 +803,36 @@ BREEZE_REF_TEXT = PATHS.VOICE_REF_F5_TEXT
 BREEZE_UNIT = "jarvis-breeze.service"
 BREEZE_FALLBACK = "f5"        # must stay LOCAL, and must stay RESIDENT
 
-# Per-chunk deadline. Not FISH_TIMEOUT_S: that is 10 s for a hosted API, and
-# a 320-character Breeze chunk is ~19 s of audio at RTF 0.742, i.e. ~14 s of
-# rendering. 60 s covers even the slow first render after a graph capture
-# (measured RTF 1.868) without letting a wedged sidecar hang the TTS worker.
+# ONE READ off the streaming socket. Not FISH_TIMEOUT_S: that is 10 s for a
+# hosted API, and this covers the FIRST read, which waits out the whole
+# time-to-first-audio (0.268 s warm, seconds after a graph capture). Every
+# read after it lands ~80 ms apart, so 60 s here is not a render budget at
+# all -- it is "the sidecar has stopped answering", and it stays small on
+# purpose so a wedged GPU cannot hold the producer thread for minutes.
+#
+# It is NOT the deadline for a whole render; see BREEZE_RENDER_TIMEOUT_S,
+# which is what _synth_breeze and the consumer's wait are sized by.
 BREEZE_TIMEOUT_S = 60.0
+
+# A WHOLE render, on the non-streaming path -- _breeze_request blocks in one
+# recv until the entire chunk exists, so for _synth_breeze (prewarm, the
+# phone's per-chunk fallback, and the BREEZE_STREAM_PLAYBACK=False
+# comparison path) the socket timeout IS a total deadline. It is also the
+# consumer-side deadline carried on the breeze _AudioStream, because
+# _play_stream_from_file waits for the complete tee file before it plays a
+# byte.
+#
+# It was 60 s, sized in BREEZE_TIMEOUT_S's own comment for a 320-character
+# chunk: 19.0 s of audio at RTF 0.742, x1.868 for the slow first render
+# after a graph capture = 35.5 s, a 1.69x margin. _BREEZE_STREAM_JOIN_CHARS
+# then took a chunk to 560 characters and nobody revisited this: the same
+# arithmetic gives 560 x 0.0594 x 1.868 = 62.1 s, i.e. OVER the deadline, so
+# a cold phone or prewarm render of a full-length reply would raise instead
+# of returning. 150 s restores the margin (2.4x) and is still half the
+# sidecar's own RENDER_STALL_S=300. test_breeze_sidecar.py asserts the
+# relation rather than the number, so raising the join bound again cannot
+# quietly outgrow this the way it just did.
+BREEZE_RENDER_TIMEOUT_S = 150.0
 
 # How long to wait for the completion receipt after a stream has ended.
 #
@@ -859,6 +884,25 @@ BREEZE_STARTUP_TIMEOUT_S = 90.0
 # any phoneme, far longer than a short first read off the socket.
 BREEZE_MIN_HEARD_BYTES = _WAV_HEADER_BYTES + int(24000 * 2 * 0.02)
 
+# Characters of TEXT per second of Breeze AUDIO, used for ONE thing: working
+# out which sentences of a chunk a cut stream cannot have reached, so the
+# rest can be re-rendered on F5 instead of vanishing (TTS._unspoken_tail).
+#
+# It is deliberately 1.5x the fastest rate measured, because the two errors
+# are not symmetric. Too LOW and a sentence that was already spoken is
+# re-rendered -- the doubled half-sentence in the other voice that the whole
+# "never re-speak a heard chunk" rule exists to prevent. Too HIGH and a
+# sentence that was never spoken is skipped, which is exactly what happened
+# before this existed. So it errs high.
+#
+# From his 2026-09-02 log, matched to the wavs those renders stored:
+# 81 characters -> 4.480 s (18.1 ch/s) and 50 -> 2.560 s (19.5 ch/s). 30 is
+# ~300 words per minute, well above anything the voice actually does, so a
+# stream that in fact COMPLETED estimates past the end of its own text and
+# nothing is re-rendered -- which is what makes it safe to run this on a
+# receipt that merely failed to arrive.
+BREEZE_CHARS_PER_SECOND = 30.0
+
 # The rig the round-11 blind test rated, pinned. Every value is in the speech
 # cache key, so changing one can never replay stale audio, and every value
 # also lives in scripts/breeze_server.py -- tests/test_breeze_sidecar.py
@@ -902,7 +946,29 @@ BREEZE_PARAMS = dict(template="ref_edit_tata", instruction=BREEZE_INSTRUCTION,
 # 400 ms, not less: the sidecar runs its render worker up to
 # RENDER_QUEUE_DEPTH=4 blocks ahead of the socket, one codec frame each at
 # the checkpoint's 12.5 Hz frame rate, so a full stall of ITS buffer is
-# 0.32 s. 400 covers that without an underrun and still returns ~1.5 s.
+# 0.32 s. 400 covers that without an underrun.
+#
+# WHAT IT RETURNS, and do not re-derive this as 0.4 s. The buffer has to be
+# FILLED, and it fills at the render's rate, not instantly. The head cost of
+# one stream is therefore
+#
+#     TTFA + latency x RTF  =  0.268 + 0.400 x 0.8  =  ~0.60 s
+#
+# against 0.268 + 2.0 x 0.8 = ~1.88 s unset, so the flag buys 1.28 s per
+# stream, not 1.5 s. The same model predicts the BEFORE case from his log to
+# within milliseconds -- 0.28 + 2.0 x 0.8 + audio is 6.360 s against 6.617 s
+# observed for the 4.480 s utterance (d +0.257, paplay teardown plus the
+# 50 ms _wait_player poll) and 4.440 s against 4.449 s for the 2.560 s one
+# (d +0.009) -- so the residual is carried into the AFTER numbers too:
+#
+#   his 23:17 reply, 7.040 s of audio in two utterances
+#     observed, as shipped that night              11.07 s
+#     this flag, still two utterances              ~8.51 s   (hole ~0.86 s)
+#     this flag AND one merged stream (below)      ~7.90 s
+#
+# i.e. the flag saves ~2.56 s and the join a further ~0.6 s. An earlier
+# draft of this comment charged each boundary a flat 0.40 s and claimed
+# ~7.84 s / ~3.2 s; that undercounted the fill and dropped the teardown.
 BREEZE_PLAYER_LATENCY_MS = 400
 
 # Play a breeze chunk while it is still rendering. Module-level so a test --
@@ -2218,13 +2284,66 @@ class TTS:
             finally:
                 stream.close(failed=failed)
 
+        def _recover_tail(sent: str, nbytes: int, why: str) -> None:
+            """Speak, on the fallback engine, the part of a cut chunk that
+            cannot have been heard.
+
+            The heard prefix is still never re-rendered -- that is the
+            doubled half sentence. What changed is that "the rest" is no
+            longer thrown away with it: since _BREEZE_STREAM_JOIN_CHARS a
+            chunk is the whole reply, so silence here is silence for the
+            whole reply. See TTS._unspoken_tail for how the cut is placed.
+            """
+            tail = self._unspoken_tail(sent, nbytes)
+            if not tail:
+                log.error("breeze stream cut after %d bytes (%s); the rest of "
+                          "the chunk cannot be re-rendered without repeating "
+                          "what was heard: %.60s", nbytes, why, sent)
+                return
+            log.error("breeze stream cut after %d bytes (%s); re-rendering "
+                      "the %d unheard piece(s) on %s: %.60s",
+                      nbytes, why, len(tail), BREEZE_FALLBACK, tail[0])
+            for piece in tail:
+                if self._stop_flag or not _fallback_chunk(piece):
+                    return
+
+        # Chunks whose completion receipt is still in flight, drained in
+        # order below. The round-trip stays on its own thread (see
+        # _confirm_breeze) because it must not sit between two sentences;
+        # what is collected here is the ANSWER, which decides one more thing
+        # than it used to: a chunk the sidecar cannot confirm may have been
+        # cut, and its unheard tail is owed to him.
+        pending: list[tuple[threading.Thread, str, _AudioStream]] = []
+
+        def _drain_receipts(wait_s: float) -> None:
+            """Take the answers that are ready and act on them, in order.
+
+            ``wait_s`` is small between chunks and generous at the end of the
+            reply: a receipt is an OrderedDict lookup over AF_UNIX and is
+            normally back within a millisecond, so between two sentences this
+            costs nothing measurable -- and a sidecar that will not answer at
+            all must not put the hole back that BREEZE_RECEIPT_TIMEOUT_S and
+            _confirm_breeze's thread were introduced to remove.
+            """
+            while pending:
+                thread, sent, stream = pending[0]
+                thread.join(timeout=wait_s)
+                if thread.is_alive():
+                    return                   # still out; try again later
+                pending.pop(0)
+                if stream.failed and not self._stop_flag:
+                    _recover_tail(sent, stream.nbytes, "no completion receipt")
+
         def _stream_breeze(sent: str, tmp_name: str) -> bool:
             """Play-while-rendering for one breeze chunk. Same contract as
             _stream_fish: hand the consumer an _AudioStream BEFORE the first
             byte exists, tee every byte into ``tmp_name`` for the cache,
             return False only when the chunk must be rendered by the fallback
             engine (it failed before ANY audio reached the player)."""
-            stream = _AudioStream(tmp_name, timeout=BREEZE_TIMEOUT_S,
+            # BREEZE_RENDER_TIMEOUT_S, not BREEZE_TIMEOUT_S: this deadline is
+            # the CONSUMER's, and _play_stream_from_file spends it waiting for
+            # a whole render rather than for one read off the socket.
+            stream = _AudioStream(tmp_name, timeout=BREEZE_RENDER_TIMEOUT_S,
                                   min_heard=BREEZE_MIN_HEARD_BYTES,
                                   latency_ms=BREEZE_PLAYER_LATENCY_MS)
             wav_q.put(stream)
@@ -2244,11 +2363,14 @@ class TTS:
             except Exception:
                 log.exception("breeze stream failed: %.60s", sent)
                 stream.close(failed=True)
-                # Audio already reached the ear: re-rendering the sentence on
-                # F5 would say the first half twice, in a different voice.
-                # Lose the tail of this one chunk instead.
+                # Audio already reached the ear: re-rendering what was HEARD
+                # would say it twice, in a different voice. What was not
+                # heard is a different question, and since a chunk became a
+                # whole reply it is most of the answer -- so the sentences
+                # that lie past the cut go to F5 rather than nowhere.
                 if stream.heard:
-                    log.warning("breeze stream cut mid-chunk; not re-speaking")
+                    if not self._stop_flag:
+                        _recover_tail(sent, stream.nbytes, "the read failed")
                     return True
                 return False
             finally:
@@ -2276,9 +2398,11 @@ class TTS:
             if self._stop_flag:
                 stream.close()       # a stopped chunk is never cached anyway
                 return True
-            threading.Thread(target=_confirm_breeze, daemon=True,
-                             name="tts-breeze-receipt",
-                             args=(request_id, sent, tmp_name, stream)).start()
+            receipt = threading.Thread(
+                target=_confirm_breeze, daemon=True, name="tts-breeze-receipt",
+                args=(request_id, sent, tmp_name, stream))
+            receipt.start()
+            pending.append((receipt, sent, stream))
             return True
 
         def _fallback_chunk(sent: str) -> bool:
@@ -2314,6 +2438,12 @@ class TTS:
                 for sent in chunks:
                     if self._stop_flag:
                         break
+                    # Before this chunk's audio is queued, so a recovered
+                    # tail is spoken in its own place rather than after the
+                    # reply. 0.2 s, which a receipt beats by two orders of
+                    # magnitude and a silent sidecar does not: the answer
+                    # keeps until the drain in the finally below.
+                    _drain_receipts(0.2)
                     cached = self._cached(engine, sent)
                     if cached is not None:
                         wav_q.put((cached, False))
@@ -2398,6 +2528,14 @@ class TTS:
                         self._store(used, sent, tmp.name)
                     wav_q.put((tmp.name, True))
             finally:
+                # The last chunk's receipt has nobody after it to be drained
+                # by, and through speak() it is the ONLY chunk. Bounded by
+                # the receipt deadline the thread is already under, and paid
+                # while the consumer still has that chunk's audio to play.
+                try:
+                    _drain_receipts(BREEZE_RECEIPT_TIMEOUT_S + 1.0)
+                except Exception:
+                    log.exception("breeze receipt drain failed")
                 wav_q.put(_DONE)
 
         producer = threading.Thread(
@@ -2544,12 +2682,16 @@ class TTS:
     # 560 = MAX_SPEAK_LENGTH x 1.12. The cap is applied to the text BEFORE
     # the pronunciation pass, which was measured expanding his real calendar
     # and course lines by at most x1.045 ("ENGR" -> "Engineering"), so this
-    # leaves every reply the room can speak in one chunk with margin. It is
-    # deliberately not unbounded: a Breeze stream cut after its first audible
-    # byte is never re-spoken (_stream_breeze -- re-rendering it on F5 would
-    # say the first half twice, in the other voice), so the chunk is what
-    # bounds how much of a long reading is lost to one cut. It is also far
-    # inside the sidecar's own ceiling: max_new_tokens=1500 at the
+    # leaves every reply the room can speak in one chunk with margin.
+    #
+    # It is still bounded, but NOT because the chunk bounds the loss on a cut
+    # stream any more -- through speak() there is exactly one chunk, so that
+    # would bound nothing, and the first draft of this comment claiming
+    # otherwise was wrong. What bounds the loss is TTS._unspoken_tail: the
+    # heard prefix is never re-spoken, and everything past the cut is
+    # re-rendered on F5. The bound that remains is BREEZE_RENDER_TIMEOUT_S,
+    # which is sized against this number and asserted against it. It is also
+    # far inside the sidecar's own ceiling: max_new_tokens=1500 at the
     # checkpoint's 12.5 Hz frame rate is 120 s of audio, against ~31 s here.
     _BREEZE_STREAM_JOIN_CHARS = int(MAX_SPEAK_LENGTH * 1.12)
 
@@ -2659,6 +2801,49 @@ class TTS:
                 else:
                     out.append(piece)
         return out or [text]
+
+    def _unspoken_tail(self, text: str, nbytes: int) -> list[str]:
+        """The chunks of ``text`` a Breeze stream cut at ``nbytes`` cannot
+        have reached, ready to be re-rendered on the fallback engine.
+
+        WHY THIS EXISTS. A stream cut after its first audible byte is never
+        re-spoken whole: half of it has already been heard, and rendering
+        the same sentence on F5 would say that half twice, in the other
+        voice. That rule was written when a chunk WAS a sentence, so the
+        loss it accepted was a sentence. _BREEZE_STREAM_JOIN_CHARS made a
+        chunk the whole reply, and the same rule then silently dropped up to
+        87% of it -- 20 ms of audio is enough to make a stream "heard", so a
+        sidecar that died a fifth of a second into a briefing cost the whole
+        briefing, with nothing but a log line.
+
+        So bound the loss by ARITHMETIC instead of by the chunk. 24 kHz
+        PCM16 is 48000 bytes of audio per second, and BREEZE_CHARS_PER_SECOND
+        turns that into a position in the text -- deliberately overstated, so
+        the sentence straddling the cut is skipped along with everything
+        before it and only sentences that lie WHOLLY past it come back. A
+        stream that actually completed estimates past its own last character
+        and yields nothing, which is what lets a caller run this on a receipt
+        that merely failed to arrive rather than on a positive truncation.
+
+        The offsets are counted off the chunk list, not searched for in
+        ``text``: a merge rewrites runs of whitespace to a single space, so
+        a str.find would be exact only sometimes, and against a x1.5 rate
+        estimate the difference is noise.
+        """
+        pieces = self._split_sentences(text, engine=BREEZE_FALLBACK)
+        if len(pieces) < 2:
+            return []            # nothing to salvage that was not started
+        heard_s = max(0, int(nbytes) - _WAV_HEADER_BYTES) / float(
+            int(BREEZE_PARAMS["sr"]) * 2)
+        spoken = heard_s * BREEZE_CHARS_PER_SECOND
+        tail, pos = [], 0
+        for i, piece in enumerate(pieces):
+            # i, never 0: audio was heard, so the first piece was started
+            # whatever the arithmetic says.
+            if i and pos >= spoken:
+                tail.append(piece)
+            pos += len(piece) + 1
+        return tail
 
     # --------------------------------------------------------- envelope
     def _start_amp_feeder(self, wav_path: str):
@@ -2935,7 +3120,8 @@ class TTS:
         same line are level-identical.
         """
         resp = _breeze_request({"text": text, "out": out_path,
-                                "gain": output_gain_for("breeze")})
+                                "gain": output_gain_for("breeze")},
+                               timeout=BREEZE_RENDER_TIMEOUT_S)
         if not resp.get("ok"):
             raise RuntimeError(f"breeze synthesis failed: {resp.get('error')}")
         if not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
@@ -3065,6 +3251,28 @@ def wav_header(rate: int, channels: int = 1, sampwidth: int = 2,
             b"data" + struct.pack("<I", data))
 
 
+def wav_split_header(head: bytes) -> Optional[tuple[tuple[int, int, int],
+                                                    bytes]]:
+    """``((rate, channels, sampwidth), pcm)`` for a wav arriving in PIECES.
+
+    The file readers above need a complete file; this is for the seam where
+    one does not exist yet -- the phone renderer forwarding a Breeze stream
+    it is still receiving. It understands exactly the 44-byte layout
+    ``wav_header`` writes (which is also what the sidecar writes, asserted
+    both ways by test_breeze_sidecar.py) and returns None until that many
+    bytes have arrived, or if they are not that header.
+    """
+    if len(head) < _WAV_HEADER_BYTES:
+        return None
+    if (head[:4] != b"RIFF" or head[8:16] != b"WAVEfmt "
+            or head[36:40] != b"data"):
+        return None
+    _, channels, rate, _, _, bits = struct.unpack("<HHIIHH", head[20:36])
+    if not (channels and rate and bits and bits % 8 == 0):
+        return None
+    return (int(rate), int(channels), int(bits) // 8), head[_WAV_HEADER_BYTES:]
+
+
 def wav_pcm(path: str) -> tuple[tuple[int, int, int], bytes]:
     """``((rate, channels, sampwidth), pcm)`` for one rendered chunk.
 
@@ -3094,11 +3302,25 @@ class Rendition:
 
     Built from the same steps ``speak()`` takes, so the cache keys match the
     room's exactly: a line Jarvis has already said aloud is already on disk
-    here. When every chunk is a hit, ``cached`` is True and ``body()`` is a
-    few file reads -- the phone gets a real Content-Length and can seek.
-    When it is not, ``stream()`` renders chunk by chunk and yields each one
-    as it lands, so the first sentence is on its way to the phone while the
-    second is still on the GPU.
+    here. The chunking is the room's too, and must stay so -- the cache key
+    IS the chunk text, and a phone that split differently would miss every
+    line the room had already paid for.
+
+    When every chunk is a hit, ``cached`` is True and ``body()`` is a few
+    file reads -- the phone gets a real Content-Length and can seek. When it
+    is not, ``stream()`` yields audio as it is produced.
+
+    TIME TO FIRST BYTE is what that last sentence is for, and how it is
+    earned depends on the engine. F5, XTTS and edge render a whole chunk
+    before a byte of it exists, so their first bytes arrive one chunk in.
+    Breeze does not: it streams, so ``stream()`` forwards its blocks as they
+    land and the phone hears the reply ~0.3 s in whatever its length. That
+    matters here more than it does in the room, because
+    _BREEZE_STREAM_JOIN_CHARS made a reply one chunk -- correctly, for a
+    player that streams; ruinously for a reader that waited for a finished
+    file, which is what this used to be (a 218-character reply went from
+    1.35 s to first byte to 9.49 s, and webapp's _stream_clip holds the HTTP
+    status line back until then).
     """
 
     def __init__(self, tts: "TTS", text: str):
@@ -3162,6 +3384,9 @@ class Rendition:
                 raise RuntimeError("no speech engine is available")
             self._replan()
         for chunk, cached in self.plan:
+            if cached is None and self._streams():
+                yield from self._stream_chunk(chunk)
+                continue
             path, owned = cached, False
             if path is None:
                 path = self._synth(chunk)
@@ -3195,6 +3420,75 @@ class Rendition:
             yield pcm
 
     # ----------------------------------------------------------- private
+    def _streams(self) -> bool:
+        """True when this engine can be read while it is still rendering.
+
+        Only breeze, and only on the same flag the room's player uses --
+        with BREEZE_STREAM_PLAYBACK off, the sidecar's non-streaming mode is
+        the whole point and _synth_breeze is the right call.
+        """
+        return self.engine == "breeze" and BREEZE_STREAM_PLAYBACK
+
+    def _stream_chunk(self, chunk: str) -> Iterator[bytes]:
+        """One chunk, forwarded from the sidecar block by block.
+
+        Tees into a temp wav and files it under the rendering engine exactly
+        as _synth does, so the room and a second phone still get the cache
+        entry -- but ONLY on a positive completion receipt, the same rule
+        _speak_pipelined applies: a clipped sentence must never be filed as
+        the finished one. Nothing is re-rendered on failure here, because
+        (unlike the room) the bytes have already left for the phone.
+        """
+        request_id = _breeze_request_id()
+        tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        tmp.close()
+        head, started, whole = b"", False, False
+        try:
+            with open(tmp.name, "wb") as fh:
+                for data in _breeze_iter(chunk, output_gain_for("breeze"),
+                                         BREEZE_TIMEOUT_S,
+                                         request_id=request_id, verify=False):
+                    fh.write(data)
+                    if started:
+                        yield data
+                        continue
+                    head += data
+                    split = wav_split_header(head)
+                    if split is None:
+                        continue
+                    fmt, pcm = split
+                    started = True
+                    if self._fmt is None:
+                        self._fmt = fmt
+                        yield wav_header(*fmt)
+                    elif fmt != self._fmt:
+                        # see stream(): a rate change mid-clip sounds like a
+                        # fault in HIM, so the chunk is dropped instead
+                        log.warning("breeze chunk is %s, not %s; dropped",
+                                    fmt, self._fmt)
+                        return
+                    if pcm:
+                        yield pcm
+            _breeze_receipt(request_id)
+            whole = True
+        except Exception:
+            log.exception("breeze render failed: %.60s", chunk)
+        finally:
+            try:
+                if whole:
+                    self.tts._store(self.engine, chunk, tmp.name)
+                elif started:
+                    log.warning("breeze chunk not confirmed complete — not "
+                                "caching: %.60s", chunk)
+                else:
+                    log.warning("breeze produced no audio for %.60s", chunk)
+            finally:
+                try:
+                    os.unlink(tmp.name)
+                except OSError:
+                    log.debug("render temp unlink failed: %s", tmp.name,
+                              exc_info=True)
+
     def _replan(self):
         """``load()`` may have changed the engine under us (f5 sidecar down
         -> xtts, fish without credentials -> f5). The cache is keyed on the
