@@ -1248,6 +1248,53 @@ class MainWindow:
         # relwidth/relheight cover exactly that panel — no fractions of the
         # shell to drift out of step with the layout.
         self.room = RoomSlab(self.transcript)
+        # The SENSORS page (jarvis/ui/sensors_page.py) covers the whole
+        # stage — the reactor AND the transcript. It asks for ~940 device
+        # px at his window and scale and the transcript alone is ~420, so
+        # over the transcript its bands and SAVE button fell off the bottom
+        # (measured on scripts/ui_shots.py). It measures that span itself
+        # from the two widgets handed to it, so a hidden footer or a packed
+        # camera pane cannot put it out of step.
+        self.sensors = self._build_sensors()
+
+    def _build_sensors(self):
+        """The SENSORS page, or None.
+
+        Imported HERE rather than at module scope so a diagnostics surface
+        can never be the reason the console fails to start -- the same rule
+        _build_preview follows. The camera reaches the page as NUMBERS:
+        PreviewWorker.status() is built from PreviewShot.numbers_only(),
+        which excludes the image by name, so no code path exists by which a
+        frame could arrive on that surface.
+        """
+        try:
+            from jarvis.ui.sensors_page import SensorsPage
+            return SensorsPage(self.shell, services=self.services,
+                               camera_status=self._camera_numbers,
+                               cover=(self.reactor, self.transcript))
+        except Exception:                     # noqa: BLE001 - optional lane
+            log.exception("sensors page could not be built")
+            return None
+
+    def _camera_numbers(self) -> dict:
+        """The preview worker's numbers-only status, or {} when there is no
+        worker (no vision lane, camera.preview off, the pane failed to
+        build). {} renders as "camera not running", never as an empty room."""
+        worker = getattr(self, "preview_worker", None)
+        if worker is None or not hasattr(worker, "status"):
+            return {}
+        try:
+            return dict(worker.status())
+        except Exception:                     # noqa: BLE001 - provider edge
+            log.debug("camera status unavailable", exc_info=True)
+            return {}
+
+    def sensors_toggle(self):
+        """Show/hide the SENSORS page. F9, and the one seam a voice command
+        or a future header tab would call."""
+        page = getattr(self, "sensors", None)
+        if page is not None:
+            page.toggle()
 
     def _build_footer(self):
         self.status_strip = StatusStrip(
@@ -1438,6 +1485,12 @@ class MainWindow:
         self.root.bind("<F5>", lambda e: self._toggle_recording())
         self.root.bind("<space>", self._on_space)
         self.root.bind("<Escape>", lambda e: self._minimize_to_tray())
+        # The SENSORS page. F9 because every nearer key is spoken for --
+        # F5 is the hotword daemon's synthetic keypress, space is the mic,
+        # Escape is the tray -- and because the header has 13 px to spare
+        # at his 920-px window (tests/test_header_fit.py), so a [SENSORS]
+        # tab up there would cost him the sensing badge.
+        self.root.bind("<F9>", lambda e: self.sensors_toggle())
 
     def _on_space(self, event):
         focused = self.root.focus_get()
@@ -1654,6 +1707,13 @@ class MainWindow:
                 self.preview_worker.stop()
         except Exception:
             log.exception("camera preview stop failed")
+        # The sensors page's poll thread, for the same reason: a quit that
+        # left it running would keep hitting the ESP32 on the way out.
+        try:
+            if getattr(self, "sensors", None) is not None:
+                self.sensors.hide()
+        except Exception:
+            log.exception("sensors page stop failed")
         if self.board is not None:
             try:
                 self.board.destroy()
