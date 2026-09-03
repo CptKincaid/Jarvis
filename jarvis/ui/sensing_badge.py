@@ -8,11 +8,23 @@ case, because the absence of a badge and a badge saying SENSING would be
 indistinguishable from across the room.
 
 THREE STATES, TOLD APART THREE WAYS. The word carries it in text
-("SENSING" / "CAMERA OFF" / "OFFLINE"), the dot carries it in colour
+("SENSING" / "CAM OFF" / "OFFLINE"), the dot carries it in colour
 (cyan live, amber restricted), and OFFLINE additionally carries it in
 SHAPE -- a hollow dot, i.e. nothing lit. Colour alone would not survive a
 dimmed monitor or a colour-blind glance, and this is the one readout in
 the app where being wrong is not a cosmetic bug.
+
+WHAT 2026-09-03 TOOK, AND WHAT IT REFUSED TO TAKE. The header ran out of
+room (tests/test_header_fit.py: 312 px for this chip and the state pill
+together, 485 asked) and he ruled the wordmark out of paying for it. So
+this chip gave up chip padding and one word -- "CAMERA OFF" -> "CAM OFF",
+seven glyphs like the other two -- and NOTHING else: same SIZE_CAPTION
+face, same dot, same capsule, all three tell-apart channels intact, so
+what a glance from across the room sees is unchanged. The unabbreviated
+reason ("camera off until 7 am (curfew)") stays on ``badge_caption``,
+which MainWindow feeds the badge's tooltip on every refresh. The pill
+paid the rest of the bill; its state is also on the reactor, the
+transcript and its own dot, and this one is not.
 
 Everything a screenshot review would argue about is a pure function here
 (``badge_tone`` / ``badge_word`` / ``badge_colors`` / ``badge_caption``),
@@ -40,7 +52,9 @@ TONE_ON = "on"
 TONE_CURFEW = "curfew"
 TONE_OFF = "off"
 
-WORDS = {TONE_ON: "SENSING", TONE_CURFEW: "CAMERA OFF", TONE_OFF: "OFFLINE"}
+# Seven glyphs in every tone: the chip barely twitches between states,
+# so it reads as one steady mark rather than a thing that jumps.
+WORDS = {TONE_ON: "SENSING", TONE_CURFEW: "CAM OFF", TONE_OFF: "OFFLINE"}
 
 
 def normalise(obj: Any) -> dict:
@@ -146,11 +160,11 @@ class SensingBadge(tk.Canvas):
     in holo, filled slab in classic) so it cannot be the one widget in the
     header that renders wrong in one of the looks."""
 
-    HEIGHT, PAD_X, DOT, GAP = 26, 10, 8, 6      # design units, == StatePill
+    HEIGHT, PAD_X, DOT, GAP = 26, 6, 8, 5       # design units, == StatePill
 
     def __init__(self, parent, bg=None):
         bg = bg or parent.cget("bg")
-        self._font = ui_display(theme.SIZE_CAPTION, "semibold")
+        self._font = self.font()
         self._pill_h = px(self.HEIGHT)
         self._pill_w = 0
         self._tone = TONE_ON
@@ -163,8 +177,20 @@ class SensingBadge(tk.Canvas):
         self._fit()
 
     @classmethod
+    def font(cls) -> tuple:
+        """The chip face, read from theme at CALL time. Identical to
+        StatePill.font(): the two header chips are one type size."""
+        return ui_display(theme.SIZE_CAPTION, "semibold")
+
+    @classmethod
+    def chip_w(cls, text_w: int) -> int:
+        """Capsule width around `text_w` px of word (pure). One formula
+        for the drawn chip and the budgeted chip."""
+        return text_w + 2 * px(cls.PAD_X) + px(cls.DOT) + px(cls.GAP)
+
+    @classmethod
     def widest_w(cls) -> int:
-        """Chip width for the WIDEST of the three words ('CAMERA OFF'), in
+        """Chip width for the WIDEST of the three words ('CAM OFF'), in
         the current look/scale.
 
         The header budgets around this rather than the current word: the
@@ -175,16 +201,16 @@ class SensingBadge(tk.Canvas):
         sensing is underneath the ready symbol": 124 px of 168, its word
         sheared off flush against the wordmark, and 41 px of 214 with the
         pill on LISTENING…. Budgeting for the widest keeps it from coming
-        back at 21:00 when the curfew turns the word into CAMERA OFF --
-        and an unmapped privacy badge is the failure this class exists to
+        back at 21:00 when the curfew turns the word into CAM OFF -- and
+        an unmapped privacy badge is the failure this class exists to
         prevent, since absence and SENSING must never look the same.
         """
-        font = ui_display(theme.SIZE_CAPTION, "semibold")
+        font = cls.font()
         try:
             text_w = max(measure(font, word) for word in WORDS.values())
         except Exception:  # noqa: BLE001 - no font metrics without a root
             text_w = px(7) * max(len(word) for word in WORDS.values())
-        return text_w + 2 * px(cls.PAD_X) + px(cls.DOT) + px(cls.GAP)
+        return cls.chip_w(text_w)
 
     def _measure(self, word: str) -> int:
         try:
@@ -195,8 +221,7 @@ class SensingBadge(tk.Canvas):
     def _fit(self):
         colors = badge_colors(self._tone)
         pill_h = self._pill_h
-        pill_w = (self._measure(self._word_text) + 2 * px(self.PAD_X)
-                  + px(self.DOT) + px(self.GAP))
+        pill_w = self.chip_w(self._measure(self._word_text))
         self._pill_w = pill_w
         self.delete("badge")
         self.configure(width=pill_w)

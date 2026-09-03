@@ -794,18 +794,31 @@ class Chip(tk.Canvas):
 # --------------------------------------------------------------- StatePill
 class StatePill(tk.Canvas):
     """The single app-state site: a chamfered RAISED slab holding a state
-    dot + the state word (display SIZE_LABEL semibold). The slab hugs the
-    CURRENT word (re-measured on every set_state) — packed on the right,
-    it grows leftward into the empty header centre, so the gear beside it
-    never moves; words are never ellipsized.
-    set_state(word, dot_color, word_color)."""
+    dot + the state word (display SIZE_CAPTION semibold). The slab hugs
+    the CURRENT word (re-measured on every set_state) — packed on the
+    right, it grows leftward into the empty header centre, so the gear
+    beside it never moves; words are never ellipsized.
+    set_state(word, dot_color, word_color).
 
-    WORDS = ("READY", "LISTENING…", "THINKING…", "SPEAKING", "ERROR")
-    HEIGHT, PAD_X, DOT, GAP = 26, 12, 8, 6     # design units
+    SIZE_CAPTION, not SIZE_LABEL, and PAD_X 6 rather than 12, since
+    2026-09-03. The header has 312 px for this chip and the sensing badge
+    TOGETHER at his 920-px window once the full wordmark and the window
+    chrome are paid for, and the old pair asked 485 of them: Tk answered
+    by truncating the badge, which is the one readout in the app whose
+    absence must not look like its resting state. He ruled the wordmark
+    out of the negotiation ("dont make jarvis smaller, just make ready
+    and sensing smaller to fit"), so the pill -- whose state the reactor,
+    the transcript and the dot beside the word all say as well -- pays,
+    and the badge keeps its word. See tests/test_header_fit.py; the chip
+    now matches SensingBadge in both face and geometry, which is why
+    chip_w/font live here as pure classmethods."""
+
+    WORDS = ("READY", "LISTEN", "THINK", "SPEAK", "ERROR")
+    HEIGHT, PAD_X, DOT, GAP = 26, 6, 8, 5      # design units, == SensingBadge
 
     def __init__(self, parent, bg=None):
         bg = bg or parent.cget("bg")
-        self._font = ui_display(theme.SIZE_LABEL, "semibold")
+        self._font = self.font()
         # (never `self._w` / `self._h`: tkinter's Misc uses _w for the Tcl
         # path name)
         self._pill_h = px(self.HEIGHT)
@@ -820,26 +833,37 @@ class StatePill(tk.Canvas):
         self._fit(self._word_text)
 
     @classmethod
+    def font(cls) -> tuple:
+        """The chip face, read from theme at CALL time (a def default or a
+        class-body constant would freeze the import-time look)."""
+        return ui_display(theme.SIZE_CAPTION, "semibold")
+
+    @classmethod
+    def chip_w(cls, text_w: int) -> int:
+        """Slab width around `text_w` px of word (pure). One formula, used
+        by _fit and by widest_w, so the drawn chip and the budgeted chip
+        can never disagree."""
+        return text_w + 2 * px(cls.PAD_X) + px(cls.DOT) + px(cls.GAP)
+
+    @classmethod
     def widest_w(cls, words=None) -> int:
         """Slab width for the WIDEST state word, in the current look/scale.
 
-        The header budgets its wordmark against this and never against the
-        current word: a bar laid out around 'READY' clips its last-packed
-        child the moment the pill says 'LISTENING…', and a wordmark that
-        resized on every state change would flicker on every wake. `words`
-        takes the
-        caller's actual vocabulary -- main_window.STATE_WORDS carries two
-        (WAITING / WORKING) that this class constant does not, and a
-        budget quietly measuring the wrong list is how the clipping would
-        come back. Falls back to _measure's estimate with no root.
+        The header budgets against this and never against the current
+        word: a bar laid out around 'READY' clips its last-packed child
+        the moment the pill says 'LISTEN'. `words` takes the caller's
+        actual vocabulary -- main_window.STATE_WORDS carries two (WAIT /
+        WORK, the Claude-task states) that this class constant does not,
+        and a budget quietly measuring the wrong list is how the clipping
+        would come back. Falls back to _measure's estimate with no root.
         """
         words = tuple(words or cls.WORDS)
-        font = ui_display(theme.SIZE_LABEL, "semibold")
+        font = cls.font()
         try:
             text_w = max(measure(font, word) for word in words)
         except Exception:
             text_w = px(8) * max(len(word) for word in words)
-        return text_w + 2 * px(cls.PAD_X) + px(cls.DOT) + px(cls.GAP)
+        return cls.chip_w(text_w)
 
     def _measure(self, word: str) -> int:
         try:
@@ -851,8 +875,7 @@ class StatePill(tk.Canvas):
         """Resize the slab to `word` and rebuild its chrome (the canvas
         width changes, so the chamfer/catch-light must be redrawn)."""
         pill_h = self._pill_h
-        pill_w = (self._measure(word) + 2 * px(self.PAD_X) + px(self.DOT)
-                  + px(self.GAP))
+        pill_w = self.chip_w(self._measure(word))
         if pill_w == self._pill_w and self._word is not None:
             return
         self._pill_w = pill_w

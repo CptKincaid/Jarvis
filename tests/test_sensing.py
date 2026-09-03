@@ -457,7 +457,7 @@ def test_the_curfew_closes_a_camera_that_is_already_open(tmp_path):
     This is the control that runs unattended every night, and CameraGate
     only re-checks permission inside open(): a lens opened at 20:59 is
     still physically open at 21:00 unless something walks the devices on
-    the clock. Meanwhile the badge has already flipped to CAMERA OFF --
+    the clock. Meanwhile the badge has already flipped to CAM OFF --
     the exact lie the feature exists to prevent.
     """
     dev = FakeCamera()

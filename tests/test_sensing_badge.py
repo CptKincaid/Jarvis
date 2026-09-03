@@ -40,9 +40,24 @@ def test_the_three_states_map_to_three_tones():
 
 def test_the_word_says_the_state_not_the_feature_name():
     assert badge_word(_state()) == "SENSING"
-    assert badge_word(_state(camera=False, reason="curfew")) == "CAMERA OFF"
+    assert badge_word(_state(camera=False, reason="curfew")) == "CAM OFF"
     assert badge_word(_state(camera=False, radar=False, offline=True,
                              reason="offline")) == "OFFLINE"
+
+
+def test_every_word_is_seven_glyphs_so_the_chip_does_not_twitch():
+    """'CAMERA OFF' became 'CAM OFF' on 2026-09-03 to fit a header that
+    may not shrink its wordmark. Seven glyphs in every tone means the
+    capsule barely changes width between states (145/150/151 px at S=2),
+    so it reads as one steady mark rather than a thing that jumps -- and
+    it is still a WORD, not a bare dot, which is the whole reason this
+    readout is in the header. The unabbreviated reason stays reachable on
+    badge_caption, which MainWindow feeds the badge's tooltip."""
+    from jarvis.ui.sensing_badge import WORDS
+    assert {len(word) for word in WORDS.values()} == {7}
+    curfew = _state(camera=False, reason="curfew", curfew=((21, 0), (7, 0)))
+    assert badge_word(curfew) == "CAM OFF"
+    assert badge_caption(curfew).startswith("camera off until")
 
 
 def test_a_dict_from_the_policy_status_reads_the_same_as_the_state():

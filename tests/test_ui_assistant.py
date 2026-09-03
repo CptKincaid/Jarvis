@@ -43,10 +43,13 @@ def test_resolve_state_precedence_with_claude_states():
 
 
 def test_state_words_and_colours():
-    assert STATE_WORDS["working"] == "WORKING"
-    assert STATE_WORDS["waiting"] == "WAITING"
+    assert STATE_WORDS["working"] == "WORK"
+    assert STATE_WORDS["waiting"] == "WAIT"
+    # <= 6, not <= 10, since 2026-09-03: the header keeps 312 px for this
+    # chip and the sensing badge together at his 920-px window and the
+    # wordmark is not allowed to yield (tests/test_header_fit.py).
     for word in STATE_WORDS.values():
-        assert word.isupper() and len(word) <= 10
+        assert word.isupper() and len(word) <= 6
     assert theme.STATE_COLORS["working"] == theme.CYAN_DIM
     assert theme.STATE_COLORS["waiting"] == theme.WARN
     # the word stays FOCAL for idle / working / waiting (dot carries colour)

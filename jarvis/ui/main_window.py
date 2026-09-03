@@ -48,7 +48,7 @@ operations are invoked on daemon threads by the drawer; start/stop/quit are
 called on the Tk thread and must return quickly.
 
 Assistant events (jarvis.events) the window renders: ClaudeTaskState →
-header pill WORKING / WAITING + terminal-button ring (which also draws
+header pill WORK / WAIT + terminal-button ring (which also draws
 `open` while a terminal is attached to a jarvis-* session); ClaudeProgress
 → compact progress card; ActiveProject → status-bar PROJECT chip +
 terminal tooltip; ApprovalRequested / ApprovalResolved → approval card;
@@ -94,9 +94,9 @@ from jarvis.ui.console_mode import (ACTIVE, STANDBY, ConsoleModes, DeskWatch,
 from jarvis.ui.reactor import Reactor
 from jarvis.ui.sensing_badge import SensingBadge, sensing_failsafe_state
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
-                             TranscriptView, fit_placeholder, standby_alpha)
+                             TranscriptView, standby_alpha)
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, StatePill,
-                               Toast, Tooltip, measure, px, set_scale,
+                               Toast, Tooltip, px, set_scale,
                                ui_display, ui_mono)
 
 log = get_logger("ui.main_window")
@@ -104,22 +104,29 @@ log = get_logger("ui.main_window")
 # Design units at the 96-dpi baseline; scaled by S at runtime.
 DEFAULT_W, DEFAULT_H = 520, 880
 DEFAULT_GEOMETRY = f"{DEFAULT_W}x{DEFAULT_H}"
-# Header wordmark, widest form first. The header is over-subscribed at his
-# saved 920-px window (2026-09-02: Tk truncated the sensing badge, packed
-# last, to 124 px of its 168, flush against the wordmark), and the
-# wordmark is the only thing in the bar carrying no information, so it is
-# what steps down — tracked, untracked, monogram, gone. See
-# MainWindow._fit_wordmark and views.header_spans.
-WORDMARK_FORMS = ("J A R V I S", "JARVIS", "J", "")
+# Header wordmark. ONE form, drawn whole in every state at every width
+# the window allows. The 2026-09-02 remedy for an over-subscribed header
+# stepped it down — tracked, untracked, monogram, gone — and he rejected
+# that on sight: "dont make jarvis smaller, just make ready and sensing
+# smaller to fit". So its 322 px (PAD + canvas) are now a FIXED claim on
+# the bar and the two chips were compressed to live inside what is left;
+# tests/test_header_fit.py does the arithmetic, MainWindow._check_header_fit
+# says so in the log if a future header child ever breaks it again.
+WORDMARK = "J A R V I S"
 MIN_W, MIN_H = 460, 720
 
-# StatePill words (uppercase, <= 10 chars, never ellipsized). OFFLINE is
-# reserved — no event drives it today, so it is never shown. WORKING /
-# WAITING come from ClaudeTaskState (a Claude task running / blocked on a
-# permission question).
-STATE_WORDS = {"idle": "READY", "listening": "LISTENING…",
-               "thinking": "THINKING…", "speaking": "SPEAKING",
-               "waiting": "WAITING", "working": "WORKING",
+# StatePill words (uppercase, <= 6 chars, never ellipsized). SHORT since
+# 2026-09-03: the header keeps 312 px for the pill and the sensing badge
+# together at his 920-px window, and 'LISTENING…' alone was 271 of them —
+# Tk paid for that by shearing the badge, the one readout whose absence
+# must not look like its resting state. The word here only has to NAME
+# the state: the dot beside it carries the colour, the reactor carries
+# the motion, and the transcript carries the content. WORK / WAIT come
+# from ClaudeTaskState (a Claude task running / blocked on a permission
+# question).
+STATE_WORDS = {"idle": "READY", "listening": "LISTEN",
+               "thinking": "THINK", "speaking": "SPEAK",
+               "waiting": "WAIT", "working": "WORK",
                "error": "ERROR"}
 WARN_HOLD_S = 4.0            # warn Status: pill dot amber for this long
 ERROR_HOLD_S = 6.0           # error Status: pill ERROR until ok/info or this
@@ -909,12 +916,12 @@ class MainWindow:
         # spacing is baked into the string. The most focal text in the app
         # is WHITE per the film budget (cyan is structure, never the
         # star), with a 1px dim-cyan hologram-fringe ghost offset behind.
-        # It is also the ONLY thing in the bar carrying no information, so
-        # it is what yields when the bar runs short (_fit_wordmark).
+        # Drawn ONCE, whole, and never refitted: it does not yield to the
+        # bar, the chips do (2026-09-03, his call).
         self._wordmark = tk.Canvas(header, width=px(160), height=px(40),
                                    bg=theme.BG, highlightthickness=0, bd=0)
         self._wm_text = None
-        self._draw_wordmark(WORDMARK_FORMS[0])
+        self._draw_wordmark(WORDMARK)
         self._wordmark.pack(side="left", padx=(theme.PAD, 0))
 
         self._close_btn = RoundButton(header, text="✕", kind="ghost",
@@ -957,12 +964,14 @@ class MainWindow:
         # the tail of the word sheared off, flush against the wordmark;
         # 41 px of 214 in his worst state. Nothing is misaligned (both
         # chips declare the same 26-unit height and pack centres them);
-        # his 918-px header is simply 44 px short at rest and 173 short
-        # in the worst state. So the wordmark is refitted to whatever is
-        # left, and the badge — a privacy readout whose absence must
-        # never look like SENSING — stays whole.
+        # the bar was simply over-subscribed. It no longer is: the two
+        # chips were compressed to 280 px of the 312 the wordmark and the
+        # window chrome leave (tests/test_header_fit.py). Nothing here
+        # resizes anything any more — the binding only NOTICES, in the
+        # log, if a header child added later spends that 32-px margin.
+        self._header_short = None
         header.bind("<Configure>", self._on_header_resize, add=True)
-        self._fit_wordmark()
+        self._check_header_fit()
 
         # atmosphere: the header ground is a soft gradient (sheen behind
         # the wordmark, settling flat to the right) — flat-bg children are
@@ -1041,22 +1050,6 @@ class MainWindow:
         if bb:                    # fit exactly — don't starve the status
             canvas.configure(width=bb[2] + gh + 1)
 
-    def _wordmark_options(self) -> list:
-        """[(form, canvas width)] for WORDMARK_FORMS, widest first.
-
-        The canvas _draw_wordmark ends up with is sized from the text
-        item's BBOX, whose right edge sits one pixel past the measured
-        advance — hence the `+ 1`, without which every option here reads
-        one pixel narrower than the thing it is budgeting for.
-        """
-        font = ui_display(theme.SIZE_WORDMARK, "semibold")
-        gh = max(1, px(1))
-        out = []
-        for form in WORDMARK_FORMS:
-            out.append((form, px(2) + measure(font, form) + 1 + gh + 1)
-                       if form else (form, 1))
-        return out
-
     @staticmethod
     def _padx_total(child) -> int:
         """Total horizontal pack padding one header child claims.
@@ -1065,7 +1058,7 @@ class MainWindow:
         16 on the right only, and a reserve that guessed would be wrong in
         one direction or the other; pack_info() is the only thing that
         knows. Anything unreadable counts as zero — an under-count costs a
-        wider wordmark, never a clipped chip, because the chips are
+        quieter log line, never a clipped chip, because the chips are
         measured at their widest here.
         """
         try:
@@ -1081,27 +1074,29 @@ class MainWindow:
             return 0
         return sum(vals) if len(vals) > 1 else vals[0] * 2
 
-    def _wordmark_reserve(self) -> int:
-        """Header pixels every OTHER child claims, at its WIDEST, plus the
-        gap the wordmark keeps clear of them.
+    def _cluster_w(self) -> int:
+        """Header pixels every child except the wordmark claims, at its
+        WIDEST, plus the gap the wordmark keeps clear of them.
 
         Walked off the header's own pack list rather than a hand-written
-        one. A child this budget misses is a chip Tk truncates and, one
-        child further along, a chip Tk stops drawing (views.header_spans)
-        — and the child most likely to be added here next is a camera
-        preview on a sibling branch. Walking cannot rot that way.
+        one. A child this misses is a chip Tk truncates and, one child
+        further along, a chip Tk stops drawing (views.header_spans) — and
+        the child most likely to be added here next is a camera preview
+        on a sibling branch. Walking cannot rot that way.
 
-        The two chips are measured at their widest WORD, never the current
-        one: a header laid out around READY/SENSING fits 'JARVIS' and cuts
-        the badge in half the moment the pill says LISTENING… or the
-        curfew turns the badge into CAMERA OFF, and a wordmark that
-        resized on every state change would flicker on every wake.
+        The two chips are measured at their widest WORD, never the
+        current one: a bar that fitted around READY/SENSING and cut the
+        badge in half the moment the curfew said CAM OFF is exactly the
+        2026-09-02 defect.
         """
         widest = {}
         if getattr(self, "pill", None) is not None:
             widest[str(self.pill)] = StatePill.widest_w(STATE_WORDS.values())
         if getattr(self, "sensing_badge", None) is not None:
             widest[str(self.sensing_badge)] = SensingBadge.widest_w()
+        # theme.PAD_S is ALREADY device pixels here -- theme.apply_scale()
+        # mutates the spacing tokens once at startup, before any widget is
+        # built, so px() over them would scale S twice.
         total = theme.PAD_S            # never flush against the badge
         for child in self._header.pack_slaves():
             if child is self._wordmark:
@@ -1111,30 +1106,35 @@ class MainWindow:
         return total
 
     def _on_header_resize(self, event):
-        self._fit_wordmark(event.width)
+        self._check_header_fit(event.width)
 
-    def _fit_wordmark(self, header_w=None):
-        """Show the widest wordmark form that fits beside the cluster.
+    def _check_header_fit(self, header_w=None):
+        """Say so in the log if the bar can no longer hold the whole
+        wordmark beside the cluster at its widest.
 
-        Tracked 'J A R V I S' (290 px at S=2) needs a 1107-px header once
-        the right side is reserved; his saved 920 gets the monogram, the
-        520-unit default window gets 'JARVIS', and nothing is clipped or
-        unmapped in any state at any width the window allows. The wordmark
-        is what yields because it is the only thing in the bar that says
-        nothing — the state pill and the sensing badge both stay whole,
-        and the badge stays where it was deliberately put, beside the
-        state.
+        This is all that is left of the 2026-09-02 remedy, and
+        deliberately so: the wordmark used to SHRINK here, and he
+        rejected that ("dont make jarvis smaller"). The chips were made
+        to fit instead, with 32 px to spare at his window, so there is
+        nothing to negotiate at runtime — only something to notice, once
+        per width, if a header child added later spends that margin and
+        puts the privacy badge back under Tk's knife.
         """
         try:
             width = int(header_w if header_w else self._header.winfo_width())
             if width < 4:
                 return
-            avail = width - self._wordmark_reserve() - theme.PAD
-            options = self._wordmark_options()
+            spare = (width - self._cluster_w() - theme.PAD
+                     - self._wordmark.winfo_reqwidth())
         except (AttributeError, tk.TclError, TypeError, ValueError):
-            log.debug("wordmark fit skipped", exc_info=True)
+            log.debug("header fit check skipped", exc_info=True)
             return
-        self._draw_wordmark(fit_placeholder(avail, options))
+        if spare >= 0 or self._header_short == width:
+            return
+        self._header_short = width
+        log.warning("header %d px is %d px short of the wordmark + chips; "
+                    "the sensing badge is packed last and will be clipped",
+                    width, -spare)
 
     def _draw_header_rule(self, event):
         if self._rule_w == event.width:
@@ -1490,7 +1490,7 @@ class MainWindow:
 
     def _refresh_pill(self):
         """Recompute the StatePill from the event-derived state machine
-        (called on every state-changing event). Idle / WORKING / WAITING:
+        (called on every state-changing event). Idle / WORK / WAIT:
         FOCAL word, the dot carries the colour; other states take
         STATE_COLORS for both; a live warn hold turns only the dot amber."""
         state = self._app_state()

@@ -1,67 +1,82 @@
 """The header's width budget, tested display-free.
 
 2026-09-02, verbatim: "the word sensing is underneath the ready symbol".
+2026-09-03, verbatim: "dont make jarvis smaller, just make ready and
+sensing smaller to fit".
 
-DIAGNOSIS. Nothing is misaligned vertically -- SensingBadge and StatePill
-declare the SAME 26-design-unit height, both are packed with the default
-anchor into a 56-unit header, so pack centres them on the same line and a
-baseline mismatch is impossible. The header is over-SUBSCRIBED, and what
-Tk does with an over-subscribed bar is not what the first pass at this
-file claimed.
+DIAGNOSIS (unchanged, and still the reason this file exists). Nothing is
+misaligned vertically -- SensingBadge and StatePill declare the SAME
+26-design-unit height, both are packed with the default anchor into a
+56-unit header, so pack centres them on the same line and a baseline
+mismatch is impossible. The header is over-SUBSCRIBED, and what Tk does
+with an over-subscribed bar is not overlap: generic/tkPack.c
+ArrangePacking clamps the cavity at zero (752-756) so a child's frame
+SHRINKS, clips the child to its frame less padding (786-790), and UNMAPS
+a child left with no width (846-850). The last child packed is the one
+that loses, and that child is the sensing badge. views.header_spans
+transcribes those three passages; the assertion that matters is
+spans_clipped() == [], because an absent badge and a badge reading
+SENSING must not look the same from across the room.
 
-WHAT TK ACTUALLY DOES. generic/tkPack.c, ArrangePacking: the cavity is
-clamped at zero (752-756) so a child's frame SHRINKS rather than the
-cavity going negative; the child is then clipped to its frame less its
-padding (786-790); and a child left with no width is UNMAPPED (846-850).
-Right-packed siblings therefore cannot overlap -- `frameX` is
-`cavityX + cavityWidth` and cavityWidth is never below zero. Confirmed
-against real Tk 8.6 on Xvfb :95: at his 918-px header with the tracked
-wordmark and READY/SENSING the badge lands at x=322..446 -- 124 px of the
-168 it asked for, TRUNCATED, torn 116 px off the pill it belongs beside
-and jammed against the wordmark. In his worst state (LISTENING… +
-CAMERA OFF) it is 41 px of 214: a dot and a sliver. Push one child
-further -- a wider word, the extra header child a sibling branch is
-adding -- and Tk stops drawing it at all. views.header_spans transcribes
-those three passages and reproduces every mapped case exactly; the
-assertion that matters is spans_clipped() == [], because an absent badge
-and a badge reading SENSING must not look the same from across the room.
+WHAT CHANGED. The 09-02 remedy took the pixels out of the WORDMARK,
+stepping it down "J A R V I S" -> "JARVIS" -> "J". He rejected that: the
+wordmark stays whole in every state, and the two chips give up the space
+instead. So the budget is now fixed on both ends --
 
-THE FIX is alignment-preserving, not a relocation: the badge stays in the
-header beside the state pill, which is deliberate, and the WORDMARK --
-the one element in the bar carrying no information -- gives up the
-pixels, tracked form first, then untracked, then a monogram.
+    header at his 920-px window (shell inset 1 px a side)   918
+    PAD + wordmark 'J A R V I S'                          - 322
+    close + min + gear and their padding                  - 252
+    the two chips' own PAD_S pads                          - 32
+    ------------------------------------------------------------
+    left for the pill and the badge, in EVERY state         312
 
-Every width below was MEASURED on Xvfb :95 at JARVIS_UI_SCALE 2.0 off the
-rendered faces ('Chakra Petch SemiBold' -59 for the wordmark, -35 for the
-pill, -24 for the badge; 'Inter' for the chrome buttons) and kept as
-literals so the file stays Tk-free, the same house pattern as
-tests/test_ui_chrome.py.
+-- and 'LISTENING…' + 'CAMERA OFF' asked 485 of those 312.
+
+HOW THE 173 px CAME OUT. The badge is the privacy readout, so it gave up
+the least: it keeps its type size, its dot, its capsule and all three of
+its tell-apart channels, and loses only chip padding and one word
+('CAMERA OFF' -> 'CAM OFF', with the unabbreviated reason still on the
+tooltip via badge_caption). The pill gave up the rest -- it drops to the
+badge's SIZE_CAPTION face, so the two header chips are finally one type
+size and one geometry, and its words lose their -ING and their ellipsis
+('LISTENING…' -> 'LISTEN'): the dot beside the word already carries the
+state colour and the reactor carries the motion, so the word only has to
+NAME the state. 271+214 -> 129+151 = 280 of 312, a 32-px gap left over.
+
+Every width below was MEASURED on a PRIVATE Xvfb (:95, never his :1) at
+JARVIS_UI_SCALE 2.0 off the rendered faces ('Chakra Petch SemiBold' -59
+for the wordmark, -35 for the old pill, -24 for both chips now; 'Inter'
+for the chrome buttons) and kept as literals so the file stays Tk-free,
+the same house pattern as tests/test_ui_chrome.py.
 """
 import pytest
 
-from jarvis.ui.main_window import STATE_WORDS, WORDMARK_FORMS
+from jarvis.ui import main_window
+from jarvis.ui.main_window import STATE_WORDS, WORDMARK
 from jarvis.ui.sensing_badge import WORDS as BADGE_WORDS
-from jarvis.ui.sensing_badge import SensingBadge
-from jarvis.ui.views import fit_placeholder, header_spans, spans_clipped
+from jarvis.ui.sensing_badge import SensingBadge, badge_caption
+from jarvis.ui.views import header_spans, spans_clipped
 from jarvis.ui.widgets import StatePill
 
 HEADER_W = 918          # his 920-px window, less the shell's 1-px inset
 DEFAULT_W = 1038        # the 520-design-unit default window
 PAD, PAD_S = 32, 16     # theme.PAD / theme.PAD_S at S=2
 
-# wordmark canvas widths (px(2) lead-in + the text item's bbox + the 1-px
-# fringe ghost), as _draw_wordmark ends up configuring them
-WORDMARK = {"J A R V I S": 290, "JARVIS": 210, "J": 42, "": 1}
-# StatePill slabs: text + 2*px(12) + px(8) dot + px(6) gap. The vocabulary
-# is main_window.STATE_WORDS, NOT the shorter StatePill.WORDS: WAITING and
-# WORKING (a Claude task) only exist in the window's map.
-PILL = {"READY": 188, "ERROR": 190, "WAITING": 214, "WORKING": 232,
-        "SPEAKING": 241, "THINKING…": 255, "LISTENING…": 271}
-# SensingBadge chips: text + 2*px(10) + px(8) dot + px(6) gap
-BADGE = {"SENSING": 168, "OFFLINE": 163, "CAMERA OFF": 214}
+# wordmark canvas width (px(2) lead-in + the text item's bbox + the 1-px
+# fringe ghost), as _draw_wordmark ends up configuring it. ONE form now.
+WORDMARK_W = 290
 CLOSE, MIN, GEAR = 69, 75, 76
 
-WORDMARK_WS = [(t, WORDMARK[t]) for t in WORDMARK_FORMS]
+# --- what the chips cost BEFORE (SIZE_LABEL pill, PAD_X 12/10, GAP 6) ---
+PILL_WAS = {"READY": 188, "ERROR": 190, "WAITING": 214, "WORKING": 232,
+            "SPEAKING": 241, "THINKING…": 255, "LISTENING…": 271}
+BADGE_WAS = {"OFFLINE": 163, "SENSING": 168, "CAMERA OFF": 214}
+
+# --- and AFTER: both chips at SIZE_CAPTION, PAD_X 6, DOT 8, GAP 5, so
+# every chip is its measured text + 2*px(6) + px(8) + px(5) = text + 50 ---
+PILL = {"WAIT": 106, "THINK": 119, "WORK": 119, "SPEAK": 124,
+        "READY": 126, "LISTEN": 129, "ERROR": 129}
+BADGE = {"OFFLINE": 145, "SENSING": 150, "CAM OFF": 151}
 
 
 def _right(pill: str, badge: str) -> list:
@@ -73,16 +88,8 @@ def _right(pill: str, badge: str) -> list:
             ("sensing", BADGE[badge], 0, PAD_S)]
 
 
-def _reserve() -> int:
-    """What _wordmark_reserve() budgets: every non-wordmark child at its
-    WIDEST, its padding, and a PAD_S gap the wordmark keeps clear."""
-    return PAD_S + sum(w + pl + pr for _n, w, pl, pr
-                       in _right(max(PILL, key=PILL.get),
-                                 max(BADGE, key=BADGE.get)))
-
-
-def _spans(total_w: int, wordmark: str, pill: str, badge: str) -> list:
-    return header_spans(total_w, [("wordmark", WORDMARK[wordmark], PAD, 0)],
+def _spans(total_w: int, pill: str, badge: str, wordmark: int = WORDMARK_W):
+    return header_spans(total_w, [("wordmark", wordmark, PAD, 0)],
                         _right(pill, badge))
 
 
@@ -90,113 +97,148 @@ def _named(spans, name):
     return [s for s in spans if s[0] == name][0]
 
 
-# ------------------------------------------------------- the reproduction
-def test_the_badge_is_the_child_tk_truncates_at_his_window():
-    """What he photographed. The tracked wordmark plus the right cluster
-    ask for more than the header has, and the badge -- packed last -- is
-    the child Tk cuts down: 124 px of the 168 it asked for, its capsule
-    and the tail of its word sheared off, sitting FLUSH against the
-    wordmark with no gap at all."""
-    need = PAD + WORDMARK["J A R V I S"] + sum(
-        w + pl + pr for _n, w, pl, pr in _right("READY", "SENSING"))
-    assert need == 962 and need > HEADER_W          # 44 px over, at rest
-    spans = _spans(HEADER_W, "J A R V I S", "READY", "SENSING")
-    assert spans_clipped(spans) == [("sensing", 124, 168)]
-    _n, bx0, bx1, _req, mapped = _named(spans, "sensing")
-    assert (bx0, bx1, mapped) == (322, 446, True)   # measured on real Tk
-    assert bx1 - bx0 == 124 and 168 - 124 == 44     # 44 px of word gone
-    assert bx0 == _named(spans, "wordmark")[2]      # flush, zero gap
-    # right-packed pack siblings never overlap; that was never the defect
-    drawn = [(x0, x1) for _n, x0, x1, _r, m in spans if m]
-    assert all(a[1] <= b[0] or b[1] <= a[0]
-               for i, a in enumerate(drawn) for b in drawn[i + 1:])
-    # and it is far worse in the state he is in most
-    worst = _spans(HEADER_W, "J A R V I S", "LISTENING…", "CAMERA OFF")
+def _chips_budget(total_w: int = HEADER_W) -> int:
+    """Pixels left for the two chips THEMSELVES once the wordmark, the
+    window chrome and every pack pad have been paid for."""
+    return (total_w - (PAD + WORDMARK_W)
+            - (CLOSE + PAD_S + MIN + GEAR + PAD_S) - 2 * PAD_S)
+
+
+# ------------------------------------------------ the budget, both ends
+def test_the_wordmark_is_whole_and_there_is_no_ladder_left():
+    """His decision. The 09-02 remedy is gone: no forms list, no fitter,
+    no reserve-driven redraw -- one wordmark, drawn once, in every state
+    at every width the window allows."""
+    assert WORDMARK == "J A R V I S"
+    assert not hasattr(main_window, "WORDMARK_FORMS")
+    for gone in ("_fit_wordmark", "_wordmark_options"):
+        assert not hasattr(main_window.MainWindow, gone)
+
+
+def test_what_is_left_for_the_two_chips_is_312_px():
+    assert _chips_budget() == 312
+    assert PAD + WORDMARK_W == 322          # the wordmark's fixed claim
+    assert CLOSE + PAD_S + MIN + GEAR + PAD_S == 252     # fixed chrome
+
+
+def test_the_old_chips_asked_485_of_those_312():
+    """The reproduction. At rest the old pair was 44 px over and Tk cut
+    the badge -- packed last -- to 124 px of its 168, capsule and the
+    tail of the word sheared off, flush against the wordmark; in the
+    state he is in most it was 41 px of 214, a dot and a sliver."""
+    assert max(PILL_WAS.values()) + max(BADGE_WAS.values()) == 485
+    assert 485 - _chips_budget() == 173
+    was = header_spans(HEADER_W, [("wordmark", WORDMARK_W, PAD, 0)],
+                       [("close", CLOSE, 0, PAD_S), ("min", MIN, 0, 0),
+                        ("gear", GEAR, 0, PAD_S),
+                        ("pill", PILL_WAS["READY"], 0, PAD_S),
+                        ("sensing", BADGE_WAS["SENSING"], 0, PAD_S)])
+    assert spans_clipped(was) == [("sensing", 124, 168)]
+    assert _named(was, "sensing")[1] == _named(was, "wordmark")[2]  # flush
+    worst = header_spans(HEADER_W, [("wordmark", WORDMARK_W, PAD, 0)],
+                         [("close", CLOSE, 0, PAD_S), ("min", MIN, 0, 0),
+                          ("gear", GEAR, 0, PAD_S),
+                          ("pill", PILL_WAS["LISTENING…"], 0, PAD_S),
+                          ("sensing", BADGE_WAS["CAMERA OFF"], 0, PAD_S)])
     assert spans_clipped(worst) == [("sensing", 41, 214)]
 
 
-def test_one_child_further_and_tk_stops_drawing_the_badge_entirely():
-    """The hazard the budget exists to prevent, and the reason the
-    assertion is "nothing is clipped" rather than "nothing collides".
-
-    Tk unmaps a child whose frame has nothing left after its padding, so
-    the privacy readout does not degrade -- it disappears, and an absent
-    badge is indistinguishable from a badge that never said OFFLINE. The
-    app's own 460-unit minimum keeps his window clear of this, which is
-    exactly what a new header child would spend."""
-    spans = _spans(877, "J A R V I S", "LISTENING…", "CAMERA OFF")
-    assert _named(spans, "sensing")[4] is False     # unmapped: gone
-    assert spans_clipped(spans) == [("sensing", 0, 214)]
-    # one pixel wider and Tk keeps a sliver of it
-    assert _named(_spans(878, "J A R V I S", "LISTENING…",
-                         "CAMERA OFF"), "sensing")[4] is True
+def test_the_new_chips_ask_280_and_leave_a_32_px_gap():
+    """A third off each side of the pair, and the worst case is what
+    fits: LISTEN + CAM OFF, not READY + SENSING."""
+    assert max(PILL.values()) + max(BADGE.values()) == 280
+    assert _chips_budget() - 280 == 32           # two PAD_S of slack left
+    assert max(PILL.values()) / max(PILL_WAS.values()) < 0.5
+    assert max(BADGE.values()) / max(BADGE_WAS.values()) < 0.75
 
 
-def test_no_window_width_holds_the_tracked_wordmark_in_every_state():
-    """Why the wordmark has to yield rather than the header just being
-    given a wider minimum: the worst state asks 1091 px on its own, and
-    1107 with the gap the wordmark keeps clear -- so a minimum that fitted
-    it would be 554 design units, wider than the 520-unit DEFAULT window,
-    let alone the 460-unit minimum."""
-    bare = PAD + WORDMARK["J A R V I S"] + sum(
-        w + pl + pr for _n, w, pl, pr in _right("LISTENING…", "CAMERA OFF"))
-    assert bare == 1091 > DEFAULT_W
-    assert PAD + WORDMARK["J A R V I S"] + _reserve() == 1107
-
-
-# ------------------------------------------------------------- the fix
-def _fitted(total_w: int) -> str:
-    return fit_placeholder(total_w - _reserve() - PAD, WORDMARK_WS)
-
-
-@pytest.mark.parametrize("pill", sorted(PILL))
+# ------------------------------- the cross-product that actually matters
 @pytest.mark.parametrize("badge", sorted(BADGE))
-def test_nothing_in_the_header_is_clipped_once_the_wordmark_yields(pill, badge):
-    for width in (HEADER_W, DEFAULT_W, 1107, 1400):
-        assert spans_clipped(_spans(width, _fitted(width), pill, badge)) == []
+@pytest.mark.parametrize("pill", sorted(PILL))
+def test_no_child_is_clipped_or_unmapped_in_any_pair(pill, badge):
+    """Every pill state x every badge state, at his window and at the
+    520-unit default, with the FULL wordmark. Nothing clipped, nothing
+    unmapped, and the badge never flush against the wordmark."""
+    for width in (HEADER_W, DEFAULT_W, 1400):
+        spans = _spans(width, pill, badge)
+        assert spans_clipped(spans) == []
+        assert all(mapped for _n, _a, _b, _r, mapped in spans)
+        assert (_named(spans, "sensing")[1]
+                - _named(spans, "wordmark")[2]) >= PAD_S
 
 
 def test_the_badge_comes_back_whole_and_beside_the_state():
-    """The fix in his own worst case: 214 px of 214, one PAD_S gap from
-    the pill rather than 116 px adrift of it."""
-    spans = _spans(HEADER_W, _fitted(HEADER_W), "LISTENING…", "CAMERA OFF")
+    """His worst case, laid out: 151 px of 151, one PAD_S from the pill
+    rather than 116 px adrift of it, and 32 px clear of the wordmark."""
+    spans = _spans(HEADER_W, "LISTEN", "CAM OFF")
     assert spans_clipped(spans) == []
     _n, bx0, bx1, req, mapped = _named(spans, "sensing")
-    assert (bx0, bx1, req, mapped) == (149, 363, 214, True)
+    assert (bx0, bx1, req, mapped) == (354, 505, 151, True)
     assert _named(spans, "pill")[1] - bx1 == PAD_S
-    # ...and the wordmark is not left flush against it either
-    assert bx0 - _named(spans, "wordmark")[2] >= PAD_S
+    assert bx0 - _named(spans, "wordmark")[2] == 32
 
 
-def test_the_wordmark_steps_down_by_window_width_and_comes_back():
-    assert _fitted(HEADER_W) == "J"                 # his window today
-    assert _fitted(DEFAULT_W) == "JARVIS"           # the default window
-    assert _fitted(1107) == "J A R V I S"           # ~554 design units
-    assert _fitted(1106) == "JARVIS"
-    # monotone: a wider window never shows a SMALLER mark
-    rung = [WORDMARK_FORMS.index(_fitted(w)) for w in range(600, 1400, 8)]
-    assert rung == sorted(rung, reverse=True)
+def test_it_still_fits_with_a_state_word_nobody_has_added_yet():
+    """The slack, spent on purpose: a pill word two glyphs longer than
+    any that exists (ERROR + 'XX', ~28 px at this face) still leaves the
+    badge whole at his window."""
+    longer = max(PILL.values()) + 28
+    spans = header_spans(HEADER_W, [("wordmark", WORDMARK_W, PAD, 0)],
+                         [("close", CLOSE, 0, PAD_S), ("min", MIN, 0, 0),
+                          ("gear", GEAR, 0, PAD_S), ("pill", longer, 0, PAD_S),
+                          ("sensing", max(BADGE.values()), 0, PAD_S)])
+    assert spans_clipped(spans) == []
 
 
-def test_the_budget_is_the_widest_words_and_not_the_current_ones():
-    """Budgeting against READY/SENSING would fit 'JARVIS' at his window --
-    and cut the badge in half the moment he speaks."""
-    at_rest = sum(w + pl + pr for _n, w, pl, pr in _right("READY", "SENSING"))
-    naive = fit_placeholder(HEADER_W - at_rest - PAD, WORDMARK_WS)
-    assert naive == "JARVIS"
-    assert spans_clipped(_spans(HEADER_W, naive, "LISTENING…",
-                                "CAMERA OFF")) == [("sensing", 121, 214)]
+def test_the_460_unit_minimum_is_still_the_floor_that_holds():
+    """His 920-px window IS the app's minimum (MIN_W 460 at S=2), so the
+    worst pair has to fit there -- and 886 px is where it stops."""
+    assert main_window.MIN_W * 2 - 2 == HEADER_W
+    need = (PAD + WORDMARK_W + max(BADGE.values()) + PAD_S
+            + max(PILL.values()) + PAD_S + GEAR + PAD_S + MIN + CLOSE + PAD_S)
+    assert need == 886 and need <= HEADER_W
+    assert spans_clipped(_spans(886, "LISTEN", "CAM OFF")) == []
+    assert spans_clipped(_spans(885, "LISTEN", "CAM OFF")) != []
 
 
-def test_the_empty_form_is_the_last_resort_and_the_minimum_window_is_the_floor():
-    """Below the app's own minimum even an empty wordmark cannot save the
-    badge -- 802 px is where the right cluster alone stops fitting. The
-    460-design-unit minimum (918 px here) is what keeps him above it."""
-    assert WORDMARK_FORMS[0] == "J A R V I S" and WORDMARK_FORMS[-1] == ""
-    assert _fitted(700) == ""
-    assert spans_clipped(_spans(802, "", "LISTENING…", "CAMERA OFF")) == []
-    assert spans_clipped(_spans(801, "", "LISTENING…", "CAMERA OFF")) != []
-    assert HEADER_W > 802
+# ------------------------------------------- the badge is still the loud one
+def test_the_badge_kept_its_word_and_the_pill_paid():
+    """Constraint 1. The badge is a privacy readout: it keeps its type
+    size and a seven-glyph word in EVERY tone, so it stays unmistakable
+    across the room and cannot be confused with an absent badge -- and,
+    every word being seven glyphs, the chip barely twitches between
+    states (145/150/151). The pill's words are all shorter, so the badge
+    is always the wider of the two chips."""
+    assert set(BADGE) == set(BADGE_WORDS.values())
+    assert all(len(word) == 7 for word in BADGE_WORDS.values())
+    assert max(BADGE.values()) - min(BADGE.values()) <= 6
+    assert min(BADGE.values()) > max(PILL.values())
+    assert all(len(word) <= 6 for word in STATE_WORDS.values())
+
+
+def test_the_two_header_chips_are_one_type_size_and_one_geometry():
+    """Asserted through the widgets themselves so the formula cannot
+    drift; both calls are pure and need no root."""
+    assert StatePill.font() == SensingBadge.font()
+    assert StatePill.chip_w(0) == SensingBadge.chip_w(0)
+    assert ((StatePill.HEIGHT, StatePill.PAD_X, StatePill.DOT, StatePill.GAP)
+            == (SensingBadge.HEIGHT, SensingBadge.PAD_X, SensingBadge.DOT,
+                SensingBadge.GAP) == (26, 6, 8, 5))
+    assert StatePill.chip_w(100) - StatePill.chip_w(0) == 100
+
+
+def test_the_abbreviated_chip_still_says_which_reason_it_is_blocked():
+    """Constraint 2. 'CAM OFF' is seven glyphs; the unabbreviated reason
+    -- and the hour it ends -- stays on badge_caption, which is what
+    MainWindow feeds the badge's tooltip on every refresh."""
+    assert BADGE_WORDS["curfew"] == "CAM OFF"
+    caption = badge_caption({"camera": False, "radar": True, "offline": False,
+                             "reason": "curfew", "curfew": ((21, 0), (7, 0))})
+    assert caption.startswith("camera off until") and "curfew" in caption
+    assert "7" in caption
+    off = badge_caption({"camera": False, "radar": False, "offline": True,
+                         "reason": "offline"})
+    assert "camera" in off and "radar" in off
 
 
 # ------------------------------------------------- the pure helpers
@@ -223,14 +265,91 @@ def test_header_spans_transcribes_the_packer_it_is_named_after():
 
 
 def test_both_chips_can_report_their_widest_width_without_a_display():
-    """The header measures the cluster through the widgets themselves, so
+    """The header's own budget reads the cluster through the widgets, so
     the two formulas cannot drift apart -- and neither call needs a root."""
     assert StatePill.widest_w() > 0
     assert SensingBadge.widest_w() > 0
-    # the widest WORD is what each is budgeting for
-    assert max(BADGE, key=BADGE.get) in BADGE_WORDS.values()
     assert set(PILL) == set(STATE_WORDS.values())
-    # ...and the pill's budget follows the window's vocabulary, which is
-    # wider than its own class constant
+    # the pill's budget follows the WINDOW's vocabulary, which is wider
+    # than its own class constant (WAIT / WORK are Claude-task states)
     assert set(StatePill.WORDS) < set(STATE_WORDS.values())
     assert StatePill.widest_w(STATE_WORDS.values()) >= StatePill.widest_w()
+
+
+# ------------------------------------- what is left of the 09-02 remedy
+class _FakeChild:
+    """The two things _cluster_w reads off a header child."""
+
+    def __init__(self, name, req, padx=0):
+        self._name, self._req, self._padx = name, req, padx
+
+    def __str__(self):
+        return self._name
+
+    def winfo_reqwidth(self):
+        return self._req
+
+    def pack_info(self):
+        return {"padx": self._padx}
+
+
+class _FakeHeader:
+    def __init__(self, children, width):
+        self._children, self._width = children, width
+
+    def pack_slaves(self):
+        return self._children
+
+    def winfo_width(self):
+        return self._width
+
+
+def _stub_window(header_w):
+    win = main_window.MainWindow.__new__(main_window.MainWindow)
+    win._wordmark = _FakeChild("wordmark", WORDMARK_W, (PAD, 0))
+    win.pill = _FakeChild("pill", 1, (0, PAD_S))
+    win.sensing_badge = _FakeChild("sensing", 1, (0, PAD_S))
+    kids = [win._wordmark, _FakeChild("close", CLOSE, (0, PAD_S)),
+            _FakeChild("min", MIN, 0), _FakeChild("gear", GEAR, (0, PAD_S)),
+            win.pill, win.sensing_badge]
+    win._header = _FakeHeader(kids, header_w)
+    win._header_short = None
+    return win
+
+
+def test_the_cluster_budget_walks_the_pack_list_and_takes_the_widest_word():
+    """_cluster_w is measured through the widgets, not off a hand-written
+    list: the header child most likely to be added next is a camera
+    preview on a sibling branch, and a budget that missed it is how the
+    badge gets cut again. Both chips count at their WIDEST word, so a
+    bar that fits READY/SENSING cannot come apart at 21:00 on CAM OFF."""
+    win = _stub_window(HEADER_W)
+    expect = (main_window.theme.PAD_S
+              + CLOSE + PAD_S + MIN + GEAR + PAD_S
+              + StatePill.widest_w(STATE_WORDS.values()) + PAD_S
+              + SensingBadge.widest_w() + PAD_S)
+    assert win._cluster_w() == expect
+    # padx is Tk's own: a scalar pads BOTH sides, a pair only the named one
+    assert main_window.MainWindow._padx_total(_FakeChild("x", 1, 7)) == 14
+    assert main_window.MainWindow._padx_total(_FakeChild("x", 1, (0, 7))) == 7
+    assert main_window.MainWindow._padx_total(object()) == 0
+
+
+def test_a_header_that_ran_short_says_so_once_instead_of_shrinking_jarvis(caplog):
+    """All that survives of the remedy he rejected. The wordmark is never
+    touched; the log names the shortfall so the next header child does
+    not silently put the privacy badge back under Tk's knife -- and it
+    says it ONCE per width, not on every <Configure> of a drag."""
+    win = _stub_window(HEADER_W)
+    need = win._cluster_w() + main_window.theme.PAD + WORDMARK_W
+    with caplog.at_level("WARNING", logger="jarvis.ui.main_window"):
+        win._check_header_fit(need)          # exactly enough: silence
+        assert caplog.records == []
+        win._check_header_fit(need - 1)
+        assert len(caplog.records) == 1
+        assert "1 px short" in caplog.records[0].getMessage()
+        win._check_header_fit(need - 1)      # same width: still one line
+        assert len(caplog.records) == 1
+        win._check_header_fit(need - 40)
+        assert len(caplog.records) == 2
+    assert win._wordmark.winfo_reqwidth() == WORDMARK_W   # never touched
