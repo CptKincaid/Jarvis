@@ -19,6 +19,7 @@ the irreversible mistakes live.
 import os
 import subprocess
 import types
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -47,11 +48,17 @@ class Cfg:
 
 
 def ready_cfg(tmp_path, **over):
-    """A config that passes missing_reason -- enabled, host, user, no key."""
+    """A config that passes missing_reason -- enabled, host, user, and a key
+    file that exists.  Until F11 (2026-09-03) this fixture said "no key" and
+    the lane called that ready; a blank key is a refusal now, so the fixture
+    writes one under tmp_path rather than lean on the box's ~/.ssh."""
+    key = tmp_path / "hpcomputer.key"
+    if not key.exists():
+        key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
     base = {"remote.enabled": True,
             "remote.host": "hpcomputer.tail5323b8.ts.net",
             "remote.user": "hunterp",
-            "remote.key_path": "",
+            "remote.key_path": str(key),
             "remote.local_roots": [str(tmp_path / "Desktop")]}
     base.update(over)
     return Cfg(**base)
@@ -107,12 +114,39 @@ def test_remote_is_not_a_nagging_setup_section():
     ({"remote.enabled": True, "remote.host": "h"}, "no-user"),
     ({"remote.enabled": True, "remote.host": "h", "remote.user": "u",
       "remote.key_path": "/nope/missing.key"}, "bad-key"),
-    ({"remote.enabled": True, "remote.host": "h", "remote.user": "u"}, ""),
+    # The shipped default.  This row used to expect "" (ready) -- F11.
+    ({"remote.enabled": True, "remote.host": "h", "remote.user": "u"}, "no-key"),
 ])
 def test_missing_reason_names_exactly_what_is_absent(over, expect):
     """A present host with a missing user is a real state, and it must be
     named before a socket opens rather than becoming an auth failure."""
     assert remote.missing_reason(remote.read_config(Cfg(**over))) == expect
+
+
+def test_a_key_that_is_there_makes_the_lane_ready(tmp_path):
+    assert remote.missing_reason(remote.read_config(ready_cfg(tmp_path))) == ""
+
+
+def test_a_blank_key_path_is_refused_before_a_socket_opens(monkeypatch):
+    """F11 (2026-09-03).  DEFAULTS and the docs example ship key_path "",
+    and missing_reason called that ready.  ssh then ran with
+    IdentitiesOnly=yes and no -i, which offers only the default-named
+    identities -- and ~/.ssh here holds none (measured: no id_rsa, id_ecdsa
+    or id_ed25519; the key is ~/.ssh/hpcomputer).  So the first thing he
+    heard after enabling the lane was "HPCOMPUTER turned my key away, sir"
+    -- the far side blamed for a blank line in his own settings, after a
+    socket had opened.  A blank key is a refusal that names remote.key_path."""
+    monkeypatch.setattr(subprocess, "Popen", NoPopen())
+    conf = remote.read_config(Cfg(**{"remote.enabled": True,
+                                     "remote.host": "192.168.50.114",
+                                     "remote.user": "h2pey",
+                                     "remote.key_path": ""}))
+    assert remote.missing_reason(conf) == "no-key"
+    assert remote.ask(conf, "up").reason == "no-key"
+    assert remote.push(conf, Path("/x")).reason == "no-key"
+    assert remote.pull(conf, "outbox", "a.txt").reason == "no-key"
+    line = remote.fail_line(conf, "no-key")
+    assert "remote.key_path" in line and "turned my key away" not in line
 
 
 def test_a_hostile_config_leaves_the_lane_off():
@@ -269,10 +303,10 @@ def test_a_daemon_that_cannot_be_asked_is_unknown_not_absent(tmp_path, monkeypat
 
 def test_every_failure_reason_has_a_spoken_line(tmp_path):
     conf = remote.read_config(ready_cfg(tmp_path))
-    for reason in ("disabled", "no-host", "no-user", "bad-key", "no-ssh",
-                   "off-tailnet", "asleep", "timeout", "auth", "unreachable",
-                   "hostkey", "no-space", "denied", "not-there", "exists",
-                   "failed"):
+    for reason in ("disabled", "no-host", "no-user", "no-key", "bad-key",
+                   "no-ssh", "off-tailnet", "asleep", "timeout", "auth",
+                   "unreachable", "hostkey", "no-space", "denied", "not-there",
+                   "exists", "failed"):
         line = remote.fail_line(conf, reason)
         assert line and "{" not in line
         assert "sir" in line

@@ -4056,7 +4056,7 @@ model — the refusal only fires on an actual imperative.
   "enabled": false,
   "host": "",
   "user": "",
-  "key_path": "",
+  "key_path": "~/.ssh/hpcomputer",
   "name": "HPCOMPUTER",
   "socks_proxy": "127.0.0.1:1055",
   "inbox": "~/jarvis-inbox",

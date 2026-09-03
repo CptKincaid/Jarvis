@@ -267,7 +267,15 @@ def missing_reason(conf: RemoteConfig) -> str:
         return "no-host"
     if not conf.user:
         return "no-user"
-    if conf.key_path and not key_file(conf):
+    # A BLANK key is a refusal, not "ready" (F11, 2026-09-03).  The shipped
+    # default is "", and with IdentitiesOnly=yes and no -i, ssh offers only
+    # the default-named identities -- of which ~/.ssh here has none
+    # (measured: no id_rsa/id_ecdsa/id_ed25519; the key is ~/.ssh/hpcomputer).
+    # So a blank line in his settings opened a socket and came back as
+    # "HPCOMPUTER turned my key away, sir", blaming the far side.
+    if not conf.key_path:
+        return "no-key"
+    if not key_file(conf):
         return "bad-key"
     return ""
 
@@ -280,6 +288,8 @@ FAIL_LINES = {
                "yet, and remote.host is empty.",
     "no-user": "I don't know which account to use on {name}, sir; "
                "remote.user is empty.",
+    "no-key": "I've no key for {name}, sir; remote.key_path is empty in "
+              f"{CONFIG_HINT}.",
     "bad-key": "The key I'm meant to use for {name} isn't where my settings "
                "say it is, sir.",
     "no-ssh": "I've no ssh on this machine, sir.",
