@@ -75,12 +75,51 @@ def test_render_matches_spec(home):
 
 
 def test_default_exec_uses_venv_or_current_python(home, monkeypatch):
+    monkeypatch.setattr(auto, "WRAPPER", home / "no-such-wrapper")
     assert auto.default_exec().endswith(" -m jarvis.app")
     venv = home / "vss_env" / "bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text("")
     assert auto.default_python() == str(venv / "python")
     assert auto.REPO_ROOT.name == "Jarvis"
+
+
+def test_default_exec_prefers_the_breeze_wait_wrapper_when_it_is_there(
+        home, monkeypatch):
+    """app.py re-runs install() at every start once "autostart.enabled" is on,
+    so if this module did not know about the wrapper it would quietly rewrite
+    the entry back to the bare command and take the boot ordering with it."""
+    wrapper = home / "scripts" / "jarvis-autostart"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(auto, "WRAPPER", wrapper)
+    assert auto.default_exec() == str(wrapper)
+    assert f"Exec={wrapper}" in auto.render_desktop()
+
+
+def test_a_non_executable_wrapper_is_ignored(home, monkeypatch):
+    """A checkout that lost the mode bit must not produce an entry gnome-session
+    cannot run."""
+    wrapper = home / "scripts" / "jarvis-autostart"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o644)
+    monkeypatch.setattr(auto, "WRAPPER", wrapper)
+    assert auto.default_exec().endswith(" -m jarvis.app")
+
+
+def test_an_entry_naming_the_wrapper_counts_as_installed(home, monkeypatch):
+    """is_installed() gates the Settings toggle and the status line; it must
+    not read a wrapper entry as "Jarvis does not start at login"."""
+    wrapper = home / "scripts" / "jarvis-autostart"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("#!/bin/sh\n")
+    wrapper.chmod(0o755)
+    monkeypatch.setattr(auto, "WRAPPER", wrapper)
+    auto.install()
+    assert auto.is_installed()
+    assert auto.status()["installed"] is True
 
 
 def test_install_is_idempotent(home):

@@ -50,7 +50,26 @@ def default_python() -> str:
     return str(venv) if venv.exists() else sys.executable
 
 
+# scripts/jarvis-autostart: `python -m jarvis.app` with one thing in front of
+# it -- a wait for jarvis-breeze.service's ping. WHY THE PREFERENCE LIVES HERE
+# and not only in the installer: app.py re-runs install() at every start when
+# assistant "autostart.enabled" is on, so an entry hand-edited to name the
+# wrapper would be silently rewritten back to the bare command the first time
+# he toggled that switch -- and the boot ordering it carries would vanish with
+# it, with nothing to see. Rendering it here is the only way it survives.
+#
+# There is nothing to weigh: the wrapper is a pass-through when
+# jarvis-breeze.service is not enabled (measured against the live box on
+# 2026-09-02: "is not enabled (not-found); not waiting", then exec, in 1 ms),
+# and it stops waiting the moment the unit is not active. So it costs a login
+# nothing until the sidecar is turned on, and after that it is what keeps a
+# 19.0 GB model load out of a 31.2 GB graph capture.
+WRAPPER = REPO_ROOT / "scripts" / "jarvis-autostart"
+
+
 def default_exec() -> str:
+    if os.access(WRAPPER, os.X_OK):
+        return str(WRAPPER)
     return f"{default_python()} -m jarvis.app"
 
 
@@ -109,7 +128,12 @@ def uninstall(path: Optional[os.PathLike | str] = None) -> bool:
 
 
 def is_installed(path: Optional[os.PathLike | str] = None) -> bool:
-    """True when the entry exists, launches ``jarvis.app`` and is enabled."""
+    """True when the entry exists, launches Jarvis and is enabled.
+
+    "Launches Jarvis" is either form: the bare ``-m jarvis.app`` this module
+    wrote before the Breeze sidecar existed, or ``scripts/jarvis-autostart``,
+    which is that command behind a wait for the sidecar.
+    """
     target = desktop_path(path)
     try:
         text = target.read_text(encoding="utf-8")
@@ -120,7 +144,8 @@ def is_installed(path: Optional[os.PathLike | str] = None) -> bool:
         if "=" in line and not line.startswith(("[", "#")):
             key, _, value = line.partition("=")
             lines[key.strip()] = value.strip()
-    if "jarvis.app" not in lines.get("Exec", ""):
+    exec_line = lines.get("Exec", "")
+    if "jarvis.app" not in exec_line and "jarvis-autostart" not in exec_line:
         return False
     if lines.get("Hidden", "false").lower() == "true":
         return False

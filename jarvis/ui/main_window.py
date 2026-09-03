@@ -1450,6 +1450,7 @@ class MainWindow:
         "xtts": "XTTS",
         "fish": "FISH · S2.1",     # hosted, the default while credit lasts
         "f5":   "F5 · LOCAL",      # the local voice fish retires to
+        "breeze": "BREEZE · Q4",   # the quantized local voice, opt-in
     }
 
     @classmethod

@@ -634,10 +634,18 @@ def test_get_and_set_option_go_through_the_assistant_config(app):
 
 
 def test_autostart_option_installs_and_removes_the_entry(app):
+    from jarvis import autostart
     assert app.set_option("autostart.enabled", True)
     assert PATHS.AUTOSTART_DESKTOP.exists()
     text = PATHS.AUTOSTART_DESKTOP.read_text()
-    assert "Exec=" in text and "-m jarvis.app" in text
+    # Either shape counts as "Jarvis starts at login": the bare command, or
+    # scripts/jarvis-autostart, which is that command behind a wait for the
+    # Breeze sidecar. THIS write is why the wrapper preference has to live in
+    # jarvis.autostart -- app.py re-runs install() at every start once the
+    # option is on, so anything the module does not know to render it erases.
+    assert "Exec=" in text
+    assert "-m jarvis.app" in text or "jarvis-autostart" in text
+    assert autostart.is_installed(path=PATHS.AUTOSTART_DESKTOP)
     assert app.set_option("autostart.enabled", False)
     assert not PATHS.AUTOSTART_DESKTOP.exists()
 

@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Start Jarvis -- but not on top of the Breeze sidecar's graph capture.
+#
+# WHY THIS WRAPPER EXISTS
+# -----------------------
+# Nothing loads gemma4:26b except jarvis.brain's residency loop, so the boot
+# ordering that keeps the Breeze sidecar's one-time start out of trouble is
+# Breeze-before-JARVIS, not Breeze-before-ollama. ollama.service loads no
+# model until something asks.
+#
+# The unit and the .desktop file cannot express that ordering between them:
+# gnome-session's X-GNOME-Autostart-Delay is 15 s and the sidecar needs 33.0 s
+# (7.3 s to load ckpt-q4, 22.0 s of CUDA-graph capture, two warm renders), so
+# an unguarded autostart puts a 19.0 GB model load inside a 31.2 GB capture
+# window. At a fresh boot that is survivable on headroom alone; after a
+# scripts/breeze_make_room.py eviction it is not (49.9 - 31.2 - 19.0 = -0.3).
+# So the wait is explicit, and it is here.
+#
+# IT ONLY EVER DELAYS, NEVER BLOCKS:
+#   * the unit is not enabled          -> no wait at all (today's behaviour)
+#   * the sidecar already answers      -> no wait (a hand restart of Jarvis)
+#   * the unit refused or died         -> stop waiting the moment it is not
+#                                         active; a MemFree refusal exits in
+#                                         about a second
+#   * the sidecar never answers        -> JARVIS_BREEZE_WAIT_S and then start
+#                                         anyway, on F5
+# Jarvis starting is never contingent on Breeze. He falls back to F5 on his
+# own (jarvis/tts.py _breeze_unavailable) and promotes himself back to Breeze
+# in the background when the sidecar turns up (TTS.warm_breeze), so the only
+# thing this buys is the ORDER of two big allocations.
+set -u
+
+UNIT=${JARVIS_BREEZE_UNIT:-jarvis-breeze.service}
+SOCK=${JARVIS_BREEZE_SOCK:-/tmp/vss_voice/breeze.sock}
+# 33.0 s measured end to end, plus room for a start queued behind another job
+# on ~/voice-training/.gpu.lock.
+WAIT_S=${JARVIS_BREEZE_WAIT_S:-90}
+JARVIS_PYTHON=${JARVIS_PYTHON:-$HOME/vss_env/bin/python}
+# Derived from this script's own location, so a checkout somewhere other
+# than ~/Jarvis needs no substitution anywhere.
+JARVIS_HOME=${JARVIS_HOME:-$(cd "$(dirname "$0")/.." && pwd)}
+LOG=${JARVIS_AUTOSTART_LOG:-/tmp/vss_voice/autostart.log}
+
+mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+say() { printf '%s jarvis-autostart: %s\n' "$(date +%H:%M:%S.%3N)" "$*" >>"$LOG" 2>/dev/null; }
+
+# A ping that says READY, not merely "the socket exists": the socket is bound
+# before the warm renders finish, and capture is what we are waiting out.
+breeze_ready() {
+    /usr/bin/python3 - "$SOCK" <<'PY' >/dev/null 2>&1
+import json, socket, sys
+s = socket.socket(socket.AF_UNIX)
+s.settimeout(3.0)
+s.connect(sys.argv[1])
+s.sendall(b'{"ping": true}\n')
+buf = b""
+while b"\n" not in buf:
+    chunk = s.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+r = json.loads(buf.split(b"\n")[0] or b"{}")
+sys.exit(0 if (r.get("ready") and r.get("graphs")) else 1)
+PY
+}
+
+wait_for_breeze() {
+    if ! command -v systemctl >/dev/null 2>&1; then
+        say "no systemctl; not waiting"; return
+    fi
+    local enabled
+    enabled=$(systemctl --user is-enabled "$UNIT" 2>/dev/null || true)
+    if [ "$enabled" != "enabled" ] && [ "$enabled" != "static" ]; then
+        say "$UNIT is not enabled ($enabled); not waiting"; return
+    fi
+    local deadline=$(( $(date +%s) + WAIT_S ))
+    local t0; t0=$(date +%s)
+    say "waiting up to ${WAIT_S}s for $UNIT"
+    while :; do
+        if breeze_ready; then
+            say "sidecar ready after $(( $(date +%s) - t0 ))s"; return
+        fi
+        local state
+        state=$(systemctl --user is-active "$UNIT" 2>/dev/null || true)
+        case "$state" in
+            active|activating|reloading) : ;;
+            *) say "$UNIT is $state after $(( $(date +%s) - t0 ))s; not waiting"
+               return ;;
+        esac
+        [ "$(date +%s)" -ge "$deadline" ] && {
+            say "$UNIT did not answer in ${WAIT_S}s; starting on F5"; return; }
+        sleep 1
+    done
+}
+
+wait_for_breeze
+cd "$JARVIS_HOME" || exit 1
+say "exec $JARVIS_PYTHON -m jarvis.app"
+exec "$JARVIS_PYTHON" -m jarvis.app "$@"
