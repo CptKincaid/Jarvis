@@ -221,10 +221,31 @@ def target_label(cfg, args) -> tuple:
     The label goes into an npz key, a log line and a report he pastes, so it
     is checked against ``facegallery``'s own pattern BEFORE anything is
     opened: a name that cannot be stored must cost the run at the argument,
-    not after a minute in front of the camera."""
+    not after a minute in front of the camera.
+
+    HIS OWN LABEL IS CHECKED TOO, and it used to be the one that was not.
+    ``owner_label`` derives it from ``user.name``, keeping any character
+    ``isalnum()`` likes -- which includes non-ASCII -- while the gallery
+    stores under ``^[a-z0-9][a-z0-9_-]{0,30}$``. A ``user.name`` of "Jose"
+    with an accent, or one over 31 characters, produced a label
+    ``gallery.add`` refuses on EVERY sample: ``EnrolmentSession.offer``
+    catches the ValueError and records "gallery refused the embedding", so
+    the run spent his minute in front of the camera, captured nothing, and
+    failed the samples check at the end for a reason the config could have
+    given at the start. The voice path already checked (``enrol_answer``
+    calls ``label_ok`` and answers "That isn't a name I can store, sir"); the
+    two entry points now agree."""
     want = str(getattr(args, "label", "") or "").strip().lower()
     if not want:
-        return owner_label(cfg), ""
+        mine = owner_label(cfg)
+        if not label_ok(mine):
+            return "", ("your own name in the config does not make a usable "
+                        "label (%r from user.name %r): lowercase letters, "
+                        "digits, - and _ only, up to 31 characters. Set "
+                        "user.name in ~/.config/jarvis/assistant.json, or "
+                        "pass --label."
+                        % (mine, str(cfg.get("user.name", "") or "")))
+        return mine, ""
     if not label_ok(want):
         return "", ("%r is not a usable label: lowercase letters, digits, - "
                     "and _ only, up to 31 characters. It becomes a key in "
@@ -260,6 +281,17 @@ CONSENT_LINES = (
 )
 
 
+def _isatty(stream) -> bool:
+    """True only when ``stream`` is really a terminal.
+
+    A stream that cannot answer is NOT a terminal: this gates biometric
+    consent, so the unknown case has to fail closed."""
+    try:
+        return bool(stream.isatty())
+    except Exception:  # noqa: BLE001 - a stream that cannot say is not a tty
+        return False
+
+
 def consent(label: str, owner: str, root, say, args) -> tuple:
     """``(ok, how)``. Enrolling somebody else takes THEIR agreement.
 
@@ -273,6 +305,18 @@ def consent(label: str, owner: str, root, say, args) -> tuple:
     prompt would land in the middle of it -- a consent nobody could read is
     not a consent, and a pipe is exactly how "enrol whoever is in frame"
     would get automated.
+
+    AND NEITHER CAN A PIPE, which is the same sentence and used to be only
+    half enforced. Blocking --json closed the flag and left the mechanism it
+    was named after wide open: ``echo heather | face_enrol.py --label heather
+    --auto --yes`` satisfied this prompt with nobody at the keyboard, and the
+    run then wrote "consent typed at the keyboard" into the generation's
+    provenance -- a FALSE ATTESTATION on disk, which is worse than no record,
+    because the provenance string is the only durable thing that claims the
+    consent happened at all. So both ends are checked: stdin must be a
+    terminal (somebody typed it) and stdout must be a terminal (they could
+    read what they were agreeing to). Redirecting either one is refused with
+    the same sentence --json gets.
     """
     if label == owner:
         return True, "owner"
@@ -282,6 +326,21 @@ def consent(label: str, owner: str, root, say, args) -> tuple:
         return False, ("consent for %r cannot be taken through --json: the "
                        "person being enrolled has to read what is stored "
                        "and type their own name" % label)
+    if getattr(args, "auto", False):
+        # --auto removes the Enter between stations. For his own face that is
+        # a convenience; for somebody else's it removes the only evidence,
+        # station by station, that the person is still there and still
+        # willing -- a capture nobody has to press a key for is a capture
+        # nobody has to be present for.
+        return False, ("--auto cannot be used to enrol %r: it removes the "
+                       "key press between stations, and somebody else's "
+                       "enrolment is the one that needs them at the "
+                       "keyboard throughout" % label)
+    if not (_isatty(sys.stdin) and _isatty(sys.stdout)):
+        return False, ("consent for %r cannot be taken through a pipe: the "
+                       "person being enrolled has to read what is stored "
+                       "and type their own name, at a terminal. Run this "
+                       "without redirecting stdin or stdout." % label)
     say("")
     for line in CONSENT_LINES:
         say(line % fields)
@@ -341,21 +400,31 @@ def do_status(cfg, gallery: FaceGallery, say) -> tuple:
            ", ".join(gallery.labels()) or "-"))
     payload["notes"] = []
     payload["coverage"] = {}
+    # PER LABEL, KEYED BY LABEL. These five used to be written flat onto the
+    # payload inside this loop, so with two people enrolled the last label
+    # round the loop overwrote the first and --json reported ONE pool's
+    # numbers as the gallery's: measured on a two-person store, a healthy
+    # cohesion_min 0.998 printed over a gallery whose weakest pool was 0.466.
+    # The text half was right all along, which is exactly why nobody saw it.
+    # The gallery-wide keys below are the MIN across labels, which is the
+    # only aggregate that means anything for a "worst pool" number.
+    payload["by_label"] = {}
     for label in gallery.labels():
         embs = gallery.embeddings(label)
         takes = gallery.takes(label)
         pairs = fe.pairwise_cosines(embs)
         coh = fe.cohesion(embs)
-        payload["pairs"] = len(pairs)
-        payload["cos_min"] = min(pairs) if pairs else 0.0
-        payload["cos_p50"] = vr._pct(pairs, 0.5)
-        payload["cos_max"] = max(pairs) if pairs else 0.0
-        payload["cohesion_min"] = min(coh) if coh else 0.0
+        one = {"pairs": len(pairs),
+               "cos_min": min(pairs) if pairs else 0.0,
+               "cos_p50": vr._pct(pairs, 0.5),
+               "cos_max": max(pairs) if pairs else 0.0,
+               "cohesion_min": min(coh) if coh else 0.0}
+        payload["by_label"][label] = one
         say("  %-10s %d embeddings, %d pairs, cosine min %.3f p50 %.3f "
             "max %.3f, worst cohesion %.3f"
             % (label, len(embs), len(pairs),
-               payload["cos_min"], payload["cos_p50"], payload["cos_max"],
-               payload["cohesion_min"]))
+               one["cos_min"], one["cos_p50"], one["cos_max"],
+               one["cohesion_min"]))
         # WHAT EACH POSE IS WORTH. The notes exist to answer one question --
         # "which pose is letting me down" -- and --status is where he asks
         # it, because it is the mode that needs no camera and no minute of
@@ -746,7 +815,15 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
     and it has to mean it: ``forget()`` plus a save would leave her in every
     older generation, one --rollback from coming back and still lying on the
     disk as 128 floats a take. ``purge_label`` writes what is left FIRST and
-    then shreds every generation that held her.
+    then shreds every generation PROVEN to hold her, plus every crashed-save
+    ``.tmp`` (a whole pool that no label can filter and that the read-back
+    below cannot see, because ``generations()`` is blind to it by design).
+
+    WHAT IT WILL NOT DO IS DESTROY A FILE IT COULD NOT READ. That is a
+    deletion that cannot be verified either way, and the cost of guessing
+    wrong is the whole gallery -- so an unreadable generation is NAMED here
+    and the "verified" line is withheld. ``--delete`` with no ``--label`` is
+    the command that means everything, and it is one line further down.
 
     ``camera.identity`` is NOT touched here. It is the switch on his own
     face being written down at all; removing somebody else must not turn his
@@ -754,9 +831,24 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
     gallery.load()
     out = gallery.purge_label(label, reason="face_enrol --delete --label %s"
                               % label)
-    if not out["generations_with"] and not out["unreadable_removed"]:
+    unreadable = list(out.get("unreadable") or ())
+    if not out["generations_with"]:
         say("Nothing enrolled under %r at %s (labels: %s)"
             % (label, gallery.root, ", ".join(gallery.labels()) or "-"))
+        if out.get("tmp_removed"):
+            say("           %d crashed-save leftover(s) destroyed as well: "
+                "a .tmp holds a whole pool and no name can filter it."
+                % out["tmp_removed"])
+        if unreadable:
+            say("           %d generation(s) could NOT be read and were left "
+                "alone: %s. Nothing can say whether they hold %r, so nothing "
+                "here may claim they do not."
+                % (len(unreadable),
+                   ", ".join(str(g) for g in unreadable), label))
+            say("           Try --status, then --rollback to drop a bad "
+                "newest generation, or --delete with no --label to destroy "
+                "everything.")
+            return 1, out
         return 3, out
     if out["reason"]:
         say("STOPPED: %s" % out["reason"])
@@ -765,11 +857,10 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
         return 1, out
     say("deleted    %r from %d generation(s); %d file(s) overwritten and "
         "unlinked" % (label, len(out["generations_with"]), out["removed"]))
-    if out["unreadable_removed"]:
-        say("           %d unreadable generation(s) destroyed as well: "
-            "nothing can prove they do not hold %r either, and a delete "
-            "that leaves a maybe on the disk has not deleted anything."
-            % (out["unreadable_removed"], label))
+    if out.get("tmp_removed"):
+        say("           %d crashed-save leftover(s) destroyed as well: a "
+            ".tmp holds a whole pool and no name can filter it."
+            % out["tmp_removed"])
     if out["generation"]:
         say("           what is left is generation %d: %d embeddings over "
             "%s" % (out["generation"], out["left"],
@@ -783,7 +874,9 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
         say("           camera.identity is untouched -- run --delete with "
             "no --label to turn the feature off as well.")
     # Read it back rather than claim it. A delete that reports success over a
-    # file that still parses with her in it is the whole failure mode.
+    # file that still parses with her in it is the whole failure mode -- and
+    # so is one that reports success over a .tmp, which is why the leftovers
+    # are counted here too and not only the generations.
     back = FaceGallery(root=gallery.root)
     back.load()
     still = [g for g in back.generations()
@@ -791,6 +884,21 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
     if still:
         say("           FAILED: generation(s) %s still hold %r"
             % (", ".join(str(g) for g in still), label))
+        return 1, out
+    left_tmps = back.leftovers()
+    if left_tmps:
+        say("           FAILED: %s survived, and a .tmp holds a whole pool"
+            % ", ".join(left_tmps))
+        return 1, out
+    if unreadable:
+        # The one thing this command may not do is print "verified" over a
+        # file nothing could open.
+        say("           NOT VERIFIED: %d generation(s) could not be read and "
+            "were left alone: %s. They may or may not hold %r; nothing here "
+            "can tell, and nothing here destroyed them."
+            % (len(unreadable), ", ".join(str(g) for g in unreadable), label))
+        say("           Run --status, then --rollback to drop a bad newest "
+            "generation, or --delete with no --label to destroy everything.")
         return 1, out
     say("           verified: no generation on disk holds %r any more."
         % label)

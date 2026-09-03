@@ -5812,19 +5812,50 @@ def _h_sensing_curfew(c, t, m):
 # guided run needs the camera device the running Jarvis owns, a key press
 # between stations, and produces thirty lines of numbers he PASTES -- three
 # things a spoken assistant is the wrong shell for. So "enrol my face" hands
-# over the exact command with his poses and label already in it and puts it
-# on the clipboard, while "who do you recognise" is answered in full, here,
-# because none of that needs a lens. See jarvis/enrolentry.py.
+# over the exact command -- with his label in it, and with --pose and
+# --append too when he named what he will be doing ("enrol my face looking
+# at my phone") -- and puts it on the clipboard, while "who do you recognise"
+# is answered in full, here, because none of that needs a lens. See
+# jarvis/enrolentry.py.
 #
 # DELETING IS HANDED OVER TOO. "Forget Heather's face" arrives as a
 # speech-recognition result, and a misheard word may not destroy biometric
 # data; the typed confirmation stays in the terminal.
-_FACE_WHO = r"(?P<who>[a-z][a-z0-9 '\u2019_-]{0,30}?)"
-_FACE_TAIL = r"(?:[,\s]+(?:please|now|sir))*[?.!\s]*$"
+#
+# WHY WHO IS TWO TOKENS AND NOT A FREE SPAN. The first cut of this grammar
+# let 31 arbitrary characters -- SPACES INCLUDED -- sit between the verb and
+# the word "face", which turns every ordinary "<verb> <something> face"
+# utterance into a face command: "add a reminder to wash my face" enrolled
+# somebody called "a-reminder-to-wash-my", spoke a forty-word consent
+# paragraph and overwrote his clipboard, and because these three are in
+# ASSISTANT_TIER1 it did that WITHOUT the background-chat intent gate ever
+# getting a say. So WHO is at most two name-shaped tokens, and no token may
+# be a function word: with that, "add cream for my face", "remove the hair
+# from my face", "delete that photo of my face" and "forget what I said
+# about her face" all fail to match at all and fall through to the model,
+# which is what they were always meant to do. Swept against 582 real
+# utterances (his live log plus every tests/ handle()) -- nothing he has
+# ever said changes hands.
+_FACE_STOP = (r"for|to|from|of|about|that|this|on|in|at|by|with|and|but|or|it|"
+              r"is|was|what|which|when|while|if|so|there|here|all|any|some")
+_FACE_TOK = r"(?!(?:%s)\b)[a-z][a-z0-9'\u2019_-]{0,19}" % _FACE_STOP
+_FACE_WHO = r"(?P<who>%s(?:\s+%s)?)" % (_FACE_TOK, _FACE_TOK)
+# NAMING THE POSE IS THE FEATURE, not decoration: "add more ways for me to be
+# recognised (looking at my phone, looking away)" is what was asked for, and
+# without this the --pose half of the script was unreachable from inside
+# Jarvis and --append with it -- so every spoken enrolment was a pool-
+# REPLACING run. The clause is bounded and introduced by a fixed word, and
+# enrolentry.command_line shlex-quotes it before it reaches the clipboard.
+_FACE_POSE = (r"(?:\s+(?P<pose>(?:looking|facing|turned|wearing|holding|with|"
+              r"while|when|without)\s+[a-z0-9][a-z0-9 '\u2019_-]{0,60}?))?"
+              )
+_FACE_TAIL = r"(?:[,\s]+(?:please|now|sir|again))*[?.!\s]*$"
 _FACE_ENROL_RX = re.compile(
     r"^(?:please\s+|can\s+you\s+|could\s+you\s+)?"
-    r"(?:enroll?|register|add)\s+" + _FACE_WHO + r"(?:'s|\u2019s)?\s+face"
-    r"(?:\s+(?:in|into|to)\s+(?:the\s+)?(?:gallery|camera))?" + _FACE_TAIL,
+    r"(?:(?:enroll?|register|add|remember|learn|memori[sz]e)\s+" + _FACE_WHO +
+    r"(?:'s|\u2019s)?\s+face"
+    r"(?:\s+(?:in|into|to)\s+(?:the\s+)?(?:gallery|camera))?"
+    r"|(?:enroll?|register)\s+(?P<mine>me|myself))" + _FACE_POSE + _FACE_TAIL,
     re.I)
 _FACE_FORGET_RX = re.compile(
     r"^(?:please\s+|can\s+you\s+|could\s+you\s+)?"
@@ -5833,10 +5864,13 @@ _FACE_FORGET_RX = re.compile(
     r"(?:\s+from\s+(?:the\s+)?gallery)?" + _FACE_TAIL, re.I)
 _FACE_GALLERY_RX = re.compile(
     r"^(?:"
-    r"who(?:se)?\s+faces?\s+do\s+you\s+(?:know|recogni[sz]e|have)"
+    r"(?:who(?:se)?|what|how\s+many)\s+faces?\s+do\s+you\s+"
+    r"(?:know|recogni[sz]e|have)"
     r"|who\s+do\s+you\s+recogni[sz]e"
+    r"|who(?:'s|\u2019s| is)\s+in\s+(?:the\s+)?face\s+gallery"
     r"|(?:what(?:'s| is)\s+)?(?:in\s+)?(?:the\s+)?face\s+gallery"
     r"|(?:whose\s+)?faces?\s+(?:are\s+)?enrol(?:l)?ed"
+    r"|am\s+i\s+enrol(?:l)?ed"
     r"|face\s+enrol(?:l)?ment\s+status"
     r"|which\s+(?:of\s+my\s+)?(?:pose|take)s?\s+is\s+(?:the\s+)?weak(?:est)?"
     r")" + _FACE_TAIL, re.I)
@@ -5867,17 +5901,23 @@ def _face_gallery():
 
 
 def _h_face_enrol(c, t, m):
-    """"Enrol my face" / "add Heather's face to the gallery"."""
+    """"Enrol my face" / "add Heather's face to the gallery" / "enrol my face
+    looking at my phone"."""
     from jarvis import enrolentry as ee
     owner = _face_owner(c)
-    who = ee.spoken_label(m.group("who") or "", owner)
+    # "enrol me" names him with no WHO group at all; anything else names the
+    # person, or names nobody and gets asked.
+    spoken = m.group("who") or ("my" if m.groupdict().get("mine") else "")
+    who = ee.spoken_label(spoken, owner)
     if not who:
         return CommandResult(
             handled=True, speak=True,
             reply="Whose face, sir? Say \"enrol my face\", or give me the "
                   "name to store it under.",
             status="Enrolment: whose?")
-    out = ee.enrol_answer(_face_gallery(), who, owner=owner)
+    pose = ee.spoken_pose(m.groupdict().get("pose") or "")
+    out = ee.enrol_answer(_face_gallery(), who, owner=owner,
+                          poses=(pose,) if pose else ())
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          status=out["status"])
 

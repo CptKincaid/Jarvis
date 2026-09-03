@@ -311,6 +311,20 @@ _MINE = ("my", "me", "mine", "myself", "your", "yours")
 _NOBODY = ("a new", "another", "someone", "somebody", "a", "an", "the",
            "this", "that", "his", "her", "their", "a new person",
            "another person", "a person", "some", "new")
+# A FUNCTION WORD IS NOT PART OF A NAME. The commander's grammar already
+# refuses to let one INTO the who group -- that is where the "add a reminder
+# to wash my face" class was closed -- but this function is the one any
+# caller reaches for, so it refuses them here as well rather than trusting a
+# regex two modules away. Only the whole-phrase list above catches "the";
+# this catches "that photo", where each token is fine and the phrase is not.
+_FILLER = ("for", "to", "from", "of", "about", "on", "in", "at", "by", "with",
+           "and", "but", "or", "it", "is", "was", "what", "which", "when",
+           "while", "if", "so", "there", "here", "all", "any", "some",
+           # determiners and possessives, which _NOBODY only catches when
+           # they are the WHOLE phrase: "that photo" is two good tokens and
+           # still nobody.
+           "a", "an", "the", "that", "this", "these", "those", "my", "your",
+           "his", "her", "its", "their", "our")
 
 
 def spoken_label(text: str, owner: str = "hunter") -> str:
@@ -324,14 +338,34 @@ def spoken_label(text: str, owner: str = "hunter") -> str:
 
     Two words become one hyphenated label -- "Mary Jane" is ``mary-jane``,
     not ``mary`` -- because taking the first token silently enrols the wrong
-    name under a label that looks like it worked."""
+    name under a label that looks like it worked.
+
+    A phrase carrying a FUNCTION WORD names nobody either, and returns "" the
+    same way "the" does. "That photo" and "hair from" are each two perfectly
+    valid tokens and neither is a person; storing one produces a real,
+    gallery-shaped, permanent label in the one store whose entire point is
+    knowing whose face it holds."""
     word = str(text or "").strip().lower()
     word = word.replace("'s", "").replace("\u2019s", "").strip()
     if not word or word in _MINE:
         return owner
     if word in _NOBODY:
         return ""
-    parts = ["".join(c for c in w if c.isalnum() or c in "-_")
-             for w in word.split()]
+    parts = word.split()
+    if any(w in _FILLER for w in parts):
+        return ""
+    parts = ["".join(c for c in w if c.isalnum() or c in "-_") for w in parts]
     keep = "-".join(w for w in parts if w)
     return keep if label_ok(keep) else ""
+
+
+def spoken_pose(text: str) -> str:
+    """The pose in "enrol my face looking at my phone" -- "looking at my
+    phone" -- squeezed through the same cleaner the gallery stores notes with.
+
+    Says out loud what the note is FOR: it is written beside the embedding so
+    that six months later "which of my takes is letting me down" has an
+    answer better than an index. ``clean_note`` caps it and strips the
+    non-printables, and ``command_line`` shlex-quotes it before it goes
+    anywhere near his clipboard, so a spoken pose cannot become shell."""
+    return clean_note(str(text or "").strip())

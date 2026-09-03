@@ -444,6 +444,24 @@ def test_status_json_with_notes_is_still_numbers_and_strings_only(
 
 # ------------------------------------------------------------ other people
 CONSENT = ["--label", "heather"]
+# ENROL carries --auto, and somebody ELSE's enrolment refuses --auto by
+# design: a station nobody has to press a key for is a station nobody has to
+# be PRESENT for. So a second person's run takes the stations one Enter at a
+# time, which the patched input() answers exactly as it answers the consent
+# prompt.
+OTHER = [a for a in ENROL if a != "--auto"] + CONSENT
+
+
+@pytest.fixture(autouse=True)
+def _consent_happens_at_a_terminal(monkeypatch):
+    """Consent needs a real terminal at BOTH ends -- somebody typed it, and
+    they could read what they were agreeing to -- and under pytest neither
+    stream is one. Every test in this module that exercises the ceremony
+    would otherwise be testing the pipe refusal by accident.
+
+    The refusal itself is pinned by
+    ``test_consent_cannot_be_typed_by_a_pipe``, which opts back out."""
+    monkeypatch.setattr(face_enrol, "_isatty", lambda _stream: True)
 
 
 def test_enrolling_somebody_else_needs_their_typed_consent(monkeypatch,
@@ -451,7 +469,7 @@ def test_enrolling_somebody_else_needs_their_typed_consent(monkeypatch,
     """Her biometric data is hers to agree to, not his."""
     gallery, _feed = wire(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda *_a: "")
-    code = face_enrol.main(ENROL + CONSENT)
+    code = face_enrol.main(OTHER)
     out = capsys.readouterr().out
     assert code == 1, out
     assert gallery.generations() == []
@@ -463,7 +481,7 @@ def test_consent_says_what_is_stored_and_how_to_delete_it(monkeypatch,
                                                           tmp_path, capsys):
     wire(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda *_a: "no")
-    face_enrol.main(ENROL + CONSENT)
+    face_enrol.main(OTHER)
     out = capsys.readouterr().out
     assert "128" in out                       # what is stored
     assert "--delete --label heather" in out  # how to undo it
@@ -475,7 +493,7 @@ def test_yes_cannot_give_another_persons_consent(monkeypatch, tmp_path,
     """--yes is his flag. Consent is not his to give."""
     gallery, _feed = wire(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda *_a: "")
-    code = face_enrol.main(ENROL + CONSENT + ["--yes"])
+    code = face_enrol.main(OTHER + ["--yes"])
     assert code == 1
     assert gallery.generations() == []
     assert "CONSENT" in capsys.readouterr().out
@@ -486,7 +504,7 @@ def test_json_cannot_give_another_persons_consent(monkeypatch, tmp_path,
     """--json silences stdout, so the consent text nobody can see is a
     consent nobody gave."""
     gallery, _feed = wire(monkeypatch, tmp_path)
-    code = face_enrol.main(ENROL + CONSENT + ["--json"])
+    code = face_enrol.main(OTHER + ["--json"])
     payload = json.loads(capsys.readouterr().out)
     assert code == 1
     assert gallery.generations() == []
@@ -504,7 +522,7 @@ def test_a_second_person_does_not_disturb_the_first(monkeypatch, tmp_path,
 
     wire(monkeypatch, tmp_path, vectors=same_face(base_vec(808), 13, seed=17))
     monkeypatch.setattr("builtins.input", lambda *_a: "heather")
-    code = face_enrol.main(ENROL + CONSENT)
+    code = face_enrol.main(OTHER)
     out = capsys.readouterr().out
     assert code == 0, out
 
@@ -525,7 +543,7 @@ def test_a_second_person_is_judged_on_her_own_pool(monkeypatch, tmp_path,
     capsys.readouterr()
     wire(monkeypatch, tmp_path, vectors=same_face(base_vec(808), 13, seed=17))
     monkeypatch.setattr("builtins.input", lambda *_a: "heather")
-    assert face_enrol.main(ENROL + CONSENT) == 0
+    assert face_enrol.main(OTHER) == 0
     out = capsys.readouterr().out
     assert "[FAIL]" not in out
     assert "label      heather" in out
@@ -539,7 +557,7 @@ def test_re_enrolling_him_does_not_drop_her(monkeypatch, tmp_path, capsys):
     assert face_enrol.main(ENROL) == 0
     wire(monkeypatch, tmp_path, vectors=same_face(base_vec(808), 13, seed=17))
     monkeypatch.setattr("builtins.input", lambda *_a: "heather")
-    assert face_enrol.main(ENROL + CONSENT) == 0
+    assert face_enrol.main(OTHER) == 0
     capsys.readouterr()
 
     wire(monkeypatch, tmp_path, vectors=same_face(base_vec(5), 13, seed=19))
@@ -565,7 +583,7 @@ def test_enrolling_somebody_else_is_refused_while_sensing_says_no(
     gallery, _feed = wire(monkeypatch, tmp_path, camera=False,
                           feed_guard=True)
     monkeypatch.setattr("builtins.input", lambda *_a: "heather")
-    code = face_enrol.main(ENROL + CONSENT)
+    code = face_enrol.main(OTHER)
     out = capsys.readouterr().out
     assert code == 2
     assert "sensing says the camera may not run" in out
@@ -639,7 +657,7 @@ def test_the_command_deletes_one_person_and_says_what_went(monkeypatch,
     assert face_enrol.main(ENROL) == 0
     wire(monkeypatch, tmp_path, vectors=same_face(base_vec(808), 13, seed=17))
     monkeypatch.setattr("builtins.input", lambda *_a: "heather")
-    assert face_enrol.main(ENROL + CONSENT) == 0
+    assert face_enrol.main(OTHER) == 0
     capsys.readouterr()
 
     code = face_enrol.main(["--delete", "--label", "heather", "--yes"])
@@ -659,7 +677,7 @@ def test_deleting_one_person_leaves_the_identity_flag_alone(monkeypatch,
     assert face_enrol.main(ENROL) == 0
     wire(monkeypatch, tmp_path, vectors=same_face(base_vec(808), 13, seed=17))
     monkeypatch.setattr("builtins.input", lambda *_a: "heather")
-    assert face_enrol.main(ENROL + CONSENT) == 0
+    assert face_enrol.main(OTHER) == 0
     capsys.readouterr()
     assert face_enrol.main(["--delete", "--label", "heather", "--yes"]) == 0
     cfg = face_enrol.AssistantConfig.load()
@@ -672,7 +690,7 @@ def test_deleting_one_person_asks_for_their_name_first(monkeypatch, tmp_path,
     assert face_enrol.main(ENROL) == 0
     wire(monkeypatch, tmp_path, vectors=same_face(base_vec(808), 13, seed=17))
     monkeypatch.setattr("builtins.input", lambda *_a: "heather")
-    assert face_enrol.main(ENROL + CONSENT) == 0
+    assert face_enrol.main(OTHER) == 0
     capsys.readouterr()
     monkeypatch.setattr("builtins.input", lambda *_a: "no")
     code = face_enrol.main(["--delete", "--label", "heather"])
@@ -1307,7 +1325,7 @@ def test_a_refused_consent_does_not_turn_the_identity_gate_on(monkeypatch,
     declining to be enrolled must not have flipped it on by declining."""
     gallery, _feed = wire(monkeypatch, tmp_path)
     monkeypatch.setattr("builtins.input", lambda *_a: "no")
-    code = face_enrol.main(["--auto", "--gap-s", "0", "--enable-identity",
+    code = face_enrol.main(["--gap-s", "0", "--enable-identity",
                             "--label", "heather"])
     assert code == 1, capsys.readouterr().out
     cfg = face_enrol.AssistantConfig.load()
@@ -1323,7 +1341,7 @@ def test_nobody_is_asked_to_consent_to_a_run_that_was_going_to_stop(
     asked = []
     monkeypatch.setattr("builtins.input",
                         lambda *a: asked.append(a) or "heather")
-    code = face_enrol.main(["--auto", "--gap-s", "0", "--label", "heather"])
+    code = face_enrol.main(["--gap-s", "0", "--label", "heather"])
     out = capsys.readouterr().out
     assert code == 1
     assert "camera.identity is false" in out
@@ -1364,3 +1382,360 @@ def test_the_spoken_name_is_resolved_or_refused_never_guessed(said, want):
     perfectly valid gallery key and permanent junk in a store whose whole
     point is knowing who is in it."""
     assert ee.spoken_label(said, owner="hunter") == want
+
+
+# ---------------------------------------------------------------------------
+# THE SECOND PASS. Every test below is one a reviewer wrote down as MISSING
+# after reproducing the failure it pins on a throwaway gallery. They are
+# grouped rather than scattered because they share one sentence: a command
+# that deletes biometric data must destroy exactly what it proved it should,
+# say what it could not prove, and never claim more than it did.
+# ---------------------------------------------------------------------------
+
+def _unreadable(path: Path) -> None:
+    """Make a real generation unreadable the way a FUTURE BUILD would.
+
+    Not by truncating it -- by bumping ``_format``, which is precisely the
+    state ``FaceGallery._read`` is DESIGNED to produce on a format bump. That
+    matters: it means "unreadable" is not an exotic corruption, it is the
+    ordinary condition of every existing generation on the day the format
+    changes, and it is why destroying one on somebody's say-so is not a
+    tidy-up but a way to lose the whole gallery."""
+    data = dict(np.load(path))
+    data["_format"] = np.array([int(data["_format"][0]) + 1])
+    np.savez(path, **data)
+
+
+def test_purging_an_absent_label_never_destroys_an_unreadable_generation(
+        tmp_path):
+    """THE ONE THAT COULD HAVE EMPTIED HIS GALLERY.
+
+    ``purge_label`` used to shred every generation it could not PARSE, on the
+    reasoning that nothing can prove an unreadable file does not hold her.
+    Reproduced end to end on 2026-09-03: 13 hunter embeddings, one
+    generation, ``_format`` bumped by one -- ``--delete --label heather``
+    reported "1 unreadable generation(s) destroyed as well / nothing is left;
+    the gallery is empty", exited 0, and left an empty directory. Heather was
+    never enrolled."""
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)
+    g.save(reason="one")
+    _unreadable(g.root / "gen-00001.npz")
+
+    out = FaceGallery(root=g.root).purge_label("heather", reason="test")
+    assert out["removed"] == 0
+    assert out["unreadable"] == [1]
+    assert sorted(p.name for p in g.root.iterdir()) == ["gen-00001.npz"]
+
+
+def test_purging_an_absent_label_spares_the_unreadable_one_beside_a_good_one(
+        tmp_path):
+    """The same thing with a readable generation next to it: neither goes,
+    because neither was proven to hold her, and a no-op delete may not write
+    a redundant generation either."""
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)
+    g.save(reason="one")
+    g.save(reason="two")
+    _unreadable(g.root / "gen-00002.npz")
+
+    out = FaceGallery(root=g.root).purge_label("heather", reason="test")
+    assert out["removed"] == 0
+    assert out["generation"] == 0, "a delete of nobody must write nothing"
+    assert out["unreadable"] == [2]
+    assert sorted(p.name for p in g.root.iterdir()) == ["gen-00001.npz",
+                                                        "gen-00002.npz"]
+
+
+def test_the_command_refuses_to_claim_a_delete_it_could_not_verify(
+        monkeypatch, tmp_path, capsys):
+    """And it has to SAY so. The exit code is non-zero and the word
+    "verified" does not appear, because there is a file on the disk nothing
+    can open and therefore nothing can vouch for."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    assert face_enrol.main(ENROL) == 0
+    capsys.readouterr()
+    _unreadable(gallery.root / "gen-00001.npz")
+
+    code = face_enrol.main(["--delete", "--label", "heather", "--yes"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "verified" not in out
+    assert "could NOT be read" in out
+    assert (gallery.root / "gen-00001.npz").exists()
+
+
+def test_purging_the_last_person_takes_the_crashed_save_tmp_with_her(tmp_path):
+    """CONSENT WITHDRAWAL OVER DATA THAT IS STILL THERE.
+
+    ``gen-00002.npz.tmp`` holds a whole pool and does not match ``_GEN_RE``,
+    so ``generations()`` -- and every read-back that walks it -- is blind to
+    it. When somebody else survives the delete, ``save()`` -> ``_prune()``
+    shreds the tmps on the way past, which is exactly why this never showed:
+    when NOBODY survives there is no save, so her complete embedding set sat
+    on the disk under a command that printed "verified" and exited 0."""
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 9, seed=2):
+        g.add("heather", vec)
+    g.save(reason="one")
+    tmp = g.root / "gen-00002.npz.tmp"
+    tmp.write_bytes((g.root / "gen-00001.npz").read_bytes())
+
+    out = FaceGallery(root=g.root).purge_label("heather", reason="test")
+    assert out["tmp_removed"] == 1
+    assert list(g.root.iterdir()) == []
+
+
+def test_purging_takes_a_tmp_that_is_the_only_place_she_survives(tmp_path):
+    """She is in NO generation and only in a crashed save's leftovers. The
+    early return used to fire before anything was touched."""
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)
+    g.save(reason="one")
+    hers = FaceGallery(root=tmp_path / "h")
+    for vec in same_face(base_vec(808), 9, seed=17):
+        hers.add("heather", vec)
+    hers.save(reason="hers")
+    (g.root / "gen-00009.npz.tmp").write_bytes(
+        (hers.root / "gen-00001.npz").read_bytes())
+
+    out = FaceGallery(root=g.root).purge_label("heather", reason="test")
+    assert out["tmp_removed"] == 1
+    assert sorted(p.name for p in g.root.iterdir()) == ["gen-00001.npz"]
+    for path in g.root.iterdir():
+        assert b"heather" not in path.read_bytes()
+
+
+def test_the_command_verifies_the_leftovers_and_not_only_the_generations(
+        monkeypatch, tmp_path, capsys):
+    """The read-back has to be able to FAIL on a tmp, or "verified" means
+    "no generation", which is not what the sentence says."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    assert face_enrol.main(ENROL) == 0
+    wire(monkeypatch, tmp_path, vectors=same_face(base_vec(808), 13, seed=17))
+    monkeypatch.setattr("builtins.input", lambda *_a: "heather")
+    assert face_enrol.main(OTHER) == 0
+    capsys.readouterr()
+    gens = FaceGallery(root=gallery.root).generations()
+    (gallery.root / "gen-09999.npz.tmp").write_bytes(
+        (gallery.root / ("gen-%05d.npz" % gens[-1])).read_bytes())
+
+    assert face_enrol.main(["--delete", "--label", "heather", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "verified" in out
+    assert FaceGallery(root=gallery.root).leftovers() == [], out
+
+
+def test_a_failed_save_leaves_the_leftovers_alone_too(tmp_path, monkeypatch):
+    """"Nothing was destroyed" has to mean nothing, tmps included."""
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)
+    for vec in same_face(base_vec(808), 9, seed=17):
+        g.add("heather", vec)
+    g.save(reason="one")
+    (g.root / "gen-00002.npz.tmp").write_bytes(b"leftovers")
+
+    live = FaceGallery(root=g.root)
+    monkeypatch.setattr(FaceGallery, "save",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            ValueError("disk full")))
+    out = live.purge_label("heather", reason="test")
+    assert out["reason"] == "disk full"
+    assert out["removed"] == 0 and out["tmp_removed"] == 0
+    assert sorted(p.name for p in g.root.iterdir()) == \
+        ["gen-00001.npz", "gen-00002.npz.tmp"]
+
+
+def test_a_malformed_note_key_costs_the_note_and_not_the_embeddings(tmp_path):
+    """A COSMETIC FIELD MAY NOT COST THIRTEEN FACES.
+
+    Reproduced before the fix: a zero-length ``note_hunter_0003`` (IndexError
+    on ``[0]``) made the whole generation unreadable, ``load()`` fell back to
+    the one before, and -- compounding with the bug above -- a purge of
+    somebody who was never enrolled then shredded it."""
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)
+    g.save(reason="one")
+    data = dict(np.load(g.root / "gen-00001.npz"))
+    data["note_hunter_0003"] = np.array([])
+    data["yaw_hunter_0004"] = np.array([])
+    np.savez(g.root / "gen-00002.npz", **data)
+
+    back = FaceGallery(root=g.root)
+    assert back.load() is True
+    assert back.loaded_generation == 2, "a bad note cost the whole generation"
+    assert back.count("hunter") == 13
+    assert back.takes("hunter")[3].note == ""
+    assert back.takes("hunter")[4].yaw_deg is None
+
+
+def test_consent_cannot_be_typed_by_a_pipe(tmp_path, monkeypatch, capsys):
+    """THE MECHANISM --json WAS NAMED AFTER, LEFT OPEN.
+
+    Blocking --json closed the flag and not the pipe: ``echo heather |
+    face_enrol.py --label heather --auto --yes`` satisfied the prompt with
+    nobody at the keyboard, and the run then wrote "consent typed at the
+    keyboard" into the generation's provenance -- a false attestation on
+    disk, which is worse than no record at all."""
+    wire(monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *_a: "heather")
+    # OPTING BACK OUT of the module fixture: this is the one test that wants
+    # the streams pytest actually gives it, which are pipes.
+    monkeypatch.setattr(face_enrol, "_isatty", lambda _stream: False)
+    code = face_enrol.main(OTHER)
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "pipe" in out
+    assert not FaceGallery(root=tmp_path / "face_gallery").generations()
+
+
+def test_auto_cannot_capture_somebody_else(tmp_path, monkeypatch, capsys):
+    """A station nobody has to press a key for is a station nobody has to be
+    PRESENT for. --auto stays available for his own face."""
+    wire(monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *_a: "heather")
+    code = face_enrol.main(OTHER + ["--auto"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "--auto" in out
+
+
+def test_a_username_the_gallery_cannot_store_stops_before_the_camera(tmp_path):
+    """Not after a minute in front of it. ``owner_label`` keeps any character
+    ``isalnum()`` likes -- non-ASCII included -- while the gallery stores
+    under ``^[a-z0-9][a-z0-9_-]{0,30}$``, so a ``user.name`` of "José"
+    produced a label ``add()`` refuses on every single sample."""
+    class Cfg(dict):
+        def get(self, key, default=None):
+            return dict.get(self, key, default)
+
+    class Args:
+        label = ""
+
+    for name in ("José", "x" * 40, "-bob"):
+        label, why = face_enrol.target_label(Cfg({"user.name": name}), Args())
+        assert label == "" and "user.name" in why, name
+    label, why = face_enrol.target_label(Cfg({"user.name": "Hunter"}), Args())
+    assert (label, why) == ("hunter", "")
+
+
+def test_status_json_reports_each_pool_and_not_the_last_one_twice(
+        monkeypatch, tmp_path, capsys):
+    """--json's cohesion figures used to be written flat onto the payload
+    inside the per-label loop, so the last label overwrote the first: a
+    healthy 0.998 printed over a gallery whose weakest pool was 0.466. The
+    printed TEXT was right, which is why nobody saw it."""
+    g, _feed = wire(monkeypatch, tmp_path)
+    for vec in same_face(base_vec(1), 13, k=0.15, seed=2):
+        g.add("hunter", vec)
+    for vec in same_face(base_vec(808), 9, k=0.9, seed=17):
+        g.add("heather", vec)
+    g.save(reason="two people")
+
+    assert face_enrol.main(["--status", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)["result"]
+    by = payload["by_label"]
+    assert set(by) == {"hunter", "heather"}
+    assert by["hunter"]["cohesion_min"] != by["heather"]["cohesion_min"]
+    for label, one in by.items():
+        assert one["pairs"] > 0, label
+    assert "cohesion_min" not in payload, \
+        "a gallery-wide figure would be one pool's, reported as everyone's"
+
+
+@pytest.mark.parametrize("text", [
+    # THE CLASS THE FIRST GRAMMAR SWALLOWED. _FACE_WHO allowed 31 arbitrary
+    # characters INCLUDING SPACES between the verb and "face", so every
+    # ordinary "<verb> <filler> face" utterance became a face command --
+    # spoke a forty-word consent paragraph and overwrote his clipboard,
+    # without the background-chat gate ever getting a say.
+    "add a reminder to wash my face",
+    "add cream for my face",
+    "delete that photo of my face",
+    "remove the hair from my face",
+    "forget what i said about her face",
+    "add a note about her face",
+    "add sunscreen to my face",
+    "remove hair from face",
+    "add a face mask to the shopping list",
+    "remember that i like coffee",
+    "remember to wash my face",
+    "remember my dentist appointment",
+    "learn about my calendar",
+    "put cream on my face",
+    "what do you remember",
+    "do you recognize me now",
+    "forget me",
+    "remember me",
+])
+def test_an_ordinary_sentence_with_the_word_face_in_it_is_not_a_face_command(
+        text):
+    from jarvis import commander as cm
+    assert not [c.name for c in cm.REGISTRY
+                if c.name.startswith("face") and c.matcher(text)]
+    assert not [c.name for c in cm.ASSISTANT_TIER1
+                if c.name.startswith("face") and c.matcher(text)]
+
+
+@pytest.mark.parametrize("text,name", [
+    ("enrol me", "face enrol"), ("enroll me", "face enrol"),
+    ("register me", "face enrol"),
+    ("remember my face", "face enrol"),
+    ("learn heather's face", "face enrol"),
+    ("memorise my face", "face enrol"),
+    ("enrol my face again", "face enrol"),
+    ("enrol my face looking at my phone", "face enrol"),
+    ("add my face wearing glasses", "face enrol"),
+    ("add mary jane's face", "face enrol"),
+    ("unenrol heather's face", "face forget"),
+    ("what faces do you know", "face gallery"),
+    ("how many faces do you know", "face gallery"),
+    ("who's in the face gallery", "face gallery"),
+    ("am i enrolled", "face gallery"),
+])
+def test_the_natural_phrasings_reach_the_command_too(text, name):
+    """42 of 50 natural phrasings used to miss and fall through to a model
+    that would invent an answer -- the exact failure Tier 1 exists to stop."""
+    from jarvis import commander as cm
+    hits = [c.name for c in cm.REGISTRY
+            if c.name.startswith("face") and c.matcher(text)]
+    assert hits and hits[0] == name, hits
+
+
+def test_a_spoken_pose_reaches_the_handed_over_command(tmp_path):
+    """REQUIREMENT (c), FROM INSIDE JARVIS. ``--pose`` and ``--append`` used
+    to be unreachable from voice -- ``poses`` was never parsed and never
+    passed -- so every spoken enrolment handed over a POOL-REPLACING run over
+    his thirteen stored takes."""
+    from jarvis import commander as cm
+    m = cm._FACE_ENROL_RX.match("enrol my face looking at my phone")
+    assert m and ee.spoken_pose(m.group("pose")) == "looking at my phone"
+
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)
+    g.save(reason="one")
+    out = ee.enrol_answer(FaceGallery(root=g.root), "hunter", owner="hunter",
+                          poses=("looking at my phone",),
+                          clipboard=lambda _t: True)
+    assert "--pose 'looking at my phone'" in out["command"]
+    assert "--append" in out["command"], \
+        "a pose run over 13 stored takes must not replace the pool"
+
+
+def test_a_spoken_pose_cannot_become_shell(tmp_path):
+    """The pose comes off a speech recogniser and goes onto his CLIPBOARD,
+    which is a place he pastes things into a terminal. ``command_line``
+    shlex-quotes every part, so the whole clause stays ONE argument."""
+    import shlex
+    cmd = ee.command_line("hunter", owner="hunter",
+                          poses=("'; rm -rf ~; echo '",))
+    parts = shlex.split(cmd)
+    assert "rm" not in parts and "-rf" not in parts
+    assert parts[parts.index("--pose") + 1] == "'; rm -rf ~; echo '"
+    assert parts[-1] == "'; rm -rf ~; echo '", "the pose is the last word"

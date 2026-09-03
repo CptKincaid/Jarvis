@@ -296,6 +296,34 @@ def degenerate_reason(vec) -> str:
     return ""
 
 
+def _take_for(data, have, label: str, idx: str) -> Take:
+    """The note and yaw for one stored embedding, and never an exception.
+
+    Split out so the failure is contained to ONE take: see the block in
+    ``_read``. A key that will not read costs its own note, is logged, and
+    leaves a blank ``Take`` -- which is exactly the state every take his
+    2026-09-02 generation is in anyway, so nothing downstream is surprised
+    by it."""
+    note, yaw = "", None
+    note_key = "note_%s_%s" % (label, idx)
+    yaw_key = "yaw_%s_%s" % (label, idx)
+    if note_key in have:
+        try:
+            note = clean_note(str(data[note_key][0]))
+        except Exception:  # noqa: BLE001 - a bad note costs the note
+            log.warning("face gallery: unreadable %s; the take keeps its "
+                        "embedding and loses its note", note_key,
+                        exc_info=True)
+    if yaw_key in have:
+        try:
+            yaw = clean_yaw(data[yaw_key][0])
+        except Exception:  # noqa: BLE001
+            log.warning("face gallery: unreadable %s; the take keeps its "
+                        "embedding and loses its angle", yaw_key,
+                        exc_info=True)
+    return Take(note, yaw)
+
+
 class FaceGallery:
     """Enrolled faces, held in memory, persisted as numbered generations.
 
@@ -417,6 +445,16 @@ class FaceGallery:
             return []
         return sorted(p for p in self.root.iterdir() if _TMP_RE.match(p.name))
 
+    def leftovers(self) -> List[str]:
+        """The names of any crashed-save ``gen-NNNNN.npz.tmp`` files.
+
+        Public because a caller that has just deleted somebody has to be able
+        to CHECK, and ``generations()`` -- which every read-back walks -- is
+        blind to these by design (``_GEN_RE`` does not match them). A tmp
+        holds a whole pool, so one surviving is a failed deletion, not an
+        untidy directory."""
+        return sorted(p.name for p in self._tmp_paths())
+
     def load(self, generation: Optional[int] = None) -> bool:
         """Load one generation, defaulting to the newest that parses.
 
@@ -467,11 +505,17 @@ class FaceGallery:
                 continue
             label, idx = m.group(1), m.group(2)
             pool.setdefault(label, []).append(arr)
-            note_key = "note_%s_%s" % (label, idx)
-            yaw_key = "yaw_%s_%s" % (label, idx)
-            takes.setdefault(label, []).append(Take(
-                clean_note(str(data[note_key][0])) if note_key in have else "",
-                clean_yaw(data[yaw_key][0]) if yaw_key in have else None))
+            # A COSMETIC FIELD MAY NOT COST THE EMBEDDINGS. The note and the
+            # yaw are what a take was DOING; the vector is the enrolment. A
+            # zero-length or otherwise malformed note_/yaw_ key used to raise
+            # out of here, which _read turns into "this generation is
+            # unreadable" -- one bad string costing thirteen faces, and (with
+            # purge_label) an unreadable generation is the kind that gets
+            # destroyed. The pre-existing contract two lines up ("if not m:
+            # continue") was already to TOLERATE a key this build does not
+            # understand; this restores it for the keys this build added.
+            takes.setdefault(label, []).append(
+                _take_for(data, have, label, idx))
         prov = {"format": fmt,
                 "created_ns": int(data["_created_ns"][0]) if "_created_ns" in data.files else 0,
                 "reason": str(data["_reason"][0]) if "_reason" in data.files else "",
@@ -704,26 +748,47 @@ class FaceGallery:
         if that write fails nothing is destroyed at all -- a delete of one
         person may never cost another person's enrolment.
 
-        A generation that will not PARSE is destroyed too, and that is a
-        deliberate choice rather than an oversight: nothing can prove an
-        unreadable file does not hold her, it cannot be loaded or matched
-        against by anything, and a deletion that leaves a maybe on the disk
-        has not deleted anything. The count is returned separately so the
-        caller can say so out loud rather than have it happen quietly.
+        ONLY A GENERATION PROVEN TO HOLD HER IS DESTROYED. An earlier version
+        shredded every generation that would not PARSE as well, reasoning
+        that nothing can prove an unreadable file does not hold her. That is
+        true and it is not worth what it costs: ``_read`` REFUSES a format
+        number it does not recognise (that is the point of the check), so the
+        first build that bumps FORMAT makes every existing generation
+        "unreadable", and ``--delete --label somebody-who-was-never-enrolled``
+        would then destroy the whole gallery and exit 0. Measured 2026-09-03
+        on a throwaway store: 13 embeddings, one generation, ``_format``
+        bumped by one, ``--delete --label heather`` -> empty directory.
+        Unreadable generations are now COUNTED AND REPORTED and never
+        touched; the caller says so out loud and stops claiming the delete
+        was complete. Destroying them is still available and still one
+        command -- it is ``--delete`` with no ``--label``, which is the one
+        that means "everything".
+
+        CRASHED-SAVE LEFTOVERS GO, ALWAYS. ``gen-00002.npz.tmp`` holds a full
+        pool and does not match ``_GEN_RE``, so it is invisible to
+        ``generations()`` and to the caller's read-back -- and it cannot be
+        filtered by label, because it is somebody's whole pool. ``_prune()``
+        already shreds them on every ordinary save, which is exactly why this
+        was invisible: when somebody else survives, the save cleans up on the
+        way past. When NOBODY survives there is no save, and her complete
+        embedding set stayed on the disk under a command that printed
+        "verified". So they are shredded here, unconditionally, and counted.
 
         Every file goes through ``_shred`` -- overwritten, then unlinked.
         Read ``_shred`` for the limit of what that buys; the caller is only
         allowed to claim that part.
 
         Returns numbers, so a script can print them and a test can read them:
-        which generations held her, how many files went, which generation
-        holds what is left, and who is still enrolled.
+        which generations held her, how many files went, how many could not
+        be read and so were LEFT, which generation holds what is left, and
+        who is still enrolled.
         """
         if self.root is None:
             raise ValueError("this gallery has no root; it cannot be purged")
         label = str(label)
         out: dict = {"label": label, "generations_with": [], "removed": 0,
-                     "unreadable_removed": 0, "generation": 0, "left": 0,
+                     "unreadable": [], "tmp_removed": 0,
+                     "generation": 0, "left": 0,
                      "labels_left": (), "reason": ""}
         holds: List[int] = []
         unreadable: List[int] = []
@@ -736,7 +801,14 @@ class FaceGallery:
             if pool.get(label):
                 holds.append(gen)
         out["generations_with"] = list(holds)
-        if not holds and not unreadable:
+        out["unreadable"] = list(unreadable)
+        if not holds:
+            # Nothing on the disk was PROVEN to hold her, so nothing on the
+            # disk may be destroyed on her account. The tmps still go: they
+            # are a crashed save's leftovers, the next ordinary save would
+            # shred them anyway, and one of them may be the very pool she is
+            # asking to have removed.
+            out["tmp_removed"] = self._shred_tmps()
             return out
 
         self.load()
@@ -751,12 +823,16 @@ class FaceGallery:
             except ValueError as exc:
                 # The write that was going to carry everyone else forward
                 # failed. Destroying the old generations now would take them
-                # with her.
+                # with her -- and the tmps stay too, because "nothing was
+                # destroyed" has to mean nothing.
                 out["reason"] = str(exc)
                 log.warning("face gallery: not deleting %r -- what is left "
                             "could not be saved: %s", label, exc)
                 return out
-        for gen in holds + unreadable:
+        # No survivors means no save, and that is fine HERE and only here:
+        # the invariant the save protects is somebody else's enrolment, and
+        # when the pool is empty there is nobody else to lose.
+        for gen in holds:
             if gen == out["generation"]:
                 continue
             path = self.path_for(gen)
@@ -764,19 +840,35 @@ class FaceGallery:
                 continue          # _prune() may already have taken it
             try:
                 _shred(path)
-                if gen in unreadable:
-                    out["unreadable_removed"] += 1
-                else:
-                    out["removed"] += 1
+                out["removed"] += 1
             except OSError:
                 log.warning("could not delete face gallery generation %d",
                             gen, exc_info=True)
+        out["tmp_removed"] = self._shred_tmps()
         out["left"] = self.total()
         out["labels_left"] = self.labels()
         log.info("face gallery: %r removed from %d generation(s); %d "
-                 "embeddings over %d label(s) left",
-                 label, out["removed"], out["left"], len(out["labels_left"]))
+                 "embeddings over %d label(s) left; %d generation(s) could "
+                 "not be read and were LEFT ALONE",
+                 label, out["removed"], out["left"], len(out["labels_left"]),
+                 len(unreadable))
         return out
+
+    def _shred_tmps(self) -> int:
+        """Overwrite and unlink every ``gen-NNNNN.npz.tmp``; return the count.
+
+        A tmp is a whole pool that no name can filter, invisible to
+        ``generations()`` and therefore to any read-back that walks them.
+        ``_prune()`` already treats them as garbage on every save."""
+        gone = 0
+        for tmp in self._tmp_paths():
+            try:
+                _shred(tmp)
+                gone += 1
+            except OSError:
+                log.warning("could not delete face gallery leftover %s",
+                            tmp.name, exc_info=True)
+        return gone
 
     def drop_generations(self, generations) -> int:
         """Delete exactly these generations; return how many went.

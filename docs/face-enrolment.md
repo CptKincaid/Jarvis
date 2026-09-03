@@ -442,6 +442,14 @@ A note key is paired to its embedding **by index**, so a vector dropped for
 being degenerate takes its note with it — otherwise every note after it
 describes the wrong face.
 
+**And a malformed note costs the note, not the embeddings.** The `note_`/`yaw_`
+reads were unguarded at first, so a zero-length `note_hunter_0003` raised out of
+`_read` — which `load()` turns into "this generation is unreadable" and falls
+back past. Measured: one bad string cost 13 vectors, and (before the purge fix
+above) a delete of somebody never enrolled then shredded the file. A cosmetic
+field may not cost the enrolment; the pre-existing contract two lines up (`if not
+m: continue`) was already to *tolerate* a key this build does not understand.
+
 ### The side he has never given
 
 `pose_spread` counts `abs(yaw)`, so it cannot tell 13 takes spread from +2° to
@@ -479,6 +487,20 @@ where it exists and assumed nowhere. Pinned both ways by
 
 ---
 
+### `--status --json` reports each pool, keyed by name
+
+`pairs`, `cos_min`, `cos_p50`, `cos_max` and `cohesion_min` live under
+`result.by_label.<name>`. They used to be written flat onto the payload inside
+the per-label loop, so with two people enrolled the last label round the loop
+overwrote the first and the machine-readable half reported one pool's numbers as
+the gallery's: measured, a healthy `cohesion_min` 0.998 over a gallery whose
+weakest pool was 0.466. The printed text was right per label all along, which is
+exactly why nobody saw it. There is no gallery-wide `cohesion_min`, because the
+only honest aggregate is the minimum across labels and a reader who wants it can
+take it.
+
+---
+
 ## Other people — and their consent
 
 *This reverses the earlier "him only" ruling, at his request on 2026-09-03: "so i
@@ -497,7 +519,19 @@ comment:
   give — and `--json` cannot either, because in JSON mode stdout is a
   machine-readable document and the consent text nobody can see is a consent
   nobody gave. A pipe is exactly how "enrol whoever is in frame" would get
-  automated.
+  automated;
+* **and neither can a pipe**, which is the same sentence and used to be only
+  half enforced. Blocking `--json` closed the flag and left the mechanism it
+  was named after open: `echo heather | face_enrol.py --label heather --auto
+  --yes` satisfied the prompt with nobody at the keyboard, and the run then
+  wrote `consent typed at the keyboard` into the generation's provenance — a
+  **false attestation on disk**, worse than no record, because that string is
+  the only durable thing claiming the consent happened. Both ends are now
+  checked: stdin must be a terminal (somebody typed it) and stdout must be one
+  (they could read what they were agreeing to);
+* **`--auto` cannot be used on somebody else.** It removes the Enter between
+  stations, which for his own face is a convenience and for hers is the only
+  evidence, station by station, that she is still there and still willing.
 
 Consent is asked **after sensing and before anything is opened or turned on**, so
 a refused run leaves nothing switched on behind it — and a run sensing denied
@@ -507,12 +541,32 @@ never takes somebody's consent for a capture that cannot happen.
 just the newest. `forget()` plus a save would leave her in every older one, one
 `--rollback` from coming back and still lying on the disk as 128 floats a take.
 `FaceGallery.purge_label` writes what is left as a new generation **first**, then
-shreds every generation that held her — including any that will not parse,
-because nothing can prove those do not hold her either and a delete that leaves a
-maybe on the disk has not deleted anything. It then reads the store back and
-says whether it worked. `camera.identity` is untouched: it is the switch on his
-own face being written down, and removing somebody else must not turn his own
-recognition off.
+shreds every generation **proven** to hold her — plus every crashed-save
+`gen-NNNNN.npz.tmp`, unconditionally, because a tmp holds a whole pool that no
+label can filter and `generations()` is blind to it by design. It then reads the
+store back — generations *and* leftovers — and says whether it worked.
+`camera.identity` is untouched: it is the switch on his own face being written
+down, and removing somebody else must not turn his own recognition off.
+
+**It will not destroy a file it could not read.** An earlier version shredded
+every unparseable generation too, reasoning that nothing can prove one does not
+hold her. True, and not worth what it costs: `_read` *refuses* a format number
+it does not recognise — that is the point of the check — so the first build that
+bumps `FORMAT` makes every existing generation "unreadable", and `--delete
+--label somebody-never-enrolled` would then empty the gallery and exit 0.
+Measured 2026-09-03 on a throwaway store: 13 embeddings, one generation,
+`_format` bumped by one, `--delete --label heather` → empty directory, exit 0.
+Unreadable generations are now **named, left alone, and the "verified" line is
+withheld** with a non-zero exit. Destroying them is still one command — it is
+`--delete` with no `--label`, the one that means everything.
+
+**Two failures this closed on the withdrawal path.** Both were invisible in the
+common case because `save()` → `_prune()` shreds tmps on the way past whenever
+somebody else survives: (1) deleting the **last** enrolled person skipped the
+save, so her complete embedding set stayed in `gen-00002.npz.tmp` under a command
+printing *"verified: no generation on disk holds heather any more"*; (2) a person
+present **only** in a tmp returned "Nothing enrolled under heather", exit 3, with
+her nine embeddings still on the disk.
 
 **Everyone else survives a run that is not about them.** `save()` writes the
 whole in-memory pool, so a run that started from an empty object would write a
@@ -530,9 +584,37 @@ It is an **entry point, not a capture surface**, and it says so out loud. The
 guided run needs the camera device the running Jarvis owns, a key press between
 stations, and produces thirty lines of numbers he *pastes* — three things a
 spoken assistant is the wrong shell for. So "enrol my face" / "add Heather's
-face" hand over the exact command, with his named poses and the right label
-already in it, and put it on the clipboard (`xclip`, best-effort; if it does not
-land, the command goes into the reply instead).
+face" hand over the exact command, with the right label already in it, and put it
+on the clipboard (`xclip`, best-effort; if it does not land, the command goes
+into the reply instead).
+
+**A spoken pose reaches the command.** "Enrol my face looking at my phone" →
+`--pose 'looking at my phone'`, and `--append` with it when he already has takes,
+so a two-pose run cannot silently replace thirteen. That is requirement (c)
+— *"more ways for me to be recognized (looking at my phone, looking away etc)"* —
+and until 2026-09-03 it was unreachable from inside Jarvis: `poses` was never
+parsed and never passed, so every spoken enrolment handed over a pool-**replacing**
+run. `command_line` shlex-quotes the clause, so a spoken pose cannot become shell
+on the clipboard he pastes from.
+
+**Who is at most two name-shaped tokens, and no token may be a function word.**
+The first cut let 31 arbitrary characters — spaces included — sit between the
+verb and "face", so *"add a reminder to wash my face"* enrolled somebody called
+`a-reminder-to-wash-my`, spoke the forty-word consent paragraph and overwrote his
+clipboard — and because these three commands are Tier 1, without the
+background-chat intent gate ever getting a say. *"add cream for my face"*,
+*"remove the hair from my face"*, *"delete that photo of my face"* and *"forget
+what I said about her face"* now fail to match at all and fall through to the
+model, which is what they were always meant to do. Swept against 582 real
+utterances (his live log plus every `handle()` in `tests/`): nothing he has ever
+said changes hands.
+
+**The natural phrasings reach it too.** `remember` / `learn` / `memorise` are
+enrol verbs, "enrol me" needs no object, a trailing "again" is allowed, and
+"what faces do you know" / "how many faces do you know" / "who's in the face
+gallery" / "am I enrolled" answer from the gallery. Each was checked against the
+same 582-utterance corpus — `remember` in particular against the memory commands
+— with zero changes of hands.
 
 **"Who do you recognise" and "which pose is weakest" are answered in full**,
 because they read a gallery file and open nothing — and they are the questions
