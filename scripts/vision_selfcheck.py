@@ -53,6 +53,9 @@ from jarvis import camera as cam                          # noqa: E402
 from jarvis import facedetect                             # noqa: E402
 from jarvis import visionrig as vr                        # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
+from jarvis.config import PATHS                            # noqa: E402
+from jarvis.eye import FaceIdentifier                      # noqa: E402
+from jarvis.facegallery import FaceGallery                 # noqa: E402
 from jarvis.sensing import SensingPolicy                   # noqa: E402
 
 BANNER = (
@@ -325,11 +328,24 @@ def main(argv=None) -> int:
     detector, det_why = cam.detector_from_config(
         cfg, score_threshold=facedetect.PROBE_THRESHOLD)
     recogniser = None
+    identifier = None
     if bool(cfg.get("camera.identity", False)):
         recogniser, _rwhy = cam.recogniser_from_config(cfg)
+        # The GALLERY leg, when there is one: "is this him", against what
+        # scripts/face_enrol.py enrolled. Identity is computed only from a
+        # detection that already cleared min_conf -- FaceIdentifier enforces
+        # that itself -- because SFace scores non-faces CONFIDENTLY rather
+        # than low (jarvis/facemodels.py).
+        gallery = FaceGallery(root=PATHS.FACE_GALLERY)
+        if recogniser is not None and gallery.load():
+            identifier = FaceIdentifier(
+                gallery, recogniser,
+                min_conf=float(cfg.get("camera.min_conf", 0.6)),
+                match_min=float(cfg.get("camera.identity_min", 0.363)))
     rig = vr.Rig(cam.FeedSource(feed), detector, lens,
                  cam.thresholds_from_config(cfg),
-                 recogniser=recogniser, head=cam.head_from_config(cfg),
+                 recogniser=recogniser, identifier=identifier,
+                 head=cam.head_from_config(cfg),
                  detector_reason=det_why)
     result = rig.run(frames=args.frames, seconds=args.seconds)
     feed.close()

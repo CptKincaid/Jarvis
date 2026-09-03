@@ -1691,6 +1691,9 @@ TIER1_SAMPLES = {
     "room tone": "room tone on",
     # offline mode (jarvis/sensing.py) -- his own words for four of these
     "sensing off": "offline mode",
+    "face enrol": "enrol my face",
+    "face forget": "forget heather's face",
+    "face gallery": "who do you recognise",
     "sensing on": "come back online",
     "sensing status": "are you watching",
     "sensing hold": "no cameras for the next two hours",
