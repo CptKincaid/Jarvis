@@ -80,6 +80,7 @@ decision about what to do when the two legs disagree) lives in
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
@@ -109,6 +110,14 @@ def entity_path(domain: str, name: str) -> str:
 
 
 DEFAULT_ENTITY_PATH = entity_path("binary_sensor", PRESENCE_ENTITY)
+
+# The three DISTANCE entities, for jarvis/zones.py. Names, not object_ids,
+# for the reason spelled out above; ESPHome's ld2410 publishes them in
+# CENTIMETRES ({"id":"sensor/Moving distance","value":42,"state":"42 cm"},
+# measured 2026-09-03) and read_distance() returns metres.
+DETECTION_ENTITY = "Detection distance"
+MOVING_ENTITY = "Moving distance"
+STILL_ENTITY = "Still distance"
 # MEASURED against the live office radar, 25 polls at 4 Hz, 2026-09-03:
 # min 46 ms, median 62 ms, p90 154 ms, MAX 1186 ms. The old value here was
 # 1.5 s with the comment "LAN round trip is ~5 ms; this is pure paranoia" --
@@ -122,6 +131,9 @@ DEFAULT_COOLDOWN_S = 30.0
 MAX_COOLDOWN_S = 300.0
 MAX_BYTES = 4096            # an entity is ~60 bytes; anything else is wrong
 USER_AGENT = "jarvis-roomsensor/1"
+
+# "242 cm", "242", "2.42 cm" -- the leading number of a state string.
+_CM_RX = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*(?:cm)?$", re.I)
 
 _TRUE_WORDS = frozenset({"on", "true", "yes", "1", "occupied", "present",
                          "detected", "home", "active"})
@@ -184,6 +196,53 @@ def parse_state(body: Any) -> Optional[bool]:
     if isinstance(data, (bool, int, float, dict)):
         return parse_state(data)
     return None
+
+
+def parse_cm(body: Any) -> Optional[float]:
+    """An ESPHome distance entity -> centimetres, or None.
+
+    ``{"value": 242}`` is the typed field and wins; ``{"state": "242 cm"}``
+    is the display string and is the fallback for a firmware that omits
+    value. A null value (the radar has no target) is None, and so is a
+    negative number, HTML from a wrong URL, or anything else -- None here
+    means "no distance", never zero, because zero is a real reading that
+    means "no target of this kind" and the two must not merge.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "replace")
+    if isinstance(body, bool):
+        return None                       # a flag is not a distance
+    if isinstance(body, (int, float)):
+        return float(body) if body >= 0 else None
+    if isinstance(body, dict):
+        for key in ("value", "state"):
+            if key in body:
+                got = parse_cm(body[key])
+                if got is not None:
+                    return got
+        return None
+    text = str(body or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    else:
+        if isinstance(data, (bool, int, float, dict)):
+            return parse_cm(data)
+        if isinstance(data, str):
+            text = data
+        else:
+            return None
+    m = _CM_RX.match(text.strip())
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _from_mapping(data: dict) -> Optional[bool]:
@@ -257,6 +316,17 @@ class RoomSensor:
         self.power_url = str(power_url or "").strip().rstrip("/")
         self._post = post or _post_default
         self._power_warned = False      # one loud line per outage, not per retry
+        # The DISTANCE leg (jarvis/zones.py) gets its OWN failure counter,
+        # deliberately separate from the presence breaker above. A distance
+        # entity that 404s -- a renamed entity, a firmware without
+        # detection_distance -- would otherwise open the SHARED breaker and
+        # take PRESENCE down with it, and presence is the one thing this
+        # module exists to provide. So a bad distance costs the distance
+        # and nothing else: three failures in a row and it stops asking for
+        # a cooldown, with one warning line.
+        self._dist_fails = 0
+        self._dist_skip_until = 0.0
+        self._dist_down = False
         attach = getattr(policy, "attach", None)
         if callable(attach):
             attach(RADAR, self.stop, present=lambda: self.configured,
@@ -349,6 +419,63 @@ class RoomSensor:
         self._ok()
         self.last_value = value
         return value
+
+    def read_distance(self, entity: str = DETECTION_ENTITY) -> Optional[float]:
+        """The named distance entity in METRES, or None.
+
+        ESPHome publishes these in centimetres; the conversion happens here
+        so no caller has to remember it. None is "no distance" -- offline
+        mode, an open breaker, a timeout, a 404, a null value -- and is
+        NEVER 0.0, which is a real reading meaning "no target of this kind"
+        and is what the moving/still bits are derived from.
+
+        It asks the same ``blocked``/``paused`` gate as ``read()`` BEFORE
+        the socket, so offline mode covers it for free: while sensing is
+        denied no request is sent and ``reads`` does not move. A distance
+        read of anyone's own over urllib would have been a hole straight
+        through that promise, which is why this lives here and not in
+        jarvis/zones.py.
+        """
+        if not self.configured or self.paused:
+            return None
+        if self._dist_skip_until > self._now():
+            return None
+        url = urllib.parse.urlunsplit(
+            urllib.parse.urlsplit(self.url)._replace(
+                path=entity_path("sensor", entity), query="", fragment=""))
+        try:
+            body = self._get(url, self.timeout_s)
+        except Exception as exc:  # noqa: BLE001 - every transport failure is "unknown"
+            self.reads += 1
+            self._dist_failed(entity, exc)
+            return None
+        self.reads += 1
+        cm = parse_cm(body)
+        if cm is None:
+            self._dist_failed(entity, repr(body)[:120])
+            return None
+        self._dist_fails, self._dist_skip_until = 0, 0.0
+        if self._dist_down:
+            log.info("room sensor %s: %s is back", self.url, entity)
+            self._dist_down = False
+        return cm / 100.0
+
+    def _dist_failed(self, entity: str, detail: Any) -> None:
+        """Counts against the DISTANCE leg only -- never the presence
+        breaker. See the note in __init__."""
+        self._dist_fails += 1
+        if self._dist_fails < self.fail_after:
+            log.debug("room sensor distance %s: %s (%s)", entity, self.url, detail)
+            return
+        self._dist_skip_until = self._now() + self._base_cooldown
+        if not self._dist_down:
+            log.warning("room sensor %s: %r is unreadable (%s); zones will be "
+                        "unplaced, presence is unaffected",
+                        self.url, entity, detail)
+            self._dist_down = True
+        else:
+            log.debug("room sensor distance %s: %s; retrying in %.0fs",
+                      entity, self.url, self._base_cooldown)
 
     # ------------------------------------------------------------ breaker
     def _failed(self, kind: str, detail: Any) -> None:

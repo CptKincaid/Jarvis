@@ -85,6 +85,11 @@ os.environ["JARVIS_FACE_MODEL_DIR"] = str(_TEST_LOG_DIR / "face_models")
 # without this a test building the real App indexes into the user's
 # ~/.aiws_trainer/docs_index.
 os.environ["JARVIS_DOCS_INDEX_DIR"] = str(_TEST_LOG_DIR / "docs_index")
+# The zone transition log (jarvis/zones.py, PATHS.STATE_DIR): the real
+# ~/.local/state/jarvis/zones.jsonl is a record of which room he was in and
+# when, so the suite must never append to it -- nor read it. Forced, not
+# setdefault, for the same reason as the lines above.
+os.environ["JARVIS_STATE_DIR"] = str(_TEST_LOG_DIR / "state")
 # The room controls (jarvis/room.py, jarvis/mixer.py) shell out to xrandr,
 # gsettings and pactl, which act on the USER'S LIVE SESSION -- there is no
 # per-process display or sound server to redirect. The suite builds the real

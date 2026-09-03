@@ -109,6 +109,14 @@ class PATHS:
     CLAUDE_TASK_DIR = LOG_DIR / "claude"
     MCP_CONFIG = LOG_DIR / "mcp_jarvis.json"
     AUTOSTART_DESKTOP = Path.home() / ".config" / "autostart" / "jarvis.desktop"
+    # jarvis/zones.py: the zone TRANSITION LOG. XDG state rather than
+    # LOG_DIR because /tmp is wiped at every boot on this box (a tmpfiles
+    # `D /tmp` rule) and the whole point of a record is that it outlives
+    # one. JARVIS_STATE_DIR keeps the suite (tests/conftest.py) out of the
+    # real ~/.local/state/jarvis, which says who was in which room and
+    # when. The directory is created 0700 and the file 0600 by ZoneLog.
+    STATE_DIR = Path(os.environ.get("JARVIS_STATE_DIR") or
+                     (Path.home() / ".local" / "state" / "jarvis"))
 
 
 # ------------------------------------------------------------- settings
