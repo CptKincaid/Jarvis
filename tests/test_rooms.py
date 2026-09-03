@@ -533,6 +533,27 @@ def test_mesh_from_config_with_nothing_configured_is_idle():
     assert mesh._thread is None
 
 
+def test_back_online_inside_the_curfew_leaves_the_lens_off():
+    """"Offline mode" then "back online" at 22:00: the mesh tick checked
+    allowed() before renewing, but the SensingPolicy RESUME hook went
+    straight to renew(), pressed camera_lease_renew, set the intent to
+    ALLOW and had the spoken line name "kitchen camera" as resumed --
+    inside the curfew (F01, reproduced 2026-09-03). The gate now lives in
+    renew() itself, and a refused resume is neither claimed nor a failure."""
+    policy = Policy(camera=False, radar=True)   # i.e. curfew_active()
+    wire = Wire({"/binary_sensor/presence": ON,
+                 "/binary_sensor/radar_powered": ON,
+                 "/binary_sensor/camera_powered": OFF_BODY})
+    sat, wire, _ = make_sat(policy=policy, wire=wire, sensors=(RADAR, CAMERA))
+    wire.posts.clear()
+    assert sat.resume() is True                     # the policy's resume hook
+    assert any(u.endswith("/button/radar_lease_renew/press") for u in wire.posts)
+    assert not any("camera_lease_renew" in u for u in wire.posts)
+    assert sat.leases[CAMERA].intent != "allow"
+    from jarvis.sensing import Declined
+    assert isinstance(sat.renew(CAMERA), Declined)
+
+
 def test_the_curfew_closes_the_lens_and_leaves_the_radar_up():
     """The ruling jarvis/sensing.py made for the local box, carried one
     room out: at 21:00 the camera stops being renewed and the radar does

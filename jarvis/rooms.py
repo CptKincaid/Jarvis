@@ -90,7 +90,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from jarvis.logs import get_logger
-from jarvis.sensing import CAMERA, RADAR
+from jarvis.sensing import CAMERA, RADAR, Declined
 
 log = get_logger("rooms")
 
@@ -625,6 +625,16 @@ class Satellite:
         lease = self.leases.get(kind)
         if lease is None:
             return True                  # nothing here to lease
+        # THE GATE LIVES HERE, so every caller shares it. The mesh tick
+        # checked allowed() before renewing; the SensingPolicy resume hook
+        # did not, so "back online" at 22:00 pressed camera_lease_renew,
+        # set the intent to ALLOW and had Outcome name "kitchen camera" as
+        # resumed -- inside the curfew (F01, reproduced 2026-09-03). A room
+        # further out is exactly where the hard camera rule must not leak.
+        if not self.allowed(kind):
+            log.info("rooms: %s %s stays off; the house policy does not "
+                     "allow it now", self.spec.name, kind)
+            return Declined()
         ok = self._press(self.spec.renew_path.format(kind=kind))
         with self._lock:
             lease.intent = ALLOW

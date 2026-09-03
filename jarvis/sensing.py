@@ -125,6 +125,21 @@ MAX_STATE_BYTES = 4096         # the record is ~120 bytes; anything else is wron
 DEFAULT_ENFORCE_S = 15.0
 
 
+class Declined:
+    """The return value of a ``resume`` hook that a device's OWN policy gate
+    refused -- "back online" arriving inside the camera curfew.
+
+    TRUTHY like ``_PollingOnly`` (nothing went wrong), but ``_switch_devices``
+    files it under neither acted nor failed, so the spoken line does not
+    claim a lens came back that the house rule kept off. The alternative --
+    the hook returning True -- named "kitchen camera" among the resumed
+    while ``allowed(CAMERA)`` was False (F01, reproduced 2026-09-03).
+    """
+
+    def __bool__(self) -> bool:
+        return True
+
+
 class _PollingOnly:
     """The return value of a ``stop()`` that could only stop the POLLING.
 
@@ -539,6 +554,8 @@ class SensingPolicy:
                 failed.append(dev.name)
             elif isinstance(ok, _PollingOnly):
                 partial.append(dev.name)
+            elif isinstance(ok, Declined):
+                continue           # the device's own gate said no: not acted, not failed
             else:
                 acted.append(dev.name)
         if failed and tuple(failed) != self._last_failed:
