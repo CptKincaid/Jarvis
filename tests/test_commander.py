@@ -1648,6 +1648,10 @@ TIER1_SAMPLES = {
     "briefing section": "no news in the morning",
     "verbosity": "shorter briefings",
     "last mail": "what was my last email",
+    # The send-a-file family. The sample is his own phrasing from the
+    # brief; it arms a read-back and never a send, so the gate test can
+    # run it safely.
+    "send file": "email the lab report to heather",
     "liked songs": "play my liked songs",
     "music resume": "start playing my spotify",   # the 20:56:42 clause
     "diagnostics": "run diagnostics",
@@ -1708,6 +1712,14 @@ TIER1_SAMPLES = {
     "oracle action": "restart the haymaker bot",
     "oracle service": "is knightfall up",
     "oracle freeform": "run deploy on the oracle box",
+    # HPCOMPUTER's five doors, registered in Tier 1 for exactly the reason
+    # the Oracle five are: the hotword eats the wake word, so every one of
+    # them arrives bare and the prefixed registry pass never runs on it.
+    "remote push": "put the budget on hpcomputer",
+    "remote pull": "get the budget from hpcomputer",
+    "remote status": "is hpcomputer up",
+    "remote query": "what's the disk on hpcomputer",
+    "remote freeform": "run the build on hpcomputer",
     "gpu reclaim": "take the gpu back",
     "gpu lend": "lend the gpu",
     "log triage": "anything wrong in your log",

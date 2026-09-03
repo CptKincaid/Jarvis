@@ -110,6 +110,19 @@ os.environ["JARVIS_DESK_PRESENCE"] = "0"
 _OLLAMA_PORT = 11434
 _ollama_blocked: list = []
 
+# The SMTP SUBMISSION ports. jarvis/outbox.py sends mail with an attachment,
+# and that is the one thing this app does that reaches a stranger's inbox
+# and cannot be recalled -- so no test may open one of these, ever, and
+# there is no environment variable to let one through. The suite drives
+# mail.send_message with a fake transport (smtp=), exactly as the read side
+# is driven with a fake IMAP class; a socket on 465 means a test lost its
+# fake, and the right outcome is a loud failure rather than a real email
+# from his account. Same argument as the room controls and the speakers
+# above: some shared state has no throwaway copy, and his correspondents
+# are the least redirectable of all.
+_SMTP_PORTS = (25, 465, 587, 2525)
+_smtp_blocked: list = []
+
 
 def _blocked_player(argv) -> bool:
     """Stands in for earcons._spawn: the tone is "played" and the caller
@@ -235,11 +248,19 @@ def _firewall_live_log_dir():
     # store), so the suite stays green AND hermetic, instead of green and
     # quietly coupled to whichever model happens to be loaded.
     real_connect = socket.socket.connect
+    allow_ollama = os.environ.get("JARVIS_TEST_ALLOW_OLLAMA") == "1"
 
-    def _refuse_ollama(sock, address):
+    def _refuse(sock, address):
         port = (address[1] if isinstance(address, tuple) and len(address) > 1
                 else None)
-        if port == _OLLAMA_PORT:
+        if port in _SMTP_PORTS:
+            _smtp_blocked.append(address)
+            raise ConnectionRefusedError(
+                f"the suite must not open an SMTP connection ({address!r}): "
+                "a real email cannot be recalled. Pass a fake transport -- "
+                "mail.send_message(..., smtp=FakeSMTP) -- the way the read "
+                "side takes imap=. There is no override for this one.")
+        if port == _OLLAMA_PORT and not allow_ollama:
             _ollama_blocked.append(address)
             raise ConnectionRefusedError(
                 f"the suite must not reach the live Ollama at {address!r}: "
@@ -248,8 +269,9 @@ def _firewall_live_log_dir():
                 "deliberate live test.")
         return real_connect(sock, address)
 
-    if os.environ.get("JARVIS_TEST_ALLOW_OLLAMA") != "1":
-        socket.socket.connect = _refuse_ollama
+    # Installed unconditionally now: the Ollama leg still honours its
+    # environment escape inside _refuse, but the SMTP leg has none.
+    socket.socket.connect = _refuse
     try:
         yield
     finally:
