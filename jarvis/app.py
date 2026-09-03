@@ -2444,12 +2444,17 @@ class JarvisApp:
             # questions on the table is how a "yes" lands on the wrong one,
             # so the offer waits for that instead.
             if self._question_open(getattr(self, "commander", None)):
+                # Held -- and the question it is held BEHIND still needs
+                # its follow-up mic. Returning here dropped the window, so
+                # the "yes" to a read-back on the first turn of the day was
+                # never heard without a wake word (F35, 09-03; the old
+                # branch delivered the briefing and consumed the flag).
                 log.debug("briefing offer held: another question is open")
+            else:
+                self._briefing_pending = False
+                self._followup_after_speech = False
+                self._offer_first_wake_briefing()
                 return
-            self._briefing_pending = False
-            self._followup_after_speech = False
-            self._offer_first_wake_briefing()
-            return
         if self._followup_after_speech:
             self._followup_after_speech = False
             self._start_followup()

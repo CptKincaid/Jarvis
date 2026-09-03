@@ -2840,12 +2840,22 @@ BRIEFING_BUSY_LINE = "I'm still on the last one, sir; ask me for it in a moment.
 # _YES_WORDS, so "okay" used to answer this question with total silence --
 # must not start meaning yes to one.
 _BRIEFING_TAIL = r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|then|now))*[?.!]*$"
-_BRIEFING_YES_RX = re.compile(
-    r"^(?:jarvis[,\s]+)?"
+# An affirmative is a CHAIN: "Yes, go ahead." / "Yeah, sure." / "Okay, do
+# it." are how he actually answers, and a grammar that took one yes-word
+# plus a courtesy refused 26 of 37 natural answers (measured, 09-03, F36)
+# and routed "yes go ahead" to the model as a fresh command -- the day's
+# only offer gone. Still end-anchored, so "yes, turn the lights off" falls
+# through to the command it is.
+_BRIEFING_YES_WORD = (
     r"(?:yes|yeah|yep|yup|aye|affirmative|certainly|absolutely|definitely|"
     r"of course|sure(?: thing)?|ok(?:ay)?|alright|all right|sounds good|"
-    r"very well|please do|do it|do that|run it|go ahead|let'?s hear it|"
-    r"i would|if you would)" + _BRIEFING_TAIL, re.I)
+    r"very well|please do|do it|do that|run it|go ahead|go for it|why not|"
+    r"let'?s (?:hear it|do it)|i would|if you would|please|"
+    r"that would be great)")
+_BRIEFING_YES_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?" + _BRIEFING_YES_WORD
+    + r"(?:[,\s]+(?:" + _BRIEFING_YES_WORD
+    + r"|jarvis|sir|please|thanks|thank you|then|now))*[?.!]*$", re.I)
 # "go on" / "carry on" / "continue" are deliberately NOT here and neither
 # is a bare "skip": _READ_CTL_RX owns the first three and "skip" alone is
 # in the live log as a real command routed to local:music
@@ -10048,8 +10058,23 @@ class Commander:
             except Exception:                          # noqa: BLE001 - source
                 log.exception("send blew up for %s", name)
                 line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
-            bus.publish(JarvisReply(text=line))
             bus.publish(Status(text=status, kind=kind))
+            # Through the app's own door (services.reply -> _async_reply)
+            # when there is one: it shows, speaks, arms the follow-up
+            # window AND closes the turn. bus + _speak_now did the first
+            # two only, so after "Sent to Heather, sir." the wake word
+            # stayed dead for the 60 s watchdog (F20, 09-03). The fallback
+            # keeps _speak_now (the not-proactive door) rather than
+            # _deliver's talk-back-gated _speak: this line is the direct
+            # consequence of a yes he just gave.
+            reply = self._svc("reply")
+            if callable(reply):
+                try:
+                    reply(line, speak=True)
+                    return
+                except Exception:
+                    log.exception("services.reply failed")
+            bus.publish(JarvisReply(text=line))
             self._speak_now(line)
 
         self._bg(_run)

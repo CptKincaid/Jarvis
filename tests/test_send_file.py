@@ -623,6 +623,23 @@ def test_a_yes_then_sends_it(cmd):
     assert cmd._pending_send is None
 
 
+def test_a_voice_yes_closes_the_turn_through_the_app_door(cmd):
+    """The worker's "Sent to Heather, sir." went out through services.speak
+    only, and services.reply (_async_reply) is the ONE door that closes a
+    done=False turn -- so after a real send the wake word stayed dead for
+    the 60 s watchdog and no follow-up window opened (F20, 09-03). With the
+    app's reply door present the line goes through it; without one (this
+    fixture's default) the old direct door still speaks it."""
+    replied = []
+    cmd.services.reply = lambda text, speak=True: replied.append(text)
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    res = cmd.handle("yes", source="voice")
+    assert res.handled and res.ack and not res.done
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+    assert replied == ["Sent to Heather, sir."]
+    assert cmd.spoken == [], "spoken twice: once per door"
+
+
 def test_a_no_abandons_it(cmd):
     cmd.handle("email the biosensors handout to Heather", source="typed")
     res = cmd.handle("no", source="typed")
