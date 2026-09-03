@@ -450,7 +450,26 @@ DEFAULTS: dict = {
                  # the picture until it clears.
                  "rooms_poll_s": 2.0, "rooms_enter_hold_s": 2.0,
                  "rooms_leave_hold_s": 8.0, "rooms_switch_min_s": 6.0,
-                 "rooms_stale_after_s": 90.0, "rooms_stuck_after_h": 12.0},
+                 "rooms_stale_after_s": 90.0, "rooms_stuck_after_h": 12.0,
+                 # THE DOOR ROOM (jarvis/arrival.py, app._on_room_changed).
+                 # His words: "kitchen to see if i enter my apartment since
+                 # the kitchen and door are next to each other". That room
+                 # going occupied after a WHOLE-HOME absence is the front
+                 # door opening, and it is greeted straight away instead of
+                 # waiting for his phone's radio to answer an ARP. It must
+                 # match a `name` in `rooms` above; while no such room is
+                 # configured nothing here fires. A kitchen trip while he
+                 # is already home is not an arrival and never greets.
+                 "door_room": "kitchen",
+                 # "Welcome back from the dentist, sir" -- named only when
+                 # a calendar event honestly covered the absence, and the
+                 # plain "Welcome back, sir" otherwise. False keeps the
+                 # plain line always.
+                 "arrival_outing": True,
+                 # The doorstep OFFER: unread count plus one clause on
+                 # anything major, then a question. It never reads the mail
+                 # -- that needs a yes (Commander._try_briefing_offer).
+                 "arrival_offer": True},
     # Offline mode and the camera curfew (jarvis/sensing.py). ONE object
     # answers "may this sensor run", combining the manual switch (spoken:
     # "offline mode", "deactivate presence", "stop watching"), this daily

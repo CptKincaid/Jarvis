@@ -130,3 +130,48 @@ curl -s http://127.0.0.1:8783/binary_sensor/presence   # what the bedroom serves
 `--mode garbage|slow|error` rehearses the three failures worth rehearsing;
 under all three the house must fall back to the phone probe and nothing else
 may change.
+
+## 7. The kitchen is the front door
+
+His words: *"kitchen to see if i enter my apartment since the kitchen and door
+are next to each other"*. So one room is nominated as the DOOR, and that room
+going occupied **after a whole-home absence** is an arrival — greeted at once,
+rather than when his phone's radio next answers an ARP.
+
+```jsonc
+"presence": {
+  "door_room": "kitchen",     // must match a `name` in `rooms` above
+  "arrival_outing": true,     // "Welcome back from the dentist, sir"
+  "arrival_offer": true       // "You've 3 unread emails. Shall I go through them, sir?"
+}
+```
+
+It runs through the same `arrival_mod.run()` choreography as the phone and desk
+probes — panel, earcon, greeting, catch-up — and through the same
+`_greet_return` damper, so two sentinels noticing the same walk through the
+door is still ONE welcome. Code: `app._on_room_changed`, `arrival.DoorWatch`.
+
+**A kitchen trip mid-evening is not an arrival.** The gate is the absence, not
+the room: `presence.state` must read `away` (not `unknown`, so a restart while
+he is at his desk greets nobody). Making coffee at nine while he is already
+home never fires.
+
+**"Welcome back from X" needs evidence.** `arrival.outing()` names a calendar
+event only when he was out for at least half of it AND it ended no more than 45
+minutes before he walked in (or was still running). No calendar, an unreachable
+one, an all-day event, no recorded departure, a title too long to speak, or TWO
+events that both fit — every one of those is the plain "Welcome back, sir",
+because a guessed event name is worse than no event name. It reads the
+`CalendarSource` CACHE, so a homecoming never waits on caldav.
+
+**The catch-up OFFERS, it does not deliver.** The mail half is a count and a
+question — never a sender, never a subject — plus one clause on anything major
+(an `error` on the fault board, in its own words). He gets the contents when he
+answers yes, and the yes is resolved by the offer protocol that already exists:
+`services.briefing_offer` + `Commander._try_briefing_offer`, 60 s TTL,
+end-anchored yes/no. The quiet-hours digest in front of it is unchanged, and
+the offer is thinned into the SAME single address pass so the burst still says
+"sir" twice at most.
+
+Degradation is the point: with no kitchen sensor, no calendar and no mailbox he
+gets exactly the "Welcome back, sir" he got before any of this was built.

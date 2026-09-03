@@ -22,6 +22,16 @@ verdict on the same grace, and the sensor can only ever make him home
 sooner. With no URL configured the sentinel polls the same ``probe``
 function object it always did.
 
+N ROOMS, when ``presence.rooms`` is configured: the leg becomes
+``roomfabric.HouseView`` rather than one ``RoomSensor``, and ``RoomOrPhone``
+below needs no change at all -- the view wears the same
+``read() -> True | False | None``, and the asymmetry above is already the
+right rule for three rooms as well as one. The fabric also publishes
+``RoomChanged``, which is what lets the app treat the KITCHEN as the front
+door (jarvis/arrival.py, app._on_room_changed). With ``presence.rooms``
+empty the singular path below runs unchanged, which is the configuration
+on this box today.
+
 OFFLINE MODE (jarvis/sensing.py) takes the radar leg away and NOTHING
 else: ``RoomSensor.read`` returns None while sensing is denied, which is
 the module's existing "no opinion" path, so the composition degrades to
@@ -171,6 +181,33 @@ def _make_sensor(cfg, policy=None):
     return sensor
 
 
+def _make_fabric(cfg, policy=None):
+    """The MULTI-ROOM leg (jarvis/roomfabric.py), or None. Never raises.
+
+    Built only when ``presence.rooms`` is a non-empty list, so a config
+    written for one radar takes the single-sensor path above byte for byte
+    and this feature cannot regress the box that is live today.
+
+    Two things come with it, and the second is the point. ``HouseView``
+    wears ``RoomSensor``'s interface, so ``RoomOrPhone`` composes the whole
+    house exactly as it composed one room -- any room seeing him beats a
+    sleeping phone, no room seeing him never beats a phone that answers.
+    And the fabric publishes ``RoomChanged``, which is what makes the
+    KITCHEN a door sensor: the app greets on that event after a whole-home
+    absence (app._on_room_changed), rather than waiting for the phone's
+    radio to answer an ARP.
+    """
+    raw = _cfg_get(cfg, "presence.rooms", None)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    try:
+        from jarvis import roomfabric
+        return roomfabric.build(cfg, policy=policy, publish=bus.publish)
+    except Exception:  # noqa: BLE001 - a broken fabric may not cost the phone
+        log.exception("presence: the room fabric could not be built")
+        return None
+
+
 class RoomOrPhone:
     """``(ip, mac) -> True | False | None`` -- the two legs, composed.
 
@@ -229,8 +266,14 @@ class PresenceSentinel:
         self._publish = publish
         # The room sensor is composed IN here rather than wired in app.py:
         # probe_fn was always the injection point, and an explicit one
-        # (every test) still wins outright.
-        self.sensor = _make_sensor(cfg, policy)
+        # (every test) still wins outright. With presence.rooms configured
+        # the whole FABRIC is the leg and the singular sensor is not built
+        # at all -- two owners polling one ESP32 would double its traffic
+        # and race the breaker's counters for nothing (roomfabric.HouseView
+        # says the same about its own two callers).
+        self.fabric = _make_fabric(cfg, policy)
+        self.sensor = (self.fabric.house_view() if self.fabric is not None
+                       else _make_sensor(cfg, policy))
         self._probe = probe_fn if probe_fn is not None else make_probe(self.sensor)
         self._now = now
         self._poll_s = poll_s
@@ -383,6 +426,18 @@ class PresenceSentinel:
             self.last_seen, self._started_at = None, None
 
     # ------------------------------------------------------------ thread
+    def _fabric_call(self, what: str) -> None:
+        """start / stop the room fabric, if there is one. The sentinel owns
+        its leg's thread the way it owns its own: a fabric left running
+        after stop() would keep three ESP32s polled into the teardown."""
+        fn = getattr(self.fabric, what, None)
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 - the sentinel still runs without it
+            log.exception("presence: room fabric %s failed", what)
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -390,6 +445,10 @@ class PresenceSentinel:
             log.info("presence: no phone_ip / phone_mac / room sensor configured; "
                      "sentinel idle")
             return
+        # BEFORE the sentinel's own thread: the fabric's 2 s cadence is what
+        # notices the door, and its first RoomChanged should not have to
+        # wait on a 60 s phone poll.
+        self._fabric_call("start")
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="presence",
                                         daemon=True)
@@ -397,6 +456,7 @@ class PresenceSentinel:
 
     def stop(self) -> None:
         self._stop.set()
+        self._fabric_call("stop")
         t = self._thread
         if t is not None and t is not threading.current_thread():
             t.join(timeout=2.0)

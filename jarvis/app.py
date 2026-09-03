@@ -52,6 +52,7 @@ from jarvis.events import (
     RecordingStarted,
     RecordingStopped,
     ReminderFired,
+    RoomChanged,
     Status,
     Transcribed,
     UncertainResolved,
@@ -203,6 +204,15 @@ GUEST_LINE = "I only answer to {name}, sir."
 # silence. "my briefing" and "run my briefing" both reach _h_briefing, so
 # that is what he is offered.
 BRIEFING_OFFER_LINE = "Shall I run your briefing, sir?"
+# The arrival catch-up's mail window (_unread_count, _deliver_arrival_catch_up).
+# 24 h is mailwatch.SINCE_HOURS' argument, unchanged: an unread mail older
+# than a day is not news to be met at the door with, and a homecoming after
+# a fortnight away should not be answered with "you've 340 unread emails".
+# The limit is the fetch cap, so the COUNT saturates there rather than
+# growing without bound -- "25" is honest for anything at or above it and a
+# man with 300 unread does not want the true number read out either.
+ARRIVAL_MAIL_HOURS = 24
+ARRIVAL_MAIL_LIMIT = 25
 TURN_TIMEOUT_S = 60.0           # watchdog: a lost reply must not wedge the turn
 
 # The sources that arrive from somewhere other than this desk: a shell /
@@ -541,9 +551,25 @@ class JarvisApp:
         bus.subscribe(ReminderFired, self._on_reminder_fired)
         bus.subscribe(JarvisReply, self._on_reply_for_discord)
         bus.subscribe(Presence, self._on_presence)
+        # THE THIRD ARRIVAL TRIGGER. RoomChanged is jarvis/roomfabric.py
+        # naming the room he is in; the kitchen sits next to his front
+        # door, so that room going occupied after a whole-home absence is
+        # the door opening, and it beats the phone leg by however long the
+        # phone's radio takes to answer an ARP. It runs through the SAME
+        # _greet_return as the phone and the desk, so the damper below is
+        # shared and the choreography is not written twice.
+        bus.subscribe(RoomChanged, self._on_room_changed)
         self._wire_roomtone()
         bus.subscribe(DeskState, self._on_desk)
         self._last_greeted = 0.0        # GREET_DAMPER_S, shared by both probes
+        # When he was last seen, for "welcome back from X" (arrival.outing);
+        # 0.0 means no recorded departure, which is a plain welcome.
+        self._away_since = 0.0
+        self._door = arrival_mod.DoorWatch(
+            door=str(self.assistant.get("presence.door_room",
+                                        arrival_mod.DEFAULT_DOOR_ROOM)
+                     if self.assistant is not None
+                     else arrival_mod.DEFAULT_DOOR_ROOM))
 
         if CONFIG.target_name:
             self.desktop.restore_target(CONFIG.target_name)
@@ -1581,8 +1607,6 @@ class JarvisApp:
         arrival.run() records only what actually happened -- which is what
         the tests assert on.
         """
-        from jarvis.presence import WELCOME_LINE
-
         def panel():
             # The panel coming off its dim is owned by the night surface, not
             # here; what this step owns is the Status that wakes the console.
@@ -1602,17 +1626,27 @@ class JarvisApp:
         burst: list = []
 
         def greeting():
-            burst.append(WELCOME_LINE)
-            self._say(WELCOME_LINE)
+            # "Welcome back from the dentist, sir" when the calendar can
+            # prove it, and the plain line every other time (_welcome_text).
+            line = self._welcome_text()
+            burst.append(line)
+            self._say(line)
             return True
 
         def catch_up():
             quiet = getattr(self, "quiet", None)
-            if quiet is None:
-                return False
             # release() drains atomically: the policy's own tick would read
             # the same backlog, and whichever gets there first says it.
-            frags = quiet.release_fragments()
+            frags = list(quiet.release_fragments()) if quiet is not None else []
+            # THE OFFER, and it is the only new thing spoken on the
+            # doorstep. His ruling after the 40-second monologue of
+            # 2026-09-02: the briefing OFFERS, it does not deliver. So this
+            # is a count and a question -- never a sender, never a subject
+            # -- and it rides the SAME burst as the digest in front of it so
+            # the address thinning is still one pass over the whole cue.
+            offer = self._arrival_offer_line()
+            if offer:
+                frags.append(offer)
             if not frags:
                 return False
             # THE JOIN (7 sentences, 5 sirs measured): "Welcome back, sir."
@@ -1628,12 +1662,176 @@ class JarvisApp:
             if not digest:
                 return False
             burst[:] = thinned
+            # Parked BEFORE the words go out, exactly as the first-wake
+            # offer marks the day before it speaks: a TTS failure must not
+            # leave a question on the floor with nothing listening for the
+            # answer, and the answer's window opens off this line's
+            # falling edge (_after_speech).
+            if offer:
+                self._park_arrival_offer()
             bus.publish(JarvisReply(text=digest, speak=True))
             self._say(digest)
             return True
 
         return {"panel": panel, "earcon": earcon, "greeting": greeting,
                 "catch-up": catch_up}
+
+    # ------------------------------------------------- "back from X"
+    def _welcome_text(self) -> str:
+        """The greeting line: "Welcome back from X, sir", or the plain one.
+
+        X is named ONLY when the calendar can prove it -- an event he was
+        out for most of, that ended shortly before he walked in
+        (jarvis/arrival.outing). No calendar, an unreachable one, no
+        recorded departure, two events that both fit: every one of those is
+        the plain "Welcome back, sir", because a guessed event name is
+        worse than no event name. There is no new calendar client here:
+        this reads the CACHE the parked CalendarSource already holds
+        (``events()`` takes no socket), so a homecoming never waits on
+        caldav.
+        """
+        left = float(getattr(self, "_away_since", 0.0) or 0.0)
+        if not left or not self.assistant.get("presence.arrival_outing", True):
+            return arrival_mod.welcome_line()
+        cal = getattr(getattr(self, "services", None), "calendar", None)
+        if cal is None:
+            return arrival_mod.welcome_line()
+        try:
+            conf = getattr(cal, "configured", True)
+            if callable(conf):
+                conf = conf()
+            if not conf:
+                return arrival_mod.welcome_line()
+            what = arrival_mod.outing(
+                list(cal.events()),
+                left=datetime.fromtimestamp(left).astimezone(),
+                back=datetime.now().astimezone())
+        except Exception:  # noqa: BLE001 - a name is never worth the greeting
+            log.debug("arrival: the calendar could not say where he was",
+                      exc_info=True)
+            return arrival_mod.welcome_line()
+        if what:
+            log.info("arrival: he was at %r", what)
+        return arrival_mod.welcome_line(what)
+
+    # --------------------------------------------- the catch-up OFFER
+    def _arrival_offer_line(self) -> str:
+        """"You've 3 unread emails. Shall I go through them, sir?", or "".
+
+        The two numbers behind it are read HERE and the sentence is built
+        by jarvis/arrival.catch_up_offer, which is pure -- the same split
+        mailwatch makes ("the line is built here, never by the model"),
+        for the same reason: this has to work while the GPU is lent to a
+        trainer, and a doorstep question is not worth a model turn.
+        """
+        if not self.assistant.get("presence.arrival_offer", True):
+            return ""
+        return arrival_mod.catch_up_offer(unread=self._unread_count(),
+                                          major=self._major_line())
+
+    def _unread_count(self):
+        """How many unread emails, or None -- never their contents.
+
+        None is "I could not look" and catch_up_offer keeps it that way; a
+        mailbox that timed out must never be announced as an empty one.
+        Costs one IMAP round trip, taken AFTER the greeting has already
+        been spoken (the catch-up is the last arrival step), so a slow
+        mailbox delays the offer and never the welcome. No mailbox
+        configured raises MailNotConfigured before a socket is opened,
+        which is the dark-safe path every watcher here already uses.
+        """
+        try:
+            from jarvis.tools import mail as mail_mod
+            mails = mail_mod.fetch_unread(self.assistant,
+                                          since_hours=ARRIVAL_MAIL_HOURS,
+                                          limit=ARRIVAL_MAIL_LIMIT)
+        except Exception:  # noqa: BLE001 - every failure is "I could not look"
+            log.debug("arrival: the unread count is unavailable", exc_info=True)
+            return None
+        return len(list(mails))
+
+    def _major_line(self) -> str:
+        """One clause on anything MAJOR that happened while he was out.
+
+        The live fault board (jarvis/faults.py) and nothing else: it is
+        local, free, already in his own words, and it is the one thing in
+        this process that knows the difference between a warning and
+        something that actually broke. Only an ERROR counts -- a warning
+        that memory is tight is not news to be met at the door with.
+        """
+        board = getattr(getattr(self, "services", None), "faults", None)
+        try:
+            fault = getattr(board, "current", None)
+            if fault is None or getattr(fault, "kind", "") != "error":
+                return ""
+            return str(getattr(fault, "line", "") or getattr(fault, "text", "") or "")
+        except Exception:  # noqa: BLE001 - the board must not cost the cue
+            log.debug("arrival: the fault board could not be read", exc_info=True)
+            return ""
+
+    def _park_arrival_offer(self) -> None:
+        """Hand the question to the ONE offer protocol.
+
+        ``services.briefing_offer`` + ``Commander._try_briefing_offer`` is
+        the rung that already resolves "Shall I run your briefing, sir?" --
+        end-anchored yes/no, a 60 s TTL, a decline that costs nothing, and
+        anything not answer-shaped routed as a new subject with the offer
+        dropped. Reusing it is the point: a "yes" must not mean different
+        things on different rungs, and this question is put with an open
+        microphone exactly as that one is.
+        """
+        try:
+            self.services.briefing_offer = {
+                "made_at": time.time(),
+                "deliver": self._deliver_arrival_catch_up}
+        except Exception:  # noqa: BLE001 - a question nobody can answer is worse
+            log.exception("arrival: could not park the catch-up offer")
+            return
+        # A question nobody listens for is the 2026-09-02 stuck-listen bug
+        # in miniature: _after_speech opens the mic on this line's falling
+        # edge, so "yes" needs no wake word.
+        self._followup_after_speech = True
+
+    def _deliver_arrival_catch_up(self) -> bool:
+        """He said yes: the senders and subjects, built here, not by the model.
+
+        Same rule as mailwatch -- no model turn for a line that is three
+        facts -- and the same cap of MAX_LINES, with the rest counted
+        rather than read. False means nothing was said, and
+        _try_briefing_offer owns telling him so.
+        """
+        from jarvis.mailwatch import MAX_LINES, _subject_words
+        lines: list = []
+        major = self._major_line()
+        if major:
+            lines.append(major if major.endswith((".", "!", "?")) else major + ".")
+        try:
+            from jarvis.tools import mail as mail_mod
+            mails = list(mail_mod.fetch_unread(self.assistant,
+                                               since_hours=ARRIVAL_MAIL_HOURS,
+                                               limit=ARRIVAL_MAIL_LIMIT))
+        except Exception:  # noqa: BLE001 - the fault clause still stands alone
+            log.debug("arrival: the catch-up could not read the mail",
+                      exc_info=True)
+            mails = []
+        for mail in mails[:MAX_LINES]:
+            subject = _subject_words(getattr(mail, "subject", ""))
+            who = getattr(mail, "sender", "") or "an unknown sender"
+            lines.append(f"{who}, {subject}." if subject else f"{who}.")
+        rest = len(mails) - MAX_LINES
+        if rest > 0:
+            lines.append(f"And {rest} more.")
+        if not lines:
+            return False
+        # ONE burst, thinned once: the same rule the arrival cue itself
+        # follows, and the reason release_fragments exists at all.
+        thinned = self._thin_address(lines)
+        text = address_mod.join_thinned(thinned)
+        if not text:
+            return False
+        bus.publish(JarvisReply(text=text, speak=True))
+        self._say(text)
+        return True
 
     def _on_presence(self, ev):
         """The phone came back, or left.
@@ -1648,6 +1846,20 @@ class JarvisApp:
         self._cancel_departure()
         if not ev.home:
             bus.publish(Status(text="Away", kind="info"))
+            # WHEN HE LEFT, for "welcome back from X". ev.since is when the
+            # away GRACE expired, which on the 12-minute default is twelve
+            # minutes after he actually walked out -- long enough to lose a
+            # class that ended in between. presence.last_seen is the last
+            # time a leg actually saw him, so it is the honest departure and
+            # ev.since is only the fallback. Stamped here and never on the
+            # return: the sentinel overwrites `since` with the arrival.
+            seen = getattr(getattr(self, "presence", None), "last_seen", None)
+            self._away_since = float(seen or getattr(ev, "since", 0.0) or 0.0)
+            # He is out, so the next kitchen occupancy is a new door opening
+            # rather than the same one (arrival.DoorWatch).
+            door = getattr(self, "_door", None)
+            if door is not None:
+                door.left()
             self._arm_departure(ev)
             return
         if ev.returned:
@@ -1667,6 +1879,42 @@ class JarvisApp:
         # Home but not a return (a poll that merely confirms he is here):
         # the console gets the state, nothing is spoken.
         bus.publish(Status(text="Home", kind="info"))
+
+    def _on_room_changed(self, ev):
+        """He is in a new room. Only the DOOR room, only after an absence.
+
+        THE KITCHEN IS A DOOR SENSOR -- his words, "kitchen to see if i
+        enter my apartment since the kitchen and door are next to each
+        other". jarvis/roomfabric.py already holds a new room occupied for
+        ``rooms_enter_hold_s`` (2 s) before it publishes, so a doorway
+        pass-through at walking pace does not reach here at all, and its
+        stuck-room guard means a fan in the beam cannot pin this on.
+
+        Two guards, and both are needed. ``DoorWatch`` is the rising edge
+        -- kitchen, office, kitchen inside one homecoming is ONE arrival.
+        ``_greet_return``'s GREET_DAMPER_S is the other, and it is what
+        stops the phone sentinel greeting him again ten seconds later when
+        its own probe finally catches up. The damper was orphaned once
+        before (see _greet_return); this trigger is deliberately routed
+        through it rather than around it.
+
+        The away gate is the presence sentinel's own verdict and is read
+        as strictly "away": at boot it is "unknown", and a fresh start
+        while he is sitting in the office must not welcome him home.
+        """
+        door = getattr(self, "_door", None)
+        if door is None:
+            return
+        away = getattr(getattr(self, "presence", None), "state", "") == "away"
+        try:
+            if not door.observe(room=getattr(ev, "room", ""), away=away):
+                return
+        except Exception:  # noqa: BLE001 - the bus must not lose a subscriber
+            log.exception("arrival: the door watch failed")
+            return
+        log.info("arrival: %s is the door and the house was away",
+                 getattr(ev, "room", "?"))
+        self._greet_return("room:%s" % (getattr(ev, "room", "") or "?"))
 
     # ------------------------------------------------------ departure
     def _cancel_departure(self) -> None:
