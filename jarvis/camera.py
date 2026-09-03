@@ -55,10 +55,14 @@ log = get_logger("camera")
 
 DEVICE_GLOB = "/dev/video*"
 # MJPEG rather than raw YUY2: at 1280x720 a USB 2.0 camera cannot deliver
-# uncompressed 30 fps, and the driver's silent answer to asking is to give
-# back 5 fps instead of an error. The self-check reads the granted mode back
-# for exactly that reason.
+# uncompressed 30 fps, and the driver's silent answer to asking is to grant
+# a slower mode instead of an error -- his LifeCam grants 1280x720 YUYV at a
+# nominal 10 fps and 1280x720 MJPG at 30 (scripts/camera_mode_probe.py,
+# 2026-09-03, both fourcc-before-size and size-before-fourcc). The granted
+# mode is read back and logged in open_capture for exactly that reason.
 DEFAULT_FOURCC = "MJPG"
+# One driver buffer, not OpenCV's default four. See open_capture.
+CAPTURE_BUFFERS = 1
 # How long a close waits for a grab already in flight before releasing the
 # device anyway. One frame at the idle tier's 1.5 fps is 670 ms; a second is
 # a grab that is not coming back.
@@ -153,9 +157,39 @@ def thresholds_from_config(cfg) -> Thresholds:
 # ------------------------------------------------------------- the device
 def open_capture(device: str = "", width: int = 1280, height: int = 720,
                  fourcc: str = DEFAULT_FOURCC):
-    """cv2.VideoCapture, opened and asked for a mode. Raises if it will not
-    open -- ``Eye`` reads that as no opinion, which is the same behaviour as
-    having no camera at all.
+    """cv2.VideoCapture, opened, asked for a mode, and the GRANTED mode read
+    back and logged. Raises if it will not open -- ``Eye`` reads that as no
+    opinion, which is the same behaviour as having no camera at all.
+
+    THE GRANTED MODE IS LOGGED HERE, once per open, because until 2026-09-03
+    nothing in the running app read it back and the one time it mattered
+    nobody could tell what the device was doing: the preview logged
+    ``7.5 fps`` at 1280x720 whatever rate it asked for, and the explanation
+    everyone reached for first -- that the driver had quietly declined MJPG
+    and granted a bandwidth-capped YUYV stream -- was wrong. Measured with
+    scripts/camera_mode_probe.py, twice (2026-09-03 02:36 and 07:17, Jarvis
+    stopped, ``grab()`` only, nothing retrieved): MJPG IS granted at
+    1280x720 in either set order at a nominal 30 fps, and the device
+    delivered 3.7-3.9 fps in every 30 fps mode it has, 640x480 included,
+    both runs -- so the rate is the device's own, not the format's and not
+    the bus's. What sets it is not proven; the whole-multiple frame
+    intervals (268 ms = 8 x 33 ms at the probe, 133 ms = 4 x 33 ms with him
+    at the desk) are what auto-exposure lengthening the interval for a dim
+    scene looks like. The line printed here puts asked-against-granted
+    beside the preview's own rate line so that the next such question is a
+    grep of the log rather than a night of guessing.
+
+    ``CAP_PROP_BUFFERSIZE`` IS SET TO ONE. OpenCV's V4L2 backend queues four
+    driver buffers by default, so a consumer that reads SLOWER than the
+    device delivers is handed a frame that has been waiting in the queue --
+    up to three intervals old, which at the 7.5 fps his camera delivered
+    with him at the desk is 400 ms, and 800 ms at the 3.8 fps the probe
+    measured. The preview's log line ``6.0 fps  grab 11 ms`` at 6 requested was
+    exactly that: not a fast device but a stale picture already dequeued,
+    which is lag he can see. One buffer means the newest frame, or a wait
+    for it. The driver accepts the setting (``set(1)`` read back 1, measured
+    2026-09-03, both probe runs); if a future one does not, the read-back
+    below says so.
 
     cv2 is imported HERE, not at module scope, so that a box without OpenCV
     still loads jarvis.camera and still reports honestly.
@@ -169,12 +203,28 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
         cap.release()
         raise OSError("could not open camera %r" % (device or 0))
     try:
+        # FOURCC before the size. The probe found this driver honours both
+        # orders, but the order in which OpenCV's V4L2 backend re-negotiates
+        # has changed between versions and format-first is the one that
+        # has never been reported broken.
         if fourcc:
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, CAPTURE_BUFFERS)
     except Exception:  # noqa: BLE001 - an unsupported mode is not a failure
         log.debug("camera: the driver refused a mode request", exc_info=True)
+    try:
+        got = capture_mode(cap)
+        log.info("camera: asked %dx%d %s; granted %.0fx%.0f %s at %.1f fps "
+                 "nominal, %.0f driver buffer(s) -- the delivered rate is "
+                 "what the preview's own line reports",
+                 int(width), int(height), fourcc or "-", got["width"],
+                 got["height"], got["fourcc"] or "?", got["fps"],
+                 got["buffersize"])
+    except Exception:  # noqa: BLE001 - a read-back is not worth a crash
+        log.debug("camera: could not read the granted mode back",
+                  exc_info=True)
     return cap
 
 

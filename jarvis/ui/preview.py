@@ -87,16 +87,26 @@ uses:
     0.32-0.39 ms measured for ~24 operations that is ~0.4-0.5 ms mean and
     ~1.1 ms worst: an eighth of the 8 ms late bar, a fifteenth of a slot. A
     repaint cannot make a slot late on its own arithmetic.
-  * the RATE those land at -- 6 a second to 15, so the pane's whole claim on
-    the Tk thread goes from ~2.3 ms per second to ~7 ms out of the 1000 ms the
-    mainloop has. What changes is how MANY slots carry an extra half
-    millisecond, not whether any of them can blow their budget.
+  * the RATE those land at, which is the DEVICE's delivered rate and not the
+    configured one: a repaint happens only when a new shot has landed, and
+    his LifeCam delivers 3.7-7.5 fps at 1280x720 whatever is asked (measured
+    2026-09-03; see jarvis/campreview.py's module docstring for the table).
+    So the pane's whole claim on the Tk thread is ~1.5-3 ms per second of the
+    1000 ms the mainloop has, rising to ~15 ms if the light ever lets the
+    camera reach the 30 fps cap. What changes is how MANY slots carry an
+    extra half millisecond, not whether any of them can blow their budget.
+  * the POLL rate, which does follow the configured ceiling
+    (``campreview.poll_ms``): 12 a second at the old 6 fps default, 15 at
+    the 7.5 default, 30 at his configured 15, 50 at the 30 cap. A poll that
+    finds nothing new -- most of them, at the device's real rate -- is one
+    attribute read and an int compare on ``PreviewShot.seq``.
 
-The residual risk is stated rather than measured away: fifteen repaints a
-second is fifteen chances a second to land on a slot that was already tight
-for another reason, where six was six. The reactor prints
-``avatar: late slots N/M`` on its own window; if that starts moving after this,
-``camera.preview_fps`` is the dial and it now goes DOWN as well as up.
+The residual risk is stated rather than measured away: repaints at the
+device's rate are that many chances a second to land on a slot that was
+already tight for another reason, and the cap allows thirty where the old
+default was six. The reactor prints ``avatar: late slots N/M`` on its own
+window; if that starts moving after this, ``camera.preview_fps`` is the dial
+and it goes DOWN as well as up.
 
 A BLACK RECTANGLE IS NOT AN ANSWER. When there is no picture the pane says
 which of the reasons it is -- his toggle, offline mode, the curfew (with the
@@ -489,6 +499,11 @@ class CameraPreview(tk.Frame):
         self._fit = (0, 0, px(PANE_W), px(PANE_H))
         self._box = (px(PANE_W), px(PANE_H))
         self._interval = poll_ms(DEFAULT_FPS)
+        # The identity chip's last placement, so a chip that has not moved
+        # is not re-set and re-measured on every picture -- see _place_name.
+        self._name_last = None
+        self._name_anchor = None
+        self._name_shift = 0
         self._build()
 
     # ------------------------------------------------------------ build
@@ -587,8 +602,14 @@ class CameraPreview(tk.Frame):
         """Begin polling the worker. Idempotent.
 
         The interval comes from the WORKER's configured rate, not from a
-        constant: a pane polling at 83 ms for a capture running at 10 fps
-        would hold every other frame back a full period.
+        constant, and it is twice that rate (``campreview.poll_ms``): 67 ms
+        at the 7.5 default, 33 ms at his configured 15, 20 ms at the 30 cap.
+        The configured rate is a CEILING the device may not reach -- his
+        LifeCam delivers 3.7-7.5 fps at 1280x720 whatever is asked (measured
+        2026-09-03) -- and polling at the ceiling rather than the delivered
+        rate is the right side to err on: a poll that finds nothing new is
+        an int compare, while a poll slower than the device holds every
+        other frame back a full period.
         """
         if self._job is not None:
             return
@@ -826,6 +847,12 @@ class CameraPreview(tk.Frame):
         picture = (ox + fx, oy + fy, fw, fh)
         pad = px(NAME_PAD)
         x, y, anchor = name_anchor(rect, picture, px(NAME_GAP), name_line_h())
+        if anchor != getattr(self, "_name_anchor", None):
+            # The canvas measures the text FROM its anchor, so a flip from
+            # under the box to above it changes the bbox for the same word
+            # at the same point. The placement cache is dropped with it.
+            self._name_last = None
+            self._name_anchor = anchor
         self.canvas.itemconfigure(self._name, anchor=anchor,
                                   fill=identity_ink(face), state="normal")
         room = fw - 2 * pad
@@ -854,8 +881,14 @@ class CameraPreview(tk.Frame):
         # the pane's OTHER numbers live -- two unrelated readouts touching.
         shift = min(0, (picture[0] + fw - pad) - box[2])
         shift = max(shift, (picture[0] + pad) - box[0])
-        if shift:
+        if shift or getattr(self, "_name_shift", 0):
+            # Placed at x + shift whenever the item is not already there:
+            # this frame needs a shift, or the last one had one and a cached
+            # placement (which put nothing down) left the item where that
+            # shift moved it.
             self.canvas.coords(self._name, x + shift, y)
+        self._name_shift = shift
+        if shift:
             box = (box[0] + shift, box[1], box[2] + shift, box[3])
         self.canvas.coords(self._namebg, box[0] - pad, box[1] - pad,
                            box[2] + pad, box[3] + pad)
@@ -865,13 +898,29 @@ class CameraPreview(tk.Frame):
     def _place_name(self, text: str, x: int, y: int):
         """Put the word down and ask the canvas how wide it came out.
         ``None`` when it cannot be measured, which is a window that does not
-        exist yet rather than a failure."""
+        exist yet rather than a failure.
+
+        CACHED ON THE LAST PLACEMENT. Between two detections the boxes are
+        carried forward, so the same word lands at the same point picture
+        after picture; re-setting the text and asking the canvas to measure
+        it again was two of the ~30 canvas operations a repaint costs, at
+        the picture rate, for an answer it already had. A hit puts nothing
+        down -- the item still carries that text at that point, because
+        nothing but this method sets either (``_draw_name`` tracks the one
+        shift it applies afterwards). The anchor is part of what the canvas
+        measures; ``_draw_name`` drops the cache when it changes.
+        """
+        last = getattr(self, "_name_last", None)
+        if last is not None and last[0] == (text, x, y):
+            return last[1]
         self.canvas.itemconfigure(self._name, text=text)
         self.canvas.coords(self._name, x, y)
         try:
-            return self.canvas.bbox(self._name)
+            box = self.canvas.bbox(self._name)
         except Exception:                    # noqa: BLE001 - no window yet
             return None
+        self._name_last = ((text, x, y), box) if box is not None else None
+        return box
 
     # ------------------------------------------------------------ teardown
     def destroy(self):                       # pragma: no cover - Tk teardown

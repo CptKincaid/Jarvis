@@ -804,6 +804,196 @@ def test_a_gallery_that_raises_is_a_missing_answer_not_a_crash():
     assert face.id_ran is False and face.name == ""
 
 
+@pytest.mark.parametrize("vec", [(0.0, 0.0, 0.0), (float("nan"), 1.0, 2.0),
+                                 ()])
+def test_a_degenerate_embedding_is_a_missing_answer_not_an_unknown(vec):
+    """A crop of nothing embeds to NaNs; a blank one to zeros. The gallery
+    answers ("", 0.0) for both -- the same shape as "asked, nobody matched"
+    -- and the pane would print UNKNOWN 0.00 over a face nobody was able to
+    ask about. That is a machinery failure and is treated like one: the
+    held verdict is left alone, and from cold there is no chip at all."""
+    clock = Clock()
+    pipe, _ = identified(clock, [("hunter", 0.74)])
+    for _ in range(2):
+        clock.tick(1.0)
+        pipe.grab((16, 9))
+    assert pipe.grab((16, 9)).primary.name == "hunter"
+    pipe.recogniser = FakeRecogniser(vec=vec)
+    clock.tick(0.6)
+    assert pipe.grab((16, 9)).primary.name == "hunter"   # left alone
+    gallery = FakeGallery([("", 0.0)])
+    cold = cp.PreviewPipeline(FakeFeed(), observe=observer(), now=Clock(1.0),
+                              detector=FakeDetector(rows=[row(4, 2, 8, 8)],
+                                                    input_size=(32, 18)),
+                              recogniser=FakeRecogniser(vec=vec),
+                              gallery=gallery)
+    face = cold.grab((16, 9)).primary
+    assert face.id_ran is False                        # no chip, not UNKNOWN
+    assert gallery.calls == 0                          # never even asked
+
+
+def test_the_identity_gate_has_its_own_floor_under_the_detector_dial():
+    """camera.min_conf decides how many boxes get DRAWN, and its documented
+    direction of travel is down (0.7 -> 0.6, "because a miss is silent").
+    Borrowing it as the identity gate let a dial about what the pane shows
+    decide who gets NAMED: measured, min_conf 0.0 let a 0.25 detection
+    produce a chip reading HUNTER 0.71 over a smudge. The gate keeps its own
+    floor, and a HIGHER detector bar still raises it."""
+    clock = Clock()
+    rec = FakeRecogniser(min_conf=0.0)
+    det = FakeDetector(rows=[row(4, 2, 8, 8, conf=0.25)], input_size=(32, 18))
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=det, observe=observer(),
+                              now=clock, recogniser=rec, gallery=FakeGallery(),
+                              identity_min=0.363, min_conf=0.0)
+    assert pipe.id_conf == cp.DEFAULT_MIN_CONF
+    for _ in range(4):
+        clock.tick(1.0)
+        face = pipe.grab((16, 9)).primary
+    assert face is not None and face.conf == pytest.approx(0.25)  # drawn…
+    assert rec.rows == [] and face.id_ran is False              # …not named
+    high = cp.PreviewPipeline(FakeFeed(), observe=observer(), now=clock,
+                              detector=FakeDetector(
+                                  rows=[row(4, 2, 8, 8, conf=0.7)],
+                                  input_size=(32, 18)),
+                              recogniser=rec, gallery=FakeGallery(),
+                              identity_min=0.363, min_conf=0.8)
+    assert high.id_conf == 0.8
+    clock.tick(1.0)
+    high.grab((16, 9))
+    assert rec.rows == []                        # 0.7 is under HIS 0.8 bar
+
+
+# ------------------------------------------- the name belongs to a face
+def _two_faces(swap_every: int = 1, fps: float = 15.0, seconds: float = 10.0):
+    """Two people at similar distance, synthetic. Face A (hunter) at x=2 and
+    face B (a stranger) at x=18 in detect pixels, sizes 8/9 swapping so that
+    "largest" -- the pane's subject rule -- flips between them. The gallery
+    answers by WHICH ROW was embedded, so a name over the other face can
+    only come from the hold lending it. Returns (frames, named, wrong)."""
+    class Det(FakeDetector):
+        def __init__(self):
+            super().__init__(input_size=(32, 18))
+            self.i = 0
+
+        def detect(self, _frame):
+            self.calls += 1
+            big_a = (self.i // swap_every) % 2 == 0
+            self.i += 1
+            wa, wb = (9, 8) if big_a else (8, 9)
+            return [row(2, 2, wa, wa), row(18, 2, wb, wb)]
+
+    class Rec(FakeRecogniser):
+        last = None
+
+        def embed(self, _frame, r):
+            self.last = "A" if r[0] == 2 else "B"
+            return super().embed(_frame, r)
+
+    class Gal:
+        def match(self, _vec):
+            return ("hunter", 0.74) if rec.last == "A" else ("", 0.20)
+
+    clock, det, rec = Clock(), Det(), Rec()
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=det, observe=observer(),
+                              now=clock, recogniser=rec, gallery=Gal(),
+                              identity_min=0.363, min_conf=0.6)
+    frames = int(round(fps * seconds))
+    named = wrong = 0
+    for _ in range(frames):
+        p = pipe.grab((16, 9)).primary
+        if p.id_ran and p.name == "hunter":
+            named += 1
+            if p.x >= 36.0:                      # B's box, in capture px
+                wrong += 1
+        clock.tick(1.0 / fps)
+    return frames, named, wrong
+
+
+@pytest.mark.parametrize("swap_every", [1, 3])
+def test_a_name_never_walks_onto_a_face_it_was_not_computed_from(swap_every):
+    """THE two-person case. Measured on the unbound hold (dba972a), same
+    harness: 142 of 150 frames carried a chip and 70 of them put hunter's
+    name and score on the stranger's box, never converging -- each reading
+    about the other face reset the disagreement counter and refreshed the
+    timestamp, so neither hysteresis rule could fire. Bound to the box it
+    was computed from: 0 wrong, and the name is still there for the face
+    it belongs to (72 named frames flipping every picture, 36 every third).
+    """
+    frames, named, wrong = _two_faces(swap_every)
+    assert frames == 150
+    assert wrong == 0
+    assert named >= 30                           # the feature still works
+
+
+def test_a_failed_detection_clears_the_name_so_the_next_face_cannot_inherit_it():
+    """A detection that COULD NOT be made is not weaker evidence of "nobody
+    is there" than one that came back empty. The boxes were already dropped
+    on this path; the NAME was not, and a different person sitting down in
+    the same spot 0.2 s later inherited it (measured: the stranger's chip
+    read name='hunter' id_ran=True)."""
+    clock = Clock()
+    pipe, det = identified(clock, [("hunter", 0.74)])
+    for _ in range(2):
+        clock.tick(1.0)
+        pipe.grab((16, 9))
+    assert pipe.grab((16, 9)).primary.name == "hunter"
+
+    class Angry(FakeDetector):
+        def detect(self, _frame):
+            self.calls += 1
+            raise RuntimeError("the detector fell over")
+
+    pipe.detector = Angry(input_size=(32, 18))
+    clock.tick(0.2)
+    assert pipe.grab((16, 9)).faces == ()
+    pipe.detector = det                          # a face at the SAME place
+    clock.tick(0.6)
+    face = pipe.grab((16, 9)).primary
+    assert face.id_ran is False and face.name == ""   # a fresh question
+
+
+def test_a_row_set_the_geometry_cannot_reduce_clears_the_name_too():
+    """The other early return in _faces: no visionrig to reduce the rows
+    with. Same rule, same reason."""
+    clock = Clock()
+    pipe, det = identified(clock, [("hunter", 0.74)])
+    for _ in range(2):
+        clock.tick(1.0)
+        pipe.grab((16, 9))
+    assert pipe.grab((16, 9)).primary.name == "hunter"
+    keep = pipe._observe                          # noqa: SLF001
+    pipe._observe = None                          # noqa: SLF001
+    pipe._observer = lambda: None                 # noqa: SLF001
+    clock.tick(0.2)
+    assert pipe.grab((16, 9)).faces == ()
+    del pipe._observer
+    pipe._observe = keep                          # noqa: SLF001
+    clock.tick(0.6)
+    face = pipe.grab((16, 9)).primary
+    assert face.id_ran is False and face.name == ""
+
+
+def test_a_capture_mode_change_drops_the_name_with_the_boxes():
+    """A held verdict is expressed in the capture pixels its subject's box
+    was; a camera that renegotiates its mode while somebody new sits down
+    is exactly the window in which the last name is wrong."""
+    clock = Clock()
+    feed = FakeFeed(frames=[frame(64, 36)] * 3 + [frame(32, 18)] * 2)
+    det = FakeDetector(rows=[row(4, 2, 8, 8)], input_size=(32, 18))
+    pipe = cp.PreviewPipeline(feed, detector=det, observe=observer(),
+                              now=clock, recogniser=FakeRecogniser(),
+                              gallery=FakeGallery([("hunter", 0.74)]),
+                              identity_min=0.363, min_conf=0.6)
+    for _ in range(2):
+        clock.tick(1.0)
+        pipe.grab((16, 9))
+    assert pipe.grab((16, 9)).primary.name == "hunter"
+    clock.tick(0.1)
+    shot = pipe.grab((16, 9))                    # the mode changed
+    assert shot.cap_w == 32 and shot.faces
+    assert shot.primary.id_ran is False          # the name did not carry
+
+
 def test_identity_off_means_no_name_and_no_embedding_at_all():
     """With camera.identity off, recogniser_from_config returns None and
     nothing about his face is computed, let alone shown."""
@@ -880,6 +1070,58 @@ def test_clearing_forgets_everything_including_the_candidate():
     hold.clear()
     hold.observe("hunter", 0.74)
     assert hold.held()[2] is False               # the run started again
+
+
+A_BOX, B_BOX = (10.0, 10.0, 100.0, 100.0), (300.0, 10.0, 100.0, 100.0)
+
+
+def test_a_verdict_is_withheld_from_another_face_and_kept_for_its_own():
+    """The verdict BELONGS to the face it was computed from. Another face
+    asking for it gets nothing -- not a wrong name -- and the hold is not
+    thrown away for the asking: the face it belongs to is usually largest
+    again on the next picture."""
+    clock = Clock()
+    hold = cp.IdentityHold(agree=2, now=clock)
+    hold.observe("hunter", 0.74, A_BOX)
+    assert hold.observe("hunter", 0.75, A_BOX) == ("hunter", 0.75, True)
+    assert hold.held(B_BOX) == ("", 0.0, False)      # withheld
+    assert hold.held(A_BOX) == ("hunter", 0.75, True)   # …and still his
+    assert hold.held() == ("hunter", 0.75, True)     # no geometry: as before
+
+
+def test_a_reading_about_a_different_face_replaces_the_subject():
+    """A READING moves the subject; a stamp request does not. The hold is
+    "who the identity tick last looked at", and it just looked elsewhere."""
+    clock = Clock()
+    hold = cp.IdentityHold(agree=2, now=clock)
+    hold.observe("hunter", 0.74, A_BOX)
+    hold.observe("hunter", 0.74, A_BOX)
+    assert hold.observe("", 0.2, B_BOX) == ("", 0.2, True)   # unknown, at once
+    assert hold.held(A_BOX) == ("", 0.0, False)              # hunter's is gone
+    assert hold.held(B_BOX) == ("", 0.2, True)
+
+
+def test_two_readings_about_two_faces_are_not_two_agreeing_readings():
+    clock = Clock()
+    hold = cp.IdentityHold(agree=2, now=clock)
+    hold.observe("hunter", 0.74, A_BOX)
+    assert hold.observe("hunter", 0.74, B_BOX)[2] is False   # a new run
+    assert hold.observe("hunter", 0.74, B_BOX)[2] is True    # two about B
+    assert hold.held(A_BOX) == ("", 0.0, False)
+
+
+def test_a_head_that_drifts_at_a_desk_is_still_the_same_face():
+    """SUBJECT_IOU at 0.3: a lean of a tenth of the box is well inside it, a
+    face beside it scores 0, and a stranger stepping in front at twice the
+    linear size scores 0.25 even perfectly concentric."""
+    clock = Clock()
+    hold = cp.IdentityHold(agree=1, now=clock)
+    box = (100.0, 100.0, 200.0, 200.0)
+    hold.observe("hunter", 0.74, box)
+    assert hold.held((120.0, 110.0, 200.0, 200.0))[0] == "hunter"   # a lean
+    assert hold.held((350.0, 100.0, 200.0, 200.0))[2] is False      # beside
+    assert hold.held((0.0, 0.0, 400.0, 400.0))[2] is False          # in front
+    assert hold.held((0.0, 0.0, 0.0, 0.0))[0] == "hunter"   # no geometry: yes
 
 
 # ------------------------------------------------------ the Tk thread
@@ -1103,16 +1345,14 @@ def test_the_value_he_just_clicked_beats_a_config_that_has_not_landed():
 
 
 # ---------------------------------------------------------- the rate caps
-def test_the_capture_rate_is_capped_at_the_mode_not_at_a_fixed_bug():
-    """The old ceiling was 10, derived from a measured ~7.5 fps device -- and
-    that measurement was an artefact of asking a LifeCam Cinema for 1920x1080,
-    a mode it does not have. v4l2 grants a different one silently and the cost
-    turns up as grab latency; at the corrected 1280x720 his live log reads
-    ``grab 11 ms``, not 130.
-
-    So the ceiling is the MODE's nominal rate. Above it there is nothing to
-    fetch -- only a thread permanently inside a blocking read, which is the
-    argument the old cap was making at the wrong number.
+def test_the_capture_rate_is_capped_at_the_granted_mode_not_at_a_fixed_bug():
+    """The ceiling is the MODE's granted nominal, 30 -- read back from the
+    driver by scripts/camera_mode_probe.py (2026-09-03): 1280x720 MJPG,
+    granted in either set order. Above it there is nothing to fetch. The
+    DEVICE does not reach it: the same probe measured 3.7-3.9 fps in every
+    30 fps mode it has (640x480 included, both formats), at 02:36 and again
+    at 07:17, and his own log 7.5 with him at the desk. The request is a
+    ceiling the device decides whether to honour, not a rate.
     """
     assert cp.preview_fps(options()) == cp.DEFAULT_FPS
     assert cp.preview_fps(options(**{cp.OPTION_FPS: 60})) == cp.MAX_FPS
@@ -1122,23 +1362,59 @@ def test_the_capture_rate_is_capped_at_the_mode_not_at_a_fixed_bug():
         cp.DEFAULT_FPS
 
 
-def test_the_fifteen_he_asked_for_in_his_config_is_no_longer_clamped_away():
-    """camera.preview_fps was already 15.0 in his live assistant.json and the
-    clamp was quietly turning it into 10 -- so setting it did nothing, which
-    is the specific way this looked broken to him."""
+def test_the_default_is_the_rate_the_mode_delivered_not_the_one_it_advertises():
+    """An earlier version of this test asserted DEFAULT_FPS == 15 and called
+    the device's 7.5 fps an artefact of a fixed 1920x1080 bug. It was not
+    (measured; see the module docstring): 7.5 is what 1280x720 delivered
+    with him at the desk whether 10 or 15 was requested, so that is the
+    default. His config's own 15 still passes through unclamped -- a ceiling
+    above the delivered rate costs nothing but a parked read -- and the
+    clamp that once turned it into 10 is not coming back."""
+    assert cp.DEFAULT_FPS == 7.5
+    assert cp.MIN_FPS <= cp.DEFAULT_FPS <= cp.MAX_FPS
     assert cp.preview_fps(options(**{cp.OPTION_FPS: 15.0})) == 15.0
-    assert cp.DEFAULT_FPS == 15.0                 # …and it is now the default
 
 
 def test_the_ui_poll_sits_well_clear_of_the_60_hz_slot():
     """The pane polls on its own after-chain, not on the reactor's grid. It
     has to be slow enough to be invisible next to a 16.67 ms slot and fast
-    enough that a frame is not held back a whole period."""
-    for fps in (1.0, 6.0, 10.0):
+    enough that a frame is not held back a whole period -- at the default,
+    at his configured 15, and at the 30 ceiling, where the 20 ms floor is
+    what keeps it off the slot."""
+    for fps in (1.0, 6.0, cp.DEFAULT_FPS, 10.0, 15.0, 30.0):
         ms = cp.poll_ms(fps)
         assert ms >= 20                              # never near a slot
         assert ms <= 1000.0 / fps                    # …and never a frame late
     assert cp.poll_ms(6.0) == 83
+    assert cp.poll_ms(cp.DEFAULT_FPS) == 67
+    assert cp.poll_ms(15.0) == 33
+    assert cp.poll_ms(30.0) == 20                    # the floor, not 17
+
+
+@pytest.mark.parametrize("fps,stride", [(0.0, 1), (2.0, 1), (7.5, 1),
+                                        (10.0, 1), (15.0, 2), (30.0, 4)])
+def test_the_detect_cadence_is_every_nth_picture(fps, stride):
+    """N = max(1, round(picture_fps / DETECT_FPS)). A wall-clock period was
+    INERT at the 7.5 fps the device delivers (133 ms is already past 125)
+    and quantised to every second picture at 10 -- 5 Hz boxes, slower than
+    the pane managed before the split."""
+    assert cp.detect_stride(fps) == stride
+
+
+@pytest.mark.parametrize("fps,lo,hi", [(7.5, 15, 15), (10.0, 20, 20),
+                                       (15.0, 15, 16), (30.0, 14, 16)])
+def test_the_detect_cadence_follows_the_measured_picture_rate(fps, lo, hi):
+    """Driven with pictures at the device's rate, not the configured one:
+    every picture at 7.5 and 10 delivered fps, every second at 15, every
+    fourth at 30. Two seconds of pictures each."""
+    clock = Clock()
+    det = FakeDetector(rows=[row(4, 2, 8, 8)], input_size=(32, 18))
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=det, observe=observer(),
+                              now=clock)
+    for _ in range(int(round(fps * 2.0))):
+        pipe.grab((16, 9))
+        clock.tick(1.0 / fps)
+    assert lo <= det.calls <= hi, det.calls
 
 
 # ------------------------------------------------------------- resolving

@@ -30,68 +30,109 @@ pixels never become reachable by anyone else:
   that made looking at an image normal.
 
 WHY THE CAPTURE IS OFF THE Tk THREAD, WHICH IS THE WHOLE ENGINEERING PROBLEM.
-The first version of this module measured a **130 ms frame grab** and a device
-that delivered ~7.5 fps, and capped the rate at 10 to match. BOTH NUMBERS WERE
-AN ARTEFACT OF A BUG THAT IS NOW FIXED: ``camera.width/height`` asked for
-1920x1080, a mode the LifeCam Cinema does not have, and v4l2 does not refuse an
-impossible mode -- it silently grants a different one and the cost turns up as
-grab latency. With the resolution corrected to 1280x720 his live log reads
-``campreview: live  faces 1  1280x720  6.0 fps  grab 11 ms``. Eleven, not a
-hundred and thirty, and the loop is now period-bound rather than device-bound.
+A grab on the Tk thread is the device's frame interval spent inside the
+mainloop -- 133 ms at the 7.5 fps his LifeCam delivered with him at the
+desk, 268 ms at the 3.8 fps it delivered to the probe (both MEASURED,
+below) --
+and the console's reactor animates on 16.67 ms slot boundaries
+(jarvis/ui/avatar_clock.py). A read there would stop the console dead for
+eight to sixteen slots, every picture. So: a daemon thread, a latest-wins
+slot, and the two never block each other. The arithmetic per picture is
+small next to the wait. Measured on this box 2026-09-03 against SYNTHETIC
+1280x720 frames (no device opened): MJPG decode inside ``VideoCapture.read``
+2.7-3.2 ms, the reduction to the pane's box 1.8 ms, YuNet at 320x180
+1.4-2.6 ms, one SFace embedding 10.4 ms. Those component costs reproduce. An
+earlier draft of this docstring also carried a table of whole-pipeline
+CPU-per-second totals; they did not reproduce (off by 45% and more, and
+priced at a picture rate the device does not deliver), so they are gone.
 
-The cap therefore moved (see MAX_FPS); the thread did not, because the thread
-was never really about the 130 ms. Measured on this box 2026-09-03 against
-SYNTHETIC 1280x720 frames -- no device was opened -- the per-frame work that
-cannot be avoided is: MJPG decode inside ``VideoCapture.read`` 2.7-3.2 ms, the
-reduction to the pane's box 1.8 ms, YuNet at 320x180 1.4-2.6 ms, one SFace
-embedding 10.4 ms. That is ~5 ms of arithmetic per picture plus an unbounded
-wait on the device, and the console's reactor animates on 16.67 ms slot
-boundaries in the Tk mainloop (jarvis/ui/avatar_clock.py). Putting any of it
-there would be 15 slots a second carrying someone else's work and a mode edge
-that stops the console dead. So: still a daemon thread, still a latest-wins
-slot, and the two still never block each other.
+WHAT THE DEVICE ACTUALLY DELIVERS, MEASURED -- and why the number this
+module asks for is a CEILING, not a rate. An earlier draft said the 7.5 fps
+in his log was an artefact of asking for 1920x1080. IT WAS NOT. At the
+corrected 1280x720 his live log (2026-09-03, 00:04-00:22) reads ``6.0 fps
+grab 11 ms`` with 6 requested, ``7.5 fps  grab 133 ms`` with 10, and
+``7.4-7.6 fps`` with 15: the device hands over ~7.5 fps whatever is asked.
+(The 11 ms grab at 6 requested was not a fast device -- it was a frame that
+had been waiting in the driver's queue, a stale picture; see
+``CAP_PROP_BUFFERSIZE`` in jarvis/camera.py.) Two explanations were then put
+to the device itself by scripts/camera_mode_probe.py, TWICE -- 2026-09-03
+at 02:36 and again at 07:17, Jarvis stopped both times, ``grab()`` only:
+buffers dequeued and never retrieved, decoded, shown or saved; 10 warm-up +
+60 timed grabs per row, 30 fps requested for every row, cv2 4.12.0 on the
+V4L2 backend. The two runs agree to 0.1 fps and 1 ms; the 07:17 run is the
+one tabled, with the 02:36 sustained rate beside it:
 
-THE THREE RATES ARE NOT ONE RATE, and separating them is what stopped the pane
-looking laggy. Hunter, 2026-09-03: *"looks good but it lags a ton"*. A 10 fps
-ceiling is a 100 ms step between pictures, which reads as a slideshow whatever
-the boxes are doing -- but detection does not need to run on every picture, and
-identity must not:
+  requested       set order     granted                 sustained 07:17  02:36
+  1280x720 MJPG   fourcc-first  1280x720 MJPG 30.0 fps  3.8 fps p50 268   3.7
+  1280x720 MJPG   size-first    1280x720 MJPG 30.0 fps  3.9 fps p50 268   3.9
+  1280x720 YUYV   fourcc-first  1280x720 YUYV 10.0 fps  5.0 fps p50 200   5.0
+  1280x720 YUYV   size-first    1280x720 YUYV 10.0 fps  5.0 fps p50 200   5.0
+  640x480  MJPG   fourcc-first  640x480  MJPG 30.0 fps  3.9 fps p50 268   3.7
+  640x480  MJPG   size-first    640x480  MJPG 30.0 fps  3.8 fps p50 268   3.7
+  640x480  YUYV   fourcc-first  640x480  YUYV 30.0 fps  3.9 fps p50 267   3.9
+  640x480  YUYV   size-first    640x480  YUYV 30.0 fps  3.9 fps p50 268   3.9
 
-* PICTURES -- ``camera.preview_fps``, default 15, capped at ``MAX_FPS`` = 30.
-  30 is the nominal rate of the 1280x720 MJPG mode this app asks the device
-  for; above it there is nothing to fetch and the thread is simply parked
-  inside a blocking read, which is the argument the old cap was making at the
-  wrong number. 15 is the DEFAULT because it costs half of what 30 does for
-  the smaller half of the improvement: 100 ms between pictures to 67 ms is
-  the step that reads as motion, 67 to 33 is polish.
-* BOXES -- ``DETECT_FPS`` = 8, a constant rather than a knob. It is the rate
-  the assistant's OWN vision lane runs at (``camera.armed_fps`` is 8.0 in his
-  config), so the overlay is never staler than what Jarvis is actually
-  deciding on. Between detections the last boxes are CARRIED FORWARD rather
-  than blanked: a smooth picture with a box 125 ms behind reads better than a
-  choppy one with a perfectly fresh box.
+  (p50 in ms; max within 3 ms of p50 on every row. auto_exposure 3.0 and
+   exposure 156 read back both times, not changed; CAP_PROP_BUFFERSIZE was
+   4, set(1) accepted and read back 1, both times.)
+
+So MJPG IS granted at 720p, in either set order, at a nominal 30: the format
+is not the cause, and there is no FOURCC-ordering fix to apply. Bandwidth
+is not the cause either: 640x480 delivers the same 3.8-3.9 fps in both
+formats, and a 640x480 YUYV stream at that rate is a tenth of what USB 2.0
+carries -- so there is no resolution change worth making, and none was
+made. Every 30 fps mode delivered the same fraction of its nominal rate
+(30/8, a 268 ms interval) and the 10 fps mode delivered 10/2, where his
+live log, with him at the desk between 00:04 and 00:22, shows the same
+720p MJPG mode delivering 30/4 (7.4-7.6 fps, grab 132-136 ms). Frame
+intervals that are whole multiples of the mode's own are what a UVC
+camera on auto-exposure produces when it lengthens the interval to expose
+a dim scene ("exposure priority"), and nothing else that was measured
+explains them. It is NOT proven: the two probe runs were at 02:36 and
+07:17 and nobody looked at whether the light differed between them, so
+they neither confirm nor refute it. Proving it means a run with the desk
+lamp on, or with the camera's exposure-priority control off, and both are
+his to do. What follows from it is the rule this module keeps: THE
+PICTURE RATE IS SET BY THE LENS AND THE LIGHT, AND ``camera.preview_fps``
+CAN ONLY LOWER IT.
+
+THE THREE RATES ARE NOT ONE RATE, and separating them is what keeps the pane
+cheap whatever the device delivers. Hunter, 2026-09-03: *"looks good but it
+lags a ton"*. Detection does not need to run on every picture, and identity
+must not:
+
+* PICTURES -- ``camera.preview_fps``, default ``DEFAULT_FPS`` = 7.5, capped at
+  ``MAX_FPS`` = 30. 7.5 is the HIGHEST rate the 1280x720 mode has been
+  measured to deliver -- with him at the desk (his log, above); the probe
+  measured 3.8-3.9 at 02:36 and 07:17 -- and a default is a ceiling, so it
+  is set at the best the mode does rather than the worst: a ceiling under
+  the delivered rate throws pictures away in exactly the light where the
+  pane could be smooth. 30 is the mode's granted nominal, which the device
+  has never been measured to reach. Above the DELIVERED rate --
+  whatever it is tonight -- there is nothing more to fetch and the capture
+  thread is simply parked inside a blocking read: measured 2026-09-03, the
+  loop's sleep is 100% of the period at 6 requested against 7.5 delivered,
+  1.1% at 10, 0.5% at 15, 0.3% at 30. That costs no CPU (a blocked read is
+  not a spin) and it is not a privacy problem (``stop()`` is synchronous and
+  a frame that returns after it is dropped), but it does mean a request
+  above the delivered rate is a request the device ignores. Below it,
+  pictures are thrown away.
+* BOXES -- ``DETECT_FPS`` = 8, a constant rather than a knob, applied as
+  EVERY Nth PICTURE with ``N = max(1, round(picture_fps / DETECT_FPS))``
+  against the MEASURED picture interval (``detect_stride``). Not a
+  wall-clock period: a detection can only happen when a picture arrives, so
+  a bare ``>= 125 ms`` test is inert at 7.5 delivered fps (every picture,
+  133 ms apart) and at 10 fps quantises to every SECOND picture -- 5 Hz
+  boxes, slower than the pane managed before any of this. 8 Hz is what the
+  assistant's OWN vision lane runs at (``camera.armed_fps``), so the overlay
+  is never staler than what Jarvis is deciding on. Between detections the
+  last boxes are CARRIED FORWARD rather than blanked: a smooth picture with
+  a box an eighth of a second behind reads better than a choppy one with a
+  perfectly fresh box.
 * NAMES -- ``IDENT_FPS`` = 2. An embedding is 10.4 ms, five to seven times a
   detection. A person does not become a different person between frames, and
   the hysteresis below needs two agreeing readings anyway, so a name settles
   in about a second.
-
-WHAT THE SPLIT ACTUALLY COSTS, MEASURED. The whole pipeline driven against
-synthetic 1280x720 frames with the REAL YuNet and the REAL SFace loaded and
-an 11 ms grab standing in for the device (2026-09-03, cv2 threads=2; no
-camera was opened) -- CPU per wall second on one of the box's twenty cores:
-
-  what shipped   6 fps, detect every frame, no identity      35 ms
-  THIS           15 fps / 8 Hz boxes / 2 Hz names           124 ms
-  the same at 30 fps                                        242 ms
-  detection at the picture rate instead                     239 ms
-  identity at the detection rate instead                    399 ms
-  everything at the picture rate                            750 ms
-
-The last line is what "just raise the number" would have cost: three
-quarters of a core, permanently, on a box also running a 26B model, a
-resident TTS engine and Whisper. Splitting the rates is what makes 15 fps
-cost 12% of one core instead of 75%, and it is why the ceiling could move at
-all.
 
 SENSING IS CONSULTED BEFORE THE DEVICE, NOT AFTER THE FRAME. ``jarvis/
 sensing.py`` is the single owner of "may this sensor run" -- offline mode, the
@@ -200,20 +241,28 @@ OPTION_ENABLED = "camera.preview"
 OPTION_FPS = "camera.preview_fps"
 OPTION_IDENTITY_MIN = "camera.identity_min"
 OPTION_MIN_CONF = "camera.min_conf"
-# 15 pictures a second: 67 ms apart, which reads as motion. See the module
-# docstring for why this is not 6 (a fixed bug) and not 30 (twice the CPU for
-# the smaller half of the improvement).
-DEFAULT_FPS = 15.0
-# 30 is the nominal rate of the 1280x720 MJPG mode jarvis/camera.py asks the
-# device for. Above it there is nothing to fetch -- only a thread permanently
-# inside a blocking read, which is the state a curfew edge has to wait out.
-# Below 1 the pane stops reading as live.
+# The HIGHEST rate the 1280x720 mode has been measured to deliver -- his
+# live log 2026-09-03 00:06-00:22, him at the desk: 7.4-7.6 fps whether 10
+# or 15 was requested. Not chosen. The request is a ceiling the device may
+# not reach: the same mode delivered 3.8-3.9 fps to scripts/camera_mode_probe
+# at 02:36 and again at 07:17, and asking for more than it delivers buys
+# nothing but a thread parked in a blocking read -- while asking for LESS
+# than it delivers throws pictures away, which is why the default is the
+# best measured rate and not the worst. See the module docstring; his
+# config's own value wins.
+DEFAULT_FPS = 7.5
+# 30 is the GRANTED nominal of the 1280x720 MJPG mode (read back by the
+# probe, either set order, both runs). The parked-in-read threshold is not
+# this number but the DELIVERED rate -- 3.8 to 7.6 fps measured, and the
+# device has never been measured at 30. Below 1 the pane stops reading as
+# live.
 MIN_FPS, MAX_FPS = 1.0, 30.0
 # How often the DETECTOR runs, whatever the picture rate is. 8 Hz is what the
 # assistant's own vision lane runs at (camera.armed_fps), so the boxes on the
 # pane are never staler than what Jarvis is deciding on; between detections
-# the last boxes are carried forward. Clamped by the picture rate on its own:
-# a period longer than the capture period simply detects every frame.
+# the last boxes are carried forward. Applied as every Nth picture against
+# the MEASURED picture interval (detect_stride), so at a delivered 7.5 fps it
+# is every picture and at 30 it is every fourth.
 DETECT_FPS = 8.0
 # How often IDENTITY runs. An embedding is 10.4 ms measured (2 threads,
 # 2026-09-03), against 1.4-2.6 ms for a detection, so this is the one cadence
@@ -234,6 +283,19 @@ DEFAULT_IDENTITY_MIN = 0.363
 # camera.min_conf's default; the recogniser carries its own copy and raises,
 # and this one keeps us from paying for the exception.
 DEFAULT_MIN_CONF = 0.6
+# How much two boxes have to overlap before the held name is allowed to
+# follow from one to the other. A HELD VERDICT BELONGS TO A FACE, NOT TO THE
+# PANE: without this the label lands on whichever face is currently largest,
+# so two people at similar distance with jittering box sizes get each other's
+# names -- measured 70 of 142 chip-bearing frames wrong, and never
+# converging (synthetic two-face harness, 2026-09-03, re-run 07:20 with
+# the same counts). 0.3 is well above where a head at a desk drifts between
+# two identity ticks (a still head holds >0.9 across 500 ms) and well below
+# where two separate faces could land: side-by-side boxes score 0, and a
+# stranger stepping in front at twice the linear size scores at most 0.25
+# even perfectly concentric. Losing the chip for one identity period is the
+# safe direction -- a missing name is a question, a wrong one is an answer.
+SUBJECT_IOU = 0.3
 # Boxes the pane can draw. Three is a glance, not a dashboard, and the
 # fourth face at his desk is a poster. The cap is applied AFTER the size
 # sort -- see PreviewPipeline._faces for why the order is the whole point.
@@ -244,6 +306,24 @@ MAX_FACES = 3
 # score-descending and a real room yields single digits, so dropping the
 # 65th-most-confident detection cannot lose the face at the desk.
 MAX_ROWS = 64
+
+
+def detect_stride(picture_fps: float, detect_fps: float = DETECT_FPS) -> int:
+    """Run the detector on every Nth picture: ``max(1, round(picture_fps /
+    detect_fps))``.
+
+    A detection can only happen when a picture arrives, so the achievable
+    box rates are the picture rate divided by a whole number. A wall-clock
+    period picked the first multiple AT OR ABOVE it: inert at the 7.5 fps
+    the device delivers (every picture -- 133 ms is already over the 125 ms
+    period) and wrong at 10 (every SECOND picture, 5 Hz boxes). Rounding to
+    the nearest multiple means the saving can never cost more than it
+    saves: 7.5 -> 1, 10 -> 1, 15 -> 2, 30 -> 4. An unknown rate (the first
+    picture, a stalled feed) is 1 -- detect, and learn the interval.
+    """
+    if not picture_fps or picture_fps <= 0.0 or detect_fps <= 0.0:
+        return 1
+    return max(1, int(round(picture_fps / detect_fps)))
 
 # Why there is no picture. One of these, or "" while a frame is live.
 REASON_LIVE = ""
@@ -407,10 +487,11 @@ def preview_enabled(get_option: Optional[Callable]) -> bool:
 
 
 def preview_fps(get_option: Optional[Callable]) -> float:
-    """The PICTURE rate, clamped to [MIN_FPS, MAX_FPS].
+    """The PICTURE rate ceiling, clamped to [MIN_FPS, MAX_FPS].
 
-    It cannot beat the mode the app asks the device for (1280x720 MJPG,
-    nominally 30 fps): a rate above that buys a thread permanently inside a
+    A ceiling, not a rate: the device delivers what its granted mode and the
+    light allow (3.7-7.5 fps measured at 1280x720, see the module
+    docstring), and a request above that buys a thread parked inside a
     blocking read rather than more pictures. It is NOT the rate the boxes or
     the name update at -- those have their own cadences (DETECT_FPS,
     IDENT_FPS), which is what makes a smooth picture affordable."""
@@ -424,11 +505,15 @@ def preview_fps(get_option: Optional[Callable]) -> float:
 def poll_ms(fps: float) -> int:
     """How often the Tk side should LOOK for a new shot.
 
-    Twice the capture rate, so a frame is on screen within half a period of
-    arriving, and never faster than 20 ms. A poll that finds nothing new is
-    an int compare (``PreviewShot.seq``), so the extra passes are free; the
-    thing that must not happen is a poll on the 16.67 ms reactor slot, and
-    83 ms at the default 6 fps is nowhere near it.
+    Twice the CONFIGURED rate, so a frame is on screen within half a period
+    of arriving, and never faster than 20 ms: 67 ms at the 7.5 default,
+    33 ms at his 15, 20 ms at the 30 cap. The rate went up with the cap --
+    12 polls a second at the old 6 fps default became 30 at 15 and 50 at
+    the ceiling -- and that is affordable because a poll that finds nothing
+    new is one attribute read and an int compare (``PreviewShot.seq``),
+    which at the device's real 3.7-7.5 fps is most of them. The thing that
+    must not happen is a poll ON the 16.67 ms reactor slot, and the 20 ms
+    floor keeps every setting clear of it.
     """
     return max(20, int(round(500.0 / max(MIN_FPS, fps))))
 
@@ -510,6 +595,41 @@ class IdentityHold:
     directions cost the same evidence, because from then on a single odd
     reading in either direction is just noise.
 
+    THE VERDICT IS BOUND TO THE FACE IT WAS COMPUTED FROM, and that binding
+    is load-bearing rather than tidy. Everything above is about WHEN a label
+    may change; a hold with no subject also has to answer WHOSE it is, and
+    without that the two rules fight each other. The pane names its largest
+    face, "largest" flips between two people at similar distance as their
+    boxes jitter, and the hysteresis then works against the person looking
+    at it: each intervening reading of the OTHER name resets the
+    disagreement counter (so the two-reading bar is never reached) and
+    refreshes the timestamp (so ``hold_s`` never expires either). Measured on
+    the unbound version, 2026-09-03, synthetic two-face harness at 15 fps for
+    150 pictures with "largest" flipping every picture: 142 chip-bearing
+    frames, 70 of them one person's name and score over the other person's
+    box, never converging; flipping every third picture, 126 named and 60
+    wrong.
+
+    So a reading carries the BOX it was taken from, and a box that is not
+    plausibly the same face (``SUBJECT_IOU``) is a different question rather
+    than a disagreement about this one. Two rules follow, and they differ on
+    purpose. A READING about a different face replaces the subject: the
+    hold is cleared and the new face starts from nothing, because the hold
+    is "who the identity tick last looked at" and it just looked elsewhere.
+    A mere STAMP request for a different face -- ``held(box)`` between
+    ticks, when "largest" jitters to the other person for a frame -- is
+    refused but does not clear: the verdict is withheld from that box and
+    is still there when the face it belongs to is largest again. Clearing
+    there too was measured (same harness): 18 named frames of 150 and 0
+    wrong; withholding keeps 0 wrong and gives the right face its name back
+    without another second of agreement -- 72 named frames of 150, still 0
+    wrong. (Flipping every third picture, the identity ticks land on both
+    faces in turn and each reading replaces the subject: 36 named, 0 wrong,
+    either way.) The candidate counter is bound the same way, so "two
+    agreeing readings" means two about ONE face. This is the rule
+    ``_track`` already applies to carried boxes on a capture-geometry
+    change, moved to the thing that has a person's name on it.
+
     ``clear()`` is the hard reset for "there is no subject": ``Eye``'s own
     ``SessionIdentity.room_empty`` makes the same call for the same reason --
     an empty frame is precisely the window in which a different person sits
@@ -522,60 +642,125 @@ class IdentityHold:
 
     def __init__(self, agree: int = IDENT_AGREE,
                  hold_s: float = IDENT_HOLD_S,
-                 now: Callable[[], float] = time.monotonic):
+                 now: Callable[[], float] = time.monotonic,
+                 iou: float = SUBJECT_IOU):
         self.agree = max(1, int(agree))
         self.hold_s = float(hold_s)
+        self.iou = float(iou)
         self._now = now
         self._ran = False          # is ANYTHING held? "" is a verdict too
         self._label = ""
         self._score = 0.0
         self._at = 0.0
+        self._box: Optional[tuple] = None       # whose verdict this is
         self._cand: Optional[str] = None
+        self._cand_box: Optional[tuple] = None  # …and whose candidate
         self._n = 0
 
     def clear(self) -> None:
         """No subject, or no identity to run: forget who it was."""
         self._ran = False
         self._label, self._score, self._at = "", 0.0, 0.0
-        self._cand, self._n = None, 0
+        self._box = None
+        self._cand, self._cand_box, self._n = None, None, 0
 
-    def observe(self, label: str, score: float) -> tuple:
+    def _same(self, a: Optional[tuple], b: Optional[tuple]) -> bool:
+        """Are these two boxes plausibly the same face?
+
+        UNKNOWN READS AS YES, deliberately. A caller that does not carry
+        geometry (the hold's own unit tests, and any future consumer that
+        only has a label) gets the pre-binding behaviour rather than a hold
+        that clears itself on every reading. The binding is enforced where
+        the geometry exists, which is ``PreviewPipeline._name``.
+        """
+        if a is None or b is None:
+            return True
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+            return True                         # not geometry; do not judge
+        ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+        iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+        inter = ix * iy
+        union = aw * ah + bw * bh - inter
+        return union > 0 and (inter / union) >= self.iou
+
+    def observe(self, label: str, score: float,
+                box: Optional[tuple] = None) -> tuple:
         """One identity reading -> the held ``(label, score, ran)``.
 
         ``label`` is "" for "asked, nothing matched", which is an answer and
-        is held like any other.
+        is held like any other. ``box`` is the detection the embedding came
+        from, in capture pixels; a reading about a DIFFERENT face resets
+        rather than votes.
         """
         label = str(label or "")
         score = float(score)
         now = self._now()
+        if box is not None and not self._same(self._box, box):
+            # Not a disagreement about this face -- a different face. The
+            # held verdict has nothing to say about it and must not be
+            # confirmed, contradicted or extended by it.
+            self.clear()
         if self._ran and label == self._label:
             self._score, self._at = score, now      # a confirmation
-            self._cand, self._n = None, 0
-            return self.held()
+            self._box = box if box is not None else self._box
+            self._cand, self._cand_box, self._n = None, None, 0
+            return self.held(box)
         if not self._ran and label == "":
-            self._adopt("", score, now)             # say so at once
-            return self.held()
-        if label != self._cand:
+            self._adopt("", score, now, box)        # say so at once
+            return self.held(box)
+        if label != self._cand or not self._same(self._cand_box, box):
             self._cand, self._n = label, 0
+        self._cand_box = box if box is not None else self._cand_box
         self._n += 1
         if self._n >= self.agree:
-            self._adopt(label, score, now)
-        return self.held()
+            self._adopt(label, score, now, box)
+        return self.held(box)
 
-    def _adopt(self, label: str, score: float, now: float) -> None:
+    def _adopt(self, label: str, score: float, now: float,
+               box: Optional[tuple] = None) -> None:
         self._ran = True
         self._label, self._score, self._at = label, score, now
-        self._cand, self._n = None, 0
+        self._box = box
+        self._cand, self._cand_box, self._n = None, None, 0
 
-    def held(self) -> tuple:
+    def held(self, box: Optional[tuple] = None) -> tuple:
         """``(label, score, ran)``, expiring a verdict nothing has confirmed
-        for ``hold_s``. Read, not tick, because the caller only comes back
-        when a frame arrives -- and a chip that outlived its evidence because
-        nobody called a tick would be exactly the stale name this exists to
-        prevent."""
+        for ``hold_s``, and refusing to lend one to a face it was not
+        computed from.
+
+        Read, not tick, because the caller only comes back when a frame
+        arrives -- and a chip that outlived its evidence because nobody
+        called a tick would be exactly the stale name this exists to
+        prevent. ``box`` is the face the caller is about to stamp: a verdict
+        that does not belong to it is WITHHELD -- ``("", 0.0, False)``, no
+        chip -- rather than drawn, which is the difference between a missing
+        name and a wrong one. It is not cleared: the verdict still belongs
+        to the face it came from, and that face is usually largest again on
+        the next picture. Only a READING (``observe``) moves the subject.
+        """
         if self._ran and (self._now() - self._at) > self.hold_s:
             self.clear()
+        if self._ran and box is not None and not self._same(self._box, box):
+            return "", 0.0, False
         return self._label, self._score, self._ran
+
+
+def _usable_embedding(vec) -> bool:
+    """Finite, non-empty, non-zero -- the two failure shapes a recogniser
+    can hand back without raising. The gallery applies stricter checks of
+    its own (dimension, spread); those are the gallery's business and it
+    answers ("", 0.0) for them, which ``_match`` then accepts as an answer.
+    """
+    try:
+        import numpy as np                        # noqa: PLC0415 - lazy
+        arr = np.asarray(vec, dtype=float).ravel()
+        if arr.size == 0 or not bool(np.all(np.isfinite(arr))):
+            return False
+        return float(np.linalg.norm(arr)) > 0.0
+    except Exception:                             # noqa: BLE001 - not a vector
+        return False
 
 
 # ----------------------------------------------------------- the pipeline
@@ -618,6 +803,17 @@ class PreviewPipeline:
         self.gallery = gallery
         self.identity_min = float(identity_min)
         self.min_conf = float(min_conf)
+        # THE IDENTITY GATE HAS ITS OWN FLOOR RATHER THAN BORROWING THE
+        # DETECTOR'S. camera.min_conf decides how many boxes get DRAWN, and
+        # assistant_config records that it has already been turned down once
+        # (0.7 -> 0.6) "because a miss is SILENT" -- the documented direction
+        # of travel is downward. Borrowing it means a dial about how much the
+        # pane shows also decides who gets NAMED: at min_conf 0.0 a
+        # 0.25-scoring detection produced three embeddings and a chip reading
+        # "HUNTER 0.71" over a smudge. Raising the detector bar still raises
+        # this one (max, not a constant), because a detection the pane will
+        # not even draw is not one to embed.
+        self.id_conf = max(float(min_conf), DEFAULT_MIN_CONF)
         self._ident = hold if hold is not None else IdentityHold(now=now)
         # The three cadences. Periods rather than rates because that is what
         # the comparison against the clock wants, and a rate of 0 would be a
@@ -631,6 +827,13 @@ class PreviewPipeline:
         # twice in a row for ever.
         self._last_detect: Optional[float] = None
         self._last_ident: Optional[float] = None
+        # The MEASURED interval between pictures, which is what the detect
+        # cadence has to round against -- see _track. Measured rather than
+        # configured because the two differ: the device delivers what it
+        # delivers whatever camera.preview_fps asks for.
+        self._last_pic: Optional[float] = None
+        self._pic_dt: Optional[float] = None
+        self._since_detect = 0
         # The boxes carried forward between detections, and the capture
         # geometry they are expressed in. Faces are ALWAYS in capture pixels,
         # so a mode change makes the carried ones wrong rather than stale.
@@ -689,10 +892,20 @@ class PreviewPipeline:
         row that got thrown away, and ``_attend`` would then put the
         attention verdict on a head two metres behind him.
         """
+        # A DETECTION THAT COULD NOT BE MADE IS NOT WEAKER EVIDENCE OF
+        # "NOBODY IS THERE" THAN ONE THAT CAME BACK EMPTY. Both of these
+        # returns used to skip the clear() below, so a single frame where the
+        # detector raised left the name held -- and the next face, a
+        # different person 0.2 s later, inherited it (measured: the
+        # stranger's chip read name='hunter' id_ran=True). The boxes were
+        # already dropped on this path; the NAME was not, which is the half
+        # that says something false about a person.
         if rows is None:
+            self._ident.clear()
             return ()
         observe = self._observer()
         if observe is None:
+            self._ident.clear()
             return ()
         sx, sy = self._scales(frame_w, frame_h)
         out = []
@@ -760,7 +973,7 @@ class PreviewPipeline:
 
         1. identity has to be wired at all (``camera.identity`` on, weights
            present, an enrolment loaded). Off is the resting state.
-        2. the detection has to have cleared ``camera.min_conf`` ALREADY.
+        2. the detection has to have cleared ``self.id_conf`` ALREADY.
            SFace answers confidently on inputs that are not faces -- unrelated
            non-face crops match each other at 0.66-0.92 against a 0.363 bar --
            so an embedding from a weak detection is not a weak answer, it is a
@@ -771,18 +984,23 @@ class PreviewPipeline:
            expensive thing in this module by a factor of five.
 
         Between ticks the HELD verdict is stamped on anyway, so the chip
-        stays with the box rather than blinking at the identity rate.
+        stays with the box rather than blinking at the identity rate -- but
+        only onto the FACE IT BELONGS TO. The subject's geometry goes into
+        the hold with the reading and is checked against on the way out, so
+        a name cannot walk from the face it was computed from onto whoever
+        happens to be largest in the next picture. See ``IdentityHold``.
         """
         if self.recogniser is None or self.gallery is None:
             return face
+        box = (face.x, face.y, face.w, face.h)
         due = (self._last_ident is None
                or (at - self._last_ident) >= self._ident_period)
-        if due and face.conf >= self.min_conf:
+        if due and face.conf >= self.id_conf:
             self._last_ident = at
             label, score = self._match(frame, row)
             if label is not None:      # None = it could not be asked; hold
-                self._ident.observe(label, score)
-        label, score, ran = self._ident.held()
+                self._ident.observe(label, score, box)
+        label, score, ran = self._ident.held(box)
         if not ran:
             return face
         return replace(face, name=label, id_score=score, id_ran=True)
@@ -802,6 +1020,18 @@ class PreviewPipeline:
         except Exception:                     # noqa: BLE001 - a model edge
             log.debug("campreview: the recogniser declined a row",
                       exc_info=True)
+            return None, 0.0
+        if not _usable_embedding(vec):
+            # A crop of nothing (non-finite) or a blank one (all zero) is
+            # the MACHINERY failing, not the gallery answering. The gallery
+            # would return ("", 0.0) for it -- the same shape as "asked,
+            # nobody matched" -- and the pane would print UNKNOWN 0.00 over
+            # a face nobody actually asked about. None leaves the held
+            # verdict alone, the way a recogniser exception does. A ("",
+            # 0.0) that survives this check IS accepted as an answer: it is
+            # what the gallery says when every enrolled sample sits at or
+            # under cosine 0, which is a stranger, not a fault.
+            log.debug("campreview: the embedding was not usable")
             return None, 0.0
         try:
             label, score = self.gallery.match(vec)
@@ -875,18 +1105,53 @@ class PreviewPipeline:
         immediately -- an empty room has to empty the pane on the next
         detection, not linger for a hold period -- and that is the same pass
         that tells the attention tracker the dwell is over.
+
+        WHY THE CADENCE IS EVERY Nth PICTURE RATHER THAN A WALL-CLOCK
+        PERIOD. Detections can only happen when a picture arrives, so the
+        achievable box rates are the picture rate divided by a whole number
+        -- and a bare ``>= period`` test picks the first multiple AT OR
+        ABOVE the period, which can be much slower than the rate it was
+        asked for. At 10 pictures a second against a 125 ms period that is
+        every SECOND picture: 5 Hz boxes, slower than the 6 Hz the pane
+        managed before any of this; at the 7.5 fps the device actually
+        delivers it is inert. ``detect_stride`` rounds to the nearest
+        achievable multiple instead, so the saving can never cost more than
+        it saves. The picture interval is MEASURED -- an EMA over the last few
+        gaps between live pictures, so N follows the device's rate rather
+        than any one gap, and a stall errs towards detecting MORE often for
+        a few pictures -- not taken from ``camera.preview_fps``, because on
+        this camera those two are not the same number (module docstring).
+
+        The IDENTITY cadence deliberately stays on the clock. Rounding it up
+        would raise the rate of the one thing here that costs real
+        arithmetic (10.4 ms an embedding), and identity running slightly
+        slow is invisible: the hold covers the gap by design.
         """
+        dt = at - self._last_pic if self._last_pic is not None else 0.0
+        self._last_pic = at
+        if 0.0 < dt < 2.0:
+            self._pic_dt = dt if self._pic_dt is None \
+                else 0.7 * self._pic_dt + 0.3 * dt
         if self.detector is None:
             self._held = ()
             self._ident.clear()
             return ()
         if self._held_cap != (frame_w, frame_h):
+            # The NAME goes with the boxes. A held verdict is expressed in
+            # the same capture pixels its subject's box was, so a mode change
+            # makes it unplaceable rather than merely stale -- and a camera
+            # that renegotiates its mode while somebody new sits down is
+            # exactly the window in which the last name is wrong.
             self._held, self._held_cap = (), (frame_w, frame_h)
             self._last_detect = None
-        if self._last_detect is not None and \
-                (at - self._last_detect) < self._detect_period:
+            self._ident.clear()
+        self._since_detect += 1
+        stride = detect_stride(1.0 / self._pic_dt if self._pic_dt else 0.0,
+                               1.0 / self._detect_period)
+        if self._last_detect is not None and self._since_detect < stride:
             return self._held
         self._last_detect = at
+        self._since_detect = 0
         try:
             rows = self.detector.detect(frame)
         except Exception:                          # noqa: BLE001 - a detector
@@ -1245,11 +1510,12 @@ class PreviewWorker:
         not open anything, and a grab already in flight is dropped instead
         of published.
 
-        WHAT MAY NOT BE: the join. The thread can be inside a 130 ms grab
-        (measured on his LifeCam) or, on a wedged camera, inside one for
-        seconds, and this is called on the TK THREAD -- from
-        ``_preview_apply`` at every ACTIVE->AMBIENT edge, which is every
-        45 s of quiet. 130 ms there is eight consecutive 60 Hz slots: the
+        WHAT MAY NOT BE: the join. The thread can be inside a 133-268 ms
+        grab (one frame interval of his LifeCam, measured 2026-09-03) or,
+        on a wedged camera, inside one for seconds, and this is called on
+        the TK THREAD -- from ``_preview_apply`` at every ACTIVE->AMBIENT
+        edge, which is every 45 s of quiet. 130 ms there is eight
+        consecutive 60 Hz slots (sixteen at the probe's 268 ms): the
         console visibly stopping dead, which is precisely the symptom this
         module's threading exists to avoid. So ``join=False`` hands the
         wait and the device handback to a throwaway daemon thread and

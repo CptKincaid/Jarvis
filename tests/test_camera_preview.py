@@ -609,6 +609,59 @@ def test_the_chip_is_pulled_back_inside_the_picture():
     assert c.coords_of["name"][0] < c.coords_of["b0"][0]   # it moved left
 
 
+def test_the_same_chip_at_the_same_place_is_not_re_set_or_re_measured():
+    """Between two detections the boxes are carried forward, so the chip
+    lands at the same point picture after picture. Re-setting the text and
+    asking the canvas to measure it again was two canvas operations per
+    repaint for an answer it already had."""
+    ns = pane()
+    measured = []
+    real_bbox = ns.canvas.bbox
+    ns.canvas.bbox = lambda item: measured.append(item) or real_bbox(item)
+    shot = live(face(name="hunter", id_score=0.74, id_ran=True))
+
+    def text_sets():
+        return [kw for item, kw in ns.canvas.calls
+                if item == "name" and "text" in kw]
+
+    paint(ns, shot)
+    sets, meas = len(text_sets()), len(measured)
+    assert sets >= 1 and meas >= 1
+    first = (ns.canvas.coords_of["name"], ns.canvas.coords_of["namebg"])
+    paint(ns, shot)                              # the carried box
+    assert len(text_sets()) == sets              # nothing re-set
+    assert len(measured) == meas                 # nothing re-measured
+    assert ns.canvas.shown("name") and ns.canvas.shown("namebg")
+    assert (ns.canvas.coords_of["name"], ns.canvas.coords_of["namebg"]) \
+        == first
+    paint(ns, live(face(x=140, name="hunter", id_score=0.74, id_ran=True)))
+    assert len(measured) > meas                  # a moved face: measured
+    paint(ns, live(face(name="hunter", id_score=0.31, id_ran=True)))
+    assert len(text_sets()) > sets + 1           # a new score: re-set
+
+
+def test_a_chip_shifted_off_the_edge_is_put_back_when_the_shift_goes():
+    """A cached placement puts nothing down, so the item stays where the
+    LAST frame's edge shift moved it. The shift is tracked so the next frame
+    that needs none puts the word back under its ground."""
+    ns = pane()
+    edge = face(x=1200, y=50, w=80, h=80, name="hunter", id_score=0.74,
+                id_ran=True)
+    paint(ns, live(edge))
+    shifted = ns.canvas.coords_of["name"][0]
+    assert shifted < ns.canvas.coords_of["b0"][0]        # it moved left
+    # The same chip, same anchor point, but the picture is now wider than
+    # the box fit allowed before: no shift is needed, and the item must be
+    # placed at the unshifted x rather than left where the shift put it.
+    ns._name_last = ((ns._name_last[0][0], ns._name_last[0][1],
+                      ns._name_last[0][2]), ns._name_last[1])
+    ns._fit = (0, 0, ns._box[0] * 4, ns._box[1])
+    paint(ns, live(edge))
+    x = ns.canvas.coords_of["name"][0]
+    bg = ns.canvas.coords_of["namebg"]
+    assert bg[0] <= x <= bg[2]                           # word on its ground
+
+
 def test_no_ground_means_no_word():
     """Before there is a window the canvas cannot measure, so there is no
     ground to draw -- and a word without one is a word over live video."""
