@@ -457,3 +457,19 @@ class PowerUp(Event):
     briefing_state.json — the UI must never decide what day it is."""
     reason: str = ""                  # presence | hotword
     gap_h: float = 0.0                # how long the machine was idle
+
+
+@dataclass
+class ClearTranscript(Event):
+    """"Clear the transcript": empty the console's conversation pane.
+
+    A command rather than a fact, for the reason BoardCommand carries the
+    same shape: the commander runs on worker threads and must never hold a
+    reference to a Tk surface, so this is the one honest way for a spoken
+    verb to reach one.
+
+    THE SCREEN ONLY. Nothing here touches the conversation the model sees
+    (jarvis/memory.py, the context engine) -- the pane is glass, the memory
+    is not, and the two must never be cleared by the same event. The spoken
+    line says which he got."""
+    pass

@@ -75,7 +75,7 @@ from jarvis import perf
 from jarvis.config import CONFIG, MACHINE
 from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            ApprovalRequested, ApprovalResolved, AudioLevel,
-                           BoardCommand, PowerUp,
+                           BoardCommand, ClearTranscript, PowerUp,
                            UncertainResolved, UncertainUtterance,
                            BrainState, BriefingReady, ClaudeProgress,
                            ClaudeTaskState, DeskState, FaultRaised, HotwordDetected,
@@ -1692,10 +1692,22 @@ class MainWindow:
         bus.subscribe(BriefingReady, self._ev_briefing)
         # the console's second surface and its power-up choreography
         bus.subscribe(BoardCommand, self._ev_board)
+        bus.subscribe(ClearTranscript, self._ev_transcript_clear)
         bus.subscribe(PowerUp, self._ev_power_up)
         bus.subscribe(DeskState, self._ev_desk)
         bus.subscribe(SensingChanged, self._ev_sensing)
         bus.subscribe(FaultRaised, self._ev_fault)
+
+    def _ev_transcript_clear(self, _ev: ClearTranscript):
+        """"Clear the transcript" (commander._h_transcript_clear).
+
+        THE PANE ONLY -- no memory, no context, no mode change. It is
+        deliberately silent about the console mode: the wipe is canvas work
+        under the ambient slab, so one asked for on the way out of the room
+        must not wake the surface he is walking away from. The spoken
+        confirmation is published right after this event and, the bus being
+        FIFO, lands as the one card left on the empty glass."""
+        self.transcript.clear_all()
 
     def _ev_status(self, ev: Status):
         self.set_status(ev.text, ev.kind)

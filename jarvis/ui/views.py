@@ -1014,6 +1014,52 @@ class TranscriptView(tk.Frame):
                 pass
             self._schedule_layout()
 
+    def clear_all(self) -> int:
+        """Empty the pane — every card, the ghost preview, the open
+        progress run — and return how many cards came down.
+
+        THE SCREEN ONLY. The conversation the model sees lives in
+        jarvis/memory.py and the context engine; this touches neither, and
+        the spoken line that goes with it says so. There is no undo: the
+        cards are destroyed, not hidden.
+
+        ONE card is exempt. An approval still waiting on him carries the
+        only hand-answerable ALLOW / DENY for a Claude run that is BLOCKED
+        on it — wiping it would strand that run until the approval timeout.
+        It stays, alone, and the toast says why.
+
+        Safe in every console mode: this is canvas work under the ambient
+        slab, so a wipe asked for on the way out of the room lands the same
+        as one asked for at the desk, and nothing here wakes the surface.
+        """
+        self.clear_partial()
+        held = {id(info["card"]) for info in self._approvals.values()
+                if info.get("card") is not None and not info.get("answered")}
+        keep, removed = [], 0
+        for entry in self._cards:
+            card, _lbl, _role, win = entry[:4]
+            if id(card) in held:
+                keep.append(entry)
+                continue
+            try:
+                self.canvas.delete(win)
+                card.destroy()
+            except tk.TclError:                 # the window is going away
+                pass
+            removed += 1
+        self._cards = keep
+        self._progress = None                   # a later line opens a new run
+        # He may have scrolled up to read something before asking for the
+        # wipe; an empty column left unpinned lands the NEXT card off-screen.
+        self._pinned = True
+        for info in self._approvals.values():   # no refs to destroyed widgets
+            if info.get("answered"):
+                info["card"] = None
+        if keep and self.toast:
+            self.toast.show("Question left standing", kind="info")
+        self._schedule_layout()
+        return removed
+
     def _card_head(self, card: Card, who: str, who_color: str,
                    rtt: Optional[float] = None) -> tk.Label:
         """Head row: speaker label (display SIZE_CAPTION semibold) left,
@@ -1146,8 +1192,13 @@ class TranscriptView(tk.Frame):
             card.set_edge_glow((theme.ARC_BRIGHT,))
         else:
             card.set_edge_glow()
+        # `answered` and `card` are clear_all's: a question still waiting on
+        # him is the one card a wipe must leave standing. `done` cannot say
+        # so -- answer() above resolves with mark=False, which disables the
+        # buttons without ever setting it.
         self._approvals[request_id] = {"stamp": stamp, "stamp_text": stamp.cget("text"),
-                                       "buttons": (allow, deny), "done": False}
+                                       "buttons": (allow, deny), "done": False,
+                                       "answered": False, "card": card}
         self._push_entry(card, body, "jarvis", x, cw)
         return card
 
@@ -1161,6 +1212,7 @@ class TranscriptView(tk.Frame):
         info = self._approvals.get(request_id)
         if not info:
             return
+        info["answered"] = True
         for btn in info["buttons"]:
             try:
                 btn.set_enabled(False)

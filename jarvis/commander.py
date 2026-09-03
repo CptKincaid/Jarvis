@@ -93,7 +93,8 @@ from jarvis import reader as reader_mod
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.tools.location import clock_words
-from jarvis.events import JarvisReply, SensingChanged, Status, bus
+from jarvis.events import (ClearTranscript, JarvisReply, SensingChanged,
+                           Status, bus)
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import parse_person_statement, parse_since
@@ -5254,6 +5255,72 @@ def _h_ui_look(c, t, m):
                          status=f"Visuals: {name} (restart)")
 
 
+# The conversation pane (jarvis/ui/views.py TranscriptView), 2026-09-02.
+# 23:26:01 he said "Clear the transcript" and the intent gate answered
+# "Ignored (background chat, conf=0.80)": three words, no rung, dropped in
+# silence. This is that rung.
+#
+# THE SCREEN ONLY, and the line says so. Wiping the pane is cosmetic and
+# costs nothing; wiping the conversation the model sees (jarvis/memory.py,
+# the context engine) changes what Jarvis knows mid-sentence. He asked for
+# "the transcript", which is the thing in front of him, so that is what he
+# gets -- and he is told the memory is intact rather than left to wonder
+# whether Jarvis has just forgotten the last ten minutes.
+#
+# The collision this grammar exists to survive: "clear" is already his verb
+# for his LISTS ("clear the shopping list", 09-01 12:12 and 20:58). Two
+# defences, because this repo has shipped this bug before -- a widened undo
+# grammar quietly ate "cancel that one". First, the noun set below is a
+# closed list of words that can only mean the pane, and "list" is not in it
+# nor is it an accepted trailing word, so "clear my shopping list" cannot
+# match at all. Second, this rung sits BELOW the named-list family in the
+# registry, so even a future widening hands "... list" to the lists.
+#
+# Nouns considered and REFUSED. "memory" outright: that is the context
+# wipe, which this rung must never do. "history" and "log" on their own,
+# because "clear the history" is the clipboard's and "clear the log" is a
+# file; they are accepted only AFTER a pane noun, where "clear the chat
+# history" can mean nothing else.
+_TRANSCRIPT_NOUN = r"(?:transcript|screen|display|console|chat|conversation)"
+_TRANSCRIPT_CLEAR_RX = re.compile(
+    r"^" + _JV +
+    r"(?:clear|wipe|erase|empty|blank|clean|scrub|reset)\s+(?:out\s+)?"
+    r"(?:the|my|this|your)?\s*" + _TRANSCRIPT_NOUN +
+    r"(?:\s+(?:pane|panel|window|view|log|history|area))?"
+    r"(?:\s+(?:clean|out|off))?"
+    r"(?:[, ]+(?:please|jarvis|sir|for me|would you|will you|thanks))*"
+    r"[?.!]*$", re.I)
+# Both facts in one breath: the memory is untouched, and the cards do not
+# come back. No read-back and no undo= go with it -- see _h_transcript_clear.
+TRANSCRIPT_CLEAR_LINE = ("Screen's clear, sir. Nothing forgotten — "
+                         "and nothing to bring back.")
+
+
+def _h_transcript_clear(c, t, m):
+    """Empty the console's conversation pane.
+
+    Fire-and-forget on the bus: the commander runs on worker threads and
+    must never touch a Tk surface, so the window subscribes and does the
+    work (main_window._ev_transcript_clear). The event is queued BEFORE
+    _emit_result publishes this reply, and the bus is FIFO, so the wipe
+    lands first and the confirmation is the one card left on the glass.
+
+    No needs= and no service check. The transcript is the main window, not
+    an optional second surface like the Board, and with no window running
+    there is no one listening to mislead.
+
+    Deliberately NOT destructive-confirmed and deliberately NOT undoable.
+    _h_list_clear stashes a read-back because it destroys DATA he would have
+    to dictate again; nothing is lost here, so a "are you sure, sir?" on a
+    screen wipe would only stand between him and an empty pane. undo=None
+    leaves "scratch that" its old meaning rather than offering a restore
+    this rung cannot honour -- which is exactly why the line says so.
+    """
+    bus.publish(ClearTranscript())
+    return CommandResult(handled=True, reply=TRANSCRIPT_CLEAR_LINE, speak=True,
+                         status="Transcript cleared")
+
+
 def _dnd_seconds(c, mode: str, when: str, now: datetime) -> Optional[float]:
     """'for an hour' / 'until seven' -> seconds from now; None = unparseable."""
     when = (when or "").strip()
@@ -6992,6 +7059,10 @@ REGISTRY: list[Command] = [
     # the window look (jarvis/ui/theme.py): a config write, spoken with its
     # "after a restart" caveat; no needs= so a missing config is SAID.
     Command("ui look", _UI_LOOK_RX.match, _h_ui_look),
+    # the conversation pane: BELOW the named-list family on purpose, so
+    # that "clear the shopping list" is claimed by "list clear" before this
+    # rung is ever asked. No needs=: the transcript is the main window.
+    Command("clear transcript", _TRANSCRIPT_CLEAR_RX.match, _h_transcript_clear),
     Command("quiet status", _QUIET_STATUS_RX.match, _h_quiet_status, needs=("quiet",)),
     Command("quiet hours off", _QUIET_HOURS_OFF_RX.match, _h_quiet_hours_off,
             needs=("quiet",)),
@@ -7080,6 +7151,11 @@ ASSISTANT_TIER1: list[Command] = [
                     # "switch to classic visuals" is said AT the window he
                     # is looking at, wake word already eaten like the rest
                     "ui look",
+                    # ...and so is "clear the transcript", which arrived bare
+                    # at 23:26:01 on 09-02 and was answered "Ignored
+                    # (background chat, conf=0.80)": three words with no
+                    # Tier-1 name are exactly what the intent gate drops.
+                    "clear transcript",
                     # "where's your voice coming out" is asked AT the dead
                     # speaker, which is exactly when the wake word is least
                     # likely to have been heard.
