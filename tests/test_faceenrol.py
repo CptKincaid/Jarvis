@@ -1394,6 +1394,25 @@ def test_reset_destroys_the_old_generations_only_after_the_save(monkeypatch,
     assert back.load() is True and back.loaded_generation == 2
 
 
+def test_reset_with_append_really_ignores_the_append(monkeypatch, tmp_path,
+                                                     capsys):
+    """The script SAID --append was ignored under --reset and then carried
+    the stored takes into the new generation anyway -- 26 embeddings saved,
+    the old generation destroyed, the pool he asked to replace intact (F14,
+    reproduced). The sentence has to be true."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    assert face_enrol.main(ENROL) == 0
+    capsys.readouterr()
+    wire(monkeypatch, tmp_path, vectors=same_face(base_vec(64), 13, seed=12))
+    assert face_enrol.main(ENROL + ["--reset", "--yes", "--append"]) == 0
+    out = capsys.readouterr().out
+    assert "--append is ignored" in out
+    assert "13 already in the gallery" not in out
+    assert "0 already in the gallery" in out
+    back = FaceGallery(root=gallery.root)
+    assert back.load() is True and back.total() == 13, "the old pool came forward"
+
+
 def test_reset_asks_before_it_destroys_anything(monkeypatch, tmp_path,
                                                 capsys):
     """--delete demands a typed word for this data; --reset demanded

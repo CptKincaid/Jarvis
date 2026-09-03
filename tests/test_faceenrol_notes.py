@@ -903,6 +903,25 @@ def test_the_forget_answer_never_deletes_by_voice(tmp_path):
     assert FaceGallery(root=g.root).load() is True, "it deleted by voice"
 
 
+def test_the_owner_forgetting_his_own_face_still_names_the_label(tmp_path):
+    """"Forget my face" handed over a bare --delete, which the script
+    defines as EVERYBODY plus camera.identity off -- Heather's enrolment
+    would have gone with a sentence about his own six takes (F32). The
+    owner's label is elided from every other command; not from a delete."""
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(808), 6, seed=17):
+        g.add("hunter", vec)
+    for vec in same_face(base_vec(909), 6, seed=18):
+        g.add("heather", vec)
+    g.save(reason="test")
+    out = ee.forget_answer(FaceGallery(root=g.root), "hunter",
+                           owner="hunter", clipboard=lambda text: True)
+    assert "--delete --label hunter" in out["command"]
+    assert ee.command_line("hunter", owner="hunter", delete=True).endswith(
+        "--delete --label hunter")
+    assert "--label" not in ee.command_line("hunter", owner="hunter")
+
+
 def test_the_entry_point_never_imports_a_camera(tmp_path):
     """The in-app entry point reads a gallery and formats sentences. If it
     ever grows an import that can open a lens, that is a capture UI arriving

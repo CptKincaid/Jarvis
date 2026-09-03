@@ -691,6 +691,14 @@ class FaceGallery:
         gens = self.generations()
         if len(gens) < 2:
             return 0
+        # Prove there is something to fall back TO before destroying what
+        # is here. With gen 1 unreadable (a 0-byte truncation, a FORMAT
+        # bump) and gen 2 the only good enrolment, this used to shred gen 2
+        # on a file COUNT, fail the load, return 0 -- and the caller then
+        # printed "nothing to roll back to" over an empty directory (F13,
+        # reproduced 2026-09-03). An unreadable generation defends nothing.
+        if not any(self._sample_count(g) > 0 for g in gens[:-1]):
+            return 0
         _shred(self.path_for(gens[-1]))
         self.loaded_generation = 0
         self._loaded_n = 0

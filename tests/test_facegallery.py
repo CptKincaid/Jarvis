@@ -418,6 +418,26 @@ def test_a_crashed_save_leaves_no_embeddings_behind(tmp_path):
     assert list(root.iterdir()) == []
 
 
+def test_rollback_refuses_when_the_only_readable_generation_is_the_newest(tmp_path):
+    """gen 1 unreadable (a 0-byte truncation), gen 2 the only good
+    enrolment: rollback() used to shred gen 2 on a file COUNT, fail the
+    load, and leave nothing on disk that parses (F13, reproduced). Now it
+    proves an older generation parses BEFORE it destroys anything."""
+    g = FaceGallery(root=tmp_path / "g")
+    base = vec(5)
+    for i in range(6):
+        g.add("hunter", near(base, 300 + i))
+    g.save("gen1")
+    g.add("hunter", near(base, 310))
+    g.save("gen2")
+    assert g.generations() == [1, 2]
+    g.path_for(1).write_bytes(b"")          # the shape backup() warns about
+    assert g.rollback() == 0
+    assert g.generations() == [1, 2], "it destroyed the only good enrolment"
+    back = FaceGallery(root=g.root)
+    assert back.load() is True and back.loaded_generation == 2
+
+
 def test_rollback_reports_the_generation_it_is_actually_holding(tmp_path):
     """``load()`` falls back down the stack when the predecessor is also
     corrupt, but the return value was hard-coded to ``gens[-2]``. Measured

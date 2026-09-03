@@ -88,7 +88,14 @@ def command_line(label: str, owner: str = "hunter",
            shlex.quote(script or script_path())]
     if delete:
         out.append("--delete")
-    if label and label != owner:
+    # A delete ALWAYS names its person. Without --label the script's
+    # --delete is "everything": every generation of every face, and
+    # camera.identity switched off. "Forget my face" used to hand that
+    # over for the owner (whose label is elided everywhere else), so a
+    # sentence about his 6 takes would have erased Heather's as well and
+    # asked for a different confirmation word than the one he was told
+    # (F32, reproduced 2026-09-03). do_delete_label is the one-person path.
+    if label and (label != owner or delete):
         out += ["--label", shlex.quote(label)]
     if append and not delete:
         out.append("--append")

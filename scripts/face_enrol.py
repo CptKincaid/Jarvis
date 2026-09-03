@@ -546,6 +546,11 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
         if args.append:
             say("--append is ignored: --reset replaces the pool rather than "
                 "adding to it.")
+            # ...and it IS ignored: this flag used to survive the sentence,
+            # so the stored takes were carried into the new generation and
+            # the old ones were then destroyed -- the pool he asked to
+            # replace came forward in full (F14, reproduced 2026-09-03).
+            args.append = False
         if superseded and not args.yes and args.json:
             # The prompt below writes to stdout, which would land in the
             # middle of the JSON document. A destructive flag may not be
@@ -800,9 +805,15 @@ def do_rollback(gallery: FaceGallery, say) -> tuple:
     before = gallery.generations()
     gen = gallery.rollback()
     if not gen:
-        say("STOPPED: there is no earlier generation to roll back to "
-            "(%d on disk)." % len(before))
-        return 3, {"generations": len(before)}
+        # rollback() refuses BEFORE it shreds when no older generation
+        # parses, so a 0 here means the disk is exactly as it was -- and
+        # the line says so, instead of counting files that may be unreadable.
+        after = gallery.generations()
+        say("STOPPED: there is no readable earlier generation to roll back "
+            "to (%d on disk, %s)." % (len(before),
+                                     "nothing touched" if after == before
+                                     else "%d left" % len(after)))
+        return 3, {"generations": len(after), "touched": after != before}
     say("rolled back to generation %d, %d embeddings" % (gen, gallery.total()))
     return 0, {"generation": gen, "total": gallery.total()}
 
