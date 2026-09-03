@@ -249,6 +249,16 @@ def test_a_box_with_no_camera_is_reported_absent_not_stopped(tmp_path):
     assert feed is not None
 
 
+def test_device_present_maps_a_digit_to_the_video_node(monkeypatch):
+    """open_capture treats "0" as a cv2 index; present() must ask about
+    /dev/video0, not about a file called "0" in the working directory
+    (which made a lit camera read as absent -- F53)."""
+    asked = []
+    monkeypatch.setattr(cam.os.path, "exists", lambda p: asked.append(p) or True)
+    assert cam.device_present("0") is True
+    assert asked == ["/dev/video0"]
+
+
 def test_device_present_reads_the_node_not_a_config_flag(tmp_path):
     node = tmp_path / "video7"
     assert cam.device_present(str(node)) is False

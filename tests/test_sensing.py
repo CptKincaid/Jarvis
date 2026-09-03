@@ -401,6 +401,35 @@ def test_a_device_that_is_not_there_is_not_claimed_as_stopped(tmp_path):
     assert out.absent == ("camera",)
 
 
+def test_a_device_that_reads_absent_is_still_stopped_on_the_way_off(tmp_path):
+    """camera.device "0" is a cv2 INDEX, not a path, so present() read a lit
+    camera as absent and the stopper was skipped: disable() said "nothing
+    was sensing to stop" with the handle still open (F53, measured). Now the
+    off path stops whatever this process may be holding regardless, and
+    "absent" is only the wording."""
+    p = _policy(tmp_path)
+    p.enable()
+    stopped = []
+    p.attach("camera", lambda: stopped.append("camera") or True,
+             present=lambda: False)
+    out = p.disable()
+    assert stopped == ["camera"]           # the stop ran anyway
+    assert out.stopped == ()               # ...but is not CLAIMED
+    assert out.absent == ("camera",)
+
+
+def test_an_absent_device_is_not_resumed_on_the_way_back_on(tmp_path):
+    """The symmetric case keeps its old rule: "back online" must not try to
+    open a lens present() cannot see."""
+    p = _policy(tmp_path)
+    p.disable()
+    resumed = []
+    p.attach("camera", lambda: True, present=lambda: False,
+             resume=lambda: resumed.append("camera") or True)
+    p.enable()
+    assert resumed == []
+
+
 def test_a_stop_that_raises_is_a_failure_not_a_crash(tmp_path):
     p = _policy(tmp_path)
     p.enable()

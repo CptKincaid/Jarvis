@@ -90,6 +90,13 @@ def device_present(device: str = "") -> bool:
     absent separately from one it stopped, because "the camera is off" is a
     lie when there was never a camera."""
     if device:
+        # open_capture takes a bare digit as a cv2 index, so the question
+        # "is /dev/video<N> there" is the one to ask; os.path.exists("0")
+        # is never true and read a lit camera as absent (jarvis/sensing.py
+        # _switch_devices, which now stops regardless -- this keeps the
+        # spoken WORDING honest too).
+        if device.isdigit():
+            device = "/dev/video%d" % int(device)
         return os.path.exists(device)
     return bool(device_nodes())
 

@@ -503,6 +503,22 @@ class SensingPolicy:
                 here = True            # assume it is there and try anyway
             if not here:
                 absent.append(dev.name)
+                if on or dev.stop is None:
+                    continue
+                # A device THIS PROCESS may be holding open is stopped
+                # whatever present() says. present() answers "is there a
+                # node at this path" -- and camera.device "0" is an index,
+                # not a path, so it reads absent while the lens is lit;
+                # skipping the stopper there left a raw capture handle open
+                # through "offline mode" and the curfew (measured: disable()
+                # returned absent=('camera',) with the device still open).
+                # A stop is idempotent, so stopping what was never open
+                # costs nothing; "absent" stays the WORDING, never a veto.
+                try:
+                    dev.stop()
+                except Exception:  # noqa: BLE001 - one bad device must not skip the rest
+                    log.exception("sensing: %s could not be stopped", dev.name)
+                    failed.append(dev.name)
                 continue
             if on and state is not None and not self._may_run(state, dev.name):
                 # "Back online" does not mean "open the lens": the nightly
