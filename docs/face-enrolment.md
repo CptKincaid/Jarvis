@@ -11,6 +11,8 @@ states the incident this design answers.*
 ~/vss_env/bin/python scripts/face_enrol.py --restore ~/face-backup
 ~/vss_env/bin/python scripts/face_enrol.py --rollback      # undo the last save
 ~/vss_env/bin/python scripts/face_enrol.py --delete        # destroy it
+~/vss_env/bin/python scripts/face_enrol.py --append        # add to the pool
+~/vss_env/bin/python scripts/face_enrol.py --reset         # replace the pool
 ```
 
 ---
@@ -84,6 +86,7 @@ matters and the first bar is not negotiable:
 |---|---|---|
 | one face in frame | 1 | a gallery that learned a visitor identifies the wrong person confidently, and nothing about it looks wrong afterwards |
 | **detector confidence** | `camera.min_conf` (0.6) | **see below — this is the whole gate** |
+| the bar is a bar | ≥ 0.30 | `camera.min_conf` is user-editable and at 0 it removed the gate entirely — a 0.01 detection was accepted, embedded and stored, with nothing saying so. Below the detector's own filter it cannot reject anything, so it is refused; a bar merely *lowered* from 0.60 is allowed and printed in the report header |
 | eye landmarks distinct | — | coincident eyes means the crop cannot be aligned and every angle below is invented |
 | face size | ≥ 112 px | SFace's input is 112×112; smaller is being upsampled, and the model costs the same either way |
 | interocular | ≥ 35 px | ArcFace's 112×112 alignment template puts the eye centres 35.2 px apart; under that the aligner is magnifying |
@@ -114,6 +117,21 @@ deliberately: `EnrolmentSession.offer` judges before it embeds,
 on the matching path. A rejected sample costs **zero** embeddings, and a test
 counts the recogniser's calls to prove it.
 
+Two things had to be true for "three gates on one rule" to mean anything, and
+neither was:
+
+* **They must fail shut.** Every bar was spelled `value < bar`, and `NaN < 0.6`
+  is False — so a non-finite score cleared the confidence gate *and then every
+  bar under it*, in all three places at once. They are now spelled
+  `not (value >= bar)`, so a NaN passes nothing.
+* **They must read the same number.** The judge read `row[IDX_SCORE]` (column
+  14); the recogniser and the identifier read `row[-1]`. Identical for YuNet's
+  15 columns and divergent for anything longer, in *both* directions — with a
+  16-column row a 0.45 detection the judge would refuse got embedded, and a 0.99
+  detection got dropped. All three now read column 14, and a row of any other
+  shape is refused loudly at the seam rather than having some other number
+  silently read as its confidence.
+
 ### The sharpness number is provisional and says so
 
 Nobody has measured a blur bar on his face, and the asymmetry is one-sided: a
@@ -135,17 +153,84 @@ The gallery is judged as a whole, and **it is not saved if it fails.**
 variation (yaw range < 25°, or fewer than 2 frontal and 2 off-axis samples).
 This gallery knows him in one position and rejects him in every other.
 
-**Too loose** — some sample's *median* cosine to the others is under the 0.363
-"same person" bar. That is either a different person who walked through frame or
-a crop that is not a face. Median rather than mean, so one genuinely distant
-pose does not condemn a sample; per-sample rather than pool-wide, because
-`FaceGallery.match` scores against the pool's **best** member, so one poisoned
-sample is all it takes and the pool's own median stays healthy while it sits
-there.
+**Too loose** — some member's *median* cosine to the others is under the 0.363
+"same person" bar, **or** far below the pool's own median. Median rather than
+mean, so one genuinely distant pose does not condemn a member; per-member rather
+than pool-wide, because `FaceGallery.match` scores against the pool's **best**
+member, so one poisoned member is all it takes and the pool's own median stays
+healthy while it sits there.
+
+### Why the cohesion check has two terms, and what it still cannot see
+
+0.363 is OpenCV's **verification** threshold — "are these two the same person,
+at some FAR" — and a healthy pool's own median sits near **0.80**. An absolute
+0.363 bar is therefore 0.44 *below* the distribution it is supposed to police:
+measured on synthetic pools, it only fires below ~0.40. A foreign member at
+cosine 0.45, 0.50 or 0.60 to the pool cleared every check.
+
+So the check is relative as well as absolute. A member fails if it is under
+0.363 **or** under `pool median − max(0.20, 6 × pool MAD)`. Scaled by the pool's
+own MAD because his yaw runs 14°–54° and an enrolment that covers it is
+*supposed* to be spread — a fixed margin alone would refuse the thing the
+stations exist to produce. With that second term the refusal now fires from
+about 0.62 downward instead of 0.40.
+
+**Say what it still does not catch.** This is an outlier test: it finds one
+member unlike a pool. It does **not** find a pool that is *two* tight clusters
+at a cross-cosine above the bar — with an even split every member's median *is*
+the cross value, so the shape is invisible to any per-member statistic. What
+stands there instead is the one-face-in-frame rule (a second face is refused
+before any embedding), the single-label rule, and judging the pool that will
+actually be written rather than the batch that was captured. The 0.66–0.92 band
+that non-face crops occupy is likewise only partly covered; the detector
+confidence bar, not this check, is what keeps non-faces out.
 
 Both failures are *silent* in use, which is why neither may be saved. The report
-names which one, with the numbers. `--force` exists and records itself in the
-generation's provenance string, so a forced save can be identified later.
+names which one, with the numbers — including the relative floor and the margin
+it was computed from, so a refusal is arithmetic he can check rather than a
+verdict he has to trust. `--force` exists and records itself in the generation's
+provenance string, so a forced save can be identified later.
+
+> **`camera.identity_min` is two knobs wearing one name.** It is the enrolment's
+> absolute cohesion floor *and* the live match bar. Lowering it because his
+> off-axis samples land under 0.363 also lowers the bar that keeps a stranger
+> out of the gallery, by the same amount, silently. The relative term above is
+> deliberately independent of it, so tightening or loosening `identity_min` no
+> longer moves the whole refusal. If they ever need to move separately, they
+> need to be two keys.
+
+---
+
+## Enrolling again: three commands, and what each destroys
+
+| command | captures | what it saves | what it destroys |
+|---|---|---|---|
+| *(no flag)* | a fresh pool | a **new** generation | nothing |
+| `--append` | a fresh pool | the loaded pool **plus** the new one | nothing |
+| `--reset` | a fresh pool | a **new** generation | the older generations, **after** the save |
+
+**Plain re-run is the one you want.** The previous enrolment stays on disk and
+is one `--rollback` away.
+
+**`--append` judges the merged pool, not the batch.** It loads the existing pool
+first and `save()` writes loaded+new, so the checks run over what will actually
+reach the disk. They used to run over the captured batch alone, and the gap was
+not cosmetic: demonstrated synthetically, 13 embeddings of him as generation 1
+plus an `--append` of 13 embeddings of a **different identity** (cross cosine
+0.10) passed all four checks and was written under his label — while the same
+checks over the 26 that landed say `[FAIL] cohesion` with a worst median of
+0.075, and `match()` then returned `('hunter', 1.0000)` for the stranger. The
+report's `pool` line says which set the cosines describe.
+
+**`--reset` captures first and destroys last.** It used to purge before the
+capture, so a run that then failed a check — 'too tight' / 'too loose', the
+outcome this whole design exists to produce — left an empty directory and
+nothing to roll back to. Now: it asks him to type `reset` (the same standard
+`--delete` has, on the same data), says how many generations are going, captures
+and saves, and **only then** drops the generations that predate the new one. If
+anything fails, it destroys nothing and says so. It also no longer side-steps
+the shrink guard by emptying the disk first — a smaller replacement still needs
+`--allow-shrink`, which is the guard doing its job.
 
 ---
 
@@ -182,18 +267,50 @@ it parses. That check is the point: a backup nobody has read back is exactly the
 shape the voiceprint's `.corrupt-<date>` copy had — it existed, it was named like
 a backup, and it held only the fixtures.
 
+Two things it refuses or reports, both from real failure shapes:
+
+* **A destination that is the gallery, or inside it, is refused before a byte is
+  written.** `--backup ~/.aiws_trainer/face_gallery` — one typo from the path in
+  every doc — used to open each live generation with `O_TRUNC` and rewrite it
+  from itself, reporting `copied: 1, verified: 1, ok: True` while doing it. An
+  interruption after the truncate left `gen-00001.npz` at 0 bytes with `load()`
+  returning False: the enrolment gone, from the command whose job is to keep it.
+  Each copy is now written tmp + `os.replace`, the way `FaceGallery.save` is, so
+  a crash mid-copy costs the tmp and never the file it replaces.
+* **It reports what the destination HOLDS, not only what was copied into it.** A
+  backup directory is never reconciled with the source, so after a `--rollback`
+  the discarded generation is still sitting there — and it is still the *newest*,
+  which is the only thing `--restore` looks at. The report names the generation
+  list, the newest and its sample count, and flags any generation that is in the
+  backup but no longer in the live gallery.
+
 `--restore DIR` loads the newest generation from the backup and saves it as a
 **new generation** of the live gallery. It replaces the live pool rather than
 merging into it (a pool that is two enrolments at once is one nobody can reason
 about), and it overwrites nothing — so a restore of the wrong thing is one
-`--rollback` away.
+`--rollback` away. It prints which generation it took, how many samples that
+holds, and how many were live before, because those three numbers are what say
+whether it just resurrected an enrolment he had deliberately rolled back.
 
 `--delete` destroys **every** generation *and* any `gen-NNNNN.npz.tmp` a crashed
 save left behind — a tmp holds a full set of embeddings under a name the
 generation pattern does not match, so a "delete" that skipped it would leave a
-measurement of his face on the disk at 0600. It then reports what is left in the
-directory, and sets `camera.identity` to false, because recognition running
-against a gallery he has just destroyed is a feature that is on and cannot work.
+measurement of his face on the disk at 0600. Each file is **overwritten with
+zeros and then unlinked**: unlink alone removes the directory entry and leaves
+the vectors in the extents. It then reports what is left in the directory, and
+sets `camera.identity` to false, because recognition running against a gallery
+he has just destroyed is a feature that is on and cannot work.
+
+**What `--delete` is allowed to claim, and what it is not.** It says "the gallery
+at *path* is gone: N files overwritten and unlinked", not "your face is no longer
+on this disk" — that older line was wrong twice over. A `--backup` copy survives
+it fully loadable (the command's own confirm prompt already conceded that three
+lines earlier), so the closing text now says copies are **not** touched and he
+must delete them himself. And the overwrite is a *filesystem*-level erase: on a
+copy-on-write filesystem, on a journalled one that already wrote the block
+elsewhere, and on any SSD whose controller remaps rather than rewrites, the old
+blocks can survive. What is true is that the bytes are gone from the path
+anything reads, and that is exactly what it says.
 
 ### The test firewall
 
@@ -202,6 +319,15 @@ into a throwaway directory — *forced*, not `setdefault`, so a shell that expor
 the real path cannot defeat it. `tests/test_faceenrol.py` asserts the redirect
 holds rather than trusting it was set, including through `default_gallery()`,
 which is the exact call the 2026-09-02 accident made against the voiceprint.
+
+The redirect is **also** asserted in the session-scoped `_firewall_live_log_dir`
+fixture, beside the two voiceprint assertions. A forced env var is one belt; the
+voiceprint was given two *after* it was lost, and a face embedding is the same
+kind of irreplaceable measurement. The difference is when it fires: a fixture
+fails at session start, an ordinary test fails somewhere inside a 7,000-test run
+— possibly after something has already written. And the real gallery does not
+exist on this box yet, so a leak now would silently *create* a fixture gallery at
+the real path, which is harder to notice than corrupting one.
 
 ---
 
@@ -286,3 +412,18 @@ never grant capability gets harder to hold the more names exist.
 * **`camera.nose_ratio` = 0.35** is an anthropometric assumption, so every yaw in
   degrees inherits it. The report prints the raw ratio too; the $0 photo test in
   `docs/vision.md` §9 calibrates it.
+* **The false-accept rate. Nothing measures it.** Everything above is validated
+  on the false-*reject* side: `--verify`'s gallery check asks only whether the
+  gallery matches **him** (`id_matched_frames > id_unknown_frames`). No path in
+  `jarvis/` or `scripts/` measures whether it rejects anybody else. A number can
+  be had without enrolling a second person and without breaking the him-only
+  ruling: run `--verify` while somebody else sits in the chair, and read the
+  match distribution against the bar — the report already prints
+  `match_p50`/`match_min_score` and the gallery bar. That is a measurement, not
+  an enrolment.
+* **Liveness. There is none, at any stage.** The detector gate is a *face-ness*
+  test, not a *live-ness* test, so a face on a monitor, in a video call, or in a
+  printed photograph is indistinguishable from a face in the room — at enrolment
+  and at match. Nothing here claims otherwise, and nothing downstream grants a
+  capability on a name (see **What a name may do**), which is what keeps that
+  from being urgent rather than what makes it untrue.

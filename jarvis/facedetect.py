@@ -42,6 +42,7 @@ import numpy as np
 
 from jarvis import facemodels as fm
 from jarvis.logs import get_logger
+from jarvis.visionrig import DETECT_COLS, IDX_SCORE
 
 log = get_logger("facedetect")
 
@@ -216,9 +217,29 @@ class SFaceRecogniser:
         programming: SFace answers CONFIDENTLY on inputs that are not faces,
         so an embedding taken from a weak detection is worse than no
         embedding -- it is a wrong answer that looks right.
+
+        THE SCORE IS READ FROM ``IDX_SCORE``, NOT FROM ``row[-1]``. This gate
+        and the one in ``faceenrol.judge_sample`` are deliberately two gates
+        on ONE rule, and that argument only holds if they read the same
+        number. They are identical for YuNet's 15 columns and divergent for
+        anything longer, in both directions: with a 16-column row a 0.45
+        detection the judge would refuse got embedded, and a 0.99 detection
+        got dropped. A differently shaped detector must fail LOUDLY here
+        rather than have some other column silently read as its confidence.
+
+        ``not (conf >= bar)`` rather than ``conf < bar`` so a non-finite
+        score fails SHUT: ``NaN < 0.6`` is False, which made the one gate the
+        safety argument rests on fail OPEN on a NaN.
         """
-        conf = float(np.asarray(row).ravel()[-1])
-        if conf < self.min_conf:
+        arr = np.asarray(row).ravel()
+        if arr.size != DETECT_COLS:
+            raise ValueError(
+                "refusing to embed a %d-column detection row: YuNet's is %d "
+                "and the confidence is column %d. A row of another shape "
+                "would have some other number read as its score."
+                % (arr.size, DETECT_COLS, IDX_SCORE))
+        conf = float(arr[IDX_SCORE])
+        if not (conf >= self.min_conf):
             raise ValueError(
                 "refusing to embed a detection scoring %.2f, under the %.2f "
                 "bar: SFace collapses on out-of-distribution input and would "

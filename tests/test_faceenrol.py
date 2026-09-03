@@ -37,6 +37,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from jarvis import facedetect as fd
 from jarvis import faceenrol as fe
 from jarvis import visionrig as vr
 from jarvis.config import PATHS
@@ -50,6 +51,12 @@ _SPEC = importlib.util.spec_from_file_location(
     "face_enrol", os.path.join(_HERE, "scripts", "face_enrol.py"))
 face_enrol = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(face_enrol)
+# The REAL config loader, captured once at import. ``wire`` monkeypatches
+# ``AssistantConfig.load``, so a test that wires twice -- which the enrol,
+# --append and --reset sequences have to -- would otherwise capture the
+# PATCHED zero-argument lambda as its "real" loader and fail on the second
+# call rather than on anything it is testing.
+_REAL_CONFIG_LOAD = face_enrol.AssistantConfig.load
 
 
 # ------------------------------------------------------------------ fakes
@@ -875,9 +882,8 @@ def wire(monkeypatch, tmp_path, *, yaws=None, vectors=None, camera=True,
     model or touches his real gallery or his real config."""
     gallery = FaceGallery(root=tmp_path / "gallery")
     cfg_path = tmp_path / "assistant.json"
-    real_load = face_enrol.AssistantConfig.load
     monkeypatch.setattr(face_enrol.AssistantConfig, "load",
-                        staticmethod(lambda: real_load(cfg_path)))
+                        staticmethod(lambda: _REAL_CONFIG_LOAD(cfg_path)))
     monkeypatch.setattr(face_enrol, "open_gallery", lambda: gallery)
     monkeypatch.setattr(face_enrol, "SensingPolicy",
                         lambda cfg=None: FakePolicy(camera=camera))
@@ -1039,8 +1045,15 @@ def test_backup_delete_and_restore_round_trip(monkeypatch, tmp_path, capsys):
 
     assert face_enrol.main(["--delete", "--yes"]) == 0
     out = capsys.readouterr().out
-    assert "no longer on this disk" in out
+    assert "overwritten and unlinked" in out
     assert FaceGallery(root=gallery.root).generations() == []
+    # It must NOT claim his face is off the disk while the backup it just
+    # made is sitting there fully loadable -- which is what it used to say,
+    # three lines under its own prompt conceding a backup may exist.
+    assert "no longer on this disk" not in out
+    assert "--backup are NOT touched" in out
+    survivor = FaceGallery(root=dest)
+    assert survivor.load() is True and survivor.total() > 0
 
     assert face_enrol.main(["--restore", str(dest)]) == 0
     assert "restored" in capsys.readouterr().out
@@ -1218,3 +1231,386 @@ def test_a_refused_run_leaves_the_identity_flag_alone(monkeypatch, tmp_path,
     assert face_enrol.main(ENROL) == 2
     capsys.readouterr()
     assert face_enrol.AssistantConfig.load().get("camera.identity") is False
+
+
+# ------------------------------------------- what the review found, pinned
+#
+# Each test below is one finding from the 2026-09-02 adversarial review, and
+# every one of them is a way the numbers said "good" while the gallery was
+# not -- or a way a single command could destroy the only copy of an
+# irreplaceable biometric. They are grouped here rather than scattered so the
+# next person can read the failure modes as a list.
+def at_cosine(base, target: float, seed: int = 7) -> np.ndarray:
+    """A 128-float vector whose cosine to ``base`` is exactly ``target``.
+
+    Built as ``t * base_direction + sqrt(1-t^2) * something orthogonal``, so
+    the cosine is a knob rather than a hope. Nothing here is a face; it is the
+    arithmetic the cohesion check reads."""
+    b = np.asarray(base, dtype=np.float64).ravel()
+    u = b / np.linalg.norm(b)
+    r = np.random.default_rng(seed).standard_normal(u.size)
+    r -= float(np.dot(r, u)) * u
+    r /= np.linalg.norm(r)
+    t = float(target)
+    return (np.linalg.norm(b)
+            * (t * u + math.sqrt(max(0.0, 1.0 - t * t)) * r)).astype(np.float32)
+
+
+def test_append_judges_the_pool_that_gets_saved_not_the_batch(tmp_path):
+    """THE ONE THAT MATTERS. ``--append`` loads the existing pool and saves
+    loaded+new, so judging only what this run captured judges a set that
+    never reaches the disk: a whole appended batch of a DIFFERENT PERSON
+    passed every check and was written under his label, and ``match()`` then
+    returned ('hunter', 1.0000) for the stranger."""
+    gallery = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):      # him, generation 1
+        gallery.add("hunter", vec)
+    gallery.save(reason="first")
+
+    stranger = same_face(base_vec(4242), 13, seed=5)    # somebody else
+    det = ScriptedDetector(PLAN_YAWS)
+    session = fe.EnrolmentSession(gallery, "hunter", LIFECAM_CINEMA, det,
+                                  ScriptedRecogniser(stranger),
+                                  fe.SampleLimits(min_conf=0.6))
+    source = FakeSource()
+    for _ in range(len(PLAN_YAWS)):
+        _ok, frame = source.read()
+        session.offer(frame, "plan")
+    rep = session.report()
+
+    assert rep.pool_total == 26 and rep.pool_stored == 13
+    assert rep.ok is False, [c.as_tuple() for c in rep.checks]
+    assert "cohesion" in {c.name for c in rep.checks if c.ok is False}
+    # And the regression itself: the batch alone passes every check, which is
+    # exactly what the old code judged.
+    batch_only = fe.judge_gallery(session.samples, session.embs)
+    assert all(c.ok is not False for c in batch_only), \
+        "the batch alone must still look fine -- that is the whole trap"
+
+
+def test_the_command_refuses_an_append_of_somebody_else(monkeypatch, tmp_path,
+                                                        capsys):
+    """End to end: a second person cannot be appended under his label with
+    every check green."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    assert face_enrol.main(ENROL) == 0
+    capsys.readouterr()
+
+    wire(monkeypatch, tmp_path, vectors=same_face(base_vec(999), 13, seed=6))
+    code = face_enrol.main(ENROL + ["--append"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "[FAIL] cohesion" in out
+    assert gallery.generations() == [1], "a two-identity gallery reached disk"
+    assert "judge the MERGED pool" in out
+
+
+def test_the_pool_line_says_what_was_stored_and_what_was_captured(tmp_path):
+    """The report must say which set the cosines describe, or the numbers he
+    pastes mean two different things on two different runs."""
+    gallery, _det, _rec, session = a_good_session(tmp_path)
+    source = FakeSource()
+    for _ in range(len(PLAN_YAWS)):
+        _ok, frame = source.read()
+        session.offer(frame, "plan")
+    lines = "\n".join(session.report().lines())
+    assert "pool       13 embeddings judged" in lines
+    assert "13 captured now, 0 already in the gallery" in lines
+
+
+def test_an_outlier_above_the_absolute_bar_is_still_refused():
+    """THE COHESION CHECK IS RELATIVE TOO. 0.363 is a VERIFICATION threshold
+    and a healthy pool medians near 0.82, so an absolute bar only fires below
+    ~0.40 -- while the measured out-of-distribution collapse sits at
+    0.66-0.92. A member at cosine 0.45 to the pool cleared every check."""
+    base = base_vec(31)
+    good = same_face(base, 12, seed=3)
+    pool = good[:6] + [at_cosine(base, 0.50)] + good[6:]
+    samples = [fe.Sample(index=i, station="plan", faces=1, conf=0.9,
+                         face_px=300.0, eye_px=140.0,
+                         yaw_deg=float(-40 + i * 7), roll_deg=0.0,
+                         bearing_deg=0.0, sharpness=0.4, accepted=True,
+                         reason="ok") for i in range(len(pool))]
+    checks = {c.name: c for c in fe.judge_gallery(samples, pool)}
+    coh = fe.cohesion(pool)
+    assert min(coh) > SFACE_COSINE_SAME, "the absolute bar must NOT be what fires"
+    assert checks["cohesion"].ok is False
+    assert "relative floor" in checks["cohesion"].detail
+    assert "#6" in checks["cohesion"].detail
+
+
+def test_a_genuinely_spread_pool_is_not_punished_for_being_spread():
+    """The relative floor is scaled by the pool's OWN MAD for this reason:
+    his yaw runs 14-54 deg, and an enrolment that covers it is SUPPOSED to be
+    spread. A margin that refused that would make enrolment impossible with a
+    confusing message, which is the expensive way to be wrong."""
+    base = base_vec(77)
+    spread = [at_cosine(base, t, seed=i)
+              for i, t in enumerate((1.0, 0.95, 0.9, 0.85, 0.8, 0.75, 0.7,
+                                     0.68, 0.66, 0.64, 0.62, 0.6, 0.58))]
+    samples = [fe.Sample(index=i, station="plan", faces=1, conf=0.9,
+                         face_px=300.0, eye_px=140.0,
+                         yaw_deg=float(-40 + i * 7), roll_deg=0.0,
+                         bearing_deg=0.0, sharpness=0.4, accepted=True,
+                         reason="ok") for i in range(len(spread))]
+    checks = {c.name: c for c in fe.judge_gallery(samples, spread)}
+    assert checks["cohesion"].ok is True, checks["cohesion"].detail
+
+
+def test_reset_destroys_nothing_when_the_run_fails_a_check(monkeypatch,
+                                                           tmp_path, capsys):
+    """--reset used to purge BEFORE the capture, so a run that then failed a
+    check -- 'too tight' / 'too loose', the outcome this whole design exists
+    to produce -- left an empty directory and nothing to roll back to, on the
+    store the docs themselves call the only copy."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    assert face_enrol.main(ENROL) == 0
+    assert gallery.generations() == [1]
+    capsys.readouterr()
+
+    wire(monkeypatch, tmp_path, yaws=[0.0, 2.0, -2.0])       # one pose only
+    code = face_enrol.main(ENROL + ["--reset", "--yes"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "[FAIL] pose_spread" in out
+    assert gallery.generations() == [1], "the only enrolment was destroyed"
+    assert "destroyed NOTHING" in out
+    back = FaceGallery(root=gallery.root)
+    assert back.load() is True and back.total() == 13
+
+
+def test_reset_destroys_the_old_generations_only_after_the_save(monkeypatch,
+                                                                tmp_path,
+                                                                capsys):
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    assert face_enrol.main(ENROL) == 0
+    capsys.readouterr()
+    wire(monkeypatch, tmp_path, vectors=same_face(base_vec(64), 13, seed=12))
+    assert face_enrol.main(ENROL + ["--reset", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert gallery.generations() == [2], out
+    assert "superseded generation(s) destroyed" in out
+    back = FaceGallery(root=gallery.root)
+    assert back.load() is True and back.loaded_generation == 2
+
+
+def test_reset_asks_before_it_destroys_anything(monkeypatch, tmp_path,
+                                                capsys):
+    """--delete demands a typed word for this data; --reset demanded
+    nothing, on the same data."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    assert face_enrol.main(ENROL) == 0
+    capsys.readouterr()
+    wire(monkeypatch, tmp_path)
+    monkeypatch.setattr("builtins.input", lambda *_a: "no")
+    assert face_enrol.main(ENROL + ["--reset"]) == 1
+    out = capsys.readouterr().out
+    assert "Not resetting" in out
+    assert "nothing was destroyed" in out
+    assert gallery.generations() == [1]
+
+
+def test_a_non_finite_score_fails_every_gate_shut(tmp_path):
+    """``NaN < 0.6`` is False, so the natural spelling of every bar in this
+    lane let a non-finite score through -- and then through every bar under
+    it. The gate the whole safety argument rests on failed OPEN on exactly
+    the input least likely to be a face."""
+    nan = float("nan")
+    ok, why = fe.judge_sample(_obs(conf=nan), 1, 1.0,
+                              fe.SampleLimits(min_conf=0.6))
+    assert ok is False and "detector bar" in why
+
+    det = ScriptedDetector(PLAN_YAWS, conf=lambda _i: nan)
+    gallery = FaceGallery(root=tmp_path / "g")
+    rec = ScriptedRecogniser(same_face(base_vec(), 13))
+    session = fe.EnrolmentSession(gallery, "hunter", LIFECAM_CINEMA, det, rec,
+                                  fe.SampleLimits(min_conf=0.6))
+    _ok, frame = FakeSource().read()
+    sample = session.offer(frame, "plan")
+    assert sample is not None and sample.accepted is False
+    assert rec.calls == 0 and gallery.total() == 0
+
+    class Net:
+        def alignCrop(self, frame, row):
+            raise AssertionError("no crop may be taken from a NaN detection")
+
+        def feature(self, crop):
+            raise AssertionError("no embedding may be computed")
+
+    row = np.asarray(head_row(0.0, conf=nan), dtype=np.float32)
+    with pytest.raises(ValueError):
+        fd.SFaceRecogniser(Net(), min_conf=0.6).embed(None, row)
+
+    pool = FaceGallery()
+    for vec in same_face(base_vec(), 4):
+        pool.add("hunter", vec)
+    ident = FaceIdentifier(pool, ScriptedRecogniser(same_face(base_vec(), 2)),
+                           min_conf=0.6)
+    assert ident.identify(None, row) == ("", 0.0)
+    assert ident.gated_out == 1
+
+
+def test_both_gates_read_the_same_column():
+    """Two gates on one rule is the stated defence; the judge read column 14
+    and the recogniser and identifier read column -1. Identical for YuNet's
+    15 columns and divergent in BOTH directions for anything longer, so a
+    differently shaped row must fail loudly rather than have some other
+    number silently read as its confidence."""
+    class Net:
+        def alignCrop(self, frame, row):
+            raise AssertionError("a misread row must never reach the model")
+
+        def feature(self, crop):
+            raise AssertionError("a misread row must never reach the model")
+
+    rec = fd.SFaceRecogniser(Net(), min_conf=0.6)
+    for last in (0.99, 0.10):
+        wide = np.asarray(head_row(0.0, conf=0.90) + [last],
+                          dtype=np.float32)
+        assert wide.size == vr.DETECT_COLS + 1
+        with pytest.raises(ValueError) as exc:
+            rec.embed(None, wide)
+        assert "16-column" in str(exc.value)
+
+        pool = FaceGallery()
+        for vec in same_face(base_vec(), 4):
+            pool.add("hunter", vec)
+        ident = FaceIdentifier(pool, rec, min_conf=0.6)
+        assert ident.identify(None, wide) == ("", 0.0)
+        assert ident.errors == 1
+
+
+def test_a_min_conf_of_zero_is_refused_rather_than_silently_ungated():
+    """``camera.min_conf`` is user-editable, and at 0 it removes the gate the
+    module calls non-negotiable: a detection scoring 0.01 was accepted,
+    embedded and added, with nothing in the report saying the bar was off."""
+    for bad in (0.0, -1.0, 0.1, float("nan")):
+        with pytest.raises(ValueError) as exc:
+            fe.SampleLimits(min_conf=bad)
+        assert "detector bar" in str(exc.value)
+    assert fe.SampleLimits(min_conf=fd.PROBE_THRESHOLD).min_conf == \
+        fd.PROBE_THRESHOLD
+
+
+def test_the_command_stops_on_a_min_conf_that_is_not_a_bar(monkeypatch,
+                                                           tmp_path, capsys):
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    cfg = face_enrol.AssistantConfig.load()
+    cfg.set("camera.min_conf", 0.0)
+    code = face_enrol.main(ENROL)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "STOPPED" in out and "camera.min_conf" in out
+    # And it stops BEFORE the phase gate is written: a run that cannot happen
+    # must not leave camera.identity -- the switch that says his face may be
+    # written down at all -- turned on behind it.
+    assert face_enrol.AssistantConfig.load().get("camera.identity") is False
+    assert gallery.generations() == []
+
+
+def test_a_lowered_bar_is_said_in_the_report(tmp_path):
+    """A bar he moved is his business; a bar he moved and nobody mentioned is
+    how the gate becomes a formality."""
+    gallery, _det, _rec, session = a_good_session(tmp_path, min_conf=0.35)
+    source = FakeSource()
+    for _ in range(len(PLAN_YAWS)):
+        _ok, frame = source.read()
+        session.offer(frame, "plan")
+    lines = "\n".join(session.report().lines())
+    assert "LOWERED from the 0.60 default" in lines
+
+
+def _saved(tmp_path, name="g", seed=5, n=13):
+    gallery = FaceGallery(root=tmp_path / name)
+    for vec in same_face(base_vec(seed), n, seed=seed + 1):
+        gallery.add("hunter", vec)
+    gallery.save(reason="probe")
+    return gallery
+
+
+def test_a_backup_into_the_gallery_is_refused_before_anything_is_written(
+        tmp_path):
+    """``--backup ~/.aiws_trainer/face_gallery`` -- one typo from the path in
+    every doc -- opened each live generation with O_TRUNC and rewrote it from
+    itself, reporting ok=True. Interrupted, that left the enrolment at 0
+    bytes with no other copy."""
+    gallery = _saved(tmp_path)
+    before = gallery.path_for(1).read_bytes()
+    out = fe.backup(gallery, gallery.root)
+    assert out["ok"] is False and out["copied"] == 0
+    assert "not a backup" in " ".join(out["failed"])
+    assert gallery.path_for(1).read_bytes() == before
+    assert FaceGallery(root=gallery.root).load() is True
+
+    inside = gallery.root / "inside"
+    out2 = fe.backup(gallery, inside)
+    assert out2["ok"] is False and out2["copied"] == 0
+    assert not inside.exists()
+    assert gallery.path_for(1).read_bytes() == before
+
+
+def test_a_copy_that_fails_leaves_the_previous_copy_intact(tmp_path,
+                                                           monkeypatch):
+    """The copy was the one non-atomic write in the feature. FaceGallery.save
+    is tmp + os.replace and says why; this now is too."""
+    gallery = _saved(tmp_path)
+    dest = tmp_path / "elsewhere"
+    assert fe.backup(gallery, dest)["ok"] is True
+    kept = (dest / "gen-00001.npz").read_bytes()
+
+    def boom(_src, _dst):
+        raise OSError("interrupted")
+
+    monkeypatch.setattr(fe.os, "replace", boom)
+    out = fe.backup(gallery, dest)
+    assert out["ok"] is False and out["copied"] == 0
+    assert (dest / "gen-00001.npz").read_bytes() == kept
+    assert not list(dest.glob("*.tmp")), "a half-written copy was left behind"
+
+
+def test_backup_reports_what_the_destination_holds_not_just_what_it_copied(
+        tmp_path):
+    """A backup directory is never reconciled with the source, so after a
+    --rollback the discarded generation is still there and is still the
+    NEWEST -- and the newest is the only thing --restore looks at."""
+    gallery = _saved(tmp_path)
+    for vec in same_face(base_vec(9), 15, seed=21):
+        gallery.add("hunter", vec)
+    gallery.save(reason="second")
+    dest = tmp_path / "bak"
+    assert fe.backup(gallery, dest)["ok"] is True
+
+    assert gallery.rollback() == 1
+    out = fe.backup(gallery, dest)
+    assert out["dest_generations"] == [1, 2]
+    assert out["dest_newest"] == 2
+    assert out["dest_newest_samples"] == 28
+    assert out["not_in_live"] == [2], \
+        "the rolled-back generation is still what --restore would take"
+
+
+def test_restore_says_which_generation_it_took(tmp_path):
+    gallery = _saved(tmp_path)
+    dest = tmp_path / "bak"
+    fe.backup(gallery, dest)
+    out = fe.restore(gallery, dest, reason="probe")
+    assert out["src_generation"] == 1
+    assert out["src_samples"] == 13
+    assert out["live_before"] == 13
+    assert out["generation"] == 2
+
+
+def test_a_deleted_generation_is_overwritten_before_it_is_unlinked(tmp_path):
+    """unlink removes the directory ENTRY; the extents holding the 128-float
+    vectors persist until the filesystem reuses them, while the command said
+    the data was gone. Read through a second hard link to the same inode --
+    the bytes are zeros, not embeddings."""
+    gallery = _saved(tmp_path)
+    path = gallery.path_for(1)
+    body = path.read_bytes()
+    assert len(body) > 100 and body.strip(b"\0")
+    twin = tmp_path / "same-inode"
+    os.link(path, twin)                 # a second NAME for the same extents
+    assert gallery.purge() == 1
+    assert not path.exists()
+    assert twin.read_bytes() == b"\0" * len(body)

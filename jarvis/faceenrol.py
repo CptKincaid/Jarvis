@@ -51,11 +51,23 @@ WHAT THE TWO REFUSALS MEAN.
   gallery will match him in one pose and reject him in every other, which
   reads at the far end as "Jarvis does not know me any more" and is the
   expensive failure: it is silent, and it looks like the camera not working.
-* **Too loose** -- some sample does not cluster with the rest (its median
-  cosine to the others is under the "same person" bar). That is either a
-  different person who walked past, or a crop that is not a face. Either way
-  it drags every future match toward itself, because ``FaceGallery.match``
-  scores against the pool's BEST member.
+* **Too loose** -- some member does not cluster with the rest: its median
+  cosine to the others is under the "same person" bar, OR it is far below the
+  pool's OWN median. Either way it drags every future match toward itself,
+  because ``FaceGallery.match`` scores against the pool's BEST member.
+
+  BOTH TERMS ARE NEEDED AND NEITHER IS SUFFICIENT. 0.363 is OpenCV's
+  VERIFICATION threshold; a healthy pool's own median is ~0.80, so an
+  absolute 0.363 bar only fires below ~0.40 and cannot see an outlier at 0.5
+  or 0.6 -- which is inside the 0.66-0.92 band the measured OOD collapse
+  occupies. The relative term asks the question the absolute one cannot.
+  SAY THE LIMIT: what this catches is an outlier IN a pool. It does not catch
+  a pool that is TWO tight clusters at a cross-cosine above the bar -- an
+  even split makes every member's median the cross value, so the shape is
+  invisible to a per-member statistic. What stands there instead is
+  ``MAX_FACES_IN_FRAME`` (a second face in frame is refused before any
+  embedding), the one-label rule, and judging the pool that will actually be
+  written rather than the batch (see ``EnrolmentSession.pool``).
 
 Nothing here imports cv2, torch or a model. The detector, the recogniser and
 the frame source are all seams, so the whole module runs in the suite with no
@@ -71,6 +83,7 @@ from typing import Callable, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from jarvis.facedetect import PROBE_THRESHOLD
 from jarvis.facegallery import SFACE_COSINE_SAME, FaceGallery, cosine
 from jarvis.logs import get_logger
 from jarvis.visionrig import IDX_SCORE, Check, HeadModel, _pct, observe
@@ -124,10 +137,27 @@ FRONTAL_MAX_DEG = 15.0     # "looking at the camera"
 OFFAXIS_MIN_DEG = 20.0     # "looking at the screen"
 MIN_FRONTAL = 2
 MIN_OFFAXIS = 2
+# A cohesion floor is only half a check. 0.363 is OpenCV's VERIFICATION
+# threshold -- "are these two the same person, at some FAR" -- and a healthy
+# pool's own median sits around 0.80, i.e. 0.44 ABOVE it. So an absolute
+# 0.363 bar cannot see an outlier at 0.5 or 0.6, which is squarely inside the
+# band the measured OOD collapse occupies (0.66-0.92 for non-face crops). The
+# second term asks the question the first cannot: is this member unlike the
+# pool RELATIVE to how varied the pool already is. Scaled by the pool's own
+# MAD so a genuinely spread enrolment -- his 14-54 deg range -- is not
+# punished for being spread, with a fixed margin underneath so a tight pool
+# does not get a razor-thin bar out of a near-zero MAD.
+COHESION_MARGIN = 0.20
+COHESION_MAD_K = 6.0
 # Two faces in frame during enrolment is the one thing that must never be
 # quietly averaged in: a gallery that learned a visitor identifies the wrong
 # person confidently, and nothing about it looks wrong afterwards.
 MAX_FACES_IN_FRAME = 1
+# What ``camera.min_conf`` ships as. A run under this is not refused -- he may
+# have measured his own face and moved it -- but it is SAID, in the report
+# header, because a lowered bar is the one setting that quietly turns the
+# gate in the module docstring into a formality.
+DEFAULT_MIN_CONF = 0.6
 
 
 @dataclass(frozen=True)
@@ -143,6 +173,31 @@ class SampleLimits:
     max_roll_deg: float = MAX_ROLL_DEG
     min_sharpness: float = MIN_SHARPNESS
     max_faces: int = MAX_FACES_IN_FRAME
+
+    def __post_init__(self) -> None:
+        """Refuse a bar that is not a bar.
+
+        ``min_conf`` is read from a user-editable key
+        (``camera.min_conf`` in ~/.config/jarvis/assistant.json). Set to 0 it
+        removes the gate this whole module is built on -- a detection scoring
+        0.01 would be embedded and written under his label -- and nothing
+        anywhere said so. The floor is the detector's OWN filter
+        (``facedetect.PROBE_THRESHOLD``): under it the bar is not merely low,
+        it is below the score of anything YuNet will even hand back, so it
+        cannot reject anything at all.
+
+        Spelled ``not (x >= floor)`` rather than ``x < floor`` so a NaN in the
+        config fails SHUT. ``NaN < 0.3`` is False, which would have let a
+        non-comparable bar through the one check that exists to stop it.
+        """
+        if not (float(self.min_conf) >= float(PROBE_THRESHOLD)):
+            raise ValueError(
+                "min_conf %r is not a usable detector bar: it must be at "
+                "least %.2f, the floor the detector itself filters at. Below "
+                "that the confidence gate rejects nothing, and SFace returns "
+                "a CONFIDENT match on a crop that is not a face -- so a bar "
+                "of 0 does not make enrolment lenient, it makes it wrong."
+                % (self.min_conf, float(PROBE_THRESHOLD)))
 
 
 @dataclass(frozen=True)
@@ -279,30 +334,37 @@ def judge_sample(obs, faces: int, sharp: float,
     THE CONFIDENCE BAR IS CHECKED FIRST AND IS NOT NEGOTIABLE. Everything
     below it is a quality preference; that one is the rule that keeps SFace's
     out-of-distribution collapse out of the gallery.
+
+    EVERY BAR IS SPELLED ``not (value PASSES)`` RATHER THAN ``value FAILS``,
+    and that is not a style choice. ``NaN < 0.6`` is False, so the natural
+    spelling makes a non-finite score clear the bar -- and then clear every
+    bar under it, since they are all comparisons too. The one gate the whole
+    safety argument rests on would fail OPEN on exactly the input least
+    likely to be a face. Inverted, a NaN passes nothing.
     """
     if faces > int(limits.max_faces):
         return False, ("%d faces in frame -- a gallery that learns a visitor "
                        "identifies the wrong person confidently" % faces)
-    if obs.conf < limits.min_conf:
+    if not (obs.conf >= limits.min_conf):
         return False, ("conf %.2f under the %.2f detector bar -- no "
                        "embedding is computed from this"
                        % (obs.conf, limits.min_conf))
     if not obs.landmarks_ok:
         return False, "the eye landmarks coincide; the crop cannot be aligned"
-    if obs.face_px < limits.min_face_px:
+    if not (obs.face_px >= limits.min_face_px):
         return False, ("face %.0f px under SFace's %.0f px input -- the crop "
                        "would be upsampled" % (obs.face_px,
                                                limits.min_face_px))
-    if obs.eye_px < limits.min_eye_px:
+    if not (obs.eye_px >= limits.min_eye_px):
         return False, ("interocular %.0f px under %.0f -- too small to align"
                        % (obs.eye_px, limits.min_eye_px))
-    if abs(obs.yaw_deg) > limits.max_yaw_deg:
+    if not (abs(obs.yaw_deg) <= limits.max_yaw_deg):
         return False, ("yaw %+.1f deg past the %.0f deg limit"
                        % (obs.yaw_deg, limits.max_yaw_deg))
-    if abs(obs.roll_deg) > limits.max_roll_deg:
+    if not (abs(obs.roll_deg) <= limits.max_roll_deg):
         return False, ("roll %+.1f deg past the %.0f deg limit"
                        % (obs.roll_deg, limits.max_roll_deg))
-    if sharp < limits.min_sharpness:
+    if not (sharp >= limits.min_sharpness):
         return False, ("sharpness %.3f under %.3f -- motion blur"
                        % (sharp, limits.min_sharpness))
     return True, "ok"
@@ -336,22 +398,61 @@ def cohesion(embs: Sequence) -> List[float]:
     return out
 
 
+def member_name(index: int, stored: int, kept: Sequence[Sample]) -> str:
+    """What to call pool member ``index`` in a line he will paste.
+
+    The pool is what was already in the gallery followed by what this run
+    added, so an index below ``stored`` is a member from an earlier
+    generation that this run never saw -- and calling it "#3" would point him
+    at a sample line in THIS report that has nothing to do with it. The
+    numbering of this run's members is the SAMPLE index, not the embedding
+    index, because the sample lines are numbered over every candidate
+    including the dropped ones.
+    """
+    if index < stored:
+        return ("stored embedding %d of the %d already in the gallery (from "
+                "an earlier generation, not captured in this run)"
+                % (index + 1, stored))
+    j = index - stored
+    return "#%d" % (kept[j].index if j < len(kept) else j)
+
+
 def judge_gallery(samples: Sequence[Sample], embs: Sequence,
                   identity_min: float = SFACE_COSINE_SAME,
-                  min_samples: int = MIN_SAMPLES) -> Tuple[Check, ...]:
+                  min_samples: int = MIN_SAMPLES,
+                  pool: Optional[Sequence] = None) -> Tuple[Check, ...]:
     """The pass/fail lines that decide whether this gallery may be saved.
 
     A gallery that is too tight fails him in every pose but one; a gallery
     that is too loose has somebody else in it. Both are worse than no gallery,
     because both are SILENT -- and the second is worse than the first,
     because it is confident.
+
+    ``pool`` IS THE SET THAT WILL BE WRITTEN, and it is what gets judged --
+    ``embs`` is only what this run captured. They differ under ``--append``,
+    which loads the existing gallery first and saves loaded+new: judging the
+    batch there meant a whole appended batch of a DIFFERENT PERSON passed
+    every check and was written under his label, while re-running these same
+    checks over the 26 embeddings that actually landed said [FAIL] cohesion.
+    The pose spread stays a statement about THIS RUN, because no yaw is
+    stored with an embedding -- so an append has to earn the spread again
+    rather than inherit a claim nothing can verify.
     """
     kept = [s for s in samples if s.accepted]
+    pool = list(embs) if pool is None else list(pool)
+    # The run's embeddings are appended to whatever was loaded, so anything
+    # before them is stored history. If the pool somehow does not contain
+    # this run, fall back to the run rather than name the wrong members.
+    stored = len(pool) - len(embs)
+    if stored < 0:
+        pool, stored = list(embs), 0
     checks: List[Check] = [
-        Check("samples", len(embs) >= int(min_samples),
-              "%d embeddings from %d candidate frames, against a floor of %d"
-              % (len(embs), len(samples), int(min_samples)))]
-    if not embs:
+        Check("samples", len(pool) >= int(min_samples),
+              "%d embeddings to be saved (%d from this run's %d candidate "
+              "frames, %d already in the gallery), against a floor of %d"
+              % (len(pool), len(embs), len(samples), stored,
+                 int(min_samples)))]
+    if not pool:
         checks.append(Check("pose_spread", None, "no samples to measure"))
         checks.append(Check("variation", None, "no samples to compare"))
         checks.append(Check("cohesion", None, "no samples to compare"))
@@ -373,7 +474,7 @@ def judge_gallery(samples: Sequence[Sample], embs: Sequence,
            MIN_YAW_SPREAD_DEG, frontal, FRONTAL_MAX_DEG, MIN_FRONTAL,
            offaxis, OFFAXIS_MIN_DEG, MIN_OFFAXIS)))
 
-    pairs = pairwise_cosines(embs)
+    pairs = pairwise_cosines(pool)
     p50 = _pct(pairs, 0.5)
     checks.append(Check(
         "variation", (not pairs) or p50 <= NEAR_DUPLICATE_MAX,
@@ -383,22 +484,32 @@ def judge_gallery(samples: Sequence[Sample], embs: Sequence,
         % (len(pairs), min(pairs) if pairs else 0.0, p50,
            max(pairs) if pairs else 0.0, NEAR_DUPLICATE_MAX)))
 
-    coh = cohesion(embs)
-    worst = min(range(len(coh)), key=lambda i: coh[i]) if coh else 0
-    # The embeddings are in accepted order; the SAMPLES are numbered over
-    # every candidate including the dropped ones. Printing the embedding's
-    # index would name a different line of the report as soon as one frame
-    # was rejected, which for a report whose whole job is to be pasted and
-    # read by somebody else is worse than useless.
-    named = kept[worst].index if worst < len(kept) else worst
+    coh = cohesion(pool)
+    worst_i = min(range(len(coh)), key=lambda i: coh[i]) if coh else 0
+    worst = min(coh) if coh else 0.0
+    coh_p50 = _pct(coh, 0.5)
+    # MAD, not the standard deviation: the outlier being looked for is IN the
+    # sample, and one member cannot move a median absolute deviation the way
+    # it moves a mean one.
+    mad = _pct([abs(c - coh_p50) for c in coh], 0.5) if coh else 0.0
+    margin = max(COHESION_MARGIN, COHESION_MAD_K * mad)
+    relative_floor = coh_p50 - margin
+    # Both bars, and both spelled so a NaN fails SHUT.
+    ok = (len(coh) < 2) or (worst >= float(identity_min)
+                            and worst >= relative_floor)
     checks.append(Check(
-        "cohesion", (len(coh) < 2) or min(coh) >= float(identity_min),
-        "worst sample is #%d at median cosine %.3f to the others, against "
-        "OpenCV's %.3f 'same person' bar for SFace; the pool's own median is "
-        "%.3f. A sample under the bar is a different person or a crop that "
-        "is not a face, and match() scores against the pool's BEST member."
-        % (named, min(coh) if coh else 0.0, float(identity_min),
-           _pct(coh, 0.5))))
+        "cohesion", ok,
+        "worst member is %s at median cosine %.3f to the others, against "
+        "OpenCV's %.3f 'same person' bar for SFace AND a relative floor of "
+        "%.3f (the pool's own median %.3f less a %.3f margin, %.3f x its "
+        "%.3f MAD). A member under the absolute bar is a different person or "
+        "a crop that is not a face; a member under the relative floor is "
+        "unlike this pool by this pool's own standard, which is the band the "
+        "absolute bar cannot see -- a healthy pool medians near 0.80 and "
+        "0.363 sits 0.44 below it. match() scores against the pool's BEST "
+        "member, so one is enough."
+        % (member_name(worst_i, stored, kept), worst, float(identity_min),
+           relative_floor, coh_p50, margin, COHESION_MAD_K, mad)))
     return tuple(checks)
 
 
@@ -451,6 +562,11 @@ class EnrolmentReport:
     cos_max: float = 0.0
     cohesion_min: float = 0.0
     cohesion_p50: float = 0.0
+    # The pool the checks were run over and that save() would write. Equal to
+    # ``accepted`` on a fresh run; larger under --append, where the numbers
+    # above describe the MERGED gallery and not just this run's batch.
+    pool_total: int = 0
+    pool_stored: int = 0
     rejects: tuple = ()          # (reason-word, count) pairs
     samples: tuple = ()
     checks: tuple = ()
@@ -495,6 +611,10 @@ class EnrolmentReport:
             "sharpness  min %.3f  p50 %.3f" % (self.sharp_min,
                                                self.sharp_p50),
             "embedding  p50 %.1f ms" % self.embed_ms_p50,
+            "pool       %d embeddings judged and to be saved (%d captured "
+            "now, %d already in the gallery)"
+            % (self.pool_total, self.pool_total - self.pool_stored,
+               self.pool_stored),
             "pairwise   %d pairs  cosine min %.3f p05 %.3f p50 %.3f max %.3f"
             % (self.pairs, self.cos_min, self.cos_p05, self.cos_p50,
                self.cos_max),
@@ -502,6 +622,16 @@ class EnrolmentReport:
             "bar" % (self.cohesion_min, self.cohesion_p50,
                      self.identity_min),
         ]
+        if self.min_conf < DEFAULT_MIN_CONF:
+            # The one setting that can turn the gate this module is built on
+            # into a formality, said where he cannot miss it rather than left
+            # to be inferred from the header's bar figure.
+            out.append(
+                "NOTE       the detector bar is %.2f, LOWERED from the %.2f "
+                "default. That bar is the only thing between a crop that is "
+                "not a face and this gallery -- SFace matches non-face crops "
+                "CONFIDENTLY (0.66-0.92)." % (self.min_conf,
+                                              DEFAULT_MIN_CONF))
         if self.rejects:
             out.append("dropped    " + ", ".join(
                 "%s x%d" % (k, v) for k, v in self.rejects))
@@ -526,11 +656,23 @@ def _reject_word(reason: str) -> str:
 
 def summarise(report: EnrolmentReport, samples: Sequence[Sample],
               embs: Sequence, embed_ms: Sequence[float],
-              identity_min: float) -> None:
+              identity_min: float, pool: Optional[Sequence] = None) -> None:
     """Fill the distributions. Split out so a caller that assembled samples
     some other way -- a re-scoring of an existing gallery, say -- gets the
-    identical arithmetic rather than a second version of it."""
+    identical arithmetic rather than a second version of it.
+
+    ``pool`` is what will be SAVED (see ``judge_gallery``); the cosine and
+    cohesion figures are computed over it, so the numbers printed are the
+    numbers judged. Under ``--append`` that is the merged gallery and not
+    this run's batch -- the per-sample lines still come from this run,
+    because those are the frames he was in front of.
+    """
     kept = [s for s in samples if s.accepted]
+    pool = list(embs) if pool is None else list(pool)
+    if len(pool) < len(embs):
+        pool = list(embs)
+    report.pool_total = len(pool)
+    report.pool_stored = len(pool) - len(embs)
     report.offered = len(samples)
     report.accepted = len(kept)
     report.rejected = len(samples) - len(kept)
@@ -559,13 +701,13 @@ def summarise(report: EnrolmentReport, samples: Sequence[Sample],
     report.sharp_min = min(sharp) if sharp else 0.0
     report.sharp_p50 = _pct(sharp, 0.5)
     report.embed_ms_p50 = _pct(list(embed_ms), 0.5)
-    pairs = pairwise_cosines(embs)
+    pairs = pairwise_cosines(pool)
     report.pairs = len(pairs)
     report.cos_min = min(pairs) if pairs else 0.0
     report.cos_p05 = _pct(pairs, 0.05)
     report.cos_p50 = _pct(pairs, 0.5)
     report.cos_max = max(pairs) if pairs else 0.0
-    coh = cohesion(embs)
+    coh = cohesion(pool)
     report.cohesion_min = min(coh) if coh else 0.0
     report.cohesion_p50 = _pct(coh, 0.5)
     tally: dict = {}
@@ -576,7 +718,7 @@ def summarise(report: EnrolmentReport, samples: Sequence[Sample],
         tally[key] = tally.get(key, 0) + 1
     report.rejects = tuple(sorted(tally.items(), key=lambda kv: -kv[1]))
     report.samples = tuple(samples)
-    report.checks = judge_gallery(samples, embs, identity_min)
+    report.checks = judge_gallery(samples, embs, identity_min, pool=pool)
 
 
 # -------------------------------------------------------------- the session
@@ -685,12 +827,36 @@ class EnrolmentSession:
         self.samples.append(sample)
         return sample
 
+    def pool(self) -> List[np.ndarray]:
+        """The embeddings ``gallery.save()`` would write for this label:
+        whatever was loaded before the run, PLUS what this run added.
+
+        THIS, NOT ``self.embs``, IS WHAT MUST BE JUDGED. ``--append`` calls
+        ``gallery.load()`` before the run and ``gallery.save()`` writes
+        loaded+new, so judging ``self.embs`` judges a set that never reaches
+        the disk. Measured synthetically 2026-09-02: 13 embeddings of him as
+        generation 1, then an --append of 13 embeddings of a DIFFERENT
+        identity (cross cosine 0.10) passed all four checks and was saved as
+        generation 2 under his label -- while the same checks over the 26 that
+        landed said [FAIL] cohesion with a worst median of 0.075, and
+        ``match()`` then returned ('hunter', 1.0000) for the stranger.
+        """
+        try:
+            return self.gallery.embeddings(self.label)
+        except Exception:  # noqa: BLE001 - a gallery that cannot say is not
+            # a reason to lose the report; judging this run alone is the
+            # old behaviour and is never LOOSER than judging nothing.
+            log.debug("faceenrol: gallery could not report its pool",
+                      exc_info=True)
+            return list(self.embs)
+
     def report(self, identity_min: float = SFACE_COSINE_SAME
                ) -> EnrolmentReport:
         rep = EnrolmentReport(label=self.label, frames=self.frames,
                               detector_ok=True,
                               min_conf=self.limits.min_conf)
-        summarise(rep, self.samples, self.embs, self.embed_ms, identity_min)
+        summarise(rep, self.samples, self.embs, self.embed_ms, identity_min,
+                  pool=self.pool())
         return rep
 
 
@@ -821,23 +987,68 @@ def backup(gallery: FaceGallery, dest: Path) -> dict:
     Verification is the point of the ``read`` below. A backup nobody has read
     back is the shape the voiceprint's ``.corrupt-<date>`` copy had -- it
     existed, it was named like a backup, and it held only the fixtures.
+
+    TWO WAYS THIS COMMAND USED TO DESTROY THE THING IT PROTECTS.
+
+    1. ``--backup ~/.aiws_trainer/face_gallery`` -- the gallery itself, one
+       typo away from the path in every doc -- opened each live generation
+       with ``O_TRUNC`` and rewrote it from itself. It reported
+       ``{'copied': 1, 'verified': 1, 'ok': True}`` while doing it, and an
+       interruption after the truncate left ``gen-00001.npz`` at 0 bytes with
+       ``load()`` returning False: the enrolment gone, from the command whose
+       job is to keep it. So a destination that IS the gallery, or lives
+       inside it, is refused before a byte is written.
+    2. The copy was the one non-atomic write in the feature. ``FaceGallery.
+       save`` is deliberately tmp + ``os.replace`` and says why; this now
+       does the same, so a crash mid-copy costs the tmp and never the copy it
+       is replacing.
+
+    The report says what the DESTINATION HOLDS afterwards, not only what was
+    copied into it. Those differ after a ``--rollback``: the rolled-back
+    generation stays in the backup, it is the newest thing there, and it is
+    therefore exactly what a later ``--restore`` would take.
     """
     dest = Path(dest)
+    out: dict = {"dest": str(dest), "copied": 0, "verified": 0,
+                 "generations": [], "samples": 0, "failed": [],
+                 "dest_generations": [], "dest_newest": 0,
+                 "dest_newest_samples": 0, "not_in_live": []}
+    root = None if gallery.root is None else Path(gallery.root)
+    if root is not None:
+        try:
+            rdest, rroot = dest.resolve(), root.resolve()
+        except OSError:                      # a path that cannot be resolved
+            rdest, rroot = dest.absolute(), root.absolute()
+        if rdest == rroot or rroot in rdest.parents:
+            out["failed"].append(
+                "%s is the gallery itself (or inside it): a backup into the "
+                "gallery is not a backup, and copying a generation over "
+                "itself is how the only copy gets truncated. Nothing was "
+                "written." % dest)
+            out["ok"] = False
+            return out
     dest.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(dest, 0o700)
-    out: dict = {"dest": str(dest), "copied": 0, "verified": 0,
-                 "generations": [], "samples": 0, "failed": []}
     for gen in gallery.generations():
         src = gallery.path_for(gen)
         target = dest / src.name
+        tmp = target.with_name(target.name + ".tmp")
         try:
             data = src.read_bytes()
-            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
             with os.fdopen(fd, "wb") as fh:
                 fh.write(data)
-            os.chmod(target, 0o600)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, target)
             out["copied"] += 1
         except OSError as exc:
+            try:
+                tmp.unlink()
+            except OSError:
+                log.debug("could not remove the failed copy %s", tmp.name,
+                          exc_info=True)
             out["failed"].append("%s: %s" % (src.name, exc))
             continue
         check = FaceGallery(root=dest)
@@ -847,6 +1058,16 @@ def backup(gallery: FaceGallery, dest: Path) -> dict:
             out["samples"] += check.total()
         else:
             out["failed"].append("%s: the copy did not parse" % target.name)
+    holding = FaceGallery(root=dest)
+    dest_gens = holding.generations()
+    out["dest_generations"] = list(dest_gens)
+    out["not_in_live"] = [g for g in dest_gens
+                          if g not in set(gallery.generations())]
+    if dest_gens:
+        out["dest_newest"] = dest_gens[-1]
+        newest = FaceGallery(root=dest)
+        if newest.load(generation=dest_gens[-1]):
+            out["dest_newest_samples"] = newest.total()
     out["ok"] = bool(out["verified"] and not out["failed"])
     return out
 
@@ -858,14 +1079,28 @@ def restore(gallery: FaceGallery, src: Path, reason: str) -> dict:
     Never a file copy over the live store: restoring by overwriting is the
     move that made the 2026-09-02 loss unrecoverable. A restore that turns
     out to be the wrong one is then just another generation to roll back.
+
+    WHAT IT TAKES IS THE NEWEST GENERATION IN ``src``, WHICH IS NOT
+    NECESSARILY THE ONE HE MEANT. A backup directory is never reconciled with
+    the live gallery, so after a ``--rollback`` the discarded generation is
+    still there and is still the newest -- a restore would resurrect exactly
+    the enrolment he had just undone. That cannot be guessed at from here, so
+    the numbers that decide it are returned and printed: which generation was
+    taken, how many samples it holds, and what was live before.
     """
     src = Path(src)
     out: dict = {"src": str(src), "restored": 0, "generation": 0,
-                 "samples": 0, "reason": ""}
+                 "samples": 0, "reason": "", "src_generation": 0,
+                 "src_samples": 0, "live_before": 0,
+                 "live_generation_before": 0}
+    out["live_before"] = gallery.total()
+    out["live_generation_before"] = gallery.loaded_generation
     holding = FaceGallery(root=src)
     if not holding.load():
         out["reason"] = "nothing readable in %s" % src
         return out
+    out["src_generation"] = holding.loaded_generation
+    out["src_samples"] = holding.total()
     # A restore REPLACES; it does not merge. Adding a backup's embeddings on
     # top of whatever the live pool happens to be holding produces a pool
     # that is two enrolments at once, whose provenance says "restore" and

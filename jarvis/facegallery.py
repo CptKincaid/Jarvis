@@ -67,7 +67,11 @@ DELETION is ``purge()``: every generation, not just the newest, AND any
 ``.tmp`` a crashed save left behind -- which is a full set of embeddings under
 a name the generation pattern does not match, so the first version of purge()
 reported success and left one on disk. A store whose "delete" leaves an older
-copy of his face on disk has not deleted anything.
+copy of his face on disk has not deleted anything. Every deletion in this
+module goes through ``_shred``: the bytes are overwritten and then unlinked,
+because unlink alone drops the directory entry and leaves the vectors in the
+extents. Read ``_shred`` for the limit of that -- it is a filesystem-level
+erase, not a device-level one, and the command says so in those words.
 
 Nothing here imports cv2, torch or a model. It is arithmetic over arrays, so
 it runs in the test suite with no camera, no display and no GPU.
@@ -110,6 +114,50 @@ _TMP_RE = re.compile(r"^gen-(\d{5})\.npz\.tmp$")
 _KEY_RE = re.compile(r"^emb_(.+)_(\d{4})$")
 # A label goes into an npz key and a log line, so keep it boring.
 _LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+
+
+def _shred(path: Path) -> None:
+    """Overwrite a generation's bytes, then unlink it.
+
+    ``unlink`` removes the directory ENTRY. The extents that held the
+    128-float vectors stay on the device until the filesystem reuses them, so
+    a "delete" that only unlinks leaves a measurement of his face on the disk
+    while the command says it is gone. The files are ~6 KB, so overwriting
+    first costs nothing measurable.
+
+    SAY THE LIMIT OUT LOUD RATHER THAN LEAVE IT IMPLIED. This makes the bytes
+    unreachable THROUGH THE FILESYSTEM. It is not a device-level erase: on a
+    copy-on-write filesystem, on a journalled one that already wrote the
+    block elsewhere, and on any SSD (this box) whose controller remaps rather
+    than rewrites, the old blocks can survive an in-place overwrite. What the
+    caller is entitled to claim is exactly what this does -- which is why
+    scripts/face_enrol.py's --delete says "overwritten and unlinked" and not
+    "off the disk".
+
+    Raises ``OSError`` from the unlink so existing callers keep their own
+    handling; a failure to OVERWRITE is logged and the unlink still happens,
+    because leaving the file in place would be strictly worse.
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    if size > 0:
+        try:
+            fd = os.open(path, os.O_WRONLY)
+            try:
+                chunk = b"\0" * min(size, 1 << 20)
+                left = size
+                while left > 0:
+                    left -= os.write(fd, chunk[:min(left, len(chunk))])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            log.warning("could not overwrite %s before deleting it",
+                        path.name, exc_info=True)
+    path.unlink()
 
 
 def cosine(a, b) -> float:
@@ -410,9 +458,10 @@ class FaceGallery:
         keep = max(KEEP_GENERATIONS, MIN_GENERATIONS)
         for tmp in self._tmp_paths():
             # A crashed save's leftovers are not a generation and hold no
-            # history worth keeping; they are just embeddings lying around.
+            # history worth keeping; they are just embeddings lying around --
+            # which is why they are shredded rather than unlinked.
             try:
-                tmp.unlink()
+                _shred(tmp)
             except OSError:
                 log.debug("could not remove %s", tmp.name, exc_info=True)
         if len(gens) <= keep:
@@ -425,7 +474,7 @@ class FaceGallery:
         doomed = [g for g in gens if g != richest][:len(gens) - keep]
         for gen in doomed:
             try:
-                self.path_for(gen).unlink()
+                _shred(self.path_for(gen))
             except OSError:
                 log.debug("could not prune generation %d", gen, exc_info=True)
 
@@ -437,7 +486,7 @@ class FaceGallery:
         gens = self.generations()
         if len(gens) < 2:
             return 0
-        self.path_for(gens[-1]).unlink()
+        _shred(self.path_for(gens[-1]))
         self.loaded_generation = 0
         self._loaded_n = 0
         # load() falls back down the stack when gens[-2] is ALSO corrupt, so
@@ -456,11 +505,16 @@ class FaceGallery:
         older measurement of his face on the disk, which answers the wrong
         question -- and so does removing only the files whose names match the
         generation pattern, because ``gen-00002.npz.tmp`` does not and holds
-        the same embeddings."""
+        the same embeddings.
+
+        Every file is OVERWRITTEN before it is unlinked (``_shred``): unlink
+        alone drops the directory entry and leaves the vectors in the extents.
+        Read ``_shred`` for what that does and does not buy -- the command
+        that calls this is only allowed to claim the part that is true."""
         removed = 0
         for path in [self.path_for(g) for g in self.generations()] + self._tmp_paths():
             try:
-                path.unlink()
+                _shred(path)
                 removed += 1
             except OSError:
                 log.warning("could not delete face gallery file %s", path.name,
@@ -470,6 +524,41 @@ class FaceGallery:
         self._loaded_n = 0
         self._provenance = {}
         log.info("face gallery purged: %d generations deleted", removed)
+        return removed
+
+    def drop_generations(self, generations) -> int:
+        """Delete exactly these generations; return how many went.
+
+        SEPARATE FROM ``purge()`` ON PURPOSE, and the difference is the whole
+        point. ``purge()`` is "destroy everything and leave the object empty",
+        which is only ever correct when the answer to "what will he have
+        afterwards" is "nothing, and he asked for that". This is the last step
+        of REPLACING: the caller has already written a new generation that it
+        holds a number for, and only the ones that predate it are going. It
+        never touches the in-memory pool or ``loaded_generation``, and a
+        generation that is not on disk is skipped rather than guessed at.
+
+        ``scripts/face_enrol.py --reset`` is the caller. It used to purge
+        BEFORE the capture, so a run that then failed a check -- 'too tight' /
+        'too loose', the outcome the whole design exists to produce -- left
+        him with an empty directory and nothing to roll back to. Capture
+        first, destroy last: the old generations survive every failure mode of
+        the run, and go only once a new one is safely on disk.
+        """
+        wanted = {int(g) for g in generations}
+        removed = 0
+        for gen in self.generations():
+            if gen not in wanted:
+                continue
+            try:
+                _shred(self.path_for(gen))
+                removed += 1
+            except OSError:
+                log.warning("could not delete face gallery generation %d",
+                            gen, exc_info=True)
+        if removed:
+            log.info("face gallery: %d superseded generation(s) deleted",
+                     removed)
         return removed
 
     def provenance(self) -> dict:

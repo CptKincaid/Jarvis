@@ -142,6 +142,19 @@ def _firewall_live_log_dir():
     assert _speaker.VOICEPRINT_FILE != real_voiceprint, \
         "speaker.VOICEPRINT_FILE still targets the user's enrolled voice"
     assert config.PATHS.VOICEPRINT != real_voiceprint, "PATHS.VOICEPRINT still live"
+    # The FACE GALLERY, asserted here and not only in tests/test_faceenrol.py.
+    # The env var above is forced, but a forced env var is one belt; the
+    # voiceprint was given two after it was destroyed, and a face embedding is
+    # the same kind of irreplaceable measurement. Asserted in the
+    # SESSION-SCOPED fixture so a broken redirect fails before the first test
+    # runs, rather than after one has already written -- and the gallery does
+    # not exist on this box yet, so a leak now would silently CREATE a fixture
+    # gallery at the real path, which is harder to notice than corrupting one.
+    real_face = Path.home() / ".aiws_trainer" / "face_gallery"
+    assert config.PATHS.FACE_GALLERY != real_face, \
+        "PATHS.FACE_GALLERY still targets the user's enrolled face"
+    assert real_face not in config.PATHS.FACE_GALLERY.parents, \
+        "PATHS.FACE_GALLERY is inside the user's real face gallery"
     try:
         from jarvis import jarvis_agent
         assert jarvis_agent.LOG_DIR != live, "jarvis_agent LOG_DIR still live"

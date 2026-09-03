@@ -66,6 +66,7 @@ import numpy as np
 
 from jarvis.facegallery import SFACE_COSINE_SAME, cosine
 from jarvis.logs import get_logger
+from jarvis.visionrig import DETECT_COLS, IDX_SCORE
 
 log = get_logger("eye")
 
@@ -427,15 +428,26 @@ class FaceIdentifier:
         because a consumer that has to tell them apart will get one of them
         wrong, and the safe reading of all four is "the camera does not know
         who this is", which is today's behaviour byte for byte.
+
+        The score is read from ``IDX_SCORE`` and the row's SHAPE is checked,
+        for the reason spelled out in ``facedetect.SFaceRecogniser.embed``:
+        this gate and that one are two gates on one rule, and ``row[-1]``
+        made them read different columns for any row that was not YuNet's 15.
         """
         self.calls += 1
         try:
-            conf = float(np.asarray(row).ravel()[-1])
+            arr = np.asarray(row).ravel()
+            if arr.size != DETECT_COLS:
+                raise ValueError("detection row has %d columns, not %d"
+                                 % (arr.size, DETECT_COLS))
+            conf = float(arr[IDX_SCORE])
         except Exception:  # noqa: BLE001
             self.errors += 1
             return "", 0.0
-        if conf < self.min_conf:
-            # THE GATE. Nothing below this line runs on a weak detection.
+        if not (conf >= self.min_conf):
+            # THE GATE. Nothing below this line runs on a weak detection, and
+            # it is spelled so that a NaN score fails SHUT rather than
+            # clearing every bar in the file.
             self.gated_out += 1
             return "", 0.0
         if self.enrolled() == 0:
