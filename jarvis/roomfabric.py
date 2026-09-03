@@ -570,13 +570,23 @@ class HouseView:
     """The fabric wearing ``RoomSensor``'s interface.
 
     ``jarvis/presence.py`` composes ONE object with ``read`` / ``configured``
-    / ``paused`` / ``status``, and its asymmetry (a room seeing somebody
-    beats a sleeping phone; a room seeing nobody never beats a phone that
-    answers) is already the right rule for three rooms as well as one. So
-    the fabric is handed to it wearing that shape and ``RoomOrPhone`` needs
-    no change whatever: read() is the house-level answer, and the None that
-    means "I cannot see the whole house" lands on the module's existing
-    dark-safe path.
+    / ``paused`` / ``blocked`` / ``status``, and its asymmetry (a room
+    seeing somebody beats a sleeping phone; a room seeing nobody never
+    beats a phone that answers) is already the right rule for three rooms
+    as well as one. So the fabric is handed to it wearing that shape and
+    ``RoomOrPhone`` needs no change whatever: read() is the house-level
+    answer, and the None that means "I cannot see the whole house" lands on
+    the module's existing dark-safe path.
+
+    **``blocked`` IS PART OF THAT SHAPE AND WAS MISSING.** It shipped
+    without one on 2026-09-03 and the cost was silent: presence's
+    ``_blacked_out()`` reads ``sensor.blocked`` inside a broad ``except``,
+    so a leg without the attribute made offline mode look like "nothing is
+    blocked" and the sentinel froze on its last verdict for the length of
+    the blackout instead of going to "unknown". On a rooms-only box (no
+    phone leg -- his) that IS the dark-safe path. Anything else wearing
+    this interface owes the same property; the pin is
+    tests/test_sensing.py::test_a_rooms_only_box_goes_unknown_when_sensing_is_off.
     """
 
     def __init__(self, fabric: RoomFabric):
@@ -594,6 +604,23 @@ class HouseView:
     def paused(self) -> bool:
         return all(getattr(r.sensor, "paused", False) for r in self.fabric.rooms) \
             if self.fabric.rooms else True
+
+    @property
+    def blocked(self) -> str:
+        """Why the WHOLE house cannot be sensed right now ("" = it can be).
+
+        Every configured room has to be blocked before the house is: one
+        radar still allowed to look is still a leg, and reporting the house
+        blind while a room can see would throw away the only evidence
+        there is. The reason returned is the first room's own word
+        ("offline", "policy", "stopped"), because presence.py logs it and
+        the rooms are all blocked by the same policy in practice.
+        """
+        rooms = self.fabric.rooms
+        if not rooms:
+            return ""
+        reasons = [str(getattr(r.sensor, "blocked", "") or "") for r in rooms]
+        return reasons[0] if all(reasons) else ""
 
     @property
     def last_value(self) -> Optional[bool]:

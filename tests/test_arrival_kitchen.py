@@ -170,6 +170,39 @@ def test_a_two_minute_absence_is_not_an_outing():
     assert outing(events, **window(10.4, 10.44)) == ""
 
 
+def test_a_four_minute_entry_cannot_explain_a_four_hour_absence():
+    """The verifier's case, and it is the failure this rule exists to
+    stop. "Take the bins out" is a four-minute calendar entry that ended
+    sixteen minutes before he walked in; the absence was four hours. The
+    first cut measured coverage against the EVENT only, so 100% of four
+    minutes named four hours out: "Welcome back from take the bins out,
+    sir." A guessed event name is worse than no event name.
+    """
+    events = [ev("take the bins out", 13.6, 13.667)]
+    assert outing(events, **window(10.0, 14.0)) == ""
+
+
+def test_a_one_minute_event_just_before_he_walked_in_names_nothing():
+    """The same shape at its smallest: a minute inside three hours."""
+    events = [ev("quick thing", 12.9, 12.917)]
+    assert outing(events, **window(10.0, 13.0)) == ""
+
+
+def test_the_absence_share_is_a_keyword_he_can_overrule():
+    """Both halves of the coverage rule are arguments, so the thresholds
+    are his to move without editing the matcher."""
+    events = [ev("take the bins out", 13.6, 13.667)]
+    assert outing(events, absence_cover=0.0, **window(10.0, 14.0)) == \
+        "take the bins out"
+
+
+def test_an_event_that_is_most_of_the_absence_is_still_named():
+    """The rule must not refuse the ordinary case: a ninety-minute class
+    inside a hundred-minute absence is 0.9 of it."""
+    events = [ev("Organic Chemistry", 9.0, 10.5)]
+    assert outing(events, **window(8.9, 10.57)) == "Organic Chemistry"
+
+
 def test_an_event_still_running_when_he_walked_in_is_named():
     """He left the meeting early. He was still at it, and it is still the
     honest answer to "back from what"."""
@@ -216,13 +249,42 @@ def test_an_empty_inbox_and_a_clear_board_offer_nothing():
 
 
 def test_a_mailbox_that_could_not_be_reached_says_nothing_about_mail():
-    """None is "I could not look", and it must never become "no mail"."""
+    """None is silence about mail -- it must never become "no mail". (There
+    is no spoken "I could not look" line and there never was; the first
+    cut's docstring claimed one.)"""
     assert "unread" not in catch_up_offer(unread=None, major="The GPU is throttling.")
 
 
-def test_one_clause_on_anything_major():
+def test_a_fault_with_no_mail_is_TOLD_and_never_offered():
+    """The nonsense question. With no mailbox and a standing error the
+    first cut said "The disk is full. Shall I go through it, sir?" -- and
+    a yes spoke the same sentence straight back. There is nothing to go
+    through: a fault is a statement."""
     line = catch_up_offer(unread=None, major="The GPU is throttling.")
-    assert "GPU is throttling" in line and line.endswith("?")
+    assert line == "The GPU is throttling."
+    assert not line.endswith("?") and arrival.offers_to_read(line) is False
+    assert catch_up_offer(unread=0, major="The disk is full.") == "The disk is full."
+
+
+def test_the_fault_clause_keeps_the_case_its_source_wrote():
+    """It is SHOWN on the card as well as spoken. The first cut lowered the
+    first letter to splice it in after "and", so faults.py's real wording
+    came out as "ollama is unreachable" and "i have lent the GPU"."""
+    line = catch_up_offer(unread=3, major="Ollama is unreachable.")
+    assert "Ollama is unreachable." in line and "ollama" not in line
+    lent = "I have lent the GPU to your trainer, sir; quick answers only."
+    assert lent in catch_up_offer(unread=2, major=lent)
+
+
+def test_the_fault_and_the_question_are_separate_fragments():
+    """address.py thins whole authored LINES, and health.py's own wording
+    carries a "sir" of its own -- as one blob the burst would arrive at the
+    door addressing him twice with nothing able to take one out."""
+    frags = arrival.catch_up_fragments(
+        unread=2, major="I have lent the GPU to your trainer, sir.")
+    assert len(frags) == 2 and frags[0].endswith("sir.")
+    assert frags[1].endswith("?")
+    assert arrival.catch_up_fragments(unread=0, major="") == []
 
 
 def test_the_major_clause_and_the_count_ride_one_question():
@@ -235,11 +297,17 @@ def test_the_major_clause_and_the_count_ride_one_question():
 
 def test_one_unread_email_is_singular():
     """Noun AND pronoun. A line that says "one email... shall I go through
-    them" is the tell that it was assembled rather than written."""
+    them" is the tell that it was assembled rather than written.
+
+    The pronoun counts the MAIL and only the mail, because the mail is all
+    a yes delivers: the fault has already been told, and the delivery no
+    longer repeats it."""
     line = catch_up_offer(unread=1)
     assert "1 unread email" in line and "emails" not in line
     assert "through it, sir?" in line
-    assert "through them, sir?" in catch_up_offer(unread=1,
+    assert "through it, sir?" in catch_up_offer(unread=1,
+                                                major="The disk is full.")
+    assert "through them, sir?" in catch_up_offer(unread=2,
                                                   major="The disk is full.")
 
 
@@ -267,3 +335,25 @@ def test_a_sensor_with_no_opinion_is_not_an_arrival():
     turns that into no active room at all. None is never a door."""
     watch = DoorWatch()
     assert watch.observe(room=None, away=True) is False
+
+
+def test_the_room_key_slugs_exactly_as_the_fabric_does():
+    """The two have to agree or a configured door room silently names
+    nothing. `arrival._room_key` copies `roomfabric._slug` rather than
+    importing it (this module owns no thread and no socket), so the copy
+    is pinned here: the first cut collapsed whitespace and lower-cased but
+    did NOT strip punctuation, so a room called "Kitchen!" became the
+    fabric room "kitchen" while `door_room` "Kitchen!" matched forever
+    nothing."""
+    from jarvis.roomfabric import _slug
+    for name in ("kitchen", "Kitchen!", "  Front  Hall ", "KITCHEN",
+                 "kitchen/1", "office-2", "my_room", "café", "", None,
+                 "hall (front)", "kitchen."):
+        assert arrival._room_key(name) == _slug(name), repr(name)
+
+
+def test_a_punctuated_room_name_still_opens_the_door():
+    """The bug, at the surface it bit: the config says "Kitchen!", the
+    fabric publishes "kitchen", and nothing ever matched."""
+    assert door_arrival(room="kitchen", door="Kitchen!", away=True) is True
+    assert DoorWatch(door="Kitchen!").observe(room="kitchen", away=True) is True

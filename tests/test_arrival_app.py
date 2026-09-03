@@ -112,6 +112,20 @@ def test_an_event_that_covered_the_absence_is_named_in_the_greeting():
     assert a._welcome_text() == "Welcome back from the dentist, sir."
 
 
+def test_a_short_errand_does_not_name_a_long_absence_at_the_app_edge():
+    """The verifier's app-level repro, pinned where it actually bit: four
+    hours away, one four-minute calendar entry that ended sixteen minutes
+    before he walked in, and the greeting said "Welcome back from take the
+    bins out, sir." The absence-coverage half of the rule (arrival.outing)
+    is what makes it the plain line again."""
+    now = datetime.now().astimezone()
+    cal = Calendar([ev("take the bins out", now - timedelta(minutes=20),
+                       now - timedelta(minutes=16))])
+    a = make_app(services=SimpleNamespace(calendar=cal))
+    a._away_since = (now - timedelta(hours=4)).timestamp()
+    assert a._welcome_text() == WELCOME_LINE
+
+
 def test_an_unreachable_calendar_costs_the_name_and_not_the_greeting():
     now = datetime.now().astimezone()
     cal = Calendar([], boom=True)
@@ -223,12 +237,64 @@ def test_only_an_error_is_major_enough_to_meet_him_at_the_door():
     assert a._major_line() == "The disk is full."
 
 
-def test_the_major_clause_reaches_the_offer_with_no_mailbox_at_all():
+def test_the_major_clause_with_no_mailbox_is_a_statement_not_a_question():
+    """The nonsense offer, at the app's edge. With no mailbox and an error
+    standing this used to be "The disk is full. Shall I go through it,
+    sir?" -- and the yes it invited spoke that sentence back."""
     err = SimpleNamespace(kind="error", line="The disk is full.", text="")
     a = make_app(services=SimpleNamespace(panel_wake=None,
                                           faults=SimpleNamespace(current=err)))
     line = a._arrival_offer_line()
-    assert "disk is full" in line and line.endswith("?") and "unread" not in line
+    assert line == "The disk is full."
+    assert not line.endswith("?") and "unread" not in line
+
+
+def test_a_fault_only_line_is_spoken_but_nothing_is_parked():
+    """A statement is not an offer: parking one would leave a "yes"
+    hanging on nothing, and open the mic for an answer to no question."""
+    err = SimpleNamespace(kind="error", line="Ollama is unreachable.", text="")
+    a = make_app(quiet=Quiet([]),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None,
+                                          faults=SimpleNamespace(current=err)))
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
+    assert a.tts.spoken == ["Ollama is unreachable."]
+    assert a.services.briefing_offer is None
+    assert a._followup_after_speech is False
+
+
+def test_the_delivery_does_not_read_the_fault_the_offer_already_spoke():
+    """He says yes and hears the sentence he just heard. The offer speaks
+    the fault; the delivery is about the MAIL."""
+    import jarvis.tools.mail as mail_mod
+    err = SimpleNamespace(kind="error", line="Ollama is unreachable.", text="")
+    mails = [SimpleNamespace(sender="Canvas", subject="Lab 3 graded")]
+    a = make_app(quiet=Quiet([]),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None,
+                                          faults=SimpleNamespace(current=err)))
+    a._unread_count = lambda: len(mails)
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert "Ollama is unreachable." in a.tts.spoken[0]
+    a.tts.spoken.clear()
+    orig = mail_mod.fetch_unread
+    mail_mod.fetch_unread = lambda *args, **kw: list(mails)
+    try:
+        assert a.services.briefing_offer["deliver"]() is True
+    finally:
+        mail_mod.fetch_unread = orig
+    said = " ".join(a.tts.spoken)
+    assert "Ollama" not in said, "the fault was read back a second time"
+    assert "Canvas, Lab 3 graded." in said
+
+
+def test_a_fault_that_appeared_AFTER_the_offer_is_still_delivered():
+    """The narrow case the `said` carry-through has to keep: the delivery
+    skips only the sentence the offer actually spoke, not every fault."""
+    a = make_app()
+    later = SimpleNamespace(kind="error", line="The disk is full.", text="")
+    a.services = SimpleNamespace(panel_wake=None,
+                                 faults=SimpleNamespace(current=later))
+    assert a._deliver_arrival_catch_up(said="Ollama is unreachable.") is True
+    assert "The disk is full." in " ".join(a.tts.spoken)
 
 
 def test_the_offer_can_be_switched_off():
@@ -376,3 +442,149 @@ def test_stopping_the_sentinel_stops_the_fabric_with_it():
                                stop=lambda: calls.append("stop"))
     p.stop()
     assert calls == ["stop"]
+
+
+# ==================================================================
+# The catch-up must not freeze the window it is greeting him through
+# ==================================================================
+# `bus.attach_tk(root)` makes publish() queue and drain() run from the UI's
+# `_pump`, so every subscriber -- `_on_presence`, `_on_room_changed`, and
+# the whole arrival cue behind them -- executes on the Tk MAIN thread. The
+# unread count is an IMAP round trip (IMAP_TIMEOUT 15 s a mailbox;
+# mail.py records a measured 8.1 s across his three accounts), so paying
+# it inline froze the window and every event behind it at the moment he
+# walked in.
+FAKE_ACCOUNT = {"label": "test", "address": "someone@example.com",
+                "app_password": "not-a-real-password"}
+
+
+def _slow_mailbox(seconds=2.0):
+    import time as _time
+
+    def fetch_unread(*args, **kw):
+        _time.sleep(seconds)
+        return [SimpleNamespace(sender="Canvas", subject="Lab 3 graded")]
+    return fetch_unread
+
+
+def test_a_slow_mailbox_does_not_block_the_arrival_cue(monkeypatch):
+    """MEASURED, not argued: the step returns in well under the fetch it
+    is waiting on, and the offer still gets spoken once the worker lands."""
+    import time as _time
+
+    import jarvis.tools.mail as mail_mod
+    monkeypatch.setattr(mail_mod, "fetch_unread", _slow_mailbox(2.0))
+    a = make_app({"gmail.accounts": [FAKE_ACCOUNT]}, quiet=Quiet([]),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    assert a._arrival_mail_is_remote() is True
+    started = _time.monotonic()
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
+    blocked_for = _time.monotonic() - started
+    assert blocked_for < 0.5, f"the pump thread was held for {blocked_for:.2f}s"
+    assert a.tts.spoken == [], "the fetch was paid on the calling thread"
+    a._arrival_catch_up_thread.join(timeout=10.0)
+    assert not a._arrival_catch_up_thread.is_alive()
+    assert "1 unread email" in a.tts.spoken[0]
+    assert a.services.briefing_offer is not None
+
+
+def test_with_no_mailbox_the_step_stays_inline_and_synchronous():
+    """No account configured means fetch_unread raises before a socket is
+    opened, so there is nothing to move and the cue stays end-to-end
+    synchronous -- which is what every assertion on tts.spoken the line
+    after run() depends on."""
+    a = make_app(quiet=Quiet(["While you were out, sir:", "The build passed, sir."]))
+    assert a._arrival_mail_is_remote() is False
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
+    assert a.tts.spoken and getattr(a, "_arrival_catch_up_thread", None) is None
+
+
+def test_the_offer_is_switched_off_before_a_worker_is_ever_started():
+    a = make_app({"presence.arrival_offer": False,
+                  "gmail.accounts": [FAKE_ACCOUNT]})
+    assert a._arrival_mail_is_remote() is False
+
+
+# ==================================================================
+# The 60 s window starts when he can answer, not when we decided to ask
+# ==================================================================
+def test_the_offer_ttl_is_stamped_after_the_digest_is_spoken():
+    """BRIEFING_OFFER_TTL_S (60 s) is measured off `made_at`. The question
+    is parked BEFORE the burst goes out so a TTS failure cannot leave it on
+    the floor -- but a long quiet-hours backlog in front of it then ate
+    most of the window he had to say yes."""
+    import time as _time
+    stamps = []
+    a = make_app(quiet=Quiet(["While you were out, sir:", "The build passed, sir."]),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    a._unread_count = lambda: 3
+    spoken = a.tts.speak
+
+    def slow_speak(text):
+        stamps.append(a.services.briefing_offer["made_at"])
+        _time.sleep(0.2)                 # stand-in for the digest being read
+        spoken(text)
+
+    a.tts.speak = slow_speak
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert stamps, "the offer was not parked before the words went out"
+    after = a.services.briefing_offer["made_at"]
+    assert after - stamps[0] >= 0.2, "the TTL still ran during the digest"
+    assert after <= _time.time()
+
+
+def test_a_first_wake_offer_that_replaced_ours_keeps_its_own_clock():
+    """Re-stamping must touch only the offer we parked; whoever owns the
+    slot now owns its TTL."""
+    a = make_app(services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    ours = {"made_at": 100.0, "deliver": lambda: True}
+    theirs = {"made_at": 200.0, "deliver": lambda: True}
+    a.services.briefing_offer = theirs
+    a._restamp_offer(ours)
+    assert theirs["made_at"] == 200.0 and ours["made_at"] == 100.0
+    a._restamp_offer(None)
+    assert a.services.briefing_offer is theirs
+
+
+def test_a_door_room_that_names_no_configured_room_is_reported(caplog):
+    """A door room that matches nothing is otherwise SILENT: the trigger
+    just never fires and there is no error anywhere to find."""
+    import logging
+    a = make_app({"presence.door_room": "hallway",
+                  "presence.room_sensor_enabled": True,
+                  "presence.rooms": [{"name": "office", "url": "http://10.0.0.9"},
+                                     {"name": "kitchen", "url": "http://10.0.0.8"}]})
+    a._door = arrival_mod.DoorWatch(door="hallway")
+    with caplog.at_level(logging.WARNING):
+        a._warn_door_room_names_nothing()
+    assert any("hallway" in r.getMessage() for r in caplog.records)
+
+
+def test_a_box_with_no_rooms_list_is_not_warned_at_every_boot():
+    """The live configuration today: the whole feature is inert by design,
+    and a warning every boot would be noise."""
+    import logging
+    a = make_app({"presence.door_room": "hallway"})
+    a._door = arrival_mod.DoorWatch(door="hallway")
+    records = []
+    handler = logging.Handler()
+    handler.emit = records.append
+    log = logging.getLogger("jarvis.app")
+    log.addHandler(handler)
+    try:
+        a._warn_door_room_names_nothing()
+    finally:
+        log.removeHandler(handler)
+    assert [r for r in records if r.levelno >= logging.WARNING] == []
+
+
+def test_a_door_room_that_does_match_is_silent(caplog):
+    import logging
+    a = make_app({"presence.door_room": "Kitchen!",
+                  "presence.room_sensor_enabled": True,
+                  "presence.rooms": [{"name": "office", "url": "http://10.0.0.9"},
+                                     {"name": "kitchen", "url": "http://10.0.0.8"}]})
+    a._door = arrival_mod.DoorWatch(door="Kitchen!")
+    with caplog.at_level(logging.WARNING):
+        a._warn_door_room_names_nothing()
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []

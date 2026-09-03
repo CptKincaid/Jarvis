@@ -93,7 +93,15 @@ the phone probe — exactly the behaviour this box had before any sensor existed
 | the LAN is congested | up to 1.5 s timeout × 3 rooms for 3 ticks, then the breakers open | `None` | yes |
 | Wi-Fi drops entirely | every room `None` | phone-only, and his phone is off the LAN too, so 12 min later "away" | quiet and wrong; unavoidable |
 | the Spark restarts | history empty; `where()` unknown until 2 s after the first sighting | phone-only for one poll | yes — and the ESP32s keep running, which is *why* they are not powered from the Spark |
-| offline mode | every room `None`, **no HTTP request is sent at all** | phone-only | yes |
+| offline mode | every room `None`, **no HTTP request is sent at all** | phone-only — and with no phone leg the sentinel goes to **unknown** rather than freezing on its last verdict, via `HouseView.blocked` | yes |
+
+`HouseView.blocked` is what carries that last row. `PresenceSentinel._blacked_out()`
+reads `sensor.blocked` and nothing else asks the question, so the view shipping
+without the property (2026-09-03) silently turned the dark-safe path off on the
+one box shape that needs it — no phone leg, rooms only. It reports the house
+blind only when EVERY configured room is blocked: one radar still permitted to
+look is still a leg. Anything else wearing this interface owes the same
+property, and presence now logs a missing one at ERROR instead of swallowing it.
 
 A room stuck ON is the opposite risk — a pedestal fan inside the beam is the
 documented failure and would make the house occupied for ever. A room whose bit
@@ -140,7 +148,9 @@ rather than when his phone's radio next answers an ARP.
 
 ```jsonc
 "presence": {
-  "door_room": "kitchen",     // must match a `name` in `rooms` above
+  "door_room": "kitchen",     // must match a `name` in `rooms` above; slugged
+                              // the same way, and a door room that names no
+                              // configured room is warned about at startup
   "arrival_outing": true,     // "Welcome back from the dentist, sir"
   "arrival_offer": true       // "You've 3 unread emails. Shall I go through them, sir?"
 }
@@ -157,21 +167,45 @@ he is at his desk greets nobody). Making coffee at nine while he is already
 home never fires.
 
 **"Welcome back from X" needs evidence.** `arrival.outing()` names a calendar
-event only when he was out for at least half of it AND it ended no more than 45
-minutes before he walked in (or was still running). No calendar, an unreachable
-one, an all-day event, no recorded departure, a title too long to speak, or TWO
-events that both fit — every one of those is the plain "Welcome back, sir",
-because a guessed event name is worse than no event name. It reads the
-`CalendarSource` CACHE, so a homecoming never waits on caldav.
+event only when **both** halves of the coverage rule hold — he was out for at
+least half of the EVENT, and the event accounts for at least half of the
+ABSENCE — AND it ended no more than 45 minutes before he walked in (or was
+still running). The second half was missing on the first cut, and without it a
+four-minute entry that ended sixteen minutes before he got in named a four-hour
+absence: *"Welcome back from take the bins out, sir."* The honest cost of the
+fix is that a one-hour class inside a two-and-a-half-hour absence is now the
+plain line — a long commute either side of a short event is exactly the case
+the calendar cannot prove, and `absence_cover` is a keyword argument for anyone
+who disagrees. No calendar, an unreachable one, an all-day event, no recorded
+departure, a title too long to speak, or TWO events that both fit — every one
+of those is the plain "Welcome back, sir", because a guessed event name is
+worse than no event name. It reads the `CalendarSource` CACHE, so a homecoming
+never waits on caldav.
 
 **The catch-up OFFERS, it does not deliver.** The mail half is a count and a
 question — never a sender, never a subject — plus one clause on anything major
-(an `error` on the fault board, in its own words). He gets the contents when he
-answers yes, and the yes is resolved by the offer protocol that already exists:
-`services.briefing_offer` + `Commander._try_briefing_offer`, 60 s TTL,
-end-anchored yes/no. The quiet-hours digest in front of it is unchanged, and
-the offer is thinned into the SAME single address pass so the burst still says
-"sir" twice at most.
+(an `error` on the fault board, in its own words and its own case). He gets the
+contents when he answers yes, and the yes is resolved by the offer protocol
+that already exists: `services.briefing_offer` + `Commander._try_briefing_offer`,
+60 s TTL, end-anchored yes/no. The quiet-hours digest in front of it is
+unchanged, and the fault clause and the question go in as SEPARATE fragments of
+the same single address pass, so the burst still says "sir" twice at most.
+
+Three rules that are easy to get wrong, and were:
+
+* **A fault is TOLD, not offered.** With no mailbox and a standing error the
+  line is `"The disk is full."` and there is no question and nothing parked —
+  there is nothing to "go through" in a broken disk, and the first cut asked
+  anyway and then read the same sentence back when he said yes. The delivery
+  never repeats what the offer already spoke.
+* **The 60 s TTL starts when the digest has been SPOKEN**, not when the
+  question was parked, or a long quiet-hours backlog eats the window he has to
+  answer in.
+* **The unread count runs on a worker thread** when a mailbox is configured.
+  `bus.drain()` runs from the UI's Tk pump, so an IMAP round trip (15 s timeout
+  a mailbox; 8.1 s measured across his three accounts) taken inline froze the
+  window and every event behind it at the moment he walked in. With no mailbox
+  nothing opens a socket and the cue stays synchronous.
 
 Degradation is the point: with no kitchen sensor, no calendar and no mailbox he
 gets exactly the "Welcome back, sir" he got before any of this was built.

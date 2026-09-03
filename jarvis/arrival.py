@@ -27,7 +27,9 @@ THREE THINGS WERE ADDED 2026-09-03, and all three say LESS than they could:
   calendar event honestly covered the absence. Two events that both fit is
   no name at all: a guessed event name is worse than no event name.
 * **the catch-up OFFERS** -- ``catch_up_offer`` is a count and a question,
-  never a sender or a subject. His ruling: "He should offer."
+  never a sender or a subject. His ruling: "He should offer." A standing
+  FAULT is told rather than offered: there is nothing to "go through" in
+  a broken disk, and the first cut asked anyway.
 
 Three things this module deliberately does NOT do.
 
@@ -173,8 +175,21 @@ DEFAULT_DOOR_ROOM = "kitchen"
 
 def _room_key(value) -> str:
     """A room name as it is compared: slugged the way roomfabric slugs it,
-    so a hand-written config key and a fabric event name meet."""
-    return " ".join(str(value or "").split()).strip().lower()
+    so a hand-written config key and a fabric event name meet.
+
+    THE SAME RULE, not merely a similar one. ``roomfabric._slug`` also
+    strips every character that is not alphanumeric, space, hyphen or
+    underscore, and the first cut here did not -- so a room called
+    "Kitchen!" became the fabric room "kitchen" while a ``door_room`` of
+    "Kitchen!" matched nothing, silently, for ever. It is copied rather
+    than imported because this module's promise is that it pulls in
+    nothing that owns a thread or a socket; the two are pinned to each
+    other by
+    tests/test_arrival_kitchen.py::test_the_room_key_slugs_exactly_as_the_fabric_does.
+    """
+    text = " ".join(str(value or "").split()).lower()
+    return "".join(ch if (ch.isalnum() or ch in " -_") else ""
+                   for ch in text).strip()
 
 
 def door_arrival(*, room, door: str = DEFAULT_DOOR_ROOM,
@@ -243,6 +258,21 @@ OUTING_COVER = 0.5
 OUTING_ENDED_WITHIN_S = 45 * 60.0
 # Under this there is nothing to be back FROM: he took the bins out.
 OUTING_MIN_ABSENCE_S = 5 * 60.0
+# ...and the event has to explain most of the time he was ACTUALLY GONE.
+# This is the second half of the coverage rule and it was missing on the
+# first cut: OUTING_COVER alone measures the overlap against the EVENT, so
+# a four-minute entry that ended sixteen minutes before he walked in named
+# a four-hour absence -- measured, "Welcome back from take the bins out,
+# sir." after four hours out. Both directions now have to hold: he was at
+# most of the event, AND the event was most of his absence.
+#
+# WHAT THIS REFUSES, and it is the honest cost: a one-hour class inside a
+# two-and-a-half-hour absence is 0.4 and gets the plain line. A long
+# commute either side of a short event is exactly the case where the
+# calendar cannot prove where he was, and his rule is that a guessed event
+# name is worse than no event name. Raise it toward 0.0 to name more and
+# guess more; it is a keyword argument for that reason.
+OUTING_ABSENCE_COVER = 0.5
 # A calendar title can be a paragraph (his Canvas feed's are). Spoken as
 # the tail of a two-second greeting, a long one is worse than the plain
 # line, so it disqualifies the match rather than being truncated -- a
@@ -259,7 +289,8 @@ def speakable_title(value, cap: int = OUTING_MAX_TITLE) -> str:
 def outing(events, *, left, back, cover: float = OUTING_COVER,
            ended_within_s: float = OUTING_ENDED_WITHIN_S,
            min_absence_s: float = OUTING_MIN_ABSENCE_S,
-           max_title: int = OUTING_MAX_TITLE) -> str:
+           max_title: int = OUTING_MAX_TITLE,
+           absence_cover: float = OUTING_ABSENCE_COVER) -> str:
     """What he was out AT, or "" -- and "" is the common answer.
 
     ``events`` is whatever ``CalendarSource.events()`` returns (anything
@@ -270,6 +301,10 @@ def outing(events, *, left, back, cover: float = OUTING_COVER,
     * it is not all-day (a "Fall break" spanning the absence is not
       somewhere he went);
     * he was out for at least ``cover`` of it;
+    * **it accounts for at least ``absence_cover`` of the absence** -- the
+      symmetric half, without which a four-minute errand named a four-hour
+      outing (the docstring's own counter-example is what the code
+      produced before 2026-09-03);
     * it ended no more than ``ended_within_s`` before he walked in, or was
       still running;
     * its title is short enough to say.
@@ -287,7 +322,8 @@ def outing(events, *, left, back, cover: float = OUTING_COVER,
     """
     try:
         return _outing(events, left, back, float(cover), float(ended_within_s),
-                       float(min_absence_s), int(max_title))
+                       float(min_absence_s), int(max_title),
+                       float(absence_cover))
     except Exception:  # noqa: BLE001 - a name is never worth the greeting
         log.debug("arrival: the outing match failed; plain welcome",
                   exc_info=True)
@@ -295,10 +331,11 @@ def outing(events, *, left, back, cover: float = OUTING_COVER,
 
 
 def _outing(events, left, back, cover, ended_within_s, min_absence_s,
-            max_title) -> str:
+            max_title, absence_cover) -> str:
     if left is None or back is None:
         return ""                       # no recorded departure: nothing to match
-    if (back - left).total_seconds() < min_absence_s:
+    absence = (back - left).total_seconds()
+    if absence < min_absence_s:
         return ""
     found: dict = {}
     for event in events or ():
@@ -312,6 +349,12 @@ def _outing(events, left, back, cover, ended_within_s, min_absence_s,
             continue
         overlap = (min(end, back) - max(start, left)).total_seconds()
         if overlap <= 0 or overlap < cover * length:
+            continue
+        # THE OTHER DIRECTION. The line above asks "was he at the event?";
+        # this one asks "was the event where he was?". Only both together
+        # rule out a short entry standing in for hours nobody can account
+        # for -- see OUTING_ABSENCE_COVER.
+        if overlap < absence_cover * absence:
             continue
         if (back - end).total_seconds() > ended_within_s:
             continue
@@ -354,32 +397,75 @@ CATCH_UP_QUESTION = "Shall I go through {it}, sir?"
 def catch_up_offer(*, unread=None, major: str = "") -> str:
     """The offer, or "" when there is nothing honest to ask about.
 
-    ``unread`` is a count or None, and **None is "I could not look", never
+    ``unread`` is a count or None. **None is SILENCE about mail -- never
     "no mail"** -- the same rule ``RoomSensor.read`` follows, for the same
     reason: a mailbox that timed out must not be reported as an empty one.
-    Zero unread and a clear board is silence, not "no email, sir".
+    (It does not say "I could not look" either; the first cut's docstring
+    claimed a line that has never existed. There is no honest short way to
+    say it at the door, and an unreachable mailbox is not news.) Zero
+    unread and a clear board is silence too, not "no email, sir".
 
     ``major`` is one clause about anything that actually went wrong while
     he was out, in the words its own source wrote (jarvis/faults.py builds
     that line; nothing here paraphrases it).
+
+    **THE QUESTION IS ABOUT THE MAIL AND NOTHING ELSE.** With no unread
+    count and a fault standing, this returns the fault as a STATEMENT with
+    no question on the end. "The disk is full. Shall I go through it,
+    sir?" was what the first cut said, and there is nothing to go through:
+    answering yes just spoke the same sentence back. A fault is told, not
+    offered. ``offers_to_read`` is how the caller tells the two apart, and
+    only a question is worth parking on the offer protocol.
+
+    The fault clause is its own sentence and its case is LEFT ALONE. The
+    first cut lower-cased its first letter to splice it in after "and",
+    which turned "Ollama is unreachable" into "ollama is unreachable" and
+    "I have lent the GPU to your trainer" -- health.py's real wording --
+    into "i have lent". The digest is shown on the card as well as spoken,
+    and no rule can tell "Memory" (safe to lower) from "Ollama" (not) by
+    looking at it, so nothing is re-cased at all.
     """
-    clauses = []
+    return " ".join(catch_up_fragments(unread=unread, major=major))
+
+
+def catch_up_fragments(*, unread=None, major: str = "") -> list:
+    """``catch_up_offer`` before it is joined: 0, 1 or 2 whole lines.
+
+    The fault is its own fragment and the mail question is another,
+    because that is the invariant ``jarvis/address.py`` thinning needs --
+    "each fragment must be a whole authored Jarvis line". health.py's real
+    wording carries its own "sir" ("I have lent the GPU to your trainer,
+    sir; quick answers only..."), and as one three-sentence blob the burst
+    would arrive at the door addressing him twice with nothing able to
+    take one out.
+    """
     try:
         count = None if unread is None else max(0, int(unread))
     except (TypeError, ValueError):
         count = None
-    if count:
-        clauses.append("you've %d unread email%s" % (count, "" if count == 1 else "s"))
-    clause = " ".join(str(major or "").split()).rstrip(".")
-    if clause:
-        clauses.append(clause[0].lower() + clause[1:] if clauses else clause)
-    if not clauses:
-        return ""
-    # "Shall I go through THEM" for three emails, "IT" for one thing. A
-    # pronoun that does not agree is the tell that a line was assembled
-    # rather than written, and this one is spoken at the door.
-    things = (count or 0) + (1 if clause else 0)
-    lead = ", and ".join(clauses)
-    lead = lead[0].upper() + lead[1:]
-    return "%s. %s" % (lead, CATCH_UP_QUESTION.format(
-        it="them" if things > 1 else "it"))
+    fault = " ".join(str(major or "").split())
+    parts = []
+    if fault:
+        parts.append(fault if fault.endswith((".", "!", "?")) else fault + ".")
+    if not count:
+        # No mail to go through: the fault stands alone, or there is
+        # nothing at all to say.
+        return parts
+    # "Shall I go through THEM" for three emails, "IT" for one. A pronoun
+    # that does not agree is the tell that a line was assembled rather
+    # than written, and this one is spoken at the door. It counts the
+    # MAIL, because the mail is all a yes delivers.
+    parts.append("You've %d unread email%s. %s" % (
+        count, "" if count == 1 else "s",
+        CATCH_UP_QUESTION.format(it="them" if count > 1 else "it")))
+    return parts
+
+
+def offers_to_read(line: str) -> bool:
+    """Did ``catch_up_offer`` ask a question, or just tell him something?
+
+    The caller has to know: only a question may be parked on
+    ``services.briefing_offer``, and parking a statement would leave a
+    "yes" hanging on nothing. A fault-only line is a statement.
+    """
+    return str(line or "").strip().endswith("?")

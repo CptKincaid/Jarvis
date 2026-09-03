@@ -243,6 +243,18 @@ DISCORD_ACTIVE_S = 600.0        # a Discord exchange stays "active" this long
 GREET_DAMPER_S = 600.0
 
 
+def _same_clause(a: str, b: str) -> bool:
+    """Are these the same sentence, allowing for the full stop?
+
+    Used once, and for one reason: the arrival OFFER speaks the standing
+    fault, and the delivery that a "yes" buys must not read it back word
+    for word (which is exactly what it did before 2026-09-03).
+    """
+    def norm(text) -> str:
+        return " ".join(str(text or "").split()).rstrip(".!?").casefold()
+    return bool(norm(a)) and norm(a) == norm(b)
+
+
 def yes_no(text: str):
     """True / False for an approval answer, None when the text is neither
     ("yes", "allow it", "no thanks", "deny"). Used for Discord replies to a
@@ -570,6 +582,12 @@ class JarvisApp:
                                         arrival_mod.DEFAULT_DOOR_ROOM)
                      if self.assistant is not None
                      else arrival_mod.DEFAULT_DOOR_ROOM))
+        self._warn_door_room_names_nothing()
+
+        # The unread count runs on a worker when a mailbox is configured,
+        # so the cue is not paid for on the Tk pump. Held only so a test
+        # can join it (see _arrival_actions.catch_up).
+        self._arrival_catch_up_thread = None
 
         if CONFIG.target_name:
             self.desktop.restore_target(CONFIG.target_name)
@@ -1562,6 +1580,30 @@ class JarvisApp:
             return
         self._greet_return("desk")
 
+    def _warn_door_room_names_nothing(self) -> None:
+        """Say so ONCE at startup when ``presence.door_room`` matches no
+        configured room.
+
+        A door room that names nothing is silent: the kitchen trigger
+        simply never fires and there is no error anywhere to find. Only
+        checked when rooms ARE configured -- on a box with no ``rooms``
+        list the whole feature is inert by design and a warning every boot
+        would be noise.
+        """
+        try:
+            from jarvis import roomfabric
+            specs = roomfabric.room_specs(self.assistant)
+            if not specs:
+                return
+            door = arrival_mod._room_key(self._door.door)
+            names = [roomfabric._slug(spec.name) for spec in specs]
+            if door and door not in names:
+                log.warning("arrival: presence.door_room %r matches no "
+                            "configured room (%s); the door trigger can "
+                            "never fire", self._door.door, ", ".join(names))
+        except Exception:  # noqa: BLE001 - a warning may not cost the boot
+            log.debug("arrival: could not check the door room", exc_info=True)
+
     def _greet_return(self, source: str) -> None:
         """One arrival cue per return, shared by the phone and desk probes.
 
@@ -1633,22 +1675,21 @@ class JarvisApp:
             self._say(line)
             return True
 
-        def catch_up():
-            quiet = getattr(self, "quiet", None)
-            # release() drains atomically: the policy's own tick would read
-            # the same backlog, and whichever gets there first says it.
-            frags = list(quiet.release_fragments()) if quiet is not None else []
+        def speak_catch_up(held):
             # THE OFFER, and it is the only new thing spoken on the
             # doorstep. His ruling after the 40-second monologue of
             # 2026-09-02: the briefing OFFERS, it does not deliver. So this
             # is a count and a question -- never a sender, never a subject
             # -- and it rides the SAME burst as the digest in front of it so
             # the address thinning is still one pass over the whole cue.
-            offer = self._arrival_offer_line()
-            if offer:
-                frags.append(offer)
+            offer, major = self._arrival_offer_fragments()
+            frags = list(held) + list(offer)
             if not frags:
                 return False
+            # A fault-only line is a STATEMENT ("The disk is full.") and
+            # there is nothing to go through; only a question may be
+            # parked, or a "yes" would hang on nothing.
+            asks = bool(offer) and arrival_mod.offers_to_read(offer[-1])
             # THE JOIN (7 sentences, 5 sirs measured): "Welcome back, sir."
             # has already addressed him, so the digest's own later vocatives
             # are the ones that go. The digest arrives as FRAGMENTS and is
@@ -1657,7 +1698,7 @@ class JarvisApp:
             # first, and thinning a finished string is the mode that killed
             # the first attempt (jarvis/address.py). Then both shown and
             # spoken, so the card he reads and the voice he hears agree.
-            thinned = self._thin_address(burst + list(frags))
+            thinned = self._thin_address(burst + frags)
             digest = address_mod.join_thinned(thinned[len(burst):])
             if not digest:
                 return False
@@ -1667,10 +1708,51 @@ class JarvisApp:
             # leave a question on the floor with nothing listening for the
             # answer, and the answer's window opens off this line's
             # falling edge (_after_speech).
-            if offer:
-                self._park_arrival_offer()
+            parked = self._park_arrival_offer(said=major) if asks else None
             bus.publish(JarvisReply(text=digest, speak=True))
             self._say(digest)
+            # ...and the 60 s TTL is measured from HERE, not from the park.
+            # A long quiet-hours backlog in front of the question used to
+            # eat most of the window he had to answer it.
+            self._restamp_offer(parked)
+            return True
+
+        def finish_off_thread(held):
+            # arrival.run() guards each step and logs what ran; a worker has
+            # no such parent, so both come with it. A catch-up that died on
+            # the way to the speaker belongs in the log, not in a dead
+            # thread, and "catch-up" in the cue's own line means STARTED.
+            try:
+                if not speak_catch_up(held):
+                    log.info("arrival: the catch-up had nothing to say")
+            except Exception:  # noqa: BLE001
+                log.exception("arrival: the catch-up failed off-thread")
+
+        def catch_up():
+            quiet = getattr(self, "quiet", None)
+            # release() drains atomically: the policy's own tick would read
+            # the same backlog, and whichever gets there first says it.
+            frags = list(quiet.release_fragments()) if quiet is not None else []
+            # OFF THE PUMP THREAD WHEN IT COSTS A SOCKET. bus.publish only
+            # queues once Tk is attached, and drain() runs from the UI's
+            # own _pump -- so every subscriber here, this step included,
+            # executes on the Tk MAIN THREAD. The unread count is an IMAP
+            # round trip (IMAP_TIMEOUT is 15 s a mailbox, and mail.py's
+            # own docstring records a measured 8.1 s across his three
+            # accounts), and paying that on the pump freezes the window and
+            # every event behind it at the exact moment he walks in. So a
+            # configured mailbox finishes the step on a short-lived worker,
+            # the way every other mail watcher in this file already does
+            # (mailwatch.PeopleMailHeadsUp is its own service). With no
+            # mailbox nothing opens a socket, so that path stays inline and
+            # the cue is still synchronous end to end.
+            if not self._arrival_mail_is_remote():
+                return speak_catch_up(frags)
+            worker = threading.Thread(target=finish_off_thread, args=(frags,),
+                                      name="arrival-catchup", daemon=True)
+            # Held so a test can join it; nothing in the app waits.
+            self._arrival_catch_up_thread = worker
+            worker.start()
             return True
 
         return {"panel": panel, "earcon": earcon, "greeting": greeting,
@@ -1715,37 +1797,75 @@ class JarvisApp:
         return arrival_mod.welcome_line(what)
 
     # --------------------------------------------- the catch-up OFFER
-    def _arrival_offer_line(self) -> str:
-        """"You've 3 unread emails. Shall I go through them, sir?", or "".
+    def _arrival_offer_fragments(self):
+        """``([fragments], the fault clause inside them)``, both possibly empty.
 
-        The two numbers behind it are read HERE and the sentence is built
-        by jarvis/arrival.catch_up_offer, which is pure -- the same split
-        mailwatch makes ("the line is built here, never by the model"),
-        for the same reason: this has to work while the GPU is lent to a
-        trainer, and a doorstep question is not worth a model turn.
+        "You've 3 unread emails. Shall I go through them, sir?" is one
+        fragment; a standing fault is another in front of it, because
+        jarvis/address.py thins whole authored LINES and health.py's own
+        wording carries a "sir" of its own. The two numbers behind them are
+        read HERE and the sentences are built by jarvis/arrival, which is
+        pure -- the same split mailwatch makes ("the line is built here,
+        never by the model"), for the same reason: this has to work while
+        the GPU is lent to a trainer, and a doorstep question is not worth
+        a model turn.
+
+        The fault clause comes back as well as going in, so the delivery
+        can decline to say it a second time (see _deliver_arrival_catch_up).
         """
         if not self.assistant.get("presence.arrival_offer", True):
-            return ""
-        return arrival_mod.catch_up_offer(unread=self._unread_count(),
-                                          major=self._major_line())
+            return [], ""
+        major = self._major_line()
+        frags = arrival_mod.catch_up_fragments(unread=self._unread_count(),
+                                               major=major)
+        return list(frags), major
+
+    def _arrival_offer_line(self) -> str:
+        """The fragments above as one string. Convenience, and the shape
+        the tests read."""
+        return " ".join(self._arrival_offer_fragments()[0])
+
+    def _arrival_mail_is_remote(self) -> bool:
+        """Will the unread count cost an IMAP round trip?
+
+        The one question that decides whether the catch-up step finishes
+        on the Tk pump thread or on a worker. No mailbox configured means
+        ``fetch_unread`` raises before a socket is opened, and that path is
+        cheap enough to stay inline -- which is the live box today, and
+        every test that asserts on ``tts.spoken`` the line after ``run()``.
+        Never raises: an unreadable config is treated as "no mailbox", and
+        the worst that costs is a synchronous call that was going to be
+        fast anyway.
+        """
+        try:
+            if not self.assistant.get("presence.arrival_offer", True):
+                return False
+            from jarvis.tools import mail as mail_mod
+            return bool(mail_mod.mail_accounts(self.assistant))
+        except Exception:  # noqa: BLE001 - a config read may not cost the cue
+            log.debug("arrival: could not tell whether a mailbox is configured",
+                      exc_info=True)
+            return False
 
     def _unread_count(self):
         """How many unread emails, or None -- never their contents.
 
-        None is "I could not look" and catch_up_offer keeps it that way; a
-        mailbox that timed out must never be announced as an empty one.
-        Costs one IMAP round trip, taken AFTER the greeting has already
-        been spoken (the catch-up is the last arrival step), so a slow
-        mailbox delays the offer and never the welcome. No mailbox
-        configured raises MailNotConfigured before a socket is opened,
-        which is the dark-safe path every watcher here already uses.
+        None is silence about mail, never "no mail": catch_up_offer keeps
+        it that way, because a mailbox that timed out must not be
+        announced as an empty one. Costs one IMAP round trip, taken AFTER
+        the greeting has already been spoken (the catch-up is the last
+        arrival step) and, when a mailbox is actually configured, on a
+        worker thread rather than on the Tk pump -- see the comment in
+        ``catch_up``. No mailbox configured raises MailNotConfigured
+        before a socket is opened, which is the dark-safe path every
+        watcher here already uses.
         """
         try:
             from jarvis.tools import mail as mail_mod
             mails = mail_mod.fetch_unread(self.assistant,
                                           since_hours=ARRIVAL_MAIL_HOURS,
                                           limit=ARRIVAL_MAIL_LIMIT)
-        except Exception:  # noqa: BLE001 - every failure is "I could not look"
+        except Exception:  # noqa: BLE001 - every failure is silence about mail
             log.debug("arrival: the unread count is unavailable", exc_info=True)
             return None
         return len(list(mails))
@@ -1769,8 +1889,8 @@ class JarvisApp:
             log.debug("arrival: the fault board could not be read", exc_info=True)
             return ""
 
-    def _park_arrival_offer(self) -> None:
-        """Hand the question to the ONE offer protocol.
+    def _park_arrival_offer(self, said: str = ""):
+        """Hand the question to the ONE offer protocol. Returns the dict.
 
         ``services.briefing_offer`` + ``Commander._try_briefing_offer`` is
         the rung that already resolves "Shall I run your briefing, sir?" --
@@ -1779,30 +1899,63 @@ class JarvisApp:
         dropped. Reusing it is the point: a "yes" must not mean different
         things on different rungs, and this question is put with an open
         microphone exactly as that one is.
+
+        ``said`` is the fault clause the OFFER already spoke, carried into
+        the delivery so a yes does not get the same sentence read back at
+        it. The dict is returned so the caller can re-stamp ``made_at``
+        once the words are actually out.
         """
+        offer = {"made_at": time.time(),
+                 "deliver": lambda: self._deliver_arrival_catch_up(said=said)}
         try:
-            self.services.briefing_offer = {
-                "made_at": time.time(),
-                "deliver": self._deliver_arrival_catch_up}
+            self.services.briefing_offer = offer
         except Exception:  # noqa: BLE001 - a question nobody can answer is worse
             log.exception("arrival: could not park the catch-up offer")
-            return
+            return None
         # A question nobody listens for is the 2026-09-02 stuck-listen bug
         # in miniature: _after_speech opens the mic on this line's falling
         # edge, so "yes" needs no wake word.
         self._followup_after_speech = True
+        return offer
 
-    def _deliver_arrival_catch_up(self) -> bool:
+    def _restamp_offer(self, offer) -> None:
+        """Start the offer's 60 s TTL from when he could first ANSWER.
+
+        ``BRIEFING_OFFER_TTL_S`` is measured off ``made_at``, and the
+        question is parked before the burst goes out (a TTS failure must
+        not leave a question on the floor). A released quiet-hours backlog
+        can be several sentences, so stamping at the park spent most of
+        his window before the question had even been asked. Re-stamped
+        only if the offer we parked is still the live one -- a first-wake
+        offer that replaced it keeps its own clock.
+        """
+        if not isinstance(offer, dict):
+            return
+        try:
+            if getattr(self.services, "briefing_offer", None) is offer:
+                offer["made_at"] = time.time()
+        except Exception:  # noqa: BLE001 - a stale TTL is not worth an exception
+            log.debug("arrival: could not re-stamp the catch-up offer",
+                      exc_info=True)
+
+    def _deliver_arrival_catch_up(self, said: str = "") -> bool:
         """He said yes: the senders and subjects, built here, not by the model.
 
         Same rule as mailwatch -- no model turn for a line that is three
         facts -- and the same cap of MAX_LINES, with the rest counted
         rather than read. False means nothing was said, and
         _try_briefing_offer owns telling him so.
+
+        ``said`` is what the offer already spoke about the fault board. It
+        used to be read again unconditionally, so with a standing error the
+        whole delivery was the sentence he had just heard, word for word.
+        A fault is told once.
         """
         from jarvis.mailwatch import MAX_LINES, _subject_words
         lines: list = []
         major = self._major_line()
+        if major and _same_clause(major, said):
+            major = ""                  # the offer already said it
         if major:
             lines.append(major if major.endswith((".", "!", "?")) else major + ".")
         try:

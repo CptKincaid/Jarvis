@@ -25,8 +25,11 @@ function object it always did.
 N ROOMS, when ``presence.rooms`` is configured: the leg becomes
 ``roomfabric.HouseView`` rather than one ``RoomSensor``, and ``RoomOrPhone``
 below needs no change at all -- the view wears the same
-``read() -> True | False | None``, and the asymmetry above is already the
-right rule for three rooms as well as one. The fabric also publishes
+``read() -> True | False | None`` **and the same ``blocked``**, which is
+what carries the offline-mode path below into the multi-room case (it
+shipped without one, and ``_blacked_out`` swallowed the AttributeError);
+the asymmetry above is already the right rule for three rooms as well as
+one. The fabric also publishes
 ``RoomChanged``, which is what lets the app treat the KITCHEN as the front
 door (jarvis/arrival.py, app._on_room_changed). With ``presence.rooms``
 empty the singular path below runs unchanged, which is the configuration
@@ -80,6 +83,10 @@ DEFAULT_AWAY_POLL_S = 10.0     # see the poll_s docstring: arrival must be promp
 PING_TIMEOUT_S = 3.0
 PRESENT_STATES = ("REACHABLE", "DELAY", "PERMANENT")
 WELCOME_LINE = "Welcome back, sir."
+
+# A leg that does not answer "are you blocked?" at all, told apart from
+# one that answers "no". See PresenceSentinel._blacked_out.
+_MISSING = object()
 
 _NEIGH_RX = re.compile(
     r"^(?P<ip>\S+)\s+dev\s+(?P<dev>\S+)(?:\s+lladdr\s+(?P<mac>[0-9a-f:]+))?"
@@ -396,12 +403,31 @@ class PresenceSentinel:
         30 s and holding the last verdict across it is correct. Offline mode
         lasts until he says otherwise, and there is no honest way to keep
         answering a question nothing has been able to observe for hours.
+
+        A MISSING ``blocked`` IS LOUD, and that is the whole change here.
+        This check used to sit inside a bare ``except Exception`` logged at
+        debug, so when the multi-room leg arrived without the attribute
+        (2026-09-03) the AttributeError was swallowed and the dark-safe
+        path simply stopped existing: presence held its last verdict for
+        the length of the blackout. A privacy path that fails silently is
+        the worst failure in this file, so a leg that cannot say whether it
+        is blocked is reported at ERROR with its type named. It still
+        returns False -- inventing "blacked out" from a broken leg would
+        blank presence on every bug -- but it can no longer do so quietly.
         """
         if self.phone_ip or self.phone_mac:
             return False
         sensor = self.sensor
+        if sensor is None:
+            return False
+        blocked = getattr(sensor, "blocked", _MISSING)
+        if blocked is _MISSING:
+            log.error("presence: the %s leg has no `blocked`, so offline mode "
+                      "cannot reach the sentinel; holding the last verdict",
+                      type(sensor).__name__)
+            return False
         try:
-            return bool(sensor is not None and sensor.blocked)
+            return bool(blocked)
         except Exception:  # noqa: BLE001 - provider boundary
             log.debug("presence: sensor block check failed", exc_info=True)
             return False

@@ -909,3 +909,130 @@ def test_the_quiet_policy_and_the_desk_probe_are_left_alone():
     root = pathlib.Path(sensing.__file__).parent
     for name in ("quiet.py", "deskpresence.py"):
         assert "sensing" not in (root / name).read_text(), name
+
+
+# ------------------------- the same promise, on the MULTI-ROOM leg
+#
+# 2026-09-03 regression. `presence.rooms` swaps the sentinel's leg from one
+# `RoomSensor` to `roomfabric.HouseView`, and the view shipped without a
+# `blocked` property. `_blacked_out()` read it inside a broad `except` at
+# debug level, so the AttributeError was swallowed, the check answered
+# "nothing is blocked", and every test above stopped applying to the only
+# configuration that has more than one radar in it. Measured on the branch
+# before the fix: a rooms-only box held "home" through a full blackout
+# where the single-sensor box reached "unknown".
+def _rooms_only_sentinel(policy, body='{"value": true}'):
+    """A box whose ONLY presence leg is a two-room fabric -- his, once the
+    kitchen is flashed. No phone_ip, no phone_mac."""
+    from jarvis.presence import PresenceSentinel
+    cfg = FakeCfg({"presence.room_sensor_enabled": True,
+                   "presence.rooms": [
+                       {"name": "office", "url": "http://10.0.0.9",
+                        "primary": True},
+                       {"name": "kitchen", "url": "http://10.0.0.8"}],
+                   "presence.phone_ip": "", "presence.phone_mac": ""})
+    published, clock = [], {"t": 1_000_000.0}
+    s = PresenceSentinel(cfg, publish=published.append,
+                         now=lambda: clock["t"], poll_s=1.0, policy=policy)
+    for room in s.fabric.rooms:
+        room.sensor._get = _Transport(body)
+    return s, published, clock
+
+
+def test_the_house_view_can_say_it_is_blocked_at_all(tmp_path):
+    """The attribute itself, pinned so it cannot go missing again. Presence
+    reads `sensor.blocked` and nothing else asks the question, so a leg
+    without it silently disables offline mode's reach into presence."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, _pub, _clock = _rooms_only_sentinel(p)
+    view = s.sensor
+    assert hasattr(type(view), "blocked"), "HouseView must wear `blocked`"
+    assert view.blocked == ""
+    p.disable()
+    assert view.blocked == "offline"
+
+
+def test_a_rooms_only_box_goes_unknown_when_sensing_is_off(tmp_path):
+    """The end-to-end promise, on the leg that broke it. Two radars report
+    the room occupied, then sensing goes off: the house must go to
+    "unknown", not hold "home" and speak proactive lines into a room
+    nobody can see."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, published, clock = _rooms_only_sentinel(p, '{"value": true}')
+    clock["t"] += 600.0
+    s.tick()
+    assert s.state == "home"
+    p.disable()
+    clock["t"] += 600.0
+    assert s.tick() is None
+    assert s.state == "unknown", "a house nobody can see is not a home"
+    assert s.is_home() is True
+    assert len(published) == 1, "no transition was invented on the way out"
+    assert [r.sensor.reads for r in s.fabric.rooms] == [1, 1], \
+        "the radars were polled while offline"
+
+
+def test_a_rooms_only_box_stops_asserting_AWAY_while_blacked_out(tmp_path):
+    """The direction that MUTES him, which is why finding 1 mattered: a
+    frozen "away" makes jarvis/quiet.py answer "you're out" and swallow
+    every proactive line while he is sitting in the kitchen."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, published, clock = _rooms_only_sentinel(p, '{"value": false}')
+    for _ in range(4):
+        clock["t"] += 600.0
+        s.tick()
+    assert s.state == "away" and s.is_home() is False
+    assert len(published) == 1
+    p.disable()
+    clock["t"] += 600.0
+    assert s.tick() is None
+    assert s.state == "unknown" and s.is_home() is True
+    assert len(published) == 1
+
+
+def test_a_breaker_outage_on_the_rooms_leg_still_HOLDS(tmp_path):
+    """Same distinction as the single-sensor case: a dead ESP32 is a
+    transient, not a privacy blackout, and dropping to unknown on every
+    hiccup would flap the ambient row."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, _published, clock = _rooms_only_sentinel(p, '{"value": true}')
+    clock["t"] += 600.0
+    s.tick()
+    assert s.state == "home"
+
+    def dead(url, timeout):
+        raise OSError("no route to host")
+
+    for room in s.fabric.rooms:
+        room.sensor._get = dead
+    for _ in range(6):
+        clock["t"] += 600.0
+        s.tick()
+    assert s.state == "home", "a transient outage is not a privacy blackout"
+
+
+def test_a_leg_that_cannot_answer_blocked_is_reported_LOUDLY(caplog):
+    """The swallow itself. `_blacked_out` used to read `.blocked` inside a
+    bare `except Exception` logged at DEBUG, so a leg without the attribute
+    turned offline mode off without a word. It still answers False -- a
+    broken leg must not blank presence -- but at ERROR, naming the type."""
+    import logging
+    from jarvis.presence import PresenceSentinel
+
+    class LegWithNoBlocked:
+        configured = True
+
+        def read(self):
+            return None
+
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = LegWithNoBlocked()
+    with caplog.at_level(logging.ERROR):
+        assert s._blacked_out() is False
+    assert any("LegWithNoBlocked" in r.getMessage() and r.levelno >= logging.ERROR
+               for r in caplog.records), "the missing attribute was swallowed"
