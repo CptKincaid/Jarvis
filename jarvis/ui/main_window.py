@@ -92,6 +92,7 @@ from jarvis.ui.board import BoardWindow, board_enabled
 from jarvis.ui.console_mode import (ACTIVE, STANDBY, ConsoleModes, DeskWatch,
                                     resolve_idle_fn)
 from jarvis.ui.reactor import Reactor
+from jarvis.ui.carry_chip import CarryChip
 from jarvis.ui.sensing_badge import SensingBadge, sensing_failsafe_state
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
                              TranscriptView, standby_alpha)
@@ -419,6 +420,11 @@ class Services:
     # this to JarvisApp._board_hide; build_ui_services drops it harmlessly
     # while that side is unwired.
     board_closed: Optional[Callable] = None
+    # Grab and throw (jarvis/gesturecast.GestureCast): the courier the
+    # console hands its carry chip and Tk marshaller to, and whose hand
+    # stage rides the camera preview's own capture (jarvis/handstage.py).
+    # Optional: a stand-in Services simply has no gesture.
+    gesture: Optional[Any] = None
 
 
 # ------------------------------------------------------------------ tray
@@ -994,6 +1000,17 @@ class MainWindow:
         header.bind("<Configure>", self._on_header_resize, add=True)
         self._check_header_fit()
 
+        # The carry chip (jarvis/ui/carry_chip.py): what his closed hand is
+        # holding, left of the sensing badge, NOT packed until a grab. A
+        # header indicator rather than a transcript card because a carry
+        # is a transient, not conversation. Click = put it down.
+        self.carry_chip = None
+        try:
+            self.carry_chip = CarryChip(header, bg=theme.BG,
+                                        on_dismiss=self._carry_dismissed)
+        except Exception:                     # noqa: BLE001 - optional chrome
+            log.exception("carry chip could not be built")
+
         # atmosphere: the header ground is a soft gradient (sheen behind
         # the wordmark, settling flat to the right) — flat-bg children are
         # re-tinted so nothing punches a hole in it; slightly stronger for
@@ -1025,7 +1042,7 @@ class MainWindow:
         # space landed on an unbound widget and the window could not be
         # dragged at all. A structural walk cannot rot that way.
         self._bind_drag_tree(header, skip=(self._close_btn, self._min_btn,
-                                           self._gear))
+                                           self._gear, self.carry_chip))
         self._bind_drag_tree(rule)
 
     def _bind_drag_tree(self, widget, skip=()):
@@ -1291,7 +1308,8 @@ class MainWindow:
             self.preview_worker = campreview.PreviewWorker(
                 get_option=self._console_option,
                 sensing=getattr(self.services, "sensing", None),
-                services=self.services, box=worker_box())
+                services=self.services, box=worker_box(),
+                hands=self._hand_stage())
         except Exception:                     # noqa: BLE001
             log.exception("camera preview worker could not be built")
             self.preview_worker = None
@@ -1301,6 +1319,46 @@ class MainWindow:
             self.preview_worker = None
             return
         self._preview_apply()
+
+    def _hand_stage(self):
+        """The grab-and-throw stage for the preview's capture, or None.
+
+        Built by the courier (services.gesture) so the console knows
+        nothing about trackers or thresholds; it only lends the courier
+        its chip and a way onto the Tk thread. The stage runs INSIDE
+        PreviewPipeline.grab() on the frame the preview already pulled --
+        no second device, no second thread -- and inherits every way the
+        preview shuts. A courier that fails to build leaves the preview
+        exactly as it was.
+        """
+        courier = getattr(self.services, "gesture", None)
+        if courier is None:
+            return None
+        try:
+            courier.attach_ui(chip=getattr(self, "carry_chip", None),
+                              post=lambda fn: self._after(0, fn),
+                              console_visible=self._console_active)
+            return courier.stage(get_option=self._console_option)
+        except Exception:                     # noqa: BLE001 - optional lane
+            log.exception("gesture stage could not be built")
+            return None
+
+    def _console_active(self) -> bool:
+        """Is the console the surface he is looking at? A plain attribute
+        read (no Tk call), because the cast asks from a worker thread."""
+        modes = getattr(self, "modes", None)
+        return modes is None or getattr(modes, "mode", ACTIVE) == ACTIVE
+
+    def _carry_dismissed(self):
+        """The chip was clicked: put the carry down. The courier ends the
+        gesture's carry and the chip hears about it through on_event."""
+        courier = getattr(self.services, "gesture", None)
+        if courier is None:
+            return
+        try:
+            courier.drop_by_voice()
+        except Exception:                     # noqa: BLE001 - a click
+            log.exception("carry dismiss failed")
 
     def _preview_enabled(self) -> bool:
         return bool(self._console_option(CAMERA_PREVIEW_OPTION, False))

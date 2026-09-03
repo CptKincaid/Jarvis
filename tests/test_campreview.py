@@ -1555,8 +1555,9 @@ def test_no_shot_summary_can_carry_pixels():
     for key, value in data.items():
         assert isinstance(value, (int, float, str, bool, dict)), key
     assert set(data["face"]) == {"conf", "x", "y", "w", "h", "yaw_deg",
-                                 "attending", "landmarks_ok",
+                                 "attending", "landmarks_ok", "eye_px",
                                  "name", "id_score", "id_ran"}
+    assert data["hand"] == {}
 
 
 def test_the_status_dict_a_diagnostic_would_print_is_numbers_and_strings():
@@ -1565,7 +1566,11 @@ def test_the_status_dict_a_diagnostic_would_print_is_numbers_and_strings():
         assert isinstance(value, (int, float, str, bool, dict))
 
 
-@pytest.mark.parametrize("name", ["jarvis/campreview.py", "jarvis/ui/preview.py"])
+@pytest.mark.parametrize("name", ["jarvis/campreview.py", "jarvis/ui/preview.py",
+                                  # the hand stage rides grab() on the same
+                                  # frame, and the tracker under it is the
+                                  # only other code that sees the array
+                                  "jarvis/handstage.py", "jarvis/handpose.py"])
 def test_no_code_path_writes_a_frame_anywhere(name):
     """The rule, enforced mechanically. Reviewing for an imwrite does not
     survive the next edit; a grep the suite runs does.

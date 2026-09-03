@@ -1669,6 +1669,13 @@ TIER1_SAMPLES = {
     "list strike": "take milk off the shopping list",
     "list strike anon": "cross the second one off the list",
     "list clear": "clear the shopping list",
+    # grab and throw by voice (jarvis/gesturecast.py)
+    "cast throw": "throw this on hpcomputer",
+    "cast put": "put it on the board",
+    "cast drop": "drop it",
+    "cast holding": "what am i holding",
+    "cast side": "which side is hpcomputer on",
+    "cast teach": "hpcomputer is on my right",
     "lists": "what lists do i have",
     "week review": "how was my week",
     "garden report": "memory report",
@@ -1803,6 +1810,16 @@ UNION_FIRST_RUNG = {
     # judge whether "face" names a file at all
     "send heather's face to hpcomputer": "remote push",
     "email my face to heather": "send file",
+    # the cast verbs (gesture-cast) sit ABOVE the remote five in the
+    # registry, pinned here so the merge order is a decision and not an
+    # accident: an object that is only this/it/that, aimed at a sink the
+    # cast table knows, is the throw by voice (the held subject, else the
+    # one resolved now); a NAMED file to the same host is still the
+    # transfer with its read-back
+    "put this on hpcomputer": "cast put",
+    "send it to the hp": "cast throw",
+    "put this file on hpcomputer": "remote push",
+    "send this file to hpcomputer": "remote push",
     # ...and the neighbours each family had to beat still answer their own
     "forget the walk to wisenbaker": "leave time forget",
     "remember that the lab is on tuesday": "remember",
@@ -2708,3 +2725,110 @@ def test_incident_replay_push_back_then_forward_leaves_the_series_alone(real_tk,
     it = tk.list("alarm")[0]
     assert it.snooze_until is None and not it.shifted
     assert tk.list_text("alarm") == "One alarm, sir: wake up at 7:00 am tomorrow, every day."
+
+
+# ------------------------------------------------ grab and throw by voice
+class FakeCourier:
+    """jarvis/gesturecast.GestureCast's voice face, recording every call."""
+
+    def __init__(self):
+        self.throws, self.drops, self.taught, self.sides = [], 0, [], []
+        self.holding, self.spoken_over_calls = 0, 0
+
+    def throw_by_voice(self, sink):
+        self.throws.append(sink)
+        return "On the board, sir.", "landed"
+
+    def drop_by_voice(self):
+        self.drops += 1
+        return "Put down, sir."
+
+    def holding_line(self):
+        self.holding += 1
+        return "Holding the thesis draft, sir."
+
+    def teach(self, side, sink):
+        self.taught.append((side, sink))
+        return "Right is HPCOMPUTER from now on, sir."
+
+    def side_line(self, sink):
+        self.sides.append(sink)
+        return "HPCOMPUTER is on your right, sir."
+
+    def spoken_over(self):
+        self.spoken_over_calls += 1
+
+
+@pytest.fixture
+def courier(rich, services):
+    c = FakeCourier()
+    services.gesture = c
+    return c
+
+
+def test_the_cast_verbs_reach_the_courier(rich, courier):
+    res = rich.handle("throw this on hpcomputer", source="voice")
+    assert res.handled and res.speak and res.reply == "On the board, sir."
+    assert courier.throws == ["hpcomputer"]
+    res = rich.handle("put it on the board", source="voice")
+    assert res.reply == "On the board, sir." and courier.throws[-1] == "the board"
+    res = rich.handle("drop it", source="voice")
+    assert res.reply == "Put down, sir." and courier.drops == 1
+    res = rich.handle("what am I holding", source="voice")
+    assert res.reply == "Holding the thesis draft, sir." and courier.holding == 1
+    res = rich.handle("HPCOMPUTER is on my right", source="voice")
+    assert res.reply.startswith("Right is HPCOMPUTER") and courier.taught == [("right", "hpcomputer")]
+    res = rich.handle("which side is hpcomputer on", source="voice")
+    assert res.reply == "HPCOMPUTER is on your right, sir." and courier.sides == ["hpcomputer"]
+
+
+def test_without_a_courier_the_cast_verbs_do_not_claim_the_turn(rich, services):
+    services.gesture = None
+    assert rich._match_assistant("drop it") == "cast drop"
+    res = rich._try_assistant("drop it")
+    assert res is None
+
+
+def test_the_cast_verbs_do_not_collide_with_the_list_and_board_families(rich, courier):
+    """The words overlap half the registry: the object is pinned to
+    this/it/that and the target to the sink table, in both directions."""
+    for phrase, name in (
+            ("put milk on the shopping list", "list add"),
+            ("throw milk on the shopping list", "list add"),
+            ("cross the second one off the list", "list strike anon"),
+            ("drop the board", "board hide"),
+            ("put the board down", "board hide"),
+            ("put up the board", "board show"),
+            ("drop the timer", "cancel schedule"),
+            ("throw this on hpcomputer", "cast throw"),
+            ("send this to the desktop", "cast throw"),
+            ("put that on the board", "cast put"),
+            ("put it down", "cast drop"),
+            ("let go", "cast drop"),
+            ("hpcomputer is on my left", "cast teach"),
+            ("the right is the board", "cast teach")):
+        assert rich._match_assistant(phrase) == name, phrase
+    for phrase in ("throw a party for my sister", "send this to mom",
+                   "right is fine", "what is left", "drop everything",
+                   "put it on my calendar", "throw it away",
+                   "cast a wide net", "let it be"):
+        got = rich._match_assistant(phrase)
+        assert not (got or "").startswith("cast"), (phrase, got)
+    assert courier.throws == []
+
+
+def test_a_sentence_puts_a_live_carry_down_but_a_cast_verb_does_not(rich, courier):
+    rich.handle("what time is it", source="voice")
+    assert courier.spoken_over_calls == 1
+    rich.handle("drop it", source="voice")
+    rich.handle("throw this on the board", source="voice")
+    rich.handle("hpcomputer is on my right", source="voice")
+    rich.handle("what am i holding", source="voice")
+    assert courier.spoken_over_calls == 1
+    rich.handle("bring up the board", source="typed")
+    assert courier.spoken_over_calls == 2
+
+
+def test_a_slim_commander_with_no_services_survives_the_carry_hook():
+    c = object.__new__(Commander)
+    c._cast_spoken_over("anything at all")       # no services: a no-op

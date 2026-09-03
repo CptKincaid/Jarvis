@@ -4086,3 +4086,128 @@ model — the refusal only fires on an actual imperative.
   semicolon, a newline) is refused rather than escaped, in both directions.
 
 Restart Jarvis after editing `assistant.json`.
+
+## 83. Grab and throw: reach at the lens, close your hand, fling it
+
+His words, 2026-09-03: *"lets have a gesture added where i basically reach
+out and grab at the screen (in the air) where the camera is and then gesture
+towards almost throwing the cast onto the HPCOMPUTER."*
+
+It ships **off**, and it rides the camera preview (§ the Privacy section of
+the settings drawer): the hand stage runs *inside* the preview's own capture,
+on the frame the pane already pulled, so there is no second camera handle, no
+second thread, and every way the preview shuts — the curfew, offline mode,
+standby, the toggle, quit — shuts this too. The two hand models are the
+opencv_zoo MediaPipe palm detector and hand-landmark graphs (Apache-2.0),
+sha-verified under `~/.aiws_trainer/models/hand`; nothing here leaves the
+box and no frame is ever written or logged.
+
+### Turning it on
+
+Settings → Privacy: switch **Camera preview** on, then **Grab and throw**.
+Or in `~/.config/jarvis/assistant.json`:
+
+```json
+"camera":  {"preview": true},
+"gesture": {"enabled": true}
+```
+
+Restart after a file edit, as always. Then say nothing — do it:
+
+1. **Reach** at the lens with an open hand. He resolves what you are about
+   to pick up while your hand is still on its way (a document you just had
+   explained, the track that is playing, else the window in front of you),
+   so the grab is instant.
+2. **Close your hand** and hold it still for a third of a second. You hear
+   the *heard-you* tone first, a chip appears in the console header with
+   the name, and he says: **"Holding the thesis draft, sir."** (set
+   `gesture.speak_grab` false for tone-and-chip only). With nothing in front
+   of him there is no carry: one *held-back* tone, and only a second empty
+   grab inside ten seconds earns **"I've nothing in hand, sir."**
+3. **Fling it left or right** and open your hand. The chip slides that way
+   and the throw lands:
+   * on **the board** (the Spark's own docked panel — a CAST slab appears
+     on it, the *done* tone plays, and if the console is not on top he says
+     **"On the board, sir."**). Until you have taught him a side, *every*
+     throw goes here and he tells you once: **"That went to the board, sir.
+     Tell me which side HPCOMPUTER is on and I'll send it there."**
+   * on **HPCOMPUTER**, once taught — and today that is **held**, out loud,
+     with the live reason: **"HPCOMPUTER isn't answering, sir — no port
+     answered. I've kept it here."** (a repeat inside a minute: **"Still
+     nothing listening, sir."**). The *warning* tone plays and the payload
+     falls back to the board so you are not left holding it. The one thing
+     that *does* reach it is a playing Spotify track: **"Blue in Green, on
+     HPCOMPUTER, sir."**
+4. **Put it down** any of four ways: open your hand where it is, pull it
+   back still closed, say **"drop it"** / **"put it down"**, or wait eight
+   seconds. Each is the *held-back* tone and the chip reads *dropped*. A
+   fling at the desk is a cancel too. Any other sentence you say while
+   carrying puts it down quietly — a sentence outranks a gesture.
+
+Nothing irreversible happens on a wave. A sink that needs a read-back (the
+handoff page, and the SSH push once it exists) is only *proposed* — **"The
+thesis draft to the page, sir. Shall I send it?"** — and runs on your spoken
+yes inside a minute, the same machinery as a bulk cancel.
+
+### The same verbs by voice, camera off
+
+| say | he |
+| --- | --- |
+| "throw this on HPCOMPUTER" / "put it on the board" / "cast this to the pc" | resolves the subject now (or takes the one you are carrying) and casts it |
+| "drop it" / "put that down" / "let go" | **"Put down, sir."** — or **"I've nothing in hand, sir."** |
+| "what am I holding" / "what's in your hand" | **"Holding the thesis draft, sir."** |
+| "HPCOMPUTER is on my right" / "the left is the board" | **"Right is HPCOMPUTER from now on, sir."** — written to `gesture.sinks` |
+| "which side is HPCOMPUTER on" | **"HPCOMPUTER is on your right, sir."** or how to teach it |
+
+Targets he knows: `hpcomputer` (also "the pc", "the desktop", "the Windows
+machine"), `board` ("the board", "the spark", "my screen") and `handoff`
+("the page"). Anything else: **"I don't know a target called the fridge,
+sir."**
+
+### Which side is HPCOMPUTER?
+
+Nobody but you can see the room, so the direction map **ships empty**. One
+sentence fixes it once: *"HPCOMPUTER is on my right."* Teaching a side
+*moves* a machine, never doubles it.
+
+### What HPCOMPUTER can actually catch today (measured 2026-09-03)
+
+`192.168.50.114` answers ARP (REACHABLE: powered on, on the LAN), ping is
+100% loss, and none of 22/445/3389/5900/8008/2343 answers (00:45); 22/445/
+3389 again at 02:40 and 07:21 — a Windows firewall dropping every inbound
+packet. It is not on the tailnet. So a thrown file or screen is **held** and
+said so; a track lands by Spotify's own outbound connection. The unblocks,
+in order, are in `scratchpad/ideas/cast-target.md`: OpenSSH Server on
+HPCOMPUTER (user `h2pey`, key `~/.ssh/hpcomputer`, then `ssh hpcomputer
+whoami`), or `phone.enabled` on so the Spark serves a handoff page it can
+fetch. The SSH transport is a seam (`HpcomputerSink(transport=...)`) with
+nothing behind it until it can be tested against the real host.
+
+### Every number is a starting point
+
+The thresholds in `gesture` (fist/open bars, the reach ratio, the dwell in
+frames, the throw distances in hand-units, the 8 s carry cap) were measured
+on a synthetic hand with the LifeCam's own lens constants — never on his
+hand. The self-check prints what his hand actually measures, as numbers
+only, and shows or saves nothing:
+
+```bash
+~/vss_env/bin/python scripts/gesture_selfcheck.py --seconds 30
+```
+
+Two guesses are named in the config comments: the hand-to-face anthropometry
+behind the reach ratio (±15% on him) and the 3 s attention latch. The frame
+counters follow the rate the camera *delivers* (~7.5 fps), not the
+`preview_fps` you asked for.
+
+### If it does not fire
+
+* Settings → Privacy: both switches on, and the sensing badge reads SENSING
+  (not CAMERA OFF / OFFLINE). The console must be active — the preview stops
+  in ambient and standby.
+* `grep "gesture" /tmp/vss_voice/jarvis.log` — "no hand tracker" names the
+  missing model file; "hand tracker ready" means it loaded.
+* Look at the lens for a moment first: attention is latched for 3 s and the
+  face baseline needs three detections in the last five seconds.
+* One hand. Two hands out at the lens is not this gesture, on purpose.
+* A question on the floor (a read-back waiting on your yes) blocks a grab.

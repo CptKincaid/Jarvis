@@ -1104,7 +1104,17 @@ class JarvisApp:
             register=lambda: app.brain.register(),
         )
 
+        # Grab and throw (jarvis/gesturecast.py): the courier between the
+        # camera's hand stage and the cast sinks, and the voice verbs'
+        # target. Built here so it is on the same bag the commander and the
+        # console read; the commander itself is built AFTER this bag, so it
+        # is handed as a resolver. Side-effect free to construct: no probe,
+        # no thread, no device -- a test that builds the services opens
+        # nothing.
+        self.gesture = self._make_gesture()
+
         return SimpleNamespace(
+            gesture=self.gesture,
             desktop=desktop_ns, context=context_ns, memory=self.memory,
             # the engine itself, for the journal tool and the window
             # sampler (context= above is the narrow V1-shaped adapter)
@@ -1199,6 +1209,67 @@ class JarvisApp:
             # that compose it with music and quiet hours (jarvis/scenes.py)
             room_light=self.room_light, scenes=self.scenes, mixer=self.mixer,
         )
+
+    # ---------------------------------------------------------- the cast
+    def _make_gesture(self):
+        """The grab-and-throw courier, or None with the reason logged. A
+        gesture must not be able to stop the app from building."""
+        try:
+            from jarvis import gesturecast
+            try:
+                fps = float(self.get_option("camera.preview_fps", 6.0) or 6.0)
+            except (TypeError, ValueError):
+                fps = 6.0
+            return gesturecast.GestureCast(
+                get_option=self.get_option, set_option=self.set_option,
+                commander=lambda: getattr(self, "commander", None),
+                spotify=lambda: getattr(getattr(self, "services", None),
+                                        "spotify", None),
+                capture=lambda: self.context.capture_screen(),
+                identity=self._eye_identity,
+                # Not proactive: he is at the desk, gesturing or asking.
+                speak=lambda text: self._say(text),
+                board_show=self._board_show,
+                transfer=self._spotify_transfer,
+                preview_fps=fps)
+        except Exception:                          # noqa: BLE001 - optional lane
+            log.exception("gesture courier could not be built; the gesture "
+                          "stays off")
+            return None
+
+    def _eye_identity(self) -> str:
+        """The camera's name for whoever is in frame, "" for no opinion.
+
+        Read off the app's OWN feed when it has one (services.camera_feed
+        -> .eye, a state with ``identity`` and ``usable()``). Nothing
+        attaches a feed on this tree today and camera.identity ships off,
+        so this answers "" -- which cast() reads as NO OPINION, never a
+        veto and never a match. An irreversible sink that demands a
+        positive identity therefore refuses out loud until both exist.
+        """
+        feed = getattr(getattr(self, "services", None), "camera_feed", None)
+        eye = getattr(feed, "eye", None)
+        state = getattr(eye, "state", None)
+        if callable(state):
+            try:
+                state = state()
+            except Exception:                      # noqa: BLE001 - the eye
+                return ""
+        usable = getattr(state, "usable", None)
+        try:
+            if callable(usable) and not usable():
+                return ""
+        except Exception:                          # noqa: BLE001 - the eye
+            return ""
+        return str(getattr(state, "identity", "") or "")
+
+    def _spotify_transfer(self, device):
+        """HpcomputerSink's one working route: a TRACK moves by Spotify's
+        own outbound connection (the firewall does not block it)."""
+        sp = getattr(getattr(self, "services", None), "spotify", None)
+        if sp is None:
+            return None
+        return sp.control("transfer", value=device)
 
     # ------------------------------------------------------- brain executor
     def _on_stream_sentence(self, sentence):
@@ -3313,7 +3384,9 @@ class JarvisApp:
             presence=lambda: getattr(self, "presence", None),
             canvas=self._board_canvas_lines,
             schedule=self._board_schedule,
-            tasks=lambda: dict(getattr(self, "_board_tasks", {})))
+            tasks=lambda: dict(getattr(self, "_board_tasks", {})),
+            # the last thing he threw (jarvis/gesturecast.py), or None
+            cast=getattr(getattr(self, "gesture", None), "recent", None))
 
     def board_text(self) -> str:
         """`jarvis board` over SSH — the same state the panel draws."""
@@ -4881,6 +4954,9 @@ class JarvisApp:
             # Services dataclass declares the field; build_ui_services drops
             # what it does not, so passing it is safe in either merge order.
             board_closed=self._board_hide,
+            # Grab and throw: the courier lends the console its hand stage
+            # (rides the preview's capture) and takes the carry chip back.
+            gesture=getattr(self, "gesture", None),
             # ONE seam for the desk reading: services.desk_idle_s, the
             # DeskSentinel's cached poll. This used to read the name off
             # `self`, where it has never existed, so Services.desk_idle_s
