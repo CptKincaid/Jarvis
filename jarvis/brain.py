@@ -1318,20 +1318,32 @@ _REASONING_TAGS = r"think|thinking|reasoning|analysis|scratchpad"
 _CHANNEL_OPEN = (r"<\|channel\|>[ \t]*(?:analysis|analyses|thought|thinking|"
                  r"reasoning|commentary|scratchpad)\b")
 _CHANNEL_END = r"<\|(?:end|return|start)\|>"
+# Gemma's own thought block, with ASYMMETRIC pipes: ``<|channel>thought\n
+# {reasoning}<channel|>{answer}``. The 09-02 leak was this block with an
+# EMPTY thought, so the scrub only learned to drop the bare label; with a
+# non-empty thought the CONTENT survived both scrubs and went to TTS ahead
+# of the answer (F47, reproduced 2026-09-03: "He wants a greeting. It is 2
+# pm and the family is home." spoken to the room). The opener can be eaten
+# upstream (that is the shape that reached the log), so a buffer that
+# BEGINS with "thought" and a newline opens a block too.
+_GEMMA_OPEN = r"(?:<\|channel>[ \t]*thought\b|^[ \t]*thought[ \t]*\n)"
+_GEMMA_END = r"<channel\|>"
 # A block that has both ends. This is the ONLY form that may be cut out of
 # a half-arrived stream buffer, where "no terminator yet" means "still
 # coming", not "runs to the end of the reply".
 _CLOSED_REASONING_RX = re.compile(
     rf"<\s*({_REASONING_TAGS})\s*>.*?<\s*/\s*\1\s*>|"
-    rf"{_CHANNEL_OPEN}.*?{_CHANNEL_END}", re.I | re.S)
+    rf"{_CHANNEL_OPEN}.*?{_CHANNEL_END}|"
+    rf"{_GEMMA_OPEN}.*?{_GEMMA_END}", re.I | re.S)
 # An opener with nothing closing it. On a WHOLE reply that is the end of
 # the stream, so the rest of the text is thinking and goes with it; the
 # alternative is reading the model's monologue to the room, which is the
 # defect this whole section exists for.
 _UNCLOSED_REASONING_RX = re.compile(
-    rf"(?:<\s*(?:{_REASONING_TAGS})\s*>|{_CHANNEL_OPEN}).*$", re.I | re.S)
+    rf"(?:<\s*(?:{_REASONING_TAGS})\s*>|{_CHANNEL_OPEN}|{_GEMMA_OPEN}).*$",
+    re.I | re.S)
 _REASONING_OPEN_RX = re.compile(
-    rf"<\s*(?:{_REASONING_TAGS})\s*>|{_CHANNEL_OPEN}", re.I)
+    rf"<\s*(?:{_REASONING_TAGS})\s*>|{_CHANNEL_OPEN}|{_GEMMA_OPEN}", re.I)
 _REASONING_TAG_RX = re.compile(
     rf"<\s*/?\s*(?:{_REASONING_TAGS})\s*>", re.I)
 # A channel label, and the roles a turn header names.
@@ -3139,18 +3151,26 @@ class JarvisBrain:
             missing = held_lines_missing(spoken, held_lines)
             if missing:
                 spoken = append_spoken_lines(spoken, missing)
-                if streamed_sentences and on_sentence is not None \
-                        and not self._stale(gen):
-                    # The render round's prose went out sentence by
-                    # sentence and SPEAK will not be spoken again (the
-                    # STREAMED tag): the confirmation has to go to TTS
-                    # itself or it is written and never said.
-                    for line in missing:
-                        streamed_sentences.append(line)
-                        try:
-                            on_sentence(line)
-                        except Exception:
-                            log.exception("on_sentence failed")
+            if streamed_sentences and on_sentence is not None \
+                    and not self._stale(gen):
+                # The render round's prose went out sentence by sentence
+                # and SPEAK will not be spoken again (the STREAMED tag):
+                # the confirmation has to go to TTS itself or it is written
+                # and never said. Judged against what on_sentence actually
+                # RECEIVED, not against `spoken`: the two disagree (the
+                # stream's splitter counts "a.m." as a sentence end and
+                # spends the cap early; _finish_spoken char-caps and the
+                # stream does not), so judging on `spoken` left the line
+                # unsaid in one shape and said twice in the other (F25,
+                # reproduced 2026-09-03 both ways).
+                unheard = held_lines_missing(" ".join(streamed_sentences),
+                                             held_lines)
+                for line in unheard:
+                    streamed_sentences.append(line)
+                    try:
+                        on_sentence(line)
+                    except Exception:
+                        log.exception("on_sentence failed")
         log.info("chat reply (%.2fs wall, %.2fs ollama overhead): %s",
                  time.monotonic() - started, server_s, spoken[:80])
         tags = []
