@@ -3956,6 +3956,28 @@ recalled.
 It never guesses an address from a name, and it never picks between two
 files that fit equally well.
 
+**"Which one?" is a real question and it waits for you.** Answer it with an
+ordinal ("the second one", "the first one", "the last one", "the other
+one") or with the name itself ("the final one", "lab report final") and
+Jarvis reads that file back for the usual yes. Say "neither" and it is
+dropped. The microphone stays open for the answer, as it does for every
+other question he asks. Choosing a file confirms nothing: the read-back
+still has to be answered — and repeating the phrase that was ambiguous in
+the first place gets the question again, never a guess at which of the two
+you meant.
+
+**A yes has to come from where the question was asked.** The read-back is
+spoken at the desk, so it is answered at the desk — by voice or by typing
+into the same window. A "yes" arriving from Discord, the phone client, a
+`jarvis "..."` in a terminal or the socket never heard the question and
+sends nothing; the draft is left where it is, waiting for you.
+
+**Naming the account takes a word, not a letter.** "from my school account"
+works, and so does "sch"; a single letter does not, and neither does the
+local part of the address on its own. An unrecognised hint gets a question
+("I've no s account, sir."), never the nearest identity — sending as the
+wrong one of your three is as irreversible as sending to the wrong person.
+
 ### When it refuses
 
 * the file is a folder, is unreadable, or has gone;
@@ -4000,3 +4022,67 @@ files that fit equally well.
   to send mail; the only path is a sentence you said and a yes you gave.
 
 Restart Jarvis after editing `assistant.json`, as with every other setting.
+
+
+## 82. HPCOMPUTER: files both ways, and no shell
+
+The other machine. Five things can be said to it and no more:
+
+```
+"put the lab report on HPCOMPUTER"          a file goes over
+"get the report from HPCOMPUTER"            a file comes back
+"is HPCOMPUTER up"                          reachability
+"what's the disk on HPCOMPUTER"             one row of a fixed question list
+"run the build on HPCOMPUTER"               refused, out loud
+```
+
+Both transfers are **read back and confirmed**, with the same strict answer
+grammar the email lane uses — a passing "yeah" in a longer sentence does
+not count, "sure" is asked again rather than obeyed, and the yes has to
+come from the channel the question was asked on. A file on another machine
+cannot be taken back any more than an email can.
+
+The last line is the point of the lane: there is no path from speech to a
+shell on that box. "Delete the logs on the HP" and "delete the block on the
+HP" differ by one phoneme and only one of them is recoverable, so neither
+runs. A sentence that merely mentions the machine ("the build failed on the
+HP", "did you install anything on the HP") is left alone and goes to the
+model — the refusal only fires on an actual imperative.
+
+### Configuration
+
+```json
+"remote": {
+  "enabled": false,
+  "host": "",
+  "user": "",
+  "key_path": "",
+  "name": "HPCOMPUTER",
+  "socks_proxy": "127.0.0.1:1055",
+  "inbox": "~/jarvis-inbox",
+  "pull_dirs": {"outbox": "~/jarvis-outbox",
+                "desktop": "~/Desktop",
+                "downloads": "~/Downloads"},
+  "max_mb": 100
+}
+```
+
+* `enabled` ships **false**, and every door says exactly what is missing
+  rather than opening a socket to find out.
+* `host` is HPCOMPUTER's tailnet name, `user` the account there, `key_path`
+  a key **ssh already owns** — Jarvis never reads it, only hands over its
+  path, so no new secret enters `assistant.json`.
+* `socks_proxy` is not a preference. tailscaled on the Spark runs
+  `--tun=userspace-networking`, so there is no route to the tailnet at all
+  and everything goes through the daemon's own SOCKS5 port. Blank it only
+  if this box ever gets a real tun device.
+* `inbox` is the **only** folder a push can land in, and `pull_dirs` the
+  only ones a pull may read. Speech never names a remote path: the spoken
+  words pick a *key* ("desktop"), never a directory.
+* The paths may start with `~`; Jarvis writes them the two different ways
+  the far side needs (`$HOME` for a shell, home-relative for scp). Do not
+  quote them yourself.
+* A local file whose *name* contains a shell character (a backtick, a
+  semicolon, a newline) is refused rather than escaped, in both directions.
+
+Restart Jarvis after editing `assistant.json`.

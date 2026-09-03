@@ -602,13 +602,31 @@ def account_label(account: dict) -> str:
         str((account or {}).get("address") or "").partition("@")[0]
 
 
+# A hint shorter than this is not a name, it is a letter Whisper kept out
+# of a longer word. Measured against his three accounts, the old prefix
+# pass resolved "s" -> school, "w" -> work and "p" -> personal, and the
+# local-part leg turned "hp" -- the first half of HPCOMPUTER -- into his
+# school identity. Three characters is short enough that every label he
+# actually has -- "work", "school", "personal" -- still resolves from a
+# prefix, and long enough that a stray letter resolves nothing.
+MIN_ACCOUNT_HINT = 3
+
+
 def account_by_label(accounts: list[dict], hint: str) -> Optional[dict]:
     """The account a spoken hint names, or None.
 
-    Matches the label ("work"), the address, or the local part -- exactly,
-    then as a prefix. Never fuzzily: sending from the wrong identity is one
-    of the two irreversible halves of this feature, so an unrecognised hint
-    must produce a question, not a near miss.
+    Matches the label ("work") or the full address, exactly; then the label
+    as a PREFIX, and only for a hint long enough to be a word. Never
+    fuzzily: sending from the wrong identity is one of the two irreversible
+    halves of this feature, so an unrecognised hint must produce a
+    question, not a near miss.
+
+    Two legs the docstring used to promise and the code did not keep are
+    gone. The bare local part ("hunter", "hp") is no longer a match on its
+    own -- it is not how he names an identity, and it collides with the
+    other machine's name; the full address still is. And the reverse prefix
+    (``want.startswith(label)``) is gone with it: it made "worked" mean
+    work, which is a near miss by any reading.
     """
     want = " ".join(str(hint or "").split()).lower()
     if not want or not accounts:
@@ -616,13 +634,13 @@ def account_by_label(accounts: list[dict], hint: str) -> Optional[dict]:
     for account in accounts:
         label = account_label(account).lower()
         addr = str(account.get("address") or "").lower()
-        if want in (label, addr, addr.partition("@")[0]):
+        if want == label or (addr and want == addr):
             return account
-    for account in accounts:
-        label = account_label(account).lower()
-        if label and (label.startswith(want) or want.startswith(label)):
-            return account
-    return None
+    if len(want) < MIN_ACCOUNT_HINT:
+        return None
+    hits = [a for a in accounts
+            if account_label(a).lower().startswith(want)]
+    return hits[0] if len(hits) == 1 else None
 
 
 def choose_account(accounts: list[dict], hint: str = "",

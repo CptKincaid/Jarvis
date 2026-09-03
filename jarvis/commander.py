@@ -4856,8 +4856,20 @@ _REMOTE_FREEFORM_RX = re.compile(
 # Words that make a phrase an ORDER rather than a mention. "how's HPCOMPUTER"
 # is a question the status door already took; "is HPCOMPUTER a good machine"
 # is conversation and belongs to the model.
+#
+# ANCHORED at the head of the clause, which an unanchored `search` was not,
+# and that difference is the whole of the door's manners. An order is an
+# IMPERATIVE -- the verb comes first. A clause that merely CONTAINS one of
+# these words is a question or a report, and every one of these was being
+# refused out loud: "did you install anything on the HP", "have you run the
+# tests on the HP", "I need to update the HP", "the build failed on the HP",
+# "remind me to run the backup on the HP". The last is worse than noise --
+# it is a reminder he asked for and did not get. Same rule _SEND_NOT_RX
+# applies to the mail lane, stated as an anchor rather than a veto list.
 _REMOTE_ORDER_RX = re.compile(
-    r"\b(?:run|start|stop|restart|reboot|shut\s*down|kill|delete|remove|rm\b|"
+    r"^(?:(?:please|just|go\s+ahead\s+and|can\s+you|could\s+you|"
+    r"would\s+you|will\s+you)[,\s]+)*"
+    r"(?:run|start|stop|restart|reboot|shut\s*down|kill|delete|remove|rm\b|"
     r"install|update|upgrade|build|make|compile|deploy|launch|open|execute|"
     r"format|wipe|clear|empty|move|rename|chmod|sudo)\b", re.I)
 
@@ -4969,10 +4981,17 @@ def _h_remote_query(c, t, m):
                          reply=f"On {conf.name}, {say}: {body}.")
 
 
-def _remote_ask_which(c, conf, names, verb: str):
-    """More than one file could be meant. ASK -- never pick the newer one."""
+def _remote_ask_which(c, conf, names, resume):
+    """More than one file could be meant. ASK -- never pick the newer one.
+
+    Parked in the shared "Which one?" slot (``stash_filepick``) so the
+    answer can actually be heard: without it the question was spoken, the
+    follow-up microphone got the short window, and "the second one" was
+    classified as background chat and dropped in silence.
+    """
     line = (f"I've more than one that could be, sir: "
             f"{filepick.describe(names)}. Which one?")
+    c.stash_filepick(names, resume)
     return CommandResult(handled=True, reply=line, speak=True,
                          status="Which one?")
 
@@ -4988,28 +5007,45 @@ def _h_remote_push(c, t, m):
     if blocked is not None:
         return blocked
     said = (m.group("what") or "").strip()
+
+    def _armed(path):
+        """Read the transfer back and wait. STRICT: the yes that spends this
+        is parse_send_answer's end-anchored grammar, not parse_yes_no --
+        a file on another machine is as irreversible as one in an email."""
+        if not remote_mod.inbox_target(conf, path.name):
+            return _remote_fail(conf, "odd-name", "Bad name")
+        question = f"Send {path.name} to {conf.name}'s inbox, sir?"
+
+        def _run():
+            res = remote_mod.push(conf, path)
+            if not res.ok:
+                return _remote_fail(conf, res.reason)
+            return CommandResult(handled=True, speak=True,
+                                 status=f"Sent to {conf.name}",
+                                 reply=f"{path.name} is on {conf.name}, sir.")
+
+        c.stash_destructive(_run, question, strict=True)
+        return CommandResult(handled=True, reply=question, speak=True,
+                             status="Confirm?")
+
     pick = _remote_resolve_local(said, conf)
     if pick.ambiguous:
-        return _remote_ask_which(c, conf, pick.candidates, "send")
+        def _resume(path):
+            again = _remote_resolve_local(str(path), conf)
+            if not again.ok:
+                size_mb = getattr(again, "size", 0) / (1024 * 1024)
+                return CommandResult(
+                    handled=True, speak=True, status="No such file",
+                    reply=filepick.reason_line(again.reason, conf.max_mb,
+                                               size_mb))
+            return _armed(again.path)
+        return _remote_ask_which(c, conf, pick.candidates, _resume)
     if not pick.ok:
         size_mb = getattr(pick, "size", 0) / (1024 * 1024)
         return CommandResult(handled=True, speak=True, status="No such file",
                              reply=filepick.reason_line(pick.reason,
                                                         conf.max_mb, size_mb))
-    path = pick.path
-    question = (f"Send {path.name} to {conf.name}'s inbox, sir?")
-
-    def _run():
-        res = remote_mod.push(conf, path)
-        if not res.ok:
-            return _remote_fail(conf, res.reason)
-        return CommandResult(handled=True, speak=True,
-                             status=f"Sent to {conf.name}",
-                             reply=f"{path.name} is on {conf.name}, sir.")
-
-    c.stash_destructive(_run, question)
-    return CommandResult(handled=True, reply=question, speak=True,
-                         status="Confirm?")
+    return _armed(pick.path)
 
 
 def _h_remote_pull(c, t, m):
@@ -5028,28 +5064,37 @@ def _h_remote_pull(c, t, m):
         return CommandResult(handled=True, speak=True, status="Empty",
                              reply=f"There's nothing in {conf.name}'s "
                                    f"{key}, sir.")
+
+    def _armed(name: str):
+        dest = remote_mod.pull_target(conf, name)
+        question = (f"Bring {name} from {conf.name} to your "
+                    f"{dest.parent.name}, sir?")
+
+        def _run():
+            res = remote_mod.pull(conf, key, name)
+            if not res.ok:
+                return _remote_fail(conf, res.reason)
+            return CommandResult(handled=True, speak=True, status="Fetched",
+                                 reply=f"{name} is on your "
+                                       f"{dest.parent.name}, sir.")
+
+        # STRICT, for the same reason the push is: this one lands a
+        # stranger's file on HIS disk and can overwrite nothing, but it is
+        # still a transfer he must have actually said yes to.
+        c.stash_destructive(_run, question, strict=True)
+        return CommandResult(handled=True, reply=question, speak=True,
+                             status="Confirm?")
+
     pick = remote_mod.match_remote(said, names)
     if pick.ambiguous:
-        return _remote_ask_which(c, conf, pick.candidates, "fetch")
+        return _remote_ask_which(
+            c, conf, pick.candidates,
+            lambda path: _armed(Path(path).name))
     if not pick.ok:
         return CommandResult(handled=True, speak=True, status="No such file",
                              reply=f"I can't see anything by that name in "
                                    f"{conf.name}'s {key}, sir.")
-    name = pick.path.name
-    dest = remote_mod.pull_target(conf, name)
-    question = f"Bring {name} from {conf.name} to your {dest.parent.name}, sir?"
-
-    def _run():
-        res = remote_mod.pull(conf, key, name)
-        if not res.ok:
-            return _remote_fail(conf, res.reason)
-        return CommandResult(handled=True, speak=True, status="Fetched",
-                             reply=f"{name} is on your "
-                                   f"{dest.parent.name}, sir.")
-
-    c.stash_destructive(_run, question)
-    return CommandResult(handled=True, reply=question, speak=True,
-                         status="Confirm?")
+    return _armed(pick.path.name)
 
 
 def _h_remote_freeform(c, t, m):
@@ -5066,7 +5111,7 @@ def _h_remote_freeform(c, t, m):
     """
     conf = _remote_conf(c)
     said = _oracle_group(m, "cmd", "cmd2", "cmd3")
-    if not said or not _REMOTE_ORDER_RX.search(said):
+    if not said or not _REMOTE_ORDER_RX.match(said.strip()):
         # A mention, not an order ("the music's playing on HPCOMPUTER"):
         # not this lane's business, so it goes to the model.
         return None
@@ -5149,8 +5194,12 @@ _SEND_NOT_RX = re.compile(
     r"|" + _SEND_VERB + r"\s+(?:\w+\s+){0,2}?"
     r"(?:a |an |the |my |your )?"
     r"(?:reminder|invite|invitation|meeting|link|url|password|money|"
-    r"payment|song|track|playlist|location|weather|apolog|regards|love|"
-    r"thanks|note to self)\b",
+    # `apolog` was the one stem here, and \b after it never matched:
+    # "apolog" + "y" is not a word boundary, so "send an apology to my
+    # professor" reached the send lane and was answered "I can't find a
+    # file by that name, sir." Both endings, spelled out.
+    r"payment|song|track|playlist|location|weather|apolog(?:y|ies)|"
+    r"regards|love|thanks|note to self)\b",
     re.I)
 
 # The read-back's answer, with its OWN end-anchored grammar and NOT
@@ -5162,7 +5211,13 @@ _SEND_NOT_RX = re.compile(
 # accident cannot be undone, so this grammar is the briefing offer's shape
 # and a NARROWER vocabulary: an answer here is the word, a courtesy, and
 # nothing else.
-_SEND_TAIL = (r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|"
+# The separator is [.!?,\s]+ and not [,\s]+ because Whisper punctuates:
+# "Yes. Thank you." is one of his own logged answers (jarvis.log.1:17109)
+# and a comma-only separator made the full stop end the sentence, so a
+# clean yes fell through to the silent-drop branch while "yes, thank you"
+# worked. The words that may follow are unchanged -- this widens the
+# PUNCTUATION, not the vocabulary.
+_SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|"
               r"it|that|send it|send that|go ahead|do it))*[?.!]*$")
 # "ok" / "okay" / "sure" / "alright" are deliberately ABSENT. They are the
 # words a man says while still reading the read-back, and this is the one
@@ -5188,6 +5243,86 @@ _SEND_MAYBE_RX = re.compile(
     r"i think so|if you like|why not)" + _SEND_TAIL, re.I)
 
 
+# ---- "Which one, sir?" ---------------------------------------------------
+# BOTH file lanes ask this ("I've 2 that could be the lab report, sir: lab
+# report.pdf or lab report final.pdf. Which one?") and until now neither
+# could hear the answer: prepare() returned a question with no draft, so
+# nothing was parked, question_open() stayed False, the app sized the
+# follow-up microphone at 4 s, and "the final one" was then classified as
+# background chat and dropped in SILENCE. That is the same failure his
+# issue #8 was about, and it lands on the exact case the ambiguous branch
+# was written for -- lab_report.pdf against lab_report_final.pdf.
+#
+# So the offer is parked, like every other question Jarvis asks, and this
+# is its grammar. Deliberately narrow: an ordinal, or a name that scores
+# clearly against ONE of the candidates it just read out. Anything else
+# drops the slot and keeps its own meaning -- a wrong pick here sends the
+# wrong file, which is the mistake the question exists to prevent.
+FILEPICK_TTL_S = 45.0
+
+_PICK_ORDINALS = {"first": 0, "1st": 0, "one": 0, "1": 0,
+                  "second": 1, "2nd": 1, "two": 1, "2": 1, "other": 1,
+                  "third": 2, "3rd": 2, "three": 2, "3": 2,
+                  "fourth": 3, "4th": 3, "four": 3, "4": 3,
+                  "fifth": 4, "5th": 4, "five": 4, "5": 4}
+_PICK_ORDINAL_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:(?:the|number|no\.?|option)\s+)*"
+    r"(?P<n>first|second|third|fourth|fifth|last|latest|newest|other|"
+    r"1st|2nd|3rd|4th|5th|one|two|three|four|five|[1-5])"
+    r"(?:\s+one)?(?:[,\s]+(?:please|sir|jarvis|thanks))*[\s,.!?]*$", re.I)
+_PICK_CANCEL_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:no|nope|nah|neither|none|not (?:that|those|"
+    r"either|any)|cancel|stop|forget it|never ?mind|leave it|"
+    r"don'?t bother|skip it)\b", re.I)
+
+
+def pick_from_answer(text, candidates) -> tuple:
+    """(the candidate he named, was it a near miss).
+
+    Two readings and no third. An ORDINAL ("the second one", "the last
+    one", "the other one") indexes the list exactly as it was read out. A
+    NAME is scored against the candidates with the same scorer that offered
+    them, and has to beat its nearest rival by more than
+    ``filephrase.TIE_SCORE`` -- the very band that called these two
+    ambiguous in the first place. Anything narrower would let him repeat
+    the ambiguous phrase and get a guess, which is the mistake the question
+    exists to prevent.
+
+    (None, True) is the near miss: he was plainly naming one of them and
+    the margin was not there. The caller asks once more rather than
+    dropping it in silence. (None, False) is "not an answer at all".
+    """
+    said = " ".join(str(text or "").split())
+    cands = [Path(c) for c in (candidates or ())]
+    if not said or not cands:
+        return None, False
+    m = _PICK_ORDINAL_RX.match(said)
+    if m:
+        word = m.group("n").lower()
+        if word in ("last", "latest", "newest"):
+            return cands[-1], False
+        # "the other one" is only meaningful when there are exactly two.
+        if word == "other" and len(cands) != 2:
+            return None, True
+        idx = _PICK_ORDINALS.get(word)
+        if idx is not None and idx < len(cands):
+            return cands[idx], False
+        return None, True
+    trimmed = re.sub(r"^(?:jarvis[,\s]+)?(?:the\s+)?", "", said, flags=re.I)
+    trimmed = re.sub(r"\s+(?:one|file|please|sir)\b[\s,.!?]*$", "", trimmed,
+                     flags=re.I).strip(" ,.!?")
+    if not trimmed:
+        return None, False
+    scored = sorted(((filepick.score(trimmed, c.name), c) for c in cands),
+                    key=lambda t: (-t[0], len(t[1].name), t[1].name))
+    if scored[0][0] < filepick.FUZZY_FLOOR:
+        return None, False
+    tie = getattr(_filephrase, "TIE_SCORE", 0.12) if _filephrase else 0.12
+    if len(scored) > 1 and scored[1][0] > scored[0][0] - tie:
+        return None, True
+    return scored[0][1], False
+
+
 def parse_send_answer(text) -> Optional[bool]:
     """True / False / None for a read-back answer. None is "not an answer".
 
@@ -5204,36 +5339,112 @@ def parse_send_answer(text) -> Optional[bool]:
     return None
 
 
-def _h_send_file(c, t, m):
-    """Arm a file send and read it back. Nothing is sent from here."""
+def _send_file_pieces(c, t, m=None):
+    """The pieces of a send-a-file request -- or None, meaning this lane has
+    no claim on the sentence and it keeps whatever meaning it already had.
+
+    ONE claim rule, used by the handler AND by the intent-gate probe
+    (``Commander._match_assistant``), so the two cannot disagree about what
+    counts as a send. The gate is why it matters: a Tier-1 name match turns
+    the classifier OFF, and the raw ``_SEND_FILE_RX`` is far too generous to
+    be that switch on its own.
+
+    Three tests, cheapest first:
+
+    1. the NEGATIVE table gets first refusal, as it always did -- but now
+       BEFORE the gate is switched off rather than after, so "send my
+       regards to Heather" and "send a text to Heather" are background
+       chat again instead of sentences the model answers out loud;
+    2. the RECIPIENT is resolved BEFORE the file, because that is the half
+       that says whether the sentence was addressed to Jarvis at all.
+       "Send the kids to bed", "send flowers to my mom", "share my screen
+       with the class" all fit shape A perfectly and name nobody he can
+       write to. Shape B always demanded this; shape A never did, and it
+       claimed 28 of 33 everyday sentences measured against it;
+    3. a recipient that does not resolve is fatal -- UNLESS the file phrase
+       names something really on his disk. That exception is the whole
+       reason "email the biosensors handout to Dana" is still answered
+       "I've no address for Dana, sir. What is it?" instead of vanishing:
+       he named a real file, so he was plainly talking to me.
+    """
     if _SEND_NOT_RX.search(t):
-        log.info("send-file: %r is not a send-a-file request", t)
         return None
     cfg = c._svc("assistant")
     if cfg is None:
+        return None
+    lm = m or _SEND_FILE_RX.match(t)
+    if lm is None:
         return None
     # The lower-cased match gives the SHAPE; the file name has to come back
     # from the original casing, or "Lab_Report.pdf" is looked for as
     # "lab_report.pdf" -- which is a different file on a case-sensitive
     # filesystem and no file at all on the day he has both.
     raw = _raw_cmd_text(c)
-    rm = _SEND_FILE_RX.match(raw) or m
-    shape_a = bool(m.group("file_a"))
+    rm = (_SEND_FILE_RX.match(raw) if raw else None) or lm
+    shape_a = bool(lm.group("file_a"))
     said_file = (rm.group("file_a") or rm.group("file_b") or "").strip()
     who = (rm.group("who_a") or rm.group("who_b") or "").strip()
     hint = (rm.group("acct") or "").strip()
     memory = c._svc("memory")
-    if not shape_a:
-        # Shape B is loose enough to swallow "send me the weather". Only a
-        # recipient Jarvis can actually address makes it a file send; for
-        # anyone else the utterance keeps its own meaning and goes on to
-        # the router, which is where "send me the weather" belongs.
-        addr, _ = outbox.resolve_recipient(cfg, memory, who)
-        if not addr:
+    addr, _ = outbox.resolve_recipient(cfg, memory, who)
+    if not addr:
+        if not shape_a:
             log.info("send-file: %r names no one I can write to", who)
             return None
-    prep = outbox.prepare(cfg, memory, said_file, who, account_hint=hint)
+        if not outbox.names_a_real_file(cfg, said_file):
+            log.info("send-file: %r names neither a file nor a correspondent",
+                     t[:60])
+            return None
+    return said_file, who, hint, addr
+
+
+def _send_file_offer(c, prep, who: str, hint: str):
+    """"Which one, sir?", parked so the answer can be heard.
+
+    Without the slot this branch was a dead end: the question was spoken,
+    nothing was armed, the follow-up microphone got the short window and
+    every natural answer ("the final one", "lab report final") was then
+    called background chat and dropped without a word.
+    """
+    cfg = c._svc("assistant")
+
+    def _resume(path):
+        again = outbox.prepare(cfg, c._svc("memory"), str(path), who,
+                               account_hint=hint, chosen=path)
+        if again.draft is None:
+            return CommandResult(handled=True, reply=again.ask, speak=True,
+                                 status=again.status)
+        c.stash_send(again.draft)
+        return CommandResult(handled=True, speak=True, status=again.status,
+                             reply=outbox.read_back(again.draft))
+
+    c.stash_filepick(prep.candidates, _resume)
+    return CommandResult(handled=True, reply=prep.ask, speak=True,
+                         status=prep.status)
+
+
+def _h_send_file(c, t, m):
+    """Arm a file send and read it back. Nothing is sent from here."""
+    pieces = _send_file_pieces(c, t, m)
+    if pieces is None:
+        log.info("send-file: %r is not a send-a-file request", t)
+        return None
+    said_file, who, hint, _addr = pieces
+    # ONE read-back at a time. Every ordinary path spends _pending_send in
+    # _try_send_confirm before a second send can arm, so this is reached
+    # only inside a single turn -- the compound "email A to Heather and
+    # email B to Heather", where arming twice speaks two questions and
+    # leaves only the second one answerable.
+    live = getattr(c, "_pending_send", None)
+    if live is not None and not live.stale():
+        return CommandResult(handled=True, speak=True, status="One at a time",
+                             reply="There's one waiting on your yes already, "
+                                   "sir; that one first.")
+    prep = outbox.prepare(c._svc("assistant"), c._svc("memory"), said_file,
+                          who, account_hint=hint)
     if prep.draft is None:
+        if prep.candidates:
+            return _send_file_offer(c, prep, who, hint)
         return CommandResult(handled=True, reply=prep.ask, speak=True,
                              status=prep.status)
     c.stash_send(prep.draft)
@@ -7378,7 +7589,13 @@ REGISTRY: list[Command] = [
     Command("remote pull", _REMOTE_PULL_RX.match, _h_remote_pull),
     Command("remote status", _REMOTE_STATUS_RX.match, _h_remote_status),
     Command("remote query", _REMOTE_QUERY_RX.match, _h_remote_query),
-    Command("remote freeform", _REMOTE_FREEFORM_RX.match, _h_remote_freeform),
+    # ...and the refusal door is NOT here. It is the loosest matcher in the
+    # family (any clause of 2-120 characters beside the host's name), and
+    # sitting at this index it outranked "list add" and "remind me": "clear
+    # the shopping list on my desktop computer" was refused instead of
+    # clearing the list. It is registered below both of them instead, so
+    # every command that has a real answer is tried first and only then is
+    # an order to the other machine refused. Its entry is below "remind me".
     # Email a file (jarvis/outbox.py). AFTER the HPCOMPUTER family: "send
     # the budget to HPCOMPUTER" is a transfer and `remote push` must have
     # it, and _SEND_NOT_RX names _HPC again so the two guards are
@@ -7459,6 +7676,10 @@ REGISTRY: list[Command] = [
             needs=("context",)),
     Command("quick command", _m_quick_command, _h_quick_command),
     Command("remind me", _REMIND_RX.match, _h_remind_me),
+    # HPCOMPUTER's refusal door, moved down out of its own family (see the
+    # note there). LAST thing that may claim a sentence naming the host:
+    # everything above it either answers the request or leaves it alone.
+    Command("remote freeform", _REMOTE_FREEFORM_RX.match, _h_remote_freeform),
     # ambient (jarvis/quiet.py): before "free" so "I'm free until seven"
     # does not read as a DND request, and status before the hours setter.
     # "room tone" comes first of all: "stop the room tone" must not be read
@@ -7575,6 +7796,17 @@ ASSISTANT_TIER1: list[Command] = [
                     # hotword, like every other surface question
                     "oracle status", "oracle logs", "oracle action",
                     "oracle service", "oracle freeform",
+                    # HPCOMPUTER, for exactly the reason the Oracle five are
+                    # here and by the same oversight that kept them out
+                    # once: the hotword eats the wake word, so "put the lab
+                    # report on HPCOMPUTER" arrives bare, the prefixed
+                    # registry pass never runs on it, and every one of the
+                    # five doors was unreachable by voice -- three dropped
+                    # by the intent gate, two handed to the model. The
+                    # refusal door is here too, because a refusal he cannot
+                    # hear is not the safety story this lane claims.
+                    "remote push", "remote pull", "remote status",
+                    "remote query", "remote freeform",
                     "log triage", "whats wrong", "quietly", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router
@@ -7585,6 +7817,40 @@ ASSISTANT_TIER1: list[Command] = [
                     # and nobody says "jarvis" before a sum.
                     "math",
                     "read control")
+]
+
+
+def _tier1_send_file(t):
+    """The Tier-1 probe for the one irreversible family in the app.
+
+    A Tier-1 name match switches the intent classifier OFF for the whole
+    utterance (``_handle_inner``: "tier-1 match %r bypasses the intent
+    gate"), so whatever matcher stands here IS the gate for this family --
+    and the raw ``_SEND_FILE_RX`` is far too generous to be it. Unaddressed
+    speech of the shape "send X to Y" armed a live draft and read it back
+    out loud, and a backchannel "yeah" then sent the file; sentences the
+    negative table exists to veto ("send my regards to Heather", "send a
+    text to Heather", "send the money to Ali") bypassed the gate too and
+    were answered by the model instead of dropped as background chat.
+
+    So the veto runs HERE, before the gate is switched off, rather than
+    only inside the handler afterwards. The registry keeps the wide
+    matcher: a sentence he prefixed with "jarvis" was addressed to me by
+    construction and needs no gate at all.
+
+    The rest of the claim rule -- a recipient he can actually write to, or
+    a file that is really on his disk -- needs services a matcher does not
+    get, so ``Commander._match_assistant`` applies it beside this.
+    """
+    if _SEND_NOT_RX.search(t):
+        return None
+    return _SEND_FILE_RX.match(t)
+
+
+ASSISTANT_TIER1 = [
+    cmd if cmd.name != "send file"
+    else Command(cmd.name, _tier1_send_file, cmd.handler, cmd.needs)
+    for cmd in ASSISTANT_TIER1
 ]
 
 
@@ -8123,6 +8389,23 @@ class Commander:
     _last_undo: Optional[tuple] = None
     _confidence: Optional[float] = None
     _pending_destructive: Optional[tuple] = None
+    # (source, strict, the tuple it describes) for the slot above. Kept
+    # BESIDE the tuple rather than inside it because the tuple's 3-item
+    # shape is written and read all over the app and its tests; the `ref`
+    # leg means stale metadata can never be applied to a slot somebody set
+    # by hand -- an unrecognised tuple falls back to the old, lenient rules.
+    _pending_destructive_meta: Optional[tuple] = None
+    # (candidates, resume, source, made_at) for "Which one, sir?"
+    _pending_filepick: Optional[tuple] = None
+    # The source of the turn being handled, so a question armed inside a
+    # handler knows which channel it was asked on.
+    _turn_source: str = "voice"
+    # Set by the rungs that answer one of THIS commander's own questions,
+    # read by _drop_stranded_questions.
+    _answered_pending: bool = False
+    # One re-ask per STRICT read-back, the same one-shot the send draft
+    # carries on itself. Reset when the offer is armed and when it is spent.
+    _strict_reasked: bool = False
     _pending_objection: Optional[tuple] = None
     _pending_send: Any = None                 # outbox.Draft awaiting a yes
     _objection_timer = None
@@ -8184,6 +8467,11 @@ class Commander:
         self._confidence: Optional[float] = None
         # A read-back waiting for a yes: (run, spoken line, stamp).
         self._pending_destructive: Optional[tuple] = None
+        self._pending_destructive_meta: Optional[tuple] = None
+        self._pending_filepick: Optional[tuple] = None
+        self._turn_source = "voice"
+        self._answered_pending = False
+        self._strict_reasked = False
         self._pending_send = None
         # He advised against something and asked "shall I set it anyway?":
         # (run, spoken line, Objection, stamp). Its own slot because its
@@ -8253,7 +8541,14 @@ class Commander:
             return CommandResult(handled=False, status="No speech detected")
         with self._turn_lock:
             self._confidence = confidence
+            self._turn_source = source
+            armed = (getattr(self, "_pending_send", None),
+                     getattr(self, "_pending_filepick", None),
+                     getattr(self, "_pending_destructive", None),
+                     getattr(self, "_pending_destructive_meta", None))
+            self._answered_pending = False
             result = self._handle_inner(text, source)
+            self._drop_stranded_questions(armed, result, source)
             # A correction / re-run answers a different utterance: THAT is
             # the last turn, so a second "no, I said ..." corrects the
             # right text.
@@ -8264,6 +8559,53 @@ class Commander:
             if undo is not None:
                 self._last_undo = (undo, time.monotonic())
         return result
+
+    def _drop_stranded_questions(self, armed: tuple, result,
+                                 source: str = "voice") -> None:
+        """A question of MINE that survived a turn somebody ELSE answered is
+        dropped, not left armed for the next yes-shaped sentence.
+
+        Every pending rung clears its own slot before it does anything, and
+        each is written as if it were the only one on the floor. But a
+        ringing kitchen timer, a Claude permission prompt, an alarm offer
+        and the first-wake briefing offer all arrive OUT OF BAND, and each
+        of them sits ABOVE the read-back rungs and returns before they run.
+        Measured: with a draft armed, "yes" answered a parked alarm offer,
+        set the alarm -- and left the draft live for the rest of its 90 s,
+        so the NEXT yes-shaped utterance, aimed at anything at all, sent
+        the file. Same for the study offer, the briefing offer and "stop"
+        to a ringing timer.
+
+        The rungs that DID answer set ``_answered_pending``; anything else
+        that consumed the turn spends the questions it talked over. Identity
+        comparison, not truthiness: a question armed DURING this turn is a
+        new object and is left alone.
+
+        A turn from ANOTHER ROOM spends nothing. A Discord message or a
+        tmux turn could not have answered a question put out loud at the
+        desk, so it is not its cancellation either -- the question stays
+        parked for the channel it was asked on, which is the same rule the
+        confirm rungs themselves apply.
+        """
+        if self._answered_pending or result is None:
+            return
+        send, pick, destructive, meta = armed
+        if send is not None and getattr(self, "_pending_send", None) is send \
+                and self._same_room(getattr(send, "asked_from", "voice"), source):
+            log.info("send read-back dropped: the turn was answered elsewhere")
+            self._pending_send = None
+        if pick is not None and getattr(self, "_pending_filepick", None) is pick \
+                and self._same_room(pick[2] if len(pick) == 5 else "voice", source):
+            log.info("which-one dropped: the turn was answered elsewhere")
+            self._pending_filepick = None
+        asked = meta[0] if (isinstance(meta, tuple) and len(meta) == 3
+                            and meta[2] is destructive) else ""
+        if destructive is not None and \
+                getattr(self, "_pending_destructive", None) is destructive \
+                and (not asked or self._same_room(asked, source)):
+            log.info("read-back dropped: the turn was answered elsewhere")
+            self._pending_destructive = None
+            self._pending_destructive_meta = None
 
     def shaky_transcript(self) -> bool:
         """The utterance being handled scraped in under confirm.shaky_logprob."""
@@ -8315,6 +8657,18 @@ class Commander:
             except Exception:  # noqa: BLE001 - a slim/duck-typed draft
                 log.debug("question_open: send draft staleness failed",
                           exc_info=True)
+        # "Which one, sir?" -- the ambiguous-file question both file lanes
+        # ask. It holds the floor exactly as the read-back does: it is a
+        # question Jarvis put out loud and is waiting on, and while it was
+        # missing from this list the app gave its answer the 4 s window and
+        # the strict confidence gate instead of the 15 s question window.
+        pick = getattr(self, "_pending_filepick", None)
+        if isinstance(pick, tuple) and len(pick) == 5:
+            try:
+                if time.monotonic() - float(pick[3]) <= FILEPICK_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                pass
         # A read-back ("Cancel all three alarms, sir?") and the objection
         # ("Shall I set it anyway?") both hold the floor for DESTRUCTIVE_TTL_S.
         for name, size in (("_pending_destructive", 3), ("_pending_objection", 4)):
@@ -8384,10 +8738,56 @@ class Commander:
         self._leave_touch = time.monotonic()
         return True
 
-    def stash_destructive(self, run: Callable[[], CommandResult], line: str):
+    def stash_destructive(self, run: Callable[[], CommandResult], line: str,
+                          strict: bool = False):
         """A handler read an action back instead of doing it; the next yes
-        runs it (``_try_destructive_confirm``)."""
+        runs it (``_try_destructive_confirm``).
+
+        ``strict`` swaps the answer grammar for ``parse_send_answer`` -- the
+        end-anchored one the mail lane was built with -- and adds its one
+        re-ask on a vague word. Pass it for anything as irreversible as an
+        email: the two HPCOMPUTER transfers do, and they are the reason the
+        flag exists. ``parse_yes_no`` waives its overheard-speech guard
+        whenever the first word is a yes word and counts "sure" as one, so
+        "Yeah, so you should be able to look that up." -- a real line from
+        his log that answered nothing -- spent a read-back once already.
+        Cancelling three alarms that way is a bad afternoon; putting a file
+        on another machine that way cannot be taken back.
+        """
         self._pending_destructive = (run, line, time.monotonic())
+        self._pending_destructive_meta = (self._turn_source, bool(strict),
+                                          self._pending_destructive)
+        self._strict_reasked = False
+        # The mirror of stash_send's clear. Two questions can never share
+        # one yes, and until now that invariant held in one direction only
+        # -- by the accident that _try_send_confirm sits above this rung
+        # and drops its draft on any non-answer. A read-back armed outside
+        # handle() (a proactive offer) had no such accident protecting it.
+        self._pending_send = None
+
+    def stash_filepick(self, candidates, resume: Callable):
+        """"Which one, sir?" -- park the rivals so the answer can be heard.
+
+        ``resume(path)`` carries on with the candidate he names and returns
+        the CommandResult for that turn; for both lanes it ends in the
+        ordinary read-back, so choosing a file still confirms nothing.
+
+        This is the slot whose absence made the ambiguous branch a silent
+        dead end: the question was asked, nothing was parked,
+        ``question_open()`` said no, the app gave the follow-up microphone
+        the short window and the answer was then dropped as background chat.
+        """
+        keep = [Path(c) for c in (candidates or ())]
+        if not keep:
+            self._pending_filepick = None
+            return
+        self._pending_filepick = (keep, resume, self._turn_source,
+                                  time.monotonic(), False)
+        # One question on the floor at a time, the same rule stash_send and
+        # stash_destructive keep between themselves.
+        self._pending_send = None
+        self._pending_destructive = None
+        self._pending_destructive_meta = None
 
     def stash_send(self, draft):
         """A file send was read back; only an explicit yes spends it.
@@ -8399,12 +8799,35 @@ class Commander:
         has a narrower grammar of its own (``parse_send_answer``) and one
         re-ask for a vague answer.
         """
+        try:
+            draft.asked_from = self._turn_source
+        except Exception:  # noqa: BLE001 - a slim/duck-typed draft in a test
+            log.debug("stash_send: draft would not record its source",
+                      exc_info=True)
         self._pending_send = draft
         # A new question replaces the old one, the way a new quiz replaces
         # the last: without this a remote-push read-back armed a moment
         # earlier would still be sitting in _pending_destructive, and the
         # yes that sends the email would leave IT armed for the next one.
         self._pending_destructive = None
+        self._pending_destructive_meta = None
+        self._pending_filepick = None
+
+    def _same_room(self, asked: str, answering: str) -> bool:
+        """Could a turn from ``answering`` be the answer to a question put
+        on ``asked``?
+
+        Voice and typed are the same desk -- he can say it or type it into
+        the window the question is on. Everything else is a different room:
+        a Discord message, a phone-client turn, a tmux `jarvis "..."` and a
+        socket turn never heard the question, and a "yes" from one of them
+        is a yes to something else. ``_try_briefing_offer`` already draws
+        this line for an offer that is entirely reversible.
+        """
+        desk = ("voice", "typed")
+        if asked in desk:
+            return answering in desk
+        return answering == asked
 
     # -- reasoned dissent (jarvis/objections.py) -----------------------
     def _objection_ledger(self):
@@ -8696,12 +9119,21 @@ class Commander:
         #       not parse_yes_no -- and because the two can never be live
         #       together anyway: a send arms its own slot and nothing in
         #       the app arms both.
-        res = self._try_send_confirm(text)
+        res = self._try_send_confirm(text, source)
+        if res is not None:
+            return res
+        # 3d-iv. "Which one, sir?" -- the ambiguous-file question both file
+        #        lanes ask. Below the yes/no rungs because its own grammar
+        #        is an ORDINAL or a NAME and it must not be handed a bare
+        #        "yes" that belongs to one of them; above the destructive
+        #        rung because "the second one" is not a yes and that rung
+        #        would drop this question's slot without answering it.
+        res = self._try_filepick_answer(text, source)
         if res is not None:
             return res
         # 3e. A destructive action was read back ("Cancel all three alarms,
         #     sir?"): a plain yes runs it, anything else drops it.
-        res = self._try_destructive_confirm(text)
+        res = self._try_destructive_confirm(text, source)
         if res is not None:
             return res
         # 3f. He advised against something ("Shall I set it anyway?"). AFTER
@@ -9141,7 +9573,68 @@ class Commander:
         return CommandResult(handled=True, reply=str(line), speak=True,
                              status="Undone")
 
-    def _try_send_confirm(self, text: str) -> Optional[CommandResult]:
+    def _try_filepick_answer(self, text: str,
+                             source: str = "voice") -> Optional[CommandResult]:
+        """Answer "Which one, sir?" -- the ambiguous-file question.
+
+        Narrow on purpose (``pick_from_answer``): an ordinal, or a name that
+        beats its rivals by more than the band that called them ambiguous.
+        An explicit "neither" says so out loud; a NEAR miss -- most often
+        the ambiguous phrase repeated -- gets one more question rather than
+        a guess; anything else drops the slot and keeps its own meaning.
+        The chosen file is then READ BACK like any other, so a wrong pick
+        here still cannot send or move anything on its own.
+        """
+        pend = getattr(self, "_pending_filepick", None)
+        if not isinstance(pend, tuple) or len(pend) != 5:
+            return None
+        cands, resume, asked, made, reasked = pend
+        if time.monotonic() - float(made or 0.0) > FILEPICK_TTL_S:
+            self._pending_filepick = None
+            log.info("which-one: expired; %r is a new subject", text[:40])
+            return None
+        # A question put at the desk is not answered from Discord or a tmux
+        # shell. Left PARKED rather than dropped: that turn is not its
+        # answer, but it is not its cancellation either.
+        if not self._same_room(asked, source):
+            log.debug("which-one: a %s turn is not its answer", source)
+            return None
+        choice, near = pick_from_answer(text, cands)
+        if choice is None:
+            said = " ".join(str(text or "").split())
+            if _PICK_CANCEL_RX.match(said):
+                self._pending_filepick = None
+                self._answered_pending = True
+                return CommandResult(handled=True, reply="Very good, sir.",
+                                     speak=True, status="Dropped")
+            # A NEAR MISS -- he named one of them and the margin was not
+            # there, which is most often the ambiguous phrase repeated. One
+            # more question rather than a guess or a silence; the second
+            # near miss spends it, exactly as the send read-back does.
+            if near and not reasked:
+                self._pending_filepick = (cands, resume, asked, made, True)
+                self._answered_pending = True
+                log.info("which-one: %r still fits both; asking again",
+                         text[:60])
+                return CommandResult(
+                    handled=True, speak=True, status="Which one?",
+                    reply=f"Still either, sir: {filepick.describe(cands)}. "
+                          f"Which of them?")
+            self._pending_filepick = None
+            log.info("which-one: %r names none of them", text[:60])
+            return None
+        self._pending_filepick = None
+        self._answered_pending = True
+        log.info("which-one: %r means %s", text[:40], choice.name)
+        try:
+            return resume(choice)
+        except Exception:
+            log.exception("which-one: could not carry on with %s", choice.name)
+            return CommandResult(handled=True, speak=True, status="error",
+                                 reply="I couldn't manage that, sir.")
+
+    def _try_send_confirm(self, text: str,
+                          source: str = "voice") -> Optional[CommandResult]:
         """Resolve a file-send read-back ("...Send it, sir?").
 
         Four answers, and the difference between them is the whole feature:
@@ -9166,15 +9659,39 @@ class Commander:
         if draft.stale():
             log.info("send read-back expired: %s", draft.path.name)
             return None
+        # The question was SPOKEN, at the desk. A Discord message, a phone
+        # turn, a `jarvis "..."` from tmux and a socket turn never heard it,
+        # so their "yes" is a yes to something else -- and this one sends an
+        # attachment. The draft is put BACK: that turn is not its answer,
+        # but it is not its cancellation either, and it is still his file
+        # waiting on his word at the desk where he was asked.
+        if not self._same_room(getattr(draft, "asked_from", "voice"), source):
+            self._pending_send = draft
+            log.info("send read-back: a %s turn is not its answer", source)
+            return None
+        self._answered_pending = True
         answer = parse_send_answer(text)
         if answer is None:
-            if _SEND_MAYBE_RX.match(" ".join(str(text or "").split())) \
-                    and not draft.reasked:
+            said = " ".join(str(text or "").split())
+            # Two ways to be vague, and BOTH get the one re-ask rather than
+            # the silent drop. _SEND_MAYBE_RX catches the bare fillers
+            # ("okay", "sure"); the second leg catches a yes this grammar
+            # does not take but parse_yes_no does -- "um, yes", "okay yes",
+            # "I think so yes", "yeah go ahead and send it", and his own
+            # logged "system, yes." Six words is parse_yes_no's own
+            # overheard-speech line, and it is what keeps the ten-word
+            # "Yeah, so you should be able to look that up." on the silent
+            # branch where it belongs. Safety is unchanged either way:
+            # nothing is sent, he is asked once more.
+            vague = bool(_SEND_MAYBE_RX.match(said)) or (
+                len(said.split()) <= 6 and parse_yes_no(said) is True)
+            if vague and not draft.reasked:
                 draft.reasked = True
                 self._pending_send = draft
                 log.info("send read-back: %r is not a yes; asking again", text)
                 return CommandResult(handled=True, reply=outbox.UNSURE_LINE,
                                      speak=True, status="Confirm?")
+            self._answered_pending = False
             log.info("send draft dropped, the subject changed: %r", text)
             return None
         if not answer:
@@ -9213,14 +9730,40 @@ class Commander:
                              speak=True, ack=True, done=False,
                              status=f"Sending {name}")
 
-    def _try_destructive_confirm(self, text: str) -> Optional[CommandResult]:
+    def _try_destructive_confirm(self, text: str,
+                                 source: str = "voice") -> Optional[CommandResult]:
         """Resolve a read-back ("Cancel all three alarms, sir?").
 
         As with a calendar add, anything that is not a clear yes or no
         DROPS the offer: changing the subject is not consent, and a stale
         offer would attach the next stray "yes" to an old cancel. An offer
-        older than DESTRUCTIVE_TTL_S is dropped even on a yes."""
+        older than DESTRUCTIVE_TTL_S is dropped even on a yes.
+
+        Two things the plain read-back does not have:
+
+        * a STRICT slot (``stash_destructive(..., strict=True)``, which the
+          two HPCOMPUTER transfers use) is answered by ``parse_send_answer``
+          instead, with the send lane's one re-ask on a vague word. Its yes
+          moves a file onto another machine and there is no undo closure
+          waiting on the far side;
+        * the answer has to come from the channel the question was PUT on.
+          A "yes" typed into Discord or arriving down the phone socket never
+          heard the question, and one of these read-backs is irreversible.
+        """
         pend, self._pending_destructive = self._pending_destructive, None
+        meta, self._pending_destructive_meta = \
+            getattr(self, "_pending_destructive_meta", None), None
+        # Only trust metadata that names THIS tuple: _pending_destructive is
+        # also written by hand (tests, jarvis/app.py reads it), and stale
+        # metadata applied to somebody else's slot would be worse than none.
+        asked, strict = "", False
+        if isinstance(meta, tuple) and len(meta) == 3 and meta[2] is pend:
+            asked, strict = str(meta[0] or ""), bool(meta[1])
+        if pend is not None and asked and not self._same_room(asked, source):
+            self._pending_destructive = pend
+            self._pending_destructive_meta = meta
+            log.info("read-back: a %s turn is not its answer", source)
+            return None
         notes = self._svc("notes")
         npend = getattr(notes, "pending_clear", None) if notes is not None else None
         if not isinstance(npend, dict):
@@ -9238,9 +9781,33 @@ class Commander:
             npend = None
         if pend is None and npend is None:
             return None
-        answer = parse_yes_no(text)
-        if answer is None:
-            return None
+        if strict:
+            said = " ".join(str(text or "").split())
+            answer = parse_send_answer(said)
+            if answer is None:
+                # The send lane's one re-ask, and for the same reason:
+                # obeying "okay" is how a file lands on the wrong machine,
+                # and dropping it in silence is how he learns the feature
+                # does not work. The second vague answer spends the offer.
+                vague = bool(_SEND_MAYBE_RX.match(said)) or (
+                    len(said.split()) <= 6 and parse_yes_no(said) is True)
+                if vague and not self._strict_reasked:
+                    self._strict_reasked = True
+                    self._answered_pending = True
+                    self._pending_destructive = pend
+                    self._pending_destructive_meta = meta
+                    log.info("read-back: %r is not a yes; asking again", text)
+                    return CommandResult(handled=True, speak=True,
+                                         reply=outbox.UNSURE_LINE,
+                                         status="Confirm?")
+                log.info("read-back dropped, the subject changed: %r", text)
+                return None
+            self._strict_reasked = False
+        else:
+            answer = parse_yes_no(text)
+            if answer is None:
+                return None
+        self._answered_pending = True
         if not answer:
             return CommandResult(handled=True, reply="Very good, sir.", speak=True,
                                  status="Dropped")
@@ -10133,8 +10700,12 @@ class Commander:
                     res = None
                 stash = self._pending_destructive
                 if stash is not None:
-                    pending.append(stash)
+                    meta = getattr(self, "_pending_destructive_meta", None)
+                    strict = bool(isinstance(meta, tuple) and len(meta) == 3
+                                  and meta[2] is stash and meta[1])
+                    pending.append((stash, strict))
                     self._pending_destructive = None
+                    self._pending_destructive_meta = None
                 if res is None or not res.handled:
                     log.warning("multi-intent: clause %r matched but did "
                                 "nothing", part)
@@ -10211,8 +10782,11 @@ class Commander:
         One question, one yes, every clause run: _try_destructive_confirm
         pops one slot, so anything left unchained is silently lost.
         """
-        runs = [p[0] for p in pending]
-        lines = [str(p[1]).strip() for p in pending if p[1]]
+        # Entries are (the 3-tuple that was stashed, was it strict).
+        stashes = [p[0] for p in pending]
+        strict = any(p[1] for p in pending)
+        runs = [p[0] for p in stashes]
+        lines = [str(p[1]).strip() for p in stashes if p[1]]
 
         def _run_all() -> CommandResult:
             replies, statuses = [], []
@@ -10232,7 +10806,11 @@ class Commander:
                                  reply=address.join_fragments(replies) or None,
                                  speak=True,
                                  status=" + ".join(statuses) or "Done")
-        self.stash_destructive(_run_all, address.join_fragments(lines))
+        # One STRICT clause makes the joined question strict: the yes that
+        # answers it would run that clause too, and it is the irreversible
+        # one in the pair.
+        self.stash_destructive(_run_all, address.join_fragments(lines),
+                               strict=strict)
 
     def _multi_match(self, text: str) -> list:
         """The clauses of a compound whose EVERY half is a Tier-1 command
@@ -10298,10 +10876,23 @@ class Commander:
             except Exception:
                 log.exception("matcher %s failed on clause %r", cmd.name, part)
                 return False
+        if sum(hits) == 2:
+            # BOTH halves are this command. "email the notes to Heather and
+            # email the handout to Heather" is two requests, and bailing
+            # here let the whole-utterance match stand: _SEND_FILE_RX's
+            # `to`-split is non-greedy but $-anchored, so who_a swallowed
+            # the second clause and Jarvis asked for the address of a
+            # person called "Heather and email the biosensors handout to
+            # Heather". _try_multi is what this sentence wanted all along.
+            if self._multi_match(bare) and not self.shaky_transcript():
+                log.info("tier-1 %r declines the compound %r: both halves "
+                         "are the same command", cmd.name, text)
+                return True
+            return False
         if sum(hits) != 1:
-            # It accepts both halves, or neither ("add milk and bread to my
-            # shopping list" matches only whole). Either way the match is
-            # not one clause of a two-request sentence.
+            # Neither half on its own ("add milk and bread to my shopping
+            # list" matches only whole), so the match is not one clause of
+            # a two-request sentence.
             return False
         first = hits.index(True) == 0
         other = parts[1] if first else parts[0]
@@ -10330,10 +10921,27 @@ class Commander:
         t = text.strip().lower().rstrip(".!?")
         for cmd in ASSISTANT_TIER1:
             try:
-                if cmd.matcher(t):
-                    return cmd.name
+                if not cmd.matcher(t):
+                    continue
             except Exception:
                 log.exception("matcher %s failed", cmd.name)
+                continue
+            # The one family where the gate must not be switched off on the
+            # SHAPE of a sentence alone. _tier1_send_file has already run
+            # the negative table; this is the other half of the same claim
+            # rule -- a recipient he can write to, or a file really on his
+            # disk -- and it needs services a matcher does not get. Without
+            # it "send the deposit to the landlord" is addressed to Jarvis.
+            if cmd.name == "send file":
+                try:
+                    claimed = _send_file_pieces(self, t) is not None
+                except Exception:  # noqa: BLE001 - a slim test commander
+                    log.debug("send-file: the claim rule needs services I "
+                              "haven't got", exc_info=True)
+                    claimed = True
+                if not claimed:
+                    continue
+            return cmd.name
         return None
 
     def _try_assistant(self, text: str) -> Optional[CommandResult]:

@@ -101,6 +101,13 @@ class Draft:
     # a yes is how a man learns the feature does not work, and treating it
     # AS a yes is how a file reaches the wrong person.
     reasked: bool = False
+    # WHICH CHANNEL the read-back was spoken on. A question put out loud at
+    # the desk cannot be answered from Discord, a phone client, a tmux
+    # shell or a socket -- those turns never heard it. commander.stash_send
+    # records the turn's source here and _try_send_confirm requires the
+    # answer to come back the same way, the rule _try_briefing_offer
+    # already applies to a question that is entirely reversible.
+    asked_from: str = "voice"
 
     @property
     def account_label(self) -> str:
@@ -265,6 +272,29 @@ def parse_address(text: str) -> str:
     return ""
 
 
+def names_a_real_file(cfg, file_query: str, search_roots=None,
+                      now: Optional[float] = None) -> bool:
+    """Does this spoken phrase point at something actually on his disk?
+
+    Used by the commander to decide whether a sentence is a send request at
+    all when the RECIPIENT did not resolve. "Send the kids to bed" and
+    "email the biosensors handout to Dana" have the same grammar and name
+    nobody Jarvis can write to; the difference between them, and the only
+    one available, is that one of them names a real file.
+
+    True for a refusal as well as a match (too big, empty, a folder): those
+    are real things he pointed at, and they deserve the sentence that says
+    so rather than silence.
+    """
+    said = " ".join(str(file_query or "").split())
+    if not said:
+        return False
+    match = filephrase.resolve(
+        said, roots=search_roots if search_roots is not None else roots(cfg),
+        max_mb=max_mb(cfg), now=now)
+    return bool(match.ok or match.ambiguous or match.path is not None)
+
+
 def contacts(cfg) -> dict:
     """assistant.json ``send_file.contacts``: {"heather": "h@x.com"}."""
     raw = _cfg_get(cfg, "send_file.contacts", None)
@@ -360,12 +390,19 @@ def default_subject(path) -> str:
 def prepare(cfg, memory, file_query: str, recipient: str,
             account_hint: str = "", subject: str = "",
             now: Optional[float] = None,
-            search_roots: Optional[list] = None) -> Prepared:
+            search_roots: Optional[list] = None,
+            chosen=None) -> Prepared:
     """Turn the request into a Draft, or into the question to ask.
 
     Checked in the order a failure is cheapest to say: is there a mailbox
     at all, then the FILE (the hard half, and the half he named), then the
     recipient, then which identity to send as.
+
+    ``chosen`` is the answer to "Which one, sir?" -- one of the paths this
+    function itself offered a moment ago. It goes through the SAME resolver
+    as a spoken phrase rather than round the side of it, so the containment
+    check, the cap and the mtime the draft records are the ones every other
+    send passed; the only thing it skips is the guessing.
     """
     accounts = mail_mod.mail_accounts(cfg)
     if not accounts:
@@ -373,7 +410,7 @@ def prepare(cfg, memory, file_query: str, recipient: str,
                         status="Mail not set up")
 
     cap = max_mb(cfg)
-    match = filephrase.resolve(file_query,
+    match = filephrase.resolve(str(chosen) if chosen is not None else file_query,
                                roots=search_roots if search_roots is not None
                                else roots(cfg),
                                max_mb=cap, now=now)

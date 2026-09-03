@@ -721,6 +721,11 @@ NOT_A_SEND = [
     "send the budget to HPCOMPUTER",
     "send the invite to Heather",
     "when should i email the handout to Heather",
+    # `apolog` was anchored with \b, which never matches "apology" or
+    # "apologies" -- the only stem in that alternation that was not a whole
+    # word, and the only one the veto silently missed.
+    "send an apology to my professor",
+    "send my apologies to Heather",
 ]
 
 
@@ -808,6 +813,24 @@ def test_arming_a_send_clears_a_read_back_that_was_already_on_the_floor(cmd):
     assert cmd._pending_send is None and cmd._pending_destructive is None
 
 
+def test_arming_a_read_back_clears_a_send_that_was_already_on_the_floor(cmd):
+    """The MIRROR of the test above, and it was missing.  stash_send cleared
+    _pending_destructive and stash_destructive did not clear _pending_send,
+    so with both armed "yes" sent the email and silently abandoned the
+    read-back he had just heard.  What stopped it reaching handle() was an
+    accident of rung ordering -- _try_send_confirm runs first and drops its
+    draft on any non-answer -- not a check, and any read-back armed outside
+    handle() (a proactive offer) had no such accident to rely on."""
+    ran = []
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    assert cmd._pending_send is not None
+    cmd.stash_destructive(lambda: ran.append("cancelled"),
+                          "Cancel all three alarms, sir?")
+    assert cmd._pending_send is None, "two questions cannot share one yes"
+    cmd.handle("yes", source="typed")
+    assert ran == ["cancelled"] and not FakeSMTP.made
+
+
 def test_an_oversized_explicit_path_keeps_its_size_in_the_refusal(home, roots):
     big = home / "Desktop" / "dump.zip"
     big.write_bytes(b"0" * (3 * 1024 * 1024))
@@ -826,3 +849,312 @@ def test_an_empty_file_is_refused_before_the_read_back(home, roots):
     prep = outbox.prepare(cfg, None, "the blank form", "Heather")
     assert not prep.ok and prep.ask == "blank form.pdf is empty, sir; " \
         "there'd be nothing to attach."
+
+
+# ==================================================================
+# 10. The intent gate: what a Tier-1 name is allowed to switch off
+# ==================================================================
+# Registering "send file" in ASSISTANT_TIER1 is what makes the feature
+# reachable by voice at all (the hotword eats the wake word). It also turns
+# the intent classifier OFF for every sentence the matcher accepts -- so the
+# matcher standing there IS the gate for the one irreversible family in the
+# app, and the raw grammar was much too generous to be it.
+GATE_MUST_NOT_CLAIM = [
+    # vetoed by the negative table, which used to run only AFTER the gate
+    # had already been switched off -- so these were handed to the model
+    # out loud instead of being dropped as background chat
+    "send my regards to Heather",
+    "send a text to Heather",
+    "send the money to Ali",
+    "send an apology to my professor",
+    # named nobody he can write to and no file that exists: 28 of 33
+    # everyday sentences like these were claimed, and answered with a
+    # file-shaped refusal ("I can't find a file by that name, sir.")
+    "send the kids to bed",
+    "send the package to my dad",
+    "send flowers to my mom",
+    "send the deposit to the landlord",
+    "send a card to my grandmother",
+    "share the road with cyclists",
+    "share my screen with the class",
+    "send that to the printer",
+    "send it to the shop",
+    "share that with the group",
+]
+
+
+@pytest.mark.parametrize("said", GATE_MUST_NOT_CLAIM)
+def test_an_everyday_sentence_never_reaches_the_send_lane_by_voice(cmd, said):
+    """Bare voice, no wake word -- the live path. Nothing is armed, and the
+    words are NOT claimed: they go to the classifier like any other
+    overheard sentence."""
+    res = cmd.handle(said, source="voice")
+    assert cmd._pending_send is None, f"{said!r} armed a file send"
+    assert not FakeSMTP.made
+    assert res.status in ("Ignored (background chat)", "Was that for me?"), \
+        f"{said!r} was claimed: {res.status!r} / {res.reply!r}"
+
+
+@pytest.mark.parametrize("said", GATE_MUST_NOT_CLAIM)
+def test_and_the_tier_1_probe_agrees(cmd, said):
+    """The gate consults _match_assistant, so the two must not disagree."""
+    assert cmd._match_assistant(said.lower()) != "send file"
+
+
+def test_a_real_request_still_works_by_voice_with_no_wake_word(cmd):
+    """The reason the name is in ASSISTANT_TIER1 at all."""
+    res = cmd.handle("email the biosensors handout to Heather", source="voice")
+    assert res.reply.endswith("Send it, sir?")
+    assert cmd._pending_send is not None
+
+
+def test_a_real_file_makes_it_a_request_even_when_the_person_is_unknown(cmd):
+    """"Email the biosensors handout to Dana" names a file that is really on
+    his disk, so he was plainly talking to me: it asks for Dana's address
+    rather than being dropped with the household sentences above."""
+    res = cmd.handle("email the biosensors handout to Dana", source="voice")
+    assert res.reply == "I've no address for Dana, sir. What is it?"
+    assert cmd._pending_send is None
+
+
+def test_a_backchannel_yeah_cannot_send_what_was_never_armed(cmd):
+    """The whole exposure in one test: unaddressed speech of the right
+    shape, then a backchannel "yeah"."""
+    cmd.handle("send the deposit to the landlord", source="voice")
+    cmd.handle("yeah", source="voice")
+    assert not FakeSMTP.made
+
+
+# ==================================================================
+# 11. A yes has to come from the room the question was asked in
+# ==================================================================
+@pytest.mark.parametrize("src", ["discord", "phone", "socket", "cli"])
+def test_a_yes_from_a_channel_that_never_heard_the_question_sends_nothing(
+        cmd, src):
+    """app.py publishes UserUtterance(source="discord") for a Discord
+    message and `phone` carries a bearer token in SECRET_KEYS, so these are
+    live channels, not hypotheticals. A read-back spoken at the desk cannot
+    be answered from one of them."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("yes", source=src)
+    assert not FakeSMTP.made, f"a {src} yes sent the attachment"
+    assert res is None or res.status != "Sending"
+    # ...and it is not a cancellation either: the question is still his.
+    assert cmd._pending_send is not None
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+def test_the_desk_is_one_room(cmd):
+    """Voice and typed are the same window; he may answer either way."""
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent
+
+
+# ==================================================================
+# 12. A question somebody else answered spends the draft
+# ==================================================================
+def test_an_offer_answered_in_between_takes_the_draft_with_it(cmd):
+    """The alarm offer, the study offer, the briefing offer and a ringing
+    timer all arrive OUT OF BAND and all sit above the send rung. Measured:
+    the yes that answered the offer left the draft armed for the rest of
+    its 90 s, and the next yes-shaped utterance -- aimed at anything --
+    sent the file."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.services.alarm_offer = {"made_at": time.time(), "when": 7 * 3600,
+                                "label": "wake"}
+    cmd.handle("yes", source="typed")
+    assert cmd._pending_send is None, "the offer's yes left the draft armed"
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made
+
+
+def test_a_ringing_timer_takes_the_draft_with_it(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.services.timekeeper.ringing = types.SimpleNamespace(label="tea")
+    cmd.handle("stop", source="typed")
+    assert cmd._pending_send is None
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made
+
+
+# ==================================================================
+# 13. "Which one, sir?" is a question, and questions get answered
+# ==================================================================
+@pytest.mark.parametrize("answer", [
+    "the final one", "the second one", "lab report final", "final",
+    "lab_report_final.pdf", "the last one",
+])
+def test_the_ambiguous_branch_hears_its_own_answer(cmd, answer):
+    """The designed-for common case -- lab_report.pdf against
+    lab_report_final.pdf -- used to be a silent dead end: nothing was
+    parked, question_open() said no, the follow-up microphone got the short
+    window and every natural answer was called background chat."""
+    res = cmd.handle("email the lab report to Heather", source="typed")
+    assert "Which one?" in res.reply
+    assert cmd.question_open(), "the mic must stay open for the answer"
+    res = cmd.handle(answer, source="typed")
+    assert res is not None and res.reply.endswith("Send it, sir?")
+    assert "lab report final.pdf" in res.reply
+    assert not FakeSMTP.made, "choosing a file confirms nothing"
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent
+
+
+def test_the_first_one_means_the_first_one(cmd):
+    cmd.handle("email the lab report to Heather", source="typed")
+    res = cmd.handle("the first one", source="typed")
+    assert "lab report.pdf" in res.reply and "final" not in res.reply
+
+
+def test_neither_of_them_drops_the_question_out_loud(cmd):
+    cmd.handle("email the lab report to Heather", source="typed")
+    res = cmd.handle("neither", source="typed")
+    assert res.reply == "Very good, sir." and not cmd.question_open()
+
+
+def test_an_answer_that_still_fits_both_is_asked_again_not_guessed(cmd):
+    """Repeating the ambiguous phrase is not a choice.  The margin a name
+    has to beat is filephrase.TIE_SCORE -- the very band that called these
+    two ambiguous -- so "the lab report" cannot resolve to the higher
+    scorer, and one more question is asked rather than a guess made or a
+    silence returned.  The second near miss spends it."""
+    cmd.handle("email the lab report to Heather", source="typed")
+    res = cmd.handle("the lab report", source="typed")
+    assert res is not None and "Which of them?" in res.reply
+    assert cmd.question_open() and not FakeSMTP.made
+    # ...and now the ordinal lands
+    res = cmd.handle("the second one", source="typed")
+    assert "lab report final.pdf" in res.reply
+
+
+def test_the_second_near_miss_spends_the_question(cmd):
+    cmd.handle("email the lab report to Heather", source="typed")
+    cmd.handle("the lab report", source="typed")
+    cmd.handle("the lab report", source="typed")
+    assert cmd._pending_filepick is None and not FakeSMTP.made
+
+
+def test_an_answer_that_names_none_of_them_is_not_a_pick(cmd):
+    """A wrong pick would send the wrong file, so a name that does not beat
+    its rivals clearly is not an answer at all."""
+    cmd.handle("email the lab report to Heather", source="typed")
+    cmd.handle("what time is it", source="typed")
+    assert cmd._pending_filepick is None and not FakeSMTP.made
+
+
+def test_a_bare_yes_is_never_a_choice_between_two_files(cmd):
+    cmd.handle("email the lab report to Heather", source="typed")
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made and cmd._pending_send is None
+
+
+# ==================================================================
+# 14. The yeses that used to be dropped in silence
+# ==================================================================
+@pytest.mark.parametrize("said", [
+    "system, yes.",              # real, jarvis.log.1:5313
+    "um, yes", "uh yeah", "okay yes", "mhm yeah",
+    "yeah go ahead and send it", "yes that's the one", "yes it is",
+    "I think so yes", "well, yes",
+])
+def test_a_yes_this_grammar_does_not_take_is_asked_again_not_dropped(cmd, said):
+    """parse_yes_no reads all of these as yes and parse_send_answer does
+    not. Sending on them is how a file reaches the wrong person; dropping
+    them without a word is how he learns the feature does not work. They
+    get the re-ask the vague fillers already got."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.reply == outbox.UNSURE_LINE
+    assert not FakeSMTP.made and cmd._pending_send is not None
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent
+
+
+def test_a_full_stop_no_longer_breaks_a_clean_yes(cmd):
+    """"Yes. Thank you." is one of his own logged answers
+    (jarvis.log.1:17109); the tail separator allowed only a comma or a
+    space, so the full stop ended the sentence and a clean yes fell
+    through to the silent-drop branch."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("Yes. Thank you.", source="typed")
+    assert res.ack and FakeSMTP.made[-1].sent
+
+
+def test_the_ten_word_stray_is_still_dropped_in_silence(cmd):
+    """The widening must NOT reach the sentence the whole grammar exists
+    for. Six words is parse_yes_no's own overheard-speech line."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("Yeah, so you should be able to look that up.",
+                     source="typed")
+    assert res is None or res.reply != outbox.UNSURE_LINE
+    assert not FakeSMTP.made and cmd._pending_send is None
+
+
+# ==================================================================
+# 15. Two sends in one breath
+# ==================================================================
+def test_two_sends_in_one_breath_are_not_one_long_recipient(cmd):
+    """_compound_hijack bailed whenever a matcher accepted BOTH clauses, so
+    the whole-utterance match stood: _SEND_FILE_RX's `to`-split is
+    non-greedy but $-anchored, and who_a swallowed the second clause.
+    Jarvis asked for the address of "Heather and email the biosensors
+    handout to Heather"."""
+    res = cmd.handle("jarvis email the notes to Heather and email the "
+                     "biosensors handout to Heather", source="typed")
+    assert "and email" not in (res.reply or "")
+    assert not FakeSMTP.made
+    # One read-back is on the table, and it names a real file.
+    assert cmd._pending_send is not None
+    assert "One at a time" in (res.status or "")
+
+
+def test_a_second_send_never_quietly_replaces_the_first(cmd):
+    """Two read-backs, one answerable slot: the second is refused out loud
+    rather than overwriting a question he has already heard."""
+    from jarvis.commander import _SEND_FILE_RX, _h_send_file
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    first = cmd._pending_send
+    # The handler called directly, which is what a compound clause does:
+    # every path through handle() spends the draft in _try_send_confirm
+    # before a second send can arm.
+    text = "email the invoice to heather"
+    cmd._raw_text = text
+    res = _h_send_file(cmd, text, _SEND_FILE_RX.match(text))
+    assert res.status == "One at a time"
+    assert cmd._pending_send is first
+    assert not FakeSMTP.made
+
+
+# ==================================================================
+# 16. Which identity, and how sure we have to be
+# ==================================================================
+@pytest.mark.parametrize("hint", ["s", "w", "p", "hp", "hunter", "worked",
+                                  "sc", "sch00l"])
+def test_a_hint_that_is_not_a_name_picks_no_identity(hint):
+    """Sending as the wrong one of his three identities is one of the two
+    irreversible halves of this feature, and the docstring has always said
+    an unrecognised hint must produce a question rather than a near miss.
+    Measured before the fix: "s" -> school, "w" -> work, "p" -> personal,
+    "worked" -> work, and the local-part leg made "hp" -- the first half of
+    HPCOMPUTER -- his school account."""
+    accounts = mail_mod.mail_accounts(Cfg())
+    assert mail_mod.account_by_label(accounts, hint) is None
+
+
+@pytest.mark.parametrize("hint,label", [
+    ("school", "school"), ("work", "work"), ("personal", "personal"),
+    ("sch", "school"), ("hp@tamu.edu", "school"),
+])
+def test_a_hint_that_is_a_name_still_resolves(hint, label):
+    accounts = mail_mod.mail_accounts(Cfg())
+    picked = mail_mod.account_by_label(accounts, hint)
+    assert picked is not None and mail_mod.account_label(picked) == label
+
+
+def test_an_unrecognised_hint_asks(cmd):
+    res = cmd.handle("email the biosensors handout to Heather from my s "
+                     "account", source="typed")
+    assert cmd._pending_send is None and not FakeSMTP.made
+    assert "no s account" in (res.reply or "").lower()

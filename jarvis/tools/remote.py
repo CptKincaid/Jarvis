@@ -119,6 +119,56 @@ SAFE_REMOTE_NAME_RX = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9 ._+()-]{0,120}$")
 PULL_KEYS = ("outbox", "desktop", "downloads")
 
 
+# ------------------------------------------------------- remote paths
+# Every shipped remote directory starts with "~".  A tilde is expanded by
+# the remote SHELL and by nothing else, so the two far sides need it
+# written two DIFFERENT ways, and quoting it the obvious way breaks both.
+#
+# Measured on this box, 2026-09-03:
+#     shlex.quote("~/x")            -> "'~/x'"
+#     sh -c "ls -1p -- '~/x'"       -> No such file or directory (rc 2)
+#     sh -c 'ls -1pd -- "$HOME"/x'  -> /home/hunterp/x   (rc 0)
+# The failing form's stderr matches _MISSING_RX, so classify_error called it
+# "not-there" and FAIL_LINES spoke a config bug as "I couldn't find that on
+# HPCOMPUTER, sir." -- the whole pull half of the lane, and the `inbox`
+# question, wrong AND misdiagnosed out loud.
+def shell_path(path: str) -> str:
+    """A remote path for a remote SHELL: "$HOME" unquoted, the rest quoted.
+
+    Only the tilde escapes quoting, and only as the leading segment; every
+    character that came from the config file is still inside single quotes,
+    so ``~/my inbox; rm -rf ~`` is one directory name and not two commands.
+    A ``~user`` form is left quoted deliberately -- it would fail loudly
+    rather than resolve to somebody else's home.
+    """
+    raw = (path or "").strip()
+    if not raw:
+        return ""
+    if raw == "~":
+        return '"$HOME"'
+    if raw.startswith("~/"):
+        rest = raw[2:].strip("/")
+        return '"$HOME"' if not rest else '"$HOME"/' + shlex.quote(rest)
+    return shlex.quote(raw)
+
+
+def scp_path(path: str) -> str:
+    """The same path as SCP must receive it: relative to the login home.
+
+    scp is not a shell on the far side.  OpenSSH 9.6 (this box, ``ssh -V``)
+    runs scp over SFTP, where a relative path resolves against the login
+    home and a tilde is a literal character; the legacy ``-O`` protocol runs
+    a remote shell whose cwd is that same home.  A path relative to the home
+    is therefore right in both, and ``~/x`` is right in neither.
+    """
+    raw = (path or "").strip()
+    if raw == "~":
+        return "."
+    if raw.startswith("~/"):
+        return raw[2:].lstrip("/") or "."
+    return raw
+
+
 # --------------------------------------------------------------- config
 @dataclass
 class RemoteConfig:
@@ -247,6 +297,10 @@ FAIL_LINES = {
     "no-space": "{name} hadn't the room for that file, sir.",
     "denied": "{name} wouldn't let me write that, sir.",
     "not-there": "I couldn't find that on {name}, sir.",
+    # A LOCAL file whose name has characters this module will not put into a
+    # remote path.  Refused, never escaped -- see inbox_target.
+    "odd-name": "That file's name has characters I won't put on {name}, "
+                "sir; rename it and I'll send it.",
     "exists": "There's already a file by that name where I'd put it, sir; "
               "I've left yours alone.",
     "failed": "{name} wouldn't answer that, sir.",
@@ -370,9 +424,16 @@ def scp_argv(conf: RemoteConfig, local: str, remote: str,
 
     ``--`` before the paths, and ``./`` glued to a bare local name, because
     scp reads a leading dash as a flag and a local file called ``-rf`` would
-    otherwise be an argument.  The remote side is quoted for the remote
-    shell -- belt to :data:`SAFE_REMOTE_NAME_RX`'s braces, which has already
-    refused anything a quote would have to save us from.
+    otherwise be an argument.
+
+    The remote half is NOT quoted here, and that is deliberate rather than
+    an oversight: whether scp puts it through a remote shell at all depends
+    on the protocol (SFTP on OpenSSH 9, a remote shell under ``-O``), so a
+    quote would be literal in one mode and syntax in the other.  What makes
+    it safe instead is that neither end of it can carry a shell character:
+    :data:`SAFE_REMOTE_NAME_RX` vets the basename on BOTH directions
+    (:func:`inbox_target` on a push, :func:`list_remote` and :func:`pull` on
+    a fetch), and the directory half is config, never speech.
     """
     opts = _common_opts(conf, timeout_s or conf.transfer_timeout_s)
     local_arg = local if os.path.isabs(local) else os.path.join(".", local)
@@ -519,10 +580,11 @@ QUERIES = {
 
 def query_command(conf: RemoteConfig, key: str) -> str:
     """The command for a QUERIES row.  "inbox" is the one row whose command
-    depends on config rather than being a constant -- built here with the
-    path quoted, never from anything spoken."""
+    depends on config rather than being a constant -- built here through
+    :func:`shell_path` (quoted, but with a leading tilde left for the remote
+    shell to expand), never from anything spoken."""
     if key == "inbox":
-        return f"ls -1p -- {shlex.quote(conf.inbox)} 2>/dev/null | head -40"
+        return f"ls -1p -- {shell_path(conf.inbox)} 2>/dev/null | head -40"
     row = QUERIES.get(key)
     return row["cmd"] if row else ""
 
@@ -563,7 +625,7 @@ def list_remote(conf: RemoteConfig, key: str) -> tuple[list, str]:
     folder = remote_dir(conf, key)
     if not folder:
         return [], "not-there"
-    res = run_ssh(conf, f"ls -1p -- {shlex.quote(folder)}")
+    res = run_ssh(conf, f"ls -1p -- {shell_path(folder)}")
     if not res.ok:
         reason = res.reason
         if reason in ("unreachable", "timeout"):
@@ -604,16 +666,28 @@ def match_remote(said: str, names: Sequence[str]) -> filepick.Pick:
 
 
 def inbox_target(conf: RemoteConfig, name: str) -> str:
-    """Where a pushed file lands: ALWAYS inside ``remote.inbox``.
+    """Where a pushed file lands: ALWAYS inside ``remote.inbox``.  "" when
+    the local basename is not one this module will write remotely.
 
     The basename is taken from the LOCAL file (which ``filepick`` already
     resolved and bounded), never from the transcript, and joined to the one
     configured folder.  There is no code path by which a spoken phrase
     chooses a remote directory -- that is the whole point of this function
     existing instead of a formatted string at the call site.
+
+    The name is run through :data:`SAFE_REMOTE_NAME_RX` here as well, which
+    the pull side has always done and this side had not.  A LOCAL file may
+    legitimately be called ``a;b.txt`` or hold a backtick, and that name was
+    reaching the remote argument unescaped: harmless while scp speaks SFTP,
+    remote command execution the day it does not (``-O``, an older scp, a
+    different ``SCP_BIN``).  Refused rather than escaped, exactly as an
+    unquotable remote name is dropped rather than quoted.
     """
     base = os.path.basename(name)
-    return f"{conf.inbox.rstrip('/')}/{base}"
+    if not SAFE_REMOTE_NAME_RX.match(base):
+        log.warning("remote: refusing to push a name I won't write remotely")
+        return ""
+    return f"{scp_path(conf.inbox).rstrip('/')}/{base}"
 
 
 def push(conf: RemoteConfig, local: Path) -> SshResult:
@@ -625,7 +699,10 @@ def push(conf: RemoteConfig, local: Path) -> SshResult:
     bad = filepick.check_file(local, roots, conf.max_mb)
     if bad:
         return SshResult(False, reason=bad)
-    res = run_copy(conf, str(local), inbox_target(conf, local.name), push=True)
+    target = inbox_target(conf, local.name)
+    if not target:
+        return SshResult(False, reason="odd-name")
+    res = run_copy(conf, str(local), target, push=True)
     if not res.ok and res.reason in ("unreachable", "timeout"):
         better = unreachable_reason(conf)
         if better:
@@ -660,7 +737,7 @@ def pull(conf: RemoteConfig, key: str, remote_name: str) -> SshResult:
     if dest.exists():
         # Never clobber something of his without being told to.
         return SshResult(False, reason="exists")
-    src = f"{folder.rstrip('/')}/{remote_name}"
+    src = f"{scp_path(folder).rstrip('/')}/{remote_name}"
     res = run_copy(conf, str(dest), src, push=False)
     if not res.ok and res.reason in ("unreachable", "timeout"):
         better = unreachable_reason(conf)

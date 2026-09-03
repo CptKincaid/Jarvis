@@ -18,11 +18,15 @@ the irreversible mistakes live.
 """
 import os
 import subprocess
+import types
+from unittest.mock import MagicMock
 
 import pytest
 
 from jarvis import commander as cmd_mod
 from jarvis.assistant_config import DEFAULTS
+from jarvis.commander import Commander, IntentClassifier
+from jarvis.config import CONFIG
 from jarvis.tools import filepick, remote
 
 
@@ -284,10 +288,55 @@ def test_a_question_never_interpolates_a_transcript(tmp_path):
 
 
 def test_the_inbox_question_quotes_the_configured_path(tmp_path):
+    """Quoted, but NOT the leading tilde.
+
+    This test used to pin the bug: it asserted `'~/my inbox; rm -rf ~'`, and
+    a quoted tilde is never expanded, so the whole thing was one literal
+    directory name that could not exist.  Measured on this box 2026-09-03:
+    `sh -c "ls -1p -- '~/x'"` fails "No such file or directory" (rc 2) while
+    the $HOME form resolves -- and that stderr hits _MISSING_RX, so Jarvis
+    reported a config bug as "I couldn't find that on HPCOMPUTER, sir."
+    Every character that came from the config file is still inside single
+    quotes; only the tilde is outside them."""
     conf = remote.read_config(ready_cfg(
         tmp_path, **{"remote.inbox": "~/my inbox; rm -rf ~"}))
     cmd = remote.query_command(conf, "inbox")
-    assert "'~/my inbox; rm -rf ~'" in cmd
+    assert '"$HOME"/\'my inbox; rm -rf ~\'' in cmd
+    assert "'~/my inbox" not in cmd
+
+
+@pytest.mark.parametrize("path,expect", [
+    ("~/jarvis-outbox", '"$HOME"/jarvis-outbox'),
+    ("~/my inbox; rm -rf ~", '"$HOME"/\'my inbox; rm -rf ~\''),
+    ("~", '"$HOME"'),
+    ("~/", '"$HOME"'),
+    ("/srv/drop box", "'/srv/drop box'"),
+    ("relative/dir", "relative/dir"),
+])
+def test_a_tilde_never_reaches_the_remote_shell_inside_quotes(path, expect):
+    assert remote.shell_path(path) == expect
+
+
+@pytest.mark.parametrize("path,expect", [
+    ("~/jarvis-inbox", "jarvis-inbox"),
+    ("~", "."),
+    ("/srv/drop", "/srv/drop"),
+])
+def test_scp_gets_a_home_relative_path_because_it_is_not_a_shell(path, expect):
+    """scp on OpenSSH 9.6 (this box) speaks SFTP, which has no tilde and
+    resolves a relative path against the login home; the legacy -O protocol
+    runs a shell whose cwd is that same home.  Relative is right in both."""
+    assert remote.scp_path(path) == expect
+
+
+def test_every_shipped_remote_directory_survives_the_round_trip():
+    """The shipped config is all "~" paths, which is the state that made
+    this a bug rather than a theory."""
+    row = DEFAULTS["remote"]
+    for path in [row["inbox"]] + list(row["pull_dirs"].values()):
+        assert path.startswith("~"), path
+        assert "'~" not in remote.shell_path(path)
+        assert not remote.scp_path(path).startswith("~")
 
 
 def test_a_question_on_an_unconfigured_lane_opens_nothing(monkeypatch):
@@ -301,10 +350,37 @@ def test_a_push_can_only_ever_land_in_the_configured_inbox(tmp_path):
     """Speech never names a remote path.  This is the function that makes
     that true, so it is tested against a name that tries to escape."""
     conf = remote.read_config(ready_cfg(tmp_path))
-    assert remote.inbox_target(conf, "b.txt") == "~/jarvis-inbox/b.txt"
+    # Home-relative, not "~/...": see scp_path.  scp is not a shell.
+    assert remote.inbox_target(conf, "b.txt") == "jarvis-inbox/b.txt"
     # a basename is taken even from something path-shaped
     assert remote.inbox_target(conf, "../../.ssh/authorized_keys") == \
-        "~/jarvis-inbox/authorized_keys"
+        "jarvis-inbox/authorized_keys"
+
+
+@pytest.mark.parametrize("name", [
+    "note;rm -rf ~.txt", "back`id`.txt", "two\nlines.txt", "-rf.txt",
+    "$(id).txt", "quote'.txt",
+])
+def test_a_local_name_a_remote_shell_could_read_is_refused_not_escaped(
+        tmp_path, name):
+    """The pull side has always vetted names with SAFE_REMOTE_NAME_RX and the
+    push side did not: the LOCAL basename went into the remote argument
+    unescaped.  Harmless while scp speaks SFTP (no remote shell); remote
+    command execution under -O, an older scp, or a different SCP_BIN.  It is
+    refused with a sentence, the way an unquotable remote name is dropped."""
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert remote.inbox_target(conf, name) == ""
+
+
+def test_a_push_of_such_a_name_never_opens_a_transfer(tmp_path, desk,
+                                                      monkeypatch):
+    monkeypatch.setattr(remote, "run_copy", lambda *a, **k:
+                        pytest.fail("copied a name I will not write remotely"))
+    conf = remote.read_config(ready_cfg(tmp_path))
+    f = desk / "back`id`.txt"
+    f.write_text("x")
+    assert remote.push(conf, f).reason == "odd-name"
+    assert remote.fail_line(conf, "odd-name").startswith("That file's name")
 
 
 def test_push_refuses_a_file_outside_his_folders(tmp_path, desk, monkeypatch):
@@ -349,7 +425,7 @@ def test_a_good_push_uses_the_inbox_and_the_local_basename(tmp_path, desk,
     f.write_text("x")
     assert remote.push(conf, f).ok
     assert seen["push"] is True
-    assert seen["remote"] == "~/jarvis-inbox/budget.xlsx"
+    assert seen["remote"] == "jarvis-inbox/budget.xlsx"
 
 
 # ==================================================== tier 2: pulling files
@@ -621,3 +697,244 @@ def test_this_lane_keeps_hard_containment_where_the_mail_lane_relaxes_it(
     passes allow_explicit_outside=False and "/etc/shadow" stays unsayable."""
     conf = remote.read_config(ready_cfg(tmp_path))
     assert cmd_mod._remote_resolve_local("/etc/shadow", conf).reason == "outside"
+
+
+# ==================================================================
+# The spoken lane, end to end -- no socket, no host, no tailnet
+# ==================================================================
+# `remote.run_ssh`, `remote.run_copy` and `remote.tailnet_state` are the
+# three seams and every test below replaces all three.  What is under test
+# is the DECISIONS: which door a sentence reaches, what has to be said to
+# spend a transfer read-back, and which channel may say it.
+@pytest.fixture
+def wired(tmp_path, monkeypatch):
+    """A Commander whose HPCOMPUTER lane is configured and whose transport
+    records instead of connecting."""
+    desk = tmp_path / "Desktop"
+    desk.mkdir(exist_ok=True)
+    for name, body in (("budget.xlsx", b"B" * 400),
+                       ("lab_report.pdf", b"L" * 400),
+                       ("lab_report_final.pdf", b"F" * 400)):
+        (desk / name).write_bytes(body)
+
+    copied = []
+    monkeypatch.setattr(remote, "run_copy",
+                        lambda conf, local, rem, push:
+                        (copied.append((local, rem, push)),
+                         remote.SshResult(True))[1])
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        remote.SshResult(True, out="report_v1.pdf\n"
+                                                   "report_v2.pdf\n"))
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf: "online")
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "i.json")
+    monkeypatch.setattr(Commander, "FEEDBACK_LOG", tmp_path / "fb.jsonl",
+                        raising=False)
+    for key, val in (("voice_cmds", True), ("jarvis_mode", True),
+                     ("auto_type", False), ("talkback", False)):
+        monkeypatch.setattr(CONFIG, key, val)
+    monkeypatch.setattr(Commander, "_bg", lambda self, fn: fn())
+    monkeypatch.setattr(Commander, "_speak_now", lambda self, text: True)
+    svc = types.SimpleNamespace(
+        assistant=ready_cfg(tmp_path), memory=MagicMock(), desktop=MagicMock(),
+        workflows=MagicMock(), brain=MagicMock(), context=MagicMock(),
+        tts=MagicMock(), timekeeper=MagicMock(), notes=MagicMock(),
+        approvals=MagicMock(), claude=MagicMock(), router=MagicMock())
+    svc.desktop.parse_action = lambda part: None
+    svc.workflows.get.return_value = None
+    svc.context.answer_question.return_value = None
+    svc.memory.resolve_person.return_value = None
+    svc.memory.suggest_by_habit.return_value = None
+    svc.timekeeper.ringing = None
+    svc.approvals.pending.return_value = []
+    svc.router.pending.return_value = None
+    svc.claude.active_project = "jarvis"
+    c = Commander(svc)
+    c.copied = copied
+    return c
+
+
+# ---------------------------------------------- reachable by voice at all
+@pytest.mark.parametrize("name", ["remote push", "remote pull",
+                                  "remote status", "remote query",
+                                  "remote freeform"])
+def test_every_door_is_registered_for_unprefixed_speech(name):
+    """The family copied the Oracle five's registry shape everywhere except
+    here, and ASSISTANT_TIER1 is the list that makes a command reachable
+    once the hotword has eaten the wake word.  Without it `cmd_text` is
+    None, the registry pass is skipped, and the intent gate drops or
+    mis-routes every phrasing."""
+    assert name in [c.name for c in cmd_mod.ASSISTANT_TIER1]
+
+
+@pytest.mark.parametrize("said,expect", [
+    ("put the lab report on HPCOMPUTER", "Which one?"),
+    ("is HPCOMPUTER up", "HPCOMPUTER: up"),
+    ("what's the disk on HPCOMPUTER", "HPCOMPUTER: disk"),
+    ("get the report from HPCOMPUTER", "Which one?"),
+    ("run the build on HPCOMPUTER", "Refused"),
+])
+def test_the_doors_answer_bare_voice_with_no_wake_word(wired, said, expect):
+    """The live path: the hotword consumed "jarvis", so this is what the
+    commander actually receives."""
+    res = wired.handle(said, source="voice")
+    assert res.status == expect, f"{said!r} -> {res.status!r} / {res.reply!r}"
+
+
+def test_a_push_reads_back_and_moves_nothing(wired):
+    res = wired.handle("put the budget on HPCOMPUTER", source="voice")
+    assert res.reply == "Send budget.xlsx to HPCOMPUTER's inbox, sir?"
+    assert wired.copied == [] and wired.question_open()
+
+
+# ------------------------------------------ the transfer read-back is strict
+def test_a_stray_yeah_cannot_push_a_file(wired):
+    """The exact line the mail lane pins as a regression
+    (test_send_file.py::test_a_stray_yeah_to_something_else_cannot_send_the_file).
+    It answered a live offer once already; parse_yes_no waives its
+    overheard-speech guard whenever the first word is a yes word, and this
+    lane's own design calls a transfer "a file on another machine" -- as
+    irreversible as an email."""
+    wired.handle("put the budget on HPCOMPUTER", source="voice")
+    wired.handle("Yeah, so you should be able to look that up.", source="voice")
+    assert wired.copied == []
+    assert wired._pending_destructive is None, "and the offer is spent"
+
+
+def test_sure_is_asked_again_rather_than_obeyed(wired):
+    """"sure" is in _YES_WORDS and deliberately absent from the send lane's
+    grammar: it is what a man says while still listening."""
+    wired.handle("put the budget on HPCOMPUTER", source="voice")
+    res = wired.handle("sure", source="voice")
+    assert res.reply == outbox_unsure()
+    assert wired.copied == []
+    res = wired.handle("yes", source="voice")
+    assert res.reply == "budget.xlsx is on HPCOMPUTER, sir."
+    assert wired.copied[-1][2] is True
+
+
+def outbox_unsure():
+    from jarvis import outbox
+    return outbox.UNSURE_LINE
+
+
+@pytest.mark.parametrize("said", ["yes", "yes please", "go ahead", "send it"])
+def test_a_real_yes_still_spends_it(wired, said):
+    wired.handle("put the budget on HPCOMPUTER", source="voice")
+    wired.handle(said, source="voice")
+    assert len(wired.copied) == 1
+
+
+@pytest.mark.parametrize("said", ["no", "cancel", "not that one"])
+def test_a_no_drops_it(wired, said):
+    wired.handle("put the budget on HPCOMPUTER", source="voice")
+    res = wired.handle(said, source="voice")
+    assert res.status == "Dropped" and wired.copied == []
+
+
+@pytest.mark.parametrize("src", ["discord", "phone", "socket", "cli"])
+def test_a_yes_from_another_room_moves_no_file(wired, src):
+    wired.handle("put the budget on HPCOMPUTER", source="voice")
+    wired.handle("yes", source=src)
+    assert wired.copied == [], f"a {src} yes pushed the file"
+    # left parked: that turn is not its answer, nor its cancellation
+    assert wired._pending_destructive is not None
+    wired.handle("yes", source="voice")
+    assert len(wired.copied) == 1
+
+
+def test_a_pull_is_just_as_strict(wired):
+    wired.handle("get report v1 from HPCOMPUTER", source="voice")
+    wired.handle("Yeah, so you should be able to look that up.", source="voice")
+    assert wired.copied == []
+
+
+# ------------------------------------------------ "Which one?" is answerable
+@pytest.mark.parametrize("answer,expect", [
+    ("the second one", "lab_report_final.pdf"),
+    ("the final one", "lab_report_final.pdf"),
+    ("the first one", "lab_report.pdf"),
+])
+def test_an_ambiguous_push_hears_its_answer(wired, answer, expect):
+    res = wired.handle("put the lab report on HPCOMPUTER", source="voice")
+    assert "Which one?" in res.reply and wired.question_open()
+    res = wired.handle(answer, source="voice")
+    assert res.reply == f"Send {expect} to HPCOMPUTER's inbox, sir?"
+    assert wired.copied == [], "choosing a file confirms nothing"
+    wired.handle("yes", source="voice")
+    assert wired.copied[-1][1] == f"jarvis-inbox/{expect}"
+
+
+def test_an_ambiguous_pull_hears_its_answer(wired):
+    res = wired.handle("get the report from HPCOMPUTER", source="voice")
+    assert "report_v1.pdf" in res.reply and "report_v2.pdf" in res.reply
+    res = wired.handle("the second one", source="voice")
+    assert "report_v2.pdf" in res.reply
+    assert wired.copied == []
+
+
+# ------------------------------------------- the refusal door's manners
+REFUSAL_MUST_NOT_CLAIM = [
+    # questions and reports that merely CONTAIN an order word
+    "did you install anything on the HP",
+    "have you run the tests on the HP",
+    "the build failed on the HP",
+    "i need to update the HP",
+    "i should install python on the HP",
+]
+
+
+@pytest.mark.parametrize("said", REFUSAL_MUST_NOT_CLAIM)
+def test_a_question_about_the_host_is_not_an_order_to_it(wired, said):
+    res = wired.handle(said, source="voice")
+    assert res.status != "Refused", f"{said!r} was refused out loud"
+    assert remote.FREEFORM_REFUSAL.format(name="HPCOMPUTER") != res.reply
+
+
+@pytest.mark.parametrize("said,order", [
+    ("run the build on HPCOMPUTER", True),
+    ("delete the logs on the hp", True),
+    ("please restart the hp computer", True),
+    ("shut down HPCOMPUTER", True),
+    ("did you install anything on the HP", False),
+    ("the build failed on the HP", False),
+    ("i need to update the HP", False),
+    ("remind me to run the backup on the HP", False),
+])
+def test_an_order_is_a_verb_at_the_head_of_the_clause(said, order):
+    """_REMOTE_ORDER_RX used to be an unanchored `search`, so any clause
+    CONTAINING one of its words read as an instruction.  An order is an
+    imperative: the verb comes first."""
+    m = cmd_mod._REMOTE_FREEFORM_RX.match(said)
+    assert m is not None
+    spoken = cmd_mod._oracle_group(m, "cmd", "cmd2", "cmd3")
+    assert bool(cmd_mod._REMOTE_ORDER_RX.match(spoken.strip())) is order
+
+
+def test_the_refusal_door_no_longer_outranks_the_commands_it_shadowed():
+    """It is the loosest matcher in the family, and at its old index it
+    took "clear the shopping list on my desktop computer" (a list) and
+    "remind me to run the backup on the HP" (a reminder) before either
+    could be answered."""
+    names = [c.name for c in cmd_mod.REGISTRY]
+    assert names.index("remote freeform") > names.index("list add")
+    assert names.index("remote freeform") > names.index("remind me")
+    # ...and still after the four doors that DO something.
+    for door in ("remote push", "remote pull", "remote status", "remote query"):
+        assert names.index("remote freeform") > names.index(door)
+
+
+def test_a_reminder_that_names_the_machine_is_a_reminder():
+    """"Remind me to run the backup on the HP" was answered "I don't run
+    loose commands on HPCOMPUTER, sir." -- a reminder he asked for and did
+    not get.  Two independent fixes now stop it: the refusal door is below
+    `remind me` in REGISTRY, and "run" in the middle of a clause is no
+    longer an order.  Both are asserted, so removing either is a failure.
+    ("workflow" is skipped: its matcher accepts every utterance and it is
+    held back only by needs=("workflows",).)"""
+    said = "remind me to run the backup on the hp"
+    hits = [c.name for c in cmd_mod.REGISTRY
+            if c.name != "workflow" and c.matcher(said)]
+    assert hits and hits[0] == "remind me", hits
+    m = cmd_mod._REMOTE_FREEFORM_RX.match(said)
+    spoken = cmd_mod._oracle_group(m, "cmd", "cmd2", "cmd3")
+    assert not cmd_mod._REMOTE_ORDER_RX.match(spoken.strip())
