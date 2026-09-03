@@ -987,7 +987,7 @@ def resolve_sink(deg: float, *, get_option: Optional[Callable] = None,
 _SINK_ALIASES = {
     "hpcomputer": "hpcomputer", "hp computer": "hpcomputer", "the hp": "hpcomputer",
     "hp": "hpcomputer", "the pc": "hpcomputer", "my pc": "hpcomputer",
-    "the desktop": "hpcomputer", "my desktop": "hpcomputer",
+    # "the desktop" / "my desktop" are deliberately absent: a folder here, not the host.
     "the windows machine": "hpcomputer", "the windows box": "hpcomputer",
     "the other computer": "hpcomputer", "the other machine": "hpcomputer",
     "board": "board", "the board": "board", "spark": "board", "the spark": "board",

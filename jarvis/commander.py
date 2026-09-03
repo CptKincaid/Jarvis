@@ -7542,8 +7542,11 @@ def _board_svc(c):
 # longer utterances before, so the object is pinned to this/it/that and the
 # target to the table.
 _CAST_SINK = (
-    r"(?P<sink>hp\s*computer|the\s+hp|the\s+pc|my\s+pc|the\s+desktop|"
-    r"my\s+desktop|the\s+windows\s+(?:machine|box)|"
+    # "the desktop" is NOT here: the file lane rules a bare "desktop" is a
+    # FOLDER on this box ("put this on my desktop" stays a local request),
+    # and the merge of the two lanes had this table quietly overruling that.
+    r"(?P<sink>hp\s*computer|the\s+hp|the\s+pc|my\s+pc|"
+    r"the\s+windows\s+(?:machine|box)|"
     r"the\s+other\s+(?:computer|machine)|(?:the\s+)?board|(?:the\s+)?spark|"
     r"(?:my|this)\s+screen|the\s+console|(?:the\s+)?handoff(?:\s+page)?|"
     r"the\s+page)")

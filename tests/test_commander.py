@@ -2801,13 +2801,17 @@ def test_the_cast_verbs_do_not_collide_with_the_list_and_board_families(rich, co
             ("put up the board", "board show"),
             ("drop the timer", "cancel schedule"),
             ("throw this on hpcomputer", "cast throw"),
-            ("send this to the desktop", "cast throw"),
+            ("send this to the pc", "cast throw"),
             ("put that on the board", "cast put"),
             ("put it down", "cast drop"),
             ("let go", "cast drop"),
             ("hpcomputer is on my left", "cast teach"),
             ("the right is the board", "cast teach")):
         assert rich._match_assistant(phrase) == name, phrase
+    # "the desktop" is a folder on this box (the file lane's ruling), so it
+    # must never resolve to HPCOMPUTER as a cast sink.
+    assert not str(rich._match_assistant("send this to the desktop") or "").startswith("cast")
+    assert not str(rich._match_assistant("put this on my desktop") or "").startswith("cast")
     for phrase in ("throw a party for my sister", "send this to mom",
                    "right is fine", "what is left", "drop everything",
                    "put it on my calendar", "throw it away",
