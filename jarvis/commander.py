@@ -4819,11 +4819,27 @@ _HPC_RX = re.compile(_HPC, re.I)
 # A file phrase: "this file", "the budget spreadsheet", "budget.xlsx".
 _FILE_WORD = r"(?P<what>[\w][\w '.\-()+]{0,80}?)"
 
-# "is HPCOMPUTER up", "is it awake", "how's HPCOMPUTER"
+# The polite openers, ONCE, for all five doors (F09, 2026-09-03). The four
+# answering doors were anchored on the bare verb while the refusal door
+# below stripped exactly these words, so "please move the budget to
+# hpcomputer" fell past its own door and was REFUSED out loud as a loose
+# command, and "please put / can you put / could you copy / please get"
+# went to the model, which cannot move a file. The same list the mail
+# lane's _SEND_OPENER takes; _REMOTE_ORDER_RX is built from this string so
+# the two can never drift apart again.
+_REMOTE_OPENER = (r"^(?:jarvis[,\s]+)?"
+                  r"(?:(?:please|just|go\s+ahead\s+and|can\s+you|could\s+you|"
+                  r"would\s+you|will\s+you)[,\s]+)*")
+_REMOTE_OPENER_RX = re.compile(_REMOTE_OPENER, re.I)
+_UP_WORDS = r"(?:up|on|awake|alive|online|running|ok|okay|there)"
+
+# "is HPCOMPUTER up", "is it awake", "how's HPCOMPUTER", and the polite
+# "could you tell me if HPCOMPUTER is up".
 _REMOTE_STATUS_RX = re.compile(
-    r"^(?:"
-    r"(?:is|are)\s+" + _HPC + r"\s+(?:up|on|awake|alive|online|running|"
-    r"ok|okay|there)|"
+    _REMOTE_OPENER + r"(?:"
+    r"(?:is|are)\s+" + _HPC + r"\s+" + _UP_WORDS + r"|"
+    r"(?:tell\s+me\s+)?(?:if|whether)\s+" + _HPC + r"(?:\s+is|'s)\s+"
+    + _UP_WORDS + r"|"
     r"(?:how(?:'s|s| is))\s+" + _HPC + r"(?:\s+(?:doing|looking))?|"
     r"(?:check|check on|ping)\s+" + _HPC + r"|"
     r"(?:can|could)\s+you\s+(?:see|reach)\s+" + _HPC +
@@ -4833,14 +4849,16 @@ _REMOTE_STATUS_RX = re.compile(
 # itself is a constant in remote.QUERIES, so a misheard word can only pick a
 # different question from the table or none at all.
 _REMOTE_QUERY_RX = re.compile(
-    r"^(?:what(?:'s|s| is)|how(?:'s|s| is)|who(?:'s|s| is)|show me)\s+"
+    _REMOTE_OPENER +
+    r"(?:tell\s+me\s+)?(?:what(?:'s|s| is)|how(?:'s|s| is)|who(?:'s|s| is)|"
+    r"show\s+me|tell\s+me)\s+"
     r"(?:the\s+|my\s+)?(?P<q>disk|space|drive|storage|room|uptime|load|"
     r"logged\s+in|logged\s+on|on\s+it|inbox|in\s+the\s+inbox)\b"
     r".{0,20}?\bon\s+" + _HPC + r"\W*$", re.I)
 
 # PUSH: "put the budget on HPCOMPUTER", "send this file to HPCOMPUTER".
 _REMOTE_PUSH_RX = re.compile(
-    r"^(?:put|copy|send|move|push|transfer)\s+"
+    _REMOTE_OPENER + r"(?:put|copy|send|move|push|transfer)\s+"
     r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
     r"(?:\s+file)?\s+(?:on(?:to)?|to|over\s+to|across\s+to)\s+"
     + _HPC + r"\W*$", re.I)
@@ -4848,7 +4866,7 @@ _REMOTE_PUSH_RX = re.compile(
 # PULL: "get the budget from HPCOMPUTER", "grab that off HPCOMPUTER".
 # The optional trailing folder word is an ALLOW-LIST key, not a path.
 _REMOTE_PULL_RX = re.compile(
-    r"^(?:get|grab|fetch|bring|pull|copy|download)\s+(?:me\s+)?"
+    _REMOTE_OPENER + r"(?:get|grab|fetch|bring|pull|copy|download)\s+(?:me\s+)?"
     r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
     r"(?:\s+file)?\s+(?:from|off(?:\s+of)?|out\s+of)\s+" + _HPC +
     r"(?:(?:'s)?\s+(?P<where>outbox|desktop|downloads))?\W*$", re.I)
@@ -4877,9 +4895,11 @@ _REMOTE_FREEFORM_RX = re.compile(
 # "remind me to run the backup on the HP". The last is worse than noise --
 # it is a reminder he asked for and did not get. Same rule _SEND_NOT_RX
 # applies to the mail lane, stated as an anchor rather than a veto list.
+# The openers it steps over are _REMOTE_OPENER -- the SAME string the four
+# answering doors accept (F09), so an opener can never again carry a
+# transfer past its door and into this refusal.
 _REMOTE_ORDER_RX = re.compile(
-    r"^(?:(?:please|just|go\s+ahead\s+and|can\s+you|could\s+you|"
-    r"would\s+you|will\s+you)[,\s]+)*"
+    _REMOTE_OPENER +
     r"(?:run|start|stop|restart|reboot|shut\s*down|kill|delete|remove|rm\b|"
     r"install|update|upgrade|build|make|compile|deploy|launch|open|execute|"
     r"format|wipe|clear|empty|move|rename|chmod|sudo)\b", re.I)

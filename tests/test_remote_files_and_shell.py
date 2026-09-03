@@ -1420,3 +1420,80 @@ def test_a_posix_row_sent_to_a_windows_shell_is_named_out_loud(wired, tmp_path,
     wired.handle("what's the disk on HPCOMPUTER", source="voice")
     assert " df" in wired.spoken[-1] and "remote.os" in wired.spoken[-1]
     assert wired.statuses[-1] == "HPCOMPUTER: wrong-os"
+
+
+# ==================================================================
+# F09 (2026-09-03): the polite forms reach the four answering doors
+# ==================================================================
+# _REMOTE_PUSH/PULL/STATUS/QUERY_RX were anchored at ^ on the bare verb,
+# while _REMOTE_ORDER_RX strips "please|just|go ahead and|can you|could
+# you|would you|will you" and the mail lane's _SEND_OPENER takes the same.
+# So a polite transfer fell past its own door to `remote freeform`: with
+# "move" (an order verb) it was REFUSED out loud -- "please move the budget
+# to hpcomputer" -> "I don't run loose commands on HPCOMPUTER, sir" -- and
+# with put/copy/get/check it went to the model, which cannot move a file.
+# Repro: scratch-0903/bugpass/test_remote_openers_live.py (10 forms).
+POLITE = [
+    ("please put the budget on hpcomputer", "remote push"),
+    ("please move the budget to hpcomputer", "remote push"),
+    ("can you put the budget on hpcomputer", "remote push"),
+    ("could you copy the budget over to hpcomputer", "remote push"),
+    ("would you send this file to hp computer", "remote push"),
+    ("go ahead and send the budget to hpcomputer", "remote push"),
+    ("just put the budget on hpcomputer", "remote push"),
+    ("jarvis, please move the budget to hpcomputer", "remote push"),
+    ("please get the budget from hpcomputer", "remote pull"),
+    ("could you grab the report off hpcomputer", "remote pull"),
+    ("can you fetch the report from HPCOMPUTER's desktop", "remote pull"),
+    ("please check hpcomputer", "remote status"),
+    ("can you check on hpcomputer", "remote status"),
+    ("could you tell me if hpcomputer is up", "remote status"),
+    ("please tell me the disk on hpcomputer", "remote query"),
+    ("could you tell me what's the disk on hpcomputer", "remote query"),
+    ("can you show me the inbox on hpcomputer", "remote query"),
+    ("would you tell me who's logged in on hp computer", "remote query"),
+]
+
+
+@pytest.mark.parametrize("said,name", POLITE)
+def test_a_polite_form_reaches_the_door_the_bare_form_does(said, name):
+    for c in _ungated():
+        if c.matcher(said):
+            assert c.name == name, f"{said!r} went to {c.name}"
+            return
+    pytest.fail(f"{said!r} matched nothing")
+
+
+def test_a_polite_move_is_a_read_back_not_a_refusal(wired):
+    """The one that was refused OUT LOUD."""
+    res = wired.handle("please move the budget to hpcomputer", source="voice")
+    assert res.status == "Confirm?", (res.status, res.reply)
+    assert res.reply == "Send budget.xlsx to HPCOMPUTER's inbox, sir?"
+    assert remote.FREEFORM_REFUSAL.format(name="HPCOMPUTER") != res.reply
+
+
+def test_every_opener_the_refusal_door_strips_is_one_the_doors_take():
+    """The drift guard: the refusal door can never again outrank a transfer
+    on an opener, because the two lists are the same list."""
+    for opener in ("please", "just", "go ahead and", "can you", "could you",
+                   "would you", "will you"):
+        said = f"{opener} move the budget to hpcomputer"
+        assert cmd_mod._REMOTE_ORDER_RX.match(said), opener
+        assert cmd_mod._REMOTE_PUSH_RX.match(said), f"{opener!r} not taken"
+        assert cmd_mod._REMOTE_OPENER_RX.match(said + " ").end() > 0, opener
+
+
+@pytest.mark.parametrize("said", [
+    "please restart the hp computer", "could you delete the logs on the hp",
+    "can you run the build on hpcomputer",
+])
+def test_a_polite_order_is_still_refused(said):
+    """Politeness does not open a shell."""
+    for c in _ungated():
+        if c.matcher(said):
+            assert c.name == "remote freeform", f"{said!r} went to {c.name}"
+            m = cmd_mod._REMOTE_FREEFORM_RX.match(said)
+            spoken = cmd_mod._oracle_group(m, "cmd", "cmd2", "cmd3")
+            assert cmd_mod._REMOTE_ORDER_RX.match(spoken.strip())
+            return
+    pytest.fail(f"{said!r} matched nothing")
