@@ -1171,14 +1171,23 @@ class MainWindow:
         # not inside the same try as the repack: the capture is the half that
         # matters, and a widget that refuses to unpack must not be able to
         # keep a lens open behind an invisible pane.
+        #
+        # The pane's stop() also RELEASES the frame it is showing, so the
+        # widget is never unmapped still holding the last picture; the
+        # worker's runs with join=False because we are on the Tk thread and
+        # a wedged camera would otherwise freeze the console here (see
+        # campreview.PreviewWorker.stop -- the deny is synchronous either
+        # way, only the device handback moves off this thread).
         if not want:
-            for stop in (getattr(pane, "stop", None),
-                         getattr(worker, "stop", None)):
-                try:
-                    if callable(stop):
-                        stop()
-                except Exception:             # noqa: BLE001 - provider edge
-                    log.exception("camera preview could not be stopped")
+            try:
+                pane.stop()
+            except Exception:                 # noqa: BLE001 - a dead widget
+                log.exception("camera preview repaint could not be stopped")
+            try:
+                if worker is not None:
+                    worker.stop(join=False)
+            except Exception:                 # noqa: BLE001 - provider edge
+                log.exception("camera preview capture could not be stopped")
         if want != self._preview_shown:
             self._preview_shown = want
             try:
@@ -1191,11 +1200,21 @@ class MainWindow:
             except Exception:                 # noqa: BLE001 - a dead widget
                 log.debug("preview repack failed", exc_info=True)
         if want:
+            # Two tries, not one. They were together and a worker that
+            # refused to start skipped pane.start() -- which is what CLEARS
+            # the pane on its first poll, so the band would be remapped
+            # showing whatever it had last, with no timer left to fix it.
+            # The value he chose is passed to the worker rather than left
+            # for it to re-read: see PreviewWorker.start.
             try:
-                worker.start()
-                pane.start()
+                if worker is not None:
+                    worker.start(enabled=enabled)
             except Exception:                 # noqa: BLE001 - provider edge
-                log.exception("camera preview could not be started")
+                log.exception("camera preview capture could not be started")
+            try:
+                pane.start()
+            except Exception:                 # noqa: BLE001 - a dead widget
+                log.exception("camera preview repaint could not be started")
 
     # -------------------------------------------------------- keybindings
     def _bind_keys(self):

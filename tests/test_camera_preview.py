@@ -259,6 +259,11 @@ def test_a_face_box_has_an_edge_whatever_is_behind_it(look):
     theme.select_look(look)
     for attending in (True, False):
         assert _contrast(pv.box_ink(attending), pv.halo_ink()) >= 4.5
+    # The OTHER faces too. A secondary box that is not legible over its own
+    # halo is indistinguishable from a detection the detector missed, and
+    # the first spelling of this (RAMP33) measured 2.2:1 / 2.3:1.
+    assert _contrast(pv.box_ink(False, primary=False), pv.halo_ink()) >= 4.5
+    assert _contrast(pv.box_ink(True, primary=False), pv.halo_ink()) >= 4.5
 
 
 @pytest.mark.parametrize("look", theme.LOOKS)
@@ -276,15 +281,22 @@ def test_every_colour_is_read_at_call_time_and_not_frozen_at_import():
     holo = (pv.chrome_ink(), pv.tone_ink(pv.TONE_OFF), pv.halo_ink())
     theme.select_look("classic")
     classic = (pv.chrome_ink(), pv.tone_ink(pv.TONE_OFF), pv.halo_ink())
-    assert holo[0] != classic[0]        # GLASS_EDGE vs LINE
+    assert holo[0] != classic[0]        # GLASS_EDGE is derived per look
     assert holo[2] != classic[2]        # the two grounds
 
 
-def test_the_chrome_follows_the_look_it_was_designed_for():
-    theme.select_look("holo")
+@pytest.mark.parametrize("look", theme.LOOKS)
+def test_the_picture_box_has_a_visible_outline_in_both_looks(look):
+    """The outline is the ONLY thing separating the box from the panel:
+    SURFACE sits just 1.05:1 (holo) / 1.15:1 (classic) above the ground, so
+    a chrome token that does not clear the fill leaves the pane's dark
+    state -- its default, and its state until the vision lane lands -- as
+    readouts floating on nothing. Classic LINE measured 1.44:1, which was
+    the bug this replaced."""
+    theme.select_look(look)
     assert pv.chrome_ink() == theme.GLASS_EDGE   # 1px strokes ARE the chrome
-    theme.select_look("classic")
-    assert pv.chrome_ink() == theme.LINE         # the lifted ground needs a rule
+    assert _contrast(pv.chrome_ink(), theme.SURFACE) >= 3.0
+    assert _contrast(pv.chrome_ink(), theme.BG) >= 3.0
 
 
 # ---------------------------------------------------------- the surfaces
@@ -479,6 +491,115 @@ def test_a_frame_that_will_not_convert_leaves_the_pane_dark_not_stale():
         assert c.state[item]["state"] == "hidden"
 
 
+# ------------------------------------- letting go of the last frame
+class FakePhoto:
+    """``ImageTk.PhotoImage``'s seam. It HOLDS the picture, which is the
+    whole point of the two tests below: a photo that is merely hidden is a
+    frame the process -- and Tk's image store -- is still keeping."""
+
+    def __init__(self, image):
+        self.image = image
+
+    def paste(self, image):
+        self.image = image
+
+
+def photo_pane(monkeypatch, scale=1.0):
+    """``pane()``, but running the REAL ``_show_image`` against a stub
+    PhotoImage. The default harness stubs that method out, so ``_photo``
+    -- the one surviving reference to a frame -- is never exercised by it.
+
+    No picture exists here either: what is handed in is an object with a
+    width and a height, because nothing in this file may look at pixels.
+    """
+    ns = pane(scale=scale)
+    ns._show_image = lambda image: CameraPreview._show_image(ns, image)
+    monkeypatch.setattr("PIL.ImageTk.PhotoImage", FakePhoto)
+    return ns
+
+
+def picture(ns):
+    return SimpleNamespace(width=ns._box[0], height=ns._box[1])
+
+
+def test_going_dark_releases_the_frame_and_does_not_merely_hide_it(
+        monkeypatch):
+    """A frozen last frame under the words "camera off" would be the console
+    showing him a view it is claiming not to have -- and hiding the canvas
+    item does not stop it being one. PhotoImage keeps the picture in a Tk
+    image buffer for as long as anything references it, so the reference has
+    to go too."""
+    ns = photo_pane(monkeypatch)
+    img = picture(ns)
+    paint(ns, cp.PreviewShot(image=img, faces=(face(),), cap_w=1280,
+                             cap_h=720, reason=cp.REASON_LIVE, seq=1))
+    assert ns._photo is not None and ns._photo.image is img   # it IS held
+    assert ns._photo_size == ns._box
+
+    c = paint(ns, cp.blank(cp.REASON_SENSING, "offline mode"))
+    assert c.state["img"]["state"] == "hidden"
+    assert c.state["img"]["image"] == ""     # …and Tk is not left the name
+    assert ns._photo is None, "the last frame is still in the Tk image store"
+    assert ns._photo_size == (0, 0)
+
+
+def test_the_switch_going_off_clears_a_pane_that_will_never_paint_again(
+        monkeypatch):
+    """The OFF paths do not repaint: MainWindow._preview_apply stops the
+    pane, stops the capture and pack_forgets the widget. A stop that only
+    cancelled the timer would unmap a pane still displaying -- and still
+    holding -- the frame he just switched off, and on the next pack it would
+    be remapped visible."""
+    ns = photo_pane(monkeypatch)
+    paint(ns, cp.PreviewShot(image=picture(ns), faces=(face(),), cap_w=1280,
+                             cap_h=720, reason=cp.REASON_LIVE, seq=7))
+    assert ns._photo is not None
+    cancelled = []
+    ns._job = "after#1"
+    ns.after_cancel = cancelled.append
+    ns._clear_picture = lambda: CameraPreview._clear_picture(ns)
+
+    CameraPreview.stop(ns)
+
+    assert cancelled == ["after#1"]              # the poll is off…
+    assert ns._photo is None                     # …and so is the picture
+    assert ns.canvas.state["img"]["state"] == "hidden"
+    assert ns.canvas.state["img"]["image"] == ""
+    for item in ns._boxes + ns._shadows + ns._brackets:
+        assert ns.canvas.state[item]["state"] == "hidden"
+    # The next shot always repaints: a poll that found the same sequence
+    # number and returned early would leave the pane dark over a live one.
+    assert ns._seq == -1
+
+
+def test_stopping_a_pane_that_was_never_started_is_still_a_clear(monkeypatch):
+    """stop() used to return early when there was no timer. The clear has to
+    happen anyway -- quit and the standby edge both reach it that way."""
+    ns = photo_pane(monkeypatch)
+    paint(ns, cp.PreviewShot(image=picture(ns), cap_w=1280, cap_h=720,
+                             reason=cp.REASON_LIVE, seq=1))
+    ns._job = None
+    ns._clear_picture = lambda: CameraPreview._clear_picture(ns)
+    CameraPreview.stop(ns)
+    assert ns._photo is None
+
+
+def test_a_pane_whose_canvas_has_gone_still_stops_cleanly(monkeypatch):
+    """stop() runs on the quit path, after the toplevel may already be on
+    its way out. A clear that raised there would take the teardown with it."""
+    ns = photo_pane(monkeypatch)
+    paint(ns, cp.PreviewShot(image=picture(ns), cap_w=1280, cap_h=720,
+                             reason=cp.REASON_LIVE, seq=1))
+
+    def gone(*_a, **_kw):
+        raise RuntimeError("the canvas is destroyed")
+    ns.canvas.itemconfigure = gone
+    ns._job = None
+    ns._clear_picture = lambda: CameraPreview._clear_picture(ns)
+    CameraPreview.stop(ns)                       # must not raise
+    assert ns._photo is None                     # …and it still let go
+
+
 def test_a_poll_that_finds_the_same_frame_repaints_nothing():
     """What makes polling at twice the capture rate affordable next to a
     60 fps animation loop: a no-op poll is an int compare."""
@@ -524,13 +645,17 @@ class FakeWorker:
     def __init__(self):
         self.starts = 0
         self.stops = 0
+        self.started_with = []
+        self.joined = []
 
-    def start(self):
+    def start(self, enabled=None):
         self.starts += 1
+        self.started_with.append(enabled)
         return True
 
-    def stop(self):
+    def stop(self, timeout=2.0, join=True):
         self.stops += 1
+        self.joined.append(join)
 
 
 def window(mode=ACTIVE, enabled=True):
@@ -555,6 +680,11 @@ def test_going_to_standby_hides_the_pane_and_stops_the_capture():
     assert ns.preview.forgets == 1
     assert ns.preview_worker.stops == 1
     assert ns.preview.stopped == 1               # the repaint timer too
+    # …and it does NOT wait for the device here. This runs on the Tk thread
+    # and the edge recurs every 45 s of quiet; a 130 ms grab (his measured
+    # LifeCam figure) would be eight consecutive 60 Hz slots of frozen
+    # console. The deny is synchronous either way -- only the handback moves.
+    assert ns.preview_worker.joined == [False]
 
 
 def test_the_toggle_off_stops_the_capture_even_in_the_active_console():
@@ -563,6 +693,9 @@ def test_the_toggle_off_stops_the_capture_even_in_the_active_console():
     assert ns.preview.packs == 0
     assert ns.preview_worker.starts == 0
     assert ns.preview_worker.stops == 1          # and it is told to release
+    # The pane is stopped too, and THAT is what drops the picture: the
+    # widget is unmapped without ever painting again.
+    assert ns.preview.stopped == 1
 
 
 def test_the_switch_is_idempotent_so_a_mode_tick_does_not_repack():
@@ -594,11 +727,29 @@ def test_the_worker_is_stopped_even_when_the_pane_refuses():
 def test_the_toggles_new_value_is_used_rather_than_re_read():
     """SettingsDrawer._set_option writes assistant.json on a daemon thread
     and echoes to the console immediately. Re-reading here would race that
-    write and could act on the value he just changed away from."""
+    write and could act on the value he just changed away from -- and the
+    WORKER re-read it too, so a stale False would pack the pane and then
+    refuse to capture behind it, saying "OFF -- preview off"."""
     ns = window(enabled=False)               # what the file still says
     ns._preview_apply(enabled=True)          # what he just clicked
     assert ns.preview.packs == 1
     assert ns.preview_worker.starts == 1
+    assert ns.preview_worker.started_with == [True]   # …handed on, not re-read
+
+
+def test_a_capture_that_refuses_to_start_still_leaves_the_pane_polling():
+    """The two used to share one try, so a worker that raised skipped
+    pane.start() -- which is what clears the band on its first poll. The
+    pane would be remapped showing whatever it had last, with no timer left
+    to fix it."""
+    class Angry(FakeWorker):
+        def start(self, enabled=None):
+            raise RuntimeError("no thread for you")
+    ns = window()
+    ns.preview_worker = Angry()
+    ns._preview_apply()
+    assert ns.preview.packs == 1
+    assert ns.preview.started == 1
 
 
 def test_the_pane_polls_at_twice_the_configured_capture_rate():
@@ -669,7 +820,7 @@ def test_services_declares_the_camera_feed_the_app_will_hand_over():
     assert "camera_feed" in names
     assert Services().camera_feed is None
     assert cp.resolve_feed(Services(camera_feed="the app's"), None, None,
-                           None) == ("the app's", "")
+                           None) == ("the app's", "", False)
 
 
 # ---------------------------------------------------------- the privacy rule

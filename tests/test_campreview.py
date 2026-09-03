@@ -20,6 +20,7 @@ a STATED reason, and the Tk thread is never the thread that waits 130 ms for
 a frame.
 """
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -397,6 +398,12 @@ def test_the_biggest_face_is_the_subject_and_only_it_gets_the_verdict():
     assert shot.faces[0].attending is True
     assert shot.faces[1].attending is False             # never the others
     assert len(tracker.seen) == 1                       # one head, one tracker
+    # …and this is NOT the rule visionrig.Rig uses (it takes the most
+    # confident). What the two share is the GEOMETRY that produces the
+    # numbers, not the choice of subject, so the divergence is stated where
+    # a reader of either will meet it rather than left to be discovered by
+    # comparing two files.
+    assert "Rig" in (cp.PreviewShot.primary.__doc__ or "")
 
 
 def test_more_faces_than_the_pane_can_draw_are_dropped_not_averaged():
@@ -404,6 +411,28 @@ def test_more_faces_than_the_pane_can_draw_are_dropped_not_averaged():
     pipe = cp.PreviewPipeline(FakeFeed(), detector=FakeDetector(rows=rows),
                               observe=observer())
     assert len(pipe.grab((16, 9)).faces) == cp.MAX_FACES
+
+
+def test_the_cap_keeps_the_face_at_the_desk_not_the_three_most_confident():
+    """The cap is applied AFTER the size sort. YuNet hands its rows back
+    score-descending, so slicing first would keep by CONFIDENCE: three 20 px
+    faces across the room would survive and the 360 px one at the desk --
+    the subject, by this class's own rule -- would be thrown away, taking
+    the attention verdict onto the wrong head."""
+    rows = [row(0, 0, 2, 2, conf=0.99), row(3, 0, 2, 2, conf=0.98),
+            row(6, 0, 2, 2, conf=0.97), row(9, 0, 9, 9, conf=0.80)]
+    det = FakeDetector(rows=rows, input_size=(32, 18))
+    tracker = FakeTracker([True])
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=det, tracker=tracker,
+                              observe=observer())
+    shot = pipe.grab((16, 9))
+    assert len(shot.faces) == cp.MAX_FACES
+    assert shot.primary.conf == pytest.approx(0.80)   # the BIG one survived
+    assert shot.faces[0] is shot.primary
+    assert shot.faces[0].attending is True            # …and it is the subject
+    # The reduction is bounded too, so a detector with a runaway top_k
+    # cannot cost the capture thread a visible amount of arithmetic.
+    assert cp.MAX_ROWS >= 16
 
 
 def test_a_frame_with_no_face_tells_the_tracker_so_rather_than_going_quiet():
@@ -491,6 +520,172 @@ def test_stop_releases_the_device_even_when_the_grab_is_still_in_flight():
     assert pipe.closes >= 1
 
 
+def test_the_ui_thread_is_not_made_to_wait_for_a_wedged_camera_to_let_go():
+    """stop() runs on the TK THREAD -- from _preview_apply, at every
+    ACTIVE->AMBIENT edge, i.e. every 45 s of quiet. A 130 ms grab there is
+    eight consecutive 60 Hz slots and the console visibly stops dead, which
+    is the symptom this module's threading exists to avoid. So the console
+    passes join=False: the deny still happens before stop() returns, only
+    the device handback moves off the caller."""
+    pipe = FakePipeline(delay=1.5)
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         pipeline=pipe, sensing=Policy())
+    w.start()
+    time.sleep(0.05)
+    t0 = time.monotonic()
+    w.stop(join=False)
+    blocked = time.monotonic() - t0
+    # One 60 Hz slot is 16.67 ms. The call must not be a fraction of it.
+    assert blocked < 0.005, "stop() blocked the caller %.1f ms" % (
+        blocked * 1000)
+    assert w.running is False                  # …and the deny is immediate
+    assert w.latest().reason == cp.REASON_DISABLED
+    assert w.latest().image is None
+    for _ in range(300):                       # the device still comes back
+        if pipe.closes:
+            break
+        time.sleep(0.01)
+    assert pipe.closes >= 1
+
+
+def test_a_frame_that_arrives_after_the_switch_is_dropped_not_stored():
+    """"stop() means no frame is held" has to survive a grab that outlasts
+    the bounded join, not only a 130 ms one. The capture thread finishes its
+    in-flight read after the switch went off; that frame must not land in
+    the slot."""
+    started, release = threading.Event(), threading.Event()
+
+    class WedgedPipeline(FakePipeline):
+        def grab(self, box, seq=0):
+            started.set()
+            release.wait(3.0)
+            return cp.PreviewShot(image=object(), cap_w=box[0], cap_h=box[1],
+                                  reason=cp.REASON_LIVE, seq=seq)
+
+    pipe = WedgedPipeline()
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         pipeline=pipe, sensing=Policy())
+    w.start()
+    assert started.wait(2.0)
+    w.stop(timeout=0.2)                        # times out on the wedged grab
+    assert w.latest().image is None
+    release.set()                              # now the grab comes back
+    time.sleep(0.15)
+    assert w.latest().reason == cp.REASON_DISABLED
+    assert w.latest().image is None, "a frame was held after stop()"
+
+
+def campreview_threads() -> int:
+    return sum(1 for t in threading.enumerate()
+               if t.is_alive() and t.name == "campreview")
+
+
+def test_a_stop_that_timed_out_cannot_be_revived_by_the_next_start():
+    """The stop event is PER GENERATION and is never cleared.
+
+    A single shared flag would be un-set by the next start(), reviving the
+    thread still inside the wedged read -- so two of them would drive one
+    device for the life of the process, racing in jarvis/eye.py's lockless
+    capture() (where one can reach release() while the other is inside
+    read()) and in this object's own non-atomic counters. Each wedge and
+    restart would add another permanent thread.
+
+    The successor is held on the capture lease rather than refused, so the
+    pane comes back by itself the moment the wedged read returns -- and it
+    waits there, not on the Tk thread.
+    """
+    inside, seen = [], []
+    gate = threading.Lock()
+    release = threading.Event()
+
+    class SharedFeedPipeline(FakePipeline):
+        """ONE object across both generations, the way a real
+        services.camera_feed is: _close_pipeline drops the reference but
+        the device behind it is the same device."""
+
+        def grab(self, box, seq=0):
+            with gate:
+                inside.append(threading.current_thread().ident)
+                seen.append(len(inside))
+            try:
+                release.wait(2.0)
+                return cp.PreviewShot(image=object(), cap_w=box[0],
+                                      cap_h=box[1], reason=cp.REASON_LIVE,
+                                      seq=seq)
+            finally:
+                with gate:
+                    inside.pop()
+
+    pipe = SharedFeedPipeline()
+    before = campreview_threads()
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         make_pipeline=lambda: pipe, sensing=Policy())
+    try:
+        w.start()
+        for _ in range(400):
+            if seen:
+                break
+            time.sleep(0.005)
+        assert seen, "the first capture never reached the device"
+        w.stop(timeout=0.05)                   # the join times out
+        first = w._thread                      # noqa: SLF001 - the point
+        assert first is None                   # running says False…
+        w.start()                              # …and he switches it back on
+        second = w._thread                     # noqa: SLF001
+        assert second is not None
+        time.sleep(0.15)                       # plenty of time to double up
+        assert max(seen) == 1, \
+            "two capture threads were inside the device at once"
+        release.set()                          # the wedged read comes back
+        for _ in range(400):                   # …and the successor takes over
+            if len(seen) > 1:
+                break
+            time.sleep(0.005)
+        assert len(seen) > 1, "the pane never came back after the wedge"
+        assert max(seen) == 1
+    finally:
+        release.set()
+        w.stop(timeout=2.0)
+    for _ in range(400):                       # no thread is left behind
+        if campreview_threads() <= before:
+            break
+        time.sleep(0.005)
+    assert campreview_threads() <= before
+
+
+def test_the_last_pass_of_a_stopped_run_cannot_overwrite_the_live_one():
+    """A superseded generation finishing its last pass must not write its
+    stale verdict over the picture the new one is publishing."""
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         pipeline=FakePipeline(), sensing=Policy())
+    old = w._stop                              # noqa: SLF001 - the point
+    w.start()                                  # mints a NEW generation
+    live = w.cycle()
+    assert live.live is True
+    w._publish(cp.blank(cp.REASON_DISABLED), old)   # noqa: SLF001
+    assert w.latest() is live                  # the old run was ignored
+    w.stop()
+
+
+def test_the_value_he_just_clicked_beats_a_config_that_has_not_landed():
+    """SettingsDrawer._set_option writes assistant.json on a daemon thread
+    and echoes to the console synchronously, so the ON path holds the new
+    value while a re-read here could still see the old one -- and a stale
+    False would pack the pane and then refuse to capture behind it."""
+    stale = options()                          # what the file still says
+    w = cp.PreviewWorker(get_option=stale, pipeline=FakePipeline(),
+                         sensing=Policy())
+    assert w.start() is False                  # …without the override
+    assert w.start(enabled=True) is True       # …and with it
+    try:
+        assert w.latest().reason != cp.REASON_DISABLED
+    finally:
+        w.stop()
+    # The OFF direction never re-reads at all, so it cannot race either.
+    w.set_enabled(False)
+    assert w.running is False
+
+
 # ---------------------------------------------------------- the rate caps
 def test_the_capture_rate_is_capped_under_what_the_device_delivers():
     """~7.5 fps measured. Asking for 30 does not buy 30 frames, it buys a
@@ -526,10 +721,11 @@ def test_the_app_feed_wins_and_a_second_one_is_never_built():
         return object(), ""
 
     services = type("S", (), {"camera_feed": "the app's feed"})()
-    feed, reason = cp.resolve_feed(services, options(), Policy(), build)
+    feed, reason, owned = cp.resolve_feed(services, options(), Policy(), build)
     assert feed == "the app's feed"
     assert reason == ""
     assert built == []
+    assert owned is False              # BORROWED -- see close(), below
 
 
 def test_with_no_app_feed_the_preview_builds_one_through_the_gated_path():
@@ -541,18 +737,20 @@ def test_with_no_app_feed_the_preview_builds_one_through_the_gated_path():
         return "a gated feed", ""
 
     policy = Policy()
-    feed, reason = cp.resolve_feed(None, options(**{"camera.hfov_deg": 65.6}),
-                                   policy, build)
+    feed, reason, owned = cp.resolve_feed(
+        None, options(**{"camera.hfov_deg": 65.6}), policy, build)
     assert feed == "a gated feed"
     assert seen["hfov"] == 65.6            # the config reaches camera.build
     assert seen["policy"] is policy        # …and so does the sensing owner
+    assert owned is True                   # we opened it, we close it
 
 
 def test_no_sensing_owner_means_no_feed_is_built_at_all():
     built = []
-    feed, reason = cp.resolve_feed(None, options(), None,
-                                   lambda *_a: (built.append(1), None)[1])
+    feed, reason, owned = cp.resolve_feed(
+        None, options(), None, lambda *_a: (built.append(1), None)[1])
     assert feed is None
+    assert owned is False
     assert "sensing" in reason
     assert built == []
 
@@ -560,9 +758,52 @@ def test_no_sensing_owner_means_no_feed_is_built_at_all():
 def test_a_build_that_explodes_is_a_reason_not_an_exception():
     def build(_cfg, _policy):
         raise RuntimeError("v4l2 said no")
-    feed, reason = cp.resolve_feed(None, options(), Policy(), build)
+    feed, reason, owned = cp.resolve_feed(None, options(), Policy(), build)
     assert feed is None
+    assert owned is False
     assert "v4l2 said no" in reason
+
+
+def test_the_apps_own_feed_is_never_closed_by_the_preview():
+    """``CameraFeed.close()`` bumps the gate epoch and releases the raw
+    device, so a preview that closed the app's lens would discard another
+    consumer's in-flight read and force a reopen -- on every ambient
+    transition, every curfew edge and every toggle-off. The preview stops
+    READING it; whether it shuts is the sensing owner's ruling."""
+    feed = FakeFeed()
+    pipe = cp.PreviewPipeline(feed, owned=False)
+    pipe.close()
+    assert feed.closes == 0                 # borrowed: left to its owner
+    assert pipe.feed is None                # …but this object stops reading
+
+
+def test_a_feed_the_preview_built_itself_is_the_preview_to_close():
+    feed = FakeFeed()
+    pipe = cp.PreviewPipeline(feed, owned=True)
+    pipe.close()
+    assert feed.closes == 1
+
+
+def test_a_curfew_edge_does_not_shut_the_lens_the_app_handed_over():
+    """The failure mode this pairs with: the sensing branch calls
+    _close_pipeline on every denial, so a borrowed feed would be closed
+    from under the app the first time the curfew engaged."""
+    feed = FakeFeed()
+    services = type("S", (), {"camera_feed": feed})()
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         services=services,
+                         sensing=Policy(State(camera=True)),
+                         make_pipeline=lambda: cp.build_pipeline(
+                             services, options(), Policy(), feed=feed,
+                             owned=False))
+    assert w.cycle().live is True
+    w.sensing = Policy(State(camera=False, reason="curfew",
+                             curfew=((21, 0), (7, 0))))
+    shot = w.cycle()
+    assert shot.reason == cp.REASON_SENSING
+    assert shot.image is None
+    assert feed.closes == 0                 # …and the app still has its lens
+    assert feed.captures == 1               # the preview stopped reading it
 
 
 # ---------------------------------------------------------- the reduction

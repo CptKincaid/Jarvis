@@ -50,10 +50,12 @@ SENSING IS CONSULTED BEFORE THE DEVICE, NOT AFTER THE FRAME. ``jarvis/
 sensing.py`` is the single owner of "may this sensor run" -- offline mode, the
 nightly camera curfew, and the fail-to-offline rule. This module asks it at
 the top of every cycle and, when the answer is no, does not call the pipeline
-at all and releases the device it was holding. That is belt-and-braces on top
-of ``Eye``'s own two checks per frame, and it is what makes the pane's stated
-reason trustworthy: the words "camera off (curfew until 7 am)" are printed by
-the same branch that skipped the capture.
+at all and lets go of the device it was holding -- closing it when the preview
+opened it, dropping the reference when the feed is the app's (see
+``PreviewPipeline.close``). That is belt-and-braces on top of ``Eye``'s own two
+checks per frame, and it is what makes the pane's stated reason trustworthy:
+the words "camera off (curfew until 7 am)" are printed by the same branch that
+skipped the capture.
 
 A BLACK RECTANGLE IS NOT AN ANSWER. Every way this can decline names itself
 in ``PreviewShot.reason`` -- the toggle, the sensing owner, a missing vision
@@ -86,6 +88,20 @@ built a second one, the second would silently displace the first and the
 curfew would stop reaching the app's lens. Wiring ``camera_feed`` is therefore
 how the two lanes stay one lens; the fallback exists only because nothing
 attaches a camera on this tree today (verified) and logs loudly when it fires.
+It also means the app's feed is BORROWED, not owned: closing it here would
+bump the gate epoch and release a device another consumer is reading, on every
+ambient transition and every curfew edge, so ``PreviewPipeline.close`` drops a
+borrowed feed instead of shutting it.
+
+THE THREAD'S LIFETIME IS ITS OWN, NOT A SHARED FLAG. Each ``start()`` mints a
+fresh stop event and hands it to that run; ``stop()`` sets it and never clears
+it. A single shared event would be un-set by the next ``start()`` -- reviving
+a thread whose bounded join had timed out, so two of them would drive one
+device forever -- and a run that outlived its own stop could publish a frame
+grabbed after the switch went off. Both are closed here: the generation's
+event gates its own loop, its own capture and its own writes to the slot, and
+a capture lease keeps a wedged thread and its successor from being inside the
+device at the same time.
 """
 from __future__ import annotations
 
@@ -108,8 +124,15 @@ DEFAULT_FPS = 6.0
 # blocking read to always be inside; below 1 the pane stops reading as live.
 MIN_FPS, MAX_FPS = 1.0, 10.0
 # Boxes the pane can draw. Three is a glance, not a dashboard, and the
-# fourth face at his desk is a poster.
+# fourth face at his desk is a poster. The cap is applied AFTER the size
+# sort -- see PreviewPipeline._faces for why the order is the whole point.
 MAX_FACES = 3
+# A WORK bound on the reduction, not a draw cap: every row is reduced before
+# anything is sorted, so a detector with a runaway top_k cannot cost the
+# capture thread a visible amount of arithmetic. YuNet returns its rows
+# score-descending and a real room yields single digits, so dropping the
+# 65th-most-confident detection cannot lose the face at the desk.
+MAX_ROWS = 64
 
 # Why there is no picture. One of these, or "" while a frame is live.
 REASON_LIVE = ""
@@ -186,7 +209,19 @@ class PreviewShot:
     def primary(self) -> Optional[PreviewFace]:
         """The face the readouts talk about: the biggest one. Size, not
         confidence -- at a desk the nearest face is the one at the desk,
-        and a confident 20 px face across the room is not the subject."""
+        and a confident 20 px face across the room is not the subject.
+
+        THIS IS NOT THE RULE ``visionrig.Rig`` USES. The rig picks
+        ``max(faces, key=conf)``; the pane picks the biggest. What the two
+        share is the geometry that produces the numbers -- ``observe``,
+        ``HeadModel``, ``AttentionTracker`` -- so a yaw the pane prints is
+        the same yaw his self-check prints for the same face. With more
+        than one face in frame they can nevertheless report attention on
+        DIFFERENT heads, and that is a real difference, not an oversight:
+        for a pane read at a glance from a desk chair, nearest-is-the-
+        subject is the honest rule. Anyone reconciling the two should
+        change the rig rather than blunt this one.
+        """
         return max(self.faces, key=lambda f: f.w * f.h, default=None)
 
     def numbers_only(self) -> dict:
@@ -322,12 +357,17 @@ class PreviewPipeline:
     ``detect(frame)``); None means the pane shows the reason and no boxes,
     NEVER "nobody is there". That distinction is the whole lesson of the VSS
     yunet path that silently fell back and never once ran.
+
+    ``owned`` says whether shutting the device is this object's business --
+    False for the feed the app handed over. See ``close``.
     """
 
     def __init__(self, feed, detector=None, lens=None, head=None,
                  tracker=None, reason: str = "", observe=None,
-                 now: Callable[[], float] = time.monotonic):
+                 now: Callable[[], float] = time.monotonic,
+                 owned: bool = True):
         self.feed = feed
+        self.owned = bool(owned)
         self.detector = detector
         self.lens = lens
         self.head = head
@@ -374,7 +414,16 @@ class PreviewPipeline:
         the roll-invariant landmark ratio and ``HeadModel`` owns the one
         anthropometric constant that turns it into degrees; a second copy
         in a UI feature is a second copy that can disagree with the number
-        the rig prints in his self-check report.
+        the rig prints in his self-check report. (The SUBJECT rule does
+        differ from the rig's -- see ``PreviewShot.primary``.)
+
+        THE CAP IS APPLIED AFTER THE SORT, and the order is the whole
+        point. YuNet hands its rows back score-descending, so slicing
+        first would keep by CONFIDENCE and drop by confidence: with four
+        detections -- three 20 px faces across the room at 0.99/0.98/0.97
+        and the 360 px one at the desk at 0.80 -- the subject would be the
+        row that got thrown away, and ``_attend`` would then put the
+        attention verdict on a head two metres behind him.
         """
         if rows is None:
             return ()
@@ -383,7 +432,7 @@ class PreviewPipeline:
             return ()
         sx, sy = self._scales(frame_w, frame_h)
         out = []
-        for row in list(rows)[:MAX_FACES]:
+        for row in list(rows)[:MAX_ROWS]:
             try:
                 obs = observe(row, self.lens, sx, sy, self.head)
             except Exception:                      # noqa: BLE001 - one bad row
@@ -396,7 +445,7 @@ class PreviewPipeline:
                                    yaw_deg=float(obs.yaw_deg),
                                    landmarks_ok=bool(obs.landmarks_ok)))
         out.sort(key=lambda f: f.w * f.h, reverse=True)
-        return tuple(self._attend(out))
+        return tuple(self._attend(out[:MAX_FACES]))
 
     def _attend(self, faces: list) -> list:
         """The attention verdict, on the BIGGEST face only.
@@ -478,8 +527,29 @@ class PreviewPipeline:
                            grab_ms=(self._now() - t0) * 1000.0)
 
     def close(self) -> None:
+        """Stop reading the device -- and shut it only if it is OURS.
+
+        The preview closes what it opened. It does NOT close
+        ``services.camera_feed``: that object is the app's lens, the
+        console's own vision lane reads it, and ``CameraFeed.close()``
+        bumps the gate epoch (invalidating every ``_GatedDevice`` already
+        handed out, so an in-flight read elsewhere is discarded) and
+        releases the raw device, which then has to be reopened and have its
+        focus and exposure pinned again. This method is reached on every
+        ACTIVE->AMBIENT transition, every curfew edge and every toggle-off,
+        so closing a borrowed feed would cost the app's lane a device
+        reopen each time the console went quiet.
+
+        What the preview owes when it may not look is to STOP LOOKING, and
+        dropping the reference is that. Whether the lens itself shuts is
+        the sensing owner's ruling (``jarvis/sensing.py`` releases the
+        devices it has attached), not a UI pane's.
+        """
+        feed, self.feed = self.feed, None
+        if feed is None or not self.owned:
+            return
         try:
-            self.feed.close()
+            feed.close()
         except Exception:                          # noqa: BLE001
             log.debug("campreview: the feed would not close", exc_info=True)
 
@@ -542,33 +612,41 @@ def shrink(frame, box: tuple):
 # ------------------------------------------------------------- resolving
 def resolve_feed(services=None, get_option: Optional[Callable] = None,
                  policy=None, build=None) -> tuple:
-    """``(feed, reason)``. Never raises, never opens a device by itself.
+    """``(feed, reason, owned)``. Never raises, never opens a device itself.
 
     The app's own feed wins whenever there is one. See the module docstring
     for why that is a correctness rule and not a preference: two feeds mean
     two ``SensingPolicy.attach`` calls under the same name, the second
     displaces the first, and the curfew stops reaching the lens the first
     one held.
+
+    ``owned`` travels WITH the feed rather than being inferred later,
+    because the two ways of getting one differ in exactly this: a feed the
+    preview built is the preview's to shut, and a feed the app handed over
+    is not (``PreviewPipeline.close``). Inferring it at the closing end --
+    by identity against ``services``, say -- would be a second reading of a
+    fact only this function actually knows.
     """
     feed = getattr(services, "camera_feed", None) if services else None
     if feed is not None:
-        return feed, ""
+        return feed, "", False                     # BORROWED: do not close
     if policy is None:
-        return None, "sensing owner not wired"
+        return None, "sensing owner not wired", False
     maker = build
     if maker is None:
         try:
             from jarvis.camera import build as maker   # noqa: PLC0415
         except Exception as exc:                       # noqa: BLE001
-            return None, "the camera lane is not installed (%s)" % exc
+            return None, "the camera lane is not installed (%s)" % exc, False
     log.warning("campreview: no services.camera_feed; building the preview's "
                 "own gated feed. The app should hand one over instead -- "
                 "SensingPolicy.attach replaces by name, so two feeds mean the "
                 "curfew only reaches the newer one.")
     try:
-        return maker(_CfgView(get_option), policy)
+        feed, reason = maker(_CfgView(get_option), policy)
     except Exception as exc:                           # noqa: BLE001
-        return None, "%s: %s" % (type(exc).__name__, exc)
+        return None, "%s: %s" % (type(exc).__name__, exc), False
+    return feed, reason, feed is not None
 
 
 class _CfgView:
@@ -588,15 +666,21 @@ class _CfgView:
 
 
 def build_pipeline(services=None, get_option: Optional[Callable] = None,
-                   policy=None, feed=None, build=None) -> PreviewPipeline:
+                   policy=None, feed=None, build=None,
+                   owned: bool = True) -> PreviewPipeline:
     """The pipeline, or one whose ``feed`` is None and whose ``reason`` says
     why. Never raises: a camera must not be able to take the console down,
     and a console that failed to build because a webcam was unplugged would
-    be a worse bug than no preview."""
+    be a worse bug than no preview.
+
+    ``owned`` applies only to a ``feed`` passed in directly (the suite's
+    seam); a resolved one carries its own answer back from
+    ``resolve_feed``."""
     cfg = _CfgView(get_option)
     reason = ""
     if feed is None:
-        feed, reason = resolve_feed(services, get_option, policy, build)
+        feed, reason, owned = resolve_feed(services, get_option, policy,
+                                           build)
     if feed is None:
         return PreviewPipeline(None, reason=reason or "no camera feed")
 
@@ -616,7 +700,7 @@ def build_pipeline(services=None, get_option: Optional[Callable] = None,
                  type(exc).__name__, exc)
         reason = reason or "%s: %s" % (type(exc).__name__, exc)
     return PreviewPipeline(feed, detector=detector, lens=lens, head=head,
-                           tracker=tracker, reason=reason)
+                           tracker=tracker, reason=reason, owned=owned)
 
 
 # --------------------------------------------------------------- the loop
@@ -624,10 +708,19 @@ class PreviewWorker:
     """The capture thread, and the latest-wins slot the Tk side reads.
 
     START/STOP IS THE PRIVACY CONTROL, not a visibility flag. ``stop()``
-    joins the thread and closes the feed, so with the toggle off -- or with
-    the console in standby, where nobody is looking at the pane -- there is
-    no thread, no ``capture()`` call and no open device. A worker that kept
-    grabbing behind a hidden widget would be a camera running for nobody.
+    ends the capture and hands the device back, so with the toggle off --
+    or with the console in standby, where nobody is looking at the pane --
+    there is no capture loop, no ``capture()`` call and no device held. A
+    worker that kept grabbing behind a hidden widget would be a camera
+    running for nobody.
+
+    THE DENY IS SYNCHRONOUS; THE HANDBACK NEED NOT BE. Setting the stop
+    event is what guarantees no further frame: the loop checks it before
+    every pass, ``cycle`` checks it before opening anything, and a grab
+    already in flight is DROPPED rather than published. Waiting for the
+    thread is only about giving the device back, so ``stop(join=False)``
+    moves that wait off the caller -- see ``stop`` for why the Tk thread
+    must not do it.
 
     The thread NEVER touches Tk. It writes one immutable ``PreviewShot`` to
     ``self._shot`` under a lock and the UI reads it on its own timer; there
@@ -649,7 +742,12 @@ class PreviewWorker:
             lambda: build_pipeline(services, get_option, sensing))
         self._now = now
         self._sleep = sleep
-        self._lock = threading.Lock()
+        self._lock = threading.Lock()            # guards self._shot
+        self._pipe_lock = threading.Lock()       # guards self._pipeline
+        # ONE capture at a time across generations -- see _run.
+        self._lease = threading.Lock()
+        # The CURRENT generation's stop event. start() mints a new one
+        # rather than clearing this; nothing ever clears a stop event.
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._seq = 0
@@ -671,50 +769,112 @@ class PreviewWorker:
         thread = self._thread
         return thread is not None and thread.is_alive()
 
-    def start(self) -> bool:
+    def start(self, enabled: Optional[bool] = None) -> bool:
         """Begin capturing. Idempotent; False when the toggle says no.
 
         The toggle is read HERE rather than inside the loop so that "off"
         costs no thread at all, which is the difference between a switch
         and a curtain.
+
+        ``enabled`` OVERRIDES that read with a value the caller already
+        has. ``SettingsDrawer._set_option`` writes assistant.json on a
+        daemon thread and echoes to the console synchronously, so the
+        console's ON path holds the new value while a re-read here could
+        still see the old one -- and a stale False would pack the pane and
+        then refuse to capture behind it, saying "OFF -- preview off",
+        with nothing to retry it until the next console mode change. Every
+        other caller (the first build, a mode change) passes nothing and
+        gets the config read.
         """
         if self.running:
             return True
-        if not preview_enabled(self.get_option):
+        want = (preview_enabled(self.get_option) if enabled is None
+                else bool(enabled))
+        if not want:
             self._publish(blank(REASON_DISABLED))
             return False
-        self._stop.clear()
+        # A NEW event, never a cleared one. Clearing would un-set the flag
+        # a PREVIOUS generation is still waiting on -- a stop whose bounded
+        # join timed out leaves exactly such a thread, inside a blocking
+        # read -- and revive it, so two threads would drive one device for
+        # the life of the process, racing in jarvis/eye.py's lockless
+        # capture() and in this object's own counters.
+        self._stop = stop = threading.Event()
         self._publish(blank(REASON_WAITING))
-        self._thread = threading.Thread(target=self._run, daemon=True,
-                                        name="campreview")
+        self._thread = threading.Thread(target=self._run, args=(stop,),
+                                        daemon=True, name="campreview")
         self._thread.start()
         return True
 
-    def stop(self, timeout: float = 2.0) -> None:
-        """End the capture and RELEASE the device. Idempotent, never raises.
+    def stop(self, timeout: float = 2.0, join: bool = True) -> None:
+        """End the capture and hand the device back. Idempotent, never
+        raises.
 
-        The join is bounded because the thread may be inside a 130 ms grab
-        (and, on a wedged camera, considerably longer); the feed is closed
-        regardless, which is the same ordering of risks ``CameraFeed.
-        _close_raw`` settled on -- a privacy control that can be postponed
-        indefinitely by a stuck device is not one.
+        WHAT IS SYNCHRONOUS: the stop event is set and the slot says
+        "disabled" before this returns. That is the deny, and it is
+        complete -- the loop will not start another pass, ``cycle`` will
+        not open anything, and a grab already in flight is dropped instead
+        of published.
+
+        WHAT MAY NOT BE: the join. The thread can be inside a 130 ms grab
+        (measured on his LifeCam) or, on a wedged camera, inside one for
+        seconds, and this is called on the TK THREAD -- from
+        ``_preview_apply`` at every ACTIVE->AMBIENT edge, which is every
+        45 s of quiet. 130 ms there is eight consecutive 60 Hz slots: the
+        console visibly stopping dead, which is precisely the symptom this
+        module's threading exists to avoid. So ``join=False`` hands the
+        wait and the device handback to a throwaway daemon thread and
+        returns at once; the console passes it, and quit passes the
+        default and waits.
+
+        The join is bounded either way, because a privacy control that can
+        be postponed indefinitely by a stuck device is not one -- the same
+        ordering of risks ``CameraFeed._close_raw`` settled on.
         """
         self._stop.set()
         thread, self._thread = self._thread, None
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=timeout)
-            if thread.is_alive():
-                log.warning("campreview: the capture thread did not stop in "
-                            "%.1fs; closing the device anyway", timeout)
-        self._close_pipeline()
         self._publish(blank(REASON_DISABLED))
+        if thread is None or not thread.is_alive():
+            self._close_pipeline()
+            return
+        if join:
+            self._release(thread, timeout)
+            return
+        threading.Thread(target=self._release, args=(thread, timeout),
+                         daemon=True, name="campreview-stop").start()
+
+    def _release(self, thread: threading.Thread, timeout: float) -> None:
+        """Wait briefly for the capture thread, and take the device back
+        MYSELF only if it did not stop.
+
+        A thread that exits cleanly closes the pipeline on its own way out
+        (``_loop``), so closing again from here would be a no-op at best --
+        and at worst would close a pipeline a NEW generation had built in
+        the gap, since with ``join=False`` this runs concurrently with
+        whatever the console does next. The close here is for the wedged
+        case only, and it stays unconditional there because a privacy
+        control that can be postponed indefinitely by a stuck device is
+        not one.
+
+        Off the Tk thread whenever ``stop(join=False)`` was used. Never
+        raises: this is the last thing that runs on a teardown path.
+        """
+        try:
+            thread.join(timeout=timeout)
+        except Exception:                     # noqa: BLE001 - a teardown path
+            log.debug("campreview: the join failed", exc_info=True)
+        if not thread.is_alive():
+            return
+        log.warning("campreview: the capture thread did not stop in %.1fs; "
+                    "releasing the device without it", timeout)
+        self._close_pipeline()
 
     def set_enabled(self, enabled: bool) -> None:
-        """The settings toggle, live. Starting re-reads the option, so this
-        is safe to call before the write has landed on disk only in the
-        direction that stops; the drawer writes first."""
+        """The settings toggle, live. The value he just chose is passed
+        through rather than re-read, so this does not race the drawer's
+        write to assistant.json in either direction."""
         if enabled:
-            self.start()
+            self.start(enabled=True)
         else:
             self.stop()
 
@@ -738,7 +898,19 @@ class PreviewWorker:
     # code path by which a log line can carry pixels.
     LOG_EVERY_S = 60.0
 
-    def _publish(self, shot: PreviewShot) -> None:
+    def _publish(self, shot: PreviewShot,
+                 stop: Optional[threading.Event] = None) -> None:
+        """Write the latest-wins slot.
+
+        ``stop`` is the writer's own generation event. A write from a
+        SUPERSEDED generation -- the thread of a stop whose join timed out,
+        finishing its last pass after the pane has been switched back on --
+        is dropped, so it cannot overwrite the live picture with its own
+        stale verdict. Callers on the UI thread pass nothing and always
+        write.
+        """
+        if stop is not None and stop is not self._stop:
+            return
         with self._lock:
             self._shot = shot
         self._maybe_log(shot)
@@ -773,7 +945,15 @@ class PreviewWorker:
             return sensing_failsafe_state()
 
     def _close_pipeline(self) -> None:
-        pipe, self._pipeline = self._pipeline, None
+        """Let go of the pipeline, and of whatever device it owns.
+
+        Locked because two threads can reach it at once now: the releaser
+        started by ``stop(join=False)`` and the capture thread's own exit
+        path. Without the lock both could read the same pipeline and close
+        it twice.
+        """
+        with self._pipe_lock:
+            pipe, self._pipeline = self._pipeline, None
         if pipe is not None:
             pipe.close()
 
@@ -786,53 +966,94 @@ class PreviewWorker:
         gap = at - last
         return (1.0 / gap) if last and 0.0 < gap < 10.0 else 0.0
 
-    def cycle(self) -> PreviewShot:
+    def cycle(self, stop: Optional[threading.Event] = None) -> PreviewShot:
         """One pass, exposed so the suite can drive the loop body without a
-        thread. Publishes and returns the shot."""
+        thread. Publishes and returns the shot.
+
+        ``stop`` is the calling generation's event; the loop passes its
+        own, and a direct caller gets the current one. It is checked
+        TWICE: before anything is opened, and again after the grab
+        returns.
+        """
+        stop = self._stop if stop is None else stop
         self.cycles += 1
         seq = self._next_seq()
         state = self._sensing_state()
         if not camera_allowed(state):
-            # Not "grab and discard": the device is not opened, and one that
-            # was open is released. Enforcement at the device is the ruling.
+            # Not "grab and discard": the device is not opened, and the
+            # pipeline lets go of it -- closing one the preview opened,
+            # dropping a borrowed one for its owner to shut. Enforcement
+            # before the device is the ruling.
             self._close_pipeline()
             shot = blank(REASON_SENSING, sensing_detail(state), seq=seq,
                          at=time.time())
-            self._publish(shot)
+            self._publish(shot, stop)
+            return shot
+        if stop.is_set():
+            # Switched off between the loop's check and here. No device is
+            # opened for a session that is already over.
+            shot = blank(REASON_DISABLED, seq=seq, at=time.time())
+            self._publish(shot, stop)
             return shot
         if self._pipeline is None:
-            self._pipeline = self._make()
+            with self._pipe_lock:
+                if self._pipeline is None:
+                    self._pipeline = self._make()
         pipe = self._pipeline
         if pipe is None or getattr(pipe, "feed", None) is None:
             shot = blank(REASON_PIPELINE,
                          getattr(pipe, "reason", "") or
                          REASON_WORDS[REASON_PIPELINE], seq=seq,
                          at=time.time())
-            self._publish(shot)
+            self._publish(shot, stop)
             return shot
         shot = pipe.grab(self.box, seq=seq)
-        if shot.live:
+        if stop.is_set():
+            # THE SWITCH WENT OFF WHILE THIS GRAB WAS IN FLIGHT. The frame
+            # came back after he said stop, so it is dropped here rather
+            # than stored in the slot -- "stop() means no frame is held"
+            # has to survive a wedged 2 s read, not only a 130 ms one.
+            shot = blank(REASON_DISABLED, seq=seq, at=time.time())
+        elif shot.live:
             shot = PreviewShot(image=shot.image, faces=shot.faces,
                                cap_w=shot.cap_w, cap_h=shot.cap_h,
                                reason=shot.reason, detail=shot.detail,
                                seq=shot.seq, at=shot.at,
                                fps=self._measure_fps(self._now()),
                                grab_ms=shot.grab_ms)
-        self._publish(shot)
+        self._publish(shot, stop)
         return shot
 
-    def _run(self) -> None:
+    def _run(self, stop: threading.Event) -> None:
+        """One generation of capture, behind the lease.
+
+        ONE CAPTURE AT A TIME, whatever happened to the last one. A
+        ``stop()`` whose bounded join timed out leaves a thread inside a
+        blocking read; without this lease it and its successor would be in
+        the device together, and ``jarvis/eye.py``'s ``capture()`` has no
+        lock -- so a ``release()`` on one thread can land inside a
+        ``read()`` on the other, and the counters here are non-atomic
+        read-modify-writes besides. The successor waits HERE, off the Tk
+        thread, and starts the moment the wedged read returns.
+        """
+        with self._lease:
+            if stop.is_set():                 # stopped while it waited
+                return
+            self._loop(stop)
+
+    def _loop(self, stop: threading.Event) -> None:
         period = 1.0 / preview_fps(self.get_option)
         log.info("campreview: capturing at up to %.1f fps into a %dx%d box",
                  1.0 / period, self.box[0], self.box[1])
-        while not self._stop.is_set():
+        while not stop.is_set():
             t0 = self._now()
             try:
-                self.cycle()
+                self.cycle(stop)
             except Exception:                 # noqa: BLE001 - the loop lives
                 log.exception("campreview: a capture cycle failed")
                 self._publish(blank(REASON_NO_FRAME, "the capture failed",
-                                    seq=self._next_seq(), at=time.time()))
+                                    seq=self._next_seq(), at=time.time()),
+                              stop)
             # Wait on the STOP EVENT rather than sleeping: a toggle-off must
             # not have to wait out a frame period, and a busy-wait on a
             # 130 ms device would burn a core for nothing.
@@ -840,6 +1061,6 @@ class PreviewWorker:
             if self._sleep is not None:
                 self._sleep(max(0.0, left))
             elif left > 0:
-                self._stop.wait(left)
+                stop.wait(left)
         self._close_pipeline()
         log.info("campreview: capture stopped after %d cycles", self.cycles)

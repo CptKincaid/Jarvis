@@ -68,12 +68,15 @@ that is not installed. "camera off (curfew until 7 am)" is checkable; a dark
 box is indistinguishable from a broken feature, and he would have no way to
 tell which he was looking at.
 
-NO PIXELS REACH ANYTHING BUT THIS CANVAS. The image handed in has already
-been reduced to the pane's own box by ``jarvis/campreview.shrink`` on the
-capture thread; this module converts it to a Tk photo and pastes it into ONE
-canvas item. Nothing is saved, nothing is published, no function here returns
-an image, and ``tests/test_camera_preview.py`` greps this file for the ways a
-frame could reach a disk.
+NO PIXELS REACH ANYTHING BUT THIS CANVAS, AND NOT FOR LONGER THAN THE VIEW
+IS ON. The image handed in has already been reduced to the pane's own box by
+``jarvis/campreview.shrink`` on the capture thread; this module converts it to
+a Tk photo and pastes it into ONE canvas item. Nothing is saved, nothing is
+published, no function here returns an image, and
+``tests/test_camera_preview.py`` greps this file for the ways a frame could
+reach a disk. When the view goes off -- his toggle, the sensing owner, the
+ambient surface, quit -- ``_clear_picture`` drops the photo as well as hiding
+it, because a hidden ``PhotoImage`` is a frame the process is still holding.
 
 EVERY COLOUR IS READ AT CALL TIME. ``select_look`` re-derives the tokens at
 runtime, so a module constant such as ``BOX = theme.CYAN`` would freeze the
@@ -252,9 +255,19 @@ def tone_ink(tone: str) -> str:
 def box_ink(attending: bool, primary: bool = True) -> str:
     """The face rectangle's stroke. The tracked face is focal white when it
     is inside the cone and structure cyan when it is not; every other face
-    is drawn dimmer so the subject is obvious at a glance."""
+    is drawn in the dimmed cyan, so the subject is obvious at a glance
+    while the others are still VISIBLE.
+
+    Dimmed, not faint. The first spelling of this used RAMP33, which
+    measures 2.2:1 (holo) / 2.3:1 (classic) against the dark halo drawn
+    under it -- below any legibility bar, so a secondary box would read as
+    a smudge or as nothing at all, which is indistinguishable from the
+    detector having missed that face. CYAN_DIM is 5.9:1 / 5.2:1 and still
+    well under CYAN's 12.5:1 / 11.0:1, so the hierarchy the pane is read
+    for survives at both ends.
+    """
     if not primary:
-        return theme.RAMP33
+        return theme.CYAN_DIM
     return theme.FOCAL if attending else theme.CYAN
 
 
@@ -266,10 +279,20 @@ def halo_ink() -> str:
 
 
 def chrome_ink() -> str:
-    """The picture box's 1px outline. Holo carries its chrome in bright 1px
-    strokes on black; classic's ground is lifted, so the same value would
-    disappear and the separator token is the right one there."""
-    return theme.GLASS_EDGE if theme.LOOK == "holo" else theme.LINE
+    """The picture box's 1px outline -- GLASS_EDGE in BOTH looks.
+
+    This branched on the look at first, on the reasoning that classic's
+    lifted ground wanted the quieter separator token. Measured, that is
+    backwards: classic LINE is 1.44:1 against the box fill (SURFACE) and
+    1.65:1 against the canvas ground, while GLASS_EDGE is 3.25:1 / 3.73:1.
+    And classic needs the outline MORE, not less -- its SURFACE step is
+    only 1.15:1 above BG, so in the pane's dark state (its default, and its
+    state until the vision lane lands) the outline is the only thing
+    separating the picture box from the panel. At 1.44:1 there would be no
+    box at all: readouts floating on the ground, which is exactly the "hole
+    in the panel" the filled SURFACE is there to prevent.
+    """
+    return theme.GLASS_EDGE
 
 
 def pane_visible(mode: str, enabled: bool) -> bool:
@@ -407,13 +430,29 @@ class CameraPreview(tk.Frame):
         self._tick()
 
     def stop(self) -> None:
+        """Stop polling AND let go of the frame on screen.
+
+        The clear belongs here rather than only in ``_paint`` because the
+        OFF paths never paint again: ``MainWindow._preview_apply`` stops
+        the pane, stops the capture and then ``pack_forget``s the widget,
+        so a stop that only cancelled the timer would unmap a pane still
+        displaying -- and still holding -- the last frame, with no poll
+        left to clear it. Putting it here covers the settings toggle, the
+        ambient/standby transition and quit in one place.
+
+        ``_seq`` is reset so the next shot always repaints: after a clear,
+        a poll that found the same sequence number and returned early
+        would leave the pane dark over a live capture.
+        """
         job, self._job = self._job, None
-        if job is None:
-            return
-        try:
-            self.after_cancel(job)
-        except Exception:                    # noqa: BLE001 - a dead window
-            log.debug("preview: after_cancel on a dead widget", exc_info=True)
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:                # noqa: BLE001 - a dead window
+                log.debug("preview: after_cancel on a dead widget",
+                          exc_info=True)
+        self._seq = -1
+        self._clear_picture()
 
     def _tick(self) -> None:
         try:
@@ -495,12 +534,35 @@ class CameraPreview(tk.Frame):
             return text
 
     def _clear_picture(self) -> None:
+        """Hide the picture AND release its pixels.
+
+        Hiding alone is not enough, and the difference is the whole point
+        of this method. ``ImageTk.PhotoImage`` keeps the reduced frame in a
+        Tk image buffer for as long as anything references it, so a merely
+        hidden item would leave the last frame he was shown alive in the
+        process -- and in Tk's image store, with the canvas item still
+        pointing at it -- for the life of the app, underneath the words
+        "camera off". Dropping the last Python reference is what makes
+        ``PhotoImage.__del__`` delete the Tk image and free the buffer.
+
+        The item is pointed at "" BEFORE the reference goes, so Tk is not
+        left holding the name of an image that is being deleted.
+
+        The cost is one ``PhotoImage`` rebuild per on/off cycle, not per
+        frame, so the paste-don't-replace design in ``_show_image`` is
+        untouched.
+        """
         try:
-            self.canvas.itemconfigure(self._img, state="hidden")
+            self.canvas.itemconfigure(self._img, image="", state="hidden")
         except Exception:                    # noqa: BLE001
             log.debug("preview: could not hide the picture", exc_info=True)
-        for item in self._shadows + self._boxes + self._brackets:
-            self.canvas.itemconfigure(item, state="hidden")
+        self._photo = None
+        self._photo_size = (0, 0)
+        try:
+            for item in self._shadows + self._boxes + self._brackets:
+                self.canvas.itemconfigure(item, state="hidden")
+        except Exception:                    # noqa: BLE001 - a dead window
+            log.debug("preview: could not hide the overlay", exc_info=True)
 
     def _show_image(self, image) -> bool:
         """Install the frame. Returns whether there is a picture to place.
