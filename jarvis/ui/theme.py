@@ -271,6 +271,12 @@ def _derive(name: str) -> None:
         "working":   t["CYAN_DIM"],   # a Claude task is running
         "error":     t["ERR"],
         "offline":   t["FAINT"],
+        # 2026-09-03 (ui-polish U05/U07): the boot pill and the ringing
+        # alarm. FAINT for loading -- the lamp is not lit yet -- and amber
+        # for the alarm, which is the semantic budget's one loud colour
+        # short of a fault (ERR stays the error state's).
+        "loading":   t["FAINT"],
+        "alarm":     t["WARN"],
     }
 
     globals().update(t)

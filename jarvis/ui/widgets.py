@@ -821,6 +821,12 @@ class StatePill(tk.Canvas):
 
     WORDS = ("READY", "LISTENING", "THINKING", "SPEAKING", "ERROR")
     HEIGHT, PAD_X, DOT, GAP = 26, 4, 8, 4      # design units, == SensingBadge
+    # Dot shapes -- the sensing badge's third channel, borrowed (2026-09-03,
+    # ui-polish U05): DISC is Jarvis's own states; RING (outline only) is
+    # the two Claude-task states, so "Jarvis is busy" and "Claude is busy"
+    # part at a glance without a fourth colour. Measured before: WORKING's
+    # dot was (24,153,189), pixel-identical to READY's.
+    DOT_DISC, DOT_RING = "disc", "ring"
 
     def __init__(self, parent, bg=None):
         bg = bg or parent.cget("bg")
@@ -830,6 +836,7 @@ class StatePill(tk.Canvas):
         self._pill_h = px(self.HEIGHT)
         self._pill_w = 0
         self._dot_color = theme.CYAN_DIM
+        self._dot_shape = self.DOT_DISC
         self._word_text = self.WORDS[0]
         self._word_color = theme.FOCAL
         super().__init__(parent, width=1, height=self._pill_h, bg=bg,
@@ -916,23 +923,33 @@ class StatePill(tk.Canvas):
         r = px(self.DOT) / 2.0
         dx, dy = px(self.PAD_X) + r, pill_h / 2.0
         self._dot = self.create_oval(dx - r, dy - r, dx + r, dy + r,
-                                     fill=self._dot_color, outline="",
-                                     tags=("pill",))
+                                     width=max(1, px(1)), tags=("pill",),
+                                     **self._dot_paint())
         self._word = self.create_text(
             px(self.PAD_X) + px(self.DOT) + px(self.GAP), pill_h // 2,
             anchor="w", text=self._word_text, fill=self._word_color,
             font=self._font, tags=("pill",))
 
-    def set_state(self, word: str, dot_color: str, word_color: str):
+    def _dot_paint(self) -> dict:
+        """fill/outline for the dot in its current colour and shape: a
+        disc is filled with no outline, a ring is the outline alone."""
+        if self._dot_shape == self.DOT_RING:
+            return dict(fill="", outline=self._dot_color)
+        return dict(fill=self._dot_color, outline="")
+
+    def set_state(self, word: str, dot_color: str, word_color: str,
+                  shape: str = DOT_DISC):
         self._word_text, self._dot_color = word, dot_color
         self._word_color = word_color
+        self._dot_shape = shape if shape in (self.DOT_DISC, self.DOT_RING) \
+            else self.DOT_DISC
         self._fit(word)
         self.itemconfigure(self._word, text=word, fill=word_color)
-        self.itemconfigure(self._dot, fill=dot_color)
+        self.itemconfigure(self._dot, **self._dot_paint())
 
     def set_dot(self, color: str):
         self._dot_color = color
-        self.itemconfigure(self._dot, fill=color)
+        self.itemconfigure(self._dot, **self._dot_paint())
 
 
 # ----------------------------------------------------------------- Tooltip
