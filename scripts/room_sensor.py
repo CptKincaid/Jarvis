@@ -867,7 +867,13 @@ def cmd_mac(args) -> int:
     exists, writable, detail = _port_state(args.port)
     if not writable:
         raise SystemExit("%s: %s -- run `%s doctor`" % (args.port, detail, sys.argv[0]))
-    res = subprocess.run([str(py), "-m", "esptool", "--port", args.port, "read-mac"],
+    # 115200 EXPLICITLY. esptool's default tries a faster rate first and on the
+    # CP210x board this failed with "Serial data stream stopped: Possible serial
+    # noise or corruption" while 115200 read the MAC first time (MEASURED on the
+    # kitchen board, 2026-09-03). The MAC read is three bytes of traffic; there
+    # is nothing to gain from a faster rate and a whole command to lose.
+    res = subprocess.run([str(py), "-m", "esptool", "--port", args.port,
+                          "--baud", "115200", "read-mac"],
                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     macs = re.findall(r"MAC:\s+([0-9a-f:]{17})", res.stdout)
     if not macs:
