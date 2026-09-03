@@ -344,6 +344,18 @@ class RigReport:
     id_cosine_min: float = 0.0
     id_cosine_p50: float = 0.0
     id_cosine_max: float = 0.0
+    # The GALLERY leg: the same embedding asked "is this him" rather than "is
+    # this the same face as a moment ago". Zero everywhere when no identifier
+    # was supplied, which is the state until he has enrolled.
+    gallery_enrolled: int = 0
+    gallery_match_min: float = 0.0
+    id_matched_frames: int = 0
+    id_unknown_frames: int = 0
+    id_gated_out: int = 0
+    match_min_score: float = 0.0
+    match_p50: float = 0.0
+    match_max: float = 0.0
+    match_ms_p50: float = 0.0
     checks: tuple = ()
 
     @property
@@ -394,6 +406,16 @@ class RigReport:
             out.append("identity   %d pairs  cosine min %.3f p50 %.3f max %.3f"
                        % (self.id_pairs, self.id_cosine_min,
                           self.id_cosine_p50, self.id_cosine_max))
+        if self.gallery_enrolled or self.id_matched_frames or \
+                self.id_unknown_frames:
+            out.append("gallery    %d enrolled  %d matched  %d unknown  "
+                       "%d under the detector bar  %.1fms p50"
+                       % (self.gallery_enrolled, self.id_matched_frames,
+                          self.id_unknown_frames, self.id_gated_out,
+                          self.match_ms_p50))
+            out.append("match      min %.3f  p50 %.3f  max %.3f  against "
+                       "%.3f" % (self.match_min_score, self.match_p50,
+                                 self.match_max, self.gallery_match_min))
         for check in self.checks:
             mark = "n/a " if check.ok is None else ("PASS" if check.ok
                                                     else "FAIL")
@@ -482,6 +504,8 @@ class _Acc:
     level: list = field(default_factory=list)
     contrast: list = field(default_factory=list)
     cosine: list = field(default_factory=list)
+    match: list = field(default_factory=list)
+    ident_id: list = field(default_factory=list)
 
 
 class Rig:
@@ -497,17 +521,26 @@ class Rig:
     all, the reason is carried into the report, and ``ok`` is False. A rig
     that quietly reported "0 faces, all good" with no weights on disk would
     be the VSS bug with a new name.
+    ``identifier`` is a ``jarvis.eye.FaceIdentifier`` -- the enrolled gallery,
+    asked "is this him". It is separate from ``recogniser`` because the two
+    ask different questions: the recogniser leg measures whether consecutive
+    frames of the SAME sitting agree (a stability measurement that needs no
+    enrolment), the identifier leg measures whether the person in the chair
+    matches the gallery on disk. Passing both computes two embeddings per
+    frame, which is ~20 ms and is what a bring-up run wants; production passes
+    one.
     """
 
     def __init__(self, source, detector, lens, thresholds: Thresholds, *,
                  recogniser=None, head: Optional[HeadModel] = None,
-                 detector_reason: str = "",
+                 detector_reason: str = "", identifier=None,
                  now: Callable[[], float] = time.monotonic):
         self.source = source
         self.detector = detector
         self.lens = lens
         self.thresholds = thresholds
         self.recogniser = recogniser
+        self.identifier = identifier
         self.head = head or HeadModel()
         self.detector_reason = detector_reason
         self._now = now
@@ -610,25 +643,40 @@ class Rig:
             # "same person" bar (jarvis/facemodels.py) -- so the embedding is
             # not a second opinion on whether this is a face and must never
             # be computed from one that did not already clear min_conf.
-            if self.recogniser is not None and best is not None and \
+            if (self.recogniser is not None or self.identifier is not None) \
+                    and best is not None and \
                     best.conf >= self.thresholds.min_conf:
-                t3 = self._now()
-                try:
-                    vec = self.recogniser.embed(
-                        frame, rows[int(np.argmax([r[IDX_SCORE]
-                                                   for r in rows]))])
-                except Exception as exc:  # noqa: BLE001
-                    rep.errors += 1
-                    if not rep.reason:
-                        rep.reason = "recogniser: %s" % exc
-                    vec = None
-                acc.ident.append((self._now() - t3) * 1000.0)
-                if vec is not None:
-                    if ref is None:
-                        ref = np.asarray(vec, dtype=np.float32).ravel()
+                row = rows[int(np.argmax([r[IDX_SCORE] for r in rows]))]
+                if self.recogniser is not None:
+                    t3 = self._now()
+                    try:
+                        vec = self.recogniser.embed(frame, row)
+                    except Exception as exc:  # noqa: BLE001
+                        rep.errors += 1
+                        if not rep.reason:
+                            rep.reason = "recogniser: %s" % exc
+                        vec = None
+                    acc.ident.append((self._now() - t3) * 1000.0)
+                    if vec is not None:
+                        if ref is None:
+                            ref = np.asarray(vec, dtype=np.float32).ravel()
+                        else:
+                            acc.cosine.append(_cosine(
+                                np.asarray(vec, dtype=np.float32).ravel(),
+                                ref))
+                if self.identifier is not None:
+                    # The gallery leg. ``identify`` re-checks the same
+                    # confidence bar underneath this branch: identity may
+                    # never be computed from a detection that did not clear
+                    # it, and that rule does not get to depend on the caller.
+                    t4 = self._now()
+                    label, score = self.identifier.identify(frame, row)
+                    acc.ident_id.append((self._now() - t4) * 1000.0)
+                    if label:
+                        rep.id_matched_frames += 1
+                        acc.match.append(float(score))
                     else:
-                        acc.cosine.append(_cosine(
-                            np.asarray(vec, dtype=np.float32).ravel(), ref))
+                        rep.id_unknown_frames += 1
             frame = None            # the frame does not outlive its iteration
             if interval_s:
                 time.sleep(interval_s)
@@ -669,6 +717,15 @@ class Rig:
         rep.id_cosine_min = min(acc.cosine) if acc.cosine else 0.0
         rep.id_cosine_p50 = _pct(acc.cosine, 0.50)
         rep.id_cosine_max = max(acc.cosine) if acc.cosine else 0.0
+        rep.match_min_score = min(acc.match) if acc.match else 0.0
+        rep.match_p50 = _pct(acc.match, 0.50)
+        rep.match_max = max(acc.match) if acc.match else 0.0
+        rep.match_ms_p50 = _pct(acc.ident_id, 0.50)
+        if self.identifier is not None:
+            st = self.identifier.status()
+            rep.gallery_enrolled = int(st.get("enrolled", 0))
+            rep.gallery_match_min = float(st.get("match_min", 0.0))
+            rep.id_gated_out = int(st.get("gated_out", 0))
 
     def _checks(self, rep: RigReport) -> list:
         th = self.thresholds
@@ -725,4 +782,25 @@ class Rig:
                              "%d pairs, cosine p50 %.3f against %.3f"
                              % (rep.id_pairs, rep.id_cosine_p50,
                                 th.identity_min)))
+        if self.identifier is not None:
+            seen = rep.id_matched_frames + rep.id_unknown_frames
+            if not rep.gallery_enrolled:
+                out.append(Check("gallery", None,
+                                 "nothing enrolled -- run "
+                                 "scripts/face_enrol.py"))
+            elif not seen:
+                out.append(Check("gallery", None,
+                                 "%d embeddings enrolled, but no detection "
+                                 "cleared the %.2f bar to be identified from"
+                                 % (rep.gallery_enrolled, th.min_conf)))
+            else:
+                out.append(Check(
+                    "gallery", rep.id_matched_frames > rep.id_unknown_frames,
+                    "%d of %d identified frames matched the gallery at "
+                    "cosine p50 %.3f (min %.3f) against a %.3f bar; %d "
+                    "detections were under the %.2f detector bar and had no "
+                    "embedding computed at all"
+                    % (rep.id_matched_frames, seen, rep.match_p50,
+                       rep.match_min_score, rep.gallery_match_min,
+                       rep.id_gated_out, th.min_conf)))
         return out

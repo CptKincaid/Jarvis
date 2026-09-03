@@ -41,6 +41,15 @@ made at the call site rather than inside the consumer, the same shape VSS's
 future consumer can acquire pixels by accident because no code path produces
 them.
 
+WHO IT IS (``FaceIdentifier``) is the enrolled gallery asked one question,
+under one rule: identity is only ever computed from a detection that already
+cleared the detector's confidence bar, because SFace scores garbage
+CONFIDENTLY rather than low. And a name may only ever REMOVE capability or
+ADD a name -- never grant capability the existing gates do not already grant,
+which is why ``resolve_wake`` promotes exactly as much for a recognised him
+as it does for an anonymous attending face, and less for a recognised
+stranger.
+
 THE FUSION RULE (``resolve_wake``) is the reason to own a camera at all, and
 it is deliberately one-directional: the camera can promote a wake the audio
 gate suppressed, and can never do the reverse. ``jarvis/hotword.py:373-375``
@@ -55,7 +64,7 @@ from typing import Callable, Optional, Tuple
 
 import numpy as np
 
-from jarvis.facegallery import cosine
+from jarvis.facegallery import SFACE_COSINE_SAME, cosine
 from jarvis.logs import get_logger
 
 log = get_logger("eye")
@@ -347,6 +356,129 @@ def resolve_wake(verdict: str, ok: bool, eye: Optional[Attention],
     out.guest_ok = False        # it woke; there is no guest to decline
     out.evidence = evidence
     return out
+
+
+# ------------------------------------------------------- the face identity
+class FaceIdentifier:
+    """The enrolled gallery, asked "who is this", under one hard rule.
+
+    IDENTITY IS ONLY EVER COMPUTED FROM A DETECTION THAT ALREADY CLEARED THE
+    DETECTOR BAR, AND THAT IS ENFORCED HERE IN CODE. SFace's 128-D embedding
+    collapses on out-of-distribution input -- measured on this box 2026-09-02,
+    unrelated NON-FACE crops match each other at mean cosine 0.66-0.92, with
+    94-100% of pairs above the 0.363 "same person" bar
+    (jarvis/facemodels.py). A false-positive box, a motion blur or a bad
+    alignment therefore does not score LOW against the gallery, it scores
+    CONFIDENTLY. The embedding is not a second opinion on whether this is a
+    face and must never be used as one, so a row under ``min_conf`` returns
+    ("", 0.0) with no embedding computed at all, and ``gated_out`` counts how
+    often that happened so the number is visible in a report rather than
+    inferred. ``SFaceRecogniser.embed`` refuses the same row underneath
+    (jarvis/facedetect.py:212-226); two gates on one rule is deliberate.
+
+    ``match_min`` is OpenCV's own documented SFace cosine for "same person",
+    0.363, exported by ``jarvis/facegallery.SFACE_COSINE_SAME`` and settable
+    from ``camera.identity_min``. It is keyword-only for the same reason
+    ``SessionIdentity.match_min`` is: a threshold calibrated for one vector
+    silently applied to another is how a gate stops meaning anything.
+
+    WHAT A NAME MAY DO, which is his standing ruling and not a preference:
+    **identity may REMOVE capability or ADD a name; it must never GRANT
+    capability the existing gates do not already grant.** ``resolve_wake``
+    above is written that way -- ``eye.identity in ("", owner)`` means a
+    recognised stranger BLOCKS a promotion an anonymous face would have got,
+    while a recognised owner promotes exactly what an anonymous single
+    attending face already promoted, and only the log line differs. This
+    class does the same to the body anchor: recognising him anchors it,
+    recognising somebody else drops it. Pinned by
+    tests/test_eye.py::test_recognising_him_grants_nothing_an_anonymous_face_lacked.
+
+    Nothing is retained. The frame belongs to the caller, the crop lives
+    inside the recogniser, and the embedding is dropped before this returns:
+    a body vector never reaches the disk and neither does a face crop.
+    """
+
+    def __init__(self, gallery, recogniser, *, min_conf: float,
+                 match_min: float = SFACE_COSINE_SAME, owner: str = "hunter",
+                 session: Optional["SessionIdentity"] = None):
+        self.gallery = gallery
+        self.recogniser = recogniser
+        self.min_conf = float(min_conf)
+        self.match_min = float(match_min)
+        self.owner = str(owner)
+        self.session = session
+        self.calls = 0
+        self.gated_out = 0        # rows under the bar; no embedding computed
+        self.errors = 0
+        self.matched = 0
+        self.unknown = 0
+
+    def enrolled(self) -> int:
+        try:
+            return int(self.gallery.total())
+        except Exception:  # noqa: BLE001 - a broken gallery is no opinion
+            return 0
+
+    def identify(self, frame, row, body_vec=None) -> Tuple[str, float]:
+        """``(label, score)``, or ``("", 0.0)`` meaning NO OPINION.
+
+        Every way this can decline -- under the bar, no gallery, a recogniser
+        that raised, a score under ``match_min`` -- returns the same pair,
+        because a consumer that has to tell them apart will get one of them
+        wrong, and the safe reading of all four is "the camera does not know
+        who this is", which is today's behaviour byte for byte.
+        """
+        self.calls += 1
+        try:
+            conf = float(np.asarray(row).ravel()[-1])
+        except Exception:  # noqa: BLE001
+            self.errors += 1
+            return "", 0.0
+        if conf < self.min_conf:
+            # THE GATE. Nothing below this line runs on a weak detection.
+            self.gated_out += 1
+            return "", 0.0
+        if self.enrolled() == 0:
+            return "", 0.0
+        try:
+            vec = self.recogniser.embed(frame, row)
+            label, score = self.gallery.match(vec)
+        except Exception:  # noqa: BLE001 - a broken model is not an identity
+            self.errors += 1
+            log.debug("eye: identity failed on a detection", exc_info=True)
+            return "", 0.0
+        finally:
+            vec = None
+        if not label or score < self.match_min:
+            self.unknown += 1
+            # A face that is not confirmed to be him ends the body anchor.
+            # Below the bar the nearest LABEL means nothing -- the gallery
+            # always has a nearest member -- so "matched him weakly" and
+            # "matched somebody else" are the same state, and the anchor may
+            # not survive either. Removing an identity is the direction this
+            # is allowed to act in; granting one is not.
+            if self.session is not None:
+                self.session.room_empty()
+            return "", 0.0
+        self.matched += 1
+        if self.session is not None and body_vec is not None and \
+                label == self.owner:
+            try:
+                self.session.anchor(label, body_vec)
+            except (ValueError, TypeError):
+                # A degenerate body vector is not an anchor. It is also not a
+                # reason to lose the face identification.
+                log.debug("eye: the body vector could not anchor",
+                          exc_info=True)
+        return label, float(score)
+
+    def status(self) -> dict:
+        """Numbers only, for the self-check and the enrolment report."""
+        return {"enrolled": self.enrolled(), "calls": self.calls,
+                "gated_out": self.gated_out, "matched": self.matched,
+                "unknown": self.unknown, "errors": self.errors,
+                "min_conf": self.min_conf, "match_min": self.match_min,
+                "owner": self.owner}
 
 
 # ------------------------------------------------------- the body anchor
