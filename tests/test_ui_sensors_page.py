@@ -23,6 +23,8 @@ THE TWO RULES THIS FILE EXISTS TO HOLD.
 """
 import os
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -162,9 +164,12 @@ def test_the_fault_line_names_offline_mode_rather_than_a_dead_sensor():
 
 
 def test_the_fault_line_says_when_the_breaker_will_try_again():
+    # retry_in_s is the seconds LEFT on the sensor's own deadline. It used
+    # to read cooldown_s, which roomsensor._failed has ALREADY doubled by
+    # the time status() is asked -- see the 09-03 verifier test below.
     line = sp.fault_line({"url": OFFICE.url, "blocked": "", "paused": True,
-                          "fails": 3, "cooldown_s": 60.0})
-    assert "60" in line and "again" in line.lower()
+                          "fails": 3, "cooldown_s": 60.0, "retry_in_s": 30.0})
+    assert "30" in line and "again" in line.lower()
 
 
 def test_a_room_with_no_address_says_so_rather_than_no_answer():
@@ -586,3 +591,370 @@ def test_the_camera_only_ever_arrives_as_the_numbers_only_status_dict():
     # PreviewWorker.status adds)
     for key in ("faces", "reason", "detail", "live", "face"):
         assert key in keys, key
+
+
+# =====================================================================
+# The 2026-09-03 verifier pass. Every test below reproduces a finding
+# that was MEASURED against this branch before it was repaired; the
+# comment on each one is the failure it saw.
+# =====================================================================
+
+# ------------------------------------------------- MAJOR: a failed save
+class _Services:
+    """A services stand-in with the shape jarvis/app.py actually has:
+    ``set_option`` RETURNS False on failure and does not raise."""
+
+    def __init__(self, answer=True, raises=None):
+        self.answer, self.raises = answer, raises
+        self.calls = []
+
+    def set_option(self, key, value):
+        self.calls.append((key, value))
+        if self.raises is not None:
+            raise self.raises
+        return self.answer
+
+
+EDITS = {sp.OPTION_DESK_BAND: [0.8, 1.8],
+         sp.OPTION_ROOM_BAND: [1.8, 4.5],
+         sp.OPTION_CAMERA_OVERRULES: True}
+
+
+def test_a_write_that_returns_false_is_never_reported_as_saved():
+    """THE WORST THING ON THE BRANCH. jarvis/app.py set_option catches
+    internally and RETURNS False -- it does not raise -- so the page's
+    old `try: fn(...) except: log` on a daemon thread could not see a
+    failure at all, and set SAVED_NOTE unconditionally on the next line.
+    He restarts expecting new bands, gets the old ones, and nothing on
+    screen said so. Nothing in this codebase may report a failure as a
+    success."""
+    svc = _Services(answer=False)
+    failed = sp.write_options(svc.set_option, EDITS)
+    assert set(failed) == set(EDITS)
+    text, tone = sp.save_note(failed)
+    assert text != sp.SAVED_NOTE
+    assert "saved" not in text.lower() or "not saved" in text.lower()
+    assert tone == sp.TONE_ERR
+
+
+def test_a_write_that_raises_is_never_reported_as_saved_either():
+    svc = _Services(raises=OSError("read-only file system"))
+    failed = sp.write_options(svc.set_option, EDITS)
+    assert set(failed) == set(EDITS)
+    assert sp.save_note(failed)[0] != sp.SAVED_NOTE
+
+
+def test_the_failure_note_names_the_key_that_would_not_write():
+    text, _tone = sp.save_note((sp.OPTION_ROOM_BAND,))
+    assert sp.OPTION_ROOM_BAND in text
+    assert sp.OPTION_DESK_BAND not in text
+
+
+def test_one_key_failing_is_still_a_failure_and_not_a_partial_success():
+    def half(key, value):
+        return key != sp.OPTION_ROOM_BAND
+    failed = sp.write_options(half, EDITS)
+    assert failed == (sp.OPTION_ROOM_BAND,)
+    assert sp.save_note(failed)[0] != sp.SAVED_NOTE
+
+
+def test_a_write_that_says_nothing_at_all_still_counts_as_saved():
+    """A services object whose set_option returns None (the drawer's own
+    stand-ins do) must not be read as a failure: only an explicit False
+    is one, because that is the value jarvis/app.py returns."""
+    assert sp.write_options(lambda k, v: None, EDITS) == ()
+    assert sp.save_note(())[0] == sp.SAVED_NOTE
+
+
+def test_the_save_is_written_inline_and_not_handed_to_a_daemon_thread():
+    """Two reasons the thread had to go: its result could not reach the
+    note, and a daemon thread means SAVE-then-quit can be killed
+    mid-write. Three set_option calls are an in-memory edit plus one
+    atomic os.replace."""
+    import re as _re
+    src = open(sp.__file__, encoding="utf-8").read()
+    body = src[src.index("    def save(self)"):src.index("    def band_values")]
+    body = _re.sub(r"(?m)#.*$", "", body)
+    assert "Thread(" not in body and "daemon" not in body
+    assert "write_options(" in body and "save_note(" in body
+
+
+# -------------------------------------------- MAJOR: the leaked threads
+class _Blocking:
+    """A transport that parks inside the request until the test lets it
+    go -- the widest form of the race, which is an in-flight HTTP read."""
+
+    def __init__(self):
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.calls = 0
+
+    def __call__(self, url, timeout):
+        self.calls += 1
+        self.entered.set()
+        self.release.wait(5.0)
+        return '{"value": true, "state": "ON"}'
+
+
+def _live_poll_threads() -> int:
+    return sum(1 for t in threading.enumerate()
+               if t.name == sp.POLL_THREAD_NAME and t.is_alive())
+
+
+class _Slow:
+    """A transport that takes 0.3 s, the way an ESP32 mid-answer does. The
+    verifier's probe used 0.6 s against a real worst round trip of 1186 ms;
+    the point is only that stop() lands while a request is in flight."""
+
+    def __init__(self, delay=0.3):
+        self.delay, self.calls = delay, 0
+        self.entered = threading.Event()
+
+    def __call__(self, url, timeout):
+        self.calls += 1
+        self.entered.set()
+        time.sleep(self.delay)
+        return '{"value": true, "state": "ON"}'
+
+
+def _settle(before: int, timeout: float = 5.0) -> int:
+    deadline = time.time() + timeout
+    while time.time() < deadline and _live_poll_threads() > before:
+        time.sleep(0.02)
+    return _live_poll_threads()
+
+
+def test_closing_and_reopening_the_page_leaves_one_poll_loop_not_four():
+    """MEASURED before the repair: four open/close cycles gave live
+    "sensors-page" threads 1, 2, 3, 4 -- four loops all hitting one ESP32
+    at 1 Hz, four presence + four distance requests a second against a
+    device whose p90 is 154 ms, and four repaints a second posted to Tk.
+
+    The cause: stop() dropped the Thread handle without joining and
+    start() then CLEARED the SHARED stop flag out from under the thread
+    still inside get(), so that thread never saw the stop and looped
+    forever. The race window is the whole in-flight HTTP read -- widest
+    for an unreachable sensor, which is exactly the state the page exists
+    to be opened in. A tab is far easier to flip in and out of than F9,
+    so this only gets worse the moment the strip ships.
+
+    Nothing is settled between the toggles ON PURPOSE: letting each
+    orphan notice the flag and exit is precisely what does not happen
+    when he flips the tab quickly, and the bug would not reproduce.
+    """
+    before = _live_poll_threads()
+    slow = _Slow(delay=0.4)
+    poller = sp.SensorPoller([OFFICE], get=slow)
+    try:
+        for _toggle in range(3):
+            slow.entered.clear()
+            poller.start(lambda rows: None, post=lambda fn: None)
+            assert slow.entered.wait(5.0), "the poll thread never started"
+            poller.stop()
+        # ... and now he leaves it open, which is the state that costs him
+        slow.entered.clear()
+        poller.start(lambda rows: None, post=lambda fn: None)
+        assert slow.entered.wait(5.0)
+        assert _settle(before + 1, timeout=4.0) == before + 1, (
+            "more than one poll loop is hitting the room sensor")
+    finally:
+        poller.stop()
+    assert _settle(before) == before
+    settled = slow.calls
+    time.sleep(1.2)                       # more than a poll interval
+    assert slow.calls == settled, "a closed page kept hitting the ESP32"
+
+
+def test_a_stopped_poller_never_polls_again_even_mid_request():
+    """The orphan must not come back to life when the page is reopened:
+    it gets its own stop flag, so a later start() cannot clear it."""
+    gate = _Blocking()
+    poller = sp.SensorPoller([OFFICE], get=gate)
+    poller.start(lambda rows: None, post=lambda fn: None)
+    assert gate.entered.wait(5.0)
+    poller.stop()
+    poller.start(lambda rows: None, post=lambda fn: None)   # reopened
+    poller.stop()
+    gate.release.set()
+    deadline = time.time() + 5.0
+    while time.time() < deadline and _live_poll_threads():
+        time.sleep(0.05)
+    settled = gate.calls
+    time.sleep(0.6)
+    assert gate.calls == settled, "a stopped poller polled again"
+
+
+def test_stop_reports_whether_the_thread_actually_ended():
+    poller = sp.SensorPoller([OFFICE], get=lambda u, t: '{"value": false}')
+    poller.start(lambda rows: None, post=lambda fn: None)
+    assert poller.stop() is True
+
+
+# ------------------------------ MINOR: the retry countdown was 2x and static
+def test_the_retry_countdown_is_the_wait_that_is_left_not_the_next_one():
+    """MEASURED with a frozen clock: at the pass where the breaker opened
+    the page said 'trying again in 60 s' while the real wait was 30 s --
+    and jarvis.log said 30 s for the same event. roomsensor._failed sets
+    _skip_until from the CURRENT cooldown and THEN doubles it, so
+    status()['cooldown_s'] is the NEXT one. The page reads the sensor's
+    own deadline instead, so the number is right AND counts down."""
+    line = sp.fault_line({"url": OFFICE.url, "paused": True, "fails": 3,
+                          "cooldown_s": 60.0, "retry_in_s": 30.0})
+    assert "30" in line and "60" not in line
+    # and it MOVES: the same breaker one repaint later
+    later = sp.fault_line({"url": OFFICE.url, "paused": True, "fails": 3,
+                           "cooldown_s": 60.0, "retry_in_s": 11.0})
+    assert "11" in later and "30" not in later
+
+
+def test_a_status_with_no_deadline_drops_the_number_rather_than_guessing():
+    line = sp.fault_line({"url": OFFICE.url, "paused": True, "fails": 3,
+                          "cooldown_s": 60.0})
+    assert "60" not in line and "again" in line.lower()
+
+
+def test_the_sensor_publishes_the_wait_that_is_left_and_the_log_agrees():
+    """The fix at the source: roomsensor.status() now carries the seconds
+    LEFT, so the page and the one warning line in jarvis.log can no longer
+    disagree by 2x about the same sensor."""
+    from jarvis import roomsensor
+    clock = {"t": 100.0}
+
+    def boom(url, timeout):
+        raise OSError("down")
+
+    s = roomsensor.RoomSensor("http://192.0.2.10", get=boom,
+                              now=lambda: clock["t"], fail_after=1,
+                              cooldown_s=30.0)
+    s.read()
+    assert s.status()["retry_in_s"] == pytest.approx(30.0)
+    assert s.status()["cooldown_s"] == 60.0          # the NEXT one, unchanged
+    clock["t"] += 20.0
+    assert s.status()["retry_in_s"] == pytest.approx(10.0)   # it counts down
+    clock["t"] += 20.0
+    assert s.status()["retry_in_s"] == 0.0
+
+
+# ------------------ MINOR: an out-of-range band was swapped in silence
+def test_a_band_the_config_could_not_use_is_named_rather_than_swapped_quietly():
+    """MEASURED: presence.room_band_m = [1.8, 8.0] rendered as 1.8/4.5
+    with no note anywhere on the page, and one press of SAVE then wrote
+    the 4.5 over his 8.0. The repair stays -- one broken band must not
+    cost him the page -- but it is no longer silent."""
+    cfg = {sp.OPTION_ROOM_BAND: [1.8, 8.0]}
+    bands, notes = sp.read_bands_noted(lambda k, d=None: cfg.get(k, d))
+    assert (bands.room_lo, bands.room_hi) == sp.DEFAULT_ROOM_BAND
+    joined = " ".join(notes).lower()
+    assert "room band" in joined and "8" in joined
+    assert "save" in joined                  # it says SAVE would overwrite it
+
+
+def test_a_band_in_centimetres_is_named_too():
+    cfg = {sp.OPTION_DESK_BAND: [80, 180]}
+    bands, notes = sp.read_bands_noted(lambda k, d=None: cfg.get(k, d))
+    assert (bands.desk_lo, bands.desk_hi) == sp.DEFAULT_DESK_BAND
+    assert "desk band" in " ".join(notes).lower()
+
+
+def test_a_band_that_was_only_reordered_is_repaired_without_a_note():
+    """Swapping the ends loses nothing, so it stays silent: a note for
+    every generosity would train him to ignore the ones that cost data."""
+    cfg = {sp.OPTION_DESK_BAND: [1.8, 0.8]}
+    bands, notes = sp.read_bands_noted(lambda k, d=None: cfg.get(k, d))
+    assert (bands.desk_lo, bands.desk_hi) == (0.8, 1.8)
+    assert notes == ()
+
+
+def test_bands_absent_from_the_config_are_not_a_complaint():
+    _bands, notes = sp.read_bands_noted(lambda k, d=None: d)
+    assert notes == ()
+
+
+# ------------- MINOR: the empty state named only one of the two switches
+def test_the_empty_page_names_the_master_switch_when_that_is_what_is_off():
+    """roomfabric.room_specs() returns [] at its FIRST line when
+    presence.room_sensor_enabled is false, whatever the URL says. The old
+    line always blamed presence.room_sensor_url -- and after 00d5b7e
+    ('URL set, master switch still off') that is the likely next state,
+    so the page would point at the one key that is already right."""
+    cfg = {"presence.room_sensor_enabled": False,
+           "presence.room_sensor_url": "http://192.0.2.10"}
+    line = sp.empty_state_line(lambda k, d=None: cfg.get(k, d))
+    assert "presence.room_sensor_enabled" in line
+    assert "presence.room_sensor_url" not in line
+
+
+def test_the_empty_page_names_the_address_keys_when_the_switch_is_on():
+    cfg = {"presence.room_sensor_enabled": True}
+    line = sp.empty_state_line(lambda k, d=None: cfg.get(k, d))
+    assert "presence.room_sensor_url" in line
+    assert "presence.room_sensor_enabled" not in line
+
+
+def test_the_empty_page_says_the_fix_is_a_hand_edit_and_a_restart():
+    """Nothing on this page can set either switch, so telling him the key
+    without telling him where it lives is half an answer."""
+    for enabled in (True, False):
+        line = sp.empty_state_line(lambda k, d=None, e=enabled: (
+            e if k == "presence.room_sensor_enabled" else d))
+        assert "assistant.json" in line and "restart" in line.lower()
+
+
+# ------------------------------------------ MINOR: no staleness signal
+def test_the_page_says_how_old_the_numbers_are():
+    """A diagnostics page he reads while walking the room had no way to
+    tell him the numbers had stopped moving: Reading.at was captured on
+    every poll and never rendered."""
+    assert sp.age_text(1000.0, 1000.0) == "updated just now"
+    assert "2 s" in sp.age_text(1002.4, 1000.0)
+    assert "1 min" in sp.age_text(1000.0 + 65, 1000.0)
+    assert sp.age_text(1000.0, 0.0) == ""          # nothing has landed yet
+    assert sp.age_text(1000.0, 2000.0) == "updated just now"   # clock skew
+
+
+def test_two_failed_hops_to_the_tk_thread_stop_the_loop_loudly():
+    """Reproduced by driving the page with root.update() instead of
+    mainloop: every self.after() raised 'main thread is not in main loop',
+    the page kept polling, and nothing on screen or at INFO said why. The
+    rows cannot be repainted from a thread that cannot reach Tk, so the
+    honest answer is to stop and say so."""
+    posts = []
+
+    def dead_post(fn):
+        posts.append(fn)
+        raise RuntimeError("main thread is not in main loop")
+
+    poller = sp.SensorPoller([OFFICE], get=lambda u, t: '{"value": true}')
+    poller.start(lambda rows: None, post=dead_post, interval_s=0.2)
+    deadline = time.time() + 5.0
+    while time.time() < deadline and _live_poll_threads():
+        time.sleep(0.05)
+    assert not _live_poll_threads(), "the loop kept polling into a dead Tk"
+    assert len(posts) == sp.POST_FAILS_MAX
+    assert poller.post_failed is True
+    poller.stop()
+
+
+# ------------------------ NIT: the camera was pinned to whichever room is primary
+def test_the_camera_belongs_to_the_room_a_key_says_it_does():
+    """roomfabric forces `primary` onto the FIRST entry when none is
+    marked, so a presence.rooms list that happened to lead with the
+    kitchen would have shown the office camera's recognised face against
+    the kitchen row. camera.room is the key that ties the lens to a room;
+    primary is the default when he has not said."""
+    assert sp.camera_room_name(lambda k, d=None: {"camera.room": "kitchen"}
+                               .get(k, d), [OFFICE, KITCHEN]) == "kitchen"
+    assert sp.camera_room_name(lambda k, d=None: d, [OFFICE, KITCHEN]) == "office"
+    # a name that is not a configured room is ignored rather than silently
+    # giving every row "no camera in this room"
+    assert sp.camera_room_name(lambda k, d=None: {"camera.room": "garage"}
+                               .get(k, d), [OFFICE, KITCHEN]) == "office"
+
+
+# ------------------------------- NIT: fault_line raised on a non-integer
+def test_a_status_dict_with_junk_in_it_cannot_blank_the_whole_page():
+    """page_rows calls fault_line inside the repaint, so a ValueError
+    there takes out every row, not one field."""
+    line = sp.fault_line({"url": OFFICE.url, "fails": "x"})
+    assert line and "opinion" in line.lower()
+    assert sp.fault_line({"url": OFFICE.url, "fails": 2.9})

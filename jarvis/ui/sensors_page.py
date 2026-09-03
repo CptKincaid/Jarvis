@@ -4,14 +4,23 @@ which of them won.
 He asked for "a small GUI" inside the console -- not a browser tab and not
 a second window -- to watch presence while he tunes it::
 
-    JARVIS   [chat] [SENSORS] [*]
-    ---------------------------------
+    JARVIS                            [READY] [SENSING]
+    ---------------------------------------------------
+     [ CHAT ]  [ SENSORS ]      <- jarvis/ui/tab_strip.py
+    ---------------------------------------------------
      office        * PRESENT 1.4 m
        camera      * FACE  hunterp
        verdict     AT THE DESK
      desk band  [0.8]---#---[1.8] m
      room band  [1.8]--#----[4.5] m
      camera overrules radar   [x]
+     [SAVE]                        updated 2 s ago
+
+The tab row is a MODULE OF ITS OWN, one row under the wordmark, and this
+page draws none of it: 2026-09-03, his words, "make a little tab to click
+thats underneath jarvis, that can be the area that has multiple tabs".
+The strip owns show()/hide(), which is also what keeps "polls only while
+it is on screen" true now that flipping in and out is one click.
 
 WHAT THE HARDWARE CAN ACTUALLY TELL HIM, because the page must not imply
 more. The office sensor is an HLK-LD2410C on an ESP32 behind ESPHome's
@@ -123,6 +132,7 @@ TONES = (TONE_OK, TONE_WARN, TONE_ERR, TONE_MUTED, TONE_FAINT)
 # "saved to assistant.json" -- which is a claim, not a caption.
 RESTART_NOTE = "edits apply at the next Jarvis restart — nothing reloads the config"
 SAVED_NOTE = "saved — restart Jarvis to apply it"
+NOT_WIRED_NOTE = "assistant settings not wired"
 
 # ------------------------------------------------------------- the geometry
 # The distance entity, addressed by its NAME exactly as the presence one is:
@@ -148,6 +158,14 @@ OPTION_ROOM_BAND = "presence.room_band_m"
 OPTION_CAMERA_OVERRULES = "presence.camera_overrules"
 
 POLL_S = 1.0                  # while the page is on screen, and only then
+POLL_THREAD_NAME = "sensors-page"
+# How long stop() waits for the loop to end. Short on purpose: it is called
+# from hide(), which is the Tk thread, and the loop is almost always parked
+# in stop.wait() and returns at once. Correctness does not rest on the join
+# -- it rests on the per-run flag, which no later start() can clear.
+JOIN_S = 0.25
+POST_FAILS_MAX = 2            # consecutive failed hops to the Tk thread
+AGE_TICK_MS = 1000            # how often the "updated N s ago" line redraws
 
 
 @dataclass(frozen=True)
@@ -256,7 +274,7 @@ def _finite_cm(value) -> Optional[float]:
 
 # ----------------------------------------------------------------- the bands
 def _pair(value, default: tuple) -> tuple:
-    """One configured band -> an ordered (lo, hi), or the default.
+    """One configured band -> ((lo, hi), was_replaced).
 
     READING THE FILE IS GENEROUS. A hand-edit that swapped the ends is
     ordered rather than dropped, and anything that is not two usable
@@ -264,21 +282,49 @@ def _pair(value, default: tuple) -> tuple:
     must not cost him the page. Typing INTO the page is the other way round
     (band_edits refuses and says why), because a person who just typed
     something wrong should be told, not silently corrected.
+
+    But the generosity is no longer SILENT, which is the half that costs
+    him data: the second return says the value in the file was thrown
+    away, so ``read_bands_noted`` can name it on screen. Measured
+    2026-09-03: ``presence.room_band_m = [1.8, 8.0]`` rendered as 1.8/4.5
+    with no note anywhere, and one press of SAVE wrote the 4.5 over his
+    8.0. REORDERING is not a replacement and says nothing -- nothing was
+    lost, and a note for every kindness teaches him to ignore the ones
+    that matter.
     """
     try:
         lo, hi = (float(value[0]), float(value[1]))
     except (TypeError, ValueError, IndexError, KeyError):
-        return default
+        return default, True
     if not (math.isfinite(lo) and math.isfinite(hi)):
-        return default
+        return default, True
     lo, hi = min(lo, hi), max(lo, hi)
     if lo < 0.0 or hi > MAX_BAND_M or lo >= hi:
-        return default
-    return (lo, hi)
+        return default, True
+    return (lo, hi), False
 
 
-def read_bands(get_option: Optional[Callable]) -> Bands:
-    """The two bands from assistant.json, repaired. Never raises."""
+def _band_note(label: str, raw, default: tuple) -> str:
+    """The sentence for a band the config could not use. It names the
+    band, quotes what was in the file and says what SAVE would do with the
+    substitute, because that is the press that destroys the original."""
+    return ("%s: %s in assistant.json is not usable (two numbers, 0 to "
+            "%.0f m, near end first) — showing the default %.2f–%.2f m, "
+            "and SAVE would write that over it"
+            % (label, _short(raw), MAX_BAND_M, default[0], default[1]))
+
+
+def _short(value) -> str:
+    text = repr(value)
+    return text if len(text) <= 40 else text[:37] + "..."
+
+
+def read_bands_noted(get_option: Optional[Callable]) -> tuple:
+    """(the two bands, repaired) and (what the config lost doing it).
+
+    Never raises. The notes tuple is empty when the file was usable as
+    written -- and when it was merely reordered, which loses nothing.
+    """
     def opt(key, default):
         if not callable(get_option):
             return default
@@ -289,11 +335,86 @@ def read_bands(get_option: Optional[Callable]) -> Bands:
             return default
         return default if value is None else value
 
-    desk = _pair(opt(OPTION_DESK_BAND, list(DEFAULT_DESK_BAND)),
-                 DEFAULT_DESK_BAND)
-    room = _pair(opt(OPTION_ROOM_BAND, list(DEFAULT_ROOM_BAND)),
-                 DEFAULT_ROOM_BAND)
-    return Bands(desk[0], desk[1], room[0], room[1])
+    notes = []
+    out = []
+    for label, key, default in (("desk band", OPTION_DESK_BAND,
+                                 DEFAULT_DESK_BAND),
+                                ("room band", OPTION_ROOM_BAND,
+                                 DEFAULT_ROOM_BAND)):
+        raw = opt(key, None)
+        if raw is None:
+            out.append(default)           # absent is not a complaint
+            continue
+        pair, replaced = _pair(raw, default)
+        out.append(pair)
+        if replaced:
+            log.warning("sensors page: %s is not usable (%s); using %s",
+                        key, _short(raw), default)
+            notes.append(_band_note(label, raw, default))
+    return Bands(out[0][0], out[0][1], out[1][0], out[1][1]), tuple(notes)
+
+
+def read_bands(get_option: Optional[Callable]) -> Bands:
+    """The two bands from assistant.json, repaired. Never raises."""
+    return read_bands_noted(get_option)[0]
+
+
+def empty_state_line(get_option: Optional[Callable]) -> str:
+    """What the page says when no room is configured.
+
+    It BRANCHES, because ``roomfabric.room_specs()`` returns [] at its
+    FIRST line whenever ``presence.room_sensor_enabled`` is false, whatever
+    the address says. The old line always blamed
+    ``presence.room_sensor_url`` -- and since 00d5b7e was about getting
+    that URL right, "URL set, master switch still off" is the likely next
+    state, in which the page would have pointed him at the one key that
+    was already correct.
+
+    Nothing on this page can set either switch, so the line says where
+    they live and that a restart is what applies them.
+    """
+    enabled = False
+    if callable(get_option):
+        try:
+            enabled = bool(get_option("presence.room_sensor_enabled", False))
+        except Exception:                 # noqa: BLE001 - config boundary
+            log.debug("sensors page: the master switch is unreadable",
+                      exc_info=True)
+    where = " — edit ~/.config/jarvis/assistant.json and restart Jarvis"
+    if not enabled:
+        return ("no room sensors: presence.room_sensor_enabled is off, so "
+                "nothing is polled whatever the address says" + where)
+    return ("no room sensors: presence.room_sensor_url and presence.rooms "
+            "are both empty" + where)
+
+
+def camera_room_name(get_option: Optional[Callable], specs) -> str:
+    """Which room the lens is in.
+
+    ``camera.room`` is the key that ties the camera to a room; the PRIMARY
+    room is the default when he has not said. Reading primary ALONE was
+    geometry inferred from an unrelated key: roomfabric forces ``primary``
+    onto the first entry when none is marked, so a ``presence.rooms`` list
+    that happened to lead with the kitchen would have shown the office
+    camera's recognised face against the kitchen row and declared AT THE
+    DESK there. A name that is not a configured room is ignored rather
+    than obeyed, because obeying it gives EVERY row "no camera in this
+    room" and hides the camera leg entirely.
+    """
+    names = [getattr(s, "name", "") for s in (specs or ())]
+    want = ""
+    if callable(get_option):
+        try:
+            want = str(get_option("camera.room", "") or "").strip()
+        except Exception:                 # noqa: BLE001 - config boundary
+            log.debug("sensors page: camera.room unreadable", exc_info=True)
+    if want and want in names:
+        return want
+    if want:
+        log.warning("sensors page: camera.room is %r, which is not a "
+                    "configured room; using the primary one", want)
+    return next((getattr(s, "name", "") for s in (specs or ())
+                 if getattr(s, "primary", False)), "")
 
 
 def read_overrules(get_option: Optional[Callable]) -> bool:
@@ -399,6 +520,51 @@ def band_edits(desk_lo, desk_hi, room_lo, room_hi, overrules) -> tuple:
         values[key] = pair
     values[OPTION_CAMERA_OVERRULES] = bool(overrules)
     return values, ""
+
+
+# ----------------------------------------------------------------- the write
+def write_options(set_option: Callable, edits: dict) -> tuple:
+    """Write every edit. Returns the keys that would NOT write, in order.
+
+    THE ONE RULE THIS FUNCTION EXISTS FOR: in the real app the write does
+    not raise. ``jarvis/app.py`` set_option catches internally and RETURNS
+    False, so a caller that only guarded with try/except could not see a
+    failure at all -- and the page's old save() dispatched these onto a
+    daemon thread and then set "saved — restart Jarvis to apply it"
+    unconditionally on the next line, before the write had even happened.
+    He would restart expecting new bands, get the old ones, and nothing on
+    screen would have said so.
+
+    Only an explicit ``False`` is a failure. ``None`` is not: several
+    services stand-ins in this tree return nothing at all, and reading
+    silence as a failure would put a red line under a write that worked.
+
+    Called INLINE, on the Tk thread. Three set_option calls are an
+    in-memory edit plus one atomic os.replace (mkstemp in the same
+    directory, fsync, replace, chmod 0600), and a daemon thread would also
+    mean SAVE-then-quit could be killed mid-write.
+    """
+    failed = []
+    for key, value in (edits or {}).items():
+        try:
+            ok = set_option(key, value)
+        except Exception:                 # noqa: BLE001 - config boundary
+            log.exception("sensors page: set_option %s failed", key)
+            failed.append(key)
+            continue
+        if ok is False:
+            log.warning("sensors page: %s would not write", key)
+            failed.append(key)
+    return tuple(failed)
+
+
+def save_note(failed) -> tuple:
+    """(the line under the SAVE button, a tone key) for a write's outcome."""
+    keys = tuple(failed or ())
+    if not keys:
+        return SAVED_NOTE, TONE_FAINT
+    return ("NOT SAVED — %s would not write; assistant.json still holds the "
+            "old value" % ", ".join(keys)), TONE_ERR
 
 
 # ---------------------------------------------------------------- the camera
@@ -619,6 +785,44 @@ def fmt_s(value) -> str:
         return DASH
 
 
+def _int_or(value, default: int = 0) -> int:
+    """Every other scalar in fault_line is defended; this one was not, and
+    ``int(data.get("fails") or 0)`` raised ValueError on a non-integer.
+    page_rows calls fault_line INSIDE the repaint, so that would have
+    blanked the whole page rather than one field."""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def age_text(now: float, at: float) -> str:
+    """"updated 2 s ago", or "" when nothing has landed yet.
+
+    The page had no staleness signal at all: ``Reading.at`` was captured on
+    every poll and never rendered, so a diagnostics surface he reads while
+    walking the room could not tell him the numbers had STOPPED moving.
+    It is driven by the page's own 1 s Tk tick rather than by the poll, so
+    a wedged transport makes the number climb instead of freezing it.
+
+    A reading from the future (a clock step) reads as "just now" rather
+    than as a negative age: the honest claim there is that it is fresh.
+    """
+    try:
+        gap = float(now) - float(at)
+    except (TypeError, ValueError):
+        return ""
+    if not math.isfinite(gap) or float(at) <= 0.0:
+        return ""
+    if gap < 1.5:
+        return "updated just now"
+    if gap < 60.0:
+        return "updated %d s ago" % round(gap)
+    if gap < 3600.0:
+        return "updated %d min ago" % int(gap // 60)
+    return "updated over an hour ago"
+
+
 def presence_words(present: Optional[bool]) -> tuple:
     """(word, tone) for the presence bit. NO OPINION is its own state and
     wears the warning tone, so it can never be mistaken for EMPTY at a
@@ -652,8 +856,18 @@ def fault_line(status: Any, present: Optional[bool] = None) -> str:
     if blocked:
         return "not polled — %s" % blocked
     if data.get("paused"):
-        return "no answer — trying again in %s" % fmt_s(data.get("cooldown_s"))
-    fails = int(data.get("fails") or 0)
+        # retry_in_s, NOT cooldown_s: roomsensor._failed arms the breaker
+        # from the current cooldown and THEN doubles it, so cooldown_s is
+        # the NEXT wait -- exactly 2x the truth, and static for the whole
+        # wait. Measured 09-03: the page said 60 s while jarvis.log said
+        # 30 s for the same event. A status dict that carries no deadline
+        # (a stand-in from a future caller) drops the number rather than
+        # guessing at one.
+        left = data.get("retry_in_s")
+        if left is None:
+            return "no answer — trying again shortly"
+        return "no answer — trying again in %s" % fmt_s(left)
+    fails = _int_or(data.get("fails"), 0)
     if fails:
         return "no answer from the sensor (%d in a row)" % fails
     return "no opinion — nothing that reads as presence came back"
@@ -754,8 +968,11 @@ class SensorPoller:
         self.timeout_s = float(timeout_s)
         self._now = now or time.perf_counter
         self._sensors: dict = {}
+        self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
+        # A stop flag PER RUN, not one shared Event -- see stop().
+        self._stop: Optional[threading.Event] = None
+        self.post_failed = False
 
     # ------------------------------------------------------------ one pass
     def _sensor(self, spec) -> RoomSensor:
@@ -816,33 +1033,93 @@ class SensorPoller:
     def start(self, on_rows: Callable, post: Optional[Callable] = None,
               interval_s: float = POLL_S) -> None:
         """Poll on a thread of our own; hand results back through ``post``
-        (the Tk thread hop). Idempotent."""
-        if self._thread is not None and self._thread.is_alive():
-            return
-        self._stop.clear()
+        (the Tk thread hop). Idempotent.
 
-        def loop():
-            while not self._stop.is_set():
-                try:
-                    rows = self.poll_once()
-                except Exception:         # noqa: BLE001 - a diagnostic page
-                    log.exception("sensors page: poll failed")
-                    rows = ()
-                if self._stop.is_set():
+        The stop flag is created HERE, per run, and captured by the loop.
+        The old code shared one Event and cleared it on every start, so a
+        thread still inside a blocking ``get(url, 3.0)`` had its stop flag
+        taken away from under it and looped forever: four open/close cycles
+        measured 4 threads all polling one ESP32 at once. A tab is far
+        easier to flip in and out of than F9, so that only got worse.
+        """
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            stop = threading.Event()
+            self._stop = stop
+            self.post_failed = False
+            thread = threading.Thread(target=self._loop, daemon=True,
+                                      name=POLL_THREAD_NAME,
+                                      args=(stop, on_rows, post, interval_s))
+            self._thread = thread
+        thread.start()
+
+    def _loop(self, stop: threading.Event, on_rows: Callable,
+              post: Optional[Callable], interval_s: float) -> None:
+        """One run of the poll loop, bound to the flag it was started with.
+
+        ``post`` failing twice in a row ENDS the run, loudly. The hop is
+        the only way to the Tk thread, so a loop that cannot make it can
+        no longer repaint anything -- it would poll the ESP32 forever
+        behind a surface frozen on stale numbers, with nothing at INFO
+        saying why (measured: every self.after() raising "main thread is
+        not in main loop" while the page kept polling).
+        """
+        misses = 0
+        while not stop.is_set():
+            try:
+                rows = self.poll_once()
+            except Exception:             # noqa: BLE001 - a diagnostic page
+                log.exception("sensors page: poll failed")
+                rows = ()
+            if stop.is_set():
+                return
+            try:
+                (post or (lambda fn: fn()))(lambda r=rows: on_rows(r))
+                misses = 0
+            except Exception:             # noqa: BLE001 - a dead widget
+                misses += 1
+                if misses >= POST_FAILS_MAX:
+                    self.post_failed = True
+                    log.warning("sensors page: %d repaints in a row could not "
+                                "reach the Tk thread; the poll loop is "
+                                "stopping rather than polling behind a frozen "
+                                "surface", misses, exc_info=True)
                     return
-                try:
-                    (post or (lambda fn: fn()))(lambda r=rows: on_rows(r))
-                except Exception:         # noqa: BLE001 - a dead widget
-                    log.debug("sensors page: repaint failed", exc_info=True)
-                self._stop.wait(max(0.2, float(interval_s)))
+                log.debug("sensors page: repaint failed", exc_info=True)
+            stop.wait(max(0.2, float(interval_s)))
 
-        self._thread = threading.Thread(target=loop, daemon=True,
-                                        name="sensors-page")
-        self._thread.start()
+    def stop(self, timeout_s: float = JOIN_S) -> bool:
+        """End the run. True when the thread was gone by ``timeout_s``.
 
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread = None
+        The handle is kept until it has been joined, and the flag the loop
+        holds is set rather than replaced, so a later ``start()`` cannot
+        resurrect an orphan: the worst case is one thread finishing the
+        HTTP read it was already inside and then exiting on its next check.
+        """
+        with self._lock:
+            thread, stop = self._thread, self._stop
+            self._thread, self._stop = None, None
+        if stop is not None:
+            stop.set()
+        if thread is None:
+            return True
+        if thread is threading.current_thread():
+            return False
+        thread.join(max(0.0, float(timeout_s)))
+        alive = thread.is_alive()
+        if alive:
+            # Bounded and harmless: it cannot poll again (its own flag is
+            # set) and cannot be restarted. Said out loud so a wedged
+            # transport is visible rather than inferred.
+            log.info("sensors page: the poll thread is still inside a "
+                     "request; it will exit when that returns")
+        return not alive
+
+    @property
+    def running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
 
 
 def _spoken(spec) -> str:
@@ -967,26 +1244,30 @@ class _RoomBlock(tk.Frame):
 class SensorsPage(tk.Frame):
     """The SENSORS surface, placed over the console's stage.
 
-    WHY NOT A HEADER TAB. The header has 13 px to spare at his 920-px
-    window -- tests/test_header_fit.py measures it: 299 of the 312 left for
-    chips is spent by the state pill and the sensing badge, and the ruling
-    that got it there was his own ("dont make jarvis smaller, just make
-    ready and sensing smaller to fit"). A `[SENSORS]` tab up there would
-    cost him the sensing badge, which is the privacy readout. So the tab
-    strip lives at the top of the PAGE and the header is untouched. If he
-    would rather have it in the header, something up there has to go, and
-    that is his call to make, not one to make for him.
+    WHERE THE TAB IS. Not here and not in the header. The header has 13 px
+    to spare at his 920-px window (tests/test_header_fit.py measures it),
+    so a `[SENSORS]` chip up there costs him the sensing badge, which is
+    the privacy readout. It is a ROW OF ITS OWN under the wordmark --
+    jarvis/ui/tab_strip.py -- and this page no longer draws the two fake
+    tabs it used to: two rows of tabs on one screen is a question about
+    which of them is in charge.
 
     WHY IT COVERS THE REACTOR TOO. MEASURED at his window and scale
-    (920x1440, S=2.0): the transcript panel alone is ~420 device px and
-    this page asks for ~940, so placed over the transcript the bands, the
+    (920x1440, S=2.0): the transcript panel alone is ~520 device px and
+    this page asks for 773, so placed over the transcript the bands, the
     overrule toggle and SAVE were simply cut off the bottom -- the first
     photo rig pass showed exactly that. ``cover`` is the widgets whose
     union it should span (the reactor and the transcript); the reactor is
     decoration, and a man reading a sensor page is not looking at it.
+    MEASURED 2026-09-03 with the strip in: the stage spans 1044 device px
+    and this page asks 773 of them, 271 to spare -- MORE headroom than
+    before, because dropping its own tab row (95 px) paid for the strip
+    (80 px) with 15 px over.
 
     Nothing here polls until ``show()`` and nothing keeps polling after
-    ``hide()``.
+    ``hide()`` -- and after 09-03 that is enforced by a per-run stop flag
+    rather than by a shared one, because a tab is far easier to flip in
+    and out of than a function key was.
     """
 
     def __init__(self, host, services=None, camera_status=None,
@@ -1001,12 +1282,14 @@ class SensorsPage(tk.Frame):
         self._blocks: dict = {}
         self._rows: list = []
         self._last: tuple = ()            # the readings the rows were painted from
+        self._tick_id = None
 
         self.specs = self._room_specs()
-        self.bands = read_bands(self._get_option)
+        self.bands, self.config_notes = read_bands_noted(self._get_option)
         self.overrules = read_overrules(self._get_option)
-        self.camera_room = next((s.name for s in self.specs
-                                 if getattr(s, "primary", False)), "")
+        # camera.room, falling back to the primary room -- NOT primary
+        # alone, which was geometry inferred from an unrelated key.
+        self.camera_room = camera_room_name(self._get_option, self.specs)
         self.poller = SensorPoller(self.specs,
                                    policy=getattr(services, "sensing", None))
         self._build()
@@ -1041,26 +1324,20 @@ class SensorsPage(tk.Frame):
     # -------------------------------------------------------------- build
     def _build(self) -> None:
         bg = theme.TV_BG
-        tabs = tk.Frame(self, bg=bg)
-        tabs.pack(fill="x", padx=theme.PAD, pady=(theme.PAD_S, 0))
-        RoundButton(tabs, text="CHAT", kind="ghost", size=theme.SIZE_CAPTION,
-                    bg=bg, command=self.hide).pack(side="left")
-        RoundButton(tabs, text="SENSORS", kind="accent",
-                    size=theme.SIZE_CAPTION, bg=bg,
-                    command=lambda: None).pack(side="left", padx=(px(6), 0))
-        RoundButton(tabs, text="✕", kind="ghost", size=theme.SIZE_CAPTION,
-                    pad_x=8, pad_y=5, bg=bg,
-                    command=self.hide).pack(side="right")
-        tk.Frame(self, bg=theme.LINE, height=max(1, px(1))).pack(
-            fill="x", padx=theme.PAD, pady=(theme.PAD_S, theme.PAD_S))
-
+        # NO tab row of its own any more. The console has a real one
+        # (jarvis/ui/tab_strip.py) directly under the wordmark, which is
+        # what he asked for, and two rows of tabs on one screen is a
+        # question about which of them is in charge. Dropping it also pays
+        # for the strip: it cost this page more vertical than the strip
+        # costs the stage (measured, scripts/ui_shots.py).
         body = tk.Frame(self, bg=bg)
-        body.pack(fill="both", expand=True, padx=theme.PAD)
+        body.pack(fill="both", expand=True, padx=theme.PAD,
+                  pady=(theme.PAD_S, 0))
         if not self.specs:
-            tk.Label(body, text="no room sensors configured — "
-                              "presence.room_sensor_url is empty",
+            tk.Label(body, text=empty_state_line(self._get_option),
                      font=ui_font(theme.SIZE_LABEL), fg=theme.FAINT, bg=bg,
-                     anchor="w", justify="left").pack(fill="x")
+                     anchor="w", justify="left",
+                     wraplength=px(420)).pack(fill="x")
         for spec in self.specs:
             block = _RoomBlock(body, bg)
             # px(4), not PAD_S: with a fault line AND a reason line on both
@@ -1089,8 +1366,22 @@ class SensorsPage(tk.Frame):
 
         foot = tk.Frame(self, bg=bg)
         foot.pack(fill="x", padx=theme.PAD, pady=(theme.PAD_S, theme.PAD))
-        RoundButton(foot, text="SAVE", kind="default", size=theme.SIZE_CAPTION,
-                    bg=bg, command=self.save).pack(anchor="w")
+        # SAVE and the age share ONE row; the caption gets the next one to
+        # itself. Packing all three into `foot` put the caption between the
+        # button and the age and cut it mid-word -- photographed 09-03,
+        # which is the same trap that put this caption below the button in
+        # the first place.
+        row = tk.Frame(foot, bg=bg)
+        row.pack(fill="x")
+        RoundButton(row, text="SAVE", kind="default", size=theme.SIZE_CAPTION,
+                    bg=bg, command=self.save).pack(side="left")
+        # The staleness readout, on the SAVE row so it costs no height. It
+        # is driven by the page's own 1 s tick, not by the poll, so a poll
+        # that has stopped makes this number CLIMB rather than freeze --
+        # which is the whole point of putting an age on a numbers page.
+        self._age = tk.Label(row, font=ui_font(theme.SIZE_CAPTION),
+                             fg=theme.FAINT, bg=bg, anchor="e")
+        self._age.pack(side="right", padx=(px(12), 0))
         # BELOW the button, not beside it: beside it the caption had ~750 px
         # of a 920-px window and was cut mid-word on the photo rig, and the
         # refusal message a bad band edit puts here is longer still.
@@ -1178,12 +1469,14 @@ class SensorsPage(tk.Frame):
         # and _probe_room follow, and for the same reason.
         self.waiting()
         self.poller.start(self.apply, post=self._post)
+        self._tick()
 
     def hide(self) -> None:
         if not self._open:
             return
         self._open = False
         self.poller.stop()
+        self._untick()
         try:
             self.place_forget()
         except Exception:                 # noqa: BLE001 - a dead widget
@@ -1195,11 +1488,42 @@ class SensorsPage(tk.Frame):
                 log.exception("sensors page: on_close failed")
 
     def _post(self, fn) -> None:
-        """Hop to the Tk thread. A page that has been closed drops it."""
+        """Hop to the Tk thread. RAISES when the hop cannot be made.
+
+        It used to swallow the failure at DEBUG, which is how a page whose
+        every repaint raised "main thread is not in main loop" kept
+        polling behind a surface stuck on READING… with nothing at INFO
+        saying why. The poll loop counts these now and stops after
+        POST_FAILS_MAX in a row, loudly -- a loop that cannot reach Tk
+        cannot repaint anything, so continuing is only cost.
+        """
+        self.after(0, fn)
+
+    # ---------------------------------------------------------- the age tick
+    def _tick(self) -> None:
+        """Repaint the age of the newest reading, once a second, on the Tk
+        thread. Independent of the poll ON PURPOSE (see ``age_text``)."""
+        self._tick_id = None
+        if not self._open:
+            return
+        newest = max((r.at for r in self._last if r.at), default=0.0)
+        text = age_text(time.time(), newest)
+        if self.poller.post_failed:
+            text = "the poll loop stopped — reopen the page"
         try:
-            self.after(0, fn)
+            self._age.configure(text=text)
+            self._tick_id = self.after(AGE_TICK_MS, self._tick)
         except Exception:                 # noqa: BLE001 - torn down
-            log.debug("sensors page: post failed", exc_info=True)
+            log.debug("sensors page: age tick failed", exc_info=True)
+
+    def _untick(self) -> None:
+        tick, self._tick_id = self._tick_id, None
+        if tick is None:
+            return
+        try:
+            self.after_cancel(tick)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("sensors page: age tick cancel failed", exc_info=True)
 
     # ------------------------------------------------------------ painting
     def waiting(self) -> None:
@@ -1249,7 +1573,9 @@ class SensorsPage(tk.Frame):
         return got if isinstance(got, dict) else {}
 
     def _show_notes(self) -> None:
-        notes = band_notes(self.bands)
+        # config_notes FIRST: "the file holds a value I could not use" is
+        # the one that costs him data if he presses SAVE past it.
+        notes = tuple(self.config_notes) + band_notes(self.bands)
         if notes:
             self._notes.configure(text="\n".join(notes))
             self._notes.pack(fill="x", padx=theme.PAD, pady=(0, theme.PAD_S))
@@ -1267,27 +1593,31 @@ class SensorsPage(tk.Frame):
         self.apply(self._last)
 
     def save(self) -> None:
+        """Validate, write, and say WHICH of those three happened.
+
+        The write is inline and its result is read: see ``write_options``
+        for why a thread and a bare try/except could not tell a failed
+        save from a successful one. A band the config could not use is
+        re-checked here too, because a successful write clears it.
+        """
         edits, err = self.band_values()
         if err:
             self._note.configure(text=err, fg=theme.ERR)
             return
         self.bands = Bands(*(edits[OPTION_DESK_BAND] + edits[OPTION_ROOM_BAND]))
         self.overrules = bool(edits[OPTION_CAMERA_OVERRULES])
-        self._show_notes()
         fn = getattr(self.services, "set_option", None) if self.services else None
         if fn is None:
-            self._note.configure(text="assistant settings not wired",
-                                 fg=theme.WARN)
+            self._note.configure(text=NOT_WIRED_NOTE, fg=theme.WARN)
             return
-
-        def run():
-            for key, value in edits.items():
-                try:
-                    fn(key, value)
-                except Exception:         # noqa: BLE001 - config boundary
-                    log.exception("sensors page: set_option %s failed", key)
-        threading.Thread(target=run, daemon=True, name="sensors-save").start()
-        self._note.configure(text=SAVED_NOTE, fg=theme.FAINT)
+        failed = write_options(fn, edits)
+        if not failed:
+            # What he typed is now what the file holds, so the "the config
+            # had a value I could not use" notes are spent.
+            self.config_notes = ()
+        self._show_notes()
+        text, tone = save_note(failed)
+        self._note.configure(text=text, fg=tone_color(tone))
 
     def band_values(self) -> tuple:
         """What is currently typed, validated. Split out so the refusal

@@ -376,9 +376,19 @@ class RoomSensor:
         self.last_ok = self._now()
 
     def status(self) -> dict:
-        """For the console / a diagnostic script; never parsed by the app."""
+        """For the console / a diagnostic script; never parsed by the app.
+
+        ``cooldown_s`` is the NEXT wait, because _failed() arms the breaker
+        from the current one and THEN doubles it -- so a surface that
+        printed it was exactly 2x the truth and static for the whole wait.
+        ``retry_in_s`` is the seconds LEFT on this breaker's own deadline,
+        which is the number the one warning line in the log quotes and the
+        only one that counts down. (2026-09-03: the SENSORS page rendered
+        "trying again in 60 s" while the log said 30 s for the same event.)
+        """
         return {"url": self.url, "value": self.last_value, "fails": self._fails,
                 "paused": self.paused, "cooldown_s": self._cooldown,
+                "retry_in_s": max(0.0, self._skip_until - self._now()),
                 "reads": self.reads, "last_ok": self.last_ok,
                 "blocked": self.blocked,
                 "power_url": self.power_url}
