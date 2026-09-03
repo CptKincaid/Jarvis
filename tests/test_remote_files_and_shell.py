@@ -1085,3 +1085,92 @@ def test_a_worker_that_blows_up_still_closes_the_turn(queued, monkeypatch):
     queued.jobs[0]()
     assert queued.spoken[-1] == remote.fail_line(
         remote.read_config(queued.services.assistant), "failed")
+
+
+# ==================================================================
+# F08 (2026-09-03): the tailnet is only asked about a tailnet address
+# ==================================================================
+# HPCOMPUTER is reached over the LAN (192.168.50.114 / hpcomputer.local; it
+# has no Tailscale peer), and tailnet_state looked the host's first label
+# up among the peers regardless: "192" and "hpcomputer" are not peers, so
+# every door said "HPCOMPUTER isn't on the tailnet, sir -- I can't see it
+# at all" without opening ssh, and a real unreachable/timeout (the box
+# asleep) was rewritten into the same wrong sentence.  Repro:
+# scratch-0903/bugpass/remote_lan_host_repro.py sections 1-2 and 5.
+@pytest.mark.parametrize("host,proxy,expect", [
+    ("hpcomputer.tail5323b8.ts.net", "127.0.0.1:1055", True),
+    ("HPCOMPUTER.TAIL5323B8.TS.NET", "", True),
+    ("100.70.145.99", "", True),                  # 100.64/10 is the tailnet
+    ("hpcomputer", "127.0.0.1:1055", True),       # MagicDNS name, via the proxy
+    ("192.168.50.114", "", False),
+    ("192.168.50.114", "127.0.0.1:1055", False),  # the shipped proxy default
+    ("hpcomputer.local", "", False),
+    ("hpcomputer.local", "127.0.0.1:1055", False),
+    ("hpcomputer", "", False),                    # the router's name, not MagicDNS
+    ("101.0.0.1", "", False),                     # just outside 100.64/10
+])
+def test_only_a_tailnet_address_is_a_tailnet_question(tmp_path, host, proxy,
+                                                       expect):
+    conf = remote.read_config(ready_cfg(tmp_path, **{"remote.host": host,
+                                                     "remote.socks_proxy": proxy}))
+    assert remote.tailnet_host(conf) is expect
+
+
+def lan_cfg(tmp_path, **over):
+    """The host the checklist gives him: LAN address, no proxy."""
+    base = {"remote.host": "192.168.50.114", "remote.socks_proxy": "",
+            "remote.user": "h2pey"}
+    base.update(over)
+    return ready_cfg(tmp_path, **base)
+
+
+def test_a_lan_host_is_never_reported_off_tailnet(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf:
+                        pytest.fail("asked the tailnet about a LAN address"))
+    conf = remote.read_config(lan_cfg(tmp_path))
+    assert remote.unreachable_reason(conf) == ""
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        remote.SshResult(False, err="ssh: connect to host "
+                                         "192.168.50.114 port 22: Connection "
+                                         "timed out", reason="unreachable"))
+    res = remote.ask(conf, "up")
+    assert res.reason == "unreachable"
+    assert "tailnet" not in remote.fail_line(conf, res.reason)
+
+
+def test_a_tailnet_host_still_gets_the_honest_sentence(tmp_path, monkeypatch):
+    """The other half of the same rule: for a .ts.net name the tailnet view
+    is the more specific answer and it must still be used."""
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf: "offline")
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert remote.unreachable_reason(conf) == "asleep"
+
+
+def test_the_status_door_tries_ssh_for_a_lan_host(wired, tmp_path, monkeypatch):
+    wired.services.assistant = lan_cfg(tmp_path)
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf:
+                        pytest.fail("asked the tailnet about a LAN address"))
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        remote.SshResult(True, out="up 3 days\n"))
+    wired.handle("is HPCOMPUTER up", source="voice")
+    assert wired.spoken[-1] == "HPCOMPUTER is up, sir -- up 3 days."
+    assert wired.statuses[-1] == "HPCOMPUTER: up"
+
+
+def test_the_socks_proxy_is_for_the_tailnet_not_the_lan(tmp_path):
+    """The shipped default is socks_proxy 127.0.0.1:1055, and with a LAN
+    address that sent every ssh through tailscaled's SOCKS5 -- whether that
+    forwards to a LAN IP at all is unverified (no network in tests).  His
+    own verified line is a direct `ssh h2pey@192.168.50.114`, so the proxy
+    is applied to a tailnet address only; blanking it is no longer a step
+    he has to remember."""
+    conf = remote.read_config(ready_cfg(tmp_path, **{
+        "remote.host": "192.168.50.114"}))        # proxy left at the default
+    assert "ProxyCommand" not in " ".join(remote.ssh_argv(conf, "uptime"))
+    conf = remote.read_config(ready_cfg(tmp_path))  # .ts.net: still proxied
+    assert "ProxyCommand" in " ".join(remote.ssh_argv(conf, "uptime"))
+
+
+def test_the_no_host_line_does_not_blame_the_tailnet(tmp_path):
+    conf = remote.read_config(ready_cfg(tmp_path, **{"remote.host": ""}))
+    assert "tailnet" not in remote.fail_line(conf, "no-host")

@@ -284,8 +284,8 @@ def missing_reason(conf: RemoteConfig) -> str:
 FAIL_LINES = {
     "disabled": "{name} isn't set up in my settings yet, sir; "
                 f"remote.enabled is false in {CONFIG_HINT}.",
-    "no-host": "I've no address for {name}, sir -- it isn't on the tailnet "
-               "yet, and remote.host is empty.",
+    "no-host": "I've no address for {name}, sir; remote.host is empty in "
+               f"{CONFIG_HINT}.",
     "no-user": "I don't know which account to use on {name}, sir; "
                "remote.user is empty.",
     "no-key": "I've no key for {name}, sir; remote.key_path is empty in "
@@ -376,6 +376,35 @@ class SshResult:
 
 
 # ------------------------------------------------------------- transport
+_TAILNET_IP_RX = re.compile(r"^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$")
+
+
+def tailnet_host(conf: RemoteConfig) -> bool:
+    """Is ``remote.host`` a TAILNET address -- the only kind the tailnet
+    view and the SOCKS proxy have anything to say about?
+
+    F08 (2026-09-03).  HPCOMPUTER is reached over the LAN (192.168.50.114 /
+    hpcomputer.local; it has no Tailscale peer), and every door asked the
+    tailnet about it anyway: the host's first label ("192", "hpcomputer")
+    is not a peer, so ``tailnet_state`` said "absent" and the spoken line
+    was "isn't on the tailnet, sir -- I can't see it at all" -- without a
+    socket ever opening, and with a real unreachable/timeout (the box
+    asleep) rewritten into the same wrong sentence.
+
+    A tailnet address is a MagicDNS name (``*.ts.net``), an address in the
+    CGNAT block Tailscale hands out (100.64/10), or a bare single label
+    WITH the proxy configured -- that is the MagicDNS short name, and the
+    proxy is the only way this box reaches MagicDNS.  A bare label with no
+    proxy is the router's name for a LAN box, and ``.local`` is mDNS.
+    """
+    host = (conf.host or "").strip().lower()
+    if not host:
+        return False
+    if host.endswith(".ts.net") or _TAILNET_IP_RX.match(host):
+        return True
+    return "." not in host and bool(conf.socks_proxy)
+
+
 def proxy_args(conf: RemoteConfig) -> list:
     """The ``ProxyCommand`` that makes the tailnet reachable from a
     USERSPACE tailscaled.
@@ -384,10 +413,13 @@ def proxy_args(conf: RemoteConfig) -> list:
     ssh to a tailnet name fails with "Network is unreachable" no matter how
     healthy the tailnet is.  The daemon's SOCKS5 port is the supported way
     through, and ``nc -X 5 -x`` speaks it.  Empty when ``socks_proxy`` is
-    blank, which is the right configuration the day he gives this box a real
-    tun device or reaches the host over plain LAN.
+    blank (the day this box gets a real tun device) and -- F08 -- for any
+    host that is not a tailnet address: the proxy is tailscaled's way to
+    the TAILNET, whether it forwards to a LAN IP at all is unverified, and
+    his own verified line is a direct ``ssh h2pey@192.168.50.114``.  So the
+    shipped proxy default no longer has to be blanked for the LAN box.
     """
-    if not conf.socks_proxy:
+    if not conf.socks_proxy or not tailnet_host(conf):
         return []
     return ["-o", f"ProxyCommand={NC_BIN} -X 5 -x "
                   f"{shlex.quote(conf.socks_proxy)} %h %p"]
@@ -563,7 +595,12 @@ def tailnet_state(conf: RemoteConfig) -> str:
 
 def unreachable_reason(conf: RemoteConfig) -> str:
     """Turn a failed round trip into the MOST specific reason available, by
-    asking the tailnet what it thinks.  "" when nothing better is known."""
+    asking the tailnet what it thinks.  "" when nothing better is known --
+    and always "" for a LAN address (F08), where the tailnet knows nothing
+    and "absent" would be a confident wrong answer; the ssh result
+    ("unreachable", "timeout") is then the honest one."""
+    if not tailnet_host(conf):
+        return ""
     state = tailnet_state(conf)
     if state == "absent":
         return "off-tailnet"

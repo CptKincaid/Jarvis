@@ -4069,13 +4069,18 @@ model — the refusal only fires on an actual imperative.
 
 * `enabled` ships **false**, and every door says exactly what is missing
   rather than opening a socket to find out.
-* `host` is HPCOMPUTER's tailnet name, `user` the account there, `key_path`
-  a key **ssh already owns** — Jarvis never reads it, only hands over its
-  path, so no new secret enters `assistant.json`.
-* `socks_proxy` is not a preference. tailscaled on the Spark runs
+* `host` is where HPCOMPUTER answers ssh: on this LAN that is
+  `192.168.50.114` (or `hpcomputer.local`), `user` the account there
+  (`h2pey`), `key_path` a key **ssh already owns** (`~/.ssh/hpcomputer`) —
+  Jarvis never reads it, only hands over its path, so no new secret enters
+  `assistant.json`. A blank `key_path` is refused out loud, not tried.
+* `socks_proxy` applies to a **tailnet** address only — a `*.ts.net` name,
+  a `100.x` address, or a bare MagicDNS name. tailscaled on the Spark runs
   `--tun=userspace-networking`, so there is no route to the tailnet at all
-  and everything goes through the daemon's own SOCKS5 port. Blank it only
-  if this box ever gets a real tun device.
+  and tailnet traffic goes through the daemon's own SOCKS5 port. For a LAN
+  address it is ignored, and so is the tailnet's view of the host: "is
+  HPCOMPUTER up" tries ssh and reports what ssh says. Leave it at the
+  default.
 * `inbox` is the **only** folder a push can land in, and `pull_dirs` the
   only ones a pull may read. Speech never names a remote path: the spoken
   words pick a *key* ("desktop"), never a directory.

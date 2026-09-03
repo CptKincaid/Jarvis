@@ -5012,17 +5012,21 @@ def _remote_async(c, conf, work, status: str, ack: Optional[str] = None):
 
 
 def _h_remote_status(c, t, m):
-    """Is it there? Answered from the LOCAL tailnet view first, so a machine
-    that is off or has never joined costs no socket and no wait -- and gets
-    a different sentence from one that is merely slow. Those three are not
-    the same problem and he should not have to guess which he has."""
+    """Is it there? For a TAILNET address, answered from the local tailnet
+    view first, so a machine that is off or has never joined costs no
+    socket and no wait -- and gets a different sentence from one that is
+    merely slow. Those three are not the same problem and he should not
+    have to guess which he has. For a LAN address (the real HPCOMPUTER,
+    192.168.50.114 -- F08) the tailnet knows nothing, and asking it made
+    "is HPCOMPUTER up" answer "isn't on the tailnet" without trying ssh."""
     conf = _remote_conf(c)
     blocked = _remote_blocked(c, conf)
     if blocked is not None:
         return blocked
 
     def _look():
-        state = remote_mod.tailnet_state(conf)
+        state = (remote_mod.tailnet_state(conf)
+                 if remote_mod.tailnet_host(conf) else "unknown")
         if state == "absent":
             return _remote_fail(conf, "off-tailnet", f"{conf.name}: absent")
         if state == "offline":
