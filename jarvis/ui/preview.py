@@ -42,24 +42,61 @@ never on it. Text over live video is text over an unknown background, and
 the one readout in this pane that has to be legible in every frame is the
 one saying whether the camera is on.
 
-WHAT IT COSTS THE 60 fps LOOP, MEASURED. On a scratch Xvfb at his UI scale
-(S=2.0), a real reactor animating on 16.67 ms slot boundaries, 30 s windows
-after a 12 s warm-up, with a synthetic 1280x720 source carrying the LifeCam's
-measured 130 ms grab latency (scratchpad harness; no camera was opened) --
+THE ONE THING THAT IS ON THE PICTURE IS THE NAME, and it brings a ground with
+it. Hunter, 2026-09-03: *"lets have the identity of the person its tracking
+next to their name, small but readable"* -- a caption beside the picture would
+not have answered that, because with two faces in frame it would not say WHICH
+one it meant. So the identity chip is drawn against the tracked box, and the
+rule above is honoured rather than waived: the word sits on a filled rectangle
+in the window ground (``chip_ink``), sized from the canvas's own measurement of
+the text, so its contrast is a fact about two palette tokens rather than a hope
+about what is behind him. It reads "HUNTER 0.74" or "UNKNOWN 0.21", and it is
+ABSENT when identity did not run -- three states, because "not looking" and
+"do not recognise you" are opposite facts about the same picture.
+
+Nothing the chip says is a permission. See jarvis/campreview.py: identity may
+remove capability or add a name and may never grant one, and the structural
+guarantee is that nothing outside jarvis/ui/ can see a PreviewFace at all.
+
+WHAT IT COSTS THE 60 fps LOOP. On a scratch Xvfb at his UI scale (S=2.0), a
+real reactor animating on 16.67 ms slot boundaries, 30 s windows after a 12 s
+warm-up, with a synthetic 1280x720 source (2026-09-02; no camera was opened) --
 
   A  reactor alone                     0 late slots / 1801   max late 1.6-4.3 ms
   B  reactor + this pane at 6 fps    0-1 late slots / 1802   max late 1.4-3.8 ms
   C  the same capture ON the Tk loop 744-771 / ~1800 (41-43%)  max late 137 ms
 
 C is the counterfactual this whole design exists to avoid, and it is not a
-near miss: two slots in five late and a 137 ms stall is the console stopping
-dead eight refreshes at a time, six times a second. B is indistinguishable
-from A across five paired runs in both orders (a "late slot" is one starting
->8 ms after its boundary; 0 or 1 in 1800 either way), because the only
-Tk-thread work per frame is one photo paste plus a dozen coords /
-itemconfigure calls: **0.32-0.39 ms mean, 0.88 ms worst observed**, against a
-16.67 ms slot. The 1.5 ms resize of the full frame happens on the capture
-thread, not here.
+near miss: two slots in five late is the console stopping dead several
+refreshes at a time. B is indistinguishable from A across five paired runs in
+both orders (a "late slot" is one starting >8 ms after its boundary; 0 or 1 in
+1800 either way), because the only Tk-thread work per frame is one photo paste
+plus a couple of dozen coords / itemconfigure calls: **0.32-0.39 ms mean,
+0.88 ms worst observed**, against a 16.67 ms slot.
+
+THAT TABLE COULD NOT BE RE-RUN FOR THE 15 fps CHANGE, and pretending otherwise
+would be worse than saying so: there is no Xvfb on this box, and the only
+display is the one his LIVE console is running on -- window churn there is what
+froze his desktop on 2026-08-26. So what was measured instead (2026-09-03) is
+the thing that table scales with, on the same display-free harness the suite
+uses:
+
+  * the Tk-thread WORK per repaint, in canvas operations -- 24 before this
+    change, 26 with identity off, 30 with a name on screen (one photo paste,
+    the boxes, the brackets, and the chip's measure-and-place). Against the
+    0.32-0.39 ms measured for ~24 operations that is ~0.4-0.5 ms mean and
+    ~1.1 ms worst: an eighth of the 8 ms late bar, a fifteenth of a slot. A
+    repaint cannot make a slot late on its own arithmetic.
+  * the RATE those land at -- 6 a second to 15, so the pane's whole claim on
+    the Tk thread goes from ~2.3 ms per second to ~7 ms out of the 1000 ms the
+    mainloop has. What changes is how MANY slots carry an extra half
+    millisecond, not whether any of them can blow their budget.
+
+The residual risk is stated rather than measured away: fifteen repaints a
+second is fifteen chances a second to land on a slot that was already tight
+for another reason, where six was six. The reactor prints
+``avatar: late slots N/M`` on its own window; if that starts moving after this,
+``camera.preview_fps`` is the dial and it now goes DOWN as well as up.
 
 A BLACK RECTANGLE IS NOT AN ANSWER. When there is no picture the pane says
 which of the reasons it is -- his toggle, offline mode, the curfew (with the
@@ -89,8 +126,8 @@ from __future__ import annotations
 import tkinter as tk
 from typing import Optional
 
-from jarvis.campreview import (MAX_FACES, REASON_DISABLED, REASON_LIVE,
-                               REASON_NO_FRAME, REASON_PIPELINE,
+from jarvis.campreview import (DEFAULT_FPS, MAX_FACES, REASON_DISABLED,
+                               REASON_LIVE, REASON_NO_FRAME, REASON_PIPELINE,
                                REASON_SENSING, REASON_WAITING, PreviewShot,
                                poll_ms)
 # Re-exported, not used here: the letterbox is computed on the CAPTURE
@@ -115,6 +152,11 @@ ROW_H = 16                        # readout row pitch
 HEAD_DROP = 2                     # heading baseline inside the box top
 BRACKET_ARM = 5                   # attention bracket arm, design units
 MIN_BOX = 6                       # a face box never draws smaller than this
+NAME_GAP = 3                      # tracked box -> identity chip
+NAME_PAD = 3                      # chip padding around its text
+# How much of the picture's width the chip may take before it drops its
+# score. Measured, not chosen: see identity_name().
+NAME_MAX_FRAC = 0.6
 
 # The three tones the readouts use. Word first, colour second, shape third
 # -- see the module docstring.
@@ -134,6 +176,10 @@ STATE_WORDS = {
 ATTEND_YES = "LOOKING AT JARVIS"
 ATTEND_NO = "LOOKING AWAY"
 ATTEND_NONE = "NO FACE IN FRAME"
+# What a face that matched nothing is called. Not blank, and not the last
+# name seen: "asked, and nobody in the gallery is this person" is an answer
+# and has to look like one.
+IDENT_UNKNOWN = "UNKNOWN"
 
 
 # ------------------------------------------------------------ pure layout
@@ -194,6 +240,113 @@ def bracket_points(rect: tuple, arm: int) -> tuple:
         (x1, y1 - arm, x1, y1, x1 - arm, y1),
         (x0 + arm, y1, x0, y1, x0, y1 - arm),
     )
+
+
+def identity_text(face) -> str:
+    """"HUNTER 0.74" / "UNKNOWN 0.21", or "" when identity did not run.
+
+    THREE STATES, NOT TWO, and the empty string is the one that is easy to
+    get wrong. No chip means identity was not ASKED -- ``camera.identity`` is
+    off, the SFace weights are missing, nobody is enrolled, or this is not
+    the tracked face. UNKNOWN means it was asked and nothing matched. A pane
+    that drew those the same way would leave him unable to tell "Jarvis is
+    not looking" from "Jarvis does not know you", which are opposite facts
+    about the same picture.
+
+    The SCORE rides along because he reads this pane to understand
+    behaviour, not to be reassured by it: 0.74 against his measured p50 of
+    0.739 and a 0.363 bar is a number he can check, and an UNKNOWN sitting
+    at 0.35 tells him the bar is the problem rather than the camera.
+    """
+    who = identity_name(face)
+    if not who:
+        return ""
+    return "%s %.2f" % (who, float(getattr(face, "id_score", 0.0)))
+
+
+def identity_name(face) -> str:
+    """The chip WITHOUT its score -- what it falls back to when the full
+    caption would cover the face it is naming.
+
+    The score is dropped before the name is, and that ordering is the whole
+    point: the name is what he asked for and the score is the evidence
+    behind it. Measured on the real font files 2026-09-03 at S=2, against
+    the 272 px picture: "HUNTER 0.74" is 122 px in Rajdhani SemiBold (the
+    console's display face, 45%) but 179 px in the DejaVu fallback (66%),
+    which is a dark bar across two thirds of a small preview. One rule
+    covers both rather than a font this pane cannot guarantee.
+    """
+    if face is None or not getattr(face, "id_ran", False):
+        return ""
+    name = (getattr(face, "name", "") or "").strip()
+    return name.upper() if name else IDENT_UNKNOWN
+
+
+def identity_ink(face) -> str:
+    """The chip's text colour. A NAME is a focal value -- the pane's
+    brightest ink, the same step the numbers use. An UNKNOWN is MUTED: still
+    over the 4.5:1 bar on the chip's own ground, but visibly a lesser claim,
+    so the two never have to be read letter by letter to be told apart."""
+    known = bool(face is not None and (getattr(face, "name", "") or "").strip())
+    return theme.FOCAL if known else theme.MUTED
+
+
+def chip_ink() -> str:
+    """The chip's fill: the window ground, the darkest value the palette has.
+
+    THE CHIP EXISTS BECAUSE OF A RULE THIS PANE ALREADY MADE. Text over live
+    video is text over an unknown background, and the module docstring's
+    answer was to keep every readout beside the picture. He asked for this
+    one to sit next to the face, so instead of relaxing the rule the text
+    brings its own ground with it -- the same trick the face boxes use with
+    their dark halo, and it is what lets the contrast be a fact rather than
+    a hope about what is behind him.
+    """
+    return theme.BG
+
+
+def name_font() -> tuple:
+    """The chip's face: the pane's DISPLAY face at the one annotation size.
+
+    Display rather than the UI face, for two reasons that point the same
+    way. It is what this pane already uses for its other verdicts (the state
+    word, LOOKING AT JARVIS), and a name is a verdict rather than a label.
+    And it is CONDENSED -- at the same legible size it covers noticeably
+    less of a 136-unit-wide picture than the UI face would, which is the
+    whole difference between "small but readable" and a caption that hides
+    the face it is captioning.
+    """
+    return ui_display(theme.SIZE_CAPTION, "semibold")
+
+
+def name_line_h() -> int:
+    """The chip's height in device pixels, derived from the FONT rather than
+    from a design constant, so it cannot drift out of step with the text it
+    has to enclose at a scale nobody measured at."""
+    return abs(int(name_font()[1])) + 2 * px(NAME_PAD)
+
+
+def name_anchor(rect: tuple, picture: tuple, gap: int, line_h: int) -> tuple:
+    """``(x, y, anchor)`` for the identity chip: under the tracked box.
+
+    Under, not over: the chip is a caption on the face and a caption sits
+    below its subject. It flips ABOVE when the box is against the bottom of
+    the picture, and tucks inside the bottom edge when the face fills the
+    frame -- which at a desk is the common case for the person nearest the
+    lens, so it is not an edge case worth getting wrong.
+
+    ``picture`` is ``(x, y, w, h)`` of the drawn frame in canvas
+    coordinates; the chip never leaves it, because a caption hanging in the
+    panel beside the picture is a readout with no ground under it.
+    """
+    x0, y0, _x1, y1 = rect
+    px0, py0, _pw, ph = picture
+    bottom = py0 + ph
+    if y1 + gap + line_h <= bottom:
+        return x0, y1 + gap, "nw"
+    if y0 - gap - line_h >= py0:
+        return x0, y0 - gap, "sw"
+    return x0, bottom - gap, "sw"
 
 
 def state_word(shot: PreviewShot) -> str:
@@ -314,10 +467,12 @@ class CameraPreview(tk.Frame):
 
     Nothing here creates or destroys a canvas item after ``_build``, and the
     photo is pasted into rather than replaced. That is deliberate and it is
-    the performance design: at 6 fps a per-frame ``create_image`` /
-    ``delete`` pair would hand Tk a new XImage sixty times a minute, on the
-    same thread the reactor is trying to hit 16.67 ms slot boundaries on.
-    Updating is ``coords`` + ``itemconfigure`` + one ``paste``.
+    the performance design, and raising the rate is what made it matter: at
+    15 fps a per-frame ``create_image`` / ``delete`` pair would hand Tk a new
+    XImage nine hundred times a minute, on the same thread the reactor is
+    trying to hit 16.67 ms slot boundaries on. Updating is ``coords`` +
+    ``itemconfigure`` + one ``paste``, and the identity chip joins that
+    discipline rather than being the one thing recreated per frame.
 
     The widget never captures. It polls ``PreviewWorker.latest()`` on its
     own ``after`` chain at twice the capture rate (``campreview.poll_ms``),
@@ -333,7 +488,7 @@ class CameraPreview(tk.Frame):
         self._job = None
         self._fit = (0, 0, px(PANE_W), px(PANE_H))
         self._box = (px(PANE_W), px(PANE_H))
-        self._interval = poll_ms(6.0)
+        self._interval = poll_ms(DEFAULT_FPS)
         self._build()
 
     # ------------------------------------------------------------ build
@@ -415,6 +570,18 @@ class CameraPreview(tk.Frame):
             cx, cy + px(ROW_H) * 3, anchor="nw", text="",
             font=ui_display(theme.SIZE_CAPTION, "semibold"), fill=theme.MUTED)
 
+        # The identity chip: a ground and a word, created LAST so canvas
+        # stacking (creation order) puts them over the picture, the boxes and
+        # the brackets. Two items, created once and moved -- the same
+        # paste-don't-replace discipline the rest of this pane keeps, because
+        # they now move fifteen times a second rather than six.
+        self._namebg = self.canvas.create_rectangle(
+            0, 0, 0, 0, fill=chip_ink(), outline="", state="hidden",
+            tags="overlay")
+        self._name = self.canvas.create_text(
+            0, 0, anchor="nw", text="", state="hidden", font=name_font(),
+            fill=theme.FOCAL, tags="overlay")
+
     # ----------------------------------------------------------- polling
     def start(self, ms: Optional[int] = None) -> None:
         """Begin polling the worker. Idempotent.
@@ -426,7 +593,7 @@ class CameraPreview(tk.Frame):
         if self._job is not None:
             return
         rate = getattr(self.worker, "fps", None)
-        self._interval = int(ms or poll_ms(rate if rate else 6.0))
+        self._interval = int(ms or poll_ms(rate if rate else DEFAULT_FPS))
         self._tick()
 
     def stop(self) -> None:
@@ -559,7 +726,8 @@ class CameraPreview(tk.Frame):
         self._photo = None
         self._photo_size = (0, 0)
         try:
-            for item in self._shadows + self._boxes + self._brackets:
+            for item in (self._shadows + self._boxes + self._brackets
+                         + [self._namebg, self._name]):
                 self.canvas.itemconfigure(item, state="hidden")
         except Exception:                    # noqa: BLE001 - a dead window
             log.debug("preview: could not hide the overlay", exc_info=True)
@@ -612,16 +780,98 @@ class CameraPreview(tk.Frame):
             self.canvas.itemconfigure(
                 item, state="normal",
                 outline=box_ink(face.attending, face is primary))
-        if primary is None or not attending:
+        if primary is None:
+            self._draw_name(None, None)
             for item in self._brackets:
                 self.canvas.itemconfigure(item, state="hidden")
             return
         rect = face_rect(primary, shot.cap_w, shot.cap_h, self._fit)
-        pts = bracket_points((rect[0] + ox, rect[1] + oy,
-                              rect[2] + ox, rect[3] + oy), px(BRACKET_ARM))
+        rect = (rect[0] + ox, rect[1] + oy, rect[2] + ox, rect[3] + oy)
+        self._draw_name(primary, rect)
+        if not attending:
+            for item in self._brackets:
+                self.canvas.itemconfigure(item, state="hidden")
+            return
+        pts = bracket_points(rect, px(BRACKET_ARM))
         for item, arm in zip(self._brackets, pts):
             self.canvas.coords(item, *arm)
             self.canvas.itemconfigure(item, state="normal", fill=theme.FOCAL)
+
+    def _draw_name(self, face, rect) -> None:
+        """The identity chip, beside the tracked box. Hidden when there is
+        nothing honest to put in it.
+
+        THE GROUND IS MEASURED, NOT ASSUMED. The chip's rectangle is sized
+        from the canvas's own ``bbox`` of the text rather than from a guessed
+        character width, because a ground a few pixels short of its word puts
+        the last letter over live video -- and the whole reason for the chip
+        is that a letter over live video has no guaranteed contrast. If the
+        bbox cannot be had (no window yet), the TEXT is hidden too: no
+        ground, no word. Same trade ``_show_image`` makes when a frame will
+        not convert -- dark rather than half-drawn.
+
+        AND IT SHEDS THE SCORE BEFORE IT COVERS THE FACE. The picture is
+        272 px wide at his scale; a caption over 60% of that is a bar, not a
+        label. The measurement is why this is a loop rather than a constant:
+        the console's display face is condensed and fits both words, the
+        fallback face does not, and this pane cannot guarantee which one Tk
+        resolved. The common case still measures once.
+        """
+        if not identity_name(face) or rect is None:
+            self.canvas.itemconfigure(self._namebg, state="hidden")
+            self.canvas.itemconfigure(self._name, state="hidden")
+            return
+        ox, oy = self._origin
+        fx, fy, fw, fh = self._fit
+        picture = (ox + fx, oy + fy, fw, fh)
+        pad = px(NAME_PAD)
+        x, y, anchor = name_anchor(rect, picture, px(NAME_GAP), name_line_h())
+        self.canvas.itemconfigure(self._name, anchor=anchor,
+                                  fill=identity_ink(face), state="normal")
+        room = fw - 2 * pad
+        box = None
+        for text, bar in ((identity_text(face), fw * NAME_MAX_FRAC),
+                          (identity_name(face), room)):
+            box = self._place_name(text, x, y)
+            if box is None:
+                self.canvas.itemconfigure(self._name, state="hidden")
+                self.canvas.itemconfigure(self._namebg, state="hidden")
+                return
+            if (box[2] - box[0]) + 2 * pad <= bar:
+                break
+        else:
+            # Even the bare word does not fit -- a long enrolled label at a
+            # large UI scale. Trimmed rather than clamped off the edge: half
+            # a name he can see beats a whole one he cannot.
+            box = self._place_name(
+                ellipsize(identity_name(face), name_font(), room), x, y)
+            if box is None:
+                self.canvas.itemconfigure(self._name, state="hidden")
+                self.canvas.itemconfigure(self._namebg, state="hidden")
+                return
+        # Kept inside the picture. A chip anchored to a face at the right
+        # edge would otherwise run into the readout column, which is where
+        # the pane's OTHER numbers live -- two unrelated readouts touching.
+        shift = min(0, (picture[0] + fw - pad) - box[2])
+        shift = max(shift, (picture[0] + pad) - box[0])
+        if shift:
+            self.canvas.coords(self._name, x + shift, y)
+            box = (box[0] + shift, box[1], box[2] + shift, box[3])
+        self.canvas.coords(self._namebg, box[0] - pad, box[1] - pad,
+                           box[2] + pad, box[3] + pad)
+        self.canvas.itemconfigure(self._namebg, state="normal",
+                                  fill=chip_ink())
+
+    def _place_name(self, text: str, x: int, y: int):
+        """Put the word down and ask the canvas how wide it came out.
+        ``None`` when it cannot be measured, which is a window that does not
+        exist yet rather than a failure."""
+        self.canvas.itemconfigure(self._name, text=text)
+        self.canvas.coords(self._name, x, y)
+        try:
+            return self.canvas.bbox(self._name)
+        except Exception:                    # noqa: BLE001 - no window yet
+            return None
 
     # ------------------------------------------------------------ teardown
     def destroy(self):                       # pragma: no cover - Tk teardown
