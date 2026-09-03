@@ -1941,6 +1941,312 @@ def test_only_one_render_runs_at_a_time_even_with_threaded_connections(
 
 
 # ===========================================================================
+# 11b. THE ONE RENDER THREAD
+#
+# WHY THIS SECTION EXISTS. Measured 2026-09-02 with an external MemFree
+# sampler: a render costs a +16.37 GiB GPU transient the FIRST time it runs on
+# a given host thread, and 0.0-0.3 GiB every time after that on the same
+# thread. serve() gives each CONNECTION its own thread, so the render used to
+# pay that on every sentence -- on the box whose exhausted unified pool forced
+# the 2026-08-28 power-off. Arms, one resident model, cfg_scale 4.0
+# throughout: a new thread per render 16.42/16.37/16.29/16.39 GiB; ONE
+# persistent worker 16.24 on its first render then 0.04/0.08/0.02/0.00/0.04;
+# the main thread over 28 renders 0.01-0.30.
+#
+# The cost was localised (probe3/probe4) to prepare_inputs, and inside it to
+# the Mimi encode of the reference clip -- generation on that same fresh
+# thread dips 0.01-0.11 GiB -- but WHY that call is per-thread is NOT KNOWN.
+# So these tests pin the THREAD IDENTITY, the thing that was measured, and
+# nothing about the mechanism. They also pin what the fix must not
+# cost: chunks still arrive progressively (0.27 s to first audio, against the
+# shipped F5 path's 0.53 s), errors still arrive before any audio, and a dead
+# worker still means F5 rather than a hung connection.
+# ===========================================================================
+def recv_exactly(sock, n: int, timeout: float = 5.0) -> bytes:
+    """Exactly ``n`` bytes, or an assertion. Used to prove that audio reached
+    the client while the render was still blocked mid-utterance."""
+    sock.settimeout(timeout)
+    buf = b""
+    while len(buf) < n:
+        part = sock.recv(n - len(buf))
+        if not part:
+            break
+        buf += part
+    assert len(buf) == n, f"wanted {n} bytes, got {len(buf)}"
+    return buf
+
+
+def test_every_render_runs_on_the_one_worker_thread(tmp_path):
+    """THE measurement, as a property of the code: seven renders over seven
+    connections, one thread identity. Before this, each was a fresh
+    connection thread and each paid 16.37 GiB."""
+    path = tmp_path / "breeze.sock"
+    idents = []
+    seen = threading.Lock()
+
+    def render(text, gain=1.0):
+        with seen:
+            idents.append(threading.get_ident())
+        yield pcm(4)
+
+    svc = ready_service(render)
+    start_real_server(path, svc)
+    for i in range(4):
+        ask(path, json.dumps({"text": f"one at a time {i}",
+                              "stream": True}).encode() + b"\n", 30)
+    askers = [threading.Thread(
+        target=lambda i=i: ask(path, json.dumps(
+            {"text": f"all at once {i}", "stream": True}).encode() + b"\n", 30),
+        daemon=True) for i in range(3)]
+    for t in askers:
+        t.start()
+    for t in askers:
+        t.join(30)
+    assert len(idents) == 7, idents
+    assert len(set(idents)) == 1, f"{len(set(idents))} threads rendered: {idents}"
+    assert idents[0] == svc.worker.ident
+    assert idents[0] != threading.main_thread().ident
+
+
+def test_a_plain_render_is_wired_through_a_worker_and_never_doubled():
+    """The wrapping is the service's job, not the caller's: the defect was a
+    render running on whichever thread held the connection, so a service that
+    cannot be built without a worker cannot regress to it."""
+    svc = ready_service(blocks_render(pcm(2)))
+    assert isinstance(svc.worker, bs.RenderWorker)
+    assert svc.render is svc.worker              # the seam is the worker
+    already = bs.RenderWorker(blocks_render(pcm(2)))
+    assert bs.BreezeService(render=already, ready=True,
+                            graphs=ALL_GRAPHS).worker is already
+    assert bs.BreezeService(render=None, ready=True,
+                            graphs=ALL_GRAPHS).worker is None
+
+
+def test_nothing_on_the_render_path_starts_a_thread_per_request():
+    """The regression, named. A thread created anywhere under handle() is the
+    16.37 GiB bill coming back."""
+    body = (REPO / "scripts" / "breeze_server.py").read_text()
+    service = body.split("class BreezeService", 1)[1].split("def read_request", 1)[0]
+    assert "Thread(" not in service
+    accept = body.split("def serve(", 1)[1].split("def build_parser", 1)[0]
+    assert accept.count("threading.Thread") == 1     # the connection, only
+
+
+def test_chunks_still_arrive_while_the_render_is_still_running(tmp_path):
+    """THE LATENCY THE WORKER MUST NOT COST. Breeze reaches first audio in
+    0.27 s against the shipped F5 path's 0.53 s, and that is the whole reason
+    this voice is worth its memory. A queue that handed back only a finished
+    render would throw it away, so the fake here REFUSES to produce its second
+    chunk until the first has been read off the socket."""
+    path = tmp_path / "breeze.sock"
+    finish = threading.Event()
+
+    def render(text, gain=1.0):
+        yield pcm(4, 111)
+        assert finish.wait(5), "the second chunk was never asked for"
+        yield pcm(4, 222)
+
+    start_real_server(path, ready_service(render))
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    sock.connect(str(path))
+    try:
+        sock.sendall(b'{"text": "two chunks", "stream": true}\n')
+        line = b""
+        while not line.endswith(b"\n"):
+            line += recv_exactly(sock, 1)
+        head = json.loads(line.decode())
+        assert head["ok"] is True and head["stream"] is True
+        # The header and the FIRST chunk, with the render still parked inside
+        # the model. If this times out the sidecar buffered the utterance.
+        assert recv_exactly(sock, 44) == bs.wav_header(24000)
+        assert recv_exactly(sock, 8) == pcm(4, 111)
+        finish.set()
+        assert recv_exactly(sock, 8) == pcm(4, 222)
+    finally:
+        finish.set()
+        sock.close()
+
+
+def test_the_worker_does_not_run_far_ahead_of_a_slow_consumer():
+    """Bounded on purpose: unbounded, a client that stopped reading would let
+    the GPU generate a whole utterance into RAM on a box with none to
+    spare."""
+    produced = []
+
+    def render(text, gain=1.0):
+        for i in range(200):
+            produced.append(i)
+            yield pcm(2)
+
+    worker = bs.RenderWorker(render)
+    blocks = worker("a long one")
+    try:
+        assert next(blocks) == pcm(2)
+        time.sleep(0.3)
+        assert len(produced) <= bs.RENDER_QUEUE_DEPTH + 2, len(produced)
+    finally:
+        blocks.close()
+        worker.stop()
+
+
+def test_a_consumer_that_goes_away_stops_the_generation():
+    """Barge-in, or Jarvis exiting. The client's thread closes the generator;
+    the GPU must not still be rendering for a room nobody is in."""
+    closed = threading.Event()
+
+    def render(text, gain=1.0):
+        try:
+            for _ in range(1000):
+                yield pcm(2)
+        finally:
+            closed.set()
+
+    worker = bs.RenderWorker(render)
+    blocks = worker("a long one")
+    try:
+        assert next(blocks) == pcm(2)
+        blocks.close()
+        assert closed.wait(5), "the worker kept generating for a client that had gone"
+    finally:
+        worker.stop()
+
+
+def test_a_render_that_raises_crosses_the_thread_as_an_error_before_audio():
+    """The thread hop must not turn a refusal into half a sentence: the
+    caller renders this chunk on F5 and may not hear the failed one."""
+    svc = ready_service(blocks_render(pcm(10), fail_after=0))
+    head, rest = split_reply(
+        serve_once(svc, {"text": "x", "stream": True, "id": "r9"}))
+    assert head["ok"] is False
+    assert head["error"] == "RuntimeError: cuda blew up"   # message intact
+    assert rest == b""
+    assert svc.receipt("r9")["complete"] is False
+
+
+def test_a_dead_render_worker_makes_the_sidecar_not_ready(tmp_path):
+    """FAIL CLOSED. A sidecar whose render thread has gone must say so on the
+    next ping -- Jarvis pings on every utterance -- so the reply is spoken in
+    the 2.79 voice instead of not at all."""
+    path = tmp_path / "breeze.sock"
+    svc = ready_service(blocks_render(pcm(4)))
+    start_real_server(path, svc)
+    ask(path, b'{"text": "hello", "stream": true}\n', 30)   # start the thread
+    assert svc.worker.ident is not None
+    assert split_reply(ask(path, b'{"ping": true}\n'))[0]["ready"] is True
+
+    svc.worker.stop()
+    assert svc.worker.alive is False
+    pong, _ = split_reply(ask(path, b'{"ping": true}\n', 5))
+    assert pong["ok"] is True and pong["ready"] is False
+    assert bs.WORKER_GONE in pong["error"]
+
+    started = time.monotonic()
+    head, rest = split_reply(ask(path, b'{"text": "hi", "stream": true}\n', 5))
+    assert head["ok"] is False and rest == b""
+    assert time.monotonic() - started < 2.0, "the connection hung instead"
+
+
+def test_a_worker_that_dies_mid_render_answers_and_then_reports_not_ready(
+        tmp_path):
+    """A BaseException out of the model kills the worker. It must not also
+    kill the ANSWER: _serve_stream catches Exception, so a SystemExit crossing
+    the thread untouched would reach the client as EOF with no refusal line --
+    the one thing the protocol promises never to do before audio."""
+    path = tmp_path / "breeze.sock"
+
+    def render(text, gain=1.0):
+        raise SystemExit("the venv went away")
+        yield pcm(2)                                   # pragma: no cover
+
+    svc = ready_service(render)
+    start_real_server(path, svc)
+    head, rest = split_reply(ask(path, b'{"text": "hi", "stream": true}\n', 5))
+    assert head["ok"] is False and rest == b""
+    assert "SystemExit" in head["error"] and "died" in head["error"]
+    assert wait_until(lambda: svc.worker.alive is False), "the worker survived"
+    pong, _ = split_reply(ask(path, b'{"ping": true}\n', 5))
+    assert pong["ok"] is True and pong["ready"] is False
+    again, _ = split_reply(ask(path, b'{"text": "again", "stream": true}\n', 5))
+    assert again["ok"] is False                        # refused, not queued
+
+
+def test_concurrent_renders_serialise_and_their_audio_never_interleaves(
+        tmp_path):
+    """One resident model, one render thread: three clients at once must come
+    out as three whole utterances, not three shuffled ones."""
+    path = tmp_path / "breeze.sock"
+    windows = []
+    seen = threading.Lock()
+
+    def render(text, gain=1.0):
+        i = int(text.rsplit(" ", 1)[1])
+        with seen:
+            windows.append(("in", i))
+        yield pcm(2, 100 + i)
+        time.sleep(0.05)
+        yield pcm(2, 200 + i)
+        with seen:
+            windows.append(("out", i))
+
+    start_real_server(path, ready_service(render))
+    got = {}
+
+    def one(i):
+        _, rest = split_reply(ask(path, json.dumps(
+            {"text": f"line {i}", "stream": True}).encode() + b"\n", 30))
+        got[i] = rest
+
+    askers = [threading.Thread(target=one, args=(i,), daemon=True)
+              for i in range(3)]
+    for t in askers:
+        t.start()
+    for t in askers:
+        t.join(30)
+    for i in range(3):
+        assert got[i] == bs.wav_header(24000) + pcm(2, 100 + i) + pcm(2, 200 + i)
+    assert [w[0] for w in windows] == ["in", "out"] * 3, windows
+
+
+def test_shutting_the_worker_down_is_clean_and_final():
+    rendered = []
+
+    def render(text, gain=1.0):
+        rendered.append(text)
+        yield pcm(2)
+
+    worker = bs.RenderWorker(render)
+    assert list(worker("one")) == [pcm(2)]
+    thread = worker._thread
+    worker.stop()
+    assert thread.is_alive() is False
+    assert worker.alive is False
+    with pytest.raises(RuntimeError):
+        list(worker("two"))
+    assert rendered == ["one"]
+    worker.stop()                                # idempotent
+
+
+def test_stopping_a_worker_that_never_started_is_not_an_error():
+    worker = bs.RenderWorker(blocks_render(pcm(2)))
+    worker.stop()
+    assert worker.alive is False
+
+
+def test_the_boot_warm_renders_run_on_the_worker_thread():
+    """The one-off 16.2 GiB is paid at boot, inside the GPU flock, next to the
+    18.2 GiB capture transient the flock exists to serialise -- not on
+    Hunter's first sentence. This cannot be exercised without the model, so
+    the wiring is asserted where it lives."""
+    body = (REPO / "scripts" / "breeze_server.py").read_text()
+    body = body.split("def load_engine", 1)[1].split("def socket_owner", 1)[0]
+    assert "worker = RenderWorker(render)" in body
+    warm = body.split('for label in ("discarded", "measured")', 1)[1]
+    assert "for block in worker(" in warm
+    assert "return worker, graphs, None, config" in body
+
+
+# ===========================================================================
 # 12. the room never waits on bookkeeping
 # ===========================================================================
 def test_end_audio_releases_the_player_without_ending_the_producer():

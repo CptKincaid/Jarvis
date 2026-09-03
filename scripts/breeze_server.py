@@ -30,6 +30,18 @@ first render after capture is 1.509 s to first audio at RTF 1.868 -- it
 would underrun on its own. The second is 0.265 s at RTF 0.814. The first
 one is paid here.
 
+WHY EVERY RENDER RUNS ON ONE THREAD
+----------------------------------
+Measured 2026-09-02: a render costs a +16.37 GiB GPU transient the FIRST time
+it runs on a given host thread, and 0.0-0.3 GiB every time after that on that
+same thread. Connections are served thread-per-connection, so the render used
+to pay that on every sentence. It does not any more: RenderWorker holds one
+long-lived render thread, warmed at boot inside the GPU flock, and the
+connection threads feed it and stream its chunks straight back out. The cost
+is in prepare_inputs -- specifically the Mimi encode of the reference clip --
+and not in generation; WHY that is per-thread is not known. See RenderWorker
+for the arms, and for what was falsified.
+
 PROTOCOL: newline-delimited JSON over a unix socket, one request per
 connection (like f5_server.py).
 
@@ -80,6 +92,7 @@ import fcntl
 import itertools
 import json
 import os
+import queue
 import socket
 import struct
 import sys
@@ -87,6 +100,7 @@ import threading
 import time
 import traceback
 import wave
+import weakref
 from pathlib import Path
 
 import numpy as np
@@ -331,6 +345,328 @@ def gpu_lock(path):
             fh.close()
 
 
+# ---------------------------------------------------------- one render thread
+# THE +16.37 GiB TRANSIENT, AND WHY THIS CLASS EXISTS.
+#
+# Measured 2026-09-02 with an external MemFree sampler -- a 1 Hz one misses it
+# entirely; the dip is ~620 ms wide and starts ~540 ms into the render, to
+# within 5 ms every time. EVERY render served through this socket cost a
+# +16.37 GiB GPU transient, fully returned each time (no leak), and INDEPENDENT
+# OF THE TEXT: a 20-character line cost the same as a 293-character one.
+#
+# Two plausible causes were tested and FALSIFIED. max_new_tokens does not size
+# it (37 renders, caps 1500 down to 50: 16.373 +/- 0.177 GiB, R^2 0.022 -- so
+# the cap stays at 1500, where it belongs; below ~260 frames it guillotines
+# real replies, and 5 of the 14 rated lines run past 8 s). Nor is it
+# torch.compile/Inductor autotuning: the cache was already warm and 25 renders
+# wrote no new files.
+#
+# What it IS, measured: PER HOST THREAD, paid once on that thread's first
+# render. Controlled arms, one resident model, cfg_scale 4.0 throughout --
+#
+#     a new thread for each render     16.42 / 16.37 / 16.29 / 16.39 GiB
+#     ONE persistent worker thread     16.24 GiB on its FIRST render, then
+#                                      0.04 / 0.08 / 0.02 / 0.00 / 0.04 / 0.05
+#     one new thread, three renders    16.39, then 0.29, 1.47
+#     the main thread, 28 renders      0.01 - 0.30 GiB (nvidia-smi: 0.00)
+#
+# serve() starts a thread per CONNECTION and the render used to run on it, so
+# Jarvis paid that 16 GiB on every single sentence -- on a box where the GPU
+# memory IS the system memory and where an exhausted pool is what forced the
+# 2026-08-28 hard power-off.
+#
+# WHERE the cost is, measured one level down (probe3/probe4 in
+# ~/voice-training/breeze-cap): IT IS NOT THE GENERATION. On a fresh thread,
+# prepare_inputs dipped 16.47 / 16.34 / 16.24 GiB while the generation that
+# followed it on that same thread dipped 0.01 / 0.07 / 0.11. Inside
+# prepare_inputs it is the Mimi audio tokenizer encoding the REFERENCE CLIP
+# (encode_prompt_audio): on a brand-new thread that call alone dips 16.47 GiB
+# over 620 ms, the HF text tokenisation beside it dips 0.0, and torch's own
+# max_memory_allocated goes 6.33 -> 22.65 GB across it -- so the 16 GiB is a
+# torch allocation, not something hidden in the driver. Reserved comes back to
+# 6.66-6.78 GB after: a warm thread does not HOLD the 16 GiB, it simply never
+# asks for it again. That is why one long-lived thread is a fix and not a
+# trade.
+#
+# WHY that one call is per-thread is still NOT KNOWN, and this comment will
+# not invent a reason. A generic per-thread CUDA first-touch was ruled out --
+# a fresh thread's first torch.zeros, bf16 matmul, sdpa, conv1d and conv2d
+# each cost 0.00-0.01 GiB (microthread.py) -- so it is something specific to
+# that encoder's first call on a host thread. The consequence for THIS file is
+# the same either way, which is why tests/test_breeze_sidecar.py pins the
+# THREAD IDENTITY and no story about it.
+#
+# It does name a better fix for whoever picks this up: the reference clip
+# never changes and its encode is deterministic, so memoising
+# encode_prompt_audio would remove the 16 GiB outright, boot included. That
+# lives in the breeze source tree, not in this file.
+#
+# Only the RENDER moves. Connections keep their own threads -- a ping or a
+# completion receipt must never queue behind a 14 s render, which is the
+# measured reason serve() went thread-per-connection in the first place --
+# and BreezeService._render_lock still holds generation to one at a time.
+# Streaming is preserved chunk by chunk (see __call__): the room's 0.27 s
+# time-to-first-audio, which beats the shipped F5 path at 0.53 s, is the whole
+# reason this voice is worth the memory, and a worker that returned only
+# finished audio would throw it away.
+
+# How many PCM blocks the worker may run ahead of the connection thread that
+# is writing them to the socket. Bounded on purpose. Unbounded, a client that
+# stopped reading would let the GPU generate a whole utterance into RAM on a
+# box with no memory to spare; at 1 it would reimpose exactly the lock-step
+# the inline generator had, making the socket's write latency the model's
+# problem. Four is small: fast_codec yields one codec frame per block and the
+# checkpoint's _frame_rate is 12.5 Hz, so the buffer is ~0.32 s of audio.
+RENDER_QUEUE_DEPTH = 4
+
+# A NET, NOT A DEADLINE. The worker reports its own death (_fail_pending), so
+# this only catches a worker wedged INSIDE the model, where a connection thread
+# would otherwise wait for ever and Jarvis would never fall back to F5. It sits
+# far above any real render: the longest rated line is ~14 s of wall clock.
+RENDER_STALL_S = 300.0
+
+# The stop pill. A sentinel object, not None, because None is a legal nothing.
+_STOP = object()
+_DONE = object()
+
+WORKER_GONE = "the breeze render worker is not running"
+
+
+class _Failed:
+    """A render that raised, on its way back to the connection thread."""
+
+    __slots__ = ("exc",)
+
+    def __init__(self, exc):
+        self.exc = exc
+
+
+class _RenderJob:
+    """One render in flight between a connection thread and the worker.
+
+    ``chunks`` carries PCM blocks and then exactly one terminal item (_DONE or
+    a _Failed). ``cancelled`` is how a connection thread that has gone away --
+    barge-in, a dead client, a send timeout -- tells the worker to stop
+    generating for nobody.
+    """
+
+    __slots__ = ("text", "gain", "chunks", "cancelled")
+
+    def __init__(self, text: str, gain: float, depth: int):
+        self.text = text
+        self.gain = float(gain)
+        self.chunks = queue.Queue(maxsize=depth)
+        self.cancelled = threading.Event()
+
+
+class RenderWorker:
+    """Runs every render on ONE long-lived thread, streaming as it goes.
+
+    It is itself a ``render(text, gain) -> iterator of PCM blocks`` callable,
+    which is the seam BreezeService and load_engine already used, so nothing
+    downstream had to learn what a queue is.
+    """
+
+    def __init__(self, render, *, name: str = "breeze-render",
+                 depth: int = RENDER_QUEUE_DEPTH,
+                 stall_s: float = RENDER_STALL_S):
+        self._render = render
+        self._name = name
+        self._depth = max(1, int(depth))
+        self._stall_s = float(stall_s)
+        self._inbox: "queue.Queue" = queue.Queue()
+        self._lock = threading.Lock()
+        self._thread = None
+        self._dead = threading.Event()
+        self._current = None
+
+    # ------------------------------------------------------------ lifecycle
+    @property
+    def alive(self) -> bool:
+        """False once the thread has exited or could never be started.
+
+        Read on every ping and before every dispatch: a dead worker must make
+        the sidecar not-ready, not make one connection hang.
+        """
+        return not self._dead.is_set()
+
+    @property
+    def ident(self):
+        """The thread the model actually runs on, for the log and the tests."""
+        return self._thread.ident if self._thread is not None else None
+
+    def start(self):
+        """Idempotent. Raises if the worker has already died."""
+        with self._lock:
+            if self._dead.is_set():
+                raise RuntimeError(WORKER_GONE)
+            self._start_locked()
+        return self
+
+    def _start_locked(self) -> None:
+        if self._thread is not None:
+            return
+        thread = threading.Thread(target=self._loop, name=self._name,
+                                  daemon=True)
+        try:
+            thread.start()
+        except RuntimeError:            # out of threads: fail closed, loudly
+            self._dead.set()
+            raise
+        self._thread = thread
+
+    def stop(self, timeout: float = 2.0) -> None:
+        """Ask the worker to finish and go. Safe to call twice, or never
+        having started."""
+        with self._lock:
+            thread = self._thread
+            if thread is None:
+                self._dead.set()
+        job = self._current
+        if job is not None:
+            job.cancelled.set()         # so a long render notices the pill
+        self._inbox.put(_STOP)
+        if thread is None:
+            self._fail_pending(RuntimeError(WORKER_GONE))
+            return
+        thread.join(timeout)
+
+    # ---------------------------------------------------------- the callable
+    def __call__(self, text: str, gain: float = 1.0):
+        """``render(text, gain)``: a generator of PCM blocks.
+
+        The blocks are handed over AS THEY ARE PRODUCED -- this is a pipe, not
+        a promise. _serve_stream writes each one to the socket the moment it
+        arrives, so time-to-first-audio is still the model's first chunk and
+        nothing waits for the utterance to finish.
+        """
+        job = _RenderJob(text, gain, self._depth)
+        self._submit(job)
+        try:
+            while True:
+                try:
+                    item = job.chunks.get(timeout=self._stall_s)
+                except queue.Empty:
+                    raise RuntimeError(
+                        f"the breeze render worker produced nothing for "
+                        f"{self._stall_s:.0f}s") from None
+                if item is _DONE:
+                    return
+                if isinstance(item, _Failed):
+                    if not isinstance(item.exc, Exception):
+                        # A BaseException -- SystemExit, KeyboardInterrupt --
+                        # would blow straight through _serve_stream's
+                        # `except Exception`, past handle()'s net and past
+                        # _serve_conn's, and the caller would get EOF with no
+                        # refusal line: the one outcome this protocol promises
+                        # never to produce before audio, and the one that
+                        # makes Jarvis speak half a sentence twice. It killed
+                        # the worker; it does not get to kill the answer too.
+                        raise RuntimeError(
+                            f"the breeze render worker died: "
+                            f"{type(item.exc).__name__}: {item.exc}")
+                    raise item.exc
+                yield item
+        finally:
+            # Whether this ended, raised, or was closed by _close_generator
+            # because the client hung up: the worker must stop generating for
+            # a consumer that is no longer reading.
+            job.cancelled.set()
+
+    def _submit(self, job) -> None:
+        # Under the lock, and _loop sets _dead BEFORE it drains, so a job can
+        # never be filed with a worker that has just gone and then wait out
+        # RENDER_STALL_S for an answer nobody will send.
+        with self._lock:
+            if self._dead.is_set():
+                raise RuntimeError(WORKER_GONE)
+            self._start_locked()
+            self._inbox.put(job)
+
+    # ------------------------------------------------------------- the loop
+    def _loop(self) -> None:
+        try:
+            while True:
+                job = self._inbox.get()
+                if job is _STOP:
+                    break
+                self._current = job
+                try:
+                    self._run(job)
+                finally:
+                    self._current = None
+        except BaseException:            # it is about to die anyway
+            traceback.print_exc()
+            print("breeze: the render worker died -- the sidecar is now "
+                  "not-ready and Jarvis will speak in F5", file=sys.stderr,
+                  flush=True)
+        finally:
+            # Order matters: _dead first, so _submit under the same lock can
+            # never slip a job in behind the drain below.
+            self._dead.set()
+            self._fail_pending(RuntimeError(WORKER_GONE))
+
+    def _run(self, job) -> None:
+        blocks = None
+        try:
+            blocks = self._render(job.text, job.gain)
+            for block in blocks:
+                if job.cancelled.is_set():
+                    break
+                if not block:
+                    continue
+                if not self._put(job, block):
+                    break               # cancelled while waiting for room
+            self._put(job, _DONE)
+        except Exception as exc:
+            # NOT fatal to the worker: one line that blew up must not cost the
+            # resident model. The connection thread re-raises this, and if no
+            # audio has been sent yet it answers {"ok": false} so the caller
+            # renders that chunk on F5.
+            self._put(job, _Failed(exc))
+        except BaseException as exc:     # hand it back, then die
+            self._put(job, _Failed(exc))
+            raise
+        finally:
+            # On the WORKER thread, deliberately. Closing a half-consumed
+            # render generator runs its cleanup wherever close() is called
+            # from, and that cleanup touches CUDA -- so a barge-in used to
+            # tear down GPU state on the connection thread. Now every line of
+            # this that reaches the model runs on the one thread.
+            _close_generator(blocks)
+
+    def _put(self, job, item) -> bool:
+        """Hand one item over, giving up if the consumer has gone. Polls
+        rather than blocking so a client that hung up cannot pin the worker
+        to a full queue for ever."""
+        while not job.cancelled.is_set():
+            try:
+                job.chunks.put(item, timeout=0.1)
+                return True
+            except queue.Full:
+                continue
+        return False
+
+    def _fail_pending(self, exc) -> None:
+        """Every job that will now never run -- the one in flight and every
+        one still queued -- gets the error, so no connection thread is left
+        waiting on a worker that has gone."""
+        stranded = []
+        job = self._current
+        if job is not None:
+            stranded.append(job)
+        with self._lock:
+            while True:
+                try:
+                    item = self._inbox.get_nowait()
+                except queue.Empty:
+                    break
+                if item is not _STOP:
+                    stranded.append(item)
+        for job in stranded:
+            self._put(job, _Failed(exc))
+
+
 # ------------------------------------------------------------- the protocol
 class BreezeService:
     """The socket protocol, with the engine behind one callable.
@@ -343,7 +679,19 @@ class BreezeService:
     def __init__(self, render=None, sample_rate: int = SAMPLE_RATE,
                  ready: bool = False, graphs: dict | None = None,
                  error: str | None = None, config: dict | None = None):
-        self.render = render
+        # EVERY render goes through the one worker thread -- see RenderWorker
+        # for the 16.37 GiB per-thread measurement that is the whole reason.
+        # The wrapping happens HERE, not at the call sites, because the defect
+        # being fixed was a render running on whichever thread happened to be
+        # holding the connection: a service that cannot be constructed without
+        # a worker cannot regress to that by accident. load_engine passes a
+        # RenderWorker it has already warmed (so the one-off transient is paid
+        # at boot, inside the GPU flock) and that one is used as it is.
+        if render is None or isinstance(render, RenderWorker):
+            self.worker = render
+        else:
+            self.worker = RenderWorker(render)
+        self.render = self.worker
         self.sample_rate = int(sample_rate)
         self.graphs = dict(graphs or {})
         # id -> {"complete": bool, ...} for the receipt query. See the
@@ -354,7 +702,12 @@ class BreezeService:
         # are reached concurrently. _render_lock keeps the one resident model
         # to ONE generation at a time -- which is what the old accept-then-
         # handle loop gave for free, and the only part of that serialisation
-        # worth keeping. _receipt_lock guards the OrderedDict a receipt query
+        # worth keeping. The single render thread would serialise generation
+        # on its own, so this lock is now belt AND braces, and it earns its
+        # keep: it holds the worker's inbox to one job, so seven queued
+        # connections cannot each buy a chunk buffer, and it keeps "one render
+        # at a time" a property of the protocol rather than of the worker's
+        # internals. _receipt_lock guards the OrderedDict a receipt query
         # reads while a stream is writing it.
         self._render_lock = threading.Lock()
         self._receipt_lock = threading.Lock()
@@ -365,9 +718,40 @@ class BreezeService:
         # one voice under another's key in silence.
         self.config = dict(config or {})
         # ready is never a synonym for "loaded": see the module docstring.
-        self.ready = bool(ready and render is not None
-                          and all_graphs_captured(self.graphs))
+        # It is also not a synonym for "was ready at boot" -- see the property
+        # below, which folds in whether the render thread is still there.
+        self._ready = bool(ready and self.worker is not None
+                           and all_graphs_captured(self.graphs))
         self.error = error
+        # A service that is dropped -- a test, or any future embedder -- must
+        # not leave its worker parked on the inbox for the life of the
+        # process. main()'s service lives until exit and calls close() itself.
+        self._finalizer = (weakref.finalize(self, self.worker.stop)
+                           if self.worker is not None else None)
+
+    @property
+    def ready(self) -> bool:
+        """Ready AND the render thread is still alive. FAIL CLOSED.
+
+        A dead worker means every render would raise, so the next ping has to
+        say not-ready and Jarvis has to speak in the 2.79 voice. The
+        alternative -- a sidecar that still claims 4.71 and then errors, or
+        worse, hangs the connection -- is a mute assistant.
+        """
+        return self._ready and self.worker is not None and self.worker.alive
+
+    def close(self) -> None:
+        """Stop the render thread. Idempotent."""
+        if self.worker is not None:
+            self.worker.stop()
+
+    def _why_not(self) -> str | None:
+        """The error to report, including one that happened after boot."""
+        if self.error:
+            return self.error
+        if self._ready and self.worker is not None and not self.worker.alive:
+            return WORKER_GONE
+        return None
 
     # ------------------------------------------------------------- replies
     def ping(self) -> dict:
@@ -375,8 +759,9 @@ class BreezeService:
                  "graphs": all_graphs_captured(self.graphs),
                  "detail": self.graphs, "sr": self.sample_rate,
                  "config": self.config}
-        if self.error:
-            reply["error"] = self.error
+        why = self._why_not()
+        if why:
+            reply["error"] = why
         return reply
 
     def receipt(self, request_id: str) -> dict:
@@ -397,7 +782,7 @@ class BreezeService:
                 self._receipts.popitem(last=False)
 
     def _not_ready(self) -> dict:
-        return {"ok": False, "error": self.error or
+        return {"ok": False, "error": self._why_not() or
                 "breeze sidecar is not ready (CUDA graphs were not captured)"}
 
     # ------------------------------------------------------------ dispatch
@@ -476,11 +861,12 @@ class BreezeService:
             conn.settimeout(SEND_TIMEOUT_S)
         except (AttributeError, OSError):
             pass
-        # ONE generation at a time on the one resident model. A ping or a
-        # receipt query never reaches this, which is the point: measured
-        # before the split, a 6 s in-flight render made Jarvis's
-        # _ensure_breeze_server cost 6.0 s on the speak path because its ping
-        # was stuck behind the render in the accept queue.
+        # ONE generation at a time on the one resident model, and -- since
+        # self.render IS the RenderWorker -- always on the same thread as the
+        # last one. A ping or a receipt query never reaches this, which is the
+        # point: measured before the split, a 6 s in-flight render made
+        # Jarvis's _ensure_breeze_server cost 6.0 s on the speak path because
+        # its ping was stuck behind the render in the accept queue.
         with self._render_lock:
             if req.get("stream"):
                 self._serve_stream(conn, text.strip(), float(gain),
@@ -658,7 +1044,13 @@ def make_renderer(runtime, tokenizer, audio_tokenizer, model, *, template: str,
 
 def load_engine(args):
     """Load, capture, warm. Returns (render, graphs, error, config) -- never
-    raises for a graph problem, only for a model that will not load at all."""
+    raises for a graph problem, only for a model that will not load at all.
+
+    ``render`` is a started, warmed RenderWorker: a ``render(text, gain)``
+    callable like any other, whose ONE thread has already paid the 16.2 GiB
+    first-render transient, here, inside the GPU flock, rather than on
+    Hunter's first sentence.
+    """
     sys.path.insert(0, str(args.repo))
     os.chdir(args.repo)
     # Triton's bundled ptxas (12.8) has no sm_121a, so the depth decoder's
@@ -733,6 +1125,14 @@ def load_engine(args):
                            ref_text=ref_text, instruction=args.instruction,
                            cfg_scale=args.cfg_scale, seed=args.seed)
 
+    # THE ONE RENDER THREAD, started here so that every render this process
+    # ever serves -- including the two warm ones below -- runs on it. See
+    # RenderWorker: the first render on any thread costs a +16.2 GiB transient
+    # and later ones on that same thread cost 0.0-0.3 GiB, so this is where
+    # that bill is paid: at boot, under the GPU flock, next to the 18.2 GiB
+    # capture transient the flock already exists to serialise.
+    worker = RenderWorker(render)
+
     # TWO warm renders, and the first is thrown away without being measured:
     # measured on this box, the first render after capture is 1.509 s to
     # first audio at RTF 1.868 -- it would underrun. The second is the one
@@ -740,11 +1140,13 @@ def load_engine(args):
     # cannot speak, so it fails readiness rather than waiting to fail on
     # Hunter's first reply.
     try:
+        worker.start()
+        print(f"breeze: render worker on thread {worker.ident}", flush=True)
         for label in ("discarded", "measured"):
             t = time.perf_counter()
             first = None
             n = 0
-            for block in render(args.warm_text, 1.0):
+            for block in worker(args.warm_text, 1.0):
                 if first is None:
                     first = time.perf_counter() - t
                 n += len(block)
@@ -756,6 +1158,7 @@ def load_engine(args):
                   flush=True)
     except Exception as exc:
         traceback.print_exc()
+        worker.stop()
         return None, graphs, f"warm render failed: {type(exc).__name__}: {exc}", config
 
     # WHAT THIS THING ACTUALLY COSTS, on one line in journalctl, after the
@@ -775,9 +1178,10 @@ def load_engine(args):
     print(f"breeze: resident free={free_mem_gb():.1f}GB "
           f"alloc={torch.cuda.memory_allocated() / 1024 ** 3:.2f}GB "
           f"reserved={torch.cuda.memory_reserved() / 1024 ** 3:.2f}GB "
-          f"peak={torch.cuda.max_memory_allocated() / 1024 ** 3:.2f}GB",
+          f"peak={torch.cuda.max_memory_allocated() / 1024 ** 3:.2f}GB "
+          f"render_thread={worker.ident}",
           flush=True)
-    return render, graphs, None, config
+    return worker, graphs, None, config
 
 
 # ------------------------------------------------------------------- serve
@@ -860,6 +1264,10 @@ def serve(sock_path, service: BreezeService) -> int:
     connected and never finished its request line wedged the entire sidecar
     for the connection deadline. Generation itself is still serialised, by
     BreezeService._render_lock, because there is only one resident model.
+
+    These threads do the SOCKET I/O only. The model runs on the one thread
+    RenderWorker owns, whatever connection asked for it -- that is what makes
+    a render cost 0.04 GiB instead of 16.37.
     """
     if _refuse_second_instance(sock_path, "bind"):
         return 2
@@ -930,7 +1338,7 @@ def main(argv=None) -> int:
     if _refuse_second_instance(args.socket, "start"):
         return 2
 
-    render = graphs = error = config = None
+    engine = graphs = error = config = None
     # The lock covers load AND capture AND both warm renders; only the
     # serving loop runs outside it.
     with gpu_lock(args.gpu_lock):
@@ -954,14 +1362,23 @@ def main(argv=None) -> int:
         # between its release of this lock and its bind.
         if _refuse_second_instance(args.socket, "start"):
             return 2
-        render, graphs, error, config = load_engine(args)
+        engine, graphs, error, config = load_engine(args)
 
-    service = BreezeService(render=render, sample_rate=SAMPLE_RATE,
-                            ready=render is not None, graphs=graphs,
+    # ``engine`` is load_engine's warmed RenderWorker (or, under a test's
+    # monkeypatch, a plain callable BreezeService wraps in one of its own).
+    service = BreezeService(render=engine, sample_rate=SAMPLE_RATE,
+                            ready=engine is not None, graphs=graphs,
                             error=error, config=config)
     if not service.ready:
-        print(f"breeze: NOT READY -- {error}", file=sys.stderr, flush=True)
-    return serve(args.socket, service)
+        print(f"breeze: NOT READY -- {service._why_not()}", file=sys.stderr,
+              flush=True)
+    try:
+        return serve(args.socket, service)
+    finally:
+        # serve() only returns when the listening socket is gone or a second
+        # instance owns it; either way the render thread should not outlive
+        # this call while the process is on its way out.
+        service.close()
 
 
 if __name__ == "__main__":
