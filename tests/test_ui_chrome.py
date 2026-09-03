@@ -17,10 +17,11 @@ os.environ.setdefault("JARVIS_ASSISTANT_CONFIG",
                                    "assistant.json"))
 
 from jarvis.ui import theme  # noqa: E402
-from jarvis.ui.views import (CommandBar, StatusStrip, card_look,  # noqa: E402
-                             fit_placeholder, fmt_temps_compact,
-                             levels_for_look, plan_strip, plan_telemetry,
-                             telemetry_segments, tracked)
+from jarvis.ui.views import (TELEMETRY_LEVELS, CommandBar,  # noqa: E402
+                             StatusStrip, card_look, fit_placeholder,
+                             fmt_load, fmt_temps_compact, levels_for_look,
+                             plan_strip, plan_telemetry, telemetry_segments,
+                             tracked)
 from jarvis.ui.widgets import (Card, Chip, Meter, RoundButton,  # noqa: E402
                                Toast)
 
@@ -46,6 +47,35 @@ LEVEL0 = [("CPU", 218), ("GPU", 218), ("MEMORY", 274)]   # sum 710 → x 210
 LEVEL1 = [("CPU", 134), ("GPU", 134), ("MEMORY", 162)]   # sum 430 → x 490
 LEVEL2 = [("MEMORY", 162)]                               # sum 162 → x 758
 LEVELS = [LEVEL0, LEVEL1, LEVEL2]
+
+# MEASURED 2026-09-03 on Xvfb :95 at JARVIS_UI_SCALE 2.0, the same faces
+# and the same method as the 09-01 pass above ('Chakra Petch SemiBold' -24
+# labels, 'JetBrains Mono' -24 values): labels CPU/GPU 48, MEM 52, MEMORY
+# 100; one mono character 14. A segment is PAD_S + value + PAD_S, plus
+# label + 6-unit gap when it has a label, plus PAD on the last one --
+# StatusStrip._layout's own formula. The strip lives in a shell packed
+# padx=1, so his 920-px window gives it 918, not 920.
+#
+# IDLE ('cpu 53° 7% · gpu 44° 0%', '47.5/122 GB'):
+#   0 full     CPU '53°C · 7%' 218 | GPU 218 | MEM '47.5/122 GB' 282 = 718
+#   1 compact  CPU '53° 7%'    176 | GPU 176 |     '47.5/122 GB' 218 = 570
+#   2 load     CPU '7%'        120 | GPU 120 |     '47.5/122 GB' 218 = 458
+#   3 minimal                                      '47.5/122 GB' 218 = 218
+STRIP_W = 918
+LIVE = [[("CPU", 218), ("GPU", 218), ("MEMORY", 282)],
+        [("CPU", 176), ("GPU", 176), ("MEMORY", 218)],
+        [("CPU", 120), ("GPU", 120), ("MEMORY", 218)],
+        [("MEMORY", 218)]]
+# HOT ('cpu 100° 100% · gpu 88° 100%', '121.7/122 GB') -- a three-digit
+# temperature under full load, on a pool over 100 GB in use:
+#   0 full  260 | 246 | 296 = 802     2 load  148 | 148 | 232 = 528
+#   1 comp  218 | 204 | 232 = 654     3 min               232 = 232
+HOT = [[("CPU", 260), ("GPU", 246), ("MEMORY", 296)],
+       [("CPU", 218), ("GPU", 204), ("MEMORY", 232)],
+       [("CPU", 148), ("GPU", 148), ("MEMORY", 232)],
+       [("MEMORY", 232)]]
+WAKE_END_OFF = 32 + 16 + 12 + 192 + 16   # PAD ring gap 'WAKE WORD OFF' PAD_S
+WAKE_END_CLASSIC = 32 + 219 + 16         # classic: '○ WAKE WORD OFF', no ring
 
 
 # ------------------------------------------------------- placeholder
@@ -113,21 +143,29 @@ def test_plan_telemetry_leaves_every_layout_that_fitted_before_alone():
     assert plan_telemetry(920, WAKE_END_AT_920, 130, 14, 6, LEVELS) == (0,) + old
 
 
-def test_classic_plans_with_level_zero_only_so_it_renders_as_today():
-    """The 09-01 review's same-minute A/B found the elision to be the ONE
-    classic pixel change outside the sphere; classic is the exact fallback,
-    so it keeps the old plan_strip answer -- collision included (the FOUND
-    08-26 xfail in test_found_status_strip_overlap.py stays open for it)."""
-    theme.select_look("classic")
-    assert levels_for_look(LEVELS) == [LEVEL0]
-    assert plan_telemetry(920, WAKE_END_AT_920, 130, 14, 0,
-                          levels_for_look(LEVELS)) == (0, 0, [])   # as d38b493
-    theme.select_look("holo")
-    assert levels_for_look(LEVELS) == LEVELS
-    assert plan_telemetry(920, WAKE_END_AT_920, 130, 14, 0,
-                          levels_for_look(LEVELS)) == (1, 0, [])
-    # explicit look beats the module state; empty survives
-    assert levels_for_look(LEVELS, "classic") == [LEVEL0]
+def test_both_looks_now_plan_with_the_whole_ladder():
+    """2026-09-02: classic gets the elision too.
+
+    It used to plan with level 0 alone -- the 09-01 review's same-minute
+    A/B found the elision to be the ONE classic pixel change outside the
+    holo sphere, and classic is the fallback that renders the 08-31
+    console token for token, FOUND 08-26 overprint included. Answering
+    "is that free or used?" broke that contract by itself: the level-0
+    memory value changed in BOTH looks ('47.5 GB' -> '47.5/122 GB'), so
+    classic's cluster grew 710 -> 718 px and its overprint on his 918-px
+    strip went 59 px -> 67. Given a classic 8 px MORE broken or a classic
+    that elides, the elision wins."""
+    for look in ("classic", "holo"):
+        theme.select_look(look)
+        assert levels_for_look(LIVE) == LIVE
+    # and the overprint the contract used to preserve is gone: classic at
+    # his window plans the compact rung instead of printing CPU over OFF
+    assert plan_telemetry(STRIP_W, WAKE_END_CLASSIC, 130, 14, 0,
+                          levels_for_look(LIVE, "classic")) == (1, 0, [])
+    assert sum(w for _n, w in LIVE[0]) > STRIP_W - WAKE_END_CLASSIC
+    assert sum(w for _n, w in LIVE[1]) <= STRIP_W - WAKE_END_CLASSIC
+    # explicit look no longer changes the answer; empty still survives
+    assert levels_for_look(LIVE, "classic") == levels_for_look(LIVE, "holo")
     assert levels_for_look([], "classic") == [] and levels_for_look(None) == []
 
 
@@ -137,15 +175,28 @@ def test_telemetry_segments_per_level():
         ("CPU", "53°C · 7%"), ("GPU", "44°C · 0%"), ("MEM", "47.5/122 GB")]
     assert telemetry_segments(temps, mem, 1) == [
         ("CPU", "53° 7%"), ("GPU", "44° 0%"), ("", "47.5/122 GB")]
-    assert telemetry_segments(temps, mem, 2) == [("", "47.5/122 GB")]
+    assert telemetry_segments(temps, mem, 2) == [
+        ("CPU", "7%"), ("GPU", "0%"), ("", "47.5/122 GB")]
+    assert telemetry_segments(temps, mem, 3) == [("", "47.5/122 GB")]
+    # the ladder has four rungs and the last one is the floor
+    assert TELEMETRY_LEVELS == 4 == len(LIVE)
+    assert telemetry_segments(temps, mem, 9) == \
+        telemetry_segments(temps, mem, TELEMETRY_LEVELS - 1)
     # the compact line reads 'CPU 53° 7% · GPU 44° 0% · 47.5/122 GB'
     assert " · ".join(f"{lab} {val}".strip()
                       for lab, val in telemetry_segments(temps, mem, 1)) \
         == "CPU 53° 7% · GPU 44° 0% · 47.5/122 GB"
+    # ...and the load line 'CPU 7% · GPU 0% · 47.5/122 GB'
+    assert " · ".join(f"{lab} {val}".strip()
+                      for lab, val in telemetry_segments(temps, mem, 2)) \
+        == "CPU 7% · GPU 0% · 47.5/122 GB"
     # unknowns
     assert telemetry_segments("", "", 0) == [("CPU", "--"), ("GPU", "--"),
                                              ("MEM", "--")]
     assert telemetry_segments("gpu 38°", None, 1) == [("CPU", "--"),
+                                                      ("GPU", "38°"), ("", "--")]
+    # a segment with no percentage has only its temperature to give
+    assert telemetry_segments("gpu 38°", None, 2) == [("CPU", "--"),
                                                       ("GPU", "38°"), ("", "--")]
 
 
@@ -160,6 +211,10 @@ def test_the_compact_level_keeps_the_number_that_actually_moves():
     assert "7%" in compact[0] and "0%" in compact[1]
     # a temperature-only rung is what it replaces
     assert compact[0] != fmt_temps_compact("cpu 53° 7%") == "53°"
+    # and the utilisation survives every rung below it but the floor
+    for level in range(1, TELEMETRY_LEVELS - 1):
+        values = [v for _lab, v in telemetry_segments(temps, "47.5 GB", level)]
+        assert "7%" in values[0] and "0%" in values[1]
 
 
 def test_fmt_temps_compact():
@@ -170,30 +225,50 @@ def test_fmt_temps_compact():
     assert StatusStrip.SEGMENTS == ("CPU", "GPU", "MEMORY")
 
 
-# Re-measured 2026-09-02 (same faces, same JARVIS_UI_SCALE 2.0, same
-# 920-px window) for the compact rung that keeps the utilisation and the
-# used/total memory value:
-#   level 0  CPU 53°C · 7% | GPU 44°C · 0% | MEM 47.5/122 GB  = 729
-#   level 1  CPU 53° 7%    | GPU 44° 0%    |     47.5/122 GB  = 577
-#   level 2                                     47.5/122 GB   = 222
-LIVE = [[("CPU", 221), ("GPU", 222), ("MEMORY", 286)],
-        [("CPU", 177), ("GPU", 178), ("MEMORY", 222)],
-        [("MEMORY", 222)]]
-WAKE_END_OFF = 32 + 219 + 16      # PAD + "WAKE WORD OFF" + PAD_S = 267
-
-
 def test_the_livelier_cluster_still_respects_the_width_budget():
     """What the extra characters cost, against the budget the elision
     system exists to respect. The percentage and the /total are paid for
-    out of level 1's slack (434 -> 577 px of the 651 free at his window),
+    out of level 1's slack (430 -> 570 px of the 650 free at his window),
     and level 0 still fits the 520-design-unit DEFAULT window, so no
     layout that showed the full cluster before loses it."""
-    assert plan_telemetry(920, WAKE_END_OFF, 130, 14, 0, LIVE)[0] == 1
-    assert 920 - sum(w for _n, w in LIVE[1]) - WAKE_END_OFF == 76
+    assert WAKE_END_OFF == 268 and WAKE_END_CLASSIC == 267
+    assert plan_telemetry(STRIP_W, WAKE_END_OFF, 130, 14, 0, LIVE)[0] == 1
+    assert STRIP_W - sum(w for _n, w in LIVE[1]) - WAKE_END_OFF == 80
+    # the default window keeps the full cluster, with 52 px to spare
     assert plan_telemetry(1038, WAKE_END_OFF, 130, 14, 0, LIVE)[0] == 0
-    # and the minimum window (460 design units) never falls past level 1
-    assert plan_telemetry(920, WAKE_END_OFF, 130, 14, 0,
-                          levels_for_look(LIVE, "holo"))[0] == 1
+    assert 1038 - sum(w for _n, w in LIVE[0]) - WAKE_END_OFF == 52
+
+
+def test_a_three_digit_temperature_under_load_never_blanks_the_strip():
+    """The rung the load level exists for.
+
+    Keeping the utilisation at level 1 spent most of its slack: at 100°
+    and 100% on a pool over 100 GB the compact rung asks 654 px of the 650
+    his strip leaves, so the plan drops a rung -- and until 2026-09-02 the
+    rung below was memory ALONE. CPU and GPU would have vanished at
+    exactly the load the whole change exists to surface. The load rung
+    catches it with 122 px to spare, and drops the temperatures instead of
+    the numbers that move."""
+    free = STRIP_W - WAKE_END_OFF
+    assert free == 650
+    assert sum(w for _n, w in HOT[1]) == 654 > free      # compact tips
+    assert sum(w for _n, w in HOT[2]) == 528 <= free     # load holds
+    assert plan_telemetry(STRIP_W, WAKE_END_OFF, 130, 14, 0, HOT)[0] == 2
+    hot = "cpu 100° 100% · gpu 88° 100%"
+    assert telemetry_segments(hot, "121.7/122 GB", 2) == [
+        ("CPU", "100%"), ("GPU", "100%"), ("", "121.7/122 GB")]
+    # what the three-rung ladder would have shown instead: memory alone
+    three_rung = [HOT[0], HOT[1], HOT[3]]
+    assert plan_telemetry(STRIP_W, WAKE_END_OFF, 130, 14, 0, three_rung)[0] == 2
+    assert telemetry_segments(hot, "121.7/122 GB", 3) == [("", "121.7/122 GB")]
+
+
+def test_fmt_load_keeps_the_percentage_and_falls_back_to_the_temperature():
+    assert fmt_load("cpu 53° 7%") == "7%"
+    assert fmt_load("gpu 44° 100%") == "100%"
+    assert fmt_load("gpu 38°") == "38°"        # no percentage to keep
+    assert fmt_load("") == "--" and fmt_load(None) == "--"
+    assert fmt_load("gpu unknown") == "--"
 
 
 # --------------------------------------------------------- captions

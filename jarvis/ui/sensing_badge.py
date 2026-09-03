@@ -169,10 +169,15 @@ class SensingBadge(tk.Canvas):
 
         The header budgets around this rather than the current word: the
         badge is packed LAST in the header, so when the bar runs out of
-        room the badge is the child Tk pushes back over its neighbour --
-        the 2026-09-02 "the word sensing is underneath the ready symbol".
-        Budgeting for the widest keeps that from coming back at 21:00 when
-        the curfew turns the word into CAMERA OFF.
+        room the badge is the child Tk CLIPS -- and, when the cavity is
+        gone entirely, the child Tk stops drawing (views.header_spans, a
+        transcription of tkPack.c). That is the 2026-09-02 "the word
+        sensing is underneath the ready symbol": 124 px of 168, its word
+        sheared off flush against the wordmark, and 41 px of 214 with the
+        pill on LISTENING…. Budgeting for the widest keeps it from coming
+        back at 21:00 when the curfew turns the word into CAMERA OFF --
+        and an unmapped privacy badge is the failure this class exists to
+        prevent, since absence and SENSING must never look the same.
         """
         font = ui_display(theme.SIZE_CAPTION, "semibold")
         try:

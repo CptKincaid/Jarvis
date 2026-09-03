@@ -105,10 +105,11 @@ log = get_logger("ui.main_window")
 DEFAULT_W, DEFAULT_H = 520, 880
 DEFAULT_GEOMETRY = f"{DEFAULT_W}x{DEFAULT_H}"
 # Header wordmark, widest form first. The header is over-subscribed at his
-# saved 920-px window (2026-09-02: the sensing badge, packed last, was
-# pushed back on top of its neighbour), and the wordmark is the only thing
-# in the bar carrying no information, so it is what steps down — tracked,
-# untracked, monogram, gone. See MainWindow._fit_wordmark.
+# saved 920-px window (2026-09-02: Tk truncated the sensing badge, packed
+# last, to 124 px of its 168, flush against the wordmark), and the
+# wordmark is the only thing in the bar carrying no information, so it is
+# what steps down — tracked, untracked, monogram, gone. See
+# MainWindow._fit_wordmark and views.header_spans.
 WORDMARK_FORMS = ("J A R V I S", "JARVIS", "J", "")
 MIN_W, MIN_H = 460, 720
 
@@ -946,15 +947,20 @@ class MainWindow:
         self._sensing_tip = Tooltip(self.sensing_badge, "Sensing state")
         self._refresh_sensing()
 
-        # The header is packed right-to-left and Tk's packer neither wraps
-        # nor stops: once the cavity is spent it hands the NEXT parcel out
-        # to the left of where the cavity began, on top of whatever is
-        # already there. The badge is packed last, so the badge is what
-        # lands on its neighbour — 2026-09-02, "the word sensing is
-        # underneath the ready symbol". Nothing is misaligned (both chips
-        # declare the same 26-unit height and pack centres them); his
-        # 918-px header is simply 33 px short at rest and 164 short in the
-        # worst state. So the wordmark is refitted to whatever is left.
+        # The header is packed right-to-left out of a cavity Tk clamps
+        # at zero: once the cavity is spent it CLIPS the next child to
+        # what is left, and when nothing is left it stops drawing it at
+        # all (views.header_spans transcribes tkPack.c — the children
+        # never overlap). The badge is packed last, so the badge is what
+        # gets cut — 2026-09-02, "the word sensing is underneath the
+        # ready symbol": at 918 px it was 124 px of its 168, capsule and
+        # the tail of the word sheared off, flush against the wordmark;
+        # 41 px of 214 in his worst state. Nothing is misaligned (both
+        # chips declare the same 26-unit height and pack centres them);
+        # his 918-px header is simply 44 px short at rest and 173 short
+        # in the worst state. So the wordmark is refitted to whatever is
+        # left, and the badge — a privacy readout whose absence must
+        # never look like SENSING — stays whole.
         header.bind("<Configure>", self._on_header_resize, add=True)
         self._fit_wordmark()
 
@@ -1036,30 +1042,73 @@ class MainWindow:
             canvas.configure(width=bb[2] + gh + 1)
 
     def _wordmark_options(self) -> list:
-        """[(form, canvas width)] for WORDMARK_FORMS, widest first."""
+        """[(form, canvas width)] for WORDMARK_FORMS, widest first.
+
+        The canvas _draw_wordmark ends up with is sized from the text
+        item's BBOX, whose right edge sits one pixel past the measured
+        advance — hence the `+ 1`, without which every option here reads
+        one pixel narrower than the thing it is budgeting for.
+        """
         font = ui_display(theme.SIZE_WORDMARK, "semibold")
         gh = max(1, px(1))
         out = []
         for form in WORDMARK_FORMS:
-            out.append((form, px(2) + measure(font, form) + gh + 1)
+            out.append((form, px(2) + measure(font, form) + 1 + gh + 1)
                        if form else (form, 1))
         return out
 
-    def _wordmark_reserve(self) -> int:
-        """Header pixels the right-hand cluster claims, at its WIDEST.
+    @staticmethod
+    def _padx_total(child) -> int:
+        """Total horizontal pack padding one header child claims.
 
-        Measured through the widgets themselves so the two chip formulas
-        cannot drift from this budget, and against the widest WORD rather
-        than the current one: a header laid out around READY/SENSING fits
-        'JARVIS' and puts the overlap straight back the moment the pill
-        says LISTENING… or the curfew turns the badge into CAMERA OFF.
+        Tk reads `-padx 16` as 16 px on BOTH sides and `-padx {0 16}` as
+        16 on the right only, and a reserve that guessed would be wrong in
+        one direction or the other; pack_info() is the only thing that
+        knows. Anything unreadable counts as zero — an under-count costs a
+        wider wordmark, never a clipped chip, because the chips are
+        measured at their widest here.
         """
-        pad_s = theme.PAD_S
-        return (StatePill.widest_w(STATE_WORDS.values()) + pad_s
-                + SensingBadge.widest_w() + pad_s
-                + self._gear.winfo_reqwidth() + pad_s
-                + self._min_btn.winfo_reqwidth()
-                + self._close_btn.winfo_reqwidth() + pad_s)
+        try:
+            padx = child.pack_info().get("padx", 0)
+        except (AttributeError, TypeError, tk.TclError):
+            return 0
+        parts = padx if isinstance(padx, (list, tuple)) else str(padx).split()
+        try:
+            vals = [int(float(part)) for part in parts]
+        except (TypeError, ValueError):
+            return 0
+        if not vals:
+            return 0
+        return sum(vals) if len(vals) > 1 else vals[0] * 2
+
+    def _wordmark_reserve(self) -> int:
+        """Header pixels every OTHER child claims, at its WIDEST, plus the
+        gap the wordmark keeps clear of them.
+
+        Walked off the header's own pack list rather than a hand-written
+        one. A child this budget misses is a chip Tk truncates and, one
+        child further along, a chip Tk stops drawing (views.header_spans)
+        — and the child most likely to be added here next is a camera
+        preview on a sibling branch. Walking cannot rot that way.
+
+        The two chips are measured at their widest WORD, never the current
+        one: a header laid out around READY/SENSING fits 'JARVIS' and cuts
+        the badge in half the moment the pill says LISTENING… or the
+        curfew turns the badge into CAMERA OFF, and a wordmark that
+        resized on every state change would flicker on every wake.
+        """
+        widest = {}
+        if getattr(self, "pill", None) is not None:
+            widest[str(self.pill)] = StatePill.widest_w(STATE_WORDS.values())
+        if getattr(self, "sensing_badge", None) is not None:
+            widest[str(self.sensing_badge)] = SensingBadge.widest_w()
+        total = theme.PAD_S            # never flush against the badge
+        for child in self._header.pack_slaves():
+            if child is self._wordmark:
+                continue
+            total += (widest.get(str(child), child.winfo_reqwidth())
+                      + self._padx_total(child))
+        return total
 
     def _on_header_resize(self, event):
         self._fit_wordmark(event.width)
@@ -1067,13 +1116,14 @@ class MainWindow:
     def _fit_wordmark(self, header_w=None):
         """Show the widest wordmark form that fits beside the cluster.
 
-        Tracked 'J A R V I S' (286 px at S=2) needs a ~1120-px header once
+        Tracked 'J A R V I S' (290 px at S=2) needs a 1107-px header once
         the right side is reserved; his saved 920 gets the monogram, the
-        520-unit default window gets 'JARVIS', and nothing overlaps in any
-        state at any width. The wordmark is what yields because it is the
-        only thing in the bar that says nothing — the state pill and the
-        sensing badge both stay whole, and the badge stays where it was
-        deliberately put, beside the state.
+        520-unit default window gets 'JARVIS', and nothing is clipped or
+        unmapped in any state at any width the window allows. The wordmark
+        is what yields because it is the only thing in the bar that says
+        nothing — the state pill and the sensing badge both stay whole,
+        and the badge stays where it was deliberately put, beside the
+        state.
         """
         try:
             width = int(header_w if header_w else self._header.winfo_width())

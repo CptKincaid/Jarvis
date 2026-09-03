@@ -824,12 +824,13 @@ class StatePill(tk.Canvas):
         """Slab width for the WIDEST state word, in the current look/scale.
 
         The header budgets its wordmark against this and never against the
-        current word: a bar laid out around 'READY' collides the moment
-        the pill says 'LISTENING…', and a wordmark that resized on every
-        state change would flicker on every wake. `words` takes the
+        current word: a bar laid out around 'READY' clips its last-packed
+        child the moment the pill says 'LISTENING…', and a wordmark that
+        resized on every state change would flicker on every wake. `words`
+        takes the
         caller's actual vocabulary -- main_window.STATE_WORDS carries two
         (WAITING / WORKING) that this class constant does not, and a
-        budget quietly measuring the wrong list is how the collision would
+        budget quietly measuring the wrong list is how the clipping would
         come back. Falls back to _measure's estimate with no root.
         """
         words = tuple(words or cls.WORDS)
