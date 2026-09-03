@@ -390,16 +390,42 @@ def test_the_detect_size_cannot_drift_from_the_capture_aspect():
 
 
 def test_the_capture_resolution_is_the_one_the_mount_arithmetic_needs():
-    """docs/vision.md section 9: ~90 deg horizontal at 95 cm spans 191 cm, so
-    1920 px gives 10.05 px/cm and a 16 cm face is 161 px. 640x480 -- which
-    shipped first, uncommented -- makes that same face 53 px against SFace's
-    112x112 input, which section 9 itself calls "far too small"."""
+    """A 16 cm face at the 95 cm mount must survive to SFace's 112x112 input.
+
+    THIS TEST USED TO CARRY THE BUG IT WAS GUARDING. It hard-coded a 191 cm
+    span, which is what ~90 deg horizontal gives at 95 cm -- and 90 deg is
+    the 98 deg-diagonal Arducam docs/vision.md section 9 recommends BUYING,
+    not the 65.6 deg LifeCam Cinema he owns. With the span nailed to one
+    camera, changing width/height to a mode the LifeCam actually has made
+    the test fail on a config that is MORE correct, not less.
+
+    So the span now comes from the configured field of view, which is the
+    whole point of camera.hfov_deg existing: 1280 px across a 122 cm span is
+    167 px on the face, better than the 162 the Arducam manages across 191
+    cm at 1920. 640x480, which shipped first, would give 53 px -- what
+    section 9 calls "far too small"."""
+    from jarvis.assistant_config import DEFAULTS
+    from jarvis.facemodels import Lens
+    cam = DEFAULTS["camera"]
+    lens = Lens(cam["width"], cam["height"], cam["hfov_deg"])
+    face_px = lens.face_px(95.0)
+    assert face_px >= 112.0, "a 16 cm face is %.0f px at %dx%d, %.1f deg" % (
+        face_px, cam["width"], cam["height"], cam["hfov_deg"])
+    # And it must still clear YuNet's floor after the downscale the detector
+    # actually sees -- the step the two cameras do NOT cancel at.
+    assert lens.detect_face_px(95.0, cam["detect_width"]) >= 10.0
+
+
+def test_the_config_states_a_field_of_view_instead_of_implying_one():
+    """The 90 deg the old comment reasoned from lived in prose, so nothing
+    could disagree with it and nothing could be wrong. Every real candidate
+    is 65-82 deg."""
     from jarvis.assistant_config import DEFAULTS
     cam = DEFAULTS["camera"]
-    span_cm = 191.0
-    face_px = cam["width"] / span_cm * 16.0
-    assert face_px >= 112.0, "a 16 cm face is %.0f px at %dx%d" % (
-        face_px, cam["width"], cam["height"])
+    assert 0.0 < cam["hfov_deg"] < 180.0
+    assert cam["hfov_deg"] < 85.0, "no camera he is considering is that wide"
+    assert (cam["width"], cam["height"]) == (1280, 720), \
+        "the LifeCam has no 1080p mode; asking for one gets a silent fallback"
 
 
 def test_the_confidence_bar_leaves_the_measured_face_a_margin():

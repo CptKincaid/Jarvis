@@ -105,17 +105,25 @@ DETECTOR_OPENCV5 = "face_detection_yunet_2026may.onnx"
 # are deliberately not the pinned choice.
 
 
-def model_dir() -> Path:
-    """Where the weights live. JARVIS_FACE_MODEL_DIR lets the suite point
-    somewhere harmless; unset in production."""
+def model_dir(override: Optional[os.PathLike | str] = None) -> Path:
+    """Where the weights live, most specific first.
+
+    ``override`` is ``camera.model_dir`` from his config -- the caller's
+    explicit choice, so it wins. JARVIS_FACE_MODEL_DIR is next and lets the
+    suite point somewhere harmless (tests/conftest.py forces it, so no test
+    can reach the real weights). Otherwise the shipped location.
+    """
+    if override:
+        return Path(override)
     env = os.environ.get("JARVIS_FACE_MODEL_DIR")
     if env:
         return Path(env)
     return Path.home() / ".aiws_trainer" / "models" / "face"
 
 
-def model_path(model: FaceModel) -> Path:
-    return model_dir() / model.filename
+def model_path(model: FaceModel,
+               override: Optional[os.PathLike | str] = None) -> Path:
+    return model_dir(override) / model.filename
 
 
 def sha256_of(path: Path, chunk: int = 1 << 20) -> str:
@@ -126,11 +134,12 @@ def sha256_of(path: Path, chunk: int = 1 << 20) -> str:
     return h.hexdigest()
 
 
-def verify(model: FaceModel, deep: bool = False) -> tuple[bool, str]:
+def verify(model: FaceModel, deep: bool = False,
+           model_dir: Optional[os.PathLike | str] = None) -> tuple[bool, str]:
     """(ok, reason). ``deep`` hashes the file; the cheap path checks size,
     which catches the common failure of a git-lfs POINTER (about 130 bytes)
     downloaded instead of the weights."""
-    path = model_path(model)
+    path = model_path(model, model_dir)
     if not path.exists():
         return False, f"missing: {path}"
     actual = path.stat().st_size
@@ -146,13 +155,17 @@ def verify(model: FaceModel, deep: bool = False) -> tuple[bool, str]:
     return True, "ok"
 
 
-def available(deep: bool = False) -> dict[str, tuple[bool, str]]:
+def available(deep: bool = False,
+              model_dir: Optional[os.PathLike | str] = None
+              ) -> dict[str, tuple[bool, str]]:
     """Per-model readiness, for a voice_check-style report."""
-    return {m.key: verify(m, deep=deep) for m in MODELS}
+    return {m.key: verify(m, deep=deep, model_dir=model_dir) for m in MODELS}
 
 
-def ready(deep: bool = False) -> bool:
-    return all(ok for ok, _ in available(deep=deep).values())
+def ready(deep: bool = False,
+          model_dir: Optional[os.PathLike | str] = None) -> bool:
+    return all(ok for ok, _ in available(deep=deep,
+                                         model_dir=model_dir).values())
 
 
 # ------------------------------------------------------------------ geometry

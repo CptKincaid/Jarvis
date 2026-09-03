@@ -440,26 +440,39 @@ DEFAULTS: dict = {
     # section shipped a detect size that could not resolve the face the mount
     # arithmetic produces, and nothing connected the two numbers.
     #
-    # docs/vision.md section 9: a 98 deg diagonal lens on 16:9 gives ~90 deg
-    # horizontally; the recommended mount is ~95 cm from his face and so spans
-    # 2*95*tan(45) = 191 cm. At 1920 px that is 10.05 px/cm, so a 16 cm face is
-    # 161 px -- 8.4% of the frame width. THAT is the face the detector has to
-    # find, and it is why width/height is 1080p and not the 640x480 that
-    # shipped first: at 640x480 the same face is 53 px, against SFace's 112.
+    # THE FIELD OF VIEW IS NOW A KEY, AND THAT IS THE FIX. Until 2026-09-02
+    # nothing in this dict was a field of view: the 90 deg the arithmetic
+    # below reasons from lived only in this comment, which is precisely how
+    # it got applied to a camera that does not have it. hfov_deg is the
+    # HORIZONTAL field of the camera actually plugged in, and every
+    # pixel-to-angle claim in jarvis/camera.py and jarvis/visionrig.py is
+    # derived from it. There is no default anywhere in the code: an unset
+    # hfov_deg is an error, never a 90 (jarvis/camera.lens_from_config).
     #
-    # BUT THOSE NUMBERS DESCRIBE A CAMERA HE DOES NOT OWN. 90 deg horizontal
-    # is the 98 deg-diagonal Arducam section 9 recommends BUYING. The camera
-    # actually to hand is a LifeCam Cinema: 1280x720 -- so 1920x1080 is a mode
-    # it does not have -- and 73 deg DIAGONAL, which is 65.6 deg horizontal,
-    # not 73 (the conversion is a ratio of tangents, jarvis/facemodels.py).
-    # Its narrower field and lower resolution very nearly cancel at full
-    # frame: 167 px across the same face, against the Arducam's 162. They do
-    # NOT cancel after the downscale below, because 1280->320 is 4x while
-    # 1920->320 is 6x, so the detector sees 42 px on the LifeCam and 27 px on
-    # the Arducam. Both clear YuNet's documented 10-300 px range; only one of
-    # them has much margin. Nothing in this dict is a field of view, so no
-    # consumer may assume one -- jarvis/facemodels.Lens takes it as a
-    # required argument for exactly that reason.
+    # 65.6 is the LifeCam Cinema he already owns. Its spec sheet says 73 deg,
+    # which is the DIAGONAL; the conversion to horizontal is a ratio of
+    # TANGENTS, not of numbers, and gives 65.64 (jarvis/facemodels.py). Set
+    # diag_fov_deg instead and the conversion is done here. For reference:
+    # a Logitech C930e is 82.2 deg horizontal, and the 98 deg-diagonal
+    # Arducam docs/vision.md section 9 recommends BUYING is 90.1 -- the
+    # number the old comment assumed for all of them.
+    #
+    # THE RESOLUTION THAT FOLLOWS FROM IT, at the ~95 cm mount section 9
+    # recommends. The LifeCam spans 2*95*tan(32.82) = 122 cm, so 1280 px is
+    # 10.4 px/cm and a 16 cm face is 167 px. The Arducam spans 191 cm, so
+    # 1920 px is 10.05 px/cm and the same face is 162 px: the narrower field
+    # and the lower resolution very nearly cancel at full frame. They do NOT
+    # cancel after the downscale below -- 1280->320 is 4x against 1920->320's
+    # 6x -- so the detector sees 42 px on the LifeCam and 27 px on the
+    # Arducam. Both clear YuNet's documented 10-300 px range; only one has
+    # margin. 640x480, which shipped first, would make the same face 53 px
+    # against SFace's 112x112 input, which section 9 calls "far too small".
+    #
+    # width/height is 1280x720 BECAUSE THAT IS A MODE THE LIFECAM HAS.
+    # 1920x1080 shipped here until 2026-09-02 and is not one of them; a
+    # driver asked for a mode it does not have does not error, it quietly
+    # grants a different one, which is why scripts/vision_selfcheck.py reads
+    # the granted mode back and prints it.
     #
     # detect_width/height is the size YuNet actually sees. 320x180, not the
     # 320x240 that shipped first, and the reason is aspect, not pixels: a
@@ -513,15 +526,37 @@ DEFAULTS: dict = {
     #
     # identity=False is the phase gate: with it off, nothing about his face is
     # ever written down (jarvis/facegallery.py is not constructed at all).
-    "camera": {"enabled": False, "device": "", "width": 1920, "height": 1080,
+    "camera": {"enabled": False, "device": "", "width": 1280, "height": 720,
+               # The lens. hfov_deg is horizontal degrees; set diag_fov_deg
+               # instead if the spec sheet quotes the diagonal (most webcams
+               # do) and leave hfov_deg at 0. One of the two must be set --
+               # nothing in the code guesses a field of view.
+               "hfov_deg": 65.6, "diag_fov_deg": 0.0, "fourcc": "MJPG",
                "detect_width": 320, "detect_height": 180, "threads": 2,
                "idle_fps": 1.5, "armed_fps": 8.0, "min_conf": 0.6,
+               # Where the downloaded YuNet/SFace weights live. Empty means
+               # ~/.aiws_trainer/models/face (jarvis/facemodels.py). They are
+               # NOT in the repo and must not be: 38 MB of SFace beside 140 MB
+               # of TTS weights is how repo/ got swept into a commit once.
+               "model_dir": "",
                # The attention cone, in degrees off the lens axis. 20 deg is
                # generous against the 47 deg separation an off-axis mount
                # gives (scratchpad/ideas/camera.md section 4) and useless on a
                # monitor-top mount, where the screen's own top edge is 1.8 deg
                # away.  Hysteresis on release so a blink does not drop it.
-               "cone_deg": 20.0, "cone_hysteresis_deg": 5.0, "dwell_s": 0.6,
+               # cone_centre_deg AIMS the cone off the lens axis, which an
+               # off-axis mount needs: the camera sits beside the monitor, so
+               # "looking at Jarvis" need not be "looking down the lens".
+               "cone_deg": 20.0, "cone_hysteresis_deg": 5.0,
+               "cone_centre_deg": 0.0, "dwell_s": 0.6,
+               # Nose-tip protrusion over interocular distance -- the ONE
+               # anthropometric constant standing between the measured
+               # landmark ratio and a head angle in degrees. AN ASSUMPTION,
+               # not a measurement of him: ~2.2 cm over ~6.3 cm. A 23% error
+               # in it is ~5 deg at the cone edge, a quarter of the cone, so
+               # calibrate it from the $0 photo test (docs/vision.md 9): the
+               # rig prints the raw ratio t, and r = t / tan(known angle).
+               "nose_ratio": 0.35,
                # Fold the camera into the wake gate (jarvis/eye.py
                # resolve_wake). It can only ever promote a suppressed wake,
                # never suppress an accepted one.

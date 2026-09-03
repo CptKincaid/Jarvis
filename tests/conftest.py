@@ -75,6 +75,12 @@ os.environ["JARVIS_VOICEPRINT"] = str(_TEST_LOG_DIR / "voiceprint.npz")
 # embedding is the same kind of irreplaceable measurement of one person.
 # Forced, not setdefault, for the same reason as the line above.
 os.environ["JARVIS_FACE_GALLERY"] = str(_TEST_LOG_DIR / "face_gallery")
+# The downloaded YuNet/SFace weights (jarvis/facemodels.py). Forced at a
+# throwaway directory so the suite is identical on a box that has them and a
+# box that does not: a test that quietly passed only because 38 MB of SFace
+# happened to be on this machine would be worse than no test. Anything
+# wanting the real weights is a script he runs, not a test.
+os.environ["JARVIS_FACE_MODEL_DIR"] = str(_TEST_LOG_DIR / "face_models")
 # The docs embedding index (jarvis/tools/docs.py: env > config > default):
 # without this a test building the real App indexes into the user's
 # ~/.aiws_trainer/docs_index.

@@ -1,0 +1,528 @@
+"""The camera wired to the sensing owner -- tested with a device that
+records whether it was ever opened.
+
+The assertion that matters is never "the consumer ignored the frame". A
+gate that merely discarded frames would still leave a lit camera light in
+his room, so every test here counts OPENS on a fake device, exactly as
+tests/test_sensing.py does for ``CameraGate`` itself.
+
+What is new here, and why it needed a module rather than two lines of glue:
+
+* ``Eye`` owns the two permission checks (before the open, and again after
+  the grab) and ``CameraGate`` owns the device and the attachment to
+  ``SensingPolicy.enforce``. Handing ``Eye`` the gate's raw device would
+  leave the gate believing it still held one after ``Eye.close()``, so the
+  device that crosses between them is WRAPPED: its ``release`` goes back
+  through the gate, and its ``read`` refuses once the gate has let go.
+* The 21:00 curfew edge arrives with nobody speaking. That is
+  ``SensingPolicy.enforce()`` calling ``CameraGate.release``, and the test
+  for it opens a device at 20:59 and asserts it is released at 21:01.
+* The field of view is CONFIGURED, never assumed. ``lens_from_config``
+  refuses to guess.
+
+No cv2, no /dev/video*, no display.
+"""
+from __future__ import annotations
+
+import datetime as _dt
+
+import pytest
+
+from jarvis import camera as cam
+from jarvis.sensing import CAMERA, SensingPolicy
+
+
+def _clock(hour: int, minute: int = 0, day: int = 2) -> float:
+    return _dt.datetime(2026, 9, day, hour, minute).timestamp()
+
+
+class FakeDevice:
+    """cv2.VideoCapture's surface, and a record of what happened to it."""
+
+    def __init__(self, fail_read: bool = False):
+        self.reads = 0
+        self.released = 0
+        self.fail_read = fail_read
+
+    def read(self):
+        self.reads += 1
+        if self.fail_read:
+            return False, None
+        return True, [[self.reads]]
+
+    def release(self):
+        self.released += 1
+
+
+class Opener:
+    """Counts the only thing that matters: how often a device was OPENED."""
+
+    def __init__(self, fail: bool = False):
+        self.opens = 0
+        self.devices = []
+        self.fail = fail
+
+    def __call__(self):
+        self.opens += 1
+        if self.fail:
+            raise OSError("no such device")
+        dev = FakeDevice()
+        self.devices.append(dev)
+        return dev
+
+
+class FakeCfg:
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+
+    def get(self, dotted, default=None):
+        value = self.data.get(dotted, default)
+        return default if value is None else value
+
+
+def _online_policy(tmp_path, now=None):
+    path = tmp_path / "sensing.json"
+    path.write_text('{"version": 1, "offline": false, "until": null}')
+    return SensingPolicy(path=path, now=now or (lambda: _clock(12)))
+
+
+def _feed(tmp_path, policy=None, opener=None, **kw):
+    policy = policy or _online_policy(tmp_path)
+    opener = opener or Opener()
+    return cam.CameraFeed(policy, opener, **kw), policy, opener
+
+
+# --------------------------------------------------- the device is not opened
+def test_offline_never_opens_the_device(tmp_path):
+    feed, policy, opener = _feed(tmp_path)
+    policy.disable(source="test")
+    assert feed.capture() is None
+    assert feed.capture() is None
+    assert opener.opens == 0
+    assert feed.device_open is False
+
+
+def test_a_missing_state_file_starts_offline_and_still_opens_nothing(tmp_path):
+    """The fail-safe reaches the device. A first run has no state file, which
+    ``SensingPolicy`` reads as OFFLINE, and the camera must inherit that
+    rather than deciding for itself that nobody said no."""
+    policy = SensingPolicy(path=tmp_path / "nope.json",
+                           now=lambda: _clock(12))
+    feed, _p, opener = _feed(tmp_path, policy=policy)
+    assert feed.capture() is None
+    assert opener.opens == 0
+
+
+def test_the_curfew_never_opens_the_device(tmp_path):
+    policy = _online_policy(tmp_path, now=lambda: _clock(22))
+    feed, _p, opener = _feed(tmp_path, policy=policy)
+    assert policy.state().camera is False
+    assert feed.capture() is None
+    assert opener.opens == 0
+
+
+def test_online_and_outside_the_curfew_opens_once_and_reuses(tmp_path):
+    feed, _p, opener = _feed(tmp_path)
+    frames = [feed.capture() for _ in range(4)]
+    assert all(f is not None for f in frames)
+    assert opener.opens == 1
+    assert opener.devices[0].reads == 4
+
+
+def test_a_broken_policy_is_not_permission(tmp_path):
+    class Exploding:
+        def allowed(self, kind):
+            raise RuntimeError("the state file caught fire")
+
+        def attach(self, *a, **k):
+            pass
+
+    feed, _p, opener = _feed(tmp_path, policy=Exploding())
+    assert feed.capture() is None
+    assert opener.opens == 0
+
+
+# ------------------------------------------- the curfew edge, nobody speaking
+def test_the_curfew_edge_releases_a_device_already_open(tmp_path):
+    """A lens opened at 20:59 is still a lit camera at 21:01 unless something
+    walks the devices on the clock. That something is
+    ``SensingPolicy.enforce`` calling the gate's release, and this is the
+    whole reason the camera attaches to the policy instead of only asking it.
+    """
+    clock = {"t": _clock(20, 59)}
+    policy = _online_policy(tmp_path, now=lambda: clock["t"])
+    feed, _p, opener = _feed(tmp_path, policy=policy)
+    assert feed.capture() is not None
+    assert feed.device_open is True
+    dev = opener.devices[0]
+
+    clock["t"] = _clock(21, 1)
+    out = policy.enforce()
+
+    assert CAMERA in out.stopped
+    assert dev.released == 1
+    assert feed.gate.is_open is False
+
+
+def test_after_the_curfew_edge_the_next_capture_opens_nothing(tmp_path):
+    clock = {"t": _clock(20, 59)}
+    policy = _online_policy(tmp_path, now=lambda: clock["t"])
+    feed, _p, opener = _feed(tmp_path, policy=policy)
+    feed.capture()
+    clock["t"] = _clock(21, 1)
+    policy.enforce()
+    assert feed.capture() is None
+    assert opener.opens == 1        # still just the one, from before the edge
+
+
+def test_the_gate_and_the_eye_do_not_disagree_about_who_is_open(tmp_path):
+    """``Eye`` releases the device on its own deny edge. If it released the
+    RAW device the gate would still believe it held one, and the next
+    permitted capture would hand back a released handle instead of opening a
+    fresh one. The wrapper is what keeps the two in step."""
+    policy = _online_policy(tmp_path)
+    feed, _p, opener = _feed(tmp_path, policy=policy)
+    assert feed.capture() is not None
+    policy.disable(source="test")
+    assert feed.capture() is None
+    assert feed.gate.is_open is False
+    assert opener.devices[0].released == 1
+    policy.enable(source="test")
+    assert feed.capture() is not None
+    assert opener.opens == 2
+
+
+def test_a_frame_in_flight_when_offline_is_set_is_dropped(tmp_path):
+    """Offline said mid-grab must not recognise a face captured a
+    millisecond earlier. ``Eye``'s second permission check is what does it;
+    this asserts it survives the composition."""
+    policy = _online_policy(tmp_path)
+    feed, _p, opener = _feed(tmp_path, policy=policy)
+
+    class Flipping(FakeDevice):
+        def read(self):
+            policy.disable(source="mid-grab")
+            return FakeDevice.read(self)
+
+    dev = Flipping()
+    feed, _p, _o = _feed(tmp_path, policy=policy, opener=lambda: dev)
+    assert feed.capture() is None
+    assert feed.frames_dropped == 1
+    assert dev.reads == 1
+    assert dev.released == 1
+
+
+def test_a_dead_read_closes_rather_than_latching(tmp_path):
+    opener = Opener()
+    feed, _p, _o = _feed(tmp_path, opener=opener)
+
+    def bad():
+        opener.opens += 1
+        d = FakeDevice(fail_read=True)
+        opener.devices.append(d)
+        return d
+
+    feed, _p, _o = _feed(tmp_path, opener=bad)
+    assert feed.capture() is None
+    assert feed.capture() is None
+    assert opener.opens == 2          # re-opened rather than latching shut
+
+
+def test_an_opener_that_raises_is_no_opinion_not_a_crash(tmp_path):
+    feed, _p, opener = _feed(tmp_path, opener=Opener(fail=True))
+    assert feed.capture() is None
+    assert feed.status()["open"] is False
+
+
+# ------------------------------------------------ absence, told honestly
+def test_a_box_with_no_camera_is_reported_absent_not_stopped(tmp_path):
+    """"The camera is off" is a lie when there was never a camera. The
+    presence callable is the gate's own, and offline mode reports it."""
+    policy = _online_policy(tmp_path)
+    feed, _p, opener = _feed(tmp_path, policy=policy,
+                             present=lambda: False)
+    out = policy.disable(source="test")
+    assert out.absent == (CAMERA,)
+    assert out.stopped == ()
+    assert opener.opens == 0
+    assert feed is not None
+
+
+def test_device_present_reads_the_node_not_a_config_flag(tmp_path):
+    node = tmp_path / "video7"
+    assert cam.device_present(str(node)) is False
+    node.write_text("")
+    assert cam.device_present(str(node)) is True
+
+
+# -------------------------------------------------- the lens is configured
+def test_the_lens_comes_from_the_config_and_is_not_assumed(tmp_path):
+    cfg = FakeCfg({"camera.width": 1280, "camera.height": 720,
+                   "camera.hfov_deg": 65.64})
+    lens = cam.lens_from_config(cfg)
+    assert (lens.width_px, lens.height_px) == (1280, 720)
+    assert lens.hfov_deg == pytest.approx(65.64, abs=0.01)
+    assert lens.face_px(95.0) == pytest.approx(167, abs=1)
+
+
+def test_a_missing_field_of_view_is_refused_rather_than_guessed():
+    """The shipped comment reasoned from ~90 deg horizontal, which belongs to
+    a camera he does not own; every real candidate is 65-82. A default here
+    is how that error propagated in the first place."""
+    with pytest.raises(ValueError) as exc:
+        cam.lens_from_config(FakeCfg({"camera.width": 1280,
+                                      "camera.height": 720}))
+    assert "hfov_deg" in str(exc.value)
+
+
+def test_an_absurd_field_of_view_is_refused():
+    for bad in (0.0, -3.0, 180.0, 400.0):
+        with pytest.raises(ValueError):
+            cam.lens_from_config(FakeCfg({"camera.width": 1280,
+                                          "camera.height": 720,
+                                          "camera.hfov_deg": bad}))
+
+
+def test_a_diagonal_field_of_view_is_converted_with_tangents(tmp_path):
+    """Webcams are SOLD by the diagonal. Accepting one and converting it is
+    better than inviting him to type 73 into a horizontal field."""
+    cfg = FakeCfg({"camera.width": 1280, "camera.height": 720,
+                   "camera.diag_fov_deg": 73.0})
+    assert cam.lens_from_config(cfg).hfov_deg == pytest.approx(65.64, abs=0.02)
+
+
+def test_the_thresholds_come_from_his_config(tmp_path):
+    cfg = FakeCfg({"camera.min_conf": 0.62, "camera.cone_deg": 18.0,
+                   "camera.cone_hysteresis_deg": 4.0, "camera.dwell_s": 0.7,
+                   "camera.identity_min": 0.4, "camera.cone_centre_deg": 30.0})
+    th = cam.thresholds_from_config(cfg)
+    assert (th.min_conf, th.cone_deg, th.dwell_s) == (0.62, 18.0, 0.7)
+    assert th.cone_centre_deg == 30.0
+
+
+# ------------------------------------------------------------ the safe build
+def test_build_never_raises_and_says_why_it_declined(tmp_path):
+    cfg = FakeCfg({"camera.enabled": False})
+    feed, why = cam.build(cfg, _online_policy(tmp_path))
+    assert feed is None and "camera.enabled" in why
+
+
+def test_build_declines_a_config_it_cannot_read_without_crashing(tmp_path):
+    class Hostile:
+        def get(self, *a, **k):
+            raise RuntimeError("config on fire")
+
+    feed, why = cam.build(Hostile(), _online_policy(tmp_path))
+    assert feed is None and why
+
+
+def test_build_wires_the_policy_when_the_config_is_complete(tmp_path):
+    cfg = FakeCfg({"camera.enabled": True, "camera.width": 1280,
+                   "camera.height": 720, "camera.hfov_deg": 65.64})
+    opener = Opener()
+    feed, why = cam.build(cfg, _online_policy(tmp_path), opener=opener)
+    assert feed is not None and why == ""
+    assert feed.lens.hfov_deg == pytest.approx(65.64, abs=0.01)
+    assert feed.capture() is not None
+    assert opener.opens == 1
+
+
+# ------------------------------------------------- models, absent-safely
+def test_no_weights_means_no_detector_and_a_reason_not_a_crash(tmp_path):
+    """With nothing on disk the camera path must degrade to no opinion --
+    today's behaviour exactly -- and say which file is missing. It must not
+    raise, and it must not return something else that runs."""
+    cfg = FakeCfg({"camera.model_dir": str(tmp_path / "nothing-here")})
+    det, why = cam.detector_from_config(cfg)
+    assert det is None
+    assert "face_detection_yunet_2023mar.onnx" in why
+    assert "missing" in why
+
+
+def test_the_model_directory_is_configurable(tmp_path):
+    """The weights are 38 MB and live outside the repo. Which outside is his
+    choice, and the config key is how he makes it."""
+    from jarvis import facemodels as fm
+    here = tmp_path / "weights"
+    here.mkdir()
+    for model in fm.MODELS:
+        (here / model.filename).write_bytes(b"\0" * model.size)
+    cfg = FakeCfg({"camera.model_dir": str(here), "camera.identity": True})
+    calls = []
+    import jarvis.facedetect as fdmod
+    real = fdmod._create_yunet
+    try:
+        fdmod._create_yunet = lambda path, **kw: calls.append(path) or object()
+        det, why = cam.detector_from_config(cfg)
+    finally:
+        fdmod._create_yunet = real
+    assert det is not None and why == ""
+    assert calls and calls[0].startswith(str(here))
+
+
+def test_identity_off_means_the_recogniser_is_never_built(tmp_path):
+    cfg = FakeCfg({"camera.identity": False})
+    rec, why = cam.recogniser_from_config(cfg)
+    assert rec is None and "camera.identity" in why
+
+
+# --------------------------------------------- what the driver actually gave
+class FakeCap:
+    """A capture that GRANTS a different mode from the one asked for, which
+    is what v4l2 does rather than erroring."""
+
+    def __init__(self, granted=None, refuse=()):
+        self.granted = dict(granted or {})
+        self.refuse = set(refuse)
+        self.sets = []
+
+    def get(self, prop):
+        return self.granted.get(prop, -1.0)
+
+    def set(self, prop, value):
+        self.sets.append((prop, value))
+        if prop in self.refuse:
+            return False
+        self.granted[prop] = value
+        return True
+
+
+def test_the_granted_mode_is_read_back_not_assumed():
+    cv2 = pytest.importorskip("cv2")
+    cap = FakeCap({cv2.CAP_PROP_FRAME_WIDTH: 1280.0,
+                   cv2.CAP_PROP_FRAME_HEIGHT: 720.0,
+                   cv2.CAP_PROP_FPS: 30.0,
+                   cv2.CAP_PROP_FOURCC: float(
+                       cv2.VideoWriter_fourcc(*"MJPG"))})
+    mode = cam.capture_mode(cap)
+    assert (mode["width"], mode["height"]) == (1280.0, 720.0)
+    assert mode["fourcc"] == "MJPG"
+    assert mode["fps"] == 30.0
+
+
+def test_an_unsupported_property_is_a_number_not_an_exception():
+    pytest.importorskip("cv2")
+    mode = cam.capture_mode(FakeCap())
+    assert mode["width"] == -1.0 and mode["fourcc"] == ""
+
+
+def test_focus_reports_whether_it_could_actually_be_pinned():
+    cv2 = pytest.importorskip("cv2")
+    cap = FakeCap({cv2.CAP_PROP_AUTOFOCUS: 1.0},
+                  refuse={cv2.CAP_PROP_FOCUS})
+    probe = cam.focus_probe(cap)
+    assert probe["autofocus"]["pinned"] is True
+    assert probe["focus"]["pinned"] is False
+
+
+def test_fourcc_decodes_and_shrugs_at_nonsense():
+    assert cam.fourcc_name(0) == ""
+    assert cam.fourcc_name("nope") == ""
+    cv2 = pytest.importorskip("cv2")
+    assert cam.fourcc_name(cv2.VideoWriter_fourcc(*"YUYV")) == "YUYV"
+
+
+# ------------------------------------------- the harness runs THROUGH the gate
+def test_the_rig_source_obeys_offline_mode(tmp_path):
+    """A rig pointed at a raw VideoCapture would be a second code path that
+    never asks the sensing owner. It reads the feed instead."""
+    from jarvis.visionrig import Rig, Thresholds
+    from jarvis.facemodels import LIFECAM_CINEMA
+
+    policy = _online_policy(tmp_path)
+    feed, _p, opener = _feed(tmp_path, policy=policy)
+    source = cam.FeedSource(feed)
+    ok, frame = source.read()
+    assert ok and frame is not None
+
+    policy.disable(source="test")
+    ok, frame = source.read()
+    assert ok is False and frame is None
+
+    class Det:
+        name, input_size = "stub", (320, 180)
+
+        def detect(self, frame):
+            return None
+
+    report = Rig(source, Det(), LIFECAM_CINEMA,
+                 Thresholds(min_conf=0.6, cone_deg=20.0,
+                            cone_hysteresis_deg=5.0, dwell_s=0.6,
+                            identity_min=0.363)).run(frames=5)
+    assert report.frames == 0            # offline: nothing was read
+    assert opener.opens == 1
+
+
+# ------------------------------------------- the curfew against a live grab
+def test_a_close_waits_for_a_grab_already_in_flight(tmp_path):
+    """``SensingPolicy.enforce`` runs on its own thread, and
+    cv2.VideoCapture is not thread-safe. Releasing a capture while another
+    thread is inside read() is undefined behaviour, and "the process
+    crashed, which did close the camera" is not the enforcement anybody
+    wants. So a close waits for the grab."""
+    import threading
+
+    clock = {"t": _clock(20, 59)}
+    policy = _online_policy(tmp_path, now=lambda: clock["t"])
+    in_read = threading.Event()
+    may_finish = threading.Event()
+    order = []
+
+    class Slow(FakeDevice):
+        def read(self):
+            in_read.set()
+            may_finish.wait(5.0)
+            order.append("read done")
+            return FakeDevice.read(self)
+
+        def release(self):
+            order.append("released")
+            FakeDevice.release(self)
+
+    dev = Slow()
+    feed, _p, _o = _feed(tmp_path, policy=policy, opener=lambda: dev)
+    grab = threading.Thread(target=feed.capture, daemon=True)
+    grab.start()
+    assert in_read.wait(5.0)
+
+    clock["t"] = _clock(21, 1)
+    closer = threading.Thread(target=policy.enforce, daemon=True)
+    closer.start()
+    may_finish.set()
+    grab.join(5.0)
+    closer.join(5.0)
+
+    assert order == ["read done", "released"]
+    assert dev.released == 1
+
+
+def test_a_wedged_grab_does_not_postpone_the_curfew_forever(tmp_path,
+                                                            monkeypatch):
+    """The other half of the same decision: a camera that has stopped
+    answering must not be able to hold the lens open indefinitely."""
+    import threading
+
+    monkeypatch.setattr(cam, "CLOSE_WAIT_S", 0.05)
+    clock = {"t": _clock(20, 59)}
+    policy = _online_policy(tmp_path, now=lambda: clock["t"])
+    in_read = threading.Event()
+    stuck = threading.Event()
+
+    class Wedged(FakeDevice):
+        def read(self):
+            in_read.set()
+            stuck.wait(10.0)
+            return FakeDevice.read(self)
+
+    dev = Wedged()
+    feed, _p, _o = _feed(tmp_path, policy=policy, opener=lambda: dev)
+    grab = threading.Thread(target=feed.capture, daemon=True)
+    grab.start()
+    assert in_read.wait(5.0)
+
+    clock["t"] = _clock(21, 1)
+    out = policy.enforce()                 # must return, not hang
+    assert CAMERA in out.stopped
+    assert dev.released == 1
+    stuck.set()
+    grab.join(5.0)

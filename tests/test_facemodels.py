@@ -102,9 +102,10 @@ def test_absurd_fov_rejected(bad):
         fm.Lens(1280, 720, bad)
 
 
-def test_lifecam_is_720p_not_the_configs_1080p():
-    """camera.width/height ship as 1920x1080, a mode the LifeCam does not
-    have."""
+def test_lifecam_is_720p_and_so_is_the_config_now():
+    """camera.width/height shipped as 1920x1080 until 2026-09-02, which is a
+    mode the LifeCam does not have; the config now says 1280x720 and
+    tests/test_eye.py pins it."""
     assert (fm.LIFECAM_CINEMA.width_px, fm.LIFECAM_CINEMA.height_px) == \
         (1280, 720)
     assert fm.LIFECAM_CINEMA.hfov_deg == pytest.approx(65.64, abs=0.02)

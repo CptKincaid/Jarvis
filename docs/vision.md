@@ -697,6 +697,135 @@ into `hotword.py` or `app.py`. All of it needs a camera to be worth anything, an
    run a week, and count what it would have promoted. n ≥ 30 before changing a default — the same
    discipline as the voice rounds.
 
+---
+
+## 13. Bring-up: the harness, the wiring, and the field of view (2026-09-02, later)
+
+Everything above was written with **no camera and no weights**. The weights now exist
+(`~/.aiws_trainer/models/face`, YuNet MIT + SFace Apache-2.0, verified per-model); this section is
+what was built so the rest can be developed and debugged **without anyone ever viewing a frame**.
+
+### 13.1 The numbers-only harness — `jarvis/visionrig.py`
+
+Point it at a frame source and it emits detection counts, confidences, box geometry in both
+capture and detector pixels, bearing and head angle in degrees, embedding cosines, per-stage
+timings, frame level and contrast, and a pass/fail line against each threshold in his config.
+**It cannot emit an image**: `assert_numbers_only` walks the report and raises on anything that is
+not a scalar, a string or a container of those, the rig retains no frame or embedding as an
+attribute, and both are asserted by tests rather than promised in a comment.
+
+The workflow this is designed for: **he runs it against his real camera and pastes the numbers.**
+That is the natural path, not the workaround — `scripts/vision_selfcheck.py` is one command and
+its whole output is numbers.
+
+Two rules are enforced in code rather than left to callers:
+
+* **"I could not look" is never spelled "I saw nobody."** A missing model, a model OpenCV refuses
+  to build, and an exception mid-run all set `detector_ok` False, name themselves in `reason`, and
+  make the verdict `not ok`. Zero faces with `ok` True means the room was empty. This is the VSS
+  `region_mode='yunet'` shape — a path that silently fell back to head_box and has never once run
+  — and it is the one bug this lane could most easily have repeated.
+* **Identity is gated on the detection, hard.** SFace collapses on out-of-distribution input, so a
+  bad crop scores *confidently* against the gallery rather than low. The recogniser is not called
+  at all for a face under `min_conf`, in the rig and again inside `SFaceRecogniser.embed`.
+
+### 13.2 The yaw proxy is a stated model, not a measurement
+
+Yaw comes from YuNet's five landmarks: the nose tip's displacement from the eye midpoint,
+projected **onto the interocular direction** (which makes it roll-invariant — a tilted head is not
+a turned one) and divided by the interocular distance. Under yaw that ratio is
+`t = nose_ratio · tan(yaw)`, so the inverse is one `atan`.
+
+`nose_ratio` — nose-tip protrusion over interocular distance, ~2.2 cm / ~6.3 cm ≈ **0.35** — is the
+single anthropometric constant between a measured ratio and a number in degrees, and it is an
+assumption about a generic head, not a measurement of his. **A 23 % error in it is ≈5° at the 20°
+cone edge, a quarter of the whole cone.** So the rig reports the raw `t` beside the degrees, and
+`camera.nose_ratio` is a config key: photograph a known angle, read the `t` the rig prints, and
+solve `r = t / tan(angle)`. That is the §9 $0 test, now with a number to read off it.
+
+### 13.3 The field of view is a config key, and that is the fix
+
+`camera.hfov_deg` (or `camera.diag_fov_deg`, since webcams are sold by the diagonal and the
+conversion is a ratio of *tangents*). **There is no default anywhere in the code** —
+`camera.lens_from_config` raises on an unset field of view rather than assuming 90°, and
+`facemodels.Lens` has required it from the start.
+
+Two things this changed:
+
+* `camera.width/height` is now **1280×720**. 1920×1080 shipped here and is not a LifeCam mode; a
+  driver asked for a mode it does not have does not error, it quietly grants a different one.
+* `tests/test_eye.py::test_the_capture_resolution_is_the_one_the_mount_arithmetic_needs`
+  **carried the bug it was guarding**: it hard-coded a 191 cm span, which is what ~90° gives at
+  95 cm — the Arducam §9 says to buy, not the camera he owns. With the span nailed to one camera,
+  correcting the resolution made the test fail on the *better* config. It now derives the span
+  from `camera.hfov_deg`.
+
+| camera | H fov | capture | span at 95 cm | 16 cm face | at detect 320 |
+|---|---|---|---|---|---|
+| LifeCam Cinema (owned) | 65.6° (73° diagonal) | 1280×720 | 122 cm | 167 px | **42 px** |
+| C930e | 82.2° | 1920×1080 | 166 cm | 185 px | 31 px |
+| Arducam IMX462 (§9) | 90.1° (98° diagonal) | 1920×1080 | 191 cm | 162 px | 27 px |
+
+### 13.4 The camera consumes the sensing owner — `jarvis/camera.py`
+
+`CameraFeed` joins `sensing.CameraGate` (which owns the device and is what
+`SensingPolicy.enforce()` reaches through when the 21:00 curfew arrives with nobody speaking) to
+`eye.Eye` (which owns the two permission checks around a single frame). Neither is
+re-implemented, and the curfew exists in exactly one place.
+
+The join is not two lines of glue, and this is why: `Eye` closes the device on its own deny edge,
+so handing it the gate's **raw** device would leave the gate believing it still held one — and the
+gate, believing that, would hand the same dead handle back on the next permitted capture instead
+of opening a fresh one. The device that crosses between them is wrapped: `release()` goes back
+through the gate, and a wrapper made before a close refuses to read afterwards.
+
+Every test asserts on **opens counted at a fake device**, never on a consumer politely ignoring a
+frame: offline opens nothing, the curfew opens nothing, a missing state file (fail-to-offline)
+opens nothing, a policy that raises opens nothing, a device open at 20:59 is released by
+`enforce()` at 21:01, and offline set mid-grab drops the frame already in flight.
+
+### 13.5 Absent-safe, and never a silent fallback — `jarvis/facedetect.py`
+
+`load_detector` / `load_recogniser` verify against the pinned sizes in `facemodels.py` *before*
+OpenCV is asked to load anything, and raise `ModelUnavailable` naming the file and the fault — a
+git-lfs pointer is reported as a pointer, not as a corrupt model. There is no second detector.
+`camera.detector_from_config` turns that into `(None, reason)` so the camera path degrades to
+today's behaviour and logs why. `camera.model_dir` makes the location a config key.
+
+One deliberate asymmetry: **OpenCV's own `score_threshold` is floored below `camera.min_conf`**
+(0.30). If the detector filtered at his bar, a face scoring 0.45 would simply not be reported, and
+the harness would print "no face" when the truth is "your face scores 0.45 against your 0.6 bar".
+Those two need different fixes.
+
+### 13.6 The one command to run when the adapter arrives
+
+```
+~/vss_env/bin/python scripts/vision_selfcheck.py            # everything
+~/vss_env/bin/python scripts/vision_selfcheck.py --json      # machine-readable
+~/vss_env/bin/python scripts/vision_selfcheck.py --models-only
+```
+
+Sensing state → models and licences → `/dev/video*` and the formats/frame rates each advertises
+(via `v4l2-ctl`, which is **not installed on this box** and costs that one section only) → the
+geometry the configured lens implies → **the mode the driver actually granted against the one that
+was asked for** → whether autofocus can be switched off and focus pinned → what the detector sees
+on his scene. Exit 0 all clear, 1 a failed check, 2 sensing said no (and **the device is not
+opened**), 3 no camera.
+
+Run against this box today it stops at 2 with `reason=failsafe`, having opened nothing.
+
+**It found something already.** Changing a *default* does not change an existing config file: his
+live `~/.config/jarvis/assistant.json` gained `hfov_deg: 65.6` and kept `width: 1920` from the old
+default, and the geometry line prints `1920x1080 hfov 65.6deg` — a LifeCam field of view on a
+resolution the LifeCam does not have. One of those two numbers has to change by hand.
+
+### 13.7 Still unmeasured, and only he can measure it
+
+Nothing here answers **whether a real face clears `min_conf` 0.6 at 42 px**. That needs a face,
+which nothing in this lane may look at. It is what the self-check's section 7 exists to print.
+
+---
+
 ### Sources
 
 - [opencv/opencv_zoo](https://github.com/opencv/opencv_zoo) — model sizes (git-lfs), per-model `LICENSE` files, and the published ARM benchmark table
