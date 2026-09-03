@@ -23,9 +23,18 @@ hide MEMORY (and then GPU) when left_w + right > total_w.
 2026-09-01: the holo look sidesteps it in StatusStrip._layout with
 plan_telemetry (a compact 'CPU 53° | GPU 44° | 47.5 GB' level when the
 full cluster would run under the wake word; tests/test_ui_chrome.py). The
-classic look deliberately keeps level 0 only -- it is the fallback that
+classic look deliberately kept level 0 only -- it is the fallback that
 must render exactly as the 08-31 console did, this collision included --
-so the plan_strip path below is still the open defect for classic.
+so the plan_strip path below was still the open defect for classic.
+
+2026-09-02: classic elides too (views.levels_for_look). Answering "is
+that free or used?" changed the level-0 memory value in BOTH looks, so
+classic's pixels moved anyway and its cluster grew 710 -> 718 px; keeping
+the contract would have meant an overprint 8 px DEEPER rather than none.
+The strip no longer reaches the collision in either look. plan_strip
+itself is unfixed, and the assertion below still pins that: it is the
+PROJECT-chip path, where a no-project bar still refuses to let MEMORY
+yield.
 """
 import pytest
 

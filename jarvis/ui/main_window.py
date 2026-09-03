@@ -96,22 +96,40 @@ from jarvis.ui.sensing_badge import SensingBadge, sensing_failsafe_state
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
                              TranscriptView, standby_alpha)
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, StatePill,
-                               Toast, Tooltip, px, set_scale, ui_display,
-                               ui_mono)
+                               Toast, Tooltip, px, set_scale,
+                               ui_display, ui_mono)
 
 log = get_logger("ui.main_window")
 
 # Design units at the 96-dpi baseline; scaled by S at runtime.
 DEFAULT_W, DEFAULT_H = 520, 880
 DEFAULT_GEOMETRY = f"{DEFAULT_W}x{DEFAULT_H}"
+# Header wordmark. ONE form, drawn whole in every state at every width
+# the window allows. The 2026-09-02 remedy for an over-subscribed header
+# stepped it down — tracked, untracked, monogram, gone — and he rejected
+# that on sight: "dont make jarvis smaller, just make ready and sensing
+# smaller to fit". So its 322 px (PAD + canvas) are now a FIXED claim on
+# the bar and the two chips were compressed to live inside what is left;
+# tests/test_header_fit.py does the arithmetic, MainWindow._check_header_fit
+# says so in the log if a future header child ever breaks it again.
+WORDMARK = "J A R V I S"
 MIN_W, MIN_H = 460, 720
 
-# StatePill words (uppercase, <= 10 chars, never ellipsized). OFFLINE is
-# reserved — no event drives it today, so it is never shown. WORKING /
-# WAITING come from ClaudeTaskState (a Claude task running / blocked on a
-# permission question).
-STATE_WORDS = {"idle": "READY", "listening": "LISTENING…",
-               "thinking": "THINKING…", "speaking": "SPEAKING",
+# StatePill words (uppercase, <= 9 chars, never ellipsized). The header
+# keeps 312 px for the pill and the sensing badge together at his 920-px
+# window, and 'LISTENING…' alone was 271 of them on 2026-09-02 — Tk paid
+# for that by shearing the badge, the one readout whose absence must not
+# look like its resting state. The first 09-03 cut answered with bare
+# imperatives (LISTEN / THINK / SPEAK), which on a voice console read as
+# orders to the user; his words were "smaller, not reworded", and
+# MEASURED on Xvfb the full participles fit once both chips drop to
+# PAD_X 4 / GAP 4 (LISTENING 158 + CAM OFF 141 = 299 of 312 at S=2, and
+# >= 6 px to spare at every scale 1.0-3.0; tests/test_header_fit.py).
+# Only the ellipsis went: the reactor carries the motion. WORKING /
+# WAITING come from ClaudeTaskState (a Claude task running / blocked on
+# a permission question).
+STATE_WORDS = {"idle": "READY", "listening": "LISTENING",
+               "thinking": "THINKING", "speaking": "SPEAKING",
                "waiting": "WAITING", "working": "WORKING",
                "error": "ERROR"}
 WARN_HOLD_S = 4.0            # warn Status: pill dot amber for this long
@@ -281,15 +299,25 @@ def terminal_attached(run=None) -> bool:
 
 
 def fmt_mem_gb(total_kb: int, avail_kb: int) -> str:
-    """Used system RAM for the status bar: '26.8 GB' ('--' when total is
-    unknown)."""
+    """Used/total system RAM for the status bar: '26.8/128 GB' ('--' when
+    total is unknown).
+
+    2026-09-02, verbatim: "is that free or used?". It was used (MemTotal -
+    MemAvailable) and nothing on screen said so — at the compact and
+    minimal elision levels the segment carries no label at all, so it read
+    as a bare '59.9 GB' beside a 122 GB box. The value now answers the
+    question by itself at every level, and on a machine whose whole
+    failure mode is the unified pool running out (2026-08-28) the ceiling
+    is the half worth showing.
+    """
     try:
         total, avail = int(total_kb), int(avail_kb)
     except (TypeError, ValueError):
         return "--"
     if total <= 0:
         return "--"
-    return f"{max(0, total - avail) / 1048576.0:.1f} GB"
+    gb = total / 1048576.0
+    return f"{max(0, total - avail) / 1048576.0:.1f}/{gb:.0f} GB"
 
 
 def fmt_asr(model_text: str) -> str:
@@ -589,7 +617,7 @@ class MainWindow:
         self._mic_available = MACHINE.has_mic
         self._last_confidence: Optional[float] = None
         self._temps_text = ""     # written by worker thread, read by Tk loop
-        self._mem_text = ""       # used RAM ('26.8 GB'), same worker
+        self._mem_text = ""       # RAM used/total ('26.8/128 GB')
         self._closing = False
         # Desk standby (jarvis/deskpresence.py): the board's current opacity.
         # 1.0 is the only state the app ever boots in.
@@ -906,20 +934,13 @@ class MainWindow:
         # spacing is baked into the string. The most focal text in the app
         # is WHITE per the film budget (cyan is structure, never the
         # star), with a 1px dim-cyan hologram-fringe ghost offset behind.
-        wm_font = ui_display(theme.SIZE_WORDMARK, "semibold")
-        wm_text = "J A R V I S"
-        wordmark = tk.Canvas(header, width=px(160), height=px(40),
-                             bg=theme.BG, highlightthickness=0, bd=0)
-        gh = max(1, px(1))
-        wordmark.create_text(px(2) + gh, px(20) + gh, text=wm_text,
-                             font=wm_font, fill=theme.RAMP40, anchor="w")
-        wm_main = wordmark.create_text(px(2), px(20), text=wm_text,
-                                       font=wm_font, fill=theme.FOCAL,
-                                       anchor="w")
-        bb = wordmark.bbox(wm_main)
-        if bb:                        # fit exactly — don't starve the status
-            wordmark.configure(width=bb[2] + gh + 1)
-        wordmark.pack(side="left", padx=(theme.PAD, 0))
+        # Drawn ONCE, whole, and never refitted: it does not yield to the
+        # bar, the chips do (2026-09-03, his call).
+        self._wordmark = tk.Canvas(header, width=px(160), height=px(40),
+                                   bg=theme.BG, highlightthickness=0, bd=0)
+        self._wm_text = None
+        self._draw_wordmark(WORDMARK)
+        self._wordmark.pack(side="left", padx=(theme.PAD, 0))
 
         self._close_btn = RoundButton(header, text="✕", kind="ghost",
                                       size=theme.SIZE_LABEL, pad_x=9, pad_y=5,
@@ -950,6 +971,28 @@ class MainWindow:
         self.sensing_badge.pack(side="right", padx=(0, theme.PAD_S))
         self._sensing_tip = Tooltip(self.sensing_badge, "Sensing state")
         self._refresh_sensing()
+
+        # The header is packed right-to-left out of a cavity Tk clamps
+        # at zero: once the cavity is spent it CLIPS the next child to
+        # what is left, and when nothing is left it stops drawing it at
+        # all (views.header_spans transcribes tkPack.c — the children
+        # never overlap). The badge is packed last, so the badge is what
+        # gets cut — 2026-09-02, "the word sensing is underneath the
+        # ready symbol": at 918 px it was 124 px of its 168, capsule and
+        # the tail of the word sheared off, flush against the wordmark;
+        # 41 px of 214 in his worst state. Nothing is misaligned (both
+        # chips declare the same 26-unit height and pack centres them);
+        # the bar was simply over-subscribed. It no longer is: the two
+        # chips were compressed to 299 px of the 312 the wordmark and the
+        # window chrome leave (tests/test_header_fit.py). Nothing here
+        # resizes anything any more — the binding only NOTICES, in the
+        # log, once per width, when the bar is narrower than the wordmark
+        # plus the cluster at its widest, i.e. exactly when Tk would
+        # start cutting the badge (the cliff is 905 px at S=2, measured;
+        # his window is 918).
+        self._header_short = None
+        header.bind("<Configure>", self._on_header_resize, add=True)
+        self._check_header_fit()
 
         # atmosphere: the header ground is a soft gradient (sheen behind
         # the wordmark, settling flat to the right) — flat-bg children are
@@ -1006,6 +1049,121 @@ class MainWindow:
             return
         for child in children:
             self._bind_drag_tree(child, skip)
+
+    # ------------------------------------------------------ header wordmark
+    def _draw_wordmark(self, text: str):
+        """Paint the wordmark canvas with `text` and shrink it to fit."""
+        if text == self._wm_text:
+            return
+        self._wm_text = text
+        canvas = self._wordmark
+        canvas.delete("wm")       # keeps the bar-gradient ground slice
+        gh = max(1, px(1))
+        if not text:
+            canvas.configure(width=1)
+            return
+        font = ui_display(theme.SIZE_WORDMARK, "semibold")
+        canvas.create_text(px(2) + gh, px(20) + gh, text=text, font=font,
+                           fill=theme.RAMP40, anchor="w", tags=("wm",))
+        main = canvas.create_text(px(2), px(20), text=text, font=font,
+                                  fill=theme.FOCAL, anchor="w", tags=("wm",))
+        bb = canvas.bbox(main)
+        if bb:                    # fit exactly — don't starve the status
+            canvas.configure(width=bb[2] + gh + 1)
+
+    @staticmethod
+    def _padx_total(child) -> int:
+        """Total horizontal pack padding one header child claims.
+
+        Tk reads `-padx 16` as 16 px on BOTH sides and `-padx {0 16}` as
+        16 on the right only, and a reserve that guessed would be wrong in
+        one direction or the other; pack_info() is the only thing that
+        knows. Anything unreadable counts as zero — an under-count costs a
+        quieter log line, never a clipped chip, because the chips are
+        measured at their widest here.
+        """
+        try:
+            padx = child.pack_info().get("padx", 0)
+        except (AttributeError, TypeError, tk.TclError):
+            return 0
+        parts = padx if isinstance(padx, (list, tuple)) else str(padx).split()
+        try:
+            vals = [int(float(part)) for part in parts]
+        except (TypeError, ValueError):
+            return 0
+        if not vals:
+            return 0
+        return sum(vals) if len(vals) > 1 else vals[0] * 2
+
+    def _cluster_w(self) -> int:
+        """Header pixels every child except the wordmark claims, at its
+        WIDEST, plus the gap the wordmark keeps clear of them.
+
+        Walked off the header's own pack list rather than a hand-written
+        one. A child this misses is a chip Tk truncates and, one child
+        further along, a chip Tk stops drawing (views.header_spans) — and
+        the child most likely to be added here next is a camera preview
+        on a sibling branch. Walking cannot rot that way.
+
+        The two chips are measured at their widest WORD, never the
+        current one: a bar that fitted around READY/SENSING and cut the
+        badge in half the moment the curfew said CAM OFF is exactly the
+        2026-09-02 defect.
+        """
+        widest = {}
+        if getattr(self, "pill", None) is not None:
+            widest[str(self.pill)] = StatePill.widest_w(STATE_WORDS.values())
+        if getattr(self, "sensing_badge", None) is not None:
+            widest[str(self.sensing_badge)] = SensingBadge.widest_w()
+        # No reserve seeded in: this is the pixel at which Tk starts to
+        # clip, nothing softer. The first cut seeded PAD_S "so the badge
+        # is never flush against the wordmark", which made the warning
+        # fire 16 px BEFORE anything was cut -- and once the chips left
+        # only 13 px of slack at his window (tests/test_header_fit.py)
+        # that would have been a warning at his own window, about a bar
+        # that fits. (The pack pads below are ALREADY device pixels:
+        # theme.apply_scale() mutates the spacing tokens once at startup,
+        # so px() over them would scale S twice.)
+        total = 0
+        for child in self._header.pack_slaves():
+            if child is self._wordmark:
+                continue
+            total += (widest.get(str(child), child.winfo_reqwidth())
+                      + self._padx_total(child))
+        return total
+
+    def _on_header_resize(self, event):
+        self._check_header_fit(event.width)
+
+    def _check_header_fit(self, header_w=None):
+        """Say so in the log if the bar can no longer hold the whole
+        wordmark beside the cluster at its widest.
+
+        This is all that is left of the 2026-09-02 remedy, and
+        deliberately so: the wordmark used to SHRINK here, and he
+        rejected that ("dont make jarvis smaller"). The chips were made
+        to fit instead, with 13 px to spare at his window (measured, S=2),
+        so there is nothing to negotiate at runtime — only something to
+        notice, once per width, if a header child added later spends
+        that margin and puts the privacy badge back under Tk's knife.
+        `spare` < 0 IS the knife: _cluster_w seeds no reserve, so the
+        line fires at the clipping cliff itself, not 16 px early.
+        """
+        try:
+            width = int(header_w if header_w else self._header.winfo_width())
+            if width < 4:
+                return
+            spare = (width - self._cluster_w() - theme.PAD
+                     - self._wordmark.winfo_reqwidth())
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            log.debug("header fit check skipped", exc_info=True)
+            return
+        if spare >= 0 or self._header_short == width:
+            return
+        self._header_short = width
+        log.warning("header %d px is %d px short of the wordmark + chips; "
+                    "the sensing badge is packed last and will be clipped",
+                    width, -spare)
 
     def _draw_header_rule(self, event):
         if self._rule_w == event.width:
@@ -2318,7 +2476,7 @@ class MainWindow:
             self._dev_text = "NONE"
 
     def _read_mem(self) -> str:
-        """Used system RAM from /proc/meminfo → '26.8 GB'."""
+        """Used/total system RAM from /proc/meminfo → '26.8/128 GB'."""
         try:
             info = {}
             with open("/proc/meminfo") as fh:
