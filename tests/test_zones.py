@@ -430,7 +430,13 @@ def test_the_dwell_and_the_cap_are_read_from_the_config():
 
 
 class _Cfg:
-    """The dotted ``cfg.get`` shape every jarvis module reads."""
+    """The dotted ``cfg.get`` shape every jarvis module reads.
+
+    Faithful to ``AssistantConfig.get`` on the one point that matters
+    here: a key that is PRESENT and null comes back as None, not as the
+    default. A stub that folded the two together was why the first repair
+    looked complete.
+    """
 
     def __init__(self, data):
         self.data = data
@@ -441,7 +447,7 @@ class _Cfg:
             if not isinstance(node, dict) or part not in node:
                 return default
             node = node[part]
-        return default if node is None else node
+        return node
 
 
 # -------------------------------------------------------------- the watcher
@@ -813,3 +819,215 @@ def test_the_instrument_is_governed_by_offline_mode_like_the_app(tmp_path):
     assert sensor.read() is None
     assert sensor.read_distance() is None
     assert sensor.reads == 0
+
+
+# --------------------------------------------------- the repairs (review 3)
+# A second verifier proved the first repair incomplete: it told "no rooms
+# key" from "a rooms LIST", not from "a rooms key of the wrong shape", so
+# the commonest JSON slip in that file -- dropping the [ ] around the one
+# room -- still landed on the built-in ladder, silently. These pin that,
+# plus the two the repair itself introduced.
+
+def _rooms(value):
+    return _Cfg({"zones": {"rooms": value}})
+
+
+ONE_ROOM = {"name": "office",
+            "bands": [{"name": "my new near band", "near_m": 0.75,
+                       "far_m": 2.0}]}
+
+
+def test_a_rooms_key_of_the_wrong_shape_is_refused_and_never_bridged():
+    # THE SLIP: he edits his one room and drops the square brackets. The
+    # config TRIED to say something about rooms and got it wrong, which is
+    # not the same as a config that stayed silent -- only silence may fall
+    # back. Anything else records nothing, loudly.
+    for shape in (ONE_ROOM,                       # the [ ] dropped
+                  {"office": ONE_ROOM},           # an object map
+                  "office",                       # a bare string
+                  3,                              # a number
+                  None):                          # an explicit null
+        cfg = _rooms(shape)
+        assert zn.zone_map_for(cfg, "office") is None, shape
+        assert zn.zone_maps(cfg) == {}, shape
+        why = zn.rejected_rooms(cfg)
+        assert "zones.rooms" in why, shape
+        assert "list" in why["zones.rooms"], shape
+
+
+def test_the_wrong_shape_is_refused_through_the_real_config_too(tmp_path):
+    # Not a stub: AssistantConfig._deep_merge replaces a list with the
+    # user's dict, so the DEFAULTS ladder does not survive the slip -- and
+    # zones.rooms coming out of DEFAULTS is exactly why the bridge must
+    # not answer here.
+    from jarvis.assistant_config import AssistantConfig
+    path = tmp_path / "assistant.json"
+    path.write_text(json.dumps({"zones": {"rooms": ONE_ROOM}}),
+                    encoding="utf-8")
+    cfg = AssistantConfig.load(path)
+    assert isinstance(cfg.get("zones.rooms"), dict)      # the slip survived
+    assert zn.zone_map_for(cfg, "office") is None
+    assert "zones.rooms" in zn.rejected_rooms(cfg)
+
+
+def test_only_a_missing_rooms_key_still_gets_the_built_in_ladder():
+    # The one fallback left, and it has to keep working: a config written
+    # before this section existed.
+    assert zn.zone_map_for(_Cfg({}), "office") is not None
+    assert zn.zone_map_for(_Cfg({"zones": {"enabled": True}}), "office") \
+        is not None
+    assert zn.rejected_rooms(_Cfg({})) == {}
+
+
+def test_two_band_names_that_differ_only_past_the_cap_say_so():
+    # The 64-character cap the last repair added can turn two DIFFERENT
+    # names into one, and ZoneMap then refused the room for a duplicate he
+    # never wrote -- sending him looking for a second entry that is not
+    # there. Refusing is right; the reason has to be the true one.
+    prefix = "the corner of the office behind the filing cabinet by the window"
+    assert len(prefix) == zn.MAX_NAME_CHARS
+    cfg = _rooms([{"name": "office", "bands": [
+        {"name": prefix + " near", "near_m": 0.75, "far_m": 2.0},
+        {"name": prefix + " far", "near_m": 2.0, "far_m": 4.5}]}])
+    why = zn.rejected_rooms(cfg)["office"]
+    assert zn.zone_map_for(cfg, "office") is None      # still refused
+    assert "twice" not in why                          # but not as a duplicate
+    assert "first %d characters" % zn.MAX_NAME_CHARS in why
+
+
+def test_two_room_names_that_differ_only_past_the_cap_say_so_too():
+    # Same trap one level up: two rooms, one lookup key, and the old
+    # message would have called them the same room.
+    prefix = "the workshop at the far end of the garage behind the big freezer"
+    assert len(prefix) == zn.MAX_NAME_CHARS
+    band = [{"name": "a", "near_m": 0.75, "far_m": 4.5}]
+    cfg = _rooms([{"name": prefix + " left wall", "bands": band},
+                  {"name": prefix + " right wall", "bands": band}])
+    key = list(zn.rejected_rooms(cfg))[0]
+    why = zn.rejected_rooms(cfg)[key]
+    assert zn.zone_map_for(cfg, prefix) is None
+    assert "twice" not in why
+    assert "first %d characters" % zn.MAX_NAME_CHARS in why
+
+
+def test_a_genuine_duplicate_room_name_still_reads_as_a_duplicate():
+    cfg = _rooms([{"name": "office",
+                   "bands": [{"name": "a", "near_m": 0.75, "far_m": 4.5}]},
+                  {"name": "OFFICE",
+                   "bands": [{"name": "b", "near_m": 0.75, "far_m": 2.0}]}])
+    assert zn.zone_map_for(cfg, "office") is None
+    assert "twice" in zn.rejected_rooms(cfg)["office"]
+
+
+def test_a_genuine_duplicate_band_name_still_reads_as_a_duplicate():
+    cfg = _rooms([{"name": "office", "bands": [
+        {"name": "here", "near_m": 0.75, "far_m": 2.0},
+        {"name": "here", "near_m": 2.0, "far_m": 4.5}]}])
+    assert zn.zone_map_for(cfg, "office") is None
+    assert "twice" in zn.rejected_rooms(cfg)["office"]
+
+
+def test_a_huge_room_name_does_not_land_whole_in_the_complaint():
+    # ZoneMap capped self.room only AFTER building its error strings, so a
+    # 300-character room name reached the log line and rejected_rooms in
+    # full. Every name that leaves this module is capped, errors included.
+    with pytest.raises(ValueError) as caught:
+        ZoneMap("R" * 300, (Band("a", 3.0, 1.0),))
+    assert len(str(caught.value)) < 300
+    assert "R" * (zn.MAX_NAME_CHARS + 1) not in str(caught.value)
+
+
+def test_a_name_is_capped_in_BYTES_not_only_in_characters():
+    # json.dumps escapes non-ASCII, so one CJK character costs 6 bytes on
+    # the line and an emoji 12. A 64-CHARACTER cap is not a 64-byte cap,
+    # and MAX_LINE_BYTES is a byte figure.
+    for ch in ("居", "\U0001f600", "é", "x"):
+        name = ch * 300
+        assert len(json.dumps(zn._short(name))) - 2 <= zn.MAX_NAME_CHARS, ch
+
+
+def test_a_room_named_in_cjk_or_emoji_cannot_write_past_its_cap(tmp_path):
+    for ch in ("居", "\U0001f600"):
+        # The names differ at the FRONT: two that differ only past the cap
+        # are a clash, which the test above owns.
+        cfg = _rooms([{"name": ch * 300, "bands": [
+            {"name": "a" + ch * 300, "near_m": 0.75, "far_m": 2.0},
+            {"name": "b" + ch * 300, "near_m": 2.0, "far_m": 4.5}]}])
+        maps = zn.zone_maps(cfg)
+        assert maps, ch          # capping must not collapse them into one
+        zmap = list(maps.values())[0]
+        path = tmp_path / ("z-%s.jsonl" % ord(ch))
+        log_file = ZoneLog(path, max_bytes=zn.MAX_LINE_BYTES)
+        t = ZoneTracker(zmap.room, zmap, dwell_s=0.0, log=log_file)
+        for i in range(20):
+            t.observe(presence=True, distance_m=[1.0, 3.0][i % 2],
+                      camera=CameraOpinion(known=False, label=ch * 300))
+        rolled = path.with_name(path.name + ".1")
+        on_disk = path.stat().st_size + \
+            (rolled.stat().st_size if rolled.exists() else 0)
+        assert log_file.failures == 0, ch
+        assert on_disk <= (log_file.keep + 1) * log_file.max_bytes, ch
+
+
+def test_the_widest_record_the_fields_allow_is_computed_not_asserted():
+    # The last repair called 499 bytes "the worst possible record" and it
+    # was not: a wider float reaches 538. So compute the maximum over the
+    # whole space instead of pinning a number a future field invalidates.
+    # A float's repr is at most 24 characters, so the widest number here is
+    # the widest number there is.
+    # The names go in RAW: as_record is the last gate before the file and
+    # caps them itself, so the size is a property of the format and not of
+    # every caller's good behaviour.
+    names = ["x" * 300, "居" * 300, "\U0001f600" * 300, '"\\' * 300,
+             "é" * 300]
+    numbers = [1.7976931348623157e+308, -1.7976931348623157e+308,
+               -1234567890123.456, 99999999999.999, 1e16, -1e16,
+               float("inf"), float("-inf"), float("nan"), -0.0]
+    rules = [RULE_BAND, RULE_CAMERA, RULE_EMPTY, RULE_SILENT, RULE_UNPLACED]
+    worst = 0
+    for raw in names:
+        for number in numbers:
+            for rule in rules:
+                t = zn.Transition(
+                    room=raw, old=raw, new=raw, rule=rule, at=number,
+                    iso="2026-09-03T12:34:56", held_s=number,
+                    distance_m=number, presence=True, moving=True,
+                    still=True,
+                    camera=CameraOpinion(known=True, label=raw))
+                worst = max(worst,
+                            len(json.dumps(t.as_record()).encode()) + 1)
+    assert worst <= zn.MAX_LINE_BYTES, worst
+    # The numbers above are the widest a float can print: 24 characters.
+    # iso is the one field this does not bound, and append refuses it.
+    assert max(len(json.dumps(round(float(n), 3))) for n in numbers) == 24
+
+
+def test_a_line_that_would_break_the_ceiling_is_refused_not_written(tmp_path):
+    # The (keep+1)*max_bytes ceiling is only true if no single line can
+    # exceed MAX_LINE_BYTES. Names are capped so it cannot happen through
+    # the config; this is the backstop for a field that is not a name, and
+    # it makes the bound ENFORCED rather than enumerated.
+    path = tmp_path / "zones.jsonl"
+    log_file = ZoneLog(path, max_bytes=zn.MAX_LINE_BYTES)
+    fat = zn.Transition(room="office", old=UNPLACED, new="by the door",
+                        rule=RULE_BAND, at=1.0, iso="i" * 4000, held_s=1.0)
+    assert log_file.append(fat) is False
+    assert log_file.writes == 0 and log_file.failures == 1
+    assert not path.exists() or path.stat().st_size == 0
+
+
+def test_the_instrument_refuses_a_rooms_key_of_the_wrong_shape(tmp_path,
+                                                               capsys,
+                                                               monkeypatch):
+    # The point of the instrument is an hour of truthful record. Told to
+    # record against a ladder it cannot read, it must stop with a non-zero
+    # exit and the reason, not start with the shipped one.
+    path = tmp_path / "assistant.json"
+    path.write_text(json.dumps({"zones": {"rooms": ONE_ROOM}}),
+                    encoding="utf-8")
+    monkeypatch.setenv("JARVIS_ASSISTANT_CONFIG", str(path))
+    zl = _zone_log_script()
+    assert zl.main(["--describe"]) == 2
+    err = capsys.readouterr().err
+    assert "NOTHING will be recorded" in err
+    assert zn.ROOMS_KEY in err

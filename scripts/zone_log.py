@@ -118,13 +118,17 @@ def main(argv=None) -> int:
         # worked. See jarvis/zones.py: zone_map_for.
         print("no zones for %r -- NOTHING will be recorded." % room,
               file=sys.stderr)
-        if room in refused:
-            print("  refused: %s" % refused[room], file=sys.stderr)
+        for key in (zn.ROOMS_KEY, room):
+            # ROOMS_KEY first: when the rooms list is not a list at all it
+            # is the reason for every other silence on this screen.
+            if key in refused:
+                print("  refused: %s" % refused[key], file=sys.stderr)
         print("  zones.enabled is %r; usable rooms: %s"
               % (cfg.get("zones.enabled", True),
                  ", ".join(sorted(zn.zone_maps(cfg))) or "(none)"),
               file=sys.stderr)
-        for name in sorted(k for k in refused if k != room):
+        for name in sorted(k for k in refused
+                           if k not in (room, zn.ROOMS_KEY)):
             print("  also refused: %s -- %s" % (name, refused[name]),
                   file=sys.stderr)
         return 2
