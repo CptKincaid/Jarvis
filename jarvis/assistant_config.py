@@ -421,6 +421,20 @@ DEFAULTS: dict = {
                  "room_sensor_enabled": False, "room_sensor_url": "",
                  "room_sensor_power_url": "",
                  "room_sensor_timeout_s": 1.5,
+                 # THE ZONE MODEL, in metres (jarvis/ui/sensors_page.py).
+                 # The LD2410 reports a range and NO angle, so "at the desk"
+                 # can only ever be a distance BAND -- it cannot tell the
+                 # desk from the bookshelf when both sit at the same range.
+                 # That is why the camera is allowed to overrule it: if the
+                 # eye recognises him in its cone he is at the desk whatever
+                 # the radar's range says (his words, 2026-09-03). The
+                 # defaults are the sketch he picked, and 4.5 m is the
+                 # coverage the tuned gates MEASURED, not a guess. Edit them
+                 # on the console's SENSORS page rather than by hand; either
+                 # way a restart is needed.
+                 "desk_band_m": [0.8, 1.8],
+                 "room_band_m": [1.8, 4.5],
+                 "camera_overrules": True,
                  # THREE ROOMS (jarvis/roomfabric.py). The plural
                  # of the four keys above, shaped exactly like
                  # gmail.accounts: a LIST of labelled entries, and while it

@@ -176,6 +176,47 @@ def test_the_only_live_picture_is_one_this_script_draws(rig):
     assert w.latest().seq == 2
 
 
+# ---------------------------------------------------- the radar stand-in
+def test_the_radar_stand_in_is_a_transport_and_never_a_socket(rig):
+    radar = rig.RigRadar()
+    body = radar("http://192.0.2.10/binary_sensor/Presence", 3.0)
+    assert rig.__dict__.get("socket") is None            # none is imported
+    from jarvis.roomsensor import parse_state
+    assert parse_state(body) is True
+    from jarvis.ui.sensors_page import parse_distance_cm
+    cm = parse_distance_cm(radar("http://192.0.2.10/sensor/Detection%20distance",
+                                 3.0))
+    assert cm == 142.0
+    # a host it does not know behaves exactly as an unflashed ESP32 does
+    with pytest.raises(OSError):
+        radar("http://192.0.2.11/binary_sensor/Presence", 3.0)
+    with pytest.raises(OSError):
+        radar("http://192.168.50.51/binary_sensor/Presence", 3.0)
+
+
+def test_the_rigs_two_rooms_are_test_net_literals_and_not_his_lan(rig):
+    # RFC 5737 TEST-NET-1: reserved for documentation, routed nowhere.
+    for spec in rig.OPTIONS["presence.rooms"]:
+        assert spec["url"].startswith("http://192.0.2."), spec
+    assert "192.168." not in open(SCRIPT, encoding="utf-8").read()
+
+
+def test_the_sensors_page_gets_its_transport_before_it_is_ever_shown(source):
+    # The page builds a SensorPoller with roomsensor's REAL http client in
+    # its __init__; the rig must replace it before show() polls anything.
+    swap = source.index("win.sensors.poller = sensors.SensorPoller")
+    assert swap < source.index("win.sensors_toggle()")
+    assert "get=self.radar" in source
+
+
+def test_the_named_face_state_leaves_the_anonymous_one_alone(rig):
+    plain = rig.synthetic_shot((272, 152))
+    named = rig.synthetic_shot((272, 152), name="hunterp", id_score=0.71)
+    assert plain.primary.name == "" and plain.primary.id_ran is False
+    assert named.primary.name == "hunterp" and named.primary.id_ran is True
+    assert named.primary.conf == plain.primary.conf == pytest.approx(0.74)
+
+
 def test_the_import_blocker_refuses_cv2_and_the_vision_lane(rig):
     blocker = rig._LensBlocker()
     for name in ("cv2", "cv2.data", "jarvis.camera", "jarvis.eye",

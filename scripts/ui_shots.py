@@ -86,6 +86,22 @@ tests/test_ui_shots.py pins ``STATES`` to it.
                       card left on the empty glass (commander's own order)
   25  header-worst    the header alone at exactly 918 px in the worst pair:
                       LISTENING + CAM OFF
+  26  sensors         the SENSORS page (F9 / win.sensors_toggle) over the
+                      transcript: the office radar PRESENT at 1.4 m with the
+                      camera naming a face, the kitchen sensor unreachable,
+                      both distance bands and the overrule toggle. The radar
+                      answers come from RigRadar, a TRANSPORT stand-in --
+                      SensorPoller takes `get` as its seam, so no socket is
+                      opened and no address on his LAN is named (the rig's
+                      two rooms are RFC 5737 TEST-NET-1 literals)
+  27  sensors-fault   the same page in its two other normal states: the
+                      radar unreachable long enough to trip the breaker, and
+                      the camera off for the curfew. Every unknown reads NO
+                      OPINION with a reason, never "nobody there"
+  28  standby-over-sensors  the console goes quiet with the SENSORS page
+                      still open: the tab row goes with the footer, the page
+                      is shut, and the note carries the number of radar
+                      requests sent across the standby dwell (it is zero)
 """
 from __future__ import annotations
 
@@ -97,6 +113,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 from typing import Any, Callable, Optional
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -136,6 +153,9 @@ STATES = (
     ("23", "claude-task", None),
     ("24", "cleared", None),
     ("25", "header-worst", None),
+    ("26", "sensors", None),
+    ("27", "sensors-fault", None),
+    ("28", "standby-over-sensors", None),
 )
 
 
@@ -170,6 +190,21 @@ OPTIONS = {
     "presence.desk_standby": True,
     "camera.preview": False,          # the pane is toggled on for 21/22 only
     "camera.preview_fps": 6.0,
+    # The two rooms the SENSORS page (26/27) lists. The addresses are RFC
+    # 5737 TEST-NET-1 literals, never routed anywhere, and the page's poller
+    # is handed RigRadar as its transport before the page is ever shown -- so
+    # neither the rig nor a bug in it can reach a device on his LAN. The
+    # kitchen ESP32 really is unflashed and off the network today, which is
+    # why it is the one that renders unreachable.
+    "presence.room_sensor_enabled": True,
+    "presence.rooms": [
+        {"name": "office", "label": "office", "url": "http://192.0.2.10",
+         "primary": True},
+        {"name": "kitchen", "label": "kitchen", "url": "http://192.0.2.11"},
+    ],
+    "presence.desk_band_m": [0.8, 1.8],
+    "presence.room_band_m": [1.8, 4.5],
+    "presence.camera_overrules": True,
 }
 
 ROOM = {"playing": "", "next": "BIOSENSORS  ·  10:00", "due": "LAB REPORT  ·  NOON",
@@ -360,6 +395,45 @@ class RigPreviewWorker:
         self._put(shot)
 
 
+class RigRadar:
+    """Stands in for the ESPHome web_server endpoints of the room sensors.
+
+    It is a TRANSPORT, not a device: ``SensorPoller`` takes ``get`` as its
+    seam, so handing it this replaces the socket entirely -- the rig opens
+    none, and the two addresses it answers for are RFC 5737 TEST-NET-1
+    literals that are not routed anywhere. A host it does not know RAISES,
+    which is exactly what an unreachable ESP32 does and is how state 27
+    trips the circuit breaker.
+
+    ``present`` and ``cm`` are the numbers the page renders; the bodies are
+    the shapes measured off the live office radar on 2026-09-03 (see
+    jarvis/roomsensor.py's docstring for the curl transcript).
+    """
+
+    OFFICE, KITCHEN = "192.0.2.10", "192.0.2.11"
+
+    def __init__(self):
+        # host -> (presence bit, detection distance in cm), or None for a
+        # host that answers nothing at all (the kitchen ESP32 is unflashed)
+        self.rooms = {self.OFFICE: (True, 142), self.KITCHEN: None}
+        # Every attempt, reachable or not: state 28 asserts that a page shut
+        # by standby sends none, and a raise is still a request.
+        self.calls = 0
+
+    def __call__(self, url: str, timeout: float) -> str:
+        self.calls += 1
+        host = urllib.parse.urlsplit(url).hostname or ""
+        answer = self.rooms.get(host)
+        if answer is None:
+            raise OSError("no route to host %s" % host)
+        present, cm = answer
+        if "binary_sensor" in url:
+            return '{"id":"binary_sensor/Presence","value":%s,"state":"%s"}' % (
+                "true" if present else "false", "ON" if present else "OFF")
+        return '{"id":"sensor/Detection distance","value":%d,"state":"%d cm"}' % (
+            cm, cm)
+
+
 def synthetic_frame(box: tuple, cap: tuple = (1280, 720), label: str = "HUNTER 0.74",
                     face: tuple = (470, 150, 300, 340)):
     """A gradient this script DRAWS -- nothing a lens saw -- letterboxed to
@@ -400,13 +474,21 @@ def synthetic_frame(box: tuple, cap: tuple = (1280, 720), label: str = "HUNTER 0
     return img
 
 
-def synthetic_shot(box: tuple):
+def synthetic_shot(box: tuple, name: str = "", id_score: float = 0.0):
     """The PreviewShot for state 22: the drawn frame plus ONE face as
-    numbers, attending, confidence 0.74 (the readout column prints it)."""
+    numbers, attending, confidence 0.74 (the readout column prints it).
+
+    ``name``/``id_score`` are for state 26, where the SENSORS page needs a
+    RECOGNISED face to show the camera overruling the radar. They default
+    to the anonymous face state 22 has always used, and ``id_ran`` follows
+    the name -- False is "identity was never asked", which is a different
+    row on that page from "asked, and did not know him"."""
     from jarvis.campreview import REASON_LIVE, PreviewFace, PreviewShot
     cap = (1280, 720)
     face = PreviewFace(conf=0.74, x=470.0, y=150.0, w=300.0, h=340.0,
-                       yaw_deg=6.0, attending=True, landmarks_ok=True)
+                       yaw_deg=6.0, attending=True, landmarks_ok=True,
+                       name=name, id_score=id_score,
+                       id_ran=bool(name or id_score))
     return PreviewShot(image=synthetic_frame(box, cap), faces=(face,),
                        cap_w=cap[0], cap_h=cap[1], reason=REASON_LIVE,
                        detail="", fps=6.0, grab_ms=1.2)
@@ -558,6 +640,11 @@ class Rig:
         self.services = services
         self.sensing = sensing
         self.desk = desk
+        # The radar transport for states 26/27. Built here rather than in
+        # build_services because it is not a service: it replaces the
+        # SENSORS page's own HTTP client, and nothing else in the window
+        # ever sees it.
+        self.radar = RigRadar()
         self.look = look
         self.display = display
         self.out_dir = out_dir
@@ -950,6 +1037,71 @@ class Rig:
             "header + rule only, 918 px wide: LISTENING pill + CAM OFF badge")), 0)
         S(lambda: self.publish(RecordingStopped(reason="abort", endpoint="manual")), 200)
 
+        # 26 the SENSORS page ----------------------------------------------
+        def sensors_on():
+            from jarvis.ui import sensors_page as sensors
+            # The transport swap comes FIRST, and it is the whole safety
+            # argument for these two states: the page builds its own
+            # SensorPoller in __init__ with roomsensor's real HTTP client,
+            # and this replaces it before the page is ever shown.
+            win.sensors.poller = sensors.SensorPoller(win.sensors.specs,
+                                                      get=self.radar)
+            win.preview_worker.staged = synthetic_shot(
+                win.preview_worker.box, name="hunterp", id_score=0.71)
+            OPTIONS["camera.preview"] = True
+            win._on_config_change(CAMERA_PREVIEW_OPTION, True)
+            self.sensing.set("on")
+            self.publish(self.sensing.event())
+            win.sensors_toggle()
+
+        S(lambda: (self.begin("26", "sensors"), sensors_on()), 1400)
+        S(lambda: self.capture("26", "sensors", note=(
+            "the office radar answers PRESENT at 1.42 m and the camera names a "
+            "face, so the fused verdict is AT THE DESK by CAMERA; the kitchen "
+            "ESP32 (unflashed, off the network) answers nothing. Every radar "
+            "body comes from RigRadar, a transport stand-in -- no socket is "
+            "opened and no address on his LAN is named")), 0)
+
+        # 27 the same page with both legs dark ------------------------------
+        def sensors_fault():
+            from jarvis.campreview import REASON_SENSING, blank
+            self.radar.rooms[RigRadar.OFFICE] = None      # unplug the office
+            self.sensing.set("curfew")
+            self.publish(self.sensing.event())
+            win.preview_worker.show(
+                blank(REASON_SENSING, "CAMERA OFF · curfew until 7 am"))
+
+        S(lambda: (self.begin("27", "sensors-fault"), sensors_fault()), 4200)
+        S(lambda: self.capture("27", "sensors-fault", note=(
+            "four failed polls at 1 Hz trip roomsensor's breaker, so both "
+            "rooms read NO OPINION with the retry in the fault line and the "
+            "round trip a dash (no request was sent); the camera row carries "
+            "the curfew sentence. Nothing here reads 'nobody there'")), 0)
+        # 28 standby WITH the page open ------------------------------------
+        # main_window._set_footer_hidden's own words: in standby the panel is
+        # "a clock and nothing else". The tab row is packed above the stage,
+        # so it was untouched by that and shipped lit and clickable over the
+        # dimmed clock. Hiding the row is only half: a page left open would
+        # keep POLLING behind the clock, at a radar the curfew may just have
+        # powered down. The note carries the request count for the dwell.
+        S(lambda: (self.begin("28", "standby-over-sensors"),
+                   setattr(self.radar, "calls", 0),
+                   setattr(self.desk, "idle", 99999.0),
+                   self.publish(DeskState(at_desk=False, idle_s=99999.0))), 0)
+        S(lambda: self.wait_until(lambda: win.modes.mode == STANDBY, 6000), None)
+        S(lambda: None, 2500)
+        S(lambda: self.capture("28", "standby-over-sensors", note=(
+            "the SENSORS page was open when the console went quiet: the tab "
+            "row is gone with the footer, the page is shut, and the radar "
+            "transport was called %d times across the standby dwell"
+            % self.radar.calls)), 0)
+        S(lambda: (setattr(self.desk, "idle", 0.0),
+                   self.publish(DeskState(at_desk=True, idle_s=0.0,
+                                          returned=True))), 0)
+        S(lambda: self.wait_until(lambda: win.modes.mode == ACTIVE, 4000), None)
+        S(lambda: (OPTIONS.__setitem__("camera.preview", False),
+                   win._on_config_change(CAMERA_PREVIEW_OPTION, False)), 400)
+
         S(self.teardown, 200)
 
     def teardown(self) -> None:
@@ -962,6 +1114,8 @@ class Rig:
                 win.desk.stop()
             if getattr(win, "preview", None) is not None:
                 win.preview.stop()
+            if getattr(win, "sensors", None) is not None:
+                win.sensors.hide()          # stops its poll thread
             if win.board is not None:
                 win.board.destroy()
                 win.board = None

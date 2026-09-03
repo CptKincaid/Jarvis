@@ -1617,6 +1617,17 @@ def test_a_recognised_face_cannot_grant_anything_because_nothing_reads_it():
     Written as a grep because a reviewer's assurance does not survive the
     next edit and this does: the day somebody imports campreview into
     jarvis/app.py to save a round trip, this fails and asks why.
+
+    2026-09-03: jarvis/ui/sensors_page.py joined the list. It takes ONE
+    thing from here -- REASON_WORDS, the sentence for a camera that is not
+    running -- so the two surfaces use one vocabulary for the same states
+    rather than inventing a second. It does fuse a recognised face into a
+    zone verdict ("AT THE DESK"), and that verdict is DISPLAY-ONLY by the
+    same structural argument: the page is constructed by main_window and by
+    nothing else, it publishes no event, and no module imports it to read
+    one. If the arrival greeting ever wants that verdict, the fusion moves
+    to a module of its own with its own capability argument -- it does not
+    get read off a Tk page.
     """
     importers = set()
     for path in sorted((REPO / "jarvis").rglob("*.py")):
@@ -1626,7 +1637,18 @@ def test_a_recognised_face_cannot_grant_anything_because_nothing_reads_it():
                      path.read_text(), re.M):
             importers.add(path.relative_to(REPO).as_posix())
     assert importers <= {"jarvis/ui/preview.py", "jarvis/ui/main_window.py",
-                         "jarvis/ui/views.py"}, importers
+                         "jarvis/ui/views.py",
+                         "jarvis/ui/sensors_page.py"}, importers
+    # The sensors page's verdict really is display-only: only the window
+    # that packs it imports it. (A MENTION does not count -- the config's
+    # own comment names the file as where the zone model is argued.)
+    readers = {p.relative_to(REPO).as_posix()
+               for p in sorted((REPO / "jarvis").rglob("*.py"))
+               if p.name != "sensors_page.py"
+               and re.search(r"^\s*(from|import)\s+\S*sensors_page|"
+                             r"^\s*from\s+\S+\s+import\s+[^\n]*\bsensors_page\b",
+                             p.read_text(), re.M)}
+    assert readers <= {"jarvis/ui/main_window.py"}, readers
     # …and the class itself hands nothing out but a shot: no callback, no
     # sink, no publish. The pane POLLS; nothing here pushes.
     api = {n for n in dir(cp.PreviewWorker) if not n.startswith("_")}

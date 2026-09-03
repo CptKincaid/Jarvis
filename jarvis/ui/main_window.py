@@ -661,6 +661,7 @@ class MainWindow:
         # really baked into the geometry, and only the mover knows that.
         self._standby_drift = (0, 0)
         self._footer_hidden = False
+        self._tabs_hidden = False        # the tab row goes with the footer
         self._term_available = terminal_available()
         self._session_seen = False       # a jarvis-* tmux session is alive
         self._term_attached = False      # …and a terminal is watching it
@@ -1232,6 +1233,13 @@ class MainWindow:
             i += 1
 
     def _build_stage(self):
+        # The tab row (jarvis/ui/tab_strip.py), packed FIRST of the stage's
+        # side="top" children so it lands directly under the header rule --
+        # "a little tab to click thats underneath jarvis", his words. It
+        # costs the stage 80 device px at his scale (measured; the number
+        # is pinned in tests/test_tab_strip.py), which the SENSORS page
+        # pays for by giving up the tab row it used to draw itself.
+        self.tabs = self._build_tabs()
         self.reactor = Reactor(self.shell, height=px(300))
         self.reactor.pack(fill="x", side="top")
         self.reactor.attach_toplevel()
@@ -1248,6 +1256,110 @@ class MainWindow:
         # relwidth/relheight cover exactly that panel — no fractions of the
         # shell to drift out of step with the layout.
         self.room = RoomSlab(self.transcript)
+        # The SENSORS page (jarvis/ui/sensors_page.py) covers the whole
+        # stage — the reactor AND the transcript. It asks for ~940 device
+        # px at his window and scale and the transcript alone is ~420, so
+        # over the transcript its bands and SAVE button fell off the bottom
+        # (measured on scripts/ui_shots.py). It measures that span itself
+        # from the two widgets handed to it, so a hidden footer or a packed
+        # camera pane cannot put it out of step.
+        self.sensors = self._build_sensors()
+        self._fill_tabs()
+
+    def _build_tabs(self):
+        """The tab row, or None. Imported here rather than at module scope
+        for the same reason _build_sensors is: a strip that failed to build
+        must not be why the console does not start (sensors_toggle falls
+        back to the page's own toggle, and F9 keeps working)."""
+        try:
+            from jarvis.ui.tab_strip import TabStrip
+            strip = TabStrip(self.shell, bg=theme.BG)
+            strip.pack(fill="x", side="top")
+            return strip
+        except Exception:                     # noqa: BLE001 - optional chrome
+            log.exception("tab strip could not be built")
+            return None
+
+    def _fill_tabs(self):
+        """One line per surface. A third tab is one more line here and
+        nothing else -- no width to re-budget, no test to update."""
+        strip = getattr(self, "tabs", None)
+        if strip is None:
+            return
+        strip.add("chat", "CHAT")
+        if self.sensors is not None:
+            strip.add("sensors", "SENSORS", select=self.sensors.show,
+                      leave=self.sensors.hide)
+        # CHAT is added first and is therefore already selected; nothing is
+        # shown or hidden for it, because the stage under it is what is on
+        # screen at build time.
+        # The row's own fit check, measured off the live widgets the way
+        # _check_header_fit does for the header. max(): an unrealized root
+        # reports 1 px, and warning about that would be noise.
+        try:
+            fit = strip.clipped(max(self.root.winfo_width(), px(MIN_W)))
+        except Exception:                     # noqa: BLE001 - unmapped
+            fit = []
+        if fit:
+            log.warning("tab strip: %s clipped at this width", fit)
+
+    def _build_sensors(self):
+        """The SENSORS page, or None.
+
+        Imported HERE rather than at module scope so a diagnostics surface
+        can never be the reason the console fails to start -- the same rule
+        _build_preview follows. The camera reaches the page as NUMBERS:
+        PreviewWorker.status() is built from PreviewShot.numbers_only(),
+        which excludes the image by name, so no code path exists by which a
+        frame could arrive on that surface.
+        """
+        try:
+            from jarvis.ui.sensors_page import SensorsPage
+            return SensorsPage(self.shell, services=self.services,
+                               camera_status=self._camera_numbers,
+                               cover=(self.reactor, self.transcript),
+                               on_close=self._sensors_closed)
+        except Exception:                     # noqa: BLE001 - optional lane
+            log.exception("sensors page could not be built")
+            return None
+
+    def _sensors_closed(self):
+        """The page hid itself (quit, or anything else that calls hide()).
+        Put the strip back on CHAT so the lit tab matches the screen.
+        select() is idempotent, so the strip's own CHAT press -- which is
+        what called hide() in the first place -- does not come back round."""
+        strip = getattr(self, "tabs", None)
+        if strip is not None:
+            strip.select("chat")
+
+    def _camera_numbers(self) -> dict:
+        """The preview worker's numbers-only status, or {} when there is no
+        worker (no vision lane, camera.preview off, the pane failed to
+        build). {} renders as "camera not running", never as an empty room."""
+        worker = getattr(self, "preview_worker", None)
+        if worker is None or not hasattr(worker, "status"):
+            return {}
+        try:
+            return dict(worker.status())
+        except Exception:                     # noqa: BLE001 - provider edge
+            log.debug("camera status unavailable", exc_info=True)
+            return {}
+
+    def sensors_toggle(self):
+        """Show/hide the SENSORS page.
+
+        The TAB is the primary way in now; F9 stays as the shortcut and is
+        the one seam a voice command would call. It goes THROUGH the strip
+        so the selected tab and the surface on screen can never disagree --
+        and the strip is what starts and stops the page's poll thread.
+        """
+        strip = getattr(self, "tabs", None)
+        if strip is not None and "sensors" in strip.keys:
+            strip.select("chat" if strip.selected == "sensors" else "sensors")
+            return
+        page = getattr(self, "sensors", None)  # no strip: F9 still works
+        if page is not None:
+            page.toggle()
 
     def _build_footer(self):
         self.status_strip = StatusStrip(
@@ -1438,6 +1550,14 @@ class MainWindow:
         self.root.bind("<F5>", lambda e: self._toggle_recording())
         self.root.bind("<space>", self._on_space)
         self.root.bind("<Escape>", lambda e: self._minimize_to_tray())
+        # The SENSORS page. The TAB under the wordmark is the primary way
+        # in (jarvis/ui/tab_strip.py); F9 stays as the shortcut, and it is
+        # F9 because every nearer key is spoken for -- F5 is the hotword
+        # daemon's synthetic keypress, space is the mic, Escape is the
+        # tray. It still may not go in the HEADER: 13 px spare at his
+        # 920-px window (tests/test_header_fit.py) and a chip there would
+        # cost him the sensing badge.
+        self.root.bind("<F9>", lambda e: self.sensors_toggle())
 
     def _on_space(self, event):
         focused = self.root.focus_get()
@@ -1654,6 +1774,13 @@ class MainWindow:
                 self.preview_worker.stop()
         except Exception:
             log.exception("camera preview stop failed")
+        # The sensors page's poll thread, for the same reason: a quit that
+        # left it running would keep hitting the ESP32 on the way out.
+        try:
+            if getattr(self, "sensors", None) is not None:
+                self.sensors.hide()
+        except Exception:
+            log.exception("sensors page stop failed")
         if self.board is not None:
             try:
                 self.board.destroy()
@@ -1891,6 +2018,10 @@ class MainWindow:
         except AttributeError:
             log.debug("transcript has no atmosphere loop", exc_info=True)
         self._set_footer_hidden(mode == STANDBY)
+        # …and the tab row goes with it. It is packed ABOVE the stage, so
+        # _set_footer_hidden never reached it: the quiet mode shipped with a
+        # row of lit, clickable tabs over the dimmed clock.
+        self._set_tabs_hidden(mode == STANDBY)
         # The camera pane is an ACTIVE-console widget only, and going quiet
         # STOPS the capture rather than hiding it (jarvis/ui/preview.py).
         self._preview_apply(mode)
@@ -1929,6 +2060,49 @@ class MainWindow:
                 self.command_bar.pack(fill="x", side="bottom")
         except tk.TclError:
             log.debug("footer repack on a dead window", exc_info=True)
+
+    def _set_tabs_hidden(self, hidden: bool):
+        """Standby takes the tab row away too, and shuts whatever surface
+        it had open on the way out.
+
+        _set_footer_hidden's own words: in standby the panel is "a clock
+        and nothing else". The strip is packed into the shell ABOVE the
+        stage (see _build_stage), so nothing the footer does reaches it --
+        photographed 2026-09-03 as CHAT and SENSORS at full brightness over
+        the dimmed clock, with one click on SENSORS enough to start the
+        poll thread behind it. F9 could always do that; a tab makes it a
+        one-click accident.
+
+        Selecting CHAT is what actually stops the poll: the strip owns the
+        page's show()/hide() (jarvis/ui/tab_strip.py), so a SENSORS surface
+        that was open when the console went quiet is hidden and its thread
+        ends, rather than polling a radar the curfew may just have powered
+        down. With no strip at all (it is optional chrome and F9 still
+        works without it) the page is hidden directly, for the same reason.
+        """
+        if hidden == self._tabs_hidden:
+            return
+        self._tabs_hidden = hidden
+        strip = getattr(self, "tabs", None)
+        if hidden:
+            page = getattr(self, "sensors", None)
+            if strip is not None and "chat" in strip.keys:
+                strip.select("chat")      # runs leave() -> the page hides
+            elif page is not None:
+                page.hide()
+        if strip is None:
+            return
+        try:
+            if hidden:
+                strip.pack_forget()
+            else:
+                # before=: the row's whole point is that it sits directly
+                # under the header rule. pack() with no anchor APPENDS to
+                # the shell's side="top" stack, which would put the row
+                # back under the transcript.
+                strip.pack(fill="x", side="top", before=self.reactor)
+        except tk.TclError:
+            log.debug("tab strip repack on a dead window", exc_info=True)
 
     def _on_console_dim(self, factor: float):
         """Dimming is a canvas-colour blend inside our own window — never

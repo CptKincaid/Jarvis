@@ -137,6 +137,12 @@ class _Console:
     _preview_apply = MainWindow._preview_apply
     _pick_geometry = MainWindow._pick_geometry
     _default_geometry = MainWindow._default_geometry
+    # 2026-09-03: standby hides the tab row with the footer and shuts a
+    # SENSORS page left open behind the clock. Bound, not stubbed -- the
+    # console with no strip built is a state the shipping method handles
+    # (`tabs` is None when _build_tabs failed), so it is worth taking that
+    # path here rather than pretending the call does not happen.
+    _set_tabs_hidden = MainWindow._set_tabs_hidden
 
     def __init__(self):
         self.root = _Root()
@@ -144,6 +150,8 @@ class _Console:
         self._geom_ts = 0.0
         self._standby_origin = None
         self._standby_drift = (0, 0)
+        self._tabs_hidden = False
+        self.tabs = None                 # _build_tabs failed / not built yet
         self._min_w, self._min_h = 460, 720
         self.modes = None
         self.room = SimpleNamespace(set_mode=lambda mode: None)
