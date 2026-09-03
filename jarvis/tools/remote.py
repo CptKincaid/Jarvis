@@ -88,6 +88,7 @@ log = get_logger("tools.remote")
 
 SSH_BIN = "ssh"
 SCP_BIN = "scp"
+SFTP_BIN = "sftp"
 NC_BIN = "nc"
 TAILSCALE_BIN = os.path.expanduser("~/.local/bin/tailscale")
 # The rootless daemon's socket.  The CLI defaults to /var/run/tailscale,
@@ -177,6 +178,10 @@ class RemoteConfig:
     user: str = ""
     key_path: str = ""
     name: str = "HPCOMPUTER"
+    # "windows" | "posix": which far side the read side talks to.  Windows
+    # is shipped because that is what HPCOMPUTER is (F07); it decides the
+    # question table, and whether a listing is a shell `ls` or SFTP.
+    os: str = "windows"
     timeout_s: float = DEFAULT_TIMEOUT_S
     transfer_timeout_s: float = DEFAULT_TRANSFER_S
     socks_proxy: str = "127.0.0.1:1055"
@@ -214,6 +219,21 @@ def _cfg_get(cfg, dotted: str, default=None):
     return default if val is None else val
 
 
+_POSIX_WORDS = ("posix", "linux", "unix", "mac", "macos", "darwin", "bsd")
+
+
+def _norm_os(value) -> str:
+    """Two words and no third.  Anything that is not plainly POSIX is
+    windows, the shipped default -- a typo must not silently switch the
+    lane onto a shell that is not there."""
+    word = str(value or "").strip().lower()
+    if word in _POSIX_WORDS:
+        return "posix"
+    if word and word not in ("windows", "win", "win32", "nt"):
+        log.warning("remote.os %r is not windows|posix; using windows", word)
+    return "windows"
+
+
 def read_config(cfg) -> RemoteConfig:
     """The ``remote`` section, defensively.  A malformed config must leave the
     lane OFF, never half-configured: a present host with a missing user is
@@ -229,6 +249,7 @@ def read_config(cfg) -> RemoteConfig:
         user=str(_cfg_get(cfg, "remote.user", "") or "").strip(),
         key_path=str(_cfg_get(cfg, "remote.key_path", "") or "").strip(),
         name=str(_cfg_get(cfg, "remote.name", "") or "").strip() or "HPCOMPUTER",
+        os=_norm_os(_cfg_get(cfg, "remote.os", "")),
         timeout_s=_clamp(_cfg_get(cfg, "remote.timeout_s", None),
                          MIN_TIMEOUT_S, MAX_TIMEOUT_S, DEFAULT_TIMEOUT_S),
         transfer_timeout_s=_clamp(
@@ -313,6 +334,13 @@ FAIL_LINES = {
                 "sir; rename it and I'll send it.",
     "exists": "There's already a file by that name where I'd put it, sir; "
               "I've left yours alone.",
+    # The far side's OWN shell said it does not know the command (F07): a
+    # POSIX row sent to cmd.exe, or a Windows row sent to sh.  That is a
+    # remote.os problem on this side, and it names the command so he can
+    # tell which -- the generic line hid this behind "wouldn't answer".
+    "wrong-os": "{name} doesn't know that command, sir{missing}. I asked it "
+                "the way I'd ask a {os_word} box; remote.os in "
+                f"{CONFIG_HINT} is probably wrong.",
     "failed": "{name} wouldn't answer that, sir.",
 }
 
@@ -323,14 +351,45 @@ FREEFORM_REFUSAL = (
     "them, and answer a short list of questions about it -- but not that.")
 
 
-def fail_line(conf: RemoteConfig, reason: str) -> str:
+# The command a shell did not recognise, in the three wordings that matter:
+# cmd.exe ("'ls' is not recognized ..."), dash ("sh: 1: powershell: not
+# found"), bash ("bash: powershell: command not found").
+_MISSING_CMD_RX = re.compile(
+    r"'([^'\r\n]+)' is not recognized|"
+    r"(?:^|\n)(?:\w+: (?:\d+: )?)?(\S+): (?:command )?not found", re.I)
+
+
+def missing_command(err: str) -> str:
+    """The command name out of a wrong-os stderr, or "" when the text does
+    not carry one ("The system cannot find the path specified.")."""
+    m = _MISSING_CMD_RX.search(err or "")
+    if not m:
+        return ""
+    return next((g for g in m.groups() if g), "")
+
+
+def fail_line(conf: RemoteConfig, reason: str, err: str = "") -> str:
+    """The spoken line for a reason.  ``err`` is the stderr it came from,
+    used only by the wrong-os line to name the command (F07)."""
     line = FAIL_LINES.get(reason) or FAIL_LINES["failed"]
-    return line.format(name=conf.name, timeout=int(conf.timeout_s))
+    cmd = missing_command(err) if reason == "wrong-os" else ""
+    return line.format(name=conf.name, timeout=int(conf.timeout_s),
+                       missing=f" -- it has no {cmd}" if cmd else "",
+                       os_word="Windows" if conf.os == "windows" else "Linux")
 
 
 _HOSTKEY_RX = re.compile(
     r"host key.*(changed|verification failed)|REMOTE HOST IDENTIFICATION",
     re.I)
+# What the far side's shell says to a command that is not there.  cmd.exe
+# says the first for `ls`, and the second for the `2>/dev/null` in a POSIX
+# row (it reads it as a redirect into a path that does not exist); dash and
+# bash say the last two to `powershell`.  Any of them means the table was
+# built for the wrong OS -- remote.os, not the host, is what to look at.
+_WRONG_OS_RX = re.compile(
+    r"is not recognized as an internal or external command|"
+    r"the system cannot find the path specified|"
+    r"command not found|sh: \d+: \S+: not found", re.I)
 _AUTH_RX = re.compile(
     r"permission denied|too many authentication|no supported authentication|"
     r"publickey.*denied|authentication failed", re.I)
@@ -341,19 +400,26 @@ _REACH_RX = re.compile(
 _SPACE_RX = re.compile(r"no space left|disk quota exceeded", re.I)
 _DENIED_RX = re.compile(r"permission denied.*(writ|creat)|read-only file system",
                         re.I)
-_MISSING_RX = re.compile(r"no such file or directory|not a directory", re.I)
+# The third wording is sftp's, for a folder that is not there -- measured
+# 2026-09-03 with `sftp -b -`: `Can't ls: "x" not found` on stderr, rc 1.
+_MISSING_RX = re.compile(
+    r"no such file or directory|not a directory|can't ls: .* not found", re.I)
 
 
 def classify_error(err: str) -> str:
-    """ssh/scp stderr in one word.  Order matters, and each rung is a real
-    confusion this avoids: a changed host key ALSO prints "Permission
+    """ssh/scp/sftp stderr in one word.  Order matters, and each rung is a
+    real confusion this avoids: a changed host key ALSO prints "Permission
     denied" further down and is the one thing he must look at himself; a
+    shell that does not know the command is a remote.os mistake on THIS
+    side and must not be filed under any of the far side's failures; a
     full remote disk and a refused write both look like a generic failure
     but need different sentences; and "no such file" during a pull is a
     misremembered name, not a broken link."""
     text = err or ""
     if _HOSTKEY_RX.search(text):
         return "hostkey"
+    if _WRONG_OS_RX.search(text):
+        return "wrong-os"
     if _SPACE_RX.search(text):
         return "no-space"
     if _DENIED_RX.search(text):
@@ -610,30 +676,71 @@ def unreachable_reason(conf: RemoteConfig) -> str:
 
 
 # ---------------------------------------------------- tier 1: questions
-# Named, parameterless, READ-ONLY commands.  A spoken phrase selects a row;
-# the row's `cmd` is what runs.  Nothing from a transcript is interpolated,
-# which is why this tier needs no confirmation: the worst a misheard word
-# can do is run a different question from this table, or none.
+# Named, parameterless, READ-ONLY commands, one per OS.  A spoken phrase
+# selects a row; the row's command for ``conf.os`` is what runs.  Nothing
+# from a transcript is interpolated, which is why this tier needs no
+# confirmation: the worst a misheard word can do is run a different
+# question from this table, or none.
+#
+# The Windows column (F07, 2026-09-03).  HPCOMPUTER runs the built-in
+# OpenSSH Server, whose login shell is cmd.exe unless the DefaultShell
+# registry value says PowerShell, and the POSIX rows came back from it as
+# "'uptime' is not recognized as an internal or external command".  Every
+# Windows row is one ``powershell -Command "<expression>"``, chosen for ONE
+# property: no ``$``, no backtick, no nested quote, one double-quoted
+# argument.  That is the quoting that both cmd.exe and PowerShell hand to
+# powershell.exe unchanged -- a ``$var`` would be interpolated by an outer
+# PowerShell before it ever ran, and a nested quote is parsed differently
+# by the two.  ``net``/``wmic``/``quser`` were passed over: wmic is gone
+# from Windows 11 24H2 and quser is absent on Home editions.
+#
+# MEASURED here: the POSIX rows (this box) and sftp's batch format.  NOT
+# measured: the Windows rows against HPCOMPUTER -- by instruction the first
+# live command is Hunter's, and until then they are a reading of the
+# PowerShell docs, not a result.  The wrong-os rung is what he hears if the
+# reading was wrong.
+_PS = "powershell -NoProfile -NonInteractive -Command "
 QUERIES = {
-    "up": {"cmd": "uptime -p 2>/dev/null || uptime",
-           "say": "how long it's been up"},
-    "disk": {"cmd": "df -Ph / | tail -1", "say": "how the disk looks"},
-    "load": {"cmd": "cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3",
-             "say": "what the load is"},
-    "who": {"cmd": "who 2>/dev/null | head -5", "say": "who's logged in"},
-    "inbox": {"cmd": "", "say": "what's in the inbox"},   # built from config
+    "up": {"posix": "uptime -p 2>/dev/null || uptime",
+           "windows": _PS + '"(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"',
+           "say": "how long it's been up", "say_windows": "up since"},
+    "disk": {"posix": "df -Ph / | tail -1",
+             "windows": _PS + '"[math]::Round((Get-PSDrive C).Free/1GB)"',
+             "say": "how the disk looks",
+             "say_windows": "free space on C, in gigabytes"},
+    "load": {"posix": "cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3",
+             "windows": _PS + '"(Get-CimInstance Win32_Processor).LoadPercentage"',
+             "say": "what the load is", "say_windows": "the CPU load, in percent"},
+    "who": {"posix": "who 2>/dev/null | head -5",
+            "windows": _PS + '"(Get-CimInstance Win32_ComputerSystem).UserName"',
+            "say": "who's logged in"},
+    # Built from config on POSIX (query_command); listed over SFTP on
+    # Windows (ask), where there is no shell to build it for.
+    "inbox": {"posix": "", "windows": "", "say": "what's in the inbox"},
 }
 
 
 def query_command(conf: RemoteConfig, key: str) -> str:
-    """The command for a QUERIES row.  "inbox" is the one row whose command
-    depends on config rather than being a constant -- built here through
-    :func:`shell_path` (quoted, but with a leading tilde left for the remote
-    shell to expand), never from anything spoken."""
-    if key == "inbox":
-        return f"ls -1p -- {shell_path(conf.inbox)} 2>/dev/null | head -40"
+    """The command for a QUERIES row on ``conf.os``.  "inbox" is the one row
+    whose POSIX command depends on config rather than being a constant --
+    built here through :func:`shell_path` (quoted, but with a leading tilde
+    left for the remote shell to expand), never from anything spoken.  On
+    Windows it is "" on purpose: :func:`ask` lists the inbox over SFTP."""
     row = QUERIES.get(key)
-    return row["cmd"] if row else ""
+    if not row:
+        return ""
+    if key == "inbox":
+        if conf.os == "windows":
+            return ""
+        return f"ls -1p -- {shell_path(conf.inbox)} 2>/dev/null | head -40"
+    return row.get(conf.os) or ""
+
+
+def query_say(conf: RemoteConfig, key: str) -> str:
+    """How the answer is introduced -- per OS where the output differs in
+    kind (a boot TIME on Windows, an uptime on POSIX)."""
+    row = QUERIES.get(key) or {}
+    return row.get(f"say_{conf.os}") or row.get("say") or ""
 
 
 def ask(conf: RemoteConfig, key: str) -> SshResult:
@@ -641,6 +748,9 @@ def ask(conf: RemoteConfig, key: str) -> SshResult:
     why = missing_reason(conf)
     if why:
         return SshResult(False, reason=why)
+    if key == "inbox" and conf.os == "windows":
+        names, why = list_remote(conf, "inbox")
+        return SshResult(not why, out="\n".join(names[:40]), reason=why)
     cmd = query_command(conf, key)
     if not cmd:
         return SshResult(False, reason="failed")
@@ -653,34 +763,142 @@ def ask(conf: RemoteConfig, key: str) -> SshResult:
 
 
 # ------------------------------------------------------------ tier 2: files
+def _remote_folder(conf: RemoteConfig, raw: str) -> str:
+    """A configured remote folder as the far side is addressed.  On Windows
+    a backslash becomes a slash: SFTP paths are slash-separated on every
+    server (Windows OpenSSH takes ``C:/Users/...``), scp speaks SFTP, and to
+    sftp's own tokenizer a backslash is an escape, not a separator."""
+    folder = (raw or "").strip()
+    if conf.os == "windows":
+        folder = folder.replace("\\", "/")
+    return folder
+
+
 def remote_dir(conf: RemoteConfig, key: str) -> str:
     """The configured remote folder for a spoken key, or "" if not allowed."""
     if key == "inbox":
-        return conf.inbox
-    return conf.pull_dirs.get(key, "")
+        return _remote_folder(conf, conf.inbox)
+    return _remote_folder(conf, conf.pull_dirs.get(key, ""))
+
+
+# ---- the SFTP listing (F07) ----
+# Windows OpenSSH has no `ls`, but it has the SFTP subsystem -- the same
+# one scp already speaks -- so a Windows folder is listed the way it is
+# copied from: no shell on the far side at all.  Format measured on this
+# box 2026-09-03 (`sftp -q -b - -D /usr/lib/openssh/sftp-server`, which
+# pipes straight to the local sftp-server; no socket):
+#
+#     sftp> ls -ln "jarvis-outbox"                          <- the echo
+#     -rw-rw-r--    ? hunterp  hunterp   1 Sep  3 12:21 jarvis-outbox/a.txt
+#     drwxrwxr-x    ? hunterp  hunterp 4096 Sep  3 12:21 jarvis-outbox/sub dir
+#
+# Batch mode echoes each command; a name comes back PATH-PREFIXED; the mode
+# column's first character tells a directory; dotfiles are absent without
+# -a; a missing folder is `Can't ls: "x" not found` on stderr with rc 1.
+# `-ln` rather than `-1` because -1 cannot tell a directory from a file, and
+# `-n` makes the long line the LOCAL sftp client's own ls_file() format
+# whatever the server sends, which is the format above.  A path is quoted
+# with double quotes for sftp's tokenizer; a folder that contains one is
+# refused rather than escaped, the rule this module applies to names.
+_SFTP_UNQUOTABLE_RX = re.compile(r'["\r\n]')
+_SFTP_LONG_FIELDS = 8              # mode links user group size mon day time
+
+
+def sftp_argv(conf: RemoteConfig, timeout_s: float = 0.0) -> list:
+    """``sftp -b -`` reads its commands from stdin, so the batch is Popen
+    input and never an argument; the same guards as ssh's."""
+    return ([SFTP_BIN, "-q", "-b", "-"]
+            + _common_opts(conf, timeout_s or conf.timeout_s)
+            + ["--", conf.target])
+
+
+def run_sftp(conf: RemoteConfig, batch: str,
+             timeout_s: float = 0.0) -> SshResult:
+    """THE SEAM for a listing.  One bounded SFTP session fed ``batch`` on
+    stdin; the same Popen + communicate(timeout) + kill-without-wait shape
+    as :func:`run_ssh`, for the same reason."""
+    budget = timeout_s or conf.timeout_s
+    argv = sftp_argv(conf, budget)
+    log.info("remote: sftp %s (%.0fs budget)", conf.name, budget)
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("remote: sftp unavailable: %s", type(exc).__name__)
+        return SshResult(False, reason="no-ssh")
+    try:
+        out, err = proc.communicate(input=batch.rstrip("\n") + "\n",
+                                    timeout=budget)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        log.warning("remote: %s did not answer sftp in %.0fs; not waiting",
+                    conf.name, budget)
+        return SshResult(False, reason="timeout")
+    if proc.returncode != 0:
+        reason = classify_error(err)
+        log.warning("remote: sftp rc=%s (%s)", proc.returncode, reason)
+        return SshResult(False, out=out or "", err=err or "", reason=reason)
+    return SshResult(True, out=out or "", err=err or "")
+
+
+def sftp_listing(out: str) -> list:
+    """Filenames out of an ``ls -ln`` batch's stdout: the echo skipped,
+    directories dropped, the path prefix removed.  Names are NOT vetted
+    here -- :func:`list_remote` does that, the same for both listings."""
+    names = []
+    for raw in (out or "").splitlines()[:LISTING_CAP + 1]:
+        line = raw.rstrip()
+        if not line or line.startswith("sftp>") or line[0] == "d":
+            continue
+        fields = line.split(None, _SFTP_LONG_FIELDS)
+        if len(fields) <= _SFTP_LONG_FIELDS:
+            continue
+        names.append(fields[_SFTP_LONG_FIELDS].rsplit("/", 1)[-1])
+    return names
+
+
+def _list_sftp(conf: RemoteConfig, folder: str) -> SshResult:
+    path = scp_path(folder)
+    if _SFTP_UNQUOTABLE_RX.search(path):
+        log.warning("remote: refusing to list a folder I won't put in an "
+                    "sftp batch line")
+        return SshResult(False, reason="not-there")
+    return run_sftp(conf, f'ls -ln "{path}"')
 
 
 def list_remote(conf: RemoteConfig, key: str) -> tuple[list, str]:
     """Filenames in an allow-listed remote folder, and a failure reason.
 
-    ``ls -1p`` marks directories with a trailing slash so they can be
-    dropped without a second round trip.  Every surviving name must match
-    :data:`SAFE_REMOTE_NAME_RX`; anything else is DISCARDED rather than
-    escaped, and that is deliberate -- a name containing a quote or a
-    newline is not a file worth risking a quoting bug for.
+    POSIX: ``ls -1p`` marks directories with a trailing slash so they can
+    be dropped without a second round trip.  Windows: an SFTP ``ls -ln``,
+    read by :func:`sftp_listing` (F07 -- there is no ``ls`` there).  Either
+    way every surviving name must match :data:`SAFE_REMOTE_NAME_RX`;
+    anything else is DISCARDED rather than escaped, and that is deliberate
+    -- a name containing a quote or a newline is not a file worth risking
+    a quoting bug for.
     """
     folder = remote_dir(conf, key)
     if not folder:
         return [], "not-there"
-    res = run_ssh(conf, f"ls -1p -- {shell_path(folder)}")
+    if conf.os == "windows":
+        res = _list_sftp(conf, folder)
+    else:
+        res = run_ssh(conf, f"ls -1p -- {shell_path(folder)}")
     if not res.ok:
         reason = res.reason
         if reason in ("unreachable", "timeout"):
             reason = unreachable_reason(conf) or reason
         return [], reason
+    if conf.os == "windows":
+        listed = sftp_listing(res.out)
+    else:
+        listed = [raw.strip() for raw in (res.out or "").splitlines()]
     names = []
-    for raw in (res.out or "").splitlines()[:LISTING_CAP]:
-        line = raw.strip()
+    for line in listed[:LISTING_CAP]:
         if not line or line.endswith("/"):
             continue
         if SAFE_REMOTE_NAME_RX.match(line):
@@ -734,7 +952,7 @@ def inbox_target(conf: RemoteConfig, name: str) -> str:
     if not SAFE_REMOTE_NAME_RX.match(base):
         log.warning("remote: refusing to push a name I won't write remotely")
         return ""
-    return f"{scp_path(conf.inbox).rstrip('/')}/{base}"
+    return f"{scp_path(remote_dir(conf, 'inbox')).rstrip('/')}/{base}"
 
 
 def push(conf: RemoteConfig, local: Path) -> SshResult:

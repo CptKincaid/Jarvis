@@ -4939,9 +4939,11 @@ def _remote_blocked(c, conf):
                          status=f"{conf.name}: not set up")
 
 
-def _remote_fail(conf, reason: str, status: str = ""):
+def _remote_fail(conf, reason: str, status: str = "", err: str = ""):
+    """``err`` is the far side's stderr, which only the wrong-os line reads
+    -- to name the command it did not recognise (F07)."""
     return CommandResult(handled=True, speak=True,
-                         reply=remote_mod.fail_line(conf, reason),
+                         reply=remote_mod.fail_line(conf, reason, err),
                          status=status or f"{conf.name}: {reason}")
 
 
@@ -5033,7 +5035,7 @@ def _h_remote_status(c, t, m):
             return _remote_fail(conf, "asleep", f"{conf.name}: asleep")
         res = remote_mod.ask(conf, "up")
         if not res.ok:
-            return _remote_fail(conf, res.reason)
+            return _remote_fail(conf, res.reason, err=res.err)
         up = " ".join((res.out or "").split())[:120]
         line = f"{conf.name} is up, sir" + (f" -- {up}." if up else ".")
         return CommandResult(handled=True, reply=line, speak=True,
@@ -5057,13 +5059,13 @@ def _h_remote_query(c, t, m):
     def _ask():
         res = remote_mod.ask(conf, key)
         if not res.ok:
-            return _remote_fail(conf, res.reason)
+            return _remote_fail(conf, res.reason, err=res.err)
         body = " ".join((res.out or "").split())[:200]
         if not body:
             return CommandResult(handled=True, speak=True,
                                  status=f"{conf.name}: nothing",
                                  reply="Nothing to report there, sir.")
-        say = remote_mod.QUERIES[key]["say"]
+        say = remote_mod.query_say(conf, key)
         return CommandResult(handled=True, speak=True,
                              status=f"{conf.name}: {key}",
                              reply=f"On {conf.name}, {say}: {body}.")
@@ -5109,7 +5111,7 @@ def _h_remote_push(c, t, m):
         def _copy():
             res = remote_mod.push(conf, path)
             if not res.ok:
-                return _remote_fail(conf, res.reason)
+                return _remote_fail(conf, res.reason, err=res.err)
             return CommandResult(handled=True, speak=True,
                                  status=f"Sent to {conf.name}",
                                  reply=f"{path.name} is on {conf.name}, sir.")
@@ -5161,7 +5163,7 @@ def _h_remote_pull(c, t, m):
         def _copy():
             res = remote_mod.pull(conf, key, name)
             if not res.ok:
-                return _remote_fail(conf, res.reason)
+                return _remote_fail(conf, res.reason, err=res.err)
             return CommandResult(handled=True, speak=True, status="Fetched",
                                  reply=f"{name} is on your "
                                        f"{dest.parent.name}, sir.")

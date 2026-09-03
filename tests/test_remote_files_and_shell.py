@@ -59,6 +59,10 @@ def ready_cfg(tmp_path, **over):
             "remote.host": "hpcomputer.tail5323b8.ts.net",
             "remote.user": "hunterp",
             "remote.key_path": str(key),
+            # The POSIX far side these were measured against ($HOME quoting,
+            # `ls -1p`); the shipped default is windows (F07), and the
+            # Windows tests set it by name.
+            "remote.os": "posix",
             "remote.local_roots": [str(tmp_path / "Desktop")]}
     base.update(over)
     return Cfg(**base)
@@ -1174,3 +1178,245 @@ def test_the_socks_proxy_is_for_the_tailnet_not_the_lan(tmp_path):
 def test_the_no_host_line_does_not_blame_the_tailnet(tmp_path):
     conf = remote.read_config(ready_cfg(tmp_path, **{"remote.host": ""}))
     assert "tailnet" not in remote.fail_line(conf, "no-host")
+
+
+# ==================================================================
+# F07 (2026-09-03): HPCOMPUTER is Windows -- there is no POSIX shell there
+# ==================================================================
+# It runs the built-in OpenSSH Server (Add-WindowsCapability OpenSSH.Server;
+# user h2pey; 192.168.50.114), whose login shell is cmd.exe or PowerShell.
+# Every QUERIES row (`uptime -p 2>/dev/null || uptime`, `df -Ph /`, `cat
+# /proc/loadavg`, `who`), the inbox row and the `ls -1p` every pull listed
+# with came back rc!=0 with "'ls' is not recognized as an internal or
+# external command", classify_error had no rung for it, and all of them
+# were spoken as the generic "HPCOMPUTER wouldn't answer that, sir."  Only
+# push -- scp over SFTP, no shell -- could work.  Repro:
+# scratch-0903/bugpass/remote_lan_host_repro.py section 3, win_shell_trace.py.
+#
+# So: `remote.os` (windows|posix, windows shipped), a per-OS question table,
+# an SFTP listing for the Windows pull (and its inbox question), and a
+# rung that names the command the far side did not recognise.
+CMD_NOT_RECOGNISED = ("'ls' is not recognized as an internal or external "
+                      "command,\noperable program or batch file.\n")
+
+# Verbatim from this box, 2026-09-03: `printf 'ls -ln "jarvis-outbox"\n' |
+# sftp -q -b - -D /usr/lib/openssh/sftp-server` with cwd holding that folder
+# (-D pipes straight to the local sftp-server; no socket).  Batch mode
+# echoes the command as "sftp> ...", names come back PATH-PREFIXED, a
+# directory's mode starts with "d", dotfiles are absent without -a.
+SFTP_LISTING = (
+    'sftp> ls -ln "jarvis-outbox"\n'
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:21 jarvis-outbox/-dash.txt\n"
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:21 jarvis-outbox/a.txt\n"
+    "-rw-rw-r--    ? hunterp  hunterp         2 Sep  3 12:21 jarvis-outbox/b c.pdf\n"
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:33 jarvis-outbox/report.pdf\n"
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:33 jarvis-outbox/two  spaces.txt\n"
+    "drwxrwxr-x    ? hunterp  hunterp      4096 Sep  3 12:21 jarvis-outbox/sub dir\n")
+SFTP_NOT_FOUND = 'Can\'t ls: "jarvis-outbox" not found\n'     # stderr, rc 1
+
+
+def win_cfg(tmp_path, **over):
+    return lan_cfg(tmp_path, **{"remote.os": "windows", **over})
+
+
+def test_the_shipped_os_is_windows_and_the_posix_fixture_says_so(tmp_path):
+    """DEFAULTS carry no `os`, and the box this lane is for is Windows, so
+    the default is windows.  ready_cfg pins posix on purpose: the shell
+    listing and $HOME tests above were measured against a POSIX far side."""
+    assert remote.read_config(Cfg()).os == "windows"
+    assert remote.read_config(ready_cfg(tmp_path)).os == "posix"
+
+
+@pytest.mark.parametrize("value,expect", [
+    ("windows", "windows"), ("Windows", "windows"), ("win", "windows"),
+    ("posix", "posix"), ("linux", "posix"), ("mac", "posix"),
+    ("", "windows"), ("toaster", "windows"),
+])
+def test_remote_os_is_one_of_two_words(value, expect):
+    assert remote.read_config(Cfg(**{"remote.os": value})).os == expect
+
+
+@pytest.mark.parametrize("err", [
+    CMD_NOT_RECOGNISED,
+    "The system cannot find the path specified.\n",     # cmd.exe on 2>/dev/null
+    "sh: 1: powershell: not found\n",                    # the other way round
+    "bash: powershell: command not found\n",
+])
+def test_the_far_sides_own_shell_saying_no_is_a_named_reason(err):
+    assert remote.classify_error(err) == "wrong-os"
+
+
+def test_the_wrong_os_line_names_the_command_and_the_setting(tmp_path):
+    conf = remote.read_config(win_cfg(tmp_path, **{"remote.os": "posix"}))
+    line = remote.fail_line(conf, "wrong-os", CMD_NOT_RECOGNISED)
+    assert " ls" in line and "remote.os" in line and "Linux" in line
+    assert "wouldn't answer" not in line
+    conf = remote.read_config(win_cfg(tmp_path))
+    line = remote.fail_line(conf, "wrong-os", "sh: 1: powershell: not found\n")
+    assert "powershell" in line and "Windows" in line
+    # no command in the text: still a sentence, still names the setting
+    line = remote.fail_line(conf, "wrong-os",
+                            "The system cannot find the path specified.\n")
+    assert "remote.os" in line and "{" not in line
+
+
+def test_no_posix_row_reaches_a_windows_shell(tmp_path):
+    conf = remote.read_config(win_cfg(tmp_path))
+    for key in remote.QUERIES:
+        cmd = remote.query_command(conf, key)
+        if key == "inbox":
+            assert cmd == "", "the Windows inbox is listed over SFTP"
+            continue
+        assert cmd, key
+        for posix in ("uptime", "df ", "/proc/", "who ", "ls ", "$HOME",
+                      "/dev/null", "| tail", "| head", "| cut"):
+            assert posix not in cmd, (key, cmd)
+        # ONE quoting rule that survives both cmd.exe and PowerShell as the
+        # login shell: no $, no backtick, no nested quote, one quoted arg.
+        assert "$" not in cmd and "`" not in cmd and cmd.count('"') == 2
+        assert remote.query_say(conf, key)
+    for key in remote.QUERIES:
+        assert remote.query_say(remote.read_config(ready_cfg(tmp_path)), key)
+
+
+def test_a_windows_row_is_a_constant_whatever_the_config_says(tmp_path):
+    conf = remote.read_config(win_cfg(tmp_path, **{"remote.inbox": "~/x; rm -rf ~"}))
+    assert "rm" not in remote.query_command(conf, "load")
+
+
+def test_the_sftp_batch_never_touches_a_shell(tmp_path, monkeypatch):
+    """`sftp -b -` reads its commands from stdin: the batch is a Popen
+    input, never an argument, and the transport carries the same guards ssh
+    does (BatchMode, no password prompt, accept-new)."""
+    seen = {}
+
+    class P:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            seen.update(input=input, timeout=timeout)
+            return 'sftp> ls -ln "x"\n', ""
+
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda argv, **kw: (seen.update(argv=argv, kw=kw), P())[1])
+    conf = remote.read_config(win_cfg(tmp_path))
+    res = remote.run_sftp(conf, 'ls -ln "x"')
+    assert res.ok and seen["input"] == 'ls -ln "x"\n'
+    assert seen["kw"]["stdin"] == subprocess.PIPE and not seen["kw"].get("shell")
+    argv = seen["argv"]
+    assert argv[0] == remote.SFTP_BIN and argv[argv.index("-b") + 1] == "-"
+    assert argv[-2:] == ["--", "h2pey@192.168.50.114"]
+    joined = " ".join(argv)
+    assert "BatchMode=yes" in joined and "PasswordAuthentication=no" in joined
+    assert seen["timeout"] == conf.timeout_s
+
+
+def test_the_windows_listing_is_sftp_and_reads_the_measured_text(tmp_path,
+                                                                 monkeypatch):
+    monkeypatch.setattr(remote, "run_ssh", lambda *a, **k:
+                        pytest.fail("ran a shell command on a Windows host"))
+    batches = []
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        batches.append(batch) or
+                        remote.SshResult(True, out=SFTP_LISTING))
+    conf = remote.read_config(win_cfg(tmp_path))
+    names, why = remote.list_remote(conf, "outbox")
+    assert why == ""
+    # the echo line skipped, the directory dropped, the prefix stripped, a
+    # double space kept, and the dash-name refused by SAFE_REMOTE_NAME_RX
+    assert names == ["a.txt", "b c.pdf", "report.pdf", "two  spaces.txt"]
+    assert batches == ['ls -ln "jarvis-outbox"']    # scp_path form: no tilde
+
+
+def test_a_missing_windows_folder_is_not_there(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        remote.SshResult(False, err=SFTP_NOT_FOUND,
+                                         reason=remote.classify_error(SFTP_NOT_FOUND)))
+    conf = remote.read_config(win_cfg(tmp_path))
+    assert remote.list_remote(conf, "outbox") == ([], "not-there")
+
+
+def test_a_windows_folder_with_a_quote_is_refused_not_escaped(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "run_sftp", lambda *a, **k:
+                        pytest.fail("put a quote into an sftp batch line"))
+    conf = remote.read_config(win_cfg(tmp_path, **{
+        "remote.pull_dirs": {"desktop": 'C:/Users/h2pey/"Desktop'}}))
+    assert remote.list_remote(conf, "desktop") == ([], "not-there")
+
+
+def test_a_backslash_windows_path_goes_over_with_slashes(tmp_path, monkeypatch):
+    """SFTP paths are slash-separated on every server and Windows OpenSSH
+    takes C:/Users/... ; a backslash is an escape to sftp's own tokenizer.
+    Both directions: the listing and the scp source built from it."""
+    batches, copies = [], []
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        batches.append(batch) or remote.SshResult(
+                            True, out=SFTP_LISTING.replace(
+                                "jarvis-outbox", "C:/Users/h2pey/Desktop")))
+    monkeypatch.setattr(remote, "run_copy", lambda conf, local, rem, push:
+                        copies.append(rem) or remote.SshResult(True))
+    conf = remote.read_config(win_cfg(tmp_path, **{
+        "remote.pull_dirs": {"desktop": "C:\\Users\\h2pey\\Desktop"},
+        "remote.inbox": "C:\\Users\\h2pey\\jarvis-inbox"}))
+    names, _ = remote.list_remote(conf, "desktop")
+    assert batches == ['ls -ln "C:/Users/h2pey/Desktop"'] and "a.txt" in names
+    (tmp_path / "Desktop").mkdir(exist_ok=True)
+    assert remote.pull(conf, "desktop", "a.txt").ok
+    assert copies == ["C:/Users/h2pey/Desktop/a.txt"]
+    assert remote.inbox_target(conf, "b.txt") == "C:/Users/h2pey/jarvis-inbox/b.txt"
+
+
+def test_the_windows_inbox_question_is_the_sftp_listing(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "run_ssh", lambda *a, **k:
+                        pytest.fail("ran a shell command on a Windows host"))
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        remote.SshResult(True, out=SFTP_LISTING.replace(
+                            "jarvis-outbox", "jarvis-inbox")))
+    conf = remote.read_config(win_cfg(tmp_path))
+    res = remote.ask(conf, "inbox")
+    assert res.ok and res.out.split("\n") == ["a.txt", "b c.pdf", "report.pdf",
+                                              "two  spaces.txt"]
+
+
+def test_the_posix_listing_is_untouched(tmp_path, monkeypatch):
+    """The measured $HOME form still runs for a POSIX host."""
+    monkeypatch.setattr(remote, "run_sftp", lambda *a, **k:
+                        pytest.fail("used sftp for a POSIX listing"))
+    sent = []
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        sent.append(cmd) or remote.SshResult(True, out="a.txt\n"))
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert remote.list_remote(conf, "outbox") == (["a.txt"], "")
+    assert sent == ['ls -1p -- "$HOME"/jarvis-outbox']
+
+
+def test_the_pull_door_on_the_windows_box_lists_with_sftp(wired, tmp_path,
+                                                          monkeypatch):
+    wired.services.assistant = win_cfg(tmp_path)
+    monkeypatch.setattr(remote, "run_ssh", lambda *a, **k:
+                        pytest.fail("ran a shell command on a Windows host"))
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        remote.SshResult(True, out=SFTP_LISTING))
+    wired.handle("get the report from HPCOMPUTER", source="voice")
+    assert wired.spoken[-1] == \
+        "Bring report.pdf from HPCOMPUTER to your Desktop, sir?"
+    wired.handle("yes", source="voice")
+    assert wired.copied[-1] == (str(tmp_path / "Desktop" / "report.pdf"),
+                                "jarvis-outbox/report.pdf", False)
+
+
+def test_a_posix_row_sent_to_a_windows_shell_is_named_out_loud(wired, tmp_path,
+                                                               monkeypatch):
+    """remote.os wrongly posix on the Windows box: the spoken line names the
+    command cmd.exe did not know and the setting to look at, instead of
+    "HPCOMPUTER wouldn't answer that, sir."."""
+    wired.services.assistant = lan_cfg(tmp_path, **{"remote.os": "posix"})
+
+    def cmd_exe(conf, cmd, **k):
+        err = CMD_NOT_RECOGNISED.replace("'ls'", f"'{cmd.split()[0]}'")
+        return remote.SshResult(False, err=err, reason=remote.classify_error(err))
+
+    monkeypatch.setattr(remote, "run_ssh", cmd_exe)
+    wired.handle("what's the disk on HPCOMPUTER", source="voice")
+    assert " df" in wired.spoken[-1] and "remote.os" in wired.spoken[-1]
+    assert wired.statuses[-1] == "HPCOMPUTER: wrong-os"
