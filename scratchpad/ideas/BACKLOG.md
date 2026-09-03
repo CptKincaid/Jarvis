@@ -257,3 +257,23 @@ this is tractable at all: `xdotool` has full synthetic input on X11 and none on
 Wayland. Present: `xdotool`, `xclip`, `gnome-screenshot`. **Missing:** `wmctrl`,
 `scrot`, `import`, `ydotool` — and there is no sudo, so anything needing an
 apt install is a blocker to raise, not to assume.
+
+### Interrupt by talking, not by saying "Jarvis" — BACKLOG, 2026-09-02
+His words: *"no just by saying jarvis for now but put that on backlog."*
+
+**Barge-in already works, but only on the WAKE WORD.** Measured live at
+23:23:54: he said "Jarvis" mid-reply and `speech interrupted (barge-in #1)`
+fired in the SAME MILLISECOND as the wake detection. Talking over Jarvis does
+nothing, and that is what made it feel broken.
+
+Doing it properly means an always-open mic during speech, which needs
+**acoustic echo cancellation** — otherwise Jarvis hears himself and barges in on
+his own voice constantly. Prior note: AEC was *prepared but never installed* on
+this box (the `aec-prep` branch, merged as docs/scripts only). So this is a real
+piece of work, not a config flag, and it is the reason wake-word-only barge-in
+was the right first shape.
+
+When it is picked up: the earlier aec-prep lane found a live blocker worth
+knowing — the mixer ducks by PID, so an AEC playback stream must be exempted
+(sink-input `jarvis_aec_playback`) or it will duck the very audio it is trying
+to cancel.
