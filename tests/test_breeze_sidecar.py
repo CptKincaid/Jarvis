@@ -2748,6 +2748,109 @@ def test_a_worker_that_dies_mid_render_answers_and_then_reports_not_ready(
     assert again["ok"] is False                        # refused, not queued
 
 
+def test_a_worker_wedged_inside_the_model_makes_the_sidecar_not_ready():
+    """The stall net (RENDER_STALL_S) fired for the ONE connection that hit
+    it and changed nothing else: the thread was still blocked in the model,
+    so alive stayed True, ready stayed True, and every later job queued
+    behind the wedged one and stalled in its turn. On Jarvis's side that is
+    BREEZE_TIMEOUT_S = 60 s of silence per chunk before F5, for every chunk
+    of every reply, until someone restarted the unit -- the 'ready' docstring
+    says FAIL CLOSED and this was the one death it did not close on.
+    Measured with stall_s=0.5: the first render raised after 0.50 s, alive
+    True, ping ready True, and the second render stalled 0.50 s again.
+
+    The stall now marks the worker dead: ready flips, the ping says why,
+    and the next render is refused at once -- before audio, so Jarvis
+    renders that chunk on F5 in one round-trip instead of 60 s."""
+    wedge = threading.Event()
+
+    def render(text, gain=1.0):
+        yield pcm(2)
+        wedge.wait()                     # the GPU stopped answering
+
+    worker = bs.RenderWorker(render, stall_s=0.3)
+    svc = bs.BreezeService(render=worker, ready=True, graphs=ALL_GRAPHS)
+    assert svc.ping()["ready"] is True
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="wedged"):
+            list(svc.render("first line", 1.0))
+        assert 0.25 < time.monotonic() - started < 2.0
+        assert worker.alive is False
+        pong = svc.ping()
+        assert pong["ready"] is False and "wedged" in pong["error"]
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="wedged"):
+            list(svc.render("second line", 1.0))
+        assert time.monotonic() - started < 0.2, "the second render waited too"
+        # and over the wire: refused before audio, so Jarvis falls to F5
+        head, rest = split_reply(serve_once(
+            svc, {"text": "third", "stream": True, "id": "w3"}))
+        assert head["ok"] is False and "wedged" in head["error"]
+        assert rest == b""
+    finally:
+        wedge.set()
+        worker.stop(1.0)
+
+
+def test_a_dead_worker_ends_the_process_so_the_unit_restarts_it():
+    """The wedged thread cannot be killed and the model it holds cannot be
+    reloaded in-process; a worker that died any other way leaves the same
+    residue -- a not-ready sidecar that stays alive, holding 13.5 GB, that
+    Restart=always never fires for because the process is up. So a dead
+    render thread becomes a dead PROCESS: exit status 1, not the 2 that
+    RestartPreventExitStatus treats as a deliberate refusal, after a grace
+    for the connection threads still answering {"ok": false}. StartLimit
+    bounds the loop if it recurs. main() disarms it before its own close(),
+    so a deliberate shutdown is not turned into a crash."""
+    exits = []
+
+    def render(text, gain=1.0):
+        raise SystemExit("the venv went away")
+        yield pcm(2)                                   # pragma: no cover
+
+    worker = bs.RenderWorker(render)
+    disarm = bs.exit_when_the_worker_dies(worker, grace_s=0.05,
+                                          _exit=exits.append)
+    with pytest.raises(RuntimeError):
+        list(worker("one"))
+    assert wait_until(lambda: exits == [1], 3), "the process was not ended"
+    assert disarm.is_set() is False
+
+    calm = []
+    worker = bs.RenderWorker(blocks_render(pcm(2)))
+    disarm = bs.exit_when_the_worker_dies(worker, grace_s=0.05,
+                                          _exit=calm.append)
+    assert list(worker("one")) == [pcm(2)]
+    disarm.set()                                       # a deliberate close
+    worker.stop()
+    time.sleep(0.3)
+    assert calm == []
+
+
+def test_main_arms_the_death_watch_and_disarms_it_on_its_own_way_out(
+        tmp_path, monkeypatch):
+    _fake_meminfo(monkeypatch, 40.0, 73.0)
+    monkeypatch.setattr(bs, "load_engine",
+                        lambda args: (blocks_render(pcm(10)), ALL_GRAPHS,
+                                      None, {}))
+    armed = []
+    real = bs.exit_when_the_worker_dies
+
+    def spy(worker, **kw):
+        disarm = real(worker, **kw)
+        armed.append((worker, disarm))
+        return disarm
+
+    monkeypatch.setattr(bs, "exit_when_the_worker_dies", spy)
+    served = []
+    monkeypatch.setattr(bs, "serve",
+                        lambda path, svc: served.append(svc) or 0)
+    assert bs.main(gate_argv(tmp_path)) == 0
+    assert len(armed) == 1 and armed[0][0] is served[0].worker
+    assert armed[0][1].is_set(), "main() closed the worker with the watch armed"
+
+
 def test_concurrent_renders_serialise_and_their_audio_never_interleaves(
         tmp_path):
     """One resident model, one render thread: three clients at once must come
