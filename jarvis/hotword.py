@@ -476,9 +476,19 @@ class Hotword:
             # every frame past the adaptive threshold printed the room.  None
             # means "the trim could not cut this", which is not a speech
             # measurement and must never be read as one (see the docstring).
-            trimmed = speaker_mod.trim_silence(audio)
-            if len(trimmed) < len(audio):
-                trimmed_s = len(trimmed) / speaker_mod.SAMPLE_RATE
+            # Measured from the BOUNDS, not from the slice length. A short
+            # buffer that is all speech (he talked over the tail of a
+            # reply, the ring buffer had just been cleared) gives bounds
+            # spanning the whole buffer; at his 44.1 kHz mic the resampled
+            # length is always a multiple of the frame, so the slice was
+            # the whole buffer, "trimmed" read none, and 0.8 s of his own
+            # voice at -0.057 was SUPPRESSED with "I only answer to Hunter"
+            # -- 17 of 20 wake candidates one evening printed trimmed=none
+            # (F48, reproduced 2026-09-03). None still means "no speech
+            # could be told from the room", which falls through to the bar.
+            bounds = speaker_mod.speech_bounds(audio)
+            if bounds:
+                trimmed_s = (bounds[1] - bounds[0]) / speaker_mod.SAMPLE_RATE
             score = speaker.score(audio,
                                   min_seconds=speaker_mod.MIN_SPEECH_SECONDS)
         except Exception:
