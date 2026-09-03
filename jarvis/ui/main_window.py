@@ -94,16 +94,22 @@ from jarvis.ui.console_mode import (ACTIVE, STANDBY, ConsoleModes, DeskWatch,
 from jarvis.ui.reactor import Reactor
 from jarvis.ui.sensing_badge import SensingBadge, sensing_failsafe_state
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
-                             TranscriptView, standby_alpha)
+                             TranscriptView, fit_placeholder, standby_alpha)
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, StatePill,
-                               Toast, Tooltip, px, set_scale, ui_display,
-                               ui_mono)
+                               Toast, Tooltip, measure, px, set_scale,
+                               ui_display, ui_mono)
 
 log = get_logger("ui.main_window")
 
 # Design units at the 96-dpi baseline; scaled by S at runtime.
 DEFAULT_W, DEFAULT_H = 520, 880
 DEFAULT_GEOMETRY = f"{DEFAULT_W}x{DEFAULT_H}"
+# Header wordmark, widest form first. The header is over-subscribed at his
+# saved 920-px window (2026-09-02: the sensing badge, packed last, was
+# pushed back on top of its neighbour), and the wordmark is the only thing
+# in the bar carrying no information, so it is what steps down — tracked,
+# untracked, monogram, gone. See MainWindow._fit_wordmark.
+WORDMARK_FORMS = ("J A R V I S", "JARVIS", "J", "")
 MIN_W, MIN_H = 460, 720
 
 # StatePill words (uppercase, <= 10 chars, never ellipsized). OFFLINE is
@@ -276,15 +282,25 @@ def terminal_attached(run=None) -> bool:
 
 
 def fmt_mem_gb(total_kb: int, avail_kb: int) -> str:
-    """Used system RAM for the status bar: '26.8 GB' ('--' when total is
-    unknown)."""
+    """Used/total system RAM for the status bar: '26.8/128 GB' ('--' when
+    total is unknown).
+
+    2026-09-02, verbatim: "is that free or used?". It was used (MemTotal -
+    MemAvailable) and nothing on screen said so — at the compact and
+    minimal elision levels the segment carries no label at all, so it read
+    as a bare '59.9 GB' beside a 122 GB box. The value now answers the
+    question by itself at every level, and on a machine whose whole
+    failure mode is the unified pool running out (2026-08-28) the ceiling
+    is the half worth showing.
+    """
     try:
         total, avail = int(total_kb), int(avail_kb)
     except (TypeError, ValueError):
         return "--"
     if total <= 0:
         return "--"
-    return f"{max(0, total - avail) / 1048576.0:.1f} GB"
+    gb = total / 1048576.0
+    return f"{max(0, total - avail) / 1048576.0:.1f}/{gb:.0f} GB"
 
 
 def fmt_asr(model_text: str) -> str:
@@ -575,7 +591,7 @@ class MainWindow:
         self._mic_available = MACHINE.has_mic
         self._last_confidence: Optional[float] = None
         self._temps_text = ""     # written by worker thread, read by Tk loop
-        self._mem_text = ""       # used RAM ('26.8 GB'), same worker
+        self._mem_text = ""       # RAM used/total ('26.8/128 GB')
         self._closing = False
         # Desk standby (jarvis/deskpresence.py): the board's current opacity.
         # 1.0 is the only state the app ever boots in.
@@ -892,20 +908,13 @@ class MainWindow:
         # spacing is baked into the string. The most focal text in the app
         # is WHITE per the film budget (cyan is structure, never the
         # star), with a 1px dim-cyan hologram-fringe ghost offset behind.
-        wm_font = ui_display(theme.SIZE_WORDMARK, "semibold")
-        wm_text = "J A R V I S"
-        wordmark = tk.Canvas(header, width=px(160), height=px(40),
-                             bg=theme.BG, highlightthickness=0, bd=0)
-        gh = max(1, px(1))
-        wordmark.create_text(px(2) + gh, px(20) + gh, text=wm_text,
-                             font=wm_font, fill=theme.RAMP40, anchor="w")
-        wm_main = wordmark.create_text(px(2), px(20), text=wm_text,
-                                       font=wm_font, fill=theme.FOCAL,
-                                       anchor="w")
-        bb = wordmark.bbox(wm_main)
-        if bb:                        # fit exactly — don't starve the status
-            wordmark.configure(width=bb[2] + gh + 1)
-        wordmark.pack(side="left", padx=(theme.PAD, 0))
+        # It is also the ONLY thing in the bar carrying no information, so
+        # it is what yields when the bar runs short (_fit_wordmark).
+        self._wordmark = tk.Canvas(header, width=px(160), height=px(40),
+                                   bg=theme.BG, highlightthickness=0, bd=0)
+        self._wm_text = None
+        self._draw_wordmark(WORDMARK_FORMS[0])
+        self._wordmark.pack(side="left", padx=(theme.PAD, 0))
 
         self._close_btn = RoundButton(header, text="✕", kind="ghost",
                                       size=theme.SIZE_LABEL, pad_x=9, pad_y=5,
@@ -936,6 +945,18 @@ class MainWindow:
         self.sensing_badge.pack(side="right", padx=(0, theme.PAD_S))
         self._sensing_tip = Tooltip(self.sensing_badge, "Sensing state")
         self._refresh_sensing()
+
+        # The header is packed right-to-left and Tk's packer neither wraps
+        # nor stops: once the cavity is spent it hands the NEXT parcel out
+        # to the left of where the cavity began, on top of whatever is
+        # already there. The badge is packed last, so the badge is what
+        # lands on its neighbour — 2026-09-02, "the word sensing is
+        # underneath the ready symbol". Nothing is misaligned (both chips
+        # declare the same 26-unit height and pack centres them); his
+        # 918-px header is simply 33 px short at rest and 164 short in the
+        # worst state. So the wordmark is refitted to whatever is left.
+        header.bind("<Configure>", self._on_header_resize, add=True)
+        self._fit_wordmark()
 
         # atmosphere: the header ground is a soft gradient (sheen behind
         # the wordmark, settling flat to the right) — flat-bg children are
@@ -992,6 +1013,78 @@ class MainWindow:
             return
         for child in children:
             self._bind_drag_tree(child, skip)
+
+    # ------------------------------------------------------ header wordmark
+    def _draw_wordmark(self, text: str):
+        """Paint the wordmark canvas with `text` and shrink it to fit."""
+        if text == self._wm_text:
+            return
+        self._wm_text = text
+        canvas = self._wordmark
+        canvas.delete("wm")       # keeps the bar-gradient ground slice
+        gh = max(1, px(1))
+        if not text:
+            canvas.configure(width=1)
+            return
+        font = ui_display(theme.SIZE_WORDMARK, "semibold")
+        canvas.create_text(px(2) + gh, px(20) + gh, text=text, font=font,
+                           fill=theme.RAMP40, anchor="w", tags=("wm",))
+        main = canvas.create_text(px(2), px(20), text=text, font=font,
+                                  fill=theme.FOCAL, anchor="w", tags=("wm",))
+        bb = canvas.bbox(main)
+        if bb:                    # fit exactly — don't starve the status
+            canvas.configure(width=bb[2] + gh + 1)
+
+    def _wordmark_options(self) -> list:
+        """[(form, canvas width)] for WORDMARK_FORMS, widest first."""
+        font = ui_display(theme.SIZE_WORDMARK, "semibold")
+        gh = max(1, px(1))
+        out = []
+        for form in WORDMARK_FORMS:
+            out.append((form, px(2) + measure(font, form) + gh + 1)
+                       if form else (form, 1))
+        return out
+
+    def _wordmark_reserve(self) -> int:
+        """Header pixels the right-hand cluster claims, at its WIDEST.
+
+        Measured through the widgets themselves so the two chip formulas
+        cannot drift from this budget, and against the widest WORD rather
+        than the current one: a header laid out around READY/SENSING fits
+        'JARVIS' and puts the overlap straight back the moment the pill
+        says LISTENING… or the curfew turns the badge into CAMERA OFF.
+        """
+        pad_s = theme.PAD_S
+        return (StatePill.widest_w(STATE_WORDS.values()) + pad_s
+                + SensingBadge.widest_w() + pad_s
+                + self._gear.winfo_reqwidth() + pad_s
+                + self._min_btn.winfo_reqwidth()
+                + self._close_btn.winfo_reqwidth() + pad_s)
+
+    def _on_header_resize(self, event):
+        self._fit_wordmark(event.width)
+
+    def _fit_wordmark(self, header_w=None):
+        """Show the widest wordmark form that fits beside the cluster.
+
+        Tracked 'J A R V I S' (286 px at S=2) needs a ~1120-px header once
+        the right side is reserved; his saved 920 gets the monogram, the
+        520-unit default window gets 'JARVIS', and nothing overlaps in any
+        state at any width. The wordmark is what yields because it is the
+        only thing in the bar that says nothing — the state pill and the
+        sensing badge both stay whole, and the badge stays where it was
+        deliberately put, beside the state.
+        """
+        try:
+            width = int(header_w if header_w else self._header.winfo_width())
+            if width < 4:
+                return
+            avail = width - self._wordmark_reserve() - theme.PAD
+            options = self._wordmark_options()
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            log.debug("wordmark fit skipped", exc_info=True)
+            return
+        self._draw_wordmark(fit_placeholder(avail, options))
 
     def _draw_header_rule(self, event):
         if self._rule_w == event.width:
@@ -2145,7 +2238,7 @@ class MainWindow:
             self._dev_text = "NONE"
 
     def _read_mem(self) -> str:
-        """Used system RAM from /proc/meminfo → '26.8 GB'."""
+        """Used/total system RAM from /proc/meminfo → '26.8/128 GB'."""
         try:
             info = {}
             with open("/proc/meminfo") as fh:

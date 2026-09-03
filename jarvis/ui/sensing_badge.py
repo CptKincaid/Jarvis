@@ -162,6 +162,25 @@ class SensingBadge(tk.Canvas):
         self.caption = ""
         self._fit()
 
+    @classmethod
+    def widest_w(cls) -> int:
+        """Chip width for the WIDEST of the three words ('CAMERA OFF'), in
+        the current look/scale.
+
+        The header budgets around this rather than the current word: the
+        badge is packed LAST in the header, so when the bar runs out of
+        room the badge is the child Tk pushes back over its neighbour --
+        the 2026-09-02 "the word sensing is underneath the ready symbol".
+        Budgeting for the widest keeps that from coming back at 21:00 when
+        the curfew turns the word into CAMERA OFF.
+        """
+        font = ui_display(theme.SIZE_CAPTION, "semibold")
+        try:
+            text_w = max(measure(font, word) for word in WORDS.values())
+        except Exception:  # noqa: BLE001 - no font metrics without a root
+            text_w = px(7) * max(len(word) for word in WORDS.values())
+        return text_w + 2 * px(cls.PAD_X) + px(cls.DOT) + px(cls.GAP)
+
     def _measure(self, word: str) -> int:
         try:
             return measure(self._font, word)

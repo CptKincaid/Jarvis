@@ -819,6 +819,27 @@ class StatePill(tk.Canvas):
         self._word = None
         self._fit(self._word_text)
 
+    @classmethod
+    def widest_w(cls, words=None) -> int:
+        """Slab width for the WIDEST state word, in the current look/scale.
+
+        The header budgets its wordmark against this and never against the
+        current word: a bar laid out around 'READY' collides the moment
+        the pill says 'LISTENING…', and a wordmark that resized on every
+        state change would flicker on every wake. `words` takes the
+        caller's actual vocabulary -- main_window.STATE_WORDS carries two
+        (WAITING / WORKING) that this class constant does not, and a
+        budget quietly measuring the wrong list is how the collision would
+        come back. Falls back to _measure's estimate with no root.
+        """
+        words = tuple(words or cls.WORDS)
+        font = ui_display(theme.SIZE_LABEL, "semibold")
+        try:
+            text_w = max(measure(font, word) for word in words)
+        except Exception:
+            text_w = px(8) * max(len(word) for word in words)
+        return text_w + 2 * px(cls.PAD_X) + px(cls.DOT) + px(cls.GAP)
+
     def _measure(self, word: str) -> int:
         try:
             return measure(self._font, word)

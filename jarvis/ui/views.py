@@ -250,28 +250,55 @@ def curfew_choice_values(curfew) -> tuple:
 
 
 def fmt_temps_compact(seg: str) -> str:
-    """Compact status-bar value from one temps segment: 'cpu 53° 7%' →
-    '53°' (the load percentage is the first thing to go when the strip is
-    tight), unparsable → '--'."""
+    """Temperature alone from one temps segment: 'cpu 53° 7%' → '53°',
+    unparsable → '--'. NOT what the compact strip level shows any more --
+    see fmt_temps_live."""
     m = _TEMP_RE.search(seg or "")
     return f"{m.group(1)}°" if m else "--"
 
 
+def fmt_temps_live(seg: str) -> str:
+    """Compact status-bar value from one temps segment: 'cpu 53° 7%' →
+    '53° 7%' (the °C and the middot go, the utilisation stays),
+    unparsable → '--'.
+
+    2026-09-02, verbatim: "i dont think the CPU and GPU are updating".
+    They were. The strip elides to level 1 at his 920-px window and level
+    1 used to drop the PERCENTAGE and keep only the temperature -- which
+    on this box moves a degree or two over minutes, so the compact rung
+    read as a dead strip. The utilisation is the number that actually
+    moves, and the one he can act on.
+    """
+    m = _TEMP_RE.search(seg or "")
+    if not m:
+        return "--"
+    temp, pct = m.group(1), m.group(2)
+    return f"{temp}° {pct}%" if pct is not None else f"{temp}°"
+
+
 def telemetry_segments(temps_text: str, mem_text: str, level: int) -> list:
     """The telemetry cluster at an elision `level` as [(label, value)]:
-    level 0 = full ('CPU' '53°C · 7%', 'GPU' '44°C · 0%', 'MEMORY' '47.5 GB'),
-    level 1 = compact ('CPU' '53°', 'GPU' '44°', '' '47.5 GB'), level 2 =
-    minimal ('' '47.5 GB'). Pure; the strip picks the level with
-    plan_telemetry from measured widths."""
+    level 0 = full ('CPU' '53°C · 7%', 'GPU' '44°C · 0%', 'MEM'
+    '47.5/122 GB'), level 1 = compact ('CPU' '53° 7%', 'GPU' '44° 0%', ''
+    '47.5/122 GB'), level 2 = minimal ('' '47.5/122 GB'). Pure; the strip
+    picks the level with plan_telemetry from measured widths.
+
+    The memory VALUE (fmt_mem_gb) carries used/total rather than the label
+    carrying the word MEMORY, because levels 1 and 2 drop the label and a
+    bare '59.9 GB' on a 122 GB box is exactly what he had to ask about.
+    'MEM' rather than 'MEMORY' at level 0 pays for the wider value: the
+    measured level-0 cluster comes to 729 px against the 771 the default
+    window leaves, so every layout that showed the full cluster still does.
+    """
     temps = split_temps(temps_text)
     mem = (mem_text or "").strip() or "--"
     if level <= 0:
         return [("CPU", fmt_temps(temps.get("cpu", ""))),
                 ("GPU", fmt_temps(temps.get("gpu", ""))),
-                ("MEMORY", mem)]
+                ("MEM", mem)]
     if level == 1:
-        return [("CPU", fmt_temps_compact(temps.get("cpu", ""))),
-                ("GPU", fmt_temps_compact(temps.get("gpu", ""))),
+        return [("CPU", fmt_temps_live(temps.get("cpu", ""))),
+                ("GPU", fmt_temps_live(temps.get("gpu", ""))),
                 ("", mem)]
     return [("", mem)]
 
@@ -328,6 +355,36 @@ def fit_placeholder(avail_px: int, options) -> str:
         if w <= avail_px:
             return text
     return options[-1][0]
+
+
+def header_spans(total_w: int, left_ws, right_ws) -> list:
+    """Where a fixed-height bar's children land under Tk's packer (pure).
+
+    `left_ws` / `right_ws` are [(name, width)] in PACKING order, each width
+    including the padx pack gives that child. Tk hands every right-packed
+    child its FULL parcel out of a shrinking cavity and never wraps, so
+    once the cavity is spent the next parcel is handed out to the LEFT of
+    where the cavity began -- on top of a child already sitting there.
+    That is the 2026-09-02 header report ("the word sensing is underneath
+    the ready symbol"): the badge is packed last, so the badge is what
+    lands on its neighbour. Returns [(name, x0, x1)].
+    """
+    spans, x = [], 0
+    for name, w in left_ws or ():
+        spans.append((name, x, x + w))
+        x += w
+    right = total_w
+    for name, w in right_ws or ():
+        right -= w
+        spans.append((name, right, right + w))
+    return spans
+
+
+def spans_collide(spans) -> list:
+    """[(a, b)] for every pair of `header_spans` parcels that overlap."""
+    items = list(spans or ())
+    return [(a[0], b[0]) for i, a in enumerate(items) for b in items[i + 1:]
+            if a[1] < b[2] and b[1] < a[2]]
 
 
 def tracked(text: str) -> str:
@@ -2421,8 +2478,8 @@ class StatusStrip(tk.Frame):
 
     @property
     def telemetry_level(self) -> int:
-        """0 full, 1 compact ('CPU 53° · GPU 44° · 47.5 GB'), 2 minimal
-        ('47.5 GB') — what the last layout chose."""
+        """0 full, 1 compact ('CPU 53° 7% · GPU 44° 0% · 47.5/122 GB'),
+        2 minimal ('47.5/122 GB') — what the last layout chose."""
         return self._level
 
     def _hot_clicked(self, _e):
@@ -2453,7 +2510,7 @@ class StatusStrip(tk.Frame):
         self._set_value("GPU", fmt_temps(segs.get("gpu", "")))
 
     def set_memory(self, text: str):
-        """Used system RAM, e.g. '26.8 GB' ('--' when unknown)."""
+        """Used/total system RAM, e.g. '26.8/128 GB' ('--' when unknown)."""
         self._mem_text = text or ""
         self._set_value("MEMORY", text or "--")
 

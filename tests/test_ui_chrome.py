@@ -132,21 +132,34 @@ def test_classic_plans_with_level_zero_only_so_it_renders_as_today():
 
 
 def test_telemetry_segments_per_level():
-    temps, mem = "cpu 53° 7% · gpu 44° 0%", "47.5 GB"
+    temps, mem = "cpu 53° 7% · gpu 44° 0%", "47.5/122 GB"
     assert telemetry_segments(temps, mem, 0) == [
-        ("CPU", "53°C · 7%"), ("GPU", "44°C · 0%"), ("MEMORY", "47.5 GB")]
+        ("CPU", "53°C · 7%"), ("GPU", "44°C · 0%"), ("MEM", "47.5/122 GB")]
     assert telemetry_segments(temps, mem, 1) == [
-        ("CPU", "53°"), ("GPU", "44°"), ("", "47.5 GB")]
-    assert telemetry_segments(temps, mem, 2) == [("", "47.5 GB")]
-    # the compact line reads 'CPU 53° · GPU 44° · 47.5 GB'
+        ("CPU", "53° 7%"), ("GPU", "44° 0%"), ("", "47.5/122 GB")]
+    assert telemetry_segments(temps, mem, 2) == [("", "47.5/122 GB")]
+    # the compact line reads 'CPU 53° 7% · GPU 44° 0% · 47.5/122 GB'
     assert " · ".join(f"{lab} {val}".strip()
                       for lab, val in telemetry_segments(temps, mem, 1)) \
-        == "CPU 53° · GPU 44° · 47.5 GB"
+        == "CPU 53° 7% · GPU 44° 0% · 47.5/122 GB"
     # unknowns
     assert telemetry_segments("", "", 0) == [("CPU", "--"), ("GPU", "--"),
-                                             ("MEMORY", "--")]
+                                             ("MEM", "--")]
     assert telemetry_segments("gpu 38°", None, 1) == [("CPU", "--"),
                                                       ("GPU", "38°"), ("", "--")]
+
+
+def test_the_compact_level_keeps_the_number_that_actually_moves():
+    """2026-09-02, verbatim: "i dont think the CPU and GPU are updating".
+    They were: the strip elides to level 1 at his 920-px window, and level
+    1 dropped the PERCENTAGE and kept only the temperature -- which on this
+    box drifts a degree or two over minutes. The compact rung reads as a
+    frozen strip because the only fast-moving number had been elided away."""
+    temps = "cpu 53° 7% · gpu 44° 0%"
+    compact = [v for _lab, v in telemetry_segments(temps, "47.5/122 GB", 1)]
+    assert "7%" in compact[0] and "0%" in compact[1]
+    # a temperature-only rung is what it replaces
+    assert compact[0] != fmt_temps_compact("cpu 53° 7%") == "53°"
 
 
 def test_fmt_temps_compact():
@@ -155,6 +168,32 @@ def test_fmt_temps_compact():
     assert fmt_temps_compact("") == "--"
     assert fmt_temps_compact(None) == "--"
     assert StatusStrip.SEGMENTS == ("CPU", "GPU", "MEMORY")
+
+
+# Re-measured 2026-09-02 (same faces, same JARVIS_UI_SCALE 2.0, same
+# 920-px window) for the compact rung that keeps the utilisation and the
+# used/total memory value:
+#   level 0  CPU 53°C · 7% | GPU 44°C · 0% | MEM 47.5/122 GB  = 729
+#   level 1  CPU 53° 7%    | GPU 44° 0%    |     47.5/122 GB  = 577
+#   level 2                                     47.5/122 GB   = 222
+LIVE = [[("CPU", 221), ("GPU", 222), ("MEMORY", 286)],
+        [("CPU", 177), ("GPU", 178), ("MEMORY", 222)],
+        [("MEMORY", 222)]]
+WAKE_END_OFF = 32 + 219 + 16      # PAD + "WAKE WORD OFF" + PAD_S = 267
+
+
+def test_the_livelier_cluster_still_respects_the_width_budget():
+    """What the extra characters cost, against the budget the elision
+    system exists to respect. The percentage and the /total are paid for
+    out of level 1's slack (434 -> 577 px of the 651 free at his window),
+    and level 0 still fits the 520-design-unit DEFAULT window, so no
+    layout that showed the full cluster before loses it."""
+    assert plan_telemetry(920, WAKE_END_OFF, 130, 14, 0, LIVE)[0] == 1
+    assert 920 - sum(w for _n, w in LIVE[1]) - WAKE_END_OFF == 76
+    assert plan_telemetry(1038, WAKE_END_OFF, 130, 14, 0, LIVE)[0] == 0
+    # and the minimum window (460 design units) never falls past level 1
+    assert plan_telemetry(920, WAKE_END_OFF, 130, 14, 0,
+                          levels_for_look(LIVE, "holo"))[0] == 1
 
 
 # --------------------------------------------------------- captions
