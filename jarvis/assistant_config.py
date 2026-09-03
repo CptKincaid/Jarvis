@@ -473,6 +473,9 @@ DEFAULTS: dict = {
     # driver asked for a mode it does not have does not error, it quietly
     # grants a different one, which is why scripts/vision_selfcheck.py reads
     # the granted mode back and prints it.
+    # Measured on /dev/video0 that night: the granted mode is nominally
+    # 30 fps but delivers a frame every 130 ms (p50) -- ~7.5 fps, which is
+    # the real ceiling any preview or detector loop has to live inside.
     #
     # detect_width/height is the size YuNet actually sees. 320x180, not the
     # 320x240 that shipped first, and the reason is aspect, not pixels: a
@@ -566,8 +569,31 @@ DEFAULTS: dict = {
                # person".
                "identity": False, "identity_min": 0.363,
                # One JPEG at 0600, overwritten each time, for diagnosing a
-               # mount. The only path by which a frame reaches the disk.
-               "debug_frame": False},
+               # mount. The only path by which a frame reaches the disk --
+               # and note that the console's camera preview is NOT one:
+               # jarvis/campreview.py never writes a frame anywhere.
+               "debug_frame": False,
+               # The console's camera pane (jarvis/campreview.py,
+               # jarvis/ui/preview.py). His words, 2026-09-02: "lets add a
+               # small camera with visable tracking on the jarvis app but
+               # make me be able to turn if off in settings" -- this is the
+               # settings half, and the Privacy row in the drawer writes it.
+               #
+               # OFF by default, like every other lens key here. A pane that
+               # switched itself on would be this feature introducing itself
+               # by breaking the rule it lives under; and it is gated by
+               # sensing.py on top, so offline mode and the curfew shut it
+               # whatever this says.
+               #
+               # preview_fps is CAPTURE rate, and 6 is deliberately under the
+               # ~7.5 the device delivers. The console animates on 16.67 ms
+               # slot boundaries in the same process (jarvis/ui/reactor.py),
+               # so the capture runs on its own thread and the pane repaints
+               # at twice this rate off a latest-wins slot; asking for 30
+               # here would not produce 30 frames, it would produce a thread
+               # that is always inside a 130 ms blocking read and a curfew
+               # edge that has to wait it out.
+               "preview": False, "preview_fps": 6.0},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.

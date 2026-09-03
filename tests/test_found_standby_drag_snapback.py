@@ -134,6 +134,7 @@ class _Console:
     _move_to = MainWindow._move_to
     _on_console_drift = MainWindow._on_console_drift
     _on_console_mode = MainWindow._on_console_mode
+    _preview_apply = MainWindow._preview_apply
     _pick_geometry = MainWindow._pick_geometry
     _default_geometry = MainWindow._default_geometry
 
@@ -148,6 +149,11 @@ class _Console:
         self.room = SimpleNamespace(set_mode=lambda mode: None)
         self.reactor = object()
         self.transcript = object()
+        # The camera pane, unbuilt -- the same state a console takes before
+        # _build_footer has run, and the path _preview_apply returns from
+        # at once. Nothing on the drag/anchor path touches it.
+        self.preview = None
+        self.preview_worker = None
 
     def _set_footer_hidden(self, hidden):
         """Stubbed, not recorded: the real one pack_forgets two widgets and

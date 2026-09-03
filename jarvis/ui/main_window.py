@@ -71,7 +71,7 @@ import tkinter as tk
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from jarvis import perf
+from jarvis import campreview, perf
 from jarvis.config import CONFIG, MACHINE
 from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            ApprovalRequested, ApprovalResolved, AudioLevel,
@@ -117,6 +117,11 @@ STATE_WORDS = {"idle": "READY", "listening": "LISTENING…",
 WARN_HOLD_S = 4.0            # warn Status: pill dot amber for this long
 ERROR_HOLD_S = 6.0           # error Status: pill ERROR until ok/info or this
 SNOOZE_MIN = 10              # the alarm modal's SNOOZE button
+# assistant.json key the settings drawer's Privacy row writes; the
+# drawer echoes it back through on_config_change so the pane switches
+# at once instead of at the next restart. Imported by name rather than
+# spelled twice -- jarvis/campreview.py owns it.
+CAMERA_PREVIEW_OPTION = campreview.OPTION_ENABLED
 SESSION_PROBE_MS = 20000     # gap between `tmux ls` probes (2 retries)
 SESSION_PROBE_RETRIES = 2
 ATTACH_POLL_MS = 5000        # `tmux list-clients` while a session exists
@@ -364,6 +369,15 @@ class Services:
     # last input at the desk, or None when nothing can see the keyboard.
     room_state: Optional[Callable] = None
     desk_idle_s: Optional[Callable] = None
+    # The camera feed the APP owns (jarvis/camera.CameraFeed), for the
+    # console's preview pane. DECLARED HERE even though nothing wires it
+    # yet, because build_ui_services drops what this dataclass does not
+    # declare -- so an app half that passes it would have it silently
+    # dropped and the preview would build a SECOND feed instead.
+    # SensingPolicy.attach replaces a device by name, so a second feed takes
+    # the curfew away from the first: this field is how the two lanes stay
+    # one lens (jarvis/campreview.resolve_feed).
+    camera_feed: Optional[Any] = None
     # Offline mode (jarvis/sensing.py). The POLICY OBJECT, not a callable:
     # the drawer's curfew pickers set the window through it and the header
     # badge reads state() off the same 5 s pass room_state uses. Optional,
@@ -1080,6 +1094,127 @@ class MainWindow:
         if not self._term_available:
             log.warning("terminal button disabled: tmux or gnome-terminal "
                         "missing")
+        # The camera pane packs LAST of the bottom-side widgets, so it lands
+        # directly above the command bar (Tk stacks side="bottom" children in
+        # pack order, bottom-most first). See jarvis/ui/preview.py for why
+        # that band and not the reactor stage.
+        self._build_preview()
+
+    # -------------------------------------------------------- camera pane
+    def _build_preview(self):
+        """The camera preview band and the capture thread behind it.
+
+        EVERYTHING IT NEEDS WAS ALREADY ON Services: ``sensing`` (the policy
+        object the header badge reads on the 5 s pass) and ``get_option``
+        (the settings drawer's assistant.json reader). So no app-side wiring
+        is added by this feature and it lands whichever way the vision lane
+        merges. When the app does come to own a camera feed it hands it over
+        as ``services.camera_feed`` -- see jarvis/campreview.resolve_feed for
+        why that is a correctness rule (``SensingPolicy.attach`` replaces by
+        name, so a second feed would take the curfew away from the first).
+
+        A camera must not be able to stop the console from being built, so
+        every failure here leaves ``self.preview`` None and the console
+        exactly as it was.
+        """
+        self.preview = None
+        self.preview_worker = None
+        self._preview_shown = False
+        try:
+            # jarvis.ui.preview is imported HERE, not at module scope: it
+            # pulls PIL through jarvis.ui.widgets' font machinery and a
+            # console that failed to import over an optional pane would be a
+            # console that does not start.
+            from jarvis.ui.preview import build_preview, worker_box
+        except Exception:                     # noqa: BLE001 - optional lane
+            log.exception("camera preview unavailable")
+            return
+        try:
+            self.preview_worker = campreview.PreviewWorker(
+                get_option=self._console_option,
+                sensing=getattr(self.services, "sensing", None),
+                services=self.services, box=worker_box())
+        except Exception:                     # noqa: BLE001
+            log.exception("camera preview worker could not be built")
+            self.preview_worker = None
+            return
+        self.preview = build_preview(self.shell, worker=self.preview_worker)
+        if self.preview is None:
+            self.preview_worker = None
+            return
+        self._preview_apply()
+
+    def _preview_enabled(self) -> bool:
+        return bool(self._console_option(CAMERA_PREVIEW_OPTION, False))
+
+    def _preview_apply(self, mode: Optional[str] = None,
+                       enabled: Optional[bool] = None):
+        """Show/hide the band and start/stop the CAPTURE, as one decision.
+
+        They are deliberately not separable. A hidden pane whose thread kept
+        grabbing would be a lit camera serving a screen nobody is looking
+        at, which is the opposite of what a preview toggle is for -- so
+        "not visible" here really does mean "the device is closed".
+        """
+        pane = getattr(self, "preview", None)
+        if pane is None:
+            return
+        from jarvis.ui.preview import pane_visible
+        if mode is None:
+            modes = getattr(self, "modes", None)
+            mode = ACTIVE if modes is None else modes.mode
+        if enabled is None:
+            enabled = self._preview_enabled()
+        want = bool(pane_visible(mode, enabled))
+        worker = self.preview_worker
+        # STOPPING COMES FIRST when it is going away, and it is deliberately
+        # not inside the same try as the repack: the capture is the half that
+        # matters, and a widget that refuses to unpack must not be able to
+        # keep a lens open behind an invisible pane.
+        #
+        # The pane's stop() also RELEASES the frame it is showing, so the
+        # widget is never unmapped still holding the last picture; the
+        # worker's runs with join=False because we are on the Tk thread and
+        # a wedged camera would otherwise freeze the console here (see
+        # campreview.PreviewWorker.stop -- the deny is synchronous either
+        # way, only the device handback moves off this thread).
+        if not want:
+            try:
+                pane.stop()
+            except Exception:                 # noqa: BLE001 - a dead widget
+                log.exception("camera preview repaint could not be stopped")
+            try:
+                if worker is not None:
+                    worker.stop(join=False)
+            except Exception:                 # noqa: BLE001 - provider edge
+                log.exception("camera preview capture could not be stopped")
+        if want != self._preview_shown:
+            self._preview_shown = want
+            try:
+                if want:
+                    # Above the command bar: side="bottom" stacks in pack
+                    # order, and the two footer bars were packed first.
+                    pane.pack(fill="x", side="bottom")
+                else:
+                    pane.pack_forget()
+            except Exception:                 # noqa: BLE001 - a dead widget
+                log.debug("preview repack failed", exc_info=True)
+        if want:
+            # Two tries, not one. They were together and a worker that
+            # refused to start skipped pane.start() -- which is what CLEARS
+            # the pane on its first poll, so the band would be remapped
+            # showing whatever it had last, with no timer left to fix it.
+            # The value he chose is passed to the worker rather than left
+            # for it to re-read: see PreviewWorker.start.
+            try:
+                if worker is not None:
+                    worker.start(enabled=enabled)
+            except Exception:                 # noqa: BLE001 - provider edge
+                log.exception("camera preview capture could not be started")
+            try:
+                pane.start()
+            except Exception:                 # noqa: BLE001 - a dead widget
+                log.exception("camera preview repaint could not be started")
 
     # -------------------------------------------------------- keybindings
     def _bind_keys(self):
@@ -1293,6 +1428,16 @@ class MainWindow:
                 self.desk.stop()
         except Exception:
             log.exception("desk watch stop failed")
+        # The capture thread and the device it holds. Before the geometry
+        # save and before the tray goes: a quit that left a camera open
+        # would be the one leak this whole lane exists to prevent.
+        try:
+            if getattr(self, "preview", None) is not None:
+                self.preview.stop()
+            if getattr(self, "preview_worker", None) is not None:
+                self.preview_worker.stop()
+        except Exception:
+            log.exception("camera preview stop failed")
         if self.board is not None:
             try:
                 self.board.destroy()
@@ -1530,6 +1675,9 @@ class MainWindow:
         except AttributeError:
             log.debug("transcript has no atmosphere loop", exc_info=True)
         self._set_footer_hidden(mode == STANDBY)
+        # The camera pane is an ACTIVE-console widget only, and going quiet
+        # STOPS the capture rather than hiding it (jarvis/ui/preview.py).
+        self._preview_apply(mode)
         if mode == STANDBY:
             if self._standby_origin is None:
                 try:
@@ -2044,6 +2192,19 @@ class MainWindow:
             self._refresh_placeholder()
         elif name == "tts_engine":
             self._tts_text = self._tts_desc(str(value))
+        elif name == CAMERA_PREVIEW_OPTION:
+            # An assistant.json dotted key rather than a CONFIG field: the
+            # drawer's Privacy rows write through services.set_option, and
+            # this callback is already the console's "a setting changed,
+            # react now" seam. The pane has to react at once because the
+            # alternative is a switch that appears to do nothing until the
+            # next restart -- and this one governs a lens.
+            #
+            # The VALUE is used, not re-read. SettingsDrawer._set_option
+            # writes assistant.json on a daemon thread and echoes here
+            # immediately, so a re-read would race the write and could act
+            # on the value he just changed away from.
+            self._preview_apply(enabled=bool(value))
 
     # ------------------------------------------------------------- temps
     def _temps_worker(self):
