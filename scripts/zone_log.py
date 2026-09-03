@@ -38,6 +38,15 @@ The URL comes from ``presence.room_sensor_url`` (or the matching entry in
 ``presence.rooms``) unless ``--url`` overrides it; the bands, the dwell and
 the log path come from the ``zones`` section. A restart of Jarvis is not
 needed for either -- this process reads the config itself.
+
+IT REFUSES RATHER THAN GUESSES. ``jarvis.zones.read_zones`` validates the
+whole ``zones`` section in one pass against a declared shape, and ANY key
+in it that is the wrong shape -- the section, the enabled flag, the dwell,
+a log key, the rooms list, a room entry, a room field, a band entry or a
+band field -- means this exits 2 and names the dotted config path, printing
+nothing but the reason. Only a key that is entirely ABSENT falls back to a
+default, and the built-in office ladder answers for one case only: a config
+with no ``zones.rooms`` key at all.
 """
 from __future__ import annotations
 
@@ -109,32 +118,35 @@ def main(argv=None) -> int:
 
     cfg = AssistantConfig.load()
     room = " ".join(str(args.room).split()).lower()
-    zmap = zn.zone_map_for(cfg, room)
-    refused = zn.rejected_rooms(cfg)
+    # ONE validation pass for the whole zones section, and every value
+    # below comes off it. Asking jarvis.zones one question at a time would
+    # walk the config once per question and print each complaint that many
+    # times.
+    zones = zn.read_zones(cfg)
+    zmap = zones.rooms.get(room)
+    if zmap is None and zones.bridge and room == "office":
+        zmap = zn.ZoneMap.office()
     if zmap is None:
-        # LOUD, and it records nothing. A bad ladder is refused by name
-        # rather than replaced by the built-in one, because a log written
-        # against the bands he thought he had replaced looks like it
-        # worked. See jarvis/zones.py: zone_map_for.
+        # LOUD, and it records nothing. A config that got the zones section
+        # wrong is refused by name rather than replaced by the built-in
+        # ladder, because a log written against the bands he thought he had
+        # replaced looks like it worked. See jarvis/zones.py: read_zones.
         print("no zones for %r -- NOTHING will be recorded." % room,
               file=sys.stderr)
-        for key in (zn.ROOMS_KEY, room):
-            # ROOMS_KEY first: when the rooms list is not a list at all it
-            # is the reason for every other silence on this screen.
-            if key in refused:
-                print("  refused: %s" % refused[key], file=sys.stderr)
-        print("  zones.enabled is %r; usable rooms: %s"
-              % (cfg.get("zones.enabled", True),
-                 ", ".join(sorted(zn.zone_maps(cfg))) or "(none)"),
-              file=sys.stderr)
-        for name in sorted(k for k in refused
-                           if k not in (room, zn.ROOMS_KEY)):
-            print("  also refused: %s -- %s" % (name, refused[name]),
-                  file=sys.stderr)
+        why = zones.why(room)
+        if why and why not in zones.refused.values():
+            # The room-level reason, when it is not already one of the
+            # dotted paths printed below.
+            print("  %s" % why, file=sys.stderr)
+        print("  usable rooms: %s"
+              % (", ".join(sorted(zones.rooms)) or "(none)"), file=sys.stderr)
+        for key in sorted(zones.refused):
+            # Keyed by the dotted config path, because that is the line he
+            # has to go and edit.
+            print("  refused: %s" % zones.refused[key], file=sys.stderr)
         return 2
-    for name in sorted(refused):
-        print("WARNING: %s records nothing: %s" % (name, refused[name]),
-              file=sys.stderr)
+    for key in sorted(zones.refused):
+        print("WARNING: %s" % zones.refused[key], file=sys.stderr)
 
     print("%s -- the ladder:" % room)
     print(zmap.describe())
@@ -162,10 +174,10 @@ def main(argv=None) -> int:
         print("NOTE: radar sensing is DENIED right now (%s); no request will "
               "leave this process until that changes." % sensor.blocked,
               file=sys.stderr)
-    dwell = args.dwell if args.dwell is not None else zn.dwell_s(cfg)
-    log_file = zn.ZoneLog(Path(args.log) if args.log else zn.log_path(cfg),
-                          max_bytes=zn.log_max_bytes(cfg),
-                          keep=zn.log_keep(cfg))
+    dwell = args.dwell if args.dwell is not None else zones.dwell_s
+    log_file = zn.ZoneLog(Path(args.log) if args.log else zones.log_path,
+                          max_bytes=zones.log_max_bytes,
+                          keep=zones.log_keep)
     watcher = zn.ZoneWatcher(room, sensor, zmap, dwell_s=dwell,
                              log_file=log_file)
     if args.dry_run:

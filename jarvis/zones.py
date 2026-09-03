@@ -120,25 +120,30 @@ is that it outlives one. The directory is 0700 and the file 0600. It
 rotates at ``log_max_bytes`` (1 MB) keeping one generation, so 2 MB is the
 hard ceiling.
 
-LINE SIZES, and this is the third statement of them because the first two
-quoted a figure as a maximum that was not one. Two different claims, and
-they are not the same kind of claim:
+LINE SIZES: ONE CLAIM, AND IT IS ENFORCED RATHER THAN MEASURED. Three
+passes of this file quoted a "typical" office line size and a records-per-MB
+figure derived from it, and a verifier failed to reproduce the figure all
+three times. It is DELETED rather than restated a fourth time -- the numbers
+are not repeated here even to disown them -- and what is left is a bound the
+code holds up:
 
-* TYPICAL, measured. Enumerating EVERY old/new pair the office vocabulary
-  can produce (the three bands plus "unplaced", "not in the room", "no
-  opinion" and "at the desk") against no camera opinion, a short label and
-  a label at the 64-character cap, with a plausible clock, dwell and
-  distance, a line on disk is **234 to 346 bytes** including its newline,
-  so 1 MB is about 2,890 transitions -- far more than a day at the dwell
-  above. That is what his office will actually write, and nothing more.
-* THE CEILING, enforced. ``ZoneLog.append`` REFUSES a line over
-  ``MAX_LINE_BYTES`` (640) rather than writing it, so the ceiling does not
-  depend on anyone's enumeration being complete: 1 MB is at least 1,562
-  records whatever the config says, and the file cannot pass
-  ``(keep + 1) * max_bytes``. The widest record the capped fields can
-  actually make measures 542 bytes -- every name at its cap and all three
-  numbers at the widest a float repr goes (24 characters) -- so the
-  backstop has 98 bytes of headroom and is not expected to fire.
+    ``ZoneLog.append`` REFUSES a line over ``MAX_LINE_BYTES`` (640 bytes)
+    rather than writing it, and counts the refusal the way it counts an
+    unwritable disk.
+
+That makes the ceiling arithmetic on two constants instead of a claim
+about how well somebody enumerated the space: a file of ``max_bytes``
+holds at least ``max_bytes // MAX_LINE_BYTES`` records -- 1,562 at the
+1 MB default -- and the whole log cannot pass ``(keep + 1) * max_bytes``,
+2 MB, whatever the config says. The widest record the capped fields can
+actually build is not stated here as a number: it is COMPUTED over the
+whole space by the suite's
+``test_the_widest_record_the_fields_allow_is_computed_not_asserted``, and
+asserted to sit under the limit, so a field added later moves the test's
+answer instead of making this paragraph a lie. What a real office
+day actually writes is NOT MEASURED -- the office radar has been off the
+network throughout (2026-09-03) -- and ``scripts/zone_log.py`` is the
+instrument that would settle it.
 
 The ceiling needs both halves. Room and band names come out of the config
 and are otherwise arbitrary strings, so they are capped
@@ -210,8 +215,10 @@ OFFICE_BANDS: Tuple[Tuple[str, float, float], ...] = (
 )
 
 DEFAULT_DWELL_S = 3.0
-DEFAULT_MAX_BYTES = 1_000_000     # about 2,890 office records, and at
-                                  # least 1,562 of any record at all
+DEFAULT_MAX_BYTES = 1_000_000     # at least DEFAULT_MAX_BYTES //
+                                  # MAX_LINE_BYTES = 1,562 records of ANY
+                                  # shape, which is arithmetic on the two
+                                  # constants and not an estimate
 DEFAULT_KEEP = 1                  # so the ceiling is 2 x DEFAULT_MAX_BYTES
 MAX_LABEL_CHARS = 64              # a NAME. Nothing the lens saw, ever.
 # Room and band names come out of the config and are arbitrary strings, so
@@ -222,13 +229,13 @@ MAX_NAME_CHARS = 64
 MAX_LINE_BYTES = 640              # ENFORCED in ZoneLog.append: a record
                                   # over this is refused, not written, so
                                   # the (keep + 1) * max_bytes ceiling is
-                                  # not a claim about how well I enumerated
-                                  # the space. The widest record the capped
-                                  # fields can make measures 542 B
-                                  # (measured 2026-09-03: every name at its
-                                  # cap, all three numbers at the widest a
-                                  # float repr goes), so this has 98 bytes
-                                  # of headroom. It is also the floor under
+                                  # not a claim about how well anyone
+                                  # enumerated the space. No worst-case
+                                  # record size is quoted here on purpose
+                                  # -- three passes quoted one and got it
+                                  # wrong; the suite COMPUTES it over the
+                                  # whole space instead and asserts it is
+                                  # under this. It is also the floor under
                                   # max_bytes, so a cap can never be set
                                   # below one record.
 
@@ -551,13 +558,17 @@ class ZoneLog:
     -- 2 MB at the defaults. That bound holds because ``max_bytes`` is
     clamped up to ``MAX_LINE_BYTES`` and NO LINE MAY EXCEED IT: names are
     capped in bytes so a record cannot get there through the config, and
-    ``append`` refuses one that does anyway. Office lines measure 234-346
-    bytes, so 1 MB is about 2,890 of them; the widest record the capped
-    fields can make is 542 bytes, so 1 MB is at least 1,562 of anything.
+    ``append`` refuses one that does anyway. So ``max_bytes`` holds at
+    least ``max_bytes // MAX_LINE_BYTES`` records -- 1,562 at the default
+    -- which is arithmetic on two constants rather than an average anyone
+    had to measure.
 
-    Every failure -- an unwritable directory, a full disk, a line past the
-    limit -- is counted and logged, and ``append`` returns False. A logging
-    feature may not take the poll loop down with it.
+    Every failure -- an unwritable directory, a full disk, a path that
+    cannot be opened at all, a line past the limit, a transition carrying a
+    field that is not a number -- is counted and logged, and ``append``
+    returns False. IT NEVER RAISES AT THE CALLER: a logging feature may not
+    take the poll loop down with it, and that includes while it is still
+    building the line.
     """
 
     def __init__(self, path: Optional[os.PathLike | str] = None,
@@ -576,8 +587,27 @@ class ZoneLog:
         self._warned = False
 
     def append(self, transition: Transition) -> bool:
-        line = json.dumps(transition.as_record()) + "\n"
-        blob = line.encode("utf-8")
+        try:
+            # INSIDE the try, which is the whole promise. This was built
+            # above it, so a Transition carrying a field that is not a
+            # number -- as_record calls float() on three of them -- raised
+            # ValueError at the CALLER, i.e. inside the poll loop, which is
+            # exactly what "it never raises at the caller" says it will
+            # not do. The named exceptions are the ones a bad field can
+            # actually produce: float()/round() give ValueError,
+            # TypeError or OverflowError, json.dumps gives TypeError or
+            # ValueError, and an object that is not a Transition at all
+            # gives AttributeError.
+            blob = (json.dumps(transition.as_record()) + "\n").encode("utf-8")
+        except (AttributeError, OverflowError, TypeError, ValueError) as exc:
+            self.failures += 1
+            if not self._warned:
+                log.warning("zones: a transition could not be turned into a "
+                            "record (%s); it was NOT recorded", exc)
+                self._warned = True
+            else:
+                log.debug("zones: unrecordable transition", exc_info=True)
+            return False
         if len(blob) > MAX_LINE_BYTES:
             # THE CEILING IS ENFORCED, NOT ENUMERATED. Every name is capped
             # so this cannot be reached through the config; it is the
@@ -603,11 +633,16 @@ class ZoneLog:
                 os.write(fd, blob)
             finally:
                 os.close(fd)
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            # ValueError as well as OSError: a path carrying a null byte
+            # makes os.stat and os.open raise ValueError, and that one is
+            # reachable straight from zones.log_path -- so catching only
+            # OSError here let a config value take the poll loop down,
+            # which is the one thing this class promises it will not do.
             self.failures += 1
             if not self._warned:
-                log.warning("zones: %s is not writable (%s); transitions are "
-                            "not being recorded", self.path, exc)
+                log.warning("zones: %s cannot be written (%s); transitions "
+                            "are not being recorded", self.path, exc)
                 self._warned = True
             else:
                 log.debug("zones: append to %s failed", self.path, exc_info=True)
@@ -807,12 +842,228 @@ class ZoneWatcher:
 
 
 # ----------------------------------------------------------------- config
-# "the config has no such key AT ALL", which is not the same answer as
-# "the key is there and it is null". For a number or a path the two can be
-# folded together; for zones.rooms they must not be, because one of them
-# is a config that stayed silent and the other is a config that tried to
-# say something and got it wrong.
-_MISSING = object()
+# ONE VALIDATOR FOR THE WHOLE SECTION, and nothing reads a zones value
+# around it.
+#
+# Three passes of this module fixed one level and left the level above it
+# open: a malformed BAND list fell back to the built-in ladder, then a
+# ``zones.rooms`` of the wrong SHAPE fell back, then a ``zones`` KEY of the
+# wrong shape fell back -- and ``zones.enabled`` was read with ``bool()``,
+# so "false", "no", "off", "0" and null all left recording switched ON.
+# Every one of those was the same disease treated one level at a time.
+#
+# THE RULE, and it has no exceptions and no special levels:
+#
+#     A config that TRIES to say something about zones and gets it wrong is
+#     REFUSED BY NAME and records nothing. Only a key that is entirely
+#     ABSENT falls back to a default.
+#
+# So the shape of the whole section is DECLARED below as data
+# (``SECTION_SHAPE``, ``ROOM_SHAPE``, ``BAND_SHAPE``), one walker
+# (``_Shape``) checks every level against it, and ``read_zones`` is the
+# only door: ``dwell_s``, ``log_path``, ``log_max_bytes``, ``log_keep``,
+# ``zone_maps``, ``rejected_rooms`` and ``zone_map_for`` are all views over
+# its result. A level added to the declaration without a check is
+# impossible -- the declaration IS the check -- and
+# ``tests/test_zones.py`` walks the same declaration as a cross product of
+# every level against every wrong shape, so a level added to the config and
+# not to the declaration fails the suite instead of shipping.
+#
+# WHAT REFUSING COSTS. A refusal ABOVE the room level (the section itself,
+# ``enabled``, ``dwell_s``, the log keys, or a ``rooms`` that is not a
+# list) poisons everything: there are no entries to salvage and no defaults
+# it would be honest to use, so every room records nothing. A refusal
+# INSIDE one room entry costs that room and no other, exactly as one bad
+# room does in ``roomfabric.room_specs``.
+#
+# SHAPE IS MOST OF IT AND NOT ALL OF IT. The tables answer "is this the
+# right KIND of thing"; two values pass that and are still unusable, and
+# both are refused by name at the same level as any other wrong value: a
+# ``log_path`` that is text and cannot become a path ("~nobody/x", or one
+# carrying a null byte -- ``read_zones``), and a band list whose geometry
+# does not describe a ladder (``ZoneMap`` raises, ``_read_rooms`` catches).
+#
+# WHAT IT DOES NOT DO, declared rather than overlooked: a key the tables
+# below do not name is left alone. A config written by a LATER Jarvis must
+# not be refused wholesale by an earlier one, so an unknown key is not an
+# error here -- only a declared key of the wrong shape is.
+_MISSING = object()      # the key is not in the config at all
+_REQUIRED = object()     # ... and there is no default for it, so that is fatal
+
+SECTION_KEY = "zones"
+ROOMS_KEY = "zones.rooms"
+
+
+def _is_number(value) -> bool:
+    """A number this module can actually use as a distance or a size.
+
+    Three ways a "number" is not one. ``bool`` is an ``int`` in Python and
+    ``"near_m": true`` is not a distance. NaN and inf survive ``float()``
+    and then poison every comparison that places a body in a band. And an
+    integer big enough -- ``10 ** 400`` in a hand-edited file -- makes
+    ``float()`` itself raise OverflowError, which is how this check
+    escaped as an exception at the caller in its first draft.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (OverflowError, ValueError):
+        return False
+
+
+# The vocabulary of shapes, spelled the way the refusal will read.
+SHAPES: Dict[str, Callable[[Any], bool]] = {
+    "a mapping": lambda v: isinstance(v, dict),
+    "a list": lambda v: isinstance(v, (list, tuple)),
+    "true or false": lambda v: isinstance(v, bool),
+    "a number": _is_number,
+    "text": lambda v: isinstance(v, str),
+}
+
+# (key, shape, default). ``_REQUIRED`` means there is no sane default, so
+# the key being absent is itself a refusal; ``_MISSING`` as a default means
+# "absent is a real answer the caller handles" -- true of ``rooms`` alone,
+# where absence is the one surviving bridge to the built-in ladder.
+SECTION_SHAPE = (
+    ("enabled", "true or false", True),
+    ("dwell_s", "a number", DEFAULT_DWELL_S),
+    ("log_path", "text", ""),
+    ("log_max_bytes", "a number", DEFAULT_MAX_BYTES),
+    ("log_keep", "a number", DEFAULT_KEEP),
+    ("rooms", "a list", _MISSING),
+)
+ROOM_SHAPE = (
+    ("name", "text", _REQUIRED),
+    ("enabled", "true or false", True),
+    ("camera_zone", "text", DEFAULT_CAMERA_ZONE),
+    ("bands", "a list", _REQUIRED),
+)
+BAND_SHAPE = (
+    ("name", "text", _REQUIRED),
+    ("near_m", "a number", _REQUIRED),
+    ("far_m", "a number", _REQUIRED),
+)
+
+
+def _kind(value) -> str:
+    """What the config actually put there, in the words ``SHAPES`` uses."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true or false"
+    if isinstance(value, float) and not math.isfinite(value):
+        return "%r, which is not a finite number" % value
+    if isinstance(value, int) and not _is_number(value):
+        return "a whole number too large to use"
+    for want, ok in SHAPES.items():
+        if ok(value):
+            return want
+    return "a %s" % type(value).__name__
+
+
+class _Shape:
+    """The walker. Checks one value against one declared shape and files
+    the failure under the DOTTED CONFIG PATH, which is the thing he has to
+    go and edit.
+
+    It never raises and never returns a substitute: a value that fails is
+    absent from the result and present in ``refused``, and the caller
+    decides how far up that reaches.
+    """
+
+    def __init__(self):
+        self.refused: Dict[str, str] = {}
+
+    def refuse(self, path: str, why: str, *, deliberate: bool = False) -> bool:
+        # setdefault: the FIRST reason is the one to fix, and a later,
+        # vaguer complaint about the same key must not overwrite it.
+        #
+        # ``deliberate`` is the one refusal that is not a mistake: a room
+        # switched off in its own entry. It still records nothing and is
+        # still named, but telling him to go and fix a switch he set on
+        # purpose -- at ERROR, every poll -- would be wrong.
+        if path not in self.refused:
+            self.refused[path] = "%s %s" % (path, why)
+            if deliberate:
+                log.info("zones: %s, so it records nothing", self.refused[path])
+            else:
+                log.error("zones: %s -- it records nothing until that is "
+                          "fixed; it is NOT falling back to the built-in "
+                          "ladder", self.refused[path])
+        return False
+
+    def value(self, path: str, raw, want: str) -> Tuple[Any, bool]:
+        """One value that is not read out of a mapping: the section, a room
+        entry, a band entry."""
+        if SHAPES[want](raw):
+            return raw, True
+        return None, self.refuse(path, "is %s; %s was expected"
+                                 % (_kind(raw), want))
+
+    def field(self, holder: dict, path: str, key: str, want: str,
+              default) -> Tuple[Any, bool]:
+        raw = holder.get(key, _MISSING)
+        where = "%s.%s" % (path, key)
+        if raw is _MISSING:
+            if default is _REQUIRED:
+                return None, self.refuse(where, "is missing")
+            return default, True       # ABSENT is the only silence there is
+        return self.value(where, raw, want)
+
+    def block(self, holder: dict, path: str, shape) -> Tuple[dict, bool]:
+        """Every declared field of one mapping.
+
+        It does not stop at the first bad field: one run of the instrument
+        should name everything that is wrong, not send him back round the
+        loop for the next one.
+        """
+        out, ok = {}, True
+        for key, want, default in shape:
+            out[key], good = self.field(holder, path, key, want, default)
+            ok = good and ok
+        return out, ok
+
+
+@dataclass(frozen=True)
+class ZonesConfig:
+    """The whole ``zones`` section after one validation pass.
+
+    ``refused`` is keyed by DOTTED CONFIG PATH and is the canonical answer;
+    ``room_refusals`` is the same set of messages keyed by the room they
+    cost, for the rooms whose name could be read at all. Both are built in
+    the one walk, so they cannot drift apart.
+    """
+    enabled: bool
+    dwell_s: float
+    log_path: Path
+    log_max_bytes: int
+    log_keep: int
+    rooms: Dict[str, ZoneMap]
+    refused: Dict[str, str]
+    room_refusals: Dict[str, str]
+    bridge: bool                    # zones.rooms was ABSENT: the built-in
+    poisoned: bool                  # a refusal ABOVE the room level
+
+    def why(self, room: str) -> str:
+        """Why ``room`` records nothing, or "" when it does record.
+
+        The section-level reason wins, because when the section is poisoned
+        that is the only thing worth telling him -- a per-room complaint
+        underneath it would send him to the wrong line of the file.
+        """
+        if self.poisoned:
+            return sorted(self.refused.values())[0] if self.refused else ""
+        if not self.enabled:
+            return "%s.enabled is false; nothing is recorded" % SECTION_KEY
+        key = _room_key(room)
+        if key in self.rooms:
+            return ""
+        if key in self.room_refusals:
+            return self.room_refusals[key]
+        if not self.bridge:
+            return "%r is not in %s" % (key, ROOMS_KEY)
+        return ""          # no rooms key at all: zone_map_for owns the bridge
 
 
 def _cfg_raw(cfg, key: str):
@@ -820,7 +1071,11 @@ def _cfg_raw(cfg, key: str):
 
     ``AssistantConfig.get`` returns its default only for a key that is not
     there, and the value -- None included -- for a key that is, so passing
-    a sentinel as the default is what tells the two apart.
+    a sentinel as the default is what tells the two apart. Every other
+    dotted read of a zones key has been deleted: this is the only one, and
+    it asks for the SECTION, so a ``zones`` that is a string or a number
+    cannot hide behind a dotted lookup that quietly answers "absent" for
+    every key under it.
     """
     get = getattr(cfg, "get", None)
     if not callable(get):
@@ -832,188 +1087,246 @@ def _cfg_raw(cfg, key: str):
         return _MISSING
 
 
-def _cfg_get(cfg, key: str, default=None):
-    """The value at ``key``, with a missing key AND a null both taken as
-    ``default``. Right for a dwell or a path; see ``read_rooms`` for the
-    one key where it is not."""
-    value = _cfg_raw(cfg, key)
-    return default if value is _MISSING or value is None else value
-
-
-def dwell_s(cfg) -> float:
-    try:
-        return max(0.0, float(_cfg_get(cfg, "zones.dwell_s", DEFAULT_DWELL_S)))
-    except (TypeError, ValueError):
-        return DEFAULT_DWELL_S
-
-
-def log_max_bytes(cfg) -> int:
-    try:
-        return max(MAX_LINE_BYTES,
-                   int(_cfg_get(cfg, "zones.log_max_bytes", DEFAULT_MAX_BYTES)))
-    except (TypeError, ValueError):
-        return DEFAULT_MAX_BYTES
-
-
-def log_keep(cfg) -> int:
-    """1 to keep one rotated generation (the default), 0 to discard it."""
-    try:
-        return 1 if int(_cfg_get(cfg, "zones.log_keep", DEFAULT_KEEP)) else 0
-    except (TypeError, ValueError):
-        return DEFAULT_KEEP
-
-
-def log_path(cfg) -> Path:
-    text = str(_cfg_get(cfg, "zones.log_path", "") or "").strip()
-    return Path(text).expanduser() if text else default_log_path()
-
-
 def _room_key(name: Any) -> str:
     """A room's lookup name: collapsed, lower-cased and capped.
 
-    The same function builds the key in ``read_rooms`` and looks it up in
+    The same function builds the key in ``read_zones`` and looks it up in
     ``zone_map_for``, so the two cannot disagree about what counts as the
     same room. Lower-cased BEFORE the cap, not after, so that the key is
-    exactly ``_short`` of the lower-cased name and the clash check below
-    is looking at the same string the lookup will.
+    exactly ``_short`` of the lower-cased name and the clash check below is
+    looking at the same string the lookup will.
     """
     return _short(_flat(name).lower())
-
-
-ROOMS_KEY = "zones.rooms"
-
-
-def _rooms_raw(cfg):
-    """``zones.rooms`` exactly as the config holds it, or ``_MISSING``.
-
-    Three outcomes, and the middle one is the whole point:
-
-    * ``_MISSING`` -- the config predates this section. That, and only
-      that, gets the built-in office ladder;
-    * a list or tuple -- the config is the authority for every room in it;
-    * ANYTHING ELSE -- a dict, a string, a number, an explicit null. The
-      config tried to say something about rooms and got it wrong, which is
-      not silence, so it is refused by name and nothing is recorded.
-
-    The first repair returned None for every non-list, which folded the
-    third case into the first: dropping the ``[ ]`` around his one room --
-    the commonest slip there is in that file -- silently reinstated the
-    shipped ladder, and ``AssistantConfig._deep_merge`` replaces on a type
-    mismatch, so the dict really does win over the DEFAULTS list.
-    """
-    return _cfg_raw(cfg, ROOMS_KEY)
-
-
-def _rooms_shape_error(raw) -> str:
-    """Why a ``zones.rooms`` that is not a list records nothing."""
-    kind = type(raw).__name__
-    shape = ("null" if raw is None
-             else "%s %s" % ("an" if kind[:1] in "aeiou" else "a", kind))
-    return ("%s is %s, not a list of room entries; every room records "
-            "nothing until that is fixed -- it is NOT falling back to the "
-            "built-in ladder" % (ROOMS_KEY, shape))
 
 
 def _cap_clash(flats) -> str:
     """The complaint for two names that DIFFER but become one once capped.
 
-    ``MAX_NAME_CHARS`` can turn two distinct config names into a single
-    one, and the duplicate check downstream would then refuse the room for
-    a repetition the user never wrote -- sending him looking for a second
+    ``_short`` can turn two distinct config names into a single one, and
+    the duplicate check downstream would then refuse the room for a
+    repetition the user never wrote -- sending him looking for a second
     entry that is not in his file. Refusing is still right; the reason has
-    to be the true one. Empty string when there is no such pair.
+    to be the true one.
+
+    It has to say what ACTUALLY happened, which is why the length is
+    computed and not quoted: ``_short`` cuts at ``MAX_NAME_CHARS``
+    characters AND at ``MAX_NAME_CHARS`` escaped bytes, so two names in
+    CJK collide after ten characters, not sixty-four. The previous message
+    said "share their first 64 characters" whatever the alphabet, which was
+    simply untrue for his non-ASCII case.
 
     ``flats`` are whitespace-collapsed and, for room names, lower-cased
     already, so a name that differs only in case is a real duplicate here
-    and not a clash.
+    and not a clash. Empty string when there is no such pair.
     """
     seen: Dict[str, str] = {}
     for flat in flats:
         key = _short(flat)
         if seen.setdefault(key, flat) != flat:
-            return ("two names share their first %d characters (%r), so "
-                    "they become one name" % (MAX_NAME_CHARS, key))
+            return ("two names are the same once each is cut to fit one "
+                    "record: both become %r, which is %d characters and %d "
+                    "escaped bytes, and a name is cut at %d of each -- they "
+                    "differ only past that"
+                    % (key, len(key), _json_cost(key), MAX_NAME_CHARS))
     return ""
 
 
-def read_rooms(cfg) -> Tuple[Dict[str, ZoneMap], Dict[str, str]]:
-    """``(the usable ladders, the rooms this REFUSES to record and why)``.
+def _read_bands(shape: _Shape, raw, where: str) -> Optional[Tuple[Band, ...]]:
+    """Every band of one room, or None when the room records nothing."""
+    if not raw:
+        shape.refuse(where, "is empty; a room with no bands has no ladder")
+        return None
+    out, ok = [], True
+    flats = []
+    for j, entry in enumerate(raw):
+        at = "%s[%d]" % (where, j)
+        band, good = shape.value(at, entry, "a mapping")
+        if not good:
+            ok = False
+            continue
+        fields, good = shape.block(band, at, BAND_SHAPE)
+        if not good:
+            ok = False
+            continue
+        flats.append(_flat(fields["name"]))
+        out.append((at, fields))
+    if not ok:
+        return None
+    clash = _cap_clash(flats)
+    if clash:
+        shape.refuse(where, "cannot be used: %s" % clash)
+        return None
+    return tuple(Band(f["name"], float(f["near_m"]), float(f["far_m"]))
+                 for _, f in out)
 
-    A broken entry is not quietly dropped. It is named, with the config key
-    that is wrong, so ``zone_map_for`` can refuse that room outright rather
-    than hand back a built-in ladder -- because a record written against
-    the bands he THOUGHT he had replaced is worse than no record at all: it
-    looks like it worked. Refusing costs him one room, and the log he then
-    reads is the log of the ladder he wrote.
 
-    One bad room still does not take the others down, exactly as in
-    ``roomfabric.room_specs``: it only takes itself. The one exception is
-    a ``zones.rooms`` that is not a list at all -- there are no entries to
-    salvage, so the refusal is filed under ``ROOMS_KEY`` and covers every
-    room.
+def _read_rooms(shape: _Shape, raw) -> Tuple[Dict[str, ZoneMap],
+                                             Dict[str, str]]:
+    """The usable ladders and the per-room refusals, in config order.
+
+    One bad room takes itself and nothing else, exactly as in
+    ``roomfabric.room_specs``.
     """
     maps: Dict[str, ZoneMap] = {}
-    refused: Dict[str, str] = {}
-    if not bool(_cfg_get(cfg, "zones.enabled", True)):
-        return maps, refused
-    raw = _rooms_raw(cfg)
-    if raw is _MISSING:
-        return maps, refused                 # the bridge; zone_map_for owns it
-    if not isinstance(raw, (list, tuple)):
-        refused[ROOMS_KEY] = _rooms_shape_error(raw)
-        log.error("zones: %s", refused[ROOMS_KEY])
-        return maps, refused
-    full: Dict[str, str] = {}                # key -> the name uncapped
+    room_refusals: Dict[str, str] = {}
+    full: Dict[str, str] = {}        # room key -> the name before capping
+    first: Dict[str, str] = {}       # room key -> the path that claimed it
+
+    def refuse(key: str, path: str, why: str,
+               deliberate: bool = False) -> None:
+        shape.refuse(path, why, deliberate=deliberate)
+        if key:
+            room_refusals.setdefault(key, shape.refused[path])
+
+    def under(path: str) -> str:
+        """The first refusal filed at or below ``path``. Never empty at the
+        call sites below -- they are only reached after one was filed --
+        but written so that a future one cannot IndexError on the log."""
+        found = sorted(v for k, v in shape.refused.items()
+                       if k == path or k.startswith(path + ".")
+                       or k.startswith(path + "["))
+        return found[0] if found else "%s is unusable" % path
+
     for i, entry in enumerate(raw):
         where = "%s[%d]" % (ROOMS_KEY, i)
-        if not isinstance(entry, dict):
-            refused[where] = "%s is not a room entry" % where
-            log.warning("zones: %s is not a room entry; it records nothing",
-                        where)
+        room, ok = shape.value(where, entry, "a mapping")
+        if not ok:
             continue
-        flat = _flat(entry.get("name")).lower()
-        name = _room_key(entry.get("name"))
+        fields, ok = shape.block(room, where, ROOM_SHAPE)
+        flat = _flat(fields["name"] or "").lower()
+        name = _short(flat)
+        if not ok:
+            # The name may itself have been the wrong shape, in which case
+            # there is no room key to file this under and the dotted path
+            # in ``shape.refused`` is the whole answer.
+            if name:
+                room_refusals.setdefault(name, under(where))
+            continue
         if not name:
-            refused[where] = "%s.name is empty" % where
-            log.warning("zones: %s has no name; it records nothing", where)
+            refuse("", "%s.name" % where, "is empty")
             continue
-        if name in maps or name in refused:
+        if name in maps or name in room_refusals:
             # Two ladders both claiming one room have no defensible answer,
-            # so neither is used and the room is named as refused. Which of
-            # the two it is matters: a name he wrote once and a name the
-            # cap folded into another send him looking for different
-            # things.
+            # so NEITHER is used. Which of the two it is matters: a name he
+            # wrote twice and a name the cap folded into another send him
+            # looking for different things.
             maps.pop(name, None)
             clash = _cap_clash([full.get(name, flat), flat])
-            refused[name] = (("%s: %s" % (ROOMS_KEY, clash)) if clash else
-                             ("%s names %r twice; two ladders cannot both be "
-                              "the room" % (ROOMS_KEY, name)))
-            log.warning("zones: %r records nothing: %s", name, refused[name])
+            refuse(name, where,
+                   ("and %s cannot both be the room: %s"
+                    % (first.get(name, ROOMS_KEY), clash)) if clash else
+                   ("names %r again -- %s already does, and two ladders "
+                    "cannot both be the room"
+                    % (name, first.get(name, ROOMS_KEY))))
             continue
-        full[name] = flat
-        if not bool(entry.get("enabled", True)):
-            refused[name] = "%s.enabled is false" % where
-            log.info("zones: %r is switched off at %s.enabled; it records "
-                     "nothing", name, where)
+        full[name], first[name] = flat, where
+        if not fields["enabled"]:
+            refuse(name, "%s.enabled" % where,
+                   "is false, so the room is switched off", deliberate=True)
+            continue
+        bands = _read_bands(shape, fields["bands"], "%s.bands" % where)
+        if bands is None:
+            room_refusals.setdefault(name, under("%s.bands" % where))
             continue
         try:
-            raw_bands = list(entry.get("bands") or [])
-            clash = _cap_clash(_flat(b.get("name")) for b in raw_bands
-                               if isinstance(b, dict))
-            if clash:
-                raise ValueError(clash)
-            bands = tuple(Band(str(b["name"]), float(b["near_m"]),
-                               float(b["far_m"]))
-                          for b in raw_bands)
-            maps[name] = ZoneMap(name, bands,
-                                 str(entry.get("camera_zone") or
-                                     DEFAULT_CAMERA_ZONE))
-        except (KeyError, TypeError, ValueError) as exc:
-            refused[name] = "%s.bands is unusable (%s)" % (where, exc)
-            log.warning("zones: %s.bands is unusable (%s); %r records nothing "
-                        "until that is fixed -- it is NOT falling back to the "
-                        "built-in ladder", where, exc, name)
-    return maps, refused
+            maps[name] = ZoneMap(name, bands, fields["camera_zone"])
+        except ValueError as exc:
+            # The geometry, not the shape: overlapping bands, a band that
+            # ends before it starts, one name used twice. Shape is the
+            # table's job and this is the only thing left.
+            refuse(name, "%s.bands" % where, "does not describe a ladder (%s)"
+                   % exc)
+    return maps, room_refusals
+
+
+def read_zones(cfg) -> ZonesConfig:
+    """THE validator. Walk the whole declared shape of ``zones`` once.
+
+    Everything else in this module that wants a zones value asks this and
+    nothing else, so there is no path by which a value reaches the log
+    without having been checked.
+    """
+    shape = _Shape()
+    raw = _cfg_raw(cfg, SECTION_KEY)
+    if raw is _MISSING:
+        # The config predates this section entirely. That, and only that,
+        # is silence, and silence is the one thing the built-in office
+        # ladder may still answer.
+        return ZonesConfig(True, DEFAULT_DWELL_S, default_log_path(),
+                           DEFAULT_MAX_BYTES, DEFAULT_KEEP, {}, {}, {},
+                           bridge=True, poisoned=False)
+
+    def nothing() -> ZonesConfig:
+        """A section that got itself wrong above the room level. No value
+        out of it is trustworthy, so none is used and nothing records."""
+        return ZonesConfig(False, DEFAULT_DWELL_S, default_log_path(),
+                           DEFAULT_MAX_BYTES, DEFAULT_KEEP, {},
+                           dict(shape.refused), {}, bridge=False,
+                           poisoned=True)
+
+    section, ok = shape.value(SECTION_KEY, raw, "a mapping")
+    if not ok:
+        return nothing()
+    values, ok = shape.block(section, SECTION_KEY, SECTION_SHAPE)
+    if not ok:
+        return nothing()
+
+    rooms_raw = values["rooms"]
+    bridge = rooms_raw is _MISSING
+    maps: Dict[str, ZoneMap] = {}
+    room_refusals: Dict[str, str] = {}
+    if values["enabled"] and not bridge:
+        maps, room_refusals = _read_rooms(shape, rooms_raw)
+    if not values["enabled"]:
+        # The master switch. Off is an ANSWER, not a refusal: there is
+        # nothing to go and fix, so nothing is named -- but a built-in
+        # ladder that answered underneath it would not be a switch, so the
+        # bridge is closed here too.
+        bridge = False
+    text = values["log_path"].strip()
+    try:
+        if "\0" in text:
+            # A null byte makes os.open raise ValueError rather than
+            # OSError, so it would have walked past ZoneLog's handler too.
+            raise ValueError("it contains a null byte")
+        chosen = Path(text).expanduser() if text else default_log_path()
+    except (RuntimeError, ValueError) as exc:
+        # THE SAME RULE, ONE LEVEL DOWN FROM SHAPE. "~nosuchuser/zones.jsonl"
+        # is text, so the table passes it, and then expanduser RAISES
+        # RuntimeError -- which took the exception out through read_zones to
+        # the caller instead of refusing the key. Shape is not the only way a
+        # value can be wrong, and a wrong value is refused BY NAME at every
+        # level including this one.
+        shape.refuse("%s.log_path" % SECTION_KEY,
+                     "is text but cannot be used as a path (%s)" % exc)
+        return nothing()
+    return ZonesConfig(
+        enabled=values["enabled"],
+        dwell_s=max(0.0, float(values["dwell_s"])),
+        log_path=chosen,
+        log_max_bytes=max(MAX_LINE_BYTES, int(values["log_max_bytes"])),
+        log_keep=1 if values["log_keep"] else 0,
+        rooms=maps, refused=dict(shape.refused), room_refusals=room_refusals,
+        bridge=bridge, poisoned=False)
+
+
+# The views. Each one is ``read_zones`` and a field: there is deliberately
+# no second way to read any of these keys.
+def dwell_s(cfg) -> float:
+    return read_zones(cfg).dwell_s
+
+
+def log_max_bytes(cfg) -> int:
+    return read_zones(cfg).log_max_bytes
+
+
+def log_keep(cfg) -> int:
+    """1 to keep one rotated generation (the default), 0 to discard it."""
+    return read_zones(cfg).log_keep
+
+
+def log_path(cfg) -> Path:
+    return read_zones(cfg).log_path
 
 
 def zone_maps(cfg) -> Dict[str, ZoneMap]:
@@ -1022,75 +1335,77 @@ def zone_maps(cfg) -> Dict[str, ZoneMap]:
     A room the config names but this module refuses is absent from here and
     present in ``rejected_rooms``; the two together are the whole picture.
     """
-    return read_rooms(cfg)[0]
+    return read_zones(cfg).rooms
 
 
 def rejected_rooms(cfg) -> Dict[str, str]:
-    """The rooms the config names that will record NOTHING, and the key
-    that is wrong. Empty is the healthy answer, and anything in here is
-    worth printing at the top of a run."""
-    return read_rooms(cfg)[1]
+    """Everything in the ``zones`` section that will record NOTHING, keyed
+    by the DOTTED CONFIG PATH that is wrong -- which is the line he has to
+    go and edit.
+
+    Empty is the healthy answer, and anything in here is worth printing at
+    the top of a run. A room whose entry could be read far enough to know
+    its name also appears in ``read_zones(cfg).room_refusals`` under that
+    name; the path is the canonical key because a room whose NAME is the
+    broken thing has no other.
+    """
+    return read_zones(cfg).refused
 
 
 def zone_map_for(cfg, room: str) -> Optional[ZoneMap]:
     """The ladder for ONE room, or None -- and None means RECORD NOTHING.
 
-    Five different Nones, every one of them deliberate:
+    Every way to get None, and every one of them deliberate:
 
+    * anything in the section is the wrong shape -- ``zones`` itself,
+      ``enabled``, ``dwell_s``, a log key, ``rooms``, a room entry, a room
+      field, a band entry or a band field. The config TRIED to say
+      something about zones and got it wrong, and a wrong answer is refused
+      rather than overruled;
+    * ``log_path`` is text and still cannot be a path -- a home directory
+      that does not exist, a null byte. Shape is not the only way to be
+      wrong, and this level is not exempt either;
     * ``zones.enabled`` is false -- the master switch, and an off switch a
       built-in default could walk around would not be one;
-    * ``zones.rooms`` is there but is not a list -- an unwrapped room
-      object, a map keyed by name, a string, a number, an explicit null.
-      The config TRIED to say something about rooms and got it wrong;
     * the room's own entry says ``enabled: false``;
-    * the room's entry is malformed or duplicated -- it is REFUSED BY NAME,
-      never replaced by the shipped ladder. A typo in his band list must
-      not leave the log being written against the old bands and looking
-      like it worked;
+    * the room's entry is duplicated, or its geometry does not describe a
+      ladder -- it is REFUSED BY NAME, never replaced by the shipped one. A
+      typo in his band list must not leave the log being written against
+      the old bands and looking like it worked;
     * the config HAS a ``zones.rooms`` list and this room is not in it.
 
     The single fallback left is a config written BEFORE this section
-    existed: NO ``zones.rooms`` KEY AT ALL still gets the built-in office
-    ladder, the same way roomfabric falls back to the singular
-    ``presence.room_sensor_*`` keys. Absence is the only silence; every
-    other shape is an answer, and a wrong answer is refused rather than
-    overruled. Note that ``AssistantConfig`` serves the ``zones`` block out
-    of DEFAULTS, so in the running app that bridge is never the path taken
-    -- the office ladder always arrives through the config, which is
-    exactly why an edit to it has to be refused loudly rather than
+    existed: NO ``zones`` SECTION AT ALL, or a section with no ``rooms``
+    key, still gets the built-in office ladder, the same way roomfabric
+    falls back to the singular ``presence.room_sensor_*`` keys. Absence is
+    the only silence. Note that ``AssistantConfig`` serves the ``zones``
+    block out of DEFAULTS, so in the running app that bridge is never the
+    path taken -- the office ladder always arrives through the config,
+    which is exactly why an edit to it has to be refused loudly rather than
     replaced.
     """
-    if not bool(_cfg_get(cfg, "zones.enabled", True)):
-        return None
+    zones = read_zones(cfg)
     name = _room_key(room)
-    raw = _rooms_raw(cfg)
-    if raw is not _MISSING and not isinstance(raw, (list, tuple)):
-        # Checked here and not through ``refused`` so that a room actually
-        # NAMED "zones.rooms" cannot be mistaken for this.
-        log.error("zones: %r records nothing: %s", name,
-                  _rooms_shape_error(raw))
-        return None
-    maps, refused = read_rooms(cfg)
-    got = maps.get(name)
+    got = zones.rooms.get(name)
     if got is not None:
         return got
-    why = refused.get(name)
-    if why is not None:
+    why = zones.why(name)
+    if why:
         log.error("zones: %r records nothing: %s", name, why)
         return None
-    if raw is not _MISSING:
-        log.warning("zones: %r is not in %s; it records nothing", name,
-                    ROOMS_KEY)
-        return None
-    return ZoneMap.office() if name == "office" else None
+    if zones.bridge and name == "office":
+        return ZoneMap.office()
+    log.warning("zones: there is no ladder for %r; it records nothing", name)
+    return None
 
 
-__all__ = ["ABSENT", "BLIND_M", "Band", "CameraOpinion", "DEFAULT_DWELL_S",
-           "GATE_M", "MAX_LABEL_CHARS", "MAX_LINE_BYTES", "MAX_NAME_CHARS",
-           "NO_OPINION", "OFFICE_BANDS", "RECORD_FIELDS", "ROOMS_KEY",
-           "RULE_BAND", "RULE_CAMERA", "RULE_EMPTY", "RULE_SILENT",
-           "RULE_UNPLACED", "STILL_FLOOR_M", "Transition", "UNPLACED",
-           "Verdict", "ZoneLog", "ZoneMap", "ZoneTracker", "ZoneWatcher",
+__all__ = ["ABSENT", "BAND_SHAPE", "BLIND_M", "Band", "CameraOpinion",
+           "DEFAULT_DWELL_S", "GATE_M", "MAX_LABEL_CHARS", "MAX_LINE_BYTES",
+           "MAX_NAME_CHARS", "NO_OPINION", "OFFICE_BANDS", "RECORD_FIELDS",
+           "ROOMS_KEY", "ROOM_SHAPE", "RULE_BAND", "RULE_CAMERA", "RULE_EMPTY",
+           "RULE_SILENT", "RULE_UNPLACED", "SECTION_KEY", "SECTION_SHAPE",
+           "SHAPES", "STILL_FLOOR_M", "Transition", "UNPLACED", "Verdict",
+           "ZoneLog", "ZoneMap", "ZoneTracker", "ZoneWatcher", "ZonesConfig",
            "default_log_path", "dwell_s", "log_keep", "log_max_bytes",
-           "log_path", "read_rooms", "rejected_rooms", "verdict",
+           "log_path", "read_zones", "rejected_rooms", "verdict",
            "zone_map_for", "zone_maps"]

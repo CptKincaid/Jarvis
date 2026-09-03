@@ -16,6 +16,7 @@ The three things worth pinning, in the order they will break:
 """
 from __future__ import annotations
 
+import copy
 import json
 import os
 import stat
@@ -639,14 +640,20 @@ def test_a_room_whose_bands_are_broken_is_refused_not_quietly_replaced():
                                       "far_m": 1.0}]}]}})
     assert zn.zone_maps(broken) == {}
     assert zn.zone_map_for(broken, "office") is None
-    assert "office" in zn.rejected_rooms(broken)
+    # Keyed by the dotted config path -- the line he has to go and edit --
+    # and repeated under the room it costs.
+    assert "zones.rooms[0].bands" in zn.rejected_rooms(broken)
+    assert "office" in zn.read_zones(broken).room_refusals
 
 
 def test_a_rejected_room_names_the_config_key_that_is_wrong():
     broken = _Cfg({"zones": {"rooms": [
         {"name": "kitchen", "bands": [{"name": "a", "near_m": 0.75}]}]}})
-    why = zn.rejected_rooms(broken)["kitchen"]
-    assert "zones.rooms[0].bands" in why
+    # The missing key is far_m of the first band, and that exact path is
+    # what comes back -- not "the kitchen is broken somewhere".
+    assert "zones.rooms[0].bands[0].far_m" in zn.rejected_rooms(broken)
+    why = zn.read_zones(broken).room_refusals["kitchen"]
+    assert "zones.rooms[0].bands[0].far_m" in why and "missing" in why
 
 
 def test_a_room_switched_off_in_its_own_entry_is_refused_not_replaced():
@@ -654,7 +661,8 @@ def test_a_room_switched_off_in_its_own_entry_is_refused_not_replaced():
         {"name": "office", "enabled": False,
          "bands": [{"name": "a", "near_m": 0.75, "far_m": 4.5}]}]}})
     assert zn.zone_map_for(off, "office") is None
-    assert "zones.rooms[0].enabled" in zn.rejected_rooms(off)["office"]
+    assert "zones.rooms[0].enabled" in zn.rejected_rooms(off)
+    assert "is false" in zn.read_zones(off).room_refusals["office"]
 
 
 def test_a_config_that_lists_rooms_at_all_gets_no_built_in_ladder():
@@ -674,7 +682,11 @@ def test_a_room_named_twice_is_refused_because_two_ladders_cannot_both_win():
         {"name": "office", "bands": [{"name": "a", "near_m": 0.75, "far_m": 4.5}]},
         {"name": "office", "bands": [{"name": "b", "near_m": 0.75, "far_m": 2.0}]}]}})
     assert zn.zone_map_for(twice, "office") is None
-    assert "twice" in zn.rejected_rooms(twice)["office"]
+    why = zn.read_zones(twice).room_refusals["office"]
+    # BOTH entries are named, because "one of these two" is not an
+    # instruction he can act on.
+    assert "zones.rooms[1]" in why and "zones.rooms[0]" in why
+    assert "zones.rooms[1]" in zn.rejected_rooms(twice)
 
 
 def _zero_http(detection, **rest):
@@ -889,10 +901,12 @@ def test_two_band_names_that_differ_only_past_the_cap_say_so():
     cfg = _rooms([{"name": "office", "bands": [
         {"name": prefix + " near", "near_m": 0.75, "far_m": 2.0},
         {"name": prefix + " far", "near_m": 2.0, "far_m": 4.5}]}])
-    why = zn.rejected_rooms(cfg)["office"]
+    why = zn.read_zones(cfg).room_refusals["office"]
     assert zn.zone_map_for(cfg, "office") is None      # still refused
     assert "twice" not in why                          # but not as a duplicate
-    assert "first %d characters" % zn.MAX_NAME_CHARS in why
+    # And it says what ACTUALLY happened. These names are ASCII, so the
+    # character cap is the one that bit and both numbers are 64.
+    assert "64 characters and 64 escaped bytes" in why
 
 
 def test_two_room_names_that_differ_only_past_the_cap_say_so_too():
@@ -903,11 +917,10 @@ def test_two_room_names_that_differ_only_past_the_cap_say_so_too():
     band = [{"name": "a", "near_m": 0.75, "far_m": 4.5}]
     cfg = _rooms([{"name": prefix + " left wall", "bands": band},
                   {"name": prefix + " right wall", "bands": band}])
-    key = list(zn.rejected_rooms(cfg))[0]
-    why = zn.rejected_rooms(cfg)[key]
+    why = list(zn.rejected_rooms(cfg).values())[0]
     assert zn.zone_map_for(cfg, prefix) is None
     assert "twice" not in why
-    assert "first %d characters" % zn.MAX_NAME_CHARS in why
+    assert "64 characters and 64 escaped bytes" in why
 
 
 def test_a_genuine_duplicate_room_name_still_reads_as_a_duplicate():
@@ -916,7 +929,8 @@ def test_a_genuine_duplicate_room_name_still_reads_as_a_duplicate():
                   {"name": "OFFICE",
                    "bands": [{"name": "b", "near_m": 0.75, "far_m": 2.0}]}])
     assert zn.zone_map_for(cfg, "office") is None
-    assert "twice" in zn.rejected_rooms(cfg)["office"]
+    why = zn.read_zones(cfg).room_refusals["office"]
+    assert "again" in why and "zones.rooms[0]" in why
 
 
 def test_a_genuine_duplicate_band_name_still_reads_as_a_duplicate():
@@ -924,7 +938,7 @@ def test_a_genuine_duplicate_band_name_still_reads_as_a_duplicate():
         {"name": "here", "near_m": 0.75, "far_m": 2.0},
         {"name": "here", "near_m": 2.0, "far_m": 4.5}]}])
     assert zn.zone_map_for(cfg, "office") is None
-    assert "twice" in zn.rejected_rooms(cfg)["office"]
+    assert "twice" in zn.read_zones(cfg).room_refusals["office"]
 
 
 def test_a_huge_room_name_does_not_land_whole_in_the_complaint():
@@ -1031,3 +1045,374 @@ def test_the_instrument_refuses_a_rooms_key_of_the_wrong_shape(tmp_path,
     err = capsys.readouterr().err
     assert "NOTHING will be recorded" in err
     assert zn.ROOMS_KEY in err
+
+
+# --------------------------------------------------- the repairs (review 4)
+# THREE rounds, three versions of ONE finding: a malformed band list fell
+# back to the built-in ladder, then a zones.rooms of the wrong shape fell
+# back, then a zones key of the wrong shape fell back -- each repair fixed
+# the level it was shown and left the level above it open. And zones.enabled
+# was read with bool(), so "false", "no", "off", "0" and null all left
+# recording switched ON.
+#
+# So these do not test another instance. They test the CLASS: the declared
+# shape of the whole section, crossed with every wrong shape there is. A
+# level added to the config later and not to the declaration fails
+# test_every_key_the_shipped_config_has_is_declared; a level in the
+# declaration with no check behind it fails the cross product.
+
+# One kind of wrong per column. None of them is ever the right shape for
+# anything: the cross product below skips a value that satisfies the level
+# it is aimed at, so "a number" is not tested against 7.
+WRONG_SHAPES = {
+    "a mapping": {"name": "office"},
+    "a list": ["office"],
+    "text": "office",
+    "an int": 7,
+    "a float": 1.5,
+    "true or false": True,
+    "null": None,
+    "a nested wrong shape": [{"name": {"deep": ["wrong"]}}],
+    "not a number": float("nan"),
+}
+
+GOOD_BAND = {"name": "mine near", "near_m": 0.75, "far_m": 1.5}
+GOOD_ROOM = {"name": "office", "enabled": True, "camera_zone": "at the desk",
+             "bands": [dict(GOOD_BAND),
+                       {"name": "mine far", "near_m": 1.5, "far_m": 3.0}]}
+GOOD_ZONES = {"enabled": True, "dwell_s": 3.0, "log_path": "",
+              "log_max_bytes": 1000000, "log_keep": 1,
+              "rooms": [copy.deepcopy(GOOD_ROOM)]}
+
+
+def _levels():
+    """Every level of the section, straight off the DECLARATION.
+
+    Read from ``SECTION_SHAPE``/``ROOM_SHAPE``/``BAND_SHAPE`` rather than
+    written out here, so a key added to the declaration is tested the
+    moment it is declared and cannot be added without a check behind it.
+    Each entry is (dotted path, declared shape, a setter that puts a value
+    at that path in a copy of GOOD_ZONES).
+    """
+    def at_section(key):
+        return lambda z, v: (z.__setitem__(key, v), z)[1]
+
+    def at_room(key):
+        return lambda z, v: (z["rooms"][0].__setitem__(key, v), z)[1]
+
+    def at_band(key):
+        return lambda z, v: (z["rooms"][0]["bands"][0].__setitem__(key, v), z)[1]
+
+    out = [("zones", "a mapping", lambda z, v: v)]
+    out += [("zones.%s" % k, want, at_section(k)) for k, want, _
+            in zn.SECTION_SHAPE]
+    out.append(("zones.rooms[0]", "a mapping",
+                lambda z, v: (z["rooms"].__setitem__(0, v), z)[1]))
+    out += [("zones.rooms[0].%s" % k, want, at_room(k)) for k, want, _
+            in zn.ROOM_SHAPE]
+    out.append(("zones.rooms[0].bands[0]", "a mapping",
+                lambda z, v: (z["rooms"][0]["bands"].__setitem__(0, v), z)[1]))
+    out += [("zones.rooms[0].bands[0].%s" % k, want, at_band(k)) for k, want, _
+            in zn.BAND_SHAPE]
+    return out
+
+
+def _real_cfg(tmp_path, zones_section, n=[0]):
+    """The REAL AssistantConfig off a real file, not a stub.
+
+    The stub is where round two hid: _deep_merge replaces on a type
+    mismatch, so a user's unwrapped dict beats the DEFAULTS list and the
+    shipped ladder does NOT survive the slip.
+    """
+    from jarvis.assistant_config import AssistantConfig
+    n[0] += 1
+    path = tmp_path / ("assistant-%d.json" % n[0])
+    path.write_text(json.dumps({"zones": zones_section}), encoding="utf-8")
+    return AssistantConfig.load(path)
+
+
+CROSS = [(path, want, kind, value)
+         for path, want, _setter in _levels()
+         for kind, value in WRONG_SHAPES.items()
+         if not zn.SHAPES[want](value)]
+SETTERS = {path: setter for path, _want, setter in _levels()}
+
+
+def test_the_good_config_the_cross_product_starts_from_is_actually_good():
+    # Without this the whole table below could pass by refusing everything.
+    cfg = _Cfg({"zones": copy.deepcopy(GOOD_ZONES)})
+    zmap = zn.zone_map_for(cfg, "office")
+    assert zmap is not None
+    assert [b.name for b in zmap.bands] == ["mine near", "mine far"]
+    assert zn.rejected_rooms(cfg) == {}
+    assert zn.dwell_s(cfg) == 3.0 and zn.log_keep(cfg) == 1
+
+
+@pytest.mark.parametrize("path,want,kind,value", CROSS,
+                         ids=["%s=%s" % (p, k) for p, _w, k, _v in CROSS])
+def test_every_level_crossed_with_every_wrong_shape_is_refused_by_name(
+        path, want, kind, value, tmp_path):
+    # THE RULE, and it has no exempt level: a config that TRIES to say
+    # something about zones and gets it wrong is refused BY NAME and
+    # records nothing. Only an absent key falls back to a default.
+    section = SETTERS[path](copy.deepcopy(GOOD_ZONES), copy.deepcopy(value))
+    for cfg in (_Cfg({"zones": copy.deepcopy(section)}),
+                _real_cfg(tmp_path, copy.deepcopy(section))):
+        where = "%s %s at %s" % (kind, value, path)
+        # 1. it records NOTHING, and in particular is not quietly handed
+        #    the ladder built into jarvis/zones.py
+        assert zn.zone_map_for(cfg, "office") is None, where
+        assert zn.zone_maps(cfg) == {}, where
+        # 2. it is refused BY NAME, under the exact dotted path he must go
+        #    and edit -- not "something in zones is wrong"
+        refused = zn.rejected_rooms(cfg)
+        assert path in refused, (where, sorted(refused))
+        assert refused[path].startswith(path), refused[path]
+        assert want in refused[path], (where, refused[path])
+
+
+# The one column the cross product above cannot carry: a container whose
+# SHAPE is right and whose CONTENTS are wrong. A list of rooms really is a
+# list, so the table skips it -- and "one level up" is the exact shape of
+# the bug that came back three times, so it gets its own table.
+# (container path, the value put there, the DEEPER path that must be named)
+NESTED_WRONG = [
+    ("zones", {"enabled": "false", "rooms": [copy.deepcopy(GOOD_ROOM)]},
+     "zones.enabled"),
+    ("zones.rooms", [{"name": {"deep": ["wrong"]},
+                      "bands": [dict(GOOD_BAND)]}],
+     "zones.rooms[0].name"),
+    # a break in the SECOND room is named at index 1, and takes only the
+    # kitchen with it -- one bad room is survivable, unlike a bad section
+    ("zones.rooms", [copy.deepcopy(GOOD_ROOM),
+                     {"name": "kitchen", "bands": 3}],
+     "zones.rooms[1].bands"),
+    ("zones.rooms[0]", {"name": "office", "bands": "not a list"},
+     "zones.rooms[0].bands"),
+    ("zones.rooms[0].bands", [{"name": 5, "near_m": 0.75, "far_m": 1.5}],
+     "zones.rooms[0].bands[0].name"),
+    ("zones.rooms[0].bands", [dict(GOOD_BAND),
+                              {"name": "b", "near_m": None, "far_m": 3.0}],
+     "zones.rooms[0].bands[1].near_m"),
+    ("zones.rooms[0].bands[0]", {"name": "a", "near_m": "0.75", "far_m": 1.5},
+     "zones.rooms[0].bands[0].near_m"),
+]
+
+
+@pytest.mark.parametrize("container,value,deeper", NESTED_WRONG,
+                         ids=[d for _c, _v, d in NESTED_WRONG])
+def test_a_container_of_the_right_shape_with_wrong_contents_is_refused_too(
+        container, value, deeper, tmp_path):
+    section = SETTERS[container](copy.deepcopy(GOOD_ZONES),
+                                 copy.deepcopy(value))
+    # A break under zones.rooms[1] costs the kitchen and NOT the office:
+    # one bad room is survivable, a bad section is not.
+    costs_office = not deeper.startswith("zones.rooms[1]")
+    for cfg in (_Cfg({"zones": copy.deepcopy(section)}),
+                _real_cfg(tmp_path, copy.deepcopy(section))):
+        assert (zn.zone_map_for(cfg, "office") is None) is costs_office, deeper
+        assert zn.zone_map_for(cfg, "kitchen") is None, deeper
+        refused = zn.rejected_rooms(cfg)
+        # named at the DEEPER path, not blamed on the container it sits in
+        assert deeper in refused, (deeper, sorted(refused))
+        assert container not in refused or container == deeper
+
+
+def test_a_number_that_float_itself_cannot_hold_is_refused_not_raised():
+    # My own first draft of the shape check called math.isfinite on the raw
+    # value, and math.isfinite(10 ** 400) raises OverflowError -- so a
+    # hand-edited config with an absurd integer in it took the exception
+    # out through read_zones to the caller instead of being refused.
+    for value in (10 ** 400, -10 ** 400, float("nan"), float("inf"),
+                  float("-inf")):
+        cfg = _Cfg({"zones": {"dwell_s": value, "rooms": [ONE_ROOM]}})
+        assert zn.zone_map_for(cfg, "office") is None, repr(value)
+        assert "zones.dwell_s" in zn.rejected_rooms(cfg), repr(value)
+        assert zn.dwell_s(cfg) == zn.DEFAULT_DWELL_S, repr(value)
+        band = _rooms([{"name": "office",
+                        "bands": [{"name": "a", "near_m": value,
+                                   "far_m": 4.5}]}])
+        assert zn.zone_map_for(band, "office") is None, repr(value)
+        assert "zones.rooms[0].bands[0].near_m" in zn.rejected_rooms(band)
+
+
+def test_every_key_the_shipped_config_has_is_declared_in_the_shape():
+    # The other half of the guarantee. The cross product covers every
+    # DECLARED level; this is what makes a level added to the config and
+    # NOT declared fail the suite instead of shipping unvalidated.
+    zones = DEFAULTS["zones"]
+    assert set(zones) == {k for k, _w, _d in zn.SECTION_SHAPE}
+    for room in zones["rooms"]:
+        assert set(room) == {k for k, _w, _d in zn.ROOM_SHAPE}
+        for band in room["bands"]:
+            assert set(band) == {k for k, _w, _d in zn.BAND_SHAPE}
+    # and every shape a table names is one the walker can actually check
+    for table in (zn.SECTION_SHAPE, zn.ROOM_SHAPE, zn.BAND_SHAPE):
+        for key, want, _default in table:
+            assert want in zn.SHAPES, (key, want)
+
+
+def test_nothing_reads_a_zones_key_around_the_validator():
+    # There must be no SECOND DOOR. Three rounds of this bug were three
+    # different readers of the same section disagreeing about what counts
+    # as an answer, so the fix is only a fix while there is one reader.
+    import pathlib
+    import re
+    dotted = re.compile(r"""get\(\s*["']zones""")
+    root = pathlib.Path(zn.__file__).resolve().parents[1]
+    for name in ("jarvis/zones.py", "scripts/zone_log.py"):
+        text = (root / name).read_text(encoding="utf-8")
+        assert not dotted.search(text), name     # no cfg.get("zones.x")
+    source = (root / "jarvis/zones.py").read_text(encoding="utf-8")
+    # exactly one raw read of the config, and it asks for the SECTION --
+    # a dotted read answers "absent" for every key under a zones that is a
+    # string, which is how the whole section slipped past round three.
+    assert source.count("_cfg_raw(") == 2        # the def and its one call
+    assert "_cfg_raw(cfg, SECTION_KEY)" in source
+
+
+def test_an_enabled_flag_of_the_wrong_shape_does_not_leave_recording_on():
+    # The verifier's own list: "false", "no", "off", "0" and null all left
+    # recording enabled, because bool("false") is True and a present null
+    # was folded into the default. An off switch that is only off when it
+    # is spelled the one right way is not an off switch.
+    for value in ("false", "no", "off", "0", "", 0, 1, None, [], {}):
+        cfg = _Cfg({"zones": {"enabled": value, "rooms": [ONE_ROOM]}})
+        assert zn.zone_map_for(cfg, "office") is None, repr(value)
+        assert "zones.enabled" in zn.rejected_rooms(cfg), repr(value)
+    # A real bool still works, both ways, and switching off is an ANSWER
+    # rather than a mistake -- there is nothing to go and fix, so nothing
+    # is named.
+    on = _Cfg({"zones": {"enabled": True, "rooms": [ONE_ROOM]}})
+    off = _Cfg({"zones": {"enabled": False, "rooms": [ONE_ROOM]}})
+    assert zn.zone_map_for(on, "office") is not None
+    assert zn.zone_map_for(off, "office") is None
+    assert zn.rejected_rooms(off) == {}
+
+
+def test_a_broken_key_above_the_rooms_costs_every_room_not_just_one():
+    # A refusal above the room level has no entries to salvage and no
+    # default it would be honest to use, so it is not survivable the way
+    # one bad room is.
+    two = [ONE_ROOM, {"name": "kitchen",
+                      "bands": [{"name": "a", "near_m": 0.75, "far_m": 4.5}]}]
+    fine = _Cfg({"zones": {"rooms": copy.deepcopy(two)}})
+    assert sorted(zn.zone_maps(fine)) == ["kitchen", "office"]
+    broken = _Cfg({"zones": {"dwell_s": "three seconds",
+                             "rooms": copy.deepcopy(two)}})
+    assert zn.zone_maps(broken) == {}
+    assert zn.zone_map_for(broken, "kitchen") is None
+    assert zn.zone_map_for(broken, "office") is None
+    assert "zones.dwell_s" in zn.rejected_rooms(broken)
+    # but one bad ROOM still only takes itself
+    one_bad = _Cfg({"zones": {"rooms": [
+        {"name": "office", "bands": "not a list"}, copy.deepcopy(two[1])]}})
+    assert sorted(zn.zone_maps(one_bad)) == ["kitchen"]
+
+
+def test_the_clash_message_counts_what_was_really_cut_not_always_sixty_four():
+    # _short cuts at MAX_NAME_CHARS characters AND at MAX_NAME_CHARS
+    # escaped bytes, and json.dumps escapes one CJK character to six bytes
+    # -- so two CJK names become one after TEN characters, not sixty-four.
+    # The message said "share their first 64 characters" whatever the
+    # alphabet, which sent him to a column that does not exist.
+    prefix = "居" * 12
+    cfg = _rooms([{"name": "office", "bands": [
+        {"name": prefix + "A", "near_m": 0.75, "far_m": 2.0},
+        {"name": prefix + "B", "near_m": 2.0, "far_m": 4.5}]}])
+    why = zn.read_zones(cfg).room_refusals["office"]
+    assert zn.zone_map_for(cfg, "office") is None
+    assert "10 characters and 60 escaped bytes" in why, why
+    assert "64 characters" not in why, why       # the sentence that was false
+    # and the number in the message is the truth about this string
+    assert len(zn._short(prefix)) == 10
+    assert len(json.dumps(zn._short(prefix))) - 2 == 60
+
+
+def test_the_log_never_raises_at_the_caller_even_while_building_the_line(
+        tmp_path):
+    # ZoneLog.append built the JSON line OUTSIDE its try, so a Transition
+    # carrying a field that is not a number raised ValueError at the
+    # caller -- inside the poll loop -- against this class's documented
+    # contract that it never does.
+    path = tmp_path / "z.jsonl"
+    log_file = ZoneLog(path)
+
+    def t(**kw):
+        base = dict(room="office", old=UNPLACED, new="by the door",
+                    rule=RULE_BAND, at=1.0, iso="2026-09-03T00:00:00",
+                    held_s=1.0)
+        base.update(kw)
+        return zn.Transition(**base)
+
+    bad = [t(at="not a clock"),            # float() -> ValueError
+           t(held_s=object()),             # float() -> TypeError
+           t(distance_m="near"),           # float() -> ValueError
+           t(presence={1, 2}),             # json.dumps -> TypeError
+           object()]                       # not a Transition -> AttributeError
+    for item in bad:
+        assert log_file.append(item) is False
+    assert log_file.writes == 0
+    assert log_file.failures == len(bad)
+    assert not path.exists() or path.stat().st_size == 0
+    # and it is a refusal, not a poisoned log: a good record still writes
+    assert log_file.append(t()) is True
+    assert log_file.writes == 1
+
+
+def test_the_ceiling_is_arithmetic_on_two_constants_not_an_average(tmp_path):
+    # The only records-per-MB figure this module still states. Three passes
+    # quoted a measured "typical" line size and a verifier failed to
+    # reproduce it three times, so the measured claim is gone and what is
+    # left divides one enforced constant by another.
+    assert zn.DEFAULT_MAX_BYTES // zn.MAX_LINE_BYTES == 1562
+    assert zn.ZoneLog(tmp_path / "z.jsonl", max_bytes=1).max_bytes == \
+        zn.MAX_LINE_BYTES                        # no cap below one record
+    # and no per-record byte figure survives in the prose, where it could
+    # go stale without failing anything
+    import pathlib
+    for name in ("jarvis/zones.py", "jarvis/assistant_config.py"):
+        text = (pathlib.Path(zn.__file__).resolve().parents[1]
+                / name).read_text(encoding="utf-8")
+        for stale in ("2,890", "2,850", "234-346", "234 to 346", "234-350",
+                      "542 bytes", "499 bytes"):
+            assert stale not in text, (name, stale)
+
+
+def test_a_log_path_that_is_text_but_unusable_is_refused_by_name(tmp_path):
+    # The class again, one level DOWN from shape this time. "~nobody/x" is
+    # text, so the shape table passes it, and Path.expanduser then RAISES
+    # RuntimeError -- which came out of read_zones at the caller instead of
+    # being refused. A null byte is the same story through os.open, which
+    # raises ValueError and so walked past ZoneLog's OSError handler too.
+    import pathlib
+    for value in ("~nosuchuser12345/zones.jsonl", "\0zones.jsonl",
+                  "/var/\0/zones.jsonl"):
+        for cfg in (_Cfg({"zones": {"log_path": value, "rooms": [ONE_ROOM]}}),
+                    _real_cfg(tmp_path, {"log_path": value,
+                                         "rooms": [copy.deepcopy(ONE_ROOM)]})):
+            zones = zn.read_zones(cfg)          # and it does NOT raise
+            assert "zones.log_path" in zones.refused, repr(value)
+            assert zn.zone_map_for(cfg, "office") is None, repr(value)
+            assert zn.zone_maps(cfg) == {}, repr(value)
+            # and it falls back to nothing, not to the default file
+            assert zones.poisoned, repr(value)
+    # a path that is merely absent, or ordinary, still resolves
+    plain = _Cfg({"zones": {"rooms": [ONE_ROOM]}})
+    assert zn.log_path(plain) == zn.default_log_path()
+    tilde = _Cfg({"zones": {"log_path": "~/zones.jsonl", "rooms": [ONE_ROOM]}})
+    assert zn.log_path(tilde) == pathlib.Path("~/zones.jsonl").expanduser()
+
+
+def test_the_log_never_raises_when_the_path_itself_cannot_be_opened():
+    # ZoneLog says it never raises at the caller. os.stat and os.open raise
+    # ValueError -- not OSError -- on a path with a null byte in it, and
+    # that path can come straight out of the config, so the promise was
+    # only true for the errors somebody had thought of.
+    t = zn.Transition(room="office", old=UNPLACED, new="by the door",
+                      rule=RULE_BAND, at=1.0, iso="2026-09-03T00:00:00",
+                      held_s=1.0)
+    for bad in ("\0zones.jsonl", "/var/\0/zones.jsonl"):
+        log_file = ZoneLog(bad)
+        assert log_file.append(t) is False, bad
+        assert log_file.failures == 1 and log_file.writes == 0, bad
