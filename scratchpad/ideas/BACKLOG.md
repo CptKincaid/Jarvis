@@ -222,3 +222,38 @@ so this is genuinely two-way.
 If he fully logs out of the desktop, or Jarvis is converted to a SYSTEM systemd
 unit, SMS stops working and nothing else does. Needs an explicit precondition
 check with a clear error.
+
+---
+
+## 2026-09-02, late — his rulings on the backlog
+
+**DOING NOW:**
+  * **Email a file to someone** (idea 2). Free, no new accounts.
+  * **HPCOMPUTER files + remote shell** (part of idea 3). Tailscale already
+    running is the transport.
+  * **Screen control on the SPARK itself** — new, his words: *"lets do screen
+    control on the spark for jarvis. that would be a hard but useful one."*
+
+**DROPPED — do not raise again unless he does:**
+  * **Encryption (idea 4)** — disregarded. Three of the four were router/system
+    settings anyway, and the VPN already exists.
+  * **Texting (idea 5)** — disregarded. Answer stands if he ever wants it: a
+    Waveshare SIM7600NA-H (~$65) + Red Pocket $30/yr, mmcli, no sudo needed.
+
+**BACKLOG, not now:**
+  * **HPCOMPUTER SCREEN control** — deliberately split from files/shell, which
+    are cheap. Note when it comes up: CASTING to that screen is far cheaper than
+    CONTROLLING it, and is probably what he wants more often.
+  * **Google Drive (idea 1)** — unresolved. He wants read + download + send-on,
+    so READ-ONLY scope suffices, but it is still the first standing cloud token
+    on the box that runs agent code. His call, not made yet.
+
+### Spark screen control — what already exists, measured 2026-09-02
+Do not start from scratch. `jarvis/desktop.py` already has `DesktopControl`,
+`press_key`, `launch_app`, `list_windows`, `find_claude_terminal` and
+`parse_desktop_action`; `jarvis/tools/screen.py` handles screen Q&A.
+**The session is X11 (`DISPLAY=:1`, `Type=x11`), not Wayland** — which is why
+this is tractable at all: `xdotool` has full synthetic input on X11 and none on
+Wayland. Present: `xdotool`, `xclip`, `gnome-screenshot`. **Missing:** `wmctrl`,
+`scrot`, `import`, `ydotool` — and there is no sudo, so anything needing an
+apt install is a blocker to raise, not to assume.
