@@ -11,7 +11,7 @@ photograph --
   * its source never imports cv2 or the vision lane, never names a video
     device node, and never constructs the real capture worker;
   * its state list is the one its docstring promises, in order, with the
-    two states this tree cannot show marked as skipped.
+    one state this tree cannot show marked as skipped.
 
 No Tk root is created. The module is imported from its path; the heavy
 imports inside it (jarvis.ui.main_window) happen only in the helpers that
@@ -44,8 +44,9 @@ def source():
 
 # ------------------------------------------------------------ the states
 def _docstring_states(doc: str) -> list:
+    # `08b`: a lettered state sits between its bare number and the next
     return [(m.group(1), m.group(2))
-            for m in re.finditer(r"^  (\d\d)  ([a-z][a-z-]*)\b", doc, re.M)]
+            for m in re.finditer(r"^  (\d\d[a-z]?) +([a-z][a-z-]*)\b", doc, re.M)]
 
 
 def test_the_state_list_is_the_one_the_docstring_promises(rig):
@@ -56,14 +57,34 @@ def test_the_state_list_is_the_one_the_docstring_promises(rig):
 
 def test_the_states_are_numbered_in_order_and_the_skips_say_why(rig):
     numbers = [n for n, _s, _w in rig.STATES]
-    assert numbers == [f"{i:02d}" for i in range(1, len(numbers) + 1)]
+    # 01..25 without a gap; a lettered state (08b) follows its bare number
+    ints = [int(n[:2]) for n in numbers]
+    assert ints == sorted(ints)
+    assert sorted(set(ints)) == list(range(1, max(ints) + 1))
+    for i, n in enumerate(numbers):
+        if len(n) > 2:
+            assert numbers[i - 1] == n[:2], f"{n} does not follow {n[:2]}"
+    assert "08b" in numbers
     skipped = {n: why for n, _s, why in rig.STATES if why}
-    assert set(skipped) == {"13", "24"}
+    assert set(skipped) == {"13"}
     for why in skipped.values():
         assert "59bb901" in why
-    # the docstring marks the same two as SKIPPED, nothing else
-    doc_skips = re.findall(r"^  (\d\d)  \S+\s+SKIPPED", rig.__doc__, re.M)
-    assert sorted(doc_skips) == ["13", "24"]
+    # the docstring marks the same one as SKIPPED, nothing else
+    doc_skips = re.findall(r"^  (\d\d[a-z]?) +\S+\s+SKIPPED", rig.__doc__, re.M)
+    assert sorted(doc_skips) == ["13"]
+
+
+def test_skip_reasons_are_looked_up_by_number_not_by_position(rig):
+    # STATES[12] stopped being 13-timer the day 08b went in
+    assert rig.skip_reason("13") == rig.STATES[13][2]
+    assert rig.STATES[13][:2] == ("13", "timer")
+    assert rig.skip_reason("24") == ""
+    assert rig.skip_reason("99") == ""
+
+
+def test_the_cleared_shot_speaks_the_commanders_own_line(rig):
+    from jarvis.commander import TRANSCRIPT_CLEAR_LINE
+    assert rig.TRANSCRIPT_CLEAR_LINE == TRANSCRIPT_CLEAR_LINE
 
 
 def test_shot_filenames_are_number_dash_slug(rig):
@@ -100,16 +121,23 @@ def test_every_service_callable_is_harmless(rig):
 
 
 def test_the_sensing_stand_in_covers_the_three_badge_states(rig):
-    from jarvis.ui.sensing_badge import badge_word
+    # The TONES, not the words: the words are the badge's own (ui-telemetry
+    # shortened CAMERA OFF to CAM OFF for the header fit, and
+    # tests/test_sensing_badge.py pins them); the stand-in's job is to reach
+    # all three states through both the state() read and the event.
+    from jarvis.ui.sensing_badge import (TONE_CURFEW, TONE_OFF, TONE_ON,
+                                         badge_tone, badge_word)
     s = rig.RigSensing("on")
-    assert badge_word(s.state()) == "SENSING"
-    assert badge_word(s.event()) == "SENSING"
+    assert badge_tone(s.state()) == badge_tone(s.event()) == TONE_ON
     s.set("curfew")
-    assert badge_word(s.state()) == "CAMERA OFF"
-    assert badge_word(s.event()) == "CAMERA OFF"
+    assert badge_tone(s.state()) == badge_tone(s.event()) == TONE_CURFEW
     s.set("offline")
-    assert badge_word(s.state()) == "OFFLINE"
-    assert badge_word(s.event()) == "OFFLINE"
+    assert badge_tone(s.state()) == badge_tone(s.event()) == TONE_OFF
+    words = set()
+    for mode in ("on", "curfew", "offline"):
+        s.set(mode)
+        words.add(badge_word(s.state()))
+    assert len(words) == 3, words
 
 
 # -------------------------------------------------- the capture stand-in

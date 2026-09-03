@@ -56,6 +56,10 @@ tests/test_ui_shots.py pins ``STATES`` to it.
   07  error           Status(error): pill ERROR + toast
   08  transcript      six more turns -- one long multi-sentence reply and
                       one short one -- eight turns on screen in all
+  08b transcript-clean  the same eight turns with Status("Ready") published
+                      first and 07's error toast EXPIRED before the shot
+                      (it lives 4 s; an ok Status clears the pill hold but
+                      not the toast, so 08 at ~3.4 s still carries it)
   09  briefing        BriefingReady: the WEATHER / CALENDAR / DUE tool card
                       (the only tool-card type on this tree)
   10  uncertain       UncertainUtterance: the YES / NO "Was that for me?" card
@@ -68,7 +72,8 @@ tests/test_ui_shots.py pins ``STATES`` to it.
   16  ambient         desk idle 120 s: the room slab over the transcript
   17  standby         desk idle 99999 s: dimmed, footer hidden, burn-in drift
   18  sensing         SensingChanged(camera + radar on): badge SENSING
-  19  camera-off      SensingChanged(curfew): badge CAMERA OFF
+  19  camera-off      SensingChanged(curfew): badge CAM OFF (the header-fit
+                      word; the pane placeholder below still says CAMERA OFF)
   20  offline         SensingChanged(offline): badge OFFLINE
   21  pane-off        the camera pane packed with its capture declining:
                       the "CAMERA OFF · curfew until 7 am" placeholder
@@ -76,9 +81,11 @@ tests/test_ui_shots.py pins ``STATES`` to it.
                       face box and "HUNTER 0.74" drawn into the picture
   23  claude-task     ClaudeTaskState(running) + ClaudeProgress: pill
                       WORKING, the terminal button's ring, the progress card
-  24  cleared         SKIPPED -- no clear-transcript event exists at 59bb901
+  24  cleared         the two open questions (10, 11) answered, then
+                      ClearTranscript + the spoken confirmation: the one
+                      card left on the empty glass (commander's own order)
   25  header-worst    the header alone at exactly 918 px in the worst pair:
-                      LISTENING + CAMERA OFF
+                      LISTENING + CAM OFF
 """
 from __future__ import annotations
 
@@ -111,6 +118,7 @@ STATES = (
     ("06", "warn", None),
     ("07", "error", None),
     ("08", "transcript", None),
+    ("08b", "transcript-clean", None),
     ("09", "briefing", None),
     ("10", "uncertain", None),
     ("11", "approval", None),
@@ -126,9 +134,26 @@ STATES = (
     ("21", "pane-off", None),
     ("22", "pane-synthetic", None),
     ("23", "claude-task", None),
-    ("24", "cleared", "no clear-transcript event exists at 59bb901"),
+    ("24", "cleared", None),
     ("25", "header-worst", None),
 )
+
+
+def skip_reason(num: str) -> str:
+    """The skip reason for state `num`, by NUMBER: indexing STATES by
+    position broke the day 08b went in between 08 and 09."""
+    for n, _slug, why in STATES:
+        if n == num:
+            return why or ""
+    return ""
+
+
+# The spoken confirmation the commander publishes right after
+# ClearTranscript (jarvis/commander.py TRANSCRIPT_CLEAR_LINE, held == 0).
+# Copied, not imported: the commander is 8000 lines the child has no other
+# use for, and tests/test_ui_shots.py pins the two strings equal.
+TRANSCRIPT_CLEAR_LINE = ("Screen's clear, sir. Nothing forgotten — "
+                         "and nothing to bring back.")
 
 # Modules through which a frame could reach this process. Refused for the
 # life of the child, and checked at the end to have never loaded.
@@ -642,13 +667,15 @@ class Rig:
     def plan(self) -> None:
         from jarvis.board import BoardState, Panel
         from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped,
-                                   ApprovalRequested, AudioLevel, BoardCommand,
-                                   BoardUpdate, BrainState, BriefingReady,
-                                   ClaudeProgress, ClaudeTaskState, DeskState,
-                                   FaultRaised, HotwordDetected, JarvisReply,
-                                   ModelInfo, PartialText, RecordingStarted,
-                                   RecordingStopped, SpeakingState, Status,
-                                   Transcribed, UncertainUtterance, UserUtterance)
+                                   ApprovalRequested, ApprovalResolved, AudioLevel,
+                                   BoardCommand, BoardUpdate, BrainState,
+                                   BriefingReady, ClaudeProgress, ClaudeTaskState,
+                                   ClearTranscript, DeskState, FaultRaised,
+                                   HotwordDetected, JarvisReply, ModelInfo,
+                                   PartialText, RecordingStarted, RecordingStopped,
+                                   SpeakingState, Status, Transcribed,
+                                   UncertainResolved, UncertainUtterance,
+                                   UserUtterance)
         from jarvis.ui.console_mode import ACTIVE, AMBIENT, STANDBY
         from jarvis.ui.main_window import CAMERA_PREVIEW_OPTION
         win, S = self.win, self.step
@@ -730,6 +757,20 @@ class Rig:
         S(lambda: None, 800)
         S(lambda: self.capture("08", "transcript"), 0)
 
+        # 08b the same transcript, no toast --------------------------------
+        # 07's error toast lives 4 s (main_window.set_status) and an ok
+        # Status clears the PILL hold, not the toast -- so 08, ~3.4 s after
+        # the error, still had it over the cards. Ready goes first here and
+        # the rig waits on the toast's OWN timer to run out rather than
+        # racing it with a guessed sleep.
+        S(lambda: (self.begin("08b", "transcript-clean"),
+                   self.publish(Status(text="Ready", kind="ok"))), 0)
+        S(lambda: self.wait_until(lambda: win.toast._frame is None, 6000), None)
+        S(lambda: None, 400)
+        S(lambda: self.capture("08b", "transcript-clean", note=(
+            "the eight turns of 08 with Status(Ready) published first and "
+            "07's error toast expired before the shot")), 0)
+
         # 09 briefing card -------------------------------------------------
         S(lambda: (self.begin("09", "briefing"),
                    self.publish(UserUtterance(text="give me my morning brief",
@@ -764,7 +805,7 @@ class Rig:
         S(lambda: self.publish(AlarmStopped(alarm_id="al-1", action="dismiss")), 300)
 
         # 13 timer ---------------------------------------------------------
-        S(lambda: self.skip("13", "timer", STATES[12][2]), 0)
+        S(lambda: self.skip("13", "timer", skip_reason("13")), 0)
 
         # 14 settings ------------------------------------------------------
         S(lambda: (self.begin("14", "settings"), win.drawer_toggle()), 900)
@@ -878,7 +919,27 @@ class Rig:
                                                state="done", text="Done")), 300)
 
         # 24 cleared -------------------------------------------------------
-        S(lambda: self.skip("24", "cleared", STATES[23][2]), 0)
+        # The commander's own order (commander._h_transcript_clear): the
+        # ClearTranscript event, then the spoken confirmation as the one card
+        # left on the empty glass. clear_all leaves an UNANSWERED question
+        # standing on purpose, and two are open on this glass (10's YES / NO,
+        # 11's ALLOW / DENY), so both are answered first -- as they long
+        # since would have been at a real desk.
+        S(lambda: (self.begin("24", "cleared"),
+                   self.publish(UncertainResolved(request_id="u-1", yes=True,
+                                                  source="ui"),
+                                ApprovalResolved(request_id="a-1", allowed=True,
+                                                 source="ui"),
+                                UserUtterance(text="clear the transcript",
+                                              source="voice"))), 200)
+        S(lambda: (setattr(win, "_utter_ts", time.monotonic() - 0.6),
+                   self.publish(ClearTranscript(),
+                                JarvisReply(text=TRANSCRIPT_CLEAR_LINE,
+                                            speak=True))), 900)
+        S(lambda: self.capture("24", "cleared", note=(
+            "ClearTranscript after the two open questions were answered "
+            "(an unanswered one is kept by design); the spoken confirmation "
+            "is the one card on the empty glass")), 0)
 
         # 25 the header alone, worst pair ----------------------------------
         S(lambda: (self.begin("25", "header-worst"), self.sensing.set("curfew"),
@@ -886,7 +947,7 @@ class Rig:
                                 RecordingStarted(),
                                 AudioLevel(level=0.5, waveform=bars))), 900)
         S(lambda: self.capture("25", "header-worst", bbox=self.header_bbox(), note=(
-            "header + rule only, 918 px wide: LISTENING pill + CAMERA OFF badge")), 0)
+            "header + rule only, 918 px wide: LISTENING pill + CAM OFF badge")), 0)
         S(lambda: self.publish(RecordingStopped(reason="abort", endpoint="manual")), 200)
 
         S(self.teardown, 200)
