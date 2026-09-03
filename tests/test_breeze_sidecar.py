@@ -1726,6 +1726,44 @@ def test_the_phone_falls_back_to_f5_when_the_sidecar_is_gone(tmp_path,
     assert t.cache.get(t._cache_key("breeze", "Good evening, sir.")) is None
 
 
+def test_a_phone_reply_during_a_breeze_outage_hands_f5_its_own_chunks(
+        tmp_path, monkeypatch):
+    """Rendition plans its chunks under render_engine() == breeze -- ONE
+    chunk, the join. stream() then calls load(), which falls back to F5
+    because the sidecar is gone, and _replan() re-read the cache under the
+    new engine but kept the SAME chunk list. F5 is a whole-chunk engine, so
+    the phone waited for a whole-reply F5 render before webapp could send
+    its status line (~2-3 s for a capped reply against ~0.5 s for the first
+    sentence), and the render was stored under an F5 key for text the
+    room's F5 split -- four sentence chunks -- never looks up: measured,
+    all four room-side keys missed afterwards.
+
+    The plan is now re-derived from the text under the engine load() chose,
+    so the phone's F5 chunks ARE the room's, and each one is a room-side
+    hit."""
+    monkeypatch.setattr(tts_mod, "BREEZE_STREAM_PLAYBACK", True)
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: False)
+    monkeypatch.setattr(tts_mod, "_ensure_breeze_server", lambda *a, **k: False)
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
+    monkeypatch.setattr(tts_mod.subprocess, "Popen", FakeProc)
+    t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+    f5 = []
+    monkeypatch.setattr(t, "_synth_f5", lambda text, out: (
+        f5.append(text), open(out, "wb").write(wav_bytes(0.1))))
+    rend = tts_mod.Rendition(t, FOUR_SENTENCES)
+    assert rend.engine == "breeze" and len(rend) == 1
+    body = rend.body()
+    assert len(body) > tts_mod._WAV_HEADER_BYTES
+    assert t.engine == "f5" and rend.engine == "f5"
+    want = TTS(engine="f5", cache=False).render_chunks(FOUR_SENTENCES)
+    assert len(want) >= 3, want
+    assert f5 == want, "F5 was handed the Breeze-sized chunk"
+    assert rend.chunks == want
+    assert all(t._cached("f5", c) for c in want), "the room would miss"
+    assert FakeProc.spawned == []                 # nothing played in the room
+
+
 def test_a_repeat_plays_from_cache_without_touching_the_socket(breeze, sock_path,
                                                                monkeypatch):
     srv = FakeSidecar(sock_path, sidecar_handler([wav_bytes(0.1)[44:]]))

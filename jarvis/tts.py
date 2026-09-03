@@ -3443,6 +3443,7 @@ class Rendition:
 
     def __init__(self, tts: "TTS", text: str):
         self.tts = tts
+        self.text = text                 # kept for _replan
         self.engine = tts.render_engine()
         # ONE cache lookup per chunk, here: _cached() also keeps the hit /
         # miss counters, so asking twice would report a hit rate this
@@ -3615,11 +3616,20 @@ class Rendition:
         engine = self.tts.render_engine()
         if engine == self.engine:
             return
-        log.info("render: engine changed %s -> %s; re-reading the cache",
+        log.info("render: engine changed %s -> %s; re-planning under it",
                  self.engine, engine)
         self.engine = engine
+        # Re-derived from the text, not re-keyed chunk by chunk: the chunks
+        # are the engine's too. Planned under Breeze the reply is ONE chunk
+        # (the join), and handing that to F5 -- a whole-chunk engine --
+        # made the phone wait for a whole-reply render before its status
+        # line (~2-3 s for a capped reply against ~0.5 s for a sentence)
+        # and filed it under a key the room's F5 split never looks up
+        # (measured: four sentence chunks, four misses). render_chunks runs
+        # the room's own three steps under the engine load() chose, so the
+        # pad, the pronunciation rules and the split are all F5's.
         self.plan = [(chunk, self.tts._cached(engine, chunk))
-                     for chunk, _ in self.plan]
+                     for chunk in self.tts.render_chunks(self.text)]
 
     def _synth(self, chunk: str) -> Optional[str]:
         """Render one chunk to a temp wav and file it in the speech cache
