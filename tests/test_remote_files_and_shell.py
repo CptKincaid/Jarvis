@@ -766,8 +766,16 @@ def wired(tmp_path, monkeypatch):
     for key, val in (("voice_cmds", True), ("jarvis_mode", True),
                      ("auto_type", False), ("talkback", False)):
         monkeypatch.setattr(CONFIG, key, val)
+    # _bg runs inline, as in test_oracle: the four answering doors hand
+    # their round trip to a thread (F10), and a test that sleeps for one
+    # flakes.  What the worker SAYS is recorded from _speak_now, and what
+    # it puts on the strip from the bus.
     monkeypatch.setattr(Commander, "_bg", lambda self, fn: fn())
-    monkeypatch.setattr(Commander, "_speak_now", lambda self, text: True)
+    spoken, statuses = [], []
+    monkeypatch.setattr(Commander, "_speak_now",
+                        lambda self, text: spoken.append(text) or True)
+    from jarvis.events import Status, bus
+    bus.subscribe(Status, lambda e: statuses.append(e.text))
     svc = types.SimpleNamespace(
         assistant=ready_cfg(tmp_path), memory=MagicMock(), desktop=MagicMock(),
         workflows=MagicMock(), brain=MagicMock(), context=MagicMock(),
@@ -783,7 +791,7 @@ def wired(tmp_path, monkeypatch):
     svc.router.pending.return_value = None
     svc.claude.active_project = "jarvis"
     c = Commander(svc)
-    c.copied = copied
+    c.copied, c.spoken, c.statuses = copied, spoken, statuses
     return c
 
 
@@ -809,9 +817,14 @@ def test_every_door_is_registered_for_unprefixed_speech(name):
 ])
 def test_the_doors_answer_bare_voice_with_no_wake_word(wired, said, expect):
     """The live path: the hotword consumed "jarvis", so this is what the
-    commander actually receives."""
+    commander actually receives.  A door that answers from its worker (F10)
+    puts the answer's status on the strip rather than on the turn's result,
+    so either place counts -- the refusal and a read-back are still on the
+    turn, the round trips are not."""
     res = wired.handle(said, source="voice")
-    assert res.status == expect, f"{said!r} -> {res.status!r} / {res.reply!r}"
+    assert res.handled
+    assert expect in [res.status] + wired.statuses, \
+        f"{said!r} -> {res.status!r} / {res.reply!r} / {wired.statuses!r}"
 
 
 def test_a_push_reads_back_and_moves_nothing(wired):
@@ -842,7 +855,9 @@ def test_sure_is_asked_again_rather_than_obeyed(wired):
     assert res.reply == outbox_unsure()
     assert wired.copied == []
     res = wired.handle("yes", source="voice")
-    assert res.reply == "budget.xlsx is on HPCOMPUTER, sir."
+    # The yes turn acknowledges; the outcome is spoken from the worker (F10).
+    assert res.reply == "Sending it now, sir." and res.ack and res.done is False
+    assert wired.spoken[-1] == "budget.xlsx is on HPCOMPUTER, sir."
     assert wired.copied[-1][2] is True
 
 
@@ -899,8 +914,13 @@ def test_an_ambiguous_push_hears_its_answer(wired, answer, expect):
 
 
 def test_an_ambiguous_pull_hears_its_answer(wired):
-    res = wired.handle("get the report from HPCOMPUTER", source="voice")
-    assert "report_v1.pdf" in res.reply and "report_v2.pdf" in res.reply
+    wired.handle("get the report from HPCOMPUTER", source="voice")
+    # The listing is a round trip, so "Which one?" is spoken from the
+    # worker (F10); the answer's read-back needs no round trip and is on
+    # the turn.
+    asked = wired.spoken[-1]
+    assert "report_v1.pdf" in asked and "report_v2.pdf" in asked
+    assert wired.question_open()
     res = wired.handle("the second one", source="voice")
     assert "report_v2.pdf" in res.reply
     assert wired.copied == []
@@ -972,3 +992,96 @@ def test_a_reminder_that_names_the_machine_is_a_reminder():
     m = cmd_mod._REMOTE_FREEFORM_RX.match(said)
     spoken = cmd_mod._oracle_group(m, "cmd", "cmd2", "cmd3")
     assert not cmd_mod._REMOTE_ORDER_RX.match(spoken.strip())
+
+
+# ==================================================================
+# F10 (2026-09-03): nothing that opens a socket runs on the voice turn
+# ==================================================================
+# A confirmed push ran remote.push INLINE from _try_destructive_confirm
+# (`pend[0]()`), on the _process_audio thread with app._audio_busy set, for
+# up to transfer_timeout_s (120 s default, 900 s clamp); the status, query
+# and pull doors each held the turn for a full ssh budget (12 s) the same
+# way.  For all of it Jarvis was silent and deaf -- no "stop", no "never
+# mind", no wake word (app.py gates wake/recording on _audio_busy).  The
+# Oracle lane this family says it copies hands its round trip to c._bg and
+# returns done=False; so does the send lane.  These pin that shape: _bg is
+# replaced with a QUEUE, and the transport must not have been touched by
+# the time handle() returns.
+@pytest.fixture
+def queued(wired, monkeypatch):
+    """The wired Commander with _bg parked instead of inlined."""
+    jobs = []
+    monkeypatch.setattr(Commander, "_bg", lambda self, fn: jobs.append(fn))
+    wired.jobs = jobs
+    return wired
+
+
+def test_a_confirmed_push_leaves_the_voice_turn_at_once(queued):
+    queued.handle("put the budget on HPCOMPUTER", source="voice")
+    res = queued.handle("yes", source="voice")
+    assert queued.copied == [], "the copy ran on the voice turn"
+    assert res.handled and res.ack and res.done is False
+    assert res.reply == "Sending it now, sir." and res.speak
+    assert len(queued.jobs) == 1
+    queued.jobs[0]()
+    assert queued.copied[-1][2] is True
+    assert queued.spoken[-1] == "budget.xlsx is on HPCOMPUTER, sir."
+
+
+def test_a_confirmed_pull_leaves_the_voice_turn_at_once(queued):
+    queued.handle("get report v1 from HPCOMPUTER", source="voice")
+    queued.jobs.pop()()                       # the listing, from its worker
+    assert queued.spoken[-1].startswith("Bring report_v1.pdf from HPCOMPUTER")
+    res = queued.handle("yes", source="voice")
+    assert queued.copied == [], "the copy ran on the voice turn"
+    assert res.ack and res.done is False and res.reply == "Fetching it now, sir."
+    queued.jobs.pop()()
+    assert queued.copied[-1][2] is False
+    assert queued.spoken[-1] == "report_v1.pdf is on your Desktop, sir."
+
+
+@pytest.mark.parametrize("said,expect", [
+    ("is HPCOMPUTER up", "HPCOMPUTER: up"),
+    ("what's the disk on HPCOMPUTER", "HPCOMPUTER: disk"),
+    ("get the report from HPCOMPUTER", "Which one?"),
+])
+def test_a_remote_round_trip_never_runs_on_the_voice_turn(queued, monkeypatch,
+                                                          said, expect):
+    asked = []
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        asked.append(cmd) or
+                        remote.SshResult(True, out="report_v1.pdf\n"
+                                                   "report_v2.pdf\n"))
+    res = queued.handle(said, source="voice")
+    assert asked == [], f"{said!r} opened ssh on the voice turn"
+    assert res.handled and res.done is False and not res.reply
+    assert len(queued.jobs) == 1
+    queued.jobs[0]()
+    assert len(asked) == 1
+    assert queued.statuses[-1] == expect
+    assert queued.spoken, "the worker said nothing"
+
+
+def test_a_worker_outcome_goes_through_the_app_door_when_there_is_one(queued):
+    """The send lane's F20 lesson, kept here by name: bus + _speak_now show
+    and speak but do not CLOSE a done=False turn, so after the outcome the
+    wake word stayed dead until the 60 s watchdog.  services.reply
+    (JarvisApp._async_reply) shows, speaks, closes the turn and arms the
+    follow-up window; when it is wired, the worker must use it and nothing
+    else."""
+    delivered = []
+    queued.services.reply = lambda text, speak=True: delivered.append((text, speak))
+    queued.handle("is HPCOMPUTER up", source="voice")
+    queued.jobs[0]()
+    assert delivered and delivered[-1][0].startswith("HPCOMPUTER is up")
+    assert delivered[-1][1] is True
+    assert queued.spoken == [], "spoken twice: once per door"
+
+
+def test_a_worker_that_blows_up_still_closes_the_turn(queued, monkeypatch):
+    monkeypatch.setattr(remote, "ask", lambda conf, key:
+                        (_ for _ in ()).throw(RuntimeError("boom")))
+    queued.handle("is HPCOMPUTER up", source="voice")
+    queued.jobs[0]()
+    assert queued.spoken[-1] == remote.fail_line(
+        remote.read_config(queued.services.assistant), "failed")
