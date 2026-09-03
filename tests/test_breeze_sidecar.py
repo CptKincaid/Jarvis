@@ -2726,6 +2726,58 @@ def test_concurrent_renders_serialise_and_their_audio_never_interleaves(
     assert [w[0] for w in windows] == ["in", "out"] * 3, windows
 
 
+def test_a_phone_stream_behind_a_room_stream_waits_for_the_whole_render(
+        tmp_path):
+    """Rendition's docstring claimed the phone hears the reply '~0.3 s in
+    whatever its length'. That holds on an IDLE sidecar only. _dispatch
+    serialises generation under _render_lock and _serve_stream withholds
+    the status line until the first block exists, so a phone request that
+    lands while the room's utterance is rendering gets NOTHING -- not a
+    byte -- until that render has finished; and webapp's _stream_clip holds
+    the HTTP status line back for that same first block, so the phone sees
+    no response at all for the duration. Since the join the room's
+    utterance is the whole reply: up to ~30 s. Measured here with the
+    room's render gated: the phone's line arrives only once the gate opens."""
+    path = tmp_path / "breeze.sock"
+    gate = threading.Event()
+
+    def render(text, gain=1.0):
+        yield pcm(4, 1)
+        if text == "room":
+            gate.wait(10)                # the room's utterance, still on the GPU
+        yield pcm(4, 2)
+
+    start_real_server(path, ready_service(render))
+    room = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    phone = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        room.settimeout(5)
+        room.connect(str(path))
+        room.sendall(b'{"text": "room", "stream": true}\n')
+        line = b""
+        while not line.endswith(b"\n"):
+            line += recv_exactly(room, 1)
+        assert json.loads(line.decode())["ok"] is True
+        recv_exactly(room, 44 + 8)      # the header and the first block: rendering
+        phone.connect(str(path))
+        phone.sendall(b'{"text": "phone", "stream": true}\n')
+        phone.settimeout(0.5)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            phone.recv(1)                # not even the status line
+        gate.set()
+        phone.settimeout(5)
+        line = b""
+        while not line.endswith(b"\n"):
+            line += recv_exactly(phone, 1)
+        assert json.loads(line.decode())["ok"] is True
+        assert time.monotonic() - started >= 0.5
+    finally:
+        gate.set()
+        room.close()
+        phone.close()
+
+
 def test_shutting_the_worker_down_is_clean_and_final():
     rendered = []
 

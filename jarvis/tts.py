@@ -3432,13 +3432,26 @@ class Rendition:
     earned depends on the engine. F5, XTTS and edge render a whole chunk
     before a byte of it exists, so their first bytes arrive one chunk in.
     Breeze does not: it streams, so ``stream()`` forwards its blocks as they
-    land and the phone hears the reply ~0.3 s in whatever its length. That
-    matters here more than it does in the room, because
-    _BREEZE_STREAM_JOIN_CHARS made a reply one chunk -- correctly, for a
-    player that streams; ruinously for a reader that waited for a finished
-    file, which is what this used to be (a 218-character reply went from
-    1.35 s to first byte to 9.49 s, and webapp's _stream_clip holds the HTTP
-    status line back until then).
+    land and the phone hears the reply ~0.3 s in whatever its length --
+    WHEN THE SIDECAR IS IDLE. That matters here more than it does in the
+    room, because _BREEZE_STREAM_JOIN_CHARS made a reply one chunk --
+    correctly, for a player that streams; ruinously for a reader that
+    waited for a finished file, which is what this used to be (a
+    218-character reply went from 1.35 s to first byte to 9.49 s, and
+    webapp's _stream_clip holds the HTTP status line back until then).
+
+    Behind a room utterance it is that utterance's REMAINING RENDER. The
+    sidecar serialises generation under one lock and withholds its status
+    line until the first block exists, so a request that lands mid-utterance
+    gets nothing at all until the room's render is done -- and since the
+    join the room's utterance is the whole reply, up to ~30 s for a capped
+    one at RTF 0.742 (before it, the lock was released at every sentence
+    and a phone request could slip in between). _stream_clip then holds the
+    HTTP status line back for that same first block, so for all of it the
+    phone sees no response whatever. The reverse holds too: a phone stream
+    stalls the room's next utterance on the same lock, which the room
+    survives only because BREEZE_TIMEOUT_S is 60 s. Pinned by
+    test_a_phone_stream_behind_a_room_stream_waits_for_the_whole_render.
     """
 
     def __init__(self, tts: "TTS", text: str):
