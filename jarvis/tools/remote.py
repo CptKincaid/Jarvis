@@ -1,32 +1,48 @@
 """HPCOMPUTER -- files both ways and a SHORT allow-list of read-only questions.
 
-GROUND TRUTH, measured on the Spark 2026-09-02, before a line of this was
-written.  It is written down because every one of these facts changed the
-design, and a future reader who assumes otherwise will build the wrong thing:
+GROUND TRUTH, re-measured on the Spark 2026-09-03.  The 09-02 block this
+replaces said ``hpcomputer.local`` was a stale mDNS record, the host
+answered nothing and no key existed -- true that night, none of it now,
+and the design that followed from it (tailnet name + SOCKS proxy, a POSIX
+shell on the far side) targeted the wrong link.  Written down because every
+one of these facts changed the design, and a future reader who assumes
+otherwise will build the wrong thing:
 
-* **HPCOMPUTER is not on the tailnet.**  ``tailscale status`` has exactly
-  two nodes -- ``spark`` (this box, 100.70.145.63) and ``iphone172`` (iOS,
-  offline two days).  There is no HPCOMPUTER peer.
-* **HPCOMPUTER is not reachable at all right now.**  ``hpcomputer.local``
-  still resolves on the LAN, to 192.168.50.114, but that is a stale mDNS
-  record: the host answers no ping and has nothing listening on 22, 3389,
-  445 or 5900.  It is asleep or off.
-* **There is no ssh key for it.**  ``~/.ssh`` holds ``known_hosts`` and the
-  Oracle key, nothing else.  Key auth to HPCOMPUTER cannot work yet.
-* **tailscaled here runs in USERSPACE mode** (``--tun=userspace-networking``,
-  ``"TUN": false``), as a rootless user unit.  This is the fact that would
-  otherwise cost an afternoon: there is NO tun device, so once HPCOMPUTER
-  does join the tailnet, ``ssh user@hpcomputer.tail5323b8.ts.net`` will
-  still not route.  Tailscale traffic has to go through the SOCKS5 proxy
-  the daemon already runs on ``localhost:1055``, which is why
-  :func:`ssh_argv` grows a ``ProxyCommand``.  ``nc -X 5 -x`` is present and
-  supports SOCKS5; ssh, scp, sftp and rsync are all installed.
+* **HPCOMPUTER is a Windows box on the LAN, not a tailnet peer.**
+  ``hpcomputer.local`` resolves to 192.168.50.114 (``getent hosts``) and
+  there is a live ARP entry for it (60:cf:84:ad:fd:91).  ``tailscale
+  status`` has two nodes -- ``spark`` (100.70.145.63) and ``iphone172``
+  (offline) -- and no HPCOMPUTER, nor a plan for one.  So the tailnet view
+  and the SOCKS proxy apply to a tailnet ADDRESS only
+  (:func:`tailnet_host`); a LAN host gets ssh's own answer.
+* **Its ssh is Windows OpenSSH Server** (``Add-WindowsCapability
+  OpenSSH.Server``, staged and waiting on a reboot as of the 09-03
+  checklist; user ``h2pey``).  Its login shell is cmd.exe or PowerShell:
+  there is no ``ls``, ``df``, ``uptime`` or ``$HOME`` there.  Hence
+  ``remote.os`` (windows shipped), a question table with a command per OS
+  (:data:`QUERIES`), and the Windows folder listing over SFTP -- the
+  channel scp already speaks -- rather than a remote shell.  Port 22 has
+  NOT been probed from here (no network, by instruction), and the Windows
+  rows have not been run: the first live command is Hunter's.
+* **The key is ``~/.ssh/hpcomputer``** (ed25519, generated 09-03 00:44; its
+  public half belongs in ``C:\\ProgramData\\ssh\\administrators_authorized_keys``
+  because his account is an administrator).  ``~/.ssh`` holds NO
+  default-named identity, so a blank ``remote.key_path`` offers ssh nothing
+  and is refused before a socket opens ("no-key").
+* **tailscaled here runs in USERSPACE mode** (``--tun=userspace-networking
+  --socks5-server=localhost:1055``, a rootless user unit whose socket is
+  ``~/.local/share/tailscale/tailscaled.sock``).  There is NO tun device,
+  so a tailnet name routes only through that SOCKS5 port, which is why
+  :func:`ssh_argv` grows a ``ProxyCommand`` for a tailnet address.  ``nc
+  -X 5 -x`` is present; ssh, scp and sftp are OpenSSH 9.6p1.
 
 So this module ships ``enabled: false`` and every entry point refuses out
 loud with a reason that names what is missing.  Nothing here has been run
 against the real host -- by instruction, Hunter runs the first live command
 himself.  What IS tested is every decision this module makes before the
-socket opens, which is where the irreversible mistakes live.
+socket opens, which is where the irreversible mistakes live -- and, for
+the Windows side, the reading of sftp's batch output as measured locally
+(``sftp -D`` straight to this box's sftp-server; no socket).
 
 ------------------------------------------------------------------- safety
 
@@ -66,9 +82,9 @@ Two more rules that are less obvious and matter as much:
   quoted around -- a file with a newline or a backtick in its name is not
   worth the class of bug it invites.
 
-``run_ssh`` and ``run_copy`` are the two module-level seams, looked up at
-call time, so tests replace them and no test in this repo can reach a
-network, a host key or a disk it did not make.
+``run_ssh``, ``run_copy`` and ``run_sftp`` are the three module-level
+seams, looked up at call time, so tests replace them and no test in this
+repo can reach a network, a host key or a disk it did not make.
 """
 from __future__ import annotations
 

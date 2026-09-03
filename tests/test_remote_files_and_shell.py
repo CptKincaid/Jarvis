@@ -2,19 +2,24 @@
 that refuses everything else -- jarvis/tools/remote.py + jarvis/tools/filepick.py.
 
 NOTHING HERE OPENS A SOCKET, TOUCHES THE TAILNET OR WRITES OUTSIDE tmp_path.
-``remote.run_ssh``, ``remote.run_copy`` and ``remote.tailnet_state`` are the
-three module-level seams and every test replaces the ones it needs; the
-unconfigured tests assert that reaching ``subprocess.Popen`` AT ALL is the
-bug, because the whole point of ``missing_reason`` is to answer without
-opening anything.
+``remote.run_ssh``, ``remote.run_copy``, ``remote.run_sftp`` and
+``remote.tailnet_state`` are the four module-level seams and every test
+replaces the ones it needs; the unconfigured tests assert that reaching
+``subprocess.Popen`` AT ALL is the bug, because the whole point of
+``missing_reason`` is to answer without opening anything.
 
-The ground truth these were written against, measured 2026-09-02: HPCOMPUTER
-is NOT a tailnet peer (only ``spark`` and an offline iPhone are), it answers
-no ping and has no port 22, there is no key for it in ``~/.ssh``, and
-tailscaled here runs ``--tun=userspace-networking`` so tailnet traffic must
-go through the SOCKS5 proxy on 127.0.0.1:1055.  So the lane ships OFF, and
-what is tested is every decision made BEFORE the socket -- which is where
-the irreversible mistakes live.
+The ground truth these were written against, re-measured 2026-09-03 (the
+09-02 header said a stale mDNS record, no port 22 and no key -- see the
+module docstring): HPCOMPUTER is a Windows box on the LAN, 192.168.50.114 /
+hpcomputer.local, running Windows OpenSSH Server as user h2pey, and NOT a
+tailnet peer; the key is ~/.ssh/hpcomputer; tailscaled here runs
+``--tun=userspace-networking``, so a TAILNET address goes through the SOCKS5
+proxy on 127.0.0.1:1055 and a LAN address goes direct.  The lane still
+ships OFF -- the first live command is his -- and what is tested is every
+decision made BEFORE the socket, which is where the irreversible mistakes
+live.  The sftp batch text the Windows tests read is verbatim from this
+box (``sftp -D`` to the local sftp-server, no socket); the Windows
+PowerShell rows themselves are not verified here.
 """
 import os
 import subprocess
@@ -89,9 +94,10 @@ class NoPopen:
 
 # ============================================================ the config
 def test_the_shipped_config_is_off_and_empty():
-    """It ships OFF with a blank host because as of 2026-09-02 HPCOMPUTER is
-    not on the tailnet and has no key here.  A default that pretended
-    otherwise would produce a ten-second timeout instead of a sentence."""
+    """It ships OFF with a blank host because nothing here has run against
+    the real box and the first live command is his.  A default that
+    pretended otherwise would produce a ten-second timeout instead of a
+    sentence."""
     row = DEFAULTS["remote"]
     assert row["enabled"] is False
     assert row["host"] == ""
@@ -101,7 +107,8 @@ def test_the_shipped_config_is_off_and_empty():
 
 def test_the_shipped_config_routes_through_the_userspace_socks_proxy():
     """The one setting that would otherwise cost an afternoon: tailscaled
-    here has no tun device, so a direct ssh to a tailnet name cannot route."""
+    here has no tun device, so a direct ssh to a tailnet name cannot route.
+    Applied to a tailnet ADDRESS only (F08); the LAN box goes direct."""
     assert DEFAULTS["remote"]["socks_proxy"] == "127.0.0.1:1055"
 
 
