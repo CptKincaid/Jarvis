@@ -30,14 +30,31 @@ class Cfg:
 
 
 class Quiet:
-    """quiet.py's one seam the arrival cue uses."""
+    """quiet.py's one seam the arrival cue uses, with the SAME contract as
+    QuietPolicy.take_fragments: a drain the caller can undo. The arrival
+    catch-up may decide not to speak long after it asked, and a stand-in
+    that could only drain one-way would let a test claim the backlog was
+    safe when the real policy's was being destroyed."""
 
     def __init__(self, frags=()):
         self.frags = list(frags)
+        self.put_backs = 0
+
+    def take_fragments(self):
+        taken, self.frags = self.frags, []
+        done = []
+
+        def put_back():
+            if done:
+                return 0
+            done.append(True)
+            self.put_backs += 1
+            self.frags = list(taken) + list(self.frags)
+            return len(taken)
+        return list(taken), put_back
 
     def release_fragments(self):
-        frags, self.frags = self.frags, []
-        return frags
+        return self.take_fragments()[0]
 
 
 def make_app(cfg=None, quiet=None, services=None):
@@ -451,10 +468,11 @@ def test_stopping_the_sentinel_stops_the_fabric_with_it():
 # `bus.attach_tk(root)` makes publish() queue and drain() run from the UI's
 # `_pump`, so every subscriber -- `_on_presence`, `_on_room_changed`, and
 # the whole arrival cue behind them -- executes on the Tk MAIN thread. The
-# unread count is an IMAP round trip, bounded by IMAP_TIMEOUT (15 s a
-# mailbox, in parallel, so one timeout and not their sum -- what three of
-# his own mailboxes cost is NOT measured), so paying it inline froze the
-# window and every event behind it at the moment he walked in.
+# unread count is an IMAP round trip, and how long one of those can take is
+# NOT MEASURED and has no bound this tree can quote: IMAP_TIMEOUT is the
+# SOCKET timeout, so it bounds one blocking call and never bounded a fetch.
+# That is exactly why it cannot be paid inline, where it froze the window
+# and every event behind it at the moment he walked in.
 FAKE_ACCOUNT = {"label": "test", "address": "someone@example.com",
                 "app_password": "not-a-real-password"}
 
@@ -596,11 +614,13 @@ def test_a_door_room_that_does_match_is_silent(caplog):
 # ==================================================================
 # Taking the fetch off the pump thread bought the window back and sold the
 # ATOMICITY of the last arrival step: the cue returns, and the offer is
-# spoken and parked whenever the mailbox happens to answer -- up to
-# IMAP_TIMEOUT (15 s) later. Inline that could not happen. A catch-up that
-# lands after he has asked Jarvis something else is not late, it is WRONG,
-# and silence is the right outcome for a stale digest: nothing here is
-# news that keeps.
+# spoken and parked whenever the mailbox happens to answer -- however long
+# that is, which nothing here measures or bounds. Inline that could not
+# happen. A catch-up that lands after he has asked Jarvis something else is
+# not late, it is WRONG, and silence is the right outcome for a stale
+# digest: nothing here is news that keeps. How late is TOO late is the one
+# part that is bounded, and by a check rather than a claim -- see the
+# lateness tests at the end of this file.
 def _gated_mailbox(gate, seconds=10.0):
     def fetch_unread(*args, **kw):
         gate.wait(seconds)
@@ -608,10 +628,10 @@ def _gated_mailbox(gate, seconds=10.0):
     return fetch_unread
 
 
-def _catching_up(monkeypatch, gate):
+def _catching_up(monkeypatch, gate, held=()):
     import jarvis.tools.mail as mail_mod
     monkeypatch.setattr(mail_mod, "fetch_unread", _gated_mailbox(gate))
-    a = make_app({"gmail.accounts": [FAKE_ACCOUNT]}, quiet=Quiet([]),
+    a = make_app({"gmail.accounts": [FAKE_ACCOUNT]}, quiet=Quiet(held),
                  services=SimpleNamespace(panel_wake=None, briefing_offer=None))
     assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
     return a
@@ -731,3 +751,348 @@ def test_the_deferred_mark_does_not_survive_into_the_NEXT_cue(monkeypatch):
     a.quiet = Quiet(["While you were out, sir:"])
     arrival_mod.run(["catch-up"], a._arrival_actions())
     assert a._arrival_ledger(["catch-up"]) == "catch-up"
+
+
+# ==================================================================
+# A DROPPED CATCH-UP MUST NOT COST HIM THE BACKLOG
+# ==================================================================
+# The repair above was right to drop a stale digest and wrong in how it
+# did it: the held lines were drained atomically on the pump thread BEFORE
+# the worker started, so when the worker decided the catch-up was stale
+# those lines were GONE. They are the things he missed while he was out
+# and there is no second copy of them anywhere.
+#
+# Two rules hold it now and these tests are the whole class, not the one
+# reported case: nothing is taken until the guard has passed, and every
+# path out of speak_catch_up that did not queue the words puts it back.
+HELD = ["While you were out, sir:", "The build passed, sir."]
+
+
+def _boom(*a, **kw):
+    raise RuntimeError("the floor probe exploded")
+
+
+def _turn_taken(a):
+    a._dispatch_gen = getattr(a, "_dispatch_gen", 0) + 1
+
+
+def _turn_open(a):
+    import threading as _threading
+    a._turn_busy = _threading.Event()
+    a._turn_busy.set()
+
+
+def _transcribing(a):
+    import threading as _threading
+    a._audio_busy = _threading.Event()
+    a._audio_busy.set()
+
+
+def _mic_open(a):
+    a.recorder = SimpleNamespace(recording=True)
+
+
+def _newer_arrival(a):
+    a._arrival_gen = getattr(a, "_arrival_gen", 0) + 1
+
+
+def _guard_itself_broken(a):
+    # A GUARD THAT FAILS OPEN IS NOT A GUARD. Every read in
+    # _arrival_catch_up_stale used to sit under one bare `except` that fell
+    # through to "" -- and "" is PERMISSION to speak. So: break a read and
+    # the question does not get asked.
+    a._turn_busy = SimpleNamespace(is_set=_boom)
+
+
+DROPS = [_turn_taken, _turn_open, _transcribing, _mic_open, _newer_arrival,
+         _guard_itself_broken]
+
+
+@pytest.mark.parametrize("move", DROPS, ids=lambda f: f.__name__)
+def test_a_dropped_catch_up_leaves_the_QUIET_BACKLOG_INTACT(monkeypatch, move):
+    """Every way the digest can be dropped, against a real backlog."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate, held=HELD)
+    move(a)
+    _finish(a, gate)
+    _said_nothing(a)
+    assert a.quiet.frags == HELD, "the dropped catch-up destroyed the backlog"
+
+
+@pytest.mark.parametrize("move", DROPS, ids=lambda f: f.__name__)
+def test_a_dropped_catch_up_does_not_even_TAKE_the_backlog(monkeypatch, move):
+    """Not "took it and gave it back" -- never taken. The guard is asked
+    before anything that cannot be undone, so the ordinary drop leaves the
+    policy's own falling edge to read the lines out on its next tick."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate, held=HELD)
+    move(a)
+    _finish(a, gate)
+    assert a.quiet.frags == HELD and a.quiet.put_backs == 0, \
+        "it was taken and handed back, not left alone"
+
+
+@pytest.mark.parametrize("move", DROPS, ids=lambda f: f.__name__)
+def test_the_backlog_a_dropped_catch_up_left_is_STILL_THERE_NEXT_TIME(
+        monkeypatch, move):
+    """The point of keeping it: the next cue reads it out."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate, held=HELD)
+    move(a)
+    _finish(a, gate)
+    # ...and he walks in again, this time with nothing in the way.
+    a.assistant.data.pop("gmail.accounts")
+    a._dispatch_gen = getattr(a, "_dispatch_gen", 0)
+    a._turn_busy = a._audio_busy = None
+    a.recorder = None
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert a.tts.spoken and "The build passed" in a.tts.spoken[-1]
+    assert a.quiet.frags == []
+
+
+def test_a_catch_up_that_DOES_speak_consumes_the_backlog_exactly_once(monkeypatch):
+    """The control, and the other half of the class: a digest that WAS
+    spoken must not be put back, or he hears it twice."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate, held=HELD)
+    _finish(a, gate)
+    assert "The build passed" in a.tts.spoken[0]
+    assert "1 unread email" in a.tts.spoken[0]
+    assert a.quiet.frags == [] and a.quiet.put_backs == 0
+
+
+def test_a_digest_that_THINS_AWAY_TO_NOTHING_puts_the_backlog_back():
+    """The exit nobody was looking at: taken, and then there was nothing
+    left to say. It returns "" like an empty backlog does, and "" must not
+    mean the lines were spent."""
+    a = make_app(quiet=Quiet(HELD),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    a._unread_count = lambda: 3
+    a._thin_address = lambda frags: ["" for _ in frags]
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == []
+    assert a.tts.spoken == [] and a.quiet.frags == HELD
+    assert a.quiet.put_backs == 1
+
+
+def test_a_TTS_FAILURE_puts_the_backlog_back_too():
+    """A digest that could not be spoken is worth repeating; one that was
+    destroyed is not recoverable."""
+    a = make_app(quiet=Quiet(HELD),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    a._unread_count = lambda: 3
+    a.tts.speak = _boom
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == []
+    assert a.quiet.frags == HELD and a.quiet.put_backs == 1
+
+
+def test_a_ONE_WAY_quiet_stand_in_is_declared_rather_than_losing_lines(caplog):
+    """A policy that has only the one-way drain cannot give anything back.
+    That is a degraded guarantee, and the whole bug above was a degraded
+    guarantee nobody said out loud."""
+    import logging
+
+    class OneWay:
+        def __init__(self):
+            self.frags = list(HELD)
+
+        def release_fragments(self):
+            frags, self.frags = self.frags, []
+            return frags
+
+    a = make_app(quiet=OneWay(),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    with caplog.at_level(logging.WARNING):
+        assert a._take_held_fragments()[0] == HELD
+    assert any("OneWay" in r.getMessage() and r.levelno >= logging.WARNING
+               for r in caplog.records)
+
+
+# ==================================================================
+# The park and the follow-up mic are one invariant
+# ==================================================================
+def test_a_TTS_FAILURE_still_leaves_a_WINDOW_to_answer_the_parked_question():
+    """Parking before the words is deliberate: a TTS failure must not leave
+    a question on the floor with nothing listening for the answer. Arming
+    the mic after `_say` -- which is right, the welcome's own falling edge
+    could otherwise open it early -- put the arm on the far side of the one
+    call that can fail, so a TTS failure produced exactly the outcome the
+    park exists to prevent. The card is already published; he can read the
+    question, and now he can answer it."""
+    a = make_app(quiet=Quiet([]),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    a._unread_count = lambda: 3
+    a.tts.speak = _boom
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert a.services.briefing_offer is not None, "the question was not parked"
+    assert a._followup_after_speech is True, "parked with no window to answer in"
+
+
+def test_nothing_is_armed_when_nothing_was_PARKED_even_on_a_TTS_failure():
+    """A fault-only line is a statement; there is no question, so there is
+    no window -- the `finally` must not arm one anyway."""
+    board = SimpleNamespace(current=SimpleNamespace(kind="error",
+                                                    line="The disk is full."))
+    a = make_app(quiet=Quiet([]),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None,
+                                          faults=board))
+    a._unread_count = lambda: 0
+    a.tts.speak = _boom
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert a.services.briefing_offer is None
+    assert a._followup_after_speech is False
+
+
+# ==================================================================
+# How late the question may be is a CHECK, not a claim
+# ==================================================================
+# "IMAP_TIMEOUT: 15 s a mailbox" was quoted as the worst case three times
+# in this branch and was never one -- it is the SOCKET timeout, so it
+# bounds one blocking call, not a fetch and not the step. The bound is now
+# enforced where it can be true by construction.
+def test_a_catch_up_that_overruns_the_LATENESS_BOUND_is_dropped(monkeypatch):
+    """MEASURED against the clock, not argued: the bound is set below the
+    fetch and the digest does not get spoken."""
+    import jarvis.tools.mail as mail_mod
+    monkeypatch.setattr(app_mod, "ARRIVAL_CATCH_UP_LATENESS_S", 0.2)
+    monkeypatch.setattr(mail_mod, "fetch_unread", _slow_mailbox(0.5))
+    a = make_app({"gmail.accounts": [FAKE_ACCOUNT]}, quiet=Quiet(HELD),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
+    a._arrival_catch_up_thread.join(timeout=10.0)
+    assert not a._arrival_catch_up_thread.is_alive()
+    _said_nothing(a)
+    assert a.quiet.frags == HELD
+
+
+def test_a_catch_up_INSIDE_the_lateness_bound_still_speaks(monkeypatch):
+    """The control. A guard that drops the ordinary case is worse than the
+    bug it was written for."""
+    import jarvis.tools.mail as mail_mod
+    monkeypatch.setattr(app_mod, "ARRIVAL_CATCH_UP_LATENESS_S", 5.0)
+    monkeypatch.setattr(mail_mod, "fetch_unread", _slow_mailbox(0.05))
+    a = make_app({"gmail.accounts": [FAKE_ACCOUNT]}, quiet=Quiet(HELD),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    a._arrival_catch_up_thread.join(timeout=10.0)
+    assert "The build passed" in a.tts.spoken[0]
+    assert a.services.briefing_offer is not None
+
+
+# ==================================================================
+# The guard fails CLOSED
+# ==================================================================
+def test_the_guard_says_DROP_when_it_cannot_tell():
+    """"" is permission. A guard whose own breakage grants the thing it
+    exists to withhold is the wrong way round, and there is now exactly one
+    `return ""` in it -- the last statement of the try."""
+    import time as _time
+    a = make_app()
+    a._arrival_gen = a._dispatch_gen = 0
+    a._turn_busy = SimpleNamespace(is_set=_boom)
+    assert a._arrival_catch_up_stale(0, 0, _time.monotonic()) != ""
+
+
+def test_the_guard_says_SPEAK_when_nothing_has_moved():
+    import time as _time
+    a = make_app()
+    a._arrival_gen = a._dispatch_gen = 0
+    assert a._arrival_catch_up_stale(0, 0, _time.monotonic()) == ""
+
+
+def test_the_guard_drops_anything_older_than_the_bound():
+    import time as _time
+    a = make_app()
+    a._arrival_gen = a._dispatch_gen = 0
+    started = _time.monotonic() - (app_mod.ARRIVAL_CATCH_UP_LATENESS_S + 1.0)
+    why = a._arrival_catch_up_stale(0, 0, started)
+    assert "late" in why
+
+
+# ==================================================================
+# The same class, against the REAL QuietPolicy
+# ==================================================================
+# Everything above vets the drop against the `Quiet` stand-in at the top of
+# this file -- and that stand-in was rewritten by the same change as the
+# fix. On its own it proves the two AGREE, not that his backlog survives.
+# These wire jarvis.quiet.QuietPolicy itself: its own deque, its own
+# take_fragments, its own put_back.
+def _real_quiet(lines=HELD):
+    from jarvis.quiet import QuietPolicy
+    p = QuietPolicy(Cfg())
+    p.set_dnd(600)                      # he is out; the lines are held
+    for line in lines:
+        assert p.hold(line, "message") is True
+    return p
+
+
+def _texts(policy):
+    return [text for _, text, _ in policy.held]
+
+
+def _catching_up_for_real(monkeypatch, gate, policy):
+    """As `_catching_up`, but the REAL policy is wired BEFORE the cue runs
+    -- which is the whole point. Attached afterwards it would never be the
+    thing the pump thread reached for, and the old one-way drain would sail
+    past a test that looked like it was watching it."""
+    import jarvis.tools.mail as mail_mod
+    monkeypatch.setattr(mail_mod, "fetch_unread", _gated_mailbox(gate))
+    a = make_app({"gmail.accounts": [FAKE_ACCOUNT]}, quiet=policy,
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
+    return a
+
+
+@pytest.mark.parametrize("move", DROPS, ids=lambda f: f.__name__)
+def test_a_dropped_catch_up_leaves_a_REAL_policys_backlog_intact(monkeypatch,
+                                                                 move):
+    import threading as _threading
+    gate = _threading.Event()
+    p = _real_quiet()
+    a = _catching_up_for_real(monkeypatch, gate, p)
+    move(a)
+    _finish(a, gate)
+    _said_nothing(a)
+    assert _texts(p) == list(HELD), "the dropped catch-up destroyed the backlog"
+
+
+def test_the_REAL_backlog_a_dropped_catch_up_left_is_read_out_NEXT_TIME(
+        monkeypatch):
+    """Kept is worth nothing if nothing ever says it."""
+    import threading as _threading
+    gate = _threading.Event()
+    p = _real_quiet()
+    a = _catching_up_for_real(monkeypatch, gate, p)
+    a._dispatch_gen = getattr(a, "_dispatch_gen", 0) + 1       # he took a turn
+    _finish(a, gate)
+    _said_nothing(a)
+    # ...and he walks in again, with no mailbox in the way (inline, atomic).
+    a.assistant.data.pop("gmail.accounts")
+    a._dispatch_gen = getattr(a, "_dispatch_gen", 0)
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
+    assert a.tts.spoken and "The build passed" in a.tts.spoken[-1]
+    assert p.held == []
+
+
+def test_a_TTS_FAILURE_gives_a_REAL_policy_its_lines_back_and_they_are_SPOKEN():
+    """The put_back path itself, end to end: taken from the real deque,
+    handed back to it, and read out by the policy's OWN next tick -- which
+    only happens because put_back re-arms the falling edge the take
+    consumed."""
+    said = []
+    p = _real_quiet()
+    p._say = said.append
+    a = make_app(quiet=p,
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    a._unread_count = lambda: 3
+    a.tts.speak = _boom
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == []
+    assert a.tts.spoken == [] and _texts(p) == list(HELD)
+    # The take consumed the falling edge those lines belonged to; put_back
+    # re-armed it, so the policy's own next tick reads them out.
+    p._set("quiet.dnd_until", 0)               # the window is over
+    text = p.tick()
+    assert "The build passed" in text and said == [text]

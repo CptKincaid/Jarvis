@@ -265,9 +265,9 @@ def make_probe(sensor, phone: Callable = probe) -> Callable:
 class PresenceSentinel:
     """See the module docstring. ``state`` is 'home' | 'away' | 'unknown'."""
 
-    # The leg already named in the missing-`blocked` ERROR (see
-    # _warn_no_blocked). A class default so a sentinel built by a test with
-    # object.__new__ still answers the question.
+    # The leg-and-reason already named in the unreadable-`blocked` ERROR
+    # (see _warn_no_blocked). A class default so a sentinel built by a test
+    # with object.__new__ still answers the question.
     _no_blocked_warned = ""
 
     def __init__(self, cfg, publish: Callable = bus.publish,
@@ -409,31 +409,30 @@ class PresenceSentinel:
         lasts until he says otherwise, and there is no honest way to keep
         answering a question nothing has been able to observe for hours.
 
-        A MISSING ``blocked`` IS LOUD, and that is the whole change here.
-        This check used to sit inside a bare ``except Exception`` logged at
-        debug, so when the multi-room leg arrived without the attribute
-        (2026-09-03) the AttributeError was swallowed and the dark-safe
-        path simply stopped existing: presence held its last verdict for
-        the length of the blackout. A privacy path that fails silently is
-        the worst failure in this file, so a leg that cannot say whether it
-        is blocked is reported at ERROR with its type named. It still
-        returns False -- inventing "blacked out" from a broken leg would
-        blank presence on every bug -- but it can no longer do so quietly.
+        A LEG THAT CANNOT SAY WHETHER IT IS BLOCKED IS LOUD -- however it
+        fails to say it. This is the privacy path, and it has now gone
+        quiet twice in two different ways. First the whole read sat inside
+        a bare ``except Exception`` logged at debug, so when the multi-room
+        leg arrived without the attribute (2026-09-03) the AttributeError
+        was swallowed and the dark-safe path simply stopped existing.
+        Then the fix made a MISSING ``blocked`` loud and left the OTHER
+        branch of its own ``if`` exactly as it was: a ``blocked`` that
+        RAISED -- an unreadable policy file, a bug in a future leg -- was
+        still caught, still debug, still silent. Same bug, other half.
 
-        LOUD ABOUT THE CASE WE CAN NAME, STILL CAUGHT FOR THE ONES WE
-        CANNOT. The first cut of that ERROR put the read OUTSIDE the try,
-        which narrowed a catch on the privacy path: a ``blocked`` that
-        raises anything other than a missing attribute -- an unreadable
-        policy file, a bug in a future leg -- then escaped this method,
-        escaped ``tick()`` (which has no guard of its own; only ``_loop``
-        does) and cost the whole poll, this blackout's own ``_forget()``
-        included. Widening a catch is usually the wrong instinct; here the
-        old breadth was protecting something. The read is back inside.
+        So there is no longer a branch to forget. One ``try`` asks the leg
+        the question; ANY answer that is not a usable one -- the attribute
+        absent, the property raising, the value refusing ``bool()`` -- is
+        the same event, reported at ERROR by ``_warn_no_blocked`` with the
+        leg and the reason named. It still returns False (inventing
+        "blacked out" from a broken leg would blank presence on every bug)
+        but it can no longer do so quietly, and the ERROR is said ONCE per
+        leg-and-reason: ``poll_s`` is 60 s, and one line an hour for ever
+        is how a real error gets filtered out of a log.
 
-        And the ERROR is said ONCE per leg. A leg with no ``blocked`` is
-        wrong for as long as it is wired, and ``poll_s`` is 60 s: one line
-        names the bug, one an hour for ever is how a real error gets
-        filtered out of a log.
+        Caught, not raised, either way. ``tick()`` has no guard of its own
+        (only ``_loop`` does), so an exception escaping here costs the
+        whole poll -- this blackout's own ``_forget()`` included.
         """
         if self.phone_ip or self.phone_mac:
             return False
@@ -443,20 +442,26 @@ class PresenceSentinel:
         try:
             blocked = getattr(sensor, "blocked", _MISSING)
             if blocked is _MISSING:
-                self._warn_no_blocked(type(sensor).__name__)
-                return False
+                raise AttributeError("the leg has no `blocked`")
             return bool(blocked)
-        except Exception:  # noqa: BLE001 - provider boundary
-            log.debug("presence: sensor block check failed", exc_info=True)
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            self._warn_no_blocked(type(sensor).__name__, exc)
             return False
 
-    def _warn_no_blocked(self, leg: str) -> None:
-        """The missing-``blocked`` ERROR, once per leg type."""
-        if getattr(self, "_no_blocked_warned", "") == leg:
+    def _warn_no_blocked(self, leg: str, exc: BaseException) -> None:
+        """The unreadable-``blocked`` ERROR, once per leg and reason.
+
+        Keyed on the reason as well as the leg so a leg that starts
+        failing a NEW way says so, while the one that is simply wired
+        wrong stays one line rather than one a minute.
+        """
+        key = "%s/%s" % (leg, type(exc).__name__)
+        if getattr(self, "_no_blocked_warned", "") == key:
             return
-        self._no_blocked_warned = leg
-        log.error("presence: the %s leg has no `blocked`, so offline mode "
-                  "cannot reach the sentinel; holding the last verdict", leg)
+        self._no_blocked_warned = key
+        log.error("presence: the %s leg cannot say whether it is blocked "
+                  "(%s: %s), so offline mode cannot reach the sentinel; "
+                  "holding the last verdict", leg, type(exc).__name__, exc)
 
     def _forget(self) -> None:
         """Back to "no opinion", without publishing a transition.

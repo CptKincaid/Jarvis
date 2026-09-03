@@ -203,19 +203,41 @@ Three rules that are easy to get wrong, and were:
   answer in.
 * **The unread count runs on a worker thread** when a mailbox is configured.
   `bus.drain()` runs from the UI's Tk pump, so an IMAP round trip taken inline
-  froze the window and every event behind it at the moment he walked in. The
-  bound is `IMAP_TIMEOUT`: 15 s a mailbox, in parallel, so one timeout rather
-  than their sum. What three of his mailboxes actually cost is **not
-  measured** — the 8.1 s figure elsewhere in the tree is mail.py's *sequential*
-  measurement from 2026-08-31 and predates the pool. With no mailbox nothing
-  opens a socket and the cue stays synchronous.
+  froze the window and every event behind it at the moment he walked in. **How
+  long that round trip can take is not measured and has no bound this tree can
+  quote.** `IMAP_TIMEOUT` was quoted as one three times and never was: it is
+  the *socket* timeout, so it bounds one blocking call — not a mailbox, not a
+  fetch, not the step. (The 8.1 s figure elsewhere is mail.py's *sequential*
+  measurement from 2026-08-31 and predates the thread pool.) The unbounded cost
+  is the reason it cannot be paid on the pump. With no mailbox nothing opens a
+  socket and the cue stays synchronous.
 * **A catch-up that lands too late is DROPPED, not spoken.** Off the pump the
-  last step is no longer atomic, so before it speaks the worker asks whether
-  the arrival it belongs to is still the current one and whether he has taken a
-  turn since (`_dispatch_gen`, the same counter `_async_reply` reads). If
-  either has moved, silence: nothing in the digest is news that keeps. The
-  cue's log line says `catch-up (started)` on that path, because that is all
-  `run()` can honestly claim.
+  last step is no longer atomic, so after the fetch and before anything is said
+  the worker asks whether the world it was answering is still there: how late
+  it now is (`ARRIVAL_CATCH_UP_LATENESS_S`, a **check** and therefore a real
+  bound — 10 s, a judgement, not a measurement), whether he has taken a turn
+  since (`_dispatch_gen`, the counter `_async_reply` reads), whether the floor
+  is busy, and whether this is still the current arrival. Any of those and it
+  is silence: nothing in the digest is news that keeps. **The guard fails
+  closed** — a guard that could not tell is a question that does not get
+  asked, because "" means permission. The cue's log line says
+  `catch-up (started)` on that path, because that is all `run()` can honestly
+  claim.
+* **A dropped catch-up must not cost him the backlog.** The first cut of the
+  drop drained the quiet-hours backlog on the pump thread and handed it to the
+  worker, so dropping the digest *destroyed* the lines he had missed. Nothing
+  is taken now until the guard has passed (`quiet.take_fragments`, the
+  reversible form of `release_fragments`), and every path out that does not
+  queue the words puts it back — including a TTS failure and a digest that
+  thins away to nothing. `put_back()` re-arms the policy's falling edge, so
+  the lines are read out by quiet.py's own next tick rather than sitting held
+  and mute.
+* **The parked question and the follow-up mic are one invariant.** The question
+  is parked before the words so a TTS failure cannot leave it on the floor;
+  the mic is armed after `_say` has queued, so the *welcome's* falling edge
+  cannot open it early. A `finally` holds both together — arming after `_say`
+  without one meant a TTS failure parked a question with no window to answer
+  it in, which is the exact outcome the early park exists to prevent.
 
 Degradation is the point: with no kitchen sensor, no calendar and no mailbox he
 gets exactly the "Welcome back, sir" he got before any of this was built.

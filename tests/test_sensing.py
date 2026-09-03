@@ -1090,3 +1090,112 @@ def test_the_missing_blocked_ERROR_is_said_once_not_once_a_POLL(caplog):
     said = [r for r in caplog.records
             if "LegWithNoBlocked" in r.getMessage() and r.levelno >= logging.ERROR]
     assert len(said) == 1, "one ERROR a poll, for as long as the leg is wrong"
+
+
+# =====================================================================
+# The privacy path is loud HOWEVER the leg fails to answer
+# =====================================================================
+# Third pass on the same three lines. It went silent once with the read
+# inside a bare `except ... debug`; then a MISSING `blocked` was made loud
+# and the OTHER branch of that same `if` -- a `blocked` that RAISES -- was
+# left exactly as it was, caught at debug and swallowed. There is no branch
+# left to forget now: one `try` asks the question and every way of failing
+# to answer it is the same reported event.
+class _NoBlocked:
+    configured = True
+
+    def read(self):
+        return None
+
+
+class _BlockedRaises:
+    configured = True
+
+    @property
+    def blocked(self):
+        raise RuntimeError("the policy file is unreadable")
+
+    def read(self):
+        return None
+
+
+class _UnBoolable:
+    """A value that is there and still cannot be read as a yes or a no."""
+
+    class _Odd:
+        def __bool__(self):
+            raise ValueError("this cannot be read as a yes or a no")
+
+    configured = True
+    blocked = _Odd()
+
+    def read(self):
+        return None
+
+
+def _dark_sentinel(leg):
+    from jarvis.presence import PresenceSentinel
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = leg
+    return s
+
+
+@pytest.mark.parametrize("leg", [_NoBlocked, _BlockedRaises, _UnBoolable])
+def test_EVERY_way_of_failing_to_answer_blocked_is_reported_loudly(leg, caplog):
+    """Absent, raising, or refusing bool(): one ERROR, naming the leg, and
+    False rather than an invented blackout. A privacy path that fails
+    silently is the worst failure in this file."""
+    import logging
+    s = _dark_sentinel(leg())
+    with caplog.at_level(logging.ERROR):
+        assert s._blacked_out() is False
+    loud = [r for r in caplog.records
+            if leg.__name__ in r.getMessage() and r.levelno >= logging.ERROR]
+    assert len(loud) == 1, f"{leg.__name__} failed quietly"
+
+
+@pytest.mark.parametrize("leg", [_NoBlocked, _BlockedRaises, _UnBoolable])
+def test_no_way_of_failing_to_answer_blocked_costs_the_TICK(leg):
+    """`tick()` has no guard of its own (only `_loop` does), so anything
+    escaping here loses the whole poll -- the blackout's own `_forget()`
+    included."""
+    s = _dark_sentinel(leg())
+    assert s.tick() is None
+
+
+@pytest.mark.parametrize("leg", [_NoBlocked, _BlockedRaises, _UnBoolable])
+def test_the_unreadable_blocked_ERROR_is_said_once_not_once_a_poll(leg, caplog):
+    """`poll_s` is 60 s and the leg stays wrong for as long as it is wired:
+    one line an hour for ever is how a real error gets filtered out."""
+    import logging
+    s = _dark_sentinel(leg())
+    with caplog.at_level(logging.ERROR):
+        for _ in range(5):
+            assert s._blacked_out() is False
+    loud = [r for r in caplog.records
+            if leg.__name__ in r.getMessage() and r.levelno >= logging.ERROR]
+    assert len(loud) == 1
+
+
+def test_a_leg_that_starts_failing_a_NEW_way_says_so_again(caplog):
+    """Once per leg AND reason. A leg that was merely missing the attribute
+    and then starts raising is a different fact about the privacy path, and
+    the log has to carry it."""
+    import logging
+    leg = _NoBlocked()
+    s = _dark_sentinel(leg)
+    with caplog.at_level(logging.ERROR):
+        s._blacked_out()
+        s._blacked_out()
+        type(leg).blocked = property(
+            lambda self: (_ for _ in ()).throw(OSError("the socket died")))
+        try:
+            s._blacked_out()
+            s._blacked_out()
+        finally:
+            del type(leg).blocked
+    loud = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(loud) == 2, [r.getMessage() for r in loud]
+    assert "AttributeError" in loud[0].getMessage()
+    assert "OSError" in loud[1].getMessage()
