@@ -102,7 +102,8 @@ binary_sensor:
   - platform: ld2410
     ld2410_id: radar
     # THE ENTITY JARVIS READS. Its name is what makes the URL
-    # /binary_sensor/presence -- rename it and you must change
+    # /binary_sensor/Presence (the NAME, capital P -- web_server v2 does NOT
+    # use a lower-cased object_id) -- rename it and you must change
     # presence.room_sensor_url to match.
     #
     # has_target is PRESENCE, not motion: the LD2410 reports a still

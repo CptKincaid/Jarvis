@@ -15,11 +15,23 @@ there" survives him sitting still, which is what "is he home" actually
 needs.
 
 TRANSPORT: one HTTP GET of one entity, stdlib only, no broker to install
-and no new dependency in the shared venv. ESPHome's ``web_server`` serves
-each entity as JSON at ``/<domain>/<object_id>``::
+and no new dependency in the shared venv. ESPHome's ``web_server`` (version
+2, which is what both templates ask for) serves each entity as JSON at its
+NAME, percent-encoded -- NOT at the snake_case object_id, and NOT at the
+``id:`` the YAML gives it. MEASURED against the live office radar,
+2026-09-03::
 
-    $ curl http://192.168.50.60/binary_sensor/presence
-    {"id":"binary_sensor-presence","value":true,"state":"ON"}
+    $ curl http://192.168.50.51/binary_sensor/Presence
+    {"id":"binary_sensor/Presence","value":true,"state":"ON"}
+    $ curl -o /dev/null -w '%{http_code}\n' http://192.168.50.51/binary_sensor/presence
+    404
+    $ curl 'http://192.168.50.51/sensor/Moving%20distance'
+    {"id":"sensor/Moving distance","value":42,"state":"42 cm"}
+
+This module and ``scripts/room_sensor.py`` both built the object_id form,
+so every poll and every tune write was a 404: presence never once fired,
+and it degraded to "no opinion" silently, exactly as a missing sensor
+would. Build a path with ``entity_path()`` and nothing else.
 
 THREE RULES the rest of the app depends on.
 
@@ -78,11 +90,33 @@ from jarvis.sensing import POLLING_ONLY, RADAR
 
 log = get_logger("roomsensor")
 
-# ESPHome names the endpoint after the entity: a binary_sensor called
-# "Presence" is /binary_sensor/presence. The YAML in
-# scripts/esphome/jarvis-room-sensor.yaml uses exactly this name.
-DEFAULT_ENTITY_PATH = "/binary_sensor/presence"
-DEFAULT_TIMEOUT_S = 1.5     # LAN round trip is ~5 ms; this is pure paranoia
+# The entity whose name IS the URL. Renaming it in the YAML moves the
+# endpoint, so the name lives here as a constant and the path is derived
+# from it -- never spelled out a second time.
+PRESENCE_ENTITY = "Presence"
+
+
+def entity_path(domain: str, name: str) -> str:
+    """The web_server path for an entity, from its NAME.
+
+    ``entity_path("binary_sensor", "Presence") == "/binary_sensor/Presence"``
+    and ``entity_path("sensor", "Moving distance")`` percent-encodes the
+    space. This is the only place that rule is written down; see the
+    measurement in the module docstring for why it is the name and not the
+    object_id.
+    """
+    return "/%s/%s" % (domain, urllib.parse.quote(str(name), safe=""))
+
+
+DEFAULT_ENTITY_PATH = entity_path("binary_sensor", PRESENCE_ENTITY)
+# MEASURED against the live office radar, 25 polls at 4 Hz, 2026-09-03:
+# min 46 ms, median 62 ms, p90 154 ms, MAX 1186 ms. The old value here was
+# 1.5 s with the comment "LAN round trip is ~5 ms; this is pure paranoia" --
+# it was neither. An ESP32 in Wi-Fi modem-sleep parks a round trip for the
+# best part of a second, so 1.5 s was 1.3x the worst sample, not 300x it.
+# 3.0 s is ~2.5x the worst seen. A slow poll is not costly: read() returns
+# None, the phone leg answers, and only DEFAULT_FAIL_AFTER in a row is a fault.
+DEFAULT_TIMEOUT_S = 3.0
 DEFAULT_FAIL_AFTER = 3      # transients are free; three in a row is a fault
 DEFAULT_COOLDOWN_S = 30.0
 MAX_COOLDOWN_S = 300.0

@@ -98,14 +98,53 @@ def test_the_room_names_the_device_and_never_the_entity():
     live in the device name or presence.room_sensor_url moves under Jarvis."""
     p = rs.Profile(room="Office", ip="192.168.50.60")
     assert p.device_name == "jarvis-office"
-    assert p.presence_url == "http://192.168.50.60/binary_sensor/presence"
+    assert p.presence_url == "http://192.168.50.60/binary_sensor/Presence"
 
 
-def test_object_ids_match_the_template_names():
-    assert rs.object_id("Presence") == "presence"
-    assert rs.object_id("Absence delay") == "absence_delay"
-    assert rs.object_id("Max move gate") == "max_move_gate"
-    assert rs.object_id("Max still gate") == "max_still_gate"
+def test_the_path_is_the_entity_name_and_not_a_lower_cased_object_id():
+    """MEASURED against the live office radar (192.168.50.51), 2026-09-03:
+
+        /binary_sensor/Presence        -> 200 {"value":true,"state":"ON"}
+        /binary_sensor/presence        -> 404
+        /sensor/Moving%20distance      -> 200
+        /sensor/moving_distance        -> 404
+        POST /number/Absence%20delay/set?value=5 -> 200
+        POST /number/absence_delay/set?value=5   -> 404
+
+    Every URL this script builds used to come from a lower-cased object_id,
+    so the presence poll, every ``tune`` read-back and every ``tune`` write
+    were 404s. Nothing caught it because the fake wires in the suite were
+    keyed on the same wrong string the code produced.
+    """
+    assert rs.url_name("Presence") == "Presence"
+    assert rs.url_name("Absence delay") == "Absence%20delay"
+    assert rs.url_name("Max move gate") == "Max%20move%20gate"
+    assert rs.url_name("Max still gate") == "Max%20still%20gate"
+
+
+def test_the_script_and_jarvis_agree_on_every_path():
+    """The rule is written twice -- here and in jarvis.roomsensor -- because
+    the script must run without importing the package. They must not drift."""
+    sys.path.insert(0, str(REPO))
+    from jarvis import roomsensor
+
+    assert roomsensor.PRESENCE_ENTITY == rs.PRESENCE_ENTITY
+    for name in (rs.PRESENCE_ENTITY, *rs.NUMBER_ENTITIES.values()):
+        assert roomsensor.entity_path("number", name).rsplit("/", 1)[1] == \
+            rs.url_name(name), name
+    p = rs.Profile(room="office", ip="192.168.50.60")
+    assert p.presence_url.endswith(roomsensor.DEFAULT_ENTITY_PATH)
+
+
+def test_every_entity_the_code_addresses_is_declared_in_the_template():
+    """The check that was missing. The code names four entities; the YAML
+    declares them. Rename one in either place and this fails LOUDLY, instead
+    of the device answering 404 to a poll nobody watches."""
+    yaml = (REPO / "scripts" / "esphome" / "jarvis-room-sensor.yaml").read_text()
+    declared = {line.split("name:", 1)[1].strip().strip('"\'')
+                for line in yaml.splitlines() if line.strip().startswith("name:")}
+    for name in (rs.PRESENCE_ENTITY, *rs.NUMBER_ENTITIES.values()):
+        assert name in declared, "%r is addressed but not declared" % name
 
 
 def test_a_still_capable_mount_never_asks_for_a_gate_below_the_still_floor():

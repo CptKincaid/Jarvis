@@ -44,11 +44,13 @@ in the LD2410's own NVM and are set over HTTP at runtime. ``tune`` therefore
 needs no re-flash, and it READS BACK every value it writes rather than
 claiming success -- an ESPHome rename would otherwise fail silently.
 
-THE ENTITY NAME STAYS "Presence" IN EVERY ROOM. web_server derives the URL
-path from the name, so renaming it to "Office presence" moves the endpoint to
-/binary_sensor/office_presence and silently breaks presence.room_sensor_url.
-The ROOM goes in the device name (jarvis-office), which is the hostname and
-the OTA target, and never in the entity.
+THE ENTITY NAME STAYS "Presence" IN EVERY ROOM. web_server (version 2) serves
+an entity at its NAME percent-encoded -- /binary_sensor/Presence, capital P --
+NOT at a snake_case object_id and NOT at the `id:` the YAML gives it. So
+renaming it to "Office presence" moves the endpoint to
+/binary_sensor/Office%20presence and breaks presence.room_sensor_url. The ROOM
+goes in the device name (jarvis-office), which is the hostname and the OTA
+target, and never in the entity.
 
 SECRETS DO NOT GO IN THE REPO. The profile (with the Wi-Fi PSK) lives in
 ~/.config/jarvis/room-sensors/<room>.json at 0600, and the rendered YAML in
@@ -72,6 +74,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -103,9 +106,13 @@ DEFAULT_GATEWAY = "192.168.50.1"
 DEFAULT_SUBNET = "255.255.255.0"
 
 # ------------------------------------------------------------- ESPHome bits
-# web_server derives an object_id from the entity's name: lower-cased, every
-# run of non-alphanumerics collapsed to one underscore. These are the names in
-# the template, and the URLs they produce.
+# THE PATH IS THE NAME, percent-encoded. MEASURED against the live office
+# radar on 2026-09-03: /binary_sensor/Presence -> 200, /binary_sensor/presence
+# -> 404, /sensor/Moving%20distance -> 200, /sensor/moving_distance -> 404,
+# POST /number/Absence%20delay/set?value=5 -> 200 and the object_id form ->
+# 404. Every URL here used to be built from a lower-cased object_id, so the
+# presence poll, every `tune` read-back and every `tune` write were 404s.
+# These are the names in the template; url_name() turns one into a path.
 PRESENCE_ENTITY = "Presence"
 NUMBER_ENTITIES = {                     # profile field -> entity name
     "timeout_s": "Absence delay",
@@ -114,9 +121,14 @@ NUMBER_ENTITIES = {                     # profile field -> entity name
 }
 
 
-def object_id(name: str) -> str:
-    """ESPHome's own sanitize: lower-case, non-alphanumerics -> '_'."""
-    return re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+def url_name(name: str) -> str:
+    """The path segment web_server serves an entity at: its name, quoted.
+
+    The same rule as ``jarvis.roomsensor.entity_path``, spelled once more
+    here so this script stays runnable without importing the package;
+    test_the_script_and_jarvis_agree_on_every_path pins the two together.
+    """
+    return urllib.parse.quote(str(name).strip(), safe="")
 
 
 def gate_for_metres(metres: float) -> int:
@@ -234,7 +246,7 @@ class Profile:
 
     @property
     def presence_url(self) -> str:
-        return "%s/binary_sensor/%s" % (self.base_url, object_id(PRESENCE_ENTITY))
+        return "%s/binary_sensor/%s" % (self.base_url, url_name(PRESENCE_ENTITY))
 
     # ---- storage -------------------------------------------------------
     @classmethod
@@ -680,7 +692,7 @@ def _http_get(url: str, timeout: float = 3.0) -> str:
 
 
 def _number_get(prof: Profile, entity: str, timeout: float = 3.0):
-    body = _http_get("%s/number/%s" % (prof.base_url, object_id(entity)), timeout)
+    body = _http_get("%s/number/%s" % (prof.base_url, url_name(entity)), timeout)
     try:
         return json.loads(body).get("value")
     except Exception:
@@ -688,7 +700,7 @@ def _number_get(prof: Profile, entity: str, timeout: float = 3.0):
 
 
 def _number_set(prof: Profile, entity: str, value, timeout: float = 3.0) -> None:
-    url = "%s/number/%s/set?value=%s" % (prof.base_url, object_id(entity), value)
+    url = "%s/number/%s/set?value=%s" % (prof.base_url, url_name(entity), value)
     req = urllib.request.Request(url, method="POST", data=b"")
     with urllib.request.urlopen(req, timeout=timeout):            # noqa: S310
         pass
