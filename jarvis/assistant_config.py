@@ -683,6 +683,39 @@ DEFAULTS: dict = {
     "phone": {"enabled": False, "bind": "", "port": 8765, "token": "",
               "max_audio_mb": 8, "link_file": "~/jarvis-phone.txt",
               "qr_file": "~/jarvis-phone.svg"},
+    # HPCOMPUTER -- files both ways and a short allow-list of read-only
+    # questions (jarvis/tools/remote.py).  Ships OFF and EMPTY because as of
+    # 2026-09-02 the host is not on the tailnet at all, has no sshd
+    # reachable and has no key here; `host` stays blank until it joins, and
+    # a blank host is refused by name ("it isn't on the tailnet yet").
+    #
+    # Deliberately NOT in SETUP_LINES/SECTIONS, exactly like `oracle`:
+    # missing_sections() drives a spoken nag at boot, and nagging about a
+    # machine he has not chosen to connect yet would be noise.
+    #
+    # `socks_proxy` is not optional here and not a preference.  tailscaled
+    # on this box runs --tun=userspace-networking, so there is NO route to
+    # 100.64/10 and a direct ssh to a tailnet name fails with "network is
+    # unreachable" however healthy the tailnet is.  1055 is the daemon's
+    # own SOCKS5 port.  Blank it only if this box ever gets a real tun.
+    #
+    # `inbox` is the ONLY directory a push can land in, and `pull_dirs` the
+    # only ones a pull may read: speech never names a remote path.
+    "remote": {
+        "enabled": False,
+        "host": "",                       # e.g. hpcomputer.tail5323b8.ts.net
+        "user": "",
+        "key_path": "",                   # a path ssh already owns; never a key
+        "name": "HPCOMPUTER",
+        "timeout_s": 12,
+        "transfer_timeout_s": 120,
+        "socks_proxy": "127.0.0.1:1055",
+        "inbox": "~/jarvis-inbox",
+        "pull_dirs": {"outbox": "~/jarvis-outbox",
+                      "desktop": "~/Desktop",
+                      "downloads": "~/Downloads"},
+        "max_mb": 100,
+    },
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",

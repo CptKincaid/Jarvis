@@ -100,7 +100,9 @@ from jarvis.memory import parse_person_statement, parse_since
 from jarvis import selfstate
 from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
+from jarvis.tools import filepick
 from jarvis.tools import oracle as oracle_mod
+from jarvis.tools import remote as remote_mod
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import add_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
@@ -4785,6 +4787,293 @@ def _h_oracle_freeform(c, t, m):
                          reply=reply)
 
 
+# ---- HPCOMPUTER: files and a short question list (jarvis/tools/remote.py) --
+# Five doors out to his other machine, none back in. Two of them move a file
+# and both are READ BACK before anything opens; one answers a fixed list of
+# read-only questions unattended; one refuses everything else out loud.
+#
+# The host words are deliberately narrow, and "desktop" ALONE is not among
+# them. His own phrasing for the mail lane is "this file ... on my desktop",
+# where "my desktop" is the FOLDER the file sits in -- so a bare "desktop"
+# must never be read as the destination machine. "Put this on my desktop"
+# stays a local request and falls through to the model; only "the desktop
+# MACHINE" (or HPCOMPUTER, or "the other machine") names the host.
+_HPC = (r"(?:hp\s*computer|the\s+hp\b|"
+        r"(?:my|the)\s+(?:desktop|other)\s+(?:machine|computer|box|pc)|"
+        r"(?:my|the)\s+other\s+machine)")
+_HPC_RX = re.compile(_HPC, re.I)
+
+# A file phrase: "this file", "the budget spreadsheet", "budget.xlsx".
+_FILE_WORD = r"(?P<what>[\w][\w '.\-()+]{0,80}?)"
+
+# "is HPCOMPUTER up", "is it awake", "how's HPCOMPUTER"
+_REMOTE_STATUS_RX = re.compile(
+    r"^(?:"
+    r"(?:is|are)\s+" + _HPC + r"\s+(?:up|on|awake|alive|online|running|"
+    r"ok|okay|there)|"
+    r"(?:how(?:'s|s| is))\s+" + _HPC + r"(?:\s+(?:doing|looking))?|"
+    r"(?:check|check on|ping)\s+" + _HPC + r"|"
+    r"(?:can|could)\s+you\s+(?:see|reach)\s+" + _HPC +
+    r")\W*$", re.I)
+
+# The read-only question list. The KEY is chosen by these words; the command
+# itself is a constant in remote.QUERIES, so a misheard word can only pick a
+# different question from the table or none at all.
+_REMOTE_QUERY_RX = re.compile(
+    r"^(?:what(?:'s|s| is)|how(?:'s|s| is)|who(?:'s|s| is)|show me)\s+"
+    r"(?:the\s+|my\s+)?(?P<q>disk|space|drive|storage|room|uptime|load|"
+    r"logged\s+in|logged\s+on|on\s+it|inbox|in\s+the\s+inbox)\b"
+    r".{0,20}?\bon\s+" + _HPC + r"\W*$", re.I)
+
+# PUSH: "put the budget on HPCOMPUTER", "send this file to HPCOMPUTER".
+_REMOTE_PUSH_RX = re.compile(
+    r"^(?:put|copy|send|move|push|transfer)\s+"
+    r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
+    r"(?:\s+file)?\s+(?:on(?:to)?|to|over\s+to|across\s+to)\s+"
+    + _HPC + r"\W*$", re.I)
+
+# PULL: "get the budget from HPCOMPUTER", "grab that off HPCOMPUTER".
+# The optional trailing folder word is an ALLOW-LIST key, not a path.
+_REMOTE_PULL_RX = re.compile(
+    r"^(?:get|grab|fetch|bring|pull|copy|download)\s+(?:me\s+)?"
+    r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
+    r"(?:\s+file)?\s+(?:from|off(?:\s+of)?|out\s+of)\s+" + _HPC +
+    r"(?:(?:'s)?\s+(?P<where>outbox|desktop|downloads))?\W*$", re.I)
+
+# The refusal door, LAST: anything else aimed at the host that reads like an
+# instruction. "run the build on HPCOMPUTER", "delete the logs on the HP".
+# Three shapes, because an order can put the host anywhere: "run the build ON
+# HPCOMPUTER", "HPCOMPUTER, run the build", and the bare "shut down
+# HPCOMPUTER" that names no preposition at all -- that last one is how a
+# reboot gets said, so leaving it out would leave the loudest order unrefused.
+_REMOTE_FREEFORM_RX = re.compile(
+    r"^(?:(?P<cmd>.{2,120}?)\s+on\s+" + _HPC + r"|"
+    r"(?:on\s+)?" + _HPC + r"[,:]?\s+(?P<cmd2>.{2,120}?)|"
+    r"(?P<cmd3>.{2,120}?)\s+" + _HPC + r")\W*$", re.I)
+
+# Words that make a phrase an ORDER rather than a mention. "how's HPCOMPUTER"
+# is a question the status door already took; "is HPCOMPUTER a good machine"
+# is conversation and belongs to the model.
+_REMOTE_ORDER_RX = re.compile(
+    r"\b(?:run|start|stop|restart|reboot|shut\s*down|kill|delete|remove|rm\b|"
+    r"install|update|upgrade|build|make|compile|deploy|launch|open|execute|"
+    r"format|wipe|clear|empty|move|rename|chmod|sudo)\b", re.I)
+
+_QUERY_KEYS = {"disk": "disk", "space": "disk", "drive": "disk",
+               "storage": "disk", "room": "disk", "uptime": "up",
+               "load": "load", "logged in": "who", "logged on": "who",
+               "on it": "who", "inbox": "inbox", "in the inbox": "inbox"}
+
+
+try:                                        # the mail lane's phrase layer
+    from jarvis import filephrase as _filephrase
+except ImportError:                         # pragma: no cover - lane dropped
+    _filephrase = None
+
+
+def _remote_conf(c):
+    return remote_mod.read_config(c._svc("assistant"))
+
+
+def _remote_resolve_local(said: str, conf):
+    """Spoken words -> ONE local file, the rivals, or a reason.
+
+    COORDINATION, not duplication. `jarvis/tools/filepick.py` is the shared
+    resolver both lanes rank and vet files with; the mail lane's
+    `jarvis/filephrase.py` is a PHRASE layer on top of it that understands
+    the shapes a bare name cannot -- "that file on my desktop" (a folder is
+    the handle, there is no name), "the PDF I just downloaded" (a type and a
+    recency). Those are exactly the phrases he uses for this lane too, so it
+    is used here rather than re-derived, and the two lanes cannot disagree
+    about what "that file" means.
+
+    ONE argument differs and it is deliberate: ``allow_explicit_outside`` is
+    FALSE here. The mail lane lets him attach a path he names outright from
+    anywhere (guarded by its DENY_ROOTS); this lane keeps filepick's hard
+    containment, because a push has a second machine's filesystem on the far
+    end and "put /etc/... on HPCOMPUTER" should not be sayable at all.
+
+    Falls back to the shared resolver alone if the phrase layer is absent,
+    so this lane still stands on its own.
+    """
+    if _filephrase is not None:
+        return _filephrase.resolve(said, roots=conf.local_roots,
+                                   max_mb=conf.max_mb,
+                                   allow_explicit_outside=False)
+    return filepick.pick(said, roots=conf.local_roots, max_mb=conf.max_mb)
+
+
+def _remote_blocked(c, conf):
+    """One honest line naming exactly what is missing, and no socket opened
+    to find it out. None when the lane is ready to try."""
+    reason = remote_mod.missing_reason(conf)
+    if not reason:
+        return None
+    return CommandResult(handled=True, speak=True,
+                         reply=remote_mod.fail_line(conf, reason),
+                         status=f"{conf.name}: not set up")
+
+
+def _remote_fail(conf, reason: str, status: str = ""):
+    return CommandResult(handled=True, speak=True,
+                         reply=remote_mod.fail_line(conf, reason),
+                         status=status or f"{conf.name}: {reason}")
+
+
+def _h_remote_status(c, t, m):
+    """Is it there? Answered from the LOCAL tailnet view first, so a machine
+    that is off or has never joined costs no socket and no wait -- and gets
+    a different sentence from one that is merely slow. Those three are not
+    the same problem and he should not have to guess which he has."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    state = remote_mod.tailnet_state(conf)
+    if state == "absent":
+        return _remote_fail(conf, "off-tailnet", f"{conf.name}: absent")
+    if state == "offline":
+        return _remote_fail(conf, "asleep", f"{conf.name}: asleep")
+    res = remote_mod.ask(conf, "up")
+    if not res.ok:
+        return _remote_fail(conf, res.reason)
+    up = " ".join((res.out or "").split())[:120]
+    line = f"{conf.name} is up, sir" + (f" -- {up}." if up else ".")
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"{conf.name}: up")
+
+
+def _h_remote_query(c, t, m):
+    """One row of the read-only table. Unattended by design: the spoken words
+    choose a KEY, never a command."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    said = " ".join((m.group("q") or "").lower().split())
+    key = _QUERY_KEYS.get(said)
+    if not key:
+        return None
+    res = remote_mod.ask(conf, key)
+    if not res.ok:
+        return _remote_fail(conf, res.reason)
+    body = " ".join((res.out or "").split())[:200]
+    if not body:
+        return CommandResult(handled=True, speak=True,
+                             status=f"{conf.name}: nothing",
+                             reply="Nothing to report there, sir.")
+    say = remote_mod.QUERIES[key]["say"]
+    return CommandResult(handled=True, speak=True, status=f"{conf.name}: {key}",
+                         reply=f"On {conf.name}, {say}: {body}.")
+
+
+def _remote_ask_which(c, conf, names, verb: str):
+    """More than one file could be meant. ASK -- never pick the newer one."""
+    line = (f"I've more than one that could be, sir: "
+            f"{filepick.describe(names)}. Which one?")
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Which one?")
+
+
+def _h_remote_push(c, t, m):
+    """Send ONE local file to the host's inbox, after reading it back.
+
+    Read back EVERY time, not only on a shaky transcript the way an alarm
+    is: an alarm set wrong is an annoyance, and this puts a file of his on
+    another machine, where it cannot be taken back."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    said = (m.group("what") or "").strip()
+    pick = _remote_resolve_local(said, conf)
+    if pick.ambiguous:
+        return _remote_ask_which(c, conf, pick.candidates, "send")
+    if not pick.ok:
+        size_mb = getattr(pick, "size", 0) / (1024 * 1024)
+        return CommandResult(handled=True, speak=True, status="No such file",
+                             reply=filepick.reason_line(pick.reason,
+                                                        conf.max_mb, size_mb))
+    path = pick.path
+    question = (f"Send {path.name} to {conf.name}'s inbox, sir?")
+
+    def _run():
+        res = remote_mod.push(conf, path)
+        if not res.ok:
+            return _remote_fail(conf, res.reason)
+        return CommandResult(handled=True, speak=True,
+                             status=f"Sent to {conf.name}",
+                             reply=f"{path.name} is on {conf.name}, sir.")
+
+    c.stash_destructive(_run, question)
+    return CommandResult(handled=True, reply=question, speak=True,
+                         status="Confirm?")
+
+
+def _h_remote_pull(c, t, m):
+    """Fetch ONE file from an allow-listed remote folder, after reading back
+    the name the REMOTE reported -- not the one that was said."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    said = (m.group("what") or "").strip()
+    key = (m.group("where") or "outbox").lower()
+    names, why = remote_mod.list_remote(conf, key)
+    if why:
+        return _remote_fail(conf, why)
+    if not names:
+        return CommandResult(handled=True, speak=True, status="Empty",
+                             reply=f"There's nothing in {conf.name}'s "
+                                   f"{key}, sir.")
+    pick = remote_mod.match_remote(said, names)
+    if pick.ambiguous:
+        return _remote_ask_which(c, conf, pick.candidates, "fetch")
+    if not pick.ok:
+        return CommandResult(handled=True, speak=True, status="No such file",
+                             reply=f"I can't see anything by that name in "
+                                   f"{conf.name}'s {key}, sir.")
+    name = pick.path.name
+    dest = remote_mod.pull_target(conf, name)
+    question = f"Bring {name} from {conf.name} to your {dest.parent.name}, sir?"
+
+    def _run():
+        res = remote_mod.pull(conf, key, name)
+        if not res.ok:
+            return _remote_fail(conf, res.reason)
+        return CommandResult(handled=True, speak=True, status="Fetched",
+                             reply=f"{name} is on your "
+                                   f"{dest.parent.name}, sir.")
+
+    c.stash_destructive(_run, question)
+    return CommandResult(handled=True, reply=question, speak=True,
+                         status="Confirm?")
+
+
+def _h_remote_freeform(c, t, m):
+    """The last door, and the one that defines the lane: an instruction
+    aimed at the other machine that is not a file move or a listed question
+    is REFUSED, out loud, and never handed to the model.
+
+    This is the whole safety argument in one function. A voice channel with
+    a measurable false-accept rate cannot be given a shell on a second
+    machine -- "delete the logs on the HP" and "delete the block on the HP"
+    differ by one phoneme, and only one of them is recoverable. The useful
+    part of a remote shell is already covered by the read-only table above;
+    what is left is unbounded, so it does not exist.
+    """
+    conf = _remote_conf(c)
+    said = _oracle_group(m, "cmd", "cmd2", "cmd3")
+    if not said or not _REMOTE_ORDER_RX.search(said):
+        # A mention, not an order ("the music's playing on HPCOMPUTER"):
+        # not this lane's business, so it goes to the model.
+        return None
+    log.info("remote: refusing a free-form order aimed at %s", conf.name)
+    return CommandResult(handled=True, speak=True, status="Refused",
+                         reply=remote_mod.FREEFORM_REFUSAL.format(
+                             name=conf.name))
+
+
 def _h_network(c, t, m):                                   # 3267-3279
     net = c._svc("context").check_connectivity()
     status = "Online" if net.get("internet") else "Offline"
@@ -6911,6 +7200,18 @@ REGISTRY: list[Command] = [
     # ...and the refusal door LAST of the five, so every phrasing that IS
     # answerable has already been taken by one of them.
     Command("oracle freeform", _ORACLE_FREEFORM_RX.match, _h_oracle_freeform),
+    # HPCOMPUTER (jarvis/tools/remote.py). Same shape as the Oracle five and
+    # for the same reason: the two doors that MOVE something come before the
+    # ones that only ask, and the refusal door is LAST of the family, so
+    # "put the budget on HPCOMPUTER" is a transfer and never an order that
+    # gets refused. `remote push`/`remote pull` are ahead of `remote query`
+    # because "send me the disk report from HPCOMPUTER" is a file, not the
+    # `disk` row of the question table.
+    Command("remote push", _REMOTE_PUSH_RX.match, _h_remote_push),
+    Command("remote pull", _REMOTE_PULL_RX.match, _h_remote_pull),
+    Command("remote status", _REMOTE_STATUS_RX.match, _h_remote_status),
+    Command("remote query", _REMOTE_QUERY_RX.match, _h_remote_query),
+    Command("remote freeform", _REMOTE_FREEFORM_RX.match, _h_remote_freeform),
     Command("standup", standup.STANDUP_RX.match, _h_standup,
             needs=("context",)),
     Command("gpu reclaim", _GPU_RECLAIM_RX.match, _h_gpu_reclaim,
