@@ -447,22 +447,51 @@ DEFAULTS: dict = {
     # find, and it is why width/height is 1080p and not the 640x480 that
     # shipped first: at 640x480 the same face is 53 px, against SFace's 112.
     #
+    # BUT THOSE NUMBERS DESCRIBE A CAMERA HE DOES NOT OWN. 90 deg horizontal
+    # is the 98 deg-diagonal Arducam section 9 recommends BUYING. The camera
+    # actually to hand is a LifeCam Cinema: 1280x720 -- so 1920x1080 is a mode
+    # it does not have -- and 73 deg DIAGONAL, which is 65.6 deg horizontal,
+    # not 73 (the conversion is a ratio of tangents, jarvis/facemodels.py).
+    # Its narrower field and lower resolution very nearly cancel at full
+    # frame: 167 px across the same face, against the Arducam's 162. They do
+    # NOT cancel after the downscale below, because 1280->320 is 4x while
+    # 1920->320 is 6x, so the detector sees 42 px on the LifeCam and 27 px on
+    # the Arducam. Both clear YuNet's documented 10-300 px range; only one of
+    # them has much margin. Nothing in this dict is a field of view, so no
+    # consumer may assume one -- jarvis/facemodels.Lens takes it as a
+    # required argument for exactly that reason.
+    #
     # detect_width/height is the size YuNet actually sees. 320x180, not the
     # 320x240 that shipped first, and the reason is aspect, not pixels: a
     # 16:9 frame squeezed into 4:3 is a 1.33x anisotropic horizontal squash of
-    # every face in it. Measured on this box 2026-09-02 on a 1080p frame
-    # carrying exactly the 161 px face above, 4 threads --
+    # every face in it. 1920x1080 -> 320x180 is an exact 6:1 in both axes,
+    # while ->320x240 is 6:1 and 4.5:1; on the LifeCam's 1280x720 it is 4:1
+    # and 4:1 against 4:1 and 3:1. The squash is the argument, and it is pure
+    # arithmetic that holds for both cameras (tests/test_facemodels.py).
     #
-    #   detect    YuNet score   resize+detect
-    #   320x240      0.703        2.54 + 1.74 ms
-    #   320x180      0.840        1.30 + 1.00 ms
-    #   640x360      0.894        1.06 + 2.97 ms
+    # AN EARLIER VERSION OF THIS COMMENT CARRIED A TABLE OF YuNet CONFIDENCE
+    # SCORES (320x240 -> 0.703, 320x180 -> 0.840, 640x360 -> 0.894) ATTRIBUTED
+    # TO A MEASUREMENT ON THIS BOX ON 2026-09-02. Those numbers cannot have
+    # been measured: the weights were not on this machine until they were
+    # downloaded on 2026-09-02 (find / -iname '*yunet*' returned nothing), and
+    # a confidence score requires a real face, which nothing here is permitted
+    # to look at. They have been removed rather than corrected. The real
+    # per-frame COST, measured on synthetic frames once the weights existed
+    # (scripts/measure_face_models.py, resize from 1280x720 + detect, p50, on
+    # this 20-core aarch64 box) --
     #
-    # -- so the aspect-correct target scores better on FEWER pixels and costs
-    # 2.0 ms less per frame, because 1920x1080 -> 320x180 is an exact 6:1 in
-    # both axes while ->320x240 is 6:1 and 4.5:1. 0.703 against a 0.700 bar is
-    # not a margin; two other reconstructions of the same scene put 320x240 at
-    # 0.62 and at no detection at all.
+    #   detect       1 thread   2 threads   4 threads
+    #   320x180       2.41 ms     2.16 ms     1.50 ms
+    #   320x240       3.25 ms     1.99 ms     1.35 ms
+    #   640x360       9.46 ms     5.21 ms     3.06 ms
+    #   1280x720     39.46 ms    21.30 ms    11.86 ms
+    #
+    # -- which does NOT reproduce the old claim that 320x180 is 2.0 ms cheaper
+    # than 320x240. It is cheaper only single-threaded; at 2 and 4 threads the
+    # taller frame is very slightly FASTER, presumably tiling. So 320x180 is
+    # kept on the aspect argument alone, which is sound, and not on a speed
+    # argument, which is not. Whether a real face clears min_conf at either
+    # size is still unmeasured and needs a camera and a tape.
     #
     # min_conf 0.6, down from 0.7, for the asymmetry: a miss is SILENT and
     # disables the whole feature, while a false face has to survive faces==1
@@ -470,8 +499,10 @@ DEFAULTS: dict = {
     # a tape and a real camera (section 9's $0 test) before trusting them.
     #
     # threads 2, not the 4 that docs/vision.md section 2 first advised. 4 is
-    # the latency win (SFace 22.1 -> 7.0 ms wall) but it costs MORE total CPU,
-    # not less -- measured 22.13 CPU-ms at 1 thread against 25.93 at 4. At the
+    # the latency win (SFace 20.9 -> 5.8 ms wall, re-measured 2026-09-02
+    # against real weights) but it costs MORE total CPU, not less -- 21.1
+    # CPU-ms at 1 thread against 22.6 at 4, and 2 threads is the sweet spot at
+    # 10.1 ms wall for 20.4 CPU-ms. At the
     # armed tier's 8 fps the frame period is 125 ms and the whole chain is
     # ~20 ms even at 2, so latency is not the binding constraint; contention
     # with live Jarvis, ollama and F5 on a box that has already had one
