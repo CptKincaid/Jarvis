@@ -440,3 +440,21 @@ def test_a_synthetic_run_measures_cost_and_claims_no_accuracy():
     checks = {c.name: c for c in report.checks}
     assert checks["min_conf"].ok is None      # nothing to say, and it says so
     assert checks["detection_rate"].ok is None
+
+
+def test_a_recognisers_failure_is_not_reported_on_the_detector_line():
+    """"the detector is broken, PASS" is the kind of line nobody believes
+    twice. The reason belongs to whichever thing actually failed."""
+    class Broken:
+        def embed(self, frame, row):
+            raise RuntimeError("alignCrop said no")
+
+    det = StubDetector([[head_row(0.0, conf=0.9)]])
+    report = vr.Rig(StubSource(), det, LIFECAM_CINEMA, thresholds(),
+                    recogniser=Broken(), now=iter_clock()).run(frames=3)
+    checks = {c.name: c for c in report.checks}
+    assert checks["detector"].ok is True
+    assert "alignCrop" not in checks["detector"].detail
+    assert checks["errors"].ok is False
+    assert "alignCrop" in checks["errors"].detail
+    assert report.ok is False

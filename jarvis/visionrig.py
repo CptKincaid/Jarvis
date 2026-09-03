@@ -672,11 +672,19 @@ class Rig:
 
     def _checks(self, rep: RigReport) -> list:
         th = self.thresholds
+        # The reason belongs to whichever thing failed. Printing it on the
+        # detector line when the RECOGNISER was what raised reads as "the
+        # detector is broken, PASS", which is exactly the kind of report
+        # nobody believes twice.
         out = [Check("detector", rep.detector_ok,
-                     rep.reason or "%s ran on %d frames"
-                     % (rep.detector or "detector", rep.frames))]
+                     rep.reason if not rep.detector_ok else
+                     "%s ran on %d frames" % (rep.detector or "detector",
+                                              rep.frames))]
         out.append(Check("errors", rep.errors == 0,
-                         "%d error(s) during the run" % rep.errors))
+                         "%d error(s) during the run%s"
+                         % (rep.errors, (": " + rep.reason)
+                            if (rep.errors and rep.detector_ok and rep.reason)
+                            else "")))
         squash = (rep.scale_x / rep.scale_y) if rep.scale_y else 0.0
         out.append(Check(
             "aspect", abs(squash - 1.0) <= 0.01,
