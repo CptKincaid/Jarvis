@@ -32,7 +32,9 @@ What is pinned, and why each matters:
 from __future__ import annotations
 
 import gc
+import importlib.util
 import io
+import json
 import math
 import re
 import sys
@@ -625,3 +627,154 @@ def test_the_row_scale_is_gestures_scale_and_not_a_second_formula():
     code = code_only(REPO / "jarvis" / "handpose.py")
     assert "observe_hand" in code
     assert not re.search(r"hypot\s*\(", code.split("class HandTracker")[1])
+
+
+# ======================================================= the self-check
+def _load_selfcheck():
+    spec = importlib.util.spec_from_file_location(
+        "gesture_selfcheck", REPO / "scripts" / "gesture_selfcheck.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class FakeCfg:
+    def __init__(self, data):
+        self.data = data
+
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+
+class TestSelfCheck:
+    """scripts/gesture_selfcheck.py: the instrument he runs on his own
+    hand. The script's live path needs a camera and is HIS to run; what is
+    pinned here runs on drawn frames and never opens a device."""
+
+    def test_the_overlay_reads_through_and_never_writes(self):
+        """AssistantConfig.set() saves to disk; the script's --device and
+        the suite's overrides must go through a read-only overlay."""
+        sc = _load_selfcheck()
+        base = FakeCfg({"camera.device": "/dev/video0", "camera.fps": 6.0})
+        over = sc.ConfigOverlay(base, {"camera.device": "/dev/video2"})
+        assert over.get("camera.device") == "/dev/video2"
+        assert over.get("camera.fps") == 6.0
+        assert over.get("camera.absent", "dflt") == "dflt"
+        assert base.data["camera.device"] == "/dev/video0"
+        assert not hasattr(over, "set") and not hasattr(over, "save")
+        # No config write anywhere in the script: cfg.set / cfg.update
+        # save his assistant.json, and nothing here may call .save().
+        code = code_only(REPO / "scripts" / "gesture_selfcheck.py")
+        assert not re.search(r"\bcfg\.(set|update|save)\s*\(", code)
+        assert not re.search(r"\.save\s*\(", code)
+        assert not re.search(r"\.data\b", code)
+
+    def test_thresholds_from_config_overrides_key_by_key(self):
+        sc = _load_selfcheck()
+        assert sc.thresholds_from_config(FakeCfg({})) == g.CastThresholds()
+        t = sc.thresholds_from_config(FakeCfg({
+            "camera.gesture.reach_min": 2.5, "camera.gesture.dwell_frames": 4,
+            "camera.gesture.target_sectors": ["left"],
+            "camera.gesture.carry_max_s": 6}))
+        assert t.reach_min == 2.5 and t.dwell_frames == 4
+        assert t.target_sectors == ("left",) and t.carry_max_s == 6.0
+        assert isinstance(t.dwell_frames, int)
+        assert t.open_min == g.CastThresholds().open_min
+
+    def test_the_synthetic_source_keeps_the_rig_contract(self):
+        pytest.importorskip("cv2")
+        sc = _load_selfcheck()
+        src = sc.SyntheticHandSource(640, 360, frames=2)
+        ok, frame = src.read()
+        assert ok and frame.shape == (360, 640, 3) and frame.dtype == np.uint8
+        assert src.read()[0] is True
+        assert src.read() == (False, None)
+        src.release()
+        assert src.released == 1
+
+    def test_closed_3d_is_a_ratio_and_zero_on_the_wrong_shape(self):
+        sc = _load_selfcheck()
+        assert sc.closed_3d(np.zeros((20, 3))) == 0.0
+        assert sc.closed_3d(np.zeros((21, 3))) == 0.0
+        w = np.zeros((21, 3))
+        w[g.MID_MCP] = (0, 0.10, 0)
+        w[g.IDX_MCP], w[g.PNK_MCP] = (-0.03, 0.09, 0), (0.04, 0.09, 0)
+        for tip in g.TIPS:
+            w[tip] = (0, 0.18, 0)
+        assert sc.closed_3d(w) == pytest.approx(0.18 / math.hypot(0.10, 0.07))
+
+    def test_models_only_reaches_a_verdict_without_a_device(self, capsys):
+        sc = _load_selfcheck()
+        code = sc.main(["--models-only", "--json"])
+        report = json.loads(capsys.readouterr().out)
+        assert_numbers_only(report)
+        assert report["exit_code"] == code
+        assert set(report["hand_models"]["models"]) == {
+            "palm", "landmarks", "landmarks_fp32"}
+        assert "run" not in report
+        assert code == (0 if hp.ready() else 1)
+
+    @needs_models
+    def test_the_synthetic_run_is_numbers_only_and_honest(self, capsys):
+        """A drawn hand: found on every frame, R 0.0 (no face), no grab,
+        and every claim that needs his hand marked not measurable."""
+        pytest.importorskip("cv2")
+        sc = _load_selfcheck()
+        code = sc.main(["--synthetic", "--frames", "3", "--json"])
+        report = json.loads(capsys.readouterr().out)
+        assert_numbers_only(report)
+        assert code == 0 and report["exit_code"] == 0
+        run = report["run"]
+        assert run["frames"] == 3 and run["hand_frames"] == 3
+        assert run["R"]["max"] == 0.0 and run["face_frames"] == 0
+        assert run["C"]["min"] >= g.CastThresholds().open_min
+        assert run["grabs"] == 0 and run["throws"] == 0
+        assert run["states"] == {"idle": 3}
+        checks = {c["name"]: c for c in report["checks"]}
+        assert checks["hand seen"]["ok"] and checks["hand seen"]["measurable"]
+        for name in ("reached", "grab fired", "throw fired", "face seen"):
+            assert not checks[name]["measurable"], name
+        assert report["thresholds"]["reach_min"] == 2.35
+        assert report["fps_mismatch"] is False
+
+    @needs_models
+    def test_the_counters_are_scaled_by_the_configured_rate(self, capsys,
+                                                            monkeypatch):
+        """His live config asks for preview_fps 15 (read 2026-09-03,
+        default 6.0). At 15 the design's 3-frame dwell would be 200 ms,
+        so the self-check applies for_fps exactly as the app must, and
+        says so. The LifeCam delivers ~7.5 whatever is asked, which is why
+        the script also compares delivered to configured after the run."""
+        pytest.importorskip("cv2")
+        sc = _load_selfcheck()
+        real_load = sc.AssistantConfig.load
+
+        def load(*a, **k):
+            # An overlay, never AssistantConfig.set(): set() SAVES.
+            return sc.ConfigOverlay(real_load(*a, **k),
+                                    {"camera.preview_fps": 15.0})
+
+        monkeypatch.setattr(sc.AssistantConfig, "load", staticmethod(load))
+        assert sc.main(["--synthetic", "--frames", "2", "--json"]) == 0
+        report = json.loads(capsys.readouterr().out)
+        assert report["capture_fps"] == 15.0
+        assert report["counters_scaled"] is True
+        assert report["thresholds"]["dwell_frames"] == 6
+        assert report["thresholds"]["exit_step_u"] == pytest.approx(0.175)
+        assert report["thresholds"]["reach_min"] == 2.35
+
+    def test_the_selfcheck_writes_no_frame_and_opens_no_device_itself(self):
+        """The live path reaches the camera only through jarvis/camera's
+        gated feed (cam.build / CameraFeed), never a VideoCapture of its
+        own, and nothing in it can write or show a frame."""
+        code = code_only(REPO / "scripts" / "gesture_selfcheck.py")
+        for pattern in (r"\bimwrite\b", r"\bimencode\b", r"\bimshow\b",
+                        r"\bimread\b", r"\bnamedWindow\b", r"\bwaitKey\b",
+                        r"\bVideoCapture\b", r"\.save\s*\(", r"\btofile\b",
+                        r"\bopen\s*\([^)]*['\"]w", r"\bNamedTemporaryFile\b",
+                        r"\bmkstemp\b", r"\bwrite_bytes\b", r"\bwrite_text\b",
+                        r"\bsocket\b", r"\brequests\b", r"\burlopen\b",
+                        r"\bsubprocess\b", r"\btkinter\b", r"\bPIL\b"):
+            assert not re.search(pattern, code), pattern
+        assert "cam.FeedSource" in code and "cam.build" in code
+        assert "assert_numbers_only" in code
