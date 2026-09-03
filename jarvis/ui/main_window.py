@@ -1232,6 +1232,13 @@ class MainWindow:
             i += 1
 
     def _build_stage(self):
+        # The tab row (jarvis/ui/tab_strip.py), packed FIRST of the stage's
+        # side="top" children so it lands directly under the header rule --
+        # "a little tab to click thats underneath jarvis", his words. It
+        # costs the stage 80 device px at his scale (measured; the number
+        # is pinned in tests/test_tab_strip.py), which the SENSORS page
+        # pays for by giving up the tab row it used to draw itself.
+        self.tabs = self._build_tabs()
         self.reactor = Reactor(self.shell, height=px(300))
         self.reactor.pack(fill="x", side="top")
         self.reactor.attach_toplevel()
@@ -1256,6 +1263,44 @@ class MainWindow:
         # from the two widgets handed to it, so a hidden footer or a packed
         # camera pane cannot put it out of step.
         self.sensors = self._build_sensors()
+        self._fill_tabs()
+
+    def _build_tabs(self):
+        """The tab row, or None. Imported here rather than at module scope
+        for the same reason _build_sensors is: a strip that failed to build
+        must not be why the console does not start (sensors_toggle falls
+        back to the page's own toggle, and F9 keeps working)."""
+        try:
+            from jarvis.ui.tab_strip import TabStrip
+            strip = TabStrip(self.shell, bg=theme.BG)
+            strip.pack(fill="x", side="top")
+            return strip
+        except Exception:                     # noqa: BLE001 - optional chrome
+            log.exception("tab strip could not be built")
+            return None
+
+    def _fill_tabs(self):
+        """One line per surface. A third tab is one more line here and
+        nothing else -- no width to re-budget, no test to update."""
+        strip = getattr(self, "tabs", None)
+        if strip is None:
+            return
+        strip.add("chat", "CHAT")
+        if self.sensors is not None:
+            strip.add("sensors", "SENSORS", select=self.sensors.show,
+                      leave=self.sensors.hide)
+        # CHAT is added first and is therefore already selected; nothing is
+        # shown or hidden for it, because the stage under it is what is on
+        # screen at build time.
+        # The row's own fit check, measured off the live widgets the way
+        # _check_header_fit does for the header. max(): an unrealized root
+        # reports 1 px, and warning about that would be noise.
+        try:
+            fit = strip.clipped(max(self.root.winfo_width(), px(MIN_W)))
+        except Exception:                     # noqa: BLE001 - unmapped
+            fit = []
+        if fit:
+            log.warning("tab strip: %s clipped at this width", fit)
 
     def _build_sensors(self):
         """The SENSORS page, or None.
@@ -1271,10 +1316,20 @@ class MainWindow:
             from jarvis.ui.sensors_page import SensorsPage
             return SensorsPage(self.shell, services=self.services,
                                camera_status=self._camera_numbers,
-                               cover=(self.reactor, self.transcript))
+                               cover=(self.reactor, self.transcript),
+                               on_close=self._sensors_closed)
         except Exception:                     # noqa: BLE001 - optional lane
             log.exception("sensors page could not be built")
             return None
+
+    def _sensors_closed(self):
+        """The page hid itself (quit, or anything else that calls hide()).
+        Put the strip back on CHAT so the lit tab matches the screen.
+        select() is idempotent, so the strip's own CHAT press -- which is
+        what called hide() in the first place -- does not come back round."""
+        strip = getattr(self, "tabs", None)
+        if strip is not None:
+            strip.select("chat")
 
     def _camera_numbers(self) -> dict:
         """The preview worker's numbers-only status, or {} when there is no
@@ -1290,9 +1345,18 @@ class MainWindow:
             return {}
 
     def sensors_toggle(self):
-        """Show/hide the SENSORS page. F9, and the one seam a voice command
-        or a future header tab would call."""
-        page = getattr(self, "sensors", None)
+        """Show/hide the SENSORS page.
+
+        The TAB is the primary way in now; F9 stays as the shortcut and is
+        the one seam a voice command would call. It goes THROUGH the strip
+        so the selected tab and the surface on screen can never disagree --
+        and the strip is what starts and stops the page's poll thread.
+        """
+        strip = getattr(self, "tabs", None)
+        if strip is not None and "sensors" in strip.keys:
+            strip.select("chat" if strip.selected == "sensors" else "sensors")
+            return
+        page = getattr(self, "sensors", None)  # no strip: F9 still works
         if page is not None:
             page.toggle()
 
@@ -1485,11 +1549,13 @@ class MainWindow:
         self.root.bind("<F5>", lambda e: self._toggle_recording())
         self.root.bind("<space>", self._on_space)
         self.root.bind("<Escape>", lambda e: self._minimize_to_tray())
-        # The SENSORS page. F9 because every nearer key is spoken for --
-        # F5 is the hotword daemon's synthetic keypress, space is the mic,
-        # Escape is the tray -- and because the header has 13 px to spare
-        # at his 920-px window (tests/test_header_fit.py), so a [SENSORS]
-        # tab up there would cost him the sensing badge.
+        # The SENSORS page. The TAB under the wordmark is the primary way
+        # in (jarvis/ui/tab_strip.py); F9 stays as the shortcut, and it is
+        # F9 because every nearer key is spoken for -- F5 is the hotword
+        # daemon's synthetic keypress, space is the mic, Escape is the
+        # tray. It still may not go in the HEADER: 13 px spare at his
+        # 920-px window (tests/test_header_fit.py) and a chip there would
+        # cost him the sensing badge.
         self.root.bind("<F9>", lambda e: self.sensors_toggle())
 
     def _on_space(self, event):
