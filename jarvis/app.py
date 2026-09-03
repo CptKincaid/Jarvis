@@ -1639,16 +1639,102 @@ class JarvisApp:
         # talking.
         if "greeting" in steps:
             self._last_greeted = now
+        # THIS arrival, for as long as it owns the floor. The catch-up can
+        # finish on a worker seconds after run() returns, and a digest
+        # belonging to a homecoming that has since been superseded must not
+        # be spoken -- see _arrival_catch_up_stale.
+        self._arrival_gen = getattr(self, "_arrival_gen", 0) + 1
         done = arrival_mod.run(steps, self._arrival_actions())
-        log.info("arrival (%s): %s", source, " -> ".join(done) or "(nothing)")
+        log.info("arrival (%s): %s", source, self._arrival_ledger(done)
+                 or "(nothing)")
+
+    def _arrival_ledger(self, done) -> str:
+        """The cue's one log line, and it must not overstate the last step.
+
+        ``arrival.run``'s contract is "the steps that actually ran", and a
+        catch-up that went to a worker has only STARTED: it may yet turn
+        out to have nothing to say and log so, and the two lines then
+        contradicted each other -- the ledger claiming a step that spoke
+        nothing. The whole point of the ledger is recording what happened.
+        """
+        if getattr(self, "_arrival_catch_up_deferred", False):
+            done = ["catch-up (started)" if step == "catch-up" else step
+                    for step in done]
+        return " -> ".join(done)
+
+    def _arrival_catch_up_stale(self, gen: int, turn: int) -> str:
+        """Why this late catch-up must NOT be spoken, or "".
+
+        Moving the unread count to a worker fixed the freeze and cost the
+        last arrival step its atomicity: the cue returns, and the offer is
+        spoken and parked whenever the mailbox happens to answer -- seconds
+        later, and a slow one is bounded only by the socket timeout it is
+        given per operation (IMAP_TIMEOUT, 15 s). THE WORST CASE IS NOT
+        MEASURED and no number here should be read as one; what is
+        measured is that the window exists at all. Inline it did not. So
+        the worker asks, at the last moment before it speaks, whether the
+        world it was answering is still there.
+
+        Two generations carried from the pump thread, and then the same
+        floor checks ``_after_speech`` makes before it puts anything of its
+        own out:
+
+        * ``turn`` -- ``_dispatch_gen``, bumped by every dispatch. THIS IS
+          THE ONE THAT FIRES: he asked Jarvis something while the mailbox
+          was thinking, and the answer to THAT owns the floor. The same
+          counter ``_async_reply`` reads, for the same purpose.
+        * the floor right now: a turn still open, a clip being
+          transcribed, the mic recording.
+        * ``gen`` -- the arrival this digest belongs to, and belt and
+          braces rather than a case anyone has hit. ``GREET_DAMPER_S`` is
+          600 s and ``_greet_return`` returns before it bumps this, so a
+          second cue cannot open inside one fetch at today's numbers. It
+          is here so the guard stays correct if that damper ever moves,
+          and so a digest can never outlive the homecoming it describes.
+
+        SILENCE IS THE CORRECT OUTCOME, not a deferral. Nothing in the
+        digest is news that keeps -- the mail is still unread and the
+        fault is still on the board -- and a question re-asked into a gap
+        minutes later is the proactive-line failure this cue exists to
+        avoid. Every read is defensive: a stale digest is worth dropping,
+        never an exception on a worker thread.
+
+        Racy by construction, and knowingly: the check and the ``_say``
+        are not atomic, so a turn beginning in the microseconds between
+        them is still spoken over. That window is the same one
+        ``_async_reply`` and ``_after_speech`` live with; closing it needs
+        a lock on the floor that this file does not have.
+        """
+        try:
+            if getattr(self, "_arrival_gen", 0) != gen:
+                return "a newer arrival owns the cue"
+            if getattr(self, "_dispatch_gen", 0) != turn:
+                return "he has taken a turn since"
+            busy = getattr(self, "_turn_busy", None)
+            if busy is not None and busy.is_set():
+                return "a turn is still open"
+            audio = getattr(self, "_audio_busy", None)
+            if audio is not None and audio.is_set():
+                return "a clip is being transcribed"
+            if getattr(getattr(self, "recorder", None), "recording", False):
+                return "the microphone is open"
+        except Exception:  # noqa: BLE001 - never raise on the worker
+            log.debug("arrival: could not tell whether the catch-up is stale",
+                      exc_info=True)
+        return ""
 
     def _arrival_actions(self) -> dict:
         """The callables behind jarvis/arrival.ARRIVAL_STEPS.
 
         A step returning False did nothing (there was no backlog), and
         arrival.run() records only what actually happened -- which is what
-        the tests assert on.
+        the tests assert on. The one step that can outlive the call is the
+        catch-up: see _arrival_ledger for what "happened" means there.
         """
+        # This cue's own mark, cleared at the top so a previous cue's
+        # worker cannot label this one's inline step.
+        self._arrival_catch_up_deferred = False
+
         def panel():
             # The panel coming off its dim is owned by the night surface, not
             # here; what this step owns is the Status that wakes the console.
@@ -1675,17 +1761,24 @@ class JarvisApp:
             self._say(line)
             return True
 
-        def speak_catch_up(held):
+        def speak_catch_up(held, guard=None):
             # THE OFFER, and it is the only new thing spoken on the
             # doorstep. His ruling after the 40-second monologue of
             # 2026-09-02: the briefing OFFERS, it does not deliver. So this
             # is a count and a question -- never a sender, never a subject
             # -- and it rides the SAME burst as the digest in front of it so
             # the address thinning is still one pass over the whole cue.
+            #
+            # Returns "" (nothing worth saying), "spoke", or -- only with a
+            # ``guard``, which is only the worker path -- the reason it was
+            # dropped. Three outcomes rather than a bool because the log
+            # line for "there was no backlog" and the one for "it was too
+            # late to say it" are not the same sentence, and the ledger
+            # reads both.
             offer, major = self._arrival_offer_fragments()
             frags = list(held) + list(offer)
             if not frags:
-                return False
+                return ""
             # A fault-only line is a STATEMENT ("The disk is full.") and
             # there is nothing to go through; only a question may be
             # parked, or a "yes" would hang on nothing.
@@ -1701,7 +1794,17 @@ class JarvisApp:
             thinned = self._thin_address(burst + frags)
             digest = address_mod.join_thinned(thinned[len(burst):])
             if not digest:
-                return False
+                return ""
+            # THE LAST MOMENT BEFORE THE WORDS. Everything above is a read
+            # -- the mailbox, the fault board, the thinning -- and the
+            # mailbox read is the slow one, so this is the only place the
+            # staleness question can honestly be asked: at the worker's
+            # START nothing had happened yet BECAUSE NOTHING HAD WAITED
+            # yet. Nothing below is undone, so the burst ledger is left
+            # alone until we know we are speaking.
+            why = guard() if guard is not None else ""
+            if why:
+                return why
             burst[:] = thinned
             # Parked BEFORE the words go out, exactly as the first-wake
             # offer marks the day before it speaks: a TTS failure must not
@@ -1711,19 +1814,45 @@ class JarvisApp:
             parked = self._park_arrival_offer(said=major) if asks else None
             bus.publish(JarvisReply(text=digest, speak=True))
             self._say(digest)
+            # THE MIC IS ARMED HERE, not at the park. The falling edge
+            # arrives as SpeakingState on the Tk pump (_turn_on_speaking ->
+            # _after_speech), which opens the follow-up window whenever it
+            # finds this flag with nothing pending -- so arming it before
+            # _say had queued a word left a gap in which the WELCOME's own
+            # edge opened a mic for a question that had not been asked yet.
+            # Inline, that gap was two statements on one thread; off the
+            # pump, the edge drains on the other one while the worker is
+            # still in the mailbox. Arming after _say is safe in the other
+            # direction because _say only ENQUEUES (tts.speak puts on a
+            # queue and returns), so this line's own edge cannot already
+            # have run.
+            if parked is not None:
+                self._followup_after_speech = True
             # ...and the 60 s TTL is measured from HERE, not from the park.
             # A long quiet-hours backlog in front of the question used to
             # eat most of the window he had to answer it.
             self._restamp_offer(parked)
-            return True
+            return "spoke"
 
-        def finish_off_thread(held):
+        def finish_off_thread(held, gen, turn):
             # arrival.run() guards each step and logs what ran; a worker has
             # no such parent, so both come with it. A catch-up that died on
             # the way to the speaker belongs in the log, not in a dead
-            # thread, and "catch-up" in the cue's own line means STARTED.
+            # thread -- and so does one that was still worth saying when it
+            # was asked for and was not by the time it could be said.
             try:
-                if not speak_catch_up(held):
+                outcome = speak_catch_up(
+                    held, guard=lambda: self._arrival_catch_up_stale(gen, turn))
+                if outcome == "spoke":
+                    return
+                if outcome:
+                    # SILENCE IS THE RIGHT OUTCOME FOR A STALE DIGEST.
+                    # Nothing in it is news that keeps: the mail is still
+                    # there, the fault is still on the board, and both are
+                    # one question away whenever he asks.
+                    log.info("arrival: the catch-up landed too late (%s); "
+                             "dropped", outcome)
+                else:
                     log.info("arrival: the catch-up had nothing to say")
             except Exception:  # noqa: BLE001
                 log.exception("arrival: the catch-up failed off-thread")
@@ -1737,21 +1866,38 @@ class JarvisApp:
             # queues once Tk is attached, and drain() runs from the UI's
             # own _pump -- so every subscriber here, this step included,
             # executes on the Tk MAIN THREAD. The unread count is an IMAP
-            # round trip (IMAP_TIMEOUT is 15 s a mailbox, and mail.py's
-            # own docstring records a measured 8.1 s across his three
-            # accounts), and paying that on the pump freezes the window and
-            # every event behind it at the exact moment he walks in. So a
+            # round trip, and its BOUND is IMAP_TIMEOUT: 15 s a mailbox,
+            # taken in parallel (mail._fetch_every runs a pool), so the
+            # wall cost is one timeout rather than their sum. What three
+            # of his mailboxes actually cost is NOT MEASURED -- the 8.1 s
+            # this comment used to quote is mail.py's SEQUENTIAL figure
+            # from 2026-08-31 and predates that pool. The bound is enough:
+            # paying it on the pump freezes the window and every event
+            # behind it at the exact moment he walks in. So a
             # configured mailbox finishes the step on a short-lived worker,
             # the way every other mail watcher in this file already does
             # (mailwatch.PeopleMailHeadsUp is its own service). With no
             # mailbox nothing opens a socket, so that path stays inline and
             # the cue is still synchronous end to end.
             if not self._arrival_mail_is_remote():
-                return speak_catch_up(frags)
-            worker = threading.Thread(target=finish_off_thread, args=(frags,),
+                # No guard on this path and none needed: inline, the step
+                # is still atomic -- nothing can have taken the floor
+                # between the read and the words.
+                return speak_catch_up(frags) == "spoke"
+            # WHOSE ARRIVAL, AND WHOSE FLOOR. Read on the pump thread, at
+            # the moment the step is taken, and carried to the worker so
+            # the worker can tell whether the world it was speaking to is
+            # still there when the mailbox finally answers.
+            gen = getattr(self, "_arrival_gen", 0)
+            turn = getattr(self, "_dispatch_gen", 0)
+            worker = threading.Thread(target=finish_off_thread,
+                                      args=(frags, gen, turn),
                                       name="arrival-catchup", daemon=True)
             # Held so a test can join it; nothing in the app waits.
             self._arrival_catch_up_thread = worker
+            # The ledger has to say STARTED rather than DONE for this one:
+            # see _arrival_ledger.
+            self._arrival_catch_up_deferred = True
             worker.start()
             return True
 
@@ -1819,11 +1965,6 @@ class JarvisApp:
         frags = arrival_mod.catch_up_fragments(unread=self._unread_count(),
                                                major=major)
         return list(frags), major
-
-    def _arrival_offer_line(self) -> str:
-        """The fragments above as one string. Convenience, and the shape
-        the tests read."""
-        return " ".join(self._arrival_offer_fragments()[0])
 
     def _arrival_mail_is_remote(self) -> bool:
         """Will the unread count cost an IMAP round trip?
@@ -1903,7 +2044,11 @@ class JarvisApp:
         ``said`` is the fault clause the OFFER already spoke, carried into
         the delivery so a yes does not get the same sentence read back at
         it. The dict is returned so the caller can re-stamp ``made_at``
-        once the words are actually out.
+        once the words are actually out -- and arm the follow-up mic then
+        too. A question nobody listens for is the 2026-09-02 stuck-listen
+        bug in miniature, but arming it HERE, before ``_say`` had queued a
+        word, opened the mic on the welcome's own falling edge instead of
+        the question's. The caller owns that line now.
         """
         offer = {"made_at": time.time(),
                  "deliver": lambda: self._deliver_arrival_catch_up(said=said)}
@@ -1912,10 +2057,6 @@ class JarvisApp:
         except Exception:  # noqa: BLE001 - a question nobody can answer is worse
             log.exception("arrival: could not park the catch-up offer")
             return None
-        # A question nobody listens for is the 2026-09-02 stuck-listen bug
-        # in miniature: _after_speech opens the mic on this line's falling
-        # edge, so "yes" needs no wake word.
-        self._followup_after_speech = True
         return offer
 
     def _restamp_offer(self, offer) -> None:

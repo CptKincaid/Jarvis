@@ -265,6 +265,11 @@ def make_probe(sensor, phone: Callable = probe) -> Callable:
 class PresenceSentinel:
     """See the module docstring. ``state`` is 'home' | 'away' | 'unknown'."""
 
+    # The leg already named in the missing-`blocked` ERROR (see
+    # _warn_no_blocked). A class default so a sentinel built by a test with
+    # object.__new__ still answers the question.
+    _no_blocked_warned = ""
+
     def __init__(self, cfg, publish: Callable = bus.publish,
                  probe_fn: Optional[Callable] = None,
                  now: Callable[[], float] = time.time, poll_s: Optional[float] = None,
@@ -414,23 +419,44 @@ class PresenceSentinel:
         is blocked is reported at ERROR with its type named. It still
         returns False -- inventing "blacked out" from a broken leg would
         blank presence on every bug -- but it can no longer do so quietly.
+
+        LOUD ABOUT THE CASE WE CAN NAME, STILL CAUGHT FOR THE ONES WE
+        CANNOT. The first cut of that ERROR put the read OUTSIDE the try,
+        which narrowed a catch on the privacy path: a ``blocked`` that
+        raises anything other than a missing attribute -- an unreadable
+        policy file, a bug in a future leg -- then escaped this method,
+        escaped ``tick()`` (which has no guard of its own; only ``_loop``
+        does) and cost the whole poll, this blackout's own ``_forget()``
+        included. Widening a catch is usually the wrong instinct; here the
+        old breadth was protecting something. The read is back inside.
+
+        And the ERROR is said ONCE per leg. A leg with no ``blocked`` is
+        wrong for as long as it is wired, and ``poll_s`` is 60 s: one line
+        names the bug, one an hour for ever is how a real error gets
+        filtered out of a log.
         """
         if self.phone_ip or self.phone_mac:
             return False
         sensor = self.sensor
         if sensor is None:
             return False
-        blocked = getattr(sensor, "blocked", _MISSING)
-        if blocked is _MISSING:
-            log.error("presence: the %s leg has no `blocked`, so offline mode "
-                      "cannot reach the sentinel; holding the last verdict",
-                      type(sensor).__name__)
-            return False
         try:
+            blocked = getattr(sensor, "blocked", _MISSING)
+            if blocked is _MISSING:
+                self._warn_no_blocked(type(sensor).__name__)
+                return False
             return bool(blocked)
         except Exception:  # noqa: BLE001 - provider boundary
             log.debug("presence: sensor block check failed", exc_info=True)
             return False
+
+    def _warn_no_blocked(self, leg: str) -> None:
+        """The missing-``blocked`` ERROR, once per leg type."""
+        if getattr(self, "_no_blocked_warned", "") == leg:
+            return
+        self._no_blocked_warned = leg
+        log.error("presence: the %s leg has no `blocked`, so offline mode "
+                  "cannot reach the sentinel; holding the last verdict", leg)
 
     def _forget(self) -> None:
         """Back to "no opinion", without publishing a transition.

@@ -202,10 +202,20 @@ Three rules that are easy to get wrong, and were:
   question was parked, or a long quiet-hours backlog eats the window he has to
   answer in.
 * **The unread count runs on a worker thread** when a mailbox is configured.
-  `bus.drain()` runs from the UI's Tk pump, so an IMAP round trip (15 s timeout
-  a mailbox; 8.1 s measured across his three accounts) taken inline froze the
-  window and every event behind it at the moment he walked in. With no mailbox
-  nothing opens a socket and the cue stays synchronous.
+  `bus.drain()` runs from the UI's Tk pump, so an IMAP round trip taken inline
+  froze the window and every event behind it at the moment he walked in. The
+  bound is `IMAP_TIMEOUT`: 15 s a mailbox, in parallel, so one timeout rather
+  than their sum. What three of his mailboxes actually cost is **not
+  measured** — the 8.1 s figure elsewhere in the tree is mail.py's *sequential*
+  measurement from 2026-08-31 and predates the pool. With no mailbox nothing
+  opens a socket and the cue stays synchronous.
+* **A catch-up that lands too late is DROPPED, not spoken.** Off the pump the
+  last step is no longer atomic, so before it speaks the worker asks whether
+  the arrival it belongs to is still the current one and whether he has taken a
+  turn since (`_dispatch_gen`, the same counter `_async_reply` reads). If
+  either has moved, silence: nothing in the digest is news that keeps. The
+  cue's log line says `catch-up (started)` on that path, because that is all
+  `run()` can honestly claim.
 
 Degradation is the point: with no kitchen sensor, no calendar and no mailbox he
 gets exactly the "Welcome back, sir" he got before any of this was built.

@@ -170,7 +170,7 @@ def test_with_no_mailbox_and_a_clear_board_nothing_is_offered():
     opened, and the count is None rather than zero."""
     a = make_app()
     assert a._unread_count() is None
-    assert a._arrival_offer_line() == ""
+    assert a._arrival_offer_fragments() == ([], "")
 
 
 def test_the_offer_rides_the_same_burst_as_the_quiet_digest():
@@ -244,8 +244,9 @@ def test_the_major_clause_with_no_mailbox_is_a_statement_not_a_question():
     err = SimpleNamespace(kind="error", line="The disk is full.", text="")
     a = make_app(services=SimpleNamespace(panel_wake=None,
                                           faults=SimpleNamespace(current=err)))
-    line = a._arrival_offer_line()
-    assert line == "The disk is full."
+    frags, major = a._arrival_offer_fragments()
+    line = " ".join(frags)
+    assert line == "The disk is full." and major == "The disk is full."
     assert not line.endswith("?") and "unread" not in line
 
 
@@ -300,7 +301,7 @@ def test_a_fault_that_appeared_AFTER_the_offer_is_still_delivered():
 def test_the_offer_can_be_switched_off():
     a = make_app({"presence.arrival_offer": False})
     a._unread_count = lambda: 9
-    assert a._arrival_offer_line() == ""
+    assert a._arrival_offer_fragments() == ([], "")
 
 
 def test_the_delivery_reads_senders_and_subjects_and_only_after_a_yes():
@@ -450,10 +451,10 @@ def test_stopping_the_sentinel_stops_the_fabric_with_it():
 # `bus.attach_tk(root)` makes publish() queue and drain() run from the UI's
 # `_pump`, so every subscriber -- `_on_presence`, `_on_room_changed`, and
 # the whole arrival cue behind them -- executes on the Tk MAIN thread. The
-# unread count is an IMAP round trip (IMAP_TIMEOUT 15 s a mailbox;
-# mail.py records a measured 8.1 s across his three accounts), so paying
-# it inline froze the window and every event behind it at the moment he
-# walked in.
+# unread count is an IMAP round trip, bounded by IMAP_TIMEOUT (15 s a
+# mailbox, in parallel, so one timeout and not their sum -- what three of
+# his own mailboxes cost is NOT measured), so paying it inline froze the
+# window and every event behind it at the moment he walked in.
 FAKE_ACCOUNT = {"label": "test", "address": "someone@example.com",
                 "app_password": "not-a-real-password"}
 
@@ -588,3 +589,145 @@ def test_a_door_room_that_does_match_is_silent(caplog):
     with caplog.at_level(logging.WARNING):
         a._warn_door_room_names_nothing()
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
+
+
+# ==================================================================
+# ...and it must not speak into whatever he is doing when it lands
+# ==================================================================
+# Taking the fetch off the pump thread bought the window back and sold the
+# ATOMICITY of the last arrival step: the cue returns, and the offer is
+# spoken and parked whenever the mailbox happens to answer -- up to
+# IMAP_TIMEOUT (15 s) later. Inline that could not happen. A catch-up that
+# lands after he has asked Jarvis something else is not late, it is WRONG,
+# and silence is the right outcome for a stale digest: nothing here is
+# news that keeps.
+def _gated_mailbox(gate, seconds=10.0):
+    def fetch_unread(*args, **kw):
+        gate.wait(seconds)
+        return [SimpleNamespace(sender="Canvas", subject="Lab 3 graded")]
+    return fetch_unread
+
+
+def _catching_up(monkeypatch, gate):
+    import jarvis.tools.mail as mail_mod
+    monkeypatch.setattr(mail_mod, "fetch_unread", _gated_mailbox(gate))
+    a = make_app({"gmail.accounts": [FAKE_ACCOUNT]}, quiet=Quiet([]),
+                 services=SimpleNamespace(panel_wake=None, briefing_offer=None))
+    assert arrival_mod.run(["catch-up"], a._arrival_actions()) == ["catch-up"]
+    return a
+
+
+def _finish(a, gate):
+    gate.set()
+    a._arrival_catch_up_thread.join(timeout=10.0)
+    assert not a._arrival_catch_up_thread.is_alive()
+
+
+def _said_nothing(a):
+    assert a.tts.spoken == [], "the stale catch-up spoke anyway"
+    assert a.services.briefing_offer is None, "a stale question was parked"
+    assert a._followup_after_speech is False, "a mic was opened for it"
+
+
+def test_a_catch_up_that_lands_after_he_has_TAKEN_A_TURN_is_dropped(monkeypatch):
+    """He walked in, the mailbox took its time, and he asked Jarvis
+    something in the meantime. The answer to THAT is the floor; the
+    doorstep question arriving on top of it is the failure."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate)
+    a._dispatch_gen = getattr(a, "_dispatch_gen", 0) + 1   # one turn, as _dispatch does
+    _finish(a, gate)
+    _said_nothing(a)
+
+
+def test_a_catch_up_that_lands_during_a_LIVE_turn_is_dropped(monkeypatch):
+    """The floor is busy right now: _turn_busy is exactly the guard
+    _after_speech makes before it puts anything of its own out."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate)
+    a._turn_busy = _threading.Event()
+    a._turn_busy.set()
+    _finish(a, gate)
+    _said_nothing(a)
+
+
+def test_a_catch_up_from_a_SUPERSEDED_arrival_is_dropped(monkeypatch):
+    """He came back, left again and came back again inside one slow fetch.
+    The first cue's digest belongs to an arrival that is over."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate)
+    a._arrival_gen = getattr(a, "_arrival_gen", 0) + 1
+    _finish(a, gate)
+    _said_nothing(a)
+
+
+def test_a_catch_up_that_lands_on_a_QUIET_house_still_speaks(monkeypatch):
+    """The control: nothing changed while the mailbox answered, so the
+    offer is spoken and parked exactly as it always was. A guard that
+    drops the ordinary case is worse than the bug."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate)
+    _finish(a, gate)
+    assert "1 unread email" in a.tts.spoken[0]
+    assert a.services.briefing_offer is not None
+    assert a._followup_after_speech is True
+
+
+def test_the_follow_up_mic_is_armed_only_once_the_question_is_QUEUED():
+    """`_park_arrival_offer` set `_followup_after_speech` before `_say`
+    had queued a word. On the worker that is a real gap: the welcome's own
+    falling edge can drain on the Tk thread inside it, and `_after_speech`
+    then sees the flag with `tts.pending == 0` and opens the mic before the
+    question has been asked."""
+    a = make_app(quiet=Quiet([]), services=SimpleNamespace(panel_wake=None,
+                                                           briefing_offer=None))
+    a._unread_count = lambda: 3
+    seen, spoken = [], a.tts.speak
+
+    def watch(text):
+        seen.append(a._followup_after_speech)
+        spoken(text)
+
+    a.tts.speak = watch
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert seen == [False], "the mic was armed before the question was queued"
+    assert a._followup_after_speech is True
+
+
+# ==================================================================
+# The cue's ledger says what actually happened
+# ==================================================================
+def test_the_ledger_says_STARTED_when_the_catch_up_went_to_a_worker(monkeypatch):
+    """`arrival.run`'s contract is "returns those that actually ran", and
+    on the worker path the step has only STARTED -- it may yet turn out to
+    have nothing to say, and log so. Two log lines contradicting each
+    other is worse than either."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate)
+    assert a._arrival_ledger(["greeting", "catch-up"]) == \
+        "greeting -> catch-up (started)"
+    _finish(a, gate)
+
+
+def test_the_ledger_says_plain_catch_up_when_it_ran_INLINE():
+    a = make_app(quiet=Quiet(["While you were out, sir:", "The build passed, sir."]))
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert a._arrival_ledger(["greeting", "catch-up"]) == "greeting -> catch-up"
+    assert a._arrival_ledger([]) == ""
+
+
+def test_the_deferred_mark_does_not_survive_into_the_NEXT_cue(monkeypatch):
+    """One cue's worker must not label the next cue's inline step."""
+    import threading as _threading
+    gate = _threading.Event()
+    a = _catching_up(monkeypatch, gate)
+    _finish(a, gate)
+    a.assistant.data.pop("gmail.accounts")
+    a.quiet = Quiet(["While you were out, sir:"])
+    arrival_mod.run(["catch-up"], a._arrival_actions())
+    assert a._arrival_ledger(["catch-up"]) == "catch-up"

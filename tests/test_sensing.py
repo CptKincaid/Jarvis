@@ -1036,3 +1036,57 @@ def test_a_leg_that_cannot_answer_blocked_is_reported_LOUDLY(caplog):
         assert s._blacked_out() is False
     assert any("LegWithNoBlocked" in r.getMessage() and r.levelno >= logging.ERROR
                for r in caplog.records), "the missing attribute was swallowed"
+
+
+def test_a_leg_whose_blocked_EXPLODES_does_not_cost_the_whole_TICK():
+    """The other half of the same repair, and the one it narrowed.
+
+    Making a MISSING `blocked` loud moved the read out of the `try`, so a
+    leg whose `blocked` RAISES anything else -- an unreadable policy file,
+    a property with a bug -- escaped `_blacked_out()`, escaped `tick()`
+    (which has no guard of its own; only `_loop` does) and lost the entire
+    poll, the blackout `_forget()` included. The old bare `except
+    Exception` caught it. Loud about the case we can name, still caught
+    for the ones we cannot.
+    """
+    from jarvis.presence import PresenceSentinel
+
+    class ExplodingBlocked:
+        configured = True
+
+        @property
+        def blocked(self):
+            raise RuntimeError("the policy file is unreadable")
+
+        def read(self):
+            return None
+
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = ExplodingBlocked()
+    assert s._blacked_out() is False
+    assert s.tick() is None          # and NOT a RuntimeError out of the tick
+
+
+def test_the_missing_blocked_ERROR_is_said_once_not_once_a_POLL(caplog):
+    """A leg with no `blocked` is wrong for as long as it is wired, and the
+    sentinel polls every `poll_s` (60 s by default). One ERROR names the
+    bug; one an hour, for ever, is how a real error gets filtered out."""
+    import logging
+    from jarvis.presence import PresenceSentinel
+
+    class LegWithNoBlocked:
+        configured = True
+
+        def read(self):
+            return None
+
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = LegWithNoBlocked()
+    with caplog.at_level(logging.ERROR):
+        for _ in range(5):
+            assert s._blacked_out() is False
+    said = [r for r in caplog.records
+            if "LegWithNoBlocked" in r.getMessage() and r.levelno >= logging.ERROR]
+    assert len(said) == 1, "one ERROR a poll, for as long as the leg is wrong"
