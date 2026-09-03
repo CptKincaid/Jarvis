@@ -406,7 +406,8 @@ class _AudioStream:
     """
 
     def __init__(self, path: str, timeout: float = FISH_TIMEOUT_S,
-                 min_heard: int = _WAV_HEADER_BYTES):
+                 min_heard: int = _WAV_HEADER_BYTES,
+                 latency_ms: int | None = None):
         self.path = path
         # How long the CONSUMER may wait on this producer. It travels with
         # the stream because the consumer loop, _play_stream and
@@ -423,6 +424,13 @@ class _AudioStream:
         # keeps byte-identical; see BREEZE_MIN_HEARD_BYTES for why a header
         # plus a handful of samples is not "heard" by any ear.
         self.min_heard = int(min_heard)
+        # What target buffer the PLAYER is asked for, or None to leave it
+        # alone. It travels here for the same reason the two deadlines above
+        # do -- _play_stream is shared by every streaming engine -- and it
+        # defaults to None so fish, whose arrival is a jittery hosted API,
+        # keeps the player it has always had to the byte. See
+        # BREEZE_PLAYER_LATENCY_MS for what it costs to leave it unset.
+        self.latency_ms = None if latency_ms is None else int(latency_ms)
         self.nbytes = 0
         self.failed = False
         self.done = threading.Event()
@@ -866,6 +874,36 @@ BREEZE_PARAMS = dict(template="ref_edit_tata", instruction=BREEZE_INSTRUCTION,
                      cfg_scale=4.0, seed=1234, temperature=0.9,
                      repetition_penalty=1.1, max_new_tokens=1500,
                      sr=24000, attn="eager", text_encoder_attn="sdpa")
+
+# The target buffer paplay is asked for when it reads a Breeze stream from
+# stdin, in milliseconds.
+#
+# MEASURED, from his own log of 2026-09-02 matched to the wav each utterance
+# stored in the speech cache. Wall clock minus the audio actually in the file:
+#
+#   f5, render the whole chunk then play it     0.48 - 0.65 s   (RTF ~0.1)
+#   breeze, CACHE HIT, play the file            0.07 - 0.11 s
+#   breeze, STREAMED to paplay's stdin          1.79 - 2.34 s
+#
+# The controlled pair is the last two rows. "Checking right now, sir. One
+# moment." is 2.24 s of audio and costs 0.07 s off the disk and 1.81 s
+# streamed: same engine, same bytes, same player, and the only difference is
+# stdin. Nor is the engine the one waiting -- for the 1.12 s utterance the
+# receipt thread had already stored the FINISHED wav at t=1.08 s, so every
+# byte was in hand, and the utterance still ran to t=2.29 s.
+#
+# That is prebuffering. Without --latency-msec paplay asks for PulseAudio's
+# default target buffer, ~2 s, and prebuf defaults to it: the stream does not
+# start until it is full. A file fills 2 s in milliseconds; a render arriving
+# at ~1.3x real time takes ~1.5 s, and an utterance shorter than the buffer
+# never fills it at all and only starts when the socket closes. That is the
+# ~1.9 s he heard in the middle of a two-sentence reply at 23:17.
+#
+# 400 ms, not less: the sidecar runs its render worker up to
+# RENDER_QUEUE_DEPTH=4 blocks ahead of the socket, one codec frame each at
+# the checkpoint's 12.5 Hz frame rate, so a full stall of ITS buffer is
+# 0.32 s. 400 covers that without an underrun and still returns ~1.5 s.
+BREEZE_PLAYER_LATENCY_MS = 400
 
 # Play a breeze chunk while it is still rendering. Module-level so a test --
 # or an ear -- can switch the whole-chunk path back on for comparison; it is
@@ -2187,7 +2225,8 @@ class TTS:
             return False only when the chunk must be rendered by the fallback
             engine (it failed before ANY audio reached the player)."""
             stream = _AudioStream(tmp_name, timeout=BREEZE_TIMEOUT_S,
-                                  min_heard=BREEZE_MIN_HEARD_BYTES)
+                                  min_heard=BREEZE_MIN_HEARD_BYTES,
+                                  latency_ms=BREEZE_PLAYER_LATENCY_MS)
             wav_q.put(stream)
             request_id = _breeze_request_id()
             # verify=False: this generator now ends at end of AUDIO, and the
@@ -2480,9 +2519,53 @@ class TTS:
     # still breaking a runaway paragraph.
     #
     # With BREEZE_STREAM_PLAYBACK off it falls back to the module default,
-    # NOT to this: on the whole-chunk path a 320-character chunk would be
-    # ~14 s of silence before the first word.
-    _BREEZE_STREAM_CHUNKING = (320, 8.0)
+    # NOT to this: on the whole-chunk path a 560-character chunk would be
+    # ~25 s of silence before the first word.
+    _BREEZE_STREAM_CHUNKING = (560, 8.0)
+
+    # How far SENTENCES may be merged into one chunk, for breeze while it is
+    # streaming. This is the FIRST pass; everything above bounds the second.
+    #
+    # The bound above was raised from 320 and this was added because the
+    # comma cap was never what cut his reply apart. Sentences are ALWAYS
+    # split -- max_chars only governs re-splitting a long chunk at its commas
+    # -- so a two-sentence reply was two chunks whatever that number said,
+    # and at 23:17 on 2026-09-02 it was worse than that: the streaming reply
+    # path hands TTS one sentence per speak() call, so his two sentences were
+    # two whole utterances, each paying a fresh player startup.
+    #
+    # Every boundary costs the same two things, and neither is theoretical:
+    # BREEZE_PLAYER_LATENCY_MS is the ~1.9 s of player prebuffer measured on
+    # each one, and the block above _ENGINE_CHUNKING is the F0 measurement
+    # showing a split resets the sentence's pitch. Breeze reaches first audio
+    # in 0.268 s on a WHOLE utterance -- better than F5 does on a chunk -- so
+    # a boundary buys it nothing whatever. The right number of them is none.
+    #
+    # 560 = MAX_SPEAK_LENGTH x 1.12. The cap is applied to the text BEFORE
+    # the pronunciation pass, which was measured expanding his real calendar
+    # and course lines by at most x1.045 ("ENGR" -> "Engineering"), so this
+    # leaves every reply the room can speak in one chunk with margin. It is
+    # deliberately not unbounded: a Breeze stream cut after its first audible
+    # byte is never re-spoken (_stream_breeze -- re-rendering it on F5 would
+    # say the first half twice, in the other voice), so the chunk is what
+    # bounds how much of a long reading is lost to one cut. It is also far
+    # inside the sidecar's own ceiling: max_new_tokens=1500 at the
+    # checkpoint's 12.5 Hz frame rate is 120 s of audio, against ~31 s here.
+    _BREEZE_STREAM_JOIN_CHARS = int(MAX_SPEAK_LENGTH * 1.12)
+
+    def _join_chars(self, engine: str | None = None) -> int:
+        """How far sentences may be merged into ONE chunk for ``engine``.
+
+        0 means "only the min_chars merge every engine has always done", and
+        that is every engine but breeze-while-streaming: F5, XTTS, edge and
+        fish all render a chunk whole before a byte of it sounds, so for them
+        a sentence boundary is what keeps the pipeline fed.
+        """
+        if engine is None:
+            engine = getattr(self, "_engine", "") and self.render_engine()
+        if engine == "breeze" and BREEZE_STREAM_PLAYBACK:
+            return self._BREEZE_STREAM_JOIN_CHARS
+        return 0
 
     def _chunk_limits(self, engine: str | None = None) -> tuple[int, float]:
         """(max_chars, growth) for ``engine``. getattr, not self._engine:
@@ -2503,6 +2586,9 @@ class TTS:
         Splits on [.!?;]+whitespace, keeps common abbreviations (Mr. / e.g. /
         single initials) attached, and merges fragments shorter than
         ``min_chars`` forward (a short trailing fragment merges backward).
+        An engine that STREAMS merges much further than that -- up to
+        ``_join_chars(engine)``, which for breeze is a whole reply -- because
+        for it a chunk boundary is pure cost; see _join_chars.
 
         Chunks longer than ``max_chars`` are then broken again at commas.
         Sentence-only splitting starved playback: a short opening sentence
@@ -2513,6 +2599,11 @@ class TTS:
         parts = re.split(r'(?<=[.!?;])\s+', text)
         engine_max, growth = self._chunk_limits(engine)
         max_chars = engine_max if max_chars is None else max_chars
+        # How long the merge-forward buffer may get before a chunk is closed.
+        # For every engine but breeze-while-streaming this is min_chars, i.e.
+        # exactly the condition this loop has always tested, so their splits
+        # come out byte-identical; see _join_chars.
+        join = max(min_chars, self._join_chars(engine))
         chunks: list[str] = []
         buf = ""
         for part in parts:
@@ -2520,7 +2611,7 @@ class TTS:
             if not part:
                 continue
             buf = f"{buf} {part}" if buf else part
-            if self._ABBREV_TAIL.search(buf) or len(buf) < min_chars:
+            if self._ABBREV_TAIL.search(buf) or len(buf) < join:
                 continue                 # merge forward into the next part
             chunks.append(buf)
             buf = ""
@@ -2698,6 +2789,8 @@ class TTS:
                 return
         dev = (CONFIG.playback_device or "").strip()
         cmd = ["paplay", f"--client-name={SPEECH_CLIENT_NAME}",
+               *([f"--latency-msec={stream.latency_ms}"]
+                 if stream.latency_ms else []),
                *(["--device", dev] if dev else [])]
         started = time.monotonic()
         self._mark_audio()

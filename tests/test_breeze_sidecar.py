@@ -846,6 +846,37 @@ def breeze(tmp_path, sock_path, monkeypatch, no_spawn):
     return TTS(engine="breeze", cache_dir=tmp_path / "cache")
 
 
+# A reply long enough that breeze still renders it in TWO chunks.
+#
+# It used to be two sentences. It cannot be any more: a whole reply is now
+# one stream (section 6b), because every boundary costs ~1.9 s of player
+# prebuffer and resets the sentence's pitch. What is below the bound is one
+# chunk, so the per-chunk machinery these tests are about -- the fallback,
+# the receipts, the cut chunk that is never re-spoken -- is reached only by a
+# reading past _BREEZE_STREAM_JOIN_CHARS, and that is exactly the case it
+# exists for: bounding how much of a long document one bad render costs.
+TWO_CHUNKS = [" ".join(["The reactor is holding steady this evening."] * 13),
+              " ".join(["The workshop is quiet and the coffee is fresh."] * 4)]
+TWO = " ".join(TWO_CHUNKS)
+
+
+@pytest.fixture
+def long_reading(monkeypatch):
+    """Let a test hand TTS more than one reply's worth of text.
+
+    In the room this is unreachable, and that is the point of this branch:
+    MAX_SPEAK_LENGTH truncates every utterance at 500 characters before the
+    engine sees a word of it, and _BREEZE_STREAM_JOIN_CHARS is 560, so a
+    Breeze reply is now ALWAYS one stream -- no boundary, no second player
+    startup, no pitch reset. The per-chunk machinery still has to be right
+    for a caller that bounds its own text (and for f5, xtts and fish, which
+    are chunked at 160-240 characters and reach it constantly), so the tests
+    that are about that machinery raise the cap to get to it.
+    """
+    monkeypatch.setattr(tts_mod.TTS, "MAX_SPEAK_LENGTH", 4000)
+
+
+
 def test_bytes_reach_the_player_before_the_stream_ends(breeze, sock_path,
                                                        tmp_path):
     """Breeze's 0.268 s engine time-to-first-audio only reaches the ear if
@@ -859,7 +890,9 @@ def test_bytes_reach_the_player_before_the_stream_ends(breeze, sock_path,
         done = breeze.speak("Good evening, sir.")
         assert wait_until(lambda: bool(FakeProc.spawned))
         proc = FakeProc.spawned[0]
-        assert proc.cmd == ["paplay", f"--client-name={tts_mod.SPEECH_CLIENT_NAME}"]
+        assert proc.cmd == ["paplay",
+                            f"--client-name={tts_mod.SPEECH_CLIENT_NAME}",
+                            f"--latency-msec={tts_mod.BREEZE_PLAYER_LATENCY_MS}"]
         assert wait_until(lambda: len(proc.fed) >= 44 + len(body))
         assert not done.is_set()          # still streaming
         gate.set()
@@ -874,9 +907,13 @@ def test_bytes_reach_the_player_before_the_stream_ends(breeze, sock_path,
     assert not [p for p in tmp_path.glob("**/*.wav") if "cache" not in str(p)]
 
 
-def test_a_two_sentence_reply_streams_both_chunks_in_order(breeze, sock_path):
+def test_a_multi_chunk_reading_streams_both_chunks_in_order(
+        breeze, sock_path, long_reading):
     """Chunk N+1 renders while chunk N plays, and the consumer still hands
-    them to the player in order -- the producer runs ahead at RTF 0.742."""
+    them to the player in order -- the producer runs ahead at RTF 0.742.
+
+    Only a reading past the join bound is chunked at all now; below it the
+    reply is one stream and there is no boundary to get wrong."""
     first, second = wav_bytes(0.2)[44:], wav_bytes(0.3)[44:]
     order = []
 
@@ -895,13 +932,10 @@ def test_a_two_sentence_reply_streams_both_chunks_in_order(breeze, sock_path):
 
     srv = FakeSidecar(sock_path, handler)
     try:
-        breeze.speak("The reactor is holding steady this evening. "
-                     "The workshop is quiet and the coffee is fresh.",
-                     block=True)
+        breeze.speak(TWO, block=True)
     finally:
         srv.close()
-    assert order == ["The reactor is holding steady this evening.",
-                     "The workshop is quiet and the coffee is fresh."]
+    assert order == TWO_CHUNKS
     assert len(FakeProc.spawned) == 2
     assert bytes(FakeProc.spawned[0].fed).endswith(first)
     assert bytes(FakeProc.spawned[1].fed).endswith(second)
@@ -914,11 +948,273 @@ def test_a_long_sentence_is_not_comma_split_the_way_f5s_is():
     cannot underrun, so there is nothing to buy by splitting."""
     t = TTS.__new__(TTS)
     t.cache = None
-    assert t._chunk_limits("breeze") == (320, 8.0)
+    assert t._chunk_limits("breeze") == (560, 8.0)
     line = ("On the calendar you have Biosensors at nine ten ay em, Magnetic "
             "Resonance Engineering at twelve forty pee em, and at four ten "
             "pee em your Electrical Design Lab presentation.")
     assert t._split_sentences(line, engine="breeze") == [line]
+
+
+# ===========================================================================
+# 6b. one utterance is ONE stream
+#
+# MEASURED, 2026-09-02 23:17 (his "he took quite long to say his second
+# sentence"). Two log lines, one reply, and the second one starts 1 ms after
+# the first finishes -- so nothing is queued badly and nothing renders slowly:
+#
+#   23:17:53.020 speaking (breeze): I'm afraid the processing of your ...
+#   23:17:59.637 speech complete                       6.617 s wall
+#   23:17:59.638 speaking (breeze): It seems my new voice is still ...
+#   23:18:04.087 speech complete                       4.449 s wall
+#
+# The two wavs those renders left in his speech cache are 215084 and 122924
+# bytes of 24 kHz PCM16: 4.480 s and 2.560 s of AUDIO. So 2.14 s and 1.89 s
+# of each utterance was not audio at all. Across every Breeze utterance in
+# that evening's log, matched to the wav each one stored:
+#
+#   engine / path                     wall - audio
+#   f5, render whole chunk then play     0.48 - 0.65 s   (its render, RTF ~0.1)
+#   breeze, CACHE HIT, play the file     0.07 - 0.11 s
+#   breeze, STREAMED to paplay stdin     1.79 - 2.34 s
+#
+# The controlled pair is the third row against the second: "Checking right
+# now, sir. One moment." is 2.24 s of audio and costs 0.07 s from the cache
+# and 1.81 s streamed. Same engine, same audio, same player -- the only
+# difference is stdin.
+#
+# And it is not the engine waiting to speak. For the 1.12 s utterance the
+# receipt thread had stored the finished wav at t=1.08 s, i.e. EVERY byte was
+# in hand, yet the utterance ran to t=2.29 s. Playback had not started when
+# the render was already over. That is paplay prebuffering: without
+# --latency-msec, PulseAudio's default target buffer is ~2 s and it will not
+# start a stream until prebuf is met, which a file fills in milliseconds and
+# a 1.3x-real-time render does not.
+#
+# Two things follow, and this section asserts both.
+#   1. Bound the player's buffer on the streaming path (BREEZE_PLAYER_LATENCY_MS).
+#   2. Stop making boundaries. Every chunk boundary pays that startup again
+#      AND resets the sentence's pitch (see _ENGINE_CHUNKING). Breeze reaches
+#      first audio in 0.268 s on a WHOLE utterance, so a boundary buys it
+#      nothing at all.
+# ===========================================================================
+def _recording_handler(order, blocks_for=None):
+    """The standard sidecar, recording the text of every render asked for."""
+    def handler(srv, conn, req):
+        if req.get("ping"):
+            srv.send(conn, {"ok": True, "ready": True, "graphs": True})
+            return
+        if req.get("status"):
+            got = srv.receipts.get(req["status"])
+            srv.send(conn, {"ok": True, **got} if got else
+                     {"ok": False, "error": "unknown request id"})
+            return
+        order.append(req["text"])
+        block = (blocks_for or (lambda t: wav_bytes(0.3)[44:]))(req["text"])
+        if not req.get("stream"):
+            with wave.open(req["out"], "wb") as fh:
+                fh.setnchannels(1)
+                fh.setsampwidth(2)
+                fh.setframerate(24000)
+                fh.writeframes(block)
+            srv.send(conn, {"ok": True, "seconds": 0.1, "wall": 0.05})
+            return
+        srv.send(conn, {"ok": True, "stream": True, "sr": 24000})
+        conn.sendall(tts_mod.wav_header(24000, 1, 2, None) + block)
+        srv.receipts[req.get("id")] = {"complete": True, "bytes": 44 + len(block)}
+        conn.shutdown(socket.SHUT_WR)
+    return handler
+
+
+def test_a_two_sentence_reply_is_one_render_one_player_one_cache_entry(
+        breeze, sock_path):
+    """His 23:17 reply, verbatim. It cost him 1.89 s of silence in the middle
+    because sentence 2 was a second utterance with a second player startup;
+    one stream has one startup and one pitch contour."""
+    order = []
+    srv = FakeSidecar(sock_path, _recording_handler(order))
+    reply = ("I'm afraid the processing of your request took a moment longer "
+             "than expected, sir. It seems my new voice is still finding its "
+             "footing.")
+    try:
+        breeze.speak(reply, block=True)
+    finally:
+        srv.close()
+    assert order == [reply]                    # ONE render, both sentences
+    assert len(FakeProc.spawned) == 1          # ONE player startup
+    assert breeze.cache.stats()["files"] == 1
+
+
+def test_the_same_reply_is_still_four_chunks_on_f5(breeze):
+    """F5 renders whole chunks at RTF ~0.1 and never streams, so its split is
+    fitted to it and must not move. The engine is the only thing that differs
+    between this and the assertion above."""
+    line = ("Your briefing for today, sir. It is overcast and quite warm, "
+            "with a high of ninety-seven. On the calendar you have Biosensors "
+            "at nine ten ay em, Magnetic Resonance Engineering at twelve "
+            "forty pee em, and at four ten pee em your Electrical Design Lab "
+            "presentation. The inbox is quiet, for once.")
+    assert len(breeze._split_sentences(line, engine="f5")) == 4
+    assert breeze._split_sentences(line, engine="breeze") == [line]
+    # and every non-streaming engine keeps the merge it has always had
+    for engine in ("f5", "xtts", "edge", "fish"):
+        assert breeze._join_chars(engine) == 0, engine
+
+
+def test_the_join_is_off_when_breeze_is_not_streaming(monkeypatch):
+    """With BREEZE_STREAM_PLAYBACK off a chunk is rendered whole before a
+    byte of it sounds, and a 560-character chunk is ~25 s of silence first.
+    The join and the streaming flag are one switch, like the chunk limits."""
+    monkeypatch.setattr(tts_mod, "BREEZE_STREAM_PLAYBACK", False)
+    t = TTS.__new__(TTS)
+    t.cache = None
+    assert t._join_chars("breeze") == 0
+    assert t._chunk_limits("breeze") == (TTS._MAX_CHUNK_CHARS,
+                                         TTS._CHUNK_GROWTH)
+
+
+def test_the_join_bound_covers_a_capped_reply_and_stops_above_it():
+    """MAX_SPEAK_LENGTH caps a reply at 500 characters BEFORE the
+    pronunciation pass, which was measured expanding his real calendar and
+    course lines by at most x1.045 ("ENGR" -> "Engineering"). The bound is
+    500 x 1.12, so every reply the room can speak is one chunk with margin --
+    and text that got past the cap is still broken up, because a Breeze
+    stream cut after the first audible byte is deliberately never re-spoken
+    (_stream_breeze) and the chunk is what bounds how much is lost."""
+    t = TTS.__new__(TTS)
+    t.cache = None
+    assert t._join_chars("breeze") == 560 >= int(TTS.MAX_SPEAK_LENGTH * 1.045)
+    sentence = "The reactor is holding steady this evening. "
+    capped = (sentence * 12)[:TTS.MAX_SPEAK_LENGTH]
+    assert t._split_sentences(capped, engine="breeze") == [capped.strip()]
+    runaway = sentence * 40                      # 1720 chars, past any cap
+    chunks = t._split_sentences(runaway, engine="breeze")
+    assert len(chunks) > 1
+    assert max(len(c) for c in chunks) <= 560 + len(sentence)
+
+
+def test_no_reply_the_room_can_speak_is_ever_chunked(breeze):
+    """The invariant, stated once. _clean_for_speech truncates at
+    MAX_SPEAK_LENGTH before the engine sees a word, and the join bound is
+    above it, so through speak() a Breeze reply is ALWAYS one stream -- not
+    usually, always. Raising MAX_SPEAK_LENGTH without revisiting the bound
+    would quietly put the 1.9 s hole back in the middle of his long replies,
+    and this is what would catch it."""
+    assert TTS.MAX_SPEAK_LENGTH < breeze._join_chars("breeze")
+    longest = breeze._clean_for_speech("The reactor is holding steady. " * 80)
+    assert len(longest) <= TTS.MAX_SPEAK_LENGTH
+    assert breeze.render_chunks(longest) == [breeze.spoken_form(longest)]
+
+
+def test_barge_in_still_cuts_the_middle_of_one_long_stream(breeze, sock_path):
+    """Removing the boundaries must not remove his ability to interrupt.
+    Nothing about barge-in was ever chunk-granular -- stop() terminates the
+    player and the producer's socket loop checks the flag per read -- and
+    this is the assertion that keeps it that way now that a whole reply is
+    one chunk."""
+    audio = wav_bytes(0.6)[44:]
+    gate = threading.Event()
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [audio[:2000], audio[2000:]], gate=gate))
+    reply = ("The reactor is holding steady this evening. The workshop is "
+             "quiet and the coffee is fresh, sir.")
+    try:
+        done = breeze.speak(reply)
+        assert wait_until(lambda: bool(FakeProc.spawned))
+        proc = FakeProc.spawned[0]
+        assert wait_until(lambda: len(proc.fed) >= 44 + 2000)
+        breeze.stop()                            # barge-in, mid-stream
+        gate.set()
+        assert done.wait(10)
+    finally:
+        srv.close()
+    assert proc.returncode == -15                # the player was terminated
+    assert len(FakeProc.spawned) == 1            # and nothing started after it
+    assert not bytes(proc.fed).endswith(audio[2000:])
+    assert breeze.cache.stats()["files"] == 0    # a cut chunk is never cached
+
+
+def test_the_speech_cache_still_serves_a_whole_utterance(breeze, sock_path):
+    """One chunk means one key. The reply he hears twice must still cost one
+    render, and the second one must come off the disk."""
+    order = []
+    srv = FakeSidecar(sock_path, _recording_handler(order))
+    reply = ("The reactor is holding steady this evening. The workshop is "
+             "quiet and the coffee is fresh, sir.")
+    try:
+        breeze.speak(reply, block=True)
+        assert order == [reply]
+        breeze.speak(reply, block=True)
+    finally:
+        srv.close()
+    assert order == [reply]                      # no second render
+    assert breeze.cache.stats()["files"] == 1
+    assert breeze._cached("breeze", reply) is not None
+
+
+def test_a_prewarmed_two_sentence_line_is_now_a_cache_hit(breeze, sock_path):
+    """prewarm() files a phrase under ONE key for every engine but xtts, so
+    every multi-sentence canned line he has -- "Checking right now, sir. One
+    moment." and its neighbours in _canned_phrases -- was filed whole and
+    then looked up in halves, and missed. One chunk per utterance is what
+    makes the two agree."""
+    order = []
+    srv = FakeSidecar(sock_path, _recording_handler(order))
+    line = "Checking right now, sir. I will have an answer in a moment."
+    try:
+        breeze.prewarm([line], block=True)
+        assert order == [line]                   # rendered once, whole
+        breeze.speak(line, block=True)
+    finally:
+        srv.close()
+    assert order == [line]                       # the room did NOT re-render
+    assert len(FakeProc.spawned) == 1
+    assert breeze.cache.stats()["files"] == 1
+
+
+# ---------------------------------------------------------- the prebuffer
+def test_the_streaming_player_is_told_not_to_prebuffer_two_seconds(
+        breeze, sock_path):
+    """paplay with no --latency-msec asks PulseAudio for its default ~2 s
+    target buffer and will not start until prebuf is met. Measured on his
+    log: 1.79-2.34 s before the first sample sounded, on renders that had
+    already FINISHED. The file chain fills that buffer from disk instantly,
+    which is why a cached line costs 0.07 s and the identical streamed one
+    costs 1.81 s."""
+    srv = FakeSidecar(sock_path, sidecar_handler([wav_bytes(0.3)[44:]]))
+    try:
+        breeze.speak("Good evening, sir.", block=True)
+    finally:
+        srv.close()
+    assert FakeProc.spawned[0].cmd == [
+        "paplay", f"--client-name={tts_mod.SPEECH_CLIENT_NAME}",
+        f"--latency-msec={tts_mod.BREEZE_PLAYER_LATENCY_MS}"]
+    # Above the sidecar's own RENDER_QUEUE_DEPTH=4 blocks of lookahead (one
+    # codec frame each at the checkpoint's 12.5 Hz frame rate, so ~0.32 s):
+    # a full stall of the sidecar's buffer is covered without an underrun.
+    assert tts_mod.BREEZE_PLAYER_LATENCY_MS >= 320
+
+
+def test_the_latency_travels_on_the_stream_so_fish_is_unchanged():
+    """Same reason timeout and min_heard travel on it: the consumer loop,
+    _play_stream and _play_stream_from_file are shared by every streaming
+    engine. Fish is a hosted API over the network and its arrival is jittery
+    -- it keeps the player it has always had, to the byte."""
+    assert tts_mod._AudioStream("x").latency_ms is None
+    assert tts_mod._AudioStream("x", latency_ms=400).latency_ms == 400
+
+
+def test_the_file_chain_player_is_unchanged(breeze, tmp_path, monkeypatch):
+    """F5 renders a whole chunk to a file and plays it through _play; a cache
+    hit takes the same road. Neither may grow a latency flag: they have no
+    prebuffer problem (0.07-0.11 s measured) and paplay must stay a
+    three-player chain."""
+    wav = tmp_path / "x.wav"
+    wav.write_bytes(wav_bytes(0.1))
+    monkeypatch.setattr(tts_mod.CONFIG, "playback_device", "")
+    breeze._stop_flag = False
+    breeze._play(str(wav))
+    assert FakeProc.spawned[0].cmd == [
+        "paplay", f"--client-name={tts_mod.SPEECH_CLIENT_NAME}", str(wav)]
 
 
 def test_a_refusal_before_any_audio_renders_that_chunk_on_f5(breeze, sock_path):
@@ -1053,14 +1349,8 @@ def _two_chunk_handler(first_block, second_block, *, refuse_nth=None,
     return handler, seen
 
 
-TWO = ("The reactor is holding steady this evening. "
-       "The workshop is quiet and the coffee is fresh.")
-TWO_CHUNKS = ["The reactor is holding steady this evening.",
-              "The workshop is quiet and the coffee is fresh."]
-
-
-def test_a_refusal_on_the_second_chunk_does_not_re_speak_the_first(breeze,
-                                                                   sock_path):
+def test_a_refusal_on_the_second_chunk_does_not_re_speak_the_first(
+        breeze, sock_path, long_reading):
     """Breeze says sentence 1, then refuses sentence 2 before any audio.
 
     Only sentence 2 may reach F5. The bug this forecloses is a fallback that
@@ -1088,7 +1378,7 @@ def test_a_refusal_on_the_second_chunk_does_not_re_speak_the_first(breeze,
 
 
 def test_a_cut_first_chunk_is_not_re_spoken_and_the_reply_still_finishes(
-        breeze, sock_path):
+        breeze, sock_path, long_reading):
     """Sentence 1 is cut mid-stream after part of it was HEARD; sentence 2 is
     fine.
 
@@ -1118,8 +1408,8 @@ def test_a_cut_first_chunk_is_not_re_spoken_and_the_reply_still_finishes(
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[1])) is not None
 
 
-def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(breeze, sock_path,
-                                                            monkeypatch):
+def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(
+        breeze, sock_path, monkeypatch, long_reading):
     """The same "never say it twice" guard, reached by the OTHER door.
 
     _stream_breeze has two ways out after audio has been heard: the stream
@@ -1182,7 +1472,7 @@ def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(breeze, sock_path,
 
 
 def test_the_sidecar_dying_between_two_sentences_finishes_the_reply_on_f5(
-        breeze, sock_path):
+        breeze, sock_path, long_reading):
     """The whole sidecar goes away after sentence 1 -- the socket file with
     it. Sentence 2 has to be spoken by F5, not dropped, and sentence 1 must
     not be repeated."""
@@ -2326,7 +2616,7 @@ def test_a_stream_cut_just_past_the_header_is_re_rendered_on_f5(breeze,
 
 
 def test_a_slow_completion_receipt_does_not_stall_the_reply(
-        breeze, sock_path, monkeypatch):
+        breeze, sock_path, monkeypatch, long_reading):
     """The receipt is a SECOND connection, and it used to be the tail of the
     producer's generator: the producer waited for it before rendering the next
     sentence, and the consumer waited for it again (stream.done) before taking
@@ -2363,9 +2653,7 @@ def test_a_slow_completion_receipt_does_not_stall_the_reply(
     srv = FakeSidecar(sock_path, handler, threaded=True)
     started = time.monotonic()
     try:
-        breeze.speak("The reactor is holding steady this evening. "
-                     "The workshop is quiet and the coffee is fresh.",
-                     block=True)
+        breeze.speak(TWO, block=True)
     finally:
         blocked.set()
         srv.close()
