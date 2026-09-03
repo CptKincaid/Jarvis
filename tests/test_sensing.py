@@ -909,3 +909,293 @@ def test_the_quiet_policy_and_the_desk_probe_are_left_alone():
     root = pathlib.Path(sensing.__file__).parent
     for name in ("quiet.py", "deskpresence.py"):
         assert "sensing" not in (root / name).read_text(), name
+
+
+# ------------------------- the same promise, on the MULTI-ROOM leg
+#
+# 2026-09-03 regression. `presence.rooms` swaps the sentinel's leg from one
+# `RoomSensor` to `roomfabric.HouseView`, and the view shipped without a
+# `blocked` property. `_blacked_out()` read it inside a broad `except` at
+# debug level, so the AttributeError was swallowed, the check answered
+# "nothing is blocked", and every test above stopped applying to the only
+# configuration that has more than one radar in it. Measured on the branch
+# before the fix: a rooms-only box held "home" through a full blackout
+# where the single-sensor box reached "unknown".
+def _rooms_only_sentinel(policy, body='{"value": true}'):
+    """A box whose ONLY presence leg is a two-room fabric -- his, once the
+    kitchen is flashed. No phone_ip, no phone_mac."""
+    from jarvis.presence import PresenceSentinel
+    cfg = FakeCfg({"presence.room_sensor_enabled": True,
+                   "presence.rooms": [
+                       {"name": "office", "url": "http://10.0.0.9",
+                        "primary": True},
+                       {"name": "kitchen", "url": "http://10.0.0.8"}],
+                   "presence.phone_ip": "", "presence.phone_mac": ""})
+    published, clock = [], {"t": 1_000_000.0}
+    s = PresenceSentinel(cfg, publish=published.append,
+                         now=lambda: clock["t"], poll_s=1.0, policy=policy)
+    for room in s.fabric.rooms:
+        room.sensor._get = _Transport(body)
+    return s, published, clock
+
+
+def test_the_house_view_can_say_it_is_blocked_at_all(tmp_path):
+    """The attribute itself, pinned so it cannot go missing again. Presence
+    reads `sensor.blocked` and nothing else asks the question, so a leg
+    without it silently disables offline mode's reach into presence."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, _pub, _clock = _rooms_only_sentinel(p)
+    view = s.sensor
+    assert hasattr(type(view), "blocked"), "HouseView must wear `blocked`"
+    assert view.blocked == ""
+    p.disable()
+    assert view.blocked == "offline"
+
+
+def test_a_rooms_only_box_goes_unknown_when_sensing_is_off(tmp_path):
+    """The end-to-end promise, on the leg that broke it. Two radars report
+    the room occupied, then sensing goes off: the house must go to
+    "unknown", not hold "home" and speak proactive lines into a room
+    nobody can see."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, published, clock = _rooms_only_sentinel(p, '{"value": true}')
+    clock["t"] += 600.0
+    s.tick()
+    assert s.state == "home"
+    p.disable()
+    clock["t"] += 600.0
+    assert s.tick() is None
+    assert s.state == "unknown", "a house nobody can see is not a home"
+    assert s.is_home() is True
+    assert len(published) == 1, "no transition was invented on the way out"
+    assert [r.sensor.reads for r in s.fabric.rooms] == [1, 1], \
+        "the radars were polled while offline"
+
+
+def test_a_rooms_only_box_stops_asserting_AWAY_while_blacked_out(tmp_path):
+    """The direction that MUTES him, which is why finding 1 mattered: a
+    frozen "away" makes jarvis/quiet.py answer "you're out" and swallow
+    every proactive line while he is sitting in the kitchen."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, published, clock = _rooms_only_sentinel(p, '{"value": false}')
+    for _ in range(4):
+        clock["t"] += 600.0
+        s.tick()
+    assert s.state == "away" and s.is_home() is False
+    assert len(published) == 1
+    p.disable()
+    clock["t"] += 600.0
+    assert s.tick() is None
+    assert s.state == "unknown" and s.is_home() is True
+    assert len(published) == 1
+
+
+def test_a_breaker_outage_on_the_rooms_leg_still_HOLDS(tmp_path):
+    """Same distinction as the single-sensor case: a dead ESP32 is a
+    transient, not a privacy blackout, and dropping to unknown on every
+    hiccup would flap the ambient row."""
+    p = _policy(tmp_path)
+    p.enable()
+    s, _published, clock = _rooms_only_sentinel(p, '{"value": true}')
+    clock["t"] += 600.0
+    s.tick()
+    assert s.state == "home"
+
+    def dead(url, timeout):
+        raise OSError("no route to host")
+
+    for room in s.fabric.rooms:
+        room.sensor._get = dead
+    for _ in range(6):
+        clock["t"] += 600.0
+        s.tick()
+    assert s.state == "home", "a transient outage is not a privacy blackout"
+
+
+def test_a_leg_that_cannot_answer_blocked_is_reported_LOUDLY(caplog):
+    """The swallow itself. `_blacked_out` used to read `.blocked` inside a
+    bare `except Exception` logged at DEBUG, so a leg without the attribute
+    turned offline mode off without a word. It still answers False -- a
+    broken leg must not blank presence -- but at ERROR, naming the type."""
+    import logging
+    from jarvis.presence import PresenceSentinel
+
+    class LegWithNoBlocked:
+        configured = True
+
+        def read(self):
+            return None
+
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = LegWithNoBlocked()
+    with caplog.at_level(logging.ERROR):
+        assert s._blacked_out() is False
+    assert any("LegWithNoBlocked" in r.getMessage() and r.levelno >= logging.ERROR
+               for r in caplog.records), "the missing attribute was swallowed"
+
+
+def test_a_leg_whose_blocked_EXPLODES_does_not_cost_the_whole_TICK():
+    """The other half of the same repair, and the one it narrowed.
+
+    Making a MISSING `blocked` loud moved the read out of the `try`, so a
+    leg whose `blocked` RAISES anything else -- an unreadable policy file,
+    a property with a bug -- escaped `_blacked_out()`, escaped `tick()`
+    (which has no guard of its own; only `_loop` does) and lost the entire
+    poll, the blackout `_forget()` included. The old bare `except
+    Exception` caught it. Loud about the case we can name, still caught
+    for the ones we cannot.
+    """
+    from jarvis.presence import PresenceSentinel
+
+    class ExplodingBlocked:
+        configured = True
+
+        @property
+        def blocked(self):
+            raise RuntimeError("the policy file is unreadable")
+
+        def read(self):
+            return None
+
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = ExplodingBlocked()
+    assert s._blacked_out() is False
+    assert s.tick() is None          # and NOT a RuntimeError out of the tick
+
+
+def test_the_missing_blocked_ERROR_is_said_once_not_once_a_POLL(caplog):
+    """A leg with no `blocked` is wrong for as long as it is wired, and the
+    sentinel polls every `poll_s` (60 s by default). One ERROR names the
+    bug; one an hour, for ever, is how a real error gets filtered out."""
+    import logging
+    from jarvis.presence import PresenceSentinel
+
+    class LegWithNoBlocked:
+        configured = True
+
+        def read(self):
+            return None
+
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = LegWithNoBlocked()
+    with caplog.at_level(logging.ERROR):
+        for _ in range(5):
+            assert s._blacked_out() is False
+    said = [r for r in caplog.records
+            if "LegWithNoBlocked" in r.getMessage() and r.levelno >= logging.ERROR]
+    assert len(said) == 1, "one ERROR a poll, for as long as the leg is wrong"
+
+
+# =====================================================================
+# The privacy path is loud HOWEVER the leg fails to answer
+# =====================================================================
+# Third pass on the same three lines. It went silent once with the read
+# inside a bare `except ... debug`; then a MISSING `blocked` was made loud
+# and the OTHER branch of that same `if` -- a `blocked` that RAISES -- was
+# left exactly as it was, caught at debug and swallowed. There is no branch
+# left to forget now: one `try` asks the question and every way of failing
+# to answer it is the same reported event.
+class _NoBlocked:
+    configured = True
+
+    def read(self):
+        return None
+
+
+class _BlockedRaises:
+    configured = True
+
+    @property
+    def blocked(self):
+        raise RuntimeError("the policy file is unreadable")
+
+    def read(self):
+        return None
+
+
+class _UnBoolable:
+    """A value that is there and still cannot be read as a yes or a no."""
+
+    class _Odd:
+        def __bool__(self):
+            raise ValueError("this cannot be read as a yes or a no")
+
+    configured = True
+    blocked = _Odd()
+
+    def read(self):
+        return None
+
+
+def _dark_sentinel(leg):
+    from jarvis.presence import PresenceSentinel
+    cfg = FakeCfg({"presence.phone_ip": "", "presence.phone_mac": ""})
+    s = PresenceSentinel(cfg, publish=lambda ev: None)
+    s.sensor = leg
+    return s
+
+
+@pytest.mark.parametrize("leg", [_NoBlocked, _BlockedRaises, _UnBoolable])
+def test_EVERY_way_of_failing_to_answer_blocked_is_reported_loudly(leg, caplog):
+    """Absent, raising, or refusing bool(): one ERROR, naming the leg, and
+    False rather than an invented blackout. A privacy path that fails
+    silently is the worst failure in this file."""
+    import logging
+    s = _dark_sentinel(leg())
+    with caplog.at_level(logging.ERROR):
+        assert s._blacked_out() is False
+    loud = [r for r in caplog.records
+            if leg.__name__ in r.getMessage() and r.levelno >= logging.ERROR]
+    assert len(loud) == 1, f"{leg.__name__} failed quietly"
+
+
+@pytest.mark.parametrize("leg", [_NoBlocked, _BlockedRaises, _UnBoolable])
+def test_no_way_of_failing_to_answer_blocked_costs_the_TICK(leg):
+    """`tick()` has no guard of its own (only `_loop` does), so anything
+    escaping here loses the whole poll -- the blackout's own `_forget()`
+    included."""
+    s = _dark_sentinel(leg())
+    assert s.tick() is None
+
+
+@pytest.mark.parametrize("leg", [_NoBlocked, _BlockedRaises, _UnBoolable])
+def test_the_unreadable_blocked_ERROR_is_said_once_not_once_a_poll(leg, caplog):
+    """`poll_s` is 60 s and the leg stays wrong for as long as it is wired:
+    one line an hour for ever is how a real error gets filtered out."""
+    import logging
+    s = _dark_sentinel(leg())
+    with caplog.at_level(logging.ERROR):
+        for _ in range(5):
+            assert s._blacked_out() is False
+    loud = [r for r in caplog.records
+            if leg.__name__ in r.getMessage() and r.levelno >= logging.ERROR]
+    assert len(loud) == 1
+
+
+def test_a_leg_that_starts_failing_a_NEW_way_says_so_again(caplog):
+    """Once per leg AND reason. A leg that was merely missing the attribute
+    and then starts raising is a different fact about the privacy path, and
+    the log has to carry it."""
+    import logging
+    leg = _NoBlocked()
+    s = _dark_sentinel(leg)
+    with caplog.at_level(logging.ERROR):
+        s._blacked_out()
+        s._blacked_out()
+        type(leg).blocked = property(
+            lambda self: (_ for _ in ()).throw(OSError("the socket died")))
+        try:
+            s._blacked_out()
+            s._blacked_out()
+        finally:
+            del type(leg).blocked
+    loud = [r for r in caplog.records if r.levelno >= logging.ERROR]
+    assert len(loud) == 2, [r.getMessage() for r in loud]
+    assert "AttributeError" in loud[0].getMessage()
+    assert "OSError" in loud[1].getMessage()

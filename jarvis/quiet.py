@@ -493,6 +493,61 @@ class QuietPolicy:
         with self._lock:
             return list(self._held)
 
+    def take_fragments(self, prefix: Optional[str] = None):
+        """The backlog drained for ONE ATTEMPT at speaking it, with a way back.
+
+        Returns ``(fragments, put_back)``. ``release_fragments`` is the
+        one-way form of this and it is right for a caller that speaks what
+        it took there and then. It is WRONG for a caller that can still
+        decide not to speak, and on 2026-09-03 that cost the backlog: the
+        arrival catch-up drained the held lines on the pump thread, went
+        off to read a mailbox, and then dropped the digest as stale --
+        taking the drained lines with it. They are the things he missed
+        while he was out and there is no second copy of them anywhere, so
+        a caller that might not speak has to be able to give them back.
+
+        ``put_back()`` returns the very items taken, in order, to the FRONT
+        of the backlog and re-arms the falling edge, so the policy's own
+        next tick reads them out (see ``tick``): held lines nothing will
+        ever say are lost by another name. It is idempotent -- twice puts
+        them back once -- and returns how many went back. The deque's
+        ``maxlen`` still applies to the merged backlog, dropping the oldest
+        exactly as it would have had these never been taken.
+        """
+        with self._lock:
+            items = list(self._held)
+            self._held.clear()
+            reason = self._last_reason
+        done = [False]
+
+        def put_back() -> int:
+            if done[0] or not items:
+                done[0] = True
+                return 0
+            done[0] = True
+            with self._lock:
+                merged = items + list(self._held)
+                self._held.clear()
+                # extend, not extendleft: with a maxlen the deque drops from
+                # the end it is not being fed, so feeding it in order drops
+                # the OLDEST on overflow -- the same line hold() would have
+                # dropped had these never been taken.
+                self._held.extend(merged)
+                # THE FALLING EDGE, RE-ARMED. tick() releases the digest on
+                # the edge where quiet stops being true and never again; the
+                # edge that would have said these has already gone by. Put
+                # the lines back without this and they sit held until the
+                # next quiet window opens and closes -- kept, and mute.
+                self._last_quiet = True
+            log.info("quiet: %d held line(s) put back unspoken", len(items))
+            return len(items)
+
+        if not items:
+            return [], put_back
+        if prefix is None:
+            prefix = AWAY_PREFIX if reason == "you're out" else BUSY_PREFIX
+        return digest_fragments(items, prefix), put_back
+
     def release_fragments(self, prefix: Optional[str] = None) -> list:
         """Drain the held lines into the FRAGMENTS of one spoken digest
         ([] when empty) -- the prefix line and then each held line, still
@@ -502,16 +557,13 @@ class QuietPolicy:
         burst that is joined and then thinned again as a finished string is
         exactly what jarvis/address.py refuses to do, so a caller that has
         more to say in the same burst (the arrival cue, "I am free") takes
-        the fragments and joins once."""
-        with self._lock:
-            items = list(self._held)
-            self._held.clear()
-            reason = self._last_reason
-        if not items:
-            return []
-        if prefix is None:
-            prefix = AWAY_PREFIX if reason == "you're out" else BUSY_PREFIX
-        return digest_fragments(items, prefix)
+        the fragments and joins once.
+
+        ONE-WAY. The lines are gone the moment this returns, so the caller
+        must be about to say them; one that may still change its mind takes
+        ``take_fragments`` and gives them back.
+        """
+        return self.take_fragments(prefix)[0]
 
     def release(self, prefix: Optional[str] = None) -> str:
         """Drain the held lines into one spoken digest ("" when empty)."""
@@ -520,7 +572,18 @@ class QuietPolicy:
     # ----------------------------------------------------------- thread
     def tick(self) -> str:
         """Notice a quiet window closing; speak the digest through ``say``.
-        Returns what was said ("" when nothing)."""
+        Returns what was said ("" when nothing).
+
+        THE LINES ARE ONLY SPENT ONCE THEY HAVE BEEN SAID. This used to
+        ``release()`` -- one-way -- and then swallow a TTS failure, so a
+        digest that could not be spoken took the whole backlog with it.
+        It is the same class of bug the arrival catch-up shipped on
+        2026-09-03 (drained on one thread, dropped on another) sitting one
+        level up in this file, and one fix does not close a class while
+        the other instance stands. A failed speak puts the lines back and
+        re-arms the edge, exactly as the ``can_speak`` deferral below
+        already does: kept, and retried next tick.
+        """
         with self._lock:
             quiet = self.is_quiet()
             was = self._last_quiet
@@ -541,12 +604,20 @@ class QuietPolicy:
                     # to prevent. Keep the backlog; retry next tick.
                     self._last_quiet = True
                     return ""
-            text = self.release()
-        if text and callable(self._say):
+            frags, put_back = self.take_fragments()
+            text = address.join_fragments(frags)
+        if not text:
+            # Nothing speakable came out of them. They are not spent.
+            put_back()
+            return ""
+        if callable(self._say):
             try:
                 self._say(text)
             except Exception:  # noqa: BLE001 - a TTS failure must not kill the loop
-                log.exception("quiet: digest speak failed")
+                # ...and must not cost him the lines either.
+                log.exception("quiet: digest speak failed; the lines go back")
+                put_back()
+                return ""
         return text
 
     def start(self) -> None:

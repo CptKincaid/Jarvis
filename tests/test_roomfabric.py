@@ -475,3 +475,33 @@ def test_a_room_change_publishes_one_event_not_a_metronome():
     assert len(seen) == 1
     assert isinstance(seen[0], RoomChanged)
     assert (seen[0].room, seen[0].previous) == ("office", "")
+
+
+def test_the_house_view_reports_blocked_only_when_every_room_is(monkeypatch):
+    """The attribute presence.py reads to decide whether offline mode has
+    taken the last leg away (`PresenceSentinel._blacked_out`). It shipped
+    missing on 2026-09-03 and the AttributeError was swallowed at debug, so
+    a rooms-only box held its last verdict through a whole blackout.
+
+    All-or-nothing on purpose: one radar still permitted to look is still a
+    leg, and calling the house blind would throw the only evidence away.
+    """
+    fab, _ = fabric()
+    view = HouseView(fab)
+    for room in fab.rooms:
+        room.sensor.blocked = ""
+    assert view.blocked == ""
+    fab.rooms[0].sensor.blocked = "offline"
+    assert view.blocked == "", "one blocked room is not a blind house"
+    for room in fab.rooms:
+        room.sensor.blocked = "offline"
+    assert view.blocked == "offline"
+
+
+def test_a_house_view_over_sensors_with_no_blocked_at_all_is_not_blocked():
+    """The FakeSensor above carries no `blocked`, and neither does the
+    satellite lane's reader. Absence of the attribute is "not blocked", not
+    a crash -- the loud path for a leg that cannot answer lives one level
+    up, in presence._blacked_out."""
+    fab, _ = fabric()
+    assert HouseView(fab).blocked == ""
