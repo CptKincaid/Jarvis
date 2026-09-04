@@ -54,7 +54,9 @@ assumed:
 * `button: platform: template` + the web REST API's
   `POST /button/<object_id>/press` — the renew and revoke endpoints.
 * `binary_sensor: platform: template` reading the rail back —
-  `GET /binary_sensor/radar_powered` is what Jarvis confirms against.
+  `GET /binary_sensor/Radar%20powered` is what Jarvis confirms against
+  (the entity's NAME, percent-encoded — the only path ESPHome's web_server
+  serves; the lower-cased object_id is a 404, measured 2026-09-03).
 * The rail switch itself is `internal: true`. **There is no endpoint on the
   device that turns a sensor on and leaves it on.** The only way to make a
   satellite sense is to keep asking, every 25 s, forever — which is true for
@@ -63,7 +65,7 @@ assumed:
 One lease **per sensor kind**, not per room. The 21:00 curfew closes the
 lens and leaves the radar up (`docs/offline-mode.md`); a room-wide lease
 could not express that, because stopping renewal would take the radar with
-the camera. `jarvis/rooms.py` substitutes `{kind}` into every path.
+the camera. `jarvis/rooms.py` substitutes `{Kind}` into every entity name.
 
 **Revoke is the mechanism; the lease is the backstop.** At the curfew edge
 and on "offline mode" Jarvis sends an explicit revoke and retries it three
@@ -206,7 +208,7 @@ per-room layer cannot open a sensor the house policy has closed.
   **longer** one, and that is expressible without three independent windows.
 
 So: one window in `sensing.curfew.*`, plus an optional per-room
-**extension** in `rooms.satellites[].curfew_extra`, enforced as a union and
+**extension** in `presence.rooms[].curfew_extra`, enforced as a union and
 never an intersection — a room's window may start earlier and end later than
 the house window, never later or earlier. No voice grammar for it in v1 (a
 picker in Settings → Privacy is enough, and the sentence "camera curfew in
@@ -292,7 +294,7 @@ So HTTP is the control plane, and it must be locked down instead:
   `/events` are covered, not just the browsable page. Jarvis sends
   pre-emptive Basic (digest costs a 401 round trip per request through
   urllib, doubling the poll, against an attacker the LAN threat model does
-  not include). Credentials go in `rooms.satellites[].password`, added to
+  not include). Credentials go in `presence.rooms[].password`, added to
   `SECRET_LIST_FIELDS` so they are masked in logs and `repr(cfg)` — the same
   standard as `phone.token`.
 * **`web_server: ota: false`** — the built-in firmware-upload form has no
@@ -433,18 +435,19 @@ into the app** — deliberately, so this lane cannot conflict with the offline
 lane's edits to `app.py`, `presence.py` and `commander.py`. The integration
 is small:
 
-1. `jarvis/assistant_config.py` — a `"rooms"` section in `DEFAULTS`:
+1. `jarvis/assistant_config.py` — DONE 2026-09-04 (F02). There is ONE room
+   list, `presence.rooms`, and an entry becomes a leased satellite by
+   listing `sensors`; the `"rooms"` section holds only the lane's timers:
 
    ```json
-   "rooms": {"enabled": false, "renew_s": 25, "stale_after_s": 90,
-             "timeout_s": 1.5,
-             "satellites": [
-               {"name": "kitchen", "url": "http://192.168.60.61",
-                "sensors": ["radar"], "username": "jarvis", "password": "",
-                "lease_ttl_s": 90}]}
+   "presence": {"rooms": [
+       {"name": "kitchen", "url": "http://192.168.60.61",
+        "sensors": ["radar"], "username": "jarvis", "password": "",
+        "lease_ttl_s": 90}]},
+   "rooms": {"renew_s": 25, "stale_after_s": 90, "timeout_s": 3.0}
    ```
 
-   and `("rooms.satellites", "password")` added to `SECRET_LIST_FIELDS`.
+   `("presence.rooms", "password")` is in `SECRET_LIST_FIELDS`.
 
 2. `jarvis/app.py`, immediately after `self.sensing`:
 

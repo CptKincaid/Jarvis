@@ -13,12 +13,13 @@
 # So this firmware does not wait to be told to stop. It runs on a LEASE:
 #
 #   * the radar's supply is held by a GPIO that boots OFF and stays OFF;
-#   * POST /button/radar_lease_renew/press powers it on and (re)starts a
-#     ${lease_ttl} countdown;
+#   * POST /button/Radar%20lease%20renew/press powers it on and (re)starts
+#     a ${lease_ttl} countdown (the entity's NAME, percent-encoded: that is
+#     the only path ESPHome's web_server serves; the object_id is a 404);
 #   * when the countdown finishes -- because Jarvis crashed, the Wi-Fi died,
 #     the router rebooted, or he said "offline mode" and Jarvis simply stopped
 #     renewing -- the firmware powers the radar down. Nobody has to reach it.
-#   * POST /button/radar_lease_revoke/press is the immediate version, which
+#   * POST /button/Radar%20lease%20revoke/press is the immediate version, which
 #     is what the 21:00 curfew edge and "offline mode" actually send. The
 #     lease is the BACKSTOP for when that request cannot be delivered.
 #
@@ -59,9 +60,11 @@ substitutions:
   ota_password: "pick-something-long"         # <-- CHANGE ME
   # The HTTP credentials Jarvis sends. Generate the password with
   #   python -c "import secrets;print(secrets.token_urlsafe(24))"
-  # and put the SAME pair in ~/.config/jarvis/assistant.json under
-  # rooms.satellites[].username / .password (it is in SECRET_LIST_FIELDS,
-  # so it is masked in logs and in repr(cfg)).
+  # and put the SAME pair in ~/.config/jarvis/assistant.json in this room's
+  # presence.rooms[] entry as .username / .password, next to the
+  # "sensors": ["radar"] that marks the entry as a leased satellite (the
+  # password is in SECRET_LIST_FIELDS, so it is masked in logs and in
+  # repr(cfg)).
   web_user: "jarvis"                          # <-- CHANGE ME
   web_password: "CHANGE_ME_32_RANDOM_CHARS"   # <-- CHANGE ME
   static_ip: 192.168.60.61                    # <-- CHANGE ME
@@ -210,8 +213,9 @@ script:
 
 button:
   - platform: template
-    # THE NAME MAKES THE URL, and jarvis/rooms.py substitutes the SENSOR
-    # KIND into it: "Radar lease renew" -> /button/radar_lease_renew/press.
+    # THE NAME MAKES THE URL -- percent-encoded, as the web_server serves
+    # it: "Radar lease renew" -> /button/Radar%20lease%20renew/press.
+    # jarvis/rooms.py substitutes the SENSOR KIND into the name.
     # A satellite that also carries a lens adds "Camera lease renew" beside
     # this one, with its own script and its own rail -- because the 21:00
     # curfew closes the lens and deliberately leaves the radar up, and one
@@ -223,7 +227,7 @@ button:
       - script.execute: lease_watchdog
 
   - platform: template
-    name: "Radar lease revoke"           # -> /button/radar_lease_revoke/press
+    name: "Radar lease revoke"      # -> /button/Radar%20lease%20revoke/press
     id: lease_revoke
     on_press:
       - script.stop: lease_watchdog
@@ -239,7 +243,7 @@ button:
 
 binary_sensor:
   # WHAT JARVIS CONFIRMS AGAINST. The device's own report of the rail it is
-  # driving -- GET /binary_sensor/radar_powered. jarvis/rooms.py returns "no
+  # driving -- GET /binary_sensor/Radar%20powered. jarvis/rooms.py returns "no
   # opinion" for presence unless this reads ON in the same pass, and treats a
   # stale or missing answer as UNKNOWN rather than as OFF.
   - platform: template
@@ -264,7 +268,7 @@ binary_sensor:
 
 sensor:
   - platform: template
-    name: "Lease seconds"                # -> GET /sensor/lease_seconds
+    name: "Lease seconds"                # -> GET /sensor/Lease%20seconds
     id: lease_seconds
     update_interval: 5s
     unit_of_measurement: s

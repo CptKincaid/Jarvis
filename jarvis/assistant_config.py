@@ -461,6 +461,34 @@ DEFAULTS: dict = {
                  #    "enabled": true}
                  # An entry with no url or no name is skipped rather than
                  # fatal: one unfinished room must not take the others down.
+                 #
+                 # THE ONE LIST. jarvis/rooms.py (the satellite lease) and
+                 # jarvis/roomaudio.py (which speaker a line comes out of)
+                 # read THIS list too, and every lane spells the name with
+                 # roomfabric.room_name, so "Kitchen", " kitchen " and
+                 # "Kitchen!" are one room. Two lists was the shape that bit
+                 # (F02, 2026-09-03): the other two lanes read a
+                 # rooms.satellites key declared nowhere, so a config with
+                 # this list got a fabric and no leases. The extra per-entry
+                 # keys, and the lane that reads each:
+                 #    "sensors": ["radar"],          # rooms: THE OPT-IN. Only
+                 #                                   #   a box flashed with
+                 #                                   #   jarvis-satellite.yaml
+                 #                                   #   is leased; a plain
+                 #                                   #   radar has no buttons
+                 #                                   #   to press and is never
+                 #                                   #   pressed
+                 #    "username": "jarvis",          # rooms: web_server auth
+                 #    "password": "",                # ditto -- masked; see
+                 #                                   #   SECRET_LIST_FIELDS
+                 #    "lease_ttl_s": 90.0,           # rooms: keep in step with
+                 #                                   #   the YAML's lease_ttl
+                 #    "say_url": "",                 # roomaudio: that room's
+                 #                                   #   speaker; "" = none
+                 #    "private": false               # roomaudio: never a
+                 #                                   #   broadcast target
+                 # The primary entry is the Spark's own room, and the one
+                 # the voice falls through to.
                  "rooms": [],
                  # The fabric's four timers, argued in jarvis/roomfabric.py.
                  # enter: how long a new room must hold occupied before it
@@ -495,6 +523,14 @@ DEFAULTS: dict = {
                  # anything major, then a question. It never reads the mail
                  # -- that needs a yes (Commander._try_briefing_offer).
                  "arrival_offer": True},
+    # The satellite LEASE lane's timers (jarvis/rooms.py). No room list
+    # here, on purpose: the list is presence.rooms above, and an entry
+    # there that lists "sensors" is what makes a room a leased satellite.
+    # renew_s must stay in step with renew_every in scripts/esphome/
+    # jarvis-satellite.yaml; timeout_s is jarvis/roomsensor.py's MEASURED
+    # 3.0 s (max round trip seen 1186 ms), not the 1.5 s that used to be
+    # the module's default.
+    "rooms": {"renew_s": 25.0, "stale_after_s": 90.0, "timeout_s": 3.0},
     # Offline mode and the camera curfew (jarvis/sensing.py). ONE object
     # answers "may this sensor run", combining the manual switch (spoken:
     # "offline mode", "deactivate presence", "stop watching"), this daily
@@ -1090,7 +1126,10 @@ SECRET_LIST_FIELDS = (("gmail.accounts", "app_password"),
                       # a log line. MEASURED 2026-09-03 with a gmail
                       # app_password and a satellite password in one config:
                       # the gmail one was masked, the satellite one was not.
-                      ("rooms.satellites", "password"))
+                      # It lives in presence.rooms[] since 2026-09-04, when
+                      # that became the ONE room list (F02); the entry here
+                      # moved with it.
+                      ("presence.rooms", "password"))
 
 # is_configured() / setup_line() sections and the film-JARVIS excuse for each.
 SETUP_LINES: dict[str, str] = {

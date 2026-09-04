@@ -137,9 +137,63 @@ class RoomSpec:
         return self.label or self.name
 
 
-def _slug(value: Any) -> str:
+def room_name(value: Any) -> str:
+    """THE spelling of a room name, for every lane that reads
+    ``presence.rooms``: this fabric, the satellite lease
+    (``jarvis/rooms.py``) and the speaker router (``jarvis/roomaudio.py``).
+
+    Case-folded, whitespace collapsed, punctuation dropped: a room name is
+    an identifier he types into a JSON file by hand, and "Kitchen " must
+    not be a second room. Until 2026-09-04 the fabric slugged and the other
+    two lanes only stripped, so the same word typed once became "kitchen"
+    for presence and "Kitchen" for the voice, and an announcement routed
+    on the fabric's occupancy landed in the office with the reason "no
+    room has an opinion" (F02). One function, imported by the other two,
+    is the only version of that guarantee that cannot drift.
+    ``jarvis/arrival.py`` keeps a COPY on purpose (it may import nothing
+    that owns a thread) and its test pins the copy to this one.
+    """
     text = " ".join(str(value or "").split()).lower()
     return "".join(ch if (ch.isalnum() or ch in " -_") else "" for ch in text).strip()
+
+
+_slug = room_name      # the fabric's first name for it; app.py still says it
+
+
+def room_entries(cfg) -> list:
+    """``presence.rooms`` as THE list, read once and the same way for
+    every lane.
+
+    Each entry comes back as a COPY with its ``name`` normalised by
+    ``room_name``. Entries that are not dicts, are switched off, have no
+    name, or repeat a name are dropped HERE (the duplicate with a warning),
+    so no lane can keep a room another lane dropped. Deliberately NOT
+    applied here: ``presence.room_sensor_enabled`` (the fabric's master
+    switch -- the speaker router does not need a radar to have a speaker)
+    and the url requirement (a speaker-only room has a ``say_url`` and no
+    radar). Never raises.
+    """
+    raw = _cfg_get(cfg, "presence.rooms", None)
+    out: list = []
+    seen: set = set()
+    for entry in raw if isinstance(raw, (list, tuple)) else ():
+        if not isinstance(entry, dict):
+            continue
+        if not bool(entry.get("enabled", True)):
+            continue
+        name = room_name(entry.get("name") or "")
+        if not name:
+            if entry.get("url") or entry.get("say_url"):
+                log.warning("roomfabric: a room entry has a url and no name; "
+                            "skipped")
+            continue
+        if name in seen:
+            log.warning("roomfabric: two rooms are both called %r; the "
+                        "second is skipped", name)
+            continue
+        seen.add(name)
+        out.append(dict(entry, name=name))
+    return out
 
 
 def room_specs(cfg) -> list:
@@ -171,23 +225,11 @@ def room_specs(cfg) -> list:
                          power_url=str(_cfg_get(
                              cfg, "presence.room_sensor_power_url", "") or "").strip())]
     out: list = []
-    seen: set = set()
-    for entry in raw:
-        if not isinstance(entry, dict):
-            continue
-        if not bool(entry.get("enabled", True)):
-            continue
+    for entry in room_entries(cfg):
         url = str(entry.get("url") or "").strip()
-        name = _slug(entry.get("name") or "")
-        if not url or not name or name in seen:
-            if url and not name:
-                log.warning("roomfabric: a room entry has a url and no name; "
-                            "skipped")
-            elif name in seen:
-                log.warning("roomfabric: two rooms are both called %r; the "
-                            "second is skipped", name)
-            continue
-        seen.add(name)
+        if not url:
+            continue      # unfinished, or a speaker-only room (roomaudio's)
+        name = entry["name"]
         out.append(RoomSpec(
             name=name,
             url=url,
