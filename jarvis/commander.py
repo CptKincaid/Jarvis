@@ -2916,6 +2916,23 @@ _BRIEFING_NO_RX = re.compile(
 # for one wake-word retry on top.
 BRIEFING_OFFER_TTL_S = 60.0
 
+
+def _event_offer_expired(pending: dict) -> bool:
+    """Is a calendar read-back ("...Shall I add it, sir?") past its life?
+
+    calendar.add_event stamps ``made_at`` (monotonic) when it parks the
+    interpretation; the read-back takes the next yes for OFFER_TTL_S, the
+    same life as the wake-alarm and teach offers. A dict with no stamp --
+    the shape every test built before the stamp existed, and any older
+    caller -- is treated as LIVE: it is a question Jarvis asked, and the
+    hole this closes was a live question being counted as none.
+    """
+    try:
+        made = float(pending.get("made_at") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return bool(made) and (time.monotonic() - made) > OFFER_TTL_S
+
 # ---- in-app face enrolment (jarvis/enrolrun.py) ----------------------
 # THE COMMIT WORD IS TYPED AND ONLY TYPED, so this pattern is deliberately
 # the bare word and nothing else -- no "yes", no "go ahead", no word bag.
@@ -9240,6 +9257,7 @@ class Commander:
         # Set when the Claude manager refuses an out-of-project task and
         # offers the terminal; the next "yes" opens it (spec 7 / OUTSIDE_LINE).
         self._pending_terminal_slug = ""
+        self._pending_terminal_made = 0.0     # monotonic; OFFER_TTL_S life
         # Quiz mode: the QuizSession whose open question the next utterance
         # answers (jarvis.tools.quiz); the flashcard store behind it is
         # built on first use. The document last explained, for "read it to
@@ -9504,6 +9522,32 @@ class Commander:
                         return True
                 except (TypeError, ValueError):
                     pass
+        # Three more rungs that take the next plain yes, and were missing
+        # here (F37, 09-03): the teach offer (3a''), Claude's terminal
+        # offer (3b) and the calendar read-back (3c). Missing meant the
+        # first-wake briefing offer was spoken straight after "Dentist,
+        # tomorrow at 3 pm. Shall I add it, sir?" -- two questions on the
+        # table, and his yes landed on the event. Each carries its expiry
+        # so a dead offer never holds the floor.
+        teach = getattr(self, "_pending_teach", None)
+        if isinstance(teach, tuple) and len(teach) == 3:
+            try:
+                if time.monotonic() - float(teach[2]) <= OFFER_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        if getattr(self, "_pending_terminal_slug", ""):
+            made = getattr(self, "_pending_terminal_made", 0.0) or 0.0
+            try:
+                if not made or time.monotonic() - float(made) <= OFFER_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        calendar = getattr(getattr(self, "services", None), "calendar", None)
+        pending_event = getattr(calendar, "pending_event", None)
+        if isinstance(pending_event, dict) and pending_event:
+            if not _event_offer_expired(pending_event):
+                return True
         # "Shall I hand that to Claude, sir, or is it a quick one for me?"
         # is a question Jarvis asked too. The router owns it (its own
         # ASK_TTL_S, and .pending() self-expires), and it was missing here:
@@ -11291,8 +11335,15 @@ class Commander:
         pending = getattr(source, "pending_event", None) if source else None
         if not pending:
             return None
-        answer = parse_yes_no(text)
         source.pending_event = None
+        # The read-back had no life of its own before F37: a "yes" an hour
+        # later, aimed at anything, would have written the event. Same
+        # OFFER_TTL_S every other offer rung keeps; question_open() reads
+        # the same stamp so a dead read-back never holds the floor either.
+        if _event_offer_expired(pending):
+            log.info("event read-back expired; %r is a new subject", text[:40])
+            return None
+        answer = parse_yes_no(text)
         if answer is None:
             return None
         if not answer:
@@ -11593,6 +11644,13 @@ class Commander:
         there instead") a plain yes means the terminal, not a new task."""
         slug = self._pending_terminal_slug
         if not slug:
+            return None
+        # Stamped when armed (F37): an offer older than OFFER_TTL_S is not
+        # a question any more, here or in question_open().
+        made = getattr(self, "_pending_terminal_made", 0.0) or 0.0
+        if made and time.monotonic() - float(made) > OFFER_TTL_S:
+            self._pending_terminal_slug = ""
+            log.info("terminal offer expired; %r is a new subject", text[:40])
             return None
         t = text.strip()
         if _YES_RX.match(t) or _OPEN_IT_RX.match(t):
@@ -12056,6 +12114,7 @@ class Commander:
                 if out.strip() in offers:
                     # "*" = whatever project is active when he answers
                     self._pending_terminal_slug = d.project or active or "*"
+                    self._pending_terminal_made = time.monotonic()
                 return CommandResult(handled=True, reply=out, speak=True,
                                      status="Claude: queued", done=False)
             if d.args.get("terminal"):
