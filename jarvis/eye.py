@@ -58,6 +58,7 @@ that triggers too often" -- and a second sensor must not quietly undo that.
 """
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
@@ -67,6 +68,29 @@ import numpy as np
 from jarvis.facegallery import SFACE_COSINE_SAME, cosine
 from jarvis.logs import get_logger
 from jarvis.visionrig import DETECT_COLS, IDX_SCORE
+
+
+def _bar(value, what: str) -> float:
+    """A threshold, or a ValueError. NEVER a NaN and never an infinity.
+
+    ``camera.identity_min`` is a user-editable key and ``json.loads`` accepts
+    the bare literal ``NaN``, so a hand-edited assistant.json can deliver a
+    number that clears every comparison written the natural way. The two
+    match bars in this file are the last two in the vision lane that were
+    spelled ``score < bar`` rather than ``not (score >= bar)`` -- so a NaN
+    made them fail OPEN and a stranger at cosine 0.04 came back as him
+    (F17, reproduced 2026-09-03). Both spellings are fixed below; this
+    refuses the value at the door as well, the way
+    ``faceenrol.SampleLimits.__post_init__`` refuses ``min_conf``, because a
+    bar nothing can compare against is a broken config and not a policy.
+    """
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError(
+            "%s %r is not a usable bar: a comparison against it is neither "
+            "true nor false, so the gate it is meant to be stops gating"
+            % (what, value))
+    return out
 
 log = get_logger("eye")
 
@@ -414,7 +438,7 @@ class FaceIdentifier:
         self.gallery = gallery
         self.recogniser = recogniser
         self.min_conf = float(min_conf)
-        self.match_min = float(match_min)
+        self.match_min = _bar(match_min, "match_min")
         self.owner = str(owner)
         self.session = session
         self.calls = 0
@@ -470,7 +494,11 @@ class FaceIdentifier:
             return "", 0.0
         finally:
             vec = None
-        if not label or score < self.match_min:
+        # ``not (score >= bar)`` and not ``score < bar``: the second is
+        # False for a NaN on either side, which is how a non-comparable bar
+        # matched EVERYTHING. The constructor refuses one now; this is the
+        # spelling that holds even if a bar arrives some other way.
+        if not label or not (score >= self.match_min):
             self.unknown += 1
             # A face that is not confirmed to be him ends the body anchor.
             # Below the bar the nearest LABEL means nothing -- the gallery
@@ -540,7 +568,7 @@ class SessionIdentity:
         # default is how a threshold calibrated for one vector ends up
         # silently applied to another.
         self.ttl_s = float(ttl_s)
-        self.match_min = float(match_min)
+        self.match_min = _bar(match_min, "match_min")
         self._now = now
         self._label = ""
         self._vec = None
@@ -570,6 +598,6 @@ class SessionIdentity:
         if arr.size != self._vec.size or not np.all(np.isfinite(arr)):
             return "", 0.0
         score = cosine(arr, self._vec)
-        if score < self.match_min:
+        if not (score >= self.match_min):   # NaN fails SHUT; see _bar above
             return "", 0.0
         return self._label, score
