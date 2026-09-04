@@ -19,10 +19,15 @@ states the incident this design answers.*
 ```
 
 From inside Jarvis: **"enrol my face"**, **"add Heather's face"**, **"who do you
-recognise"**, **"which pose is weakest"**, **"forget Heather's face"**. The first,
-second and last hand over the exact command and put it on the clipboard; the
+recognise"**, **"which pose is weakest"**, **"forget Heather's face"**. The
 questions are answered in full, because they read a file and open nothing. See
 *The way in, from inside Jarvis* below.
+
+**"Enrol my face" now runs in the window** and needs no terminal and no restart —
+Jarvis offers, **one typed `enrol`** starts it, and the whole run is spoken and
+sounded so he can follow it with his head turned away. It is **owner-only**;
+naming somebody else, or naming a pose, still hands over the command line above.
+See *Enrolling without killing Jarvis*.
 
 ---
 
@@ -626,6 +631,193 @@ go and hands over the command, and the typed confirmation stays in a terminal.
 
 Nothing in that module can open a lens — pinned by a test that reads its import
 lines.
+
+---
+
+## Enrolling without killing Jarvis (2026-09-04)
+
+*`jarvis/enrolrun.py` + `jarvis/enroltap.py`. Voice makes the offer; **one typed
+word** starts it; the camera never leaves the sensing gate.*
+
+### The two locked doors this replaces
+
+On 2026-09-03 enrolment was **unreachable while Jarvis ran**, in both directions:
+
+| Jarvis | what happened |
+| --- | --- |
+| **running** | The app holds `/dev/video0` (measured: fd 14 on the Jarvis pid). V4L2 capture is exclusive, so `scripts/face_enrol.py` got *"can't open camera by index"* and reported *"the frame source stopped delivering — sensing denied the camera, or the device went away"*. **Both halves were false**: sensing said `camera=True` and the device was present. |
+| **stopped** | "Go offline" frees the device, and `SensingPolicy` then refuses: *"STOPPED: sensing says the camera may not run (offline)."* |
+
+The only path through was: come back online → kill Jarvis → enrol → restart. He
+asked for that to go away.
+
+### The shape
+
+Enrolment now runs **inside the running app**, and it does **not open a device**.
+The console's preview already owns a gated `CameraFeed`, so the run reads frames
+through a **pull-based tap** inside that existing capture:
+
+* `enroltap.FrameTap` — a one-shot rendezvous. `read()` sets a *want* flag and
+  blocks; `PreviewPipeline.grab()` checks that flag once per frame and, only when
+  it is set, hands the full frame over by reference. **Single slot, latest-wins,
+  no queue** — at most one frame exists outside the capture loop at any moment,
+  and it is cleared on take, on deny, on abort and on release.
+* `read()` returns `(ok, frame)` — cv2's own contract, which is exactly what
+  `faceenrol.run_enrolment` already takes as its `source`. **There is no second
+  station loop, no second set of quality bars and no second way to save.**
+* Detect (~2 ms) and embed (~10 ms) run on the **enrolment** thread. The capture
+  thread only lets go of a pointer, and the ask rate is ~3/s against 7.5–15 fps
+  delivered, so the pane does not lose its frame rate. `camera.preview_fps` is
+  unchanged.
+
+**The deny is the privacy edge.** `PreviewWorker._close_pipeline()` is the single
+point every camera handback converges on — the sensing deny, the curfew edge,
+`stop()` and `_release` — so `tap.deny()` is written there and nowhere else. It
+drops any pending frame and wakes the blocked reader with `(False, None)`, which
+`run_enrolment` already treats as fatal. The curfew starting mid-run **ends** the
+run; it does not stall it.
+
+**The preview lease.** The pane is ACTIVE-only and goes AMBIENT after 45 s of
+quiet, which would take the camera away halfway through. `main_window` gains a
+`preview_lease(on)` that adds to the "should the capture run" decision, shows the
+pane for the duration (a capture behind a hidden pane is the thing that function
+exists to prevent), is released in a `finally` on **every** path including the
+exception path, and is independently capped at **5 minutes** of wall clock so a
+wedged run cannot hold the lens open.
+
+### The audio grammar — because two stations have no screen and no keyboard
+
+Station three is *"turn your head the other way"* and station four is *"sit back,
+further than usual"*. At those two he can see no screen and reach no keyboard, so
+anything advancing on a key press solves the three easy stations and **fails the
+two the five-station plan exists for**. The progress channel is therefore sound:
+
+| tone | means |
+| --- | --- |
+| **rising fifth → octave** (`heard-you`) | capturing now — hold still |
+| **quiet root + fifth** (`thinking`) | one sample kept — *he counts these* |
+| **three-note rise** (`done`) | position finished — you may move |
+| **falling** (`held-back`) | that position gave nothing, moving on |
+| **grave, falling** (`warning`) | the run has stopped |
+
+Every play passes `cooldown_s=0.0`: the default 4 s same-tone cooldown exists to
+stop a false-wake tone repeating, and here it would silently swallow the second
+and third "kept one" ticks of a three-sample station.
+
+Jarvis says the station, pauses ~3 s to settle, tones, captures, chimes, and
+speaks the count in one breath with the next station's line. **Advance is on a
+frame budget, not on a pose gate** — a station he cannot reach on his camera
+mount costs him a note, not minutes of standing still. `run_enrolment` already
+says when a yaw is outside the station's window, and `judge_gallery` judges the
+distribution that actually came out.
+
+Mid-run, riding the always-live hotword: **"stop" / "cancel" / "never mind"**
+aborts, **"ready" / "next" / "go"** skips the settle, **"wait" / "hold on"**
+holds before the *next* station (never mid-capture) for up to 2 minutes, after
+which the run ends itself with the camera off.
+
+### Why the commit is TYPED, and this is not negotiable
+
+`owner.mode` is **`shadow`** on his live config. In shadow every refusal is
+downgraded to admit, so **the OwnerGate refuses nothing today** — and even in
+`enforce` it fails open four documented ways, and `gate.py`'s own header says a
+photograph defeats the face leg.
+
+If a spoken sentence were enough, a stranger saying *"enrol my face"* would
+**replace his gallery with their face under his own label**, after which the
+gate's face leg would name that stranger as him. That is the one case where a
+mistaken identity *grants* rather than denies, and a gate designed to fail open
+must not be the last thing standing in front of a biometric write.
+
+`gate.GATED_SOURCES` is `("voice",)` — `typed` is exempt **by construction**, on
+the argument that typing means somebody is physically at the keyboard. So:
+
+> **Voice makes the offer. One typed word in the existing command bar commits
+> it.** No new widget, no new dialog. He is at his desk when he asks, and the
+> four letters happen *before* the camera opens and long before station four puts
+> the keyboard out of reach.
+
+The offer lives 90 s. Said aloud instead of typed, the answer is *"That has to be
+typed, sir, not said"* and the offer stays parked.
+
+### Why third parties still use the terminal
+
+`scripts/face_enrol.consent` requires **stdin and stdout to both be real TTYs**
+and makes the person **type their own name** before their biometrics are stored.
+A Tk window can reproduce *read it and type it* but not *and nobody may type it
+for them* — the dialog is driven by whoever is already logged in.
+
+So in-app enrolment is **owner-only**. The label is forced to
+`identity.owner_label(cfg)` and is **never** read from spoken words, so even a
+misrouted turn cannot write somebody else's face under his name, or his name over
+somebody else's. *"Enrol Heather's face"* keeps today's hand-over, unchanged.
+
+A **named pose** (*"enrol my face looking at my phone"*) also keeps the terminal:
+one station is six takes, under the 8-sample floor, so in-app it would capture for
+a minute and then refuse — the terminal path can say `--append`, and this one
+cannot.
+
+### What the window cannot do
+
+Deliberately, each for a stated reason:
+
+* **No `--force`, and no "save anyway".** The verdict guard moved out of
+  `scripts/face_enrol.py` into `faceenrol.save_enrolment()`, which both callers
+  go through. `force` is the CLI's flag; the word does not appear in
+  `jarvis/enrolrun.py` at all — pinned by a test.
+* **No deletes, no `--reset`, `--rollback` or `--allow-shrink`.**
+* **It does not flip `camera.identity`.** The CLI sets it after typed consent;
+  in-app it is *checked* and refused (*"I won't flip that one for you from a
+  spoken command"*), because an aborted run must not leave "faces may be written
+  down" switched on behind it.
+* **It never acquires the mic arbiter.** That arbiter is a re-entrant depth
+  counter which pauses the hotword on first acquire — a two-minute hold would be
+  two minutes of deafness, and his abort word would be the one thing that could
+  not be heard.
+
+### Where the numbers go
+
+Still numbers-only, and still nothing but the embedding reaches the disk:
+
+* the **spoken verdict** — one sentence;
+* an **8-line card** via a display-only `JarvisReply` (`speak=False`), which is
+  the one reply path that does not call `context.add_exchange` and therefore does
+  not land in the plaintext journal;
+* the **full ~41-line report to the clipboard**, preserving the paste-it-to-
+  somebody workflow;
+* **one INFO log line** of counts and a verdict. The full report is deliberately
+  *not* logged: it would pass `assert_numbers_only`, but the enrolment banner
+  promises the embedding is the only thing that reaches the disk, and the
+  clipboard already covers the convenience.
+
+`visionrig.assert_numbers_only` runs over the payload **before** anything is
+emitted, exactly as the CLI does it. Honest about what that proves: it is a
+*structural* check — it guarantees no array, no crop and no object escaped into
+the report; it does not vet the wording of a string.
+
+### A partial run cannot destroy a good gallery
+
+The ordering is the CLI's, unchanged: `load()` then `forget(label)` are **in
+memory only**, `run_enrolment` never saves, and `gallery.save()` happens exactly
+once — inside `save_enrolment()`, and only when the judge passed. Abort, crash,
+camera loss and a failed verdict all leave the disk untouched. The run also
+builds its **own** `FaceGallery` rather than sharing the preview's, because an
+aborted run's in-memory `forget()` would otherwise un-recognise him in the live
+preview until the next restart.
+
+### The false message, fixed
+
+`camera.FeedSource` now has a `reason` property, and `run_enrolment` prefers it
+over its hard-coded sentence. It answers from what it can actually check — what
+sensing says, whether the node exists, whether the device ever opened, and **who
+is holding it** (`camera.device_holder`, a `/proc` fd readlink; it opens
+nothing). So the 2026-09-03 case now reads:
+
+> `/dev/video0 is already open — python3 (pid 1835163) is holding it, and v4l2
+> only allows one`
+
+**This fixes the CLI too**, which is where the false sentence actually cost him
+the half hour.
 
 ---
 

@@ -152,28 +152,13 @@ def open_gallery(cfg=None) -> FaceGallery:
 
 
 def build_models(cfg):
-    """``(detector, recogniser, reason)`` -- never raises, never falls back.
+    """``(detector, recogniser, reason)``. A DELEGATE -- see fe.build_models.
 
-    The detector is floored LOW rather than at his ``camera.min_conf``, for
-    the same reason scripts/vision_selfcheck.py does it: a face scoring 0.45
-    against a 0.6 bar must be reported WITH ITS SCORE, not vanish and read as
-    "no face seen". The bar is then applied by the quality gate, which says
-    which bar it was.
+    The body moved into the library when the in-app run became a second
+    caller, so that "which models does enrolment load" has one answer. The
+    name is kept here because it is what this script's own tests drive.
     """
-    detector, why = cam.detector_from_config(
-        cfg, score_threshold=facedetect.PROBE_THRESHOLD)
-    if detector is None:
-        return None, None, why
-    try:
-        rec = facedetect.load_recogniser(
-            min_conf=float(cfg.get("camera.min_conf", 0.6)),
-            model_dir=str(cfg.get("camera.model_dir", "") or "") or None,
-            backend=cam.face_backend_from_config(cfg),
-            input_size=(int(cfg.get("camera.detect_width", 320)),
-                        int(cfg.get("camera.detect_height", 180))))
-    except Exception as exc:  # noqa: BLE001 - absence is not a crash
-        return detector, None, str(exc)
-    return detector, rec, ""
+    return fe.build_models(cfg)
 
 
 def build_feed(cfg, policy):
@@ -191,7 +176,8 @@ def build_feed(cfg, policy):
             policy,
             lambda: cam.open_capture(device, lens.width_px, lens.height_px,
                                      fourcc),
-            lens=lens, present=lambda: cam.device_present(device)), why
+            lens=lens, present=lambda: cam.device_present(device),
+            device=device), why
     except Exception as exc:  # noqa: BLE001
         return None, "%s: %s" % (type(exc).__name__, exc)
 
@@ -675,24 +661,24 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     finally:
         feed.close()
 
-    removed = 0
-    if rep.ok or args.force:
-        try:
-            gen = gallery.save(
-                reason="face_enrol %s%s%s"
-                % (label,
-                   " (consent typed at the keyboard)" if how == "typed"
-                   else "",
-                   " --force" if not rep.ok else ""),
-                allow_shrink=bool(args.allow_shrink))
-            rep.saved_generation = gen
-            rep.gallery_total = gallery.total()
-            if superseded:
-                removed = gallery.drop_generations(superseded)
-        except ValueError as exc:
-            say("")
-            say("NOT SAVED: %s" % exc)
-            rep.reason = rep.reason or str(exc)
+    # THE VERDICT GUARD IS NO LONGER WRITTEN OUT HERE. It moved into
+    # fe.save_enrolment so that this script and the in-app run
+    # (jarvis/enrolrun.py) are guarded by the same code rather than by two
+    # copies of the same sentence. --force is passed from here and from
+    # nowhere else; the window has no way to reach it.
+    saved = fe.save_enrolment(
+        gallery, rep,
+        reason="face_enrol %s%s%s"
+        % (label,
+           " (consent typed at the keyboard)" if how == "typed"
+           else "",
+           " --force" if not rep.ok else ""),
+        allow_shrink=bool(args.allow_shrink), force=bool(args.force),
+        superseded=superseded)
+    removed = saved["removed"]
+    if saved["error"]:
+        say("")
+        say("NOT SAVED: %s" % saved["error"])
     payload = rep.to_dict()
     payload["reset_removed"] = removed
     payload["consent"] = how

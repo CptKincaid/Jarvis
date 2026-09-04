@@ -631,3 +631,124 @@ def test_a_wedged_grab_does_not_postpone_the_curfew_forever(tmp_path,
     assert dev.released == 1
     stuck.set()
     grab.join(5.0)
+
+
+# ==========================================================================
+# WHY THE CAMERA WOULD NOT OPEN, said truthfully (2026-09-04)
+# ==========================================================================
+# THE INCIDENT THIS FIXES. On 2026-09-03 scripts/face_enrol.py could not open
+# the camera and reported "the frame source stopped delivering -- sensing
+# denied the camera, or the device went away". BOTH HALVES WERE FALSE:
+# sensing said camera=True and the device was present. It was simply HELD by
+# the running Jarvis, because v4l2 capture is exclusive. The message was
+# true-sounding and useless, and it cost half an hour of checking the two
+# things that were already fine.
+#
+# So FeedSource now answers the question from what it can actually check --
+# the gate, the node, whether the device ever opened, and who has it -- and
+# these tests pin each branch. Nothing here opens a device or reads a frame;
+# device_holder is a directory listing and a readlink, and opens nothing.
+class _StatusFeed:
+    """A CameraFeed-shaped stub: just the four things ``reason`` reads."""
+
+    def __init__(self, allowed=True, opens=1, frames=0, device="",
+                 policy_reason=""):
+        self._status = {"allowed": allowed, "opens": opens, "frames": frames,
+                        "name": "camera", "open": False}
+        self.device = device
+        self.policy = type("P", (), {
+            "status": staticmethod(lambda: {"reason": policy_reason})})()
+
+    def status(self):
+        return dict(self._status)
+
+
+def _readlink_or_blank(path: str) -> str:
+    import os
+    try:
+        return os.readlink(path)
+    except OSError:
+        return ""
+
+
+def test_a_denied_feed_says_sensing_and_names_the_reason():
+    src = cam.FeedSource(_StatusFeed(allowed=False, policy_reason="curfew"))
+    assert "sensing" in src.reason
+    assert "curfew" in src.reason
+
+
+def test_an_absent_device_says_so_rather_than_blaming_sensing(monkeypatch):
+    monkeypatch.setattr(cam, "device_present", lambda _d="": False)
+    src = cam.FeedSource(_StatusFeed(device="/dev/video9"))
+    assert "not there" in src.reason
+    assert "/dev/video9" in src.reason
+
+
+def test_a_device_that_never_opened_is_reported_as_held_by_somebody(
+        monkeypatch):
+    """THE 2026-09-03 CASE. Sensing allows it, the node exists, and we never
+    once got it open -- which on a v4l2 device means somebody else has it."""
+    monkeypatch.setattr(cam, "device_present", lambda _d="": True)
+    monkeypatch.setattr(cam, "device_holder",
+                        lambda _d="": (1835163, "python3"))
+    said = cam.FeedSource(_StatusFeed(opens=0, device="/dev/video0")).reason
+    assert "already open" in said
+    assert "1835163" in said and "python3" in said
+    # ...and it does NOT repeat either of the two false claims.
+    assert "sensing denied" not in said
+    assert "went away" not in said
+
+
+def test_an_unidentifiable_holder_is_still_reported_honestly(monkeypatch):
+    """A process this user may not read must produce "somebody, and I cannot
+    say who" -- never a guess, and never the old sentence."""
+    monkeypatch.setattr(cam, "device_present", lambda _d="": True)
+    monkeypatch.setattr(cam, "device_holder", lambda _d="": (0, ""))
+    said = cam.FeedSource(_StatusFeed(opens=0, device="/dev/video0")).reason
+    assert "another process is holding it" in said
+
+
+def test_a_device_that_opened_and_then_stopped_says_that_instead(monkeypatch):
+    monkeypatch.setattr(cam, "device_present", lambda _d="": True)
+    said = cam.FeedSource(_StatusFeed(opens=1, frames=42)).reason
+    assert "stopped answering" in said and "42" in said
+
+
+def test_the_reason_never_raises_on_a_feed_that_cannot_answer():
+    """It is read on a failure path, so it must not be able to add a second
+    failure on top of the first."""
+    class Broken:
+        device = ""
+
+        def status(self):
+            raise RuntimeError("no")
+
+    assert cam.FeedSource(Broken()).reason == ""
+
+
+def test_device_holder_really_walks_proc_and_skips_our_own_pid(tmp_path):
+    """Proves the /proc walk WORKS rather than merely returning (0, "") for
+    everything, which is how this could pass while being broken.
+
+    A plain temp file stands in for the video node: device_holder matches an
+    fd's readlink target and has no opinion about what kind of file that is.
+    Our own pid is skipped by design -- the question is "who has it INSTEAD
+    of me" -- so both halves are asserted: nobody is reported, and the fd is
+    nevertheless right there to be found at the path that was skipped.
+    """
+    import os
+    probe = tmp_path / "video-probe"
+    probe.write_text("x")
+    fh = open(probe, "rb")
+    try:
+        assert cam.device_holder(str(probe)) == (0, "")
+        mine = "/proc/%d/fd" % os.getpid()
+        found = [f for f in os.listdir(mine)
+                 if _readlink_or_blank("%s/%s" % (mine, f)) == str(probe)]
+        assert found, "the /proc walk is looking in the wrong place"
+    finally:
+        fh.close()
+
+
+def test_device_holder_says_nobody_for_a_node_that_does_not_exist():
+    assert cam.device_holder("/dev/video-nope-99") == (0, "")
