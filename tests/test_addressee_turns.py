@@ -80,7 +80,10 @@ def test_every_live_system_message_reads_the_keyed_cache():
     body = src.split('"""', 2)[2]                 # past the module docstring
     readers = re.findall(r'\{"role": "system",\s*"content": ([^}]+)\}', body)
     assert len(readers) >= 6, readers
-    assert set(readers) == {"static_system()"}, readers
+    # The tool loop hands static_system its OWN reading of the turn
+    # (addressee_to=...); every other reader takes the current one.
+    assert all(r.startswith("static_system(") for r in readers), readers
+    assert "static_system(addressee_to=turn_addr)" in readers, readers
     # No other code reads the cache by hand: every touch of the "system"
     # table sits inside static_system() or reset_static_prompt().
     def span(name):

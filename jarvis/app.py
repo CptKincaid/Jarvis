@@ -73,6 +73,7 @@ from jarvis import earcons
 from jarvis import gate as gate_mod
 from jarvis import honorific as honorific_mod
 from jarvis import identity as identity_mod
+from jarvis import scope as scope_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
 from jarvis import vocab as vocab_mod
@@ -948,6 +949,23 @@ class JarvisApp:
             except Exception:                      # noqa: BLE001
                 pass
 
+    def _the_turn_is_his(self) -> None:
+        """This turn is the OWNER'S: attribute it to nobody and name the
+        owner to the prompt builder.
+
+        Called for every source the gate does not judge -- the keyboard,
+        the command socket, the phone's intercom clip, Discord -- and
+        before every proactive ask (the first-wake briefing). The
+        round-2 review (09-04) found the attribution written only by the
+        voice path and never cleared: one admitted guest turn and every
+        typed turn of his, and his own briefing, ran scoped as the guest.
+        The scope is per turn now (jarvis/scope.py); this is the owner's
+        half of "per turn", and ``_gate_admits`` is the voice half.
+        """
+        self._gate_who, self._gate_how = "", ""
+        self._gate_who_ts = -1e9
+        self._tell_the_model_who_is_here("")
+
     def _honorific(self) -> str:
         """"sir", "ma'am" or "" for WHOEVER THE NEXT LINE IS AIMED AT.
 
@@ -1234,12 +1252,19 @@ class JarvisApp:
 
         b = self.brain
 
-        def chat(text, force_tool=None, force_args=None):
+        def chat(text, force_tool=None, force_args=None, addressee=None):
             # Every keyword the real JarvisBrain.chat accepts must be forwarded
             # here: the commander only ever sees this wrapper, and a keyword it
             # does not take raises TypeError inside the handler, which the
             # dispatcher turns into "Command failed: <name>" for the user.
+            # ``addressee`` is the commander's ONE reading of whose turn this
+            # is (jarvis/scope.py). Dropped here, a known person's question
+            # would reach the model as his turn with every tool offered --
+            # and test_app_wiring pins that this wrapper takes every keyword
+            # JarvisBrain.chat takes.
             extra = {"force_args": force_args} if force_args is not None else {}
+            if addressee is not None:
+                extra["addressee"] = addressee
             if CONFIG.stream_replies:
                 extra["on_sentence"] = app._on_stream_sentence
             return b.chat(text, callback=app._on_brain_tags,
@@ -4141,8 +4166,12 @@ class JarvisApp:
         # time-of-day rule for the house (jarvis/arc.py), not a second one
         # here.
         when = arc_mod.greeting_word(datetime.now())
+        # Proactive, and his: the calendar and the lab it reads are not
+        # scoped by whoever the gate last named (round-2 review, 09-04).
+        self._the_turn_is_his()
         try:
-            brain.chat(f"my {when} briefing", force_tool="get_briefing")
+            brain.chat(f"my {when} briefing", force_tool="get_briefing",
+                       addressee=scope_mod.OWNER)
         except Exception:
             log.exception("first-wake briefing failed")
             return False
@@ -5277,6 +5306,11 @@ class JarvisApp:
         if source == "voice":
             self._turn_start()
             self.turns.mark("handle")
+        elif source not in gate_mod.GATED_SOURCES:
+            # Not judged by the gate, so nobody but him: the keyboard, the
+            # socket, his phone, Discord. The attribution a guest's voice
+            # turn left behind must not scope HIS typed turn.
+            self._the_turn_is_his()
         # The Whisper avg_logprob travels only when there is one: typed
         # text has none, and a stand-in commander need not take the keyword.
         kw = {} if confidence is None else {"confidence": confidence}

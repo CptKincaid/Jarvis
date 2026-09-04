@@ -1188,6 +1188,16 @@ def test_services_brain_chat_forwards_every_keyword_the_brain_takes(build, monke
                             force_args={"unread_only": False, "limit": 1})
     assert seen["force_tool"] == "get_mail"
     assert seen["force_args"] == {"unread_only": False, "limit": 1}
+    # The commander's one reading of whose turn it is (jarvis/scope.py):
+    # dropped here, a known person's question would reach the model as HIS
+    # turn with every tool offered. Round 3 of people-signin (09-04) found
+    # exactly that: the checkpoint passed addressee= and this wrapper ate it.
+    seen.clear()
+    app.services.brain.chat("how far is the moon", addressee=("Mara", "ma'am"))
+    assert seen["addressee"] == ("Mara", "ma'am")
+    seen.clear()
+    app.services.brain.chat("what time is it")
+    assert "addressee" not in seen, "an owner turn lets the brain read the scope"
     # and structurally: every keyword the real method accepts (bar callback,
     # which the wrapper supplies) must be accepted by the wrapper
     from jarvis.brain import JarvisBrain

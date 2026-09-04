@@ -145,7 +145,8 @@ def test_no_authored_line_still_says_sir_to_a_maam_person():
 def test_the_gates_own_new_lines_are_clean():
     """Spot-checked separately because they are the lines Mara and Heather
     are most likely to hear first."""
-    for line in (gt.SIGNIN_OK_LINE, gt.ENROL_AT_KEYBOARD_LINE,
+    for line in (gt.SIGNIN_OK_LINE.format(first="Mara"),
+                 gt.ENROL_AT_KEYBOARD_LINE,
                  gt.UNKNOWN_LINE, gt.UNKNOWN_PHRASE_LINE,
                  gt.SIGNIN_PENDING_LINE.format(name="Mara"),
                  gt.SIGNIN_NO_LEG_LINE.format(name="Mara"),
@@ -156,16 +157,31 @@ def test_the_gates_own_new_lines_are_clean():
 
 
 def test_signed_in_reads_right_in_all_three_forms():
-    """The exact sentences Mara, Heather and a no-address person hear."""
-    line = gt.SIGNIN_OK_LINE
-    assert line == ("Signed in, sir. I can give you the time, the weather, "
-                    "the music, and I'll answer what I can.")
-    assert address.swap_addresses(line, "ma'am") == (
-        "Signed in, ma'am. I can give you the time, the weather, "
-        "the music, and I'll answer what I can.")
-    assert address.swap_addresses(line, "") == (
-        "Signed in. I can give you the time, the weather, "
-        "the music, and I'll answer what I can.")
+    """HIS words (09-04), verbatim, with the first name in them. Mara,
+    Heather and a no-address person hear the SAME sentence: it carries
+    no honorific, so the swap has nothing to change in any register."""
+    assert gt.SIGNIN_OK_LINE == ("Voice and identity recognized, welcome "
+                                 "back {first}. How may I be of assistance "
+                                 "today?")
+    for first in ("Mara", "Heather", "Alex"):
+        line = gt.SIGNIN_OK_LINE.format(first=first)
+        assert line == ("Voice and identity recognized, welcome back %s. "
+                        "How may I be of assistance today?" % first)
+        for hon in ("sir", "ma'am", ""):
+            assert address.swap_addresses(line, hon) == line
+    # A template is never prewarmed: the cache would hold "{first}".
+    assert gt.SIGNIN_OK_LINE not in gt.PREWARM_LINES
+    assert "{first}" not in "".join(gt.PREWARM_LINES)
+
+
+def test_first_name_is_the_typed_one_then_the_display_names_first_word():
+    from jarvis.identity import Person
+    assert gt.first_name(Person(label="mara", first="Mara", last="Quinn")) \
+        == "Mara"
+    assert gt.first_name(Person(label="heather", name="Heather Vance")) \
+        == "Heather"
+    assert gt.first_name(Person(label="alex")) == "Alex"
+    assert gt.first_name(None, "there") == "there"
 
 
 # --------------------------------------- (b) nothing moves for the owner

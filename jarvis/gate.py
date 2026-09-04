@@ -234,11 +234,16 @@ SIGNIN_PENDING_LINE = ("I have a {name} on file. I can't confirm that's you "
 SIGNIN_NO_LEG_LINE = ("I have a {name} on file, but I've no way to confirm "
                       "it just now — the camera's off. The owner can sign "
                       "you in at the keyboard.")
-# Confirmed. Authored with "sir" like every other line in this tree and
-# rewritten at the door for whoever is actually being addressed
-# (jarvis/address.swap_addresses).
-SIGNIN_OK_LINE = ("Signed in, sir. I can give you the time, the weather, "
-                  "the music, and I'll answer what I can.")
+# Confirmed. HIS WORDING, VERBATIM (09-04): "Voice and identity
+# recognized, welcome back <first name>. How may I be of assistance
+# today?" -- the same sentence jarvis/signinlines.py carries on the
+# voice-multispeaker branch, so the two cannot disagree at the merge. A
+# {first} template: the name does the work of address, there is no
+# honorific in it, and Mara and Heather -- "ma'am" everywhere else --
+# hear their own first name here. Like every {name} template it is never
+# prewarmed.
+SIGNIN_OK_LINE = ("Voice and identity recognized, welcome back {first}. "
+                  "How may I be of assistance today?")
 # A KNOWN person reaching for a setting or a privilege. A {name} template
 # like KNOWN_SCOPE_LINE, and for the same reason: he is already recognised
 # and greeted by name, and a refusal that says his name back is a refusal
@@ -251,13 +256,28 @@ NOT_YOURS_LINE = "That's Hunter's to change, {name}. I'll leave it be."
 ENROL_AT_KEYBOARD_LINE = ("Enrolling somebody else has to happen at the "
                           "keyboard, sir — they need to read what's stored "
                           "and type their own name.")
-# {name} templates are never prewarmed -- KNOWN_SCOPE_LINE and
-# NOT_YOURS_LINE are out for that reason, as they always were. SIGNIN_OK_LINE
-# and ENROL_AT_KEYBOARD_LINE are prewarmed AS AUTHORED, which caches the
-# "sir" rendering; the "ma'am" rendering of each is a cache miss the first
-# time a ma'am person hears it, which is a latency cost and not a defect.
+# {name} templates are never prewarmed -- KNOWN_SCOPE_LINE, NOT_YOURS_LINE
+# and now SIGNIN_OK_LINE are out for that reason. ENROL_AT_KEYBOARD_LINE is
+# prewarmed AS AUTHORED, which caches the "sir" rendering; the "ma'am"
+# rendering is a cache miss the first time a ma'am person hears it, which
+# is a latency cost and not a defect.
 PREWARM_LINES = (UNKNOWN_LINE, UNKNOWN_PHRASE_LINE, STANDDOWN_LINE,
-                 PHRASE_OK_LINE, SIGNIN_OK_LINE, ENROL_AT_KEYBOARD_LINE)
+                 PHRASE_OK_LINE, ENROL_AT_KEYBOARD_LINE)
+
+
+def first_name(person, fallback: str = "") -> str:
+    """What ``{first}`` renders as: the typed first name, else the first
+    word of the display name, else ``fallback``."""
+    if person is None:
+        return fallback
+    first = str(getattr(person, "first", "") or "").strip()
+    if first:
+        return first
+    try:
+        words = str(person.display() or "").split()
+    except Exception:  # noqa: BLE001 - a row that cannot say
+        words = []
+    return words[0] if words else fallback
 
 # ------------------------------------------------------------- the scope
 # What a KNOWN person may do. DEFAULT-DENY: an explicit allow-list, and
@@ -692,7 +712,8 @@ class OwnerGate:
                              "confirmed it", verdict.who, verdict.how)
                     if self._once_per(self._welcomed, verdict.who,
                                       SIGNIN_GREET_S, now):
-                        greeting = SIGNIN_OK_LINE
+                        greeting = SIGNIN_OK_LINE.format(
+                            first=first_name(person, name))
                 log.info("gate: %s (%s) on the %s leg", verdict.who,
                          verdict.role, verdict.how)
                 return Decision(admit=True, who=verdict.who, role=verdict.role,

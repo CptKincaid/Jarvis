@@ -136,7 +136,9 @@ def test_the_claim_is_confirmed_by_a_leg_and_only_then(tmp_path):
     d = g.judge("voice", "signing in, Mara Quinn", stats=MATCHED,
                 rejected=True, face="mara", face_running=True)
     assert d.admit is True and d.who == "mara" and d.how == gt.HOW_FACE
-    assert d.line == gt.SIGNIN_OK_LINE
+    assert d.line == gt.SIGNIN_OK_LINE.format(first="Mara")
+    assert d.line == ("Voice and identity recognized, welcome back Mara. "
+                      "How may I be of assistance today?")
 
 
 def test_the_welcome_is_said_once_not_on_every_turn(tmp_path):
@@ -145,7 +147,7 @@ def test_the_welcome_is_said_once_not_on_every_turn(tmp_path):
                     face="mara", face_running=True, now=0.0)
     again = g.judge("voice", "it's Mara Quinn", stats=MATCHED, rejected=True,
                     face="mara", face_running=True, now=5.0)
-    assert first.line == gt.SIGNIN_OK_LINE
+    assert first.line == gt.SIGNIN_OK_LINE.format(first="Mara")
     assert again.line == ""
 
 

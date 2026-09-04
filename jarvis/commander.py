@@ -93,6 +93,7 @@ from jarvis import outbox
 from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
+from jarvis import scope as scope_mod
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.tools.location import clock_words
@@ -8888,6 +8889,24 @@ ASSISTANT_TIER1 = [
     for cmd in ASSISTANT_TIER1
 ]
 
+# What a KNOWN person's turn may run from REGISTRY, by name. DEFAULT-DENY,
+# the mirror of brain.KNOWN_TOOLS: an entry not named here is his, and her
+# words matching it are answered with scope.HIS_LINE and no handler. The
+# clock and arithmetic read nothing of his. The courtesies, greetings,
+# "quiet" and "say again" are answered inline in Commander._handle_known
+# without their owner handlers (which wake his scene, start his wind-down,
+# cancel his Claude task). Music is NOT here: "music resume" and "liked
+# songs" force spotify tools the model is not offered on her turn, so the
+# table would only hand her a second refusal.
+KNOWN_TIER1 = frozenset({"clock", "math"})
+# Entries whose MATCHER accepts any sentence and whose handler decides
+# (workflow: `workflows.get(t)` is None for anything that is not one of
+# his). Skipped by the known person's probe, which asks whether the WORDS
+# claimed something of his; tests/test_known_tier1.py pins that this is
+# the only such entry, so a new catch-all cannot silently hand a guest's
+# every sentence the refusal.
+CATCH_ALL_COMMANDS = frozenset({"workflow"})
+
 
 def _call_manager(fn, args: dict):
     """Call a session-manager method with the arguments it accepts.
@@ -9612,6 +9631,16 @@ class Commander:
         with self._turn_lock:
             self._confidence = confidence
             self._turn_source = source
+            # ONE reading of whose turn this is (jarvis/scope.py), taken
+            # here and carried for the whole turn. A known person who is
+            # not the owner gets the narrow path and nothing below it: not
+            # the pending yes/no rungs (his read-backs are his to answer),
+            # not the sticky modes, not the Tier-1 table that reads his
+            # calendar, notes, memory and held lines with no model and,
+            # until 09-04, no scope.
+            who, hon = scope_mod.addressee()
+            if who:
+                return self._handle_known(text, source, who, hon)
             armed = (getattr(self, "_pending_send", None),
                      getattr(self, "_pending_filepick", None),
                      getattr(self, "_pending_destructive", None),
@@ -9630,6 +9659,135 @@ class Commander:
             if undo is not None:
                 self._last_undo = (undo, time.monotonic())
         return result
+
+    # -- a known person's turn ------------------------------------------
+    def _refused(self, what: str, who: str) -> CommandResult:
+        """The authored refusal, through the one scope function."""
+        line = scope_mod.owner_only(what, who=who)
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status="Not %s's" % who)
+
+    def _handle_known(self, text: str, source: str, who: str,
+                      hon: str) -> CommandResult:
+        """The turn of a KNOWN person who is not the owner.
+
+        AN ALLOW-LIST, NOT A VETO -- the same reading brain.KNOWN_TOOLS
+        takes of the gate's "the time, the weather". The owner's path is
+        ~40 rungs deep and most of them read something of his: the
+        round-2 review (09-04) measured "what's my next class", "what's on
+        my to-do list", "what did I miss", "who is my doctor" and "what
+        did I say about the dentist" all answered for a known person from
+        his calendar, notes, held lines and memory, with no model and no
+        scope. Auditing every rung for a data read would be a list
+        somebody has to remember to extend; this runs only what is listed
+        here and hands everything else to the model, whose own scope
+        (brain.KNOWN_TOOLS) offers her the time and the weather.
+
+        What she gets, in order: the voice I/O words (quiet, say again);
+        the courtesies and greetings as plain lines -- never
+        ``_h_greeting`` / ``_h_courtesy``, which wake his room scene and
+        start his wind-down; the ``KNOWN_TIER1`` entries of the table by
+        NAME (the clock, arithmetic); a refusal with the authored line for
+        any other table entry her words match, whole or as a clause of a
+        compound; the background-chat gate for a voice turn; then the
+        model. Nothing here types, targets a window, answers a pending
+        question of his, or files a dictation line.
+        """
+        cmd = strip_jarvis_prefix(text)
+        t = (cmd if cmd is not None else text).strip().lower().rstrip(".!?")
+        if not t:
+            return CommandResult(handled=False, status="No speech detected")
+        # 1. Voice I/O she may work. "quiet" without the Claude cancel
+        #    that _h_quiet carries for him.
+        if quiet_kind(t):
+            _cut_speech(self)
+            return CommandResult(handled=True, reply="Very good.",
+                                 speak=False, status="Quiet")
+        if repeat_kind(t):
+            return _h_repeat(self, t, True)
+        # 2. Courtesies and greetings: the line, and only the line.
+        kind = courtesy_kind(t) or greeting_kind(t)
+        if kind:
+            return CommandResult(
+                handled=True, speak=True, status="Courtesy",
+                reply=courtesy_reply(kind, register=_register_name(self)))
+        # 3. The table, by name -- the WHOLE of REGISTRY, prefixed or not,
+        #    which is stricter than his unprefixed pass (ASSISTANT_TIER1)
+        #    on purpose: a matcher of his that accepts her words is a
+        #    claim on his data whether or not the handler would have found
+        #    any. Her words, and each clause of a compound ("what time is
+        #    it and what's on my to-do list"), are probed first; one
+        #    unlisted name anywhere and the turn is refused whole rather
+        #    than half-answered.
+        names = [self._table_name(t)] + \
+            [self._table_name(part) for part in split_clauses(t)]
+        for name in names:
+            if name and name not in KNOWN_TIER1:
+                return self._refused(name, who)
+        for entry in REGISTRY:
+            if entry.name not in KNOWN_TIER1:
+                continue
+            try:
+                m = entry.matcher(t)
+            except Exception:
+                log.exception("matcher %s failed", entry.name)
+                continue
+            if not m:
+                continue
+            if any(self._svc(n) is None for n in entry.needs):
+                continue
+            try:
+                res = entry.handler(self, t, m)
+            except Exception:
+                log.exception("handler %s failed", entry.name)
+                return CommandResult(handled=True,
+                                     reply=f"Command failed: {entry.name}",
+                                     status="error")
+            if res is not None:
+                return res
+        # 4. The background-chat gate, voice only, as for him -- but an
+        #    UNCERTAIN verdict is dropped rather than put on his screen as
+        #    a card: a YES there re-runs the words down HIS path.
+        if source == "voice" and not WEB_CUE_RX.search(text):
+            intent, conf = self.intent.classify(text)
+            if intent != IntentClassifier.YES:
+                log.info("Ignored (background chat from %s, conf=%.2f): %r",
+                         who, conf, text)
+                return CommandResult(handled=True,
+                                     status="Ignored (background chat)")
+        # 5. The model, with her scope. Not the router: no Claude session,
+        #    no web one-shot carrying his recent conversation, no forced
+        #    tool of his -- brain.chat and brain.KNOWN_TOOLS. The reading
+        #    taken at the top of handle() travels WITH the text, so the
+        #    tool loop on the worker scopes this turn to the same person
+        #    even if the attribution expires or the gate names the next
+        #    person before the worker gets to it.
+        brain = self._svc("brain")
+        if brain is None or not hasattr(brain, "chat"):
+            if brain is not None and hasattr(brain, "think"):
+                brain.think(text)
+                return CommandResult(handled=True, status="Thinking...",
+                                     done=False)
+            return CommandResult(handled=False, reply=text,
+                                 status="No route (no brain)")
+        brain.chat(strip_address(text), addressee=(who, hon))
+        return CommandResult(handled=True, status="Thinking…", done=False)
+
+    def _table_name(self, t: str) -> Optional[str]:
+        """The name of the first REGISTRY entry whose matcher accepts
+        ``t``, else None. A probe: no handler runs, no service is read.
+        ``CATCH_ALL_COMMANDS`` are skipped -- "workflow" accepts every
+        sentence and decides inside its handler -- so a match here means
+        the WORDS claimed something."""
+        for entry in REGISTRY:
+            if entry.name in CATCH_ALL_COMMANDS:
+                continue
+            try:
+                if entry.matcher(t):
+                    return entry.name
+            except Exception:
+                log.exception("matcher %s failed", entry.name)
+        return None
 
     def _drop_stranded_questions(self, armed: tuple, result,
                                  source: str = "voice") -> None:
