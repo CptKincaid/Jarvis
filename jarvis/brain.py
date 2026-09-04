@@ -307,6 +307,11 @@ _ACTION_CLAIM_RX = re.compile(
     r"removed|sent|queued|scheduled|saved|created|deleted|paused|resumed|"
     r"turned (?:on|off|up|down)|switched|moved|booked|cleared|stopped|"
     r"muted|skipped|dimmed|put)\b"
+    # "I have noted that, sir" (2026-09-02, his graduation): a claim to have
+    # remembered is a claim to have acted, and nothing was stored.
+    r"|i(?:'ve| have)(?: just| now| already)? noted (?:that|it|this)\b"
+    r"|i(?:'ll| will| shall)(?: certainly| of course)? (?:remember|note) (?:that|it|this)\b"
+    r"|i(?:'ve| have)(?: just| now)? (?:stored|saved|put|committed) (?:that|it|this) (?:in|to|into) (?:my )?memory\b"
     # "I'm starting your music now", "I am adding it to the list"
     r"|i(?:'m| am)(?: now| just)? (?:starting|playing|adding|setting|cancell?ing|"
     r"removing|sending|queuing|queueing|scheduling|saving|creating|"
