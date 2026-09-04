@@ -255,6 +255,10 @@ def bracket_points(rect: tuple, arm: int) -> tuple:
 def identity_text(face) -> str:
     """"HUNTER 0.74" / "UNKNOWN 0.21", or "" when identity did not run.
 
+    NOT DRAWN OVER THE PICTURE ANY MORE, and kept only because the score is
+    worth having a formatter for. The preview caption is ``identity_name``:
+    the name alone. See the comment at the caption ladder for why.
+
     THREE STATES, NOT TWO, and the empty string is the one that is easy to
     get wrong. No chip means identity was not ASKED -- ``camera.identity`` is
     off, the SFace weights are missing, nobody is enrolled, or this is not
@@ -857,8 +861,14 @@ class CameraPreview(tk.Frame):
                                   fill=identity_ink(face), state="normal")
         room = fw - 2 * pad
         box = None
-        for text, bar in ((identity_text(face), fw * NAME_MAX_FRAC),
-                          (identity_name(face), room)):
+        # THE NAME ONLY. The score used to ride in front of the name here,
+        # dropping out on a narrow pane -- which is why he saw "HUNTER 0.51"
+        # sometimes and "HUNTER" other times over the same face. He asked
+        # for it gone: the caption over his own face is an ANSWER, and the
+        # evidence behind it belongs on a surface he opens to read numbers.
+        # The score is still on the SENSORS page (ui/sensors_page.py), which
+        # is exactly such a surface, so nothing was lost by removing it here.
+        for text, bar in ((identity_name(face), room),):
             box = self._place_name(text, x, y)
             if box is None:
                 self.canvas.itemconfigure(self._name, state="hidden")

@@ -518,10 +518,16 @@ def test_a_frame_that_will_not_convert_leaves_the_pane_dark_not_stale():
 # --------------------------------------------------- who it is looking at
 def test_the_tracked_face_is_labelled_with_who_it_is():
     """His words, 2026-09-03: "lets have the identity of the person its
-    tracking next to their name, small but readable"."""
+    tracking next to their name, small but readable" -- WHO, and only who.
+
+    The first build of this read "identity" as the match score and drew
+    "HUNTER 0.74" over his face. Seeing it live the same day he said it
+    should not be there, and he is right: the caption over a face is the
+    ANSWER, and the evidence behind the answer belongs on a surface opened
+    to read numbers. The score is still on the SENSORS page."""
     ns = pane()
     c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
-    assert c.state["name"]["text"] == "HUNTER 0.74"
+    assert c.state["name"]["text"] == "HUNTER"
     assert c.shown("name") and c.shown("namebg")
     assert c.state["name"]["fill"] == theme.FOCAL
 
@@ -532,7 +538,7 @@ def test_a_face_that_matched_nothing_says_unknown_rather_than_going_blank():
     same way would leave him unable to tell one from the other."""
     ns = pane()
     c = paint(ns, live(face(name="", id_score=0.21, id_ran=True)))
-    assert c.state["name"]["text"] == "UNKNOWN 0.21"
+    assert c.state["name"]["text"] == "UNKNOWN"
     assert c.state["name"]["fill"] == theme.MUTED     # a lesser claim
     assert c.shown("name")
 
@@ -549,7 +555,7 @@ def test_only_the_tracked_face_is_named():
     ns = pane()
     c = paint(ns, live(face(w=300, name="hunter", id_score=0.74, id_ran=True),
                        face(x=0, y=0, w=80, h=80)))
-    assert c.state["name"]["text"] == "HUNTER 0.74"
+    assert c.state["name"]["text"] == "HUNTER"
     assert len([1 for item in ("name", "namebg") if c.shown(item)]) == 2
 
 
@@ -734,10 +740,17 @@ def test_a_chip_that_would_cover_the_face_sheds_its_score_first():
     assert c.shown("name") and c.shown("namebg")
 
 
-def test_the_score_survives_when_there_is_room_for_it():
-    ns = pane()
-    c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
-    assert c.state["name"]["text"] == "HUNTER 0.74"
+def test_the_score_is_never_drawn_over_the_picture_however_much_room_there_is():
+    """The caption used to carry the score and DROP it when the pane was
+    narrow, so the same face read "HUNTER 0.74" or "HUNTER" depending on
+    the width -- which is how he noticed it at all. Width must not change
+    what the caption says."""
+    for char_w in (4, 8, 16):
+        ns = pane()
+        ns.canvas.CHAR_W = char_w
+        c = paint(ns, live(face(name="hunter", id_score=0.74, id_ran=True)))
+        assert c.state["name"]["text"] == "HUNTER", char_w
+        assert "0.74" not in c.state["name"]["text"], char_w
 
 
 def test_a_name_too_wide_even_on_its_own_is_trimmed_not_run_off_the_edge(
