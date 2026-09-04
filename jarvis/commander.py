@@ -4837,11 +4837,27 @@ _HPC_RX = re.compile(_HPC, re.I)
 # A file phrase: "this file", "the budget spreadsheet", "budget.xlsx".
 _FILE_WORD = r"(?P<what>[\w][\w '.\-()+]{0,80}?)"
 
-# "is HPCOMPUTER up", "is it awake", "how's HPCOMPUTER"
+# The polite openers, ONCE, for all five doors (F09, 2026-09-03). The four
+# answering doors were anchored on the bare verb while the refusal door
+# below stripped exactly these words, so "please move the budget to
+# hpcomputer" fell past its own door and was REFUSED out loud as a loose
+# command, and "please put / can you put / could you copy / please get"
+# went to the model, which cannot move a file. The same list the mail
+# lane's _SEND_OPENER takes; _REMOTE_ORDER_RX is built from this string so
+# the two can never drift apart again.
+_REMOTE_OPENER = (r"^(?:jarvis[,\s]+)?"
+                  r"(?:(?:please|just|go\s+ahead\s+and|can\s+you|could\s+you|"
+                  r"would\s+you|will\s+you)[,\s]+)*")
+_REMOTE_OPENER_RX = re.compile(_REMOTE_OPENER, re.I)
+_UP_WORDS = r"(?:up|on|awake|alive|online|running|ok|okay|there)"
+
+# "is HPCOMPUTER up", "is it awake", "how's HPCOMPUTER", and the polite
+# "could you tell me if HPCOMPUTER is up".
 _REMOTE_STATUS_RX = re.compile(
-    r"^(?:"
-    r"(?:is|are)\s+" + _HPC + r"\s+(?:up|on|awake|alive|online|running|"
-    r"ok|okay|there)|"
+    _REMOTE_OPENER + r"(?:"
+    r"(?:is|are)\s+" + _HPC + r"\s+" + _UP_WORDS + r"|"
+    r"(?:tell\s+me\s+)?(?:if|whether)\s+" + _HPC + r"(?:\s+is|'s)\s+"
+    + _UP_WORDS + r"|"
     r"(?:how(?:'s|s| is))\s+" + _HPC + r"(?:\s+(?:doing|looking))?|"
     r"(?:check|check on|ping)\s+" + _HPC + r"|"
     r"(?:can|could)\s+you\s+(?:see|reach)\s+" + _HPC +
@@ -4851,14 +4867,16 @@ _REMOTE_STATUS_RX = re.compile(
 # itself is a constant in remote.QUERIES, so a misheard word can only pick a
 # different question from the table or none at all.
 _REMOTE_QUERY_RX = re.compile(
-    r"^(?:what(?:'s|s| is)|how(?:'s|s| is)|who(?:'s|s| is)|show me)\s+"
+    _REMOTE_OPENER +
+    r"(?:tell\s+me\s+)?(?:what(?:'s|s| is)|how(?:'s|s| is)|who(?:'s|s| is)|"
+    r"show\s+me|tell\s+me)\s+"
     r"(?:the\s+|my\s+)?(?P<q>disk|space|drive|storage|room|uptime|load|"
     r"logged\s+in|logged\s+on|on\s+it|inbox|in\s+the\s+inbox)\b"
     r".{0,20}?\bon\s+" + _HPC + r"\W*$", re.I)
 
 # PUSH: "put the budget on HPCOMPUTER", "send this file to HPCOMPUTER".
 _REMOTE_PUSH_RX = re.compile(
-    r"^(?:put|copy|send|move|push|transfer)\s+"
+    _REMOTE_OPENER + r"(?:put|copy|send|move|push|transfer)\s+"
     r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
     r"(?:\s+file)?\s+(?:on(?:to)?|to|over\s+to|across\s+to)\s+"
     + _HPC + r"\W*$", re.I)
@@ -4866,7 +4884,7 @@ _REMOTE_PUSH_RX = re.compile(
 # PULL: "get the budget from HPCOMPUTER", "grab that off HPCOMPUTER".
 # The optional trailing folder word is an ALLOW-LIST key, not a path.
 _REMOTE_PULL_RX = re.compile(
-    r"^(?:get|grab|fetch|bring|pull|copy|download)\s+(?:me\s+)?"
+    _REMOTE_OPENER + r"(?:get|grab|fetch|bring|pull|copy|download)\s+(?:me\s+)?"
     r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
     r"(?:\s+file)?\s+(?:from|off(?:\s+of)?|out\s+of)\s+" + _HPC +
     r"(?:(?:'s)?\s+(?P<where>outbox|desktop|downloads))?\W*$", re.I)
@@ -4895,9 +4913,11 @@ _REMOTE_FREEFORM_RX = re.compile(
 # "remind me to run the backup on the HP". The last is worse than noise --
 # it is a reminder he asked for and did not get. Same rule _SEND_NOT_RX
 # applies to the mail lane, stated as an anchor rather than a veto list.
+# The openers it steps over are _REMOTE_OPENER -- the SAME string the four
+# answering doors accept (F09), so an opener can never again carry a
+# transfer past its door and into this refusal.
 _REMOTE_ORDER_RX = re.compile(
-    r"^(?:(?:please|just|go\s+ahead\s+and|can\s+you|could\s+you|"
-    r"would\s+you|will\s+you)[,\s]+)*"
+    _REMOTE_OPENER +
     r"(?:run|start|stop|restart|reboot|shut\s*down|kill|delete|remove|rm\b|"
     r"install|update|upgrade|build|make|compile|deploy|launch|open|execute|"
     r"format|wipe|clear|empty|move|rename|chmod|sudo)\b", re.I)
@@ -4957,33 +4977,109 @@ def _remote_blocked(c, conf):
                          status=f"{conf.name}: not set up")
 
 
-def _remote_fail(conf, reason: str, status: str = ""):
+def _remote_fail(conf, reason: str, status: str = "", err: str = ""):
+    """``err`` is the far side's stderr, which only the wrong-os line reads
+    -- to name the command it did not recognise (F07)."""
     return CommandResult(handled=True, speak=True,
-                         reply=remote_mod.fail_line(conf, reason),
+                         reply=remote_mod.fail_line(conf, reason, err),
                          status=status or f"{conf.name}: {reason}")
 
 
+def _remote_deliver(c, res):
+    """A worker's outcome, through the app's own door.
+
+    The send lane's F20 lesson, kept by name: ``services.reply``
+    (JarvisApp._async_reply) shows, speaks, CLOSES the done=False turn and
+    arms the follow-up window -- the long one when a question was parked,
+    since _start_followup asks question_open() -- exactly as a brain reply
+    does. bus + _speak_now do the first two only, so after the outcome the
+    wake word stayed dead until the 60 s watchdog. The fallback keeps
+    _speak_now (the not-proactive door) rather than the talk-back-gated
+    _speak: this line is the direct consequence of something he just asked.
+    """
+    if res is None:
+        res = CommandResult(handled=True)
+    if res.status:
+        bus.publish(Status(text=res.status, kind="info"))
+    line = res.reply or ""
+    reply = c._svc("reply")
+    if callable(reply):
+        try:
+            reply(line, speak=bool(line and res.speak))
+            return
+        except Exception:
+            log.exception("services.reply failed")
+    if line:
+        bus.publish(JarvisReply(text=line, speak=False))
+        if res.speak:
+            c._speak_now(line)
+
+
+def _remote_async(c, conf, work, status: str, ack: Optional[str] = None):
+    """Run ``work`` -- anything that opens a socket -- OFF the voice turn,
+    and hand the turn back at once.
+
+    F10 (2026-09-03). A confirmed push ran remote.push inline from
+    _try_destructive_confirm (``pend[0]()``) on the _process_audio thread
+    with app._audio_busy set, for up to transfer_timeout_s (120 s default,
+    900 s clamp); the status, query and pull doors each held the turn for a
+    full ssh budget (12 s) the same way. app.py gates wake and recording on
+    that flag, so for the whole of it Jarvis was silent and deaf: no "stop",
+    no "never mind", no wake word, and a sleeping host that drops packets
+    costs the entire budget. The Oracle lane this family says it copies
+    hands its round trip to c._bg and returns done=False; the send lane
+    does the same and speaks "Sending it now". ``work`` returns the
+    CommandResult it would have returned on the turn -- a line, a failure,
+    or a QUESTION it has already parked (stash_destructive/stash_filepick
+    read _turn_source, which is the source of the turn that started this
+    worker) -- and _remote_deliver puts it through the app's door.
+
+    ``ack`` is spoken for a transfer, which takes long enough to deserve
+    one; a question gets a busy status only, as the Oracle's does, because
+    "let me look" before every one-second answer is chatter.
+    """
+    def _run():
+        try:
+            res = work()
+        except Exception:                          # noqa: BLE001 - worker
+            log.exception("remote: %s failed off the turn", status)
+            res = _remote_fail(conf, "failed")
+        _remote_deliver(c, res)
+
+    c._bg(_run)
+    return CommandResult(handled=True, reply=ack, speak=bool(ack), ack=True,
+                         done=False, status=status)
+
+
 def _h_remote_status(c, t, m):
-    """Is it there? Answered from the LOCAL tailnet view first, so a machine
-    that is off or has never joined costs no socket and no wait -- and gets
-    a different sentence from one that is merely slow. Those three are not
-    the same problem and he should not have to guess which he has."""
+    """Is it there? For a TAILNET address, answered from the local tailnet
+    view first, so a machine that is off or has never joined costs no
+    socket and no wait -- and gets a different sentence from one that is
+    merely slow. Those three are not the same problem and he should not
+    have to guess which he has. For a LAN address (the real HPCOMPUTER,
+    192.168.50.114 -- F08) the tailnet knows nothing, and asking it made
+    "is HPCOMPUTER up" answer "isn't on the tailnet" without trying ssh."""
     conf = _remote_conf(c)
     blocked = _remote_blocked(c, conf)
     if blocked is not None:
         return blocked
-    state = remote_mod.tailnet_state(conf)
-    if state == "absent":
-        return _remote_fail(conf, "off-tailnet", f"{conf.name}: absent")
-    if state == "offline":
-        return _remote_fail(conf, "asleep", f"{conf.name}: asleep")
-    res = remote_mod.ask(conf, "up")
-    if not res.ok:
-        return _remote_fail(conf, res.reason)
-    up = " ".join((res.out or "").split())[:120]
-    line = f"{conf.name} is up, sir" + (f" -- {up}." if up else ".")
-    return CommandResult(handled=True, reply=line, speak=True,
-                         status=f"{conf.name}: up")
+
+    def _look():
+        state = (remote_mod.tailnet_state(conf)
+                 if remote_mod.tailnet_host(conf) else "unknown")
+        if state == "absent":
+            return _remote_fail(conf, "off-tailnet", f"{conf.name}: absent")
+        if state == "offline":
+            return _remote_fail(conf, "asleep", f"{conf.name}: asleep")
+        res = remote_mod.ask(conf, "up")
+        if not res.ok:
+            return _remote_fail(conf, res.reason, err=res.err)
+        up = " ".join((res.out or "").split())[:120]
+        line = f"{conf.name} is up, sir" + (f" -- {up}." if up else ".")
+        return CommandResult(handled=True, reply=line, speak=True,
+                             status=f"{conf.name}: up")
+
+    return _remote_async(c, conf, _look, f"{conf.name}: asking…")
 
 
 def _h_remote_query(c, t, m):
@@ -4997,17 +5093,22 @@ def _h_remote_query(c, t, m):
     key = _QUERY_KEYS.get(said)
     if not key:
         return None
-    res = remote_mod.ask(conf, key)
-    if not res.ok:
-        return _remote_fail(conf, res.reason)
-    body = " ".join((res.out or "").split())[:200]
-    if not body:
+
+    def _ask():
+        res = remote_mod.ask(conf, key)
+        if not res.ok:
+            return _remote_fail(conf, res.reason, err=res.err)
+        body = " ".join((res.out or "").split())[:200]
+        if not body:
+            return CommandResult(handled=True, speak=True,
+                                 status=f"{conf.name}: nothing",
+                                 reply="Nothing to report there, sir.")
+        say = remote_mod.query_say(conf, key)
         return CommandResult(handled=True, speak=True,
-                             status=f"{conf.name}: nothing",
-                             reply="Nothing to report there, sir.")
-    say = remote_mod.QUERIES[key]["say"]
-    return CommandResult(handled=True, speak=True, status=f"{conf.name}: {key}",
-                         reply=f"On {conf.name}, {say}: {body}.")
+                             status=f"{conf.name}: {key}",
+                             reply=f"On {conf.name}, {say}: {body}.")
+
+    return _remote_async(c, conf, _ask, f"{conf.name}: asking…")
 
 
 def _remote_ask_which(c, conf, names, resume):
@@ -5045,13 +5146,18 @@ def _h_remote_push(c, t, m):
             return _remote_fail(conf, "odd-name", "Bad name")
         question = f"Send {path.name} to {conf.name}'s inbox, sir?"
 
-        def _run():
+        def _copy():
             res = remote_mod.push(conf, path)
             if not res.ok:
-                return _remote_fail(conf, res.reason)
+                return _remote_fail(conf, res.reason, err=res.err)
             return CommandResult(handled=True, speak=True,
                                  status=f"Sent to {conf.name}",
                                  reply=f"{path.name} is on {conf.name}, sir.")
+
+        def _run():
+            # The yes runs this; the copy itself is off the turn (F10).
+            return _remote_async(c, conf, _copy, f"Sending {path.name}",
+                                 ack="Sending it now, sir.")
 
         c.stash_destructive(_run, question, strict=True)
         return CommandResult(handled=True, reply=question, speak=True,
@@ -5086,26 +5192,23 @@ def _h_remote_pull(c, t, m):
         return blocked
     said = (m.group("what") or "").strip()
     key = (m.group("where") or "outbox").lower()
-    names, why = remote_mod.list_remote(conf, key)
-    if why:
-        return _remote_fail(conf, why)
-    if not names:
-        return CommandResult(handled=True, speak=True, status="Empty",
-                             reply=f"There's nothing in {conf.name}'s "
-                                   f"{key}, sir.")
 
     def _armed(name: str):
         dest = remote_mod.pull_target(conf, name)
         question = (f"Bring {name} from {conf.name} to your "
                     f"{dest.parent.name}, sir?")
 
-        def _run():
+        def _copy():
             res = remote_mod.pull(conf, key, name)
             if not res.ok:
-                return _remote_fail(conf, res.reason)
+                return _remote_fail(conf, res.reason, err=res.err)
             return CommandResult(handled=True, speak=True, status="Fetched",
                                  reply=f"{name} is on your "
                                        f"{dest.parent.name}, sir.")
+
+        def _run():
+            return _remote_async(c, conf, _copy, f"Fetching {name}",
+                                 ack="Fetching it now, sir.")
 
         # STRICT, for the same reason the push is: this one lands a
         # stranger's file on HIS disk and can overwrite nothing, but it is
@@ -5114,16 +5217,31 @@ def _h_remote_pull(c, t, m):
         return CommandResult(handled=True, reply=question, speak=True,
                              status="Confirm?")
 
-    pick = remote_mod.match_remote(said, names)
-    if pick.ambiguous:
-        return _remote_ask_which(
-            c, conf, pick.candidates,
-            lambda path: _armed(Path(path).name))
-    if not pick.ok:
-        return CommandResult(handled=True, speak=True, status="No such file",
-                             reply=f"I can't see anything by that name in "
-                                   f"{conf.name}'s {key}, sir.")
-    return _armed(pick.path.name)
+    def _look():
+        # The listing is a round trip, so it is off the turn too (F10);
+        # what it ends in -- the read-back, "Which one?", or a line -- is
+        # parked and spoken from here, and the answer's own turn needs no
+        # socket at all.
+        names, why = remote_mod.list_remote(conf, key)
+        if why:
+            return _remote_fail(conf, why)
+        if not names:
+            return CommandResult(handled=True, speak=True, status="Empty",
+                                 reply=f"There's nothing in {conf.name}'s "
+                                       f"{key}, sir.")
+        pick = remote_mod.match_remote(said, names)
+        if pick.ambiguous:
+            return _remote_ask_which(
+                c, conf, pick.candidates,
+                lambda path: _armed(Path(path).name))
+        if not pick.ok:
+            return CommandResult(handled=True, speak=True,
+                                 status="No such file",
+                                 reply=f"I can't see anything by that name "
+                                       f"in {conf.name}'s {key}, sir.")
+        return _armed(pick.path.name)
+
+    return _remote_async(c, conf, _look, f"{conf.name}: looking…")
 
 
 def _h_remote_freeform(c, t, m):

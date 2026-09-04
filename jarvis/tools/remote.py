@@ -1,32 +1,48 @@
 """HPCOMPUTER -- files both ways and a SHORT allow-list of read-only questions.
 
-GROUND TRUTH, measured on the Spark 2026-09-02, before a line of this was
-written.  It is written down because every one of these facts changed the
-design, and a future reader who assumes otherwise will build the wrong thing:
+GROUND TRUTH, re-measured on the Spark 2026-09-03.  The 09-02 block this
+replaces said ``hpcomputer.local`` was a stale mDNS record, the host
+answered nothing and no key existed -- true that night, none of it now,
+and the design that followed from it (tailnet name + SOCKS proxy, a POSIX
+shell on the far side) targeted the wrong link.  Written down because every
+one of these facts changed the design, and a future reader who assumes
+otherwise will build the wrong thing:
 
-* **HPCOMPUTER is not on the tailnet.**  ``tailscale status`` has exactly
-  two nodes -- ``spark`` (this box, 100.70.145.63) and ``iphone172`` (iOS,
-  offline two days).  There is no HPCOMPUTER peer.
-* **HPCOMPUTER is not reachable at all right now.**  ``hpcomputer.local``
-  still resolves on the LAN, to 192.168.50.114, but that is a stale mDNS
-  record: the host answers no ping and has nothing listening on 22, 3389,
-  445 or 5900.  It is asleep or off.
-* **There is no ssh key for it.**  ``~/.ssh`` holds ``known_hosts`` and the
-  Oracle key, nothing else.  Key auth to HPCOMPUTER cannot work yet.
-* **tailscaled here runs in USERSPACE mode** (``--tun=userspace-networking``,
-  ``"TUN": false``), as a rootless user unit.  This is the fact that would
-  otherwise cost an afternoon: there is NO tun device, so once HPCOMPUTER
-  does join the tailnet, ``ssh user@hpcomputer.tail5323b8.ts.net`` will
-  still not route.  Tailscale traffic has to go through the SOCKS5 proxy
-  the daemon already runs on ``localhost:1055``, which is why
-  :func:`ssh_argv` grows a ``ProxyCommand``.  ``nc -X 5 -x`` is present and
-  supports SOCKS5; ssh, scp, sftp and rsync are all installed.
+* **HPCOMPUTER is a Windows box on the LAN, not a tailnet peer.**
+  ``hpcomputer.local`` resolves to 192.168.50.114 (``getent hosts``) and
+  there is a live ARP entry for it (60:cf:84:ad:fd:91).  ``tailscale
+  status`` has two nodes -- ``spark`` (100.70.145.63) and ``iphone172``
+  (offline) -- and no HPCOMPUTER, nor a plan for one.  So the tailnet view
+  and the SOCKS proxy apply to a tailnet ADDRESS only
+  (:func:`tailnet_host`); a LAN host gets ssh's own answer.
+* **Its ssh is Windows OpenSSH Server** (``Add-WindowsCapability
+  OpenSSH.Server``, staged and waiting on a reboot as of the 09-03
+  checklist; user ``h2pey``).  Its login shell is cmd.exe or PowerShell:
+  there is no ``ls``, ``df``, ``uptime`` or ``$HOME`` there.  Hence
+  ``remote.os`` (windows shipped), a question table with a command per OS
+  (:data:`QUERIES`), and the Windows folder listing over SFTP -- the
+  channel scp already speaks -- rather than a remote shell.  Port 22 has
+  NOT been probed from here (no network, by instruction), and the Windows
+  rows have not been run: the first live command is Hunter's.
+* **The key is ``~/.ssh/hpcomputer``** (ed25519, generated 09-03 00:44; its
+  public half belongs in ``C:\\ProgramData\\ssh\\administrators_authorized_keys``
+  because his account is an administrator).  ``~/.ssh`` holds NO
+  default-named identity, so a blank ``remote.key_path`` offers ssh nothing
+  and is refused before a socket opens ("no-key").
+* **tailscaled here runs in USERSPACE mode** (``--tun=userspace-networking
+  --socks5-server=localhost:1055``, a rootless user unit whose socket is
+  ``~/.local/share/tailscale/tailscaled.sock``).  There is NO tun device,
+  so a tailnet name routes only through that SOCKS5 port, which is why
+  :func:`ssh_argv` grows a ``ProxyCommand`` for a tailnet address.  ``nc
+  -X 5 -x`` is present; ssh, scp and sftp are OpenSSH 9.6p1.
 
 So this module ships ``enabled: false`` and every entry point refuses out
 loud with a reason that names what is missing.  Nothing here has been run
 against the real host -- by instruction, Hunter runs the first live command
 himself.  What IS tested is every decision this module makes before the
-socket opens, which is where the irreversible mistakes live.
+socket opens, which is where the irreversible mistakes live -- and, for
+the Windows side, the reading of sftp's batch output as measured locally
+(``sftp -D`` straight to this box's sftp-server; no socket).
 
 ------------------------------------------------------------------- safety
 
@@ -66,9 +82,9 @@ Two more rules that are less obvious and matter as much:
   quoted around -- a file with a newline or a backtick in its name is not
   worth the class of bug it invites.
 
-``run_ssh`` and ``run_copy`` are the two module-level seams, looked up at
-call time, so tests replace them and no test in this repo can reach a
-network, a host key or a disk it did not make.
+``run_ssh``, ``run_copy`` and ``run_sftp`` are the three module-level
+seams, looked up at call time, so tests replace them and no test in this
+repo can reach a network, a host key or a disk it did not make.
 """
 from __future__ import annotations
 
@@ -88,6 +104,7 @@ log = get_logger("tools.remote")
 
 SSH_BIN = "ssh"
 SCP_BIN = "scp"
+SFTP_BIN = "sftp"
 NC_BIN = "nc"
 TAILSCALE_BIN = os.path.expanduser("~/.local/bin/tailscale")
 # The rootless daemon's socket.  The CLI defaults to /var/run/tailscale,
@@ -177,6 +194,10 @@ class RemoteConfig:
     user: str = ""
     key_path: str = ""
     name: str = "HPCOMPUTER"
+    # "windows" | "posix": which far side the read side talks to.  Windows
+    # is shipped because that is what HPCOMPUTER is (F07); it decides the
+    # question table, and whether a listing is a shell `ls` or SFTP.
+    os: str = "windows"
     timeout_s: float = DEFAULT_TIMEOUT_S
     transfer_timeout_s: float = DEFAULT_TRANSFER_S
     socks_proxy: str = "127.0.0.1:1055"
@@ -214,6 +235,21 @@ def _cfg_get(cfg, dotted: str, default=None):
     return default if val is None else val
 
 
+_POSIX_WORDS = ("posix", "linux", "unix", "mac", "macos", "darwin", "bsd")
+
+
+def _norm_os(value) -> str:
+    """Two words and no third.  Anything that is not plainly POSIX is
+    windows, the shipped default -- a typo must not silently switch the
+    lane onto a shell that is not there."""
+    word = str(value or "").strip().lower()
+    if word in _POSIX_WORDS:
+        return "posix"
+    if word and word not in ("windows", "win", "win32", "nt"):
+        log.warning("remote.os %r is not windows|posix; using windows", word)
+    return "windows"
+
+
 def read_config(cfg) -> RemoteConfig:
     """The ``remote`` section, defensively.  A malformed config must leave the
     lane OFF, never half-configured: a present host with a missing user is
@@ -229,6 +265,7 @@ def read_config(cfg) -> RemoteConfig:
         user=str(_cfg_get(cfg, "remote.user", "") or "").strip(),
         key_path=str(_cfg_get(cfg, "remote.key_path", "") or "").strip(),
         name=str(_cfg_get(cfg, "remote.name", "") or "").strip() or "HPCOMPUTER",
+        os=_norm_os(_cfg_get(cfg, "remote.os", "")),
         timeout_s=_clamp(_cfg_get(cfg, "remote.timeout_s", None),
                          MIN_TIMEOUT_S, MAX_TIMEOUT_S, DEFAULT_TIMEOUT_S),
         transfer_timeout_s=_clamp(
@@ -267,7 +304,15 @@ def missing_reason(conf: RemoteConfig) -> str:
         return "no-host"
     if not conf.user:
         return "no-user"
-    if conf.key_path and not key_file(conf):
+    # A BLANK key is a refusal, not "ready" (F11, 2026-09-03).  The shipped
+    # default is "", and with IdentitiesOnly=yes and no -i, ssh offers only
+    # the default-named identities -- of which ~/.ssh here has none
+    # (measured: no id_rsa/id_ecdsa/id_ed25519; the key is ~/.ssh/hpcomputer).
+    # So a blank line in his settings opened a socket and came back as
+    # "HPCOMPUTER turned my key away, sir", blaming the far side.
+    if not conf.key_path:
+        return "no-key"
+    if not key_file(conf):
         return "bad-key"
     return ""
 
@@ -276,10 +321,12 @@ def missing_reason(conf: RemoteConfig) -> str:
 FAIL_LINES = {
     "disabled": "{name} isn't set up in my settings yet, sir; "
                 f"remote.enabled is false in {CONFIG_HINT}.",
-    "no-host": "I've no address for {name}, sir -- it isn't on the tailnet "
-               "yet, and remote.host is empty.",
+    "no-host": "I've no address for {name}, sir; remote.host is empty in "
+               f"{CONFIG_HINT}.",
     "no-user": "I don't know which account to use on {name}, sir; "
                "remote.user is empty.",
+    "no-key": "I've no key for {name}, sir; remote.key_path is empty in "
+              f"{CONFIG_HINT}.",
     "bad-key": "The key I'm meant to use for {name} isn't where my settings "
                "say it is, sir.",
     "no-ssh": "I've no ssh on this machine, sir.",
@@ -303,6 +350,13 @@ FAIL_LINES = {
                 "sir; rename it and I'll send it.",
     "exists": "There's already a file by that name where I'd put it, sir; "
               "I've left yours alone.",
+    # The far side's OWN shell said it does not know the command (F07): a
+    # POSIX row sent to cmd.exe, or a Windows row sent to sh.  That is a
+    # remote.os problem on this side, and it names the command so he can
+    # tell which -- the generic line hid this behind "wouldn't answer".
+    "wrong-os": "{name} doesn't know that command, sir{missing}. I asked it "
+                "the way I'd ask a {os_word} box; remote.os in "
+                f"{CONFIG_HINT} is probably wrong.",
     "failed": "{name} wouldn't answer that, sir.",
 }
 
@@ -313,14 +367,45 @@ FREEFORM_REFUSAL = (
     "them, and answer a short list of questions about it -- but not that.")
 
 
-def fail_line(conf: RemoteConfig, reason: str) -> str:
+# The command a shell did not recognise, in the three wordings that matter:
+# cmd.exe ("'ls' is not recognized ..."), dash ("sh: 1: powershell: not
+# found"), bash ("bash: powershell: command not found").
+_MISSING_CMD_RX = re.compile(
+    r"'([^'\r\n]+)' is not recognized|"
+    r"(?:^|\n)(?:\w+: (?:\d+: )?)?(\S+): (?:command )?not found", re.I)
+
+
+def missing_command(err: str) -> str:
+    """The command name out of a wrong-os stderr, or "" when the text does
+    not carry one ("The system cannot find the path specified.")."""
+    m = _MISSING_CMD_RX.search(err or "")
+    if not m:
+        return ""
+    return next((g for g in m.groups() if g), "")
+
+
+def fail_line(conf: RemoteConfig, reason: str, err: str = "") -> str:
+    """The spoken line for a reason.  ``err`` is the stderr it came from,
+    used only by the wrong-os line to name the command (F07)."""
     line = FAIL_LINES.get(reason) or FAIL_LINES["failed"]
-    return line.format(name=conf.name, timeout=int(conf.timeout_s))
+    cmd = missing_command(err) if reason == "wrong-os" else ""
+    return line.format(name=conf.name, timeout=int(conf.timeout_s),
+                       missing=f" -- it has no {cmd}" if cmd else "",
+                       os_word="Windows" if conf.os == "windows" else "Linux")
 
 
 _HOSTKEY_RX = re.compile(
     r"host key.*(changed|verification failed)|REMOTE HOST IDENTIFICATION",
     re.I)
+# What the far side's shell says to a command that is not there.  cmd.exe
+# says the first for `ls`, and the second for the `2>/dev/null` in a POSIX
+# row (it reads it as a redirect into a path that does not exist); dash and
+# bash say the last two to `powershell`.  Any of them means the table was
+# built for the wrong OS -- remote.os, not the host, is what to look at.
+_WRONG_OS_RX = re.compile(
+    r"is not recognized as an internal or external command|"
+    r"the system cannot find the path specified|"
+    r"command not found|sh: \d+: \S+: not found", re.I)
 _AUTH_RX = re.compile(
     r"permission denied|too many authentication|no supported authentication|"
     r"publickey.*denied|authentication failed", re.I)
@@ -331,19 +416,26 @@ _REACH_RX = re.compile(
 _SPACE_RX = re.compile(r"no space left|disk quota exceeded", re.I)
 _DENIED_RX = re.compile(r"permission denied.*(writ|creat)|read-only file system",
                         re.I)
-_MISSING_RX = re.compile(r"no such file or directory|not a directory", re.I)
+# The third wording is sftp's, for a folder that is not there -- measured
+# 2026-09-03 with `sftp -b -`: `Can't ls: "x" not found` on stderr, rc 1.
+_MISSING_RX = re.compile(
+    r"no such file or directory|not a directory|can't ls: .* not found", re.I)
 
 
 def classify_error(err: str) -> str:
-    """ssh/scp stderr in one word.  Order matters, and each rung is a real
-    confusion this avoids: a changed host key ALSO prints "Permission
+    """ssh/scp/sftp stderr in one word.  Order matters, and each rung is a
+    real confusion this avoids: a changed host key ALSO prints "Permission
     denied" further down and is the one thing he must look at himself; a
+    shell that does not know the command is a remote.os mistake on THIS
+    side and must not be filed under any of the far side's failures; a
     full remote disk and a refused write both look like a generic failure
     but need different sentences; and "no such file" during a pull is a
     misremembered name, not a broken link."""
     text = err or ""
     if _HOSTKEY_RX.search(text):
         return "hostkey"
+    if _WRONG_OS_RX.search(text):
+        return "wrong-os"
     if _SPACE_RX.search(text):
         return "no-space"
     if _DENIED_RX.search(text):
@@ -366,6 +458,35 @@ class SshResult:
 
 
 # ------------------------------------------------------------- transport
+_TAILNET_IP_RX = re.compile(r"^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$")
+
+
+def tailnet_host(conf: RemoteConfig) -> bool:
+    """Is ``remote.host`` a TAILNET address -- the only kind the tailnet
+    view and the SOCKS proxy have anything to say about?
+
+    F08 (2026-09-03).  HPCOMPUTER is reached over the LAN (192.168.50.114 /
+    hpcomputer.local; it has no Tailscale peer), and every door asked the
+    tailnet about it anyway: the host's first label ("192", "hpcomputer")
+    is not a peer, so ``tailnet_state`` said "absent" and the spoken line
+    was "isn't on the tailnet, sir -- I can't see it at all" -- without a
+    socket ever opening, and with a real unreachable/timeout (the box
+    asleep) rewritten into the same wrong sentence.
+
+    A tailnet address is a MagicDNS name (``*.ts.net``), an address in the
+    CGNAT block Tailscale hands out (100.64/10), or a bare single label
+    WITH the proxy configured -- that is the MagicDNS short name, and the
+    proxy is the only way this box reaches MagicDNS.  A bare label with no
+    proxy is the router's name for a LAN box, and ``.local`` is mDNS.
+    """
+    host = (conf.host or "").strip().lower()
+    if not host:
+        return False
+    if host.endswith(".ts.net") or _TAILNET_IP_RX.match(host):
+        return True
+    return "." not in host and bool(conf.socks_proxy)
+
+
 def proxy_args(conf: RemoteConfig) -> list:
     """The ``ProxyCommand`` that makes the tailnet reachable from a
     USERSPACE tailscaled.
@@ -374,10 +495,13 @@ def proxy_args(conf: RemoteConfig) -> list:
     ssh to a tailnet name fails with "Network is unreachable" no matter how
     healthy the tailnet is.  The daemon's SOCKS5 port is the supported way
     through, and ``nc -X 5 -x`` speaks it.  Empty when ``socks_proxy`` is
-    blank, which is the right configuration the day he gives this box a real
-    tun device or reaches the host over plain LAN.
+    blank (the day this box gets a real tun device) and -- F08 -- for any
+    host that is not a tailnet address: the proxy is tailscaled's way to
+    the TAILNET, whether it forwards to a LAN IP at all is unverified, and
+    his own verified line is a direct ``ssh h2pey@192.168.50.114``.  So the
+    shipped proxy default no longer has to be blanked for the LAN box.
     """
-    if not conf.socks_proxy:
+    if not conf.socks_proxy or not tailnet_host(conf):
         return []
     return ["-o", f"ProxyCommand={NC_BIN} -X 5 -x "
                   f"{shlex.quote(conf.socks_proxy)} %h %p"]
@@ -553,7 +677,12 @@ def tailnet_state(conf: RemoteConfig) -> str:
 
 def unreachable_reason(conf: RemoteConfig) -> str:
     """Turn a failed round trip into the MOST specific reason available, by
-    asking the tailnet what it thinks.  "" when nothing better is known."""
+    asking the tailnet what it thinks.  "" when nothing better is known --
+    and always "" for a LAN address (F08), where the tailnet knows nothing
+    and "absent" would be a confident wrong answer; the ssh result
+    ("unreachable", "timeout") is then the honest one."""
+    if not tailnet_host(conf):
+        return ""
     state = tailnet_state(conf)
     if state == "absent":
         return "off-tailnet"
@@ -563,30 +692,71 @@ def unreachable_reason(conf: RemoteConfig) -> str:
 
 
 # ---------------------------------------------------- tier 1: questions
-# Named, parameterless, READ-ONLY commands.  A spoken phrase selects a row;
-# the row's `cmd` is what runs.  Nothing from a transcript is interpolated,
-# which is why this tier needs no confirmation: the worst a misheard word
-# can do is run a different question from this table, or none.
+# Named, parameterless, READ-ONLY commands, one per OS.  A spoken phrase
+# selects a row; the row's command for ``conf.os`` is what runs.  Nothing
+# from a transcript is interpolated, which is why this tier needs no
+# confirmation: the worst a misheard word can do is run a different
+# question from this table, or none.
+#
+# The Windows column (F07, 2026-09-03).  HPCOMPUTER runs the built-in
+# OpenSSH Server, whose login shell is cmd.exe unless the DefaultShell
+# registry value says PowerShell, and the POSIX rows came back from it as
+# "'uptime' is not recognized as an internal or external command".  Every
+# Windows row is one ``powershell -Command "<expression>"``, chosen for ONE
+# property: no ``$``, no backtick, no nested quote, one double-quoted
+# argument.  That is the quoting that both cmd.exe and PowerShell hand to
+# powershell.exe unchanged -- a ``$var`` would be interpolated by an outer
+# PowerShell before it ever ran, and a nested quote is parsed differently
+# by the two.  ``net``/``wmic``/``quser`` were passed over: wmic is gone
+# from Windows 11 24H2 and quser is absent on Home editions.
+#
+# MEASURED here: the POSIX rows (this box) and sftp's batch format.  NOT
+# measured: the Windows rows against HPCOMPUTER -- by instruction the first
+# live command is Hunter's, and until then they are a reading of the
+# PowerShell docs, not a result.  The wrong-os rung is what he hears if the
+# reading was wrong.
+_PS = "powershell -NoProfile -NonInteractive -Command "
 QUERIES = {
-    "up": {"cmd": "uptime -p 2>/dev/null || uptime",
-           "say": "how long it's been up"},
-    "disk": {"cmd": "df -Ph / | tail -1", "say": "how the disk looks"},
-    "load": {"cmd": "cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3",
-             "say": "what the load is"},
-    "who": {"cmd": "who 2>/dev/null | head -5", "say": "who's logged in"},
-    "inbox": {"cmd": "", "say": "what's in the inbox"},   # built from config
+    "up": {"posix": "uptime -p 2>/dev/null || uptime",
+           "windows": _PS + '"(Get-CimInstance Win32_OperatingSystem).LastBootUpTime"',
+           "say": "how long it's been up", "say_windows": "up since"},
+    "disk": {"posix": "df -Ph / | tail -1",
+             "windows": _PS + '"[math]::Round((Get-PSDrive C).Free/1GB)"',
+             "say": "how the disk looks",
+             "say_windows": "free space on C, in gigabytes"},
+    "load": {"posix": "cat /proc/loadavg 2>/dev/null | cut -d' ' -f1-3",
+             "windows": _PS + '"(Get-CimInstance Win32_Processor).LoadPercentage"',
+             "say": "what the load is", "say_windows": "the CPU load, in percent"},
+    "who": {"posix": "who 2>/dev/null | head -5",
+            "windows": _PS + '"(Get-CimInstance Win32_ComputerSystem).UserName"',
+            "say": "who's logged in"},
+    # Built from config on POSIX (query_command); listed over SFTP on
+    # Windows (ask), where there is no shell to build it for.
+    "inbox": {"posix": "", "windows": "", "say": "what's in the inbox"},
 }
 
 
 def query_command(conf: RemoteConfig, key: str) -> str:
-    """The command for a QUERIES row.  "inbox" is the one row whose command
-    depends on config rather than being a constant -- built here through
-    :func:`shell_path` (quoted, but with a leading tilde left for the remote
-    shell to expand), never from anything spoken."""
-    if key == "inbox":
-        return f"ls -1p -- {shell_path(conf.inbox)} 2>/dev/null | head -40"
+    """The command for a QUERIES row on ``conf.os``.  "inbox" is the one row
+    whose POSIX command depends on config rather than being a constant --
+    built here through :func:`shell_path` (quoted, but with a leading tilde
+    left for the remote shell to expand), never from anything spoken.  On
+    Windows it is "" on purpose: :func:`ask` lists the inbox over SFTP."""
     row = QUERIES.get(key)
-    return row["cmd"] if row else ""
+    if not row:
+        return ""
+    if key == "inbox":
+        if conf.os == "windows":
+            return ""
+        return f"ls -1p -- {shell_path(conf.inbox)} 2>/dev/null | head -40"
+    return row.get(conf.os) or ""
+
+
+def query_say(conf: RemoteConfig, key: str) -> str:
+    """How the answer is introduced -- per OS where the output differs in
+    kind (a boot TIME on Windows, an uptime on POSIX)."""
+    row = QUERIES.get(key) or {}
+    return row.get(f"say_{conf.os}") or row.get("say") or ""
 
 
 def ask(conf: RemoteConfig, key: str) -> SshResult:
@@ -594,6 +764,9 @@ def ask(conf: RemoteConfig, key: str) -> SshResult:
     why = missing_reason(conf)
     if why:
         return SshResult(False, reason=why)
+    if key == "inbox" and conf.os == "windows":
+        names, why = list_remote(conf, "inbox")
+        return SshResult(not why, out="\n".join(names[:40]), reason=why)
     cmd = query_command(conf, key)
     if not cmd:
         return SshResult(False, reason="failed")
@@ -606,34 +779,142 @@ def ask(conf: RemoteConfig, key: str) -> SshResult:
 
 
 # ------------------------------------------------------------ tier 2: files
+def _remote_folder(conf: RemoteConfig, raw: str) -> str:
+    """A configured remote folder as the far side is addressed.  On Windows
+    a backslash becomes a slash: SFTP paths are slash-separated on every
+    server (Windows OpenSSH takes ``C:/Users/...``), scp speaks SFTP, and to
+    sftp's own tokenizer a backslash is an escape, not a separator."""
+    folder = (raw or "").strip()
+    if conf.os == "windows":
+        folder = folder.replace("\\", "/")
+    return folder
+
+
 def remote_dir(conf: RemoteConfig, key: str) -> str:
     """The configured remote folder for a spoken key, or "" if not allowed."""
     if key == "inbox":
-        return conf.inbox
-    return conf.pull_dirs.get(key, "")
+        return _remote_folder(conf, conf.inbox)
+    return _remote_folder(conf, conf.pull_dirs.get(key, ""))
+
+
+# ---- the SFTP listing (F07) ----
+# Windows OpenSSH has no `ls`, but it has the SFTP subsystem -- the same
+# one scp already speaks -- so a Windows folder is listed the way it is
+# copied from: no shell on the far side at all.  Format measured on this
+# box 2026-09-03 (`sftp -q -b - -D /usr/lib/openssh/sftp-server`, which
+# pipes straight to the local sftp-server; no socket):
+#
+#     sftp> ls -ln "jarvis-outbox"                          <- the echo
+#     -rw-rw-r--    ? hunterp  hunterp   1 Sep  3 12:21 jarvis-outbox/a.txt
+#     drwxrwxr-x    ? hunterp  hunterp 4096 Sep  3 12:21 jarvis-outbox/sub dir
+#
+# Batch mode echoes each command; a name comes back PATH-PREFIXED; the mode
+# column's first character tells a directory; dotfiles are absent without
+# -a; a missing folder is `Can't ls: "x" not found` on stderr with rc 1.
+# `-ln` rather than `-1` because -1 cannot tell a directory from a file, and
+# `-n` makes the long line the LOCAL sftp client's own ls_file() format
+# whatever the server sends, which is the format above.  A path is quoted
+# with double quotes for sftp's tokenizer; a folder that contains one is
+# refused rather than escaped, the rule this module applies to names.
+_SFTP_UNQUOTABLE_RX = re.compile(r'["\r\n]')
+_SFTP_LONG_FIELDS = 8              # mode links user group size mon day time
+
+
+def sftp_argv(conf: RemoteConfig, timeout_s: float = 0.0) -> list:
+    """``sftp -b -`` reads its commands from stdin, so the batch is Popen
+    input and never an argument; the same guards as ssh's."""
+    return ([SFTP_BIN, "-q", "-b", "-"]
+            + _common_opts(conf, timeout_s or conf.timeout_s)
+            + ["--", conf.target])
+
+
+def run_sftp(conf: RemoteConfig, batch: str,
+             timeout_s: float = 0.0) -> SshResult:
+    """THE SEAM for a listing.  One bounded SFTP session fed ``batch`` on
+    stdin; the same Popen + communicate(timeout) + kill-without-wait shape
+    as :func:`run_ssh`, for the same reason."""
+    budget = timeout_s or conf.timeout_s
+    argv = sftp_argv(conf, budget)
+    log.info("remote: sftp %s (%.0fs budget)", conf.name, budget)
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, errors="replace")
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("remote: sftp unavailable: %s", type(exc).__name__)
+        return SshResult(False, reason="no-ssh")
+    try:
+        out, err = proc.communicate(input=batch.rstrip("\n") + "\n",
+                                    timeout=budget)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        log.warning("remote: %s did not answer sftp in %.0fs; not waiting",
+                    conf.name, budget)
+        return SshResult(False, reason="timeout")
+    if proc.returncode != 0:
+        reason = classify_error(err)
+        log.warning("remote: sftp rc=%s (%s)", proc.returncode, reason)
+        return SshResult(False, out=out or "", err=err or "", reason=reason)
+    return SshResult(True, out=out or "", err=err or "")
+
+
+def sftp_listing(out: str) -> list:
+    """Filenames out of an ``ls -ln`` batch's stdout: the echo skipped,
+    directories dropped, the path prefix removed.  Names are NOT vetted
+    here -- :func:`list_remote` does that, the same for both listings."""
+    names = []
+    for raw in (out or "").splitlines()[:LISTING_CAP + 1]:
+        line = raw.rstrip()
+        if not line or line.startswith("sftp>") or line[0] == "d":
+            continue
+        fields = line.split(None, _SFTP_LONG_FIELDS)
+        if len(fields) <= _SFTP_LONG_FIELDS:
+            continue
+        names.append(fields[_SFTP_LONG_FIELDS].rsplit("/", 1)[-1])
+    return names
+
+
+def _list_sftp(conf: RemoteConfig, folder: str) -> SshResult:
+    path = scp_path(folder)
+    if _SFTP_UNQUOTABLE_RX.search(path):
+        log.warning("remote: refusing to list a folder I won't put in an "
+                    "sftp batch line")
+        return SshResult(False, reason="not-there")
+    return run_sftp(conf, f'ls -ln "{path}"')
 
 
 def list_remote(conf: RemoteConfig, key: str) -> tuple[list, str]:
     """Filenames in an allow-listed remote folder, and a failure reason.
 
-    ``ls -1p`` marks directories with a trailing slash so they can be
-    dropped without a second round trip.  Every surviving name must match
-    :data:`SAFE_REMOTE_NAME_RX`; anything else is DISCARDED rather than
-    escaped, and that is deliberate -- a name containing a quote or a
-    newline is not a file worth risking a quoting bug for.
+    POSIX: ``ls -1p`` marks directories with a trailing slash so they can
+    be dropped without a second round trip.  Windows: an SFTP ``ls -ln``,
+    read by :func:`sftp_listing` (F07 -- there is no ``ls`` there).  Either
+    way every surviving name must match :data:`SAFE_REMOTE_NAME_RX`;
+    anything else is DISCARDED rather than escaped, and that is deliberate
+    -- a name containing a quote or a newline is not a file worth risking
+    a quoting bug for.
     """
     folder = remote_dir(conf, key)
     if not folder:
         return [], "not-there"
-    res = run_ssh(conf, f"ls -1p -- {shell_path(folder)}")
+    if conf.os == "windows":
+        res = _list_sftp(conf, folder)
+    else:
+        res = run_ssh(conf, f"ls -1p -- {shell_path(folder)}")
     if not res.ok:
         reason = res.reason
         if reason in ("unreachable", "timeout"):
             reason = unreachable_reason(conf) or reason
         return [], reason
+    if conf.os == "windows":
+        listed = sftp_listing(res.out)
+    else:
+        listed = [raw.strip() for raw in (res.out or "").splitlines()]
     names = []
-    for raw in (res.out or "").splitlines()[:LISTING_CAP]:
-        line = raw.strip()
+    for line in listed[:LISTING_CAP]:
         if not line or line.endswith("/"):
             continue
         if SAFE_REMOTE_NAME_RX.match(line):
@@ -687,7 +968,7 @@ def inbox_target(conf: RemoteConfig, name: str) -> str:
     if not SAFE_REMOTE_NAME_RX.match(base):
         log.warning("remote: refusing to push a name I won't write remotely")
         return ""
-    return f"{scp_path(conf.inbox).rstrip('/')}/{base}"
+    return f"{scp_path(remote_dir(conf, 'inbox')).rstrip('/')}/{base}"
 
 
 def push(conf: RemoteConfig, local: Path) -> SshResult:
