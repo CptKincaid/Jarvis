@@ -443,9 +443,10 @@ _CLAIM_IDIOM_RX = re.compile(
 _CLAIM_REPORTED_RX = re.compile(r"(?:^|\s)(?:as|like|just as)\s*$", re.I)
 
 
-def _sentence_claim(sent):
-    """The action claim in ONE sentence, or None: a table hit that none of
-    the vetoes above disqualifies."""
+def _sentence_claim(sent, ran=(), backers=None, kinds=None):
+    """The unbacked action claim in ONE sentence, or None: a table hit
+    that none of the vetoes above disqualifies, no tool in ``ran`` backs
+    (claim_backed), and whose kind is in ``kinds`` (None: any kind)."""
     if _CLAIM_HEDGE_RX.search(sent or ""):
         return None
     for m in _ACTION_CLAIM_RX.finditer(sent or ""):
@@ -454,6 +455,10 @@ def _sentence_claim(sent):
         if _CLAIM_REPORTED_RX.search(sent[:m.start()]):
             continue
         if _CLAIM_IDIOM_RX.match(sent[m.end():]):
+            continue
+        if kinds is not None and claim_kind(m.group(0)) not in kinds:
+            continue
+        if claim_backed(m.group(0), ran, backers):
             continue
         return m.group(0)
     return None
@@ -466,20 +471,60 @@ def claim_kind(claim):
     return "memory" if _MEMORY_CLAIM_RX.match(claim or "") else "action"
 
 
-def unbacked_claim(text):
+# WHAT BACKS A CLAIM: claim kind -> the tool names whose run this turn
+# makes the claim a report rather than an invention. None means any tool
+# at all -- the original rule, "a turn that ran a tool is trusted". A
+# memory claim is backed by a tool that STORES A FACT, and no registry
+# tool does: the remember rung is the commander's, which the model cannot
+# call, and notes/add_event/set_reminder write somewhere the recall path
+# never reads. So "I have noted that you graduate December 10th" beside a
+# real get_time result was as unbacked as it is alone, and the any-tool
+# exemption spoke it (2026-09-04 refuter, probe h). When a fact-storing
+# tool lands, name it HERE and nowhere else.
+CLAIM_BACKERS = {
+    "memory": frozenset(),
+    "action": None,
+}
+
+
+def claim_backed(claim, ran=(), backers=None):
+    """Does a tool in ``ran`` (the names run this turn) back ``claim``?"""
+    table = CLAIM_BACKERS if backers is None else backers
+    names = table.get(claim_kind(claim))
+    if names is None:
+        return bool(ran)
+    return bool(names.intersection(ran))
+
+
+def unbacked_claim(text, ran=(), backers=None, kinds=None):
     """The first first-person action claim in ``text`` ("I've added ...",
-    "I'm starting ..."), else None. Pure; the caller decides whether a
-    tool backs it. Judged one sentence at a time, because both the
-    negation that cancels a claim and the idiom that was never one live
-    inside the sentence that carries them."""
+    "I'm starting ...") that no tool in ``ran`` backs, else None. Pure.
+    Judged one sentence at a time, because both the negation that cancels
+    a claim and the idiom that was never one live inside the sentence that
+    carries them. ``kinds`` narrows it to some claim kinds (claim_kind)."""
     for sent in split_sentences(text or ""):
-        claim = _sentence_claim(sent)
+        claim = _sentence_claim(sent, ran, backers, kinds)
         if claim:
             return claim
     return None
 
 
-def strip_unbacked_claims(text, n=None):
+# An utterance that asks for something to be STORED. The guard stands down
+# on a question because its retry executes; a memory claim can execute
+# nothing real (CLAIM_BACKERS: no tool stores a fact), so on a question
+# that also asks for a store -- "Tell me the time and put this in your
+# memory: ..." is a question by the router's `tell me` rule -- the guard
+# judges memory-shaped claims and only those. An action claim on the same
+# question stays the answer it is: the 2026-09-02 timer bug was a retry
+# writing what a question had only asked about.
+_MEMORY_REQUEST_RX = re.compile(
+    r"\b(?:remember|memory|memori[sz]e|keep (?:this |that |it )?in mind|"
+    r"bear (?:this |that |it )?in mind|make a note|note (?:that|this|down)|"
+    r"don['’]t forget|do not forget|never forget|jot (?:this |that |it )?down|"
+    r"write (?:this |that |it )?down|for the record)\b", re.I)
+
+
+def strip_unbacked_claims(text, n=None, ran=(), backers=None, kinds=None):
     """``text`` with every sentence that claims an action replaced by ONE
     UNBACKED_LINE, in the place of the first, the other sentences kept:
     the greeting survives, the invented actions do not. ``n`` is the
@@ -488,7 +533,7 @@ def strip_unbacked_claims(text, n=None):
     Unchanged text when nothing claims anything."""
     kept, said = [], False
     for sent in split_sentences(text):
-        if _sentence_claim(sent):
+        if _sentence_claim(sent, ran, backers, kinds):
             if not said:
                 kept.append(UNBACKED_LINE)
                 said = True
@@ -2980,21 +3025,36 @@ class JarvisBrain:
         # on; `plain_round` takes the retry off the stream, because the
         # first reply's honest sentences were already spoken and the
         # retry's words are either tool calls or discarded.
+        # A question that also asks for a store ("tell me the time and put
+        # this in your memory: ...") arms the guard for MEMORY claims only
+        # (_MEMORY_REQUEST_RX): the retry cannot store anything, so it
+        # cannot do the harm the question gate exists to prevent.
+        question = is_question(text)
+        memory_asked = bool(_MEMORY_REQUEST_RX.search(text or ""))
         unbacked_armed = (registry is not None and bool(tools)
-                          and not is_question(text))
+                          and (not question or memory_asked))
+        claim_kinds = {"memory"} if question else None
         unbacked_first = None
+        unbacked_ran_at = 0         # len(ran_results) when the retry was asked
         plain_round = False
+
+        def ran_names():
+            # the tools that ran this turn, forced path included: what a
+            # claim is judged against (CLAIM_BACKERS)
+            return [name for name, _ in ran_results]
 
         def guard(sentence):
             # The guards _finish_spoken applies to the whole reply, per
             # sentence: a streamed sentence is spoken before the reply
             # exists, so it must not carry an ungrounded clock claim or
             # a leaked context line the full reply would have lost.
-            if unbacked_armed and not tool_texts and unbacked_claim(sentence):
-                # Withheld, not spoken: with no tool run yet, "I'm starting
-                # your music now" is a claim the round has not earned. The
-                # whole reply is judged once the round ends -- the retry or
-                # UNBACKED_LINE speaks for this sentence, never the model.
+            if unbacked_armed and unbacked_claim(sentence, ran_names(),
+                                                 kinds=claim_kinds):
+                # Withheld, not spoken: with no backing tool run yet, "I'm
+                # starting your music now" is a claim the round has not
+                # earned. The whole reply is judged once the round ends --
+                # the retry or the authored line speaks for this sentence,
+                # never the model.
                 return ""
             line = clean_ollama_reply(strip_markdown(clean_ollama_reply(sentence)))
             guarded = guard_clock_claims(
@@ -3075,14 +3135,23 @@ class JarvisBrain:
                     calls = []
                 if not calls or registry is None:
                     final = content
-                    if unbacked_armed and not tool_texts:
-                        # ZERO tools ran this turn and the model is done
-                        # talking: did it claim to have done something?
-                        claim = unbacked_claim(final)
+                    if unbacked_armed:
+                        # The model is done talking: did it claim to have
+                        # done something no tool this turn backs? (For a
+                        # memory claim that is every tool there is today.)
+                        ran_now = ran_names()
+                        claim = unbacked_claim(final, ran_now, kinds=claim_kinds)
                         if claim and unbacked_first is None:
-                            log.warning("brain: unbacked action claim %r "
-                                        "(no tool ran)", claim)
+                            if ran_now:
+                                log.warning("brain: unbacked %s claim %r "
+                                            "(%s ran; nothing that ran "
+                                            "stores a fact)", claim_kind(claim),
+                                            claim, ", ".join(ran_now))
+                            else:
+                                log.warning("brain: unbacked action claim %r "
+                                            "(no tool ran)", claim)
                             unbacked_first = final
+                            unbacked_ran_at = len(ran_results)
                             messages.append({"role": "assistant",
                                              "content": content})
                             messages.append({"role": "user",
@@ -3093,17 +3162,23 @@ class JarvisBrain:
                             rounds_left = max(rounds_left, 1)
                             plain_round = True
                             continue
-                        if unbacked_first is not None:
-                            # The retry ran no tool either. Its words are
-                            # not trusted over the first reply's -- the
-                            # same model, the same nothing behind it -- so
-                            # the FIRST reply is what he hears, with the
-                            # claims taken out and the rest (the greeting)
-                            # left standing.
+                        if claim and unbacked_first is not None:
+                            # The retry claims again with nothing behind
+                            # it: the FIRST reply is what he hears, with
+                            # the claims taken out and the rest (the
+                            # greeting) left standing -- its honest
+                            # sentences are the ones already streamed.
+                            # Unless a tool DID run since the retry was
+                            # asked and this is its render round claiming
+                            # afresh: then the render is the reply, and
+                            # the first would drop the tool's answer.
                             log.warning("brain: unbacked action claim stands "
                                         "after the retry (no tool ran); "
                                         "replacing it")
-                            final = strip_unbacked_claims(unbacked_first, cap)
+                            source = (final if len(ran_results) > unbacked_ran_at
+                                      else unbacked_first)
+                            final = strip_unbacked_claims(source, cap,
+                                                          kinds=claim_kinds)
                             if on_sentence is not None and \
                                     not self._stale(gen):
                                 # the honest sentences were streamed as they
@@ -3114,6 +3189,43 @@ class JarvisBrain:
                                     on_sentence(UNBACKED_LINE)
                                 except Exception:
                                     log.exception("on_sentence failed")
+                        elif unbacked_first is not None:
+                            # A retry that claims nothing and ran no tool
+                            # is KEPT. This used to discard it for the
+                            # first reply's honest sentences, on the
+                            # reasoning that the retry's words came from
+                            # the same model with the same nothing behind
+                            # them. That reason no longer holds: the retry
+                            # is judged by the same table (a second lie
+                            # lands above), so a claim-free retry is the
+                            # model answering the nudge as written -- and
+                            # for a memory claim, where no tool exists to
+                            # make good on it, it is the ONLY path to an
+                            # honest sentence in the model's own words.
+                            # Discarding it threw away "I'm afraid I have
+                            # no way to store that, sir" for "I couldn't
+                            # do that part, sir." (2026-09-04 refuter,
+                            # probe b). On the stream the retry was a
+                            # plain round, so it is spoken here, after
+                            # what already went out, minus any sentence
+                            # that did.
+                            log.info("brain: the retry claims nothing; "
+                                     "speaking it")
+                            if not streaming and streamed_sentences and \
+                                    on_sentence is not None and \
+                                    not self._stale(gen):
+                                for sent in split_sentences(final):
+                                    if len(streamed_sentences) >= cap:
+                                        break
+                                    line = guard(sent)
+                                    if not line or line in streamed_sentences:
+                                        continue
+                                    streamed_sentences.append(line)
+                                    try:
+                                        on_sentence(line)
+                                    except Exception:
+                                        log.exception("on_sentence failed")
+                                final = " ".join(streamed_sentences)
                     if render_only and tool_texts and not (final or "").strip():
                         # the reserved round produced no words at all: say
                         # WHAT is in hand rather than only that something is

@@ -153,3 +153,150 @@ def test_the_authored_memory_line_is_not_itself_a_claim():
     'remember that' and 'I will'; a retry that echoes it must not trip
     the table it was written to answer."""
     assert brain_mod.unbacked_claim(brain_mod.UNBACKED_MEMORY_LINE) is None
+
+
+# ------------------------------------------- (2) what backs a memory claim
+# The guard's exemption was "any tool ran this turn". A memory claim is
+# backed by a tool that STORES A FACT, and no registry tool does (the
+# remember rung lives in the commander, which the model cannot call), so
+# "tell me the time and put this in your memory" ran get_time and "I have
+# noted that you graduate December 10th" walked through (probe h). The
+# table below is the one place a future memory tool is named.
+COMPOUND = ("Tell me the time and put this in your memory: I graduate "
+            "December 10th 2026")
+TIME_AND_LIE = "It's five past four, sir. I have noted that you graduate December 10th."
+
+
+def test_no_registry_tool_backs_a_memory_claim_today():
+    assert brain_mod.CLAIM_BACKERS["memory"] == frozenset()
+    assert brain_mod.CLAIM_BACKERS["action"] is None        # any tool at all
+    assert brain_mod.claim_kind("I have noted that") == "memory"
+    assert brain_mod.claim_kind("I'll keep that in mind") == "memory"
+    assert brain_mod.claim_kind("I've added") == "action"
+    assert brain_mod.claim_backed("I have noted that", ("get_time", "notes")) is False
+    assert brain_mod.claim_backed("I've added", ("notes",)) is True
+    assert brain_mod.claim_backed("I've added", ()) is False
+
+
+def test_a_tool_that_ran_backs_an_action_claim_but_not_a_memory_one():
+    assert brain_mod.unbacked_claim("I've added milk to your list.", ran=("notes",)) is None
+    assert brain_mod.unbacked_claim(TIME_AND_LIE, ran=("get_time",)) == "I have noted that"
+    # the one-place extension: a fact-storing tool named in the table backs it
+    assert brain_mod.unbacked_claim(TIME_AND_LIE, ran=("get_time",),
+                                    backers={"memory": frozenset({"get_time"})}) is None
+
+
+def test_a_memory_claim_beside_a_real_tool_is_still_caught(setup, caplog):
+    """get_time runs, the model reads the time AND claims the store: the
+    time is his, the store is a lie, and the lie must not be spoken."""
+    b, fake, record = setup
+    fake.replies = [tool_reply(("get_time", {})),
+                    text_reply(TIME_AND_LIE),
+                    text_reply("It's five past four, sir.")]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(COMPOUND)
+    spoken = dict(tags)["SPEAK"]
+    assert "noted" not in spoken.lower(), spoken
+    assert "five past four" in spoken
+    assert record == [("get_time", None)]                     # once, not again
+    assert _warnings(caplog)[0] == (
+        "brain: unbacked memory claim 'I have noted that' (get_time ran; "
+        "nothing that ran stores a fact)")
+    assert len(fake.chat_payloads()) == 3                      # the one retry
+
+
+# ------------------------------- a question that also asks for a store
+# "Tell me the time and put this in your memory: ..." is a QUESTION by the
+# router's rule (tell me), and the guard stands down on a question because
+# its retry executes. A memory claim cannot execute anything real (no tool
+# stores a fact), so on a question that also asks for a store the guard
+# judges MEMORY claims only -- an action claim on the same question stays
+# the answer it is, the way the 09-02 timer bug demands.
+def test_a_question_that_asks_for_a_store_judges_memory_claims_only(setup, caplog):
+    b, fake, record = setup
+    asked = "What's the weather, and remember that I graduate December 10th"
+    assert is_question(asked)
+    fake.replies = [tool_reply(("get_weather", {"when": "now"})),
+                    text_reply("Seventy-two and cloudy, sir. I'll remember that."),
+                    text_reply("Seventy-two and cloudy, sir.")]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(asked)
+    assert dict(tags)["SPEAK"] == "Seventy-two and cloudy, sir."
+    assert record == [("get_weather", "now", None)]
+    assert len(_warnings(caplog)) == 1
+
+
+def test_an_action_claim_on_a_memory_question_is_still_never_acted_on(setup, caplog):
+    """"Do you remember if you added milk?" asks for nothing to be stored
+    and answers with an action claim: the retry would WRITE. Untouched."""
+    b, fake, record = setup
+    fake.replies = [text_reply("Yes, sir. I've added milk to your list already."),
+                    tool_reply(("notes", {"action": "add", "text": "milk"}))]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync("Do you remember if you added milk to my list?")
+    assert tags == [("SPEAK", "Yes, sir. I've added milk to your list already.")]
+    assert record == [] and len(fake.chat_payloads()) == 1
+    assert _warnings(caplog) == []
+
+
+# ------------------------------------------ (3) the honest retry is kept
+# brain.py discarded the retry by design ("the FIRST reply is what he
+# hears, with the claims taken out"), so the model's one honest answer --
+# "I'm afraid I have no way to store that, sir" -- was thrown away for
+# "I couldn't do that part, sir." (probe b). The reason no longer holds:
+# the retry is judged by the same table, so a retry that claims nothing
+# and ran no tool is the model answering the nudge as written, and it is
+# the only path to an honest sentence in the model's own words.
+HONEST = "I'm afraid I have no way to store that, sir; say remember that and I shall."
+STORE = "Put this in your memory: I graduate December 10th 2026"
+
+
+def test_a_claim_free_retry_is_spoken_not_discarded(setup, caplog):
+    b, fake, record = setup
+    fake.replies = [text_reply(NOTED), text_reply(HONEST)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(STORE)
+    assert tags == [("SPEAK", HONEST)]
+    assert record == []
+    assert _warnings(caplog) == [
+        "brain: unbacked action claim 'I have noted that' (no tool ran)"]
+    assert len(fake.chat_payloads()) == 2
+
+
+def _chunks(text):
+    out = [{"message": {"role": "assistant", "content": text[i:i + 7]}, "done": False}
+           for i in range(0, len(text), 7)]
+    out.append({"message": {"role": "assistant", "content": ""}, "done": True,
+                "load_duration": 0})
+    return out
+
+
+@pytest.fixture
+def streamed(setup, monkeypatch):
+    b, fake, record = setup
+    streams = []
+
+    def stream(path, payload, timeout=None):
+        assert streams, "no scripted stream left"
+        for chunk in streams.pop(0):
+            yield chunk
+    monkeypatch.setattr(brain_mod, "_http_stream", stream)
+    return b, fake, record, streams
+
+
+GREETING = "Good evening, Ali and Heather."
+
+
+def test_a_claim_free_retry_is_spoken_after_the_streamed_greeting(streamed, caplog):
+    """The greeting went to TTS as it landed and the claim was withheld;
+    the honest retry follows it, once, on the same stream."""
+    b, fake, record, streams = streamed
+    streams.append(_chunks(f"{GREETING} I'll remember that, sir."))
+    fake.replies = [text_reply(HONEST)]
+    spoken = []
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync("say hello to my family and remember that I graduate "
+                            "December 10th", on_sentence=spoken.append)
+    assert spoken == [GREETING, HONEST]
+    assert tags == [("STREAMED", "2"), ("SPEAK", f"{GREETING} {HONEST}")]
+    assert record == [] and len(_warnings(caplog)) == 1
