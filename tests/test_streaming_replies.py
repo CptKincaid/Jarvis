@@ -48,11 +48,15 @@ def test_sentences_are_spoken_as_they_land_and_not_again(monkeypatch):
     b = _brain(monkeypatch, _chunks("It is ten past nine, sir. The evening is clear. Rain is unlikely."))
     spoken = []
     tags = b._chat_sync("what time is it", on_sentence=spoken.append)
-    # the spoken cap (MAX_SPOKEN_SENTENCES = 2) holds sentence by sentence
-    assert spoken == ["It is ten past nine, sir.", "The evening is clear."]
+    # The spoken cap holds sentence by sentence. Three sentences arrive and
+    # the cap is 4 since 2026-09-04, so all three are spoken -- the CAP case
+    # is covered by test_the_spoken_cap_still_holds_while_streaming, which
+    # reads the constant.
+    assert spoken == ["It is ten past nine, sir.", "The evening is clear.",
+                      "Rain is unlikely."]
     kinds = [t for t, _ in tags]
     assert kinds == ["STREAMED", "SPEAK"], kinds
-    assert dict(tags)["STREAMED"] == "2"
+    assert dict(tags)["STREAMED"] == "3"
     assert dict(tags)["SPEAK"].startswith("It is ten past nine, sir.")
 
 
@@ -185,8 +189,13 @@ def test_pre_tool_chatter_does_not_eat_the_answers_cap(monkeypatch):
                     ToolResult(text="hello goodbye"), name="ask_docs")
     spoken = []
     tags = b._chat_sync("what does the file say", on_sentence=spoken.append)
-    assert spoken == ["Let me look.", "The file says hello.", "And goodbye."]
-    assert dict(tags)["STREAMED"] == "3"
+    # Chatter before the tool must not spend the ANSWER's allowance. With a
+    # cap of 4 the answer's three sentences all survive alongside the chatter;
+    # the property under test is that the answer is not short-changed, not the
+    # absolute count.
+    assert spoken[0] == "Let me look."
+    assert spoken[1:] == ["The file says hello.", "And goodbye.", "And more."]
+    assert dict(tags)["STREAMED"] == "4"
 
 
 def test_the_partial_notice_is_spoken_on_the_streamed_path(monkeypatch):

@@ -749,7 +749,7 @@ JARVIS_SYSTEM = f"""You are JARVIS, Hunter's personal AI: the calm, dry British 
 {VOICE_RULES}
 Never gush, never flatter, never sound like customer service. Answer the question and stop.
 
-Tools: you have tools for live data and for his schedule. Use a tool whenever the answer depends on live data (the time, the weather, his calendar, his mail, his reminders, timers and alarms, his notes) and never guess those. Call the tool first, without commentary. After a tool result, answer in one or two sentences using only the numbers, names and times in the result; never invent a figure the result does not contain. If a tool says something is not set up, say so in one sentence and name the thing. If a tool reports a failure, say what could not be reached in one sentence. Do not call a tool for a greeting, thanks, a joke, an opinion or general knowledge.
+Tools: you have tools for live data and for his schedule. Use a tool whenever the answer depends on live data (the time, the weather, his calendar, his mail, his reminders, timers and alarms, his notes) and never guess those. Call the tool first, without commentary. After a tool result, answer in two to four sentences using only the numbers, names and times in the result; never invent a figure the result does not contain. If a tool says something is not set up, say so in one sentence and name the thing. If a tool reports a failure, say what could not be reached in one sentence. Do not call a tool for a greeting, thanks, a joke, an opinion or general knowledge.
 
 Beyond your tools you cannot act: you cannot buy, book, browse, call, text, order, open files or run code yourself; the desktop commands and Claude do that through the rest of the system. If he asks you to buy, order, book, call, text, send or fetch anything, say in one sentence that you cannot, naming what he asked for, with a dry reason of your own (no hands, no phone, no card); never answer with what you can do instead. Never say you checked, ran, read, saved or found anything unless a tool result in this conversation says so. When he asks for advice, give the one check anyone would make first and do not pretend to have inspected his code.
 
@@ -762,7 +762,7 @@ Answer as Jarvis only: no "Jarvis:" label, no writing the user's lines, and don'
 Examples of the manner only; every reply is in fresh words for this exact request and names the thing he actually asked for (the pizza, the branch, the hour), never the thing in the example:
 {{examples}}
 
-{{register}}Now answer Hunter as Jarvis, in your own words, keeping the manner of the examples, and call him sir. One short sentence is the norm; add a second only if it says something new that he asked for, and never describe his screen, files or machine unless he asked. If he asks for a joke, it is one dry remark about his situation, never a question and its answer. The examples are the manner only, never the words: never reuse a sentence, a clause or an object from an example — if an example speaks of a phone and he asks about dinner, the reply is about dinner. Then stop."""
+{{register}}Now answer Hunter as Jarvis, in your own words, keeping the manner of the examples, and call him sir. Two or three sentences is the norm; take a fourth when the question genuinely needs it and one when it does not -- length follows the question, not a quota, and never describe his screen, files or machine unless he asked. If he asks for a joke, it is one dry remark about his situation, never a question and its answer. The examples are the manner only, never the words: never reuse a sentence, a clause or an object from an example — if an example speaks of a phone and he asks about dinner, the reply is about dinner. Then stop."""
 
 # Router tie-breaker (spec 4.2): the instruction rides in the user turn so
 # the request shares the static prefix (system + tools) with chat.
@@ -1277,8 +1277,15 @@ def reclaim():
 # ----------------------------------------------------------------------
 # Guards between the model and TTS
 # ----------------------------------------------------------------------
-MAX_SPOKEN_SENTENCES = 2
-MAX_SPOKEN_CHARS = 250                    # prefer a sentence end below this
+MAX_SPOKEN_SENTENCES = 4       # 2 until 2026-09-04. Raised WITH the system
+                               # prompt, never alone -- see the note at the
+                               # top of this file about the last attempt.
+MAX_SPOKEN_CHARS = 450                    # prefer a sentence end below this
+# WHY THIS COSTS HIM NOTHING: speech is streamed a sentence at a time
+# (_stream_round, and 'a streamed sentence is spoken before the reply'
+# below), so time-to-first-word does not depend on how long the answer
+# turns out to be. A longer reply means he hears MORE, not that he waits
+# longer to hear anything -- which is the condition he set for raising it.
 HARD_SPOKEN_CHARS = _TTS.MAX_SPEAK_LENGTH  # the one hard limit, shared w/ TTS
 NO_CLOCK_LINE = "I'm afraid I haven't a clock in front of me just now, sir."
 # Said instead when a clock IS available and the model's reading contradicts

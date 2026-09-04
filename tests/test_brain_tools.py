@@ -377,9 +377,14 @@ def test_the_render_round_is_offered_once_and_never_speaks_the_result(
 
 
 def test_two_sentence_cap_holds_without_a_tool(brain, setup):
+    """The spoken cap still bites on a tool-free reply -- at whatever the cap
+    currently is. Written against the constant since 2026-09-04, when raising
+    it from 2 to 4 broke an oracle that had hard-coded the old number."""
     b, fake, _ = setup
-    fake.replies = [text_reply("One, sir. Two, sir. Three, sir.")]
-    assert b._chat_sync("hello") == [("SPEAK", "One, sir. Two, sir.")]
+    n = brain.MAX_SPOKEN_SENTENCES
+    body = [f"Sentence {i}, sir." for i in range(n + 1)]
+    fake.replies = [text_reply(" ".join(body))]
+    assert b._chat_sync("hello") == [("SPEAK", " ".join(body[:n]))]
 
 
 def test_max_rounds_exhausted_speaks_a_persona_line(brain, setup):
