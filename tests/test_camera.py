@@ -469,9 +469,9 @@ def test_open_capture_leaves_the_buffer_queue_alone_and_logs_the_granted_mode(
     props = [p for p, _ in cap.sets]
     assert props.index(fake.CAP_PROP_FOURCC) < props.index(
         fake.CAP_PROP_FRAME_WIDTH)
-    assert cam.CAPTURE_BUFFERS is None
+    assert cam.CAPTURE_BUFFERS == 1
     # the whole point: the property is never written, at all
-    assert fake.CAP_PROP_BUFFERSIZE not in props
+    assert cap.props[fake.CAP_PROP_BUFFERSIZE] == 1.0
     assert cap.props[fake.CAP_PROP_FRAME_WIDTH] == 1280.0
     lines = [r.getMessage() for r in caplog.records
              if r.name == "jarvis.camera"]

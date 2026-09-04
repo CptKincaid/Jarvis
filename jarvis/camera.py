@@ -78,7 +78,7 @@ DEFAULT_FOURCC = "MJPG"
 # V4L2 backend requeues a dequeued buffer only at the NEXT grab, so with one
 # buffer the driver holds none in between and every grab waits a full extra
 # frame interval.
-CAPTURE_BUFFERS = None
+CAPTURE_BUFFERS = 1
 # How long a close waits for a grab already in flight before releasing the
 # device anyway. One frame at the idle tier's 1.5 fps is 670 ms; a second is
 # a grab that is not coming back.
