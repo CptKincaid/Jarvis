@@ -668,6 +668,21 @@ DEFAULTS: dict = {
                # do) and leave hfov_deg at 0. One of the two must be set --
                # nothing in the code guesses a field of view.
                "hfov_deg": 65.6, "diag_fov_deg": 0.0, "fourcc": "MJPG",
+               # exposure: 0 leaves the camera on its own auto-exposure. A
+               # value > 0 PINS manual exposure (v4l2 exposure_absolute
+               # units, 100 us) at every open. Why the lever exists: the
+               # LifeCam's sensor rate is set by its exposure tier -- 30 fps
+               # at <=156, 15 at 312-625, 7.5 at >=1250 -- and its auto
+               # metering stepped down to the slowest tier on 2026-09-03
+               # evening, halving the preview to 3.7 fps; manual 156 was
+               # MEASURED (09-04, grab only) to return it to 15-16 fps
+               # through the app's single driver buffer. It trades the
+               # camera's metering for a fixed rate, so whether the pane is
+               # still watchable in evening light is read off the next
+               # "campreview:" log line, not assumed. Values off the
+               # camera's own table (50, 100, 200, 400) fall to the SLOWEST
+               # tier -- 156 first, then read the line.
+               "exposure": 0,
                "detect_width": 320, "detect_height": 180, "threads": 2,
                "idle_fps": 1.5, "armed_fps": 8.0, "min_conf": 0.6,
                # Where the downloaded weights live. Empty means
