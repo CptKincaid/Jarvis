@@ -89,6 +89,41 @@ def spawn_relauncher(old_pid: int, cmd: list[str], cwd, env: dict, log_path,
     return int(proc.pid)
 
 
+# ------------------------------------------------------ the status line
+def format_code_status(status: dict) -> str:
+    """The drawer's one line above the button. ``status`` is what
+    app.JarvisApp.code_status() returns: running / disk (short hashes, ""
+    when git could not say), behind (commits HEAD has that the running
+    commit lacks; None when the running commit is not an ancestor of HEAD
+    at all) and dirty (uncommitted changes on disk). Lives here rather than
+    in app.py so the UI can import it without the app's import cost."""
+    status = status or {}
+    running = status.get("running") or ""
+    disk = status.get("disk") or ""
+    if not running:
+        line = "Running unknown"
+        if disk:
+            line += f", on disk {disk}"
+    else:
+        line = f"Running {running}"
+        if disk:
+            line += f", on disk {disk}"
+            behind = status.get("behind")
+            if running == disk or behind == 0:
+                line += " (up to date)"
+            elif behind is None:
+                line += " (not on HEAD's line)"
+            elif behind == 1:
+                line += " (1 commit behind)"
+            else:
+                line += f" ({behind} commits behind)"
+        else:
+            line += ", on disk unknown"
+    if status.get("dirty"):
+        line += ", uncommitted changes"
+    return line
+
+
 # --------------------------------------------------------- helper side
 def _read_cmdline(pid: int) -> str:
     with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:

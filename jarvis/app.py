@@ -74,6 +74,7 @@ from jarvis import gate as gate_mod
 from jarvis import identity as identity_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
+from jarvis import relaunch
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
@@ -88,8 +89,9 @@ from jarvis.commander import (BRIEFING_OFFER_TTL_S, COURTESY_BY_REGISTER,
                               LEAVE_ANSWER_WINDOW_S, REGISTER_LINES,
                               CommandResult, Commander, parse_yes_no,
                               strip_jarvis_prefix)
-from jarvis.context import ContextEngine
+from jarvis.context import ContextEngine, _git
 from jarvis.history import TypedHistory
+from jarvis.relaunch import format_code_status  # noqa: F401 - the drawer's line, re-exported
 from jarvis.hotword import Hotword
 from jarvis.jarvis_agent import JarvisAgent
 from jarvis.memory import JarvisMemory
@@ -372,6 +374,12 @@ class JarvisApp:
         self._last_milestone: dict[str, str] = {}
         self._assistant_started = False
         self._quitting = False
+        self._restarting = False
+        # The commit this PROCESS started from, read once here (at startup,
+        # never at import: a module-level read would stamp whatever tree the
+        # test runner or a --help happened to import from). The drawer's
+        # code-status line compares it with HEAD on disk at open time.
+        self.running_commit = running_commit()
         # The earcon lexicon reads sound.earcons / sound.volume / cooldown
         # from here. Installed the way channels.notify.set_quiet_gate is,
         # because recorder.play_beep() is a module function with no config
@@ -6137,6 +6145,67 @@ class JarvisApp:
         except OSError:
             pass
 
+    # ------------------------------------------------------- restart button
+    def code_status(self) -> dict:
+        """running / disk / behind / dirty for the drawer's line (spec in
+        relaunch.format_code_status). Four short git calls in the repo."""
+        return probe_code_status(getattr(self, "running_commit", ""),
+                                 relaunch.REPO_ROOT)
+
+    def _tts_busy(self) -> bool:
+        busy = getattr(self.tts, "busy", False)
+        try:
+            return bool(busy() if callable(busy) else busy)
+        except Exception:
+            return False
+
+    def restart(self, spawn=None, sleep=time.sleep, clock=time.monotonic):
+        """The Restart button's second press (Hunter, 2026-09-04: "yes,
+        button only"). Say the line, let it finish (TTS.busy, bounded at
+        RESTART_SAY_WAIT_S -- a ceiling, not a fixed wait, so a gated or
+        already-finished line costs nothing), start the detached helper
+        with OUR pid to wait on, THEN the normal quit. In that order: a
+        quit first would leave nobody to relaunch. Returns the helper's
+        pid, or None when it could not be started -- in which case nothing
+        is quit, because a Jarvis that is down is worse than one that is
+        stale, and the Status says so.
+
+        Runs on the drawer's worker thread; the window close is marshalled
+        onto the Tk thread by the hook attach_window installs."""
+        if getattr(self, "_restarting", False):
+            log.info("restart already in flight")
+            return None
+        self._restarting = True
+        spawn = spawn or relaunch.spawn_relauncher
+        self._say(RESTART_LINE)
+        deadline = clock() + RESTART_SAY_WAIT_S
+        while self._tts_busy() and clock() < deadline:
+            sleep(0.1)
+        cmd, cwd, env = relaunch.plan()
+        log_path = PATHS.LOG_DIR / "relaunch.log"
+        try:
+            helper = spawn(os.getpid(), cmd, cwd, env, log_path=log_path)
+        except Exception as exc:          # noqa: BLE001 - reported, nothing quit
+            log.exception("relaunch helper did not start")
+            bus.publish(Status(text=f"Restart failed: {exc}"[:120],
+                               kind="error"))
+            self._restarting = False
+            return None
+        log.info("relaunch helper pid %s waiting on pid %s (log %s); "
+                 "quitting", helper, os.getpid(), log_path)
+        self._close_window()
+        return helper
+
+    def _close_window(self):
+        """The ✕ path when a window is attached (MainWindow._on_close via
+        after(0) -- geometry save, tray, services.quit, root.destroy), else
+        the app's own quit()."""
+        fn = getattr(self, "close_window", None)
+        if callable(fn):
+            fn()
+        else:
+            self.quit()
+
     # ------------------------------------------------------------ UI hooks
     def ui_service_kwargs(self) -> dict:
         """Everything the UI's Services dataclass may take (spec 9.10);
@@ -6168,6 +6237,11 @@ class JarvisApp:
             dispatch_text=self.dispatch_text,
             toggle_hotword=self.toggle_hotword,
             quit=self.quit,
+            # The drawer's Restart button and the code-status line above
+            # it (jarvis/relaunch.py). build_ui_services drops both on a
+            # UI that does not declare them.
+            restart=self.restart,
+            code_status=self.code_status,
             calibrate_noise=self.calibrate_noise,
             enroll_speaker=self.enroll_speaker,
             train_wakeword=self.train_wakeword,
@@ -6225,6 +6299,48 @@ def build_ui_services(services_cls, kwargs: dict):
     if dropped:
         log.warning("UI Services lacks %s; those hooks stay unwired", dropped)
     return services_cls(**kept)
+
+
+RESTART_LINE = "Back in a moment, sir."
+RESTART_SAY_WAIT_S = 6.0      # ceiling on waiting for that line to finish
+
+
+def running_commit(repo=None, git=None) -> str:
+    """Short hash of HEAD in the checkout this process runs from, "" when
+    there is no git (a tarball, a box without git): the code-status line
+    then reads "Running unknown"."""
+    git = git or _git
+    return git(str(repo or relaunch.REPO_ROOT), "rev-parse", "--short", "HEAD") or ""
+
+
+def probe_code_status(running: str, repo, git=None) -> dict:
+    """running / disk / behind / dirty, through context._git (stdout or ""
+    on any failure, so a missing git degrades to unknowns, never a raise).
+    ``behind`` is `git rev-list --count <running>..HEAD` -- but only when
+    `HEAD..<running>` is empty, i.e. the running commit is an ANCESTOR of
+    HEAD; a rebased-away or unknown hash answers None, because a count
+    against a commit HEAD does not contain would be a made-up number."""
+    git = git or _git
+    repo = str(repo)
+    running = running or ""
+    disk = git(repo, "rev-parse", "--short", "HEAD") or ""
+    behind = None
+    if running and disk:
+        if running == disk:
+            behind = 0
+        else:
+            own = git(repo, "rev-list", "--count", f"HEAD..{running}")
+            count = git(repo, "rev-list", "--count", f"{running}..HEAD")
+            if own == "0" and count.isdigit():
+                behind = int(count)
+    dirty = bool(git(repo, "diff", "HEAD", "--shortstat")) if disk else False
+    return {"running": running, "disk": disk, "behind": behind, "dirty": dirty}
+
+
+def attach_window(app, window) -> None:
+    """Give the app the ✕ path: restart() ends by calling this hook from
+    a worker thread, and MainWindow._on_close must run on the Tk thread."""
+    app.close_window = lambda: window.root.after(0, window._on_close)
 
 
 WM_CLASS = "jarvis"          # tk.Tk(className="jarvis") in ui.main_window.create
@@ -6429,6 +6545,7 @@ def main():
 
     signal.signal(signal.SIGUSR1, _on_show_signal)
     window = create(build_ui_services(Services, app.ui_service_kwargs()))
+    attach_window(app, window)        # the Restart button's quit is the ✕'s
     try:
         window.root.update()          # map it now: the icon click gets a window
     except Exception:
