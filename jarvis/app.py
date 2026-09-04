@@ -4029,6 +4029,17 @@ class JarvisApp:
         # sir (24/24 measured), and catching it would mean rewriting at the
         # TTS door, which is the thing this design does not do. So the
         # burst keeps exactly one sir of its own and the reply keeps its.
+        # A briefing that is being DELIVERED retires any parked offer of one.
+        # 2026-09-04 15:06: the model answered his briefing inside a compound
+        # question, the arrival offer from 14:44 then asked "Shall I run your
+        # briefing, sir?", he said yes, and the calendar and the lab were read
+        # to him a second time. The offer rung only ever cleared itself when
+        # it was answered; nothing cleared it when the thing it offered had
+        # already happened.
+        try:
+            self.services.briefing_offer = None
+        except Exception:  # noqa: BLE001 - no services, nothing parked
+            pass
         say_in_burst("Your briefing for today, sir.")
         # arc.greeting_word, not the literal "morning": every delivery in
         # the two retained logs (08-31 14:33, 09-01 15:00, 09-02 14:29)

@@ -312,6 +312,19 @@ _ACTION_CLAIM_RX = re.compile(
     r"removing|sending|queuing|queueing|scheduling|saving|creating|"
     r"deleting|pausing|resuming|turning|switching|moving|booking|clearing|"
     r"stopping|muting|skipping|dimming|putting)\b"
+    # THE FUTURE IS A CLAIM TOO. "I shall pass on your regards to <two real
+    # people>" (2026-09-04 15:06:29) promised an action no tool can take and
+    # nobody asked for, and walked through because the table knew only the
+    # past and the progressive. A promise the system cannot keep is
+    # exactly as unbacked as a claim it did not do; the relay verbs (pass
+    # on, tell, let .. know, relay, forward) are here because that is the
+    # shape it took. "I'll be here" and "I'll stop there" fall to the
+    # idiom veto below, as they always did for the progressive.
+    r"|i(?:'ll| will| shall)(?: now| just| also| certainly| of course)? "
+    r"(?:pass (?:on|along)|tell|let \w+ know|relay|forward|add|set|start|"
+    r"cancel|remove|send|queue|schedule|save|create|delete|pause|resume|"
+    r"turn (?:on|off|up|down)|switch|move|book|clear|stop|mute|skip|dim|"
+    r"put)\b"
     # the passive and the state claims: "milk is added to your list",
     # "your timer is set", "the music is on", "playing now". Kept to the
     # shapes of a DONE action: this guard is for actions the model says it
