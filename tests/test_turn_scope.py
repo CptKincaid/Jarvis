@@ -167,7 +167,7 @@ def test_the_loop_reads_the_addressee_exactly_once(loop, monkeypatch):
     assert len(readers) == 1, readers
     # ...and the prompt is rendered from that reading, not a second one.
     assert "static_system(addressee_to=turn_addr)" in body
-    assert "self._dynamic_context(text, owner=owner_turn)" in body
+    assert "self._dynamic_context(text) if owner_turn" in body
 
 
 def test_a_guest_turn_carries_none_of_his_background(loop):
@@ -184,13 +184,16 @@ def test_a_guest_turn_carries_none_of_his_background(loop):
     b._chat_sync("what am I looking at?")
     hers = fake.chat_payloads()[-1]["messages"][1]["content"]
     assert "what am I looking at?" in hers
-    ctx, mem = b._dynamic_context("what am I looking at?", owner=True)
+    ctx, mem = b._dynamic_context("what am I looking at?")
     assert ctx or mem, "the fake context carries nothing; test is vacuous"
     for piece in (ctx, mem):
         if piece:
             assert piece in his
             assert piece not in hers
-    assert b._dynamic_context("anything", owner=False) == ("", "")
+    # The seam keeps its one-argument shape: six tests stub it so.
+    import inspect
+    assert list(inspect.signature(brain_mod.JarvisBrain._dynamic_context)
+                .parameters) == ["self", "text"]
 
 
 # ---------------------------------------------------- the app's dispatch

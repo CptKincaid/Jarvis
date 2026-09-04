@@ -24,7 +24,9 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 
 
 def _owner(text):
-    return "ma'am" not in text and "Mara" not in text and \
+    # The addressee CLAUSE, not the bare word: since jarvis-v3 ac934b0 the
+    # persona itself carries a literal "say ma'am" example for him.
+    return 'Call them "ma\'am"' not in text and "Mara" not in text and \
         "Heather" not in text and "not Hunter" not in text
 
 
@@ -50,7 +52,7 @@ def test_the_cached_prompt_follows_the_addressee_across_turns():
     brain.set_addressee("Alex", "")
     alex = brain.static_system()
     assert 'Call them "Alex" now and then' in alex
-    assert "ma'am" not in alex and "Mara" not in alex
+    assert 'Call them "ma\'am"' not in alex and "Mara" not in alex
 
     brain.set_addressee("", "sir")
     assert brain.static_system() is hunter_1

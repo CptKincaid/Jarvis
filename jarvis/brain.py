@@ -2795,18 +2795,15 @@ class JarvisBrain:
     # ------------------------------------------------------------------
     # Tier 2: Ollama /api/chat with tools
     # ------------------------------------------------------------------
-    def _dynamic_context(self, text="", owner=True):
+    def _dynamic_context(self, text=""):
         """The per-turn background: context + memory. ``text`` (Hunter's
         words) lets the memory pick the facts RELEVANT to this utterance;
         it stays in the user turn, never the static system prompt.
 
-        ``owner=False`` -- a known person's turn -- gets NEITHER: the
-        context block carries his active window, his git state, his
-        recent conversation and his screen, and the memory block carries
-        what he told me about his life. None of it is hers to be answered
-        from, with or without a tool; the time is a tool she is offered."""
-        if not owner:
-            return "", ""
+        Called for HIS turn only: _chat_sync hands a known person's turn
+        ("", "") instead. The signature is a seam six tests stub with
+        ``lambda text="": ("", "")``, so the scope is decided at the call
+        site and not here."""
         ctx_text = ""
         if self._context:
             ctx = self._context.get_context("standard")
@@ -2903,7 +2900,12 @@ class JarvisBrain:
             else scope_mod.addressee()
         turn_who = turn_addr[0]
         owner_turn = not turn_who
-        ctx_text, mem_text = self._dynamic_context(text, owner=owner_turn)
+        # A guest's turn carries NONE of his background: the context block
+        # is his active window, his git state, his recent conversation and
+        # his screen; the memory block is what he told me about his life.
+        # None of it is hers to be answered from, with or without a tool.
+        ctx_text, mem_text = (self._dynamic_context(text) if owner_turn
+                              else ("", ""))
         messages = [{"role": "system",
                      "content": static_system(addressee_to=turn_addr)},
                     {"role": "user",
