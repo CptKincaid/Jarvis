@@ -6174,7 +6174,16 @@ _TRANSCRIPT_CLEAR_RX = re.compile(
     r"(?:\s+(?:pane|panel|window|view|log|history|area))?"
     r"(?:\s+(?:clean|out|off))?"
     r"(?:\s+(?:right\s+)?now)?"
-    r"(?:[, ]+(?:please|jarvis|sir|for me|would you|will you|thanks))*"
+    # "thanks" was in and "thank you" was not, so "clear the transcript
+    # thank you" -- bare, the way the hotword leaves it -- reached NO rung
+    # and went to the classifier, the silent drop this whole rung exists to
+    # end (measured 2026-09-03: rx=False, registry=None, tier1=None,
+    # multi=[]).  With a comma the compound splitter rescued it, which is
+    # not a distinction he can hear himself making.  Longest first: the
+    # alternation is ordered, and "thanks" would otherwise claim the
+    # "thank" of "thank you" and leave the rest unmatched.
+    r"(?:[, ]+(?:please|jarvis|sir|for me|would you|will you|"
+    r"thank you very much|thank you|thanks))*"
     r"[?.!]*$", re.I)
 # Both facts in one breath: the memory is untouched, and the cards do not
 # come back. No read-back and no undo= go with it -- see _h_transcript_clear.
@@ -6183,7 +6192,7 @@ TRANSCRIPT_CLEAR_LINE = ("Screen's clear, sir. Nothing forgotten — "
 
 
 def _standing_questions(c) -> int:
-    """How many approval questions are still waiting on him.
+    """How many unanswered question CARDS the wipe is going to leave up.
 
     TranscriptView.clear_all deliberately KEEPS an unanswered approval
     card -- it carries the only hand-answerable ALLOW / DENY for a Claude
@@ -6191,10 +6200,21 @@ def _standing_questions(c) -> int:
     when the wipe lands, and "Screen's clear, sir" would be the wrong
     thing to say.  The wipe itself is fire-and-forget (the commander runs
     on worker threads and must never touch a Tk surface), so the fact is
-    read from the approvals SERVICE, which is the same fact the pane is
-    keying on: ApprovalService.pending() holds exactly the requests whose
-    cards are unanswered, and answer()/_resolve() is the only thing that
-    empties it.
+    read from the services, which key on the same thing the pane does.
+
+    TWO producers fill that dict, not one, and counting only the first was
+    a wrong sentence spoken out loud (found 2026-09-03, review).
+    ApprovalService.pending() holds the Claude requests; the "Was that for
+    me?" prompt goes into the SAME TranscriptView._approvals via
+    add_approval (main_window._ev_uncertain) and ApprovalService has never
+    heard of it.  An unanswered one is easy to reach -- app._ask_uncertain
+    returns without publishing UncertainResolved when the 5 s window hears
+    nothing, or when there is no mic at all -- and clear_all then keeps
+    that card while this said "Screen's clear, sir", with an 1800 ms toast
+    as the only correction.  Worse, every LATER wipe kept it too, so no
+    voice command could empty the pane again.  ``c.uncertain_open`` is the
+    app's count of those (wired beside claim_uncertain in App.__init__);
+    a commander with no app behind it simply has none.
 
     Reading it here rather than reporting it back from the window is also
     the only version that cannot lose a race: a Status published from
@@ -6203,17 +6223,28 @@ def _standing_questions(c) -> int:
     the status after the wipe was queued), so the window's correction
     would be overwritten by the flat "Transcript cleared".
 
-    Never raises and never blocks the wipe: with no approvals service, or
-    a service that throws, this answers 0 and the plain line is spoken.
+    Never raises and never blocks the wipe: with no approvals service, no
+    app hook, or either of them throwing, the missing half counts 0 and
+    the wipe still happens.  ``c._svc`` is NOT used for the approvals leg
+    -- it reads ``self.services``, which the 13 test-shaped commanders
+    built with ``object.__new__`` do not have, and an AttributeError here
+    was answered "Command failed: clear transcript" with the pane never
+    wiped at all, because the publish comes after this count.
     """
-    ap = c._svc("approvals") if hasattr(c, "_svc") else None
-    if ap is None:
-        return 0
-    try:
-        return len(ap.pending() or ())
-    except Exception:                           # noqa: BLE001 - cosmetic
-        log.exception("approvals.pending failed; reporting a plain wipe")
-        return 0
+    held = 0
+    ap = getattr(getattr(c, "services", None), "approvals", None)
+    if ap is not None:
+        try:
+            held += len(ap.pending() or ())
+        except Exception:                       # noqa: BLE001 - cosmetic
+            log.exception("approvals.pending failed; reporting a plain wipe")
+    open_uncertain = getattr(c, "uncertain_open", None)
+    if callable(open_uncertain):
+        try:
+            held += int(open_uncertain() or 0)
+        except Exception:                       # noqa: BLE001 - cosmetic
+            log.exception("uncertain_open failed; reporting a plain wipe")
+    return held
 
 
 def transcript_clear_line(held: int) -> str:
@@ -9138,6 +9169,7 @@ class Commander:
     # (tests/test_custom_phrases.py) builds a Commander with __new__ and
     # fills in only what it needs.
     claim_uncertain: Optional[Callable[[bool], bool]] = None
+    uncertain_open: Optional[Callable[[], int]] = None
     _last_turn: Optional[LastTurn] = None
     _last_undo: Optional[tuple] = None
     _confidence: Optional[float] = None
@@ -9212,6 +9244,10 @@ class Commander:
         # App hook: a spoken "that was for you" answers the open card too
         # (claim_uncertain(yes) -> bool, whether a card was waiting).
         self.claim_uncertain: Optional[Callable[[bool], bool]] = None
+        # App hook: how many "Was that for me?" cards are still unanswered.
+        # The SECOND producer of the pane's question cards, and the one
+        # ApprovalService.pending() cannot see -- see _standing_questions.
+        self.uncertain_open: Optional[Callable[[], int]] = None
         # The last utterance handled, for "no, I said ..." and "that was
         # for you"; the app's _last_user_text is not visible from here.
         self._last_turn: Optional[LastTurn] = None
