@@ -723,10 +723,11 @@ DEFAULTS: dict = {
                # calibrate it from the $0 photo test (docs/vision.md 9): the
                # rig prints the raw ratio t, and r = t / tan(known angle).
                "nose_ratio": 0.35,
-               # Fold the camera into the wake gate (jarvis/eye.py
-               # resolve_wake). It can only ever promote a suppressed wake,
-               # never suppress an accepted one.
-               "wake_tiebreak": True,
+               # There is deliberately NO wake-gate key here. eye.resolve_wake
+               # exists and nothing calls it (docs/vision.md: the wiring "is
+               # a two-line change when one exists"), so a camera wake-tiebreak
+               # key sat here for two days promising a control the code did
+               # not have. It comes back with the wiring, not before.
                # Face identity: a gallery of HIS FACE on disk. Opt-in, and the
                # threshold is OpenCV's own documented SFace cosine for "same
                # person".
@@ -742,11 +743,12 @@ DEFAULTS: dict = {
                # start. scripts/face_model_compare.py is how the real number
                # arrives, and only he can run it -- it needs his face.
                "identity": False, "identity_min": 0.363,
-               # One JPEG at 0600, overwritten each time, for diagnosing a
-               # mount. The only path by which a frame reaches the disk --
-               # and note that the console's camera preview is NOT one:
-               # jarvis/campreview.py never writes a frame anywhere.
-               "debug_frame": False,
+               # And NO frame-to-disk key. A camera debug-frame key ("one
+               # JPEG at 0600, for diagnosing a mount") sat here unread, and
+               # an implementer following its comment would have written a
+               # camera frame to disk -- the one thing the standing camera
+               # rule and jarvis/campreview.py's docstring forbid. The mount
+               # is diagnosed from numbers (scripts/vision_selfcheck.py).
                # The console's camera pane (jarvis/campreview.py,
                # jarvis/ui/preview.py). His words, 2026-09-02: "lets add a
                # small camera with visable tracking on the jarvis app but
@@ -759,21 +761,30 @@ DEFAULTS: dict = {
                # sensing.py on top, so offline mode and the curfew shut it
                # whatever this says.
                #
-               # preview_fps is the PICTURE rate. It was 6, under a measured
-               # ~7.5 fps device -- and that measurement was an artefact of
-               # asking a LifeCam Cinema for 1920x1080, a mode it does not
-               # have (v4l2 grants a different one silently and the cost shows
-               # up as grab latency). At the corrected 1280x720 the grab is
-               # 11 ms, so 6 fps was leaving the pane at a 167 ms step for no
-               # reason and he said so: "it lags a ton" (2026-09-03).
+               # preview_fps is the PICTURE rate, a CEILING the device may
+               # not reach, and THE SAME NUMBER AS campreview.DEFAULT_FPS --
+               # pinned equal by tests/test_campreview.py, because this dict
+               # is deep-merged into every config, so THIS is the default a
+               # fresh install runs at and campreview's copy is only reached
+               # with no config at all. The two were 15.0 and 7.5 for a day.
                #
-               # 15 is capped at 30 in jarvis/campreview.py -- the nominal
-               # rate of the mode -- and the boxes and the name have their own
-               # slower cadences, which is what keeps the whole thing at ~12%
-               # of one core instead of 75%. The console animates on 16.67 ms
-               # slot boundaries in the same process, so the capture runs on
-               # its own thread and the pane repaints off a latest-wins slot.
-               "preview": False, "preview_fps": 15.0},
+               # 7.5 is the highest rate the running app has been measured to
+               # get from the LifeCam's 1280x720 MJPG mode: 7.4-7.6 fps with
+               # him at the desk at 10 requested (2026-09-03 00:04-00:22)
+               # and 7.6 at 15 requested (19:47 the same day). A ceiling
+               # above the delivered rate costs nothing but a parked read;
+               # one below it throws pictures away, which is why the default
+               # is the best measured rate and not the worst. An earlier
+               # comment here said the 720p grab was 11 ms and that the
+               # cadences kept the pane at ~12% of one core instead of 75%;
+               # neither reproduced and both are gone -- the measured story,
+               # including why the 7.5 is not understood, is the module
+               # docstring of jarvis/campreview.py. His own config sets this
+               # key explicitly, so his rate is whatever he last wrote there.
+               # Capped at 30 in campreview, the mode's granted nominal; the
+               # boxes and the name have their own slower cadences, and the
+               # capture runs on its own thread off a latest-wins slot.
+               "preview": False, "preview_fps": 7.5},
     # Grab and throw (jarvis/gesture.py, jarvis/handstage.py,
     # jarvis/cast.py, jarvis/gesturecast.py). His words, 2026-09-03: "reach
     # out and grab at the screen (in the air) where the camera is and then

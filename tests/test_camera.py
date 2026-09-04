@@ -447,20 +447,20 @@ class _FakeCv2:
         return cap
 
 
-def test_open_capture_leaves_the_buffer_queue_alone_and_logs_the_granted_mode(
+def test_open_capture_asks_for_one_buffer_and_logs_the_granted_mode(
         monkeypatch, caplog):
-    """The buffer count is the DRIVER'S, and that is a correction.
+    """ONE buffer is requested, and the history of that number is on
+    camera.CAPTURE_BUFFERS: set to 1 to keep a slow consumer off a frame
+    up to three intervals old; measured in the PROBE to cost exactly half
+    the rate (c228a01: 2.00x on eight rows of eight, so it was set to
+    None); put back the same evening because the APP gained nothing from
+    the driver's buffers -- 7.6 fps / 132 ms on its own rate line -- and
+    he saw the staleness at once (9ba1c56). An earlier version of this
+    test was named for c228a01's world and asserted 9ba1c56's.
 
-    It was set to 1 on 2026-09-03 to stop a slow consumer being handed a
-    frame up to three intervals old -- real lag, and the reasoning was
-    sound. What was never measured was the price, and the price is HALF THE
-    FRAME RATE: an A/B pair of probe runs in the same light, 60 timed grabs
-    a row, gave a clean 2.00x on eight rows of eight (720p MJPG 132.2 ms ->
-    67.9, 720p YUYV 200.0 -> 100.0), and with the driver's own buffers the
-    720p YUYV mode reaches its granted 10.0 fps exactly. Starving the queue
-    is the worse trade, so nothing sets CAP_PROP_BUFFERSIZE at all now and
-    the proper fix -- draining the stale frames rather than never queueing
-    them -- is still owed.
+    The log line says "requested", not "driver": cv2's read-back of
+    CAP_PROP_BUFFERSIZE is OpenCV's own stored request, and the count the
+    driver allocated is not observable through it (P12).
 
     The granted mode is still LOGGED, because the running app never read it
     back and a night was spent guessing that MJPG had been declined (it had
@@ -474,13 +474,14 @@ def test_open_capture_leaves_the_buffer_queue_alone_and_logs_the_granted_mode(
     assert props.index(fake.CAP_PROP_FOURCC) < props.index(
         fake.CAP_PROP_FRAME_WIDTH)
     assert cam.CAPTURE_BUFFERS == 1
-    # the whole point: the property is never written, at all
     assert cap.props[fake.CAP_PROP_BUFFERSIZE] == 1.0
     assert cap.props[fake.CAP_PROP_FRAME_WIDTH] == 1280.0
     lines = [r.getMessage() for r in caplog.records
              if r.name == "jarvis.camera"]
     assert any("asked 1280x720 MJPG" in m and "granted 1280x720 MJPG" in m
                for m in lines), lines
+    assert any("1 buffer(s) requested" in m for m in lines), lines
+    assert not any("driver buffer" in m for m in lines), lines
     assert cap.released == 0
 
 
