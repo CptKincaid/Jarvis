@@ -1074,13 +1074,20 @@ def _ensure_breeze_server(startup_timeout: float = 0.0) -> bool:
                             "cached audio may not match what it renders",
                             "; ".join(drift))
             return True
-        if reply and not reply.get("graphs"):
-            # It answered and told us it is degraded. Do not wait for a unit
-            # that is already up and already wrong.
-            log.error("breeze sidecar is up but its CUDA graphs are NOT "
-                      "captured (%s) -- it would stutter; using %s",
-                      reply.get("error") or reply.get("detail"),
-                      BREEZE_FALLBACK)
+        if reply:
+            # It answered, and it is not ready. That is TERMINAL for this
+            # process, not a phase of starting: the sidecar binds its socket
+            # only after load and capture, so a not-ready answer means the
+            # graphs were not captured (it would stutter) or the render
+            # thread has since died. Waiting on a unit that is already up
+            # and already wrong only delays the fallback. The dead-worker
+            # reply (ready:false, graphs:true) used to fall through this
+            # branch, which was keyed on graphs alone: the speak path logged
+            # "not answering yet" for a sidecar that had answered in under a
+            # millisecond and the warm thread polled it for the whole
+            # startup budget -- measured, 8 pings over a 3 s stand-in for
+            # the 90 -- with its reason never logged.
+            _breeze_refused(reply)
             return False
         if not _breeze_unit_active():
             log.error("breeze sidecar is not running (%s is not active); "
@@ -1097,19 +1104,40 @@ def _ensure_breeze_server(startup_timeout: float = 0.0) -> bool:
     return _wait_for_breeze_unit(startup_timeout)
 
 
+def _breeze_refused(reply: dict) -> None:
+    """Say WHY a sidecar that answered is being refused, quoting its reason:
+    the error text is the one line that tells him which of the two
+    terminal states it is in."""
+    why = reply.get("error") or reply.get("detail")
+    if not reply.get("graphs"):
+        log.error("breeze sidecar is up but its CUDA graphs are NOT "
+                  "captured (%s) -- it would stutter; using %s",
+                  why, BREEZE_FALLBACK)
+    else:
+        log.error("breeze sidecar is up but not ready (%s); using %s until "
+                  "%s is restarted", why, BREEZE_FALLBACK, BREEZE_UNIT)
+
+
 def _wait_for_breeze_unit(startup_timeout: float) -> bool:
     """The unit owns the socket: poll until it answers or dies.
 
     Re-checks the unit every few seconds so a unit that crashed during graph
-    capture does not cost the whole startup budget.
+    capture does not cost the whole startup budget. A socket that appears
+    and answers NOT READY ends the wait the same way: that answer is
+    terminal for the process (see _ensure_breeze_server), so the rest of
+    the budget would be spent polling a sidecar that cannot change its mind.
     """
     log.info("breeze sidecar is owned by %s; waiting for it", BREEZE_UNIT)
     deadline = time.monotonic() + startup_timeout
     next_unit_check = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if _breeze_alive():
+        reply = _breeze_ping()
+        if reply.get("ready") and reply.get("graphs"):
             log.info("breeze sidecar ready (%s)", BREEZE_UNIT)
             return True
+        if reply:
+            _breeze_refused(reply)
+            return False
         if time.monotonic() >= next_unit_check:
             if not _breeze_unit_active():
                 log.error("%s stopped while we were waiting for it", BREEZE_UNIT)
@@ -1993,15 +2021,20 @@ class TTS:
         self._burst_announced = True
         bus.publish(SpeakingState(active=True, amplitude=0.0))
 
-    def _pronounce(self, text: str) -> str:
-        """Apply the pronunciation dictionary (never fails speech)."""
+    def _pronounce(self, text: str, engine: str | None = None) -> str:
+        """Apply the pronunciation dictionary (never fails speech).
+
+        ``engine`` defaults to the current one; the F5 fallback for a
+        refused Breeze chunk names its own (see _refit)."""
         if not self._pronunciation:
             return text
         try:
             # The ENGINE decides, not this call site: an engine that reads
             # "9:10 am" correctly is made WORSE by being handed "nine ten ay
             # em" (fish voiced it as "I'm"; Breeze does the same, measured).
-            return pronounce.apply(text, engine=self._engine) or text
+            return pronounce.apply(
+                text, engine=self._engine if engine is None else engine
+            ) or text
         except Exception:
             log.exception("pronunciation apply failed")
             return text
@@ -2037,6 +2070,37 @@ class TTS:
         against the speech without a GPU, a speaker or a running app."""
         cleaned = self._clean_for_speech(text or "")
         return self._pronounce(cleaned) if cleaned else ""
+
+    def _refit(self, text: str, engine: str) -> list[str]:
+        """``text``, prepared for the engine that refused it, re-prepared as
+        ``engine``'s own chunks: the text its rules were measured on, split
+        the way it splits, keyed the way it keys.
+
+        WHY. A chunk reaches the F5 fallback carrying Breeze's preparation:
+        no short-line pad (_ENGINE_NEEDS_SHORT_PAD["breeze"] is False -- the
+        floor the pad works around is F5's) and Breeze's self-normalising
+        rule set (no "6:00 pm" -> "six pee em", no "049" -> "zero four
+        nine"). F5 then rendered a 14-byte line with no pad, which is the
+        measured floor case ("said buy milk really fast", 0.55-1.29 s short),
+        and raw clock digits it was never listened to on; and it filed the
+        audio under a key no native F5 reply looks up, so a later F5
+        utterance of the same line simply missed.
+
+        The order is the room's own. The pad runs BEFORE the pronunciation
+        pass because that is where _clean_for_speech runs it, so the key
+        comes out byte-identical to a native F5 utterance of the same line.
+        Measured on 17 of his real lines (calendar, rooms, clock times,
+        shouted course codes, terse acks): pad-then-F5-rules over the Breeze
+        form matched the native F5 form on all 17. The split is F5's too
+        (240 chars, _ENGINE_CHUNKING): since the join a Breeze chunk is the
+        whole reply, and a 560-character F5 render was one cache entry
+        nothing would ever hit and ~2 s to its first byte where the first
+        sentence alone is ~0.5 s.
+        """
+        line = (pad_short_line(text)
+                if _ENGINE_NEEDS_SHORT_PAD.get(engine, False) else text)
+        line = self._pronounce(line, engine=engine)
+        return self._split_sentences(line, engine=engine)
 
     def _cache_key(self, engine: str, spoken: str) -> str:
         if engine == "fish":
@@ -2406,32 +2470,52 @@ class TTS:
             return True
 
         def _fallback_chunk(sent: str) -> bool:
-            """Render one chunk on F5 and queue it. True when it was queued.
+            """Render one chunk on F5 and queue it. True when any of it was.
 
             Used when Breeze fails before any audio: a dropped chunk is a
             hole in the sentence, and Jarvis in the 2.79 voice is better than
             Jarvis missing a clause.
+
+            ``sent`` was prepared for Breeze. F5 gets it re-prepared as its
+            own pieces (TTS._refit), each looked up in the cache and filed
+            under F5's key exactly as a native F5 reply would be -- so the
+            fallback voice speaks the text its rules were measured on, and
+            the next F5 utterance of the same line is a hit.
             """
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.close()
+            log.warning("falling back to %s for this chunk", BREEZE_FALLBACK)
             try:
-                log.warning("falling back to %s for this chunk",
-                            BREEZE_FALLBACK)
-                if self.load_breeze_fallback():
-                    self._synth_f5(sent, tmp.name)
-                    if not self._stop_flag:
-                        # under the RENDERING engine's key: breeze-keyed F5
-                        # audio would replay in the wrong voice from cache
-                        self._store(BREEZE_FALLBACK, sent, tmp.name)
-                    wav_q.put((tmp.name, True))
-                    return True
+                if not self.load_breeze_fallback():
+                    return False
             except Exception:
                 log.exception("fallback synth failed too")
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            return False
+                return False
+            queued = False
+            for piece in self._refit(sent, BREEZE_FALLBACK):
+                if self._stop_flag:
+                    break
+                cached = self._cached(BREEZE_FALLBACK, piece)
+                if cached is not None:
+                    wav_q.put((cached, False))
+                    queued = True
+                    continue
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.close()
+                try:
+                    self._synth_f5(piece, tmp.name)
+                except Exception:
+                    log.exception("fallback synth failed too")
+                    try:
+                        os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                    break
+                if not self._stop_flag:
+                    # under the RENDERING engine's key: breeze-keyed F5
+                    # audio would replay in the wrong voice from cache
+                    self._store(BREEZE_FALLBACK, piece, tmp.name)
+                wav_q.put((tmp.name, True))
+                queued = True
+            return queued
 
         def _producer():
             try:
@@ -2908,10 +2992,13 @@ class TTS:
     def _play(self, wav_path: str):
         """Play a wav via paplay → pw-play → aplay (chain order unchanged).
 
-        Uses Popen + poll so stop() can interrupt playback; per-player
-        timeout stays 30s, non-zero exit falls through to the next player.
+        Uses Popen + poll so stop() can interrupt playback; non-zero exit
+        falls through to the next player. The per-player deadline is the
+        file's own length plus PLAYER_GRACE_S -- it was a flat 30 s, which a
+        joined Breeze chunk's replay outlived (see PLAYER_GRACE_S).
         """
         dev = (CONFIG.playback_device or "").strip()
+        deadline_s = _player_deadline(wav_path)
         # An explicit sink (the echo-cancelling one) for the two players
         # that can take one; aplay is the no-PipeWire fallback.
         for cmd in [["paplay", f"--client-name={SPEECH_CLIENT_NAME}",
@@ -2928,7 +3015,7 @@ class TTS:
                 continue
             self._play_proc = proc
             try:
-                if not self._wait_player(proc, deadline_s=30):
+                if not self._wait_player(proc, deadline_s=deadline_s):
                     return
             finally:
                 self._play_proc = None
@@ -2942,6 +3029,11 @@ class TTS:
         deadline = time.monotonic() + deadline_s
         while proc.poll() is None:
             if self._stop_flag or time.monotonic() > deadline:
+                if not self._stop_flag:
+                    # Loud, because it was not: a chunk cut here used to
+                    # leave "speech complete" as its only trace.
+                    log.warning("player cut at its %.0f s deadline -- the "
+                                "rest of that chunk was not heard", deadline_s)
                 proc.terminate()
                 try:
                     proc.wait(timeout=2)
@@ -3297,6 +3389,60 @@ def wav_pcm(path: str) -> tuple[tuple[int, int, int], bytes]:
     return (int(rate), int(data.shape[1]), 2), data.tobytes()
 
 
+# What the file-chain player (paplay / pw-play / aplay handed a FINISHED wav)
+# is allowed BEYOND the audio in that file before it is terminated.
+#
+# It used to be a flat 30 s per player, and a flat number was fine while the
+# largest chunk any engine produced was ~320 characters (~19 s of audio).
+# _BREEZE_STREAM_JOIN_CHARS then made a Breeze chunk the whole reply, 560
+# characters, and only the STREAM path's deadline was revisited
+# (stream.timeout + 30 in _play_stream). The first hearing of a long reply
+# was therefore whole and every other road to the speaker was cut: the same
+# reply said again is a cache hit through _play(), a refusal before audio
+# sends the whole one-chunk reply to F5 through _play(), and so does
+# _play_stream_from_file. At 0.0594 s/char (BREEZE_TIMEOUT_S's arithmetic) a
+# 560-char chunk is 33.2 s and a capped 522-char reply 31.0 s; at F5's
+# measured 0.060 s/char the fallback render of the same reply is 31.4 s. All
+# of them past 30, terminated in silence, with "speech complete" in the log.
+#
+# So the deadline is now the file's own length plus this. 30 is kept as the
+# grace because it is what the number always bounded in practice: the sound
+# server's buffered tail, a slow start, and a player that has genuinely
+# wedged. See _wav_seconds for why the length is read off the file's SIZE
+# and not its header.
+PLAYER_GRACE_S = 30.0
+
+
+def _wav_seconds(path: str) -> Optional[float]:
+    """Seconds of audio in a PCM wav, or None when it is not one.
+
+    From the file's SIZE, bounded by the header's frame count, and not the
+    header alone: a Breeze cache entry is the tee of a stream, so its header
+    carries STREAM_SIZE in both length fields -- which wave reads as
+    2147483647 frames, 89478 s at 24 kHz (measured). A deadline built on
+    that would be no deadline at all. Edge writes an MP3 into a .wav-suffixed
+    file (module docstring), which wave refuses: that returns None and the
+    player keeps the flat grace it always had.
+    """
+    try:
+        size = os.path.getsize(path)
+        with wave.open(path, "rb") as fh:
+            rate = fh.getframerate()
+            frame = fh.getnchannels() * fh.getsampwidth()
+            if not rate or not frame:
+                return None
+            frames = min(fh.getnframes(),
+                         max(0, size - _WAV_HEADER_BYTES) // frame)
+    except (wave.Error, EOFError, OSError):
+        return None
+    return frames / float(rate)
+
+
+def _player_deadline(path: str) -> float:
+    """How long _play may wait on one player for ``path``."""
+    return PLAYER_GRACE_S + (_wav_seconds(path) or 0.0)
+
+
 class Rendition:
     """One reply, rendered as wav bytes for a client that is not the room.
 
@@ -3314,17 +3460,31 @@ class Rendition:
     earned depends on the engine. F5, XTTS and edge render a whole chunk
     before a byte of it exists, so their first bytes arrive one chunk in.
     Breeze does not: it streams, so ``stream()`` forwards its blocks as they
-    land and the phone hears the reply ~0.3 s in whatever its length. That
-    matters here more than it does in the room, because
-    _BREEZE_STREAM_JOIN_CHARS made a reply one chunk -- correctly, for a
-    player that streams; ruinously for a reader that waited for a finished
-    file, which is what this used to be (a 218-character reply went from
-    1.35 s to first byte to 9.49 s, and webapp's _stream_clip holds the HTTP
-    status line back until then).
+    land and the phone hears the reply ~0.3 s in whatever its length --
+    WHEN THE SIDECAR IS IDLE. That matters here more than it does in the
+    room, because _BREEZE_STREAM_JOIN_CHARS made a reply one chunk --
+    correctly, for a player that streams; ruinously for a reader that
+    waited for a finished file, which is what this used to be (a
+    218-character reply went from 1.35 s to first byte to 9.49 s, and
+    webapp's _stream_clip holds the HTTP status line back until then).
+
+    Behind a room utterance it is that utterance's REMAINING RENDER. The
+    sidecar serialises generation under one lock and withholds its status
+    line until the first block exists, so a request that lands mid-utterance
+    gets nothing at all until the room's render is done -- and since the
+    join the room's utterance is the whole reply, up to ~30 s for a capped
+    one at RTF 0.742 (before it, the lock was released at every sentence
+    and a phone request could slip in between). _stream_clip then holds the
+    HTTP status line back for that same first block, so for all of it the
+    phone sees no response whatever. The reverse holds too: a phone stream
+    stalls the room's next utterance on the same lock, which the room
+    survives only because BREEZE_TIMEOUT_S is 60 s. Pinned by
+    test_a_phone_stream_behind_a_room_stream_waits_for_the_whole_render.
     """
 
     def __init__(self, tts: "TTS", text: str):
         self.tts = tts
+        self.text = text                 # kept for _replan
         self.engine = tts.render_engine()
         # ONE cache lookup per chunk, here: _cached() also keeps the hit /
         # miss counters, so asking twice would report a hit rate this
@@ -3497,11 +3657,20 @@ class Rendition:
         engine = self.tts.render_engine()
         if engine == self.engine:
             return
-        log.info("render: engine changed %s -> %s; re-reading the cache",
+        log.info("render: engine changed %s -> %s; re-planning under it",
                  self.engine, engine)
         self.engine = engine
+        # Re-derived from the text, not re-keyed chunk by chunk: the chunks
+        # are the engine's too. Planned under Breeze the reply is ONE chunk
+        # (the join), and handing that to F5 -- a whole-chunk engine --
+        # made the phone wait for a whole-reply render before its status
+        # line (~2-3 s for a capped reply against ~0.5 s for a sentence)
+        # and filed it under a key the room's F5 split never looks up
+        # (measured: four sentence chunks, four misses). render_chunks runs
+        # the room's own three steps under the engine load() chose, so the
+        # pad, the pronunciation rules and the split are all F5's.
         self.plan = [(chunk, self.tts._cached(engine, chunk))
-                     for chunk, _ in self.plan]
+                     for chunk in self.tts.render_chunks(self.text)]
 
     def _synth(self, chunk: str) -> Optional[str]:
         """Render one chunk to a temp wav and file it in the speech cache
