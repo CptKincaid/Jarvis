@@ -77,6 +77,7 @@ from jarvis import leavetime as leavetime_mod
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
+from jarvis.previewprobe import PATH_GREEDY, PATH_SPECULATIVE, PreviewProbe
 from jarvis import dayreview as dayreview_mod
 from jarvis import garden as garden_mod
 from jarvis.dialogue import SESSION_WINDOW_S
@@ -2918,6 +2919,22 @@ class JarvisApp:
         threading.Thread(target=self._partial_loop, name="partial",
                          daemon=True).start()
 
+    @property
+    def preview_probe(self) -> PreviewProbe:
+        """The ghost-card instrument (jarvis/previewprobe.py), built lazily.
+
+        Lazy, and with a class-level None default, for the same reason the
+        attributes above have one: _partial_loop is exercised on apps the
+        tests build with object.__new__, which never run __init__. An
+        instrument that raises on an uninitialised app would take down the
+        preview thread it is supposed to be watching.
+        """
+        probe = self._preview_probe
+        if probe is None:
+            probe = PreviewProbe(jsonl_path=PATHS.LOG_DIR / "previews.jsonl")
+            self._preview_probe = probe
+        return probe
+
     def _partial_loop(self):
         """Re-decode the growing buffer and publish PartialText; run the
         speculative decode once the user has paused (_maybe_speculate).
@@ -2971,6 +2988,13 @@ class JarvisApp:
                     audio = audio[-int(SAMPLE_RATE * self._PARTIAL_MAX_S):]
                 if audio is not None and len(audio) >= int(
                         SAMPLE_RATE * self._PARTIAL_MIN_S):
+                    # Count the decode BEFORE the publish filter below. The
+                    # gap between decodes and emissions is the number no
+                    # diagnosis of the 09-03 transcript spam could get: the
+                    # preview fires ~1/s for the whole capture, and only the
+                    # passes that CHANGED the card were ever visible at all.
+                    seconds = len(audio) / SAMPLE_RATE
+                    self.preview_probe.decoded(PATH_GREEDY)
                     try:
                         text = (self.transcriber.partial(audio) or "").strip()
                     except Exception:
@@ -2981,6 +3005,14 @@ class JarvisApp:
                     if text and text != last and self.recorder.recording:
                         last = text
                         self._partial_shown = True
+                        # Record the SHAPE of what is about to be shown.
+                        # This call cannot withhold the publish and its
+                        # result is deliberately ignored -- the cause of
+                        # the spam is unproven, and a preview filter built
+                        # on a guess is the 2026-08-31 confidence gate that
+                        # ate his commands, wearing a different hat.
+                        self.preview_probe.shown(text, path=PATH_GREEDY,
+                                                 audio_s=seconds)
                         bus.publish(PartialText(text=text))
                 # pace from the END of the decode, so a slow pass backs off
                 # instead of queueing up behind itself.
@@ -2994,6 +3026,7 @@ class JarvisApp:
             # is the last thread that should get to keep one on screen.
             if self._partial_shown:
                 self._partial_shown = False
+                self.preview_probe.retracted(PATH_GREEDY)
                 bus.publish(PartialText(text=""))
 
     # ------------------------------------------- speculative transcription
@@ -3020,6 +3053,7 @@ class JarvisApp:
     _speculation = None
     _spec_lock = threading.Lock()
     _partial_shown = False        # a ghost card is up and needs retracting
+    _preview_probe = None         # PreviewProbe, built on first use below
     _stop_event = None
     _wake_pending = False
     _turn_from_wake = False
@@ -3105,6 +3139,19 @@ class JarvisApp:
         if text and result.accepted and rec.recording:
             # The speculative text IS the best preview there is.
             self._partial_shown = True
+            # Instrumented too, though this path is already gated and
+            # already logged below: both paths publish the SAME PartialText
+            # event, so without the path tag a repeat on screen cannot be
+            # attributed to an emitter after the fact. That ambiguity is
+            # what cost the 09-03 diagnosis its confidence.
+            # getattr, not result.audio_seconds: the probe's methods swallow
+            # their own exceptions, but ARGUMENT evaluation happens first,
+            # and `result` here is duck-typed by callers and tests. An
+            # instrument is not allowed to be the thing that breaks the
+            # decode path it is measuring.
+            self.preview_probe.shown(
+                text, path=PATH_SPECULATIVE,
+                audio_s=getattr(result, "audio_seconds", None))
             bus.publish(PartialText(text=text))
         log.debug("speculative decode at last_speech=%.2fs took %.2fs (%s)",
                   key, spec.finished - spec.started,

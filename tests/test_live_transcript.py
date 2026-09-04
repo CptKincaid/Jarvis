@@ -290,3 +290,102 @@ def test_empty_partial_text_takes_the_card_down():
     TranscriptView.show_partial(fake, "2-")          # noise clears it too
     TranscriptView.show_partial(fake, "2,000,000,000,000")
     assert fake.cleared == 3
+
+
+# ------------------------------------------------- the ghost-card instrument
+#
+# 2026-09-03, Hunter: two words repeated on the console transcript for a
+# short bit, then stopped on their own. Three independent diagnoses ran and
+# NONE reached high confidence, all for the same reason -- this loop
+# publishes to the screen and writes nothing down, so a grep of the log
+# found 0 and 1 hits for words he had watched appear repeatedly. The cause
+# is still unproven, so what ships is an instrument (jarvis/previewprobe.py),
+# not a filter. These tests pin the wiring: the instrument sees what the
+# screen sees, and it costs the screen nothing.
+
+def _instrumented_pipe(texts, min_s=0.5):
+    """A pipeline whose preview returns `texts` in order, then stops."""
+    from jarvis.previewprobe import PreviewProbe
+    state = {"i": 0}
+
+    class Rec:
+        recording = True
+
+        def snapshot_audio(self):
+            return np.zeros(int(SAMPLE_RATE * 1.0), dtype=np.float32)
+
+    class Tr:
+        def partial(self, audio):
+            i = min(state["i"], len(texts) - 1)
+            state["i"] += 1
+            if state["i"] >= len(texts):
+                Rec.recording = False
+            return texts[i]
+
+    pipe = object.__new__(_pipeline_class())
+    pipe.recorder, pipe.transcriber = Rec(), Tr()
+    pipe._PARTIAL_INTERVAL_S, pipe._PARTIAL_MIN_S = 0.01, min_s
+    # Fixed salt and a captured emit: the probe's own behaviour is covered
+    # in tests/test_preview_probe.py; these only care that the loop feeds it.
+    got = []
+    pipe._preview_probe = PreviewProbe(repeat_threshold=3, salt=b"wiring",
+                                       emit=got.append)
+    return pipe, got
+
+
+def test_the_preview_counts_every_decode_not_only_the_visible_ones(monkeypatch):
+    """The number no 09-03 diagnosis could get. The loop republishes only
+    on CHANGE, so a preview stuck on one string decodes over and over and
+    draws once -- and before this, those passes left no trace anywhere."""
+    seen = _capture(monkeypatch)
+    pipe, _ = _instrumented_pipe(["same", "same", "same", "same"])
+    pipe._partial_loop()
+
+    counts = pipe.preview_probe.counters()
+    assert counts["decodes"] == 4, counts       # every pass through partial()
+    assert counts["emissions"] == 1, counts     # one card ever drawn
+    assert counts["retractions"] == 1, counts
+    assert seen == ["same", ""], seen           # unchanged by instrumenting
+
+
+def test_instrumenting_the_preview_changes_nothing_on_screen(monkeypatch):
+    """The contract that makes this safe to ship against an unproven cause:
+    the probe observes, it does not decide. Same expectation as
+    test_partial_loop_publishes_only_changes, held after the wiring."""
+    seen = _capture(monkeypatch)
+    pipe, _ = _instrumented_pipe(["hello", "hello", "hello there",
+                                  "hello there"])
+    pipe._partial_loop()
+    assert seen == ["hello", "hello there", ""], seen
+
+
+def test_a_repeated_preview_is_recorded_as_a_repeat(monkeypatch):
+    """The signature the next occurrence will leave behind: one string,
+    three times, tagged with the path that emitted it and the buffer
+    length that produced it."""
+    from jarvis.previewprobe import PATH_GREEDY
+    _capture(monkeypatch)
+    # alternating spellings, the way whisper varies between passes --
+    # one hallucination, not three
+    pipe, got = _instrumented_pipe(["Beta.", "beta", " Beta ", "beta."])
+    pipe._partial_loop()
+
+    assert len(got) == 1, got
+    rec = got[0]
+    assert rec.count == 3 and rec.path == PATH_GREEDY
+    assert rec.words == 1
+    assert rec.audio_s is not None
+    # and it still showed him every one of them
+    assert pipe.preview_probe.counters()["emissions"] >= 3
+
+
+def test_the_probe_is_built_lazily_on_an_uninitialised_app():
+    """_partial_loop runs on apps these tests build with object.__new__,
+    which never ran __init__. An instrument that raised there would take
+    down the preview thread it exists to watch."""
+    from jarvis.previewprobe import PreviewProbe
+
+    pipe = object.__new__(_pipeline_class())
+    probe = pipe.preview_probe
+    assert isinstance(probe, PreviewProbe)
+    assert pipe.preview_probe is probe          # built once, then reused
