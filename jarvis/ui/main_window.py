@@ -132,7 +132,13 @@ MIN_W, MIN_H = 460, 720
 STATE_WORDS = {"idle": "READY", "listening": "LISTENING",
                "thinking": "THINKING", "speaking": "SPEAKING",
                "waiting": "WAITING", "working": "WORKING",
-               "error": "ERROR"}
+               "error": "ERROR",
+               # 2026-09-03 (ui-polish U05/U07): the boot pill and the
+               # ringing alarm. Both narrower than LISTENING -- measured
+               # on Xvfb :92 at S=2 in the chip face, LOADING 140 px and
+               # ALARM 118 against LISTENING's 158 -- so the header budget
+               # of tests/test_header_fit.py is unchanged.
+               "loading": "LOADING", "alarm": "ALARM"}
 WARN_HOLD_S = 4.0            # warn Status: pill dot amber for this long
 ERROR_HOLD_S = 6.0           # error Status: pill ERROR until ok/info or this
 SNOOZE_MIN = 10              # the alarm modal's SNOOZE button
@@ -150,24 +156,73 @@ DEFAULT_SWEEP_STAGES = 4     # power-up stages when no Board is up to count
 
 def resolve_state(speaking: bool, listening: bool, thinking: bool,
                   error: bool, waiting: bool = False,
-                  working: bool = False) -> str:
+                  working: bool = False, alarm: bool = False,
+                  loading: bool = False) -> str:
     """App-state precedence — the first four in the SAME order as
     Reactor.state() so the pill and the stage never disagree (the stage
     keeps idle / listen / think / speak): speaking > listening > thinking
-    > waiting > working > error (held) > idle."""
+    > alarm > waiting > working > error (held) > loading > idle.
+
+    `alarm` (a modal is ringing) sits right under the three turn states:
+    the modal is the loud signal, but while he answers it LISTENING is the
+    feedback he needs. `loading` (the speech model is still coming up) is
+    the floor above idle: anything at all outranks it, because anything at
+    all is proof the app is alive."""
     if speaking:
         return "speaking"
     if listening:
         return "listening"
     if thinking:
         return "thinking"
+    if alarm:
+        return "alarm"
     if waiting:
         return "waiting"
     if working:
         return "working"
     if error:
         return "error"
+    if loading:
+        return "loading"
     return "idle"
+
+
+def pill_look(state: str, warn_live: bool, look: Optional[str] = None) -> tuple:
+    """(dot_color, word_color, dot_shape) for the StatePill in `state`
+    (pure; `look` defaults to theme.LOOK at call time).
+
+    Classic: today's table, byte for byte -- the word is FOCAL for the
+    FOCAL_WORD_STATES and the state colour otherwise, and a live warn hold
+    paints the dot amber whatever the state.
+
+    Holo (2026-09-03, ui-polish U05), three collisions measured on the
+    09-03 shots and closed here:
+      * ERROR's dot was (255,180,84) = WARN whenever a warn hold was live
+        (a warn then an error inside 4 s is exactly 'memory tight' then
+        'Ollama not responding'), so ERROR read as WARN from 2 m -- the
+        error state now ignores the hold: ERR dot, ERR word.
+      * WORKING's dot was (24,153,189), identical to READY's -- the two
+        Claude-task states now draw the dot as a RING (the sensing badge's
+        shape channel), CYAN for working and WARN for waiting, so 'Claude
+        is busy' and 'Jarvis is busy' part without a fourth colour.
+      * a LOADING word in MUTED over a FAINT dot: the lamp is not lit yet.
+    """
+    look = theme.LOOK if look is None else look
+    color = theme.STATE_COLORS.get(state, theme.CYAN_DIM)
+    word = theme.FOCAL if state in theme.FOCAL_WORD_STATES else color
+    shape = "disc"
+    if look != "holo":
+        return (theme.WARN if warn_live else color), word, shape
+    if state == "error":
+        return color, word, shape
+    if state == "working":
+        color, shape = theme.CYAN, "ring"
+    elif state == "waiting":
+        shape = "ring"
+    elif state == "loading":
+        word = theme.MUTED
+    dot = theme.WARN if warn_live else color
+    return dot, word, shape
 
 
 class ClaudeTaskTracker:
@@ -638,6 +693,18 @@ class MainWindow:
         self._tasks = ClaudeTaskTracker()
         self._project = ""
         self._alarm = None               # (alarm_id, Card) while ringing
+        self._alarm_scrim = None         # holo: the stippled dim under it
+        # Pill inputs beyond the turn (2026-09-03, ui-polish U05/U07).
+        # `_booting` is raised at the END of construction -- after the
+        # construction-time Status("Ready") below, which is the window's
+        # own, not the app's -- and cleared by ModelInfo (the speech model
+        # is up) or by the first ok/info/error Status the app publishes.
+        # Before this the pill read READY from the first frame while
+        # 'Loading speech model…' (a busy Status, which renders no text)
+        # was the truth. `_pending` holds the request ids of YES/NO and
+        # ALLOW/DENY cards still waiting on him: an answer owed is WAITING.
+        self._booting = False
+        self._pending: set = set()
         # The console's second surface and its mode machine. Declared HERE,
         # before _subscribe() attaches the bus: a BoardCommand arriving
         # between that and the driver's construction must find `None`, not
@@ -746,6 +813,9 @@ class MainWindow:
         else:
             self.set_status("Ready", "ok")
         self._refresh_placeholder()
+        # Raised AFTER the window's own Status above: from here until the
+        # app says otherwise the speech model is still loading (U05).
+        self._booting = True
         self._refresh_pill()
         self._refresh_terminal()
 
@@ -1812,6 +1882,11 @@ class MainWindow:
         or 6 s, whichever first, plus a 4 s toast."""
         log.info("status[%s]: %s", kind, text)
         now = time.monotonic()
+        if kind != "busy" and self._booting:
+            # any ok / info / warn / error from the app is proof it is up;
+            # busy is what the boot itself publishes (U05)
+            self._booting = False
+            self._refresh_pill()
         if kind == "warn":
             self.toast.show(text, kind="warn", ms=4000)
             self._warn_until = now + WARN_HOLD_S
@@ -1828,21 +1903,36 @@ class MainWindow:
 
     def _app_state(self) -> str:
         now = time.monotonic()
+        # The three 09-03 inputs (alarm ringing, an answer owed, the boot)
+        # are holo-only: classic keeps the 08-31 pill exactly, warts
+        # included (CLAUDE.md), so it never sees them.
+        holo = theme.LOOK == "holo"
         return resolve_state(self._speaking, self._recording, self._thinking,
                              now < self._error_until,
-                             waiting=self._tasks.waiting,
-                             working=self._tasks.working)
+                             waiting=self._tasks.waiting
+                             or (holo and bool(self._pending)),
+                             working=self._tasks.working,
+                             alarm=holo and self._alarm is not None,
+                             loading=holo and self._booting)
 
     def _refresh_pill(self):
         """Recompute the StatePill from the event-derived state machine
-        (called on every state-changing event). Idle / WORKING / WAITING:
-        FOCAL word, the dot carries the colour; other states take
-        STATE_COLORS for both; a live warn hold turns only the dot amber."""
+        (called on every state-changing event). pill_look() holds the
+        colour / shape table for both looks."""
         state = self._app_state()
-        color = theme.STATE_COLORS.get(state, theme.CYAN_DIM)
-        word_color = theme.FOCAL if state in theme.FOCAL_WORD_STATES else color
-        dot = theme.WARN if time.monotonic() < self._warn_until else color
-        self.pill.set_state(STATE_WORDS[state], dot, word_color)
+        dot, word_color, shape = pill_look(
+            state, time.monotonic() < self._warn_until)
+        self.pill.set_state(STATE_WORDS[state], dot, word_color, shape)
+        if theme.LOOK == "holo" and dot != self._bar_state_color:
+            # the leading ticks of the segmented bar follow the state dot
+            # (recoloured on state events only — never a timer of its own)
+            self._bar_state_color = dot
+            rule = getattr(self, "_rule", None)
+            if rule is not None:
+                try:
+                    rule.itemconfigure("state", fill=dot)
+                except tk.TclError:
+                    pass
         if theme.LOOK == "holo" and dot != self._bar_state_color:
             # the leading ticks of the segmented bar follow the state dot
             # (recoloured on state events only — never a timer of its own)
@@ -2258,6 +2348,9 @@ class MainWindow:
 
     def _ev_model(self, ev: ModelInfo):
         self._asr_text = fmt_asr(ev.text)         # 'small · GPU fp16' → SMALL
+        if self._booting:
+            self._booting = False                 # the speech model is up
+            self._refresh_pill()
 
     def _ev_partial(self, ev: PartialText):
         self.transcript.show_partial(ev.text)
@@ -2432,11 +2525,25 @@ class MainWindow:
         # the question is what this turn produced: consume the utterance
         # stamp so a later spontaneous reply cannot wear its round trip
         self._utter_ts = None
-        self.transcript.add_approval(ev.request_id, ev.question,
-                                     self._answer_approval)
+        card = self.transcript.add_approval(ev.request_id, ev.question,
+                                            self._answer_approval)
+        if card is not None:
+            self._question_opened(ev.request_id)
+
+    def _question_opened(self, request_id: str):
+        """A YES/NO or ALLOW/DENY card is now waiting on him: the pill
+        says WAITING until it is answered (U07)."""
+        self._pending.add(request_id)
+        self._refresh_pill()
+
+    def _question_closed(self, request_id: str):
+        if request_id in self._pending:
+            self._pending.discard(request_id)
+            self._refresh_pill()
 
     def _ev_approval_done(self, ev: ApprovalResolved):
         self.transcript.resolve_approval(ev.request_id, ev.allowed)
+        self._question_closed(ev.request_id)
 
     def _ev_uncertain(self, ev: UncertainUtterance):
         """"Was that for me?" as a card that WAITS. The old behaviour was a
@@ -2444,15 +2551,18 @@ class MainWindow:
         before it could be read, and nothing could answer it."""
         self._note_output()
         self._utter_ts = None
-        self.transcript.add_approval(ev.request_id, ev.question,
-                                     self._answer_uncertain,
-                                     yes_text="YES", no_text="NO")
+        card = self.transcript.add_approval(ev.request_id, ev.question,
+                                            self._answer_uncertain,
+                                            yes_text="YES", no_text="NO")
+        if card is not None:
+            self._question_opened(ev.request_id)
 
     def _ev_uncertain_done(self, ev: UncertainResolved):
         # also fires when the spoken reply answered it, so the card stops
         # inviting a click that would arrive too late
         self.transcript.resolve_approval(ev.request_id, ev.yes,
                                          yes_mark="yes", no_mark="no")
+        self._question_closed(ev.request_id)
 
     def _answer_uncertain(self, request_id: str, yes: bool):
         fn = self.services.uncertain_answer
@@ -2584,6 +2694,13 @@ class MainWindow:
             card.destroy()
         except tk.TclError:
             pass
+        if self._alarm_scrim is not None:
+            self._alarm_scrim = None
+            try:
+                self.reactor.delete("alarm_scrim")
+            except tk.TclError:
+                pass
+        self._refresh_pill()                      # ALARM leaves the header
 
     # ------------------------------------------------------ config echoes
     def _on_config_change(self, name, value):

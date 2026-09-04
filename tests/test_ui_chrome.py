@@ -370,3 +370,13 @@ def test_toast_kind_colour_is_read_per_call():
     theme.select_look("holo")
     assert Toast._kind_fg("info") == theme.INK
     assert Toast._kind_fg("error") == theme.ERR
+
+
+# =====================================================================
+# 2026-09-03 ui-polish (the 09-03 panel, ~/scratch-0903/ui-synthesis.md)
+# =====================================================================
+from jarvis.ui.widgets import StatePill  # noqa: E402
+def test_state_pill_has_a_ring_shape_and_set_state_defaults_to_the_disc():
+    sig = inspect.signature(StatePill.set_state)
+    assert sig.parameters["shape"].default == StatePill.DOT_DISC == "disc"
+    assert StatePill.DOT_RING == "ring"
