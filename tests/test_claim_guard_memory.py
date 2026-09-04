@@ -24,6 +24,7 @@ which is also true of the live registry today.
 """
 import pytest
 
+import jarvis.brain as brain_mod
 from jarvis.router import is_question
 from tests.test_brain_tools import (FakeContext, FakeMemory, FakeOllama,  # noqa: F401
                                     brain, make_registry, text_reply, tool_reply)
@@ -98,3 +99,57 @@ def test_do_not_forget_is_guarded_on_the_brain(setup, caplog):
     assert record == []
     assert _warnings(caplog), "the guard never armed"
     assert len(fake.chat_payloads()) == 2          # the one retry was spent
+
+
+# ------------------------------------------------ (5) the memory shapes
+# 7539478 taught the table "I have noted that", "I'll remember/note that"
+# and "I've saved that to memory". The refuter listed the promises that
+# still walked through (store, keep/bear in mind, make a note, the
+# have-less "I noted that already", "I've remembered that") and the
+# ordinary English that must not be caught.
+@pytest.mark.parametrize("line", [
+    "I'll keep that in mind, sir.",
+    "I'll bear that in mind, sir.",
+    "I'll make a note of that.",
+    "I'll store that for you.",
+    "I've remembered that, sir.",
+    "I noted that already, sir.",
+    "I will keep this in mind.",
+    "I shall make a note of it, sir.",
+    "I've made a note of that, sir.",
+    "I'm making a note of that now, sir.",
+    "I won't forget that, sir.",              # the negative promise IS the promise
+    "I've committed that to memory, sir.",
+    "I have noted that, sir; December 10th for your graduation.",
+])
+def test_a_memory_promise_is_an_unbacked_claim(line):
+    assert brain_mod.unbacked_claim(line), line
+
+
+@pytest.mark.parametrize("line", [
+    "I've saved you twenty minutes, sir.",          # saved + a duration: an idiom
+    "I've saved you some time, sir.",
+    "I've saved you the trouble of a second trip.",
+    "I've saved you a trip to the lab, sir.",
+    "As I noted earlier, the lab has no listed duration.",
+    "As I noted this morning, your flight is at nine.",
+    "You noted that yourself last week, sir.",
+    "It is noted in your calendar as a tentative hold.",
+    "I remember that day well, sir.",               # present tense, no promise
+    "I can't remember that, sir; it was before my time.",
+    "I haven't noted anything about your graduation, sir.",
+    "Shall I remember that for you, sir?",          # an offer
+    "Would you like me to keep that in mind?",
+    "I'll keep it short, sir.",                     # keep, but not in mind
+    "I'll remember this evening for a long time, sir.",
+    "I'm afraid I have no way to store that, sir; say remember that and I shall.",
+])
+def test_ordinary_memory_talk_is_not_a_claim(line):
+    assert brain_mod.unbacked_claim(line) is None, line
+
+
+def test_the_authored_memory_line_is_not_itself_a_claim():
+    """The line the guard speaks for a memory claim carries the words
+    'remember that' and 'I will'; a retry that echoes it must not trip
+    the table it was written to answer."""
+    assert brain_mod.unbacked_claim(brain_mod.UNBACKED_MEMORY_LINE) is None

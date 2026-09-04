@@ -300,18 +300,81 @@ UNBACKED_NUDGE = ("[You described actions you did not perform. If I asked "
                   "only asked a question, answer it without saying you did "
                   "anything.]")
 UNBACKED_LINE = "I couldn't do that part, sir."
+# The MEMORY-shaped claim gets a line of its own, and an actionable one.
+# "I couldn't do that part, sir." was honest and useless for it (2026-09-04
+# refuter, probe a): "that part" named nothing he could identify and told
+# him nothing about how to phrase it so it lands. This names the way in.
+UNBACKED_MEMORY_LINE = ("I can't store that from here, sir — say 'remember "
+                        "that …' and I will.")
+
+
+# The memory shapes: "I have noted that, sir" (2026-09-02, his graduation),
+# "I'll remember that", "I've saved that to memory", and the promises the
+# refuter found still walking through (store, keep/bear in mind, make a
+# note, the have-less "I noted that already", "I've remembered that", the
+# negative promise "I won't forget that"). A claim to have remembered is a
+# claim to have acted, and nothing was stored: no tool in the registry
+# stores a fact (see CLAIM_BACKERS).
+#
+# Written as a function of ONE choice, measured in
+# tests/test_claim_guard_memory.py over 60 sentences: does "I have noted
+# that <the lab has no listed duration>" -- an observation wearing the
+# store's verb -- count? `observation_exempt=True` lets "that <clause>"
+# through and catches only "that, sir" / "that." / "that for you"; False
+# flags them all. The strict rule is the one compiled: it costs an
+# observation a retry (and, with the retry kept when honest, rarely more),
+# where the lookahead lets "I have noted that you graduate December 10th"
+# -- the incident's own sentence with its fact spelled out -- walk through.
+_MEMORY_OBJ = r" (?:that|it|this|all (?:of )?(?:that|it|this))"
+_MEMORY_ADV = (r"(?: just| now| already| duly| certainly| of course| definitely|"
+               r" gladly| also| always)?")
+
+
+def _memory_claim_src(observation_exempt=False):
+    obj = _MEMORY_OBJ
+    if observation_exempt:
+        obj += (r"(?=\s*(?:[,.;:!?]|$|(?:sir|for you|for later|already|now|"
+                r"then|too|as well|down)\b))")
+    return (
+        # done: "I have noted that", "I've remembered that", "I noted that already"
+        r"i(?:'ve| have)?" + _MEMORY_ADV + r" (?:noted|remembered|memori[sz]ed)" + obj
+        + r"|i(?:'ve| have)?" + _MEMORY_ADV + r" made a (?:mental )?note of" + obj
+        # done, into memory: "I've saved/stored/put/committed that to memory"
+        + r"|i(?:'ve| have)?" + _MEMORY_ADV
+        + r" (?:stored|saved|put|committed|added|filed|logged)" + _MEMORY_OBJ
+        + r" (?:in|to|into|away in) (?:my |your |long-term )?memory\b"
+        # doing: "I'm making a note of that now", "I am keeping that in mind"
+        + r"|i(?:'m| am)(?: now| just)? (?:noting|remembering|memori[sz]ing)" + obj
+        + r"|i(?:'m| am)(?: now| just)? making a (?:mental )?note of" + obj
+        + r"|i(?:'m| am)(?: now| just)? (?:keeping|bearing)" + _MEMORY_OBJ + r" in mind\b"
+        + r"|i(?:'m| am)(?: now| just)? (?:storing|saving|committing|filing)"
+        + _MEMORY_OBJ + r" (?:in|to|into|away in) (?:my |your |long-term )?memory\b"
+        # promised: "I'll remember that", "I shall store that for you",
+        # "I'll keep that in mind", "I'll make a note of that"
+        + r"|i(?:'ll| will| shall)" + _MEMORY_ADV
+        + r" (?:remember|note|store|memori[sz]e|retain)" + obj
+        + r"|i(?:'ll| will| shall)" + _MEMORY_ADV + r" (?:keep|bear)" + _MEMORY_OBJ + r" in mind\b"
+        + r"|i(?:'ll| will| shall)" + _MEMORY_ADV + r" make a (?:mental )?note of" + obj
+        # the negative promise IS the promise: "I won't forget that, sir"
+        + r"|i (?:won['’]t|will not|shall not|shan['’]t)(?: ever)? forget" + obj
+        + r"|i(?:'ll| will| shall) never forget" + obj
+    )
+
+
+_MEMORY_CLAIM_SRC = _memory_claim_src(observation_exempt=False)
+# The claim text alone (what _sentence_claim returns), for claim_kind.
+_MEMORY_CLAIM_RX = re.compile(r"^(?:" + _MEMORY_CLAIM_SRC + r")$", re.I)
 _ACTION_CLAIM_RX = re.compile(
     r"\b(?:"
+    # The memory shapes come FIRST: alternation takes the first branch that
+    # matches at a position, and "I've saved that to memory" must be found
+    # by the memory branch, not cut to "I've saved" by the past-tense one.
+    + _MEMORY_CLAIM_SRC +
     # "I've added milk", "I have set a timer", "I've just started it"
-    r"i(?:'ve| have)(?: just| now| already)? (?:added|set|started|cancell?ed|"
+    r"|i(?:'ve| have)(?: just| now| already)? (?:added|set|started|cancell?ed|"
     r"removed|sent|queued|scheduled|saved|created|deleted|paused|resumed|"
     r"turned (?:on|off|up|down)|switched|moved|booked|cleared|stopped|"
     r"muted|skipped|dimmed|put)\b"
-    # "I have noted that, sir" (2026-09-02, his graduation): a claim to have
-    # remembered is a claim to have acted, and nothing was stored.
-    r"|i(?:'ve| have)(?: just| now| already)? noted (?:that|it|this)\b"
-    r"|i(?:'ll| will| shall)(?: certainly| of course)? (?:remember|note) (?:that|it|this)\b"
-    r"|i(?:'ve| have)(?: just| now)? (?:stored|saved|put|committed) (?:that|it|this) (?:in|to|into) (?:my )?memory\b"
     # "I'm starting your music now", "I am adding it to the list"
     r"|i(?:'m| am)(?: now| just)? (?:starting|playing|adding|setting|cancell?ing|"
     r"removing|sending|queuing|queueing|scheduling|saving|creating|"
@@ -362,24 +425,45 @@ _CLAIM_HEDGE_RX = re.compile(
 #    "I'm stopping there". Matched against what FOLLOWS the claim, so the
 #    same verbs with a real object still count ("I'm turning on the
 #    lights", "I'm putting on some jazz", "I'm moving your three o'clock").
+#    Two more from the memory shapes (2026-09-04): "I've saved you twenty
+#    minutes" -- saved + a duration or an effort is a figure of speech,
+#    nothing was written anywhere -- and "I'll remember this evening" /
+#    "as I noted this morning", where the object is a TIME, not a fact.
 _CLAIM_IDIOM_RX = re.compile(
     r"^\s*(?:on(?:to|\s+to|\s+from)\b|on[\s,.;!]*$|onwards?\b|aside\b|"
     r"ahead\b|forwards?\b|afresh\b|anew\b|short\b|there\b|here\b|"
-    r"(?:\d+|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b)", re.I)
+    r"(?:\d+|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety)\b|"
+    r"you\b(?:\s+\w+){0,3}?\s+(?:minutes?|hours?|seconds?|days?|weeks?|"
+    r"months?|years?|time|trip|trouble|bother|effort|hassle|journey|walk|"
+    r"drive|fortune|money|steps?)\b|"
+    r"(?:morning|afternoon|evening|night|week|weekend|month|year|day|time|"
+    r"moment|occasion|summer|winter|spring|autumn)\b)", re.I)
+# 4. REPORTED, not claimed: "As I noted this morning, ..." refers back to
+#    something said; the word before the claim decides.
+_CLAIM_REPORTED_RX = re.compile(r"(?:^|\s)(?:as|like|just as)\s*$", re.I)
 
 
 def _sentence_claim(sent):
     """The action claim in ONE sentence, or None: a table hit that none of
-    the three vetoes above disqualifies."""
+    the vetoes above disqualifies."""
     if _CLAIM_HEDGE_RX.search(sent or ""):
         return None
     for m in _ACTION_CLAIM_RX.finditer(sent or ""):
         if _CLAIM_NEGATED_RX.search(sent[:m.start()]):
             continue
+        if _CLAIM_REPORTED_RX.search(sent[:m.start()]):
+            continue
         if _CLAIM_IDIOM_RX.match(sent[m.end():]):
             continue
         return m.group(0)
     return None
+
+
+def claim_kind(claim):
+    """'memory' for a claim to have stored or to remember something,
+    'action' for every other shape in the table. The two are backed by
+    different things (CLAIM_BACKERS) and answered with different lines."""
+    return "memory" if _MEMORY_CLAIM_RX.match(claim or "") else "action"
 
 
 def unbacked_claim(text):
