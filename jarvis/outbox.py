@@ -38,6 +38,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from jarvis import contacts as contacts_mod
 from jarvis import filephrase
 from jarvis.logs import get_logger
 from jarvis.tools import filepick
@@ -81,6 +82,12 @@ ACCOUNT_REASK_LINE = "I've no {hint} account, sir — {names}?"
 ACCOUNT_WHICH_LINE = "Which of them, sir — {names}?"
 ASK_DROPPED_LINE = "I'll leave it there, sir; ask me again when you have it."
 ASK_SPENT_LINE = "Very good, sir; nothing sent."
+# "Which Heather, sir — Heather Smith or Heather Jones?" -- the address
+# book's question (jarvis/contacts.py), when two rows answer to the name he
+# said. The status strip carries this string and the commander branches on
+# it BEFORE the file offer, because the file offer's answer grammar is the
+# fuzzy one and a list of people must never reach it.
+WHICH_PERSON_STATUS = "Which person?"
 # The cap refusal is the one place this lane does NOT reuse
 # filepick.reason_line: filepick's wording ("past the N I'll put on the wire
 # without you saying so plainly") offers an override, and for mail there is
@@ -116,6 +123,14 @@ class Draft:
     # answer to come back the same way, the rule _try_briefing_offer
     # already applies to a question that is entirely reversible.
     asked_from: str = "voice"
+    # The recipient came out of the ADDRESS BOOK (jarvis/contacts.py): a
+    # person he typed and validated, with a name to say. The read-back then
+    # speaks the name and SHOWS the address (CommandResult.display_only) --
+    # an address is a bad minute of TTS, and he ruled it. A spoken address,
+    # a legacy send_file.contacts hit and a memory hit keep the spelled-out
+    # wording: they have no validated name to say instead.
+    from_book: bool = False
+    honorific: str = ""              # "Dr" -- spoken before the name only
 
     @property
     def account_label(self) -> str:
@@ -202,8 +217,20 @@ def account_words(account: dict) -> str:
 
 def _to_words(draft: Draft) -> str:
     who = draft.to_name or ""
+    if getattr(draft, "from_book", False) and who:
+        hon = str(getattr(draft, "honorific", "") or "").strip()
+        return f"{hon} {who}".strip()
     addr = spoken_address(draft.to_addr)
     return f"{who}, at {addr}" if who else addr
+
+
+def shown_address(draft: Draft) -> str:
+    """The half of a book read-back that is SHOWN and never spoken:
+    "to heather@example.com". "" for every other kind of recipient, whose
+    address is already in the spoken line."""
+    if getattr(draft, "from_book", False) and draft.to_name:
+        return f"to {draft.to_addr}"
+    return ""
 
 
 def read_back(draft: Draft) -> str:
@@ -331,32 +358,42 @@ def contacts(cfg) -> dict:
     return out
 
 
-def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
-    """(address, what to call them). ("", name) when he has to be asked.
+def resolve(cfg, memory, who: str) -> contacts_mod.Resolution:
+    """What a spoken recipient comes to: found, ambiguous, or unknown.
 
-    Three sources, most explicit first: an address he actually said, the
-    ``send_file.contacts`` map, then the people book Jarvis already keeps
+    Four sources, most explicit first: an address he actually said; the
+    ADDRESS BOOK (jarvis/contacts.py -- consulted first among the books
+    because it is the only one that can say "ambiguous"); the legacy
+    ``send_file.contacts`` map; then the people book Jarvis already keeps
     ("my brother" -> whatever memory.resolve_person returns). NOTHING
-    infers an address from a name — a plausible guess here is a stranger
-    holding his file, and there is no undo.
+    infers an address from a name -- a plausible guess here is a stranger
+    holding his file, and there is no undo. Two rows that answer to one
+    name are a QUESTION (``candidates``), never the first row.
     """
     raw = " ".join(str(who or "").split()).strip(" .,;:?!")
     if not raw:
-        return "", ""
+        return contacts_mod.Resolution()
     said = parse_address(raw)
     if said:
-        return said, ""
+        return contacts_mod.Resolution(addr=said)
     key = re.sub(r"^(?:my|our|the)\s+", "", raw, flags=re.I).strip()
+    try:
+        res = contacts_mod.resolve(raw)
+    except Exception:                                  # noqa: BLE001 - a file
+        log.exception("outbox: the address book could not be read")
+        res = contacts_mod.Resolution()
+    if res.addr or res.candidates:
+        return res
     book = contacts(cfg)
     hit = book.get(key.lower()) or book.get(raw.lower())
     if hit:
-        return hit, key
-    resolve = getattr(memory, "resolve_person", None) if memory is not None else None
-    if callable(resolve):
+        return contacts_mod.Resolution(addr=hit, name=key)
+    resolve_person = getattr(memory, "resolve_person", None) if memory is not None else None
+    if callable(resolve_person):
         person = None
         for probe in (raw, key):
             try:
-                person = resolve(probe)
+                person = resolve_person(probe)
             except Exception:                          # noqa: BLE001 - store
                 log.debug("outbox: resolve_person failed", exc_info=True)
                 person = None
@@ -365,8 +402,17 @@ def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
         if isinstance(person, dict):
             addr = parse_address(person.get("email") or "")
             name = str(person.get("name") or key)
-            return (addr, name) if addr else ("", name)
-    return "", key
+            return contacts_mod.Resolution(addr=addr, name=name)
+    return contacts_mod.Resolution(name=key)
+
+
+def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
+    """(address, what to call them). ("", name) when he has to be asked --
+    and ("", name) for an AMBIGUOUS name too: the callers that only want
+    an address get none, and ``resolve`` is there for the one that needs
+    to know why."""
+    res = resolve(cfg, memory, who)
+    return res.addr, res.name
 
 
 # ------------------------------------------------------------- config
@@ -454,7 +500,17 @@ def prepare(cfg, memory, file_query: str, recipient: str,
         return Prepared(ask=EMPTY_LINE.format(what=spoken_name(match.path)),
                         status="Refused: empty")
 
-    addr, who = resolve_recipient(cfg, memory, recipient)
+    res = resolve(cfg, memory, recipient)
+    addr, who = res.addr, res.name
+    if res.ambiguous:
+        # Two rows in the address book answer to the name he said. A
+        # question, in file order, never the first one -- and its OWN
+        # status, so the commander parks it as a person question and not
+        # as the file offer (whose answer grammar is the fuzzy one).
+        said = " ".join(str(recipient or "").split()).strip(" .,;:?!")
+        return Prepared(ask=contacts_mod.which_line(said, res.candidates),
+                        status=WHICH_PERSON_STATUS,
+                        candidates=list(res.candidates))
     if not addr:
         line = NO_RECIPIENT_LINE.format(who=who) if who else WHO_LINE
         return Prepared(ask=line, status="No address")
@@ -488,7 +544,8 @@ def prepare(cfg, memory, file_query: str, recipient: str,
                   to_addr=addr, to_name=who, account=account,
                   subject=subject.strip() or default_subject(match.path),
                   body=str(_cfg_get(cfg, "send_file.body", "") or DEFAULT_BODY),
-                  made_at=time.monotonic(), roots=kept)
+                  made_at=time.monotonic(), roots=kept,
+                  from_book=bool(res.from_book), honorific=res.honorific)
     log.info("outbox: drafted %s (%d bytes) to %s from %s", match.path.name,
              match.size, mail_mod._mask_address(addr),
              mail_mod.account_label(account))

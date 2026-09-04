@@ -1056,3 +1056,171 @@ def test_nothing_new_on_the_page_needs_a_relaxed_policy(server):
     assert "<script src" not in page
     for handler in ("onclick=", "onchange=", "onload=", "onsubmit="):
         assert handler not in page, f"{handler} would be blocked in silence"
+
+
+# ------------------------------------------------- 10. the address book
+# jarvis/contacts.py's third way in. It rides the SAME server: the enabled
+# switch, the private-bind rule, the key, the limiter and the CSP are all
+# inherited, and every test here proves one of them still applies. Every
+# name and address is made up; the book lives in tmp_path.
+import stat as _stat                                              # noqa: E402
+
+from jarvis import contacts as contacts_mod                       # noqa: E402
+
+
+@pytest.fixture
+def book(tmp_path, monkeypatch):
+    path = tmp_path / "cfg" / "contacts.json"
+    monkeypatch.setenv(contacts_mod.ENV_VAR, str(path))
+    monkeypatch.setattr(contacts_mod, "_BOOK", None)
+    yield path
+    monkeypatch.setattr(contacts_mod, "_BOOK", None)
+
+
+def contacts_post(srv, payload, token=None):
+    return call(srv, "POST", "/api/contacts", json.dumps(payload),
+                token=srv.token if token is None else token,
+                ctype="application/json")
+
+
+def test_the_book_needs_the_key_like_everything_else(server, book):
+    for method, body in (("GET", None),
+                         ("POST", '{"op":"add","name":"X","email":"x@example.com"}')):
+        status, out = call(server.srv, method, "/api/contacts", body,
+                           ctype="application/json")
+        assert status == 401 and "key" in out["error"], method
+    assert not book.exists(), "nothing is written without the key"
+    status, _ = contacts_post(server.srv, {"op": "add", "name": "X",
+                                           "email": "x@example.com"},
+                              token="not-the-key")
+    assert status == 401 and not book.exists()
+
+
+def test_a_public_peer_is_refused_before_the_book_is_touched(server, book,
+                                                              monkeypatch):
+    monkeypatch.setattr(wa._Handler, "_peer", lambda self: "8.8.8.8")
+    status, out = call(server.srv, "GET", "/api/contacts", token=server.srv.token)
+    assert status == 403
+    status, _ = contacts_post(server.srv, {"op": "add", "name": "X",
+                                           "email": "x@example.com"})
+    assert status == 403 and not book.exists()
+
+
+def test_the_book_page_binds_by_the_same_rule_as_the_phone_page(tmp_path):
+    """There is no second server: the page is a route on PhoneServer, so a
+    public bind refuses to start exactly as before."""
+    cfg = make_config(tmp_path, bind="0.0.0.0")
+    srv = wa.PhoneServer(PhoneApp(cfg), cfg=cfg)
+    assert srv.start() is False and not srv.running
+    assert "/contacts" in wa._Handler.do_GET.__code__.co_consts
+
+
+def test_the_book_shell_carries_no_data(server, book):
+    contacts_post(server.srv, {"op": "add", "name": "Perpetua Quill",
+                               "email": "perpetua@example.net"})
+    status, body = call(server.srv, "GET", "/contacts")
+    assert status == 200
+    page = body.decode("utf-8")
+    assert "<title>Jarvis address book</title>" in page
+    assert server.srv.token not in page
+    assert "Perpetua" not in page and "Quill" not in page
+    assert "@" not in page, "no address of any kind, not even a placeholder"
+    assert "<form" not in page, "CSP form-action is 'none'; a submit fails in silence"
+    for handler in ("onclick=", "onchange=", "onload=", "onsubmit="):
+        assert handler not in page
+    assert 'src="http' not in page and 'href="http' not in page
+
+
+def test_add_then_list_round_trips_and_the_file_is_his(server, book):
+    status, out = contacts_post(server.srv, {
+        "op": "add", "name": "Heather Smith", "email": "heather@example.com",
+        "honorific": "Dr", "aliases": ["my advisor"], "note": "PhD advisor"})
+    assert status == 200 and out["ok"] is True, out
+    assert out["contacts"] == [{"name": "Heather Smith", "email": "heather@example.com",
+                                "honorific": "Dr", "aliases": ["my advisor"],
+                                "note": "PhD advisor"}]
+    assert out["path"] == contacts_mod.display_path(book)
+    assert _stat.S_IMODE(book.stat().st_mode) == 0o600
+    status, out = call(server.srv, "GET", "/api/contacts", token=server.srv.token)
+    assert status == 200 and out["contacts"][0]["email"] == "heather@example.com"
+    assert out["skipped"] == []
+    # and the send lane sees it: same resolver, same file
+    assert contacts_mod.current().resolve("my advisor").addr == "heather@example.com"
+
+
+def test_a_bad_address_is_a_400_and_the_file_is_unchanged(server, book):
+    contacts_post(server.srv, {"op": "add", "name": "Heather Smith",
+                               "email": "heather@example.com"})
+    before = book.read_text()
+    for row in ({"name": "Dana Ruiz", "email": "dana at example dot com"},
+                {"name": "Dana Ruiz", "email": "dana@example.com junk"},
+                {"name": "dana@example.com", "email": "dana@example.com"},
+                {"name": "heather smith", "email": "other@example.com"},
+                {"name": "Dana Ruiz", "email": "HEATHER@example.com"}):
+        status, out = contacts_post(server.srv, dict(row, op="add"))
+        assert status == 400 and out["error"], row
+    assert book.read_text() == before
+    status, out = contacts_post(server.srv, {"op": "edit"})
+    assert status == 400 and "op" in out["error"]
+
+
+def test_remove_needs_the_exact_name_and_the_exact_address(server, book):
+    contacts_post(server.srv, {"op": "add", "name": "Heather Smith",
+                               "email": "heather@example.com"})
+    status, out = contacts_post(server.srv, {"op": "remove", "name": "Heather Smith",
+                                             "email": "stale@example.com"})
+    assert status == 400 and "not at that address" in out["error"]
+    status, out = contacts_post(server.srv, {"op": "remove", "name": "Heather"})
+    assert status == 400
+    status, out = contacts_post(server.srv, {"op": "remove", "name": "Heather",
+                                             "email": "heather@example.com"})
+    assert status == 400 and "nothing in the book" in out["error"]
+    assert len(json.loads(book.read_text())["contacts"]) == 1
+    status, out = contacts_post(server.srv, {"op": "remove", "name": "Heather Smith",
+                                             "email": "heather@example.com"})
+    assert status == 200 and out["contacts"] == []
+    assert json.loads(book.read_text())["contacts"] == []
+
+
+def test_an_oversized_book_request_is_refused_before_it_is_read(server, book):
+    big = {"op": "add", "name": "X", "email": "x@example.com",
+           "note": "n" * (wa.MAX_TEXT_BYTES + 10)}
+    status, out = contacts_post(server.srv, big)
+    assert status == 413 and "cap" in out["error"]
+    assert not book.exists()
+
+
+def test_a_hand_edit_between_two_page_loads_is_reflected(server, book):
+    contacts_post(server.srv, {"op": "add", "name": "Heather Smith",
+                               "email": "heather@example.com"})
+    _, first = call(server.srv, "GET", "/api/contacts", token=server.srv.token)
+    assert [c["name"] for c in first["contacts"]] == ["Heather Smith"]
+    data = json.loads(book.read_text())
+    data["contacts"].append({"name": "Dana Ruiz", "email": "dana@example"})
+    data["contacts"].append({"name": "Mum", "email": "linda@example.com"})
+    book.write_text(json.dumps(data))
+    _, second = call(server.srv, "GET", "/api/contacts", token=server.srv.token)
+    assert [c["name"] for c in second["contacts"]] == ["Heather Smith", "Mum"]
+    assert second["skipped"] == [{"index": 1, "name": "Dana Ruiz",
+                                  "why": second["skipped"][0]["why"]}]
+    assert "bad address" in second["skipped"][0]["why"]
+    # a page write after the hand edit keeps the hand edit
+    contacts_post(server.srv, {"op": "remove", "name": "Mum",
+                               "email": "linda@example.com"})
+    names = [r["name"] for r in json.loads(book.read_text())["contacts"]]
+    assert names == ["Heather Smith", "Dana Ruiz"]
+
+
+def test_a_book_write_is_a_file_edit_not_a_turn(server, book):
+    contacts_post(server.srv, {"op": "add", "name": "Heather Smith",
+                               "email": "heather@example.com"})
+    call(server.srv, "GET", "/api/contacts", token=server.srv.token)
+    assert server.app.calls == [], "never through dispatch_text"
+    assert server.app.tts.spoken == []
+
+
+def test_the_phone_page_links_to_the_book(server):
+    _, body = call(server.srv, "GET", "/")
+    page = body.decode("utf-8")
+    assert 'href="/contacts"' in page and "Address book" in page
+    assert "/contacts" not in wa.MANIFEST, "no manifest entry, no home-screen icon"

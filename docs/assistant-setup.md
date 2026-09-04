@@ -4009,8 +4009,45 @@ wrong one of your three is as irreversible as sending to the wrong person.
   account and Jarvis asks which identity to send as, which is usually what
   you want: personal, work and school are three different people to whoever
   receives the mail.
-* `contacts` — a plain name-to-address map, checked before the people book
-  ("my advisor is Dr Peyrovi"). Both are consulted; neither is guessed at.
+* `contacts` — the OLD plain name-to-address map, kept as a fallback. Put
+  people in the address book below instead; it can say "which Heather?"
+  and this map cannot.
+
+### The address book
+
+The place to put people is **`~/.config/jarvis/contacts.json`** — its own
+file beside this one, not inside it, so nothing that edits the book ever
+touches the file with your passwords in it. Plain JSON, yours to edit by
+hand; Jarvis re-reads it on the next send, no restart:
+
+```json
+{
+  "format": 1,
+  "contacts": [
+    {"name": "Heather Smith", "email": "heather@example.com",
+     "honorific": "Dr", "aliases": ["my advisor"], "note": "PhD advisor"},
+    {"name": "Heather Jones", "email": "hjones@example.com"}
+  ]
+}
+```
+
+Three ways in: the file itself, `scripts/jarvis_contacts.py` over ssh
+(`list`, `show NAME`, `add NAME EMAIL`, `remove NAME` — it works with Jarvis
+down), and the **Address book** link in the phone page's footer (needs
+`phone.enabled`). Jarvis only ever *reads* it: nothing you say can write a
+row, because a misheard address stored is the typo waiting to be mailed.
+
+The matching is exact, on purpose. What you said has to equal a row's full
+name, first name, surname, honorific + name or an alias — "Heathr" is
+nobody, and two Heathers get "Which Heather, sir — Heather Smith or
+Heather Jones?" (answer with the full name, the surname, "Dr Smith" or
+"the second one"). A book recipient is read back by name — "to Dr Heather
+Smith" — and the address is *shown* in the transcript, never spoken.
+Addresses are checked on entry (one @, a dot in the domain, no spaces), a
+row that fails is flagged "bad address, not used" rather than mailed to,
+and the file is written 0600. `show NAME` prints exactly what the send
+lane would do with a name, so you can test one over ssh with no
+microphone.
 
 ### Things it deliberately will not do
 

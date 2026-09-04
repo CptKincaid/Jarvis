@@ -74,7 +74,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -89,6 +89,7 @@ from jarvis import faults as faults_mod
 from jarvis import lecture as lecture_mod
 from jarvis import mathspeak
 from jarvis import objections as objections_mod
+from jarvis import contacts as contacts_mod
 from jarvis import outbox
 from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
@@ -5573,7 +5574,7 @@ SENDASK_TTL_S = 45.0           # the same life as "Which one, sir?" (FILEPICK_TT
 class SendAsk:
     """A send that stopped at a question: what it still needs, and the
     pieces to run outbox.prepare again once it has it."""
-    kind: str                  # "account" | "recipient"
+    kind: str                  # "account" | "recipient" | "person"
     said_file: str             # the file phrase (or the chosen path)
     who: str                   # the recipient as said, "" for WHO_LINE
     hint: str                  # the account hint as said
@@ -5581,6 +5582,11 @@ class SendAsk:
     made_at: float = 0.0
     reasked: bool = False
     to_name: str = ""          # the name he said, when ``who`` is an address
+    # "Which Heather, sir — Heather Smith or Heather Jones?": the address
+    # book's rivals, FULL names in file order. The answer rung
+    # (_person_from_answer) accepts an exact full name, a surname unique
+    # among these, honorific + name, or an ordinal -- never a score.
+    candidates: list = field(default_factory=list)
 
     def stale(self, now: Optional[float] = None) -> bool:
         now = time.monotonic() if now is None else float(now)
@@ -5700,6 +5706,44 @@ def pick_from_answer(text, candidates) -> tuple:
     return scored[0][1], False
 
 
+def _person_from_answer(text, candidates) -> Optional[str]:
+    """The answer to "Which Heather, sir?" -- one of ``candidates`` (the
+    address book's full names, in the order they were read out), or None.
+
+    Two readings and no third, like pick_from_answer -- but the NAME leg is
+    exact, never scored: contacts.Book.choose takes the full name, a
+    surname unique among the rivals, or honorific + either, and nothing
+    else. A first name is the very ambiguity being asked about, and a
+    near-miss is a stranger holding his file.
+    """
+    said = " ".join(str(text or "").split())
+    names = [str(c) for c in (candidates or ())]
+    if not said or not names:
+        return None
+    m = _PICK_ORDINAL_RX.match(said)
+    if m:
+        word = m.group("n").lower()
+        if word in ("last", "latest", "newest"):
+            return names[-1]
+        if word == "other":
+            return names[1] if len(names) == 2 else None
+        idx = _PICK_ORDINALS.get(word)
+        if idx is not None and idx < len(names):
+            return names[idx]
+        return None
+    trimmed = re.sub(r"^(?:jarvis[,\s]+)?(?:(?:to|it'?s|it\s+is|that'?s|"
+                     r"the)\s+)?", "", said, flags=re.I)
+    trimmed = re.sub(r"\s+(?:one|please|sir|thanks|thank you)\b[\s,.!?]*$",
+                     "", trimmed, flags=re.I).strip(" ,.!?")
+    if not trimmed:
+        return None
+    try:
+        return contacts_mod.current().choose(trimmed, names)
+    except Exception:                          # noqa: BLE001 - a file read
+        log.exception("which-person: the address book could not be read")
+        return None
+
+
 def parse_send_answer(text) -> Optional[bool]:
     """True / False / None for a read-back answer. None is "not an answer".
 
@@ -5763,8 +5807,12 @@ def _send_file_pieces(c, t, m=None):
     who = (rm.group("who_a") or rm.group("who_b") or "").strip()
     hint = (rm.group("acct") or "").strip()
     memory = c._svc("memory")
-    addr, _ = outbox.resolve_recipient(cfg, memory, who)
-    if not addr:
+    res = outbox.resolve(cfg, memory, who)
+    addr = res.addr
+    # AMBIGUOUS counts as resolved for the claim: two Heathers in the
+    # address book is a question for him, and "send Heather the notes"
+    # (shape B) must reach that question rather than vanish in silence.
+    if not addr and not res.candidates:
         if not shape_a:
             log.info("send-file: %r names no one I can write to", who)
             return None
@@ -5820,6 +5868,19 @@ def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
     re-ask lives on the draft and is untouched by either.
     """
     if prep.draft is None:
+        # "Which Heather, sir?" is tested FIRST, before ``candidates``: the
+        # branch below it is the FILE offer, whose answer is scored with
+        # filepick, and a list of people must never reach a scorer.
+        if prep.status == outbox.WHICH_PERSON_STATUS:
+            if reasked_kind == "person":
+                log.info("send-file: person asked twice; letting it go")
+                return CommandResult(handled=True, speak=True, status="Dropped",
+                                     reply=outbox.ASK_DROPPED_LINE)
+            c.stash_sendask(SendAsk(kind="person", said_file=said_file,
+                                    who=who, hint=hint,
+                                    candidates=list(prep.candidates)))
+            return CommandResult(handled=True, reply=prep.ask, speak=True,
+                                 status=prep.status)
         if prep.candidates:
             return _send_file_offer(c, prep, who, hint)
         kind = ("account" if prep.status == "Which account?"
@@ -5836,8 +5897,11 @@ def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
     if to_name and not prep.draft.to_name:
         prep.draft.to_name = to_name
     c.stash_send(prep.draft)
+    # A book recipient is read back by NAME; the address is shown in the
+    # transcript and never spoken (display_only). "" for every other kind.
     return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
-                         speak=True, status=prep.status)
+                         speak=True, status=prep.status,
+                         display_only=outbox.shown_address(prep.draft) or None)
 
 
 def _h_send_file(c, t, m):
@@ -10966,10 +11030,43 @@ class Commander:
             return _send_file_finish(self, prep, ask.said_file, ask.who, label,
                                      to_name=ask.to_name,
                                      reasked_kind=ask.kind if ask.reasked else "")
-        # recipient: an address, or a name the book resolves
+        if ask.kind == "person":
+            picked = _person_from_answer(said, ask.candidates)
+            if picked is None:
+                # An attempt -- a name's worth of words, or a bare yes --
+                # gets the list once more; a sentence is a new subject.
+                attempt = len(said.split()) <= 3 or parse_yes_no(said) is True
+                if not attempt:
+                    log.info("send person: %r is a new subject", said[:40])
+                    return None
+                if ask.reasked:
+                    self._answered_pending = True
+                    return CommandResult(handled=True, speak=True,
+                                         status="Dropped",
+                                         reply=outbox.ASK_DROPPED_LINE)
+                ask.reasked = True
+                self._pending_sendask = ask
+                self._answered_pending = True
+                return CommandResult(handled=True, speak=True,
+                                     status=outbox.WHICH_PERSON_STATUS,
+                                     reply=contacts_mod.reask_line(ask.candidates))
+            self._answered_pending = True
+            log.info("send person: %r means %s", said[:40], picked)
+            # The FULL name goes back through prepare: an exact full name
+            # resolves outright in the book, so this is the ordinary path
+            # with the ambiguity taken out of it, and nothing is sent.
+            prep = outbox.prepare(cfg, memory, ask.said_file, picked,
+                                  account_hint=ask.hint)
+            return _send_file_finish(self, prep, ask.said_file, picked,
+                                     ask.hint,
+                                     reasked_kind="person" if ask.reasked else "")
+        # recipient: an address, or a name the book resolves -- or a name
+        # the ADDRESS BOOK finds ambiguous, which is an answer too: it
+        # goes through prepare and comes back as "Which Heather, sir?".
         who = _recipient_answer(said)
         addr = outbox.parse_address(who)
-        resolved = addr or outbox.resolve_recipient(cfg, memory, who)[0]
+        res = outbox.resolve(cfg, memory, who) if not addr else None
+        resolved = addr or (res.addr or bool(res.candidates))
         if not resolved:
             # Not an address and not a name we know. One re-ask for a
             # sentence that was plainly an attempt -- an address shape
