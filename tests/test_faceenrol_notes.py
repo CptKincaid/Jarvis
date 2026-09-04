@@ -1774,3 +1774,334 @@ def test_a_spoken_pose_cannot_become_shell(tmp_path):
     assert "rm" not in parts and "-rf" not in parts
     assert parts[parts.index("--pose") + 1] == "'; rm -rf ~; echo '"
     assert parts[-1] == "'; rm -rf ~; echo '", "the pose is the last word"
+
+
+# ------------------------------------------------- the checks that are counts
+# F16 / F34 (thawed 2026-09-04). Two of judge_gallery's four checks are decided
+# by arithmetic before a frame exists, and the command he is handed -- or
+# steered toward -- has to be one that arithmetic allows to pass.
+
+
+def test_the_shortfalls_are_arithmetic_and_not_a_prediction():
+    """``plan_shortfalls`` may only name a check the plan CANNOT reach, and
+    the two it can prove are counting problems: the pool it would save, and
+    how many angles this run has to supply on its own.
+
+    His live generation 1 is the case that matters -- 13 embeddings written
+    before takes carried a yaw -- so appending three takes of one named pose
+    onto it can put 16 embeddings in the pool and STILL fail pose_spread,
+    because the stored takes count for nothing there and 3 samples of one
+    pose cannot be 2 frontal AND 2 off-axis (F16)."""
+    blank = [Take()] * 13
+    one_pose = fe.custom_stations(["looking at my phone"])
+    assert sum(st.samples for st in one_pose) == 3
+
+    short = fe.plan_shortfalls(blank, one_pose)
+    assert len(short) == 1 and "pose_spread" in short[0]
+    assert "samples" not in short[0], "16 in the pool clears the floor"
+    assert "13 kept take(s) carry no angle" in short[0]
+
+    # The same three takes with nothing stored fails BOTH, and says both.
+    both = fe.plan_shortfalls([], one_pose)
+    assert len(both) == 2
+    assert any(line.startswith("samples") for line in both)
+    assert any(line.startswith("pose_spread") for line in both)
+
+    # More samples of ONE pose do not help: a named take is one angle, so
+    # --pose-samples cannot buy the second band (F16's "whatever
+    # --pose-samples is").
+    assert fe.plan_shortfalls(blank, fe.custom_stations(
+        ["looking at my phone"], samples=12)) != ()
+    # Two named poses CAN be two bands, so two of them is not short.
+    assert fe.plan_shortfalls(blank, fe.custom_stations(
+        ["looking at my phone", "turned away"])) == ()
+
+    # Recorded coverage on both sides is evidence, and it is used: one more
+    # named pose on top of it is a plan that can pass.
+    covered = [Take(note="lens", yaw_deg=4.0)] * 6 + \
+              [Take(note="screen", yaw_deg=50.0)] * 6
+    assert fe.plan_shortfalls(covered, one_pose) == ()
+    # Coverage on ONE side plus a named pose can pass -- the pose may land
+    # off-axis -- but that coverage alone cannot.
+    frontal_only = [Take(note="lens", yaw_deg=4.0)] * 13
+    assert fe.plan_shortfalls(frontal_only, one_pose) == ()
+    assert fe.plan_shortfalls(frontal_only, ()) != ()
+    # And the five stations always can, from nothing at all.
+    assert fe.plan_shortfalls([], fe.DEFAULT_PLAN) == ()
+    # --plan full --pose X is the five stations AND the named take, last.
+    plan, why = fe.choose_plan([], poses=["looking at my phone"], mode="full")
+    assert plan[:5] == fe.DEFAULT_PLAN
+    assert plan[-1].note == "looking at my phone"
+    assert "five-station" in why and "you named" in why
+    assert fe.plan_shortfalls([], plan) == ()
+
+
+def test_a_plan_that_reaches_both_bands_can_still_be_short_on_the_spread():
+    """The spread is its own bar: FRONTAL_MAX_DEG is 15 and OFFAXIS_MIN_DEG
+    is 20, so two angles either side of the dead zone can be a few degrees
+    apart and ``judge_gallery`` wants 25. Two narrow stations that straddle
+    the zone are short on the spread alone."""
+    narrow = (fe.Station("a", "", 10.0, 15.0, 3),
+              fe.Station("b", "", 20.0, 22.0, 3))
+    short = fe.plan_shortfalls([Take()] * 8, narrow)
+    assert len(short) == 1 and "pose_spread" in short[0]
+    assert "12 deg of spread (want 25)" in short[0]
+
+
+def test_appending_a_named_pose_to_a_pose_less_gallery_is_stopped_before_the_run(
+        monkeypatch, tmp_path, capsys):
+    """HIS LIVE GALLERY IS THE ONE THIS HAPPENS TO.
+
+    13 embeddings with no recorded angles. The script's own advice was
+    "--append is almost certainly what you want", and that run -- 3 takes of
+    one named pose over 13 blank ones -- can never satisfy pose_spread: the
+    stored takes carry no angle and count for nothing, and 3 samples cannot
+    be 2 frontal AND 2 off-axis. It captured, failed and saved nothing, and
+    the only warning the script had was gated on the NON-append case (F16).
+    The minute is his; the arithmetic is knowable before he spends it, so
+    the run stops before the lens, names the check, and names the run that
+    would work."""
+    gallery, feed = wire(monkeypatch, tmp_path)
+    his_generation(gallery.root)          # 13 takes, no yaw, no notes
+    code = face_enrol.main(ENROL + ["--append", "--pose",
+                                    "looking at my phone"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "WARNING" in out
+    assert "pose_spread" in out
+    assert "STOPPED before the camera opened" in out
+    assert "--append --plan full" in out, "it has to name the run that would work"
+    assert "Sit where you normally sit" not in out, "the minute was spent"
+    assert feed.closed == 1, "the feed stays open after a pre-capture stop"
+    assert gallery.generations() == [1]
+
+
+def test_the_hint_does_not_send_him_at_a_run_that_cannot_pass(monkeypatch,
+                                                              tmp_path,
+                                                              capsys):
+    """"--append is almost certainly what you want" is true when the stored
+    takes carry angles and false when they do not -- and his do not. The
+    REPLACE warning stays; the hint is replaced by the run that can pass."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    his_generation(gallery.root)
+    code = face_enrol.main(ENROL + ["--pose", "looking at my phone"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "will REPLACE the 13 already stored" in out
+    assert "--append is almost certainly what you want" not in out
+    assert "--plan full" in out
+    assert gallery.generations() == [1]
+
+
+def test_the_stopped_plan_is_numbers_only_in_json_mode(monkeypatch, tmp_path,
+                                                       capsys):
+    """The pre-capture refusal goes through the same --json document as
+    every other outcome, and it has to pass the numbers-only check."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    his_generation(gallery.root)
+    code = face_enrol.main(ENROL + ["--json", "--append", "--pose",
+                                    "looking at my phone"])
+    out = capsys.readouterr().out
+    assert code == 1
+    doc = json.loads(out)
+    assert doc["exit_code"] == 1
+    assert doc["result"]["fix"] == "--append --plan full"
+    assert any("pose_spread" in s for s in doc["result"]["shortfalls"])
+    assert gallery.generations() == [1]
+
+
+def test_a_first_enrolment_with_one_named_pose_is_stopped_at_the_floor(
+        monkeypatch, tmp_path, capsys):
+    """The script side of F34: no gallery, ``--pose`` alone is three takes
+    against a floor of eight. It used to capture and then say [FAIL]
+    samples; the under-the-floor warning was gated on stored takes, so
+    this exact case was silent."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    code = face_enrol.main(ENROL + ["--pose", "looking at my phone"])
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "samples: 3 in the pool" in out and "floor of 8" in out
+    assert "STOPPED before the camera opened" in out
+    assert "--plan full" in out
+    assert gallery.generations() == []
+
+
+def test_force_runs_a_short_plan_anyway_and_says_so(monkeypatch, tmp_path,
+                                                    capsys):
+    """--force exists to save a gallery that failed a check on purpose, so
+    it may not be refused before the capture; it is warned instead."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    face_enrol.main(ENROL + ["--force", "--pose", "looking at my phone"])
+    out = capsys.readouterr().out
+    assert "cannot pass the checks" in out
+    assert "--force: running it anyway" in out
+    assert "Sit where you normally sit" in out
+    assert "STOPPED before the camera opened" not in out
+
+
+def test_a_full_plan_with_a_named_pose_runs_and_records_the_pose(
+        monkeypatch, tmp_path, capsys):
+    """The run the hand-over now writes: five stations plus the named take,
+    against a fresh gallery. It is not stopped, and it is the pose that is
+    written on the take it produced."""
+    gallery, _feed = wire(monkeypatch, tmp_path,
+                          yaws=list(PLAN_YAWS) + [3.0, 4.0, 5.0],
+                          vectors=same_face(base_vec(), 16))
+    code = face_enrol.main(ENROL + ["--plan", "full", "--pose",
+                                    "looking at my phone"])
+    out = capsys.readouterr().out
+    assert "STOPPED before the camera opened" not in out
+    assert "6 stations, 16 samples wanted" in out
+    assert code == 0, out
+    notes = [t.note for t in gallery.takes("hunter")]
+    assert "looking at my phone" in notes
+
+
+def test_a_first_enrolment_with_a_named_pose_hands_over_a_runnable_plan(
+        tmp_path):
+    """"Enrol my face looking at my phone" on a box with no gallery.
+
+    ``choose_plan`` answered with one custom station of 3 takes and Jarvis
+    announced it as a valid run: "1 station, 3 takes". ``MIN_SAMPLES`` is 8,
+    so after the consent text and the minute in front of the lens the report
+    was [FAIL] samples and nothing was saved -- every time, whatever
+    --pose-samples said (F34). The command he is handed has to be one that
+    can pass."""
+    import shlex
+    out = ee.enrol_answer(FaceGallery(root=tmp_path / "nope"), "hunter",
+                          owner="hunter", poses=["looking at my phone"],
+                          clipboard=lambda _t: True)
+    argv = shlex.split(out["command"])
+    args = face_enrol.build_parser().parse_args(argv[2:])
+    assert args.append is False
+    plan, _why = fe.choose_plan([], poses=args.pose,
+                                pose_samples=int(args.pose_samples),
+                                mode=args.plan)
+    assert fe.plan_shortfalls([], plan) == ()
+    assert sum(st.samples for st in plan) >= fe.MIN_SAMPLES
+    assert [st.note for st in plan][-1] == "looking at my phone"
+    assert out["stations"] == len(plan) == 6
+    assert "6 stations" in out["reply"]
+    assert "floor" in out["reply"], "he is told why it grew"
+    assert argv[-1] == "looking at my phone", "the pose is still the last word"
+
+
+def test_a_first_enrolment_of_somebody_else_with_a_pose_is_runnable_too(
+        tmp_path):
+    """The Heather case in F34: her consent step is spent on the run, so the
+    run has to be one that can be saved."""
+    out = ee.enrol_answer(FaceGallery(root=tmp_path / "nope"), "heather",
+                          owner="hunter", poses=["looking at her phone"],
+                          clipboard=lambda _t: True)
+    assert "--label heather" in out["command"]
+    assert "--plan full" in out["command"]
+    assert out["stations"] == 6 and "6 stations" in out["reply"]
+
+
+def test_a_named_pose_over_a_pose_less_gallery_is_handed_the_full_script_too(
+        tmp_path):
+    """The voice side of F16: his 13 stored takes carry no angle, so an
+    --append of one named pose cannot reach the spread either. The five
+    stations come with it, and the reply says why."""
+    import shlex
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)              # no note, no yaw -- his gen 1
+    g.save(reason="one")
+    out = ee.enrol_answer(FaceGallery(root=g.root), "hunter", owner="hunter",
+                          poses=["looking at my phone"],
+                          clipboard=lambda _t: True)
+    argv = shlex.split(out["command"])
+    args = face_enrol.build_parser().parse_args(argv[2:])
+    assert args.append is True and args.plan == "full"
+    plan, _why = fe.choose_plan(g.takes("hunter"), poses=args.pose,
+                                pose_samples=int(args.pose_samples),
+                                mode=args.plan)
+    assert fe.plan_shortfalls(g.takes("hunter"), plan) == ()
+    assert "five stations come with it" in out["reply"]
+
+
+def test_a_named_pose_on_top_of_real_coverage_stays_one_station(tmp_path):
+    """And the ordinary case is not made heavier: with both sides recorded,
+    "one more way to be recognised" is still one station."""
+    import shlex
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 6, seed=2):
+        g.add("hunter", vec, note="looking at the lens", yaw_deg=4.0)
+    for vec in same_face(base_vec(1), 6, seed=3):
+        g.add("hunter", vec, note="looking at my screen", yaw_deg=50.0)
+    g.save(reason="one")
+    out = ee.enrol_answer(FaceGallery(root=g.root), "hunter", owner="hunter",
+                          poses=["looking at my phone"],
+                          clipboard=lambda _t: True)
+    assert "--plan" not in out["command"]
+    assert out["stations"] == 1
+    assert shlex.split(out["command"])[-2:] == ["--pose",
+                                                "looking at my phone"]
+
+
+# ------------------------------------------- F15, pinned after the fact
+# Closed on 2026-09-03 by ``purge_label`` saving with ``prune=False``
+# (bbd2627). These pin the sentence the script prints against the disk, so
+# a future save that prunes again cannot bring it back quietly.
+
+
+def _five_generations(root: Path):
+    """Five saves of one 22-embedding pool: hunter 13 + heather 9.
+
+    Five is the number that matters -- ``KEEP_GENERATIONS`` -- because the
+    save inside ``purge_label`` writes a sixth and that is when an ordinary
+    ``_prune`` would start choosing something to destroy."""
+    g = FaceGallery(root=root)
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)
+    for vec in same_face(base_vec(808), 9, seed=17):
+        g.add("heather", vec)
+    for i in range(5):
+        g.save(reason="gen %d" % (i + 1))
+    assert g.generations() == [1, 2, 3, 4, 5]
+    return g
+
+
+def test_the_delete_that_left_a_generation_alone_does_not_prune_it_instead(
+        tmp_path):
+    """"LEFT ALONE" HAS TO MEAN LEFT ALONE, INCLUDING BY THE SAVE.
+
+    ``purge_label`` refuses to destroy a generation it could not read, and
+    says so. The save it makes to carry everybody else forward used to be
+    an ordinary save, so it ran ``_prune()`` -- and an unreadable generation
+    scores 0 embeddings, is therefore never the richest, and is the oldest,
+    so it is exactly what the window evicts. Reproduced 2026-09-03: five
+    generations with gen 1 unreadable, ``--delete --label heather`` left
+    ``[6]`` on the disk and printed "nothing here destroyed them" over a
+    gen-00001.npz that was gone (F15)."""
+    g = _five_generations(tmp_path / "g")
+    _unreadable(g.root / "gen-00001.npz")
+
+    out = FaceGallery(root=g.root).purge_label("heather", reason="test")
+    assert out["unreadable"] == [1]
+    assert out["generations_with"] == [2, 3, 4, 5]
+    assert out["complete"] is False
+    assert (g.root / "gen-00001.npz").exists(), "the save pruned it anyway"
+    assert sorted(p.name for p in g.root.iterdir()) == ["gen-00001.npz",
+                                                        "gen-00006.npz"]
+    back = FaceGallery(root=g.root)
+    assert back.load() is True
+    assert back.labels() == ("hunter",) and back.total() == 13
+
+
+def test_the_command_does_not_print_a_sentence_the_disk_contradicts(
+        monkeypatch, tmp_path, capsys):
+    """The same thing from the outside: the line he reads says the file was
+    left alone, so the file has to still be there when the command returns,
+    and "verified" is withheld."""
+    gallery, _feed = wire(monkeypatch, tmp_path)
+    g = _five_generations(gallery.root)
+    _unreadable(g.root / "gen-00001.npz")
+
+    code = face_enrol.main(["--delete", "--label", "heather", "--yes"])
+    out = capsys.readouterr().out
+    assert code == 1, out
+    assert "could NOT be read" in out
+    assert (g.root / "gen-00001.npz").exists(), out
+    assert "verified" not in out

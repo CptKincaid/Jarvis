@@ -70,7 +70,7 @@ def script_path() -> str:
 
 def command_line(label: str, owner: str = "hunter",
                  poses: Sequence[str] = (), delete: bool = False,
-                 append: bool = False,
+                 append: bool = False, plan: str = "",
                  python: Optional[str] = None,
                  script: Optional[str] = None) -> str:
     """The exact shell command, quoted so a pose with spaces survives it.
@@ -83,7 +83,12 @@ def command_line(label: str, owner: str = "hunter",
     be recognised" is additive by intent, and a plain run REPLACES the pool
     -- so a two-pose command without it captures six takes over an existing
     thirteen, fails the eight-sample floor, saves nothing, and costs him the
-    minute for a refusal he could not have predicted."""
+    minute for a refusal he could not have predicted.
+
+    ``plan`` is the script's --plan when the named takes need the five
+    stations alongside them ("full"); "" leaves the script's default. It
+    goes BEFORE the poses, because the pose is the last word on the line
+    and a test pins that."""
     out = [shlex.quote(python or sys.executable),
            shlex.quote(script or script_path())]
     if delete:
@@ -99,6 +104,8 @@ def command_line(label: str, owner: str = "hunter",
         out += ["--label", shlex.quote(label)]
     if append and not delete:
         out.append("--append")
+    if plan and not delete:
+        out += ["--plan", shlex.quote(str(plan))]
     for pose in poses:
         note = clean_note(pose)
         if note:
@@ -266,9 +273,31 @@ def enrol_answer(gallery, label: str, owner: str = "hunter",
     # underneath.
     plan, why = fe.choose_plan([], poses=poses)
     add = bool(poses) and bool(takes)
-    command = command_line(label, owner=owner, poses=poses, append=add)
+    # THE COMMAND HANDED OVER HAS TO BE ONE THAT CAN PASS. A named take is
+    # one station of three, and ``judge_gallery`` wants eight in the pool
+    # and two angles in each band: on a box with no gallery that is a
+    # guaranteed [FAIL] samples after the consent step and the minute
+    # (F34), and on his live generation -- 13 takes with no recorded angle
+    # -- an --append of one pose can never reach the spread (F16). Both are
+    # counting problems, ``plan_shortfalls`` counts them, and when the
+    # named take alone falls short the five stations go with it
+    # (--plan full --pose ...). With real coverage stored, one more way to
+    # be recognised is still one station.
+    kept = takes if add else []
+    full = bool(poses) and bool(fe.plan_shortfalls(kept, plan))
+    if full:
+        plan, why = fe.choose_plan([], poses=poses, mode="full")
+    command = command_line(label, owner=owner, poses=poses, append=add,
+                           plan="full" if full else "")
     if add:
         why = "%s, added to the %d already stored" % (why, len(takes))
+    if full and not takes:
+        why += (" - a first enrolment has to clear the %d-take floor on "
+                "its own, so the five stations come with it"
+                % fe.MIN_SAMPLES)
+    elif full:
+        why += (" - what's stored doesn't give the pose check enough to go "
+                "on, so the five stations come with it")
 
     who = "you" if label == owner else label.capitalize()
     wanted = sum(s.samples for s in plan)

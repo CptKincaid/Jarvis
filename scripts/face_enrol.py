@@ -635,15 +635,50 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     # could not have predicted: a two-pose run is six takes, under the
     # eight-sample floor, so it captures, fails and saves nothing.
     wanted = sum(st.samples for st in plan)
+    # THE CHECKS THAT ARE ARITHMETIC ARE RUN NOW, NOT AFTER THE MINUTE.
+    # ``samples`` and ``pose_spread`` are decided by the plan and the takes
+    # it keeps, so a plan that fails them is known to fail before a frame
+    # exists (fe.plan_shortfalls). The hint underneath is worked out from
+    # the same arithmetic, so it can never name a run that also fails:
+    # --append is the answer only when the stored takes carry enough
+    # recorded coverage to lift this plan over the bar. His live generation
+    # 1 carries none, and the old hint -- "--append is almost certainly
+    # what you want" -- sent him at exactly the run that cannot pass
+    # (F16, reproduced 2026-09-03). Otherwise the five stations come along.
+    short = fe.plan_shortfalls(plan_takes, plan)
+    appended_would_pass = (bool(stored_takes) and not args.append
+                           and not fe.plan_shortfalls(stored_takes, plan))
     if args.pose and not args.append and stored_takes:
         say("WARNING    these %d take(s) will REPLACE the %d already stored "
             "under %r. Add --append to keep what is there."
             % (wanted, len(stored_takes), label))
-        if wanted < fe.MIN_SAMPLES:
+        if wanted < fe.MIN_SAMPLES and appended_would_pass:
             say("           %d is under the %d-sample floor, so this run "
                 "would be refused after the capture. --append is almost "
                 "certainly what you want."
                 % (wanted, fe.MIN_SAMPLES))
+    if short:
+        say("WARNING    this plan cannot pass the checks, whatever the "
+            "camera sees:")
+        for line in short:
+            say("           %s" % line)
+        if appended_would_pass:
+            fix = "--append"
+        else:
+            fix = "%s--plan full" % ("--append " if args.append else "")
+        if args.force:
+            say("           --force: running it anyway, and the generation "
+                "it writes will be recorded as forced.")
+        else:
+            say("STOPPED before the camera opened: nothing was captured. "
+                "Run it again with %s%s."
+                % (fix, "" if appended_would_pass
+                   else " -- the five stations plus the take(s) you named"))
+            feed.close()
+            return 1, {"reason": "the plan cannot pass: %s"
+                                 % "; ".join(short),
+                       "shortfalls": list(short), "label": label,
+                       "plan": plan_why, "fix": fix}
     say("Sit where you normally sit. Nothing you see is shown to anybody, "
         "because nothing is shown at all.")
     def wait(prompt):
@@ -732,11 +767,22 @@ def do_verify(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     bar_why = cam.identity_min_warning(cfg)
     if bar_why:
         say("NOTE: %s" % bar_why)
-    ident = FaceIdentifier(
-        gallery, recogniser,
-        min_conf=float(cfg.get("camera.min_conf", 0.6)),
-        match_min=float(cfg.get("camera.identity_min", SFACE_COSINE_SAME)),
-        owner=owner_label(cfg))
+    try:
+        ident = FaceIdentifier(
+            gallery, recogniser,
+            min_conf=float(cfg.get("camera.min_conf", 0.6)),
+            match_min=float(cfg.get("camera.identity_min",
+                                    SFACE_COSINE_SAME)),
+            owner=owner_label(cfg))
+    except ValueError as exc:
+        # camera.identity_min is user-editable and json.loads accepts the
+        # bare literal NaN, which used to clear every comparison and name a
+        # stranger as him (F17). The bar is refused at the door now, so
+        # this is the same accommodation do_enrol makes for camera.min_conf.
+        say("STOPPED: %s" % exc)
+        say("Fix camera.identity_min in ~/.config/jarvis/assistant.json.")
+        feed.close()
+        return 1, {"reason": str(exc)}
     rig = vr.Rig(cam.FeedSource(feed), detector, feed.lens,
                  cam.thresholds_from_config(cfg), identifier=ident,
                  head=cam.head_from_config(cfg))
