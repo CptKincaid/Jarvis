@@ -73,6 +73,14 @@ EMPTY_LINE = "{what} is empty, sir; there'd be nothing to attach."
 NO_RECIPIENT_LINE = "I've no address for {who}, sir. What is it?"
 WHO_LINE = "Who should I send it to, sir?"
 WHICH_FILE_LINE = "Which file, sir?"
+# The answers to the two questions above, when they miss (F21). One re-ask
+# each, the way the read-back and "Which one, sir?" already get one.
+ADDRESS_REASK_LINE = ("I didn't catch an address there, sir — say it as "
+                      "name at domain dot com, or a name I know.")
+ACCOUNT_REASK_LINE = "I've no {hint} account, sir — {names}?"
+ACCOUNT_WHICH_LINE = "Which of them, sir — {names}?"
+ASK_DROPPED_LINE = "I'll leave it there, sir; ask me again when you have it."
+ASK_SPENT_LINE = "Very good, sir; nothing sent."
 # The cap refusal is the one place this lane does NOT reuse
 # filepick.reason_line: filepick's wording ("past the N I'll put on the wire
 # without you saying so plainly") offers an override, and for mail there is
@@ -192,17 +200,32 @@ def account_words(account: dict) -> str:
     return f"your {label} account" if label else "your account"
 
 
+def _to_words(draft: Draft) -> str:
+    who = draft.to_name or ""
+    addr = spoken_address(draft.to_addr)
+    return f"{who}, at {addr}" if who else addr
+
+
 def read_back(draft: Draft) -> str:
     """The one sentence standing between the file and the recipient.
 
     File, size, address, account, then the question — nothing else, and the
     question LAST so the yes he gives is to a sentence he has heard all of.
     """
-    who = draft.to_name or ""
-    addr = spoken_address(draft.to_addr)
-    to = f"{who}, at {addr}" if who else addr
     return (f"{spoken_name(draft.path)}, {spoken_size(draft.size)}, "
-            f"to {to}, from {account_words(draft.account)}. Send it, sir?")
+            f"to {_to_words(draft)}, from {account_words(draft.account)}. "
+            f"Send it, sir?")
+
+
+def unsure_line(draft: Draft) -> str:
+    """The one re-ask a vague answer gets -- and it names the file and the
+    recipient again (F23, 09-03). The generic UNSURE_LINE asked for a yes
+    without saying what the yes was to, so the second yes was to a sentence
+    he had not heard since the first one; the read-back exists so he hears
+    where the file is going, and the re-ask is the same question."""
+    return (f"I'd rather be certain, sir — that's {spoken_name(draft.path)} "
+            f"to {_to_words(draft)}. Say yes and I'll send it, or no and "
+            f"I'll let it go.")
 
 
 def offer_line(candidates, what: str = "") -> str:

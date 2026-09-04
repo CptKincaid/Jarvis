@@ -696,7 +696,8 @@ def test_a_new_subject_abandons_it(cmd):
 def test_a_vague_answer_is_asked_again_once_and_then_dropped(cmd):
     cmd.handle("email the biosensors handout to Heather", source="typed")
     res = cmd.handle("okay", source="typed")
-    assert res.reply == outbox.UNSURE_LINE and not FakeSMTP.made
+    assert res.reply == outbox.unsure_line(cmd._pending_send)
+    assert not FakeSMTP.made
     assert cmd._pending_send is not None
     res = cmd.handle("sure", source="typed")
     assert res is None or not FakeSMTP.made
@@ -1151,7 +1152,8 @@ def test_a_yes_this_grammar_does_not_take_is_asked_again_not_dropped(cmd, said):
     get the re-ask the vague fillers already got."""
     cmd.handle("email the biosensors handout to Heather", source="typed")
     res = cmd.handle(said, source="typed")
-    assert res is not None and res.reply == outbox.UNSURE_LINE
+    assert res is not None
+    assert res.reply == outbox.unsure_line(cmd._pending_send)
     assert not FakeSMTP.made and cmd._pending_send is not None
     cmd.handle("yes", source="typed")
     assert FakeSMTP.made[-1].sent
@@ -1173,7 +1175,7 @@ def test_the_ten_word_stray_is_still_dropped_in_silence(cmd):
     cmd.handle("email the biosensors handout to Heather", source="typed")
     res = cmd.handle("Yeah, so you should be able to look that up.",
                      source="typed")
-    assert res is None or res.reply != outbox.UNSURE_LINE
+    assert res is None or not str(res.reply or "").startswith("I'd rather be certain")
     assert not FakeSMTP.made and cmd._pending_send is None
 
 
@@ -1243,3 +1245,282 @@ def test_an_unrecognised_hint_asks(cmd):
                      "account", source="typed")
     assert cmd._pending_send is None and not FakeSMTP.made
     assert "no s account" in (res.reply or "").lower()
+
+
+# ==================================================================
+# 16. "Which account?" and "What is it?" are questions too (F21, 09-03)
+# ==================================================================
+# His real config has three accounts and send_file.from ships BLANK, so
+# on the shipped default EVERY send that does not say "from my X account"
+# stopped at "Which account should I send from, sir — personal, work,
+# school?" -- spoken with no slot behind it. question_open() was False,
+# the app gave the answer the 4 s window and the intent gate, and
+# "school" came back as "Was that for me?". Same for "I've no address for
+# Dana, sir. What is it?": the address he then said went nowhere.
+@pytest.fixture
+def cmd_no_default(cmd):
+    """The shipped default: three accounts and no send_file.from."""
+    cmd.services.assistant.data.pop("send_file.from", None)
+    return cmd
+
+
+def test_which_account_is_a_question_he_can_answer(cmd_no_default):
+    cmd = cmd_no_default
+    res = cmd.handle("email the biosensors handout to Heather", source="voice")
+    assert res.reply.startswith("Which account should I send from, sir")
+    assert cmd._pending_send is None and cmd._pending_sendask is not None
+    assert cmd.question_open(), "the answer gets the question window"
+    res = cmd.handle("school", source="voice")
+    assert res is not None and res.reply.endswith("Send it, sir?"), res
+    assert "your school account" in res.reply
+    assert "heather at example dot com" in res.reply
+    assert cmd._pending_sendask is None and cmd._pending_send is not None
+    assert not FakeSMTP.made, "answering a question never sends"
+    cmd.handle("yes", source="voice")
+    assert FakeSMTP.made[-1].logged_in[0] == "hp@tamu.edu"
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+@pytest.mark.parametrize("said", [
+    "work", "the work one", "from my work account", "use work, please",
+    "Work.", "my work account", "send it from work", "the work account",
+])
+def test_the_account_answer_takes_his_phrasings(cmd_no_default, said):
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    res = cmd.handle(said, source="voice")
+    assert res is not None and "your work account" in res.reply, (said, res)
+    assert cmd._pending_send is not None and not FakeSMTP.made
+
+
+def test_a_label_he_does_not_have_is_asked_once_more_then_let_go(cmd_no_default):
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    res = cmd.handle("yahoo", source="voice")
+    assert res.reply == outbox.ACCOUNT_REASK_LINE.format(
+        hint="yahoo", names="personal, work, school")
+    assert cmd.question_open(), "asked again: still a question"
+    res = cmd.handle("hotmail", source="voice")
+    assert res.reply == outbox.ASK_DROPPED_LINE
+    assert cmd._pending_sendask is None and cmd._pending_send is None
+    assert not FakeSMTP.made
+
+
+def test_a_bare_yes_is_not_an_account(cmd_no_default):
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    res = cmd.handle("yes", source="voice")
+    assert res.reply == outbox.ACCOUNT_WHICH_LINE.format(
+        names="personal, work, school")
+    res = cmd.handle("personal", source="voice")
+    assert "your personal account" in res.reply and not FakeSMTP.made
+
+
+def test_a_no_to_the_account_question_lets_it_go_out_loud(cmd_no_default):
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    res = cmd.handle("never mind", source="voice")
+    assert res.reply == outbox.ASK_SPENT_LINE
+    assert cmd._pending_sendask is None and not cmd.question_open()
+
+
+def test_a_new_subject_drops_the_account_question(cmd_no_default):
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    cmd.handle("what time is it", source="voice")
+    assert cmd._pending_sendask is None and cmd._pending_send is None
+    cmd.handle("school", source="voice")
+    assert cmd._pending_send is None, "the question is gone; 'school' is not its answer"
+
+
+def test_the_account_question_is_not_answered_from_another_room(cmd_no_default):
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    cmd.handle("school", source="discord")
+    assert cmd._pending_sendask is not None, "parked, not spent"
+    assert cmd._pending_send is None
+    res = cmd.handle("school", source="voice")
+    assert "your school account" in res.reply
+
+
+def test_an_expired_account_question_ignores_a_late_answer(cmd_no_default):
+    from jarvis.commander import SENDASK_TTL_S
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    cmd._pending_sendask.made_at -= SENDASK_TTL_S + 1
+    assert not cmd.question_open()
+    cmd.handle("school", source="voice")
+    assert cmd._pending_send is None and cmd._pending_sendask is None
+
+
+def test_an_offer_answered_in_between_takes_the_question_with_it(cmd_no_default):
+    """Same rule the draft already keeps (_drop_stranded_questions)."""
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    cmd.services.alarm_offer = {"made_at": time.time(), "when": 7 * 3600,
+                                "label": "wake"}
+    cmd.handle("yes", source="voice")
+    assert cmd._pending_sendask is None, "the offer's yes left the question armed"
+
+
+def test_whats_the_address_is_a_question_he_can_answer(cmd):
+    res = cmd.handle("email the biosensors handout to Dana", source="voice")
+    assert res.reply == "I've no address for Dana, sir. What is it?"
+    assert cmd.question_open() and cmd._pending_sendask.kind == "recipient"
+    res = cmd.handle("dana at example dot com", source="voice")
+    assert res.reply.endswith("Send it, sir?"), res
+    assert "to Dana, at dana at example dot com" in res.reply
+    assert not FakeSMTP.made
+    cmd.handle("yes", source="voice")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "dana@example.com"
+
+
+@pytest.mark.parametrize("said", [
+    "it's dana at example dot com", "send it to dana@example.com",
+    "her address is dana at example dot com", "dana@example.com, please",
+])
+def test_the_address_answer_takes_his_phrasings(cmd, said):
+    cmd.handle("email the biosensors handout to Dana", source="voice")
+    res = cmd.handle(said, source="voice")
+    assert res is not None and "dana at example dot com" in res.reply, (said, res)
+    assert cmd._pending_send is not None and not FakeSMTP.made
+
+
+def test_a_name_the_book_knows_answers_the_address_question(cmd):
+    cmd.handle("email the biosensors handout to Dana", source="voice")
+    res = cmd.handle("send it to Heather instead", source="voice")
+    assert "to Heather, at heather at example dot com" in res.reply
+    assert not FakeSMTP.made
+
+
+def test_a_non_address_is_asked_once_more_then_let_go(cmd):
+    cmd.handle("email the biosensors handout to Dana", source="voice")
+    res = cmd.handle("dana at example com", source="voice")   # no "dot"
+    assert res.reply == outbox.ADDRESS_REASK_LINE and cmd.question_open()
+    res = cmd.handle("dana example", source="voice")
+    assert res.reply == outbox.ASK_DROPPED_LINE
+    assert cmd._pending_sendask is None and not FakeSMTP.made
+
+
+def test_who_should_i_send_it_to_is_answerable_as_well(cmd):
+    """WHO_LINE, the empty-recipient shape of the same question."""
+    from jarvis.commander import SendAsk
+    ask = SendAsk(kind="recipient", said_file="the biosensors handout",
+                  who="", hint="school")
+    cmd._turn_source = "voice"
+    cmd.stash_sendask(ask)
+    assert cmd.question_open()
+    res = cmd.handle("Heather", source="voice")
+    assert "to Heather, at heather at example dot com" in res.reply
+
+
+def test_the_question_slots_never_share_a_floor(cmd_no_default):
+    """Arming the account question clears a read-back and vice versa, the
+    invariant every other slot pair keeps."""
+    from jarvis.commander import SendAsk
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather "
+               "from my school account", source="voice")
+    assert cmd._pending_send is not None
+    cmd.stash_sendask(SendAsk(kind="account", said_file="x", who="Heather", hint=""))
+    assert cmd._pending_send is None and cmd._pending_sendask is not None
+    cmd.handle("email the biosensors handout to Heather "
+               "from my school account", source="voice")
+    assert cmd._pending_sendask is None and cmd._pending_send is not None
+    cmd.stash_sendask(SendAsk(kind="account", said_file="x", who="Heather", hint=""))
+    cmd.stash_filepick([Path("/tmp/a"), Path("/tmp/b")], lambda p: None)
+    assert cmd._pending_sendask is None
+
+
+# ==================================================================
+# 17. A yes that carries a correction (F23, 09-03)
+# ==================================================================
+def test_a_yes_with_a_new_recipient_never_sends_to_the_old_one(cmd):
+    """Read-back to Heather; "yes, send it to Dana". parse_send_answer said
+    None, the vague leg re-asked the ORIGINAL question, and the next bare
+    "yes" sent the file to Heather -- the correction discarded without a
+    word. Now the draft is spent and the SAME file is read back again to
+    Dana; with no address for her, that is the address question."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("yes, send it to Dana", source="typed")
+    assert res.reply == "I've no address for Dana, sir. What is it?"
+    assert cmd._pending_send is None and not FakeSMTP.made
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made, "a yes after the correction must not send to Heather"
+    res = cmd.handle("dana at example dot com", source="typed")
+    assert "to Dana, at dana at example dot com" in res.reply
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "dana@example.com"
+
+
+@pytest.mark.parametrize("said", [
+    "yes, send it to Dana", "yes but to Dana", "yeah, to Dana instead",
+    "yes, but send it to Dana instead", "yes send it to dana@example.com",
+    "yes, actually send it to Dana please",
+])
+def test_a_corrected_recipient_the_book_knows_is_read_back_again(cmd, said):
+    cmd.services.assistant.data["send_file.contacts"]["dana"] = "dana@example.com"
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert "dana at example dot com" in res.reply and "heather" not in res.reply
+    assert not FakeSMTP.made
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "dana@example.com"
+
+
+def test_a_yes_with_an_account_correction_is_read_back_from_that_account(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("yes, but from my work account", source="typed")
+    assert res.reply.endswith("Send it, sir?")
+    assert "your work account" in res.reply
+    assert "to Heather, at heather at example dot com" in res.reply
+    assert not FakeSMTP.made
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].logged_in[0] == "hunter@work.com"
+
+
+def test_the_seven_word_correction_is_no_longer_a_silent_drop(cmd):
+    """The parametrised silent-drop case the old test relied on: "yes, but
+    send it to her work address instead" fell to the drop branch and he
+    heard nothing at all. It is a correction; it gets the address question."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("yes, but send it to her work address instead",
+                     source="typed")
+    assert res is not None and res.reply.endswith("What is it?"), res
+    assert cmd.question_open() and not FakeSMTP.made
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made
+
+
+def test_the_re_ask_names_the_file_and_the_recipient_again(cmd):
+    """The second half of F23: the generic re-ask asked for a yes without
+    saying what the yes was to."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("okay", source="typed")
+    assert "Biosensors Lab Handout v2.pdf" in res.reply
+    assert "Heather, at heather at example dot com" in res.reply
+    assert res.reply.startswith("I'd rather be certain")
+    assert not FakeSMTP.made and cmd._pending_send is not None
+
+
+def test_the_ten_word_stray_is_not_a_correction_either(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.handle("Yeah, so you should be able to look that up.", source="typed")
+    assert cmd._pending_send is None and cmd._pending_sendask is None
+    assert not FakeSMTP.made
+
+
+@pytest.mark.parametrize("said,want", [
+    ("yes, send it to Dana", ("Dana", "")),
+    ("yes but to her work address instead", ("work address", "")),
+    ("yes, from my work account", ("", "work")),
+    ("yes send it to dana@example.com from my school account",
+     ("dana@example.com", "school")),
+    ("yes", None), ("yes please", None), ("yes that's the one", None),
+    ("Yeah, so you should be able to look that up.", None),
+    ("yes, thank you", None),
+])
+def test_what_counts_as_a_correction(said, want):
+    from jarvis.commander import _send_correction
+    assert _send_correction(said) == want, said

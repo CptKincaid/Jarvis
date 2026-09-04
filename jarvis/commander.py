@@ -5450,6 +5450,121 @@ _SEND_MAYBE_RX = re.compile(
     r"uh huh|i guess|i suppose|maybe|probably|whatever|sounds good|"
     r"i think so|if you like|why not)" + _SEND_TAIL, re.I)
 
+# ---- a yes that carries a CORRECTION (F23) ---------------------------------
+# "yes, send it to Dana" / "yes, but to her work address instead" / "yes,
+# from my work account". parse_send_answer says None (the tail is not in
+# the yes vocabulary), and the vague leg then re-asked the ORIGINAL
+# question -- so the next bare yes sent the file to Heather, and the
+# correction he put inside his yes was discarded without a word. A
+# correction is neither a yes nor a change of subject: the draft is
+# dropped and the SAME file is read back again to the corrected recipient
+# or account. Never sent. The "to" must follow a word that makes it a
+# recipient ("send it to", "yes to", "but to"): "Yeah, so you should be
+# able to look that up." has a "to" in it too.
+_SEND_CORRECT_TO_RX = re.compile(
+    r"\b(?:send|e-?mail|mail|forward|shoot|fire|it|that|this|one|file|"
+    r"but|rather|instead|no|yes|yeah|yep|okay|ok|sure|actually)[,\s]+"
+    r"(?:it\s+|that\s+|this\s+)?to\s+(?P<who>[^,.!?]+?)"
+    r"(?:\s+(?:instead|rather|please|thanks|thank you|sir))*[.!?,]*$", re.I)
+_SEND_CORRECT_ACCT_RX = re.compile(
+    r"\b(?:from|using|via|use|with|out of|off)\s+(?:my\s+|the\s+)?"
+    r"(?P<acct>[\w'\-]+(?:\s+[\w'\-]+)?)\s+(?:account|mailbox|e-?mail|"
+    r"identity)\b", re.I)
+
+
+def _send_correction(said: str) -> Optional[tuple[str, str]]:
+    """(recipient, account hint) a read-back answer carries, or None.
+
+    Either half may be "". An address said outright counts as the
+    recipient whatever surrounds it.
+    """
+    t = " ".join(str(said or "").split())
+    if not t:
+        return None
+    who, acct = "", ""
+    am = _SEND_CORRECT_ACCT_RX.search(t)
+    if am:
+        acct = am.group("acct").strip()
+        t_wo = t[:am.start()] + t[am.end():]
+    else:
+        t_wo = t
+    addr = outbox.parse_address(t_wo)
+    if addr:
+        who = addr
+    else:
+        tm = _SEND_CORRECT_TO_RX.search(t_wo)
+        if tm:
+            who = tm.group("who").strip()
+            # "to her work address" names an address of a person, not a
+            # person: hand it over as the possessive-less form the people
+            # book might know, and let the address question do the rest.
+            who = re.sub(r"^(?:her|his|their)\s+", "", who, flags=re.I)
+    if not who and not acct:
+        return None
+    return who, acct
+
+
+# ---- "Which account?" / "What is it?" (F21) --------------------------------
+# outbox.prepare asks two more questions the file lane could not hear the
+# answer to: "Which account should I send from, sir — personal, work,
+# school?" (three identities, send_file.from blank -- the SHIPPED default)
+# and "I've no address for Dana, sir. What is it?". Neither armed a slot,
+# question_open() was False, the app gave the answer the 4 s window and
+# the intent gate, and "school" / "dana at example dot com" came back as
+# "Was that for me?". Every send dead-ended for him unless the whole
+# sentence was re-said with "from my school account".
+SENDASK_TTL_S = 45.0           # the same life as "Which one, sir?" (FILEPICK_TTL_S)
+
+
+@dataclass
+class SendAsk:
+    """A send that stopped at a question: what it still needs, and the
+    pieces to run outbox.prepare again once it has it."""
+    kind: str                  # "account" | "recipient"
+    said_file: str             # the file phrase (or the chosen path)
+    who: str                   # the recipient as said, "" for WHO_LINE
+    hint: str                  # the account hint as said
+    source: str = "voice"
+    made_at: float = 0.0
+    reasked: bool = False
+
+    def stale(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else float(now)
+        return (now - float(self.made_at or 0.0)) > SENDASK_TTL_S
+
+
+# "from my school account" / "the work one" / "school, please" -> "school"
+_ACCOUNT_ANSWER_LEAD_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:(?:send|e-?mail|mail)\s+it\s+)?"
+    r"(?:(?:from|use|using|with|via|it'?s|it\s+is|that'?s|the|my)[,\s]+)*",
+    re.I)
+_ACCOUNT_ANSWER_TAIL_RX = re.compile(
+    r"(?:[,\s]+(?:account|mailbox|e-?mail|address|identity|one|please|"
+    r"thanks|thank you|sir|jarvis))*[.!?,\s]*$", re.I)
+# "it's dana at example dot com" / "send it to dana@x.com" / "her address is
+# ..." -> the part that is the address or the name
+_RECIPIENT_ANSWER_LEAD_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:(?:send|e-?mail|mail)\s+it\s+to|to|try|use|"
+    r"it'?s|it\s+is|that'?s|(?:her|his|their|the)\s+(?:e-?mail\s+)?"
+    r"address\s+is|(?:her|his|their)\s+e-?mail\s+is)[,\s]+", re.I)
+_RECIPIENT_ANSWER_TAIL_RX = re.compile(
+    r"(?:[,\s]+(?:instead|rather|then|please|thanks|thank you|sir|jarvis))*"
+    r"[.!?,\s]*$", re.I)
+
+
+def _account_answer(text: str) -> str:
+    t = " ".join(str(text or "").split())
+    t = _ACCOUNT_ANSWER_LEAD_RX.sub("", t, count=1)
+    t = _ACCOUNT_ANSWER_TAIL_RX.sub("", t, count=1)
+    return t.strip(" ,.!?")
+
+
+def _recipient_answer(text: str) -> str:
+    t = " ".join(str(text or "").split())
+    t = _RECIPIENT_ANSWER_LEAD_RX.sub("", t, count=1)
+    t = _RECIPIENT_ANSWER_TAIL_RX.sub("", t, count=1)
+    return t.strip(" ,.!?")
+
 
 # ---- "Which one, sir?" ---------------------------------------------------
 # BOTH file lanes ask this ("I've 2 that could be the lab report, sir: lab
@@ -5619,16 +5734,50 @@ def _send_file_offer(c, prep, who: str, hint: str):
     def _resume(path):
         again = outbox.prepare(cfg, c._svc("memory"), str(path), who,
                                account_hint=hint, chosen=path)
-        if again.draft is None:
-            return CommandResult(handled=True, reply=again.ask, speak=True,
-                                 status=again.status)
-        c.stash_send(again.draft)
-        return CommandResult(handled=True, speak=True, status=again.status,
-                             reply=outbox.read_back(again.draft))
+        return _send_file_finish(c, again, str(path), who, hint)
 
     c.stash_filepick(prep.candidates, _resume)
     return CommandResult(handled=True, reply=prep.ask, speak=True,
                          status=prep.status)
+
+
+def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
+                      to_name: str = "", reasked: bool = False):
+    """What every path through the file lane ends in: a read-back, or the
+    question it stopped at -- ARMED, so the answer can be heard.
+
+    Four callers: the first utterance (_h_send_file), the "Which one, sir?"
+    answer (_send_file_offer), the account / address answer
+    (_try_sendask_answer) and a corrected yes (_try_send_confirm). Until
+    F21 only the first two existed, and only the file question was parked;
+    "Which account should I send from, sir?" and "What is it?" were spoken
+    with no slot behind them.
+
+    ``to_name`` is what to call the recipient when the address itself was
+    the answer -- outbox resolves an address to a nameless draft, and the
+    read-back should still say "to Dana, at dana at ...". ``reasked`` is
+    carried from the slot being answered: a second miss on the SAME
+    question spends it rather than asking a third time.
+    """
+    if prep.draft is None:
+        if prep.candidates:
+            return _send_file_offer(c, prep, who, hint)
+        kind = ("account" if prep.status == "Which account?"
+                else "recipient" if prep.status == "No address" else "")
+        if kind:
+            if reasked:
+                log.info("send-file: %s asked twice; letting it go", kind)
+                return CommandResult(handled=True, speak=True, status="Dropped",
+                                     reply=outbox.ASK_DROPPED_LINE)
+            c.stash_sendask(SendAsk(kind=kind, said_file=said_file, who=who,
+                                    hint=hint))
+        return CommandResult(handled=True, reply=prep.ask, speak=True,
+                             status=prep.status)
+    if to_name and not prep.draft.to_name:
+        prep.draft.to_name = to_name
+    c.stash_send(prep.draft)
+    return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
+                         speak=True, status=prep.status)
 
 
 def _h_send_file(c, t, m):
@@ -5650,14 +5799,7 @@ def _h_send_file(c, t, m):
                                    "sir; that one first.")
     prep = outbox.prepare(c._svc("assistant"), c._svc("memory"), said_file,
                           who, account_hint=hint)
-    if prep.draft is None:
-        if prep.candidates:
-            return _send_file_offer(c, prep, who, hint)
-        return CommandResult(handled=True, reply=prep.ask, speak=True,
-                             status=prep.status)
-    c.stash_send(prep.draft)
-    return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
-                         speak=True, status=prep.status)
+    return _send_file_finish(c, prep, said_file, who, hint)
 
 
 def _h_network(c, t, m):                                   # 3267-3279
@@ -9227,6 +9369,7 @@ class Commander:
     _strict_reasked: bool = False
     _pending_objection: Optional[tuple] = None
     _pending_send: Any = None                 # outbox.Draft awaiting a yes
+    _pending_sendask: Optional[SendAsk] = None  # "Which account?" / "What is it?"
     _objection_timer = None
     _objections = None
     # Monotonic; 0.0 means "no building has been named this session", which
@@ -9297,6 +9440,8 @@ class Commander:
         self._answered_pending = False
         self._strict_reasked = False
         self._pending_send = None
+        # A send that stopped at "Which account?" / "What is it?" (F21).
+        self._pending_sendask: Optional[SendAsk] = None
         # He advised against something and asked "shall I set it anyway?":
         # (run, spoken line, Objection, stamp). Its own slot because its
         # default on ambiguity is the OPPOSITE of the read-back's -- see
@@ -9370,7 +9515,8 @@ class Commander:
             armed = (getattr(self, "_pending_send", None),
                      getattr(self, "_pending_filepick", None),
                      getattr(self, "_pending_destructive", None),
-                     getattr(self, "_pending_destructive_meta", None))
+                     getattr(self, "_pending_destructive_meta", None),
+                     getattr(self, "_pending_sendask", None))
             self._answered_pending = False
             result = self._handle_inner(text, source)
             self._drop_stranded_questions(armed, result, source)
@@ -9414,11 +9560,17 @@ class Commander:
         """
         if self._answered_pending or result is None:
             return
-        send, pick, destructive, meta = armed
+        send, pick, destructive, meta = armed[:4]
+        ask = armed[4] if len(armed) > 4 else None
         if send is not None and getattr(self, "_pending_send", None) is send \
                 and self._same_room(getattr(send, "asked_from", "voice"), source):
             log.info("send read-back dropped: the turn was answered elsewhere")
             self._pending_send = None
+        if ask is not None and getattr(self, "_pending_sendask", None) is ask \
+                and self._same_room(getattr(ask, "source", "voice"), source):
+            log.info("send %s question dropped: the turn was answered elsewhere",
+                     ask.kind)
+            self._pending_sendask = None
         if pick is not None and getattr(self, "_pending_filepick", None) is pick \
                 and self._same_room(pick[2] if len(pick) == 5 else "voice", source):
             log.info("which-one dropped: the turn was answered elsewhere")
@@ -9512,6 +9664,16 @@ class Commander:
                     return True
             except (TypeError, ValueError):
                 pass
+        # "Which account should I send from, sir?" / "What is it?" -- the
+        # file lane's other two questions (F21). Same rule as the two above.
+        ask = getattr(self, "_pending_sendask", None)
+        if ask is not None:
+            try:
+                if not ask.stale():
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed slot
+                log.debug("question_open: send ask staleness failed",
+                          exc_info=True)
         # A read-back ("Cancel all three alarms, sir?") and the objection
         # ("Shall I set it anyway?") both hold the floor for DESTRUCTIVE_TTL_S.
         for name, size in (("_pending_destructive", 3), ("_pending_objection", 4)):
@@ -9633,6 +9795,24 @@ class Commander:
         # and drops its draft on any non-answer. A read-back armed outside
         # handle() (a proactive offer) had no such accident protecting it.
         self._pending_send = None
+        self._pending_sendask = None
+
+    def stash_sendask(self, ask: SendAsk):
+        """"Which account should I send from, sir?" / "What is it?" --
+        park the half-made send so the answer can be heard (F21).
+
+        The same slot rule as the other three: one question on the floor
+        at a time, and the answer rung (``_try_sendask_answer``) re-runs
+        outbox.prepare with the missing piece and ends in the ordinary
+        read-back, so answering it still sends nothing.
+        """
+        ask.source = self._turn_source
+        ask.made_at = time.monotonic()
+        self._pending_sendask = ask
+        self._pending_send = None
+        self._pending_filepick = None
+        self._pending_destructive = None
+        self._pending_destructive_meta = None
 
     def stash_filepick(self, candidates, resume: Callable):
         """"Which one, sir?" -- park the rivals so the answer can be heard.
@@ -9655,6 +9835,7 @@ class Commander:
         # One question on the floor at a time, the same rule stash_send and
         # stash_destructive keep between themselves.
         self._pending_send = None
+        self._pending_sendask = None
         self._pending_destructive = None
         self._pending_destructive_meta = None
 
@@ -9681,6 +9862,7 @@ class Commander:
         self._pending_destructive = None
         self._pending_destructive_meta = None
         self._pending_filepick = None
+        self._pending_sendask = None
 
     def _same_room(self, asked: str, answering: str) -> bool:
         """Could a turn from ``answering`` be the answer to a question put
@@ -9997,6 +10179,14 @@ class Commander:
         #       together anyway: a send arms its own slot and nothing in
         #       the app arms both.
         res = self._try_send_confirm(text, source)
+        if res is not None:
+            return res
+        # 3d-iii. "Which account should I send from, sir?" / "What is it?"
+        #        -- the file lane's other two questions (F21). Its answer
+        #        is a label or an address, never a bare yes, and it can
+        #        never be live with the read-back above or the pick below
+        #        (each stash clears the others).
+        res = self._try_sendask_answer(text, source)
         if res is not None:
             return res
         # 3d-iv. "Which one, sir?" -- the ambiguous-file question both file
@@ -10550,6 +10740,26 @@ class Commander:
         answer = parse_send_answer(text)
         if answer is None:
             said = " ".join(str(text or "").split())
+            # A yes that carries a CORRECTION -- "yes, send it to Dana",
+            # "yes, but from my work account", "yes, to her work address
+            # instead" -- is neither a yes nor a change of subject (F23).
+            # It was the vague leg below: a generic re-ask, and the next
+            # bare yes sent the file to the person he had just corrected
+            # AWAY from. The draft is spent and the same file is read back
+            # again to the corrected recipient / account. Never sent.
+            fix = _send_correction(said) if parse_yes_no(said) is True else None
+            if fix is not None:
+                who, hint = fix
+                log.info("send read-back: %r corrects the draft; asking again",
+                         text[:60])
+                cfg = self._svc("assistant")
+                to = who or draft.to_name or draft.to_addr
+                prep = outbox.prepare(cfg, self._svc("memory"), str(draft.path),
+                                      to, account_hint=hint or draft.account_label,
+                                      chosen=draft.path)
+                return _send_file_finish(self, prep, str(draft.path), to,
+                                         hint or draft.account_label,
+                                         to_name="" if who else draft.to_name)
             # Two ways to be vague, and BOTH get the one re-ask rather than
             # the silent drop. _SEND_MAYBE_RX catches the bare fillers
             # ("okay", "sure"); the second leg catches a yes this grammar
@@ -10559,15 +10769,17 @@ class Commander:
             # overheard-speech line, and it is what keeps the ten-word
             # "Yeah, so you should be able to look that up." on the silent
             # branch where it belongs. Safety is unchanged either way:
-            # nothing is sent, he is asked once more.
+            # nothing is sent, he is asked once more -- and the re-ask
+            # names the file and the recipient again (F23), so the yes he
+            # gives next is to a sentence he has just heard.
             vague = bool(_SEND_MAYBE_RX.match(said)) or (
                 len(said.split()) <= 6 and parse_yes_no(said) is True)
             if vague and not draft.reasked:
                 draft.reasked = True
                 self._pending_send = draft
                 log.info("send read-back: %r is not a yes; asking again", text)
-                return CommandResult(handled=True, reply=outbox.UNSURE_LINE,
-                                     speak=True, status="Confirm?")
+                return CommandResult(handled=True, speak=True, status="Confirm?",
+                                     reply=outbox.unsure_line(draft))
             self._answered_pending = False
             log.info("send draft dropped, the subject changed: %r", text)
             return None
@@ -10621,6 +10833,111 @@ class Commander:
         return CommandResult(handled=True, reply="Sending it now, sir.",
                              speak=True, ack=True, done=False,
                              status=f"Sending {name}")
+
+    def _try_sendask_answer(self, text: str,
+                            source: str = "voice") -> Optional[CommandResult]:
+        """Answer "Which account should I send from, sir?" or "What is
+        it?" -- the two send questions that had no slot (F21).
+
+        The account answer is a label ("school", "the work one", "from my
+        personal account"), matched by mail.account_by_label and never
+        fuzzily. The recipient answer is an address said aloud ("dana at
+        example dot com") or a name the people book knows. Either way the
+        send is prepared AGAIN with the missing piece and ends in the
+        ordinary read-back, so this rung can never send anything.
+
+        A miss gets ONE more question, as the read-back and "Which one,
+        sir?" do; a no or a "never mind" lets it go out loud; anything
+        else drops the question and keeps its own meaning.
+        """
+        ask = getattr(self, "_pending_sendask", None)
+        if ask is None:
+            return None
+        if ask.stale():
+            self._pending_sendask = None
+            log.info("send %s question expired; %r is a new subject",
+                     ask.kind, text[:40])
+            return None
+        if not self._same_room(ask.source, source):
+            log.debug("send %s question: a %s turn is not its answer",
+                      ask.kind, source)
+            return None
+        self._pending_sendask = None
+        said = " ".join(str(text or "").split())
+        if _PICK_CANCEL_RX.match(said) or parse_yes_no(said) is False:
+            self._answered_pending = True
+            return CommandResult(handled=True, reply=outbox.ASK_SPENT_LINE,
+                                 speak=True, status="Dropped")
+        cfg = self._svc("assistant")
+        memory = self._svc("memory")
+        if ask.kind == "account":
+            hint = _account_answer(said)
+            picked = (mail_mod.account_by_label(mail_mod.mail_accounts(cfg), hint)
+                      if hint else None)
+            if picked is None:
+                # A label is one word, two at most ("the work one" has
+                # already lost its wrapping); "what time is it" is a new
+                # subject and keeps its meaning.
+                if not hint or len(hint.split()) > 2:
+                    log.info("send account: %r is a new subject", said[:40])
+                    return None
+                if ask.reasked:
+                    self._answered_pending = True
+                    return CommandResult(handled=True, speak=True,
+                                         status="Dropped",
+                                         reply=outbox.ASK_DROPPED_LINE)
+                names = ", ".join(mail_mod.account_label(a)
+                                  for a in mail_mod.mail_accounts(cfg))
+                # A bare "yes" is not an account either; it gets the list
+                # again rather than "I've no yes account".
+                line = (outbox.ACCOUNT_WHICH_LINE.format(names=names)
+                        if parse_yes_no(said) is True else
+                        outbox.ACCOUNT_REASK_LINE.format(hint=hint, names=names))
+                ask.reasked = True
+                self._pending_sendask = ask
+                self._answered_pending = True
+                return CommandResult(handled=True, speak=True,
+                                     status="Which account?", reply=line)
+            self._answered_pending = True
+            label = mail_mod.account_label(picked)
+            log.info("send account: %r means %s", said[:40], label)
+            prep = outbox.prepare(cfg, memory, ask.said_file, ask.who,
+                                  account_hint=label)
+            return _send_file_finish(self, prep, ask.said_file, ask.who, label,
+                                     reasked=ask.reasked)
+        # recipient: an address, or a name the book resolves
+        who = _recipient_answer(said)
+        addr = outbox.parse_address(who)
+        resolved = addr or outbox.resolve_recipient(cfg, memory, who)[0]
+        if not resolved:
+            # Not an address and not a name we know. One re-ask for a
+            # sentence that was plainly an attempt -- an address shape
+            # ("dana at example com", the "dot" lost), a name's worth of
+            # words, or a bare yes -- and a new subject keeps its meaning.
+            attempt = bool(who) and (
+                "@" in who or re.search(r"\bat\b", who, re.I) is not None
+                or len(who.split()) <= 3 or parse_yes_no(said) is True)
+            if not attempt:
+                log.info("send recipient: %r is a new subject", said[:40])
+                return None
+            if ask.reasked:
+                self._answered_pending = True
+                return CommandResult(handled=True, speak=True, status="Dropped",
+                                     reply=outbox.ASK_DROPPED_LINE)
+            ask.reasked = True
+            self._pending_sendask = ask
+            self._answered_pending = True
+            return CommandResult(handled=True, speak=True, status="No address",
+                                 reply=outbox.ADDRESS_REASK_LINE)
+        self._answered_pending = True
+        log.info("send recipient: %r resolves", said[:40])
+        prep = outbox.prepare(cfg, memory, ask.said_file, who,
+                              account_hint=ask.hint)
+        # An address said outright resolves to a nameless draft; the name
+        # he used in the first sentence is what the read-back should say.
+        return _send_file_finish(self, prep, ask.said_file, who, ask.hint,
+                                 to_name=ask.who if addr else "",
+                                 reasked=ask.reasked)
 
     def _try_destructive_confirm(self, text: str,
                                  source: str = "voice") -> Optional[CommandResult]:
