@@ -168,3 +168,105 @@ def wait_for_exit(pid: int, grace_s: float, *, alive, kill, sleep, clock,
         sleep(poll_s)
     log(f"pid {pid} gone {clock() - t2:.2f}s after SIGKILL")
     return "killed"
+
+
+# ------------------------------------------------------------- the CLI
+def _parse(argv):
+    import argparse
+    ap = argparse.ArgumentParser(
+        prog="python -m jarvis.relaunch",
+        description="Wait for the old Jarvis (by pid) to be gone, then "
+                    "launch the command after '--' once. Started by the "
+                    "Restart button; lines go to --log.")
+    ap.add_argument("--wait-pid", type=int, required=True,
+                    help="the running jarvis.app to wait out")
+    ap.add_argument("--grace", type=float, default=DEFAULT_GRACE_S,
+                    help="seconds of patience before SIGTERM (then SIGKILL "
+                         "5 s later)")
+    ap.add_argument("--log", default="",
+                    help="append the timeline here (default: stdout)")
+    ap.add_argument("--cwd", default=str(REPO_ROOT),
+                    help="working directory for the launch")
+    ap.add_argument("cmd", nargs=argparse.REMAINDER,
+                    help="-- then the command to launch")
+    ns = ap.parse_args(argv)
+    cmd = list(ns.cmd)
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        ap.error("nothing to launch after '--'")
+    ns.cmd = cmd
+    return ns
+
+
+class _Log:
+    """Timestamped lines to the --log file (append, flushed per line) or
+    stdout. Never raises: a log that cannot be written must not stop the
+    hand-over it is describing."""
+
+    def __init__(self, path: str):
+        self.fh = None
+        if path:
+            try:
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                self.fh = open(path, "a", encoding="utf-8")
+            except OSError:
+                self.fh = None
+
+    def __call__(self, msg: str) -> None:
+        import time
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S") + \
+            f".{int(time.time() * 1000) % 1000:03d}"
+        line = f"{stamp} relaunch[{os.getpid()}]: {msg}\n"
+        try:
+            out = self.fh or sys.stdout
+            out.write(line)
+            out.flush()
+        except (OSError, ValueError):
+            pass
+
+    def close(self):
+        if self.fh is not None:
+            try:
+                self.fh.close()
+            except OSError:
+                pass
+
+
+def main(argv=None, *, alive=process_alive, kill=os.kill, sleep=None,
+         popen=subprocess.Popen, clock=None) -> int:
+    """The helper. 0 when the new Jarvis was launched, 1 when it could
+    not be (the old process would not die, or the launch itself failed).
+    ONE attempt: a helper that retried would relaunch a broken checkout
+    forever, and the log is where he finds out instead."""
+    import time
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    ns = _parse(sys.argv[1:] if argv is None else list(argv))
+    log = _Log(ns.log)
+    rc = 1
+    try:
+        log(f"start: wait for pid {ns.wait_pid}, then "
+            f"{' '.join(ns.cmd)} in {ns.cwd}")
+        how = wait_for_exit(ns.wait_pid, ns.grace, alive=alive, kill=kill,
+                            sleep=sleep, clock=clock, log=log)
+        if how == "stuck":
+            log(f"not launching: pid {ns.wait_pid} is still there and "
+                "app._focus_running_instance would only raise its window")
+            return rc
+        try:
+            proc = popen(ns.cmd, cwd=ns.cwd, env=dict(os.environ),
+                         start_new_session=True)
+        except Exception as exc:          # noqa: BLE001 - reported, not retried
+            log(f"launch failed: {exc!r}")
+            return rc
+        log(f"launched pid {proc.pid}: {' '.join(ns.cmd)} (old process {how})")
+        rc = 0
+        return rc
+    finally:
+        log(f"exit {rc}")
+        log.close()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

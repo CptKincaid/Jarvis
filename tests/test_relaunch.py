@@ -12,7 +12,6 @@ import subprocess
 import sys
 from pathlib import Path
 
-import pytest
 
 from jarvis import relaunch
 
@@ -247,3 +246,117 @@ def test_a_process_that_survives_sigkill_is_given_up_on_not_waited_forever():
     assert how == "stuck"
     assert world.t < 1.0 + 5.0 + 3.0 + 1.0
     assert any("still alive" in ln for ln in lines)
+
+
+# ------------------------------------------------------------------ main
+STAMP = r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3} relaunch\[\d+\]: "
+
+
+def _main(world, popen, log_path, grace="20", cmd=("py", "-m", "jarvis.app")):
+    argv = ["--wait-pid", str(world.pid), "--grace", grace,
+            "--log", str(log_path), "--cwd", "/repo", "--", *cmd]
+    return relaunch.main(argv, alive=world.alive, kill=world.kill,
+                         sleep=world.sleep, popen=popen, clock=world.clock)
+
+
+def test_main_waits_for_the_old_pid_then_launches_once_with_a_timeline(
+        tmp_path):
+    import re
+    world = FakeWorld(pid=100, dies_at=0.6)
+    launched_at = []
+    inner = _RecordingPopen(pid=4242)
+
+    def popen(argv, **kw):
+        launched_at.append(world.clock())
+        return inner(argv, **kw)
+    log_path = tmp_path / "relaunch.log"
+    rc = _main(world, popen, log_path)
+    assert rc == 0
+    assert len(inner.calls) == 1
+    argv, kw = inner.calls[0]
+    assert argv == ["py", "-m", "jarvis.app"]
+    assert kw["cwd"] == "/repo" and kw["start_new_session"] is True
+    # launched only once the old pid was gone
+    assert launched_at == [world.t] and world.t >= 0.6
+    lines = log_path.read_text().splitlines()
+    assert lines and all(re.match(STAMP, ln) for ln in lines), lines
+    assert any("launched pid 4242" in ln for ln in lines)
+    assert lines[-1].endswith("exit 0")
+
+
+def test_main_logs_the_failed_launch_exits_1_and_never_retries(tmp_path):
+    world = FakeWorld(pid=100, dies_at=0.1)
+    attempts = []
+
+    def popen(argv, **kw):
+        attempts.append(list(argv))
+        raise OSError("no such interpreter")
+    log_path = tmp_path / "relaunch.log"
+    rc = _main(world, popen, log_path)
+    assert rc == 1
+    assert len(attempts) == 1
+    text = log_path.read_text()
+    assert "launch failed" in text and "no such interpreter" in text
+    assert text.rstrip().endswith("exit 1")
+
+
+def test_main_does_not_launch_over_a_process_that_survived_sigkill(tmp_path):
+    world = FakeWorld(pid=100, honours=())
+    inner = _RecordingPopen()
+    rc = _main(world, inner, tmp_path / "relaunch.log", grace="1")
+    assert rc == 1
+    assert inner.calls == []
+
+
+def test_main_appends_to_an_existing_log(tmp_path):
+    log_path = tmp_path / "relaunch.log"
+    log_path.write_text("earlier\n")
+    world = FakeWorld(pid=100, dies_at=0.1)
+    _main(world, _RecordingPopen(), log_path)
+    assert log_path.read_text().startswith("earlier\n")
+
+
+# ------------------------------------------------- import-time hygiene
+def _tree(root: Path) -> dict:
+    out = {}
+    for p in sorted(root.rglob("*")):
+        st = p.stat()
+        out[str(p.relative_to(root))] = (st.st_size, st.st_mtime_ns)
+    return out
+
+
+def test_importing_and_helping_never_touches_home_or_a_config_module(
+        tmp_path):
+    """jarvis/config.py runs Config.load() at import and jarvis.brain loads
+    the assistant config at import: a helper whose only job is a clean
+    hand-over must not pull either in. Measured, not asserted by reading:
+    ``python -X importtime`` in a subprocess with HOME at a tmp dir that
+    HOLDS config files, before/after a byte-and-mtime snapshot of HOME."""
+    home = tmp_path / "home"
+    (home / ".config" / "jarvis").mkdir(parents=True)
+    (home / ".config" / "jarvis" / "assistant.json").write_text(
+        '{"user": {"name": "probe"}}')
+    (home / ".aiws_trainer").mkdir()
+    (home / ".aiws_trainer" / "voice_settings.json").write_text("{}")
+    before = _tree(home)
+    env = {"HOME": str(home), "PATH": os.environ.get("PATH", "/usr/bin")}
+
+    r = subprocess.run([sys.executable, "-X", "importtime", "-c",
+                        "import jarvis.relaunch"],
+                       cwd=REPO_ROOT, env=env, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-2000:]
+    imported = [ln.split("|")[-1].strip() for ln in r.stderr.splitlines()
+                if ln.startswith("import time:")]
+    jarvis_mods = sorted(m for m in imported if m.startswith("jarvis"))
+    assert jarvis_mods == ["jarvis", "jarvis.relaunch"], jarvis_mods
+    for heavy in ("torch", "numpy", "tkinter", "sounddevice", "whisper"):
+        assert not any(m == heavy or m.startswith(heavy + ".")
+                       for m in imported), heavy
+
+    r = subprocess.run([sys.executable, "-m", "jarvis.relaunch", "--help"],
+                       cwd=REPO_ROOT, env=env, capture_output=True,
+                       text=True, timeout=60)
+    assert r.returncode == 0, r.stderr[-2000:]
+    assert "--wait-pid" in r.stdout and "--grace" in r.stdout
+    assert _tree(home) == before
