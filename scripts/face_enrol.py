@@ -209,9 +209,14 @@ def owner_label(cfg) -> str:
     got. Enrolling Heather can only ever make Jarvis more careful. Pinned by
     tests/test_faceenrol_notes.py::test_enrolling_a_second_person_can_only_TAKE_a_promotion_AWAY.
     """
-    name = str(cfg.get("user.name", "") or "hunter").strip().lower()
-    keep = "".join(c if (c.isalnum() or c in "-_") else "" for c in name)
-    return keep or "hunter"
+    # A DELEGATE. It used to derive the label here, which was the third of
+    # three copies -- and the one that kept every character isalnum() liked,
+    # including non-ASCII, while the gallery stores under
+    # ^[a-z0-9][a-z0-9_-]{0,30}$. A user.name of "Jose" with an accent
+    # produced a label the gallery would not take. identity.slug fixes that
+    # for all three callers at once.
+    from jarvis.identity import owner_label as _one_owner_label
+    return _one_owner_label(cfg)
 
 
 def target_label(cfg, args) -> tuple:

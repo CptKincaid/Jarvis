@@ -117,6 +117,14 @@ class PATHS:
     # when. The directory is created 0700 and the file 0600 by ZoneLog.
     STATE_DIR = Path(os.environ.get("JARVIS_STATE_DIR") or
                      (Path.home() / ".local" / "state" / "jarvis"))
+    # jarvis/identity.py: WHO Jarvis knows -- one row per person, with the
+    # salted hashes of the two fallbacks (the spoken passphrase and the
+    # typed override code). Beside zones.jsonl and NOT inside
+    # assistant.json on purpose: that object is deep-copied into reports
+    # and prints redacted() from its __repr__, so the strongest way to
+    # keep a hash out of a log is to keep it out of that object. Written
+    # 0600 in a 0700 directory by Registry.save.
+    OWNER_REGISTRY = STATE_DIR / "people.json"
 
 
 # ------------------------------------------------------------- settings
