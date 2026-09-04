@@ -1179,3 +1179,55 @@ def test_no_function_in_the_pane_hands_a_picture_back_out():
     assert "return self._photo" not in source
     assert not re.search(r"def \w+\([^)]*\)\s*->\s*(Image|ImageTk)", source)
     assert "shot.image" in source                # it is only ever handed on
+
+
+# -------------------------------------- the draw stage is posted back (09-04)
+def test_a_live_repaint_posts_its_own_cost_to_the_worker_as_a_number():
+    """The one stage the capture thread cannot time. After a live shot is
+    painted the pane tells the worker how long the repaint took, so the
+    once-a-minute ``campreview:`` line carries ``draw`` beside ``grab`` --
+    a slow pane and a slow camera become two columns, not one complaint."""
+    ns = pane()
+    ns._paint = lambda shot: None
+    posted = []
+    ns.worker = SimpleNamespace(latest=lambda: live(face()),
+                                note_stage=lambda n, ms: posted.append((n, ms)))
+    CameraPreview.refresh(ns)
+    assert len(posted) == 1
+    name, ms = posted[0]
+    assert name == "draw"
+    assert isinstance(ms, float) and ms >= 0.0
+    CameraPreview.refresh(ns)                    # same seq: no repaint, no post
+    assert len(posted) == 1
+
+
+def test_a_shot_that_is_not_live_posts_no_draw_time():
+    ns = pane()
+    ns._paint = lambda shot: None
+    posted = []
+    ns.worker = SimpleNamespace(
+        latest=lambda: cp.blank(cp.REASON_DISABLED, seq=7),
+        note_stage=lambda n, ms: posted.append((n, ms)))
+    CameraPreview.refresh(ns)
+    assert posted == []
+
+
+def test_a_worker_without_the_hook_is_painted_and_left_alone():
+    ns = pane()
+    painted = []
+    ns._paint = lambda shot: painted.append(shot)
+    ns.worker = SimpleNamespace(latest=lambda: live(face()))   # no note_stage
+    CameraPreview.refresh(ns)                    # must not raise
+    assert len(painted) == 1
+
+
+def test_a_hook_that_raises_costs_the_number_not_the_picture():
+    ns = pane()
+    painted = []
+    ns._paint = lambda shot: painted.append(shot)
+
+    def angry(_n, _ms):
+        raise RuntimeError("the worker is gone")
+    ns.worker = SimpleNamespace(latest=lambda: live(face()), note_stage=angry)
+    CameraPreview.refresh(ns)                    # must not raise
+    assert len(painted) == 1

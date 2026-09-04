@@ -19,6 +19,7 @@ the toggle off means no capture at all, a sensing denial means no capture and
 a STATED reason, and the Tk thread is never the thread that waits 130 ms for
 a frame.
 """
+import logging
 import re
 import threading
 import time
@@ -1813,9 +1814,16 @@ def test_a_recognised_face_cannot_grant_anything_because_nothing_reads_it():
     # and SensingPolicy still own the lens. What it exists for is the reverse
     # of a capability grant -- it lets face ENROLMENT happen without killing
     # Jarvis, and enrolment writes an embedding, it does not read one.
+    #
+    # note_stage (2026-09-04) is the other direction entirely: a FLOAT IN.
+    # The Tk pane posts how long its repaint took so the minute log line
+    # can print ``draw`` beside ``grab``; nothing comes back out of it, it
+    # holds no frame and no callback, and StageStats only ever stores
+    # floats. ``stages`` is that store, readable for the log and the suite.
     api = {n for n in dir(cp.PreviewWorker) if not n.startswith("_")}
     assert api == {"start", "stop", "set_enabled", "latest", "status",
-                   "cycle", "fps", "running", "set_tap", "LOG_EVERY_S"}, api
+                   "cycle", "fps", "running", "set_tap", "LOG_EVERY_S",
+                   "note_stage"}, api
 
 
 def test_the_gallery_is_only_ever_read_never_written():
@@ -1913,3 +1921,240 @@ def test_a_strong_detection_with_landmarks_that_are_not_a_face_is_never_embedded
     assert shot.primary.conf == pytest.approx(0.95)
     assert shot.primary.id_ran is False       # and never named
     assert shot.primary.name == ""
+
+
+# ------------------------------------------------- per-stage timing (09-04)
+# WHY THESE EXIST. On 2026-09-03 the preview line read ``3.7 fps  grab 268
+# ms`` for a whole evening and the one number on it was the WHOLE cycle, so
+# three agents ruled out USB, the GPU and the app's own loop before anybody
+# timed the device read alone. The stages are timed separately now and the
+# minute line prints each one's p50, with ``-`` for a stage that did not run.
+# Every clock here is hand-wound: a fake that advances the clock INSIDE its
+# call is how a stage's cost is known to the millisecond, and the reason a
+# real device is never needed to test the instrument.
+class TickingFeed(FakeFeed):
+    """A feed whose capture takes exactly ``cost`` seconds of the fake clock
+    -- the device's frame interval, without a device."""
+
+    def __init__(self, clock, cost, **kw):
+        super().__init__(**kw)
+        self.clock, self.cost = clock, cost
+
+    def capture(self):
+        self.clock.tick(self.cost)
+        return super().capture()
+
+
+class TickingDetector(FakeDetector):
+    def __init__(self, clock, cost, **kw):
+        super().__init__(**kw)
+        self.clock, self.cost = clock, cost
+
+    def detect(self, frame):
+        self.clock.tick(self.cost)
+        return super().detect(frame)
+
+
+class TickingRecogniser(FakeRecogniser):
+    def __init__(self, clock, cost, **kw):
+        super().__init__(**kw)
+        self.clock, self.cost = clock, cost
+
+    def embed(self, frame, row):
+        self.clock.tick(self.cost)
+        return super().embed(frame, row)
+
+
+def test_stage_stats_take_a_p50_per_stage_and_say_absent_for_one_that_never_ran():
+    st = cp.StageStats()
+    for ms in (10.0, 268.0, 12.0):
+        st.note("grab", ms)
+    st.extend({"shrink": 1.5, "detect": "3.0"})
+    st.note("nonsense", "not a number")            # ignored, never raises
+    p = st.p50s()
+    assert p["grab"] == 12.0                       # the median, not the mean
+    assert p["shrink"] == 1.5 and p["detect"] == 3.0
+    assert "embed" not in p and "nonsense" not in p
+    assert st.counts()["grab"] == 3
+    assert st.p50s(reset=True)["grab"] == 12.0
+    assert st.p50s() == {}                         # reset really resets
+
+
+def test_stage_stats_keep_a_bounded_window_so_a_silent_log_cannot_grow_them():
+    st = cp.StageStats()
+    for i in range(cp.STAGE_KEEP + 100):
+        st.note("grab", float(i))
+    assert st.counts()["grab"] == cp.STAGE_KEEP
+
+
+def test_the_stage_line_prints_every_stage_in_order_with_dash_for_did_not_run():
+    line = cp.stage_line({"grab": 267.9, "detect": 3.14, "shrink": 1.8,
+                          "draw": 2.06}, cycles=222)
+    assert line == ("stages p50 ms [222 cycles]: grab 268  detect 3.1  "
+                    "landmarks -  embed -  hand -  offer -  shrink 1.8  "
+                    "draw 2.1"), line
+    # a stage nobody declared still prints, after the known ones
+    assert cp.stage_line({"odd": 4.0}).endswith("draw -  odd 4.0")
+
+
+def test_a_live_shot_carries_the_device_read_separately_from_the_whole_cycle():
+    """The device read is 268 ms, the detector 3 ms: the cycle says 271 and
+    the stages say which of the two it is. That sentence is the entire
+    reason the instrument exists."""
+    clock = Clock()
+    feed = TickingFeed(clock, 0.268)
+    det = TickingDetector(clock, 0.003, rows=[row(4, 2, 8, 8)],
+                          input_size=(32, 18))
+    pipe = cp.PreviewPipeline(feed, detector=det, observe=observer(),
+                              now=clock)
+    shot = pipe.grab((16, 9))
+    assert shot.live
+    assert shot.stage_ms["grab"] == pytest.approx(268.0)
+    assert shot.stage_ms["detect"] == pytest.approx(3.0)
+    assert shot.stage_ms["landmarks"] == pytest.approx(0.0)   # no clock cost
+    assert shot.stage_ms["shrink"] == pytest.approx(0.0)
+    assert shot.grab_ms == pytest.approx(271.0)                # the whole pass
+    # stages that had nothing to do are ABSENT, not zero
+    for name in ("embed", "hand", "offer", "draw"):
+        assert name not in shot.stage_ms, name
+    assert set(shot.stage_ms) <= set(cp.STAGES)
+    assert all(isinstance(v, float) for v in shot.stage_ms.values())
+
+
+def test_detect_and_landmarks_are_timed_only_on_the_cycles_they_run():
+    clock = Clock()
+    det = TickingDetector(clock, 0.003, rows=[row(4, 2, 8, 8)],
+                          input_size=(32, 18))
+    # a feed that costs no clock: the picture interval is what the ticks
+    # between grabs say (15 fps), so the 8 Hz cadence lands on every other
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=det,
+                              observe=observer(), now=clock)
+    first = pipe.grab((16, 9))
+    clock.tick(1.0 / 15.0)
+    second = pipe.grab((16, 9))                  # carried boxes, no detect
+    assert det.calls == 1
+    assert first.stage_ms["detect"] == pytest.approx(3.0)
+    assert "landmarks" in first.stage_ms
+    assert "detect" not in second.stage_ms and "landmarks" not in second.stage_ms
+    assert second.stage_ms["grab"] == pytest.approx(0.0)   # still measured
+
+
+def test_the_embedding_is_its_own_column_and_is_not_counted_as_landmarks():
+    clock = Clock()
+    rec = TickingRecogniser(clock, 0.0104)
+    pipe, _det = identified(clock, recogniser=rec)
+    shot = pipe.grab((16, 9))
+    assert len(rec.rows) == 1                    # one embedding was taken
+    assert shot.stage_ms["embed"] == pytest.approx(10.4)
+    # _faces was measured whole; the embed inside it is taken back out
+    assert shot.stage_ms["landmarks"] == pytest.approx(0.0)
+    assert shot.stage_ms["grab"] == pytest.approx(0.0)
+
+
+def test_the_offer_and_the_hand_stage_are_timed_when_and_only_when_wired():
+    clock = Clock()
+
+    class Tap:
+        def __init__(self):
+            self.offers = 0
+
+        def offer(self, _frame):
+            self.offers += 1
+            clock.tick(0.002)
+
+    class Hands:
+        def observe(self, *_a):
+            clock.tick(0.0056)
+            return None
+
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=FakeDetector(rows=[]),
+                              observe=observer(), now=clock, hands=Hands())
+    bare = pipe.grab((16, 9))
+    assert bare.stage_ms["hand"] == pytest.approx(5.6)
+    assert "offer" not in bare.stage_ms
+    pipe.tap = Tap()
+    tapped = pipe.grab((16, 9))
+    assert tapped.stage_ms["offer"] == pytest.approx(2.0)
+    assert tapped.stage_ms["hand"] == pytest.approx(5.6)
+
+
+def test_a_missed_frame_still_reports_how_long_the_miss_took_nothing_else():
+    """A feed that answers None after a 2 s wait is a stuck camera, and
+    that wait is the number worth having; the blank shot carries no image
+    and no stages, so nothing downstream mistakes it for a picture."""
+    clock = Clock()
+    feed = TickingFeed(clock, 2.0, frames=[])
+    pipe = cp.PreviewPipeline(feed, detector=FakeDetector(rows=[]),
+                              observe=observer(), now=clock)
+    shot = pipe.grab((16, 9))
+    assert not shot.live and shot.stage_ms == {}
+    assert pipe._cycle_ms["grab"] == pytest.approx(2000.0)
+
+
+def test_numbers_only_carries_the_stage_costs_as_floats_keyed_by_name():
+    shot = cp.PreviewShot(image=object(), reason=cp.REASON_LIVE,
+                          stage_ms={"grab": 268.0, "shrink": 1.8})
+    data = shot.numbers_only()
+    assert data["stage_ms"] == {"grab": 268.0, "shrink": 1.8}
+    assert "image" not in data
+    assert all(isinstance(v, float) for v in data["stage_ms"].values())
+
+
+def test_the_minute_line_prints_the_p50_of_every_stage_and_resets(caplog):
+    """The log line the next such evening is answered from. The cycle's
+    whole cost keeps its place on the line (renamed ``cycle`` -- it was
+    printed as ``grab`` and read as the device read alone for a whole
+    evening), then the per-stage p50s follow in STAGES order, with ``-``
+    for a stage that did not run this minute, and the Tk thread's ``draw``
+    arrives through note_stage."""
+    clock = Clock(100.0)
+    shots = iter([
+        cp.PreviewShot(image=object(), cap_w=1280, cap_h=720,
+                       reason=cp.REASON_LIVE, seq=1, grab_ms=271.0,
+                       stage_ms={"grab": 266.0, "detect": 3.0, "shrink": 2.0}),
+        cp.PreviewShot(image=object(), cap_w=1280, cap_h=720,
+                       reason=cp.REASON_LIVE, seq=2, grab_ms=270.0,
+                       stage_ms={"grab": 270.0, "shrink": 1.6}),
+        cp.PreviewShot(image=object(), cap_w=1280, cap_h=720,
+                       reason=cp.REASON_LIVE, seq=3, grab_ms=268.0,
+                       stage_ms={"grab": 268.0, "detect": 3.4, "shrink": 1.8}),
+        cp.PreviewShot(image=object(), cap_w=1280, cap_h=720,
+                       reason=cp.REASON_LIVE, seq=4, grab_ms=268.0,
+                       stage_ms={"grab": 268.0, "shrink": 1.8}),
+    ])
+
+    class Pipe(FakePipeline):
+        def grab(self, box, seq=0):
+            self.grabs += 1
+            return next(shots)
+
+    w = cp.PreviewWorker(get_option=options(**{"camera.preview": True}),
+                         sensing=Policy(), pipeline=Pipe(), now=clock)
+    w._logged = clock()                          # the minute has just begun
+    for _ in range(3):
+        w.cycle()
+        clock.tick(0.27)
+    w.note_stage("draw", 2.1)
+    w.note_stage("draw", 2.3)
+    w.note_stage("draw", 1.9)
+    clock.tick(cp.PreviewWorker.LOG_EVERY_S)     # …and now it is over
+    with caplog.at_level(logging.INFO, logger="jarvis.campreview"):
+        w.cycle()                                # the 4th shot closes the minute
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "jarvis.campreview" and "stages p50" in r.getMessage()]
+    assert lines, [r.getMessage() for r in caplog.records]
+    line = lines[-1]
+    assert "live  faces 0  1280x720  " in line and "cycle 268 ms" in line, line
+    assert "grab 268  detect 3.2  landmarks -  embed -  hand -  offer -  " \
+           "shrink 1.8  draw 2.1" in line, line
+    assert "[4 cycles]" in line, line
+    # and the window is reset: the next minute starts empty
+    assert w.stages.p50s() == {}
+
+
+def test_a_stage_number_posted_from_the_pane_is_a_float_in_and_nothing_out():
+    w = cp.PreviewWorker(get_option=options())
+    assert w.note_stage("draw", 2.5) is None
+    assert w.stages.p50s() == {"draw": 2.5}
+    w.note_stage("draw", "garbage")             # never raises
+    assert w.stages.counts() == {"draw": 1}
