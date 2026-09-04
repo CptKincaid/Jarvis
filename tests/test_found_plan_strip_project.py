@@ -38,9 +38,9 @@ PROJ_FIXED = 16 + 116 + 12 + 16                 # PAD_S + 'PROJECT' + gap + PAD_
 CHAR_W = 14                                     # JetBrains Mono at SIZE_CAPTION
 
 
-@pytest.mark.xfail(reason="plan_strip returns (0, hidden) — it drops the chip "
-                          "but never puts the yielded MEMORY segment back",
-                   strict=True)
+# FIXED 2026-09-03 (U14, fix-ui-polish): the strip re-plans without the
+# chip once it is dropped, so the yielded MEMORY segment comes back. This
+# was @xfail(strict=True) while the bug stood; the fix makes it plain.
 def test_memory_returns_when_the_chip_itself_yields():
     chars, hidden = plan_strip(920, LEFT_W, PROJ_FIXED, CHAR_W, len("jarvis"),
                                SEG_WS)

@@ -26,46 +26,79 @@ class Cfg:
 
 
 # ------------------------------------------------------------------ config
-def _cfg(satellites, here="office", enabled=True):
-    return Cfg(**{"rooms.here": here, "rooms.enabled": enabled,
-                  "rooms.satellites": satellites})
+OFFICE = {"name": "Office", "url": "http://192.168.50.51", "primary": True}
 
 
-def test_here_always_exists_even_with_no_satellites():
+def _cfg(rooms):
+    """presence.rooms -- THE list, the one the fabric and the satellite
+    lease read (F02). The fabric's master switch is deliberately not set:
+    a speaker does not need a radar."""
+    return Cfg(**{"presence.rooms": rooms})
+
+
+def test_here_always_exists_even_with_no_rooms_configured():
     """The Spark's own room has no satellite, and it is the room every
     other rule falls through to."""
-    rooms, here = rooms_from_config(_cfg([], enabled=False))
+    rooms, here = rooms_from_config(_cfg([]))
     assert here == "office" and rooms["office"].url == ""
 
 
-def test_the_satellite_list_is_shared_with_the_sensing_half():
+def test_the_room_list_is_shared_with_the_sensing_half():
     """One list, so a room cannot exist for the radar and not for the
-    voice, and a room name cannot be spelled two ways."""
+    voice, and a room name cannot be spelled two ways: 'Office' in the
+    file is 'office' here, exactly as it is for the fabric."""
     rooms, here = rooms_from_config(_cfg([
+        OFFICE,
         {"name": "kitchen", "url": "http://192.168.50.61",
          "say_url": "http://192.168.50.61:8765"},
-        {"name": "bedroom", "url": "http://192.168.50.62", "private": True},
+        {"name": "Bedroom ", "url": "http://192.168.50.62", "private": True},
     ]))
-    assert set(rooms) == {"office", "kitchen", "bedroom"}
+    assert set(rooms) == {"office", "kitchen", "bedroom"} and here == "office"
     assert rooms["kitchen"].url == "http://192.168.50.61:8765/say"
     assert rooms["bedroom"].url == ""          # radar but no speaker yet
     assert rooms["bedroom"].private is True
+
+
+def test_here_is_the_primary_room_and_the_first_when_he_did_not_say():
+    """`here` is the fabric's primary -- the entry marked so, else the
+    first -- rather than a second key that could name a room the list does
+    not have. It never gets a speaker url: it is the paplay path."""
+    _, here = rooms_from_config(_cfg([{"name": "kitchen"}, {"name": "den"}]))
+    assert here == "kitchen"
+    rooms, here = rooms_from_config(_cfg([
+        {"name": "kitchen", "say_url": "http://192.168.50.61:8765"},
+        {"name": "Den", "primary": True,
+         "say_url": "http://192.168.50.62:8765"}]))
+    assert here == "den" and rooms["den"].url == ""
+    assert rooms["kitchen"].url == "http://192.168.50.61:8765/say"
+
+
+def test_a_speaker_only_room_is_a_room_for_the_voice_and_not_the_radar():
+    """docs/multiroom-audio.md 1.3: a Pi with a speaker and no radar. It
+    has a say_url and no url, so the fabric skips it and the voice keeps it."""
+    from jarvis.roomfabric import room_specs
+    cfg = Cfg(**{"presence.room_sensor_enabled": True, "presence.rooms": [
+        OFFICE, {"name": "hall", "say_url": "http://192.168.50.70:8765"}]})
+    rooms, _ = rooms_from_config(cfg)
+    assert rooms["hall"].url == "http://192.168.50.70:8765/say"
+    assert [s.name for s in room_specs(cfg)] == ["office"]
 
 
 def test_a_room_whose_say_url_is_rejected_survives_as_a_name():
     """It falls back to `here`, so he still hears the line; a silently
     missing room is one he never hears and never finds out about."""
     rooms, _ = rooms_from_config(_cfg([
+        OFFICE,
         {"name": "kitchen", "url": "http://192.168.50.61",
          "say_url": "http://kitchen.local:8765"},          # a hostname
     ]))
     assert "kitchen" in rooms and rooms["kitchen"].url == ""
 
 
-def test_disabled_rooms_config_speaks_here_only():
+def test_a_room_switched_off_in_the_list_is_off_for_the_voice_too():
     rooms, here = rooms_from_config(_cfg(
-        [{"name": "kitchen", "url": "http://192.168.50.61",
-          "say_url": "http://192.168.50.61:8765"}], enabled=False))
+        [OFFICE, {"name": "kitchen", "url": "http://192.168.50.61",
+                  "say_url": "http://192.168.50.61:8765", "enabled": False}]))
     assert set(rooms) == {"office"} and here == "office"
 
 

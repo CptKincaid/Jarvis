@@ -150,16 +150,18 @@ in §4.2. It is a fine *speaker-only* room; it is a dead end for a full one.
 
 ### 1.4 Config, and the day-one no-op
 
-The audio side does **not** get a config block of its own. It reads the same
-`rooms.satellites` list `jarvis/rooms.py` reads — one list, so a room cannot
-exist for the radar and not for the voice, and a room name cannot be spelled
-two ways. Two audio-only keys per entry, plus `rooms.here`:
+The audio side does **not** get a config block of its own. It reads
+`presence.rooms` — THE room list, the one `jarvis/roomfabric.py` (which room
+he is in) and `jarvis/rooms.py` (the satellite lease) read — one list, so a
+room cannot exist for the radar and not for the voice, and a room name cannot
+be spelled two ways (every lane spells it with `roomfabric.room_name`; until
+2026-09-04 this lane read a `rooms.satellites` list declared nowhere, F02).
+Two audio-only keys per entry:
 
 ```json
-"rooms": {
-  "enabled": false,
-  "here": "office",
-  "satellites": [
+"presence": {
+  "rooms": [
+    {"name": "office", "url": "http://192.168.50.51", "primary": true},
     {"name": "kitchen", "url": "http://192.168.50.61",
      "say_url": "http://192.168.50.61:8765", "sensors": ["radar"]},
     {"name": "bedroom", "url": "http://192.168.50.62",
@@ -174,11 +176,12 @@ may be a $6 ESP32 on port 80 and the speaker a Pi on 8765, in the same room.
 An empty `say_url` is a room that can be *seen* in but not *spoken* in — a
 real intermediate state, and announcements for it fall back to `here`.
 
-`rooms.here` is the Spark's room. It always exists as a room even with no
-satellite configured, it needs no `say_url`, and it is the existing `paplay`
-path untouched. **With `rooms.enabled` false, `here` is the only room and the
-router is a no-op** — which is what makes this safe to merge before any
-hardware exists.
+`here` is the Spark's room: the entry marked `primary`, else the first
+(the fabric's own rule), and "office" when nothing is configured. It always
+exists as a room, it needs no `say_url`, and it is the existing `paplay` path
+untouched. **With no `say_url` anywhere, every line falls through to `here`
+and the router is a no-op** — which is what makes this safe to merge before
+any hardware exists.
 
 The URL rule is not a second one. `roomaudio.say_url()` is built on
 `rooms.check_url()`: `http(s)://` plus a **private IP literal**, no hostnames
@@ -510,7 +513,7 @@ Three ducking domains, and they must not be confused:
 
 | # | Cost | What | What it proves |
 | --- | --- | --- | --- |
-| 0 | $0 | `rooms.enabled = true` with **one** room, `office`, `say_url: ""` | the router is a no-op; nothing about today's behaviour changed |
+| 0 | $0 | `presence.rooms` with **one** room, `office`, `say_url: ""` | the router is a no-op; nothing about today's behaviour changed |
 | 1 | $0 | the old phone on a charger in the kitchen, web client open | **the only question that matters**: does he want an answer in the kitchen, or does he want to walk to the office? |
 | 2 | ~$40 | one Pi satellite in the kitchen: `/say`, `/stop`, `/health` — **no mic** | routing, the receipt path, demotion, per-room duck |
 | 3 | ~$10 | an LD2410 for that room (the existing YAML, a different IP) | the sensor fabric's room answer feeding real routing |
@@ -566,7 +569,7 @@ cannot answer.
 
 ### Room by room
 
-* **Office (the Spark).** Nothing to buy. It is `rooms.here`, `say_url: ""`,
+* **Office (the Spark).** Nothing to buy. It is `here` (the primary room), `say_url: ""`,
   and `soundbar.py` keeps watching it. One caveat that shapes the other rooms:
   the SoundCore 2 is measured today as the default sink
   (`bluez_output.F4_4E_FC_95_BA_CB.1`) and is **SBC-only Bluetooth**, which

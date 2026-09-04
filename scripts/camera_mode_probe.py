@@ -7,8 +7,9 @@
 
 WHY THIS EXISTS. The preview pane's live log said the device delivered
 ~7.5 fps at 1280x720 whatever ``camera.preview_fps`` asked for (6.0 fps at 6
-requested, 7.5 at 10, 7.4-7.6 at 15), so raising the request did nothing for
-the lag he can see. Two explanations were never measured: the driver may not
+requested, 7.4-7.6 at 10; his configured 15 was clamped to 10 by the build
+then running, so 15 had not been asked), so raising the request did nothing
+for the lag he can see. Two explanations were never measured: the driver may not
 have GRANTED the MJPG format the app asks for (a 720p YUYV stream on USB 2.0
 is bandwidth-capped near 7.5 fps, and v4l2 does not refuse a format request
 -- it quietly grants something else), or the 720p mode is capped whatever

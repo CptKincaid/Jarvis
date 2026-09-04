@@ -280,7 +280,7 @@ def test_few_shots_are_sampled_one_per_family_and_vary(brain):
 def test_negative_rules_and_brevity_rule_present(brain):
     for phrase in ("no lists", "no bullet points", "no emoji", "no markdown",
                    "no headings", "As an AI", "I'd be happy to",
-                   "never more than two", "read aloud", "never explained",
+                   "Two or three sentences usually", "read aloud", "never explained",
                    "let a good night be a good night", "Never pad",
                    "start, not initiate", "Do not recite file names",
                    "Never say you checked, ran, noticed or found",

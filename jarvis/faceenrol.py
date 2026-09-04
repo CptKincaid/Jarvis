@@ -664,9 +664,20 @@ def choose_plan(takes: Sequence[Take], poses: Sequence[str] = (),
     quietly did something other than the five stations is a run whose numbers
     he will misread later."""
     if poses:
-        return (custom_stations(poses, pose_samples),
-                "the %d take%s you named"
-                % (len(poses), "" if len(poses) == 1 else "s"))
+        named = custom_stations(poses, pose_samples)
+        why = ("the %d take%s you named"
+               % (len(poses), "" if len(poses) == 1 else "s"))
+        if mode == "full":
+            # --plan full --pose X: the five stations AND the named take.
+            # This is the run that can pass when the named take alone
+            # cannot -- a first enrolment, or an append onto takes that
+            # carry no angle (see ``plan_shortfalls``) -- and it is what
+            # the hand-over in jarvis/enrolentry.py writes in those cases.
+            # Named takes come LAST so the report reads in the order he
+            # will do them.
+            return (DEFAULT_PLAN + named,
+                    "the full five-station script plus %s" % why)
+        return named, why
     if mode == "full":
         return DEFAULT_PLAN, "the full five-station script (--plan full)"
     gaps = missing_stations(takes)
@@ -695,6 +706,112 @@ def choose_plan(takes: Sequence[Take], poses: Sequence[str] = (),
                 "already complete, so this is a refresh rather than a gap")
     return (gaps, "the %d station%s your gallery is missing"
             % (len(gaps), "" if len(gaps) == 1 else "s"))
+
+
+def _station_options(station: Station) -> List[Tuple[int, int, float, float]]:
+    """The ways one station's samples can land, as ``(frontal, off_axis,
+    yaw_lo, yaw_hi)`` -- every sample in one band, and the angles the
+    station can reach for the spread.
+
+    A station whose window reaches ONE band -- the five defaults -- puts
+    every sample there and may spread across its whole window. A station
+    whose window reaches BOTH bands is a named take, and a named take is
+    ONE pose: "looking at my phone" is not a head sweep, so its samples
+    land together, in one band, at one angle. It is offered each band it
+    can reach and never both at once, which is what makes three takes of one
+    named pose unable to be "2 frontal AND 2 off-axis" however many are
+    captured. A window that reaches neither band (the dead zone between
+    ``FRONTAL_MAX_DEG`` and ``OFFAXIS_MIN_DEG``) counts for nothing, exactly
+    as ``judge_gallery`` would count it."""
+    lo, hi = float(station.yaw_lo), float(station.yaw_hi)
+    n = int(station.samples)
+    frontal = lo <= FRONTAL_MAX_DEG and hi >= -FRONTAL_MAX_DEG
+    offaxis = hi >= OFFAXIS_MIN_DEG or lo <= -OFFAXIS_MIN_DEG
+    if frontal and offaxis:
+        at = min(max(0.0, lo), hi)          # the nearest-to-straight angle
+        out = [(n, 0, at, at)]
+        if hi >= OFFAXIS_MIN_DEG:
+            out.append((0, n, hi, hi))
+        if lo <= -OFFAXIS_MIN_DEG:
+            out.append((0, n, lo, lo))
+        return out
+    if frontal:
+        return [(n, 0, lo, hi)]
+    if offaxis:
+        return [(0, n, lo, hi)]
+    return [(0, 0, lo, hi)]
+
+
+def plan_shortfalls(takes: Sequence[Take],
+                    plan: Sequence[Station]) -> Tuple[str, ...]:
+    """The checks in ``judge_gallery`` this plan CANNOT pass, one line each
+    -- or ``()`` when the arithmetic allows it to.
+
+    ARITHMETIC, NOT A PREDICTION. Two of the four checks are decided by
+    counting before a single frame exists: ``samples`` is the size of the
+    pool the run would save, and ``pose_spread`` is how many angles land in
+    each band and how far apart they are. Both are knowable from the plan
+    and the takes it keeps, so a run that fails them is known to fail before
+    he sits down -- and the minute in front of the lens is his. ``variation``
+    and ``cohesion`` are about the vectors and are not guessed at here.
+
+    ``takes`` are the takes this run KEEPS: the stored ones under --append,
+    nothing at all otherwise (a plain run replaces the pool). A kept take
+    with no recorded angle counts toward ``samples`` and toward nothing
+    else, which is the rule ``judge_gallery`` applies to it -- and it is the
+    whole reason this exists: his live generation 1 is 13 embeddings that
+    carry no angle, so appending three takes of one named pose onto it puts
+    16 in the pool, clears the floor, and can never satisfy the spread. The
+    script printed "--append is almost certainly what you want" over exactly
+    that run (F16, reproduced 2026-09-03), and the hand-over for a FIRST
+    enrolment with a named pose announced one station of three takes as a
+    valid run against a floor of eight (F34).
+
+    Best case is taken throughout: each station is allowed to land wherever
+    its window lets it, the way ``_station_options`` spells out, and the
+    plan is short only if NO way of landing passes. The search is a small
+    dynamic programme over (frontal so far, off-axis so far, lowest angle,
+    highest angle), capped at the wanted counts, so a plan of any realistic
+    length costs microseconds."""
+    stations = list(plan)
+    wanted = sum(int(st.samples) for st in stations)
+    kept = list(takes)
+    pool = len(kept) + wanted
+    out: List[str] = []
+    if pool < MIN_SAMPLES:
+        out.append("samples: %d in the pool this run would save (%d kept + "
+                   "%d wanted) against a floor of %d"
+                   % (pool, len(kept), wanted, MIN_SAMPLES))
+    cov = coverage(kept)
+    yaws = [float(t.yaw_deg) for t in kept if t.yaw_deg is not None]
+    have_f = min(cov["frontal"], MIN_FRONTAL)
+    have_o = min(cov["positive"] + cov["negative"], MIN_OFFAXIS)
+    lo0 = min(yaws) if yaws else None
+    hi0 = max(yaws) if yaws else None
+    states = {(have_f, have_o, lo0, hi0)}
+    for st in stations:
+        nxt = set()
+        for f, o, lo, hi in states:
+            for df, do, slo, shi in _station_options(st):
+                nxt.add((min(f + df, MIN_FRONTAL), min(o + do, MIN_OFFAXIS),
+                         slo if lo is None else min(lo, slo),
+                         shi if hi is None else max(hi, shi)))
+        states = nxt
+
+    def spread_of(s) -> float:
+        return 0.0 if s[2] is None else float(s[3] - s[2])
+
+    if not any(s[0] >= MIN_FRONTAL and s[1] >= MIN_OFFAXIS
+               and spread_of(s) >= MIN_YAW_SPREAD_DEG for s in states):
+        best = max(states, key=lambda s: (s[0] + s[1], spread_of(s)))
+        blank = int(cov["unrecorded"])
+        out.append("pose_spread: at best %d frontal (want %d) and %d off-axis "
+                   "(want %d) over %.0f deg of spread (want %.0f)%s"
+                   % (best[0], MIN_FRONTAL, best[1], MIN_OFFAXIS,
+                      spread_of(best), MIN_YAW_SPREAD_DEG,
+                      (" -- %d kept take(s) carry no angle and count for "
+                       "nothing here" % blank) if blank else ""))
+    return tuple(out)
 
 
 def member_name(index: int, stored: int, kept: Sequence[Sample]) -> str:

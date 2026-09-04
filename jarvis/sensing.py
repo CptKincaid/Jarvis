@@ -279,13 +279,62 @@ class SensingPolicy:
             from jarvis.config import PATHS
             path = PATHS.MEMORY_DIR / "sensing.json"
         self.path = Path(path)
+        # The bytes this object last read or wrote. ``state()`` compares the
+        # file against them so a change made by ANOTHER process -- the
+        # running Jarvis told "offline mode" while scripts/face_enrol.py
+        # holds its own policy -- is seen on the next read; see _refresh.
+        self._seen: Optional[str] = None
         self._offline, self._until, self._failsafe = self._load()
 
     # ------------------------------------------------------------ loading
-    def _load(self) -> tuple:
+    def _raw(self) -> Optional[str]:
+        """The state file's text, or None when it cannot be read."""
+        try:
+            return self.path.read_text(encoding="utf-8")[:MAX_STATE_BYTES]
+        except Exception:  # noqa: BLE001 - _load() says why, this only compares
+            return None
+
+    def _refresh(self) -> None:
+        """Re-read the file if somebody ELSE wrote it. Called under _lock.
+
+        WHY THIS EXISTS. There is one owner per process, and the enrolment
+        script is a second process: it built its own SensingPolicy in
+        main(), and this class loaded the file once in __init__ and never
+        again, so a spoken "offline mode" to the live Jarvis wrote
+        sensing.json and the script's CameraGate kept answering True until
+        the station loop ended (F33, reproduced 2026-09-03). The docstrings
+        on run_enrolment and in docs/face-enrolment.md said the script
+        obeyed the spoken switch "through the same objects"; only the clock
+        curfew was actually honoured mid-run. Comparing the bytes on every
+        ``state()`` costs one small read (the record is ~120 bytes) and
+        makes the sentence true within one frame.
+
+        The comparison is on CONTENT, not mtime: two saves inside one
+        coarse kernel timestamp tick would look identical by stat. A file
+        that cannot be read now is NOT a change -- the in-memory verdict
+        stands, and the next ``_save`` puts the file back -- so deleting the
+        file out from under a running owner does not flip it, and an owner
+        whose own save failed (``persisted`` False) keeps the state it was
+        told rather than re-reading the stale file it could not replace.
+        This object's own writes are recorded in ``_save`` so they never
+        count as somebody else's."""
+        raw = self._raw()
+        if raw is None or raw == self._seen:
+            return
+        self._seen = raw
+        before = (self._offline, self._until, self._failsafe)
+        self._offline, self._until, self._failsafe = self._load(raw)
+        after = (self._offline, self._until, self._failsafe)
+        if after != before:
+            log.info("sensing: state changed on disk by another process; "
+                     "now %s", "OFFLINE" if self._offline else "online")
+
+    def _load(self, raw: Optional[str] = None) -> tuple:
         """(offline, until, failsafe). EVERY failure path lands offline."""
         try:
-            raw = self.path.read_text(encoding="utf-8")[:MAX_STATE_BYTES]
+            if raw is None:
+                raw = self.path.read_text(encoding="utf-8")[:MAX_STATE_BYTES]
+            self._seen = raw
         except FileNotFoundError:
             log.info("sensing: no state at %s; starting OFFLINE until told "
                      "otherwise", self.path)
@@ -337,8 +386,10 @@ class SensingPolicy:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+            text = json.dumps(record, indent=2) + "\n"
+            tmp.write_text(text, encoding="utf-8")
             os.replace(tmp, self.path)
+            self._seen = text[:MAX_STATE_BYTES]   # our own write, not a change
         except OSError:
             # NOT fatal in-process: the running Jarvis still obeys the
             # switch. But the next start would read the old file, so the
@@ -431,6 +482,7 @@ class SensingPolicy:
 
     def state(self) -> SensingState:
         with self._lock:
+            self._refresh()
             self._expire()
             curfew = self.curfew()
             if self._offline:

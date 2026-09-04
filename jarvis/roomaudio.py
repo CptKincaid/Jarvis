@@ -8,7 +8,7 @@ room". This module CONSUMES that as ``{room: True | False | None}`` and
 never computes one; ``occupancy_from`` is the adapter and it is the only
 thing here that knows the mesh's shape.
 
-The two modules share the config block (``rooms.satellites``), the URL
+The two modules share the room list (``presence.rooms``, THE one), the URL
 trust rule (``rooms.check_url``: an http(s) PRIVATE IP LITERAL, never a
 hostname) and the room names. They do not share a file, because a
 satellite's radar and a satellite's speaker are allowed to be two
@@ -66,6 +66,7 @@ from typing import Any, Callable, Iterable, Optional
 
 from jarvis import rooms as roommesh
 from jarvis.logs import get_logger
+from jarvis.roomfabric import room_entries
 
 log = get_logger("roomaudio")
 
@@ -109,8 +110,8 @@ def say_url(value: Any, path: str = SAY_PATH) -> str:
     lax one would be the hole.
 
     An empty value is legal and MEANINGFUL: the room has no speaker of its
-    own. Only ``rooms.here`` -- the room the Spark is in -- speaks without
-    a URL, out of the existing ``paplay`` path.
+    own. Only ``here`` -- the primary room, the one the Spark is in --
+    speaks without a URL, out of the existing ``paplay`` path.
     """
     base = roommesh.check_url(value)
     if not base:
@@ -128,8 +129,8 @@ class Room:
     room is called -- that name is what the spoken line says out loud.
 
     ``url`` empty means the room has no speaker of its own. The one room
-    allowed to be targeted anyway is ``rooms.here``, which is this box: the
-    existing ``paplay`` path. That is what makes a one-room config a
+    allowed to be targeted anyway is ``here`` -- the primary room, this
+    box: the existing ``paplay`` path. That is what makes a one-room config a
     no-op, and why the office is a room like any other rather than a
     special case carved around.
     """
@@ -160,17 +161,21 @@ class Decision:
 def rooms_from_config(cfg) -> tuple:
     """``({name: Room}, here)`` from assistant.json. Never raises.
 
-    Reads the SAME ``rooms.satellites`` list ``rooms.specs_from_config``
-    reads, plus two audio-only keys per entry -- ``say_url`` and
-    ``private`` -- and the house-level ``rooms.here``. One list, so a room
-    cannot exist for the radar and not for the voice, and a room name
-    cannot be spelled two ways.
+    Reads ``presence.rooms`` -- THE room list, the one the fabric and the
+    satellite lease read -- through ``roomfabric.room_entries``, so a room
+    cannot exist for the radar and not for the voice and a name cannot be
+    spelled two ways (every lane spells it with ``roomfabric.room_name``).
+    Until 2026-09-04 this read a ``rooms.satellites`` list declared
+    nowhere and did not case-fold, so "Kitchen" was one room for the radar
+    and another for the voice (F02). Two audio-only keys per entry:
+    ``say_url`` and ``private``.
 
-    ``here`` is always present as a Room even when it is not in the
-    satellite list: the Spark's own room has no satellite, and it is the
-    fallback every other rule falls through to.
+    ``here`` is the PRIMARY room -- the fabric's rule: the entry marked
+    ``primary``, else the first -- and "office" when no room is configured
+    at all. It is always present as a Room: the Spark's own room needs no
+    ``say_url``, and it is the fallback every other rule falls through to.
 
-    Tolerant on purpose. A satellite with a bad ``say_url`` keeps its room
+    Tolerant on purpose. A room with a bad ``say_url`` keeps its name
     (announcements for it fall back to ``here``, so he still hears them)
     rather than vanishing, because a silently missing room is a line he
     never hears and never finds out about. The mistake is logged once.
@@ -179,22 +184,16 @@ def rooms_from_config(cfg) -> tuple:
     if not callable(get):
         return {}, DEFAULT_HERE
     try:
-        here = str(get("rooms.here", DEFAULT_HERE) or DEFAULT_HERE).strip()
-        enabled = bool(get("rooms.enabled", False))
-        raw = get("rooms.satellites", []) or []
+        entries = room_entries(cfg)
     except Exception:  # noqa: BLE001 - a broken config must not lose his voice
         log.exception("roomaudio: config unreadable; speaking here only")
         return {DEFAULT_HERE: Room(name=DEFAULT_HERE)}, DEFAULT_HERE
-    here = here or DEFAULT_HERE
+    primary = next((e for e in entries if bool(e.get("primary", False))),
+                   entries[0] if entries else None)
+    here = str(primary["name"]) if primary else DEFAULT_HERE
     out = {here: Room(name=here)}
-    if not enabled:
-        return out, here
-    for entry in raw if isinstance(raw, (list, tuple)) else ():
-        if not isinstance(entry, dict):
-            continue
-        name = str(entry.get("name", "") or "").strip()
-        if not name:
-            continue
+    for entry in entries:
+        name = entry["name"]
         want = str(entry.get("say_url", "") or "").strip()
         url = say_url(want)
         if want and not url:

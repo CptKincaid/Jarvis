@@ -138,13 +138,15 @@ def test_defaults_match_spec_10_1():
     assert SECRET_KEYS == ("icloud.app_password", "gmail.app_password", "discord.bot_token",
                            "spotify.client_secret", "canvas.token", "phone.token")
     from jarvis.assistant_config import SECRET_LIST_FIELDS
-    # rooms.satellites[].password joined it on 2026-09-03 (F03). The satellite
+    # The satellite password joined it on 2026-09-03 (F03). The satellite
     # YAML already TOLD him it was in this tuple and "masked in logs and in
     # repr(cfg)" -- it was not, so repr(cfg) printed it in clear while the
     # same YAML explains that without that password the lease endpoints are
     # world-writable. This tripwire is why adding one is a deliberate act.
+    # It moved from rooms.satellites[] to presence.rooms[] on 2026-09-04
+    # when that became the one room list (F02).
     assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),
-                                  ("rooms.satellites", "password"))
+                                  ("presence.rooms", "password"))
     assert DEFAULTS["alerts"] == {"desktop": True, "discord": True, "claude_hooks": True}
     assert DEFAULTS["phrases"] == []
 
@@ -633,16 +635,17 @@ def test_a_satellite_password_is_masked_the_way_a_gmail_one_is():
     "masking is broken" but "this one field was never added to the list"."""
     cfg = ac.AssistantConfig({
         "gmail": {"accounts": [{"address": "a@b.c", "app_password": "gm-secret"}]},
-        "rooms": {"satellites": [{"name": "kitchen", "url": "http://10.0.0.9",
-                                  "username": "jarvis", "password": "sat-secret"}]},
+        "presence": {"rooms": [{"name": "kitchen", "url": "http://10.0.0.9",
+                                "sensors": ["radar"], "username": "jarvis",
+                                "password": "sat-secret"}]},
     })
     blob = repr(cfg)
     assert "gm-secret" not in blob
     assert "sat-secret" not in blob, "the satellite password reached repr(cfg)"
 
     red = cfg.redacted()
-    assert red["rooms"]["satellites"][0]["password"] == ac.MASK
-    assert red["rooms"]["satellites"][0]["username"] == "jarvis"   # not a secret
+    assert red["presence"]["rooms"][0]["password"] == ac.MASK
+    assert red["presence"]["rooms"][0]["username"] == "jarvis"   # not a secret
 
     vals = cfg.secret_values()
     assert "sat-secret" in vals and "gm-secret" in vals
@@ -656,8 +659,8 @@ def test_a_placeholder_satellite_password_is_not_treated_as_a_secret():
     scrubbing a placeholder would blank ordinary text that happens to contain
     it, and it protects nothing."""
     cfg = ac.AssistantConfig({
-        "rooms": {"satellites": [{"name": "kitchen", "url": "http://10.0.0.9",
-                                  "password": "CHANGE_ME_32_RANDOM_CHARS"}]},
+        "presence": {"rooms": [{"name": "kitchen", "url": "http://10.0.0.9",
+                                "password": "CHANGE_ME_32_RANDOM_CHARS"}]},
     })
     assert "CHANGE_ME_32_RANDOM_CHARS" not in cfg.secret_values()
 

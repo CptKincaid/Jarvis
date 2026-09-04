@@ -1191,8 +1191,12 @@ def make_tools(cfg, services) -> list[ToolSpec]:
             # Stash the interpretation and read it back. Nothing is written
             # until the user says yes: a misheard time would otherwise become
             # a real event on their phone.
+            # made_at: the read-back takes the next yes for OFFER_TTL_S
+            # (commander._try_event_confirm) and counts as an open
+            # question for exactly that long (Commander.question_open).
             source.pending_event = {"title": title, "start": when, "end": end,
-                                    "calendar": calendar}
+                                    "calendar": calendar,
+                                    "made_at": time.monotonic()}
             words = when.strftime("%A at %I:%M %p").replace(" 0", " ").lstrip("0")
             line = f"I have {title}, {words} — {reason}. Shall I add it, sir?"
             return ToolResult(text=line, speak=line)

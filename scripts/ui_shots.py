@@ -274,9 +274,38 @@ def _display_alive(display: str) -> bool:
         return False
 
 
+# Displays this rig must never touch. ensure_display() attaches to ANY
+# live server at --display, so `--display :1` would have built the console
+# on his real desktop -- a Jarvis window popping up on :1, over whatever
+# he is reading, driven through an alarm and a fake camera pane. :0 and :1
+# (and their .N screens) are refused before anything is imported or
+# started; the guard is a pure function so tests/test_ui_shots.py can pin
+# it without a display.
+FORBIDDEN_DISPLAYS = (":0", ":1")
+
+
+def display_allowed(display: str) -> bool:
+    """False for his desktop displays (:0, :1, :0.0, :1.0, with or without
+    a host part); True for anything else (:91..:99, a private Xvfb)."""
+    d = (display or "").strip()
+    if not d:
+        return False
+    d = d[d.index(":"):] if ":" in d else d          # 'localhost:1.0' -> ':1.0'
+    d = d.split(".")[0]                              # ':1.0' -> ':1'
+    return d not in FORBIDDEN_DISPLAYS
+
+
+def refuse_live_display(display: str) -> None:
+    if not display_allowed(display):
+        raise SystemExit(f"ui_shots: refusing display {display!r} -- that is "
+                         "his desktop, never a rig display (use :91-:99)")
+
+
 def ensure_display(display: str, size=SCREEN) -> Optional[subprocess.Popen]:
     """Attach to a live X server at `display`, or start a private Xvfb
-    there. Returns the Popen when this process started it, else None."""
+    there. Returns the Popen when this process started it, else None.
+    :0 and :1 are refused outright (display_allowed)."""
+    refuse_live_display(display)
     if _display_alive(display):
         log(f"display {display}: attached to a running server")
         return None
@@ -1290,6 +1319,7 @@ def parse_args(argv=None):
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    refuse_live_display(args.display)      # parent AND child, before any import
     if args.child:
         return run_child(args)
     return run_parent(args)

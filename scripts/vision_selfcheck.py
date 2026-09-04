@@ -355,10 +355,17 @@ def main(argv=None) -> int:
         if bar_why:
             print("identity: %s" % bar_why)
         if recogniser is not None and gallery is not None:
-            identifier = FaceIdentifier(
-                gallery, recogniser,
-                min_conf=float(cfg.get("camera.min_conf", 0.6)),
-                match_min=float(cfg.get("camera.identity_min", 0.363)))
+            try:
+                identifier = FaceIdentifier(
+                    gallery, recogniser,
+                    min_conf=float(cfg.get("camera.min_conf", 0.6)),
+                    match_min=float(cfg.get("camera.identity_min", 0.363)))
+            except ValueError as exc:
+                # A non-finite camera.identity_min is refused at the door
+                # (F17); the self-check reports it and runs without the
+                # identity leg rather than naming a stranger as him.
+                print("identity: OFF -- %s" % exc)
+                identifier = None
     rig = vr.Rig(cam.FeedSource(feed), detector, lens,
                  cam.thresholds_from_config(cfg),
                  recogniser=recogniser, identifier=identifier,

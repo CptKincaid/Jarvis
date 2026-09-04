@@ -300,6 +300,112 @@ class TestWhatIsActuallyDelivered:
 # ===================================================================
 # the commander half: answering the offer
 # ===================================================================
+# ===================================================================
+# F37 (09-03): three yes-taking rungs question_open() did not count
+# ===================================================================
+def _slim_cmdr(tmp_path, monkeypatch):
+    monkeypatch.setenv("JARVIS_ASSISTANT_CONFIG", str(tmp_path / "assistant.json"))
+    monkeypatch.setattr(IntentClassifier, "INTENT_LOG", tmp_path / "intent_log.json")
+    monkeypatch.setattr(CONFIG, "voice_cmds", True)
+    monkeypatch.setattr(CONFIG, "jarvis_mode", True)
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    svc = SimpleNamespace(desktop=MagicMock(), workflows=MagicMock(), memory=MagicMock(),
+                          context=MagicMock(), tts=MagicMock(), briefing_offer=None)
+    svc.desktop.parse_action = lambda part: None
+    svc.workflows.get.return_value = None
+    svc.context.answer_question.return_value = None
+    svc.context.get_last_window.return_value = None
+    svc.memory.suggest_by_habit.return_value = None
+    svc.brain = SimpleNamespace(think=MagicMock(), chat=MagicMock())
+    return Commander(svc)
+
+
+def test_the_teach_offer_is_an_open_question_until_it_expires(tmp_path, monkeypatch):
+    """"...say quiz me and I'll test you on it, sir" (rung 3a'') takes the
+    next plain yes and was not counted, so the briefing offer could land
+    on top of it."""
+    c = _slim_cmdr(tmp_path, monkeypatch)
+    assert c.question_open() is False
+    c._pending_teach = ("thermodynamics", "body", _t.monotonic())
+    assert c.question_open() is True
+    c._pending_teach = ("thermodynamics", "body", _t.monotonic() - OFFER_TTL_S - 1)
+    assert c.question_open() is False, "a dead offer must not hold the floor"
+
+
+def test_the_terminal_offer_is_an_open_question_until_it_expires(tmp_path, monkeypatch):
+    """Claude's "say the word and I'll open the terminal there instead"
+    (rung 3b) had no stamp at all: it took a yes for ever and was never
+    counted. It now carries one, and both ends read it."""
+    c = _slim_cmdr(tmp_path, monkeypatch)
+    c._pending_terminal_slug = "vss"
+    c._pending_terminal_made = _t.monotonic()
+    assert c.question_open() is True
+    c._pending_terminal_made = _t.monotonic() - OFFER_TTL_S - 1
+    assert c.question_open() is False
+    # ...and the rung itself lets a late yes go rather than opening a
+    # terminal he asked for an hour ago.
+    c.services.claude = SimpleNamespace(open_terminal=lambda slug: True)
+    assert c._try_terminal_offer("yes") is None
+    assert c._pending_terminal_slug == ""
+
+
+def test_the_event_read_back_is_an_open_question_until_it_expires(tmp_path, monkeypatch):
+    """"Dentist, tomorrow at 3 pm. Shall I add it, sir?" (rung 3c) is the
+    one he hits most. calendar.add_event now stamps made_at; a dict with
+    no stamp (every older caller and test) still counts as live."""
+    c = _slim_cmdr(tmp_path, monkeypatch)
+    c.services.calendar = SimpleNamespace(
+        pending_event={"title": "Dentist", "start": None, "end": None})
+    assert c.question_open() is True, "unstamped: a live question"
+    c.services.calendar.pending_event["made_at"] = _t.monotonic()
+    assert c.question_open() is True
+    c.services.calendar.pending_event["made_at"] = _t.monotonic() - OFFER_TTL_S - 1
+    assert c.question_open() is False
+    # ...and a late "yes" to it writes nothing: the read-back is spent.
+    written = []
+    import jarvis.commander as cmd_mod
+    monkeypatch.setattr(cmd_mod, "add_event",
+                        lambda *a, **kw: written.append(1) or ("Added", None))
+    c.services.calendar.icloud_calendars = lambda: ["CAL"]
+    assert c._try_event_confirm("yes") is None
+    assert written == [] and c.services.calendar.pending_event is None
+
+
+def test_the_calendar_tool_stamps_the_read_back_it_parks():
+    """The producing end of the stamp above."""
+    import inspect
+    from jarvis.tools import calendar as cal_mod
+    src = inspect.getsource(cal_mod)
+    assert '"made_at": time.monotonic()' in src
+
+
+def test_the_offer_is_held_behind_an_event_read_back(monkeypatch, tmp_path):
+    """The live consequence. First voice turn of the day: "add a dentist
+    appointment tomorrow at three" -> "Dentist, tomorrow at 3 pm. Shall I
+    add it, sir?". The settled burst used to put "Shall I run your
+    briefing, sir?" straight on top of it -- two questions on the table --
+    and his yes landed on the event while the day's only offer was
+    spent. The real Commander's question_open() now counts it."""
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    a = _app(monkeypatch, tmp_path)
+    _clock(monkeypatch, 9, 0)
+    c = _slim_cmdr(tmp_path, monkeypatch)
+    c.services.calendar = SimpleNamespace(
+        pending_event={"title": "Dentist", "start": None, "end": None,
+                       "made_at": _t.monotonic()})
+    a.commander = c
+    opened = []
+    a._start_followup = lambda: opened.append(1)
+    a._after_dispatch("add a dentist appointment tomorrow at three", "voice",
+                      SimpleNamespace(reply="Dentist, tomorrow at 3 pm. Shall I add it, sir?",
+                                      speak=True, done=True, ack=False, status="Read-back"))
+    a._after_speech()
+    assert a.said == [], "the offer must wait behind the read-back"
+    assert a._briefing_pending, "...and stay armed for after it"
+    assert c.services.calendar.pending_event is not None
+    assert opened == [1], "the read-back keeps its follow-up mic (F35)"
+
+
 @pytest.fixture
 def cmdr(tmp_path, monkeypatch):
     monkeypatch.setenv("JARVIS_ASSISTANT_CONFIG", str(tmp_path / "assistant.json"))
