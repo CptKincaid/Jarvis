@@ -653,3 +653,103 @@ def test_warmup_does_not_warm_up_twice(firewall):
     assert tr.warmup() is True
     assert tr.warmup() is False
     assert len(tr._model.calls) == 1
+
+
+# ================= the bound a turn CAN wait on the warm-up (F49)
+# The docstring used to say a real turn could never wait on the warm-up.
+# The lock is taken non-blocking by warmup() and BLOCKING by transcribe()
+# and partial(), so a capture that ends while the throwaway decode holds
+# the lock waits for the rest of it -- a whisper kernel cannot be
+# abandoned. The honest bound: one silent decode, then the turn decodes
+# warm. These pin that bound and the one ordering the app can still avoid.
+class SlowFirstDecode(FakeGpuWhisper):
+    """The first decode (the warm-up) takes ``hold`` seconds; every one
+    after it is instant, which is what a warm kernel looks like."""
+
+    def __init__(self, hold):
+        super().__init__()
+        self.hold = hold
+        self.finished: list[float] = []
+
+    def transcribe(self, audio, **kw):
+        import time
+        if not self.calls:
+            time.sleep(self.hold)
+        out = super().transcribe(audio, **kw)
+        self.finished.append(time.monotonic())
+        return out
+
+
+def test_a_turn_landing_inside_the_warmup_waits_for_it_and_no_longer(firewall):
+    import threading
+    import time
+
+    hold = 0.15
+    tr = _gpu(SlowFirstDecode(hold))
+    warm = threading.Thread(target=tr.warmup, daemon=True)
+    warm.start()
+    for _ in range(200):                       # until the warm-up holds the lock
+        if tr._lock.locked():
+            break
+        time.sleep(0.005)
+    assert tr._lock.locked(), "the warm-up never took the lock"
+    t0 = time.monotonic()
+    got = tr.transcribe(_audio(2.0))
+    waited = time.monotonic() - t0
+    warm.join(timeout=2.0)
+    assert got.text == "hello", "the turn's decode ran, after the warm-up"
+    assert len(tr._model.calls) == 2, "warm-up, then the turn: never dropped"
+    assert tr._model.finished[0] <= t0 + waited, \
+        "the turn decoded before the warm-up let go of the model"
+    assert waited <= hold + 0.5, \
+        f"waited {waited:.2f}s on a {hold:.2f}s warm-up: more than one decode"
+
+
+def _loader_app(order, **extra):
+    app = types.SimpleNamespace(
+        brain=SimpleNamespace(warmup=lambda: order.append("brain")),
+        _install_endpointer=lambda: order.append("endpointer"),
+        transcriber=SimpleNamespace(
+            load=lambda: (order.append("whisper-load"), "cuda")[1],
+            warmup=lambda: order.append("whisper-warmup")),
+        tts=SimpleNamespace(load=lambda: True, prewarm=lambda phrases: None),
+        speaker=SimpleNamespace(enrolled=False, load_model=lambda: None),
+        _canned_phrases=lambda: [],
+        **extra,
+    )
+    app._load_tts = lambda: app_mod.JarvisApp._load_tts(app)
+    return app
+
+
+def test_the_loader_skips_the_warmup_when_a_capture_is_open():
+    """A capture already open when the loader gets here has a decode
+    seconds away; the throwaway decode would only stand in front of it."""
+    import threading
+    order: list[str] = []
+    app = _loader_app(order, recorder=SimpleNamespace(recording=True),
+                      _audio_busy=threading.Event())
+    app_mod.JarvisApp._load_models(app)
+    assert "whisper-load" in order
+    assert "whisper-warmup" not in order
+
+
+def test_the_loader_skips_the_warmup_while_a_turn_is_being_processed():
+    """recorder.recording is already False during the decode pass;
+    _audio_busy is the flag that says a turn is in flight (CLAUDE.md)."""
+    import threading
+    order: list[str] = []
+    busy = threading.Event()
+    busy.set()
+    app = _loader_app(order, recorder=SimpleNamespace(recording=False),
+                      _audio_busy=busy)
+    app_mod.JarvisApp._load_models(app)
+    assert "whisper-warmup" not in order
+
+
+def test_the_loader_still_warms_when_the_mic_is_idle():
+    import threading
+    order: list[str] = []
+    app = _loader_app(order, recorder=SimpleNamespace(recording=False),
+                      _audio_busy=threading.Event())
+    app_mod.JarvisApp._load_models(app)
+    assert "whisper-warmup" in order

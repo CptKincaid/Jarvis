@@ -38,6 +38,14 @@ line — cleaner, markdown, clock guard, the sentence cap and trim_spoken.
 The tests below drive the real _chat_sync rather than re-deriving the old
 expression, so they pin the production path and not a copy of it.
 
+MOVED 2026-09-04 (F26/F27, tests/test_reply_coverage.py): the guards and
+the sentence cap are now applied ONCE, per authored line, where the line
+is collected (brain.authored_line / guard_authored), and the joined reply
+goes through _finish_authored, which caps nothing but the TTS hard limit.
+This file's guarantees hold unchanged -- a single ten-sentence note line
+is still capped and still cleaned -- and two authored lines no longer pay
+for each other.
+
 These tests were the strict-xfail record of the defect; they now pass.
 """
 import pytest
