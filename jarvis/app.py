@@ -6152,16 +6152,10 @@ class JarvisApp:
         return probe_code_status(getattr(self, "running_commit", ""),
                                  relaunch.REPO_ROOT)
 
-    def _tts_busy(self) -> bool:
-        busy = getattr(self.tts, "busy", False)
-        try:
-            return bool(busy() if callable(busy) else busy)
-        except Exception:
-            return False
-
     def restart(self, spawn=None, sleep=time.sleep, clock=time.monotonic):
         """The Restart button's second press (Hunter, 2026-09-04: "yes,
-        button only"). Say the line, let it finish (TTS.busy, bounded at
+        button only"). Say the line, let it finish (_tts_busy: the filler's
+        strictly-typed TTS.is_speaking / TTS.pending read, bounded at
         RESTART_SAY_WAIT_S -- a ceiling, not a fixed wait, so a gated or
         already-finished line costs nothing), start the detached helper
         with OUR pid to wait on, THEN the normal quit. In that order: a

@@ -2255,18 +2255,20 @@ def test_restart_waits_for_the_spoken_line_but_never_past_the_ceiling(
         spawn_at.append(clock.t)
         return 1
     app.close_window = lambda: None
-    # still talking for 2 s: the helper starts once the line is out
-    app.tts.busy = True
+    # still talking for 2 s (the same TTS.is_speaking the thinking filler
+    # reads through _tts_busy): the helper starts once the line is out
+    app.tts.is_speaking = True
 
     def sleep(s):
         clock.sleep(s)
         if clock.t >= 2.0:
-            app.tts.busy = False
+            app.tts.is_speaking = False
     app.restart(spawn=spawn, sleep=sleep, clock=clock)
     assert 2.0 <= spawn_at[0] < 2.5
-    # a TTS that never reports idle: bounded at RESTART_SAY_WAIT_S
+    # a line still QUEUED counts too, and a TTS that never reports idle is
+    # bounded at RESTART_SAY_WAIT_S
     app._restarting = False
-    app.tts.busy = True
+    app.tts.pending = 1
     clock.t = 0.0
     app.restart(spawn=spawn, sleep=clock.sleep, clock=clock)
     assert app_mod.RESTART_SAY_WAIT_S <= spawn_at[1] < \
