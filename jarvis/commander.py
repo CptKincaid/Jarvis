@@ -8515,8 +8515,14 @@ REGISTRY: list[Command] = [
             _h_add_person, needs=("memory",)),
     # "remember to buy milk" is a to-do (the notes tool); only "remember
     # (that) <fact>" lands in long-term memory.
+    # 2026-09-04: "Put it in your memory that I graduate December 10th" did not
+    # match "remember", reached the model, and the model SAID "I have noted
+    # that, sir" while nothing was stored; two days later he asked and Jarvis
+    # searched his documents. The rung now takes the ways he says it.
     Command("remember",
-            _m_re(r"remember (?:that )?(?!to\b)(.+)"),
+            _m_re(r"(?:remember(?: that)?|note that|keep in mind(?: that)?|"
+                  r"don'?t forget(?: that)?|make a note(?: that| of)?|"
+                  r"put (?:it|this|that) in your memory(?: that)?) (?!to\b)(.+)"),
             _h_remember, needs=("memory",)),
     # Before "recall": episodic ("when did I last …") vs semantic ("what did
     # I say about …"). Neither matcher claims the other's words, but the
