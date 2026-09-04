@@ -132,7 +132,13 @@ MIN_W, MIN_H = 460, 720
 STATE_WORDS = {"idle": "READY", "listening": "LISTENING",
                "thinking": "THINKING", "speaking": "SPEAKING",
                "waiting": "WAITING", "working": "WORKING",
-               "error": "ERROR"}
+               "error": "ERROR",
+               # 2026-09-03 (ui-polish U05/U07): the boot pill and the
+               # ringing alarm. Both narrower than LISTENING -- measured
+               # on Xvfb :92 at S=2 in the chip face, LOADING 140 px and
+               # ALARM 118 against LISTENING's 158 -- so the header budget
+               # of tests/test_header_fit.py is unchanged.
+               "loading": "LOADING", "alarm": "ALARM"}
 WARN_HOLD_S = 4.0            # warn Status: pill dot amber for this long
 ERROR_HOLD_S = 6.0           # error Status: pill ERROR until ok/info or this
 SNOOZE_MIN = 10              # the alarm modal's SNOOZE button
@@ -141,6 +147,12 @@ SNOOZE_MIN = 10              # the alarm modal's SNOOZE button
 # at once instead of at the next restart. Imported by name rather than
 # spelled twice -- jarvis/campreview.py owns it.
 CAMERA_PREVIEW_OPTION = campreview.OPTION_ENABLED
+# The longest an in-app enrolment may hold the preview open, INDEPENDENT of
+# the run itself. A five-station enrolment is about ninety seconds and the
+# run releases its own lease in a finally -- this is the backstop for the
+# case that finally cannot cover, which is a wedged or crashed enrolment
+# thread. Without it, one hung run leaves the lens lit until he notices.
+PREVIEW_LEASE_MAX_S = 300.0
 SESSION_PROBE_MS = 20000     # gap between `tmux ls` probes (2 retries)
 SESSION_PROBE_RETRIES = 2
 ATTACH_POLL_MS = 5000        # `tmux list-clients` while a session exists
@@ -150,24 +162,73 @@ DEFAULT_SWEEP_STAGES = 4     # power-up stages when no Board is up to count
 
 def resolve_state(speaking: bool, listening: bool, thinking: bool,
                   error: bool, waiting: bool = False,
-                  working: bool = False) -> str:
+                  working: bool = False, alarm: bool = False,
+                  loading: bool = False) -> str:
     """App-state precedence — the first four in the SAME order as
     Reactor.state() so the pill and the stage never disagree (the stage
     keeps idle / listen / think / speak): speaking > listening > thinking
-    > waiting > working > error (held) > idle."""
+    > alarm > waiting > working > error (held) > loading > idle.
+
+    `alarm` (a modal is ringing) sits right under the three turn states:
+    the modal is the loud signal, but while he answers it LISTENING is the
+    feedback he needs. `loading` (the speech model is still coming up) is
+    the floor above idle: anything at all outranks it, because anything at
+    all is proof the app is alive."""
     if speaking:
         return "speaking"
     if listening:
         return "listening"
     if thinking:
         return "thinking"
+    if alarm:
+        return "alarm"
     if waiting:
         return "waiting"
     if working:
         return "working"
     if error:
         return "error"
+    if loading:
+        return "loading"
     return "idle"
+
+
+def pill_look(state: str, warn_live: bool, look: Optional[str] = None) -> tuple:
+    """(dot_color, word_color, dot_shape) for the StatePill in `state`
+    (pure; `look` defaults to theme.LOOK at call time).
+
+    Classic: today's table, byte for byte -- the word is FOCAL for the
+    FOCAL_WORD_STATES and the state colour otherwise, and a live warn hold
+    paints the dot amber whatever the state.
+
+    Holo (2026-09-03, ui-polish U05), three collisions measured on the
+    09-03 shots and closed here:
+      * ERROR's dot was (255,180,84) = WARN whenever a warn hold was live
+        (a warn then an error inside 4 s is exactly 'memory tight' then
+        'Ollama not responding'), so ERROR read as WARN from 2 m -- the
+        error state now ignores the hold: ERR dot, ERR word.
+      * WORKING's dot was (24,153,189), identical to READY's -- the two
+        Claude-task states now draw the dot as a RING (the sensing badge's
+        shape channel), CYAN for working and WARN for waiting, so 'Claude
+        is busy' and 'Jarvis is busy' part without a fourth colour.
+      * a LOADING word in MUTED over a FAINT dot: the lamp is not lit yet.
+    """
+    look = theme.LOOK if look is None else look
+    color = theme.STATE_COLORS.get(state, theme.CYAN_DIM)
+    word = theme.FOCAL if state in theme.FOCAL_WORD_STATES else color
+    shape = "disc"
+    if look != "holo":
+        return (theme.WARN if warn_live else color), word, shape
+    if state == "error":
+        return color, word, shape
+    if state == "working":
+        color, shape = theme.CYAN, "ring"
+    elif state == "waiting":
+        shape = "ring"
+    elif state == "loading":
+        word = theme.MUTED
+    dot = theme.WARN if warn_live else color
+    return dot, word, shape
 
 
 class ClaudeTaskTracker:
@@ -229,6 +290,18 @@ def alarm_modal_text(label: str, kind: str, due_text: str) -> tuple:
     title = (label or "").strip() or ALARM_TITLES.get(
         (kind or "alarm").lower(), "ALARM")
     return title, (due_text or "").strip().upper()
+
+
+def alarm_modal_parts(label: str, kind: str, due_text: str) -> tuple:
+    """(kind_word, title, time) for the HOLO alarm modal (2026-09-03,
+    ui-polish U10). The kind is ALWAYS its own word -- alarm_modal_text
+    drops ALARM the moment the alarm has a label, so 'Biosensors lecture
+    / 9:45 AM' could have been a calendar card; here it is the tracked
+    eyebrow over the title. `title` is '' when the alarm has no label
+    (the eyebrow already says what it is), never the kind word twice."""
+    kind_word = ALARM_TITLES.get((kind or "alarm").lower(), "ALARM")
+    title = (label or "").strip()
+    return kind_word, title, (due_text or "").strip().upper()
 
 
 def terminal_button_state(task_state: str, project: str,
@@ -638,6 +711,18 @@ class MainWindow:
         self._tasks = ClaudeTaskTracker()
         self._project = ""
         self._alarm = None               # (alarm_id, Card) while ringing
+        self._alarm_scrim = None         # holo: the stippled dim under it
+        # Pill inputs beyond the turn (2026-09-03, ui-polish U05/U07).
+        # `_booting` is raised at the END of construction -- after the
+        # construction-time Status("Ready") below, which is the window's
+        # own, not the app's -- and cleared by ModelInfo (the speech model
+        # is up) or by the first ok/info/error Status the app publishes.
+        # Before this the pill read READY from the first frame while
+        # 'Loading speech model…' (a busy Status, which renders no text)
+        # was the truth. `_pending` holds the request ids of YES/NO and
+        # ALLOW/DENY cards still waiting on him: an answer owed is WAITING.
+        self._booting = False
+        self._pending: set = set()
         # The console's second surface and its mode machine. Declared HERE,
         # before _subscribe() attaches the bus: a BoardCommand arriving
         # between that and the driver's construction must find `None`, not
@@ -717,6 +802,12 @@ class MainWindow:
         # keep their space; the transcript absorbs any height shortfall.
         self._build_footer()
         self._build_stage()
+        if theme.LOOK == "holo":
+            # holo: the toast is a laid-out strip directly above the
+            # command bar (packed before the reactor, side=bottom), never
+            # an overlay on the newest card -- widgets.Toast has the
+            # measurements. Classic keeps the placed slab.
+            self.toast.dock(self.shell, before=self.reactor)
 
         self.drawer = SettingsDrawer(
             root, services=self.services,
@@ -746,6 +837,9 @@ class MainWindow:
         else:
             self.set_status("Ready", "ok")
         self._refresh_placeholder()
+        # Raised AFTER the window's own Status above: from here until the
+        # app says otherwise the speech model is still loading (U05).
+        self._booting = True
         self._refresh_pill()
         self._refresh_terminal()
 
@@ -1407,6 +1501,11 @@ class MainWindow:
         self.preview = None
         self.preview_worker = None
         self._preview_shown = False
+        # An in-app enrolment's claim on the capture. See preview_lease: the
+        # pane is ACTIVE-only and goes AMBIENT after 45 s of quiet, which
+        # would take the camera away halfway through a run.
+        self._preview_lease = False
+        self._preview_lease_at = 0.0
         try:
             # jarvis.ui.preview is imported HERE, not at module scope: it
             # pulls PIL through jarvis.ui.widgets' font machinery and a
@@ -1430,6 +1529,16 @@ class MainWindow:
         if self.preview is None:
             self.preview_worker = None
             return
+        # PUBLISHED ON THE SERVICES NAMESPACE so that jarvis/enrolrun.py can
+        # reach the capture that already holds the camera. It is the handle
+        # and nothing more: the run never opens a device, never starts or
+        # stops this worker for its own convenience, and asks for the lens
+        # only through preview_lease below.
+        try:
+            self.services.preview_worker = self.preview_worker
+            self.services.preview_lease = self.preview_lease
+        except Exception:                     # noqa: BLE001 - a slim services
+            log.debug("preview worker could not be published", exc_info=True)
         self._preview_apply()
 
     def _hand_stage(self):
@@ -1475,6 +1584,58 @@ class MainWindow:
     def _preview_enabled(self) -> bool:
         return bool(self._console_option(CAMERA_PREVIEW_OPTION, False))
 
+    def _preview_lease_live(self) -> bool:
+        """Is an enrolment's claim on the capture still good?
+
+        The cap is re-checked HERE as well as on the timer, so an expired
+        lease cannot keep the lens open just because a Tk ``after`` was
+        dropped by a window that was busy or on its way out. Fail closed:
+        anything unreadable is no lease.
+        """
+        if not self._preview_lease:
+            return False
+        started = float(self._preview_lease_at or 0.0)
+        if started and (time.monotonic() - started) > PREVIEW_LEASE_MAX_S:
+            log.warning("preview lease expired after %.0f s; the camera is "
+                        "going back", PREVIEW_LEASE_MAX_S)
+            self._preview_lease = False
+            self._preview_lease_at = 0.0
+            return False
+        return True
+
+    def preview_lease(self, on: bool) -> None:
+        """Hold the preview's capture open for an in-app enrolment, or let go.
+
+        CALLED FROM THE ENROLMENT THREAD, which is why the work is marshalled
+        onto Tk with ``_after`` rather than done here -- ``_preview_apply``
+        packs and unpacks widgets, and Tk from a second thread is how a
+        console dies without a traceback. The FLAG is set synchronously, so
+        a ``_preview_apply`` triggered by anything else in the meantime
+        already sees the claim.
+
+        Releasing is never conditional and never deferred behind a check:
+        jarvis/enrolrun.py calls ``preview_lease(False)`` in a ``finally`` on
+        every path, including the exception path, and the wall-clock cap in
+        ``_preview_lease_live`` covers the thread that never gets there.
+        """
+        want = bool(on)
+        self._preview_lease = want
+        self._preview_lease_at = time.monotonic() if want else 0.0
+        if want:
+            self._after(0, lambda: self._preview_apply(enabled=True))
+            self._after(int(PREVIEW_LEASE_MAX_S * 1000) + 50,
+                        self._preview_lease_expire)
+        else:
+            self._after(0, self._preview_apply)
+
+    def _preview_lease_expire(self) -> None:
+        """The backstop firing. Re-applies only if the lease really is over,
+        so a SECOND enrolment started inside the window is not cut short by
+        the first one's timer."""
+        if self._preview_lease_live():
+            return
+        self._preview_apply()
+
     def _preview_apply(self, mode: Optional[str] = None,
                        enabled: Optional[bool] = None):
         """Show/hide the band and start/stop the CAPTURE, as one decision.
@@ -1493,7 +1654,18 @@ class MainWindow:
             mode = ACTIVE if modes is None else modes.mode
         if enabled is None:
             enabled = self._preview_enabled()
-        want = bool(pane_visible(mode, enabled))
+        lease = self._preview_lease_live()
+        if lease:
+            # AN ENROLMENT OVERRIDES BOTH HALVES, and it has to override
+            # both. pane_visible is ACTIVE-only, so 45 s of quiet would
+            # otherwise stop the capture mid-run; and camera.preview may be
+            # off entirely, in which case PreviewWorker.start(enabled=False)
+            # would refuse to capture behind a pane we had just packed. He
+            # asked for this; the pane is SHOWN for the duration, because a
+            # capture behind a hidden pane is the one thing this function
+            # exists to prevent.
+            enabled = True
+        want = bool(pane_visible(mode, enabled)) or lease
         worker = self.preview_worker
         # STOPPING COMES FIRST when it is going away, and it is deliberately
         # not inside the same try as the repack: the capture is the half that
@@ -1812,6 +1984,11 @@ class MainWindow:
         or 6 s, whichever first, plus a 4 s toast."""
         log.info("status[%s]: %s", kind, text)
         now = time.monotonic()
+        if kind != "busy" and self._booting:
+            # any ok / info / warn / error from the app is proof it is up;
+            # busy is what the boot itself publishes (U05)
+            self._booting = False
+            self._refresh_pill()
         if kind == "warn":
             self.toast.show(text, kind="warn", ms=4000)
             self._warn_until = now + WARN_HOLD_S
@@ -1828,21 +2005,36 @@ class MainWindow:
 
     def _app_state(self) -> str:
         now = time.monotonic()
+        # The three 09-03 inputs (alarm ringing, an answer owed, the boot)
+        # are holo-only: classic keeps the 08-31 pill exactly, warts
+        # included (CLAUDE.md), so it never sees them.
+        holo = theme.LOOK == "holo"
         return resolve_state(self._speaking, self._recording, self._thinking,
                              now < self._error_until,
-                             waiting=self._tasks.waiting,
-                             working=self._tasks.working)
+                             waiting=self._tasks.waiting
+                             or (holo and bool(self._pending)),
+                             working=self._tasks.working,
+                             alarm=holo and self._alarm is not None,
+                             loading=holo and self._booting)
 
     def _refresh_pill(self):
         """Recompute the StatePill from the event-derived state machine
-        (called on every state-changing event). Idle / WORKING / WAITING:
-        FOCAL word, the dot carries the colour; other states take
-        STATE_COLORS for both; a live warn hold turns only the dot amber."""
+        (called on every state-changing event). pill_look() holds the
+        colour / shape table for both looks."""
         state = self._app_state()
-        color = theme.STATE_COLORS.get(state, theme.CYAN_DIM)
-        word_color = theme.FOCAL if state in theme.FOCAL_WORD_STATES else color
-        dot = theme.WARN if time.monotonic() < self._warn_until else color
-        self.pill.set_state(STATE_WORDS[state], dot, word_color)
+        dot, word_color, shape = pill_look(
+            state, time.monotonic() < self._warn_until)
+        self.pill.set_state(STATE_WORDS[state], dot, word_color, shape)
+        if theme.LOOK == "holo" and dot != self._bar_state_color:
+            # the leading ticks of the segmented bar follow the state dot
+            # (recoloured on state events only — never a timer of its own)
+            self._bar_state_color = dot
+            rule = getattr(self, "_rule", None)
+            if rule is not None:
+                try:
+                    rule.itemconfigure("state", fill=dot)
+                except tk.TclError:
+                    pass
         if theme.LOOK == "holo" and dot != self._bar_state_color:
             # the leading ticks of the segmented bar follow the state dot
             # (recoloured on state events only — never a timer of its own)
@@ -2025,6 +2217,23 @@ class MainWindow:
         # The camera pane is an ACTIVE-console widget only, and going quiet
         # STOPS the capture rather than hiding it (jarvis/ui/preview.py).
         self._preview_apply(mode)
+        if theme.LOOK == "holo":
+            # Keyboard-idle standby dims the WHOLE window through the same
+            # -alpha path the radar's DeskState uses (_apply_standby), not
+            # just the room slab (2026-09-03, ui-polish U08): measured on
+            # the 09-03 shots the sphere's mean luminance was 72.6 in
+            # standby against 72.1 in READY and the header band 37.4 in
+            # both -- the brightest object on the panel was exempt from the
+            # night dim. Reversible by construction: ACTIVE restores, and
+            # _wake_board / _on_close restore on their own paths. Needs a
+            # compositor, so a Xvfb shot cannot show it; the wiring is
+            # pinned in tests/test_ui_assistant.py instead. Looked up, not
+            # called outright, for the same reason the reactor/transcript
+            # calls above are guarded: a console without the standby seam
+            # (a bare test fake) keeps its brightness.
+            apply = getattr(self, "_apply_standby", None)
+            if callable(apply):
+                apply(mode != STANDBY)
         if mode == STANDBY:
             if self._standby_origin is None:
                 try:
@@ -2258,6 +2467,9 @@ class MainWindow:
 
     def _ev_model(self, ev: ModelInfo):
         self._asr_text = fmt_asr(ev.text)         # 'small · GPU fp16' → SMALL
+        if self._booting:
+            self._booting = False                 # the speech model is up
+            self._refresh_pill()
 
     def _ev_partial(self, ev: PartialText):
         self.transcript.show_partial(ev.text)
@@ -2432,11 +2644,25 @@ class MainWindow:
         # the question is what this turn produced: consume the utterance
         # stamp so a later spontaneous reply cannot wear its round trip
         self._utter_ts = None
-        self.transcript.add_approval(ev.request_id, ev.question,
-                                     self._answer_approval)
+        card = self.transcript.add_approval(ev.request_id, ev.question,
+                                            self._answer_approval)
+        if card is not None:
+            self._question_opened(ev.request_id)
+
+    def _question_opened(self, request_id: str):
+        """A YES/NO or ALLOW/DENY card is now waiting on him: the pill
+        says WAITING until it is answered (U07)."""
+        self._pending.add(request_id)
+        self._refresh_pill()
+
+    def _question_closed(self, request_id: str):
+        if request_id in self._pending:
+            self._pending.discard(request_id)
+            self._refresh_pill()
 
     def _ev_approval_done(self, ev: ApprovalResolved):
         self.transcript.resolve_approval(ev.request_id, ev.allowed)
+        self._question_closed(ev.request_id)
 
     def _ev_uncertain(self, ev: UncertainUtterance):
         """"Was that for me?" as a card that WAITS. The old behaviour was a
@@ -2444,15 +2670,18 @@ class MainWindow:
         before it could be read, and nothing could answer it."""
         self._note_output()
         self._utter_ts = None
-        self.transcript.add_approval(ev.request_id, ev.question,
-                                     self._answer_uncertain,
-                                     yes_text="YES", no_text="NO")
+        card = self.transcript.add_approval(ev.request_id, ev.question,
+                                            self._answer_uncertain,
+                                            yes_text="YES", no_text="NO")
+        if card is not None:
+            self._question_opened(ev.request_id)
 
     def _ev_uncertain_done(self, ev: UncertainResolved):
         # also fires when the spoken reply answered it, so the card stops
         # inviting a click that would arrive too late
         self.transcript.resolve_approval(ev.request_id, ev.yes,
                                          yes_mark="yes", no_mark="no")
+        self._question_closed(ev.request_id)
 
     def _answer_uncertain(self, request_id: str, yes: bool):
         fn = self.services.uncertain_answer
@@ -2492,32 +2721,24 @@ class MainWindow:
 
     # ------------------------------------------------------ alarm modal
     def _ev_alarm(self, ev: AlarmFired):
-        """Overlay Card centred on the stage (300 wide): label (display
-        SIZE_LABEL semibold), time (mono SIZE_BODY), DISMISS / SNOOZE 10.
-        The reactor keeps animating beneath; the window is brought back
-        from the tray so the alarm is seen."""
+        """Classic: an overlay Card centred on the stage (300 wide): label
+        (display SIZE_LABEL semibold), time (mono SIZE_BODY), DISMISS /
+        SNOOZE 10, the reactor animating beneath. Holo: the stage takeover
+        in _build_alarm_holo. Either way the window is brought back from
+        the tray so the alarm is seen."""
         # An alarm ringing behind a room clock is a bug: wake the console
         # NOW rather than at the mode machine's next four-second tick.
         self._note_output()
         self._hide_alarm()
-        title, when = alarm_modal_text(ev.label, ev.kind, ev.due_text)
         if theme.LOOK == "holo":
-            # holo: a thin bright frame on the stage ground, not a slab.
-            # The ground under it is the reactor's glow pool, not BG: at
-            # the stage centre those are ~20 levels apart, so filling with
-            # theme.BG drew the modal as a dark rectangle over the pool --
-            # the same slab defect the transcript cards had (09-01
-            # review). Tk has no alpha, so the closest we get is the pool
-            # sampled under the card's own centre (Reactor.ground_at); the
-            # card is centred on the stage, hence relx/rely 0.5 here too.
-            fill = self.reactor.ground_at(self.reactor.winfo_width() / 2,
-                                          self.reactor.winfo_height() / 2)
-            card = Card(self.reactor, fill=fill, pad=12, bg=fill,
-                        style="frame", edge=theme.GLASS_EDGE,
-                        accent=theme.BRIGHT)
-        else:
-            fill = theme.RAISED
-            card = Card(self.reactor, fill=fill, pad=12, bg=theme.BG)
+            card, buttons = self._build_alarm_holo(ev)
+            self._alarm = (ev.alarm_id, card, buttons)
+            self._refresh_pill()                  # the header says ALARM (U07)
+            self._raise_for_alarm()
+            return
+        title, when = alarm_modal_text(ev.label, ev.kind, ev.due_text)
+        fill = theme.RAISED
+        card = Card(self.reactor, fill=fill, pad=12, bg=theme.BG)
         body = card.body
         tk.Label(body, text=title, font=ui_display(theme.SIZE_LABEL, "semibold"),
                  fg=theme.INK, bg=fill, anchor="w", justify="left",
@@ -2537,20 +2758,92 @@ class MainWindow:
                         command=lambda: self._alarm_action(alarm_id, "snooze")))
         buttons[0].pack(side="left")
         buttons[1].pack(side="left", padx=(theme.PAD_S, 0))
-        if theme.LOOK == "holo":
-            card.set_edge_glow((theme.ARC_BRIGHT,))
-        else:
-            card.set_edge_glow()
+        card.set_edge_glow()
         card.place(in_=self.reactor, relx=0.5, rely=0.5, anchor="center",
                    width=px(300))
         tk.Misc.lift(card)
         self._alarm = (alarm_id, card, buttons)
+        self._raise_for_alarm()
+
+    def _raise_for_alarm(self):
         try:
             if self.root.state() == "withdrawn":
                 self.root.deiconify()
             self.root.lift()
         except tk.TclError:
             log.debug("alarm: could not raise the window", exc_info=True)
+
+    # design px the holo alarm modal keeps inside the stage on each side:
+    # at his 918-px stage that is x 32..886, which covers the engine card
+    # (right edge 881, engine_card_x1) and stays clear of the rail ticks
+    # (889..899) and the frame line (899) -- measured on the 09-03 shots
+    ALARM_MARGIN = 16
+
+    def _build_alarm_holo(self, ev: AlarmFired) -> tuple:
+        """The holo alarm: a stage TAKEOVER, not a card (2026-09-03,
+        ui-polish U10).
+
+        Measured on the 09-03 shot 12-alarm: a plain 600x300 frame with
+        no kind word, filled (10,37,49) over a stage ground of (9,33,44)
+        -- four levels apart, no scrim -- laid across the engine card so
+        '…ER SMALL / ZE · Q4 / MA4:26B / GB10' stayed visible beside it in
+        FOCAL white, brighter than the alarm's own 25-px title. The one
+        state that must interrupt him lost to the reactor.
+
+        Now: a 50% stipple of BG over every stage item (Tk has no alpha;
+        'gray50' is the compositor-free scrim), a chamfered WARN outline
+        with WARN brackets -- the only amber-framed panel on screen, per
+        theme.py's semantic budget -- spanning the stage frame's inner
+        width so nothing peeks past it, a tracked kind word as the
+        eyebrow, the TIME at wordmark size in FOCAL (the time IS the
+        alarm), the label under it at body size. The card is filled with
+        the pool colour sampled under its centre (Reactor.ground_at), so
+        against the dimmed stage it reads as the one lit panel."""
+        stage = self.reactor
+        w, h = stage.winfo_width(), stage.winfo_height()
+        fill = stage.ground_at(w / 2, h / 2)
+        try:
+            stage.delete("alarm_scrim")
+            self._alarm_scrim = stage.create_rectangle(
+                0, 0, max(w, 1), max(h, 1), fill=theme.BG, outline="",
+                stipple="gray50", tags=("alarm_scrim",))
+        except tk.TclError:
+            self._alarm_scrim = None
+        width = max(px(300), w - 2 * px(self.ALARM_MARGIN))
+        pad = 14
+        card = Card(stage, fill=fill, pad=pad, bg=fill, style="chamfer",
+                    edge=theme.WARN, accent=theme.WARN)
+        body = card.body
+        kind_word, title, when = alarm_modal_parts(ev.label, ev.kind,
+                                                   ev.due_text)
+        wrap = max(px(80), width - 2 * px(pad) - px(4))
+        tk.Label(body, text=theme.caption(kind_word, surface=True),
+                 font=ui_display(theme.SIZE_CAPTION, "semibold"),
+                 fg=theme.WARN, bg=fill, anchor="w").pack(fill="x")
+        if when:
+            tk.Label(body, text=when,
+                     font=ui_display(theme.SIZE_WORDMARK, "semibold"),
+                     fg=theme.FOCAL, bg=fill, anchor="w").pack(
+                fill="x", pady=(px(2), 0))
+        if title:
+            tk.Label(body, text=title,
+                     font=ui_display(theme.SIZE_BODY, "semibold"),
+                     fg=theme.INK, bg=fill, anchor="w", justify="left",
+                     wraplength=wrap).pack(fill="x", pady=(px(4), 0))
+        row = tk.Frame(body, bg=fill)
+        row.pack(fill="x", pady=(px(12), 0))
+        alarm_id = ev.alarm_id
+        buttons = (
+            RoundButton(row, text="DISMISS", kind="accent", bg=fill,
+                        command=lambda: self._alarm_action(alarm_id, "dismiss")),
+            RoundButton(row, text=f"SNOOZE {SNOOZE_MIN}", kind="default",
+                        bg=fill,
+                        command=lambda: self._alarm_action(alarm_id, "snooze")))
+        buttons[0].pack(side="left")
+        buttons[1].pack(side="left", padx=(theme.PAD_S, 0))
+        card.place(in_=stage, relx=0.5, rely=0.5, anchor="center", width=width)
+        tk.Misc.lift(card)
+        return card, buttons
 
     def _alarm_action(self, alarm_id: str, action: str):
         """DISMISS / SNOOZE → services.alarm_action(alarm_id, action, 10)
@@ -2584,6 +2877,13 @@ class MainWindow:
             card.destroy()
         except tk.TclError:
             pass
+        if self._alarm_scrim is not None:
+            self._alarm_scrim = None
+            try:
+                self.reactor.delete("alarm_scrim")
+            except tk.TclError:
+                pass
+        self._refresh_pill()                      # ALARM leaves the header
 
     # ------------------------------------------------------ config echoes
     def _on_config_change(self, name, value):

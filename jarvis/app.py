@@ -78,6 +78,7 @@ from jarvis import leavetime as leavetime_mod
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
 from jarvis.turnclock import TurnLedger
+from jarvis.previewprobe import PATH_GREEDY, PATH_SPECULATIVE, PreviewProbe
 from jarvis import dayreview as dayreview_mod
 from jarvis import garden as garden_mod
 from jarvis.dialogue import SESSION_WINDOW_S
@@ -551,6 +552,13 @@ class JarvisApp:
         # is never reached from the running app at all.
         self.commander.on_uncertain = self._on_uncertain
         self.commander.claim_uncertain = self._claim_uncertain
+        # ...and the count of those cards, for "clear the transcript": the
+        # prompt goes into the SAME TranscriptView._approvals dict the
+        # Claude approvals do, clear_all keeps it while it is unanswered,
+        # and ApprovalService.pending() has never heard of it. Without this
+        # the wipe said "Screen's clear, sir" over a card still on the
+        # glass (commander._standing_questions).
+        self.commander.uncertain_open = self._uncertain_open
         self._pending_uncertain: dict = {}      # request_id -> utterance
         # The open debrief question (jarvis/debrief.py), modelled on
         # _pending_uncertain: a context dict the NEXT transcript is filed
@@ -1310,6 +1318,20 @@ class JarvisApp:
             # Commander._try_briefing_offer -- declared here so the
             # namespace says the slot exists.
             briefing_offer=None,
+            # In-app face enrolment (jarvis/enrolrun.py). The OFFER is parked
+            # by Commander._h_face_enrol and answered by _try_enrol; the RUN
+            # is the live EnrolRun, which parks and unparks itself. Declared
+            # here so the namespace says both slots exist -- and so a box
+            # with no camera console still answers getattr with None rather
+            # than raising on the first "enrol my face".
+            enrol_offer=None,
+            enrol_run=None,
+            # The console's capture thread and its preview lease, published
+            # by ui.main_window once the pane is built. None on a headless
+            # box, which is what makes the in-app path refuse rather than
+            # reach for a camera nobody is holding.
+            preview_worker=None,
+            preview_lease=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
             # the one self-state sheet the courtesy and the readout share
@@ -2696,6 +2718,15 @@ class JarvisApp:
         if arm(key, place) is False:
             return False
         bus.publish(JarvisReply(text=question, speak=False))
+        # ARM THE MIC. This is a QUESTION Jarvis asked, and until 2026-09-02
+        # it was the only one that opened nothing: `_after_speech` starts a
+        # follow-up only on this flag, `Commander.ask_leave_time` arms just
+        # `_pending_leave` (the answering rung, patient for
+        # LEAVE_ANSWER_WINDOW_S), and no wake word follows a proactive line.
+        # At 08:56:15 he was asked "How long do you need to get to
+        # Wisenbaker, sir?", got no mic at all, and answered by TYPING 21 s
+        # later (live log: `handle 'about 10 minutes' source=typed`).
+        self._followup_after_speech = True
         self._say(question, proactive=True, kind="message")
         # ...and OPEN THE MIC THAT ANSWERS IT. Alone among every question
         # Jarvis asks, this one did not: on 2026-09-02 08:56:15 he asked
@@ -2867,6 +2898,20 @@ class JarvisApp:
                 return False
         return bool(ok)
 
+    def unset_option(self, key) -> bool:
+        """Remove a settings key entirely. True when the file was written.
+
+        The SENSORS page uses it to retire presence.desk_band_m /
+        presence.room_band_m once their bands have been carried into
+        zones.rooms: a superseded key left in the file looks exactly like a
+        live one.
+        """
+        try:
+            return bool(self.assistant.unset(key))
+        except Exception:
+            log.exception("unset_option %s failed", key)
+            return False
+
     def open_terminal(self, slug=None) -> bool:
         mgr = self.claude
         if mgr is None:
@@ -2993,6 +3038,22 @@ class JarvisApp:
         threading.Thread(target=self._partial_loop, name="partial",
                          daemon=True).start()
 
+    @property
+    def preview_probe(self) -> PreviewProbe:
+        """The ghost-card instrument (jarvis/previewprobe.py), built lazily.
+
+        Lazy, and with a class-level None default, for the same reason the
+        attributes above have one: _partial_loop is exercised on apps the
+        tests build with object.__new__, which never run __init__. An
+        instrument that raises on an uninitialised app would take down the
+        preview thread it is supposed to be watching.
+        """
+        probe = self._preview_probe
+        if probe is None:
+            probe = PreviewProbe(jsonl_path=PATHS.LOG_DIR / "previews.jsonl")
+            self._preview_probe = probe
+        return probe
+
     def _partial_loop(self):
         """Re-decode the growing buffer and publish PartialText; run the
         speculative decode once the user has paused (_maybe_speculate).
@@ -3046,6 +3107,13 @@ class JarvisApp:
                     audio = audio[-int(SAMPLE_RATE * self._PARTIAL_MAX_S):]
                 if audio is not None and len(audio) >= int(
                         SAMPLE_RATE * self._PARTIAL_MIN_S):
+                    # Count the decode BEFORE the publish filter below. The
+                    # gap between decodes and emissions is the number no
+                    # diagnosis of the 09-03 transcript spam could get: the
+                    # preview fires ~1/s for the whole capture, and only the
+                    # passes that CHANGED the card were ever visible at all.
+                    seconds = len(audio) / SAMPLE_RATE
+                    self.preview_probe.decoded(PATH_GREEDY)
                     try:
                         text = (self.transcriber.partial(audio) or "").strip()
                     except Exception:
@@ -3056,6 +3124,14 @@ class JarvisApp:
                     if text and text != last and self.recorder.recording:
                         last = text
                         self._partial_shown = True
+                        # Record the SHAPE of what is about to be shown.
+                        # This call cannot withhold the publish and its
+                        # result is deliberately ignored -- the cause of
+                        # the spam is unproven, and a preview filter built
+                        # on a guess is the 2026-08-31 confidence gate that
+                        # ate his commands, wearing a different hat.
+                        self.preview_probe.shown(text, path=PATH_GREEDY,
+                                                 audio_s=seconds)
                         bus.publish(PartialText(text=text))
                 # pace from the END of the decode, so a slow pass backs off
                 # instead of queueing up behind itself.
@@ -3069,6 +3145,7 @@ class JarvisApp:
             # is the last thread that should get to keep one on screen.
             if self._partial_shown:
                 self._partial_shown = False
+                self.preview_probe.retracted(PATH_GREEDY)
                 bus.publish(PartialText(text=""))
 
     # ------------------------------------------- speculative transcription
@@ -3095,6 +3172,7 @@ class JarvisApp:
     _speculation = None
     _spec_lock = threading.Lock()
     _partial_shown = False        # a ghost card is up and needs retracting
+    _preview_probe = None         # PreviewProbe, built on first use below
     _stop_event = None
     _wake_pending = False
     _turn_from_wake = False
@@ -3180,6 +3258,19 @@ class JarvisApp:
         if text and result.accepted and rec.recording:
             # The speculative text IS the best preview there is.
             self._partial_shown = True
+            # Instrumented too, though this path is already gated and
+            # already logged below: both paths publish the SAME PartialText
+            # event, so without the path tag a repeat on screen cannot be
+            # attributed to an emitter after the fact. That ambiguity is
+            # what cost the 09-03 diagnosis its confidence.
+            # getattr, not result.audio_seconds: the probe's methods swallow
+            # their own exceptions, but ARGUMENT evaluation happens first,
+            # and `result` here is duck-typed by callers and tests. An
+            # instrument is not allowed to be the thing that breaks the
+            # decode path it is measuring.
+            self.preview_probe.shown(
+                text, path=PATH_SPECULATIVE,
+                audio_s=getattr(result, "audio_seconds", None))
             bus.publish(PartialText(text=text))
         log.debug("speculative decode at last_speech=%.2fs took %.2fs (%s)",
                   key, spec.finished - spec.started,
@@ -3632,6 +3723,19 @@ class JarvisApp:
                     return self._window_setting("quiz.window_s", 15.0)
             except (TypeError, ValueError, KeyError):
                 pass
+        # "How long do you need to get to Wisenbaker, sir?" -- same shape,
+        # and checked HERE rather than in `_question_open` for the same
+        # reason as the debrief: `Commander.ask_leave_time` calls
+        # `question_open()` as its own do-not-ask guard, so a leave question
+        # listed there would stand down from its own answer. A walk duration
+        # is said after a pause to think about it, not inside 4 s.
+        leave = getattr(commander, "_pending_leave", None)
+        if isinstance(leave, tuple) and len(leave) == 3:
+            try:
+                if time.monotonic() - float(leave[2]) <= LEAVE_ANSWER_WINDOW_S:
+                    return self._window_setting("quiz.window_s", 15.0)
+            except (TypeError, ValueError):
+                pass
         if self._question_open(commander):
             return self._window_setting("quiz.window_s", 15.0)
         return None
@@ -4018,6 +4122,17 @@ class JarvisApp:
         # sir (24/24 measured), and catching it would mean rewriting at the
         # TTS door, which is the thing this design does not do. So the
         # burst keeps exactly one sir of its own and the reply keeps its.
+        # A briefing that is being DELIVERED retires any parked offer of one.
+        # 2026-09-04 15:06: the model answered his briefing inside a compound
+        # question, the arrival offer from 14:44 then asked "Shall I run your
+        # briefing, sir?", he said yes, and the calendar and the lab were read
+        # to him a second time. The offer rung only ever cleared itself when
+        # it was answered; nothing cleared it when the thing it offered had
+        # already happened.
+        try:
+            self.services.briefing_offer = None
+        except Exception:  # noqa: BLE001 - no services, nothing parked
+            pass
         say_in_burst("Your briefing for today, sir.")
         # arc.greeting_word, not the literal "morning": every delivery in
         # the two retained logs (08-31 14:33, 09-01 15:00, 09-02 14:29)
@@ -5113,9 +5228,18 @@ class JarvisApp:
         """Publish a CommandResult's reply/status. Shared by _dispatch and the
         uncertain-prompt answer, so a YES there runs and SPEAKS exactly like a
         command that had been understood the first time."""
-        if result.reply:
-            bus.publish(JarvisReply(text=result.reply, speak=result.speak))
-            if result.speak:
+        # `display_only` is SHOWN and never SPOKEN (commander.CommandResult):
+        # the spoken text below stays exactly `result.reply`, and only the
+        # published/displayed text carries the extra line. The clipboard
+        # hand-over depends on this -- the command must reach the transcript
+        # every time, whether or not the clipboard took it.
+        extra = getattr(result, "display_only", None)
+        if result.reply or extra:
+            shown = result.reply or ""
+            if extra:
+                shown = "%s\n%s" % (shown, extra) if shown else str(extra)
+            bus.publish(JarvisReply(text=shown, speak=result.speak))
+            if result.speak and result.reply:
                 if getattr(result, "ack", False):
                     # "Looking that up, sir." is speech, not the answer: the
                     # turn ledger records it as a filler and keeps waiting.
@@ -5409,6 +5533,21 @@ class JarvisApp:
             self.uncertain_answer(rid, answer, source="voice")
         except Exception:
             log.exception("uncertain follow-up failed")
+
+    def _uncertain_open(self) -> int:
+        """Commander hook: how many "Was that for me?" cards are still up.
+
+        One prompt at a time by construction (_on_uncertain supersedes the
+        last), so this is 0 or 1 -- but it is counted rather than asserted,
+        because the pane counts CARDS and the commander speaks a number.
+
+        Easy to be non-zero with nobody at fault: _ask_uncertain returns
+        without publishing UncertainResolved when the 5 s window hears
+        nothing, when the transcript is refused, or when there is no mic,
+        so the card sits there waiting for a click that may never come.
+        """
+        with self._uncertain_lock:
+            return len(getattr(self, "_pending_uncertain", ()) or ())
 
     def _claim_uncertain(self, yes: bool) -> bool:
         """Commander hook: a spoken "that was for you" / "that wasn't for
@@ -5876,11 +6015,24 @@ class JarvisApp:
         # his first turn, and the prewarm and gc.freeze below land ~0.85 s
         # later because of it. The hotword is already listening by now
         # (start_background runs before start_models), so warmup() gives way
-        # to a real turn rather than making it wait -- see its docstring.
-        try:
-            self.transcriber.warmup()
-        except Exception:
-            log.exception("whisper warm-up failed")
+        # to a decode already in flight, and a turn that lands INSIDE the
+        # warm-up waits for the rest of it -- at most one ~0.85 s silent
+        # decode, then decodes warm (its docstring has the real bound). The
+        # one ordering the transcriber cannot see from inside is a capture
+        # already open when this line is reached: its decode is seconds
+        # away and would only queue behind the throwaway one, so the
+        # warm-up is skipped and that turn pays the cold decode it would
+        # have paid anyway, minus the wait (F49).
+        rec = getattr(self, "recorder", None)
+        busy = getattr(self, "_audio_busy", None)
+        if getattr(rec, "recording", False) or (busy is not None
+                                                and busy.is_set()):
+            log.info("whisper warm-up skipped: a capture is in flight")
+        else:
+            try:
+                self.transcriber.warmup()
+            except Exception:
+                log.exception("whisper warm-up failed")
         # Honest failure for the speakers: with only a dummy/null sink the
         # playback chain "succeeds" into silence (seen on this machine with
         # no HDMI audio device attached).

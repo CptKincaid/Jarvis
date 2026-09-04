@@ -47,7 +47,7 @@ from jarvis.events import BoardUpdate, bus
 from jarvis.logs import get_logger
 from jarvis.ui import theme
 from jarvis.ui.ambient import hud_bracket_points, hud_frame_points, tracked
-from jarvis.ui.widgets import ellipsize, px, ui_display, ui_mono
+from jarvis.ui.widgets import ellipsize, px, ui_display, ui_font, ui_mono
 
 log = get_logger("ui.board")
 
@@ -154,6 +154,27 @@ def rows_that_fit(rows, height: int, row_h: int, head_h: int) -> list:
     room = int(height) - int(head_h)
     n = max(0, room // max(1, int(row_h)))
     return list(rows or [])[:n]
+
+
+# What an EMPTY panel says (2026-09-03, ui-polish U15). Measured on the
+# 09-03 shot 15-board: FOCUS with no rows was a bare frame, and a bare
+# frame is indistinguishable from a panel whose feed never arrived. One
+# muted line turns a blank into a state, per panel key; anything unnamed
+# gets the generic line.
+EMPTY_PANEL_TEXT = {
+    "focus": "nothing in focus",
+    "sessions": "no sessions",
+    "deadlines": "nothing due",
+    "turns": "no turns yet",
+    "vitals": "no readings",
+    "quiet": "not in quiet hours",
+}
+EMPTY_PANEL_DEFAULT = "nothing to show"
+
+
+def empty_panel_text(key: str) -> str:
+    """The one-line statement for a panel with no rows and no spark (pure)."""
+    return EMPTY_PANEL_TEXT.get(str(key or ""), EMPTY_PANEL_DEFAULT)
 
 
 # ---------------------------------------------------- borderless toplevel
@@ -414,6 +435,12 @@ class BoardWindow:
         vf = ui_mono(theme.SIZE_CAPTION)
         budget = max(px(40), w - 2 * pad - px(70))
         rows = rows_that_fit(panel.rows, h - head, px(ROW_H), px(12))
+        if not rows and not panel.spark and theme.LOOK == "holo":
+            # an empty slab states its emptiness (U15); classic stays bare
+            c.create_text(x + pad, y + head + px(12), anchor="w",
+                          text=empty_panel_text(panel.key), fill=theme.MUTED,
+                          font=ui_font(theme.SIZE_CAPTION))
+            return
         for i, (label, value) in enumerate(rows):
             ry = y + head + px(12) + i * px(ROW_H)
             if ry > y + h - px(4):

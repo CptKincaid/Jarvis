@@ -271,6 +271,12 @@ def _derive(name: str) -> None:
         "working":   t["CYAN_DIM"],   # a Claude task is running
         "error":     t["ERR"],
         "offline":   t["FAINT"],
+        # 2026-09-03 (ui-polish U05/U07): the boot pill and the ringing
+        # alarm. FAINT for loading -- the lamp is not lit yet -- and amber
+        # for the alarm, which is the semantic budget's one loud colour
+        # short of a fault (ERR stays the error state's).
+        "loading":   t["FAINT"],
+        "alarm":     t["WARN"],
     }
 
     globals().update(t)
@@ -386,6 +392,40 @@ def resolve_fonts(root=None) -> str:
             break
     _HAS_DISPLAY = _DISPLAY is not None
     return _FAMILY
+
+
+# ---- caption tracking rule (2026-09-03, ui-polish U16) -------------------
+# Tk has no letter-spacing, so the holo captions are tracked by hand
+# ('JARVIS' -> 'J A R V I S'). The 09-03 panel found two tracking styles
+# sharing one caption face with no rule for which is which -- tracked
+# 'J A R V I S' 40 px above untracked 'WEATHER / CALENDAR / DUE' inside one
+# briefing card. THE RULE: a label that names a SURFACE (the wordmark, a
+# card's speaker, a board panel or settings section title, the camera pane's
+# head) is tracked; a label that names a ROW inside one (a briefing key, a
+# board row key, a footer segment, a readout line) is plain. Classic tracks
+# nothing (the 08-31 console, token for token).
+#
+# Applied 2026-09-04 to the last two row-key sites that still tracked: the
+# reactor's engine-card keys and LOAD readout (reactor.py _draw_card /
+# _draw_holo_decor) and the ambient slab's row keys (ambient.py _draw_rows /
+# _draw_framed_rows); tests/test_ui_chrome.py draws both on a fake canvas.
+
+
+def tracked_caps(text: str) -> str:
+    """'Voice ID' -> 'V O I C E   I D': one space between glyphs, an inner
+    space becomes three (the reactor/ambient spelling, which keeps a
+    two-word label readable as two words)."""
+    return " ".join((text or "").strip().upper())
+
+
+def caption(text: str, surface: bool = True) -> str:
+    """The text a HUD caption is drawn with, per the rule above: tracked
+    caps for a surface label in holo, plain caps for a row label and for
+    everything in classic. Reads LOOK at call time."""
+    text = (text or "").strip().upper()
+    if surface and LOOK == "holo":
+        return tracked_caps(text)
+    return text
 
 
 def font(size: int, weight: str = "normal") -> tuple:

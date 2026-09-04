@@ -138,13 +138,15 @@ def test_defaults_match_spec_10_1():
     assert SECRET_KEYS == ("icloud.app_password", "gmail.app_password", "discord.bot_token",
                            "spotify.client_secret", "canvas.token", "phone.token")
     from jarvis.assistant_config import SECRET_LIST_FIELDS
-    # rooms.satellites[].password joined it on 2026-09-03 (F03). The satellite
+    # The satellite password joined it on 2026-09-03 (F03). The satellite
     # YAML already TOLD him it was in this tuple and "masked in logs and in
     # repr(cfg)" -- it was not, so repr(cfg) printed it in clear while the
     # same YAML explains that without that password the lease endpoints are
     # world-writable. This tripwire is why adding one is a deliberate act.
+    # It moved from rooms.satellites[] to presence.rooms[] on 2026-09-04
+    # when that became the one room list (F02).
     assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),
-                                  ("rooms.satellites", "password"))
+                                  ("presence.rooms", "password"))
     assert DEFAULTS["alerts"] == {"desktop": True, "discord": True, "claude_hooks": True}
     assert DEFAULTS["phrases"] == []
 
@@ -633,16 +635,17 @@ def test_a_satellite_password_is_masked_the_way_a_gmail_one_is():
     "masking is broken" but "this one field was never added to the list"."""
     cfg = ac.AssistantConfig({
         "gmail": {"accounts": [{"address": "a@b.c", "app_password": "gm-secret"}]},
-        "rooms": {"satellites": [{"name": "kitchen", "url": "http://10.0.0.9",
-                                  "username": "jarvis", "password": "sat-secret"}]},
+        "presence": {"rooms": [{"name": "kitchen", "url": "http://10.0.0.9",
+                                "sensors": ["radar"], "username": "jarvis",
+                                "password": "sat-secret"}]},
     })
     blob = repr(cfg)
     assert "gm-secret" not in blob
     assert "sat-secret" not in blob, "the satellite password reached repr(cfg)"
 
     red = cfg.redacted()
-    assert red["rooms"]["satellites"][0]["password"] == ac.MASK
-    assert red["rooms"]["satellites"][0]["username"] == "jarvis"   # not a secret
+    assert red["presence"]["rooms"][0]["password"] == ac.MASK
+    assert red["presence"]["rooms"][0]["username"] == "jarvis"   # not a secret
 
     vals = cfg.secret_values()
     assert "sat-secret" in vals and "gm-secret" in vals
@@ -656,7 +659,37 @@ def test_a_placeholder_satellite_password_is_not_treated_as_a_secret():
     scrubbing a placeholder would blank ordinary text that happens to contain
     it, and it protects nothing."""
     cfg = ac.AssistantConfig({
-        "rooms": {"satellites": [{"name": "kitchen", "url": "http://10.0.0.9",
-                                  "password": "CHANGE_ME_32_RANDOM_CHARS"}]},
+        "presence": {"rooms": [{"name": "kitchen", "url": "http://10.0.0.9",
+                                "password": "CHANGE_ME_32_RANDOM_CHARS"}]},
     })
     assert "CHANGE_ME_32_RANDOM_CHARS" not in cfg.secret_values()
+
+
+def test_unset_removes_a_key_rather_than_nulling_it(tmp_path):
+    """``set(key, None)`` leaves a null in the file, which is still a key.
+    Retiring a superseded setting needs it GONE -- a key nothing reads
+    looks exactly like one that drives something, which is how two zone
+    models disagreed for a day (jarvis/ui/sensors_page.py)."""
+    import json
+    from jarvis.assistant_config import AssistantConfig
+    path = tmp_path / "assistant.json"
+    cfg = AssistantConfig.load(path)
+    assert cfg.set("presence.desk_band_m", [2.25, 3.75])
+    assert cfg.get("presence.desk_band_m") == [2.25, 3.75]
+    assert cfg.unset("presence.desk_band_m") is True
+    assert cfg.get("presence.desk_band_m") is None
+    written = json.loads(path.read_text())
+    assert "desk_band_m" not in written["presence"]
+    assert "camera_overrules" in written["presence"]     # its neighbours stay
+
+
+def test_unset_of_a_key_that_is_not_there_is_not_an_error_and_not_a_write(tmp_path):
+    from jarvis.assistant_config import AssistantConfig
+    path = tmp_path / "assistant.json"
+    cfg = AssistantConfig.load(path)
+    assert cfg.save()
+    before = path.read_text()
+    for missing in ("presence.no_such_key", "no_such_section.key",
+                    "claude.model.deeper", "nothing"):
+        assert cfg.unset(missing) is False, missing
+    assert path.read_text() == before

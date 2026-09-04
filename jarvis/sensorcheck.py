@@ -27,6 +27,22 @@ writes from. A confirmed disagreement is one loud line naming the room,
 what the gates should be, what they are, in metres as well as gates, and
 the exact command that fixes it.
 
+VERIFIED AGAINST THE LIVE HARDWARE, 2026-09-03, read-only GETs::
+
+    office   192.168.50.51   profile range_m 3.0 still -> wants gate 4 / 4
+             device answered  move 4  still 4   -> ok   (171 ms, 2 requests)
+    kitchen  192.168.50.52   profile range_m 3.0 still -> wants gate 4 / 4
+             device answered  move 4  still 4   -> ok   (418 ms, 2 requests)
+
+So the paths that matter on a healthy box are measured: the entity names
+resolve, the bodies parse, the arithmetic agrees with the profile, and a
+matching device says nothing at all. THE MISMATCH PATH IS NOT MEASURED
+AGAINST HARDWARE and cannot honestly be: reproducing it means writing gate
+0 to his device, and the whole argument below is that this code does not
+write to his device. It is covered against the fake transport
+(tests/test_sensorcheck.py) and against the two numbers the failure
+actually produced.
+
 IT REPORTS. IT DOES NOT HEAL, and that is a decision rather than an
 omission:
 

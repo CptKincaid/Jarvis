@@ -4056,8 +4056,9 @@ model — the refusal only fires on an actual imperative.
   "enabled": false,
   "host": "",
   "user": "",
-  "key_path": "",
+  "key_path": "~/.ssh/hpcomputer",
   "name": "HPCOMPUTER",
+  "os": "windows",
   "socks_proxy": "127.0.0.1:1055",
   "inbox": "~/jarvis-inbox",
   "pull_dirs": {"outbox": "~/jarvis-outbox",
@@ -4069,19 +4070,38 @@ model — the refusal only fires on an actual imperative.
 
 * `enabled` ships **false**, and every door says exactly what is missing
   rather than opening a socket to find out.
-* `host` is HPCOMPUTER's tailnet name, `user` the account there, `key_path`
-  a key **ssh already owns** — Jarvis never reads it, only hands over its
-  path, so no new secret enters `assistant.json`.
-* `socks_proxy` is not a preference. tailscaled on the Spark runs
+* `host` is where HPCOMPUTER answers ssh: on this LAN that is
+  `192.168.50.114` (or `hpcomputer.local`), `user` the account there
+  (`h2pey`), `key_path` a key **ssh already owns** (`~/.ssh/hpcomputer`) —
+  Jarvis never reads it, only hands over its path, so no new secret enters
+  `assistant.json`. A blank `key_path` is refused out loud, not tried.
+* `socks_proxy` applies to a **tailnet** address only — a `*.ts.net` name,
+  a `100.x` address, or a bare MagicDNS name. tailscaled on the Spark runs
   `--tun=userspace-networking`, so there is no route to the tailnet at all
-  and everything goes through the daemon's own SOCKS5 port. Blank it only
-  if this box ever gets a real tun device.
+  and tailnet traffic goes through the daemon's own SOCKS5 port. For a LAN
+  address it is ignored, and so is the tailnet's view of the host: "is
+  HPCOMPUTER up" tries ssh and reports what ssh says. Leave it at the
+  default.
+* `os` is `windows` (shipped — HPCOMPUTER runs the built-in OpenSSH
+  Server, whose login shell is cmd.exe or PowerShell, and there is no
+  `ls`, `df` or `uptime` there) or `posix`. It picks the question list —
+  each row has a command per OS, the Windows ones a single
+  `powershell -Command "..."` — and how a folder is listed: over SFTP on
+  Windows, the same channel scp uses, so no shell is involved; a plain
+  `ls` on POSIX. If the far side answers "is not recognized as an internal
+  or external command" (or "command not found" the other way round),
+  Jarvis says which command it did not know and names this setting,
+  rather than the generic "wouldn't answer that". The Windows commands
+  have **not** been run against HPCOMPUTER yet — the first live one is
+  yours.
 * `inbox` is the **only** folder a push can land in, and `pull_dirs` the
   only ones a pull may read. Speech never names a remote path: the spoken
   words pick a *key* ("desktop"), never a directory.
-* The paths may start with `~`; Jarvis writes them the two different ways
-  the far side needs (`$HOME` for a shell, home-relative for scp). Do not
-  quote them yourself.
+* The paths may start with `~`, which scp and SFTP read against the login
+  home on both OSes (`C:\Users\h2pey` on HPCOMPUTER); on Windows a
+  backslash is written as a slash for you. Jarvis writes them the
+  different ways the far side needs (`$HOME` for a POSIX shell,
+  home-relative for scp/SFTP). Do not quote them yourself.
 * A local file whose *name* contains a shell character (a backtick, a
   semicolon, a newline) is refused rather than escaped, in both directions.
 

@@ -1258,9 +1258,16 @@ def test_nothing_reads_a_zones_key_around_the_validator():
     # as an answer, so the fix is only a fix while there is one reader.
     import pathlib
     import re
-    dotted = re.compile(r"""get\(\s*["']zones""")
+    dotted = re.compile(r"""get(?:_option)?\(\s*["']zones""")
     root = pathlib.Path(zn.__file__).resolve().parents[1]
-    for name in ("jarvis/zones.py", "scripts/zone_log.py"):
+    # jarvis/ui/sensors_page.py joined the list on 2026-09-03: it is the
+    # second consumer of this section and, unlike the log, it WRITES it.
+    # A writer needs the rooms list as the file holds it, and it takes that
+    # from ZonesConfig.raw_rooms rather than reading the key itself --
+    # otherwise the page is a second door onto the same section, which is
+    # the shape of every bug in this file's history.
+    for name in ("jarvis/zones.py", "scripts/zone_log.py",
+                 "jarvis/ui/sensors_page.py"):
         text = (root / name).read_text(encoding="utf-8")
         assert not dotted.search(text), name     # no cfg.get("zones.x")
     source = (root / "jarvis/zones.py").read_text(encoding="utf-8")

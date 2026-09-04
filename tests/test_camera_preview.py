@@ -25,6 +25,7 @@ from jarvis import campreview as cp
 from jarvis.ui import preview as pv
 from jarvis.ui import theme
 from jarvis.ui.console_mode import ACTIVE, AMBIENT, STANDBY
+from jarvis.ui import main_window as main_window_mod
 from jarvis.ui.main_window import MainWindow
 from jarvis.ui.preview import CameraPreview
 from jarvis.ui.widgets import get_scale, px, set_scale
@@ -649,23 +650,31 @@ def test_the_same_chip_at_the_same_place_is_not_re_set_or_re_measured():
 def test_a_chip_shifted_off_the_edge_is_put_back_when_the_shift_goes():
     """A cached placement puts nothing down, so the item stays where the
     LAST frame's edge shift moved it. The shift is tracked so the next frame
-    that needs none puts the word back under its ground."""
+    that needs none puts the word back under its ground.
+
+    Driven DIRECTLY (P05): an earlier version of this test painted a face
+    at the edge twice and asserted the word sat on its ground, which was
+    true on both paints because the shift was still -61 -- the branch it
+    was named for was never reached. Here the placement is a cache hit
+    for a centred face that needs no shift, and the item has been left
+    where a previous frame's shift moved it."""
     ns = pane()
-    edge = face(x=1200, y=50, w=80, h=80, name="hunter", id_score=0.74,
-                id_ran=True)
-    paint(ns, live(edge))
-    shifted = ns.canvas.coords_of["name"][0]
-    assert shifted < ns.canvas.coords_of["b0"][0]        # it moved left
-    # The same chip, same anchor point, but the picture is now wider than
-    # the box fit allowed before: no shift is needed, and the item must be
-    # placed at the unshifted x rather than left where the shift put it.
-    ns._name_last = ((ns._name_last[0][0], ns._name_last[0][1],
-                      ns._name_last[0][2]), ns._name_last[1])
-    ns._fit = (0, 0, ns._box[0] * 4, ns._box[1])
-    paint(ns, live(edge))
-    x = ns.canvas.coords_of["name"][0]
+    centred = face(x=400, y=200, w=200, h=200, name="hunter", id_score=0.74,
+                   id_ran=True)
+    paint(ns, live(centred))                     # measured and cached
+    x, y = ns.canvas.coords_of["name"][:2]
+    assert ns._name_shift == 0                   # no shift needed here
+    ns._name_shift = -61                         # …but the last frame had one
+    ns.canvas.coords("name", x - 61, y)          # and left the item there
+    measured = len([c for c in ns.canvas.calls
+                    if c[0] == "name" and "text" in c[1]])
+    paint(ns, live(centred))
+    assert len([c for c in ns.canvas.calls
+                if c[0] == "name" and "text" in c[1]]) == measured  # a hit
+    assert ns.canvas.coords_of["name"][0] == x   # put back under its ground
+    assert ns._name_shift == 0
     bg = ns.canvas.coords_of["namebg"]
-    assert bg[0] <= x <= bg[2]                           # word on its ground
+    assert bg[0] <= x <= bg[2]
 
 
 def test_no_ground_means_no_word():
@@ -958,16 +967,60 @@ class FakeWorker:
         self.joined.append(join)
 
 
-def window(mode=ACTIVE, enabled=True):
+def window(mode=ACTIVE, enabled=True, lease=False):
+    """A stand-in for the console, carrying exactly the state
+    ``_preview_apply`` reads.
+
+    ``lease`` is the in-app enrolment's claim on the capture (2026-09-04,
+    jarvis/enrolrun.py). It defaults to False, which is the state every test
+    below was written against, so they all still say what they always said.
+    """
     ns = SimpleNamespace(
         preview=FakePane(), preview_worker=FakeWorker(),
         modes=SimpleNamespace(mode=mode), _preview_shown=False,
+        _preview_lease=bool(lease), _preview_lease_at=0.0,
         _console_option=lambda key, default=None:
             enabled if key == cp.OPTION_ENABLED else default)
     ns._preview_enabled = lambda: MainWindow._preview_enabled(ns)
+    ns._preview_lease_live = lambda: MainWindow._preview_lease_live(ns)
     ns._preview_apply = lambda m=None, enabled=None: \
         MainWindow._preview_apply(ns, m, enabled)
     return ns
+
+
+def test_an_enrolment_lease_keeps_the_capture_through_the_ambient_edge():
+    """THE 45-SECOND EDGE. pane_visible is ACTIVE-only, so a run that took
+    ninety seconds would have the camera taken away underneath it the moment
+    the console went quiet. The lease is what stops that."""
+    ns = window(lease=True)
+    ns._preview_apply(STANDBY)
+    assert ns.preview_worker.stops == 0
+    assert ns.preview_worker.starts >= 1
+    assert ns._preview_shown is True         # and the pane is SHOWN for it
+
+
+def test_a_lease_beats_the_camera_preview_toggle_being_off():
+    """He can enrol without having the preview pane switched on -- but the
+    pane is shown while it happens, because a capture behind a hidden pane is
+    exactly what _preview_apply exists to prevent."""
+    ns = window(enabled=False, lease=True)
+    ns._preview_apply()
+    assert ns.preview_worker.stops == 0
+    assert ns.preview_worker.started_with == [True], \
+        ns.preview_worker.started_with
+    assert ns._preview_shown is True
+
+
+def test_an_expired_lease_gives_the_camera_back_even_without_the_timer():
+    """The wall-clock cap is re-checked on every apply, so a dropped Tk
+    ``after`` cannot leave the lens open for a wedged enrolment thread."""
+    import time as _time
+    ns = window(mode=STANDBY, enabled=False, lease=True)
+    ns._preview_lease_at = _time.monotonic() - (
+        main_window_mod.PREVIEW_LEASE_MAX_S + 1)
+    ns._preview_apply()
+    assert ns._preview_lease is False
+    assert ns.preview_worker.stops == 1
 
 
 def test_going_to_standby_hides_the_pane_and_stops_the_capture():
@@ -1134,3 +1187,81 @@ def test_no_function_in_the_pane_hands_a_picture_back_out():
     assert "return self._photo" not in source
     assert not re.search(r"def \w+\([^)]*\)\s*->\s*(Image|ImageTk)", source)
     assert "shot.image" in source                # it is only ever handed on
+
+
+# -------------------------------------- the draw stage is posted back (09-04)
+def test_a_live_repaint_posts_its_own_cost_to_the_worker_as_a_number():
+    """The one stage the capture thread cannot time. After a live shot is
+    painted the pane tells the worker how long the repaint took, so the
+    once-a-minute ``campreview:`` line carries ``draw`` beside ``grab`` --
+    a slow pane and a slow camera become two columns, not one complaint."""
+    ns = pane()
+    ns._paint = lambda shot: None
+    posted = []
+    ns.worker = SimpleNamespace(latest=lambda: live(face()),
+                                note_stage=lambda n, ms: posted.append((n, ms)))
+    CameraPreview.refresh(ns)
+    assert len(posted) == 1
+    name, ms = posted[0]
+    assert name == "draw"
+    assert isinstance(ms, float) and ms >= 0.0
+    CameraPreview.refresh(ns)                    # same seq: no repaint, no post
+    assert len(posted) == 1
+
+
+def test_a_shot_that_is_not_live_posts_no_draw_time():
+    ns = pane()
+    ns._paint = lambda shot: None
+    posted = []
+    ns.worker = SimpleNamespace(
+        latest=lambda: cp.blank(cp.REASON_DISABLED, seq=7),
+        note_stage=lambda n, ms: posted.append((n, ms)))
+    CameraPreview.refresh(ns)
+    assert posted == []
+
+
+def test_a_worker_without_the_hook_is_painted_and_left_alone():
+    ns = pane()
+    painted = []
+    ns._paint = lambda shot: painted.append(shot)
+    ns.worker = SimpleNamespace(latest=lambda: live(face()))   # no note_stage
+    CameraPreview.refresh(ns)                    # must not raise
+    assert len(painted) == 1
+
+
+def test_a_hook_that_raises_costs_the_number_not_the_picture():
+    ns = pane()
+    painted = []
+    ns._paint = lambda shot: painted.append(shot)
+
+    def angry(_n, _ms):
+        raise RuntimeError("the worker is gone")
+    ns.worker = SimpleNamespace(latest=lambda: live(face()), note_stage=angry)
+    CameraPreview.refresh(ns)                    # must not raise
+    assert len(painted) == 1
+
+
+# ------------------------------------------ a detector that could not look
+def _live_without_faces(detail):
+    return cp.PreviewShot(image=object(), faces=(), cap_w=1280, cap_h=720,
+                          reason=cp.REASON_LIVE, detail=detail, seq=1)
+
+
+def test_a_detector_that_could_not_look_is_not_printed_as_an_empty_room():
+    """F56. "I could not look" and "nobody is there" need opposite responses
+    from him, and the pane printed both as NO FACE IN FRAME / FACES 0."""
+    shot = _live_without_faces(cp.DETAIL_DETECTOR_FAILED + "RuntimeError")
+    assert pv.attention_line(shot) == (pv.ATTEND_FAILED, pv.TONE_OFF)
+    assert pv.readout_rows(shot)[0] == ("FACES", "")       # not measured
+    c = paint(pane(), shot)
+    assert c.state["verdict"]["text"] == pv.ATTEND_FAILED
+    assert c.shown("img")                                  # the picture stays
+
+
+def test_a_missing_detector_is_not_printed_as_an_empty_room_either():
+    shot = _live_without_faces("no face detector")
+    assert pv.attention_line(shot) == (pv.ATTEND_NO_DETECTOR, pv.TONE_OFF)
+    assert pv.readout_rows(shot)[0] == ("FACES", "")
+    # …and a genuinely empty room still counts to zero.
+    assert pv.attention_line(live()) == (pv.ATTEND_NONE, pv.TONE_AWAY)
+    assert pv.readout_rows(live())[0] == ("FACES", "0")

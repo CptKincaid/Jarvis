@@ -743,6 +743,65 @@ def test_a_degraded_sidecar_is_refused_without_waiting_on_systemd(
     finally:
         srv.close()
 
+WORKER_GONE_PING = {"ok": True, "ready": False, "graphs": True,
+                    "detail": ALL_GRAPHS, "error": bs.WORKER_GONE, "config": {}}
+
+
+def test_a_sidecar_whose_render_thread_died_is_refused_at_once_and_named(
+        sock_path, no_spawn, monkeypatch, caplog):
+    """The server answers ready:false, graphs:true, error=WORKER_GONE once
+    its render thread has died (test_a_dead_render_worker_makes_the_sidecar_
+    not_ready). The only 'degraded' branch here was keyed on graphs, so that
+    reply fell through: the speak path logged 'active but not answering yet
+    (it loads for ~30 s ...)' for a sidecar that had answered in under a
+    millisecond, the warm thread polled it for the whole startup budget
+    (measured with 3 s standing in for 90: 8 pings, then 'did not answer'),
+    and the error text was never logged.
+
+    Any answer that is not ready is TERMINAL for that process -- the socket
+    is bound only after load and capture -- so it is refused at once, once,
+    with its reason."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active",
+                        lambda: pytest.fail("must not ask systemd"))
+    srv = FakeSidecar(sock_path, sidecar_handler([], ping=WORKER_GONE_PING))
+    try:
+        with caplog.at_level("ERROR", logger="jarvis.tts"):
+            started = time.monotonic()
+            assert tts_mod._ensure_breeze_server() is False
+            assert tts_mod._ensure_breeze_server(startup_timeout=10) is False
+        assert time.monotonic() - started < 2.0
+        assert len([r for r in srv.requests if r.get("ping")]) == 2
+    finally:
+        srv.close()
+    assert any(bs.WORKER_GONE in r.getMessage() for r in caplog.records)
+    assert not any("not answering yet" in r.getMessage()
+                   for r in caplog.records)
+
+
+def test_a_sidecar_that_comes_up_not_ready_during_the_wait_ends_the_wait(
+        sock_path, no_spawn, monkeypatch):
+    """The same reply landing mid-wait: the unit was active with no socket,
+    the warm thread was polling, and the socket that then appears answers
+    not-ready (its capture failed). Polling it for the rest of the budget
+    bought nothing but a late fallback."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: True)
+    holder = {}
+
+    def _late():
+        time.sleep(0.3)
+        holder["srv"] = FakeSidecar(sock_path, sidecar_handler(
+            [], ping={"ok": True, "ready": False, "graphs": False,
+                      "error": "CUDA graphs were not captured"}))
+
+    threading.Thread(target=_late, daemon=True).start()
+    started = time.monotonic()
+    try:
+        assert tts_mod._ensure_breeze_server(startup_timeout=10) is False
+        assert time.monotonic() - started < 3.0
+    finally:
+        wait_until(lambda: "srv" in holder)
+        holder["srv"].close()
+
 
 def test_an_activating_unit_is_waited_for_never_raced(sock_path, no_spawn,
                                                       monkeypatch):
@@ -1297,6 +1356,86 @@ def test_a_refusal_before_any_audio_renders_that_chunk_on_f5(breeze, sock_path):
     assert breeze.cache.get(breeze._cache_key("breeze", "Good evening, sir.")) is None
 
 
+FOUR_SENTENCES = ("I'm afraid the processing of your request took a moment "
+                  "longer than expected, sir. It seems my new voice is still "
+                  "finding its footing. The inbox is quiet, for once, and the "
+                  "calendar shows nothing before noon tomorrow. I shall let "
+                  "you know if that changes, sir.")
+
+
+def test_a_chunk_that_falls_back_to_f5_gets_f5s_own_text(breeze, sock_path):
+    """The chunk was prepared for BREEZE: no short-line pad
+    (_ENGINE_NEEDS_SHORT_PAD["breeze"] is False; the floor it works around
+    is F5's) and Breeze's self-normalising rule set (no "6:00 pm" -> "six
+    pee em"). When the sidecar refused it before audio, _fallback_chunk
+    handed that same text to F5, which rendered a 14-byte line with no pad
+    -- the measured floor case, "said buy milk really fast", 0.55-1.29 s
+    short -- and raw clock digits F5 was never listened to on, and filed
+    the audio under a key no native F5 reply looks up.
+
+    F5 now gets the text its own rules were measured on: the pad first,
+    then F5's rules over the Breeze form, which matched the native F5 form
+    on 17 of 17 of his real lines (calendar, rooms, clock times, shouted
+    course codes, terse acks) -- so the cache key is the native one too."""
+    srv = FakeSidecar(sock_path, sidecar_handler(
+        [], refuse="not ready (CUDA graphs were not captured)"))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (
+            f5.append(text), open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak("It is 6:00 pm.", block=True)
+    finally:
+        srv.close()
+    want = TTS(engine="f5", cache=False).spoken_form("It is 6:00 pm.")
+    assert want == "It is six pee em, sir."      # the pad AND the meridiem rule
+    assert f5 == [want]
+    assert breeze.cache.get(breeze._cache_key("f5", want)) is not None
+    assert breeze.cache.get(breeze._cache_key("f5", "It is 6:00 pm.")) is None
+    assert breeze.cache.get(breeze._cache_key("breeze", "It is 6:00 pm.")) is None
+
+
+def test_a_refused_reply_is_rendered_in_f5s_own_chunks_and_cached_as_such(
+        breeze, sock_path):
+    """Since the join a Breeze chunk is the whole reply, so the fallback
+    handed F5 one 260-character render: one cache entry under a key that a
+    native F5 reply -- split at 240, sentence by sentence -- would never
+    look up, and ~2 s to its first byte where the first sentence alone is
+    ~0.5 s (F5 renders at RTF 0.063). F5 now gets its own split, each piece
+    looked up and filed exactly as a native F5 utterance would be, so the
+    next time the room says any of it on F5 it is on disk."""
+    srv = FakeSidecar(sock_path, sidecar_handler([], refuse="not ready"))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (
+            f5.append(text), open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak(FOUR_SENTENCES, block=True)
+    finally:
+        srv.close()
+    want = TTS(engine="f5", cache=False).render_chunks(FOUR_SENTENCES)
+    assert len(want) >= 3, want
+    assert f5 == want
+    assert len(FakeProc.spawned) == len(want)          # every piece, in order
+    assert all(breeze._cached("f5", piece) for piece in want)
+    assert breeze.cache.stats()["files"] == len(want)
+
+
+def test_a_fallback_piece_already_on_disk_is_not_rendered_again(breeze,
+                                                                sock_path):
+    """A line the room has said on F5 before is a hit for the fallback too --
+    the whole point of filing it under the native key."""
+    srv = FakeSidecar(sock_path, sidecar_handler([], refuse="not ready"))
+    f5 = []
+    try:
+        breeze._synth_f5 = lambda text, out: (
+            f5.append(text), open(out, "wb").write(wav_bytes(0.1)))
+        breeze.speak("Good evening, sir.", block=True)
+        breeze.speak("Good evening, sir.", block=True)
+    finally:
+        srv.close()
+    assert f5 == ["Good evening, sir."]               # rendered once
+    assert len(FakeProc.spawned) == 2                 # played twice
+
+
 def test_a_failure_mid_stream_is_not_re_spoken_and_is_not_cached(breeze,
                                                                  sock_path):
     """Half a sentence has already been heard. Re-rendering it on F5 would
@@ -1430,12 +1569,17 @@ def test_a_refusal_on_the_second_chunk_does_not_re_speak_the_first(
     finally:
         srv.close()
     assert seen == TWO_CHUNKS                   # breeze was asked for both
-    assert f5 == [TWO_CHUNKS[1]]                # F5 rendered ONLY the second
-    assert len(FakeProc.spawned) == 2           # two players, one per sentence
+    # F5 rendered ONLY the second -- as its own pieces (TTS._refit), which
+    # here are four identical sentences: one render, three cache hits, four
+    # players. Not a word of sentence 1 reached it.
+    pieces = breeze._split_sentences(TWO_CHUNKS[1], engine="f5")
+    assert f5 == pieces[:1]
+    assert len(FakeProc.spawned) == 1 + len(pieces)
     assert bytes(FakeProc.spawned[0].fed).endswith(first)
     # each sentence filed under the engine that RENDERED it
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[0])) is not None
-    assert breeze.cache.get(breeze._cache_key("f5", TWO_CHUNKS[1])) is not None
+    assert all(breeze.cache.get(breeze._cache_key("f5", p)) is not None
+               for p in pieces)
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[1])) is None
     assert breeze.engine == "breeze"            # one bad chunk does not retire it
 
@@ -1467,12 +1611,14 @@ def test_a_cut_first_chunk_keeps_its_heard_half_and_recovers_the_rest(
     assert seen == TWO_CHUNKS
     pieces = breeze._split_sentences(TWO_CHUNKS[0], engine="f5")
     # a COUNT, because these 13 sentences are deliberately identical: what
-    # is asserted is how much came back, not which words
-    assert 0 < len(f5) < len(pieces), "the unheard tail was dropped"
-    assert f5 == pieces[len(pieces) - len(f5):], "and only the tail, in order"
-    assert len(f5) <= len(pieces) // 2, "half of it was HEARD; do not repeat it"
-    # chunk 1's cut audio, then its recovered tail, then chunk 2
-    assert len(FakeProc.spawned) == 2 + len(f5)
+    # is asserted is how much came back, not which words. Identical also
+    # means the fallback renders the tail ONCE and replays it from the cache
+    # (TTS._refit looks each piece up first), so the count is of PLAYERS:
+    # chunk 1's cut audio, then the recovered tail, then chunk 2.
+    recovered = len(FakeProc.spawned) - 2
+    assert 0 < recovered < len(pieces), "the unheard tail was dropped"
+    assert f5 == pieces[:1], "and only the tail's text, rendered once"
+    assert recovered <= len(pieces) // 2, "half of it was HEARD; do not repeat it"
     assert bytes(FakeProc.spawned[0].fed).endswith(first[:len(first) // 2])
     assert bytes(FakeProc.spawned[-1].fed).endswith(second)
     # the truncated one is not cached; the whole one is; the tail is filed
@@ -1541,10 +1687,13 @@ def test_a_wedged_sidecar_mid_chunk_is_not_re_spoken_either(
     assert seen == TWO_CHUNKS
     pieces = breeze._split_sentences(TWO_CHUNKS[0], engine="f5")
     # a COUNT, because these 13 sentences are deliberately identical: what
-    # is asserted is how much came back, not which words
-    assert 0 < len(f5) <= len(pieces) // 2, "the heard half was re-rendered"
-    assert f5 == pieces[len(pieces) - len(f5):], "only the unheard tail"
-    assert len(FakeProc.spawned) == 2 + len(f5), "chunk 2 was dropped"
+    # is asserted is how much came back, not which words -- and, being
+    # identical, the tail is one F5 render replayed from the cache, so the
+    # count is of PLAYERS (see the cut-chunk test above).
+    recovered = len(FakeProc.spawned) - 2
+    assert 0 < recovered <= len(pieces) // 2, "the heard half was re-rendered"
+    assert f5 == pieces[:1], "only the unheard tail's text, rendered once"
+    assert bytes(FakeProc.spawned[-1].fed).endswith(second), "chunk 2 was dropped"
     assert bytes(FakeProc.spawned[0].fed).endswith(first[:len(first) // 2])
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[0])) is None
     assert breeze.cache.get(breeze._cache_key("breeze", TWO_CHUNKS[1])) is not None
@@ -1590,10 +1739,16 @@ def test_the_sidecar_dying_between_two_sentences_finishes_the_reply_on_f5(
     finally:
         srv.close()
     assert seen == [TWO_CHUNKS[0]]
-    assert f5 == [TWO_CHUNKS[1]], "the rest of the reply was dropped"
-    assert len(FakeProc.spawned) == 2
+    # All of chunk 2, once, in order -- as F5's OWN pieces: the fallback
+    # re-splits a Breeze chunk the way a native F5 reply is split and files
+    # each piece under the key that reply would look up (TTS._refit). Four
+    # identical sentences here, so one render, three cache hits, four
+    # players after chunk 1's.
+    pieces = breeze._split_sentences(TWO_CHUNKS[1], engine="f5")
+    assert f5 == pieces[:1], "the rest of the reply was dropped"
+    assert len(FakeProc.spawned) == 1 + len(pieces)
     assert bytes(FakeProc.spawned[0].fed).endswith(first)   # said once, whole
-    assert breeze.cache.get(breeze._cache_key("f5", TWO_CHUNKS[1])) is not None
+    assert breeze.cache.get(breeze._cache_key("f5", pieces[0])) is not None
 
 
 def test_the_phone_falls_back_to_f5_when_the_sidecar_is_gone(tmp_path,
@@ -1628,6 +1783,44 @@ def test_the_phone_falls_back_to_f5_when_the_sidecar_is_gone(tmp_path,
     # filed under F5, so the room does not later replay it as Breeze
     assert t.cache.get(t._cache_key("f5", "Good evening, sir.")) is not None
     assert t.cache.get(t._cache_key("breeze", "Good evening, sir.")) is None
+
+
+def test_a_phone_reply_during_a_breeze_outage_hands_f5_its_own_chunks(
+        tmp_path, monkeypatch):
+    """Rendition plans its chunks under render_engine() == breeze -- ONE
+    chunk, the join. stream() then calls load(), which falls back to F5
+    because the sidecar is gone, and _replan() re-read the cache under the
+    new engine but kept the SAME chunk list. F5 is a whole-chunk engine, so
+    the phone waited for a whole-reply F5 render before webapp could send
+    its status line (~2-3 s for a capped reply against ~0.5 s for the first
+    sentence), and the render was stored under an F5 key for text the
+    room's F5 split -- four sentence chunks -- never looks up: measured,
+    all four room-side keys missed afterwards.
+
+    The plan is now re-derived from the text under the engine load() chose,
+    so the phone's F5 chunks ARE the room's, and each one is a room-side
+    hit."""
+    monkeypatch.setattr(tts_mod, "BREEZE_STREAM_PLAYBACK", True)
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: False)
+    monkeypatch.setattr(tts_mod, "_ensure_breeze_server", lambda *a, **k: False)
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
+    monkeypatch.setattr(tts_mod.subprocess, "Popen", FakeProc)
+    t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+    f5 = []
+    monkeypatch.setattr(t, "_synth_f5", lambda text, out: (
+        f5.append(text), open(out, "wb").write(wav_bytes(0.1))))
+    rend = tts_mod.Rendition(t, FOUR_SENTENCES)
+    assert rend.engine == "breeze" and len(rend) == 1
+    body = rend.body()
+    assert len(body) > tts_mod._WAV_HEADER_BYTES
+    assert t.engine == "f5" and rend.engine == "f5"
+    want = TTS(engine="f5", cache=False).render_chunks(FOUR_SENTENCES)
+    assert len(want) >= 3, want
+    assert f5 == want, "F5 was handed the Breeze-sized chunk"
+    assert rend.chunks == want
+    assert all(t._cached("f5", c) for c in want), "the room would miss"
+    assert FakeProc.spawned == []                 # nothing played in the room
 
 
 def test_a_repeat_plays_from_cache_without_touching_the_socket(breeze, sock_path,
@@ -2555,6 +2748,109 @@ def test_a_worker_that_dies_mid_render_answers_and_then_reports_not_ready(
     assert again["ok"] is False                        # refused, not queued
 
 
+def test_a_worker_wedged_inside_the_model_makes_the_sidecar_not_ready():
+    """The stall net (RENDER_STALL_S) fired for the ONE connection that hit
+    it and changed nothing else: the thread was still blocked in the model,
+    so alive stayed True, ready stayed True, and every later job queued
+    behind the wedged one and stalled in its turn. On Jarvis's side that is
+    BREEZE_TIMEOUT_S = 60 s of silence per chunk before F5, for every chunk
+    of every reply, until someone restarted the unit -- the 'ready' docstring
+    says FAIL CLOSED and this was the one death it did not close on.
+    Measured with stall_s=0.5: the first render raised after 0.50 s, alive
+    True, ping ready True, and the second render stalled 0.50 s again.
+
+    The stall now marks the worker dead: ready flips, the ping says why,
+    and the next render is refused at once -- before audio, so Jarvis
+    renders that chunk on F5 in one round-trip instead of 60 s."""
+    wedge = threading.Event()
+
+    def render(text, gain=1.0):
+        yield pcm(2)
+        wedge.wait()                     # the GPU stopped answering
+
+    worker = bs.RenderWorker(render, stall_s=0.3)
+    svc = bs.BreezeService(render=worker, ready=True, graphs=ALL_GRAPHS)
+    assert svc.ping()["ready"] is True
+    try:
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="wedged"):
+            list(svc.render("first line", 1.0))
+        assert 0.25 < time.monotonic() - started < 2.0
+        assert worker.alive is False
+        pong = svc.ping()
+        assert pong["ready"] is False and "wedged" in pong["error"]
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="wedged"):
+            list(svc.render("second line", 1.0))
+        assert time.monotonic() - started < 0.2, "the second render waited too"
+        # and over the wire: refused before audio, so Jarvis falls to F5
+        head, rest = split_reply(serve_once(
+            svc, {"text": "third", "stream": True, "id": "w3"}))
+        assert head["ok"] is False and "wedged" in head["error"]
+        assert rest == b""
+    finally:
+        wedge.set()
+        worker.stop(1.0)
+
+
+def test_a_dead_worker_ends_the_process_so_the_unit_restarts_it():
+    """The wedged thread cannot be killed and the model it holds cannot be
+    reloaded in-process; a worker that died any other way leaves the same
+    residue -- a not-ready sidecar that stays alive, holding 13.5 GB, that
+    Restart=always never fires for because the process is up. So a dead
+    render thread becomes a dead PROCESS: exit status 1, not the 2 that
+    RestartPreventExitStatus treats as a deliberate refusal, after a grace
+    for the connection threads still answering {"ok": false}. StartLimit
+    bounds the loop if it recurs. main() disarms it before its own close(),
+    so a deliberate shutdown is not turned into a crash."""
+    exits = []
+
+    def render(text, gain=1.0):
+        raise SystemExit("the venv went away")
+        yield pcm(2)                                   # pragma: no cover
+
+    worker = bs.RenderWorker(render)
+    disarm = bs.exit_when_the_worker_dies(worker, grace_s=0.05,
+                                          _exit=exits.append)
+    with pytest.raises(RuntimeError):
+        list(worker("one"))
+    assert wait_until(lambda: exits == [1], 3), "the process was not ended"
+    assert disarm.is_set() is False
+
+    calm = []
+    worker = bs.RenderWorker(blocks_render(pcm(2)))
+    disarm = bs.exit_when_the_worker_dies(worker, grace_s=0.05,
+                                          _exit=calm.append)
+    assert list(worker("one")) == [pcm(2)]
+    disarm.set()                                       # a deliberate close
+    worker.stop()
+    time.sleep(0.3)
+    assert calm == []
+
+
+def test_main_arms_the_death_watch_and_disarms_it_on_its_own_way_out(
+        tmp_path, monkeypatch):
+    _fake_meminfo(monkeypatch, 40.0, 73.0)
+    monkeypatch.setattr(bs, "load_engine",
+                        lambda args: (blocks_render(pcm(10)), ALL_GRAPHS,
+                                      None, {}))
+    armed = []
+    real = bs.exit_when_the_worker_dies
+
+    def spy(worker, **kw):
+        disarm = real(worker, **kw)
+        armed.append((worker, disarm))
+        return disarm
+
+    monkeypatch.setattr(bs, "exit_when_the_worker_dies", spy)
+    served = []
+    monkeypatch.setattr(bs, "serve",
+                        lambda path, svc: served.append(svc) or 0)
+    assert bs.main(gate_argv(tmp_path)) == 0
+    assert len(armed) == 1 and armed[0][0] is served[0].worker
+    assert armed[0][1].is_set(), "main() closed the worker with the watch armed"
+
+
 def test_concurrent_renders_serialise_and_their_audio_never_interleaves(
         tmp_path):
     """One resident model, one render thread: three clients at once must come
@@ -2590,6 +2886,58 @@ def test_concurrent_renders_serialise_and_their_audio_never_interleaves(
     for i in range(3):
         assert got[i] == bs.wav_header(24000) + pcm(2, 100 + i) + pcm(2, 200 + i)
     assert [w[0] for w in windows] == ["in", "out"] * 3, windows
+
+
+def test_a_phone_stream_behind_a_room_stream_waits_for_the_whole_render(
+        tmp_path):
+    """Rendition's docstring claimed the phone hears the reply '~0.3 s in
+    whatever its length'. That holds on an IDLE sidecar only. _dispatch
+    serialises generation under _render_lock and _serve_stream withholds
+    the status line until the first block exists, so a phone request that
+    lands while the room's utterance is rendering gets NOTHING -- not a
+    byte -- until that render has finished; and webapp's _stream_clip holds
+    the HTTP status line back for that same first block, so the phone sees
+    no response at all for the duration. Since the join the room's
+    utterance is the whole reply: up to ~30 s. Measured here with the
+    room's render gated: the phone's line arrives only once the gate opens."""
+    path = tmp_path / "breeze.sock"
+    gate = threading.Event()
+
+    def render(text, gain=1.0):
+        yield pcm(4, 1)
+        if text == "room":
+            gate.wait(10)                # the room's utterance, still on the GPU
+        yield pcm(4, 2)
+
+    start_real_server(path, ready_service(render))
+    room = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    phone = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        room.settimeout(5)
+        room.connect(str(path))
+        room.sendall(b'{"text": "room", "stream": true}\n')
+        line = b""
+        while not line.endswith(b"\n"):
+            line += recv_exactly(room, 1)
+        assert json.loads(line.decode())["ok"] is True
+        recv_exactly(room, 44 + 8)      # the header and the first block: rendering
+        phone.connect(str(path))
+        phone.sendall(b'{"text": "phone", "stream": true}\n')
+        phone.settimeout(0.5)
+        started = time.monotonic()
+        with pytest.raises(TimeoutError):
+            phone.recv(1)                # not even the status line
+        gate.set()
+        phone.settimeout(5)
+        line = b""
+        while not line.endswith(b"\n"):
+            line += recv_exactly(phone, 1)
+        assert json.loads(line.decode())["ok"] is True
+        assert time.monotonic() - started >= 0.5
+    finally:
+        gate.set()
+        room.close()
+        phone.close()
 
 
 def test_shutting_the_worker_down_is_clean_and_final():
@@ -3068,6 +3416,146 @@ def test_the_consumer_deadline_is_the_render_one_not_the_read_one(breeze,
     assert seen and seen[0].timeout == tts_mod.BREEZE_RENDER_TIMEOUT_S
 
 
+def _silence_wav(seconds: float, streaming: bool = False) -> bytes:
+    """``seconds`` of PCM16 silence at 24 kHz, headed as a finished file or
+    as the tee of a STREAM (both size fields 0xFFFFFFFF, which is what a
+    Breeze cache entry carries)."""
+    n = int(24000 * 2 * seconds)
+    return tts_mod.wav_header(24000, 1, 2, None if streaming else n) + bytes(n)
+
+
+class _FakeClock:
+    """time.* for _wait_player: sleep() advances the clock instead of
+    waiting, so a 31 s playback costs nothing."""
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+    time = perf_counter = monotonic
+
+
+def _player_needing(clock, seconds, events):
+    """A Popen double that 'exits' once ``seconds`` of the fake clock have
+    passed, recording when it is terminated."""
+
+    class Proc:
+        def __init__(self, cmd, **kw):
+            self.cmd = cmd
+            self.returncode = None
+            self.start = clock.t
+
+        def poll(self):
+            if self.returncode is None and clock.t - self.start >= seconds:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            events.append(("terminate", round(clock.t - self.start, 2)))
+            self.returncode = -15
+
+        kill = terminate
+
+        def wait(self, timeout=None):
+            return self.returncode
+
+    return Proc
+
+
+def _bare_player(monkeypatch, clock, proc_cls):
+    monkeypatch.setattr(tts_mod, "time", clock)
+    monkeypatch.setattr(tts_mod.subprocess, "Popen", proc_cls)
+    monkeypatch.setattr(tts_mod.CONFIG, "playback_device", "")
+    t = TTS.__new__(TTS)
+    t._stop_flag = False
+    t._burst_announced = True
+    t._player = None
+    return t
+
+
+def test_a_replayed_joined_chunk_is_not_cut_at_thirty_seconds(tmp_path,
+                                                              monkeypatch):
+    """The stream path allows stream.timeout + 30 s, so the FIRST hearing of
+    a joined reply was whole. Every other road to the speaker -- the same
+    reply said again (a cache hit), the F5 fallback for a refused chunk,
+    _play_stream_from_file -- goes through _play(), which gave each player a
+    flat 30 s and terminated it with no log line. A joined chunk is 560
+    characters: 33.2 s of audio at the 0.0594 s/char BREEZE_TIMEOUT_S's own
+    comment uses, and a capped 522-char reply is 31.0 s. Before the join the
+    largest chunk was ~320 characters (~19 s) and the 30 s was unreachable.
+
+    Measured on b6b8079 with this clock: a player that needs 31 s was
+    terminated at t=30.00. The deadline is now the file's own length plus
+    the grace."""
+    clock, events = _FakeClock(), []
+    t = _bare_player(monkeypatch, clock, _player_needing(clock, 31.0, events))
+    wav = tmp_path / "replay.wav"
+    wav.write_bytes(_silence_wav(31.0, streaming=True))   # a Breeze cache hit
+    t._play(str(wav))
+    assert events == [], "the player was terminated before the audio ended"
+    assert clock.t >= 31.0
+
+
+def test_a_player_that_never_exits_is_still_cut_and_now_says_so(
+        tmp_path, monkeypatch, caplog):
+    """The grace is still a deadline: a wedged paplay is terminated the
+    file's length plus PLAYER_GRACE_S after it started. And it is LOGGED --
+    before, the only trace of a chunk whose tail was never heard was
+    'speech complete'."""
+    clock, events = _FakeClock(), []
+    t = _bare_player(monkeypatch, clock, _player_needing(clock, 10 ** 9, events))
+    wav = tmp_path / "short.wav"
+    wav.write_bytes(_silence_wav(0.5))
+    with caplog.at_level("WARNING", logger="jarvis.tts"):
+        t._play(str(wav))
+    assert len(events) == 1 and events[0][0] == "terminate"
+    assert abs(events[0][1] - (tts_mod.PLAYER_GRACE_S + 0.5)) < 0.2
+    assert any("deadline" in r.getMessage() for r in caplog.records)
+
+
+def test_the_players_deadline_is_measured_off_the_file_not_its_header(
+        tmp_path):
+    """A Breeze cache entry is the tee of a stream, so its header says
+    0xFFFFFFFF bytes -- which wave reads as 2147483647 frames, 89478 s at
+    24 kHz (measured). A deadline taken from that would be no deadline at
+    all, so the file's SIZE bounds it. Edge's cache entries are an MP3 in a
+    .wav-suffixed file, which wave refuses: those keep the flat grace they
+    always had."""
+    streamed = tmp_path / "streamed.wav"
+    streamed.write_bytes(_silence_wav(31.0, streaming=True))
+    whole = tmp_path / "whole.wav"
+    whole.write_bytes(_silence_wav(31.0))
+    mp3 = tmp_path / "edge.wav"
+    mp3.write_bytes(b"ID3\x04\x00" + bytes(200))
+    assert abs(tts_mod._wav_seconds(str(streamed)) - 31.0) < 0.001
+    assert abs(tts_mod._wav_seconds(str(whole)) - 31.0) < 0.001
+    assert tts_mod._wav_seconds(str(mp3)) is None
+    assert tts_mod._wav_seconds(str(tmp_path / "missing.wav")) is None
+    assert tts_mod._player_deadline(str(streamed)) == pytest.approx(
+        31.0 + tts_mod.PLAYER_GRACE_S)
+    assert tts_mod._player_deadline(str(mp3)) == tts_mod.PLAYER_GRACE_S
+
+
+def test_the_file_chain_deadline_covers_the_longest_chunk_the_join_can_make(
+        tmp_path):
+    """The relation, at both rates a fallen-back chunk can be rendered at:
+    Breeze's 0.0594 s/char (BREEZE_TIMEOUT_S's arithmetic) and F5's
+    0.060 s/char (162 chars -> 9.74 s, the _ENGINE_CHUNKING measurement).
+    The flat grace is UNDER a joined chunk at both -- that was the bug --
+    and the deadline for a file of that length is over it."""
+    for s_per_char in (19.0 / 320, 9.74 / 162):
+        audio = TTS._BREEZE_STREAM_JOIN_CHARS * s_per_char
+        assert audio > tts_mod.PLAYER_GRACE_S, "the flat number was not the bug"
+        wav = tmp_path / f"{s_per_char:.4f}.wav"
+        wav.write_bytes(_silence_wav(audio))
+        assert tts_mod._player_deadline(str(wav)) > audio + 10
+
+
 # ===========================================================================
 # 13. starting up without stalling the room
 # ===========================================================================
@@ -3135,6 +3623,72 @@ def test_the_background_warm_does_not_override_his_own_choice(
     try:
         t._breeze_warm_thread.join(15)
         assert t.engine == "edge"
+    finally:
+        srv.close()
+
+
+def test_a_sidecar_that_comes_up_later_is_re_adopted(sock_path, no_spawn,
+                                                     monkeypatch, tmp_path):
+    """One failed probe demoted Breeze to F5 for the whole session. The
+    memory gate refusing at boot is the sidecar's documented normal state
+    some mornings (MemFree 20.9 GB against the 33 GB floor when this was
+    filed), so the unit is 'failed', load() takes the F5 branch on every
+    utterance, nothing pings Breeze again, and warm_breeze -- only spawned
+    when the unit was active -- gave up after one 90 s budget. Hunter frees
+    memory and starts the unit; Jarvis keeps speaking F5 with tts_engine
+    still 'breeze', until a restart. Measured: with a READY sidecar bound
+    and the unit active, ten further load() calls sent it 0 requests.
+
+    The re-probe is a background loop now (BREEZE_REPROBE_S), spawned by
+    the demotion itself whatever the unit's state, and still off the speak
+    path: load() itself sends nothing to the socket while demoted."""
+    unit = {"active": False}
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: unit["active"])
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
+    monkeypatch.setattr(tts_mod, "BREEZE_REPROBE_S", 0.2)
+    t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+    assert t.load() is True and t.engine == "f5"
+    warm = t._breeze_warm_thread
+    assert warm is not None and warm.is_alive(), "nothing is re-probing"
+    time.sleep(0.6)                                # a few probes, no sidecar
+    assert t.engine == "f5"
+    unit["active"] = True
+    srv = FakeSidecar(sock_path, sidecar_handler([]))   # he started the unit
+    try:
+        assert wait_until(lambda: t.engine == "breeze", 5), \
+            "the sidecar answered and nothing picked it back up"
+        pings = len([r for r in srv.requests if r.get("ping")])
+        for _ in range(5):                         # five more utterances
+            assert t.load() is True
+        assert t.engine == "breeze"
+        assert len([r for r in srv.requests if r.get("ping")]) == pings + 5
+    finally:
+        srv.close()
+        warm.join(5)
+    assert not warm.is_alive()                     # done once it promoted
+
+
+def test_the_re_probe_stops_when_he_picks_another_engine(sock_path, no_spawn,
+                                                         monkeypatch, tmp_path):
+    """It only ever RESTORES a demotion we made: once the engine is no longer
+    the one we fell back to, the loop ends and never promotes."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: False)
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
+    monkeypatch.setattr(tts_mod, "BREEZE_REPROBE_S", 0.2)
+    t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+    assert t.load() is True and t.engine == "f5"
+    warm = t._breeze_warm_thread
+    assert warm is not None and warm.is_alive(), "nothing is re-probing"
+    t.engine = "edge"
+    warm.join(3)
+    assert not warm.is_alive(), "the loop outlived his choice"
+    srv = FakeSidecar(sock_path, sidecar_handler([]))
+    try:
+        time.sleep(0.6)
+        assert t.engine == "edge"
+        assert srv.requests == []
     finally:
         srv.close()
 

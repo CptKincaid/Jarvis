@@ -49,13 +49,28 @@ priced at a picture rate the device does not deliver), so they are gone.
 WHAT THE DEVICE ACTUALLY DELIVERS, MEASURED -- and why the number this
 module asks for is a CEILING, not a rate. An earlier draft said the 7.5 fps
 in his log was an artefact of asking for 1920x1080. IT WAS NOT. At the
-corrected 1280x720 his live log (2026-09-03, 00:04-00:22) reads ``6.0 fps
-grab 11 ms`` with 6 requested, ``7.5 fps  grab 133 ms`` with 10, and
-``7.4-7.6 fps`` with 15: the device hands over ~7.5 fps whatever is asked.
-(The 11 ms grab at 6 requested was not a fast device -- it was a frame that
-had been waiting in the driver's queue, a stale picture; see
-``CAP_PROP_BUFFERSIZE`` in jarvis/camera.py.) Two explanations were then put
-to the device itself by scripts/camera_mode_probe.py, TWICE -- 2026-09-03
+corrected 1280x720 his live log (2026-09-03, 00:01-00:24) reads ``6.0 fps
+grab 11 ms`` with 6 requested and ``7.4-7.6 fps  grab 132-136 ms`` with 10
+requested: raising the request by four bought one and a half.
+
+15 WAS NEVER ASKED OF THE DEVICE BY THAT BUILD, and an earlier draft of
+this docstring said otherwise ("7.4-7.6 fps with 15 requested, as with
+10"). Every ``capturing at up to`` line in that log reads 6.0 or
+10.0 -- five at 10.0, two at 6.0, none at 15 -- because the build running
+00:01-00:24 was 59bb901, whose ``MAX_FPS`` was 10, so his configured 15
+was clamped to it. The clamp was lifted at 00:49:59, 25 minutes after the
+log ends. The one later reading at 15 requested is the app's own rate
+line at 19:47 the same day (commit 9ba1c56, jarvis/camera.py): 7.6 fps,
+grab 132 ms. So the app has delivered ~7.5 at 10 and at 15; both are
+above what it gets.
+
+THE 11 ms GRAB AT 6 REQUESTED IS AN INFERENCE, NOT A MEASUREMENT. The most
+plausible reading of an 11 ms grab from a device whose frame interval is
+133 ms is a frame that had already been waiting in the driver's queue -- a
+stale picture -- and nothing timed frame age before or after
+``CAP_PROP_BUFFERSIZE`` was set, so it is a reading rather than a result
+(see jarvis/camera.py). Two explanations for the RATE were then put to
+the device itself by scripts/camera_mode_probe.py, TWICE -- 2026-09-03
 at 02:36 and again at 07:17, Jarvis stopped both times, ``grab()`` only:
 buffers dequeued and never retrieved, decoded, shown or saved; 10 warm-up +
 60 timed grabs per row, 30 fps requested for every row, cv2 4.12.0 on the
@@ -73,8 +88,13 @@ one tabled, with the 02:36 sustained rate beside it:
   640x480  YUYV   size-first    640x480  YUYV 30.0 fps  3.9 fps p50 268   3.9
 
   (p50 in ms; max within 3 ms of p50 on every row. auto_exposure 3.0 and
-   exposure 156 read back both times, not changed; CAP_PROP_BUFFERSIZE was
-   4, set(1) accepted and read back 1, both times.)
+   exposure 156 read back both times, not changed. Every row also set
+   ``CAP_PROP_BUFFERSIZE`` to 1: ``set(1)`` returned True and ``get`` read
+   back 1, which is NOT a driver read-back -- OpenCV's V4L2 backend
+   returns its own stored request from that property and never compares
+   it with what VIDIOC_REQBUFS allocated, so the count the driver queued
+   is not observable through cv2, and the "was 4" is likewise OpenCV's
+   DEFAULT_V4L_BUFFERS, not a reading.)
 
 So MJPG IS granted at 720p, in either set order, at a nominal 30: the format
 is not the cause, and there is no FOURCC-ordering fix to apply. Bandwidth
@@ -88,27 +108,48 @@ live log, with him at the desk between 00:04 and 00:22, shows the same
 intervals that are whole multiples of the mode's own are what a UVC
 camera on auto-exposure produces when it lengthens the interval to expose
 a dim scene ("exposure priority"), and nothing else that was measured
-explains them. It is NOT proven: the two probe runs were at 02:36 and
-07:17 and nobody looked at whether the light differed between them, so
-they neither confirm nor refute it. Proving it means a run with the desk
-lamp on, or with the camera's exposure-priority control off, and both are
-his to do. What follows from it is the rule this module keeps: THE
-PICTURE RATE IS SET BY THE LENS AND THE LIGHT, AND ``camera.preview_fps``
-CAN ONLY LOWER IT.
+explains them. PROVEN 2026-09-04, grab() only, the app closed: the LifeCam
+runs a 30 / 15 / 7.5 fps sensor ladder by exposure tier (<=15.6 ms /
+31-62 ms / >=125 ms), its auto-exposure was on the slowest rung (3.75 fps
+through the app's single driver buffer, exactly the 268 ms above) -- WHY
+it chose that rung at midday with the lights up is NOT measured; only the
+mechanism is -- and forcing manual exposure 156 on the same open gave 15-16 fps
+with nothing else changed; back to auto, straight back down. The "fast"
+7.5 fps days were the MIDDLE tier halved, so the camera has been
+exposure-throttled all along. WHAT MOVES THE METERING is not measured --
+it cannot be from numbers alone -- and the two candidates (the scene the
+lens sees; a firmware state only a replug clears) are his to test.
+``camera.exposure`` in jarvis/camera.py is the lever, shipped off. What
+follows from it is the rule this module keeps: THE PICTURE RATE IS SET BY
+THE LENS AND THE LIGHT, AND ``camera.preview_fps`` CAN ONLY LOWER IT --
+and since 09-04 the minute log line prints each stage's own p50 (see
+``STAGES``), so the next such evening is a grep rather than three agents.
+The single driver buffer is a separate, MEASURED 2.00x on top of whatever
+rung the camera is on (set(1) vs the driver's default, eight rows each,
+same light). So the probe's 3.8 fps was that rung through one buffer,
+NOT THE DEVICE'S CEILING -- the ceiling is 30 fps, reached at manual
+exposure 156 with the default buffers. And the app gained nothing from
+the default buffers when it was tried: 7.6 fps / 132 ms on its own rate
+line either way, with the staleness he saw at once, so the single buffer
+stayed (9ba1c56) and camera-drain is the dropped branch that argued
+about it.
 
 THE THREE RATES ARE NOT ONE RATE, and separating them is what keeps the pane
 cheap whatever the device delivers. Hunter, 2026-09-03: *"looks good but it
 lags a ton"*. Detection does not need to run on every picture, and identity
 must not:
 
-* PICTURES -- ``camera.preview_fps``, default ``DEFAULT_FPS`` = 7.5, capped at
-  ``MAX_FPS`` = 30. 7.5 is the HIGHEST rate the 1280x720 mode has been
-  measured to deliver -- with him at the desk (his log, above); the probe
-  measured 3.8-3.9 at 02:36 and 07:17 -- and a default is a ceiling, so it
-  is set at the best the mode does rather than the worst: a ceiling under
-  the delivered rate throws pictures away in exactly the light where the
-  pane could be smooth. 30 is the mode's granted nominal, which the device
-  has never been measured to reach. Above the DELIVERED rate --
+* PICTURES -- ``camera.preview_fps``, default ``DEFAULT_FPS`` = 7.5 (the
+  same number in assistant_config.DEFAULTS, which is the copy a fresh
+  install actually runs at; the suite pins them equal), capped at
+  ``MAX_FPS`` = 30. 7.5 is the HIGHEST rate the APP has been measured to
+  get from the 1280x720 mode -- with him at the desk, at 10 requested and
+  at 15 (his log, above) -- and a default is a ceiling, so it is set at
+  the best the app does rather than the worst: a ceiling under the
+  delivered rate throws pictures away in exactly the light where the pane
+  could be smooth. 30 is the mode's granted nominal, which the device has
+  never been measured to reach; the probe alone has reached 15 with the
+  driver's default buffers, and the app has not. Above the DELIVERED rate --
   whatever it is tonight -- there is nothing more to fetch and the capture
   thread is simply parked inside a blocking read: measured 2026-09-03, the
   loop's sleep is 100% of the period at 6 requested against 7.5 delivered,
@@ -172,8 +213,10 @@ how:
   holds the cone: a NAME needs two agreeing readings to take the screen, and
   the verdict survives ``IDENT_HOLD_S`` without a confirmation before it
   goes. The asymmetry is deliberate -- the first honest "unknown" is shown at
-  once, because being slow to say "I do not know who this is" is the failure
-  that matters.
+  once, from cold, because being slow to say "I do not know who this is" is
+  the failure that matters. Once a NAME is held, an "unknown" costs the same
+  two readings as any other change (0.8 s at 7.5 fps, measured; see
+  ``IdentityHold``).
 * **IDENTITY MAY REMOVE CAPABILITY OR ADD A NAME. IT MAY NEVER GRANT ONE.**
   Nothing outside ``jarvis/ui/`` imports this module -- pinned by
   tests/test_campreview.py -- so a recognised face here cannot reach the wake
@@ -227,7 +270,8 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, replace
+import statistics
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 from jarvis.logs import get_logger
@@ -241,15 +285,25 @@ OPTION_ENABLED = "camera.preview"
 OPTION_FPS = "camera.preview_fps"
 OPTION_IDENTITY_MIN = "camera.identity_min"
 OPTION_MIN_CONF = "camera.min_conf"
-# The HIGHEST rate the 1280x720 mode has been measured to deliver -- his
-# live log 2026-09-03 00:06-00:22, him at the desk: 7.4-7.6 fps whether 10
-# or 15 was requested. Not chosen. The request is a ceiling the device may
-# not reach: the same mode delivered 3.8-3.9 fps to scripts/camera_mode_probe
-# at 02:36 and again at 07:17, and asking for more than it delivers buys
+# The HIGHEST rate the APP has been measured to get from the 1280x720 mode
+# -- his live log 2026-09-03 00:06-00:22, him at the desk: 7.4-7.6 fps with
+# 10 requested (not "10 or 15": 15 was in his config, but the build running
+# then clamped every request at 10; module docstring), and 7.6 at 15
+# requested at 19:47 the same day. Not chosen. The request is a ceiling
+# the device may not reach, and asking for more than it delivers buys
 # nothing but a thread parked in a blocking read -- while asking for LESS
 # than it delivers throws pictures away, which is why the default is the
-# best measured rate and not the worst. See the module docstring; his
-# config's own value wins.
+# best measured rate and not the worst.
+#
+# THIS IS NOT THE ONLY COPY OF IT. assistant_config.DEFAULTS ships
+# camera.preview_fps, and AssistantConfig deep-merges DEFAULTS into every
+# config, so THAT is the number a fresh install actually runs at and this
+# one is only reached with no config at all (the suite, a bare
+# PreviewWorker). The two were 7.5 and 15.0 for a day, which made every
+# "at the 7.5 default" sentence in this module a statement about a default
+# the app never used. tests/test_campreview.py pins them equal; change
+# both or neither. His own config sets the key explicitly, so his rate is
+# whatever he last wrote there.
 DEFAULT_FPS = 7.5
 # 30 is the GRANTED nominal of the 1280x720 MJPG mode (read back by the
 # probe, either set order, both runs). The parked-in-read threshold is not
@@ -274,7 +328,17 @@ IDENT_FPS = 2.0
 IDENT_AGREE = 2
 # How long a held verdict survives with nothing confirming it -- three
 # identity periods. Beyond that the chip goes rather than sitting there over
-# a face nobody has checked. A face LEAVING clears it immediately.
+# a face nobody has checked. An EMPTY or FAILED detection clears it at
+# once (PreviewPipeline._faces), so a face that leaves is forgotten as
+# soon as the detector comes back empty. A face REPLACED IN PLACE -- another
+# person's box overlapping the held one by SUBJECT_IOU or more, with no
+# empty detection between -- keeps the old name for up to two identity
+# periods (~1 s) when the recogniser answers, and up to this bound when it
+# cannot (a face under id_conf, a degenerate embedding, a recogniser
+# exception). Measured, synthetic faces and a hand-wound clock, 2026-09-03,
+# swap phase swept in 25 ms steps: worst 0.93 s at 15 and 7.5 fps when the
+# recogniser answers, 1.47 s when it does not. Pre-existing hysteresis
+# bound, not a regression; only an empty or failed detection is faster.
 IDENT_HOLD_S = 1.5
 # OpenCV's own documented SFace cosine for "same person"; the default for
 # camera.identity_min, and the same number jarvis/facegallery.py starts from.
@@ -289,12 +353,23 @@ DEFAULT_MIN_CONF = 0.6
 # so two people at similar distance with jittering box sizes get each other's
 # names -- measured 70 of 142 chip-bearing frames wrong, and never
 # converging (synthetic two-face harness, 2026-09-03, re-run 07:20 with
-# the same counts). 0.3 is well above where a head at a desk drifts between
-# two identity ticks (a still head holds >0.9 across 500 ms) and well below
-# where two separate faces could land: side-by-side boxes score 0, and a
-# stranger stepping in front at twice the linear size scores at most 0.25
-# even perfectly concentric. Losing the chip for one identity period is the
-# safe direction -- a missing name is a question, a wrong one is an answer.
+# the same counts). 0.3 is above where a head at a desk is EXPECTED to
+# drift between two identity ticks (a still head should hold well over 0.9
+# across 500 ms -- expected, not measured: no box geometry is logged and
+# nothing may look), and side-by-side boxes score 0. It is NOT, on its
+# own, above where two separate faces can land: two detector rows
+# overlapping 40% of their width reproduce the whole failure (35 of 71
+# chips wrong at 7.5 fps, never converging), and the detectors' own NMS
+# lets rows overlap up to facedetect.NMS_THRESHOLD (0.3, YuNet) or
+# faceinsight.NMS_IOU (0.4, SCRFD) -- the second is ABOVE this number. So
+# the binding does not rest on this constant: IdentityHold.best_match
+# stamps the verdict only on the face whose box best matches the held one
+# among the faces in the picture, which is what keeps 0 wrong at 40/50/60%
+# overlap. Losing the chip is the safe direction -- a missing name is a
+# question, a wrong one is an answer -- and the price of a withheld stamp
+# is 500-1000 ms without a chip (measured 800 ms in the synthetic harness
+# at 15 fps: one withheld period, then a clear and two agreeing readings
+# at IDENT_FPS), not the single period an earlier draft claimed.
 SUBJECT_IOU = 0.3
 # Boxes the pane can draw. Three is a glance, not a dashboard, and the
 # fourth face at his desk is a poster. The cap is applied AFTER the size
@@ -308,7 +383,13 @@ MAX_FACES = 3
 MAX_ROWS = 64
 
 
-def detect_stride(picture_fps: float, detect_fps: float = DETECT_FPS) -> int:
+# How far past the rounding boundary the picture/detect ratio has to move
+# before detect_stride changes the stride in force. See detect_stride.
+STRIDE_HYSTERESIS = 0.1
+
+
+def detect_stride(picture_fps: float, detect_fps: float = DETECT_FPS,
+                  prev: Optional[int] = None) -> int:
     """Run the detector on every Nth picture: ``max(1, round(picture_fps /
     detect_fps))``.
 
@@ -320,10 +401,28 @@ def detect_stride(picture_fps: float, detect_fps: float = DETECT_FPS) -> int:
     the nearest multiple means the saving can never cost more than it
     saves: 7.5 -> 1, 10 -> 1, 15 -> 2, 30 -> 4. An unknown rate (the first
     picture, a stalled feed) is 1 -- detect, and learn the interval.
+
+    ``prev`` is the stride in force, and it is KEPT unless the ratio has
+    moved past the rounding boundary by ``STRIDE_HYSTERESIS``. At exactly
+    12 pictures a second the ratio is 1.5, and without the margin float
+    noise in the measured interval flips ``round()`` between 1 and 2 from
+    second to second -- measured on synthetic pictures at 12.0 fps, zero
+    jitter: [8, 6, 11, 12, 7, 6, 6, 6, 11, 11] detections a second.
+    Unreachable on his camera (its delivered rates are 30/n) but any 12 or
+    20 fps device would show it.
     """
     if not picture_fps or picture_fps <= 0.0 or detect_fps <= 0.0:
         return 1
-    return max(1, int(round(picture_fps / detect_fps)))
+    ratio = picture_fps / detect_fps
+    if prev is not None and prev >= 1 and \
+            abs(ratio - prev) <= 0.5 + STRIDE_HYSTERESIS:
+        return prev
+    return max(1, int(round(ratio)))
+
+# What PreviewShot.detail starts with, on a LIVE shot, when the detector
+# raised: "face detector failed: RuntimeError". The pane turns it into a
+# verdict of its own rather than "NO FACE IN FRAME" (jarvis/ui/preview.py).
+DETAIL_DETECTOR_FAILED = "face detector failed: "
 
 # Why there is no picture. One of these, or "" while a frame is live.
 REASON_LIVE = ""
@@ -341,6 +440,122 @@ REASON_WORDS = {
     REASON_NO_FRAME: "no frame from the camera",
     REASON_WAITING: "waking the camera…",
 }
+
+
+# ---------------------------------------------------------- stage timing
+# The stages of one capture cycle, in the order they run, and the order the
+# once-a-minute log line prints them. Milliseconds, p50 over the minute,
+# NUMBERS ONLY -- a timing can no more carry a pixel than a frame count can.
+#
+# WHY THIS EXISTS. On 2026-09-03 the preview line went from ``7.5 fps  grab
+# 132 ms`` to ``3.7 fps  grab 268 ms`` and stayed there through four app
+# restarts, and the one number the line carried was the WHOLE cycle -- the
+# device read, the MJPG decode, the detector, the landmark geometry, the
+# embedding, the hand stage, the enrolment tap and the shrink, summed. Three
+# agents spent an evening ruling out USB bandwidth, the app's own loop and
+# the GPU before the device read was timed on its own and found to be the
+# entire 268 ms (the camera's auto-exposure had stepped its sensor rate to
+# 7.5 fps, doubled by the single driver buffer; see jarvis/camera.py). With
+# the stages timed separately that answer is one log line: a slow ``grab``
+# beside a 3 ms ``detect`` is the device, a slow ``detect`` beside a 67 ms
+# ``grab`` is the model, and a slow ``draw`` is the Tk thread.
+#
+#   grab       feed.capture(): the V4L2 dequeue AND cv2's MJPG decode, which
+#              cv2.VideoCapture.read() does in one call. The two cannot be
+#              split without changing jarvis/eye.py's read path, so the
+#              probe's grab()-only number (scripts/camera_mode_probe.py) is
+#              the reference for how much of it is the wait.
+#   detect     detector.detect(frame) -- only on the cycles it runs.
+#   landmarks  the geometry pass over the rows (visionrig.observe per row,
+#              the plausibility check, the sort, the attention tracker) --
+#              only on detect cycles. The five landmarks themselves come
+#              back from the detector; this is what is done with them.
+#   embed      recogniser.embed + gallery.match, only when identity was due.
+#   hand       the gesture stage, when one is wired.
+#   offer      tap.offer(frame), when an enrolment is running.
+#   shrink     the reduction to the pane's box.
+#   draw       the Tk repaint of a live shot -- on the OTHER thread, timed
+#              in jarvis/ui/preview.py and posted back via
+#              ``PreviewWorker.note_stage``.
+STAGES = ("grab", "detect", "landmarks", "embed", "hand", "offer", "shrink",
+          "draw")
+# Samples kept per stage between log lines. A minute at 30 fps is 1 800; the
+# cap is there so a log that stops (a filter, a level) cannot grow the
+# lists for the life of the process.
+STAGE_KEEP = 4096
+
+
+class StageStats:
+    """Per-stage millisecond samples, p50'd once a minute and reset.
+
+    Thread-safe because two threads feed it: the capture thread posts every
+    stage but one, and the Tk thread posts ``draw``. Only floats go in and
+    only floats come out.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._samples: dict = {}
+
+    def note(self, name: str, ms: float) -> None:
+        try:
+            value = float(ms)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            bucket = self._samples.setdefault(str(name), [])
+            bucket.append(value)
+            if len(bucket) > STAGE_KEEP:
+                del bucket[:len(bucket) - STAGE_KEEP]
+
+    def extend(self, stage_ms) -> None:
+        """A whole cycle's ``{stage: ms}`` at once."""
+        try:
+            items = list(dict(stage_ms or {}).items())
+        except Exception:                          # noqa: BLE001 - not a dict
+            return
+        for name, ms in items:
+            self.note(name, ms)
+
+    def counts(self) -> dict:
+        with self._lock:
+            return {name: len(v) for name, v in self._samples.items()}
+
+    def p50s(self, reset: bool = False) -> dict:
+        """``{stage: p50 ms}`` for every stage that has a sample. A stage
+        that never ran is ABSENT rather than 0.0: "0 ms" and "did not run"
+        are different facts, and the log prints the second as ``-``."""
+        with self._lock:
+            out = {name: float(statistics.median(v))
+                   for name, v in self._samples.items() if v}
+            if reset:
+                self._samples = {}
+        return out
+
+    def reset(self) -> None:
+        with self._lock:
+            self._samples = {}
+
+
+def stage_line(p50s: dict, cycles: int = 0) -> str:
+    """The stage half of the once-a-minute log line, e.g.
+    ``stages p50 ms [222 cycles]: grab 265  detect 3.1  landmarks 0.4
+    embed -  hand -  offer -  shrink 1.8  draw 2.1``. Every stage is always
+    printed, in ``STAGES`` order, so a grep finds the column whether or not
+    the stage ran; ``-`` is "did not run this minute"."""
+    parts = []
+    for name in STAGES:
+        value = p50s.get(name)
+        if value is None:
+            parts.append("%s -" % name)
+        elif value >= 10.0:
+            parts.append("%s %.0f" % (name, value))
+        else:
+            parts.append("%s %.1f" % (name, value))
+    extra = {k: v for k, v in p50s.items() if k not in STAGES}
+    for name in sorted(extra):
+        parts.append("%s %.1f" % (name, extra[name]))
+    return "stages p50 ms [%d cycles]: %s" % (int(cycles), "  ".join(parts))
 
 
 # --------------------------------------------------------------- records
@@ -411,7 +626,12 @@ class PreviewShot:
     seq: int = 0
     at: float = 0.0
     fps: float = 0.0                 # measured delivery rate, not the target
-    grab_ms: float = 0.0             # p50-ish cost of the last cycle
+    grab_ms: float = 0.0             # the WHOLE cycle's cost, grab to shrink
+    # This cycle's per-stage cost in ms, ``{stage: ms}`` over the names in
+    # STAGES that ran -- floats keyed by short strings, nothing else. The
+    # worker folds these into its minute p50s (StageStats); the pane never
+    # reads them.
+    stage_ms: dict = field(default_factory=dict)
     # The hand stage's verdict for this frame (jarvis/handstage.HandShot),
     # SCALARS ONLY, or None for no opinion -- the stage is off, has no
     # models, or raised. Never a landmark array, never a crop.
@@ -448,7 +668,9 @@ class PreviewShot:
                 "detail": self.detail, "seq": self.seq, "fps": self.fps,
                 "grab_ms": self.grab_ms, "live": self.live,
                 "face": self.primary.as_dict() if self.primary else {},
-                "hand": self.hand.as_dict() if self.hand is not None else {}}
+                "hand": self.hand.as_dict() if self.hand is not None else {},
+                "stage_ms": {str(k): float(v)
+                             for k, v in self.stage_ms.items()}}
 
 
 def blank(reason: str, detail: str = "", seq: int = 0,
@@ -586,6 +808,25 @@ def camera_allowed(state: Any) -> bool:
 
 
 # ------------------------------------------------------------- who it is
+def iou(a: tuple, b: tuple) -> float:
+    """Intersection over union of two ``(x, y, w, h)`` boxes, or ``-1.0``
+    when either is not geometry (a zero or negative side).
+
+    Negative rather than 0.0 for the degenerate case, because 0.0 is a real
+    answer -- two boxes that do not touch -- and the callers here have to
+    treat "cannot judge" differently from "certainly not the same face".
+    """
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        return -1.0
+    ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
+    iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
+    inter = ix * iy
+    union = aw * ah + bw * bh - inter
+    return (inter / union) if union > 0 else -1.0
+
+
 class IdentityHold:
     """The tracked face's name, held steady enough to read.
 
@@ -644,7 +885,18 @@ class IdentityHold:
     ``SessionIdentity.room_empty`` makes the same call for the same reason --
     an empty frame is precisely the window in which a different person sits
     down, so an identity that survives one is an identity vouching for
-    whoever is there when the next face appears.
+    whoever is there when the next face appears. ONLY an empty or failed
+    detection is that fast. A person who replaces another IN THE SAME BOX
+    with no empty frame between is, to this class, a disagreeing reading
+    about the same face, and once a name is held a reading of "unknown"
+    needs the same two agreeing ticks as any other change: the old name
+    stays on the newcomer for 0.8 s at 7.5 fps (6 frames; measured,
+    synthetic faces, 2026-09-03) when the recogniser answers, and for up
+    to ``hold_s`` when it cannot answer at all (a face under the detector
+    bar, a degenerate embedding, a recogniser exception -- worst 1.47 s
+    measured). "The first honest unknown is shown at once" is true from
+    cold, and only from cold; that is the asymmetry above, and the price
+    of not flickering.
 
     Nothing here is persisted and nothing here is a permission. It produces a
     label and a number for a chip on his screen.
@@ -685,15 +937,39 @@ class IdentityHold:
         """
         if a is None or b is None:
             return True
-        ax, ay, aw, ah = a
-        bx, by, bw, bh = b
-        if aw <= 0 or ah <= 0 or bw <= 0 or bh <= 0:
+        score = iou(a, b)
+        return True if score < 0.0 else score >= self.iou
+
+    def best_match(self, box: Optional[tuple],
+                   others: tuple = ()) -> bool:
+        """Is ``box`` the face in THIS picture that the held verdict most
+        plausibly belongs to?
+
+        ``_same`` asks a yes/no question of one box, and one box is not
+        enough when two of them qualify. Two detections that overlap each
+        other -- a stranger leaning into his shoulder -- can BOTH clear
+        ``SUBJECT_IOU`` against the held box (the detectors' own NMS allows
+        rows up to 0.3 or 0.4 IoU apart, and the held box is up to one
+        identity period stale besides), and then "largest" decides which
+        of them wears his name, which is the failure the binding exists to
+        stop. Measured on this class without this method (synthetic
+        two-face harness, 2026-09-03, boxes overlapping 40/50/60% of their
+        width, "largest" flipping every picture): 35 of 71 chips wrong at
+        7.5 fps, 18 of 36 at 3.8, never converging -- the same shape as
+        the wholly unbound version. With it: 0 wrong at all three
+        overlaps, and every non-overlapping scenario unchanged.
+
+        A tie goes to the caller's box, because the common case is one face
+        and no others, and because withholding on a tie would blink the chip
+        for a difference of nothing.
+        """
+        if self._box is None or box is None or not others:
+            return True
+        mine = iou(self._box, box)
+        if mine < 0.0:
             return True                         # not geometry; do not judge
-        ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
-        iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
-        inter = ix * iy
-        union = aw * ah + bw * bh - inter
-        return union > 0 and (inter / union) >= self.iou
+        return not any(iou(self._box, other) > mine
+                       for other in others if other is not None)
 
     def observe(self, label: str, score: float,
                 box: Optional[tuple] = None) -> tuple:
@@ -735,7 +1011,8 @@ class IdentityHold:
         self._box = box
         self._cand, self._cand_box, self._n = None, None, 0
 
-    def held(self, box: Optional[tuple] = None) -> tuple:
+    def held(self, box: Optional[tuple] = None,
+             others: tuple = ()) -> tuple:
         """``(label, score, ran)``, expiring a verdict nothing has confirmed
         for ``hold_s``, and refusing to lend one to a face it was not
         computed from.
@@ -743,16 +1020,21 @@ class IdentityHold:
         Read, not tick, because the caller only comes back when a frame
         arrives -- and a chip that outlived its evidence because nobody
         called a tick would be exactly the stale name this exists to
-        prevent. ``box`` is the face the caller is about to stamp: a verdict
-        that does not belong to it is WITHHELD -- ``("", 0.0, False)``, no
-        chip -- rather than drawn, which is the difference between a missing
-        name and a wrong one. It is not cleared: the verdict still belongs
-        to the face it came from, and that face is usually largest again on
-        the next picture. Only a READING (``observe``) moves the subject.
+        prevent. ``box`` is the face the caller is about to stamp; ``others``
+        are the OTHER faces in the same picture, which is what turns "does
+        this box qualify" into "is this box the best of the ones that do"
+        (see ``best_match``). A verdict that does not belong to the caller's
+        box is WITHHELD -- ``("", 0.0, False)``, no chip -- rather than
+        drawn, which is the difference between a missing name and a wrong
+        one. It is not cleared: the verdict still belongs to the face it
+        came from, and that face is usually largest again on the next
+        picture. Only a READING (``observe``) moves the subject.
         """
         if self._ran and (self._now() - self._at) > self.hold_s:
             self.clear()
-        if self._ran and box is not None and not self._same(self._box, box):
+        if self._ran and box is not None and (
+                not self._same(self._box, box)
+                or not self.best_match(box, others)):
             return "", 0.0, False
         return self._label, self._score, self._ran
 
@@ -801,6 +1083,10 @@ class PreviewPipeline:
                  ident_fps: float = IDENT_FPS, hold=None, hands=None):
         self.feed = feed
         self.owned = bool(owned)
+        # The enrolment tap, or None. Set by PreviewWorker.set_tap and by
+        # nothing else; see grab(). None is the normal state and costs one
+        # attribute read per frame.
+        self.tap = None
         self.detector = detector
         self.lens = lens
         self.head = head
@@ -844,6 +1130,20 @@ class PreviewPipeline:
         self._last_pic: Optional[float] = None
         self._pic_dt: Optional[float] = None
         self._since_detect = 0
+        # The stride in force, so detect_stride can hold it across the
+        # rounding boundary rather than re-deciding from a noisy ratio on
+        # every picture (P08). None until the first picture.
+        self._stride: Optional[int] = None
+        # THE DETECTOR'S OWN HEALTH, so "I could not look" is never drawn as
+        # "nobody is there". A detector that raised used to leave a LIVE
+        # shot with no faces and no detail, which the pane printed as
+        # NO FACE IN FRAME / FACES 0 -- indistinguishable from an empty
+        # room, with his face in the picture -- and only a debug log line
+        # (measured: reason='' live=True detail='' faces=0). Now the failure
+        # is a sentence in ``detail``, a counter, and one WARNING per change
+        # of state; visionrig.Rig counts the same event as an error.
+        self.detector_error = ""
+        self.detector_errors = 0
         # The boxes carried forward between detections, and the capture
         # geometry they are expressed in. Faces are ALWAYS in capture pixels,
         # so a mode change makes the carried ones wrong rather than stale.
@@ -863,6 +1163,13 @@ class PreviewPipeline:
         self._now = now
         self.frames = 0
         self.misses = 0
+        # The stage costs of the cycle in progress, reset at the top of
+        # grab() and handed over on the shot as ``stage_ms``. Floats only.
+        self._cycle_ms: dict = {}
+
+    def _stage(self, name: str, since: float) -> None:
+        """Record one stage's cost, measured from ``since`` to now."""
+        self._cycle_ms[name] = (self._now() - since) * 1000.0
 
     def _observer(self):
         if self._observe is not None:
@@ -914,6 +1221,16 @@ class PreviewPipeline:
         # stranger's chip read name='hunter' id_ran=True). The boxes were
         # already dropped on this path; the NAME was not, which is the half
         # that says something false about a person.
+        #
+        # THE PRICE OF THAT RULE, measured (synthetic single face, detector
+        # raising on every Nth call, chip-bearing frames of 150): every 5th
+        # 112 -> 0, every 10th 128 -> 58, every 20th 136 -> 112. Each
+        # exception costs at least a second without a chip -- the clear,
+        # then two agreeing readings at IDENT_FPS -- and a detector that
+        # raises more often than about every 20 detections never shows a
+        # chip at all. Kept, because a same-spot swap needs it even with
+        # the box binding; if the chip blinks, this is where to look, and
+        # the pane now says DETECTOR FAILED beside it (detector_error).
         if rows is None:
             self._ident.clear()
             return ()
@@ -960,7 +1277,11 @@ class PreviewPipeline:
         out = out[:MAX_FACES]
         faces = self._attend([face for face, _ in out])
         if faces:
-            faces[0] = self._name(frame, faces[0], out[0][1], at)
+            # The other boxes go with the subject's, so the held name can
+            # be withheld from a face that qualifies but is not the best
+            # match for it (IdentityHold.best_match).
+            others = tuple((f.x, f.y, f.w, f.h) for f in faces[1:])
+            faces[0] = self._name(frame, faces[0], out[0][1], at, others)
         else:
             self._ident.clear()
         return tuple(faces)
@@ -996,7 +1317,8 @@ class PreviewPipeline:
         return faces
 
     # ------------------------------------------------------------- who
-    def _name(self, frame, face: PreviewFace, row, at: float) -> PreviewFace:
+    def _name(self, frame, face: PreviewFace, row, at: float,
+              others: tuple = ()) -> PreviewFace:
         """The tracked face, with a held identity on it -- or unchanged.
 
         THREE GATES BEFORE AN EMBEDDING IS TAKEN, and the order matters:
@@ -1018,7 +1340,9 @@ class PreviewPipeline:
         only onto the FACE IT BELONGS TO. The subject's geometry goes into
         the hold with the reading and is checked against on the way out, so
         a name cannot walk from the face it was computed from onto whoever
-        happens to be largest in the next picture. See ``IdentityHold``.
+        happens to be largest in the next picture -- and ``others``, the
+        rest of the faces in this picture, is what stops it walking onto a
+        face that overlaps the subject's. See ``IdentityHold``.
         """
         if self.recogniser is None or self.gallery is None:
             return face
@@ -1038,10 +1362,12 @@ class PreviewPipeline:
         # has no way to satisfy except by accident.
         if due and face.conf >= self.id_conf and face.landmarks_ok:
             self._last_ident = at
+            t0 = self._now()
             label, score = self._match(frame, row)
+            self._stage("embed", t0)
             if label is not None:      # None = it could not be asked; hold
                 self._ident.observe(label, score, box)
-        label, score, ran = self._ident.held(box)
+        label, score, ran = self._ident.held(box, others)
         if not ran:
             return face
         return replace(face, name=label, id_score=score, id_ran=True)
@@ -1080,7 +1406,11 @@ class PreviewPipeline:
             log.debug("campreview: the gallery would not match", exc_info=True)
             return None, 0.0
         score = float(score)
-        if not label or score < self.identity_min:
+        # ``not (score >= bar)`` and not ``score < bar``: the second is False
+        # for a NaN on either side, so a non-finite camera.identity_min
+        # would have named a stranger here too (F17; the same spelling in
+        # jarvis/eye.py). This fails SHUT.
+        if not label or not (score >= self.identity_min):
             return "", score                  # asked, and the answer is no
         return str(label), score
 
@@ -1096,11 +1426,14 @@ class PreviewPipeline:
         stage = self.hands
         if stage is None:
             return None
+        t0 = self._now()
         try:
             return stage.observe(frame, faces, frame_w, frame_h, seq)
         except Exception:                          # noqa: BLE001 - the stage
             log.debug("campreview: the hand stage raised", exc_info=True)
             return None
+        finally:
+            self._stage("hand", t0)
 
     # ----------------------------------------------------------- capture
     def grab(self, box: tuple, seq: int = 0) -> PreviewShot:
@@ -1112,11 +1445,13 @@ class PreviewPipeline:
         the frame returns; nothing about it is stored on ``self``.
         """
         t0 = self._now()
+        self._cycle_ms = {}
         try:
             frame = self.feed.capture()
         except Exception:                          # noqa: BLE001 - device edge
             log.debug("campreview: the feed raised", exc_info=True)
             frame = None
+        self._stage("grab", t0)
         if frame is None:
             self.misses += 1
             return blank(REASON_NO_FRAME, seq=seq, at=time.time())
@@ -1135,19 +1470,53 @@ class PreviewPipeline:
         # forward, which is what the stage's baseline and latch read.
         hand = self._hand(frame, faces, frame_w, frame_h, seq)
 
+        # THE ENROLMENT TAP, and this is the only place it can be. Below
+        # this line the frame is shrunk to the pane's box, which is 160x90 --
+        # far under the 112 px face the enrolment quality bar demands -- so
+        # the full frame has to be offered here or not at all. Above it, the
+        # detections have not run, and the hand stage reads the same frame.
+        #
+        # ONE CONSUMER AND NO COPY. offer() hands over a REFERENCE and only
+        # when an enrolment is actually blocked waiting for one; with no tap,
+        # or with a tap nobody is reading, this is an attribute read and an
+        # Event check. The detect-and-embed work (~12 ms) happens on the
+        # ENROLMENT thread, not here -- this thread only lets go of a
+        # pointer, which is why a run does not cost the pane its frame rate.
+        tap = self.tap
+        if tap is not None:
+            t_offer = self._now()
+            try:
+                tap.offer(frame)
+            except Exception:                  # noqa: BLE001 - the tap
+                # A tap that raises costs the enrolment, never the preview.
+                # The pane going dark because a face was being enrolled is
+                # exactly the failure this whole lane exists to avoid.
+                log.debug("campreview: the enrolment tap raised",
+                          exc_info=True)
+            self._stage("offer", t_offer)
+
         # LETTERBOXED HERE, on this thread, so what crosses over is the
         # picture at exactly the size it will be drawn. Stretching a 4:3
         # camera into a 16:9 box would squash every face 1.33x and put
         # every overlay box slightly off the face it belongs to.
         _ox, _oy, bw, bh = fit_box(frame_w, frame_h, box[0], box[1])
+        t_shrink = self._now()
         image = shrink(frame, (bw, bh))
+        self._stage("shrink", t_shrink)
         self.frames += 1
-        detail = "" if self.detector is not None else \
-            (self.reason or "no face detector")
+        # A LIVE shot carries a sentence only when nothing could be looked
+        # for: no detector at all, or a detector that raised on its last
+        # run. "" means the detector answered, and an empty ``faces`` then
+        # honestly means an empty room.
+        if self.detector is None:
+            detail = self.reason or "no face detector"
+        else:
+            detail = self.detector_error
         return PreviewShot(image=image, faces=faces, cap_w=frame_w,
                            cap_h=frame_h, reason=REASON_LIVE, detail=detail,
                            seq=seq, at=time.time(),
-                           grab_ms=(self._now() - t0) * 1000.0, hand=hand)
+                           grab_ms=(self._now() - t0) * 1000.0, hand=hand,
+                           stage_ms=dict(self._cycle_ms))
 
     def _track(self, frame, frame_w: int, frame_h: int,
                at: float) -> tuple:
@@ -1211,18 +1580,52 @@ class PreviewPipeline:
             self._ident.clear()
         self._since_detect += 1
         stride = detect_stride(1.0 / self._pic_dt if self._pic_dt else 0.0,
-                               1.0 / self._detect_period)
+                               1.0 / self._detect_period, self._stride)
+        self._stride = stride
         if self._last_detect is not None and self._since_detect < stride:
             return self._held
         self._last_detect = at
         self._since_detect = 0
+        t0 = self._now()
         try:
             rows = self.detector.detect(frame)
-        except Exception:                          # noqa: BLE001 - a detector
-            log.debug("campreview: the detector raised", exc_info=True)
+        except Exception as exc:                   # noqa: BLE001 - a detector
             rows = None
+            # F56: "I could not look" is not "nobody is there" -- the
+            # pipeline records its own health so the pane never draws a
+            # dead detector as an empty room.
+            self._detector_failed(exc)
+        else:
+            self._detector_recovered()
+        self._stage("detect", t0)
+        t1 = self._now()
         self._held = self._faces(frame, rows, frame_w, frame_h, at)
+        # ``embed`` is timed inside _name and is NOT part of this figure:
+        # _faces is measured whole, then the embed's own cost is taken back
+        # out, so ``landmarks`` is the geometry alone.
+        self._cycle_ms["landmarks"] = max(
+            0.0, (self._now() - t1) * 1000.0
+            - self._cycle_ms.get("embed", 0.0))
         return self._held
+
+    def _detector_failed(self, exc: BaseException) -> None:
+        """Count it, name it in ``detail``, and say so ONCE -- a WARNING on
+        the change of state, not one per frame, because a detector that
+        raises on every frame at 8 Hz would otherwise be a log that says
+        nothing else."""
+        self.detector_errors += 1
+        name = type(exc).__name__
+        if not self.detector_error:
+            log.warning("campreview: the face detector raised (%s); the pane "
+                        "says DETECTOR FAILED rather than NO FACE IN FRAME "
+                        "until it answers again", name, exc_info=True)
+        self.detector_error = DETAIL_DETECTOR_FAILED + name
+
+    def _detector_recovered(self) -> None:
+        if self.detector_error:
+            log.warning("campreview: the face detector answers again after "
+                        "%d failure(s)", self.detector_errors)
+            self.detector_error = ""
 
     def close(self) -> None:
         """Stop reading the device -- and shut it only if it is OURS.
@@ -1509,6 +1912,11 @@ class PreviewWorker:
         self._make = make_pipeline or (
             lambda: build_pipeline(services, get_option, sensing,
                                    hands=hands))
+        # The enrolment tap outlives any ONE pipeline, because a pipeline is
+        # rebuilt whenever the capture is restarted and an enrolment that
+        # survived a restart would otherwise be reading from an object
+        # nothing hands frames to any more. Same argument as self.hands.
+        self._tap = None
         self._now = now
         self._sleep = sleep
         self._lock = threading.Lock()            # guards self._shot
@@ -1524,6 +1932,36 @@ class PreviewWorker:
         self._last_at = 0.0
         self._logged = 0.0
         self.cycles = 0
+        # The minute's per-stage samples. Outlives any one pipeline, like
+        # the tap and the hand stage, so a restart mid-minute does not lose
+        # the half-minute before it.
+        self.stages = StageStats()
+        self._stage_cycles = 0
+
+    def note_stage(self, name: str, ms: float) -> None:
+        """A stage cost measured somewhere else -- ``draw`` from the Tk pane
+        (jarvis/ui/preview.py). Any thread; numbers only."""
+        self.stages.note(name, ms)
+
+    # ---------------------------------------------------- the enrol tap
+    def set_tap(self, tap) -> None:
+        """Lend the running capture to an enrolment, or take it back (None).
+
+        The tap is stored on the WORKER and pushed at the live pipeline,
+        because those are two different lifetimes: the worker survives a
+        stop/start, the pipeline does not. Storing it in only one place got
+        it wrong either way -- on the pipeline alone a restart silently
+        stopped delivering, on the worker alone the running grab never saw it.
+        """
+        self._tap = tap
+        with self._pipe_lock:
+            pipe = self._pipeline
+        if pipe is not None:
+            try:
+                pipe.tap = tap
+            except Exception:                 # noqa: BLE001 - a stub pipeline
+                log.debug("campreview: the pipeline took no tap",
+                          exc_info=True)
 
     # -------------------------------------------------------- the switch
     @property
@@ -1682,13 +2120,23 @@ class PreviewWorker:
         SUPERSEDED generation -- the thread of a stop whose join timed out,
         finishing its last pass after the pane has been switched back on --
         is dropped, so it cannot overwrite the live picture with its own
-        stale verdict. Callers on the UI thread pass nothing and always
-        write.
+        stale verdict. So is a write from a generation whose stop has been
+        SET: ``stop()`` sets the event and then writes "disabled" itself,
+        and a grab that passed ``cycle``'s post-grab check a few
+        instructions before that set would otherwise land a live frame in
+        the slot AFTER ``stop()`` had returned -- measured in a
+        deterministic replay (fake pipeline, no device): slot live=True,
+        image present, pipeline already closed. Identity alone did not
+        catch it because the in-flight generation IS the current one.
+        Callers on the UI thread pass nothing and always write.
         """
-        if stop is not None and stop is not self._stop:
+        if stop is not None and (stop is not self._stop or stop.is_set()):
             return
         with self._lock:
             self._shot = shot
+        if shot.stage_ms:
+            self.stages.extend(shot.stage_ms)
+            self._stage_cycles += 1
         self._maybe_log(shot)
 
     def _maybe_log(self, shot: PreviewShot) -> None:
@@ -1705,9 +2153,17 @@ class PreviewWorker:
             # reached this dict -- numbers_only() has no image field.
             who = "  id %s %.2f" % (face.get("name") or "unknown",
                                     face.get("id_score") or 0.0)
-        log.info("campreview: %s  faces %d  %dx%d  %.1f fps  grab %.0f ms%s",
+        # ``cycle`` is the whole pass, grab to shrink -- the number this line
+        # used to print as ``grab``, renamed because it was read as the
+        # device read alone for a whole evening (2026-09-03) and was not. The
+        # stage figures after it are the minute's p50s; ``grab`` there IS the
+        # device read (plus decode), and ``draw`` is the Tk thread's.
+        cycles, self._stage_cycles = self._stage_cycles, 0
+        log.info("campreview: %s  faces %d  %dx%d  %.1f fps  cycle %.0f ms%s"
+                 "  %s",
                  data["reason"] or "live", data["faces"], data["cap_w"],
-                 data["cap_h"], data["fps"], data["grab_ms"], who)
+                 data["cap_h"], data["fps"], data["grab_ms"], who,
+                 stage_line(self.stages.p50s(reset=True), cycles))
 
     def _sensing_state(self):
         """The policy's state, or the fail-safe when there is no policy.
@@ -1740,6 +2196,34 @@ class PreviewWorker:
             pipe, self._pipeline = self._pipeline, None
         if pipe is not None:
             pipe.close()
+        # THE ONE PLACE AN ENROLMENT IS TOLD THE CAMERA HAS GONE. Every
+        # handback converges here -- the sensing deny in cycle(), the loop's
+        # own exit, stop() and _release -- so the deny is written once rather
+        # than at four call sites that can drift apart. deny() drops any
+        # pending frame and wakes a blocked read with (False, None), and
+        # run_enrolment treats that as fatal, so the run ENDS rather than
+        # spinning against a camera nobody holds.
+        tap, self._tap = self._tap, None
+        if tap is not None:
+            try:
+                tap.deny("the camera was handed back -- sensing said no, or "
+                         "the preview stopped")
+            except Exception:                 # noqa: BLE001 - the tap
+                log.debug("campreview: the tap refused a deny", exc_info=True)
+        # Whatever the hand was carrying is put down with the device. The
+        # engine's caps run only when a frame arrives to test them, so a
+        # carry whose frames stopped here -- the ACTIVE->AMBIENT edge, the
+        # curfew, the toggle -- stayed live for as long as the silence
+        # lasted (MEASURED: 60 s, and a spoken throw then took the stale
+        # subject). Any thread; a no-op when nothing is in flight.
+        stage = self.hands
+        cancel = getattr(stage, "cancel", None) if stage is not None else None
+        if callable(cancel):
+            try:
+                cancel("preview stopped")
+            except Exception:                 # noqa: BLE001 - the stage
+                log.debug("campreview: the hand stage would not cancel",
+                          exc_info=True)
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -1782,7 +2266,16 @@ class PreviewWorker:
         if self._pipeline is None:
             with self._pipe_lock:
                 if self._pipeline is None:
-                    self._pipeline = self._make()
+                    made = self._make()
+                    # A pipeline built mid-enrolment gets the tap too, or the
+                    # run would stall on a restart it never asked for.
+                    if made is not None and self._tap is not None:
+                        try:
+                            made.tap = self._tap
+                        except Exception:     # noqa: BLE001 - a stub
+                            log.debug("campreview: fresh pipeline took no "
+                                      "tap", exc_info=True)
+                    self._pipeline = made
         pipe = self._pipeline
         if pipe is None or getattr(pipe, "feed", None) is None:
             shot = blank(REASON_PIPELINE,
@@ -1792,6 +2285,17 @@ class PreviewWorker:
             self._publish(shot, stop)
             return shot
         shot = pipe.grab(self.box, seq=seq)
+        if not shot.stage_ms:
+            # A MISS KEEPS ITS TIMING. A blank shot deliberately carries no
+            # stages, so nothing downstream mistakes it for a picture -- but
+            # the grab that produced it is exactly the number this instrument
+            # exists for: a device that took two seconds to say nothing is a
+            # stalling device, and it has to show up on the minute line as
+            # 'grab 2000', not vanish. The pipeline still holds the cost.
+            miss = getattr(pipe, "_cycle_ms", None) or {}
+            if miss.get("grab") is not None:
+                self.stages.extend({"grab": float(miss["grab"])})
+                self._stage_cycles += 1
         if stop.is_set():
             # THE SWITCH WENT OFF WHILE THIS GRAB WAS IN FLIGHT. The frame
             # came back after he said stop, so it is dropped here rather
@@ -1804,7 +2308,8 @@ class PreviewWorker:
                                reason=shot.reason, detail=shot.detail,
                                seq=shot.seq, at=shot.at,
                                fps=self._measure_fps(self._now()),
-                               grab_ms=shot.grab_ms, hand=shot.hand)
+                               grab_ms=shot.grab_ms, hand=shot.hand,
+                               stage_ms=shot.stage_ms)
         self._publish(shot, stop)
         return shot
 

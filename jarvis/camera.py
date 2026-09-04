@@ -61,28 +61,68 @@ DEVICE_GLOB = "/dev/video*"
 # 2026-09-03, both fourcc-before-size and size-before-fourcc). The granted
 # mode is read back and logged in open_capture for exactly that reason.
 DEFAULT_FOURCC = "MJPG"
-# One driver buffer, not OpenCV's default four. See open_capture.
-# None means LEAVE THE DRIVER'S DEFAULT ALONE, which is what the fast probe
-# run actually did. Setting this to 1 costs exactly half the frame rate --
-# MEASURED 2026-09-03, one A/B pair back to back in the same light with
-# scripts/camera_mode_probe.py, 60 timed grabs per row, 8 rows out of 8:
+# One buffer requested, not OpenCV's default four -- and this is a REVERT
+# to that, not the original choice. None means leave the driver's default
+# alone. The history, in order, because two commits on one day disagreed
+# and the comment here described the wrong one for a while:
 #
-#   mode              set(1)              driver default
-#   720p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
-#   480p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
-#   720p YUYV      5.0 fps / 200.0 ms   10.0 fps / 100.0 ms
-#   480p YUYV      7.5 fps / 132.1 ms   15.0 fps /  67.9 ms
+# 1. Set to 1 (12eadf0) so a slow consumer could not be handed a frame that
+#    had waited up to three intervals in the queue -- lag he can see.
+# 2. MEASURED IN THE PROBE to cost exactly half the rate (c228a01): one A/B
+#    pair back to back in the same light with scripts/camera_mode_probe.py,
+#    60 timed grabs per row, 8 rows out of 8:
 #
-# A clean 2.00x on every row, and with the default the 720p YUYV mode hits
-# its granted 10.0 fps exactly -- so the device was never the cap. OpenCV's
-# V4L2 backend requeues a dequeued buffer only at the NEXT grab, so with one
-# buffer the driver holds none in between and every grab waits a full extra
-# frame interval.
+#      mode              set(1)              driver default
+#      720p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
+#      480p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
+#      720p YUYV      5.0 fps / 200.0 ms   10.0 fps / 100.0 ms
+#      480p YUYV      7.5 fps / 132.1 ms   15.0 fps /  67.9 ms
+#
+#    A clean 2.00x on every row, with the 720p YUYV mode hitting its
+#    granted 10.0 fps exactly at the default -- so in the probe the device
+#    was never the cap. That measurement stands. It was set to None.
+# 3. Put back to 1 the same evening (9ba1c56), because THE APP DID NOT GET
+#    THE RATE: with the driver's buffers its own rate line read 7.6 fps /
+#    132 ms (19:47), the same ~7.5 it had with one buffer, and he saw the
+#    staleness at once ("way less accurate", boxes on "random objects").
+#    The probe grabs in a tight loop and never retrieves; the app grabs,
+#    retrieves, decodes and works; something in that difference eats the
+#    other half and NOBODY KNOWS WHAT YET. So the setting that demonstrably
+#    keeps his picture fresh wins over a rate gain that does not reach the
+#    app.
+#
+# OpenCV's V4L2 backend requeues a dequeued buffer only at the NEXT grab,
+# so with one buffer the driver holds none in between and every grab waits
+# a full extra frame interval -- the mechanism that fits the probe's 2x.
+# The count the driver actually allocated is not observable through cv2:
+# CAP_PROP_BUFFERSIZE's get() returns OpenCV's own stored request, never
+# compared with what VIDIOC_REQBUFS granted, so "set(1) read back 1" says
+# only that the request was accepted, and the log line below says
+# "requested" for that reason. The proper fix is to DRAIN the queue, not
+# starve it (branch camera-drain); when it lands the buffers come back.
 CAPTURE_BUFFERS = 1
 # How long a close waits for a grab already in flight before releasing the
 # device anyway. One frame at the idle tier's 1.5 fps is 670 ms; a second is
 # a grab that is not coming back.
 CLOSE_WAIT_S = 1.0
+# V4L2's exposure_auto values, which cv2's V4L2 backend passes through RAW
+# on CAP_PROP_AUTO_EXPOSURE (measured 2026-09-04 on his LifeCam: get() read
+# 3.0 under auto, set(1) read back 1.0 and the v4l2 control agreed). Not
+# the 0.25/0.75 folklore from other backends.
+EXPOSURE_MANUAL = 1
+EXPOSURE_AUTO = 3
+# The driver controls that decide the camera's OWN frame period. Read and
+# logged at every open (``exposure_probe``), because on 2026-09-03/04 the
+# preview halved from 7.5 to 3.7 fps with nothing in the log able to say
+# whether the camera had been re-metered. MEASURED 2026-09-04, grab() only,
+# the app closed: the LifeCam runs a 30 / 15 / 7.5 fps ladder by exposure
+# tier (<=15.6 ms / 31-62 ms / >=125 ms) and auto-exposure was sitting on
+# the SLOWEST rung -- at midday, lights up, so not the room: WHAT it was
+# metering on is unmeasured. Forcing manual exposure 156 took it from 3.75 to
+# 15-16 fps in the app's own 1-buffer configuration, and back to auto put
+# it straight back. Under auto the ``exposure`` figure is the CACHED manual
+# value, not a meter reading; ``auto_exposure`` is the number that matters.
+EXPOSURE_CONTROLS = ("auto_exposure", "exposure", "gain")
 
 
 def _import_cv2():
@@ -90,6 +130,54 @@ def _import_cv2():
     a box without OpenCV and ``build()`` can report that as a reason."""
     import cv2                       # noqa: PLC0415 - deliberately lazy
     return cv2
+
+
+def exposure_probe(cap) -> dict:
+    """The driver's exposure controls, as NUMBERS. Never raises, never
+    changes anything; -1.0 is "the driver has no such control" (his LifeCam
+    has no gain), which is data and is logged as such."""
+    cv2 = _import_cv2()
+    out = {}
+    for name, prop in (("auto_exposure", "CAP_PROP_AUTO_EXPOSURE"),
+                       ("exposure", "CAP_PROP_EXPOSURE"),
+                       ("gain", "CAP_PROP_GAIN")):
+        try:
+            out[name] = float(cap.get(getattr(cv2, prop)))
+        except Exception:  # noqa: BLE001 - an absent control is a number
+            out[name] = -1.0
+    return out
+
+
+def pin_exposure(cap, exposure: int) -> dict:
+    """Manual exposure, pinned: auto off, then the value. Reports what the
+    driver READ BACK, because a refused set is silent on v4l2.
+
+    THE ONE CAVEAT IS THE CAMERA'S OWN TABLE. The LifeCam accepts any value
+    in 5..20000 but runs its fastest 30 fps sensor rate only at values on
+    its discrete list (5, 9, 10, 19, 20, 39, 78, 156 measured; 312 and 625
+    give 15; anything off the list -- 50, 100, 200, 400 -- falls to the
+    SLOWEST tier). So the number to use is one the next preview line shows
+    to be fast, not one that looks reasonable. 156 is the value the camera
+    itself caches under auto and is the safe first choice.
+    """
+    cv2 = _import_cv2()
+    out = {"asked": int(exposure)}
+    try:
+        out["auto_accepted"] = bool(cap.set(cv2.CAP_PROP_AUTO_EXPOSURE,
+                                            EXPOSURE_MANUAL))
+    except Exception:  # noqa: BLE001
+        out["auto_accepted"] = False
+    try:
+        out["accepted"] = bool(cap.set(cv2.CAP_PROP_EXPOSURE,
+                                       int(exposure)))
+    except Exception:  # noqa: BLE001
+        out["accepted"] = False
+    out.update(exposure_probe(cap))
+    out["pinned"] = bool(out["auto_accepted"] and out["accepted"]
+                         and out["auto_exposure"] == float(EXPOSURE_MANUAL)
+                         and out["exposure"] == float(int(exposure)))
+    return out
+
 
 
 def device_nodes() -> list:
@@ -115,6 +203,68 @@ def device_present(device: str = "") -> bool:
             device = "/dev/video%d" % int(device)
         return os.path.exists(device)
     return bool(device_nodes())
+
+
+def _proc_name(pid: int) -> str:
+    """``/proc/<pid>/comm``, or "". Never raises; a name is a courtesy."""
+    try:
+        with open("/proc/%d/comm" % int(pid), encoding="utf-8",
+                  errors="replace") as fh:
+            return fh.read().strip()
+    except Exception:            # noqa: BLE001 - the process may have gone
+        return ""
+
+
+def device_holder(device: str = "") -> tuple:
+    """``(pid, name)`` of a process holding ``device`` open, else ``(0, "")``.
+
+    WHY THIS EXISTS. V4L2 capture is EXCLUSIVE: a second opener does not get
+    a queue, it gets a failure, and cv2 reports that failure the same way it
+    reports a missing camera. On 2026-09-03 that cost half an hour --
+    ``scripts/face_enrol.py`` said "sensing denied the camera, or the device
+    went away" while sensing said camera=True and the device was sitting
+    right there, held by the running Jarvis on fd 14. Both halves of the
+    sentence were false and both sent him to check something that was fine.
+
+    IT OPENS NOTHING. It reads the /proc fd symlinks, which is a directory
+    listing and a readlink -- the same information ``fuser`` prints, at no
+    risk of taking the device away from whoever legitimately has it. A
+    process this user may not read is simply skipped, so the honest failure
+    here is ``(0, "")`` -- "somebody, and I cannot say who" -- never a guess.
+    """
+    node = str(device or "")
+    if node.isdigit():
+        node = "/dev/video%d" % int(node)
+    if not node:
+        nodes = device_nodes()
+        node = nodes[0] if nodes else ""
+    if not node:
+        return 0, ""
+    me = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:              # pragma: no cover - a broken /proc
+        return 0, ""
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            # Our own fd is not an answer to "who has it instead of me".
+            continue
+        fd_dir = "/proc/%d/fd" % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue             # not ours to read, or already exited
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) != node:
+                    continue
+            except OSError:
+                continue
+            return pid, _proc_name(pid)
+    return 0, ""
 
 
 # ------------------------------------------------------------- the config
@@ -179,10 +329,30 @@ def thresholds_from_config(cfg) -> Thresholds:
 
 # ------------------------------------------------------------- the device
 def open_capture(device: str = "", width: int = 1280, height: int = 720,
-                 fourcc: str = DEFAULT_FOURCC):
+                 fourcc: str = DEFAULT_FOURCC, exposure: int = 0):
     """cv2.VideoCapture, opened, asked for a mode, and the GRANTED mode read
     back and logged. Raises if it will not open -- ``Eye`` reads that as no
     opinion, which is the same behaviour as having no camera at all.
+
+    THE EXPOSURE CONTROLS ARE LOGGED AT EVERY OPEN, beside the granted mode,
+    since 2026-09-04. What the two probes of 09-03 left "NOT proven" (below)
+    was then measured, grab() only and the app closed: the delivered rate is
+    the camera's own auto-exposure tier. His LifeCam runs 30 / 15 / 7.5 fps
+    at exposure <=15.6 ms / 31-62 ms / >=125 ms, auto was on the slowest
+    rung (3.75 fps through the app's single driver buffer) for a reason
+    nobody has measured -- ambient light is refuted, the scene is not -- and
+    manual exposure 156 took the same open to 15-16 fps with no other change.
+    So the line printed here says ``auto_exposure``, ``exposure`` and
+    ``gain`` as the driver reports them -- and says plainly that under auto
+    the exposure figure is a cached manual value, not a light reading, so
+    nobody reads 156 as "the room is bright" again.
+
+    ``exposure`` > 0 PINS manual exposure at that value (``pin_exposure``),
+    which is ``camera.exposure`` in his config and ships at 0 = leave auto
+    alone. It is a lever, not a verdict: it trades the camera's own metering
+    for a fixed sensor rate, and whether the pane and the detector are still
+    usable at that exposure in his evening light is his to read off the
+    next ``campreview:`` line, not this module's to assume.
 
     THE GRANTED MODE IS LOGGED HERE, once per open, because until 2026-09-03
     nothing in the running app read it back and the one time it mattered
@@ -192,36 +362,35 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
     and granted a bandwidth-capped YUYV stream -- was wrong. Measured with
     scripts/camera_mode_probe.py, twice (2026-09-03 02:36 and 07:17, Jarvis
     stopped, ``grab()`` only, nothing retrieved): MJPG IS granted at
-    1280x720 in either set order at a nominal 30 fps, and the device
-    delivered 3.7-3.9 fps in every 30 fps mode it has, 640x480 included,
-    both runs -- so the rate is the device's own, not the format's and not
-    the bus's. What sets it is not proven; the whole-multiple frame
-    intervals (268 ms = 8 x 33 ms at the probe, 133 ms = 4 x 33 ms with him
-    at the desk) are what auto-exposure lengthening the interval for a dim
-    scene looks like. The line printed here puts asked-against-granted
-    beside the preview's own rate line so that the next such question is a
-    grep of the log rather than a night of guessing.
+    1280x720 in either set order at a nominal 30 fps, so the format is not
+    what sets the rate and neither is the bus (640x480 delivered the same
+    3.7-3.9 fps in both formats). That 3.7-3.9 was the PROBE'S
+    configuration in that morning's light -- one buffer, 30 fps requested
+    -- not the device's ceiling: the same configuration gave 7.5 that
+    afternoon and the driver's default gave 15.0 (CAPTURE_BUFFERS above),
+    while the app gets ~7.5 either way. What sets the app's 7.5 is not
+    proven; the whole-multiple frame intervals (268 ms = 8 x 33 ms, 133 =
+    4 x 33, 68 = 2 x 33) are what auto-exposure lengthening the interval
+    for a dim scene looks like, and the light was never controlled for.
+    The line printed here puts asked-against-granted beside the preview's
+    own rate line so that the next such question is a grep of the log
+    rather than a night of guessing.
 
-    ``CAP_PROP_BUFFERSIZE`` IS LEFT AT THE DRIVER'S DEFAULT, and that is a
-    correction. It was set to ONE to stop a slow consumer being handed a
-    frame that had waited in the queue -- up to three intervals old, which
-    is lag he can see, and the reasoning was right. The cost was not
-    measured until 2026-09-03, and the cost is HALF THE FRAME RATE: an A/B
-    pair in the same light gave a clean 2.00x on all eight rows (see
-    CAPTURE_BUFFERS above), and with the default the 720p YUYV mode reaches
-    its granted 10.0 fps exactly, so the device was never the cap.
-
-    Half the rate is the worse trade. At his configured ``preview_fps`` of
-    15 the consumer now keeps pace with the device (15.0 fps delivered), so
-    the queue does not build and the staleness this was fighting does not
-    arise; it only bit when the consumer ran far slower than the device
-    (the old ``6.0 fps  grab 11 ms`` line, 6 requested against 15 delivered).
+    ``CAP_PROP_BUFFERSIZE`` IS REQUESTED AS ONE, and the history of that
+    number is on CAPTURE_BUFFERS: it halves the probe's rate, does not
+    change the app's, and is what keeps the picture he sees fresh. The
+    staleness it fights is a frame up to three intervals old handed to a
+    consumer that runs slower than the device. The old ``6.0 fps  grab
+    11 ms`` line at 6 requested is CONSISTENT with that -- an 11 ms grab
+    from a 133 ms device is most plausibly a frame that was already waiting
+    -- but frame age was never timed, and 9ba1c56's "boxes on random
+    objects" with the driver's buffers is the nearest thing to a
+    measurement of it. Expected mechanism, not yet measured.
 
     THE PROPER FIX IS TO DRAIN, NOT TO STARVE: keep the driver's buffers and
     discard the stale ones before retrieving, so a slow consumer still gets
-    the newest frame at full rate. That is not built yet, and until it is,
-    a consumer configured well below the delivered rate can still be handed
-    a frame up to three intervals old.
+    the newest frame at full rate. That is not built yet (branch
+    camera-drain), and until it is, the single buffer stays.
 
     cv2 is imported HERE, not at module scope, so that a box without OpenCV
     still loads jarvis.camera and still reports honestly.
@@ -250,13 +419,34 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
     try:
         got = capture_mode(cap)
         log.info("camera: asked %dx%d %s; granted %.0fx%.0f %s at %.1f fps "
-                 "nominal, %.0f driver buffer(s) -- the delivered rate is "
-                 "what the preview's own line reports",
+                 "nominal, %.0f buffer(s) requested -- the delivered rate "
+                 "is what the preview's own line reports",
                  int(width), int(height), fourcc or "-", got["width"],
                  got["height"], got["fourcc"] or "?", got["fps"],
                  got["buffersize"])
     except Exception:  # noqa: BLE001 - a read-back is not worth a crash
         log.debug("camera: could not read the granted mode back",
+                  exc_info=True)
+    try:
+        if int(exposure or 0) > 0:
+            pin = pin_exposure(cap, int(exposure))
+            log.info("camera: exposure pinned manual %d -> %s; driver reads "
+                     "back auto_exposure %.0f  exposure %.0f  gain %.0f",
+                     pin["asked"], "accepted" if pin["pinned"] else "REFUSED",
+                     pin["auto_exposure"], pin["exposure"], pin["gain"])
+        else:
+            ctl = exposure_probe(cap)
+            log.info("camera: controls at open: auto_exposure %.0f  exposure "
+                     "%.0f  gain %.0f (%s; -1 = no such control; under auto "
+                     "the exposure figure is the cached manual value, not a "
+                     "light reading -- the camera's own rate tier shows in "
+                     "the preview line)",
+                     ctl["auto_exposure"], ctl["exposure"], ctl["gain"],
+                     "auto" if ctl["auto_exposure"] == float(EXPOSURE_AUTO)
+                     else "manual" if ctl["auto_exposure"]
+                     == float(EXPOSURE_MANUAL) else "mode ?")
+    except Exception:  # noqa: BLE001 - a control read is not worth a crash
+        log.debug("camera: could not read the exposure controls",
                   exc_info=True)
     return cap
 
@@ -309,9 +499,14 @@ class CameraFeed:
     def __init__(self, policy, opener: Callable[[], Any], *,
                  present: Optional[Callable[[], bool]] = None,
                  on_blind: Optional[Callable[[], None]] = None,
-                 name: str = CAMERA, lens: Optional[Lens] = None):
+                 name: str = CAMERA, lens: Optional[Lens] = None,
+                 device: str = ""):
         self.name = name
         self.lens = lens
+        # The node this feed was pointed at, kept ONLY so that a failure to
+        # open can name the process holding it (see FeedSource.reason). It is
+        # never opened from here; the opener owns that.
+        self.device = str(device or "")
         self.policy = policy
         self._opener = opener
         self._lock = threading.RLock()
@@ -425,6 +620,67 @@ class FeedSource:
 
     def release(self) -> None:
         self.feed.close()
+
+    @property
+    def reason(self) -> str:
+        """Why the last read came back empty, in ONE true sentence.
+
+        ``CameraFeed.capture`` returns None for five different reasons on
+        purpose -- a consumer that has to tell them apart will get one of
+        them wrong -- but a HUMAN being told to go and fix it needs exactly
+        that distinction, and the caller that guessed at it got both halves
+        wrong on 2026-09-03 (see ``faceenrol.FRAMES_STOPPED``). So the guess
+        is replaced by the four things this object can actually check: what
+        sensing says, whether the node exists, whether we ever got the device
+        open at all, and who has it if we did not.
+
+        Never raises and never opens anything. "" means "I have nothing
+        better than the caller's own sentence", which is an honest answer.
+        """
+        feed = self.feed
+        try:
+            st = feed.status()
+        except Exception:        # noqa: BLE001 - a duck-typed feed
+            log.debug("camera: the feed could not report status",
+                      exc_info=True)
+            return ""
+        if st.get("allowed") is not True:
+            why = ""
+            try:
+                why = str(feed.policy.status().get("reason") or "")
+            except Exception:    # noqa: BLE001 - a slim/absent policy
+                why = ""
+            return ("sensing is holding the camera shut (%s)" % why) if why \
+                else "sensing is holding the camera shut"
+        device = getattr(feed, "device", "") or ""
+        try:
+            there = device_present(device)
+        except Exception:        # noqa: BLE001
+            there = True
+        if not there:
+            return ("the camera device is not there (%s)" % device) if device \
+                else "there is no camera device"
+        if not int(st.get("opens") or 0):
+            # Sensing allows it, the node exists, and we never once got it
+            # open. On a V4L2 device that means somebody else has it.
+            pid, name = 0, ""
+            try:
+                pid, name = device_holder(device)
+            except Exception:    # noqa: BLE001 - /proc is a courtesy
+                log.debug("camera: could not look for the holder",
+                          exc_info=True)
+            node = device or "the camera"
+            if pid and name:
+                return ("%s is already open -- %s (pid %d) is holding it, "
+                        "and v4l2 only allows one" % (node, name, pid))
+            if pid:
+                return ("%s is already open -- pid %d is holding it, and "
+                        "v4l2 only allows one" % (node, pid))
+            return ("%s could not be opened; sensing allows it and the "
+                    "device is there, so another process is holding it"
+                    % node)
+        return ("the camera stopped answering after %d frame(s)"
+                % int(st.get("frames") or 0))
 
 
 def fourcc_name(value) -> str:
@@ -635,12 +891,15 @@ def build(cfg, policy, opener: Optional[Callable[[], Any]] = None,
         lens = lens_from_config(cfg)
         device = str(_cfg_get(cfg, "camera.device", "") or "")
         fourcc = str(_cfg_get(cfg, "camera.fourcc", DEFAULT_FOURCC) or "")
+        # 0 = auto-exposure, the camera's own metering. See open_capture.
+        exposure = int(_cfg_get(cfg, "camera.exposure", 0) or 0)
         if opener is None:
             def opener():                       # noqa: E306 - one call site
                 return open_capture(device, lens.width_px, lens.height_px,
-                                    fourcc)
+                                    fourcc, exposure=exposure)
         feed = CameraFeed(policy, opener, lens=lens, on_blind=on_blind,
-                          present=lambda: device_present(device))
+                          present=lambda: device_present(device),
+                          device=device)
         return feed, ""
     except Exception as exc:  # noqa: BLE001 - a camera must not end the app
         log.warning("camera: not wired (%s: %s)", type(exc).__name__, exc)

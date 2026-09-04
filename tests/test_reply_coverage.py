@@ -59,9 +59,12 @@ WHAT IT DOES NOT PROMISE. The check fires on any read beside an authored
 line, whatever the intent behind it, and RENDER_NOW_LINE pushes the model
 toward answering: it never COMPOSES a recital, but nothing here stops the
 model writing one. And the convention it reads -- reads hand back text,
-writes author their own line -- has one deliberate exception already,
-screen_qa (jarvis/tools/screen.py), which authors its success line because
-the vision call can take 25 s. Nothing at register time enforces it.
+writes author their own line -- has exceptions already: this header used
+to name one, screen_qa (jarvis/tools/screen.py, because the vision call
+can take 25 s), and a census of jarvis/tools on 2026-09-03 found ten
+(AUTHORED_BY_READS at the bottom of this file, pinned by a test that
+parses the tools rather than trusting this prose). Nothing at register
+time enforces the convention.
 
 WHY THIS CANNOT BECOME THE TIMER BUG. The unbacked-action guard must not
 arm on questions because its retry is offered the tools and executes
@@ -92,6 +95,15 @@ CALENDAR_TEXT = ("Tomorrow: 11:15 am Hunter Peyrovi and ValerieAnne "
 # notes.py: ToolResult(text=f"{k} added: {text}", speak=line)
 NOTES_TEXT = "todo added: milk"
 NOTES_LINE = "Added to your shopping list, sir."
+# notes.py:834, `act == "list"`: speak= is s.list_text(k), i.e. the items
+# HE dictated, in his words. Markdown and an emoji here because that is
+# what a shopping list picks up (2026-09-03, F27).
+LIST_LINE = "Three on your shopping list, sir: **milk**, eggs 🥚 and bread."
+LIST_LINE_SPOKEN = "Three on your shopping list, sir: milk, eggs and bread."
+# timekeeper.py list_text: three sentences, and the tool says so
+# (max_sentences=3).
+SCHEDULE_LINE = ("Two timers running, sir. The kitchen one has four minutes "
+                 "left. The laundry one has half an hour.")
 # what the render round writes once it is allowed to run
 COVERED = ("You have a meeting with ValerieAnne at 11:15 tomorrow, sir, "
            "then Biosensors and the chiropractor. Milk is on the shopping "
@@ -101,7 +113,8 @@ COVERED = ("You have a meeting with ValerieAnne at 11:15 tomorrow, sir, "
 SCREEN_LINE = "A pull request, sir."
 
 
-def make_registry(record, calendar=CALENDAR_TEXT, calendar_ok=True):
+def make_registry(record, calendar=CALENDAR_TEXT, calendar_ok=True,
+                  screen=None):
     """The four tools this turn can reach, shaped like the real ones: the
     read hands back TEXT for the model to phrase, the writes hand back an
     authored ``speak`` line of their own."""
@@ -113,6 +126,11 @@ def make_registry(record, calendar=CALENDAR_TEXT, calendar_ok=True):
 
     def notes(action="list", text="", **_):
         record.append(("notes", action, text))
+        if action == "list":
+            # notes.py:834 -- the READ half of the same tool authors its
+            # line too, and the line is HUNTER'S OWN text: whatever he put
+            # on the list, markdown, emoji and all.
+            return ToolResult(text=LIST_LINE, speak=LIST_LINE)
         return ToolResult(text=NOTES_TEXT, speak=NOTES_LINE)
 
     def add_event(title="", when="", **_):
@@ -125,6 +143,15 @@ def make_registry(record, calendar=CALENDAR_TEXT, calendar_ok=True):
         line = f"Timer set for {when}, sir."
         return ToolResult(text=line, speak=line)
 
+    def manage_schedule(action="list", **_):
+        # timekeeper.py `a == "list"`: a READ that authors its line, and
+        # the line is several sentences (max_sentences=3, as the real one
+        # declares). Held beside an owed read it is three sentences of
+        # authored text in the degrade, not one.
+        record.append(("manage_schedule", action))
+        return ToolResult(text=SCHEDULE_LINE, speak=SCHEDULE_LINE,
+                          max_sentences=3)
+
     def get_weather(when="now", **_):
         record.append(("get_weather", when))
         return ToolResult(text="Tomorrow: high 96, low 77, heavy showers.")
@@ -135,7 +162,9 @@ def make_registry(record, calendar=CALENDAR_TEXT, calendar_ok=True):
 
     def screen_qa(question="", **_):
         record.append(("screen_qa", question))
-        return ToolResult(text=f"Active window: Chrome. {SCREEN_LINE}",
+        # `screen` overrides the result TEXT only: a vision answer long
+        # enough to be cut against NUM_CTX, with the authored line intact.
+        return ToolResult(text=screen or f"Active window: Chrome. {SCREEN_LINE}",
                           max_sentences=3, speak=SCREEN_LINE)
 
     obj = {"type": "object", "properties": {}}
@@ -144,6 +173,8 @@ def make_registry(record, calendar=CALENDAR_TEXT, calendar_ok=True):
         ToolSpec("notes", "Notes, to-dos and lists.", obj, notes),
         ToolSpec("add_event", "Put an event on the calendar.", obj, add_event),
         ToolSpec("set_reminder", "Set a timer or reminder.", obj, set_reminder),
+        ToolSpec("manage_schedule", "List, cancel or adjust timers.", obj,
+                 manage_schedule),
         ToolSpec("get_weather", "Weather now or a forecast.", obj, get_weather),
         ToolSpec("system_health", "How the machine is doing.", obj, system_health),
         ToolSpec("screen_qa", "Answer a question about the screen.", obj,
@@ -719,3 +750,253 @@ def test_a_result_from_the_talking_round_itself_is_still_owed(brain,  # noqa: F8
     assert len(sent) == 2, "the calendar answer was never phrased"
     assert "11:15" in " ".join(spoken)
     assert spoken[-1] == NOTES_LINE
+
+
+# ============== JARVIS'S OWN WORDS ARE NOT THE MODEL'S TO BE CAPPED (F26)
+# The two spoken caps -- MAX_SPOKEN_SENTENCES (2) and MAX_SPOKEN_CHARS
+# (250) -- are a rule about how much PROSE he wants back from a model.
+# They were being applied to lines the CODE wrote as well: the
+# confirmation a write authored, and the degrade's honest notice about
+# what went unspoken beside it. append_spoken_lines has exempted a HELD
+# line from exactly this since it was written ("the cap is a rule about
+# how much prose he wants, not a licence to drop the news of a write");
+# the speak branch and the degrade never got the same exemption.
+def test_the_degrade_still_says_what_went_unspoken_after_two_confirmations(
+        setup, caplog):
+    """"What's the weather tomorrow, add milk to my list and what timers
+    do I have": one read owed, a write done, a three-sentence authored
+    read-out held beside it, and a render round that writes nothing at
+    all. The reply is the degrade -- both authored lines plus the notice
+    naming the weather, FIVE sentences -- and it went through the model's
+    sentence cap (4 since 09-04, 2 the night this was found), so
+    limit_sentences dropped the notice, which is the last sentence. He
+    heard about the milk and his timers and nothing whatever about the
+    weather he asked for, while the WARNING claimed the sources had been
+    named instead."""
+    b, fake = setup[0]()
+    record = setup[1]
+    fake.replies = [tool_reply(("get_weather", {"when": "tomorrow"}),
+                               ("notes", {"action": "add", "text": "milk"}),
+                               ("manage_schedule", {"action": "list"})),
+                    text_reply("   ")]           # the render round says nothing
+    with caplog.at_level("WARNING", logger="jarvis.brain"):
+        spoken = dict(b._chat_sync(
+            "what's the weather tomorrow, add milk to my list and what "
+            "timers do I have"))["SPEAK"]
+    assert [n for n, *_ in record] == ["get_weather", "notes",
+                                       "manage_schedule"]
+    assert NOTES_LINE in spoken and SCHEDULE_LINE in spoken
+    assert len(brain_mod.split_sentences(spoken)) > brain_mod.MAX_SPOKEN_SENTENCES, \
+        "the case only bites past the model's cap; this reply is under it"
+    assert brain_mod.tool_only_line(["get_weather"]) in spoken, \
+        "the log says the sources were named; the cap had eaten the notice"
+
+
+def test_two_confirmations_in_one_round_both_survive_the_char_cap(setup):
+    """Two writes, nothing owed, so the authored lines end the turn:
+    speak = " ".join(authored). The sentence cap was raised for them and
+    the CHARACTER cap was not -- MAX_SPOKEN_CHARS on a reply of that many
+    sentences -- so a long calendar confirmation ate the timer's. Both
+    things happened; he is told about both. The title is sized at run
+    time so the pair lands between the prose cap and the TTS hard limit,
+    whatever the caps are set to."""
+    b, fake = setup[0]()
+    timer = "Timer set for ten minutes, sir."
+    title = "Dinner with the Staffeldts"
+    while len(f"Added {title}, Tuesday at 4:30 PM, to your calendar, sir.") \
+            + 1 + len(timer) <= brain_mod.MAX_SPOKEN_CHARS:
+        title += " at the place by the river"
+    event = f"Added {title}, Tuesday at 4:30 PM, to your calendar, sir."
+    assert brain_mod.MAX_SPOKEN_CHARS < len(event) + 1 + len(timer) \
+        <= brain_mod.HARD_SPOKEN_CHARS, "the case needs room under the TTS limit"
+    fake.replies = [tool_reply(("add_event", {"title": title,
+                                              "when": "Tuesday at 4:30 PM"}),
+                               ("set_reminder", {"when": "ten minutes"}))]
+    spoken = dict(b._chat_sync("put dinner in my calendar and set a timer "
+                               "for ten minutes"))["SPEAK"]
+    assert event in spoken
+    assert timer in spoken, "the second write's confirmation was trimmed off"
+
+
+def test_a_long_authored_read_out_keeps_its_own_allowance_and_no_more(setup):
+    """The per-line rule, both halves. A ten-sentence note read-out is
+    still not read whole (2026-08-26, tests/test_found_speak_bypass.py):
+    the cap is applied to the LINE, at the larger of the model cap and
+    the tool's own allowance. And it is applied to the line only: the
+    timer's confirmation beside it is not what pays for the trim."""
+    b, fake = setup[0]()
+    ten = " ".join(f"Item {n} is on it." for n in range(1, 11))
+    long_line = f"Ten on your list, sir. {ten}"
+    reg = brain_mod._REGISTRY
+    reg.register(ToolSpec("notes_long", "A long read-out.",
+                          {"type": "object", "properties": {}},
+                          lambda **_: ToolResult(text=long_line,
+                                                 speak=long_line)))
+    fake.replies = [tool_reply(("notes_long", {}),
+                               ("set_reminder", {"when": "ten minutes"}))]
+    spoken = dict(b._chat_sync("read me my list and set a timer for ten "
+                               "minutes"))["SPEAK"]
+    sentences = brain_mod.split_sentences(spoken)
+    assert sentences[-1] == "Timer set for ten minutes, sir."
+    assert len(sentences) == brain_mod.MAX_SPOKEN_SENTENCES + 1, sentences
+
+
+def test_the_half_a_result_notice_never_costs_him_a_confirmation(setup):
+    """A tool text too long for the context window is cut, and the reply
+    then owes him PARTIAL_RESULT_LINE. The model's answer gives up a
+    sentence to make room for it -- that is the trade, and it is the
+    model's prose to give. Two authored confirmations are not: the notice
+    joins them or it is left out."""
+    b, fake = setup[0](screen="Active window: Chrome. " + "detail. " * 700)
+    fake.replies = [tool_reply(("screen_qa", {"question": "what is this"}),
+                               ("set_reminder", {"when": "ten minutes"}))]
+    spoken = dict(b._chat_sync("what's on my screen and set a timer for "
+                               "ten minutes"))["SPEAK"]
+    assert SCREEN_LINE in spoken
+    assert "Timer set for ten minutes, sir." in spoken, \
+        "the partial-result notice was paid for with a write he was owed"
+
+
+# ======= A HELD LINE GETS THE GUARDS EVERY OTHER AUTHORED LINE GETS (F27)
+# notes list / notes search / timekeeper list put HUNTER'S OWN text on the
+# speak= path. Spoken alone it goes through _finish_spoken, which strips
+# the markdown and the emoji. Held beside an owed read and appended by the
+# code, it went to TTS exactly as he dictated it -- and the same raw line
+# was what held_lines_missing compared against the GUARDED reply, so a
+# model that copied it verbatim never matched and he heard it twice.
+def test_a_held_list_is_guarded_exactly_as_it_is_when_it_is_spoken_alone(setup):
+    b, fake = setup[0]()
+    fake.replies = [tool_reply(("notes", {"action": "list"}))]
+    alone = dict(b._chat_sync("read me my shopping list"))["SPEAK"]
+    assert alone == LIST_LINE_SPOKEN
+    fake.replies = [tool_reply(("notes", {"action": "list"}),
+                               ("get_weather", {"when": "tomorrow"})),
+                    text_reply("Heavy showers tomorrow, sir.")]
+    held = dict(b._chat_sync("read me my list and what's the weather"))["SPEAK"]
+    assert held.endswith(LIST_LINE_SPOKEN), held
+    assert "**" not in held and "🥚" not in held
+
+
+def test_a_held_list_reaches_tts_guarded_on_the_streamed_path_too(brain,  # noqa: F811
+                                                                  monkeypatch):
+    """The streamed path hands the held line to on_sentence itself, which
+    is the one place TTS gets it: raw there is raw in the room."""
+    b, sent = _streamer(brain, monkeypatch, [
+        _tool_chunk(("notes", {"action": "list"}),
+                    ("get_weather", {"when": "tomorrow"})),
+        [{"message": {"role": "assistant",
+                      "content": "Heavy showers tomorrow, sir."},
+          "done": True, "load_duration": 0}]])
+    spoken = []
+    b._chat_sync("read me my list and what's the weather",
+                 on_sentence=spoken.append)
+    assert spoken[-1] == LIST_LINE_SPOKEN, spoken
+
+
+def test_a_reply_that_copies_the_guarded_line_is_not_made_to_say_it_twice(setup):
+    """The model is TOLD the held line in HELD_LINE_NOTE and copying it is
+    the common case. It copies what it was told, so what it was told has
+    to be the line that will actually be spoken -- otherwise the match
+    fails on the markdown alone and the code appends a second copy."""
+    b, fake = setup[0]()
+    fake.replies = [tool_reply(("notes", {"action": "list"}),
+                               ("get_weather", {"when": "tomorrow"})),
+                    text_reply(f"Heavy showers tomorrow, sir. "
+                               f"{LIST_LINE_SPOKEN}")]
+    spoken = dict(b._chat_sync("read me my list and what's the weather"))["SPEAK"]
+    assert spoken.count("shopping list") == 1, spoken
+    told = [m["content"] for m in fake.chat_payloads()[-1]["messages"]
+            if m["role"] == "user"][-1]
+    assert LIST_LINE_SPOKEN in told and "**" not in told
+
+
+def test_a_model_that_dies_mid_repair_still_says_the_line_guarded(setup):
+    """The two early returns that keep a write's news when Ollama dies
+    hand back degrade() untouched -- no guards at all on that path."""
+    b, fake = setup[0]()
+    fake.replies = [tool_reply(("notes", {"action": "list"}),
+                               ("get_weather", {"when": "tomorrow"})),
+                    brain_mod.OllamaDown("connection refused")]
+    spoken = dict(b._chat_sync("read me my list and what's the weather"))["SPEAK"]
+    assert LIST_LINE_SPOKEN in spoken
+    assert "**" not in spoken and "🥚" not in spoken
+
+
+# ===== THE CONVENTION THE CHECK TRUSTS, COUNTED RATHER THAN ASSUMED (F28)
+# answer_owed reads one convention: reads hand back text and leave the
+# phrasing to a round, writes and controls author their own confirmation.
+# The comment above it named screen_qa as the ONE deliberate exception.
+# That was wrong, and the census below is what it should have said.
+def _authored_success_lines():
+    """Every ToolResult in jarvis/tools that carries speak= on a path that
+    is not a plain failure, as (module, function). Static parse: nothing
+    is imported, called, or reached over the network."""
+    import ast
+    import pathlib
+
+    found = set()
+    root = pathlib.Path(brain_mod.__file__).resolve().parent / "tools"
+    for path in sorted(root.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        holder = {}
+        for node in ast.walk(tree):
+            for child in ast.iter_child_nodes(node):
+                holder[child] = node
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", "") == "ToolResult"):
+                continue
+            kw = {k.arg: k.value for k in node.keywords if k.arg}
+            ok = kw.get("ok")
+            if "speak" not in kw or (isinstance(ok, ast.Constant)
+                                     and ok.value is False):
+                continue
+            up = node
+            while up in holder:
+                up = holder[up]
+                if isinstance(up, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    found.add((path.name, up.name))
+                    break
+    return found
+
+
+# Writes and controls: authoring the line is the CONVENTION for these, and
+# the coverage check is right to treat them as already answered.
+AUTHORED_BY_WRITES = {
+    ("calendar.py", "add_event"), ("docs.py", "docs_reindex"),
+    ("notes.py", "notes"), ("spotify.py", "play"), ("spotify.py", "control"),
+    ("spotify.py", "queue"), ("spotify.py", "radio"), ("spotify.py", "liked"),
+    ("spotify.py", "_like"), ("timekeeper.py", "set_reminder"),
+    ("timekeeper.py", "set_timer"), ("timekeeper.py", "set_alarm"),
+    ("timekeeper.py", "manage_schedule"),
+}
+# READS that author a success line -- every one of them invisible to
+# answer_owed, exactly the way screen_qa's own answer is. Measured
+# 2026-09-03; the comment in brain.py claimed there was one.
+AUTHORED_BY_READS = {
+    ("screen.py", "screen_qa"),            # the documented one
+    ("notes.py", "notes"),                 # list / search
+    ("timekeeper.py", "manage_schedule"),  # list
+    ("spotify.py", "now_playing"),
+    ("oracle.py", "oracle_status"),
+    ("canvas.py", "canvas_due"),           # "nothing due"
+    ("canvas.py", "canvas_grades"),        # "no grades posted"
+    ("canvas.py", "canvas_announcements"),
+    ("journal.py", "recap_day"),           # "nothing in your journal"
+    ("mail.py", "get_mail"),               # "nothing new"
+}
+
+
+def test_the_reads_that_author_their_own_success_line_are_counted():
+    """A new name in this failure is a decision, not a nuisance: if what
+    authored the line is a READ, the coverage check has just gone blind to
+    it and brain.py's convention comment needs it by name."""
+    assert _authored_success_lines() == AUTHORED_BY_WRITES | AUTHORED_BY_READS
+
+
+def test_a_read_that_authors_its_line_is_invisible_to_the_check():
+    """Which is the whole reason the list above has to be maintained: the
+    check cannot tell such a read from a write, and never could."""
+    for authored in (SCREEN_LINE, LIST_LINE):
+        assert brain_mod.answer_owed(
+            ToolResult(text="data he can hear", speak=authored)) is False

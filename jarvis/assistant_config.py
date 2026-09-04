@@ -56,8 +56,11 @@ DEFAULTS: dict = {
     # per-account entry in `accounts` may carry its own smtp_host; without
     # one, mail.smtp_host() rewrites imap.x -> smtp.x, which is right for
     # Gmail and for everything else that names its servers that way.
+    # smtp_host is deliberately NOT a default: load() writes every default
+    # key into the file, and a written "smtp.gmail.com" then reached every
+    # account that had none of its own, so the rewrite never ran (F22).
     "gmail": {"address": "", "app_password": "", "imap_host": "imap.gmail.com",
-              "smtp_host": "smtp.gmail.com", "accounts": []},
+              "accounts": []},
     "claude": {
         "allowed_dirs": ["/home/hunterp/Jarvis", "/home/hunterp/haymaker-digest"],
         "projects_root": "/home/hunterp/projects",
@@ -421,19 +424,30 @@ DEFAULTS: dict = {
                  "room_sensor_enabled": False, "room_sensor_url": "",
                  "room_sensor_power_url": "",
                  "room_sensor_timeout_s": 1.5,
-                 # THE ZONE MODEL, in metres (jarvis/ui/sensors_page.py).
-                 # The LD2410 reports a range and NO angle, so "at the desk"
-                 # can only ever be a distance BAND -- it cannot tell the
-                 # desk from the bookshelf when both sit at the same range.
-                 # That is why the camera is allowed to overrule it: if the
-                 # eye recognises him in its cone he is at the desk whatever
-                 # the radar's range says (his words, 2026-09-03). The
-                 # defaults are the sketch he picked, and 4.5 m is the
-                 # coverage the tuned gates MEASURED, not a guess. Edit them
-                 # on the console's SENSORS page rather than by hand; either
-                 # way a restart is needed.
-                 "desk_band_m": [0.8, 1.8],
-                 "room_band_m": [1.8, 4.5],
+                 # THE ZONE MODEL LIVES IN "zones" AT THE BOTTOM OF THIS
+                 # FILE, and nowhere else. There used to be a second one
+                 # here -- desk_band_m / room_band_m, a TWO-band ladder
+                 # that assumed the desk was the NEARER band -- and it
+                 # disagreed with the named N-band ladder under
+                 # zones.rooms: the SENSORS page called 4 of 10 points "AT
+                 # THE DESK" from the radar alone while the zone log had no
+                 # desk band at all. They were different keys, so git saw
+                 # no conflict, and in his actual office the two-band model
+                 # was BACKWARDS -- the near space is empty and the desk is
+                 # at 3.13 m (measured 2026-09-03).
+                 #
+                 # So the two keys are gone from here. jarvis/ui/
+                 # sensors_page.py still READS them, once, as a migration
+                 # source: a config that has them and no zones.rooms gets
+                 # its bands carried across, the page says which key it
+                 # used, and SAVE writes zones.rooms and clears them. They
+                 # are deliberately absent from DEFAULTS so that a value
+                 # here means "his file still holds it" and not "the
+                 # shipped default is sitting here looking live".
+                 #
+                 # camera_overrules stays: it is the SENSORS page's own
+                 # toggle for watching the fusion with the override off,
+                 # and it is not a second copy of anything.
                  "camera_overrules": True,
                  # THREE ROOMS (jarvis/roomfabric.py). The plural
                  # of the four keys above, shaped exactly like
@@ -450,6 +464,34 @@ DEFAULTS: dict = {
                  #    "enabled": true}
                  # An entry with no url or no name is skipped rather than
                  # fatal: one unfinished room must not take the others down.
+                 #
+                 # THE ONE LIST. jarvis/rooms.py (the satellite lease) and
+                 # jarvis/roomaudio.py (which speaker a line comes out of)
+                 # read THIS list too, and every lane spells the name with
+                 # roomfabric.room_name, so "Kitchen", " kitchen " and
+                 # "Kitchen!" are one room. Two lists was the shape that bit
+                 # (F02, 2026-09-03): the other two lanes read a
+                 # rooms.satellites key declared nowhere, so a config with
+                 # this list got a fabric and no leases. The extra per-entry
+                 # keys, and the lane that reads each:
+                 #    "sensors": ["radar"],          # rooms: THE OPT-IN. Only
+                 #                                   #   a box flashed with
+                 #                                   #   jarvis-satellite.yaml
+                 #                                   #   is leased; a plain
+                 #                                   #   radar has no buttons
+                 #                                   #   to press and is never
+                 #                                   #   pressed
+                 #    "username": "jarvis",          # rooms: web_server auth
+                 #    "password": "",                # ditto -- masked; see
+                 #                                   #   SECRET_LIST_FIELDS
+                 #    "lease_ttl_s": 90.0,           # rooms: keep in step with
+                 #                                   #   the YAML's lease_ttl
+                 #    "say_url": "",                 # roomaudio: that room's
+                 #                                   #   speaker; "" = none
+                 #    "private": false               # roomaudio: never a
+                 #                                   #   broadcast target
+                 # The primary entry is the Spark's own room, and the one
+                 # the voice falls through to.
                  "rooms": [],
                  # The fabric's four timers, argued in jarvis/roomfabric.py.
                  # enter: how long a new room must hold occupied before it
@@ -484,6 +526,14 @@ DEFAULTS: dict = {
                  # anything major, then a question. It never reads the mail
                  # -- that needs a yes (Commander._try_briefing_offer).
                  "arrival_offer": True},
+    # The satellite LEASE lane's timers (jarvis/rooms.py). No room list
+    # here, on purpose: the list is presence.rooms above, and an entry
+    # there that lists "sensors" is what makes a room a leased satellite.
+    # renew_s must stay in step with renew_every in scripts/esphome/
+    # jarvis-satellite.yaml; timeout_s is jarvis/roomsensor.py's MEASURED
+    # 3.0 s (max round trip seen 1186 ms), not the 1.5 s that used to be
+    # the module's default.
+    "rooms": {"renew_s": 25.0, "stale_after_s": 90.0, "timeout_s": 3.0},
     # Offline mode and the camera curfew (jarvis/sensing.py). ONE object
     # answers "may this sensor run", combining the manual switch (spoken:
     # "offline mode", "deactivate presence", "stop watching"), this daily
@@ -657,6 +707,21 @@ DEFAULTS: dict = {
                # do) and leave hfov_deg at 0. One of the two must be set --
                # nothing in the code guesses a field of view.
                "hfov_deg": 65.6, "diag_fov_deg": 0.0, "fourcc": "MJPG",
+               # exposure: 0 leaves the camera on its own auto-exposure. A
+               # value > 0 PINS manual exposure (v4l2 exposure_absolute
+               # units, 100 us) at every open. Why the lever exists: the
+               # LifeCam's sensor rate is set by its exposure tier -- 30 fps
+               # at <=156, 15 at 312-625, 7.5 at >=1250 -- and its auto
+               # metering stepped down to the slowest tier on 2026-09-03
+               # evening, halving the preview to 3.7 fps; manual 156 was
+               # MEASURED (09-04, grab only) to return it to 15-16 fps
+               # through the app's single driver buffer. It trades the
+               # camera's metering for a fixed rate, so whether the pane is
+               # still watchable in evening light is read off the next
+               # "campreview:" log line, not assumed. Values off the
+               # camera's own table (50, 100, 200, 400) fall to the SLOWEST
+               # tier -- 156 first, then read the line.
+               "exposure": 0,
                "detect_width": 320, "detect_height": 180, "threads": 2,
                "idle_fps": 1.5, "armed_fps": 8.0, "min_conf": 0.6,
                # Where the downloaded weights live. Empty means
@@ -712,10 +777,11 @@ DEFAULTS: dict = {
                # calibrate it from the $0 photo test (docs/vision.md 9): the
                # rig prints the raw ratio t, and r = t / tan(known angle).
                "nose_ratio": 0.35,
-               # Fold the camera into the wake gate (jarvis/eye.py
-               # resolve_wake). It can only ever promote a suppressed wake,
-               # never suppress an accepted one.
-               "wake_tiebreak": True,
+               # There is deliberately NO wake-gate key here. eye.resolve_wake
+               # exists and nothing calls it (docs/vision.md: the wiring "is
+               # a two-line change when one exists"), so a camera wake-tiebreak
+               # key sat here for two days promising a control the code did
+               # not have. It comes back with the wiring, not before.
                # Face identity: a gallery of HIS FACE on disk. Opt-in, and the
                # threshold is OpenCV's own documented SFace cosine for "same
                # person".
@@ -731,11 +797,12 @@ DEFAULTS: dict = {
                # start. scripts/face_model_compare.py is how the real number
                # arrives, and only he can run it -- it needs his face.
                "identity": False, "identity_min": 0.363,
-               # One JPEG at 0600, overwritten each time, for diagnosing a
-               # mount. The only path by which a frame reaches the disk --
-               # and note that the console's camera preview is NOT one:
-               # jarvis/campreview.py never writes a frame anywhere.
-               "debug_frame": False,
+               # And NO frame-to-disk key. A camera debug-frame key ("one
+               # JPEG at 0600, for diagnosing a mount") sat here unread, and
+               # an implementer following its comment would have written a
+               # camera frame to disk -- the one thing the standing camera
+               # rule and jarvis/campreview.py's docstring forbid. The mount
+               # is diagnosed from numbers (scripts/vision_selfcheck.py).
                # The console's camera pane (jarvis/campreview.py,
                # jarvis/ui/preview.py). His words, 2026-09-02: "lets add a
                # small camera with visable tracking on the jarvis app but
@@ -748,21 +815,30 @@ DEFAULTS: dict = {
                # sensing.py on top, so offline mode and the curfew shut it
                # whatever this says.
                #
-               # preview_fps is the PICTURE rate. It was 6, under a measured
-               # ~7.5 fps device -- and that measurement was an artefact of
-               # asking a LifeCam Cinema for 1920x1080, a mode it does not
-               # have (v4l2 grants a different one silently and the cost shows
-               # up as grab latency). At the corrected 1280x720 the grab is
-               # 11 ms, so 6 fps was leaving the pane at a 167 ms step for no
-               # reason and he said so: "it lags a ton" (2026-09-03).
+               # preview_fps is the PICTURE rate, a CEILING the device may
+               # not reach, and THE SAME NUMBER AS campreview.DEFAULT_FPS --
+               # pinned equal by tests/test_campreview.py, because this dict
+               # is deep-merged into every config, so THIS is the default a
+               # fresh install runs at and campreview's copy is only reached
+               # with no config at all. The two were 15.0 and 7.5 for a day.
                #
-               # 15 is capped at 30 in jarvis/campreview.py -- the nominal
-               # rate of the mode -- and the boxes and the name have their own
-               # slower cadences, which is what keeps the whole thing at ~12%
-               # of one core instead of 75%. The console animates on 16.67 ms
-               # slot boundaries in the same process, so the capture runs on
-               # its own thread and the pane repaints off a latest-wins slot.
-               "preview": False, "preview_fps": 15.0},
+               # 7.5 is the highest rate the running app has been measured to
+               # get from the LifeCam's 1280x720 MJPG mode: 7.4-7.6 fps with
+               # him at the desk at 10 requested (2026-09-03 00:04-00:22)
+               # and 7.6 at 15 requested (19:47 the same day). A ceiling
+               # above the delivered rate costs nothing but a parked read;
+               # one below it throws pictures away, which is why the default
+               # is the best measured rate and not the worst. An earlier
+               # comment here said the 720p grab was 11 ms and that the
+               # cadences kept the pane at ~12% of one core instead of 75%;
+               # neither reproduced and both are gone -- the measured story,
+               # including why the 7.5 is not understood, is the module
+               # docstring of jarvis/campreview.py. His own config sets this
+               # key explicitly, so his rate is whatever he last wrote there.
+               # Capped at 30 in campreview, the mode's granted nominal; the
+               # boxes and the name have their own slower cadences, and the
+               # capture runs on its own thread off a latest-wins slot.
+               "preview": False, "preview_fps": 7.5},
     # Grab and throw (jarvis/gesture.py, jarvis/handstage.py,
     # jarvis/cast.py, jarvis/gesturecast.py). His words, 2026-09-03: "reach
     # out and grab at the screen (in the air) where the camera is and then
@@ -1079,7 +1155,10 @@ SECRET_LIST_FIELDS = (("gmail.accounts", "app_password"),
                       # a log line. MEASURED 2026-09-03 with a gmail
                       # app_password and a satellite password in one config:
                       # the gmail one was masked, the satellite one was not.
-                      ("rooms.satellites", "password"))
+                      # It lives in presence.rooms[] since 2026-09-04, when
+                      # that became the ONE room list (F02); the entry here
+                      # moved with it.
+                      ("presence.rooms", "password"))
 
 # is_configured() / setup_line() sections and the film-JARVIS excuse for each.
 SETUP_LINES: dict[str, str] = {
@@ -1340,6 +1419,33 @@ class AssistantConfig:
                     child = node[part] = {}
                 node = child
             node[parts[-1]] = copy.deepcopy(value)
+        return self.save()
+
+    def unset(self, dotted: str) -> bool:
+        """REMOVE a dotted key and save. True when the file was written.
+
+        The counterpart ``set`` never had, and it exists for exactly one
+        job: retiring a key that has been superseded. A superseded key that
+        is merely ignored still sits in his file looking live, and the next
+        person to read it -- him, at midnight, wondering why the bands are
+        not what he typed -- has no way to tell it apart from one that
+        still drives something.
+
+        A key that is not there is not an error and is not a write: False
+        with nothing changed, so a caller can call it unconditionally.
+        Intermediate keys that are not mappings are the same case.
+        """
+        parts = dotted.split(".")
+        with self._lock:
+            node = self._data
+            for part in parts[:-1]:
+                child = node.get(part) if isinstance(node, dict) else None
+                if not isinstance(child, dict):
+                    return False
+                node = child
+            if not isinstance(node, dict) or parts[-1] not in node:
+                return False
+            node.pop(parts[-1], None)
         return self.save()
 
     def update(self, values: dict) -> bool:

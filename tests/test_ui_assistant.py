@@ -235,8 +235,13 @@ def test_plan_strip_value_budget_shrinks_first():
     assert hidden == ["MEMORY"] and chars >= 6
     # slug shorter than six needs only its own length
     assert plan_strip(1040, 237, 130, 14, 3, segs)[0] == 3
-    # absurdly narrow: the chip itself yields, MEMORY stays hidden
-    assert plan_strip(500, 237, 130, 14, 15, segs) == (0, ["MEMORY"])
+    # absurdly narrow: the chip itself yields -- and takes its yield with
+    # it. This read (0, ["MEMORY"]) until 2026-09-03: a plan with no chip
+    # that still hid the segment the chip had displaced is the footer of
+    # the 09-03 shot 23 ('CPU 52°C · 7% | GPU 44°C · 2%', no memory figure,
+    # no PROJECT chip); tests/test_ui_chrome.py has the measured widths
+    # (ui-polish U14)
+    assert plan_strip(500, 237, 130, 14, 15, segs) == (0, [])
 
 
 def test_plan_strip_at_460_design_px_keeps_the_chip():
@@ -403,3 +408,232 @@ def test_the_room_probe_still_works_against_a_provider_with_no_gpu_arg(
     p._gpu_util_pct = 42
     p._probe_room()
     assert p._room_data["temp"] == "72"
+
+
+# =====================================================================
+# 2026-09-03 ui-polish: pill precedence (U05/U07), the alarm parts (U10),
+# the standby alpha wiring (U08). The 09-03 panel's measurements are in
+# the docstrings of the functions under test.
+# =====================================================================
+import pytest  # noqa: E402
+
+from jarvis.events import ApprovalResolved, ModelInfo  # noqa: E402
+from jarvis.ui.console_mode import ACTIVE, STANDBY  # noqa: E402
+from jarvis.ui.main_window import alarm_modal_parts, pill_look  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _holo():
+    theme.select_look("holo")
+    yield
+    theme.select_look(theme.DEFAULT_LOOK)
+
+
+# ------------------------------------ U05 / U07 the pill's precedence
+def test_resolve_state_places_alarm_under_the_turn_and_loading_over_idle():
+    assert resolve_state(False, False, False, False, alarm=True) == "alarm"
+    assert resolve_state(False, False, True, False, alarm=True) == "thinking"
+    assert resolve_state(False, True, False, False, alarm=True) == "listening"
+    assert resolve_state(False, False, False, False, waiting=True,
+                         alarm=True) == "alarm"
+    assert resolve_state(False, False, False, True, loading=True) == "error"
+    assert resolve_state(False, False, False, False, working=True,
+                         loading=True) == "working"
+    assert resolve_state(False, False, False, False, loading=True) == "loading"
+    assert STATE_WORDS["loading"] == "LOADING" and STATE_WORDS["alarm"] == "ALARM"
+    assert theme.STATE_COLORS["loading"] == theme.FAINT
+    assert theme.STATE_COLORS["alarm"] == theme.WARN
+
+
+def test_pill_look_holo_error_outranks_a_warn_hold():
+    # measured in 07-error: dot (255,180,84) = WARN with the word in ERR
+    assert pill_look("error", True, "holo") == (theme.ERR, theme.ERR, "disc")
+    assert pill_look("error", False, "holo") == (theme.ERR, theme.ERR, "disc")
+    # every other state still takes the amber dot while the hold lives
+    assert pill_look("idle", True, "holo") == (theme.WARN, theme.FOCAL, "disc")
+    assert pill_look("listening", True, "holo")[0] == theme.WARN
+
+
+def test_pill_look_holo_gives_the_claude_states_a_ring():
+    # measured in 23: WORKING's dot (24,153,189) == READY's
+    assert pill_look("idle", False, "holo") == (theme.CYAN_DIM, theme.FOCAL, "disc")
+    assert pill_look("working", False, "holo") == (theme.CYAN, theme.FOCAL, "ring")
+    assert pill_look("waiting", False, "holo") == (theme.WARN, theme.FOCAL, "ring")
+    assert pill_look("working", False, "holo")[:2] != pill_look("idle", False, "holo")[:2]
+    assert pill_look("loading", False, "holo") == (theme.FAINT, theme.MUTED, "disc")
+    assert pill_look("alarm", False, "holo") == (theme.WARN, theme.WARN, "disc")
+
+
+def test_pill_look_classic_is_todays_table():
+    theme.select_look("classic")
+    for state in ("idle", "working", "waiting", "error", "thinking"):
+        color = theme.STATE_COLORS[state]
+        word = theme.FOCAL if state in theme.FOCAL_WORD_STATES else color
+        assert pill_look(state, False) == (color, word, "disc")
+        assert pill_look(state, True) == (theme.WARN, word, "disc")   # warts included
+
+
+class _Pill:
+    def __init__(self):
+        self.states = []
+
+    def set_state(self, word, dot, word_color, shape="disc"):
+        self.states.append((word, dot, word_color, shape))
+
+    @property
+    def last(self):
+        return self.states[-1]
+
+
+class _Win:
+    """The pill's inputs on a bare window: the shipping methods, unbound."""
+
+    _app_state = MainWindow._app_state
+    _refresh_pill = MainWindow._refresh_pill
+    set_status = MainWindow.set_status
+    _ev_model = MainWindow._ev_model
+    _question_opened = MainWindow._question_opened
+    _question_closed = MainWindow._question_closed
+    _ev_approval_done = MainWindow._ev_approval_done
+    _hide_alarm = MainWindow._hide_alarm
+    _ev_alarm_stopped = MainWindow._ev_alarm_stopped
+
+    def __init__(self):
+        self.pill = _Pill()
+        self._speaking = self._recording = self._thinking = False
+        self._error_until = self._warn_until = 0.0
+        self._tasks = ClaudeTaskTracker()
+        self._alarm = None
+        self._alarm_scrim = None
+        self._booting = True
+        self._pending = set()
+        self._bar_state_color = theme.CYAN_DIM
+        self._rule = None
+        self.toast = SimpleNamespace(show=lambda *a, **k: None)
+        self.root = SimpleNamespace(after=lambda ms, fn: None)
+        self.transcript = SimpleNamespace(resolve_approval=lambda *a, **k: None)
+        self.reactor = SimpleNamespace(delete=lambda tag: None)
+
+
+def test_the_pill_reads_loading_until_the_model_lands():
+    win = _Win()
+    win._refresh_pill()
+    assert win.pill.last == ("LOADING", theme.FAINT, theme.MUTED, "disc")
+    # the boot's own busy Status changes nothing
+    win.set_status("Loading speech model…", "busy")
+    assert win.pill.last[0] == "LOADING"
+    # ModelInfo is the model coming up: READY
+    win._ev_model(ModelInfo(text="small · GPU fp16"))
+    assert win.pill.last == ("READY", theme.CYAN_DIM, theme.FOCAL, "disc")
+    assert not win._booting
+
+
+def test_any_non_busy_status_ends_the_boot_and_classic_never_starts_it():
+    win = _Win()
+    win.set_status("Speech model failed to load", "error")
+    assert not win._booting and win.pill.last[0] == "ERROR"
+    win = _Win()
+    win.set_status("Mic: Snowball", "info")
+    assert not win._booting and win.pill.last[0] == "READY"
+    theme.select_look("classic")
+    win = _Win()
+    win._refresh_pill()
+    assert win.pill.last[0] == "READY"           # the 08-31 pill, untouched
+
+
+def test_an_answer_owed_reads_waiting_and_a_ringing_alarm_reads_alarm():
+    win = _Win()
+    win._booting = False
+    win._question_opened("u-1")
+    assert win.pill.last == ("WAITING", theme.WARN, theme.FOCAL, "ring")
+    win._question_opened("a-1")
+    win._ev_approval_done(ApprovalResolved(request_id="u-1", allowed=True,
+                                           source="ui"))
+    assert win.pill.last[0] == "WAITING"         # a-1 is still open
+    win._question_closed("a-1")
+    assert win.pill.last[0] == "READY"
+    win._question_closed("never-opened")          # harmless
+    win._alarm = ("al-1", None, ())
+    win._refresh_pill()
+    assert win.pill.last == ("ALARM", theme.WARN, theme.WARN, "disc")
+    # the scrim and the card go with the alarm; the header returns
+    win._alarm = ("al-1", SimpleNamespace(place_forget=lambda: None,
+                                          destroy=lambda: None), ())
+    win._alarm_scrim = 7
+    win._ev_alarm_stopped(SimpleNamespace(alarm_id="al-1"))
+    assert win._alarm is None and win._alarm_scrim is None
+    assert win.pill.last[0] == "READY"
+    # classic sees neither input
+    theme.select_look("classic")
+    win = _Win()
+    win._booting = False
+    win._pending.add("u-9")
+    win._alarm = ("al-9", None, ())
+    win._refresh_pill()
+    assert win.pill.last[0] == "READY"
+
+
+# ---------------------------------------------- U10 the alarm's words
+def test_alarm_modal_parts_always_names_the_kind():
+    assert alarm_modal_parts("Biosensors lecture", "alarm", "9:45 am") == \
+        ("ALARM", "Biosensors lecture", "9:45 AM")
+    assert alarm_modal_parts("", "timer", "in 1 minute") == ("TIMER", "", "IN 1 MINUTE")
+    assert alarm_modal_parts(None, None, None) == ("ALARM", "", "")
+    assert alarm_modal_parts("  ", "reminder", " 7:00 pm ") == ("REMINDER", "", "7:00 PM")
+    # the classic modal keeps its own text (the label OR the kind word)
+    assert alarm_modal_text("Biosensors lecture", "alarm", "9:45 am")[0] == \
+        "Biosensors lecture"
+    assert MainWindow.ALARM_MARGIN == 16
+
+
+# ------------------------------------------- U08 standby dims the stage
+class _ModeWin:
+    """_on_console_mode with every seam it touches stubbed and the standby
+    alpha recorded."""
+
+    _on_console_mode = MainWindow._on_console_mode
+
+    def __init__(self):
+        self.room = SimpleNamespace(set_mode=lambda mode: None)
+        self.reactor = SimpleNamespace(set_speed_scale=lambda s: None)
+        self.transcript = SimpleNamespace(pause_atmo=lambda p: None)
+        self._standby_origin = None
+        self._standby_drift = (0, 0)
+        self.root = SimpleNamespace(winfo_x=lambda: 0, winfo_y=lambda: 0)
+        self.alphas = []
+
+    def _set_footer_hidden(self, hidden):
+        pass
+
+    def _set_tabs_hidden(self, hidden):
+        pass
+
+    def _preview_apply(self, mode=None, enabled=None):
+        pass
+
+    def _move_to(self, x, y):
+        pass
+
+    def _apply_standby(self, at_desk):
+        self.alphas.append(at_desk)
+
+
+def test_keyboard_idle_standby_dims_the_whole_window_in_holo():
+    win = _ModeWin()
+    win._on_console_mode(STANDBY)
+    assert win.alphas == [False]
+    win._on_console_mode(ACTIVE)
+    assert win.alphas == [False, True]
+    theme.select_look("classic")
+    win = _ModeWin()
+    win._on_console_mode(STANDBY)
+    assert win.alphas == []                       # classic: the slab alone
+
+
+def test_a_fake_without_the_standby_seam_still_changes_mode():
+    win = _ModeWin()
+    del _ModeWin._apply_standby
+    try:
+        win._on_console_mode(STANDBY)             # no AttributeError
+    finally:
+        _ModeWin._apply_standby = lambda self, at_desk: self.alphas.append(at_desk)

@@ -152,28 +152,13 @@ def open_gallery(cfg=None) -> FaceGallery:
 
 
 def build_models(cfg):
-    """``(detector, recogniser, reason)`` -- never raises, never falls back.
+    """``(detector, recogniser, reason)``. A DELEGATE -- see fe.build_models.
 
-    The detector is floored LOW rather than at his ``camera.min_conf``, for
-    the same reason scripts/vision_selfcheck.py does it: a face scoring 0.45
-    against a 0.6 bar must be reported WITH ITS SCORE, not vanish and read as
-    "no face seen". The bar is then applied by the quality gate, which says
-    which bar it was.
+    The body moved into the library when the in-app run became a second
+    caller, so that "which models does enrolment load" has one answer. The
+    name is kept here because it is what this script's own tests drive.
     """
-    detector, why = cam.detector_from_config(
-        cfg, score_threshold=facedetect.PROBE_THRESHOLD)
-    if detector is None:
-        return None, None, why
-    try:
-        rec = facedetect.load_recogniser(
-            min_conf=float(cfg.get("camera.min_conf", 0.6)),
-            model_dir=str(cfg.get("camera.model_dir", "") or "") or None,
-            backend=cam.face_backend_from_config(cfg),
-            input_size=(int(cfg.get("camera.detect_width", 320)),
-                        int(cfg.get("camera.detect_height", 180))))
-    except Exception as exc:  # noqa: BLE001 - absence is not a crash
-        return detector, None, str(exc)
-    return detector, rec, ""
+    return fe.build_models(cfg)
 
 
 def build_feed(cfg, policy):
@@ -191,7 +176,8 @@ def build_feed(cfg, policy):
             policy,
             lambda: cam.open_capture(device, lens.width_px, lens.height_px,
                                      fourcc),
-            lens=lens, present=lambda: cam.device_present(device)), why
+            lens=lens, present=lambda: cam.device_present(device),
+            device=device), why
     except Exception as exc:  # noqa: BLE001
         return None, "%s: %s" % (type(exc).__name__, exc)
 
@@ -649,15 +635,50 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     # could not have predicted: a two-pose run is six takes, under the
     # eight-sample floor, so it captures, fails and saves nothing.
     wanted = sum(st.samples for st in plan)
+    # THE CHECKS THAT ARE ARITHMETIC ARE RUN NOW, NOT AFTER THE MINUTE.
+    # ``samples`` and ``pose_spread`` are decided by the plan and the takes
+    # it keeps, so a plan that fails them is known to fail before a frame
+    # exists (fe.plan_shortfalls). The hint underneath is worked out from
+    # the same arithmetic, so it can never name a run that also fails:
+    # --append is the answer only when the stored takes carry enough
+    # recorded coverage to lift this plan over the bar. His live generation
+    # 1 carries none, and the old hint -- "--append is almost certainly
+    # what you want" -- sent him at exactly the run that cannot pass
+    # (F16, reproduced 2026-09-03). Otherwise the five stations come along.
+    short = fe.plan_shortfalls(plan_takes, plan)
+    appended_would_pass = (bool(stored_takes) and not args.append
+                           and not fe.plan_shortfalls(stored_takes, plan))
     if args.pose and not args.append and stored_takes:
         say("WARNING    these %d take(s) will REPLACE the %d already stored "
             "under %r. Add --append to keep what is there."
             % (wanted, len(stored_takes), label))
-        if wanted < fe.MIN_SAMPLES:
+        if wanted < fe.MIN_SAMPLES and appended_would_pass:
             say("           %d is under the %d-sample floor, so this run "
                 "would be refused after the capture. --append is almost "
                 "certainly what you want."
                 % (wanted, fe.MIN_SAMPLES))
+    if short:
+        say("WARNING    this plan cannot pass the checks, whatever the "
+            "camera sees:")
+        for line in short:
+            say("           %s" % line)
+        if appended_would_pass:
+            fix = "--append"
+        else:
+            fix = "%s--plan full" % ("--append " if args.append else "")
+        if args.force:
+            say("           --force: running it anyway, and the generation "
+                "it writes will be recorded as forced.")
+        else:
+            say("STOPPED before the camera opened: nothing was captured. "
+                "Run it again with %s%s."
+                % (fix, "" if appended_would_pass
+                   else " -- the five stations plus the take(s) you named"))
+            feed.close()
+            return 1, {"reason": "the plan cannot pass: %s"
+                                 % "; ".join(short),
+                       "shortfalls": list(short), "label": label,
+                       "plan": plan_why, "fix": fix}
     say("Sit where you normally sit. Nothing you see is shown to anybody, "
         "because nothing is shown at all.")
     def wait(prompt):
@@ -675,24 +696,24 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     finally:
         feed.close()
 
-    removed = 0
-    if rep.ok or args.force:
-        try:
-            gen = gallery.save(
-                reason="face_enrol %s%s%s"
-                % (label,
-                   " (consent typed at the keyboard)" if how == "typed"
-                   else "",
-                   " --force" if not rep.ok else ""),
-                allow_shrink=bool(args.allow_shrink))
-            rep.saved_generation = gen
-            rep.gallery_total = gallery.total()
-            if superseded:
-                removed = gallery.drop_generations(superseded)
-        except ValueError as exc:
-            say("")
-            say("NOT SAVED: %s" % exc)
-            rep.reason = rep.reason or str(exc)
+    # THE VERDICT GUARD IS NO LONGER WRITTEN OUT HERE. It moved into
+    # fe.save_enrolment so that this script and the in-app run
+    # (jarvis/enrolrun.py) are guarded by the same code rather than by two
+    # copies of the same sentence. --force is passed from here and from
+    # nowhere else; the window has no way to reach it.
+    saved = fe.save_enrolment(
+        gallery, rep,
+        reason="face_enrol %s%s%s"
+        % (label,
+           " (consent typed at the keyboard)" if how == "typed"
+           else "",
+           " --force" if not rep.ok else ""),
+        allow_shrink=bool(args.allow_shrink), force=bool(args.force),
+        superseded=superseded)
+    removed = saved["removed"]
+    if saved["error"]:
+        say("")
+        say("NOT SAVED: %s" % saved["error"])
     payload = rep.to_dict()
     payload["reset_removed"] = removed
     payload["consent"] = how
@@ -746,11 +767,22 @@ def do_verify(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     bar_why = cam.identity_min_warning(cfg)
     if bar_why:
         say("NOTE: %s" % bar_why)
-    ident = FaceIdentifier(
-        gallery, recogniser,
-        min_conf=float(cfg.get("camera.min_conf", 0.6)),
-        match_min=float(cfg.get("camera.identity_min", SFACE_COSINE_SAME)),
-        owner=owner_label(cfg))
+    try:
+        ident = FaceIdentifier(
+            gallery, recogniser,
+            min_conf=float(cfg.get("camera.min_conf", 0.6)),
+            match_min=float(cfg.get("camera.identity_min",
+                                    SFACE_COSINE_SAME)),
+            owner=owner_label(cfg))
+    except ValueError as exc:
+        # camera.identity_min is user-editable and json.loads accepts the
+        # bare literal NaN, which used to clear every comparison and name a
+        # stranger as him (F17). The bar is refused at the door now, so
+        # this is the same accommodation do_enrol makes for camera.min_conf.
+        say("STOPPED: %s" % exc)
+        say("Fix camera.identity_min in ~/.config/jarvis/assistant.json.")
+        feed.close()
+        return 1, {"reason": str(exc)}
     rig = vr.Rig(cam.FeedSource(feed), detector, feed.lens,
                  cam.thresholds_from_config(cfg), identifier=ident,
                  head=cam.head_from_config(cfg))

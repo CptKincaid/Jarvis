@@ -558,7 +558,17 @@ _CLASS_CODE_RX = re.compile(
     r"flaky|passes|passing|green|red|clean\s*up|cleanup|"
     r"files?|modules?|repos?|repository|codebase|lines?|functions?|"
     r"methods?|subclass(?:es)?|superclass(?:es)?|inherits?|inheritance|"
-    r"decorators?|packages?|directory|folder|docstrings?)\b", re.I)
+    r"decorators?|packages?|directory|folder|docstrings?|"
+    # ...and the class LIFECYCLE vocabulary (F38, measured 09-03): "where
+    # is my class defined / declared / used", "when is my class
+    # instantiated", "where's my base class", "which class is next in the
+    # pipeline" all wear a possessive and a where/when/next frame and none
+    # of the nouns above, so they went to local:calendar. "called" only in
+    # its passive shape -- "when does my class get called" is code, but
+    # "what is my next class called" is the timetable asking for a name.
+    r"defined|declared|used|instantiated|constructed|constructors?|"
+    r"(?:get|gets|got|is|was|be|been|being)\s+called|invoked|"
+    r"base|parent|child|pipeline|chain|handlers?|attributes?)\b", re.I)
 
 
 def class_diary(text: str) -> bool:

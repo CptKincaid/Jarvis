@@ -82,7 +82,10 @@ FIRST_CUT_WORST = 129 + 151                  # LISTEN + CAM OFF
 # --- and NOW: both chips at SIZE_CAPTION, PAD_X 4, DOT 8, GAP 4, so
 # every chip is its measured text + 2*px(4) + px(8) + px(4) = text + 40 ---
 PILL = {"READY": 116, "ERROR": 119, "WAITING": 135, "THINKING": 148,
-        "WORKING": 148, "SPEAKING": 153, "LISTENING": 158}
+        "WORKING": 148, "SPEAKING": 153, "LISTENING": 158,
+        # 2026-09-03 (ui-polish U05/U07), measured on :92 the same way:
+        # the boot word and the ringing alarm, both narrower than LISTENING
+        "LOADING": 140, "ALARM": 118}
 BADGE = {"OFFLINE": 135, "SENSING": 140, "CAM OFF": 141}
 # slack at his window with the worst pair: what separates the badge from
 # the wordmark canvas there (the canvas ends ~2 px past its last glyph)
@@ -234,7 +237,10 @@ def test_the_badge_kept_its_word_and_the_pill_kept_its_vocabulary():
     assert STATE_WORDS == {"idle": "READY", "listening": "LISTENING",
                            "thinking": "THINKING", "speaking": "SPEAKING",
                            "waiting": "WAITING", "working": "WORKING",
-                           "error": "ERROR"}
+                           "error": "ERROR",
+                           "loading": "LOADING", "alarm": "ALARM"}
+    # the two 09-03 words stay under the widest one, so the budget holds
+    assert max(PILL["LOADING"], PILL["ALARM"]) < PILL["LISTENING"]
     assert not any("…" in word or "." in word for word in STATE_WORDS.values())
 
 

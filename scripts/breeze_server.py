@@ -430,6 +430,18 @@ _STOP = object()
 _DONE = object()
 
 WORKER_GONE = "the breeze render worker is not running"
+WORKER_WEDGED = "the breeze render worker is wedged inside the model"
+
+# How long the sidecar stays up after its render thread has died before the
+# PROCESS exits, so the connection threads still answering {"ok": false} for
+# it can finish. A dead thread used to leave a not-ready sidecar resident for
+# ever: the model's 13.5 GB held, every ping answered not-ready, and
+# Restart=always never fired because the process was alive -- and a thread
+# wedged INSIDE the model (RENDER_STALL_S) cannot be killed or reloaded from
+# in here at all. Exit status 1, deliberately not the 2 that
+# RestartPreventExitStatus treats as a refusal; the unit's StartLimit bounds
+# the loop if it recurs. See exit_when_the_worker_dies.
+WORKER_DEATH_EXIT_GRACE_S = 2.0
 
 
 class _Failed:
@@ -478,6 +490,7 @@ class RenderWorker:
         self._lock = threading.Lock()
         self._thread = None
         self._dead = threading.Event()
+        self._why = None                 # the reason, once there is one
         self._current = None
 
     # ------------------------------------------------------------ lifecycle
@@ -491,6 +504,15 @@ class RenderWorker:
         return not self._dead.is_set()
 
     @property
+    def why(self) -> str:
+        """What to tell a ping about a worker that is no longer alive."""
+        return self._why or WORKER_GONE
+
+    def wait_dead(self, timeout: float | None = None) -> bool:
+        """Block until the worker is dead (or ``timeout``); True when it is."""
+        return self._dead.wait(timeout)
+
+    @property
     def ident(self):
         """The thread the model actually runs on, for the log and the tests."""
         return self._thread.ident if self._thread is not None else None
@@ -499,7 +521,7 @@ class RenderWorker:
         """Idempotent. Raises if the worker has already died."""
         with self._lock:
             if self._dead.is_set():
-                raise RuntimeError(WORKER_GONE)
+                raise RuntimeError(self.why)
             self._start_locked()
         return self
 
@@ -547,9 +569,8 @@ class RenderWorker:
                 try:
                     item = job.chunks.get(timeout=self._stall_s)
                 except queue.Empty:
-                    raise RuntimeError(
-                        f"the breeze render worker produced nothing for "
-                        f"{self._stall_s:.0f}s") from None
+                    self._wedged()
+                    raise RuntimeError(self.why) from None
                 if item is _DONE:
                     return
                 if isinstance(item, _Failed):
@@ -573,13 +594,36 @@ class RenderWorker:
             # a consumer that is no longer reading.
             job.cancelled.set()
 
+    def _wedged(self) -> None:
+        """The thread is blocked inside the model and is not coming back.
+
+        This used to raise for the one connection that hit the stall and
+        change nothing else: the thread was still alive, so ``alive`` and
+        the service's ``ready`` stayed True, and every later job queued
+        behind the wedged one and stalled in its turn -- on Jarvis's side
+        60 s of silence (BREEZE_TIMEOUT_S) per chunk before F5, for every
+        chunk of every reply, until someone restarted the unit. Measured
+        with stall_s=0.5: first render raised after 0.50 s, alive True, ping
+        ready True, second render stalled 0.50 s again.
+
+        FAIL CLOSED, as the ready docstring promises: mark the worker dead
+        so the next ping says not-ready and the next _submit is refused at
+        once, and fail every job already queued so no connection thread is
+        left waiting on it. The thread itself cannot be killed; the process
+        can (exit_when_the_worker_dies), and the unit restarts it.
+        """
+        if self._why is None:
+            self._why = f"{WORKER_WEDGED} (no block for {self._stall_s:.0f}s)"
+        self._dead.set()
+        self._fail_pending(RuntimeError(self.why))
+
     def _submit(self, job) -> None:
         # Under the lock, and _loop sets _dead BEFORE it drains, so a job can
         # never be filed with a worker that has just gone and then wait out
         # RENDER_STALL_S for an answer nobody will send.
         with self._lock:
             if self._dead.is_set():
-                raise RuntimeError(WORKER_GONE)
+                raise RuntimeError(self.why)
             self._start_locked()
             self._inbox.put(job)
 
@@ -598,7 +642,8 @@ class RenderWorker:
         except BaseException:            # it is about to die anyway
             traceback.print_exc()
             print("breeze: the render worker died -- the sidecar is now "
-                  "not-ready and Jarvis will speak in F5", file=sys.stderr,
+                  "not-ready, Jarvis will speak in F5, and this process "
+                  "exits so the unit can restart it", file=sys.stderr,
                   flush=True)
         finally:
             # Order matters: _dead first, so _submit under the same lock can
@@ -665,6 +710,43 @@ class RenderWorker:
                     stranded.append(item)
         for job in stranded:
             self._put(job, _Failed(exc))
+
+
+def exit_when_the_worker_dies(worker: RenderWorker, *,
+                              grace_s: float = WORKER_DEATH_EXIT_GRACE_S,
+                              _exit=os._exit) -> threading.Event:
+    """Turn a dead render thread into a dead PROCESS, so systemd restarts it.
+
+    A worker that has died -- an exception that took the thread with it, or
+    a wedge inside the model that the stall net caught -- leaves a sidecar
+    that is alive, not-ready and resident: 13.5 GB held for nothing, every
+    ping refused, and Restart=always never firing because the process never
+    exits. Nothing in-process can fix that: the wedged thread cannot be
+    killed and the model cannot be reloaded next to itself. The unit can.
+
+    Returns the disarm event. main() sets it before its own deliberate
+    close(), so a normal exit -- serve() returning 2 for a second instance,
+    say -- is not overwritten with a 1 by a watch that saw stop() as a
+    death. os._exit, not sys.exit: this runs on a daemon thread, and the
+    point is to leave without waiting on the thread that cannot finish.
+    """
+    disarm = threading.Event()
+
+    def _watch():
+        worker.wait_dead()
+        if disarm.is_set():
+            return
+        time.sleep(grace_s)              # in-flight refusals go out first
+        if disarm.is_set():
+            return
+        print(f"breeze: {worker.why} -- exiting so the unit restarts a fresh "
+              f"sidecar; Jarvis speaks in F5 until it is back",
+              file=sys.stderr, flush=True)
+        _exit(1)
+
+    threading.Thread(target=_watch, daemon=True,
+                     name="breeze-death-watch").start()
+    return disarm
 
 
 # ------------------------------------------------------------- the protocol
@@ -750,7 +832,7 @@ class BreezeService:
         if self.error:
             return self.error
         if self._ready and self.worker is not None and not self.worker.alive:
-            return WORKER_GONE
+            return self.worker.why
         return None
 
     # ------------------------------------------------------------- replies
@@ -1372,12 +1454,21 @@ def main(argv=None) -> int:
     if not service.ready:
         print(f"breeze: NOT READY -- {service._why_not()}", file=sys.stderr,
               flush=True)
+    # A dead render thread is a dead sidecar: nothing in this process can
+    # revive it, and a not-ready sidecar that stays up never trips the
+    # unit's Restart=always. Armed here and nowhere else -- a test's service
+    # must never be able to end pytest.
+    disarm = (exit_when_the_worker_dies(service.worker)
+              if service.worker is not None else None)
     try:
         return serve(args.socket, service)
     finally:
         # serve() only returns when the listening socket is gone or a second
         # instance owns it; either way the render thread should not outlive
-        # this call while the process is on its way out.
+        # this call while the process is on its way out -- and its stop()
+        # is deliberate, not a death, so the watch is disarmed first.
+        if disarm is not None:
+            disarm.set()
         service.close()
 
 

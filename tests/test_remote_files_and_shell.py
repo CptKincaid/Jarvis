@@ -2,23 +2,29 @@
 that refuses everything else -- jarvis/tools/remote.py + jarvis/tools/filepick.py.
 
 NOTHING HERE OPENS A SOCKET, TOUCHES THE TAILNET OR WRITES OUTSIDE tmp_path.
-``remote.run_ssh``, ``remote.run_copy`` and ``remote.tailnet_state`` are the
-three module-level seams and every test replaces the ones it needs; the
-unconfigured tests assert that reaching ``subprocess.Popen`` AT ALL is the
-bug, because the whole point of ``missing_reason`` is to answer without
-opening anything.
+``remote.run_ssh``, ``remote.run_copy``, ``remote.run_sftp`` and
+``remote.tailnet_state`` are the four module-level seams and every test
+replaces the ones it needs; the unconfigured tests assert that reaching
+``subprocess.Popen`` AT ALL is the bug, because the whole point of
+``missing_reason`` is to answer without opening anything.
 
-The ground truth these were written against, measured 2026-09-02: HPCOMPUTER
-is NOT a tailnet peer (only ``spark`` and an offline iPhone are), it answers
-no ping and has no port 22, there is no key for it in ``~/.ssh``, and
-tailscaled here runs ``--tun=userspace-networking`` so tailnet traffic must
-go through the SOCKS5 proxy on 127.0.0.1:1055.  So the lane ships OFF, and
-what is tested is every decision made BEFORE the socket -- which is where
-the irreversible mistakes live.
+The ground truth these were written against, re-measured 2026-09-03 (the
+09-02 header said a stale mDNS record, no port 22 and no key -- see the
+module docstring): HPCOMPUTER is a Windows box on the LAN, 192.168.50.114 /
+hpcomputer.local, running Windows OpenSSH Server as user h2pey, and NOT a
+tailnet peer; the key is ~/.ssh/hpcomputer; tailscaled here runs
+``--tun=userspace-networking``, so a TAILNET address goes through the SOCKS5
+proxy on 127.0.0.1:1055 and a LAN address goes direct.  The lane still
+ships OFF -- the first live command is his -- and what is tested is every
+decision made BEFORE the socket, which is where the irreversible mistakes
+live.  The sftp batch text the Windows tests read is verbatim from this
+box (``sftp -D`` to the local sftp-server, no socket); the Windows
+PowerShell rows themselves are not verified here.
 """
 import os
 import subprocess
 import types
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -47,11 +53,21 @@ class Cfg:
 
 
 def ready_cfg(tmp_path, **over):
-    """A config that passes missing_reason -- enabled, host, user, no key."""
+    """A config that passes missing_reason -- enabled, host, user, and a key
+    file that exists.  Until F11 (2026-09-03) this fixture said "no key" and
+    the lane called that ready; a blank key is a refusal now, so the fixture
+    writes one under tmp_path rather than lean on the box's ~/.ssh."""
+    key = tmp_path / "hpcomputer.key"
+    if not key.exists():
+        key.write_text("-----BEGIN OPENSSH PRIVATE KEY-----\n")
     base = {"remote.enabled": True,
             "remote.host": "hpcomputer.tail5323b8.ts.net",
             "remote.user": "hunterp",
-            "remote.key_path": "",
+            "remote.key_path": str(key),
+            # The POSIX far side these were measured against ($HOME quoting,
+            # `ls -1p`); the shipped default is windows (F07), and the
+            # Windows tests set it by name.
+            "remote.os": "posix",
             "remote.local_roots": [str(tmp_path / "Desktop")]}
     base.update(over)
     return Cfg(**base)
@@ -78,9 +94,10 @@ class NoPopen:
 
 # ============================================================ the config
 def test_the_shipped_config_is_off_and_empty():
-    """It ships OFF with a blank host because as of 2026-09-02 HPCOMPUTER is
-    not on the tailnet and has no key here.  A default that pretended
-    otherwise would produce a ten-second timeout instead of a sentence."""
+    """It ships OFF with a blank host because nothing here has run against
+    the real box and the first live command is his.  A default that
+    pretended otherwise would produce a ten-second timeout instead of a
+    sentence."""
     row = DEFAULTS["remote"]
     assert row["enabled"] is False
     assert row["host"] == ""
@@ -90,7 +107,8 @@ def test_the_shipped_config_is_off_and_empty():
 
 def test_the_shipped_config_routes_through_the_userspace_socks_proxy():
     """The one setting that would otherwise cost an afternoon: tailscaled
-    here has no tun device, so a direct ssh to a tailnet name cannot route."""
+    here has no tun device, so a direct ssh to a tailnet name cannot route.
+    Applied to a tailnet ADDRESS only (F08); the LAN box goes direct."""
     assert DEFAULTS["remote"]["socks_proxy"] == "127.0.0.1:1055"
 
 
@@ -107,12 +125,39 @@ def test_remote_is_not_a_nagging_setup_section():
     ({"remote.enabled": True, "remote.host": "h"}, "no-user"),
     ({"remote.enabled": True, "remote.host": "h", "remote.user": "u",
       "remote.key_path": "/nope/missing.key"}, "bad-key"),
-    ({"remote.enabled": True, "remote.host": "h", "remote.user": "u"}, ""),
+    # The shipped default.  This row used to expect "" (ready) -- F11.
+    ({"remote.enabled": True, "remote.host": "h", "remote.user": "u"}, "no-key"),
 ])
 def test_missing_reason_names_exactly_what_is_absent(over, expect):
     """A present host with a missing user is a real state, and it must be
     named before a socket opens rather than becoming an auth failure."""
     assert remote.missing_reason(remote.read_config(Cfg(**over))) == expect
+
+
+def test_a_key_that_is_there_makes_the_lane_ready(tmp_path):
+    assert remote.missing_reason(remote.read_config(ready_cfg(tmp_path))) == ""
+
+
+def test_a_blank_key_path_is_refused_before_a_socket_opens(monkeypatch):
+    """F11 (2026-09-03).  DEFAULTS and the docs example ship key_path "",
+    and missing_reason called that ready.  ssh then ran with
+    IdentitiesOnly=yes and no -i, which offers only the default-named
+    identities -- and ~/.ssh here holds none (measured: no id_rsa, id_ecdsa
+    or id_ed25519; the key is ~/.ssh/hpcomputer).  So the first thing he
+    heard after enabling the lane was "HPCOMPUTER turned my key away, sir"
+    -- the far side blamed for a blank line in his own settings, after a
+    socket had opened.  A blank key is a refusal that names remote.key_path."""
+    monkeypatch.setattr(subprocess, "Popen", NoPopen())
+    conf = remote.read_config(Cfg(**{"remote.enabled": True,
+                                     "remote.host": "192.168.50.114",
+                                     "remote.user": "h2pey",
+                                     "remote.key_path": ""}))
+    assert remote.missing_reason(conf) == "no-key"
+    assert remote.ask(conf, "up").reason == "no-key"
+    assert remote.push(conf, Path("/x")).reason == "no-key"
+    assert remote.pull(conf, "outbox", "a.txt").reason == "no-key"
+    line = remote.fail_line(conf, "no-key")
+    assert "remote.key_path" in line and "turned my key away" not in line
 
 
 def test_a_hostile_config_leaves_the_lane_off():
@@ -269,10 +314,10 @@ def test_a_daemon_that_cannot_be_asked_is_unknown_not_absent(tmp_path, monkeypat
 
 def test_every_failure_reason_has_a_spoken_line(tmp_path):
     conf = remote.read_config(ready_cfg(tmp_path))
-    for reason in ("disabled", "no-host", "no-user", "bad-key", "no-ssh",
-                   "off-tailnet", "asleep", "timeout", "auth", "unreachable",
-                   "hostkey", "no-space", "denied", "not-there", "exists",
-                   "failed"):
+    for reason in ("disabled", "no-host", "no-user", "no-key", "bad-key",
+                   "no-ssh", "off-tailnet", "asleep", "timeout", "auth",
+                   "unreachable", "hostkey", "no-space", "denied", "not-there",
+                   "exists", "failed"):
         line = remote.fail_line(conf, reason)
         assert line and "{" not in line
         assert "sir" in line
@@ -732,8 +777,16 @@ def wired(tmp_path, monkeypatch):
     for key, val in (("voice_cmds", True), ("jarvis_mode", True),
                      ("auto_type", False), ("talkback", False)):
         monkeypatch.setattr(CONFIG, key, val)
+    # _bg runs inline, as in test_oracle: the four answering doors hand
+    # their round trip to a thread (F10), and a test that sleeps for one
+    # flakes.  What the worker SAYS is recorded from _speak_now, and what
+    # it puts on the strip from the bus.
     monkeypatch.setattr(Commander, "_bg", lambda self, fn: fn())
-    monkeypatch.setattr(Commander, "_speak_now", lambda self, text: True)
+    spoken, statuses = [], []
+    monkeypatch.setattr(Commander, "_speak_now",
+                        lambda self, text: spoken.append(text) or True)
+    from jarvis.events import Status, bus
+    bus.subscribe(Status, lambda e: statuses.append(e.text))
     svc = types.SimpleNamespace(
         assistant=ready_cfg(tmp_path), memory=MagicMock(), desktop=MagicMock(),
         workflows=MagicMock(), brain=MagicMock(), context=MagicMock(),
@@ -749,7 +802,7 @@ def wired(tmp_path, monkeypatch):
     svc.router.pending.return_value = None
     svc.claude.active_project = "jarvis"
     c = Commander(svc)
-    c.copied = copied
+    c.copied, c.spoken, c.statuses = copied, spoken, statuses
     return c
 
 
@@ -775,9 +828,14 @@ def test_every_door_is_registered_for_unprefixed_speech(name):
 ])
 def test_the_doors_answer_bare_voice_with_no_wake_word(wired, said, expect):
     """The live path: the hotword consumed "jarvis", so this is what the
-    commander actually receives."""
+    commander actually receives.  A door that answers from its worker (F10)
+    puts the answer's status on the strip rather than on the turn's result,
+    so either place counts -- the refusal and a read-back are still on the
+    turn, the round trips are not."""
     res = wired.handle(said, source="voice")
-    assert res.status == expect, f"{said!r} -> {res.status!r} / {res.reply!r}"
+    assert res.handled
+    assert expect in [res.status] + wired.statuses, \
+        f"{said!r} -> {res.status!r} / {res.reply!r} / {wired.statuses!r}"
 
 
 def test_a_push_reads_back_and_moves_nothing(wired):
@@ -808,7 +866,9 @@ def test_sure_is_asked_again_rather_than_obeyed(wired):
     assert res.reply == outbox_unsure()
     assert wired.copied == []
     res = wired.handle("yes", source="voice")
-    assert res.reply == "budget.xlsx is on HPCOMPUTER, sir."
+    # The yes turn acknowledges; the outcome is spoken from the worker (F10).
+    assert res.reply == "Sending it now, sir." and res.ack and res.done is False
+    assert wired.spoken[-1] == "budget.xlsx is on HPCOMPUTER, sir."
     assert wired.copied[-1][2] is True
 
 
@@ -865,8 +925,13 @@ def test_an_ambiguous_push_hears_its_answer(wired, answer, expect):
 
 
 def test_an_ambiguous_pull_hears_its_answer(wired):
-    res = wired.handle("get the report from HPCOMPUTER", source="voice")
-    assert "report_v1.pdf" in res.reply and "report_v2.pdf" in res.reply
+    wired.handle("get the report from HPCOMPUTER", source="voice")
+    # The listing is a round trip, so "Which one?" is spoken from the
+    # worker (F10); the answer's read-back needs no round trip and is on
+    # the turn.
+    asked = wired.spoken[-1]
+    assert "report_v1.pdf" in asked and "report_v2.pdf" in asked
+    assert wired.question_open()
     res = wired.handle("the second one", source="voice")
     assert "report_v2.pdf" in res.reply
     assert wired.copied == []
@@ -938,3 +1003,504 @@ def test_a_reminder_that_names_the_machine_is_a_reminder():
     m = cmd_mod._REMOTE_FREEFORM_RX.match(said)
     spoken = cmd_mod._oracle_group(m, "cmd", "cmd2", "cmd3")
     assert not cmd_mod._REMOTE_ORDER_RX.match(spoken.strip())
+
+
+# ==================================================================
+# F10 (2026-09-03): nothing that opens a socket runs on the voice turn
+# ==================================================================
+# A confirmed push ran remote.push INLINE from _try_destructive_confirm
+# (`pend[0]()`), on the _process_audio thread with app._audio_busy set, for
+# up to transfer_timeout_s (120 s default, 900 s clamp); the status, query
+# and pull doors each held the turn for a full ssh budget (12 s) the same
+# way.  For all of it Jarvis was silent and deaf -- no "stop", no "never
+# mind", no wake word (app.py gates wake/recording on _audio_busy).  The
+# Oracle lane this family says it copies hands its round trip to c._bg and
+# returns done=False; so does the send lane.  These pin that shape: _bg is
+# replaced with a QUEUE, and the transport must not have been touched by
+# the time handle() returns.
+@pytest.fixture
+def queued(wired, monkeypatch):
+    """The wired Commander with _bg parked instead of inlined."""
+    jobs = []
+    monkeypatch.setattr(Commander, "_bg", lambda self, fn: jobs.append(fn))
+    wired.jobs = jobs
+    return wired
+
+
+def test_a_confirmed_push_leaves_the_voice_turn_at_once(queued):
+    queued.handle("put the budget on HPCOMPUTER", source="voice")
+    res = queued.handle("yes", source="voice")
+    assert queued.copied == [], "the copy ran on the voice turn"
+    assert res.handled and res.ack and res.done is False
+    assert res.reply == "Sending it now, sir." and res.speak
+    assert len(queued.jobs) == 1
+    queued.jobs[0]()
+    assert queued.copied[-1][2] is True
+    assert queued.spoken[-1] == "budget.xlsx is on HPCOMPUTER, sir."
+
+
+def test_a_confirmed_pull_leaves_the_voice_turn_at_once(queued):
+    queued.handle("get report v1 from HPCOMPUTER", source="voice")
+    queued.jobs.pop()()                       # the listing, from its worker
+    assert queued.spoken[-1].startswith("Bring report_v1.pdf from HPCOMPUTER")
+    res = queued.handle("yes", source="voice")
+    assert queued.copied == [], "the copy ran on the voice turn"
+    assert res.ack and res.done is False and res.reply == "Fetching it now, sir."
+    queued.jobs.pop()()
+    assert queued.copied[-1][2] is False
+    assert queued.spoken[-1] == "report_v1.pdf is on your Desktop, sir."
+
+
+@pytest.mark.parametrize("said,expect", [
+    ("is HPCOMPUTER up", "HPCOMPUTER: up"),
+    ("what's the disk on HPCOMPUTER", "HPCOMPUTER: disk"),
+    ("get the report from HPCOMPUTER", "Which one?"),
+])
+def test_a_remote_round_trip_never_runs_on_the_voice_turn(queued, monkeypatch,
+                                                          said, expect):
+    asked = []
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        asked.append(cmd) or
+                        remote.SshResult(True, out="report_v1.pdf\n"
+                                                   "report_v2.pdf\n"))
+    res = queued.handle(said, source="voice")
+    assert asked == [], f"{said!r} opened ssh on the voice turn"
+    assert res.handled and res.done is False and not res.reply
+    assert len(queued.jobs) == 1
+    queued.jobs[0]()
+    assert len(asked) == 1
+    assert queued.statuses[-1] == expect
+    assert queued.spoken, "the worker said nothing"
+
+
+def test_a_worker_outcome_goes_through_the_app_door_when_there_is_one(queued):
+    """The send lane's F20 lesson, kept here by name: bus + _speak_now show
+    and speak but do not CLOSE a done=False turn, so after the outcome the
+    wake word stayed dead until the 60 s watchdog.  services.reply
+    (JarvisApp._async_reply) shows, speaks, closes the turn and arms the
+    follow-up window; when it is wired, the worker must use it and nothing
+    else."""
+    delivered = []
+    queued.services.reply = lambda text, speak=True: delivered.append((text, speak))
+    queued.handle("is HPCOMPUTER up", source="voice")
+    queued.jobs[0]()
+    assert delivered and delivered[-1][0].startswith("HPCOMPUTER is up")
+    assert delivered[-1][1] is True
+    assert queued.spoken == [], "spoken twice: once per door"
+
+
+def test_a_worker_that_blows_up_still_closes_the_turn(queued, monkeypatch):
+    monkeypatch.setattr(remote, "ask", lambda conf, key:
+                        (_ for _ in ()).throw(RuntimeError("boom")))
+    queued.handle("is HPCOMPUTER up", source="voice")
+    queued.jobs[0]()
+    assert queued.spoken[-1] == remote.fail_line(
+        remote.read_config(queued.services.assistant), "failed")
+
+
+# ==================================================================
+# F08 (2026-09-03): the tailnet is only asked about a tailnet address
+# ==================================================================
+# HPCOMPUTER is reached over the LAN (192.168.50.114 / hpcomputer.local; it
+# has no Tailscale peer), and tailnet_state looked the host's first label
+# up among the peers regardless: "192" and "hpcomputer" are not peers, so
+# every door said "HPCOMPUTER isn't on the tailnet, sir -- I can't see it
+# at all" without opening ssh, and a real unreachable/timeout (the box
+# asleep) was rewritten into the same wrong sentence.  Repro:
+# scratch-0903/bugpass/remote_lan_host_repro.py sections 1-2 and 5.
+@pytest.mark.parametrize("host,proxy,expect", [
+    ("hpcomputer.tail5323b8.ts.net", "127.0.0.1:1055", True),
+    ("HPCOMPUTER.TAIL5323B8.TS.NET", "", True),
+    ("100.70.145.99", "", True),                  # 100.64/10 is the tailnet
+    ("hpcomputer", "127.0.0.1:1055", True),       # MagicDNS name, via the proxy
+    ("192.168.50.114", "", False),
+    ("192.168.50.114", "127.0.0.1:1055", False),  # the shipped proxy default
+    ("hpcomputer.local", "", False),
+    ("hpcomputer.local", "127.0.0.1:1055", False),
+    ("hpcomputer", "", False),                    # the router's name, not MagicDNS
+    ("101.0.0.1", "", False),                     # just outside 100.64/10
+])
+def test_only_a_tailnet_address_is_a_tailnet_question(tmp_path, host, proxy,
+                                                       expect):
+    conf = remote.read_config(ready_cfg(tmp_path, **{"remote.host": host,
+                                                     "remote.socks_proxy": proxy}))
+    assert remote.tailnet_host(conf) is expect
+
+
+def lan_cfg(tmp_path, **over):
+    """The host the checklist gives him: LAN address, no proxy."""
+    base = {"remote.host": "192.168.50.114", "remote.socks_proxy": "",
+            "remote.user": "h2pey"}
+    base.update(over)
+    return ready_cfg(tmp_path, **base)
+
+
+def test_a_lan_host_is_never_reported_off_tailnet(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf:
+                        pytest.fail("asked the tailnet about a LAN address"))
+    conf = remote.read_config(lan_cfg(tmp_path))
+    assert remote.unreachable_reason(conf) == ""
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        remote.SshResult(False, err="ssh: connect to host "
+                                         "192.168.50.114 port 22: Connection "
+                                         "timed out", reason="unreachable"))
+    res = remote.ask(conf, "up")
+    assert res.reason == "unreachable"
+    assert "tailnet" not in remote.fail_line(conf, res.reason)
+
+
+def test_a_tailnet_host_still_gets_the_honest_sentence(tmp_path, monkeypatch):
+    """The other half of the same rule: for a .ts.net name the tailnet view
+    is the more specific answer and it must still be used."""
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf: "offline")
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert remote.unreachable_reason(conf) == "asleep"
+
+
+def test_the_status_door_tries_ssh_for_a_lan_host(wired, tmp_path, monkeypatch):
+    wired.services.assistant = lan_cfg(tmp_path)
+    monkeypatch.setattr(remote, "tailnet_state", lambda conf:
+                        pytest.fail("asked the tailnet about a LAN address"))
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        remote.SshResult(True, out="up 3 days\n"))
+    wired.handle("is HPCOMPUTER up", source="voice")
+    assert wired.spoken[-1] == "HPCOMPUTER is up, sir -- up 3 days."
+    assert wired.statuses[-1] == "HPCOMPUTER: up"
+
+
+def test_the_socks_proxy_is_for_the_tailnet_not_the_lan(tmp_path):
+    """The shipped default is socks_proxy 127.0.0.1:1055, and with a LAN
+    address that sent every ssh through tailscaled's SOCKS5 -- whether that
+    forwards to a LAN IP at all is unverified (no network in tests).  His
+    own verified line is a direct `ssh h2pey@192.168.50.114`, so the proxy
+    is applied to a tailnet address only; blanking it is no longer a step
+    he has to remember."""
+    conf = remote.read_config(ready_cfg(tmp_path, **{
+        "remote.host": "192.168.50.114"}))        # proxy left at the default
+    assert "ProxyCommand" not in " ".join(remote.ssh_argv(conf, "uptime"))
+    conf = remote.read_config(ready_cfg(tmp_path))  # .ts.net: still proxied
+    assert "ProxyCommand" in " ".join(remote.ssh_argv(conf, "uptime"))
+
+
+def test_the_no_host_line_does_not_blame_the_tailnet(tmp_path):
+    conf = remote.read_config(ready_cfg(tmp_path, **{"remote.host": ""}))
+    assert "tailnet" not in remote.fail_line(conf, "no-host")
+
+
+# ==================================================================
+# F07 (2026-09-03): HPCOMPUTER is Windows -- there is no POSIX shell there
+# ==================================================================
+# It runs the built-in OpenSSH Server (Add-WindowsCapability OpenSSH.Server;
+# user h2pey; 192.168.50.114), whose login shell is cmd.exe or PowerShell.
+# Every QUERIES row (`uptime -p 2>/dev/null || uptime`, `df -Ph /`, `cat
+# /proc/loadavg`, `who`), the inbox row and the `ls -1p` every pull listed
+# with came back rc!=0 with "'ls' is not recognized as an internal or
+# external command", classify_error had no rung for it, and all of them
+# were spoken as the generic "HPCOMPUTER wouldn't answer that, sir."  Only
+# push -- scp over SFTP, no shell -- could work.  Repro:
+# scratch-0903/bugpass/remote_lan_host_repro.py section 3, win_shell_trace.py.
+#
+# So: `remote.os` (windows|posix, windows shipped), a per-OS question table,
+# an SFTP listing for the Windows pull (and its inbox question), and a
+# rung that names the command the far side did not recognise.
+CMD_NOT_RECOGNISED = ("'ls' is not recognized as an internal or external "
+                      "command,\noperable program or batch file.\n")
+
+# Verbatim from this box, 2026-09-03: `printf 'ls -ln "jarvis-outbox"\n' |
+# sftp -q -b - -D /usr/lib/openssh/sftp-server` with cwd holding that folder
+# (-D pipes straight to the local sftp-server; no socket).  Batch mode
+# echoes the command as "sftp> ...", names come back PATH-PREFIXED, a
+# directory's mode starts with "d", dotfiles are absent without -a.
+SFTP_LISTING = (
+    'sftp> ls -ln "jarvis-outbox"\n'
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:21 jarvis-outbox/-dash.txt\n"
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:21 jarvis-outbox/a.txt\n"
+    "-rw-rw-r--    ? hunterp  hunterp         2 Sep  3 12:21 jarvis-outbox/b c.pdf\n"
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:33 jarvis-outbox/report.pdf\n"
+    "-rw-rw-r--    ? hunterp  hunterp         1 Sep  3 12:33 jarvis-outbox/two  spaces.txt\n"
+    "drwxrwxr-x    ? hunterp  hunterp      4096 Sep  3 12:21 jarvis-outbox/sub dir\n")
+SFTP_NOT_FOUND = 'Can\'t ls: "jarvis-outbox" not found\n'     # stderr, rc 1
+
+
+def win_cfg(tmp_path, **over):
+    return lan_cfg(tmp_path, **{"remote.os": "windows", **over})
+
+
+def test_the_shipped_os_is_windows_and_the_posix_fixture_says_so(tmp_path):
+    """DEFAULTS carry no `os`, and the box this lane is for is Windows, so
+    the default is windows.  ready_cfg pins posix on purpose: the shell
+    listing and $HOME tests above were measured against a POSIX far side."""
+    assert remote.read_config(Cfg()).os == "windows"
+    assert remote.read_config(ready_cfg(tmp_path)).os == "posix"
+
+
+@pytest.mark.parametrize("value,expect", [
+    ("windows", "windows"), ("Windows", "windows"), ("win", "windows"),
+    ("posix", "posix"), ("linux", "posix"), ("mac", "posix"),
+    ("", "windows"), ("toaster", "windows"),
+])
+def test_remote_os_is_one_of_two_words(value, expect):
+    assert remote.read_config(Cfg(**{"remote.os": value})).os == expect
+
+
+@pytest.mark.parametrize("err", [
+    CMD_NOT_RECOGNISED,
+    "The system cannot find the path specified.\n",     # cmd.exe on 2>/dev/null
+    "sh: 1: powershell: not found\n",                    # the other way round
+    "bash: powershell: command not found\n",
+])
+def test_the_far_sides_own_shell_saying_no_is_a_named_reason(err):
+    assert remote.classify_error(err) == "wrong-os"
+
+
+def test_the_wrong_os_line_names_the_command_and_the_setting(tmp_path):
+    conf = remote.read_config(win_cfg(tmp_path, **{"remote.os": "posix"}))
+    line = remote.fail_line(conf, "wrong-os", CMD_NOT_RECOGNISED)
+    assert " ls" in line and "remote.os" in line and "Linux" in line
+    assert "wouldn't answer" not in line
+    conf = remote.read_config(win_cfg(tmp_path))
+    line = remote.fail_line(conf, "wrong-os", "sh: 1: powershell: not found\n")
+    assert "powershell" in line and "Windows" in line
+    # no command in the text: still a sentence, still names the setting
+    line = remote.fail_line(conf, "wrong-os",
+                            "The system cannot find the path specified.\n")
+    assert "remote.os" in line and "{" not in line
+
+
+def test_no_posix_row_reaches_a_windows_shell(tmp_path):
+    conf = remote.read_config(win_cfg(tmp_path))
+    for key in remote.QUERIES:
+        cmd = remote.query_command(conf, key)
+        if key == "inbox":
+            assert cmd == "", "the Windows inbox is listed over SFTP"
+            continue
+        assert cmd, key
+        for posix in ("uptime", "df ", "/proc/", "who ", "ls ", "$HOME",
+                      "/dev/null", "| tail", "| head", "| cut"):
+            assert posix not in cmd, (key, cmd)
+        # ONE quoting rule that survives both cmd.exe and PowerShell as the
+        # login shell: no $, no backtick, no nested quote, one quoted arg.
+        assert "$" not in cmd and "`" not in cmd and cmd.count('"') == 2
+        assert remote.query_say(conf, key)
+    for key in remote.QUERIES:
+        assert remote.query_say(remote.read_config(ready_cfg(tmp_path)), key)
+
+
+def test_a_windows_row_is_a_constant_whatever_the_config_says(tmp_path):
+    conf = remote.read_config(win_cfg(tmp_path, **{"remote.inbox": "~/x; rm -rf ~"}))
+    assert "rm" not in remote.query_command(conf, "load")
+
+
+def test_the_sftp_batch_never_touches_a_shell(tmp_path, monkeypatch):
+    """`sftp -b -` reads its commands from stdin: the batch is a Popen
+    input, never an argument, and the transport carries the same guards ssh
+    does (BatchMode, no password prompt, accept-new)."""
+    seen = {}
+
+    class P:
+        returncode = 0
+
+        def communicate(self, input=None, timeout=None):
+            seen.update(input=input, timeout=timeout)
+            return 'sftp> ls -ln "x"\n', ""
+
+    monkeypatch.setattr(subprocess, "Popen",
+                        lambda argv, **kw: (seen.update(argv=argv, kw=kw), P())[1])
+    conf = remote.read_config(win_cfg(tmp_path))
+    res = remote.run_sftp(conf, 'ls -ln "x"')
+    assert res.ok and seen["input"] == 'ls -ln "x"\n'
+    assert seen["kw"]["stdin"] == subprocess.PIPE and not seen["kw"].get("shell")
+    argv = seen["argv"]
+    assert argv[0] == remote.SFTP_BIN and argv[argv.index("-b") + 1] == "-"
+    assert argv[-2:] == ["--", "h2pey@192.168.50.114"]
+    joined = " ".join(argv)
+    assert "BatchMode=yes" in joined and "PasswordAuthentication=no" in joined
+    assert seen["timeout"] == conf.timeout_s
+
+
+def test_the_windows_listing_is_sftp_and_reads_the_measured_text(tmp_path,
+                                                                 monkeypatch):
+    monkeypatch.setattr(remote, "run_ssh", lambda *a, **k:
+                        pytest.fail("ran a shell command on a Windows host"))
+    batches = []
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        batches.append(batch) or
+                        remote.SshResult(True, out=SFTP_LISTING))
+    conf = remote.read_config(win_cfg(tmp_path))
+    names, why = remote.list_remote(conf, "outbox")
+    assert why == ""
+    # the echo line skipped, the directory dropped, the prefix stripped, a
+    # double space kept, and the dash-name refused by SAFE_REMOTE_NAME_RX
+    assert names == ["a.txt", "b c.pdf", "report.pdf", "two  spaces.txt"]
+    assert batches == ['ls -ln "jarvis-outbox"']    # scp_path form: no tilde
+
+
+def test_a_missing_windows_folder_is_not_there(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        remote.SshResult(False, err=SFTP_NOT_FOUND,
+                                         reason=remote.classify_error(SFTP_NOT_FOUND)))
+    conf = remote.read_config(win_cfg(tmp_path))
+    assert remote.list_remote(conf, "outbox") == ([], "not-there")
+
+
+def test_a_windows_folder_with_a_quote_is_refused_not_escaped(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "run_sftp", lambda *a, **k:
+                        pytest.fail("put a quote into an sftp batch line"))
+    conf = remote.read_config(win_cfg(tmp_path, **{
+        "remote.pull_dirs": {"desktop": 'C:/Users/h2pey/"Desktop'}}))
+    assert remote.list_remote(conf, "desktop") == ([], "not-there")
+
+
+def test_a_backslash_windows_path_goes_over_with_slashes(tmp_path, monkeypatch):
+    """SFTP paths are slash-separated on every server and Windows OpenSSH
+    takes C:/Users/... ; a backslash is an escape to sftp's own tokenizer.
+    Both directions: the listing and the scp source built from it."""
+    batches, copies = [], []
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        batches.append(batch) or remote.SshResult(
+                            True, out=SFTP_LISTING.replace(
+                                "jarvis-outbox", "C:/Users/h2pey/Desktop")))
+    monkeypatch.setattr(remote, "run_copy", lambda conf, local, rem, push:
+                        copies.append(rem) or remote.SshResult(True))
+    conf = remote.read_config(win_cfg(tmp_path, **{
+        "remote.pull_dirs": {"desktop": "C:\\Users\\h2pey\\Desktop"},
+        "remote.inbox": "C:\\Users\\h2pey\\jarvis-inbox"}))
+    names, _ = remote.list_remote(conf, "desktop")
+    assert batches == ['ls -ln "C:/Users/h2pey/Desktop"'] and "a.txt" in names
+    (tmp_path / "Desktop").mkdir(exist_ok=True)
+    assert remote.pull(conf, "desktop", "a.txt").ok
+    assert copies == ["C:/Users/h2pey/Desktop/a.txt"]
+    assert remote.inbox_target(conf, "b.txt") == "C:/Users/h2pey/jarvis-inbox/b.txt"
+
+
+def test_the_windows_inbox_question_is_the_sftp_listing(tmp_path, monkeypatch):
+    monkeypatch.setattr(remote, "run_ssh", lambda *a, **k:
+                        pytest.fail("ran a shell command on a Windows host"))
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        remote.SshResult(True, out=SFTP_LISTING.replace(
+                            "jarvis-outbox", "jarvis-inbox")))
+    conf = remote.read_config(win_cfg(tmp_path))
+    res = remote.ask(conf, "inbox")
+    assert res.ok and res.out.split("\n") == ["a.txt", "b c.pdf", "report.pdf",
+                                              "two  spaces.txt"]
+
+
+def test_the_posix_listing_is_untouched(tmp_path, monkeypatch):
+    """The measured $HOME form still runs for a POSIX host."""
+    monkeypatch.setattr(remote, "run_sftp", lambda *a, **k:
+                        pytest.fail("used sftp for a POSIX listing"))
+    sent = []
+    monkeypatch.setattr(remote, "run_ssh", lambda conf, cmd, **k:
+                        sent.append(cmd) or remote.SshResult(True, out="a.txt\n"))
+    conf = remote.read_config(ready_cfg(tmp_path))
+    assert remote.list_remote(conf, "outbox") == (["a.txt"], "")
+    assert sent == ['ls -1p -- "$HOME"/jarvis-outbox']
+
+
+def test_the_pull_door_on_the_windows_box_lists_with_sftp(wired, tmp_path,
+                                                          monkeypatch):
+    wired.services.assistant = win_cfg(tmp_path)
+    monkeypatch.setattr(remote, "run_ssh", lambda *a, **k:
+                        pytest.fail("ran a shell command on a Windows host"))
+    monkeypatch.setattr(remote, "run_sftp", lambda conf, batch, **k:
+                        remote.SshResult(True, out=SFTP_LISTING))
+    wired.handle("get the report from HPCOMPUTER", source="voice")
+    assert wired.spoken[-1] == \
+        "Bring report.pdf from HPCOMPUTER to your Desktop, sir?"
+    wired.handle("yes", source="voice")
+    assert wired.copied[-1] == (str(tmp_path / "Desktop" / "report.pdf"),
+                                "jarvis-outbox/report.pdf", False)
+
+
+def test_a_posix_row_sent_to_a_windows_shell_is_named_out_loud(wired, tmp_path,
+                                                               monkeypatch):
+    """remote.os wrongly posix on the Windows box: the spoken line names the
+    command cmd.exe did not know and the setting to look at, instead of
+    "HPCOMPUTER wouldn't answer that, sir."."""
+    wired.services.assistant = lan_cfg(tmp_path, **{"remote.os": "posix"})
+
+    def cmd_exe(conf, cmd, **k):
+        err = CMD_NOT_RECOGNISED.replace("'ls'", f"'{cmd.split()[0]}'")
+        return remote.SshResult(False, err=err, reason=remote.classify_error(err))
+
+    monkeypatch.setattr(remote, "run_ssh", cmd_exe)
+    wired.handle("what's the disk on HPCOMPUTER", source="voice")
+    assert " df" in wired.spoken[-1] and "remote.os" in wired.spoken[-1]
+    assert wired.statuses[-1] == "HPCOMPUTER: wrong-os"
+
+
+# ==================================================================
+# F09 (2026-09-03): the polite forms reach the four answering doors
+# ==================================================================
+# _REMOTE_PUSH/PULL/STATUS/QUERY_RX were anchored at ^ on the bare verb,
+# while _REMOTE_ORDER_RX strips "please|just|go ahead and|can you|could
+# you|would you|will you" and the mail lane's _SEND_OPENER takes the same.
+# So a polite transfer fell past its own door to `remote freeform`: with
+# "move" (an order verb) it was REFUSED out loud -- "please move the budget
+# to hpcomputer" -> "I don't run loose commands on HPCOMPUTER, sir" -- and
+# with put/copy/get/check it went to the model, which cannot move a file.
+# Repro: scratch-0903/bugpass/test_remote_openers_live.py (10 forms).
+POLITE = [
+    ("please put the budget on hpcomputer", "remote push"),
+    ("please move the budget to hpcomputer", "remote push"),
+    ("can you put the budget on hpcomputer", "remote push"),
+    ("could you copy the budget over to hpcomputer", "remote push"),
+    ("would you send this file to hp computer", "remote push"),
+    ("go ahead and send the budget to hpcomputer", "remote push"),
+    ("just put the budget on hpcomputer", "remote push"),
+    ("jarvis, please move the budget to hpcomputer", "remote push"),
+    ("please get the budget from hpcomputer", "remote pull"),
+    ("could you grab the report off hpcomputer", "remote pull"),
+    ("can you fetch the report from HPCOMPUTER's desktop", "remote pull"),
+    ("please check hpcomputer", "remote status"),
+    ("can you check on hpcomputer", "remote status"),
+    ("could you tell me if hpcomputer is up", "remote status"),
+    ("please tell me the disk on hpcomputer", "remote query"),
+    ("could you tell me what's the disk on hpcomputer", "remote query"),
+    ("can you show me the inbox on hpcomputer", "remote query"),
+    ("would you tell me who's logged in on hp computer", "remote query"),
+]
+
+
+@pytest.mark.parametrize("said,name", POLITE)
+def test_a_polite_form_reaches_the_door_the_bare_form_does(said, name):
+    for c in _ungated():
+        if c.matcher(said):
+            assert c.name == name, f"{said!r} went to {c.name}"
+            return
+    pytest.fail(f"{said!r} matched nothing")
+
+
+def test_a_polite_move_is_a_read_back_not_a_refusal(wired):
+    """The one that was refused OUT LOUD."""
+    res = wired.handle("please move the budget to hpcomputer", source="voice")
+    assert res.status == "Confirm?", (res.status, res.reply)
+    assert res.reply == "Send budget.xlsx to HPCOMPUTER's inbox, sir?"
+    assert remote.FREEFORM_REFUSAL.format(name="HPCOMPUTER") != res.reply
+
+
+def test_every_opener_the_refusal_door_strips_is_one_the_doors_take():
+    """The drift guard: the refusal door can never again outrank a transfer
+    on an opener, because the two lists are the same list."""
+    for opener in ("please", "just", "go ahead and", "can you", "could you",
+                   "would you", "will you"):
+        said = f"{opener} move the budget to hpcomputer"
+        assert cmd_mod._REMOTE_ORDER_RX.match(said), opener
+        assert cmd_mod._REMOTE_PUSH_RX.match(said), f"{opener!r} not taken"
+        assert cmd_mod._REMOTE_OPENER_RX.match(said + " ").end() > 0, opener
+
+
+@pytest.mark.parametrize("said", [
+    "please restart the hp computer", "could you delete the logs on the hp",
+    "can you run the build on hpcomputer",
+])
+def test_a_polite_order_is_still_refused(said):
+    """Politeness does not open a shell."""
+    for c in _ungated():
+        if c.matcher(said):
+            assert c.name == "remote freeform", f"{said!r} went to {c.name}"
+            m = cmd_mod._REMOTE_FREEFORM_RX.match(said)
+            spoken = cmd_mod._oracle_group(m, "cmd", "cmd2", "cmd3")
+            assert cmd_mod._REMOTE_ORDER_RX.match(spoken.strip())
+            return
+    pytest.fail(f"{said!r} matched nothing")

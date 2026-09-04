@@ -670,25 +670,61 @@ class JarvisAgent:
         self._init_clipboard()
         return list(self._clipboard_history)[-n:]
 
-    def paste_from_history(self, index):
+    def paste_from_history(self, index, popen=None, run=None):
+        """Put history item ``index`` back on the clipboard and press
+        Ctrl+V. The pasted text on success, None if it did not happen.
+
+        THIS USED TO CLAIM A PASTE IT HAD NOT CHECKED. It returned the text
+        as soon as the two subprocesses had been STARTED -- not the xclip
+        return code, not the xdotool one, and certainly not the clipboard
+        itself -- so "Pasted: ..." was said over a clipboard write that may
+        never have landed. Same bug, same day, as the enrolment hand-over
+        (jarvis/enrolentry.py, 2026-09-03).
+
+        The read-back is the same partial check it is there: an X11
+        CLIPBOARD selection has no storage, a live process owns it, so
+        reading it back proves the write LANDED and never that it will
+        survive. Here that is enough, because the paste happens immediately
+        afterwards -- but it is a narrow window, not no window.
+
+        ``popen``/``run`` are the injected seams the tests use; nothing may
+        drive his real desktop from a test."""
         self._init_clipboard()
         items = list(self._clipboard_history)
-        if 0 <= index < len(items):
-            text = items[-(index + 1)]["text"]
-            try:
-                proc = subprocess.Popen(
-                    ["xclip", "-selection", "clipboard"],
-                    stdin=subprocess.PIPE,
-                )
-                proc.communicate(input=text.encode(), timeout=2)
-                subprocess.run(
-                    ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
-                    timeout=2, capture_output=True,
-                )
-                return text[:50]
-            except Exception:
-                pass
-        return None
+        if not (0 <= index < len(items)):
+            return None
+        text = items[-(index + 1)]["text"]
+        opener = popen or subprocess.Popen
+        runner = run or subprocess.run
+        try:
+            proc = opener(
+                ["xclip", "-selection", "clipboard"],
+                stdin=subprocess.PIPE,
+            )
+            proc.communicate(input=text.encode(), timeout=2)
+            if getattr(proc, "returncode", 1) != 0:
+                return None
+            back = runner(
+                ["xclip", "-selection", "clipboard", "-o"],
+                timeout=2, capture_output=True,
+            )
+            if getattr(back, "returncode", 1) != 0:
+                return None
+            got = getattr(back, "stdout", b"") or b""
+            if isinstance(got, bytes):
+                got = got.decode("utf-8", "replace")
+            if got != text and got.rstrip("\n") != text:
+                _log("paste: the clipboard did not take the item")
+                return None
+            keyed = runner(
+                ["xdotool", "key", "--clearmodifiers", "ctrl+v"],
+                timeout=2, capture_output=True,
+            )
+            if getattr(keyed, "returncode", 1) != 0:
+                return None
+            return text[:50]
+        except Exception:
+            return None
 
     # ------------------------------------------------------------------
     # 14. Voice Notes

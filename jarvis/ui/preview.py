@@ -133,10 +133,12 @@ fallback too.
 """
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from typing import Optional
 
-from jarvis.campreview import (DEFAULT_FPS, MAX_FACES, REASON_DISABLED,
+from jarvis.campreview import (DEFAULT_FPS, DETAIL_DETECTOR_FAILED, MAX_FACES,
+                               REASON_DISABLED,
                                REASON_LIVE, REASON_NO_FRAME, REASON_PIPELINE,
                                REASON_SENSING, REASON_WAITING, PreviewShot,
                                poll_ms)
@@ -186,6 +188,11 @@ STATE_WORDS = {
 ATTEND_YES = "LOOKING AT JARVIS"
 ATTEND_NO = "LOOKING AWAY"
 ATTEND_NONE = "NO FACE IN FRAME"
+# A LIVE picture the detector could not look at. Two words that need
+# opposite responses from him -- "the detector fell over" and "nobody is
+# there" -- used to print the same NO FACE IN FRAME / FACES 0 (F56).
+ATTEND_FAILED = "DETECTOR FAILED"
+ATTEND_NO_DETECTOR = "NO DETECTOR"
 # What a face that matched nothing is called. Not blank, and not the last
 # name seen: "asked, and nobody in the gallery is this person" is an answer
 # and has to look like one.
@@ -375,11 +382,20 @@ def state_tone(shot: PreviewShot) -> str:
 
 
 def attention_line(shot: PreviewShot) -> tuple:
-    """``(text, tone)`` for the verdict row."""
+    """``(text, tone)`` for the verdict row.
+
+    A live shot with no faces and a ``detail`` is one where nothing could
+    be LOOKED FOR -- the detector raised, or there is none -- and that is
+    printed as such, in the warning ink, rather than as an empty room.
+    """
     if shot.reason != REASON_LIVE:
         return shot.detail or "", TONE_OFF
     face = shot.primary
     if face is None:
+        if shot.detail.startswith(DETAIL_DETECTOR_FAILED):
+            return ATTEND_FAILED, TONE_OFF
+        if shot.detail:
+            return ATTEND_NO_DETECTOR, TONE_OFF
         return ATTEND_NONE, TONE_AWAY
     return (ATTEND_YES, TONE_LIVE) if face.attending else (ATTEND_NO,
                                                            TONE_AWAY)
@@ -399,7 +415,9 @@ def readout_rows(shot: PreviewShot) -> tuple:
         # state word and the reason line below carry the whole story.
         return (("", ""), ("", ""))
     if face is None:
-        return (("FACES", "0"), ("YAW", ""))
+        # "0" is a count; a detector that could not look counted nothing,
+        # and the row says so by being blank (see attention_line).
+        return (("FACES", "" if shot.detail else "0"), ("YAW", ""))
     conf = ("CONF", "%.2f" % face.conf)
     yaw = ("YAW", "%+.0f°" % face.yaw_deg if face.landmarks_ok else "—")
     if len(shot.faces) > 1:
@@ -667,7 +685,22 @@ class CameraPreview(tk.Frame):
         if shot.seq == self._seq:
             return
         self._seq = shot.seq
+        t0 = time.monotonic()
         self._paint(shot)
+        if shot.live:
+            # THE ONE STAGE THE CAPTURE THREAD CANNOT TIME. The repaint runs
+            # here, on the Tk thread, and is posted back to the worker so the
+            # once-a-minute ``campreview:`` line carries ``draw`` beside
+            # ``grab`` and ``detect`` -- a slow pane and a slow camera are
+            # then two different columns instead of one complaint. A number,
+            # never the shot; a worker without the hook (a stub) is skipped.
+            note = getattr(worker, "note_stage", None)
+            if callable(note):
+                try:
+                    note("draw", (time.monotonic() - t0) * 1000.0)
+                except Exception:            # noqa: BLE001 - a diagnostic
+                    log.debug("preview: could not post the draw time",
+                              exc_info=True)
 
     # ---------------------------------------------------------- painting
     def _paint(self, shot: PreviewShot) -> None:

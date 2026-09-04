@@ -93,6 +93,14 @@ SAYS_CLEAR_IT = (
     "clear that screen",
     "clear this transcript",
     "clear our chat",
+    # The TRAILING edge (review, 2026-09-03).  "thanks" was accepted and
+    # "thank you" was not, so the comma he did or did not say decided
+    # whether the sentence reached a rung at all: with one the compound
+    # splitter rescued it, without one it went to the classifier.
+    "clear the transcript thank you",
+    "clear the transcript, thank you",
+    "clear the screen thank you very much",
+    "jarvis clear the transcript thank you",
 )
 
 # Negatives.  The first four are HIS, off the log; the rest are ordinary
@@ -143,6 +151,11 @@ MEANS_SOMETHING_ELSE = (
     "can you clear that up",
     "please clear my calendar",
     "go ahead and clear the garage",
+    # ...and the trailing courtesy is a TAIL, not a way in: the pane noun
+    # is still what the language is anchored on.
+    "clear the shopping list thank you",
+    "clear my calendar thank you",
+    "thank you",
 )
 
 
@@ -394,6 +407,98 @@ def test_a_broken_or_absent_approvals_service_never_holds_up_the_wipe(
     assert len(cleared) == 2
 
 
+def test_an_unanswered_was_that_for_me_card_is_counted_too(commander, cleared):
+    """FOUND in review 2026-09-03.  The pane has TWO producers of question
+    cards and this counted one.  main_window._ev_uncertain puts "Was that
+    for me?" into the SAME TranscriptView._approvals dict via add_approval,
+    clear_all keeps it while it is unanswered -- and ApprovalService
+    .pending() has never heard of it, so he was told "Screen's clear, sir"
+    over a card still on the glass, and every later wipe kept it too."""
+    _standing(commander, 0)
+    commander.uncertain_open = lambda: 1
+    res = commander.handle("clear the transcript", source="voice")
+    assert len(cleared) == 1                    # the wipe still happens
+    assert res.reply != TRANSCRIPT_CLEAR_LINE
+    low = res.reply.lower()
+    assert "one question" in low and "still waiting" in low
+    assert "1 question" in res.status and "standing" in res.status
+
+
+def test_the_two_kinds_of_card_are_added_up_not_chosen_between(
+        commander, cleared):
+    """A blocked Claude approval AND an unanswered prompt can be up at the
+    same time -- they are different services and neither knows the other."""
+    _standing(commander, 1)
+    commander.uncertain_open = lambda: 1
+    res = commander.handle("clear the transcript", source="voice")
+    assert "2 questions" in res.reply.lower()
+    assert "2 questions" in res.status
+
+
+def test_a_hook_that_throws_never_holds_up_the_wipe(commander, cleared):
+    """Same rule the approvals leg has kept since it went in: the count is
+    a courtesy on top of the wipe, never a precondition for it."""
+    def _boom():
+        raise RuntimeError("app is going down")
+
+    commander.uncertain_open = _boom
+    res = commander.handle("clear the transcript", source="voice")
+    assert res.reply == TRANSCRIPT_CLEAR_LINE
+    assert len(cleared) == 1
+
+
+def test_a_commander_with_no_services_at_all_still_wipes_the_pane():
+    """FOUND in review 2026-09-03.  The count read `c._svc("approvals")`,
+    and _svc is `getattr(self.services, ...)` -- so on the 13 test-shaped
+    commanders built with object.__new__ it raised AttributeError BEFORE
+    the try block, _try_registry answered "Command failed: clear
+    transcript", and because the publish comes after the count the pane
+    was never wiped at all.  The docstring said "Never raises and never
+    blocks the wipe"."""
+    from jarvis.commander import _h_transcript_clear, _standing_questions
+    c = object.__new__(Commander)
+    assert not hasattr(c, "services")
+    assert _standing_questions(c) == 0
+    seen = []
+    bus.subscribe(ClearTranscript, seen.append)
+    try:
+        res = _h_transcript_clear(c, "clear the transcript", None)
+    finally:
+        bus.unsubscribe(ClearTranscript, seen.append)
+    assert res.reply == TRANSCRIPT_CLEAR_LINE
+    assert len(seen) == 1
+
+
+def test_the_app_hook_reports_the_prompts_the_pane_is_still_holding():
+    """The other end of the same fact: App._pending_uncertain is what
+    _on_uncertain fills and uncertain_answer / _claim_uncertain empty, and
+    app._ask_uncertain returns WITHOUT publishing UncertainResolved when
+    the 5 s window hears nothing -- which is how the card gets stranded in
+    the first place.  Taken unbound against a stand-in self, the way
+    clear_all is below: no App is built and no window is opened."""
+    import threading
+    from jarvis.app import JarvisApp
+    app = types.SimpleNamespace(_uncertain_lock=threading.Lock(),
+                                _pending_uncertain={})
+    assert JarvisApp._uncertain_open(app) == 0
+    app._pending_uncertain["r1"] = "turn the kettle on"
+    assert JarvisApp._uncertain_open(app) == 1
+    # ...and before __init__ has made the dict at all.
+    bare = types.SimpleNamespace(_uncertain_lock=threading.Lock())
+    assert JarvisApp._uncertain_open(bare) == 0
+
+
+def test_the_app_wires_that_hook_to_the_commander():
+    """A count nothing calls is not a fix.  Asserted on the source beside
+    the two hooks it belongs with, because building a real App opens the
+    microphone, the model and a Tk window."""
+    import inspect
+    from jarvis.app import JarvisApp
+    src = inspect.getsource(JarvisApp.__init__)
+    assert "self.commander.uncertain_open = self._uncertain_open" in src
+    assert "self.commander.claim_uncertain" in src
+
+
 def test_the_spoken_count_is_the_count_the_pane_actually_keeps():
     """The two ends of the same fact, tied together: ApprovalService
     .pending() is what the commander counts, and `not answered` is what
@@ -405,6 +510,18 @@ def test_the_spoken_count_is_the_count_the_pane_actually_keeps():
     assert len(pane._cards) == 1
     assert "one question" in transcript_clear_line(len(pane._cards)).lower()
     assert "1 question" in transcript_clear_status(len(pane._cards))
+
+
+def test_the_prompt_card_is_kept_by_the_same_rule_the_approval_is():
+    """Why the count has two halves.  main_window._ev_uncertain calls the
+    SAME TranscriptView.add_approval, so an unanswered "Was that for me?"
+    lands in _approvals and clear_all keeps it on exactly the same test --
+    but ApprovalService.pending() would have reported nothing."""
+    pane = _Pane(cards=2)
+    pane.add_approval_stub("uncertain-1")       # add_approval, YES / NO
+    pane.clear_all()
+    assert len(pane._cards) == 1
+    assert pane.toast.shown == [("Question left standing", "info")]
 
 
 def test_his_shopping_list_still_gets_its_read_back_not_a_screen_wipe(

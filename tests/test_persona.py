@@ -280,7 +280,7 @@ def test_few_shots_are_sampled_one_per_family_and_vary(brain):
 def test_negative_rules_and_brevity_rule_present(brain):
     for phrase in ("no lists", "no bullet points", "no emoji", "no markdown",
                    "no headings", "As an AI", "I'd be happy to",
-                   "never more than two", "read aloud", "never explained",
+                   "Two or three sentences usually", "read aloud", "never explained",
                    "let a good night be a good night", "Never pad",
                    "start, not initiate", "Do not recite file names",
                    "Never say you checked, ran, noticed or found",
@@ -358,9 +358,10 @@ def test_rules_quote_nothing_the_model_could_copy(brain):
     # the closing brevity instruction is the last thing the model reads
     # (recency wins) and survives rendering
     tail = ("Now answer Hunter as Jarvis, in your own words, keeping the "
-            "manner of the examples, and call him sir. One short sentence is "
-            "the norm; add a second only if it says something new that he "
-            "asked for, and never describe his screen, files or machine "
+            "manner of the examples, and call him sir. Two or three sentences "
+            "is the norm; take a fourth when the question genuinely needs "
+            "it and one when it does not -- length follows the question, "
+            "not a quota, and never describe his screen, files or machine "
             "unless he asked. If he asks for a joke, it is one dry remark "
             "about his situation, never a question and its answer. The "
             "examples are the manner only, never the words: never reuse a "
@@ -450,18 +451,21 @@ def test_split_sentences_is_abbreviation_and_ellipsis_aware(brain):
 
 
 def test_two_sentence_cap_is_enforced_in_code(brain, monkeypatch):
+    # One MORE sentence than the cap allows, whatever the cap currently is.
+    body = [f"Sentence number {i} is here." for i in
+            range(brain.MAX_SPOKEN_SENTENCES + 1)]
+    over = " ".join(body)
+    assert brain.limit_sentences(over) == " ".join(body[:-1])
     three = ("I'm afraid I don't know, sir. The clock is elsewhere. "
              "It was last updated yesterday.")
-    assert brain.limit_sentences(three) == \
-        "I'm afraid I don't know, sir. The clock is elsewhere."
     _ollama_returning(monkeypatch, three)
     b = brain.JarvisBrain(context=FakeContext(), memory=None)
     monkeypatch.setattr(b, "_query_claude",
                         lambda text: pytest.fail("fell back to Claude"))
     actions = b._chat_sync("Where did I leave off?")
     spoken = " ".join(d for t, d in actions if t == "SPEAK")
-    assert count_sentences(spoken) == 2
-    assert spoken == "I'm afraid I don't know, sir. The clock is elsewhere."
+    assert count_sentences(spoken) == 3, spoken
+    assert spoken == three
 
 
 def test_invented_clock_reading_is_stripped_without_a_clock_line(brain,
@@ -494,14 +498,20 @@ def test_invented_clock_reading_is_stripped_without_a_clock_line(brain,
 def test_trim_spoken_never_ends_mid_word(brain):
     trim = brain.trim_spoken
     b = brain.JarvisBrain(context=None, memory=None)
-    # whole sentences that fit the 250 target are kept, the rest dropped:
-    # 2 x 26 chars + 7 x 27 chars = 241 fit; the eighth "Third" would not
+    # Whole sentences that fit the char target are kept, the rest dropped.
+    # Derived from brain.MAX_SPOKEN_CHARS rather than hard-coded: this oracle
+    # was written against 250 and silently pinned it, so raising the cap on
+    # 2026-09-04 broke a test that was really asserting arithmetic, not
+    # behaviour. The BEHAVIOUR is "cut on a sentence boundary at or under the
+    # cap, never mid-word", and that is what is asserted now.
     many = ("First sentence here, sir. " * 2 +
-            "Third one is dropped, sir. " * 8).strip()
+            "Third one is dropped, sir. " * 40).strip()
     out = trim(many)
-    assert out == many[:240]
-    assert out.count("Third") == 7 and out.endswith(", sir.")
-    assert len(out) == 240 and len(out) + 27 > 250
+    assert len(out) <= brain.MAX_SPOKEN_CHARS
+    assert out.endswith(", sir."), out[-40:]
+    assert many.startswith(out)                 # a prefix, never re-worded
+    # the very next sentence would have overshot, i.e. it kept as many as fit
+    assert len(out) + len("Third one is dropped, sir. ") > brain.MAX_SPOKEN_CHARS
     # a 300-char single sentence: spoken whole (fits the TTS limit), ends on
     # a word boundary with terminal punctuation
     s300 = ("word " * 59 + "finish.").strip()
@@ -519,8 +529,15 @@ def test_trim_spoken_never_ends_mid_word(brain):
               "repository behind it.")
     assert len(sample) == 357
     spoken = b._parse_response(sample)
-    assert spoken == [("SPEAK", sample.split(". Currently")[0] + ".")]
-    assert spoken[0][1].endswith("to Claude.")
+    # 357 chars sits UNDER the cap since 2026-09-04, so this one is now kept
+    # whole -- which is the point of the raise. The cut-at-a-sentence-boundary
+    # behaviour is asserted by the `many` case above, against the constant.
+    # What must hold at EVERY cap is the thing this test is named for:
+    # whatever comes out never ends mid-word.
+    assert len(sample) <= brain.MAX_SPOKEN_CHARS
+    assert spoken == [("SPEAK", sample)]
+    assert not spoken[0][1].rstrip().endswith(("Curre", "termin", "reposit"))
+    assert sample.startswith(spoken[0][1][:40])
     # beyond the TTS limit a single sentence is cut at a clause boundary
     # beyond index 100, never inside a word, and given a period
     s600 = ("alpha beta, " * 50).strip()

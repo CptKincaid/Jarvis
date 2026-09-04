@@ -875,6 +875,26 @@ BREEZE_PING_TIMEOUT_S = 2.0
 # landing on the F5 that was available in 0.53 s.
 BREEZE_STARTUP_TIMEOUT_S = 90.0
 
+# How often a Jarvis that has fallen back to F5 asks whether the Breeze
+# sidecar has come back -- on the warm thread, never on the speak path.
+#
+# One failed probe used to demote Breeze for the whole session: load() took
+# the F5 branch on every utterance after that and nothing pinged Breeze
+# again, and warm_breeze (spawned only while the unit was active) gave up
+# after its one 90 s budget. The memory gate refusing at boot is a normal
+# morning on this box (MemFree 20.9 GB against the 33 GB floor when this was
+# filed), so "he frees memory and starts the unit" is the ordinary recovery
+# -- and Jarvis kept speaking F5 with tts_engine still "breeze" until a
+# restart. Measured: a READY sidecar bound, the unit active, ten further
+# load() calls, 0 requests reached it.
+#
+# 30 s: a probe is one AF_UNIX connect (ECONNREFUSED or ENOENT in
+# microseconds while the sidecar is down, 2 s at worst against a hung one),
+# and the sidecar's own start is ~30 s, so nothing faster would find it
+# sooner. The unit-is-starting case still gets the 0.5 s cadence of
+# BREEZE_STARTUP_TIMEOUT_S first; this is what follows when that runs out.
+BREEZE_REPROBE_S = 30.0
+
 # A stream cut just past the header was still never audible, so re-rendering
 # it on F5 cannot produce a doubled fragment. The threshold has to be a
 # DURATION and not the header length: at 44 bytes exactly the fallback fires
@@ -1074,13 +1094,20 @@ def _ensure_breeze_server(startup_timeout: float = 0.0) -> bool:
                             "cached audio may not match what it renders",
                             "; ".join(drift))
             return True
-        if reply and not reply.get("graphs"):
-            # It answered and told us it is degraded. Do not wait for a unit
-            # that is already up and already wrong.
-            log.error("breeze sidecar is up but its CUDA graphs are NOT "
-                      "captured (%s) -- it would stutter; using %s",
-                      reply.get("error") or reply.get("detail"),
-                      BREEZE_FALLBACK)
+        if reply:
+            # It answered, and it is not ready. That is TERMINAL for this
+            # process, not a phase of starting: the sidecar binds its socket
+            # only after load and capture, so a not-ready answer means the
+            # graphs were not captured (it would stutter) or the render
+            # thread has since died. Waiting on a unit that is already up
+            # and already wrong only delays the fallback. The dead-worker
+            # reply (ready:false, graphs:true) used to fall through this
+            # branch, which was keyed on graphs alone: the speak path logged
+            # "not answering yet" for a sidecar that had answered in under a
+            # millisecond and the warm thread polled it for the whole
+            # startup budget -- measured, 8 pings over a 3 s stand-in for
+            # the 90 -- with its reason never logged.
+            _breeze_refused(reply)
             return False
         if not _breeze_unit_active():
             log.error("breeze sidecar is not running (%s is not active); "
@@ -1097,19 +1124,40 @@ def _ensure_breeze_server(startup_timeout: float = 0.0) -> bool:
     return _wait_for_breeze_unit(startup_timeout)
 
 
+def _breeze_refused(reply: dict) -> None:
+    """Say WHY a sidecar that answered is being refused, quoting its reason:
+    the error text is the one line that tells him which of the two
+    terminal states it is in."""
+    why = reply.get("error") or reply.get("detail")
+    if not reply.get("graphs"):
+        log.error("breeze sidecar is up but its CUDA graphs are NOT "
+                  "captured (%s) -- it would stutter; using %s",
+                  why, BREEZE_FALLBACK)
+    else:
+        log.error("breeze sidecar is up but not ready (%s); using %s until "
+                  "%s is restarted", why, BREEZE_FALLBACK, BREEZE_UNIT)
+
+
 def _wait_for_breeze_unit(startup_timeout: float) -> bool:
     """The unit owns the socket: poll until it answers or dies.
 
     Re-checks the unit every few seconds so a unit that crashed during graph
-    capture does not cost the whole startup budget.
+    capture does not cost the whole startup budget. A socket that appears
+    and answers NOT READY ends the wait the same way: that answer is
+    terminal for the process (see _ensure_breeze_server), so the rest of
+    the budget would be spent polling a sidecar that cannot change its mind.
     """
     log.info("breeze sidecar is owned by %s; waiting for it", BREEZE_UNIT)
     deadline = time.monotonic() + startup_timeout
     next_unit_check = time.monotonic() + 5
     while time.monotonic() < deadline:
-        if _breeze_alive():
+        reply = _breeze_ping()
+        if reply.get("ready") and reply.get("graphs"):
             log.info("breeze sidecar ready (%s)", BREEZE_UNIT)
             return True
+        if reply:
+            _breeze_refused(reply)
+            return False
         if time.monotonic() >= next_unit_check:
             if not _breeze_unit_active():
                 log.error("%s stopped while we were waiting for it", BREEZE_UNIT)
@@ -1424,6 +1472,10 @@ class TTS:
         self._stop_flag = False
         self._speaking = False           # burst state (queue non-empty → done)
         self._burst_announced = False    # SpeakingState(active=True) sent yet?
+        # The burst's falling edge has been published; nothing may assert
+        # active=True after it (see _run_amp_feeder's tail).
+        self._burst_closed = False
+        self._edge_lock = threading.Lock()   # orders the two publishing threads
         self._amp_playing = False
         self._amp_gen = 0                # generation token: one per chunk feeder
         self._current_amp = 0.0
@@ -1513,14 +1565,12 @@ class TTS:
                 # socket, which is the normal case.
                 self.warm_f5_fallback()
                 return True
-            if _breeze_unit_active():
-                # It exists and is coming up (loading, capturing, or queued on
-                # the GPU lock). Speak THIS reply in F5 at 0.53 s and let a
-                # background thread put the good voice back when it answers,
-                # rather than spending the startup budget in silence to reach
-                # the same F5. One extra `systemctl is-active` on the way
-                # down, once per session -- _engine is f5 after this.
-                self.warm_breeze()
+            # Speak THIS reply in F5 at 0.53 s; _breeze_unavailable puts a
+            # background thread on the job of getting the good voice back
+            # (warm_breeze), whether the unit is coming up or not there at
+            # all, rather than spending any budget in silence to reach the
+            # same F5. _engine is f5 after this, so load() takes the F5
+            # branch from here on and never probes on the speak path.
             return self._breeze_unavailable()
         if self._engine == "f5":
             if _ensure_f5_server():
@@ -1577,26 +1627,57 @@ class TTS:
         long as that job runs. Waiting for it inside load() cost the reply the
         whole budget in silence and then fell back to F5 anyway.
 
+        It does not give up. A unit that is active gets the startup budget
+        at its 0.5 s cadence first; after that -- or from the start, when the
+        unit is not running at all -- the sidecar is asked again every
+        BREEZE_REPROBE_S for as long as we are still on the engine we fell
+        back to. One failed probe used to be the whole session (see
+        BREEZE_REPROBE_S for the measurement); the ordinary recovery on this
+        box is him freeing memory and starting the unit by hand, and that
+        has to be enough.
+
         Daemon, one per instance, and it only ever RESTORES a choice Hunter
-        already made: it sets the engine back to "breeze" if and only if we
-        are the ones who demoted it.
+        already made: it sets the engine back to "breeze" if and only if the
+        engine is still the one we demoted it to, and it ends the moment
+        that stops being true -- his choice, or a further demotion.
         """
         t = self._breeze_warm_thread
         if t is not None and t.is_alive():
             return t
 
-        def _run():
-            if not _ensure_breeze_server(BREEZE_STARTUP_TIMEOUT_S):
-                log.warning("breeze sidecar did not come up within %.0fs; "
-                            "staying on %s for this session",
-                            BREEZE_STARTUP_TIMEOUT_S, BREEZE_FALLBACK)
-                return
+        def _still_demoted() -> bool:
+            return self._engine == BREEZE_FALLBACK
+
+        def _promote() -> None:
             if self._engine != BREEZE_FALLBACK:
-                # He changed the engine while we waited. His choice wins.
-                return
+                return               # he changed the engine meanwhile: his call
             log.info("breeze sidecar is up — the next reply uses it")
             self._engine = "breeze"
             bus.publish(Status(text="Breeze voice is back", kind="ok"))
+
+        def _run():
+            if _breeze_unit_active():
+                if _ensure_breeze_server(BREEZE_STARTUP_TIMEOUT_S):
+                    _promote()
+                    return
+                log.warning("breeze sidecar did not come up within %.0fs; "
+                            "staying on %s and asking again every %.0fs",
+                            BREEZE_STARTUP_TIMEOUT_S, BREEZE_FALLBACK,
+                            BREEZE_REPROBE_S)
+            while _still_demoted():
+                # In short steps, so a changed engine ends this within a
+                # second rather than a probe interval.
+                until = time.monotonic() + BREEZE_REPROBE_S
+                while time.monotonic() < until:
+                    if not _still_demoted():
+                        return
+                    time.sleep(min(0.5, max(0.0, until - time.monotonic())))
+                # A bare ping first: _ensure_breeze_server logs an ERROR for
+                # a unit that is not running, which is true every time round
+                # while he has not started it and is not news at that rate.
+                if _breeze_alive() and _ensure_breeze_server():
+                    _promote()
+                    return
 
         t = threading.Thread(target=_run, daemon=True, name="tts-breeze-warm")
         self._breeze_warm_thread = t
@@ -1623,6 +1704,10 @@ class TTS:
         bus.publish(Status(text="Breeze voice down — using F5 (local)",
                            kind="warn"))
         self._engine = BREEZE_FALLBACK
+        # After the demotion, so the loop finds the engine it is to watch;
+        # whatever the unit's state, because a unit that is not running is
+        # exactly the one he is about to start by hand (BREEZE_REPROBE_S).
+        self.warm_breeze()
         return self.load()
 
     def _f5_unavailable(self) -> bool:
@@ -1958,6 +2043,8 @@ class TTS:
                 if not self._speaking:
                     self._speaking = True
                     self._burst_announced = False
+                    with self._edge_lock:
+                        self._burst_closed = False
                     self._acquire_mic()
                     # SpeakingState(active=True) is NOT published here. It is
                     # the app's "audio" mark, and the turn ledger's "wait"
@@ -1983,7 +2070,12 @@ class TTS:
                         # rising one, so give them the edge -- late, but the
                         # turn still closes and the follow-up mic still opens.
                         self._mark_audio()
-                    bus.publish(SpeakingState(active=False, amplitude=0.0))
+                    # Under the lock WITH the publish: the amp feeder's tail
+                    # publishes from its own thread and must not re-assert
+                    # active=True on the other side of this edge (2026-09-02).
+                    with self._edge_lock:
+                        self._burst_closed = True
+                        bus.publish(SpeakingState(active=False, amplitude=0.0))
 
     def _mark_audio(self):
         """Publish the burst's SpeakingState(active=True) once, at the moment
@@ -1993,15 +2085,20 @@ class TTS:
         self._burst_announced = True
         bus.publish(SpeakingState(active=True, amplitude=0.0))
 
-    def _pronounce(self, text: str) -> str:
-        """Apply the pronunciation dictionary (never fails speech)."""
+    def _pronounce(self, text: str, engine: str | None = None) -> str:
+        """Apply the pronunciation dictionary (never fails speech).
+
+        ``engine`` defaults to the current one; the F5 fallback for a
+        refused Breeze chunk names its own (see _refit)."""
         if not self._pronunciation:
             return text
         try:
             # The ENGINE decides, not this call site: an engine that reads
             # "9:10 am" correctly is made WORSE by being handed "nine ten ay
             # em" (fish voiced it as "I'm"; Breeze does the same, measured).
-            return pronounce.apply(text, engine=self._engine) or text
+            return pronounce.apply(
+                text, engine=self._engine if engine is None else engine
+            ) or text
         except Exception:
             log.exception("pronunciation apply failed")
             return text
@@ -2037,6 +2134,37 @@ class TTS:
         against the speech without a GPU, a speaker or a running app."""
         cleaned = self._clean_for_speech(text or "")
         return self._pronounce(cleaned) if cleaned else ""
+
+    def _refit(self, text: str, engine: str) -> list[str]:
+        """``text``, prepared for the engine that refused it, re-prepared as
+        ``engine``'s own chunks: the text its rules were measured on, split
+        the way it splits, keyed the way it keys.
+
+        WHY. A chunk reaches the F5 fallback carrying Breeze's preparation:
+        no short-line pad (_ENGINE_NEEDS_SHORT_PAD["breeze"] is False -- the
+        floor the pad works around is F5's) and Breeze's self-normalising
+        rule set (no "6:00 pm" -> "six pee em", no "049" -> "zero four
+        nine"). F5 then rendered a 14-byte line with no pad, which is the
+        measured floor case ("said buy milk really fast", 0.55-1.29 s short),
+        and raw clock digits it was never listened to on; and it filed the
+        audio under a key no native F5 reply looks up, so a later F5
+        utterance of the same line simply missed.
+
+        The order is the room's own. The pad runs BEFORE the pronunciation
+        pass because that is where _clean_for_speech runs it, so the key
+        comes out byte-identical to a native F5 utterance of the same line.
+        Measured on 17 of his real lines (calendar, rooms, clock times,
+        shouted course codes, terse acks): pad-then-F5-rules over the Breeze
+        form matched the native F5 form on all 17. The split is F5's too
+        (240 chars, _ENGINE_CHUNKING): since the join a Breeze chunk is the
+        whole reply, and a 560-character F5 render was one cache entry
+        nothing would ever hit and ~2 s to its first byte where the first
+        sentence alone is ~0.5 s.
+        """
+        line = (pad_short_line(text)
+                if _ENGINE_NEEDS_SHORT_PAD.get(engine, False) else text)
+        line = self._pronounce(line, engine=engine)
+        return self._split_sentences(line, engine=engine)
 
     def _cache_key(self, engine: str, spoken: str) -> str:
         if engine == "fish":
@@ -2406,32 +2534,52 @@ class TTS:
             return True
 
         def _fallback_chunk(sent: str) -> bool:
-            """Render one chunk on F5 and queue it. True when it was queued.
+            """Render one chunk on F5 and queue it. True when any of it was.
 
             Used when Breeze fails before any audio: a dropped chunk is a
             hole in the sentence, and Jarvis in the 2.79 voice is better than
             Jarvis missing a clause.
+
+            ``sent`` was prepared for Breeze. F5 gets it re-prepared as its
+            own pieces (TTS._refit), each looked up in the cache and filed
+            under F5's key exactly as a native F5 reply would be -- so the
+            fallback voice speaks the text its rules were measured on, and
+            the next F5 utterance of the same line is a hit.
             """
-            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            tmp.close()
+            log.warning("falling back to %s for this chunk", BREEZE_FALLBACK)
             try:
-                log.warning("falling back to %s for this chunk",
-                            BREEZE_FALLBACK)
-                if self.load_breeze_fallback():
-                    self._synth_f5(sent, tmp.name)
-                    if not self._stop_flag:
-                        # under the RENDERING engine's key: breeze-keyed F5
-                        # audio would replay in the wrong voice from cache
-                        self._store(BREEZE_FALLBACK, sent, tmp.name)
-                    wav_q.put((tmp.name, True))
-                    return True
+                if not self.load_breeze_fallback():
+                    return False
             except Exception:
                 log.exception("fallback synth failed too")
-            try:
-                os.unlink(tmp.name)
-            except OSError:
-                pass
-            return False
+                return False
+            queued = False
+            for piece in self._refit(sent, BREEZE_FALLBACK):
+                if self._stop_flag:
+                    break
+                cached = self._cached(BREEZE_FALLBACK, piece)
+                if cached is not None:
+                    wav_q.put((cached, False))
+                    queued = True
+                    continue
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp.close()
+                try:
+                    self._synth_f5(piece, tmp.name)
+                except Exception:
+                    log.exception("fallback synth failed too")
+                    try:
+                        os.unlink(tmp.name)
+                    except OSError:
+                        pass
+                    break
+                if not self._stop_flag:
+                    # under the RENDERING engine's key: breeze-keyed F5
+                    # audio would replay in the wrong voice from cache
+                    self._store(BREEZE_FALLBACK, piece, tmp.name)
+                wav_q.put((tmp.name, True))
+                queued = True
+            return queued
 
         def _producer():
             try:
@@ -2880,8 +3028,12 @@ class TTS:
 
         def _feed_amp():
             for amp in source:
+                # _burst_closed as well as the generation token: every tick
+                # here is a SpeakingState(active=True) too, so a feeder still
+                # draining its envelope after the worker's falling edge
+                # re-asserts the burst just as surely as the tail does.
                 if (gen != self._amp_gen or not self._amp_playing
-                        or self._stop_flag):
+                        or self._stop_flag or self._burst_closed):
                     break
                 self._current_amp = amp
                 bus.publish(SpeakingState(active=True, amplitude=amp))
@@ -2889,17 +3041,26 @@ class TTS:
             if gen == self._amp_gen:     # don't stomp a newer chunk's feeder
                 self._current_amp = 0.0
                 self._amp_playing = False
-                # amplitude_only: close the mouth, touch nobody's idea of
-                # whether he is still speaking. This publish used to carry
-                # active=True (it cannot carry False -- mid-burst that is a
-                # spurious end-of-speech, and _after_speech would open the
-                # follow-up mic under the next chunk's playback), and the
-                # 80 ms sleeps here drift behind the player, so on a long
-                # line it arrived AFTER the worker's active=False and
-                # latched every level-reader True for good. 2026-09-02
-                # 08:56:19: the one orphan duck in a boot of 65.
-                bus.publish(SpeakingState(active=True, amplitude=0.0,
-                                          amplitude_only=True))
+                # THE TAIL IS NOT AN AUTHORITY ON active. Its job is to shut
+                # the avatar's mouth at the end of a CHUNK, mid-burst. It used
+                # to publish a hard-coded active=True from the tts-amp-feeder
+                # thread, unordered against the worker's active=False -- and on
+                # 2026-09-02 08:56:18 it landed 236 ms AFTER the falling edge.
+                # Nothing ever clears a re-asserted True: the mixer stayed
+                # ducked 17 s, the pill stayed "Speaking", app._tts_active
+                # stayed set, and he had to TYPE his answer.
+                #
+                # TWO fixes for this arrived on two branches and both are kept,
+                # because they fail differently. The guard is the ORDERING one:
+                # once the falling edge has published, this says nothing at all.
+                # amplitude_only is the DECLARATIVE one: the message itself
+                # tells every subscriber to read amplitude and IGNORE active,
+                # so even a publish that slips past the guard cannot latch.
+                with self._edge_lock:
+                    if self._burst_closed:
+                        return
+                    bus.publish(SpeakingState(active=True, amplitude=0.0,
+                                              amplitude_only=True))
 
         threading.Thread(target=_feed_amp, daemon=True,
                          name="tts-amp-feeder").start()
@@ -2908,10 +3069,13 @@ class TTS:
     def _play(self, wav_path: str):
         """Play a wav via paplay → pw-play → aplay (chain order unchanged).
 
-        Uses Popen + poll so stop() can interrupt playback; per-player
-        timeout stays 30s, non-zero exit falls through to the next player.
+        Uses Popen + poll so stop() can interrupt playback; non-zero exit
+        falls through to the next player. The per-player deadline is the
+        file's own length plus PLAYER_GRACE_S -- it was a flat 30 s, which a
+        joined Breeze chunk's replay outlived (see PLAYER_GRACE_S).
         """
         dev = (CONFIG.playback_device or "").strip()
+        deadline_s = _player_deadline(wav_path)
         # An explicit sink (the echo-cancelling one) for the two players
         # that can take one; aplay is the no-PipeWire fallback.
         for cmd in [["paplay", f"--client-name={SPEECH_CLIENT_NAME}",
@@ -2928,7 +3092,7 @@ class TTS:
                 continue
             self._play_proc = proc
             try:
-                if not self._wait_player(proc, deadline_s=30):
+                if not self._wait_player(proc, deadline_s=deadline_s):
                     return
             finally:
                 self._play_proc = None
@@ -2942,6 +3106,11 @@ class TTS:
         deadline = time.monotonic() + deadline_s
         while proc.poll() is None:
             if self._stop_flag or time.monotonic() > deadline:
+                if not self._stop_flag:
+                    # Loud, because it was not: a chunk cut here used to
+                    # leave "speech complete" as its only trace.
+                    log.warning("player cut at its %.0f s deadline -- the "
+                                "rest of that chunk was not heard", deadline_s)
                 proc.terminate()
                 try:
                     proc.wait(timeout=2)
@@ -3297,6 +3466,60 @@ def wav_pcm(path: str) -> tuple[tuple[int, int, int], bytes]:
     return (int(rate), int(data.shape[1]), 2), data.tobytes()
 
 
+# What the file-chain player (paplay / pw-play / aplay handed a FINISHED wav)
+# is allowed BEYOND the audio in that file before it is terminated.
+#
+# It used to be a flat 30 s per player, and a flat number was fine while the
+# largest chunk any engine produced was ~320 characters (~19 s of audio).
+# _BREEZE_STREAM_JOIN_CHARS then made a Breeze chunk the whole reply, 560
+# characters, and only the STREAM path's deadline was revisited
+# (stream.timeout + 30 in _play_stream). The first hearing of a long reply
+# was therefore whole and every other road to the speaker was cut: the same
+# reply said again is a cache hit through _play(), a refusal before audio
+# sends the whole one-chunk reply to F5 through _play(), and so does
+# _play_stream_from_file. At 0.0594 s/char (BREEZE_TIMEOUT_S's arithmetic) a
+# 560-char chunk is 33.2 s and a capped 522-char reply 31.0 s; at F5's
+# measured 0.060 s/char the fallback render of the same reply is 31.4 s. All
+# of them past 30, terminated in silence, with "speech complete" in the log.
+#
+# So the deadline is now the file's own length plus this. 30 is kept as the
+# grace because it is what the number always bounded in practice: the sound
+# server's buffered tail, a slow start, and a player that has genuinely
+# wedged. See _wav_seconds for why the length is read off the file's SIZE
+# and not its header.
+PLAYER_GRACE_S = 30.0
+
+
+def _wav_seconds(path: str) -> Optional[float]:
+    """Seconds of audio in a PCM wav, or None when it is not one.
+
+    From the file's SIZE, bounded by the header's frame count, and not the
+    header alone: a Breeze cache entry is the tee of a stream, so its header
+    carries STREAM_SIZE in both length fields -- which wave reads as
+    2147483647 frames, 89478 s at 24 kHz (measured). A deadline built on
+    that would be no deadline at all. Edge writes an MP3 into a .wav-suffixed
+    file (module docstring), which wave refuses: that returns None and the
+    player keeps the flat grace it always had.
+    """
+    try:
+        size = os.path.getsize(path)
+        with wave.open(path, "rb") as fh:
+            rate = fh.getframerate()
+            frame = fh.getnchannels() * fh.getsampwidth()
+            if not rate or not frame:
+                return None
+            frames = min(fh.getnframes(),
+                         max(0, size - _WAV_HEADER_BYTES) // frame)
+    except (wave.Error, EOFError, OSError):
+        return None
+    return frames / float(rate)
+
+
+def _player_deadline(path: str) -> float:
+    """How long _play may wait on one player for ``path``."""
+    return PLAYER_GRACE_S + (_wav_seconds(path) or 0.0)
+
+
 class Rendition:
     """One reply, rendered as wav bytes for a client that is not the room.
 
@@ -3314,17 +3537,31 @@ class Rendition:
     earned depends on the engine. F5, XTTS and edge render a whole chunk
     before a byte of it exists, so their first bytes arrive one chunk in.
     Breeze does not: it streams, so ``stream()`` forwards its blocks as they
-    land and the phone hears the reply ~0.3 s in whatever its length. That
-    matters here more than it does in the room, because
-    _BREEZE_STREAM_JOIN_CHARS made a reply one chunk -- correctly, for a
-    player that streams; ruinously for a reader that waited for a finished
-    file, which is what this used to be (a 218-character reply went from
-    1.35 s to first byte to 9.49 s, and webapp's _stream_clip holds the HTTP
-    status line back until then).
+    land and the phone hears the reply ~0.3 s in whatever its length --
+    WHEN THE SIDECAR IS IDLE. That matters here more than it does in the
+    room, because _BREEZE_STREAM_JOIN_CHARS made a reply one chunk --
+    correctly, for a player that streams; ruinously for a reader that
+    waited for a finished file, which is what this used to be (a
+    218-character reply went from 1.35 s to first byte to 9.49 s, and
+    webapp's _stream_clip holds the HTTP status line back until then).
+
+    Behind a room utterance it is that utterance's REMAINING RENDER. The
+    sidecar serialises generation under one lock and withholds its status
+    line until the first block exists, so a request that lands mid-utterance
+    gets nothing at all until the room's render is done -- and since the
+    join the room's utterance is the whole reply, up to ~30 s for a capped
+    one at RTF 0.742 (before it, the lock was released at every sentence
+    and a phone request could slip in between). _stream_clip then holds the
+    HTTP status line back for that same first block, so for all of it the
+    phone sees no response whatever. The reverse holds too: a phone stream
+    stalls the room's next utterance on the same lock, which the room
+    survives only because BREEZE_TIMEOUT_S is 60 s. Pinned by
+    test_a_phone_stream_behind_a_room_stream_waits_for_the_whole_render.
     """
 
     def __init__(self, tts: "TTS", text: str):
         self.tts = tts
+        self.text = text                 # kept for _replan
         self.engine = tts.render_engine()
         # ONE cache lookup per chunk, here: _cached() also keeps the hit /
         # miss counters, so asking twice would report a hit rate this
@@ -3497,11 +3734,20 @@ class Rendition:
         engine = self.tts.render_engine()
         if engine == self.engine:
             return
-        log.info("render: engine changed %s -> %s; re-reading the cache",
+        log.info("render: engine changed %s -> %s; re-planning under it",
                  self.engine, engine)
         self.engine = engine
+        # Re-derived from the text, not re-keyed chunk by chunk: the chunks
+        # are the engine's too. Planned under Breeze the reply is ONE chunk
+        # (the join), and handing that to F5 -- a whole-chunk engine --
+        # made the phone wait for a whole-reply render before its status
+        # line (~2-3 s for a capped reply against ~0.5 s for a sentence)
+        # and filed it under a key the room's F5 split never looks up
+        # (measured: four sentence chunks, four misses). render_chunks runs
+        # the room's own three steps under the engine load() chose, so the
+        # pad, the pronunciation rules and the split are all F5's.
         self.plan = [(chunk, self.tts._cached(engine, chunk))
-                     for chunk, _ in self.plan]
+                     for chunk in self.tts.render_chunks(self.text)]
 
     def _synth(self, chunk: str) -> Optional[str]:
         """Render one chunk to a temp wav and file it in the speech cache
