@@ -377,6 +377,7 @@ def test_toast_kind_colour_is_read_per_call():
 # =====================================================================
 from jarvis.ui.board import (EMPTY_PANEL_DEFAULT, EMPTY_PANEL_TEXT,  # noqa: E402
                              empty_panel_text)
+from jarvis.ui import views as views_mod  # noqa: E402
 from jarvis.ui.views import (SNAP_FRAGMENT, SettingsDrawer,  # noqa: E402
                              snap_hidden, speaker_color)
 from jarvis.ui.widgets import StatePill  # noqa: E402
@@ -411,6 +412,194 @@ def test_snap_never_hides_the_card_the_view_rests_on_or_a_whole_card():
     assert snap_hidden([16, 316], [284, 100], 316, 192) == [False, False]
     assert snap_hidden([], [], 0, 192) == []
     assert SNAP_FRAGMENT == 96
+
+
+# The wiring, not the arithmetic: a wheel tick and a relayout must both run
+# the snap, or snap_hidden is a pure function nobody calls (the 09-04 review
+# found the two tests above still passing with every _apply_snap() call
+# deleted). No Tk: the view is built with __new__ over a fake canvas that
+# records item states, and the fragment card must come out "hidden".
+class _FakeCanvas:
+    def __init__(self, width, height, tops=None):
+        self.w, self.h = width, height
+        self.pos = dict(tops or {})           # win id -> y
+        self.state = {}                        # win id -> last state
+        self.width = {}
+        self.region_h = None
+        self.top = 0
+
+    # geometry ---------------------------------------------------------
+    def winfo_exists(self):
+        return True
+
+    def update_idletasks(self):
+        pass
+
+    def winfo_width(self):
+        return self.w
+
+    def winfo_height(self):
+        return self.h
+
+    def coords(self, item, *xy):
+        if xy:
+            self.pos[item] = xy[1]
+            return None
+        return [0, self.pos[item]]
+
+    def itemconfigure(self, item, **kw):
+        if "state" in kw:
+            self.state[item] = kw["state"]
+        if "width" in kw:
+            self.width[item] = kw["width"]
+
+    def configure(self, **kw):
+        if "scrollregion" in kw:
+            self.region_h = kw["scrollregion"][3]
+
+    # scrolling --------------------------------------------------------
+    def yview_moveto(self, frac):
+        self.top = int(max(0, (self.region_h or self.h) - self.h) * frac)
+
+    def yview_scroll(self, n, _unit):
+        self.top = max(0, self.top + n * 10)
+
+    def yview(self):
+        return (0.0, 1.0)
+
+    def canvasy(self, y):
+        return self.top + y
+
+
+class _FakeCard:
+    def __init__(self, height, text="body"):
+        self.h = height
+        self._text = text
+
+    def sync(self):
+        pass
+
+    def winfo_reqheight(self):
+        return self.h
+
+    def cget(self, _key):
+        return self._text
+
+
+def _snap_view(heights, canvas):
+    from jarvis.ui.views import TranscriptView
+    view = TranscriptView.__new__(TranscriptView)      # no tk.Frame.__init__
+    view.canvas = canvas
+    view._cards = []
+    for i, h in enumerate(heights):
+        card = _FakeCard(h)
+        view._cards.append([card, card, "jarvis", 100 + i, h])
+    view._partial = None
+    view._pinned = True
+    view._layout_job = None
+    view._schedule_dots = lambda: None
+    view._card_geo = lambda role, W=None, text="": (0, 400, 380)
+    return view
+
+
+def test_a_wheel_tick_runs_the_snap_and_unmaps_the_fragment(monkeypatch):
+    theme.select_look("holo")
+    monkeypatch.setattr(views_mod, "px", lambda v: v * 2)   # S=2 arithmetic
+    tops = {100: 16, 101: 316, 102: 532, 103: 748}
+    canvas = _FakeCanvas(800, 700, tops)
+    view = _snap_view([284, 200, 200, 120], canvas)
+    canvas.top = 16 + 284 - 178 - 20          # one tick above the 08b cut
+    view._wheel(1)                             # +20 px: lands the cut at -178
+    assert canvas.top == 16 + 284 - 178
+    assert canvas.state == {100: "hidden", 101: "normal", 102: "normal",
+                            103: "normal"}, canvas.state
+    # scrolling up unpins nothing here (yview says pinned), but a taller
+    # remainder is a card worth reading: it comes back
+    view._wheel(-3)
+    assert canvas.state[100] == "normal"
+
+
+def test_a_relayout_runs_the_snap_after_stacking_the_cards(monkeypatch):
+    """A new card arrives, the stack is rebuilt top-anchored and pinned to
+    the bottom, and the first card's 40 px remainder (09's halved 'Here's
+    your morning, sir.') must be unmapped BY THE RELAYOUT -- it is the one
+    code path a new reply always takes."""
+    theme.select_look("holo")
+    monkeypatch.setattr(views_mod, "px", lambda v: v * 2)
+    heights = [284, 200, 200, 120]
+    gap = theme.PAD_S
+    total = sum(heights) + gap * 3
+    # viewport sized so the view's top edge lands 40 px above the bottom
+    # of the first card once pinned to the bottom of the scrollregion
+    H = (gap + total + gap) - (gap + 284 - 40)
+    canvas = _FakeCanvas(800, H)
+    view = _snap_view(heights, canvas)
+    view._relayout()
+    assert canvas.top == gap + 284 - 40
+    assert canvas.state[100] == "hidden", canvas.state
+    assert [canvas.state[i] for i in (101, 102, 103)] == ["normal"] * 3
+    # classic never snaps: the same relayout maps every card
+    theme.select_look("classic")
+    view._relayout()
+    assert all(s == "normal" for s in canvas.state.values())
+    theme.select_look("holo")
+
+
+# ------------------------------------------- U09 the standby clock
+# MEASURED 2026-09-04 on Xvfb :95 (scripts/ui_shots.py, holo, S=2, the
+# tree before this fix), rows below the stage of 17-standby: the clock
+# band peaks at luminance 159, its caption at 131, the row VALUES at 173
+# -- the clock was the third brightest text on its own slab, because the
+# holo head was CORE_BANDS[2] (#a8e9ff, L 221) under INK (#e9f2fb, L 241).
+# The 09-03 panel shot (ui-shots-int) reads 129 / 106 / 140, same order.
+def _lum(hex_color):
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def test_standby_clock_outranks_the_rows_and_its_caption_in_holo():
+    from jarvis.ui import ambient
+    from jarvis.ui.console_mode import DIM_FLOOR, dim
+    theme.select_look("holo")
+    head, body, faint = ambient.slab_ink("normal")
+    assert head == theme.FOCAL and faint == theme.MUTED
+    assert _lum(head) > _lum(body) > _lum(faint)
+    # the ladder survives the standby dim at every factor down to the floor
+    # (dim is a blend toward the ground, so the order is what matters)
+    for f in (1.0, 0.7, DIM_FLOOR):
+        assert _lum(dim(head, f)) > _lum(dim(body, f)) > _lum(dim(faint, f))
+    # and the top of the ladder really is the top: no token brighter
+    assert _lum(theme.FOCAL) >= max(_lum(theme.INK), _lum(theme.MUTED),
+                                    _lum(theme.CYAN))
+
+
+def test_holo_standby_caption_is_the_date_alone_and_classic_keeps_its_am():
+    from datetime import datetime
+    from jarvis.ui import ambient
+    at = datetime(2026, 9, 4, 16, 26)
+    assert ambient.standby_caption(at, look="holo") == \
+        ambient.tracked("FRIDAY 4 SEPTEMBER")
+    assert "PM" not in ambient.standby_caption(at, look="holo")
+    # classic is frozen to the 85d5066 oracle: meridiem, dots, untracked
+    assert ambient.standby_caption(at, look="classic") == \
+        "PM  ·  FRIDAY 4 SEPTEMBER"
+    theme.select_look("classic")
+    assert ambient.standby_caption(at) == "PM  ·  FRIDAY 4 SEPTEMBER"
+    theme.select_look("holo")
+    assert ambient.standby_caption(at) == ambient.tracked("FRIDAY 4 SEPTEMBER")
+
+
+def test_the_meridiem_sits_inline_after_the_digits_as_one_centred_group():
+    from jarvis.ui.ambient import clock_line, meridiem_bottom
+    # digits 240 px, gap 20, 'PM' 60: the 320 px group is centred on 460
+    dx, mx = clock_line(460, 240, 60, 20)
+    assert (dx, mx) == (460 - 160, 460 - 160 + 240 + 20)
+    assert dx + 240 + 20 == mx                 # inline, one gap after
+    assert (dx + (mx + 60)) // 2 == 460        # the GROUP is centred
+    # baselines meet: a 120 px linespace with a 96 px ascent centred on
+    # y=500 has its baseline at 500 - 60 + 96 = 536; a 9 px descent on
+    # the smaller face puts its south anchor at 545
+    assert meridiem_bottom(500, 120, 96, 9) == 545
 
 
 # --------------------------------------------------- U03 label > meta

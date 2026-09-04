@@ -247,12 +247,16 @@ def test_slab_ink_normal_is_the_focal_ladder_in_classic():
     assert ambient.slab_ink("normal", look="classic")[0] == theme.FOCAL
 
 
-def test_slab_ink_holo_clock_steps_toward_ice_not_white():
+def test_slab_ink_holo_clock_is_focal_the_top_of_the_ladder():
+    """09-01 stepped the holo clock to CORE_BANDS[2] (#a8e9ff) for a cool
+    cast; measured on 17-standby (U09, 09-03) that made the clock the
+    third brightest text on its own slab. FOCAL now, in both looks."""
     theme.select_look("holo")
     head, body, faint = ambient.slab_ink("normal")
-    assert head == theme.CORE_BANDS[ambient.HOLO_CLOCK_BAND]
-    assert head != theme.CORE_BANDS[0]          # not the white core
+    assert head == theme.FOCAL
+    assert head not in theme.CORE_BANDS
     assert (body, faint) == (theme.INK, theme.MUTED)
+    assert not hasattr(ambient, "HOLO_CLOCK_BAND")
 
 
 def test_slab_ink_reads_the_theme_when_called_not_when_imported():
@@ -260,12 +264,8 @@ def test_slab_ink_reads_the_theme_when_called_not_when_imported():
     classic = ambient.slab_ink("normal")
     theme.select_look("holo")
     holo = ambient.slab_ink("normal")
-    assert classic != holo
-    assert holo[0] == theme.CORE_BANDS[ambient.HOLO_CLOCK_BAND]
-
-
-def test_the_holo_clock_band_indexes_into_core_bands():
-    assert 0 <= ambient.HOLO_CLOCK_BAND < len(theme.CORE_BANDS)
+    assert classic != holo                  # INK / MUTED differ per look
+    assert holo == (theme.FOCAL, theme.INK, theme.MUTED)
 
 
 # ------------------------------------------------- board tone colours
