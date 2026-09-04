@@ -215,14 +215,29 @@ def _volume() -> int:
     return int(max(0.0, min(1.0, vol)) * 65536)
 
 
-def _allowed(key: str) -> bool:
+def _allowed(key: str, cooldown_s: Optional[float] = None) -> bool:
     """The shared rate limit. See the module docstring for why it is
-    per-name plus a small global gap rather than one cue for all causes."""
+    per-name plus a small global gap rather than one cue for all causes.
+
+    ``cooldown_s`` lets ONE caller shorten the same-tone cooldown for its
+    own play: the grab-and-throw gesture (jarvis/gesturecast.py) plays
+    heard-you / held-back at the pace of a hand, and under the 4 s config
+    default a grab-drop-grab inside four seconds would make the second grab
+    silent -- which reads as "the gesture is unreliable". The wake-word
+    path passes nothing and keeps the config value, so a false-wake
+    metronome is still suppressed.
+    """
     global _last_any
-    try:
-        cooldown = float(_get("sound.cooldown_s", DEFAULT_COOLDOWN_S))
-    except (TypeError, ValueError):
-        cooldown = DEFAULT_COOLDOWN_S
+    if cooldown_s is not None:
+        try:
+            cooldown = max(0.0, float(cooldown_s))
+        except (TypeError, ValueError):
+            cooldown = DEFAULT_COOLDOWN_S
+    else:
+        try:
+            cooldown = float(_get("sound.cooldown_s", DEFAULT_COOLDOWN_S))
+        except (TypeError, ValueError):
+            cooldown = DEFAULT_COOLDOWN_S
     now = _clock()
     with _lock:
         if now - _last_played.get(key, -1e9) < cooldown:
@@ -243,11 +258,14 @@ def _spawn(argv) -> bool:
         return False
 
 
-def play(name: str, run: Optional[Callable] = None) -> bool:
+def play(name: str, run: Optional[Callable] = None,
+         cooldown_s: Optional[float] = None) -> bool:
     """Play one earcon, asynchronously. True when a player was launched.
 
     Never raises: this is called from the hotword listener thread and from
     bus subscribers, where an exception would take the room down with it.
+    ``cooldown_s`` overrides the same-tone cooldown for THIS play only (see
+    ``_allowed``); leave it unset everywhere but the gesture path.
     """
     key = resolve(name)
     if not key or not enabled():
@@ -258,7 +276,7 @@ def play(name: str, run: Optional[Callable] = None) -> bool:
     # speakers -- twice, on 2026-08-31, while he was sitting at the desk.
     run = _spawn if run is None else run
     try:
-        if not _allowed(key):
+        if not _allowed(key, cooldown_s):
             return False
         path = render(key)
         if path is None:

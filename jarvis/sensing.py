@@ -125,6 +125,21 @@ MAX_STATE_BYTES = 4096         # the record is ~120 bytes; anything else is wron
 DEFAULT_ENFORCE_S = 15.0
 
 
+class Declined:
+    """The return value of a ``resume`` hook that a device's OWN policy gate
+    refused -- "back online" arriving inside the camera curfew.
+
+    TRUTHY like ``_PollingOnly`` (nothing went wrong), but ``_switch_devices``
+    files it under neither acted nor failed, so the spoken line does not
+    claim a lens came back that the house rule kept off. The alternative --
+    the hook returning True -- named "kitchen camera" among the resumed
+    while ``allowed(CAMERA)`` was False (F01, reproduced 2026-09-03).
+    """
+
+    def __bool__(self) -> bool:
+        return True
+
+
 class _PollingOnly:
     """The return value of a ``stop()`` that could only stop the POLLING.
 
@@ -503,6 +518,22 @@ class SensingPolicy:
                 here = True            # assume it is there and try anyway
             if not here:
                 absent.append(dev.name)
+                if on or dev.stop is None:
+                    continue
+                # A device THIS PROCESS may be holding open is stopped
+                # whatever present() says. present() answers "is there a
+                # node at this path" -- and camera.device "0" is an index,
+                # not a path, so it reads absent while the lens is lit;
+                # skipping the stopper there left a raw capture handle open
+                # through "offline mode" and the curfew (measured: disable()
+                # returned absent=('camera',) with the device still open).
+                # A stop is idempotent, so stopping what was never open
+                # costs nothing; "absent" stays the WORDING, never a veto.
+                try:
+                    dev.stop()
+                except Exception:  # noqa: BLE001 - one bad device must not skip the rest
+                    log.exception("sensing: %s could not be stopped", dev.name)
+                    failed.append(dev.name)
                 continue
             if on and state is not None and not self._may_run(state, dev.name):
                 # "Back online" does not mean "open the lens": the nightly
@@ -523,6 +554,8 @@ class SensingPolicy:
                 failed.append(dev.name)
             elif isinstance(ok, _PollingOnly):
                 partial.append(dev.name)
+            elif isinstance(ok, Declined):
+                continue           # the device's own gate said no: not acted, not failed
             else:
                 acted.append(dev.name)
         if failed and tuple(failed) != self._last_failed:

@@ -81,6 +81,66 @@ def _arm(a):
                                       done=True, ack=False, status="Chat"))
 
 
+YES_ANSWERS = [
+    "yes", "Yes.", "yes please", "Yes, please.", "yeah", "sure", "okay", "go ahead",
+    "yes go ahead", "Yes, go ahead.", "yeah sure", "Yeah, sure.", "yes please do",
+    "Yes, please do.", "sure go ahead", "Sure, go ahead.", "yes do it", "Yes, do it.",
+    "yes run it", "okay go ahead", "Okay, do it.", "yes let's hear it",
+    "Yes, let's hear it.", "yeah go for it", "go for it", "why not", "sure why not",
+    "yes that would be great", "please", "yes thank you", "yes sir", "ok sure",
+    "yeah okay", "yes yes", "yep go ahead", "let's do it", "do it please"]
+NO_ANSWERS = [
+    "no", "No.", "no thanks", "No, thank you.", "not now", "no not now", "later",
+    "No, maybe later.", "nah", "no I'm good", "skip it", "No, skip it.",
+    "not today thanks", "no leave it", "not right now", "no, not right now, thanks",
+    "I'm fine", "no need", "never mind", "no thank you jarvis"]
+
+
+@pytest.mark.parametrize("text", YES_ANSWERS)
+def test_a_composed_yes_is_still_a_yes(text):
+    """26 of these 37 were refused by a grammar that took ONE yes-word plus a
+    courtesy, and "yes go ahead" then went to the model as a fresh command
+    -- the day's only offer gone (F36, measured 09-03)."""
+    from jarvis.commander import _BRIEFING_NO_RX, _BRIEFING_YES_RX
+    assert _BRIEFING_YES_RX.match(text.strip()), text
+    assert not _BRIEFING_NO_RX.match(text.strip()), text
+
+
+@pytest.mark.parametrize("text", NO_ANSWERS)
+def test_a_decline_is_still_a_decline(text):
+    from jarvis.commander import _BRIEFING_NO_RX, _BRIEFING_YES_RX
+    assert _BRIEFING_NO_RX.match(text.strip()), text
+    assert not _BRIEFING_YES_RX.match(text.strip()), text
+
+
+@pytest.mark.parametrize("text", ["yes, turn the lights off", "yes and what is the weather",
+                                  "sure, set a timer for ten minutes"])
+def test_a_yes_that_carries_a_command_falls_through(text):
+    from jarvis.commander import _BRIEFING_YES_RX
+    assert not _BRIEFING_YES_RX.match(text)
+
+
+def test_a_held_offer_keeps_the_follow_up_mic_for_the_open_question(monkeypatch, tmp_path):
+    """First voice turn of the day ends in a read-back. The offer is armed
+    behind it and correctly HELD on the falling edge -- but the hold used to
+    return before the follow-up block, so the "yes" that read-back needed
+    was never heard without a wake word (F35, 09-03)."""
+    monkeypatch.setattr(CONFIG, "talkback", True)
+    a = _app(monkeypatch, tmp_path)
+    _clock(monkeypatch, 9, 0)
+    opened = []
+    a._start_followup = lambda: opened.append(1)
+    a.commander = SimpleNamespace(question_open=lambda: True)   # the read-back is live
+    a._after_dispatch("cancel all my alarms", "voice",
+                      SimpleNamespace(reply="Cancel all three alarms, sir?", speak=True,
+                                      done=True, ack=False, status="Read-back"))
+    assert a._briefing_pending and a._followup_after_speech
+    a._after_speech()                                            # the read-back's falling edge
+    assert a.said == [] and a._briefing_pending                  # offer held...
+    assert opened == [1], "...and the mic for the read-back opened"
+    assert a._followup_after_speech is False
+
+
 class TestTheOfferReplacesTheDelivery:
     def test_a_settled_burst_offers_instead_of_reading_the_briefing(self, monkeypatch, tmp_path):
         a = _app(monkeypatch, tmp_path)

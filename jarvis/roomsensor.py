@@ -15,11 +15,23 @@ there" survives him sitting still, which is what "is he home" actually
 needs.
 
 TRANSPORT: one HTTP GET of one entity, stdlib only, no broker to install
-and no new dependency in the shared venv. ESPHome's ``web_server`` serves
-each entity as JSON at ``/<domain>/<object_id>``::
+and no new dependency in the shared venv. ESPHome's ``web_server`` (version
+2, which is what both templates ask for) serves each entity as JSON at its
+NAME, percent-encoded -- NOT at the snake_case object_id, and NOT at the
+``id:`` the YAML gives it. MEASURED against the live office radar,
+2026-09-03::
 
-    $ curl http://192.168.50.60/binary_sensor/presence
-    {"id":"binary_sensor-presence","value":true,"state":"ON"}
+    $ curl http://192.168.50.51/binary_sensor/Presence
+    {"id":"binary_sensor/Presence","value":true,"state":"ON"}
+    $ curl -o /dev/null -w '%{http_code}\n' http://192.168.50.51/binary_sensor/presence
+    404
+    $ curl 'http://192.168.50.51/sensor/Moving%20distance'
+    {"id":"sensor/Moving distance","value":42,"state":"42 cm"}
+
+This module and ``scripts/room_sensor.py`` both built the object_id form,
+so every poll and every tune write was a 404: presence never once fired,
+and it degraded to "no opinion" silently, exactly as a missing sensor
+would. Build a path with ``entity_path()`` and nothing else.
 
 THREE RULES the rest of the app depends on.
 
@@ -68,26 +80,60 @@ decision about what to do when the two legs disagree) lives in
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.parse
 import urllib.request
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from jarvis.logs import get_logger
 from jarvis.sensing import POLLING_ONLY, RADAR
 
 log = get_logger("roomsensor")
 
-# ESPHome names the endpoint after the entity: a binary_sensor called
-# "Presence" is /binary_sensor/presence. The YAML in
-# scripts/esphome/jarvis-room-sensor.yaml uses exactly this name.
-DEFAULT_ENTITY_PATH = "/binary_sensor/presence"
-DEFAULT_TIMEOUT_S = 1.5     # LAN round trip is ~5 ms; this is pure paranoia
+# The entity whose name IS the URL. Renaming it in the YAML moves the
+# endpoint, so the name lives here as a constant and the path is derived
+# from it -- never spelled out a second time.
+PRESENCE_ENTITY = "Presence"
+
+
+def entity_path(domain: str, name: str) -> str:
+    """The web_server path for an entity, from its NAME.
+
+    ``entity_path("binary_sensor", "Presence") == "/binary_sensor/Presence"``
+    and ``entity_path("sensor", "Moving distance")`` percent-encodes the
+    space. This is the only place that rule is written down; see the
+    measurement in the module docstring for why it is the name and not the
+    object_id.
+    """
+    return "/%s/%s" % (domain, urllib.parse.quote(str(name), safe=""))
+
+
+DEFAULT_ENTITY_PATH = entity_path("binary_sensor", PRESENCE_ENTITY)
+
+# The three DISTANCE entities, for jarvis/zones.py. Names, not object_ids,
+# for the reason spelled out above; ESPHome's ld2410 publishes them in
+# CENTIMETRES ({"id":"sensor/Moving distance","value":42,"state":"42 cm"},
+# measured 2026-09-03) and read_distance() returns metres.
+DETECTION_ENTITY = "Detection distance"
+MOVING_ENTITY = "Moving distance"
+STILL_ENTITY = "Still distance"
+# MEASURED against the live office radar, 25 polls at 4 Hz, 2026-09-03:
+# min 46 ms, median 62 ms, p90 154 ms, MAX 1186 ms. The old value here was
+# 1.5 s with the comment "LAN round trip is ~5 ms; this is pure paranoia" --
+# it was neither. An ESP32 in Wi-Fi modem-sleep parks a round trip for the
+# best part of a second, so 1.5 s was 1.3x the worst sample, not 300x it.
+# 3.0 s is ~2.5x the worst seen. A slow poll is not costly: read() returns
+# None, the phone leg answers, and only DEFAULT_FAIL_AFTER in a row is a fault.
+DEFAULT_TIMEOUT_S = 3.0
 DEFAULT_FAIL_AFTER = 3      # transients are free; three in a row is a fault
 DEFAULT_COOLDOWN_S = 30.0
 MAX_COOLDOWN_S = 300.0
 MAX_BYTES = 4096            # an entity is ~60 bytes; anything else is wrong
 USER_AGENT = "jarvis-roomsensor/1"
+
+# "242 cm", "242", "2.42 cm" -- the leading number of a state string.
+_CM_RX = re.compile(r"^([+-]?\d+(?:\.\d+)?)\s*(?:cm)?$", re.I)
 
 _TRUE_WORDS = frozenset({"on", "true", "yes", "1", "occupied", "present",
                          "detected", "home", "active"})
@@ -150,6 +196,53 @@ def parse_state(body: Any) -> Optional[bool]:
     if isinstance(data, (bool, int, float, dict)):
         return parse_state(data)
     return None
+
+
+def parse_cm(body: Any) -> Optional[float]:
+    """An ESPHome distance entity -> centimetres, or None.
+
+    ``{"value": 242}`` is the typed field and wins; ``{"state": "242 cm"}``
+    is the display string and is the fallback for a firmware that omits
+    value. A null value (the radar has no target) is None, and so is a
+    negative number, HTML from a wrong URL, or anything else -- None here
+    means "no distance", never zero, because zero is a real reading that
+    means "no target of this kind" and the two must not merge.
+    """
+    if isinstance(body, (bytes, bytearray)):
+        body = body.decode("utf-8", "replace")
+    if isinstance(body, bool):
+        return None                       # a flag is not a distance
+    if isinstance(body, (int, float)):
+        return float(body) if body >= 0 else None
+    if isinstance(body, dict):
+        for key in ("value", "state"):
+            if key in body:
+                got = parse_cm(body[key])
+                if got is not None:
+                    return got
+        return None
+    text = str(body or "").strip()
+    if not text:
+        return None
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        pass
+    else:
+        if isinstance(data, (bool, int, float, dict)):
+            return parse_cm(data)
+        if isinstance(data, str):
+            text = data
+        else:
+            return None
+    m = _CM_RX.match(text.strip())
+    if not m:
+        return None
+    try:
+        value = float(m.group(1))
+    except ValueError:
+        return None
+    return value if value >= 0 else None
 
 
 def _from_mapping(data: dict) -> Optional[bool]:
@@ -223,6 +316,23 @@ class RoomSensor:
         self.power_url = str(power_url or "").strip().rstrip("/")
         self._post = post or _post_default
         self._power_warned = False      # one loud line per outage, not per retry
+        # The DISTANCE leg (jarvis/zones.py) gets its OWN failure counter,
+        # deliberately separate from the presence breaker above. A distance
+        # entity that 404s -- a renamed entity, a firmware without
+        # detection_distance -- would otherwise open the SHARED breaker and
+        # take PRESENCE down with it, and presence is the one thing this
+        # module exists to provide. So a bad distance costs the distance
+        # and nothing else: three failures in a row and it stops asking for
+        # a cooldown, with one warning line.
+        #
+        # Counted PER ENTITY, not once for all three. One shared counter was
+        # reset by any successful read, so a permanently 404ing entity -- a
+        # renamed one, a firmware without still_distance -- was re-asked on
+        # every single poll for ever, its neighbours zeroing the count each
+        # time, and the backoff this comment promises never happened.
+        self._dist_fails: Dict[str, int] = {}
+        self._dist_skip_until: Dict[str, float] = {}
+        self._dist_down: Dict[str, bool] = {}
         attach = getattr(policy, "attach", None)
         if callable(attach):
             attach(RADAR, self.stop, present=lambda: self.configured,
@@ -316,6 +426,121 @@ class RoomSensor:
         self.last_value = value
         return value
 
+    def read_distance(self, entity: str = DETECTION_ENTITY) -> Optional[float]:
+        """The named distance entity in METRES, or None.
+
+        ESPHome publishes these in centimetres; the conversion happens here
+        so no caller has to remember it. None is "no distance" -- offline
+        mode, an open breaker, a timeout, a 404, a null value -- and is
+        NEVER 0.0, which is a real reading meaning "no target of this kind"
+        and is what the moving/still bits are derived from.
+
+        It asks the same ``blocked``/``paused`` gate as ``read()`` BEFORE
+        the socket, so offline mode covers it for free: while sensing is
+        denied no request is sent and ``reads`` does not move. A distance
+        read of anyone's own over urllib would have been a hole straight
+        through that promise, which is why this lives here and not in
+        jarvis/zones.py.
+        """
+        if not self.configured or self.paused:
+            return None
+        if self._dist_skip_until.get(entity, 0.0) > self._now():
+            return None
+        url = urllib.parse.urlunsplit(
+            urllib.parse.urlsplit(self.url)._replace(
+                path=entity_path("sensor", entity), query="", fragment=""))
+        try:
+            body = self._get(url, self.timeout_s)
+        except Exception as exc:  # noqa: BLE001 - every transport failure is "unknown"
+            self.reads += 1
+            self._dist_failed(entity, exc)
+            return None
+        self.reads += 1
+        cm = parse_cm(body)
+        if cm is None:
+            self._dist_failed(entity, repr(body)[:120])
+            return None
+        self._dist_fails.pop(entity, None)
+        self._dist_skip_until.pop(entity, None)
+        if self._dist_down.pop(entity, False):
+            log.info("room sensor %s: %s is back", self.url, entity)
+        return cm / 100.0
+
+    def read_number(self, entity: str) -> Optional[float]:
+        """One ESPHome ``number`` entity's value, or None -- READ ONLY.
+
+        ESPHome serves the tunable numbers ("Max move gate", "Absence
+        delay") at ``/number/<name>``, the same name-is-the-path rule as
+        everything else here. This is a GET and nothing else: setting one
+        is ``POST /number/<name>/set?value=``, which lives in
+        ``scripts/room_sensor.py`` and is deliberately not reachable from
+        the package -- the device's tuning is his, and the check that reads
+        these (``jarvis/sensorcheck.py``) reports rather than rewrites.
+
+        It asks the same ``blocked``/``paused`` gate as ``read()`` BEFORE
+        the socket, so offline mode covers it for free, and it counts its
+        failures on the DISTANCE leg's per-entity counters rather than the
+        presence breaker: a firmware without one of these numbers must not
+        take presence down with it.
+        """
+        return self._read_entity("number", entity, "the tuning cannot be "
+                                 "checked, presence is unaffected")
+
+    def _read_entity(self, domain: str, entity: str,
+                     consequence: str) -> Optional[float]:
+        """One numeric entity of one domain, or None. The body of
+        ``read_distance`` and ``read_number``, which differ only in the
+        domain, the unit and what a failure costs."""
+        key = "%s/%s" % (domain, entity)
+        if not self.configured or self.paused:
+            return None
+        if self._dist_skip_until.get(key, 0.0) > self._now():
+            return None
+        url = urllib.parse.urlunsplit(
+            urllib.parse.urlsplit(self.url)._replace(
+                path=entity_path(domain, entity), query="", fragment=""))
+        try:
+            body = self._get(url, self.timeout_s)
+        except Exception as exc:  # noqa: BLE001 - every transport failure is "unknown"
+            self.reads += 1
+            self._entity_failed(key, entity, exc, consequence)
+            return None
+        self.reads += 1
+        value = parse_cm(body)
+        if value is None:
+            self._entity_failed(key, entity, repr(body)[:120], consequence)
+            return None
+        self._dist_fails.pop(key, None)
+        self._dist_skip_until.pop(key, None)
+        if self._dist_down.pop(key, False):
+            log.info("room sensor %s: %s is back", self.url, entity)
+        return value
+
+    def _dist_failed(self, entity: str, detail: Any) -> None:
+        """Counts against the DISTANCE leg only -- never the presence
+        breaker. See the note in __init__."""
+        self._entity_failed(entity, entity, detail,
+                            "zones will be unplaced, presence is unaffected")
+
+    def _entity_failed(self, key: str, entity: str, detail: Any,
+                       consequence: str) -> None:
+        """One non-presence entity failed. Counted PER KEY so a
+        permanently 404ing entity backs off instead of being re-asked every
+        poll while its neighbours zero the count."""
+        fails = self._dist_fails.get(key, 0) + 1
+        self._dist_fails[key] = fails
+        if fails < self.fail_after:
+            log.debug("room sensor entity %s: %s (%s)", entity, self.url, detail)
+            return
+        self._dist_skip_until[key] = self._now() + self._base_cooldown
+        if not self._dist_down.get(key):
+            log.warning("room sensor %s: %r is unreadable (%s); %s",
+                        self.url, entity, detail, consequence)
+            self._dist_down[key] = True
+        else:
+            log.debug("room sensor entity %s: %s; retrying in %.0fs",
+                      entity, self.url, self._base_cooldown)
+
     # ------------------------------------------------------------ breaker
     def _failed(self, kind: str, detail: Any) -> None:
         self._fails += 1
@@ -342,9 +567,19 @@ class RoomSensor:
         self.last_ok = self._now()
 
     def status(self) -> dict:
-        """For the console / a diagnostic script; never parsed by the app."""
+        """For the console / a diagnostic script; never parsed by the app.
+
+        ``cooldown_s`` is the NEXT wait, because _failed() arms the breaker
+        from the current one and THEN doubles it -- so a surface that
+        printed it was exactly 2x the truth and static for the whole wait.
+        ``retry_in_s`` is the seconds LEFT on this breaker's own deadline,
+        which is the number the one warning line in the log quotes and the
+        only one that counts down. (2026-09-03: the SENSORS page rendered
+        "trying again in 60 s" while the log said 30 s for the same event.)
+        """
         return {"url": self.url, "value": self.last_value, "fails": self._fails,
                 "paused": self.paused, "cooldown_s": self._cooldown,
+                "retry_in_s": max(0.0, self._skip_until - self._now()),
                 "reads": self.reads, "last_ok": self.last_ok,
                 "blocked": self.blocked,
                 "power_url": self.power_url}

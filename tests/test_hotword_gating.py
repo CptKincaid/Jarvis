@@ -255,6 +255,20 @@ def test_too_little_speech_abstains_instead_of_refusing_him(caplog):
     assert ok is True and "-> abstain (too little speech)" in line
 
 
+def test_a_short_buffer_that_is_all_speech_abstains_too(caplog):
+    """The ring buffer was cleared while he was already saying "Jarvis":
+    0.80 s of voice, no quiet either side, buffer length a multiple of the
+    20 ms frame (12800 samples, as every 44.1 kHz chunk resamples to).
+    speech_bounds spans the whole buffer, so the old slice-length test read
+    "trimmed=none" and a -0.057 on his own voice was SUPPRESSED (F48)."""
+    audio = _speech(0.80)
+    assert len(audio) % 320 == 0
+    ok, line = verdict_of(caplog, FakeSpeaker(-0.057), audio,
+                          music=False, oww=0.9)
+    assert ok is True and "-> abstain (too little speech)" in line
+    assert "trimmed=0.80s" in line
+
+
 def test_enough_speech_is_still_judged_on_the_score(caplog):
     """hey_jarvis_09: 2.0 s of trimmed speech at -0.122.  That much audio is
     evidence, so the refusal stands."""

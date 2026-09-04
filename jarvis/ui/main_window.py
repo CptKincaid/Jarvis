@@ -75,7 +75,7 @@ from jarvis import campreview, perf
 from jarvis.config import CONFIG, MACHINE
 from jarvis.events import (ActiveProject, AlarmFired, AlarmStopped, AppQuit,
                            ApprovalRequested, ApprovalResolved, AudioLevel,
-                           BoardCommand, PowerUp,
+                           BoardCommand, ClearTranscript, PowerUp,
                            UncertainResolved, UncertainUtterance,
                            BrainState, BriefingReady, ClaudeProgress,
                            ClaudeTaskState, DeskState, FaultRaised, HotwordDetected,
@@ -92,26 +92,45 @@ from jarvis.ui.board import BoardWindow, board_enabled
 from jarvis.ui.console_mode import (ACTIVE, STANDBY, ConsoleModes, DeskWatch,
                                     resolve_idle_fn)
 from jarvis.ui.reactor import Reactor
+from jarvis.ui.carry_chip import CarryChip
 from jarvis.ui.sensing_badge import SensingBadge, sensing_failsafe_state
 from jarvis.ui.views import (CommandBar, SettingsDrawer, StatusStrip,
                              TranscriptView, standby_alpha)
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, StatePill,
-                               Toast, Tooltip, px, set_scale, ui_display,
-                               ui_mono)
+                               Toast, Tooltip, px, set_scale,
+                               ui_display, ui_mono)
 
 log = get_logger("ui.main_window")
 
 # Design units at the 96-dpi baseline; scaled by S at runtime.
 DEFAULT_W, DEFAULT_H = 520, 880
 DEFAULT_GEOMETRY = f"{DEFAULT_W}x{DEFAULT_H}"
+# Header wordmark. ONE form, drawn whole in every state at every width
+# the window allows. The 2026-09-02 remedy for an over-subscribed header
+# stepped it down — tracked, untracked, monogram, gone — and he rejected
+# that on sight: "dont make jarvis smaller, just make ready and sensing
+# smaller to fit". So its 322 px (PAD + canvas) are now a FIXED claim on
+# the bar and the two chips were compressed to live inside what is left;
+# tests/test_header_fit.py does the arithmetic, MainWindow._check_header_fit
+# says so in the log if a future header child ever breaks it again.
+WORDMARK = "J A R V I S"
 MIN_W, MIN_H = 460, 720
 
-# StatePill words (uppercase, <= 10 chars, never ellipsized). OFFLINE is
-# reserved — no event drives it today, so it is never shown. WORKING /
-# WAITING come from ClaudeTaskState (a Claude task running / blocked on a
-# permission question).
-STATE_WORDS = {"idle": "READY", "listening": "LISTENING…",
-               "thinking": "THINKING…", "speaking": "SPEAKING",
+# StatePill words (uppercase, <= 9 chars, never ellipsized). The header
+# keeps 312 px for the pill and the sensing badge together at his 920-px
+# window, and 'LISTENING…' alone was 271 of them on 2026-09-02 — Tk paid
+# for that by shearing the badge, the one readout whose absence must not
+# look like its resting state. The first 09-03 cut answered with bare
+# imperatives (LISTEN / THINK / SPEAK), which on a voice console read as
+# orders to the user; his words were "smaller, not reworded", and
+# MEASURED on Xvfb the full participles fit once both chips drop to
+# PAD_X 4 / GAP 4 (LISTENING 158 + CAM OFF 141 = 299 of 312 at S=2, and
+# >= 6 px to spare at every scale 1.0-3.0; tests/test_header_fit.py).
+# Only the ellipsis went: the reactor carries the motion. WORKING /
+# WAITING come from ClaudeTaskState (a Claude task running / blocked on
+# a permission question).
+STATE_WORDS = {"idle": "READY", "listening": "LISTENING",
+               "thinking": "THINKING", "speaking": "SPEAKING",
                "waiting": "WAITING", "working": "WORKING",
                "error": "ERROR"}
 WARN_HOLD_S = 4.0            # warn Status: pill dot amber for this long
@@ -281,15 +300,25 @@ def terminal_attached(run=None) -> bool:
 
 
 def fmt_mem_gb(total_kb: int, avail_kb: int) -> str:
-    """Used system RAM for the status bar: '26.8 GB' ('--' when total is
-    unknown)."""
+    """Used/total system RAM for the status bar: '26.8/128 GB' ('--' when
+    total is unknown).
+
+    2026-09-02, verbatim: "is that free or used?". It was used (MemTotal -
+    MemAvailable) and nothing on screen said so — at the compact and
+    minimal elision levels the segment carries no label at all, so it read
+    as a bare '59.9 GB' beside a 122 GB box. The value now answers the
+    question by itself at every level, and on a machine whose whole
+    failure mode is the unified pool running out (2026-08-28) the ceiling
+    is the half worth showing.
+    """
     try:
         total, avail = int(total_kb), int(avail_kb)
     except (TypeError, ValueError):
         return "--"
     if total <= 0:
         return "--"
-    return f"{max(0, total - avail) / 1048576.0:.1f} GB"
+    gb = total / 1048576.0
+    return f"{max(0, total - avail) / 1048576.0:.1f}/{gb:.0f} GB"
 
 
 def fmt_asr(model_text: str) -> str:
@@ -391,6 +420,11 @@ class Services:
     # this to JarvisApp._board_hide; build_ui_services drops it harmlessly
     # while that side is unwired.
     board_closed: Optional[Callable] = None
+    # Grab and throw (jarvis/gesturecast.GestureCast): the courier the
+    # console hands its carry chip and Tk marshaller to, and whose hand
+    # stage rides the camera preview's own capture (jarvis/handstage.py).
+    # Optional: a stand-in Services simply has no gesture.
+    gesture: Optional[Any] = None
 
 
 # ------------------------------------------------------------------ tray
@@ -589,7 +623,7 @@ class MainWindow:
         self._mic_available = MACHINE.has_mic
         self._last_confidence: Optional[float] = None
         self._temps_text = ""     # written by worker thread, read by Tk loop
-        self._mem_text = ""       # used RAM ('26.8 GB'), same worker
+        self._mem_text = ""       # RAM used/total ('26.8/128 GB')
         self._closing = False
         # Desk standby (jarvis/deskpresence.py): the board's current opacity.
         # 1.0 is the only state the app ever boots in.
@@ -627,6 +661,7 @@ class MainWindow:
         # really baked into the geometry, and only the mover knows that.
         self._standby_drift = (0, 0)
         self._footer_hidden = False
+        self._tabs_hidden = False        # the tab row goes with the footer
         self._term_available = terminal_available()
         self._session_seen = False       # a jarvis-* tmux session is alive
         self._term_attached = False      # …and a terminal is watching it
@@ -906,20 +941,13 @@ class MainWindow:
         # spacing is baked into the string. The most focal text in the app
         # is WHITE per the film budget (cyan is structure, never the
         # star), with a 1px dim-cyan hologram-fringe ghost offset behind.
-        wm_font = ui_display(theme.SIZE_WORDMARK, "semibold")
-        wm_text = "J A R V I S"
-        wordmark = tk.Canvas(header, width=px(160), height=px(40),
-                             bg=theme.BG, highlightthickness=0, bd=0)
-        gh = max(1, px(1))
-        wordmark.create_text(px(2) + gh, px(20) + gh, text=wm_text,
-                             font=wm_font, fill=theme.RAMP40, anchor="w")
-        wm_main = wordmark.create_text(px(2), px(20), text=wm_text,
-                                       font=wm_font, fill=theme.FOCAL,
-                                       anchor="w")
-        bb = wordmark.bbox(wm_main)
-        if bb:                        # fit exactly — don't starve the status
-            wordmark.configure(width=bb[2] + gh + 1)
-        wordmark.pack(side="left", padx=(theme.PAD, 0))
+        # Drawn ONCE, whole, and never refitted: it does not yield to the
+        # bar, the chips do (2026-09-03, his call).
+        self._wordmark = tk.Canvas(header, width=px(160), height=px(40),
+                                   bg=theme.BG, highlightthickness=0, bd=0)
+        self._wm_text = None
+        self._draw_wordmark(WORDMARK)
+        self._wordmark.pack(side="left", padx=(theme.PAD, 0))
 
         self._close_btn = RoundButton(header, text="✕", kind="ghost",
                                       size=theme.SIZE_LABEL, pad_x=9, pad_y=5,
@@ -950,6 +978,39 @@ class MainWindow:
         self.sensing_badge.pack(side="right", padx=(0, theme.PAD_S))
         self._sensing_tip = Tooltip(self.sensing_badge, "Sensing state")
         self._refresh_sensing()
+
+        # The header is packed right-to-left out of a cavity Tk clamps
+        # at zero: once the cavity is spent it CLIPS the next child to
+        # what is left, and when nothing is left it stops drawing it at
+        # all (views.header_spans transcribes tkPack.c — the children
+        # never overlap). The badge is packed last, so the badge is what
+        # gets cut — 2026-09-02, "the word sensing is underneath the
+        # ready symbol": at 918 px it was 124 px of its 168, capsule and
+        # the tail of the word sheared off, flush against the wordmark;
+        # 41 px of 214 in his worst state. Nothing is misaligned (both
+        # chips declare the same 26-unit height and pack centres them);
+        # the bar was simply over-subscribed. It no longer is: the two
+        # chips were compressed to 299 px of the 312 the wordmark and the
+        # window chrome leave (tests/test_header_fit.py). Nothing here
+        # resizes anything any more — the binding only NOTICES, in the
+        # log, once per width, when the bar is narrower than the wordmark
+        # plus the cluster at its widest, i.e. exactly when Tk would
+        # start cutting the badge (the cliff is 905 px at S=2, measured;
+        # his window is 918).
+        self._header_short = None
+        header.bind("<Configure>", self._on_header_resize, add=True)
+        self._check_header_fit()
+
+        # The carry chip (jarvis/ui/carry_chip.py): what his closed hand is
+        # holding, left of the sensing badge, NOT packed until a grab. A
+        # header indicator rather than a transcript card because a carry
+        # is a transient, not conversation. Click = put it down.
+        self.carry_chip = None
+        try:
+            self.carry_chip = CarryChip(header, bg=theme.BG,
+                                        on_dismiss=self._carry_dismissed)
+        except Exception:                     # noqa: BLE001 - optional chrome
+            log.exception("carry chip could not be built")
 
         # atmosphere: the header ground is a soft gradient (sheen behind
         # the wordmark, settling flat to the right) — flat-bg children are
@@ -982,7 +1043,7 @@ class MainWindow:
         # space landed on an unbound widget and the window could not be
         # dragged at all. A structural walk cannot rot that way.
         self._bind_drag_tree(header, skip=(self._close_btn, self._min_btn,
-                                           self._gear))
+                                           self._gear, self.carry_chip))
         self._bind_drag_tree(rule)
 
     def _bind_drag_tree(self, widget, skip=()):
@@ -1006,6 +1067,121 @@ class MainWindow:
             return
         for child in children:
             self._bind_drag_tree(child, skip)
+
+    # ------------------------------------------------------ header wordmark
+    def _draw_wordmark(self, text: str):
+        """Paint the wordmark canvas with `text` and shrink it to fit."""
+        if text == self._wm_text:
+            return
+        self._wm_text = text
+        canvas = self._wordmark
+        canvas.delete("wm")       # keeps the bar-gradient ground slice
+        gh = max(1, px(1))
+        if not text:
+            canvas.configure(width=1)
+            return
+        font = ui_display(theme.SIZE_WORDMARK, "semibold")
+        canvas.create_text(px(2) + gh, px(20) + gh, text=text, font=font,
+                           fill=theme.RAMP40, anchor="w", tags=("wm",))
+        main = canvas.create_text(px(2), px(20), text=text, font=font,
+                                  fill=theme.FOCAL, anchor="w", tags=("wm",))
+        bb = canvas.bbox(main)
+        if bb:                    # fit exactly — don't starve the status
+            canvas.configure(width=bb[2] + gh + 1)
+
+    @staticmethod
+    def _padx_total(child) -> int:
+        """Total horizontal pack padding one header child claims.
+
+        Tk reads `-padx 16` as 16 px on BOTH sides and `-padx {0 16}` as
+        16 on the right only, and a reserve that guessed would be wrong in
+        one direction or the other; pack_info() is the only thing that
+        knows. Anything unreadable counts as zero — an under-count costs a
+        quieter log line, never a clipped chip, because the chips are
+        measured at their widest here.
+        """
+        try:
+            padx = child.pack_info().get("padx", 0)
+        except (AttributeError, TypeError, tk.TclError):
+            return 0
+        parts = padx if isinstance(padx, (list, tuple)) else str(padx).split()
+        try:
+            vals = [int(float(part)) for part in parts]
+        except (TypeError, ValueError):
+            return 0
+        if not vals:
+            return 0
+        return sum(vals) if len(vals) > 1 else vals[0] * 2
+
+    def _cluster_w(self) -> int:
+        """Header pixels every child except the wordmark claims, at its
+        WIDEST, plus the gap the wordmark keeps clear of them.
+
+        Walked off the header's own pack list rather than a hand-written
+        one. A child this misses is a chip Tk truncates and, one child
+        further along, a chip Tk stops drawing (views.header_spans) — and
+        the child most likely to be added here next is a camera preview
+        on a sibling branch. Walking cannot rot that way.
+
+        The two chips are measured at their widest WORD, never the
+        current one: a bar that fitted around READY/SENSING and cut the
+        badge in half the moment the curfew said CAM OFF is exactly the
+        2026-09-02 defect.
+        """
+        widest = {}
+        if getattr(self, "pill", None) is not None:
+            widest[str(self.pill)] = StatePill.widest_w(STATE_WORDS.values())
+        if getattr(self, "sensing_badge", None) is not None:
+            widest[str(self.sensing_badge)] = SensingBadge.widest_w()
+        # No reserve seeded in: this is the pixel at which Tk starts to
+        # clip, nothing softer. The first cut seeded PAD_S "so the badge
+        # is never flush against the wordmark", which made the warning
+        # fire 16 px BEFORE anything was cut -- and once the chips left
+        # only 13 px of slack at his window (tests/test_header_fit.py)
+        # that would have been a warning at his own window, about a bar
+        # that fits. (The pack pads below are ALREADY device pixels:
+        # theme.apply_scale() mutates the spacing tokens once at startup,
+        # so px() over them would scale S twice.)
+        total = 0
+        for child in self._header.pack_slaves():
+            if child is self._wordmark:
+                continue
+            total += (widest.get(str(child), child.winfo_reqwidth())
+                      + self._padx_total(child))
+        return total
+
+    def _on_header_resize(self, event):
+        self._check_header_fit(event.width)
+
+    def _check_header_fit(self, header_w=None):
+        """Say so in the log if the bar can no longer hold the whole
+        wordmark beside the cluster at its widest.
+
+        This is all that is left of the 2026-09-02 remedy, and
+        deliberately so: the wordmark used to SHRINK here, and he
+        rejected that ("dont make jarvis smaller"). The chips were made
+        to fit instead, with 13 px to spare at his window (measured, S=2),
+        so there is nothing to negotiate at runtime — only something to
+        notice, once per width, if a header child added later spends
+        that margin and puts the privacy badge back under Tk's knife.
+        `spare` < 0 IS the knife: _cluster_w seeds no reserve, so the
+        line fires at the clipping cliff itself, not 16 px early.
+        """
+        try:
+            width = int(header_w if header_w else self._header.winfo_width())
+            if width < 4:
+                return
+            spare = (width - self._cluster_w() - theme.PAD
+                     - self._wordmark.winfo_reqwidth())
+        except (AttributeError, tk.TclError, TypeError, ValueError):
+            log.debug("header fit check skipped", exc_info=True)
+            return
+        if spare >= 0 or self._header_short == width:
+            return
+        self._header_short = width
+        log.warning("header %d px is %d px short of the wordmark + chips; "
+                    "the sensing badge is packed last and will be clipped",
+                    width, -spare)
 
     def _draw_header_rule(self, event):
         if self._rule_w == event.width:
@@ -1057,6 +1233,13 @@ class MainWindow:
             i += 1
 
     def _build_stage(self):
+        # The tab row (jarvis/ui/tab_strip.py), packed FIRST of the stage's
+        # side="top" children so it lands directly under the header rule --
+        # "a little tab to click thats underneath jarvis", his words. It
+        # costs the stage 80 device px at his scale (measured; the number
+        # is pinned in tests/test_tab_strip.py), which the SENSORS page
+        # pays for by giving up the tab row it used to draw itself.
+        self.tabs = self._build_tabs()
         self.reactor = Reactor(self.shell, height=px(300))
         self.reactor.pack(fill="x", side="top")
         self.reactor.attach_toplevel()
@@ -1073,6 +1256,110 @@ class MainWindow:
         # relwidth/relheight cover exactly that panel — no fractions of the
         # shell to drift out of step with the layout.
         self.room = RoomSlab(self.transcript)
+        # The SENSORS page (jarvis/ui/sensors_page.py) covers the whole
+        # stage — the reactor AND the transcript. It asks for ~940 device
+        # px at his window and scale and the transcript alone is ~420, so
+        # over the transcript its bands and SAVE button fell off the bottom
+        # (measured on scripts/ui_shots.py). It measures that span itself
+        # from the two widgets handed to it, so a hidden footer or a packed
+        # camera pane cannot put it out of step.
+        self.sensors = self._build_sensors()
+        self._fill_tabs()
+
+    def _build_tabs(self):
+        """The tab row, or None. Imported here rather than at module scope
+        for the same reason _build_sensors is: a strip that failed to build
+        must not be why the console does not start (sensors_toggle falls
+        back to the page's own toggle, and F9 keeps working)."""
+        try:
+            from jarvis.ui.tab_strip import TabStrip
+            strip = TabStrip(self.shell, bg=theme.BG)
+            strip.pack(fill="x", side="top")
+            return strip
+        except Exception:                     # noqa: BLE001 - optional chrome
+            log.exception("tab strip could not be built")
+            return None
+
+    def _fill_tabs(self):
+        """One line per surface. A third tab is one more line here and
+        nothing else -- no width to re-budget, no test to update."""
+        strip = getattr(self, "tabs", None)
+        if strip is None:
+            return
+        strip.add("chat", "CHAT")
+        if self.sensors is not None:
+            strip.add("sensors", "SENSORS", select=self.sensors.show,
+                      leave=self.sensors.hide)
+        # CHAT is added first and is therefore already selected; nothing is
+        # shown or hidden for it, because the stage under it is what is on
+        # screen at build time.
+        # The row's own fit check, measured off the live widgets the way
+        # _check_header_fit does for the header. max(): an unrealized root
+        # reports 1 px, and warning about that would be noise.
+        try:
+            fit = strip.clipped(max(self.root.winfo_width(), px(MIN_W)))
+        except Exception:                     # noqa: BLE001 - unmapped
+            fit = []
+        if fit:
+            log.warning("tab strip: %s clipped at this width", fit)
+
+    def _build_sensors(self):
+        """The SENSORS page, or None.
+
+        Imported HERE rather than at module scope so a diagnostics surface
+        can never be the reason the console fails to start -- the same rule
+        _build_preview follows. The camera reaches the page as NUMBERS:
+        PreviewWorker.status() is built from PreviewShot.numbers_only(),
+        which excludes the image by name, so no code path exists by which a
+        frame could arrive on that surface.
+        """
+        try:
+            from jarvis.ui.sensors_page import SensorsPage
+            return SensorsPage(self.shell, services=self.services,
+                               camera_status=self._camera_numbers,
+                               cover=(self.reactor, self.transcript),
+                               on_close=self._sensors_closed)
+        except Exception:                     # noqa: BLE001 - optional lane
+            log.exception("sensors page could not be built")
+            return None
+
+    def _sensors_closed(self):
+        """The page hid itself (quit, or anything else that calls hide()).
+        Put the strip back on CHAT so the lit tab matches the screen.
+        select() is idempotent, so the strip's own CHAT press -- which is
+        what called hide() in the first place -- does not come back round."""
+        strip = getattr(self, "tabs", None)
+        if strip is not None:
+            strip.select("chat")
+
+    def _camera_numbers(self) -> dict:
+        """The preview worker's numbers-only status, or {} when there is no
+        worker (no vision lane, camera.preview off, the pane failed to
+        build). {} renders as "camera not running", never as an empty room."""
+        worker = getattr(self, "preview_worker", None)
+        if worker is None or not hasattr(worker, "status"):
+            return {}
+        try:
+            return dict(worker.status())
+        except Exception:                     # noqa: BLE001 - provider edge
+            log.debug("camera status unavailable", exc_info=True)
+            return {}
+
+    def sensors_toggle(self):
+        """Show/hide the SENSORS page.
+
+        The TAB is the primary way in now; F9 stays as the shortcut and is
+        the one seam a voice command would call. It goes THROUGH the strip
+        so the selected tab and the surface on screen can never disagree --
+        and the strip is what starts and stops the page's poll thread.
+        """
+        strip = getattr(self, "tabs", None)
+        if strip is not None and "sensors" in strip.keys:
+            strip.select("chat" if strip.selected == "sensors" else "sensors")
+            return
+        page = getattr(self, "sensors", None)  # no strip: F9 still works
+        if page is not None:
+            page.toggle()
 
     def _build_footer(self):
         self.status_strip = StatusStrip(
@@ -1133,7 +1420,8 @@ class MainWindow:
             self.preview_worker = campreview.PreviewWorker(
                 get_option=self._console_option,
                 sensing=getattr(self.services, "sensing", None),
-                services=self.services, box=worker_box())
+                services=self.services, box=worker_box(),
+                hands=self._hand_stage())
         except Exception:                     # noqa: BLE001
             log.exception("camera preview worker could not be built")
             self.preview_worker = None
@@ -1143,6 +1431,46 @@ class MainWindow:
             self.preview_worker = None
             return
         self._preview_apply()
+
+    def _hand_stage(self):
+        """The grab-and-throw stage for the preview's capture, or None.
+
+        Built by the courier (services.gesture) so the console knows
+        nothing about trackers or thresholds; it only lends the courier
+        its chip and a way onto the Tk thread. The stage runs INSIDE
+        PreviewPipeline.grab() on the frame the preview already pulled --
+        no second device, no second thread -- and inherits every way the
+        preview shuts. A courier that fails to build leaves the preview
+        exactly as it was.
+        """
+        courier = getattr(self.services, "gesture", None)
+        if courier is None:
+            return None
+        try:
+            courier.attach_ui(chip=getattr(self, "carry_chip", None),
+                              post=lambda fn: self._after(0, fn),
+                              console_visible=self._console_active)
+            return courier.stage(get_option=self._console_option)
+        except Exception:                     # noqa: BLE001 - optional lane
+            log.exception("gesture stage could not be built")
+            return None
+
+    def _console_active(self) -> bool:
+        """Is the console the surface he is looking at? A plain attribute
+        read (no Tk call), because the cast asks from a worker thread."""
+        modes = getattr(self, "modes", None)
+        return modes is None or getattr(modes, "mode", ACTIVE) == ACTIVE
+
+    def _carry_dismissed(self):
+        """The chip was clicked: put the carry down. The courier ends the
+        gesture's carry and the chip hears about it through on_event."""
+        courier = getattr(self.services, "gesture", None)
+        if courier is None:
+            return
+        try:
+            courier.drop_by_voice()
+        except Exception:                     # noqa: BLE001 - a click
+            log.exception("carry dismiss failed")
 
     def _preview_enabled(self) -> bool:
         return bool(self._console_option(CAMERA_PREVIEW_OPTION, False))
@@ -1222,6 +1550,14 @@ class MainWindow:
         self.root.bind("<F5>", lambda e: self._toggle_recording())
         self.root.bind("<space>", self._on_space)
         self.root.bind("<Escape>", lambda e: self._minimize_to_tray())
+        # The SENSORS page. The TAB under the wordmark is the primary way
+        # in (jarvis/ui/tab_strip.py); F9 stays as the shortcut, and it is
+        # F9 because every nearer key is spoken for -- F5 is the hotword
+        # daemon's synthetic keypress, space is the mic, Escape is the
+        # tray. It still may not go in the HEADER: 13 px spare at his
+        # 920-px window (tests/test_header_fit.py) and a chip there would
+        # cost him the sensing badge.
+        self.root.bind("<F9>", lambda e: self.sensors_toggle())
 
     def _on_space(self, event):
         focused = self.root.focus_get()
@@ -1438,6 +1774,13 @@ class MainWindow:
                 self.preview_worker.stop()
         except Exception:
             log.exception("camera preview stop failed")
+        # The sensors page's poll thread, for the same reason: a quit that
+        # left it running would keep hitting the ESP32 on the way out.
+        try:
+            if getattr(self, "sensors", None) is not None:
+                self.sensors.hide()
+        except Exception:
+            log.exception("sensors page stop failed")
         if self.board is not None:
             try:
                 self.board.destroy()
@@ -1675,6 +2018,10 @@ class MainWindow:
         except AttributeError:
             log.debug("transcript has no atmosphere loop", exc_info=True)
         self._set_footer_hidden(mode == STANDBY)
+        # …and the tab row goes with it. It is packed ABOVE the stage, so
+        # _set_footer_hidden never reached it: the quiet mode shipped with a
+        # row of lit, clickable tabs over the dimmed clock.
+        self._set_tabs_hidden(mode == STANDBY)
         # The camera pane is an ACTIVE-console widget only, and going quiet
         # STOPS the capture rather than hiding it (jarvis/ui/preview.py).
         self._preview_apply(mode)
@@ -1713,6 +2060,49 @@ class MainWindow:
                 self.command_bar.pack(fill="x", side="bottom")
         except tk.TclError:
             log.debug("footer repack on a dead window", exc_info=True)
+
+    def _set_tabs_hidden(self, hidden: bool):
+        """Standby takes the tab row away too, and shuts whatever surface
+        it had open on the way out.
+
+        _set_footer_hidden's own words: in standby the panel is "a clock
+        and nothing else". The strip is packed into the shell ABOVE the
+        stage (see _build_stage), so nothing the footer does reaches it --
+        photographed 2026-09-03 as CHAT and SENSORS at full brightness over
+        the dimmed clock, with one click on SENSORS enough to start the
+        poll thread behind it. F9 could always do that; a tab makes it a
+        one-click accident.
+
+        Selecting CHAT is what actually stops the poll: the strip owns the
+        page's show()/hide() (jarvis/ui/tab_strip.py), so a SENSORS surface
+        that was open when the console went quiet is hidden and its thread
+        ends, rather than polling a radar the curfew may just have powered
+        down. With no strip at all (it is optional chrome and F9 still
+        works without it) the page is hidden directly, for the same reason.
+        """
+        if hidden == self._tabs_hidden:
+            return
+        self._tabs_hidden = hidden
+        strip = getattr(self, "tabs", None)
+        if hidden:
+            page = getattr(self, "sensors", None)
+            if strip is not None and "chat" in strip.keys:
+                strip.select("chat")      # runs leave() -> the page hides
+            elif page is not None:
+                page.hide()
+        if strip is None:
+            return
+        try:
+            if hidden:
+                strip.pack_forget()
+            else:
+                # before=: the row's whole point is that it sits directly
+                # under the header rule. pack() with no anchor APPENDS to
+                # the shell's side="top" stack, which would put the row
+                # back under the transcript.
+                strip.pack(fill="x", side="top", before=self.reactor)
+        except tk.TclError:
+            log.debug("tab strip repack on a dead window", exc_info=True)
 
     def _on_console_dim(self, factor: float):
         """Dimming is a canvas-colour blend inside our own window — never
@@ -1840,10 +2230,22 @@ class MainWindow:
         bus.subscribe(BriefingReady, self._ev_briefing)
         # the console's second surface and its power-up choreography
         bus.subscribe(BoardCommand, self._ev_board)
+        bus.subscribe(ClearTranscript, self._ev_transcript_clear)
         bus.subscribe(PowerUp, self._ev_power_up)
         bus.subscribe(DeskState, self._ev_desk)
         bus.subscribe(SensingChanged, self._ev_sensing)
         bus.subscribe(FaultRaised, self._ev_fault)
+
+    def _ev_transcript_clear(self, _ev: ClearTranscript):
+        """"Clear the transcript" (commander._h_transcript_clear).
+
+        THE PANE ONLY -- no memory, no context, no mode change. It is
+        deliberately silent about the console mode: the wipe is canvas work
+        under the ambient slab, so one asked for on the way out of the room
+        must not wake the surface he is walking away from. The spoken
+        confirmation is published right after this event and, the bus being
+        FIFO, lands as the one card left on the empty glass."""
+        self.transcript.clear_all()
 
     def _ev_status(self, ev: Status):
         self.set_status(ev.text, ev.kind)
@@ -2306,7 +2708,7 @@ class MainWindow:
             self._dev_text = "NONE"
 
     def _read_mem(self) -> str:
-        """Used system RAM from /proc/meminfo → '26.8 GB'."""
+        """Used/total system RAM from /proc/meminfo → '26.8/128 GB'."""
         try:
             info = {}
             with open("/proc/meminfo") as fh:

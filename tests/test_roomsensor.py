@@ -65,8 +65,11 @@ def _sensor(*answers, clock=None, **kw):
 
 # ----------------------------------------------------------------- URL
 def test_a_url_needs_a_scheme_and_gains_the_default_entity_path():
-    assert normalize_url("http://10.0.0.9") == "http://10.0.0.9/binary_sensor/presence"
-    assert normalize_url("http://10.0.0.9/") == "http://10.0.0.9/binary_sensor/presence"
+    # Capital P: web_server serves the entity at its NAME. See
+    # test_room_sensor.py::test_the_path_is_the_entity_name_... for the
+    # measurement against the live radar.
+    assert normalize_url("http://10.0.0.9") == "http://10.0.0.9/binary_sensor/Presence"
+    assert normalize_url("http://10.0.0.9/") == "http://10.0.0.9/binary_sensor/Presence"
     assert normalize_url("http://10.0.0.9/binary_sensor/room") == \
         "http://10.0.0.9/binary_sensor/room"
     # No guessing: a bare host, a typo or a stray number is NOT a URL, and
@@ -249,7 +252,7 @@ def test_the_sensor_is_off_until_both_keys_are_set():
 def test_a_configured_sensor_is_built_with_its_timeout():
     s = presence_mod._make_sensor(DictCfg({**SENSOR, "presence.room_sensor_timeout_s": 0.4}))
     assert isinstance(s, RoomSensor) and s.timeout_s == 0.4
-    assert s.url == "http://10.0.0.9/binary_sensor/presence"
+    assert s.url == "http://10.0.0.9/binary_sensor/Presence"
 
 
 def test_an_unconfigured_sentinel_polls_the_untouched_phone_probe():

@@ -181,6 +181,53 @@ def test_a_reasoning_block_spanning_a_sentence_break_is_never_streamed(
     assert spoken == ["Good afternoon, sir."]
 
 
+# ----------------------------------------------------------------------
+# Gemma's OWN block, with a thought in it (F47, 09-03 bug pass)
+#
+# gemma4 emits ``<|channel>thought\n{reasoning}<channel|>{answer}`` --
+# asymmetric pipes. The 14:43:59 leak was this block with an EMPTY thought,
+# so the scrub only learned the bare label; with a real thought the content
+# survived both scrubs and reached TTS ahead of the answer. The opener can
+# be eaten upstream, which is the shape that reached the log.
+# ----------------------------------------------------------------------
+GEMMA_THOUGHT = ("<|channel>thought\nHe wants a greeting. It is 2 pm and the "
+                 "family is home.<channel|>Good afternoon, sir.")
+GEMMA_THOUGHT_NO_OPENER = GEMMA_THOUGHT[len("<|channel>"):]
+
+
+@pytest.mark.parametrize("raw", [GEMMA_THOUGHT, GEMMA_THOUGHT_NO_OPENER])
+def test_a_gemma_thought_with_content_is_not_spoken(raw):
+    assert _finish_spoken(raw, "", "", 3) == "Good afternoon, sir."
+
+
+@pytest.mark.parametrize("raw", [GEMMA_THOUGHT, GEMMA_THOUGHT_NO_OPENER])
+@pytest.mark.parametrize("chunk", [1, 7, 500])
+def test_a_gemma_thought_with_content_is_never_streamed(monkeypatch, raw, chunk):
+    from tests.test_streaming_replies import _brain, _chunks
+
+    b = _brain(monkeypatch, _chunks(raw)
+               if chunk == 7 else
+               [{"message": {"role": "assistant", "content": raw[i:i + chunk]},
+                 "done": False} for i in range(0, len(raw), chunk)] +
+               [{"message": {"role": "assistant", "content": ""},
+                 "done": True, "load_duration": 0}])
+    spoken = []
+    b._chat_sync("say hi", on_sentence=spoken.append)
+    assert spoken == ["Good afternoon, sir."]
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("<|channel>thought\nHe wants a greeting.", True),
+    ("thought\nHe wants a greeting. It is 2 pm", True),
+    (GEMMA_THOUGHT, False),
+    ("I thought so, sir.", False),
+])
+def test_reasoning_block_open_knows_gemma_s_block(text, expected):
+    from jarvis.brain import reasoning_block_open
+
+    assert reasoning_block_open(text) is expected
+
+
 def test_an_unterminated_reasoning_block_speaks_nothing(monkeypatch):
     """The stream died mid-thought. Everything after the opener is the
     model talking to itself, so none of it goes out; _chat_sync answers

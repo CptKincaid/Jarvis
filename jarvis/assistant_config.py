@@ -52,8 +52,12 @@ DEFAULTS: dict = {
     "google_ical_urls": [],
     "icloud": {"apple_id": "", "app_password": "",
                "url": "https://caldav.icloud.com"},
+    # Reading uses imap_host; SENDING uses smtp_host (jarvis/outbox.py). A
+    # per-account entry in `accounts` may carry its own smtp_host; without
+    # one, mail.smtp_host() rewrites imap.x -> smtp.x, which is right for
+    # Gmail and for everything else that names its servers that way.
     "gmail": {"address": "", "app_password": "", "imap_host": "imap.gmail.com",
-              "accounts": []},
+              "smtp_host": "smtp.gmail.com", "accounts": []},
     "claude": {
         "allowed_dirs": ["/home/hunterp/Jarvis", "/home/hunterp/haymaker-digest"],
         "projects_root": "/home/hunterp/projects",
@@ -416,7 +420,70 @@ DEFAULTS: dict = {
                  # (POST <url>/turn_off) instead of merely not polling it.
                  "room_sensor_enabled": False, "room_sensor_url": "",
                  "room_sensor_power_url": "",
-                 "room_sensor_timeout_s": 1.5},
+                 "room_sensor_timeout_s": 1.5,
+                 # THE ZONE MODEL, in metres (jarvis/ui/sensors_page.py).
+                 # The LD2410 reports a range and NO angle, so "at the desk"
+                 # can only ever be a distance BAND -- it cannot tell the
+                 # desk from the bookshelf when both sit at the same range.
+                 # That is why the camera is allowed to overrule it: if the
+                 # eye recognises him in its cone he is at the desk whatever
+                 # the radar's range says (his words, 2026-09-03). The
+                 # defaults are the sketch he picked, and 4.5 m is the
+                 # coverage the tuned gates MEASURED, not a guess. Edit them
+                 # on the console's SENSORS page rather than by hand; either
+                 # way a restart is needed.
+                 "desk_band_m": [0.8, 1.8],
+                 "room_band_m": [1.8, 4.5],
+                 "camera_overrules": True,
+                 # THREE ROOMS (jarvis/roomfabric.py). The plural
+                 # of the four keys above, shaped exactly like
+                 # gmail.accounts: a LIST of labelled entries, and while it
+                 # is empty the singular keys above are used instead, so a
+                 # config written before this existed keeps working with no
+                 # edit. room_sensor_enabled stays the master switch over
+                 # the whole fabric. Each entry is
+                 #   {"name": "office",              # the identifier
+                 #    "label": "the office",         # what gets spoken
+                 #    "url": "http://192.168.50.60",
+                 #    "power_url": "",               # optional; see above
+                 #    "primary": true,               # where the Spark is
+                 #    "enabled": true}
+                 # An entry with no url or no name is skipped rather than
+                 # fatal: one unfinished room must not take the others down.
+                 "rooms": [],
+                 # The fabric's four timers, argued in jarvis/roomfabric.py.
+                 # enter: how long a new room must hold occupied before it
+                 # takes over (a doorway pass-through is ~1 s in the beam).
+                 # leave: how long the current room may read empty and still
+                 # be believed -- the LD2410's own absence delay is already
+                 # 5 s, so anything under that re-litigates the device.
+                 # switch: the floor between room changes, the doorway
+                 # anti-flap. stale: when the last known room stops being
+                 # named at all. stuck: a room reading occupied this long
+                 # without a break is a fan, not a man, and is dropped from
+                 # the picture until it clears.
+                 "rooms_poll_s": 2.0, "rooms_enter_hold_s": 2.0,
+                 "rooms_leave_hold_s": 8.0, "rooms_switch_min_s": 6.0,
+                 "rooms_stale_after_s": 90.0, "rooms_stuck_after_h": 12.0,
+                 # THE DOOR ROOM (jarvis/arrival.py, app._on_room_changed).
+                 # His words: "kitchen to see if i enter my apartment since
+                 # the kitchen and door are next to each other". That room
+                 # going occupied after a WHOLE-HOME absence is the front
+                 # door opening, and it is greeted straight away instead of
+                 # waiting for his phone's radio to answer an ARP. It must
+                 # match a `name` in `rooms` above; while no such room is
+                 # configured nothing here fires. A kitchen trip while he
+                 # is already home is not an arrival and never greets.
+                 "door_room": "kitchen",
+                 # "Welcome back from the dentist, sir" -- named only when
+                 # a calendar event honestly covered the absence, and the
+                 # plain "Welcome back, sir" otherwise. False keeps the
+                 # plain line always.
+                 "arrival_outing": True,
+                 # The doorstep OFFER: unread count plus one clause on
+                 # anything major, then a question. It never reads the mail
+                 # -- that needs a yes (Commander._try_briefing_offer).
+                 "arrival_offer": True},
     # Offline mode and the camera curfew (jarvis/sensing.py). ONE object
     # answers "may this sensor run", combining the manual switch (spoken:
     # "offline mode", "deactivate presence", "stop watching"), this daily
@@ -428,6 +495,61 @@ DEFAULTS: dict = {
     # switching it off at night would cost presence for no privacy.
     # start/end are "HH:MM" 24 h and wrap midnight, like quiet.hours.
     "sensing": {"curfew": {"enabled": True, "start": "21:00", "end": "07:00"}},
+    # ZONES (jarvis/zones.py): WHERE in a room, and a written record of it
+    # before anything is allowed to act on it -- his words, "just log it
+    # first". Nothing reads this to decide what Jarvis says; the only
+    # effect of turning it on is a JSONL file.
+    #
+    # A zone is a named DISTANCE BAND on one radar, because an LD2410C
+    # reports range and no angle. The camera OVERRULES it: if the eye
+    # recognises him in its cone he is at the desk whatever the range says.
+    # camera_zone is what that verdict is called, and it defaults to "at
+    # the desk" because the office is the only room with a lens -- a room
+    # whose camera watches something else must set its own.
+    #
+    # The office ladder is the real geometry and is NOT a naive
+    # "desk = nearest band". The profile in ~/.config/jarvis/room-sensors/
+    # office.json records the module as sitting on the desk at the BACK
+    # edge aimed OUT across the room at the door, so sitting in the chair
+    # he is behind it and inside its 0.75 m blind zone, and the first 1.5 m
+    # in front of it has no still-target sensitivity at all. The nearest
+    # band is therefore the floor IN FRONT of the desk; the chair belongs
+    # to the camera. Edges are multiples of one 0.75 m distance gate --
+    # anything finer is a fiction the sensor cannot support -- and the
+    # ladder stops at 4.5 m, the device's tuned far gate.
+    #
+    # dwell_s is the anti-chatter hold: a zone change commits only after it
+    # has held this long. 3.0 s is three consecutive reads at the 2.0 s
+    # poll cadence, longer than the ~0.6 s a walker spends inside the
+    # narrowest band, and well inside the radar's own 10 s absence delay.
+    # log_path "" means ~/.local/state/jarvis/zones.jsonl (0600 in a 0700
+    # directory). The file rotates at log_max_bytes keeping one generation,
+    # so 2 MB is the ceiling. No line may exceed jarvis/zones.py's
+    # MAX_LINE_BYTES (640) -- append refuses one that would -- so 1 MB is
+    # at least 1,562 transitions of any shape. What a real day writes is
+    # not measured; earlier comments here quoted a per-record average that
+    # would not reproduce, so it has been removed rather than restated.
+    #
+    # EDIT THIS SECTION AND MIND THE TYPO. Anything here of the wrong SHAPE
+    # -- a rooms that is not a list, an entry that is not an object, a
+    # near_m that is text, an enabled that is the STRING "false" -- is
+    # REFUSED BY NAME and records nothing. It does NOT fall back to the
+    # ladder built into jarvis/zones.py, and only a key that is absent
+    # altogether falls back to anything. That is deliberate: a log written
+    # against the bands you thought you had replaced looks exactly like a
+    # log that worked.
+    "zones": {"enabled": True, "dwell_s": 3.0, "log_path": "",
+              "log_max_bytes": 1000000, "log_keep": 1,
+              "rooms": [
+                  {"name": "office", "enabled": True,
+                   "camera_zone": "at the desk",
+                   "bands": [
+                       {"name": "just off the desk",
+                        "near_m": 0.75, "far_m": 1.5},
+                       {"name": "the middle of the room",
+                        "near_m": 1.5, "far_m": 3.0},
+                       {"name": "by the door",
+                        "near_m": 3.0, "far_m": 4.5}]}]},
     # The camera (jarvis/eye.py, scratchpad/ideas/vision.md). OFF until he
     # turns it on, and there is deliberately NO SCHEDULE HERE: offline mode
     # and the 21:00-07:00 curfew belong to the single sensing-state owner,
@@ -585,15 +707,113 @@ DEFAULTS: dict = {
                # sensing.py on top, so offline mode and the curfew shut it
                # whatever this says.
                #
-               # preview_fps is CAPTURE rate, and 6 is deliberately under the
-               # ~7.5 the device delivers. The console animates on 16.67 ms
-               # slot boundaries in the same process (jarvis/ui/reactor.py),
-               # so the capture runs on its own thread and the pane repaints
-               # at twice this rate off a latest-wins slot; asking for 30
-               # here would not produce 30 frames, it would produce a thread
-               # that is always inside a 130 ms blocking read and a curfew
-               # edge that has to wait it out.
-               "preview": False, "preview_fps": 6.0},
+               # preview_fps is the PICTURE rate. It was 6, under a measured
+               # ~7.5 fps device -- and that measurement was an artefact of
+               # asking a LifeCam Cinema for 1920x1080, a mode it does not
+               # have (v4l2 grants a different one silently and the cost shows
+               # up as grab latency). At the corrected 1280x720 the grab is
+               # 11 ms, so 6 fps was leaving the pane at a 167 ms step for no
+               # reason and he said so: "it lags a ton" (2026-09-03).
+               #
+               # 15 is capped at 30 in jarvis/campreview.py -- the nominal
+               # rate of the mode -- and the boxes and the name have their own
+               # slower cadences, which is what keeps the whole thing at ~12%
+               # of one core instead of 75%. The console animates on 16.67 ms
+               # slot boundaries in the same process, so the capture runs on
+               # its own thread and the pane repaints off a latest-wins slot.
+               "preview": False, "preview_fps": 15.0},
+    # Grab and throw (jarvis/gesture.py, jarvis/handstage.py,
+    # jarvis/cast.py, jarvis/gesturecast.py). His words, 2026-09-03: "reach
+    # out and grab at the screen (in the air) where the camera is and then
+    # gesture towards almost throwing the cast onto the HPCOMPUTER".
+    #
+    # OFF by default, like every other lens key. It RIDES THE CAMERA
+    # PREVIEW: the hand stage runs inside the preview's own capture, on the
+    # frame it already pulled, so camera.preview must be on and the console
+    # active for a gesture to be seen at all -- there is no second device,
+    # no second thread, and every way the preview shuts (curfew, offline,
+    # standby, the toggle, quit) shuts this too. The models are the two
+    # opencv_zoo MediaPipe hand graphs under ~/.aiws_trainer/models/hand
+    # (Apache-2.0, sha-verified by jarvis/handpose.py); never in the repo.
+    #
+    # sinks: which side is which machine, taught by voice ("HPCOMPUTER is
+    # on my right") and SHIPPED EMPTY -- nobody but Hunter can see the
+    # room, so until he says, every throw lands on the board and Jarvis
+    # tells him once how to teach a side. Keys are "left" / "right";
+    # values are "board", "hpcomputer" or "handoff".
+    #
+    # EVERY NUMBER BELOW IS A CALIBRATED STARTING POINT, measured on a
+    # synthetic hand with his own lens constants and never on his hand
+    # (jarvis/gesture.py CastThresholds carries the measurements). The
+    # self-check prints what his hand actually measures:
+    #   ~/vss_env/bin/python scripts/gesture_selfcheck.py --seconds 30
+    "gesture": {"enabled": False, "sinks": {},
+                # ORT intra-op threads for the two hand graphs, SEPARATE
+                # from camera.threads (cv2's global). 2 matches it: the
+                # latency win of 4 costs total CPU on a box that has had
+                # one unified-memory power-off already. model_dir empty
+                # means ~/.aiws_trainer/models/hand. mirrored: the LifeCam
+                # feed is NOT mirrored (cv2.flip appears nowhere), so image
+                # +x is his LEFT; set true only if the feed is ever flipped.
+                "hand_threads": 2, "model_dir": "", "mirrored": False,
+                # Say "Holding <thing>, sir." on the grab (the tone plays
+                # either way, and the chip names it either way).
+                "speak_grab": True,
+                # Attention is LATCHED, not sampled: one face attending
+                # within attend_latch_s arms the hand stage, then a reach or
+                # a carry keeps it armed -- the reaching arm crosses the face
+                # at exactly the moment it matters. GUESSED (the design pass
+                # offered 1.0 and 3.0). The reach ratio's scale is a rolling
+                # MEDIAN of the interocular distance over face_window_s
+                # with at least face_min_samples faces seen; no baseline
+                # means no grab, stated as a refusal, never a default.
+                "attend_latch_s": 3.0, "face_window_s": 5.0,
+                "face_min_samples": 3,
+                # The hand: C = mean fingertip-to-wrist / palm_diag. A fist
+                # reads <= 0.680 and an open hand >= 0.919 over the pose
+                # envelope; the two bars sit inside that gap with a dead
+                # band between so a hand at the boundary cannot chatter.
+                "closed_max": 0.70, "open_min": 0.85,
+                # The reach: R = palm_diag / interocular. A hand at the FACE
+                # PLANE never exceeded 2.03; 2.35 was the first bar with zero
+                # false grabs in 288 everyday motions and full lateral
+                # recall. reach_arm is where the stage starts preparing the
+                # subject so the grab feels instant.
+                "reach_min": 2.35, "reach_arm": 1.60,
+                # FRAMES, not seconds, deliberately: at 7.5 fps a "300 ms
+                # dwell" is 2.25 frames and the rounding decides whether it
+                # works. dwell 3 = 400 ms of a still fist at reach; the hand
+                # must have been seen OPEN within open_lookback_frames (1.6 s)
+                # or a resting fist drifting into the zone becomes a grab;
+                # anchor_drift_u is how still "still" is, in hand-units
+                # (~7x the 0.05-0.09 landmark noise floor).
+                "dwell_frames": 3, "open_lookback_frames": 12,
+                "open_frames_req": 1, "anchor_drift_u": 0.60,
+                # The throw, in hand-units of travel from the anchor: opened
+                # in frame needs a full hand-width (he opens his hand
+                # hundreds of times an hour); left the picture within
+                # edge_frac of a half-field needs only 0.25 (leaving is the
+                # evidence); vanished in open space needs 0.50 AND a last
+                # step of exit_step_u. Anything less is a DROP -- the cheap,
+                # reversible outcome.
+                "throw_release_u": 1.00, "throw_exit_u": 0.25,
+                "throw_lost_u": 0.50, "exit_step_u": 0.35, "edge_frac": 0.30,
+                # A carry survives lost_grace_frames of missed detection,
+                # and ends at carry_max_frames OR carry_max_s, whichever
+                # first (the seconds are the wall-clock backstop for a
+                # starved frame rate). cooldown_frames after any carry end.
+                "lost_grace_frames": 2, "carry_max_frames": 30,
+                "carry_max_s": 8.0, "cooldown_frames": 8,
+                # Direction: four +/-sector_half_deg sectors in HIS frame
+                # with 20 deg of "ambiguous" between them -- an unnameable
+                # fling is a drop. Only left and right THROW (measured:
+                # vertical throws scored 12/12 or 2/12 on finger direction
+                # alone); down is the cancel, up is not a target. A second
+                # hand at reach depth at least second_hand_frac the size of
+                # the first makes the frame ambiguous: two hands out at the
+                # lens is not this gesture.
+                "sector_half_deg": 35.0, "target_sectors": ["left", "right"],
+                "second_hand_frac": 0.70},
     # The arc (jarvis/arc.py): one name for the hour of the house --
     # pre-dawn / waking / working / afternoon / dusk / evening / night --
     # from locally computed sunrise/sunset plus quiet, presence and focus.
@@ -709,6 +929,67 @@ DEFAULTS: dict = {
     "phone": {"enabled": False, "bind": "", "port": 8765, "token": "",
               "max_audio_mb": 8, "link_file": "~/jarvis-phone.txt",
               "qr_file": "~/jarvis-phone.svg"},
+    # "Email this file to this person" (jarvis/outbox.py). Nothing here
+    # switches the feature on or off: it is on, and what makes it safe is
+    # the spoken read-back and the yes, not a flag.
+    #
+    # `roots` are the ONLY folders a spoken file NAME may resolve inside --
+    # ~ is a whole filesystem and "the lab report" must not be able to reach
+    # a README three levels down a checkout. An absolute path he gives
+    # outright is allowed outside them (filephrase.DENY_ROOTS says what is
+    # still refused there: anything behind a leading dot, anything under a
+    # system tree).
+    #
+    # `max_mb` may only be lowered. 18 MB is what Gmail will actually
+    # deliver once base64 has inflated the file by 4/3 inside a 25 MB
+    # limit; a bigger number here would not send a bigger file, it would
+    # move the refusal to the SMTP server AFTER the read-back had promised
+    # the thing went.
+    #
+    # `contacts` is a name -> address map, checked before the people book
+    # in jarvis/memory.py. Both are consulted and NEITHER is guessed at: an
+    # unknown name is a question, never a plausible address.
+    #
+    # `from` is a label from gmail.accounts. Blank with more than one
+    # account configured means Jarvis asks which identity to send as, which
+    # is the right default -- personal, work and school are three different
+    # people to whoever receives the mail.
+    "send_file": {"roots": ["~/Desktop", "~/Downloads", "~/Documents"],
+                  "max_mb": 18, "from": "", "contacts": {},
+                  "body": "Sent from Jarvis."},
+    # HPCOMPUTER -- files both ways and a short allow-list of read-only
+    # questions (jarvis/tools/remote.py).  Ships OFF and EMPTY because as of
+    # 2026-09-02 the host is not on the tailnet at all, has no sshd
+    # reachable and has no key here; `host` stays blank until it joins, and
+    # a blank host is refused by name ("it isn't on the tailnet yet").
+    #
+    # Deliberately NOT in SETUP_LINES/SECTIONS, exactly like `oracle`:
+    # missing_sections() drives a spoken nag at boot, and nagging about a
+    # machine he has not chosen to connect yet would be noise.
+    #
+    # `socks_proxy` is not optional here and not a preference.  tailscaled
+    # on this box runs --tun=userspace-networking, so there is NO route to
+    # 100.64/10 and a direct ssh to a tailnet name fails with "network is
+    # unreachable" however healthy the tailnet is.  1055 is the daemon's
+    # own SOCKS5 port.  Blank it only if this box ever gets a real tun.
+    #
+    # `inbox` is the ONLY directory a push can land in, and `pull_dirs` the
+    # only ones a pull may read: speech never names a remote path.
+    "remote": {
+        "enabled": False,
+        "host": "",                       # e.g. hpcomputer.tail5323b8.ts.net
+        "user": "",
+        "key_path": "",                   # a path ssh already owns; never a key
+        "name": "HPCOMPUTER",
+        "timeout_s": 12,
+        "transfer_timeout_s": 120,
+        "socks_proxy": "127.0.0.1:1055",
+        "inbox": "~/jarvis-inbox",
+        "pull_dirs": {"outbox": "~/jarvis-outbox",
+                      "desktop": "~/Desktop",
+                      "downloads": "~/Downloads"},
+        "max_mb": 100,
+    },
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",

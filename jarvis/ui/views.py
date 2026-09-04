@@ -29,6 +29,7 @@ from datetime import datetime
 from typing import Callable, Optional
 
 from jarvis.campreview import OPTION_ENABLED as CAMERA_PREVIEW_OPTION
+from jarvis.handstage import OPTION_ENABLED as GESTURE_OPTION
 from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import UserUtterance, bus
 from jarvis.logs import get_logger
@@ -251,28 +252,96 @@ def curfew_choice_values(curfew) -> tuple:
 
 
 def fmt_temps_compact(seg: str) -> str:
-    """Compact status-bar value from one temps segment: 'cpu 53° 7%' →
-    '53°' (the load percentage is the first thing to go when the strip is
-    tight), unparsable → '--'."""
+    """Temperature alone from one temps segment: 'cpu 53° 7%' → '53°',
+    unparsable → '--'. NOT what the compact strip level shows any more --
+    see fmt_temps_live."""
     m = _TEMP_RE.search(seg or "")
     return f"{m.group(1)}°" if m else "--"
 
 
+def fmt_temps_live(seg: str) -> str:
+    """Compact status-bar value from one temps segment: 'cpu 53° 7%' →
+    '53° 7%' (the °C and the middot go, the utilisation stays),
+    unparsable → '--'.
+
+    2026-09-02, verbatim: "i dont think the CPU and GPU are updating".
+    They were. The strip elides to level 1 at his 920-px window and level
+    1 used to drop the PERCENTAGE and keep only the temperature -- which
+    on this box moves a degree or two over minutes, so the compact rung
+    read as a dead strip. The utilisation is the number that actually
+    moves, and the one he can act on.
+    """
+    m = _TEMP_RE.search(seg or "")
+    if not m:
+        return "--"
+    temp, pct = m.group(1), m.group(2)
+    return f"{temp}° {pct}%" if pct is not None else f"{temp}°"
+
+
+def fmt_load(seg: str) -> str:
+    """Utilisation alone from one temps segment: 'cpu 53° 7%' → '7%'.
+
+    The narrow rung. When even 'CPU 53° 7%' will not fit, the temperature
+    is what goes and the percentage is what stays: it is the number that
+    moves second to second and the one he can act on, and a strip that
+    drops BOTH of them (which is what the ladder used to do -- straight
+    from temperature-only to memory-only) goes blank at exactly the load
+    it exists to report. A segment with no percentage in it has only its
+    temperature to show ('gpu 38°' → '38°'); unparsable → '--'.
+    """
+    m = _TEMP_RE.search(seg or "")
+    if not m:
+        return "--"
+    return f"{m.group(2)}%" if m.group(2) is not None else f"{m.group(1)}°"
+
+
+# Rungs of the telemetry ladder, widest first (telemetry_segments).
+TELEMETRY_LEVELS = 4
+
+
 def telemetry_segments(temps_text: str, mem_text: str, level: int) -> list:
     """The telemetry cluster at an elision `level` as [(label, value)]:
-    level 0 = full ('CPU' '53°C · 7%', 'GPU' '44°C · 0%', 'MEMORY' '47.5 GB'),
-    level 1 = compact ('CPU' '53°', 'GPU' '44°', '' '47.5 GB'), level 2 =
-    minimal ('' '47.5 GB'). Pure; the strip picks the level with
-    plan_telemetry from measured widths."""
+
+      0 full     ('CPU' '53°C · 7%')  ('GPU' '44°C · 0%')  ('MEM' '47.5/122 GB')
+      1 compact  ('CPU' '53° 7%')     ('GPU' '44° 0%')     (''    '47.5/122 GB')
+      2 load     ('CPU' '7%')         ('GPU' '0%')         (''    '47.5/122 GB')
+      3 minimal                                            (''    '47.5/122 GB')
+
+    Pure; the strip picks the level with plan_telemetry from measured
+    widths.
+
+    THE LOAD RUNG EXISTS BECAUSE LEVEL 1 CAN TIP. Keeping the utilisation
+    at level 1 costs it: measured at S=2.0 the compact rung went 430 px →
+    570, against the 650 his 918-px strip leaves beside 'WAKE WORD OFF'.
+    That is still slack at 63° 7% (570 px), and it still holds with both
+    processors pinned at 100% (640). But a three-digit temperature under
+    load ('cpu 100° 100% · gpu 88° 100%', '121.7/122 GB') asks 654 and
+    tips the plan a rung -- and the rung below used to be memory ALONE, so
+    CPU and GPU vanished at precisely the load this change exists to
+    surface. The load rung asks 528 in that same worst case: the ladder
+    now drops the temperatures before it drops the numbers that move.
+
+    The memory VALUE (fmt_mem_gb) carries used/total rather than the label
+    carrying the word MEMORY, because every rung but the first drops the
+    label and a bare '59.9 GB' on a 122 GB box is exactly what he had to
+    ask about. 'MEM' rather than 'MEMORY' at level 0 pays for the wider
+    value: the measured level-0 cluster comes to 718 px against the 770
+    the default window leaves, so every layout that showed the full
+    cluster still does.
+    """
     temps = split_temps(temps_text)
     mem = (mem_text or "").strip() or "--"
     if level <= 0:
         return [("CPU", fmt_temps(temps.get("cpu", ""))),
                 ("GPU", fmt_temps(temps.get("gpu", ""))),
-                ("MEMORY", mem)]
+                ("MEM", mem)]
     if level == 1:
-        return [("CPU", fmt_temps_compact(temps.get("cpu", ""))),
-                ("GPU", fmt_temps_compact(temps.get("gpu", ""))),
+        return [("CPU", fmt_temps_live(temps.get("cpu", ""))),
+                ("GPU", fmt_temps_live(temps.get("gpu", ""))),
+                ("", mem)]
+    if level == 2:
+        return [("CPU", fmt_load(temps.get("cpu", ""))),
+                ("GPU", fmt_load(temps.get("gpu", ""))),
                 ("", mem)]
     return [("", mem)]
 
@@ -303,17 +372,29 @@ def plan_telemetry(total_w: int, left_w: int, project_fixed_w: int,
 
 
 def levels_for_look(levels, look: Optional[str] = None) -> list:
-    """The elision levels StatusStrip may plan with (pure). Holo: all of
-    them. Classic: level 0 alone, which makes plan_telemetry exactly the
-    old plan_strip call -- classic is the 08-31 console token for token,
-    so the FOUND 08-26 wake-word/CPU overprint at 920 px survives there by
-    contract, the same call _placeholder_for makes for the clipped
-    placeholder. The 09-01 review measured the elision as the ONE classic
-    pixel change outside the sphere and we chose exact; drop the guard
-    here to give classic the fix too."""
-    look = theme.LOOK if look is None else look
-    levels = list(levels or [])
-    return levels if look == "holo" else levels[:1]
+    """The elision levels StatusStrip may plan with (pure) -- now all of
+    them, in BOTH looks.
+
+    Until 2026-09-02 this handed classic level 0 alone: the 09-01 review
+    measured the elision as the one classic pixel change outside the holo
+    sphere, and classic is the fallback that renders the 08-31 console
+    token for token, so it kept the FOUND 08-26 wake-word/telemetry
+    overprint by contract rather than drift.
+
+    That contract could not survive this commit. Telling him whether the
+    memory figure is used or free changed the level-0 value in BOTH looks
+    ('47.5 GB' → '47.5/122 GB'), and with it classic's pixels: its cluster
+    grew 710 → 718 px, i.e. the overprint on his 918-px strip went 59 px
+    → 67. Given the choice between a classic that is 8 px MORE broken and
+    a classic that elides, the elision wins -- and the guard's own comment
+    always said so. Classic at 918 px now plans the compact rung (570 px
+    beside a 267-px wake segment) instead of printing CPU over OFF.
+
+    `look` is kept (and ignored) so the call sites and the look-explicit
+    tests do not all have to change to say the same thing: this is still
+    the ONE place a look-specific ladder would go.
+    """
+    return list(levels or [])
 
 
 def fit_placeholder(avail_px: int, options) -> str:
@@ -329,6 +410,70 @@ def fit_placeholder(avail_px: int, options) -> str:
         if w <= avail_px:
             return text
     return options[-1][0]
+
+
+def header_spans(total_w: int, left_ws, right_ws) -> list:
+    """Where a bar's packed children land, and how wide they end up (pure).
+
+    A transcription of Tk 8.6's packer, generic/tkPack.c ArrangePacking:
+
+      * each child is handed a FRAME out of a shrinking cavity, and the
+        cavity is CLAMPED at zero rather than going negative, the frame
+        shrinking to whatever is left instead (lines 752-756);
+      * the child is then CLIPPED to its frame less its padding (786-790);
+      * and a child left with no width at all is UNMAPPED -- Tk stops
+        drawing it entirely (846-850).
+
+    So right-packed pack siblings can never overlap: `frameX` for a right
+    child is `cavityX + cavityWidth` and cavityWidth is never negative, so
+    no parcel ever starts left of the cavity origin. An over-subscribed
+    header does not print one chip on top of another; it TRUNCATES the last
+    one packed, and then makes it vanish. That is the real 2026-09-02
+    header report ("the word sensing is underneath the ready symbol"): at
+    918 px the badge was cut to 124 px of its 168 -- capsule and the tail
+    of the word sheared off, sitting flush against the wordmark -- and
+    41 px of 214 in his worst state, a dot and a sliver against the pill.
+    One child further along (a wider word, the extra header child a
+    sibling branch is adding) Tk stops drawing it at all, and an absent
+    badge and a badge reading SENSING must not look the same.
+
+    `left_ws` / `right_ws` are [(name, req_w, pad_left, pad_right)] in
+    PACKING order (left-packed children first, as the header packs them).
+    Returns [(name, x0, x1, req_w, mapped)] -- x0..x1 is what is actually
+    DRAWN, so `x1 - x0 < req_w` means Tk clipped it and `mapped` False
+    means Tk unmapped it. spans_clipped() names both.
+    """
+    spans, cav_x, cav_w = [], 0, max(0, int(total_w))
+    for to_left, items in ((True, left_ws), (False, right_ws)):
+        for name, req, pad_l, pad_r in items or ():
+            pad = pad_l + pad_r
+            frame_w = req + pad
+            cav_w -= frame_w
+            if cav_w < 0:                 # tkPack.c 752-756: clamp, shrink
+                frame_w += cav_w
+                cav_w = 0
+            if to_left:
+                frame_x = cav_x
+                cav_x += frame_w
+            else:
+                frame_x = cav_x + cav_w
+            drawn = min(req, frame_w - pad)   # tkPack.c 786-790: clip
+            x0 = frame_x + pad_l
+            spans.append((name, x0, x0 + max(0, drawn), req, drawn > 0))
+    return spans
+
+
+def spans_clipped(spans) -> list:
+    """[(name, drawn_px, requested_px)] for every `header_spans` child the
+    packer had to cut down, 0 drawn px meaning Tk unmapped it outright.
+
+    This is the header's real fitting assertion. Pack siblings cannot
+    overlap (see header_spans), so "nothing collides" is free and says
+    nothing; "nothing is clipped" is what keeps the sensing badge whole --
+    and keeps it on screen at all.
+    """
+    return [(name, x1 - x0, req) for name, x0, x1, req, _m in spans or ()
+            if (x1 - x0) < req]
 
 
 def tracked(text: str) -> str:
@@ -1015,6 +1160,52 @@ class TranscriptView(tk.Frame):
                 pass
             self._schedule_layout()
 
+    def clear_all(self) -> int:
+        """Empty the pane — every card, the ghost preview, the open
+        progress run — and return how many cards came down.
+
+        THE SCREEN ONLY. The conversation the model sees lives in
+        jarvis/memory.py and the context engine; this touches neither, and
+        the spoken line that goes with it says so. There is no undo: the
+        cards are destroyed, not hidden.
+
+        ONE card is exempt. An approval still waiting on him carries the
+        only hand-answerable ALLOW / DENY for a Claude run that is BLOCKED
+        on it — wiping it would strand that run until the approval timeout.
+        It stays, alone, and the toast says why.
+
+        Safe in every console mode: this is canvas work under the ambient
+        slab, so a wipe asked for on the way out of the room lands the same
+        as one asked for at the desk, and nothing here wakes the surface.
+        """
+        self.clear_partial()
+        held = {id(info["card"]) for info in self._approvals.values()
+                if info.get("card") is not None and not info.get("answered")}
+        keep, removed = [], 0
+        for entry in self._cards:
+            card, _lbl, _role, win = entry[:4]
+            if id(card) in held:
+                keep.append(entry)
+                continue
+            try:
+                self.canvas.delete(win)
+                card.destroy()
+            except tk.TclError:                 # the window is going away
+                pass
+            removed += 1
+        self._cards = keep
+        self._progress = None                   # a later line opens a new run
+        # He may have scrolled up to read something before asking for the
+        # wipe; an empty column left unpinned lands the NEXT card off-screen.
+        self._pinned = True
+        for info in self._approvals.values():   # no refs to destroyed widgets
+            if info.get("answered"):
+                info["card"] = None
+        if keep and self.toast:
+            self.toast.show("Question left standing", kind="info")
+        self._schedule_layout()
+        return removed
+
     def _card_head(self, card: Card, who: str, who_color: str,
                    rtt: Optional[float] = None) -> tk.Label:
         """Head row: speaker label (display SIZE_CAPTION semibold) left,
@@ -1147,8 +1338,13 @@ class TranscriptView(tk.Frame):
             card.set_edge_glow((theme.ARC_BRIGHT,))
         else:
             card.set_edge_glow()
+        # `answered` and `card` are clear_all's: a question still waiting on
+        # him is the one card a wipe must leave standing. `done` cannot say
+        # so -- answer() above resolves with mark=False, which disables the
+        # buttons without ever setting it.
         self._approvals[request_id] = {"stamp": stamp, "stamp_text": stamp.cget("text"),
-                                       "buttons": (allow, deny), "done": False}
+                                       "buttons": (allow, deny), "done": False,
+                                       "answered": False, "card": card}
         self._push_entry(card, body, "jarvis", x, cw)
         return card
 
@@ -1162,6 +1358,7 @@ class TranscriptView(tk.Frame):
         info = self._approvals.get(request_id)
         if not info:
             return
+        info["answered"] = True
         for btn in info["buttons"]:
             try:
                 btn.set_enabled(False)
@@ -2062,6 +2259,15 @@ class SettingsDrawer(tk.Frame):
         # the pane says which, and no device is opened.
         self._preview_toggle = self._option_toggle_row(
             box, "Camera preview", CAMERA_PREVIEW_OPTION, echo=True)
+        # Grab and throw (jarvis/gesturecast.py). Beside the preview
+        # because it RIDES the preview: the hand stage runs inside the
+        # pane's own capture, so with the row above off there is no frame
+        # for it to read and nothing here opens one. No echo: the stage
+        # reads the switch on every frame, so it takes effect at once.
+        self._gesture_toggle = self._option_toggle_row(
+            box, "Grab and throw", GESTURE_OPTION)
+        self._info_row(box, "Reach at the lens, close your hand, fling it "
+                            "left or right. Needs the camera preview on.")
         self._info_row(box, "The microphone stays on while offline — say "
                             "“come back online” to switch sensing back on.")
 
@@ -2177,6 +2383,10 @@ class SettingsDrawer(tk.Frame):
         tog = getattr(self, "_preview_toggle", None)
         if tog is not None:
             tog.set(bool(self._get_option(CAMERA_PREVIEW_OPTION, False)),
+                    animate=False)
+        tog = getattr(self, "_gesture_toggle", None)
+        if tog is not None:
+            tog.set(bool(self._get_option(GESTURE_OPTION, False)),
                     animate=False)
         pol = self._sensing()
         if pol is None:
@@ -2403,7 +2613,7 @@ class StatusStrip(tk.Frame):
         # telemetry per elision level (pure: telemetry_segments); the
         # widest level that leaves the left side clear wins
         levels, texts = [], []
-        for level in range(3):
+        for level in range(TELEMETRY_LEVELS):
             segs = telemetry_segments(self._temps_text, self._mem_text, level)
             seg_ws, seg_txt = [], {}
             for name, (label, value) in zip(self.SEGMENTS[-len(segs):], segs):
@@ -2468,8 +2678,9 @@ class StatusStrip(tk.Frame):
 
     @property
     def telemetry_level(self) -> int:
-        """0 full, 1 compact ('CPU 53° · GPU 44° · 47.5 GB'), 2 minimal
-        ('47.5 GB') — what the last layout chose."""
+        """What the last layout chose: 0 full, 1 compact ('CPU 53° 7% ·
+        GPU 44° 0% · 47.5/122 GB'), 2 load ('CPU 7% · GPU 0% ·
+        47.5/122 GB'), 3 minimal ('47.5/122 GB')."""
         return self._level
 
     def _hot_clicked(self, _e):
@@ -2500,7 +2711,7 @@ class StatusStrip(tk.Frame):
         self._set_value("GPU", fmt_temps(segs.get("gpu", "")))
 
     def set_memory(self, text: str):
-        """Used system RAM, e.g. '26.8 GB' ('--' when unknown)."""
+        """Used/total system RAM, e.g. '26.8/128 GB' ('--' when unknown)."""
         self._mem_text = text or ""
         self._set_value("MEMORY", text or "--")
 

@@ -47,6 +47,12 @@ log = get_logger("board")
 # Panel order, top to bottom on the docked surface. The two that change
 # fastest (vitals, turns) sit at the top where the eye lands.
 PANEL_ORDER = ("vitals", "turns", "sessions", "deadlines", "focus", "quiet")
+# Panels that appear only while they have something to say. The CAST slab
+# (a thrown document / track / screen, jarvis/gesturecast.py) is on the
+# board only for CAST_TTL_S after a throw: a permanent "CAST: nothing"
+# would be clutter on a mission-control surface, and a stale one a lie.
+OPTIONAL_PANELS = ("cast",)
+CAST_TTL_S = 1800.0
 
 POLL_S = 5.0              # BoardFeed cadence; the Canvas half is cached
 SPARK_WIDTH = 28          # sparkline columns; ~2.5 minutes of turns
@@ -75,6 +81,8 @@ PANEL_ALIASES = {
     "focus block": "focus", "study": "focus",
     "quiet": "quiet", "the quiet": "quiet", "quiet hours": "quiet",
     "presence": "quiet", "do not disturb": "quiet",
+    "cast": "cast", "the cast": "cast", "the throw": "cast",
+    "last throw": "cast", "the last throw": "cast", "what i threw": "cast",
 }
 
 
@@ -443,6 +451,50 @@ def quiet_panel(reason: str, presence_state: str = "",
     return p
 
 
+def cast_panel(recent, now: float) -> Optional[Panel]:
+    """The last thing he threw, and where it ended up -- or None when
+    nothing was thrown inside CAST_TTL_S. ``recent`` is
+    gesturecast.GestureCast.recent(): status / spoken / target / kind / at,
+    strings and numbers only. A HELD cast is drawn as a warning with the
+    target it could not reach, because the board is where the payload fell
+    back to and he should be able to see why it is here."""
+    if not isinstance(recent, dict) or not recent:
+        return None
+    try:
+        at = float(recent.get("at") or 0.0)
+    except (TypeError, ValueError):
+        return None
+    if at <= 0.0 or now - at > CAST_TTL_S:
+        return None
+    status = str(recent.get("status") or "").lower()
+    what = str(recent.get("spoken") or "").strip()
+    target = str(recent.get("target") or "").strip()
+    p = Panel("cast", "CAST")
+    word = {"landed": "LANDED", "held": "HELD", "proposed": "ASKED",
+            "refused": "REFUSED", "vetoed": "REFUSED",
+            "empty": "NOTHING"}.get(status, status.upper() or "—")
+    p.rows.append(("STATUS", word))
+    if what:
+        p.rows.append(("WHAT", what[:26]))
+    if target:
+        p.rows.append(("TO", target[:26].upper()))
+    if recent.get("url"):
+        p.rows.append(("FETCH", str(recent["url"])[:26]))
+    p.tone = "ok" if status in ("landed", "proposed") else \
+        ("warn" if status in ("held", "refused", "vetoed") else "idle")
+    if status == "landed":
+        p.line = f"{what or 'It'} landed on {target or 'the board'}, sir." \
+            if what else "The last throw landed, sir."
+    elif status == "held":
+        p.line = (f"I'm holding {what or 'the last throw'}, sir; "
+                  f"{target or 'the target'} wasn't answering.")
+    elif status == "proposed":
+        p.line = f"{what or 'It'} is waiting on your yes, sir."
+    else:
+        p.line = "Nothing landed, sir."
+    return p
+
+
 # ------------------------------------------------------------- assembly
 def board_state(*, health: Optional[Callable] = None,
                 sessions: Optional[Callable] = None,
@@ -453,6 +505,7 @@ def board_state(*, health: Optional[Callable] = None,
                 canvas: Optional[Callable] = None,
                 schedule: Optional[Callable] = None,
                 tasks: Optional[Callable] = None,
+                cast: Optional[Callable] = None,
                 now: Optional[float] = None) -> BoardState:
     """Compose the whole Board from injected providers (each a zero-arg
     callable, each optional, none of them allowed to sink the board).
@@ -461,7 +514,7 @@ def board_state(*, health: Optional[Callable] = None,
       turns     -> [ledger record dict]       focus    -> FocusSession
       quiet     -> QuietPolicy                presence -> PresenceSentinel
       canvas    -> [str] Canvas due lines     schedule -> [timekeeper Item]
-      tasks     -> {project slug: state}
+      tasks     -> {project slug: state}      cast     -> gesturecast.recent()
 
     Nothing here does I/O of its own: that is the caller's job, and it is
     why the whole layer unit-tests with fakes and no network.
@@ -491,7 +544,10 @@ def board_state(*, health: Optional[Callable] = None,
         focus_panel(_safe(focus, "focus")),
         quiet_panel(reason, state_word, held, configured),
     ]
-    order = {k: i for i, k in enumerate(PANEL_ORDER)}
+    thrown = cast_panel(_safe(cast, "cast"), at)
+    if thrown is not None:
+        panels.append(thrown)
+    order = {k: i for i, k in enumerate(PANEL_ORDER + OPTIONAL_PANELS)}
     panels.sort(key=lambda p: order.get(p.key, len(order)))
     return BoardState(panels=panels, at=at)
 

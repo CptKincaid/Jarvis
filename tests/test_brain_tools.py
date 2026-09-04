@@ -1180,14 +1180,18 @@ def test_a_mute_render_round_says_what_it_found(brain, monkeypatch):
 def test_the_fan_out_cap_also_answers_the_calls_it_trimmed(brain, setup):
     """MAX_TOOL_CALLS_PER_ROUND trims what RUNS; the calls it trimmed are
     in the transcript all the same, and an unanswered one is what sends
-    the next round back for more tools."""
+    the next round back for more tools.
+
+    The repeat of one call with identical arguments runs ONCE (see
+    TOOL_REPEAT_TEXT): the round no longer stops at the first authored
+    line, so a repeated call would really act a second time."""
     b, fake, record = setup
     n = brain.MAX_TOOL_CALLS_PER_ROUND + 3
     fake.replies = [tool_reply(*[("get_weather", {"when": "now"})] * n),
                     text_reply("Seventy-two and sunny, sir.")]
     tags = b._chat_sync("weather")
     assert tags == [("SPEAK", "Seventy-two and sunny, sir.")]
-    assert len(record) == brain.MAX_TOOL_CALLS_PER_ROUND
+    assert len(record) == 1, "the same call ran more than once"
     msgs = fake.chat_payloads()[1]["messages"]
     asked = sum(len(m.get("tool_calls") or []) for m in msgs)
     answered = sum(1 for m in msgs if m["role"] == "tool")

@@ -90,16 +90,20 @@ uart:
 ld2410:
   id: radar
   uart_id: ld2410_uart
-  # Part of the arrival latency budget: how often the radar's state may be
-  # republished. The default is 1 s; 250 ms costs nothing on a LAN and
-  # takes a quarter-second off "he walked in" -> "the endpoint says ON".
-  throttle: 250ms
+  # NO `throttle:` HERE. It was removed from this component upstream
+  # ("throttle has been removed; use per-sensor filters, instead" --
+  # esphome 2025.x, caught by `room_sensor.py build` on 2026-09-03), and the
+  # rate it used to set is now per-entity. That is a better fit anyway: the
+  # PRESENCE bit wants no throttle at all, because every millisecond it waits
+  # is arrival latency Jarvis pays; only the distance readouts need slowing,
+  # and they are slowed where they are declared.
 
 binary_sensor:
   - platform: ld2410
     ld2410_id: radar
     # THE ENTITY JARVIS READS. Its name is what makes the URL
-    # /binary_sensor/presence -- rename it and you must change
+    # /binary_sensor/Presence (the NAME, capital P -- web_server v2 does NOT
+    # use a lower-cased object_id) -- rename it and you must change
     # presence.room_sensor_url to match.
     #
     # has_target is PRESENCE, not motion: the LD2410 reports a still
@@ -116,12 +120,19 @@ binary_sensor:
 sensor:
   - platform: ld2410
     ld2410_id: radar
+    # These three are for YOUR eyes on the device's own web page while you
+    # decide where to mount it -- Jarvis never reads them. They update at the
+    # radar's frame rate, so they are throttled here rather than globally;
+    # the presence bit above stays unthrottled.
     moving_distance:
       name: Moving distance
+      filters: [throttle: 1s]
     still_distance:
       name: Still distance
+      filters: [throttle: 1s]
     detection_distance:
       name: Detection distance
+      filters: [throttle: 1s]
   - platform: uptime
     name: Uptime
   - platform: wifi_signal

@@ -19,10 +19,17 @@ def test_split_temps():
     assert split_temps("") == {}
 
 
-def test_fmt_mem_gb():
+def test_fmt_mem_gb_says_used_of_total_so_nobody_has_to_ask():
+    """2026-09-02, verbatim: "is that free or used?". It was USED, and
+    nothing on the strip said so -- at the compact elision level the
+    segment loses its MEM label and showed a bare '59.9 GB' on a 122 GB
+    box. The value now carries the answer at EVERY level."""
     total_kb = 128 * 1048576
     avail_kb = total_kb - int(26.8 * 1048576)
-    assert fmt_mem_gb(total_kb, avail_kb) == "26.8 GB"
+    assert fmt_mem_gb(total_kb, avail_kb) == "26.8/128 GB"
+    # the left number is the used half, and it moves
+    assert fmt_mem_gb(total_kb, total_kb) == "0.0/128 GB"
+    assert fmt_mem_gb(total_kb, 0) == "128.0/128 GB"
     assert fmt_mem_gb(0, 0) == "--"
     assert fmt_mem_gb("x", 1) == "--"
 

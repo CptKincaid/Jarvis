@@ -22,6 +22,19 @@ verdict on the same grace, and the sensor can only ever make him home
 sooner. With no URL configured the sentinel polls the same ``probe``
 function object it always did.
 
+N ROOMS, when ``presence.rooms`` is configured: the leg becomes
+``roomfabric.HouseView`` rather than one ``RoomSensor``, and ``RoomOrPhone``
+below needs no change at all -- the view wears the same
+``read() -> True | False | None`` **and the same ``blocked``**, which is
+what carries the offline-mode path below into the multi-room case (it
+shipped without one, and ``_blacked_out`` swallowed the AttributeError);
+the asymmetry above is already the right rule for three rooms as well as
+one. The fabric also publishes
+``RoomChanged``, which is what lets the app treat the KITCHEN as the front
+door (jarvis/arrival.py, app._on_room_changed). With ``presence.rooms``
+empty the singular path below runs unchanged, which is the configuration
+on this box today.
+
 OFFLINE MODE (jarvis/sensing.py) takes the radar leg away and NOTHING
 else: ``RoomSensor.read`` returns None while sensing is denied, which is
 the module's existing "no opinion" path, so the composition degrades to
@@ -70,6 +83,10 @@ DEFAULT_AWAY_POLL_S = 10.0     # see the poll_s docstring: arrival must be promp
 PING_TIMEOUT_S = 3.0
 PRESENT_STATES = ("REACHABLE", "DELAY", "PERMANENT")
 WELCOME_LINE = "Welcome back, sir."
+
+# A leg that does not answer "are you blocked?" at all, told apart from
+# one that answers "no". See PresenceSentinel._blacked_out.
+_MISSING = object()
 
 _NEIGH_RX = re.compile(
     r"^(?P<ip>\S+)\s+dev\s+(?P<dev>\S+)(?:\s+lladdr\s+(?P<mac>[0-9a-f:]+))?"
@@ -171,6 +188,33 @@ def _make_sensor(cfg, policy=None):
     return sensor
 
 
+def _make_fabric(cfg, policy=None):
+    """The MULTI-ROOM leg (jarvis/roomfabric.py), or None. Never raises.
+
+    Built only when ``presence.rooms`` is a non-empty list, so a config
+    written for one radar takes the single-sensor path above byte for byte
+    and this feature cannot regress the box that is live today.
+
+    Two things come with it, and the second is the point. ``HouseView``
+    wears ``RoomSensor``'s interface, so ``RoomOrPhone`` composes the whole
+    house exactly as it composed one room -- any room seeing him beats a
+    sleeping phone, no room seeing him never beats a phone that answers.
+    And the fabric publishes ``RoomChanged``, which is what makes the
+    KITCHEN a door sensor: the app greets on that event after a whole-home
+    absence (app._on_room_changed), rather than waiting for the phone's
+    radio to answer an ARP.
+    """
+    raw = _cfg_get(cfg, "presence.rooms", None)
+    if not isinstance(raw, (list, tuple)) or not raw:
+        return None
+    try:
+        from jarvis import roomfabric
+        return roomfabric.build(cfg, policy=policy, publish=bus.publish)
+    except Exception:  # noqa: BLE001 - a broken fabric may not cost the phone
+        log.exception("presence: the room fabric could not be built")
+        return None
+
+
 class RoomOrPhone:
     """``(ip, mac) -> True | False | None`` -- the two legs, composed.
 
@@ -221,6 +265,11 @@ def make_probe(sensor, phone: Callable = probe) -> Callable:
 class PresenceSentinel:
     """See the module docstring. ``state`` is 'home' | 'away' | 'unknown'."""
 
+    # The leg-and-reason already named in the unreadable-`blocked` ERROR
+    # (see _warn_no_blocked). A class default so a sentinel built by a test
+    # with object.__new__ still answers the question.
+    _no_blocked_warned = ""
+
     def __init__(self, cfg, publish: Callable = bus.publish,
                  probe_fn: Optional[Callable] = None,
                  now: Callable[[], float] = time.time, poll_s: Optional[float] = None,
@@ -229,8 +278,14 @@ class PresenceSentinel:
         self._publish = publish
         # The room sensor is composed IN here rather than wired in app.py:
         # probe_fn was always the injection point, and an explicit one
-        # (every test) still wins outright.
-        self.sensor = _make_sensor(cfg, policy)
+        # (every test) still wins outright. With presence.rooms configured
+        # the whole FABRIC is the leg and the singular sensor is not built
+        # at all -- two owners polling one ESP32 would double its traffic
+        # and race the breaker's counters for nothing (roomfabric.HouseView
+        # says the same about its own two callers).
+        self.fabric = _make_fabric(cfg, policy)
+        self.sensor = (self.fabric.house_view() if self.fabric is not None
+                       else _make_sensor(cfg, policy))
         self._probe = probe_fn if probe_fn is not None else make_probe(self.sensor)
         self._now = now
         self._poll_s = poll_s
@@ -353,15 +408,60 @@ class PresenceSentinel:
         30 s and holding the last verdict across it is correct. Offline mode
         lasts until he says otherwise, and there is no honest way to keep
         answering a question nothing has been able to observe for hours.
+
+        A LEG THAT CANNOT SAY WHETHER IT IS BLOCKED IS LOUD -- however it
+        fails to say it. This is the privacy path, and it has now gone
+        quiet twice in two different ways. First the whole read sat inside
+        a bare ``except Exception`` logged at debug, so when the multi-room
+        leg arrived without the attribute (2026-09-03) the AttributeError
+        was swallowed and the dark-safe path simply stopped existing.
+        Then the fix made a MISSING ``blocked`` loud and left the OTHER
+        branch of its own ``if`` exactly as it was: a ``blocked`` that
+        RAISED -- an unreadable policy file, a bug in a future leg -- was
+        still caught, still debug, still silent. Same bug, other half.
+
+        So there is no longer a branch to forget. One ``try`` asks the leg
+        the question; ANY answer that is not a usable one -- the attribute
+        absent, the property raising, the value refusing ``bool()`` -- is
+        the same event, reported at ERROR by ``_warn_no_blocked`` with the
+        leg and the reason named. It still returns False (inventing
+        "blacked out" from a broken leg would blank presence on every bug)
+        but it can no longer do so quietly, and the ERROR is said ONCE per
+        leg-and-reason: ``poll_s`` is 60 s, and one line an hour for ever
+        is how a real error gets filtered out of a log.
+
+        Caught, not raised, either way. ``tick()`` has no guard of its own
+        (only ``_loop`` does), so an exception escaping here costs the
+        whole poll -- this blackout's own ``_forget()`` included.
         """
         if self.phone_ip or self.phone_mac:
             return False
         sensor = self.sensor
-        try:
-            return bool(sensor is not None and sensor.blocked)
-        except Exception:  # noqa: BLE001 - provider boundary
-            log.debug("presence: sensor block check failed", exc_info=True)
+        if sensor is None:
             return False
+        try:
+            blocked = getattr(sensor, "blocked", _MISSING)
+            if blocked is _MISSING:
+                raise AttributeError("the leg has no `blocked`")
+            return bool(blocked)
+        except Exception as exc:  # noqa: BLE001 - provider boundary
+            self._warn_no_blocked(type(sensor).__name__, exc)
+            return False
+
+    def _warn_no_blocked(self, leg: str, exc: BaseException) -> None:
+        """The unreadable-``blocked`` ERROR, once per leg and reason.
+
+        Keyed on the reason as well as the leg so a leg that starts
+        failing a NEW way says so, while the one that is simply wired
+        wrong stays one line rather than one a minute.
+        """
+        key = "%s/%s" % (leg, type(exc).__name__)
+        if getattr(self, "_no_blocked_warned", "") == key:
+            return
+        self._no_blocked_warned = key
+        log.error("presence: the %s leg cannot say whether it is blocked "
+                  "(%s: %s), so offline mode cannot reach the sentinel; "
+                  "holding the last verdict", leg, type(exc).__name__, exc)
 
     def _forget(self) -> None:
         """Back to "no opinion", without publishing a transition.
@@ -383,6 +483,18 @@ class PresenceSentinel:
             self.last_seen, self._started_at = None, None
 
     # ------------------------------------------------------------ thread
+    def _fabric_call(self, what: str) -> None:
+        """start / stop the room fabric, if there is one. The sentinel owns
+        its leg's thread the way it owns its own: a fabric left running
+        after stop() would keep three ESP32s polled into the teardown."""
+        fn = getattr(self.fabric, what, None)
+        if not callable(fn):
+            return
+        try:
+            fn()
+        except Exception:  # noqa: BLE001 - the sentinel still runs without it
+            log.exception("presence: room fabric %s failed", what)
+
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
             return
@@ -390,6 +502,10 @@ class PresenceSentinel:
             log.info("presence: no phone_ip / phone_mac / room sensor configured; "
                      "sentinel idle")
             return
+        # BEFORE the sentinel's own thread: the fabric's 2 s cadence is what
+        # notices the door, and its first RoomChanged should not have to
+        # wait on a 60 s phone poll.
+        self._fabric_call("start")
         self._stop.clear()
         self._thread = threading.Thread(target=self._loop, name="presence",
                                         daemon=True)
@@ -397,6 +513,7 @@ class PresenceSentinel:
 
     def stop(self) -> None:
         self._stop.set()
+        self._fabric_call("stop")
         t = self._thread
         if t is not None and t is not threading.current_thread():
             t.join(timeout=2.0)

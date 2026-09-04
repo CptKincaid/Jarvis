@@ -158,9 +158,21 @@ Passwords section).
 "gmail": {"address": "<you@gmail.com>", "app_password": "<16-char-app-password>", "imap_host": "imap.gmail.com"}
 ```
 
-Jarvis only reads: `SELECT INBOX` read-only, `BODY.PEEK`, so nothing is
-marked read and nothing is sent. Message bodies are never logged. A Google
+Reading is read-only by construction: `SELECT INBOX` read-only, `BODY.PEEK`,
+so nothing is ever marked read. Message bodies are never logged. A Google
 Workspace account uses the same host.
+
+Jarvis can also **send** a file (section 81 below). Sending uses the same
+app password over SMTP and adds one key:
+
+```json
+"gmail": {"address": "<you@gmail.com>", "app_password": "<16-char-app-password>",
+          "imap_host": "imap.gmail.com", "smtp_host": "smtp.gmail.com"}
+```
+
+Leave `smtp_host` out and it is worked out from `imap_host`
+(`imap.x` -> `smtp.x`). Nothing is ever sent without you saying yes out
+loud first.
 
 ## 6. Discord (away alerts, two-way)
 
@@ -3903,3 +3915,299 @@ in your network:
 * Answers are slow the first time and quick after: read the line the page
   prints when the link is the slow half. See "Why is the first question
   slow?" above — it is the tailnet finding a direct path, not Jarvis.
+
+
+## 81. Emailing a file: "email the lab report to Heather"
+
+Say it the way you would say it to a person:
+
+```
+"Jarvis, email the lab report to Heather"
+"send the PDF I just downloaded to my brother"
+"email that file on my desktop to heather@example.com from my school account"
+"send Heather the biosensors handout"
+```
+
+**Nothing is sent by the first sentence.** Jarvis finds the file, works out
+who you mean and which of your accounts to use, and then reads the whole
+thing back:
+
+> "Biosensors Lab Handout v2.pdf, 5 kilobytes, to Heather, at heather at
+> example dot com, from your school account. Send it, sir?"
+
+Say **yes** (or "send it", "go ahead", "do it") and it goes. Say **no**
+(or "not that one", "wrong file", "hold on") and it is dropped. Say
+anything else — change the subject, ask a different question — and the draft
+is thrown away and your sentence keeps its own meaning. A vague "okay" or
+"sure" gets asked once more rather than obeyed: this is the one question in
+the app where "probably yes" is not enough, because an email cannot be
+recalled.
+
+### When it asks instead of guessing
+
+| What happened | What you hear |
+|---|---|
+| Two files fit the name | "I've 2 that could be the lab report, sir: lab report.pdf or lab report final.pdf. Which one?" |
+| Nothing fits | "I can't find a file by that name, sir." |
+| You did not name a file at all | "Which file, sir?" |
+| The person is not in the book | "I've no address for Dana, sir. What is it?" |
+| More than one account, and you did not say which | "Which account should I send from, sir — personal, work or school?" |
+
+It never guesses an address from a name, and it never picks between two
+files that fit equally well.
+
+**"Which one?" is a real question and it waits for you.** Answer it with an
+ordinal ("the second one", "the first one", "the last one", "the other
+one") or with the name itself ("the final one", "lab report final") and
+Jarvis reads that file back for the usual yes. Say "neither" and it is
+dropped. The microphone stays open for the answer, as it does for every
+other question he asks. Choosing a file confirms nothing: the read-back
+still has to be answered — and repeating the phrase that was ambiguous in
+the first place gets the question again, never a guess at which of the two
+you meant.
+
+**A yes has to come from where the question was asked.** The read-back is
+spoken at the desk, so it is answered at the desk — by voice or by typing
+into the same window. A "yes" arriving from Discord, the phone client, a
+`jarvis "..."` in a terminal or the socket never heard the question and
+sends nothing; the draft is left where it is, waiting for you.
+
+**Naming the account takes a word, not a letter.** "from my school account"
+works, and so does "sch"; a single letter does not, and neither does the
+local part of the address on its own. An unrecognised hint gets a question
+("I've no s account, sir."), never the nearest identity — sending as the
+wrong one of your three is as irreversible as sending to the wrong person.
+
+### When it refuses
+
+* the file is a folder, is unreadable, or has gone;
+* it is over **18 MB** — Gmail will not carry more once the attachment is
+  encoded, so a bigger limit would only turn a spoken refusal into a bounce
+  after Jarvis had already said it went;
+* the name resolves **outside** `~/Desktop`, `~/Downloads` and
+  `~/Documents` — a symlink on the desktop pointing somewhere else is
+  refused, not followed;
+* an explicit path you give outright (`~/projects/thesis.pdf`) **is**
+  allowed outside those folders, but never into a dot-folder (`~/.ssh`,
+  `~/.gnupg`, `~/.config`) or a system tree (`/etc`, `/usr`, ...).
+
+### Configuration
+
+```json
+"send_file": {
+  "roots": ["~/Desktop", "~/Downloads", "~/Documents"],
+  "max_mb": 18,
+  "from": "",
+  "contacts": {"heather": "heather@example.com", "brother": "sam@example.com"},
+  "body": "Sent from Jarvis."
+}
+```
+
+* `roots` — the only folders a spoken file *name* may resolve inside.
+* `max_mb` — may only be lowered; 18 is the Gmail ceiling.
+* `from` — a label from `gmail.accounts`. Leave it blank with more than one
+  account and Jarvis asks which identity to send as, which is usually what
+  you want: personal, work and school are three different people to whoever
+  receives the mail.
+* `contacts` — a plain name-to-address map, checked before the people book
+  ("my advisor is Dr Peyrovi"). Both are consulted; neither is guessed at.
+
+### Things it deliberately will not do
+
+* **Texts and calls.** Out of scope by decision, not by omission —
+  "send Heather a text" is recognised and left alone.
+* **Reply, forward, delete.** This makes a new message with an attachment
+  and nothing else.
+* **Anything the model decides.** There is no tool the local model can call
+  to send mail; the only path is a sentence you said and a yes you gave.
+
+Restart Jarvis after editing `assistant.json`, as with every other setting.
+
+
+## 82. HPCOMPUTER: files both ways, and no shell
+
+The other machine. Five things can be said to it and no more:
+
+```
+"put the lab report on HPCOMPUTER"          a file goes over
+"get the report from HPCOMPUTER"            a file comes back
+"is HPCOMPUTER up"                          reachability
+"what's the disk on HPCOMPUTER"             one row of a fixed question list
+"run the build on HPCOMPUTER"               refused, out loud
+```
+
+Both transfers are **read back and confirmed**, with the same strict answer
+grammar the email lane uses — a passing "yeah" in a longer sentence does
+not count, "sure" is asked again rather than obeyed, and the yes has to
+come from the channel the question was asked on. A file on another machine
+cannot be taken back any more than an email can.
+
+The last line is the point of the lane: there is no path from speech to a
+shell on that box. "Delete the logs on the HP" and "delete the block on the
+HP" differ by one phoneme and only one of them is recoverable, so neither
+runs. A sentence that merely mentions the machine ("the build failed on the
+HP", "did you install anything on the HP") is left alone and goes to the
+model — the refusal only fires on an actual imperative.
+
+### Configuration
+
+```json
+"remote": {
+  "enabled": false,
+  "host": "",
+  "user": "",
+  "key_path": "",
+  "name": "HPCOMPUTER",
+  "socks_proxy": "127.0.0.1:1055",
+  "inbox": "~/jarvis-inbox",
+  "pull_dirs": {"outbox": "~/jarvis-outbox",
+                "desktop": "~/Desktop",
+                "downloads": "~/Downloads"},
+  "max_mb": 100
+}
+```
+
+* `enabled` ships **false**, and every door says exactly what is missing
+  rather than opening a socket to find out.
+* `host` is HPCOMPUTER's tailnet name, `user` the account there, `key_path`
+  a key **ssh already owns** — Jarvis never reads it, only hands over its
+  path, so no new secret enters `assistant.json`.
+* `socks_proxy` is not a preference. tailscaled on the Spark runs
+  `--tun=userspace-networking`, so there is no route to the tailnet at all
+  and everything goes through the daemon's own SOCKS5 port. Blank it only
+  if this box ever gets a real tun device.
+* `inbox` is the **only** folder a push can land in, and `pull_dirs` the
+  only ones a pull may read. Speech never names a remote path: the spoken
+  words pick a *key* ("desktop"), never a directory.
+* The paths may start with `~`; Jarvis writes them the two different ways
+  the far side needs (`$HOME` for a shell, home-relative for scp). Do not
+  quote them yourself.
+* A local file whose *name* contains a shell character (a backtick, a
+  semicolon, a newline) is refused rather than escaped, in both directions.
+
+Restart Jarvis after editing `assistant.json`.
+
+## 83. Grab and throw: reach at the lens, close your hand, fling it
+
+His words, 2026-09-03: *"lets have a gesture added where i basically reach
+out and grab at the screen (in the air) where the camera is and then gesture
+towards almost throwing the cast onto the HPCOMPUTER."*
+
+It ships **off**, and it rides the camera preview (§ the Privacy section of
+the settings drawer): the hand stage runs *inside* the preview's own capture,
+on the frame the pane already pulled, so there is no second camera handle, no
+second thread, and every way the preview shuts — the curfew, offline mode,
+standby, the toggle, quit — shuts this too. The two hand models are the
+opencv_zoo MediaPipe palm detector and hand-landmark graphs (Apache-2.0),
+sha-verified under `~/.aiws_trainer/models/hand`; nothing here leaves the
+box and no frame is ever written or logged.
+
+### Turning it on
+
+Settings → Privacy: switch **Camera preview** on, then **Grab and throw**.
+Or in `~/.config/jarvis/assistant.json`:
+
+```json
+"camera":  {"preview": true},
+"gesture": {"enabled": true}
+```
+
+Restart after a file edit, as always. Then say nothing — do it:
+
+1. **Reach** at the lens with an open hand. He resolves what you are about
+   to pick up while your hand is still on its way (a document you just had
+   explained, the track that is playing, else the window in front of you),
+   so the grab is instant.
+2. **Close your hand** and hold it still for a third of a second. You hear
+   the *heard-you* tone first, a chip appears in the console header with
+   the name, and he says: **"Holding the thesis draft, sir."** (set
+   `gesture.speak_grab` false for tone-and-chip only). With nothing in front
+   of him there is no carry: one *held-back* tone, and only a second empty
+   grab inside ten seconds earns **"I've nothing in hand, sir."**
+3. **Fling it left or right** and open your hand. The chip slides that way
+   and the throw lands:
+   * on **the board** (the Spark's own docked panel — a CAST slab appears
+     on it, the *done* tone plays, and if the console is not on top he says
+     **"On the board, sir."**). Until you have taught him a side, *every*
+     throw goes here and he tells you once: **"That went to the board, sir.
+     Tell me which side HPCOMPUTER is on and I'll send it there."**
+   * on **HPCOMPUTER**, once taught — and today that is **held**, out loud,
+     with the live reason: **"HPCOMPUTER isn't answering, sir — no port
+     answered. I've kept it here."** (a repeat inside a minute: **"Still
+     nothing listening, sir."**). The *warning* tone plays and the payload
+     falls back to the board so you are not left holding it. The one thing
+     that *does* reach it is a playing Spotify track: **"Blue in Green, on
+     HPCOMPUTER, sir."**
+4. **Put it down** any of four ways: open your hand where it is, pull it
+   back still closed, say **"drop it"** / **"put it down"**, or wait eight
+   seconds. Each is the *held-back* tone and the chip reads *dropped*. A
+   fling at the desk is a cancel too. Any other sentence you say while
+   carrying puts it down quietly — a sentence outranks a gesture.
+
+Nothing irreversible happens on a wave. A sink that needs a read-back (the
+handoff page, and the SSH push once it exists) is only *proposed* — **"The
+thesis draft to the page, sir. Shall I send it?"** — and runs on your spoken
+yes inside a minute, the same machinery as a bulk cancel.
+
+### The same verbs by voice, camera off
+
+| say | he |
+| --- | --- |
+| "throw this on HPCOMPUTER" / "put it on the board" / "cast this to the pc" | resolves the subject now (or takes the one you are carrying) and casts it |
+| "drop it" / "put that down" / "let go" | **"Put down, sir."** — or **"I've nothing in hand, sir."** |
+| "what am I holding" / "what's in your hand" | **"Holding the thesis draft, sir."** |
+| "HPCOMPUTER is on my right" / "the left is the board" | **"Right is HPCOMPUTER from now on, sir."** — written to `gesture.sinks` |
+| "which side is HPCOMPUTER on" | **"HPCOMPUTER is on your right, sir."** or how to teach it |
+
+Targets he knows: `hpcomputer` (also "the pc", "the desktop", "the Windows
+machine"), `board` ("the board", "the spark", "my screen") and `handoff`
+("the page"). Anything else: **"I don't know a target called the fridge,
+sir."**
+
+### Which side is HPCOMPUTER?
+
+Nobody but you can see the room, so the direction map **ships empty**. One
+sentence fixes it once: *"HPCOMPUTER is on my right."* Teaching a side
+*moves* a machine, never doubles it.
+
+### What HPCOMPUTER can actually catch today (measured 2026-09-03)
+
+`192.168.50.114` answers ARP (REACHABLE: powered on, on the LAN), ping is
+100% loss, and none of 22/445/3389/5900/8008/2343 answers (00:45); 22/445/
+3389 again at 02:40 and 07:21 — a Windows firewall dropping every inbound
+packet. It is not on the tailnet. So a thrown file or screen is **held** and
+said so; a track lands by Spotify's own outbound connection. The unblocks,
+in order, are in `scratchpad/ideas/cast-target.md`: OpenSSH Server on
+HPCOMPUTER (user `h2pey`, key `~/.ssh/hpcomputer`, then `ssh hpcomputer
+whoami`), or `phone.enabled` on so the Spark serves a handoff page it can
+fetch. The SSH transport is a seam (`HpcomputerSink(transport=...)`) with
+nothing behind it until it can be tested against the real host.
+
+### Every number is a starting point
+
+The thresholds in `gesture` (fist/open bars, the reach ratio, the dwell in
+frames, the throw distances in hand-units, the 8 s carry cap) were measured
+on a synthetic hand with the LifeCam's own lens constants — never on his
+hand. The self-check prints what his hand actually measures, as numbers
+only, and shows or saves nothing:
+
+```bash
+~/vss_env/bin/python scripts/gesture_selfcheck.py --seconds 30
+```
+
+Two guesses are named in the config comments: the hand-to-face anthropometry
+behind the reach ratio (±15% on him) and the 3 s attention latch. The frame
+counters follow the rate the camera *delivers* (~7.5 fps), not the
+`preview_fps` you asked for.
+
+### If it does not fire
+
+* Settings → Privacy: both switches on, and the sensing badge reads SENSING
+  (not CAMERA OFF / OFFLINE). The console must be active — the preview stops
+  in ambient and standby.
+* `grep "gesture" /tmp/vss_voice/jarvis.log` — "no hand tracker" names the
+  missing model file; "hand tracker ready" means it loaded.
+* Look at the lens for a moment first: attention is latched for 3 s and the
+  face baseline needs three detections in the last five seconds.
+* One hand. Two hands out at the lens is not this gesture, on purpose.
+* A question on the floor (a read-back waiting on your yes) blocks a grab.

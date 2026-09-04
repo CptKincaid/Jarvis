@@ -62,6 +62,28 @@ log = get_logger("visionrig")
 DETECT_COLS = 15
 IDX_SCORE = 14
 IDX_EYE_R, IDX_EYE_L, IDX_NOSE = 4, 6, 8
+IDX_MOUTH_R, IDX_MOUTH_L = 10, 12
+
+# THE MOUTH IS BELOW THE EYES. Anatomy, not a tuning parameter, and the one
+# thing a hallucinated row cannot honour by construction. Measured in units of
+# the interocular distance along the FACE's own down axis (so a rolled head is
+# not a rejected head); a real face lands around 1.1-1.6. This floor sits far
+# below any face and catches only the impossible.
+#
+# WHY IT EXISTS: landmark_geometry called a row good whenever the two eye
+# landmarks were not literally identical (eye_px < 1e-6). Nothing else was
+# checked, so a detector firing on a closed FIST above camera.min_conf 0.6 was
+# accepted as a face, drawn as one and counted as one -- it only lost its yaw
+# opinion. Hunter hit exactly that in the preview on 2026-09-03.
+MOUTH_DROP_MIN_U = 0.15
+
+# The interocular distance over the detector's own box width. A frontal face is
+# around 0.38 and yaw shrinks it by cos(yaw). It is a strong signal against a
+# hallucinated row, but NOTHING IS BOUNDED ON IT HERE: the distribution has not
+# been measured on his cameras, and a floor guessed from the literature would
+# start rejecting real profile views with no way to see that it had. It is
+# reported on every observation so it can be calibrated from his own numbers.
+EYE_BOX_RATIO_UNMEASURED = None
 
 # YuNet's documented working range starts around 10 px across. At detect
 # width 320 the LifeCam puts a 16 cm face at 95 cm at 42 px and the 90 deg
@@ -137,6 +159,10 @@ def landmark_geometry(row: Sequence[float]) -> tuple:
 
     ``ok`` is False when the two eye landmarks coincide -- a degenerate row
     from a bad detection, where every downstream angle would be invented.
+
+    This is the ANGLE half only: an angle can be perfectly well defined on a
+    row that is not a face at all. Whether it is face-SHAPED is
+    ``landmark_plausibility``, and ``observe`` requires both.
     """
     ex = float(row[IDX_EYE_L]) - float(row[IDX_EYE_R])
     ey = float(row[IDX_EYE_L + 1]) - float(row[IDX_EYE_R + 1])
@@ -196,6 +222,51 @@ class FaceObservation:
     roll_deg: float
     eye_px: float
     landmarks_ok: bool
+    # Reported for calibration, bounding nothing. Defaulted so any older
+    # construction of this object keeps working.
+    eye_box_ratio: float = 0.0
+    mouth_drop_u: float = 0.0
+
+
+def landmark_plausibility(row: Sequence[float]) -> tuple:
+    """``(eye_box_ratio, mouth_drop_u, ok)`` -- is this row shaped like a face?
+
+    Pure geometry over the five landmarks. No image is read, so it is testable
+    on synthetic rows and needs no camera and no permission.
+
+    ``mouth_drop_u`` is the mouth midpoint's displacement from the eye
+    midpoint, projected onto the face's OWN down axis and divided by the
+    interocular distance. The down axis is the interocular direction turned a
+    quarter turn, which is what makes the number roll-invariant: a head tilted
+    40 degrees has the same mouth drop as an upright one, where a naive
+    image-y comparison would not.
+    """
+    ex = float(row[IDX_EYE_L]) - float(row[IDX_EYE_R])
+    ey = float(row[IDX_EYE_L + 1]) - float(row[IDX_EYE_R + 1])
+    eye_px = math.hypot(ex, ey)
+    box_w = float(row[2])
+    ratio = (eye_px / box_w) if box_w > 1e-6 else 0.0
+    if eye_px < 1e-6:
+        return ratio, 0.0, False
+    ux, uy = ex / eye_px, ey / eye_px
+    # Image coordinates grow downward, so (ux, uy) -> (-uy, ux) points from the
+    # eye line toward the chin at any roll.
+    dnx, dny = -uy, ux
+    eye_mx = (float(row[IDX_EYE_L]) + float(row[IDX_EYE_R])) / 2.0
+    eye_my = (float(row[IDX_EYE_L + 1]) + float(row[IDX_EYE_R + 1])) / 2.0
+    mr = (float(row[IDX_MOUTH_R]), float(row[IDX_MOUTH_R + 1]))
+    ml = (float(row[IDX_MOUTH_L]), float(row[IDX_MOUTH_L + 1]))
+    if mr == (0.0, 0.0) or ml == (0.0, 0.0):
+        # NO MOUTH WAS REPORTED, so there is nothing to disbelieve. Absent
+        # evidence is not evidence of a fist: refusing here would be the same
+        # error as reading an unreachable sensor as "nobody there". A real
+        # five-point row always fills these; a row that does not is a partial
+        # detector or a hand-built fixture, and both get the benefit of the
+        # doubt with a drop of 0.0 recorded so the abstention is visible.
+        return ratio, 0.0, True
+    mouth_mx, mouth_my = (ml[0] + mr[0]) / 2.0, (ml[1] + mr[1]) / 2.0
+    drop = ((mouth_mx - eye_mx) * dnx + (mouth_my - eye_my) * dny) / eye_px
+    return ratio, drop, bool(drop >= MOUTH_DROP_MIN_U)
 
 
 def observe(row: Sequence[float], lens, scale_x: float, scale_y: float,
@@ -212,6 +283,9 @@ def observe(row: Sequence[float], lens, scale_x: float, scale_y: float,
     w, h = float(row[2]) * scale_x, float(row[3]) * scale_y
     cx, cy = x + w / 2.0, y + h / 2.0
     t, roll, eye_px, ok = landmark_geometry(row)
+    # BOTH halves: two knuckle shadows make a perfectly good "interocular axis".
+    eye_box_ratio, mouth_drop_u, shaped = landmark_plausibility(row)
+    ok = bool(ok and shaped)
     return FaceObservation(
         conf=conf, x=x, y=y, w=w, h=h, cx=cx, cy=cy,
         detect_px=float(row[2]), face_px=w,
@@ -221,7 +295,8 @@ def observe(row: Sequence[float], lens, scale_x: float, scale_y: float,
         # wrong for no gain.
         elevation_deg=lens.offset_deg(cy - lens.height_px / 2.0),
         yaw_t=t, yaw_deg=head.yaw_deg(t) if ok else 0.0,
-        roll_deg=roll, eye_px=eye_px * scale_x, landmarks_ok=ok)
+        roll_deg=roll, eye_px=eye_px * scale_x, landmarks_ok=ok,
+        eye_box_ratio=eye_box_ratio, mouth_drop_u=mouth_drop_u)
 
 
 # --------------------------------------------------------- the attention cone
@@ -344,6 +419,18 @@ class RigReport:
     id_cosine_min: float = 0.0
     id_cosine_p50: float = 0.0
     id_cosine_max: float = 0.0
+    # The GALLERY leg: the same embedding asked "is this him" rather than "is
+    # this the same face as a moment ago". Zero everywhere when no identifier
+    # was supplied, which is the state until he has enrolled.
+    gallery_enrolled: int = 0
+    gallery_match_min: float = 0.0
+    id_matched_frames: int = 0
+    id_unknown_frames: int = 0
+    id_gated_out: int = 0
+    match_min_score: float = 0.0
+    match_p50: float = 0.0
+    match_max: float = 0.0
+    match_ms_p50: float = 0.0
     checks: tuple = ()
 
     @property
@@ -394,6 +481,16 @@ class RigReport:
             out.append("identity   %d pairs  cosine min %.3f p50 %.3f max %.3f"
                        % (self.id_pairs, self.id_cosine_min,
                           self.id_cosine_p50, self.id_cosine_max))
+        if self.gallery_enrolled or self.id_matched_frames or \
+                self.id_unknown_frames:
+            out.append("gallery    %d enrolled  %d matched  %d unknown  "
+                       "%d under the detector bar  %.1fms p50"
+                       % (self.gallery_enrolled, self.id_matched_frames,
+                          self.id_unknown_frames, self.id_gated_out,
+                          self.match_ms_p50))
+            out.append("match      min %.3f  p50 %.3f  max %.3f  against "
+                       "%.3f" % (self.match_min_score, self.match_p50,
+                                 self.match_max, self.gallery_match_min))
         for check in self.checks:
             mark = "n/a " if check.ok is None else ("PASS" if check.ok
                                                     else "FAIL")
@@ -482,6 +579,8 @@ class _Acc:
     level: list = field(default_factory=list)
     contrast: list = field(default_factory=list)
     cosine: list = field(default_factory=list)
+    match: list = field(default_factory=list)
+    ident_id: list = field(default_factory=list)
 
 
 class Rig:
@@ -497,17 +596,26 @@ class Rig:
     all, the reason is carried into the report, and ``ok`` is False. A rig
     that quietly reported "0 faces, all good" with no weights on disk would
     be the VSS bug with a new name.
+    ``identifier`` is a ``jarvis.eye.FaceIdentifier`` -- the enrolled gallery,
+    asked "is this him". It is separate from ``recogniser`` because the two
+    ask different questions: the recogniser leg measures whether consecutive
+    frames of the SAME sitting agree (a stability measurement that needs no
+    enrolment), the identifier leg measures whether the person in the chair
+    matches the gallery on disk. Passing both computes two embeddings per
+    frame, which is ~20 ms and is what a bring-up run wants; production passes
+    one.
     """
 
     def __init__(self, source, detector, lens, thresholds: Thresholds, *,
                  recogniser=None, head: Optional[HeadModel] = None,
-                 detector_reason: str = "",
+                 detector_reason: str = "", identifier=None,
                  now: Callable[[], float] = time.monotonic):
         self.source = source
         self.detector = detector
         self.lens = lens
         self.thresholds = thresholds
         self.recogniser = recogniser
+        self.identifier = identifier
         self.head = head or HeadModel()
         self.detector_reason = detector_reason
         self._now = now
@@ -610,25 +718,40 @@ class Rig:
             # "same person" bar (jarvis/facemodels.py) -- so the embedding is
             # not a second opinion on whether this is a face and must never
             # be computed from one that did not already clear min_conf.
-            if self.recogniser is not None and best is not None and \
+            if (self.recogniser is not None or self.identifier is not None) \
+                    and best is not None and \
                     best.conf >= self.thresholds.min_conf:
-                t3 = self._now()
-                try:
-                    vec = self.recogniser.embed(
-                        frame, rows[int(np.argmax([r[IDX_SCORE]
-                                                   for r in rows]))])
-                except Exception as exc:  # noqa: BLE001
-                    rep.errors += 1
-                    if not rep.reason:
-                        rep.reason = "recogniser: %s" % exc
-                    vec = None
-                acc.ident.append((self._now() - t3) * 1000.0)
-                if vec is not None:
-                    if ref is None:
-                        ref = np.asarray(vec, dtype=np.float32).ravel()
+                row = rows[int(np.argmax([r[IDX_SCORE] for r in rows]))]
+                if self.recogniser is not None:
+                    t3 = self._now()
+                    try:
+                        vec = self.recogniser.embed(frame, row)
+                    except Exception as exc:  # noqa: BLE001
+                        rep.errors += 1
+                        if not rep.reason:
+                            rep.reason = "recogniser: %s" % exc
+                        vec = None
+                    acc.ident.append((self._now() - t3) * 1000.0)
+                    if vec is not None:
+                        if ref is None:
+                            ref = np.asarray(vec, dtype=np.float32).ravel()
+                        else:
+                            acc.cosine.append(_cosine(
+                                np.asarray(vec, dtype=np.float32).ravel(),
+                                ref))
+                if self.identifier is not None:
+                    # The gallery leg. ``identify`` re-checks the same
+                    # confidence bar underneath this branch: identity may
+                    # never be computed from a detection that did not clear
+                    # it, and that rule does not get to depend on the caller.
+                    t4 = self._now()
+                    label, score = self.identifier.identify(frame, row)
+                    acc.ident_id.append((self._now() - t4) * 1000.0)
+                    if label:
+                        rep.id_matched_frames += 1
+                        acc.match.append(float(score))
                     else:
-                        acc.cosine.append(_cosine(
-                            np.asarray(vec, dtype=np.float32).ravel(), ref))
+                        rep.id_unknown_frames += 1
             frame = None            # the frame does not outlive its iteration
             if interval_s:
                 time.sleep(interval_s)
@@ -669,6 +792,15 @@ class Rig:
         rep.id_cosine_min = min(acc.cosine) if acc.cosine else 0.0
         rep.id_cosine_p50 = _pct(acc.cosine, 0.50)
         rep.id_cosine_max = max(acc.cosine) if acc.cosine else 0.0
+        rep.match_min_score = min(acc.match) if acc.match else 0.0
+        rep.match_p50 = _pct(acc.match, 0.50)
+        rep.match_max = max(acc.match) if acc.match else 0.0
+        rep.match_ms_p50 = _pct(acc.ident_id, 0.50)
+        if self.identifier is not None:
+            st = self.identifier.status()
+            rep.gallery_enrolled = int(st.get("enrolled", 0))
+            rep.gallery_match_min = float(st.get("match_min", 0.0))
+            rep.id_gated_out = int(st.get("gated_out", 0))
 
     def _checks(self, rep: RigReport) -> list:
         th = self.thresholds
@@ -725,4 +857,25 @@ class Rig:
                              "%d pairs, cosine p50 %.3f against %.3f"
                              % (rep.id_pairs, rep.id_cosine_p50,
                                 th.identity_min)))
+        if self.identifier is not None:
+            seen = rep.id_matched_frames + rep.id_unknown_frames
+            if not rep.gallery_enrolled:
+                out.append(Check("gallery", None,
+                                 "nothing enrolled -- run "
+                                 "scripts/face_enrol.py"))
+            elif not seen:
+                out.append(Check("gallery", None,
+                                 "%d embeddings enrolled, but no detection "
+                                 "cleared the %.2f bar to be identified from"
+                                 % (rep.gallery_enrolled, th.min_conf)))
+            else:
+                out.append(Check(
+                    "gallery", rep.id_matched_frames > rep.id_unknown_frames,
+                    "%d of %d identified frames matched the gallery at "
+                    "cosine p50 %.3f (min %.3f) against a %.3f bar; %d "
+                    "detections were under the %.2f detector bar and had no "
+                    "embedding computed at all"
+                    % (rep.id_matched_frames, seen, rep.match_p50,
+                       rep.match_min_score, rep.gallery_match_min,
+                       rep.id_gated_out, th.min_conf)))
         return out

@@ -440,3 +440,43 @@ def test_a_raising_close_hook_does_not_leave_the_board_half_closed():
                             on_close=boom)
     ui_board.BoardWindow.hide(shell)     # Tk's WM handler must not see it
     assert shell._visible is False
+
+
+# ----------------------------------------------------------- the cast slab
+def _thrown(**kw):
+    base = dict(status="landed", spoken="the thesis draft", target="the board",
+                kind="screen", by="gesture", at=990.0)
+    base.update(kw)
+    return base
+
+
+def test_the_cast_slab_appears_only_after_a_throw_and_ages_out():
+    assert "cast" not in board.board_state(now=1000.0).keys
+    st = board.board_state(cast=lambda: _thrown(), now=1000.0)
+    assert st.keys == board.PANEL_ORDER + ("cast",)
+    p = st.get("cast")
+    assert ("STATUS", "LANDED") in p.rows and ("WHAT", "the thesis draft") in p.rows
+    assert ("TO", "THE BOARD") in p.rows and p.tone == "ok"
+    assert "the thesis draft" in p.line
+    late = 990.0 + board.CAST_TTL_S + 1.0
+    assert "cast" not in board.board_state(cast=lambda: _thrown(), now=late).keys
+
+
+def test_a_held_cast_is_a_warning_that_names_the_deaf_target():
+    p = board.cast_panel(_thrown(status="held", target="HPCOMPUTER"), 1000.0)
+    assert p.tone == "warn" and ("STATUS", "HELD") in p.rows
+    assert "HPCOMPUTER" in p.line and "holding" in p.line
+
+
+def test_a_bad_cast_record_cannot_sink_the_board():
+    assert board.cast_panel(None, 1000.0) is None
+    assert board.cast_panel({"at": "soon"}, 1000.0) is None
+    assert board.cast_panel({}, 1000.0) is None
+    st = board.board_state(cast=lambda: (_ for _ in ()).throw(RuntimeError("x")),
+                           now=1000.0)
+    assert st.keys == board.PANEL_ORDER
+
+
+def test_the_throw_can_be_asked_about_by_name():
+    assert board.resolve_panel("the last throw") == "cast"
+    assert board.resolve_panel("what i threw") == "cast"

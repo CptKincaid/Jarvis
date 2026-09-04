@@ -63,11 +63,42 @@ plus ``_format``, ``_created_ns`` and ``_reason``. Labels live in the key
 because a face gallery holds more than one person the moment a second person
 sits down -- distinguishing "someone" from "him" is the point.
 
+WHAT A TAKE SAYS IT WAS, and why it is a KEY and not a format bump. He asked
+for "a note on what i am doing in the take" -- looking at my phone, looking
+away, with glasses -- because when a match scores badly the only useful
+question is WHICH POSE is weak, and 128 floats cannot answer it. So each
+sample may carry a ``note_<label>_<nnnn>`` string and a ``yaw_<label>_<nnnn>``
+float beside its embedding.
+
+They are OPTIONAL KEYS AT THE SAME ``_format``, and that is the whole design
+constraint. ``_read`` REFUSES a format number it does not know (four lines
+below the paragraph above, and correctly -- reading a newer pool as if it
+were this one is how embeddings silently stop comparing). So bumping FORMAT
+for notes would have made his live enrolment -- 13 embeddings written at
+23:29 on 2026-09-02, verified at 120 of 120 frames matched -- unreadable by
+the build that added the feature, which is precisely the class of loss this
+module exists to prevent. A missing note key is not an error; it is a take
+that predates the notes, and ``Take.recorded`` is False so nothing downstream
+can mistake "no record" for "frontal". A note key is paired to its embedding
+by INDEX, so a vector dropped for being degenerate takes its note with it --
+otherwise every note after the dropped one describes the wrong face.
+
+DELETING ONE PERSON is ``purge_label()``, and it is not ``forget()`` plus a
+save. A save writes a new generation; the OLD generations still hold her, one
+``rollback()`` away and still on the disk. Consent withdrawn has to mean the
+embeddings go, so ``purge_label`` writes what is left as a new generation and
+then SHREDS every generation that held her -- including the ones that are
+unreadable, because nothing can prove those do not hold her either.
+
 DELETION is ``purge()``: every generation, not just the newest, AND any
 ``.tmp`` a crashed save left behind -- which is a full set of embeddings under
 a name the generation pattern does not match, so the first version of purge()
 reported success and left one on disk. A store whose "delete" leaves an older
-copy of his face on disk has not deleted anything.
+copy of his face on disk has not deleted anything. Every deletion in this
+module goes through ``_shred``: the bytes are overwritten and then unlinked,
+because unlink alone drops the directory entry and leaves the vectors in the
+extents. Read ``_shred`` for the limit of that -- it is a filesystem-level
+erase, not a device-level one, and the command says so in those words.
 
 Nothing here imports cv2, torch or a model. It is arithmetic over arrays, so
 it runs in the test suite with no camera, no display and no GPU.
@@ -77,6 +108,7 @@ from __future__ import annotations
 import os
 import re
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -110,6 +142,121 @@ _TMP_RE = re.compile(r"^gen-(\d{5})\.npz\.tmp$")
 _KEY_RE = re.compile(r"^emb_(.+)_(\d{4})$")
 # A label goes into an npz key and a log line, so keep it boring.
 _LABEL_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
+# A note goes into an npz key, a printed report he PASTES to somebody, and a
+# log line. One printable line, and short enough that a whole gallery's worth
+# of them still reads as a table.
+NOTE_MAX = 120
+
+
+@dataclass(frozen=True)
+class Take:
+    """What one sample was, beyond the 128 floats.
+
+    ``note`` is his own words for the pose -- "looking at my phone" -- and
+    ``yaw_deg`` is what the head model measured while it was captured.
+
+    ``yaw_deg`` IS None RATHER THAN 0.0 WHEN NOTHING WAS RECORDED, and the
+    difference matters more than it looks: his live generation carries no
+    angles at all, and a 0.0 default would report 13 perfectly frontal takes
+    that were never measured -- turning "this gallery cannot say what it
+    covers" into a confident and wrong "it is fully covered frontally". The
+    same three-valued contract ``jarvis/roomsensor.py`` writes down for the
+    radar: absent is not zero."""
+
+    note: str = ""
+    yaw_deg: Optional[float] = None
+
+    @property
+    def recorded(self) -> bool:
+        """Did anything about this take get written down at all?"""
+        return bool(self.note) or self.yaw_deg is not None
+
+    def as_dict(self) -> dict:
+        return {"note": self.note, "yaw_deg": self.yaw_deg}
+
+
+def label_ok(label) -> bool:
+    """Is this a name ``add()`` will accept?
+
+    Public because the enrolment script has to refuse a bad ``--label`` at
+    the ARGUMENT, before a minute in front of the camera, and reaching into
+    ``_LABEL_RE`` from outside would make the rule two rules that can drift."""
+    return bool(_LABEL_RE.match(str(label or "")))
+
+
+def clean_note(text) -> str:
+    """One printable line, at most ``NOTE_MAX`` characters.
+
+    A note is free text: he types it at a prompt, or it arrives from a voice
+    command through the entry point. It then lands in an npz key's value, in
+    a report he pastes into a chat window, and in a log line. Newlines would
+    break the report's table, control characters would break the terminal it
+    is pasted into, and anything that is not a string at all is refused by
+    being turned into one -- ``str(np.zeros((4, 4)))`` is a string and is
+    then capped like any other, so a note can never smuggle an array onto the
+    disk under a key the numbers-only checker does not inspect."""
+    s = "" if text is None else str(text)
+    s = "".join(c if (c.isprintable() and c != "\x00") else " " for c in s)
+    return " ".join(s.split())[:NOTE_MAX]
+
+
+def clean_yaw(value) -> Optional[float]:
+    """A finite angle, or None meaning "not recorded".
+
+    A NaN yaw is what a failed head model produces, and it would compare
+    False against every bucket edge -- landing the take in no bucket while
+    still counting as recorded. None says the true thing instead."""
+    if value is None:
+        return None
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) else None
+
+
+def _shred(path: Path) -> None:
+    """Overwrite a generation's bytes, then unlink it.
+
+    ``unlink`` removes the directory ENTRY. The extents that held the
+    128-float vectors stay on the device until the filesystem reuses them, so
+    a "delete" that only unlinks leaves a measurement of his face on the disk
+    while the command says it is gone. The files are ~6 KB, so overwriting
+    first costs nothing measurable.
+
+    SAY THE LIMIT OUT LOUD RATHER THAN LEAVE IT IMPLIED. This makes the bytes
+    unreachable THROUGH THE FILESYSTEM. It is not a device-level erase: on a
+    copy-on-write filesystem, on a journalled one that already wrote the
+    block elsewhere, and on any SSD (this box) whose controller remaps rather
+    than rewrites, the old blocks can survive an in-place overwrite. What the
+    caller is entitled to claim is exactly what this does -- which is why
+    scripts/face_enrol.py's --delete says "overwritten and unlinked" and not
+    "off the disk".
+
+    Raises ``OSError`` from the unlink so existing callers keep their own
+    handling; a failure to OVERWRITE is logged and the unlink still happens,
+    because leaving the file in place would be strictly worse.
+    """
+    path = Path(path)
+    try:
+        size = path.stat().st_size
+    except OSError:
+        size = 0
+    if size > 0:
+        try:
+            fd = os.open(path, os.O_WRONLY)
+            try:
+                chunk = b"\0" * min(size, 1 << 20)
+                left = size
+                while left > 0:
+                    left -= os.write(fd, chunk[:min(left, len(chunk))])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        except OSError:
+            log.warning("could not overwrite %s before deleting it",
+                        path.name, exc_info=True)
+    path.unlink()
 
 
 def cosine(a, b) -> float:
@@ -149,6 +296,34 @@ def degenerate_reason(vec) -> str:
     return ""
 
 
+def _take_for(data, have, label: str, idx: str) -> Take:
+    """The note and yaw for one stored embedding, and never an exception.
+
+    Split out so the failure is contained to ONE take: see the block in
+    ``_read``. A key that will not read costs its own note, is logged, and
+    leaves a blank ``Take`` -- which is exactly the state every take his
+    2026-09-02 generation is in anyway, so nothing downstream is surprised
+    by it."""
+    note, yaw = "", None
+    note_key = "note_%s_%s" % (label, idx)
+    yaw_key = "yaw_%s_%s" % (label, idx)
+    if note_key in have:
+        try:
+            note = clean_note(str(data[note_key][0]))
+        except Exception:  # noqa: BLE001 - a bad note costs the note
+            log.warning("face gallery: unreadable %s; the take keeps its "
+                        "embedding and loses its note", note_key,
+                        exc_info=True)
+    if yaw_key in have:
+        try:
+            yaw = clean_yaw(data[yaw_key][0])
+        except Exception:  # noqa: BLE001
+            log.warning("face gallery: unreadable %s; the take keeps its "
+                        "embedding and loses its angle", yaw_key,
+                        exc_info=True)
+    return Take(note, yaw)
+
+
 class FaceGallery:
     """Enrolled faces, held in memory, persisted as numbered generations.
 
@@ -159,6 +334,10 @@ class FaceGallery:
     def __init__(self, root: Optional[Path] = None):
         self.root: Optional[Path] = None if root is None else Path(root)
         self._pool: Dict[str, List[np.ndarray]] = {}
+        # Kept in lockstep with _pool, index for index. ``takes()`` pads
+        # rather than trusting that, because a mismatch would attach one
+        # sample's note to another sample's face.
+        self._takes: Dict[str, List[Take]] = {}
         self.loaded_generation = 0
         self._loaded_n = 0            # the size the shrink guard compares to
         self._provenance: dict = {}
@@ -176,13 +355,36 @@ class FaceGallery:
     def embeddings(self, label: str) -> List[np.ndarray]:
         return list(self._pool.get(label, ()))
 
+    def takes(self, label: str) -> List[Take]:
+        """What each of this label's samples says it was, index for index
+        with ``embeddings(label)``.
+
+        Padded to the pool's length with blank takes rather than returning a
+        shorter list: every caller zips the two, and a short list would
+        silently drop the last samples from a coverage count -- reporting
+        better coverage than the gallery has, which is the one direction this
+        feature must not fail in."""
+        n = len(self._pool.get(label, ()))
+        got = list(self._takes.get(label, ()))
+        if len(got) < n:
+            got = got + [Take()] * (n - len(got))
+        return got[:n]
+
     def reset(self) -> None:
         """Empty the in-memory pool. Touches no disk: the generations stay,
         which is what makes "enrol again from scratch" a safe thing to do."""
         self._pool = {}
+        self._takes = {}
 
-    def add(self, label: str, vec) -> None:
-        """Add one embedding, or raise ValueError saying why not."""
+    def add(self, label: str, vec, note="", yaw_deg=None) -> None:
+        """Add one embedding and what it was, or raise ValueError saying why
+        not.
+
+        ``note`` and ``yaw_deg`` both default to "nothing recorded", so every
+        existing caller keeps writing exactly the file it wrote before. The
+        take is appended in the SAME statement region as the vector and only
+        after every refusal above has passed, so the two lists cannot come
+        apart on a rejected sample."""
         if not _LABEL_RE.match(label or ""):
             raise ValueError("bad label %r: lowercase letters, digits, - and _" % label)
         why = degenerate_reason(vec)
@@ -190,10 +392,17 @@ class FaceGallery:
             raise ValueError("refusing a degenerate embedding: %s" % why)
         arr = np.asarray(vec, dtype=np.float32).ravel().copy()
         self._pool.setdefault(label, []).append(arr)
+        self._takes.setdefault(label, []).append(
+            Take(clean_note(note), clean_yaw(yaw_deg)))
 
     def forget(self, label: str) -> int:
-        """Drop one person from the in-memory pool; save() commits it."""
+        """Drop one person from the in-memory pool; save() commits it.
+
+        IN MEMORY ONLY, AND THAT IS NOT A DELETE. The generations on disk
+        still hold them, and one ``rollback()`` brings them back. Removing a
+        person because they withdrew consent is ``purge_label()``."""
         gone = len(self._pool.pop(label, ()))
+        self._takes.pop(label, None)
         return gone
 
     def match(self, vec) -> Tuple[str, float]:
@@ -236,6 +445,16 @@ class FaceGallery:
             return []
         return sorted(p for p in self.root.iterdir() if _TMP_RE.match(p.name))
 
+    def leftovers(self) -> List[str]:
+        """The names of any crashed-save ``gen-NNNNN.npz.tmp`` files.
+
+        Public because a caller that has just deleted somebody has to be able
+        to CHECK, and ``generations()`` -- which every read-back walks -- is
+        blind to these by design (``_GEN_RE`` does not match them). A tmp
+        holds a whole pool, so one surviving is a failed deletion, not an
+        untidy directory."""
+        return sorted(p.name for p in self._tmp_paths())
+
     def load(self, generation: Optional[int] = None) -> bool:
         """Load one generation, defaulting to the newest that parses.
 
@@ -245,12 +464,13 @@ class FaceGallery:
         wanted = [generation] if generation else list(reversed(self.generations()))
         for gen in wanted:
             try:
-                pool, prov = self._read(self.path_for(gen))
+                pool, takes, prov = self._read(self.path_for(gen))
             except Exception:
                 log.warning("face gallery generation %d unreadable; "
                             "falling back to the one before", gen, exc_info=True)
                 continue
             self._pool = pool
+            self._takes = takes
             self.loaded_generation = gen
             self._loaded_n = sum(len(v) for v in pool.values())
             self._provenance = prov
@@ -268,6 +488,8 @@ class FaceGallery:
             # this for the voiceprint. Refuse, do not guess.
             raise ValueError("face gallery format %d, this build reads %d" % (fmt, FORMAT))
         pool: Dict[str, List[np.ndarray]] = {}
+        takes: Dict[str, List[Take]] = {}
+        have = set(data.files)
         for key in sorted(data.files):
             m = _KEY_RE.match(key)
             if not m:
@@ -275,15 +497,32 @@ class FaceGallery:
             arr = np.asarray(data[key], dtype=np.float32).ravel()
             if degenerate_reason(arr):
                 # A stored vector that cannot be a face is not loaded: it
-                # would drag every future match toward itself.
+                # would drag every future match toward itself. ITS NOTE GOES
+                # WITH IT -- the two lists are paired by position, so keeping
+                # the note of a dropped vector shifts every note after it
+                # onto the wrong face.
                 log.warning("face gallery: dropping %s (%s)", key, degenerate_reason(arr))
                 continue
-            pool.setdefault(m.group(1), []).append(arr)
+            label, idx = m.group(1), m.group(2)
+            pool.setdefault(label, []).append(arr)
+            # A COSMETIC FIELD MAY NOT COST THE EMBEDDINGS. The note and the
+            # yaw are what a take was DOING; the vector is the enrolment. A
+            # zero-length or otherwise malformed note_/yaw_ key used to raise
+            # out of here, which _read turns into "this generation is
+            # unreadable" -- one bad string costing thirteen faces, and (with
+            # purge_label) an unreadable generation is the kind that gets
+            # destroyed. The pre-existing contract two lines up ("if not m:
+            # continue") was already to TOLERATE a key this build does not
+            # understand; this restores it for the keys this build added.
+            takes.setdefault(label, []).append(
+                _take_for(data, have, label, idx))
         prov = {"format": fmt,
                 "created_ns": int(data["_created_ns"][0]) if "_created_ns" in data.files else 0,
                 "reason": str(data["_reason"][0]) if "_reason" in data.files else "",
-                "n": sum(len(v) for v in pool.values())}
-        return pool, prov
+                "n": sum(len(v) for v in pool.values()),
+                "recorded": sum(1 for ts in takes.values()
+                                for t in ts if t.recorded)}
+        return pool, takes, prov
 
     def save(self, reason: str, allow_shrink: bool = False) -> int:
         """Write the pool as the NEXT generation; return its number.
@@ -314,8 +553,19 @@ class FaceGallery:
         gen = (self.generations() or [0])[-1] + 1
         arrays: Dict[str, np.ndarray] = {}
         for label, pool in self._pool.items():
+            tks = self.takes(label)
             for i, emb in enumerate(pool):
                 arrays["emb_%s_%04d" % (label, i)] = emb
+                # WRITTEN ONLY WHEN THERE IS SOMETHING TO WRITE, so a pool
+                # with no notes produces byte-for-byte the file it produced
+                # before this feature existed -- which is what makes "his
+                # generation still loads" true in both directions.
+                if tks[i].note:
+                    arrays["note_%s_%04d" % (label, i)] = \
+                        np.array([tks[i].note])
+                if tks[i].yaw_deg is not None:
+                    arrays["yaw_%s_%04d" % (label, i)] = \
+                        np.array([float(tks[i].yaw_deg)])
         arrays["_format"] = np.array([FORMAT])
         arrays["_created_ns"] = np.array([time.time_ns()])
         arrays["_reason"] = np.array([str(reason)])
@@ -350,7 +600,10 @@ class FaceGallery:
         self.loaded_generation = gen
         self._loaded_n = n
         self._provenance = {"format": FORMAT, "created_ns": time.time_ns(),
-                            "reason": str(reason), "n": n}
+                            "reason": str(reason), "n": n,
+                            "recorded": sum(1 for label in self._pool
+                                            for t in self.takes(label)
+                                            if t.recorded)}
         self._prune()
         log.info("face gallery saved: generation %d, %d samples (%s)", gen, n, reason)
         return gen
@@ -362,7 +615,7 @@ class FaceGallery:
         than trusting a number in memory, because the whole point of the two
         callers is to defend against a caller whose memory is empty."""
         try:
-            _pool, prov = self._read(self.path_for(generation))
+            _pool, _takes, prov = self._read(self.path_for(generation))
         except Exception:
             return 0          # unreadable: it defends nothing and protects nothing
         return int(prov.get("n") or 0)
@@ -410,9 +663,10 @@ class FaceGallery:
         keep = max(KEEP_GENERATIONS, MIN_GENERATIONS)
         for tmp in self._tmp_paths():
             # A crashed save's leftovers are not a generation and hold no
-            # history worth keeping; they are just embeddings lying around.
+            # history worth keeping; they are just embeddings lying around --
+            # which is why they are shredded rather than unlinked.
             try:
-                tmp.unlink()
+                _shred(tmp)
             except OSError:
                 log.debug("could not remove %s", tmp.name, exc_info=True)
         if len(gens) <= keep:
@@ -425,7 +679,7 @@ class FaceGallery:
         doomed = [g for g in gens if g != richest][:len(gens) - keep]
         for gen in doomed:
             try:
-                self.path_for(gen).unlink()
+                _shred(self.path_for(gen))
             except OSError:
                 log.debug("could not prune generation %d", gen, exc_info=True)
 
@@ -437,7 +691,15 @@ class FaceGallery:
         gens = self.generations()
         if len(gens) < 2:
             return 0
-        self.path_for(gens[-1]).unlink()
+        # Prove there is something to fall back TO before destroying what
+        # is here. With gen 1 unreadable (a 0-byte truncation, a FORMAT
+        # bump) and gen 2 the only good enrolment, this used to shred gen 2
+        # on a file COUNT, fail the load, return 0 -- and the caller then
+        # printed "nothing to roll back to" over an empty directory (F13,
+        # reproduced 2026-09-03). An unreadable generation defends nothing.
+        if not any(self._sample_count(g) > 0 for g in gens[:-1]):
+            return 0
+        _shred(self.path_for(gens[-1]))
         self.loaded_generation = 0
         self._loaded_n = 0
         # load() falls back down the stack when gens[-2] is ALSO corrupt, so
@@ -456,20 +718,199 @@ class FaceGallery:
         older measurement of his face on the disk, which answers the wrong
         question -- and so does removing only the files whose names match the
         generation pattern, because ``gen-00002.npz.tmp`` does not and holds
-        the same embeddings."""
+        the same embeddings.
+
+        Every file is OVERWRITTEN before it is unlinked (``_shred``): unlink
+        alone drops the directory entry and leaves the vectors in the extents.
+        Read ``_shred`` for what that does and does not buy -- the command
+        that calls this is only allowed to claim the part that is true."""
         removed = 0
         for path in [self.path_for(g) for g in self.generations()] + self._tmp_paths():
             try:
-                path.unlink()
+                _shred(path)
                 removed += 1
             except OSError:
                 log.warning("could not delete face gallery file %s", path.name,
                             exc_info=True)
         self._pool = {}
+        self._takes = {}
         self.loaded_generation = 0
         self._loaded_n = 0
         self._provenance = {}
         log.info("face gallery purged: %d generations deleted", removed)
+        return removed
+
+    def purge_label(self, label: str, reason: str = "") -> dict:
+        """Destroy ONE person's embeddings, everywhere on the disk.
+
+        THE REASON THIS IS NOT ``forget()`` + ``save()``. A save writes a new
+        generation; the older ones still hold her, one ``rollback()`` away
+        and, more to the point, still lying on the disk as 128 floats per
+        take. "Delete me" is the one promise in this module that a new
+        generation cannot keep, because what was asked for is the absence of
+        the data and not the absence of a match.
+
+        So the order is the same as ``--reset``'s and for the same reason:
+        WRITE WHAT IS LEFT FIRST, DESTROY SECOND. Everyone else's embeddings
+        land in a fresh generation before a single old file is touched, and
+        if that write fails nothing is destroyed at all -- a delete of one
+        person may never cost another person's enrolment.
+
+        ONLY A GENERATION PROVEN TO HOLD HER IS DESTROYED. An earlier version
+        shredded every generation that would not PARSE as well, reasoning
+        that nothing can prove an unreadable file does not hold her. That is
+        true and it is not worth what it costs: ``_read`` REFUSES a format
+        number it does not recognise (that is the point of the check), so the
+        first build that bumps FORMAT makes every existing generation
+        "unreadable", and ``--delete --label somebody-who-was-never-enrolled``
+        would then destroy the whole gallery and exit 0. Measured 2026-09-03
+        on a throwaway store: 13 embeddings, one generation, ``_format``
+        bumped by one, ``--delete --label heather`` -> empty directory.
+        Unreadable generations are now COUNTED AND REPORTED and never
+        touched; the caller says so out loud and stops claiming the delete
+        was complete. Destroying them is still available and still one
+        command -- it is ``--delete`` with no ``--label``, which is the one
+        that means "everything".
+
+        CRASHED-SAVE LEFTOVERS GO, ALWAYS. ``gen-00002.npz.tmp`` holds a full
+        pool and does not match ``_GEN_RE``, so it is invisible to
+        ``generations()`` and to the caller's read-back -- and it cannot be
+        filtered by label, because it is somebody's whole pool. ``_prune()``
+        already shreds them on every ordinary save, which is exactly why this
+        was invisible: when somebody else survives, the save cleans up on the
+        way past. When NOBODY survives there is no save, and her complete
+        embedding set stayed on the disk under a command that printed
+        "verified". So they are shredded here, unconditionally, and counted.
+
+        Every file goes through ``_shred`` -- overwritten, then unlinked.
+        Read ``_shred`` for the limit of what that buys; the caller is only
+        allowed to claim that part.
+
+        Returns numbers, so a script can print them and a test can read them:
+        which generations held her, how many files went, how many could not
+        be read and so were LEFT, which generation holds what is left, and
+        who is still enrolled.
+        """
+        if self.root is None:
+            raise ValueError("this gallery has no root; it cannot be purged")
+        label = str(label)
+        out: dict = {"label": label, "generations_with": [], "removed": 0,
+                     "unreadable": [], "tmp_removed": 0,
+                     "generation": 0, "left": 0,
+                     "labels_left": (), "reason": ""}
+        holds: List[int] = []
+        unreadable: List[int] = []
+        for gen in self.generations():
+            try:
+                pool, _takes, _prov = self._read(self.path_for(gen))
+            except Exception:
+                unreadable.append(gen)
+                continue
+            if pool.get(label):
+                holds.append(gen)
+        out["generations_with"] = list(holds)
+        out["unreadable"] = list(unreadable)
+        if not holds:
+            # Nothing on the disk was PROVEN to hold her, so nothing on the
+            # disk may be destroyed on her account. The tmps still go: they
+            # are a crashed save's leftovers, the next ordinary save would
+            # shred them anyway, and one of them may be the very pool she is
+            # asking to have removed.
+            out["tmp_removed"] = self._shred_tmps()
+            return out
+
+        self.load()
+        self.forget(label)
+        if self.total():
+            try:
+                # allow_shrink: removing a person IS a shrink, and it is the
+                # deliberate kind the guard exists to let through when it is
+                # asked for by name.
+                out["generation"] = self.save(
+                    reason=reason or ("forget %s" % label), allow_shrink=True)
+            except ValueError as exc:
+                # The write that was going to carry everyone else forward
+                # failed. Destroying the old generations now would take them
+                # with her -- and the tmps stay too, because "nothing was
+                # destroyed" has to mean nothing.
+                out["reason"] = str(exc)
+                log.warning("face gallery: not deleting %r -- what is left "
+                            "could not be saved: %s", label, exc)
+                return out
+        # No survivors means no save, and that is fine HERE and only here:
+        # the invariant the save protects is somebody else's enrolment, and
+        # when the pool is empty there is nobody else to lose.
+        for gen in holds:
+            if gen == out["generation"]:
+                continue
+            path = self.path_for(gen)
+            if not path.exists():
+                continue          # _prune() may already have taken it
+            try:
+                _shred(path)
+                out["removed"] += 1
+            except OSError:
+                log.warning("could not delete face gallery generation %d",
+                            gen, exc_info=True)
+        out["tmp_removed"] = self._shred_tmps()
+        out["left"] = self.total()
+        out["labels_left"] = self.labels()
+        log.info("face gallery: %r removed from %d generation(s); %d "
+                 "embeddings over %d label(s) left; %d generation(s) could "
+                 "not be read and were LEFT ALONE",
+                 label, out["removed"], out["left"], len(out["labels_left"]),
+                 len(unreadable))
+        return out
+
+    def _shred_tmps(self) -> int:
+        """Overwrite and unlink every ``gen-NNNNN.npz.tmp``; return the count.
+
+        A tmp is a whole pool that no name can filter, invisible to
+        ``generations()`` and therefore to any read-back that walks them.
+        ``_prune()`` already treats them as garbage on every save."""
+        gone = 0
+        for tmp in self._tmp_paths():
+            try:
+                _shred(tmp)
+                gone += 1
+            except OSError:
+                log.warning("could not delete face gallery leftover %s",
+                            tmp.name, exc_info=True)
+        return gone
+
+    def drop_generations(self, generations) -> int:
+        """Delete exactly these generations; return how many went.
+
+        SEPARATE FROM ``purge()`` ON PURPOSE, and the difference is the whole
+        point. ``purge()`` is "destroy everything and leave the object empty",
+        which is only ever correct when the answer to "what will he have
+        afterwards" is "nothing, and he asked for that". This is the last step
+        of REPLACING: the caller has already written a new generation that it
+        holds a number for, and only the ones that predate it are going. It
+        never touches the in-memory pool or ``loaded_generation``, and a
+        generation that is not on disk is skipped rather than guessed at.
+
+        ``scripts/face_enrol.py --reset`` is the caller. It used to purge
+        BEFORE the capture, so a run that then failed a check -- 'too tight' /
+        'too loose', the outcome the whole design exists to produce -- left
+        him with an empty directory and nothing to roll back to. Capture
+        first, destroy last: the old generations survive every failure mode of
+        the run, and go only once a new one is safely on disk.
+        """
+        wanted = {int(g) for g in generations}
+        removed = 0
+        for gen in self.generations():
+            if gen not in wanted:
+                continue
+            try:
+                _shred(self.path_for(gen))
+                removed += 1
+            except OSError:
+                log.warning("could not delete face gallery generation %d",
+                            gen, exc_info=True)
+        if removed:
+            log.info("face gallery: %d superseded generation(s) deleted",
+                     removed)
         return removed
 
     def provenance(self) -> dict:

@@ -805,3 +805,134 @@ def test_real_app_asks_its_own_focus_session(build, monkeypatch):  # noqa: F811
     assert a.tts.spoken == [] and len(a.quiet.held) == 1
     a.focus._speak("Time for a break, sir.")              # the session's own
     assert a.tts.spoken == ["Time for a break, sir."]
+
+
+# =====================================================================
+# take_fragments: a drain you can undo
+# =====================================================================
+# 2026-09-03. The arrival catch-up drained the backlog on the pump thread,
+# went off to read a mailbox on a worker, and then DROPPED the digest as
+# stale -- taking the drained lines with it. They are the things he missed
+# while he was out and there is no second copy of them anywhere. Any caller
+# that can still decide not to speak takes the reversible form.
+def test_a_take_that_is_put_back_leaves_the_backlog_exactly_as_it_was():
+    p = _policy()
+    p.set_dnd(600)
+    p.hold("The build passed, sir.", "message")
+    p.hold("Canvas: Lab 3 graded.", "message")
+    before = p.held
+    frags, put_back = p.take_fragments()
+    assert frags and p.held == [], "take_fragments did not drain"
+    assert put_back() == 2
+    assert p.held == before, "the held lines did not come back as they were"
+
+
+def test_putting_back_twice_puts_them_back_once():
+    p = _policy()
+    p.set_dnd(600)
+    p.hold("The build passed, sir.", "message")
+    _, put_back = p.take_fragments()
+    assert put_back() == 1 and put_back() == 0
+    assert len(p.held) == 1
+
+
+def test_a_put_back_goes_in_FRONT_of_anything_held_meanwhile():
+    """The lines he missed first are still read first."""
+    p = _policy()
+    p.set_dnd(600)
+    p.hold("First.", "message")
+    _, put_back = p.take_fragments()
+    p.hold("Second.", "message")
+    put_back()
+    assert [text for _, text, _ in p.held] == ["First.", "Second."]
+
+
+def test_a_put_back_over_the_cap_drops_the_OLDEST_as_hold_would_have():
+    """The backlog is a bounded deque; putting lines back must not make it
+    unbounded, and must drop the same line hold() would have."""
+    from jarvis.quiet import HOLD_MAX
+    p = _policy()
+    p.set_dnd(600)
+    p.hold("oldest.", "message")
+    _, put_back = p.take_fragments()
+    for i in range(HOLD_MAX):
+        p.hold(f"later {i}.", "message")
+    put_back()
+    texts = [text for _, text, _ in p.held]
+    assert len(texts) == HOLD_MAX and "oldest." not in texts
+    assert texts[-1] == f"later {HOLD_MAX - 1}."
+
+
+def test_a_put_back_is_still_SPOKEN_by_the_policys_own_next_tick():
+    """"Still held" is worth nothing if nothing ever says it. The digest
+    goes out on the FALLING edge of the quiet window and never again, and
+    the take consumed the tick that edge belonged to -- so the put-back
+    re-arms it."""
+    said = []
+    p = _policy(say=said.append)
+    p.set_dnd(600)
+    p.hold("Sir, this is your reminder. Stand up", "reminder")
+    p.clock.tick(minutes=11)                 # the window is over
+    frags, put_back = p.take_fragments()     # ...and the arrival cue took it
+    assert frags
+    assert p.tick() == "" and said == []     # nothing left to say this tick
+    put_back()                               # ...and then did not speak it
+    text = p.tick()
+    assert "one reminder" in text and said == [text]
+
+
+def test_a_take_of_an_empty_backlog_still_answers_the_contract():
+    p = _policy()
+    frags, put_back = p.take_fragments()
+    assert frags == [] and put_back() == 0 and p.held == []
+
+
+def test_release_fragments_is_still_the_one_way_form():
+    """The one-way primitive is unchanged for the callers that speak what
+    they took there and then ("I am free", the policy's own tick)."""
+    p = _policy()
+    p.set_dnd(600)
+    p.hold("The build passed, sir.", "message")
+    frags = p.release_fragments()
+    assert frags and p.held == []
+    assert frags[0].startswith(BUSY_PREFIX)
+
+
+def test_a_digest_the_TTS_could_not_speak_is_KEPT_and_retried():
+    """The same class one level up in this file: tick() drained one-way and
+    then swallowed a TTS failure, so a digest that could not be spoken took
+    the whole backlog with it. A failed speak keeps the lines and the next
+    tick tries again."""
+    tries = []
+
+    def say(text):
+        tries.append(text)
+        if len(tries) == 1:
+            raise RuntimeError("the speaker is unplugged")
+    p = _policy(say=say)
+    p.set_dnd(600)
+    p.hold("Sir, this is your reminder. Stand up", "reminder")
+    p.clock.tick(minutes=11)
+    assert p.tick() == "", "a digest that was not spoken was reported as said"
+    assert len(p.held) == 1, "the TTS failure destroyed the backlog"
+    text = p.tick()
+    assert "one reminder" in text and len(tries) == 2 and p.held == []
+
+
+def test_a_digest_that_JOINS_TO_NOTHING_is_not_counted_as_spent():
+    """The other way out of tick() without words: nothing speakable came of
+    the fragments. They are not spent either."""
+    said = []
+    p = _policy(say=said.append)
+    p.set_dnd(600)
+    p.hold("The build passed, sir.", "message")
+    p.clock.tick(minutes=11)
+    import jarvis.quiet as quiet_mod
+    real = quiet_mod.address.join_fragments
+    quiet_mod.address.join_fragments = lambda *a, **kw: ""
+    try:
+        assert p.tick() == ""
+    finally:
+        quiet_mod.address.join_fragments = real
+    assert len(p.held) == 1 and said == []
+    assert "The build passed" in p.tick()

@@ -214,3 +214,29 @@ def test_a_broken_cooldown_setting_falls_back_to_the_default(monkeypatch):
     assert earcons.play("done", run=run) is True
     now[0] += 1.0
     assert earcons.play("done", run=run) is False
+
+
+def test_a_caller_may_shorten_the_same_tone_cooldown_for_its_own_play(monkeypatch):
+    """The gesture (jarvis/gesturecast.py) plays heard-you at the pace of a
+    hand: grab-drop-grab inside 4 s. The wake-word path passes nothing and
+    keeps the config value, so a false-wake metronome is still swallowed."""
+    now = [100.0]
+    monkeypatch.setattr(earcons, "_clock", lambda: now[0])
+    calls, run = _play_log()
+    assert earcons.play("heard-you", run, cooldown_s=0.6)
+    now[0] += 1.0
+    assert not earcons.play("heard-you", run)              # the 4 s default
+    assert earcons.play("heard-you", run, cooldown_s=0.6)  # the gesture's own
+    now[0] += 0.3
+    assert not earcons.play("heard-you", run, cooldown_s=0.6)
+    assert len(calls) == 2
+
+
+def test_a_broken_per_call_cooldown_falls_back_to_the_default(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(earcons, "_clock", lambda: now[0])
+    calls, run = _play_log()
+    assert earcons.play("done", run, cooldown_s="soon")
+    now[0] += 1.0
+    assert not earcons.play("done", run, cooldown_s="soon")
+    assert len(calls) == 1

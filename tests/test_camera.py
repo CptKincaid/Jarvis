@@ -25,6 +25,7 @@ No cv2, no /dev/video*, no display.
 from __future__ import annotations
 
 import datetime as _dt
+import logging
 
 import pytest
 
@@ -248,6 +249,16 @@ def test_a_box_with_no_camera_is_reported_absent_not_stopped(tmp_path):
     assert feed is not None
 
 
+def test_device_present_maps_a_digit_to_the_video_node(monkeypatch):
+    """open_capture treats "0" as a cv2 index; present() must ask about
+    /dev/video0, not about a file called "0" in the working directory
+    (which made a lit camera read as absent -- F53)."""
+    asked = []
+    monkeypatch.setattr(cam.os.path, "exists", lambda p: asked.append(p) or True)
+    assert cam.device_present("0") is True
+    assert asked == ["/dev/video0"]
+
+
 def test_device_present_reads_the_node_not_a_config_flag(tmp_path):
     node = tmp_path / "video7"
     assert cam.device_present(str(node)) is False
@@ -385,6 +396,85 @@ class FakeCap:
             return False
         self.granted[prop] = value
         return True
+
+
+class _FakeVideoCapture:
+    """cv2.VideoCapture's surface for open_capture: records every set, in
+    order, and answers get() with what was set."""
+
+    def __init__(self, target, opened=True):
+        self.target = target
+        self.sets = []
+        self.props = {}
+        self.released = 0
+        self._opened = opened
+
+    def isOpened(self):
+        return self._opened
+
+    def set(self, prop, value):
+        self.sets.append((prop, float(value)))
+        self.props[prop] = float(value)
+        return True
+
+    def get(self, prop):
+        return self.props.get(prop, 0.0)
+
+    def release(self):
+        self.released += 1
+
+
+class _FakeCv2:
+    CAP_PROP_FRAME_WIDTH, CAP_PROP_FRAME_HEIGHT = 3, 4
+    CAP_PROP_FPS, CAP_PROP_FOURCC = 5, 6
+    CAP_PROP_CONVERT_RGB, CAP_PROP_BUFFERSIZE = 16, 38
+
+    def __init__(self, opened=True):
+        self.caps = []
+        self._opened = opened
+
+    @staticmethod
+    def VideoWriter_fourcc(*chars):
+        return sum(ord(c) << (8 * i) for i, c in enumerate(chars))
+
+    def VideoCapture(self, target):
+        cap = _FakeVideoCapture(target, self._opened)
+        self.caps.append(cap)
+        return cap
+
+
+def test_open_capture_asks_for_one_buffer_and_logs_the_granted_mode(
+        monkeypatch, caplog):
+    """Two things nothing did until 2026-09-03. CAP_PROP_BUFFERSIZE=1,
+    because the V4L2 backend's default four buffers hand a slow consumer a
+    frame up to three intervals old -- the preview's "grab 11 ms" at 6 fps
+    was a stale picture, not a fast device. And the granted mode LOGGED,
+    because the running app never read it back and a night was spent
+    guessing that MJPG had been declined (it had not; the probe showed it
+    granted in either set order, twice). FOURCC goes before the size."""
+    fake = _FakeCv2()
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    with caplog.at_level(logging.INFO, logger="jarvis.camera"):
+        cap = cam.open_capture("", 1280, 720, "MJPG")
+    props = [p for p, _ in cap.sets]
+    assert props.index(fake.CAP_PROP_FOURCC) < props.index(
+        fake.CAP_PROP_FRAME_WIDTH)
+    assert cap.props[fake.CAP_PROP_BUFFERSIZE] == 1.0
+    assert cam.CAPTURE_BUFFERS == 1
+    assert cap.props[fake.CAP_PROP_FRAME_WIDTH] == 1280.0
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "jarvis.camera"]
+    assert any("asked 1280x720 MJPG" in m and "granted 1280x720 MJPG" in m
+               and "1 driver buffer" in m for m in lines), lines
+    assert cap.released == 0
+
+
+def test_open_capture_raises_when_the_device_will_not_open(monkeypatch):
+    fake = _FakeCv2(opened=False)
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    with pytest.raises(OSError):
+        cam.open_capture("/dev/video9")
+    assert fake.caps[0].released == 1            # and lets go of the handle
 
 
 def test_the_granted_mode_is_read_back_not_assumed():

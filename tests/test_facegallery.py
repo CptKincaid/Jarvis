@@ -418,6 +418,26 @@ def test_a_crashed_save_leaves_no_embeddings_behind(tmp_path):
     assert list(root.iterdir()) == []
 
 
+def test_rollback_refuses_when_the_only_readable_generation_is_the_newest(tmp_path):
+    """gen 1 unreadable (a 0-byte truncation), gen 2 the only good
+    enrolment: rollback() used to shred gen 2 on a file COUNT, fail the
+    load, and leave nothing on disk that parses (F13, reproduced). Now it
+    proves an older generation parses BEFORE it destroys anything."""
+    g = FaceGallery(root=tmp_path / "g")
+    base = vec(5)
+    for i in range(6):
+        g.add("hunter", near(base, 300 + i))
+    g.save("gen1")
+    g.add("hunter", near(base, 310))
+    g.save("gen2")
+    assert g.generations() == [1, 2]
+    g.path_for(1).write_bytes(b"")          # the shape backup() warns about
+    assert g.rollback() == 0
+    assert g.generations() == [1, 2], "it destroyed the only good enrolment"
+    back = FaceGallery(root=g.root)
+    assert back.load() is True and back.loaded_generation == 2
+
+
 def test_rollback_reports_the_generation_it_is_actually_holding(tmp_path):
     """``load()`` falls back down the stack when the predecessor is also
     corrupt, but the return value was hard-coded to ``gens[-2]``. Measured
@@ -439,3 +459,65 @@ def test_rollback_reports_the_generation_it_is_actually_holding(tmp_path):
     got = g.rollback()
     assert got == g.loaded_generation == 1
     assert g.total() == 6
+
+
+# ---------------------------------- destroying only what is superseded
+def test_drop_generations_removes_exactly_what_it_is_given(tmp_path):
+    """The primitive ``--reset`` needs so it can destroy LAST rather than
+    first: the enrolment is captured and saved, and only then do the
+    generations it supersedes go. ``purge()`` cannot do this job -- it
+    destroys everything and empties the object, which is only ever right when
+    the answer to "what does he have afterwards" is "nothing"."""
+    g = FaceGallery(root=tmp_path / "g")
+    base = vec(3)
+    for i in range(5):
+        g.add("hunter", near(base, 10 + i))
+    g.save(reason="one")
+    for i in range(5):
+        g.add("hunter", near(base, 30 + i))
+    g.save(reason="two")
+    for i in range(5):
+        g.add("hunter", near(base, 50 + i))
+    g.save(reason="three")
+    assert g.generations() == [1, 2, 3]
+
+    assert g.drop_generations([1, 2]) == 2
+    assert g.generations() == [3]
+    # The in-memory pool and the loaded generation are untouched: this is the
+    # tail of a save, not a reset.
+    assert g.total() == 15 and g.loaded_generation == 3
+    assert FaceGallery(root=g.root).load() is True
+
+    assert g.drop_generations([1, 2]) == 0, "a missing generation is not a guess"
+    assert g.drop_generations([]) == 0
+    assert g.generations() == [3]
+
+
+def test_every_deletion_overwrites_the_embeddings_first(tmp_path):
+    """unlink drops the directory ENTRY and leaves the 128-float vectors in
+    the extents until the filesystem reuses them. Read back through a second
+    hard link to the same inode -- zeros, not embeddings.
+
+    This is a filesystem-level erase and the command says so in those words;
+    an SSD's controller may still hold the old blocks, which is why nothing
+    here claims the data is off the device."""
+    import os
+    g = FaceGallery(root=tmp_path / "g")
+    base = vec(9)
+    for i in range(6):
+        g.add("hunter", near(base, 70 + i))
+    g.save(reason="one")
+    for i in range(6):
+        g.add("hunter", near(base, 90 + i))
+    g.save(reason="two")
+
+    for gen, name in ((1, "twin1"), (2, "twin2")):
+        path = g.path_for(gen)
+        body = path.read_bytes()
+        assert body.strip(b"\0"), "the fixture must not already be zeros"
+        os.link(path, tmp_path / name)
+
+    assert g.rollback() == 1                      # generation 2 goes
+    assert (tmp_path / "twin2").read_bytes().strip(b"\0") == b""
+    assert g.purge() == 1                         # and now generation 1
+    assert (tmp_path / "twin1").read_bytes().strip(b"\0") == b""

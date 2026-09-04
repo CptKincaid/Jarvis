@@ -1,0 +1,354 @@
+# Jarvis SATELLITE -- an ESP32 + HLK-LD2410 in a room that is not the
+# Spark's. Same hardware as scripts/esphome/jarvis-room-sensor.yaml; the
+# difference is entirely in WHO ENFORCES THE PRIVACY RULES.
+#
+# ---------------------------------------------------------------------------
+# THE ONE IDEA IN THIS FILE
+#
+# The Spark can hold its own camera shut, because the camera is plugged into
+# it (jarvis/sensing.py CameraGate). It cannot hold YOUR KITCHEN's radar shut,
+# because the kitchen radar is a different computer: if the Wi-Fi drops,
+# Jarvis can stop believing the readings but it cannot stop the sensing.
+#
+# So this firmware does not wait to be told to stop. It runs on a LEASE:
+#
+#   * the radar's supply is held by a GPIO that boots OFF and stays OFF;
+#   * POST /button/radar_lease_renew/press powers it on and (re)starts a
+#     ${lease_ttl} countdown;
+#   * when the countdown finishes -- because Jarvis crashed, the Wi-Fi died,
+#     the router rebooted, or he said "offline mode" and Jarvis simply stopped
+#     renewing -- the firmware powers the radar down. Nobody has to reach it.
+#   * POST /button/radar_lease_revoke/press is the immediate version, which
+#     is what the 21:00 curfew edge and "offline mode" actually send. The
+#     lease is the BACKSTOP for when that request cannot be delivered.
+#
+# THERE IS DELIBERATELY NO ENDPOINT THAT TURNS THE RADAR ON AND LEAVES IT ON.
+# `radar_power` is `internal: true`, so it is not exposed over HTTP at all.
+# The only way to make this device sense is to keep asking, forever, every
+# ${renew_every}. That is true even for Jarvis, and even for someone who has
+# stolen Jarvis's credentials.
+#
+# WHAT THIS STILL CANNOT PROMISE, and the LED that fixes it:
+# a device that has been reflashed will report whatever its author wants. No
+# amount of YAML detects that. Wire an LED + 1k resistor ACROSS THE SWITCHED
+# SUPPLY (between the MOSFET-side LD2410 VCC and its GND), not to a GPIO:
+# then the light is powered by the same rail as the radar, no firmware can
+# light it or hide it, and "is it off" is answered by looking at the room.
+# ---------------------------------------------------------------------------
+#
+#   pip install esphome                    # in ANY venv/pipx, not vss_env
+#   esphome run scripts/esphome/jarvis-satellite.yaml
+#
+# WIRING -- as jarvis-room-sensor.yaml, PLUS the power-cut block which is
+# optional there and MANDATORY here (without it the lease only stops the
+# polling, which is the thing that does not need a lease):
+#     LD2410 GND -> MOSFET drain;  MOSFET source -> ESP32 GND
+#     MOSFET gate -> GPIO25 through 100R, with a 100k pull-DOWN to GND
+#       (the pull-down is what keeps the radar off while the ESP32 boots)
+#     LD2410 VCC -> ESP32 5V/VIN   (still 5 V; do NOT switch VCC from a GPIO,
+#                                   the module pulls ~80 mA)
+#     LD2410 TX  -> GPIO16   LD2410 RX -> GPIO17   (crossed, 3.3 V logic)
+#     LED anode  -> LD2410 VCC through 1k; LED cathode -> MOSFET drain
+#                                  (the tell-tale above -- no GPIO involved)
+
+substitutions:
+  device_name: jarvis-kitchen                 # <-- CHANGE ME (one per room)
+  room: kitchen                               # <-- CHANGE ME
+  wifi_ssid: "YOUR_IOT_SSID"                  # <-- CHANGE ME (the IoT VLAN)
+  wifi_password: "YOUR_IOT_PASSWORD"          # <-- CHANGE ME
+  ota_password: "pick-something-long"         # <-- CHANGE ME
+  # The HTTP credentials Jarvis sends. Generate the password with
+  #   python -c "import secrets;print(secrets.token_urlsafe(24))"
+  # and put the SAME pair in ~/.config/jarvis/assistant.json under
+  # rooms.satellites[].username / .password (it is in SECRET_LIST_FIELDS,
+  # so it is masked in logs and in repr(cfg)).
+  web_user: "jarvis"                          # <-- CHANGE ME
+  web_password: "CHANGE_ME_32_RANDOM_CHARS"   # <-- CHANGE ME
+  static_ip: 192.168.60.61                    # <-- CHANGE ME
+  gateway: 192.168.60.1                       # <-- CHANGE ME
+  subnet: 255.255.255.0
+  # THE LEASE. Longer = a Jarvis restart costs less presence in this room;
+  # shorter = a satellite that loses contact goes dark sooner. 90 s against
+  # a 25 s renewal survives two lost renewals. Keep them in step with
+  # rooms.renew_s in assistant.json.
+  lease_ttl: 90s
+  lease_ttl_ms: "90000"
+  renew_every: 25s
+
+esphome:
+  name: ${device_name}
+  comment: "Jarvis satellite -- ${room}. Radar is leased; it powers down on its own."
+  on_boot:
+    # Belt to restore_mode's braces. A boot with no lease is a boot with no
+    # sensing, whatever else happened; this is the fail-to-offline rule
+    # reaching into the firmware, where nothing on the network can undo it.
+    priority: 600
+    then:
+      - switch.turn_off: radar_power
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  baud_rate: 115200
+  # The radar's distance readings describe a person moving around a room.
+  # They do not belong in a serial log that is also the recovery console.
+  level: INFO
+
+# NO `api:` BLOCK, and it is a decision rather than an omission.
+# `api:` is Home Assistant's protobuf-over-Noise channel. Jarvis is stdlib
+# only and does not speak it (aioesphomeapi is a dependency and an async
+# runtime), so enabling it would open a listening TCP port that nothing in
+# this house ever connects to -- and with no client connecting, ESPHome
+# reboots the device every `reboot_timeout` (default 15 min) by design.
+# That would punch a reboot hole in presence every quarter hour AND, worse,
+# reboot the enforcer. If you ever do want the native API here, you must set
+# BOTH `reboot_timeout: 0s` AND `encryption: key:` -- an unencrypted native
+# API on a device that governs a privacy switch is not acceptable.
+
+ota:
+  - platform: esphome
+    password: ${ota_password}
+
+wifi:
+  ssid: ${wifi_ssid}
+  password: ${wifi_password}
+  manual_ip:
+    static_ip: ${static_ip}
+    gateway: ${gateway}
+    subnet: ${subnet}
+    # NO dns1/dns2 ON PURPOSE. This device has no reason to resolve a name,
+    # and a resolver is the first thing anything that gets onto it will
+    # reach for. Block it at the router as well; see docs/multiroom-privacy.md.
+
+# NO `captive_portal:` AND NO `ap:` FALLBACK, and this is the biggest
+# difference from jarvis-room-sensor.yaml.
+# The fallback AP raises an open-ish network with a password that is written
+# in a file in a git repo, and the captive portal on it will ACCEPT NEW WI-FI
+# CREDENTIALS from anyone who joins. On a device in the office that is a
+# recovery convenience. On a device in a shared room, in radio range of
+# neighbours, it is a standing invitation to re-point a presence sensor.
+# Recovery here is the USB cable: the device is in the house, you can reach it.
+
+# mDNS is how `esphome run` finds a device by name. The address is static and
+# assistant.json holds an IP literal, so nothing needs it -- one fewer service
+# listening, and one fewer way to be found by something scanning the segment.
+mdns:
+  disabled: true
+
+web_server:
+  port: 80
+  version: 2
+  # AUTH IS NOT OPTIONAL HERE. Without it every endpoint below is world-
+  # writable to anything on the segment: the tuning numbers (set the absence
+  # delay to its maximum and this room reads "occupied" for ever), the
+  # restart button (a free denial of presence), and the lease buttons.
+  # ESPHome wraps EVERY registered handler in AuthMiddlewareHandler
+  # (esphome/components/web_server_base/web_server_base.h), so the JSON REST
+  # endpoints and /events are covered, not just the browsable page.
+  auth:
+    username: ${web_user}
+    password: ${web_password}
+  # The built-in "upload firmware" form. OTA belongs on the `esphome` push
+  # path with its own password, not on the HTTP surface that also answers
+  # presence queries.
+  ota: false
+  # Serve the page's assets from flash. Without this the browsable UI fetches
+  # its JS from the internet, which this device deliberately cannot reach --
+  # the page would be blank and look like a fault. Jarvis's own GET/POST
+  # calls do not care either way.
+  local: true
+
+uart:
+  id: ld2410_uart
+  tx_pin: GPIO17
+  rx_pin: GPIO16
+  baud_rate: 256000
+  parity: NONE
+  stop_bits: 1
+
+ld2410:
+  id: radar
+  uart_id: ld2410_uart
+  throttle: 250ms
+
+globals:
+  # Display only -- the ENFORCEMENT is the script's delay, not this number.
+  # Kept so the console can say "lease runs out in 40 s" from the device's
+  # own clock rather than from Jarvis's guess about a message it sent.
+  - id: lease_deadline_ms
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+switch:
+  # The rail. `internal: true` means it is NOT exposed over HTTP: there is no
+  # endpoint anywhere on this device that turns the radar on and leaves it on.
+  - platform: gpio
+    pin: GPIO25
+    id: radar_power
+    internal: true
+    # ESPHome's default, spelled out because it is load-bearing: a crash, a
+    # brown-out or a reboot while offline comes back with the radar DOWN.
+    restore_mode: ALWAYS_OFF
+
+script:
+  # THE LEASE. `mode: restart` means each renewal kills the running countdown
+  # and starts a fresh one; when renewals stop, the last one runs out and the
+  # radar loses power without anybody sending anything.
+  - id: lease_watchdog
+    mode: restart
+    then:
+      - switch.turn_on: radar_power
+      - delay: ${lease_ttl}
+      - logger.log:
+          level: WARN
+          format: "lease expired with no renewal; powering the radar down"
+      - switch.turn_off: radar_power
+
+button:
+  - platform: template
+    # THE NAME MAKES THE URL, and jarvis/rooms.py substitutes the SENSOR
+    # KIND into it: "Radar lease renew" -> /button/radar_lease_renew/press.
+    # A satellite that also carries a lens adds "Camera lease renew" beside
+    # this one, with its own script and its own rail -- because the 21:00
+    # curfew closes the lens and deliberately leaves the radar up, and one
+    # lease for the whole room could not say that.
+    name: "Radar lease renew"
+    id: lease_renew
+    on_press:
+      - lambda: 'id(lease_deadline_ms) = millis() + ${lease_ttl_ms};'
+      - script.execute: lease_watchdog
+
+  - platform: template
+    name: "Radar lease revoke"           # -> /button/radar_lease_revoke/press
+    id: lease_revoke
+    on_press:
+      - script.stop: lease_watchdog
+      - switch.turn_off: radar_power
+      - lambda: 'id(lease_deadline_ms) = millis();'
+      - logger.log: "lease revoked"
+
+  # Internal: a reachable restart button is a one-request denial of presence,
+  # and nothing Jarvis does needs it. Reboot it by power-cycling or over OTA.
+  - platform: restart
+    name: Restart
+    internal: true
+
+binary_sensor:
+  # WHAT JARVIS CONFIRMS AGAINST. The device's own report of the rail it is
+  # driving -- GET /binary_sensor/radar_powered. jarvis/rooms.py returns "no
+  # opinion" for presence unless this reads ON in the same pass, and treats a
+  # stale or missing answer as UNKNOWN rather than as OFF.
+  - platform: template
+    name: "Radar powered"
+    id: radar_powered
+    lambda: 'return id(radar_power).state;'
+
+  - platform: ld2410
+    ld2410_id: radar
+    # Left exposed and NOT gated in firmware on purpose. With the rail cut the
+    # LD2410 stops talking and this entity holds its last value; publishing
+    # OFF here would say "the room is empty", which is a different and worse
+    # claim than "I have no opinion". The gate is in jarvis/rooms.py, where
+    # "unknown" is a value the type system can carry.
+    has_target:
+      name: Presence
+      id: room_presence
+    has_moving_target:
+      name: Moving target
+    has_still_target:
+      name: Still target
+
+sensor:
+  - platform: template
+    name: "Lease seconds"                # -> GET /sensor/lease_seconds
+    id: lease_seconds
+    update_interval: 5s
+    unit_of_measurement: s
+    accuracy_decimals: 0
+    lambda: |-
+      // Rollover-safe: millis() wraps every ~49.7 days and a naive
+      // `deadline <= now` would read as "expired" for the 49 days after a
+      // wrap. Signed difference is the standard fix and matters here
+      // because the number it feeds is a privacy readout.
+      int32_t left = (int32_t)(id(lease_deadline_ms) - millis());
+      return left <= 0 ? 0.0f : left / 1000.0f;
+
+  - platform: ld2410
+    ld2410_id: radar
+    moving_distance:
+      name: Moving distance
+    still_distance:
+      name: Still distance
+    detection_distance:
+      name: Detection distance
+  - platform: uptime
+    name: Uptime
+  - platform: wifi_signal
+    name: WiFi signal
+    update_interval: 60s
+
+number:
+  # Internal: these are the radar's sensitivity gates and its absence delay.
+  # Writable over HTTP they are a way to blind the sensor or to pin the room
+  # "occupied"; tune them once over USB and leave them here.
+  - platform: ld2410
+    ld2410_id: radar
+    timeout:
+      name: Absence delay
+      internal: true
+    max_move_distance_gate:
+      name: Max move gate
+      internal: true
+    max_still_distance_gate:
+      name: Max still gate
+      internal: true
+
+# ---------------------------------------------------------------------------
+# OPTIONAL, AND ONLY IF YOU VERIFY IT: A CURFEW ON THE DEVICE ITSELF.
+#
+# The lease already gives you the curfew: Jarvis stops renewing at 21:00 and
+# this device powers down. A device-side curfew buys ONE extra thing -- it
+# holds even if Jarvis is compromised and keeps renewing. It also costs a
+# clock, and that is the trap:
+#
+#   ESPHome's sntp platform defaults to 0/1/2.pool.ntp.org. A satellite with
+#   no route to the internet -- which is the whole point of the VLAN -- WILL
+#   NEVER SYNC, `on_time` will NEVER FIRE, and the curfew you thought you
+#   installed will silently not exist. That is exactly the class of promise
+#   this design is trying not to make.
+#
+# So enable this ONLY after you have confirmed a LAN time source answers
+# (most routers do; try `ntpdate -q 192.168.60.1` from the Spark first), and
+# only with an IP literal, because there is no DNS configured above. Then
+# check `GET /sensor/clock_synced` before believing the curfew is armed --
+# jarvis/rooms.py can surface "kitchen clock never synced; device curfew
+# inactive" rather than assuming.
+#
+# time:
+#   - platform: sntp
+#     id: satellite_time
+#     timezone: America/Denver              # <-- CHANGE ME
+#     servers:
+#       - ${gateway}                        # the router, by IP, no DNS
+#     on_time:
+#       - seconds: 0
+#         minutes: 0
+#         hours: 21                         # the curfew start
+#         then:
+#           # THE LENS ONLY. The radar makes no image, so taking it down at
+#           # night would cost presence for no privacy -- the ruling in
+#           # jarvis/sensing.py, and the reason the leases are per kind.
+#           # On a radar-only satellite this whole block does nothing and
+#           # should not be enabled at all.
+#           - script.stop: camera_lease_watchdog
+#           - switch.turn_off: camera_power
+#
+# binary_sensor:
+#   - platform: template
+#     name: "Clock synced"
+#     lambda: 'return id(satellite_time).now().is_valid();'
+# ---------------------------------------------------------------------------

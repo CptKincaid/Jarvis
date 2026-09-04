@@ -82,25 +82,31 @@ from jarvis import address
 from jarvis import arc as arc_mod
 from jarvis import aside as aside_mod
 from jarvis import board as board_mod
+from jarvis import cast as cast_mod
 from jarvis import dialogue as dialogue_mod
 from jarvis import faults as faults_mod
 from jarvis import lecture as lecture_mod
 from jarvis import mathspeak
 from jarvis import objections as objections_mod
+from jarvis import outbox
 from jarvis import leavetime as leave_mod
 from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
 from jarvis.tools.location import clock_words
-from jarvis.events import JarvisReply, SensingChanged, Status, bus
+from jarvis.events import (ClearTranscript, JarvisReply, SensingChanged,
+                           Status, bus)
 from jarvis.logs import get_logger
 from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import parse_person_statement, parse_since
 from jarvis import selfstate
 from jarvis.tools import notes as notes_mod
 from jarvis.tools import journal as journal_mod
+from jarvis.tools import mail as mail_mod
+from jarvis.tools import filepick
 from jarvis.tools import oracle as oracle_mod
+from jarvis.tools import remote as remote_mod
 from jarvis.tools import quiz as quiz_mod
 from jarvis.tools.calendar import add_event
 from jarvis.tools.docs import EmbedError, INDEXING_LINE, course_chunks
@@ -2835,12 +2841,22 @@ BRIEFING_BUSY_LINE = "I'm still on the last one, sir; ask me for it in a moment.
 # _YES_WORDS, so "okay" used to answer this question with total silence --
 # must not start meaning yes to one.
 _BRIEFING_TAIL = r"(?:[,\s]+(?:jarvis|sir|please|thanks|thank you|then|now))*[?.!]*$"
-_BRIEFING_YES_RX = re.compile(
-    r"^(?:jarvis[,\s]+)?"
+# An affirmative is a CHAIN: "Yes, go ahead." / "Yeah, sure." / "Okay, do
+# it." are how he actually answers, and a grammar that took one yes-word
+# plus a courtesy refused 26 of 37 natural answers (measured, 09-03, F36)
+# and routed "yes go ahead" to the model as a fresh command -- the day's
+# only offer gone. Still end-anchored, so "yes, turn the lights off" falls
+# through to the command it is.
+_BRIEFING_YES_WORD = (
     r"(?:yes|yeah|yep|yup|aye|affirmative|certainly|absolutely|definitely|"
     r"of course|sure(?: thing)?|ok(?:ay)?|alright|all right|sounds good|"
-    r"very well|please do|do it|do that|run it|go ahead|let'?s hear it|"
-    r"i would|if you would)" + _BRIEFING_TAIL, re.I)
+    r"very well|please do|do it|do that|run it|go ahead|go for it|why not|"
+    r"let'?s (?:hear it|do it)|i would|if you would|please|"
+    r"that would be great)")
+_BRIEFING_YES_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?" + _BRIEFING_YES_WORD
+    + r"(?:[,\s]+(?:" + _BRIEFING_YES_WORD
+    + r"|jarvis|sir|please|thanks|thank you|then|now))*[?.!]*$", re.I)
 # "go on" / "carry on" / "continue" are deliberately NOT here and neither
 # is a bare "skip": _READ_CTL_RX owns the first three and "skip" alone is
 # in the live log as a real command routed to local:music
@@ -4785,6 +4801,669 @@ def _h_oracle_freeform(c, t, m):
                          reply=reply)
 
 
+# ---- HPCOMPUTER: files and a short question list (jarvis/tools/remote.py) --
+# Five doors out to his other machine, none back in. Two of them move a file
+# and both are READ BACK before anything opens; one answers a fixed list of
+# read-only questions unattended; one refuses everything else out loud.
+#
+# The host words are deliberately narrow, and "desktop" ALONE is not among
+# them. His own phrasing for the mail lane is "this file ... on my desktop",
+# where "my desktop" is the FOLDER the file sits in -- so a bare "desktop"
+# must never be read as the destination machine. "Put this on my desktop"
+# stays a local request and falls through to the model; only "the desktop
+# MACHINE" (or HPCOMPUTER, or "the other machine") names the host.
+_HPC = (r"(?:hp\s*computer|the\s+hp\b|"
+        r"(?:my|the)\s+(?:desktop|other)\s+(?:machine|computer|box|pc)|"
+        r"(?:my|the)\s+other\s+machine)")
+_HPC_RX = re.compile(_HPC, re.I)
+
+# A file phrase: "this file", "the budget spreadsheet", "budget.xlsx".
+_FILE_WORD = r"(?P<what>[\w][\w '.\-()+]{0,80}?)"
+
+# "is HPCOMPUTER up", "is it awake", "how's HPCOMPUTER"
+_REMOTE_STATUS_RX = re.compile(
+    r"^(?:"
+    r"(?:is|are)\s+" + _HPC + r"\s+(?:up|on|awake|alive|online|running|"
+    r"ok|okay|there)|"
+    r"(?:how(?:'s|s| is))\s+" + _HPC + r"(?:\s+(?:doing|looking))?|"
+    r"(?:check|check on|ping)\s+" + _HPC + r"|"
+    r"(?:can|could)\s+you\s+(?:see|reach)\s+" + _HPC +
+    r")\W*$", re.I)
+
+# The read-only question list. The KEY is chosen by these words; the command
+# itself is a constant in remote.QUERIES, so a misheard word can only pick a
+# different question from the table or none at all.
+_REMOTE_QUERY_RX = re.compile(
+    r"^(?:what(?:'s|s| is)|how(?:'s|s| is)|who(?:'s|s| is)|show me)\s+"
+    r"(?:the\s+|my\s+)?(?P<q>disk|space|drive|storage|room|uptime|load|"
+    r"logged\s+in|logged\s+on|on\s+it|inbox|in\s+the\s+inbox)\b"
+    r".{0,20}?\bon\s+" + _HPC + r"\W*$", re.I)
+
+# PUSH: "put the budget on HPCOMPUTER", "send this file to HPCOMPUTER".
+_REMOTE_PUSH_RX = re.compile(
+    r"^(?:put|copy|send|move|push|transfer)\s+"
+    r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
+    r"(?:\s+file)?\s+(?:on(?:to)?|to|over\s+to|across\s+to)\s+"
+    + _HPC + r"\W*$", re.I)
+
+# PULL: "get the budget from HPCOMPUTER", "grab that off HPCOMPUTER".
+# The optional trailing folder word is an ALLOW-LIST key, not a path.
+_REMOTE_PULL_RX = re.compile(
+    r"^(?:get|grab|fetch|bring|pull|copy|download)\s+(?:me\s+)?"
+    r"(?:the\s+|my\s+|this\s+|that\s+)?" + _FILE_WORD +
+    r"(?:\s+file)?\s+(?:from|off(?:\s+of)?|out\s+of)\s+" + _HPC +
+    r"(?:(?:'s)?\s+(?P<where>outbox|desktop|downloads))?\W*$", re.I)
+
+# The refusal door, LAST: anything else aimed at the host that reads like an
+# instruction. "run the build on HPCOMPUTER", "delete the logs on the HP".
+# Three shapes, because an order can put the host anywhere: "run the build ON
+# HPCOMPUTER", "HPCOMPUTER, run the build", and the bare "shut down
+# HPCOMPUTER" that names no preposition at all -- that last one is how a
+# reboot gets said, so leaving it out would leave the loudest order unrefused.
+_REMOTE_FREEFORM_RX = re.compile(
+    r"^(?:(?P<cmd>.{2,120}?)\s+on\s+" + _HPC + r"|"
+    r"(?:on\s+)?" + _HPC + r"[,:]?\s+(?P<cmd2>.{2,120}?)|"
+    r"(?P<cmd3>.{2,120}?)\s+" + _HPC + r")\W*$", re.I)
+
+# Words that make a phrase an ORDER rather than a mention. "how's HPCOMPUTER"
+# is a question the status door already took; "is HPCOMPUTER a good machine"
+# is conversation and belongs to the model.
+#
+# ANCHORED at the head of the clause, which an unanchored `search` was not,
+# and that difference is the whole of the door's manners. An order is an
+# IMPERATIVE -- the verb comes first. A clause that merely CONTAINS one of
+# these words is a question or a report, and every one of these was being
+# refused out loud: "did you install anything on the HP", "have you run the
+# tests on the HP", "I need to update the HP", "the build failed on the HP",
+# "remind me to run the backup on the HP". The last is worse than noise --
+# it is a reminder he asked for and did not get. Same rule _SEND_NOT_RX
+# applies to the mail lane, stated as an anchor rather than a veto list.
+_REMOTE_ORDER_RX = re.compile(
+    r"^(?:(?:please|just|go\s+ahead\s+and|can\s+you|could\s+you|"
+    r"would\s+you|will\s+you)[,\s]+)*"
+    r"(?:run|start|stop|restart|reboot|shut\s*down|kill|delete|remove|rm\b|"
+    r"install|update|upgrade|build|make|compile|deploy|launch|open|execute|"
+    r"format|wipe|clear|empty|move|rename|chmod|sudo)\b", re.I)
+
+_QUERY_KEYS = {"disk": "disk", "space": "disk", "drive": "disk",
+               "storage": "disk", "room": "disk", "uptime": "up",
+               "load": "load", "logged in": "who", "logged on": "who",
+               "on it": "who", "inbox": "inbox", "in the inbox": "inbox"}
+
+
+try:                                        # the mail lane's phrase layer
+    from jarvis import filephrase as _filephrase
+except ImportError:                         # pragma: no cover - lane dropped
+    _filephrase = None
+
+
+def _remote_conf(c):
+    return remote_mod.read_config(c._svc("assistant"))
+
+
+def _remote_resolve_local(said: str, conf):
+    """Spoken words -> ONE local file, the rivals, or a reason.
+
+    COORDINATION, not duplication. `jarvis/tools/filepick.py` is the shared
+    resolver both lanes rank and vet files with; the mail lane's
+    `jarvis/filephrase.py` is a PHRASE layer on top of it that understands
+    the shapes a bare name cannot -- "that file on my desktop" (a folder is
+    the handle, there is no name), "the PDF I just downloaded" (a type and a
+    recency). Those are exactly the phrases he uses for this lane too, so it
+    is used here rather than re-derived, and the two lanes cannot disagree
+    about what "that file" means.
+
+    ONE argument differs and it is deliberate: ``allow_explicit_outside`` is
+    FALSE here. The mail lane lets him attach a path he names outright from
+    anywhere (guarded by its DENY_ROOTS); this lane keeps filepick's hard
+    containment, because a push has a second machine's filesystem on the far
+    end and "put /etc/... on HPCOMPUTER" should not be sayable at all.
+
+    Falls back to the shared resolver alone if the phrase layer is absent,
+    so this lane still stands on its own.
+    """
+    if _filephrase is not None:
+        return _filephrase.resolve(said, roots=conf.local_roots,
+                                   max_mb=conf.max_mb,
+                                   allow_explicit_outside=False)
+    return filepick.pick(said, roots=conf.local_roots, max_mb=conf.max_mb)
+
+
+def _remote_blocked(c, conf):
+    """One honest line naming exactly what is missing, and no socket opened
+    to find it out. None when the lane is ready to try."""
+    reason = remote_mod.missing_reason(conf)
+    if not reason:
+        return None
+    return CommandResult(handled=True, speak=True,
+                         reply=remote_mod.fail_line(conf, reason),
+                         status=f"{conf.name}: not set up")
+
+
+def _remote_fail(conf, reason: str, status: str = ""):
+    return CommandResult(handled=True, speak=True,
+                         reply=remote_mod.fail_line(conf, reason),
+                         status=status or f"{conf.name}: {reason}")
+
+
+def _h_remote_status(c, t, m):
+    """Is it there? Answered from the LOCAL tailnet view first, so a machine
+    that is off or has never joined costs no socket and no wait -- and gets
+    a different sentence from one that is merely slow. Those three are not
+    the same problem and he should not have to guess which he has."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    state = remote_mod.tailnet_state(conf)
+    if state == "absent":
+        return _remote_fail(conf, "off-tailnet", f"{conf.name}: absent")
+    if state == "offline":
+        return _remote_fail(conf, "asleep", f"{conf.name}: asleep")
+    res = remote_mod.ask(conf, "up")
+    if not res.ok:
+        return _remote_fail(conf, res.reason)
+    up = " ".join((res.out or "").split())[:120]
+    line = f"{conf.name} is up, sir" + (f" -- {up}." if up else ".")
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status=f"{conf.name}: up")
+
+
+def _h_remote_query(c, t, m):
+    """One row of the read-only table. Unattended by design: the spoken words
+    choose a KEY, never a command."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    said = " ".join((m.group("q") or "").lower().split())
+    key = _QUERY_KEYS.get(said)
+    if not key:
+        return None
+    res = remote_mod.ask(conf, key)
+    if not res.ok:
+        return _remote_fail(conf, res.reason)
+    body = " ".join((res.out or "").split())[:200]
+    if not body:
+        return CommandResult(handled=True, speak=True,
+                             status=f"{conf.name}: nothing",
+                             reply="Nothing to report there, sir.")
+    say = remote_mod.QUERIES[key]["say"]
+    return CommandResult(handled=True, speak=True, status=f"{conf.name}: {key}",
+                         reply=f"On {conf.name}, {say}: {body}.")
+
+
+def _remote_ask_which(c, conf, names, resume):
+    """More than one file could be meant. ASK -- never pick the newer one.
+
+    Parked in the shared "Which one?" slot (``stash_filepick``) so the
+    answer can actually be heard: without it the question was spoken, the
+    follow-up microphone got the short window, and "the second one" was
+    classified as background chat and dropped in silence.
+    """
+    line = (f"I've more than one that could be, sir: "
+            f"{filepick.describe(names)}. Which one?")
+    c.stash_filepick(names, resume)
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Which one?")
+
+
+def _h_remote_push(c, t, m):
+    """Send ONE local file to the host's inbox, after reading it back.
+
+    Read back EVERY time, not only on a shaky transcript the way an alarm
+    is: an alarm set wrong is an annoyance, and this puts a file of his on
+    another machine, where it cannot be taken back."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    said = (m.group("what") or "").strip()
+
+    def _armed(path):
+        """Read the transfer back and wait. STRICT: the yes that spends this
+        is parse_send_answer's end-anchored grammar, not parse_yes_no --
+        a file on another machine is as irreversible as one in an email."""
+        if not remote_mod.inbox_target(conf, path.name):
+            return _remote_fail(conf, "odd-name", "Bad name")
+        question = f"Send {path.name} to {conf.name}'s inbox, sir?"
+
+        def _run():
+            res = remote_mod.push(conf, path)
+            if not res.ok:
+                return _remote_fail(conf, res.reason)
+            return CommandResult(handled=True, speak=True,
+                                 status=f"Sent to {conf.name}",
+                                 reply=f"{path.name} is on {conf.name}, sir.")
+
+        c.stash_destructive(_run, question, strict=True)
+        return CommandResult(handled=True, reply=question, speak=True,
+                             status="Confirm?")
+
+    pick = _remote_resolve_local(said, conf)
+    if pick.ambiguous:
+        def _resume(path):
+            again = _remote_resolve_local(str(path), conf)
+            if not again.ok:
+                size_mb = getattr(again, "size", 0) / (1024 * 1024)
+                return CommandResult(
+                    handled=True, speak=True, status="No such file",
+                    reply=filepick.reason_line(again.reason, conf.max_mb,
+                                               size_mb))
+            return _armed(again.path)
+        return _remote_ask_which(c, conf, pick.candidates, _resume)
+    if not pick.ok:
+        size_mb = getattr(pick, "size", 0) / (1024 * 1024)
+        return CommandResult(handled=True, speak=True, status="No such file",
+                             reply=filepick.reason_line(pick.reason,
+                                                        conf.max_mb, size_mb))
+    return _armed(pick.path)
+
+
+def _h_remote_pull(c, t, m):
+    """Fetch ONE file from an allow-listed remote folder, after reading back
+    the name the REMOTE reported -- not the one that was said."""
+    conf = _remote_conf(c)
+    blocked = _remote_blocked(c, conf)
+    if blocked is not None:
+        return blocked
+    said = (m.group("what") or "").strip()
+    key = (m.group("where") or "outbox").lower()
+    names, why = remote_mod.list_remote(conf, key)
+    if why:
+        return _remote_fail(conf, why)
+    if not names:
+        return CommandResult(handled=True, speak=True, status="Empty",
+                             reply=f"There's nothing in {conf.name}'s "
+                                   f"{key}, sir.")
+
+    def _armed(name: str):
+        dest = remote_mod.pull_target(conf, name)
+        question = (f"Bring {name} from {conf.name} to your "
+                    f"{dest.parent.name}, sir?")
+
+        def _run():
+            res = remote_mod.pull(conf, key, name)
+            if not res.ok:
+                return _remote_fail(conf, res.reason)
+            return CommandResult(handled=True, speak=True, status="Fetched",
+                                 reply=f"{name} is on your "
+                                       f"{dest.parent.name}, sir.")
+
+        # STRICT, for the same reason the push is: this one lands a
+        # stranger's file on HIS disk and can overwrite nothing, but it is
+        # still a transfer he must have actually said yes to.
+        c.stash_destructive(_run, question, strict=True)
+        return CommandResult(handled=True, reply=question, speak=True,
+                             status="Confirm?")
+
+    pick = remote_mod.match_remote(said, names)
+    if pick.ambiguous:
+        return _remote_ask_which(
+            c, conf, pick.candidates,
+            lambda path: _armed(Path(path).name))
+    if not pick.ok:
+        return CommandResult(handled=True, speak=True, status="No such file",
+                             reply=f"I can't see anything by that name in "
+                                   f"{conf.name}'s {key}, sir.")
+    return _armed(pick.path.name)
+
+
+def _h_remote_freeform(c, t, m):
+    """The last door, and the one that defines the lane: an instruction
+    aimed at the other machine that is not a file move or a listed question
+    is REFUSED, out loud, and never handed to the model.
+
+    This is the whole safety argument in one function. A voice channel with
+    a measurable false-accept rate cannot be given a shell on a second
+    machine -- "delete the logs on the HP" and "delete the block on the HP"
+    differ by one phoneme, and only one of them is recoverable. The useful
+    part of a remote shell is already covered by the read-only table above;
+    what is left is unbounded, so it does not exist.
+    """
+    conf = _remote_conf(c)
+    said = _oracle_group(m, "cmd", "cmd2", "cmd3")
+    if not said or not _REMOTE_ORDER_RX.match(said.strip()):
+        # A mention, not an order ("the music's playing on HPCOMPUTER"):
+        # not this lane's business, so it goes to the model.
+        return None
+    log.info("remote: refusing a free-form order aimed at %s", conf.name)
+    return CommandResult(handled=True, speak=True, status="Refused",
+                         reply=remote_mod.FREEFORM_REFUSAL.format(
+                             name=conf.name))
+
+
+# ---- Email a file (jarvis/outbox.py, 2026-09-02) --------------------------
+# "Email this file to this person from this location on my desktop", which is
+# how he asked for it. Two irreversible things happen at once -- a file
+# leaves the machine, and it leaves it wearing one of his three identities --
+# so this family arms NOTHING on the first utterance. It builds a draft,
+# reads back the file, the size, the address and the account, and waits
+# (_try_send_confirm). Anything it is not sure of becomes a question.
+#
+# Placed AFTER the HPCOMPUTER family on purpose. "Send the budget to
+# HPCOMPUTER" is a transfer, not an email, and _REMOTE_PUSH_RX must have the
+# first claim on it; _SEND_NOT_RX repeats the guard by name so the ordering
+# is belt and braces rather than the only thing holding it.
+_SEND_OPENER = (r"^(?:jarvis[,\s]+)?"
+                r"(?:(?:please|can you|could you|would you|will you|"
+                r"i(?:'d| would) like you to|i want you to|"
+                r"go ahead and)[,\s]+)*")
+_SEND_VERB = r"(?:e-?mail|send|share|forward on|shoot|fire)"
+# Two shapes, and only two:
+#   A  "email <the lab report> to <Heather> [from my <school> account]"
+#      ("share <X> WITH <Y>" is the same shape; "with" is in the
+#      preposition list because that is how a share is phrased, and the
+#      worst it can do is make an odd sentence ask who the recipient is.)
+#   B  "send <Heather> <the lab report>"
+# B is the loose one -- "send me the weather" fits it perfectly -- so its
+# handler refuses to act unless the recipient RESOLVES to a real address in
+# the people book or the contacts map. A is anchored by an explicit "to".
+_SEND_FILE_RX = re.compile(
+    _SEND_OPENER + _SEND_VERB + r"\s+"
+    r"(?:(?P<file_a>\S.*?)\s+(?:to|over to|across to|with)\s+(?P<who_a>\S.*?)"
+    r"|(?P<who_b>[a-z][\w'.\-]*(?:\s+[a-z][\w'.\-]*)?)\s+"
+    r"(?P<file_b>(?:the|my|that|this|a|an)\s+\S.*?))"
+    r"(?:\s+(?:from|using|via|out of|off)\s+(?:my\s+|the\s+)?"
+    r"(?P<acct>[\w'\-]+(?:\s+[\w'\-]+)?)\s+"
+    r"(?:account|address|mailbox|e-?mail))?"
+    r"[\s,.!?]*$", re.I)
+
+# The NEGATIVE table. He says "send", "email" and "file" in ordinary
+# sentences all day, and every line here is one of those sentences. A hit
+# returns None, so the utterance keeps whatever meaning it already had --
+# usually the model's.
+_SEND_NOT_RX = re.compile(
+    # 1. A QUESTION or a report about sending, not an order to send. The
+    #    polite openers (can you / could you / would you / please) are
+    #    consumed by _SEND_OPENER above and are deliberately absent here.
+    r"^(?:did|do|does|has|have|had|is|are|was|were|should|shall|am|ain'?t|"
+    r"when|what|why|how|who|whom|whose|where|which)\b"
+    # 2. NARRATION. "I need to send the lab report to Heather" is him
+    #    thinking out loud about a chore, not handing it to me.
+    r"|^(?:i|we)\s+(?:need|want|have|had|ought|meant|forgot|should|must|"
+    r"will|'ll|am|was|might|may|could|would|still|just)\b"
+    r"|\b(?:already |just )?(?:sent|emailed|e-mailed|forwarded|mailed)\b"
+    # 3. ANOTHER CHANNEL. Texts and calls were ruled OUT of this queue by
+    #    name ("email send with read-back, NO texts/calls"), and Discord
+    #    and Spotify are other lanes in this same file.
+    r"|" + _SEND_VERB + r"\s+(?:\w+\s+){0,3}?"
+    r"(?:a |an |the |my |him |her |them |me )?"
+    r"(?:text|texts|sms|imessage|dm|voicemail|whatsapp)\b"
+    r"|\bto\s+(?:discord|slack|whatsapp|my\s+phone|the\s+group\s+chat)\b"
+    # 4. HPCOMPUTER. The remote lane owns every phrasing that names the
+    #    other machine; _HPC is its own definition, shared so the two
+    #    cannot drift apart.
+    r"|\b(?:to|onto|on|over to|across to)\s+" + _HPC +
+    # 5. MAIL VERBS THIS IS NOT. Replying, forwarding and unsubscribing all
+    #    act on a message that already exists; this feature makes a new one.
+    r"|^(?:reply|respond|forward|unsubscribe|archive)\b"
+    r"|\breply\s+to\b|\brespond\s+to\b"
+    # 6. "file" as a VERB. "File that away", "file a report".
+    r"|\bfile\s+(?:it|that|this|them|these)?\s*(?:away|under|a |an )\b"
+    # 7. Objects that are not files. Each of these fits shape A perfectly
+    #    ("send my location to Heather") and none of them is an attachment.
+    r"|" + _SEND_VERB + r"\s+(?:\w+\s+){0,2}?"
+    r"(?:a |an |the |my |your )?"
+    r"(?:reminder|invite|invitation|meeting|link|url|password|money|"
+    # `apolog` was the one stem here, and \b after it never matched:
+    # "apolog" + "y" is not a word boundary, so "send an apology to my
+    # professor" reached the send lane and was answered "I can't find a
+    # file by that name, sir." Both endings, spelled out.
+    r"payment|song|track|playlist|location|weather|apolog(?:y|ies)|"
+    r"regards|love|thanks|note to self)\b",
+    re.I)
+
+# The read-back's answer, with its OWN end-anchored grammar and NOT
+# parse_yes_no. parse_yes_no is a word BAG that waives its overheard-speech
+# guard whenever the first word is a yes word, which is how the ten-word
+# "Yeah, so you should be able to look that up." (jarvis.log.1:19499, a real
+# line that answered nothing) read as a yes and delivered a whole briefing.
+# Delivering a briefing by accident costs a briefing. Sending a file by
+# accident cannot be undone, so this grammar is the briefing offer's shape
+# and a NARROWER vocabulary: an answer here is the word, a courtesy, and
+# nothing else.
+# The separator is [.!?,\s]+ and not [,\s]+ because Whisper punctuates:
+# "Yes. Thank you." is one of his own logged answers (jarvis.log.1:17109)
+# and a comma-only separator made the full stop end the sentence, so a
+# clean yes fell through to the silent-drop branch while "yes, thank you"
+# worked. The words that may follow are unchanged -- this widens the
+# PUNCTUATION, not the vocabulary.
+_SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|"
+              r"it|that|send it|send that|go ahead|do it))*[?.!]*$")
+# "ok" / "okay" / "sure" / "alright" are deliberately ABSENT. They are the
+# words a man says while still reading the read-back, and this is the one
+# question in the app where "probably yes" must not be enough. They are
+# caught by _SEND_MAYBE_RX below and asked again rather than dropped in
+# silence -- silence is how he learns the feature does not work.
+_SEND_YES_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?"
+    r"(?:yes|yeah|yep|yup|aye|affirmative|correct|confirmed?|certainly|"
+    r"absolutely|definitely|of course|go ahead|do it|send it|send that|"
+    r"send it now|please do|that'?s right|fire away|off you go)"
+    + _SEND_TAIL, re.I)
+_SEND_NO_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:no[,\s]+)?"
+    r"(?:no|nope|nah|negative|don'?t|do not|stop|cancel|abort|"
+    r"not now|not yet|not that one|wrong one|wrong file|wrong person|"
+    r"hold on|hold off|wait|never ?mind|forget it|scratch that|leave it|"
+    r"no thanks|no thank you|that'?s wrong)" + _SEND_TAIL, re.I)
+_SEND_MAYBE_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?"
+    r"(?:ok(?:ay)?|alright|all right|sure|fine|right|very well|mhm|mm|"
+    r"uh huh|i guess|i suppose|maybe|probably|whatever|sounds good|"
+    r"i think so|if you like|why not)" + _SEND_TAIL, re.I)
+
+
+# ---- "Which one, sir?" ---------------------------------------------------
+# BOTH file lanes ask this ("I've 2 that could be the lab report, sir: lab
+# report.pdf or lab report final.pdf. Which one?") and until now neither
+# could hear the answer: prepare() returned a question with no draft, so
+# nothing was parked, question_open() stayed False, the app sized the
+# follow-up microphone at 4 s, and "the final one" was then classified as
+# background chat and dropped in SILENCE. That is the same failure his
+# issue #8 was about, and it lands on the exact case the ambiguous branch
+# was written for -- lab_report.pdf against lab_report_final.pdf.
+#
+# So the offer is parked, like every other question Jarvis asks, and this
+# is its grammar. Deliberately narrow: an ordinal, or a name that scores
+# clearly against ONE of the candidates it just read out. Anything else
+# drops the slot and keeps its own meaning -- a wrong pick here sends the
+# wrong file, which is the mistake the question exists to prevent.
+FILEPICK_TTL_S = 45.0
+
+_PICK_ORDINALS = {"first": 0, "1st": 0, "one": 0, "1": 0,
+                  "second": 1, "2nd": 1, "two": 1, "2": 1, "other": 1,
+                  "third": 2, "3rd": 2, "three": 2, "3": 2,
+                  "fourth": 3, "4th": 3, "four": 3, "4": 3,
+                  "fifth": 4, "5th": 4, "five": 4, "5": 4}
+_PICK_ORDINAL_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:(?:the|number|no\.?|option)\s+)*"
+    r"(?P<n>first|second|third|fourth|fifth|last|latest|newest|other|"
+    r"1st|2nd|3rd|4th|5th|one|two|three|four|five|[1-5])"
+    r"(?:\s+one)?(?:[,\s]+(?:please|sir|jarvis|thanks))*[\s,.!?]*$", re.I)
+_PICK_CANCEL_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:no|nope|nah|neither|none|not (?:that|those|"
+    r"either|any)|cancel|stop|forget it|never ?mind|leave it|"
+    r"don'?t bother|skip it)\b", re.I)
+
+
+def pick_from_answer(text, candidates) -> tuple:
+    """(the candidate he named, was it a near miss).
+
+    Two readings and no third. An ORDINAL ("the second one", "the last
+    one", "the other one") indexes the list exactly as it was read out. A
+    NAME is scored against the candidates with the same scorer that offered
+    them, and has to beat its nearest rival by more than
+    ``filephrase.TIE_SCORE`` -- the very band that called these two
+    ambiguous in the first place. Anything narrower would let him repeat
+    the ambiguous phrase and get a guess, which is the mistake the question
+    exists to prevent.
+
+    (None, True) is the near miss: he was plainly naming one of them and
+    the margin was not there. The caller asks once more rather than
+    dropping it in silence. (None, False) is "not an answer at all".
+    """
+    said = " ".join(str(text or "").split())
+    cands = [Path(c) for c in (candidates or ())]
+    if not said or not cands:
+        return None, False
+    m = _PICK_ORDINAL_RX.match(said)
+    if m:
+        word = m.group("n").lower()
+        if word in ("last", "latest", "newest"):
+            return cands[-1], False
+        # "the other one" is only meaningful when there are exactly two.
+        if word == "other" and len(cands) != 2:
+            return None, True
+        idx = _PICK_ORDINALS.get(word)
+        if idx is not None and idx < len(cands):
+            return cands[idx], False
+        return None, True
+    trimmed = re.sub(r"^(?:jarvis[,\s]+)?(?:the\s+)?", "", said, flags=re.I)
+    trimmed = re.sub(r"\s+(?:one|file|please|sir)\b[\s,.!?]*$", "", trimmed,
+                     flags=re.I).strip(" ,.!?")
+    if not trimmed:
+        return None, False
+    scored = sorted(((filepick.score(trimmed, c.name), c) for c in cands),
+                    key=lambda t: (-t[0], len(t[1].name), t[1].name))
+    if scored[0][0] < filepick.FUZZY_FLOOR:
+        return None, False
+    tie = getattr(_filephrase, "TIE_SCORE", 0.12) if _filephrase else 0.12
+    if len(scored) > 1 and scored[1][0] > scored[0][0] - tie:
+        return None, True
+    return scored[0][1], False
+
+
+def parse_send_answer(text) -> Optional[bool]:
+    """True / False / None for a read-back answer. None is "not an answer".
+
+    NO is tested first: "no, send it" is a contradictory sentence and the
+    safe reading of it is the one where nothing leaves the machine.
+    """
+    t = " ".join(str(text or "").split())
+    if not t:
+        return None
+    if _SEND_NO_RX.match(t):
+        return False
+    if _SEND_YES_RX.match(t):
+        return True
+    return None
+
+
+def _send_file_pieces(c, t, m=None):
+    """The pieces of a send-a-file request -- or None, meaning this lane has
+    no claim on the sentence and it keeps whatever meaning it already had.
+
+    ONE claim rule, used by the handler AND by the intent-gate probe
+    (``Commander._match_assistant``), so the two cannot disagree about what
+    counts as a send. The gate is why it matters: a Tier-1 name match turns
+    the classifier OFF, and the raw ``_SEND_FILE_RX`` is far too generous to
+    be that switch on its own.
+
+    Three tests, cheapest first:
+
+    1. the NEGATIVE table gets first refusal, as it always did -- but now
+       BEFORE the gate is switched off rather than after, so "send my
+       regards to Heather" and "send a text to Heather" are background
+       chat again instead of sentences the model answers out loud;
+    2. the RECIPIENT is resolved BEFORE the file, because that is the half
+       that says whether the sentence was addressed to Jarvis at all.
+       "Send the kids to bed", "send flowers to my mom", "share my screen
+       with the class" all fit shape A perfectly and name nobody he can
+       write to. Shape B always demanded this; shape A never did, and it
+       claimed 28 of 33 everyday sentences measured against it;
+    3. a recipient that does not resolve is fatal -- UNLESS the file phrase
+       names something really on his disk. That exception is the whole
+       reason "email the biosensors handout to Dana" is still answered
+       "I've no address for Dana, sir. What is it?" instead of vanishing:
+       he named a real file, so he was plainly talking to me.
+    """
+    if _SEND_NOT_RX.search(t):
+        return None
+    cfg = c._svc("assistant")
+    if cfg is None:
+        return None
+    lm = m or _SEND_FILE_RX.match(t)
+    if lm is None:
+        return None
+    # The lower-cased match gives the SHAPE; the file name has to come back
+    # from the original casing, or "Lab_Report.pdf" is looked for as
+    # "lab_report.pdf" -- which is a different file on a case-sensitive
+    # filesystem and no file at all on the day he has both.
+    raw = _raw_cmd_text(c)
+    rm = (_SEND_FILE_RX.match(raw) if raw else None) or lm
+    shape_a = bool(lm.group("file_a"))
+    said_file = (rm.group("file_a") or rm.group("file_b") or "").strip()
+    who = (rm.group("who_a") or rm.group("who_b") or "").strip()
+    hint = (rm.group("acct") or "").strip()
+    memory = c._svc("memory")
+    addr, _ = outbox.resolve_recipient(cfg, memory, who)
+    if not addr:
+        if not shape_a:
+            log.info("send-file: %r names no one I can write to", who)
+            return None
+        if not outbox.names_a_real_file(cfg, said_file):
+            log.info("send-file: %r names neither a file nor a correspondent",
+                     t[:60])
+            return None
+    return said_file, who, hint, addr
+
+
+def _send_file_offer(c, prep, who: str, hint: str):
+    """"Which one, sir?", parked so the answer can be heard.
+
+    Without the slot this branch was a dead end: the question was spoken,
+    nothing was armed, the follow-up microphone got the short window and
+    every natural answer ("the final one", "lab report final") was then
+    called background chat and dropped without a word.
+    """
+    cfg = c._svc("assistant")
+
+    def _resume(path):
+        again = outbox.prepare(cfg, c._svc("memory"), str(path), who,
+                               account_hint=hint, chosen=path)
+        if again.draft is None:
+            return CommandResult(handled=True, reply=again.ask, speak=True,
+                                 status=again.status)
+        c.stash_send(again.draft)
+        return CommandResult(handled=True, speak=True, status=again.status,
+                             reply=outbox.read_back(again.draft))
+
+    c.stash_filepick(prep.candidates, _resume)
+    return CommandResult(handled=True, reply=prep.ask, speak=True,
+                         status=prep.status)
+
+
+def _h_send_file(c, t, m):
+    """Arm a file send and read it back. Nothing is sent from here."""
+    pieces = _send_file_pieces(c, t, m)
+    if pieces is None:
+        log.info("send-file: %r is not a send-a-file request", t)
+        return None
+    said_file, who, hint, _addr = pieces
+    # ONE read-back at a time. Every ordinary path spends _pending_send in
+    # _try_send_confirm before a second send can arm, so this is reached
+    # only inside a single turn -- the compound "email A to Heather and
+    # email B to Heather", where arming twice speaks two questions and
+    # leaves only the second one answerable.
+    live = getattr(c, "_pending_send", None)
+    if live is not None and not live.stale():
+        return CommandResult(handled=True, speak=True, status="One at a time",
+                             reply="There's one waiting on your yes already, "
+                                   "sir; that one first.")
+    prep = outbox.prepare(c._svc("assistant"), c._svc("memory"), said_file,
+                          who, account_hint=hint)
+    if prep.draft is None:
+        if prep.candidates:
+            return _send_file_offer(c, prep, who, hint)
+        return CommandResult(handled=True, reply=prep.ask, speak=True,
+                             status=prep.status)
+    c.stash_send(prep.draft)
+    return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
+                         speak=True, status=prep.status)
+
+
 def _h_network(c, t, m):                                   # 3267-3279
     net = c._svc("context").check_connectivity()
     status = "Online" if net.get("internet") else "Offline"
@@ -5252,6 +5931,170 @@ def _h_ui_look(c, t, m):
                              status=f"Visuals: {name} saved, env pins {pinned}")
     return CommandResult(handled=True, speak=True, reply=UI_LOOK_LINES[name],
                          status=f"Visuals: {name} (restart)")
+
+
+# The conversation pane (jarvis/ui/views.py TranscriptView), 2026-09-02.
+# 23:26:01 he said "Clear the transcript" and the intent gate answered
+# "Ignored (background chat, conf=0.80)": three words, no rung, dropped in
+# silence. This is that rung.
+#
+# THE SCREEN ONLY, and the line says so. Wiping the pane is cosmetic and
+# costs nothing; wiping the conversation the model sees (jarvis/memory.py,
+# the context engine) changes what Jarvis knows mid-sentence. He asked for
+# "the transcript", which is the thing in front of him, so that is what he
+# gets -- and he is told the memory is intact rather than left to wonder
+# whether Jarvis has just forgotten the last ten minutes.
+#
+# The collision this grammar exists to survive: "clear" is already his verb
+# for his LISTS ("clear the shopping list", 09-01 12:12 and 20:58). Two
+# defences, because this repo has shipped this bug before -- a widened undo
+# grammar quietly ate "cancel that one". First, the noun set below is a
+# closed list of words that can only mean the pane, and "list" is not in it
+# nor is it an accepted trailing word, so "clear my shopping list" cannot
+# match at all. Second, this rung sits BELOW the named-list family in the
+# registry, so even a future widening hands "... list" to the lists.
+#
+# Nouns considered and REFUSED. "memory" outright: that is the context
+# wipe, which this rung must never do. "history" and "log" on their own,
+# because "clear the history" is the clipboard's and "clear the log" is a
+# file; they are accepted only AFTER a pane noun, where "clear the chat
+# history" can mean nothing else.
+_TRANSCRIPT_NOUN = r"(?:transcript|screen|display|console|chat|conversation)"
+# THE LEFT EDGE (added 2026-09-03, review).  _JV alone is the house
+# convention -- 41 rungs open with it and exactly one, _ADJUST_SCHED_RX,
+# also takes a leading "please" -- but on THIS rung that convention lands
+# his ordinary phrasing in the very silent drop the rung was built to end:
+# measured through the shipping ladder, "please clear the transcript",
+# "can you clear the transcript", "go ahead and clear the transcript" and
+# even the explicitly-addressed "jarvis please clear the transcript" all
+# reached NO rung and were handed to a model that has no tool to clear
+# anything.  Repeated (`*`) because "please can you" and "jarvis, go ahead
+# and" are each one breath; every alternative eats a whole word plus its
+# space, so the group cannot spin on an empty match.  It sits on BOTH
+# sides of _JV -- he says "jarvis, please clear..." and "please, jarvis,
+# clear..." interchangeably.
+#
+# Widening the LEFT edge cannot reach his lists.  The language is still
+# end-anchored on the closed pane-noun set below, and "list" is in neither
+# that set nor the trailing words, so "please clear the shopping list"
+# still cannot match at all -- the negative table in
+# tests/test_clear_transcript.py asserts every one of his logged list
+# utterances against the shipping dispatch order, not against this regex
+# alone.
+_LEAD_COURTESY = (r"(?:(?:please|can you|could you|would you|will you|just|"
+                  r"go ahead and|let's|lets),?\s+)*")
+_TRANSCRIPT_CLEAR_RX = re.compile(
+    r"^" + _LEAD_COURTESY + _JV + _LEAD_COURTESY +
+    r"(?:clear|wipe|erase|empty|blank|clean|scrub|reset)\s+(?:out\s+)?"
+    # "that" was missing while "this" and "your" were in, so "clear that
+    # transcript" was dropped in silence -- the same class of miss as the
+    # 23:26:01 log line this rung answers.  The set is now the union of
+    # this one and _LIST_CLEAR_RX's (my|the|our), so the two no longer
+    # differ for no stated reason; a determiner cannot cause a collision,
+    # the noun after it can, and that set is closed.
+    r"(?:the|my|this|that|your|our)?\s*(?:(?:whole|entire|full)\s+)?"
+    + _TRANSCRIPT_NOUN +
+    r"(?:\s+(?:pane|panel|window|view|log|history|area))?"
+    r"(?:\s+(?:clean|out|off))?"
+    r"(?:\s+(?:right\s+)?now)?"
+    r"(?:[, ]+(?:please|jarvis|sir|for me|would you|will you|thanks))*"
+    r"[?.!]*$", re.I)
+# Both facts in one breath: the memory is untouched, and the cards do not
+# come back. No read-back and no undo= go with it -- see _h_transcript_clear.
+TRANSCRIPT_CLEAR_LINE = ("Screen's clear, sir. Nothing forgotten — "
+                         "and nothing to bring back.")
+
+
+def _standing_questions(c) -> int:
+    """How many approval questions are still waiting on him.
+
+    TranscriptView.clear_all deliberately KEEPS an unanswered approval
+    card -- it carries the only hand-answerable ALLOW / DENY for a Claude
+    run that is blocked on it -- so in that one case the pane is NOT clear
+    when the wipe lands, and "Screen's clear, sir" would be the wrong
+    thing to say.  The wipe itself is fire-and-forget (the commander runs
+    on worker threads and must never touch a Tk surface), so the fact is
+    read from the approvals SERVICE, which is the same fact the pane is
+    keying on: ApprovalService.pending() holds exactly the requests whose
+    cards are unanswered, and answer()/_resolve() is the only thing that
+    empties it.
+
+    Reading it here rather than reporting it back from the window is also
+    the only version that cannot lose a race: a Status published from
+    inside _ev_transcript_clear lands BEFORE the CommandResult's own
+    status (the bus is a queue, and _emit_result publishes the reply and
+    the status after the wipe was queued), so the window's correction
+    would be overwritten by the flat "Transcript cleared".
+
+    Never raises and never blocks the wipe: with no approvals service, or
+    a service that throws, this answers 0 and the plain line is spoken.
+    """
+    ap = c._svc("approvals") if hasattr(c, "_svc") else None
+    if ap is None:
+        return 0
+    try:
+        return len(ap.pending() or ())
+    except Exception:                           # noqa: BLE001 - cosmetic
+        log.exception("approvals.pending failed; reporting a plain wipe")
+        return 0
+
+
+def transcript_clear_line(held: int) -> str:
+    """The spoken confirmation, told plainly: what he actually got.
+
+    The brief's rule for this rung was to say what happened rather than
+    leave it to be guessed at, which is why the plain line names both the
+    memory and the missing undo.  The held case is the same rule: he hears
+    that one card stayed and why, instead of hearing "Screen's clear" and
+    seeing a card, with an 1800 ms toast as the only correction.
+    """
+    if held <= 0:
+        return TRANSCRIPT_CLEAR_LINE
+    what = "one question" if held == 1 else f"{held} questions"
+    those = "that card" if held == 1 else "those cards"
+    return (f"Screen's clear bar {what} still waiting on you, sir — "
+            f"I've left {those} up. Nothing forgotten, and nothing to "
+            f"bring back.")
+
+
+def transcript_clear_status(held: int) -> str:
+    """The status strip's line -- it outlives the toast, which is the
+    point: the toast under the held card is gone in 1.8 s."""
+    if held <= 0:
+        return "Transcript cleared"
+    s = "" if held == 1 else "s"
+    return f"Transcript cleared — {held} question{s} left standing"
+
+
+def _h_transcript_clear(c, t, m):
+    """Empty the console's conversation pane.
+
+    Fire-and-forget on the bus: the commander runs on worker threads and
+    must never touch a Tk surface, so the window subscribes and does the
+    work (main_window._ev_transcript_clear). The event is queued BEFORE
+    _emit_result publishes this reply, and the bus is FIFO, so the wipe
+    lands first and the confirmation is the one card left on the glass.
+
+    No needs= and no service check. The transcript is the main window, not
+    an optional second surface like the Board, and with no window running
+    there is no one listening to mislead.
+
+    Deliberately NOT destructive-confirmed and deliberately NOT undoable.
+    _h_list_clear stashes a read-back because it destroys DATA he would have
+    to dictate again; nothing is lost here, so a "are you sure, sir?" on a
+    screen wipe would only stand between him and an empty pane. undo=None
+    leaves "scratch that" its old meaning rather than offering a restore
+    this rung cannot honour -- which is exactly why the line says so.
+
+    The one case where the pane does NOT come out empty -- a question still
+    waiting on him, which clear_all keeps on purpose -- is counted BEFORE
+    the wipe is queued and said out loud, so the reply and the status strip
+    both match the glass. See _standing_questions.
+    """
+    held = _standing_questions(c)
+    bus.publish(ClearTranscript())
+    return CommandResult(handled=True, reply=transcript_clear_line(held),
+                         speak=True, status=transcript_clear_status(held))
 
 
 def _dnd_seconds(c, mode: str, when: str, now: datetime) -> Optional[float]:
@@ -5804,6 +6647,147 @@ def _h_sensing_curfew(c, t, m):
     return _sensing_result(
         SENSING_CURFEW_SET_LINE.format(start=words[0], end=words[1]),
         "Camera curfew %s–%s" % words)
+
+
+# ---- Tier 1 face enrolment: the way in, and what the gallery knows -------
+# THE ENTRY POINT HE ASKED FOR ("add the enrollment option into Jarvis"),
+# and it is deliberately an entry point rather than a capture surface. The
+# guided run needs the camera device the running Jarvis owns, a key press
+# between stations, and produces thirty lines of numbers he PASTES -- three
+# things a spoken assistant is the wrong shell for. So "enrol my face" hands
+# over the exact command -- with his label in it, and with --pose and
+# --append too when he named what he will be doing ("enrol my face looking
+# at my phone") -- and puts it on the clipboard, while "who do you recognise"
+# is answered in full, here, because none of that needs a lens. See
+# jarvis/enrolentry.py.
+#
+# DELETING IS HANDED OVER TOO. "Forget Heather's face" arrives as a
+# speech-recognition result, and a misheard word may not destroy biometric
+# data; the typed confirmation stays in the terminal.
+#
+# WHY WHO IS TWO TOKENS AND NOT A FREE SPAN. The first cut of this grammar
+# let 31 arbitrary characters -- SPACES INCLUDED -- sit between the verb and
+# the word "face", which turns every ordinary "<verb> <something> face"
+# utterance into a face command: "add a reminder to wash my face" enrolled
+# somebody called "a-reminder-to-wash-my", spoke a forty-word consent
+# paragraph and overwrote his clipboard, and because these three are in
+# ASSISTANT_TIER1 it did that WITHOUT the background-chat intent gate ever
+# getting a say. So WHO is at most two name-shaped tokens, and no token may
+# be a function word: with that, "add cream for my face", "remove the hair
+# from my face", "delete that photo of my face" and "forget what I said
+# about her face" all fail to match at all and fall through to the model,
+# which is what they were always meant to do. Swept against 582 real
+# utterances (his live log plus every tests/ handle()) -- nothing he has
+# ever said changes hands.
+_FACE_STOP = (r"for|to|from|of|about|that|this|on|in|at|by|with|and|but|or|it|"
+              r"is|was|what|which|when|while|if|so|there|here|all|any|some")
+_FACE_TOK = r"(?!(?:%s)\b)[a-z][a-z0-9'\u2019_-]{0,19}" % _FACE_STOP
+_FACE_WHO = r"(?P<who>%s(?:\s+%s)?)" % (_FACE_TOK, _FACE_TOK)
+# NAMING THE POSE IS THE FEATURE, not decoration: "add more ways for me to be
+# recognised (looking at my phone, looking away)" is what was asked for, and
+# without this the --pose half of the script was unreachable from inside
+# Jarvis and --append with it -- so every spoken enrolment was a pool-
+# REPLACING run. The clause is bounded and introduced by a fixed word, and
+# enrolentry.command_line shlex-quotes it before it reaches the clipboard.
+_FACE_POSE = (r"(?:\s+(?P<pose>(?:looking|facing|turned|wearing|holding|with|"
+              r"while|when|without)\s+[a-z0-9][a-z0-9 '\u2019_-]{0,60}?))?"
+              )
+_FACE_TAIL = r"(?:[,\s]+(?:please|now|sir|again))*[?.!\s]*$"
+_FACE_ENROL_RX = re.compile(
+    r"^(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:(?:enroll?|register|add|remember|learn|memori[sz]e)\s+" + _FACE_WHO +
+    r"(?:'s|\u2019s)?\s+face"
+    r"(?:\s+(?:in|into|to)\s+(?:the\s+)?(?:gallery|camera))?"
+    r"|(?:enroll?|register)\s+(?P<mine>me|myself))" + _FACE_POSE + _FACE_TAIL,
+    re.I)
+_FACE_FORGET_RX = re.compile(
+    r"^(?:please\s+|can\s+you\s+|could\s+you\s+)?"
+    r"(?:forget|delete|remove|unenrol|unenroll)\s+" + _FACE_WHO +
+    r"(?:'s|\u2019s)?\s+face"
+    r"(?:\s+from\s+(?:the\s+)?gallery)?" + _FACE_TAIL, re.I)
+_FACE_GALLERY_RX = re.compile(
+    r"^(?:"
+    r"(?:who(?:se)?|what|how\s+many)\s+faces?\s+do\s+you\s+"
+    r"(?:know|recogni[sz]e|have)"
+    r"|who\s+do\s+you\s+recogni[sz]e"
+    r"|who(?:'s|\u2019s| is)\s+in\s+(?:the\s+)?face\s+gallery"
+    r"|(?:what(?:'s| is)\s+)?(?:in\s+)?(?:the\s+)?face\s+gallery"
+    r"|(?:whose\s+)?faces?\s+(?:are\s+)?enrol(?:l)?ed"
+    r"|am\s+i\s+enrol(?:l)?ed"
+    r"|face\s+enrol(?:l)?ment\s+status"
+    r"|which\s+(?:of\s+my\s+)?(?:pose|take)s?\s+is\s+(?:the\s+)?weak(?:est)?"
+    r")" + _FACE_TAIL, re.I)
+
+
+def _face_owner(c) -> str:
+    """His label, from HIS config -- never from the gallery.
+
+    This is where the ruling is anchored on this side too: the set of
+    enrolled names may grow without the set of privileged names growing by
+    one, because "owner" is a config value and a recognised face cannot
+    write the config."""
+    cfg = c._svc("assistant")
+    name = ""
+    if cfg is not None:
+        try:
+            name = str(cfg.get("user.name", "") or "")
+        except Exception:  # noqa: BLE001 - a config that cannot say is not
+            log.debug("face: could not read user.name", exc_info=True)
+    name = name.strip().lower()
+    keep = "".join(ch for ch in name if ch.isalnum() or ch in "-_")
+    return keep or "hunter"
+
+
+def _face_gallery():
+    from jarvis.facegallery import default_gallery
+    return default_gallery()
+
+
+def _h_face_enrol(c, t, m):
+    """"Enrol my face" / "add Heather's face to the gallery" / "enrol my face
+    looking at my phone"."""
+    from jarvis import enrolentry as ee
+    owner = _face_owner(c)
+    # "enrol me" names him with no WHO group at all; anything else names the
+    # person, or names nobody and gets asked.
+    spoken = m.group("who") or ("my" if m.groupdict().get("mine") else "")
+    who = ee.spoken_label(spoken, owner)
+    if not who:
+        return CommandResult(
+            handled=True, speak=True,
+            reply="Whose face, sir? Say \"enrol my face\", or give me the "
+                  "name to store it under.",
+            status="Enrolment: whose?")
+    pose = ee.spoken_pose(m.groupdict().get("pose") or "")
+    out = ee.enrol_answer(_face_gallery(), who, owner=owner,
+                          poses=(pose,) if pose else ())
+    return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         status=out["status"])
+
+
+def _h_face_forget(c, t, m):
+    """"Forget Heather's face" -- which deletes nothing. See the block
+    comment above: a misheard word may not destroy biometric data."""
+    from jarvis import enrolentry as ee
+    owner = _face_owner(c)
+    who = ee.spoken_label(m.group("who") or "", owner)
+    if not who:
+        return CommandResult(handled=True, speak=True,
+                             reply="Whose face, sir?",
+                             status="Face gallery: whose?")
+    out = ee.forget_answer(_face_gallery(), who, owner=owner)
+    return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         status=out["status"])
+
+
+def _h_face_gallery(c, t, m):
+    """"Who do you recognise?" / "which pose is weakest?" -- the half of
+    this feature that genuinely belongs in the window, because it reads a
+    file and opens nothing."""
+    from jarvis import enrolentry as ee
+    out = ee.gallery_answer(_face_gallery(), owner=_face_owner(c))
+    return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         status=out["status"])
 
 
 def _h_quiet_status(c, t, m):
@@ -6545,6 +7529,114 @@ def _board_svc(c):
     return c._svc("board")
 
 
+# ---- the cast: grab-and-throw by voice (jarvis/gesturecast.py) ---------
+# Hunter, 2026-09-03: "reach out and grab at the screen ... throwing the
+# cast onto the HPCOMPUTER". The gesture itself is the camera's; these are
+# the same verbs by voice, with the camera off, and the cancel for a live
+# carry. EVERY pattern is whole-utterance and ends in a KNOWN target (the
+# alias table lives in jarvis/cast.py beside the sinks), because the words
+# collide with half the registry otherwise: "put milk on the shopping list"
+# (list add), "throw" in the list-add opener, "drop the board" (board hide),
+# "drop" in the cancel-schedule family, "let go" in ordinary speech. An
+# unanchored "put it on" was exactly the class of Tier-1 hijack that ate
+# longer utterances before, so the object is pinned to this/it/that and the
+# target to the table.
+_CAST_SINK = (
+    # "the desktop" is NOT here: the file lane rules a bare "desktop" is a
+    # FOLDER on this box ("put this on my desktop" stays a local request),
+    # and the merge of the two lanes had this table quietly overruling that.
+    r"(?P<sink>hp\s*computer|the\s+hp|the\s+pc|my\s+pc|"
+    r"the\s+windows\s+(?:machine|box)|"
+    r"the\s+other\s+(?:computer|machine)|(?:the\s+)?board|(?:the\s+)?spark|"
+    r"(?:my|this)\s+screen|the\s+console|(?:the\s+)?handoff(?:\s+page)?|"
+    r"the\s+page)")
+_CAST_THROW_RX = re.compile(
+    r"^(?:throw|cast|fling|toss|chuck|send)\s+(?:this|it|that)(?:\s+one)?\s+"
+    r"(?:on|onto|at|to|over\s+to|up\s+on|across\s+to)\s+" + _CAST_SINK
+    + r"[.!]*$", re.I)
+_CAST_PUT_RX = re.compile(
+    r"^put\s+(?:this|it|that)(?:\s+one)?\s+(?:on|onto|up\s+on)\s+"
+    + _CAST_SINK + r"[.!]*$", re.I)
+_CAST_DROP_RX = re.compile(
+    r"^(?:drop\s+(?:it|that|this)|put\s+(?:it|that|this)\s+(?:down|back)|"
+    r"let\s+(?:it|that)\s+go|let\s+go(?:\s+of\s+(?:it|that))?)[.!]*$", re.I)
+_CAST_HOLDING_RX = re.compile(
+    r"^(?:what\s+(?:am\s+i|are\s+you)\s+holding|"
+    r"what(?:'s|\s+is)\s+in\s+(?:your|my)\s+hand)[?.!]*$", re.I)
+_CAST_SIDE_RX = re.compile(
+    r"^(?:which|what)\s+side\s+(?:is\s+)?" + _CAST_SINK
+    + r"(?:\s+on)?[?.!]*$", re.I)
+# The whole family, for the one rule that a sentence outranks a gesture:
+# any OTHER utterance puts a live carry down (Commander._cast_spoken_over).
+_CAST_FAMILY_RX = re.compile("|".join(
+    "(?:%s)" % rx.pattern.replace("(?P<sink>", "(?:")
+    for rx in (_CAST_THROW_RX, _CAST_PUT_RX, _CAST_DROP_RX,
+               _CAST_HOLDING_RX, _CAST_SIDE_RX)), re.I)
+
+
+def _cast_svc(c):
+    return c._svc("gesture")
+
+
+def _h_cast_throw(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    try:
+        line, status = courier.throw_by_voice(m.group("sink"))
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("cast by voice failed")
+        return CommandResult(handled=True, status="Cast",
+                             reply="I couldn't manage that throw, sir.",
+                             speak=True)
+    return CommandResult(handled=True, reply=line or None, speak=bool(line),
+                         status="Cast: %s" % status)
+
+
+def _h_cast_drop(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    try:
+        line = courier.drop_by_voice()
+    except Exception:                            # noqa: BLE001 - service boundary
+        log.exception("cast drop failed")
+        return None
+    return CommandResult(handled=True, reply=line, speak=True, status="Cast")
+
+
+def _h_cast_holding(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    return CommandResult(handled=True, reply=courier.holding_line(),
+                         speak=True, status="Cast")
+
+
+def _h_cast_teach(c, t, m):
+    """"HPCOMPUTER is on my right": m is (side, sink) from
+    cast.parse_side_teaching, which only parses a KNOWN target."""
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    side, sink = m
+    try:
+        line = courier.teach(side, sink)
+    except Exception:                            # noqa: BLE001 - config boundary
+        log.exception("cast teach failed")
+        line = cast_mod.TAUGHT_FAILED_LINE
+    return CommandResult(handled=True, reply=line, speak=True,
+                         status="Cast: %s is %s" % (side, sink))
+
+
+def _h_cast_side(c, t, m):
+    courier = _cast_svc(c)
+    if courier is None:
+        return None
+    return CommandResult(handled=True, reply=courier.side_line(m.group("sink")),
+                         speak=True, status="Cast")
+
+
 def _h_board_show(c, t, m):
     board = _board_svc(c)
     if board is None:
@@ -6726,6 +7818,15 @@ REGISTRY: list[Command] = [
     Command("sensing hold", _SENSING_HOLD_RX.match, _h_sensing_hold),
     Command("sensing on", _SENSING_ON_RX.match, _h_sensing_on),
     Command("sensing off", _SENSING_OFF_RX.match, _h_sensing_off),
+    # Face enrolment, in the same family and for the same reason: it is
+    # about the lens and about biometric data, and it must never be shadowed
+    # by a later entry that starts claiming "add" or "forget". All three
+    # matchers are whole-utterance regexes ending in "face" or "gallery", so
+    # they shadow nothing themselves. The QUESTION goes first, so "who do
+    # you recognise" is never read as an instruction.
+    Command("face gallery", _FACE_GALLERY_RX.match, _h_face_gallery),
+    Command("face forget", _FACE_FORGET_RX.match, _h_face_forget),
+    Command("face enrol", _FACE_ENROL_RX.match, _h_face_enrol),
     Command("go back",
             _m_exact("go back", "previous window", "last window"),
             _h_go_back, needs=("context", "desktop")),
@@ -6824,6 +7925,23 @@ REGISTRY: list[Command] = [
             needs=("board",)),
     Command("board focus", _BOARD_FOCUS_RX.match, _h_board_focus,
             needs=("board",)),
+    # Grab and throw by voice (jarvis/gesturecast.py). BEFORE the list
+    # family: "put it on the board" and "add milk to the shopping list"
+    # share an opener, and each pattern here ends in a known target so the
+    # list's "<name> list" tail can never match it -- the collision tests
+    # in tests/test_commander.py pin both directions.
+    Command("cast throw", _CAST_THROW_RX.match, _h_cast_throw,
+            needs=("gesture",)),
+    Command("cast put", _CAST_PUT_RX.match, _h_cast_throw,
+            needs=("gesture",)),
+    Command("cast drop", _CAST_DROP_RX.match, _h_cast_drop,
+            needs=("gesture",)),
+    Command("cast holding", _CAST_HOLDING_RX.match, _h_cast_holding,
+            needs=("gesture",)),
+    Command("cast side", _CAST_SIDE_RX.match, _h_cast_side,
+            needs=("gesture",)),
+    Command("cast teach", cast_mod.parse_side_teaching, _h_cast_teach,
+            needs=("gesture",)),
     Command("timer", _TIMER_RX.match, _h_timer),
     Command("alarm", _ALARM_RX.match, _h_alarm),
     Command("no asides", _m_no_asides, _h_no_asides),
@@ -6911,6 +8029,31 @@ REGISTRY: list[Command] = [
     # ...and the refusal door LAST of the five, so every phrasing that IS
     # answerable has already been taken by one of them.
     Command("oracle freeform", _ORACLE_FREEFORM_RX.match, _h_oracle_freeform),
+    # HPCOMPUTER (jarvis/tools/remote.py). Same shape as the Oracle five and
+    # for the same reason: the two doors that MOVE something come before the
+    # ones that only ask, and the refusal door is LAST of the family, so
+    # "put the budget on HPCOMPUTER" is a transfer and never an order that
+    # gets refused. `remote push`/`remote pull` are ahead of `remote query`
+    # because "send me the disk report from HPCOMPUTER" is a file, not the
+    # `disk` row of the question table.
+    Command("remote push", _REMOTE_PUSH_RX.match, _h_remote_push),
+    Command("remote pull", _REMOTE_PULL_RX.match, _h_remote_pull),
+    Command("remote status", _REMOTE_STATUS_RX.match, _h_remote_status),
+    Command("remote query", _REMOTE_QUERY_RX.match, _h_remote_query),
+    # ...and the refusal door is NOT here. It is the loosest matcher in the
+    # family (any clause of 2-120 characters beside the host's name), and
+    # sitting at this index it outranked "list add" and "remind me": "clear
+    # the shopping list on my desktop computer" was refused instead of
+    # clearing the list. It is registered below both of them instead, so
+    # every command that has a real answer is tried first and only then is
+    # an order to the other machine refused. Its entry is below "remind me".
+    # Email a file (jarvis/outbox.py). AFTER the HPCOMPUTER family: "send
+    # the budget to HPCOMPUTER" is a transfer and `remote push` must have
+    # it, and _SEND_NOT_RX names _HPC again so the two guards are
+    # independent. The handler returns None for everything the negative
+    # table catches, so an ordinary sentence with "send" in it falls
+    # through to the router exactly as it did before.
+    Command("send file", _SEND_FILE_RX.match, _h_send_file),
     Command("standup", standup.STANDUP_RX.match, _h_standup,
             needs=("context",)),
     Command("gpu reclaim", _GPU_RECLAIM_RX.match, _h_gpu_reclaim,
@@ -6984,6 +8127,10 @@ REGISTRY: list[Command] = [
             needs=("context",)),
     Command("quick command", _m_quick_command, _h_quick_command),
     Command("remind me", _REMIND_RX.match, _h_remind_me),
+    # HPCOMPUTER's refusal door, moved down out of its own family (see the
+    # note there). LAST thing that may claim a sentence naming the host:
+    # everything above it either answers the request or leaves it alone.
+    Command("remote freeform", _REMOTE_FREEFORM_RX.match, _h_remote_freeform),
     # ambient (jarvis/quiet.py): before "free" so "I'm free until seven"
     # does not read as a DND request, and status before the hours setter.
     # "room tone" comes first of all: "stop the room tone" must not be read
@@ -6992,6 +8139,10 @@ REGISTRY: list[Command] = [
     # the window look (jarvis/ui/theme.py): a config write, spoken with its
     # "after a restart" caveat; no needs= so a missing config is SAID.
     Command("ui look", _UI_LOOK_RX.match, _h_ui_look),
+    # the conversation pane: BELOW the named-list family on purpose, so
+    # that "clear the shopping list" is claimed by "list clear" before this
+    # rung is ever asked. No needs=: the transcript is the main window.
+    Command("clear transcript", _TRANSCRIPT_CLEAR_RX.match, _h_transcript_clear),
     Command("quiet status", _QUIET_STATUS_RX.match, _h_quiet_status, needs=("quiet",)),
     Command("quiet hours off", _QUIET_HOURS_OFF_RX.match, _h_quiet_hours_off,
             needs=("quiet",)),
@@ -7017,10 +8168,21 @@ ASSISTANT_TIER1: list[Command] = [
                     # the Board: "bring up the board" is said at the desk
                     # without a wake-word prefix, like every other surface verb
                     "board show", "board hide", "board focus",
+                    # the cast: "throw this on HPCOMPUTER" / "drop it" /
+                    # "HPCOMPUTER is on my right" are said at the desk,
+                    # mid-gesture, with no wake word left to strip
+                    "cast throw", "cast put", "cast drop", "cast holding",
+                    "cast side", "cast teach",
                     "timer", "alarm", "no asides",
                     "list schedule", "cancel schedule", "adjust schedule",
                     "briefing", "preview", "week", "briefing section", "verbosity",
                     "last mail", "diagnostics", "register", "next exam",
+                    # "email the lab report to Heather" arrives at the desk
+                    # with the wake word already eaten, like every other
+                    # instruction he gives standing up. Without this name
+                    # the registry pass never runs on it and the intent
+                    # gate calls it background chat.
+                    "send file",
                     # "what's my next class" arrives with the wake word
                     # already eaten, like every other question at the desk
                     "next class",
@@ -7077,9 +8239,20 @@ ASSISTANT_TIER1: list[Command] = [
                     # feature cannot survive.
                     "sensing status", "sensing curfew", "sensing hold",
                     "sensing on", "sensing off",
+                    # "enrol my face" and "who do you recognise" are said at
+                    # the desk with the wake word already eaten, like every
+                    # other surface verb -- and without Tier 1 they would
+                    # reach a model that cannot open a gallery and would
+                    # answer the question by inventing an answer.
+                    "face gallery", "face forget", "face enrol",
                     # "switch to classic visuals" is said AT the window he
                     # is looking at, wake word already eaten like the rest
                     "ui look",
+                    # ...and so is "clear the transcript", which arrived bare
+                    # at 23:26:01 on 09-02 and was answered "Ignored
+                    # (background chat, conf=0.80)": three words with no
+                    # Tier-1 name are exactly what the intent gate drops.
+                    "clear transcript",
                     # "where's your voice coming out" is asked AT the dead
                     # speaker, which is exactly when the wake word is least
                     # likely to have been heard.
@@ -7094,6 +8267,17 @@ ASSISTANT_TIER1: list[Command] = [
                     # hotword, like every other surface question
                     "oracle status", "oracle logs", "oracle action",
                     "oracle service", "oracle freeform",
+                    # HPCOMPUTER, for exactly the reason the Oracle five are
+                    # here and by the same oversight that kept them out
+                    # once: the hotword eats the wake word, so "put the lab
+                    # report on HPCOMPUTER" arrives bare, the prefixed
+                    # registry pass never runs on it, and every one of the
+                    # five doors was unreachable by voice -- three dropped
+                    # by the intent gate, two handed to the model. The
+                    # refusal door is here too, because a refusal he cannot
+                    # hear is not the safety story this lane claims.
+                    "remote push", "remote pull", "remote status",
+                    "remote query", "remote freeform",
                     "log triage", "whats wrong", "quietly", "slow turn",
                     # the hotword consumes the wake word, so spoken text never
                     # reaches the prefixed registry: without this the router
@@ -7104,6 +8288,40 @@ ASSISTANT_TIER1: list[Command] = [
                     # and nobody says "jarvis" before a sum.
                     "math",
                     "read control")
+]
+
+
+def _tier1_send_file(t):
+    """The Tier-1 probe for the one irreversible family in the app.
+
+    A Tier-1 name match switches the intent classifier OFF for the whole
+    utterance (``_handle_inner``: "tier-1 match %r bypasses the intent
+    gate"), so whatever matcher stands here IS the gate for this family --
+    and the raw ``_SEND_FILE_RX`` is far too generous to be it. Unaddressed
+    speech of the shape "send X to Y" armed a live draft and read it back
+    out loud, and a backchannel "yeah" then sent the file; sentences the
+    negative table exists to veto ("send my regards to Heather", "send a
+    text to Heather", "send the money to Ali") bypassed the gate too and
+    were answered by the model instead of dropped as background chat.
+
+    So the veto runs HERE, before the gate is switched off, rather than
+    only inside the handler afterwards. The registry keeps the wide
+    matcher: a sentence he prefixed with "jarvis" was addressed to me by
+    construction and needs no gate at all.
+
+    The rest of the claim rule -- a recipient he can actually write to, or
+    a file that is really on his disk -- needs services a matcher does not
+    get, so ``Commander._match_assistant`` applies it beside this.
+    """
+    if _SEND_NOT_RX.search(t):
+        return None
+    return _SEND_FILE_RX.match(t)
+
+
+ASSISTANT_TIER1 = [
+    cmd if cmd.name != "send file"
+    else Command(cmd.name, _tier1_send_file, cmd.handler, cmd.needs)
+    for cmd in ASSISTANT_TIER1
 ]
 
 
@@ -7642,7 +8860,25 @@ class Commander:
     _last_undo: Optional[tuple] = None
     _confidence: Optional[float] = None
     _pending_destructive: Optional[tuple] = None
+    # (source, strict, the tuple it describes) for the slot above. Kept
+    # BESIDE the tuple rather than inside it because the tuple's 3-item
+    # shape is written and read all over the app and its tests; the `ref`
+    # leg means stale metadata can never be applied to a slot somebody set
+    # by hand -- an unrecognised tuple falls back to the old, lenient rules.
+    _pending_destructive_meta: Optional[tuple] = None
+    # (candidates, resume, source, made_at) for "Which one, sir?"
+    _pending_filepick: Optional[tuple] = None
+    # The source of the turn being handled, so a question armed inside a
+    # handler knows which channel it was asked on.
+    _turn_source: str = "voice"
+    # Set by the rungs that answer one of THIS commander's own questions,
+    # read by _drop_stranded_questions.
+    _answered_pending: bool = False
+    # One re-ask per STRICT read-back, the same one-shot the send draft
+    # carries on itself. Reset when the offer is armed and when it is spent.
+    _strict_reasked: bool = False
     _pending_objection: Optional[tuple] = None
+    _pending_send: Any = None                 # outbox.Draft awaiting a yes
     _objection_timer = None
     _objections = None
     # Monotonic; 0.0 means "no building has been named this session", which
@@ -7702,6 +8938,12 @@ class Commander:
         self._confidence: Optional[float] = None
         # A read-back waiting for a yes: (run, spoken line, stamp).
         self._pending_destructive: Optional[tuple] = None
+        self._pending_destructive_meta: Optional[tuple] = None
+        self._pending_filepick: Optional[tuple] = None
+        self._turn_source = "voice"
+        self._answered_pending = False
+        self._strict_reasked = False
+        self._pending_send = None
         # He advised against something and asked "shall I set it anyway?":
         # (run, spoken line, Objection, stamp). Its own slot because its
         # default on ambiguity is the OPPOSITE of the read-back's -- see
@@ -7768,9 +9010,17 @@ class Commander:
         text = (text or "").strip()
         if not text:
             return CommandResult(handled=False, status="No speech detected")
+        self._cast_spoken_over(text)
         with self._turn_lock:
             self._confidence = confidence
+            self._turn_source = source
+            armed = (getattr(self, "_pending_send", None),
+                     getattr(self, "_pending_filepick", None),
+                     getattr(self, "_pending_destructive", None),
+                     getattr(self, "_pending_destructive_meta", None))
+            self._answered_pending = False
             result = self._handle_inner(text, source)
+            self._drop_stranded_questions(armed, result, source)
             # A correction / re-run answers a different utterance: THAT is
             # the last turn, so a second "no, I said ..." corrects the
             # right text.
@@ -7781,6 +9031,71 @@ class Commander:
             if undo is not None:
                 self._last_undo = (undo, time.monotonic())
         return result
+
+    def _drop_stranded_questions(self, armed: tuple, result,
+                                 source: str = "voice") -> None:
+        """A question of MINE that survived a turn somebody ELSE answered is
+        dropped, not left armed for the next yes-shaped sentence.
+
+        Every pending rung clears its own slot before it does anything, and
+        each is written as if it were the only one on the floor. But a
+        ringing kitchen timer, a Claude permission prompt, an alarm offer
+        and the first-wake briefing offer all arrive OUT OF BAND, and each
+        of them sits ABOVE the read-back rungs and returns before they run.
+        Measured: with a draft armed, "yes" answered a parked alarm offer,
+        set the alarm -- and left the draft live for the rest of its 90 s,
+        so the NEXT yes-shaped utterance, aimed at anything at all, sent
+        the file. Same for the study offer, the briefing offer and "stop"
+        to a ringing timer.
+
+        The rungs that DID answer set ``_answered_pending``; anything else
+        that consumed the turn spends the questions it talked over. Identity
+        comparison, not truthiness: a question armed DURING this turn is a
+        new object and is left alone.
+
+        A turn from ANOTHER ROOM spends nothing. A Discord message or a
+        tmux turn could not have answered a question put out loud at the
+        desk, so it is not its cancellation either -- the question stays
+        parked for the channel it was asked on, which is the same rule the
+        confirm rungs themselves apply.
+        """
+        if self._answered_pending or result is None:
+            return
+        send, pick, destructive, meta = armed
+        if send is not None and getattr(self, "_pending_send", None) is send \
+                and self._same_room(getattr(send, "asked_from", "voice"), source):
+            log.info("send read-back dropped: the turn was answered elsewhere")
+            self._pending_send = None
+        if pick is not None and getattr(self, "_pending_filepick", None) is pick \
+                and self._same_room(pick[2] if len(pick) == 5 else "voice", source):
+            log.info("which-one dropped: the turn was answered elsewhere")
+            self._pending_filepick = None
+        asked = meta[0] if (isinstance(meta, tuple) and len(meta) == 3
+                            and meta[2] is destructive) else ""
+        if destructive is not None and \
+                getattr(self, "_pending_destructive", None) is destructive \
+                and (not asked or self._same_room(asked, source)):
+            log.info("read-back dropped: the turn was answered elsewhere")
+            self._pending_destructive = None
+            self._pending_destructive_meta = None
+
+    def _cast_spoken_over(self, text: str) -> None:
+        """A sentence outranks a gesture: any utterance that is not itself
+        one of the cast verbs puts a LIVE carry down, quietly
+        (jarvis/gesturecast.GestureCast.spoken_over). The cast verbs are
+        exempt because "throw this on the board" while carrying IS the
+        throw. getattr chains, not _svc: a slim test commander made with
+        __new__ has no services at all."""
+        courier = getattr(getattr(self, "services", None), "gesture", None)
+        if courier is None:
+            return
+        t = text.strip().lower().rstrip(".!?")
+        if _CAST_FAMILY_RX.match(t) or cast_mod.parse_side_teaching(t):
+            return
+        try:
+            courier.spoken_over()
+        except Exception:                        # noqa: BLE001 - service boundary
+            log.debug("cast spoken_over failed", exc_info=True)
 
     def shaky_transcript(self) -> bool:
         """The utterance being handled scraped in under confirm.shaky_logprob."""
@@ -7821,6 +9136,29 @@ class Commander:
                     return True
             except Exception:  # noqa: BLE001 - a bad session
                 log.debug("question_open: session state failed", exc_info=True)
+        # A file send read back and not yet answered ("...Send it, sir?").
+        # Its own expiry, outbox.DRAFT_TTL_S, which is longer than the
+        # destructive read-back's because there are four facts to check.
+        draft = getattr(self, "_pending_send", None)
+        if draft is not None:
+            try:
+                if not draft.stale():
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed draft
+                log.debug("question_open: send draft staleness failed",
+                          exc_info=True)
+        # "Which one, sir?" -- the ambiguous-file question both file lanes
+        # ask. It holds the floor exactly as the read-back does: it is a
+        # question Jarvis put out loud and is waiting on, and while it was
+        # missing from this list the app gave its answer the 4 s window and
+        # the strict confidence gate instead of the 15 s question window.
+        pick = getattr(self, "_pending_filepick", None)
+        if isinstance(pick, tuple) and len(pick) == 5:
+            try:
+                if time.monotonic() - float(pick[3]) <= FILEPICK_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                pass
         # A read-back ("Cancel all three alarms, sir?") and the objection
         # ("Shall I set it anyway?") both hold the floor for DESTRUCTIVE_TTL_S.
         for name, size in (("_pending_destructive", 3), ("_pending_objection", 4)):
@@ -7890,10 +9228,96 @@ class Commander:
         self._leave_touch = time.monotonic()
         return True
 
-    def stash_destructive(self, run: Callable[[], CommandResult], line: str):
+    def stash_destructive(self, run: Callable[[], CommandResult], line: str,
+                          strict: bool = False):
         """A handler read an action back instead of doing it; the next yes
-        runs it (``_try_destructive_confirm``)."""
+        runs it (``_try_destructive_confirm``).
+
+        ``strict`` swaps the answer grammar for ``parse_send_answer`` -- the
+        end-anchored one the mail lane was built with -- and adds its one
+        re-ask on a vague word. Pass it for anything as irreversible as an
+        email: the two HPCOMPUTER transfers do, and they are the reason the
+        flag exists. ``parse_yes_no`` waives its overheard-speech guard
+        whenever the first word is a yes word and counts "sure" as one, so
+        "Yeah, so you should be able to look that up." -- a real line from
+        his log that answered nothing -- spent a read-back once already.
+        Cancelling three alarms that way is a bad afternoon; putting a file
+        on another machine that way cannot be taken back.
+        """
         self._pending_destructive = (run, line, time.monotonic())
+        self._pending_destructive_meta = (self._turn_source, bool(strict),
+                                          self._pending_destructive)
+        self._strict_reasked = False
+        # The mirror of stash_send's clear. Two questions can never share
+        # one yes, and until now that invariant held in one direction only
+        # -- by the accident that _try_send_confirm sits above this rung
+        # and drops its draft on any non-answer. A read-back armed outside
+        # handle() (a proactive offer) had no such accident protecting it.
+        self._pending_send = None
+
+    def stash_filepick(self, candidates, resume: Callable):
+        """"Which one, sir?" -- park the rivals so the answer can be heard.
+
+        ``resume(path)`` carries on with the candidate he names and returns
+        the CommandResult for that turn; for both lanes it ends in the
+        ordinary read-back, so choosing a file still confirms nothing.
+
+        This is the slot whose absence made the ambiguous branch a silent
+        dead end: the question was asked, nothing was parked,
+        ``question_open()`` said no, the app gave the follow-up microphone
+        the short window and the answer was then dropped as background chat.
+        """
+        keep = [Path(c) for c in (candidates or ())]
+        if not keep:
+            self._pending_filepick = None
+            return
+        self._pending_filepick = (keep, resume, self._turn_source,
+                                  time.monotonic(), False)
+        # One question on the floor at a time, the same rule stash_send and
+        # stash_destructive keep between themselves.
+        self._pending_send = None
+        self._pending_destructive = None
+        self._pending_destructive_meta = None
+
+    def stash_send(self, draft):
+        """A file send was read back; only an explicit yes spends it.
+
+        Its own slot, NOT ``_pending_destructive``: that one is answered by
+        ``parse_yes_no``, a word bag wide enough that a passing "yeah" in a
+        ten-word sentence counts. Cancelling three alarms by accident is a
+        bad afternoon; sending a file by accident is permanent, so this slot
+        has a narrower grammar of its own (``parse_send_answer``) and one
+        re-ask for a vague answer.
+        """
+        try:
+            draft.asked_from = self._turn_source
+        except Exception:  # noqa: BLE001 - a slim/duck-typed draft in a test
+            log.debug("stash_send: draft would not record its source",
+                      exc_info=True)
+        self._pending_send = draft
+        # A new question replaces the old one, the way a new quiz replaces
+        # the last: without this a remote-push read-back armed a moment
+        # earlier would still be sitting in _pending_destructive, and the
+        # yes that sends the email would leave IT armed for the next one.
+        self._pending_destructive = None
+        self._pending_destructive_meta = None
+        self._pending_filepick = None
+
+    def _same_room(self, asked: str, answering: str) -> bool:
+        """Could a turn from ``answering`` be the answer to a question put
+        on ``asked``?
+
+        Voice and typed are the same desk -- he can say it or type it into
+        the window the question is on. Everything else is a different room:
+        a Discord message, a phone-client turn, a tmux `jarvis "..."` and a
+        socket turn never heard the question, and a "yes" from one of them
+        is a yes to something else. ``_try_briefing_offer`` already draws
+        this line for an offer that is entirely reversible.
+        """
+        desk = ("voice", "typed")
+        if asked in desk:
+            return answering in desk
+        return answering == asked
 
     # -- reasoned dissent (jarvis/objections.py) -----------------------
     def _objection_ledger(self):
@@ -8178,9 +9602,28 @@ class Commander:
         res = self._try_briefing_offer(text, source)
         if res is not None:
             return res
+        # 3d'''. A FILE SEND was read back ("lab report.pdf, 2.4
+        #       megabytes, to Heather ... Send it, sir?"). Above the
+        #       destructive rung because it is the stricter question of
+        #       the two -- its yes is an end-anchored grammar of its own,
+        #       not parse_yes_no -- and because the two can never be live
+        #       together anyway: a send arms its own slot and nothing in
+        #       the app arms both.
+        res = self._try_send_confirm(text, source)
+        if res is not None:
+            return res
+        # 3d-iv. "Which one, sir?" -- the ambiguous-file question both file
+        #        lanes ask. Below the yes/no rungs because its own grammar
+        #        is an ORDINAL or a NAME and it must not be handed a bare
+        #        "yes" that belongs to one of them; above the destructive
+        #        rung because "the second one" is not a yes and that rung
+        #        would drop this question's slot without answering it.
+        res = self._try_filepick_answer(text, source)
+        if res is not None:
+            return res
         # 3e. A destructive action was read back ("Cancel all three alarms,
         #     sir?"): a plain yes runs it, anything else drops it.
-        res = self._try_destructive_confirm(text)
+        res = self._try_destructive_confirm(text, source)
         if res is not None:
             return res
         # 3f. He advised against something ("Shall I set it anyway?"). AFTER
@@ -8620,14 +10063,212 @@ class Commander:
         return CommandResult(handled=True, reply=str(line), speak=True,
                              status="Undone")
 
-    def _try_destructive_confirm(self, text: str) -> Optional[CommandResult]:
+    def _try_filepick_answer(self, text: str,
+                             source: str = "voice") -> Optional[CommandResult]:
+        """Answer "Which one, sir?" -- the ambiguous-file question.
+
+        Narrow on purpose (``pick_from_answer``): an ordinal, or a name that
+        beats its rivals by more than the band that called them ambiguous.
+        An explicit "neither" says so out loud; a NEAR miss -- most often
+        the ambiguous phrase repeated -- gets one more question rather than
+        a guess; anything else drops the slot and keeps its own meaning.
+        The chosen file is then READ BACK like any other, so a wrong pick
+        here still cannot send or move anything on its own.
+        """
+        pend = getattr(self, "_pending_filepick", None)
+        if not isinstance(pend, tuple) or len(pend) != 5:
+            return None
+        cands, resume, asked, made, reasked = pend
+        if time.monotonic() - float(made or 0.0) > FILEPICK_TTL_S:
+            self._pending_filepick = None
+            log.info("which-one: expired; %r is a new subject", text[:40])
+            return None
+        # A question put at the desk is not answered from Discord or a tmux
+        # shell. Left PARKED rather than dropped: that turn is not its
+        # answer, but it is not its cancellation either.
+        if not self._same_room(asked, source):
+            log.debug("which-one: a %s turn is not its answer", source)
+            return None
+        choice, near = pick_from_answer(text, cands)
+        if choice is None:
+            said = " ".join(str(text or "").split())
+            if _PICK_CANCEL_RX.match(said):
+                self._pending_filepick = None
+                self._answered_pending = True
+                return CommandResult(handled=True, reply="Very good, sir.",
+                                     speak=True, status="Dropped")
+            # A NEAR MISS -- he named one of them and the margin was not
+            # there, which is most often the ambiguous phrase repeated. One
+            # more question rather than a guess or a silence; the second
+            # near miss spends it, exactly as the send read-back does.
+            if near and not reasked:
+                self._pending_filepick = (cands, resume, asked, made, True)
+                self._answered_pending = True
+                log.info("which-one: %r still fits both; asking again",
+                         text[:60])
+                return CommandResult(
+                    handled=True, speak=True, status="Which one?",
+                    reply=f"Still either, sir: {filepick.describe(cands)}. "
+                          f"Which of them?")
+            self._pending_filepick = None
+            log.info("which-one: %r names none of them", text[:60])
+            return None
+        self._pending_filepick = None
+        self._answered_pending = True
+        log.info("which-one: %r means %s", text[:40], choice.name)
+        try:
+            return resume(choice)
+        except Exception:
+            log.exception("which-one: could not carry on with %s", choice.name)
+            return CommandResult(handled=True, speak=True, status="error",
+                                 reply="I couldn't manage that, sir.")
+
+    def _try_send_confirm(self, text: str,
+                          source: str = "voice") -> Optional[CommandResult]:
+        """Resolve a file-send read-back ("...Send it, sir?").
+
+        Four answers, and the difference between them is the whole feature:
+
+        * a clear YES sends it, in the background, because an attachment is
+          the one tool result in this app whose transfer can take seconds;
+        * a clear NO drops it and says so;
+        * a VAGUE answer ("okay", "sure", "mhm") is asked once more rather
+          than obeyed or ignored. Obeying it is how a file reaches the wrong
+          person; ignoring it in silence is how he concludes the feature
+          does not work. The second vague answer spends the draft;
+        * ANYTHING ELSE -- a new command, a changed subject -- drops the
+          draft and keeps its own meaning, exactly as the destructive
+          read-back does. Changing the subject is not consent.
+
+        The slot is cleared FIRST, before any of that, so no path through
+        this method can leave a live draft behind for a later stray yes.
+        """
+        draft, self._pending_send = getattr(self, "_pending_send", None), None
+        if draft is None:
+            return None
+        if draft.stale():
+            log.info("send read-back expired: %s", draft.path.name)
+            return None
+        # The question was SPOKEN, at the desk. A Discord message, a phone
+        # turn, a `jarvis "..."` from tmux and a socket turn never heard it,
+        # so their "yes" is a yes to something else -- and this one sends an
+        # attachment. The draft is put BACK: that turn is not its answer,
+        # but it is not its cancellation either, and it is still his file
+        # waiting on his word at the desk where he was asked.
+        if not self._same_room(getattr(draft, "asked_from", "voice"), source):
+            self._pending_send = draft
+            log.info("send read-back: a %s turn is not its answer", source)
+            return None
+        self._answered_pending = True
+        answer = parse_send_answer(text)
+        if answer is None:
+            said = " ".join(str(text or "").split())
+            # Two ways to be vague, and BOTH get the one re-ask rather than
+            # the silent drop. _SEND_MAYBE_RX catches the bare fillers
+            # ("okay", "sure"); the second leg catches a yes this grammar
+            # does not take but parse_yes_no does -- "um, yes", "okay yes",
+            # "I think so yes", "yeah go ahead and send it", and his own
+            # logged "system, yes." Six words is parse_yes_no's own
+            # overheard-speech line, and it is what keeps the ten-word
+            # "Yeah, so you should be able to look that up." on the silent
+            # branch where it belongs. Safety is unchanged either way:
+            # nothing is sent, he is asked once more.
+            vague = bool(_SEND_MAYBE_RX.match(said)) or (
+                len(said.split()) <= 6 and parse_yes_no(said) is True)
+            if vague and not draft.reasked:
+                draft.reasked = True
+                self._pending_send = draft
+                log.info("send read-back: %r is not a yes; asking again", text)
+                return CommandResult(handled=True, reply=outbox.UNSURE_LINE,
+                                     speak=True, status="Confirm?")
+            self._answered_pending = False
+            log.info("send draft dropped, the subject changed: %r", text)
+            return None
+        if not answer:
+            log.info("send declined: %s", draft.path.name)
+            return CommandResult(handled=True, reply=outbox.DROPPED_LINE,
+                                 speak=True, status="Not sent")
+
+        smtp = self._svc("smtp")
+        cap = outbox.max_mb(self._svc("assistant"))
+        name = draft.path.name
+
+        def _run():
+            try:
+                line = outbox.send(draft, smtp=smtp, cap_mb=cap)
+                kind, status = "ok", "Sent"
+            except outbox.DraftChanged as exc:
+                # Its message IS the sentence: the file moved between the
+                # read-back and the yes, and he needs to hear which.
+                line, kind, status = str(exc), "error", "Not sent"
+            except mail_mod.MailSendFailed as exc:
+                # A transport failure's text is a class name, never a line.
+                log.warning("send failed for %s (%s)", name, exc)
+                line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
+            except Exception:                          # noqa: BLE001 - source
+                log.exception("send blew up for %s", name)
+                line, kind, status = mail_mod.SEND_FAILED_LINE, "error", "Send failed"
+            bus.publish(Status(text=status, kind=kind))
+            # Through the app's own door (services.reply -> _async_reply)
+            # when there is one: it shows, speaks, arms the follow-up
+            # window AND closes the turn. bus + _speak_now did the first
+            # two only, so after "Sent to Heather, sir." the wake word
+            # stayed dead for the 60 s watchdog (F20, 09-03). The fallback
+            # keeps _speak_now (the not-proactive door) rather than
+            # _deliver's talk-back-gated _speak: this line is the direct
+            # consequence of a yes he just gave.
+            reply = self._svc("reply")
+            if callable(reply):
+                try:
+                    reply(line, speak=True)
+                    return
+                except Exception:
+                    log.exception("services.reply failed")
+            bus.publish(JarvisReply(text=line))
+            self._speak_now(line)
+
+        self._bg(_run)
+        # ack=True: "Sending it now" is an acknowledgement, and the result
+        # follows on its own event. done=False keeps the turn open so the
+        # UI does not call it finished while the file is still on the wire.
+        return CommandResult(handled=True, reply="Sending it now, sir.",
+                             speak=True, ack=True, done=False,
+                             status=f"Sending {name}")
+
+    def _try_destructive_confirm(self, text: str,
+                                 source: str = "voice") -> Optional[CommandResult]:
         """Resolve a read-back ("Cancel all three alarms, sir?").
 
         As with a calendar add, anything that is not a clear yes or no
         DROPS the offer: changing the subject is not consent, and a stale
         offer would attach the next stray "yes" to an old cancel. An offer
-        older than DESTRUCTIVE_TTL_S is dropped even on a yes."""
+        older than DESTRUCTIVE_TTL_S is dropped even on a yes.
+
+        Two things the plain read-back does not have:
+
+        * a STRICT slot (``stash_destructive(..., strict=True)``, which the
+          two HPCOMPUTER transfers use) is answered by ``parse_send_answer``
+          instead, with the send lane's one re-ask on a vague word. Its yes
+          moves a file onto another machine and there is no undo closure
+          waiting on the far side;
+        * the answer has to come from the channel the question was PUT on.
+          A "yes" typed into Discord or arriving down the phone socket never
+          heard the question, and one of these read-backs is irreversible.
+        """
         pend, self._pending_destructive = self._pending_destructive, None
+        meta, self._pending_destructive_meta = \
+            getattr(self, "_pending_destructive_meta", None), None
+        # Only trust metadata that names THIS tuple: _pending_destructive is
+        # also written by hand (tests, jarvis/app.py reads it), and stale
+        # metadata applied to somebody else's slot would be worse than none.
+        asked, strict = "", False
+        if isinstance(meta, tuple) and len(meta) == 3 and meta[2] is pend:
+            asked, strict = str(meta[0] or ""), bool(meta[1])
+        if pend is not None and asked and not self._same_room(asked, source):
+            self._pending_destructive = pend
+            self._pending_destructive_meta = meta
+            log.info("read-back: a %s turn is not its answer", source)
+            return None
         notes = self._svc("notes")
         npend = getattr(notes, "pending_clear", None) if notes is not None else None
         if not isinstance(npend, dict):
@@ -8645,9 +10286,33 @@ class Commander:
             npend = None
         if pend is None and npend is None:
             return None
-        answer = parse_yes_no(text)
-        if answer is None:
-            return None
+        if strict:
+            said = " ".join(str(text or "").split())
+            answer = parse_send_answer(said)
+            if answer is None:
+                # The send lane's one re-ask, and for the same reason:
+                # obeying "okay" is how a file lands on the wrong machine,
+                # and dropping it in silence is how he learns the feature
+                # does not work. The second vague answer spends the offer.
+                vague = bool(_SEND_MAYBE_RX.match(said)) or (
+                    len(said.split()) <= 6 and parse_yes_no(said) is True)
+                if vague and not self._strict_reasked:
+                    self._strict_reasked = True
+                    self._answered_pending = True
+                    self._pending_destructive = pend
+                    self._pending_destructive_meta = meta
+                    log.info("read-back: %r is not a yes; asking again", text)
+                    return CommandResult(handled=True, speak=True,
+                                         reply=outbox.UNSURE_LINE,
+                                         status="Confirm?")
+                log.info("read-back dropped, the subject changed: %r", text)
+                return None
+            self._strict_reasked = False
+        else:
+            answer = parse_yes_no(text)
+            if answer is None:
+                return None
+        self._answered_pending = True
         if not answer:
             return CommandResult(handled=True, reply="Very good, sir.", speak=True,
                                  status="Dropped")
@@ -9540,8 +11205,12 @@ class Commander:
                     res = None
                 stash = self._pending_destructive
                 if stash is not None:
-                    pending.append(stash)
+                    meta = getattr(self, "_pending_destructive_meta", None)
+                    strict = bool(isinstance(meta, tuple) and len(meta) == 3
+                                  and meta[2] is stash and meta[1])
+                    pending.append((stash, strict))
                     self._pending_destructive = None
+                    self._pending_destructive_meta = None
                 if res is None or not res.handled:
                     log.warning("multi-intent: clause %r matched but did "
                                 "nothing", part)
@@ -9618,8 +11287,11 @@ class Commander:
         One question, one yes, every clause run: _try_destructive_confirm
         pops one slot, so anything left unchained is silently lost.
         """
-        runs = [p[0] for p in pending]
-        lines = [str(p[1]).strip() for p in pending if p[1]]
+        # Entries are (the 3-tuple that was stashed, was it strict).
+        stashes = [p[0] for p in pending]
+        strict = any(p[1] for p in pending)
+        runs = [p[0] for p in stashes]
+        lines = [str(p[1]).strip() for p in stashes if p[1]]
 
         def _run_all() -> CommandResult:
             replies, statuses = [], []
@@ -9639,7 +11311,11 @@ class Commander:
                                  reply=address.join_fragments(replies) or None,
                                  speak=True,
                                  status=" + ".join(statuses) or "Done")
-        self.stash_destructive(_run_all, address.join_fragments(lines))
+        # One STRICT clause makes the joined question strict: the yes that
+        # answers it would run that clause too, and it is the irreversible
+        # one in the pair.
+        self.stash_destructive(_run_all, address.join_fragments(lines),
+                               strict=strict)
 
     def _multi_match(self, text: str) -> list:
         """The clauses of a compound whose EVERY half is a Tier-1 command
@@ -9705,10 +11381,23 @@ class Commander:
             except Exception:
                 log.exception("matcher %s failed on clause %r", cmd.name, part)
                 return False
+        if sum(hits) == 2:
+            # BOTH halves are this command. "email the notes to Heather and
+            # email the handout to Heather" is two requests, and bailing
+            # here let the whole-utterance match stand: _SEND_FILE_RX's
+            # `to`-split is non-greedy but $-anchored, so who_a swallowed
+            # the second clause and Jarvis asked for the address of a
+            # person called "Heather and email the biosensors handout to
+            # Heather". _try_multi is what this sentence wanted all along.
+            if self._multi_match(bare) and not self.shaky_transcript():
+                log.info("tier-1 %r declines the compound %r: both halves "
+                         "are the same command", cmd.name, text)
+                return True
+            return False
         if sum(hits) != 1:
-            # It accepts both halves, or neither ("add milk and bread to my
-            # shopping list" matches only whole). Either way the match is
-            # not one clause of a two-request sentence.
+            # Neither half on its own ("add milk and bread to my shopping
+            # list" matches only whole), so the match is not one clause of
+            # a two-request sentence.
             return False
         first = hits.index(True) == 0
         other = parts[1] if first else parts[0]
@@ -9737,10 +11426,27 @@ class Commander:
         t = text.strip().lower().rstrip(".!?")
         for cmd in ASSISTANT_TIER1:
             try:
-                if cmd.matcher(t):
-                    return cmd.name
+                if not cmd.matcher(t):
+                    continue
             except Exception:
                 log.exception("matcher %s failed", cmd.name)
+                continue
+            # The one family where the gate must not be switched off on the
+            # SHAPE of a sentence alone. _tier1_send_file has already run
+            # the negative table; this is the other half of the same claim
+            # rule -- a recipient he can write to, or a file really on his
+            # disk -- and it needs services a matcher does not get. Without
+            # it "send the deposit to the landlord" is addressed to Jarvis.
+            if cmd.name == "send file":
+                try:
+                    claimed = _send_file_pieces(self, t) is not None
+                except Exception:  # noqa: BLE001 - a slim test commander
+                    log.debug("send-file: the claim rule needs services I "
+                              "haven't got", exc_info=True)
+                    claimed = True
+                if not claimed:
+                    continue
+            return cmd.name
         return None
 
     def _try_assistant(self, text: str) -> Optional[CommandResult]:

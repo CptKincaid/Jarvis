@@ -1648,6 +1648,10 @@ TIER1_SAMPLES = {
     "briefing section": "no news in the morning",
     "verbosity": "shorter briefings",
     "last mail": "what was my last email",
+    # The send-a-file family. The sample is his own phrasing from the
+    # brief; it arms a read-back and never a send, so the gate test can
+    # run it safely.
+    "send file": "email the lab report to heather",
     "liked songs": "play my liked songs",
     "music resume": "start playing my spotify",   # the 20:56:42 clause
     "diagnostics": "run diagnostics",
@@ -1665,6 +1669,13 @@ TIER1_SAMPLES = {
     "list strike": "take milk off the shopping list",
     "list strike anon": "cross the second one off the list",
     "list clear": "clear the shopping list",
+    # grab and throw by voice (jarvis/gesturecast.py)
+    "cast throw": "throw this on hpcomputer",
+    "cast put": "put it on the board",
+    "cast drop": "drop it",
+    "cast holding": "what am i holding",
+    "cast side": "which side is hpcomputer on",
+    "cast teach": "hpcomputer is on my right",
     "lists": "what lists do i have",
     "week review": "how was my week",
     "garden report": "memory report",
@@ -1691,11 +1702,16 @@ TIER1_SAMPLES = {
     "room tone": "room tone on",
     # offline mode (jarvis/sensing.py) -- his own words for four of these
     "sensing off": "offline mode",
+    "face enrol": "enrol my face",
+    "face forget": "forget heather's face",
+    "face gallery": "who do you recognise",
     "sensing on": "come back online",
     "sensing status": "are you watching",
     "sensing hold": "no cameras for the next two hours",
     "sensing curfew": "camera curfew from nine to seven",
     "ui look": "switch to classic visuals",
+    # 2026-09-02 23:26, verbatim -- the gate called it background chat
+    "clear transcript": "clear the transcript",
     "audio out": "where's your voice coming out",
     "standup": "standup",
     "oracle status": "how's the oracle box",
@@ -1703,6 +1719,14 @@ TIER1_SAMPLES = {
     "oracle action": "restart the haymaker bot",
     "oracle service": "is knightfall up",
     "oracle freeform": "run deploy on the oracle box",
+    # HPCOMPUTER's five doors, registered in Tier 1 for exactly the reason
+    # the Oracle five are: the hotword eats the wake word, so every one of
+    # them arrives bare and the prefixed registry pass never runs on it.
+    "remote push": "put the budget on hpcomputer",
+    "remote pull": "get the budget from hpcomputer",
+    "remote status": "is hpcomputer up",
+    "remote query": "what's the disk on hpcomputer",
+    "remote freeform": "run the build on hpcomputer",
     "gpu reclaim": "take the gpu back",
     "gpu lend": "lend the gpu",
     "log triage": "anything wrong in your log",
@@ -1751,6 +1775,64 @@ def test_tier_one_samples_survive_the_intent_gate(tmp_path, monkeypatch):
             continue
         verdict, conf = ic.classify(phrase)
         assert verdict != IntentClassifier.NO, (name, phrase, conf)
+
+
+# The two Tier-1 families that landed in the same merge (integration-0903):
+# enrol-in-app's face rungs sit HIGH in the registry so "remember Heather's
+# face" beats "remember", "forget Heather's face" beats "leave time forget"
+# and "add Heather's face" beats "list add"; file-and-remote's send/remote
+# rungs sit LOWER and key on send/email/put/get verbs with a file or a
+# machine. Each branch proved its own ladder; nobody had run the UNION. The
+# gate test above only asks that a sample matches *some* rung, which would
+# not notice "forget heather's face" being swallowed by "leave time forget",
+# so this one asks which rung answers FIRST -- the rung that actually runs.
+UNION_FIRST_RUNG = {
+    # face family, incl. the verbs it shares with older rungs
+    "enrol my face": "face enrol",
+    "add heather's face to the gallery": "face enrol",
+    "remember heather's face": "face enrol",
+    "register me": "face enrol",
+    "forget heather's face": "face forget",
+    "delete heather's face": "face forget",
+    "remove ali's face from the gallery": "face forget",
+    "who do you recognise": "face gallery",
+    "am i enrolled": "face gallery",
+    # send/remote family
+    "email the lab report to heather": "send file",
+    "put the budget on hpcomputer": "remote push",
+    "copy the lab report to hpcomputer": "remote push",
+    "get the budget from hpcomputer": "remote pull",
+    "is hpcomputer up": "remote status",
+    "what's the disk on hpcomputer": "remote query",
+    "run the build on hpcomputer": "remote freeform",
+    # a sentence with BOTH families' words in it is a transfer, not an
+    # enrolment: the verb decides, and the send/remote claim rules then
+    # judge whether "face" names a file at all
+    "send heather's face to hpcomputer": "remote push",
+    "email my face to heather": "send file",
+    # the cast verbs (gesture-cast) sit ABOVE the remote five in the
+    # registry, pinned here so the merge order is a decision and not an
+    # accident: an object that is only this/it/that, aimed at a sink the
+    # cast table knows, is the throw by voice (the held subject, else the
+    # one resolved now); a NAMED file to the same host is still the
+    # transfer with its read-back
+    "put this on hpcomputer": "cast put",
+    "send it to the hp": "cast throw",
+    "put this file on hpcomputer": "remote push",
+    "send this file to hpcomputer": "remote push",
+    # ...and the neighbours each family had to beat still answer their own
+    "forget the walk to wisenbaker": "leave time forget",
+    "remember that the lab is on tuesday": "remember",
+    "add milk to the shopping list": "list add",
+}
+
+
+@pytest.mark.parametrize("phrase,expected", sorted(UNION_FIRST_RUNG.items()))
+def test_face_and_remote_families_do_not_shadow_each_other(phrase, expected):
+    from jarvis.commander import ASSISTANT_TIER1
+    t = phrase.strip().lower().rstrip(".!?")
+    first = next((c.name for c in ASSISTANT_TIER1 if c.matcher(t)), None)
+    assert first == expected, (phrase, first)
 
 
 # The dialogue-board phrasings that MISS their Tier-1 regex and so fall
@@ -2643,3 +2725,114 @@ def test_incident_replay_push_back_then_forward_leaves_the_series_alone(real_tk,
     it = tk.list("alarm")[0]
     assert it.snooze_until is None and not it.shifted
     assert tk.list_text("alarm") == "One alarm, sir: wake up at 7:00 am tomorrow, every day."
+
+
+# ------------------------------------------------ grab and throw by voice
+class FakeCourier:
+    """jarvis/gesturecast.GestureCast's voice face, recording every call."""
+
+    def __init__(self):
+        self.throws, self.drops, self.taught, self.sides = [], 0, [], []
+        self.holding, self.spoken_over_calls = 0, 0
+
+    def throw_by_voice(self, sink):
+        self.throws.append(sink)
+        return "On the board, sir.", "landed"
+
+    def drop_by_voice(self):
+        self.drops += 1
+        return "Put down, sir."
+
+    def holding_line(self):
+        self.holding += 1
+        return "Holding the thesis draft, sir."
+
+    def teach(self, side, sink):
+        self.taught.append((side, sink))
+        return "Right is HPCOMPUTER from now on, sir."
+
+    def side_line(self, sink):
+        self.sides.append(sink)
+        return "HPCOMPUTER is on your right, sir."
+
+    def spoken_over(self):
+        self.spoken_over_calls += 1
+
+
+@pytest.fixture
+def courier(rich, services):
+    c = FakeCourier()
+    services.gesture = c
+    return c
+
+
+def test_the_cast_verbs_reach_the_courier(rich, courier):
+    res = rich.handle("throw this on hpcomputer", source="voice")
+    assert res.handled and res.speak and res.reply == "On the board, sir."
+    assert courier.throws == ["hpcomputer"]
+    res = rich.handle("put it on the board", source="voice")
+    assert res.reply == "On the board, sir." and courier.throws[-1] == "the board"
+    res = rich.handle("drop it", source="voice")
+    assert res.reply == "Put down, sir." and courier.drops == 1
+    res = rich.handle("what am I holding", source="voice")
+    assert res.reply == "Holding the thesis draft, sir." and courier.holding == 1
+    res = rich.handle("HPCOMPUTER is on my right", source="voice")
+    assert res.reply.startswith("Right is HPCOMPUTER") and courier.taught == [("right", "hpcomputer")]
+    res = rich.handle("which side is hpcomputer on", source="voice")
+    assert res.reply == "HPCOMPUTER is on your right, sir." and courier.sides == ["hpcomputer"]
+
+
+def test_without_a_courier_the_cast_verbs_do_not_claim_the_turn(rich, services):
+    services.gesture = None
+    assert rich._match_assistant("drop it") == "cast drop"
+    res = rich._try_assistant("drop it")
+    assert res is None
+
+
+def test_the_cast_verbs_do_not_collide_with_the_list_and_board_families(rich, courier):
+    """The words overlap half the registry: the object is pinned to
+    this/it/that and the target to the sink table, in both directions."""
+    for phrase, name in (
+            ("put milk on the shopping list", "list add"),
+            ("throw milk on the shopping list", "list add"),
+            ("cross the second one off the list", "list strike anon"),
+            ("drop the board", "board hide"),
+            ("put the board down", "board hide"),
+            ("put up the board", "board show"),
+            ("drop the timer", "cancel schedule"),
+            ("throw this on hpcomputer", "cast throw"),
+            ("send this to the pc", "cast throw"),
+            ("put that on the board", "cast put"),
+            ("put it down", "cast drop"),
+            ("let go", "cast drop"),
+            ("hpcomputer is on my left", "cast teach"),
+            ("the right is the board", "cast teach")):
+        assert rich._match_assistant(phrase) == name, phrase
+    # "the desktop" is a folder on this box (the file lane's ruling), so it
+    # must never resolve to HPCOMPUTER as a cast sink.
+    assert not str(rich._match_assistant("send this to the desktop") or "").startswith("cast")
+    assert not str(rich._match_assistant("put this on my desktop") or "").startswith("cast")
+    for phrase in ("throw a party for my sister", "send this to mom",
+                   "right is fine", "what is left", "drop everything",
+                   "put it on my calendar", "throw it away",
+                   "cast a wide net", "let it be"):
+        got = rich._match_assistant(phrase)
+        assert not (got or "").startswith("cast"), (phrase, got)
+    assert courier.throws == []
+
+
+def test_a_sentence_puts_a_live_carry_down_but_a_cast_verb_does_not(rich, courier):
+    rich.handle("what time is it", source="voice")
+    assert courier.spoken_over_calls == 1
+    rich.handle("drop it", source="voice")
+    rich.handle("throw this on the board", source="voice")
+    rich.handle("hpcomputer is on my right", source="voice")
+    rich.handle("what am i holding", source="voice")
+    assert courier.spoken_over_calls == 1
+    rich.handle("bring up the board", source="typed")
+    assert courier.spoken_over_calls == 2
+
+
+def test_a_slim_commander_with_no_services_survives_the_carry_hook():
+    c = object.__new__(Commander)
+    c._cast_spoken_over("anything at all")       # no services: a no-op
