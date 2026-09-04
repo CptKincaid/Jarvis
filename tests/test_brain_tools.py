@@ -191,9 +191,10 @@ def test_chat_payload_matches_spec(brain, setup):
     assert p["model"] == brain.OLLAMA_MODEL
     assert p["stream"] is False and p["think"] is False
     assert p["keep_alive"] == -1
-    # The window and the spoken cap come from assistant.json brain.*
-    # (jarvis/brain.py SETTINGS), read ONCE at import; the DEFAULTS
-    # themselves are pinned in tests/test_brain_room.py.
+    # The window and the per-round generation budget come from
+    # assistant.json brain.* (jarvis/brain.py SETTINGS), built ONCE on
+    # first use -- never at import; the DEFAULTS themselves are pinned in
+    # tests/test_brain_room.py.
     assert p["options"] == {"num_ctx": brain.NUM_CTX,
                             "temperature": brain.SETTINGS.temperature,
                             "num_predict": brain.SETTINGS.num_predict,

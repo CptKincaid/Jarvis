@@ -27,9 +27,12 @@ Ollama reload the model.
 What the model is GIVEN -- the window, the per-round generation budget,
 the temperature, whether it reasons, and the guard that keeps his question
 in the window -- is his to tune in ``~/.config/jarvis/assistant.json``
-under ``brain``. It is read ONCE, at import, into SETTINGS (see the block
-by ModelSettings for why once and not per request) and a change needs a
-restart. The settings actually in force, and the room they leave for the
+under ``brain``. It is read ONCE per process into SETTINGS -- handed over
+by the app from the config it already loaded (configure(config=...)), or
+on first use for anything else; never at import, because an import must
+not read his config, let alone write it (see the block by ModelSettings
+for why once and not per request) -- and a change needs a restart.
+The settings actually in force, and the room they leave for the
 answer, are logged in one line the first time the prompt is built:
 log_settings(). Every /api/chat request this module makes -- the tool
 loop (streamed or not), the persona helpers, the router tie-breaker, the
@@ -59,6 +62,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import dataclasses
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -128,7 +132,8 @@ CLASSIFY_TIMEOUT_S = 5.0
 # turn would cost him a reload a turn. Three of four attempts to change it
 # on the LIVE server hung indefinitely instead.
 #
-# So the config is read ONCE, at import, into SETTINGS; NUM_CTX is that one
+# So the config is read ONCE per process into SETTINGS (on first use, or
+# handed in by the app -- never at import); NUM_CTX is that one
 # value; and every request this module makes (chat, classify_route,
 # summarize, local_line, the JSON helpers, the warm-up) and every request
 # jarvis/tools/screen.py makes alongside it sends exactly that number.
@@ -155,28 +160,46 @@ class ModelSettings:
     protect_question: bool = True   # the guard in fit_prompt()
 
     def ceiling_for(self, num_predict=None) -> int:
-        """Estimated prompt tokens a request may use before the guard trims.
+        """CALIBRATED prompt tokens a request may use before the guard trims.
 
-        Below the window by the round's own generation budget plus a
-        reserve: a prompt that fills the window leaves nothing to answer
-        WITH, and Ollama accepts it anyway -- measured 2026-09-04, an
-        8175-token prompt accepted with num_predict 160 at num_ctx 8192,
-        i.e. 17 tokens of room for a 160-token reply. ``num_predict`` is
-        the request's own override (a warm-up asks for 1, explain_text for
-        420); None means the configured one."""
+        Below the window by the round's own generation budget, the reserve,
+        AND an estimate-error margin of ESTIMATE_MARGIN of the window: a
+        prompt that fills the window leaves nothing to answer WITH, and
+        Ollama accepts it anyway -- measured 2026-09-04, an 8175-token
+        prompt accepted with num_predict 160 at num_ctx 8192, i.e. 17
+        tokens of room for a 160-token reply. The margin is there because
+        the guard compares an ESTIMATE: at 16384 the reserve alone (160 +
+        128 = 288) was smaller than the estimate's own measured error (the
+        static prefix estimated 3556, counted 3761, 5.8% low -- ~930 tokens
+        at the old 16096 ceiling). The arithmetic at the shipped settings:
+        16384 - 160 - 128 - 655 (4%) = 15441 ceiling; a calibrated estimate
+        (raw x 1.06) passes at raw <= 14566; even a real cost 10% above raw
+        (16022, worse than anything measured) plus the 160-token reply is
+        16182 < 16384. ``num_predict`` is the request's own override (a
+        warm-up asks for 1, explain_text for 420); None means the
+        configured one."""
         predict = self.num_predict if num_predict is None else num_predict
         try:
             predict = int(predict)
         except (TypeError, ValueError):
             predict = self.num_predict
-        return max(1024, int(self.num_ctx) - predict
-                   - int(self.answer_reserve_tokens))
+        window = int(self.num_ctx)
+        return max(1024, window - predict - int(self.answer_reserve_tokens)
+                   - int(window * ESTIMATE_MARGIN))
 
     @property
     def prompt_ceiling(self) -> int:
         """ceiling_for() at the configured num_predict: the tool loop's."""
         return self.ceiling_for(None)
 
+
+# The guard's estimate-error margin, as a fraction of the window, taken off
+# the ceiling on top of answer_reserve_tokens (see ceiling_for for the
+# arithmetic). 4% of 16384 is 655 tokens: the whole of the measured 5.8%
+# under-estimate of the static prefix is covered by the calibration factor
+# below (CALIBRATION_INITIAL), and this margin covers the same error again
+# on the part of the prompt no round has calibrated yet.
+ESTIMATE_MARGIN = 0.04
 
 # Bounds are sanity rails, not opinions: outside them the default is used
 # and the reason is logged, because a typo in his config must not put this
@@ -218,7 +241,10 @@ def model_settings(cfg=None) -> ModelSettings:
     default, because the brain has to start either way.
 
     Pure apart from those log lines, so a test can hand it a fake config;
-    the PROCESS-WIDE value is SETTINGS, built once below and never rebuilt.
+    the PROCESS-WIDE value is SETTINGS, built once by _build_settings()
+    (on first use, or from the app's own config via configure()) and
+    never rebuilt. With cfg None it READS the config -- AssistantConfig.load()
+    is a read since 2026-09-04 and cannot write the file back.
     """
     if cfg is None:
         try:
@@ -257,17 +283,73 @@ def model_settings(cfg=None) -> ModelSettings:
     return got
 
 
-SETTINGS = model_settings()    # read ONCE per process; a change needs a restart
-NUM_CTX = SETTINGS.num_ctx     # identical on EVERY request (see above)
-# Sampling options for Tier 2 (num_predict is the per-round generation
+# SETTINGS, NUM_CTX, CHAT_OPTIONS and OLLAMA_OPTIONS are module attributes
+# built ONCE per process by _build_settings() -- on first use, through the
+# module __getattr__ at the bottom of this file or settings()/num_ctx()
+# inside it -- and never rebuilt. They are deliberately NOT built here:
+# until 2026-09-04 this read `SETTINGS = model_settings()`, which called
+# AssistantConfig.load() the moment anything imported jarvis.brain (an
+# agent, a script, jarvis-breeze at boot, the test suite), and load() then
+# WROTE his secret-bearing assistant.json whenever DEFAULTS had gained a
+# key; that is what rewrote the live file at 15:08 that day. Both ends are
+# closed now: load() cannot write (assistant_config.ensure_defaults is the
+# app's explicit write), and an import of this module reads no config at
+# all -- tests/test_config_readonly.py imports every jarvis module and
+# checks the file's bytes and mtime did not move.
+#
+# NUM_CTX is identical on EVERY request (see above). CHAT_OPTIONS are the
+# sampling options for Tier 2 (num_predict is the per-round generation
 # budget -- reply text plus tool-call JSON -- not the spoken cap, which is
 # MAX_SPOKEN_* below; the stop strings end a run-on transcript before the
 # model writes Hunter's next line for him). Built from SETTINGS, so these
-# are one value too.
-CHAT_OPTIONS = {"num_ctx": NUM_CTX, "temperature": SETTINGS.temperature,
-                "num_predict": SETTINGS.num_predict,
-                "stop": ["\nUser:", "\nHunter:"]}
-OLLAMA_OPTIONS = CHAT_OPTIONS  # legacy name
+# are one value too. OLLAMA_OPTIONS is the legacy name for CHAT_OPTIONS.
+_LAZY_NAMES = ("SETTINGS", "NUM_CTX", "CHAT_OPTIONS", "OLLAMA_OPTIONS")
+_SETTINGS_LOCK = threading.Lock()
+_SETTINGS_SOURCE: list = []    # ["app"] or ["first use"], once built
+
+
+def _build_settings(cfg=None, source="first use"):
+    """Build the four module values once; return SETTINGS. A SETTINGS a
+    test has already installed is kept (setdefault) -- the wire values
+    NUM_CTX / CHAT_OPTIONS still come from the config, which is what the
+    tiny-window tests rely on."""
+    g = globals()
+    with _SETTINGS_LOCK:
+        if "NUM_CTX" not in g:
+            built = model_settings(cfg)
+            g.setdefault("SETTINGS", built)
+            g["NUM_CTX"] = built.num_ctx
+            g["CHAT_OPTIONS"] = {"num_ctx": built.num_ctx,
+                                 "temperature": built.temperature,
+                                 "num_predict": built.num_predict,
+                                 "stop": ["\nUser:", "\nHunter:"]}
+            g["OLLAMA_OPTIONS"] = g["CHAT_OPTIONS"]
+            _SETTINGS_SOURCE.append(source)
+            log.info("brain: model settings built once from %s (window %d, "
+                     "generation per round %d, temperature %s, thinking %s)",
+                     source, built.num_ctx, built.num_predict,
+                     built.temperature, "on" if built.think else "off")
+        return g["SETTINGS"]
+
+
+def settings() -> ModelSettings:
+    """The ModelSettings in force (built on first call)."""
+    s = globals().get("SETTINGS")
+    return s if s is not None else _build_settings()
+
+
+def num_ctx() -> int:
+    """The one num_ctx on the wire (built on first call)."""
+    n = globals().get("NUM_CTX")
+    if n is None:
+        _build_settings()
+        n = globals()["NUM_CTX"]
+    return n
+
+
+def settings_source() -> str:
+    """'app', 'first use', or '' while nothing has built them yet."""
+    return _SETTINGS_SOURCE[0] if _SETTINGS_SOURCE else ""
 # 30 s, not 300. This loop is the ONLY thing that notices the chat model
 # has fallen out of Ollama's single slot, and at 300 s a turn could pay a
 # ~7 s reload for up to five minutes after any second-model request --
@@ -1129,9 +1211,17 @@ _REGISTRY = None
 _RESIDENCY = {"unloaded_once": False, "thread": None, "lent": False}
 
 
-def configure(model=None):
+def configure(model=None, config=None):
     """Choose the local model (app start, from assistant.local_model); the
-    JARVIS_OLLAMA_MODEL env var wins. Returns the model in force."""
+    JARVIS_OLLAMA_MODEL env var wins. Returns the model in force.
+
+    ``config`` is the app's already-loaded AssistantConfig: the brain.*
+    model settings are built from it here, ONCE, instead of this module
+    reading (or, before 2026-09-04, writing) a config of its own. If
+    something built them earlier -- a first use before the app got here
+    -- they are kept, because a rebuild would send Ollama a second num_ctx
+    (the one-value invariant); it is logged as a warning only when the
+    values actually differ from what the config says."""
     global OLLAMA_MODEL
     chosen = (os.environ.get("JARVIS_OLLAMA_MODEL") or model or
               OLLAMA_MODEL).strip()
@@ -1139,6 +1229,17 @@ def configure(model=None):
         log.info("ollama model: %s -> %s", OLLAMA_MODEL, chosen)
         OLLAMA_MODEL = chosen
         _RESIDENCY["unloaded_once"] = False
+    if config is not None:
+        if "NUM_CTX" not in globals():
+            _build_settings(config, source="app")
+        else:
+            wanted = model_settings(config)
+            if wanted != settings():
+                log.warning("brain: model settings were already built (%s) "
+                            "before the app handed its config over, and "
+                            "differ from it; keeping the built ones -- they "
+                            "are one value per process",
+                            settings_source())
     return OLLAMA_MODEL
 
 
@@ -1286,9 +1387,10 @@ def _split_complete_sentences(buf):
 
 
 def _options(**overrides):
-    opts = dict(CHAT_OPTIONS)
+    ctx = num_ctx()                    # builds the settings on first use
+    opts = dict(globals()["CHAT_OPTIONS"])
     opts.update(overrides)
-    opts["num_ctx"] = NUM_CTX          # never varies: a change reloads the model
+    opts["num_ctx"] = ctx              # never varies: a change reloads the model
     return opts
 
 
@@ -1300,7 +1402,7 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
                # brain.think in assistant.json; measured off (see
                # model_settings) -- and the reasoning scrubber below is
                # only DEFENSIVE while it stays off.
-               "think": SETTINGS.think,
+               "think": settings().think,
                "keep_alive": 0 if _RESIDENCY.get("lent") else -1,
                "options": _options(**opt_overrides)}
     if tools:
@@ -1343,8 +1445,8 @@ def log_settings(registry=None):
     except Exception:
         log.debug("brain: tool schema cost unavailable for the settings line")
     prefix = system_tokens + schema_tokens
-    left = SETTINGS.num_ctx - prefix - SETTINGS.num_predict \
-        - SETTINGS.answer_reserve_tokens
+    S = settings()
+    left = S.num_ctx - prefix - S.num_predict - S.answer_reserve_tokens
     log.info(
         "brain: window %d tokens, generation per round capped at %d "
         "(reply text plus tool calls; speech is clamped separately), "
@@ -1352,12 +1454,13 @@ def log_settings(registry=None):
         "needs a restart). Static prefix ~%d tokens (persona ~%d + %d tool "
         "schemas ~%d), %d reserved -> ~%d tokens left for his question, "
         "memory, history and tool results. Question guard %s (trims a "
-        "round above ~%d tokens).",
-        SETTINGS.num_ctx, SETTINGS.num_predict, SETTINGS.temperature,
-        "on" if SETTINGS.think else "off", prefix, system_tokens, tools,
-        schema_tokens, SETTINGS.answer_reserve_tokens, left,
-        "on" if SETTINGS.protect_question else "OFF",
-        SETTINGS.prompt_ceiling)
+        "round above ~%d calibrated tokens: %d%% of the window kept as "
+        "estimate margin, estimate x%.3f from the last measured round).",
+        S.num_ctx, S.num_predict, S.temperature,
+        "on" if S.think else "off", prefix, system_tokens, tools,
+        schema_tokens, S.answer_reserve_tokens, left,
+        "on" if S.protect_question else "OFF",
+        S.prompt_ceiling, int(ESTIMATE_MARGIN * 100), calibration_factor())
     if left < 1024:
         log.warning("brain: only ~%d tokens are left for his actual turn "
                     "after the persona and the tool schemas; raise "
@@ -1369,6 +1472,62 @@ def log_settings(registry=None):
 # an invitation to make the call again, and the model can say what it lost.
 TOOL_DROPPED_TEXT = ("[an earlier result was dropped to keep the question "
                      "itself inside the model's window]")
+# ...but dropping whole is the LAST resort. When the overflow is smaller
+# than the result, the guard cuts the result's TAIL (as fit_material does
+# for a document) and marks the cut, so a long calendar loses its evening
+# rather than its morning: a review probe (num_ctx 2048, one 3 900-char
+# calendar result) showed the drop-whole rule replacing the ONLY result
+# the model needed and the turn ending as "an earlier result was dropped,
+# sir" instead of a partial calendar. A cut that would leave fewer than
+# MIN_TOOL_KEEP_CHARS is a drop.
+TOOL_CUT_TEXT = ("\n[cut here to keep the question in the model's window; "
+                 "the result went on]")
+MIN_TOOL_KEEP_CHARS = 400
+# tool_message() appends SENTENCE_ALLOWANCE to a list-shaped result, at the
+# END. It is instruction, not data: a tail cut lifts it off first and puts
+# it back after the marker, or a cut calendar would also lose the model's
+# permission to name more than two of its items. Built from the template
+# itself so the two cannot drift apart.
+_ALLOWANCE_RX = re.compile(
+    re.escape(SENTENCE_ALLOWANCE.format(n="\x00")).replace("\x00", r"\d+")
+    + r"\Z")
+
+
+def _split_allowance(content):
+    """(body, allowance-suffix-or-empty) of a tool message's content."""
+    m = _ALLOWANCE_RX.search(content or "")
+    if not m:
+        return content, ""
+    return content[:m.start()], content[m.start():]
+
+
+def seen_after_guard(edits, index, ran_results, tool_texts):
+    """After fit_prompt: bring the loop's records to what the model NOW
+    sees of each result the guard cut or dropped -- the kept head with its
+    cut marker, or the dropped marker -- so the coverage and provenance
+    checks judge a reply against the text the model actually had, not
+    words it never saw. ``edits`` is fit_prompt's ``changed`` list,
+    ``index`` maps id(message) -> position in ran_results / tool_texts.
+    Returns the positions updated."""
+    done = []
+    for msg, _kind, _before in edits or ():
+        i = index.get(id(msg))
+        if i is None or i >= len(ran_results) or i >= len(tool_texts):
+            continue
+        seen = msg.get("content") or ""
+        name, result = ran_results[i]
+        try:
+            result = dataclasses.replace(result, text=seen)
+        except (TypeError, ValueError):
+            from jarvis.tools.registry import ToolResult
+            result = ToolResult(text=seen, ok=getattr(result, "ok", True),
+                                max_sentences=getattr(result, "max_sentences", 2),
+                                card=getattr(result, "card", None),
+                                speak=getattr(result, "speak", None))
+        ran_results[i] = (name, result)
+        tool_texts[i] = seen
+        done.append(i)
+    return done
 
 
 # ----------------------------------------------------------------------
@@ -1387,6 +1546,62 @@ TOOL_CHARS_PER_TOKEN = 2.25                 # tool results and tool-call JSON
 # Chat-template markers per message (<start_of_turn>role ... <end_of_turn>).
 # Not measured; about four, and erring high is the safe direction.
 MESSAGE_OVERHEAD_TOKENS = 4
+# An image in a message (the screen tool) is not text: gemma-family models
+# spend a fixed block of tokens per image. Not measured on this box; 1024
+# is above the 256-token figure the model card gives, erring high.
+IMAGE_TOKENS_ALLOWANCE = 1024
+
+# CALIBRATION: the estimate is checked against Ollama's own prompt_eval_count
+# on every round (_log_round_tokens), and the ratio measured/estimated is
+# carried forward as a correction factor the guard multiplies the NEXT
+# round's estimate by. It starts at the measured under-estimate of the
+# static prefix (2026-09-04: estimated 3556, counted 3761 -> 1.058) so the
+# very first round is already corrected; it is an EMA (half old, half new)
+# clamped to [CALIBRATION_INITIAL, CALIBRATION_MAX] -- it can only ever make
+# the guard MORE cautious than the measured baseline, never less, because
+# the failure it prevents is silent and the cost of over-caution is a
+# tail-trim. A count below half the estimate is not used: it cannot be a
+# whole-prompt count (a prefix-cache hit reporting only the tail is the
+# suspected cause, not verified), and a low count is never a truncation
+# risk anyway. Every change is logged with both numbers.
+CALIBRATION_INITIAL = 1.06
+CALIBRATION_MAX = 2.0
+CALIBRATION_ALPHA = 0.5
+_CALIBRATION = {"factor": CALIBRATION_INITIAL, "samples": 0}
+
+
+def calibration_factor() -> float:
+    return _CALIBRATION["factor"]
+
+
+def calibrated(estimate) -> int:
+    """An estimate with the running correction applied: what the guard
+    compares against the ceiling."""
+    return int(estimate * _CALIBRATION["factor"] + 0.5)
+
+
+def _calibrate(used, estimated, label="chat"):
+    """Fold one measured (used) vs estimated pair into the factor."""
+    try:
+        used, estimated = int(used), int(estimated)
+    except (TypeError, ValueError):
+        return
+    if used <= 0 or estimated <= 0:
+        return
+    ratio = used / estimated
+    if ratio < 0.5:
+        log.debug("ctx: %d counted against an estimate of %d [%s] is not a "
+                  "whole-prompt count; calibration unchanged", used,
+                  estimated, label)
+        return
+    old = _CALIBRATION["factor"]
+    new = old + CALIBRATION_ALPHA * (ratio - old)
+    new = max(CALIBRATION_INITIAL, min(CALIBRATION_MAX, new))
+    _CALIBRATION["factor"] = round(new, 4)
+    _CALIBRATION["samples"] += 1
+    if abs(new - old) >= 0.005:
+        log.info("ctx-calibration: %.3f -> %.3f (Ollama counted %d against "
+                 "an estimate of %d [%s])", old, new, used, estimated, label)
 
 # Schema cost, cached by tool NAMES. The tools block is byte-stable for a
 # fixed tool set (registry.schemas(), the static-prefix rule), so its
@@ -1434,6 +1649,12 @@ def _message_tokens(msg) -> int:
             tokens += len(json.dumps(calls, default=str)) / TOOL_CHARS_PER_TOKEN
         except (TypeError, ValueError):
             pass
+    images = msg.get("images")
+    if images:
+        try:
+            tokens += IMAGE_TOKENS_ALLOWANCE * len(images)
+        except TypeError:
+            tokens += IMAGE_TOKENS_ALLOWANCE
     return int(tokens)
 
 
@@ -1444,7 +1665,8 @@ def estimate_prompt_tokens(messages, tools=None):
     chars per token, tool results and tool-call JSON at the measured 2.25.
     It is an estimate on purpose -- the exact count is only knowable after
     the fact, and _log_round_tokens() logs that one from Ollama's own reply
-    beside this one, on every path, so the two can be compared in the log."""
+    beside this one, on every path, so the two can be compared in the log.
+    This is the RAW figure; the guards compare calibrated() of it."""
     try:
         total = sum(_message_tokens(m) for m in (messages or []))
     except Exception:                      # noqa: BLE001 - never block a turn
@@ -1453,44 +1675,80 @@ def estimate_prompt_tokens(messages, tools=None):
 
 
 def fit_prompt(messages, tools=None, ceiling=None, num_predict=None,
-               label="chat"):
+               label="chat", changed=None):
     """THE GUARD for the tool loop (assistant.json ``brain.protect_question``).
 
-    When a round would overflow the window, drop the OLDEST TOOL RESULT --
-    because if we do not, Ollama makes room its own way, and its way is to
-    delete whole messages oldest-first after the system prompt. That is HIS
-    QUESTION. Measured 2026-09-04 on the live server: a 9 000-char calendar
-    result took prompt_eval_count from 8253 DOWN to 7754 -- exactly the 499
-    tokens of his question, background and memory -- and a 10 000-char one
-    collapsed it to 3761, i.e. the system prompt and the tool schemas alone.
-    No error, no log line, nothing; the model then answered something
-    confident and unrelated.
+    When a round would overflow the window, shorten the OLDEST TOOL RESULT
+    -- because if we do not, Ollama makes room its own way, and its way is
+    to delete whole messages oldest-first after the system prompt. That is
+    HIS QUESTION. Measured 2026-09-04 on the live server: a 9 000-char
+    calendar result took prompt_eval_count from 8253 DOWN to 7754 --
+    exactly the 499 tokens of his question, background and memory -- and a
+    10 000-char one collapsed it to 3761, i.e. the system prompt and the
+    tool schemas alone. No error, no log line, nothing; the model then
+    answered something confident and unrelated.
 
-    Mutates ``messages`` in place and returns (dropped, estimated tokens).
+    Oldest result first: its tail is cut to absorb the overflow when at
+    least MIN_TOOL_KEEP_CHARS of it would remain (TOOL_CUT_TEXT marks the
+    cut); otherwise it is replaced whole by TOOL_DROPPED_TEXT and the next
+    result is considered. The estimate compared is calibrated() -- the raw
+    estimate times the factor measured on earlier rounds.
+
+    Mutates ``messages`` in place and returns (results dropped WHOLE,
+    calibrated estimate). ``changed``, when a list, receives one
+    (message, "cut" | "dropped", previous content) per message touched,
+    so the caller can record what the model actually saw.
     """
+    S = settings()
     if ceiling is None:
-        ceiling = SETTINGS.ceiling_for(num_predict)
+        ceiling = S.ceiling_for(num_predict)
     ceiling = int(ceiling)
-    estimate = estimate_prompt_tokens(messages, tools)
-    if estimate <= ceiling or not SETTINGS.protect_question:
+    estimate = calibrated(estimate_prompt_tokens(messages, tools))
+    if estimate <= ceiling or not S.protect_question:
         return 0, estimate
     dropped = 0
+    factor = calibration_factor()
     for msg in messages:
         if estimate <= ceiling:
             break
         if not isinstance(msg, dict) or msg.get("role") != "tool":
             continue
         content = msg.get("content") or ""
-        if content == TOOL_DROPPED_TEXT:
-            continue                      # already given up, once is enough
-        msg["content"] = TOOL_DROPPED_TEXT
-        dropped += 1
-        log.warning("%s: prompt ~%d tokens over the %d-token ceiling; "
-                    "dropped the oldest result (%s, %d chars) so his "
-                    "question stays in the window",
-                    label, estimate, ceiling,
-                    msg.get("tool_name") or "tool", len(content))
-        estimate = estimate_prompt_tokens(messages, tools)
+        if content == TOOL_DROPPED_TEXT or TOOL_CUT_TEXT in content:
+            continue                      # already given up on, once is enough
+        over = estimate - ceiling
+        # the sentence allowance (instruction, at the end) is kept whole;
+        # only the data in front of it is cut
+        body, suffix = _split_allowance(content)
+        # chars to remove at the dense rate, un-calibrated back to raw
+        # chars, plus the marker and a line of slack so one pass fits
+        cut = int(over * TOOL_CHARS_PER_TOKEN / factor) \
+            + len(TOOL_CUT_TEXT) + int(MESSAGE_OVERHEAD_TOKENS * TOOL_CHARS_PER_TOKEN)
+        keep = len(body) - cut
+        if keep >= MIN_TOOL_KEEP_CHARS:
+            head = body[:keep]
+            nl = head.rfind("\n")
+            if nl > keep // 2:
+                head = head[:nl]           # cut at a line, as cap_tool_text does
+            msg["content"] = head.rstrip() + TOOL_CUT_TEXT + suffix
+            kind = "cut"
+            log.warning("%s: prompt ~%d tokens over the %d-token ceiling; "
+                        "cut the last %d of %d chars of the oldest result "
+                        "(%s) so his question stays in the window",
+                        label, estimate, ceiling, len(body) - len(head),
+                        len(body), msg.get("tool_name") or "tool")
+        else:
+            msg["content"] = TOOL_DROPPED_TEXT
+            dropped += 1
+            kind = "dropped"
+            log.warning("%s: prompt ~%d tokens over the %d-token ceiling; "
+                        "dropped the oldest result (%s, %d chars) so his "
+                        "question stays in the window",
+                        label, estimate, ceiling,
+                        msg.get("tool_name") or "tool", len(content))
+        if changed is not None:
+            changed.append((msg, kind, content))
+        estimate = calibrated(estimate_prompt_tokens(messages, tools))
     if estimate > ceiling:
         # Nothing left that is safe to drop: what remains is the system
         # prompt, the tool schemas and his turn, and his turn is the one
@@ -1530,8 +1788,9 @@ def fit_material(messages, tools=None, ceiling=None, num_predict=None,
     have held it anyway. Mutates ``messages`` in place and returns (chars
     cut, estimated tokens -- the dense one).
     """
+    S = settings()
     if ceiling is None:
-        ceiling = SETTINGS.ceiling_for(num_predict)
+        ceiling = S.ceiling_for(num_predict)
     ceiling = int(ceiling)
     last = None
     for msg in reversed(messages or []):
@@ -1540,27 +1799,29 @@ def fit_material(messages, tools=None, ceiling=None, num_predict=None,
             last = msg
             break
     if last is None:
-        estimate = estimate_prompt_tokens(messages, tools)
-        if estimate > ceiling and SETTINGS.protect_question:
+        estimate = calibrated(estimate_prompt_tokens(messages, tools))
+        if estimate > ceiling and S.protect_question:
             log.warning("%s: prompt ~%d tokens against a %d-token ceiling "
                         "with no material to trim; Ollama may truncate it. "
                         "Raise brain.num_ctx.", label, estimate, ceiling)
         return 0, estimate
     base = estimate_prompt_tokens([m for m in messages if m is not last],
                                   tools)
+    factor = calibration_factor()
 
     def dense(text):
-        return int(len(text) / TOOL_CHARS_PER_TOKEN) + MESSAGE_OVERHEAD_TOKENS
+        return calibrated(base + len(text) / TOOL_CHARS_PER_TOKEN
+                          + MESSAGE_OVERHEAD_TOKENS)
 
     content = last["content"]
-    estimate = base + dense(content)
-    if estimate <= ceiling or not SETTINGS.protect_question:
+    estimate = dense(content)
+    if estimate <= ceiling or not S.protect_question:
         return 0, estimate
     over = estimate - ceiling
-    cut = int(over * TOOL_CHARS_PER_TOKEN) + len(MATERIAL_CUT_TEXT)
+    cut = int(over * TOOL_CHARS_PER_TOKEN / factor) + len(MATERIAL_CUT_TEXT)
     keep = max(0, len(content) - cut)
     last["content"] = content[:keep].rstrip() + MATERIAL_CUT_TEXT
-    estimate = base + dense(last["content"])
+    estimate = dense(last["content"])
     log.warning("%s: prompt ~%d tokens over the %d-token ceiling; cut the "
                 "last %d of %d chars of material to fit (~%d tokens now)",
                 label, over + ceiling, ceiling, len(content) - keep,
@@ -1589,11 +1850,17 @@ def _log_round_tokens(data, estimated=0, label="chat"):
         out = int(data.get("eval_count") or 0)
     except (TypeError, ValueError):
         out = 0
-    pct = (100.0 * used / NUM_CTX) if NUM_CTX else 0.0
+    window = num_ctx()
+    pct = (100.0 * used / window) if window else 0.0
     line = ("ctx: prompt %d/%d tokens (%.0f%%), answer %d/%d"
-            % (used, NUM_CTX, pct, out, SETTINGS.num_predict))
+            % (used, window, pct, out, settings().num_predict))
     if estimated:
-        line += " (estimated %d)" % estimated
+        # `estimated` is the calibrated figure the guard compared; the raw
+        # one it came from is what the next round's factor is measured on.
+        raw = int(estimated / calibration_factor() + 0.5)
+        line += " (estimated %d, raw %d x%.3f)" % (estimated, raw,
+                                                    calibration_factor())
+        _calibrate(used, raw, label)
     line += " [%s]" % label
     if pct >= 90.0:
         log.warning("%s -- close to the window; Ollama drops the OLDEST "
@@ -3182,6 +3449,11 @@ class JarvisBrain:
         # the turn, so when an authored speak= line tries to end it the
         # loop can see whether an ANSWER is still owed.
         ran_results = []
+        # The message object each result became, by ran_results index, so
+        # that when the guard cuts or drops one the two lists above can be
+        # brought to what the model ACTUALLY saw (the provenance and
+        # coverage checks judge the reply against them).
+        tool_msgs = {}
         held_lines = []            # authored lines the check held back
         held_said = False          # ...and whether the reply carries them yet
         # How much of ran_results has already been put into SPOKEN words.
@@ -3255,7 +3527,10 @@ class JarvisBrain:
                 # appended after the budget accounting: this is instruction,
                 # not tool data, and must not squeeze the result itself out
                 content += SENTENCE_ALLOWANCE.format(n=allowed)
-            return {"role": "tool", "content": content, "tool_name": name}
+            msg = {"role": "tool", "content": content, "tool_name": name}
+            tool_msgs[id(msg)] = len(ran_results) - 1   # note() ran first
+            return msg
+
 
         rounds_left = max(1, int(max_rounds or 1))
         render_only = False        # next round writes; it may not call tools
@@ -3418,7 +3693,13 @@ class JarvisBrain:
                 # THE GUARD, before every round: keep his question in
                 # the window rather than letting Ollama delete it to make
                 # room for a tool result (see fit_prompt).
-                _, prompt_estimate = fit_prompt(messages, round_tools)
+                edits = []
+                _, prompt_estimate = fit_prompt(messages, round_tools,
+                                                changed=edits)
+                if edits:
+                    # tool_texts / ran_results now hold what the model
+                    # SEES of a cut or dropped result (seen_after_guard)
+                    seen_after_guard(edits, tool_msgs, ran_results, tool_texts)
                 round_started = time.monotonic()
                 streaming = on_sentence is not None and not plain_round
                 plain_round = False
@@ -4068,3 +4349,14 @@ class JarvisBrain:
             actions.append(("SPEAK", clean))
 
         return actions
+
+
+def __getattr__(name):
+    """SETTINGS / NUM_CTX / CHAT_OPTIONS / OLLAMA_OPTIONS, built on first
+    access (PEP 562) rather than at import -- see the block above
+    _build_settings for why an import of this module must not read the
+    config."""
+    if name in _LAZY_NAMES:
+        _build_settings()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

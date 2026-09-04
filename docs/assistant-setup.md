@@ -4236,10 +4236,25 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
 
 Everything the local model is *given* now lives in one place you can edit,
 under `brain` in `~/.config/jarvis/assistant.json`. It used to be four
-numbers buried in the code. (These six keys are already in your live
-`assistant.json` — an agent's import wrote them there on 2026-09-04 — and
-he reads them; a value that makes no sense is logged and replaced with the
-default rather than obeyed.)
+numbers buried in the code. A value that makes no sense is logged and
+replaced with the default rather than obeyed.
+
+**How these six keys got into your live file, and why that cannot happen
+again.** They are in your `assistant.json` because on 2026-09-04 at 15:08
+an *agent's* `import jarvis.brain` rewrote it — not Jarvis. Two things
+allowed that: importing the brain read the config, and reading the config
+saved it back whenever the defaults had gained a key. Both are closed.
+Loading the config **never writes** now — a missing file, a corrupt file,
+a loose mode or new default keys are only noted and logged. The one write
+is `ensure_defaults()`, which only the running app calls, once, at
+startup (it creates the file, moves a corrupt one to `.bad`, tightens the
+mode, fills in new keys — exactly what loading used to do, in the one
+process that owns the file). And importing the brain reads nothing: the
+app hands its already-loaded config over, and anything else gets a
+read-only load the first time it actually needs a setting. A test imports
+every one of the 152 jarvis modules against a stale, loose config and
+checks the bytes, the mtime and the mode did not move (measured on the
+old code: the same walk grew a 38-byte file to 12,632 bytes in 2 s).
 
 ```json
 "brain": {
@@ -4297,7 +4312,18 @@ that finished took 11 to 33 seconds against his usual 1.3. If you turn it
 on he warns you in the log and tells you what your `num_predict` is.
 
 **`answer_reserve_tokens` — headroom kept clear for the reply.** 128.
-You will not need to touch this.
+You will not need to touch this: since round 3 it is not the only margin.
+The guard works from an *estimate*, and the estimate has a measured error
+— the static prefix was estimated at 3,556 tokens and Ollama counted 3,761,
+5.8% low, which at the old 16,096 ceiling was ~930 tokens against a
+288-token margin (160 + 128). So two more things now sit between the
+estimate and the window: a **calibration factor** the estimate is
+multiplied by, starting at the measured **1.06** and learning from every
+round (below), and a fixed **4% of the window** (655 tokens) taken off the
+ceiling. The arithmetic at the shipped settings: 16384 − 160 − 128 − 655 =
+**15441** is the ceiling; a calibrated estimate passes at a raw estimate of
+at most 14,566; even if the real cost ran 10% above that (16,022 — worse
+than anything measured) the 160-token reply still fits under 16,384.
 
 **`protect_question` — the safety catch. Leave it on.**
 When a turn gets big — a long calendar plus a long email — something has
@@ -4306,17 +4332,30 @@ and the oldest message is **your question**. Measured: a 9000-character
 calendar result took his prompt from 8253 tokens down to 7754, and the
 499 tokens that vanished were your question, the background and his
 memory. He then answers something confident and unrelated, and nothing
-anywhere says why. With this on he drops the oldest *tool result*
-instead, keeps your question, and writes a line in the log saying he did
-it.
+anywhere says why. With this on he cuts the *tail of the oldest tool
+result* instead — a long calendar loses its evening, not its morning —
+marks the cut in the result so the model knows it is reading part of it
+(the "you may take up to N sentences" note a list-shaped result carries at
+its end is lifted off and put back, so a cut calendar is still read out in
+full sentences), keeps your question, and writes a line in the log saying
+he did it. Only
+a result too small to absorb the overflow (fewer than 400 characters
+would be left) is dropped whole. Round 2 dropped whole every time, which
+for the one result a turn hinged on meant he answered "an earlier result
+was dropped, sir" instead of reading you the morning. What the model then
+sees of a cut result is also what his own checks judge the reply against,
+not the full text it never had.
 
 It guards **every** request he makes to the model, not only the tool
 loop: the spoken summaries, the router's tie-breaker, "explain this
-document", the quizzes, the syllabus reader, the Sunday memory garden and
-both warm-ups. Those have no tool result to drop, so there he cuts the
-*tail of the material* — the end of the document or digest — and marks
-the cut, because the instruction in front of it is what Ollama would have
-eaten first.
+document", the quizzes, the syllabus reader, the Sunday memory garden,
+both warm-ups — and the screen tool's vision question (`[screen]` in the
+log), which used to post on its own. Those have no tool result to cut, so
+there he cuts the *tail of the material* — the end of the document or
+digest, or the question — and marks the cut, because the instruction in
+front of it is what Ollama would have eaten first. A screenshot is costed
+as a fixed allowance, never as its base64, so an image cannot trim the
+question.
 
 ### How he knows a prompt is too big
 
@@ -4331,16 +4370,24 @@ Then he logs what it *really* cost, from Ollama's own reply, on every
 path:
 
 ```
-ctx: prompt 4265/16384 tokens (26%), answer 22/160 (estimated 4310) [chat]
+ctx: prompt 4265/16384 tokens (26%), answer 22/160 (estimated 4310, raw 4066 x1.060) [chat]
+ctx-calibration: 1.060 -> 1.079 (Ollama counted 4265 against an estimate of 4066 [chat])
 ```
 
 The tag at the end names the path — `chat` (the tool loop), `persona`
 (summaries), `route` (the tie-breaker), `json` (documents, quizzes, the
-garden), `warm` and `rewarm` (the warm-ups). Estimate and real number sit
-side by side so a drift can be seen. Above 90% of the window the line
-becomes a warning. The `warm` line is special: the warm-up sends the
-static prefix and nothing else, so its prompt number **is** the true cost
-of the persona plus the tool schemas.
+garden), `warm` and `rewarm` (the warm-ups), `screen` (the vision
+question). Three numbers sit side by side: what Ollama counted, the
+calibrated estimate the guard compared, and the raw estimate with the
+factor it was multiplied by. The second line is the **calibration**: the
+measured-over-raw ratio of that round moves the factor half-way toward
+itself, and the *next* round's guard uses the new factor. It can only make
+him more careful than the measured 1.06 baseline, never less (a count
+below half the estimate is ignored as not a whole-prompt count), and it
+is capped at 2.0. Above 90% of the window the `ctx:` line becomes a
+warning. The `warm` line is special: the warm-up sends the static prefix
+and nothing else, so its prompt number **is** the true cost of the
+persona plus the tool schemas.
 
 ### Two things to know
 
@@ -4360,7 +4407,9 @@ plus tool calls; speech is clamped separately), temperature 0.7, thinking
 off (assistant.json brain.*; a change needs a restart). Static prefix
 ~3556 tokens (persona ~1462 + 28 tool schemas ~2094), 128 reserved ->
 ~12540 tokens left for his question, memory, history and tool results.
-Question guard on (trims a round above ~16096 tokens).
+Question guard on (trims a round above ~15441 calibrated tokens: 4% of
+the window kept as estimate margin, estimate x1.060 from the last
+measured round).
 ```
 
 None of this was visible before.

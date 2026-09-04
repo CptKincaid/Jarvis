@@ -80,14 +80,21 @@ def cfg_path(tmp_path, monkeypatch):
 
 @pytest.fixture
 def cfg(cfg_path):
-    return AssistantConfig.load()
+    cfg = AssistantConfig.load()
+    cfg.ensure_defaults()          # the app's one write, so the file exists
+    return cfg
 
 
 # ------------------------------------------------------------ creation
 def test_load_creates_file_with_placeholders_and_mode_600(cfg_path):
+    """Since 2026-09-04 the creation is ensure_defaults(), the app's
+    explicit write; load() alone leaves a missing file missing."""
     assert not cfg_path.exists()
     cfg = AssistantConfig.load()
     assert cfg.path == cfg_path
+    assert not cfg_path.exists()
+    assert cfg.disk_state["missing"] is True
+    assert cfg.ensure_defaults() is True
     assert cfg_path.exists()
     mode = stat.S_IMODE(cfg_path.stat().st_mode)
     assert mode == 0o600, oct(mode)
@@ -163,6 +170,7 @@ def test_env_override_wins_over_default_path(tmp_path, monkeypatch):
     monkeypatch.setenv(ac.ENV_VAR, str(env_path))
     assert ac.config_path() == env_path
     cfg = AssistantConfig.load()
+    cfg.ensure_defaults()
     assert cfg.path == env_path and env_path.exists()
     assert not (tmp_path / "home" / ".config" / "jarvis").exists()
 
@@ -172,6 +180,7 @@ def test_default_path_is_under_home_config(tmp_path, monkeypatch):
     monkeypatch.delenv(ac.ENV_VAR, raising=False)
     assert ac.config_path() == tmp_path / ".config" / "jarvis" / "assistant.json"
     cfg = AssistantConfig.load()
+    cfg.ensure_defaults()
     assert cfg.path == tmp_path / ".config" / "jarvis" / "assistant.json"
     assert cfg.path.exists()
     assert stat.S_IMODE(cfg.path.stat().st_mode) == 0o600
@@ -180,6 +189,7 @@ def test_default_path_is_under_home_config(tmp_path, monkeypatch):
 def test_explicit_path_arg_wins_over_env(tmp_path, cfg_path):
     other = tmp_path / "other.json"
     cfg = AssistantConfig.load(other)
+    cfg.ensure_defaults()
     assert cfg.path == other and other.exists()
     assert not cfg_path.exists()
 
@@ -203,17 +213,25 @@ def test_load_keeps_user_values_and_fills_new_keys(cfg_path):
     assert cfg.get("claude.big_model") == "fable"           # filled from DEFAULTS
     assert cfg.get("alarms.snooze_min") == 10
     on_disk = json.loads(cfg_path.read_text())
+    assert "alarms" not in on_disk                          # load() wrote NOTHING
+    assert cfg.disk_state["new_keys"] is True
+    assert cfg.ensure_defaults() is True                    # the app's write
+    on_disk = json.loads(cfg_path.read_text())
     assert on_disk["alarms"]["snooze_min"] == 10            # written back
     assert on_disk["custom_key"] == {"kept": True}
     assert on_disk["claude"]["model"] == "sonnet"
 
 
-def test_load_tightens_loose_mode(cfg_path):
+def test_ensure_defaults_tightens_loose_mode_and_load_does_not(cfg_path):
     cfg_path.parent.mkdir(parents=True)
     cfg_path.write_text(json.dumps(DEFAULTS))
     os.chmod(cfg_path, 0o644)
-    AssistantConfig.load()
+    cfg = AssistantConfig.load()
+    assert stat.S_IMODE(cfg_path.stat().st_mode) == 0o644   # noted, not touched
+    assert cfg.disk_state["loose_mode"] is True
+    assert cfg.ensure_defaults() is True
     assert stat.S_IMODE(cfg_path.stat().st_mode) == 0o600
+    assert json.loads(cfg_path.read_text()) == DEFAULTS      # bytes untouched
 
 
 def test_load_never_raises_on_unwritable_dir(tmp_path, monkeypatch):
@@ -227,6 +245,7 @@ def test_load_never_raises_on_unwritable_dir(tmp_path, monkeypatch):
         monkeypatch.setenv(ac.ENV_VAR, str(locked / "assistant.json"))
         cfg = AssistantConfig.load()
         assert cfg.get("local_model") == "gemma4:26b"
+        assert cfg.ensure_defaults() is False
         assert cfg.save() is False
         assert cfg.set("units", "metric") is False
         assert cfg.get("units") == "metric"       # in memory still works
@@ -240,9 +259,16 @@ def test_corrupt_file_is_moved_aside_and_recreated(cfg_path, content):
     cfg_path.parent.mkdir(parents=True)
     cfg_path.write_text(content, encoding="utf-8", errors="surrogateescape") \
         if content != "\xff\xfe" else cfg_path.write_bytes(b"\xff\xfe\x00")
+    corrupt_bytes = cfg_path.read_bytes()
     cfg = AssistantConfig.load()
     bad = cfg_path.with_name("assistant.json.bad")
+    assert not bad.exists()                       # load() is a read
+    assert cfg_path.read_bytes() == corrupt_bytes
+    assert cfg.disk_state["corrupt"] is True
+    assert cfg.get("version") == 1                # defaults in memory
+    assert cfg.ensure_defaults() is True          # the app's write
     assert bad.exists(), "corrupt file must be preserved as .bad"
+    assert bad.read_bytes() == corrupt_bytes
     assert cfg_path.exists()
     assert json.loads(cfg_path.read_text()) == DEFAULTS
     assert stat.S_IMODE(cfg_path.stat().st_mode) == 0o600

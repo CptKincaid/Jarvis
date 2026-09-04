@@ -14,6 +14,7 @@ throwaway equivalent at all -- the user's display, his speakers and the
 single local Ollama server -- by blocking the call rather than redirecting
 it. See _firewall_live_log_dir."""
 import os
+import sys
 import socket
 import tempfile
 from pathlib import Path
@@ -149,6 +150,21 @@ def _blocked_player(argv) -> bool:
 
 
 _blocked_player.calls = []
+
+
+@pytest.fixture(autouse=True)
+def _reset_brain_calibration():
+    """brain._CALIBRATION is process state fed by every fake Ollama reply's
+    prompt_eval_count; a test must not inherit the factor another test's
+    replies taught. Only touches jarvis.brain if a test already imported
+    it (never imports it: an import is what tests/test_config_readonly.py
+    keeps honest)."""
+    brain = sys.modules.get("jarvis.brain")
+    if brain is not None and "_CALIBRATION" in vars(brain):
+        brain._CALIBRATION.update(factor=brain.CALIBRATION_INITIAL, samples=0)
+    yield
+    if brain is not None and "_CALIBRATION" in vars(brain):
+        brain._CALIBRATION.update(factor=brain.CALIBRATION_INITIAL, samples=0)
 
 
 @pytest.fixture(scope="session", autouse=True)
