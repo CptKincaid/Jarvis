@@ -1000,7 +1000,18 @@ SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",
 # Secrets that live inside a LIST of sections rather than at a dotted path:
 # (list key, field). gmail.accounts[].app_password was invisible to redacted()
 # and scrub(), so repr(cfg) printed three real app passwords in full.
-SECRET_LIST_FIELDS = (("gmail.accounts", "app_password"),)
+SECRET_LIST_FIELDS = (("gmail.accounts", "app_password"),
+                      # The satellite's web_server basic-auth password. It is
+                      # the ONLY thing between anyone on the segment and the
+                      # radar lease buttons -- scripts/esphome/jarvis-satellite
+                      # .yaml says so in its own words ("world-writable"
+                      # without it) AND told him it was already masked here,
+                      # which it was not: repr(cfg) printed it in clear,
+                      # secret_values() did not list it, and scrub() left it in
+                      # a log line. MEASURED 2026-09-03 with a gmail
+                      # app_password and a satellite password in one config:
+                      # the gmail one was masked, the satellite one was not.
+                      ("rooms.satellites", "password"))
 
 # is_configured() / setup_line() sections and the film-JARVIS excuse for each.
 SETUP_LINES: dict[str, str] = {
@@ -1023,7 +1034,11 @@ SECTIONS = tuple(SETUP_LINES)
 # "your-…", "changeme", "xxxx…".  Real secrets never look like these.
 _PLACEHOLDER = re.compile(
     r"^\s*$|^<.*>$|^(paste|your|replace|todo|example)[-_ :]|"
-    r"^change[ -_]?me\b|^x{3,}$", re.I)
+    # "me" NOT followed by a letter, rather than \b: the satellite YAML ships
+    # CHANGE_ME_32_RANDOM_CHARS, and "_" is a word character, so \b never
+    # fired after "ME" and the shipped placeholder was treated as a real
+    # secret -- scrub() would have blanked those words wherever they appeared.
+    r"^change[ -_]?me(?![a-z])|^x{3,}$", re.I)
 
 
 def _is_placeholder(value: Any) -> bool:

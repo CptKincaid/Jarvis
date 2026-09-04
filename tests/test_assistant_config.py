@@ -138,7 +138,13 @@ def test_defaults_match_spec_10_1():
     assert SECRET_KEYS == ("icloud.app_password", "gmail.app_password", "discord.bot_token",
                            "spotify.client_secret", "canvas.token", "phone.token")
     from jarvis.assistant_config import SECRET_LIST_FIELDS
-    assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),)
+    # rooms.satellites[].password joined it on 2026-09-03 (F03). The satellite
+    # YAML already TOLD him it was in this tuple and "masked in logs and in
+    # repr(cfg)" -- it was not, so repr(cfg) printed it in clear while the
+    # same YAML explains that without that password the lease endpoints are
+    # world-writable. This tripwire is why adding one is a deliberate act.
+    assert SECRET_LIST_FIELDS == (("gmail.accounts", "app_password"),
+                                  ("rooms.satellites", "password"))
     assert DEFAULTS["alerts"] == {"desktop": True, "discord": True, "claude_hooks": True}
     assert DEFAULTS["phrases"] == []
 
@@ -613,3 +619,44 @@ def test_account_passwords_and_the_spotify_secret_are_redacted():
     assert "abcd efgh" not in repr(cfg) and "3c9b703a" not in repr(cfg)
     assert cfg.scrub("pw=abcd efgh ijkl mnop secret=3c9b703ab94844349fffafa4bc86c7df") == \
         f"pw={MASK} secret={MASK}"
+
+
+def test_a_satellite_password_is_masked_the_way_a_gmail_one_is():
+    """F03. The satellite YAML told him this password was already in
+    SECRET_LIST_FIELDS and therefore "masked in logs and in repr(cfg)". It was
+    not: only gmail.accounts[].app_password was listed, so repr(cfg) printed
+    the satellite password in clear, secret_values() did not know about it and
+    scrub() left it in a log line -- while the same YAML explains that without
+    that password the satellite's lease endpoints are world-writable.
+
+    Asserted against the gmail one in the same config, because the bug was not
+    "masking is broken" but "this one field was never added to the list"."""
+    cfg = ac.AssistantConfig({
+        "gmail": {"accounts": [{"address": "a@b.c", "app_password": "gm-secret"}]},
+        "rooms": {"satellites": [{"name": "kitchen", "url": "http://10.0.0.9",
+                                  "username": "jarvis", "password": "sat-secret"}]},
+    })
+    blob = repr(cfg)
+    assert "gm-secret" not in blob
+    assert "sat-secret" not in blob, "the satellite password reached repr(cfg)"
+
+    red = cfg.redacted()
+    assert red["rooms"]["satellites"][0]["password"] == ac.MASK
+    assert red["rooms"]["satellites"][0]["username"] == "jarvis"   # not a secret
+
+    vals = cfg.secret_values()
+    assert "sat-secret" in vals and "gm-secret" in vals
+
+    line = "POST http://10.0.0.9 auth jarvis:sat-secret failed"
+    assert "sat-secret" not in cfg.scrub(line)
+
+
+def test_a_placeholder_satellite_password_is_not_treated_as_a_secret():
+    """The CHANGE_ME the YAML ships with must not become a scrub pattern --
+    scrubbing a placeholder would blank ordinary text that happens to contain
+    it, and it protects nothing."""
+    cfg = ac.AssistantConfig({
+        "rooms": {"satellites": [{"name": "kitchen", "url": "http://10.0.0.9",
+                                  "password": "CHANGE_ME_32_RANDOM_CHARS"}]},
+    })
+    assert "CHANGE_ME_32_RANDOM_CHARS" not in cfg.secret_values()
