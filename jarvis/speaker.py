@@ -27,6 +27,7 @@ import time
 
 import numpy as np
 
+from jarvis import voicegallery as vgal
 from jarvis.config import PATHS
 from jarvis.events import Status, bus
 from jarvis.logs import get_logger
@@ -49,6 +50,15 @@ DEFAULT_THRESHOLD = 0.30
 
 # Maximum stored embeddings (oldest beyond this are dropped)
 MAX_EMBEDDINGS = 100
+
+# Passive samples one PROCESS may add to the voiceprint. See add_sample for
+# the drift measurement that produced the number: at the label's own genuine
+# floor a single passive sample rotates a 14-take centroid to cos 0.997 and
+# leaves an intruder at 0.220, two leave it at 0.991 / 0.281, and three put
+# the intruder INSIDE a 0.30 bar at 0.334. Two is the last safe value and it
+# is the one taken. The app's own 10-minute cooldown and 0.55 bar sit in
+# front of this (app._maybe_learn_voice); this is the floor under them.
+PASSIVE_CAP = 2
 
 # Minimum audio length (seconds) for a useful embedding
 MIN_AUDIO_SECONDS = 1.0
@@ -157,6 +167,17 @@ def trim_silence(audio_16k, frame_ms=FRAME_MS, min_speech_s=MIN_SPEECH_SECONDS):
 class SpeakerVerifier:
     """ECAPA-TDNN speaker verification with enrollment and passive learning."""
 
+    # CLASS-LEVEL DEFAULTS, not only __init__ ones. Several tests build a bare
+    # verifier with ``object.__new__(SpeakerVerifier)`` to exercise the pure
+    # arithmetic without a model, and an attribute that exists only in
+    # __init__ turns every one of them into an AttributeError the moment a new
+    # field is added. The defaults are also the SAFE state: no gallery, no
+    # frozen reference, nothing learned.
+    gallery = None
+    _frozen_centroid = None
+    _passive_added = 0
+    format_fault = ""
+
     def __init__(self, gpu=0, threshold=DEFAULT_THRESHOLD):
         self.gpu = gpu
         self.threshold = threshold
@@ -175,12 +196,55 @@ class SpeakerVerifier:
         # the instrument can say WHY the voice leg is dark, the way
         # facegallery.reenrol_message does for a cross-model gallery.
         self.format_fault = ""
+        # THE MULTI-SPEAKER STORE, BESIDE THE VOICEPRINT AND NOT INSTEAD OF IT.
+        # ``voiceprint.npz`` stays exactly what it was -- one pool, one
+        # centroid, his -- and is the rollback. The gallery adds labels. Both
+        # are consulted; see ``_all_centroids``.
+        self.gallery = None
+        # The reference passive learning is measured against, captured the
+        # first time it is needed and never moved afterwards. See add_sample.
+        self._frozen_centroid = None
+        self._passive_added = 0
 
     # ------------------------------------------------------------ state
     @property
     def is_enrolled(self):
-        """Whether we have at least one voiceprint embedding."""
-        return len(self._embeddings) > 0
+        """Whether anybody at all is enrolled -- the voiceprint OR the gallery.
+
+        BOTH HALVES OF THE "OR" ARE LOAD-BEARING AND IN OPPOSITE DIRECTIONS.
+        False here makes the wake gate and the transcript gate BOTH fail open,
+        which is what keeps a fresh box from being mute; True makes the
+        transcript gate fail shut, which is what stops a television reaching
+        the commander. So a box with only a gallery must read True (or the
+        person who just enrolled is not being filtered for), and a box with
+        neither must read False (or it goes silent on its first day).
+        """
+        return bool(self._embeddings) or bool(self._gallery_labels())
+
+    def _gallery_labels(self):
+        try:
+            return self.gallery.labels() if self.gallery is not None else ()
+        except Exception:  # noqa: BLE001 - a broken gallery is no gallery
+            log.debug("voice gallery labels unreadable", exc_info=True)
+            return ()
+
+    def _all_centroids(self):
+        """``{label_or_"": centroid}`` over everything enrolled.
+
+        The voiceprint's pool is keyed "" -- it has no label and inventing one
+        here would put a name into the identity chain that no store agrees on.
+        ``gate._voice_leg`` turns a nameless match into the owner, which is
+        where the owner's label is actually known.
+        """
+        out = {}
+        if self._centroid is not None:
+            out[""] = self._centroid
+        if self.gallery is not None:
+            try:
+                out.update(self.gallery.centroids())
+            except Exception:  # noqa: BLE001
+                log.debug("voice gallery centroids unreadable", exc_info=True)
+        return out
 
     # Legacy alias (voice_input_gui / hotword_daemon used .enrolled)
     @property
@@ -275,8 +339,33 @@ class SpeakerVerifier:
         return False
 
     # ----------------------------------------------------- persistence
+    def load_gallery(self):
+        """Load the multi-speaker store, if there is one. Never raises.
+
+        SEPARATE FROM ``load()``'s BODY so a gallery that will not read cannot
+        cost him his voiceprint. The two stores are independent on purpose:
+        one is his rollback and the other is the new feature.
+        """
+        try:
+            gal = vgal.default_gallery()
+            if gal.load():
+                self.gallery = gal
+                log.info("voice gallery: %d label(s) enrolled (%s)",
+                         len(gal.labels()), ", ".join(gal.labels()) or "-")
+            else:
+                self.gallery = None
+                if gal.foreign_generations:
+                    log.warning("voice gallery: %d generation(s) written by "
+                                "another encoder; nothing loaded and nothing "
+                                "touched", len(gal.foreign_generations))
+        except Exception:
+            self.gallery = None
+            log.exception("voice gallery load error; multi-speaker voice ID "
+                          "is off and the voiceprint is unaffected")
+
     def load(self):
-        """Load saved voiceprint from disk."""
+        """Load saved voiceprint AND the multi-speaker gallery from disk."""
+        self.load_gallery()
         if not VOICEPRINT_FILE.exists():
             self._loaded = True
             return
@@ -441,6 +530,11 @@ class SpeakerVerifier:
             self._format = VOICEPRINT_FORMAT
             self._embeddings.append(embedding)
             self._recompute_centroid()
+            # A DELIBERATE ENROLMENT IS A NEW REFERENCE. The frozen centroid
+            # exists to stop passive samples walking the pool; it must not
+            # freeze him out of moving it himself, on purpose, at the mic.
+            self._frozen_centroid = None
+            self._passive_added = 0
 
         self.save()
         log.info("enrolled sample #%d (embedding norm: %.3f)",
@@ -473,7 +567,51 @@ class SpeakerVerifier:
         if embedding is None:
             return None
         with self._lock:
-            return float(self._cosine_similarity(embedding, self._centroid))
+            return self._best_score(embedding)
+
+    def _best_score(self, embedding):
+        """The highest cosine against ANY enrolled centroid.
+
+        A MAXIMUM, AND THAT IS WHAT KEEPS THE WAKE GATE FAILING OPEN. The wake
+        gate (hotword._speaker_ok) asks this for a BOOLEAN and never for a
+        name. Adding a label can only ever raise a maximum, so enrolling
+        somebody can only make that gate MORE permissive -- never less. An
+        unwakeable assistant is the worse failure and this feature is not
+        allowed to create one.
+
+        Callers hold ``self._lock``.
+        """
+        cents = self._all_centroids()
+        if not cents:
+            return None
+        return max(float(self._cosine_similarity(embedding, c))
+                   for c in cents.values())
+
+    def _who(self, embedding, speech_s):
+        """``(who, {label: score})`` from the gallery, or ``("", {})``.
+
+        Every bar lives in ``voicegallery.identify`` -- the accept bar, the
+        margin, the provisional rule and the abstain window. Nothing here
+        second-guesses it, and ``gate.py`` holds no threshold at all.
+        """
+        if self.gallery is None:
+            return "", {}
+        try:
+            verdict = self.gallery.identify(embedding, speech_s, self.threshold)
+        except Exception:  # noqa: BLE001 - a broken gallery names nobody
+            log.exception("voice gallery identify failed; naming nobody")
+            return "", {}
+        if verdict.who:
+            log.info("voice gallery: %s (%.3f%s)", verdict.who, verdict.score,
+                     "" if verdict.margin is None
+                     else ", margin %.3f" % verdict.margin)
+        elif verdict.provisional:
+            log.info("voice gallery: probably %s (%.3f) but only %d take(s); "
+                     "naming nobody", verdict.provisional, verdict.score,
+                     self.gallery.count(verdict.provisional))
+        elif verdict.why and not verdict.abstained:
+            log.info("voice gallery: naming nobody -- %s", verdict.why)
+        return verdict.who, dict(verdict.scores)
 
     def verify(self, audio_16k):
         """Check if audio matches the enrolled voiceprint.
@@ -489,10 +627,20 @@ class SpeakerVerifier:
         clip is ACCEPTED (True, 1.0) — logged at WARNING, with one
         Status(kind=warn) event per session.
         """
+        is_match, score, _who, _scores = self._verify_named(audio_16k)
+        return is_match, score
+
+    def _verify_named(self, audio_16k):
+        """``verify()`` plus the label. ``(is_match, score, who, who_scores)``.
+
+        Split out rather than folded in because ``filter_segments`` falls back
+        to whole-clip verification on a short capture and needs the name too;
+        returning it through a shared attribute would race the recorder's
+        1 Hz polling."""
         if not self.is_enrolled:
-            # No voiceprint yet — accept all audio
+            # Nobody enrolled — accept all audio
             self._fail_open("no voiceprint enrolled")
-            return True, 1.0
+            return True, 1.0, "", {}
 
         speech_s = len(trim_silence(audio_16k)) / SAMPLE_RATE
         if speech_s < ABSTAIN_SECONDS:
@@ -505,26 +653,33 @@ class SpeakerVerifier:
             # themselves be judged -- rather than reject him silently.
             log.info("speaker verify: %.2fs of speech is too little to judge; "
                      "abstaining (fail-open)", speech_s)
-            return True, 0.0
+            # NO NAME FROM AN ABSTENTION, and that is the trap a naive label
+            # change springs. The clip is accepted (fail-open) with who="",
+            # and gate._voice_leg turns a nameless match into the owner. An
+            # abstention must never be narrated as a recognition: nothing was
+            # measured.
+            return True, 0.0, "", {}
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             # Can't extract embedding (model missing, audio too short) — accept
             reason = ("model not loaded" if not self._model_loaded
                       else "no embedding (audio too short?)")
             self._fail_shut(reason)
-            return False, 0.0
+            return False, 0.0, "", {}
 
         with self._lock:
-            score = self._cosine_similarity(embedding, self._centroid)
+            score = self._best_score(embedding)
+        who, who_scores = self._who(embedding, speech_s)
 
         # Duration beside the score, always: it is the variable that actually
         # drives rejection, and it was invisible in the log until now.
         log.info("speaker verify: score=%.3f on %.2fs of speech (threshold %.2f)",
                  score, speech_s, self.threshold)
         is_match = score >= self.threshold
-        log.info("speaker verify: score=%.3f threshold=%s %s",
-                 score, self.threshold, "MATCH" if is_match else "REJECT")
-        return is_match, score
+        log.info("speaker verify: score=%.3f threshold=%s %s%s",
+                 score, self.threshold, "MATCH" if is_match else "REJECT",
+                 " (%s)" % who if who else "")
+        return is_match, score, who, who_scores
 
     # ------------------------------------------------ passive learning
     def add_sample(self, audio_16k):
@@ -538,25 +693,65 @@ class SpeakerVerifier:
 
         Returns:
             True if sample was added
+
+        GATED AGAINST A FROZEN CENTROID, NOT THE LIVE ONE, and the difference
+        is a measured one. This method used to score a candidate against the
+        centroid it was about to move, so the bar bounded one STEP and not the
+        WALK: every accepted sample buys the next one more room. Measured
+        2026-09-04 on synthetic vectors at his pool's spread
+        (tests/test_voice_passive.py), worst-case attacker, 14-take enrolment,
+        an intruder starting at 0.149 against a 0.30 bar --
+
+            gate on the live centroid, 20 accepts   cos 0.657, intruder 0.843
+            gate on the frozen centroid, 20         cos 0.724, intruder 0.790
+
+        -- so freezing is better and IS NOT ENOUGH. Twenty new vectors against
+        fourteen originals is a 59% swing in a mean whatever each one scores;
+        only the COUNT bounds it, hence PASSIVE_CAP.
+
+        AND SAY THE LIMIT OUT LOUD. ``voiceprint.npz`` has no per-sample
+        provenance, so it cannot tell an enrolment take from a passively
+        learned one. This "frozen" centroid is frozen for the life of the
+        PROCESS; after a restart it is recomputed over a pool that already
+        contains the passive samples, and the walk resumes from wherever it
+        got to. Closing that needs a per-sample key, which is a format bump
+        this file may not take -- ``jarvis/voicegallery.py`` has the key
+        (``src_``), and passive learning into that store is OFF for exactly
+        the reasons above.
         """
         if self._format < VOICEPRINT_FORMAT:
             log.info("passive sample skipped: voiceprint predates silence "
                      "trimming; re-enrol with scripts/enroll_voice.py --reset")
             return False
+        if self._passive_added >= PASSIVE_CAP:
+            log.info("passive sample skipped: %d already added this session, "
+                     "the cap (see add_sample for the measured drift)",
+                     self._passive_added)
+            return False
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             return False
 
-        # Only add if it matches current profile (sanity check)
+        # Only add if it matches the FROZEN reference (sanity check)
         if self.is_enrolled:
             with self._lock:
-                score = self._cosine_similarity(embedding, self._centroid)
+                if self._frozen_centroid is None and self._centroid is not None:
+                    self._frozen_centroid = np.array(self._centroid, copy=True)
+                ref = self._frozen_centroid
+                score = (self._cosine_similarity(embedding, ref)
+                         if ref is not None else None)
+            if score is None:
+                log.info("passive sample skipped: no frozen reference to "
+                         "measure it against")
+                return False
             if score < self.threshold:
-                log.info("passive sample rejected (score=%.3f < %s)",
+                log.info("passive sample rejected (score=%.3f < %s against "
+                         "the frozen enrolment centroid)",
                          score, self.threshold)
                 return False
 
         with self._lock:
+            self._passive_added += 1
             self._embeddings.append(embedding)
             # Trim oldest if over limit (keep first 10 enrollment + newest)
             if len(self._embeddings) > MAX_EMBEDDINGS:
@@ -612,10 +807,12 @@ class SpeakerVerifier:
         if not self.is_enrolled:
             # Unconfigured: pass through, or voice never works on a fresh box.
             self._fail_open("no voiceprint enrolled")
-            return audio_16k, {"total": 0, "matched": 0, "scores": []}
+            return audio_16k, {"total": 0, "matched": 0, "scores": [],
+                               "who": "", "who_scores": {}}
         if not self._ensure_model():
             self._fail_shut("model not loaded")
-            return None, {"total": 0, "matched": 0, "scores": []}
+            return None, {"total": 0, "matched": 0, "scores": [],
+                          "who": "", "who_scores": {}}
 
         window_samples = int(window_sec * SAMPLE_RATE)
         hop_samples = int(hop_sec * SAMPLE_RATE)
@@ -623,10 +820,12 @@ class SpeakerVerifier:
 
         if total_samples < window_samples:
             # Audio shorter than one window — fall back to whole-clip verify
-            is_match, score = self.verify(audio_16k)
+            is_match, score, who, who_scores = self._verify_named(audio_16k)
             if is_match:
-                return audio_16k, {"total": 1, "matched": 1, "scores": [score]}
-            return None, {"total": 1, "matched": 0, "scores": [score]}
+                return audio_16k, {"total": 1, "matched": 1, "scores": [score],
+                                   "who": who, "who_scores": who_scores}
+            return None, {"total": 1, "matched": 0, "scores": [score],
+                          "who": "", "who_scores": who_scores}
 
         windows = []
         positions = []
@@ -673,14 +872,22 @@ class SpeakerVerifier:
         # Batch embedding extraction for speed
         scores = []
         matched_mask = []
+        # The window that scored best, kept so ONE identify() runs on the
+        # strongest evidence in the capture rather than on an arbitrary
+        # window. Identity is a fact about the speaker, not about a 3 s slice.
+        best = (None, -2.0, 0.0)          # embedding, score, trimmed seconds
         try:
             for chunk in windows:
                 emb = self._extract_embedding(chunk)
                 if emb is not None:
                     with self._lock:
-                        score = self._cosine_similarity(emb, self._centroid)
+                        score = self._best_score(emb)
+                    score = 0.0 if score is None else score
                     scores.append(score)
                     matched_mask.append(score >= self.threshold)
+                    if score > best[1]:
+                        best = (emb, score,
+                                len(trim_silence(chunk)) / SAMPLE_RATE)
                 else:
                     scores.append(0.0)
                     matched_mask.append(False)
@@ -689,7 +896,12 @@ class SpeakerVerifier:
         except Exception:
             log.exception("segment verification error")
             self._fail_shut("segment verification error")
-            return None, {"total": len(windows), "matched": 0, "scores": []}
+            return None, {"total": len(windows), "matched": 0, "scores": [],
+                          "who": "", "who_scores": {}}
+
+        who, who_scores = ("", {})
+        if best[0] is not None:
+            who, who_scores = self._who(best[0], best[2])
 
         matched_count = sum(matched_mask)
         total_count = len(windows)
@@ -699,7 +911,10 @@ class SpeakerVerifier:
                  ", ".join(f"{s:.2f}" for s in scores))
 
         if matched_count == 0:
-            return None, {"total": total_count, "matched": 0, "scores": scores}
+            # No name on a rejection, whatever the gallery thought: "matched"
+            # is the pipeline's verdict and a label may never contradict it.
+            return None, {"total": total_count, "matched": 0, "scores": scores,
+                          "who": "", "who_scores": who_scores}
 
         # Reconstruct audio from matched segments using a mask over the
         # original audio to preserve continuity where possible
@@ -713,7 +928,8 @@ class SpeakerVerifier:
         filtered = audio_16k[keep]
 
         return filtered, {"total": total_count, "matched": matched_count,
-                          "scores": scores}
+                          "scores": scores, "who": who,
+                          "who_scores": who_scores}
 
     # ------------------------------------------------------------ reset
     def clear(self):
@@ -722,6 +938,8 @@ class SpeakerVerifier:
             self._embeddings.clear()
             self._centroid = None
             self._format = VOICEPRINT_FORMAT
+            self._frozen_centroid = None
+            self._passive_added = 0
         try:
             VOICEPRINT_FILE.unlink(missing_ok=True)
             log.info("voiceprint cleared")

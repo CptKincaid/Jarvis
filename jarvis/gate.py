@@ -341,7 +341,18 @@ class OwnerGate:
             # The clip was dropped, or nothing matched. That is not evidence
             # against anybody else's leg: "no name from me" is all it says.
             return "", True
-        return self._owner_label(), True
+        # WHO, WHEN THE VOICE GALLERY NAMED SOMEBODY -- AND THE OWNER FALLBACK
+        # IS LOAD-BEARING, not politeness. ``matched`` can be 1 with no name
+        # at all: an ABSTENTION sets it (every "Yes." he says is under 1.5 s
+        # of speech and fails open by design), and so does a fail-open with
+        # nothing enrolled. An empty label there would refuse his own
+        # follow-ups -- tests/test_owner_gate.py:74 is the concrete lockout.
+        # So a nameless match still means him, exactly as it did before this
+        # feature existed; a NAMED match means the person the gallery named.
+        #
+        # No threshold is applied here and none ever may be. Both bars live in
+        # jarvis/voicegallery.py, which is where the numbers were measured.
+        return str(stats.get("who") or self._owner_label()), True
 
     def _face_leg(self, face, running) -> Tuple[str, bool]:
         """The gallery's name, mapped to a registry label.
