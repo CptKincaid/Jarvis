@@ -898,6 +898,10 @@ _NEXT_CLASS_RX = re.compile(
 # 'electrical design lab ii'; the rest of the nouns appear in a title the
 # way they are said.
 _KIND_TITLE = {"lab": r"labs?|laborator(?:y|ies)"}
+# Kinds that name a WAY of being taught rather than a word in a title:
+# "lecture" and "lesson" mean any course that is not a lab. seminar /
+# tutorial / recitation stay title-matched -- a course that is one says so.
+_GENERIC_KINDS = frozenset({"lecture", "lesson"})
 # A one-off sitting is invisible to courses.recurring_courses (MIN_DATES =
 # 2), so a make-up lab or the first meeting of a term is silently dropped
 # and a LATER class is named "your next class". Probed: a single SENIOR
@@ -959,6 +963,19 @@ def _h_next_class(c, t, m):
         if not course:
             return None
         cand = [course]
+    elif kind in _GENERIC_KINDS:
+        # "my next lecture" / "my next lesson": GENERIC words for a taught
+        # sitting, not titles. None of his courses is called "lecture"
+        # (BIOSENSORS, MAGNETIC RESONANCE ENGR, ELECTRICAL DESIGN LAB II),
+        # so title-matching answered None and the model then reached for
+        # get_calendar's next EVENT -- the MBA-admissions-Zoom trap this
+        # rung exists to close (F39, 09-03). A lecture is every course
+        # that is not a lab; a timetable that is all labs still falls
+        # through, because then there is no lecture to name.
+        cand = [n for n in names
+                if n not in _kinded_courses("lab", names, courses_mod.fold)]
+        if not cand:
+            return None
     elif kind:
         # He said "lab", not "class": naming a lecture here is the confident
         # wrong answer this command exists to remove. No course of that kind
