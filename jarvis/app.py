@@ -2574,6 +2574,20 @@ class JarvisApp:
                 return False
         return bool(ok)
 
+    def unset_option(self, key) -> bool:
+        """Remove a settings key entirely. True when the file was written.
+
+        The SENSORS page uses it to retire presence.desk_band_m /
+        presence.room_band_m once their bands have been carried into
+        zones.rooms: a superseded key left in the file looks exactly like a
+        live one.
+        """
+        try:
+            return bool(self.assistant.unset(key))
+        except Exception:
+            log.exception("unset_option %s failed", key)
+            return False
+
     def open_terminal(self, slug=None) -> bool:
         mgr = self.claude
         if mgr is None:

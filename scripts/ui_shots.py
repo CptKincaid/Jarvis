@@ -202,9 +202,29 @@ OPTIONS = {
          "primary": True},
         {"name": "kitchen", "label": "kitchen", "url": "http://192.0.2.11"},
     ],
-    "presence.desk_band_m": [0.8, 1.8],
-    "presence.room_band_m": [1.8, 4.5],
     "presence.camera_overrules": True,
+    # THE ZONE LADDERS, and they are the ones in his assistant.json today
+    # (2026-09-03). The office desk is the FARTHER band -- the radar sits on
+    # the desk aimed out across the room, so the near space is empty and he
+    # reads at 3.13 m median -- and the kitchen has NO LENS, which is what
+    # the blank camera_zone says. The page edits these; there is no second
+    # two-band model any more (jarvis/ui/sensors_page.py).
+    # NESTED, not dotted, because jarvis/zones.py deliberately reads the
+    # SECTION in one go: a dotted read answers "absent" for every key under
+    # a zones that is the wrong shape, which is how a whole broken section
+    # slipped past a round of review. get_option below walks a dotted key
+    # into this.
+    "zones": {
+        "enabled": True,
+        "rooms": [
+            {"name": "office", "enabled": True, "camera_zone": "at the desk",
+             "bands": [{"name": "empty space", "near_m": 0.75, "far_m": 2.25},
+                       {"name": "at the desk", "near_m": 2.25, "far_m": 3.75}]},
+            {"name": "kitchen", "enabled": True, "camera_zone": "",
+             "bands": [{"name": "the kitchen", "near_m": 0.75, "far_m": 3.0},
+                       {"name": "at the door", "near_m": 3.0, "far_m": 3.75}]},
+        ],
+    },
 }
 
 ROOM = {"playing": "", "next": "BIOSENSORS  ·  10:00", "due": "LAB REPORT  ·  NOON",
@@ -520,7 +540,17 @@ def build_services(sensing: Optional[RigSensing] = None,
         return fn
 
     def get_option(key, default=None):
-        value = OPTIONS.get(key)
+        # Flat dotted keys first (most of OPTIONS is written that way), then
+        # a walk INTO a nested section -- "zones" is nested because
+        # jarvis/zones.py reads that section whole.
+        if key in OPTIONS:
+            value = OPTIONS[key]
+        else:
+            value = OPTIONS
+            for part in key.split("."):
+                if not isinstance(value, dict) or part not in value:
+                    return default
+                value = value[part]
         return default if value is None else value
 
     def set_option(key, value):

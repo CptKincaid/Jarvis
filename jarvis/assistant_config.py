@@ -421,19 +421,30 @@ DEFAULTS: dict = {
                  "room_sensor_enabled": False, "room_sensor_url": "",
                  "room_sensor_power_url": "",
                  "room_sensor_timeout_s": 1.5,
-                 # THE ZONE MODEL, in metres (jarvis/ui/sensors_page.py).
-                 # The LD2410 reports a range and NO angle, so "at the desk"
-                 # can only ever be a distance BAND -- it cannot tell the
-                 # desk from the bookshelf when both sit at the same range.
-                 # That is why the camera is allowed to overrule it: if the
-                 # eye recognises him in its cone he is at the desk whatever
-                 # the radar's range says (his words, 2026-09-03). The
-                 # defaults are the sketch he picked, and 4.5 m is the
-                 # coverage the tuned gates MEASURED, not a guess. Edit them
-                 # on the console's SENSORS page rather than by hand; either
-                 # way a restart is needed.
-                 "desk_band_m": [0.8, 1.8],
-                 "room_band_m": [1.8, 4.5],
+                 # THE ZONE MODEL LIVES IN "zones" AT THE BOTTOM OF THIS
+                 # FILE, and nowhere else. There used to be a second one
+                 # here -- desk_band_m / room_band_m, a TWO-band ladder
+                 # that assumed the desk was the NEARER band -- and it
+                 # disagreed with the named N-band ladder under
+                 # zones.rooms: the SENSORS page called 4 of 10 points "AT
+                 # THE DESK" from the radar alone while the zone log had no
+                 # desk band at all. They were different keys, so git saw
+                 # no conflict, and in his actual office the two-band model
+                 # was BACKWARDS -- the near space is empty and the desk is
+                 # at 3.13 m (measured 2026-09-03).
+                 #
+                 # So the two keys are gone from here. jarvis/ui/
+                 # sensors_page.py still READS them, once, as a migration
+                 # source: a config that has them and no zones.rooms gets
+                 # its bands carried across, the page says which key it
+                 # used, and SAVE writes zones.rooms and clears them. They
+                 # are deliberately absent from DEFAULTS so that a value
+                 # here means "his file still holds it" and not "the
+                 # shipped default is sitting here looking live".
+                 #
+                 # camera_overrules stays: it is the SENSORS page's own
+                 # toggle for watching the fusion with the override off,
+                 # and it is not a second copy of anything.
                  "camera_overrules": True,
                  # THREE ROOMS (jarvis/roomfabric.py). The plural
                  # of the four keys above, shaped exactly like
@@ -1257,6 +1268,33 @@ class AssistantConfig:
                     child = node[part] = {}
                 node = child
             node[parts[-1]] = copy.deepcopy(value)
+        return self.save()
+
+    def unset(self, dotted: str) -> bool:
+        """REMOVE a dotted key and save. True when the file was written.
+
+        The counterpart ``set`` never had, and it exists for exactly one
+        job: retiring a key that has been superseded. A superseded key that
+        is merely ignored still sits in his file looking live, and the next
+        person to read it -- him, at midnight, wondering why the bands are
+        not what he typed -- has no way to tell it apart from one that
+        still drives something.
+
+        A key that is not there is not an error and is not a write: False
+        with nothing changed, so a caller can call it unconditionally.
+        Intermediate keys that are not mappings are the same case.
+        """
+        parts = dotted.split(".")
+        with self._lock:
+            node = self._data
+            for part in parts[:-1]:
+                child = node.get(part) if isinstance(node, dict) else None
+                if not isinstance(child, dict):
+                    return False
+                node = child
+            if not isinstance(node, dict) or parts[-1] not in node:
+                return False
+            node.pop(parts[-1], None)
         return self.save()
 
     def update(self, values: dict) -> bool:

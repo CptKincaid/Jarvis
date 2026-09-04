@@ -8,11 +8,11 @@ a second window -- to watch presence while he tunes it::
     ---------------------------------------------------
      [ CHAT ]  [ SENSORS ]      <- jarvis/ui/tab_strip.py
     ---------------------------------------------------
-     office        * PRESENT 1.4 m
+     office        * PRESENT 3.1 m
        camera      * FACE  hunterp
        verdict     AT THE DESK
-     desk band  [0.8]---#---[1.8] m
-     room band  [1.8]--#----[4.5] m
+     empty space  [0.75]-#-----[2.25] m
+     at the desk  [2.25]----#--[3.75] m
      camera overrules radar   [x]
      [SAVE]                        updated 2 s ago
 
@@ -46,6 +46,36 @@ polls on ``roomsensor.DEFAULT_TIMEOUT_S`` (3.0 s) rather than the 1.5 s in
 ``presence.room_sensor_timeout_s``: a diagnostic surface exists to SHOW him
 the 1186 ms sample, and a 1.5 s timeout would render it as a fault.
 
+ONE ZONE MODEL, AND IT IS NOT THIS FILE'S (2026-09-03). Until today this
+page had a zone model of its own -- ``presence.desk_band_m`` and
+``presence.room_band_m``, two bands, the desk assumed to be the NEARER one
+-- while ``jarvis/zones.py`` and the zone log had an N-band ladder with
+names, gaps and a camera zone under ``zones.rooms``. Different keys, so git
+saw no conflict when the two branches merged, and the disagreement was
+MEASURED rather than argued: the console called 4 of 10 points "AT THE
+DESK" from the radar alone, and the zone log had no desk band at all and
+could reach "at the desk" only through the camera. In his actual office the
+two-band model was BACKWARDS -- the near space is empty and the desk is at
+3.13 m median (measured on the live radar, 2026-09-03).
+
+So the page reads and writes ``zones.rooms`` and nothing else: the bands
+come out of ``zones.read_zones`` (the same validator ``scripts/zone_log.py``
+uses) and the verdict is ``zones.verdict``, so what he edits here is what
+places a reading in the record. The band rows are named by the band and
+grouped by room, because "desk band" and "room band" are not what his
+ladders are called. His kitchen has no lens and says so -- a blank
+``camera_zone`` means there is no camera in the room, and the camera rule
+cannot fire for it.
+
+THE OLD KEYS ARE A MIGRATION SOURCE AND NOTHING ELSE. They are gone from
+``assistant_config.DEFAULTS``, this file is the only reader left, and a
+config that still has them gets its numbers carried across rather than
+dropped: where there is no ``zones.rooms`` ladder for a room they become
+its bands, where there IS one ``zones.rooms`` wins and the page says which
+it used, and a successful SAVE writes the bands into ``zones.rooms`` and
+REMOVES the old keys -- a superseded key left in the file looks exactly
+like a live one, which is how two models disagreed for a day.
+
 FIVE RULES THIS FILE HOLDS, all of them learned elsewhere in the tree:
 
 * **None is NO OPINION, never an empty room.** ``RoomSensor.read()``
@@ -72,7 +102,14 @@ FIVE RULES THIS FILE HOLDS, all of them learned elsewhere in the tree:
 * **Saving goes through ``services.set_option``.** That lands in
   ``AssistantConfig.set`` -> ``save()``, which is the one atomic 0600
   writer (mkstemp in the same directory, fsync, os.replace, chmod). This
-  file never opens assistant.json.
+  file never opens assistant.json. Retiring the superseded keys goes
+  through ``services.unset_option`` for the same reason, and where that is
+  not wired the keys stay and the page SAYS they stay.
+* **The write is a MERGE of ``zones.rooms``, never a rebuild.** A list
+  replaces rather than merges in ``AssistantConfig``, so a save that built
+  the list from the widgets would silently delete every room this page was
+  not showing. ``band_edits`` edits a copy of what the file holds and
+  touches only the bands of the rooms on screen.
 * **An edit is not live.** ``AssistantConfig.reload_if_changed`` has no
   callers, so a band he changes here takes effect at the next start. The
   page SAYS so (``RESTART_NOTE``) instead of pretending otherwise.
@@ -90,6 +127,7 @@ jarvis/ui/views.py and jarvis/ui/console_mode.py make.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import threading
@@ -99,10 +137,17 @@ import urllib.parse
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+from jarvis import zones as zn
 from jarvis.logs import get_logger
 from jarvis.roomsensor import DEFAULT_TIMEOUT_S, RoomSensor, entity_path
 from jarvis.sensing import RADAR
 from jarvis.ui import theme
+# ABSENT and UNPLACED are re-exported rather than used here: they are the
+# three verdicts that are not a band, they are SPELLED in jarvis/zones.py,
+# and a page that wrote its own copy of the words is how the two models
+# drifted apart in the first place.
+from jarvis.zones import (ABSENT, NO_OPINION,  # noqa: F401 - re-exported
+                          UNPLACED, Band, ZoneMap)
 from jarvis.ui.widgets import (RoundButton, Toggle, px, ui_display, ui_font,
                                ui_mono)
 
@@ -111,18 +156,14 @@ log = get_logger("ui.sensors_page")
 # ---------------------------------------------------------------- the words
 DASH = "—"                    # every unknown scalar; never "0" and never ""
 
-ZONE_DESK = "desk"
-ZONE_ROOM = "room"
-ZONE_AWAY = "away"
-ZONE_UNKNOWN = "unknown"
-ZONE_WORDS = {
-    ZONE_DESK: "AT THE DESK",
-    ZONE_ROOM: "IN THE ROOM",
-    ZONE_AWAY: "NOBODY THERE",
-    # Deliberately not "EMPTY": this is the state where BOTH legs abstained,
-    # and the whole point of the None contract is that it is not absence.
-    ZONE_UNKNOWN: "NO OPINION",
-}
+# THE ZONES ARE THE CONFIG'S, NOT THIS FILE'S. There is no ZONE_DESK here
+# any more: a zone is whatever ``zones.rooms[].bands[].name`` calls it, and
+# the words on screen are that name in capitals. The page used to carry its
+# own four-word vocabulary over a TWO-band model of its own, and that model
+# disagreed with the one the zone log writes -- see the module docstring.
+# The three verdicts that are not a band come straight from jarvis/zones.py
+# so there is one spelling of each in the tree.
+NO_LADDER = "no zone ladder"     # this page only: the room has no bands
 
 # Tone KEYS, not colours: a colour resolved out here would freeze the
 # import-time look (tests/test_theme_look.py scans this file for exactly
@@ -147,19 +188,34 @@ NOT_WIRED_NOTE = "assistant settings not wired"
 DISTANCE_ENTITY = "Detection distance"
 DISTANCE_PATH = entity_path("sensor", DISTANCE_ENTITY)
 
-# The bands, in metres. The desk band's floor sits just outside the LD2410's
-# 0.75 m blind zone and its ceiling just inside the 4.5 m the tuned gates
-# reach; both numbers come from scripts/room_sensor.py (GATE_M 0.75, gates
-# 0..8) and from the 09-03 walk measured in the module docstring.
-DEFAULT_DESK_BAND = (0.8, 1.8)
-DEFAULT_ROOM_BAND = (1.8, 4.5)
 MAX_BAND_M = 6.0              # 8 gates x 0.75 m: the module's own ceiling
-BLIND_M = 0.75                # nothing at all is detected inside this
-STILL_FLOOR_M = 1.5           # no STILL target inside this (gates 0 and 1)
+BLIND_M = zn.BLIND_M          # nothing at all is detected inside this
+STILL_FLOOR_M = zn.STILL_FLOOR_M   # no STILL target inside this (gates 0, 1)
 
-OPTION_DESK_BAND = "presence.desk_band_m"
-OPTION_ROOM_BAND = "presence.room_band_m"
+# THE ONE KEY THE BANDS LIVE IN. Written whole rather than per-room, because
+# a band list is a list and AssistantConfig replaces lists rather than
+# merging them; band_edits therefore edits a COPY of what the file holds and
+# hands back the whole thing, so a room this page never showed keeps its
+# ladder byte for byte.
+OPTION_ROOMS = zn.ROOMS_KEY                  # "zones.rooms"
 OPTION_CAMERA_OVERRULES = "presence.camera_overrules"
+
+# THE SUPERSEDED KEYS. A two-band model that assumed the desk was the NEARER
+# band, which in his office is backwards -- the near space is empty and the
+# desk is at 3.13 m. They are read HERE and nowhere else in the tree, once,
+# as a migration source: a config that has them and no usable zones.rooms
+# gets its numbers carried across rather than dropped, and SAVE writes them
+# into zones.rooms and then REMOVES them, so the file stops holding a key
+# that looks live and drives nothing. They are absent from
+# assistant_config.DEFAULTS, so a value in either means his file still has
+# it.
+LEGACY_DESK_BAND = "presence.desk_band_m"
+LEGACY_ROOM_BAND = "presence.room_band_m"
+LEGACY_KEYS = (LEGACY_DESK_BAND, LEGACY_ROOM_BAND)
+# What the two legacy bands were called on screen, and what they become as
+# named bands when they are carried across.
+LEGACY_NEAR_NAME = "at the desk"
+LEGACY_FAR_NAME = "in the room"
 
 POLL_S = 1.0                  # while the page is on screen, and only then
 POLL_THREAD_NAME = "sensors-page"
@@ -173,12 +229,48 @@ AGE_TICK_MS = 1000            # how often the "updated N s ago" line redraws
 
 
 @dataclass(frozen=True)
-class Bands:
-    """The two distance bands, in metres, already repaired."""
-    desk_lo: float
-    desk_hi: float
-    room_lo: float
-    room_hi: float
+class Ladders:
+    """Every room's ladder, plus where each one came from and what the
+    config lost getting here.
+
+    ``maps`` is keyed by room key (``zones._room_key``) and holds
+    ``jarvis.zones.ZoneMap`` -- the SAME object the zone log places a
+    reading with, which is the whole point of this pass. ``legacy`` is the
+    one ladder carried across from the superseded two-band keys, used for
+    any room that has none of its own. ``raw`` is ``zones.rooms`` exactly
+    as the file holds it, which is what SAVE edits a copy of.
+    """
+    maps: dict = field(default_factory=dict)
+    legacy: Optional[ZoneMap] = None
+    raw: Any = None
+    notes: tuple = ()
+    refused: frozenset = frozenset()      # room keys jarvis/zones.py refused
+    blocked: str = ""                     # why SAVE may not touch the bands
+
+    def for_room(self, room: str) -> Optional[ZoneMap]:
+        """The ladder that places a reading in ``room``, or None.
+
+        The room's own entry wins; the carried-across legacy ladder stands
+        in only where there is no entry at all. A room whose entry is
+        REFUSED gets None, never the legacy one -- jarvis/zones.py refuses
+        a broken ladder rather than substituting a working one, and a page
+        that substituted here would be showing him a verdict the log will
+        not write.
+        """
+        key = zn._room_key(room)
+        got = self.maps.get(key)
+        if got is not None:
+            return got
+        return None if key in self.refused else self.legacy
+
+    def source(self, room: str) -> str:
+        """Which config key this room's bands came from ("" = none)."""
+        key = zn._room_key(room)
+        if key in self.maps:
+            return OPTION_ROOMS
+        if key not in self.refused and self.legacy is not None:
+            return LEGACY_DESK_BAND
+        return ""
 
 
 def tone_color(tone: str) -> str:
@@ -276,91 +368,236 @@ def _finite_cm(value) -> Optional[float]:
     return cm
 
 
-# ----------------------------------------------------------------- the bands
-def _pair(value, default: tuple) -> tuple:
-    """One configured band -> ((lo, hi), was_replaced).
-
-    READING THE FILE IS GENEROUS. A hand-edit that swapped the ends is
-    ordered rather than dropped, and anything that is not two usable
-    numbers falls back to the default for that band alone: one broken band
-    must not cost him the page. Typing INTO the page is the other way round
-    (band_edits refuses and says why), because a person who just typed
-    something wrong should be told, not silently corrected.
-
-    But the generosity is no longer SILENT, which is the half that costs
-    him data: the second return says the value in the file was thrown
-    away, so ``read_bands_noted`` can name it on screen. Measured
-    2026-09-03: ``presence.room_band_m = [1.8, 8.0]`` rendered as 1.8/4.5
-    with no note anywhere, and one press of SAVE wrote the 4.5 over his
-    8.0. REORDERING is not a replacement and says nothing -- nothing was
-    lost, and a note for every kindness teaches him to ignore the ones
-    that matter.
-    """
-    try:
-        lo, hi = (float(value[0]), float(value[1]))
-    except (TypeError, ValueError, IndexError, KeyError):
-        return default, True
-    if not (math.isfinite(lo) and math.isfinite(hi)):
-        return default, True
-    lo, hi = min(lo, hi), max(lo, hi)
-    if lo < 0.0 or hi > MAX_BAND_M or lo >= hi:
-        return default, True
-    return (lo, hi), False
-
-
-def _band_note(label: str, raw, default: tuple) -> str:
-    """The sentence for a band the config could not use. It names the
-    band, quotes what was in the file and says what SAVE would do with the
-    substitute, because that is the press that destroys the original."""
-    return ("%s: %s in assistant.json is not usable (two numbers, 0 to "
-            "%.0f m, near end first) — showing the default %.2f–%.2f m, "
-            "and SAVE would write that over it"
-            % (label, _short(raw), MAX_BAND_M, default[0], default[1]))
-
-
+# ---------------------------------------------------------------- the bands
 def _short(value) -> str:
     text = repr(value)
     return text if len(text) <= 40 else text[:37] + "..."
 
 
-def read_bands_noted(get_option: Optional[Callable]) -> tuple:
-    """(the two bands, repaired) and (what the config lost doing it).
+def _legacy_pair(value) -> Optional[tuple]:
+    """One superseded band -> (near, far), or None for "not usable".
 
-    Never raises. The notes tuple is empty when the file was usable as
-    written -- and when it was merely reordered, which loses nothing.
+    REORDERING IS FREE, EVERYTHING ELSE IS REFUSED. A hand-edit that
+    swapped the ends loses nothing and is ordered silently. Anything that
+    is not two usable metres -- centimetres, a word, a range past what the
+    radar can see -- is None, and the caller NAMES it.
+
+    It used to fall back to a built-in default pair, which is the disease
+    this whole pass is closing: measured 2026-09-03,
+    ``presence.room_band_m = [1.8, 8.0]`` rendered as 1.8/4.5 with no note
+    anywhere and one press of SAVE wrote the 4.5 over his 8.0. There is no
+    default left to fall back TO -- the keys are gone from DEFAULTS and
+    these are a migration source, not a live model -- so a value that
+    cannot be carried across is said out loud and carried across as
+    nothing.
     """
-    def opt(key, default):
-        if not callable(get_option):
-            return default
-        try:
-            value = get_option(key, default)
-        except Exception:                 # noqa: BLE001 - config boundary
-            log.debug("sensors page: %s unreadable", key, exc_info=True)
-            return default
-        return default if value is None else value
+    try:
+        lo, hi = (float(value[0]), float(value[1]))
+    except (TypeError, ValueError, IndexError, KeyError):
+        return None
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        return None
+    lo, hi = min(lo, hi), max(lo, hi)
+    if lo < 0.0 or hi > MAX_BAND_M or lo >= hi:
+        return None
+    return lo, hi
 
-    notes = []
-    out = []
-    for label, key, default in (("desk band", OPTION_DESK_BAND,
-                                 DEFAULT_DESK_BAND),
-                                ("room band", OPTION_ROOM_BAND,
-                                 DEFAULT_ROOM_BAND)):
-        raw = opt(key, None)
-        if raw is None:
-            out.append(default)           # absent is not a complaint
+
+def _opt(get_option: Optional[Callable], key: str, default=None):
+    """One config read that never raises and never turns null into a
+    value."""
+    if not callable(get_option):
+        return default
+    try:
+        value = get_option(key, default)
+    except Exception:                     # noqa: BLE001 - config boundary
+        log.debug("sensors page: %s unreadable", key, exc_info=True)
+        return default
+    return default if value is None else value
+
+
+def legacy_ladder(get_option: Optional[Callable]) -> tuple:
+    """(the ladder the superseded keys describe, notes). Never raises.
+
+    ``(None, ())`` when neither key is in his file, which is the normal
+    case and not a complaint. The two bands become NAMED bands -- the near
+    one keeps the word the old page put on screen for it -- so that what is
+    carried into ``zones.rooms`` reads like the rest of the ladder rather
+    than like a migration artefact.
+
+    THE ORDER IS TAKEN FROM THE NUMBERS, NOT FROM THE KEY NAMES. The old
+    model assumed the desk was the NEARER band; in his office it is the
+    FARTHER one (the near space is empty and he sits at 3.13 m). So
+    ``desk_band_m`` keeps the name "at the desk" wherever its numbers put
+    it, and ZoneMap sorts the ladder.
+    """
+    raw = {key: _opt(get_option, key) for key in LEGACY_KEYS}
+    if all(value is None for value in raw.values()):
+        return None, ()
+    notes, bands = [], []
+    for key, name in ((LEGACY_DESK_BAND, LEGACY_NEAR_NAME),
+                      (LEGACY_ROOM_BAND, LEGACY_FAR_NAME)):
+        value = raw[key]
+        if value is None:
             continue
-        pair, replaced = _pair(raw, default)
-        out.append(pair)
-        if replaced:
-            log.warning("sensors page: %s is not usable (%s); using %s",
-                        key, _short(raw), default)
-            notes.append(_band_note(label, raw, default))
-    return Bands(out[0][0], out[0][1], out[1][0], out[1][1]), tuple(notes)
+        pair = _legacy_pair(value)
+        if pair is None:
+            log.warning("sensors page: %s is not usable (%s); it is not "
+                        "carried across", key, _short(value))
+            notes.append("%s in assistant.json is not usable (%s) — two "
+                         "numbers, 0 to %.0f m — so it is NOT carried into "
+                         "%s and nothing on this page uses it"
+                         % (key, _short(value), MAX_BAND_M, OPTION_ROOMS))
+            continue
+        bands.append(Band(name, pair[0], pair[1]))
+    if not bands:
+        return None, tuple(notes)
+    try:
+        zmap = ZoneMap("room", tuple(bands), zn.DEFAULT_CAMERA_ZONE)
+    except ValueError as exc:
+        # Two bands that overlap are not a ladder, and jarvis/zones.py is
+        # the one judge of that -- the page must not accept a geometry the
+        # log would refuse.
+        notes.append("%s and %s in assistant.json do not describe a ladder "
+                     "(%s), so neither is carried into %s"
+                     % (LEGACY_DESK_BAND, LEGACY_ROOM_BAND, exc, OPTION_ROOMS))
+        return None, tuple(notes)
+    return zmap, tuple(notes)
 
 
-def read_bands(get_option: Optional[Callable]) -> Bands:
-    """The two bands from assistant.json, repaired. Never raises."""
-    return read_bands_noted(get_option)[0]
+def read_ladders(get_option: Optional[Callable]) -> Ladders:
+    """Every room's bands, through jarvis/zones.py and nothing else.
+
+    ONE ZONE MODEL. ``zones.read_zones`` is THE validator for that section
+    -- the same call ``scripts/zone_log.py`` makes -- so a ladder this page
+    shows is a ladder the log will write against, and a ladder it refuses
+    is refused here too, by name, rather than quietly replaced with
+    something that looks like it works.
+
+    What this adds on top is only reporting: a refused room becomes a
+    sentence on screen instead of a line in the log he is not reading, and
+    the superseded two-band keys are carried across for a room that has no
+    entry of its own. Where both exist, ``zones.rooms`` WINS and the page
+    says so -- one of them has to, and it is the one that matches his
+    measured room.
+    """
+    cfg = _CfgView(get_option)
+    try:
+        parsed = zn.read_zones(cfg)
+    except Exception:                     # noqa: BLE001 - config boundary
+        log.exception("sensors page: the zones section could not be read")
+        parsed = None
+    notes: list = []
+    maps: dict = {}
+    refused: set = set()
+    raw = None
+    # A section that got itself wrong ABOVE the room level poisons
+    # everything: there are no entries to salvage, and a SAVE from here
+    # would replace whatever is in the file with a list built out of a page
+    # showing nothing. Refuse the write and say which key to go and fix.
+    blocked = ""
+    if parsed is None:
+        blocked = ("the %s section could not be read at all; fix it in "
+                   "assistant.json before saving from here" % zn.SECTION_KEY)
+    elif parsed.poisoned:
+        blocked = ("%s — fix that in assistant.json before saving from here"
+                   % (sorted(parsed.refused.values())[0] if parsed.refused
+                      else "the %s section is unusable" % zn.SECTION_KEY))
+    if parsed is not None:
+        maps = dict(parsed.rooms)
+        refused = set(parsed.room_refusals)
+        # From the validator, NOT a dotted read of our own: jarvis/zones.py
+        # is the only door onto that section, for a writer as much as for a
+        # reader.
+        raw = parsed.raw_rooms
+        for path, why in sorted(parsed.refused.items()):
+            notes.append("%s — that room records nothing and is not shown "
+                         "with a zone until it is fixed" % why)
+    legacy, legacy_notes = legacy_ladder(get_option)
+    notes.extend(legacy_notes)
+    if legacy is not None and maps:
+        # Both models are in his file. zones.rooms wins; say which, and say
+        # that SAVE clears the loser rather than leaving it looking live.
+        notes.append("%s and %s are still in assistant.json and are NOT "
+                     "read: the bands come from %s. SAVE removes them."
+                     % (LEGACY_DESK_BAND, LEGACY_ROOM_BAND, OPTION_ROOMS))
+    elif legacy is not None:
+        notes.append("the bands were carried across from %s and %s; SAVE "
+                     "writes them into %s and removes the old keys"
+                     % (LEGACY_DESK_BAND, LEGACY_ROOM_BAND, OPTION_ROOMS))
+    return Ladders(maps=maps, legacy=legacy, raw=raw, notes=tuple(notes),
+                   refused=frozenset(refused), blocked=blocked)
+
+
+def name_mismatch_note(specs, ladders: Ladders) -> tuple:
+    """The sentence for "these two lists do not use the same room names".
+
+    The page polls the rooms in ``presence.rooms`` (or the singular
+    ``presence.room_sensor_*`` keys, which name the room "room") and places
+    them with the ladders in ``zones.rooms``. The join is the room NAME, and
+    when it does not join there is no verdict for any row and nothing in
+    the log to say why -- which is exactly the state his config is in
+    tonight: ``presence.rooms`` is empty, so one room called "room" is
+    polled, while ``zones.rooms`` names "office" and "kitchen".
+
+    Silent when every polled room has a ladder, and silent when there are
+    no ladders at all (that is a different sentence, and read_ladders
+    already has it).
+    """
+    polled = [getattr(s, "name", "") for s in (specs or ())
+              if getattr(s, "name", "")]
+    if not polled or not ladders.maps:
+        return ()
+    missing = [name for name in polled if ladders.for_room(name) is None]
+    if not missing:
+        return ()
+    return ("%s %s polled but %s no ladder: %s names %s and %s names %s. "
+            "They join on the room NAME — make the two lists agree, and "
+            "restart."
+            % (" and ".join(repr(m) for m in missing),
+               "are" if len(missing) > 1 else "is",
+               "have" if len(missing) > 1 else "has",
+               "presence.rooms", ", ".join(repr(n) for n in polled),
+               OPTION_ROOMS, ", ".join(repr(n) for n in sorted(ladders.maps))),)
+
+
+def zone_word(zone: str) -> str:
+    """The verdict, as the page prints it: the band's own name, in capitals.
+
+    ``NO OPINION`` is deliberately not "EMPTY" and NOBODY is deliberately
+    not a band name -- both come from jarvis/zones.py, where the argument
+    that a non-answer is not absence was already settled.
+    """
+    return str(zone or "").upper()
+
+
+def band_notes(zmap: Optional[ZoneMap]) -> tuple:
+    """Hardware facts his bands just walked into, in his language.
+
+    Both come from the LD2410's own geometry (scripts/room_sensor.py, which
+    refuses to flash a profile that violates them): the module detects
+    NOTHING inside 0.75 m, and no STILL target inside 1.5 m -- so a band
+    that lives entirely below 1.5 m reads a motionless man as an empty
+    room, which is the PIR failure the radar was chosen to avoid. Notes,
+    not refusals: it is his wall and his desk.
+
+    NAMED PER BAND, because the ladder is his and "the desk band" is no
+    longer a thing this file knows about. The band a note is about is the
+    band he has to go and change.
+    """
+    if zmap is None:
+        return ()
+    out = []
+    for band in zmap.bands:
+        if band.near_m < BLIND_M:
+            out.append("%r starts at %.2f m, inside the %.2f m the radar "
+                       "detects nothing at all in" % (band.name, band.near_m,
+                                                      BLIND_M))
+        if band.far_m <= STILL_FLOOR_M:
+            out.append("%r ends at %.2f m and no STILL target is reported "
+                       "inside %.1f m, so a motionless man there may read as "
+                       "an empty room" % (band.name, band.far_m, STILL_FLOOR_M))
+    return tuple(out)
 
 
 def empty_state_line(get_option: Optional[Callable]) -> str:
@@ -461,30 +698,6 @@ def read_overrules(get_option: Optional[Callable]) -> bool:
     return read_overrules_noted(get_option)[0]
 
 
-def zone_for_distance(metres, bands: Bands) -> str:
-    """Which band a range falls in: desk, room, or "" (neither).
-
-    The desk band is checked FIRST, so where the two bands touch (1.8 m in
-    his sketch) the nearer one wins. That is the safer way round: calling a
-    man at the boundary "at the desk" costs a greeting he was going to get
-    anyway, while calling him "in the room" would hold back the thing the
-    desk zone exists to trigger.
-    """
-    if metres is None:
-        return ""
-    try:
-        m = float(metres)
-    except (TypeError, ValueError):
-        return ""
-    if not math.isfinite(m):
-        return ""
-    if bands.desk_lo <= m <= bands.desk_hi:
-        return ZONE_DESK
-    if bands.room_lo <= m <= bands.room_hi:
-        return ZONE_ROOM
-    return ""
-
-
 def band_fraction(metres, lo: float, hi: float) -> Optional[float]:
     """Where a range sits inside a band, 0..1, or None when it is outside
     it (the marker is then simply not drawn -- a clamped marker parked on
@@ -500,58 +713,178 @@ def band_fraction(metres, lo: float, hi: float) -> Optional[float]:
     return (m - lo) / (hi - lo)
 
 
-def band_notes(bands: Bands) -> tuple:
-    """Hardware facts his numbers just walked into, in his language.
+@dataclass(frozen=True)
+class BandEdit:
+    """One band as the page holds it while he types in it.
 
-    Both come from the LD2410's own geometry (scripts/room_sensor.py, which
-    refuses to flash a profile that violates them): the module detects
-    NOTHING inside 0.75 m, and it detects no STILL target inside 1.5 m --
-    so a desk band that lives entirely below 1.5 m reads a motionless man
-    as an empty room, which is the PIR failure the radar was chosen to
-    avoid. Notes, not refusals: it is his wall and his desk.
+    The NAME rides along unchanged: this page tunes the numbers, and a
+    band's name is what the zone log will call the place he was standing.
     """
-    out = []
-    if bands.desk_lo < BLIND_M:
-        out.append("the radar detects nothing inside %.2f m, so the bottom "
-                   "of the desk band is dead" % BLIND_M)
-    if bands.desk_hi <= STILL_FLOOR_M:
-        out.append("no STILL target is reported inside %.1f m, so a "
-                   "motionless man at the desk may read as empty" % STILL_FLOOR_M)
-    return tuple(out)
+    room: str
+    name: str
+    lo: str
+    hi: str
 
 
-def band_edits(desk_lo, desk_hi, room_lo, room_hi, overrules) -> tuple:
+def _typed(label: str, raw) -> tuple:
+    """One typed metre value -> (number, "") or (None, why it is refused).
+
+    Typing is REFUSED rather than repaired, which is the opposite of how
+    the superseded keys were READ, and deliberately so: a person who has
+    just typed something wrong should be told, not silently corrected.
+    """
+    text = str(raw).strip()
+    try:
+        num = float(text)
+    except (TypeError, ValueError):
+        return None, "%s: %r is not a number" % (label, text)
+    if not math.isfinite(num):
+        return None, "%s: %r is not a number" % (label, text)
+    if num < 0.0 or num > MAX_BAND_M:
+        return None, ("%s: %.2f m is outside what the radar can see "
+                      "(0 to %.0f m)" % (label, num, MAX_BAND_M))
+    return round(num, 2), ""
+
+
+def band_edits(edits, ladders: Ladders, overrules) -> tuple:
     """(the dotted keys to write, "") or ({}, why it was refused).
 
-    Refuses rather than repairs -- see ``_pair`` for why the two directions
-    differ. Every message names WHICH band, because two rows of four
-    identical-looking boxes is exactly where a wrong one hides.
+    ``edits`` is the ``BandEdit`` rows the page is showing, in order. The
+    result is exactly TWO keys -- ``zones.rooms`` and the overrule toggle
+    -- because there is one zone model now and its bands live in one place.
+
+    THE WRITE IS A MERGE, NOT A REBUILD. It starts from ``ladders.raw``,
+    which is ``zones.rooms`` as the file holds it, and replaces only the
+    ``bands`` of the rooms this page actually showed. A room he has
+    configured but is not polling, a room's ``camera_zone``, its
+    ``enabled`` flag and every key a later Jarvis might add all survive
+    untouched -- and a room that only had the carried-across legacy bands
+    is APPENDED, which is what completes the migration.
+
+    THE GEOMETRY IS JUDGED BY jarvis/zones.py AND NOT HERE. Every room's
+    new ladder is built as a ``ZoneMap`` before anything is written, so a
+    pair of overlapping bands is refused on screen instead of being saved
+    and then refused by the log -- which is how a config gets into the
+    state where the page shows one thing and the record says another.
     """
-    values = {}
-    for label, lo_raw, hi_raw, key in (
-            ("desk band", desk_lo, desk_hi, OPTION_DESK_BAND),
-            ("room band", room_lo, room_hi, OPTION_ROOM_BAND)):
+    rows = list(edits or ())
+    if ladders.blocked:
+        return {}, ladders.blocked
+    if not rows:
+        # Nothing on screen to save. Writing the bands anyway would replace
+        # his list with one built out of an empty page.
+        return {OPTION_CAMERA_OVERRULES: bool(overrules)}, ""
+    values: dict = {}
+    for row in rows:
+        label = "%s / %s" % (row.room, row.name)
         pair = []
-        for raw in (lo_raw, hi_raw):
-            try:
-                num = float(str(raw).strip())
-            except (TypeError, ValueError):
-                return {}, "%s: %r is not a number" % (label, str(raw).strip())
-            if not math.isfinite(num):
-                return {}, "%s: %r is not a number" % (label, str(raw).strip())
-            if num < 0.0 or num > MAX_BAND_M:
-                return {}, ("%s: %.2f m is outside what the radar can see "
-                            "(0 to %.0f m)" % (label, num, MAX_BAND_M))
-            pair.append(round(num, 2))
+        for raw in (row.lo, row.hi):
+            num, err = _typed(label, raw)
+            if err:
+                return {}, err
+            pair.append(num)
         if pair[0] >= pair[1]:
             return {}, ("%s: the near end (%.2f) must be less than the far "
                         "end (%.2f)" % (label, pair[0], pair[1]))
-        values[key] = pair
-    values[OPTION_CAMERA_OVERRULES] = bool(overrules)
-    return values, ""
+        values.setdefault(row.room, []).append(
+            {"name": row.name, "near_m": pair[0], "far_m": pair[1]})
+    for room, bands in values.items():
+        try:
+            ZoneMap(room, tuple(Band(b["name"], b["near_m"], b["far_m"])
+                                for b in bands),
+                    _camera_zone_of(ladders, room))
+        except ValueError as exc:
+            return {}, "%s: %s" % (room, exc)
+    raw = ladders.raw
+    if raw is None:
+        raw = []
+    if not isinstance(raw, (list, tuple)):
+        return {}, ("%s in assistant.json is %s, not a list of rooms — fix "
+                    "that by hand before saving from here"
+                    % (OPTION_ROOMS, type(raw).__name__))
+    return {OPTION_ROOMS: _merged_rooms(raw, values, ladders),
+            OPTION_CAMERA_OVERRULES: bool(overrules)}, ""
+
+
+def _camera_zone_of(ladders: Ladders, room: str) -> str:
+    """The room's camera zone, carried through an edit unchanged.
+
+    "" is a real answer and means the room has no lens (jarvis/zones.py,
+    ``ZoneMap.has_camera``); it must survive a band edit rather than being
+    replaced with the built-in default, which is the exact bug this pass
+    closed one file over.
+    """
+    zmap = ladders.for_room(room)
+    return "" if zmap is None else zmap.camera_zone
+
+
+def _merged_rooms(raw, bands_by_room: dict, ladders: Ladders) -> list:
+    """``zones.rooms`` with only the edited rooms' bands replaced."""
+    out = []
+    seen = set()
+    for entry in raw:
+        if not isinstance(entry, dict):
+            out.append(copy.deepcopy(entry))   # not ours to judge; not ours
+            continue                           # to lose either
+        key = zn._room_key(entry.get("name"))
+        fresh = dict(entry)
+        if key in bands_by_room:
+            fresh["bands"] = copy.deepcopy(bands_by_room[key])
+            seen.add(key)
+        out.append(fresh)
+    for key, bands in bands_by_room.items():
+        if key in seen:
+            continue
+        # The migration write: a room that had no entry of its own gets one,
+        # carrying the camera zone the ladder was showing.
+        out.append({"name": key, "enabled": True,
+                    "camera_zone": _camera_zone_of(ladders, key),
+                    "bands": copy.deepcopy(bands)})
+    return out
 
 
 # ----------------------------------------------------------------- the write
+def retire_legacy(get_option: Optional[Callable],
+                  unset_option: Optional[Callable]) -> tuple:
+    """Remove the superseded band keys once their numbers are in
+    ``zones.rooms``. Returns the notes that are LEFT to show.
+
+    A key that has been superseded and is merely IGNORED still sits in his
+    file looking live, with plausible numbers in it and no way to tell it
+    from one that drives something -- which is exactly how two zone models
+    disagreed for a day without anyone noticing. So it goes, on the save
+    that carried its numbers across.
+
+    Where the services object has no ``unset_option`` (an older app, a
+    stand-in) the keys STAY and the page SAYS they stay. Silently leaving a
+    live-looking lie in the file is the one outcome this function exists to
+    prevent, so it may not be the quiet failure mode either.
+
+    Never raises: a write that will not happen is a note, not a crash on
+    the Tk thread.
+    """
+    held = [key for key in LEGACY_KEYS if _opt(get_option, key) is not None]
+    if not held:
+        return ()
+    if not callable(unset_option):
+        return ("%s %s still in assistant.json and no longer read; the bands "
+                "live in %s now — remove them by hand"
+                % (" and ".join(held), "are" if len(held) > 1 else "is",
+                   OPTION_ROOMS),)
+    for key in held:
+        try:
+            unset_option(key)
+        except Exception:                 # noqa: BLE001 - config boundary
+            log.exception("sensors page: %s would not clear", key)
+    left = [key for key in held if _opt(get_option, key) is not None]
+    if left:
+        return ("%s could not be removed from assistant.json; %s no longer "
+                "read — the bands live in %s"
+                % (" and ".join(left), "they are" if len(left) > 1 else "it is",
+                   OPTION_ROOMS),)
+    return ()
+
+
 def write_options(set_option: Callable, edits: dict) -> tuple:
     """Write every edit. Returns the keys that would NOT write, in order.
 
@@ -624,12 +957,18 @@ class CameraView:
     detail: str = ""
 
     @property
-    def zone(self) -> str:
-        """The camera's own verdict. A face in the cone is a person at the
-        desk -- the lens points at the desk, which is the whole reason it
-        is allowed to overrule a range. WHO that is rides separately in
-        ``name``; this page does not fold identity into geometry."""
-        return ZONE_DESK if (self.present and self.live and self.faces) else ""
+    def sees_a_face(self) -> bool:
+        """Whether the eye has an opinion at all right now.
+
+        It no longer returns a ZONE. Naming the place was this page's own
+        two-band model talking: WHICH place a recognised face means is the
+        room's ``camera_zone`` in ``zones.rooms``, which is "at the desk"
+        in his office and DELIBERATELY BLANK in his kitchen -- a room with
+        no lens. WHO it is rides separately in ``name``; this page does not
+        fold identity into geometry.
+        """
+        return bool(self.present and self.live and self.faces)
+
 
 
 def camera_view(status: Any, present: bool = True) -> CameraView:
@@ -708,54 +1047,75 @@ class Verdict:
 
 
 def fuse(*, present: Optional[bool], distance_m, camera: CameraView,
-         bands: Bands, overrules: bool) -> Verdict:
-    """The one fusion rule, as a pure function.
+         zmap, overrules: bool) -> Verdict:
+    """The one fusion rule -- and it is ``jarvis.zones.verdict``, not a
+    second copy of it living on a Tk page.
 
-    ORDER, and the argument for it:
+    THAT IS THE WHOLE POINT OF THIS FUNCTION. Until 2026-09-03 this page
+    had a fusion of its own over a two-band model of its own, and the
+    merge agent measured the two disagreeing: the console called 4 of 10
+    points "AT THE DESK" from the radar alone while the zone log had no
+    desk band at all and could only reach "at the desk" through the camera.
+    They were different config keys, so nothing conflicted and nothing
+    complained. What is left here is the ADAPTER: it decides whether the
+    camera gets to speak, and jarvis/zones.py decides what the answer is.
 
-    1. The camera, when he lets it. His words: "camera recognition
-       overrules sensor detection since he can literaly see me at my desk".
-    2. The radar's presence bit, placed by its range. Presence with NO
-       usable range is IN THE ROOM, never at the desk: the sensor's honest
-       claim is "someone is here", and inventing the nearer zone out of a
-       missing number is the failure mode this page was built to expose.
-    3. Presence False is NOBODY THERE -- but only because a leg actually
-       said so.
-    4. Both legs silent is NO OPINION. Not an empty room. The whole None
-       contract in jarvis/roomsensor.py exists for this line.
+    THE ORDER, which is that module's and is argued there:
 
-    With the toggle OFF and the radar abstaining, the camera still answers
-    (step 5): nothing is being overruled when the other leg did not speak,
-    and refusing the only evidence in the room would be a different lie.
+    1. The camera, when he lets it AND the room has one. His words:
+       "camera recognition overrules sensor detection since he can literaly
+       see me at my desk". A room whose ``camera_zone`` is blank has no
+       lens and the rule cannot fire for it at all (``ZoneMap.has_camera``).
+    2. The radar's presence bit, placed by its band. Presence with NO
+       usable range is "in the room, unplaced" -- never the nearest band.
+       Inventing a place out of a missing number is the failure this page
+       was built to expose.
+    3. Presence False is "not in the room", and only because a leg said so.
+    4. Both legs silent is "no opinion". Not an empty room.
+
+    With the toggle OFF and the radar abstaining, the camera still answers:
+    nothing is being overruled when the other leg did not speak, and
+    refusing the only evidence in the room would be a different lie.
+
+    A room with no ladder gets NO LADDER and no invented bands. The page
+    can still say PRESENT and print a range; what it cannot honestly do is
+    name a place.
     """
-    cam_zone = camera.zone if camera is not None else ""
-    if cam_zone and overrules:
-        return Verdict(ZONE_DESK, ZONE_WORDS[ZONE_DESK], "camera",
-                       "the camera can see a face; the radar's range is not asked")
-    if present is True:
-        zone = zone_for_distance(distance_m, bands)
-        if zone == ZONE_DESK:
-            why = "a target inside the desk band"
-        elif zone == ZONE_ROOM:
-            why = "a target inside the room band"
-        else:
-            zone = ZONE_ROOM
-            why = ("presence with no usable range — someone is in the room, "
-                   "the band is unknown")
-        if cam_zone and not overrules:
-            why += "; the camera sees a face but is not allowed to overrule"
-        return Verdict(zone, ZONE_WORDS[zone], "radar", why)
-    if present is False:
+    saw_face = bool(camera is not None and camera.sees_a_face)
+    if zmap is None:
+        return Verdict(NO_LADDER, zone_word(NO_LADDER), "",
+                       "there is no ladder for this room in %s, so a range "
+                       "cannot be given a name" % OPTION_ROOMS)
+    speak = saw_face and (overrules or present is None)
+    opinion = zn.CameraOpinion(known=True, label=camera.name) if speak else None
+    v = zn.verdict(zmap, presence=present, distance_m=distance_m,
+                   camera=opinion)
+    if v.rule == zn.RULE_CAMERA:
+        why = ("the camera can see a face; the radar's range is not asked"
+               if present is not None else
+               "the radar has no opinion; the camera can see a face")
+        return Verdict(v.zone, zone_word(v.zone), "camera", why)
+    if v.rule == zn.RULE_BAND:
+        why = "a target inside %r" % v.zone
+    elif v.rule == zn.RULE_UNPLACED:
+        why = ("presence with no usable range — someone is in the room, the "
+               "band is unknown" if distance_m is None else
+               "%.2f m is in a gap between the bands, so the room is the "
+               "only honest answer" % distance_m)
+    elif v.rule == zn.RULE_EMPTY:
         why = "the radar reads empty"
-        if cam_zone:
-            why += ("; the camera sees a face but is not allowed to overrule"
-                    if not overrules else "")
-        return Verdict(ZONE_AWAY, ZONE_WORDS[ZONE_AWAY], "radar", why)
-    if cam_zone:
-        return Verdict(ZONE_DESK, ZONE_WORDS[ZONE_DESK], "camera",
-                       "the radar has no opinion; the camera can see a face")
-    return Verdict(ZONE_UNKNOWN, ZONE_WORDS[ZONE_UNKNOWN], "",
-                   "neither leg has an opinion — this is not an empty room")
+    else:
+        why = "neither leg has an opinion — this is not an empty room"
+    if saw_face and not speak:
+        why += "; the camera sees a face but is not allowed to overrule"
+    elif saw_face:
+        # It was allowed and still did not win, which leaves exactly one
+        # reason: this room's camera_zone is blank, i.e. the config says
+        # there is no lens here (jarvis/zones.py, ZoneMap.has_camera).
+        why += ("; the camera sees a face but %r has no camera zone in %s"
+                % (zmap.room, OPTION_ROOMS))
+    source = "" if v.rule == zn.RULE_SILENT and not saw_face else "radar"
+    return Verdict(v.zone, zone_word(v.zone), source, why)
 
 
 # ------------------------------------------------------------- the readings
@@ -919,9 +1279,14 @@ class RoomRow:
     verdict: Verdict
 
 
-def page_rows(readings, camera_status: Any, bands: Bands, overrules: bool,
+def page_rows(readings, camera_status: Any, ladders: Ladders, overrules: bool,
               camera_room: str = "") -> list:
-    """Every configured room, in config order, ready to paint."""
+    """Every configured room, in config order, ready to paint.
+
+    The ladder is looked up PER ROOM, so the kitchen is placed by the
+    kitchen's bands and the office by the office's -- and a room with no
+    ladder says so instead of borrowing another room's geometry.
+    """
     out = []
     for r in readings or ():
         cam = camera_view(camera_status,
@@ -937,7 +1302,8 @@ def page_rows(readings, camera_status: Any, bands: Bands, overrules: bool,
             fault=fault_line(r.status, r.present),
             camera_text=text, camera_tone=cam_tone,
             verdict=fuse(present=r.present, distance_m=r.distance_m,
-                         camera=cam, bands=bands, overrules=overrules)))
+                         camera=cam, zmap=ladders.for_room(r.name),
+                         overrules=overrules)))
     return out
 
 
@@ -952,7 +1318,7 @@ def waiting_row(spec) -> RoomRow:
                    presence_word=WAITING_WORD, presence_tone=TONE_MUTED,
                    distance_text=DASH, distance_m=None, rtt_text=DASH,
                    fault="", camera_text=DASH, camera_tone=TONE_FAINT,
-                   verdict=Verdict(ZONE_UNKNOWN, ZONE_WORDS[ZONE_UNKNOWN], "",
+                   verdict=Verdict(NO_OPINION, zone_word(NO_OPINION), "",
                                    "the first poll has not come back yet"))
 
 
@@ -1366,7 +1732,8 @@ class _RoomBlock(tk.Frame):
                               fg=tone_color(row.camera_tone))
         self.verdict.configure(
             text=row.verdict.word,
-            fg=theme.FOCAL if row.verdict.zone != ZONE_UNKNOWN else theme.WARN)
+            fg=(theme.WARN if row.verdict.zone in (NO_OPINION, NO_LADDER)
+                else theme.FOCAL))
         self.why.configure(text=("%s · %s" % (row.verdict.source,
                                               row.verdict.why)
                                  if row.verdict.source else row.verdict.why))
@@ -1406,6 +1773,22 @@ class SensorsPage(tk.Frame):
     this page's own tab row (95 px) paid for the strip (80 px, identical
     in the two looks) with 15 px over.
 
+    WHAT THE BAND ROWS COST, MEASURED 2026-09-03 after the zone model was
+    unified -- one row per BAND now, not two rows for ever. Tk on a private
+    Xvfb at 920x1440, holo, scale 2.0, with the worst case packed: a fault
+    line AND a reason line on every room, and a config note at the foot::
+
+        rooms  bands   winfo_reqheight()
+        1      2       417 px
+        2      4       638 px
+        2      5       686 px
+
+    Against the 1044-px holo stage span above, the widest of those leaves
+    358 px. His config today is one polled room, which is the 417. What is
+    NOT measured is a ladder with more bands than five or a third sensor;
+    the arithmetic is roughly 48 px a band, so the stage runs out somewhere
+    past a dozen -- if it ever does, the tune section is what should scroll.
+
     Nothing here polls until ``show()`` and nothing keeps polling after
     ``hide()``. After 09-03 that is a generation number rather than a stop
     flag, and there is exactly ONE poll thread at a time (see
@@ -1431,7 +1814,11 @@ class SensorsPage(tk.Frame):
         self._tick_id = None
 
         self.specs = self._room_specs()
-        self.bands, self.config_notes = read_bands_noted(self._get_option)
+        # ONE zone model: the ladders come from zones.rooms through
+        # jarvis/zones.py's own validator, so what he edits here is what
+        # the zone log places a reading with.
+        self.ladders = read_ladders(self._get_option)
+        self.config_notes = tuple(self.ladders.notes)
         # The toggle gets the same treatment as the bands: a value the file
         # holds that this page cannot use is NAMED, because SAVE writes the
         # substitute over it.
@@ -1501,10 +1888,27 @@ class SensorsPage(tk.Frame):
             fill="x", padx=theme.PAD, pady=theme.PAD_S)
         tune = tk.Frame(self, bg=bg)
         tune.pack(fill="x", padx=theme.PAD)
-        self._desk = self._band_row(tune, "desk band",
-                                    self.bands.desk_lo, self.bands.desk_hi)
-        self._room = self._band_row(tune, "room band",
-                                    self.bands.room_lo, self.bands.room_hi)
+        # ONE ROW PER BAND, named by the band, grouped by room. The two
+        # fixed rows that used to live here were the page's own two-band
+        # model; his office ladder has its own names and his kitchen has
+        # different ones again, and a page that could only edit "desk" and
+        # "room" could not edit either of them.
+        self._bands = []                  # in the order they are packed
+        for spec in self.specs:
+            zmap = self.ladders.for_room(spec.name)
+            if zmap is None:
+                tk.Label(tune, text="%s: no ladder in %s — add one and "
+                                    "restart" % (_spoken(spec), OPTION_ROOMS),
+                         font=ui_font(theme.SIZE_CAPTION), fg=theme.WARN,
+                         bg=bg, anchor="w").pack(fill="x")
+                continue
+            if len(self.specs) > 1:
+                tk.Label(tune, text=_spoken(spec).upper(),
+                         font=ui_font(theme.SIZE_CAPTION), fg=theme.FAINT,
+                         bg=bg, anchor="w").pack(fill="x")
+            for band in zmap.bands:
+                self._bands.append(self._band_row(tune, zn._room_key(spec.name),
+                                                  band))
 
         row = tk.Frame(tune, bg=bg)
         row.pack(fill="x", pady=px(4))
@@ -1548,22 +1952,23 @@ class SensorsPage(tk.Frame):
             for w in (self._notes, self._note)], add=True)
         self._show_notes()
 
-    def _band_row(self, parent, caption: str, lo: float, hi: float) -> dict:
+    def _band_row(self, parent, room: str, band) -> dict:
         bg = theme.TV_BG
         row = tk.Frame(parent, bg=bg)
         row.pack(fill="x", pady=px(4))
-        tk.Label(row, text=caption, font=ui_font(theme.SIZE_LABEL),
+        tk.Label(row, text=band.name, font=ui_font(theme.SIZE_LABEL),
                  fg=theme.MUTED, bg=bg, anchor="w",
-                 width=11).pack(side="left")
+                 width=13).pack(side="left")
         tk.Label(row, text="m", font=ui_font(theme.SIZE_CAPTION),
                  fg=theme.FAINT, bg=bg).pack(side="right", padx=(px(4), 0))
-        hi_e = self._entry(row, hi)
+        hi_e = self._entry(row, band.far_m)
         hi_e.pack(side="right")
-        lo_e = self._entry(row, lo)
+        lo_e = self._entry(row, band.near_m)
         lo_e.pack(side="left", padx=(0, px(6)))
         bar = _BandBar(row, bg=bg)
         bar.pack(side="left", fill="x", expand=True, padx=(0, px(6)))
-        return {"lo": lo_e, "hi": hi_e, "bar": bar}
+        return {"room": room, "name": band.name, "lo": lo_e, "hi": hi_e,
+                "bar": bar, "near_m": band.near_m, "far_m": band.far_m}
 
     def _entry(self, parent, value: float) -> tk.Entry:
         e = tk.Entry(parent, width=5, justify="center",
@@ -1696,19 +2101,19 @@ class SensorsPage(tk.Frame):
         if not self._open:
             return
         self._last = tuple(readings or ())
-        rows = page_rows(self._last, self._camera(), self.bands, self.overrules,
-                         camera_room=self.camera_room)
+        rows = page_rows(self._last, self._camera(), self.ladders,
+                         self.overrules, camera_room=self.camera_room)
         self._rows = rows
         for row in rows:
             self.apply_row(row)
-        here = next((r.distance_m for r in rows
-                     if r.name == self.camera_room), None)
-        if here is None and rows:
-            here = rows[0].distance_m
-        self._desk["bar"].set(band_fraction(here, self.bands.desk_lo,
-                                            self.bands.desk_hi))
-        self._room["bar"].set(band_fraction(here, self.bands.room_lo,
-                                            self.bands.room_hi))
+        # The marker goes on the bands of the room the reading came FROM.
+        # It used to take one distance and put it on both bars whatever
+        # room it was measured in, which with two sensors draws the kitchen
+        # range on the office ladder.
+        here = {zn._room_key(row.name): row.distance_m for row in rows}
+        for band in self._bands:
+            band["bar"].set(band_fraction(here.get(band["room"]),
+                                          band["near_m"], band["far_m"]))
 
     def _camera(self) -> dict:
         """The camera's numbers-only status, or {} -- which renders as "not
@@ -1726,7 +2131,10 @@ class SensorsPage(tk.Frame):
     def _show_notes(self) -> None:
         # config_notes FIRST: "the file holds a value I could not use" is
         # the one that costs him data if he presses SAVE past it.
-        notes = tuple(self.config_notes) + band_notes(self.bands)
+        notes = tuple(self.config_notes)
+        notes += name_mismatch_note(self.specs, self.ladders)
+        for spec in self.specs:
+            notes += band_notes(self.ladders.for_room(spec.name))
         if notes:
             self._notes.configure(text="\n".join(notes))
             self._notes.pack(fill="x", padx=theme.PAD, pady=(0, theme.PAD_S))
@@ -1755,7 +2163,6 @@ class SensorsPage(tk.Frame):
         if err:
             self._note.configure(text=err, fg=theme.ERR)
             return
-        self.bands = Bands(*(edits[OPTION_DESK_BAND] + edits[OPTION_ROOM_BAND]))
         self.overrules = bool(edits[OPTION_CAMERA_OVERRULES])
         fn = getattr(self.services, "set_option", None) if self.services else None
         if fn is None:
@@ -1764,18 +2171,41 @@ class SensorsPage(tk.Frame):
         failed = write_options(fn, edits)
         if not failed:
             # What he typed is now what the file holds, so the "the config
-            # had a value I could not use" notes are spent.
-            self.config_notes = ()
+            # had a value I could not use" notes are spent -- and the
+            # superseded keys have been carried across, so they go.
+            self.ladders = Ladders(maps=self.ladders.maps,
+                                   legacy=self.ladders.legacy,
+                                   raw=edits[OPTION_ROOMS],
+                                   refused=self.ladders.refused)
+            self.config_notes = retire_legacy(
+                self._get_option,
+                getattr(self.services, "unset_option", None)
+                if self.services else None)
+            self._reread_ladders()
         self._show_notes()
         text, tone = save_note(failed)
         self._note.configure(text=text, fg=tone_color(tone))
 
+    def _reread_ladders(self) -> None:
+        """Re-read the ladders from the config after a successful write, so
+        the verdicts and the band bars follow what was just saved.
+
+        Not a reload of the whole config -- ``reload_if_changed`` still has
+        no callers and ``RESTART_NOTE`` is still true for the rest of the
+        app. This is the in-memory ``AssistantConfig`` the write just went
+        through answering the same question again.
+        """
+        try:
+            self.ladders = read_ladders(self._get_option)
+        except Exception:                 # noqa: BLE001 - config boundary
+            log.exception("sensors page: the ladders could not be re-read")
+
     def band_values(self) -> tuple:
         """What is currently typed, validated. Split out so the refusal
         message is testable without a display."""
-        return band_edits(self._desk["lo"].get(), self._desk["hi"].get(),
-                          self._room["lo"].get(), self._room["hi"].get(),
-                          self._overrule.get())
+        return band_edits([BandEdit(b["room"], b["name"], b["lo"].get(),
+                                    b["hi"].get()) for b in self._bands],
+                          self.ladders, self._overrule.get())
 
 
 class _CfgView:
