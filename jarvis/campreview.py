@@ -88,13 +88,21 @@ live log, with him at the desk between 00:04 and 00:22, shows the same
 intervals that are whole multiples of the mode's own are what a UVC
 camera on auto-exposure produces when it lengthens the interval to expose
 a dim scene ("exposure priority"), and nothing else that was measured
-explains them. It is NOT proven: the two probe runs were at 02:36 and
-07:17 and nobody looked at whether the light differed between them, so
-they neither confirm nor refute it. Proving it means a run with the desk
-lamp on, or with the camera's exposure-priority control off, and both are
-his to do. What follows from it is the rule this module keeps: THE
-PICTURE RATE IS SET BY THE LENS AND THE LIGHT, AND ``camera.preview_fps``
-CAN ONLY LOWER IT.
+explains them. PROVEN 2026-09-04, grab() only, the app closed: the LifeCam
+runs a 30 / 15 / 7.5 fps sensor ladder by exposure tier (<=15.6 ms /
+31-62 ms / >=125 ms), its auto-exposure had stepped to the slowest tier
+(3.75 fps through the app's single driver buffer, exactly the 268 ms
+above), and forcing manual exposure 156 on the same open gave 15-16 fps
+with nothing else changed; back to auto, straight back down. The "fast"
+7.5 fps days were the MIDDLE tier halved, so the camera has been
+exposure-throttled all along. WHAT MOVES THE METERING is not measured --
+it cannot be from numbers alone -- and the two candidates (the scene the
+lens sees; a firmware state only a replug clears) are his to test.
+``camera.exposure`` in jarvis/camera.py is the lever, shipped off. What
+follows from it is the rule this module keeps: THE PICTURE RATE IS SET BY
+THE LENS AND THE LIGHT, AND ``camera.preview_fps`` CAN ONLY LOWER IT --
+and since 09-04 the minute log line prints each stage's own p50 (see
+``STAGES``), so the next such evening is a grep rather than three agents.
 
 THE THREE RATES ARE NOT ONE RATE, and separating them is what keeps the pane
 cheap whatever the device delivers. Hunter, 2026-09-03: *"looks good but it
@@ -227,7 +235,8 @@ from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, replace
+import statistics
+from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Optional
 
 from jarvis.logs import get_logger
@@ -343,6 +352,122 @@ REASON_WORDS = {
 }
 
 
+# ---------------------------------------------------------- stage timing
+# The stages of one capture cycle, in the order they run, and the order the
+# once-a-minute log line prints them. Milliseconds, p50 over the minute,
+# NUMBERS ONLY -- a timing can no more carry a pixel than a frame count can.
+#
+# WHY THIS EXISTS. On 2026-09-03 the preview line went from ``7.5 fps  grab
+# 132 ms`` to ``3.7 fps  grab 268 ms`` and stayed there through four app
+# restarts, and the one number the line carried was the WHOLE cycle -- the
+# device read, the MJPG decode, the detector, the landmark geometry, the
+# embedding, the hand stage, the enrolment tap and the shrink, summed. Three
+# agents spent an evening ruling out USB bandwidth, the app's own loop and
+# the GPU before the device read was timed on its own and found to be the
+# entire 268 ms (the camera's auto-exposure had stepped its sensor rate to
+# 7.5 fps, doubled by the single driver buffer; see jarvis/camera.py). With
+# the stages timed separately that answer is one log line: a slow ``grab``
+# beside a 3 ms ``detect`` is the device, a slow ``detect`` beside a 67 ms
+# ``grab`` is the model, and a slow ``draw`` is the Tk thread.
+#
+#   grab       feed.capture(): the V4L2 dequeue AND cv2's MJPG decode, which
+#              cv2.VideoCapture.read() does in one call. The two cannot be
+#              split without changing jarvis/eye.py's read path, so the
+#              probe's grab()-only number (scripts/camera_mode_probe.py) is
+#              the reference for how much of it is the wait.
+#   detect     detector.detect(frame) -- only on the cycles it runs.
+#   landmarks  the geometry pass over the rows (visionrig.observe per row,
+#              the plausibility check, the sort, the attention tracker) --
+#              only on detect cycles. The five landmarks themselves come
+#              back from the detector; this is what is done with them.
+#   embed      recogniser.embed + gallery.match, only when identity was due.
+#   hand       the gesture stage, when one is wired.
+#   offer      tap.offer(frame), when an enrolment is running.
+#   shrink     the reduction to the pane's box.
+#   draw       the Tk repaint of a live shot -- on the OTHER thread, timed
+#              in jarvis/ui/preview.py and posted back via
+#              ``PreviewWorker.note_stage``.
+STAGES = ("grab", "detect", "landmarks", "embed", "hand", "offer", "shrink",
+          "draw")
+# Samples kept per stage between log lines. A minute at 30 fps is 1 800; the
+# cap is there so a log that stops (a filter, a level) cannot grow the
+# lists for the life of the process.
+STAGE_KEEP = 4096
+
+
+class StageStats:
+    """Per-stage millisecond samples, p50'd once a minute and reset.
+
+    Thread-safe because two threads feed it: the capture thread posts every
+    stage but one, and the Tk thread posts ``draw``. Only floats go in and
+    only floats come out.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._samples: dict = {}
+
+    def note(self, name: str, ms: float) -> None:
+        try:
+            value = float(ms)
+        except (TypeError, ValueError):
+            return
+        with self._lock:
+            bucket = self._samples.setdefault(str(name), [])
+            bucket.append(value)
+            if len(bucket) > STAGE_KEEP:
+                del bucket[:len(bucket) - STAGE_KEEP]
+
+    def extend(self, stage_ms) -> None:
+        """A whole cycle's ``{stage: ms}`` at once."""
+        try:
+            items = list(dict(stage_ms or {}).items())
+        except Exception:                          # noqa: BLE001 - not a dict
+            return
+        for name, ms in items:
+            self.note(name, ms)
+
+    def counts(self) -> dict:
+        with self._lock:
+            return {name: len(v) for name, v in self._samples.items()}
+
+    def p50s(self, reset: bool = False) -> dict:
+        """``{stage: p50 ms}`` for every stage that has a sample. A stage
+        that never ran is ABSENT rather than 0.0: "0 ms" and "did not run"
+        are different facts, and the log prints the second as ``-``."""
+        with self._lock:
+            out = {name: float(statistics.median(v))
+                   for name, v in self._samples.items() if v}
+            if reset:
+                self._samples = {}
+        return out
+
+    def reset(self) -> None:
+        with self._lock:
+            self._samples = {}
+
+
+def stage_line(p50s: dict, cycles: int = 0) -> str:
+    """The stage half of the once-a-minute log line, e.g.
+    ``stages p50 ms [222 cycles]: grab 265  detect 3.1  landmarks 0.4
+    embed -  hand -  offer -  shrink 1.8  draw 2.1``. Every stage is always
+    printed, in ``STAGES`` order, so a grep finds the column whether or not
+    the stage ran; ``-`` is "did not run this minute"."""
+    parts = []
+    for name in STAGES:
+        value = p50s.get(name)
+        if value is None:
+            parts.append("%s -" % name)
+        elif value >= 10.0:
+            parts.append("%s %.0f" % (name, value))
+        else:
+            parts.append("%s %.1f" % (name, value))
+    extra = {k: v for k, v in p50s.items() if k not in STAGES}
+    for name in sorted(extra):
+        parts.append("%s %.1f" % (name, extra[name]))
+    return "stages p50 ms [%d cycles]: %s" % (int(cycles), "  ".join(parts))
+
+
 # --------------------------------------------------------------- records
 @dataclass(frozen=True)
 class PreviewFace:
@@ -411,7 +536,12 @@ class PreviewShot:
     seq: int = 0
     at: float = 0.0
     fps: float = 0.0                 # measured delivery rate, not the target
-    grab_ms: float = 0.0             # p50-ish cost of the last cycle
+    grab_ms: float = 0.0             # the WHOLE cycle's cost, grab to shrink
+    # This cycle's per-stage cost in ms, ``{stage: ms}`` over the names in
+    # STAGES that ran -- floats keyed by short strings, nothing else. The
+    # worker folds these into its minute p50s (StageStats); the pane never
+    # reads them.
+    stage_ms: dict = field(default_factory=dict)
     # The hand stage's verdict for this frame (jarvis/handstage.HandShot),
     # SCALARS ONLY, or None for no opinion -- the stage is off, has no
     # models, or raised. Never a landmark array, never a crop.
@@ -448,7 +578,9 @@ class PreviewShot:
                 "detail": self.detail, "seq": self.seq, "fps": self.fps,
                 "grab_ms": self.grab_ms, "live": self.live,
                 "face": self.primary.as_dict() if self.primary else {},
-                "hand": self.hand.as_dict() if self.hand is not None else {}}
+                "hand": self.hand.as_dict() if self.hand is not None else {},
+                "stage_ms": {str(k): float(v)
+                             for k, v in self.stage_ms.items()}}
 
 
 def blank(reason: str, detail: str = "", seq: int = 0,
@@ -867,6 +999,13 @@ class PreviewPipeline:
         self._now = now
         self.frames = 0
         self.misses = 0
+        # The stage costs of the cycle in progress, reset at the top of
+        # grab() and handed over on the shot as ``stage_ms``. Floats only.
+        self._cycle_ms: dict = {}
+
+    def _stage(self, name: str, since: float) -> None:
+        """Record one stage's cost, measured from ``since`` to now."""
+        self._cycle_ms[name] = (self._now() - since) * 1000.0
 
     def _observer(self):
         if self._observe is not None:
@@ -1042,7 +1181,9 @@ class PreviewPipeline:
         # has no way to satisfy except by accident.
         if due and face.conf >= self.id_conf and face.landmarks_ok:
             self._last_ident = at
+            t0 = self._now()
             label, score = self._match(frame, row)
+            self._stage("embed", t0)
             if label is not None:      # None = it could not be asked; hold
                 self._ident.observe(label, score, box)
         label, score, ran = self._ident.held(box)
@@ -1100,11 +1241,14 @@ class PreviewPipeline:
         stage = self.hands
         if stage is None:
             return None
+        t0 = self._now()
         try:
             return stage.observe(frame, faces, frame_w, frame_h, seq)
         except Exception:                          # noqa: BLE001 - the stage
             log.debug("campreview: the hand stage raised", exc_info=True)
             return None
+        finally:
+            self._stage("hand", t0)
 
     # ----------------------------------------------------------- capture
     def grab(self, box: tuple, seq: int = 0) -> PreviewShot:
@@ -1116,11 +1260,13 @@ class PreviewPipeline:
         the frame returns; nothing about it is stored on ``self``.
         """
         t0 = self._now()
+        self._cycle_ms = {}
         try:
             frame = self.feed.capture()
         except Exception:                          # noqa: BLE001 - device edge
             log.debug("campreview: the feed raised", exc_info=True)
             frame = None
+        self._stage("grab", t0)
         if frame is None:
             self.misses += 1
             return blank(REASON_NO_FRAME, seq=seq, at=time.time())
@@ -1153,6 +1299,7 @@ class PreviewPipeline:
         # pointer, which is why a run does not cost the pane its frame rate.
         tap = self.tap
         if tap is not None:
+            t_offer = self._now()
             try:
                 tap.offer(frame)
             except Exception:                  # noqa: BLE001 - the tap
@@ -1161,20 +1308,24 @@ class PreviewPipeline:
                 # exactly the failure this whole lane exists to avoid.
                 log.debug("campreview: the enrolment tap raised",
                           exc_info=True)
+            self._stage("offer", t_offer)
 
         # LETTERBOXED HERE, on this thread, so what crosses over is the
         # picture at exactly the size it will be drawn. Stretching a 4:3
         # camera into a 16:9 box would squash every face 1.33x and put
         # every overlay box slightly off the face it belongs to.
         _ox, _oy, bw, bh = fit_box(frame_w, frame_h, box[0], box[1])
+        t_shrink = self._now()
         image = shrink(frame, (bw, bh))
+        self._stage("shrink", t_shrink)
         self.frames += 1
         detail = "" if self.detector is not None else \
             (self.reason or "no face detector")
         return PreviewShot(image=image, faces=faces, cap_w=frame_w,
                            cap_h=frame_h, reason=REASON_LIVE, detail=detail,
                            seq=seq, at=time.time(),
-                           grab_ms=(self._now() - t0) * 1000.0, hand=hand)
+                           grab_ms=(self._now() - t0) * 1000.0, hand=hand,
+                           stage_ms=dict(self._cycle_ms))
 
     def _track(self, frame, frame_w: int, frame_h: int,
                at: float) -> tuple:
@@ -1243,12 +1394,21 @@ class PreviewPipeline:
             return self._held
         self._last_detect = at
         self._since_detect = 0
+        t0 = self._now()
         try:
             rows = self.detector.detect(frame)
         except Exception:                          # noqa: BLE001 - a detector
             log.debug("campreview: the detector raised", exc_info=True)
             rows = None
+        self._stage("detect", t0)
+        t1 = self._now()
         self._held = self._faces(frame, rows, frame_w, frame_h, at)
+        # ``embed`` is timed inside _name and is NOT part of this figure:
+        # _faces is measured whole, then the embed's own cost is taken back
+        # out, so ``landmarks`` is the geometry alone.
+        self._cycle_ms["landmarks"] = max(
+            0.0, (self._now() - t1) * 1000.0
+            - self._cycle_ms.get("embed", 0.0))
         return self._held
 
     def close(self) -> None:
@@ -1556,6 +1716,16 @@ class PreviewWorker:
         self._last_at = 0.0
         self._logged = 0.0
         self.cycles = 0
+        # The minute's per-stage samples. Outlives any one pipeline, like
+        # the tap and the hand stage, so a restart mid-minute does not lose
+        # the half-minute before it.
+        self.stages = StageStats()
+        self._stage_cycles = 0
+
+    def note_stage(self, name: str, ms: float) -> None:
+        """A stage cost measured somewhere else -- ``draw`` from the Tk pane
+        (jarvis/ui/preview.py). Any thread; numbers only."""
+        self.stages.note(name, ms)
 
     # ---------------------------------------------------- the enrol tap
     def set_tap(self, tap) -> None:
@@ -1741,6 +1911,9 @@ class PreviewWorker:
             return
         with self._lock:
             self._shot = shot
+        if shot.stage_ms:
+            self.stages.extend(shot.stage_ms)
+            self._stage_cycles += 1
         self._maybe_log(shot)
 
     def _maybe_log(self, shot: PreviewShot) -> None:
@@ -1757,9 +1930,17 @@ class PreviewWorker:
             # reached this dict -- numbers_only() has no image field.
             who = "  id %s %.2f" % (face.get("name") or "unknown",
                                     face.get("id_score") or 0.0)
-        log.info("campreview: %s  faces %d  %dx%d  %.1f fps  grab %.0f ms%s",
+        # ``cycle`` is the whole pass, grab to shrink -- the number this line
+        # used to print as ``grab``, renamed because it was read as the
+        # device read alone for a whole evening (2026-09-03) and was not. The
+        # stage figures after it are the minute's p50s; ``grab`` there IS the
+        # device read (plus decode), and ``draw`` is the Tk thread's.
+        cycles, self._stage_cycles = self._stage_cycles, 0
+        log.info("campreview: %s  faces %d  %dx%d  %.1f fps  cycle %.0f ms%s"
+                 "  %s",
                  data["reason"] or "live", data["faces"], data["cap_w"],
-                 data["cap_h"], data["fps"], data["grab_ms"], who)
+                 data["cap_h"], data["fps"], data["grab_ms"], who,
+                 stage_line(self.stages.p50s(reset=True), cycles))
 
     def _sensing_state(self):
         """The policy's state, or the fail-safe when there is no policy.
@@ -1879,7 +2060,8 @@ class PreviewWorker:
                                reason=shot.reason, detail=shot.detail,
                                seq=shot.seq, at=shot.at,
                                fps=self._measure_fps(self._now()),
-                               grab_ms=shot.grab_ms, hand=shot.hand)
+                               grab_ms=shot.grab_ms, hand=shot.hand,
+                               stage_ms=shot.stage_ms)
         self._publish(shot, stop)
         return shot
 

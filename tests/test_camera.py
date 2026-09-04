@@ -752,3 +752,183 @@ def test_device_holder_really_walks_proc_and_skips_our_own_pid(tmp_path):
 
 def test_device_holder_says_nobody_for_a_node_that_does_not_exist():
     assert cam.device_holder("/dev/video-nope-99") == (0, "")
+
+
+# ----------------------------------------- the exposure controls (2026-09-04)
+# Everything below runs against _FakeCv2 / _FakeVideoCapture: a recorder of
+# sets and gets, never a device. The real cv2 property numbers are used
+# where a test needs them so the fake answers the same question the driver
+# would; nothing opens /dev/video*.
+_FakeCv2.CAP_PROP_GAIN, _FakeCv2.CAP_PROP_EXPOSURE = 14, 15
+_FakeCv2.CAP_PROP_AUTO_EXPOSURE = 21
+
+
+class _MeteredCapture(_FakeVideoCapture):
+    """A capture that reports his LifeCam's controls as measured 2026-09-04:
+    auto-exposure on (3), a cached exposure of 156, and NO gain control
+    (get returns -1, the way v4l2 answers for a control the camera lacks).
+    """
+
+    def __init__(self, target, opened=True, auto=3.0, exposure=156.0,
+                 refuse=()):
+        super().__init__(target, opened)
+        self.props[21] = float(auto)
+        self.props[15] = float(exposure)
+        self.props[14] = -1.0
+        self.refuse = set(refuse)
+
+    def set(self, prop, value):
+        if prop in self.refuse:
+            self.sets.append((prop, float(value)))
+            return False
+        return super().set(prop, value)
+
+
+class _MeteredCv2(_FakeCv2):
+    def __init__(self, opened=True, **kw):
+        super().__init__(opened)
+        self._kw = kw
+
+    def VideoCapture(self, target):
+        cap = _MeteredCapture(target, self._opened, **self._kw)
+        self.caps.append(cap)
+        return cap
+
+
+def test_the_exposure_controls_are_read_as_numbers_and_an_absent_one_is_minus_one(
+        monkeypatch):
+    fake = _MeteredCv2()
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    cap = fake.VideoCapture(0)
+    ctl = cam.exposure_probe(cap)
+    assert ctl == {"auto_exposure": 3.0, "exposure": 156.0, "gain": -1.0}
+    assert cap.sets == []                        # a probe changes nothing
+    # a capture that raises on get is still a number, never an exception
+    class Angry:
+        def get(self, _prop):
+            raise RuntimeError("no")
+    assert cam.exposure_probe(Angry()) == {"auto_exposure": -1.0,
+                                           "exposure": -1.0, "gain": -1.0}
+
+
+def test_every_open_logs_the_exposure_controls_beside_the_granted_mode(
+        monkeypatch, caplog):
+    """The line that was missing on 2026-09-03: the preview halved from 7.5
+    to 3.7 fps and nothing in the log could say whether the camera had been
+    re-metered. Now every open says auto/manual and the three numbers, and
+    says in the same breath that under auto the exposure figure is a cached
+    value, so 156 is never again read as 'the room is bright'."""
+    fake = _MeteredCv2()
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    with caplog.at_level(logging.INFO, logger="jarvis.camera"):
+        cap = cam.open_capture("", 1280, 720, "MJPG")
+    lines = [r.getMessage() for r in caplog.records if r.name == "jarvis.camera"]
+    granted = [i for i, m in enumerate(lines) if "granted 1280x720" in m]
+    controls = [i for i, m in enumerate(lines) if "controls at open" in m]
+    assert granted and controls
+    assert controls[0] == granted[0] + 1         # next to it, not somewhere
+    line = lines[controls[0]]
+    assert "auto_exposure 3  exposure 156  gain -1 (auto;" in line, line
+    assert "cached manual value" in line
+    # and by default NOTHING about exposure was written to the driver
+    assert not any(p in (fake.CAP_PROP_AUTO_EXPOSURE, fake.CAP_PROP_EXPOSURE)
+                   for p, _ in cap.sets)
+
+
+def test_a_manual_control_is_logged_as_manual(monkeypatch, caplog):
+    fake = _MeteredCv2(auto=1.0, exposure=20.0)
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    with caplog.at_level(logging.INFO, logger="jarvis.camera"):
+        cam.open_capture("", 1280, 720, "MJPG")
+    assert any("auto_exposure 1  exposure 20  gain -1 (manual;" in
+               r.getMessage() for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_camera_exposure_pins_manual_exposure_at_open_and_reads_it_back(
+        monkeypatch, caplog):
+    """The lever, MEASURED 2026-09-04 grab-only with the app closed: auto
+    had put his LifeCam on its 7.5 fps sensor tier (3.75 fps through the
+    single driver buffer); manual 156 took the same open to 15-16 fps.
+    Auto is switched off BEFORE the value is written -- v4l2 ignores an
+    exposure_absolute written while exposure_auto is still 3 -- and the
+    read-back is what the log prints, because a refused set is silent."""
+    fake = _MeteredCv2()
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    with caplog.at_level(logging.INFO, logger="jarvis.camera"):
+        cap = cam.open_capture("", 1280, 720, "MJPG", exposure=156)
+    props = [p for p, _ in cap.sets]
+    assert fake.CAP_PROP_AUTO_EXPOSURE in props and fake.CAP_PROP_EXPOSURE in props
+    assert props.index(fake.CAP_PROP_AUTO_EXPOSURE) < props.index(
+        fake.CAP_PROP_EXPOSURE)
+    # and both AFTER the mode: the format negotiation comes first
+    assert props.index(fake.CAP_PROP_FRAME_HEIGHT) < props.index(
+        fake.CAP_PROP_AUTO_EXPOSURE)
+    assert cap.props[fake.CAP_PROP_AUTO_EXPOSURE] == float(cam.EXPOSURE_MANUAL)
+    assert cap.props[fake.CAP_PROP_EXPOSURE] == 156.0
+    lines = [r.getMessage() for r in caplog.records if r.name == "jarvis.camera"]
+    assert any("exposure pinned manual 156 -> accepted; driver reads back "
+               "auto_exposure 1  exposure 156  gain -1" in m for m in lines), \
+        lines
+    assert not any("controls at open" in m for m in lines)   # one line, not two
+
+
+def test_a_refused_exposure_pin_is_logged_as_refused_not_assumed(
+        monkeypatch, caplog):
+    fake = _MeteredCv2(refuse={15})               # the driver declines EXPOSURE
+    monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
+    with caplog.at_level(logging.INFO, logger="jarvis.camera"):
+        cam.open_capture("", 1280, 720, "MJPG", exposure=156)
+    assert any("exposure pinned manual 156 -> REFUSED" in r.getMessage()
+               for r in caplog.records), \
+        [r.getMessage() for r in caplog.records]
+
+
+def test_pin_exposure_reports_the_read_back_and_never_raises():
+    class Dead:
+        def set(self, *_a):
+            raise RuntimeError("gone")
+
+        def get(self, *_a):
+            raise RuntimeError("gone")
+    import types
+    fake = types.SimpleNamespace(CAP_PROP_AUTO_EXPOSURE=21,
+                                 CAP_PROP_EXPOSURE=15, CAP_PROP_GAIN=14)
+    import jarvis.camera as mod
+    orig = mod._import_cv2
+    mod._import_cv2 = lambda: fake
+    try:
+        out = cam.pin_exposure(Dead(), 156)
+    finally:
+        mod._import_cv2 = orig
+    assert out["pinned"] is False and out["asked"] == 156
+    assert out["auto_exposure"] == -1.0
+
+
+def test_build_hands_camera_exposure_to_the_opener_and_zero_means_auto(
+        tmp_path, monkeypatch):
+    seen = []
+
+    def fake_open(device, width, height, fourcc, exposure=0):
+        seen.append((device, width, height, fourcc, exposure))
+        return object()
+    monkeypatch.setattr(cam, "open_capture", fake_open)
+    base = {"camera.enabled": True, "camera.width": 1280,
+            "camera.height": 720, "camera.hfov_deg": 65.6}
+    feed, why = cam.build(FakeCfg(base), _online_policy(tmp_path))
+    assert feed is not None, why
+    feed._opener()
+    feed2, why = cam.build(FakeCfg({**base, "camera.exposure": 156}),
+                           _online_policy(tmp_path))
+    assert feed2 is not None, why
+    feed2._opener()
+    assert [s[4] for s in seen] == [0, 156]
+    assert all(s[3] == "MJPG" for s in seen)
+
+
+def test_the_shipped_config_leaves_exposure_on_auto():
+    """0 in the defaults: the lever exists, and it ships untouched. Whether
+    the pane is still watchable at a fixed exposure in his evening light is
+    his to read off the log, not this file's to decide."""
+    from jarvis.assistant_config import DEFAULTS
+    assert DEFAULTS["camera"]["exposure"] == 0

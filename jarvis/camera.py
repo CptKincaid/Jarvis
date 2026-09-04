@@ -83,6 +83,23 @@ CAPTURE_BUFFERS = 1
 # device anyway. One frame at the idle tier's 1.5 fps is 670 ms; a second is
 # a grab that is not coming back.
 CLOSE_WAIT_S = 1.0
+# V4L2's exposure_auto values, which cv2's V4L2 backend passes through RAW
+# on CAP_PROP_AUTO_EXPOSURE (measured 2026-09-04 on his LifeCam: get() read
+# 3.0 under auto, set(1) read back 1.0 and the v4l2 control agreed). Not
+# the 0.25/0.75 folklore from other backends.
+EXPOSURE_MANUAL = 1
+EXPOSURE_AUTO = 3
+# The driver controls that decide the camera's OWN frame period. Read and
+# logged at every open (``exposure_probe``), because on 2026-09-03/04 the
+# preview halved from 7.5 to 3.7 fps with nothing in the log able to say
+# whether the camera had been re-metered. MEASURED 2026-09-04, grab() only,
+# the app closed: the LifeCam runs a 30 / 15 / 7.5 fps ladder by exposure
+# tier (<=15.6 ms / 31-62 ms / >=125 ms) and its auto-exposure had stepped
+# to the darkest tier; forcing manual exposure 156 took it from 3.75 to
+# 15-16 fps in the app's own 1-buffer configuration, and back to auto put
+# it straight back. Under auto the ``exposure`` figure is the CACHED manual
+# value, not a meter reading; ``auto_exposure`` is the number that matters.
+EXPOSURE_CONTROLS = ("auto_exposure", "exposure", "gain")
 
 
 def _import_cv2():
@@ -90,6 +107,54 @@ def _import_cv2():
     a box without OpenCV and ``build()`` can report that as a reason."""
     import cv2                       # noqa: PLC0415 - deliberately lazy
     return cv2
+
+
+def exposure_probe(cap) -> dict:
+    """The driver's exposure controls, as NUMBERS. Never raises, never
+    changes anything; -1.0 is "the driver has no such control" (his LifeCam
+    has no gain), which is data and is logged as such."""
+    cv2 = _import_cv2()
+    out = {}
+    for name, prop in (("auto_exposure", "CAP_PROP_AUTO_EXPOSURE"),
+                       ("exposure", "CAP_PROP_EXPOSURE"),
+                       ("gain", "CAP_PROP_GAIN")):
+        try:
+            out[name] = float(cap.get(getattr(cv2, prop)))
+        except Exception:  # noqa: BLE001 - an absent control is a number
+            out[name] = -1.0
+    return out
+
+
+def pin_exposure(cap, exposure: int) -> dict:
+    """Manual exposure, pinned: auto off, then the value. Reports what the
+    driver READ BACK, because a refused set is silent on v4l2.
+
+    THE ONE CAVEAT IS THE CAMERA'S OWN TABLE. The LifeCam accepts any value
+    in 5..20000 but runs its fastest 30 fps sensor rate only at values on
+    its discrete list (5, 9, 10, 19, 20, 39, 78, 156 measured; 312 and 625
+    give 15; anything off the list -- 50, 100, 200, 400 -- falls to the
+    SLOWEST tier). So the number to use is one the next preview line shows
+    to be fast, not one that looks reasonable. 156 is the value the camera
+    itself caches under auto and is the safe first choice.
+    """
+    cv2 = _import_cv2()
+    out = {"asked": int(exposure)}
+    try:
+        out["auto_accepted"] = bool(cap.set(cv2.CAP_PROP_AUTO_EXPOSURE,
+                                            EXPOSURE_MANUAL))
+    except Exception:  # noqa: BLE001
+        out["auto_accepted"] = False
+    try:
+        out["accepted"] = bool(cap.set(cv2.CAP_PROP_EXPOSURE,
+                                       int(exposure)))
+    except Exception:  # noqa: BLE001
+        out["accepted"] = False
+    out.update(exposure_probe(cap))
+    out["pinned"] = bool(out["auto_accepted"] and out["accepted"]
+                         and out["auto_exposure"] == float(EXPOSURE_MANUAL)
+                         and out["exposure"] == float(int(exposure)))
+    return out
+
 
 
 def device_nodes() -> list:
@@ -241,10 +306,29 @@ def thresholds_from_config(cfg) -> Thresholds:
 
 # ------------------------------------------------------------- the device
 def open_capture(device: str = "", width: int = 1280, height: int = 720,
-                 fourcc: str = DEFAULT_FOURCC):
+                 fourcc: str = DEFAULT_FOURCC, exposure: int = 0):
     """cv2.VideoCapture, opened, asked for a mode, and the GRANTED mode read
     back and logged. Raises if it will not open -- ``Eye`` reads that as no
     opinion, which is the same behaviour as having no camera at all.
+
+    THE EXPOSURE CONTROLS ARE LOGGED AT EVERY OPEN, beside the granted mode,
+    since 2026-09-04. What the two probes of 09-03 left "NOT proven" (below)
+    was then measured, grab() only and the app closed: the delivered rate is
+    the camera's own auto-exposure tier. His LifeCam runs 30 / 15 / 7.5 fps
+    at exposure <=15.6 ms / 31-62 ms / >=125 ms, auto had stepped to the
+    slowest tier (3.75 fps through the app's single driver buffer), and
+    manual exposure 156 took the same open to 15-16 fps with no other change.
+    So the line printed here says ``auto_exposure``, ``exposure`` and
+    ``gain`` as the driver reports them -- and says plainly that under auto
+    the exposure figure is a cached manual value, not a light reading, so
+    nobody reads 156 as "the room is bright" again.
+
+    ``exposure`` > 0 PINS manual exposure at that value (``pin_exposure``),
+    which is ``camera.exposure`` in his config and ships at 0 = leave auto
+    alone. It is a lever, not a verdict: it trades the camera's own metering
+    for a fixed sensor rate, and whether the pane and the detector are still
+    usable at that exposure in his evening light is his to read off the
+    next ``campreview:`` line, not this module's to assume.
 
     THE GRANTED MODE IS LOGGED HERE, once per open, because until 2026-09-03
     nothing in the running app read it back and the one time it mattered
@@ -319,6 +403,27 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
                  got["buffersize"])
     except Exception:  # noqa: BLE001 - a read-back is not worth a crash
         log.debug("camera: could not read the granted mode back",
+                  exc_info=True)
+    try:
+        if int(exposure or 0) > 0:
+            pin = pin_exposure(cap, int(exposure))
+            log.info("camera: exposure pinned manual %d -> %s; driver reads "
+                     "back auto_exposure %.0f  exposure %.0f  gain %.0f",
+                     pin["asked"], "accepted" if pin["pinned"] else "REFUSED",
+                     pin["auto_exposure"], pin["exposure"], pin["gain"])
+        else:
+            ctl = exposure_probe(cap)
+            log.info("camera: controls at open: auto_exposure %.0f  exposure "
+                     "%.0f  gain %.0f (%s; -1 = no such control; under auto "
+                     "the exposure figure is the cached manual value, not a "
+                     "light reading -- the camera's own rate tier shows in "
+                     "the preview line)",
+                     ctl["auto_exposure"], ctl["exposure"], ctl["gain"],
+                     "auto" if ctl["auto_exposure"] == float(EXPOSURE_AUTO)
+                     else "manual" if ctl["auto_exposure"]
+                     == float(EXPOSURE_MANUAL) else "mode ?")
+    except Exception:  # noqa: BLE001 - a control read is not worth a crash
+        log.debug("camera: could not read the exposure controls",
                   exc_info=True)
     return cap
 
@@ -763,10 +868,12 @@ def build(cfg, policy, opener: Optional[Callable[[], Any]] = None,
         lens = lens_from_config(cfg)
         device = str(_cfg_get(cfg, "camera.device", "") or "")
         fourcc = str(_cfg_get(cfg, "camera.fourcc", DEFAULT_FOURCC) or "")
+        # 0 = auto-exposure, the camera's own metering. See open_capture.
+        exposure = int(_cfg_get(cfg, "camera.exposure", 0) or 0)
         if opener is None:
             def opener():                       # noqa: E306 - one call site
                 return open_capture(device, lens.width_px, lens.height_px,
-                                    fourcc)
+                                    fourcc, exposure=exposure)
         feed = CameraFeed(policy, opener, lens=lens, on_blind=on_blind,
                           present=lambda: device_present(device),
                           device=device)

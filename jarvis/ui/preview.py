@@ -133,6 +133,7 @@ fallback too.
 """
 from __future__ import annotations
 
+import time
 import tkinter as tk
 from typing import Optional
 
@@ -667,7 +668,22 @@ class CameraPreview(tk.Frame):
         if shot.seq == self._seq:
             return
         self._seq = shot.seq
+        t0 = time.monotonic()
         self._paint(shot)
+        if shot.live:
+            # THE ONE STAGE THE CAPTURE THREAD CANNOT TIME. The repaint runs
+            # here, on the Tk thread, and is posted back to the worker so the
+            # once-a-minute ``campreview:`` line carries ``draw`` beside
+            # ``grab`` and ``detect`` -- a slow pane and a slow camera are
+            # then two different columns instead of one complaint. A number,
+            # never the shot; a worker without the hook (a stub) is skipped.
+            note = getattr(worker, "note_stage", None)
+            if callable(note):
+                try:
+                    note("draw", (time.monotonic() - t0) * 1000.0)
+                except Exception:            # noqa: BLE001 - a diagnostic
+                    log.debug("preview: could not post the draw time",
+                              exc_info=True)
 
     # ---------------------------------------------------------- painting
     def _paint(self, shot: PreviewShot) -> None:
