@@ -2287,3 +2287,124 @@ def test_a_long_sentence_naming_no_file_is_a_new_subject_to_which_file(cmd):
     res = cmd.handle("what is the capital of france would you say", source="typed")
     assert res is None or res.reply != outbox.WHICH_FILE_LINE
     assert cmd._pending_sendask is None
+
+
+# ==================================================================
+# 23. The fifth pass (09-04): a second recipient of any kind is the
+#     re-ask, "and then" dangles like "and", and Hunter's ruling
+# ==================================================================
+# Attack 1's seven-word second-recipient sentences ("send it to her and
+# cc Dana", "... and 3 others", "yes, 2 copies to her and Dana", "... and
+# to Dana") were dropped OUT LOUD on the aside path, and "send it to her
+# and dana@example.com" fell to the send-file family and asked "Which
+# file, sir?". He said "to her" and then named somebody else: the one
+# re-ask, whatever the length, and the yes he gives to THAT sentence
+# sends to her.
+FIFTH_PASS_SECOND_RECIPIENTS = [
+    "send it to her and to Dana", "send it to her and cc Dana", "send it to her cc Dana",
+    "send it to her and 3 others", "yes, 2 copies to her and Dana",
+    "send it to her and dana@example.com", "send it to her and Dana",
+    "send it to her, then Dana", "send it to her and Dana please",
+    "send it to her and her mother", "send it to her and the whole department",
+    "yes, send it to her and to Dana", "send it to her and to heather",
+    "send it to her and me", "send it to her, plus Dana", "send it to her and also Dana",
+    "send it to her and copy Dana", "send it to her and one to Dana",
+]
+
+
+@pytest.mark.parametrize("said", FIFTH_PASS_SECOND_RECIPIENTS)
+def test_a_second_recipient_of_any_kind_is_not_a_yes(said):
+    assert parse_send_answer(said) is not True, said
+
+
+@pytest.mark.parametrize("said", FIFTH_PASS_SECOND_RECIPIENTS)
+def test_a_second_recipient_of_any_kind_is_the_re_ask(cmd, said):
+    """Not sent, not dropped, not "Which file, sir?", not a correction to
+    anybody: the one re-ask with the draft kept."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert cmd._pending_send is not None, (said, res.reply)
+    assert res.reply == outbox.unsure_line(cmd._pending_send), (said, res.reply)
+    assert res.reply not in (outbox.ASK_SPENT_LINE, outbox.WHICH_FILE_LINE), said
+    assert "no address" not in res.reply.lower(), (said, res.reply)
+    assert cmd._pending_sendask is None, said
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+def test_what_counts_as_a_second_recipient():
+    from jarvis.commander import _send_near_yes, _send_second_recipient
+    for said in ("send it to her and to Dana", "to her and cc Dana",
+                 "send it to her and 3 others", "yes, 2 copies to her and Dana",
+                 "send it to her and dana@example.com", "send it to her, then Dana please",
+                 "send it to her address and Dana"):
+        assert _send_second_recipient(said) and _send_near_yes(said), said
+    # a command after the read-back's words keeps its meaning below this rung
+    for said in ("send it to her and turn the lights off",
+                 "send it to her and then turn the lights off",
+                 "send it to her and what is the time now"):
+        assert not _send_second_recipient(said), said
+    # the same person with a noun on it, a thanks, a trailing then: a yes,
+    # not a near one
+    for said in ("yes, to her and to her address", "send it to her and thanks",
+                 "send it to her then, thanks", "yes, then that one"):
+        assert not _send_near_yes(said) and parse_send_answer(said) is True, said
+    # ends on a connector: the bar, not this rule
+    assert _send_near_yes("send it to her and")
+    assert not _send_second_recipient("send it to her and")
+
+
+@pytest.mark.parametrize("said", ["yes and then", "yes, and then", "send it to her and then",
+                                  "go on and then", "yes then and"])
+def test_and_then_dangles_like_and(said):
+    assert parse_send_answer(said) is not True, said
+
+
+def test_yes_and_then_is_asked_again_not_sent(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("yes and then", source="typed")
+    assert not FakeSMTP.made
+    assert res.reply == outbox.unsure_line(cmd._pending_send)
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+@pytest.mark.parametrize("said", ["do it then", "yes then", "go on then", "send it on then"])
+def test_a_trailing_then_alone_is_still_a_yes(said):
+    assert parse_send_answer(said) is True, said
+
+
+# ---- Hunter's ruling (16:58, 09-04): after a read-back, "okay send it to
+# her" SENDS -- "okay" is a filler and "send it to her" is the read-back's
+# own words said back. A trailing "?" still re-asks.
+HUNTERS_RULING_SENDS = [
+    "okay send it to her", "okay, send it to her", "alright send it to her",
+    "okay, send it to him", "right, send it to her", "sure, send it to her",
+    "okay send it to heather", "okay, send it to her address",
+]
+HUNTERS_RULING_REASKS = [
+    "send it to her?", "okay send it to her?", "okay, send it to her?",
+    "alright send it to her?", "yes?", "go on?", "to her address?",
+]
+
+
+@pytest.mark.parametrize("said", HUNTERS_RULING_SENDS)
+def test_hunters_ruling_a_filler_on_the_read_backs_own_words_sends(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled and res.ack, (said, res)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+    assert cmd._pending_send is None
+
+
+@pytest.mark.parametrize("said", HUNTERS_RULING_REASKS)
+def test_hunters_ruling_a_question_mark_still_re_asks(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert cmd._pending_send is not None, (said, res)
+    assert res.reply == outbox.unsure_line(cmd._pending_send), (said, res.reply)
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"

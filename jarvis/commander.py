@@ -5526,7 +5526,8 @@ _SEND_YES_RX = re.compile(
 #   1. it ends on "?" -- Whisper writes one on a rising intonation, and
 #      "send it to her?", "yes?", "go on?", "to her address?" are questions
 #      put to me, not answers to mine;
-#   2. it ends on "and" -- "yes, and" is a sentence he was interrupted in;
+#   2. it ends on "and" -- "yes, and" is a sentence he was interrupted in
+#      (and so is "yes and then": a trailing "then" alone is "do it then");
 #   3. a connector ("and" / "then") is followed by a BARE pronoun, with or
 #      without a "to" -- "send it to her and to him", "send it to her, then
 #      him", "yes and him" name a SECOND recipient. A ref with a noun on
@@ -5534,7 +5535,7 @@ _SEND_YES_RX = re.compile(
 # A barred sentence is a NEAR yes: asked again, never sent, never dropped.
 _SEND_YES_BAR_RX = re.compile(
     r"\?\s*$"
-    r"|\band[.!?,\s]*$"
+    r"|\band(?:[.!?,\s]+then)?[.!?,\s]*$"
     r"|\b(?:and|then)[.!?,\s]+(?:" + _SEND_TO_PREP + r"\s+)?" + _SEND_BARE_REF
     + r"(?!['\w])(?![.!?,\s]+" + _SEND_REF_NOUN + r"\b)",
     re.I)
@@ -5544,12 +5545,48 @@ def _send_yes_barred(t: str) -> bool:
     return _SEND_YES_BAR_RX.search(t) is not None
 
 
+# A SECOND recipient of any kind, on the read-back's own words (the fifth
+# pass, 09-04): "send it to her and to Dana", "to her and cc Dana", "to her
+# and 3 others", "2 copies to her and Dana", "to her and dana@example.com".
+# He said "to her" -- the sentence is about THIS draft -- and then named
+# somebody beside her. Not a yes, not a correction (to whom?), not a change
+# of subject, and not overheard speech whatever its length: the one
+# re-ask. The seven-word ones used to be dropped out loud on the aside
+# path, and "to her and dana@example.com" fell to the send-file family and
+# asked "Which file, sir?". What follows the connector must be shaped like
+# a recipient -- "to X", "cc X", a count, an address, or three words at
+# most -- so "send it to her and turn the lights off" is still a command
+# of his own below this rung, exactly as before.
+_SEND_SECOND_RX = re.compile(
+    r"(?:^|[.!?,\s])" + _SEND_TO_PREP + r"\s+" + _SEND_REF + r"(?!['\w])"
+    r"[.!?,\s]+(?:and|then|plus|also|as well as|cc|copy(?:ing)?)\b"
+    r"[.!?,\s]*(?P<rest>\S.*)$", re.I)
+_SEND_SECOND_HEAD_RX = re.compile(
+    r"^(?:to|cc|copy(?:ing)?|one to|a copy to|copies to|\d+|[^\s@]+@)", re.I)
+_SEND_SECOND_TAIL_RX = re.compile(
+    r"(?:[.!?,\s]+(?:please|thanks|thank you|sir|jarvis|now|too|as well))*"
+    r"[.!?,\s]*$", re.I)
+
+
+def _send_second_recipient(t: str) -> bool:
+    m = _SEND_SECOND_RX.search(t)
+    if not m:
+        return False
+    rest = _SEND_SECOND_TAIL_RX.sub("", m.group("rest"), count=1).strip()
+    if not rest:
+        return False
+    return bool(_SEND_SECOND_HEAD_RX.match(rest)) or len(rest.split()) <= 3
+
+
 def _send_near_yes(text) -> bool:
-    """A yes-shaped sentence one of the bars stopped: the one re-ask."""
+    """A yes-shaped sentence one of the bars stopped, or the read-back's
+    own "to her" with a second recipient after it: the one re-ask."""
     t = _send_clean(text)
     if not t or _SEND_NO_RX.match(t):
         return False
-    return bool(_SEND_YES_RX.match(t)) and _send_yes_barred(t)
+    if _SEND_YES_RX.match(t):
+        return _send_yes_barred(t)
+    return _send_second_recipient(t)
 # What comes off before the yes / no grammars run (the third review):
 #   * a leading run of fillers -- "um", "uh", "er", "hmm", "well", "so",
 #     "okay", "right", "sure", "alright", "fine" -- after an optional
