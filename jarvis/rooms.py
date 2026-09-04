@@ -44,9 +44,10 @@ WHAT THE LEASE DOES NOT BUY, said now rather than discovered later:
 
 HOW IT COMPOSES WITH WHAT IS ALREADY THERE, without touching it.
 
-* ``jarvis/roomsensor.py`` is reused unmodified, once for
-  ``/binary_sensor/presence`` and once per governed sensor for
-  ``/binary_sensor/<kind>_powered``.
+* ``jarvis/roomsensor.py`` is reused unmodified, once for the ``Presence``
+  entity and once per governed sensor for ``<Kind> powered`` -- at the
+  entity's NAME, which is the only path ESPHome's web_server serves
+  (``roomsensor.entity_path``; the lower-cased object_id was a 404).
   Its circuit breaker, its 4 KB cap and its None-on-anything-odd rule are
   the containment for a satellite that has been compromised, and reusing it
   means there is one HTTP parser to review rather than two. The ``get``
@@ -90,6 +91,8 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from jarvis.logs import get_logger
+from jarvis.roomfabric import room_entries, room_name
+from jarvis.roomsensor import DEFAULT_TIMEOUT_S, entity_path
 from jarvis.sensing import CAMERA, RADAR, Declined
 
 log = get_logger("rooms")
@@ -110,6 +113,14 @@ OFF = "off"             # the device says it is not, recently
 UNKNOWN = "unknown"     # no fresh answer: unreachable, stale, unparseable
 DISAGREE = "disagree"   # we asked for OFF and the device says it is ON
 ABSENT = "absent"       # no such sensor in that room
+# Present, reachable, and deliberately not leased: the satellite
+# microphone. jarvis/sensing.py stops at the mic on purpose (offline mode
+# is spoken off again, so the mic has to stay live to hear "back online"),
+# and rendering that as UNKNOWN made "Are you watching?" answer "I can't
+# reach the kitchen mic", rolled the whole house up to UNKNOWN and hid the
+# all-confirmed tick for ever. It is its own state so the console can say
+# what is true: the mic is running and nothing here will stop it.
+UNGOVERNED = "ungoverned"
 
 ALLOW = "allow"
 DENY = "deny"
@@ -122,22 +133,66 @@ DEFAULT_LEASE_TTL_S = 90.0
 DEFAULT_CAMERA_TTL_S = 20.0
 DEFAULT_RENEW_S = 25.0          # ~TTL/3.5: two lost packets are survivable
 DEFAULT_STALE_AFTER_S = 90.0    # older than this is UNKNOWN, not the last value
-DEFAULT_TIMEOUT_S = 1.5
+# DEFAULT_TIMEOUT_S is jarvis/roomsensor.py's, imported above: it measured
+# the live radar's round trip (max 1186 ms, 25 polls) and set 3.0 s. The
+# 1.5 s that used to sit here carried the same "~5 ms LAN" claim that
+# measurement retired, and a press is the same trip as a poll.
 REVOKE_TRIES = 3                # then stop asking and let the lease expire
 
-DEFAULT_PRESENCE_PATH = "/binary_sensor/presence"
+# The BUTTON breaker, the POST-side twin of the one RoomSensor already puts
+# on the GETs. Without it an unplugged satellite paid a full timeout per
+# kind per tick on the mesh thread and wrote a WARNING every tick -- 3,456
+# lines a day per room into the log that is meant to be worth reading
+# first. Same numbers as jarvis/roomsensor.py for the same reasons:
+# three failures in a row is a fault rather than a transient, and the
+# cooldown doubles to a ceiling so a satellite that is gone for a week is
+# polled once every five minutes rather than every twenty-five seconds.
+PRESS_FAIL_AFTER = 3
+PRESS_COOLDOWN_S = 30.0
+PRESS_MAX_COOLDOWN_S = 300.0
+
+# THE URLS ARE ENTITY NAMES, not object_ids. ESPHome web_server v2 serves an
+# entity at its NAME, percent-encoded -- measured against the live office
+# radar on 2026-09-03: /binary_sensor/Presence -> 200 and
+# /binary_sensor/presence -> 404 (jarvis/roomsensor.py, module docstring).
+# Every path this file built was the lower-cased object_id form, so every
+# press and every confirmation would have been a 404: the lease would never
+# have landed and the console would have read UNKNOWN for a satellite that
+# was answering. The rule is written ONCE, in roomsensor.entity_path; these
+# are the names scripts/esphome/jarvis-satellite.yaml gives its entities,
+# and tests/test_rooms.py holds the two files to each other.
+#
 # ONE LEASE PER SENSOR KIND, not one per room. The 21:00 curfew closes the
 # lens and deliberately leaves the radar up (jarvis/sensing.py: the radar
 # makes no image, so taking it down at night costs presence for no privacy).
 # A single room-wide lease could not express that -- stopping renewal would
-# take the radar with the camera -- so ``{kind}`` is substituted into each
-# path and each kind counts down on its own.
-DEFAULT_POWERED_PATH = "/binary_sensor/{kind}_powered"
-DEFAULT_RENEW_PATH = "/button/{kind}_lease_renew/press"
-DEFAULT_REVOKE_PATH = "/button/{kind}_lease_revoke/press"
+# take the radar with the camera -- so ``{Kind}`` ("Radar", "Camera") is
+# substituted into each name and each kind counts down on its own.
+DEFAULT_PRESENCE_ENTITY = "Presence"
+DEFAULT_POWERED_ENTITY = "{Kind} powered"
+DEFAULT_RENEW_ENTITY = "{Kind} lease renew"
+DEFAULT_REVOKE_ENTITY = "{Kind} lease revoke"
+
+
+def entity_name(template: str, kind: str = RADAR) -> str:
+    """``"{Kind} powered"`` with ``"radar"`` -> ``"Radar powered"``. Both
+    spellings of the placeholder are accepted so a hand-written override
+    in the config can use either; a template with a brace it cannot fill
+    is returned as written rather than raised on."""
+    text = str(template or "")
+    try:
+        return text.format(kind=kind, Kind=str(kind).capitalize())
+    except (KeyError, IndexError, ValueError):
+        return text
 
 MAX_BYTES = 4096
 USER_AGENT = "jarvis-rooms/1"
+
+
+# ------------------------------------------------------------------ names
+# room_name is jarvis/roomfabric.py's -- the lane that is live today -- and
+# is imported here and in jarvis/roomaudio.py so the three room lanes cannot
+# spell a room two ways. ``rooms.room_name`` re-exports it.
 
 
 # ----------------------------------------------------------------- trust
@@ -252,19 +307,36 @@ class RoomSpec:
     sensors: tuple = (RADAR,)
     username: str = ""
     password: str = ""
-    presence_path: str = DEFAULT_PRESENCE_PATH
-    powered_path: str = DEFAULT_POWERED_PATH
-    renew_path: str = DEFAULT_RENEW_PATH
-    revoke_path: str = DEFAULT_REVOKE_PATH
+    presence_entity: str = DEFAULT_PRESENCE_ENTITY
+    powered_entity: str = DEFAULT_POWERED_ENTITY
+    renew_entity: str = DEFAULT_RENEW_ENTITY
+    revoke_entity: str = DEFAULT_REVOKE_ENTITY
     lease_ttl_s: float = DEFAULT_LEASE_TTL_S
 
     @property
     def configured(self) -> bool:
         return bool(self.name and self.url)
 
+    # The four paths, each through roomsensor.entity_path, so the
+    # name-not-object_id rule has exactly one spelling in the codebase.
+    def presence_path(self) -> str:
+        return entity_path("binary_sensor", self.presence_entity)
+
+    def powered_path(self, kind: str = RADAR) -> str:
+        return entity_path("binary_sensor",
+                           entity_name(self.powered_entity, kind))
+
+    def renew_path(self, kind: str = RADAR) -> str:
+        return entity_path("button",
+                           entity_name(self.renew_entity, kind)) + "/press"
+
+    def revoke_path(self, kind: str = RADAR) -> str:
+        return entity_path("button",
+                           entity_name(self.revoke_entity, kind)) + "/press"
+
 
 def spec_from_dict(data: Any) -> Optional[RoomSpec]:
-    """One ``rooms.satellites[]`` entry -> a RoomSpec, or None.
+    """One ``presence.rooms[]`` entry -> a RoomSpec, or None.
 
     Never raises: a satellite that cannot be understood is dropped with a
     line in the log, exactly as a bad room_sensor_url is next door. A
@@ -273,7 +345,7 @@ def spec_from_dict(data: Any) -> Optional[RoomSpec]:
     """
     if not isinstance(data, dict):
         return None
-    name = str(data.get("name", "") or "").strip()
+    name = room_name(data.get("name", ""))
     url = check_url(data.get("url", ""))
     if not name or not url:
         if name or data.get("url"):
@@ -292,37 +364,50 @@ def spec_from_dict(data: Any) -> Optional[RoomSpec]:
         name=name, url=url, sensors=kinds,
         username=str(data.get("username", "") or ""),
         password=str(data.get("password", "") or ""),
-        presence_path=str(data.get("presence_path") or DEFAULT_PRESENCE_PATH),
-        powered_path=str(data.get("powered_path") or DEFAULT_POWERED_PATH),
-        renew_path=str(data.get("renew_path") or DEFAULT_RENEW_PATH),
-        revoke_path=str(data.get("revoke_path") or DEFAULT_REVOKE_PATH),
+        presence_entity=str(data.get("presence_entity")
+                            or DEFAULT_PRESENCE_ENTITY),
+        powered_entity=str(data.get("powered_entity") or DEFAULT_POWERED_ENTITY),
+        renew_entity=str(data.get("renew_entity") or DEFAULT_RENEW_ENTITY),
+        revoke_entity=str(data.get("revoke_entity") or DEFAULT_REVOKE_ENTITY),
         lease_ttl_s=ttl)
 
 
 def specs_from_config(cfg) -> tuple:
-    """Every enabled satellite from ``rooms.satellites``. Never raises."""
+    """Every LEASED satellite in ``presence.rooms``. Never raises.
+
+    THE ONE LIST. ``presence.rooms`` is the room list the fabric
+    (``jarvis/roomfabric.py``), the speaker router (``jarvis/roomaudio.py``)
+    and this lane all read, every one through ``roomfabric.room_entries``
+    so a name has one spelling. Until 2026-09-04 this lane and the audio
+    lane read a ``rooms.satellites`` list that was declared nowhere, so a
+    config with the documented ``presence.rooms`` got a fabric and no
+    leases, and one with both spelled "Kitchen" two ways (F02).
+
+    An entry is a leased satellite only when it lists ``sensors`` -- that
+    key is the declaration that the box runs jarvis-satellite.yaml and has
+    lease buttons to press. The radars on the wall today run
+    jarvis-room-sensor.yaml, have no buttons, and must never be pressed:
+    a plain entry is the fabric's, not this lane's.
+    ``presence.room_sensor_enabled`` is the master switch over every room
+    lane -- with it off nobody reads a radar, so a leased one would be a
+    powered sensor nobody is listening to.
+    """
     get = getattr(cfg, "get", None)
     if not callable(get):
         return ()
     try:
-        if not bool(get("rooms.enabled", False)):
+        if not bool(get("presence.room_sensor_enabled", False)):
             return ()
-        raw = get("rooms.satellites", []) or []
     except Exception:  # noqa: BLE001 - a broken config must not open a lens
         log.exception("rooms: config unreadable; no satellites")
         return ()
     out = []
-    seen = set()
-    for entry in raw if isinstance(raw, (list, tuple)) else ():
+    for entry in room_entries(cfg):
+        if not entry.get("sensors"):
+            continue                     # a plain room sensor: the fabric's
         spec = spec_from_dict(entry)
-        if spec is None:
-            continue
-        if spec.name in seen:
-            log.warning("rooms: two satellites are called %r; the second is "
-                        "dropped", spec.name)
-            continue
-        seen.add(spec.name)
-        out.append(spec)
+        if spec is not None:
+            out.append(spec)
     return tuple(out)
 
 
@@ -340,6 +425,12 @@ class SensorView:
     lease_left_s: Optional[float] = None
     unexpected: bool = False            # asked to sense, reports off
     detail: str = ""
+    # Time since the REVOKE, which is not time since the last confirmation:
+    # every mesh tick refreshes ``age_s``, so a satellite that had been
+    # refusing to stop for an hour read "asked to stop 0 s ago" for ever.
+    # The one red state on the console must not understate the breach by a
+    # tick cadence.
+    revoked_age_s: Optional[float] = None
 
     @property
     def confirmed(self) -> bool:
@@ -370,6 +461,11 @@ TONES = {LIVE: ("LIVE", "cyan", True),
          OFF: ("OFF", "warn", True),
          UNKNOWN: ("UNKNOWN", "muted", False),
          DISAGREE: ("STILL ON", "error", True),
+         # FILLED, unlike UNKNOWN: this is a fact the console knows, not a
+         # gap in what it knows. Muted rather than cyan because nothing is
+         # wrong -- the mic is supposed to be live -- but the word says so
+         # in text, which is the axis that survives a dimmed room.
+         UNGOVERNED: ("NOT GOVERNED", "muted", True),
          ABSENT: ("", "muted", False)}
 
 
@@ -403,9 +499,17 @@ def caption(view: SensorView) -> str:
     inference rather than dressed up as a reading."""
     if view.state == ABSENT:
         return "no %s in the %s" % (view.kind, view.room)
+    if view.state == UNGOVERNED:
+        return ("not governed by offline mode; it stays live so "
+                "\"back online\" can be heard")
     if view.state == DISAGREE:
+        # Since the REVOKE, not since the last confirmation: a tick
+        # refreshes the confirmation every renew_s, and reading the breach
+        # from that number rounded an hour of refusal down to "0 s ago".
+        since = view.revoked_age_s if view.revoked_age_s is not None \
+            else view.age_s
         return ("asked to stop %s ago and still reporting on"
-                % _mins(view.age_s).replace(" ago", ""))
+                % _mins(since).replace(" ago", ""))
     if view.state == UNKNOWN:
         head = "unreachable; last heard %s" % _mins(view.age_s)
         if view.lease_left_s is not None and view.lease_left_s <= 0:
@@ -432,11 +536,13 @@ class PrivacyView:
     def worst(self) -> str:
         """The single state a one-chip roll-up may show.
 
-        DISAGREE beats UNKNOWN beats LIVE beats OFF. Note that LIVE beats
-        OFF and not the other way round: a roll-up that showed OFF while
-        one room was still sensing would be the lie again, one level up.
+        DISAGREE beats UNKNOWN beats LIVE beats UNGOVERNED beats OFF. Note
+        that LIVE beats OFF and not the other way round: a roll-up that
+        showed OFF while one room was still sensing would be the lie again,
+        one level up -- and UNGOVERNED sits above OFF for the same reason,
+        because a live microphone nothing here can stop is not "off".
         """
-        for state in (DISAGREE, UNKNOWN, LIVE, OFF):
+        for state in (DISAGREE, UNKNOWN, LIVE, UNGOVERNED, OFF):
             if any(r.state == state for r in self.rows):
                 return state
         return OFF
@@ -495,6 +601,7 @@ def spoken_status(view: PrivacyView) -> str:
     bad = view.by_state(DISAGREE)
     unknown = view.by_state(UNKNOWN)
     live = view.by_state(LIVE)
+    ungoverned = view.by_state(UNGOVERNED)
     off = view.by_state(OFF)
     if bad:
         parts.append("%s %s still reporting on after I asked %s to stop."
@@ -513,6 +620,13 @@ def spoken_status(view: PrivacyView) -> str:
         parts.append("%s %s sensing."
                      % (_phrase(live)[0].upper() + _phrase(live)[1:],
                         "are" if len(live) > 1 else "is"))
+    if ungoverned:
+        # Said out loud rather than left to be inferred: "offline mode left
+        # the kitchen microphone live" is the sentence this row exists for,
+        # and it is emphatically not "I can't reach the kitchen mic".
+        parts.append("%s %s not governed by offline mode."
+                     % (_phrase(ungoverned)[0].upper() + _phrase(ungoverned)[1:],
+                        "are" if len(ungoverned) > 1 else "is"))
     if off and not (bad or unknown):
         parts.append("%s %s off."
                      % (_phrase(off)[0].upper() + _phrase(off)[1:],
@@ -535,6 +649,10 @@ class _Lease:
     powered: Optional[bool] = None   # what the device last said
     confirmed_at: Optional[float] = None
     revoke_tries: int = 0
+    # When this kind was last ASKED to stop, cleared by a renewal. The
+    # STILL ON caption ages from here and not from confirmed_at, which a
+    # mesh tick refreshes every renew_s.
+    revoked_at: Optional[float] = None
 
 
 class Satellite:
@@ -561,13 +679,21 @@ class Satellite:
         self._get = get or default_get
         self._post = post or default_post
         self._lock = threading.RLock()
+        # The POST-side circuit breaker (see _press). Per SATELLITE rather
+        # than per kind: it is the network to that box that is down, not
+        # one button on it.
+        self._press_fails = 0
+        self._press_skip_until = 0.0
+        self._press_down = False        # has the breaker's warning been logged?
+        self._press_cooldown = PRESS_COOLDOWN_S
+        self.presses = 0                # requests actually sent (the proof)
         # NOT given the policy: SensingPolicy.attach replaces by NAME, so
         # every satellite attaching as "radar" would leave one stoppable and
         # the rest silently un-stoppable. The gate is applied in read()
         # instead, and the attach below is room-qualified -- which is also
         # exactly what the spoken confirmation needs to name.
         self.presence = roomsensor.RoomSensor(
-            spec.url + spec.presence_path, timeout_s=self.timeout_s,
+            spec.url + spec.presence_path(), timeout_s=self.timeout_s,
             get=self._get, now=now)
         self.leases: dict = {}
         self.powered: dict = {}
@@ -576,7 +702,7 @@ class Satellite:
                 continue                 # not governed; see the module head
             self.leases[kind] = _Lease(kind)
             self.powered[kind] = roomsensor.RoomSensor(
-                spec.url + spec.powered_path.format(kind=kind),
+                spec.url + spec.powered_path(kind),
                 timeout_s=self.timeout_s, get=self._get, now=now)
         attach = getattr(policy, "attach", None)
         if callable(attach):
@@ -609,13 +735,64 @@ class Satellite:
         return tuple(self.leases)
 
     # ------------------------------------------------------------ lease
+    @property
+    def press_paused(self) -> bool:
+        """True while a press will not touch the network. The POST twin of
+        ``RoomSensor.paused``, and the reason an unplugged kitchen no
+        longer costs a timeout per kind per tick on the mesh thread."""
+        return self._press_skip_until > self._now()
+
     def _press(self, path: str) -> bool:
+        """POST one button. False for every failure, including a press the
+        breaker refused to send -- a lease that was not renewed is not
+        extended, which is exactly what the device is doing.
+
+        The breaker is a LATENCY guarantee as much as a log one: without
+        it, three unreachable two-sensor satellites cost the mesh thread
+        six timeouts (9 s at the shipped 1.5 s) on every pass.
+        """
+        if self.press_paused:
+            return False
         try:
+            self.presses += 1
             self._post(self.spec.url + path, self.timeout_s)
         except Exception:  # noqa: BLE001 - every transport failure is a NO
-            log.debug("rooms: %s%s failed", self.spec.name, path, exc_info=True)
+            self._press_failed(path)
             return False
+        self._press_ok()
         return True
+
+    # ---------------------------------------------------- press breaker
+    def _press_failed(self, path: str) -> None:
+        self._press_fails += 1
+        if self._press_fails < PRESS_FAIL_AFTER:
+            log.debug("rooms: %s%s failed", self.spec.name, path,
+                      exc_info=True)
+            return
+        self._press_skip_until = self._now() + self._press_cooldown
+        if not self._press_down:
+            # The ONE line an unplugged satellite is allowed. It says what
+            # happens next, because the honest answer is not "a feature is
+            # lost" -- it is "that room's sensors power themselves down".
+            log.warning("rooms: %s is not taking button presses (%s); its "
+                        "lease is no longer being renewed, so its sensors "
+                        "power down within %.0fs. Retrying in %.0fs",
+                        self.spec.name, self.spec.url, self.spec.lease_ttl_s,
+                        self._press_cooldown)
+            self._press_down = True
+        else:
+            log.debug("rooms: %s%s failed again; retrying in %.0fs",
+                      self.spec.name, path, self._press_cooldown)
+        self._press_cooldown = min(self._press_cooldown * 2.0,
+                                   PRESS_MAX_COOLDOWN_S)
+
+    def _press_ok(self) -> None:
+        if self._press_down:
+            log.info("rooms: %s is back; its leases are being renewed again",
+                     self.spec.name)
+        self._press_fails, self._press_skip_until = 0, 0.0
+        self._press_down = False
+        self._press_cooldown = PRESS_COOLDOWN_S
 
     def renew(self, kind: str = RADAR) -> bool:
         """Push one sensor's lease out by a TTL. False when it did not land
@@ -635,15 +812,19 @@ class Satellite:
             log.info("rooms: %s %s stays off; the house policy does not "
                      "allow it now", self.spec.name, kind)
             return Declined()
-        ok = self._press(self.spec.renew_path.format(kind=kind))
+        ok = self._press(self.spec.renew_path(kind))
         with self._lock:
             lease.intent = ALLOW
             lease.revoke_tries = 0
+            lease.revoked_at = None
             if ok:
                 lease.until = self._now() + self.spec.lease_ttl_s
         if not ok:
-            log.warning("rooms: %s %s did not take the lease renewal",
-                        self.spec.name, kind)
+            # DEBUG, not WARNING. This runs every renew_s for as long as
+            # the satellite is unplugged; the loud line belongs to the
+            # breaker in _press, which fires once per outage.
+            log.debug("rooms: %s %s did not take the lease renewal",
+                      self.spec.name, kind)
         return ok
 
     def revoke(self, kind: str = RADAR) -> bool:
@@ -657,15 +838,27 @@ class Satellite:
         lease = self.leases.get(kind)
         if lease is None:
             return True
-        ok = self._press(self.spec.revoke_path.format(kind=kind))
+        ok = self._press(self.spec.revoke_path(kind))
         with self._lock:
+            first = lease.intent != DENY or lease.revoked_at is None
             lease.intent = DENY
             lease.revoke_tries = 0 if ok else lease.revoke_tries + 1
+            if first:
+                # The moment he was told it would stop. Retries do not move
+                # it, so "asked to stop 12 min ago" stays true.
+                lease.revoked_at = self._now()
             if ok:
                 lease.until = self._now()
         if not ok:
-            log.warning("rooms: %s %s refused the revoke (try %d)",
-                        self.spec.name, kind, lease.revoke_tries)
+            # Bounded already -- RoomMesh._tick_one stops asking after
+            # REVOKE_TRIES -- and this is the privacy-critical half, so the
+            # first refusal keeps its warning and the retries do not.
+            if first:
+                log.warning("rooms: %s %s refused the revoke; it may still "
+                            "be running", self.spec.name, kind)
+            else:
+                log.debug("rooms: %s %s refused the revoke (try %d)",
+                          self.spec.name, kind, lease.revoke_tries)
         return ok
 
     # SensingPolicy.attach hooks are bound per kind in __init__, so
@@ -710,8 +903,12 @@ class Satellite:
             if kind == MIC:
                 # Not leased, not governed, and honest about it: offline
                 # mode leaves microphones alone by design, and a row that
-                # quietly showed OFF would be the lie one room over.
-                return SensorView(self.spec.name, kind, UNKNOWN,
+                # quietly showed OFF would be the lie one room over. It is
+                # UNGOVERNED and not UNKNOWN -- the mic is reachable, the
+                # fact is known, and calling it unreachable made "Are you
+                # watching?" answer "I can't reach the kitchen mic" and hid
+                # the all-confirmed tick for ever.
+                return SensorView(self.spec.name, kind, UNGOVERNED,
                                   detail="the microphone is not governed by "
                                          "offline mode")
             lease = self.leases[kind]
@@ -719,12 +916,15 @@ class Satellite:
             age = None if lease.confirmed_at is None \
                 else now - lease.confirmed_at
             left = None if lease.until is None else lease.until - now
+            since_revoke = None if lease.revoked_at is None \
+                else now - lease.revoked_at
             state = derive_state(lease.intent, lease.powered, age,
                                  stale_after_s)
             return SensorView(self.spec.name, kind, state,
                               intent=lease.intent, age_s=age, lease_left_s=left,
                               unexpected=(state == OFF
-                                          and lease.intent == ALLOW))
+                                          and lease.intent == ALLOW),
+                              revoked_age_s=since_revoke)
 
     # ------------------------------------------------------------- read
     def read(self) -> Optional[bool]:
@@ -748,9 +948,12 @@ class Satellite:
             return {"room": self.spec.name, "url": self.spec.url,
                     "sensors": list(self.spec.sensors),
                     "presence_reads": self.presence.reads,
+                    "presses": self.presses,
+                    "press_paused": self.press_paused,
                     "leases": {k: {"intent": v.intent, "until": v.until,
                                    "powered": v.powered,
                                    "confirmed_at": v.confirmed_at,
+                                   "revoked_at": v.revoked_at,
                                    "reads": self.powered[k].reads}
                                for k, v in self.leases.items()}}
 
