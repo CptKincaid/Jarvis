@@ -4041,13 +4041,38 @@ The matching is exact, on purpose. What you said has to equal a row's full
 name, first name, surname, honorific + name or an alias — "Heathr" is
 nobody, and two Heathers get "Which Heather, sir — Heather Smith or
 Heather Jones?" (answer with the full name, the surname, "Dr Smith" or
-"the second one"). A book recipient is read back by name — "to Dr Heather
-Smith" — and the address is *shown* in the transcript, never spoken.
-Addresses are checked on entry (one @, a dot in the domain, no spaces), a
-row that fails is flagged "bad address, not used" rather than mailed to,
-and the file is written 0600. `show NAME` prints exactly what the send
-lane would do with a name, so you can test one over ssh with no
-microphone.
+"the second one" — an ordinal only counts when the list was short enough
+to be read out, four at most; with five or more it asks for the full name
+and "the first one" is asked again). A book recipient is read back by name
+— "to Dr Heather Smith" — and the address is *shown* in the transcript,
+never spoken. `show NAME` prints exactly what the send lane would do with
+a name, so you can test one over ssh with no microphone.
+
+Three rules keep the file honest, and each is worth knowing:
+
+* **Addresses are checked for shape only.** One @; a local part with no
+  leading, trailing or doubled dot; domain labels of 1–63 letters, digits
+  or hyphens that do not start or end with a hyphen; a last label of two
+  or more letters; 254 characters at most. `x@-.-`, `a@b.c`, `h@1.2`,
+  `h@example.com-` and `heather..x@example.com` are refused. What the
+  check *cannot* do is know that **`heather@gmail.con` is wrong — it is
+  well-formed, and no rule can catch it. The read-back before a send is
+  the last check**, which is why it always names the person. A row that
+  fails on load is flagged "not used" rather than mailed to.
+* **A file that cannot be read is never written over.** A trailing comma
+  from a hand edit, the wrong `format`, a permission: Jarvis keeps the
+  last good rows *for resolving only*, and every `add`/`remove` — CLI and
+  page — refuses with `REFUSED: contacts.json is not valid JSON (<path>)
+  — fix it by hand first` and writes nothing. In a fresh process the last
+  good book is empty, and writing that back would have been the loss.
+* **A one-word name has to be unique.** "Heather" beside "Heather Jones",
+  or "Smith" beside "Sam Smith", is refused on `add`; if you hand-edit
+  both in, both rows are kept and flagged, and "Heather" becomes a
+  question ("Which Heather, sir — Heather or Heather Jones?") rather than
+  a pick — answer with the two-word name or "the first one". A one-word
+  row that clashes with nobody ("Mum") reads back fine.
+
+The file is written 0600.
 
 ### Things it deliberately will not do
 

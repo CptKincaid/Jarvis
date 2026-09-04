@@ -5600,7 +5600,8 @@ class SendAsk:
     # "Which Heather, sir — Heather Smith or Heather Jones?": the address
     # book's rivals, FULL names in file order. The answer rung
     # (_person_from_answer) accepts an exact full name, a surname unique
-    # among these, honorific + name, or an ordinal -- never a score.
+    # among these, honorific + name, or an ordinal when the list was
+    # short enough to be read out (<= contacts.WHICH_MAX) -- never a score.
     candidates: list = field(default_factory=list)
 
     def stale(self, now: Optional[float] = None) -> bool:
@@ -5737,6 +5738,12 @@ def _person_from_answer(text, candidates) -> Optional[str]:
         return None
     m = _PICK_ORDINAL_RX.match(said)
     if m:
+        # An ordinal indexes the list AS IT WAS READ OUT. Past WHICH_MAX
+        # the question read no list ("the full name, please"), so "the
+        # first one" has nothing to point at: a miss, re-asked, never
+        # file order.
+        if len(names) > contacts_mod.WHICH_MAX:
+            return None
         word = m.group("n").lower()
         if word in ("last", "latest", "newest"):
             return names[-1]

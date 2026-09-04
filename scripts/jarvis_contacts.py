@@ -22,8 +22,13 @@ for the book.
 
 No `set`: correct a row by editing the file, or remove + add. No import
 from send_file.contacts: it has no entries. Refusals print "REFUSED: <why>"
-and exit 2; a file that cannot be written exits 1. Addresses are printed in
-full here because this is his own terminal.
+and exit 2; a file that cannot be written exits 1. A file that cannot be
+READ (a trailing comma from a hand edit, say) refuses every add/remove with
+"REFUSED: contacts.json is not valid JSON (<path>) — fix it by hand first"
+and writes nothing -- the last good rows are never written back over it.
+Addresses are checked for shape only; "gmail.con" is well-formed and the
+read-back is the last check. Addresses are printed in full here because
+this is his own terminal.
 """
 from __future__ import annotations
 
@@ -71,6 +76,11 @@ def do_list(book: book_mod.Book, as_json: bool) -> int:
         say(_row_line(c))
     for s in book.skipped:
         say(f"BAD (not used): row {s.index + 1} {s.name or '(no name)'}: {s.why}")
+    for f in book.flagged:
+        say(f"AMBIGUOUS (kept): row {f.index + 1} {f.name}: {f.why}")
+    if book.broken:
+        say(f"REFUSED: {book.broken} (this is the last good book; nothing "
+            "can be added or removed until it reads)")
     n = len(book.contacts)
     say(f"{n} {'person' if n == 1 else 'people'} in "
         f"{book_mod.display_path(book.path)}")
@@ -153,9 +163,16 @@ def main(argv=None) -> int:
     ls.add_argument("--json", action="store_true")
     sh = sub.add_parser("show", help="what the send lane would do with a name")
     sh.add_argument("name")
-    ad = sub.add_parser("add")
+    ad = sub.add_parser(
+        "add", help="one person; refused if the name or address is off",
+        epilog=("The address is checked for SHAPE only -- one @, no spaces, no "
+                "dot at either end of the name or doubled, domain labels of "
+                "letters/digits/hyphens ending in letters. heather@gmail.con "
+                "is well-formed and CANNOT be caught here: the read-back before "
+                "a send is the last check. A one-word name (\"Mum\") must not be "
+                "another row's first name or surname."))
     ad.add_argument("name", help='"Heather Smith"')
-    ad.add_argument("email")
+    ad.add_argument("email", help="name@example.com shape; see below")
     ad.add_argument("--honorific", default="", help="Dr, Prof, Mr ...")
     ad.add_argument("--alias", action="append", default=[],
                     help='another spoken name: --alias "my advisor"')

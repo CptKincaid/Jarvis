@@ -1224,3 +1224,34 @@ def test_the_phone_page_links_to_the_book(server):
     page = body.decode("utf-8")
     assert 'href="/contacts"' in page and "Address book" in page
     assert "/contacts" not in wa.MANIFEST, "no manifest entry, no home-screen icon"
+
+
+def test_a_broken_file_is_a_409_and_the_bytes_are_untouched(server, book):
+    """The reviewed loss: a fresh process + a trailing comma + Add wrote the
+    new row over his two. Now the page refuses and writes nothing."""
+    text = ('{\n  "format": 1,\n  "contacts": [\n'
+            '    {"name": "Heather Smith", "email": "heather@example.com"},\n'
+            '    {"name": "Heather Jones", "email": "hjones@example.com"},\n'
+            '  ]\n}\n')
+    book.parent.mkdir(parents=True, exist_ok=True)
+    book.write_text(text, encoding="utf-8")
+    status, out = contacts_post(server.srv, {"op": "add", "name": "Dana Ruiz",
+                                             "email": "dana@example.com"})
+    assert status == 409, out
+    assert out["error"].startswith("REFUSED: contacts.json is not valid JSON")
+    assert out["error"].endswith("fix it by hand first")
+    assert book.read_text(encoding="utf-8") == text
+    status, out = contacts_post(server.srv, {"op": "remove", "name": "Heather Smith",
+                                             "email": "heather@example.com"})
+    assert status == 409 and book.read_text(encoding="utf-8") == text
+    # the GET still answers (the last good book, empty here) and says why
+    status, out = call(server.srv, "GET", "/api/contacts", token=server.srv.token)
+    assert status == 200 and out["broken"].startswith("contacts.json is not valid JSON")
+
+
+def test_the_page_refuses_the_reviewers_bad_addresses(server, book):
+    for bad in ("x@-.-", "a@b.c", "h@1.2", "h@example.com-", "heather..x@example.com"):
+        status, out = contacts_post(server.srv, {"op": "add", "name": "Dana Ruiz",
+                                                 "email": bad})
+        assert status == 400 and "bad address" in out["error"], bad
+    assert not book.exists()

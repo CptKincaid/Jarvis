@@ -917,6 +917,11 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(500, "the address book could not be written")
             return
         if contact is None:
+            if book.broken:
+                # The file on disk cannot be read: nothing is written,
+                # and the last good rows are never written back over it.
+                self._error(409, "REFUSED: " + why)
+                return
             self._error(400, why)
             return
         log.info("contacts page: %s %s", op, contact.name)
@@ -2344,16 +2349,32 @@ never spoken.</p>
       li.className = "bad";
       var who = text("div", "who", "");
       var name = text("div", "name", "row " + (s.index + 1) + (s.name ? ": " + s.name : ""));
-      name.appendChild(text("span", "badge", "bad address, not used"));
+      name.appendChild(text("span", "badge", "not used"));
       who.appendChild(name);
       who.appendChild(text("div", "meta", s.why + " \u2014 fix it in the file"));
+      li.appendChild(who);
+      list.appendChild(li);
+    });
+    (out.flagged || []).forEach(function (f) {
+      /* A one-word name that is also someone's first name or surname:
+         both rows are kept and used, but the name is a QUESTION now. */
+      var li = document.createElement("li");
+      li.className = "bad";
+      var who = text("div", "who", "");
+      var name = text("div", "name", "row " + (f.index + 1) + ": " + f.name);
+      name.appendChild(text("span", "badge", "ambiguous, kept"));
+      who.appendChild(name);
+      who.appendChild(text("div", "meta", f.why));
       li.appendChild(who);
       list.appendChild(li);
     });
     if (!rows.length && !(out.skipped || []).length) {
       list.appendChild(text("li", "", "Nobody yet. Add someone below, or edit the file."));
     }
-    pathEl.textContent = out.path ? "The book is " + out.path + " \u2014 plain JSON, edit it by hand if you like; Jarvis re-reads it on the next send." : "";
+    if (out.broken) {
+      say("REFUSED: " + out.broken + " \u2014 this list is the last good book; nothing can be added or removed until the file reads.", "bad");
+    }
+    pathEl.textContent = out.path ? "The book is " + out.path + " \u2014 plain JSON, edit it by hand if you like; Jarvis re-reads it on the next send. Addresses are checked for shape only: gmail.con is well-formed, and the read-back is the last check." : "";
   }
 
   function load() {

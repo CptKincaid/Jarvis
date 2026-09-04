@@ -22,9 +22,21 @@ is shaped by that one fact:
   resolves to nobody; two Heathers resolve to a QUESTION, never to the
   first one. An exact full name wins outright even when another row shares
   the first name.
-* addresses are validated on ENTRY (one @, a dot in the domain, no spaces,
-  a full match rather than a search), and a row that fails on load is
-  skipped for resolution and flagged, so a typo cannot sit there waiting.
+* addresses are checked on ENTRY for SHAPE: one @; a local part with no
+  leading, trailing or doubled dot; domain labels of 1-63 letters, digits
+  or hyphens that do not start or end with a hyphen; a last label of two
+  or more letters; at most 254 characters; a full match, never a search.
+  A row that fails on load is skipped for resolution and flagged. What
+  the check cannot do is know that "gmail.con" is wrong: it is
+  well-formed, and the READ-BACK is the last check for that.
+* a file that cannot be read -- a trailing comma from a hand edit, the
+  wrong format, a permission -- is never written over: the last good rows
+  stay for RESOLVING, and every add/remove refuses until it is fixed by
+  hand. Writing the last good rows back would be writing his edit away.
+* a one-word name ("Heather", "Mum") that is also another row's first
+  name, surname or honorific + surname is refused on add, and on load
+  both rows are kept and flagged: the name resolves as a QUESTION, never
+  a pick.
 * the file is his: 0600, directory 0700, written atomically, unknown keys
   kept on rewrite so a hand edit is never thrown away, and re-read by
   stamp on every resolve so an edit is live on the next send with no
@@ -74,9 +86,21 @@ NOTE_MAX = 200
 WHICH_MAX = 4
 
 # A FULL match, not a search: parse_address in outbox searches inside
-# text and would accept "heather@example.com junk" as an address. One @,
-# at least one dot in the domain, nothing but address characters.
-EMAIL_RX = re.compile(r"[A-Za-z0-9._%+\-]+@[A-Za-z0-9\-]+(?:\.[A-Za-z0-9\-]+)+")
+# text and would accept "heather@example.com junk" as an address. Local
+# part: address characters with no leading, trailing or doubled dot.
+# Domain: labels of 1-63 letters/digits/hyphens, no hyphen at either end,
+# at least two of them, the last one letters only and 2+ long. "a@b.c",
+# "h@1.2", "x@-.-", "h@example.com-" all fail; "heather@gmail.con" passes,
+# because it IS an address -- only the read-back can catch that one.
+_LOCAL = r"[A-Za-z0-9_%+\-]+(?:\.[A-Za-z0-9_%+\-]+)*"
+_LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9\-]{0,61}[A-Za-z0-9])?"
+EMAIL_RX = re.compile(rf"{_LOCAL}@(?:{_LABEL}\.)+[A-Za-z]{{2,}}")
+BAD_ADDRESS = ("bad address: name@example.com shape -- one @, no spaces, no "
+               "dot at either end of the name or doubled, a domain of "
+               "letters/digits/hyphens ending in letters")
+# What a write path says while the file cannot be read. The CLI prefixes
+# "REFUSED: "; the page sends it whole as a 409.
+UNREADABLE_LINE = "contacts.json {what} ({path}) — fix it by hand first"
 _LEAD_RX = re.compile(r"^(?:my|our|the)\s+")
 _TAIL_PUNCT = ".,;:?!"
 _NUMBER_WORDS = ("no", "one", "two", "three", "four", "five", "six",
@@ -236,8 +260,7 @@ def validate_row(raw) -> tuple[Optional[Contact], str]:
     if not email:
         return None, "email is missing"
     if not EMAIL_RX.fullmatch(email):
-        return None, ("bad address: one @, a dot in the domain, no spaces "
-                      "-- name@example.com")
+        return None, BAD_ADDRESS
     honorific, why = _clean_text(raw.get("honorific"), HONORIFIC_MAX)
     if why:
         return None, f"honorific: {why}"
@@ -275,14 +298,9 @@ def validate_row(raw) -> tuple[Optional[Contact], str]:
                    aliases=aliases, note=note, extra=extra), ""
 
 
-def check_unique(existing, new: Contact) -> str:
-    """Why ``new`` may not join ``existing``, or "".
-
-    No two rows with one full name (the "which" question could not be
-    answered); no two rows with one address (it is one person twice); and
-    an alias may not equal any other row's name, first name, surname or
-    alias -- it would make a plain first name ambiguous with a nickname.
-    """
+def _duplicate(existing, new: Contact) -> str:
+    """The SKIP class: a second row that is the same person, or an alias
+    that is someone else's name. On load the later row is dropped."""
     new_full = new.full
     new_email = new.email.lower()
     new_aliases = new.alias_keys()
@@ -302,6 +320,57 @@ def check_unique(existing, new: Contact) -> str:
         if clash:
             return (f"{sorted(clash)[0]!r} is already an alias of "
                     f"{other.name}")
+    return ""
+
+
+def _how_known(contact: Contact, key: str) -> str:
+    """"first name" / "surname" / "Dr + surname" -- how ``key`` is one of
+    ``contact``'s own name keys."""
+    if key == contact.first and key != contact.surname:
+        return "first name"
+    if key == contact.surname:
+        return "surname"
+    hon = normalise(contact.honorific)
+    if hon and key == f"{hon} {contact.surname}":
+        return f"{contact.honorific} + surname"
+    return "name"
+
+
+def name_collision(a: Contact, b: Contact) -> str:
+    """Why ``a``'s FULL name is also one of ``b``'s name keys (or the other
+    way round), or "". "Heather" beside "Heather Jones": a plain "Heather"
+    would draft to the one-word row outright, read back "to Heather" --
+    which is what he said -- and never ask. So it is a QUESTION on load
+    and a refusal on add. Two multi-word names sharing a first name or a
+    surname are not this: "Heather Smith" and "Heather Jones" already ask.
+    """
+    if a.full in b.name_keys():
+        return f"{a.name!r} is also {b.name}'s {_how_known(b, a.full)}"
+    if b.full in a.name_keys():
+        return f"{b.name!r} is also {a.name}'s {_how_known(a, b.full)}"
+    return ""
+
+
+def check_unique(existing, new: Contact) -> str:
+    """Why ``new`` may not join ``existing``, or "".
+
+    No two rows with one full name (the "which" question could not be
+    answered); no two rows with one address (it is one person twice); an
+    alias may not equal any other row's name, first name, surname or
+    alias -- it would make a plain first name ambiguous with a nickname;
+    and a row's whole name may not be another row's first name, surname
+    or honorific + surname ("Heather" beside "Heather Jones", "Dr Smith"
+    beside Dr Heather Smith) -- a one-word name has to be unique.
+    """
+    why = _duplicate(existing, new)
+    if why:
+        return why
+    for other in existing:
+        if other is new:
+            continue
+        why = name_collision(new, other)
+        if why:
+            return why + " — a one-word name has to be unique in the book"
     return ""
 
 
@@ -397,9 +466,11 @@ def _write_private(path: Path, text: str) -> None:
 
 
 def _stamp(path: Path):
+    """(mtime_ns, size, ctime_ns). ctime is in it so a chmod -- which moves
+    neither mtime nor size -- still counts as the file having changed."""
     try:
         st = path.stat()
-        return (st.st_mtime_ns, st.st_size)
+        return (st.st_mtime_ns, st.st_size, st.st_ctime_ns)
     except OSError:
         return None
 
@@ -408,7 +479,7 @@ class Book:
     """The book as last read, and the stamp it was read at.
 
     ``current()`` is the door: it re-stats the file every time and re-reads
-    when the (mtime_ns, size) stamp has moved -- one stat per send, per
+    when the (mtime_ns, size, ctime_ns) stamp has moved -- one stat per send, per
     question answer, per correction. An edit by hand, by the CLI or by the
     page is live on the next resolve with no restart, and AssistantConfig
     stays load-once.
@@ -418,8 +489,13 @@ class Book:
         self.path = Path(path) if path is not None else book_path()
         self.rows: list = []             # raw rows, file order, bad ones too
         self.contacts: list = []         # the validated ones
-        self.skipped: list = []
+        self.skipped: list = []          # bad rows: not used, kept in the file
+        self.flagged: list = []          # collisions: used, but as a question
         self.extra: dict = {}            # unknown top-level keys, kept
+        # Why the file on disk cannot be read right now, or "". While it is
+        # set the rows above are the LAST GOOD book, for resolving only:
+        # add/remove refuse rather than write them back over his edit.
+        self.broken: str = ""
         self.stamp = None
         self._warned_stamp = None
         self._loaded = False
@@ -449,12 +525,20 @@ class Book:
                 if not isinstance(rows, list):
                     raise ValueError("contacts is not a list")
             except (OSError, ValueError) as exc:
-                # Keep the last good book; say so once per stamp, and say
-                # only the PATH -- never a row.
+                # Keep the last good book FOR RESOLVING; say so once per
+                # stamp, and say only the PATH -- never a row. Every write
+                # path reads ``broken`` and refuses until he has fixed it.
+                if isinstance(exc, json.JSONDecodeError):
+                    what = "is not valid JSON"
+                elif isinstance(exc, OSError):
+                    what = "could not be read"
+                else:
+                    what = f"is not a format-{FORMAT} address book"
+                self.broken = UNREADABLE_LINE.format(what=what, path=self.path)
                 if stamp != self._warned_stamp:
                     log.warning("contacts: %s could not be read (%s); keeping "
-                                "the last good book", self.path,
-                                exc.__class__.__name__)
+                                "the last good book for resolving, refusing "
+                                "writes", self.path, exc.__class__.__name__)
                     self._warned_stamp = stamp
                 self._loaded = True
                 return self
@@ -464,11 +548,11 @@ class Book:
             return self
 
     def _install(self, rows: list, extra: dict, stamp) -> None:
-        contacts, skipped = [], []
+        contacts, skipped, flagged = [], [], []
         for i, row in enumerate(rows):
             contact, why = validate_row(row)
             if contact is not None:
-                why = check_unique(contacts, contact)
+                why = _duplicate(contacts, contact)
             if contact is None or why:
                 shown = ""
                 if isinstance(row, dict):
@@ -477,10 +561,24 @@ class Book:
                 continue
             contact.index = i
             contacts.append(contact)
+        # A one-word name that is also someone's first name or surname:
+        # BOTH rows stay (they are his, and each is a real person) and
+        # both are flagged, because the name now resolves as a question.
+        for a in contacts:
+            for b in contacts:
+                if a.index >= b.index:
+                    continue
+                why = name_collision(a, b)
+                if why:
+                    tail = " — resolves as a question, never a pick; make it unique"
+                    flagged.append(Skipped(index=a.index, name=a.name, why=why + tail))
+                    flagged.append(Skipped(index=b.index, name=b.name, why=why + tail))
         self.rows = list(rows)
         self.contacts = contacts
         self.skipped = skipped
+        self.flagged = flagged
         self.extra = extra
+        self.broken = ""
         self.stamp = stamp
         self._loaded = True
         if skipped:
@@ -489,6 +587,10 @@ class Book:
                         self.path, "; ".join(
                             f"#{s.index + 1} {s.name or '(no name)'}: {s.why}"
                             for s in skipped))
+        if flagged:
+            log.warning("contacts: %d row(s) in %s collide: %s", len(flagged),
+                        self.path, "; ".join(
+                            f"#{f.index + 1} {f.name}: {f.why}" for f in flagged))
 
     # ------------------------------------------------------------- reads
     def resolve(self, said) -> Resolution:
@@ -498,10 +600,17 @@ class Book:
         if not key:
             return Resolution()
         # An exact FULL name (or honorific + full name) wins outright even
-        # when another row shares the first name: he said all of it.
+        # when another row shares the first name: he said all of it --
+        # UNLESS the whole name is also another row's first name or
+        # surname (a flagged collision, "Heather" beside "Heather Jones").
+        # Then it is the ambiguity itself, and a question.
         for c in self.contacts:
             hon = normalise(c.honorific)
             if key == c.full or (hon and key == f"{hon} {c.full}"):
+                rivals = [o for o in self.contacts if o is not c and key in o.keys()]
+                if rivals:
+                    names = [o.name for o in self.contacts if o is c or o in rivals]
+                    return Resolution(candidates=names, from_book=True)
                 return Resolution(addr=c.email, name=c.name, from_book=True,
                                   honorific=c.honorific, matched_on="full name")
         hits = [c for c in self.contacts if key in c.keys()]
@@ -539,19 +648,19 @@ class Book:
             return None
         wanted = [normalise(c) for c in (candidates or ())]
         rows = [c for c in self.contacts if c.full in wanted]
-        if not rows:
+        # ONE of the rivals may own the spelling. Two owning it ("Smith"
+        # for two Smiths; "Heather" for the one-word row AND the first
+        # name of "Heather Jones") is the question being asked, not an
+        # answer to it.
+        owners = [c for c in rows if key in c.keys()]
+        if len(owners) != 1:
             return None
-        for c in rows:
-            hon = normalise(c.honorific)
-            if key == c.full or (hon and key == f"{hon} {c.full}"):
-                return c.name
-        by_surname = [c for c in rows
-                      if key == c.surname
-                      or (normalise(c.honorific)
-                          and key == f"{normalise(c.honorific)} {c.surname}")]
-        if len(by_surname) == 1:
-            return by_surname[0].name
-        return None
+        c = owners[0]
+        accepted = {c.full, c.surname}
+        hon = normalise(c.honorific)
+        if hon:
+            accepted |= {f"{hon} {c.full}", f"{hon} {c.surname}"}
+        return c.name if key in accepted else None
 
     # ------------------------------------------------------------ writes
     def add(self, raw: dict) -> tuple[Optional[Contact], str]:
@@ -563,6 +672,8 @@ class Book:
             return None, why
         with self._lock:
             self.refresh()
+            if self.broken:
+                return None, self.broken
             why = check_unique(self.contacts, contact)
             if why:
                 return None, why
@@ -576,6 +687,8 @@ class Book:
         remove the wrong row after a hand edit)."""
         with self._lock:
             self.refresh()
+            if self.broken:
+                return None, self.broken
             contact = self.by_name(name)
             if contact is None:
                 return None, f"nothing in the book called {name!r}"
@@ -601,6 +714,9 @@ class Book:
         return {"contacts": [c.public() for c in self.contacts],
                 "skipped": [{"index": s.index, "name": s.name, "why": s.why}
                             for s in self.skipped],
+                "flagged": [{"index": f.index, "name": f.name, "why": f.why}
+                            for f in self.flagged],
+                "broken": self.broken,
                 "path": display_path(self.path)}
 
 

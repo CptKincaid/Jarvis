@@ -770,3 +770,288 @@ def test_cli_cannot_write_is_exit_1(cli, two_heathers, capsys, monkeypatch):
                         lambda *a, **k: (_ for _ in ()).throw(PermissionError("ro")))
     assert cli.main(["add", "Dana Ruiz", "dana@example.com"]) == 1
     assert "could not be written" in capsys.readouterr().out
+
+
+# ==================================================================
+# 7. The review's four: a broken file is never written over, a one-word
+#    name that is also someone's first name is a question, an ordinal
+#    only counts when the list was read, and the address check is what
+#    the docs say it is
+# ==================================================================
+import subprocess  # noqa: E402
+import sys  # noqa: E402
+
+BROKEN = "contacts.json is not valid JSON"
+FIX_IT = "fix it by hand first"
+
+
+def _corrupt(path: Path) -> str:
+    """A 2-row book with the trailing comma a hand edit leaves behind."""
+    text = ('{\n  "format": 1,\n  "contacts": [\n'
+            '    {"name": "Heather Smith", "email": "heather@example.com"},\n'
+            '    {"name": "Heather Jones", "email": "hjones@example.com"},\n'
+            '  ]\n}\n')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return text
+
+
+# ---- (1) silent book loss
+def test_a_broken_file_refuses_an_add_and_is_not_touched_in_process(two_heathers):
+    """The last-good rows stay for RESOLVING; nothing writes them back."""
+    book = book_mod.current()
+    assert book.resolve("Heather Smith").found
+    text = _corrupt(two_heathers)
+    before = two_heathers.stat()
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is None
+    assert why.startswith(BROKEN) and str(two_heathers) in why and why.endswith(FIX_IT)
+    assert two_heathers.read_text(encoding="utf-8") == text, "byte-identical"
+    assert two_heathers.stat().st_mtime_ns == before.st_mtime_ns
+    # resolving still works off the last good book
+    assert book.resolve("Heather Smith").found
+    # the last good rows are NOT what remove works on either
+    gone, why = book.remove("Heather Smith", "heather@example.com")
+    assert gone is None and why.startswith(BROKEN)
+    assert two_heathers.read_text(encoding="utf-8") == text
+
+
+def test_a_broken_file_in_a_fresh_process_refuses_the_cli_add(book_file):
+    """The reproduced loss: a fresh process has NO last-good rows, so the
+    old code wrote [the new row] over his two. Run the real script."""
+    text = _corrupt(book_file)
+    env = dict(os.environ, **{book_mod.ENV_VAR: str(book_file)})
+    proc = subprocess.run([sys.executable, str(SCRIPT), "add", "Dana Ruiz",
+                           "dana@example.com"], env=env, capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == 2, proc.stdout + proc.stderr
+    assert proc.stdout.startswith("REFUSED: " + BROKEN), proc.stdout
+    assert str(book_file) in proc.stdout and proc.stdout.rstrip().endswith(FIX_IT)
+    assert book_file.read_text(encoding="utf-8") == text, "byte-identical"
+    proc = subprocess.run([sys.executable, str(SCRIPT), "remove", "Heather Smith",
+                           "--yes"], env=env, capture_output=True, text=True,
+                          timeout=60)
+    assert proc.returncode == 2 and "REFUSED:" in proc.stdout
+    assert book_file.read_text(encoding="utf-8") == text
+
+
+def test_the_cli_refusal_line_is_the_one_the_docs_promise(cli, two_heathers, capsys):
+    _corrupt(two_heathers)
+    assert cli.main(["add", "Dana Ruiz", "dana@example.com"]) == 2
+    out = capsys.readouterr().out.strip()
+    assert out == (f"REFUSED: contacts.json is not valid JSON ({two_heathers}) "
+                   "— fix it by hand first")
+
+
+@pytest.mark.parametrize("text", ['{"format": 2, "contacts": []}',
+                                  '{"contacts": "nope", "format": 1}', '[]'])
+def test_a_wrong_shape_refuses_a_write_too(two_heathers, text):
+    book = book_mod.current()
+    two_heathers.write_text(text, encoding="utf-8")
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is None and "contacts.json" in why and why.endswith(FIX_IT)
+    assert two_heathers.read_text(encoding="utf-8") == text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads anything")
+def test_an_unreadable_file_refuses_a_write(two_heathers):
+    import time
+    book = book_mod.current()
+    assert book.resolve("Mum").found
+    # Kernel file times are coarse (a tick of a few ms): a chmod in the same
+    # tick as the write leaves ctime where it was. One tick between them is
+    # how it happens in life; the stamp carries ctime so a chmod is seen.
+    time.sleep(0.05)
+    two_heathers.chmod(0)
+    try:
+        contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+        assert contact is None
+        assert "contacts.json could not be read" in why and why.endswith(FIX_IT)
+        assert book.resolve("Mum").found, "the last good book still resolves"
+        # a fresh process has no last good book: still a refusal, still nothing
+        fresh = book_mod.Book(two_heathers)
+        assert fresh.resolve("Mum").unknown
+        assert fresh.add({"name": "Dana Ruiz", "email": "dana@example.com"})[0] is None
+    finally:
+        two_heathers.chmod(0o600)
+    # and once it is readable again the write goes through
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is not None and why == ""
+
+
+def test_a_fixed_file_writes_again(two_heathers):
+    book = book_mod.current()
+    _corrupt(two_heathers)
+    assert book.add({"name": "Dana Ruiz", "email": "dana@example.com"})[0] is None
+    write(two_heathers, TWO_HEATHERS)
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is not None and why == ""
+    assert [r["name"] for r in json.loads(two_heathers.read_text())["contacts"]] == \
+        ["Heather Smith", "Heather Jones", "Mum", "Dana Ruiz"]
+
+
+# ---- (2) a one-word name that is also someone's first name or surname
+@pytest.mark.parametrize("existing, new, why_has", [
+    ({"name": "Heather Jones", "email": "hj@example.com"},
+     {"name": "Heather", "email": "h@example.com"}, "first name"),
+    ({"name": "Heather", "email": "h@example.com"},
+     {"name": "Heather Jones", "email": "hj@example.com"}, "first name"),
+    ({"name": "Sam Smith", "email": "ss@example.com"},
+     {"name": "Smith", "email": "s@example.com"}, "surname"),
+    ({"name": "Smith", "email": "s@example.com"},
+     {"name": "Sam Smith", "email": "ss@example.com"}, "surname"),
+    ({"name": "Heather Smith", "email": "hs@example.com", "honorific": "Dr"},
+     {"name": "Dr Smith", "email": "d@example.com"}, "Dr"),
+    ({"name": "Linda Mum", "email": "l@example.com"},
+     {"name": "Mum", "email": "m@example.com"}, "surname"),
+])
+def test_a_one_word_name_may_not_be_another_rows_first_name_or_surname(
+        existing, new, why_has):
+    old, _ = book_mod.validate_row(existing)
+    row, _ = book_mod.validate_row(new)
+    why = book_mod.check_unique([old], row)
+    assert why, (existing, new)
+    assert why_has in why, why
+    assert old.name in why
+
+
+def test_two_multi_word_names_that_share_a_first_name_or_surname_are_still_fine():
+    a, _ = book_mod.validate_row({"name": "Heather Smith", "email": "a@example.com"})
+    b, _ = book_mod.validate_row({"name": "Heather Jones", "email": "b@example.com"})
+    c, _ = book_mod.validate_row({"name": "John Smith", "email": "c@example.com"})
+    assert book_mod.check_unique([a], b) == ""
+    assert book_mod.check_unique([a], c) == ""
+
+
+def test_a_one_word_collision_is_refused_on_add_and_writes_nothing(book_file):
+    write(book_file, [{"name": "Heather Jones", "email": "hj@example.com"}])
+    before = book_file.read_text()
+    contact, why = book_mod.current().add({"name": "Heather", "email": "h@example.com"})
+    assert contact is None and "first name" in why
+    assert book_file.read_text() == before
+
+
+def test_a_one_word_collision_on_load_keeps_both_flags_both_and_asks(book_file, caplog):
+    write(book_file, [{"name": "Heather", "email": "h@example.com"},
+                      {"name": "Heather Jones", "email": "hj@example.com"},
+                      {"name": "Mum", "email": "linda@example.com"}])
+    with caplog.at_level(logging.WARNING, logger="contacts"):
+        book = book_mod.current()
+    assert [c.name for c in book.contacts] == ["Heather", "Heather Jones", "Mum"], \
+        "both rows are kept"
+    assert book.skipped == []
+    assert sorted(f.name for f in book.flagged) == ["Heather", "Heather Jones"]
+    assert all("question" in f.why for f in book.flagged)
+    assert "example.com" not in caplog.text
+    # the collision resolves as a QUESTION, never a pick
+    res = book.resolve("Heather")
+    assert res.ambiguous and res.candidates == ["Heather", "Heather Jones"], res
+    # the full two-word name is still exact
+    assert book.resolve("Heather Jones").addr == "hj@example.com"
+    assert book.resolve("Jones").addr == "hj@example.com"
+    # a one-word row that is unique reads back fine
+    assert book.resolve("Mum").addr == "linda@example.com"
+    # and the which-answer cannot be "Heather" -- that is the question
+    cands = ["Heather", "Heather Jones"]
+    assert book.choose("Heather", cands) is None
+    assert book.choose("Heather Jones", cands) == "Heather Jones"
+    assert book.choose("Jones", cands) == "Heather Jones"
+    assert "flagged" in book.public() and len(book.public()["flagged"]) == 2
+
+
+def test_a_shared_surname_with_a_one_word_row_is_a_question(book_file):
+    write(book_file, [{"name": "Sam Smith", "email": "ss@example.com"},
+                      {"name": "Smith", "email": "s@example.com"}])
+    book = book_mod.current()
+    assert book.resolve("Smith").ambiguous
+    assert book.resolve("Smith").candidates == ["Sam Smith", "Smith"]
+    assert book.resolve("Sam Smith").addr == "ss@example.com"
+    assert book.resolve("Sam").addr == "ss@example.com"
+
+
+def test_the_commander_asks_which_heather_for_a_one_word_collision(cmd_book):
+    write(book_mod.book_path(), [{"name": "Heather", "email": "h@example.com"},
+                                 {"name": "Heather Jones", "email": "hj@example.com"}])
+    res = cmd_book.handle("email the biosensors handout to Heather", source="voice")
+    assert res.reply == "Which Heather, sir — Heather or Heather Jones?"
+    assert cmd_book._pending_send is None
+    res = cmd_book.handle("Heather", source="voice")
+    assert res.reply.startswith("The full name, sir"), res
+    res = cmd_book.handle("Jones", source="voice")
+    assert "to Heather Jones, from your school account" in res.reply
+    assert res.display_only == "to hj@example.com"
+    assert not FakeSMTP.made
+
+
+def test_cli_list_shows_the_collision_as_kept_and_flagged(cli, book_file, capsys):
+    write(book_file, [{"name": "Heather", "email": "h@example.com"},
+                      {"name": "Heather Jones", "email": "hj@example.com"}])
+    assert cli.main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "2 people in" in out
+    assert "AMBIGUOUS (kept): row 1 Heather:" in out
+    assert "AMBIGUOUS (kept): row 2 Heather Jones:" in out
+    assert cli.main(["show", "Heather"]) == 3
+
+
+# ---- (3) an ordinal only counts when the list was actually read
+FIVE = [{"name": f"Heather {s}", "email": f"h{s.lower()}@example.com"}
+        for s in ("Adams", "Brown", "Clark", "Davis", "Evans")]
+
+
+@pytest.mark.parametrize("said", ["the first one", "the second one", "2", "5",
+                                  "the last one", "the other one"])
+def test_an_ordinal_is_a_miss_when_the_list_was_not_read(said):
+    from jarvis import commander as cm
+    names = [r["name"] for r in FIVE]
+    assert len(names) > book_mod.WHICH_MAX
+    assert cm._person_from_answer(said, names) is None, said
+    # and it still works for a list that WAS read
+    four = names[:book_mod.WHICH_MAX]
+    assert cm._person_from_answer("the first one", four) == "Heather Adams"
+    assert cm._person_from_answer("the last one", four) == "Heather Davis"
+
+
+def test_five_heathers_the_first_one_is_re_asked_for_the_full_name(cmd_book):
+    write(book_mod.book_path(), FIVE)
+    res = cmd_book.handle("email the biosensors handout to Heather", source="voice")
+    assert res.reply == "I've five people called Heather, sir — the full name, please."
+    res = cmd_book.handle("the first one", source="voice")
+    assert res.reply.startswith("The full name"), res
+    assert cmd_book._pending_send is None and cmd_book.question_open()
+    res = cmd_book.handle("Heather Clark", source="voice")
+    assert "to Heather Clark, from your school account" in res.reply
+    assert res.display_only == "to hclark@example.com"
+    assert not FakeSMTP.made
+
+
+# ---- (4) the address check is what the docs say it is
+@pytest.mark.parametrize("bad", [
+    "x@-.-", "a@b.c", "h@1.2", "h@example.com-", "heather..x@example.com",
+    ".h@example.com", "h.@example.com", "h@-example.com", "h@example-.com",
+    "h@example.c0m", "h@example.", "h@.example.com", "h@" + "a" * 64 + ".com",
+    "h@example.com.", "h" + "@" + "x" * 250 + ".com",
+])
+def test_the_reviewers_accepted_bad_addresses_are_refused(bad):
+    contact, why = book_mod.validate_row({"name": "Heather Smith", "email": bad})
+    assert contact is None, bad
+    assert why.startswith("bad address") or "longer than" in why, why
+
+
+@pytest.mark.parametrize("good", [
+    "heather@example.com", "heather.smith@example.co.uk", "h+tag@example.com",
+    "h_s%x@sub-domain.example.org", "h@" + "a" * 63 + ".com", "H@EXAMPLE.COM",
+    "heather@gmail.con",
+])
+def test_a_well_formed_address_is_accepted_even_when_it_is_wrong(good):
+    contact, why = book_mod.validate_row({"name": "Heather Smith", "email": good})
+    assert contact is not None, (good, why)
+
+
+def test_the_docs_and_the_cli_help_admit_gmail_con_cannot_be_caught(cli, capsys):
+    doc = (Path(__file__).resolve().parents[1] / "docs" / "assistant-setup.md"
+           ).read_text(encoding="utf-8")
+    assert "gmail.con" in doc and "read-back" in doc
+    with pytest.raises(SystemExit):
+        cli.main(["add", "--help"])
+    assert "gmail.con" in capsys.readouterr().out
