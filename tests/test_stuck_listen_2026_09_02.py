@@ -522,6 +522,13 @@ def test_the_feeder_sign_off_is_flagged_amplitude_only():
         eng._current_amp = 0.0
         eng._stop_flag = False
         eng._burst_announced = True          # the burst already announced
+        # The falling edge has NOT gone out yet, which is the case this test
+        # is about: mid-burst, so the sign-off must still fire and must be
+        # flagged. Both attributes exist because the feeder tail is now
+        # guarded by the edge as well as flagged -- two fixes for the same
+        # 2026-09-02 orphan duck, kept together when the branches merged.
+        eng._burst_closed = False
+        eng._edge_lock = threading.Lock()
         eng._run_amp_feeder(iter([0.5, 0.4]))
         deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and len(seen) < 3:
