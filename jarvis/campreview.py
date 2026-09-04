@@ -930,6 +930,20 @@ class PreviewPipeline:
                 log.debug("campreview: a detection row would not reduce",
                           exc_info=True)
                 continue
+            # HIS BAR, APPLIED. ``camera.min_conf`` was read, stored and
+            # never once used: this class said in as many words that it
+            # "decides how many boxes get DRAWN" and nothing anywhere
+            # compared a row against it, so the detector's own 0.3 floor was
+            # the only bar in the system. MEASURED on his wall, 2026-09-03:
+            # a door frame drew a box at conf 0.48 against his configured
+            # 0.6 and was then embedded and named -- "id hunter 0.39",
+            # "0.43", "0.42" in the log, over a 0.363 identity bar, while
+            # his own real matches that evening were 0.51 and 0.57. SFace
+            # collapses on a non-face crop and scores it CONFIDENTLY, which
+            # facedetect.py's docstring already warned about; the detection
+            # bar is the guard that was missing, not the identity one.
+            if float(obs.conf) < self.min_conf:
+                continue
             # The ROW travels beside the reduced face, because SFace aligns
             # its own crop from the five landmarks and cannot work from a
             # rectangle. It is a local; nothing about it reaches an
@@ -1011,7 +1025,18 @@ class PreviewPipeline:
         box = (face.x, face.y, face.w, face.h)
         due = (self._last_ident is None
                or (at - self._last_ident) >= self._ident_period)
-        if due and face.conf >= self.id_conf:
+        # AND THE LANDMARKS HAVE TO BE FACE-SHAPED. SFace aligns its own
+        # crop from the five landmarks, so a row whose landmarks are not a
+        # face's gives it a nonsense crop -- and SFace does not answer
+        # weakly on nonsense, it answers CONFIDENTLY and wrongly. MEASURED
+        # on his wall, 2026-09-03: a door frame was embedded and named "id
+        # hunter 0.39 / 0.43 / 0.42" against a 0.363 bar, while his own
+        # face that evening scored 0.51 and 0.57. The confidence bar alone
+        # does not catch it -- the wall cleared 0.6 -- but the geometry
+        # does: visionrig.landmark_plausibility requires the mouth to sit
+        # below the eye line along the face's own down axis, which a wall
+        # has no way to satisfy except by accident.
+        if due and face.conf >= self.id_conf and face.landmarks_ok:
             self._last_ident = at
             label, score = self._match(frame, row)
             if label is not None:      # None = it could not be asked; hold

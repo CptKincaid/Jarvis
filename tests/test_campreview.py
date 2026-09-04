@@ -346,19 +346,19 @@ class Obs:
     reads. Duck-typed on purpose: the preview must not care whether a future
     observation grows a field."""
 
-    def __init__(self, row, sx, sy):
+    def __init__(self, row, sx, sy, landmarks_ok=True):
         self.conf = float(row[14])
         self.x, self.y = float(row[0]) * sx, float(row[1]) * sy
         self.w, self.h = float(row[2]) * sx, float(row[3]) * sy
         self.yaw_deg = float(row[8]) - (self.x + self.w / 2.0)
-        self.landmarks_ok = True
+        self.landmarks_ok = landmarks_ok
 
 
-def observer(calls=None):
+def observer(calls=None, landmarks_ok=True):
     def observe(row, _lens, sx, sy, _head):
         if calls is not None:
             calls.append((sx, sy))
-        return Obs(row, sx, sy)
+        return Obs(row, sx, sy, landmarks_ok=landmarks_ok)
     return observe
 
 
@@ -667,7 +667,12 @@ def test_identity_is_never_computed_from_a_detection_under_the_bar():
         clock.tick(1.0)
         shot = pipe.grab((16, 9))
     assert rec.rows == []                        # never asked
-    assert shot.primary.id_ran is False          # …and no chip claims one
+    # …and it is not a face AT ALL. camera.min_conf was read, stored and
+    # never compared against anything until 2026-09-03, so the detector's
+    # own 0.3 floor was the only bar: a door frame drew a box at 0.48
+    # against his configured 0.6 and got named. His bar is applied now.
+    assert shot.primary is None
+    assert shot.faces == ()
 
 
 def test_identity_runs_at_its_own_cadence_not_at_the_detection_rate():
@@ -759,9 +764,14 @@ def test_the_name_goes_when_the_face_does_rather_than_lingering():
 
 
 def test_a_held_name_expires_rather_than_sitting_over_an_unchecked_face():
-    """Identity stops being computed whenever the subject drops under the
-    detector's bar. The box is still drawn -- a weak detection is still a
-    detection -- but the NAME on it has to age out."""
+    """A subject that drops under HIS bar stops being a face, and the name
+    goes with it.
+
+    This used to keep the box and expire only the name, on the argument
+    that a weak detection is still a detection. Seeing it live on
+    2026-09-03 he called it "capturing random objects": the pane drew boxes
+    on his wall at 0.48 against a configured 0.6. The bar the class always
+    said it applied is applied."""
     clock = Clock()
     rec = FakeRecogniser(min_conf=0.6)
     det = FakeDetector(rows=[row(4, 2, 8, 8, conf=0.9)], input_size=(32, 18))
@@ -775,9 +785,7 @@ def test_a_held_name_expires_rather_than_sitting_over_an_unchecked_face():
     assert pipe.grab((16, 9)).primary.name == "hunter"
     det.rows = [row(4, 2, 8, 8, conf=0.4)]           # too weak to embed
     clock.tick(cp.IDENT_HOLD_S + 0.1)
-    face = pipe.grab((16, 9)).primary
-    assert face.id_ran is False                      # no chip at all
-    assert face.conf == pytest.approx(0.4)           # …but still a box
+    assert pipe.grab((16, 9)).primary is None        # gone, name and all
 
 
 def test_an_embedding_that_fails_leaves_the_last_verdict_alone():
@@ -1725,3 +1733,29 @@ def test_build_pipeline_never_opens_a_device_when_the_camera_is_off():
     pipe = cp.build_pipeline(None, options(), Policy())
     assert pipe.feed is None
     assert pipe.reason
+
+
+def test_a_strong_detection_with_landmarks_that_are_not_a_face_is_never_embedded():
+    """The wall. MEASURED on his own camera, 2026-09-03: a door frame was
+    detected, embedded and named -- "id hunter 0.39", "0.43", "0.42" in the
+    log against a 0.363 bar, while his real face that evening scored 0.51
+    and 0.57. The confidence bar does not catch it, because the wall
+    cleared 0.6. SFace aligns its crop from the five landmarks, so a row
+    whose landmarks are not a face's hands it nonsense -- and SFace answers
+    nonsense CONFIDENTLY, not weakly. The geometry is the guard."""
+    clock = Clock()
+    rec = FakeRecogniser(min_conf=0.6)
+    det = FakeDetector(rows=[row(4, 2, 8, 8, conf=0.95)], input_size=(32, 18))
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=det,
+                              observe=observer(landmarks_ok=False),
+                              now=clock, recogniser=rec,
+                              gallery=FakeGallery([("hunter", 0.74)]),
+                              identity_min=0.363, min_conf=0.6)
+    for _ in range(6):
+        clock.tick(1.0)
+        shot = pipe.grab((16, 9))
+    assert rec.rows == []                     # never embedded
+    assert shot.primary is not None           # still drawn: it IS a detection
+    assert shot.primary.conf == pytest.approx(0.95)
+    assert shot.primary.id_ran is False       # and never named
+    assert shot.primary.name == ""
