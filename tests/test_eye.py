@@ -347,7 +347,6 @@ def test_the_camera_is_off_until_he_turns_it_on():
     cam = DEFAULTS["camera"]
     assert cam["enabled"] is False
     assert cam["identity"] is False       # a face gallery on disk is opt-in
-    assert cam["debug_frame"] is False    # the one JPEG path, off by default
 
 
 def test_the_camera_section_carries_no_schedule_of_its_own():
@@ -556,3 +555,22 @@ def test_the_tiebreaker_promotes_nothing_without_attention():
         out = resolve_wake("suppress", False, eye)
         assert out.ok is False, (faces, dwell, ident, age)
         assert out.evidence == ""
+
+
+def test_the_camera_section_carries_no_key_that_nothing_reads():
+    """F57. camera.debug_frame documented a frame-to-disk path nothing
+    implemented -- and nothing may: a frame on disk is the one thing the
+    standing camera rule and campreview's own docstring forbid -- and
+    camera.wake_tiebreak a wake-gate fold that eye.resolve_wake has no
+    caller for. A documented control the code does not have is a config
+    that lies, so both keys are gone rather than implemented."""
+    from pathlib import Path
+    from jarvis.assistant_config import DEFAULTS
+    cam = DEFAULTS["camera"]
+    assert "debug_frame" not in cam
+    assert "wake_tiebreak" not in cam
+    repo = Path(__file__).resolve().parents[1]
+    source = "\n".join(p.read_text() for d in ("jarvis", "scripts")
+                       for p in (repo / d).rglob("*.py"))
+    assert "debug_frame" not in source
+    assert "wake_tiebreak" not in source

@@ -61,23 +61,45 @@ DEVICE_GLOB = "/dev/video*"
 # 2026-09-03, both fourcc-before-size and size-before-fourcc). The granted
 # mode is read back and logged in open_capture for exactly that reason.
 DEFAULT_FOURCC = "MJPG"
-# One driver buffer, not OpenCV's default four. See open_capture.
-# None means LEAVE THE DRIVER'S DEFAULT ALONE, which is what the fast probe
-# run actually did. Setting this to 1 costs exactly half the frame rate --
-# MEASURED 2026-09-03, one A/B pair back to back in the same light with
-# scripts/camera_mode_probe.py, 60 timed grabs per row, 8 rows out of 8:
+# One buffer requested, not OpenCV's default four -- and this is a REVERT
+# to that, not the original choice. None means leave the driver's default
+# alone. The history, in order, because two commits on one day disagreed
+# and the comment here described the wrong one for a while:
 #
-#   mode              set(1)              driver default
-#   720p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
-#   480p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
-#   720p YUYV      5.0 fps / 200.0 ms   10.0 fps / 100.0 ms
-#   480p YUYV      7.5 fps / 132.1 ms   15.0 fps /  67.9 ms
+# 1. Set to 1 (12eadf0) so a slow consumer could not be handed a frame that
+#    had waited up to three intervals in the queue -- lag he can see.
+# 2. MEASURED IN THE PROBE to cost exactly half the rate (c228a01): one A/B
+#    pair back to back in the same light with scripts/camera_mode_probe.py,
+#    60 timed grabs per row, 8 rows out of 8:
 #
-# A clean 2.00x on every row, and with the default the 720p YUYV mode hits
-# its granted 10.0 fps exactly -- so the device was never the cap. OpenCV's
-# V4L2 backend requeues a dequeued buffer only at the NEXT grab, so with one
-# buffer the driver holds none in between and every grab waits a full extra
-# frame interval.
+#      mode              set(1)              driver default
+#      720p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
+#      480p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
+#      720p YUYV      5.0 fps / 200.0 ms   10.0 fps / 100.0 ms
+#      480p YUYV      7.5 fps / 132.1 ms   15.0 fps /  67.9 ms
+#
+#    A clean 2.00x on every row, with the 720p YUYV mode hitting its
+#    granted 10.0 fps exactly at the default -- so in the probe the device
+#    was never the cap. That measurement stands. It was set to None.
+# 3. Put back to 1 the same evening (9ba1c56), because THE APP DID NOT GET
+#    THE RATE: with the driver's buffers its own rate line read 7.6 fps /
+#    132 ms (19:47), the same ~7.5 it had with one buffer, and he saw the
+#    staleness at once ("way less accurate", boxes on "random objects").
+#    The probe grabs in a tight loop and never retrieves; the app grabs,
+#    retrieves, decodes and works; something in that difference eats the
+#    other half and NOBODY KNOWS WHAT YET. So the setting that demonstrably
+#    keeps his picture fresh wins over a rate gain that does not reach the
+#    app.
+#
+# OpenCV's V4L2 backend requeues a dequeued buffer only at the NEXT grab,
+# so with one buffer the driver holds none in between and every grab waits
+# a full extra frame interval -- the mechanism that fits the probe's 2x.
+# The count the driver actually allocated is not observable through cv2:
+# CAP_PROP_BUFFERSIZE's get() returns OpenCV's own stored request, never
+# compared with what VIDIOC_REQBUFS granted, so "set(1) read back 1" says
+# only that the request was accepted, and the log line below says
+# "requested" for that reason. The proper fix is to DRAIN the queue, not
+# starve it (branch camera-drain); when it lands the buffers come back.
 CAPTURE_BUFFERS = 1
 # How long a close waits for a grab already in flight before releasing the
 # device anyway. One frame at the idle tier's 1.5 fps is 670 ms; a second is
@@ -340,36 +362,35 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
     and granted a bandwidth-capped YUYV stream -- was wrong. Measured with
     scripts/camera_mode_probe.py, twice (2026-09-03 02:36 and 07:17, Jarvis
     stopped, ``grab()`` only, nothing retrieved): MJPG IS granted at
-    1280x720 in either set order at a nominal 30 fps, and the device
-    delivered 3.7-3.9 fps in every 30 fps mode it has, 640x480 included,
-    both runs -- so the rate is the device's own, not the format's and not
-    the bus's. What sets it is not proven; the whole-multiple frame
-    intervals (268 ms = 8 x 33 ms at the probe, 133 ms = 4 x 33 ms with him
-    at the desk) are what auto-exposure lengthening the interval for a dim
-    scene looks like. The line printed here puts asked-against-granted
-    beside the preview's own rate line so that the next such question is a
-    grep of the log rather than a night of guessing.
+    1280x720 in either set order at a nominal 30 fps, so the format is not
+    what sets the rate and neither is the bus (640x480 delivered the same
+    3.7-3.9 fps in both formats). That 3.7-3.9 was the PROBE'S
+    configuration in that morning's light -- one buffer, 30 fps requested
+    -- not the device's ceiling: the same configuration gave 7.5 that
+    afternoon and the driver's default gave 15.0 (CAPTURE_BUFFERS above),
+    while the app gets ~7.5 either way. What sets the app's 7.5 is not
+    proven; the whole-multiple frame intervals (268 ms = 8 x 33 ms, 133 =
+    4 x 33, 68 = 2 x 33) are what auto-exposure lengthening the interval
+    for a dim scene looks like, and the light was never controlled for.
+    The line printed here puts asked-against-granted beside the preview's
+    own rate line so that the next such question is a grep of the log
+    rather than a night of guessing.
 
-    ``CAP_PROP_BUFFERSIZE`` IS LEFT AT THE DRIVER'S DEFAULT, and that is a
-    correction. It was set to ONE to stop a slow consumer being handed a
-    frame that had waited in the queue -- up to three intervals old, which
-    is lag he can see, and the reasoning was right. The cost was not
-    measured until 2026-09-03, and the cost is HALF THE FRAME RATE: an A/B
-    pair in the same light gave a clean 2.00x on all eight rows (see
-    CAPTURE_BUFFERS above), and with the default the 720p YUYV mode reaches
-    its granted 10.0 fps exactly, so the device was never the cap.
-
-    Half the rate is the worse trade. At his configured ``preview_fps`` of
-    15 the consumer now keeps pace with the device (15.0 fps delivered), so
-    the queue does not build and the staleness this was fighting does not
-    arise; it only bit when the consumer ran far slower than the device
-    (the old ``6.0 fps  grab 11 ms`` line, 6 requested against 15 delivered).
+    ``CAP_PROP_BUFFERSIZE`` IS REQUESTED AS ONE, and the history of that
+    number is on CAPTURE_BUFFERS: it halves the probe's rate, does not
+    change the app's, and is what keeps the picture he sees fresh. The
+    staleness it fights is a frame up to three intervals old handed to a
+    consumer that runs slower than the device. The old ``6.0 fps  grab
+    11 ms`` line at 6 requested is CONSISTENT with that -- an 11 ms grab
+    from a 133 ms device is most plausibly a frame that was already waiting
+    -- but frame age was never timed, and 9ba1c56's "boxes on random
+    objects" with the driver's buffers is the nearest thing to a
+    measurement of it. Expected mechanism, not yet measured.
 
     THE PROPER FIX IS TO DRAIN, NOT TO STARVE: keep the driver's buffers and
     discard the stale ones before retrieving, so a slow consumer still gets
-    the newest frame at full rate. That is not built yet, and until it is,
-    a consumer configured well below the delivered rate can still be handed
-    a frame up to three intervals old.
+    the newest frame at full rate. That is not built yet (branch
+    camera-drain), and until it is, the single buffer stays.
 
     cv2 is imported HERE, not at module scope, so that a box without OpenCV
     still loads jarvis.camera and still reports honestly.
@@ -398,8 +419,8 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
     try:
         got = capture_mode(cap)
         log.info("camera: asked %dx%d %s; granted %.0fx%.0f %s at %.1f fps "
-                 "nominal, %.0f driver buffer(s) -- the delivered rate is "
-                 "what the preview's own line reports",
+                 "nominal, %.0f buffer(s) requested -- the delivered rate "
+                 "is what the preview's own line reports",
                  int(width), int(height), fourcc or "-", got["width"],
                  got["height"], got["fourcc"] or "?", got["fps"],
                  got["buffersize"])
