@@ -74,6 +74,30 @@ MIN_SPEECH_SECONDS = 0.35        # below this we cannot tell, so change nothing
 # embeddings incomparable with fresh ones. 2 = probes are silence-trimmed.
 VOICEPRINT_FORMAT = 2
 
+# EVERY FORMAT THIS BUILD CAN READ, and the refusal of anything else is the
+# whole point of the tuple. 1 is the pre-trim pool (loadable, and load() says
+# out loud that it scores low); 2 is the current one.
+#
+# WHY A REFUSAL AND NOT ANOTHER WARNING. This file is a SINGLE-SPEAKER pool:
+# load() selects its keys by ``k.startswith("emb_")``, which also matches
+# ``emb_mara_0000``, and the only format complaint it had fired when
+# ``fmt < VOICEPRINT_FORMAT`` -- i.e. never for a NEWER file. So a multi-label
+# voiceprint written by a later build, read by this one after a rollback or by
+# a stale process, pooled every person into one centroid without a word.
+# Measured 2026-09-04 on synthetic vectors (tests/test_speaker_format.py):
+# a _format=3 file holding two people loaded as 20 pooled samples and 6 of 6
+# of the OTHER person's takes then scored past the 0.30 bar as him -- a silent
+# universal false accept, arriving by a path nobody would think to look at.
+# That is the television-reaches-the-commander failure, so an unrecognised
+# format loads NOTHING and says which number it saw.
+#
+# Refusing leaves the pool empty, so both gates fall back to their
+# nothing-enrolled behaviour: the wake gate and the transcript gate both fail
+# OPEN and voice keeps working, unfiltered and loudly logged. That is the
+# right direction -- an unreadable pool is "no instrument", and no label is
+# minted from it, where pooling would have named a stranger as him.
+KNOWN_VOICEPRINT_FORMATS = (1, 2)
+
 
 def _frame_rms(audio_16k, n):
     frames = np.asarray(audio_16k[:len(audio_16k) // n * n],
@@ -146,6 +170,11 @@ class SpeakerVerifier:
         self._device = None         # resolved by _resolve_device()
         self._warned_fail_open = False   # one Status(warn) per session
         self._model_failed = False       # a failed load is not retried
+        # "" or one plain sentence naming the format on disk that this build
+        # refused to read. Held rather than only logged so a startup line and
+        # the instrument can say WHY the voice leg is dark, the way
+        # facegallery.reenrol_message does for a cross-model gallery.
+        self.format_fault = ""
 
     # ------------------------------------------------------------ state
     @property
@@ -251,13 +280,32 @@ class SpeakerVerifier:
         if not VOICEPRINT_FILE.exists():
             self._loaded = True
             return
+        self.format_fault = ""
         try:
             data = np.load(VOICEPRINT_FILE)
+            # THE FORMAT IS READ BEFORE THE VECTORS, because it decides
+            # whether these vectors may be read at all -- facegallery._read
+            # settles the same question in the same order and for the same
+            # reason. Reading an unknown pool as if it were this one is how
+            # embeddings silently stop meaning what the code thinks.
+            fmt = int(data["_format"][0]) if "_format" in data.files else 1
+            if fmt not in KNOWN_VOICEPRINT_FORMATS:
+                self.format_fault = (
+                    "voiceprint.npz is format %d and this build reads %s. "
+                    "Loading NOTHING from it: its keys may name several "
+                    "people and this build would pool them into one "
+                    "centroid, which accepts every one of them as you. The "
+                    "file is left exactly where it is."
+                    % (fmt, ", ".join(str(f) for f in KNOWN_VOICEPRINT_FORMATS)))
+                log.error("voice verification is OFF: %s", self.format_fault)
+                self._embeddings = []
+                self._recompute_centroid()
+                self._loaded = True
+                return
             keys = [k for k in sorted(data.files) if k.startswith("emb_")] or \
                 [k for k in sorted(data.files) if not k.startswith("_")]
             self._embeddings = [data[k] for k in keys]
             self._recompute_centroid()
-            fmt = int(data["_format"][0]) if "_format" in data.files else 1
             self._format = fmt
             log.info("voiceprint loaded: %d samples (format %d)",
                      len(self._embeddings), fmt)
