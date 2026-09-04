@@ -65,6 +65,8 @@ DEFAULT_BODY = "Sent from Jarvis."
 
 SENT_LINE = "Sent to {who}, sir."
 DROPPED_LINE = "Very good, sir; nothing sent."
+SELF_LINE = ("That draft is to {who}, sir, not to you. Yes to send it there, "
+             "no to drop it.")
 UNSURE_LINE = ("I'd rather be certain, sir — say yes and I'll send it, "
                "or no and I'll let it go.")
 CHANGED_LINE = ("That file has changed since I read it back, sir; "

@@ -1684,6 +1684,31 @@ NOT_SEND_CORPUS = [
 ]
 
 
+SELF_REDIRECTS = [
+    "send it to me", "send it to us", "send it to you", "yes, send it to me",
+    "send it to me please", "yes to me", "send that to me", "jarvis send it to me",
+    "send it over to me", "send it to me and her",
+]
+
+
+@pytest.mark.parametrize("said", SELF_REDIRECTS)
+def test_a_redirect_to_himself_never_sends_and_is_answered(cmd, said):
+    """09-04, the independent post-merge review: every one of these SENT the
+    file to the person he had been read. me/us/you sat in the pronoun set
+    beside her/him, so "send it to me" was the read-back echoed. It is a
+    redirect: answered with whom the draft is to, draft kept, nothing sent."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    FakeSMTP.made.clear()
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled, (said, res)
+    assert "not to you" in res.reply and "Heather" in res.reply, (said, res.reply)
+    assert not any(getattr(c, "sent", None) for c in FakeSMTP.made), said
+    assert cmd._pending_send is not None, "the draft must stay armed"
+    # ...and a real yes afterwards still sends to the person he was read.
+    res2 = cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", (said, res2)
+
+
 @pytest.mark.parametrize("said", NOT_SEND_CORPUS)
 def test_a_name_a_command_or_a_no_never_sends_to_the_pending_address(cmd, said):
     cmd.handle("email the biosensors handout to Heather", source="typed")
