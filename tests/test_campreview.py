@@ -2091,6 +2091,37 @@ def test_a_missed_frame_still_reports_how_long_the_miss_took_nothing_else():
     assert pipe._cycle_ms["grab"] == pytest.approx(2000.0)
 
 
+def test_a_stalled_grab_reaches_the_minute_line_through_the_worker(caplog):
+    """The reviewer's blind spot, closed one level up. The pipeline keeps a
+    missed grab's cost in ``_cycle_ms`` and -- deliberately -- hands over a
+    blank shot with NO stages, so nothing downstream mistakes it for a
+    picture. But the worker folded only ``shot.stage_ms`` into the minute
+    window, so a device that took two seconds to say nothing never appeared
+    on the one line this instrument exists to write. The worker now folds
+    the miss's grab time itself; the shot contract is untouched."""
+    clock = Clock(100.0)
+    feed = TickingFeed(clock, 2.0, frames=[])
+    pipe = cp.PreviewPipeline(feed, detector=FakeDetector(rows=[]),
+                              observe=observer(), now=clock)
+    w = cp.PreviewWorker(get_option=options(**{"camera.preview": True}),
+                         sensing=Policy(), pipeline=pipe, now=clock)
+    w._logged = clock()                          # the minute has just begun
+    shot = w.cycle()
+    assert shot.reason == cp.REASON_NO_FRAME, shot.reason
+    assert not shot.live and shot.stage_ms == {}      # the contract stands
+    p50s = w.stages.p50s()
+    assert p50s.get("grab") == pytest.approx(2000.0), p50s
+    assert w._stage_cycles == 1
+    # ...and it is the LINE that matters: the stall is printed, not merely
+    # held. Close the minute and read what the log says.
+    clock.tick(cp.PreviewWorker.LOG_EVERY_S)
+    with caplog.at_level(logging.INFO, logger="jarvis.campreview"):
+        w.cycle()
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "jarvis.campreview" and "stages p50" in r.getMessage()]
+    assert lines and "grab 2000" in lines[-1], lines
+
+
 def test_numbers_only_carries_the_stage_costs_as_floats_keyed_by_name():
     shot = cp.PreviewShot(image=object(), reason=cp.REASON_LIVE,
                           stage_ms={"grab": 268.0, "shrink": 1.8})

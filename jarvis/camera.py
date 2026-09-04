@@ -94,8 +94,9 @@ EXPOSURE_AUTO = 3
 # preview halved from 7.5 to 3.7 fps with nothing in the log able to say
 # whether the camera had been re-metered. MEASURED 2026-09-04, grab() only,
 # the app closed: the LifeCam runs a 30 / 15 / 7.5 fps ladder by exposure
-# tier (<=15.6 ms / 31-62 ms / >=125 ms) and its auto-exposure had stepped
-# to the darkest tier; forcing manual exposure 156 took it from 3.75 to
+# tier (<=15.6 ms / 31-62 ms / >=125 ms) and auto-exposure was sitting on
+# the SLOWEST rung -- at midday, lights up, so not the room: WHAT it was
+# metering on is unmeasured. Forcing manual exposure 156 took it from 3.75 to
 # 15-16 fps in the app's own 1-buffer configuration, and back to auto put
 # it straight back. Under auto the ``exposure`` figure is the CACHED manual
 # value, not a meter reading; ``auto_exposure`` is the number that matters.
@@ -315,8 +316,9 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
     since 2026-09-04. What the two probes of 09-03 left "NOT proven" (below)
     was then measured, grab() only and the app closed: the delivered rate is
     the camera's own auto-exposure tier. His LifeCam runs 30 / 15 / 7.5 fps
-    at exposure <=15.6 ms / 31-62 ms / >=125 ms, auto had stepped to the
-    slowest tier (3.75 fps through the app's single driver buffer), and
+    at exposure <=15.6 ms / 31-62 ms / >=125 ms, auto was on the slowest
+    rung (3.75 fps through the app's single driver buffer) for a reason
+    nobody has measured -- ambient light is refuted, the scene is not -- and
     manual exposure 156 took the same open to 15-16 fps with no other change.
     So the line printed here says ``auto_exposure``, ``exposure`` and
     ``gain`` as the driver reports them -- and says plainly that under auto

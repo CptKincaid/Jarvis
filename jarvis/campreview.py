@@ -90,9 +90,10 @@ camera on auto-exposure produces when it lengthens the interval to expose
 a dim scene ("exposure priority"), and nothing else that was measured
 explains them. PROVEN 2026-09-04, grab() only, the app closed: the LifeCam
 runs a 30 / 15 / 7.5 fps sensor ladder by exposure tier (<=15.6 ms /
-31-62 ms / >=125 ms), its auto-exposure had stepped to the slowest tier
-(3.75 fps through the app's single driver buffer, exactly the 268 ms
-above), and forcing manual exposure 156 on the same open gave 15-16 fps
+31-62 ms / >=125 ms), its auto-exposure was on the slowest rung (3.75 fps
+through the app's single driver buffer, exactly the 268 ms above) -- WHY
+it chose that rung at midday with the lights up is NOT measured; only the
+mechanism is -- and forcing manual exposure 156 on the same open gave 15-16 fps
 with nothing else changed; back to auto, straight back down. The "fast"
 7.5 fps days were the MIDDLE tier halved, so the camera has been
 exposure-throttled all along. WHAT MOVES THE METERING is not measured --
@@ -2048,6 +2049,17 @@ class PreviewWorker:
             self._publish(shot, stop)
             return shot
         shot = pipe.grab(self.box, seq=seq)
+        if not shot.stage_ms:
+            # A MISS KEEPS ITS TIMING. A blank shot deliberately carries no
+            # stages, so nothing downstream mistakes it for a picture -- but
+            # the grab that produced it is exactly the number this instrument
+            # exists for: a device that took two seconds to say nothing is a
+            # stalling device, and it has to show up on the minute line as
+            # 'grab 2000', not vanish. The pipeline still holds the cost.
+            miss = getattr(pipe, "_cycle_ms", None) or {}
+            if miss.get("grab") is not None:
+                self.stages.extend({"grab": float(miss["grab"])})
+                self._stage_cycles += 1
         if stop.is_set():
             # THE SWITCH WENT OFF WHILE THIS GRAB WAS IN FLIGHT. The frame
             # came back after he said stop, so it is dropped here rather
