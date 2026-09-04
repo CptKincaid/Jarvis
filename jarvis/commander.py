@@ -6738,9 +6738,22 @@ def _face_owner(c) -> str:
     return keep or "hunter"
 
 
-def _face_gallery():
+def _face_gallery(c):
+    """The gallery for the CONFIGURED face backend -- never the default one.
+
+    ``camera.face_backend`` decides which model wrote the vectors on disk, and
+    a gallery opened without it is a gallery for the wrong model. This built
+    ``default_gallery()`` with no backend, so the voice path resolved the
+    module default (or ``JARVIS_FACE_BACKEND``) while the camera path resolved
+    his config: "who do you recognise" would answer "nobody" over an
+    enrolment sitting right there, and "forget Heather's face" would read an
+    empty pool. The backend comes from HIS config, the same way
+    ``_face_owner`` reads his name -- and a missing config service means "",
+    which is the documented "let facemodels decide", not a guess at a model.
+    """
+    from jarvis.camera import face_backend_from_config
     from jarvis.facegallery import default_gallery
-    return default_gallery()
+    return default_gallery(backend=face_backend_from_config(c._svc("assistant")))
 
 
 def _h_face_enrol(c, t, m):
@@ -6759,7 +6772,7 @@ def _h_face_enrol(c, t, m):
                   "name to store it under.",
             status="Enrolment: whose?")
     pose = ee.spoken_pose(m.groupdict().get("pose") or "")
-    out = ee.enrol_answer(_face_gallery(), who, owner=owner,
+    out = ee.enrol_answer(_face_gallery(c), who, owner=owner,
                           poses=(pose,) if pose else ())
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          status=out["status"])
@@ -6775,7 +6788,7 @@ def _h_face_forget(c, t, m):
         return CommandResult(handled=True, speak=True,
                              reply="Whose face, sir?",
                              status="Face gallery: whose?")
-    out = ee.forget_answer(_face_gallery(), who, owner=owner)
+    out = ee.forget_answer(_face_gallery(c), who, owner=owner)
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          status=out["status"])
 
@@ -6785,7 +6798,7 @@ def _h_face_gallery(c, t, m):
     this feature that genuinely belongs in the window, because it reads a
     file and opens nothing."""
     from jarvis import enrolentry as ee
-    out = ee.gallery_answer(_face_gallery(), owner=_face_owner(c))
+    out = ee.gallery_answer(_face_gallery(c), owner=_face_owner(c))
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          status=out["status"])
 

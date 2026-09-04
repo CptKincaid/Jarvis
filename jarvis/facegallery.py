@@ -87,8 +87,11 @@ DELETING ONE PERSON is ``purge_label()``, and it is not ``forget()`` plus a
 save. A save writes a new generation; the OLD generations still hold her, one
 ``rollback()`` away and still on the disk. Consent withdrawn has to mean the
 embeddings go, so ``purge_label`` writes what is left as a new generation and
-then SHREDS every generation that held her -- including the ones that are
-unreadable, because nothing can prove those do not hold her either.
+then SHREDS every generation it PROVED held her AND could rewrite. A
+generation it could not read, or that another model wrote, or whose other
+people did not make it into the new generation, is counted and reported and
+LEFT: deleting one person may never cost another person's enrolment, and the
+command says out loud that it is not finished rather than claiming it is.
 
 DELETION is ``purge()``: every generation, not just the newest, AND any
 ``.tmp`` a crashed save left behind -- which is a full set of embeddings under
@@ -976,37 +979,97 @@ class FaceGallery:
         Read ``_shred`` for the limit of what that buys; the caller is only
         allowed to claim that part.
 
+        A GENERATION WHOSE SURVIVORS CANNOT BE REWRITTEN IS TREATED EXACTLY
+        LIKE AN UNREADABLE ONE, and this is the second thing that nearly cost
+        him everybody else's enrolment. Two shapes reach it:
+
+        * ANOTHER MODEL'S GENERATION. During the swap window every file on
+          the disk is SFace's and every gallery the code opens is ArcFace's.
+          ``holds`` is found by reading the files RAW, which sees across
+          models; ``load()`` then refuses the cross-model generation and
+          loads NOTHING; ``self.total()`` is 0, so the save is skipped -- and
+          the old loop shredded the generation anyway. Measured 2026-09-03 on
+          a throwaway store: one SFace generation, six hunter samples and
+          four heather samples, an ArcFace gallery, ``purge_label("heather")``
+          -> empty directory. HIS enrolment destroyed to delete HERS. The
+          justification for skipping the save ("when the pool is empty there
+          is nobody else to lose") is true when the pool is genuinely empty
+          and FALSE when it is empty because the generation could not be
+          read.
+        * A GENERATION HOLDING SOMEBODY THE NEW ONE DOES NOT. The newest
+          generation holds only her; an older one holds him as well. "What is
+          left" is nothing, there is no save, and destroying the older file
+          takes his only samples with hers.
+
+        SKIPPING SUCH A GENERATION IN THE SCAN WOULD BE THE WRONG FIX: it
+        would leave her embeddings on the disk after she asked to be
+        forgotten while the command still said "verified", and what was asked
+        for is the absence of the data, not the absence of a match. So the
+        generation is COUNTED, REPORTED and LEFT, ``complete`` goes False, and
+        the caller stops claiming the delete was carried out. Destroying it is
+        still one command -- ``--delete`` with no ``--label``, the one that
+        means everything.
+
         Returns numbers, so a script can print them and a test can read them:
         which generations held her, how many files went, how many could not
-        be read and so were LEFT, which generation holds what is left, and
-        who is still enrolled.
+        be read and so were LEFT, which were another model's, which could not
+        have their survivors carried forward, whether the delete may be called
+        complete, which generation holds what is left, and who is still
+        enrolled.
         """
         if self.root is None:
             raise ValueError("this gallery has no root; it cannot be purged")
         label = str(label)
         out: dict = {"label": label, "generations_with": [], "removed": 0,
-                     "unreadable": [], "tmp_removed": 0,
+                     "unreadable": [], "foreign": [], "foreign_models": (),
+                     "not_carried": [], "tmp_removed": 0,
                      "generation": 0, "left": 0,
-                     "labels_left": (), "reason": ""}
+                     "labels_left": (), "reason": "", "complete": False}
         holds: List[int] = []
         unreadable: List[int] = []
+        foreign: List[int] = []
+        wrote_by: Dict[int, str] = {}
+        # Who ELSE is in each generation this gallery could rewrite. Read now,
+        # before anything is written, because after the save the only way to
+        # know is to read the file we are about to destroy.
+        survivors: Dict[int, set] = {}
         for gen in self.generations():
             try:
-                pool, _takes, _prov = self._read(self.path_for(gen))
+                pool, _takes, prov = self._read(self.path_for(gen))
             except Exception:
                 unreadable.append(gen)
                 continue
-            if pool.get(label):
-                holds.append(gen)
+            if not pool.get(label):
+                continue
+            wrote = str(prov.get("model") or LEGACY_MODEL)
+            if wrote != self.model:
+                # THIS GALLERY CANNOT REWRITE IT. Its vectors are a different
+                # length from a different model, so "write what is left first"
+                # has no way to carry the survivors forward -- and it is also
+                # his previous enrolment, the thing he reverts to.
+                foreign.append(gen)
+                wrote_by[gen] = wrote
+                continue
+            holds.append(gen)
+            survivors[gen] = {k for k, v in pool.items() if v and k != label}
         out["generations_with"] = list(holds)
         out["unreadable"] = list(unreadable)
+        out["foreign"] = list(foreign)
+        out["foreign_models"] = tuple(sorted(set(wrote_by.values())))
         if not holds:
-            # Nothing on the disk was PROVEN to hold her, so nothing on the
-            # disk may be destroyed on her account. The tmps still go: they
-            # are a crashed save's leftovers, the next ordinary save would
-            # shred them anyway, and one of them may be the very pool she is
-            # asking to have removed.
+            # Nothing this gallery can rewrite was PROVEN to hold her, so
+            # nothing on the disk may be destroyed on her account. The tmps
+            # still go: they are a crashed save's leftovers, the next ordinary
+            # save would shred them anyway, and one of them may be the very
+            # pool she is asking to have removed.
             out["tmp_removed"] = self._shred_tmps()
+            out["complete"] = not (unreadable or foreign)
+            if foreign:
+                log.warning("face gallery: %r is in %d generation(s) written "
+                            "by %s and this gallery is %r; they were LEFT "
+                            "ALONE and she is still on the disk",
+                            label, len(foreign),
+                            ", ".join(out["foreign_models"]), self.model)
             return out
 
         self.load()
@@ -1027,11 +1090,19 @@ class FaceGallery:
                 log.warning("face gallery: not deleting %r -- what is left "
                             "could not be saved: %s", label, exc)
                 return out
-        # No survivors means no save, and that is fine HERE and only here:
-        # the invariant the save protects is somebody else's enrolment, and
-        # when the pool is empty there is nobody else to lose.
+        # AND ONLY NOW MAY A FILE GO. A generation is destroyed once, and only
+        # once, everybody else in it is safely in the generation just written.
+        # "No survivors means no save" is fine when the pool is EMPTY; it is
+        # not a licence to destroy a generation whose survivors were never
+        # written anywhere, and reading that licence too widely is what
+        # emptied a mixed gallery.
+        not_carried: List[int] = []
+        carried = set(self.labels())
         for gen in holds:
             if gen == out["generation"]:
+                continue
+            if not survivors.get(gen, set()) <= carried:
+                not_carried.append(gen)
                 continue
             path = self.path_for(gen)
             if not path.exists():
@@ -1040,16 +1111,23 @@ class FaceGallery:
                 _shred(path)
                 out["removed"] += 1
             except OSError:
+                # It is still there and it still holds her, so the delete is
+                # not complete and may not be reported as though it were.
+                not_carried.append(gen)
                 log.warning("could not delete face gallery generation %d",
                             gen, exc_info=True)
+        out["not_carried"] = list(not_carried)
         out["tmp_removed"] = self._shred_tmps()
         out["left"] = self.total()
         out["labels_left"] = self.labels()
+        out["complete"] = not (unreadable or foreign or not_carried)
         log.info("face gallery: %r removed from %d generation(s); %d "
-                 "embeddings over %d label(s) left; %d generation(s) could "
-                 "not be read and were LEFT ALONE",
+                 "embeddings over %d label(s) left; %d unreadable, %d from "
+                 "another model and %d with survivors that could not be "
+                 "carried forward were LEFT ALONE; delete complete: %s",
                  label, out["removed"], out["left"], len(out["labels_left"]),
-                 len(unreadable))
+                 len(unreadable), len(foreign), len(not_carried),
+                 out["complete"])
         return out
 
     def _shred_tmps(self) -> int:

@@ -220,6 +220,163 @@ def test_dimensions_are_per_model_and_an_unknown_model_raises():
         fg.FaceGallery(root=None, model="buffalo_l")
 
 
+# ============================ deleting one person during the migration window
+#
+# THE WINDOW IS THE DANGEROUS PART. Between the swap landing and his
+# re-enrolment, every vector on the disk is SFace's and every gallery the code
+# opens is ArcFace's. A delete that runs in that window used to destroy the
+# generations it could not rewrite -- taking everybody ELSE in them with the
+# one person who asked to go.
+def _mixed_store(root, hunter_n: int = 6, heather_n: int = 4) -> int:
+    """His SFace enrolment, holding two people. Returns the generation."""
+    old = fg.FaceGallery(root=root, model=fg.SFACE_MODEL)
+    for i in range(hunter_n):
+        old.add("hunter", sface_vec(100 + i))
+    for i in range(heather_n):
+        old.add("heather", sface_vec(200 + i))
+    return old.save("sface enrolment")
+
+
+def test_deleting_one_person_in_the_window_may_not_take_the_others(tmp_path):
+    """THE ONE THAT DESTROYS HIS DATA.
+
+    ``purge_label`` finds the generations that hold her by reading the files
+    RAW, which sees across models; then ``load()`` refuses the cross-model
+    generation and loads nothing; then "no survivors means no save" fires over
+    a pool that is empty only because it could not be read -- and the
+    generation is shredded anyway. His enrolment goes with hers."""
+    gen = _mixed_store(tmp_path)
+    new = fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL)
+    out = new.purge_label("heather", reason="test")
+
+    assert (tmp_path / ("gen-%05d.npz" % gen)).exists(), \
+        "a generation this build cannot rewrite was destroyed anyway"
+    back = fg.FaceGallery(root=tmp_path, model=fg.SFACE_MODEL)
+    assert back.load() is True
+    assert back.count("hunter") == 6, "his enrolment went with hers"
+    assert out["removed"] == 0
+
+
+def test_a_delete_it_could_not_carry_out_is_never_called_complete(tmp_path):
+    """And she may not be told she is gone while she is still on the disk.
+    The generation is COUNTED and REPORTED, exactly like an unreadable one."""
+    gen = _mixed_store(tmp_path)
+    new = fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL)
+    out = new.purge_label("heather", reason="test")
+
+    assert out["foreign"] == [gen]
+    assert out["foreign_models"] == (fg.SFACE_MODEL,)
+    assert out["complete"] is False
+    back = fg.FaceGallery(root=tmp_path, model=fg.SFACE_MODEL)
+    back.load()
+    assert back.count("heather") == 4, "the report must not be a lie"
+
+
+def test_a_delete_inside_one_model_still_removes_her_and_reports_complete(
+        tmp_path):
+    """The control. Nothing above may make an ordinary delete timid."""
+    g = fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL)
+    for i in range(6):
+        g.add("hunter", arc_vec(300 + i))
+    for i in range(4):
+        g.add("heather", arc_vec(400 + i))
+    g.save("arcface enrolment")
+
+    out = fg.FaceGallery(root=tmp_path,
+                         model=fg.ARCFACE_MODEL).purge_label("heather")
+    assert out["complete"] is True
+    assert out["foreign"] == [] and out["not_carried"] == []
+    assert out["removed"] == 1
+    assert out["labels_left"] == ("hunter",)
+    for path in tmp_path.iterdir():
+        assert b"heather" not in path.read_bytes()
+
+
+def test_a_generation_whose_survivors_were_not_rewritten_is_left_alone(
+        tmp_path):
+    """The same rule with no model swap in sight: the newest generation holds
+    only her, an older one holds him as well. "What is left" is nothing, so
+    there is no save -- and destroying the older generation would take his
+    only samples with her."""
+    g = fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL)
+    for i in range(6):
+        g.add("hunter", arc_vec(300 + i))
+    for i in range(4):
+        g.add("heather", arc_vec(400 + i))
+    g.save("both of them")
+    just_her = fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL)
+    for i in range(4):
+        just_her.add("heather", arc_vec(400 + i))
+    just_her.save("just her", allow_shrink=True)
+
+    out = fg.FaceGallery(root=tmp_path,
+                         model=fg.ARCFACE_MODEL).purge_label("heather")
+    assert out["not_carried"] == [1]
+    assert out["complete"] is False
+    assert out["removed"] == 1, "the one holding nobody else still goes"
+    back = fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL)
+    assert back.load(generation=1) is True
+    assert back.count("hunter") == 6
+
+
+# ------------------------------------- the two callers that dropped the model
+def test_the_read_back_reads_the_generation_as_the_caller_s_own_model(
+        tmp_path):
+    """``_generation_holds`` used to build a gallery with NO model, so it was
+    SFace's while its caller was ArcFace's: the cross-model refusal returned
+    False over a generation that was still there, and the command printed
+    "verified" over her embeddings. The model is required and has no
+    default -- a default is how it got dropped."""
+    from tests.test_faceenrol import face_enrol
+
+    g = fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL)
+    g.add("heather", arc_vec(1))
+    g.add("hunter", arc_vec(2))
+    g.save("arcface")
+
+    assert face_enrol._generation_holds(tmp_path, 1, "heather",
+                                        fg.ARCFACE_MODEL) is True
+    assert face_enrol._generation_holds(tmp_path, 1, "nobody",
+                                        fg.ARCFACE_MODEL) is False
+    with pytest.raises(TypeError):
+        face_enrol._generation_holds(tmp_path, 1, "heather")
+
+
+def test_the_command_will_not_say_verified_over_another_model_s_generation(
+        tmp_path):
+    from tests.test_faceenrol import face_enrol
+
+    _mixed_store(tmp_path)
+    said = []
+    code, out = face_enrol.do_delete_label(
+        fg.FaceGallery(root=tmp_path, model=fg.ARCFACE_MODEL),
+        "heather", None, said.append)
+    text = "\n".join(said)
+    assert code == 1, text
+    assert "verified" not in text
+    assert "--delete with no --label" in text
+    assert (tmp_path / "gen-00001.npz").exists()
+    assert out["complete"] is False
+
+
+def test_the_voice_path_opens_the_gallery_for_the_configured_backend(
+        monkeypatch):
+    """``_face_gallery`` built the DEFAULT gallery, so "who do you recognise"
+    and the voice delete could open the wrong model's store -- answering
+    "nobody" over an enrolment that is right there."""
+    from jarvis import commander as cm
+
+    class Cfg:
+        def get(self, key, default=None):
+            return "opencv" if key == "camera.face_backend" else default
+
+    class Ctx:
+        def _svc(self, name):
+            return Cfg() if name == "assistant" else None
+
+    monkeypatch.setenv(fm.BACKEND_ENV, "insightface")
+    assert cm._face_gallery(Ctx()).model == fg.SFACE_MODEL
+
 # ============================================================== the detector
 class FakeInput:
     name = "input.1"
