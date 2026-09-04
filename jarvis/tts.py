@@ -875,6 +875,26 @@ BREEZE_PING_TIMEOUT_S = 2.0
 # landing on the F5 that was available in 0.53 s.
 BREEZE_STARTUP_TIMEOUT_S = 90.0
 
+# How often a Jarvis that has fallen back to F5 asks whether the Breeze
+# sidecar has come back -- on the warm thread, never on the speak path.
+#
+# One failed probe used to demote Breeze for the whole session: load() took
+# the F5 branch on every utterance after that and nothing pinged Breeze
+# again, and warm_breeze (spawned only while the unit was active) gave up
+# after its one 90 s budget. The memory gate refusing at boot is a normal
+# morning on this box (MemFree 20.9 GB against the 33 GB floor when this was
+# filed), so "he frees memory and starts the unit" is the ordinary recovery
+# -- and Jarvis kept speaking F5 with tts_engine still "breeze" until a
+# restart. Measured: a READY sidecar bound, the unit active, ten further
+# load() calls, 0 requests reached it.
+#
+# 30 s: a probe is one AF_UNIX connect (ECONNREFUSED or ENOENT in
+# microseconds while the sidecar is down, 2 s at worst against a hung one),
+# and the sidecar's own start is ~30 s, so nothing faster would find it
+# sooner. The unit-is-starting case still gets the 0.5 s cadence of
+# BREEZE_STARTUP_TIMEOUT_S first; this is what follows when that runs out.
+BREEZE_REPROBE_S = 30.0
+
 # A stream cut just past the header was still never audible, so re-rendering
 # it on F5 cannot produce a doubled fragment. The threshold has to be a
 # DURATION and not the header length: at 44 bytes exactly the fallback fires
@@ -1545,14 +1565,12 @@ class TTS:
                 # socket, which is the normal case.
                 self.warm_f5_fallback()
                 return True
-            if _breeze_unit_active():
-                # It exists and is coming up (loading, capturing, or queued on
-                # the GPU lock). Speak THIS reply in F5 at 0.53 s and let a
-                # background thread put the good voice back when it answers,
-                # rather than spending the startup budget in silence to reach
-                # the same F5. One extra `systemctl is-active` on the way
-                # down, once per session -- _engine is f5 after this.
-                self.warm_breeze()
+            # Speak THIS reply in F5 at 0.53 s; _breeze_unavailable puts a
+            # background thread on the job of getting the good voice back
+            # (warm_breeze), whether the unit is coming up or not there at
+            # all, rather than spending any budget in silence to reach the
+            # same F5. _engine is f5 after this, so load() takes the F5
+            # branch from here on and never probes on the speak path.
             return self._breeze_unavailable()
         if self._engine == "f5":
             if _ensure_f5_server():
@@ -1609,26 +1627,57 @@ class TTS:
         long as that job runs. Waiting for it inside load() cost the reply the
         whole budget in silence and then fell back to F5 anyway.
 
+        It does not give up. A unit that is active gets the startup budget
+        at its 0.5 s cadence first; after that -- or from the start, when the
+        unit is not running at all -- the sidecar is asked again every
+        BREEZE_REPROBE_S for as long as we are still on the engine we fell
+        back to. One failed probe used to be the whole session (see
+        BREEZE_REPROBE_S for the measurement); the ordinary recovery on this
+        box is him freeing memory and starting the unit by hand, and that
+        has to be enough.
+
         Daemon, one per instance, and it only ever RESTORES a choice Hunter
-        already made: it sets the engine back to "breeze" if and only if we
-        are the ones who demoted it.
+        already made: it sets the engine back to "breeze" if and only if the
+        engine is still the one we demoted it to, and it ends the moment
+        that stops being true -- his choice, or a further demotion.
         """
         t = self._breeze_warm_thread
         if t is not None and t.is_alive():
             return t
 
-        def _run():
-            if not _ensure_breeze_server(BREEZE_STARTUP_TIMEOUT_S):
-                log.warning("breeze sidecar did not come up within %.0fs; "
-                            "staying on %s for this session",
-                            BREEZE_STARTUP_TIMEOUT_S, BREEZE_FALLBACK)
-                return
+        def _still_demoted() -> bool:
+            return self._engine == BREEZE_FALLBACK
+
+        def _promote() -> None:
             if self._engine != BREEZE_FALLBACK:
-                # He changed the engine while we waited. His choice wins.
-                return
+                return               # he changed the engine meanwhile: his call
             log.info("breeze sidecar is up — the next reply uses it")
             self._engine = "breeze"
             bus.publish(Status(text="Breeze voice is back", kind="ok"))
+
+        def _run():
+            if _breeze_unit_active():
+                if _ensure_breeze_server(BREEZE_STARTUP_TIMEOUT_S):
+                    _promote()
+                    return
+                log.warning("breeze sidecar did not come up within %.0fs; "
+                            "staying on %s and asking again every %.0fs",
+                            BREEZE_STARTUP_TIMEOUT_S, BREEZE_FALLBACK,
+                            BREEZE_REPROBE_S)
+            while _still_demoted():
+                # In short steps, so a changed engine ends this within a
+                # second rather than a probe interval.
+                until = time.monotonic() + BREEZE_REPROBE_S
+                while time.monotonic() < until:
+                    if not _still_demoted():
+                        return
+                    time.sleep(min(0.5, max(0.0, until - time.monotonic())))
+                # A bare ping first: _ensure_breeze_server logs an ERROR for
+                # a unit that is not running, which is true every time round
+                # while he has not started it and is not news at that rate.
+                if _breeze_alive() and _ensure_breeze_server():
+                    _promote()
+                    return
 
         t = threading.Thread(target=_run, daemon=True, name="tts-breeze-warm")
         self._breeze_warm_thread = t
@@ -1655,6 +1704,10 @@ class TTS:
         bus.publish(Status(text="Breeze voice down — using F5 (local)",
                            kind="warn"))
         self._engine = BREEZE_FALLBACK
+        # After the demotion, so the loop finds the engine it is to watch;
+        # whatever the unit's state, because a unit that is not running is
+        # exactly the one he is about to start by hand (BREEZE_REPROBE_S).
+        self.warm_breeze()
         return self.load()
 
     def _f5_unavailable(self) -> bool:

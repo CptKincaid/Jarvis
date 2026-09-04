@@ -1199,3 +1199,100 @@ def test_a_leg_that_starts_failing_a_NEW_way_says_so_again(caplog):
     assert len(loud) == 2, [r.getMessage() for r in loud]
     assert "AttributeError" in loud[0].getMessage()
     assert "OSError" in loud[1].getMessage()
+
+
+# ------------------------------------------ a second reader of the same file
+# F33 (thawed 2026-09-04). scripts/face_enrol.py builds its OWN SensingPolicy
+# in another process; a spoken "offline mode" to the live Jarvis has to reach
+# that policy's CameraGate mid-run, or the docstrings that say the script
+# obeys "the same rules through the same objects" are false.
+
+
+def test_a_spoken_offline_in_another_process_is_seen_by_a_second_reader(
+        tmp_path):
+    """Two policies on one sensing.json, at midday (outside the curfew).
+    The live one is told "offline mode"; the script's one must answer False
+    on its very next read, and True again when he comes back online.
+    Reproduced 2026-09-03: the second reader stayed True forever."""
+    live = _policy(tmp_path)
+    live.enable(source="test")
+    script = _policy(tmp_path)
+    assert script.allowed(CAMERA) is True
+
+    live.disable(source="voice")
+    assert live.allowed(CAMERA) is False
+    assert script.allowed(CAMERA) is False
+    assert script.state().reason == sensing.REASON_OFFLINE
+
+    live.enable(source="voice")
+    assert script.allowed(CAMERA) is True
+
+
+def test_the_second_readers_gate_shuts_on_the_next_open(tmp_path):
+    """Through the gate, which is what the enrolment feed actually asks:
+    an open device, then somebody else says offline, then the next open is
+    None and the device was released."""
+    live = _policy(tmp_path)
+    live.enable(source="test")
+    script = _policy(tmp_path)
+    dev = FakeCamera()
+    gate = CameraGate(script, dev.open, closer=lambda d: d.close())
+    assert gate.open() is dev
+    live.disable(source="voice")
+    assert gate.open() is None
+    assert dev.closes == 1 and gate.is_open is False
+
+
+def test_a_timed_offline_from_another_process_carries_its_bound(tmp_path):
+    live = _policy(tmp_path)
+    live.enable(source="test")
+    script = _policy(tmp_path)
+    live.disable(until=_clock(14), source="voice")
+    st = script.state()
+    assert st.camera is False and st.reason == sensing.REASON_TIMED
+    assert st.until == _clock(14)
+
+
+def test_a_vanished_file_is_not_a_change(tmp_path):
+    """Deleting sensing.json out from under a running owner must not flip
+    it: the in-memory verdict stands and the next save puts the file back.
+    (A MISSING file at construction is still offline -- that rule is
+    unchanged and tested above.)"""
+    p = _policy(tmp_path)
+    p.enable(source="test")
+    assert p.allowed(CAMERA) is True
+    os.unlink(tmp_path / "sensing.json")
+    assert p.allowed(CAMERA) is True
+    p.disable(source="voice")
+    assert (tmp_path / "sensing.json").exists()
+    assert p.allowed(CAMERA) is False
+
+
+def test_an_owner_does_not_reread_its_own_write_as_somebody_elses(tmp_path,
+                                                                caplog):
+    """The owner's own saves are recorded as seen, so its every ``state()``
+    is not a reload and the log does not say another process changed the
+    file on each of its own switches."""
+    import logging
+    p = _policy(tmp_path)
+    with caplog.at_level(logging.INFO):
+        p.enable(source="test")
+        p.disable(source="voice")
+        p.enable(source="voice")
+        for _ in range(5):
+            p.state()
+    assert not [r for r in caplog.records
+                if "another process" in r.getMessage()]
+
+
+def test_a_corrupt_file_written_by_somebody_else_fails_shut(tmp_path):
+    """The re-read goes through ``_load``, so its fail-safe applies: a
+    second reader that finds garbage where the record was lands OFFLINE,
+    the way a fresh start on that file would."""
+    live = _policy(tmp_path)
+    live.enable(source="test")
+    script = _policy(tmp_path)
+    assert script.allowed(CAMERA) is True
+    (tmp_path / "sensing.json").write_text("{not json", encoding="utf-8")
+    assert script.allowed(CAMERA) is False
+    assert script.state().failsafe is True

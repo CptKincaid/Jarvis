@@ -166,7 +166,26 @@ STILL_CODING_DESPITE_THE_WORD_CLASS = [
     "do I have a course module",
     "do I have any classes to clean up today",
     "which classes do I have that subclass Command",
+    # F38 (measured 09-03): the class LIFECYCLE vocabulary. Every one of
+    # these wears "my class" and a where/when/next frame, none of the
+    # nouns above, and all eleven flipped claude:code-cue -> local:calendar.
+    "where is my class defined",
+    "where is my class declared",
+    "where is my class used",
+    "when is my class instantiated",
+    "when is my class constructed",
+    "when does my class get called",
+    "where's my base class",
+    "which class is next in the pipeline",
+    "which of my classes is next in the chain",
 ]
+
+
+def test_the_name_of_his_next_class_is_still_the_timetable():
+    """"called" is code only in its passive shape: "what is my next class
+    called" asks the timetable for a name and must not flip to code."""
+    assert class_diary("what is my next class called") is True
+    assert class_diary("when does my class get called") is False
 
 
 @pytest.mark.parametrize("text", STILL_CODING_DESPITE_THE_WORD_CLASS)
@@ -403,6 +422,30 @@ def test_a_kind_he_has_no_course_for_falls_through_rather_than_guessing():
     assert _ask(_cal(events), "what is my next lecture") is None
     assert _ask(_cal(events), "when is my next seminar") is None
     assert _ask(_cal(events), "when is my next tutorial") is None
+
+
+def test_my_next_lecture_means_the_next_course_that_is_not_a_lab():
+    """F39 (09-03). "what's my next lecture" and "what is my next lecture"
+    are in HIS_TIMETABLE as his own phrasings, and both answered None by
+    design: "lecture" was looked for in a course TITLE, and none of his
+    carries the word. The router then sent it to local:calendar, forced_call
+    found nothing, and the model reached for get_calendar range=next -- the
+    next EVENT of any kind, which is the MBA-admissions-Zoom answer this
+    rung was written to stop. A lecture is any course that is not a lab."""
+    lab = NOW + timedelta(hours=1)
+    lecture = NOW + timedelta(hours=3)
+    events = _course("ELECTRICAL DESIGN LAB II", lab, WISENBAKER) + \
+        _course("MAGNETIC RESONANCE ENGR", lecture, ETB)
+    for text in ("what's my next lecture", "what is my next lecture",
+                 "when is my next lesson", "when does my next lecture start"):
+        res = _ask(_cal(events), text)
+        assert res is not None, text
+        assert "MAGNETIC RESONANCE ENGR" in res.reply, (text, res.reply)
+        assert "ELECTRICAL" not in res.reply, (text, res.reply)
+    assert _ask(_cal(events), "what's my next lecture").reply.startswith(
+        "Your next lecture is")
+    # ...and the lab word still reaches the lab, sooner though it is.
+    assert "ELECTRICAL" in _ask(_cal(events), "when is my next lab").reply
 
 
 def test_a_named_lab_course_still_wins_over_the_kind_filter():

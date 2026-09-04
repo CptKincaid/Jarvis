@@ -898,6 +898,10 @@ _NEXT_CLASS_RX = re.compile(
 # 'electrical design lab ii'; the rest of the nouns appear in a title the
 # way they are said.
 _KIND_TITLE = {"lab": r"labs?|laborator(?:y|ies)"}
+# Kinds that name a WAY of being taught rather than a word in a title:
+# "lecture" and "lesson" mean any course that is not a lab. seminar /
+# tutorial / recitation stay title-matched -- a course that is one says so.
+_GENERIC_KINDS = frozenset({"lecture", "lesson"})
 # A one-off sitting is invisible to courses.recurring_courses (MIN_DATES =
 # 2), so a make-up lab or the first meeting of a term is silently dropped
 # and a LATER class is named "your next class". Probed: a single SENIOR
@@ -959,6 +963,19 @@ def _h_next_class(c, t, m):
         if not course:
             return None
         cand = [course]
+    elif kind in _GENERIC_KINDS:
+        # "my next lecture" / "my next lesson": GENERIC words for a taught
+        # sitting, not titles. None of his courses is called "lecture"
+        # (BIOSENSORS, MAGNETIC RESONANCE ENGR, ELECTRICAL DESIGN LAB II),
+        # so title-matching answered None and the model then reached for
+        # get_calendar's next EVENT -- the MBA-admissions-Zoom trap this
+        # rung exists to close (F39, 09-03). A lecture is every course
+        # that is not a lab; a timetable that is all labs still falls
+        # through, because then there is no lecture to name.
+        cand = [n for n in names
+                if n not in _kinded_courses("lab", names, courses_mod.fold)]
+        if not cand:
+            return None
     elif kind:
         # He said "lab", not "class": naming a lecture here is the confident
         # wrong answer this command exists to remove. No course of that kind
@@ -2898,6 +2915,50 @@ _BRIEFING_NO_RX = re.compile(
 # same one. 60 s: the offer's own line, the 15 s window it opens, and room
 # for one wake-word retry on top.
 BRIEFING_OFFER_TTL_S = 60.0
+
+
+def _event_offer_expired(pending: dict) -> bool:
+    """Is a calendar read-back ("...Shall I add it, sir?") past its life?
+
+    calendar.add_event stamps ``made_at`` (monotonic) when it parks the
+    interpretation; the read-back takes the next yes for OFFER_TTL_S, the
+    same life as the wake-alarm and teach offers. A dict with no stamp --
+    the shape every test built before the stamp existed, and any older
+    caller -- is treated as LIVE: it is a question Jarvis asked, and the
+    hole this closes was a live question being counted as none.
+    """
+    try:
+        made = float(pending.get("made_at") or 0.0)
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return bool(made) and (time.monotonic() - made) > OFFER_TTL_S
+
+# ---- in-app face enrolment (jarvis/enrolrun.py) ----------------------
+# THE COMMIT WORD IS TYPED AND ONLY TYPED, so this pattern is deliberately
+# the bare word and nothing else -- no "yes", no "go ahead", no word bag.
+# The whole reason the commit is typed is that owner.mode is 'shadow' on his
+# box and the owner gate therefore refuses nothing; a loose pattern here
+# would give that back by letting an overheard "okay" start a biometric
+# write that REPLACES his gallery. Both spellings, because he types one
+# about as often as the other.
+_ENROL_CONFIRM_RX = re.compile(r"^(?:enrol|enroll)[.!]*$", re.I)
+# The mid-run controls. End-anchored for the same reason the briefing
+# offer's are: these are live while a camera is on, and a word bag would let
+# a sentence about something else stop a run halfway -- or, worse, fail to
+# stop one when he meant it to.
+_ENROL_STOP_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:stop|cancel|abort|never ?mind|forget it|"
+    r"that'?s enough|enough)"
+    r"(?:\s+(?:the\s+)?(?:enrol(?:ment|ling)?|enroll(?:ment|ing)?|"
+    r"capture|that))?"
+    r"(?:[, ]+(?:jarvis|please|thanks))*[.!]*$", re.I)
+_ENROL_READY_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:ready|next|go|go on|i'?m ready|i am ready|"
+    r"carry on)(?:[, ]+(?:jarvis|please))*[.!]*$", re.I)
+_ENROL_WAIT_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:wait|hold on|hold|not yet|one moment|"
+    r"just a moment|hang on|give me a second|give me a sec)"
+    r"(?:[, ]+(?:jarvis|please))*[.!]*$", re.I)
 # While an alarm rings (spec 5.2 a): these words stop it, "snooze [N]" snoozes.
 _RING_STOP_RX = re.compile(
     r"^(?:stop|dismiss|okay|ok|i'?m up|i am up|shut it off|shut up|enough|"
@@ -5362,20 +5423,53 @@ _SEND_NOT_RX = re.compile(
 # "Yes. Thank you." is one of his own logged answers (jarvis.log.1:17109)
 # and a comma-only separator made the full stop end the sentence, so a
 # clean yes fell through to the silent-drop branch while "yes, thank you"
-# worked. The words that may follow are unchanged -- this widens the
-# PUNCTUATION, not the vocabulary.
-_SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|"
-              r"it|that|send it|send that|go ahead|do it))*[?.!]*$")
+# worked. The words that may follow were untouched by that -- it widened
+# the PUNCTUATION, not the vocabulary.
+# A pronoun after "to" names the person he has just heard in the read-back
+# -- "yes, send it to her" -- and is part of the yes (09-04). Before this the
+# F23 correction grammar read "her" as a NEW recipient and asked "I've no
+# address for her, sir. What is it?" on the one irreversible path. "and" is
+# a connector only: every word after it still has to be in this vocabulary,
+# so "yes, and turn the lights off" is no more a yes than it was.
+_SEND_PRONOUNS = frozenset(("her", "him", "them", "it", "you", "me", "us",
+                            "that", "this", "herself", "himself",
+                            "themselves", "myself", "yourself"))
+# What a pronoun or demonstrative after "to" stands for is the recipient he
+# has JUST been read -- with or without a noun hung on it: "to her", "to her
+# address", "to that address", "to the same one", "that person", "her
+# inbox". Every one of these is the draft said back; none of them names
+# anyone new. Only a NAME or an ADDRESS after "to" corrects. (The second
+# review, 09-04: "yes send it to her address" had the possessive stripped
+# BEFORE the pronoun check, so "address" became the corrected recipient and
+# he heard "I've no address for address, sir".)
+_SEND_REF_NOUN = r"(?:e-?mail address|e-?mail|address|inbox|mailbox|one|person)"
+_SEND_REF = (r"(?:(?:her|his|their|its|that|this|the same|the usual|the)\s+"
+             + _SEND_REF_NOUN +
+             r"|her|him|them|me|us|you|it|that|this|the same|same)")
+_SEND_REF_RX = re.compile(r"^" + _SEND_REF + r"$", re.I)
+_SEND_TO_REF = (r"(?:send (?:it|that|this) )?(?:to|over to|on to) " + _SEND_REF)
+# "from the same account" is the account he was just read, not a new one.
+_SEND_FROM_SAME = r"(?:send (?:it|that|this) )?from (?:the |my |that |this )?(?:same|usual|that|this) account"
+_SEND_SAME_ACCT = frozenset(("same", "that", "this", "usual", "that same",
+                             "this same", "the same"))
+_SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|and|"
+              r"send it|send that|go ahead|do it|" + _SEND_TO_REF + r"|"
+              + _SEND_FROM_SAME + r"|" + _SEND_REF +
+              r"))*[?.!]*$")
 # "ok" / "okay" / "sure" / "alright" are deliberately ABSENT. They are the
 # words a man says while still reading the read-back, and this is the one
 # question in the app where "probably yes" must not be enough. They are
 # caught by _SEND_MAYBE_RX below and asked again rather than dropped in
 # silence -- silence is how he learns the feature does not work.
+# The literal echo of the read-back -- "send it to her", "send it to him
+# please", "please send it to her" -- is a yes in its own right, not only
+# a tail on one (the second review, 09-04). "please" may lead it.
 _SEND_YES_RX = re.compile(
-    r"^(?:jarvis[,\s]+)?"
+    r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?"
     r"(?:yes|yeah|yep|yup|aye|affirmative|correct|confirmed?|certainly|"
     r"absolutely|definitely|of course|go ahead|do it|send it|send that|"
-    r"send it now|please do|that'?s right|fire away|off you go)"
+    r"send it now|please do|that'?s right|fire away|off you go|"
+    r"send (?:it|that|this) (?:to|over to|on to) " + _SEND_REF + r")"
     + _SEND_TAIL, re.I)
 _SEND_NO_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:no[,\s]+)?"
@@ -5388,6 +5482,142 @@ _SEND_MAYBE_RX = re.compile(
     r"(?:ok(?:ay)?|alright|all right|sure|fine|right|very well|mhm|mm|"
     r"uh huh|i guess|i suppose|maybe|probably|whatever|sounds good|"
     r"i think so|if you like|why not)" + _SEND_TAIL, re.I)
+
+# ---- a yes that carries a CORRECTION (F23) ---------------------------------
+# "yes, send it to Dana" / "yes, but to her work address instead" / "yes,
+# from my work account". parse_send_answer says None (the tail is not in
+# the yes vocabulary), and the vague leg then re-asked the ORIGINAL
+# question -- so the next bare yes sent the file to Heather, and the
+# correction he put inside his yes was discarded without a word. A
+# correction is neither a yes nor a change of subject: the draft is
+# dropped and the SAME file is read back again to the corrected recipient
+# or account. Never sent. The "to" must follow a word that makes it a
+# recipient ("send it to", "yes to", "but to"): "Yeah, so you should be
+# able to look that up." has a "to" in it too.
+_SEND_CORRECT_TO_RX = re.compile(
+    r"\b(?:send|e-?mail|mail|forward|shoot|fire|it|that|this|one|file|"
+    r"but|rather|instead|no|yes|yeah|yep|okay|ok|sure|actually)[,\s]+"
+    r"(?:it\s+|that\s+|this\s+)?to\s+(?P<who>[^,.!?]+?)"
+    r"(?:\s+(?:instead|rather|please|thanks|thank you|sir|jarvis|now|then))*"
+    r"[.!?,]*$", re.I)
+_SEND_CORRECT_ACCT_RX = re.compile(
+    r"\b(?:from|using|via|use|with|out of|off)\s+(?:my\s+|the\s+)?"
+    r"(?P<acct>[\w'\-]+(?:\s+[\w'\-]+)?)\s+(?:account|mailbox|e-?mail|"
+    r"identity)\b", re.I)
+
+
+def _send_correction(said: str) -> Optional[tuple[str, str]]:
+    """(recipient, account hint) a read-back answer carries, or None.
+
+    Either half may be "". An address said outright counts as the
+    recipient whatever surrounds it.
+    """
+    t = " ".join(str(said or "").split())
+    if not t:
+        return None
+    who, acct = "", ""
+    am = _SEND_CORRECT_ACCT_RX.search(t)
+    if am:
+        acct = am.group("acct").strip()
+        t_wo = t[:am.start()] + t[am.end():]
+        # "from the same account" / "from that account" is the account he
+        # was just read, not a new one: a confirmation, never "I've no
+        # same account, sir".
+        if acct.lower() in _SEND_SAME_ACCT:
+            acct = ""
+    else:
+        t_wo = t
+    addr = outbox.parse_address(t_wo)
+    if addr:
+        who = addr
+    else:
+        tm = _SEND_CORRECT_TO_RX.search(t_wo)
+        if tm:
+            who = tm.group("who").strip()
+            # A pronoun or demonstrative, with or without a noun on it --
+            # "to her", "to her address", "to that address", "to the same
+            # one", "to that person" -- is the person he was just read,
+            # not a new one (09-04). It is a confirmation, never a
+            # correction, and never "I've no address for her / address".
+            # This is tested BEFORE the possessive is stripped: stripping
+            # first is how "her address" became a recipient called
+            # "address" (the second review).
+            if _SEND_REF_RX.match(who):
+                who = ""
+            else:
+                # "to her work address" names an address of a person, not
+                # a person: hand it over as the possessive-less form the
+                # people book might know, and let the address question do
+                # the rest.
+                who = re.sub(r"^(?:her|his|their)\s+", "", who, flags=re.I)
+                if who.lower() in _SEND_PRONOUNS:
+                    who = ""
+    if not who and not acct:
+        return None
+    return who, acct
+
+
+# ---- "Which account?" / "What is it?" (F21) --------------------------------
+# outbox.prepare asks two more questions the file lane could not hear the
+# answer to: "Which account should I send from, sir — personal, work,
+# school?" (three identities, send_file.from blank -- the SHIPPED default)
+# and "I've no address for Dana, sir. What is it?". Neither armed a slot,
+# question_open() was False, the app gave the answer the 4 s window and
+# the intent gate, and "school" / "dana at example dot com" came back as
+# "Was that for me?". Every send dead-ended for him unless the whole
+# sentence was re-said with "from my school account".
+SENDASK_TTL_S = 45.0           # the same life as "Which one, sir?" (FILEPICK_TTL_S)
+
+
+@dataclass
+class SendAsk:
+    """A send that stopped at a question: what it still needs, and the
+    pieces to run outbox.prepare again once it has it."""
+    kind: str                  # "account" | "recipient"
+    said_file: str             # the file phrase (or the chosen path)
+    who: str                   # the recipient as said, "" for WHO_LINE
+    hint: str                  # the account hint as said
+    source: str = "voice"
+    made_at: float = 0.0
+    reasked: bool = False
+    to_name: str = ""          # the name he said, when ``who`` is an address
+
+    def stale(self, now: Optional[float] = None) -> bool:
+        now = time.monotonic() if now is None else float(now)
+        return (now - float(self.made_at or 0.0)) > SENDASK_TTL_S
+
+
+# "from my school account" / "the work one" / "school, please" -> "school"
+_ACCOUNT_ANSWER_LEAD_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:(?:send|e-?mail|mail)\s+it\s+)?"
+    r"(?:(?:from|use|using|with|via|it'?s|it\s+is|that'?s|the|my)[,\s]+)*",
+    re.I)
+_ACCOUNT_ANSWER_TAIL_RX = re.compile(
+    r"(?:[,\s]+(?:account|mailbox|e-?mail|address|identity|one|please|"
+    r"thanks|thank you|sir|jarvis))*[.!?,\s]*$", re.I)
+# "it's dana at example dot com" / "send it to dana@x.com" / "her address is
+# ..." -> the part that is the address or the name
+_RECIPIENT_ANSWER_LEAD_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:(?:send|e-?mail|mail)\s+it\s+to|to|try|use|"
+    r"it'?s|it\s+is|that'?s|(?:her|his|their|the)\s+(?:e-?mail\s+)?"
+    r"address\s+is|(?:her|his|their)\s+e-?mail\s+is)[,\s]+", re.I)
+_RECIPIENT_ANSWER_TAIL_RX = re.compile(
+    r"(?:[,\s]+(?:instead|rather|then|please|thanks|thank you|sir|jarvis))*"
+    r"[.!?,\s]*$", re.I)
+
+
+def _account_answer(text: str) -> str:
+    t = " ".join(str(text or "").split())
+    t = _ACCOUNT_ANSWER_LEAD_RX.sub("", t, count=1)
+    t = _ACCOUNT_ANSWER_TAIL_RX.sub("", t, count=1)
+    return t.strip(" ,.!?")
+
+
+def _recipient_answer(text: str) -> str:
+    t = " ".join(str(text or "").split())
+    t = _RECIPIENT_ANSWER_LEAD_RX.sub("", t, count=1)
+    t = _RECIPIENT_ANSWER_TAIL_RX.sub("", t, count=1)
+    return t.strip(" ,.!?")
 
 
 # ---- "Which one, sir?" ---------------------------------------------------
@@ -5558,16 +5788,56 @@ def _send_file_offer(c, prep, who: str, hint: str):
     def _resume(path):
         again = outbox.prepare(cfg, c._svc("memory"), str(path), who,
                                account_hint=hint, chosen=path)
-        if again.draft is None:
-            return CommandResult(handled=True, reply=again.ask, speak=True,
-                                 status=again.status)
-        c.stash_send(again.draft)
-        return CommandResult(handled=True, speak=True, status=again.status,
-                             reply=outbox.read_back(again.draft))
+        return _send_file_finish(c, again, str(path), who, hint)
 
     c.stash_filepick(prep.candidates, _resume)
     return CommandResult(handled=True, reply=prep.ask, speak=True,
                          status=prep.status)
+
+
+def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
+                      to_name: str = "", reasked_kind: str = ""):
+    """What every path through the file lane ends in: a read-back, or the
+    question it stopped at -- ARMED, so the answer can be heard.
+
+    Four callers: the first utterance (_h_send_file), the "Which one, sir?"
+    answer (_send_file_offer), the account / address answer
+    (_try_sendask_answer) and a corrected yes (_try_send_confirm). Until
+    F21 only the first two existed, and only the file question was parked;
+    "Which account should I send from, sir?" and "What is it?" were spoken
+    with no slot behind them.
+
+    ``to_name`` is what to call the recipient when the address itself was
+    the answer -- outbox resolves an address to a nameless draft, and the
+    read-back should still say "to Dana, at dana at ..." -- and it rides
+    on the next question too, when there is one in between. ``reasked_kind``
+    is the kind of the question just answered, when it had already been
+    asked twice: coming back to the SAME question spends it rather than
+    asking a third time. It was a bare flag until 09-04, and the shipped
+    default (three accounts, no send_file.from) asks the address and then
+    the account: a once re-asked address made the account question --
+    never yet asked -- "asked twice; letting it go". The read-back's own
+    re-ask lives on the draft and is untouched by either.
+    """
+    if prep.draft is None:
+        if prep.candidates:
+            return _send_file_offer(c, prep, who, hint)
+        kind = ("account" if prep.status == "Which account?"
+                else "recipient" if prep.status == "No address" else "")
+        if kind:
+            if reasked_kind == kind:
+                log.info("send-file: %s asked twice; letting it go", kind)
+                return CommandResult(handled=True, speak=True, status="Dropped",
+                                     reply=outbox.ASK_DROPPED_LINE)
+            c.stash_sendask(SendAsk(kind=kind, said_file=said_file, who=who,
+                                    hint=hint, to_name=to_name))
+        return CommandResult(handled=True, reply=prep.ask, speak=True,
+                             status=prep.status)
+    if to_name and not prep.draft.to_name:
+        prep.draft.to_name = to_name
+    c.stash_send(prep.draft)
+    return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
+                         speak=True, status=prep.status)
 
 
 def _h_send_file(c, t, m):
@@ -5589,14 +5859,7 @@ def _h_send_file(c, t, m):
                                    "sir; that one first.")
     prep = outbox.prepare(c._svc("assistant"), c._svc("memory"), said_file,
                           who, account_hint=hint)
-    if prep.draft is None:
-        if prep.candidates:
-            return _send_file_offer(c, prep, who, hint)
-        return CommandResult(handled=True, reply=prep.ask, speak=True,
-                             status=prep.status)
-    c.stash_send(prep.draft)
-    return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
-                         speak=True, status=prep.status)
+    return _send_file_finish(c, prep, said_file, who, hint)
 
 
 def _h_network(c, t, m):                                   # 3267-3279
@@ -6147,7 +6410,16 @@ _TRANSCRIPT_CLEAR_RX = re.compile(
     r"(?:\s+(?:pane|panel|window|view|log|history|area))?"
     r"(?:\s+(?:clean|out|off))?"
     r"(?:\s+(?:right\s+)?now)?"
-    r"(?:[, ]+(?:please|jarvis|sir|for me|would you|will you|thanks))*"
+    # "thanks" was in and "thank you" was not, so "clear the transcript
+    # thank you" -- bare, the way the hotword leaves it -- reached NO rung
+    # and went to the classifier, the silent drop this whole rung exists to
+    # end (measured 2026-09-03: rx=False, registry=None, tier1=None,
+    # multi=[]).  With a comma the compound splitter rescued it, which is
+    # not a distinction he can hear himself making.  Longest first: the
+    # alternation is ordered, and "thanks" would otherwise claim the
+    # "thank" of "thank you" and leave the rest unmatched.
+    r"(?:[, ]+(?:please|jarvis|sir|for me|would you|will you|"
+    r"thank you very much|thank you|thanks))*"
     r"[?.!]*$", re.I)
 # Both facts in one breath: the memory is untouched, and the cards do not
 # come back. No read-back and no undo= go with it -- see _h_transcript_clear.
@@ -6156,7 +6428,7 @@ TRANSCRIPT_CLEAR_LINE = ("Screen's clear, sir. Nothing forgotten — "
 
 
 def _standing_questions(c) -> int:
-    """How many approval questions are still waiting on him.
+    """How many unanswered question CARDS the wipe is going to leave up.
 
     TranscriptView.clear_all deliberately KEEPS an unanswered approval
     card -- it carries the only hand-answerable ALLOW / DENY for a Claude
@@ -6164,10 +6436,21 @@ def _standing_questions(c) -> int:
     when the wipe lands, and "Screen's clear, sir" would be the wrong
     thing to say.  The wipe itself is fire-and-forget (the commander runs
     on worker threads and must never touch a Tk surface), so the fact is
-    read from the approvals SERVICE, which is the same fact the pane is
-    keying on: ApprovalService.pending() holds exactly the requests whose
-    cards are unanswered, and answer()/_resolve() is the only thing that
-    empties it.
+    read from the services, which key on the same thing the pane does.
+
+    TWO producers fill that dict, not one, and counting only the first was
+    a wrong sentence spoken out loud (found 2026-09-03, review).
+    ApprovalService.pending() holds the Claude requests; the "Was that for
+    me?" prompt goes into the SAME TranscriptView._approvals via
+    add_approval (main_window._ev_uncertain) and ApprovalService has never
+    heard of it.  An unanswered one is easy to reach -- app._ask_uncertain
+    returns without publishing UncertainResolved when the 5 s window hears
+    nothing, or when there is no mic at all -- and clear_all then keeps
+    that card while this said "Screen's clear, sir", with an 1800 ms toast
+    as the only correction.  Worse, every LATER wipe kept it too, so no
+    voice command could empty the pane again.  ``c.uncertain_open`` is the
+    app's count of those (wired beside claim_uncertain in App.__init__);
+    a commander with no app behind it simply has none.
 
     Reading it here rather than reporting it back from the window is also
     the only version that cannot lose a race: a Status published from
@@ -6176,17 +6459,28 @@ def _standing_questions(c) -> int:
     the status after the wipe was queued), so the window's correction
     would be overwritten by the flat "Transcript cleared".
 
-    Never raises and never blocks the wipe: with no approvals service, or
-    a service that throws, this answers 0 and the plain line is spoken.
+    Never raises and never blocks the wipe: with no approvals service, no
+    app hook, or either of them throwing, the missing half counts 0 and
+    the wipe still happens.  ``c._svc`` is NOT used for the approvals leg
+    -- it reads ``self.services``, which the 13 test-shaped commanders
+    built with ``object.__new__`` do not have, and an AttributeError here
+    was answered "Command failed: clear transcript" with the pane never
+    wiped at all, because the publish comes after this count.
     """
-    ap = c._svc("approvals") if hasattr(c, "_svc") else None
-    if ap is None:
-        return 0
-    try:
-        return len(ap.pending() or ())
-    except Exception:                           # noqa: BLE001 - cosmetic
-        log.exception("approvals.pending failed; reporting a plain wipe")
-        return 0
+    held = 0
+    ap = getattr(getattr(c, "services", None), "approvals", None)
+    if ap is not None:
+        try:
+            held += len(ap.pending() or ())
+        except Exception:                       # noqa: BLE001 - cosmetic
+            log.exception("approvals.pending failed; reporting a plain wipe")
+    open_uncertain = getattr(c, "uncertain_open", None)
+    if callable(open_uncertain):
+        try:
+            held += int(open_uncertain() or 0)
+        except Exception:                       # noqa: BLE001 - cosmetic
+            log.exception("uncertain_open failed; reporting a plain wipe")
+    return held
 
 
 def transcript_clear_line(held: int) -> str:
@@ -6955,12 +7249,62 @@ def _h_face_enrol(c, t, m):
     gallery = _face_gallery(c)
     if gallery is None:
         return _face_config_result()
+    # THE IN-APP OFFER, and only for HIM and only for a plain full run.
+    #
+    # Everything else falls through to the hand-over below, unchanged, and
+    # each exclusion has its own reason. A NAMED PERSON needs consent typed
+    # at a real terminal (scripts/face_enrol.consent wants two TTYs and the
+    # person's own name), which a window driven by whoever is already logged
+    # in cannot reproduce -- so "enrol Heather" keeps the command line. A
+    # NAMED POSE is an append-shaped run: one station is six takes, under
+    # the eight-sample floor, so in-app it would capture for a minute and
+    # then refuse, while the terminal path can say --append.
+    if who == owner and not pose:
+        offer = _enrol_offer(c)
+        if offer is not None:
+            return offer
     out = ee.enrol_answer(gallery, who, owner=owner,
                           poses=(pose,) if pose else ())
     # The command is SHOWN, not spoken -- see CommandResult.display_only.
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          display_only=out.get("display_only") or None,
                          status=out["status"])
+
+
+def _enrol_offer(c):
+    """Park "type enrol to start" on ``services.enrol_offer``, or None.
+
+    None means "I cannot offer this here" -- no camera console on this box --
+    and the caller then falls through to the terminal hand-over, which is the
+    honest answer rather than a refusal with no way forward.
+
+    A preflight the TERMINAL could not fix either (the curfew, offline mode,
+    identity switched off, missing weights) does not fall through: it speaks
+    its own sentence, because handing him a command line that is about to hit
+    exactly the same wall wastes his time twice.
+    """
+    from jarvis import enrolrun as er
+    services = getattr(c, "services", None)
+    worker = getattr(services, "preview_worker", None)
+    if worker is None:
+        return None                  # headless: the terminal is the answer
+    cfg = c._svc("assistant")
+    if cfg is None:
+        return None
+    pre = er.preflight(cfg, sensing=c._svc("sensing"), worker=worker,
+                       services=services)
+    if not pre["ok"]:
+        if pre["reply"] == er.E9:
+            return None              # "not in this window" -- hand it over
+        return CommandResult(handled=True, speak=True, reply=pre["reply"],
+                             status="Enrolment: %s" % pre["reason"])
+    try:
+        services.enrol_offer = {"made_at": time.time()}
+    except Exception:                # noqa: BLE001 - a slim services
+        log.debug("could not park the enrolment offer", exc_info=True)
+        return None
+    return CommandResult(handled=True, speak=True, reply=er.E1,
+                         status="Enrolment: type enrol to start")
 
 
 def _h_face_forget(c, t, m):
@@ -9061,6 +9405,7 @@ class Commander:
     # (tests/test_custom_phrases.py) builds a Commander with __new__ and
     # fills in only what it needs.
     claim_uncertain: Optional[Callable[[bool], bool]] = None
+    uncertain_open: Optional[Callable[[], int]] = None
     _last_turn: Optional[LastTurn] = None
     _last_undo: Optional[tuple] = None
     _confidence: Optional[float] = None
@@ -9084,6 +9429,7 @@ class Commander:
     _strict_reasked: bool = False
     _pending_objection: Optional[tuple] = None
     _pending_send: Any = None                 # outbox.Draft awaiting a yes
+    _pending_sendask: Optional[SendAsk] = None  # "Which account?" / "What is it?"
     _objection_timer = None
     _objections = None
     # Monotonic; 0.0 means "no building has been named this session", which
@@ -9114,6 +9460,7 @@ class Commander:
         # Set when the Claude manager refuses an out-of-project task and
         # offers the terminal; the next "yes" opens it (spec 7 / OUTSIDE_LINE).
         self._pending_terminal_slug = ""
+        self._pending_terminal_made = 0.0     # monotonic; OFFER_TTL_S life
         # Quiz mode: the QuizSession whose open question the next utterance
         # answers (jarvis.tools.quiz); the flashcard store behind it is
         # built on first use. The document last explained, for "read it to
@@ -9135,6 +9482,10 @@ class Commander:
         # App hook: a spoken "that was for you" answers the open card too
         # (claim_uncertain(yes) -> bool, whether a card was waiting).
         self.claim_uncertain: Optional[Callable[[bool], bool]] = None
+        # App hook: how many "Was that for me?" cards are still unanswered.
+        # The SECOND producer of the pane's question cards, and the one
+        # ApprovalService.pending() cannot see -- see _standing_questions.
+        self.uncertain_open: Optional[Callable[[], int]] = None
         # The last utterance handled, for "no, I said ..." and "that was
         # for you"; the app's _last_user_text is not visible from here.
         self._last_turn: Optional[LastTurn] = None
@@ -9149,6 +9500,8 @@ class Commander:
         self._answered_pending = False
         self._strict_reasked = False
         self._pending_send = None
+        # A send that stopped at "Which account?" / "What is it?" (F21).
+        self._pending_sendask: Optional[SendAsk] = None
         # He advised against something and asked "shall I set it anyway?":
         # (run, spoken line, Objection, stamp). Its own slot because its
         # default on ambiguity is the OPPOSITE of the read-back's -- see
@@ -9222,7 +9575,8 @@ class Commander:
             armed = (getattr(self, "_pending_send", None),
                      getattr(self, "_pending_filepick", None),
                      getattr(self, "_pending_destructive", None),
-                     getattr(self, "_pending_destructive_meta", None))
+                     getattr(self, "_pending_destructive_meta", None),
+                     getattr(self, "_pending_sendask", None))
             self._answered_pending = False
             result = self._handle_inner(text, source)
             self._drop_stranded_questions(armed, result, source)
@@ -9266,11 +9620,17 @@ class Commander:
         """
         if self._answered_pending or result is None:
             return
-        send, pick, destructive, meta = armed
+        send, pick, destructive, meta = armed[:4]
+        ask = armed[4] if len(armed) > 4 else None
         if send is not None and getattr(self, "_pending_send", None) is send \
                 and self._same_room(getattr(send, "asked_from", "voice"), source):
             log.info("send read-back dropped: the turn was answered elsewhere")
             self._pending_send = None
+        if ask is not None and getattr(self, "_pending_sendask", None) is ask \
+                and self._same_room(getattr(ask, "source", "voice"), source):
+            log.info("send %s question dropped: the turn was answered elsewhere",
+                     ask.kind)
+            self._pending_sendask = None
         if pick is not None and getattr(self, "_pending_filepick", None) is pick \
                 and self._same_room(pick[2] if len(pick) == 5 else "voice", source):
             log.info("which-one dropped: the turn was answered elsewhere")
@@ -9364,6 +9724,16 @@ class Commander:
                     return True
             except (TypeError, ValueError):
                 pass
+        # "Which account should I send from, sir?" / "What is it?" -- the
+        # file lane's other two questions (F21). Same rule as the two above.
+        ask = getattr(self, "_pending_sendask", None)
+        if ask is not None:
+            try:
+                if not ask.stale():
+                    return True
+            except Exception:  # noqa: BLE001 - a slim/duck-typed slot
+                log.debug("question_open: send ask staleness failed",
+                          exc_info=True)
         # A read-back ("Cancel all three alarms, sir?") and the objection
         # ("Shall I set it anyway?") both hold the floor for DESTRUCTIVE_TTL_S.
         for name, size in (("_pending_destructive", 3), ("_pending_objection", 4)):
@@ -9374,6 +9744,32 @@ class Commander:
                         return True
                 except (TypeError, ValueError):
                     pass
+        # Three more rungs that take the next plain yes, and were missing
+        # here (F37, 09-03): the teach offer (3a''), Claude's terminal
+        # offer (3b) and the calendar read-back (3c). Missing meant the
+        # first-wake briefing offer was spoken straight after "Dentist,
+        # tomorrow at 3 pm. Shall I add it, sir?" -- two questions on the
+        # table, and his yes landed on the event. Each carries its expiry
+        # so a dead offer never holds the floor.
+        teach = getattr(self, "_pending_teach", None)
+        if isinstance(teach, tuple) and len(teach) == 3:
+            try:
+                if time.monotonic() - float(teach[2]) <= OFFER_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                pass
+        if getattr(self, "_pending_terminal_slug", ""):
+            made = getattr(self, "_pending_terminal_made", 0.0) or 0.0
+            try:
+                if not made or time.monotonic() - float(made) <= OFFER_TTL_S:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        calendar = getattr(getattr(self, "services", None), "calendar", None)
+        pending_event = getattr(calendar, "pending_event", None)
+        if isinstance(pending_event, dict) and pending_event:
+            if not _event_offer_expired(pending_event):
+                return True
         # "Shall I hand that to Claude, sir, or is it a quick one for me?"
         # is a question Jarvis asked too. The router owns it (its own
         # ASK_TTL_S, and .pending() self-expires), and it was missing here:
@@ -9459,6 +9855,24 @@ class Commander:
         # and drops its draft on any non-answer. A read-back armed outside
         # handle() (a proactive offer) had no such accident protecting it.
         self._pending_send = None
+        self._pending_sendask = None
+
+    def stash_sendask(self, ask: SendAsk):
+        """"Which account should I send from, sir?" / "What is it?" --
+        park the half-made send so the answer can be heard (F21).
+
+        The same slot rule as the other three: one question on the floor
+        at a time, and the answer rung (``_try_sendask_answer``) re-runs
+        outbox.prepare with the missing piece and ends in the ordinary
+        read-back, so answering it still sends nothing.
+        """
+        ask.source = self._turn_source
+        ask.made_at = time.monotonic()
+        self._pending_sendask = ask
+        self._pending_send = None
+        self._pending_filepick = None
+        self._pending_destructive = None
+        self._pending_destructive_meta = None
 
     def stash_filepick(self, candidates, resume: Callable):
         """"Which one, sir?" -- park the rivals so the answer can be heard.
@@ -9481,6 +9895,7 @@ class Commander:
         # One question on the floor at a time, the same rule stash_send and
         # stash_destructive keep between themselves.
         self._pending_send = None
+        self._pending_sendask = None
         self._pending_destructive = None
         self._pending_destructive_meta = None
 
@@ -9507,6 +9922,7 @@ class Commander:
         self._pending_destructive = None
         self._pending_destructive_meta = None
         self._pending_filepick = None
+        self._pending_sendask = None
 
     def _same_room(self, asked: str, answering: str) -> bool:
         """Could a turn from ``answering`` be the answer to a question put
@@ -9756,6 +10172,14 @@ class Commander:
         res = self._try_approval(text, source)
         if res is not None:
             return res
+        # 3z. The typed "enrol" that commits a face enrolment, and the three
+        #     words that steer one while it runs. ABOVE everything below it
+        #     because a run holds the camera open and speaks on a cadence:
+        #     "stop" has to reach it before any rung that would read the word
+        #     as something else, and it must not wait behind a quiz.
+        res = self._try_enrol(text, source)
+        if res is not None:
+            return res
         # 3a. A working session is holding a question open ("Tuesday at
         #     four?"): this utterance is the answer. Above the quiz because
         #     a session may itself be a quiz-shaped thing, and below the
@@ -9815,6 +10239,14 @@ class Commander:
         #       together anyway: a send arms its own slot and nothing in
         #       the app arms both.
         res = self._try_send_confirm(text, source)
+        if res is not None:
+            return res
+        # 3d-iii. "Which account should I send from, sir?" / "What is it?"
+        #        -- the file lane's other two questions (F21). Its answer
+        #        is a label or an address, never a bare yes, and it can
+        #        never be live with the read-back above or the pick below
+        #        (each stash clears the others).
+        res = self._try_sendask_answer(text, source)
         if res is not None:
             return res
         # 3d-iv. "Which one, sir?" -- the ambiguous-file question both file
@@ -10368,6 +10800,26 @@ class Commander:
         answer = parse_send_answer(text)
         if answer is None:
             said = " ".join(str(text or "").split())
+            # A yes that carries a CORRECTION -- "yes, send it to Dana",
+            # "yes, but from my work account", "yes, to her work address
+            # instead" -- is neither a yes nor a change of subject (F23).
+            # It was the vague leg below: a generic re-ask, and the next
+            # bare yes sent the file to the person he had just corrected
+            # AWAY from. The draft is spent and the same file is read back
+            # again to the corrected recipient / account. Never sent.
+            fix = _send_correction(said) if parse_yes_no(said) is True else None
+            if fix is not None:
+                who, hint = fix
+                log.info("send read-back: %r corrects the draft; asking again",
+                         text[:60])
+                cfg = self._svc("assistant")
+                to = who or draft.to_name or draft.to_addr
+                prep = outbox.prepare(cfg, self._svc("memory"), str(draft.path),
+                                      to, account_hint=hint or draft.account_label,
+                                      chosen=draft.path)
+                return _send_file_finish(self, prep, str(draft.path), to,
+                                         hint or draft.account_label,
+                                         to_name="" if who else draft.to_name)
             # Two ways to be vague, and BOTH get the one re-ask rather than
             # the silent drop. _SEND_MAYBE_RX catches the bare fillers
             # ("okay", "sure"); the second leg catches a yes this grammar
@@ -10377,15 +10829,17 @@ class Commander:
             # overheard-speech line, and it is what keeps the ten-word
             # "Yeah, so you should be able to look that up." on the silent
             # branch where it belongs. Safety is unchanged either way:
-            # nothing is sent, he is asked once more.
+            # nothing is sent, he is asked once more -- and the re-ask
+            # names the file and the recipient again (F23), so the yes he
+            # gives next is to a sentence he has just heard.
             vague = bool(_SEND_MAYBE_RX.match(said)) or (
                 len(said.split()) <= 6 and parse_yes_no(said) is True)
             if vague and not draft.reasked:
                 draft.reasked = True
                 self._pending_send = draft
                 log.info("send read-back: %r is not a yes; asking again", text)
-                return CommandResult(handled=True, reply=outbox.UNSURE_LINE,
-                                     speak=True, status="Confirm?")
+                return CommandResult(handled=True, speak=True, status="Confirm?",
+                                     reply=outbox.unsure_line(draft))
             self._answered_pending = False
             log.info("send draft dropped, the subject changed: %r", text)
             return None
@@ -10439,6 +10893,112 @@ class Commander:
         return CommandResult(handled=True, reply="Sending it now, sir.",
                              speak=True, ack=True, done=False,
                              status=f"Sending {name}")
+
+    def _try_sendask_answer(self, text: str,
+                            source: str = "voice") -> Optional[CommandResult]:
+        """Answer "Which account should I send from, sir?" or "What is
+        it?" -- the two send questions that had no slot (F21).
+
+        The account answer is a label ("school", "the work one", "from my
+        personal account"), matched by mail.account_by_label and never
+        fuzzily. The recipient answer is an address said aloud ("dana at
+        example dot com") or a name the people book knows. Either way the
+        send is prepared AGAIN with the missing piece and ends in the
+        ordinary read-back, so this rung can never send anything.
+
+        A miss gets ONE more question, as the read-back and "Which one,
+        sir?" do; a no or a "never mind" lets it go out loud; anything
+        else drops the question and keeps its own meaning.
+        """
+        ask = getattr(self, "_pending_sendask", None)
+        if ask is None:
+            return None
+        if ask.stale():
+            self._pending_sendask = None
+            log.info("send %s question expired; %r is a new subject",
+                     ask.kind, text[:40])
+            return None
+        if not self._same_room(ask.source, source):
+            log.debug("send %s question: a %s turn is not its answer",
+                      ask.kind, source)
+            return None
+        self._pending_sendask = None
+        said = " ".join(str(text or "").split())
+        if _PICK_CANCEL_RX.match(said) or parse_yes_no(said) is False:
+            self._answered_pending = True
+            return CommandResult(handled=True, reply=outbox.ASK_SPENT_LINE,
+                                 speak=True, status="Dropped")
+        cfg = self._svc("assistant")
+        memory = self._svc("memory")
+        if ask.kind == "account":
+            hint = _account_answer(said)
+            picked = (mail_mod.account_by_label(mail_mod.mail_accounts(cfg), hint)
+                      if hint else None)
+            if picked is None:
+                # A label is one word, two at most ("the work one" has
+                # already lost its wrapping); "what time is it" is a new
+                # subject and keeps its meaning.
+                if not hint or len(hint.split()) > 2:
+                    log.info("send account: %r is a new subject", said[:40])
+                    return None
+                if ask.reasked:
+                    self._answered_pending = True
+                    return CommandResult(handled=True, speak=True,
+                                         status="Dropped",
+                                         reply=outbox.ASK_DROPPED_LINE)
+                names = ", ".join(mail_mod.account_label(a)
+                                  for a in mail_mod.mail_accounts(cfg))
+                # A bare "yes" is not an account either; it gets the list
+                # again rather than "I've no yes account".
+                line = (outbox.ACCOUNT_WHICH_LINE.format(names=names)
+                        if parse_yes_no(said) is True else
+                        outbox.ACCOUNT_REASK_LINE.format(hint=hint, names=names))
+                ask.reasked = True
+                self._pending_sendask = ask
+                self._answered_pending = True
+                return CommandResult(handled=True, speak=True,
+                                     status="Which account?", reply=line)
+            self._answered_pending = True
+            label = mail_mod.account_label(picked)
+            log.info("send account: %r means %s", said[:40], label)
+            prep = outbox.prepare(cfg, memory, ask.said_file, ask.who,
+                                  account_hint=label)
+            return _send_file_finish(self, prep, ask.said_file, ask.who, label,
+                                     to_name=ask.to_name,
+                                     reasked_kind=ask.kind if ask.reasked else "")
+        # recipient: an address, or a name the book resolves
+        who = _recipient_answer(said)
+        addr = outbox.parse_address(who)
+        resolved = addr or outbox.resolve_recipient(cfg, memory, who)[0]
+        if not resolved:
+            # Not an address and not a name we know. One re-ask for a
+            # sentence that was plainly an attempt -- an address shape
+            # ("dana at example com", the "dot" lost), a name's worth of
+            # words, or a bare yes -- and a new subject keeps its meaning.
+            attempt = bool(who) and (
+                "@" in who or re.search(r"\bat\b", who, re.I) is not None
+                or len(who.split()) <= 3 or parse_yes_no(said) is True)
+            if not attempt:
+                log.info("send recipient: %r is a new subject", said[:40])
+                return None
+            if ask.reasked:
+                self._answered_pending = True
+                return CommandResult(handled=True, speak=True, status="Dropped",
+                                     reply=outbox.ASK_DROPPED_LINE)
+            ask.reasked = True
+            self._pending_sendask = ask
+            self._answered_pending = True
+            return CommandResult(handled=True, speak=True, status="No address",
+                                 reply=outbox.ADDRESS_REASK_LINE)
+        self._answered_pending = True
+        log.info("send recipient: %r resolves", said[:40])
+        prep = outbox.prepare(cfg, memory, ask.said_file, who,
+                              account_hint=ask.hint)
+        # An address said outright resolves to a nameless draft; the name
+        # he used in the first sentence is what the read-back should say.
+        return _send_file_finish(self, prep, ask.said_file, who, ask.hint,
+                                 to_name=ask.who if addr else "",
+                                 reasked_kind=ask.kind if ask.reasked else "")
 
     def _try_destructive_confirm(self, text: str,
                                  source: str = "voice") -> Optional[CommandResult]:
@@ -10780,6 +11340,151 @@ class Commander:
                                  speak=False, status="Alarm dismissed")
         return None
 
+    def _try_enrol(self, text: str,
+                   source: str = "voice") -> Optional[CommandResult]:
+        """The typed word that starts an in-app enrolment, and the three that
+        steer one that is already running.
+
+        WHY THE COMMIT MUST BE TYPED, once more, because it is the whole
+        safety argument of this feature. ``owner.mode`` is 'shadow' on his
+        live config, and shadow downgrades every refusal to admit -- so the
+        OwnerGate refuses nothing today. If a spoken sentence were enough, a
+        stranger saying "enrol my face" would replace his gallery with their
+        face UNDER HIS LABEL, and the gate's face leg would afterwards name
+        that stranger as him. That is the one case where a mistaken identity
+        GRANTS rather than denies. ``gate.GATED_SOURCES`` is ("voice",),
+        i.e. typed is exempt BY CONSTRUCTION on the argument that typing
+        means somebody is physically at the keyboard, so the typed word is a
+        second bar layered on top of the gate rather than a hole in it.
+
+        Returning None is the normal case and it leaves the turn alone: with
+        no offer parked and no run live this rung costs two getattrs.
+        """
+        services = getattr(self, "services", None)   # a slim test commander
+        stripped = str(text or "").strip()
+        run = getattr(services, "enrol_run", None)
+        if run is not None and getattr(run, "running", False):
+            res = self._enrol_control(run, stripped)
+            if res is not None:
+                return res
+            # Not a control word. A run does NOT swallow the turn -- he can
+            # still ask the time with his head turned -- so fall through.
+            return None
+        offer = getattr(services, "enrol_offer", None)
+        if not isinstance(offer, dict) or not offer:
+            return None
+        if not _ENROL_CONFIRM_RX.match(stripped):
+            # Anything else leaves the offer parked and routes normally. It
+            # is NOT dropped the way the briefing offer is: that one holds an
+            # open microphone, this one holds nothing at all, and asking him
+            # the time between the offer and the word he types is not a
+            # change of subject worth cancelling a camera run for.
+            return None
+        from jarvis import enrolrun as er
+        try:
+            made = float(offer.get("made_at") or 0.0)
+        except (TypeError, ValueError):
+            made = 0.0
+        if made and time.time() - made > er.OFFER_TTL_S:
+            self._clear_enrol_offer()
+            return CommandResult(handled=True, speak=True, reply=er.E4,
+                                 status="Enrolment: offer expired")
+        if source != "typed":
+            # SAID, NOT TYPED. The offer stays parked -- he has been told
+            # what to do and the ninety seconds are still running.
+            return CommandResult(handled=True, speak=True, reply=er.E3,
+                                 status="Enrolment: type it, don't say it")
+        self._clear_enrol_offer()
+        return self._start_enrol()
+
+    def _clear_enrol_offer(self) -> None:
+        try:
+            self.services.enrol_offer = None
+        except Exception:                # noqa: BLE001 - a slim services
+            log.debug("could not clear the enrolment offer", exc_info=True)
+
+    def _enrol_control(self, run, text: str) -> Optional[CommandResult]:
+        """"Stop" / "ready" / "hold on" while a run is capturing.
+
+        EVERY SOURCE, not just voice, and that is the opposite of the rule
+        the briefing offer follows. That offer holds an open microphone in
+        one room; this holds an open CAMERA, and a stop typed from anywhere
+        -- the command bar, a shell turn, Discord -- must be able to shut a
+        lens. Stopping is the safe direction, so it takes the widest door.
+
+        None of these speak from here: the run is on its own thread and says
+        its own lines at the moment they become true, so a reply here would
+        arrive either twice or in the wrong order.
+        """
+        if _ENROL_STOP_RX.match(text):
+            from jarvis import enrolrun as er
+            run.abort(er.STOP_SPOKEN)
+            return CommandResult(handled=True, speak=False,
+                                 status="Enrolment stopped")
+        if _ENROL_READY_RX.match(text):
+            run.skip()
+            return CommandResult(handled=True, speak=False,
+                                 status="Enrolment: capturing")
+        if _ENROL_WAIT_RX.match(text):
+            run.pause()
+            return CommandResult(handled=True, speak=False,
+                                 status="Enrolment: holding")
+        return None
+
+    def _start_enrol(self) -> CommandResult:
+        """Build the run, park it, and start its thread.
+
+        The preflight is run AGAIN here rather than trusted from the offer.
+        Ninety seconds is long enough for the curfew to start or for him to
+        have said "offline mode" in between, and the cost of re-asking is one
+        dictionary read against opening a lens sensing has since shut.
+        """
+        from jarvis import earcons
+        from jarvis import enrolentry as ee
+        from jarvis import enrolrun as er
+        services = getattr(self, "services", None)
+        cfg = self._svc("assistant")
+        worker = getattr(services, "preview_worker", None)
+        pre = er.preflight(cfg, sensing=self._svc("sensing"), worker=worker,
+                           services=services)
+        if not pre["ok"]:
+            return CommandResult(handled=True, speak=True, reply=pre["reply"],
+                                 status="Enrolment: %s" % pre["reason"])
+        run = er.EnrolRun(
+            cfg=cfg, worker=worker, sensing=self._svc("sensing"),
+            services=services,
+            say=self._speak,
+            # DISPLAY-ONLY, which is the mechanism that keeps the card out of
+            # the plaintext journal: a JarvisReply with speak=False does not
+            # go through context.add_exchange.
+            card=lambda t: bus.publish(JarvisReply(text=t, speak=False)),
+            lease=getattr(services, "preview_lease", None),
+            # cooldown_s=0.0 on every tone: the default four-second same-tone
+            # cooldown exists to stop a false-wake tone repeating, and here it
+            # would silently swallow the second and third "kept one" ticks of
+            # a three-sample station -- the ticks he is counting.
+            earcon=lambda name: earcons.play(name, cooldown_s=0.0),
+            clipboard=ee.to_clipboard)
+        try:
+            services.enrol_run = run
+        except Exception:                # noqa: BLE001 - a slim services
+            log.debug("could not park the enrolment run", exc_info=True)
+            return CommandResult(handled=True, speak=True, reply=er.E35,
+                                 status="Enrolment: could not start")
+        if not run.start():
+            self._clear_enrol_run(run)
+            return CommandResult(handled=True, speak=True, reply=er.E35,
+                                 status="Enrolment: could not start")
+        return CommandResult(handled=True, speak=True, reply=er.E2,
+                             status="Enrolling your face")
+
+    def _clear_enrol_run(self, run) -> None:
+        try:
+            if getattr(self.services, "enrol_run", None) is run:
+                self.services.enrol_run = None
+        except Exception:                # noqa: BLE001 - a slim services
+            log.debug("could not unpark the enrolment run", exc_info=True)
+
     def _try_approval(self, text: str, source: str) -> Optional[CommandResult]:
         ap = self._svc("approvals")
         if ap is None:
@@ -11008,8 +11713,15 @@ class Commander:
         pending = getattr(source, "pending_event", None) if source else None
         if not pending:
             return None
-        answer = parse_yes_no(text)
         source.pending_event = None
+        # The read-back had no life of its own before F37: a "yes" an hour
+        # later, aimed at anything, would have written the event. Same
+        # OFFER_TTL_S every other offer rung keeps; question_open() reads
+        # the same stamp so a dead read-back never holds the floor either.
+        if _event_offer_expired(pending):
+            log.info("event read-back expired; %r is a new subject", text[:40])
+            return None
+        answer = parse_yes_no(text)
         if answer is None:
             return None
         if not answer:
@@ -11310,6 +12022,13 @@ class Commander:
         there instead") a plain yes means the terminal, not a new task."""
         slug = self._pending_terminal_slug
         if not slug:
+            return None
+        # Stamped when armed (F37): an offer older than OFFER_TTL_S is not
+        # a question any more, here or in question_open().
+        made = getattr(self, "_pending_terminal_made", 0.0) or 0.0
+        if made and time.monotonic() - float(made) > OFFER_TTL_S:
+            self._pending_terminal_slug = ""
+            log.info("terminal offer expired; %r is a new subject", text[:40])
             return None
         t = text.strip()
         if _YES_RX.match(t) or _OPEN_IT_RX.match(t):
@@ -11773,6 +12492,7 @@ class Commander:
                 if out.strip() in offers:
                     # "*" = whatever project is active when he answers
                     self._pending_terminal_slug = d.project or active or "*"
+                    self._pending_terminal_made = time.monotonic()
                 return CommandResult(handled=True, reply=out, speak=True,
                                      status="Claude: queued", done=False)
             if d.args.get("terminal"):

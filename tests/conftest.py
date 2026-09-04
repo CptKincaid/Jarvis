@@ -129,6 +129,18 @@ _SMTP_PORTS = (25, 465, 587, 2525)
 _smtp_blocked: list = []
 
 
+class SmtpFirewallRefused(BaseException):
+    """The SMTP leg's refusal. A BaseException on purpose (F24, 09-03):
+    as a ConnectionRefusedError it was caught by mail.send_message's
+    ``except Exception``, re-raised as MailSendFailed, and spoken by the
+    commander as the ordinary "I couldn't send that, sir." -- so a test
+    that lost its fake passed unless it happened to assert on the sent
+    list, and the "loud failure" the docstring above promises never
+    happened. Nothing in jarvis/ catches BaseException, so this one comes
+    out of the test that caused it. pytest_sessionfinish below is the
+    second belt: any refusal nobody owned up to fails the run."""
+
+
 def _blocked_player(argv) -> bool:
     """Stands in for earcons._spawn: the tone is "played" and the caller
     sees the same True, but nothing reaches the sound server."""
@@ -260,7 +272,7 @@ def _firewall_live_log_dir():
                 else None)
         if port in _SMTP_PORTS:
             _smtp_blocked.append(address)
-            raise ConnectionRefusedError(
+            raise SmtpFirewallRefused(
                 f"the suite must not open an SMTP connection ({address!r}): "
                 "a real email cannot be recalled. Pass a fake transport -- "
                 "mail.send_message(..., smtp=FakeSMTP) -- the way the read "
@@ -282,3 +294,24 @@ def _firewall_live_log_dir():
     finally:
         earcons._spawn = real_spawn
         socket.socket.connect = real_connect
+
+
+def pytest_sessionfinish(session, exitstatus):
+    """The SMTP firewall's second belt (F24, 09-03). SmtpFirewallRefused
+    already comes out of the test that lost its fake; this catches the one
+    it cannot reach -- a refusal on a worker thread, which dies with a
+    traceback on stderr and nothing else. A test that trips the firewall ON
+    PURPOSE (test_send_file.py asserts it works) takes its own entry back
+    off the list; anything left here is a test that reached for a real
+    mail server without knowing it, and the run fails."""
+    if _smtp_blocked:
+        session.exitstatus = 1
+        rep = session.config.pluginmanager.get_plugin("terminalreporter")
+        if rep is not None:
+            rep.write_sep("=", "SMTP FIREWALL: unowned connection attempts",
+                          red=True, bold=True)
+            for address in _smtp_blocked:
+                rep.write_line(f"  refused {address!r}", red=True)
+            rep.write_line("A test lost its FakeSMTP. Pass smtp= to "
+                           "mail.send_message or put one on services.smtp.",
+                           red=True)

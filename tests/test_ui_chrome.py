@@ -375,8 +375,435 @@ def test_toast_kind_colour_is_read_per_call():
 # =====================================================================
 # 2026-09-03 ui-polish (the 09-03 panel, ~/scratch-0903/ui-synthesis.md)
 # =====================================================================
+from jarvis.ui.board import (EMPTY_PANEL_DEFAULT, EMPTY_PANEL_TEXT,  # noqa: E402
+                             empty_panel_text)
+from jarvis.ui import views as views_mod  # noqa: E402
+from jarvis.ui.views import (SNAP_FRAGMENT, SettingsDrawer,  # noqa: E402
+                             snap_hidden, speaker_color)
 from jarvis.ui.widgets import StatePill  # noqa: E402
+
+
+# ------------------------------------------------ U01 transcript top snap
+def test_snap_hides_the_small_fragment_the_view_cuts_and_keeps_the_rest():
+    """The 09-03 shots, as arithmetic at S=2 (SNAP_FRAGMENT 96 -> 192 px).
+    Four cards stacked 16 px apart; the view's top edge lands 178 px above
+    the bottom of the first (08b's 'draft from Tuesday…' fragment, no head
+    row): hidden. Everything below is whole: shown."""
+    tops = [16, 316, 532, 748]
+    heights = [284, 200, 200, 120]
+    view_top = 16 + 284 - 178
+    assert snap_hidden(tops, heights, view_top, 192) == [True, False, False, False]
+    # a fragment taller than the floor stays -- a long reply half on
+    # screen is still worth reading
+    assert snap_hidden(tops, heights, 16 + 284 - 200, 192) == [False] * 4
+    # the empty bracket of 23-claude-task (10 px left) and the halved
+    # 'Here's your morning, sir.' of 09 (40 px) both go
+    assert snap_hidden(tops, heights, 16 + 284 - 10, 192)[0] is True
+    assert snap_hidden(tops, heights, 16 + 284 - 40, 192)[0] is True
+
+
+def test_snap_never_hides_the_card_the_view_rests_on_or_a_whole_card():
+    # one card taller than the view: it is the last card, it stays
+    assert snap_hidden([16], [1400], 900, 192) == [False]
+    # a card ENTIRELY above the edge is off-screen, not a fragment; Tk
+    # clips it and it must stay mapped for the scroll back up
+    assert snap_hidden([16, 316], [284, 100], 320, 192) == [False, False]
+    # the edge exactly on a boundary cuts nothing
+    assert snap_hidden([16, 316], [284, 100], 316, 192) == [False, False]
+    assert snap_hidden([], [], 0, 192) == []
+    assert SNAP_FRAGMENT == 96
+
+
+# The wiring, not the arithmetic: a wheel tick and a relayout must both run
+# the snap, or snap_hidden is a pure function nobody calls (the 09-04 review
+# found the two tests above still passing with every _apply_snap() call
+# deleted). No Tk: the view is built with __new__ over a fake canvas that
+# records item states, and the fragment card must come out "hidden".
+class _FakeCanvas:
+    def __init__(self, width, height, tops=None):
+        self.w, self.h = width, height
+        self.pos = dict(tops or {})           # win id -> y
+        self.state = {}                        # win id -> last state
+        self.width = {}
+        self.region_h = None
+        self.top = 0
+
+    # geometry ---------------------------------------------------------
+    def winfo_exists(self):
+        return True
+
+    def update_idletasks(self):
+        pass
+
+    def winfo_width(self):
+        return self.w
+
+    def winfo_height(self):
+        return self.h
+
+    def coords(self, item, *xy):
+        if xy:
+            self.pos[item] = xy[1]
+            return None
+        return [0, self.pos[item]]
+
+    def itemconfigure(self, item, **kw):
+        if "state" in kw:
+            self.state[item] = kw["state"]
+        if "width" in kw:
+            self.width[item] = kw["width"]
+
+    def configure(self, **kw):
+        if "scrollregion" in kw:
+            self.region_h = kw["scrollregion"][3]
+
+    # scrolling --------------------------------------------------------
+    def yview_moveto(self, frac):
+        self.top = int(max(0, (self.region_h or self.h) - self.h) * frac)
+
+    def yview_scroll(self, n, _unit):
+        self.top = max(0, self.top + n * 10)
+
+    def yview(self):
+        return (0.0, 1.0)
+
+    def canvasy(self, y):
+        return self.top + y
+
+
+class _FakeCard:
+    def __init__(self, height, text="body"):
+        self.h = height
+        self._text = text
+
+    def sync(self):
+        pass
+
+    def winfo_reqheight(self):
+        return self.h
+
+    def cget(self, _key):
+        return self._text
+
+
+def _snap_view(heights, canvas):
+    from jarvis.ui.views import TranscriptView
+    view = TranscriptView.__new__(TranscriptView)      # no tk.Frame.__init__
+    view.canvas = canvas
+    view._cards = []
+    for i, h in enumerate(heights):
+        card = _FakeCard(h)
+        view._cards.append([card, card, "jarvis", 100 + i, h])
+    view._partial = None
+    view._pinned = True
+    view._layout_job = None
+    view._schedule_dots = lambda: None
+    view._card_geo = lambda role, W=None, text="": (0, 400, 380)
+    return view
+
+
+def test_a_wheel_tick_runs_the_snap_and_unmaps_the_fragment(monkeypatch):
+    theme.select_look("holo")
+    monkeypatch.setattr(views_mod, "px", lambda v: v * 2)   # S=2 arithmetic
+    tops = {100: 16, 101: 316, 102: 532, 103: 748}
+    canvas = _FakeCanvas(800, 700, tops)
+    view = _snap_view([284, 200, 200, 120], canvas)
+    canvas.top = 16 + 284 - 178 - 20          # one tick above the 08b cut
+    view._wheel(1)                             # +20 px: lands the cut at -178
+    assert canvas.top == 16 + 284 - 178
+    assert canvas.state == {100: "hidden", 101: "normal", 102: "normal",
+                            103: "normal"}, canvas.state
+    # scrolling up unpins nothing here (yview says pinned), but a taller
+    # remainder is a card worth reading: it comes back
+    view._wheel(-3)
+    assert canvas.state[100] == "normal"
+
+
+def test_a_relayout_runs_the_snap_after_stacking_the_cards(monkeypatch):
+    """A new card arrives, the stack is rebuilt top-anchored and pinned to
+    the bottom, and the first card's 40 px remainder (09's halved 'Here's
+    your morning, sir.') must be unmapped BY THE RELAYOUT -- it is the one
+    code path a new reply always takes."""
+    theme.select_look("holo")
+    monkeypatch.setattr(views_mod, "px", lambda v: v * 2)
+    heights = [284, 200, 200, 120]
+    gap = theme.PAD_S
+    total = sum(heights) + gap * 3
+    # viewport sized so the view's top edge lands 40 px above the bottom
+    # of the first card once pinned to the bottom of the scrollregion
+    H = (gap + total + gap) - (gap + 284 - 40)
+    canvas = _FakeCanvas(800, H)
+    view = _snap_view(heights, canvas)
+    view._relayout()
+    assert canvas.top == gap + 284 - 40
+    assert canvas.state[100] == "hidden", canvas.state
+    assert [canvas.state[i] for i in (101, 102, 103)] == ["normal"] * 3
+    # classic never snaps: the same relayout maps every card
+    theme.select_look("classic")
+    view._relayout()
+    assert all(s == "normal" for s in canvas.state.values())
+    theme.select_look("holo")
+
+
+# ------------------------------------------- U09 the standby clock
+# MEASURED 2026-09-04 on Xvfb :95 (scripts/ui_shots.py, holo, S=2, the
+# tree before this fix), rows below the stage of 17-standby: the clock
+# band peaks at luminance 159, its caption at 131, the row VALUES at 173
+# -- the clock was the third brightest text on its own slab, because the
+# holo head was CORE_BANDS[2] (#a8e9ff, L 221) under INK (#e9f2fb, L 241).
+# The 09-03 panel shot (ui-shots-int) reads 129 / 106 / 140, same order.
+def _lum(hex_color):
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def test_standby_clock_outranks_the_rows_and_its_caption_in_holo():
+    from jarvis.ui import ambient
+    from jarvis.ui.console_mode import DIM_FLOOR, dim
+    theme.select_look("holo")
+    head, body, faint = ambient.slab_ink("normal")
+    assert head == theme.FOCAL and faint == theme.MUTED
+    assert _lum(head) > _lum(body) > _lum(faint)
+    # the ladder survives the standby dim at every factor down to the floor
+    # (dim is a blend toward the ground, so the order is what matters)
+    for f in (1.0, 0.7, DIM_FLOOR):
+        assert _lum(dim(head, f)) > _lum(dim(body, f)) > _lum(dim(faint, f))
+    # and the top of the ladder really is the top: no token brighter
+    assert _lum(theme.FOCAL) >= max(_lum(theme.INK), _lum(theme.MUTED),
+                                    _lum(theme.CYAN))
+
+
+def test_holo_standby_caption_is_the_date_alone_and_classic_keeps_its_am():
+    from datetime import datetime
+    from jarvis.ui import ambient
+    at = datetime(2026, 9, 4, 16, 26)
+    assert ambient.standby_caption(at, look="holo") == \
+        ambient.tracked("FRIDAY 4 SEPTEMBER")
+    assert "PM" not in ambient.standby_caption(at, look="holo")
+    # classic is frozen to the 85d5066 oracle: meridiem, dots, untracked
+    assert ambient.standby_caption(at, look="classic") == \
+        "PM  ·  FRIDAY 4 SEPTEMBER"
+    theme.select_look("classic")
+    assert ambient.standby_caption(at) == "PM  ·  FRIDAY 4 SEPTEMBER"
+    theme.select_look("holo")
+    assert ambient.standby_caption(at) == ambient.tracked("FRIDAY 4 SEPTEMBER")
+
+
+def test_the_meridiem_sits_inline_after_the_digits_as_one_centred_group():
+    from jarvis.ui.ambient import clock_line, meridiem_bottom
+    # digits 240 px, gap 20, 'PM' 60: the 320 px group is centred on 460
+    dx, mx = clock_line(460, 240, 60, 20)
+    assert (dx, mx) == (460 - 160, 460 - 160 + 240 + 20)
+    assert dx + 240 + 20 == mx                 # inline, one gap after
+    assert (dx + (mx + 60)) // 2 == 460        # the GROUP is centred
+    # baselines meet: a 120 px linespace with a 96 px ascent centred on
+    # y=500 has its baseline at 500 - 60 + 96 = 536; a 9 px descent on
+    # the smaller face puts its south anchor at 545
+    assert meridiem_bottom(500, 120, 96, 9) == 545
+
+
+# --------------------------------------------------- U03 label > meta
+def test_speaker_label_lifts_one_step_in_holo_and_keeps_classic():
+    theme.select_look("holo")
+    assert speaker_color("jarvis") == theme.CYAN
+    assert speaker_color("you") == theme.MUTED
+    # the stamp stays FAINT (views._card_head) and the label is no longer
+    # the stamp's colour on either card
+    assert theme.FAINT not in (speaker_color("jarvis"), speaker_color("you"))
+    theme.select_look("classic")
+    assert speaker_color("jarvis") == theme.CYAN_DIM
+    assert speaker_color("you") == theme.FAINT
+    # explicit look beats the current one
+    assert speaker_color("you", "holo") == theme.MUTED
+
+
+# --------------------------------------- U14 footer with an active project
+# MEASURED 2026-09-03 on Xvfb :92 at JARVIS_UI_SCALE 2.0, the rig's
+# readings ('cpu 52° 7% · gpu 44° 2%', '26.8 GB'): wake segment ends at
+# 257 ('WAKE WORD ON' 181 + ring/gaps), PROJECT fixed part 150, one mono
+# character 14; level 0 CPU/GPU 218 each and MEM 226, level 1 176/176/162,
+# level 2 120/120/162, level 3 162.
+WAKE_END_23 = 257
+PROJ_FIXED = 150
+CHAR_W = 14
+LEVELS_23 = [[("CPU", 218), ("GPU", 218), ("MEMORY", 226)],
+             [("CPU", 176), ("GPU", 176), ("MEMORY", 162)],
+             [("CPU", 120), ("GPU", 120), ("MEMORY", 162)],
+             [("MEMORY", 162)]]
+
+
+def test_a_dropped_project_chip_gives_the_memory_figure_back():
+    """The 09-03 shots 23/24: 'CPU 52°C · 7% | GPU 44°C · 2%' -- level 0,
+    MEMORY gone, and no PROJECT chip either. plan_strip yielded MEMORY for
+    a chip that then still did not fit (75 px free = 5 characters, one
+    under the six-character floor) and returned (0, ['MEMORY']): the chip
+    dropped and the segment it evicted never came back."""
+    before_free = STRIP_W - WAKE_END_23 - (218 + 218) - PROJ_FIXED
+    assert before_free // CHAR_W == 5 < 6
+    assert plan_strip(STRIP_W, WAKE_END_23, PROJ_FIXED, CHAR_W, 6,
+                      LEVELS_23[0]) == (0, [])
+    level, chars, hidden = plan_telemetry(STRIP_W, WAKE_END_23, PROJ_FIXED,
+                                          CHAR_W, 6, LEVELS_23)
+    # the ladder re-plans with the whole cluster and lands on the compact
+    # rung with the chip -- either the chip or the memory figure, never
+    # neither
+    assert (level, chars, hidden) == (1, 6, ["MEMORY"])
+    assert chars > 0 or "MEMORY" not in hidden
+    # ...and the °-form no longer flips with the project: level 1 is what
+    # the same strip plans with NO project
+    assert plan_telemetry(STRIP_W, WAKE_END_23, PROJ_FIXED, CHAR_W, 0,
+                          LEVELS_23)[0] == 1
+
+
+def test_every_plan_shows_the_chip_or_the_memory_figure():
+    for w in range(600, 1400, 7):
+        for slug_len in (0, 3, 6, 12):
+            level, chars, hidden = plan_telemetry(w, WAKE_END_23, PROJ_FIXED,
+                                                  CHAR_W, slug_len, LEVELS_23)
+            assert chars > 0 or "MEMORY" not in hidden, (w, slug_len)
+            # a plan that shows no chip hides nothing on its behalf
+            if chars == 0:
+                assert hidden == []
+
+
+# ------------------------------------------------- U16 the tracking rule
+def test_caption_tracks_surface_labels_only_and_only_in_holo():
+    theme.select_look("holo")
+    assert theme.caption("Voice ID", surface=True) == "V O I C E   I D"
+    assert theme.caption("weather", surface=False) == "WEATHER"
+    assert theme.caption("alarm") == "A L A R M"
+    assert theme.tracked_caps("Jarvis") == "J A R V I S"
+    theme.select_look("classic")
+    assert theme.caption("Voice ID", surface=True) == "VOICE ID"
+    assert theme.caption("weather", surface=False) == "WEATHER"
+    assert theme.caption("", surface=True) == ""
+
+
+# ------------------------------------------ U05 the pill's dot has a shape
 def test_state_pill_has_a_ring_shape_and_set_state_defaults_to_the_disc():
     sig = inspect.signature(StatePill.set_state)
     assert sig.parameters["shape"].default == StatePill.DOT_DISC == "disc"
     assert StatePill.DOT_RING == "ring"
+
+
+# ------------------------------------------------ U02 the toast can dock
+def test_toast_is_an_overlay_until_docked():
+    t = Toast.__new__(Toast)
+    Toast.__init__(t, container=None)
+    assert not t.docked
+    t.dock(host="shell", before="reactor")
+    assert t.docked and t._host == "shell" and t._before == "reactor"
+    assert Toast.STRIP_H == 34
+    theme.select_look("holo")
+    assert Toast._kind_dot("error") == theme.ERR
+    assert Toast._kind_dot("warn") == theme.WARN
+    assert Toast._kind_dot("ok") == theme.CYAN
+    assert Toast._kind_dot("info") == theme.CYAN_DIM
+
+
+# --------------------------------------------- U15 an empty board panel
+def test_empty_panels_state_their_emptiness():
+    assert empty_panel_text("focus") == "nothing in focus"
+    assert empty_panel_text("sessions") == "no sessions"
+    assert empty_panel_text("no-such-panel") == EMPTY_PANEL_DEFAULT
+    assert empty_panel_text(None) == EMPTY_PANEL_DEFAULT
+    for key, text in EMPTY_PANEL_TEXT.items():
+        assert text and text == text.lower(), key      # a line, not a label
+
+
+# ------------------------------------------- U12 settings slider geometry
+def test_holo_scale_rows_leave_the_value_room_at_the_low_end():
+    """MEASURED 2026-09-03 on :92 at S=2: 'Silence timeout (s)' 314 px in
+    the row face, the drawer's inner width 576, the px(130) trough 260 --
+    2 px of slack, and the Scale's value ('2.5', 36 px) is drawn centred
+    on a knob that sits at the trough's left edge at the low end, so it
+    overhung into the label. The holo trough shortens and gains a gap
+    wider than the overhang."""
+    label_w, inner, value_w = 314, 576, 36
+    holo = 2 * SettingsDrawer.SCALE_LEN_HOLO + 2 * SettingsDrawer.SCALE_GAP_HOLO
+    assert label_w + holo <= inner, (label_w + holo, inner)
+    assert 2 * SettingsDrawer.SCALE_GAP_HOLO >= value_w // 2
+    # the old geometry really did fill the row to within a few px
+    assert inner - label_w - 260 == 2
+
+
+# The rule applied to the two row-key sites that still tracked (2026-09-04):
+# both drawn on a fake canvas, no Tk.
+def _fake_measure(_font, text):
+    return 7 * len(text or "")
+
+
+def test_engine_card_keys_and_load_readout_are_plain_caps_in_holo(monkeypatch):
+    from jarvis.ui import reactor
+    theme.select_look("holo")
+    monkeypatch.setattr(reactor, "measure", _fake_measure)
+
+    class _Stage:
+        _draw_card = reactor.Reactor._draw_card
+        _draw_holo_decor = reactor.Reactor._draw_holo_decor
+
+        def __init__(self):
+            self._decor = {}
+            self.texts = []
+
+        def create_line(self, *a, **k):
+            return 1
+
+        create_polygon = create_arc = create_oval = create_line
+
+        def create_text(self, *a, **k):
+            self.texts.append(k.get("text"))
+            return 1
+
+    st = _Stage()
+    st._draw_holo_decor(918, 600, 300, 300)
+    st._draw_card(918, 300)
+    keys = [t for t in st.texts if t]
+    labels = [lab for lab, _key in reactor.CARD_ROWS]
+    assert keys[-len(labels):] == labels                  # HEAR, not H E A R
+    assert reactor.GAUGE_LABEL in keys
+    assert reactor.tracked(reactor.GAUGE_LABEL) not in keys
+    assert all(" " not in k for k in labels)
+    # the per-row value budget is still cut from the label actually drawn
+    assert set(st._decor["card_budget"]) == {key for _lab, key in reactor.CARD_ROWS}
+
+
+def test_standby_and_ambient_row_keys_are_plain_caps_in_holo(monkeypatch):
+    from jarvis.ui import ambient
+    theme.select_look("holo")
+    monkeypatch.setattr(ambient, "measure", _fake_measure)
+    ambient._MEASURE_CACHE.clear()
+
+    class _Slab:
+        _draw_framed_rows = ambient.RoomSlab._draw_framed_rows
+        _draw_rows = ambient.RoomSlab._draw_rows
+
+        def __init__(self):
+            self._reveal = None
+            self._dim = 1.0
+            self.texts = []
+
+        def _draw_frame(self, *a):
+            pass
+
+        def _pad_x(self):
+            return 20
+
+        def create_line(self, *a, **k):
+            return 1
+
+        def create_text(self, *a, **k):
+            self.texts.append(k.get("text"))
+            return 1
+
+    rows = [("NEXT", "Lab report"), ("DUE", "tomorrow"), ("OUTSIDE", "72°")]
+    try:
+        slab = _Slab()
+        slab._draw_framed_rows(rows, 900, 1400, 300, "#fff", "#888")
+        assert slab.texts[::2] == ["NEXT", "DUE", "OUTSIDE"]
+        slab = _Slab()
+        slab._draw_rows(rows, 900, 1400, 300, "#fff", "#888")
+        assert slab.texts[::2] == ["NEXT", "DUE", "OUTSIDE"]
+        assert ambient.tracked("NEXT") == "N E X T"        # the helper is untouched
+    finally:
+        ambient._MEASURE_CACHE.clear()

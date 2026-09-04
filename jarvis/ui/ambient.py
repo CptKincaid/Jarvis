@@ -88,11 +88,10 @@ GLOW_MIN_W = 120            # the clock's glow line, at its shortest
 RAIL_LIT_FRAC = 0.22        # the ambient header rail: lit share (ref2's
                             # segmented status bar — one bright segment,
                             # the rest dim)
-HOLO_CLOCK_BAND = 2         # CORE_BANDS index the standby clock is drawn in:
-                            # two steps off pure white toward ice. Band 1
-                            # (#d4f4ff) still came out neutral grey under the
-                            # 0.7 daytime dim (r1 shot, 09-01); band 2 keeps
-                            # a visible cool cast at every hour
+MERIDIEM_SIZE = 22          # the inline AM/PM after the standby digits, in
+                            # TYPE units (the wordmark's size: a third of
+                            # the clock, read as part of the time)
+MERIDIEM_GAP = 10           # design units between the digits and the AM/PM
 GLOW_STEPS = (1.0, 0.7, 0.4)  # the clock glow's nested spans, longest and
                             # dimmest first, so the line fades at its ends
 
@@ -208,21 +207,20 @@ def slab_ink(tone: str, look: Optional[str] = None) -> tuple:
     call time. Quiet hours take the whole palette ember; away drops the
     contrast; normal is the focal ladder.
 
-    `look` defaults to the current theme.LOOK. Only the holo clock differs:
-    it steps one band off white toward ice (CORE_BANDS) so the night dim,
-    which blends toward the navy ground, leaves it cool rather than the
-    neutral grey the classic FOCAL clock goes."""
+    `look` defaults to the current theme.LOOK and is read for the tokens
+    only: the ladder is the same in both looks. Until 09-03 the holo clock
+    was CORE_BANDS[2] (#a8e9ff) for a cool cast under the night dim -- and
+    measured (U09, 17-standby at S=2) it came out the THIRD brightest text
+    on its own slab: peak luminance 159 against 173 for the row values and
+    131 for its own caption. FOCAL is the top of the ladder; the cast is
+    the price of the clock owning the panel."""
     look = look or theme.LOOK
     if tone == "quiet":
         ember = quiet_ink()
         return ember, dim(ember, 0.7), theme.FAINT
     if tone == "away":
         return theme.MUTED, theme.MUTED, theme.FAINT
-    head = theme.FOCAL
-    if look == "holo":
-        bands = theme.CORE_BANDS
-        head = bands[min(max(0, HOLO_CLOCK_BAND), len(bands) - 1)]
-    return head, theme.INK, theme.MUTED
+    return theme.FOCAL, theme.INK, theme.MUTED
 
 
 # --------------------------------------------- measured-width memo
@@ -272,6 +270,47 @@ def tracked(text: str, gap: str = " ", word_gap: str = "   ") -> str:
     input collapses first, so a pre-spaced value cannot double up."""
     words = str(text or "").split()
     return word_gap.join(gap.join(word) for word in words)
+
+
+def standby_caption(now: Optional[datetime] = None,
+                    look: Optional[str] = None) -> str:
+    """The line under the standby clock (pure). Classic: 'PM  ·  SATURDAY
+    30 AUGUST', as it has always been. Holo: the tracked date alone -- the
+    meridiem sits inline after the digits (clock_line), so it is no longer
+    a detached 'PM' a caption-size below the time (U09, 09-03)."""
+    now = now or datetime.now()
+    if (look or theme.LOOK) == "holo":
+        return tracked(date_text(now))
+    return f"{meridiem(now)}  ·  {date_text(now)}"
+
+
+def clock_line(cx: int, digits_w: int, meridiem_w: int, gap: int) -> tuple:
+    """(digits_x, meridiem_x) for a west-anchored '4:26' and its 'PM' laid
+    as ONE centred group about `cx` (pure): the digits start half the
+    group's width left of centre, the meridiem `gap` past their end."""
+    total = int(digits_w) + int(gap) + int(meridiem_w)
+    digits_x = int(cx) - total // 2
+    return digits_x, digits_x + int(digits_w) + int(gap)
+
+
+def meridiem_bottom(cy: int, clock_linespace: int, clock_ascent: int,
+                    meridiem_descent: int) -> int:
+    """y for a south-anchored meridiem whose BASELINE meets the baseline of
+    digits centred on `cy` (pure). A centred text box of `clock_linespace`
+    puts its baseline at cy - linespace/2 + ascent; the smaller face's box
+    bottom is that baseline plus its own descent."""
+    return int(cy) - int(clock_linespace) // 2 + int(clock_ascent) \
+        + int(meridiem_descent)
+
+
+def font_metrics(font_spec) -> tuple:
+    """(ascent, descent, linespace) of `font_spec` in device px, via the raw
+    `font metrics` call (the same reason widgets.measure avoids tkfont.Font:
+    a pixel size wrapped in a named font reports rounded points)."""
+    root = tk._get_default_root("font metrics")
+    call = root.tk.call
+    return tuple(int(call("font", "metrics", font_spec, opt))
+                 for opt in ("-ascent", "-descent", "-linespace"))
 
 
 def frame_box(w: int, top: int, n_rows: int, row_h: int, *, frac: float,
@@ -484,14 +523,12 @@ class RoomSlab(tk.Canvas):
         holo = theme.LOOK == "holo"
         clock_font = ui_display(CLOCK_SIZE, "semibold")
         clock = clock_text(now)
-        self.create_text(w // 2, cy, anchor="center", text=clock,
-                         fill=head, font=clock_font)
         if holo:
-            self._draw_clock_glow(w, cy + px(CLOCK_BOX) // 2, clock,
-                                  clock_font)
-        caption = f"{meridiem(now)}  ·  {date_text(now)}"
-        if holo:
-            caption = tracked(f"{meridiem(now)} · {date_text(now)}")
+            self._draw_clock_line(w, cy, clock, clock_font, now, head, body)
+        else:
+            self.create_text(w // 2, cy, anchor="center", text=clock,
+                             fill=head, font=clock_font)
+        caption = standby_caption(now)
         self.create_text(w // 2, cy + px(CLOCK_BOX) // 2 + px(14),
                          anchor="center", text=caption,
                          fill=faint, font=ui_display(theme.SIZE_CAPTION))
@@ -563,7 +600,8 @@ class RoomSlab(tk.Canvas):
                                  text=f"{label}   {text}", fill=body, font=vf)
                 continue
             self.create_text(pad, y, anchor="w",
-                             text=tracked(label) if holo else label,
+                             text=(theme.caption(label, surface=False)
+                                   if holo else label),
                              fill=faint, font=lf)
             self.create_text(w - pad, y, anchor="e", text=text,
                              fill=body, font=vf)
@@ -585,15 +623,46 @@ class RoomSlab(tk.Canvas):
         for pts in hud_bracket_points(x0, y0, x1, y1, cut, px(BRACKET_LEN)):
             self.create_line(*pts, fill=dim(theme.BRIGHT, self._dim), width=1)
 
-    def _draw_clock_glow(self, w, y, clock: str, font) -> None:
+    def _draw_clock_line(self, w, cy, clock: str, clock_font, now, head,
+                         body) -> None:
+        """Holo standby: '4:26' with its 'PM' inline after the digits, the
+        pair centred as one group, baselines met, the glow line under the
+        digits (U09, 09-03: the meridiem was a detached caption below)."""
+        mer = meridiem(now)
+        mer_font = ui_display(MERIDIEM_SIZE, "semibold")
+        try:
+            digits_w = measured(clock_font, clock)
+        except Exception:                   # noqa: BLE001 - Tk font boundary
+            digits_w = int(w * 0.4)
+        try:
+            mer_w = measured(mer_font, mer)
+        except Exception:                   # noqa: BLE001 - Tk font boundary
+            mer_w = px(30)
+        dx, mx = clock_line(w // 2, digits_w, mer_w, px(MERIDIEM_GAP))
+        self.create_text(dx, cy, anchor="w", text=clock, fill=head,
+                         font=clock_font)
+        try:
+            asc, _desc, ls = font_metrics(clock_font)
+            _a, mer_desc, _l = font_metrics(mer_font)
+            self.create_text(mx, meridiem_bottom(cy, ls, asc, mer_desc),
+                             anchor="sw", text=mer, fill=body, font=mer_font)
+        except Exception:                   # noqa: BLE001 - Tk font boundary
+            self.create_text(mx, cy, anchor="w", text=mer, fill=body,
+                             font=mer_font)
+        self._draw_clock_glow(w, cy + px(CLOCK_BOX) // 2, clock, clock_font,
+                              cx=dx + digits_w // 2)
+
+    def _draw_clock_glow(self, w, y, clock: str, font, cx=None) -> None:
         """The faint cyan line under the digits — the reactor's two-stroke
         fake glow (a wide dim underlay beneath a narrow brighter core),
-        as long as the digits themselves."""
+        as long as the digits themselves, centred on `cx` (the digits'
+        centre; the slab's when not given)."""
         try:
             text_w = measured(font, clock)
         except Exception:                   # noqa: BLE001 - Tk font boundary
             text_w = int(w * 0.4)
-        x0, x1 = glow_span(w // 2, text_w, px(GLOW_MIN_W), w - 2 * px(PAD))
+        x0, x1 = glow_span(w // 2 if cx is None else int(cx), text_w,
+                           px(GLOW_MIN_W), w - 2 * px(PAD))
         spans = glow_steps(x0, x1)
         # the soft underlay sits under the MIDDLE span only, so the ends of
         # the line thin out to the 1px stroke instead of a blunt bar
@@ -625,9 +694,11 @@ class RoomSlab(tk.Canvas):
         rule = dim(theme.HOLO_DIM, self._dim)
         for sy in separator_ys(top, len(rows), px(ROW_H)):
             self.create_line(x0 + inset, sy, x1 - inset, sy, fill=rule)
-        # the label column is the widest tracked label; the value gets the
-        # rest of the frame, and is ellipsized against exactly that
-        labels = [tracked(label) for label, _v in rows]
+        # the label column is the widest label; the value gets the rest of
+        # the frame, and is ellipsized against exactly that. Row keys are
+        # plain caps, not tracked: they name a ROW, and only a label that
+        # names a surface is tracked (theme.caption, the 09-03 U16 rule)
+        labels = [theme.caption(label, surface=False) for label, _v in rows]
         try:
             label_w = max(measured(lf, t) for t in labels) if labels else 0
         except Exception:                   # noqa: BLE001 - Tk font boundary
@@ -653,9 +724,11 @@ class RoomSlab(tk.Canvas):
                          width=max(1, px(2)))
 
 
-__all__ = ["RoomSlab", "band_frame", "clock_text", "date_text", "fitted",
+__all__ = ["RoomSlab", "band_frame", "clock_line", "clock_text",
+           "date_text", "fitted", "font_metrics",
            "frame_box", "glow_span", "glow_steps", "gpu_fraction",
            "hud_bracket_points", "hud_frame_points", "measured",
            "meridiem", "quiet_ink", "rail_segments", "room_rows",
-           "separator_ys", "slab_ink", "slab_tone", "standby_rows",
+           "meridiem_bottom", "separator_ys", "slab_ink", "slab_tone",
+           "standby_caption", "standby_rows",
            "tracked", "visible_rows", "ACTIVE", "AMBIENT", "STANDBY"]

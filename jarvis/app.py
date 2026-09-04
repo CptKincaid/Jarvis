@@ -551,6 +551,13 @@ class JarvisApp:
         # is never reached from the running app at all.
         self.commander.on_uncertain = self._on_uncertain
         self.commander.claim_uncertain = self._claim_uncertain
+        # ...and the count of those cards, for "clear the transcript": the
+        # prompt goes into the SAME TranscriptView._approvals dict the
+        # Claude approvals do, clear_all keeps it while it is unanswered,
+        # and ApprovalService.pending() has never heard of it. Without this
+        # the wipe said "Screen's clear, sir" over a card still on the
+        # glass (commander._standing_questions).
+        self.commander.uncertain_open = self._uncertain_open
         self._pending_uncertain: dict = {}      # request_id -> utterance
         # The open debrief question (jarvis/debrief.py), modelled on
         # _pending_uncertain: a context dict the NEXT transcript is filed
@@ -1241,6 +1248,20 @@ class JarvisApp:
             # Commander._try_briefing_offer -- declared here so the
             # namespace says the slot exists.
             briefing_offer=None,
+            # In-app face enrolment (jarvis/enrolrun.py). The OFFER is parked
+            # by Commander._h_face_enrol and answered by _try_enrol; the RUN
+            # is the live EnrolRun, which parks and unparks itself. Declared
+            # here so the namespace says both slots exist -- and so a box
+            # with no camera console still answers getattr with None rather
+            # than raising on the first "enrol my face".
+            enrol_offer=None,
+            enrol_run=None,
+            # The console's capture thread and its preview lease, published
+            # by ui.main_window once the pane is built. None on a headless
+            # box, which is what makes the in-app path refuse rather than
+            # reach for a camera nobody is holding.
+            preview_worker=None,
+            preview_lease=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
             # the one self-state sheet the courtesy and the readout share
@@ -4015,6 +4036,17 @@ class JarvisApp:
         # sir (24/24 measured), and catching it would mean rewriting at the
         # TTS door, which is the thing this design does not do. So the
         # burst keeps exactly one sir of its own and the reply keeps its.
+        # A briefing that is being DELIVERED retires any parked offer of one.
+        # 2026-09-04 15:06: the model answered his briefing inside a compound
+        # question, the arrival offer from 14:44 then asked "Shall I run your
+        # briefing, sir?", he said yes, and the calendar and the lab were read
+        # to him a second time. The offer rung only ever cleared itself when
+        # it was answered; nothing cleared it when the thing it offered had
+        # already happened.
+        try:
+            self.services.briefing_offer = None
+        except Exception:  # noqa: BLE001 - no services, nothing parked
+            pass
         say_in_burst("Your briefing for today, sir.")
         # arc.greeting_word, not the literal "morning": every delivery in
         # the two retained logs (08-31 14:33, 09-01 15:00, 09-02 14:29)
@@ -5408,6 +5440,21 @@ class JarvisApp:
         except Exception:
             log.exception("uncertain follow-up failed")
 
+    def _uncertain_open(self) -> int:
+        """Commander hook: how many "Was that for me?" cards are still up.
+
+        One prompt at a time by construction (_on_uncertain supersedes the
+        last), so this is 0 or 1 -- but it is counted rather than asserted,
+        because the pane counts CARDS and the commander speaks a number.
+
+        Easy to be non-zero with nobody at fault: _ask_uncertain returns
+        without publishing UncertainResolved when the 5 s window hears
+        nothing, when the transcript is refused, or when there is no mic,
+        so the card sits there waiting for a click that may never come.
+        """
+        with self._uncertain_lock:
+            return len(getattr(self, "_pending_uncertain", ()) or ())
+
     def _claim_uncertain(self, yes: bool) -> bool:
         """Commander hook: a spoken "that was for you" / "that wasn't for
         you" settles the open card. The commander logs the label and routes
@@ -5874,11 +5921,24 @@ class JarvisApp:
         # his first turn, and the prewarm and gc.freeze below land ~0.85 s
         # later because of it. The hotword is already listening by now
         # (start_background runs before start_models), so warmup() gives way
-        # to a real turn rather than making it wait -- see its docstring.
-        try:
-            self.transcriber.warmup()
-        except Exception:
-            log.exception("whisper warm-up failed")
+        # to a decode already in flight, and a turn that lands INSIDE the
+        # warm-up waits for the rest of it -- at most one ~0.85 s silent
+        # decode, then decodes warm (its docstring has the real bound). The
+        # one ordering the transcriber cannot see from inside is a capture
+        # already open when this line is reached: its decode is seconds
+        # away and would only queue behind the throwaway one, so the
+        # warm-up is skipped and that turn pays the cold decode it would
+        # have paid anyway, minus the wait (F49).
+        rec = getattr(self, "recorder", None)
+        busy = getattr(self, "_audio_busy", None)
+        if getattr(rec, "recording", False) or (busy is not None
+                                                and busy.is_set()):
+            log.info("whisper warm-up skipped: a capture is in flight")
+        else:
+            try:
+                self.transcriber.warmup()
+            except Exception:
+                log.exception("whisper warm-up failed")
         # Honest failure for the speakers: with only a dummy/null sink the
         # playback chain "succeeds" into silence (seen on this machine with
         # no HDMI audio device attached).

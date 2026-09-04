@@ -3627,6 +3627,72 @@ def test_the_background_warm_does_not_override_his_own_choice(
         srv.close()
 
 
+def test_a_sidecar_that_comes_up_later_is_re_adopted(sock_path, no_spawn,
+                                                     monkeypatch, tmp_path):
+    """One failed probe demoted Breeze to F5 for the whole session. The
+    memory gate refusing at boot is the sidecar's documented normal state
+    some mornings (MemFree 20.9 GB against the 33 GB floor when this was
+    filed), so the unit is 'failed', load() takes the F5 branch on every
+    utterance, nothing pings Breeze again, and warm_breeze -- only spawned
+    when the unit was active -- gave up after one 90 s budget. Hunter frees
+    memory and starts the unit; Jarvis keeps speaking F5 with tts_engine
+    still 'breeze', until a restart. Measured: with a READY sidecar bound
+    and the unit active, ten further load() calls sent it 0 requests.
+
+    The re-probe is a background loop now (BREEZE_REPROBE_S), spawned by
+    the demotion itself whatever the unit's state, and still off the speak
+    path: load() itself sends nothing to the socket while demoted."""
+    unit = {"active": False}
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: unit["active"])
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
+    monkeypatch.setattr(tts_mod, "BREEZE_REPROBE_S", 0.2)
+    t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+    assert t.load() is True and t.engine == "f5"
+    warm = t._breeze_warm_thread
+    assert warm is not None and warm.is_alive(), "nothing is re-probing"
+    time.sleep(0.6)                                # a few probes, no sidecar
+    assert t.engine == "f5"
+    unit["active"] = True
+    srv = FakeSidecar(sock_path, sidecar_handler([]))   # he started the unit
+    try:
+        assert wait_until(lambda: t.engine == "breeze", 5), \
+            "the sidecar answered and nothing picked it back up"
+        pings = len([r for r in srv.requests if r.get("ping")])
+        for _ in range(5):                         # five more utterances
+            assert t.load() is True
+        assert t.engine == "breeze"
+        assert len([r for r in srv.requests if r.get("ping")]) == pings + 5
+    finally:
+        srv.close()
+        warm.join(5)
+    assert not warm.is_alive()                     # done once it promoted
+
+
+def test_the_re_probe_stops_when_he_picks_another_engine(sock_path, no_spawn,
+                                                         monkeypatch, tmp_path):
+    """It only ever RESTORES a demotion we made: once the engine is no longer
+    the one we fell back to, the loop ends and never promotes."""
+    monkeypatch.setattr(tts_mod, "_breeze_unit_active", lambda: False)
+    monkeypatch.setattr(tts_mod, "_ensure_f5_server", lambda *a, **k: True)
+    monkeypatch.setattr(tts_mod.TTS, "warm_f5_fallback", lambda self: None)
+    monkeypatch.setattr(tts_mod, "BREEZE_REPROBE_S", 0.2)
+    t = TTS(engine="breeze", cache_dir=tmp_path / "cache")
+    assert t.load() is True and t.engine == "f5"
+    warm = t._breeze_warm_thread
+    assert warm is not None and warm.is_alive(), "nothing is re-probing"
+    t.engine = "edge"
+    warm.join(3)
+    assert not warm.is_alive(), "the loop outlived his choice"
+    srv = FakeSidecar(sock_path, sidecar_handler([]))
+    try:
+        time.sleep(0.6)
+        assert t.engine == "edge"
+        assert srv.requests == []
+    finally:
+        srv.close()
+
+
 def test_waiting_for_the_gpu_lock_is_not_silent(tmp_path, monkeypatch, capsys):
     """gpu_lock is entered before the only other output in main(), so between
     ExecStartPre and the memory gate journalctl showed NOTHING for as long as

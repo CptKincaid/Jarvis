@@ -1624,7 +1624,8 @@ class Reactor(tk.Canvas):
         d["needle"] = line(*needle_xy(gx, gy, r, None),
                            fill=theme.ARC_BRIGHT, width=max(1, px(1)))
         self.create_text(gx - r - px(8), gy, anchor="e",
-                         text=tracked(GAUGE_LABEL), fill=theme.FAINT,
+                         text=theme.caption(GAUGE_LABEL, surface=False),
+                         fill=theme.FAINT,
                          font=ui_display(theme.SIZE_CAPTION, "semibold"),
                          tags=("decor",))
 
@@ -1679,16 +1680,19 @@ class Reactor(tk.Canvas):
         d["card_lbl"] = {}
         lf = ui_display(theme.SIZE_CAPTION, "semibold")
         vf = ui_mono(theme.SIZE_CAPTION)
-        labels = {key: (tracked(lab) if holo else lab)
+        # row keys are ROW labels, so in holo they are plain caps, not
+        # tracked (theme.caption; the 09-03 U16 rule -- the card's keys
+        # were the one HUD surface still tracking its rows)
+        labels = {key: (theme.caption(lab, surface=False) if holo else lab)
                   for lab, key in CARD_ROWS}
         if holo:
-            # tracked labels are wider than the 40 design px the classic
-            # budget assumes, and unevenly so ("D E V I C E" is 20 px
-            # wider than "H E A R" at scale 1): a single budget cut from
-            # the widest label ellipsized "WHISPER TURBO" on the HEAR row
-            # (seen 2026-09-01 on :97), so holo budgets per row — each
-            # value gets the card's inner width minus ITS label and an
-            # 8 design px gutter, never less than 48
+            # the display face's labels are wider than the 40 design px
+            # the classic budget assumes, and unevenly so (DEVICE vs HEAR):
+            # a single budget cut from the widest label ellipsized
+            # "WHISPER TURBO" on the HEAR row (seen 2026-09-01 on :97,
+            # when the keys were still tracked), so holo budgets per row
+            # — each value gets the card's inner width minus ITS label and
+            # an 8 design px gutter, never less than 48
             inner = px(CARD_W - 2 * CARD_PAD)
             d["card_budget"] = {
                 key: max(px(48), inner - measure(lf, text) - px(8))

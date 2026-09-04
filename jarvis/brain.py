@@ -449,6 +449,19 @@ _ACTION_CLAIM_RX = re.compile(
     r"removing|sending|queuing|queueing|scheduling|saving|creating|"
     r"deleting|pausing|resuming|turning|switching|moving|booking|clearing|"
     r"stopping|muting|skipping|dimming|putting)\b"
+    # THE FUTURE IS A CLAIM TOO. "I shall pass on your regards to <two real
+    # people>" (2026-09-04 15:06:29) promised an action no tool can take and
+    # nobody asked for, and walked through because the table knew only the
+    # past and the progressive. A promise the system cannot keep is
+    # exactly as unbacked as a claim it did not do; the relay verbs (pass
+    # on, tell, let .. know, relay, forward) are here because that is the
+    # shape it took. "I'll be here" and "I'll stop there" fall to the
+    # idiom veto below, as they always did for the progressive.
+    r"|i(?:'ll| will| shall)(?: now| just| also| certainly| of course)? "
+    r"(?:pass (?:on|along)|tell|let \w+ know|relay|forward|add|set|start|"
+    r"cancel|remove|send|queue|schedule|save|create|delete|pause|resume|"
+    r"turn (?:on|off|up|down)|switch|move|book|clear|stop|mute|skip|dim|"
+    r"put)\b"
     # the passive and the state claims: "milk is added to your list",
     # "your timer is set", "the music is on", "playing now". Kept to the
     # shapes of a DONE action: this guard is for actions the model says it
@@ -589,15 +602,26 @@ def strip_unbacked_claims(text, n=None):
 #
 # THE CONVENTION THIS TRUSTS, stated honestly. Reads hand back text and
 # leave the phrasing to a round; writes and controls (notes, spotify,
-# add_event, timers) author their own confirmation. There is ONE read that
-# authors its success line, deliberately: screen_qa (jarvis/tools/screen.py
-# -- the vision call can take 25 s and a second model turn to phrase it
-# would be refused). It is not exempted here. When screen_qa is the only
-# tool of the turn nothing else is owed and it still answers in one round;
-# when he asked for something else beside it, that something else IS owed
-# a sentence and the round is worth its cost. Nothing at register time
-# enforces the convention, and a future read that authors a success line
-# would go invisible to this check the way screen_qa's own answer does.
+# add_event, timers) author their own confirmation. The first cut of this
+# comment said ONE read authored its success line, screen_qa. Counted
+# 2026-09-03 (F28), it is ten, and tests/test_reply_coverage.py keeps the
+# census by name (AUTHORED_BY_READS) so the next one is a decision rather
+# than a surprise:
+#
+#   screen_qa (jarvis/tools/screen.py -- the vision call can take 25 s and
+#   a second model turn to phrase it would be refused), notes list/search
+#   (his own list text), timekeeper's manage_schedule list, spotify
+#   now_playing, oracle_status, canvas_due / canvas_grades /
+#   canvas_announcements on their "nothing" lines, recap_day on an empty
+#   journal, get_mail on "nothing new".
+#
+# None of them is exempted here, and none needs to be: an authored line
+# ends the turn alone, and held beside an owed read it is appended to the
+# render round's reply. What the check CANNOT do for these is tell a
+# read-out from an action -- HELD_LINE_NOTE calls a held line "already
+# done" whatever authored it -- and nothing at register time enforces the
+# convention, so a read that starts authoring its line goes invisible to
+# this check the way those ten already are. The census test is the guard.
 def answer_owed(result) -> bool:
     """True when ``result`` is something he is still owed a sentence
     about: it carries no authored line of its own, and it actually says
@@ -650,6 +674,24 @@ def held_lines_missing(spoken, lines) -> list:
             have = f"{have} {norm}"
             missing.append(line)
     return missing
+
+
+def guard_authored(line) -> str:
+    """A line the CODE wrote -- a tool's speak=, a held confirmation, the
+    degrade -- made safe for TTS the way spoken_from_ollama makes model
+    prose safe: clean, markdown, clean again (that order; see
+    spoken_from_ollama), and NOT capped. It is guarded ONCE, where the
+    line is collected, so every place the line then goes -- held_lines,
+    HELD_LINE_NOTE, held_lines_missing, coverage_degrade, the streamed
+    hand-off to on_sentence -- carries the form that will be spoken.
+
+    Before this (F27, 2026-09-03) only the line spoken ALONE went through
+    the guards; held beside an owed read, notes' list text reached TTS as
+    he dictated it, "**milk**, eggs 🥚" and all, and held_lines_missing
+    compared that raw line against the guarded reply, so a model copying
+    it verbatim never matched and he heard it twice."""
+    return clean_ollama_reply(strip_markdown(
+        clean_ollama_reply(line or ""))).strip()
 
 
 def append_spoken_lines(spoken, lines, cap=None) -> str:
@@ -713,8 +755,8 @@ VOICE_RULES = (
     "sentences instead of one long comma run, which is read flat. "
     "State facts plainly. Admit "
     "limits gracefully (\"I'm afraid...\") and when there is a genuine "
-    "next step, offer it briefly. One short sentence usually; never more "
-    "than two unless he explicitly asks for detail. Never pad: no second "
+    "next step, offer it briefly. Two or three sentences usually; a fourth "
+    "when the question genuinely needs it, one when it does not. Never pad: no second "
     "sentence that merely describes the screen, the repository, or what "
     "you could do next. Jokes are one line, deadpan, and never explained; "
     "never a riddle, a set-up or a knock-knock; a joke is a dry remark "
@@ -886,7 +928,7 @@ JARVIS_SYSTEM = f"""You are JARVIS, Hunter's personal AI: the calm, dry British 
 {VOICE_RULES}
 Never gush, never flatter, never sound like customer service. Answer the question and stop.
 
-Tools: you have tools for live data and for his schedule. Use a tool whenever the answer depends on live data (the time, the weather, his calendar, his mail, his reminders, timers and alarms, his notes) and never guess those. Call the tool first, without commentary. After a tool result, answer in one or two sentences using only the numbers, names and times in the result; never invent a figure the result does not contain. If a tool says something is not set up, say so in one sentence and name the thing. If a tool reports a failure, say what could not be reached in one sentence. Do not call a tool for a greeting, thanks, a joke, an opinion or general knowledge.
+Tools: you have tools for live data and for his schedule. Use a tool whenever the answer depends on live data (the time, the weather, his calendar, his mail, his reminders, timers and alarms, his notes) and never guess those. Call the tool first, without commentary. After a tool result, answer in two to four sentences using only the numbers, names and times in the result; never invent a figure the result does not contain. If a tool says something is not set up, say so in one sentence and name the thing. If a tool reports a failure, say what could not be reached in one sentence. Do not call a tool for a greeting, thanks, a joke, an opinion or general knowledge.
 
 Beyond your tools you cannot act: you cannot buy, book, browse, call, text, order, open files or run code yourself; the desktop commands and Claude do that through the rest of the system. If he asks you to buy, order, book, call, text, send or fetch anything, say in one sentence that you cannot, naming what he asked for, with a dry reason of your own (no hands, no phone, no card); never answer with what you can do instead. Never say you checked, ran, read, saved or found anything unless a tool result in this conversation says so. When he asks for advice, give the one check anyone would make first and do not pretend to have inspected his code.
 
@@ -899,7 +941,7 @@ Answer as Jarvis only: no "Jarvis:" label, no writing the user's lines, and don'
 Examples of the manner only; every reply is in fresh words for this exact request and names the thing he actually asked for (the pizza, the branch, the hour), never the thing in the example:
 {{examples}}
 
-{{register}}Now answer Hunter as Jarvis, in your own words, keeping the manner of the examples, and call him sir. One short sentence is the norm; add a second only if it says something new that he asked for, and never describe his screen, files or machine unless he asked. If he asks for a joke, it is one dry remark about his situation, never a question and its answer. The examples are the manner only, never the words: never reuse a sentence, a clause or an object from an example — if an example speaks of a phone and he asks about dinner, the reply is about dinner. Then stop."""
+{{register}}Now answer Hunter as Jarvis, in your own words, keeping the manner of the examples, and call him sir. Two or three sentences is the norm; take a fourth when the question genuinely needs it and one when it does not -- length follows the question, not a quota, and never describe his screen, files or machine unless he asked. If he asks for a joke, it is one dry remark about his situation, never a question and its answer. The examples are the manner only, never the words: never reuse a sentence, a clause or an object from an example — if an example speaks of a phone and he asks about dinner, the reply is about dinner. Then stop."""
 
 # Router tie-breaker (spec 4.2): the instruction rides in the user turn so
 # the request shares the static prefix (system + tools) with chat.
@@ -1573,8 +1615,15 @@ def reclaim():
 # ----------------------------------------------------------------------
 # Guards between the model and TTS
 # ----------------------------------------------------------------------
-MAX_SPOKEN_SENTENCES = 2
-MAX_SPOKEN_CHARS = 250                    # prefer a sentence end below this
+MAX_SPOKEN_SENTENCES = 4       # 2 until 2026-09-04. Raised WITH the system
+                               # prompt, never alone -- see the note at the
+                               # top of this file about the last attempt.
+MAX_SPOKEN_CHARS = 450                    # prefer a sentence end below this
+# WHY THIS COSTS HIM NOTHING: speech is streamed a sentence at a time
+# (_stream_round, and 'a streamed sentence is spoken before the reply'
+# below), so time-to-first-word does not depend on how long the answer
+# turns out to be. A longer reply means he hears MORE, not that he waits
+# longer to hear anything -- which is the condition he set for raising it.
 HARD_SPOKEN_CHARS = _TTS.MAX_SPEAK_LENGTH  # the one hard limit, shared w/ TTS
 NO_CLOCK_LINE = "I'm afraid I haven't a clock in front of me just now, sir."
 # Said instead when a clock IS available and the model's reading contradicts
@@ -2142,6 +2191,34 @@ def _finish_spoken(raw, guard_context, user_text, n):
     text = spoken_from_ollama(raw, guard_context, user_text, n)
     cap = MAX_SPOKEN_CHARS if n <= MAX_SPOKEN_SENTENCES else HARD_SPOKEN_CHARS
     return trim_spoken(text, cap=cap)
+
+
+def _finish_authored(raw, guard_context, user_text):
+    """A CODE-authored reply -> the line TTS gets: the same guards as
+    _finish_spoken and neither of its prose caps.
+
+    MAX_SPOKEN_SENTENCES and MAX_SPOKEN_CHARS are a rule about how much
+    PROSE he wants back from a model. Two writes' confirmations joined,
+    or the degrade's confirmations plus its honest word about what went
+    unspoken, are not prose: every sentence reports something that
+    happened or names something fetched, and cutting one drops the news
+    of a write (F26, 2026-09-03: "add milk and set a timer" spoke the
+    calendar line alone; "what's the weather, add milk, set a timer" with
+    a silent render round spoke both confirmations and lost the notice
+    about the weather while the log said the sources had been named).
+    append_spoken_lines has exempted a HELD line from the caps since it
+    was written; this is the same exemption for the speak branch and the
+    degrade.
+
+    The one bound left is HARD_SPOKEN_CHARS, whole sentences up to it:
+    that is the TTS limit, and TTS cuts there itself (tts.py,
+    MAX_SPEAK_LENGTH) -- past it a line is lost either way, and a
+    sentence boundary is the better place to lose it."""
+    text = guard_authored(raw)
+    text = guard_clock_claims(text, guard_context, user_text)
+    text = ground_greeting(text, user_text)
+    text = strip_relay_address(text, user_text)
+    return trim_spoken(text, cap=HARD_SPOKEN_CHARS, hard=HARD_SPOKEN_CHARS)
 
 
 # ----------------------------------------------------------------------
@@ -2939,6 +3016,10 @@ class JarvisBrain:
         tool_budget = MAX_TOOL_TEXT_TOTAL_CHARS
         truncated = False
         final = ""
+        # True when `final` is the degrade -- code-authored, so it is
+        # finished by _finish_authored (guards, no prose caps) rather than
+        # capped like a model's reply. See F26 in that docstring.
+        authored_final = False
         # Ollama reports load_duration even on a resident model: it is the
         # server's own per-request overhead before the runner sees the
         # prompt. Logging it separates "the model was slow" from "Ollama
@@ -3031,6 +3112,21 @@ class JarvisBrain:
                 messages.append({"role": "tool", "content": TOOL_SKIPPED_TEXT,
                                  "tool_name": name})
 
+        def authored_line(result):
+            """``result.speak`` as it will be SPOKEN: guarded once
+            (guard_authored) and sentence-capped once, PER LINE, at the
+            larger of MAX_SPOKEN_SENTENCES and the tool's own allowance.
+            The per-line cap is the 2026-08-26 M8 rule (a ten-sentence
+            note read-out is still not read whole) kept where it belongs:
+            on the line, never on the join. Two lines joined, or the
+            degrade, are then never trimmed against each other (F26)."""
+            line = guard_authored(result.speak) if result.speak else ""
+            if not line:
+                return ""
+            allowed = max(MAX_SPOKEN_SENTENCES,
+                          int(getattr(result, "max_sentences", 0) or 0))
+            return limit_sentences(line, allowed)
+
         def degrade():
             """What to say with results in hand and no prose for them.
             Lines the coverage check held back are spoken here rather than
@@ -3062,7 +3158,7 @@ class JarvisBrain:
             result = registry.call(force_tool, args)
             note(result, force_tool, args)
             if result.speak:
-                speak = result.speak
+                speak = authored_line(result) or result.speak
             else:
                 messages.append({"role": "assistant", "content": "",
                                  "tool_calls": [{"function": {
@@ -3235,7 +3331,7 @@ class JarvisBrain:
                         # WHAT is in hand rather than only that something is
                         log.warning("chat: the render round wrote nothing; "
                                     "naming the sources instead")
-                        final = degrade()
+                        final, authored_final = degrade(), True
                     break
                 if force_tool and tool_texts and rounds_left == 0 and \
                         messages[-1].get("role") == "tool":
@@ -3247,7 +3343,7 @@ class JarvisBrain:
                     # saying what get_mail found instead.
                     if grant_render_round():
                         continue
-                    final = degrade()
+                    final, authored_final = degrade(), True
                     break
                 messages.append({"role": "assistant", "content": content,
                                  "tool_calls": calls})
@@ -3293,7 +3389,12 @@ class JarvisBrain:
                     note(result, name, args)
                     messages.append(tool_message(result, name))
                     ran += 1
-                    if result.speak and result.speak not in authored:
+                    # Guarded HERE, once (authored_line): from this point
+                    # the line is held, told to the render round, matched
+                    # against its reply and spoken in one and the same
+                    # form.
+                    line = authored_line(result)
+                    if line and line not in authored:
                         # COLLECTED, NOT ACTED ON. This used to `break` the
                         # round the moment any tool authored a line, which
                         # made the whole turn depend on the ORDER the model
@@ -3311,7 +3412,7 @@ class JarvisBrain:
                         # (the fan-out cap and the work budget still bound
                         # it) and the decision is made once, below, with
                         # every result of the round in hand.
-                        authored.append(result.speak)
+                        authored.append(line)
                     if over_budget():
                         # the budget is checked INSIDE the round: a round
                         # of many calls must not run to the end first
@@ -3347,9 +3448,13 @@ class JarvisBrain:
                     else:
                         # Every authored line, not just the first: two
                         # writes in one round are two things he did and
-                        # must hear about. The cap makes room for them.
+                        # must hear about. No cap is raised for them
+                        # because none applies: the reply is code-authored
+                        # and _finish_authored below does not count
+                        # sentences (F26 -- raising the SENTENCE cap by
+                        # len(authored) left the char cap in place, and a
+                        # long calendar line trimmed the timer's off).
                         speak = " ".join(authored)
-                        cap = max(cap, len(authored))
                 if speak is None and not render_only and rounds_left > 0 and \
                         over_budget():
                     log.warning("chat: tool loop over the work budget (%.1fs)",
@@ -3366,7 +3471,8 @@ class JarvisBrain:
                     # words (a mail subject, a calendar title, a web page)
                     # and those are not spoken as if they were Jarvis's own.
                     # Only the SOURCE is named, from the tool's own name.
-                    final = degrade() if tool_texts else ""
+                    final, authored_final = ((degrade(), True) if tool_texts
+                                             else ("", False))
         except OllamaDown:
             log.warning("ollama connection refused")
             bus.publish(Status(text="Ollama isn't running", kind="warn"))
@@ -3394,17 +3500,23 @@ class JarvisBrain:
                 # spoken: keep what was said rather than say it timed out
                 final = " ".join(streamed_sentences)
             elif tool_texts:
-                final = degrade()
+                final, authored_final = degrade(), True
             else:
                 bus.publish(Status(text="Local model timed out", kind="warn"))
                 return [("SPEAK", MODEL_SLOW_LINE)]
 
         guard_ctx = "\n".join([ctx_text, mem_text] + tool_texts)
-        if speak is not None:
-            # An authored tool line still goes through the guards: notes
+        authored_reply = speak is not None or authored_final
+        if authored_reply:
+            # A code-authored reply -- a tool's speak= line, two of them
+            # joined, the degrade -- still goes through the guards: notes
             # and to-dos put Hunter's own text on this path, emoji,
-            # markdown, ten items and all.
-            spoken = _finish_spoken(speak, guard_ctx, text, cap)
+            # markdown, ten items and all. It does not go through the
+            # prose caps: every sentence of it is a write reported or a
+            # source named, and there is no model prose here to trim in
+            # its favour (F26, _finish_authored).
+            spoken = _finish_authored(speak if speak is not None else final,
+                                      guard_ctx, text)
         else:
             spoken = _finish_spoken(final, guard_ctx, text, cap)
         if not spoken:
@@ -3412,7 +3524,14 @@ class JarvisBrain:
             # not an empty turn: he keeps the write and hears what went
             # unspoken beside it
             spoken = degrade() if held_lines else MODEL_EMPTY_LINE
-        elif truncated and not _PARTIAL_RX.search(spoken):
+        elif truncated and not authored_reply and \
+                not _PARTIAL_RX.search(spoken):
+            # Not on an authored reply: the cut was to what the MODEL saw,
+            # and no model prose is being spoken -- screen_qa's answer was
+            # authored off the whole vision result, and the degrade names
+            # sources rather than reading from them. The notice used to
+            # cost the reply a sentence here, which on two confirmations
+            # was a write he was owed (F26).
             # The model answered from a result it only half saw: say so
             # rather than let a confident half-answer stand. The notice
             # costs a sentence, so the answer gives one up.

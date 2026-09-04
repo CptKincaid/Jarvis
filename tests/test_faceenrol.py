@@ -686,6 +686,48 @@ def test_a_stranger_is_no_opinion_rather_than_a_wrong_name():
     assert ident.unknown == 1
 
 
+def test_a_non_finite_match_min_fails_shut_rather_than_naming_a_stranger():
+    """THE BAR HAS TO BE A BAR, and ``score < self.match_min`` is not the
+    spelling that makes one.
+
+    ``camera.identity_min`` is a user-editable key and ``json.loads`` accepts
+    the bare literal ``NaN``, so a hand-edited assistant.json can deliver one.
+    Every other bar in this lane is spelled ``not (x >= bar)`` precisely so a
+    NaN fails SHUT (``SampleLimits.__post_init__``, ``facedetect.embed``,
+    ``FaceIdentifier``'s own conf gate); these two comparisons were the
+    natural spelling and failed OPEN. Reproduced 2026-09-03: a stranger whose
+    best cosine to the pool was 0.040 came back as ("hunter", 0.040), with
+    ``matched`` incremented and the body anchor set to the stranger (F17).
+    """
+    gallery = FaceGallery(root=None)
+    for vec in same_face(base_vec(23), 13):
+        gallery.add("hunter", vec)
+    stranger = base_vec(4242)
+    _label, best = gallery.match(stranger)
+    assert 0.0 < best < SFACE_COSINE_SAME, "the fixture stranger is not one"
+
+    with pytest.raises(ValueError):
+        FaceIdentifier(gallery, ScriptedRecogniser([stranger]), min_conf=0.6,
+                       match_min=float("nan"))
+    with pytest.raises(ValueError):
+        FaceIdentifier(gallery, ScriptedRecogniser([stranger]), min_conf=0.6,
+                       match_min=float("inf"))
+
+
+def test_a_bar_that_slipped_past_the_constructor_still_fails_shut():
+    """The comparison itself, not only the constructor: an object whose
+    ``match_min`` is set after construction (or by a future caller that does
+    not go through ``__init__``) must still decline rather than match."""
+    gallery = FaceGallery(root=None)
+    for vec in same_face(base_vec(23), 13):
+        gallery.add("hunter", vec)
+    ident = FaceIdentifier(gallery, ScriptedRecogniser([base_vec(4242)]),
+                           min_conf=0.6)
+    ident.match_min = float("nan")
+    assert ident.identify(None, head_row(0.0, conf=0.95)) == ("", 0.0)
+    assert ident.unknown == 1 and ident.matched == 0
+
+
 def test_an_empty_gallery_computes_nothing_at_all():
     """Before enrolment there is nothing to compare against, and paying for
     an embedding to discover that is pure cost."""
@@ -1637,3 +1679,190 @@ def test_a_deleted_generation_is_overwritten_before_it_is_unlinked(tmp_path):
     assert gallery.purge() == 1
     assert not path.exists()
     assert twin.read_bytes() == b"\0" * len(body)
+
+
+# ==========================================================================
+# THE SAVE GUARD, LIFTED OUT OF THE SCRIPT (2026-09-04)
+# ==========================================================================
+# "An unusable gallery is not saved" used to be a single `if rep.ok or
+# args.force:` inside scripts/face_enrol.py -- so the rule was a property of
+# ONE script rather than of enrolment. The moment a second caller existed
+# (the in-app run, jarvis/enrolrun.py) that caller would have had to restate
+# it correctly to be safe, and a rule that must be restated to hold is a rule
+# that will eventually be restated wrong. It lives in fe.save_enrolment now
+# and both callers go through it.
+class TestTheSaveGuard:
+    def _report(self, ok: bool, reason: str = ""):
+        rep = fe.EnrolmentReport(label="hunter", detector_ok=ok,
+                                 reason=reason)
+        if not ok:
+            rep.checks = (vr.Check("samples", False, "only 3 of 8"),)
+        return rep
+
+    def test_a_report_that_failed_is_not_written(self, tmp_path):
+        gallery = FaceGallery(root=tmp_path / "g")
+        for vec in same_face(base_vec(), 9):
+            gallery.add("hunter", vec)
+        out = fe.save_enrolment(gallery, self._report(False), reason="probe")
+        assert out["saved_generation"] == 0
+        assert out["refused"]
+        assert gallery.generations() == [], "an unusable pool reached the disk"
+
+    def test_a_report_that_passed_is_written_and_the_numbers_come_back(
+            self, tmp_path):
+        gallery = FaceGallery(root=tmp_path / "g")
+        for vec in same_face(base_vec(), 9):
+            gallery.add("hunter", vec)
+        rep = self._report(True)
+        out = fe.save_enrolment(gallery, rep, reason="probe")
+        assert out["saved_generation"] == 1
+        assert out["gallery_total"] == 9
+        assert rep.saved_generation == 1     # ...and the report is stamped
+        assert gallery.generations() == [1]
+
+    def test_force_is_the_only_way_past_it(self, tmp_path):
+        """--force exists for the terminal, where he can read the FAIL line
+        first. It is the difference between the two callers."""
+        gallery = FaceGallery(root=tmp_path / "g")
+        for vec in same_face(base_vec(), 9):
+            gallery.add("hunter", vec)
+        out = fe.save_enrolment(gallery, self._report(False), reason="probe",
+                                force=True)
+        assert out["saved_generation"] == 1
+
+    def test_superseded_generations_die_only_after_the_new_one_lands(
+            self, tmp_path):
+        """--reset destroys NOTHING when the run fails a check: the old
+        generations are still there to fall back to."""
+        gallery = _saved(tmp_path)
+        old = gallery.generations()
+        assert old
+        out = fe.save_enrolment(gallery, self._report(False), reason="probe",
+                                superseded=old)
+        assert out["removed"] == 0
+        assert gallery.generations() == old
+
+    def test_a_store_refusal_is_reported_without_raising(self, tmp_path):
+        """A shrink without --allow-shrink. The judge passed, the STORE
+        refused, and the caller gets a sentence rather than a traceback."""
+        gallery = _saved(tmp_path)
+        gallery.forget("hunter")
+        for vec in same_face(base_vec(2), 3):
+            gallery.add("hunter", vec)
+        out = fe.save_enrolment(gallery, self._report(True), reason="probe")
+        assert out["saved_generation"] == 0
+        assert out["error"]
+
+
+# ==========================================================================
+# THE IN-APP SEAMS ON run_enrolment (2026-09-04)
+# ==========================================================================
+# Three additive, keyword-only, default-None callbacks so that the window can
+# drive a SPOKEN cadence over the same station loop the terminal drives with
+# printed lines. The thing that must not change is the terminal's behaviour,
+# so the first test here is that passing none of them is byte-identical.
+class TestTheInAppSeams:
+    def _session(self, tmp_path):
+        return a_good_session(tmp_path)
+
+    def test_passing_no_callbacks_is_exactly_what_it_always_was(
+            self, tmp_path):
+        gallery, _d, _r, session = self._session(tmp_path)
+        said = []
+        rep, run = fe.run_enrolment(session, FakeSource(), say=said.append,
+                                    gap_s=0.0)
+        assert rep.ok is True and run == 5
+        # The three station lines and the per-sample lines are all still
+        # printed, which is the whole of the CLI's progress channel.
+        assert sum(1 for s in said if s.startswith("[")) == 5
+        assert any("hold it;" in s for s in said)
+        assert sum(1 for s in said if "KEEP" in s) == rep.accepted
+
+    def test_on_station_replaces_the_three_printed_lines(self, tmp_path):
+        gallery, _d, _r, session = self._session(tmp_path)
+        said, stations = [], []
+        rep, _run = fe.run_enrolment(
+            session, FakeSource(), say=said.append, gap_s=0.0,
+            on_station=lambda st, i, n: stations.append((st.key, i, n)))
+        assert rep.ok is True
+        assert [s[0] for s in stations] == [s.key for s in fe.DEFAULT_PLAN]
+        assert stations[0][1:] == (0, 5) and stations[-1][1:] == (4, 5)
+        # ...and the printed announcements are GONE, not duplicated.
+        assert not any(s.startswith("[") for s in said)
+        assert not any("hold it;" in s for s in said)
+
+    def test_on_sample_replaces_the_per_sample_line(self, tmp_path):
+        gallery, _d, _r, session = self._session(tmp_path)
+        said, samples = [], []
+        fe.run_enrolment(
+            session, FakeSource(), say=said.append, gap_s=0.0,
+            on_sample=lambda s, st, got, want: samples.append(
+                (st.key, got, want, s.accepted)))
+        assert samples, "on_sample was never called"
+        # got is the count BEFORE this sample, so a station's accepted
+        # samples count up from zero.
+        first = [s for s in samples if s[0] == "lens" and s[3]]
+        assert [s[1] for s in first] == list(range(len(first)))
+        assert all(s[2] == 3 for s in first)
+
+    def test_should_stop_ends_the_run_and_becomes_the_reason(self, tmp_path):
+        """This is how "Jarvis, stop" reaches a loop that is otherwise busy
+        for ninety seconds."""
+        gallery, _d, _r, session = self._session(tmp_path)
+        state = {"n": 0}
+
+        def stop():
+            state["n"] += 1
+            return "he said stop" if state["n"] > 4 else ""
+
+        rep, _run = fe.run_enrolment(session, FakeSource(), say=lambda _s: None,
+                                     gap_s=0.0, should_stop=stop)
+        assert rep.ok is False
+        assert rep.detector_ok is False
+        assert rep.reason == "he said stop"
+        assert gallery.generations() == [], "a stopped run wrote something"
+
+    def test_should_stop_is_asked_before_the_frame_is_read(self, tmp_path):
+        """An abort must not cost a frame it did not need to take."""
+        gallery, _d, _r, session = self._session(tmp_path)
+        source = FakeSource()
+        fe.run_enrolment(session, source, say=lambda _s: None, gap_s=0.0,
+                         should_stop=lambda: "stop now")
+        assert source.reads == 0
+
+
+class TestTheHonestStopReason:
+    """The 2026-09-03 bug, in the library that printed it."""
+
+    def test_a_source_that_can_explain_itself_is_believed(self, tmp_path):
+        gallery, _d, _r, session = a_good_session(tmp_path)
+        source = FakeSource(stop_after=2)
+        source.reason = "/dev/video0 is already open -- python3 (pid 99) " \
+                        "is holding it, and v4l2 only allows one"
+        rep, _run = fe.run_enrolment(session, source, say=lambda _s: None,
+                                     gap_s=0.0)
+        assert rep.reason == source.reason
+        assert "sensing denied" not in rep.reason
+        assert "went away" not in rep.reason
+
+    def test_a_source_with_nothing_to_say_falls_back_to_the_old_sentence(
+            self, tmp_path):
+        """cv2's own VideoCapture has no ``reason``, so the fallback has to
+        survive -- it is only ever the LAST resort now."""
+        gallery, _d, _r, session = a_good_session(tmp_path)
+        rep, _run = fe.run_enrolment(session, FakeSource(stop_after=2),
+                                     say=lambda _s: None, gap_s=0.0)
+        assert rep.reason == fe.FRAMES_STOPPED
+
+    def test_a_source_whose_reason_raises_costs_the_sentence_not_the_run(
+            self, tmp_path):
+        gallery, _d, _r, session = a_good_session(tmp_path)
+
+        class Grumpy(FakeSource):
+            @property
+            def reason(self):
+                raise RuntimeError("no")
+
+        rep, _run = fe.run_enrolment(session, Grumpy(stop_after=2),
+                                     say=lambda _s: None, gap_s=0.0)
+        assert rep.reason == fe.FRAMES_STOPPED

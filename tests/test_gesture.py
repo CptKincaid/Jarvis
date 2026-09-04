@@ -279,6 +279,27 @@ PUT_BACK = (3.0, lambda t: seg(t, [
     (0.4, (45, 60, 440), (45, 62, 440), 1.00, 0.06, 35, 0, 0)]))
 
 
+def withdraw(end, hold=0.50, pull=0.40, release=0.35, tail=0.5, pitch=35.):
+    """Reach in, close, hold -- then PULL THE FIST BACK to ``end`` and open
+    it there, shut the whole way. The second cancel: reaching past the
+    monitor for an object and retracting it with the thing in your hand.
+    ``end`` is named for the side it withdraws toward."""
+    return (0.55 + 0.20 + hold + pull + release + tail, lambda t: seg(t, [
+        (0.55, (140, 300, 780), (10, 10, 430), 0.10, 0.06, pitch - 5, 0, 0),
+        (0.20, (10, 10, 430), (10, 10, 425), 0.06, 1.00, pitch, 0, 0),
+        (hold, (10, 10, 425), (15, 5, 425), 1.00, 1.00, pitch, 0, 0),
+        (pull, (15, 5, 425), end, 1.00, 1.00, pitch, 0, 0),
+        (release, end, end, 1.00, 0.06, pitch, 0, 0),
+        (tail, end, end, 0.06, 0.06, pitch, 0, 0)]))
+
+
+# Shoulder height, 600 mm back from the lens: the retraction the adversarial
+# pass measured throwing 68 of 68 before ``reach_exit`` existed. Image +x is
+# HIS LEFT, so these are named for the side the hand travels toward.
+WITHDRAW = {"his-left": withdraw((200., 50., 600.)),
+            "his-right": withdraw((-200., 50., 600.))}
+
+
 def fingers_down(scen):
     """The same motion with the fingers pointing at the desk (roll + 180)."""
     dur, traj = scen
@@ -758,6 +779,61 @@ class TestOtherFrameRates:
         grabs, _t = everyday_false(30.0, phases=2)
         assert grabs > 0
 
+    def test_a_refit_rebuilds_the_open_history_to_the_new_lookback(self):
+        """The open-history deque is sized ONCE, at construction. A refit
+        that assigned ``t`` alone left it at 12 frames while the thresholds
+        asked for 48, so at 30 fps the lookback silently stayed 0.4 s and
+        the resting-fist rule refused every grab -- MEASURED: 0 of 48
+        against 24 of 24 for the same thresholds set at construction, and
+        46 of 48 at 15 fps. ``retune()`` is the only door, and it rebuilds
+        the window under the lock, keeping what it held."""
+        m = CastGesture(now=Clock(), preview_fps=7.5)
+        assert m._open_hist.maxlen == CastThresholds().open_lookback_frames
+        m.update((obs(640, 360, OPEN),), EYE_PX, 0)
+        for fps in (15.0, 30.0, 7.5):
+            th = CastThresholds.for_fps(fps)
+            m.retune(th, fps=fps)
+            assert m._open_hist.maxlen == th.open_lookback_frames, fps
+            assert m.t is th
+            assert m.preview_fps == fps
+            assert m.stall_s == pytest.approx(3.0 / fps)
+        assert list(m._open_hist) == [True]        # and it kept what it had
+
+    def test_the_refit_is_what_makes_a_fast_feed_grab_at_all(self):
+        """The same thresholds, one set at construction and one arrived at
+        through ``retune``, must behave identically. MEASURED at 30 fps:
+        24/24 either way now; assigning ``t`` alone gave 0/24."""
+        th = CastThresholds.for_fps(30.0)
+
+        def refit_first():
+            m = CastGesture(now=Clock(), preview_fps=7.5)
+            m.retune(th, fps=30.0)
+            return m
+
+        built = lateral_recall(30.0, thresholds=th, phases=6)
+        assert built == (24, 24, 0)
+        grabs = throws = wrong = 0
+        for name, scen in LATERAL.items():
+            want = "left" if "left" in name else "right"
+            dur, traj = scen
+            for ph in range(6):
+                m = refit_first()
+                clk = m._now
+                rng = np.random.default_rng(ph)
+                t = ph * (1.0 / 30.0) / 6
+                i = 0
+                while t < dur:
+                    e = m.update(sample(traj, t, 0.0, rng, False), EYE_PX, i)
+                    if e is not None and e.kind == "grab":
+                        grabs += 1
+                    elif e is not None and e.kind == "throw":
+                        throws += 1
+                        wrong += e.sector != want
+                    t += 1.0 / 30.0
+                    clk.t += 1.0 / 30.0
+                    i += 1
+        assert (grabs, throws, wrong) == built
+
     def test_a_nonsense_rate_is_refused(self):
         with pytest.raises(ValueError):
             CastThresholds.for_fps(0.0)
@@ -959,6 +1035,27 @@ class TestThrowBars:
         e = self._exit(100, 200, 0.5)
         assert e.kind == "throw" and e.sector == "right"
         assert e.bearing_deg == 0.0
+
+    def test_the_edge_names_the_direction_only_when_the_hand_went_that_way(self):
+        """Grabbed 80 px from the image-right edge (his left, frac 0.125),
+        drifted 0.3 hand-units TOWARD THE CENTRE, then lost. The edge is
+        still the nearest thing to the hand, but he was not moving toward
+        it, so it may not name the direction: judged as lost in open space,
+        and 0.3 u is under that bar. MEASURED before the direction had to
+        agree with the edge: 3 of 6 of these threw to his left."""
+        m = CastGesture(now=Clock())
+        grab_at(m, W - 80, 360)
+        m.update((obs(W - 80 - 0.3 * UNIT, 360, FIST),), EYE_PX, 5)
+        e = [m.update((), 0.0, 6 + k) for k in range(3)][-1]
+        assert e.kind == "drop" and e.why == "lost"
+        assert e.sector == ""
+        # ...and the same 0.3 u drift OUTWARD is the throw it always was.
+        m = CastGesture(now=Clock())
+        grab_at(m, W - 80 - 0.3 * UNIT, 360)
+        m.update((obs(W - 80, 360, FIST),), EYE_PX, 5)
+        e = [m.update((), 0.0, 6 + k) for k in range(3)][-1]
+        assert e.kind == "throw" and e.sector == "left"
+        assert e.why == "left frame (his left)"
 
 
 # ========================================================= ordinary motion
@@ -1274,15 +1371,67 @@ class TestCancels:
 
     def test_a_fist_that_leaves_the_reach_zone_still_closed_is_a_drop(self):
         """Reaching behind the monitor for an object and retracting it, hand
-        shut the whole way. The design harness's snatch is one shape of it;
-        this is the one that DOES pass the dwell -- and still never throws."""
+        shut the whole way. The reach is re-tested on EVERY carry frame, so
+        the carry ends on the first frame below ``reach_exit`` -- it does
+        not wait for the hand to open or to leave the picture.
+
+        R 1.5 is a fist about 765 mm from the lens (MEASURED over the
+        synthetic hand at pitch 35 with his face at 700 mm: R 2.40 at
+        450 mm, 2.01 at 550, 1.62 at 700, 1.46 at 780) -- further back than
+        his own face plane, and 0.45 below the 1.95 bar. It has left."""
         m = CastGesture(now=Clock())
         grab_at(m, 640, 360)
-        # retreat: down and shrinking, still a fist, out the bottom
-        for k, (y, pd) in enumerate(((500, 240), (640, 200), (700, 170))):
-            m.update((obs(660, y, FIST, 1.5, pd),), EYE_PX, 5 + k)
-        e = [m.update((), 0.0, 8 + k) for k in range(3)][-1]
-        assert e.kind == "drop" and e.why == "cancelled (his down)"
+        e = m.update((obs(660, 500, FIST, 1.5, 240.0),), EYE_PX, 5)
+        assert e is not None
+        assert e.kind == "drop" and e.why == "withdrawn"
+        assert e.sector == ""
+        assert m.state is CastState.COOLDOWN
+
+    def test_a_reach_of_zero_during_a_carry_is_no_opinion_not_a_withdrawal(self):
+        """The arm crosses the face at exactly the moment it matters, and
+        R is 0.0 when there is no face to scale against. 0.0 means NO
+        OPINION -- the same three-valued contract eye.py uses -- so it must
+        not end the carry the way a measured retreat does."""
+        m = CastGesture(now=Clock())
+        grab_at(m, 640, 360)
+        assert m.update((obs(645, 362, FIST, 0.0),), EYE_PX, 5) is None
+        assert m.state is CastState.CARRYING
+
+    @pytest.mark.parametrize("fps", [7.5, 6.0])
+    def test_a_shoulder_height_retraction_still_closed_never_throws(self, fps):
+        """The adversarial pass's case, through the whole engine: grab at
+        425 mm, pull the fist back to shoulder height 600 mm away with a
+        full hand-unit of sideways image travel, open it there. MEASURED
+        with the bar removed (reach_exit=0.0): 68 of 68 THREW. With it:
+        0 throws, and the drop still names the side the hand went."""
+        for name, want in (("his-left", "left"), ("his-right", "right")):
+            ends = [e for _p, e in run(WITHDRAW[name], fps, phases=12)]
+            drops = [e for e in ends if e.kind == "drop"]
+            assert sum(e.kind == "grab" for e in ends) == 12, name
+            assert sum(e.kind == "throw" for e in ends) == 0, name
+            assert len(drops) == 12, name
+            assert all(e.why == "withdrawn" for e in drops), name
+            assert all(e.sector == "" for e in drops), name
+            assert all(e.toward == want for e in drops), (name, want)
+
+    def test_without_the_exit_bar_that_same_retraction_throws(self):
+        """Why the bar is there, stated as the measurement that found it.
+        The ONLY difference is ``reach_exit``."""
+        off = CastThresholds(reach_exit=0.0)
+        t = tally(run(WITHDRAW["his-left"], 7.5, thresholds=off, phases=12))
+        assert t["throw"] == 12 and t["drop"] == 0
+        assert t["sectors"] == {"left": 12}
+
+    def test_the_exit_bar_costs_no_lateral_recall(self):
+        """It may only remove throws that were wrong. MEASURED at 0, 4 and
+        8 px of landmark noise, both rates: identical either side."""
+        off = CastThresholds(reach_exit=0.0)
+        for fps in (7.5, 6.0):
+            for noise in (0.0, 4.0, 8.0):
+                with_bar = lateral_recall(fps, noise=noise)
+                without = lateral_recall(fps, thresholds=off, noise=noise)
+                assert with_bar == without, (fps, noise, with_bar, without)
+                assert with_bar[2] == 0
 
     def test_the_spoken_drop_it_cancels_a_carry(self):
         put, seen = [], []
@@ -1338,6 +1487,43 @@ class TestCancels:
             frames += 1
         assert e is not None and e.why == "timeout"
         assert frames <= 17                  # 8.0 s / 0.5 s + 1
+
+    def test_a_carry_whose_frames_stop_is_swept_up_without_one(self):
+        """The frame cap and the stall backstop both live inside
+        ``update()``, so a carry whose frames simply STOPPED -- the worker
+        halted on a standby edge, a wedged read -- had nothing to end it:
+        MEASURED, 60 s of silence left the machine CARRYING and a spoken
+        throw then cast the stale subject. ``sweep()`` is the wall-clock
+        cap applied with no frame at all, and every voice path calls it."""
+        put, seen = [], []
+        pay = CallablePayload(pick_up=lambda: ("d1", "the lab report"),
+                              put_back=put.append)
+        clk = Clock()
+        m = CastGesture(now=clk, payload=pay, on_event=seen.append)
+        grab_at(m, 640, 360)
+        assert m.held == "the lab report"
+        clk.t += 7.9                              # inside the 8.0 s cap
+        assert m.sweep() is None
+        assert m.state is CastState.CARRYING and m.held == "the lab report"
+        clk.t += 52.1                             # 60.0 s of silence
+        e = m.sweep()
+        assert e is not None and e.kind == "drop" and e.why == "timeout"
+        assert e.payload == "the lab report"
+        assert put == ["d1"] and m.held == ""
+        assert seen[-1] is e
+        assert m.state is CastState.COOLDOWN
+        assert m.sweep() is None                  # nothing left to sweep
+
+    def test_sweeping_outside_a_carry_says_nothing(self):
+        clk = Clock()
+        m = CastGesture(now=clk)
+        assert m.sweep() is None
+        m.update((obs(640, 360, OPEN),), EYE_PX, 0)
+        m.update((obs(640, 360, FIST),), EYE_PX, 1)
+        assert m.state is CastState.CLOSING
+        clk.t += 60.0
+        assert m.sweep() is None
+        assert m.state is CastState.CLOSING       # only a frame moves this
 
     def test_a_stalled_capture_thread_drops_the_carry(self):
         clk = Clock()

@@ -664,9 +664,20 @@ def choose_plan(takes: Sequence[Take], poses: Sequence[str] = (),
     quietly did something other than the five stations is a run whose numbers
     he will misread later."""
     if poses:
-        return (custom_stations(poses, pose_samples),
-                "the %d take%s you named"
-                % (len(poses), "" if len(poses) == 1 else "s"))
+        named = custom_stations(poses, pose_samples)
+        why = ("the %d take%s you named"
+               % (len(poses), "" if len(poses) == 1 else "s"))
+        if mode == "full":
+            # --plan full --pose X: the five stations AND the named take.
+            # This is the run that can pass when the named take alone
+            # cannot -- a first enrolment, or an append onto takes that
+            # carry no angle (see ``plan_shortfalls``) -- and it is what
+            # the hand-over in jarvis/enrolentry.py writes in those cases.
+            # Named takes come LAST so the report reads in the order he
+            # will do them.
+            return (DEFAULT_PLAN + named,
+                    "the full five-station script plus %s" % why)
+        return named, why
     if mode == "full":
         return DEFAULT_PLAN, "the full five-station script (--plan full)"
     gaps = missing_stations(takes)
@@ -695,6 +706,112 @@ def choose_plan(takes: Sequence[Take], poses: Sequence[str] = (),
                 "already complete, so this is a refresh rather than a gap")
     return (gaps, "the %d station%s your gallery is missing"
             % (len(gaps), "" if len(gaps) == 1 else "s"))
+
+
+def _station_options(station: Station) -> List[Tuple[int, int, float, float]]:
+    """The ways one station's samples can land, as ``(frontal, off_axis,
+    yaw_lo, yaw_hi)`` -- every sample in one band, and the angles the
+    station can reach for the spread.
+
+    A station whose window reaches ONE band -- the five defaults -- puts
+    every sample there and may spread across its whole window. A station
+    whose window reaches BOTH bands is a named take, and a named take is
+    ONE pose: "looking at my phone" is not a head sweep, so its samples
+    land together, in one band, at one angle. It is offered each band it
+    can reach and never both at once, which is what makes three takes of one
+    named pose unable to be "2 frontal AND 2 off-axis" however many are
+    captured. A window that reaches neither band (the dead zone between
+    ``FRONTAL_MAX_DEG`` and ``OFFAXIS_MIN_DEG``) counts for nothing, exactly
+    as ``judge_gallery`` would count it."""
+    lo, hi = float(station.yaw_lo), float(station.yaw_hi)
+    n = int(station.samples)
+    frontal = lo <= FRONTAL_MAX_DEG and hi >= -FRONTAL_MAX_DEG
+    offaxis = hi >= OFFAXIS_MIN_DEG or lo <= -OFFAXIS_MIN_DEG
+    if frontal and offaxis:
+        at = min(max(0.0, lo), hi)          # the nearest-to-straight angle
+        out = [(n, 0, at, at)]
+        if hi >= OFFAXIS_MIN_DEG:
+            out.append((0, n, hi, hi))
+        if lo <= -OFFAXIS_MIN_DEG:
+            out.append((0, n, lo, lo))
+        return out
+    if frontal:
+        return [(n, 0, lo, hi)]
+    if offaxis:
+        return [(0, n, lo, hi)]
+    return [(0, 0, lo, hi)]
+
+
+def plan_shortfalls(takes: Sequence[Take],
+                    plan: Sequence[Station]) -> Tuple[str, ...]:
+    """The checks in ``judge_gallery`` this plan CANNOT pass, one line each
+    -- or ``()`` when the arithmetic allows it to.
+
+    ARITHMETIC, NOT A PREDICTION. Two of the four checks are decided by
+    counting before a single frame exists: ``samples`` is the size of the
+    pool the run would save, and ``pose_spread`` is how many angles land in
+    each band and how far apart they are. Both are knowable from the plan
+    and the takes it keeps, so a run that fails them is known to fail before
+    he sits down -- and the minute in front of the lens is his. ``variation``
+    and ``cohesion`` are about the vectors and are not guessed at here.
+
+    ``takes`` are the takes this run KEEPS: the stored ones under --append,
+    nothing at all otherwise (a plain run replaces the pool). A kept take
+    with no recorded angle counts toward ``samples`` and toward nothing
+    else, which is the rule ``judge_gallery`` applies to it -- and it is the
+    whole reason this exists: his live generation 1 is 13 embeddings that
+    carry no angle, so appending three takes of one named pose onto it puts
+    16 in the pool, clears the floor, and can never satisfy the spread. The
+    script printed "--append is almost certainly what you want" over exactly
+    that run (F16, reproduced 2026-09-03), and the hand-over for a FIRST
+    enrolment with a named pose announced one station of three takes as a
+    valid run against a floor of eight (F34).
+
+    Best case is taken throughout: each station is allowed to land wherever
+    its window lets it, the way ``_station_options`` spells out, and the
+    plan is short only if NO way of landing passes. The search is a small
+    dynamic programme over (frontal so far, off-axis so far, lowest angle,
+    highest angle), capped at the wanted counts, so a plan of any realistic
+    length costs microseconds."""
+    stations = list(plan)
+    wanted = sum(int(st.samples) for st in stations)
+    kept = list(takes)
+    pool = len(kept) + wanted
+    out: List[str] = []
+    if pool < MIN_SAMPLES:
+        out.append("samples: %d in the pool this run would save (%d kept + "
+                   "%d wanted) against a floor of %d"
+                   % (pool, len(kept), wanted, MIN_SAMPLES))
+    cov = coverage(kept)
+    yaws = [float(t.yaw_deg) for t in kept if t.yaw_deg is not None]
+    have_f = min(cov["frontal"], MIN_FRONTAL)
+    have_o = min(cov["positive"] + cov["negative"], MIN_OFFAXIS)
+    lo0 = min(yaws) if yaws else None
+    hi0 = max(yaws) if yaws else None
+    states = {(have_f, have_o, lo0, hi0)}
+    for st in stations:
+        nxt = set()
+        for f, o, lo, hi in states:
+            for df, do, slo, shi in _station_options(st):
+                nxt.add((min(f + df, MIN_FRONTAL), min(o + do, MIN_OFFAXIS),
+                         slo if lo is None else min(lo, slo),
+                         shi if hi is None else max(hi, shi)))
+        states = nxt
+
+    def spread_of(s) -> float:
+        return 0.0 if s[2] is None else float(s[3] - s[2])
+
+    if not any(s[0] >= MIN_FRONTAL and s[1] >= MIN_OFFAXIS
+               and spread_of(s) >= MIN_YAW_SPREAD_DEG for s in states):
+        best = max(states, key=lambda s: (s[0] + s[1], spread_of(s)))
+        blank = int(cov["unrecorded"])
+        out.append("pose_spread: at best %d frontal (want %d) and %d off-axis "
+                   "(want %d) over %.0f deg of spread (want %.0f)%s"
+                   % (best[0], MIN_FRONTAL, best[1], MIN_OFFAXIS,
+                      spread_of(best), MIN_YAW_SPREAD_DEG,
+                      (" -- %d kept take(s) carry no angle and count for "
+                       "nothing here" % blank) if blank else ""))
+    return tuple(out)
 
 
 def member_name(index: int, stored: int, kept: Sequence[Sample]) -> str:
@@ -1249,6 +1366,30 @@ class EnrolmentSession:
 
 
 # ------------------------------------------------------------- the run loop
+def _source_reason(source) -> str:
+    """What the frame source says about its own silence, or "".
+
+    Read through a try because ``source`` is duck-typed -- cv2's own
+    VideoCapture has no ``reason`` at all, and a property that raises must
+    cost the better sentence, never the run.
+    """
+    try:
+        return str(getattr(source, "reason", "") or "").strip()
+    except Exception:            # noqa: BLE001 - a duck-typed source
+        log.debug("faceenrol: the source could not say why", exc_info=True)
+        return ""
+
+
+# What ``run_enrolment`` says when the frames stop and the source itself
+# offers no better account. It is deliberately the LAST resort: it guesses at
+# two causes and on 2026-09-03 both guesses were wrong at once -- sensing said
+# camera=True and the device was present, merely HELD by the running Jarvis --
+# which sent him to check the two things that were already fine. Any source
+# that can say something true says it through ``source.reason``.
+FRAMES_STOPPED = ("the frame source stopped delivering -- sensing denied the "
+                  "camera, or the device went away")
+
+
 def run_enrolment(session: EnrolmentSession, source, *,
                   plan: Sequence[Station] = DEFAULT_PLAN,
                   say: Callable[[str], None] = print,
@@ -1257,7 +1398,10 @@ def run_enrolment(session: EnrolmentSession, source, *,
                   gap_s: float = 0.35,
                   identity_min: float = SFACE_COSINE_SAME,
                   now: Callable[[], float] = time.monotonic,
-                  sleep: Callable[[float], None] = time.sleep) -> Tuple:
+                  sleep: Callable[[float], None] = time.sleep,
+                  on_station: Optional[Callable] = None,
+                  on_sample: Optional[Callable] = None,
+                  should_stop: Optional[Callable[[], str]] = None) -> Tuple:
     """Walk the plan, and return ``(report, stations_run)``.
 
     ``source`` is cv2.VideoCapture's own ``read() -> (ok, frame)``, which is
@@ -1272,17 +1416,42 @@ def run_enrolment(session: EnrolmentSession, source, *,
     near-duplicates and a gallery that fails the ``variation`` check -- and
     a gallery that fails a check it could have avoided wastes his time
     rather than teaching him anything.
+
+    THE THREE CALLBACKS ARE THE IN-APP SEAM, and they are additive and
+    default-None so that ``scripts/face_enrol.py`` -- which passes none of
+    them -- behaves exactly as it did. They exist because the same station
+    loop has to drive two very different progress channels: a terminal he
+    reads, and a spoken cadence he HEARS with his head turned away from the
+    screen (jarvis/enrolrun.py). Routing the spoken version through ``say``
+    and matching on the strings was the alternative and it is brittle:
+    telling "[lens] Look straight..." from ``Sample.line()`` from "    only 2
+    of 3 here" by prefix would break silently the first time one of those
+    format strings was edited.
+
+    * ``on_station(station, index, total)`` replaces the three ``say`` lines
+      that announce a station. ``index`` is 0-based; ``total`` is len(plan).
+    * ``on_sample(sample, station, got, wanted)`` replaces ``say(sample.line())``.
+      ``got`` is the count BEFORE this sample is counted, so a caller that
+      wants "that is three" adds one for an accepted sample itself.
+    * ``should_stop()`` is asked once per frame, at the top of the inner
+      loop, and a non-empty return becomes the report's stop ``reason``.
+      That is how the window's "Jarvis, stop" reaches a loop that is
+      otherwise busy for a minute and a half.
     """
     stations_run = 0
     t_start = now()
     stopped = ""
-    for station in plan:
+    total = len(plan)
+    for index, station in enumerate(plan):
         if stopped:
             break
-        say("")
-        say("[%s] %s" % (station.key, station.prompt))
-        say("    hold it; %d samples wanted in this position."
-            % station.samples)
+        if on_station is None:
+            say("")
+            say("[%s] %s" % (station.key, station.prompt))
+            say("    hold it; %d samples wanted in this position."
+                % station.samples)
+        else:
+            on_station(station, index, total)
         if wait is not None:
             wait("    press Enter when you are in position: ")
         got = 0
@@ -1290,10 +1459,18 @@ def run_enrolment(session: EnrolmentSession, source, *,
         for _ in range(int(frames_per_station)):
             if got >= station.samples:
                 break
+            if should_stop is not None:
+                why = should_stop()
+                if why:
+                    stopped = str(why)
+                    break
             ok, frame = source.read()
             if not ok or frame is None:
-                stopped = ("the frame source stopped delivering -- sensing "
-                           "denied the camera, or the device went away")
+                # THE SOURCE GETS THE FIRST WORD. It is the only party that
+                # knows whether it was denied, unplugged or merely busy, and
+                # the hard-coded sentence below has already been wrong about
+                # all three at once. See camera.FeedSource.reason.
+                stopped = _source_reason(source) or FRAMES_STOPPED
                 break
             sample = session.offer(frame, station.key,
                                    note=station.note or station.key)
@@ -1309,7 +1486,10 @@ def run_enrolment(session: EnrolmentSession, source, *,
                 # a numbers-only workflow has to say.
                 say("    (yaw %+.1f is outside this station's %+.0f..%+.0f)"
                     % (sample.yaw_deg, station.yaw_lo, station.yaw_hi))
-            say(sample.line())
+            if on_sample is None:
+                say(sample.line())
+            else:
+                on_sample(sample, station, got, station.samples)
             if not sample.accepted:
                 continue
             got += 1
@@ -1332,6 +1512,95 @@ def run_enrolment(session: EnrolmentSession, source, *,
 
 
 # ------------------------------------------------------------ the disk side
+def build_models(cfg):
+    """``(detector, recogniser, reason)`` -- never raises, never falls back.
+
+    The detector is floored LOW rather than at his ``camera.min_conf``, for
+    the same reason scripts/vision_selfcheck.py does it: a face scoring 0.45
+    against a 0.6 bar must be reported WITH ITS SCORE, not vanish and read as
+    "no face seen". The bar is then applied by the quality gate, which says
+    which bar it was.
+
+    THIS LIVES HERE SO BOTH ENROLMENT PATHS LOAD THE SAME PAIR. It was
+    written out inside ``scripts/face_enrol.py``, which was fine while that
+    script was the only caller; the in-app run (jarvis/enrolrun.py) is a
+    second one, and two copies of "which models does enrolment use" is
+    exactly how a box ends up enrolling ArcFace vectors through an SFace
+    recogniser. The script delegates here and its behaviour is unchanged.
+
+    ``camera`` and ``facedetect`` are imported inside the function to keep
+    this module importable with neither of them wired.
+    """
+    from jarvis import camera as cam          # noqa: PLC0415 - lazy by design
+    from jarvis import facedetect             # noqa: PLC0415
+
+    detector, why = cam.detector_from_config(
+        cfg, score_threshold=facedetect.PROBE_THRESHOLD)
+    if detector is None:
+        return None, None, why
+    try:
+        rec = facedetect.load_recogniser(
+            min_conf=float(cfg.get("camera.min_conf", 0.6)),
+            model_dir=str(cfg.get("camera.model_dir", "") or "") or None,
+            backend=cam.face_backend_from_config(cfg),
+            input_size=(int(cfg.get("camera.detect_width", 320)),
+                        int(cfg.get("camera.detect_height", 180))))
+    except Exception as exc:  # noqa: BLE001 - absence is not a crash
+        return detector, None, str(exc)
+    return detector, rec, ""
+
+
+def save_enrolment(gallery, report, *, reason: str,
+                   allow_shrink: bool = False, force: bool = False,
+                   superseded: Sequence = ()) -> dict:
+    """Write this run's pool, but ONLY if the judge passed it. Numbers back.
+
+    THE VERDICT GUARD LIVES HERE RATHER THAN IN THE CALLER, and that is the
+    whole point of the function. It used to be a single ``if rep.ok or
+    args.force:`` inside ``scripts/face_enrol.py``, which meant the rule
+    "an unusable gallery is not saved" was a property of ONE script rather
+    than of enrolment -- and the in-app run (jarvis/enrolrun.py) would have
+    had to restate it correctly to be safe. A rule that has to be restated
+    to hold is a rule that will eventually be restated wrong.
+
+    IT IS DELIBERATELY NOT INSIDE ``FaceGallery.save()``. ``restore()`` and
+    ``purge_label()`` legitimately write pools that ``judge_gallery`` never
+    ran on, so a guard down there would refuse the two operations whose
+    entire job is to put back a pool that already exists.
+
+    ``force`` is the CLI's ``--force`` and nothing else reaches it: the
+    in-app path has no way to pass it, which is what makes "the window
+    cannot save an unusable gallery" a structural fact rather than a
+    promise.
+
+    ``superseded`` is destroyed only AFTER the new generation is safely on
+    disk -- ``--reset`` destroys nothing when the run fails a check.
+    """
+    out = {"saved_generation": 0, "gallery_total": 0, "removed": 0,
+           "refused": "", "error": ""}
+    if not (report.ok or force):
+        out["refused"] = ("the judge refused this pool" if not report.reason
+                          else report.reason)
+        return out
+    try:
+        gen = gallery.save(reason=str(reason),
+                           allow_shrink=bool(allow_shrink))
+    except ValueError as exc:
+        # A refusal from the store itself (a shrink, a bad root). The report
+        # keeps the FIRST reason it had: the judge's verdict explains more
+        # than the store's complaint about the consequence of it.
+        report.reason = report.reason or str(exc)
+        out["error"] = str(exc)
+        return out
+    report.saved_generation = int(gen)
+    report.gallery_total = int(gallery.total())
+    out["saved_generation"] = int(gen)
+    out["gallery_total"] = int(report.gallery_total)
+    if superseded:
+        out["removed"] = int(gallery.drop_generations(superseded))
+    return out
+
+
 def harden(root: Path) -> dict:
     """0700 on the directory, 0600 on every file under it.
 
