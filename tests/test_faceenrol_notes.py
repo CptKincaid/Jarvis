@@ -2021,6 +2021,53 @@ def test_a_named_pose_over_a_pose_less_gallery_is_handed_the_full_script_too(
     assert "five stations come with it" in out["reply"]
 
 
+# The room a hand-over must leave under the TTS cut. jarvis/tts.py clips at
+# MAX_SPEAK_LENGTH on the last full stop, silently -- the card shows it all,
+# the voice stops early -- and 50 is space for a bigger stored count or a
+# longer pose name without the F16 sentence falling off the end again.
+SPEAK_MARGIN = 50
+
+
+@pytest.mark.parametrize("clipped", [True, False])
+def test_the_f16_reply_is_spoken_whole_and_the_command_is_only_shown(
+        tmp_path, clipped):
+    """The spoken half of F16 has to survive the TTS.
+
+    Measured 2026-09-04 on this branch: the F16 reply -- 13 stored takes
+    with no angle, one named pose, clipboard verified -- was 585 characters,
+    and ``TTS._clean_for_speech`` cuts at ``MAX_SPEAK_LENGTH`` (500) on the
+    last full stop before it, which left 405. What went was the sentence
+    saying WHY the run grew and the one saying WHERE the command is. The
+    command itself was never the problem: it rides in ``display_only``
+    (jarvis/commander.py CommandResult.display_only) and is not spoken.
+    Both halves are pinned here: the reply fits under the cut with margin
+    and comes back from the cleaner untouched, and the command is in
+    ``display_only`` and nowhere in ``reply``."""
+    from jarvis.tts import TTS
+
+    g = FaceGallery(root=tmp_path / "g")
+    for vec in same_face(base_vec(1), 13, seed=2):
+        g.add("hunter", vec)              # no note, no yaw -- his gen 1
+    g.save(reason="one")
+    out = ee.enrol_answer(FaceGallery(root=g.root), "hunter", owner="hunter",
+                          poses=["looking at my phone"],
+                          clipboard=lambda _t: clipped)
+    reply = out["reply"]
+    assert len(reply) < TTS.MAX_SPEAK_LENGTH - SPEAK_MARGIN, len(reply)
+    # No worker, no engine: the bare instance exercises the cleaner alone,
+    # the way tests/test_tts_speak_queue.py does. Unchanged means uncut.
+    assert TTS.__new__(TTS)._clean_for_speech(reply) == reply
+    # The two sentences the cut used to eat are still there to be heard.
+    assert "five stations come with it" in reply
+    assert reply.endswith("take it from me." if clipped
+                          else "copy it from there.")
+    assert reply.count("pose record") == 1, "said once, not twice"
+    # The command is shown, never spoken.
+    assert out["display_only"] == out["command"]
+    assert "--append --plan full" in out["display_only"]
+    assert "face_enrol" not in reply and "--plan" not in reply
+
+
 def test_a_named_pose_on_top_of_real_coverage_stays_one_station(tmp_path):
     """And the ordinary case is not made heavier: with both sides recorded,
     "one more way to be recognised" is still one station."""
