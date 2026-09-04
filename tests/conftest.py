@@ -75,6 +75,13 @@ os.environ["JARVIS_VOICEPRINT"] = str(_TEST_LOG_DIR / "voiceprint.npz")
 # embedding is the same kind of irreplaceable measurement of one person.
 # Forced, not setdefault, for the same reason as the line above.
 os.environ["JARVIS_FACE_GALLERY"] = str(_TEST_LOG_DIR / "face_gallery")
+# The MULTI-SPEAKER voice gallery (jarvis/voicegallery.py, PATHS.VOICE_GALLERY).
+# Forced BEFORE the store can be written to rather than after something has
+# destroyed it -- which is the order the voiceprint did not get on 2026-09-02.
+# It holds ECAPA embeddings of him AND, once anyone else enrols, of them: a
+# test that reached it could destroy an enrolment belonging to somebody who is
+# not even in the room to be asked. Forced, not setdefault, like the two above.
+os.environ["JARVIS_VOICE_GALLERY"] = str(_TEST_LOG_DIR / "voice_gallery")
 # The downloaded YuNet/SFace weights (jarvis/facemodels.py). Forced at a
 # throwaway directory so the suite is identical on a box that has them and a
 # box that does not: a test that quietly passed only because 38 MB of SFace
@@ -173,6 +180,16 @@ def _firewall_live_log_dir():
         "PATHS.FACE_GALLERY still targets the user's enrolled face"
     assert real_face not in config.PATHS.FACE_GALLERY.parents, \
         "PATHS.FACE_GALLERY is inside the user's real face gallery"
+    # The VOICE GALLERY, asserted here for the reason the two above are: the
+    # env var is one belt, and this store will hold enrolments belonging to
+    # people who are not the user -- a guest cannot come back and re-record
+    # eight takes because a test overwrote them. Session-scoped, so a broken
+    # redirect fails before the first test writes anything.
+    real_voice_gallery = Path.home() / ".aiws_trainer" / "voice_gallery"
+    assert config.PATHS.VOICE_GALLERY != real_voice_gallery, \
+        "PATHS.VOICE_GALLERY still targets the real voice gallery"
+    assert real_voice_gallery not in config.PATHS.VOICE_GALLERY.parents, \
+        "PATHS.VOICE_GALLERY is inside the real voice gallery"
     try:
         from jarvis import jarvis_agent
         assert jarvis_agent.LOG_DIR != live, "jarvis_agent LOG_DIR still live"
