@@ -807,13 +807,20 @@ def test_the_voice_entry_point_opens_no_camera_and_hands_over_the_command(
     """IN-APP ENTRY, SAID PLAINLY: this does not capture inside the window.
     The guided run needs the lens and a keyboard, and three other branches
     are in jarvis/ui right now, so what Jarvis does is hand over the exact
-    command and put it on the clipboard."""
+    command.
+
+    THE CLIPBOARD IS THE CONVENIENCE, NOT THE DELIVERY -- changed 2026-09-03
+    after Jarvis claimed a clipboard write that had not survived to his
+    paste. The command now always rides in ``display_only``, which the
+    console shows and the TTS never reads. See
+    tests/test_clipboard_claim.py."""
     gallery = FaceGallery(root=tmp_path / "g")
     clipped = []
     out = ee.enrol_answer(gallery, "hunter", owner="hunter",
                           clipboard=lambda text: clipped.append(text) or True)
     assert "face_enrol.py" in out["command"]
     assert clipped == [out["command"]]
+    assert out["display_only"] == out["command"]
     assert out["reply"]
     assert "clipboard" in out["reply"].lower()
 
@@ -853,10 +860,16 @@ def test_the_command_the_entry_point_hands_over_actually_parses(tmp_path):
 
 def test_the_entry_point_falls_back_to_the_text_when_there_is_no_clipboard(
         tmp_path):
+    """It used to paste the command INTO the spoken reply on failure, which
+    made a failed clipboard the only way to see the command at all. Now the
+    command is in ``display_only`` on BOTH branches -- shown every time,
+    spoken on neither, because speaking a file path is a bad minute of
+    text-to-speech."""
     gallery = FaceGallery(root=tmp_path / "g")
     out = ee.enrol_answer(gallery, "hunter", owner="hunter",
                           clipboard=lambda text: False)
-    assert out["command"] in out["reply"]
+    assert out["command"] in out["display_only"]
+    assert out["command"] not in out["reply"]
 
 
 def test_the_gallery_answer_reads_the_gallery_and_opens_no_camera(tmp_path):

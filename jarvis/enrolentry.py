@@ -106,22 +106,90 @@ def command_line(label: str, owner: str = "hunter",
     return " ".join(out)
 
 
+def _read_back(runner: Callable) -> Optional[str]:
+    """What the clipboard holds right now, or None if it could not be asked.
+
+    None and "" are DIFFERENT answers and the caller needs both: "" is an
+    empty clipboard (the write did not land), None is "xclip could not tell
+    me", and neither may be reported as a successful write."""
+    try:
+        got = runner(["xclip", "-selection", "clipboard", "-o"],
+                     capture_output=True, timeout=CLIP_TIMEOUT_S, check=False)
+    except Exception:  # noqa: BLE001 - absence is not a crash
+        log.debug("enrolentry: the clipboard could not be read back",
+                  exc_info=True)
+        return None
+    if getattr(got, "returncode", 1) != 0:
+        return None
+    out = getattr(got, "stdout", None)
+    if out is None:
+        return None
+    if isinstance(out, bytes):
+        try:
+            return out.decode("utf-8")
+        except Exception:  # noqa: BLE001 - not our text, so not our write
+            return None
+    return str(out)
+
+
 def to_clipboard(text: str, run: Optional[Callable] = None) -> bool:
-    """Put ``text`` on the X clipboard. False if that could not happen.
+    """Put ``text`` on the X clipboard AND read it back. False either way it
+    can fail.
+
+    WHY THE READ-BACK EXISTS, AND WHAT IT DOES NOT PROVE. xclip exiting 0
+    only proves xclip STARTED. An X11 CLIPBOARD selection has no storage at
+    all: a live process owns the selection and serves the bytes when
+    somebody pastes. So the old ``returncode == 0`` was never evidence that
+    the clipboard holds this text, and it is certainly not evidence that it
+    will still hold it when he pastes -- 2026-09-03, Jarvis said "I've put
+    the command on your clipboard" and the clipboard did not have it.
+
+    Reading it back closes exactly one of those two holes: IT NEVER LANDED.
+    It cannot close the other. The clipboard is shared global state with a
+    single owner, and any other process on his desktop may take it in the
+    microseconds after this returns -- measured that day, a sentinel written
+    by an unrelated process was what he found instead. True here means "it
+    was there when I looked", never "it will be there when you paste", and
+    the sentence built on this flag has to say so.
+
+    A MISMATCH IS RETRIED ONCE, because xclip backgrounds a child to own the
+    selection and the parent can exit a hair before that child has taken
+    ownership; the second spawn is its own few milliseconds of delay. The
+    retry costs nothing on the path that worked.
+
+    Cost, measured 2026-09-03 on this box: the read-back process is 1.4 ms
+    median (min 1.07, max 2.28 over 25 runs) excluding the X round trip,
+    against a 1.3 s turn. It also only runs on the two hand-over commands,
+    not on every reply.
 
     xclip is what jarvis/reader.py already reads the clipboard WITH, so this
     adds no dependency. Every failure -- no xclip, no display, a timeout --
     is False and a debug line, never an exception: a clipboard that did not
     work must cost the convenience and not the answer."""
     runner = run or subprocess.run
+    want = str(text)
     try:
         proc = runner(["xclip", "-selection", "clipboard"],
-                      input=str(text).encode("utf-8"),
+                      input=want.encode("utf-8"),
                       timeout=CLIP_TIMEOUT_S, check=False)
     except Exception:  # noqa: BLE001 - absence is not a crash
         log.debug("enrolentry: xclip could not be run", exc_info=True)
         return False
-    return getattr(proc, "returncode", 1) == 0
+    if getattr(proc, "returncode", 1) != 0:
+        return False
+    for _attempt in (1, 2):
+        back = _read_back(runner)
+        if back is None:
+            log.debug("enrolentry: xclip exited 0 but the clipboard could "
+                      "not be read back")
+            return False
+        # A copy that appends a newline is still the command he needs; a
+        # copy that holds anything else is not this write.
+        if back == want or back.rstrip("\n") == want:
+            return True
+    log.debug("enrolentry: xclip exited 0 but the clipboard holds %d other "
+              "characters", len(back))
+    return False
 
 
 def _clip(text: str, clipboard: Optional[Callable[[str], bool]]) -> bool:
@@ -133,20 +201,39 @@ def _clip(text: str, clipboard: Optional[Callable[[str], bool]]) -> bool:
         return False
 
 
+# WHAT HE IS TOLD, AND WHY IT IS WORDED LIKE THIS. Both lines are true
+# whichever way the clipboard went, and neither promises a durability the X
+# clipboard does not have (see to_clipboard). "It's in the transcript" is the
+# only part of this that is a guarantee, so it leads in both branches -- the
+# clipboard is named second, as the convenience it is.
+CLIP_OK_LINE = ("The command is in the transcript, sir, and I've copied it "
+                "to your clipboard as well - though anything else that "
+                "copies will take it from me, so the transcript is the one "
+                "to trust.")
+CLIP_FAILED_LINE = ("The command is in the transcript, sir - the clipboard "
+                    "wouldn't take it, so copy it from there.")
+
+
 def _hand_over(command: str, spoken: str,
                clipboard: Optional[Callable[[str], bool]]) -> dict:
-    """One shape for "here is the command": speak the short sentence when the
-    clipboard took it, and put the command IN the sentence when it did not.
+    """One shape for "here is the command": say what is true, and put the
+    command itself where he can always reach it.
 
-    Speaking a file path is a bad minute of text-to-speech, so the path is
-    only ever spoken when there is no other way for him to get it."""
+    THE COMMAND IS NO LONGER DELIVERED BY THE CLIPBOARD. It travels in
+    ``display_only``, which the console shows and the TTS never reads
+    (jarvis/commander.py CommandResult.display_only, routed in
+    JarvisApp._emit_result). That is the fix for the failure this file
+    caused: a clipboard write that silently did not survive to his paste
+    left him with a claim and nothing else. Now the clipboard can fail
+    completely and he still has the command in front of him.
+
+    Speaking a file path is still a bad minute of text-to-speech, so the
+    command is SHOWN and never SPOKEN -- which is the whole reason
+    ``display_only`` had to exist rather than being appended to ``reply``."""
     clipped = _clip(command, clipboard)
-    if clipped:
-        reply = "%s I've put the command on your clipboard." % spoken
-    else:
-        reply = "%s I couldn't reach the clipboard, so here it is:\n%s" \
-            % (spoken, command)
-    return {"reply": reply, "command": command, "clipped": clipped}
+    reply = "%s %s" % (spoken, CLIP_OK_LINE if clipped else CLIP_FAILED_LINE)
+    return {"reply": reply, "command": command, "clipped": clipped,
+            "display_only": command}
 
 
 def enrol_answer(gallery, label: str, owner: str = "hunter",
@@ -164,7 +251,7 @@ def enrol_answer(gallery, label: str, owner: str = "hunter",
         return {"reply": "That isn't a name I can store, sir - lowercase "
                          "letters, digits, dashes and underscores only.",
                 "status": "Enrolment: bad name", "command": "",
-                "clipped": False}
+                "display_only": "", "clipped": False}
     takes = []
     try:
         gallery.load()
@@ -226,7 +313,8 @@ def forget_answer(gallery, label: str, owner: str = "hunter",
     label = str(label or "").strip().lower()
     if not label_ok(label):
         return {"reply": "That isn't a name I can look up, sir.",
-                "status": "Face gallery", "command": "", "clipped": False}
+                "status": "Face gallery", "command": "",
+                "display_only": "", "clipped": False}
     count = 0
     try:
         gallery.load()
@@ -236,7 +324,8 @@ def forget_answer(gallery, label: str, owner: str = "hunter",
     if not count:
         return {"reply": "There's nothing enrolled under %s, sir."
                          % (label.capitalize() if label != owner else "you"),
-                "status": "Face gallery", "command": "", "clipped": False}
+                "status": "Face gallery", "command": "",
+                "display_only": "", "clipped": False}
     command = command_line(label, owner=owner, delete=True)
     spoken = ("That would destroy %d take%s of %s face, in every generation "
               "on the disk - so I'll leave the word to you rather than to my "

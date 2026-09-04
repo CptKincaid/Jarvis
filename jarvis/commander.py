@@ -709,6 +709,22 @@ class CommandResult:
     # reply text is how an aside lands on the wrong day. Display code must
     # ignore it; it is never spoken or shown.
     action: Any = None
+    # SHOWN, NEVER SPOKEN -- the half of an answer that is unbearable read
+    # aloud. `reply` is one field doing two jobs (text to show AND text to
+    # speak), so until this existed there was no way to say "he needs to
+    # SEE this" without also making the TTS read it out.
+    #
+    # It exists because of the clipboard (jarvis/enrolentry.py): Jarvis said
+    # "I've put the command on your clipboard" and the clipboard did not
+    # have it, and there was nowhere else for the command to go -- speaking
+    # a shell command with a file path in it is a bad minute of
+    # text-to-speech. Now the command rides here, the console always shows
+    # it, and the clipboard is free to fail.
+    #
+    # JarvisApp._emit_result appends it to the DISPLAYED text and leaves the
+    # SPOKEN text as exactly `reply`. Default None, so every handler that
+    # does not set it behaves precisely as before.
+    display_only: Optional[str] = None
 
 
 @dataclass
@@ -5506,9 +5522,24 @@ def _h_clip_history(c, t, m):                              # 3308-3321
 def _h_paste_item(c, t, m):                                # 3323-3331
     idx_str = m.group(1)
     idx = 1 if idx_str in ("before last", "previous") else int(idx_str) - 1
-    result = c._svc("context").paste_from_history(idx)
+    ctx = c._svc("context")
+    result = ctx.paste_from_history(idx)
     if result:
         return CommandResult(handled=True, reply=f"Pasted: {result}")
+    # paste_from_history now VERIFIES the clipboard before it claims a paste
+    # (jarvis/jarvis_agent.py), so None has two meanings and they are
+    # different sentences: there was no such item, or there was and it did
+    # not go through. "Nothing to paste" over a failed paste is the same
+    # false report the enrolment hand-over was making.
+    try:
+        have = len(ctx.get_clipboard_history(idx + 1))
+    except Exception:                                   # noqa: BLE001
+        have = 0
+    if have > idx:
+        return CommandResult(handled=True, speak=True,
+                             reply="I couldn't get that onto the clipboard, "
+                                   "sir, so nothing was pasted.",
+                             status="Paste failed")
     return CommandResult(handled=True, status="Nothing to paste")
 
 
@@ -6808,7 +6839,9 @@ def _h_face_enrol(c, t, m):
         return _face_config_result()
     out = ee.enrol_answer(gallery, who, owner=owner,
                           poses=(pose,) if pose else ())
+    # The command is SHOWN, not spoken -- see CommandResult.display_only.
     return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         display_only=out.get("display_only") or None,
                          status=out["status"])
 
 
@@ -6827,6 +6860,7 @@ def _h_face_forget(c, t, m):
         return _face_config_result()
     out = ee.forget_answer(gallery, who, owner=owner)
     return CommandResult(handled=True, speak=True, reply=out["reply"],
+                         display_only=out.get("display_only") or None,
                          status=out["status"])
 
 

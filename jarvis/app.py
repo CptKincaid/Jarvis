@@ -5019,9 +5019,18 @@ class JarvisApp:
         """Publish a CommandResult's reply/status. Shared by _dispatch and the
         uncertain-prompt answer, so a YES there runs and SPEAKS exactly like a
         command that had been understood the first time."""
-        if result.reply:
-            bus.publish(JarvisReply(text=result.reply, speak=result.speak))
-            if result.speak:
+        # `display_only` is SHOWN and never SPOKEN (commander.CommandResult):
+        # the spoken text below stays exactly `result.reply`, and only the
+        # published/displayed text carries the extra line. The clipboard
+        # hand-over depends on this -- the command must reach the transcript
+        # every time, whether or not the clipboard took it.
+        extra = getattr(result, "display_only", None)
+        if result.reply or extra:
+            shown = result.reply or ""
+            if extra:
+                shown = "%s\n%s" % (shown, extra) if shown else str(extra)
+            bus.publish(JarvisReply(text=shown, speak=result.speak))
+            if result.speak and result.reply:
                 if getattr(result, "ack", False):
                     # "Looking that up, sir." is speech, not the answer: the
                     # turn ledger records it as a filler and keeps waiting.
