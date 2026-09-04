@@ -603,6 +603,12 @@ class JarvisApp:
                      if self.assistant is not None
                      else arrival_mod.DEFAULT_DOOR_ROOM))
         self._warn_door_room_names_nothing()
+        # A radar whose gates have gone back to 0 sees 0.75 m and reads the
+        # room as EMPTY -- measured twice on real hardware, 2026-09-03. The
+        # check is a daemon thread that waits before its first read (the
+        # readback lies for a while after a device powers up) and is never
+        # joined, so the boot does not pay for it.
+        self._room_gate_check = self._start_room_sensor_gate_check()
 
         # The unread count runs on a worker when a mailbox is configured,
         # so the cue is not paid for on the Tk pump. Held only so a test
@@ -1599,6 +1605,24 @@ class JarvisApp:
         if presence is not None and getattr(presence, "configured", False):
             return
         self._greet_return("desk")
+
+    def _start_room_sensor_gate_check(self):
+        """Check, off the boot thread, that each radar still covers its room.
+
+        See jarvis/sensorcheck.py: it is READ-ONLY (it reports the command
+        that fixes a mismatch rather than rewriting his device), it asks
+        the sensing policy before any socket, and it is NEVER handed that
+        policy -- ``SensingPolicy.attach`` replaces by name, and a second
+        sensor attaching as "radar" would take the curfew off the real one.
+        A failure here costs the check and nothing else.
+        """
+        try:
+            from jarvis import sensorcheck
+            return sensorcheck.start(self.assistant,
+                                     policy=getattr(self, "sensing", None))
+        except Exception:  # noqa: BLE001 - a check may not cost the boot
+            log.debug("sensor check: could not be started", exc_info=True)
+            return None
 
     def _warn_door_room_names_nothing(self) -> None:
         """Say so ONCE at startup when ``presence.door_room`` matches no

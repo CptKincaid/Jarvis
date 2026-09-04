@@ -466,22 +466,79 @@ class RoomSensor:
             log.info("room sensor %s: %s is back", self.url, entity)
         return cm / 100.0
 
+    def read_number(self, entity: str) -> Optional[float]:
+        """One ESPHome ``number`` entity's value, or None -- READ ONLY.
+
+        ESPHome serves the tunable numbers ("Max move gate", "Absence
+        delay") at ``/number/<name>``, the same name-is-the-path rule as
+        everything else here. This is a GET and nothing else: setting one
+        is ``POST /number/<name>/set?value=``, which lives in
+        ``scripts/room_sensor.py`` and is deliberately not reachable from
+        the package -- the device's tuning is his, and the check that reads
+        these (``jarvis/sensorcheck.py``) reports rather than rewrites.
+
+        It asks the same ``blocked``/``paused`` gate as ``read()`` BEFORE
+        the socket, so offline mode covers it for free, and it counts its
+        failures on the DISTANCE leg's per-entity counters rather than the
+        presence breaker: a firmware without one of these numbers must not
+        take presence down with it.
+        """
+        return self._read_entity("number", entity, "the tuning cannot be "
+                                 "checked, presence is unaffected")
+
+    def _read_entity(self, domain: str, entity: str,
+                     consequence: str) -> Optional[float]:
+        """One numeric entity of one domain, or None. The body of
+        ``read_distance`` and ``read_number``, which differ only in the
+        domain, the unit and what a failure costs."""
+        key = "%s/%s" % (domain, entity)
+        if not self.configured or self.paused:
+            return None
+        if self._dist_skip_until.get(key, 0.0) > self._now():
+            return None
+        url = urllib.parse.urlunsplit(
+            urllib.parse.urlsplit(self.url)._replace(
+                path=entity_path(domain, entity), query="", fragment=""))
+        try:
+            body = self._get(url, self.timeout_s)
+        except Exception as exc:  # noqa: BLE001 - every transport failure is "unknown"
+            self.reads += 1
+            self._entity_failed(key, entity, exc, consequence)
+            return None
+        self.reads += 1
+        value = parse_cm(body)
+        if value is None:
+            self._entity_failed(key, entity, repr(body)[:120], consequence)
+            return None
+        self._dist_fails.pop(key, None)
+        self._dist_skip_until.pop(key, None)
+        if self._dist_down.pop(key, False):
+            log.info("room sensor %s: %s is back", self.url, entity)
+        return value
+
     def _dist_failed(self, entity: str, detail: Any) -> None:
         """Counts against the DISTANCE leg only -- never the presence
         breaker. See the note in __init__."""
-        fails = self._dist_fails.get(entity, 0) + 1
-        self._dist_fails[entity] = fails
+        self._entity_failed(entity, entity, detail,
+                            "zones will be unplaced, presence is unaffected")
+
+    def _entity_failed(self, key: str, entity: str, detail: Any,
+                       consequence: str) -> None:
+        """One non-presence entity failed. Counted PER KEY so a
+        permanently 404ing entity backs off instead of being re-asked every
+        poll while its neighbours zero the count."""
+        fails = self._dist_fails.get(key, 0) + 1
+        self._dist_fails[key] = fails
         if fails < self.fail_after:
-            log.debug("room sensor distance %s: %s (%s)", entity, self.url, detail)
+            log.debug("room sensor entity %s: %s (%s)", entity, self.url, detail)
             return
-        self._dist_skip_until[entity] = self._now() + self._base_cooldown
-        if not self._dist_down.get(entity):
-            log.warning("room sensor %s: %r is unreadable (%s); zones will be "
-                        "unplaced, presence is unaffected",
-                        self.url, entity, detail)
-            self._dist_down[entity] = True
+        self._dist_skip_until[key] = self._now() + self._base_cooldown
+        if not self._dist_down.get(key):
+            log.warning("room sensor %s: %r is unreadable (%s); %s",
+                        self.url, entity, detail, consequence)
+            self._dist_down[key] = True
         else:
-            log.debug("room sensor distance %s: %s; retrying in %.0fs",
+            log.debug("room sensor entity %s: %s; retrying in %.0fs",
                       entity, self.url, self._base_cooldown)
 
     # ------------------------------------------------------------ breaker
