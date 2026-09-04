@@ -200,3 +200,25 @@ def test_the_camera_leg_is_off_when_no_feed_is_attached(tmp_path):
     a = _stand_in(tmp_path)
     assert a._face_running() is False
     assert a._eye_identity() == ""
+
+
+def test_shadow_does_not_even_let_the_face_leg_rescue_a_clip(tmp_path):
+    """The value of shadow is that it is SAFE TO LEAVE ON while the log is
+    read, and that is only true if it changes nothing. A face leg that
+    started answering clips the speaker filter dropped would be a visible
+    change of behaviour he has not asked for yet."""
+    a = _watching(_stand_in(tmp_path, mode="shadow"), "hunter")
+    a.get_option = lambda k, d=None: {"owner.mode": "shadow",
+                                      "camera.identity": True}.get(k, d)
+    a.gate.get_option = a.get_option
+    assert a._gate_rescue(object(), MATCHED, False) is None
+    assert a.transcriber.calls == 0
+    assert a.spoken == []
+
+
+def test_enforcing_the_face_leg_does_rescue_it(tmp_path):
+    """...and in enforce it does, which is his "EITHER voice OR face is
+    enough" doing the one job that makes the face leg worth having."""
+    a = _watching(_stand_in(tmp_path), "hunter")
+    out = a._gate_rescue(object(), MATCHED, False)
+    assert out is not None and a.transcriber.calls == 1

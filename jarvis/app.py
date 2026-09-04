@@ -4514,6 +4514,17 @@ class JarvisApp:
         face, running = self._eye_identity(), self._face_running()
         d = gate.judge("voice", "", stats=stats, rejected=True,
                        face=face, face_running=running)
+        if gate.effective_mode() != gate_mod.MODE_ENFORCE:
+            # SHADOW CHANGES NOTHING, and that has to include the rescues.
+            # A face leg that started answering clips the speaker filter
+            # dropped would be a visible change of behaviour he did not ask
+            # for yet -- and the whole value of shadow is that it is safe to
+            # leave on while the log is read. The verdict is logged inside
+            # judge() either way, which is the point of the mode.
+            if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
+                log.info("owner-gate: shadow -- the %s leg WOULD have "
+                         "rescued this clip for %s", d.how, d.who)
+            return None
         if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
             log.info("owner-gate: the %s leg rescued a clip the speaker "
                      "filter dropped (%s)", d.how, d.who)
