@@ -722,6 +722,17 @@ _QUESTION_RX = re.compile(
 _POLITE_ORDER_RX = re.compile(
     r"^\s*(?:please\s+|jarvis[\s,]+)*(?:can|could|would|will|should)\s+you\b",
     re.I)
+# "Do not forget that I graduate December 10th 2026" is an ORDER that opens
+# with the question word `do`. _QUESTION_RX called it a question, the
+# unbacked-action guard stood down, and "I have noted that, sir" was spoken
+# with nothing stored (2026-09-04 refuter, probe e: the 09-02 incident
+# reachable verbatim). An imperative "do" -- "do not", "don't", "do
+# remember / keep / note / make / bear" -- asks nothing; "don't you ...?"
+# and "do you ...?" still do.
+_IMPERATIVE_DO_RX = re.compile(
+    r"^\s*(?:please\s+|jarvis[\s,]+)*(?:do not|don['’]t)(?!\s+you\b)"
+    r"|^\s*(?:please\s+|jarvis[\s,]+)*do\s+(?:remember|keep|note|make|bear)\b",
+    re.I)
 
 
 def is_question(text: str) -> bool:
@@ -732,9 +743,11 @@ def is_question(text: str) -> bool:
     outside the router want (jarvis/brain.py's unbacked-action guard, which
     must never retry -- and so never execute -- a question). It adds the
     trailing '?' that routing does not need: "you already added milk?" is a
-    question with no wh-word in front of it."""
+    question with no wh-word in front of it -- and takes away the
+    imperative "do" (_IMPERATIVE_DO_RX) that routing never had to tell
+    from the question word."""
     t = str(text or "").strip()
-    if not t or _POLITE_ORDER_RX.match(t):
+    if not t or _POLITE_ORDER_RX.match(t) or _IMPERATIVE_DO_RX.match(t):
         return False
     return bool(_QUESTION_RX.match(t) or t.endswith("?"))
 
