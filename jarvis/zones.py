@@ -1129,6 +1129,14 @@ class ZonesConfig:
     room_refusals: Dict[str, str]
     bridge: bool                    # zones.rooms was ABSENT: the built-in
     poisoned: bool                  # a refusal ABOVE the room level
+    # ``zones.rooms`` EXACTLY as the config holds it, or None when there is
+    # no usable one (absent, or the section was refused above the room
+    # level). It is here so that a caller which has to EDIT the list --
+    # jarvis/ui/sensors_page.py writes it back with only the bands it
+    # showed changed -- does not need a dotted read of its own. A second
+    # reader of a zones key is the shape of every bug this validator
+    # exists to stop, and it stays one door even for a writer.
+    raw_rooms: Any = None
 
     def why(self, room: str) -> str:
         """Why ``room`` records nothing, or "" when it does record.
@@ -1392,7 +1400,8 @@ def read_zones(cfg) -> ZonesConfig:
         log_max_bytes=max(MAX_LINE_BYTES, int(values["log_max_bytes"])),
         log_keep=1 if values["log_keep"] else 0,
         rooms=maps, refused=dict(shape.refused), room_refusals=room_refusals,
-        bridge=bridge, poisoned=False)
+        bridge=bridge, poisoned=False,
+        raw_rooms=None if rooms_raw is _MISSING else rooms_raw)
 
 
 # The views. Each one is ``read_zones`` and a field: there is deliberately

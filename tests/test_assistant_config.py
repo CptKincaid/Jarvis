@@ -660,3 +660,33 @@ def test_a_placeholder_satellite_password_is_not_treated_as_a_secret():
                                   "password": "CHANGE_ME_32_RANDOM_CHARS"}]},
     })
     assert "CHANGE_ME_32_RANDOM_CHARS" not in cfg.secret_values()
+
+
+def test_unset_removes_a_key_rather_than_nulling_it(tmp_path):
+    """``set(key, None)`` leaves a null in the file, which is still a key.
+    Retiring a superseded setting needs it GONE -- a key nothing reads
+    looks exactly like one that drives something, which is how two zone
+    models disagreed for a day (jarvis/ui/sensors_page.py)."""
+    import json
+    from jarvis.assistant_config import AssistantConfig
+    path = tmp_path / "assistant.json"
+    cfg = AssistantConfig.load(path)
+    assert cfg.set("presence.desk_band_m", [2.25, 3.75])
+    assert cfg.get("presence.desk_band_m") == [2.25, 3.75]
+    assert cfg.unset("presence.desk_band_m") is True
+    assert cfg.get("presence.desk_band_m") is None
+    written = json.loads(path.read_text())
+    assert "desk_band_m" not in written["presence"]
+    assert "camera_overrules" in written["presence"]     # its neighbours stay
+
+
+def test_unset_of_a_key_that_is_not_there_is_not_an_error_and_not_a_write(tmp_path):
+    from jarvis.assistant_config import AssistantConfig
+    path = tmp_path / "assistant.json"
+    cfg = AssistantConfig.load(path)
+    assert cfg.save()
+    before = path.read_text()
+    for missing in ("presence.no_such_key", "no_such_section.key",
+                    "claude.model.deeper", "nothing"):
+        assert cfg.unset(missing) is False, missing
+    assert path.read_text() == before

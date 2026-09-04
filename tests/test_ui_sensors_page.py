@@ -21,6 +21,7 @@ THE TWO RULES THIS FILE EXISTS TO HOLD.
   curfew away from the app's real one. The page asks ``allowed(RADAR)``
   itself instead, and the assertion is that no request was sent.
 """
+import copy
 import os
 import tempfile
 import threading
@@ -49,7 +50,52 @@ def _restore_look():
 OFFICE = RoomSpec(name="office", url="http://192.168.50.51", label="the office",
                   primary=True)
 KITCHEN = RoomSpec(name="kitchen", url="http://192.168.50.52", label="the kitchen")
-BANDS = sp.Bands(0.8, 1.8, 1.8, 4.5)
+
+# HIS LADDERS, 2026-09-03, as assistant.json holds them. The office desk is
+# the FARTHER band -- he sits at 3.13 m median and the near space is empty
+# -- which is the fact the page's own two-band model had backwards. The
+# kitchen has no lens, and its camera_zone says so by being blank.
+OFFICE_ROOM = {"name": "office", "enabled": True, "camera_zone": "at the desk",
+               "bands": [{"name": "empty space", "near_m": 0.75, "far_m": 2.25},
+                         {"name": "at the desk", "near_m": 2.25, "far_m": 3.75}]}
+KITCHEN_ROOM = {"name": "kitchen", "enabled": True, "camera_zone": "",
+                "bands": [{"name": "the kitchen", "near_m": 0.75, "far_m": 3.0},
+                          {"name": "at the door", "near_m": 3.0, "far_m": 3.75}]}
+
+
+def opts(**over):
+    """A ``get_option`` over a dotted dict, the shape the page is handed."""
+    data = {"zones": {"enabled": True,
+                      "rooms": [copy.deepcopy(OFFICE_ROOM),
+                                copy.deepcopy(KITCHEN_ROOM)]}}
+    for key, value in over.items():
+        node = data
+        parts = key.replace("__", ".").split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        if value is _GONE:
+            node.pop(parts[-1], None)
+        else:
+            node[parts[-1]] = value
+
+    def get_option(key, default=None):
+        node = data
+        for part in key.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return default if node is None else node
+    return get_option
+
+
+_GONE = object()
+
+
+def ladders(**over):
+    return sp.read_ladders(opts(**over))
+
+
+LADDERS = ladders()
 
 
 def reading(**kw):
@@ -103,36 +149,114 @@ def test_a_distance_that_is_not_a_number_is_no_opinion_and_never_zero():
     assert sp.parse_distance_cm('{"value": 0}') is None
 
 
-# ------------------------------------------------------------- the two bands
-def test_the_desk_band_wins_where_the_two_bands_touch():
-    assert sp.zone_for_distance(1.8, BANDS) == sp.ZONE_DESK
-    assert sp.zone_for_distance(0.8, BANDS) == sp.ZONE_DESK
-    assert sp.zone_for_distance(1.81, BANDS) == sp.ZONE_ROOM
-    assert sp.zone_for_distance(4.5, BANDS) == sp.ZONE_ROOM
+# ------------------------------------------------------ ONE zone model
+# The merge of zone-log and sensors-page left TWO zone models in the tree
+# that disagreed, and the disagreement was MEASURED: "the console calls 4 of
+# 10 points 'AT THE DESK' from the radar alone, while the zone log has no
+# desk band at all and reaches 'at the desk' only through the camera". They
+# were different config keys -- presence.desk_band_m here, zones.rooms there
+# -- so git saw no conflict. These pin the page onto the ONE model that
+# survived five rounds of review and matches his measured room.
+def test_the_page_places_a_range_with_the_zone_logs_own_ladder():
+    zmap = LADDERS.for_room("office")
+    assert [b.name for b in zmap.bands] == ["empty space", "at the desk"]
+    # and it is literally the same object type the log places a reading with
+    assert isinstance(zmap, sp.ZoneMap)
+    assert zmap.place(3.13) == "at the desk"     # where he actually sits
+    assert zmap.place(1.0) == "empty space"
 
 
-def test_a_distance_outside_both_bands_has_no_zone_of_its_own():
-    assert sp.zone_for_distance(0.4, BANDS) == ""
-    assert sp.zone_for_distance(5.9, BANDS) == ""
-    assert sp.zone_for_distance(None, BANDS) == ""
+def test_the_desk_is_the_FARTHER_band_in_his_office_not_the_nearer_one():
+    """The two-band model this page used to carry assumed the desk was the
+    NEARER band. His office is the other way round -- the radar sits on the
+    desk aimed out across the room, so the near space is empty and he reads
+    at 3.13 m median (min 3.00, max 3.30, measured 2026-09-03)."""
+    zmap = LADDERS.for_room("office")
+    near, far = zmap.bands
+    assert near.name == "empty space" and far.name == "at the desk"
+    assert far.near_m > near.near_m
 
 
-def test_bands_missing_from_the_config_fall_back_to_the_measured_coverage():
-    bands = sp.read_bands(lambda key, default=None: default)
-    assert (bands.desk_lo, bands.desk_hi) == sp.DEFAULT_DESK_BAND
-    assert (bands.room_lo, bands.room_hi) == sp.DEFAULT_ROOM_BAND
-    # 4.5 m is what the tuned gates measured, not a guess
-    assert bands.room_hi == 4.5
+def test_each_room_is_placed_by_its_own_ladder_and_never_by_another_rooms():
+    assert LADDERS.for_room("kitchen").place(3.19) == "at the door"
+    assert LADDERS.for_room("office").place(3.19) == "at the desk"
 
 
-def test_bands_that_arrive_backwards_or_broken_are_repaired_not_dropped():
-    # Reading the FILE is generous: a hand-edit that swapped the ends must
-    # not cost him the page. (Typing into the page is not -- see below.)
-    cfg = {sp.OPTION_DESK_BAND: [1.8, 0.8],
-           sp.OPTION_ROOM_BAND: ["nonsense", 4.0]}
-    bands = sp.read_bands(lambda key, default=None: cfg.get(key, default))
-    assert bands.desk_lo == 0.8 and bands.desk_hi == 1.8
-    assert (bands.room_lo, bands.room_hi) == sp.DEFAULT_ROOM_BAND
+def test_a_room_with_no_ladder_says_so_rather_than_borrowing_a_geometry():
+    got = ladders(zones__rooms=[copy.deepcopy(OFFICE_ROOM)])
+    assert got.for_room("kitchen") is None
+    v = sp.fuse(present=True, distance_m=3.2, camera=sp.camera_view({}),
+                zmap=None, overrules=True)
+    assert v.zone == sp.NO_LADDER
+    assert "zones.rooms" in v.why
+
+
+def test_a_ladder_the_zone_model_refuses_is_refused_here_too_and_named():
+    """jarvis/zones.py refuses a broken ladder rather than substituting a
+    working one, and the page must not substitute either -- a verdict on
+    screen that the log will not write is the disagreement all over again."""
+    broken = copy.deepcopy(OFFICE_ROOM)
+    broken["bands"][1]["near_m"] = 1.0        # now it overlaps "empty space"
+    got = ladders(zones__rooms=[broken])
+    assert got.for_room("office") is None
+    joined = " ".join(got.notes)
+    assert "zones.rooms[0].bands" in joined and "overlap" in joined
+
+
+def test_the_bands_the_page_shows_are_the_bands_the_verdict_uses():
+    """The whole claim of this pass, as one assertion: for every metre
+    across the ladder, what the page prints is what zones.verdict says."""
+    from jarvis import zones as zn
+    zmap = LADDERS.for_room("office")
+    for cm in range(0, 500, 7):
+        metres = cm / 100.0
+        v = sp.fuse(present=True, distance_m=metres, camera=sp.camera_view({}),
+                    zmap=zmap, overrules=True)
+        expected = zn.verdict(zmap, presence=True, distance_m=metres)
+        assert v.zone == expected.zone, metres
+        assert v.word == expected.zone.upper(), metres
+
+
+def test_the_page_and_the_zone_log_ask_the_SAME_question_of_the_config():
+    """The class fix, as one assertion. scripts/zone_log.py places a
+    reading with ``zones.zone_map_for(cfg, room)``; the page places it with
+    ``read_ladders(...).for_room(room)``. Over the same config they must be
+    the same ladder, band for band -- if they can differ at all the two
+    models are back."""
+    from jarvis import zones as zn
+    get_option = opts()
+    cfg = sp._CfgView(get_option)
+    got = sp.read_ladders(get_option)
+    for room in ("office", "kitchen"):
+        theirs = zn.zone_map_for(cfg, room)
+        ours = got.for_room(room)
+        assert theirs is not None and ours is not None, room
+        assert ours.bands == theirs.bands, room
+        assert ours.camera_zone == theirs.camera_zone, room
+    # and a room the log refuses is refused here too, not substituted
+    broken = copy.deepcopy(OFFICE_ROOM)
+    broken["bands"][0]["far_m"] = "near"
+    bad = opts(zones__rooms=[broken, copy.deepcopy(KITCHEN_ROOM)])
+    assert zn.zone_map_for(sp._CfgView(bad), "office") is None
+    assert sp.read_ladders(bad).for_room("office") is None
+
+
+def test_two_lists_of_room_names_that_do_not_join_are_named_on_screen():
+    """HIS CONFIG TONIGHT. presence.rooms is empty, so roomfabric falls
+    back to the singular keys and polls ONE room called "room" at the
+    office address -- while zones.rooms names "office" and "kitchen". They
+    join on the room NAME, so nothing joins, every row reads NO ZONE LADDER
+    and nothing anywhere says why."""
+    singular = RoomSpec(name="room", url=OFFICE.url, label="room", primary=True)
+    notes = sp.name_mismatch_note([singular], LADDERS)
+    assert len(notes) == 1
+    for want in ("'room'", "presence.rooms", "zones.rooms", "'office'",
+                 "'kitchen'", "restart"):
+        assert want in notes[0], want
+    # silent when they DO join, and silent when there is no ladder at all
+    assert sp.name_mismatch_note([OFFICE, KITCHEN], LADDERS) == ()
+    assert sp.name_mismatch_note([singular], ladders(zones__rooms=[])) == ()
+    assert sp.name_mismatch_note([], LADDERS) == ()
 
 
 def test_the_band_marker_is_a_fraction_of_its_band_and_nothing_outside_it():
@@ -142,6 +266,103 @@ def test_the_band_marker_is_a_fraction_of_its_band_and_nothing_outside_it():
     assert sp.band_fraction(4.0, 0.8, 1.8) is None
     assert sp.band_fraction(None, 0.8, 1.8) is None
     assert sp.band_fraction(1.0, 1.0, 1.0) is None      # a zero-width band
+
+
+# ------------------------------------------------- the superseded two bands
+def test_the_old_two_band_keys_are_gone_from_the_shipped_defaults():
+    """A key nothing reads but DEFAULTS still ships looks live: it appears
+    in every config, it has plausible numbers in it, and there is no way to
+    tell it from one that drives something."""
+    from jarvis.assistant_config import DEFAULTS
+    presence = DEFAULTS["presence"]
+    assert "desk_band_m" not in presence
+    assert "room_band_m" not in presence
+    assert presence["camera_overrules"] is True     # this one is still live
+
+
+def test_this_page_is_the_only_reader_of_the_superseded_keys_left():
+    """Two models disagreed because two files read two different keys. One
+    reader is what makes that impossible, so this counts READERS -- string
+    constants in real code -- and lets a comment or a docstring say what
+    the key used to be, which is the audit trail."""
+    import ast
+    import pathlib as _p
+    root = _p.Path(sp.__file__).resolve().parents[2]
+    hits = []
+    for path in sorted(root.glob("jarvis/**/*.py")):
+        if path.name == "sensors_page.py":
+            continue
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        docs = {ast.get_docstring(n, clean=False) for n in ast.walk(tree)
+                if isinstance(n, (ast.Module, ast.ClassDef, ast.FunctionDef,
+                                  ast.AsyncFunctionDef))}
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Constant) and isinstance(node.value, str)
+                    and "band_m" in node.value and node.value not in docs):
+                hits.append("%s:%d" % (path.name, node.lineno))
+    assert hits == [], hits
+
+
+def test_bands_are_carried_across_when_there_is_no_zone_ladder_at_all():
+    """His numbers must not be dropped on the floor by a migration."""
+    got = ladders(zones__rooms=_GONE,
+                  presence__desk_band_m=[2.25, 3.75],
+                  presence__room_band_m=[0.75, 2.25])
+    zmap = got.for_room("office")
+    assert zmap is not None
+    assert [(b.name, b.near_m, b.far_m) for b in zmap.bands] == [
+        ("in the room", 0.75, 2.25), ("at the desk", 2.25, 3.75)]
+    assert got.source("office") == sp.LEGACY_DESK_BAND
+    joined = " ".join(got.notes)
+    assert "carried across" in joined and "zones.rooms" in joined
+
+
+def test_where_both_models_exist_zones_rooms_wins_and_the_page_says_which():
+    got = ladders(presence__desk_band_m=[0.8, 1.8],
+                  presence__room_band_m=[1.8, 4.5])
+    assert got.source("office") == sp.OPTION_ROOMS
+    assert [b.name for b in got.for_room("office").bands] == ["empty space",
+                                                              "at the desk"]
+    joined = " ".join(got.notes)
+    assert "presence.desk_band_m" in joined and "NOT" in joined
+    assert "SAVE removes them" in joined
+
+
+def test_a_superseded_band_that_cannot_be_carried_across_is_named_not_swapped():
+    """MEASURED 2026-09-03: presence.room_band_m = [1.8, 8.0] rendered as
+    1.8/4.5 with no note anywhere, and one press of SAVE wrote the 4.5 over
+    his 8.0. There is no default left to swap in -- these keys are a
+    migration source now -- so it is said out loud and carried across as
+    nothing."""
+    for junk in ([1.8, 8.0], [80, 180], ["nonsense", 4.0], [], "1.8-4.5"):
+        got = ladders(zones__rooms=_GONE, presence__room_band_m=junk,
+                      presence__desk_band_m=[2.25, 3.75])
+        joined = " ".join(got.notes)
+        assert "presence.room_band_m" in joined, junk
+        assert "not usable" in joined, junk
+        zmap = got.for_room("office")
+        assert [b.name for b in zmap.bands] == ["at the desk"], junk
+
+
+def test_a_superseded_pair_that_was_only_reordered_is_carried_without_a_note():
+    """Swapping the ends loses nothing, so it stays silent: a note for every
+    generosity would train him to ignore the ones that cost data."""
+    got = ladders(zones__rooms=_GONE, presence__desk_band_m=[3.75, 2.25])
+    zmap = got.for_room("office")
+    assert (zmap.bands[0].near_m, zmap.bands[0].far_m) == (2.25, 3.75)
+    assert not [n for n in got.notes if "not usable" in n]
+
+
+def test_superseded_keys_absent_from_the_config_are_not_a_complaint():
+    assert ladders().notes == ()
+    assert ladders().legacy is None
+
+
+def test_two_superseded_bands_that_overlap_are_refused_rather_than_merged():
+    got = ladders(zones__rooms=_GONE, presence__desk_band_m=[1.0, 3.0],
+                  presence__room_band_m=[0.75, 2.0])
+    assert got.legacy is None
+    assert "do not describe a ladder" in " ".join(got.notes)
 
 
 # ------------------------------------------------------------- the fault line
@@ -197,8 +418,9 @@ def test_a_camera_that_was_never_asked_differs_from_one_that_did_not_know_him():
     assert sp.camera_text(asked)[0] != sp.camera_text(never)[0]
     assert "UNKNOWN" in sp.camera_text(asked)[0]
     assert "identity" in sp.camera_text(never)[0].lower()
-    # both still see a face, so both put a person at the desk
-    assert asked.zone == never.zone == sp.ZONE_DESK
+    # both still SEE a face; which place that means is the room's
+    # camera_zone in zones.rooms, not anything this file decides
+    assert asked.sees_a_face is never.sees_a_face is True
 
 
 def test_the_camera_row_says_why_it_is_dark_rather_than_showing_nothing():
@@ -218,7 +440,7 @@ def test_a_room_with_no_camera_says_so_rather_than_camera_off():
     none = sp.camera_view({}, present=False)
     text, _tone = sp.camera_text(none)
     assert "no camera" in text.lower()
-    assert none.zone == ""
+    assert none.sees_a_face is False
 
 
 def test_a_named_face_carries_the_name_and_the_score_he_tunes_against():
@@ -231,73 +453,90 @@ def test_a_named_face_carries_the_name_and_the_score_he_tunes_against():
 
 
 # --------------------------------------------------------------- the fusion
+def _face(name="hunterp"):
+    return sp.camera_view({"live": True, "faces": 1, "running": True,
+                           "face": {"name": name, "id_score": 0.71,
+                                    "id_ran": True}})
+
+
+def _office():
+    return LADDERS.for_room("office")
+
+
 def test_the_camera_overrules_the_radar_when_he_lets_it():
     # His words: "camera recognition overrules sensor detection since he can
-    # literally see me at my desk".
-    cam = sp.camera_view({"live": True, "faces": 1, "running": True,
-                          "face": {"name": "hunterp", "id_score": 0.71,
-                                   "id_ran": True}})
-    v = sp.fuse(present=True, distance_m=3.4, camera=cam, bands=BANDS,
+    # literally see me at my desk". The zone it names is the ROOM'S
+    # camera_zone out of the config, not a word this file owns.
+    v = sp.fuse(present=True, distance_m=1.0, camera=_face(), zmap=_office(),
                 overrules=True)
-    assert v.zone == sp.ZONE_DESK and v.source == "camera"
-    assert v.word == sp.ZONE_WORDS[sp.ZONE_DESK]
+    assert v.zone == "at the desk" and v.source == "camera"
+    assert v.word == "AT THE DESK"
 
 
 def test_the_camera_does_not_overrule_when_the_toggle_is_off():
-    cam = sp.camera_view({"live": True, "faces": 1, "running": True,
-                          "face": {"name": "hunterp", "id_score": 0.71,
-                                   "id_ran": True}})
-    v = sp.fuse(present=True, distance_m=3.4, camera=cam, bands=BANDS,
+    v = sp.fuse(present=True, distance_m=1.0, camera=_face(), zmap=_office(),
                 overrules=False)
-    assert v.zone == sp.ZONE_ROOM and v.source == "radar"
-    v = sp.fuse(present=False, distance_m=None, camera=cam, bands=BANDS,
+    assert v.zone == "empty space" and v.source == "radar"
+    v = sp.fuse(present=False, distance_m=None, camera=_face(), zmap=_office(),
                 overrules=False)
-    assert v.zone == sp.ZONE_AWAY and "camera" in v.why.lower()
+    assert v.zone == sp.ABSENT and "camera" in v.why.lower()
 
 
 def test_the_camera_is_the_only_leg_with_an_opinion_when_the_radar_has_none():
     # Nothing is being OVERRULED here -- the radar abstained -- so the
     # camera answers even with the toggle off.
-    cam = sp.camera_view({"live": True, "faces": 1, "running": True,
-                          "face": {"name": "hunterp", "id_score": 0.71,
-                                   "id_ran": True}})
     for overrules in (True, False):
-        v = sp.fuse(present=None, distance_m=None, camera=cam, bands=BANDS,
-                    overrules=overrules)
-        assert v.zone == sp.ZONE_DESK and v.source == "camera"
+        v = sp.fuse(present=None, distance_m=None, camera=_face(),
+                    zmap=_office(), overrules=overrules)
+        assert v.zone == "at the desk" and v.source == "camera"
+
+
+def test_a_recognised_face_cannot_name_a_place_in_a_room_with_no_lens():
+    """His kitchen entry carries camera_zone "" -- there is no camera in
+    the kitchen. The camera rule cannot fire for it however the toggle is
+    set, and the verdict falls through to the radar."""
+    kitchen = LADDERS.for_room("kitchen")
+    assert kitchen.has_camera is False
+    v = sp.fuse(present=True, distance_m=3.19, camera=_face(), zmap=kitchen,
+                overrules=True)
+    assert v.zone == "at the door" and v.source == "radar"
+    assert "no camera zone" in v.why
 
 
 def test_two_legs_with_no_opinion_is_no_opinion_and_not_an_empty_room():
     v = sp.fuse(present=None, distance_m=None, camera=sp.camera_view({}),
-                bands=BANDS, overrules=True)
-    assert v.zone == sp.ZONE_UNKNOWN
-    assert v.word == sp.ZONE_WORDS[sp.ZONE_UNKNOWN]
-    assert "nobody" not in v.word.lower()
+                zmap=_office(), overrules=True)
+    assert v.zone == sp.NO_OPINION
+    assert v.word == "NO OPINION"
+    assert "nobody" not in v.word.lower() and "empty" not in v.word.lower()
     assert v.source == ""
 
 
-def test_presence_with_an_unknown_distance_is_in_the_room_not_at_the_desk():
-    # The radar answers "someone is in the room" and only coarsely "how far".
-    # With no range at all the honest answer is the room, never the desk.
+def test_presence_with_an_unknown_distance_is_unplaced_and_never_a_guess():
+    # The radar answers "someone is in the room" and only coarsely "how
+    # far". With no range at all the honest answer names no band.
     v = sp.fuse(present=True, distance_m=None, camera=sp.camera_view({}),
-                bands=BANDS, overrules=True)
-    assert v.zone == sp.ZONE_ROOM
+                zmap=_office(), overrules=True)
+    assert v.zone == sp.UNPLACED
+    # and a range in a declared gap is the same answer, with a reason that
+    # says which
     v = sp.fuse(present=True, distance_m=5.8, camera=sp.camera_view({}),
-                bands=BANDS, overrules=True)
-    assert v.zone == sp.ZONE_ROOM
+                zmap=_office(), overrules=True)
+    assert v.zone == sp.UNPLACED and "gap" in v.why
 
 
-def test_a_target_inside_the_desk_band_is_at_the_desk_without_a_camera():
-    v = sp.fuse(present=True, distance_m=1.4, camera=sp.camera_view({}),
-                bands=BANDS, overrules=True)
-    assert v.zone == sp.ZONE_DESK and v.source == "radar"
+def test_a_target_inside_a_band_is_that_band_without_any_camera():
+    v = sp.fuse(present=True, distance_m=3.13, camera=sp.camera_view({}),
+                zmap=_office(), overrules=True)
+    assert v.zone == "at the desk" and v.source == "radar"
+    assert "at the desk" in v.why
 
 
 # ------------------------------------------------------------ the whole row
 def test_the_page_lists_every_configured_room_in_config_order():
     rows = sp.page_rows([reading(name="office"),
                          reading(name="kitchen", label="the kitchen")],
-                        camera_status={}, bands=BANDS, overrules=True,
+                        camera_status={}, ladders=LADDERS, overrules=True,
                         camera_room="office")
     assert [r.name for r in rows] == ["office", "kitchen"]
     # the camera lives in ONE room; the other says so
@@ -309,16 +548,16 @@ def test_a_row_for_an_unreachable_sensor_still_renders_every_field():
                                 status={"url": OFFICE.url, "blocked": "",
                                         "paused": True, "fails": 3,
                                         "cooldown_s": 30.0})],
-                       camera_status={}, bands=BANDS, overrules=True,
+                       camera_status={}, ladders=LADDERS, overrules=True,
                        camera_room="office")[0]
     assert row.presence_word == "NO OPINION"
     assert row.distance_text == sp.DASH and row.rtt_text == sp.DASH
-    assert row.fault and row.verdict.zone == sp.ZONE_UNKNOWN
+    assert row.fault and row.verdict.zone == sp.NO_OPINION
 
 
 def test_a_present_row_prints_metres_and_milliseconds_the_way_he_reads_them():
     row = sp.page_rows([reading(present=True, distance_m=1.42, rtt_ms=62.4)],
-                       camera_status={}, bands=BANDS, overrules=True,
+                       camera_status={}, ladders=LADDERS, overrules=True,
                        camera_room="office")[0]
     assert row.presence_word == "PRESENT"
     assert row.distance_text == "1.4 m"
@@ -413,46 +652,123 @@ def test_a_room_with_no_url_is_listed_but_never_polled():
 
 
 # ------------------------------------------------------------------ saving
-def test_saving_writes_the_three_dotted_keys_and_nothing_else():
-    edits, err = sp.band_edits("0.8", "1.8", "1.8", "4.5", True)
+def _edits(office=(("empty space", "0.75", "2.25"),
+                   ("at the desk", "2.25", "3.75"))):
+    return [sp.BandEdit("office", name, lo, hi) for name, lo, hi in office]
+
+
+def test_saving_writes_the_two_dotted_keys_and_nothing_else():
+    edits, err = sp.band_edits(_edits(), LADDERS, True)
     assert err == ""
-    assert set(edits) == {sp.OPTION_DESK_BAND, sp.OPTION_ROOM_BAND,
-                          sp.OPTION_CAMERA_OVERRULES}
-    assert edits[sp.OPTION_DESK_BAND] == [0.8, 1.8]
-    assert edits[sp.OPTION_ROOM_BAND] == [1.8, 4.5]
+    assert set(edits) == {sp.OPTION_ROOMS, sp.OPTION_CAMERA_OVERRULES}
     assert edits[sp.OPTION_CAMERA_OVERRULES] is True
-    for key in edits:
-        assert key.startswith("presence.")
+    office = [r for r in edits[sp.OPTION_ROOMS] if r["name"] == "office"][0]
+    assert office["bands"] == [
+        {"name": "empty space", "near_m": 0.75, "far_m": 2.25},
+        {"name": "at the desk", "near_m": 2.25, "far_m": 3.75}]
+
+
+def test_the_write_is_a_merge_so_a_room_this_page_never_showed_survives():
+    """AssistantConfig REPLACES a list rather than merging it, so a save
+    built from the widgets would delete every room the page was not
+    showing -- his kitchen, tonight, since presence.rooms is empty and the
+    fabric polls one room called "room"."""
+    edits, err = sp.band_edits(_edits(), LADDERS, True)
+    assert err == ""
+    kitchen = [r for r in edits[sp.OPTION_ROOMS] if r["name"] == "kitchen"]
+    assert kitchen == [KITCHEN_ROOM]          # byte for byte, camera_zone ""
+
+
+def test_saving_keeps_the_camera_zone_a_band_edit_has_no_business_touching():
+    edits, _err = sp.band_edits(_edits(), LADDERS, True)
+    rooms = {r["name"]: r for r in edits[sp.OPTION_ROOMS]}
+    assert rooms["office"]["camera_zone"] == "at the desk"
+    assert rooms["kitchen"]["camera_zone"] == ""      # no lens; stays no lens
+    assert rooms["office"]["enabled"] is True
+
+
+def test_a_room_with_only_carried_across_bands_is_APPENDED_by_the_save():
+    """That is what completes the migration: the numbers stop living in the
+    superseded keys and start living in zones.rooms."""
+    carried = ladders(zones__rooms=_GONE, presence__desk_band_m=[2.25, 3.75],
+                      presence__room_band_m=[0.75, 2.25])
+    edits, err = sp.band_edits(
+        [sp.BandEdit("office", "in the room", "0.75", "2.25"),
+         sp.BandEdit("office", "at the desk", "2.25", "3.75")], carried, True)
+    assert err == ""
+    assert [r["name"] for r in edits[sp.OPTION_ROOMS]] == ["office"]
+    assert edits[sp.OPTION_ROOMS][0]["bands"][1]["near_m"] == 2.25
 
 
 def test_a_band_edit_that_is_not_a_number_is_refused_with_a_reason():
-    edits, err = sp.band_edits("nought point eight", "1.8", "1.8", "4.5", True)
+    edits, err = sp.band_edits(
+        [sp.BandEdit("office", "at the desk", "two point two five", "3.75")],
+        LADDERS, True)
     assert edits == {}
-    assert "number" in err.lower() and "desk" in err.lower()
+    assert "number" in err.lower() and "at the desk" in err
 
 
 def test_a_band_typed_backwards_is_refused_rather_than_silently_swapped():
-    # Reading the file repairs it; a person typing gets told. Two different
-    # situations, deliberately two different answers.
-    edits, err = sp.band_edits("1.8", "0.8", "1.8", "4.5", True)
-    assert edits == {} and "desk" in err.lower()
-    edits, err = sp.band_edits("0.8", "1.8", "4.5", "1.8", True)
-    assert edits == {} and "room" in err.lower()
+    # Carrying the old keys across repairs a swap; a person typing gets
+    # told. Two different situations, deliberately two different answers.
+    edits, err = sp.band_edits(
+        [sp.BandEdit("office", "at the desk", "3.75", "2.25")], LADDERS, True)
+    assert edits == {} and "at the desk" in err
+    assert "near end" in err
 
 
 def test_a_band_beyond_what_the_radar_can_see_is_refused():
-    edits, err = sp.band_edits("0.8", "1.8", "1.8", "9.0", True)
+    edits, err = sp.band_edits(
+        [sp.BandEdit("office", "at the desk", "2.25", "9.0")], LADDERS, True)
     assert edits == {}
     assert "6" in err            # gates 0..8 at 0.75 m each
     assert sp.MAX_BAND_M == 6.0
 
 
+def test_a_ladder_that_would_not_parse_is_refused_HERE_not_by_the_log_later():
+    """The page must not save a geometry jarvis/zones.py will refuse: that
+    is how a config reaches the state where the page shows one thing and
+    the record says another. The judge is the zone model itself."""
+    edits, err = sp.band_edits(
+        [sp.BandEdit("office", "empty space", "0.75", "3.00"),
+         sp.BandEdit("office", "at the desk", "2.25", "3.75")], LADDERS, True)
+    assert edits == {}
+    assert "overlap" in err and "office" in err
+
+
+def test_a_zones_rooms_of_the_wrong_shape_refuses_the_save_by_name():
+    """The save has to refuse, not proceed: with the section poisoned the
+    page is showing no bands, and a merge from an empty page would replace
+    whatever is in his file with an empty list."""
+    got = ladders(zones__rooms="office")
+    assert got.blocked and "zones.rooms" in got.blocked
+    edits, err = sp.band_edits(_edits(), got, True)
+    assert edits == {} and "zones.rooms" in err
+    # ... and the same for every other way the section can be wrong
+    for section in ("nonsense", 7, [], {"enabled": "no"},
+                    {"dwell_s": "three", "rooms": [copy.deepcopy(OFFICE_ROOM)]}):
+        got = ladders(zones=section)
+        assert got.blocked, section
+        assert sp.band_edits(_edits(), got, True)[0] == {}, section
+
+
+def test_an_empty_page_saves_the_toggle_and_never_an_empty_band_list():
+    """A list REPLACES rather than merges in AssistantConfig, so a save
+    with no band rows on screen must not write zones.rooms at all."""
+    edits, err = sp.band_edits([], LADDERS, False)
+    assert err == "" and set(edits) == {sp.OPTION_CAMERA_OVERRULES}
+    assert edits[sp.OPTION_CAMERA_OVERRULES] is False
+
+
 def test_the_bands_carry_the_hardware_notes_he_would_otherwise_learn_the_hard_way():
-    notes = sp.band_notes(sp.Bands(0.5, 1.4, 1.4, 4.5))
+    from jarvis.zones import Band, ZoneMap
+    notes = sp.band_notes(ZoneMap("office", (Band("under the desk", 0.5, 1.4),)))
     joined = " ".join(notes).lower()
     assert "0.75" in joined          # nothing at all is detected inside it
     assert "1.5" in joined           # no STILL target inside it
-    assert sp.band_notes(BANDS) == ()
+    assert "under the desk" in joined            # WHICH band, by name
+    assert sp.band_notes(LADDERS.for_room("office")) == ()
+    assert sp.band_notes(None) == ()
 
 
 def test_a_round_trip_of_zero_is_never_confused_with_one_that_was_not_sent():
@@ -560,7 +876,7 @@ def test_the_row_before_the_first_poll_does_not_read_as_an_empty_room():
     row = sp.waiting_row(OFFICE)
     assert row.presence_word == sp.WAITING_WORD
     assert row.distance_text == row.rtt_text == sp.DASH
-    assert row.verdict.zone == sp.ZONE_UNKNOWN
+    assert row.verdict.zone == sp.NO_OPINION
     for lie in ("nobody", "empty", "present"):
         assert lie not in row.presence_word.lower()
 
@@ -615,8 +931,7 @@ class _Services:
         return self.answer
 
 
-EDITS = {sp.OPTION_DESK_BAND: [0.8, 1.8],
-         sp.OPTION_ROOM_BAND: [1.8, 4.5],
+EDITS = {sp.OPTION_ROOMS: [copy.deepcopy(OFFICE_ROOM)],
          sp.OPTION_CAMERA_OVERRULES: True}
 
 
@@ -645,17 +960,118 @@ def test_a_write_that_raises_is_never_reported_as_saved_either():
 
 
 def test_the_failure_note_names_the_key_that_would_not_write():
-    text, _tone = sp.save_note((sp.OPTION_ROOM_BAND,))
-    assert sp.OPTION_ROOM_BAND in text
-    assert sp.OPTION_DESK_BAND not in text
+    text, _tone = sp.save_note((sp.OPTION_ROOMS,))
+    assert sp.OPTION_ROOMS in text
+    assert sp.OPTION_CAMERA_OVERRULES not in text
 
 
 def test_one_key_failing_is_still_a_failure_and_not_a_partial_success():
     def half(key, value):
-        return key != sp.OPTION_ROOM_BAND
+        return key != sp.OPTION_ROOMS
     failed = sp.write_options(half, EDITS)
-    assert failed == (sp.OPTION_ROOM_BAND,)
+    assert failed == (sp.OPTION_ROOMS,)
     assert sp.save_note(failed)[0] != sp.SAVED_NOTE
+
+
+class _Store:
+    """A services stand-in over a real dotted dict, so a write and the read
+    that follows it are the same file."""
+
+    def __init__(self, data=None):
+        self.data = data if data is not None else {}
+        self.cleared = []
+
+    def get_option(self, key, default=None):
+        node = self.data
+        for part in key.split("."):
+            if not isinstance(node, dict) or part not in node:
+                return default
+            node = node[part]
+        return default if node is None else node
+
+    def set_option(self, key, value):
+        node = self.data
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = value
+        return True
+
+    def unset_option(self, key):
+        node = self.data
+        parts = key.split(".")
+        for part in parts[:-1]:
+            node = node.get(part) if isinstance(node, dict) else None
+            if not isinstance(node, dict):
+                return False
+        if parts[-1] not in node:
+            return False
+        node.pop(parts[-1])
+        self.cleared.append(key)
+        return True
+
+
+def test_a_save_retires_the_superseded_keys_instead_of_leaving_them_looking_live():
+    """A key nothing reads is indistinguishable from one that drives
+    something, and that is how the two zone models disagreed for a day."""
+    svc = _Store({"presence": {"desk_band_m": [2.25, 3.75],
+                               "room_band_m": [0.75, 2.25]}})
+    notes = sp.retire_legacy(svc.get_option, svc.unset_option)
+    assert notes == ()
+    assert sorted(svc.cleared) == [sp.LEGACY_DESK_BAND, sp.LEGACY_ROOM_BAND]
+    assert svc.get_option(sp.LEGACY_DESK_BAND) is None
+
+
+def test_retiring_keys_that_are_not_there_writes_nothing_and_says_nothing():
+    svc = _Store({})
+    assert sp.retire_legacy(svc.get_option, svc.unset_option) == ()
+    assert svc.cleared == []
+
+
+def test_keys_that_cannot_be_removed_are_SAID_rather_than_left_in_silence():
+    # An older app, or a services stand-in with no unset_option. Leaving a
+    # live-looking lie in his file quietly is the one outcome this may not
+    # have.
+    svc = _Store({"presence": {"desk_band_m": [2.25, 3.75]}})
+    notes = sp.retire_legacy(svc.get_option, None)
+    assert len(notes) == 1
+    assert sp.LEGACY_DESK_BAND in notes[0] and "by hand" in notes[0]
+    # and a clear that silently does not take is named too
+    stuck = _Store({"presence": {"desk_band_m": [2.25, 3.75]}})
+    notes = sp.retire_legacy(stuck.get_option, lambda key: False)
+    assert len(notes) == 1 and sp.LEGACY_DESK_BAND in notes[0]
+
+
+def test_a_clear_that_raises_is_a_note_and_never_a_crash_on_the_tk_thread():
+    svc = _Store({"presence": {"room_band_m": [0.75, 2.25]}})
+
+    def boom(key):
+        raise OSError("read-only file system")
+
+    notes = sp.retire_legacy(svc.get_option, boom)
+    assert len(notes) == 1 and sp.LEGACY_ROOM_BAND in notes[0]
+
+
+def test_a_save_and_the_read_after_it_agree_end_to_end():
+    """The migration as one round trip: a config with only the superseded
+    keys, the bands carried across, the save, and then the SAME reader
+    finding them in zones.rooms with the old keys gone."""
+    svc = _Store({"presence": {"desk_band_m": [2.25, 3.75],
+                               "room_band_m": [0.75, 2.25]}})
+    before = sp.read_ladders(svc.get_option)
+    assert before.source("office") == sp.LEGACY_DESK_BAND
+    edits, err = sp.band_edits(
+        [sp.BandEdit("office", b.name, b.near_m, b.far_m)
+         for b in before.for_room("office").bands], before, True)
+    assert err == ""
+    assert sp.write_options(svc.set_option, edits) == ()
+    assert sp.retire_legacy(svc.get_option, svc.unset_option) == ()
+    after = sp.read_ladders(svc.get_option)
+    assert after.source("office") == sp.OPTION_ROOMS
+    assert [(b.name, b.near_m, b.far_m) for b in after.for_room("office").bands] \
+        == [("in the room", 0.75, 2.25), ("at the desk", 2.25, 3.75)]
+    assert after.notes == ()                 # nothing left to complain about
+    assert svc.get_option(sp.LEGACY_DESK_BAND) is None
 
 
 def test_a_write_that_says_nothing_at_all_still_counts_as_saved():
@@ -844,38 +1260,14 @@ def test_the_sensor_publishes_the_wait_that_is_left_and_the_log_agrees():
 
 
 # ------------------ MINOR: an out-of-range band was swapped in silence
-def test_a_band_the_config_could_not_use_is_named_rather_than_swapped_quietly():
-    """MEASURED: presence.room_band_m = [1.8, 8.0] rendered as 1.8/4.5
-    with no note anywhere on the page, and one press of SAVE then wrote
-    the 4.5 over his 8.0. The repair stays -- one broken band must not
-    cost him the page -- but it is no longer silent."""
-    cfg = {sp.OPTION_ROOM_BAND: [1.8, 8.0]}
-    bands, notes = sp.read_bands_noted(lambda k, d=None: cfg.get(k, d))
-    assert (bands.room_lo, bands.room_hi) == sp.DEFAULT_ROOM_BAND
-    joined = " ".join(notes).lower()
-    assert "room band" in joined and "8" in joined
-    assert "save" in joined                  # it says SAVE would overwrite it
-
-
-def test_a_band_in_centimetres_is_named_too():
-    cfg = {sp.OPTION_DESK_BAND: [80, 180]}
-    bands, notes = sp.read_bands_noted(lambda k, d=None: cfg.get(k, d))
-    assert (bands.desk_lo, bands.desk_hi) == sp.DEFAULT_DESK_BAND
-    assert "desk band" in " ".join(notes).lower()
-
-
-def test_a_band_that_was_only_reordered_is_repaired_without_a_note():
-    """Swapping the ends loses nothing, so it stays silent: a note for
-    every generosity would train him to ignore the ones that cost data."""
-    cfg = {sp.OPTION_DESK_BAND: [1.8, 0.8]}
-    bands, notes = sp.read_bands_noted(lambda k, d=None: cfg.get(k, d))
-    assert (bands.desk_lo, bands.desk_hi) == (0.8, 1.8)
-    assert notes == ()
-
-
-def test_bands_absent_from_the_config_are_not_a_complaint():
-    _bands, notes = sp.read_bands_noted(lambda k, d=None: d)
-    assert notes == ()
+# The four tests that were here rode on the page's own two-band model and
+# on its silent fall back to a built-in default pair. Both are gone: the
+# bands are zones.rooms now, and the superseded keys are a migration source
+# with no default to fall back TO. What the findings were about -- a value
+# in his file that is thrown away without a word, and a SAVE that then
+# writes the substitute over it -- is held by the migration tests up in
+# "the superseded two bands", which assert the same thing against the model
+# that survived.
 
 
 # ------------- MINOR: the empty state named only one of the two switches

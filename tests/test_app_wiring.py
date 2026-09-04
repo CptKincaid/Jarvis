@@ -633,6 +633,21 @@ def test_get_and_set_option_go_through_the_assistant_config(app):
     assert json.loads(PATHS.ASSISTANT_CONFIG.read_text())["briefing"]["enabled"] is True
 
 
+def test_unset_option_removes_the_key_from_the_file_and_not_just_the_value(app):
+    """A superseded key that is merely IGNORED still sits in his file
+    looking live -- plausible numbers, no way to tell it from one that
+    drives something. The SENSORS page retires presence.desk_band_m
+    through this once its bands are in zones.rooms."""
+    assert app.set_option("presence.desk_band_m", [2.25, 3.75])
+    assert app.unset_option("presence.desk_band_m")
+    assert app.get_option("presence.desk_band_m") is None
+    written = json.loads(PATHS.ASSISTANT_CONFIG.read_text())
+    assert "desk_band_m" not in written["presence"]
+    # a key that is not there is not an error and is not a write
+    assert app.unset_option("presence.desk_band_m") is False
+    assert app.unset_option("nothing.at.all") is False
+
+
 def test_autostart_option_installs_and_removes_the_entry(app):
     from jarvis import autostart
     assert app.set_option("autostart.enabled", True)
