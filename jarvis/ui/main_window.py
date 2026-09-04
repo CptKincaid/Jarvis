@@ -292,6 +292,18 @@ def alarm_modal_text(label: str, kind: str, due_text: str) -> tuple:
     return title, (due_text or "").strip().upper()
 
 
+def alarm_modal_parts(label: str, kind: str, due_text: str) -> tuple:
+    """(kind_word, title, time) for the HOLO alarm modal (2026-09-03,
+    ui-polish U10). The kind is ALWAYS its own word -- alarm_modal_text
+    drops ALARM the moment the alarm has a label, so 'Biosensors lecture
+    / 9:45 AM' could have been a calendar card; here it is the tracked
+    eyebrow over the title. `title` is '' when the alarm has no label
+    (the eyebrow already says what it is), never the kind word twice."""
+    kind_word = ALARM_TITLES.get((kind or "alarm").lower(), "ALARM")
+    title = (label or "").strip()
+    return kind_word, title, (due_text or "").strip().upper()
+
+
 def terminal_button_state(task_state: str, project: str,
                           session_seen: bool, attached: bool = False) -> str:
     """The terminal button's drawn state: the tracker's own state while a
@@ -790,6 +802,12 @@ class MainWindow:
         # keep their space; the transcript absorbs any height shortfall.
         self._build_footer()
         self._build_stage()
+        if theme.LOOK == "holo":
+            # holo: the toast is a laid-out strip directly above the
+            # command bar (packed before the reactor, side=bottom), never
+            # an overlay on the newest card -- widgets.Toast has the
+            # measurements. Classic keeps the placed slab.
+            self.toast.dock(self.shell, before=self.reactor)
 
         self.drawer = SettingsDrawer(
             root, services=self.services,
@@ -2199,6 +2217,23 @@ class MainWindow:
         # The camera pane is an ACTIVE-console widget only, and going quiet
         # STOPS the capture rather than hiding it (jarvis/ui/preview.py).
         self._preview_apply(mode)
+        if theme.LOOK == "holo":
+            # Keyboard-idle standby dims the WHOLE window through the same
+            # -alpha path the radar's DeskState uses (_apply_standby), not
+            # just the room slab (2026-09-03, ui-polish U08): measured on
+            # the 09-03 shots the sphere's mean luminance was 72.6 in
+            # standby against 72.1 in READY and the header band 37.4 in
+            # both -- the brightest object on the panel was exempt from the
+            # night dim. Reversible by construction: ACTIVE restores, and
+            # _wake_board / _on_close restore on their own paths. Needs a
+            # compositor, so a Xvfb shot cannot show it; the wiring is
+            # pinned in tests/test_ui_assistant.py instead. Looked up, not
+            # called outright, for the same reason the reactor/transcript
+            # calls above are guarded: a console without the standby seam
+            # (a bare test fake) keeps its brightness.
+            apply = getattr(self, "_apply_standby", None)
+            if callable(apply):
+                apply(mode != STANDBY)
         if mode == STANDBY:
             if self._standby_origin is None:
                 try:
@@ -2686,32 +2721,24 @@ class MainWindow:
 
     # ------------------------------------------------------ alarm modal
     def _ev_alarm(self, ev: AlarmFired):
-        """Overlay Card centred on the stage (300 wide): label (display
-        SIZE_LABEL semibold), time (mono SIZE_BODY), DISMISS / SNOOZE 10.
-        The reactor keeps animating beneath; the window is brought back
-        from the tray so the alarm is seen."""
+        """Classic: an overlay Card centred on the stage (300 wide): label
+        (display SIZE_LABEL semibold), time (mono SIZE_BODY), DISMISS /
+        SNOOZE 10, the reactor animating beneath. Holo: the stage takeover
+        in _build_alarm_holo. Either way the window is brought back from
+        the tray so the alarm is seen."""
         # An alarm ringing behind a room clock is a bug: wake the console
         # NOW rather than at the mode machine's next four-second tick.
         self._note_output()
         self._hide_alarm()
-        title, when = alarm_modal_text(ev.label, ev.kind, ev.due_text)
         if theme.LOOK == "holo":
-            # holo: a thin bright frame on the stage ground, not a slab.
-            # The ground under it is the reactor's glow pool, not BG: at
-            # the stage centre those are ~20 levels apart, so filling with
-            # theme.BG drew the modal as a dark rectangle over the pool --
-            # the same slab defect the transcript cards had (09-01
-            # review). Tk has no alpha, so the closest we get is the pool
-            # sampled under the card's own centre (Reactor.ground_at); the
-            # card is centred on the stage, hence relx/rely 0.5 here too.
-            fill = self.reactor.ground_at(self.reactor.winfo_width() / 2,
-                                          self.reactor.winfo_height() / 2)
-            card = Card(self.reactor, fill=fill, pad=12, bg=fill,
-                        style="frame", edge=theme.GLASS_EDGE,
-                        accent=theme.BRIGHT)
-        else:
-            fill = theme.RAISED
-            card = Card(self.reactor, fill=fill, pad=12, bg=theme.BG)
+            card, buttons = self._build_alarm_holo(ev)
+            self._alarm = (ev.alarm_id, card, buttons)
+            self._refresh_pill()                  # the header says ALARM (U07)
+            self._raise_for_alarm()
+            return
+        title, when = alarm_modal_text(ev.label, ev.kind, ev.due_text)
+        fill = theme.RAISED
+        card = Card(self.reactor, fill=fill, pad=12, bg=theme.BG)
         body = card.body
         tk.Label(body, text=title, font=ui_display(theme.SIZE_LABEL, "semibold"),
                  fg=theme.INK, bg=fill, anchor="w", justify="left",
@@ -2731,20 +2758,92 @@ class MainWindow:
                         command=lambda: self._alarm_action(alarm_id, "snooze")))
         buttons[0].pack(side="left")
         buttons[1].pack(side="left", padx=(theme.PAD_S, 0))
-        if theme.LOOK == "holo":
-            card.set_edge_glow((theme.ARC_BRIGHT,))
-        else:
-            card.set_edge_glow()
+        card.set_edge_glow()
         card.place(in_=self.reactor, relx=0.5, rely=0.5, anchor="center",
                    width=px(300))
         tk.Misc.lift(card)
         self._alarm = (alarm_id, card, buttons)
+        self._raise_for_alarm()
+
+    def _raise_for_alarm(self):
         try:
             if self.root.state() == "withdrawn":
                 self.root.deiconify()
             self.root.lift()
         except tk.TclError:
             log.debug("alarm: could not raise the window", exc_info=True)
+
+    # design px the holo alarm modal keeps inside the stage on each side:
+    # at his 918-px stage that is x 32..886, which covers the engine card
+    # (right edge 881, engine_card_x1) and stays clear of the rail ticks
+    # (889..899) and the frame line (899) -- measured on the 09-03 shots
+    ALARM_MARGIN = 16
+
+    def _build_alarm_holo(self, ev: AlarmFired) -> tuple:
+        """The holo alarm: a stage TAKEOVER, not a card (2026-09-03,
+        ui-polish U10).
+
+        Measured on the 09-03 shot 12-alarm: a plain 600x300 frame with
+        no kind word, filled (10,37,49) over a stage ground of (9,33,44)
+        -- four levels apart, no scrim -- laid across the engine card so
+        '…ER SMALL / ZE · Q4 / MA4:26B / GB10' stayed visible beside it in
+        FOCAL white, brighter than the alarm's own 25-px title. The one
+        state that must interrupt him lost to the reactor.
+
+        Now: a 50% stipple of BG over every stage item (Tk has no alpha;
+        'gray50' is the compositor-free scrim), a chamfered WARN outline
+        with WARN brackets -- the only amber-framed panel on screen, per
+        theme.py's semantic budget -- spanning the stage frame's inner
+        width so nothing peeks past it, a tracked kind word as the
+        eyebrow, the TIME at wordmark size in FOCAL (the time IS the
+        alarm), the label under it at body size. The card is filled with
+        the pool colour sampled under its centre (Reactor.ground_at), so
+        against the dimmed stage it reads as the one lit panel."""
+        stage = self.reactor
+        w, h = stage.winfo_width(), stage.winfo_height()
+        fill = stage.ground_at(w / 2, h / 2)
+        try:
+            stage.delete("alarm_scrim")
+            self._alarm_scrim = stage.create_rectangle(
+                0, 0, max(w, 1), max(h, 1), fill=theme.BG, outline="",
+                stipple="gray50", tags=("alarm_scrim",))
+        except tk.TclError:
+            self._alarm_scrim = None
+        width = max(px(300), w - 2 * px(self.ALARM_MARGIN))
+        pad = 14
+        card = Card(stage, fill=fill, pad=pad, bg=fill, style="chamfer",
+                    edge=theme.WARN, accent=theme.WARN)
+        body = card.body
+        kind_word, title, when = alarm_modal_parts(ev.label, ev.kind,
+                                                   ev.due_text)
+        wrap = max(px(80), width - 2 * px(pad) - px(4))
+        tk.Label(body, text=theme.caption(kind_word, surface=True),
+                 font=ui_display(theme.SIZE_CAPTION, "semibold"),
+                 fg=theme.WARN, bg=fill, anchor="w").pack(fill="x")
+        if when:
+            tk.Label(body, text=when,
+                     font=ui_display(theme.SIZE_WORDMARK, "semibold"),
+                     fg=theme.FOCAL, bg=fill, anchor="w").pack(
+                fill="x", pady=(px(2), 0))
+        if title:
+            tk.Label(body, text=title,
+                     font=ui_display(theme.SIZE_BODY, "semibold"),
+                     fg=theme.INK, bg=fill, anchor="w", justify="left",
+                     wraplength=wrap).pack(fill="x", pady=(px(4), 0))
+        row = tk.Frame(body, bg=fill)
+        row.pack(fill="x", pady=(px(12), 0))
+        alarm_id = ev.alarm_id
+        buttons = (
+            RoundButton(row, text="DISMISS", kind="accent", bg=fill,
+                        command=lambda: self._alarm_action(alarm_id, "dismiss")),
+            RoundButton(row, text=f"SNOOZE {SNOOZE_MIN}", kind="default",
+                        bg=fill,
+                        command=lambda: self._alarm_action(alarm_id, "snooze")))
+        buttons[0].pack(side="left")
+        buttons[1].pack(side="left", padx=(theme.PAD_S, 0))
+        card.place(in_=stage, relx=0.5, rely=0.5, anchor="center", width=width)
+        tk.Misc.lift(card)
+        return card, buttons
 
     def _alarm_action(self, alarm_id: str, action: str):
         """DISMISS / SNOOZE → services.alarm_action(alarm_id, action, 10)

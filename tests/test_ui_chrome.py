@@ -375,8 +375,246 @@ def test_toast_kind_colour_is_read_per_call():
 # =====================================================================
 # 2026-09-03 ui-polish (the 09-03 panel, ~/scratch-0903/ui-synthesis.md)
 # =====================================================================
+from jarvis.ui.board import (EMPTY_PANEL_DEFAULT, EMPTY_PANEL_TEXT,  # noqa: E402
+                             empty_panel_text)
+from jarvis.ui.views import (SNAP_FRAGMENT, SettingsDrawer,  # noqa: E402
+                             snap_hidden, speaker_color)
 from jarvis.ui.widgets import StatePill  # noqa: E402
+
+
+# ------------------------------------------------ U01 transcript top snap
+def test_snap_hides_the_small_fragment_the_view_cuts_and_keeps_the_rest():
+    """The 09-03 shots, as arithmetic at S=2 (SNAP_FRAGMENT 96 -> 192 px).
+    Four cards stacked 16 px apart; the view's top edge lands 178 px above
+    the bottom of the first (08b's 'draft from Tuesday…' fragment, no head
+    row): hidden. Everything below is whole: shown."""
+    tops = [16, 316, 532, 748]
+    heights = [284, 200, 200, 120]
+    view_top = 16 + 284 - 178
+    assert snap_hidden(tops, heights, view_top, 192) == [True, False, False, False]
+    # a fragment taller than the floor stays -- a long reply half on
+    # screen is still worth reading
+    assert snap_hidden(tops, heights, 16 + 284 - 200, 192) == [False] * 4
+    # the empty bracket of 23-claude-task (10 px left) and the halved
+    # 'Here's your morning, sir.' of 09 (40 px) both go
+    assert snap_hidden(tops, heights, 16 + 284 - 10, 192)[0] is True
+    assert snap_hidden(tops, heights, 16 + 284 - 40, 192)[0] is True
+
+
+def test_snap_never_hides_the_card_the_view_rests_on_or_a_whole_card():
+    # one card taller than the view: it is the last card, it stays
+    assert snap_hidden([16], [1400], 900, 192) == [False]
+    # a card ENTIRELY above the edge is off-screen, not a fragment; Tk
+    # clips it and it must stay mapped for the scroll back up
+    assert snap_hidden([16, 316], [284, 100], 320, 192) == [False, False]
+    # the edge exactly on a boundary cuts nothing
+    assert snap_hidden([16, 316], [284, 100], 316, 192) == [False, False]
+    assert snap_hidden([], [], 0, 192) == []
+    assert SNAP_FRAGMENT == 96
+
+
+# --------------------------------------------------- U03 label > meta
+def test_speaker_label_lifts_one_step_in_holo_and_keeps_classic():
+    theme.select_look("holo")
+    assert speaker_color("jarvis") == theme.CYAN
+    assert speaker_color("you") == theme.MUTED
+    # the stamp stays FAINT (views._card_head) and the label is no longer
+    # the stamp's colour on either card
+    assert theme.FAINT not in (speaker_color("jarvis"), speaker_color("you"))
+    theme.select_look("classic")
+    assert speaker_color("jarvis") == theme.CYAN_DIM
+    assert speaker_color("you") == theme.FAINT
+    # explicit look beats the current one
+    assert speaker_color("you", "holo") == theme.MUTED
+
+
+# --------------------------------------- U14 footer with an active project
+# MEASURED 2026-09-03 on Xvfb :92 at JARVIS_UI_SCALE 2.0, the rig's
+# readings ('cpu 52° 7% · gpu 44° 2%', '26.8 GB'): wake segment ends at
+# 257 ('WAKE WORD ON' 181 + ring/gaps), PROJECT fixed part 150, one mono
+# character 14; level 0 CPU/GPU 218 each and MEM 226, level 1 176/176/162,
+# level 2 120/120/162, level 3 162.
+WAKE_END_23 = 257
+PROJ_FIXED = 150
+CHAR_W = 14
+LEVELS_23 = [[("CPU", 218), ("GPU", 218), ("MEMORY", 226)],
+             [("CPU", 176), ("GPU", 176), ("MEMORY", 162)],
+             [("CPU", 120), ("GPU", 120), ("MEMORY", 162)],
+             [("MEMORY", 162)]]
+
+
+def test_a_dropped_project_chip_gives_the_memory_figure_back():
+    """The 09-03 shots 23/24: 'CPU 52°C · 7% | GPU 44°C · 2%' -- level 0,
+    MEMORY gone, and no PROJECT chip either. plan_strip yielded MEMORY for
+    a chip that then still did not fit (75 px free = 5 characters, one
+    under the six-character floor) and returned (0, ['MEMORY']): the chip
+    dropped and the segment it evicted never came back."""
+    before_free = STRIP_W - WAKE_END_23 - (218 + 218) - PROJ_FIXED
+    assert before_free // CHAR_W == 5 < 6
+    assert plan_strip(STRIP_W, WAKE_END_23, PROJ_FIXED, CHAR_W, 6,
+                      LEVELS_23[0]) == (0, [])
+    level, chars, hidden = plan_telemetry(STRIP_W, WAKE_END_23, PROJ_FIXED,
+                                          CHAR_W, 6, LEVELS_23)
+    # the ladder re-plans with the whole cluster and lands on the compact
+    # rung with the chip -- either the chip or the memory figure, never
+    # neither
+    assert (level, chars, hidden) == (1, 6, ["MEMORY"])
+    assert chars > 0 or "MEMORY" not in hidden
+    # ...and the °-form no longer flips with the project: level 1 is what
+    # the same strip plans with NO project
+    assert plan_telemetry(STRIP_W, WAKE_END_23, PROJ_FIXED, CHAR_W, 0,
+                          LEVELS_23)[0] == 1
+
+
+def test_every_plan_shows_the_chip_or_the_memory_figure():
+    for w in range(600, 1400, 7):
+        for slug_len in (0, 3, 6, 12):
+            level, chars, hidden = plan_telemetry(w, WAKE_END_23, PROJ_FIXED,
+                                                  CHAR_W, slug_len, LEVELS_23)
+            assert chars > 0 or "MEMORY" not in hidden, (w, slug_len)
+            # a plan that shows no chip hides nothing on its behalf
+            if chars == 0:
+                assert hidden == []
+
+
+# ------------------------------------------------- U16 the tracking rule
+def test_caption_tracks_surface_labels_only_and_only_in_holo():
+    theme.select_look("holo")
+    assert theme.caption("Voice ID", surface=True) == "V O I C E   I D"
+    assert theme.caption("weather", surface=False) == "WEATHER"
+    assert theme.caption("alarm") == "A L A R M"
+    assert theme.tracked_caps("Jarvis") == "J A R V I S"
+    theme.select_look("classic")
+    assert theme.caption("Voice ID", surface=True) == "VOICE ID"
+    assert theme.caption("weather", surface=False) == "WEATHER"
+    assert theme.caption("", surface=True) == ""
+
+
+# ------------------------------------------ U05 the pill's dot has a shape
 def test_state_pill_has_a_ring_shape_and_set_state_defaults_to_the_disc():
     sig = inspect.signature(StatePill.set_state)
     assert sig.parameters["shape"].default == StatePill.DOT_DISC == "disc"
     assert StatePill.DOT_RING == "ring"
+
+
+# ------------------------------------------------ U02 the toast can dock
+def test_toast_is_an_overlay_until_docked():
+    t = Toast.__new__(Toast)
+    Toast.__init__(t, container=None)
+    assert not t.docked
+    t.dock(host="shell", before="reactor")
+    assert t.docked and t._host == "shell" and t._before == "reactor"
+    assert Toast.STRIP_H == 34
+    theme.select_look("holo")
+    assert Toast._kind_dot("error") == theme.ERR
+    assert Toast._kind_dot("warn") == theme.WARN
+    assert Toast._kind_dot("ok") == theme.CYAN
+    assert Toast._kind_dot("info") == theme.CYAN_DIM
+
+
+# --------------------------------------------- U15 an empty board panel
+def test_empty_panels_state_their_emptiness():
+    assert empty_panel_text("focus") == "nothing in focus"
+    assert empty_panel_text("sessions") == "no sessions"
+    assert empty_panel_text("no-such-panel") == EMPTY_PANEL_DEFAULT
+    assert empty_panel_text(None) == EMPTY_PANEL_DEFAULT
+    for key, text in EMPTY_PANEL_TEXT.items():
+        assert text and text == text.lower(), key      # a line, not a label
+
+
+# ------------------------------------------- U12 settings slider geometry
+def test_holo_scale_rows_leave_the_value_room_at_the_low_end():
+    """MEASURED 2026-09-03 on :92 at S=2: 'Silence timeout (s)' 314 px in
+    the row face, the drawer's inner width 576, the px(130) trough 260 --
+    2 px of slack, and the Scale's value ('2.5', 36 px) is drawn centred
+    on a knob that sits at the trough's left edge at the low end, so it
+    overhung into the label. The holo trough shortens and gains a gap
+    wider than the overhang."""
+    label_w, inner, value_w = 314, 576, 36
+    holo = 2 * SettingsDrawer.SCALE_LEN_HOLO + 2 * SettingsDrawer.SCALE_GAP_HOLO
+    assert label_w + holo <= inner, (label_w + holo, inner)
+    assert 2 * SettingsDrawer.SCALE_GAP_HOLO >= value_w // 2
+    # the old geometry really did fill the row to within a few px
+    assert inner - label_w - 260 == 2
+
+
+# The rule applied to the two row-key sites that still tracked (2026-09-04):
+# both drawn on a fake canvas, no Tk.
+def _fake_measure(_font, text):
+    return 7 * len(text or "")
+
+
+def test_engine_card_keys_and_load_readout_are_plain_caps_in_holo(monkeypatch):
+    from jarvis.ui import reactor
+    theme.select_look("holo")
+    monkeypatch.setattr(reactor, "measure", _fake_measure)
+
+    class _Stage:
+        _draw_card = reactor.Reactor._draw_card
+        _draw_holo_decor = reactor.Reactor._draw_holo_decor
+
+        def __init__(self):
+            self._decor = {}
+            self.texts = []
+
+        def create_line(self, *a, **k):
+            return 1
+
+        create_polygon = create_arc = create_oval = create_line
+
+        def create_text(self, *a, **k):
+            self.texts.append(k.get("text"))
+            return 1
+
+    st = _Stage()
+    st._draw_holo_decor(918, 600, 300, 300)
+    st._draw_card(918, 300)
+    keys = [t for t in st.texts if t]
+    labels = [lab for lab, _key in reactor.CARD_ROWS]
+    assert keys[-len(labels):] == labels                  # HEAR, not H E A R
+    assert reactor.GAUGE_LABEL in keys
+    assert reactor.tracked(reactor.GAUGE_LABEL) not in keys
+    assert all(" " not in k for k in labels)
+    # the per-row value budget is still cut from the label actually drawn
+    assert set(st._decor["card_budget"]) == {key for _lab, key in reactor.CARD_ROWS}
+
+
+def test_standby_and_ambient_row_keys_are_plain_caps_in_holo(monkeypatch):
+    from jarvis.ui import ambient
+    theme.select_look("holo")
+    monkeypatch.setattr(ambient, "measure", _fake_measure)
+    ambient._MEASURE_CACHE.clear()
+
+    class _Slab:
+        _draw_framed_rows = ambient.RoomSlab._draw_framed_rows
+        _draw_rows = ambient.RoomSlab._draw_rows
+
+        def __init__(self):
+            self._reveal = None
+            self._dim = 1.0
+            self.texts = []
+
+        def _draw_frame(self, *a):
+            pass
+
+        def _pad_x(self):
+            return 20
+
+        def create_line(self, *a, **k):
+            return 1
+
+        def create_text(self, *a, **k):
+            self.texts.append(k.get("text"))
+            return 1
+
+    rows = [("NEXT", "Lab report"), ("DUE", "tomorrow"), ("OUTSIDE", "72°")]
+    try:
+        slab = _Slab()
+        slab._draw_framed_rows(rows, 900, 1400, 300, "#fff", "#888")
+        assert slab.texts[::2] == ["NEXT", "DUE", "OUTSIDE"]
+        slab = _Slab()
+        slab._draw_rows(rows, 900, 1400, 300, "#fff", "#888")
+        assert slab.texts[::2] == ["NEXT", "DUE", "OUTSIDE"]
+        assert ambient.tracked("NEXT") == "N E X T"        # the helper is untouched
+    finally:
+        ambient._MEASURE_CACHE.clear()

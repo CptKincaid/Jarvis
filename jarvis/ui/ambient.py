@@ -563,7 +563,8 @@ class RoomSlab(tk.Canvas):
                                  text=f"{label}   {text}", fill=body, font=vf)
                 continue
             self.create_text(pad, y, anchor="w",
-                             text=tracked(label) if holo else label,
+                             text=(theme.caption(label, surface=False)
+                                   if holo else label),
                              fill=faint, font=lf)
             self.create_text(w - pad, y, anchor="e", text=text,
                              fill=body, font=vf)
@@ -625,9 +626,11 @@ class RoomSlab(tk.Canvas):
         rule = dim(theme.HOLO_DIM, self._dim)
         for sy in separator_ys(top, len(rows), px(ROW_H)):
             self.create_line(x0 + inset, sy, x1 - inset, sy, fill=rule)
-        # the label column is the widest tracked label; the value gets the
-        # rest of the frame, and is ellipsized against exactly that
-        labels = [tracked(label) for label, _v in rows]
+        # the label column is the widest label; the value gets the rest of
+        # the frame, and is ellipsized against exactly that. Row keys are
+        # plain caps, not tracked: they name a ROW, and only a label that
+        # names a surface is tracked (theme.caption, the 09-03 U16 rule)
+        labels = [theme.caption(label, surface=False) for label, _v in rows]
         try:
             label_w = max(measured(lf, t) for t in labels) if labels else 0
         except Exception:                   # noqa: BLE001 - Tk font boundary
