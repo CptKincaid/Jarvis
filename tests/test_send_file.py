@@ -520,10 +520,38 @@ def test_the_suite_may_not_open_a_real_smtp_socket():
     """The conftest firewall, asserted rather than assumed. There is no
     environment escape for this one, unlike the Ollama block."""
     import socket
-    with pytest.raises(ConnectionRefusedError) as exc:
+    import tests.conftest as ct
+    before = len(ct._smtp_blocked)
+    with pytest.raises(ct.SmtpFirewallRefused) as exc:
         socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect(
             ("smtp.gmail.com", 465))
     assert "SMTP" in str(exc.value)
+    # ...and a refusal is NOT an Exception, so nothing in jarvis/ can
+    # swallow it into a spoken "I couldn't send that, sir." (F24).
+    assert not isinstance(exc.value, Exception)
+    # This test tripped the firewall on purpose: take the entry back off
+    # the list pytest_sessionfinish fails the run on.
+    assert len(ct._smtp_blocked) == before + 1
+    ct._smtp_blocked.pop()
+
+
+def test_a_test_that_loses_its_fake_fails_loudly(cmd):
+    """F24 (09-03). conftest promised "a loud failure" when a test lost its
+    SMTP fake; what actually happened was ConnectionRefusedError ->
+    mail.send_message's `except Exception` -> MailSendFailed -> the
+    commander's ordinary "I couldn't send that, sir.", status "Send
+    failed" -- and the test passed unless it happened to assert on the
+    sent list. The refusal now comes OUT of handle(), through every
+    `except Exception` on the way."""
+    import tests.conftest as ct
+    del cmd.services.smtp                               # the fake is lost
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    before = len(ct._smtp_blocked)
+    with pytest.raises(ct.SmtpFirewallRefused):
+        cmd.handle("yes", source="typed")
+    assert cmd.spoken == [], "the failure must not be spoken away"
+    assert len(ct._smtp_blocked) == before + 1
+    ct._smtp_blocked.pop()                              # owned, see above
 
 
 # ==================================================================
