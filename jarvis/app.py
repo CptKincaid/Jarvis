@@ -551,6 +551,13 @@ class JarvisApp:
         # is never reached from the running app at all.
         self.commander.on_uncertain = self._on_uncertain
         self.commander.claim_uncertain = self._claim_uncertain
+        # ...and the count of those cards, for "clear the transcript": the
+        # prompt goes into the SAME TranscriptView._approvals dict the
+        # Claude approvals do, clear_all keeps it while it is unanswered,
+        # and ApprovalService.pending() has never heard of it. Without this
+        # the wipe said "Screen's clear, sir" over a card still on the
+        # glass (commander._standing_questions).
+        self.commander.uncertain_open = self._uncertain_open
         self._pending_uncertain: dict = {}      # request_id -> utterance
         # The open debrief question (jarvis/debrief.py), modelled on
         # _pending_uncertain: a context dict the NEXT transcript is filed
@@ -5432,6 +5439,21 @@ class JarvisApp:
             self.uncertain_answer(rid, answer, source="voice")
         except Exception:
             log.exception("uncertain follow-up failed")
+
+    def _uncertain_open(self) -> int:
+        """Commander hook: how many "Was that for me?" cards are still up.
+
+        One prompt at a time by construction (_on_uncertain supersedes the
+        last), so this is 0 or 1 -- but it is counted rather than asserted,
+        because the pane counts CARDS and the commander speaks a number.
+
+        Easy to be non-zero with nobody at fault: _ask_uncertain returns
+        without publishing UncertainResolved when the 5 s window hears
+        nothing, when the transcript is refused, or when there is no mic,
+        so the card sits there waiting for a click that may never come.
+        """
+        with self._uncertain_lock:
+            return len(getattr(self, "_pending_uncertain", ()) or ())
 
     def _claim_uncertain(self, yes: bool) -> bool:
         """Commander hook: a spoken "that was for you" / "that wasn't for

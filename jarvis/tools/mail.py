@@ -150,7 +150,6 @@ def mail_accounts(cfg) -> list[dict]:
     """
     raw = _cfg_get(cfg, "gmail.accounts", None)
     default_host = _cfg_get(cfg, "gmail.imap_host", "") or DEFAULT_IMAP_HOST
-    default_smtp = str(_cfg_get(cfg, "gmail.smtp_host", "") or "").strip()
     if not isinstance(raw, (list, tuple)) or not raw:
         single = gmail_settings(cfg)
         if single is None:
@@ -174,8 +173,14 @@ def mail_accounts(cfg) -> list[dict]:
             "password": password,
             "host": str(entry.get("imap_host") or default_host).strip(),
             # Per-account submission host and display name, for the SEND
-            # path. Blank smtp_host is derived from the IMAP host below.
-            "smtp_host": str(entry.get("smtp_host") or default_smtp).strip(),
+            # path. Blank smtp_host is derived from THIS account's IMAP
+            # host by smtp_host() below -- deliberately NOT from the
+            # top-level gmail.smtp_host: that key belongs to the legacy
+            # single mailbox, and AssistantConfig.load() wrote it into
+            # his file as "smtp.gmail.com" the day it entered DEFAULTS,
+            # so inheriting it here submitted every non-Gmail account to
+            # Gmail's server with the wrong credentials (F22, 09-03).
+            "smtp_host": str(entry.get("smtp_host") or "").strip(),
             "from_name": str(entry.get("from_name") or "").strip(),
         })
     return out
