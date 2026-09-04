@@ -5434,20 +5434,42 @@ _SEND_NOT_RX = re.compile(
 _SEND_PRONOUNS = frozenset(("her", "him", "them", "it", "you", "me", "us",
                             "that", "this", "herself", "himself",
                             "themselves", "myself", "yourself"))
-_SEND_TO_PRON = r"send (?:it|that|this) (?:to|over to|on to) (?:her|him|them|me|us|you)"
+# What a pronoun or demonstrative after "to" stands for is the recipient he
+# has JUST been read -- with or without a noun hung on it: "to her", "to her
+# address", "to that address", "to the same one", "that person", "her
+# inbox". Every one of these is the draft said back; none of them names
+# anyone new. Only a NAME or an ADDRESS after "to" corrects. (The second
+# review, 09-04: "yes send it to her address" had the possessive stripped
+# BEFORE the pronoun check, so "address" became the corrected recipient and
+# he heard "I've no address for address, sir".)
+_SEND_REF_NOUN = r"(?:e-?mail address|e-?mail|address|inbox|mailbox|one|person)"
+_SEND_REF = (r"(?:(?:her|his|their|its|that|this|the same|the usual|the)\s+"
+             + _SEND_REF_NOUN +
+             r"|her|him|them|me|us|you|it|that|this|the same|same)")
+_SEND_REF_RX = re.compile(r"^" + _SEND_REF + r"$", re.I)
+_SEND_TO_REF = (r"(?:send (?:it|that|this) )?(?:to|over to|on to) " + _SEND_REF)
+# "from the same account" is the account he was just read, not a new one.
+_SEND_FROM_SAME = r"(?:send (?:it|that|this) )?from (?:the |my |that |this )?(?:same|usual|that|this) account"
+_SEND_SAME_ACCT = frozenset(("same", "that", "this", "usual", "that same",
+                             "this same", "the same"))
 _SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|and|"
-              r"it|that|send it|send that|go ahead|do it|" + _SEND_TO_PRON +
+              r"send it|send that|go ahead|do it|" + _SEND_TO_REF + r"|"
+              + _SEND_FROM_SAME + r"|" + _SEND_REF +
               r"))*[?.!]*$")
 # "ok" / "okay" / "sure" / "alright" are deliberately ABSENT. They are the
 # words a man says while still reading the read-back, and this is the one
 # question in the app where "probably yes" must not be enough. They are
 # caught by _SEND_MAYBE_RX below and asked again rather than dropped in
 # silence -- silence is how he learns the feature does not work.
+# The literal echo of the read-back -- "send it to her", "send it to him
+# please", "please send it to her" -- is a yes in its own right, not only
+# a tail on one (the second review, 09-04). "please" may lead it.
 _SEND_YES_RX = re.compile(
-    r"^(?:jarvis[,\s]+)?"
+    r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?"
     r"(?:yes|yeah|yep|yup|aye|affirmative|correct|confirmed?|certainly|"
     r"absolutely|definitely|of course|go ahead|do it|send it|send that|"
-    r"send it now|please do|that'?s right|fire away|off you go)"
+    r"send it now|please do|that'?s right|fire away|off you go|"
+    r"send (?:it|that|this) (?:to|over to|on to) " + _SEND_REF + r")"
     + _SEND_TAIL, re.I)
 _SEND_NO_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:no[,\s]+)?"
@@ -5476,7 +5498,8 @@ _SEND_CORRECT_TO_RX = re.compile(
     r"\b(?:send|e-?mail|mail|forward|shoot|fire|it|that|this|one|file|"
     r"but|rather|instead|no|yes|yeah|yep|okay|ok|sure|actually)[,\s]+"
     r"(?:it\s+|that\s+|this\s+)?to\s+(?P<who>[^,.!?]+?)"
-    r"(?:\s+(?:instead|rather|please|thanks|thank you|sir))*[.!?,]*$", re.I)
+    r"(?:\s+(?:instead|rather|please|thanks|thank you|sir|jarvis|now|then))*"
+    r"[.!?,]*$", re.I)
 _SEND_CORRECT_ACCT_RX = re.compile(
     r"\b(?:from|using|via|use|with|out of|off)\s+(?:my\s+|the\s+)?"
     r"(?P<acct>[\w'\-]+(?:\s+[\w'\-]+)?)\s+(?:account|mailbox|e-?mail|"
@@ -5497,6 +5520,11 @@ def _send_correction(said: str) -> Optional[tuple[str, str]]:
     if am:
         acct = am.group("acct").strip()
         t_wo = t[:am.start()] + t[am.end():]
+        # "from the same account" / "from that account" is the account he
+        # was just read, not a new one: a confirmation, never "I've no
+        # same account, sir".
+        if acct.lower() in _SEND_SAME_ACCT:
+            acct = ""
     else:
         t_wo = t
     addr = outbox.parse_address(t_wo)
@@ -5506,15 +5534,24 @@ def _send_correction(said: str) -> Optional[tuple[str, str]]:
         tm = _SEND_CORRECT_TO_RX.search(t_wo)
         if tm:
             who = tm.group("who").strip()
-            # "to her work address" names an address of a person, not a
-            # person: hand it over as the possessive-less form the people
-            # book might know, and let the address question do the rest.
-            who = re.sub(r"^(?:her|his|their)\s+", "", who, flags=re.I)
-            # A bare pronoun -- "yes, send it to her" -- is the person he
-            # was just read, not a new one (09-04). It is a confirmation,
-            # never a correction, and never "I've no address for her".
-            if who.lower() in _SEND_PRONOUNS:
+            # A pronoun or demonstrative, with or without a noun on it --
+            # "to her", "to her address", "to that address", "to the same
+            # one", "to that person" -- is the person he was just read,
+            # not a new one (09-04). It is a confirmation, never a
+            # correction, and never "I've no address for her / address".
+            # This is tested BEFORE the possessive is stripped: stripping
+            # first is how "her address" became a recipient called
+            # "address" (the second review).
+            if _SEND_REF_RX.match(who):
                 who = ""
+            else:
+                # "to her work address" names an address of a person, not
+                # a person: hand it over as the possessive-less form the
+                # people book might know, and let the address question do
+                # the rest.
+                who = re.sub(r"^(?:her|his|their)\s+", "", who, flags=re.I)
+                if who.lower() in _SEND_PRONOUNS:
+                    who = ""
     if not who and not acct:
         return None
     return who, acct

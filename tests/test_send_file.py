@@ -1610,3 +1610,123 @@ def test_a_re_asked_account_does_not_spend_the_read_back(cmd_no_default):
     assert res.reply.startswith("I'd rather be certain") and cmd._pending_send is not None
     cmd.handle("yes", source="voice")
     assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+# ==================================================================
+# 20. The second review (09-04): a pronoun or demonstrative after "to",
+#     with or without a noun on it, is the draft said back -- a yes.
+#     Only a NAME or an ADDRESS after "to" corrects.
+# ==================================================================
+SEND_CORPUS = [
+    # the literal echo of the read-back, on its own
+    "send it to her", "send it to him please", "please send it to her",
+    "jarvis, send it to her", "send it to her, jarvis", "send that to her now",
+    "send it over to her", "Send it to her.",
+    # a yes that names the recipient by pronoun
+    "yes, send it to her", "yes send it to him please", "yeah, send it to him",
+    "yes please send it to her", "yes, send it to them", "yes, to her",
+    "yes go ahead and send it to her", "Yes. Send it to her.",
+    "correct, send it to her", "yes, send it to her, thanks",
+    # the possessive plus a noun that is still the same person
+    "yes send it to her address", "yes, send it to her email",
+    "yes, send it to her inbox", "yes send it to her email address",
+    "yes, send it to his inbox", "yes send it to their address",
+    "yes to her address please",
+    # the demonstrative forms the spec listed
+    "yes, to that address", "yes to this address", "yes, send it to that address",
+    "yes, send it to the same address", "yes, the same address", "yes, that one",
+    "yes, that person", "yes to that person", "yes send it to the same one",
+    "yes, to the same person", "yep send it to that address",
+    # the account he was just read is not a new account either
+    "yes, from the same account", "yes, send it from that account",
+]
+
+
+@pytest.mark.parametrize("said", SEND_CORPUS)
+def test_a_confirmation_shaped_answer_sends_to_the_pending_address(cmd, said):
+    """Read-back to Heather. "yes send it to her address" stripped the
+    possessive BEFORE the pronoun check, so "address" became a corrected
+    recipient and he heard "I've no address for address, sir". "send it
+    to her" -- the read-back's own words -- was in the yes TAIL only and
+    was not a yes on its own. Every sentence here is the draft said back,
+    and the draft goes to the address he was read."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled, (said, res)
+    assert "no address" not in res.reply.lower(), (said, res.reply)
+    assert "rather be certain" not in res.reply, (said, res.reply)
+    assert FakeSMTP.made, (said, res.reply)
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+    assert cmd._pending_send is None and cmd._pending_sendask is None
+
+
+@pytest.mark.parametrize("said", SEND_CORPUS)
+def test_a_confirmation_shaped_answer_is_never_a_correction(said):
+    from jarvis.commander import _send_correction
+    assert _send_correction(said) is None, said
+
+
+NOT_SEND_CORPUS = [
+    # a NAME or an ADDRESS after "to" is a correction, never a yes
+    "yes, send it to Dana", "yes send it to dana@example.com",
+    "yes, but to her work address instead", "send it to Dana",
+    # an account by name is a correction too
+    "yes, but from my work account",
+    # a second command riding on the yes is not a yes
+    "yes, and turn the lights off", "send it to her and turn the lights off",
+    # no, in every shape, including the contradictory one
+    "no", "no, don't send it to her", "no, send it to her", "not to her",
+    # the fillers stay vague: one re-ask, nothing sent
+    "okay send it to her", "sure", "okay",
+    # not an answer at all
+    "Yeah, so you should be able to look that up.", "what's the weather",
+    "send it to her tomorrow",
+]
+
+
+@pytest.mark.parametrize("said", NOT_SEND_CORPUS)
+def test_a_name_a_command_or_a_no_never_sends_to_the_pending_address(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, said
+
+
+@pytest.mark.parametrize("said", [
+    "yes, send it to Dana", "yes send it to dana@example.com",
+    "yes, but to her work address instead", "yes, but from my work account",
+])
+def test_a_name_an_address_or_an_account_still_corrects(said):
+    """What must keep holding: a correction is still a correction."""
+    from jarvis.commander import _send_correction
+    fix = _send_correction(said)
+    assert fix is not None and fix != ("", ""), (said, fix)
+
+
+@pytest.mark.parametrize("said", [
+    "yes, send it to Dana", "yes, and turn the lights off", "okay", "sure",
+    "okay send it to her", "send it to her tomorrow",
+])
+def test_the_guards_are_not_a_yes(said):
+    assert parse_send_answer(said) is not True, said
+
+
+def test_no_is_tested_before_yes_on_the_contradictory_sentence():
+    assert parse_send_answer("no, send it to her") is False
+
+
+def test_the_fillers_get_one_re_ask_with_a_pronoun_on_them(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("okay send it to her", source="typed")
+    assert res.reply.startswith("I'd rather be certain") and cmd._pending_send is not None
+    assert not FakeSMTP.made
+    cmd.handle("send it to her", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+def test_her_address_is_not_a_recipient_called_address(cmd):
+    """The review's own sentence, end to end."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("yes send it to her address", source="typed")
+    assert "address for address" not in res.reply, res.reply
+    assert res.ack and cmd.spoken == ["Sent to Heather, sir."], (res.reply, cmd.spoken)
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
