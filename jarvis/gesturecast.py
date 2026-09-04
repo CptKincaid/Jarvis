@@ -69,6 +69,7 @@ from collections import deque
 from typing import Any, Callable, Optional
 
 from jarvis import cast as cast_mod
+from jarvis import identity as identity_mod
 from jarvis.cast import (
     NOTHING_LINE,
     ROUTABLE_DIRECTIONS,
@@ -435,6 +436,10 @@ class GestureCast:
         return cast(sink, subject, speak=speak,
                     propose=self._propose_with(speak),
                     capture=self._capture, identity=self._identity(),
+                    # HIS label, from HIS config -- jarvis/identity.py's one
+                    # derivation. Passed rather than looked up inside cast()
+                    # so a courier under test says who it means.
+                    owner=identity_mod.owner_label(self._get),
                     fallback=self.registry["board"])
 
     def _record(self, status: str, sink, subject: Optional[CastSubject],

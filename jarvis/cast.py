@@ -111,6 +111,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Optional, Protocol
 
+from jarvis import identity as identity_mod
 from jarvis.logs import get_logger
 
 log = get_logger("cast")
@@ -162,8 +163,12 @@ DEFAULT_SINK = "board"
 # vertical word is ignored, not honoured.
 ROUTABLE_DIRECTIONS = ("left", "right")
 
-# The enrolled name eye.resolve_wake accepts. Empty = no opinion.
-OWNER_IDENTITY = "hunter"
+# The enrolled name eye.resolve_wake accepts used to be a bare literal here.
+# It is jarvis/identity.owner_label() now -- THE one derivation, read from
+# HIS CONFIG and never from a gallery. There were three copies of this
+# string (this one, commander._face_owner and face_enrol.owner_label), each
+# free to drift from the other two. A cast that vetoed on a stale copy would
+# have refused him with a log line saying it was somebody else.
 
 # Which tone each outcome plays. Four DIFFERENT names on purpose:
 # earcons.py drops a repeat of the SAME tone inside its 4 s cooldown, so a
@@ -1070,12 +1075,17 @@ def teach_sink(direction: str, sink_name: str, *, set_option: Callable,
 
 
 # --------------------------------------------------------------- casting
-def _identity_opinion(identity) -> str:
-    """'' no opinion | 'owner' | 'other'."""
+def _identity_opinion(identity, owner: str = "") -> str:
+    """'' no opinion | 'owner' | 'other'.
+
+    An empty ``identity`` is NO OPINION and never a veto: a dark camera, the
+    night curfew or a back turned must degrade to exactly today's behaviour.
+    """
     name = str(identity or "").strip().lower()
     if not name:
         return ""
-    return "owner" if name == OWNER_IDENTITY else "other"
+    return "owner" if name == (owner or identity_mod.owner_label(None)) \
+        else "other"
 
 
 def _deliver(sink, subject: CastSubject) -> CastResult:
@@ -1111,7 +1121,8 @@ def earcon_for(status: str) -> str:
 def cast(sink, subject: CastSubject, *, speak: Callable[[str], None],
          propose: Optional[Callable[[Callable[[], CastResult], str], None]] = None,
          capture: Optional[Callable[[], Optional[dict]]] = None,
-         identity: Optional[str] = None, fallback=None) -> str:
+         identity: Optional[str] = None, owner: str = "",
+         fallback=None) -> str:
     """Send ``subject`` to ``sink`` and say what happened.
 
     Returns one word: empty | vetoed | held | landed | proposed | refused.
@@ -1136,8 +1147,9 @@ def cast(sink, subject: CastSubject, *, speak: Callable[[str], None],
     """
     if subject is None or not subject.holdable:
         return "empty"
-    if _identity_opinion(identity) == "other":
-        log.info("cast: vetoed, %r is not %s", identity, OWNER_IDENTITY)
+    owner_name = owner or identity_mod.owner_label(None)
+    if _identity_opinion(identity, owner_name) == "other":
+        log.info("cast: vetoed, %r is not %s", identity, owner_name)
         return "vetoed"
     try:
         needs = bool(sink.needs_readback(subject))
@@ -1149,7 +1161,7 @@ def cast(sink, subject: CastSubject, *, speak: Callable[[str], None],
             res = _deliver(sink, subject)
             return _finish(res, subject, speak, fallback)
         if getattr(sink, "needs_identity", False) and \
-                _identity_opinion(identity) != "owner":
+                _identity_opinion(identity, owner_name) != "owner":
             speak(IDENTITY_LINE)
             return "refused"
         if not callable(propose):

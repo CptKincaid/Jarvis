@@ -261,6 +261,15 @@ class DiscordChannel:
 
         token = cfg_get(cfg, "discord.bot_token", "")
         channel_id = cfg_get(cfg, "discord.channel_id", "")
+        # THE OWNER-GATE SEAM, and nothing is wired to it on purpose.
+        # His ruling, 2026-09-03: "Leave discord be for now." This channel
+        # is dormant (no token, and `discord.user_id` ships empty), and
+        # jarvis/gate.py gates only source="voice" -- an ALLOW-LIST, so
+        # "discord" is exempt by construction rather than by a carve-out.
+        # WHEN he turns it on, `user_id` is the hook: it is the one thing
+        # here that says WHICH person a message came from, so it is what
+        # a Person label in jarvis/identity.py would have to be matched
+        # against. Nothing else in this file identifies anybody.
         user_id = cfg_get(cfg, "discord.user_id", "")
         self._token = "" if is_placeholder(token) else str(token).strip()
         self._channel_id = "" if is_placeholder(channel_id) else str(channel_id).strip()

@@ -152,7 +152,13 @@ def test_a_guest_is_declined_politely_and_not_nagged(monkeypatch, tmp_path):
     a._last_guest_ts = -1e9
     a._on_guest(0.95)
     a._on_guest(0.95)
-    assert a.said == ["I only answer to Hunter, sir."]
+    # 2026-09-03: "I only answer to Hunter, sir." is gone. It named no way
+    # back in -- which was the whole complaint -- and it named HIM to a
+    # stranger besides. One wording now, shared with the owner gate
+    # (jarvis/gate.UNKNOWN_LINE), and it says how to fix the situation.
+    assert a.said == [app_mod.GUEST_LINE]
+    assert "hunter" not in a.said[0].lower()
+    assert "enrol" in a.said[0].lower()
     a._on_guest(0.5)                                     # a weak wake: silence
     assert len(a.said) == 1
 
@@ -175,7 +181,7 @@ def test_a_guest_like_wake_over_music_stays_quiet(monkeypatch, tmp_path, caplog)
     assert "guest-like wake over music, staying quiet" in caplog.text
     playing["on"] = False
     a._on_guest(0.95)                                    # music off: the old path
-    assert a.said == ["I only answer to Hunter, sir."]
+    assert a.said == [app_mod.GUEST_LINE]
 
 
 def test_the_guest_line_survives_a_mixer_that_cannot_say(monkeypatch, tmp_path):
@@ -188,7 +194,7 @@ def test_the_guest_line_survives_a_mixer_that_cannot_say(monkeypatch, tmp_path):
         raise RuntimeError("spotify down")
     a.mixer = SimpleNamespace(music_playing=boom)
     a._on_guest(0.95)
-    assert a.said == ["I only answer to Hunter, sir."]
+    assert a.said == [app_mod.GUEST_LINE]
     assert _app(monkeypatch, state=tmp_path / "b.json")._music_playing() is False
 
 

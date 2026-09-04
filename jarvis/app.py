@@ -70,6 +70,8 @@ from jarvis import debrief as debrief_mod
 from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
 from jarvis import earcons
+from jarvis import gate as gate_mod
+from jarvis import identity as identity_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
 from jarvis import vocab as vocab_mod
@@ -190,7 +192,11 @@ NUDGE_LINE = "Sir?"
 # is not an invitation: the mic is not re-opened, so it must tell him the
 # turn is over and that a wake word is how he retries.
 NOT_CAUGHT_LINE = "I did not catch that, sir. Do try me again."
-GUEST_LINE = "I only answer to {name}, sir."
+# The wake-word refusal, and the gate's, are ONE constant on purpose
+# (jarvis/gate.py). "I only answer to Hunter, sir." named no way back in --
+# that was the whole complaint -- and named him to a stranger besides.
+GUEST_LINE = gate_mod.UNKNOWN_LINE
+GUEST_PHRASE_LINE = gate_mod.UNKNOWN_PHRASE_LINE
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
 # offer").
 #
@@ -1004,6 +1010,11 @@ class JarvisApp:
         phrases += list(selfstate.PREWARM_LINES)
         phrases += list(THINKING_LINES)
         phrases += [SAY_AGAIN_LINE, NUDGE_LINE, NOT_CAUGHT_LINE, self._guest_line]
+        # The owner-gate's fixed lines. An unprewarmed refusal is a
+        # three-second pause, which is indistinguishable from being
+        # ignored -- the very thing this refusal replaces.
+        # KNOWN_SCOPE_LINE is a {name} template and is never prewarmed.
+        phrases += list(gate_mod.PREWARM_LINES)
         phrases += [CONTINUE_PROMPT, "Very good, sir.", "Welcome back, sir.",
                     "I haven't said anything yet, sir.",
                     "The clipboard is empty, sir.",
@@ -2978,13 +2989,91 @@ class JarvisApp:
         # in the app kept them — the UI's tracker is a Tk-thread object).
         self._board_feed = None
         self._board_tasks: dict = {}
+        # Who the owner gate attributed the last turn to, and on which leg.
+        # For the pane and the log: "he was refused" is not a bug report,
+        # "the face leg named Heather while the voice leg abstained" is.
+        self._gate_who = ""
+        self._gate_how = ""
         self._canvas_due_cache = (-1e9, [])   # monotonic; see _last_nudge_ts
         self._room_gpu_cache = (-1e9, None)   # ditto: the ambient GPU reading
         # The ambient slab's one outbound dependency, on a backoff
         self._room_playing_text = ""
         self._room_playing_ts = -1e9
-        name = self.assistant.user_name if self.assistant is not None else "Hunter"
-        self._guest_line = GUEST_LINE.format(name=name)
+        # ---- the owner gate (jarvis/gate.py) ------------------------------
+        # WHO Jarvis answers.  He chose to gate EVERYTHING including ordinary
+        # chat, so the question is asked ONCE, in _process_audio, and the
+        # answer travels with the turn.  It ships in SHADOW (owner.mode):
+        # every verdict logged, nothing refused, until the log says the
+        # verdicts are right.
+        #
+        # Constructed defensively because a gate that cannot be built must
+        # not be able to stop him talking: any failure here leaves
+        # self.gate None and _process_audio admits every turn.
+        self.gate = None
+        try:
+            self.gate = gate_mod.OwnerGate(
+                registry=identity_mod.Registry.load(),
+                get_option=self.get_option,
+                owner=identity_mod.owner_label(self.assistant))
+        except Exception:                          # noqa: BLE001 - never fatal
+            log.exception("owner-gate: could not be built; it is OFF and "
+                          "everyone is being answered")
+        try:
+            # The startup line is its OWN boundary. It reads the speaker and
+            # the gallery to say why a leg is dark, and none of that is worth
+            # losing the gate over -- an earlier version built the two
+            # together and a stubbed app with no `speaker` silently left the
+            # gate switched off.
+            if self.gate is not None:
+                enrolled = getattr(getattr(self, "speaker", None),
+                                   "enrolled", False)
+                log.info("%s", self.gate.startup_line(
+                    voice_ok=bool(CONFIG.speaker_verify and enrolled),
+                    face_ok=False, face_why=self._face_leg_why()))
+        except Exception:                          # noqa: BLE001 - a line only
+            log.exception("owner-gate: the startup line could not be built")
+        # One wording for both refusals, and it changes with the registry:
+        # offering a passphrase that has never been set would be a dead end
+        # of a different shape.
+        self._guest_line = (GUEST_PHRASE_LINE if self._owner_has_phrase()
+                            else GUEST_LINE)
+
+    def _owner_has_phrase(self) -> bool:
+        """Is there a spoken way back in to offer? Never the phrase itself,
+        and never anything derived from it -- only whether one exists."""
+        try:
+            return any(p.phrase_hash for p in self.gate.registry.owners())
+        except Exception:                          # noqa: BLE001 - no registry
+            return False
+
+    def _face_leg_why(self) -> str:
+        """One plain sentence for the startup line saying why the camera
+        cannot name anybody, or "" when it can.
+
+        THE ONE THAT IS ABOUT TO HAPPEN: the face model is being swapped
+        from SFace (128-D) to ArcFace (512-D) on another branch. The stored
+        vectors are not comparable, so his enrolment stops matching and he
+        must re-enrol -- and for as long as that lasts the face leg is
+        unavailable and VOICE CARRIES THE WHOLE THING. It is a width
+        mismatch, which is NO OPINION and never a negative, but he is owed
+        the sentence rather than left to work it out from being refused.
+        """
+        try:
+            from jarvis.facegallery import EMBED_DIM
+            enrolled = [p for p in self.gate.registry.people if p.face]
+            stale = [p for p in enrolled if p.face_dim and
+                     p.face_dim != EMBED_DIM]
+            if stale:
+                return ("the gallery is %d-D and %s was enrolled at %d-D; "
+                        "re-enrol to bring the face leg back"
+                        % (EMBED_DIM, stale[0].label, stale[0].face_dim))
+            if not enrolled:
+                return "no face is enrolled in the registry"
+            if not self.get_option("camera.identity", False):
+                return "camera.identity is off"
+            return "nothing on this tree attaches a camera feed yet"
+        except Exception:                          # noqa: BLE001 - a line only
+            return "the camera could not be asked"
 
     def _after_dispatch(self, text, source, result):
         """Bookkeeping once a command has been handled synchronously."""
@@ -4359,6 +4448,127 @@ class JarvisApp:
         threading.Thread(target=self._process_audio, args=(audio,),
                          daemon=True).start()
 
+    # ------------------------------------------------------- the owner gate
+    def _face_running(self) -> bool:
+        """Is the camera leg MEASURING at all? Not "is he in frame".
+
+        A dark camera, the night curfew, no feed attached and identity
+        switched off are all NO OPINION -- never a vote against him -- and
+        the gate has to be able to tell that apart from a camera that looked
+        and saw somebody else.
+        """
+        feed = getattr(getattr(self, "services", None), "camera_feed", None)
+        if getattr(feed, "eye", None) is None:
+            return False
+        return bool(self.get_option("camera.identity", False))
+
+    def _refuse_politely(self, line: str):
+        """Say a refusal once, under the SAME policy _on_guest already uses.
+
+        One cooldown between them (his complaint was hearing it twice in a
+        minute), silence over music -- a "guest" over a bed is far more often
+        him, scored down -- and silence while Jarvis is speaking, because
+        under barge-in the listener hears his own voice.
+        """
+        if not line or not CONFIG.talkback:
+            return
+        if getattr(getattr(self, "tts", None), "busy", False) is True or \
+                getattr(self, "_tts_active", False):
+            return
+        if self._music_playing():
+            log.info("owner-gate: refusing over music, staying quiet")
+            return
+        now = time.monotonic()
+        if now - self._last_guest_ts < 180.0:
+            return
+        self._last_guest_ts = now
+        self._say(line)
+
+    def _gate_rescue(self, audio, stats, speculative):
+        """A clip the speaker filter dropped: `(audio, stats, result)` to let
+        it through after all, or None to keep today's behaviour.
+
+        THE SPOKEN PASSPHRASE COSTS ONE DECODE, and only here. It arrives as
+        a Whisper transcript, and a rejected clip is never transcribed -- so
+        without this the phrase could never be heard at all. The decode runs
+        only when the gate is actually refusing AND an owner has set a
+        phrase, so an ordinary rejected clip pays nothing.
+
+        NOTHING CARRYING THE PHRASE IS EVER PUBLISHED. On a match the turn
+        ends right here with a spoken acknowledgement and an open mic: the
+        text never reaches the bus, the history, the transcript pane, the
+        turn ledger or commander's own log line, which is where a plaintext
+        secret would otherwise have landed four times over.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return None
+        try:
+            return self._gate_rescue_inner(gate, audio, stats)
+        except Exception:                          # noqa: BLE001 - never fatal
+            log.exception("owner-gate: the rescue failed; the clip is "
+                          "dropped exactly as it was before")
+            return None
+
+    def _gate_rescue_inner(self, gate, audio, stats):
+        face, running = self._eye_identity(), self._face_running()
+        d = gate.judge("voice", "", stats=stats, rejected=True,
+                       face=face, face_running=running)
+        if gate.effective_mode() != gate_mod.MODE_ENFORCE:
+            # SHADOW CHANGES NOTHING, and that has to include the rescues.
+            # A face leg that started answering clips the speaker filter
+            # dropped would be a visible change of behaviour he did not ask
+            # for yet -- and the whole value of shadow is that it is safe to
+            # leave on while the log is read. The verdict is logged inside
+            # judge() either way, which is the point of the mode.
+            if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
+                log.info("owner-gate: shadow -- the %s leg WOULD have "
+                         "rescued this clip for %s", d.how, d.who)
+            return None
+        if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
+            log.info("owner-gate: the %s leg rescued a clip the speaker "
+                     "filter dropped (%s)", d.how, d.who)
+            return audio, stats, self.transcriber.transcribe(audio)
+        if d.admit:
+            return None                # off, shadow or blind: nothing changes
+        if not self._owner_has_phrase():
+            self._refuse_politely(d.line)
+            return None
+        result = self.transcriber.transcribe(audio)
+        second = gate.judge("voice", (getattr(result, "text", "") or "").strip(),
+                            stats=stats, rejected=True, face=face,
+                            face_running=running)
+        if second.admit and second.how == gate_mod.HOW_PHRASE:
+            log.info("owner-gate: the passphrase opened the floor")
+            self._say(gate_mod.PHRASE_OK_LINE)
+            self._followup_after_speech = True
+            return None
+        if second.admit:
+            return audio, stats, result
+        self._refuse_politely(second.line)
+        return None
+
+    def _gate_admits(self, text, stats) -> bool:
+        """The admitted path: attribute the turn, and hold a KNOWN person to
+        what a known person may ask for. It cannot refuse HIM -- the speaker
+        filter has already matched him and this reuses that verdict."""
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return True
+        try:
+            d = gate.judge("voice", text, stats=stats,
+                           face=self._eye_identity(),
+                           face_running=self._face_running())
+        except Exception:                          # noqa: BLE001 - never fatal
+            log.exception("owner-gate: judging failed; the turn stands")
+            return True
+        self._gate_who, self._gate_how = d.who, d.how
+        if d.admit:
+            return True
+        self.turns.abandon("gate:%s" % (d.role or "unknown"))
+        self._refuse_politely(d.line)
+        return False
+
     def _process_audio(self, audio):
         stats = {}
         try:
@@ -4373,13 +4583,24 @@ class JarvisApp:
             else:
                 audio, stats, rejected, result = self._decode_clip(audio)
             if rejected:
-                bus.publish(Transcribed(
-                    text="", accepted=False, reject_reason="speaker",
-                    speaker_score=float(stats.get("best_score", 0.0))
-                    if isinstance(stats, dict) else 0.0,
-                    speculative=spec is not None))
-                self._nudge("speaker")
-                return
+                # THE ONE PLACE THE OWNER GATE CAN RESCUE A TURN. Until now a
+                # clip the speaker filter dropped was silently gone -- which
+                # is the right default and is also a dead end. The gate gets
+                # to say EITHER LEG SUFFICES (the camera may name him when
+                # his voice will not) and to hear the spoken passphrase,
+                # which is his way back in when he is ill, in the dark, or
+                # turned away. Anything else and today's behaviour stands.
+                rescued = self._gate_rescue(audio, stats, spec is not None)
+                if rescued is None:
+                    bus.publish(Transcribed(
+                        text="", accepted=False, reject_reason="speaker",
+                        speaker_score=float(stats.get("best_score", 0.0))
+                        if isinstance(stats, dict) else 0.0,
+                        speculative=spec is not None))
+                    self._nudge("speaker")
+                    return
+                audio, stats, result = rescued
+                rejected = False
             text = result.text.strip()
             # The confidence gate is no longer the last word. It used to
             # fire BEFORE the commander saw a syllable, so a plain "Yes."
@@ -4410,6 +4631,13 @@ class JarvisApp:
                                "looping" if looping else "confidence"),
                 speculative=spec is not None))
             if accepted and text:
+                # The gate, on the admitted path: it attributes the turn and
+                # holds a KNOWN person to what a known person may ask for.
+                # It cannot refuse HIM here -- the speaker filter has already
+                # matched him, and this reuses that verdict rather than
+                # taking one of its own.
+                if not self._gate_admits(text, stats):
+                    return
                 self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
                 bus.publish(UserUtterance(text=text, source="voice"))

@@ -83,6 +83,7 @@ from jarvis import arc as arc_mod
 from jarvis import aside as aside_mod
 from jarvis import board as board_mod
 from jarvis import cast as cast_mod
+from jarvis import identity as identity_mod
 from jarvis import dialogue as dialogue_mod
 from jarvis import faults as faults_mod
 from jarvis import lecture as lecture_mod
@@ -6722,20 +6723,14 @@ _FACE_GALLERY_RX = re.compile(
 def _face_owner(c) -> str:
     """His label, from HIS config -- never from the gallery.
 
-    This is where the ruling is anchored on this side too: the set of
-    enrolled names may grow without the set of privileged names growing by
-    one, because "owner" is a config value and a recognised face cannot
-    write the config."""
-    cfg = c._svc("assistant")
-    name = ""
-    if cfg is not None:
-        try:
-            name = str(cfg.get("user.name", "") or "")
-        except Exception:  # noqa: BLE001 - a config that cannot say is not
-            log.debug("face: could not read user.name", exc_info=True)
-    name = name.strip().lower()
-    keep = "".join(ch for ch in name if ch.isalnum() or ch in "-_")
-    return keep or "hunter"
+    A DELEGATE now, and that is the point. This used to derive the label
+    itself, which made it the second of three independent copies of the same
+    string (jarvis/cast.py's literal and scripts/face_enrol.owner_label were
+    the others). The ruling it anchors is unchanged: the set of ENROLLED
+    names may grow without the set of PRIVILEGED names growing by one,
+    because "owner" is a config value and a recognised face cannot write the
+    config. It is anchored in jarvis/identity.owner_label now, once."""
+    return identity_mod.owner_label(c._svc("assistant"))
 
 
 def _face_gallery(c):
