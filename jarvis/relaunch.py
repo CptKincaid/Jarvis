@@ -37,7 +37,9 @@ is overwritten, which is the case the helper waits for.
 """
 from __future__ import annotations
 
+import errno
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -85,3 +87,84 @@ def spawn_relauncher(old_pid: int, cmd: list[str], cwd, env: dict, log_path,
     finally:
         os.close(fd)
     return int(proc.pid)
+
+
+# --------------------------------------------------------- helper side
+def _read_cmdline(pid: int) -> str:
+    with open(f"/proc/{int(pid)}/cmdline", "rb") as fh:
+        return fh.read().decode("utf-8", "replace")
+
+
+def process_alive(pid: int, kill=os.kill, read_cmdline=_read_cmdline,
+                  marker: str = APP_MODULE) -> bool:
+    """Is the OLD JARVIS still there? False on ESRCH, and False when the
+    pid now belongs to something whose command line does not mention
+    ``jarvis.app`` (the kernel recycles pids; waiting on a stranger would
+    hold the relaunch until that stranger exits). An unreadable or EMPTY
+    cmdline (a zombie, a process mid-exit) is NOT evidence of a stranger:
+    the next poll settles it."""
+    try:
+        kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass                      # exists, owned by someone else: alive
+    except OSError as exc:
+        if getattr(exc, "errno", None) == errno.ESRCH:
+            return False
+    try:
+        cmd = read_cmdline(pid)
+    except OSError:
+        return True
+    if not cmd:
+        return True
+    return marker in cmd.replace("\x00", " ")
+
+
+def _send(kill, pid: int, sig: int, log) -> None:
+    try:
+        kill(pid, sig)
+    except ProcessLookupError:
+        log(f"pid {pid} was gone before {signal.Signals(sig).name} landed")
+    except OSError as exc:
+        log(f"{signal.Signals(sig).name} to pid {pid} failed: {exc}")
+
+
+def wait_for_exit(pid: int, grace_s: float, *, alive, kill, sleep, clock,
+                  log, poll_s: float = 0.25, term_wait_s: float = 5.0,
+                  kill_wait_s: float = 30.0) -> str:
+    """Block until ``pid`` is gone. Patience first (``grace_s``), then
+    SIGTERM, then SIGKILL ``term_wait_s`` later, then a bounded wait.
+    Returns one of "exited" (left on its own), "terminated", "killed" or
+    "stuck" (survived SIGKILL: a D-state process; the launch would only be
+    swallowed by the pid-file guard, so the caller gives up instead)."""
+    pid = int(pid)
+    t0 = clock()
+    log(f"waiting for pid {pid} to exit (grace {grace_s:g}s, poll {poll_s:g}s)")
+    while alive(pid):
+        if clock() - t0 >= grace_s:
+            break
+        sleep(poll_s)
+    else:
+        log(f"pid {pid} gone after {clock() - t0:.2f}s")
+        return "exited"
+    log(f"pid {pid} still alive after {grace_s:g}s; sending SIGTERM")
+    _send(kill, pid, signal.SIGTERM, log)
+    t1 = clock()
+    while alive(pid):
+        if clock() - t1 >= term_wait_s:
+            break
+        sleep(poll_s)
+    else:
+        log(f"pid {pid} gone {clock() - t1:.2f}s after SIGTERM")
+        return "terminated"
+    log(f"pid {pid} still alive {term_wait_s:g}s after SIGTERM; sending SIGKILL")
+    _send(kill, pid, signal.SIGKILL, log)
+    t2 = clock()
+    while alive(pid):
+        if clock() - t2 >= kill_wait_s:
+            log(f"pid {pid} still alive {kill_wait_s:g}s after SIGKILL; giving up")
+            return "stuck"
+        sleep(poll_s)
+    log(f"pid {pid} gone {clock() - t2:.2f}s after SIGKILL")
+    return "killed"

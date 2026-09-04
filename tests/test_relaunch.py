@@ -92,3 +92,158 @@ def test_spawn_relauncher_grace_is_carried_as_the_helper_saw_it(tmp_path):
                               popen=popen)
     argv, _ = popen.calls[0]
     assert argv[argv.index("--grace") + 1] == "7.5"
+
+
+# ------------------------------------------------- the helper's fake world
+class FakeWorld:
+    """A process table + clock the helper runs against. ``dies_at`` is the
+    clock reading after which the old process is gone on its own; a
+    signal it honours kills it at the next poll. ``reused_at`` hands the
+    same pid to an UNRELATED command from that moment on (the kernel
+    recycles pids; the helper must not wait on a stranger)."""
+
+    def __init__(self, pid, dies_at=None, reused_at=None,
+                 honours=("TERM", "KILL"), cmdline="python -m jarvis.app"):
+        self.pid = pid
+        self.dies_at = dies_at
+        self.reused_at = reused_at
+        self.honours = set(honours)
+        self.cmdline = cmdline
+        self.t = 0.0
+        self.signals: list[tuple[float, int, str]] = []
+        self.sleeps: list[float] = []
+        self.dead_at = None
+
+    # seams ------------------------------------------------------------
+    def clock(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps.append(s)
+        self.t += s
+
+    def _exists(self, pid):
+        if pid != self.pid:
+            return False
+        if self.dead_at is not None and self.t >= self.dead_at:
+            return False
+        if self.dies_at is not None and self.t >= self.dies_at:
+            return False
+        return True
+
+    def kill(self, pid, sig):
+        import signal as _s
+        name = "NULL" if sig == 0 else _s.Signals(sig).name.replace("SIG", "")
+        if not self._exists(pid) and not self._reused(pid):
+            raise ProcessLookupError(pid)
+        self.signals.append((self.t, pid, name))
+        if name in self.honours and self._exists(pid):
+            self.dead_at = self.t + 0.25       # dies before the next poll
+        if sig == 0:
+            return None
+
+    def _reused(self, pid):
+        return pid == self.pid and self.reused_at is not None and \
+            self.t >= self.reused_at
+
+    def read_cmdline(self, pid):
+        if self._reused(pid):
+            return "sleep 100000"
+        if self._exists(pid):
+            return self.cmdline
+        raise ProcessLookupError(pid)
+
+    def alive(self, pid):
+        return relaunch.process_alive(pid, kill=self.kill,
+                                      read_cmdline=self.read_cmdline)
+
+
+# ---------------------------------------------------------- process_alive
+def test_process_alive_is_false_once_the_kernel_says_esrch():
+    def kill(pid, sig):
+        raise ProcessLookupError(pid)
+    assert relaunch.process_alive(5, kill=kill,
+                                  read_cmdline=lambda p: "x") is False
+
+
+def test_process_alive_treats_a_reused_pid_as_gone():
+    """The pid-reuse guard: kill(pid, 0) succeeds for whatever now owns the
+    number, so the cmdline must still say jarvis.app."""
+    alive = relaunch.process_alive(
+        5, kill=lambda p, s: None,
+        read_cmdline=lambda p: "/usr/bin/sleep\x00100000\x00")
+    assert alive is False
+    assert relaunch.process_alive(
+        5, kill=lambda p, s: None,
+        read_cmdline=lambda p: "/venv/bin/python\x00-m\x00jarvis.app\x00") is True
+
+
+def test_process_alive_stays_true_when_proc_is_unreadable_but_kill_works():
+    """/proc/<pid>/cmdline can be empty for a zombie or racing exit; a
+    read error is not evidence the process is a stranger."""
+    def read_cmdline(p):
+        raise OSError("no /proc here")
+    assert relaunch.process_alive(5, kill=lambda p, s: None,
+                                  read_cmdline=read_cmdline) is True
+
+
+def test_process_alive_true_for_a_zombie_with_an_empty_cmdline():
+    assert relaunch.process_alive(5, kill=lambda p, s: None,
+                                  read_cmdline=lambda p: "") is True
+
+
+# ---------------------------------------------------------- wait_for_exit
+def _wait(world, grace_s=20.0, **kw):
+    lines = []
+    how = relaunch.wait_for_exit(world.pid, grace_s, alive=world.alive,
+                                 kill=world.kill, sleep=world.sleep,
+                                 clock=world.clock, log=lines.append, **kw)
+    return how, lines
+
+
+def test_a_process_that_quits_on_its_own_is_never_signalled():
+    world = FakeWorld(pid=100, dies_at=1.4)
+    how, lines = _wait(world)
+    assert how == "exited"
+    assert [s for s in world.signals if s[2] != "NULL"] == []
+    # polled every 0.25 s, not spun
+    assert world.sleeps and all(s == 0.25 for s in world.sleeps)
+    assert 1.25 <= world.t <= 1.75
+    assert any("gone" in ln for ln in lines)
+
+
+def test_a_process_that_ignores_the_grace_gets_term_then_kill():
+    world = FakeWorld(pid=100, honours=("KILL",))     # TERM is ignored
+    how, lines = _wait(world, grace_s=20.0)
+    named = [(t, s) for t, p, s in world.signals if s != "NULL"]
+    assert named[0][1] == "TERM" and 20.0 <= named[0][0] < 20.5
+    assert named[1][1] == "KILL" and 25.0 <= named[1][0] < 25.5
+    assert how == "killed"
+    assert any("SIGTERM" in ln for ln in lines) and \
+        any("SIGKILL" in ln for ln in lines)
+
+
+def test_a_process_that_honours_term_is_never_killed():
+    world = FakeWorld(pid=100, honours=("TERM", "KILL"))
+    how, _ = _wait(world, grace_s=2.0)
+    named = [s for _, _, s in world.signals if s != "NULL"]
+    assert named == ["TERM"]
+    assert how == "terminated"
+
+
+def test_a_reused_pid_counts_as_gone_and_the_stranger_is_not_signalled():
+    """The old Jarvis died at 0.9 s and the kernel handed pid 100 to a
+    `sleep`; the helper must launch, and must not SIGTERM the sleep."""
+    world = FakeWorld(pid=100, dies_at=0.9, reused_at=0.9)
+    how, _ = _wait(world, grace_s=1.0)
+    assert how == "exited"
+    assert [s for _, _, s in world.signals if s != "NULL"] == []
+    assert world.t < 1.5
+
+
+def test_a_process_that_survives_sigkill_is_given_up_on_not_waited_forever():
+    world = FakeWorld(pid=100, honours=())            # D-state: nothing lands
+    how, lines = _wait(world, grace_s=1.0, kill_wait_s=3.0)
+    assert how == "stuck"
+    assert world.t < 1.0 + 5.0 + 3.0 + 1.0
+    assert any("still alive" in ln for ln in lines)
