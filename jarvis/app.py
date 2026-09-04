@@ -5888,11 +5888,24 @@ class JarvisApp:
         # his first turn, and the prewarm and gc.freeze below land ~0.85 s
         # later because of it. The hotword is already listening by now
         # (start_background runs before start_models), so warmup() gives way
-        # to a real turn rather than making it wait -- see its docstring.
-        try:
-            self.transcriber.warmup()
-        except Exception:
-            log.exception("whisper warm-up failed")
+        # to a decode already in flight, and a turn that lands INSIDE the
+        # warm-up waits for the rest of it -- at most one ~0.85 s silent
+        # decode, then decodes warm (its docstring has the real bound). The
+        # one ordering the transcriber cannot see from inside is a capture
+        # already open when this line is reached: its decode is seconds
+        # away and would only queue behind the throwaway one, so the
+        # warm-up is skipped and that turn pays the cold decode it would
+        # have paid anyway, minus the wait (F49).
+        rec = getattr(self, "recorder", None)
+        busy = getattr(self, "_audio_busy", None)
+        if getattr(rec, "recording", False) or (busy is not None
+                                                and busy.is_set()):
+            log.info("whisper warm-up skipped: a capture is in flight")
+        else:
+            try:
+                self.transcriber.warmup()
+            except Exception:
+                log.exception("whisper warm-up failed")
         # Honest failure for the speakers: with only a dummy/null sink the
         # playback chain "succeeds" into silence (seen on this machine with
         # no HDMI audio device attached).

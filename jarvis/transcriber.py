@@ -623,14 +623,27 @@ class Transcriber:
         0.65 s it removes is the only part of the ledger the USER is sitting
         through.
 
-        IT MUST NOT BECOME THE THING A TURN WAITS ON. The mic is already
-        live when this runs: app.main() calls start_background() (which
-        starts the hotword) before when_cycle_live(start_models), and this
-        is the last step of _load_models. transcribe() and partial() take
-        the same lock. So the warm-up gives way twice -- it does nothing if
-        a real decode already ran, and it takes the lock non-blocking. Seen
-        live: jarvis.log.1 has "20:56:40.277 Model loaded on GPU fp16" and a
-        decode at 20:56:42.395, right inside that window.
+        WHAT A TURN CAN WAIT ON IT, honestly (F49, 2026-09-03; the first
+        cut of this docstring claimed "never"). The mic is already live
+        when this runs: app.main() calls start_background() (which starts
+        the hotword) before when_cycle_live(start_models), and this is the
+        last step of _load_models. transcribe() and partial() take the
+        same lock, BLOCKING. So the warm-up gives way in three of the four
+        orderings -- it does nothing if a real decode already ran, it
+        takes the lock non-blocking so a decode in flight is never made to
+        wait, and app._load_models skips it when a capture is already in
+        flight (recorder.recording / _audio_busy) because that capture's
+        decode is seconds away. The fourth ordering is his word landing
+        INSIDE the warm-up decode: the capture ends while this holds the
+        lock, and transcribe() waits for the rest of it. That wait is
+        bounded by one 0.5 s silent decode, ~0.85 s measured (0.838 s
+        mean, 0.885 max above), and the decode that follows is then warm
+        (~0.27 s): a first turn of at most ~1.1 s against 0.92 s cold, and
+        _log_slow_decode attributes the difference to lock wait. A whisper
+        decode cannot be abandoned mid-kernel, so that bound is the real
+        guarantee, not zero. Seen live: jarvis.log.1 has "20:56:40.277
+        Model loaded on GPU fp16" and a decode at 20:56:42.395, right
+        inside that window.
 
         Silence, never microphone audio, and NOT through transcribe(): that
         would log "Transcribed: 'Thank you.'" -- whisper's stock
