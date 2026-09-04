@@ -70,7 +70,7 @@ def script_path() -> str:
 
 def command_line(label: str, owner: str = "hunter",
                  poses: Sequence[str] = (), delete: bool = False,
-                 append: bool = False,
+                 append: bool = False, plan: str = "",
                  python: Optional[str] = None,
                  script: Optional[str] = None) -> str:
     """The exact shell command, quoted so a pose with spaces survives it.
@@ -83,7 +83,12 @@ def command_line(label: str, owner: str = "hunter",
     be recognised" is additive by intent, and a plain run REPLACES the pool
     -- so a two-pose command without it captures six takes over an existing
     thirteen, fails the eight-sample floor, saves nothing, and costs him the
-    minute for a refusal he could not have predicted."""
+    minute for a refusal he could not have predicted.
+
+    ``plan`` is the script's --plan when the named takes need the five
+    stations alongside them ("full"); "" leaves the script's default. It
+    goes BEFORE the poses, because the pose is the last word on the line
+    and a test pins that."""
     out = [shlex.quote(python or sys.executable),
            shlex.quote(script or script_path())]
     if delete:
@@ -99,6 +104,8 @@ def command_line(label: str, owner: str = "hunter",
         out += ["--label", shlex.quote(label)]
     if append and not delete:
         out.append("--append")
+    if plan and not delete:
+        out += ["--plan", shlex.quote(str(plan))]
     for pose in poses:
         note = clean_note(pose)
         if note:
@@ -206,10 +213,18 @@ def _clip(text: str, clipboard: Optional[Callable[[str], bool]]) -> bool:
 # clipboard does not have (see to_clipboard). "It's in the transcript" is the
 # only part of this that is a guarantee, so it leads in both branches -- the
 # clipboard is named second, as the convenience it is.
+#
+# AND IT IS SHORT ON PURPOSE. This line is the tail of every hand-over, and
+# jarvis/tts.py cuts speech at MAX_SPEAK_LENGTH (500) on the last full stop
+# before the limit. The F16 reply -- his live 13-take, no-angle gallery plus
+# one named pose -- measured 585 characters with the earlier 192-character
+# version of this line, and the TTS spoke 405 of them: the sentence saying
+# WHY the run was stopped and this line saying WHERE the command is were
+# the part that went. tests/test_faceenrol_notes.py pins that reply under
+# the cut with margin; this file does not import the engine to format text.
 CLIP_OK_LINE = ("The command is in the transcript, sir, and I've copied it "
-                "to your clipboard as well - though anything else that "
-                "copies will take it from me, so the transcript is the one "
-                "to trust.")
+                "to your clipboard too - anything else that copies will "
+                "take it from me.")
 CLIP_FAILED_LINE = ("The command is in the transcript, sir - the clipboard "
                     "wouldn't take it, so copy it from there.")
 
@@ -266,9 +281,39 @@ def enrol_answer(gallery, label: str, owner: str = "hunter",
     # underneath.
     plan, why = fe.choose_plan([], poses=poses)
     add = bool(poses) and bool(takes)
-    command = command_line(label, owner=owner, poses=poses, append=add)
+    # THE COMMAND HANDED OVER HAS TO BE ONE THAT CAN PASS. A named take is
+    # one station of three, and ``judge_gallery`` wants eight in the pool
+    # and two angles in each band: on a box with no gallery that is a
+    # guaranteed [FAIL] samples after the consent step and the minute
+    # (F34), and on his live generation -- 13 takes with no recorded angle
+    # -- an --append of one pose can never reach the spread (F16). Both are
+    # counting problems, ``plan_shortfalls`` counts them, and when the
+    # named take alone falls short the five stations go with it
+    # (--plan full --pose ...). With real coverage stored, one more way to
+    # be recognised is still one station.
+    kept = takes if add else []
+    full = bool(poses) and bool(fe.plan_shortfalls(kept, plan))
+    if full:
+        plan, why = fe.choose_plan([], poses=poses, mode="full")
+    command = command_line(label, owner=owner, poses=poses, append=add,
+                           plan="full" if full else "")
     if add:
         why = "%s, added to the %d already stored" % (why, len(takes))
+    cov = fe.coverage(takes)
+    if full and not takes:
+        why += (" - a first enrolment has to clear the %d-take floor on "
+                "its own, so the five stations come with it"
+                % fe.MIN_SAMPLES)
+    elif full and not cov["recorded"]:
+        # F16 exactly: every stored take is angle-less. ONE sentence says
+        # so and says what follows from it; the coverage tail below is
+        # skipped for this case because it would say the same thing again,
+        # and the repeat is what pushed the spoken reply past the TTS cut.
+        why += (" - none of those carry a pose record, so the five stations "
+                "come with it")
+    elif full:
+        why += (" - what's stored doesn't give the pose check enough to go "
+                "on, so the five stations come with it")
 
     who = "you" if label == owner else label.capitalize()
     wanted = sum(s.samples for s in plan)
@@ -287,12 +332,13 @@ def enrol_answer(gallery, label: str, owner: str = "hunter",
                   "station%s, %d takes."
                   % (who, who, who, len(plan),
                      "" if len(plan) == 1 else "s", wanted))
-    cov = fe.coverage(takes)
     if cov["recorded"] and not cov["negative"]:
         spoken += (" Worth knowing first: %s have no takes turned the other "
                    "way at all, so the third station is the one that "
                    "matters." % ("you" if label == owner else who))
-    elif cov["unrecorded"] and not cov["recorded"]:
+    elif cov["unrecorded"] and not cov["recorded"] and not full:
+        # Not under ``full``: that branch has already said the stored takes
+        # carry no angle, in the sentence that explains the plan.
         spoken += (" %s stored take%s carry no pose record, so this run "
                    "starts the record rather than adding to it."
                    % (cov["unrecorded"],

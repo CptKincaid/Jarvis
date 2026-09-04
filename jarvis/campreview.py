@@ -1406,7 +1406,11 @@ class PreviewPipeline:
             log.debug("campreview: the gallery would not match", exc_info=True)
             return None, 0.0
         score = float(score)
-        if not label or score < self.identity_min:
+        # ``not (score >= bar)`` and not ``score < bar``: the second is False
+        # for a NaN on either side, so a non-finite camera.identity_min
+        # would have named a stranger here too (F17; the same spelling in
+        # jarvis/eye.py). This fails SHUT.
+        if not label or not (score >= self.identity_min):
             return "", score                  # asked, and the answer is no
         return str(label), score
 

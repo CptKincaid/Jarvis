@@ -539,6 +539,24 @@ def test_the_body_threshold_must_be_stated_not_inherited():
     assert eye_mod.BODY_MATCH_MIN == 0.75      # the YoutuReID number, unchanged
 
 
+def test_a_non_finite_body_threshold_is_refused_and_fails_shut():
+    """The body bar is the one the docstring above says must be STATED, and a
+    stated NaN is not a bar. ``score < self.match_min`` is False for every
+    score when ``match_min`` is NaN, so the anchor answers "still him" for
+    any body at all -- the exact opposite of what the guard is for (F17,
+    reproduced 2026-09-03 on the face side of the same spelling)."""
+    with pytest.raises(ValueError):
+        SessionIdentity(ttl_s=600.0, match_min=float("nan"), now=lambda: 0.0)
+    with pytest.raises(ValueError):
+        SessionIdentity(ttl_s=600.0, match_min=float("inf"), now=lambda: 0.0)
+
+    s = SessionIdentity(ttl_s=600.0, match_min=eye_mod.BODY_MATCH_MIN,
+                        now=lambda: 0.0)
+    s.anchor("hunter", bvec(11))
+    s.match_min = float("nan")                # set past the constructor
+    assert s.identify(bvec(12)) == ("", 0.0)
+
+
 def test_the_tiebreaker_promotes_nothing_without_attention():
     """docs/vision.md section 11.1 used to offer "build the wake tiebreaker and
     presence only" as the fallback if the mount geometry cannot separate

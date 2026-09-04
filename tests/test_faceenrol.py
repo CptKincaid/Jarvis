@@ -686,6 +686,48 @@ def test_a_stranger_is_no_opinion_rather_than_a_wrong_name():
     assert ident.unknown == 1
 
 
+def test_a_non_finite_match_min_fails_shut_rather_than_naming_a_stranger():
+    """THE BAR HAS TO BE A BAR, and ``score < self.match_min`` is not the
+    spelling that makes one.
+
+    ``camera.identity_min`` is a user-editable key and ``json.loads`` accepts
+    the bare literal ``NaN``, so a hand-edited assistant.json can deliver one.
+    Every other bar in this lane is spelled ``not (x >= bar)`` precisely so a
+    NaN fails SHUT (``SampleLimits.__post_init__``, ``facedetect.embed``,
+    ``FaceIdentifier``'s own conf gate); these two comparisons were the
+    natural spelling and failed OPEN. Reproduced 2026-09-03: a stranger whose
+    best cosine to the pool was 0.040 came back as ("hunter", 0.040), with
+    ``matched`` incremented and the body anchor set to the stranger (F17).
+    """
+    gallery = FaceGallery(root=None)
+    for vec in same_face(base_vec(23), 13):
+        gallery.add("hunter", vec)
+    stranger = base_vec(4242)
+    _label, best = gallery.match(stranger)
+    assert 0.0 < best < SFACE_COSINE_SAME, "the fixture stranger is not one"
+
+    with pytest.raises(ValueError):
+        FaceIdentifier(gallery, ScriptedRecogniser([stranger]), min_conf=0.6,
+                       match_min=float("nan"))
+    with pytest.raises(ValueError):
+        FaceIdentifier(gallery, ScriptedRecogniser([stranger]), min_conf=0.6,
+                       match_min=float("inf"))
+
+
+def test_a_bar_that_slipped_past_the_constructor_still_fails_shut():
+    """The comparison itself, not only the constructor: an object whose
+    ``match_min`` is set after construction (or by a future caller that does
+    not go through ``__init__``) must still decline rather than match."""
+    gallery = FaceGallery(root=None)
+    for vec in same_face(base_vec(23), 13):
+        gallery.add("hunter", vec)
+    ident = FaceIdentifier(gallery, ScriptedRecogniser([base_vec(4242)]),
+                           min_conf=0.6)
+    ident.match_min = float("nan")
+    assert ident.identify(None, head_row(0.0, conf=0.95)) == ("", 0.0)
+    assert ident.unknown == 1 and ident.matched == 0
+
+
 def test_an_empty_gallery_computes_nothing_at_all():
     """Before enrolment there is nothing to compare against, and paying for
     an embedding to discover that is pure cost."""

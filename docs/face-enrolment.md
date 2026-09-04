@@ -398,6 +398,14 @@ If the curfew arrives mid-enrolment, `_GatedDevice.read` returns `(False, None)`
 the run **stops and says so**, and nothing is saved. It does not finish quietly
 with half a gallery.
 
+The same is true of a spoken **"offline mode"** to the running Jarvis while the
+script is capturing. The script's `SensingPolicy` is a second reader of the same
+`sensing.json`; it re-reads the file whenever its bytes change (every `state()`
+call compares them), so the live Jarvis writing *offline* is seen by the
+script's camera gate on the next frame and the run stops the same way. Until
+2026-09-04 only the clock curfew was honoured mid-run — the script loaded the
+file once at start and never looked again.
+
 Exit codes: `0` fine, `1` something failed a check, `2` sensing said no, `3`
 nothing to work with (no camera, no models, no gallery).
 
