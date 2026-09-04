@@ -195,7 +195,10 @@ def test_no_test_can_reach_his_real_face_gallery():
     assert PATHS.FACE_GALLERY != real
     assert real not in PATHS.FACE_GALLERY.parents
 
-    g = default_gallery()
+    # sface explicitly: this test is about the PATH firewall, and its
+    # fixtures are 128-D. default_gallery() otherwise follows the active
+    # backend, which after 2026-09-03 is ArcFace's 512.
+    g = default_gallery(model="sface")
     assert g.root != real
     assert real not in Path(g.root).parents
     # And a real save through the real object lands in the throwaway dir.
@@ -884,7 +887,8 @@ def wire(monkeypatch, tmp_path, *, yaws=None, vectors=None, camera=True,
     cfg_path = tmp_path / "assistant.json"
     monkeypatch.setattr(face_enrol.AssistantConfig, "load",
                         staticmethod(lambda: _REAL_CONFIG_LOAD(cfg_path)))
-    monkeypatch.setattr(face_enrol, "open_gallery", lambda: gallery)
+    monkeypatch.setattr(face_enrol, "open_gallery",
+                        lambda cfg=None: gallery)
     monkeypatch.setattr(face_enrol, "SensingPolicy",
                         lambda cfg=None: FakePolicy(camera=camera))
     monkeypatch.setattr(face_enrol.facedetect, "probe",

@@ -53,9 +53,7 @@ from jarvis import camera as cam                          # noqa: E402
 from jarvis import facedetect                             # noqa: E402
 from jarvis import visionrig as vr                        # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
-from jarvis.config import PATHS                            # noqa: E402
 from jarvis.eye import FaceIdentifier                      # noqa: E402
-from jarvis.facegallery import FaceGallery                 # noqa: E402
 from jarvis.sensing import SensingPolicy                   # noqa: E402
 
 BANNER = (
@@ -154,15 +152,29 @@ def main(argv=None) -> int:
 
     # ------------------------------------------------------------- 2. models
     model_dir = str(cfg.get("camera.model_dir", "") or "") or None
-    probe = facedetect.probe(deep=args.deep, model_dir=model_dir)
+    probe = facedetect.probe(deep=args.deep, model_dir=model_dir,
+                             backend=cam.face_backend_from_config(cfg))
     report["models"] = probe
     say("")
     say("2. face models  (%s)" % probe["dir"])
+    say("   backend %s -- %s, %d-D embeddings"
+        % (probe["backend"], probe["licence"], probe["embed_dim"]))
+    if not probe["commercial_ok"]:
+        # VSS ships from this same machine. A research-licensed weight in use
+        # is a licence question before it is a correctness one, so it is said
+        # out loud every run rather than left in a docstring.
+        say("   *** these weights are NON-COMMERCIAL RESEARCH ONLY -- fine "
+            "for Jarvis, never for VSS ***")
     for key in sorted(probe["models"]):
         m = probe["models"][key]
-        say("   %-10s %-5s %10d B (want %10d)  %-10s %s"
+        say("   %-10s %-5s %10d B (want %10d)  %-28s %s"
             % (key, "ok" if m["ok"] else "MISS", m["bytes"],
                m["expected_bytes"], m["licence"], m["reason"]))
+    for name in sorted(probe["backends"]):
+        b = probe["backends"][name]
+        say("   %-12s %-3s  %s + %s  (%d-D)"
+            % (name, "yes" if b["ready"] else "NO", b["detector"],
+               b["recogniser"], b["embed_dim"]))
     cv2s = probe["cv2"]
     say("   cv2 %s  detector_api=%s recogniser_api=%s %s"
         % (cv2s["version"] or "-", cv2s["detector_api"],
@@ -336,8 +348,13 @@ def main(argv=None) -> int:
         # detection that already cleared min_conf -- FaceIdentifier enforces
         # that itself -- because SFace scores non-faces CONFIDENTLY rather
         # than low (jarvis/facemodels.py).
-        gallery = FaceGallery(root=PATHS.FACE_GALLERY)
-        if recogniser is not None and gallery.load():
+        gallery, gallery_why = cam.gallery_from_config(cfg)
+        if gallery is None:
+            print("identity: OFF -- %s" % gallery_why)
+        bar_why = cam.identity_min_warning(cfg)
+        if bar_why:
+            print("identity: %s" % bar_why)
+        if recogniser is not None and gallery is not None:
             identifier = FaceIdentifier(
                 gallery, recogniser,
                 min_conf=float(cfg.get("camera.min_conf", 0.6)),

@@ -86,9 +86,21 @@ otherwise every note after the dropped one describes the wrong face.
 DELETING ONE PERSON is ``purge_label()``, and it is not ``forget()`` plus a
 save. A save writes a new generation; the OLD generations still hold her, one
 ``rollback()`` away and still on the disk. Consent withdrawn has to mean the
-embeddings go, so ``purge_label`` writes what is left as a new generation and
-then SHREDS every generation that held her -- including the ones that are
-unreadable, because nothing can prove those do not hold her either.
+embeddings go, so the old files have to go -- and destroying an old file is
+how somebody who never asked to be forgotten loses their enrolment. That
+happened three times, by three different routes, so ``purge_label`` is built
+around ONE invariant rather than around three guards:
+
+    NO FILE IS DESTROYED UNLESS THE EMBEDDINGS IT HELD, MINUS HERS, HAVE BEEN
+    READ BACK FROM THE NEW GENERATION ON DISK.
+
+Inventory raw first (which labels, and how many samples each, at this FORMAT),
+write the replacement second, read the replacement back off the disk third and
+prove every other label is in it at full count, shred fourth and only what was
+proved superseded, then read the disk once more and only THEN say whether the
+delete is complete. Anything that fails any step is counted, named and LEFT
+ALONE. Read ``purge_label`` for the three routes and why each one is closed by
+the invariant rather than by a check of its own.
 
 DELETION is ``purge()``: every generation, not just the newest, AND any
 ``.tmp`` a crashed save left behind -- which is a full set of embeddings under
@@ -119,11 +131,52 @@ from jarvis.logs import get_logger
 
 log = get_logger("facegallery")
 
+# NOT BUMPED FOR THE MODEL SWAP, AND THAT IS THE WHOLE POINT. ``_read``
+# refuses a format it does not recognise, so bumping this would make his
+# existing SFace generations UNREADABLE -- which would take his ability to
+# revert with them. Instead the model is carried in an OPTIONAL ``_model``
+# key: a generation without one was written by SFace, because nothing else
+# has ever written this store.
 FORMAT = 1
+
+# ------------------------------------------------------------ which model
+# WHICH MODEL PRODUCED A VECTOR IS PART OF THE VECTOR. An ArcFace 512-vector
+# and an SFace 128-vector are not weakly comparable, they are not comparable:
+# the cosine between them is not a worse measurement of the same thing, it is
+# a measurement of nothing. Before this key existed the store recorded only
+# the numbers, so a mixed gallery would have scored his own face against
+# noise and reported it as a low match -- "recognition got worse" with no way
+# to find out why. Every read, every write and every comparison here now names
+# the model, and a cross-model comparison is refused BY NAME rather than
+# scored.
+SFACE_MODEL = "sface"
+ARCFACE_MODEL = "arcface_mbf"
 # SFace (face_recognition_sface_2021dec.onnx, Apache-2.0) returns 128 float32.
 # Measured on this box 2026-09-02: shape (1, 128), L2 norm 10.41 -- NOT unit
 # length, which is why every comparison here normalises rather than dotting.
-EMBED_DIM = 128
+# ArcFace w600k_mbf returns 512 and jarvis/faceinsight.normalise unit-lengths
+# it at the source.
+MODEL_DIMS = {SFACE_MODEL: 128, ARCFACE_MODEL: 512}
+# What a generation with no ``_model`` key was written by. This is not a
+# guess: the key was added on 2026-09-03 and SFace is the only recogniser
+# that had ever written this store.
+LEGACY_MODEL = SFACE_MODEL
+DEFAULT_MODEL = SFACE_MODEL
+# What a generation's ``_model`` key is called when the key is there and will
+# not read. It is not this build's model and it is not a name anything can act
+# on, which is exactly what the callers need to know.
+UNKNOWN_MODEL = "unknown"
+EMBED_DIM = MODEL_DIMS[SFACE_MODEL]
+
+
+def model_dim(model: str) -> int:
+    """How many floats a vector from ``model`` has, or ValueError by name."""
+    try:
+        return MODEL_DIMS[str(model)]
+    except KeyError:
+        raise ValueError(
+            "unknown embedding model %r; known: %s"
+            % (model, ", ".join(sorted(MODEL_DIMS)))) from None
 # Five is enough history to undo a mistake noticed a few enrolments later and
 # small enough that the whole store stays under a megabyte at 128 floats a
 # sample. Never pruned below two: one generation is no backup at all.
@@ -133,6 +186,21 @@ MIN_GENERATIONS = 2
 # store does not enforce it (the consumer decides how sure it needs to be) but
 # it is the number a caller should start from.
 SFACE_COSINE_SAME = 0.363
+# AND THERE IS NO SUCH NUMBER FOR ARCFACE HERE, on purpose. 0.363 is OpenCV's
+# published figure for SFace's vectors; carrying it across to a different
+# model's would be a threshold that has stopped meaning anything, which is the
+# exact failure this module's cross-model refusal exists to prevent. It cannot
+# be measured without his face, so ``scripts/face_model_compare.py`` is the
+# instrument and he is the one who runs it. None means UNMEASURED, and every
+# consumer must treat it as "say so", not as "use zero".
+ARCFACE_COSINE_SAME = None
+MODEL_COSINE_SAME = {SFACE_MODEL: SFACE_COSINE_SAME,
+                     ARCFACE_MODEL: ARCFACE_COSINE_SAME}
+
+
+def cosine_same(model: str):
+    """The published "same person" cosine for a model, or None if unmeasured."""
+    return MODEL_COSINE_SAME.get(str(model))
 
 _GEN_RE = re.compile(r"^gen-(\d{5})\.npz$")
 # A crashed save leaves gen-00002.npz.tmp, which _GEN_RE does not match -- so
@@ -274,16 +342,23 @@ def cosine(a, b) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
-def degenerate_reason(vec) -> str:
-    """"" if this could be a face embedding, else why it could not be.
+def degenerate_reason(vec, model: str = DEFAULT_MODEL) -> str:
+    """"" if this could be a face embedding from ``model``, else why not.
 
     The three shapes that have actually appeared: the wrong dimension (a
     different model's output), a non-finite element (a crop of nothing), and a
     CONSTANT vector -- which is what the fixture that destroyed his voiceprint
-    contained, and which no real embedding is."""
+    contained, and which no real embedding is.
+
+    THE DIMENSION CHECK IS NOW THE MODEL CHECK'S LAST LINE, not its first.
+    512 floats where 128 belong is caught here and named; 512 floats where 512
+    belong but from the wrong 512-D model is caught upstream by the ``_model``
+    key, because arithmetic cannot see that one."""
+    dim = model_dim(model)
     arr = np.asarray(vec, dtype=np.float64).ravel()
-    if arr.size != EMBED_DIM:
-        return "wrong dimension: %d, expected %d" % (arr.size, EMBED_DIM)
+    if arr.size != dim:
+        return ("wrong dimension: %d, expected %d for %s"
+                % (arr.size, dim, model))
     if not np.all(np.isfinite(arr)):
         return "not finite"
     if float(np.linalg.norm(arr)) == 0.0:
@@ -331,8 +406,22 @@ class FaceGallery:
     wants to match against something it just built, and used by the tests that
     check the guards without touching a filesystem at all."""
 
-    def __init__(self, root: Optional[Path] = None):
+    def __init__(self, root: Optional[Path] = None,
+                 model: str = DEFAULT_MODEL):
         self.root: Optional[Path] = None if root is None else Path(root)
+        # WHAT THIS GALLERY IS FOR. Every vector added, loaded, saved and
+        # matched has to have come from this model; anything else is refused
+        # by name. Defaulting to SFace keeps every existing caller and every
+        # existing test writing exactly the file it wrote before -- the
+        # production path names the model explicitly through
+        # ``default_gallery``.
+        self.model = str(model)
+        model_dim(self.model)          # raise now, not on his enrolment
+        # Generations on disk written by SOMETHING ELSE. Not an error and not
+        # deleted: they are his old enrolment, and they are what he reverts
+        # to. ``load()`` fills this in so a caller can say the true sentence
+        # -- "13 sface takes are on disk, none for arcface_mbf, re-enrol".
+        self.foreign_generations: Dict[int, str] = {}
         self._pool: Dict[str, List[np.ndarray]] = {}
         # Kept in lockstep with _pool, index for index. ``takes()`` pads
         # rather than trusting that, because a mismatch would attach one
@@ -387,7 +476,7 @@ class FaceGallery:
         apart on a rejected sample."""
         if not _LABEL_RE.match(label or ""):
             raise ValueError("bad label %r: lowercase letters, digits, - and _" % label)
-        why = degenerate_reason(vec)
+        why = degenerate_reason(vec, self.model)
         if why:
             raise ValueError("refusing a degenerate embedding: %s" % why)
         arr = np.asarray(vec, dtype=np.float32).ravel().copy()
@@ -412,7 +501,7 @@ class FaceGallery:
         centroid of him in glasses and him without is a face that does not
         exist, and the same averaging is why the voiceprint's own pool keeps
         its members (jarvis/speaker.py:249-262)."""
-        if degenerate_reason(vec):
+        if degenerate_reason(vec, self.model):
             return "", 0.0
         best_label, best = "", 0.0
         for label, pool in self._pool.items():
@@ -462,6 +551,7 @@ class FaceGallery:
         truncated or corrupt newest file must cost the last enrolment, not the
         enrolment."""
         wanted = [generation] if generation else list(reversed(self.generations()))
+        self.foreign_generations = {}
         for gen in wanted:
             try:
                 pool, takes, prov = self._read(self.path_for(gen))
@@ -469,15 +559,65 @@ class FaceGallery:
                 log.warning("face gallery generation %d unreadable; "
                             "falling back to the one before", gen, exc_info=True)
                 continue
+            wrote = str(prov.get("model") or LEGACY_MODEL)
+            if wrote != self.model:
+                # A CROSS-MODEL LOAD IS REFUSED, NOT SCALED, NOT TRUNCATED AND
+                # NOT SILENTLY SKIPPED. Its vectors measure a different thing;
+                # cosine against them is meaningless rather than merely weak.
+                # The file is left exactly where it is -- it is his previous
+                # enrolment and the thing he reverts to.
+                self.foreign_generations[gen] = wrote
+                log.warning(
+                    "face gallery generation %d was written by %r and this "
+                    "gallery is %r. NOT comparing across models: the cosine "
+                    "between them measures nothing. Those %d sample(s) stay "
+                    "on disk untouched.",
+                    gen, wrote, self.model, int(prov.get("n") or 0))
+                continue
             self._pool = pool
             self._takes = takes
             self.loaded_generation = gen
             self._loaded_n = sum(len(v) for v in pool.values())
             self._provenance = prov
             log.info("face gallery loaded: generation %d, %d samples over %d "
-                     "labels", gen, self._loaded_n, len(pool))
+                     "labels, model %s", gen, self._loaded_n, len(pool),
+                     self.model)
             return True
+        if self.foreign_generations:
+            log.warning("face identity is OFF: %s", self.reenrol_message())
         return False
+
+    # -------------------------------------------------- the migration line
+    def foreign_sample_count(self) -> int:
+        """How many samples sit on disk under a DIFFERENT model.
+
+        Read from the files rather than remembered, because the caller that
+        needs this number is the one that has just failed to load anything.
+        """
+        total = 0
+        for gen in self.foreign_generations:
+            try:
+                _pool, _takes, prov = self._read(self.path_for(gen))
+            except Exception:  # noqa: BLE001 - unreadable defends nothing
+                continue
+            total += int(prov.get("n") or 0)
+        return total
+
+    def reenrol_message(self) -> str:
+        """ONE LINE saying exactly what he has to do, for the startup log.
+
+        Not "identity unavailable". Not a stack trace. The failure this
+        sentence prevents is the one where recognition quietly stops working
+        after a model change and the log says something true but useless.
+        """
+        others = sorted({m for m in self.foreign_generations.values()})
+        n = self.foreign_sample_count()
+        return ("nothing is enrolled for %s (%d sample(s) on disk from %s, "
+                "kept, not deleted). Say \"enrol my face\" or run "
+                "scripts/face_enrol.py to re-enrol; or set "
+                "camera.face_backend to \"opencv\" to go back to the old "
+                "models and your existing enrolment."
+                % (self.model, n, ", ".join(others) or "an older model"))
 
     def _read(self, path: Path):
         data = np.load(path)
@@ -487,6 +627,24 @@ class FaceGallery:
             # silently stop comparing; speaker.py:264-271 warns about exactly
             # this for the voiceprint. Refuse, do not guess.
             raise ValueError("face gallery format %d, this build reads %d" % (fmt, FORMAT))
+        # THE MODEL IS READ BEFORE THE VECTORS, because it decides what a
+        # valid vector looks like. A generation with no ``_model`` predates
+        # the key and was written by SFace; see LEGACY_MODEL.
+        wrote = (str(data["_model"][0]) if "_model" in data.files
+                 else LEGACY_MODEL)
+        try:
+            model_dim(wrote)
+        except ValueError:
+            # A model this build has never heard of. Its vectors cannot be
+            # validated, so none are loaded -- but the generation is REPORTED
+            # rather than treated as corrupt, because "written by a newer
+            # build" and "truncated" want opposite responses and destroying
+            # the wrong one is unrecoverable.
+            log.warning("face gallery %s was written by unknown model %r; "
+                        "loading no vectors from it and leaving it alone",
+                        path.name, wrote)
+            return {}, {}, {"format": fmt, "created_ns": 0, "reason": "",
+                            "n": 0, "recorded": 0, "model": wrote}
         pool: Dict[str, List[np.ndarray]] = {}
         takes: Dict[str, List[Take]] = {}
         have = set(data.files)
@@ -495,13 +653,14 @@ class FaceGallery:
             if not m:
                 continue
             arr = np.asarray(data[key], dtype=np.float32).ravel()
-            if degenerate_reason(arr):
+            if degenerate_reason(arr, wrote):
                 # A stored vector that cannot be a face is not loaded: it
                 # would drag every future match toward itself. ITS NOTE GOES
                 # WITH IT -- the two lists are paired by position, so keeping
                 # the note of a dropped vector shifts every note after it
                 # onto the wrong face.
-                log.warning("face gallery: dropping %s (%s)", key, degenerate_reason(arr))
+                log.warning("face gallery: dropping %s (%s)", key,
+                            degenerate_reason(arr, wrote))
                 continue
             label, idx = m.group(1), m.group(2)
             pool.setdefault(label, []).append(arr)
@@ -521,15 +680,95 @@ class FaceGallery:
                 "reason": str(data["_reason"][0]) if "_reason" in data.files else "",
                 "n": sum(len(v) for v in pool.values()),
                 "recorded": sum(1 for ts in takes.values()
-                                for t in ts if t.recorded)}
+                                for t in ts if t.recorded),
+                "model": wrote}
         return pool, takes, prov
 
-    def save(self, reason: str, allow_shrink: bool = False) -> int:
+    # ------------------------------------------------- whose data is in here
+    def _inventory(self, path: Path):
+        """``({label: samples}, the model that wrote it)`` by RAW key read, or
+        ``(None, "")`` if the file cannot be inventoried at all.
+
+        THIS ANSWERS "WHOSE EMBEDDINGS ARE IN THIS FILE", WHICH IS NOT THE
+        QUESTION ``_read`` ANSWERS. ``_read`` yields VECTORS, and every filter
+        it applies -- the model check, the dimension check, the degenerate
+        check -- is a way for its answer to come back "nobody is in here" over
+        a file with her name in thirteen of its keys. Both shapes are real: a
+        generation written by a model this build has never heard of yields no
+        vectors at all (there is no way to validate a vector whose length is
+        not known), and a generation whose vectors are another model's length
+        has every one of them dropped. Under the old scan both were INVISIBLE,
+        so her embeddings stayed on the disk and the delete returned
+        ``complete`` True over them.
+
+        THE FORMAT IS STILL CHECKED AND THAT IS NOT AN INCONSISTENCY: the key
+        layout IS the format. ``emb_<label>_<nnnn>`` is what FORMAT 1 means,
+        and scanning a file this build cannot read for keys this build invented
+        would answer "she is not in it" about a pool that may hold her under a
+        scheme nobody here has seen. A file that does not inventory is reported
+        as unreadable and treated as "may hold anybody", which is the only
+        honest reading and is why ``purge_label`` neither destroys it nor
+        claims to be finished while it is there.
+
+        Cheap: the names come out of the zip directory, and only ``_format``
+        and ``_model`` are decompressed. No embedding is read."""
+        try:
+            with np.load(path) as data:
+                names = list(data.files)
+                if "_format" not in names:
+                    return None, ""
+                if int(np.asarray(data["_format"]).ravel()[0]) != FORMAT:
+                    return None, ""
+                wrote = LEGACY_MODEL
+                if "_model" in names:
+                    try:
+                        wrote = str(np.asarray(data["_model"]).ravel()[0])
+                    except Exception:  # noqa: BLE001 - unnamed is not ours
+                        wrote = UNKNOWN_MODEL
+        except Exception:  # noqa: BLE001 - unreadable is an ANSWER here
+            return None, ""
+        counts: Dict[str, int] = {}
+        for key in names:
+            m = _KEY_RE.match(key)
+            if m:
+                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+        return counts, wrote
+
+    def disk_labels(self) -> Tuple[str, ...]:
+        """Every label with embeddings ON THIS DISK, whatever model wrote it.
+
+        ``labels()`` is what this OBJECT managed to load, and a gallery for
+        one model loads NOTHING from another model's store -- by design. So a
+        caller that answers "who is enrolled?" from ``labels()`` says "nobody"
+        over a full enrolment sitting in front of it, which is what
+        ``face_enrol --delete --label`` printed as "(labels: -)". This reads
+        the files."""
+        found = set()
+        for gen in self.generations():
+            counts, _wrote = self._inventory(self.path_for(gen))
+            for label, n in (counts or {}).items():
+                if n:
+                    found.add(label)
+        return tuple(sorted(found))
+
+    def save(self, reason: str, allow_shrink: bool = False,
+             prune: bool = True) -> int:
         """Write the pool as the NEXT generation; return its number.
 
         ``reason`` is provenance, not decoration: when a gallery turns out to
         be wrong, the only question that matters is what wrote it, and on
-        2026-09-02 nothing on disk could answer that."""
+        2026-09-02 nothing on disk could answer that.
+
+        ``prune=False`` IS FOR ONE CALLER AND IT IS NOT AN OPTIMISATION.
+        ``_prune`` deletes files this save never looked at -- the oldest
+        generations outside the five-deep window -- and ``purge_label`` is
+        the one path whose whole contract is that no file dies unproven. With
+        pruning on, its own save destroyed a bystander's only generation
+        before the delete loop had considered a single file, and the delete
+        then reported itself complete (measured 2026-09-03: five generations,
+        alice alone in the oldest, ``purge_label("heather")`` -> alice's six
+        embeddings gone, ``complete`` True). A deliberate delete does its own
+        housekeeping; the window is re-imposed by the next ordinary save."""
         if self.root is None:
             raise ValueError("this gallery has no root; it cannot be saved")
         n = self.total()
@@ -569,6 +808,10 @@ class FaceGallery:
         arrays["_format"] = np.array([FORMAT])
         arrays["_created_ns"] = np.array([time.time_ns()])
         arrays["_reason"] = np.array([str(reason)])
+        # The key that makes a mixed store safe. Written on every save from
+        # now on; its ABSENCE is what identifies the pre-2026-09-03 SFace
+        # generations, so it must never be written as an empty string.
+        arrays["_model"] = np.array([str(self.model)])
 
         path = self.path_for(gen)
         tmp = path.with_name(path.name + ".tmp")
@@ -603,8 +846,10 @@ class FaceGallery:
                             "reason": str(reason), "n": n,
                             "recorded": sum(1 for label in self._pool
                                             for t in self.takes(label)
-                                            if t.recorded)}
-        self._prune()
+                                            if t.recorded),
+                            "model": self.model}
+        if prune:
+            self._prune()
         log.info("face gallery saved: generation %d, %d samples (%s)", gen, n, reason)
         return gen
 
@@ -618,6 +863,14 @@ class FaceGallery:
             _pool, _takes, prov = self._read(self.path_for(generation))
         except Exception:
             return 0          # unreadable: it defends nothing and protects nothing
+        if str(prov.get("model") or LEGACY_MODEL) != self.model:
+            # ANOTHER MODEL'S GENERATION DEFENDS NOTHING HERE, and counting it
+            # would break the very first save after a swap: his 13 SFace takes
+            # would be the shrink guard's baseline, and a fresh 5-take ArcFace
+            # enrolment would be refused as "shrinking the gallery from 13 to
+            # 5". It is still protected from pruning -- see ``_prune`` -- it
+            # simply is not evidence about THIS model's enrolment.
+            return 0
         return int(prov.get("n") or 0)
 
     def _on_disk_n(self) -> int:
@@ -661,6 +914,19 @@ class FaceGallery:
         Ties go to the newest, so a steady state prunes exactly as before."""
         gens = self.generations()
         keep = max(KEEP_GENERATIONS, MIN_GENERATIONS)
+        # ANOTHER MODEL'S GENERATIONS ARE NOT IN THE WINDOW AT ALL. Without
+        # this line the first five saves after a model swap would evict his
+        # entire previous enrolment -- silently, as a side effect of a
+        # successful re-enrolment, leaving him nothing to revert to. That is
+        # the same shape as the incident this whole module exists for, one
+        # model change later. They are pruned by ``purge()``, which is a
+        # deliberate delete, and by nothing else.
+        mine = self._own_generations(gens)
+        kept_foreign = [g for g in gens if g not in mine]
+        if kept_foreign:
+            log.debug("face gallery: %d generation(s) from another model are "
+                      "outside the prune window", len(kept_foreign))
+        gens = mine
         for tmp in self._tmp_paths():
             # A crashed save's leftovers are not a generation and hold no
             # history worth keeping; they are just embeddings lying around --
@@ -683,12 +949,32 @@ class FaceGallery:
             except OSError:
                 log.debug("could not prune generation %d", gen, exc_info=True)
 
+    def _own_generations(self, gens=None) -> List[int]:
+        """The generations THIS gallery's model wrote, oldest first.
+
+        An unreadable generation is counted as its own -- it may be one of
+        ours and there is no way to know, and the alternative is a pruning
+        rule that quietly protects corrupt files forever.
+        """
+        out = []
+        for gen in (self.generations() if gens is None else list(gens)):
+            try:
+                _pool, _takes, prov = self._read(self.path_for(gen))
+            except Exception:  # noqa: BLE001
+                out.append(gen)
+                continue
+            if str(prov.get("model") or LEGACY_MODEL) == self.model:
+                out.append(gen)
+        return out
+
     def rollback(self) -> int:
         """Delete the newest generation and load the one before it.
 
         The step that did not exist on 2026-09-02. Returns the generation now
         loaded, or 0 if there was nothing to roll back to."""
-        gens = self.generations()
+        # OUR generations only: rolling back an ArcFace enrolment must never
+        # shred the SFace file underneath it.
+        gens = self._own_generations()
         if len(gens) < 2:
             return 0
         # Prove there is something to fall back TO before destroying what
@@ -743,91 +1029,135 @@ class FaceGallery:
     def purge_label(self, label: str, reason: str = "") -> dict:
         """Destroy ONE person's embeddings, everywhere on the disk.
 
-        THE REASON THIS IS NOT ``forget()`` + ``save()``. A save writes a new
-        generation; the older ones still hold her, one ``rollback()`` away
-        and, more to the point, still lying on the disk as 128 floats per
-        take. "Delete me" is the one promise in this module that a new
-        generation cannot keep, because what was asked for is the absence of
-        the data and not the absence of a match.
+        THE INVARIANT, AND IT IS THE WHOLE METHOD:
 
-        So the order is the same as ``--reset``'s and for the same reason:
-        WRITE WHAT IS LEFT FIRST, DESTROY SECOND. Everyone else's embeddings
-        land in a fresh generation before a single old file is touched, and
-        if that write fails nothing is destroyed at all -- a delete of one
-        person may never cost another person's enrolment.
+            NO FILE IS DESTROYED UNLESS THE EMBEDDINGS IT HELD, MINUS HERS,
+            HAVE BEEN READ BACK FROM THE NEW GENERATION ON DISK.
 
-        ONLY A GENERATION PROVEN TO HOLD HER IS DESTROYED. An earlier version
-        shredded every generation that would not PARSE as well, reasoning
-        that nothing can prove an unreadable file does not hold her. That is
-        true and it is not worth what it costs: ``_read`` REFUSES a format
-        number it does not recognise (that is the point of the check), so the
-        first build that bumps FORMAT makes every existing generation
-        "unreadable", and ``--delete --label somebody-who-was-never-enrolled``
-        would then destroy the whole gallery and exit 0. Measured 2026-09-03
-        on a throwaway store: 13 embeddings, one generation, ``_format``
-        bumped by one, ``--delete --label heather`` -> empty directory.
-        Unreadable generations are now COUNTED AND REPORTED and never
-        touched; the caller says so out loud and stops claiming the delete
-        was complete. Destroying them is still available and still one
-        command -- it is ``--delete`` with no ``--label``, which is the one
-        that means "everything".
+        Not inferred from a return value, not counted in memory, not assumed
+        because a save did not raise. READ BACK. If that read-back cannot be
+        performed for any reason at all -- a model this build cannot size, a
+        file that will not open, a save that only partly landed -- nothing is
+        destroyed, the caller is told the delete is INCOMPLETE, and it is told
+        why.
 
-        CRASHED-SAVE LEFTOVERS GO, ALWAYS. ``gen-00002.npz.tmp`` holds a full
-        pool and does not match ``_GEN_RE``, so it is invisible to
-        ``generations()`` and to the caller's read-back -- and it cannot be
-        filtered by label, because it is somebody's whole pool. ``_prune()``
-        already shreds them on every ordinary save, which is exactly why this
-        was invisible: when somebody else survives, the save cleans up on the
-        way past. When NOBODY survives there is no save, and her complete
-        embedding set stayed on the disk under a command that printed
-        "verified". So they are shredded here, unconditionally, and counted.
+        WHY IT IS WRITTEN AS AN INVARIANT AND NOT AS GUARDS. This is the third
+        round on one bug, and it moved every time: (1) ``load()`` returned
+        nothing on a mixed gallery, "no survivors" was inferred from the empty
+        pool, and every generation holding her was shredded with its bystanders
+        inside; (2) the read-back meant to catch that was inert, because it
+        built its gallery with the DEFAULT model; (3) ``_prune()`` -- inside
+        this method's OWN save -- destroyed a generation this method had never
+        looked at, and the same call reported the delete complete. Three doors
+        into one room. A fourth guard aimed at the third door would have found
+        a fourth door, so the room is closed instead: nothing here deletes
+        anything it has not proved is superseded, and ``_prune`` is not
+        allowed to run inside it (``save(prune=False)``).
 
-        Every file goes through ``_shred`` -- overwritten, then unlinked.
-        Read ``_shred`` for the limit of what that buys; the caller is only
-        allowed to claim that part.
+        THE ORDER, and each step is refusable:
+
+        1. INVENTORY FIRST, RAW. For every generation, which labels it holds
+           and HOW MANY samples each, by reading the key names at this FORMAT
+           -- no model check, no dimension check, no degenerate filter. The
+           scan that asked ``_read`` for VECTORS could not see her in a
+           generation another model wrote (it yields none), so she survived a
+           "complete" delete. A generation that will not inventory is recorded
+           as unreadable, never touched, and never vouched for.
+        2. WRITE THE REPLACEMENT, second, never first. Everyone else lands in
+           a fresh generation before one old byte is touched; if that write
+           fails, nothing is destroyed at all. It is skipped entirely when
+           every generation holding her holds ONLY her -- there is nobody to
+           carry, so there is nothing to write.
+        3. READ THE REPLACEMENT BACK FROM DISK and count it. Every label in
+           the inventory except hers must be present with AT LEAST the samples
+           it had. Counts, not names: the label-level version of this check
+           destroyed a generation holding ten of his takes on the strength of
+           one holding three, and called the delete complete. He kept his name
+           and lost seven samples.
+        4. ONLY THEN SHRED, and only the generations that step 3 proved
+           superseded -- plus every crashed-save ``.tmp``, which holds a whole
+           pool under a name no label can filter and no read-back can see.
+        5. READ THE DISK AGAIN. ``complete`` is True only if no generation
+           still holds her, nothing was left uninventoried, and no ``.tmp``
+           survived. That is the other direction of the promise and it is not
+           optional: it must be impossible for this to report success while
+           her data is on the disk.
+
+        ANYTHING THAT FAILS ANY STEP IS REPORTED AND LEFT ALONE. That is not
+        timidity, it is the only honest outcome: a generation this build
+        cannot rewrite (his SFace enrolment during the ArcFace window) or one
+        holding somebody the replacement does not carry cannot be destroyed
+        without costing a bystander their enrolment -- and it cannot be
+        pretended away either, because she is still in it. So it is counted,
+        named, and the caller stops claiming the delete was carried out.
+        Destroying it is still one command: ``--delete`` with no ``--label``,
+        the one that means everything.
+
+        Every file goes through ``_shred`` -- overwritten, then unlinked. Read
+        ``_shred`` for the limit of what that buys; the caller is only allowed
+        to claim that part.
 
         Returns numbers, so a script can print them and a test can read them:
-        which generations held her, how many files went, how many could not
-        be read and so were LEFT, which generation holds what is left, and
-        who is still enrolled.
+        which generations held her, how many files went, which could not be
+        read, which another model wrote, which could not have their survivors
+        carried forward, which STILL hold her afterwards, whether the delete
+        may be called complete, which generation holds what is left, and who
+        is still enrolled.
         """
         if self.root is None:
             raise ValueError("this gallery has no root; it cannot be purged")
         label = str(label)
         out: dict = {"label": label, "generations_with": [], "removed": 0,
-                     "unreadable": [], "tmp_removed": 0,
-                     "generation": 0, "left": 0,
-                     "labels_left": (), "reason": ""}
-        holds: List[int] = []
+                     "unreadable": [], "foreign": [], "foreign_models": (),
+                     "not_carried": [], "still_holding": [], "tmp_removed": 0,
+                     "generation": 0, "loaded": 0, "left": 0,
+                     "labels_left": (), "labels_on_disk": (), "reason": "",
+                     "complete": False}
+
+        # ---------------------------------------- 1. the inventory, raw, first
+        inventory: Dict[int, Dict[str, int]] = {}
+        wrote_by: Dict[int, str] = {}
         unreadable: List[int] = []
         for gen in self.generations():
-            try:
-                pool, _takes, _prov = self._read(self.path_for(gen))
-            except Exception:
+            counts, wrote = self._inventory(self.path_for(gen))
+            if counts is None:
                 unreadable.append(gen)
                 continue
-            if pool.get(label):
-                holds.append(gen)
+            inventory[gen] = counts
+            wrote_by[gen] = wrote
+        holds = [g for g in sorted(inventory) if inventory[g].get(label)]
         out["generations_with"] = list(holds)
         out["unreadable"] = list(unreadable)
         if not holds:
-            # Nothing on the disk was PROVEN to hold her, so nothing on the
-            # disk may be destroyed on her account. The tmps still go: they
-            # are a crashed save's leftovers, the next ordinary save would
-            # shred them anyway, and one of them may be the very pool she is
-            # asking to have removed.
+            # Nothing that could be inventoried holds her, so nothing may be
+            # destroyed on her account. The tmps still go: they are a crashed
+            # save's leftovers, the next ordinary save would shred them
+            # anyway, and one of them may be the very pool she is asking to
+            # have removed.
             out["tmp_removed"] = self._shred_tmps()
-            return out
+            return self._purge_verdict(out, label, unreadable)
+        # WHO ELSE IS IN THE FILES THAT MAY HAVE TO GO, and how many samples
+        # each of them has there. Read now, before anything is written,
+        # because after the save the only way to ask is to read the file we
+        # are about to destroy.
+        carry: Dict[str, int] = {}
+        for gen in holds:
+            for other, n in inventory[gen].items():
+                if other != label and n:
+                    carry[other] = max(carry.get(other, 0), n)
 
+        # ------------------------------------------- 2. write the replacement
         self.load()
         self.forget(label)
-        if self.total():
+        if carry and self.total():
             try:
                 # allow_shrink: removing a person IS a shrink, and it is the
                 # deliberate kind the guard exists to let through when it is
-                # asked for by name.
+                # asked for by name. prune=False: see save()'s docstring --
+                # pruning here destroyed a bystander's only generation.
                 out["generation"] = self.save(
-                    reason=reason or ("forget %s" % label), allow_shrink=True)
+                    reason=reason or ("forget %s" % label),
+                    allow_shrink=True, prune=False)
             except ValueError as exc:
                 # The write that was going to carry everyone else forward
                 # failed. Destroying the old generations now would take them
@@ -836,30 +1166,135 @@ class FaceGallery:
                 out["reason"] = str(exc)
                 log.warning("face gallery: not deleting %r -- what is left "
                             "could not be saved: %s", label, exc)
-                return out
-        # No survivors means no save, and that is fine HERE and only here:
-        # the invariant the save protects is somebody else's enrolment, and
-        # when the pool is empty there is nobody else to lose.
+                return self._purge_verdict(out, label, unreadable)
+
+        # ------------------------------------ 3. read the replacement back
+        proven: Dict[str, int] = {}
+        if out["generation"]:
+            proven, why = self._proven_survivors(out["generation"], label)
+            if why:
+                out["reason"] = why
+                log.warning("face gallery: not deleting %r -- %s", label, why)
+                return self._purge_verdict(out, label, unreadable)
+
+        # ----------------------------------------------- 4. and only then
+        left_alone: List[int] = []
         for gen in holds:
             if gen == out["generation"]:
                 continue
+            short = sorted(other for other, n in inventory[gen].items()
+                           if other != label and n > proven.get(other, 0))
+            if short:
+                # Somebody in this file is not safely in the new generation
+                # with at least what they had. It stays, she stays in it, and
+                # the caller is told both.
+                left_alone.append(gen)
+                log.warning("face gallery: generation %d also holds %s, and "
+                            "the new generation does not carry them at full "
+                            "count; LEFT ALONE with %r still in it",
+                            gen, ", ".join(short), label)
+                continue
             path = self.path_for(gen)
             if not path.exists():
-                continue          # _prune() may already have taken it
+                continue
             try:
                 _shred(path)
                 out["removed"] += 1
             except OSError:
+                left_alone.append(gen)
                 log.warning("could not delete face gallery generation %d",
                             gen, exc_info=True)
+        out["foreign"] = [g for g in left_alone
+                          if wrote_by.get(g, self.model) != self.model]
+        out["not_carried"] = [g for g in left_alone
+                              if g not in out["foreign"]]
+        out["foreign_models"] = tuple(sorted(
+            {wrote_by[g] for g in out["foreign"]}))
         out["tmp_removed"] = self._shred_tmps()
+        return self._purge_verdict(out, label, unreadable)
+
+    def _proven_survivors(self, generation: int, label: str):
+        """``({label: samples}, "")`` read back FROM DISK, or ``({}, why)``.
+
+        The one step that makes the invariant an invariant rather than a
+        wish. Everything upstream of it -- the return value of ``save``, the
+        pool in memory, the number the provenance claims -- is a report about
+        a write, and the failure this whole module exists for is a write that
+        SUCCEEDED and left the wrong bytes. So the replacement is opened
+        again, and only what comes back out of it may be used as proof.
+
+        Both readers run. ``_inventory`` sees the keys, which is what proves
+        SHE is not in the new file; ``_read`` sees the vectors, which is what
+        proves the survivors are actually loadable rather than merely named.
+        A generation that satisfies one and not the other is not proof of
+        anything."""
+        path = self.path_for(generation)
+        counts, wrote = self._inventory(path)
+        if counts is None:
+            return {}, ("the new generation %d cannot be read back from disk"
+                        % generation)
+        if wrote != self.model:
+            return {}, ("the new generation %d reads back as %r, not %r"
+                        % (generation, wrote, self.model))
+        if counts.get(label):
+            return {}, ("the new generation %d still holds %r"
+                        % (generation, label))
+        try:
+            pool, _takes, prov = self._read(path)
+        except Exception as exc:  # noqa: BLE001 - any failure is a refusal
+            return {}, ("the new generation %d does not load: %s"
+                        % (generation, exc))
+        if str(prov.get("model") or LEGACY_MODEL) != self.model:
+            return {}, ("the new generation %d loads as %r, not %r"
+                        % (generation, prov.get("model"), self.model))
+        if pool.get(label):
+            return {}, ("the new generation %d loads with %r still in it"
+                        % (generation, label))
+        return {k: len(v) for k, v in pool.items() if v}, ""
+
+    def _purge_verdict(self, out: dict, label: str,
+                       unreadable: List[int]) -> dict:
+        """Read the disk AFTER the shredding and say whether it is finished.
+
+        THE SECOND DIRECTION OF THE PROMISE. Everything above is about not
+        destroying somebody else's data; this is about not telling her she is
+        gone when she is not. It re-inventories every generation that is still
+        there -- the same raw read, so it can see her in files this gallery's
+        model cannot load -- and ``complete`` is True only when she is in none
+        of them, nothing was left uninventoried, no ``.tmp`` survived and no
+        step above refused. A shred that failed with OSError, a generation
+        left alone, a file that appeared underneath us: all of them land here
+        as "not complete" without a guard of their own."""
+        still: List[int] = []
+        unknown = list(unreadable)
+        for gen in self.generations():
+            counts, _wrote = self._inventory(self.path_for(gen))
+            if counts is None:
+                if gen not in unknown:
+                    unknown.append(gen)
+                continue
+            if counts.get(label):
+                still.append(gen)
+        out["unreadable"] = sorted(set(unknown))
+        out["still_holding"] = still
+        # What survives, read from the disk rather than remembered: after a
+        # delete the in-memory pool may be a generation that is no longer
+        # there, and "what is left" is a statement about the disk.
+        self.load()
+        out["loaded"] = self.loaded_generation
         out["left"] = self.total()
         out["labels_left"] = self.labels()
+        out["labels_on_disk"] = self.disk_labels()
+        out["complete"] = not (still or out["unreadable"] or self.leftovers()
+                               or out["reason"])
         log.info("face gallery: %r removed from %d generation(s); %d "
-                 "embeddings over %d label(s) left; %d generation(s) could "
-                 "not be read and were LEFT ALONE",
-                 label, out["removed"], out["left"], len(out["labels_left"]),
-                 len(unreadable))
+                 "embeddings over %d label(s) left; %d unreadable, %d from "
+                 "another model and %d whose survivors could not be carried "
+                 "forward were LEFT ALONE; %d still hold %r; delete complete: "
+                 "%s", label, out["removed"], out["left"],
+                 len(out["labels_left"]), len(out["unreadable"]),
+                 len(out["foreign"]), len(out["not_carried"]), len(still),
+                 label, out["complete"])
         return out
 
     def _shred_tmps(self) -> int:
@@ -917,10 +1352,20 @@ class FaceGallery:
         return dict(self._provenance)
 
 
-def default_gallery() -> FaceGallery:
-    """The user's gallery, wherever PATHS says it is.
+def default_gallery(model: Optional[str] = None,
+                    backend: Optional[str] = None) -> FaceGallery:
+    """The user's gallery, wherever PATHS says it is, for the live model.
 
     PATHS.FACE_GALLERY honours JARVIS_FACE_GALLERY, which tests/conftest.py
     forces into a throwaway directory -- so importing this in a test cannot
-    reach his enrolled face."""
-    return FaceGallery(root=PATHS.FACE_GALLERY)
+    reach his enrolled face.
+
+    ``model`` wins if given; otherwise the ACTIVE BACKEND decides, which is
+    what makes the swap arrive here without every call site being edited.
+    ``facemodels`` is imported inside the function so this module still loads
+    with nothing else present.
+    """
+    if model is None:
+        from jarvis import facemodels as fm      # noqa: PLC0415 - keeps this
+        model = fm.backend_for(backend).embed_model  # module dependency-free
+    return FaceGallery(root=PATHS.FACE_GALLERY, model=model)

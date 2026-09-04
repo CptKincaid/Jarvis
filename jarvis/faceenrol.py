@@ -1440,21 +1440,21 @@ def backup(gallery: FaceGallery, dest: Path) -> dict:
                           exc_info=True)
             out["failed"].append("%s: %s" % (src.name, exc))
             continue
-        check = FaceGallery(root=dest)
+        check = FaceGallery(root=dest, model=gallery.model)
         if check.load(generation=gen):
             out["verified"] += 1
             out["generations"].append(gen)
             out["samples"] += check.total()
         else:
             out["failed"].append("%s: the copy did not parse" % target.name)
-    holding = FaceGallery(root=dest)
+    holding = FaceGallery(root=dest, model=gallery.model)
     dest_gens = holding.generations()
     out["dest_generations"] = list(dest_gens)
     out["not_in_live"] = [g for g in dest_gens
                           if g not in set(gallery.generations())]
     if dest_gens:
         out["dest_newest"] = dest_gens[-1]
-        newest = FaceGallery(root=dest)
+        newest = FaceGallery(root=dest, model=gallery.model)
         if newest.load(generation=dest_gens[-1]):
             out["dest_newest_samples"] = newest.total()
     out["ok"] = bool(out["verified"] and not out["failed"])
@@ -1484,7 +1484,11 @@ def restore(gallery: FaceGallery, src: Path, reason: str) -> dict:
                  "live_generation_before": 0}
     out["live_before"] = gallery.total()
     out["live_generation_before"] = gallery.loaded_generation
-    holding = FaceGallery(root=src)
+    # SAME MODEL AS THE LIVE GALLERY, or the restore silently does
+    # nothing: a backup written by the other model does not load here,
+    # and the honest report is "nothing readable" rather than a merge
+    # of two incomparable vector spaces.
+    holding = FaceGallery(root=src, model=gallery.model)
     if not holding.load():
         out["reason"] = "nothing readable in %s" % src
         return out

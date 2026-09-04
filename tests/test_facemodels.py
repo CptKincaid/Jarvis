@@ -14,22 +14,48 @@ from jarvis import facemodels as fm
 
 
 # ------------------------------------------------------------------ licences
-def test_both_models_are_permissive_licences():
-    """VSS ships commercially from this machine. A research-licensed weight
-    file appearing here is the failure this test exists to catch."""
-    assert {m.licence for m in fm.MODELS} == {"MIT", "Apache-2.0"}
+def test_the_opencv_pair_is_permissive_and_commercial_safe():
+    """VSS ships commercially from this machine. This was once a check that
+    NO research-licensed weight existed here; two now do, so the check is
+    narrower and the flag that replaces it is ``commercial_ok``."""
     assert fm.YUNET.licence == "MIT"
     assert fm.SFACE.licence == "Apache-2.0"
-
-
-def test_models_come_from_opencv_zoo_only():
-    for m in fm.MODELS:
+    assert fm.YUNET.commercial_ok and fm.SFACE.commercial_ok
+    assert fm.OPENCV.commercial_ok is True
+    for m in fm.OPENCV.models():
         assert m.url.startswith("https://media.githubusercontent.com/media/"
                                 "opencv/opencv_zoo/"), m.url
-    # InsightFace / buffalo_l weights are research-only and banned on this box.
-    for m in fm.MODELS:
         assert "insightface" not in m.url.lower()
-        assert "buffalo" not in m.filename.lower()
+
+
+def test_the_insightface_pair_is_marked_non_commercial_everywhere():
+    """The restriction has to be impossible to miss by somebody reusing this
+    module later, so it is on the models, on the backend, and in a word that
+    reads as a refusal rather than as a licence name."""
+    for m in (fm.SCRFD_500M, fm.ARCFACE_MBF):
+        assert m.licence == "NON-COMMERCIAL RESEARCH ONLY"
+        assert m.commercial_ok is False
+        assert "model_zoo" in m.licence_source
+    assert fm.INSIGHT.commercial_ok is False
+    assert "NON-COMMERCIAL" in fm.INSIGHT.note
+    assert fm.commercial_backends() == ("opencv",)
+
+
+def test_the_licence_terms_are_recorded_where_a_reader_will_hit_them():
+    """The verification habit in this module is to read the model's own
+    LICENSE. InsightFace has none -- the sentence in model_zoo/README.md is
+    the only statement of terms -- and the docstring has to say so, or the
+    next reader assumes the usual answer."""
+    doc = fm.__doc__ or ""
+    assert "NON-COMMERCIAL RESEARCH ONLY" in doc
+    assert "LICENSE file at all" in doc
+    assert "model_zoo/README.md" in doc
+
+
+def test_every_declared_model_is_pinned_by_hash_and_size():
+    for m in fm.ALL_MODELS:
+        assert len(m.sha256) == 64
+        assert m.size > 1024
 
 
 # ------------------------------------------------------------------ registry
@@ -67,9 +93,51 @@ def test_correct_size_passes_shallow_but_hash_still_checked(fake_dir):
     assert not ok and "sha256" in why
 
 
-def test_available_covers_every_model(fake_dir):
+def test_available_covers_the_active_backends_pair_by_role(fake_dir):
     got = fm.available()
-    assert set(got) == {m.key for m in fm.MODELS} == {"detector", "recogniser"}
+    assert set(got) == {"detector", "recogniser"}
+    assert set(fm.available(backend="opencv")) == {"detector", "recogniser"}
+
+
+# ------------------------------------------------------------------ backends
+def test_the_default_backend_is_the_swap_and_it_is_reversible():
+    """He asked for the swap; the OpenCV pair stays fully declared so one
+    config key puts it back."""
+    assert fm.DEFAULT_BACKEND == "insightface"
+    assert set(fm.BACKENDS) == {"opencv", "insightface"}
+    assert fm.backend_for().name == "insightface"
+    assert fm.backend_for("opencv").models() == (fm.YUNET, fm.SFACE)
+    assert fm.backend_for("insightface").models() == (fm.SCRFD_500M,
+                                                      fm.ARCFACE_MBF)
+
+
+def test_an_unknown_backend_raises_rather_than_falling_back():
+    """A typo that silently left the old models running is the exact class of
+    bug this subsystem is written against."""
+    with pytest.raises(ValueError, match="unknown face backend"):
+        fm.backend_for("arcface")
+
+
+def test_the_environment_can_pick_the_backend(monkeypatch):
+    monkeypatch.setenv(fm.BACKEND_ENV, "opencv")
+    assert fm.backend_for().name == "opencv"
+    assert fm.backend_for("insightface").name == "insightface"   # arg wins
+
+
+def test_the_two_backends_disagree_about_dimension_and_bar():
+    assert fm.OPENCV.embed_dim == 128 and fm.INSIGHT.embed_dim == 512
+    assert fm.OPENCV.embed_model == "sface"
+    assert fm.INSIGHT.embed_model == "arcface_mbf"
+    assert fm.OPENCV.cosine_same == pytest.approx(0.363)
+    # UNMEASURED, not zero and not borrowed from SFace.
+    assert fm.INSIGHT.cosine_same is None
+
+
+def test_readiness_is_about_the_active_pair_not_all_four(fake_dir):
+    for model in fm.backend_for("opencv").models():
+        (fake_dir / model.filename).write_bytes(b"\0" * model.size)
+    assert fm.ready(backend="opencv") is True
+    assert fm.ready(backend="insightface") is False
 
 
 # ------------------------------------------------------------------ geometry

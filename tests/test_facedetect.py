@@ -34,7 +34,7 @@ def stocked_dir(tmp_path, monkeypatch):
     """Files of the RIGHT SIZE but the wrong content -- enough for the
     shallow check, which is what production uses."""
     monkeypatch.setenv("JARVIS_FACE_MODEL_DIR", str(tmp_path))
-    for model in fm.MODELS:
+    for model in fm.ALL_MODELS:
         (tmp_path / model.filename).write_bytes(b"\0" * model.size)
     return tmp_path
 
@@ -66,15 +66,21 @@ class FakeNet:
 # ------------------------------------------------------ absence, named
 def test_a_missing_detector_names_the_file_and_raises(empty_dir):
     with pytest.raises(fd.ModelUnavailable) as exc:
-        fd.load_detector(create=Recorder())
+        fd.load_detector(create=Recorder(), backend="opencv")
     assert fm.YUNET.filename in str(exc.value)
     assert "missing" in str(exc.value)
+    with pytest.raises(fd.ModelUnavailable) as exc:
+        fd.load_detector(create=Recorder(), backend="insightface")
+    assert fm.SCRFD_500M.filename in str(exc.value)
 
 
 def test_a_missing_recogniser_names_the_file_and_raises(empty_dir):
     with pytest.raises(fd.ModelUnavailable) as exc:
-        fd.load_recogniser(create=Recorder())
+        fd.load_recogniser(create=Recorder(), backend="opencv")
     assert fm.SFACE.filename in str(exc.value)
+    with pytest.raises(fd.ModelUnavailable) as exc:
+        fd.load_recogniser(create=Recorder(), backend="insightface")
+    assert fm.ARCFACE_MBF.filename in str(exc.value)
 
 
 def test_a_git_lfs_pointer_is_reported_as_a_pointer(empty_dir):
@@ -83,7 +89,7 @@ def test_a_git_lfs_pointer_is_reported_as_a_pointer(empty_dir):
     those two is not the same fix."""
     (empty_dir / fm.YUNET.filename).write_bytes(b"version https://git-lfs" * 5)
     with pytest.raises(fd.ModelUnavailable) as exc:
-        fd.load_detector(create=Recorder())
+        fd.load_detector(create=Recorder(), backend="opencv")
     assert "git-lfs pointer" in str(exc.value)
 
 
@@ -95,7 +101,7 @@ def test_there_is_no_second_detector_to_fall_back_to(empty_dir, monkeypatch):
                         (False, "made up reason"))
     for loader in (fd.load_detector, fd.load_recogniser):
         with pytest.raises(fd.ModelUnavailable) as exc:
-            loader(create=Recorder())
+            loader(create=Recorder(), backend="opencv")
         assert "made up reason" in str(exc.value)
 
 
@@ -105,13 +111,13 @@ def test_no_opencv_is_a_named_failure_not_a_crash(stocked_dir, monkeypatch):
 
     monkeypatch.setattr(fd, "_import_cv2", boom)
     with pytest.raises(fd.ModelUnavailable) as exc:
-        fd.load_detector()
+        fd.load_detector(backend="opencv")
     assert "cv2" in str(exc.value)
 
 
 # ------------------------------------------------------------- the probe
 def test_probe_reports_every_model_and_never_raises(empty_dir):
-    report = fd.probe()
+    report = fd.probe(backend="opencv")
     assert set(report["models"]) == {"detector", "recogniser"}
     assert report["ready"] is False
     assert fm.YUNET.filename in report["models"]["detector"]["reason"]
@@ -121,10 +127,37 @@ def test_probe_reports_every_model_and_never_raises(empty_dir):
 
 
 def test_probe_says_ready_when_the_files_are_there(stocked_dir):
-    report = fd.probe()
+    report = fd.probe(backend="opencv")
     assert report["ready"] is True
     assert report["models"]["detector"]["ok"] is True
     assert report["dir"] == str(stocked_dir)
+
+
+def test_probe_names_the_backend_and_the_licence_it_is_running_under(
+        stocked_dir):
+    """"The detector is missing" and "the detector you are not using is
+    missing" are different sentences. The report has to be able to say which,
+    and it has to carry the non-commercial term where he will see it."""
+    report = fd.probe()
+    assert report["backend"] == "insightface"
+    assert report["embed_dim"] == 512
+    assert report["embed_model"] == "arcface_mbf"
+    assert report["commercial_ok"] is False
+    assert report["licence"] == "NON-COMMERCIAL RESEARCH ONLY"
+    assert set(report["backends"]) == {"opencv", "insightface"}
+    assert report["backends"]["opencv"]["commercial_ok"] is True
+    assert report["backends"]["opencv"]["embed_dim"] == 128
+    assert_numbers_only(report)
+
+
+def test_probe_reports_the_onnxruntime_providers(empty_dir):
+    """The GB10 is unreachable from this ORT build, which is WHY mbf and not
+    r50. A report that does not say which providers exist makes the next
+    person guess."""
+    report = fd.probe()
+    assert "onnxruntime" in report
+    assert isinstance(report["onnxruntime"]["available"], bool)
+    assert isinstance(report["onnxruntime"]["providers"], str)
 
 
 def test_probe_reports_whether_opencv_can_even_build_them(empty_dir):
@@ -138,7 +171,7 @@ def test_probe_reports_whether_opencv_can_even_build_them(empty_dir):
 # ------------------------------------------------- the pinned model choice
 def test_the_opencv5_export_is_never_the_one_loaded(stocked_dir):
     rec = Recorder()
-    fd.load_detector(create=rec)
+    fd.load_detector(create=rec, backend="opencv")
     path = rec.calls[0][0]
     assert path.endswith(fm.YUNET.filename)
     assert fm.DETECTOR_OPENCV5 not in path
@@ -149,8 +182,8 @@ def test_int8_is_never_the_one_loaded(stocked_dir):
     """int8 measured SLOWER than fp32 on this aarch64 build at every thread
     count -- SFace 23.2 ms against 21.1 single-threaded."""
     rec = Recorder()
-    fd.load_detector(create=rec)
-    fd.load_recogniser(create=rec)
+    fd.load_detector(create=rec, backend="opencv")
+    fd.load_recogniser(create=rec, backend="opencv")
     import os
     assert all("int8" not in os.path.basename(path)
                for path, _ in rec.calls)
@@ -164,14 +197,15 @@ def test_the_detector_floor_is_lower_than_his_confidence_bar(stocked_dir):
     scores 0.45 against your 0.6 bar". So the detector floors low and the RIG
     judges the bar."""
     rec = Recorder()
-    fd.load_detector(create=rec, score_threshold=0.3)
+    fd.load_detector(create=rec, score_threshold=0.3, backend="opencv")
     assert rec.calls[0][1]["score_threshold"] == pytest.approx(0.3)
     assert fd.PROBE_THRESHOLD < 0.6
 
 
 def test_the_input_size_and_thread_count_reach_opencv(stocked_dir):
     rec = Recorder()
-    det = fd.load_detector(create=rec, input_size=(320, 180), threads=2)
+    det = fd.load_detector(create=rec, input_size=(320, 180), threads=2,
+                            backend="opencv")
     assert det.input_size == (320, 180)
     assert rec.calls[0][1]["input_size"] == (320, 180)
     assert rec.calls[0][1]["threads"] == 2

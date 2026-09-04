@@ -345,8 +345,9 @@ def test_no_weights_means_no_detector_and_a_reason_not_a_crash(tmp_path):
     raise, and it must not return something else that runs."""
     cfg = FakeCfg({"camera.model_dir": str(tmp_path / "nothing-here")})
     det, why = cam.detector_from_config(cfg)
+    from jarvis import facemodels as fm
     assert det is None
-    assert "face_detection_yunet_2023mar.onnx" in why
+    assert fm.backend_for().detector.filename in why
     assert "missing" in why
 
 
@@ -356,9 +357,12 @@ def test_the_model_directory_is_configurable(tmp_path):
     from jarvis import facemodels as fm
     here = tmp_path / "weights"
     here.mkdir()
-    for model in fm.MODELS:
+    for model in fm.ALL_MODELS:
         (here / model.filename).write_bytes(b"\0" * model.size)
-    cfg = FakeCfg({"camera.model_dir": str(here), "camera.identity": True})
+    # camera.face_backend is the one-line reversal; this is also the test
+    # that it reaches the loader.
+    cfg = FakeCfg({"camera.model_dir": str(here), "camera.identity": True,
+                   "camera.face_backend": "opencv"})
     calls = []
     import jarvis.facedetect as fdmod
     real = fdmod._create_yunet

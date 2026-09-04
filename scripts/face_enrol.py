@@ -120,16 +120,15 @@ from jarvis import facedetect                             # noqa: E402
 from jarvis import faceenrol as fe                        # noqa: E402
 from jarvis import visionrig as vr                        # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
-from jarvis.config import PATHS                           # noqa: E402
 from jarvis.eye import FaceIdentifier                     # noqa: E402
 from jarvis.facegallery import (SFACE_COSINE_SAME,        # noqa: E402
-                                FaceGallery, label_ok)
+                                FaceGallery, default_gallery, label_ok)
 from jarvis.sensing import SensingPolicy                   # noqa: E402
 
 BANNER = (
     "face enrolment -- numbers only. No frame is displayed, saved, described\n"
     "or written; every line below is a count, an angle, a size, a score or a\n"
-    "millisecond, and the only thing that reaches the disk is a 128-float\n"
+    "millisecond, and the only thing that reaches the disk is the\n"
     "embedding.")
 
 BACKUP_WARNING = (
@@ -141,11 +140,15 @@ BACKUP_WARNING = (
 
 
 # --------------------------------------------------------------- the seams
-def open_gallery() -> FaceGallery:
-    """The user's gallery. ``PATHS.FACE_GALLERY`` honours
+def open_gallery(cfg=None) -> FaceGallery:
+    """The user's gallery FOR THE ACTIVE MODEL. ``PATHS.FACE_GALLERY`` honours
     ``JARVIS_FACE_GALLERY``, which tests/conftest.py forces into a throwaway
-    directory -- so nothing in the suite can reach the real one."""
-    return FaceGallery(root=PATHS.FACE_GALLERY)
+    directory -- so nothing in the suite can reach the real one.
+
+    The model matters here more than anywhere: enrolling ArcFace vectors into
+    a gallery labelled SFace would produce a store nothing could ever read."""
+    backend = "" if cfg is None else cam.face_backend_from_config(cfg)
+    return default_gallery(backend=backend)
 
 
 def build_models(cfg):
@@ -164,7 +167,10 @@ def build_models(cfg):
     try:
         rec = facedetect.load_recogniser(
             min_conf=float(cfg.get("camera.min_conf", 0.6)),
-            model_dir=str(cfg.get("camera.model_dir", "") or "") or None)
+            model_dir=str(cfg.get("camera.model_dir", "") or "") or None,
+            backend=cam.face_backend_from_config(cfg),
+            input_size=(int(cfg.get("camera.detect_width", 320)),
+                        int(cfg.get("camera.detect_height", 180))))
     except Exception as exc:  # noqa: BLE001 - absence is not a crash
         return detector, None, str(exc)
     return detector, rec, ""
@@ -383,7 +389,7 @@ def do_status(cfg, gallery: FaceGallery, say) -> tuple:
         payload["total"] = 0
         return 3, payload
     for gen in gens:
-        one = FaceGallery(root=gallery.root)
+        one = FaceGallery(root=gallery.root, model=gallery.model)
         if not one.load(generation=gen):
             say("  gen %05d  UNREADABLE" % gen)
             continue
@@ -513,8 +519,13 @@ def do_enrol(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
             return 1, {"reason": "camera.identity could not be set"}
         say("camera.identity is now true (Jarvis must restart to read it).")
 
+    # backend= is not optional here. Without it ``probe`` resolves the
+    # default pair, so a box configured for "opencv" is told the InsightFace
+    # weights are missing and enrolment stops over a file it was never going
+    # to load. It is the same dropped-model mistake as _generation_holds'.
     probe = facedetect.probe(model_dir=str(cfg.get("camera.model_dir", "")
-                                           or "") or None)
+                                           or "") or None,
+                             backend=cam.face_backend_from_config(cfg))
     if not probe["ready"]:
         for key in sorted(probe["models"]):
             m = probe["models"][key]
@@ -727,6 +738,9 @@ def do_verify(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     if feed is None:
         say("STOPPED: %s" % feed_why)
         return 3, {"reason": feed_why}
+    bar_why = cam.identity_min_warning(cfg)
+    if bar_why:
+        say("NOTE: %s" % bar_why)
     ident = FaceIdentifier(
         gallery, recogniser,
         min_conf=float(cfg.get("camera.min_conf", 0.6)),
@@ -825,16 +839,33 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
     only meaningful if withdrawing is one command, so this is one command --
     and it has to mean it: ``forget()`` plus a save would leave her in every
     older generation, one --rollback from coming back and still lying on the
-    disk as 128 floats a take. ``purge_label`` writes what is left FIRST and
-    then shreds every generation PROVEN to hold her, plus every crashed-save
-    ``.tmp`` (a whole pool that no label can filter and that the read-back
-    below cannot see, because ``generations()`` is blind to it by design).
+    disk as 128 floats a take.
 
-    WHAT IT WILL NOT DO IS DESTROY A FILE IT COULD NOT READ. That is a
-    deletion that cannot be verified either way, and the cost of guessing
-    wrong is the whole gallery -- so an unreadable generation is NAMED here
-    and the "verified" line is withheld. ``--delete`` with no ``--label`` is
-    the command that means everything, and it is one line further down.
+    WHAT ``purge_label`` PROMISES, and therefore what this may print: no file
+    is destroyed unless the embeddings it held, MINUS HERS, have been read
+    back from the new generation on disk -- by name and by SAMPLE COUNT, off
+    the disk, not from a return value. Anything that cannot be proved that way
+    is left alone and named here, and the "verified" line is withheld.
+
+    THE THREE THINGS IT WILL NOT DO, all the same rule:
+
+    * destroy a file it could not read. ``_read`` refuses a FORMAT number it
+      does not know -- that is the point of the check -- so on the day the
+      format changes every existing generation is "unreadable", and a
+      ``--delete --label somebody-who-was-never-enrolled`` that destroyed
+      them would take the whole gallery (measured 2026-09-03: 13 embeddings,
+      ``_format`` bumped by one, empty directory, exit 0).
+    * destroy one it could not rewrite -- another model's generation, his
+      SFace enrolment with an ArcFace build live.
+    * destroy one holding somebody the new generation does not carry at full
+      count. A label is not an enrolment: the version of this check that
+      asked "is he in the new file?" destroyed a generation holding ten of
+      his takes on the strength of one holding three.
+
+    In all three she is then still on the disk, so this says that too rather
+    than "verified": ``complete`` comes back False and the command exits
+    non-zero. ``--delete`` with no ``--label`` is the command that means
+    everything.
 
     ``camera.identity`` is NOT touched here. It is the switch on his own
     face being written down at all; removing somebody else must not turn his
@@ -843,39 +874,72 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
     out = gallery.purge_label(label, reason="face_enrol --delete --label %s"
                               % label)
     unreadable = list(out.get("unreadable") or ())
+    foreign = list(out.get("foreign") or ())
+    foreign_models = (", ".join(out.get("foreign_models") or ())
+                      or "another model")
+    not_carried = list(out.get("not_carried") or ())
+    # WHO IS ENROLLED, READ OFF THE DISK. This used to print
+    # ``gallery.labels()``, which is what this OBJECT loaded -- and a gallery
+    # for one model loads NOTHING from another model's store, so the line said
+    # "(labels: -)" over a full enrolment sitting right there.
+    on_disk = ", ".join(out.get("labels_on_disk") or ()) or "-"
+
+    def _unreadable_lines():
+        say("           %d generation(s) could NOT be read and were left "
+            "alone: %s. Nothing can say whether they hold %r, so nothing "
+            "here may claim they do not."
+            % (len(unreadable), ", ".join(str(g) for g in unreadable), label))
+        say("           Run --status, then --rollback to drop a bad newest "
+            "generation, or --delete with no --label to destroy everything.")
+
     if not out["generations_with"]:
         say("Nothing enrolled under %r at %s (labels: %s)"
-            % (label, gallery.root, ", ".join(gallery.labels()) or "-"))
+            % (label, gallery.root, on_disk))
         if out.get("tmp_removed"):
             say("           %d crashed-save leftover(s) destroyed as well: "
                 "a .tmp holds a whole pool and no name can filter it."
                 % out["tmp_removed"])
         if unreadable:
-            say("           %d generation(s) could NOT be read and were left "
-                "alone: %s. Nothing can say whether they hold %r, so nothing "
-                "here may claim they do not."
-                % (len(unreadable),
-                   ", ".join(str(g) for g in unreadable), label))
-            say("           Try --status, then --rollback to drop a bad "
-                "newest generation, or --delete with no --label to destroy "
-                "everything.")
+            _unreadable_lines()
             return 1, out
         return 3, out
     if out["reason"]:
         say("STOPPED: %s" % out["reason"])
-        say("Nothing was destroyed -- what is left could not be written, and "
-            "deleting one person may not cost another person's enrolment.")
+        say("Nothing was destroyed -- what is left could not be written, or "
+            "could not be read back off the disk afterwards, and deleting one "
+            "person may not cost another person's enrolment.")
         return 1, out
-    say("deleted    %r from %d generation(s); %d file(s) overwritten and "
-        "unlinked" % (label, len(out["generations_with"]), out["removed"]))
+    if out["removed"]:
+        say("deleted    %r from %d of the %d generation(s) that held her; "
+            "%d file(s) overwritten and unlinked"
+            % (label, out["removed"], len(out["generations_with"]),
+               out["removed"]))
+    else:
+        say("deleted    nothing: none of the %d generation(s) holding %r "
+            "could be destroyed without costing somebody else theirs."
+            % (len(out["generations_with"]), label))
     if out.get("tmp_removed"):
         say("           %d crashed-save leftover(s) destroyed as well: a "
             ".tmp holds a whole pool and no name can filter it."
             % out["tmp_removed"])
-    if out["generation"]:
-        say("           what is left is generation %d: %d embeddings over "
-            "%s" % (out["generation"], out["left"],
-                    ", ".join(out["labels_left"]) or "nobody"))
+    # WHAT IS LEFT IS A STATEMENT ABOUT THE DISK, not about whether this
+    # command happened to write a generation. When every file holding her held
+    # ONLY her there is nobody to carry forward and nothing is written -- and
+    # the old wording then printed "nothing is left; the gallery is empty"
+    # over everybody else's generations.
+    if out["left"]:
+        if out["generation"]:
+            say("           what is left is generation %d: %d embeddings over "
+                "%s" % (out["generation"], out["left"],
+                        ", ".join(out["labels_left"]) or "nobody"))
+        else:
+            say("           nothing needed rewriting: %d embeddings over %s "
+                "are still on disk in generation %d"
+                % (out["left"], ", ".join(out["labels_left"]) or "nobody",
+                   out.get("loaded") or 0))
+    elif out.get("labels_on_disk"):
+        say("           nothing this gallery can read is left, and %s are "
+            "still on this disk under another model." % on_disk)
     else:
         say("           nothing is left; the gallery is empty.")
         # camera.identity stays as it is, and that is said rather than left
@@ -884,32 +948,48 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
         # the one that turns it off.
         say("           camera.identity is untouched -- run --delete with "
             "no --label to turn the feature off as well.")
-    # Read it back rather than claim it. A delete that reports success over a
-    # file that still parses with her in it is the whole failure mode -- and
-    # so is one that reports success over a .tmp, which is why the leftovers
-    # are counted here too and not only the generations.
-    back = FaceGallery(root=gallery.root)
+    # Read it back rather than claim it, and read it back TWICE over. A delete
+    # that reports success over a file that still parses with her in it is the
+    # whole failure mode. ``purge_label`` re-inventories the disk itself --
+    # raw, so it can see her in a file this gallery's model cannot load, which
+    # is the case ``_generation_holds`` cannot answer at all -- and this walks
+    # the generations independently on top of that. The tmps are counted here
+    # too and not only the generations, because a .tmp holds a whole pool.
+    back = FaceGallery(root=gallery.root, model=gallery.model)
     back.load()
-    still = [g for g in back.generations()
-             if _generation_holds(back.root, g, label)]
-    if still:
-        say("           FAILED: generation(s) %s still hold %r"
-            % (", ".join(str(g) for g in still), label))
-        return 1, out
+    still = sorted(set(out.get("still_holding") or ())
+                   | {g for g in back.generations()
+                      if _generation_holds(back.root, g, label, back.model)})
     left_tmps = back.leftovers()
-    if left_tmps:
-        say("           FAILED: %s survived, and a .tmp holds a whole pool"
-            % ", ".join(left_tmps))
-        return 1, out
+    if foreign:
+        say("           NOT VERIFIED: generation(s) %s were written by %s and "
+            "still hold %r. This build writes %s and cannot rewrite them, so "
+            "destroying them would cost everybody else in them their "
+            "enrolment. They were LEFT ALONE."
+            % (", ".join(str(g) for g in foreign), foreign_models, label,
+               gallery.model))
+        say("           Set camera.face_backend back to the model that wrote "
+            "them and run this again, or --delete with no --label to destroy "
+            "everything.")
+    if not_carried:
+        say("           NOT VERIFIED: generation(s) %s still hold %r and were "
+            "LEFT ALONE: somebody else in them is not in the new generation "
+            "with at least the samples they had, so destroying them would "
+            "cost that person part of their enrolment."
+            % (", ".join(str(g) for g in not_carried), label))
+        say("           --delete with no --label is the command that destroys "
+            "everything.")
     if unreadable:
         # The one thing this command may not do is print "verified" over a
         # file nothing could open.
-        say("           NOT VERIFIED: %d generation(s) could not be read and "
-            "were left alone: %s. They may or may not hold %r; nothing here "
-            "can tell, and nothing here destroyed them."
-            % (len(unreadable), ", ".join(str(g) for g in unreadable), label))
-        say("           Run --status, then --rollback to drop a bad newest "
-            "generation, or --delete with no --label to destroy everything.")
+        _unreadable_lines()
+    if still and not (foreign or not_carried):
+        say("           FAILED: generation(s) %s still hold %r"
+            % (", ".join(str(g) for g in still), label))
+    if left_tmps:
+        say("           FAILED: %s survived, and a .tmp holds a whole pool"
+            % ", ".join(left_tmps))
+    if still or left_tmps or unreadable or not out.get("complete"):
         return 1, out
     say("           verified: no generation on disk holds %r any more."
         % label)
@@ -920,8 +1000,21 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
     return 0, out
 
 
-def _generation_holds(root, generation: int, label: str) -> bool:
-    one = FaceGallery(root=root)
+def _generation_holds(root, generation: int, label: str, model: str) -> bool:
+    """Does this one generation, READ AS ``model``, still hold ``label``?
+
+    ``model`` IS REQUIRED AND HAS NO DEFAULT, and that is the fix rather than
+    an accident. This used to build ``FaceGallery(root=root)``, which takes
+    the module default -- so it was an SFace gallery while its caller was
+    ArcFace's. On a mixed store the cross-model refusal then made every
+    generation answer False, the read-back saw nothing anywhere, and
+    ``--delete --label`` printed "verified: no generation on disk holds
+    <label> any more" over embeddings that were still there. A default
+    argument is exactly how the model got dropped in the first place, so
+    there is not one: a caller that cannot say which model it means has no
+    business asking this question.
+    """
+    one = FaceGallery(root=root, model=model)
     return bool(one.load(generation=generation)) and label in one.labels()
 
 
@@ -1081,7 +1174,7 @@ def main(argv=None) -> int:
     say("")
 
     cfg = AssistantConfig.load()
-    gallery = open_gallery()
+    gallery = open_gallery(cfg)
     report: dict = {"banner": BANNER, "gallery": str(gallery.root)}
 
     if args.status:

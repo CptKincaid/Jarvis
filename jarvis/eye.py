@@ -383,6 +383,15 @@ class FaceIdentifier:
     ``SessionIdentity.match_min`` is: a threshold calibrated for one vector
     silently applied to another is how a gate stops meaning anything.
 
+    AND THAT DEFAULT IS NOW A TRAP TO WATCH, since 2026-09-03. With
+    ``camera.face_backend`` on "insightface" the vectors are ArcFace's 512,
+    for which NO same-person cosine has been measured on this machine --
+    ``facegallery.cosine_same("arcface_mbf")`` is None, deliberately. A caller
+    that lets this default stand is applying SFace's number to ArcFace's
+    distribution, which is exactly the failure the paragraph above names.
+    ``jarvis/camera.identity_min_warning`` says so in the log on every start;
+    ``scripts/face_model_compare.py`` is where the real number comes from.
+
     WHAT A NAME MAY DO, which is his standing ruling and not a preference:
     **identity may REMOVE capability or ADD a name; it must never GRANT
     capability the existing gates do not already grant.** ``resolve_wake``

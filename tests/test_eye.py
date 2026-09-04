@@ -357,8 +357,12 @@ def test_the_camera_section_carries_no_schedule_of_its_own():
     disagrees quietly is the one that keeps the lens open at 22:00."""
     from jarvis.assistant_config import DEFAULTS
     keys = set(DEFAULTS["camera"])
-    assert not {k for k in keys if "curfew" in k or "hours" in k
-                or "offline" in k or "start" in k or "end" in k}
+    # MATCHED PER UNDERSCORE-SEGMENT, not as a substring. "end" inside
+    # "face_backend" is not a schedule, and the substring form failed on that
+    # key the day it was added -- a rule that cries wolf gets deleted, and
+    # this one is guarding the lens at 22:00.
+    schedule = {"curfew", "hours", "offline", "start", "end", "until"}
+    assert not {k for k in keys if schedule & set(k.split("_"))}
 
 
 def test_the_detect_size_cannot_drift_from_the_capture_aspect():

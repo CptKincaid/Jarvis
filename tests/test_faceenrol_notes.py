@@ -178,7 +178,10 @@ def test_a_take_with_no_note_writes_no_note_key(tmp_path):
         g.add("hunter", vec)
     g.save(reason="plain")
     keys = sorted(np.load(g.path_for(1)).files)
-    assert keys == ["_created_ns", "_format", "_reason",
+    # _model joined the header on 2026-09-03 and is written on every save;
+    # its ABSENCE is what identifies his pre-swap SFace generations, so it
+    # can never be written empty. FORMAT is deliberately NOT bumped.
+    assert keys == ["_created_ns", "_format", "_model", "_reason",
                     "emb_hunter_0000", "emb_hunter_0001", "emb_hunter_0002"]
 
 
@@ -1049,7 +1052,7 @@ def test_the_voice_command_opens_no_camera_and_hands_the_command_over(
         monkeypatch, tmp_path):
     from jarvis import commander as cm
     gallery = FaceGallery(root=tmp_path / "g")
-    monkeypatch.setattr(cm, "_face_gallery", lambda: gallery)
+    monkeypatch.setattr(cm, "_face_gallery", lambda _c: gallery)
     monkeypatch.setattr(ee, "to_clipboard", lambda text, run=None: True)
     cmd = _face_cmd("face enrol")
     out = cmd.handler(FakeCommander(), "enrol my face",
@@ -1063,7 +1066,7 @@ def test_the_voice_command_names_the_person_and_the_consent_step(monkeypatch,
                                                                  tmp_path):
     from jarvis import commander as cm
     monkeypatch.setattr(cm, "_face_gallery",
-                        lambda: FaceGallery(root=tmp_path / "g"))
+                        lambda _c: FaceGallery(root=tmp_path / "g"))
     monkeypatch.setattr(ee, "to_clipboard", lambda text, run=None: True)
     cmd = _face_cmd("face enrol")
     text = "add heather's face"
@@ -1076,7 +1079,7 @@ def test_the_voice_command_asks_whose_face_rather_than_guessing(monkeypatch,
                                                                 tmp_path):
     from jarvis import commander as cm
     monkeypatch.setattr(cm, "_face_gallery",
-                        lambda: FaceGallery(root=tmp_path / "g"))
+                        lambda _c: FaceGallery(root=tmp_path / "g"))
     cmd = _face_cmd("face enrol")
     text = "add another face"
     m = cmd.matcher(text)
@@ -1093,7 +1096,7 @@ def test_the_voice_delete_destroys_nothing(monkeypatch, tmp_path):
         g.add("heather", vec)
     g.save(reason="test")
     monkeypatch.setattr(cm, "_face_gallery",
-                        lambda: FaceGallery(root=g.root))
+                        lambda _c: FaceGallery(root=g.root))
     monkeypatch.setattr(ee, "to_clipboard", lambda text, run=None: True)
     cmd = _face_cmd("face forget")
     text = "forget heather's face"
@@ -1114,7 +1117,7 @@ def test_the_owner_label_comes_from_his_config_and_never_the_gallery(
     g = FaceGallery(root=tmp_path / "g")
     g.add("heather", base_vec(808))
     g.save(reason="test")
-    monkeypatch.setattr(cm, "_face_gallery", lambda: FaceGallery(root=g.root))
+    monkeypatch.setattr(cm, "_face_gallery", lambda _c: FaceGallery(root=g.root))
     assert cm._face_owner(FakeCommander("Hunter")) == "hunter"
     assert cm._face_owner(FakeCommander("")) == "hunter"
 
@@ -1126,7 +1129,7 @@ def test_the_gallery_question_is_answered_without_a_lens(monkeypatch,
     for vec in same_face(base_vec(1), 6, seed=2):
         g.add("hunter", vec, note="looking at the lens", yaw_deg=4.0)
     g.save(reason="test")
-    monkeypatch.setattr(cm, "_face_gallery", lambda: FaceGallery(root=g.root))
+    monkeypatch.setattr(cm, "_face_gallery", lambda _c: FaceGallery(root=g.root))
     cmd = _face_cmd("face gallery")
     text = "who do you recognise"
     out = cmd.handler(FakeCommander(), text, cmd.matcher(text))
