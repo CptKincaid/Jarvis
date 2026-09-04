@@ -1088,6 +1088,114 @@ class VoiceGallery:
                      removed)
         return removed
 
+    # ------------------------------------------------------- the migration
+    def migrate_voiceprint(self, label: str, path: Optional[Path] = None,
+                           reason: str = "") -> dict:
+        """Carry an existing single-speaker ``voiceprint.npz`` in under one
+        label. HE DOES NOT PAY FOR THIS FEATURE WITH A RE-ENROLMENT.
+
+        Same encoder, same 192 dimensions, same silence-trimmed pipeline, so
+        the vectors are valid exactly as they stand: they move, they are not
+        recomputed. He re-enrolled his face this week and should not be asked
+        to sit through eight more takes to get a store he did not ask for.
+
+        ONLY FORMAT 2 MIGRATES. Format 1 predates ``trim_silence``: those
+        embeddings were pooled with the silence of fixed-length enrolment
+        takes while probes are trimmed now, and the asymmetry measurably
+        lowers genuine scores. Carrying them across would import a known-bad
+        pool under a new name and hide it behind a fresh format number, so
+        format 1 is REFUSED and speaker.py's existing re-enrol message stands.
+
+        REVERSIBLE BY CONSTRUCTION, and the reversal is the point rather than
+        a courtesy. Nothing is read from ``voiceprint.npz`` but numbers, and
+        nothing at all is written to it -- it stays byte for byte what it was,
+        which is what makes it the rollback. Undoing this is deleting the
+        generation it wrote.
+
+        Returns numbers so a script can print them and a test can read them.
+        """
+        src = Path(path) if path is not None else PATHS.VOICEPRINT
+        out = {"ok": False, "label": str(label), "source": str(src),
+               "format": 0, "found": 0, "migrated": 0, "dropped": 0,
+               "generation": 0, "why": ""}
+        if not _LABEL_RE.match(str(label or "")):
+            out["why"] = ("%r is not a label the registry, the face gallery "
+                          "and this store can all hold" % (label,))
+            return out
+        if self.root is None:
+            out["why"] = "this gallery has no root; it cannot be saved"
+            return out
+        if not src.exists():
+            out["why"] = "there is no voiceprint at %s to migrate" % src
+            return out
+        # NEVER OVER AN EXISTING ENROLMENT. A second run must not append 14
+        # more copies of the same takes, which would double the label's weight
+        # in its own centroid and quietly make every later margin wrong.
+        if label in self.disk_labels():
+            out["why"] = ("%s already has embeddings in the voice gallery; "
+                          "migrating again would store the same takes twice"
+                          % label)
+            return out
+        try:
+            data = np.load(src)
+            names = list(data.files)
+            fmt = int(data["_format"][0]) if "_format" in names else 1
+        except Exception as exc:  # noqa: BLE001 - any failure is a refusal
+            out["why"] = "%s could not be read (%s)" % (src, type(exc).__name__)
+            return out
+        out["format"] = fmt
+        if fmt != 2:
+            out["why"] = (
+                "%s is format %d and only format 2 migrates. Format 1 predates "
+                "silence trimming: those embeddings were pooled with the "
+                "silence of fixed-length takes and score low against trimmed "
+                "probes, so they would arrive here already broken. Re-enrol "
+                "with scripts/enroll_voice.py --reset instead." % (src, fmt))
+            log.warning("voice gallery: %s", out["why"])
+            return out
+        keys = sorted(k for k in names if k.startswith("emb_"))
+        out["found"] = len(keys)
+        if not keys:
+            out["why"] = "%s holds no embeddings" % src
+            return out
+        staged = []
+        for key in keys:
+            arr = np.asarray(data[key], dtype=np.float32).ravel()
+            why = degenerate_reason(arr, self.model)
+            if why:
+                out["dropped"] += 1
+                log.warning("voice gallery migration: dropping %s (%s)",
+                            key, why)
+                continue
+            staged.append(arr)
+        if not staged:
+            out["why"] = "%s holds no usable embeddings" % src
+            return out
+        before = dict(self._pool), dict(self._takes), dict(self._consent)
+        for arr in staged:
+            self.add(label, arr, src="legacy",
+                     note="migrated from voiceprint.npz format 2")
+        # The owner's own pool is his own consent; identity.Person carries the
+        # same distinction ("owner" vs "typed") and face_enrol.consent draws it
+        # in exactly this place.
+        if not self.consent(label):
+            self.set_consent(label, "owner")
+        try:
+            out["generation"] = self.save(
+                reason=reason or ("migrated %d takes from voiceprint.npz "
+                                  "format 2" % len(staged)))
+        except ValueError as exc:
+            self._pool, self._takes, self._consent = before
+            out["why"] = str(exc)
+            log.warning("voice gallery: migration refused -- %s", exc)
+            return out
+        out["migrated"] = len(staged)
+        out["ok"] = True
+        log.info("voice gallery: migrated %d take(s) from %s as %r into "
+                 "generation %d; %s is untouched and stays the rollback",
+                 len(staged), src.name, label, out["generation"], src.name)
+        return out
+
     def provenance(self) -> dict:
         return dict(self._provenance)
 
