@@ -192,8 +192,49 @@ MIN_TAKES_TO_NAME = 8
 # where the owner's label is actually known. Asserted equal by a test.
 ABSTAIN_SECONDS = 1.5
 
-# Passive samples one label may ever accumulate. See ``passive_ok``.
-MAX_PASSIVE = 20
+# PASSIVE LEARNING IS OFF, AND THE ZERO IS A MEASUREMENT RATHER THAN A MOOD.
+#
+# The plan for this store was a frozen reference centroid and a cap of 20.
+# Freezing is right and it is implemented -- gating a new sample against the
+# centroid it is about to move bounds one STEP and not the WALK, so an
+# attacker bootstraps a little further on every accepted sample. But freezing
+# turns out to be necessary and NOT sufficient, and the difference was
+# measured rather than assumed (2026-09-04, synthetic vectors at his pool's
+# spread; tests/test_voice_passive.py reproduces every row):
+#
+#   worst-case attacker, every sample at the bar, all in one direction,
+#   against a 14-take enrolment
+#
+#     rule                         after 20   cos(new, original)   intruder
+#     gate on the LIVE centroid                     0.657            0.843
+#     gate on the FROZEN centroid                   0.724            0.790
+#     frozen, bar raised to 0.55                    0.783            0.731
+#     frozen, bar raised to 0.80                    0.908            0.549
+#
+# The intruder starts at 0.149 and the accept bar is 0.30, so EVERY row above
+# ends with a stranger comfortably inside. No bar in a plausible range fixes
+# it, because the problem is not the bar: twenty new samples against fourteen
+# originals is a 59% swing in the mean whatever each one scores. Only the
+# COUNT bounds it --
+#
+#     frozen, bar at the label's own leave-one-out floor
+#       cap  1 -> cos 0.997, intruder 0.220     (a stranger stays out)
+#       cap  2 -> cos 0.991, intruder 0.281     (only just)
+#       cap  3 -> cos 0.982, intruder 0.334     (a stranger is now inside)
+#
+# -- and two samples of adaptation is not worth a door. There is a second,
+# worse problem underneath: ``voiceprint.npz`` cannot tell an enrolment take
+# from a passively learned one, so "the frozen enrolment centroid" is only
+# frozen until the next restart, after which the walk resumes from wherever it
+# got to. This store CAN tell them apart (``src_`` = "passive"), which is why
+# the arithmetic lives here -- but the weighting is hard toward false reject,
+# a false accept hands somebody else his assistant with owner scope, and with
+# N people enrolled this is N doors instead of one.
+#
+# So the default is zero and ``passive_ok`` refuses everything. A caller who
+# means it passes ``max_passive`` explicitly and gets the frozen reference,
+# the per-person genuine floor, the margin-won label and the cap.
+MAX_PASSIVE = 0
 
 
 @dataclass(frozen=True)
@@ -226,6 +267,44 @@ class Take:
     def as_dict(self) -> dict:
         return {"len_s": self.len_s, "rms": self.rms, "note": self.note,
                 "at": self.at, "src": self.src}
+
+
+@dataclass(frozen=True)
+class VoiceVerdict:
+    """What the voice leg has to say. ``who == ""`` IS THE DEFAULT RETURN.
+
+    UNKNOWN is reachable by construction rather than by an exception path:
+    every refusal below builds this object with an empty ``who`` and a ``why``
+    that names the number it failed on. Nobody is named unless BOTH bars were
+    cleared and the label had enough takes for its centroid to have settled.
+
+    ``margin`` is None when only one label is enrolled -- "the bar did not
+    apply", which is a different fact from "the bar was cleared by 0.0". The
+    same three-valued habit ``facegallery.Take.yaw_deg`` and
+    ``jarvis/roomsensor.py`` write down: absent is not zero.
+
+    ``provisional`` carries the label that WOULD have won if it had enough
+    takes. It is there so the caller can say "I think that's Mara, but I've
+    only heard her a few times" instead of silently saying nothing -- and it
+    is never ``who``, so it can never grant scope.
+    """
+
+    who: str = ""
+    score: float = 0.0
+    second: str = ""
+    second_score: float = 0.0
+    margin: Optional[float] = None
+    speech_s: float = 0.0
+    why: str = ""
+    provisional: str = ""
+    abstained: bool = False
+    scores: Tuple[Tuple[str, float], ...] = ()
+
+    def as_dict(self) -> dict:
+        return {"who": self.who, "score": self.score, "second": self.second,
+                "second_score": self.second_score, "margin": self.margin,
+                "speech_s": self.speech_s, "why": self.why,
+                "provisional": self.provisional, "abstained": self.abstained}
 
 
 def label_ok(label) -> bool:
@@ -477,6 +556,200 @@ class VoiceGallery:
         self._takes.pop(str(label), None)
         self._consent.pop(str(label), None)
         return gone
+
+    # ---------------------------------------------------------- the verdict
+    def identify(self, vec, speech_s: float,
+                 threshold: Optional[float] = None) -> VoiceVerdict:
+        """Who this embedding is, or UNKNOWN. NOBODY IS NAMED BY DEFAULT.
+
+        Takes an EMBEDDING and the seconds of TRIMMED SPEECH it came from --
+        not audio. The trim and the encoder live in ``speaker.py``; keeping
+        them there is what lets this whole decision be tested with no
+        microphone and no GPU, which on this box is the only way it can be
+        tested at all.
+
+        SCORE IS COSINE AGAINST THE PER-LABEL CENTROID, and this is the one
+        place the design deliberately departs from ``facegallery.match``.
+        That method scores against the pool's BEST SAMPLE and argues, rightly
+        for faces, that a centroid of him in glasses and him without is a face
+        that does not exist. Voice is measurably the other way round. On his
+        own pool (2026-09-04): sample-to-sample cosine bottoms at 0.283 --
+        BELOW the 0.30 bar that admits him -- while sample-to-centroid runs
+        0.632-0.831 and leave-one-out 0.570-0.798. Nearest-sample matching
+        would reject one of his takes against another of his takes on day one.
+
+        TWO BARS, BOTH REQUIRED:
+
+        1. ACCEPT -- top1 >= ``threshold``, default ``ACCEPT_DEFAULT`` (0.30,
+           measured; the live value comes from voice_settings.json). Nothing
+           here re-derives it and nothing here raises it.
+        2. MARGIN -- (top1 - top2) >= ``MARGIN`` (0.20), applied ONLY when a
+           second label is enrolled. Derived from splitting his own pool into
+           two pretend people, so it bounds what his own within-person noise
+           can produce; it is NOT a validated discrimination bar and the
+           constant's comment says so at length.
+
+        Fail either and ``who`` is "" with a ``why`` naming the number. That
+        is UNKNOWN, and it is the sentence "I can hear someone I know, but I
+        can't tell which of you" rather than a coin flip.
+
+        ABSTAIN, UNCHANGED AND LOAD-BEARING. Below ``ABSTAIN_SECONDS`` of
+        trimmed speech nothing is scored at all: a score from that little
+        speech is a coin flip (FRR@0.30 measured at 30% on 1.0 s against 0% at
+        3.0 s), and every "Yes." he says arrives that short. The verdict comes
+        back with ``abstained`` True and ``who`` "" -- and THE OWNER FALLBACK
+        FOR AN ABSTENTION LIVES IN ``gate._voice_leg``, where the owner's
+        label is actually known, because this module is arithmetic and has no
+        business deciding who owns the machine. An abstention is a fail-open,
+        not a recognition, and must never be narrated as one.
+
+        PROVISIONAL. A label with fewer than ``MIN_TAKES_TO_NAME`` takes
+        scores and logs but never names -- its centroid has not settled (cos
+        to the converged position measures 0.841 at k=2 against 0.975 at k=8).
+        """
+        speech_s = float(speech_s or 0.0)
+        bar = ACCEPT_DEFAULT if threshold is None else float(threshold)
+        if speech_s < ABSTAIN_SECONDS:
+            return VoiceVerdict(speech_s=speech_s, abstained=True,
+                                why="abstain: %.2fs of speech is under %.2fs"
+                                    % (speech_s, ABSTAIN_SECONDS))
+        cents = self.centroids()
+        if not cents:
+            return VoiceVerdict(speech_s=speech_s, why="nobody is enrolled")
+        why_bad = degenerate_reason(vec, self.model)
+        if why_bad:
+            return VoiceVerdict(speech_s=speech_s,
+                                why="no usable embedding: %s" % why_bad)
+        ranked = sorted(((label, cosine(vec, c)) for label, c in cents.items()),
+                        key=lambda kv: kv[1], reverse=True)
+        top, top_s = ranked[0]
+        second, second_s = ranked[1] if len(ranked) > 1 else ("", 0.0)
+        margin = (top_s - second_s) if second else None
+        common = {"score": float(top_s), "second": second,
+                  "second_score": float(second_s), "margin": margin,
+                  "speech_s": speech_s,
+                  "scores": tuple((k, float(v)) for k, v in ranked)}
+
+        if top_s < bar:
+            # Indistinguishable from an unrelated voice, on purpose: this is
+            # the branch the ordinary UNKNOWN line answers.
+            return VoiceVerdict(why="best %.3f below %.2f" % (top_s, bar),
+                                **common)
+        if margin is not None and margin < MARGIN:
+            return VoiceVerdict(
+                why="margin %.3f below %.2f (%s %.3f, %s %.3f)"
+                    % (margin, MARGIN, top, top_s, second, second_s),
+                **common)
+        if self.provisional(top):
+            return VoiceVerdict(
+                provisional=top,
+                why="%s has only %d take(s); %d before a name"
+                    % (top, self.count(top), MIN_TAKES_TO_NAME),
+                **common)
+        return VoiceVerdict(who=top, why="%s at %.3f" % (top, top_s), **common)
+
+    def genuine_floor(self, label: str) -> Optional[float]:
+        """The BOTTOM of this person's own measured band: the smallest
+        leave-one-out cosine across their enrolment takes.
+
+        A per-person, measured bar rather than a global guess. On his real
+        pool it is 0.570 (2026-09-04, 14 takes, LOO range 0.570-0.798) against
+        an accept bar of 0.30 -- so a sample only just past the accept bar is
+        nowhere near as characteristic of him as his own worst enrolment take,
+        and has no business being added to the pool that defines him.
+
+        None below two enrolment takes: there is no leave-one-out to take.
+        """
+        pool = self._enrolment_vectors(str(label))
+        if len(pool) < 2:
+            return None
+        vals = []
+        for i in range(len(pool)):
+            rest = centroid([e for j, e in enumerate(pool) if j != i])
+            vals.append(cosine(pool[i], rest))
+        return float(min(vals))
+
+    def passive_ok(self, label: str, vec, verdict: VoiceVerdict,
+                   frozen: Optional[np.ndarray] = None,
+                   max_passive: Optional[int] = None) -> Tuple[bool, str]:
+        """May this accepted sample join ``label``'s pool? ``(ok, why not)``.
+
+        OFF BY DEFAULT -- ``MAX_PASSIVE`` is 0, and that constant's comment
+        carries the measurement that put it there. This method is the
+        arithmetic a caller gets if it deliberately turns passive learning on
+        by passing ``max_passive``, and every condition below is a measured
+        direction rather than a preference:
+
+        1. Scored against a FROZEN reference centroid -- the enrolment's --
+           never the live one. Gating a sample against the centroid it is
+           about to move bounds one STEP and not the WALK: measured, twenty
+           at-threshold accepts under the live rule rotate the centroid to cos
+           0.657 of where it started and lift an intruder from 0.149 to 0.843.
+           Freezing alone gets that to 0.724 / 0.790, which is better and is
+           still a stranger inside the door -- hence 2 and 4.
+        2. Only for a label the verdict NAMED, which means it cleared BOTH the
+           accept bar and the margin. A near miss teaches nobody.
+        3. Never for a provisional label: a centroid that has not settled must
+           not be moved by evidence it chose for itself.
+        4. At least this person's own GENUINE FLOOR, not the accept bar. The
+           accept bar is where recognition starts; the floor is where THIS
+           person's own worst enrolment take sits. Adding something weaker
+           than his own weakest take is how the pool stops being about him.
+        5. At most ``max_passive`` passive takes, ever, and the count is read
+           from the stored ``src_`` keys rather than remembered -- which is the
+           thing ``voiceprint.npz`` cannot do, and the reason the walk resumes
+           there after every restart.
+        """
+        label = str(label)
+        cap = MAX_PASSIVE if max_passive is None else int(max_passive)
+        if cap <= 0:
+            return False, ("passive learning is off (MAX_PASSIVE is 0): no bar "
+                           "bounds the drift, only the count does, and two "
+                           "samples of adaptation is not worth the door")
+        if verdict is None or verdict.who != label:
+            return False, "the verdict did not name %s" % label
+        if verdict.abstained:
+            return False, "an abstention is not a recognition"
+        if self.provisional(label):
+            return False, ("%s is provisional (%d of %d takes); a centroid "
+                           "that has not settled may not teach itself"
+                           % (label, self.count(label), MIN_TAKES_TO_NAME))
+        passive = sum(1 for t in self.takes(label) if t.src == "passive")
+        if passive >= cap:
+            return False, ("%s already holds %d passive sample(s), the cap"
+                           % (label, passive))
+        why = degenerate_reason(vec, self.model)
+        if why:
+            return False, why
+        ref = self.enrolment_centroid(label) if frozen is None else frozen
+        if ref is None:
+            return False, "%s has no enrolment centroid to compare against" % label
+        bar = self.genuine_floor(label)
+        if bar is None:
+            return False, "%s has too few takes to have a genuine floor" % label
+        score = cosine(vec, ref)
+        if score < bar:
+            return False, ("%.3f against the frozen enrolment centroid, below "
+                           "%s's own genuine floor of %.3f" % (score, label, bar))
+        return True, ""
+
+    def _enrolment_vectors(self, label: str) -> List[np.ndarray]:
+        """This label's NON-PASSIVE takes, or the whole pool when nothing is
+        marked -- which is what a migrated legacy pool looks like, and every
+        one of those takes did come from a deliberate enrolment."""
+        pool = self._pool.get(str(label), [])
+        tks = self.takes(str(label))
+        kept = [e for e, t in zip(pool, tks) if t.src != "passive"]
+        return kept or list(pool)
+
+    def enrolment_centroid(self, label: str) -> Optional[np.ndarray]:
+        """The centroid of this label's NON-PASSIVE takes -- the frozen
+        reference ``passive_ok`` measures against.
+
+        Falls back to the whole pool only when nothing is marked, which is
+        what a migrated legacy pool looks like: every one of those takes came
+        from a deliberate enrolment, so the two answers are the same."""
+        return centroid(self._enrolment_vectors(str(label)))
 
     # ------------------------------------------------------------- on disk
     def path_for(self, generation: int) -> Path:
