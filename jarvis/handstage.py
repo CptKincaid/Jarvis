@@ -39,7 +39,12 @@ THE PRECONDITION STACK (safety lane), cheapest and most-vetoing first:
      is live when a question opens is put down.
   4. a FACE BASELINE exists: the median interocular distance over the last
      ``face_window_s`` with at least ``face_min_samples`` samples. No
-     baseline, no scale, no grab -- a refusal, never a default.
+     baseline, no scale, no grab -- a refusal, never a default. A RUN of
+     faces -- the median of the last ``FACE_JUMP_SAMPLES`` -- more than
+     ``FACE_JUMP_FRAC`` away from that median is a lean toward the lens,
+     and is no opinion for the frame, because the median lags the lean
+     and the reach ratio would inherit the error. A single wild sample is
+     not a lean and is absorbed, which is what the median is for.
   5. ATTENTION IS LATCHED, not sampled per frame: the reaching arm crosses
      the face at exactly the moment the gesture matters. The stage arms
      when one face was ATTENDING within ``attend_latch_s`` and stays armed
@@ -53,8 +58,12 @@ frame). ``CastThresholds.for_fps`` scales the frame counters for a faster
 feed, and applied to the CONFIGURED 15 it would double the dwell to six
 frames -- 800 ms of holding a fist still before anything happens. So the
 stage measures the interval between its own calls and applies ``for_fps``
-to that, re-fitting only while the machine is idle. The wall-clock stall
-backstop is set from the same measurement.
+to that, re-fitting only while the machine is idle and through
+``CastGesture.retune`` (which also rebuilds the open-history window --
+assigning ``t`` alone left it at its construction-time length, and at
+30 fps delivered that grabbed 0/48). The wall-clock stall backstop is set
+from the same measurement, and until there is one it is floored at
+``STALL_FLOOR_S`` rather than trusting the configured rate.
 
 ATTEND_LATCH_S IS A GUESS. The frames lane proposed 3.0 s and the safety
 lane 1.0 s; 3.0 is used because a reach, a close and a three-frame dwell is
@@ -92,6 +101,32 @@ DEFAULT_THREADS = 2           # matches camera.threads; see handpose.py
 RETRY_MODELS_S = 60.0         # how often a missing model is looked for again
 FPS_WINDOW = 24               # frames over which the delivered rate is read
 FPS_REFIT_DELTA = 0.5         # re-fit the counters when the rate moves this much
+# The stall backstop until a rate has been MEASURED. His config asks for
+# 15 fps, which seeds the engine's three-period bar at 0.2 s; in low light
+# the LifeCam delivers 3.8 fps (263 ms a frame), so every one of the first
+# eight frames read as a stall and reset the reach -- a gesture begun
+# inside ~2 s of the worker starting was lost (MEASURED: 0/24 with a
+# 3-frame lead against 24/24 at 7.5 fps). Three frames at 3.8 fps is
+# 0.79 s; the measured rate replaces this the moment there is one.
+STALL_FLOOR_S = 0.8
+# A face this much bigger or smaller than its own 5 s median is a LEAN,
+# and the reach ratio measured against the lagging median is wrong by the
+# same fraction: leaning in from 700 to 450 mm while closing an open hand
+# onto the chin read R ~2.5 and grabbed 6 of 6 sub-frame phases through
+# the wired path (MEASURED). No opinion for that frame instead. 20% is
+# above landmark jitter and a 30-degree head turn (cos 30 = 0.87) and
+# below any lean that changes the answer.
+FACE_JUMP_FRAC = 0.20
+# ...and the near side of that comparison is itself a MEDIAN, over the
+# last three samples, not the one frame that just arrived. Comparing a
+# single raw sample against the median throws away the only thing the
+# median is there for: one wild YuNet interocular (400 px is a face
+# 156 mm from the lens) is absorbed by the median and must not be read as
+# a lean. MEASURED, one 400 px sample injected at each of the 14 frames
+# of a his-left throw: against the raw frame 13 of 14 throws survived,
+# against the median of three 14 of 14, and the lean stays refused 6/6
+# either way.
+FACE_JUMP_SAMPLES = 3
 
 # Why the stage did not look this frame. "" when it did.
 REASON_OFF = "off"
@@ -240,6 +275,9 @@ class HandStage:
             face_min_samples if face_min_samples is not None
             else _int_option(get_option, OPTION_FACE_MIN, FACE_MIN_SAMPLES)))
         self._base = gesture.t
+        # The configured rate is an ASK the camera has not met; do not let
+        # it set a stall bar shorter than a low-light frame period.
+        gesture.stall_s = max(float(gesture.stall_s), STALL_FLOOR_S)
         self._tracker = None
         self._tracker_reason = ""
         self._tracker_tried = -1e9
@@ -293,10 +331,9 @@ class HandStage:
         if abs(fps - self._fps_applied) < FPS_REFIT_DELTA:
             return
         self._fps_applied = fps
-        self.gesture.t = CastThresholds.for_fps(fps, self._base)
-        # Three frame periods of silence, at the rate actually delivered.
-        self.gesture.preview_fps = max(fps, 0.1)
-        self.gesture.stall_s = 3.0 / max(fps, 0.1)
+        # Counters, the open-history window and the three-period stall
+        # bar, all at the rate actually delivered, in one locked step.
+        self.gesture.retune(CastThresholds.for_fps(fps, self._base), fps=fps)
 
     def _baseline(self, faces, t: float) -> float:
         """The interocular distance the reach ratio is measured against: a
@@ -313,7 +350,17 @@ class HandStage:
             self._eyes.popleft()
         if len(self._eyes) < self.face_min_samples:
             return 0.0
-        return float(statistics.median(px for _t, px in self._eyes))
+        median = float(statistics.median(px for _t, px in self._eyes))
+        recent = [px for _t, px in list(self._eyes)[-FACE_JUMP_SAMPLES:]]
+        near = float(statistics.median(recent)) if recent else 0.0
+        if near > 0.0 and median > 0.0 and \
+                abs(near - median) / median > FACE_JUMP_FRAC:
+            # A lean, not a reach: the median has not caught up with the
+            # face and the ratio would be measured against the wrong
+            # scale. A LEAN MOVES A RUN OF SAMPLES; a bad detection moves
+            # one, and ``near`` being a median is what tells them apart.
+            return 0.0
+        return median
 
     def _arm(self, faces, t: float) -> bool:
         if len(faces) == 1 and bool(getattr(faces[0], "attending", False)):
@@ -430,7 +477,8 @@ class HandStage:
 
 
 __all__ = [
-    "ATTEND_LATCH_S", "DEFAULT_THREADS", "FACE_MIN_SAMPLES", "FACE_WINDOW_S",
+    "ATTEND_LATCH_S", "DEFAULT_THREADS", "FACE_JUMP_FRAC",
+    "FACE_JUMP_SAMPLES", "FACE_MIN_SAMPLES", "FACE_WINDOW_S", "STALL_FLOOR_S",
     "HandShot", "HandStage", "OPTION_ENABLED", "OPTION_PREFIX",
     "REASON_NO_MODELS", "REASON_OFF", "REASON_QUESTION", "REASON_UNARMED",
     "default_tracker_factory", "gesture_enabled", "thresholds_from_options",

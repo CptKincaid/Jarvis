@@ -16,6 +16,7 @@ from jarvis.ui.carry_chip import (
     STATE_IDLE,
     STATE_LANDED,
     STATE_THROWN,
+    backstop_due,
     chip_colors,
     chip_name,
     chip_tone,
@@ -84,3 +85,14 @@ def test_the_rule_depletes_over_the_ttl_and_clamps():
     assert rule_fraction(9.0, 0.0, 8.0) == 0.0
     assert rule_fraction(-1.0, 0.0, 8.0) == 1.0
     assert rule_fraction(1.0, 0.0, 0.0) == 0.0
+
+
+def test_the_backstop_is_the_chips_own_timer_and_zero_means_none():
+    """When no frame arrives to end a carry the chip puts it down itself
+    at the wall-clock cap (MEASURED before: 60 s of silence, still
+    holding). No backstop asked for is never "due at once"."""
+    assert backstop_due(1000.0, 1000.0, 8.0) is False
+    assert backstop_due(1007.9, 1000.0, 8.0) is False
+    assert backstop_due(1008.1, 1000.0, 8.0) is True
+    assert backstop_due(1060.0, 1000.0, 0.0) is False
+    assert backstop_due(1060.0, 1000.0, -1.0) is False

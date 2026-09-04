@@ -59,6 +59,13 @@ plausible: correct magnitudes, believable angles, wrong side of the room. A
 test that checks ``|B - A|`` passes with the sign inverted, so the tests here
 assert a NAMED DIRECTION on a trajectory whose direction is in its own name.
 
+THE CANCELS, and where each lives. Opening the hand where it is (a
+release under one hand-unit of travel), pulling it back STILL CLOSED
+(``reach_exit``, re-tested on every carry frame), a fling at the desk (the
+DOWN sector), the spoken word and the chip click (``cancel()``), the frame
+cap and the wall-clock cap (``_carry_expired``, and ``sweep()`` when no
+frame arrives to test it). Every one of them is a ``drop``; none can throw.
+
 THE THROW AXIS IS HORIZONTAL, AND THE FIELD OF VIEW FORCED THAT. At a
 425-450 mm reach the frame is 4.6 hand-units wide but only 2.6 tall, so a
 centred anchor has 2.29 units of lateral room and 1.29 vertical -- and an
@@ -238,6 +245,11 @@ def bearing_deg(his_right: float, his_up: float) -> float:
                                    float(his_right))) % 360.0
 
 
+def _turn_between(a: float, b: float) -> float:
+    """The unsigned angle between two bearings, 0..180 degrees."""
+    return abs((float(a) - float(b) + 180.0) % 360.0 - 180.0)
+
+
 def sector(bearing: float, half_deg: float = 35.0) -> str:
     """'right' | 'up' | 'left' | 'down' | 'ambiguous'.
 
@@ -312,6 +324,21 @@ class CastThresholds:
     # reach and then pulls back along the lens axis cannot grab.
     reach_min: float = 2.35
     reach_arm: float = 1.60
+    # MEASURED (adversarial pass, 09-03). The reach is re-tested DURING the
+    # carry, not only during the dwell: a fist still closed below this bar
+    # is a WITHDRAWAL and the carry ends as a drop, never a throw. Without
+    # it the promised cancel "a fist that leaves the reach zone still
+    # closed is a drop" did not exist: a retraction to the lap or the
+    # shoulder (z 700 mm) with >= 1 hand-unit of sideways image travel,
+    # opened there, THREW in 32 of 112 synthetic carries. Swept through
+    # the wired path at 1.75/1.85/1.95/2.00/2.05: 1.95 (0.83 of reach_min,
+    # ~550 mm against the 425 mm grab) is the highest bar that leaves
+    # lateral recall IDENTICAL to no bar at all (24/24 at 6.0 and 7.5 fps
+    # with 0/4/8 px of landmark noise) and it takes the grid to 0/112 and a
+    # shoulder-height retraction to 600 mm to 0/6; at 2.00 recall starts to
+    # slip (23/24 at 6 fps, 8 px). A pull-back of only ~125 mm with a
+    # 1.4-unit sideways fling still throws, and is ambiguous by eye too.
+    reach_exit: float = 1.95
     # MEASURED in frames, deliberately. 3 hand-bearing closed frames is
     # 267 ms of elapsed time at 7.5 fps and 333 ms at 6.0 (the design note's
     # 400/500 ms counts the latch frame's own period as well). Seconds here
@@ -565,6 +592,52 @@ class CastGesture:
     def state(self) -> CastState:
         return self._state
 
+    def retune(self, thresholds: CastThresholds,
+               fps: Optional[float] = None) -> None:
+        """The same machine at another frame rate, live, from any thread.
+
+        The stage re-fits the counters to the DELIVERED rate; this is the
+        only door for that. The open-history window is rebuilt to the new
+        lookback under the lock, keeping what it held: it was sized once
+        at construction, and a refit that assigned ``t`` alone left it at
+        12 frames -- MEASURED: 0 of 48 grabs at 30 fps delivered against
+        24 of 24 for the same thresholds set at construction, and 46/48 at
+        15 fps. ``fps`` also resets the stall backstop to three periods.
+        """
+        with self._lock:
+            self.t = thresholds
+            self._open_hist = deque(
+                self._open_hist,
+                maxlen=max(1, int(thresholds.open_lookback_frames)))
+            if fps is not None:
+                self.preview_fps = max(float(fps), 0.1)
+                self.stall_s = 3.0 / self.preview_fps
+
+    def sweep(self) -> Optional[CastEvent]:
+        """The wall-clock carry cap, applied WITHOUT a frame. Any thread.
+
+        The cap and the stall backstop otherwise run only inside
+        ``update()``, so a carry whose frames simply stopped -- the preview
+        worker halted on a standby edge, a wedged read -- stayed live for
+        as long as the silence lasted (MEASURED: 60 s, and a spoken throw
+        then cast the stale subject). Every voice path calls this first.
+        """
+        with self._lock:
+            now = float(self._now())
+            if self._state is CastState.CARRYING and self._carry_expired(now):
+                return self._end_carry("timeout", now)
+            return None
+
+    def carry_cap_s(self) -> float:
+        """How long a carry can actually last, in seconds, at the rate
+        this machine is tuned to: the frame cap (it ends on the frame AFTER
+        ``carry_max_frames``, so 31 frames -- 4.13 s at 7.5 fps, MEASURED)
+        or the wall-clock backstop, whichever comes first. The chip's
+        depleting rule is drawn over THIS, not over the backstop alone,
+        which was twice too long at 7.5 fps."""
+        frames = (int(self.t.carry_max_frames) + 1) / max(self.preview_fps, 0.1)
+        return min(float(self.t.carry_max_s), frames)
+
     @property
     def held(self) -> str:
         return self._held[1] if self._held else ""
@@ -579,6 +652,7 @@ class CastGesture:
                 "reach": round(float(self._reach), 4),
                 "closed": round(float(self._closed), 4),
                 "held": self.held, "ambiguous": bool(self._ambiguous),
+                "cap_s": round(self.carry_cap_s(), 3),
                 "frame": int(self._frame)}
 
     # -------------------------------------------------------- the cycle
@@ -757,6 +831,12 @@ class CastGesture:
                                   o.cy - self._anchor[1]) / unit
         if o.closed >= self.t.open_min:
             return self._end_carry("released", now)
+        if 0.0 < o.reach < self.t.reach_exit:
+            # Still closed and no longer at reach: he has pulled his hand
+            # back with the thing in it. A withdrawal, never a throw, and
+            # a reach of 0.0 is no opinion (the arm across the face), not
+            # a withdrawal.
+            return self._end_carry("withdrawn", now)
         self._lost = 0
         self._last_fist = (o.cx, o.cy)
         return None
@@ -887,7 +967,14 @@ class CastGesture:
         elif reason == "exit":
             edge, frac, edge_bear = edge_bearing(
                 end[0], end[1], self.frame_w, self.frame_h, self.mirrored)
-            if frac <= self.t.edge_frac:
+            # The edge may name the direction only when the hand was
+            # MOVING toward that edge: a fist parked near his-left edge
+            # that drifted 45 mm toward the centre and was then lost is
+            # not a throw to his left (measured 3/6 before this check).
+            # Within a quarter turn of the edge's outward normal counts;
+            # otherwise it is judged as a hand lost in open space.
+            agrees = _turn_between(vec_bearing, edge_bear) <= 90.0
+            if frac <= self.t.edge_frac and agrees:
                 bearing = edge_bear
                 thrown = dist_u >= self.t.throw_exit_u
                 why = "left frame (his %s)" % edge
@@ -895,9 +982,9 @@ class CastGesture:
                 thrown = (dist_u >= self.t.throw_lost_u
                           and self._last_step_u >= self.t.exit_step_u)
                 why = "lost"
-        # 'timeout', 'stalled' and 'cancelled (...)' are never throws: a
-        # carry that simply ran out, or that he ended with a word, is him
-        # having put it down, not him having flung it.
+        # 'timeout', 'stalled', 'withdrawn' and 'cancelled (...)' are never
+        # throws: a carry that ran out, was pulled back closed, or that he
+        # ended with a word, is him having put it down, not flung it.
 
         where = sector(bearing, self.t.sector_half_deg)
         if thrown and where == "ambiguous":

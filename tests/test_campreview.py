@@ -1693,6 +1693,53 @@ def test_closing_the_pipeline_denies_the_tap():
     assert len(tap.denied) == 1
 
 
+class RecordingHands:
+    """jarvis.handstage.HandStage's cancel surface, counting."""
+
+    def __init__(self, raises=False):
+        self.raises = raises
+        self.cancelled = []
+
+    def cancel(self, why="cancelled"):
+        self.cancelled.append(str(why))
+        if self.raises:
+            raise RuntimeError("the stage is broken")
+
+
+def test_closing_the_pipeline_puts_the_hand_down():
+    """The gesture engine's carry caps run only when a frame arrives to
+    test them, so a carry whose frames stopped HERE -- the ACTIVE->AMBIENT
+    edge every 45 s of quiet, the curfew, the settings toggle -- stayed
+    live for as long as the silence lasted (MEASURED: 60 s, and a spoken
+    throw then took the stale subject). Every handback converges on
+    _close_pipeline, so the hand is put down there, once."""
+    hands = RecordingHands()
+    worker = cp.PreviewWorker(hands=hands, make_pipeline=lambda: cp.PreviewPipeline(
+        FakeFeed(), detector=FakeDetector(), observe=observer()))
+    worker._pipeline = worker._make()
+    worker._close_pipeline()
+    assert hands.cancelled == ["preview stopped"]
+    # stop() with no thread running takes the same door.
+    worker.stop()
+    assert hands.cancelled == ["preview stopped", "preview stopped"]
+
+
+def test_a_stage_that_cannot_cancel_does_not_break_the_handback():
+    """The close is a privacy edge and a teardown path: a stage with no
+    cancel, or one that raises, must not stop the device going back."""
+    feed = FakeFeed()
+    worker = cp.PreviewWorker(hands=object(), pipeline=cp.PreviewPipeline(
+        feed, detector=FakeDetector(), observe=observer()))
+    worker._close_pipeline()
+    assert feed.closes == 1
+    feed = FakeFeed()
+    hands = RecordingHands(raises=True)
+    worker = cp.PreviewWorker(hands=hands, pipeline=cp.PreviewPipeline(
+        feed, detector=FakeDetector(), observe=observer()))
+    worker._close_pipeline()
+    assert feed.closes == 1 and hands.cancelled == ["preview stopped"]
+
+
 def test_a_sensing_deny_reaches_the_tap_through_the_close():
     """The realistic path: the curfew starts halfway through an enrolment.
     cycle() refuses before opening anything and closes the pipeline, and the

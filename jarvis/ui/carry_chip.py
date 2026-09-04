@@ -12,11 +12,19 @@ STATES, and what each looks like:
 
   holding   a closed-hand glyph, the subject's name tail-truncated at 28
             characters, and a 2 px rule under it that DEPLETES over the
-            carry's TTL (8 s) so he can see it is about to be put down
+            carry's cap -- ``CastGesture.carry_cap_s()``, 4.1 s at the
+            7.5 fps the camera delivers, never the 8 s wall-clock backstop
+            alone (MEASURED: drawn over 8 s the rule was half gone when the
+            frame cap put the thing down) -- so he can see it is about to
+            be put down. The backstop is the chip's own timer: when no
+            frame has arrived to end the carry by ``backstop_s``, the chip
+            puts it down itself through ``on_dismiss``.
   thrown    the name with an arrow in the fling's direction, for 900 ms
   landed    "-> BOARD" / "-> HPCOMPUTER" in the ok colour, then fades
   held      the target in the warning colour: it did not get there, and
-            Jarvis has said why; the payload is on the board
+            Jarvis has said why; the payload is on the board. A veto, a
+            refusal and an empty hand are NOT this state -- nothing was
+            kept anywhere, so they read ``dropped``
   dropped   the rule goes muted and the word becomes "dropped" for 900 ms,
             then the chip goes. A TIMEOUT LOOKS IDENTICAL TO A DELIBERATE
             DROP, because it is the same outcome.
@@ -113,6 +121,14 @@ def rule_fraction(now: float, started: float, ttl_s: float) -> float:
     return max(0.0, min(1.0, left))
 
 
+def backstop_due(now: float, started: float, backstop_s: float) -> bool:
+    """Has the carry outlived its wall-clock cap with no frame to end it?
+    0 (or less) means no backstop was asked for, never "due at once"."""
+    if backstop_s <= 0.0:
+        return False
+    return (float(now) - float(started)) > float(backstop_s)
+
+
 class CarryChip(tk.Canvas):
     """The header chip. Hidden (never packed) until a grab; shown left of
     the sensing badge; goes away on its own after a throw or a drop.
@@ -133,6 +149,7 @@ class CarryChip(tk.Canvas):
         self._text = ""
         self._started = 0.0
         self._ttl = 0.0
+        self._backstop = 0.0
         self._shown = False
         self._after_id = None
         self._on_dismiss = on_dismiss
@@ -152,11 +169,13 @@ class CarryChip(tk.Canvas):
         return self._shown
 
     # --------------------------------------------------------- the API
-    def hold(self, name: str, ttl_s: float = 8.0) -> None:
+    def hold(self, name: str, ttl_s: float = 8.0,
+             backstop_s: Optional[float] = None) -> None:
         self._state = STATE_HOLDING
         self._text = chip_word(STATE_HOLDING, name)
         self._started = self._now()
         self._ttl = float(ttl_s)
+        self._backstop = float(backstop_s) if backstop_s else 0.0
         self._show()
         self._fit()
         self._schedule(TICK_MS, self._tick)
@@ -227,6 +246,10 @@ class CarryChip(tk.Canvas):
     def _tick(self) -> None:
         if self._state != STATE_HOLDING:
             return
+        if backstop_due(self._now(), self._started, self._backstop):
+            # No frame came to end it. The wall-clock cap, from here.
+            self._clicked()
+            return
         self._draw_rule()
         self._schedule(TICK_MS, self._tick)
 
@@ -288,6 +311,6 @@ class CarryChip(tk.Canvas):
 __all__ = [
     "ARROWS", "CarryChip", "FLASH_MS", "GLYPH_HOLD", "MAX_CHARS",
     "STATE_DROPPED", "STATE_HELD", "STATE_HOLDING", "STATE_IDLE",
-    "STATE_LANDED", "STATE_THROWN", "chip_colors", "chip_name", "chip_tone",
-    "chip_word", "rule_fraction",
+    "STATE_LANDED", "STATE_THROWN", "backstop_due", "chip_colors",
+    "chip_name", "chip_tone", "chip_word", "rule_fraction",
 ]
