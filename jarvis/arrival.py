@@ -53,6 +53,7 @@ outcome worth spending latency to avoid.
 """
 from __future__ import annotations
 
+import threading
 from typing import Callable, Optional
 
 from jarvis.logs import get_logger
@@ -64,6 +65,14 @@ log = get_logger("arrival")
 # the earcon precedes the words the way a knock precedes a sentence, and
 # the catch-up follows the greeting because it is the answer to it.
 ARRIVAL_STEPS = ("panel", "earcon", "greeting", "catch-up")
+# ...and the two halves it SPLITS INTO when the catch-up is deferred to his
+# desk. Declared as the split of ARRIVAL_STEPS rather than as two hand-typed
+# tuples, and pinned by
+# tests/test_arrival_desk.py::test_the_door_and_the_desk_together_are_still_the_whole_cue,
+# so a step added to the contract and to neither half fails the suite
+# instead of silently never running.
+DESK_STEPS = ("catch-up",)
+DOOR_STEPS = tuple(s for s in ARRIVAL_STEPS if s not in DESK_STEPS)
 DEPARTURE_STEPS = ("settle",)
 
 ARRIVAL_EARCON = "arrival"
@@ -72,7 +81,8 @@ DEFAULT_MIC_SILENCE_MIN = 10
 
 
 def arrival_plan(*, returned: bool = False, home: bool = True,
-                 quiet_reason: str = "", cue: bool = True) -> list[str]:
+                 quiet_reason: str = "", cue: bool = True,
+                 defer_catch_up: bool = False) -> list[str]:
     """The ordered steps for a Presence event, or [] for no cue at all.
 
     ``quiet_reason`` is quiet.py's answer, and it is honoured exactly as
@@ -80,14 +90,19 @@ def arrival_plan(*, returned: bool = False, home: bool = True,
     definition on a returned event and never defers anything, while any
     OTHER reason (quiet hours, DND, a meeting) leaves the panel to come up
     and holds the voice for the policy's own tick.
+
+    ``defer_catch_up`` drops the last step and ONLY the last step: he is
+    greeted at the door exactly as before, and the question about his mail
+    is owed until he reaches his desk (``settle_plan``, ``DeskWatch``).
     """
     if not home or not returned:
         return []
     reason = str(quiet_reason or "").strip()
     if reason and reason != "you're out":
         return ["panel"]
-    steps = [s for s in ARRIVAL_STEPS if cue or s != "earcon"]
-    return steps
+    skip = set(DESK_STEPS) if defer_catch_up else set()
+    return [s for s in ARRIVAL_STEPS
+            if (cue or s != "earcon") and s not in skip]
 
 
 def departure_plan(*, home: bool = True) -> list[str]:
@@ -242,6 +257,216 @@ class DoorWatch:
             return False
         self._fired = True
         return True
+
+
+# ======================================================================
+# THE DESK: he is greeted at the door and ASKED when he sits down
+# ======================================================================
+# His words, 2026-09-03: "Welcome back sir at the door and then when I'm in
+# my office he can ask about stuff. This can be through the sensor logic
+# and the camera logic if he sees me (if applicable)."
+#
+# So the cue splits. panel -> earcon -> greeting still run together the
+# moment the kitchen sees him; the catch-up is ARMED there and DELIVERED
+# when he settles. What it fixes is not a bug in any one line, it is the
+# timing of the whole second half: today "shall I go through your mail" is
+# put to a man who is still taking his shoes off.
+#
+# TWO LEGS, WHICHEVER ARRIVES FIRST, because at his desk his back is to the
+# radar and his face is to the camera and both of those are NORMAL:
+#
+#   radar   -- the office zone verdict reaches its desk band. Measured
+#              2026-09-03: he sits at 3.13 m median and the office map's
+#              "at the desk" band is 2.25-3.75 m.
+#   camera  -- the lens recognises him in the office. AN IDENTITY LABEL AND
+#              A SCORE. There is no argument in this module an image could
+#              be passed through, and there never will be.
+#
+# ONE DELIVERY, NEVER TWO, however many times either leg fires: DeskWatch
+# is the latch, and it holds a lock because the two legs are two lanes and
+# neither owns the Tk pump.
+#
+# DEFERRING IS NOT DRAINING. Nothing here touches quiet.release_fragments:
+# the held lines stay held, in quiet.py, exactly where they were. If he
+# never reaches the desk -- straight to bed, the office module unplugged,
+# the camera inside its 21:00-07:00 curfew -- the watch simply stays armed
+# and the backlog stays held for the policy's own next quiet window. That
+# is the whole answer to "does a deferred catch-up expire": IT DOES NOT.
+# Nothing is captured at the door to go stale. The offer is a live read of
+# the mailbox and the fault board taken at DELIVERY, so an offer made at
+# eleven at night is as true as one made at six; and the alternative --
+# expiring it -- is a timer whose only possible effect is to throw away
+# lines that are his and have no second copy anywhere.
+DEFAULT_DESK_ROOM = "office"
+# zones.DEFAULT_CAMERA_ZONE / the office map's far band, spelled here rather
+# than imported for the reason _room_key is copied rather than imported:
+# this module pulls in nothing that owns a thread, a file or a socket, and
+# jarvis/zones.py owns a log file and a config reader. The two are pinned
+# to each other by
+# tests/test_arrival_desk_app.py::test_the_desk_zone_is_the_one_zones_py_names.
+DEFAULT_DESK_ZONE = "at the desk"
+
+LEG_RADAR = "radar"
+LEG_CAMERA = "camera"
+
+
+def defer_catch_up(*, legs=(), enabled: bool = True) -> bool:
+    """Should the catch-up be held for the desk rather than asked at the door?
+
+    ``legs`` is the legs the caller believes can actually FIRE right now
+    (app._settle_legs). The check is not ceremony: a deferral no leg can
+    ever fire is the catch-up silently never happening, which is a worse
+    outcome than asking him about his mail in the hallway. With no zone
+    source attached and no camera feed, this returns False and the cue is
+    byte for byte the one that shipped.
+    """
+    return bool(enabled) and bool(tuple(legs))
+
+
+def settle_plan(*, quiet_reason: str = "") -> list[str]:
+    """The steps for a settle, or [] to leave the catch-up OWED.
+
+    THE ONE NEW WAY THIS FEATURE COULD SPEAK OVER A QUIET HOUR, and it is
+    closed here. At the door a quiet house makes the plan panel-only
+    (``arrival_plan``) so the catch-up never ran during quiet hours at
+    all. Deferred, it can arrive at his desk an hour later -- and
+    ``app._say`` is called for the digest with ``proactive=False``, which
+    does not consult quiet.py and would pierce the hold.
+
+    Held is NOT dropped: the caller leaves the watch armed, so the next
+    settle after the window closes delivers it.
+
+    "you're out" is the one reason ignored, for the same reason
+    ``arrival_plan`` ignores it: he is demonstrably at his own desk, so a
+    sentinel still saying he is out is stale by the time this is read.
+    """
+    reason = str(quiet_reason or "").strip()
+    if reason and reason != "you're out":
+        return []
+    return list(DESK_STEPS)
+
+
+def _camera_names_him(camera) -> bool:
+    """Does this camera opinion NAME somebody? A label, or a
+    ``zones.CameraOpinion``; never a frame, and there is no third form.
+
+    ``known=False`` is the lens saying "I looked and recognised nobody",
+    which zones.py is explicit is NOT a claim the chair is empty -- so it
+    is not a settle either. Anything falsy is no opinion at all.
+    """
+    if camera is None:
+        return False
+    known = getattr(camera, "known", None)
+    if known is not None:                      # a CameraOpinion
+        return bool(known) and bool(str(getattr(camera, "label", "") or "").strip())
+    return bool(str(camera or "").strip())     # an identity label
+
+
+def settle(*, room="", verdict=None, camera=None,
+           desk_room: str = DEFAULT_DESK_ROOM,
+           desk_zone: str = DEFAULT_DESK_ZONE) -> str:
+    """Has he settled at his desk, and by WHICH LEG? ``LEG_RADAR``,
+    ``LEG_CAMERA``, or "" for not yet.
+
+    Pure, and pure in the strong sense: it reads three arguments and
+    returns a string. No clock, no config, no socket, no sensor -- which
+    is what lets the whole of this feature be tested with no phone, no
+    radar, no lens and no window.
+
+    ``verdict`` is a ``zones.Verdict`` (anything with ``.zone``, and
+    optionally ``.rule`` and ``.room``) or a plain zone name. ``camera``
+    is a ``zones.CameraOpinion`` or an identity label -- ``app._eye_identity``
+    hands out a name and nothing else, and that string is the entire
+    camera-side interface of this feature.
+
+    **IT MAY NOT LIE ABOUT WHICH LEG DECIDED.** ``zones.verdict`` lets the
+    camera overrule the radar and the camera-ruled verdict then carries
+    the desk zone, so reading ``.zone`` alone would credit the radar for a
+    decision the lens made -- with his back to the radar and no range
+    reading involved at all. ``.rule`` is what settles it. With both legs
+    honestly true at once the CAMERA is named: it identified him, where
+    the radar saw a body in a band.
+
+    Never raises. A sensor lane that explodes on attribute access costs
+    this observation and nothing else -- it must not raise through a bus
+    subscriber and take the deferred catch-up with it.
+    """
+    try:
+        return _settle(room, verdict, camera, desk_room, desk_zone)
+    except Exception:  # noqa: BLE001 - a broken lane is not a homecoming
+        log.debug("arrival: the settle verdict could not be read", exc_info=True)
+        return ""
+
+
+def _settle(room, verdict, camera, desk_room, desk_zone) -> str:
+    want = _room_key(desk_room)
+    here = _room_key(room) or _room_key(getattr(verdict, "room", ""))
+    if not want or here != want:
+        return ""
+    zone = verdict if isinstance(verdict, str) else getattr(verdict, "zone", "")
+    at_desk = _room_key(zone) == _room_key(desk_zone) and bool(_room_key(zone))
+    # THE CAMERA FIRST, and by RULE rather than by zone -- see the docstring.
+    if _camera_names_him(camera):
+        return LEG_CAMERA
+    if at_desk and str(getattr(verdict, "rule", "") or "") == LEG_CAMERA:
+        return LEG_CAMERA
+    return LEG_RADAR if at_desk else ""
+
+
+class DeskWatch:
+    """The deferred catch-up: armed at the door, fired ONCE at the desk.
+
+    Holds one bool and a lock and nothing else -- no clock, no config, no
+    socket, and deliberately no copy of the digest. What is deferred is
+    the QUESTION, not its answer: the mail count and the fault board are
+    read at delivery, which is why a deferral can sit for hours without
+    going stale and why there is no expiry to get wrong.
+
+    The lock is not decoration. The radar leg and the camera leg are two
+    lanes on two threads and neither owns the Tk pump, so "exactly once"
+    cannot rest on the GIL landing between the read and the write of a
+    bare bool.
+
+    ``arm()`` is idempotent (two sentinels crossing on one walk through
+    the door both reach the greeter), ``clear()`` gives the catch-up up,
+    and only a REAL settle spends the arm -- walking through the office to
+    the bedroom leaves it owed.
+    """
+
+    def __init__(self, room: str = DEFAULT_DESK_ROOM,
+                 zone: str = DEFAULT_DESK_ZONE):
+        self.room = room
+        self.zone = zone
+        self._armed = False
+        self._lock = threading.Lock()
+
+    @property
+    def armed(self) -> bool:
+        return self._armed
+
+    def arm(self) -> None:
+        """A catch-up is owed. Idempotent."""
+        with self._lock:
+            self._armed = True
+
+    def clear(self) -> None:
+        """It was delivered, or given up on. Idempotent."""
+        with self._lock:
+            self._armed = False
+
+    def observe(self, *, room="", verdict=None, camera=None) -> str:
+        """One reading from either leg. The leg that settled him, EXACTLY
+        once per ``arm()``; "" every other time, unarmed included.
+        """
+        leg = settle(room=room, verdict=verdict, camera=camera,
+                     desk_room=self.room, desk_zone=self.zone)
+        if not leg:
+            return ""
+        with self._lock:
+            if not self._armed:
+                return ""
+            self._armed = False
+        return leg
 
 
 # ======================================================================
