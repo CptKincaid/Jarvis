@@ -990,6 +990,33 @@ DEFAULTS: dict = {
                       "downloads": "~/Downloads"},
         "max_mb": 100,
     },
+    # jarvis/gate.py -- whether Jarvis answers whoever speaks, or only the
+    # people he recognises.  THIS IS RECOGNITION, NOT A LOCK: a photograph
+    # defeats the face check and a recording defeats the voice check, and
+    # the user was told that and accepted it.
+    #
+    # SHIPS IN SHADOW, and that is the whole point of the key.  In shadow
+    # every verdict is logged and NOTHING is refused, so a day of real
+    # turns can be read before the first refusal.  His voiceprint corrupted
+    # once already this week (jarvis/config.py, PATHS.VOICEPRINT), and a
+    # gate that had been enforcing that morning would have locked him out
+    # of his own house for the rest of the day.  Move it to "enforce" when
+    # the log says the verdicts are right; "off" switches it out entirely.
+    #
+    # NO SECRET LIVES HERE.  The salted hashes of the spoken passphrase and
+    # the typed override code are in jarvis/identity.py's own 0600 file
+    # (PATHS.OWNER_REGISTRY), never in this object -- it is deep-copied
+    # into reports and its __repr__ prints redacted(), so the strongest way
+    # to keep a hash out of a log is to keep it out of here.  SECRET_KEYS
+    # is deliberately untouched.
+    #
+    # `gate_typed` reverses the one exemption that is a judgement call
+    # rather than a ruling: typed input at the Tk box is exempt on the same
+    # argument as the command socket -- he is physically at the machine.
+    "owner": {
+        "mode": "shadow",                 # shadow | enforce | off
+        "gate_typed": False,
+    },
 }
 
 SECRET_KEYS = ("icloud.app_password", "gmail.app_password", "discord.bot_token",
