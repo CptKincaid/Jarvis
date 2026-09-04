@@ -24,6 +24,14 @@ local_line, the warm-up) uses that same prefix and the same num_ctx: a
 different prefix would evict the cache, a different num_ctx would make
 Ollama reload the model.
 
+What the model is GIVEN -- the window, the spoken cap, the temperature,
+whether it reasons, and the guard that keeps his question in the window --
+is his to tune in ``~/.config/jarvis/assistant.json`` under ``brain``.
+It is read ONCE, at import, into SETTINGS (see the block by ModelSettings
+for why once and not per request) and a change needs a restart. The
+settings actually in force, and the room they leave for the answer, are
+logged in one line the first time the prompt is built: log_settings().
+
 Persona (film JARVIS): VOICE_RULES is the single description of the voice
 and is shared by all three prompts; FEW_SHOT_PINNED (you there / thanks /
 good night) is always shown; FEW_SHOT_POOL holds one or two variants for
@@ -45,6 +53,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from jarvis import address as address_mod
@@ -53,6 +62,7 @@ from jarvis.config import MACHINE
 from jarvis.events import BrainState, Status, bus
 from jarvis.logs import get_logger
 from jarvis.router import is_question
+from jarvis.tools.registry import CHARS_PER_TOKEN
 from jarvis.tts import TTS as _TTS
 
 log = get_logger("brain")
@@ -101,11 +111,135 @@ TURN_WORK_BUDGET_S = CHAT_WALL_BUDGET_S - RENDER_RESERVE_S
 # on a third of the bench's router questions. 5 s keeps the
 # tie-breaker useful; the router only asks when its rules are torn.
 CLASSIFY_TIMEOUT_S = 5.0
-NUM_CTX = 8192                 # identical on EVERY request (see module doc)
+
+# ----------------------------------------------------------------------
+# Model settings (assistant.json ``brain.*``)
+# ----------------------------------------------------------------------
+# THE ONE-VALUE INVARIANT, and it is why this is not a per-request option.
+# Ollama keys its loaded runner on num_ctx: a request that asks for a
+# different one makes the 25 B model RELOAD (measured 8.838 s on this box)
+# and throws the prefix cache away with it, so a num_ctx that varied per
+# turn would cost him a reload a turn. Three of four attempts to change it
+# on the LIVE server hung indefinitely instead.
+#
+# So the config is read ONCE, at import, into SETTINGS; NUM_CTX is that one
+# value; and every request this module makes (chat, classify_route,
+# summarize, local_line, the JSON helpers, the warm-up) and every request
+# jarvis/tools/screen.py makes alongside it sends exactly that number.
+# _options() re-asserts it over any caller's override, so a caller cannot
+# reach past it. Changing brain.num_ctx in assistant.json therefore needs a
+# Jarvis RESTART -- by design, not by omission.
+# tests/test_brain_room.py proves both halves: one value on every request,
+# and a config edited after import changing nothing.
+@dataclass(frozen=True)
+class ModelSettings:
+    """What the local model is given, in force for the life of the process."""
+    num_ctx: int = 16384            # the whole window, in tokens
+    num_predict: int = 160          # cap on the SPOKEN answer, in tokens
+    temperature: float = 0.7
+    think: bool = False             # model-side reasoning (measured off)
+    answer_reserve_tokens: int = 128
+    protect_question: bool = True   # the guard in fit_prompt()
+
+    @property
+    def prompt_ceiling(self) -> int:
+        """Estimated prompt tokens a round may use before fit_prompt trims.
+
+        Below the window by the answer's own budget plus a reserve: a
+        prompt that fills the window leaves nothing to answer WITH, and
+        Ollama accepts it anyway -- measured 2026-09-04, an 8175-token
+        prompt accepted with num_predict 160 at num_ctx 8192, i.e. 17
+        tokens of room for a 160-token reply."""
+        return max(1024, int(self.num_ctx) - int(self.num_predict)
+                   - int(self.answer_reserve_tokens))
+
+
+# Bounds are sanity rails, not opinions: outside them the default is used
+# and the reason is logged, because a typo in his config must not put this
+# box back in the state that needed a hard power-off on 2026-08-28.
+_CTX_MEASURED_SAFE = 16384      # the largest context anyone watched load
+_MODEL_MAX_CTX = 262144         # gemma4:26b's own advertised context length
+
+
+def _cfg_number(cfg, key, default, lo, hi, cast):
+    raw = default if cfg is None else cfg.get("brain." + key, default)
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        log.warning("brain.%s is %r, which is not a number; using %r",
+                    key, raw, default)
+        return default
+    if not lo <= value <= hi:
+        log.warning("brain.%s is %r, outside the safe range %r-%r; using %r",
+                    key, value, lo, hi, default)
+        return default
+    return value
+
+
+def _cfg_bool(cfg, key, default):
+    raw = default if cfg is None else cfg.get("brain." + key, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().lower() in {
+            "1", "true", "yes", "on", "0", "false", "no", "off"}:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    log.warning("brain.%s is %r, which is not true or false; using %r",
+                key, raw, default)
+    return default
+
+
+def model_settings(cfg=None) -> ModelSettings:
+    """Build ModelSettings from an AssistantConfig. Never raises: a missing
+    key, a typo or a number outside the rails logs and falls back to the
+    default, because the brain has to start either way.
+
+    Pure apart from those log lines, so a test can hand it a fake config;
+    the PROCESS-WIDE value is SETTINGS, built once below and never rebuilt.
+    """
+    if cfg is None:
+        try:
+            from jarvis.assistant_config import AssistantConfig
+            cfg = AssistantConfig.load()
+        except Exception:
+            log.exception("brain: assistant config unreadable; using the "
+                          "built-in model settings")
+            cfg = None
+    d = ModelSettings()
+    got = ModelSettings(
+        num_ctx=_cfg_number(cfg, "num_ctx", d.num_ctx,
+                            2048, _MODEL_MAX_CTX, int),
+        num_predict=_cfg_number(cfg, "num_predict", d.num_predict,
+                                16, 8192, int),
+        temperature=_cfg_number(cfg, "temperature", d.temperature,
+                                0.0, 2.0, float),
+        think=_cfg_bool(cfg, "think", d.think),
+        answer_reserve_tokens=_cfg_number(
+            cfg, "answer_reserve_tokens", d.answer_reserve_tokens,
+            0, 4096, int),
+        protect_question=_cfg_bool(cfg, "protect_question",
+                                   d.protect_question),
+    )
+    if got.num_ctx > _CTX_MEASURED_SAFE:
+        log.warning("brain.num_ctx is %d, above the %d that was actually "
+                    "watched loading on this box; watch MemAvailable, and "
+                    "check `ollama ps` says CONTEXT %d after the restart",
+                    got.num_ctx, _CTX_MEASURED_SAFE, got.num_ctx)
+    if got.think:
+        log.warning("brain.think is ON. Measured 2026-09-04: reasoning is "
+                    "charged to num_predict, so at 160 the model spent the "
+                    "whole budget thinking and returned an EMPTY reply 6 "
+                    "times out of 6, and the turns that did finish took "
+                    "10.9-33.0 s. num_predict is %d.", got.num_predict)
+    return got
+
+
+SETTINGS = model_settings()    # read ONCE per process; a change needs a restart
+NUM_CTX = SETTINGS.num_ctx     # identical on EVERY request (see above)
 # Sampling options for Tier 2 (num_predict caps a two-sentence reply; the
 # stop strings end a run-on transcript before the model writes Hunter's
-# next line for him).
-CHAT_OPTIONS = {"num_ctx": NUM_CTX, "temperature": 0.7, "num_predict": 160,
+# next line for him). Built from SETTINGS, so these are one value too.
+CHAT_OPTIONS = {"num_ctx": NUM_CTX, "temperature": SETTINGS.temperature,
+                "num_predict": SETTINGS.num_predict,
                 "stop": ["\nUser:", "\nHunter:"]}
 OLLAMA_OPTIONS = CHAT_OPTIONS  # legacy name
 # 30 s, not 300. This loop is the ONLY thing that notices the chat model
@@ -124,8 +258,11 @@ INCLUDE_GIT_LINE = True        # latency knob (spec 4.3): drop "Git:" lines
 # window: Ollama drops it silently and the model then answers something
 # confident and unrelated. Cap it here (the ONE place every tool result
 # passes through) and say in the message itself that it was cut, so the
-# model can say so too. 4 000 chars ~ 1 000 tokens; the whole turn is
-# allowed 8 000, leaving room for the ~2 700-token static prefix.
+# model can say so too. This comment used to say "4 000 chars ~ 1 000
+# tokens"; measured 2026-09-04, calendar and mail text runs 2.25 chars per
+# token, so 4 000 chars is nearer 1 780 -- wrong, but wrong in the safe
+# direction, and at the larger window it no longer bites. fit_prompt() is
+# what actually holds the line now; these two caps are the first defence.
 MAX_TOOL_TEXT_CHARS = 4000       # one tool result
 MAX_TOOL_TEXT_TOTAL_CHARS = 8000  # every tool result in one turn
 TOOL_ARGS_LOG_CHARS = 200        # tool args in the "tool X -> ok" log line
@@ -1095,7 +1232,10 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
     # still slips through (a caller that skipped _check_lent) must not pin
     # it again, so the payload itself says "unload after this one".
     payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": False,
-               "think": False,
+               # brain.think in assistant.json; measured off (see
+               # model_settings) -- and the reasoning scrubber below is
+               # only DEFENSIVE while it stays off.
+               "think": SETTINGS.think,
                "keep_alive": 0 if _RESIDENCY.get("lent") else -1,
                "options": _options(**opt_overrides)}
     if tools:
@@ -1105,6 +1245,161 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
     return payload
 
 
+_SETTINGS_LOGGED = []
+
+
+def log_settings(registry=None):
+    """One line, once, naming the settings in force and the room they leave
+    for the ANSWER.
+
+    The tool registry sets the precedent: it reports its own cost the
+    moment it becomes a prompt, because a budget nobody can see is a budget
+    nobody checks. This is the same idea for the window itself -- until
+    2026-09-04 nothing in jarvis.log said how big the window was, what the
+    static prefix cost, or how little was left, and a prompt Ollama had
+    silently truncated looked exactly like one that fitted.
+
+    Estimates use the registry's own measured chars-per-token; the ACTUAL
+    number arrives per round from Ollama in _log_round_tokens().
+    """
+    if _SETTINGS_LOGGED:
+        return
+    _SETTINGS_LOGGED.append(True)
+    try:
+        system_tokens = int(len(static_system()) / CHARS_PER_TOKEN)
+    except Exception:
+        system_tokens = 0
+    tools = 0
+    schema_tokens = 0
+    try:
+        if registry is not None:
+            tools = len(registry)
+            schema_tokens = registry.schema_tokens()
+    except Exception:
+        log.debug("brain: tool schema cost unavailable for the settings line")
+    prefix = system_tokens + schema_tokens
+    left = SETTINGS.num_ctx - prefix - SETTINGS.num_predict \
+        - SETTINGS.answer_reserve_tokens
+    log.info(
+        "brain: window %d tokens, spoken answer capped at %d, temperature "
+        "%s, thinking %s (assistant.json brain.*; a change needs a restart). "
+        "Static prefix ~%d tokens (persona ~%d + %d tool schemas ~%d), %d "
+        "reserved -> ~%d tokens left for his question, memory, history and "
+        "tool results. Question guard %s (trims a round above ~%d tokens).",
+        SETTINGS.num_ctx, SETTINGS.num_predict, SETTINGS.temperature,
+        "on" if SETTINGS.think else "off", prefix, system_tokens, tools,
+        schema_tokens, SETTINGS.answer_reserve_tokens, left,
+        "on" if SETTINGS.protect_question else "OFF",
+        SETTINGS.prompt_ceiling)
+    if left < 1024:
+        log.warning("brain: only ~%d tokens are left for his actual turn "
+                    "after the persona and the tool schemas; raise "
+                    "brain.num_ctx or register fewer tools", left)
+
+
+# What replaces a tool result the guard had to drop. It stays in the
+# transcript as a message rather than vanishing: an unanswered tool_call is
+# an invitation to make the call again, and the model can say what it lost.
+TOOL_DROPPED_TEXT = ("[an earlier result was dropped to keep the question "
+                     "itself inside the model's window]")
+
+
+def estimate_prompt_tokens(messages, tools=None):
+    """Roughly what a round's prompt will cost, in tokens.
+
+    Characters over the registry's measured CHARS_PER_TOKEN (3.95-4.26 on
+    this tokenizer, 4.1 chosen to sit inside 4% either way). It is an
+    estimate on purpose: the exact count is only knowable after the fact,
+    and _log_round_tokens() logs that one from Ollama's own reply."""
+    try:
+        chars = len(json.dumps(messages, default=str))
+        if tools:
+            chars += len(json.dumps(tools, default=str))
+    except (TypeError, ValueError):
+        return 0
+    return int(chars / CHARS_PER_TOKEN)
+
+
+def fit_prompt(messages, tools=None, ceiling=None):
+    """THE GUARD (assistant.json ``brain.protect_question``).
+
+    When a round would overflow the window, drop the OLDEST TOOL RESULT --
+    because if we do not, Ollama makes room its own way, and its way is to
+    delete whole messages oldest-first after the system prompt. That is HIS
+    QUESTION. Measured 2026-09-04 on the live server: a 9 000-char calendar
+    result took prompt_eval_count from 8253 DOWN to 7754 -- exactly the 499
+    tokens of his question, background and memory -- and a 10 000-char one
+    collapsed it to 3761, i.e. the system prompt and the tool schemas alone.
+    No error, no log line, nothing; the model then answered something
+    confident and unrelated.
+
+    Mutates ``messages`` in place and returns (dropped, estimated tokens).
+    """
+    ceiling = SETTINGS.prompt_ceiling if ceiling is None else int(ceiling)
+    estimate = estimate_prompt_tokens(messages, tools)
+    if estimate <= ceiling or not SETTINGS.protect_question:
+        return 0, estimate
+    dropped = 0
+    for msg in messages:
+        if estimate <= ceiling:
+            break
+        if not isinstance(msg, dict) or msg.get("role") != "tool":
+            continue
+        content = msg.get("content") or ""
+        if content == TOOL_DROPPED_TEXT:
+            continue                      # already given up, once is enough
+        msg["content"] = TOOL_DROPPED_TEXT
+        dropped += 1
+        log.warning("chat: prompt ~%d tokens over the %d-token ceiling; "
+                    "dropped the oldest result (%s, %d chars) so his "
+                    "question stays in the window",
+                    estimate, ceiling, msg.get("tool_name") or "tool",
+                    len(content))
+        estimate = estimate_prompt_tokens(messages, tools)
+    if estimate > ceiling:
+        # Nothing left that is safe to drop: what remains is the system
+        # prompt, the tool schemas and his turn, and his turn is the one
+        # thing this whole guard exists to keep.
+        log.warning("chat: prompt is still ~%d tokens against a %d-token "
+                    "ceiling with every tool result dropped; Ollama may "
+                    "truncate this round. Raise brain.num_ctx.",
+                    estimate, ceiling)
+    return dropped, estimate
+
+
+def _log_round_tokens(data, estimated=0):
+    """What the round ACTUALLY cost, from Ollama's own reply.
+
+    prompt_eval_count is in every /api/chat body -- the same body this
+    module already reads load_duration out of -- and until 2026-09-04 it
+    appeared nowhere in jarvis.log or turns.jsonl. So the one number that
+    says whether his question survived into the window was being thrown
+    away on every single turn."""
+    if not isinstance(data, dict):
+        return
+    try:
+        used = int(data.get("prompt_eval_count") or 0)
+    except (TypeError, ValueError):
+        return
+    if used <= 0:
+        return
+    try:
+        out = int(data.get("eval_count") or 0)
+    except (TypeError, ValueError):
+        out = 0
+    pct = (100.0 * used / NUM_CTX) if NUM_CTX else 0.0
+    line = ("ctx: prompt %d/%d tokens (%.0f%%), answer %d/%d"
+            % (used, NUM_CTX, pct, out, SETTINGS.num_predict))
+    if estimated:
+        line += " (estimated %d)" % estimated
+    if pct >= 90.0:
+        log.warning("%s -- close to the window; Ollama drops the OLDEST "
+                    "messages when it overflows, which is his question",
+                    line)
+    else:
+        log.info("%s", line)
+
+
 def _registry_schemas(registry, text=None):
     """Every registered tool, every turn. A per-turn subset chosen from
     the text was tried (2026-08-30) and dropped: the chat template renders
@@ -1112,6 +1407,7 @@ def _registry_schemas(registry, text=None):
     evicts Ollama's prefix cache (module doc, "static-prefix rule") and
     costs more prefill than the schemas it saves. ``text`` is accepted for
     the older call shape and ignored."""
+    log_settings(registry)
     if registry is None:
         return []
     try:
@@ -2845,6 +3141,10 @@ class JarvisBrain:
                         told += HELD_LINE_NOTE.format(
                             lines=" ".join(held_lines))
                     messages.append({"role": "user", "content": told})
+                # THE GUARD, before every round: keep his question in
+                # the window rather than letting Ollama delete it to make
+                # room for a tool result (see fit_prompt).
+                _, prompt_estimate = fit_prompt(messages, round_tools)
                 round_started = time.monotonic()
                 streaming = on_sentence is not None and not plain_round
                 plain_round = False
@@ -2883,6 +3183,7 @@ class JarvisBrain:
                 # budget, since the budget is wall MINUS this.
                 server_s += min(max(0.0, (data.get("load_duration") or 0) / 1e9),
                                 max(0.0, time.monotonic() - round_started))
+                _log_round_tokens(data, prompt_estimate)
                 if render_only and calls:
                     # Some models emit tool_calls even with none offered.
                     log.warning("chat: render round asked for %d more tools; "

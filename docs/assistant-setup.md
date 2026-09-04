@@ -4231,3 +4231,96 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
   face baseline needs three detections in the last five seconds.
 * One hand. Two hands out at the lens is not this gesture, on purpose.
 * A question on the floor (a read-back waiting on your yes) blocks a grab.
+
+## 84. The brain: how much room he gets to think in
+
+Everything the local model is *given* now lives in one place you can edit,
+under `brain` in `~/.config/jarvis/assistant.json`. It used to be four
+numbers buried in the code.
+
+```json
+"brain": {
+  "num_ctx": 16384,
+  "num_predict": 160,
+  "temperature": 0.7,
+  "think": false,
+  "answer_reserve_tokens": 128,
+  "protect_question": true
+}
+```
+
+**`num_ctx` — how much he can hold in his head at once.**
+Everything he sees on a turn shares this: the tool descriptions, his
+persona, what he remembers about you, the last few exchanges, your
+question, and whatever the tools came back with. 16384 is double what he
+had. Costs **0.19 GB of memory** and about **11 milliseconds a turn** —
+both measured, not guessed. It does *not* make his answers longer.
+Raising it further is untested: 16384 is the biggest window anyone
+actually watched load on this box, so above that he logs a warning and
+you should watch memory. Below 2048 or above 262144 he ignores you and
+uses 16384.
+
+**`num_predict` — how long he is allowed to speak.**
+160 tokens, about 120 words. This is not what makes him terse: his real
+replies come back at 8-28 tokens, so this cap has never once stopped
+him. What makes him brief is a line in his persona telling him to use
+one or two sentences. Raising this number makes long answers *possible*,
+not *likely* — and a long answer is a long minute of listening to him.
+
+**`temperature` — how much his wording varies.**
+0.7. Lower is steadier and flatter; higher is livelier and less
+predictable. Cheap to try, instantly reversible.
+
+**`think` — whether he reasons to himself before answering. Leave it off.**
+It was measured on 2026-09-04 and it does not work on this model yet: his
+reasoning is charged to the same budget as his speech, so at 160 he spent
+the whole thing thinking and said **nothing at all, six times out of
+six**. Given far more room, 6 of 10 were still empty and the ones that
+finished took 11 to 33 seconds against his usual 1.3. If you turn it on
+he warns you in the log and tells you what your `num_predict` is.
+
+**`answer_reserve_tokens` — headroom kept clear for the reply.** 128.
+You will not need to touch this.
+
+**`protect_question` — the safety catch. Leave it on.**
+When a turn gets big — a long calendar plus a long email — something has
+to give. Ollama's own way of giving is to delete the *oldest* messages,
+and the oldest message is **your question**. Measured: a 9000-character
+calendar result took his prompt from 8253 tokens down to 7754, and the
+499 tokens that vanished were your question, the background and his
+memory. He then answers something confident and unrelated, and nothing
+anywhere says why. With this on he drops the oldest *tool result*
+instead, keeps your question, and writes a line in the log saying he did
+it.
+
+### Two things to know
+
+**A change here does nothing until Jarvis restarts.** That is deliberate,
+not a missing feature. Ollama keys the loaded model on `num_ctx`, so
+asking for a different one mid-run makes the 25-billion-parameter model
+reload — nearly nine seconds — and on the live server three of four
+attempts to do that hung outright. So the settings are read once, when he
+starts, and are identical on every request until he restarts.
+
+**He tells you what he is running on.** In `/tmp/vss_voice/jarvis.log`,
+one line at startup:
+
+```
+brain: window 16384 tokens, spoken answer capped at 160, temperature 0.7,
+thinking off (assistant.json brain.*; a change needs a restart). Static
+prefix ~3556 tokens (persona ~1462 + 28 tool schemas ~2094), 128 reserved
+-> ~12540 tokens left for his question, memory, history and tool results.
+Question guard on (trims a round above ~16096 tokens).
+```
+
+And per round, what the prompt actually cost:
+`ctx: prompt 4265/16384 tokens (26%), answer 22/160`. Above 90% that
+becomes a warning. None of this was visible before.
+
+### Verifying after a restart
+
+```bash
+ollama ps                       # CONTEXT should read 16384
+grep "^.*brain: window" /tmp/vss_voice/jarvis.log | tail -1
+```
+If the model will not load at all, put `num_ctx` back to 8192 and restart.

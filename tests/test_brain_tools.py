@@ -191,8 +191,12 @@ def test_chat_payload_matches_spec(brain, setup):
     assert p["model"] == brain.OLLAMA_MODEL
     assert p["stream"] is False and p["think"] is False
     assert p["keep_alive"] == -1
-    assert p["options"] == {"num_ctx": 8192, "temperature": 0.7,
-                            "num_predict": 160,
+    # The window and the spoken cap come from assistant.json brain.*
+    # (jarvis/brain.py SETTINGS), read ONCE at import; the DEFAULTS
+    # themselves are pinned in tests/test_brain_room.py.
+    assert p["options"] == {"num_ctx": brain.NUM_CTX,
+                            "temperature": brain.SETTINGS.temperature,
+                            "num_predict": brain.SETTINGS.num_predict,
                             "stop": ["\nUser:", "\nHunter:"]}
     assert p["tools"] == brain._REGISTRY.schemas()
     assert [m["role"] for m in p["messages"]] == ["system", "user"]
@@ -567,7 +571,7 @@ def test_classify_route_parses_and_shares_the_prefix(brain, setup):
     assert timeout == brain.CLASSIFY_TIMEOUT_S == 5.0
     assert p["format"] == brain.ROUTE_FORMAT
     assert p["options"]["num_predict"] == 40
-    assert p["options"]["num_ctx"] == 8192
+    assert p["options"]["num_ctx"] == brain.NUM_CTX
     assert p["think"] is False
     assert p["messages"][0]["content"] == brain.static_system()
     assert p["tools"] == brain._REGISTRY.schemas()
@@ -660,7 +664,7 @@ def test_ensure_resident_unloads_others_once_then_only_rewarms(brain, setup,
         {"role": "user", "content": ""}]
     assert warm[0]["tools"] == brain._REGISTRY.schemas()
     assert warm[0]["keep_alive"] == -1 and warm[0]["think"] is False
-    assert warm[0]["options"]["num_ctx"] == 8192
+    assert warm[0]["options"]["num_ctx"] == brain.NUM_CTX
     assert warm[0]["options"]["num_predict"] == 1
     assert brain._RESIDENCY["unloaded_once"] is True
     # periodic check, ours resident: nothing but the ps call

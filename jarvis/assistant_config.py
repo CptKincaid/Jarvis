@@ -47,6 +47,44 @@ DEFAULTS: dict = {
     "user": {"name": "Hunter"},
     "units": "us",
     "local_model": "gemma4:26b",
+    # HOW MUCH ROOM THE LOCAL MODEL GETS TO THINK IN (jarvis/brain.py).
+    # Every value here is read ONCE, when Jarvis starts, and is then
+    # identical on every single request the brain makes -- Ollama keys its
+    # loaded runner on num_ctx, so asking for a different one mid-run makes
+    # the 25 B model RELOAD (measured 8.8 s) and throws away the prompt
+    # cache with it. A change here therefore needs a Jarvis RESTART; it can
+    # never take effect per turn. See docs/assistant-setup.md, "The brain".
+    "brain": {
+        # The whole window, in tokens: everything the model can see at once
+        # (tool descriptions + persona + memory + history + his question +
+        # the tool results). 16384 is the largest size measured to load
+        # safely on this box: +0.19 GB of KV cache, +0.011 s per turn.
+        # Above it nothing has been watched loading -- raise with care and
+        # watch MemAvailable.
+        "num_ctx": 16384,
+        # The cap on the SPOKEN answer, in tokens (~120 words). Real
+        # replies come back at 8-28 tokens, so this has never yet bound;
+        # raising it makes long answers possible, not likely, and a long
+        # answer is a long minute of speech.
+        "num_predict": 160,
+        # How much the wording is allowed to vary. Lower is steadier and
+        # flatter; higher is livelier and less predictable.
+        "temperature": 0.7,
+        # Let the model reason to itself before answering. MEASURED OFF for
+        # a reason: at num_predict 160 the reasoning ate the whole budget
+        # and the reply came back EMPTY 6 times out of 6, and the turns
+        # that did finish took 10.9-33.0 s against a 1.3 s baseline. Do not
+        # turn this on without also raising num_predict a long way.
+        "think": False,
+        # Tokens held back for the answer, on top of num_predict, when the
+        # guard below decides whether a round still fits.
+        "answer_reserve_tokens": 128,
+        # THE GUARD. When a round would overflow the window, drop the
+        # OLDEST TOOL RESULT. With this off, Ollama makes room its own way
+        # -- by deleting the oldest messages, which is HIS QUESTION -- and
+        # says nothing about it in any log.
+        "protect_question": True,
+    },
     "home_location": {"city": "", "region": "", "lat": None, "lon": None},
     "location_lookup": True,
     "google_ical_urls": [],
