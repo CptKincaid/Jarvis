@@ -816,6 +816,46 @@ def test_a_per_account_smtp_host_is_carried_through():
     assert conn.sent[0]["From"] == "Hunter Peyrovi <h@work.com>"
 
 
+def test_the_imap_rewrite_survives_the_real_config_class():
+    """F22 (09-03). test_the_smtp_host_follows_the_imap_host passes on a
+    bare dict; under the REAL AssistantConfig DEFAULTS carried
+    gmail.smtp_host = "smtp.gmail.com", and mail_accounts copied that into
+    every account that had none of its own, so the documented imap.x ->
+    smtp.x rewrite was unreachable in production: a Fastmail or Exchange
+    account was submitted to Gmail's server with its own credentials and
+    he heard "I couldn't send that, sir." Through the config class, not a
+    dict, and with a top-level smtp_host present the way load() wrote one
+    into his file."""
+    from jarvis.assistant_config import AssistantConfig
+    cfg = AssistantConfig({"gmail": {
+        "smtp_host": "smtp.gmail.com",          # what load() left in his file
+        "accounts": [
+            {"label": "school", "address": "hp@tamu.edu", "app_password": "s",
+             "imap_host": "imap.fastmail.com"},
+            {"label": "personal", "address": "h@gmail.com", "app_password": "p"},
+        ]}}, None)
+    school, personal = mail_mod.mail_accounts(cfg)
+    assert school["host"] == "imap.fastmail.com"
+    assert mail_mod.smtp_host(school) == "smtp.fastmail.com"
+    assert mail_mod.smtp_host(personal) == "smtp.gmail.com"
+    mail_mod.send_message(school, "h@example.com", "s", "b", smtp=FakeSMTP)
+    assert FakeSMTP.made[-1].host == "smtp.fastmail.com"
+
+
+def test_the_shipped_defaults_do_not_carry_a_submission_host():
+    """The other half of F22: AssistantConfig.load() writes every DEFAULTS
+    key into the file, so a default smtp_host is not a default, it is a
+    value in his config forever. A per-account entry with no smtp_host
+    and the legacy single mailbox both derive it from their IMAP host."""
+    from jarvis.assistant_config import DEFAULTS, AssistantConfig
+    assert "smtp_host" not in DEFAULTS["gmail"]
+    legacy = AssistantConfig({"gmail": {
+        "address": "h@fastmail.com", "app_password": "p",
+        "imap_host": "imap.fastmail.com"}}, None)
+    (single,) = mail_mod.mail_accounts(legacy)
+    assert mail_mod.smtp_host(single) == "smtp.fastmail.com"
+
+
 def test_arming_a_send_clears_a_read_back_that_was_already_on_the_floor(cmd):
     """Two questions cannot share one yes. The HPCOMPUTER lane parks its
     read-back in _pending_destructive; arming a send must take the floor

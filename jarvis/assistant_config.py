@@ -56,8 +56,11 @@ DEFAULTS: dict = {
     # per-account entry in `accounts` may carry its own smtp_host; without
     # one, mail.smtp_host() rewrites imap.x -> smtp.x, which is right for
     # Gmail and for everything else that names its servers that way.
+    # smtp_host is deliberately NOT a default: load() writes every default
+    # key into the file, and a written "smtp.gmail.com" then reached every
+    # account that had none of its own, so the rewrite never ran (F22).
     "gmail": {"address": "", "app_password": "", "imap_host": "imap.gmail.com",
-              "smtp_host": "smtp.gmail.com", "accounts": []},
+              "accounts": []},
     "claude": {
         "allowed_dirs": ["/home/hunterp/Jarvis", "/home/hunterp/haymaker-digest"],
         "projects_root": "/home/hunterp/projects",
