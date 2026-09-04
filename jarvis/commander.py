@@ -5468,27 +5468,93 @@ _SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|and|"
               r"send it|send that|go ahead|do it|" + _SEND_TO_REF + r"|"
               + _SEND_FROM_SAME + r"|" + _SEND_REF +
               r"))*[?.!]*$")
-# "ok" / "okay" / "sure" / "alright" are deliberately ABSENT. They are the
-# words a man says while still reading the read-back, and this is the one
-# question in the app where "probably yes" must not be enough. They are
-# caught by _SEND_MAYBE_RX below and asked again rather than dropped in
-# silence -- silence is how he learns the feature does not work.
+# "ok" / "okay" / "sure" / "alright" are deliberately ABSENT as answers of
+# their own. They are the words a man says while still reading the
+# read-back, and this is the one question in the app where "probably yes"
+# must not be enough. Alone they are caught by _SEND_MAYBE_RX below and
+# asked again rather than dropped in silence -- silence is how he learns
+# the feature does not work. As a PREFIX on a real yes ("okay, send it to
+# her", "sure, ship it", "right, to the same address") they are the
+# throat-clearing before the answer, and _send_clean strips them off
+# before this grammar runs (the third review, 09-04: eighteen plain
+# yeses were re-asked because "um", "yes yes" and "yeah sure" sat in
+# front of them).
 # The literal echo of the read-back -- "send it to her", "send it to him
 # please", "please send it to her" -- is a yes in its own right, not only
 # a tail on one (the second review, 09-04). "please" may lead it.
-_SEND_YES_RX = re.compile(
-    r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?"
+# A demonstrative WITH a noun on it -- "that address", "the same one",
+# "that one", "her inbox" -- is the destination said back, and so is "to
+# <that>". The bare pronouns (her / it / that) are deliberately not heads:
+# "it" alone is not consent to anything.
+_SEND_REF_HEAD = (r"(?:(?:her|his|their|that|this|the same|the usual)\s+"
+                  + _SEND_REF_NOUN + r")")
+_SEND_YES_HEAD = (
     r"(?:yes|yeah|yep|yup|aye|affirmative|correct|confirmed?|certainly|"
     r"absolutely|definitely|of course|go ahead|do it|send it|send that|"
-    r"send it now|please do|that'?s right|fire away|off you go|"
-    r"send (?:it|that|this) (?:to|over to|on to) " + _SEND_REF + r")"
-    + _SEND_TAIL, re.I)
+    r"send it now|please do|that'?s (?:right|correct)|that'?s the one|"
+    r"fire away|off you go|go on(?: then)?|go for it|ship it|"
+    r"send (?:it|that|this) (?:over|along|off|out|on)(?: then)?|"
+    r"send (?:it|that|this) (?:to|over to|on to) " + _SEND_REF + r"|"
+    r"(?:to|over to|on to) " + _SEND_REF_HEAD + r"|" + _SEND_REF_HEAD + r")")
+# A yes may be followed by another yes: "yes, that's the one", "yes that's
+# right, send it", "that one, yes", "yep, send it over". The heads are in
+# the yes tail for that reason. The no grammar takes this tail too (a no
+# followed by anything yes-shaped is a no); the maybe grammar keeps the
+# plain one.
+_SEND_YES_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|"
+                  r"then|and|" + _SEND_YES_HEAD + r"|" + _SEND_TO_REF + r"|"
+                  + _SEND_FROM_SAME + r"|" + _SEND_REF +
+                  r"))*[?.!]*$")
+_SEND_YES_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?" + _SEND_YES_HEAD + _SEND_YES_TAIL,
+    re.I)
+# What comes off before the yes / no grammars run (the third review):
+#   * a leading run of fillers -- "um", "uh", "er", "hmm", "well", "so",
+#     "okay", "right", "sure", "alright", "fine" -- after an optional
+#     "jarvis"; the address survives, the throat-clearing does not;
+#   * the pure hesitations (um / uh / er / hmm) anywhere in the sentence;
+#   * a doubled or tripled yes ("yes yes yes", "yeah sure send it", "yes,
+#     yes, to her"), collapsed to its first word.
+# The cleaned sentence is only used when something is left of it: "okay"
+# on its own cleans to nothing and is handed back whole, so it is still the
+# maybe it always was.
+_SEND_FILLER_LEAD_RX = re.compile(
+    r"^((?:jarvis[,\s]+)?)"
+    r"(?:(?:um+|uh+|er+|erm|hmm+|hm+|mm+|mhm|well|so|ok(?:ay)?|right|"
+    r"alright|all right|sure|fine)[,.\s]+)+", re.I)
+_SEND_FILLER_MID_RX = re.compile(r"\b(?:um+|uh+|er|erm|hmm+|hm+)\b[,.]*\s*",
+                                 re.I)
+_SEND_YES_RUN_RX = re.compile(
+    r"\b(yes|yeah|yep|yup|aye)\b(?:[,.\s]+(?:yes|yeah|yep|yup|aye|sure|"
+    r"ok(?:ay)?)\b)+", re.I)
+_SEND_NO_RUN_RX = re.compile(
+    r"\b(no|nope|nah)\b(?:[,.\s]+(?:no|nope|nah)\b)+", re.I)
+
+
+def _send_clean(text: str) -> str:
+    """The read-back answer with its fillers and doubled yeses (and noes)
+    taken off."""
+    t = " ".join(str(text or "").split())
+    if not t:
+        return t
+    out = _SEND_FILLER_LEAD_RX.sub(r"\1", t)
+    out = _SEND_FILLER_MID_RX.sub("", out)
+    out = _SEND_YES_RUN_RX.sub(r"\1", out)
+    out = _SEND_NO_RUN_RX.sub(r"\1", out)
+    out = " ".join(out.split()).strip(" ,.")
+    return out if re.search(r"[a-z]", out, re.I) else t
+
+
+# The no takes the YES tail: "no, ship it" / "no, go on" / "no, send it
+# over" are contradictory sentences, and the safe reading of each is the
+# one where nothing leaves the machine -- a no followed by any yes-shaped
+# thing is a no.
 _SEND_NO_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:no[,\s]+)?"
     r"(?:no|nope|nah|negative|don'?t|do not|stop|cancel|abort|"
     r"not now|not yet|not that one|wrong one|wrong file|wrong person|"
     r"hold on|hold off|wait|never ?mind|forget it|scratch that|leave it|"
-    r"no thanks|no thank you|that'?s wrong)" + _SEND_TAIL, re.I)
+    r"no thanks|no thank you|that'?s wrong)" + _SEND_YES_TAIL, re.I)
 _SEND_MAYBE_RX = re.compile(
     r"^(?:jarvis[,\s]+)?"
     r"(?:ok(?:ay)?|alright|all right|sure|fine|right|very well|mhm|mm|"
@@ -5719,9 +5785,11 @@ def parse_send_answer(text) -> Optional[bool]:
     """True / False / None for a read-back answer. None is "not an answer".
 
     NO is tested first: "no, send it" is a contradictory sentence and the
-    safe reading of it is the one where nothing leaves the machine.
+    safe reading of it is the one where nothing leaves the machine. Fillers
+    and doubled yeses come off first (_send_clean), and they come off for
+    BOTH grammars, so "well, no" is as much a no as "um, yes" is a yes.
     """
-    t = " ".join(str(text or "").split())
+    t = _send_clean(text)
     if not t:
         return None
     if _SEND_NO_RX.match(t):
@@ -9061,6 +9129,23 @@ def weather_when(text: str) -> str:
     return "now"
 
 
+def _route_recognised(d) -> bool:
+    """Did the router RECOGNISE the sentence as something -- a Claude task,
+    a web lookup, a session action, a question, a tool cue -- or merely
+    default it to the chat model ("short", "classify", "empty", a weak
+    topic, an error)? The read-back's set-aside draft answers the second
+    kind (the third review, 09-04). A decision that is not a RouteDecision
+    at all (a stub) counts as unrecognised."""
+    kind = getattr(d, "kind", None)
+    reason = getattr(d, "reason", None)
+    if not isinstance(kind, str) or not isinstance(reason, str):
+        return False
+    if kind in ("action", "ask", "web", "claude"):
+        return True
+    return kind == "local" and reason.startswith("local:") \
+        and reason != "local:topic"
+
+
 def forced_call(reason: str, text: str) -> Optional[tuple]:
     """(tool, args) when the router's reason names the tool and the
     utterance carries its arguments; None to run the full tool loop."""
@@ -9444,6 +9529,7 @@ class Commander:
     _strict_reasked: bool = False
     _pending_objection: Optional[tuple] = None
     _pending_send: Any = None                 # outbox.Draft awaiting a yes
+    _send_aside: Any = None                   # a Draft set aside for ONE turn
     _pending_sendask: Optional[SendAsk] = None  # "Which account?" / "What is it?"
     _objection_timer = None
     _objections = None
@@ -9515,6 +9601,7 @@ class Commander:
         self._answered_pending = False
         self._strict_reasked = False
         self._pending_send = None
+        self._send_aside = None
         # A send that stopped at "Which account?" / "What is it?" (F21).
         self._pending_sendask: Optional[SendAsk] = None
         # He advised against something and asked "shall I set it anyway?":
@@ -9593,7 +9680,15 @@ class Commander:
                      getattr(self, "_pending_destructive_meta", None),
                      getattr(self, "_pending_sendask", None))
             self._answered_pending = False
+            self._send_aside = None
             result = self._handle_inner(text, source)
+            if result is None or not getattr(result, "handled", False):
+                # Nothing below the read-back rung claimed the sentence
+                # either ("No route"): the set-aside draft answers it.
+                res = self._send_aside_answer(text, "no route")
+                if res is not None:
+                    result = res
+            self._send_aside = None
             self._drop_stranded_questions(armed, result, source)
             # A correction / re-run answers a different utterance: THAT is
             # the last turn, so a second "no, I said ..." corrects the
@@ -10439,11 +10534,21 @@ class Commander:
                 and not WEB_CUE_RX.search(text):
             intent, conf = self.intent.classify(text)
             if intent == IntentClassifier.NO:
+                # A draft set aside above outranks the classifier's NO:
+                # "go on" said to an open "Send it, sir?" is not background
+                # chat, and the silent drop here was one of the two ways
+                # the read-back died without a word (the third review).
+                res = self._send_aside_answer(text, "called background chat")
+                if res is not None:
+                    return res
                 log.info("Ignored (background chat, conf=%.2f): %r",
                          conf, text)
                 return CommandResult(handled=True,
                                      status="Ignored (background chat)")
             if intent == IntentClassifier.UNCERTAIN:
+                res = self._send_aside_answer(text, "uncertain intent")
+                if res is not None:
+                    return res
                 log.info("Uncertain intent (conf=%.2f): %r", conf, text)
                 self._prompt_uncertain(text)
                 return CommandResult(handled=True, status="Was that for me?",
@@ -10788,9 +10893,17 @@ class Commander:
           than obeyed or ignored. Obeying it is how a file reaches the wrong
           person; ignoring it in silence is how he concludes the feature
           does not work. The second vague answer spends the draft;
-        * ANYTHING ELSE -- a new command, a changed subject -- drops the
-          draft and keeps its own meaning, exactly as the destructive
-          read-back does. Changing the subject is not consent.
+        * ANYTHING ELSE is set ASIDE for the rest of the turn
+          (``_send_aside``). A rung below that recognises it as a command
+          of its own keeps its meaning and the draft stays dropped --
+          changing the subject is not consent, exactly as the destructive
+          read-back has it. But if NOTHING recognises it (the router's
+          "short", the intent gate's "background chat", no route at all)
+          the draft speaks: the one re-ask for a short sentence, the
+          spoken drop otherwise (_send_aside_answer). Before the third
+          review (09-04) that branch returned None -- draft gone, no
+          reply -- and "go on", "the same one" and "that address please"
+          each died that way.
 
         The slot is cleared FIRST, before any of that, so no path through
         this method can leave a live draft behind for a later stray yes.
@@ -10834,7 +10947,13 @@ class Commander:
             # bare yes sent the file to the person he had just corrected
             # AWAY from. The draft is spent and the same file is read back
             # again to the corrected recipient / account. Never sent.
-            fix = _send_correction(said) if parse_yes_no(said) is True else None
+            # The correction is read off the CLEANED sentence: "okay yes,
+            # send it to dana at example dot com" is seven words with
+            # "okay" in front, which is past parse_yes_no's six-word line
+            # and not a yes-word first -- so the raw form was no yes at all
+            # and the correction inside it was lost (the third review).
+            cleaned = _send_clean(said)
+            fix = _send_correction(cleaned) if parse_yes_no(cleaned) is True else None
             if fix is not None:
                 who, hint = fix
                 log.info("send read-back: %r corrects the draft; asking again",
@@ -10859,16 +10978,38 @@ class Commander:
             # nothing is sent, he is asked once more -- and the re-ask
             # names the file and the recipient again (F23), so the yes he
             # gives next is to a sentence he has just heard.
-            vague = bool(_SEND_MAYBE_RX.match(said)) or (
-                len(said.split()) <= 6 and parse_yes_no(said) is True)
+            vague = bool(_SEND_MAYBE_RX.match(cleaned)) or (
+                len(cleaned.split()) <= 6 and parse_yes_no(cleaned) is True)
             if vague and not draft.reasked:
                 draft.reasked = True
                 self._pending_send = draft
                 log.info("send read-back: %r is not a yes; asking again", text)
                 return CommandResult(handled=True, speak=True, status="Confirm?",
                                      reply=outbox.unsure_line(draft))
+            if vague:
+                # The second vague answer spends the draft -- OUT LOUD. It
+                # used to fall through here to the silent branch, and a
+                # second "sure" was answered by the chat model, or by
+                # nothing (the third review, 09-04).
+                log.info("send draft dropped, asked twice: %r", text)
+                return CommandResult(handled=True, speak=True,
+                                     status="Not sent",
+                                     reply=outbox.ASK_SPENT_LINE)
+            # Not an answer of any shape. It USED to be dropped here on the
+            # assumption that a new command follows -- and when none did
+            # ("the same one", "go on", "that address please" before they
+            # were in the grammar) the draft was gone and he heard NOTHING:
+            # the sentence went to the chat model, or to the intent gate,
+            # which called four words background chat. The draft is set
+            # ASIDE for the rest of this turn instead. A rung below that
+            # recognises the sentence as a command of its own keeps its
+            # meaning and the draft stays dropped, exactly as before; if
+            # nothing does, _send_aside_answer speaks -- the one re-ask, or
+            # the spoken drop -- and never returns silence.
             self._answered_pending = False
-            log.info("send draft dropped, the subject changed: %r", text)
+            self._send_aside = draft
+            log.info("send read-back: %r is not an answer; set aside for "
+                     "the rest of the turn", text)
             return None
         if not answer:
             log.info("send declined: %s", draft.path.name)
@@ -10920,6 +11061,45 @@ class Commander:
         return CommandResult(handled=True, reply="Sending it now, sir.",
                              speak=True, ack=True, done=False,
                              status=f"Sending {name}")
+
+    def _send_aside_answer(self, text: str,
+                           why: str = "") -> Optional[CommandResult]:
+        """Speak for a read-back draft that was set aside this turn and
+        that nothing below the read-back rung recognised (the third
+        review, 09-04). None when no draft is aside.
+
+        Two answers, never silence:
+
+        * a SHORT sentence (parse_yes_no's own six-word overheard-speech
+          line) gets the one re-ask, and the draft is re-armed for it --
+          once. "that one there", "the pdf", a mumble Whisper made four
+          words of: he is asked again, by name, and nothing is sent;
+        * anything else -- a long sentence, or the second miss -- spends
+          the draft OUT LOUD (ASK_SPENT_LINE). A ten-word sentence said to
+          somebody else must not re-arm the draft for the next stray
+          "yeah" (the whole grammar exists for that sentence), but it must
+          not kill it in silence either: he hears that nothing was sent.
+
+        The draft is consumed here whichever way it goes, and
+        ``_answered_pending`` is set so _drop_stranded_questions leaves a
+        re-armed draft alone.
+        """
+        draft = getattr(self, "_send_aside", None)
+        if draft is None:
+            return None
+        self._send_aside = None
+        self._answered_pending = True
+        said = " ".join(str(text or "").split())
+        if len(said.split()) <= 6 and not draft.reasked:
+            draft.reasked = True
+            self._pending_send = draft
+            log.info("send read-back: %r is not an answer (%s); asking again",
+                     said, why)
+            return CommandResult(handled=True, speak=True, status="Confirm?",
+                                 reply=outbox.unsure_line(draft))
+        log.info("send draft dropped out loud: %r (%s)", said, why)
+        return CommandResult(handled=True, speak=True, status="Not sent",
+                             reply=outbox.ASK_SPENT_LINE)
 
     def _try_sendask_answer(self, text: str,
                             source: str = "voice") -> Optional[CommandResult]:
@@ -12435,7 +12615,12 @@ class Commander:
         brain = self._svc("brain")
         claude = self._svc("claude")
         if router is None or brain is None or not hasattr(brain, "chat"):
-            # Legacy wiring (no router / old brain): Tier 2 as before.
+            # Legacy wiring (no router / old brain): Tier 2 as before --
+            # unless a read-back draft was set aside this turn, in which
+            # case nothing recognised the sentence and it answers that.
+            res = self._send_aside_answer(text, "no router")
+            if res is not None:
+                return res
             if brain is not None and hasattr(brain, "think"):
                 brain.think(text)
                 return CommandResult(handled=True, status="Thinking...",
@@ -12455,6 +12640,17 @@ class Commander:
         except Exception:
             log.exception("router.route failed; local")
             d = RouteDecision(kind="local", reason="router-error")
+        if getattr(self, "_send_aside", None) is not None \
+                and not _route_recognised(d):
+            # The router is the last stop. A sentence that reaches it with
+            # nothing but "short" or "classify" for a reason is one the app
+            # did not recognise -- and with a read-back draft set aside it
+            # is answered by that draft, not handed to the chat model to
+            # make something of (the third review, 09-04).
+            res = self._send_aside_answer(
+                text, f"unrecognised ({getattr(d, 'reason', '?')})")
+            if res is not None:
+                return res
         return self._dispatch_route(d, text)
 
     @staticmethod

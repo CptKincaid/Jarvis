@@ -1145,15 +1145,18 @@ def test_a_bare_yes_is_never_a_choice_between_two_files(cmd):
 # ==================================================================
 @pytest.mark.parametrize("said", [
     "system, yes.",              # real, jarvis.log.1:5313
-    "um, yes", "uh yeah", "okay yes", "mhm yeah",
-    "yes that's the one", "yes it is",
-    "I think so yes", "well, yes",
+    "yes it is", "I think so yes",
 ])
 def test_a_yes_this_grammar_does_not_take_is_asked_again_not_dropped(cmd, said):
     """parse_yes_no reads all of these as yes and parse_send_answer does
     not. Sending on them is how a file reaches the wrong person; dropping
     them without a word is how he learns the feature does not work. They
-    get the re-ask the vague fillers already got."""
+    get the re-ask the vague fillers already got.
+
+    (09-04, the third review: "um, yes", "uh yeah", "okay yes", "mhm
+    yeah", "well, yes" and "yes that's the one" used to sit in this list.
+    A filler in front of a plain yes is not doubt, and eighteen of his
+    plain yeses were being re-asked; they are yeses now -- section 21.)"""
     cmd.handle("email the biosensors handout to Heather", source="typed")
     res = cmd.handle(said, source="typed")
     assert res is not None
@@ -1639,6 +1642,8 @@ SEND_CORPUS = [
     "yes, to the same person", "yep send it to that address",
     # the account he was just read is not a new account either
     "yes, from the same account", "yes, send it from that account",
+    # a filler in front of the read-back's own words (09-04, third review)
+    "okay send it to her",
 ]
 
 
@@ -1676,8 +1681,10 @@ NOT_SEND_CORPUS = [
     "yes, and turn the lights off", "send it to her and turn the lights off",
     # no, in every shape, including the contradictory one
     "no", "no, don't send it to her", "no, send it to her", "not to her",
-    # the fillers stay vague: one re-ask, nothing sent
-    "okay send it to her", "sure", "okay",
+    # the fillers ALONE stay vague: one re-ask, nothing sent ("okay send it
+    # to her" moved to SEND_CORPUS, 09-04: the okay is a prefix on the
+    # read-back's own words)
+    "sure", "okay",
     # not an answer at all
     "Yeah, so you should be able to look that up.", "what's the weather",
     "send it to her tomorrow",
@@ -1729,7 +1736,7 @@ def test_a_name_an_address_or_an_account_still_corrects(said):
 
 @pytest.mark.parametrize("said", [
     "yes, send it to Dana", "yes, and turn the lights off", "okay", "sure",
-    "okay send it to her", "send it to her tomorrow",
+    "send it to her tomorrow",
 ])
 def test_the_guards_are_not_a_yes(said):
     assert parse_send_answer(said) is not True, said
@@ -1740,8 +1747,11 @@ def test_no_is_tested_before_yes_on_the_contradictory_sentence():
 
 
 def test_the_fillers_get_one_re_ask_with_a_pronoun_on_them(cmd):
+    """A filler ALONE is still the one re-ask; the read-back's own words
+    after it then send. (Until 09-04 this test said "okay send it to her"
+    was the re-ask too; the okay is a prefix on a plain yes -- section 21.)"""
     cmd.handle("email the biosensors handout to Heather", source="typed")
-    res = cmd.handle("okay send it to her", source="typed")
+    res = cmd.handle("okay", source="typed")
     assert res.reply.startswith("I'd rather be certain") and cmd._pending_send is not None
     assert not FakeSMTP.made
     cmd.handle("send it to her", source="typed")
@@ -1755,3 +1765,266 @@ def test_her_address_is_not_a_recipient_called_address(cmd):
     assert "address for address" not in res.reply, res.reply
     assert res.ack and cmd.spoken == ["Sent to Heather, sir."], (res.reply, cmd.spoken)
     assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+# ==================================================================
+# 21. The third review (09-04): fillers, doubled yeses, the whole-phrase
+#     yeses -- and while a draft is pending, NOTHING returns silence.
+# ==================================================================
+# Measured on this harness before the fix: the first eighteen were RE-ASKED
+# ("I'd rather be certain...") and the last seven got no reply at all --
+# handled=True, reply=None, draft gone, the sentence handed to the chat
+# model. Every one is a plain yes to "...to Heather. Send it, sir?".
+THIRD_REVIEW_SENDS = [
+    # re-asked: fillers and doubled yeses in front of a plain yes
+    "yes that's right, send it", "that's correct, send it", "yes yes yes",
+    "um yes send it to her", "uh, yes", "er, yes, send it", "hmm yes",
+    "yes yes", "yes yes send it", "yeah yeah send it", "yes, yes, to her",
+    "yes, that's the one", "that one, yes", "right, to the same address",
+    "yep, send it over", "yes, go for it", "yes, ship it", "yeah sure send it",
+    # silent: no yes-word at all, and a whole phrase the grammar lacked
+    "the same one", "go on", "go on then", "send it over", "send it along",
+    "send it off", "that address please",
+    # the ones section 14 used to pin as re-asks
+    "um, yes", "uh yeah", "okay yes", "mhm yeah", "well, yes",
+]
+
+
+@pytest.mark.parametrize("said", THIRD_REVIEW_SENDS)
+def test_the_third_review_yeses_send_to_the_pending_address(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled and res.ack, (said, res)
+    assert "rather be certain" not in str(res.reply), (said, res.reply)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent, (said, res.reply)
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+    assert cmd._pending_send is None and cmd._send_aside is None
+
+
+@pytest.mark.parametrize("said", THIRD_REVIEW_SENDS)
+def test_the_third_review_yeses_are_a_yes_to_the_grammar(said):
+    assert parse_send_answer(said) is True, said
+
+
+@pytest.mark.parametrize("said,want", [
+    ("um yes send it to her", "yes send it to her"),
+    ("yes yes yes", "yes"),
+    ("yes, yes, to her", "yes, to her"),
+    ("yeah sure send it", "yeah send it"),
+    ("jarvis, um, yes", "jarvis, yes"),
+    ("right, to the same address", "to the same address"),
+    ("well, no", "no"),
+    # nothing left after the fillers come off: handed back whole
+    ("okay", "okay"), ("sure", "sure"), ("okay, okay.", "okay, okay."),
+    # a word that merely contains a filler is untouched
+    ("her address", "her address"),
+])
+def test_what_send_clean_takes_off(said, want):
+    from jarvis.commander import _send_clean
+    assert _send_clean(said) == want
+
+
+# ---- the guards the review will attack ---------------------------------
+@pytest.mark.parametrize("said", [
+    # NO still wins, with or without a filler or a new head after it
+    "no, ship it", "no, go on", "well, no", "um, no, send it", "no, send it over",
+    "hmm, no", "no no no",
+])
+def test_a_no_in_front_of_a_new_yes_head_is_still_a_no(said):
+    assert parse_send_answer(said) is False, said
+
+
+@pytest.mark.parametrize("said", [
+    # a filler alone is not a yes
+    "okay", "sure", "right", "well", "um", "okay okay", "hmm",
+    # a name / an address / a second command after a new head is not a yes
+    "ship it to Dana", "go on and turn the lights off", "send it over to Dana",
+    "send it off to dana@example.com", "go for it and turn the lights off",
+    "yes yes, and turn the lights off", "um yes send it to Dana",
+    # a self-pronoun after a new head is not a yes
+    "send it over to me", "go on, send it to me", "send it off to us",
+    # the bare pronouns are not heads, with or without a "to" in front:
+    # "to her--" is what an early endpoint makes of "to her work address"
+    "her", "it", "that", "this", "to her", "to him", "to it", "to that",
+])
+def test_the_new_heads_do_not_widen_past_the_guards(said):
+    assert parse_send_answer(said) is not True, said
+
+
+@pytest.mark.parametrize("said", [
+    "to the same address", "to that address", "to her address", "that address",
+    "her inbox", "the same one", "that one", "that person",
+])
+def test_a_destination_with_a_noun_on_it_is_the_draft_said_back(said):
+    assert parse_send_answer(said) is True, said
+
+
+@pytest.mark.parametrize("said", [
+    "send it over to me", "go on, send it to me", "um yes, send it to me",
+])
+def test_a_redirect_to_himself_behind_a_new_head_still_answers_self(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    FakeSMTP.made.clear()
+    res = cmd.handle(said, source="typed")
+    assert res is not None and "not to you" in res.reply, (said, res)
+    assert not any(getattr(c, "sent", None) for c in FakeSMTP.made), said
+    assert cmd._pending_send is not None
+
+
+@pytest.mark.parametrize("said", [
+    "um yes send it to Dana", "yes yes, send it to Dana",
+    "okay yes, send it to dana@example.com",
+])
+def test_a_correction_behind_a_filler_still_corrects(cmd, said):
+    """"okay yes, send it to dana at example dot com" is seven words with
+    "okay" first -- past parse_yes_no's line -- so the raw sentence was
+    no yes at all and the correction inside it was re-asked away; the
+    next bare yes then sent the file to the person he had corrected
+    AWAY from. The correction is read off the cleaned sentence now."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled, (said, res)
+    assert not FakeSMTP.made, said
+    # a correction reads the file back again (or asks for the address):
+    # nothing sent, a question still open, and Heather is not the To.
+    assert cmd.question_open(), (said, res.reply)
+    cmd.handle("yes", source="typed")
+    assert not (FakeSMTP.made and FakeSMTP.made[-1].sent
+                and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"), said
+
+
+def test_an_account_correction_behind_a_filler_still_corrects(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("well yes, but from my work account", source="typed")
+    assert res is not None and res.reply.endswith("Send it, sir?"), res
+    assert "your work account" in res.reply and not FakeSMTP.made
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+    assert FakeSMTP.made[-1].logged_in[0] == "hunter@work.com"
+
+
+@pytest.mark.parametrize("said", ["sure", "okay", "ok", "right", "fine"])
+def test_a_filler_alone_still_gets_exactly_one_re_ask(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res.reply == outbox.unsure_line(cmd._pending_send), said
+    assert not FakeSMTP.made and cmd._pending_send is not None
+
+
+# ---- never silence while a draft is pending ----------------------------
+def test_the_second_vague_answer_is_a_spoken_drop_not_silence(cmd):
+    """It used to fall to the silent branch: the second "sure" went to the
+    chat model and the draft died without a word."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.handle("okay", source="typed")
+    res = cmd.handle("sure", source="typed")
+    assert res is not None and res.handled and res.speak, res
+    assert res.reply == outbox.ASK_SPENT_LINE
+    assert cmd._pending_send is None and not FakeSMTP.made
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made
+
+
+@pytest.mark.parametrize("said", ["the pdf", "that one there", "hmm let me think",
+                                  "the one on the desktop", "mm the thing"])
+def test_an_unrecognised_short_sentence_gets_the_re_ask_then_the_spoken_drop(cmd, said):
+    """Not yes, not no, not a correction, and nothing below the read-back
+    recognises it (this harness's router is a stub, so nothing does). The
+    old handler returned None here: draft gone, no reply. Now: the one
+    re-ask, and a second miss spends the draft out loud."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert res.reply == outbox.unsure_line(cmd._pending_send), (said, res.reply)
+    assert cmd._pending_send is not None and cmd._pending_send.reasked
+    assert not FakeSMTP.made
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.reply == outbox.ASK_SPENT_LINE, (said, res)
+    assert cmd._pending_send is None and cmd._send_aside is None
+    assert not FakeSMTP.made
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made, "a yes after the spoken drop reaches nothing"
+
+
+def test_the_re_ask_after_an_unrecognised_sentence_still_takes_a_yes(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.handle("the pdf", source="typed")
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+def test_the_ten_word_stray_is_a_spoken_drop_and_is_not_re_armed(cmd):
+    """The sentence the whole grammar exists for. It must not re-arm the
+    draft for the next stray "yeah" -- and it must not kill it in silence
+    either. Long and unrecognised: the spoken drop, first time."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("Yeah, so you should be able to look that up.",
+                     source="typed")
+    assert res is not None and res.reply == outbox.ASK_SPENT_LINE, res
+    assert cmd._pending_send is None and not FakeSMTP.made
+    cmd.handle("yeah", source="typed")
+    assert not FakeSMTP.made
+
+
+def test_a_recognised_new_command_still_keeps_its_meaning_and_drops_the_draft(cmd):
+    """The other half of the rule: a real command below the read-back is
+    not re-asked, it is obeyed, and the draft is spent as before."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("what time is it", source="typed")
+    assert res is not None and res.handled
+    assert res.reply != outbox.ASK_SPENT_LINE and "rather be certain" not in str(res.reply)
+    assert cmd._pending_send is None and cmd._send_aside is None
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made
+
+
+def test_a_routed_command_the_router_recognises_keeps_its_meaning(cmd):
+    """With a real decision from the router (a strong local cue) the
+    sentence is a command, not a miss: no re-ask, draft dropped."""
+    from jarvis.router import RouteDecision
+    cmd.services.router.route.return_value = RouteDecision("local", "local:weather")
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("what's the weather like in Houston", source="typed")
+    assert res is not None and res.handled
+    assert "rather be certain" not in str(res.reply) and res.reply != outbox.ASK_SPENT_LINE
+    assert cmd._pending_send is None and not FakeSMTP.made
+
+
+@pytest.mark.parametrize("intent", [IntentClassifier.NO, IntentClassifier.UNCERTAIN])
+def test_the_intent_gate_cannot_drop_a_pending_draft_in_silence(cmd, monkeypatch, intent):
+    """Voice, no address: the classifier calls four words background chat
+    (NO) or asks "Was that for me?" (UNCERTAIN). With a draft pending both
+    are the silent death; the draft answers first."""
+    monkeypatch.setattr(cmd.intent, "classify", lambda text: (intent, 0.9))
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    assert cmd._pending_send is not None
+    res = cmd.handle("the pdf", source="voice")
+    assert res is not None and res.reply == outbox.unsure_line(cmd._pending_send), res
+    assert cmd._pending_send is not None and not FakeSMTP.made
+    res = cmd.handle("yes", source="voice")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+def test_route_recognised_reads_the_decision_not_the_stub():
+    from unittest.mock import MagicMock
+    from jarvis.commander import _route_recognised
+    from jarvis.router import RouteDecision
+    assert not _route_recognised(MagicMock())
+    assert not _route_recognised(None)
+    for kind, reason in (("local", "short"), ("local", "classify"),
+                         ("local", "empty"), ("local", "router-error"),
+                         ("local", "local:topic")):
+        assert not _route_recognised(RouteDecision(kind, reason)), (kind, reason)
+    for kind, reason in (("local", "local:weather"), ("local", "local:question"),
+                         ("local", "local:wrapper"), ("web", "web-cue"),
+                         ("claude", "explicit"), ("action", "cancel"),
+                         ("ask", "tie")):
+        assert _route_recognised(RouteDecision(kind, reason)), (kind, reason)
+
+
+def test_the_set_aside_draft_never_outlives_its_turn(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.handle("Yeah, so you should be able to look that up.", source="typed")
+    assert cmd._send_aside is None
+    cmd.handle("the pdf", source="typed")
+    assert cmd._send_aside is None
