@@ -1452,6 +1452,10 @@ class TTS:
         self._stop_flag = False
         self._speaking = False           # burst state (queue non-empty → done)
         self._burst_announced = False    # SpeakingState(active=True) sent yet?
+        # The burst's falling edge has been published; nothing may assert
+        # active=True after it (see _run_amp_feeder's tail).
+        self._burst_closed = False
+        self._edge_lock = threading.Lock()   # orders the two publishing threads
         self._amp_playing = False
         self._amp_gen = 0                # generation token: one per chunk feeder
         self._current_amp = 0.0
@@ -1986,6 +1990,8 @@ class TTS:
                 if not self._speaking:
                     self._speaking = True
                     self._burst_announced = False
+                    with self._edge_lock:
+                        self._burst_closed = False
                     self._acquire_mic()
                     # SpeakingState(active=True) is NOT published here. It is
                     # the app's "audio" mark, and the turn ledger's "wait"
@@ -2011,7 +2017,12 @@ class TTS:
                         # rising one, so give them the edge -- late, but the
                         # turn still closes and the follow-up mic still opens.
                         self._mark_audio()
-                    bus.publish(SpeakingState(active=False, amplitude=0.0))
+                    # Under the lock WITH the publish: the amp feeder's tail
+                    # publishes from its own thread and must not re-assert
+                    # active=True on the other side of this edge (2026-09-02).
+                    with self._edge_lock:
+                        self._burst_closed = True
+                        bus.publish(SpeakingState(active=False, amplitude=0.0))
 
     def _mark_audio(self):
         """Publish the burst's SpeakingState(active=True) once, at the moment
@@ -2964,8 +2975,12 @@ class TTS:
 
         def _feed_amp():
             for amp in source:
+                # _burst_closed as well as the generation token: every tick
+                # here is a SpeakingState(active=True) too, so a feeder still
+                # draining its envelope after the worker's falling edge
+                # re-asserts the burst just as surely as the tail does.
                 if (gen != self._amp_gen or not self._amp_playing
-                        or self._stop_flag):
+                        or self._stop_flag or self._burst_closed):
                     break
                 self._current_amp = amp
                 bus.publish(SpeakingState(active=True, amplitude=amp))
@@ -2973,17 +2988,26 @@ class TTS:
             if gen == self._amp_gen:     # don't stomp a newer chunk's feeder
                 self._current_amp = 0.0
                 self._amp_playing = False
-                # amplitude_only: close the mouth, touch nobody's idea of
-                # whether he is still speaking. This publish used to carry
-                # active=True (it cannot carry False -- mid-burst that is a
-                # spurious end-of-speech, and _after_speech would open the
-                # follow-up mic under the next chunk's playback), and the
-                # 80 ms sleeps here drift behind the player, so on a long
-                # line it arrived AFTER the worker's active=False and
-                # latched every level-reader True for good. 2026-09-02
-                # 08:56:19: the one orphan duck in a boot of 65.
-                bus.publish(SpeakingState(active=True, amplitude=0.0,
-                                          amplitude_only=True))
+                # THE TAIL IS NOT AN AUTHORITY ON active. Its job is to shut
+                # the avatar's mouth at the end of a CHUNK, mid-burst. It used
+                # to publish a hard-coded active=True from the tts-amp-feeder
+                # thread, unordered against the worker's active=False -- and on
+                # 2026-09-02 08:56:18 it landed 236 ms AFTER the falling edge.
+                # Nothing ever clears a re-asserted True: the mixer stayed
+                # ducked 17 s, the pill stayed "Speaking", app._tts_active
+                # stayed set, and he had to TYPE his answer.
+                #
+                # TWO fixes for this arrived on two branches and both are kept,
+                # because they fail differently. The guard is the ORDERING one:
+                # once the falling edge has published, this says nothing at all.
+                # amplitude_only is the DECLARATIVE one: the message itself
+                # tells every subscriber to read amplitude and IGNORE active,
+                # so even a publish that slips past the guard cannot latch.
+                with self._edge_lock:
+                    if self._burst_closed:
+                        return
+                    bus.publish(SpeakingState(active=True, amplitude=0.0,
+                                              amplitude_only=True))
 
         threading.Thread(target=_feed_amp, daemon=True,
                          name="tts-amp-feeder").start()

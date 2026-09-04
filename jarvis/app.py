@@ -2622,6 +2622,15 @@ class JarvisApp:
         if arm(key, place) is False:
             return False
         bus.publish(JarvisReply(text=question, speak=False))
+        # ARM THE MIC. This is a QUESTION Jarvis asked, and until 2026-09-02
+        # it was the only one that opened nothing: `_after_speech` starts a
+        # follow-up only on this flag, `Commander.ask_leave_time` arms just
+        # `_pending_leave` (the answering rung, patient for
+        # LEAVE_ANSWER_WINDOW_S), and no wake word follows a proactive line.
+        # At 08:56:15 he was asked "How long do you need to get to
+        # Wisenbaker, sir?", got no mic at all, and answered by TYPING 21 s
+        # later (live log: `handle 'about 10 minutes' source=typed`).
+        self._followup_after_speech = True
         self._say(question, proactive=True, kind="message")
         # ...and OPEN THE MIC THAT ANSWERS IT. Alone among every question
         # Jarvis asks, this one did not: on 2026-09-02 08:56:15 he asked
@@ -3606,6 +3615,19 @@ class JarvisApp:
                 if time.monotonic() - float(pending["at"]) <= self.DEBRIEF_TTL_S:
                     return self._window_setting("quiz.window_s", 15.0)
             except (TypeError, ValueError, KeyError):
+                pass
+        # "How long do you need to get to Wisenbaker, sir?" -- same shape,
+        # and checked HERE rather than in `_question_open` for the same
+        # reason as the debrief: `Commander.ask_leave_time` calls
+        # `question_open()` as its own do-not-ask guard, so a leave question
+        # listed there would stand down from its own answer. A walk duration
+        # is said after a pause to think about it, not inside 4 s.
+        leave = getattr(commander, "_pending_leave", None)
+        if isinstance(leave, tuple) and len(leave) == 3:
+            try:
+                if time.monotonic() - float(leave[2]) <= LEAVE_ANSWER_WINDOW_S:
+                    return self._window_setting("quiz.window_s", 15.0)
+            except (TypeError, ValueError):
                 pass
         if self._question_open(commander):
             return self._window_setting("quiz.window_s", 15.0)
