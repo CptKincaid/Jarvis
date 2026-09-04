@@ -192,7 +192,7 @@ def test_few_shot_pool_is_in_voice(brain):
                  "capability", "bad idea", "mistake"):
         assert gone not in families, gone
     # ... and the prose that replaced them is still there
-    assert "Admit limits gracefully (\"I'm afraid...\")" in brain.VOICE_RULES
+    assert "say so in fresh words each time, never a stock opener" in brain.VOICE_RULES
     assert "you cannot buy, book, browse, call, text, order" in \
         brain.JARVIS_SYSTEM
     assert "When he owns up to a mistake, a light word of reassurance " \
@@ -325,10 +325,10 @@ def test_negative_rules_and_brevity_rule_present(brain):
         assert stale not in brain.JARVIS_SYSTEM, stale
     # order/book/call requests are answered by naming the thing asked
     # for, never with the capability list (round-3a pizza reply)
-    assert "buy, order, book, call, text, send or fetch" in \
+    assert "If he asks for something no tool covers" in \
         brain.JARVIS_SYSTEM
     assert "naming what he asked for" in brain.JARVIS_SYSTEM
-    assert "never answer with what you can do instead" in \
+    assert "never send him to Claude for a thing Claude cannot do either" in \
         brain.JARVIS_SYSTEM
 
 
