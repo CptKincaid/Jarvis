@@ -2898,6 +2898,33 @@ _BRIEFING_NO_RX = re.compile(
 # same one. 60 s: the offer's own line, the 15 s window it opens, and room
 # for one wake-word retry on top.
 BRIEFING_OFFER_TTL_S = 60.0
+
+# ---- in-app face enrolment (jarvis/enrolrun.py) ----------------------
+# THE COMMIT WORD IS TYPED AND ONLY TYPED, so this pattern is deliberately
+# the bare word and nothing else -- no "yes", no "go ahead", no word bag.
+# The whole reason the commit is typed is that owner.mode is 'shadow' on his
+# box and the owner gate therefore refuses nothing; a loose pattern here
+# would give that back by letting an overheard "okay" start a biometric
+# write that REPLACES his gallery. Both spellings, because he types one
+# about as often as the other.
+_ENROL_CONFIRM_RX = re.compile(r"^(?:enrol|enroll)[.!]*$", re.I)
+# The mid-run controls. End-anchored for the same reason the briefing
+# offer's are: these are live while a camera is on, and a word bag would let
+# a sentence about something else stop a run halfway -- or, worse, fail to
+# stop one when he meant it to.
+_ENROL_STOP_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:stop|cancel|abort|never ?mind|forget it|"
+    r"that'?s enough|enough)"
+    r"(?:\s+(?:the\s+)?(?:enrol(?:ment|ling)?|enroll(?:ment|ing)?|"
+    r"capture|that))?"
+    r"(?:[, ]+(?:jarvis|please|thanks))*[.!]*$", re.I)
+_ENROL_READY_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:ready|next|go|go on|i'?m ready|i am ready|"
+    r"carry on)(?:[, ]+(?:jarvis|please))*[.!]*$", re.I)
+_ENROL_WAIT_RX = re.compile(
+    r"^(?:jarvis[,\s]+)?(?:wait|hold on|hold|not yet|one moment|"
+    r"just a moment|hang on|give me a second|give me a sec)"
+    r"(?:[, ]+(?:jarvis|please))*[.!]*$", re.I)
 # While an alarm rings (spec 5.2 a): these words stop it, "snooze [N]" snoozes.
 _RING_STOP_RX = re.compile(
     r"^(?:stop|dismiss|okay|ok|i'?m up|i am up|shut it off|shut up|enough|"
@@ -6955,12 +6982,62 @@ def _h_face_enrol(c, t, m):
     gallery = _face_gallery(c)
     if gallery is None:
         return _face_config_result()
+    # THE IN-APP OFFER, and only for HIM and only for a plain full run.
+    #
+    # Everything else falls through to the hand-over below, unchanged, and
+    # each exclusion has its own reason. A NAMED PERSON needs consent typed
+    # at a real terminal (scripts/face_enrol.consent wants two TTYs and the
+    # person's own name), which a window driven by whoever is already logged
+    # in cannot reproduce -- so "enrol Heather" keeps the command line. A
+    # NAMED POSE is an append-shaped run: one station is six takes, under
+    # the eight-sample floor, so in-app it would capture for a minute and
+    # then refuse, while the terminal path can say --append.
+    if who == owner and not pose:
+        offer = _enrol_offer(c)
+        if offer is not None:
+            return offer
     out = ee.enrol_answer(gallery, who, owner=owner,
                           poses=(pose,) if pose else ())
     # The command is SHOWN, not spoken -- see CommandResult.display_only.
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          display_only=out.get("display_only") or None,
                          status=out["status"])
+
+
+def _enrol_offer(c):
+    """Park "type enrol to start" on ``services.enrol_offer``, or None.
+
+    None means "I cannot offer this here" -- no camera console on this box --
+    and the caller then falls through to the terminal hand-over, which is the
+    honest answer rather than a refusal with no way forward.
+
+    A preflight the TERMINAL could not fix either (the curfew, offline mode,
+    identity switched off, missing weights) does not fall through: it speaks
+    its own sentence, because handing him a command line that is about to hit
+    exactly the same wall wastes his time twice.
+    """
+    from jarvis import enrolrun as er
+    services = getattr(c, "services", None)
+    worker = getattr(services, "preview_worker", None)
+    if worker is None:
+        return None                  # headless: the terminal is the answer
+    cfg = c._svc("assistant")
+    if cfg is None:
+        return None
+    pre = er.preflight(cfg, sensing=c._svc("sensing"), worker=worker,
+                       services=services)
+    if not pre["ok"]:
+        if pre["reply"] == er.E9:
+            return None              # "not in this window" -- hand it over
+        return CommandResult(handled=True, speak=True, reply=pre["reply"],
+                             status="Enrolment: %s" % pre["reason"])
+    try:
+        services.enrol_offer = {"made_at": time.time()}
+    except Exception:                # noqa: BLE001 - a slim services
+        log.debug("could not park the enrolment offer", exc_info=True)
+        return None
+    return CommandResult(handled=True, speak=True, reply=er.E1,
+                         status="Enrolment: type enrol to start")
 
 
 def _h_face_forget(c, t, m):
@@ -9756,6 +9833,14 @@ class Commander:
         res = self._try_approval(text, source)
         if res is not None:
             return res
+        # 3z. The typed "enrol" that commits a face enrolment, and the three
+        #     words that steer one while it runs. ABOVE everything below it
+        #     because a run holds the camera open and speaks on a cadence:
+        #     "stop" has to reach it before any rung that would read the word
+        #     as something else, and it must not wait behind a quiz.
+        res = self._try_enrol(text, source)
+        if res is not None:
+            return res
         # 3a. A working session is holding a question open ("Tuesday at
         #     four?"): this utterance is the answer. Above the quiz because
         #     a session may itself be a quiz-shaped thing, and below the
@@ -10779,6 +10864,151 @@ class Commander:
             return CommandResult(handled=True, reply="Very good, sir.",
                                  speak=False, status="Alarm dismissed")
         return None
+
+    def _try_enrol(self, text: str,
+                   source: str = "voice") -> Optional[CommandResult]:
+        """The typed word that starts an in-app enrolment, and the three that
+        steer one that is already running.
+
+        WHY THE COMMIT MUST BE TYPED, once more, because it is the whole
+        safety argument of this feature. ``owner.mode`` is 'shadow' on his
+        live config, and shadow downgrades every refusal to admit -- so the
+        OwnerGate refuses nothing today. If a spoken sentence were enough, a
+        stranger saying "enrol my face" would replace his gallery with their
+        face UNDER HIS LABEL, and the gate's face leg would afterwards name
+        that stranger as him. That is the one case where a mistaken identity
+        GRANTS rather than denies. ``gate.GATED_SOURCES`` is ("voice",),
+        i.e. typed is exempt BY CONSTRUCTION on the argument that typing
+        means somebody is physically at the keyboard, so the typed word is a
+        second bar layered on top of the gate rather than a hole in it.
+
+        Returning None is the normal case and it leaves the turn alone: with
+        no offer parked and no run live this rung costs two getattrs.
+        """
+        services = getattr(self, "services", None)   # a slim test commander
+        stripped = str(text or "").strip()
+        run = getattr(services, "enrol_run", None)
+        if run is not None and getattr(run, "running", False):
+            res = self._enrol_control(run, stripped)
+            if res is not None:
+                return res
+            # Not a control word. A run does NOT swallow the turn -- he can
+            # still ask the time with his head turned -- so fall through.
+            return None
+        offer = getattr(services, "enrol_offer", None)
+        if not isinstance(offer, dict) or not offer:
+            return None
+        if not _ENROL_CONFIRM_RX.match(stripped):
+            # Anything else leaves the offer parked and routes normally. It
+            # is NOT dropped the way the briefing offer is: that one holds an
+            # open microphone, this one holds nothing at all, and asking him
+            # the time between the offer and the word he types is not a
+            # change of subject worth cancelling a camera run for.
+            return None
+        from jarvis import enrolrun as er
+        try:
+            made = float(offer.get("made_at") or 0.0)
+        except (TypeError, ValueError):
+            made = 0.0
+        if made and time.time() - made > er.OFFER_TTL_S:
+            self._clear_enrol_offer()
+            return CommandResult(handled=True, speak=True, reply=er.E4,
+                                 status="Enrolment: offer expired")
+        if source != "typed":
+            # SAID, NOT TYPED. The offer stays parked -- he has been told
+            # what to do and the ninety seconds are still running.
+            return CommandResult(handled=True, speak=True, reply=er.E3,
+                                 status="Enrolment: type it, don't say it")
+        self._clear_enrol_offer()
+        return self._start_enrol()
+
+    def _clear_enrol_offer(self) -> None:
+        try:
+            self.services.enrol_offer = None
+        except Exception:                # noqa: BLE001 - a slim services
+            log.debug("could not clear the enrolment offer", exc_info=True)
+
+    def _enrol_control(self, run, text: str) -> Optional[CommandResult]:
+        """"Stop" / "ready" / "hold on" while a run is capturing.
+
+        EVERY SOURCE, not just voice, and that is the opposite of the rule
+        the briefing offer follows. That offer holds an open microphone in
+        one room; this holds an open CAMERA, and a stop typed from anywhere
+        -- the command bar, a shell turn, Discord -- must be able to shut a
+        lens. Stopping is the safe direction, so it takes the widest door.
+
+        None of these speak from here: the run is on its own thread and says
+        its own lines at the moment they become true, so a reply here would
+        arrive either twice or in the wrong order.
+        """
+        if _ENROL_STOP_RX.match(text):
+            from jarvis import enrolrun as er
+            run.abort(er.STOP_SPOKEN)
+            return CommandResult(handled=True, speak=False,
+                                 status="Enrolment stopped")
+        if _ENROL_READY_RX.match(text):
+            run.skip()
+            return CommandResult(handled=True, speak=False,
+                                 status="Enrolment: capturing")
+        if _ENROL_WAIT_RX.match(text):
+            run.pause()
+            return CommandResult(handled=True, speak=False,
+                                 status="Enrolment: holding")
+        return None
+
+    def _start_enrol(self) -> CommandResult:
+        """Build the run, park it, and start its thread.
+
+        The preflight is run AGAIN here rather than trusted from the offer.
+        Ninety seconds is long enough for the curfew to start or for him to
+        have said "offline mode" in between, and the cost of re-asking is one
+        dictionary read against opening a lens sensing has since shut.
+        """
+        from jarvis import earcons
+        from jarvis import enrolentry as ee
+        from jarvis import enrolrun as er
+        services = getattr(self, "services", None)
+        cfg = self._svc("assistant")
+        worker = getattr(services, "preview_worker", None)
+        pre = er.preflight(cfg, sensing=self._svc("sensing"), worker=worker,
+                           services=services)
+        if not pre["ok"]:
+            return CommandResult(handled=True, speak=True, reply=pre["reply"],
+                                 status="Enrolment: %s" % pre["reason"])
+        run = er.EnrolRun(
+            cfg=cfg, worker=worker, sensing=self._svc("sensing"),
+            services=services,
+            say=self._speak,
+            # DISPLAY-ONLY, which is the mechanism that keeps the card out of
+            # the plaintext journal: a JarvisReply with speak=False does not
+            # go through context.add_exchange.
+            card=lambda t: bus.publish(JarvisReply(text=t, speak=False)),
+            lease=getattr(services, "preview_lease", None),
+            # cooldown_s=0.0 on every tone: the default four-second same-tone
+            # cooldown exists to stop a false-wake tone repeating, and here it
+            # would silently swallow the second and third "kept one" ticks of
+            # a three-sample station -- the ticks he is counting.
+            earcon=lambda name: earcons.play(name, cooldown_s=0.0),
+            clipboard=ee.to_clipboard)
+        try:
+            services.enrol_run = run
+        except Exception:                # noqa: BLE001 - a slim services
+            log.debug("could not park the enrolment run", exc_info=True)
+            return CommandResult(handled=True, speak=True, reply=er.E35,
+                                 status="Enrolment: could not start")
+        if not run.start():
+            self._clear_enrol_run(run)
+            return CommandResult(handled=True, speak=True, reply=er.E35,
+                                 status="Enrolment: could not start")
+        return CommandResult(handled=True, speak=True, reply=er.E2,
+                             status="Enrolling your face")
+
+    def _clear_enrol_run(self, run) -> None:
+        try:
+            if getattr(self.services, "enrol_run", None) is run:
+                self.services.enrol_run = None
+        except Exception:                # noqa: BLE001 - a slim services
+            log.debug("could not unpark the enrolment run", exc_info=True)
 
     def _try_approval(self, text: str, source: str) -> Optional[CommandResult]:
         ap = self._svc("approvals")

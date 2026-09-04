@@ -1249,6 +1249,30 @@ class EnrolmentSession:
 
 
 # ------------------------------------------------------------- the run loop
+def _source_reason(source) -> str:
+    """What the frame source says about its own silence, or "".
+
+    Read through a try because ``source`` is duck-typed -- cv2's own
+    VideoCapture has no ``reason`` at all, and a property that raises must
+    cost the better sentence, never the run.
+    """
+    try:
+        return str(getattr(source, "reason", "") or "").strip()
+    except Exception:            # noqa: BLE001 - a duck-typed source
+        log.debug("faceenrol: the source could not say why", exc_info=True)
+        return ""
+
+
+# What ``run_enrolment`` says when the frames stop and the source itself
+# offers no better account. It is deliberately the LAST resort: it guesses at
+# two causes and on 2026-09-03 both guesses were wrong at once -- sensing said
+# camera=True and the device was present, merely HELD by the running Jarvis --
+# which sent him to check the two things that were already fine. Any source
+# that can say something true says it through ``source.reason``.
+FRAMES_STOPPED = ("the frame source stopped delivering -- sensing denied the "
+                  "camera, or the device went away")
+
+
 def run_enrolment(session: EnrolmentSession, source, *,
                   plan: Sequence[Station] = DEFAULT_PLAN,
                   say: Callable[[str], None] = print,
@@ -1257,7 +1281,10 @@ def run_enrolment(session: EnrolmentSession, source, *,
                   gap_s: float = 0.35,
                   identity_min: float = SFACE_COSINE_SAME,
                   now: Callable[[], float] = time.monotonic,
-                  sleep: Callable[[float], None] = time.sleep) -> Tuple:
+                  sleep: Callable[[float], None] = time.sleep,
+                  on_station: Optional[Callable] = None,
+                  on_sample: Optional[Callable] = None,
+                  should_stop: Optional[Callable[[], str]] = None) -> Tuple:
     """Walk the plan, and return ``(report, stations_run)``.
 
     ``source`` is cv2.VideoCapture's own ``read() -> (ok, frame)``, which is
@@ -1272,17 +1299,42 @@ def run_enrolment(session: EnrolmentSession, source, *,
     near-duplicates and a gallery that fails the ``variation`` check -- and
     a gallery that fails a check it could have avoided wastes his time
     rather than teaching him anything.
+
+    THE THREE CALLBACKS ARE THE IN-APP SEAM, and they are additive and
+    default-None so that ``scripts/face_enrol.py`` -- which passes none of
+    them -- behaves exactly as it did. They exist because the same station
+    loop has to drive two very different progress channels: a terminal he
+    reads, and a spoken cadence he HEARS with his head turned away from the
+    screen (jarvis/enrolrun.py). Routing the spoken version through ``say``
+    and matching on the strings was the alternative and it is brittle:
+    telling "[lens] Look straight..." from ``Sample.line()`` from "    only 2
+    of 3 here" by prefix would break silently the first time one of those
+    format strings was edited.
+
+    * ``on_station(station, index, total)`` replaces the three ``say`` lines
+      that announce a station. ``index`` is 0-based; ``total`` is len(plan).
+    * ``on_sample(sample, station, got, wanted)`` replaces ``say(sample.line())``.
+      ``got`` is the count BEFORE this sample is counted, so a caller that
+      wants "that is three" adds one for an accepted sample itself.
+    * ``should_stop()`` is asked once per frame, at the top of the inner
+      loop, and a non-empty return becomes the report's stop ``reason``.
+      That is how the window's "Jarvis, stop" reaches a loop that is
+      otherwise busy for a minute and a half.
     """
     stations_run = 0
     t_start = now()
     stopped = ""
-    for station in plan:
+    total = len(plan)
+    for index, station in enumerate(plan):
         if stopped:
             break
-        say("")
-        say("[%s] %s" % (station.key, station.prompt))
-        say("    hold it; %d samples wanted in this position."
-            % station.samples)
+        if on_station is None:
+            say("")
+            say("[%s] %s" % (station.key, station.prompt))
+            say("    hold it; %d samples wanted in this position."
+                % station.samples)
+        else:
+            on_station(station, index, total)
         if wait is not None:
             wait("    press Enter when you are in position: ")
         got = 0
@@ -1290,10 +1342,18 @@ def run_enrolment(session: EnrolmentSession, source, *,
         for _ in range(int(frames_per_station)):
             if got >= station.samples:
                 break
+            if should_stop is not None:
+                why = should_stop()
+                if why:
+                    stopped = str(why)
+                    break
             ok, frame = source.read()
             if not ok or frame is None:
-                stopped = ("the frame source stopped delivering -- sensing "
-                           "denied the camera, or the device went away")
+                # THE SOURCE GETS THE FIRST WORD. It is the only party that
+                # knows whether it was denied, unplugged or merely busy, and
+                # the hard-coded sentence below has already been wrong about
+                # all three at once. See camera.FeedSource.reason.
+                stopped = _source_reason(source) or FRAMES_STOPPED
                 break
             sample = session.offer(frame, station.key,
                                    note=station.note or station.key)
@@ -1309,7 +1369,10 @@ def run_enrolment(session: EnrolmentSession, source, *,
                 # a numbers-only workflow has to say.
                 say("    (yaw %+.1f is outside this station's %+.0f..%+.0f)"
                     % (sample.yaw_deg, station.yaw_lo, station.yaw_hi))
-            say(sample.line())
+            if on_sample is None:
+                say(sample.line())
+            else:
+                on_sample(sample, station, got, station.samples)
             if not sample.accepted:
                 continue
             got += 1
@@ -1332,6 +1395,95 @@ def run_enrolment(session: EnrolmentSession, source, *,
 
 
 # ------------------------------------------------------------ the disk side
+def build_models(cfg):
+    """``(detector, recogniser, reason)`` -- never raises, never falls back.
+
+    The detector is floored LOW rather than at his ``camera.min_conf``, for
+    the same reason scripts/vision_selfcheck.py does it: a face scoring 0.45
+    against a 0.6 bar must be reported WITH ITS SCORE, not vanish and read as
+    "no face seen". The bar is then applied by the quality gate, which says
+    which bar it was.
+
+    THIS LIVES HERE SO BOTH ENROLMENT PATHS LOAD THE SAME PAIR. It was
+    written out inside ``scripts/face_enrol.py``, which was fine while that
+    script was the only caller; the in-app run (jarvis/enrolrun.py) is a
+    second one, and two copies of "which models does enrolment use" is
+    exactly how a box ends up enrolling ArcFace vectors through an SFace
+    recogniser. The script delegates here and its behaviour is unchanged.
+
+    ``camera`` and ``facedetect`` are imported inside the function to keep
+    this module importable with neither of them wired.
+    """
+    from jarvis import camera as cam          # noqa: PLC0415 - lazy by design
+    from jarvis import facedetect             # noqa: PLC0415
+
+    detector, why = cam.detector_from_config(
+        cfg, score_threshold=facedetect.PROBE_THRESHOLD)
+    if detector is None:
+        return None, None, why
+    try:
+        rec = facedetect.load_recogniser(
+            min_conf=float(cfg.get("camera.min_conf", 0.6)),
+            model_dir=str(cfg.get("camera.model_dir", "") or "") or None,
+            backend=cam.face_backend_from_config(cfg),
+            input_size=(int(cfg.get("camera.detect_width", 320)),
+                        int(cfg.get("camera.detect_height", 180))))
+    except Exception as exc:  # noqa: BLE001 - absence is not a crash
+        return detector, None, str(exc)
+    return detector, rec, ""
+
+
+def save_enrolment(gallery, report, *, reason: str,
+                   allow_shrink: bool = False, force: bool = False,
+                   superseded: Sequence = ()) -> dict:
+    """Write this run's pool, but ONLY if the judge passed it. Numbers back.
+
+    THE VERDICT GUARD LIVES HERE RATHER THAN IN THE CALLER, and that is the
+    whole point of the function. It used to be a single ``if rep.ok or
+    args.force:`` inside ``scripts/face_enrol.py``, which meant the rule
+    "an unusable gallery is not saved" was a property of ONE script rather
+    than of enrolment -- and the in-app run (jarvis/enrolrun.py) would have
+    had to restate it correctly to be safe. A rule that has to be restated
+    to hold is a rule that will eventually be restated wrong.
+
+    IT IS DELIBERATELY NOT INSIDE ``FaceGallery.save()``. ``restore()`` and
+    ``purge_label()`` legitimately write pools that ``judge_gallery`` never
+    ran on, so a guard down there would refuse the two operations whose
+    entire job is to put back a pool that already exists.
+
+    ``force`` is the CLI's ``--force`` and nothing else reaches it: the
+    in-app path has no way to pass it, which is what makes "the window
+    cannot save an unusable gallery" a structural fact rather than a
+    promise.
+
+    ``superseded`` is destroyed only AFTER the new generation is safely on
+    disk -- ``--reset`` destroys nothing when the run fails a check.
+    """
+    out = {"saved_generation": 0, "gallery_total": 0, "removed": 0,
+           "refused": "", "error": ""}
+    if not (report.ok or force):
+        out["refused"] = ("the judge refused this pool" if not report.reason
+                          else report.reason)
+        return out
+    try:
+        gen = gallery.save(reason=str(reason),
+                           allow_shrink=bool(allow_shrink))
+    except ValueError as exc:
+        # A refusal from the store itself (a shrink, a bad root). The report
+        # keeps the FIRST reason it had: the judge's verdict explains more
+        # than the store's complaint about the consequence of it.
+        report.reason = report.reason or str(exc)
+        out["error"] = str(exc)
+        return out
+    report.saved_generation = int(gen)
+    report.gallery_total = int(gallery.total())
+    out["saved_generation"] = int(gen)
+    out["gallery_total"] = int(report.gallery_total)
+    if superseded:
+        out["removed"] = int(gallery.drop_generations(superseded))
+    return out
+
+
 def harden(root: Path) -> dict:
     """0700 on the directory, 0600 on every file under it.
 

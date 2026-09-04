@@ -25,6 +25,7 @@ from jarvis import campreview as cp
 from jarvis.ui import preview as pv
 from jarvis.ui import theme
 from jarvis.ui.console_mode import ACTIVE, AMBIENT, STANDBY
+from jarvis.ui import main_window as main_window_mod
 from jarvis.ui.main_window import MainWindow
 from jarvis.ui.preview import CameraPreview
 from jarvis.ui.widgets import get_scale, px, set_scale
@@ -958,16 +959,60 @@ class FakeWorker:
         self.joined.append(join)
 
 
-def window(mode=ACTIVE, enabled=True):
+def window(mode=ACTIVE, enabled=True, lease=False):
+    """A stand-in for the console, carrying exactly the state
+    ``_preview_apply`` reads.
+
+    ``lease`` is the in-app enrolment's claim on the capture (2026-09-04,
+    jarvis/enrolrun.py). It defaults to False, which is the state every test
+    below was written against, so they all still say what they always said.
+    """
     ns = SimpleNamespace(
         preview=FakePane(), preview_worker=FakeWorker(),
         modes=SimpleNamespace(mode=mode), _preview_shown=False,
+        _preview_lease=bool(lease), _preview_lease_at=0.0,
         _console_option=lambda key, default=None:
             enabled if key == cp.OPTION_ENABLED else default)
     ns._preview_enabled = lambda: MainWindow._preview_enabled(ns)
+    ns._preview_lease_live = lambda: MainWindow._preview_lease_live(ns)
     ns._preview_apply = lambda m=None, enabled=None: \
         MainWindow._preview_apply(ns, m, enabled)
     return ns
+
+
+def test_an_enrolment_lease_keeps_the_capture_through_the_ambient_edge():
+    """THE 45-SECOND EDGE. pane_visible is ACTIVE-only, so a run that took
+    ninety seconds would have the camera taken away underneath it the moment
+    the console went quiet. The lease is what stops that."""
+    ns = window(lease=True)
+    ns._preview_apply(STANDBY)
+    assert ns.preview_worker.stops == 0
+    assert ns.preview_worker.starts >= 1
+    assert ns._preview_shown is True         # and the pane is SHOWN for it
+
+
+def test_a_lease_beats_the_camera_preview_toggle_being_off():
+    """He can enrol without having the preview pane switched on -- but the
+    pane is shown while it happens, because a capture behind a hidden pane is
+    exactly what _preview_apply exists to prevent."""
+    ns = window(enabled=False, lease=True)
+    ns._preview_apply()
+    assert ns.preview_worker.stops == 0
+    assert ns.preview_worker.started_with == [True], \
+        ns.preview_worker.started_with
+    assert ns._preview_shown is True
+
+
+def test_an_expired_lease_gives_the_camera_back_even_without_the_timer():
+    """The wall-clock cap is re-checked on every apply, so a dropped Tk
+    ``after`` cannot leave the lens open for a wedged enrolment thread."""
+    import time as _time
+    ns = window(mode=STANDBY, enabled=False, lease=True)
+    ns._preview_lease_at = _time.monotonic() - (
+        main_window_mod.PREVIEW_LEASE_MAX_S + 1)
+    ns._preview_apply()
+    assert ns._preview_lease is False
+    assert ns.preview_worker.stops == 1
 
 
 def test_going_to_standby_hides_the_pane_and_stops_the_capture():

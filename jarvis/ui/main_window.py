@@ -147,6 +147,12 @@ SNOOZE_MIN = 10              # the alarm modal's SNOOZE button
 # at once instead of at the next restart. Imported by name rather than
 # spelled twice -- jarvis/campreview.py owns it.
 CAMERA_PREVIEW_OPTION = campreview.OPTION_ENABLED
+# The longest an in-app enrolment may hold the preview open, INDEPENDENT of
+# the run itself. A five-station enrolment is about ninety seconds and the
+# run releases its own lease in a finally -- this is the backstop for the
+# case that finally cannot cover, which is a wedged or crashed enrolment
+# thread. Without it, one hung run leaves the lens lit until he notices.
+PREVIEW_LEASE_MAX_S = 300.0
 SESSION_PROBE_MS = 20000     # gap between `tmux ls` probes (2 retries)
 SESSION_PROBE_RETRIES = 2
 ATTACH_POLL_MS = 5000        # `tmux list-clients` while a session exists
@@ -1477,6 +1483,11 @@ class MainWindow:
         self.preview = None
         self.preview_worker = None
         self._preview_shown = False
+        # An in-app enrolment's claim on the capture. See preview_lease: the
+        # pane is ACTIVE-only and goes AMBIENT after 45 s of quiet, which
+        # would take the camera away halfway through a run.
+        self._preview_lease = False
+        self._preview_lease_at = 0.0
         try:
             # jarvis.ui.preview is imported HERE, not at module scope: it
             # pulls PIL through jarvis.ui.widgets' font machinery and a
@@ -1500,6 +1511,16 @@ class MainWindow:
         if self.preview is None:
             self.preview_worker = None
             return
+        # PUBLISHED ON THE SERVICES NAMESPACE so that jarvis/enrolrun.py can
+        # reach the capture that already holds the camera. It is the handle
+        # and nothing more: the run never opens a device, never starts or
+        # stops this worker for its own convenience, and asks for the lens
+        # only through preview_lease below.
+        try:
+            self.services.preview_worker = self.preview_worker
+            self.services.preview_lease = self.preview_lease
+        except Exception:                     # noqa: BLE001 - a slim services
+            log.debug("preview worker could not be published", exc_info=True)
         self._preview_apply()
 
     def _hand_stage(self):
@@ -1545,6 +1566,58 @@ class MainWindow:
     def _preview_enabled(self) -> bool:
         return bool(self._console_option(CAMERA_PREVIEW_OPTION, False))
 
+    def _preview_lease_live(self) -> bool:
+        """Is an enrolment's claim on the capture still good?
+
+        The cap is re-checked HERE as well as on the timer, so an expired
+        lease cannot keep the lens open just because a Tk ``after`` was
+        dropped by a window that was busy or on its way out. Fail closed:
+        anything unreadable is no lease.
+        """
+        if not self._preview_lease:
+            return False
+        started = float(self._preview_lease_at or 0.0)
+        if started and (time.monotonic() - started) > PREVIEW_LEASE_MAX_S:
+            log.warning("preview lease expired after %.0f s; the camera is "
+                        "going back", PREVIEW_LEASE_MAX_S)
+            self._preview_lease = False
+            self._preview_lease_at = 0.0
+            return False
+        return True
+
+    def preview_lease(self, on: bool) -> None:
+        """Hold the preview's capture open for an in-app enrolment, or let go.
+
+        CALLED FROM THE ENROLMENT THREAD, which is why the work is marshalled
+        onto Tk with ``_after`` rather than done here -- ``_preview_apply``
+        packs and unpacks widgets, and Tk from a second thread is how a
+        console dies without a traceback. The FLAG is set synchronously, so
+        a ``_preview_apply`` triggered by anything else in the meantime
+        already sees the claim.
+
+        Releasing is never conditional and never deferred behind a check:
+        jarvis/enrolrun.py calls ``preview_lease(False)`` in a ``finally`` on
+        every path, including the exception path, and the wall-clock cap in
+        ``_preview_lease_live`` covers the thread that never gets there.
+        """
+        want = bool(on)
+        self._preview_lease = want
+        self._preview_lease_at = time.monotonic() if want else 0.0
+        if want:
+            self._after(0, lambda: self._preview_apply(enabled=True))
+            self._after(int(PREVIEW_LEASE_MAX_S * 1000) + 50,
+                        self._preview_lease_expire)
+        else:
+            self._after(0, self._preview_apply)
+
+    def _preview_lease_expire(self) -> None:
+        """The backstop firing. Re-applies only if the lease really is over,
+        so a SECOND enrolment started inside the window is not cut short by
+        the first one's timer."""
+        if self._preview_lease_live():
+            return
+        self._preview_apply()
+
     def _preview_apply(self, mode: Optional[str] = None,
                        enabled: Optional[bool] = None):
         """Show/hide the band and start/stop the CAPTURE, as one decision.
@@ -1563,7 +1636,18 @@ class MainWindow:
             mode = ACTIVE if modes is None else modes.mode
         if enabled is None:
             enabled = self._preview_enabled()
-        want = bool(pane_visible(mode, enabled))
+        lease = self._preview_lease_live()
+        if lease:
+            # AN ENROLMENT OVERRIDES BOTH HALVES, and it has to override
+            # both. pane_visible is ACTIVE-only, so 45 s of quiet would
+            # otherwise stop the capture mid-run; and camera.preview may be
+            # off entirely, in which case PreviewWorker.start(enabled=False)
+            # would refuse to capture behind a pane we had just packed. He
+            # asked for this; the pane is SHOWN for the duration, because a
+            # capture behind a hidden pane is the one thing this function
+            # exists to prevent.
+            enabled = True
+        want = bool(pane_visible(mode, enabled)) or lease
         worker = self.preview_worker
         # STOPPING COMES FIRST when it is going away, and it is deliberately
         # not inside the same try as the repack: the capture is the half that

@@ -1600,6 +1600,146 @@ def test_no_code_path_writes_a_frame_anywhere(name):
             "%s: %r is a way a frame could leave the process" % (name, pattern)
 
 
+# ------------------------------------------------- the enrolment tap
+# The one seam by which a full frame leaves this module, added 2026-09-04 so
+# that face enrolment can run without killing Jarvis to free /dev/video0.
+# These tests are the reason it is safe: the tap is offered only while an
+# enrolment is blocked asking for a frame, and it is DENIED at the single
+# point every camera handback converges on.
+class RecordingTap:
+    """jarvis.enroltap.FrameTap's surface, counting instead of holding."""
+
+    def __init__(self, want=True, raises=False):
+        self.want = bool(want)
+        self.raises = bool(raises)
+        self.offered = 0
+        self.denied = []
+
+    def offer(self, frame):
+        self.offered += 1
+        if self.raises:
+            raise RuntimeError("the tap is broken")
+        return self.want
+
+    def deny(self, reason):
+        self.denied.append(str(reason))
+
+
+def test_the_grab_offers_the_full_frame_to_a_tap_that_is_set():
+    """The frame the tap gets is the CAPTURE frame, not the pane's 160x90
+    thumbnail. Enrolment's quality bar wants a 112 px face, which no
+    thumbnail can carry, so an offer made after the shrink would be a
+    feature that silently never produced a usable sample."""
+    tap = RecordingTap()
+    pipe = cp.PreviewPipeline(FakeFeed(frames=[frame(640, 360)]),
+                              detector=FakeDetector(), observe=observer())
+    pipe.tap = tap
+    shot = pipe.grab((16, 9))
+    assert tap.offered == 1
+    assert shot.cap_w == 640 and shot.cap_h == 360   # it really was the big one
+
+
+def test_a_pipeline_with_no_tap_offers_nothing():
+    """The normal state, and it must cost the capture thread nothing."""
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=FakeDetector(),
+                              observe=observer())
+    assert pipe.tap is None
+    pipe.grab((16, 9))          # must not raise
+
+
+def test_a_tap_that_raises_cannot_take_the_preview_down():
+    """The pane going dark because a face was being enrolled is precisely
+    the failure this whole lane exists to avoid."""
+    tap = RecordingTap(raises=True)
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=FakeDetector(),
+                              observe=observer())
+    pipe.tap = tap
+    shot = pipe.grab((16, 9))
+    assert shot.reason == cp.REASON_LIVE
+    assert tap.offered == 1
+
+
+def test_no_frame_is_offered_when_the_feed_gave_none():
+    """A missed capture is not a frame, and must not reach the tap as one."""
+    tap = RecordingTap()
+    pipe = cp.PreviewPipeline(FakeFeed(frames=[]), detector=FakeDetector(),
+                              observe=observer())
+    pipe.tap = tap
+    pipe.grab((16, 9))
+    assert tap.offered == 0
+
+
+def test_closing_the_pipeline_denies_the_tap():
+    """THE PRIVACY EDGE. _close_pipeline is the one point the sensing deny,
+    the curfew edge, stop() and _release all converge on, so the deny is
+    written once there rather than at four call sites that could drift.
+
+    An enrolment reading through a camera that has been handed back must be
+    told, not left to time out: run_enrolment treats a False read as fatal
+    and ends the run, which is what actually shuts the lens down.
+    """
+    tap = RecordingTap()
+    worker = cp.PreviewWorker(make_pipeline=lambda: cp.PreviewPipeline(
+        FakeFeed(), detector=FakeDetector(), observe=observer()))
+    worker._pipeline = worker._make()
+    worker.set_tap(tap)
+    assert worker._pipeline.tap is tap
+    worker._close_pipeline()
+    assert len(tap.denied) == 1
+    assert tap.denied[0]                     # it says WHY, not just that
+    # ...and the worker lets go of it, so a second close does not re-deny a
+    # tap that belongs to a run which has already finished.
+    worker._close_pipeline()
+    assert len(tap.denied) == 1
+
+
+def test_a_sensing_deny_reaches_the_tap_through_the_close():
+    """The realistic path: the curfew starts halfway through an enrolment.
+    cycle() refuses before opening anything and closes the pipeline, and the
+    enrolment finds out from that."""
+    tap = RecordingTap()
+    worker = cp.PreviewWorker(
+        sensing=Policy(State(camera=False, reason="curfew")),
+        make_pipeline=lambda: cp.PreviewPipeline(
+            FakeFeed(), detector=FakeDetector(), observe=observer()))
+    worker._pipeline = worker._make()
+    worker.set_tap(tap)
+    shot = worker.cycle()
+    assert shot.reason == cp.REASON_SENSING
+    assert tap.denied, "an enrolment was left reading a camera it had lost"
+
+
+def test_a_pipeline_built_mid_run_inherits_the_tap():
+    """A capture restarted under a live enrolment must keep delivering, or
+    the run stalls against an object nothing hands frames to."""
+    tap = RecordingTap()
+    # A PERMISSIVE POLICY IS REQUIRED, and that is itself the rule holding:
+    # a worker with no sensing owner fails CLOSED, closes its pipeline and
+    # denies the tap rather than capturing for an authority it cannot reach.
+    worker = cp.PreviewWorker(
+        sensing=Policy(State()),
+        make_pipeline=lambda: cp.PreviewPipeline(
+            FakeFeed(), detector=FakeDetector(), observe=observer()))
+    worker.set_tap(tap)                  # no pipeline exists yet
+    worker.cycle()                       # ...which builds one
+    assert worker._pipeline.tap is tap
+    assert tap.offered == 1
+
+
+def test_setting_no_tap_leaves_the_preview_alone():
+    tap = RecordingTap()
+    worker = cp.PreviewWorker(
+        sensing=Policy(State()),
+        make_pipeline=lambda: cp.PreviewPipeline(
+            FakeFeed(), detector=FakeDetector(), observe=observer()))
+    worker._pipeline = worker._make()
+    worker.set_tap(tap)
+    worker.set_tap(None)
+    assert worker._pipeline.tap is None
+    worker.cycle()
+    assert tap.offered == 0
+
+
 def test_the_pipeline_keeps_no_frame_after_the_grab_returns():
     """Nothing about a frame survives on the object: not the array, not a
     crop, not an embedding. The same property visionrig.Rig holds."""
@@ -1659,9 +1799,23 @@ def test_a_recognised_face_cannot_grant_anything_because_nothing_reads_it():
     assert readers <= {"jarvis/ui/main_window.py"}, readers
     # …and the class itself hands nothing out but a shot: no callback, no
     # sink, no publish. The pane POLLS; nothing here pushes.
+    #
+    # set_tap JOINED THIS LIST ON 2026-09-04 AND IT IS INSIDE THE CONTRACT,
+    # which is worth writing down rather than merely widening the set. It is
+    # not a push: the tap is PULL-based, so the capture thread hands a frame
+    # over only while an enrolment is blocked in read() asking for one, and
+    # with no tap set it is an attribute read. It is not a leak either --
+    # jarvis/enroltap.FrameTap is a single slot cleared on take, on deny, on
+    # abort and on release, it never touches a disk, and it is denied at
+    # _close_pipeline, the one point every camera handback converges on. And
+    # crucially it does not weaken the sentence above it: the tap reads
+    # through the preview's OWN gated CameraFeed, so the curfew, offline mode
+    # and SensingPolicy still own the lens. What it exists for is the reverse
+    # of a capability grant -- it lets face ENROLMENT happen without killing
+    # Jarvis, and enrolment writes an embedding, it does not read one.
     api = {n for n in dir(cp.PreviewWorker) if not n.startswith("_")}
     assert api == {"start", "stop", "set_enabled", "latest", "status",
-                   "cycle", "fps", "running", "LOG_EVERY_S"}, api
+                   "cycle", "fps", "running", "set_tap", "LOG_EVERY_S"}, api
 
 
 def test_the_gallery_is_only_ever_read_never_written():

@@ -117,6 +117,68 @@ def device_present(device: str = "") -> bool:
     return bool(device_nodes())
 
 
+def _proc_name(pid: int) -> str:
+    """``/proc/<pid>/comm``, or "". Never raises; a name is a courtesy."""
+    try:
+        with open("/proc/%d/comm" % int(pid), encoding="utf-8",
+                  errors="replace") as fh:
+            return fh.read().strip()
+    except Exception:            # noqa: BLE001 - the process may have gone
+        return ""
+
+
+def device_holder(device: str = "") -> tuple:
+    """``(pid, name)`` of a process holding ``device`` open, else ``(0, "")``.
+
+    WHY THIS EXISTS. V4L2 capture is EXCLUSIVE: a second opener does not get
+    a queue, it gets a failure, and cv2 reports that failure the same way it
+    reports a missing camera. On 2026-09-03 that cost half an hour --
+    ``scripts/face_enrol.py`` said "sensing denied the camera, or the device
+    went away" while sensing said camera=True and the device was sitting
+    right there, held by the running Jarvis on fd 14. Both halves of the
+    sentence were false and both sent him to check something that was fine.
+
+    IT OPENS NOTHING. It reads the /proc fd symlinks, which is a directory
+    listing and a readlink -- the same information ``fuser`` prints, at no
+    risk of taking the device away from whoever legitimately has it. A
+    process this user may not read is simply skipped, so the honest failure
+    here is ``(0, "")`` -- "somebody, and I cannot say who" -- never a guess.
+    """
+    node = str(device or "")
+    if node.isdigit():
+        node = "/dev/video%d" % int(node)
+    if not node:
+        nodes = device_nodes()
+        node = nodes[0] if nodes else ""
+    if not node:
+        return 0, ""
+    me = os.getpid()
+    try:
+        entries = os.listdir("/proc")
+    except OSError:              # pragma: no cover - a broken /proc
+        return 0, ""
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == me:
+            # Our own fd is not an answer to "who has it instead of me".
+            continue
+        fd_dir = "/proc/%d/fd" % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue             # not ours to read, or already exited
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) != node:
+                    continue
+            except OSError:
+                continue
+            return pid, _proc_name(pid)
+    return 0, ""
+
+
 # ------------------------------------------------------------- the config
 def _cfg_get(cfg, key: str, default=None):
     get = getattr(cfg, "get", None)
@@ -309,9 +371,14 @@ class CameraFeed:
     def __init__(self, policy, opener: Callable[[], Any], *,
                  present: Optional[Callable[[], bool]] = None,
                  on_blind: Optional[Callable[[], None]] = None,
-                 name: str = CAMERA, lens: Optional[Lens] = None):
+                 name: str = CAMERA, lens: Optional[Lens] = None,
+                 device: str = ""):
         self.name = name
         self.lens = lens
+        # The node this feed was pointed at, kept ONLY so that a failure to
+        # open can name the process holding it (see FeedSource.reason). It is
+        # never opened from here; the opener owns that.
+        self.device = str(device or "")
         self.policy = policy
         self._opener = opener
         self._lock = threading.RLock()
@@ -425,6 +492,67 @@ class FeedSource:
 
     def release(self) -> None:
         self.feed.close()
+
+    @property
+    def reason(self) -> str:
+        """Why the last read came back empty, in ONE true sentence.
+
+        ``CameraFeed.capture`` returns None for five different reasons on
+        purpose -- a consumer that has to tell them apart will get one of
+        them wrong -- but a HUMAN being told to go and fix it needs exactly
+        that distinction, and the caller that guessed at it got both halves
+        wrong on 2026-09-03 (see ``faceenrol.FRAMES_STOPPED``). So the guess
+        is replaced by the four things this object can actually check: what
+        sensing says, whether the node exists, whether we ever got the device
+        open at all, and who has it if we did not.
+
+        Never raises and never opens anything. "" means "I have nothing
+        better than the caller's own sentence", which is an honest answer.
+        """
+        feed = self.feed
+        try:
+            st = feed.status()
+        except Exception:        # noqa: BLE001 - a duck-typed feed
+            log.debug("camera: the feed could not report status",
+                      exc_info=True)
+            return ""
+        if st.get("allowed") is not True:
+            why = ""
+            try:
+                why = str(feed.policy.status().get("reason") or "")
+            except Exception:    # noqa: BLE001 - a slim/absent policy
+                why = ""
+            return ("sensing is holding the camera shut (%s)" % why) if why \
+                else "sensing is holding the camera shut"
+        device = getattr(feed, "device", "") or ""
+        try:
+            there = device_present(device)
+        except Exception:        # noqa: BLE001
+            there = True
+        if not there:
+            return ("the camera device is not there (%s)" % device) if device \
+                else "there is no camera device"
+        if not int(st.get("opens") or 0):
+            # Sensing allows it, the node exists, and we never once got it
+            # open. On a V4L2 device that means somebody else has it.
+            pid, name = 0, ""
+            try:
+                pid, name = device_holder(device)
+            except Exception:    # noqa: BLE001 - /proc is a courtesy
+                log.debug("camera: could not look for the holder",
+                          exc_info=True)
+            node = device or "the camera"
+            if pid and name:
+                return ("%s is already open -- %s (pid %d) is holding it, "
+                        "and v4l2 only allows one" % (node, name, pid))
+            if pid:
+                return ("%s is already open -- pid %d is holding it, and "
+                        "v4l2 only allows one" % (node, pid))
+            return ("%s could not be opened; sensing allows it and the "
+                    "device is there, so another process is holding it"
+                    % node)
+        return ("the camera stopped answering after %d frame(s)"
+                % int(st.get("frames") or 0))
 
 
 def fourcc_name(value) -> str:
@@ -640,7 +768,8 @@ def build(cfg, policy, opener: Optional[Callable[[], Any]] = None,
                 return open_capture(device, lens.width_px, lens.height_px,
                                     fourcc)
         feed = CameraFeed(policy, opener, lens=lens, on_blind=on_blind,
-                          present=lambda: device_present(device))
+                          present=lambda: device_present(device),
+                          device=device)
         return feed, ""
     except Exception as exc:  # noqa: BLE001 - a camera must not end the app
         log.warning("camera: not wired (%s: %s)", type(exc).__name__, exc)

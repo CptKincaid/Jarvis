@@ -1241,6 +1241,20 @@ class JarvisApp:
             # Commander._try_briefing_offer -- declared here so the
             # namespace says the slot exists.
             briefing_offer=None,
+            # In-app face enrolment (jarvis/enrolrun.py). The OFFER is parked
+            # by Commander._h_face_enrol and answered by _try_enrol; the RUN
+            # is the live EnrolRun, which parks and unparks itself. Declared
+            # here so the namespace says both slots exist -- and so a box
+            # with no camera console still answers getattr with None rather
+            # than raising on the first "enrol my face".
+            enrol_offer=None,
+            enrol_run=None,
+            # The console's capture thread and its preview lease, published
+            # by ui.main_window once the pane is built. None on a headless
+            # box, which is what makes the in-app path refuse rather than
+            # reach for a camera nobody is holding.
+            preview_worker=None,
+            preview_lease=None,
             news_cache_path=PATHS.CACHE_DIR / "news.json",
             diagnostics=self.diagnostics_text,
             # the one self-state sheet the courtesy and the readout share

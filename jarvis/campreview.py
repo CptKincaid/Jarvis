@@ -801,6 +801,10 @@ class PreviewPipeline:
                  ident_fps: float = IDENT_FPS, hold=None, hands=None):
         self.feed = feed
         self.owned = bool(owned)
+        # The enrolment tap, or None. Set by PreviewWorker.set_tap and by
+        # nothing else; see grab(). None is the normal state and costs one
+        # attribute read per frame.
+        self.tap = None
         self.detector = detector
         self.lens = lens
         self.head = head
@@ -1134,6 +1138,29 @@ class PreviewPipeline:
         # and between detections the faces are the ones _track carries
         # forward, which is what the stage's baseline and latch read.
         hand = self._hand(frame, faces, frame_w, frame_h, seq)
+
+        # THE ENROLMENT TAP, and this is the only place it can be. Below
+        # this line the frame is shrunk to the pane's box, which is 160x90 --
+        # far under the 112 px face the enrolment quality bar demands -- so
+        # the full frame has to be offered here or not at all. Above it, the
+        # detections have not run, and the hand stage reads the same frame.
+        #
+        # ONE CONSUMER AND NO COPY. offer() hands over a REFERENCE and only
+        # when an enrolment is actually blocked waiting for one; with no tap,
+        # or with a tap nobody is reading, this is an attribute read and an
+        # Event check. The detect-and-embed work (~12 ms) happens on the
+        # ENROLMENT thread, not here -- this thread only lets go of a
+        # pointer, which is why a run does not cost the pane its frame rate.
+        tap = self.tap
+        if tap is not None:
+            try:
+                tap.offer(frame)
+            except Exception:                  # noqa: BLE001 - the tap
+                # A tap that raises costs the enrolment, never the preview.
+                # The pane going dark because a face was being enrolled is
+                # exactly the failure this whole lane exists to avoid.
+                log.debug("campreview: the enrolment tap raised",
+                          exc_info=True)
 
         # LETTERBOXED HERE, on this thread, so what crosses over is the
         # picture at exactly the size it will be drawn. Stretching a 4:3
@@ -1509,6 +1536,11 @@ class PreviewWorker:
         self._make = make_pipeline or (
             lambda: build_pipeline(services, get_option, sensing,
                                    hands=hands))
+        # The enrolment tap outlives any ONE pipeline, because a pipeline is
+        # rebuilt whenever the capture is restarted and an enrolment that
+        # survived a restart would otherwise be reading from an object
+        # nothing hands frames to any more. Same argument as self.hands.
+        self._tap = None
         self._now = now
         self._sleep = sleep
         self._lock = threading.Lock()            # guards self._shot
@@ -1524,6 +1556,26 @@ class PreviewWorker:
         self._last_at = 0.0
         self._logged = 0.0
         self.cycles = 0
+
+    # ---------------------------------------------------- the enrol tap
+    def set_tap(self, tap) -> None:
+        """Lend the running capture to an enrolment, or take it back (None).
+
+        The tap is stored on the WORKER and pushed at the live pipeline,
+        because those are two different lifetimes: the worker survives a
+        stop/start, the pipeline does not. Storing it in only one place got
+        it wrong either way -- on the pipeline alone a restart silently
+        stopped delivering, on the worker alone the running grab never saw it.
+        """
+        self._tap = tap
+        with self._pipe_lock:
+            pipe = self._pipeline
+        if pipe is not None:
+            try:
+                pipe.tap = tap
+            except Exception:                 # noqa: BLE001 - a stub pipeline
+                log.debug("campreview: the pipeline took no tap",
+                          exc_info=True)
 
     # -------------------------------------------------------- the switch
     @property
@@ -1740,6 +1792,20 @@ class PreviewWorker:
             pipe, self._pipeline = self._pipeline, None
         if pipe is not None:
             pipe.close()
+        # THE ONE PLACE AN ENROLMENT IS TOLD THE CAMERA HAS GONE. Every
+        # handback converges here -- the sensing deny in cycle(), the loop's
+        # own exit, stop() and _release -- so the deny is written once rather
+        # than at four call sites that can drift apart. deny() drops any
+        # pending frame and wakes a blocked read with (False, None), and
+        # run_enrolment treats that as fatal, so the run ENDS rather than
+        # spinning against a camera nobody holds.
+        tap, self._tap = self._tap, None
+        if tap is not None:
+            try:
+                tap.deny("the camera was handed back -- sensing said no, or "
+                         "the preview stopped")
+            except Exception:                 # noqa: BLE001 - the tap
+                log.debug("campreview: the tap refused a deny", exc_info=True)
 
     def _next_seq(self) -> int:
         self._seq += 1
@@ -1782,7 +1848,16 @@ class PreviewWorker:
         if self._pipeline is None:
             with self._pipe_lock:
                 if self._pipeline is None:
-                    self._pipeline = self._make()
+                    made = self._make()
+                    # A pipeline built mid-enrolment gets the tap too, or the
+                    # run would stall on a restart it never asked for.
+                    if made is not None and self._tap is not None:
+                        try:
+                            made.tap = self._tap
+                        except Exception:     # noqa: BLE001 - a stub
+                            log.debug("campreview: fresh pipeline took no "
+                                      "tap", exc_info=True)
+                    self._pipeline = made
         pipe = self._pipeline
         if pipe is None or getattr(pipe, "feed", None) is None:
             shot = blank(REASON_PIPELINE,
