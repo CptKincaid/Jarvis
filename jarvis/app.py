@@ -616,6 +616,20 @@ class JarvisApp:
         # joined, so the boot does not pay for it.
         self._room_gate_check = self._start_room_sensor_gate_check()
 
+        # THE OTHER HALF OF THE SAME WALK. The kitchen is the door; the
+        # office is where he lands, and it is only reachable through the
+        # kitchen. The catch-up is armed at the door and delivered here --
+        # see jarvis/arrival.DeskWatch and _settle.
+        self._desk = arrival_mod.DeskWatch(
+            room=str(self.assistant.get("presence.desk_room",
+                                        arrival_mod.DEFAULT_DESK_ROOM)
+                     if self.assistant is not None
+                     else arrival_mod.DEFAULT_DESK_ROOM),
+            zone=str(self.assistant.get("presence.desk_zone",
+                                        arrival_mod.DEFAULT_DESK_ZONE)
+                     if self.assistant is not None
+                     else arrival_mod.DEFAULT_DESK_ZONE))
+
         # The unread count runs on a worker when a mailbox is configured,
         # so the cue is not paid for on the Tk pump. Held only so a test
         # can join it (see _arrival_actions.catch_up).
@@ -1680,9 +1694,19 @@ class JarvisApp:
             log.info("presence: %s return within the damper; not greeting again",
                      source)
             return
+        # GREET AT THE DOOR, ASK AT THE DESK. The catch-up is dropped from
+        # the door plan and owed to his desk -- but ONLY if some leg can
+        # actually deliver it there (_settle_legs). A deferral nothing can
+        # fire is the catch-up silently never happening, which is worse
+        # than asking him in the hallway.
+        legs = self._settle_legs()
+        defer = arrival_mod.defer_catch_up(
+            legs=legs,
+            enabled=bool(self.assistant.get("presence.settle_at_desk", True)))
         steps = arrival_mod.arrival_plan(
             returned=True, home=True, quiet_reason=self._quiet_reason(),
-            cue=bool(self.assistant.get("presence.arrival_cue", True)))
+            cue=bool(self.assistant.get("presence.arrival_cue", True)),
+            defer_catch_up=defer)
         if not steps:
             bus.publish(Status(text="Home", kind="info"))
             return
@@ -1702,6 +1726,15 @@ class JarvisApp:
         done = arrival_mod.run(steps, self._arrival_actions())
         log.info("arrival (%s): %s", source, self._arrival_ledger(done)
                  or "(nothing)")
+        # ARMED ONLY BEHIND A GREETING THAT ACTUALLY HAPPENED. A deferred
+        # catch-up is the second half of a welcome; with no welcome (the
+        # panel-only quiet plan) there is no homecoming to catch up on and
+        # the quiet policy already owns the backlog.
+        watch = getattr(self, "_desk", None)
+        if defer and watch is not None and "greeting" in done:
+            watch.arm()
+            log.info("arrival (%s): the catch-up is owed at his desk (%s)",
+                     source, " and ".join(legs))
 
     def _arrival_ledger(self, done) -> str:
         """The cue's one log line, and it must not overstate the last step.
@@ -1716,6 +1749,137 @@ class JarvisApp:
             done = ["catch-up (started)" if step == "catch-up" else step
                     for step in done]
         return " -> ".join(done)
+
+    # --------------------------------------- ASK AT THE DESK
+    def _settle_legs(self) -> tuple:
+        """Which settle legs could actually deliver a deferred catch-up.
+
+        Read at the door, and it decides whether the catch-up is deferred
+        at all. IT MAY NOT OVERSTATE: a leg counted here that cannot fire
+        is his mail question silently never being asked, so each one is
+        gated on the thing that would have to publish it and not on the
+        feature being switched on.
+
+        * ``radar``  -- something is feeding zone verdicts
+          (``services.zone_source``, whose one job is to call
+          ``note_zone_verdict``) AND his desk room's zone map actually
+          names the desk band. A verdict lane pointed at a room with no
+          map, or a map with no such band, never reaches the desk zone.
+        * ``camera`` -- a camera feed is attached
+          (``services.camera_feed``, which ``_eye_identity`` reads). It
+          answers with a NAME or "", so the curfew and offline mode close
+          it by answering "" rather than by being asked about here.
+
+        Nothing attaches either on this tree today, so this is ``()`` on
+        the live box and the arrival cue is byte for byte the one that
+        shipped. Never raises: a config that cannot be read is no leg.
+        """
+        watch = getattr(self, "_desk", None)
+        if watch is None:
+            return ()
+        services = getattr(self, "services", None)
+        legs = []
+        if getattr(services, "zone_source", None) is not None and \
+                self._desk_band_configured(watch):
+            legs.append(arrival_mod.LEG_RADAR)
+        if getattr(services, "camera_feed", None) is not None:
+            legs.append(arrival_mod.LEG_CAMERA)
+        return tuple(legs)
+
+    def _desk_band_configured(self, watch) -> bool:
+        """Does his desk room's zone map name the band he sits in?
+
+        ``zones.zone_map_for`` is the only door to that config and it
+        answers None for every way the section can be wrong or switched
+        off, which is exactly the answer this wants.
+        """
+        try:
+            from jarvis import zones as zones_mod
+            zmap = zones_mod.zone_map_for(self.assistant, watch.room)
+            if zmap is None:
+                return False
+            want = arrival_mod._room_key(watch.zone)
+            return any(arrival_mod._room_key(band.name) == want
+                       for band in zmap.bands)
+        except Exception:  # noqa: BLE001 - an unreadable config is no leg
+            log.debug("arrival: could not read the desk zone map", exc_info=True)
+            return False
+
+    def _settle(self, *, room="", verdict=None, camera=None) -> str:
+        """He has settled at his desk: deliver the catch-up he is owed.
+
+        The one door both legs come through, so "one delivery, never two"
+        is enforced in one place (``DeskWatch``) rather than negotiated
+        between two lanes. Returns the leg that delivered it, or "".
+
+        THE ORDER HERE IS THE FEATURE. The quiet policy is asked BEFORE
+        the latch is spent, because a held catch-up must stay OWED --
+        ``_say`` takes the digest with ``proactive=False`` and would
+        otherwise pierce a quiet hour that the door plan had respected an
+        hour earlier. Then the latch, then the step; nothing between the
+        latch and the step can decide not to speak except the step itself,
+        which puts the backlog back when it does.
+
+        ``camera`` is an identity label or a ``zones.CameraOpinion``.
+        There is no argument here a frame could travel through.
+        """
+        watch = getattr(self, "_desk", None)
+        if watch is None or not watch.armed:
+            return ""
+        reason = self._quiet_reason()
+        steps = arrival_mod.settle_plan(quiet_reason=reason)
+        if not steps:
+            # Asked only once he has ACTUALLY settled, or every passing
+            # kitchen reading would log a hold that never applied to it.
+            leg = arrival_mod.settle(room=room, verdict=verdict, camera=camera,
+                                     desk_room=watch.room, desk_zone=watch.zone)
+            if leg:
+                log.info("arrival: he has settled at his desk (by the %s) but "
+                         "%s; the catch-up stays owed", leg,
+                         reason or "the policy is holding")
+            return ""
+        leg = watch.observe(room=room, verdict=verdict, camera=camera)
+        if not leg:
+            return ""
+        # RE-ARMED IF THE WORKER DROPS IT. A remote mailbox finishes this
+        # step on a thread, and _arrival_catch_up_stale can decide by then
+        # that a turn owns the floor. At the door that drop cost nothing
+        # (the offer was the last word of a cue that had already spoken);
+        # here it would be the whole delivery, so the watch takes the arm
+        # back and the next reading at his desk asks again.
+        done = arrival_mod.run(steps, self._arrival_actions(missed=watch.arm))
+        log.info("arrival: he has settled at his desk, by the %s: %s", leg,
+                 self._arrival_ledger(done) or "(nothing)")
+        return leg
+
+    def note_zone_verdict(self, verdict, room: str = "") -> str:
+        """A ``zones.Verdict`` from whatever drives jarvis/zones.py.
+
+        The radar leg's entry point, and the whole of it. Nothing in this
+        tree calls it yet -- zones.py is driven by scripts/zone_log.py --
+        so the leg is dark until a verdict lane is attached as
+        ``services.zone_source``.
+        """
+        return self._settle(room=room or str(getattr(verdict, "room", "") or ""),
+                            verdict=verdict)
+
+    def note_camera_identity(self, label: str, score: float = 0.0,
+                             room: str = "") -> str:
+        """The eye recognised somebody in the office: a NAME and a SCORE.
+
+        The camera leg's entry point. It takes what ``eye.identify()``
+        returns and it will never take anything else: no frame, no crop,
+        no embedding. The score is carried so a caller need not decide
+        alone what counts -- ``eye.identify`` already returns ``("", 0.0)``
+        for every way it declines, so an empty label is the only refusal
+        this has to honour.
+        """
+        watch = getattr(self, "_desk", None)
+        where = room or (watch.room if watch is not None
+                         else arrival_mod.DEFAULT_DESK_ROOM)
+        if score < 0:
+            return ""
+        return self._settle(room=where, camera=label)
 
     def _arrival_catch_up_stale(self, gen: int, turn: int,
                                 started: float) -> str:
@@ -1814,13 +1978,21 @@ class JarvisApp:
                         type(quiet).__name__)
         return list(quiet.release_fragments()), lambda: 0
 
-    def _arrival_actions(self) -> dict:
+    def _arrival_actions(self, missed=None) -> dict:
         """The callables behind jarvis/arrival.ARRIVAL_STEPS.
 
         A step returning False did nothing (there was no backlog), and
         arrival.run() records only what actually happened -- which is what
         the tests assert on. The one step that can outlive the call is the
         catch-up: see _arrival_ledger for what "happened" means there.
+
+        ``missed`` is called when the catch-up went to a worker and the
+        worker then DROPPED it (a turn took the floor, it ran late, a
+        newer arrival superseded it) -- never when it spoke and never when
+        it had nothing to say. Only the deferred delivery passes one: at
+        the door a drop costs the last word of a cue that has already
+        spoken, but at his desk it is the whole delivery, so the watch
+        takes its arm back and asks again on his next reading.
         """
         # This cue's own mark, cleared at the top so a previous cue's
         # worker cannot label this one's inline step.
@@ -1970,10 +2142,24 @@ class JarvisApp:
                     # the held backlog was never taken.
                     log.info("arrival: the catch-up landed too late (%s); "
                              "dropped", outcome)
+                    _missed()
                 else:
                     log.info("arrival: the catch-up had nothing to say")
             except Exception:  # noqa: BLE001
                 log.exception("arrival: the catch-up failed off-thread")
+                _missed()
+
+        def _missed():
+            # A dropped delivery is still OWED. Guarded because it runs on
+            # the worker's own last line: a re-arm that raises must not
+            # turn a dropped catch-up into a logged crash.
+            if not callable(missed):
+                return
+            try:
+                missed()
+            except Exception:  # noqa: BLE001
+                log.debug("arrival: could not re-arm the desk watch",
+                          exc_info=True)
 
         def catch_up():
             # NOTHING IS DRAINED ON THIS THREAD. The held lines used to be
@@ -2317,7 +2503,28 @@ class JarvisApp:
         The away gate is the presence sentinel's own verdict and is read
         as strictly "away": at boot it is "unknown", and a fresh start
         while he is sitting in the office must not welcome him home.
+
+        AND IT IS THE CAMERA LEG'S ONE LIVE TRIGGER. His flat is a
+        corridor -- front door, kitchen, office -- so the fabric naming
+        the office is the moment to ask the eye whether it can see him
+        there, and a deferred catch-up is delivered off that answer. The
+        door half runs FIRST: on a box where the door room and the desk
+        room are the same, the arm has to exist before the settle can
+        spend it.
         """
+        self._door_from_room(ev)
+        # A NAME, never a frame. _eye_identity answers "" for a camera
+        # that is off, blind, or inside its 21:00-07:00 curfew, and "" is
+        # no opinion rather than an absence.
+        try:
+            seen = self._eye_identity()
+        except Exception:  # noqa: BLE001 - a broken eye is not a verdict
+            log.debug("arrival: the eye could not be asked", exc_info=True)
+            return
+        self._settle(room=getattr(ev, "room", "") or "", camera=seen)
+
+    def _door_from_room(self, ev) -> None:
+        """The door half of _on_room_changed. See its docstring."""
         door = getattr(self, "_door", None)
         if door is None:
             return
