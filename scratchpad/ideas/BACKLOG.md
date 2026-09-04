@@ -244,9 +244,10 @@ check with a clear error.
   * **HPCOMPUTER SCREEN control** — deliberately split from files/shell, which
     are cheap. Note when it comes up: CASTING to that screen is far cheaper than
     CONTROLLING it, and is probably what he wants more often.
-  * **Google Drive (idea 1)** — unresolved. He wants read + download + send-on,
-    so READ-ONLY scope suffices, but it is still the first standing cloud token
-    on the box that runs agent code. His call, not made yet.
+  * ~~**Google Drive (idea 1)**~~ — **DROPPED 2026-09-03. His answer: "no to
+    google drive."** It was the only backlog item that would have put a standing
+    cloud token on the box that runs agent code, and it stayed open from 09-02
+    to 09-03 for exactly that reason. Do not raise it again unless he does.
 
 ### Spark screen control — what already exists, measured 2026-09-02
 Do not start from scratch. `jarvis/desktop.py` already has `DesktopControl`,
@@ -277,3 +278,28 @@ When it is picked up: the earlier aec-prep lane found a live blocker worth
 knowing — the mixer ducks by PID, so an AEC playback stream must be exempted
 (sink-input `jarvis_aec_playback`) or it will duck the very audio it is trying
 to cancel.
+
+
+## 2026-09-03 — travel time, APPROVED (local only)
+
+His words: *"can we also do GPS for me asking how jarvis how long it would take
+to go somewhere?"* and, given the choice, *"local router"*.
+
+**Approved shape, and it is deliberately offline:**
+* POSITION comes from the phone client, which is already a browser page and
+  already uses `navigator.*` (audioSession, mediaDevices). `navigator.geolocation`
+  gives real GPS and it reaches only the Spark -- no cloud, no account, no key.
+* ROUTING is a LOCAL engine (OSRM or Valhalla) over an OpenStreetMap extract.
+  MEASURED 2026-09-03: /home has 3.0 TB free of 3.7 TB; a Texas extract is a
+  couple of GB and the prepared graph a few more.
+
+**The limitation, stated up front because it will otherwise be discovered as a
+bug:** a local router returns FREE-FLOW times. It does not know about traffic.
+"22 minutes" means 22 minutes on empty roads, which is optimistic at 08:00.
+Live traffic needs a hosted service, which he has consistently declined.
+
+**Bonus, and it is the reason to prefer this over a maps API even ignoring the
+privacy rule:** `jarvis/leavetime.py` currently refuses to guess a walk and asks
+him once per building ("How long do you need to get to Wisenbaker, sir?"). A
+local router retires that asking without breaking its rule that nothing is
+guessed -- a measured route is not a guess.

@@ -8,6 +8,9 @@ from jarvis import brain
     "I will send that along now.",
     "I'll add milk to the list.",
     "I shall set a timer for ten minutes.",
+    "I have noted that, sir; December 10th for your electrical engineering graduation.",
+    "I'll remember that, sir.",
+    "I've saved that to memory.",
 ])
 def test_a_promise_to_act_is_an_unbacked_claim(line):
     """2026-09-04 15:06:29: a promise no tool could keep, naming two real people,
