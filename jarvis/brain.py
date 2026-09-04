@@ -53,6 +53,7 @@ from jarvis.config import MACHINE
 from jarvis.events import BrainState, Status, bus
 from jarvis.logs import get_logger
 from jarvis.router import is_question
+from jarvis.tools.registry import ToolResult
 from jarvis.tts import TTS as _TTS
 
 log = get_logger("brain")
@@ -743,6 +744,17 @@ def set_addressee(name: str = "", honorific: str = "sir") -> None:
     attributed the turn to. Module state, exactly like ``set_register``,
     because the prompt builders are module functions with no config of
     their own.
+
+    THIS DOES NOT, AND MUST NOT, RESET THE STATIC PROMPT. The review of
+    09-04 found the honorific leaking across turns: this wrote the state
+    and ``static_system()`` went on handing every live caller the ONE
+    cached render, so Mara's "ma'am" clause reached Hunter's next turn
+    and his "sir" reached hers. Clearing the cache here would have fixed
+    the leak and broken two promises instead -- the few-shots are sampled
+    once per process, and his prefix must stay warm in Ollama while a
+    guest is answered. So the cache is KEYED on the addressee
+    (``static_system``): his render is built once and handed back byte
+    for byte the moment the room is his again.
     """
     _ADDRESSEE["name"] = str(name or "")
     _ADDRESSEE["honorific"] = str(honorific if honorific is not None else "sir")
@@ -926,7 +938,7 @@ If something fails, use [SPEAK] to explain and suggest alternatives.
 
 
 def build_ollama_system(context_text="", memory_text="", shots=None,
-                        register=None):
+                        register=None, addressee_to=None):
     """Render the Tier 2 STATIC system prompt.
 
     context_text / memory_text are accepted for the older call shape and
@@ -935,11 +947,14 @@ def build_ollama_system(context_text="", memory_text="", shots=None,
     explicit list for a fixed prompt. ``register`` defaults to the one in
     force and renders as nothing at all when it is "normal", so a normal
     prompt is byte-identical to the one before registers existed.
+    ``addressee_to`` is the ``(name, honorific)`` pair to write for;
+    it defaults to ``addressee()`` and is passed explicitly by
+    ``static_system`` so the render and its cache key cannot disagree.
     """
     name = register if register in REGISTERS else _REGISTER["name"]
     if shots is None:
         shots = select_few_shots(register=name)
-    who, hon = addressee()
+    who, hon = addressee_to if addressee_to is not None else addressee()
     # THE OWNER PATH IS THE UNTOUCHED ONE: addressee_clause returns "" and
     # the render is character for character the one that shipped.
     return JARVIS_SYSTEM.format(
@@ -965,28 +980,51 @@ def build_user_turn(context_text="", memory_text="", text=""):
 # the streaming path and the tool loop at once, and two threads racing to
 # rebuild it would draw two DIFFERENT few-shot samples — one turn would ship
 # a prefix nothing had cached.
-_STATIC = {}
+#
+# ONE RENDER PER ADDRESSEE. "system" is keyed on (register, addressee name,
+# honorific) and "shots" on the register alone, so a guest's prompt is
+# built from the SAME few-shot sample as Hunter's and his render is never
+# rebuilt behind her: the owner key hands back the identical object, and
+# Ollama still holds its prefix. A single cached string was the 09-04
+# leak -- set_addressee wrote the state, every live caller read the stale
+# render, and the previous person's honorific survived into the next turn.
+_STATIC = {"shots": {}, "system": {}}
 _STATIC_LOCK = threading.Lock()
 
 
+def _static_key():
+    who, hon = addressee()
+    return (_REGISTER["name"], who, hon)
+
+
 def static_system():
-    """The system prompt every Tier 2 request sends; byte-identical for the
-    life of the process (few-shots sampled once) until set_register()."""
-    system = _STATIC.get("system")
+    """The system prompt every Tier 2 request sends. Byte-identical for
+    the life of the process per addressee (few-shots sampled once) until
+    set_register(); the render follows ``addressee()`` on every call, so
+    the person the gate named is the person the prompt is written for."""
+    key = _static_key()
+    system = _STATIC["system"].get(key)
     if system is not None:
         return system
     with _STATIC_LOCK:
-        system = _STATIC.get("system")
+        system = _STATIC["system"].get(key)
         if system is None:
-            system = build_ollama_system()
-            _STATIC["system"] = system
+            register_name = key[0]
+            shots = _STATIC["shots"].get(register_name)
+            if shots is None:
+                shots = select_few_shots(register=register_name)
+                _STATIC["shots"][register_name] = shots
+            system = build_ollama_system(shots=shots, register=register_name,
+                                         addressee_to=key[1:])
+            _STATIC["system"][key] = system
         return system
 
 
 def reset_static_prompt():
     """Forget the sampled prompt (set_register, tests, the eval harness)."""
     with _STATIC_LOCK:
-        _STATIC.clear()
+        _STATIC["shots"].clear()
+        _STATIC["system"].clear()
 
 
 def set_register(name):
@@ -1219,20 +1257,85 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
     return payload
 
 
-def _registry_schemas(registry, text=None):
-    """Every registered tool, every turn. A per-turn subset chosen from
-    the text was tried (2026-08-30) and dropped: the chat template renders
-    the tools into the prefix, so a subset that changes between turns
-    evicts Ollama's prefix cache (module doc, "static-prefix rule") and
-    costs more prefill than the schemas it saves. ``text`` is accepted for
-    the older call shape and ignored."""
+# What a KNOWN person's turn may reach through the tool loop. DEFAULT-DENY,
+# the same reading gate.allowed_for takes of his "the time, the weather,
+# music": an allow-list, and everything else is his. The gate's regexes
+# refuse the turns that NAME his things; this is the belt for the ones
+# that do not -- "anything on today?", "what did I write down?" -- which
+# pass the gate as plain questions and used to arrive at gemma4 with
+# get_calendar, notes, get_mail and the rest offered on the turn. The
+# gate's own comment promised "answered as ordinary chat, with no tools
+# behind it"; this is that promise, in code (review finding 2, 09-04).
+KNOWN_TOOLS = frozenset({"get_time", "get_weather"})
+# Spoken when a guest's turn asks for one of his tools anyway -- the model
+# hallucinating a name it was not offered, or a commander short-cut that
+# forces one. Authored, so it ends the turn; no result of his is rendered.
+KNOWN_TOOL_LINE = ("That one's Hunter's, {name}. I can give you the time "
+                   "and the weather.")
+
+
+def tool_in_scope(name, owner=None) -> bool:
+    """May THIS turn run ``name``? True for the owner, always; a known
+    person gets KNOWN_TOOLS and nothing else. ``owner`` is the turn's own
+    reading of ``is_owner_addressee()`` when the caller took one."""
+    if owner is None:
+        owner = is_owner_addressee()
+    return bool(owner) or name in KNOWN_TOOLS
+
+
+def _scope_refusal(name, who=None):
+    """The ok=False result a refused tool call hands the loop. ``who`` is
+    the name the turn was opened for; the loop passes its own reading so
+    a guest whose turn is still running is addressed as herself even if
+    the gate has since named the next person."""
+    if who is None:
+        who, _hon = addressee()
+    line = KNOWN_TOOL_LINE.format(name=who or "there")
+    log.info("chat: %s is not offered to %s; refused", name, who or "?")
+    return ToolResult(text="not available to this person", ok=False,
+                      speak=line, max_sentences=2)
+
+
+def _scoped_call(registry, name, args, owner=None, who=None, **kw):
+    """``registry.call`` behind the scope: the ONE door every tool call in
+    the loop goes through, forced or model-chosen."""
+    if not tool_in_scope(name, owner):
+        return _scope_refusal(name, who)
+    return registry.call(name, args, **kw)
+
+
+def _registry_schemas(registry, text=None, owner=None):
+    """Every registered tool, every turn -- for HIM. A per-turn subset
+    chosen from the text was tried (2026-08-30) and dropped: the chat
+    template renders the tools into the prefix, so a subset that changes
+    between turns evicts Ollama's prefix cache (module doc, "static-prefix
+    rule") and costs more prefill than the schemas it saves. ``text`` is
+    accepted for the older call shape and ignored.
+
+    A KNOWN person's turn is offered KNOWN_TOOLS only. That costs no
+    cache: her turn already carries a different system prompt (the
+    addressee clause), so its prefix is cold whatever the tool block says,
+    and his stays exactly the bytes it was."""
     if registry is None:
         return []
     try:
-        return registry.schemas()
+        schemas = registry.schemas()
     except Exception:
         log.exception("tool registry schemas failed")
         return []
+    if owner is None:
+        owner = is_owner_addressee()
+    if owner:
+        return schemas
+    return [sc for sc in schemas
+            if tool_in_scope(_schema_name(sc), owner=False)]
+
+
+def _schema_name(schema):
+    try:
+        return str(schema["function"]["name"])
+    except Exception:                                  # noqa: BLE001
+        return ""
 
 
 def _same_model(a, b):
@@ -2765,11 +2868,17 @@ class JarvisBrain:
                                kind="info"))
             return [("SPEAK", MODEL_LENT_LINE)]
         registry = self.registry
+        # ONE reading of who the turn is for, taken beside the prompt: the
+        # schemas offered and every call refused below agree with the
+        # system prompt built here, even if the gate names the next person
+        # while this turn is still on the worker.
+        owner_turn = is_owner_addressee()
+        turn_who, _turn_hon = addressee()
         ctx_text, mem_text = self._dynamic_context(text)
         messages = [{"role": "system", "content": static_system()},
                     {"role": "user",
                      "content": build_user_turn(ctx_text, mem_text, text)}]
-        tools = _registry_schemas(registry, text)
+        tools = _registry_schemas(registry, text, owner=owner_turn)
         started = time.monotonic()
         cap = MAX_SPOKEN_SENTENCES
         card = None
@@ -2931,7 +3040,8 @@ class JarvisBrain:
             # exactly that question, so the read mail newer than the answer
             # it gave was never searched.
             args = dict(force_args or {})
-            result = registry.call(force_tool, args)
+            result = _scoped_call(registry, force_tool, args,
+                                  owner=owner_turn, who=turn_who)
             note(result, force_tool, args)
             if result.speak:
                 speak = authored_line(result) or result.speak
@@ -3155,8 +3265,9 @@ class JarvisBrain:
                     # key can still read it off HIS words (ToolSpec.derive):
                     # taking a knob away from the model must not mean the
                     # words lose it too.
-                    result = registry.call(name, args, from_model=True,
-                                           utterance=text)
+                    result = _scoped_call(registry, name, args,
+                                          owner=owner_turn, who=turn_who,
+                                          from_model=True, utterance=text)
                     note(result, name, args)
                     messages.append(tool_message(result, name))
                     ran += 1

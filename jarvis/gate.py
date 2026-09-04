@@ -472,7 +472,9 @@ class OwnerGate:
             # the scope line, which names what a known person MAY have.
             return False, KNOWN_SCOPE_LINE
         # Neither his, nor an open intent, nor an imperative: a question.
-        # Answered as ordinary chat, with no tools behind it.
+        # Answered as ordinary chat. "No tools behind it" is enforced in
+        # the loop, not here: brain.KNOWN_TOOLS is what her turn is
+        # offered, and brain._scoped_call refuses the rest by name.
         return True, ""
 
     # ----------------------------------------------------------- the legs
