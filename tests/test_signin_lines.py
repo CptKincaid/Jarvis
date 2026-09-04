@@ -7,6 +7,10 @@ curfew, an abstention, two legs naming different people, a leg that was never
 switched on. A sentence that claims something that did not happen is the kind
 of small lie that makes a whole feature untrustworthy.
 
+AND IT IS THE LINE FOR ANYBODY RECOGNISED, not the owner alone: his words,
+with the recognised person's first name in them. The first version greeted a
+guest with "Hello Mara, I recognize you."; he asked for his sentence.
+
 Pure functions over dataclasses. No microphone, no camera, no model.
 """
 from __future__ import annotations
@@ -94,24 +98,40 @@ def test_seen_but_not_yet_heard():
         "welcome back.")
 
 
-def test_a_known_person_gets_a_different_sentence():
-    """No "welcome back" -- that is his phrase -- and no offer of assistance."""
-    legs = Legs(voice_says="mara", voice_running=True)
-    line = sl.line_for(legs, MARA)
-    assert line == "Hello Mara, I recognize you."
-    assert "welcome back" not in line.lower()
-    assert "assistance" not in line.lower()
-
-
-def test_a_known_person_seen_on_both_legs_still_gets_the_known_sentence():
-    """THE FIFTH PRECONDITION, and a test found it rather than the brief.
-    "Welcome back" and "How may I be of assistance" are HIS greeting; said to
-    a guest they misdescribe whose house this is and offer a scope
-    gate.allowed_for would refuse a second later."""
+def test_a_recognised_guest_gets_his_exact_words_with_her_name():
+    """HIS RULING: the sentence is the sign-in line for a recognised person,
+    not "Hello Mara, I recognize you." Scope is the gate's business."""
     legs = Legs(voice_says="mara", voice_running=True,
                 face_says="mara", face_running=True)
-    assert sl.both_legs_line(legs, MARA) == ""
-    assert sl.line_for(legs, MARA) == "Hello Mara, I recognize you."
+    assert sl.line_for(legs, MARA) == (
+        "Voice and identity recognized, welcome back Mara. "
+        "How may I be of assistance today?")
+    assert "Hello Mara" not in sl.line_for(legs, MARA)
+    assert not hasattr(sl, "KNOWN_LINE")
+
+
+def test_a_guest_on_one_leg_is_told_which_leg_saw_her():
+    """The same honesty he gets: the both-legs sentence is not said when
+    only one instrument ran."""
+    legs = Legs(voice_says="mara", voice_running=True,
+                face_says="", face_running=False)
+    line = sl.line_for(legs, MARA)
+    assert line == ("I recognize your voice, Mara. The camera isn't "
+                    "confirming right now — welcome back anyway.")
+    seen = Legs(voice_says="", voice_running=False,
+                face_says="mara", face_running=True)
+    assert sl.line_for(seen, MARA) == (
+        "I recognize your face, Mara. I haven't heard you yet — welcome back.")
+
+
+def test_the_guest_line_needs_the_same_four_preconditions():
+    said = []
+    for v, vr, f, fr in itertools.product(["", "hunter", "mara"], [True, False],
+                                          ["", "hunter", "mara"], [True, False]):
+        legs = Legs(voice_says=v, voice_running=vr, face_says=f, face_running=fr)
+        if sl.both_legs_line(legs, MARA):
+            said.append((v, vr, f, fr))
+    assert said == [("mara", True, "mara", True)]
 
 
 # ------------------------------------------------------------- near miss
@@ -162,7 +182,7 @@ def test_a_leg_that_named_somebody_who_is_not_the_row_says_nothing():
 
 # ------------------------------------------------- and never as security
 @pytest.mark.parametrize("line", [sl.BOTH_LEGS_LINE, sl.VOICE_ONLY_LINE,
-                                  sl.FACE_ONLY_LINE, sl.KNOWN_LINE,
+                                  sl.FACE_ONLY_LINE,
                                   sl.NEAR_MISS_LINE, sl.PROVISIONAL_LINE])
 def test_no_sentence_is_worded_as_security(line):
     """identity.py's opening paragraph: a recording defeats the voice check

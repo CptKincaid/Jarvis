@@ -355,6 +355,6 @@ def test_a_broken_gallery_does_not_cost_him_the_voiceprint(rig, tmp_path):
     v.gallery = Broken()
     assert v.is_enrolled is True          # the voiceprint alone still counts
     assert v._all_centroids() != {}
-    who, scores, fault = v._who(world.take("hunter"), 3.0)
-    assert (who, scores) == ("", {})
+    verdict, fault = v._who(world.take("hunter"), 3.0)
+    assert verdict is None
     assert fault, "a raising gallery must say so, not look like a non-match"

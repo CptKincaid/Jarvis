@@ -102,6 +102,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from jarvis import passphrase as pp
+from jarvis import signinlines
 from jarvis.identity import (ROLE_KNOWN, ROLE_OWNER, ROLE_UNKNOWN, Registry,
                              startup_line)
 from jarvis.logs import get_logger
@@ -170,8 +171,11 @@ KNOWN_SCOPE_LINE = ("That one's the owner's, {name}. I can give you the time, "
 # the phrase, how close it was, or how long the floor stays open: it is
 # spoken out loud in a room that may hold whoever the gate just refused.
 PHRASE_OK_LINE = "Thank you, sir. I'm listening."
+# The refusal for a voice the gallery could not tell from another enrolled
+# one. Imported so there is one wording, in jarvis/signinlines.py.
+NEAR_MISS_LINE = signinlines.NEAR_MISS_LINE
 PREWARM_LINES = (UNKNOWN_LINE, UNKNOWN_PHRASE_LINE, STANDDOWN_LINE,
-                 PHRASE_OK_LINE)
+                 PHRASE_OK_LINE, NEAR_MISS_LINE)
 
 # ------------------------------------------------------------- the scope
 # What a KNOWN person may do. DEFAULT-DENY: an explicit allow-list, and
@@ -359,41 +363,94 @@ class OwnerGate:
             # is applied here and none ever may be. Both bars live in
             # jarvis/voicegallery.py, which is where the numbers were measured.
             return who, True
+        owner = self._owner_label()
+        # A NAMELESS MATCH IS THE OWNER ONLY WHEN IT WAS MEASURED ON HIS POOL
+        # AND THE GALLERY'S BEST GUESS IS NOT SOMEBODY ELSE. Two facts, both
+        # from speaker.filter_segments, and neither is a count of labels:
+        #
+        #   matched_label  whose centroid the kept windows cleared the bar on.
+        #                  "" is the voiceprint -- his -- and it is also what
+        #                  an abstention carries, since nothing was scored.
+        #   top            the label identify() ranked first above the bar,
+        #                  named or not: a provisional label ("probably
+        #                  mara"), or the winner of a margin that failed.
+        #
+        # The rule this replaces counted labels: at most one label meant "the
+        # only nameless pool is his", two meant "nobody". Measured 2026-09-04
+        # it was wrong both ways. A guest's 1.2 s command inside a 4 s clip
+        # cleared the bar on HER centroid, identify() abstained, the flag was
+        # lost, one label -> the owner, 50 of 50 with owner scope. The same
+        # path with him migrated -> two labels -> HIS short commands refused
+        # 50 of 50; two guests enrolled without --migrate -> every turn of
+        # his refused 50 of 50, provisional labels counting though they can
+        # match nobody. And a 6-take "probably mara" was minted as him
+        # 150 of 150 at a separation where her voice clears his bar.
+        top = str(stats.get("top") or "")
+        pool = str(stats.get("matched_label") or "")
+        if stats.get("near_miss"):
+            # THE MARGIN FAILED: the gallery could not tell two enrolled
+            # people apart on this voice, and that is nobody WHICHEVER of
+            # them was on top. The first draft of this rule admitted a near
+            # miss as the owner when he was on top and the bar had been
+            # cleared on his pool ("nothing says it is anybody else"), and
+            # measured 2026-09-04 that minted a confusable guest as him 5 of
+            # 150 (10 takes) and 22 of 150 (6 takes) at the widest synthetic
+            # overlap with him migrated, where the count rule it replaced
+            # had minted 0. A refusal that says "say a little more" is the
+            # documented answer to a coin flip. It costs him at separations
+            # scripts/voice_enrol.py refuses to enrol; at the ones it admits
+            # the measured cost is 1 of 150 of his turns, the same margin
+            # failure as before this branch.
+            log.info("gate: the voice matched with no name and the gallery's "
+                     "margin failed (%s on top); that is nobody, not the "
+                     "owner", top or "?")
+            return "", True
+        if top and top != owner:
+            # The gallery's best guess above the bar is somebody else --
+            # withheld only for takes or for a margin. A recognition that
+            # says "probably her" may not become "him".
+            log.info("gate: the voice matched with no name and the gallery's "
+                     "best guess is %s%s; that is nobody, not the owner", top,
+                     " (provisional)" if stats.get("provisional") else
+                     " (margin failed)" if stats.get("near_miss") else "")
+            return "", True
+        if pool and pool != owner:
+            # Measured on somebody else's pool. Whatever identify() could not
+            # say about it (too little speech, most often), it is not his.
+            log.info("gate: the voice cleared the bar on %s's pool with no "
+                     "name; that is nobody, not the owner", pool)
+            return "", True
+        # HIS POOL, OR NOTHING MEASURED. The voiceprint has no label, so a
+        # match on it arrives nameless and still means him, exactly as before
+        # this feature existed -- however many labels the gallery holds and
+        # whatever else is enrolled; nobody else enrolling can move this. An
+        # abstention lands here too: every "Yes." he says is under 1.5 s of
+        # speech and fails open by design (tests/test_owner_gate.py:74 is the
+        # concrete lockout), and it is his whether the clip was short or a
+        # short window of a long one -- the pipeline's documented fail-open,
+        # unchanged by the gallery.
         if stats.get("abstained"):
-            # NOTHING WAS MEASURED. Every "Yes." he says is under 1.5 s of
-            # speech and fails open by design; an empty label here would
-            # refuse his own follow-ups -- tests/test_owner_gate.py:74 is the
-            # concrete lockout. This is the pipeline's documented fail-open,
-            # unchanged by enrolling anybody: whoever says a clip that short
-            # inside a follow-up window is answered as him, exactly as before
-            # the gallery existed. Saying so is better than a lockout.
-            return self._owner_label(), True
-        labels = stats.get("labels") or ()
+            log.info("gate: an abstention on his pool (%d label(s): %s); "
+                     "the documented fail-open stands",
+                     len(stats.get("labels") or ()),
+                     ", ".join(str(x) for x in (stats.get("labels") or ())))
+        return owner, True
+
+    @staticmethod
+    def _near_miss(stats, rejected) -> bool:
+        """A MATCHED clip whose margin failed. A rejected clip (nothing
+        cleared the pipeline's bar) may carry the flag from the gallery's
+        scoring of its strongest window -- two provisional labels can both
+        sit above the gallery's bar while matching nobody -- and telling a
+        stranger "I can hear someone I know" on the strength of that would
+        be a small lie; the ordinary unknown line answers a rejection."""
+        if rejected or not isinstance(stats, dict):
+            return False
         try:
-            enrolled = len(labels)
-        except TypeError:
-            enrolled = 0
-        if enrolled <= 1:
-            # THE OWNER FALLBACK, AND WHERE IT IS LEGAL. The voiceprint has no
-            # label, so a match on it alone arrives nameless; with the gallery
-            # holding at most one label the only nameless pool that can have
-            # matched is his (a provisional label cannot match at all --
-            # speaker._best_score leaves it out), so a nameless match still
-            # means him, exactly as it did before this feature existed.
-            return self._owner_label(), True
-        # TWO OR MORE LABELS AND NO NAME IS UNKNOWN, NOT THE OWNER. The
-        # gallery scored this voice against everybody and could not say which
-        # of them it was -- a failed margin, a bar cleared on somebody the
-        # store may not name. Falling back to the owner here was a privilege
-        # escalation, measured 2026-09-04: a second person's clips admitted
-        # as him 150 of 150 times, with her centroid well under the accept
-        # bar against his pool (the number is in speaker._all_centroids).
-        # "I can hear someone I know, but I can't tell which of you" is a
-        # refusal with a way back in, and that is what it gets.
-        log.info("gate: the voice matched with no name among %d labels (%s); "
-                 "that is nobody, not the owner", enrolled,
-                 ", ".join(str(x) for x in labels))
-        return "", True
+            hits = int(stats.get("matched") or 0)
+        except (TypeError, ValueError):
+            return False
+        return hits >= 1 and bool(stats.get("near_miss"))
 
     def _face_leg(self, face, running) -> Tuple[str, bool]:
         """The gallery's name, mapped to a registry label.
@@ -552,6 +609,11 @@ class OwnerGate:
         # end, and it never names an owner to somebody it does not know.
         has_phrase = any(p.phrase_hash for p in self.registry.owners())
         line = UNKNOWN_PHRASE_LINE if has_phrase else UNKNOWN_LINE
+        if self._near_miss(stats, rejected):
+            # The voice IS somebody enrolled and the margin could not say
+            # which. "Enrol you at the keyboard" would be the wrong answer
+            # to a person who already is; the line names nobody.
+            line = NEAR_MISS_LINE
         if mode != MODE_ENFORCE:
             log.info("gate: shadow -- would have refused this turn")
             return Decision(admit=True, how=HOW_NOBODY, would_refuse=True,

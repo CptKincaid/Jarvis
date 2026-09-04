@@ -21,6 +21,7 @@ Usage:
 """
 from __future__ import annotations
 
+import dataclasses
 import os
 import threading
 import time
@@ -108,6 +109,27 @@ VOICEPRINT_FORMAT = 2
 # minted from it, where pooling would have named a stranger as him.
 KNOWN_VOICEPRINT_FORMATS = (1, 2)
 
+# THE OWNER'S TWO POOLS ARE ONE POOL. ``voiceprint.npz`` has no label, and
+# ``--migrate`` copies its vectors unchanged into the gallery under his label,
+# so a window of his voice scores the two centroids identically up to float
+# rounding and the maximum lands on whichever came first. Identity is decided
+# PER WINDOW now (see filter_segments), and a clip of his that split between
+# "the voiceprint" and "hunter" would have half its windows dropped as
+# somebody else's. So a gallery label is folded into the voiceprint's pool
+# when it IS the owner's label (``owner_label``, set by the app from
+# identity.owner_label) -- or, when nobody told this verifier who the owner
+# is, when its centroid is this close to the voiceprint's. Measured
+# 2026-09-04 on synthetic vectors (tests/test_voice_per_window.py): a
+# migrated copy sits at cos 1.000, the same pool after two passive samples
+# (PASSIVE_CAP) at 0.99, and a DIFFERENT synthetic person's centroid
+# (10 takes against his 14, five seeds each) at 0.00-0.17 / 0.41-0.53 /
+# 0.70-0.77 / 0.81-0.85 for apart 0.3 / 1.0 / 2.0 / 3.0 -- under the
+# analytic apart^2/(apart^2+1) because a finite pool keeps some noise, and
+# every one under this line; 3.0 is a separation scripts/voice_enrol.py
+# refuses to enrol at all. The explicit label is the mechanism; the number
+# is the fallback for a process that never set it.
+MIGRATED_ALIAS_COSINE = 0.98
+
 
 def _frame_rms(audio_16k, n):
     frames = np.asarray(audio_16k[:len(audio_16k) // n * n],
@@ -177,10 +199,14 @@ class SpeakerVerifier:
     _frozen_centroid = None
     _passive_added = 0
     format_fault = ""
+    # The owner's gallery label, so his migrated pool and his voiceprint are
+    # read as ONE pool (see MIGRATED_ALIAS_COSINE). "" is "nobody said".
+    owner_label = ""
 
-    def __init__(self, gpu=0, threshold=DEFAULT_THRESHOLD):
+    def __init__(self, gpu=0, threshold=DEFAULT_THRESHOLD, owner_label=""):
         self.gpu = gpu
         self.threshold = threshold
+        self.owner_label = str(owner_label or "")
         self._model = None
         self._embeddings = []       # List of 192-dim numpy arrays
         self._centroid = None       # Mean of all embeddings
@@ -251,9 +277,10 @@ class SpeakerVerifier:
 
         The voiceprint's pool is keyed "" -- it has no label and inventing one
         here would put a name into the identity chain that no store agrees on.
-        ``gate._voice_leg`` turns a nameless match into the owner ONLY when
-        the gallery holds at most one label; that is where the owner's label
-        is actually known.
+        ``_best_match`` reports WHICH pool a score came from (the stats dict's
+        ``matched_label``), and ``gate._voice_leg`` turns a nameless match
+        into the owner ONLY for a match on that pool or on his own migrated
+        label; that is where the owner's label is actually known.
 
         ``matchable=True`` LEAVES OUT EVERY PROVISIONAL LABEL, and that is the
         difference between a store that scores and a door. A label with fewer
@@ -387,6 +414,19 @@ class SpeakerVerifier:
                 self.gallery = gal
                 log.info("voice gallery: %d label(s) enrolled (%s)",
                          len(gal.labels()), ", ".join(gal.labels()) or "-")
+                labels = gal.labels()
+                if labels and self.owner_label and \
+                        self.owner_label not in labels:
+                    # scripts/voice_enrol.py refuses to build this layout;
+                    # a gallery from an older build can still hold it.
+                    # He is not locked out by it (a match on the voiceprint
+                    # is still his), but identify() cannot rank him against
+                    # anybody, so a guest whose voice also clears his bar
+                    # is answered by the voiceprint alone.
+                    log.warning("voice gallery holds %s but not the owner's "
+                                "label %r: run scripts/voice_enrol.py "
+                                "--migrate so the gallery can tell him from "
+                                "them", ", ".join(labels), self.owner_label)
             else:
                 self.gallery = None
                 if gal.foreign_generations:
@@ -622,33 +662,90 @@ class SpeakerVerifier:
 
         Callers hold ``self._lock``.
         """
+        best = self._best_match(embedding)
+        return None if best is None else best[1]
+
+    def _owner_pools(self, cents):
+        """The gallery labels that are HIS pool under another name -- see
+        MIGRATED_ALIAS_COSINE. ``cents`` is the dict ``_all_centroids``
+        built, so this costs one cosine per label and no lock."""
+        out = set()
+        mine = cents.get("")
+        for label, c in cents.items():
+            if not label:
+                continue
+            if label == self.owner_label:
+                out.add(label)
+            elif mine is not None and \
+                    self._cosine_similarity(c, mine) >= MIGRATED_ALIAS_COSINE:
+                out.add(label)
+        return out
+
+    def _pool_of_label(self, label):
+        """Which pool a gallery label belongs to: "" when it is the owner's
+        (see ``_owner_pools``), otherwise itself."""
+        label = str(label or "")
+        if not label:
+            return ""
+        with self._lock:
+            cents = self._all_centroids()
+        return "" if label in self._owner_pools(cents) else label
+
+    def _best_match(self, embedding):
+        """``(pool, score)`` of the best MATCHABLE centroid, or None when
+        nothing matchable is enrolled.
+
+        THE POOL IS WHICH PERSON'S CENTROID THE SCORE CAME FROM, and it is
+        the fact the gate was missing. ``_best_score`` used to return the
+        number alone, so a second person clearing the bar on HER OWN
+        centroid arrived at the gate as "a nameless match" -- byte-identical
+        to a match on his voiceprint -- and the gate's owner fallback made
+        her him (measured 2026-09-04: 50 of 50 short commands of hers
+        admitted with owner scope). "" is the voiceprint's pool, and the
+        owner's migrated label is folded into it (``_owner_pools``); any
+        other label is that person's pool and can never become the owner.
+
+        Callers hold ``self._lock``.
+        """
         cents = self._all_centroids(matchable=True)
         if not cents:
             return None
-        return max(float(self._cosine_similarity(embedding, c))
-                   for c in cents.values())
+        his = self._owner_pools(cents)
+        best = None
+        for label, c in cents.items():
+            score = float(self._cosine_similarity(embedding, c))
+            if best is None or score > best[1]:
+                best = ("" if label in his else label, score)
+        return best
 
     def _who(self, embedding, speech_s):
-        """``(who, {label: score}, fault)`` from the gallery.
+        """``(verdict, fault)`` from the gallery.
 
-        No gallery is ``("", {}, "")`` -- nobody to name, nothing wrong. A
-        gallery that RAISES is ``("", {}, "<sentence>")``, and the third
-        value is the whole point: the two used to be the same two-tuple, so a
-        wedged store reached the gate looking exactly like a voice it had
-        measured and declined to name.
+        No gallery is ``(None, "")`` -- nobody to name, nothing wrong. A
+        gallery that RAISES is ``(None, "<sentence>")``, and the second
+        value is the whole point: the two used to be the same, so a wedged
+        store reached the gate looking exactly like a voice it had measured
+        and declined to name.
+
+        THE WHOLE VERDICT COMES BACK, not the name alone. This used to
+        return ``(who, scores, "")`` and drop ``verdict.abstained`` on the
+        floor, so an abstention on a short window reached the gate as a
+        MEASURED nameless match -- which is the route a guest's 1.2 s
+        command took to owner scope, and the route his own 1.2 s command
+        took to a refusal (both measured 50/50, 2026-09-04).
 
         Every bar lives in ``voicegallery.identify`` -- the accept bar, the
         margin, the provisional rule and the abstain window. Nothing here
         second-guesses it, and ``gate.py`` holds no threshold at all.
         """
         if self.gallery is None:
-            return "", {}, ""
+            return None, ""
         try:
             verdict = self.gallery.identify(embedding, speech_s, self.threshold)
         except Exception as exc:  # noqa: BLE001 - a broken gallery names nobody
             log.exception("voice gallery identify failed; naming nobody")
-            return "", {}, ("the voice gallery could not identify: %s"
-                            % type(exc).__name__)
+            return None, ("the voice gallery could not identify: %s"
+                          % type(exc).__name__)
         if verdict.who:
             log.info("voice gallery: %s (%.3f%s)", verdict.who, verdict.score,
                      "" if verdict.margin is None
@@ -659,28 +756,78 @@ class SpeakerVerifier:
                      self.gallery.count(verdict.provisional))
         elif verdict.why and not verdict.abstained:
             log.info("voice gallery: naming nobody -- %s", verdict.why)
-        return verdict.who, dict(verdict.scores), ""
+        return verdict, ""
 
-    def _ident(self, who="", who_scores=None, abstained=False, fault="",
+    def _reconcile(self, verdict, pool):
+        """The gallery's NAME must agree with the POOL the bar was cleared
+        on, or the name is withheld and ``top`` carries it as a guess.
+
+        Reachable with the owner un-migrated: ``identify`` ranks gallery
+        labels only, so with a guest in the gallery and him only in
+        ``voiceprint.npz`` it cannot rank him against her and names the one
+        label it has -- on HIS voice, whenever it also clears her bar
+        (measured 2026-09-04 at apart 1.0: 43 of 150 of his clips named
+        "mara" outright, 150 of 150 at apart 2.0). The pool is the measured
+        fact: his voiceprint out-scored her centroid, so the name is
+        withheld and the gate answers nobody rather than her. ONE helper for
+        the whole-clip path and the windowed path, so a clip under 3 s
+        cannot be named what a clip over 3 s would not be.
+        """
+        if verdict is None or not verdict.who:
+            return verdict
+        if self._pool_of_label(verdict.who) == pool:
+            return verdict
+        log.info("voice gallery named %s but the bar was cleared on %s's "
+                 "pool; naming nobody", verdict.who, repr(pool or "voiceprint"))
+        return dataclasses.replace(verdict, who="")
+
+    def _ident(self, verdict=None, *, pool="", abstained=False, fault="",
                labels=None):
         """The identity half of a stats dict. ONE builder, so every path out
         of ``verify`` and ``filter_segments`` carries the same keys:
 
-        who        the label the gallery named, or ""
-        who_scores {label: cosine} the gallery measured
-        labels     every label the gallery holds, provisional included --
-                   the gate's owner fallback is legal only when this holds
-                   at most one
-        abstained  True when nothing was measured (too little speech): the
-                   documented fail-open, and NOT a match
-        who_fault  "" or one sentence when the gallery raised
+        who           the label the gallery NAMED (bar, margin and takes all
+                      cleared), or ""
+        who_scores    {label: cosine} the gallery measured
+        labels        every label the gallery holds, provisional included
+                      (for the log; the gate no longer counts them)
+        matched_label WHOSE POOL the kept windows cleared the bar on: "" for
+                      the voiceprint (his), a label for that person. The
+                      gate's owner fallback is legal ONLY for "" or his own
+                      label -- never for anybody else's pool.
+        top           the label identify() ranked first ABOVE THE BAR, named
+                      or not (provisional, or a failed margin). "" when
+                      nothing cleared it. A nameless match whose best guess
+                      is somebody else may not become the owner.
+        provisional   ``top`` when it was withheld only for lack of takes
+        near_miss     True when the margin failed: "I can't tell which of
+                      you", which is the line the gate says for it
+        abstained     True when identify() measured nothing on the speech
+                      it was given (too little): the documented fail-open,
+                      carried through EVERY path, and NOT a recognition
+        who_fault     "" or one sentence when the gallery raised
         """
         if labels is None:
             labels, lab_fault = self._gallery_state()
             fault = fault or lab_fault
-        return {"who": str(who or ""), "who_scores": dict(who_scores or {}),
-                "labels": tuple(labels), "abstained": bool(abstained),
-                "who_fault": str(fault or "")}
+        who = who_top = provisional = ""
+        scores = {}
+        near_miss = False
+        if verdict is not None:
+            abstained = abstained or bool(verdict.abstained)
+            scores = dict(verdict.scores)
+            who = str(verdict.who or "")
+            provisional = str(verdict.provisional or "")
+            if verdict.scores and float(verdict.score) >= self.threshold:
+                who_top = str(verdict.scores[0][0] or "")
+            near_miss = bool(not who and not provisional and not abstained
+                             and verdict.margin is not None
+                             and who_top
+                             and verdict.margin < vgal.MARGIN)
+        return {"who": who, "who_scores": scores, "labels": tuple(labels),
+                "matched_label": str(pool or ""), "top": who_top,
+                "provisional": provisional, "near_miss": near_miss,
+                "abstained": bool(abstained), "who_fault": str(fault or "")}
 
     def verify(self, audio_16k):
         """Check if audio matches the enrolled voiceprint.
@@ -740,22 +887,24 @@ class SpeakerVerifier:
             return False, 0.0, self._ident()
 
         with self._lock:
-            score = self._best_score(embedding)
+            best = self._best_match(embedding)
         # None: nothing matchable is enrolled (only provisional labels). That
         # is a REJECT on the transcript gate, not an accept -- somebody IS
         # enrolled, so the gate fails shut exactly as it did before labels.
-        score = 0.0 if score is None else score
-        who, who_scores, fault = self._who(embedding, speech_s)
+        pool, score = ("", 0.0) if best is None else best
+        verdict, fault = self._who(embedding, speech_s)
+        verdict = self._reconcile(verdict, pool)
 
         # Duration beside the score, always: it is the variable that actually
         # drives rejection, and it was invisible in the log until now.
         log.info("speaker verify: score=%.3f on %.2fs of speech (threshold %.2f)",
                  score, speech_s, self.threshold)
         is_match = score >= self.threshold
+        who = "" if verdict is None else verdict.who
         log.info("speaker verify: score=%.3f threshold=%s %s%s",
                  score, self.threshold, "MATCH" if is_match else "REJECT",
-                 " (%s)" % who if who else "")
-        return is_match, score, self._ident(who, who_scores, fault=fault)
+                 " (%s)" % (who or pool or "voiceprint") if is_match else "")
+        return is_match, score, self._ident(verdict, pool=pool, fault=fault)
 
     # ------------------------------------------------ passive learning
     def add_sample(self, audio_16k):
@@ -878,7 +1027,11 @@ class SpeakerVerifier:
             (filtered_audio, stats_dict)
             filtered_audio: numpy array of concatenated matching segments,
                             or None if no segments matched
-            stats_dict: {'total': N, 'matched': M, 'scores': [...]}
+            stats_dict: {'total': N, 'matched': M, 'scores': [...]} plus
+                        the identity keys ``_ident`` documents (who,
+                        matched_label, top, abstained, ...). ``matched``
+                        counts the windows KEPT: those that cleared the bar
+                        on the clip's own speaker's pool.
         """
         if not self.is_enrolled:
             # Unconfigured: pass through, or voice never works on a fresh box.
@@ -946,29 +1099,46 @@ class SpeakerVerifier:
             windows = [windows[i] for i in voiced]
             positions = [positions[i] for i in voiced]
 
-        # Batch embedding extraction for speed
+        # IDENTITY IS DECIDED PER WINDOW, AND THE CLIP IS ONE PERSON'S.
+        #
+        # The first version scored every window against the MAXIMUM over all
+        # centroids, kept every window that cleared it, and ran ONE identify()
+        # on the best window. So a 6 s capture holding him for 3 s and her
+        # for 3 s kept BOTH halves (each cleared the bar on its own
+        # centroid) and ran the whole thing under whichever of them scored
+        # higher: measured 2026-09-04, her half passed to the commander under
+        # HIS name 61 of 100 times. Enrolling a guest had turned the filter
+        # into a laundry.
+        #
+        # Now every window records WHOSE pool it cleared the bar on
+        # (``_best_match``), the clip is attributed to the pool of its
+        # strongest window, and a matched window on anybody else's pool is
+        # DROPPED -- its audio does not reach Whisper and it does not count
+        # toward ``matched``. The name comes from the kept windows' own
+        # verdicts, a named one first, and an abstention on every kept window
+        # is carried as an abstention rather than laundered into a match.
         scores = []
-        matched_mask = []
-        # The window that scored best, kept so ONE identify() runs on the
-        # strongest evidence in the capture rather than on an arbitrary
-        # window. Identity is a fact about the speaker, not about a 3 s slice.
-        best = (None, -2.0, 0.0)          # embedding, score, trimmed seconds
+        pools = []
+        embs = []
+        speech = []
         try:
             for chunk in windows:
                 emb = self._extract_embedding(chunk)
                 if emb is not None:
                     with self._lock:
-                        score = self._best_score(emb)
-                    score = 0.0 if score is None else score
+                        best = self._best_match(emb)
+                    pool, score = ("", 0.0) if best is None else best
                     scores.append(score)
-                    matched_mask.append(score >= self.threshold)
-                    if score > best[1]:
-                        best = (emb, score,
-                                len(trim_silence(chunk)) / SAMPLE_RATE)
+                    pools.append(pool)
+                    embs.append(emb)
+                    speech.append(len(trim_silence(chunk)) / SAMPLE_RATE)
                 else:
                     scores.append(0.0)
-                    matched_mask.append(False)
-            if os.environ.get("JARVIS_DEBUG_AUDIO") == "1" and not any(matched_mask):
+                    pools.append("")
+                    embs.append(None)
+                    speech.append(0.0)
+            cleared = [i for i, s in enumerate(scores) if s >= self.threshold]
+            if os.environ.get("JARVIS_DEBUG_AUDIO") == "1" and not cleared:
                 self._dump_reject(audio_16k, windows, scores)
         except Exception:
             log.exception("segment verification error")
@@ -976,23 +1146,58 @@ class SpeakerVerifier:
             return None, {"total": len(windows), "matched": 0, "scores": [],
                           **self._ident()}
 
-        who, who_scores, fault = ("", {}, "")
-        if best[0] is not None:
-            who, who_scores, fault = self._who(best[0], best[2])
-        ident = self._ident(who, who_scores, fault=fault)
-
-        matched_count = sum(matched_mask)
         total_count = len(windows)
-
-        log.info("segment filter: %d/%d windows matched (scores: %s)",
-                 matched_count, total_count,
-                 ", ".join(f"{s:.2f}" for s in scores))
-
-        if matched_count == 0:
+        if not cleared:
             # No name on a rejection, whatever the gallery thought: "matched"
             # is the pipeline's verdict and a label may never contradict it.
+            # The gallery still SCORES the strongest window so the log can
+            # say "probably mara, 6 takes" about a clip that went nowhere.
+            log.info("segment filter: 0/%d windows matched (scores: %s)",
+                     total_count, ", ".join(f"{s:.2f}" for s in scores))
+            verdict, fault = None, ""
+            scored = [i for i, e in enumerate(embs) if e is not None]
+            if scored:
+                i = max(scored, key=lambda i: scores[i])
+                verdict, fault = self._who(embs[i], speech[i])
+                if verdict is not None:
+                    verdict = dataclasses.replace(verdict, who="")
             return None, {"total": total_count, "matched": 0, "scores": scores,
-                          **dict(ident, who="")}
+                          **self._ident(verdict, fault=fault)}
+
+        strongest = max(cleared, key=lambda i: scores[i])
+        clip_pool = pools[strongest]
+        kept = [i for i in cleared if pools[i] == clip_pool]
+        dropped = [i for i in cleared if pools[i] != clip_pool]
+        if dropped:
+            log.info("segment filter: %d window(s) cleared the bar on %s, "
+                     "not on %s; dropped as somebody else's",
+                     len(dropped),
+                     ", ".join(repr(pools[i] or "voiceprint") for i in dropped),
+                     repr(clip_pool or "voiceprint"))
+
+        # The verdict for the clip, from ITS OWN windows: a named verdict
+        # beats a nameless one, a measured one beats an abstention, and the
+        # strongest evidence breaks ties. Every kept window is asked, so a
+        # short window that abstains cannot hide a longer one that names him.
+        verdict, fault = None, ""
+        ranked = []
+        for i in kept:
+            v, f = self._who(embs[i], speech[i])
+            if f:
+                fault = fault or f
+                continue
+            if v is not None:
+                ranked.append((bool(v.who), not v.abstained, scores[i], i, v))
+        if ranked:
+            ranked.sort(key=lambda r: r[:3], reverse=True)
+            verdict = self._reconcile(ranked[0][4], clip_pool)
+        ident = self._ident(verdict, pool=clip_pool, fault=fault)
+
+        matched_count = len(kept)
+        matched_mask = [i in kept for i in range(total_count)]
+        log.info("segment filter: %d/%d windows matched on %s (scores: %s)",
+                 matched_count, total_count, repr(clip_pool or "voiceprint"),
+                 ", ".join(f"{s:.2f}" for s in scores))
 
         # Reconstruct audio from matched segments using a mask over the
         # original audio to preserve continuity where possible

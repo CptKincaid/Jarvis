@@ -14,9 +14,13 @@ TWO FIXES, EACH WITH A TEST THAT FAILS WHEN IT IS REVERTED:
 
 1. A provisional label cannot match as anybody (``speaker._all_centroids``
    leaves it out of the matchable set). It still scores and logs.
-2. With two or more labels in the gallery a nameless match is NOBODY at the
-   gate, never the owner. With at most one label the fallback stands,
-   because the only nameless pool that can have matched is his.
+2. A nameless match is the owner ONLY when it was measured on HIS pool
+   (``matched_label`` "" or his label) and the gallery's best guess above
+   the bar (``top``) is not somebody else. The first version of this fix
+   counted labels instead (one -> him, two -> nobody); the round-2 review
+   measured that wrong both ways -- a guest's short window on a one-label
+   box minted him, and his own short window on a two-label box was refused
+   -- and tests/test_voice_per_window.py holds those fixtures now.
 
 Two further things the gate must be able to tell apart, and now can: an
 ABSTENTION (nothing measured -- the documented fail-open, unchanged by
@@ -55,7 +59,8 @@ def rig(tmp_path, monkeypatch):
 def _stats(**kw):
     base = {"total": 1, "matched": 1, "scores": [0.41], "who": "",
             "who_scores": {}, "labels": (), "abstained": False,
-            "who_fault": ""}
+            "who_fault": "", "matched_label": "", "top": "",
+            "provisional": "", "near_miss": False}
     base.update(kw)
     return base
 
@@ -124,27 +129,94 @@ def test_the_route_is_closed_at_the_gate_not_only_below_it(rig):
 
 
 # --------------------------------------------- 2. the rule, at the gate
-def test_two_labels_and_no_name_is_nobody(tmp_path):
+def test_a_nameless_match_on_her_pool_is_nobody(tmp_path):
+    """Her window cleared the bar on HER centroid and identify() could not
+    name her (too little speech). Whose pool matched is the fact; the
+    number of labels is not."""
     d = _gate(tmp_path).judge("voice", "unlock the door",
-                              stats=_stats(labels=("hunter", "mara")))
+                              stats=_stats(labels=("hunter", "mara"),
+                                           matched_label="mara",
+                                           abstained=True))
     assert d.who == "" and d.admit is False and d.how == gt.HOW_NOBODY
 
 
-def test_two_labels_and_no_name_names_the_way_back_in(tmp_path):
+def test_a_nameless_match_on_her_pool_names_the_way_back_in(tmp_path):
     d = _gate(tmp_path).judge("voice", "unlock the door",
-                              stats=_stats(labels=("hunter", "mara")))
+                              stats=_stats(labels=("hunter", "mara"),
+                                           matched_label="mara"))
     assert d.line == gt.UNKNOWN_LINE
 
 
-@pytest.mark.parametrize("labels", [(), ("hunter",), ("mara",)],
-                         ids=["no-gallery", "his-label", "one-guest"])
-def test_at_most_one_label_keeps_the_owner_fallback(tmp_path, labels):
-    """With one label the only nameless pool that can have matched is the
-    voiceprint's -- a provisional label cannot match at all, and a named
-    label arrives named -- so a nameless match still means him."""
+@pytest.mark.parametrize("labels", [(), ("hunter",), ("mara",),
+                                    ("hunter", "mara"), ("heather", "mara")],
+                         ids=["no-gallery", "his-label", "one-guest",
+                              "him-and-a-guest", "two-guests-unmigrated"])
+def test_a_match_on_his_pool_is_him_however_many_labels(tmp_path, labels):
+    """THE LOCKOUT THE COUNT RULE CAUSED. A nameless match on the
+    voiceprint is his whether the gallery holds nobody, him, one guest or
+    two guests he never migrated beside: nobody else enrolling can lock him
+    out of his own voiceprint."""
     d = _gate(tmp_path).judge("voice", "what's the time",
-                              stats=_stats(labels=labels))
+                              stats=_stats(labels=labels, matched_label=""))
     assert d.admit is True and d.who == "hunter"
+
+
+def test_his_own_migrated_label_is_his_pool(tmp_path):
+    d = _gate(tmp_path).judge("voice", "what's the time",
+                              stats=_stats(labels=("hunter", "mara"),
+                                           matched_label="hunter",
+                                           abstained=True))
+    assert d.admit is True and d.who == "hunter"
+
+
+@pytest.mark.parametrize("extra", [dict(provisional="mara"),
+                                   dict(near_miss=True)],
+                         ids=["probably-mara", "margin-failed-mara-on-top"])
+def test_the_gallerys_best_guess_being_somebody_else_blocks_the_owner(
+        tmp_path, extra):
+    """identify() ranked HER first above the bar and withheld the name --
+    for takes, or for the margin. "Probably Mara" may not be minted as
+    him, whichever pool the window cleared the bar on."""
+    d = _gate(tmp_path).judge("voice", "unlock the door",
+                              stats=_stats(labels=("hunter", "mara"),
+                                           matched_label="", top="mara",
+                                           **extra))
+    assert d.who != "hunter" and d.admit is False
+
+
+def test_a_near_miss_is_refused_with_the_near_miss_line(tmp_path):
+    d = _gate(tmp_path).judge("voice", "unlock the door",
+                              stats=_stats(labels=("hunter", "mara"),
+                                           matched_label="mara", top="mara",
+                                           near_miss=True))
+    assert d.admit is False and d.line == gt.NEAR_MISS_LINE
+    assert "hunter" not in d.line.lower() and "mara" not in d.line.lower()
+
+
+def test_a_near_miss_is_nobody_even_with_him_on_top(tmp_path):
+    """THE HOLE ROUND 3 FOUND IN ITS OWN DRAFT. The margin failed, the
+    gallery's best guess was the owner and the bar was cleared on his pool
+    -- and the draft admitted it as him ("nothing says it is anybody
+    else"). Measured on the reviewer's grid: a confusable guest minted as
+    him 5/150 (10 takes) and 22/150 (6 takes) at apart 3.0 with him
+    migrated, against 0/150 under the count rule. A failed margin is a coin
+    flip and names nobody, whoever is on top."""
+    d = _gate(tmp_path).judge("voice", "what's the time",
+                              stats=_stats(labels=("hunter", "mara"),
+                                           matched_label="", top="hunter",
+                                           near_miss=True))
+    assert d.admit is False and d.who == "" and d.line == gt.NEAR_MISS_LINE
+
+
+def test_a_rejected_clip_never_gets_the_near_miss_line(tmp_path):
+    """Two provisional labels can both sit above the gallery's bar on a
+    clip that matched nobody; "I can hear someone I know" would be a small
+    lie to a stranger. A rejection gets the ordinary unknown line."""
+    d = _gate(tmp_path).judge("voice", "unlock the door", rejected=True,
+                              stats=_stats(matched=0, scores=[0.1],
+                                           labels=("heather", "mara"),
+                                           top="mara", near_miss=True))
+    assert d.admit is False and d.line == gt.UNKNOWN_LINE
 
 
 def test_a_legacy_stats_dict_with_no_labels_key_is_still_him(tmp_path):
@@ -176,7 +248,8 @@ def test_an_abstention_stays_him_with_two_labels(tmp_path):
 
 def test_shadow_mode_logs_the_would_refuse_and_admits(tmp_path):
     d = _gate(tmp_path, mode="shadow").judge(
-        "voice", "unlock the door", stats=_stats(labels=("hunter", "mara")))
+        "voice", "unlock the door", stats=_stats(labels=("hunter", "mara"),
+                                                 matched_label="mara"))
     assert d.admit is True and d.would_refuse is True and d.who == ""
 
 
@@ -319,7 +392,7 @@ def test_the_gate_reads_the_new_keys_and_no_score(tmp_path):
             for arg in node.args[:1]:
                 if isinstance(arg, ast.Constant):
                     read.add(arg.value)
-    assert {"labels", "abstained", "who_fault"} <= read
+    assert {"labels", "abstained", "who_fault", "matched_label", "top"} <= read
     assert "scores" not in read and "who_scores" not in read
 
 

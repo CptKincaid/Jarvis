@@ -56,8 +56,16 @@ from jarvis.identity import owner_label             # noqa: E402
 
 JARVIS_PID = Path("/tmp/vss_voice/jarvis.pid")
 
-TAKES = 8               # measured: a centroid is at cos 0.975 of its converged
-SECONDS = 8.0           # position by 8 takes, and 0.987 by 10. Past 8 it is flat.
+# THE NUMBER NAMING REQUIRES, AND NOT A NUMBER OF ITS OWN. A label under
+# ``vg.MIN_TAKES_TO_NAME`` takes is PROVISIONAL: it scores and logs, it can
+# never be named, and since 2026-09-04 it cannot match as anybody either. A
+# guest enrolled with six takes would therefore be a person Jarvis can hear and
+# never answer. So the default is the naming floor itself (8 -- measured: a
+# centroid is at cos 0.975 of its converged position by 8 takes, 0.987 by 10,
+# and flat past 8), ``takes_ok`` refuses fewer, and the two numbers cannot
+# drift apart because there is only one.
+TAKES = vg.MIN_TAKES_TO_NAME
+SECONDS = 8.0
 MIN_RMS = 0.004         # below this the take is effectively silence
 
 # Varied prompts beat one long monotone take: identify() compares against the
@@ -133,6 +141,60 @@ def face_enrol():
 
 
 # --------------------------------------------------------- the pure decisions
+def takes_ok(n):
+    """``(ok, why not)`` for the number of takes asked for. Pure."""
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return False, "--takes must be a number"
+    if n < vg.MIN_TAKES_TO_NAME:
+        return False, ("%d take(s) is under %d, the number a label needs "
+                       "before Jarvis will name it. Fewer would enrol somebody "
+                       "he can hear and never answer -- a provisional label "
+                       "scores, logs, and matches nobody."
+                       % (n, vg.MIN_TAKES_TO_NAME))
+    return True, ""
+
+
+def owner_ready(gallery, owner, label, voiceprint_exists):
+    """``(ok, why not)``: may ``label`` be enrolled as a SECOND person yet?
+
+    THE OWNER MUST BE IN THE GALLERY BEFORE ANYBODY ELSE IS, and the script
+    REFUSES rather than migrating him on the guest's behalf. Two reasons.
+
+    1. ``identify`` ranks GALLERY labels only. With a guest in the gallery
+       and the owner still only in ``voiceprint.npz``, it cannot rank him
+       against her: the margin never applies, and a voice of hers that also
+       clears his voiceprint bar is answered by the voiceprint alone. The
+       runtime is not locked out by that layout (a match on the voiceprint
+       is still his -- speaker.filter_segments carries WHICH pool matched),
+       but the gallery cannot do its one job in it, which is telling the two
+       of them apart.
+    2. ``--migrate`` is a write of HIS data under his label with his consent
+       ("owner"), and it can be refused (a format-1 voiceprint, degenerate
+       vectors). That belongs to its own run with its own message, not to
+       the middle of somebody else's consent flow.
+
+    Enrolling the OWNER himself is always allowed; so is a gallery holding
+    nobody yet when there is no voiceprint to migrate (a box that never had
+    voice ID cannot be locked out of it).
+    """
+    if label == owner or owner in gallery.labels():
+        return True, ""
+    if voiceprint_exists:
+        return False, (
+            "the owner (%s) is not in the voice gallery yet, and the gallery "
+            "cannot tell %s from %s until he is. Run this first, no "
+            "microphone needed:\n    %s %s --migrate"
+            % (owner, label, owner, sys.executable, __file__))
+    if gallery.labels():
+        return False, (
+            "the owner (%s) is not in the voice gallery and there is no "
+            "voiceprint to migrate; enrol him first (--label %s) so the "
+            "gallery can tell %s from %s." % (owner, owner, label, owner))
+    return True, ""
+
+
 def take_ok(rms, min_rms=MIN_RMS):
     """``(ok, why not)`` for one take's loudness. Pure, so it is tested."""
     try:
@@ -262,6 +324,10 @@ def show_status(gallery) -> None:
         print("    %s %s --migrate" % (sys.executable, __file__))
         return
     print("enrolled        :")
+    owner = owner_label(CONFIG)
+    if owner and owner not in gallery.labels():
+        print("  ** the owner (%s) is NOT in the gallery: it cannot tell him "
+              "from anybody here. Run --migrate. **" % owner)
     for label in gallery.labels():
         n = gallery.count(label)
         floor = gallery.genuine_floor(label)
@@ -369,6 +435,15 @@ def main(argv=None) -> int:
         print("--json cannot enrol anybody: consent has to be read and typed "
               "at a terminal.", file=sys.stderr)
         return 2
+
+    ok, why = takes_ok(args.takes)
+    if not ok:
+        print("REFUSED: %s" % why, file=sys.stderr)
+        return 2
+    ok, why = owner_ready(gallery, owner, args.label, PATHS.VOICEPRINT.exists())
+    if not ok:
+        print("REFUSED: %s" % why, file=sys.stderr)
+        return 5
 
     # -------------------------------------------------------------- consent
     ok, how = face_enrol().consent(args.label, owner, gallery.root, print,

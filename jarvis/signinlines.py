@@ -5,9 +5,17 @@ no config, no model, no logger, no threshold. It takes what the legs said and
 returns a string, so every sentence in this feature can be tested with no
 microphone and no lens -- which on this box is the only way it can be tested.
 
-THE ONE SENTENCE THAT IS HIS, VERBATIM
+THE ONE SENTENCE THAT IS HIS, VERBATIM, AND IT IS THE SIGN-IN LINE FOR
+ANYBODY HE HAS ENROLLED
     "Voice and identity recognized, welcome back Hunter. How may I be of
     assistance today?"
+
+    His wording, fixed, with the first name of whoever was recognised in
+    it -- Hunter, or Mara. The first version reserved it for the owner and
+    greeted a guest with "Hello Mara, I recognize you."; he asked for his
+    sentence to be THE line for a recognised person, so it is. Scope is not
+    a greeting's business: ``gate.allowed_for`` still holds a KNOWN person
+    to the time, the weather and the music a second later.
 
     It claims BOTH legs, so it may only be said when both legs actually
     confirmed. Four preconditions, all required, and ``both_legs_line``
@@ -24,13 +32,8 @@ THE ONE SENTENCE THAT IS HIS, VERBATIM
          claims two instruments when one of them never ran is the kind of
          small lie that makes the whole feature untrustworthy.
 
-    And a fifth the brief left implicit and a test found: the person is the
-    OWNER. "Welcome back" and "How may I be of assistance" are his greeting,
-    and saying them to a guest both misdescribes whose house this is and
-    offers a scope ``gate.allowed_for`` would refuse a second later.
-
     Miss any one and a DIFFERENT and honest sentence is said, naming which
-    leg actually saw them.
+    leg actually saw them -- for him and for a guest alike.
 
 SILENCE IS ALSO A SENTENCE
     Under the abstain window, nothing about identity is said at all -- the
@@ -55,9 +58,8 @@ THE ONE HONEST TENSION, SAID OUT LOUD RATHER THAN HIDDEN
 """
 from __future__ import annotations
 
-from jarvis.identity import ROLE_OWNER
-
-# HIS WORDING, FIXED. ``{first}`` is Person.name's first token.
+# HIS WORDING, FIXED, for ANY recognised person. ``{first}`` is Person.name's
+# first token.
 BOTH_LEGS_LINE = ("Voice and identity recognized, welcome back {first}. "
                   "How may I be of assistance today?")
 
@@ -67,10 +69,6 @@ VOICE_ONLY_LINE = ("I recognize your voice, {first}. The camera isn't "
                    "confirming right now — welcome back anyway.")
 FACE_ONLY_LINE = ("I recognize your face, {first}. I haven't heard you yet — "
                   "welcome back.")
-
-# A KNOWN person. No "welcome back", which is his phrase, and no offer of
-# assistance beyond what gate.allowed_for permits a KNOWN role anyway.
-KNOWN_LINE = "Hello {first}, I recognize you."
 
 # The sentence that replaces a coin flip, and the whole reason the margin
 # exists. It NAMES NOBODY.
@@ -113,12 +111,9 @@ def both_legs_line(legs, person) -> str:
     """
     if person is None:
         return ""
-    # AND THE SENTENCE IS HIS. "Welcome back" and "How may I be of assistance"
-    # are the OWNER's greeting; saying them to a guest both misdescribes whose
-    # house this is and offers a scope gate.allowed_for would not grant. Found
-    # by tests/test_signin_lines.py, which greeted Mara with his line.
-    if str(getattr(person, "role", "") or "") != ROLE_OWNER:
-        return ""
+    # ANY registry person: his wording is the sign-in line for whoever both
+    # legs recognised. (An earlier version kept it for the owner and said
+    # "Hello Mara, I recognize you." to a guest; his call was otherwise.)
     voice = str(getattr(legs, "voice_says", "") or "")
     face = str(getattr(legs, "face_says", "") or "")
     if not (voice and face):
@@ -155,14 +150,9 @@ def line_for(legs, person, *, near_miss: bool = False, provisional=None,
         voice = str(getattr(legs, "voice_says", "") or "")
         face = str(getattr(legs, "face_says", "") or "")
         label = str(getattr(person, "label", "") or "")
-        owner = str(getattr(person, "role", "") or "") == ROLE_OWNER
         first = first_name(person)
-        if not owner:
-            # A KNOWN person gets one sentence whichever leg saw them: "welcome
-            # back" is his phrase and this is not his house being returned to.
-            if label in (voice, face):
-                return KNOWN_LINE.format(first=first)
-            return ""
+        # One leg, owner or guest alike: the line names WHICH instrument
+        # actually saw them rather than claiming both.
         if voice == label and getattr(legs, "voice_running", False):
             return VOICE_ONLY_LINE.format(first=first)
         if face == label and getattr(legs, "face_running", False):
