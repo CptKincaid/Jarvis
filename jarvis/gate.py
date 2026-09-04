@@ -333,6 +333,18 @@ class OwnerGate:
         """
         if not isinstance(stats, dict) or "matched" not in stats:
             return "", False
+        fault = str(stats.get("who_fault") or "")
+        if fault:
+            # THE NAMING INSTRUMENT IS BROKEN, and a broken instrument is NO
+            # INSTRUMENT -- not a name, not a negative. Before this key
+            # existed a gallery that raised arrived here as who="", which is
+            # byte-identical to a voice it measured and declined to name, so
+            # a wedged store either minted the owner (one label) or refused
+            # him (two). Not running is loud: it counts toward the dead-man
+            # and stands the gate down rather than guessing either way.
+            log.warning("gate: the voice leg's naming instrument faulted "
+                        "(%s); treating the leg as not running", fault)
+            return "", False
         try:
             hits = int(stats.get("matched") or 0)
         except (TypeError, ValueError):
@@ -341,18 +353,47 @@ class OwnerGate:
             # The clip was dropped, or nothing matched. That is not evidence
             # against anybody else's leg: "no name from me" is all it says.
             return "", True
-        # WHO, WHEN THE VOICE GALLERY NAMED SOMEBODY -- AND THE OWNER FALLBACK
-        # IS LOAD-BEARING, not politeness. ``matched`` can be 1 with no name
-        # at all: an ABSTENTION sets it (every "Yes." he says is under 1.5 s
-        # of speech and fails open by design), and so does a fail-open with
-        # nothing enrolled. An empty label there would refuse his own
-        # follow-ups -- tests/test_owner_gate.py:74 is the concrete lockout.
-        # So a nameless match still means him, exactly as it did before this
-        # feature existed; a NAMED match means the person the gallery named.
-        #
-        # No threshold is applied here and none ever may be. Both bars live in
-        # jarvis/voicegallery.py, which is where the numbers were measured.
-        return str(stats.get("who") or self._owner_label()), True
+        who = str(stats.get("who") or "")
+        if who:
+            # A NAMED match means the person the gallery named. No threshold
+            # is applied here and none ever may be. Both bars live in
+            # jarvis/voicegallery.py, which is where the numbers were measured.
+            return who, True
+        if stats.get("abstained"):
+            # NOTHING WAS MEASURED. Every "Yes." he says is under 1.5 s of
+            # speech and fails open by design; an empty label here would
+            # refuse his own follow-ups -- tests/test_owner_gate.py:74 is the
+            # concrete lockout. This is the pipeline's documented fail-open,
+            # unchanged by enrolling anybody: whoever says a clip that short
+            # inside a follow-up window is answered as him, exactly as before
+            # the gallery existed. Saying so is better than a lockout.
+            return self._owner_label(), True
+        labels = stats.get("labels") or ()
+        try:
+            enrolled = len(labels)
+        except TypeError:
+            enrolled = 0
+        if enrolled <= 1:
+            # THE OWNER FALLBACK, AND WHERE IT IS LEGAL. The voiceprint has no
+            # label, so a match on it alone arrives nameless; with the gallery
+            # holding at most one label the only nameless pool that can have
+            # matched is his (a provisional label cannot match at all --
+            # speaker._best_score leaves it out), so a nameless match still
+            # means him, exactly as it did before this feature existed.
+            return self._owner_label(), True
+        # TWO OR MORE LABELS AND NO NAME IS UNKNOWN, NOT THE OWNER. The
+        # gallery scored this voice against everybody and could not say which
+        # of them it was -- a failed margin, a bar cleared on somebody the
+        # store may not name. Falling back to the owner here was a privilege
+        # escalation, measured 2026-09-04: a second person's clips admitted
+        # as him 150 of 150 times, with her centroid well under the accept
+        # bar against his pool (the number is in speaker._all_centroids).
+        # "I can hear someone I know, but I can't tell which of you" is a
+        # refusal with a way back in, and that is what it gets.
+        log.info("gate: the voice matched with no name among %d labels (%s); "
+                 "that is nobody, not the owner", enrolled,
+                 ", ".join(str(x) for x in labels))
+        return "", True
 
     def _face_leg(self, face, running) -> Tuple[str, bool]:
         """The gallery's name, mapped to a registry label.

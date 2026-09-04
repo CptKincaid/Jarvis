@@ -147,6 +147,35 @@ def take_ok(rms, min_rms=MIN_RMS):
     return True, ""
 
 
+def separation_margins(mine, theirs):
+    """The margins ``identify`` would actually see between two pools:
+    ``(median margin for mine, median margin for theirs)``.
+
+    THE SAME QUANTITY THE MARGIN BAR IS APPLIED TO, and not a proxy for it.
+    ``identify`` names somebody when ``cos(probe, own centroid) - cos(probe,
+    other centroid) >= vg.MARGIN``. So each take here is scored leave-one-out
+    against its own pool's centroid and against the other pool's, exactly as a
+    fresh utterance would be, and the median over the takes is what more than
+    half of that person's verdicts will look like.
+
+    The first version of ``pool_ok`` compared the two CENTROIDS to each other
+    and refused above cosine 0.80. Measured 2026-09-04 on synthetic pools at
+    his within-person spread: at a centroid cosine of 0.71 that check passed
+    and 91-97% of verdicts for BOTH people then failed the 0.20 margin. It
+    fired only past 0.80, where every verdict had already been failing since
+    about 0.60 -- the wrong quantity, never firing in the regime it existed
+    for. Leave-one-out medians track fresh-probe medians within 0.01 on the
+    same data, so this is the number, not an estimate of it.
+    """
+    def _loo(pool, other_c):
+        out = []
+        for i, e in enumerate(pool):
+            rest = [x for j, x in enumerate(pool) if j != i]
+            out.append(vg.cosine(e, vg.centroid(rest)) - vg.cosine(e, other_c))
+        return float(np.median(out))
+    return _loo(mine, vg.centroid(theirs)), _loo(theirs, vg.centroid(mine))
+
+
 def pool_ok(gallery, label, vectors):
     """``(ok, why not)`` for a FINISHED pool, before it is saved.
 
@@ -155,11 +184,14 @@ def pool_ok(gallery, label, vectors):
 
     1. COHESION. A median pairwise cosine above 0.90 is one take recorded
        several times. His own fourteen-take pool measures 0.485.
-    2. SEPARATION. If this pool's centroid sits within ``vg.MARGIN`` of
-       somebody already enrolled, ``identify`` could never name either of them
-       -- every verdict for both would come back UNKNOWN on the margin, which
-       looks exactly like the feature being broken. Better to say so now, with
-       the number, than to store it and let them both quietly stop working.
+    2. SEPARATION. If the MARGIN this pool's takes would clear against
+       somebody already enrolled -- or theirs against this pool -- has a
+       median under ``vg.MARGIN``, ``identify`` would fail to name that
+       person more often than not: every such verdict comes back UNKNOWN on
+       the margin, which looks exactly like the feature being broken. Better
+       to say so now, with the number, than to store it and let them both
+       quietly stop working. See ``separation_margins`` for why this is the
+       margin itself and not the centroids' cosine.
     """
     if len(vectors) < 2:
         return False, "a pool needs at least two takes"
@@ -169,18 +201,22 @@ def pool_ok(gallery, label, vectors):
                        "above %.2f -- that is one take recorded several times, "
                        "not several takes. A real pool measures around 0.485."
                        % (len(vectors), med, vg.COLLAPSED_MEDIAN_COSINE))
-    mine = vg.centroid(vectors)
-    for other, theirs in sorted(gallery.centroids().items()):
+    for other in sorted(gallery.labels()):
         if other == label:
             continue
-        gap = vg.cosine(mine, theirs)
-        if gap > (1.0 - vg.MARGIN):
+        theirs = gallery.embeddings(other)
+        if len(theirs) < 2:
+            continue
+        m_mine, m_theirs = separation_margins(vectors, theirs)
+        if min(m_mine, m_theirs) < vg.MARGIN:
             return False, (
-                "%s's takes sit at cosine %.3f of %s's, which is inside the "
-                "%.2f margin. Jarvis could not tell the two of you apart: "
-                "every verdict for BOTH of you would come back \"I can't tell "
-                "which of you\". Re-record in a different spot, or use a "
-                "different microphone." % (label, gap, other, vg.MARGIN))
+                "%s's takes clear %s's by a median margin of %.3f, and %s's "
+                "clear %s's by %.3f; the bar is %.2f. Jarvis could not tell "
+                "the two of you apart: more than half the verdicts for %s "
+                "would come back \"I can't tell which of you\". Re-record in "
+                "a different spot, or use a different microphone."
+                % (label, other, m_mine, other, label, m_theirs, vg.MARGIN,
+                   label if m_mine < m_theirs else other))
     return True, ""
 
 
@@ -199,8 +235,15 @@ def separation_report(gallery):
     out = []
     for i, a in enumerate(labels):
         for b in labels[i + 1:]:
-            out.append("  %-12s vs %-12s  cosine %.3f" %
-                       (a, b, vg.cosine(cents[a], cents[b])))
+            ea, eb = gallery.embeddings(a), gallery.embeddings(b)
+            if len(ea) >= 2 and len(eb) >= 2:
+                ma, mb = separation_margins(ea, eb)
+                margin = "median margin %s %.3f, %s %.3f (bar %.2f)" % (
+                    a, ma, b, mb, vg.MARGIN)
+            else:
+                margin = "margin needs two takes each"
+            out.append("  %-12s vs %-12s  centroid cosine %.3f  %s" %
+                       (a, b, vg.cosine(cents[a], cents[b]), margin))
     return out
 
 

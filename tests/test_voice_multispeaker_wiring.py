@@ -259,9 +259,10 @@ def test_a_short_clip_abstains_and_names_nobody(rig):
     _enrol(v.gallery, world, "mara", 10)
     clip = _clip(1.0, 0.66)           # under ABSTAIN_SECONDS of speech
     enc.teach(clip, world.take("hunter"))
-    ok, score, who, who_scores = v._verify_named(clip)
+    ok, score, ident = v._verify_named(clip)
     assert ok is True and score == 0.0
-    assert who == "" and who_scores == {}
+    assert ident["who"] == "" and ident["who_scores"] == {}
+    assert ident["abstained"] is True, "an abstention must say it is one"
 
 
 def test_the_abstain_window_is_unchanged():
@@ -285,8 +286,9 @@ def test_the_gallery_names_the_speaker_on_a_real_capture(rig):
 
 def test_a_failed_margin_reaches_the_gate_as_no_name(rig):
     """The near miss. Two enrolled people too close to separate: matched can
-    still be 1 (the audio IS somebody enrolled) and the NAME is withheld, so
-    the gate falls back to the owner rather than guessing between them."""
+    still be 1 (the audio IS somebody enrolled) and the NAME is withheld.
+    With two labels the gate then reads that as NOBODY -- never the owner;
+    tests/test_voice_owner_fallback.py proves it at the gate."""
     v, enc = rig
     world = Voices(seed=7, apart=3.0)
     _enrol(v.gallery, world, "hunter", 14)
@@ -297,16 +299,25 @@ def test_a_failed_margin_reaches_the_gate_as_no_name(rig):
     verdict = v.gallery.identify(world.take("mara"), 4.0, v.threshold)
     assert verdict.margin is not None and verdict.margin < vg.MARGIN
     assert stats["who"] == ""
+    assert stats["labels"] == ("hunter", "mara")
+    assert stats["abstained"] is False and stats["who_fault"] == ""
 
 
-def test_a_provisional_label_reaches_the_gate_as_no_name(rig):
+def test_a_provisional_label_cannot_match_at_all(rig):
+    """A label with too few takes to be NAMED used to still sit inside the
+    maximum ``matched`` is taken over, so it matched as a nameless somebody
+    -- and a nameless match on a one-label box is the owner. It scores and
+    logs; it does not open the door."""
     v, enc = rig
     world = Voices(seed=8, apart=0.3)
     _enrol(v.gallery, world, "mara", 4)
     clip = _clip(4.0, 0.99)
     enc.teach(clip, world.take("mara"))
-    _out, stats = v.filter_segments(clip)
+    out, stats = v.filter_segments(clip)
     assert stats["who"] == ""
+    assert out is None and stats["matched"] == 0, \
+        "a provisional label matched as somebody"
+    assert "mara" in stats["who_scores"], "it should still SCORE"
 
 
 # ----------------------------------------------- 7. the voiceprint is safe
@@ -344,4 +355,6 @@ def test_a_broken_gallery_does_not_cost_him_the_voiceprint(rig, tmp_path):
     v.gallery = Broken()
     assert v.is_enrolled is True          # the voiceprint alone still counts
     assert v._all_centroids() != {}
-    assert v._who(world.take("hunter"), 3.0) == ("", {})
+    who, scores, fault = v._who(world.take("hunter"), 3.0)
+    assert (who, scores) == ("", {})
+    assert fault, "a raising gallery must say so, not look like a non-match"

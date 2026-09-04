@@ -222,28 +222,63 @@ class SpeakerVerifier:
         return bool(self._embeddings) or bool(self._gallery_labels())
 
     def _gallery_labels(self):
-        try:
-            return self.gallery.labels() if self.gallery is not None else ()
-        except Exception:  # noqa: BLE001 - a broken gallery is no gallery
-            log.debug("voice gallery labels unreadable", exc_info=True)
-            return ()
+        return self._gallery_state()[0]
 
-    def _all_centroids(self):
+    def _gallery_state(self):
+        """``(labels, fault)``: every label the gallery holds, and "" -- or
+        one sentence when the gallery could not even say.
+
+        THE FAULT IS RETURNED, NOT ONLY LOGGED, because ``gate._voice_leg``
+        needs it: a gallery that raises used to reach the gate as
+        ``who=""`` -- byte-identical to a legitimate non-match -- and a
+        nameless match is the owner on a one-person box. A wedged instrument
+        must arrive as a wedged instrument, which the gate treats as NOT
+        RUNNING (loud, dead-man counted), never as a name and never as a
+        rejection it did not measure.
+        """
+        if self.gallery is None:
+            return (), ""
+        try:
+            return tuple(self.gallery.labels()), ""
+        except Exception as exc:  # noqa: BLE001 - a broken gallery is no gallery
+            log.warning("voice gallery labels unreadable: %s: %s",
+                        type(exc).__name__, exc, exc_info=True)
+            return (), ("the voice gallery could not list its labels: %s"
+                        % type(exc).__name__)
+
+    def _all_centroids(self, matchable=False):
         """``{label_or_"": centroid}`` over everything enrolled.
 
         The voiceprint's pool is keyed "" -- it has no label and inventing one
         here would put a name into the identity chain that no store agrees on.
-        ``gate._voice_leg`` turns a nameless match into the owner, which is
-        where the owner's label is actually known.
+        ``gate._voice_leg`` turns a nameless match into the owner ONLY when
+        the gallery holds at most one label; that is where the owner's label
+        is actually known.
+
+        ``matchable=True`` LEAVES OUT EVERY PROVISIONAL LABEL, and that is the
+        difference between a store that scores and a door. A label with fewer
+        than ``voicegallery.MIN_TAKES_TO_NAME`` takes is never NAMED, but its
+        centroid used to sit inside the maximum ``_best_score`` takes, so a
+        second person with six takes cleared the 0.30 bar on her own centroid,
+        set ``matched=1`` with no name, and the gate's owner fallback made her
+        HIM. Measured 2026-09-04: 150 of 150 of her clips admitted as the
+        owner, at a centroid cosine to his pool of 0.246. A label that cannot
+        be named cannot match as anybody; it still scores and logs through
+        ``identify``.
         """
         out = {}
         if self._centroid is not None:
             out[""] = self._centroid
         if self.gallery is not None:
             try:
-                out.update(self.gallery.centroids())
+                cents = self.gallery.centroids()
+                if matchable:
+                    cents = {k: c for k, c in cents.items()
+                             if not self.gallery.provisional(k)}
+                out.update(cents)
             except Exception:  # noqa: BLE001
-                log.debug("voice gallery centroids unreadable", exc_info=True)
+                log.warning("voice gallery centroids unreadable; matching "
+                            "against the voiceprint alone", exc_info=True)
         return out
 
     # Legacy alias (voice_input_gui / hotword_daemon used .enrolled)
@@ -579,28 +614,41 @@ class SpeakerVerifier:
         unwakeable assistant is the worse failure and this feature is not
         allowed to create one.
 
+        OVER THE MATCHABLE CENTROIDS ONLY -- a provisional label is left out
+        (see ``_all_centroids``), so enrolling somebody with too few takes to
+        be named raises nothing here and lowers nothing here. Nothing enrolled
+        but provisional labels returns None, which the wake gate reads as its
+        fail-open.
+
         Callers hold ``self._lock``.
         """
-        cents = self._all_centroids()
+        cents = self._all_centroids(matchable=True)
         if not cents:
             return None
         return max(float(self._cosine_similarity(embedding, c))
                    for c in cents.values())
 
     def _who(self, embedding, speech_s):
-        """``(who, {label: score})`` from the gallery, or ``("", {})``.
+        """``(who, {label: score}, fault)`` from the gallery.
+
+        No gallery is ``("", {}, "")`` -- nobody to name, nothing wrong. A
+        gallery that RAISES is ``("", {}, "<sentence>")``, and the third
+        value is the whole point: the two used to be the same two-tuple, so a
+        wedged store reached the gate looking exactly like a voice it had
+        measured and declined to name.
 
         Every bar lives in ``voicegallery.identify`` -- the accept bar, the
         margin, the provisional rule and the abstain window. Nothing here
         second-guesses it, and ``gate.py`` holds no threshold at all.
         """
         if self.gallery is None:
-            return "", {}
+            return "", {}, ""
         try:
             verdict = self.gallery.identify(embedding, speech_s, self.threshold)
-        except Exception:  # noqa: BLE001 - a broken gallery names nobody
+        except Exception as exc:  # noqa: BLE001 - a broken gallery names nobody
             log.exception("voice gallery identify failed; naming nobody")
-            return "", {}
+            return "", {}, ("the voice gallery could not identify: %s"
+                            % type(exc).__name__)
         if verdict.who:
             log.info("voice gallery: %s (%.3f%s)", verdict.who, verdict.score,
                      "" if verdict.margin is None
@@ -611,7 +659,28 @@ class SpeakerVerifier:
                      self.gallery.count(verdict.provisional))
         elif verdict.why and not verdict.abstained:
             log.info("voice gallery: naming nobody -- %s", verdict.why)
-        return verdict.who, dict(verdict.scores)
+        return verdict.who, dict(verdict.scores), ""
+
+    def _ident(self, who="", who_scores=None, abstained=False, fault="",
+               labels=None):
+        """The identity half of a stats dict. ONE builder, so every path out
+        of ``verify`` and ``filter_segments`` carries the same keys:
+
+        who        the label the gallery named, or ""
+        who_scores {label: cosine} the gallery measured
+        labels     every label the gallery holds, provisional included --
+                   the gate's owner fallback is legal only when this holds
+                   at most one
+        abstained  True when nothing was measured (too little speech): the
+                   documented fail-open, and NOT a match
+        who_fault  "" or one sentence when the gallery raised
+        """
+        if labels is None:
+            labels, lab_fault = self._gallery_state()
+            fault = fault or lab_fault
+        return {"who": str(who or ""), "who_scores": dict(who_scores or {}),
+                "labels": tuple(labels), "abstained": bool(abstained),
+                "who_fault": str(fault or "")}
 
     def verify(self, audio_16k):
         """Check if audio matches the enrolled voiceprint.
@@ -627,11 +696,12 @@ class SpeakerVerifier:
         clip is ACCEPTED (True, 1.0) — logged at WARNING, with one
         Status(kind=warn) event per session.
         """
-        is_match, score, _who, _scores = self._verify_named(audio_16k)
+        is_match, score, _ident = self._verify_named(audio_16k)
         return is_match, score
 
     def _verify_named(self, audio_16k):
-        """``verify()`` plus the label. ``(is_match, score, who, who_scores)``.
+        """``verify()`` plus the identity. ``(is_match, score, ident)`` where
+        ``ident`` is the dict ``_ident`` builds.
 
         Split out rather than folded in because ``filter_segments`` falls back
         to whole-clip verification on a short capture and needs the name too;
@@ -640,7 +710,7 @@ class SpeakerVerifier:
         if not self.is_enrolled:
             # Nobody enrolled — accept all audio
             self._fail_open("no voiceprint enrolled")
-            return True, 1.0, "", {}
+            return True, 1.0, self._ident()
 
         speech_s = len(trim_silence(audio_16k)) / SAMPLE_RATE
         if speech_s < ABSTAIN_SECONDS:
@@ -655,21 +725,27 @@ class SpeakerVerifier:
                      "abstaining (fail-open)", speech_s)
             # NO NAME FROM AN ABSTENTION, and that is the trap a naive label
             # change springs. The clip is accepted (fail-open) with who="",
-            # and gate._voice_leg turns a nameless match into the owner. An
-            # abstention must never be narrated as a recognition: nothing was
-            # measured.
-            return True, 0.0, "", {}
+            # and SAID TO BE an abstention: gate._voice_leg keeps the owner
+            # fallback for one -- nothing was measured, so enrolling a second
+            # person moves nothing about it -- where a MEASURED nameless
+            # match on a two-person box is unknown. An abstention must never
+            # be narrated as a recognition.
+            return True, 0.0, self._ident(abstained=True)
         embedding = self._extract_embedding(audio_16k)
         if embedding is None:
             # Can't extract embedding (model missing, audio too short) — accept
             reason = ("model not loaded" if not self._model_loaded
                       else "no embedding (audio too short?)")
             self._fail_shut(reason)
-            return False, 0.0, "", {}
+            return False, 0.0, self._ident()
 
         with self._lock:
             score = self._best_score(embedding)
-        who, who_scores = self._who(embedding, speech_s)
+        # None: nothing matchable is enrolled (only provisional labels). That
+        # is a REJECT on the transcript gate, not an accept -- somebody IS
+        # enrolled, so the gate fails shut exactly as it did before labels.
+        score = 0.0 if score is None else score
+        who, who_scores, fault = self._who(embedding, speech_s)
 
         # Duration beside the score, always: it is the variable that actually
         # drives rejection, and it was invisible in the log until now.
@@ -679,7 +755,7 @@ class SpeakerVerifier:
         log.info("speaker verify: score=%.3f threshold=%s %s%s",
                  score, self.threshold, "MATCH" if is_match else "REJECT",
                  " (%s)" % who if who else "")
-        return is_match, score, who, who_scores
+        return is_match, score, self._ident(who, who_scores, fault=fault)
 
     # ------------------------------------------------ passive learning
     def add_sample(self, audio_16k):
@@ -808,11 +884,11 @@ class SpeakerVerifier:
             # Unconfigured: pass through, or voice never works on a fresh box.
             self._fail_open("no voiceprint enrolled")
             return audio_16k, {"total": 0, "matched": 0, "scores": [],
-                               "who": "", "who_scores": {}}
+                               **self._ident()}
         if not self._ensure_model():
             self._fail_shut("model not loaded")
             return None, {"total": 0, "matched": 0, "scores": [],
-                          "who": "", "who_scores": {}}
+                          **self._ident()}
 
         window_samples = int(window_sec * SAMPLE_RATE)
         hop_samples = int(hop_sec * SAMPLE_RATE)
@@ -820,12 +896,13 @@ class SpeakerVerifier:
 
         if total_samples < window_samples:
             # Audio shorter than one window — fall back to whole-clip verify
-            is_match, score, who, who_scores = self._verify_named(audio_16k)
+            is_match, score, ident = self._verify_named(audio_16k)
             if is_match:
                 return audio_16k, {"total": 1, "matched": 1, "scores": [score],
-                                   "who": who, "who_scores": who_scores}
+                                   **ident}
+            # No name on a rejection; the fault and the labels still travel.
             return None, {"total": 1, "matched": 0, "scores": [score],
-                          "who": "", "who_scores": who_scores}
+                          **dict(ident, who="")}
 
         windows = []
         positions = []
@@ -897,11 +974,12 @@ class SpeakerVerifier:
             log.exception("segment verification error")
             self._fail_shut("segment verification error")
             return None, {"total": len(windows), "matched": 0, "scores": [],
-                          "who": "", "who_scores": {}}
+                          **self._ident()}
 
-        who, who_scores = ("", {})
+        who, who_scores, fault = ("", {}, "")
         if best[0] is not None:
-            who, who_scores = self._who(best[0], best[2])
+            who, who_scores, fault = self._who(best[0], best[2])
+        ident = self._ident(who, who_scores, fault=fault)
 
         matched_count = sum(matched_mask)
         total_count = len(windows)
@@ -914,7 +992,7 @@ class SpeakerVerifier:
             # No name on a rejection, whatever the gallery thought: "matched"
             # is the pipeline's verdict and a label may never contradict it.
             return None, {"total": total_count, "matched": 0, "scores": scores,
-                          "who": "", "who_scores": who_scores}
+                          **dict(ident, who="")}
 
         # Reconstruct audio from matched segments using a mask over the
         # original audio to preserve continuity where possible
@@ -928,8 +1006,7 @@ class SpeakerVerifier:
         filtered = audio_16k[keep]
 
         return filtered, {"total": total_count, "matched": matched_count,
-                          "scores": scores, "who": who,
-                          "who_scores": who_scores}
+                          "scores": scores, **ident}
 
     # ------------------------------------------------------------ reset
     def clear(self):

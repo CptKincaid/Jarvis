@@ -298,3 +298,64 @@ def test_the_instrument_says_so_when_nothing_is_enrolled(tmp_path, monkeypatch,
     monkeypatch.setattr(vg.PATHS, "VOICE_GALLERY", tmp_path / "vg")
     assert voice_model_compare.main([]) == 1
     assert "--migrate" in capsys.readouterr().out
+
+
+# --------------------------------------------- the separation bar's quantity
+def test_the_separation_check_measures_the_margin_not_the_centroids(gal):
+    """THE REGIME THE CHECK EXISTS FOR. Two pools whose centroids sit at
+    cosine ~0.71 -- under the old 0.80 centroid bar, so the old check waved
+    them through -- and whose takes then fail the 0.20 margin on more than
+    nine verdicts in ten. Measured 2026-09-04 on synthetic pools at his
+    within-person spread (apart=2.0): centroid cosine 0.712, median margin
+    0.15 / 0.12, unknown-rate 91% / 97%.
+
+    Reverting pool_ok to the centroid comparison fails this test: the
+    centroids are below 0.80 and it says ok."""
+    world = Voices(seed=21, apart=2.0)
+    him = world.takes("hunter", 14)
+    _fill(gal, world, "hunter", 14)
+    hers = world.takes("mara", 8)
+    cc = vg.cosine(vg.centroid(him), vg.centroid(hers))
+    assert cc < 1.0 - vg.MARGIN, "fixture drifted: the old check would fire"
+
+    # What identify() itself would do to fresh takes of hers once stored.
+    probe = vg.VoiceGallery()
+    for e in gal.embeddings("hunter"):
+        probe.add("hunter", e)
+    for e in hers:
+        probe.add("mara", e)
+    fresh = world.takes("mara", 100)
+    unknown = sum(1 for e in fresh
+                  if probe.identify(e, 4.0, vg.ACCEPT_DEFAULT).who == "")
+    assert unknown > 50, "fixture drifted: identify names her most of the time"
+
+    ok, why = voice_enrol.pool_ok(gal, "mara", hers)
+    assert ok is False, "the check passed a pool identify cannot name"
+    assert "margin" in why and "hunter" in why
+    assert "%.2f" % vg.MARGIN in why, "the refusal must print the bar"
+
+
+def test_the_separation_margin_is_the_quantity_identify_uses(gal):
+    """Leave-one-out margins and fresh-probe margins agree within 0.02 in
+    median on the same pools, so the number printed is the number the
+    verdicts will see, not a proxy for it."""
+    world = Voices(seed=22, apart=1.5)
+    him, hers = world.takes("hunter", 14), world.takes("mara", 8)
+    m_hers, m_him = voice_enrol.separation_margins(hers, him)
+    ch, cm = vg.centroid(him), vg.centroid(hers)
+    import numpy as np
+    fresh_hers = np.median([vg.cosine(e, cm) - vg.cosine(e, ch)
+                            for e in world.takes("mara", 200)])
+    fresh_him = np.median([vg.cosine(e, ch) - vg.cosine(e, cm)
+                           for e in world.takes("hunter", 200)])
+    assert abs(m_hers - fresh_hers) < 0.03, (m_hers, fresh_hers)
+    assert abs(m_him - fresh_him) < 0.03, (m_him, fresh_him)
+
+
+def test_the_status_report_prints_the_margin(gal):
+    world = Voices(seed=23, apart=0.3)
+    _fill(gal, world, "hunter", 14)
+    _fill(gal, world, "mara", 8)
+    lines = voice_enrol.separation_report(gal)
+    assert len(lines) == 1
+    assert "margin" in lines[0] and "%.2f" % vg.MARGIN in lines[0]
