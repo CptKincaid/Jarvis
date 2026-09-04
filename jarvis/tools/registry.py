@@ -45,7 +45,10 @@ in either direction (+1.3 s per turn, forever).  Do not "optimise" either
 without a tool-selection regression pass behind it.
 
 CHARS_PER_TOKEN below is NOT a stale guess — the range under it was
-measured at three points.  Leave it at 4.1.
+measured at three points.  Leave it at 4.1.  It is the rate for schema
+JSON and prose ONLY: tool RESULTS (calendar, mail) tokenize at 2.25 chars
+per token, measured 2026-09-04, and jarvis/brain.py costs those at its own
+TOOL_CHARS_PER_TOKEN.  Do not "fix" one number to fit the other text.
 """
 from __future__ import annotations
 

@@ -47,7 +47,10 @@ DEFAULTS: dict = {
     "user": {"name": "Hunter"},
     "units": "us",
     "local_model": "gemma4:26b",
-    # HOW MUCH ROOM THE LOCAL MODEL GETS TO THINK IN (jarvis/brain.py).
+    # HOW MUCH ROOM THE LOCAL MODEL GETS TO REMEMBER IN (jarvis/brain.py).
+    # The window holds what he is TOLD -- persona, tools, memory, history,
+    # the question, the tool results -- not how hard he thinks; think is
+    # the separate switch below, and it is off.
     # Every value here is read ONCE, when Jarvis starts, and is then
     # identical on every single request the brain makes -- Ollama keys its
     # loaded runner on num_ctx, so asking for a different one mid-run makes
@@ -62,10 +65,13 @@ DEFAULTS: dict = {
         # Above it nothing has been watched loading -- raise with care and
         # watch MemAvailable.
         "num_ctx": 16384,
-        # The cap on the SPOKEN answer, in tokens (~120 words). Real
-        # replies come back at 8-28 tokens, so this has never yet bound;
-        # raising it makes long answers possible, not likely, and a long
-        # answer is a long minute of speech.
+        # The cap on what the model may GENERATE in one round, in tokens:
+        # its reply text, any tool-call JSON, and (only with think on) its
+        # reasoning. It is NOT the cap on what is spoken -- speech is
+        # clamped afterwards by MAX_SPOKEN_SENTENCES / MAX_SPOKEN_CHARS in
+        # jarvis/brain.py, and a reply this budget cuts is cut mid-word.
+        # Real replies come back at 8-28 tokens, so 160 has never yet
+        # bound; a tool call with long arguments is what would hit it.
         "num_predict": 160,
         # How much the wording is allowed to vary. Lower is steadier and
         # flatter; higher is livelier and less predictable.

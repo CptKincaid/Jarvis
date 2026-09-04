@@ -4232,11 +4232,14 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
 * One hand. Two hands out at the lens is not this gesture, on purpose.
 * A question on the floor (a read-back waiting on your yes) blocks a grab.
 
-## 84. The brain: how much room he gets to think in
+## 84. The brain: how much room he gets to remember in
 
 Everything the local model is *given* now lives in one place you can edit,
 under `brain` in `~/.config/jarvis/assistant.json`. It used to be four
-numbers buried in the code.
+numbers buried in the code. (These six keys are already in your live
+`assistant.json` — an agent's import wrote them there on 2026-09-04 — and
+he reads them; a value that makes no sense is logged and replaced with the
+default rather than obeyed.)
 
 ```json
 "brain": {
@@ -4249,23 +4252,37 @@ numbers buried in the code.
 }
 ```
 
+**First, what the window was and was not.** The 09-04 change was sold as
+"room to think". It is not: thinking is the `think` switch below, and it
+is off. What the window holds is what he is *told* — and the truncation
+it was meant to cure was rare: counted over a week of his log, **1 prompt
+in 5,328 was truncated** (a count from the 09-04 review, not re-measured
+since). Doubling the window buys room to *remember* — a long calendar and
+a long inbox in the same turn, more of the conversation — and it was the
+guard further down, not the size, that fixed the one turn that went wrong.
+
 **`num_ctx` — how much he can hold in his head at once.**
 Everything he sees on a turn shares this: the tool descriptions, his
 persona, what he remembers about you, the last few exchanges, your
 question, and whatever the tools came back with. 16384 is double what he
 had. Costs **0.19 GB of memory** and about **11 milliseconds a turn** —
-both measured, not guessed. It does *not* make his answers longer.
-Raising it further is untested: 16384 is the biggest window anyone
-actually watched load on this box, so above that he logs a warning and
-you should watch memory. Below 2048 or above 262144 he ignores you and
+both measured, not guessed. It does *not* make his answers longer or
+cleverer. Raising it further is untested: 16384 is the biggest window
+anyone actually watched load on this box, so above that he logs a warning
+and you should watch memory. Below 2048 or above 262144 he ignores you and
 uses 16384.
 
-**`num_predict` — how long he is allowed to speak.**
-160 tokens, about 120 words. This is not what makes him terse: his real
-replies come back at 8-28 tokens, so this cap has never once stopped
-him. What makes him brief is a line in his persona telling him to use
-one or two sentences. Raising this number makes long answers *possible*,
-not *likely* — and a long answer is a long minute of listening to him.
+**`num_predict` — how much he may *generate* in one round.**
+160 tokens. This is **not** how long he speaks. What he says aloud is
+clamped separately, after the model has answered, to four sentences and
+about 450 characters (`MAX_SPOKEN_SENTENCES` / `MAX_SPOKEN_CHARS` in
+`jarvis/brain.py`), and that clamp cuts at a sentence end. This budget
+covers everything the model writes in a round — the reply text *and* the
+JSON of any tool call it makes (and its reasoning, only if `think` is on)
+— and when it binds, it cuts mid-word. His real replies come back at 8-28
+tokens, so 160 has never once stopped him; a tool call with long
+arguments is what would hit it first. Raising it makes long answers
+*possible*, not *likely*.
 
 **`temperature` — how much his wording varies.**
 0.7. Lower is steadier and flatter; higher is livelier and less
@@ -4273,11 +4290,11 @@ predictable. Cheap to try, instantly reversible.
 
 **`think` — whether he reasons to himself before answering. Leave it off.**
 It was measured on 2026-09-04 and it does not work on this model yet: his
-reasoning is charged to the same budget as his speech, so at 160 he spent
-the whole thing thinking and said **nothing at all, six times out of
-six**. Given far more room, 6 of 10 were still empty and the ones that
-finished took 11 to 33 seconds against his usual 1.3. If you turn it on
-he warns you in the log and tells you what your `num_predict` is.
+reasoning is charged to the same `num_predict` budget as his reply, so at
+160 he spent the whole thing thinking and said **nothing at all, six times
+out of six**. Given far more room, 6 of 10 were still empty and the ones
+that finished took 11 to 33 seconds against his usual 1.3. If you turn it
+on he warns you in the log and tells you what your `num_predict` is.
 
 **`answer_reserve_tokens` — headroom kept clear for the reply.** 128.
 You will not need to touch this.
@@ -4293,6 +4310,38 @@ anywhere says why. With this on he drops the oldest *tool result*
 instead, keeps your question, and writes a line in the log saying he did
 it.
 
+It guards **every** request he makes to the model, not only the tool
+loop: the spoken summaries, the router's tie-breaker, "explain this
+document", the quizzes, the syllabus reader, the Sunday memory garden and
+both warm-ups. Those have no tool result to drop, so there he cuts the
+*tail of the material* — the end of the document or digest — and marks
+the cut, because the instruction in front of it is what Ollama would have
+eaten first.
+
+### How he knows a prompt is too big
+
+He estimates before he sends, with **two rates**: 4.1 characters a token
+for prose and tool descriptions, and **2.25** for tool results — measured
+on the 09-04 calendar turn, where 9,000 characters of calendar cost 3,993
+tokens. Costed at 4.1 alone the estimate ran low by up to 1.8x, and on
+that exact turn the guard would have slept. The estimate costs 0.055 ms a
+round (measured), i.e. nothing.
+
+Then he logs what it *really* cost, from Ollama's own reply, on every
+path:
+
+```
+ctx: prompt 4265/16384 tokens (26%), answer 22/160 (estimated 4310) [chat]
+```
+
+The tag at the end names the path — `chat` (the tool loop), `persona`
+(summaries), `route` (the tie-breaker), `json` (documents, quizzes, the
+garden), `warm` and `rewarm` (the warm-ups). Estimate and real number sit
+side by side so a drift can be seen. Above 90% of the window the line
+becomes a warning. The `warm` line is special: the warm-up sends the
+static prefix and nothing else, so its prompt number **is** the true cost
+of the persona plus the tool schemas.
+
 ### Two things to know
 
 **A change here does nothing until Jarvis restarts.** That is deliberate,
@@ -4306,21 +4355,21 @@ starts, and are identical on every request until he restarts.
 one line at startup:
 
 ```
-brain: window 16384 tokens, spoken answer capped at 160, temperature 0.7,
-thinking off (assistant.json brain.*; a change needs a restart). Static
-prefix ~3556 tokens (persona ~1462 + 28 tool schemas ~2094), 128 reserved
--> ~12540 tokens left for his question, memory, history and tool results.
+brain: window 16384 tokens, generation per round capped at 160 (reply text
+plus tool calls; speech is clamped separately), temperature 0.7, thinking
+off (assistant.json brain.*; a change needs a restart). Static prefix
+~3556 tokens (persona ~1462 + 28 tool schemas ~2094), 128 reserved ->
+~12540 tokens left for his question, memory, history and tool results.
 Question guard on (trims a round above ~16096 tokens).
 ```
 
-And per round, what the prompt actually cost:
-`ctx: prompt 4265/16384 tokens (26%), answer 22/160`. Above 90% that
-becomes a warning. None of this was visible before.
+None of this was visible before.
 
 ### Verifying after a restart
 
 ```bash
-ollama ps                       # CONTEXT should read 16384
-grep "^.*brain: window" /tmp/vss_voice/jarvis.log | tail -1
+ollama ps                                          # CONTEXT should read 16384
+grep "brain: window" /tmp/vss_voice/jarvis.log | tail -1
+grep "ctx: prompt" /tmp/vss_voice/jarvis.log | tail -5   # estimate vs real
 ```
 If the model will not load at all, put `num_ctx` back to 8192 and restart.

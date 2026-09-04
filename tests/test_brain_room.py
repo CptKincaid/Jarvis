@@ -444,3 +444,323 @@ def test_round_token_logging_never_raises_on_a_junk_body(brain):
     for body in ({}, {"prompt_eval_count": None},
                  {"prompt_eval_count": "lots"}, None, []):
         brain._log_round_tokens(body)
+
+
+# ------------------------------------------------------------------------
+# 2026-09-04 review, five blocking findings. Each test below fails when its
+# fix is reverted; the docstrings say which.
+# ------------------------------------------------------------------------
+from pathlib import Path  # noqa: E402
+
+REPO = Path(__file__).resolve().parent.parent
+LIVE_STATIC_PREFIX_TOKENS = 3761   # measured: prompt_eval_count, tools-only
+LIVE_TURN_TOKENS = 499             # measured: question + background + memory
+LIVE_RESULT_CHARS = 9000           # the calendar result that did the damage
+
+
+def _tiny_window(brain, monkeypatch, num_ctx=2048):
+    """A window the persona alone nearly fills, so any real material must
+    be trimmed. Only SETTINGS is replaced: NUM_CTX (the value on the wire)
+    is left alone, which the one-value tests further up depend on."""
+    s = brain.ModelSettings(num_ctx=num_ctx)
+    monkeypatch.setattr(brain, "SETTINGS", s)
+    return s
+
+
+def _ctx_lines(caplog, label):
+    return [r for r in caplog.records
+            if r.message.startswith("ctx:") and f"[{label}]" in r.message]
+
+
+# ------------------------------------- finding 2: two rates, not one
+def test_dense_tool_text_is_costed_at_its_measured_rate(brain):
+    """Finding 2. LIVE 2026-09-04: a 9 000-char calendar result cost 3 993
+    prompt tokens (8253 minus the 4260 of prefix and turn), i.e. 2.25 chars
+    per token. The registry's 4.1 is right for prose and schemas and wrong
+    by 1.8x for this, in the direction that lets the window overflow."""
+    dense = brain.estimate_prompt_tokens(
+        [{"role": "tool", "content": "x" * LIVE_RESULT_CHARS}])
+    assert 3800 <= dense <= 4200, dense
+    prose = brain.estimate_prompt_tokens(
+        [{"role": "user", "content": "x" * LIVE_RESULT_CHARS}])
+    assert 2100 <= prose <= 2300, prose
+    assert brain.TOOL_CHARS_PER_TOKEN == 2.25
+    assert brain.PROSE_CHARS_PER_TOKEN == 4.1
+
+
+def test_the_guard_fires_on_the_live_turn_it_was_built_for(brain, monkeypatch):
+    """Finding 2, the consequence. The measured turn in numbers: an 8192
+    window (ceiling 7904), the 3761-token static prefix, the 499-token
+    turn, and the 9 000-char result. Ollama measured it at 8253 and deleted
+    his question. Costed at 4.1 the estimate came to ~6500 and the guard
+    SLEPT through the very turn it exists for; at 2.25 it fires."""
+    monkeypatch.setattr(brain, "SETTINGS", brain.ModelSettings(num_ctx=8192))
+    assert brain.SETTINGS.prompt_ceiling == 7904
+    line = "09:00 BMEN 427 lecture, room 1.14; 10:30 office hours\n"
+    result = (line * (LIVE_RESULT_CHARS // len(line) + 1))[:LIVE_RESULT_CHARS]
+    msgs = [{"role": "system",
+             "content": "p" * int(LIVE_STATIC_PREFIX_TOKENS * 4.1)},
+            {"role": "user", "content": "q" * int(LIVE_TURN_TOKENS * 4.1)},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"function": {"name": "get_calendar", "arguments": {}}}]},
+            {"role": "tool", "tool_name": "get_calendar", "content": result}]
+    before = brain.estimate_prompt_tokens(msgs)
+    assert before > 7904, before                 # it really is over
+    assert abs(before - 8253) < 300, before      # and close to the real count
+    dropped, after = brain.fit_prompt(msgs)
+    assert dropped == 1
+    assert after <= 7904
+    assert msgs[1]["content"].startswith("q")    # his question, untouched
+    assert msgs[3]["content"] == brain.TOOL_DROPPED_TEXT
+
+
+# ---------------------------- finding 1: every path, not the smallest one
+def test_summarize_goes_through_the_guard_and_logs_the_real_count(
+        brain, setup, monkeypatch, caplog):
+    """Finding 1. summarize() carries a Claude result or a mail digest in
+    ONE user message; nothing in it is a tool result, so the guard trims
+    the material's tail and keeps the instruction in front of it."""
+    b, fake = setup
+    _tiny_window(brain, monkeypatch)
+    digest = ("From: registrar@tamu.edu  Subject: BMEN 427 grade posted\n"
+              * 400)                               # 20 000 dense chars
+    fake.replies = [text_reply("Your grade is posted, sir.",
+                               prompt_eval_count=1750)]
+    with caplog.at_level("INFO"):
+        out = brain.summarize(digest, max_sentences=2)
+    assert out == "Your grade is posted, sir."
+    sent = fake.chat_payloads()[-1]["messages"][-1]["content"]
+    assert sent.startswith("Background:")          # the instruction survived
+    assert sent.endswith(brain.MATERIAL_CUT_TEXT)  # the material was cut
+    assert len(sent) < len(digest)
+    assert brain.estimate_prompt_tokens(
+        fake.chat_payloads()[-1]["messages"],
+        fake.chat_payloads()[-1].get("tools")) <= brain.SETTINGS.ceiling_for(120)
+    lines = _ctx_lines(caplog, "persona")
+    assert len(lines) == 1 and "prompt 1750/" in lines[0].message
+
+
+def test_local_line_material_that_fits_is_sent_untouched(brain, setup, caplog):
+    b, fake = setup
+    fake.replies = [text_reply("Right away, sir.")]
+    with caplog.at_level("INFO"):
+        assert brain.local_line("Acknowledge.", "open the calendar") == \
+            "Right away, sir."
+    sent = fake.chat_payloads()[-1]["messages"][-1]["content"]
+    assert "open the calendar" in sent
+    assert brain.MATERIAL_CUT_TEXT not in sent
+    assert len(_ctx_lines(caplog, "persona")) == 1
+
+
+def test_classify_route_goes_through_the_guard(brain, setup, monkeypatch,
+                                               caplog):
+    """Finding 1. The router's tie-breaker: a normal utterance is untouched,
+    and its prompt_eval_count is logged like every other request's."""
+    b, fake = setup
+    _tiny_window(brain, monkeypatch)
+    fake.replies = [text_reply(json.dumps({"route": "local",
+                                           "confidence": 0.9}),
+                               prompt_eval_count=1600)]
+    with caplog.at_level("INFO"):
+        assert brain.classify_route("what's the weather like") == \
+            ("local", 0.9)
+    sent = fake.chat_payloads()[-1]["messages"][-1]["content"]
+    assert sent.endswith("what's the weather like")
+    assert len(_ctx_lines(caplog, "route")) == 1
+    # an absurd transcript (a pasted page) is cut rather than overflowing
+    fake.replies = [text_reply(json.dumps({"route": "local",
+                                           "confidence": 0.5}))]
+    brain.classify_route("word " * 8000)
+    sent = fake.chat_payloads()[-1]["messages"][-1]["content"]
+    assert sent.endswith(brain.MATERIAL_CUT_TEXT)
+    assert brain.ROUTE_INSTRUCTION[:40] in sent
+
+
+def test_explain_text_goes_through_the_guard(brain, setup, monkeypatch,
+                                             caplog):
+    """Finding 1. The JSON helpers write their material LAST in the
+    instruction (explain_text, make_quiz, read_syllabus, extract_facts,
+    grade_answer all do), so the tail-trim cuts the document, never the
+    instruction that says what to do with it."""
+    b, fake = setup
+    # 4096, not 2048: explain_text asks for 420 tokens of answer, and at
+    # 2048 the persona alone leaves nothing for the document.
+    _tiny_window(brain, monkeypatch, num_ctx=4096)
+    doc = "The lab measures impedance across a range of frequencies. " * 200
+    fake.replies = [text_reply(json.dumps({"lead": "A lab handout, sir.",
+                                           "summary": "It measures things."}),
+                               prompt_eval_count=1500)]
+    with caplog.at_level("INFO"):
+        lead, summary = brain.explain_text(doc, name="lab.pdf")
+    assert lead == "A lab handout, sir."
+    sent = fake.chat_payloads()[-1]["messages"][-1]["content"]
+    assert sent.startswith("Instruction for Jarvis")
+    assert "Document:\n" in sent
+    assert sent.endswith(brain.MATERIAL_CUT_TEXT)
+    assert len(sent) < len(doc)
+    assert fake.chat_payloads()[-1].get("tools") in (None, [])
+    assert len(_ctx_lines(caplog, "json")) == 1
+
+
+def test_both_warm_ups_log_the_real_static_prefix_cost(brain, setup,
+                                                      monkeypatch, caplog):
+    """Finding 1 and 2. The warm-ups send the static prefix and nothing
+    else, so their prompt_eval_count IS the prefix's real cost -- the one
+    number the startup estimate can be checked against. It was thrown
+    away on both paths."""
+    b, fake = setup
+    monkeypatch.setitem(brain._RESIDENCY, "lent", False)
+    monkeypatch.setitem(brain._RESIDENCY, "unloaded_once", True)
+    fake.replies = [text_reply("", prompt_eval_count=3556),
+                    text_reply("", prompt_eval_count=3556)]
+    with caplog.at_level("INFO"):
+        assert brain.warm_static() is True
+        assert brain.ensure_resident(first=False) is True
+    assert len(_ctx_lines(caplog, "rewarm")) == 1
+    assert len(_ctx_lines(caplog, "warm")) == 1
+    assert all("prompt 3556/" in r.message
+               for r in _ctx_lines(caplog, "warm") + _ctx_lines(caplog, "rewarm"))
+    for payload in fake.chat_payloads()[-2:]:
+        assert payload["options"]["num_predict"] == 1
+        assert payload["options"]["num_ctx"] == brain.NUM_CTX
+
+
+def test_every_chat_request_in_the_module_goes_through_a_guard(brain):
+    """Finding 1, structurally. Only the tool loop (fit_prompt before,
+    _log_round_tokens after, streamed or not) and _chat_once may POST to
+    /api/chat. A new caller that builds its own payload and posts it has
+    skipped the guard, and this counts it."""
+    src = Path(brain.__file__).read_text(encoding="utf-8")
+    posts = [ln.strip() for ln in src.splitlines()
+             if '"/api/chat"' in ln
+             and ("_http(" in ln or "_http_stream(" in ln)]
+    # _chat_once's own post, the tool loop's plain round, its streamed round
+    assert len(posts) == 3, posts
+    helper = src.split("def _chat_once(", 1)[1].split("\ndef ", 1)[0]
+    assert '_http("/api/chat"' in helper
+    assert "fit_material(" in helper and "_log_round_tokens(" in helper
+    # and the one-shot callers all name it
+    for fn in ("warm_static", "ensure_resident", "_persona_request",
+               "classify_route", "_json_request"):
+        body = src.split(f"\ndef {fn}(", 1)[1].split("\ndef ", 1)[0]
+        assert "_chat_once(" in body, fn
+
+
+# ------------------------------ finding 3: what num_predict really is
+def test_num_predict_is_no_longer_called_the_spoken_cap(brain):
+    """Finding 3. num_predict caps what the model GENERATES in a round;
+    what is SPOKEN is clamped by MAX_SPOKEN_SENTENCES / MAX_SPOKEN_CHARS.
+    The dataclass, the config defaults and the setup doc all said the
+    former was the latter."""
+    import jarvis.assistant_config as ac
+    sources = {
+        "brain.py": Path(brain.__file__).read_text(encoding="utf-8"),
+        "assistant_config.py": Path(ac.__file__).read_text(encoding="utf-8"),
+        "assistant-setup.md": (REPO / "docs" / "assistant-setup.md")
+        .read_text(encoding="utf-8"),
+    }
+    wrong = ("cap on the SPOKEN answer", "spoken answer capped",
+             "how long he is allowed to speak", "cap on the spoken answer")
+    for name, text in sources.items():
+        for phrase in wrong:
+            assert phrase not in text, (name, phrase)
+    assert "MAX_SPOKEN_SENTENCES" in sources["assistant_config.py"]
+    assert "MAX_SPOKEN" in sources["assistant-setup.md"]
+    # the spoken clamp really is elsewhere, and smaller than the budget
+    assert brain.MAX_SPOKEN_SENTENCES == 4
+    assert brain.MAX_SPOKEN_CHARS < brain.SETTINGS.num_predict * 4.1
+
+
+def test_startup_line_says_what_the_budget_is(brain, caplog):
+    brain._SETTINGS_LOGGED.clear()
+    with caplog.at_level("INFO"):
+        brain.log_settings(make_registry())
+    line = [r.message for r in caplog.records if "window" in r.message][0]
+    assert "generation per round capped at" in line
+    assert "speech is clamped separately" in line
+    assert "spoken answer" not in line
+
+
+# ------------------------ finding 4: what the estimate itself costs
+def test_schema_cost_is_computed_once_per_tool_set(brain, monkeypatch):
+    """Finding 4. The per-round json.dumps of messages+tools was MEASURED
+    at 0.055 ms for a 30 KB round on this box (2026-09-04) -- nothing
+    against a 1.3 s turn. The schema half is byte-stable per tool set, so
+    it is dumped once and cached; the messages are walked, not dumped."""
+    import types
+    brain._SCHEMA_TOKENS_CACHE.clear()
+    dumped = []
+    real = json.dumps
+
+    def counting(obj, *a, **k):
+        dumped.append(obj)
+        return real(obj, *a, **k)
+
+    monkeypatch.setattr(brain, "json",
+                        types.SimpleNamespace(dumps=counting, loads=json.loads))
+    tools_a = make_registry().schemas()
+    tools_b = make_registry().schemas()          # equal, not identical
+    msgs = [{"role": "system", "content": "s" * 4000},
+            {"role": "tool", "content": "t" * 9000}]
+    first = brain.estimate_prompt_tokens(msgs, tools_a)
+    second = brain.estimate_prompt_tokens(msgs, tools_b)
+    assert first == second > 0
+    assert len(brain._SCHEMA_TOKENS_CACHE) == 1
+    assert sum(1 for d in dumped if isinstance(d, list)) == 1   # tools once
+    assert not any(d is msgs for d in dumped)                   # never the transcript
+
+
+# -------------------- finding 5: room to REMEMBER, not room to think
+def test_the_docs_sell_the_window_as_memory_not_thought():
+    """Finding 5. Doubling num_ctx buys room to REMEMBER (a long calendar
+    and a long inbox in one turn, more history); thinking is `think`, and
+    it is off. The premise correction stays with it: 1 truncation in
+    5,328 prompts over a week."""
+    doc = (REPO / "docs" / "assistant-setup.md").read_text(encoding="utf-8")
+    assert "how much room he gets to remember in" in doc
+    assert "how much room he gets to think in" not in doc
+    assert "5,328" in doc
+    import jarvis.assistant_config as ac
+    cfg_src = Path(ac.__file__).read_text(encoding="utf-8")
+    assert "ROOM THE LOCAL MODEL GETS TO REMEMBER IN" in cfg_src
+
+
+# ------------------------------------------ the tail-trim, on its own
+def test_fit_material_cuts_the_tail_and_keeps_the_head(brain, monkeypatch):
+    monkeypatch.setattr(brain, "SETTINGS", brain.ModelSettings(num_ctx=2048))
+    head = "Instruction for Jarvis: read this.\n\nDocument:\n"
+    msgs = [{"role": "system", "content": "s" * 2000},
+            {"role": "user", "content": head + "d" * 30000}]
+    cut, est = brain.fit_material(msgs, None, num_predict=100)
+    assert cut > 0
+    assert est <= brain.SETTINGS.ceiling_for(100)
+    assert msgs[1]["content"].startswith(head)
+    assert msgs[1]["content"].endswith(brain.MATERIAL_CUT_TEXT)
+    # a second pass finds it fits and changes nothing
+    again = msgs[1]["content"]
+    assert brain.fit_material(msgs, None, num_predict=100)[0] == 0
+    assert msgs[1]["content"] == again
+
+
+def test_fit_material_respects_the_switch_and_a_missing_user_turn(
+        brain, monkeypatch, caplog):
+    monkeypatch.setattr(brain, "SETTINGS",
+                        brain.ModelSettings(num_ctx=2048,
+                                            protect_question=False))
+    msgs = [{"role": "user", "content": "x" * 40000}]
+    assert brain.fit_material(msgs)[0] == 0
+    assert len(msgs[0]["content"]) == 40000
+    monkeypatch.setattr(brain, "SETTINGS", brain.ModelSettings(num_ctx=2048))
+    only_system = [{"role": "system", "content": "s" * 40000}]
+    with caplog.at_level("WARNING"):
+        assert brain.fit_material(only_system, label="json")[0] == 0
+    assert any("no material to trim" in r.message for r in caplog.records)
+
+
+def test_the_ceiling_follows_the_request_s_own_num_predict(brain):
+    s = brain.ModelSettings(num_ctx=16384, num_predict=160,
+                            answer_reserve_tokens=128)
+    assert s.ceiling_for(None) == s.prompt_ceiling == 16096
+    assert s.ceiling_for(1) == 16255          # a warm-up
+    assert s.ceiling_for(420) == 15836        # explain_text
+    assert s.ceiling_for("junk") == 16096     # falls back, never raises
