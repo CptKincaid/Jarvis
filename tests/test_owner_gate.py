@@ -17,13 +17,20 @@ FAKE_PHRASE = "xxx-not-a-real-phrase-xxx"
 FAKE_CODE = "xxx000"
 
 
-def _registry(tmp_path, *, phrase=False, code=False, known=False):
+def _registry(tmp_path, *, phrase=False, code=True, known=False):
+    # code=True BY DEFAULT since the enforce guard landed: gate._mode_unsafe
+    # downgrades enforce to shadow when no owner carries an override code,
+    # because a wrong verdict would then have no way back in. A fixture
+    # without one is not an enforcing gate, so every test that means to
+    # enforce needs it. tests/test_signin.py pins the guard itself.
     r = Registry(path=tmp_path / "people.json")
     r.add_person(Person(label="hunter", name="Hunter", role=ROLE_OWNER,
-                        voice=True))
+                        voice=True, honorific="sir"))
     if known:
         r.add_person(Person(label="heather", name="Heather", role=ROLE_KNOWN,
-                            face="heather", consent="typed"))
+                            first="Heather", last="Vance",
+                            honorific="ma'am", face="heather",
+                            consent="typed"))
     if phrase:
         r.set_secret("hunter", "phrase_hash",
                      pp.hash_secret(pp.normalise_spoken(FAKE_PHRASE)))
@@ -384,8 +391,9 @@ def test_burning_the_passphrase_leaves_the_break_glass_open(tmp_path):
 
 
 def test_a_registry_with_no_code_set_is_not_a_way_in(tmp_path):
-    assert gt.check_override_code(_registry(tmp_path), "")[0] == ""
-    assert gt.check_override_code(_registry(tmp_path), FAKE_CODE)[0] == ""
+    assert gt.check_override_code(_registry(tmp_path, code=False), "")[0] == ""
+    assert gt.check_override_code(_registry(tmp_path, code=False),
+                                  FAKE_CODE)[0] == ""
 
 
 # ------------------------------------------------------------- no leaks

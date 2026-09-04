@@ -665,6 +665,74 @@ REGISTER_CLAUSES = {
 }
 _REGISTER = {"name": DEFAULT_REGISTER}
 
+# ----------------------------------------------------------------------
+# Who is being spoken to — the prompt half of the honorific
+# ----------------------------------------------------------------------
+# BELT TO THE SWAP'S BRACES, and the swap is the authority. Every spoken
+# line, model-generated or authored, goes through
+# ``address.swap_addresses`` at ``app._say`` and ``commander._speak``, so
+# a model that keeps generating "sir" is already corrected. This exists so
+# it does not have to generate it in the first place -- and so the prompt
+# does not tell the model, in front of Mara, to call her "he".
+#
+# THE OWNER PATH RETURNS THE EXISTING STRINGS VERBATIM. Not templated, not
+# rebuilt, not re-rendered: the frozen literals, so gemma4's behaviour for
+# Hunter is bit-identical to the day before this landed and the tuned
+# prompt cannot drift.
+_ADDRESSEE = {"name": "", "honorific": "sir"}
+
+# The clause that rides in the {register} slot -- which sits immediately in
+# front of "Now answer Hunter as Jarvis... and call him sir", so the
+# correction lands next to the thing it is correcting.
+ADDRESSEE_CLAUSE = (
+    "You are speaking to {name}, who is not Hunter. Wherever the rules "
+    "above say \"he\", \"him\" or \"Hunter\", they mean {name} for this "
+    "reply. {address}\n\n")
+ADDRESS_WITH_HONORIFIC = ("Call them \"{honorific}\" most of the time and "
+                          "\"{name}\" now and then.")
+ADDRESS_BY_NAME_ONLY = ("Call them \"{name}\" now and then, and use no "
+                        "other form of address.")
+
+
+def set_addressee(name: str = "", honorific: str = "sir") -> None:
+    """WHO the next prompt is written for. Empty name = Hunter.
+
+    Called from ``JarvisApp._gate_admits`` with what the owner gate
+    attributed the turn to. Module state, exactly like ``set_register``,
+    because the prompt builders are module functions with no config of
+    their own.
+    """
+    _ADDRESSEE["name"] = str(name or "")
+    _ADDRESSEE["honorific"] = str(honorific if honorific is not None else "sir")
+
+
+def addressee() -> tuple:
+    """``(display name, honorific)``. ``("", "sir")`` means the owner."""
+    return _ADDRESSEE["name"], _ADDRESSEE["honorific"]
+
+
+def is_owner_addressee() -> bool:
+    """True when the prompt should be the frozen owner one, byte for byte."""
+    return not _ADDRESSEE["name"]
+
+
+def addressee_clause(name: str = "", honorific: str = "sir") -> str:
+    """The clause for a NON-OWNER addressee, or "" for the owner.
+
+    "" for the owner is the whole point: an empty string rendered into
+    ``{register}`` leaves the prompt exactly as it was.
+    """
+    if not name:
+        return ""
+    if honorific:
+        address = ADDRESS_WITH_HONORIFIC.format(honorific=honorific,
+                                                name=name)
+    else:
+        # A person who chose no form of address. The prompt says so
+        # explicitly rather than leaving the model to fall back on "sir".
+        address = ADDRESS_BY_NAME_ONLY.format(name=name)
+    return ADDRESSEE_CLAUSE.format(name=name, address=address)
+
 
 def register() -> str:
     """The register in force for this process ("normal" until set)."""
@@ -829,8 +897,12 @@ def build_ollama_system(context_text="", memory_text="", shots=None,
     name = register if register in REGISTERS else _REGISTER["name"]
     if shots is None:
         shots = select_few_shots(register=name)
-    return JARVIS_SYSTEM.format(examples=format_few_shots(shots),
-                                register=REGISTER_CLAUSES.get(name, ""))
+    who, hon = addressee()
+    # THE OWNER PATH IS THE UNTOUCHED ONE: addressee_clause returns "" and
+    # the render is character for character the one that shipped.
+    return JARVIS_SYSTEM.format(
+        examples=format_few_shots(shots),
+        register=REGISTER_CLAUSES.get(name, "") + addressee_clause(who, hon))
 
 
 def build_user_turn(context_text="", memory_text="", text=""):

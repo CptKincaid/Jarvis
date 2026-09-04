@@ -266,7 +266,7 @@ class JarvisAgent:
             ("shell", "nvidia-smi --query-gpu=name,memory.used,utilization.gpu --format=csv"),
             ("shell", "df -h / /storage 2>/dev/null"),
             ("shell", "uptime"),
-            ("speak", "Good morning sir. Systems are online. GPU and storage look healthy."),
+            ("speak", "Good morning, sir. Systems are online. GPU and storage look healthy."),
         ],
         "training check": [
             ("shell", "nvidia-smi --query-gpu=utilization.gpu,memory.used,temperature.gpu --format=csv"),
@@ -416,7 +416,7 @@ class JarvisAgent:
         if hour < 6:
             return "Burning the midnight oil, sir?"
         elif hour < 12:
-            return "Good morning sir. All systems are online."
+            return "Good morning, sir. All systems are online."
         elif hour < 17:
             return "Good afternoon sir."
         elif hour < 21:

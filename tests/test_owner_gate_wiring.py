@@ -36,16 +36,22 @@ class FakeTranscriber:
 
 
 def _stand_in(tmp_path, *, mode="enforce", phrase=False, said="hello there",
-              known=False):
+              known=False, code=True):
     reg = Registry(path=tmp_path / "people.json")
     reg.add_person(Person(label="hunter", name="Hunter", role=ROLE_OWNER,
-                          voice=True))
+                          voice=True, honorific="sir"))
     if known:
         reg.add_person(Person(label="heather", name="Heather", role=ROLE_KNOWN,
-                              face="heather", consent="typed"))
+                              first="Heather", last="Vance",
+                              honorific="ma'am", face="heather",
+                              consent="typed"))
     if phrase:
         reg.set_secret("hunter", "phrase_hash",
                        pp.hash_secret(pp.normalise_spoken(FAKE_PHRASE)))
+    if code:
+        # See tests/test_owner_gate.py::_registry -- enforce without an
+        # override code is downgraded to shadow by the lockout guard.
+        reg.set_secret("hunter", "code_hash", pp.hash_secret("xxx000code"))
     reg.save()
     opts = {"owner.mode": mode, "camera.identity": False}
     a = SimpleNamespace()
@@ -57,6 +63,8 @@ def _stand_in(tmp_path, *, mode="enforce", phrase=False, said="hello there",
     a._last_guest_ts = -1e9
     a._followup_after_speech = False
     a._gate_who = a._gate_how = ""
+    a._gate_who_ts = -1e9
+    a.assistant = SimpleNamespace(get=lambda k, d=None: "Hunter")
     a.transcriber = FakeTranscriber(said)
     a.turns = SimpleNamespace(abandon=a.abandoned.append)
     a.get_option = lambda k, d=None: opts.get(k, d)
@@ -69,6 +77,11 @@ def _stand_in(tmp_path, *, mode="enforce", phrase=False, said="hello there",
     a._gate_rescue_inner = app_mod.JarvisApp._gate_rescue_inner.__get__(a)
     a._gate_admits = app_mod.JarvisApp._gate_admits.__get__(a)
     a._owner_has_phrase = app_mod.JarvisApp._owner_has_phrase.__get__(a)
+    # The honorific plumbing: _gate_admits names the addressee to the
+    # prompt builder on every judged turn (jarvis/brain.set_addressee).
+    a._tell_the_model_who_is_here = \
+        app_mod.JarvisApp._tell_the_model_who_is_here.__get__(a)
+    a._honorific = app_mod.JarvisApp._honorific.__get__(a)
     a.gate = gate_mod.OwnerGate(registry=reg, owner="hunter",
                                 get_option=a.get_option)
     return a

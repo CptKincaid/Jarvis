@@ -28,6 +28,20 @@ THE ONE RULE THIS FILE ENFORCES IN CODE RATHER THAN IN A COMMENT
     accident: ``add_person`` and ``set_role`` refuse to mint an owner unless
     the caller names the existing owner it means to stand beside.
 
+HOW SOMEBODY IS ADDRESSED IS STORED, TYPED, AND NEVER INFERRED
+    ``Person.honorific`` is one of exactly ``"sir"``, ``"ma'am"`` or ``""``
+    and ``scripts/jarvis_people.py add`` REQUIRES it with no default. There
+    is no name list in this repo, no gender table and no code path that
+    reads a name and produces one: Mara and Heather are addressed as
+    "ma'am" because Hunter typed ``--honorific maam``, and for no other
+    reason. An unknown stored value reads back as "" -- no form of address
+    -- never as a guess, and a FORMAT-1 row (which has no such key) lands
+    in the same place rather than silently acquiring "sir".
+
+    The line itself is swapped at the door, in ``address.swap_addresses``,
+    called from ``app._say`` and ``commander._speak``. None of the ~1,000
+    "sir" literals in this tree is edited.
+
 AND THE ONE THAT KEEPS IT FROM BECOMING A BRICK
     ``Registry.load`` NEVER RAISES. Missing, unparsable, wrong-shaped,
     unreadable, or holding no owner at all -- every one of those comes back
@@ -70,8 +84,41 @@ RANK = {ROLE_UNKNOWN: 0, ROLE_KNOWN: 1, ROLE_OWNER: 2}
 # exists and the face leg silently stops naming anyone.
 LABEL_RX = re.compile(r"^[a-z0-9][a-z0-9_-]{0,30}$")
 
-FORMAT = 1
+# FORMAT 2 added ``first``, ``last`` and ``honorific``. A FORMAT-1 row
+# carries none of those keys, so ``Person.from_json`` reads it as
+# honorific="" -- NO form of address rather than a guessed one. That is the
+# whole reason the bump is here: an old row must not silently acquire "sir".
+FORMAT = 2
 DEFAULT_OWNER = "hunter"
+
+# THE ONLY THREE FORMS OF ADDRESS, and the empty one is a real choice.
+# There is no fourth, there is no default, and there is NO CODE PATH
+# ANYWHERE that reads a name and produces one of these. Hunter is "sir"
+# because he typed it; Mara and Heather are "ma'am" because he typed that.
+# A name list, a gender table or a "guess and let them correct it" is the
+# one thing this feature must never do -- it would be wrong in front of a
+# real person standing in his kitchen.
+HON_SIR = "sir"
+HON_MAAM = "ma'am"
+HON_NONE = ""
+HONORIFICS = (HON_SIR, HON_MAAM, HON_NONE)
+
+# What the shell is allowed to type, mapped to what is stored. "maam" and
+# "none" exist so an apostrophe never has to survive a quoting mistake.
+HONORIFIC_WORDS = {"sir": HON_SIR, "maam": HON_MAAM, "ma'am": HON_MAAM,
+                   "ma\u2019am": HON_MAAM, "none": HON_NONE, "": HON_NONE}
+
+
+def honorific_from_word(word) -> Tuple[str, str]:
+    """``(value, why)`` for a typed choice. NEVER guesses from a name."""
+    try:
+        key = str(word or "").strip().lower()
+    except Exception:  # noqa: BLE001 - a choice that cannot be read is none
+        return "", "that is not a form of address I know"
+    if key not in HONORIFIC_WORDS:
+        return "", ("%r is not a form of address; choose sir, maam, or none"
+                    % (word,))
+    return HONORIFIC_WORDS[key], ""
 
 
 def slug(name) -> str:
@@ -141,6 +188,13 @@ class Person:
 
     label: str
     name: str = ""
+    # The two halves of the spoken sign-in. They are NOT a credential --
+    # see jarvis/signin.py -- they only narrow who Jarvis thinks he is
+    # hearing so a confirming leg has something to confirm.
+    first: str = ""
+    last: str = ""
+    # "sir", "ma'am" or "" -- typed by the owner, never inferred.
+    honorific: str = ""
     role: str = ROLE_KNOWN
     voice: bool = False
     face: str = ""
@@ -154,12 +208,19 @@ class Person:
     consent: str = ""
 
     def display(self) -> str:
-        return self.name or self.label.capitalize()
+        full = ("%s %s" % (self.first, self.last)).strip()
+        return self.name or full or self.label.capitalize()
+
+    def full_name(self) -> str:
+        """First and last, or "" when they were never typed."""
+        return ("%s %s" % (self.first, self.last)).strip()
 
     def redacted(self) -> dict:
         """Everything about this person EXCEPT the two hashes, which are
         replaced by a bare yes/no. Safe for a log, a report, or the pane."""
-        return {"label": self.label, "name": self.name, "role": self.role,
+        return {"label": self.label, "name": self.name,
+                "first": self.first, "last": self.last,
+                "honorific": self.honorific, "role": self.role,
                 "voice": bool(self.voice), "face": self.face,
                 "face_dim": int(self.face_dim),
                 "has_phrase": bool(self.phrase_hash),
@@ -199,7 +260,17 @@ class Person:
             dim = int(row.get("face_dim", 0) or 0)
         except (TypeError, ValueError):
             dim = 0
+        # A value this build does not know is NOT a guess and NOT a
+        # crash: it is no form of address at all. A FORMAT-1 row has no
+        # key here and lands in exactly the same place.
+        hon = str(row.get("honorific", "") or "")
+        if hon not in HONORIFICS:
+            log.warning("registry: %r is not a form of address I store; "
+                        "%s will be addressed by name only", hon, label)
+            hon = HON_NONE
         return cls(label=label, name=str(row.get("name", "") or ""),
+                   first=str(row.get("first", "") or ""),
+                   last=str(row.get("last", "") or ""), honorific=hon,
                    role=role, voice=bool(row.get("voice", False)),
                    face=str(row.get("face", "") or ""), face_dim=dim,
                    phrase_hash=str(row.get("phrase_hash", "") or ""),
@@ -334,6 +405,23 @@ class Registry:
         if person.role not in ROLES:
             return False, "%r is not a role; it is %s or %s" % (
                 person.role, ROLE_OWNER, ROLE_KNOWN)
+        if person.honorific not in HONORIFICS:
+            # Not coerced. A row created with a value nobody typed is a row
+            # whose form of address was invented, which is the one thing
+            # this feature refuses to do.
+            return False, ("%r is not a form of address; it is sir, ma'am, "
+                           "or none, and it is never inferred from a name"
+                           % (person.honorific,))
+        if person.voice and person.role != ROLE_OWNER:
+            # THE INVARIANT THAT STOPS THE VOICE LEG NAMING THE WRONG
+            # PERSON. jarvis/speaker.py holds ONE voiceprint and ONE
+            # centroid and has no notion of a label at all, so "matched"
+            # can only ever mean the owner. A second row marked
+            # voice-enrolled would make every match come back as them.
+            return False, ("only the owner can be voice-enrolled: there is "
+                           "one voiceprint on this machine, and marking a "
+                           "second person voice-enrolled would make the "
+                           "voice leg name the wrong person")
         if self.person(person.label) is not None:
             return False, "%s is already enrolled" % person.label
         existing = self.owners()
@@ -371,6 +459,29 @@ class Registry:
             return False, ("%s is the only owner; demoting them would leave "
                            "nobody who can enrol anyone" % label)
         p.role = role
+        return True, ""
+
+    def set_honorific(self, label, value, *, by: str = "") -> Tuple[bool, str]:
+        """How this person is addressed. OWNER-ONLY, on the same ``(ok, why)``
+        contract as every other writer here.
+
+        ``by`` is the label of whoever is asking. Empty means the caller has
+        already authorised itself (``scripts/jarvis_people.py._authorise``,
+        which is the keyboard/SSH path and the only one there is); a NAMED
+        caller must be an owner. There is deliberately no spoken path to
+        this and no socket command for it.
+        """
+        if by and not self.may_administer(by):
+            return False, ("only the owner can change how somebody is "
+                           "addressed")
+        if value not in HONORIFICS:
+            return False, ("%r is not a form of address; it is sir, ma'am, "
+                           "or none. Ask the person which they want."
+                           % (value,))
+        p = self.person(label)
+        if p is None:
+            return False, "%s is not enrolled" % label
+        p.honorific = value
         return True, ""
 
     def forget(self, label) -> Tuple[bool, str]:

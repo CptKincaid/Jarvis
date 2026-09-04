@@ -71,6 +71,7 @@ from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
 from jarvis import earcons
 from jarvis import gate as gate_mod
+from jarvis import honorific as honorific_mod
 from jarvis import identity as identity_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
@@ -912,6 +913,75 @@ class JarvisApp:
             log.exception("address thinning failed; speaking as written")
             return list(fragments)
 
+    def _tell_the_model_who_is_here(self, who: str) -> None:
+        """Name the addressee to the prompt builder, or clear it.
+
+        BELT TO THE SWAP'S BRACES. The swap at ``_say`` is the authority
+        and would correct a "sir" gemma4 generated anyway; this stops it
+        being generated, and stops the prompt telling the model to call a
+        woman "he". Anything that is not a KNOWN non-owner clears the
+        addressee, which restores the frozen owner prompt byte for byte.
+        """
+        try:
+            gate = getattr(self, "gate", None)
+            owner = identity_mod.owner_label(self.assistant)
+            person = (honorific_mod.known_person(gate.registry, who)
+                      if gate is not None else None)
+            if person is None or who == owner or person.role == \
+                    identity_mod.ROLE_OWNER:
+                brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
+                return
+            brain_mod.set_addressee(person.display(), person.honorific)
+        except Exception:                          # noqa: BLE001 - never fatal
+            log.exception("honorific: the addressee could not be named to "
+                          "the model; using the owner prompt")
+            try:
+                brain_mod.set_addressee("", honorific_mod.SIR_DEFAULT)
+            except Exception:                      # noqa: BLE001
+                pass
+
+    def _honorific(self) -> str:
+        """"sir", "ma'am" or "" for WHOEVER THE NEXT LINE IS AIMED AT.
+
+        Resolved from the gate's own attribution and the stored, typed
+        value on that person's row -- never from a name, never from a
+        guess. Falls back to "sir" whenever there is no registry, no
+        attribution, or a stale one, which is the state the live app is in
+        today: with no people.json the answer is "sir" on every line and
+        the swap below is a no-op.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return honorific_mod.SIR_DEFAULT
+        try:
+            return honorific_mod.for_addressee(
+                gate.registry, lambda: self._gate_who,
+                lambda: self._gate_who_ts,
+                identity_mod.owner_label(self.assistant), time.monotonic())
+        except Exception:                          # noqa: BLE001 - never fatal
+            log.exception("honorific: could not be resolved; using sir")
+            return honorific_mod.SIR_DEFAULT
+
+    def _address_for_addressee(self, text):
+        """The line as the CURRENT ADDRESSEE should hear it.
+
+        THE ONE PLACE THE FORM OF ADDRESS CHANGES on the spoken path. The
+        ~1,000 "sir" literals in this tree are authored as written and
+        rewritten here; not one of them is edited. For the owner
+        ``swap_addresses`` returns the input object unchanged, so his line
+        is byte-identical and nothing about his voice can regress through
+        this door.
+
+        Guarded exactly as _thin_fragments is: a failure here speaks the
+        line as written, because a wrong courtesy is a far smaller bug than
+        a lost sentence.
+        """
+        try:
+            return address_mod.swap_addresses(text, self._honorific())
+        except Exception:                          # noqa: BLE001
+            log.exception("honorific: the swap failed; speaking as written")
+            return text
+
     def _say(self, text, proactive=False, kind="message"):
         """The one door to TTS. ``proactive=True`` marks a line Jarvis
         decided to say on his own (watchdog, reminder, heads-up, narrator);
@@ -954,7 +1024,7 @@ class JarvisApp:
         # Claude session ack -- got "Checking right now, sir. One moment."
         # on top of an answer the user had already heard.
         self._note_spoke()
-        self.tts.speak(text)
+        self.tts.speak(self._address_for_addressee(text))
 
     def _async_reply(self, text, speak=True):
         """A Tier 1 handler's answer arriving from its worker thread (an
@@ -1260,6 +1330,11 @@ class JarvisApp:
             # ("...and a memory warning") instead of waking him at 3 am.
             speak=lambda text, proactive=True, kind="warning": self._say(
                 text, proactive=proactive, kind=kind),
+            # "sir", "ma'am" or "" for whoever is being addressed right now.
+            # A CALLABLE, resolved at speak time: commander._speak bypasses
+            # _say, and a value captured at build time would be the owner's
+            # for the life of the process.
+            honorific=self._honorific,
             # a Tier 1 worker thread's answer (explain, quiz): see _async_reply
             reply=self._async_reply,
             # docs.make_tools parks its DocsIndex here for quiz mode
@@ -3201,6 +3276,11 @@ class JarvisApp:
         # "the face leg named Heather while the voice leg abstained" is.
         self._gate_who = ""
         self._gate_how = ""
+        # WHEN that attribution was made (monotonic). The honorific resolver
+        # will not use an attribution older than honorific.ADDRESSEE_TTL:
+        # one turn in which the camera named Mara must not make tonight's
+        # reminder and tomorrow's briefing come out addressed to her.
+        self._gate_who_ts = -1e9
         self._canvas_due_cache = (-1e9, [])   # monotonic; see _last_nudge_ts
         self._room_gpu_cache = (-1e9, None)   # ditto: the ambient GPU reading
         # The ambient slab's one outbound dependency, on a backoff
@@ -3266,14 +3346,20 @@ class JarvisApp:
         the sentence rather than left to work it out from being refused.
         """
         try:
-            from jarvis.facegallery import EMBED_DIM
+            # THE LIVE WIDTH, not facegallery.EMBED_DIM. That constant is
+            # MODEL_DIMS[SFACE_MODEL] = 128 and it did not move when the
+            # backend became arcface_mbf (512-D), so an honest 512-D row was
+            # being reported as stale against a number no longer in use --
+            # the sentence said "re-enrol" to a man whose enrolment was fine.
+            from jarvis.facemodels import backend_for
+            width = int(backend_for(None).embed_dim)
             enrolled = [p for p in self.gate.registry.people if p.face]
             stale = [p for p in enrolled if p.face_dim and
-                     p.face_dim != EMBED_DIM]
+                     p.face_dim != width]
             if stale:
                 return ("the gallery is %d-D and %s was enrolled at %d-D; "
                         "re-enrol to bring the face leg back"
-                        % (EMBED_DIM, stale[0].label, stale[0].face_dim))
+                        % (width, stale[0].label, stale[0].face_dim))
             if not enrolled:
                 return "no face is enrolled in the registry"
             if not self.get_option("camera.identity", False):
@@ -4770,7 +4856,15 @@ class JarvisApp:
             log.exception("owner-gate: judging failed; the turn stands")
             return True
         self._gate_who, self._gate_how = d.who, d.how
+        self._gate_who_ts = time.monotonic()
+        self._tell_the_model_who_is_here(d.who)
         if d.admit:
+            if d.line:
+                # The sign-in welcome. Only ever set on an admitted turn
+                # where a name was CONFIRMED by a leg, and rate-limited
+                # inside the gate, so this cannot become a preamble on
+                # every sentence.
+                self._say(d.line)
             return True
         self.turns.abandon("gate:%s" % (d.role or "unknown"))
         self._refuse_politely(d.line)

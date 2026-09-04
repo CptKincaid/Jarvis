@@ -9039,9 +9039,34 @@ class Commander:
         if tts is None:
             return
         try:
-            tts.speak(text)
+            tts.speak(self._for_addressee(text))
         except Exception:
             log.exception("tts speak failed")
+
+    def _for_addressee(self, text: str) -> str:
+        """The line as WHOEVER IS BEING ADDRESSED should hear it.
+
+        The second and last call site of ``address.swap_addresses``.
+        ``_speak`` is the one path that bypasses ``JarvisApp._say``, so
+        without this a compound answer would still say "sir" to a woman
+        while every other line had been swapped.
+
+        ``services.honorific`` is a CALLABLE resolved at speak time; a
+        value captured at build time would be the owner's for the life of
+        the process. Absent (an old stand-in, a test namespace) means the
+        owner, which returns the input object unchanged.
+
+        ``jarvis/reader.py`` is deliberately NOT wired: it reads documents
+        aloud, its words are not Jarvis's, and rewriting a word inside
+        somebody's file is the one thing this pass must never do.
+        """
+        try:
+            fn = self._svc("honorific")
+            value = fn() if callable(fn) else address.SIR
+            return address.swap_addresses(text, value)
+        except Exception:
+            log.exception("honorific: the swap failed; speaking as written")
+            return text
 
     # None = speak now; a list = a compound is running, park the lines
     # (see _speak / _try_multi).
