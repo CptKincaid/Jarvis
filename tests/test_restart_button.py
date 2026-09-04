@@ -169,3 +169,225 @@ def test_running_commit_is_read_from_the_repo_with_the_same_helper(repo):
     path, heads = repo
     assert app_mod.running_commit(repo=path, git=real_git) == heads[2]
     assert app_mod.running_commit(repo=path / "nope", git=real_git) == ""
+
+
+# =====================================================================
+# Part 2 -- the drawer: Services fields, the two-press arm, the wiring.
+# Tk-free the way tests/test_ui_chrome.py builds views: the drawer is made
+# with __new__ over fakes for the two widgets it touches and for after().
+# =====================================================================
+import threading  # noqa: E402
+from dataclasses import fields  # noqa: E402
+from types import SimpleNamespace  # noqa: E402
+
+from jarvis import relaunch  # noqa: E402
+from jarvis.ui.main_window import Services  # noqa: E402
+from jarvis.ui import views as views_mod  # noqa: E402
+from jarvis.ui.views import RESTART_ARM_MS, RestartArm, SettingsDrawer  # noqa: E402
+
+
+def test_services_declare_restart_and_code_status_unwired_by_default():
+    names = {f.name for f in fields(Services)}
+    assert {"restart", "code_status"} <= names
+    svc = Services()
+    assert svc.restart is None and svc.code_status is None
+
+
+def test_the_drawer_formats_with_the_same_function_the_app_exports():
+    assert views_mod.format_code_status is relaunch.format_code_status
+    assert app_mod.format_code_status is relaunch.format_code_status
+
+
+# ------------------------------------------------------------ RestartArm
+class _Clock:
+    def __init__(self):
+        self.t = 100.0
+
+    def __call__(self):
+        return self.t
+
+
+def test_first_press_arms_second_press_within_the_window_fires():
+    clock = _Clock()
+    arm = RestartArm(window_s=5.0, clock=clock)
+    assert arm.armed is False and arm.label == "Restart Jarvis"
+    assert arm.press() == "armed"
+    assert arm.armed is True and arm.label == "Press again to restart"
+    clock.t += 4.9
+    assert arm.press() == "fire"
+    assert arm.armed is False and arm.label == "Restart Jarvis"
+
+
+def test_a_press_after_the_window_re_arms_instead_of_firing():
+    """Belt and braces with the Tk timer: even if after() has not run
+    yet, a press 5.1 s later is a first press again, never a restart."""
+    clock = _Clock()
+    arm = RestartArm(window_s=5.0, clock=clock)
+    arm.press()
+    clock.t += 5.1
+    assert arm.armed is False
+    assert arm.press() == "armed"
+    clock.t += 1.0
+    assert arm.press() == "fire"
+
+
+def test_expire_disarms():
+    arm = RestartArm(window_s=5.0, clock=_Clock())
+    arm.press()
+    arm.expire()
+    assert arm.armed is False
+    assert arm.press() == "armed"
+
+
+def test_the_arm_window_matches_the_tk_timer():
+    assert RESTART_ARM_MS == 5000
+    assert RestartArm().window_s == 5.0
+
+
+# --------------------------------------------------------- drawer wiring
+class _FakeButton:
+    def __init__(self):
+        self.texts = []
+
+    def set_text(self, text):
+        self.texts.append(text)
+
+
+class _FakeLabel:
+    def __init__(self):
+        self.texts = []
+
+    def configure(self, **kw):
+        if "text" in kw:
+            self.texts.append(kw["text"])
+
+
+class _FakeToast:
+    def __init__(self):
+        self.shown = []
+
+    def show(self, text, kind="info", ms=1800):
+        self.shown.append((text, kind))
+
+
+def _drawer(services, clock=None):
+    d = SettingsDrawer.__new__(SettingsDrawer)       # no tk.Frame.__init__
+    d.services = services
+    d.toast = _FakeToast()
+    d.after_calls = []
+    d.cancelled = []
+    d.after = lambda ms, fn: d.after_calls.append((ms, fn)) or f"job{len(d.after_calls)}"
+    d.after_cancel = lambda job: d.cancelled.append(job)
+    d._restart_arm = RestartArm(RESTART_ARM_MS / 1000.0,
+                                clock=clock or _Clock())
+    d._restart_job = None
+    d._restart_btn = _FakeButton()
+    d._code_status_lbl = _FakeLabel()
+    return d
+
+
+def test_one_press_arms_the_button_and_schedules_the_disarm_never_restarts():
+    fired = []
+    d = _drawer(SimpleNamespace(restart=lambda: fired.append(1)))
+    d._restart_pressed()
+    assert d._restart_btn.texts == ["Press again to restart"]
+    assert d.after_calls == [(5000, d._restart_expired)]
+    assert fired == []
+    assert d.toast.shown == []
+
+
+def test_the_timer_puts_the_label_back_and_the_next_press_only_arms():
+    fired = []
+    d = _drawer(SimpleNamespace(restart=lambda: fired.append(1)))
+    d._restart_pressed()
+    d._restart_expired()                        # what after() runs at 5 s
+    assert d._restart_btn.texts[-1] == "Restart Jarvis"
+    d._restart_pressed()
+    assert d._restart_btn.texts[-1] == "Press again to restart"
+    assert fired == []
+
+
+def test_the_second_press_calls_the_restart_service_off_the_tk_thread():
+    done = threading.Event()
+    threads = []
+
+    def restart():
+        threads.append(threading.current_thread().name)
+        done.set()
+    d = _drawer(SimpleNamespace(restart=restart))
+    d._restart_pressed()
+    d._restart_pressed()
+    assert done.wait(2.0), "restart service never ran"
+    assert threads and threads[0] != threading.main_thread().name
+    # the arm is spent, the timer cancelled, the label back, and he was told
+    assert d.cancelled == ["job1"]
+    assert d._restart_btn.texts[-1] == "Restart Jarvis"
+    assert d.toast.shown and d.toast.shown[-1][0].startswith("Restarting")
+
+
+def test_without_a_restart_service_the_toast_says_not_wired():
+    d = _drawer(SimpleNamespace())                # no .restart attribute
+    d._restart_pressed()
+    d._restart_pressed()
+    assert d.toast.shown == [("Restart not wired", "warn")]
+    d = _drawer(None)
+    d._restart_pressed()
+    d._restart_pressed()
+    assert d.toast.shown == [("Restart not wired", "warn")]
+
+
+def test_a_failing_restart_service_is_logged_not_raised():
+    done = threading.Event()
+
+    def restart():
+        done.set()
+        raise RuntimeError("boom")
+    d = _drawer(SimpleNamespace(restart=restart))
+    d._restart_pressed()
+    d._restart_pressed()
+    assert done.wait(2.0)
+
+
+def test_code_status_text_reads_the_service_and_degrades_to_unknown():
+    d = _drawer(SimpleNamespace(code_status=lambda: {
+        "running": "ac934b0", "disk": "7539478", "behind": 2, "dirty": False}))
+    assert d._code_status_text() == \
+        "Running ac934b0, on disk 7539478 (2 commits behind)"
+    assert _drawer(SimpleNamespace())._code_status_text() == "Running unknown"
+    assert _drawer(None)._code_status_text() == "Running unknown"
+
+    def broken():
+        raise RuntimeError("git exploded")
+    assert _drawer(SimpleNamespace(code_status=broken))._code_status_text() == \
+        "Running unknown"
+
+
+def test_open_refreshes_the_code_status_line_so_it_is_current_when_he_looks():
+    answers = [{"running": "a", "disk": "a", "behind": 0, "dirty": False},
+               {"running": "a", "disk": "b", "behind": 3, "dirty": True}]
+    d = _drawer(SimpleNamespace(code_status=lambda: answers.pop(0)))
+    for name in ("_refresh_privacy", "lift", "focus_set"):
+        setattr(d, name, lambda *a, **k: None)
+    d.place = lambda *a, **k: None
+    d._slide = lambda *a, **k: None
+    d.host = None
+    d._x = 0
+    d.WIDTH = 320
+    d._open = False
+    d.open()
+    assert d._code_status_lbl.texts == ["Running a, on disk a (up to date)"]
+    d._open = False
+    d.open()
+    assert d._code_status_lbl.texts[-1] == \
+        "Running a, on disk b (3 commits behind), uncommitted changes"
+
+
+def test_the_system_section_builds_the_status_row_and_the_button():
+    """The wiring, not the widgets: _build_sections must put the status
+    line and the arming button in System, through the row helpers every
+    other section uses. Read from the source so no Tk root is made."""
+    import inspect
+    src = inspect.getsource(SettingsDrawer._build_sections)
+    sys_at = src.index('self._section("System")')
+    assert "_code_status_lbl = self._info_row(" in src[sys_at:]
+    assert "self._restart_row(box)" in src[sys_at:]

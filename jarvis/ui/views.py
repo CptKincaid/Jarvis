@@ -33,6 +33,7 @@ from jarvis.handstage import OPTION_ENABLED as GESTURE_OPTION
 from jarvis.config import CONFIG, MACHINE, PATHS
 from jarvis.events import UserUtterance, bus
 from jarvis.logs import get_logger
+from jarvis.relaunch import format_code_status
 from jarvis.ui import theme
 from jarvis.ui.widgets import (BarGradient, Card, RoundButton, Toast, Toggle,
                                Tooltip, chamfer_rect, frame_rect, measure, px,
@@ -1935,6 +1936,50 @@ class CommandBar(tk.Frame):
 
 
 # ---------------------------------------------------------- SettingsDrawer
+RESTART_ARM_MS = 5000          # the second press must land within this
+
+
+class RestartArm:
+    """The Restart button's two-press state, Tk-free (tests drive it with a
+    fake clock). First press ARMS -- the label becomes "Press again to
+    restart" -- and a second press inside the window FIRES; the window is
+    kept by the clock as well as by the drawer's after() timer, so a press
+    that lands after the timer was due but before Tk ran it is a first
+    press again, never a restart. One press can never restart him: the
+    button sits two rows under "Continuous listen" in a scrolling drawer,
+    and a mis-tap there costs him ~40 s of Jarvis."""
+
+    LABEL_IDLE = "Restart Jarvis"
+    LABEL_ARMED = "Press again to restart"
+
+    def __init__(self, window_s: float = RESTART_ARM_MS / 1000.0,
+                 clock: Callable[[], float] = time.monotonic):
+        self.window_s = float(window_s)
+        self.clock = clock
+        self._armed_at: Optional[float] = None
+
+    @property
+    def armed(self) -> bool:
+        return self._armed_at is not None and \
+            (self.clock() - self._armed_at) < self.window_s
+
+    @property
+    def label(self) -> str:
+        return self.LABEL_ARMED if self.armed else self.LABEL_IDLE
+
+    def press(self) -> str:
+        """"armed" on a first press (or one after the window), "fire" on
+        the second press inside it; firing disarms."""
+        if self.armed:
+            self._armed_at = None
+            return "fire"
+        self._armed_at = self.clock()
+        return "armed"
+
+    def expire(self) -> None:
+        self._armed_at = None
+
+
 class SettingsDrawer(tk.Frame):
     """320px slide-over from the right (RAISED, scrollable). Groups per the
     V3 spec. Every control binds CONFIG via bind_config(); changes persist
@@ -2002,6 +2047,10 @@ class SettingsDrawer(tk.Frame):
         # Privacy first: it is the ONE section whose controls change while
         # the drawer is shut, because offline mode's primary path is voice.
         self._refresh_privacy()
+        # ...and the code-status line, which changes with every merge on
+        # disk: read now so it is current when he looks (four short git
+        # calls, 6-14 ms measured 2026-09-04).
+        self._refresh_code_status()
         self._open = True
         self.place(in_=self.host, relx=1.0, y=0, x=self._x,
                    anchor="ne", relheight=1.0, width=self.WIDTH)
@@ -2398,7 +2447,79 @@ class SettingsDrawer(tk.Frame):
         self._toggle_row(box, "Voice commands", "voice_cmds")
         self._toggle_row(box, "Auto-enter", "auto_enter")
         self._toggle_row(box, "Continuous listen", "continuous")
+        # The Restart button (Hunter, 2026-09-04: "yes, button only") and
+        # the line that says whether a restart would change anything:
+        # "Running 7539478, on disk 7539478 (up to date)". Refreshed in
+        # open(); the button arms on one press and restarts on the second
+        # (RestartArm above; services.restart is app.JarvisApp.restart).
+        self._code_status_lbl = self._info_row(box, self._code_status_text())
+        self._restart_row(box)
         tk.Frame(self._inner, bg=theme.RAISED, height=theme.PAD_L).pack()
+
+    # ------------------------------------------------- restart button
+    def _restart_row(self, box):
+        self._restart_arm = RestartArm(RESTART_ARM_MS / 1000.0)
+        self._restart_job = None
+        self._restart_btn = self._button_row(box, RestartArm.LABEL_IDLE,
+                                             self._restart_pressed)
+        return self._restart_btn
+
+    def _cancel_restart_job(self):
+        job = getattr(self, "_restart_job", None)
+        self._restart_job = None
+        if job is not None:
+            try:
+                self.after_cancel(job)
+            except Exception:
+                log.debug("restart arm timer cancel failed", exc_info=True)
+
+    def _restart_pressed(self):
+        if self._restart_arm.press() == "armed":
+            self._restart_btn.set_text(RestartArm.LABEL_ARMED)
+            self._cancel_restart_job()
+            self._restart_job = self.after(RESTART_ARM_MS, self._restart_expired)
+            return
+        self._cancel_restart_job()
+        self._restart_btn.set_text(RestartArm.LABEL_IDLE)
+        self._restart_fire()
+
+    def _restart_expired(self):
+        self._restart_job = None
+        self._restart_arm.expire()
+        self._restart_btn.set_text(RestartArm.LABEL_IDLE)
+
+    def _restart_fire(self):
+        """Same shape as _sensing_toggled: an unwired service is a toast,
+        never a silent no-op. The service blocks up to ~6 s on the spoken
+        line, so it runs off the Tk thread like every other drawer
+        service (_run_service); the window's close comes back onto the Tk
+        thread through the app's attach_window hook."""
+        fn = getattr(self.services, "restart", None) if self.services else None
+        if fn is None:
+            if self.toast:
+                self.toast.show("Restart not wired", kind="warn")
+            log.warning("restart not wired")
+            return
+        if self.toast:
+            self.toast.show("Restarting…", kind="ok", ms=8000)
+        threading.Thread(target=self._run_service, args=("restart", fn),
+                         daemon=True, name="restart").start()
+
+    def _code_status_text(self) -> str:
+        fn = getattr(self.services, "code_status", None) if self.services \
+            else None
+        if fn is None:
+            return format_code_status({})
+        try:
+            return format_code_status(fn())
+        except Exception:
+            log.exception("code status read failed")
+            return format_code_status({})
+
+    def _refresh_code_status(self):
+        lbl = getattr(self, "_code_status_lbl", None)
+        if lbl is not None:
+            lbl.configure(text=self._code_status_text())
 
     # ------------------------------------------------- offline mode rows
     def _sensing(self):
