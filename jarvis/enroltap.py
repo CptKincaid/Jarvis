@@ -58,6 +58,13 @@ log = get_logger("enroltap")
 # lens) open indefinitely.
 READ_TIMEOUT_S = 2.0
 
+# How many times read() waits READ_TIMEOUT_S before calling the source
+# dead. Three is ~6 s of patience: far longer than any frame interval
+# this preview delivers (268 ms at the 3.7 fps measured 2026-09-04, 133 ms
+# at the configured floor), and still short enough that a genuinely
+# wedged capture thread cannot hold the lens open through a whole run.
+READ_ATTEMPTS = 3
+
 # What a reader is told when nobody ever denied it and no frame arrived.
 TIMED_OUT = "the preview stopped delivering frames"
 
@@ -99,32 +106,56 @@ class FrameTap:
         Called from the ENROLMENT thread and from nowhere else. The frame
         comes back by reference and the slot is cleared in the same locked
         step, so this object is holding nothing the moment it returns.
+
+        A TIMEOUT IS NOT A DEAD SOURCE, and the difference matters because
+        ``faceenrol.run_enrolment`` treats the first not-ok read as FATAL
+        with no retry. One slow moment -- a GC pause, the preview reopening
+        its device, this box under agent load -- would otherwise end a
+        two-minute run he is sitting through. Only the tap can tell the two
+        apart, so the retry lives here and the caller keeps its simple
+        contract. A DENY still returns immediately: that one really is fatal.
         """
         self.reads += 1
-        if self._dead.is_set():
-            return False, None
         wait = self.timeout_s if timeout is None else float(timeout)
-        # Order matters: _ready is cleared BEFORE the want is announced, or a
-        # very fast capture thread can set _ready between the two and have it
-        # cleared out from under it -- which costs this read its frame and
-        # the next one a stale wake.
-        self._ready.clear()
-        self._want.set()
-        got = self._ready.wait(wait)
-        with self._lock:
-            frame, self._slot = self._slot, None
-        self._want.clear()
-        if self._dead.is_set():
-            return False, None
-        if not got or frame is None:
+        # An explicit timeout means a caller that wants exactly one attempt
+        # (the tests, and anything polling); the default is the enrolment
+        # path, which wants patience.
+        attempts = 1 if timeout is not None else READ_ATTEMPTS
+        for attempt in range(1, attempts + 1):
+            if self._dead.is_set():
+                return False, None
+            # Order matters: _ready is cleared BEFORE the want is announced,
+            # or a very fast capture thread can set _ready between the two and
+            # have it cleared out from under it -- which costs this read its
+            # frame and the next one a stale wake.
+            self._ready.clear()
+            self._want.set()
+            got = self._ready.wait(wait)
+            with self._lock:
+                # _want is cleared in the SAME locked step that takes the
+                # frame. It used to be cleared after the lock was released,
+                # and an offer() arriving in that window wrote into a slot the
+                # reader had already passed -- so the frame was not lost, it
+                # was handed over one interval STALE on the next read. During
+                # a station that is a sample of him mid-move, not held still.
+                frame, self._slot = self._slot, None
+                self._want.clear()
+            if self._dead.is_set():
+                return False, None
+            if got and frame is not None:
+                self.handed += 1
+                return True, frame
             self.timeouts += 1
-            # NOT fatal on its own -- the caller decides -- but it must not
-            # be reported as a frame, and a reason is set so that a caller
-            # which does give up has something true to say.
-            self.reason = self.reason or TIMED_OUT
-            return False, None
-        self.handed += 1
-        return True, frame
+            if attempt < attempts:
+                # Logged, never silent: a silent retry is how a degrading
+                # camera looks healthy right up to the moment it is not.
+                log.info("enroltap: no frame in %.1fs (attempt %d of %d), "
+                         "retrying", wait, attempt, attempts)
+        # Out of patience. NOT fatal on its own -- the caller decides -- but
+        # it must not be reported as a frame, and a reason is set so a caller
+        # that does give up has something true to say.
+        self.reason = self.reason or TIMED_OUT
+        return False, None
 
     # ------------------------------------------------------------ offering
     def offer(self, frame) -> bool:

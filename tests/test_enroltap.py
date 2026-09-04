@@ -198,10 +198,50 @@ def test_release_empties_the_slot_and_claims_no_reason():
 
 
 def test_a_read_that_nobody_answers_reports_a_timeout_not_a_frame():
+    """And it spends its whole patience budget first.
+
+    run_enrolment treats the first not-ok read as FATAL with no retry, so a
+    tap that gave up after one wait would end a two-minute run on one slow
+    moment. The budget is spent HERE, where the difference between "slow" and
+    "dead" is knowable, rather than in the caller, which cannot tell.
+    """
     tap = et.FrameTap(timeout_s=0.05)
     assert tap.read() == (False, None)
-    assert tap.numbers()["timeouts"] == 1
+    assert tap.numbers()["timeouts"] == et.READ_ATTEMPTS
     assert tap.reason == et.TIMED_OUT
+
+
+def test_a_stall_that_ends_still_produces_a_frame():
+    """The whole reason the retry exists: a gap longer than one timeout is a
+    stall, not a death, and the run must survive it."""
+    tap = et.FrameTap(timeout_s=0.05)
+    # Nothing for the first two waits, a real frame during the third.
+    threading.Thread(target=lambda: (time.sleep(0.12), tap.offer(frame())),
+                     daemon=True).start()
+    ok, got = tap.read()
+    assert ok and got is not None, "a stall that ended was reported as dead"
+    assert tap.numbers()["handed"] == 1
+    assert tap.reason == ""
+
+
+def test_an_explicit_timeout_is_one_attempt_and_does_not_retry():
+    """A caller that names its own timeout is asking for exactly one wait --
+    the tests and anything polling. Only the enrolment path wants patience."""
+    tap = et.FrameTap(timeout_s=5.0)
+    assert tap.read(timeout=0.02) == (False, None)
+    assert tap.numbers()["timeouts"] == 1
+
+
+def test_a_deny_during_a_retry_is_not_waited_out():
+    """A deny is fatal and must not sit through the remaining attempts."""
+    tap = et.FrameTap(timeout_s=0.05)
+    threading.Thread(target=lambda: (time.sleep(0.02), tap.deny("gone")),
+                     daemon=True).start()
+    t0 = time.monotonic()
+    assert tap.read() == (False, None)
+    assert time.monotonic() - t0 < 0.05 * et.READ_ATTEMPTS, \
+        "a deny waited out the retry budget instead of returning at once"
+    assert tap.reason == "gone"
 
 
 # ------------------------------------------------------------- the report
