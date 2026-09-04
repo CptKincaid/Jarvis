@@ -443,15 +443,25 @@ class _FakeCv2:
         return cap
 
 
-def test_open_capture_asks_for_one_buffer_and_logs_the_granted_mode(
+def test_open_capture_leaves_the_buffer_queue_alone_and_logs_the_granted_mode(
         monkeypatch, caplog):
-    """Two things nothing did until 2026-09-03. CAP_PROP_BUFFERSIZE=1,
-    because the V4L2 backend's default four buffers hand a slow consumer a
-    frame up to three intervals old -- the preview's "grab 11 ms" at 6 fps
-    was a stale picture, not a fast device. And the granted mode LOGGED,
-    because the running app never read it back and a night was spent
-    guessing that MJPG had been declined (it had not; the probe showed it
-    granted in either set order, twice). FOURCC goes before the size."""
+    """The buffer count is the DRIVER'S, and that is a correction.
+
+    It was set to 1 on 2026-09-03 to stop a slow consumer being handed a
+    frame up to three intervals old -- real lag, and the reasoning was
+    sound. What was never measured was the price, and the price is HALF THE
+    FRAME RATE: an A/B pair of probe runs in the same light, 60 timed grabs
+    a row, gave a clean 2.00x on eight rows of eight (720p MJPG 132.2 ms ->
+    67.9, 720p YUYV 200.0 -> 100.0), and with the driver's own buffers the
+    720p YUYV mode reaches its granted 10.0 fps exactly. Starving the queue
+    is the worse trade, so nothing sets CAP_PROP_BUFFERSIZE at all now and
+    the proper fix -- draining the stale frames rather than never queueing
+    them -- is still owed.
+
+    The granted mode is still LOGGED, because the running app never read it
+    back and a night was spent guessing that MJPG had been declined (it had
+    not; the probe showed it granted in either set order, twice). FOURCC
+    still goes before the size."""
     fake = _FakeCv2()
     monkeypatch.setattr(cam, "_import_cv2", lambda: fake)
     with caplog.at_level(logging.INFO, logger="jarvis.camera"):
@@ -459,13 +469,14 @@ def test_open_capture_asks_for_one_buffer_and_logs_the_granted_mode(
     props = [p for p, _ in cap.sets]
     assert props.index(fake.CAP_PROP_FOURCC) < props.index(
         fake.CAP_PROP_FRAME_WIDTH)
-    assert cap.props[fake.CAP_PROP_BUFFERSIZE] == 1.0
-    assert cam.CAPTURE_BUFFERS == 1
+    assert cam.CAPTURE_BUFFERS is None
+    # the whole point: the property is never written, at all
+    assert fake.CAP_PROP_BUFFERSIZE not in props
     assert cap.props[fake.CAP_PROP_FRAME_WIDTH] == 1280.0
     lines = [r.getMessage() for r in caplog.records
              if r.name == "jarvis.camera"]
     assert any("asked 1280x720 MJPG" in m and "granted 1280x720 MJPG" in m
-               and "1 driver buffer" in m for m in lines), lines
+               for m in lines), lines
     assert cap.released == 0
 
 

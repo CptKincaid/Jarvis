@@ -62,7 +62,23 @@ DEVICE_GLOB = "/dev/video*"
 # mode is read back and logged in open_capture for exactly that reason.
 DEFAULT_FOURCC = "MJPG"
 # One driver buffer, not OpenCV's default four. See open_capture.
-CAPTURE_BUFFERS = 1
+# None means LEAVE THE DRIVER'S DEFAULT ALONE, which is what the fast probe
+# run actually did. Setting this to 1 costs exactly half the frame rate --
+# MEASURED 2026-09-03, one A/B pair back to back in the same light with
+# scripts/camera_mode_probe.py, 60 timed grabs per row, 8 rows out of 8:
+#
+#   mode              set(1)              driver default
+#   720p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
+#   480p MJPG      7.5 fps / 132.2 ms   15.0 fps /  67.9 ms
+#   720p YUYV      5.0 fps / 200.0 ms   10.0 fps / 100.0 ms
+#   480p YUYV      7.5 fps / 132.1 ms   15.0 fps /  67.9 ms
+#
+# A clean 2.00x on every row, and with the default the 720p YUYV mode hits
+# its granted 10.0 fps exactly -- so the device was never the cap. OpenCV's
+# V4L2 backend requeues a dequeued buffer only at the NEXT grab, so with one
+# buffer the driver holds none in between and every grab waits a full extra
+# frame interval.
+CAPTURE_BUFFERS = None
 # How long a close waits for a grab already in flight before releasing the
 # device anyway. One frame at the idle tier's 1.5 fps is 670 ms; a second is
 # a grab that is not coming back.
@@ -186,17 +202,26 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
     beside the preview's own rate line so that the next such question is a
     grep of the log rather than a night of guessing.
 
-    ``CAP_PROP_BUFFERSIZE`` IS SET TO ONE. OpenCV's V4L2 backend queues four
-    driver buffers by default, so a consumer that reads SLOWER than the
-    device delivers is handed a frame that has been waiting in the queue --
-    up to three intervals old, which at the 7.5 fps his camera delivered
-    with him at the desk is 400 ms, and 800 ms at the 3.8 fps the probe
-    measured. The preview's log line ``6.0 fps  grab 11 ms`` at 6 requested was
-    exactly that: not a fast device but a stale picture already dequeued,
-    which is lag he can see. One buffer means the newest frame, or a wait
-    for it. The driver accepts the setting (``set(1)`` read back 1, measured
-    2026-09-03, both probe runs); if a future one does not, the read-back
-    below says so.
+    ``CAP_PROP_BUFFERSIZE`` IS LEFT AT THE DRIVER'S DEFAULT, and that is a
+    correction. It was set to ONE to stop a slow consumer being handed a
+    frame that had waited in the queue -- up to three intervals old, which
+    is lag he can see, and the reasoning was right. The cost was not
+    measured until 2026-09-03, and the cost is HALF THE FRAME RATE: an A/B
+    pair in the same light gave a clean 2.00x on all eight rows (see
+    CAPTURE_BUFFERS above), and with the default the 720p YUYV mode reaches
+    its granted 10.0 fps exactly, so the device was never the cap.
+
+    Half the rate is the worse trade. At his configured ``preview_fps`` of
+    15 the consumer now keeps pace with the device (15.0 fps delivered), so
+    the queue does not build and the staleness this was fighting does not
+    arise; it only bit when the consumer ran far slower than the device
+    (the old ``6.0 fps  grab 11 ms`` line, 6 requested against 15 delivered).
+
+    THE PROPER FIX IS TO DRAIN, NOT TO STARVE: keep the driver's buffers and
+    discard the stale ones before retrieving, so a slow consumer still gets
+    the newest frame at full rate. That is not built yet, and until it is,
+    a consumer configured well below the delivered rate can still be handed
+    a frame up to three intervals old.
 
     cv2 is imported HERE, not at module scope, so that a box without OpenCV
     still loads jarvis.camera and still reports honestly.
@@ -218,7 +243,8 @@ def open_capture(device: str = "", width: int = 1280, height: int = 720,
             cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, int(width))
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, int(height))
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, CAPTURE_BUFFERS)
+        if CAPTURE_BUFFERS is not None:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, CAPTURE_BUFFERS)
     except Exception:  # noqa: BLE001 - an unsupported mode is not a failure
         log.debug("camera: the driver refused a mode request", exc_info=True)
     try:
