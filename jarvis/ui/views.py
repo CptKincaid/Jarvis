@@ -234,7 +234,14 @@ def plan_strip(total_w: int, left_w: int, project_fixed_w: int, char_w: int,
         if yield_order:
             hidden.append(yield_order.pop(0))
             continue
-        return 0, hidden
+        # The chip itself goes -- and with it every yield made on its
+        # behalf. Until 2026-09-03 this returned (0, hidden) with MEMORY
+        # still in it, so at his 918-px strip with 'jarvis' active the
+        # footer lost the memory figure AND never drew the PROJECT chip
+        # that had displaced it (measured: level 0 with MEMORY yielded
+        # leaves 75 px for the value, 5 characters, one short of the
+        # six-character floor). No chip means nothing was displaced.
+        return 0, []
 
 
 def curfew_choice_values(curfew) -> tuple:
@@ -479,8 +486,57 @@ def spans_clipped(spans) -> list:
 def tracked(text: str) -> str:
     """Tracked caps for the holo captions: 'JARVIS' → 'J A R V I S'. Tk has
     no letter-spacing, so we space the glyphs by hand — the ref HUD's
-    labels are small, wide-set capitals."""
+    labels are small, wide-set capitals. theme.caption() carries the rule
+    for WHICH labels are tracked (surface labels, never row keys)."""
     return " ".join((text or "").upper().replace(" ", ""))
+
+
+def speaker_color(role: str, look: Optional[str] = None) -> str:
+    """The card head's speaker label colour (pure, call-time theme).
+
+    Classic: CYAN_DIM for JARVIS, FAINT for YOU -- the 08-31 console.
+    Holo (2026-09-03, ui-polish U03): one step up each, CYAN and MUTED.
+    Measured on the 09-03 shot 08b: the JARVIS label at CYAN_DIM was
+    5.57:1 against the transcript ground and the 'HH:MM · 1.0 s' stamp
+    beside it 4.95:1 -- two equal captions, not label > meta -- and the
+    YOU label was literally the stamp's colour, (110,134,158) against
+    (109,132,157). The stamp keeps FAINT (theme.py: captions, timestamps);
+    the speaker lifts to 11:1 / 9:1 so the head row reads label > meta."""
+    look = theme.LOOK if look is None else look
+    if role == "you":
+        return theme.MUTED if look == "holo" else theme.FAINT
+    return theme.CYAN if look == "holo" else theme.CYAN_DIM
+
+
+# ------------------------------------------------- transcript top snap
+# The viewport is pinned to the newest card, so whatever sits at the top
+# edge is cut wherever the arithmetic lands: measured on the 09-03 shots,
+# 08b a 178-px fragment 'draft from Tuesday…' with no head row, 09 'Here's
+# your morning, sir.' halved, 22 the YES / NO buttons sliced through, 23 an
+# empty bracket. Tk canvas window items always paint above canvas items
+# and a Tk widget has no alpha, so no drawn fade can soften the cut. What
+# CAN be done is to not show the fragment: while the view rests on the
+# newest card, a card whose visible remainder is shorter than SNAP_FRAGMENT
+# is unmapped, and the ground shows in its place. Taller remainders stay --
+# a long reply half on screen is still worth reading -- and the moment he
+# scrolls up (the view unpins) every card is shown, because a cut at the
+# top edge is what a scrolled list looks like.
+SNAP_FRAGMENT = 96          # design px: a head row plus ~two body lines
+
+
+def snap_hidden(tops, heights, view_top, min_visible) -> list:
+    """Which stacked cards to unmap for a view whose top edge is at
+    `view_top` (pure): True for every card that STRADDLES the edge with
+    fewer than `min_visible` px left below it -- never the last card,
+    which is the one the view is resting on. `tops` / `heights` are the
+    laid-out card y0 and height, in order."""
+    out = []
+    n = len(tops)
+    for i, (y, h) in enumerate(zip(tops, heights)):
+        straddles = y < view_top < y + h
+        out.append(bool(straddles and i < n - 1
+                        and (y + h - view_top) < min_visible))
+    return out
 
 
 def ground_is_flat(look: Optional[str] = None) -> bool:
@@ -725,7 +781,32 @@ class TranscriptView(tk.Frame):
     def _wheel(self, direction):
         self.canvas.yview_scroll(direction * 2, "units")
         self._pinned = self.canvas.yview()[1] >= 0.995
+        self._apply_snap()
         self._schedule_dots()
+
+    def _apply_snap(self):
+        """Map / unmap the cards per snap_hidden for the current view
+        (holo only; classic shows every card as it always did). Item
+        states only -- no relayout, so it is cheap enough for every
+        wheel tick."""
+        c = self.canvas
+        entries = self._entries()
+        if not entries:
+            return
+        hide = [False] * len(entries)
+        if theme.LOOK == "holo" and self._pinned:
+            try:
+                view_top = int(c.canvasy(0))
+                tops = [c.coords(e[3])[1] for e in entries]
+            except (tk.TclError, IndexError):
+                return
+            heights = [e[4] if len(e) > 4 and e[4] else 0 for e in entries]
+            hide = snap_hidden(tops, heights, view_top, px(SNAP_FRAGMENT))
+        for entry, off in zip(entries, hide):
+            try:
+                c.itemconfigure(entry[3], state="hidden" if off else "normal")
+            except tk.TclError:
+                pass
 
     # ------------------------------------------------------ dot backdrop
     def _schedule_dots(self):
@@ -1067,6 +1148,7 @@ class TranscriptView(tk.Frame):
         c.configure(scrollregion=region)
         if self._pinned:
             c.yview_moveto(1.0)
+        self._apply_snap()
         self._schedule_dots()
 
     def _text_px(self, text: str) -> int:
@@ -1101,7 +1183,7 @@ class TranscriptView(tk.Frame):
     # ------------------------------------------------------------- content
     def add_user(self, text: str, confidence: Optional[float] = None):
         self.clear_partial()
-        card = self._make_card("YOU", theme.FAINT, text)
+        card = self._make_card("YOU", speaker_color("you"), text)
         if confidence is not None:
             card.set_left_rule(theme.CYAN_DIM, max(0.12, min(1.0, confidence)))
         return card
@@ -1109,7 +1191,7 @@ class TranscriptView(tk.Frame):
     def add_jarvis(self, text: str, rtt: Optional[float] = None):
         """Reply card. `rtt` (seconds, utterance → reply) renders ONCE,
         muted, in the head row: 'HH:MM · 1.2 s' — the only RTT site."""
-        card = self._make_card("JARVIS", theme.CYAN_DIM, text, rtt=rtt)
+        card = self._make_card("JARVIS", speaker_color("jarvis"), text, rtt=rtt)
         if theme.LOOK == "holo":
             # frame cards draw ONE short bright bracket from _glow[0]
             card.set_edge_glow((theme.ARC_BRIGHT,))
@@ -1311,7 +1393,7 @@ class TranscriptView(tk.Frame):
         look = card_look("approval")
         fill = look["fill"]
         card = Card(self.canvas, pad=CARD_PAD, **look)
-        stamp = self._card_head(card, "JARVIS", theme.CYAN_DIM)
+        stamp = self._card_head(card, "JARVIS", speaker_color("jarvis"))
         body = tk.Label(card.body, text=question, font=ui_font(theme.SIZE_BODY),
                         fg=theme.INK, bg=fill, justify="left",
                         anchor="w", wraplength=wrap)
@@ -1382,7 +1464,7 @@ class TranscriptView(tk.Frame):
         look = card_look("briefing")
         fill = look["fill"]
         card = Card(self.canvas, pad=CARD_PAD, **look)
-        self._card_head(card, "JARVIS", theme.CYAN_DIM)
+        self._card_head(card, "JARVIS", speaker_color("jarvis"))
         lf = ui_display(theme.SIZE_CAPTION, "semibold")
         try:
             col_w = max([measure(lf, lab) for lab, _t in rows if lab] or [0])
@@ -2023,7 +2105,9 @@ class SettingsDrawer(tk.Frame):
 
     # -------------------------------------------------------- section UI
     def _section(self, title: str) -> tk.Frame:
-        tk.Label(self._inner, text=title.upper(),
+        # a section title names a SURFACE, so in holo it is tracked like
+        # the board's panel titles (theme.caption; the 09-03 U16 rule)
+        tk.Label(self._inner, text=theme.caption(title, surface=True),
                  font=ui_display(theme.SIZE_CAPTION, "semibold"),
                  fg=theme.CYAN_DIM,
                  bg=theme.RAISED, anchor="w").pack(
@@ -2051,6 +2135,17 @@ class SettingsDrawer(tk.Frame):
     def _picker_row(self, box, label, var_name, options, on_change=None):
         row = self._row(box, label)
         var = tk.StringVar()
+        menu = self._option_menu(row, var, options)
+        menu.pack(side="right")
+        self.bind_config(var_name, var, on_change)
+        return var
+
+    def _option_menu(self, row, var, options) -> tk.OptionMenu:
+        """A themed OptionMenu. Holo (2026-09-03, ui-polish U12): the
+        Motif indicator -- a tiny '=' at 2x -- is switched off and a
+        drawn chevron sits at the menu's right instead (a 1px-stroke
+        glyph, like every other holo mark; a font chevron would render
+        from whichever fallback face has the code point)."""
         menu = tk.OptionMenu(row, var, *options)
         menu.configure(bg=theme.RAISED, fg=theme.INK,
                        activebackground=theme.CYAN_SOFT,
@@ -2063,20 +2158,46 @@ class SettingsDrawer(tk.Frame):
                                activebackground=theme.CYAN_SOFT,
                                activeforeground=theme.CYAN, bd=0,
                                font=ui_font(theme.SIZE_LABEL))
-        menu.pack(side="right")
-        self.bind_config(var_name, var, on_change)
-        return var
+        if theme.LOOK == "holo":
+            menu.configure(indicatoron=False, padx=px(6))
+            self._chevron(row).pack(side="right", padx=(0, px(2)))
+        return menu
+
+    @staticmethod
+    def _chevron(row) -> tk.Canvas:
+        """The drawn 'open me' chevron for a holo picker: two 1px CYAN_DIM
+        strokes in a px(12) box, pointing down."""
+        s = px(12)
+        c = tk.Canvas(row, width=s, height=s, bg=theme.RAISED,
+                      highlightthickness=0, bd=0)
+        c.create_line(px(2), px(4), s // 2, px(8), s - px(2), px(4),
+                      fill=theme.CYAN_DIM, width=max(1, px(1)),
+                      joinstyle="miter")
+        return c
+
+    # Holo scale rows (U12): the Scale's value is drawn centred over the
+    # knob, and at the low end of the range the knob is at the trough's
+    # left edge, so the value overhangs the widget's left edge and lands
+    # against the label ('Silence timeout (s)2.5', measured on the 09-03
+    # shot 14). Measured at S=2 the label is 314 px and the drawer's inner
+    # width 576, so the px(130) trough left 2 px for a gap: the trough
+    # shortens to SCALE_LEN_HOLO and SCALE_GAP_HOLO keeps the value off
+    # the label at every knob position (a 36-px value overhangs ~18).
+    SCALE_LEN_HOLO = 112
+    SCALE_GAP_HOLO = 12
 
     def _scale_row(self, box, label, var_name, lo, hi, res, on_change=None):
         row = self._row(box, label)
+        holo = theme.LOOK == "holo"
         scale = tk.Scale(row, from_=lo, to=hi, resolution=res,
-                         orient="horizontal", length=px(130),
+                         orient="horizontal",
+                         length=px(self.SCALE_LEN_HOLO if holo else 130),
                          bg=theme.RAISED, fg=theme.MUTED,
                          troughcolor=theme.LINE, highlightthickness=0, bd=0,
                          activebackground=theme.CYAN,
                          font=ui_font(theme.SIZE_CAPTION),
                          showvalue=True)
-        scale.pack(side="right")
+        scale.pack(side="right", padx=(px(self.SCALE_GAP_HOLO) if holo else 0, 0))
         self.bind_config(var_name, scale, on_change)
         return scale
 
@@ -2350,18 +2471,7 @@ class SettingsDrawer(tk.Frame):
             except Exception:  # noqa: BLE001 - provider boundary
                 log.exception("curfew read failed")
         var.set(curfew_choice_values(current)[index])
-        menu = tk.OptionMenu(row, var, *options)
-        menu.configure(bg=theme.RAISED, fg=theme.INK,
-                       activebackground=theme.CYAN_SOFT,
-                       activeforeground=theme.CYAN, bd=0,
-                       highlightthickness=1,
-                       highlightbackground=theme.RAISED,
-                       highlightcolor=theme.CYAN_DIM, relief="flat",
-                       font=ui_font(theme.SIZE_LABEL))
-        menu["menu"].configure(bg=theme.RAISED, fg=theme.INK,
-                               activebackground=theme.CYAN_SOFT,
-                               activeforeground=theme.CYAN, bd=0,
-                               font=ui_font(theme.SIZE_LABEL))
+        menu = self._option_menu(row, var, options)
         menu.pack(side="right")
         var.trace_add("write", lambda *_a: self._curfew_changed())
         return var

@@ -262,3 +262,34 @@ def test_the_source_asserts_its_own_guards(source):
     assert "isinstance(win.preview_worker, RealWorker)" in source
     assert "blocked modules loaded" in source
     assert "CONFIG.save = lambda: None" in source
+
+
+# ------------------------------------------------- his desktop is off limits
+def test_the_rig_refuses_his_desktop_displays(rig):
+    """ensure_display() attaches to ANY live server at --display, so
+    `--display :1` would have put the console on his real desktop."""
+    for d in (":0", ":1", ":0.0", ":1.0", "localhost:1", "localhost:1.0", ""):
+        assert not rig.display_allowed(d), d
+        with pytest.raises(SystemExit):
+            rig.refuse_live_display(d)
+    for d in (":91", ":92", ":99", ":10", ":1a"):
+        assert rig.display_allowed(d), d
+        rig.refuse_live_display(d)
+    assert rig.FORBIDDEN_DISPLAYS == (":0", ":1")
+
+
+def test_main_refuses_a_live_display_before_starting_anything(rig, tmp_path,
+                                                                monkeypatch):
+    touched = []
+    monkeypatch.setattr(rig, "_display_alive", lambda d: touched.append(d) or True)
+    monkeypatch.setattr(rig, "run_child", lambda a: touched.append("child") or 0)
+    for argv in (["--display", ":1", "--out", str(tmp_path)],
+                 ["--display", ":0.0", "--out", str(tmp_path)],
+                 ["--child", "--look", "holo", "--display", ":1",
+                  "--out", str(tmp_path)]):
+        with pytest.raises(SystemExit) as exc:
+            rig.main(argv)
+        assert "his desktop" in str(exc.value)
+    assert touched == []
+    assert "refuse_live_display(display)" in open(rig.__file__).read() \
+        or "refuse_live_display(args.display)" in open(rig.__file__).read()

@@ -356,8 +356,11 @@ class Card(tk.Canvas):
         # style "slab" is the chamfered lit-glass panel (classic, byte for
         # byte); "frame" is the holo thin outline (frame_rect) — `edge` is
         # its outline colour, `accent` its corner-bracket colour, `dash`
-        # makes the outline dashed (the listening ghost card).
-        self._style = style if style in ("slab", "frame") else "slab"
+        # makes the outline dashed (the listening ghost card); "chamfer"
+        # is the holo 45°-cut outline in `edge` with 1px `accent` brackets
+        # at TL/BR and no fill step -- the alarm modal (2026-09-03, U10):
+        # the one card that must look nothing like a chat card.
+        self._style = style if style in ("slab", "frame", "chamfer") else "slab"
         self._edge, self._accent, self._dash = edge, accent, dash
         # radius kept for API compat; chamfer cut comes from theme.CHAMFER
         self._radius = theme.RADIUS if radius is None else radius
@@ -428,6 +431,9 @@ class Card(tk.Canvas):
         if self._style == "frame":
             self._redraw_frame(w, h)
             return
+        if self._style == "chamfer":
+            self._redraw_chamfer(w, h)
+            return
         cut = theme.CHAMFER
         # Film rule: never a full bright border (the neon-box tell). The
         # panel outline is a dim hairline; brightness lives only in the
@@ -468,6 +474,27 @@ class Card(tk.Canvas):
             y0 = (h - rule_h) // 2
             self.create_rectangle(0, y0, max(2, px(2)), y0 + rule_h,
                                   fill=color, outline="", tags="chrome")
+
+    def _redraw_chamfer(self, w: int, h: int):
+        """Holo modal: a 1px chamfered outline in `edge` (the alarm's
+        WARN), the two-stroke bracket accents at TL and BR in `accent`,
+        no catch-light and no fill step -- the fill is whatever ground the
+        caller sampled, so the panel is a lit outline on the stage."""
+        cut = theme.CHAMFER
+        edge = self._edge or theme.GLASS_EDGE
+        accent = self._accent or theme.BRIGHT
+        item = chamfer_rect(self, 1, 1, w - 2, h - 2, cut, fill=self._fill,
+                            outline=edge, width=max(1, px(1)), tags="chrome")
+        self.tag_lower(item)
+        alen, aw = px(18), max(1, px(2))
+        tl = (1, 1 + cut + alen, 1, 1 + cut, 1 + cut, 1, 1 + cut + alen, 1)
+        br = (w - 2, h - 2 - cut - alen, w - 2, h - 2 - cut,
+              w - 2 - cut, h - 2, w - 2 - cut - alen, h - 2)
+        for pts in (tl, br):
+            self.create_line(*pts, fill=accent, width=aw, tags="chrome",
+                             capstyle="projecting")
+        if self._rule:
+            self._draw_rule(h)
 
     def _redraw_frame(self, w: int, h: int):
         """Holo card: a hairline frame with small corner brackets over the
@@ -1022,12 +1049,31 @@ class Tooltip:
 
 # ------------------------------------------------------------------- Toast
 class Toast:
-    """Transient bottom-center notice on a container (usually the root)."""
+    """Transient notice. Classic: a RAISED slab placed bottom-centre over
+    the container (the 08-31 console, byte for byte). Holo, once
+    `dock()`ed: a LAID-OUT strip packed above the command bar, drawn as a
+    thin frame with a kind dot -- never over a card.
+
+    WHY THE STRIP (2026-09-03, ui-polish U02). Measured on the 09-03
+    shots: the placed slab (relx 0.5, rely 1.0, y -104) landed on the
+    newest reply's last two lines -- in 07-error the slab covered
+    'and dinner with Sam at seven, sir.' with 'and dinn' and '.' poking
+    out either side, at the exact moment he is reading the reply -- and
+    it was the one filled slab in a look whose glass is 'so thin nothing
+    reads as a filled slab' (theme.py). A strip packed BEFORE the reactor
+    with side='bottom' sits directly above the command bar and takes its
+    height out of the transcript's expand share for as long as it lives,
+    so the cards move up by STRIP_H and back, and nothing is ever painted
+    over one."""
+
+    STRIP_H = 34          # design units; the frame sits px(2) inside it
 
     def __init__(self, container):
         self.container = container
         self._frame = None
         self._after_id = None
+        self._host = None
+        self._before = None
 
     @staticmethod
     def _kind_fg(kind: str) -> str:
@@ -1036,16 +1082,68 @@ class Toast:
         return {"ok": theme.OK, "info": theme.INK,
                 "warn": theme.WARN, "error": theme.ERR}.get(kind, theme.INK)
 
+    @staticmethod
+    def _kind_dot(kind: str) -> str:
+        """The strip's dot: the kind colour for warn/error/ok, CYAN_DIM for
+        a plain notice (INK text needs a dot that is not also white)."""
+        return {"ok": theme.CYAN, "warn": theme.WARN,
+                "error": theme.ERR}.get(kind, theme.CYAN_DIM)
+
+    def dock(self, host, before) -> None:
+        """Make this toast a laid-out strip in `host`, packed side='bottom'
+        before `before` (the widget it must land above in the pack order).
+        Until dock() is called, show() places the classic overlay."""
+        self._host, self._before = host, before
+
+    @property
+    def docked(self) -> bool:
+        return self._host is not None
+
     def show(self, text: str, kind: str = "info", ms: int = 1800):
         self.hide()
         fg = self._kind_fg(kind)
-        self._frame = tk.Frame(self.container, bg=theme.LINE)
-        tk.Label(self._frame, text=text, font=ui_font(theme.SIZE_LABEL),
-                 bg=theme.RAISED, fg=fg, padx=px(14), pady=px(7)).pack(
-            padx=max(1, px(1)), pady=max(1, px(1)))
-        self._frame.place(relx=0.5, rely=1.0, y=-px(104), anchor="s")
-        self._frame.lift()
+        if self.docked:
+            self._show_strip(text, kind, fg)
+        else:
+            self._frame = tk.Frame(self.container, bg=theme.LINE)
+            tk.Label(self._frame, text=text, font=ui_font(theme.SIZE_LABEL),
+                     bg=theme.RAISED, fg=fg, padx=px(14), pady=px(7)).pack(
+                padx=max(1, px(1)), pady=max(1, px(1)))
+            self._frame.place(relx=0.5, rely=1.0, y=-px(104), anchor="s")
+            self._frame.lift()
         self._after_id = self.container.after(ms, self.hide)
+
+    def _show_strip(self, text: str, kind: str, fg: str) -> None:
+        h = px(self.STRIP_H)
+        strip = tk.Canvas(self._host, bg=theme.BG, height=h,
+                          highlightthickness=0, bd=0)
+        self._frame = strip
+        font = ui_font(theme.SIZE_LABEL)
+        dot = self._kind_dot(kind)
+
+        def draw(_e=None):
+            w = strip.winfo_width()
+            if w < 8:
+                return
+            strip.delete("all")
+            x0, x1 = theme.PAD, w - theme.PAD
+            frame_rect(strip, x0, px(2), x1, h - px(2), fill=theme.BG,
+                       outline=theme.GLASS_EDGE, accent=dot)
+            r = px(4)
+            cx, cy = x0 + px(14), h // 2
+            strip.create_oval(cx - r, cy - r, cx + r, cy + r, fill=dot,
+                              outline="")
+            tx = cx + r + px(10)
+            strip.create_text(tx, cy, anchor="w", fill=fg, font=font,
+                              text=ellipsize(text, font, x1 - px(12) - tx))
+
+        strip.bind("<Configure>", draw, add=True)
+        try:
+            strip.pack(side="bottom", fill="x", before=self._before)
+        except tk.TclError:
+            # `before` is not a pack slave (the host was rebuilt): fall
+            # back to the end of the pack order rather than lose the notice
+            strip.pack(side="bottom", fill="x")
 
     def hide(self):
         if self._after_id:
