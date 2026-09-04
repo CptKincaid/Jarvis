@@ -86,12 +86,21 @@ otherwise every note after the dropped one describes the wrong face.
 DELETING ONE PERSON is ``purge_label()``, and it is not ``forget()`` plus a
 save. A save writes a new generation; the OLD generations still hold her, one
 ``rollback()`` away and still on the disk. Consent withdrawn has to mean the
-embeddings go, so ``purge_label`` writes what is left as a new generation and
-then SHREDS every generation it PROVED held her AND could rewrite. A
-generation it could not read, or that another model wrote, or whose other
-people did not make it into the new generation, is counted and reported and
-LEFT: deleting one person may never cost another person's enrolment, and the
-command says out loud that it is not finished rather than claiming it is.
+embeddings go, so the old files have to go -- and destroying an old file is
+how somebody who never asked to be forgotten loses their enrolment. That
+happened three times, by three different routes, so ``purge_label`` is built
+around ONE invariant rather than around three guards:
+
+    NO FILE IS DESTROYED UNLESS THE EMBEDDINGS IT HELD, MINUS HERS, HAVE BEEN
+    READ BACK FROM THE NEW GENERATION ON DISK.
+
+Inventory raw first (which labels, and how many samples each, at this FORMAT),
+write the replacement second, read the replacement back off the disk third and
+prove every other label is in it at full count, shred fourth and only what was
+proved superseded, then read the disk once more and only THEN say whether the
+delete is complete. Anything that fails any step is counted, named and LEFT
+ALONE. Read ``purge_label`` for the three routes and why each one is closed by
+the invariant rather than by a check of its own.
 
 DELETION is ``purge()``: every generation, not just the newest, AND any
 ``.tmp`` a crashed save left behind -- which is a full set of embeddings under
@@ -153,6 +162,10 @@ MODEL_DIMS = {SFACE_MODEL: 128, ARCFACE_MODEL: 512}
 # that had ever written this store.
 LEGACY_MODEL = SFACE_MODEL
 DEFAULT_MODEL = SFACE_MODEL
+# What a generation's ``_model`` key is called when the key is there and will
+# not read. It is not this build's model and it is not a name anything can act
+# on, which is exactly what the callers need to know.
+UNKNOWN_MODEL = "unknown"
 EMBED_DIM = MODEL_DIMS[SFACE_MODEL]
 
 
@@ -671,12 +684,91 @@ class FaceGallery:
                 "model": wrote}
         return pool, takes, prov
 
-    def save(self, reason: str, allow_shrink: bool = False) -> int:
+    # ------------------------------------------------- whose data is in here
+    def _inventory(self, path: Path):
+        """``({label: samples}, the model that wrote it)`` by RAW key read, or
+        ``(None, "")`` if the file cannot be inventoried at all.
+
+        THIS ANSWERS "WHOSE EMBEDDINGS ARE IN THIS FILE", WHICH IS NOT THE
+        QUESTION ``_read`` ANSWERS. ``_read`` yields VECTORS, and every filter
+        it applies -- the model check, the dimension check, the degenerate
+        check -- is a way for its answer to come back "nobody is in here" over
+        a file with her name in thirteen of its keys. Both shapes are real: a
+        generation written by a model this build has never heard of yields no
+        vectors at all (there is no way to validate a vector whose length is
+        not known), and a generation whose vectors are another model's length
+        has every one of them dropped. Under the old scan both were INVISIBLE,
+        so her embeddings stayed on the disk and the delete returned
+        ``complete`` True over them.
+
+        THE FORMAT IS STILL CHECKED AND THAT IS NOT AN INCONSISTENCY: the key
+        layout IS the format. ``emb_<label>_<nnnn>`` is what FORMAT 1 means,
+        and scanning a file this build cannot read for keys this build invented
+        would answer "she is not in it" about a pool that may hold her under a
+        scheme nobody here has seen. A file that does not inventory is reported
+        as unreadable and treated as "may hold anybody", which is the only
+        honest reading and is why ``purge_label`` neither destroys it nor
+        claims to be finished while it is there.
+
+        Cheap: the names come out of the zip directory, and only ``_format``
+        and ``_model`` are decompressed. No embedding is read."""
+        try:
+            with np.load(path) as data:
+                names = list(data.files)
+                if "_format" not in names:
+                    return None, ""
+                if int(np.asarray(data["_format"]).ravel()[0]) != FORMAT:
+                    return None, ""
+                wrote = LEGACY_MODEL
+                if "_model" in names:
+                    try:
+                        wrote = str(np.asarray(data["_model"]).ravel()[0])
+                    except Exception:  # noqa: BLE001 - unnamed is not ours
+                        wrote = UNKNOWN_MODEL
+        except Exception:  # noqa: BLE001 - unreadable is an ANSWER here
+            return None, ""
+        counts: Dict[str, int] = {}
+        for key in names:
+            m = _KEY_RE.match(key)
+            if m:
+                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+        return counts, wrote
+
+    def disk_labels(self) -> Tuple[str, ...]:
+        """Every label with embeddings ON THIS DISK, whatever model wrote it.
+
+        ``labels()`` is what this OBJECT managed to load, and a gallery for
+        one model loads NOTHING from another model's store -- by design. So a
+        caller that answers "who is enrolled?" from ``labels()`` says "nobody"
+        over a full enrolment sitting in front of it, which is what
+        ``face_enrol --delete --label`` printed as "(labels: -)". This reads
+        the files."""
+        found = set()
+        for gen in self.generations():
+            counts, _wrote = self._inventory(self.path_for(gen))
+            for label, n in (counts or {}).items():
+                if n:
+                    found.add(label)
+        return tuple(sorted(found))
+
+    def save(self, reason: str, allow_shrink: bool = False,
+             prune: bool = True) -> int:
         """Write the pool as the NEXT generation; return its number.
 
         ``reason`` is provenance, not decoration: when a gallery turns out to
         be wrong, the only question that matters is what wrote it, and on
-        2026-09-02 nothing on disk could answer that."""
+        2026-09-02 nothing on disk could answer that.
+
+        ``prune=False`` IS FOR ONE CALLER AND IT IS NOT AN OPTIMISATION.
+        ``_prune`` deletes files this save never looked at -- the oldest
+        generations outside the five-deep window -- and ``purge_label`` is
+        the one path whose whole contract is that no file dies unproven. With
+        pruning on, its own save destroyed a bystander's only generation
+        before the delete loop had considered a single file, and the delete
+        then reported itself complete (measured 2026-09-03: five generations,
+        alice alone in the oldest, ``purge_label("heather")`` -> alice's six
+        embeddings gone, ``complete`` True). A deliberate delete does its own
+        housekeeping; the window is re-imposed by the next ordinary save."""
         if self.root is None:
             raise ValueError("this gallery has no root; it cannot be saved")
         n = self.total()
@@ -756,7 +848,8 @@ class FaceGallery:
                                             for t in self.takes(label)
                                             if t.recorded),
                             "model": self.model}
-        self._prune()
+        if prune:
+            self._prune()
         log.info("face gallery saved: generation %d, %d samples (%s)", gen, n, reason)
         return gen
 
@@ -936,151 +1029,135 @@ class FaceGallery:
     def purge_label(self, label: str, reason: str = "") -> dict:
         """Destroy ONE person's embeddings, everywhere on the disk.
 
-        THE REASON THIS IS NOT ``forget()`` + ``save()``. A save writes a new
-        generation; the older ones still hold her, one ``rollback()`` away
-        and, more to the point, still lying on the disk as 128 floats per
-        take. "Delete me" is the one promise in this module that a new
-        generation cannot keep, because what was asked for is the absence of
-        the data and not the absence of a match.
+        THE INVARIANT, AND IT IS THE WHOLE METHOD:
 
-        So the order is the same as ``--reset``'s and for the same reason:
-        WRITE WHAT IS LEFT FIRST, DESTROY SECOND. Everyone else's embeddings
-        land in a fresh generation before a single old file is touched, and
-        if that write fails nothing is destroyed at all -- a delete of one
-        person may never cost another person's enrolment.
+            NO FILE IS DESTROYED UNLESS THE EMBEDDINGS IT HELD, MINUS HERS,
+            HAVE BEEN READ BACK FROM THE NEW GENERATION ON DISK.
 
-        ONLY A GENERATION PROVEN TO HOLD HER IS DESTROYED. An earlier version
-        shredded every generation that would not PARSE as well, reasoning
-        that nothing can prove an unreadable file does not hold her. That is
-        true and it is not worth what it costs: ``_read`` REFUSES a format
-        number it does not recognise (that is the point of the check), so the
-        first build that bumps FORMAT makes every existing generation
-        "unreadable", and ``--delete --label somebody-who-was-never-enrolled``
-        would then destroy the whole gallery and exit 0. Measured 2026-09-03
-        on a throwaway store: 13 embeddings, one generation, ``_format``
-        bumped by one, ``--delete --label heather`` -> empty directory.
-        Unreadable generations are now COUNTED AND REPORTED and never
-        touched; the caller says so out loud and stops claiming the delete
-        was complete. Destroying them is still available and still one
-        command -- it is ``--delete`` with no ``--label``, which is the one
-        that means "everything".
+        Not inferred from a return value, not counted in memory, not assumed
+        because a save did not raise. READ BACK. If that read-back cannot be
+        performed for any reason at all -- a model this build cannot size, a
+        file that will not open, a save that only partly landed -- nothing is
+        destroyed, the caller is told the delete is INCOMPLETE, and it is told
+        why.
 
-        CRASHED-SAVE LEFTOVERS GO, ALWAYS. ``gen-00002.npz.tmp`` holds a full
-        pool and does not match ``_GEN_RE``, so it is invisible to
-        ``generations()`` and to the caller's read-back -- and it cannot be
-        filtered by label, because it is somebody's whole pool. ``_prune()``
-        already shreds them on every ordinary save, which is exactly why this
-        was invisible: when somebody else survives, the save cleans up on the
-        way past. When NOBODY survives there is no save, and her complete
-        embedding set stayed on the disk under a command that printed
-        "verified". So they are shredded here, unconditionally, and counted.
+        WHY IT IS WRITTEN AS AN INVARIANT AND NOT AS GUARDS. This is the third
+        round on one bug, and it moved every time: (1) ``load()`` returned
+        nothing on a mixed gallery, "no survivors" was inferred from the empty
+        pool, and every generation holding her was shredded with its bystanders
+        inside; (2) the read-back meant to catch that was inert, because it
+        built its gallery with the DEFAULT model; (3) ``_prune()`` -- inside
+        this method's OWN save -- destroyed a generation this method had never
+        looked at, and the same call reported the delete complete. Three doors
+        into one room. A fourth guard aimed at the third door would have found
+        a fourth door, so the room is closed instead: nothing here deletes
+        anything it has not proved is superseded, and ``_prune`` is not
+        allowed to run inside it (``save(prune=False)``).
 
-        Every file goes through ``_shred`` -- overwritten, then unlinked.
-        Read ``_shred`` for the limit of what that buys; the caller is only
-        allowed to claim that part.
+        THE ORDER, and each step is refusable:
 
-        A GENERATION WHOSE SURVIVORS CANNOT BE REWRITTEN IS TREATED EXACTLY
-        LIKE AN UNREADABLE ONE, and this is the second thing that nearly cost
-        him everybody else's enrolment. Two shapes reach it:
+        1. INVENTORY FIRST, RAW. For every generation, which labels it holds
+           and HOW MANY samples each, by reading the key names at this FORMAT
+           -- no model check, no dimension check, no degenerate filter. The
+           scan that asked ``_read`` for VECTORS could not see her in a
+           generation another model wrote (it yields none), so she survived a
+           "complete" delete. A generation that will not inventory is recorded
+           as unreadable, never touched, and never vouched for.
+        2. WRITE THE REPLACEMENT, second, never first. Everyone else lands in
+           a fresh generation before one old byte is touched; if that write
+           fails, nothing is destroyed at all. It is skipped entirely when
+           every generation holding her holds ONLY her -- there is nobody to
+           carry, so there is nothing to write.
+        3. READ THE REPLACEMENT BACK FROM DISK and count it. Every label in
+           the inventory except hers must be present with AT LEAST the samples
+           it had. Counts, not names: the label-level version of this check
+           destroyed a generation holding ten of his takes on the strength of
+           one holding three, and called the delete complete. He kept his name
+           and lost seven samples.
+        4. ONLY THEN SHRED, and only the generations that step 3 proved
+           superseded -- plus every crashed-save ``.tmp``, which holds a whole
+           pool under a name no label can filter and no read-back can see.
+        5. READ THE DISK AGAIN. ``complete`` is True only if no generation
+           still holds her, nothing was left uninventoried, and no ``.tmp``
+           survived. That is the other direction of the promise and it is not
+           optional: it must be impossible for this to report success while
+           her data is on the disk.
 
-        * ANOTHER MODEL'S GENERATION. During the swap window every file on
-          the disk is SFace's and every gallery the code opens is ArcFace's.
-          ``holds`` is found by reading the files RAW, which sees across
-          models; ``load()`` then refuses the cross-model generation and
-          loads NOTHING; ``self.total()`` is 0, so the save is skipped -- and
-          the old loop shredded the generation anyway. Measured 2026-09-03 on
-          a throwaway store: one SFace generation, six hunter samples and
-          four heather samples, an ArcFace gallery, ``purge_label("heather")``
-          -> empty directory. HIS enrolment destroyed to delete HERS. The
-          justification for skipping the save ("when the pool is empty there
-          is nobody else to lose") is true when the pool is genuinely empty
-          and FALSE when it is empty because the generation could not be
-          read.
-        * A GENERATION HOLDING SOMEBODY THE NEW ONE DOES NOT. The newest
-          generation holds only her; an older one holds him as well. "What is
-          left" is nothing, there is no save, and destroying the older file
-          takes his only samples with hers.
+        ANYTHING THAT FAILS ANY STEP IS REPORTED AND LEFT ALONE. That is not
+        timidity, it is the only honest outcome: a generation this build
+        cannot rewrite (his SFace enrolment during the ArcFace window) or one
+        holding somebody the replacement does not carry cannot be destroyed
+        without costing a bystander their enrolment -- and it cannot be
+        pretended away either, because she is still in it. So it is counted,
+        named, and the caller stops claiming the delete was carried out.
+        Destroying it is still one command: ``--delete`` with no ``--label``,
+        the one that means everything.
 
-        SKIPPING SUCH A GENERATION IN THE SCAN WOULD BE THE WRONG FIX: it
-        would leave her embeddings on the disk after she asked to be
-        forgotten while the command still said "verified", and what was asked
-        for is the absence of the data, not the absence of a match. So the
-        generation is COUNTED, REPORTED and LEFT, ``complete`` goes False, and
-        the caller stops claiming the delete was carried out. Destroying it is
-        still one command -- ``--delete`` with no ``--label``, the one that
-        means everything.
+        Every file goes through ``_shred`` -- overwritten, then unlinked. Read
+        ``_shred`` for the limit of what that buys; the caller is only allowed
+        to claim that part.
 
         Returns numbers, so a script can print them and a test can read them:
-        which generations held her, how many files went, how many could not
-        be read and so were LEFT, which were another model's, which could not
-        have their survivors carried forward, whether the delete may be called
-        complete, which generation holds what is left, and who is still
-        enrolled.
+        which generations held her, how many files went, which could not be
+        read, which another model wrote, which could not have their survivors
+        carried forward, which STILL hold her afterwards, whether the delete
+        may be called complete, which generation holds what is left, and who
+        is still enrolled.
         """
         if self.root is None:
             raise ValueError("this gallery has no root; it cannot be purged")
         label = str(label)
         out: dict = {"label": label, "generations_with": [], "removed": 0,
                      "unreadable": [], "foreign": [], "foreign_models": (),
-                     "not_carried": [], "tmp_removed": 0,
-                     "generation": 0, "left": 0,
-                     "labels_left": (), "reason": "", "complete": False}
-        holds: List[int] = []
-        unreadable: List[int] = []
-        foreign: List[int] = []
+                     "not_carried": [], "still_holding": [], "tmp_removed": 0,
+                     "generation": 0, "loaded": 0, "left": 0,
+                     "labels_left": (), "labels_on_disk": (), "reason": "",
+                     "complete": False}
+
+        # ---------------------------------------- 1. the inventory, raw, first
+        inventory: Dict[int, Dict[str, int]] = {}
         wrote_by: Dict[int, str] = {}
-        # Who ELSE is in each generation this gallery could rewrite. Read now,
-        # before anything is written, because after the save the only way to
-        # know is to read the file we are about to destroy.
-        survivors: Dict[int, set] = {}
+        unreadable: List[int] = []
         for gen in self.generations():
-            try:
-                pool, _takes, prov = self._read(self.path_for(gen))
-            except Exception:
+            counts, wrote = self._inventory(self.path_for(gen))
+            if counts is None:
                 unreadable.append(gen)
                 continue
-            if not pool.get(label):
-                continue
-            wrote = str(prov.get("model") or LEGACY_MODEL)
-            if wrote != self.model:
-                # THIS GALLERY CANNOT REWRITE IT. Its vectors are a different
-                # length from a different model, so "write what is left first"
-                # has no way to carry the survivors forward -- and it is also
-                # his previous enrolment, the thing he reverts to.
-                foreign.append(gen)
-                wrote_by[gen] = wrote
-                continue
-            holds.append(gen)
-            survivors[gen] = {k for k, v in pool.items() if v and k != label}
+            inventory[gen] = counts
+            wrote_by[gen] = wrote
+        holds = [g for g in sorted(inventory) if inventory[g].get(label)]
         out["generations_with"] = list(holds)
         out["unreadable"] = list(unreadable)
-        out["foreign"] = list(foreign)
-        out["foreign_models"] = tuple(sorted(set(wrote_by.values())))
         if not holds:
-            # Nothing this gallery can rewrite was PROVEN to hold her, so
-            # nothing on the disk may be destroyed on her account. The tmps
-            # still go: they are a crashed save's leftovers, the next ordinary
-            # save would shred them anyway, and one of them may be the very
-            # pool she is asking to have removed.
+            # Nothing that could be inventoried holds her, so nothing may be
+            # destroyed on her account. The tmps still go: they are a crashed
+            # save's leftovers, the next ordinary save would shred them
+            # anyway, and one of them may be the very pool she is asking to
+            # have removed.
             out["tmp_removed"] = self._shred_tmps()
-            out["complete"] = not (unreadable or foreign)
-            if foreign:
-                log.warning("face gallery: %r is in %d generation(s) written "
-                            "by %s and this gallery is %r; they were LEFT "
-                            "ALONE and she is still on the disk",
-                            label, len(foreign),
-                            ", ".join(out["foreign_models"]), self.model)
-            return out
+            return self._purge_verdict(out, label, unreadable)
+        # WHO ELSE IS IN THE FILES THAT MAY HAVE TO GO, and how many samples
+        # each of them has there. Read now, before anything is written,
+        # because after the save the only way to ask is to read the file we
+        # are about to destroy.
+        carry: Dict[str, int] = {}
+        for gen in holds:
+            for other, n in inventory[gen].items():
+                if other != label and n:
+                    carry[other] = max(carry.get(other, 0), n)
 
+        # ------------------------------------------- 2. write the replacement
         self.load()
         self.forget(label)
-        if self.total():
+        if carry and self.total():
             try:
                 # allow_shrink: removing a person IS a shrink, and it is the
                 # deliberate kind the guard exists to let through when it is
-                # asked for by name.
+                # asked for by name. prune=False: see save()'s docstring --
+                # pruning here destroyed a bystander's only generation.
                 out["generation"] = self.save(
-                    reason=reason or ("forget %s" % label), allow_shrink=True)
+                    reason=reason or ("forget %s" % label),
+                    allow_shrink=True, prune=False)
             except ValueError as exc:
                 # The write that was going to carry everyone else forward
                 # failed. Destroying the old generations now would take them
@@ -1089,45 +1166,135 @@ class FaceGallery:
                 out["reason"] = str(exc)
                 log.warning("face gallery: not deleting %r -- what is left "
                             "could not be saved: %s", label, exc)
-                return out
-        # AND ONLY NOW MAY A FILE GO. A generation is destroyed once, and only
-        # once, everybody else in it is safely in the generation just written.
-        # "No survivors means no save" is fine when the pool is EMPTY; it is
-        # not a licence to destroy a generation whose survivors were never
-        # written anywhere, and reading that licence too widely is what
-        # emptied a mixed gallery.
-        not_carried: List[int] = []
-        carried = set(self.labels())
+                return self._purge_verdict(out, label, unreadable)
+
+        # ------------------------------------ 3. read the replacement back
+        proven: Dict[str, int] = {}
+        if out["generation"]:
+            proven, why = self._proven_survivors(out["generation"], label)
+            if why:
+                out["reason"] = why
+                log.warning("face gallery: not deleting %r -- %s", label, why)
+                return self._purge_verdict(out, label, unreadable)
+
+        # ----------------------------------------------- 4. and only then
+        left_alone: List[int] = []
         for gen in holds:
             if gen == out["generation"]:
                 continue
-            if not survivors.get(gen, set()) <= carried:
-                not_carried.append(gen)
+            short = sorted(other for other, n in inventory[gen].items()
+                           if other != label and n > proven.get(other, 0))
+            if short:
+                # Somebody in this file is not safely in the new generation
+                # with at least what they had. It stays, she stays in it, and
+                # the caller is told both.
+                left_alone.append(gen)
+                log.warning("face gallery: generation %d also holds %s, and "
+                            "the new generation does not carry them at full "
+                            "count; LEFT ALONE with %r still in it",
+                            gen, ", ".join(short), label)
                 continue
             path = self.path_for(gen)
             if not path.exists():
-                continue          # _prune() may already have taken it
+                continue
             try:
                 _shred(path)
                 out["removed"] += 1
             except OSError:
-                # It is still there and it still holds her, so the delete is
-                # not complete and may not be reported as though it were.
-                not_carried.append(gen)
+                left_alone.append(gen)
                 log.warning("could not delete face gallery generation %d",
                             gen, exc_info=True)
-        out["not_carried"] = list(not_carried)
+        out["foreign"] = [g for g in left_alone
+                          if wrote_by.get(g, self.model) != self.model]
+        out["not_carried"] = [g for g in left_alone
+                              if g not in out["foreign"]]
+        out["foreign_models"] = tuple(sorted(
+            {wrote_by[g] for g in out["foreign"]}))
         out["tmp_removed"] = self._shred_tmps()
+        return self._purge_verdict(out, label, unreadable)
+
+    def _proven_survivors(self, generation: int, label: str):
+        """``({label: samples}, "")`` read back FROM DISK, or ``({}, why)``.
+
+        The one step that makes the invariant an invariant rather than a
+        wish. Everything upstream of it -- the return value of ``save``, the
+        pool in memory, the number the provenance claims -- is a report about
+        a write, and the failure this whole module exists for is a write that
+        SUCCEEDED and left the wrong bytes. So the replacement is opened
+        again, and only what comes back out of it may be used as proof.
+
+        Both readers run. ``_inventory`` sees the keys, which is what proves
+        SHE is not in the new file; ``_read`` sees the vectors, which is what
+        proves the survivors are actually loadable rather than merely named.
+        A generation that satisfies one and not the other is not proof of
+        anything."""
+        path = self.path_for(generation)
+        counts, wrote = self._inventory(path)
+        if counts is None:
+            return {}, ("the new generation %d cannot be read back from disk"
+                        % generation)
+        if wrote != self.model:
+            return {}, ("the new generation %d reads back as %r, not %r"
+                        % (generation, wrote, self.model))
+        if counts.get(label):
+            return {}, ("the new generation %d still holds %r"
+                        % (generation, label))
+        try:
+            pool, _takes, prov = self._read(path)
+        except Exception as exc:  # noqa: BLE001 - any failure is a refusal
+            return {}, ("the new generation %d does not load: %s"
+                        % (generation, exc))
+        if str(prov.get("model") or LEGACY_MODEL) != self.model:
+            return {}, ("the new generation %d loads as %r, not %r"
+                        % (generation, prov.get("model"), self.model))
+        if pool.get(label):
+            return {}, ("the new generation %d loads with %r still in it"
+                        % (generation, label))
+        return {k: len(v) for k, v in pool.items() if v}, ""
+
+    def _purge_verdict(self, out: dict, label: str,
+                       unreadable: List[int]) -> dict:
+        """Read the disk AFTER the shredding and say whether it is finished.
+
+        THE SECOND DIRECTION OF THE PROMISE. Everything above is about not
+        destroying somebody else's data; this is about not telling her she is
+        gone when she is not. It re-inventories every generation that is still
+        there -- the same raw read, so it can see her in files this gallery's
+        model cannot load -- and ``complete`` is True only when she is in none
+        of them, nothing was left uninventoried, no ``.tmp`` survived and no
+        step above refused. A shred that failed with OSError, a generation
+        left alone, a file that appeared underneath us: all of them land here
+        as "not complete" without a guard of their own."""
+        still: List[int] = []
+        unknown = list(unreadable)
+        for gen in self.generations():
+            counts, _wrote = self._inventory(self.path_for(gen))
+            if counts is None:
+                if gen not in unknown:
+                    unknown.append(gen)
+                continue
+            if counts.get(label):
+                still.append(gen)
+        out["unreadable"] = sorted(set(unknown))
+        out["still_holding"] = still
+        # What survives, read from the disk rather than remembered: after a
+        # delete the in-memory pool may be a generation that is no longer
+        # there, and "what is left" is a statement about the disk.
+        self.load()
+        out["loaded"] = self.loaded_generation
         out["left"] = self.total()
         out["labels_left"] = self.labels()
-        out["complete"] = not (unreadable or foreign or not_carried)
+        out["labels_on_disk"] = self.disk_labels()
+        out["complete"] = not (still or out["unreadable"] or self.leftovers()
+                               or out["reason"])
         log.info("face gallery: %r removed from %d generation(s); %d "
                  "embeddings over %d label(s) left; %d unreadable, %d from "
-                 "another model and %d with survivors that could not be "
-                 "carried forward were LEFT ALONE; delete complete: %s",
-                 label, out["removed"], out["left"], len(out["labels_left"]),
-                 len(unreadable), len(foreign), len(not_carried),
-                 out["complete"])
+                 "another model and %d whose survivors could not be carried "
+                 "forward were LEFT ALONE; %d still hold %r; delete complete: "
+                 "%s", label, out["removed"], out["left"],
+                 len(out["labels_left"]), len(out["unreadable"]),
+                 len(out["foreign"]), len(out["not_carried"]), len(still),
+                 label, out["complete"])
         return out
 
     def _shred_tmps(self) -> int:

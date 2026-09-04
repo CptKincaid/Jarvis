@@ -6750,10 +6750,46 @@ def _face_gallery(c):
     empty pool. The backend comes from HIS config, the same way
     ``_face_owner`` reads his name -- and a missing config service means "",
     which is the documented "let facemodels decide", not a guess at a model.
-    """
+
+    RETURNS None WHEN THE CONFIG CANNOT ANSWER, and the two ways it cannot are
+    both real. ``_face_owner`` right above has a try/except and this had none,
+    so a config service that RAISES took the whole voice path down with a
+    traceback; and ``camera.face_backend`` with a typo in it raises out of
+    ``facemodels.backend_for`` BY DESIGN, because a typo that silently kept
+    the old models is the class of bug that subsystem is written against.
+
+    None rather than a fallback, and that is the point: falling back to the
+    default gallery here would open a store for a model that may not be the
+    one that wrote his vectors, and "who do you recognise" would answer
+    "nobody" over a live enrolment. The three handlers say the config is
+    unreadable instead. A gallery is not a thing to guess at."""
     from jarvis.camera import face_backend_from_config
     from jarvis.facegallery import default_gallery
-    return default_gallery(backend=face_backend_from_config(c._svc("assistant")))
+    try:
+        backend = face_backend_from_config(c._svc("assistant"))
+    except Exception:  # noqa: BLE001 - a config that cannot say is not fatal
+        log.warning("face: could not read camera.face_backend", exc_info=True)
+        return None
+    try:
+        return default_gallery(backend=backend)
+    except Exception:  # noqa: BLE001 - an unknown backend name, and it RAISES
+        log.warning("face: no gallery for face backend %r", backend,
+                    exc_info=True)
+        return None
+
+
+# What the face commands say when the gallery cannot be opened at all. It
+# names the setting, because that is the one thing he can act on.
+_FACE_CONFIG_REPLY = (
+    "I can't tell which face model to open the gallery with, sir -- check "
+    "camera.face_backend in the config. I won't guess at a model: the wrong "
+    "one reads an enrolment as nobody.")
+_FACE_CONFIG_STATUS = "Face gallery: camera.face_backend unreadable"
+
+
+def _face_config_result():
+    return CommandResult(handled=True, speak=True, reply=_FACE_CONFIG_REPLY,
+                         status=_FACE_CONFIG_STATUS)
 
 
 def _h_face_enrol(c, t, m):
@@ -6772,7 +6808,10 @@ def _h_face_enrol(c, t, m):
                   "name to store it under.",
             status="Enrolment: whose?")
     pose = ee.spoken_pose(m.groupdict().get("pose") or "")
-    out = ee.enrol_answer(_face_gallery(c), who, owner=owner,
+    gallery = _face_gallery(c)
+    if gallery is None:
+        return _face_config_result()
+    out = ee.enrol_answer(gallery, who, owner=owner,
                           poses=(pose,) if pose else ())
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          status=out["status"])
@@ -6788,7 +6827,10 @@ def _h_face_forget(c, t, m):
         return CommandResult(handled=True, speak=True,
                              reply="Whose face, sir?",
                              status="Face gallery: whose?")
-    out = ee.forget_answer(_face_gallery(c), who, owner=owner)
+    gallery = _face_gallery(c)
+    if gallery is None:
+        return _face_config_result()
+    out = ee.forget_answer(gallery, who, owner=owner)
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          status=out["status"])
 
@@ -6798,7 +6840,10 @@ def _h_face_gallery(c, t, m):
     this feature that genuinely belongs in the window, because it reads a
     file and opens nothing."""
     from jarvis import enrolentry as ee
-    out = ee.gallery_answer(_face_gallery(c), owner=_face_owner(c))
+    gallery = _face_gallery(c)
+    if gallery is None:
+        return _face_config_result()
+    out = ee.gallery_answer(gallery, owner=_face_owner(c))
     return CommandResult(handled=True, speak=True, reply=out["reply"],
                          status=out["status"])
 
