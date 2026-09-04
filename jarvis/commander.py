@@ -5431,9 +5431,21 @@ _SEND_NOT_RX = re.compile(
 # address for her, sir. What is it?" on the one irreversible path. "and" is
 # a connector only: every word after it still has to be in this vocabulary,
 # so "yes, and turn the lights off" is no more a yes than it was.
-_SEND_PRONOUNS = frozenset(("her", "him", "them", "it", "you", "me", "us",
+_SEND_PRONOUNS = frozenset(("her", "him", "them", "it",
                             "that", "this", "herself", "himself",
-                            "themselves", "myself", "yourself"))
+                            "themselves"))
+# A FIRST- OR SECOND-PERSON pronoun after "to" is not the draft said back.
+# "send it to me" is a redirect to himself, and on 09-04 it SENT the file
+# to the person he was read -- ten shapes, all To=heather -- because me/us/
+# you sat in the set above and the yes grammar took "send it to <ref>" as
+# the read-back echoed. Found by the independent post-merge review; my own
+# corpus never contained one. These are answered, never sent, never a
+# recipient: the draft stays armed and he is told whom it is to.
+_SEND_SELF = frozenset(("me", "us", "you", "myself", "yourself", "ourselves",
+                        "yourselves"))
+_SEND_SELF_RX = re.compile(
+    r"(?:\b(?:send|mail|email) (?:it|that|this) |\b)(?:to|over to|on to) "
+    r"(?:me|us|you|myself|yourself|ourselves|yourselves)\b", re.I)
 # What a pronoun or demonstrative after "to" stands for is the recipient he
 # has JUST been read -- with or without a noun hung on it: "to her", "to her
 # address", "to that address", "to the same one", "that person", "her
@@ -5445,7 +5457,7 @@ _SEND_PRONOUNS = frozenset(("her", "him", "them", "it", "you", "me", "us",
 _SEND_REF_NOUN = r"(?:e-?mail address|e-?mail|address|inbox|mailbox|one|person)"
 _SEND_REF = (r"(?:(?:her|his|their|its|that|this|the same|the usual|the)\s+"
              + _SEND_REF_NOUN +
-             r"|her|him|them|me|us|you|it|that|this|the same|same)")
+             r"|her|him|them|it|that|this|the same|same)")
 _SEND_REF_RX = re.compile(r"^" + _SEND_REF + r"$", re.I)
 _SEND_TO_REF = (r"(?:send (?:it|that|this) )?(?:to|over to|on to) " + _SEND_REF)
 # "from the same account" is the account he was just read, not a new one.
@@ -5550,7 +5562,10 @@ def _send_correction(said: str) -> Optional[tuple[str, str]]:
                 # people book might know, and let the address question do
                 # the rest.
                 who = re.sub(r"^(?:her|his|their)\s+", "", who, flags=re.I)
-                if who.lower() in _SEND_PRONOUNS:
+                if who.lower() in _SEND_PRONOUNS or who.lower() in _SEND_SELF:
+                    # A self-pronoun is not a recipient called "me" either;
+                    # _try_send_confirm has already answered it by the time
+                    # a yes-prefixed one reaches here.
                     who = ""
     if not who and not acct:
         return None
@@ -10800,6 +10815,18 @@ class Commander:
         answer = parse_send_answer(text)
         if answer is None:
             said = " ".join(str(text or "").split())
+            if _SEND_SELF_RX.search(said):
+                # "send it to me": a redirect to himself. Never a yes, never
+                # a new recipient called "me". The draft is kept armed and he
+                # hears whom it is to, so the next word he says is to a
+                # sentence he has just heard.
+                self._pending_send = draft
+                log.info("send read-back: %r redirects to himself; not a yes",
+                         text[:60])
+                return CommandResult(
+                    handled=True, speak=True, status="Confirm?",
+                    reply=outbox.SELF_LINE.format(
+                        who=draft.to_name or draft.to_addr))
             # A yes that carries a CORRECTION -- "yes, send it to Dana",
             # "yes, but from my work account", "yes, to her work address
             # instead" -- is neither a yes nor a change of subject (F23).
