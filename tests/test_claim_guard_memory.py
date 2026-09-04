@@ -300,3 +300,120 @@ def test_a_claim_free_retry_is_spoken_after_the_streamed_greeting(streamed, capl
     assert spoken == [GREETING, HONEST]
     assert tags == [("STREAMED", "2"), ("SPEAK", f"{GREETING} {HONEST}")]
     assert record == [] and len(_warnings(caplog)) == 1
+
+
+# --------------------------------- (4) the line he hears, and nothing before it
+# For a memory claim the reply is UNBACKED_MEMORY_LINE -- it names the way
+# in -- and a bare acknowledgement ("Of course, sir.") that was the yes to
+# the claim goes with the claim: a yes followed by a refusal, spoken as one
+# reply, is what the stream produced (probe f). What he asked for beside
+# the claim (a greeting, a tool's answer) is kept: it is not a lead-in.
+MEMORY_LINE = brain_mod.UNBACKED_MEMORY_LINE
+OF_COURSE = "Of course, sir. I'll remember that."
+
+
+def test_the_memory_line_is_the_whole_reply(setup):
+    b, fake, record = setup
+    fake.replies = [text_reply(NOTED), text_reply(NOTED)]
+    assert b._chat_sync(STORE) == [("SPEAK", MEMORY_LINE)]
+    assert record == []
+
+
+def test_no_of_course_lead_in_before_the_refusal(setup):
+    b, fake, record = setup
+    fake.replies = [text_reply(OF_COURSE), text_reply(OF_COURSE)]
+    assert b._chat_sync(STORE) == [("SPEAK", MEMORY_LINE)]
+
+
+def test_a_greeting_and_a_tools_answer_are_kept_beside_the_line(setup):
+    b, fake, record = setup
+    fake.replies = [text_reply(f"{GREETING} I'll remember that, sir."),
+                    text_reply(f"{GREETING} I'll remember that, sir.")]
+    assert b._chat_sync("say hello to my family and remember that I graduate "
+                        "December 10th") == [("SPEAK", f"{GREETING} {MEMORY_LINE}")]
+    fake.replies = [tool_reply(("get_time", {})), text_reply(TIME_AND_LIE),
+                    text_reply(TIME_AND_LIE)]
+    assert b._chat_sync(COMPOUND) == [("SPEAK", f"It's five past four, sir. {MEMORY_LINE}")]
+
+
+def test_each_kind_gets_its_own_line_once_in_place():
+    strip = brain_mod.strip_unbacked_claims
+    assert strip(OF_COURSE) == MEMORY_LINE
+    assert strip(f"{GREETING} I'll remember that. Enjoy your evening.") == \
+        f"{GREETING} {MEMORY_LINE} Enjoy your evening."
+    assert strip("I've added milk. I'll remember that. I've noted it too.") == \
+        f"{brain_mod.UNBACKED_LINE} {MEMORY_LINE}"
+    assert strip("Certainly, sir. I've added milk to your list.") == brain_mod.UNBACKED_LINE
+    # the cap keeps every authored line, at the cost of trailing prose
+    assert strip("One. I've added milk. I'll remember that. Four.", 2) == \
+        f"{brain_mod.UNBACKED_LINE} {MEMORY_LINE}"
+    assert strip("One. Two. I'll remember that. Four.", 2) == f"One. {MEMORY_LINE}"
+
+
+def test_a_memory_claim_gets_the_memory_nudge(setup):
+    """"Use the tools and do it now" steered a store the model cannot make
+    toward the notes tool (a write the recall path never reads). The
+    memory nudge says there is no such tool and not to invent one; whether
+    gemma obeys is his to measure, no Ollama here."""
+    b, fake, record = setup
+    fake.replies = [text_reply(NOTED), text_reply(NOTED)]
+    b._chat_sync(STORE)
+    p1, p2 = fake.chat_payloads()
+    assert p2["messages"][-1]["content"] == brain_mod.UNBACKED_MEMORY_NUDGE
+    assert p2["messages"][-2]["content"] == NOTED
+    assert "notes" in brain_mod.UNBACKED_MEMORY_NUDGE.lower()
+    assert p2["messages"][0] == p1["messages"][0]        # the static prefix untouched
+
+
+def test_streamed_of_course_does_not_stand_before_the_line(streamed, caplog):
+    """The lead-in lands on the stream BEFORE the claim it is the yes to:
+    it is held one sentence, dropped when the claim follows, and he hears
+    the authored line alone."""
+    b, fake, record, streams = streamed
+    streams.append(_chunks(OF_COURSE))
+    fake.replies = [text_reply(OF_COURSE)]
+    spoken = []
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(STORE, on_sentence=spoken.append)
+    assert spoken == [MEMORY_LINE]
+    assert tags == [("STREAMED", "1"), ("SPEAK", MEMORY_LINE)]
+    assert len(_warnings(caplog)) == 2
+
+
+def test_a_held_lead_in_is_released_with_honest_content(streamed):
+    b, fake, record, streams = streamed
+    streams.append(_chunks("Of course, sir. Milk and eggs, sir."))
+    spoken = []
+    tags = b._chat_sync("read me my shopping list", on_sentence=spoken.append)
+    assert spoken == ["Of course, sir.", "Milk and eggs, sir."]
+    assert tags == [("STREAMED", "2"), ("SPEAK", "Of course, sir. Milk and eggs, sir.")]
+    assert fake.chat_payloads() == []                     # no retry
+
+
+def test_a_lead_in_alone_is_spoken_when_the_round_ends(streamed):
+    b, fake, record, streams = streamed
+    streams.append(_chunks("Of course, sir."))
+    spoken = []
+    tags = b._chat_sync("read me my shopping list", on_sentence=spoken.append)
+    assert spoken == ["Of course, sir."]
+    assert tags == [("STREAMED", "1"), ("SPEAK", "Of course, sir.")]
+
+
+def test_a_lead_in_before_a_tool_call_stays_unspoken_and_the_tool_runs(streamed):
+    """A pin, not a change: a round that turns into a tool call speaks
+    nothing (_stream_round), so "Of course, sir." before the call was
+    never spoken and the hold must not start speaking it -- the tool's
+    own line is the reply."""
+    b, fake, record, streams = streamed
+    chunks = _chunks("Of course, sir. ")[:-1]
+    chunks.append({"message": {"role": "assistant", "content": "",
+                               "tool_calls": [{"function": {
+                                   "name": "notes",
+                                   "arguments": {"action": "add", "text": "milk"}}}]},
+                   "done": True, "load_duration": 0})
+    streams.append(chunks)
+    spoken = []
+    tags = b._chat_sync("add milk to my list", on_sentence=spoken.append)
+    assert spoken == []
+    assert record == [("notes", "add", "milk")]
+    assert tags == [("SPEAK", "Noted, sir.")]

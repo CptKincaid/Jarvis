@@ -306,6 +306,30 @@ UNBACKED_LINE = "I couldn't do that part, sir."
 # him nothing about how to phrase it so it lands. This names the way in.
 UNBACKED_MEMORY_LINE = ("I can't store that from here, sir — say 'remember "
                         "that …' and I will.")
+_AUTHORED_LINES = (UNBACKED_LINE, UNBACKED_MEMORY_LINE)
+# The nudge for a memory claim. UNBACKED_NUDGE's "use the tools and do it
+# now" steers a store the model cannot make toward the notes tool -- a
+# write the recall path never reads (2026-09-04 refuter, probe c). This
+# one says there is no such tool and not to invent one. Whether gemma
+# obeys it is not measured here (no Ollama in the suite); the line above
+# stands in when it does not.
+UNBACKED_MEMORY_NUDGE = ("[You said you stored or would remember something, "
+                         "but you have no tool that stores facts, and notes, "
+                         "reminders and events are not that. Do not store it "
+                         "anywhere. Answer the rest of my request, and for the "
+                         "store say plainly that you cannot remember that from "
+                         "here.]")
+# A sentence that is ONLY an acknowledgement. Before a claim it is the yes
+# to that claim, and with the claim withheld it would stand as a yes to
+# nothing -- "Of course, sir." then a refusal, heard as one reply (probe
+# f). Held one sentence on the stream, dropped beside a replaced claim.
+# "Noted, sir." is deliberately not here: it is a claim of its own kind
+# and the notes tool's authored line, and this guard never sees the latter.
+_ACK_ONLY_RX = re.compile(
+    r"^\s*(?:(?:of course|certainly|very good|very well|right away|"
+    r"straight away|at once|absolutely|indeed|understood|as you wish|"
+    r"consider it done|by all means|with pleasure|gladly|naturally|"
+    r"but of course|yes|yes indeed)(?:,? sir)?[.!]*\s*)+$", re.I)
 
 
 # The memory shapes: "I have noted that, sir" (2026-09-02, his graduation),
@@ -526,27 +550,44 @@ _MEMORY_REQUEST_RX = re.compile(
 
 def strip_unbacked_claims(text, n=None, ran=(), backers=None, kinds=None):
     """``text`` with every sentence that claims an action replaced by ONE
-    UNBACKED_LINE, in the place of the first, the other sentences kept:
-    the greeting survives, the invented actions do not. ``n`` is the
-    spoken-sentence cap the reply will meet later; the apology is kept
-    inside it, since it is the one sentence here that must be heard.
-    Unchanged text when nothing claims anything."""
-    kept, said = [], False
+    authored line per claim KIND -- UNBACKED_LINE for an action,
+    UNBACKED_MEMORY_LINE for a store -- in the place of the first of its
+    kind, the other sentences kept: the greeting survives, the invented
+    actions do not. A bare acknowledgement ("Of course, sir.") goes with
+    the claim it was the yes to. ``n`` is the spoken-sentence cap the
+    reply will meet later; the authored lines are kept inside it, since
+    they are the sentences here that must be heard. Unchanged text when
+    nothing claims anything."""
+    kept, said = [], []
     for sent in split_sentences(text):
-        if _sentence_claim(sent, ran, backers, kinds):
-            if not said:
-                kept.append(UNBACKED_LINE)
-                said = True
+        claim = _sentence_claim(sent, ran, backers, kinds)
+        if claim:
+            kind = claim_kind(claim)
+            if kind not in said:
+                kept.append(UNBACKED_MEMORY_LINE if kind == "memory"
+                            else UNBACKED_LINE)
+                said.append(kind)
             continue
         kept.append(sent)
     if not said:
         return text
+    kept = [s for s in kept if not _ACK_ONLY_RX.match(s)]
     if n is not None and len(kept) > n:
-        head = kept[:max(1, int(n))]
-        if UNBACKED_LINE not in head:
-            head = head[:-1] + [UNBACKED_LINE]
+        lines = [s for s in kept if s in _AUTHORED_LINES]
+        room, head = max(0, int(n) - len(lines)), []
+        for sent in kept:
+            if sent in _AUTHORED_LINES:
+                head.append(sent)
+            elif room > 0:
+                head.append(sent)
+                room -= 1
         kept = head
     return " ".join(kept)
+
+
+def authored_lines_in(text):
+    """The guard's own lines present in ``text``, in order."""
+    return [s for s in split_sentences(text or "") if s in _AUTHORED_LINES]
 
 
 # ----------------------------------------------------------------------
@@ -3043,19 +3084,44 @@ class JarvisBrain:
             # claim is judged against (CLAIM_BACKERS)
             return [name for name, _ in ran_results]
 
+        # A bare acknowledgement held back one sentence while the guard is
+        # armed: "Of course, sir." is the yes to whatever follows, and if
+        # what follows is a withheld claim it must not stand alone (probe
+        # f). Released with the next honest sentence, or when the round
+        # ends with nothing to veto it (release_ack).
+        held_ack = []
+
         def guard(sentence):
             # The guards _finish_spoken applies to the whole reply, per
             # sentence: a streamed sentence is spoken before the reply
             # exists, so it must not carry an ungrounded clock claim or
             # a leaked context line the full reply would have lost.
-            if unbacked_armed and unbacked_claim(sentence, ran_names(),
-                                                 kinds=claim_kinds):
-                # Withheld, not spoken: with no backing tool run yet, "I'm
-                # starting your music now" is a claim the round has not
-                # earned. The whole reply is judged once the round ends --
-                # the retry or the authored line speaks for this sentence,
-                # never the model.
-                return ""
+            if unbacked_armed:
+                if unbacked_claim(sentence, ran_names(), kinds=claim_kinds):
+                    # Withheld, not spoken: with no backing tool run yet,
+                    # "I'm starting your music now" is a claim the round
+                    # has not earned. The whole reply is judged once the
+                    # round ends -- the retry or the authored line speaks
+                    # for this sentence, never the model. The lead-in that
+                    # said yes to it goes with it.
+                    held_ack.clear()
+                    return ""
+                if not held_ack and _ACK_ONLY_RX.match(sentence):
+                    held_ack.append(sentence)
+                    return ""
+            line = clean(sentence)
+            if held_ack:
+                return [clean(held_ack.pop()), line]
+            return line
+
+        def release_ack(streamed):
+            # the round ended with the lead-in still held and nothing
+            # spoken against it: it is the reply, or its start
+            if held_ack and not self._stale(gen):
+                self._emit_sentence(held_ack.pop(), cap, on_sentence,
+                                    streamed, clean)
+
+        def clean(sentence):
             line = clean_ollama_reply(strip_markdown(clean_ollama_reply(sentence)))
             guarded = guard_clock_claims(
                 line, "\n".join([ctx_text, mem_text] + tool_texts), text)
@@ -3101,6 +3167,7 @@ class JarvisBrain:
                         data, content, calls = self._stream_round(
                             messages, round_tools, cap, on_sentence,
                             round_sentences, guard, gen=gen)
+                        release_ack(round_sentences)
                     finally:
                         # kept even when the stream dies: they were spoken
                         streamed_sentences.extend(round_sentences)
@@ -3155,7 +3222,9 @@ class JarvisBrain:
                             messages.append({"role": "assistant",
                                              "content": content})
                             messages.append({"role": "user",
-                                             "content": UNBACKED_NUDGE})
+                                             "content": (UNBACKED_MEMORY_NUDGE
+                                                         if claim_kind(claim) == "memory"
+                                                         else UNBACKED_NUDGE)})
                             # ONE retry, with a round of its own: the
                             # reply that earned it was the model's whole
                             # answer, and max_rounds counted it.
@@ -3184,11 +3253,13 @@ class JarvisBrain:
                                 # the honest sentences were streamed as they
                                 # landed and the claims withheld: the line
                                 # standing in for them is spoken now, once
-                                streamed_sentences.append(UNBACKED_LINE)
-                                try:
-                                    on_sentence(UNBACKED_LINE)
-                                except Exception:
-                                    log.exception("on_sentence failed")
+                                # per kind
+                                for line in authored_lines_in(final):
+                                    streamed_sentences.append(line)
+                                    try:
+                                        on_sentence(line)
+                                    except Exception:
+                                        log.exception("on_sentence failed")
                         elif unbacked_first is not None:
                             # A retry that claims nothing and ran no tool
                             # is KEPT. This used to discard it for the
@@ -3573,16 +3644,21 @@ class JarvisBrain:
         if len(streamed) >= cap:
             return                            # the spoken cap still holds
         if guard is not None:
-            line = guard(sentence)
+            lines = guard(sentence)           # a str, or a released lead-in + it
         else:
-            line = trim_spoken(strip_markdown(sentence).strip())
-        if not line:
-            return
-        streamed.append(line)
-        try:
-            on_sentence(line)
-        except Exception:
-            log.exception("on_sentence failed")
+            lines = trim_spoken(strip_markdown(sentence).strip())
+        if isinstance(lines, str):
+            lines = [lines]
+        for line in lines:
+            if not line:
+                continue
+            if len(streamed) >= cap:
+                return
+            streamed.append(line)
+            try:
+                on_sentence(line)
+            except Exception:
+                log.exception("on_sentence failed")
 
     # ------------------------------------------------------------------
     # Tier 3: Claude CLI (deep reasoning)
