@@ -119,11 +119,48 @@ from jarvis.logs import get_logger
 
 log = get_logger("facegallery")
 
+# NOT BUMPED FOR THE MODEL SWAP, AND THAT IS THE WHOLE POINT. ``_read``
+# refuses a format it does not recognise, so bumping this would make his
+# existing SFace generations UNREADABLE -- which would take his ability to
+# revert with them. Instead the model is carried in an OPTIONAL ``_model``
+# key: a generation without one was written by SFace, because nothing else
+# has ever written this store.
 FORMAT = 1
+
+# ------------------------------------------------------------ which model
+# WHICH MODEL PRODUCED A VECTOR IS PART OF THE VECTOR. An ArcFace 512-vector
+# and an SFace 128-vector are not weakly comparable, they are not comparable:
+# the cosine between them is not a worse measurement of the same thing, it is
+# a measurement of nothing. Before this key existed the store recorded only
+# the numbers, so a mixed gallery would have scored his own face against
+# noise and reported it as a low match -- "recognition got worse" with no way
+# to find out why. Every read, every write and every comparison here now names
+# the model, and a cross-model comparison is refused BY NAME rather than
+# scored.
+SFACE_MODEL = "sface"
+ARCFACE_MODEL = "arcface_mbf"
 # SFace (face_recognition_sface_2021dec.onnx, Apache-2.0) returns 128 float32.
 # Measured on this box 2026-09-02: shape (1, 128), L2 norm 10.41 -- NOT unit
 # length, which is why every comparison here normalises rather than dotting.
-EMBED_DIM = 128
+# ArcFace w600k_mbf returns 512 and jarvis/faceinsight.normalise unit-lengths
+# it at the source.
+MODEL_DIMS = {SFACE_MODEL: 128, ARCFACE_MODEL: 512}
+# What a generation with no ``_model`` key was written by. This is not a
+# guess: the key was added on 2026-09-03 and SFace is the only recogniser
+# that had ever written this store.
+LEGACY_MODEL = SFACE_MODEL
+DEFAULT_MODEL = SFACE_MODEL
+EMBED_DIM = MODEL_DIMS[SFACE_MODEL]
+
+
+def model_dim(model: str) -> int:
+    """How many floats a vector from ``model`` has, or ValueError by name."""
+    try:
+        return MODEL_DIMS[str(model)]
+    except KeyError:
+        raise ValueError(
+            "unknown embedding model %r; known: %s"
+            % (model, ", ".join(sorted(MODEL_DIMS)))) from None
 # Five is enough history to undo a mistake noticed a few enrolments later and
 # small enough that the whole store stays under a megabyte at 128 floats a
 # sample. Never pruned below two: one generation is no backup at all.
@@ -133,6 +170,21 @@ MIN_GENERATIONS = 2
 # store does not enforce it (the consumer decides how sure it needs to be) but
 # it is the number a caller should start from.
 SFACE_COSINE_SAME = 0.363
+# AND THERE IS NO SUCH NUMBER FOR ARCFACE HERE, on purpose. 0.363 is OpenCV's
+# published figure for SFace's vectors; carrying it across to a different
+# model's would be a threshold that has stopped meaning anything, which is the
+# exact failure this module's cross-model refusal exists to prevent. It cannot
+# be measured without his face, so ``scripts/face_model_compare.py`` is the
+# instrument and he is the one who runs it. None means UNMEASURED, and every
+# consumer must treat it as "say so", not as "use zero".
+ARCFACE_COSINE_SAME = None
+MODEL_COSINE_SAME = {SFACE_MODEL: SFACE_COSINE_SAME,
+                     ARCFACE_MODEL: ARCFACE_COSINE_SAME}
+
+
+def cosine_same(model: str):
+    """The published "same person" cosine for a model, or None if unmeasured."""
+    return MODEL_COSINE_SAME.get(str(model))
 
 _GEN_RE = re.compile(r"^gen-(\d{5})\.npz$")
 # A crashed save leaves gen-00002.npz.tmp, which _GEN_RE does not match -- so
@@ -274,16 +326,23 @@ def cosine(a, b) -> float:
     return float(np.dot(a, b) / (na * nb))
 
 
-def degenerate_reason(vec) -> str:
-    """"" if this could be a face embedding, else why it could not be.
+def degenerate_reason(vec, model: str = DEFAULT_MODEL) -> str:
+    """"" if this could be a face embedding from ``model``, else why not.
 
     The three shapes that have actually appeared: the wrong dimension (a
     different model's output), a non-finite element (a crop of nothing), and a
     CONSTANT vector -- which is what the fixture that destroyed his voiceprint
-    contained, and which no real embedding is."""
+    contained, and which no real embedding is.
+
+    THE DIMENSION CHECK IS NOW THE MODEL CHECK'S LAST LINE, not its first.
+    512 floats where 128 belong is caught here and named; 512 floats where 512
+    belong but from the wrong 512-D model is caught upstream by the ``_model``
+    key, because arithmetic cannot see that one."""
+    dim = model_dim(model)
     arr = np.asarray(vec, dtype=np.float64).ravel()
-    if arr.size != EMBED_DIM:
-        return "wrong dimension: %d, expected %d" % (arr.size, EMBED_DIM)
+    if arr.size != dim:
+        return ("wrong dimension: %d, expected %d for %s"
+                % (arr.size, dim, model))
     if not np.all(np.isfinite(arr)):
         return "not finite"
     if float(np.linalg.norm(arr)) == 0.0:
@@ -331,8 +390,22 @@ class FaceGallery:
     wants to match against something it just built, and used by the tests that
     check the guards without touching a filesystem at all."""
 
-    def __init__(self, root: Optional[Path] = None):
+    def __init__(self, root: Optional[Path] = None,
+                 model: str = DEFAULT_MODEL):
         self.root: Optional[Path] = None if root is None else Path(root)
+        # WHAT THIS GALLERY IS FOR. Every vector added, loaded, saved and
+        # matched has to have come from this model; anything else is refused
+        # by name. Defaulting to SFace keeps every existing caller and every
+        # existing test writing exactly the file it wrote before -- the
+        # production path names the model explicitly through
+        # ``default_gallery``.
+        self.model = str(model)
+        model_dim(self.model)          # raise now, not on his enrolment
+        # Generations on disk written by SOMETHING ELSE. Not an error and not
+        # deleted: they are his old enrolment, and they are what he reverts
+        # to. ``load()`` fills this in so a caller can say the true sentence
+        # -- "13 sface takes are on disk, none for arcface_mbf, re-enrol".
+        self.foreign_generations: Dict[int, str] = {}
         self._pool: Dict[str, List[np.ndarray]] = {}
         # Kept in lockstep with _pool, index for index. ``takes()`` pads
         # rather than trusting that, because a mismatch would attach one
@@ -387,7 +460,7 @@ class FaceGallery:
         apart on a rejected sample."""
         if not _LABEL_RE.match(label or ""):
             raise ValueError("bad label %r: lowercase letters, digits, - and _" % label)
-        why = degenerate_reason(vec)
+        why = degenerate_reason(vec, self.model)
         if why:
             raise ValueError("refusing a degenerate embedding: %s" % why)
         arr = np.asarray(vec, dtype=np.float32).ravel().copy()
@@ -412,7 +485,7 @@ class FaceGallery:
         centroid of him in glasses and him without is a face that does not
         exist, and the same averaging is why the voiceprint's own pool keeps
         its members (jarvis/speaker.py:249-262)."""
-        if degenerate_reason(vec):
+        if degenerate_reason(vec, self.model):
             return "", 0.0
         best_label, best = "", 0.0
         for label, pool in self._pool.items():
@@ -462,6 +535,7 @@ class FaceGallery:
         truncated or corrupt newest file must cost the last enrolment, not the
         enrolment."""
         wanted = [generation] if generation else list(reversed(self.generations()))
+        self.foreign_generations = {}
         for gen in wanted:
             try:
                 pool, takes, prov = self._read(self.path_for(gen))
@@ -469,15 +543,65 @@ class FaceGallery:
                 log.warning("face gallery generation %d unreadable; "
                             "falling back to the one before", gen, exc_info=True)
                 continue
+            wrote = str(prov.get("model") or LEGACY_MODEL)
+            if wrote != self.model:
+                # A CROSS-MODEL LOAD IS REFUSED, NOT SCALED, NOT TRUNCATED AND
+                # NOT SILENTLY SKIPPED. Its vectors measure a different thing;
+                # cosine against them is meaningless rather than merely weak.
+                # The file is left exactly where it is -- it is his previous
+                # enrolment and the thing he reverts to.
+                self.foreign_generations[gen] = wrote
+                log.warning(
+                    "face gallery generation %d was written by %r and this "
+                    "gallery is %r. NOT comparing across models: the cosine "
+                    "between them measures nothing. Those %d sample(s) stay "
+                    "on disk untouched.",
+                    gen, wrote, self.model, int(prov.get("n") or 0))
+                continue
             self._pool = pool
             self._takes = takes
             self.loaded_generation = gen
             self._loaded_n = sum(len(v) for v in pool.values())
             self._provenance = prov
             log.info("face gallery loaded: generation %d, %d samples over %d "
-                     "labels", gen, self._loaded_n, len(pool))
+                     "labels, model %s", gen, self._loaded_n, len(pool),
+                     self.model)
             return True
+        if self.foreign_generations:
+            log.warning("face identity is OFF: %s", self.reenrol_message())
         return False
+
+    # -------------------------------------------------- the migration line
+    def foreign_sample_count(self) -> int:
+        """How many samples sit on disk under a DIFFERENT model.
+
+        Read from the files rather than remembered, because the caller that
+        needs this number is the one that has just failed to load anything.
+        """
+        total = 0
+        for gen in self.foreign_generations:
+            try:
+                _pool, _takes, prov = self._read(self.path_for(gen))
+            except Exception:  # noqa: BLE001 - unreadable defends nothing
+                continue
+            total += int(prov.get("n") or 0)
+        return total
+
+    def reenrol_message(self) -> str:
+        """ONE LINE saying exactly what he has to do, for the startup log.
+
+        Not "identity unavailable". Not a stack trace. The failure this
+        sentence prevents is the one where recognition quietly stops working
+        after a model change and the log says something true but useless.
+        """
+        others = sorted({m for m in self.foreign_generations.values()})
+        n = self.foreign_sample_count()
+        return ("nothing is enrolled for %s (%d sample(s) on disk from %s, "
+                "kept, not deleted). Say \"enrol my face\" or run "
+                "scripts/face_enrol.py to re-enrol; or set "
+                "camera.face_backend to \"opencv\" to go back to the old "
+                "models and your existing enrolment."
+                % (self.model, n, ", ".join(others) or "an older model"))
 
     def _read(self, path: Path):
         data = np.load(path)
@@ -487,6 +611,24 @@ class FaceGallery:
             # silently stop comparing; speaker.py:264-271 warns about exactly
             # this for the voiceprint. Refuse, do not guess.
             raise ValueError("face gallery format %d, this build reads %d" % (fmt, FORMAT))
+        # THE MODEL IS READ BEFORE THE VECTORS, because it decides what a
+        # valid vector looks like. A generation with no ``_model`` predates
+        # the key and was written by SFace; see LEGACY_MODEL.
+        wrote = (str(data["_model"][0]) if "_model" in data.files
+                 else LEGACY_MODEL)
+        try:
+            model_dim(wrote)
+        except ValueError:
+            # A model this build has never heard of. Its vectors cannot be
+            # validated, so none are loaded -- but the generation is REPORTED
+            # rather than treated as corrupt, because "written by a newer
+            # build" and "truncated" want opposite responses and destroying
+            # the wrong one is unrecoverable.
+            log.warning("face gallery %s was written by unknown model %r; "
+                        "loading no vectors from it and leaving it alone",
+                        path.name, wrote)
+            return {}, {}, {"format": fmt, "created_ns": 0, "reason": "",
+                            "n": 0, "recorded": 0, "model": wrote}
         pool: Dict[str, List[np.ndarray]] = {}
         takes: Dict[str, List[Take]] = {}
         have = set(data.files)
@@ -495,13 +637,14 @@ class FaceGallery:
             if not m:
                 continue
             arr = np.asarray(data[key], dtype=np.float32).ravel()
-            if degenerate_reason(arr):
+            if degenerate_reason(arr, wrote):
                 # A stored vector that cannot be a face is not loaded: it
                 # would drag every future match toward itself. ITS NOTE GOES
                 # WITH IT -- the two lists are paired by position, so keeping
                 # the note of a dropped vector shifts every note after it
                 # onto the wrong face.
-                log.warning("face gallery: dropping %s (%s)", key, degenerate_reason(arr))
+                log.warning("face gallery: dropping %s (%s)", key,
+                            degenerate_reason(arr, wrote))
                 continue
             label, idx = m.group(1), m.group(2)
             pool.setdefault(label, []).append(arr)
@@ -521,7 +664,8 @@ class FaceGallery:
                 "reason": str(data["_reason"][0]) if "_reason" in data.files else "",
                 "n": sum(len(v) for v in pool.values()),
                 "recorded": sum(1 for ts in takes.values()
-                                for t in ts if t.recorded)}
+                                for t in ts if t.recorded),
+                "model": wrote}
         return pool, takes, prov
 
     def save(self, reason: str, allow_shrink: bool = False) -> int:
@@ -569,6 +713,10 @@ class FaceGallery:
         arrays["_format"] = np.array([FORMAT])
         arrays["_created_ns"] = np.array([time.time_ns()])
         arrays["_reason"] = np.array([str(reason)])
+        # The key that makes a mixed store safe. Written on every save from
+        # now on; its ABSENCE is what identifies the pre-2026-09-03 SFace
+        # generations, so it must never be written as an empty string.
+        arrays["_model"] = np.array([str(self.model)])
 
         path = self.path_for(gen)
         tmp = path.with_name(path.name + ".tmp")
@@ -603,7 +751,8 @@ class FaceGallery:
                             "reason": str(reason), "n": n,
                             "recorded": sum(1 for label in self._pool
                                             for t in self.takes(label)
-                                            if t.recorded)}
+                                            if t.recorded),
+                            "model": self.model}
         self._prune()
         log.info("face gallery saved: generation %d, %d samples (%s)", gen, n, reason)
         return gen
@@ -618,6 +767,14 @@ class FaceGallery:
             _pool, _takes, prov = self._read(self.path_for(generation))
         except Exception:
             return 0          # unreadable: it defends nothing and protects nothing
+        if str(prov.get("model") or LEGACY_MODEL) != self.model:
+            # ANOTHER MODEL'S GENERATION DEFENDS NOTHING HERE, and counting it
+            # would break the very first save after a swap: his 13 SFace takes
+            # would be the shrink guard's baseline, and a fresh 5-take ArcFace
+            # enrolment would be refused as "shrinking the gallery from 13 to
+            # 5". It is still protected from pruning -- see ``_prune`` -- it
+            # simply is not evidence about THIS model's enrolment.
+            return 0
         return int(prov.get("n") or 0)
 
     def _on_disk_n(self) -> int:
@@ -661,6 +818,19 @@ class FaceGallery:
         Ties go to the newest, so a steady state prunes exactly as before."""
         gens = self.generations()
         keep = max(KEEP_GENERATIONS, MIN_GENERATIONS)
+        # ANOTHER MODEL'S GENERATIONS ARE NOT IN THE WINDOW AT ALL. Without
+        # this line the first five saves after a model swap would evict his
+        # entire previous enrolment -- silently, as a side effect of a
+        # successful re-enrolment, leaving him nothing to revert to. That is
+        # the same shape as the incident this whole module exists for, one
+        # model change later. They are pruned by ``purge()``, which is a
+        # deliberate delete, and by nothing else.
+        mine = self._own_generations(gens)
+        kept_foreign = [g for g in gens if g not in mine]
+        if kept_foreign:
+            log.debug("face gallery: %d generation(s) from another model are "
+                      "outside the prune window", len(kept_foreign))
+        gens = mine
         for tmp in self._tmp_paths():
             # A crashed save's leftovers are not a generation and hold no
             # history worth keeping; they are just embeddings lying around --
@@ -683,12 +853,32 @@ class FaceGallery:
             except OSError:
                 log.debug("could not prune generation %d", gen, exc_info=True)
 
+    def _own_generations(self, gens=None) -> List[int]:
+        """The generations THIS gallery's model wrote, oldest first.
+
+        An unreadable generation is counted as its own -- it may be one of
+        ours and there is no way to know, and the alternative is a pruning
+        rule that quietly protects corrupt files forever.
+        """
+        out = []
+        for gen in (self.generations() if gens is None else list(gens)):
+            try:
+                _pool, _takes, prov = self._read(self.path_for(gen))
+            except Exception:  # noqa: BLE001
+                out.append(gen)
+                continue
+            if str(prov.get("model") or LEGACY_MODEL) == self.model:
+                out.append(gen)
+        return out
+
     def rollback(self) -> int:
         """Delete the newest generation and load the one before it.
 
         The step that did not exist on 2026-09-02. Returns the generation now
         loaded, or 0 if there was nothing to roll back to."""
-        gens = self.generations()
+        # OUR generations only: rolling back an ArcFace enrolment must never
+        # shred the SFace file underneath it.
+        gens = self._own_generations()
         if len(gens) < 2:
             return 0
         # Prove there is something to fall back TO before destroying what
@@ -917,10 +1107,20 @@ class FaceGallery:
         return dict(self._provenance)
 
 
-def default_gallery() -> FaceGallery:
-    """The user's gallery, wherever PATHS says it is.
+def default_gallery(model: Optional[str] = None,
+                    backend: Optional[str] = None) -> FaceGallery:
+    """The user's gallery, wherever PATHS says it is, for the live model.
 
     PATHS.FACE_GALLERY honours JARVIS_FACE_GALLERY, which tests/conftest.py
     forces into a throwaway directory -- so importing this in a test cannot
-    reach his enrolled face."""
-    return FaceGallery(root=PATHS.FACE_GALLERY)
+    reach his enrolled face.
+
+    ``model`` wins if given; otherwise the ACTIVE BACKEND decides, which is
+    what makes the swap arrive here without every call site being edited.
+    ``facemodels`` is imported inside the function so this module still loads
+    with nothing else present.
+    """
+    if model is None:
+        from jarvis import facemodels as fm      # noqa: PLC0415 - keeps this
+        model = fm.backend_for(backend).embed_model  # module dependency-free
+    return FaceGallery(root=PATHS.FACE_GALLERY, model=model)

@@ -120,16 +120,15 @@ from jarvis import facedetect                             # noqa: E402
 from jarvis import faceenrol as fe                        # noqa: E402
 from jarvis import visionrig as vr                        # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
-from jarvis.config import PATHS                           # noqa: E402
 from jarvis.eye import FaceIdentifier                     # noqa: E402
 from jarvis.facegallery import (SFACE_COSINE_SAME,        # noqa: E402
-                                FaceGallery, label_ok)
+                                FaceGallery, default_gallery, label_ok)
 from jarvis.sensing import SensingPolicy                   # noqa: E402
 
 BANNER = (
     "face enrolment -- numbers only. No frame is displayed, saved, described\n"
     "or written; every line below is a count, an angle, a size, a score or a\n"
-    "millisecond, and the only thing that reaches the disk is a 128-float\n"
+    "millisecond, and the only thing that reaches the disk is the\n"
     "embedding.")
 
 BACKUP_WARNING = (
@@ -141,11 +140,15 @@ BACKUP_WARNING = (
 
 
 # --------------------------------------------------------------- the seams
-def open_gallery() -> FaceGallery:
-    """The user's gallery. ``PATHS.FACE_GALLERY`` honours
+def open_gallery(cfg=None) -> FaceGallery:
+    """The user's gallery FOR THE ACTIVE MODEL. ``PATHS.FACE_GALLERY`` honours
     ``JARVIS_FACE_GALLERY``, which tests/conftest.py forces into a throwaway
-    directory -- so nothing in the suite can reach the real one."""
-    return FaceGallery(root=PATHS.FACE_GALLERY)
+    directory -- so nothing in the suite can reach the real one.
+
+    The model matters here more than anywhere: enrolling ArcFace vectors into
+    a gallery labelled SFace would produce a store nothing could ever read."""
+    backend = "" if cfg is None else cam.face_backend_from_config(cfg)
+    return default_gallery(backend=backend)
 
 
 def build_models(cfg):
@@ -164,7 +167,10 @@ def build_models(cfg):
     try:
         rec = facedetect.load_recogniser(
             min_conf=float(cfg.get("camera.min_conf", 0.6)),
-            model_dir=str(cfg.get("camera.model_dir", "") or "") or None)
+            model_dir=str(cfg.get("camera.model_dir", "") or "") or None,
+            backend=cam.face_backend_from_config(cfg),
+            input_size=(int(cfg.get("camera.detect_width", 320)),
+                        int(cfg.get("camera.detect_height", 180))))
     except Exception as exc:  # noqa: BLE001 - absence is not a crash
         return detector, None, str(exc)
     return detector, rec, ""
@@ -383,7 +389,7 @@ def do_status(cfg, gallery: FaceGallery, say) -> tuple:
         payload["total"] = 0
         return 3, payload
     for gen in gens:
-        one = FaceGallery(root=gallery.root)
+        one = FaceGallery(root=gallery.root, model=gallery.model)
         if not one.load(generation=gen):
             say("  gen %05d  UNREADABLE" % gen)
             continue
@@ -727,6 +733,9 @@ def do_verify(cfg, policy, gallery: FaceGallery, args, say) -> tuple:
     if feed is None:
         say("STOPPED: %s" % feed_why)
         return 3, {"reason": feed_why}
+    bar_why = cam.identity_min_warning(cfg)
+    if bar_why:
+        say("NOTE: %s" % bar_why)
     ident = FaceIdentifier(
         gallery, recogniser,
         min_conf=float(cfg.get("camera.min_conf", 0.6)),
@@ -888,7 +897,7 @@ def do_delete_label(gallery: FaceGallery, label: str, args, say) -> tuple:
     # file that still parses with her in it is the whole failure mode -- and
     # so is one that reports success over a .tmp, which is why the leftovers
     # are counted here too and not only the generations.
-    back = FaceGallery(root=gallery.root)
+    back = FaceGallery(root=gallery.root, model=gallery.model)
     back.load()
     still = [g for g in back.generations()
              if _generation_holds(back.root, g, label)]
@@ -1081,7 +1090,7 @@ def main(argv=None) -> int:
     say("")
 
     cfg = AssistantConfig.load()
-    gallery = open_gallery()
+    gallery = open_gallery(cfg)
     report: dict = {"banner": BANNER, "gallery": str(gallery.root)}
 
     if args.status:

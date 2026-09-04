@@ -1447,19 +1447,23 @@ def resolve_identity(cfg) -> tuple:
         log.info("campreview: no name beside the box (%s)", why)
         return None, None
     try:
-        from jarvis.config import PATHS            # noqa: PLC0415
-        from jarvis.facegallery import FaceGallery  # noqa: PLC0415
-        gallery = FaceGallery(PATHS.FACE_GALLERY)
-        if not gallery.load() or not gallery.labels():
-            log.info("campreview: nobody is enrolled; the pane will show "
-                     "boxes without names")
+        gallery, why = cam.gallery_from_config(cfg)
+        if gallery is None:
+            # AFTER A MODEL SWAP THIS IS THE LINE THAT MATTERS. It is not
+            # "nobody is enrolled" -- thirteen samples may be sitting on disk
+            # that this model cannot read -- it is the sentence that says
+            # re-enrol, or set camera.face_backend back.
+            log.info("campreview: no name beside the box -- %s", why)
             return None, None
     except Exception as exc:                       # noqa: BLE001
         log.info("campreview: the face gallery would not open (%s: %s)",
                  type(exc).__name__, exc)
         return None, None
-    log.info("campreview: identity on -- %d enrolled label(s)",
-             len(gallery.labels()))
+    warn = cam.identity_min_warning(cfg)
+    if warn:
+        log.warning("campreview: %s", warn)
+    log.info("campreview: identity on -- %d enrolled label(s), model %s",
+             len(gallery.labels()), gallery.model)
     return recogniser, gallery
 
 

@@ -659,11 +659,41 @@ DEFAULTS: dict = {
                "hfov_deg": 65.6, "diag_fov_deg": 0.0, "fourcc": "MJPG",
                "detect_width": 320, "detect_height": 180, "threads": 2,
                "idle_fps": 1.5, "armed_fps": 8.0, "min_conf": 0.6,
-               # Where the downloaded YuNet/SFace weights live. Empty means
+               # Where the downloaded weights live. Empty means
                # ~/.aiws_trainer/models/face (jarvis/facemodels.py). They are
                # NOT in the repo and must not be: 38 MB of SFace beside 140 MB
                # of TTS weights is how repo/ got swept into a commit once.
                "model_dir": "",
+               # WHICH PAIR OF FACE MODELS. Empty means the shipped default,
+               # which as of 2026-09-03 is "insightface": SCRFD-500m +
+               # ArcFace-mbf, 512-D. Set it to "opencv" to go back to YuNet +
+               # SFace, 128-D, and to the enrolment already on disk. That
+               # reversal is why both pairs stay declared.
+               #
+               # WHY THE SWAP: his words, 2026-09-03, "he also is recognizing
+               # me less from the side angle". A 128-D SFace embedding is weak
+               # in profile. The new pair is SMALLER (15.4 MB against 37.1)
+               # and FASTER (measured on this box: SCRFD 2.5 ms + ArcFace
+               # 5.2 ms at 2 threads, against YuNet 1.5 + SFace 10.2) with a
+               # 512-D embedding. Whether it is MORE ACCURATE ON HIS FACE is
+               # NOT measured and cannot be measured without him: run
+               # scripts/face_model_compare.py.
+               #
+               # LICENCE, AND IT IS NOT THE USUAL ANSWER. The InsightFace
+               # weights are NON-COMMERCIAL RESEARCH ONLY -- that is the one
+               # statement of terms that exists for them, and their repository
+               # has no LICENSE file at all. Fine for Jarvis, which is his own
+               # research use. NOT fine for VSS or anything that ships from
+               # this machine; jarvis/facemodels.commercial_backends() is the
+               # list to pick from there.
+               #
+               # SWAPPING TURNS IDENTITY OFF UNTIL HE RE-ENROLS. His gallery
+               # holds SFace's 128-float vectors and an ArcFace vector is 512;
+               # the cosine between them measures nothing, so the gallery
+               # refuses to compare across models by name rather than scoring
+               # noise. The old generations stay on disk, untouched, and the
+               # startup log carries one line saying to re-enrol.
+               "face_backend": "",
                # The attention cone, in degrees off the lens axis. 20 deg is
                # generous against the 47 deg separation an off-axis mount
                # gives (scratchpad/ideas/camera.md section 4) and useless on a
@@ -689,6 +719,17 @@ DEFAULTS: dict = {
                # Face identity: a gallery of HIS FACE on disk. Opt-in, and the
                # threshold is OpenCV's own documented SFace cosine for "same
                # person".
+               #
+               # THIS NUMBER BELONGS TO SFACE AND DOES NOT CARRY ACROSS. It is
+               # OpenCV's published figure for SFace's 128-D vectors, and it
+               # was raised by hand on 2026-09-03 (to 0.47 in his own config)
+               # from SFace scores measured on his face and on his wall.
+               # ArcFace's cosines are a different model's distribution;
+               # nothing has been measured for them on this machine, so with
+               # camera.face_backend on insightface this bar is UNMEASURED and
+               # jarvis/camera.identity_min_warning says so in the log every
+               # start. scripts/face_model_compare.py is how the real number
+               # arrives, and only he can run it -- it needs his face.
                "identity": False, "identity_min": 0.363,
                # One JPEG at 0600, overwritten each time, for diagnosing a
                # mount. The only path by which a frame reaches the disk --

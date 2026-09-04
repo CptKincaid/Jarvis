@@ -494,6 +494,82 @@ def focus_probe(cap) -> dict:
     return out
 
 
+def face_backend_from_config(cfg) -> str:
+    """Which face model pair his config asks for. "" means the default.
+
+    ``camera.face_backend`` is the one-line reversal: set it to "opencv" and
+    the box goes back to YuNet + SFace and to the enrolment already on disk.
+    An unknown value RAISES out of ``facemodels.backend_for`` rather than
+    quietly leaving the old models running.
+    """
+    return str(_cfg_get(cfg, "camera.face_backend", "") or "")
+
+
+def identity_min_warning(cfg) -> str:
+    """"" or the sentence saying his identity bar was tuned for another model.
+
+    ``camera.identity_min`` is ONE number and there is ONE of it. It was
+    raised to 0.47 on 2026-09-03 from SFace scores measured on his own face
+    and his own wall. SFace's cosines and ArcFace's are different
+    distributions of a different model's vectors, so that number does not
+    carry across -- and a threshold calibrated for one vector silently applied
+    to another is precisely the failure ``jarvis/eye.py`` names in its own
+    docstring.
+
+    Nothing here CHANGES the bar. Guessing a replacement would be the same
+    mistake in the other direction. What it does is refuse to let the swap
+    happen quietly: the bar is unmeasured for this model until he runs
+    ``scripts/face_model_compare.py`` on his own face.
+    """
+    from jarvis import facegallery as fgal        # noqa: PLC0415
+    from jarvis import facemodels as fmod         # noqa: PLC0415
+    try:
+        back = fmod.backend_for(face_backend_from_config(cfg))
+    except Exception:  # noqa: BLE001 - the backend error is reported elsewhere
+        return ""
+    if fgal.cosine_same(back.embed_model) is not None:
+        return ""
+    bar = float(_cfg_get(cfg, "camera.identity_min", 0.363))
+    return ("camera.identity_min is %.3f and that number was measured "
+            "against SFace's vectors, not %s's. No same-person cosine has "
+            "been measured for %s on this machine -- run "
+            "scripts/face_model_compare.py after you re-enrol and set the "
+            "bar from what it reports."
+            % (bar, back.embed_model, back.embed_model))
+
+
+def gallery_from_config(cfg):
+    """``(gallery, reason)`` -- the enrolled faces FOR THE ACTIVE MODEL.
+
+    ``gallery`` is None with a reason whenever identity cannot be offered, and
+    after a model swap that reason is the ONE LINE that says what to do:
+    re-enrol, or set ``camera.face_backend`` back. The failure this replaces
+    is "nobody is enrolled" printed over thirteen enrolled samples that this
+    model simply cannot read -- true, useless, and exactly how a swap turns
+    into a week of confusion.
+
+    A cross-model gallery is never merged, never scaled and never scored: an
+    ArcFace 512-vector against an SFace 128-vector is not a weak comparison,
+    it is not a comparison.
+    """
+    from jarvis.config import PATHS               # noqa: PLC0415
+    from jarvis.facegallery import default_gallery  # noqa: PLC0415
+    del PATHS
+    try:
+        gallery = default_gallery(backend=face_backend_from_config(cfg))
+    except Exception as exc:  # noqa: BLE001 - a bad backend name is a reason
+        return None, str(exc)
+    try:
+        loaded = bool(gallery.load())
+    except Exception as exc:  # noqa: BLE001
+        return None, "the face gallery would not open (%s)" % exc
+    if not loaded or not gallery.labels():
+        if gallery.foreign_generations:
+            return None, gallery.reenrol_message()
+        return None, "nobody is enrolled for %s" % gallery.model
+    return gallery, ""
+
+
 def detector_from_config(cfg, score_threshold: Optional[float] = None):
     """``(detector, reason)`` -- never raises, and NEVER falls back.
 
@@ -513,7 +589,8 @@ def detector_from_config(cfg, score_threshold: Optional[float] = None):
             input_size=size,
             threads=int(_cfg_get(cfg, "camera.threads", 2)),
             score_threshold=score_threshold,
-            model_dir=str(_cfg_get(cfg, "camera.model_dir", "") or "") or None)
+            model_dir=str(_cfg_get(cfg, "camera.model_dir", "") or "") or None,
+            backend=face_backend_from_config(cfg))
         return det, ""
     except Exception as exc:  # noqa: BLE001 - absence is not a crash
         log.info("camera: no face detector (%s)", exc)
@@ -527,10 +604,17 @@ def recogniser_from_config(cfg):
     if not bool(_cfg_get(cfg, "camera.identity", False)):
         return None, "camera.identity is false"
     try:
+        # input_size is the DETECTOR's, and only the ArcFace branch uses it:
+        # every call site hands the recogniser a full capture frame with a row
+        # in detector pixels, so without this the crop is taken from the
+        # frame's top-left corner. See ArcFaceRecogniser.
         return facedetect.load_recogniser(
             min_conf=float(_cfg_get(cfg, "camera.min_conf", 0.6)),
             model_dir=str(_cfg_get(cfg, "camera.model_dir", "") or "")
-            or None), ""
+            or None,
+            backend=face_backend_from_config(cfg),
+            input_size=(int(_cfg_get(cfg, "camera.detect_width", 320)),
+                        int(_cfg_get(cfg, "camera.detect_height", 180)))), ""
     except Exception as exc:  # noqa: BLE001
         log.info("camera: no face recogniser (%s)", exc)
         return None, str(exc)

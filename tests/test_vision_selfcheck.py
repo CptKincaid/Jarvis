@@ -124,4 +124,7 @@ def test_synthetic_mode_opens_no_device_and_still_reports(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "No device is opened" in out
     assert code == 1                     # no weights in the test model dir
-    assert "face_detection_yunet" in out
+    # whichever detector the active backend names -- the point is that the
+    # missing FILE is named, not which model it is
+    from jarvis import facemodels as _fm
+    assert _fm.backend_for().detector.filename in out

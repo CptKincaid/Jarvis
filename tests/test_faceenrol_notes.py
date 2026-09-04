@@ -178,7 +178,10 @@ def test_a_take_with_no_note_writes_no_note_key(tmp_path):
         g.add("hunter", vec)
     g.save(reason="plain")
     keys = sorted(np.load(g.path_for(1)).files)
-    assert keys == ["_created_ns", "_format", "_reason",
+    # _model joined the header on 2026-09-03 and is written on every save;
+    # its ABSENCE is what identifies his pre-swap SFace generations, so it
+    # can never be written empty. FORMAT is deliberately NOT bumped.
+    assert keys == ["_created_ns", "_format", "_model", "_reason",
                     "emb_hunter_0000", "emb_hunter_0001", "emb_hunter_0002"]
 
 
