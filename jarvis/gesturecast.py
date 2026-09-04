@@ -382,7 +382,12 @@ class GestureCast:
             self._earcon(GRAB_TONE)
             subject = self.held
             name = subject.spoken if subject is not None else ev.payload
-            self._chip_do("hold", name, float(self.machine.t.carry_max_s))
+            # The rule depletes over the cap that will ACTUALLY end the
+            # carry (the frame cap, 4.1 s at 7.5 fps), and the chip keeps
+            # the wall-clock backstop as its own timer for the case where
+            # no frame ever comes to end it.
+            self._chip_do("hold", name, self.machine.carry_cap_s(),
+                          float(self.machine.t.carry_max_s))
             if subject is not None and bool(self._option(OPTION_SPEAK_GRAB, True)):
                 line = subject_line(subject)
                 self._worker(lambda: self._speak(line))
@@ -524,7 +529,11 @@ class GestureCast:
         """"throw this on HPCOMPUTER" -> (line to speak, status). The held
         subject if a carry is live, else the subject resolved now; the
         machine's carry is ended silently, because the sentence is the
-        throw."""
+        throw. The carry caps run only when a frame arrives to test them,
+        so ``sweep()`` comes first: a carry whose frames simply stopped
+        stayed live for as long as the silence lasted, and the spoken
+        throw then cast the STALE subject (MEASURED at 60 s)."""
+        self.machine.sweep()
         name = sink_alias(sink_name)
         sink = self.registry.get(name)
         if sink is None:
@@ -553,7 +562,10 @@ class GestureCast:
 
     def drop_by_voice(self) -> str:
         """"drop it" / "put it down": ends a live carry (the held-back tone
-        and the chip follow through on_event) or clears a held subject."""
+        and the chip follow through on_event) or clears a held subject.
+        The wall-clock cap is applied first, so a carry the camera stopped
+        feeding is already down before the sentence lands."""
+        self.machine.sweep()
         if self.carrying:
             self.machine.cancel("spoken")
             return DROPPED_LINE
@@ -572,6 +584,8 @@ class GestureCast:
         self.machine.cancel("spoken over")
 
     def holding_line(self) -> str:
+        """"what are you holding" -- and an expired carry is not held."""
+        self.machine.sweep()
         subject = self.held
         return subject_line(subject) if subject is not None else NOTHING_LINE
 

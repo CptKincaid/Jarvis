@@ -1988,6 +1988,20 @@ class PreviewWorker:
                          "the preview stopped")
             except Exception:                 # noqa: BLE001 - the tap
                 log.debug("campreview: the tap refused a deny", exc_info=True)
+        # Whatever the hand was carrying is put down with the device. The
+        # engine's caps run only when a frame arrives to test them, so a
+        # carry whose frames stopped here -- the ACTIVE->AMBIENT edge, the
+        # curfew, the toggle -- stayed live for as long as the silence
+        # lasted (MEASURED: 60 s, and a spoken throw then took the stale
+        # subject). Any thread; a no-op when nothing is in flight.
+        stage = self.hands
+        cancel = getattr(stage, "cancel", None) if stage is not None else None
+        if callable(cancel):
+            try:
+                cancel("preview stopped")
+            except Exception:                 # noqa: BLE001 - the stage
+                log.debug("campreview: the hand stage would not cancel",
+                          exc_info=True)
 
     def _next_seq(self) -> int:
         self._seq += 1

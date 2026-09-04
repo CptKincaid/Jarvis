@@ -50,6 +50,9 @@ from tests.test_gesture import EYE_PX, GOOD, H, W, _curls, hand3d, project, seg
 FPS = 7.5
 STEP = 1.0 / FPS
 SUBJECT = "the thesis draft"
+# What actually ends a carry at 7.5 fps: the frame cap (31 frames, 4.13 s),
+# not the 8 s wall-clock backstop -- CastGesture.carry_cap_s, MEASURED.
+CAP_S = pytest.approx(31 / FPS)
 
 
 # ------------------------------------------------ nothing reaches out
@@ -354,7 +357,7 @@ class TestTheGesture:
                                   UNTAUGHT_LINE]
         assert rig.rec.shows == [1]
         assert rig.rec.chip.names() == ["hold", "thrown", "landed"]
-        assert rig.rec.chip.calls[0] == ("hold", SUBJECT, 8.0)
+        assert rig.rec.chip.calls[0] == ("hold", SUBJECT, CAP_S, 8.0)
         assert rig.rec.chip.calls[1] == ("thrown", "left")
         assert rig.courier.held is None
         rec = rig.courier.recent()
@@ -432,7 +435,7 @@ class TestTheGesture:
         drive(rig, GOOD["his-left"], until=lambda s: s.event == "grab")
         assert rig.rec.tones == ["heard-you"]
         assert not any(s.startswith("Holding") for s in rig.rec.spoken)
-        assert rig.rec.chip.calls[0] == ("hold", SUBJECT, 8.0)
+        assert rig.rec.chip.calls[0] == ("hold", SUBJECT, CAP_S, 8.0)
 
     def test_someone_else_in_frame_vetoes_the_throw_silently(self):
         rig = build(identity=lambda: "guest")
@@ -471,6 +474,68 @@ class TestTheRate:
             rig.clock.t += 1.0 / 15.0
         assert rig.courier.machine.t.dwell_frames == 6
         assert abs(rig.courier.machine.stall_s - 0.2) < 0.01
+
+    def test_the_refit_rebuilds_the_open_history_so_a_fast_feed_grabs(self):
+        """Assigning ``gesture.t`` alone left the open-history deque at its
+        construction-time maxlen (12 frames = 1.6 s at 7.5 fps, 0.4 s at
+        30), so the reach that precedes a close fell out of the window and
+        a 30 fps feed grabbed 0 of 48 through the stage against 24 of 24 in
+        the engine with the same thresholds set at construction (MEASURED).
+        ``CastGesture.retune`` is the one door now."""
+        rig = build(preview_fps=7.5)
+        shots = drive(rig, GOOD["his-left"], lead=12, step=1.0 / 30.0)
+        assert rig.stage.status()["fps_applied"] == pytest.approx(30.0, abs=0.5)
+        assert rig.courier.machine._open_hist.maxlen == \
+            rig.courier.machine.t.open_lookback_frames
+        assert rig.courier.machine._open_hist.maxlen > 12
+        assert events(shots)[:2] == ["grab", "throw"]
+
+    def test_the_stall_bar_is_floored_until_a_rate_is_measured(self):
+        """His config asks for 15 fps, which seeds the three-period stall
+        bar at 0.2 s; in low light the LifeCam delivers 3.8 fps, so every
+        one of the first eight frames read as a stall and reset the reach
+        -- a gesture begun inside ~2 s of the worker starting was lost
+        (MEASURED 0/24 with a 3-frame lead). The bar is floored at
+        ``STALL_FLOOR_S`` until the delivered rate replaces it."""
+        rig = build(preview_fps=15.0)
+        assert rig.courier.machine.stall_s == pytest.approx(hs.STALL_FLOOR_S)
+        shots = drive(rig, GOOD["his-left"], lead=3, step=1.0 / 3.8)
+        assert "grab" in events(shots)
+
+
+class TestTheFaceBaseline:
+    def _steady(self, px=80.0, n=6):
+        rig = build(opts=Options())
+        t = 0.0
+        for _ in range(n):
+            rig.stage._baseline((face(eye_px=px),), t)
+            t += 0.1
+        return rig, t
+
+    def test_a_lean_toward_the_lens_is_no_opinion_not_a_reach(self):
+        """Leaning in from 700 to 450 mm while closing an open hand onto
+        the chin read R ~2.5 against the LAGGING median and grabbed 6 of 6
+        through the wired path (MEASURED). A run of faces more than
+        ``FACE_JUMP_FRAC`` off their own median is a lean: 0.0 for that
+        frame, and the reach ratio has nothing to be wrong against."""
+        rig, t = self._steady(80.0)
+        assert rig.stage._baseline((face(eye_px=80.0),), t) == 80.0
+        got = []
+        for _ in range(hs.FACE_JUMP_SAMPLES):
+            t += 0.1
+            got.append(rig.stage._baseline((face(eye_px=100.0),), t))
+        assert got[-1] == 0.0                        # +25 %, a run of three
+        assert 100.0 / 80.0 - 1.0 > hs.FACE_JUMP_FRAC
+
+    def test_one_wild_sample_is_absorbed_not_read_as_a_lean(self):
+        """The near side of that comparison is itself a median of three:
+        one 400 px interocular (a face 156 mm from the lens) is what the
+        median exists to swallow, and against the raw frame it cost 13 of
+        14 throws (MEASURED); against the median of three, none."""
+        rig, t = self._steady(80.0)
+        assert rig.stage._baseline((face(eye_px=400.0),), t) == 80.0
+        t += 0.1
+        assert rig.stage._baseline((face(eye_px=80.0),), t) == 80.0
 
 
 # ================================================================ purity
@@ -632,6 +697,67 @@ class TestByVoice:
         assert rig.courier.holding_line() == NOTHING_LINE
         drive(rig, GOOD["his-left"], until=lambda s: s.event == "grab")
         assert rig.courier.holding_line() == "Holding %s, sir." % SUBJECT
+
+
+class TestWhenTheFramesStop:
+    """The carry caps in the engine run only inside ``update()``, so a
+    carry whose frames simply STOPPED -- the worker halted on the
+    ACTIVE->AMBIENT edge, the curfew, a wedged read -- had nothing to end
+    it. MEASURED before the repair: grab, 60 s of silence, still carrying,
+    and "throw this on the board" then cast the STALE subject. Every voice
+    path now applies the wall-clock cap first (``CastGesture.sweep``), and
+    these fail with that one call removed from each path."""
+
+    def _grab_then_silence(self, screen_later="the new tab"):
+        rig = build()
+        drive(rig, GOOD["his-left"], until=lambda s: s.event == "grab")
+        assert rig.courier.carrying and rig.courier.held.spoken == SUBJECT
+        rig.clock.t += 60.0                       # no frame arrives
+        # ...and what is on the screen NOW is something else entirely.
+        rig.courier._providers["screen"] = lambda: CastSubject(
+            "screen", screen_later, at=rig.clock())
+        return rig
+
+    def test_a_spoken_throw_after_the_silence_casts_what_is_there_now(self):
+        rig = self._grab_then_silence()
+        line, status = rig.courier.throw_by_voice("the board")
+        assert status == "landed"
+        assert rig.courier.recent()["spoken"] == "the new tab"   # not SUBJECT
+        # The expired carry was put down first, audibly and on the chip,
+        # then the sentence did its own throw.
+        assert rig.rec.tones == ["heard-you", "held-back", "done"]
+        assert rig.rec.chip.names() == ["hold", "dropped", "landed"]
+        assert not rig.courier.carrying
+
+    def test_what_am_i_holding_after_the_silence_is_nothing(self):
+        rig = self._grab_then_silence()
+        assert rig.courier.holding_line() == NOTHING_LINE
+        assert not rig.courier.carrying and rig.courier.held is None
+        assert rig.rec.chip.names() == ["hold", "dropped"]
+
+    def test_drop_it_after_the_silence_finds_it_already_down(self):
+        rig = self._grab_then_silence()
+        assert rig.courier.drop_by_voice() == NOTHING_LINE
+        assert not rig.courier.carrying
+        assert rig.rec.tones == ["heard-you", "held-back"]
+        assert rig.rec.chip.names() == ["hold", "dropped"]
+
+    def test_inside_the_cap_the_carry_is_still_his(self):
+        rig = build()
+        drive(rig, GOOD["his-left"], until=lambda s: s.event == "grab")
+        rig.clock.t += 7.9
+        assert rig.courier.holding_line() == "Holding %s, sir." % SUBJECT
+        assert rig.courier.carrying
+
+    def test_the_chip_is_handed_the_real_cap_and_its_own_backstop(self):
+        """The rule depletes over what will actually end the carry (the
+        frame cap, 4.13 s at 7.5 fps -- drawn over 8 s it was half gone
+        when the thing was put down), and the chip keeps the 8 s backstop
+        as its own timer for the case where no frame ever comes."""
+        rig = build()
+        drive(rig, GOOD["his-left"], until=lambda s: s.event == "grab")
+        assert rig.rec.chip.calls[0] == ("hold", SUBJECT, CAP_S, 8.0)
+        assert rig.rec.chip.calls[0][2] < 8.0
 
     def test_teaching_a_side_and_asking_it_back(self):
         rig = build()
