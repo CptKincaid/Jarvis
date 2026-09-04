@@ -1416,3 +1416,149 @@ def test_the_log_never_raises_when_the_path_itself_cannot_be_opened():
         log_file = ZoneLog(bad)
         assert log_file.append(t) is False, bad
         assert log_file.failures == 1 and log_file.writes == 0, bad
+
+
+# ------------------------------- the repairs (review 5): the room with no lens
+# THE SAME DISEASE, ONE LEVEL LOWER. Four rounds closed "a config value of the
+# wrong SHAPE is silently replaced". This is a config value of the right shape
+# that is silently replaced: ``camera_zone: ""`` -- which is how a room says
+# there is no lens in it -- was `self.camera_zone or DEFAULT_CAMERA_ZONE`, so
+# his lensless kitchen described itself as "at the desk", and "   " collapsed
+# to "" and was written into the record as a NAMELESS zone while a band with
+# no name was refused outright. Blank now MEANS something, and it means it
+# everywhere.
+def _room(name="kitchen", camera=None, bands=None):
+    entry = {"name": name,
+             "bands": bands or [{"name": "the kitchen",
+                                 "near_m": 0.75, "far_m": 3.0},
+                                {"name": "at the door",
+                                 "near_m": 3.0, "far_m": 3.75}]}
+    if camera is not None:
+        entry["camera_zone"] = camera
+    return entry
+
+
+def test_a_blank_camera_zone_means_the_room_has_no_camera_at_all():
+    zmap = ZoneMap("kitchen", (Band("the kitchen", 0.75, 3.0),), "")
+    assert zmap.camera_zone == zn.NO_CAMERA == ""
+    assert zmap.has_camera is False
+    # ... and the camera rule cannot fire for it. A recognised face in a
+    # room with no lens is somebody else's mistake, and the verdict falls
+    # through to the radar rather than naming a place that does not exist.
+    v = verdict(zmap, presence=True, distance_m=1.0,
+                camera=CameraOpinion(known=True, label="hunterp"))
+    assert (v.zone, v.rule) == ("the kitchen", RULE_BAND)
+
+
+def test_a_camera_zone_of_only_spaces_is_no_camera_and_never_a_nameless_zone():
+    # The verifier's own case: "   " is truthy, so it walked past the `or`,
+    # collapsed to "" in _short, and the camera rule then wrote {"new": ""}
+    # into the record -- a zone with no name, in a file whose whole job is
+    # to say where he was.
+    for blank in ("   ", "\t", "\n  \n", ""):
+        zmap = ZoneMap("kitchen", (Band("the kitchen", 0.75, 3.0),), blank)
+        assert zmap.has_camera is False, repr(blank)
+        v = verdict(zmap, presence=False,
+                    camera=CameraOpinion(known=True, label="hunterp"))
+        assert v.zone == ABSENT and v.rule == RULE_EMPTY, repr(blank)
+
+
+def test_an_absent_camera_zone_still_takes_the_default_because_absence_is_silence():
+    # The one rule this module has never bent: a key that is not there at
+    # all is silence, and silence may take a default.
+    cfg = _Cfg({"zones": {"rooms": [_room("office", camera=None)]}})
+    zmap = zn.zone_map_for(cfg, "office")
+    assert zmap.camera_zone == zn.DEFAULT_CAMERA_ZONE
+    assert zmap.has_camera is True
+
+
+def test_his_kitchen_has_no_camera_and_says_so_instead_of_at_the_desk():
+    # His config, 2026-09-03: the kitchen entry carries camera_zone "".
+    cfg = _Cfg({"zones": {"rooms": [_room("kitchen", camera="")]}})
+    zmap = zn.zone_map_for(cfg, "kitchen")
+    assert zmap.has_camera is False
+    text = zmap.describe()
+    assert zn.DEFAULT_CAMERA_ZONE not in text
+    assert "no camera" in text
+    # and a room that HAS one still prints it against the word "camera"
+    office = zn.zone_map_for(
+        _Cfg({"zones": {"rooms": [_room("office", camera="at the desk")]}}),
+        "office")
+    assert "at the desk" in office.describe()
+    assert "camera" in office.describe()
+
+
+def test_a_room_with_no_camera_is_never_even_asked_for_an_opinion(tmp_path):
+    # Cheaper, and one less way to touch the lens: the hook is not called
+    # at all for a room the config says has no camera.
+    calls = []
+    http = Http(default=ESPHOME_OFF)
+    sensor = RoomSensor("http://10.0.0.9/binary_sensor/Presence", get=http)
+    zmap = ZoneMap("kitchen", (Band("the kitchen", 0.75, 3.0),), "")
+    watcher = ZoneWatcher("kitchen", sensor, zmap, dwell_s=0.0,
+                          log_file=ZoneLog(tmp_path / "z.jsonl"),
+                          camera=lambda: calls.append(1) or
+                          CameraOpinion(known=True, label="hunterp"))
+    watcher.poll()
+    assert calls == []
+    assert watcher.zone == ABSENT
+
+
+def test_no_configuration_of_the_camera_zone_can_write_a_zone_with_no_name():
+    # THE CLASS, not the instance. Every rule, crossed with every way a
+    # camera_zone can be blank and every camera opinion: a committed
+    # transition's zone is always a NAMED place. A nameless zone in the
+    # record is unreadable exactly when he goes looking for where he was.
+    zmap_bands = (Band("the kitchen", 0.75, 3.0), Band("at the door", 3.0, 3.75))
+    cameras = [None, CameraOpinion(known=True, label="hunterp"),
+               CameraOpinion(known=False)]
+    for camera_zone in ("", " ", "\t\n", "at the desk", "  at the desk  "):
+        zmap = ZoneMap("kitchen", zmap_bands, camera_zone)
+        for camera in cameras:
+            for presence in (True, False, None):
+                for distance in (None, 0.5, 1.0, 3.2, 9.9):
+                    v = verdict(zmap, presence=presence, distance_m=distance,
+                                camera=camera)
+                    assert v.zone.strip(), (camera_zone, camera, presence,
+                                            distance)
+                    assert v.rule in (RULE_CAMERA, RULE_BAND, RULE_UNPLACED,
+                                      RULE_EMPTY, RULE_SILENT)
+                    if v.rule == RULE_CAMERA:
+                        assert zmap.has_camera
+
+
+def test_every_declared_text_key_says_what_a_blank_value_means():
+    # The OTHER half, and the reason this is a class fix rather than one
+    # more `or`. A text key that is PRESENT and blank tried to say
+    # something; what it says has to be declared, not left to whichever
+    # `or` happens to be on the path. A text key added to the shape
+    # without an entry here fails this test instead of shipping with a
+    # silent substitution behind it.
+    declared = set(zn.BLANK_TEXT_MEANS)
+    text_keys = set()
+    for prefix, table in (("zones", zn.SECTION_SHAPE),
+                          ("zones.rooms[]", zn.ROOM_SHAPE),
+                          ("zones.rooms[].bands[]", zn.BAND_SHAPE)):
+        for key, want, _default in table:
+            if want == "text":
+                text_keys.add("%s.%s" % (prefix, key))
+    assert text_keys == declared, text_keys ^ declared
+    # and each declaration is TRUE of the code, not just written down
+    for blank in ("", "   "):
+        # name: refused, and named by its dotted path
+        cfg = _Cfg({"zones": {"rooms": [_room(blank)]}})
+        assert zn.zone_map_for(cfg, "kitchen") is None
+        assert any("name" in k for k in zn.rejected_rooms(cfg))
+        # band name: refused too
+        bad = _room("kitchen", bands=[{"name": blank, "near_m": 0.75,
+                                       "far_m": 3.0}])
+        cfg = _Cfg({"zones": {"rooms": [bad]}})
+        assert zn.zone_map_for(cfg, "kitchen") is None
+        assert zn.rejected_rooms(cfg)
+        # camera_zone: no camera, and the room still records
+        cfg = _Cfg({"zones": {"rooms": [_room("kitchen", camera=blank)]}})
+        zmap = zn.zone_map_for(cfg, "kitchen")
+        assert zmap is not None and zmap.has_camera is False
+        # log_path: the default path, which is what "" has always meant
+        cfg = _Cfg({"zones": {"log_path": blank, "rooms": [_room()]}})
+        assert zn.log_path(cfg) == zn.default_log_path()

@@ -20,6 +20,8 @@ recognition overrules sensor detection since he can literally see me at my
 desk". So::
 
     camera recognises a known face   -> the room's camera zone   ("at the desk")
+      ... but only in a room that HAS a camera; a blank ``camera_zone``
+      means there is no lens here and the radar decides (``has_camera``)
     presence True, distance in a band-> that band's name
     presence True, distance in none  -> "in the room, unplaced"
     presence False                   -> "not in the room"
@@ -205,6 +207,11 @@ RULE_EMPTY = "radar-empty"
 RULE_SILENT = "radar-silent"
 
 DEFAULT_CAMERA_ZONE = "at the desk"
+# A room's camera_zone, BLANK: there is no lens in this room, so the camera
+# rule cannot fire for it and every verdict is the radar's. It is a real
+# answer -- his kitchen is exactly this -- and not a missing one; see
+# BLANK_TEXT_MEANS at the foot of this module for the rule it belongs to.
+NO_CAMERA = ""
 # The office is the only room with a lens. A room whose camera watches
 # something else must set its own "camera_zone" in the config.
 OFFICE_CAMERA_ZONE = DEFAULT_CAMERA_ZONE
@@ -373,6 +380,18 @@ class ZoneMap:
     error worth raising on, because a reading that two bands both claim has
     no defensible answer. Gaps are the opposite -- they are legitimate and
     named (``gaps()``), and a reading inside one is "unplaced".
+
+    **A BLANK ``camera_zone`` MEANS THERE IS NO LENS IN THIS ROOM**
+    (``has_camera``), and it is stored exactly as given rather than
+    replaced. It used to be ``camera_zone or DEFAULT_CAMERA_ZONE``, which
+    is the same disease four rounds of review chased one level up: a value
+    that TRIED to say something -- "" is how a room says it has no camera
+    -- was silently swapped for the built-in one, so his lensless kitchen
+    described itself as "at the desk". Worse, "   " is truthy and walked
+    past the ``or`` entirely, collapsed to "" in ``_short``, and the camera
+    rule then wrote a NAMELESS zone into the record while a band with no
+    name was refused outright. Blank is now one answer with one meaning at
+    every level: see ``BLANK_TEXT_MEANS``.
     """
     room: str
     bands: Tuple[Band, ...]
@@ -403,8 +422,22 @@ class ZoneMap:
                                  % (self.room, lo.name, hi.name,
                                     hi.near_m, lo.far_m))
         object.__setattr__(self, "bands", bands)
-        object.__setattr__(self, "camera_zone",
-                           _short(self.camera_zone or DEFAULT_CAMERA_ZONE))
+        # NOT `or DEFAULT_CAMERA_ZONE`. _short collapses whitespace, so
+        # every blank spelling -- "", "   ", "\t\n" -- lands on the one
+        # value that means "no camera in this room".
+        object.__setattr__(self, "camera_zone", _short(self.camera_zone))
+
+    @property
+    def has_camera(self) -> bool:
+        """Is there a lens in this room at all?
+
+        False is a GUARANTEE and not an outage: "there is no camera in the
+        kitchen" and "the kitchen camera is off" are different claims, the
+        same distinction jarvis/rooms.py draws between ABSENT and OFF. A
+        room with no camera can never take the camera rule, so its verdict
+        is the radar's, always.
+        """
+        return bool(self.camera_zone)
 
     @classmethod
     def office(cls) -> "ZoneMap":
@@ -439,8 +472,14 @@ class ZoneMap:
         return tuple(out)
 
     def describe(self) -> str:
-        """The ladder as text, for a script or the console."""
-        rows = ["  %-24s camera" % self.camera_zone]
+        """The ladder as text, for a script or the console.
+
+        A room with no lens says so in the camera row rather than printing
+        a blank one: an empty first line reads as a camera whose zone
+        nobody named, which is the state that no longer exists.
+        """
+        rows = ["  %-24s camera" % self.camera_zone] if self.has_camera else \
+               ["  (no camera in this room -- every verdict is the radar's)"]
         edges: list = []
         for lo, hi in self.gaps():
             edges.append((lo, hi if hi is not None else math.inf, None))
@@ -484,7 +523,12 @@ def verdict(zmap: ZoneMap, *, presence: Optional[bool],
     """
     common = dict(room=zmap.room, distance_m=distance_m, presence=presence,
                   moving=moving, still=still, camera=camera)
-    if camera is not None and camera.known:
+    if camera is not None and camera.known and zmap.has_camera:
+        # ``has_camera`` is the whole of the guard and it is here rather
+        # than at the caller: this is a public function, a recognised face
+        # can be handed to it for any room, and a room with no lens must
+        # never answer with a place that does not exist -- nor with the
+        # nameless zone a blank camera_zone used to produce.
         return Verdict(zone=zmap.camera_zone, rule=RULE_CAMERA, **common)
     if presence is False:
         return Verdict(zone=ABSENT, rule=RULE_EMPTY, **common)
@@ -831,7 +875,16 @@ class ZoneWatcher:
                                     moving=moving, still=still)
 
     def _camera_opinion(self) -> Optional[CameraOpinion]:
-        if self._camera is None:
+        """The eye's opinion, or None -- and NOT ASKED AT ALL in a room the
+        config says has no camera.
+
+        ``verdict`` already refuses the camera rule for such a room, so
+        this is not what makes the answer right; it is what stops a
+        lensless room paying for the hook, and it is one fewer path by
+        which anything here can reach the vision lane. His kitchen has no
+        camera, and now nothing in the kitchen's poll goes near one.
+        """
+        if self._camera is None or not self.zmap.has_camera:
             return None
         try:
             got = self._camera()
@@ -944,6 +997,38 @@ BAND_SHAPE = (
     ("near_m", "a number", _REQUIRED),
     ("far_m", "a number", _REQUIRED),
 )
+
+# WHAT A PRESENT-BUT-BLANK TEXT VALUE MEANS, declared per key.
+#
+# Shape is one way a value can be wrong and blankness is another, and it is
+# the one four rounds of review did not reach. The tables above answer "is
+# this the right KIND of thing"; "" and "   " are text, so they pass, and
+# what happened next was decided by whichever ``or`` happened to be on the
+# path -- which is how ``camera_zone: ""`` became "at the desk" in a room
+# with no lens, and how ``camera_zone: "   "`` became a zone with NO NAME
+# in the record while a band with no name was refused outright. Two
+# opposite answers to the same question, neither of them written down.
+#
+# So it is written down. A blank text value is a value that TRIED to say
+# something, and every declared text key says here what it says:
+#
+#   REFUSED               -- blank is a mistake; the room records nothing
+#                            and the dotted path is named
+#   anything else         -- blank is an ANSWER, and this is the answer
+#
+# ``tests/test_zones.py`` walks the three shape tables and asserts every
+# "text" key appears here AND that the code does what the entry claims, so
+# a text key added to a table without a decision about blankness fails the
+# suite instead of shipping with a silent substitution behind it.
+REFUSED = "refused: the room records nothing and the key is named"
+BLANK_TEXT_MEANS = {
+    "zones.log_path": "the default log path -- \"\" is the shipped value",
+    "zones.rooms[].name": REFUSED,
+    "zones.rooms[].camera_zone": ("the room has NO camera, so the camera "
+                                  "rule cannot fire for it and the radar "
+                                  "decides (ZoneMap.has_camera)"),
+    "zones.rooms[].bands[].name": REFUSED,
+}
 
 
 def _kind(value) -> str:
@@ -1399,8 +1484,10 @@ def zone_map_for(cfg, room: str) -> Optional[ZoneMap]:
     return None
 
 
-__all__ = ["ABSENT", "BAND_SHAPE", "BLIND_M", "Band", "CameraOpinion",
-           "DEFAULT_DWELL_S", "GATE_M", "MAX_LABEL_CHARS", "MAX_LINE_BYTES",
+__all__ = ["ABSENT", "BAND_SHAPE", "BLANK_TEXT_MEANS", "BLIND_M", "Band",
+           "CameraOpinion", "NO_CAMERA", "REFUSED",
+           "DEFAULT_CAMERA_ZONE", "DEFAULT_DWELL_S", "GATE_M",
+           "MAX_LABEL_CHARS", "MAX_LINE_BYTES",
            "MAX_NAME_CHARS", "NO_OPINION", "OFFICE_BANDS", "RECORD_FIELDS",
            "ROOMS_KEY", "ROOM_SHAPE", "RULE_BAND", "RULE_CAMERA", "RULE_EMPTY",
            "RULE_SILENT", "RULE_UNPLACED", "SECTION_KEY", "SECTION_SHAPE",
