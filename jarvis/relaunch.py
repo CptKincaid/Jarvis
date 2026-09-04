@@ -289,6 +289,11 @@ def main(argv=None, *, alive=process_alive, kill=os.kill, sleep=None,
             log(f"not launching: pid {ns.wait_pid} is still there and "
                 "app._focus_running_instance would only raise its window")
             return rc
+        # stdout/stderr are NOT redirected: the new Jarvis inherits this
+        # helper's, which spawn_relauncher pointed at relaunch.log -- so a
+        # traceback from a checkout that cannot even start lands in the
+        # one file the docs tell him to read. jarvis.logs writes the real
+        # log elsewhere; only stray prints and crashes come here.
         try:
             proc = popen(ns.cmd, cwd=ns.cwd, env=dict(os.environ),
                          start_new_session=True)
