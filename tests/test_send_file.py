@@ -425,6 +425,9 @@ def test_sizes_are_spoken_in_words(n, want):
 @pytest.mark.parametrize("said", [
     "yes", "yeah", "yep", "send it", "go ahead", "do it, jarvis",
     "yes please send it now", "confirmed", "that's right",
+    # a pronoun after "to" is the person he was just read (09-04)
+    "yes, send it to her", "yes send it to him", "yes send it to her please",
+    "yes go ahead and send it to her", "yeah go ahead and send it",
 ])
 def test_a_clear_yes_is_a_yes(said):
     assert parse_send_answer(said) is True
@@ -448,6 +451,7 @@ def test_a_clear_no_is_a_no(said):
     "yeah I think Heather already has it",
     "okay", "sure", "alright", "mhm", "maybe",
     "yes, but send it to her work address instead",
+    "yes, send it to Dana", "yes, and turn the lights off",
 ])
 def test_nothing_ambiguous_counts_as_a_yes(said):
     assert parse_send_answer(said) is not True
@@ -1142,7 +1146,7 @@ def test_a_bare_yes_is_never_a_choice_between_two_files(cmd):
 @pytest.mark.parametrize("said", [
     "system, yes.",              # real, jarvis.log.1:5313
     "um, yes", "uh yeah", "okay yes", "mhm yeah",
-    "yeah go ahead and send it", "yes that's the one", "yes it is",
+    "yes that's the one", "yes it is",
     "I think so yes", "well, yes",
 ])
 def test_a_yes_this_grammar_does_not_take_is_asked_again_not_dropped(cmd, said):
@@ -1524,3 +1528,85 @@ def test_the_ten_word_stray_is_not_a_correction_either(cmd):
 def test_what_counts_as_a_correction(said, want):
     from jarvis.commander import _send_correction
     assert _send_correction(said) == want, said
+
+
+# ==================================================================
+# 18. A pronoun after "to" is a yes, not a new recipient (09-04)
+# ==================================================================
+@pytest.mark.parametrize("said", [
+    "yes, send it to her", "yes send it to him",
+    "yes go ahead and send it to her", "yes send it to her please",
+])
+def test_a_yes_that_names_the_recipient_by_pronoun_sends(cmd, said):
+    """Read-back to Heather; "yes, send it to her". The F23 correction
+    grammar took the bare pronoun as a NEW recipient called "her" and
+    asked "I've no address for her, sir. What is it?" -- on the send path,
+    where the read-back is the whole safety story. A pronoun after "to"
+    refers to the person he has just heard named: it is the yes."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled, (said, res)
+    assert "no address" not in res.reply.lower(), (said, res.reply)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+    assert cmd._pending_send is None and cmd._pending_sendask is None
+
+
+@pytest.mark.parametrize("said", [
+    "yes, send it to her", "yes send it to him", "yes, to them",
+    "yes go ahead and send it to her", "yes send it to her please",
+    "yes send it to me", "yes, send that to it",
+])
+def test_a_pronoun_is_never_a_corrected_recipient(said):
+    from jarvis.commander import _send_correction
+    assert _send_correction(said) is None, said
+
+
+def test_a_possessive_pronoun_still_corrects_the_address(cmd):
+    """The neighbour that must keep working: "her work address" names an
+    address of the person, not the person."""
+    from jarvis.commander import _send_correction
+    assert _send_correction("yes but to her work address instead") == ("work address", "")
+
+
+# ==================================================================
+# 19. The one re-ask belongs to ONE question (09-04)
+# ==================================================================
+def test_a_re_asked_address_does_not_spend_the_account_question(cmd_no_default):
+    """Shipped default: three accounts, no send_file.from, and Dana is not
+    in the book. The address question is re-asked once; the corrected
+    answer then reached "Which account?" carrying reasked=True, and the
+    account question -- never yet asked -- was let go as "asked twice".
+    The read-back's own re-ask must be untouched by either."""
+    cmd = cmd_no_default
+    res = cmd.handle("email the biosensors handout to Dana", source="voice")
+    assert res.reply == "I've no address for Dana, sir. What is it?"
+    res = cmd.handle("dana at example com", source="voice")       # no "dot"
+    assert res.reply == outbox.ADDRESS_REASK_LINE
+    res = cmd.handle("dana at example dot com", source="voice")
+    assert res.reply.startswith("Which account should I send from, sir"), res
+    assert cmd._pending_sendask is not None and cmd.question_open()
+    res = cmd.handle("school", source="voice")
+    assert res.reply.endswith("Send it, sir?"), res
+    # (b) the name he said survives the account question in between
+    assert "to Dana, at dana at example dot com" in res.reply
+    assert "your school account" in res.reply
+    assert not FakeSMTP.made
+    # the read-back keeps its own single re-ask
+    res = cmd.handle("okay", source="voice")
+    assert res.reply.startswith("I'd rather be certain") and cmd._pending_send is not None
+    cmd.handle("yes", source="voice")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "dana@example.com"
+    assert FakeSMTP.made[-1].logged_in[0] == "hp@tamu.edu"
+
+
+def test_a_re_asked_account_does_not_spend_the_read_back(cmd_no_default):
+    cmd = cmd_no_default
+    cmd.handle("email the biosensors handout to Heather", source="voice")
+    res = cmd.handle("yes", source="voice")                    # not an account
+    assert res.reply.startswith("Which of them, sir") and cmd._pending_sendask.reasked
+    res = cmd.handle("school", source="voice")
+    assert res.reply.endswith("Send it, sir?"), res
+    res = cmd.handle("okay", source="voice")
+    assert res.reply.startswith("I'd rather be certain") and cmd._pending_send is not None
+    cmd.handle("yes", source="voice")
+    assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"

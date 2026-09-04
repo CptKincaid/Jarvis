@@ -5423,10 +5423,21 @@ _SEND_NOT_RX = re.compile(
 # "Yes. Thank you." is one of his own logged answers (jarvis.log.1:17109)
 # and a comma-only separator made the full stop end the sentence, so a
 # clean yes fell through to the silent-drop branch while "yes, thank you"
-# worked. The words that may follow are unchanged -- this widens the
-# PUNCTUATION, not the vocabulary.
-_SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|"
-              r"it|that|send it|send that|go ahead|do it))*[?.!]*$")
+# worked. The words that may follow were untouched by that -- it widened
+# the PUNCTUATION, not the vocabulary.
+# A pronoun after "to" names the person he has just heard in the read-back
+# -- "yes, send it to her" -- and is part of the yes (09-04). Before this the
+# F23 correction grammar read "her" as a NEW recipient and asked "I've no
+# address for her, sir. What is it?" on the one irreversible path. "and" is
+# a connector only: every word after it still has to be in this vocabulary,
+# so "yes, and turn the lights off" is no more a yes than it was.
+_SEND_PRONOUNS = frozenset(("her", "him", "them", "it", "you", "me", "us",
+                            "that", "this", "herself", "himself",
+                            "themselves", "myself", "yourself"))
+_SEND_TO_PRON = r"send (?:it|that|this) (?:to|over to|on to) (?:her|him|them|me|us|you)"
+_SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|and|"
+              r"it|that|send it|send that|go ahead|do it|" + _SEND_TO_PRON +
+              r"))*[?.!]*$")
 # "ok" / "okay" / "sure" / "alright" are deliberately ABSENT. They are the
 # words a man says while still reading the read-back, and this is the one
 # question in the app where "probably yes" must not be enough. They are
@@ -5499,6 +5510,11 @@ def _send_correction(said: str) -> Optional[tuple[str, str]]:
             # person: hand it over as the possessive-less form the people
             # book might know, and let the address question do the rest.
             who = re.sub(r"^(?:her|his|their)\s+", "", who, flags=re.I)
+            # A bare pronoun -- "yes, send it to her" -- is the person he
+            # was just read, not a new one (09-04). It is a confirmation,
+            # never a correction, and never "I've no address for her".
+            if who.lower() in _SEND_PRONOUNS:
+                who = ""
     if not who and not acct:
         return None
     return who, acct
@@ -5527,6 +5543,7 @@ class SendAsk:
     source: str = "voice"
     made_at: float = 0.0
     reasked: bool = False
+    to_name: str = ""          # the name he said, when ``who`` is an address
 
     def stale(self, now: Optional[float] = None) -> bool:
         now = time.monotonic() if now is None else float(now)
@@ -5742,7 +5759,7 @@ def _send_file_offer(c, prep, who: str, hint: str):
 
 
 def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
-                      to_name: str = "", reasked: bool = False):
+                      to_name: str = "", reasked_kind: str = ""):
     """What every path through the file lane ends in: a read-back, or the
     question it stopped at -- ARMED, so the answer can be heard.
 
@@ -5755,9 +5772,15 @@ def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
 
     ``to_name`` is what to call the recipient when the address itself was
     the answer -- outbox resolves an address to a nameless draft, and the
-    read-back should still say "to Dana, at dana at ...". ``reasked`` is
-    carried from the slot being answered: a second miss on the SAME
-    question spends it rather than asking a third time.
+    read-back should still say "to Dana, at dana at ..." -- and it rides
+    on the next question too, when there is one in between. ``reasked_kind``
+    is the kind of the question just answered, when it had already been
+    asked twice: coming back to the SAME question spends it rather than
+    asking a third time. It was a bare flag until 09-04, and the shipped
+    default (three accounts, no send_file.from) asks the address and then
+    the account: a once re-asked address made the account question --
+    never yet asked -- "asked twice; letting it go". The read-back's own
+    re-ask lives on the draft and is untouched by either.
     """
     if prep.draft is None:
         if prep.candidates:
@@ -5765,12 +5788,12 @@ def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
         kind = ("account" if prep.status == "Which account?"
                 else "recipient" if prep.status == "No address" else "")
         if kind:
-            if reasked:
+            if reasked_kind == kind:
                 log.info("send-file: %s asked twice; letting it go", kind)
                 return CommandResult(handled=True, speak=True, status="Dropped",
                                      reply=outbox.ASK_DROPPED_LINE)
             c.stash_sendask(SendAsk(kind=kind, said_file=said_file, who=who,
-                                    hint=hint))
+                                    hint=hint, to_name=to_name))
         return CommandResult(handled=True, reply=prep.ask, speak=True,
                              status=prep.status)
     if to_name and not prep.draft.to_name:
@@ -10904,7 +10927,8 @@ class Commander:
             prep = outbox.prepare(cfg, memory, ask.said_file, ask.who,
                                   account_hint=label)
             return _send_file_finish(self, prep, ask.said_file, ask.who, label,
-                                     reasked=ask.reasked)
+                                     to_name=ask.to_name,
+                                     reasked_kind=ask.kind if ask.reasked else "")
         # recipient: an address, or a name the book resolves
         who = _recipient_answer(said)
         addr = outbox.parse_address(who)
@@ -10937,7 +10961,7 @@ class Commander:
         # he used in the first sentence is what the read-back should say.
         return _send_file_finish(self, prep, ask.said_file, who, ask.hint,
                                  to_name=ask.who if addr else "",
-                                 reasked=ask.reasked)
+                                 reasked_kind=ask.kind if ask.reasked else "")
 
     def _try_destructive_confirm(self, text: str,
                                  source: str = "voice") -> Optional[CommandResult]:
