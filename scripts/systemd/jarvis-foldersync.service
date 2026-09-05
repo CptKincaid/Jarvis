@@ -25,12 +25,16 @@ WorkingDirectory=%h/Jarvis
 ExecStart=%h/vss_env/bin/python -m jarvis.foldersync
 Restart=always
 RestartSec=15
-# A PREFLIGHT REFUSAL IS TERMINAL.  main() returns 2 when the folders are
-# configured into a shape that would loop (outbox == inbox, Sent nested inside
-# the Outbox) or when the Outbox sits outside remote.local_roots.  A restart
-# cannot fix any of those, and without this line five restarts in ten minutes
-# would replace a legible message with "start request repeated too quickly".
-RestartPreventExitStatus=2
+# TWO TERMINAL EXITS, neither of which a restart can fix.
+#   2  the folders are configured into a shape that would loop (outbox ==
+#      inbox, Sent nested inside the Outbox) or the Outbox sits outside
+#      remote.local_roots.
+#   3  foldersync.enabled is false.  Without this the unit would exit 0 and
+#      be restarted every 15 s for as long as the switch is off -- a loop
+#      whose only symptom is a churning journal.
+# Without the line, five restarts in ten minutes replace a legible message
+# with systemd's "start request repeated too quickly".
+RestartPreventExitStatus=2 3
 # Copying a 500 MB file must never make his desktop stutter.
 Nice=10
 IOSchedulingClass=idle

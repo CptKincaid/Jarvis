@@ -1218,8 +1218,14 @@ def main(argv=None) -> int:
     if problems:
         return 2
     if not syncer.conf.enabled:
-        print("foldersync.enabled is false; nothing to do.", file=sys.stderr)
-        return 0
+        # 3, not 0.  The unit is Restart=always, so exiting 0 here would make
+        # systemd start this every 15 seconds for as long as the switch is
+        # off -- a restart loop whose only symptom is a churning journal.
+        # The unit lists 3 in RestartPreventExitStatus, so it stops cleanly
+        # and says why.
+        print("foldersync.enabled is false in ~/.config/jarvis/"
+              "assistant.json; nothing to do.", file=sys.stderr)
+        return 3
 
     lock = Path(getattr(PATHS, "STATE_DIR")) / "foldersync.lock"
     with single_instance(lock) as mine:

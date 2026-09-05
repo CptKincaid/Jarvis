@@ -775,8 +775,11 @@ def test_the_lane_ships_off_so_nothing_moves_until_he_says_so(home, monkeypatch)
                         lambda cfg: (fs.Syncer(conf, sconf, t), []))
     monkeypatch.setattr("jarvis.assistant_config.AssistantConfig.load",
                         staticmethod(lambda *a, **k: Cfg()))
-    assert fs.main([]) == 0
+    # 3, not 0: the unit is Restart=always, so a 0 here would have systemd
+    # restarting this every 15 seconds for as long as the switch is off.
+    assert fs.main([]) == 3
     assert t.calls == []
+    assert "RestartPreventExitStatus=2 3" in UNIT.read_text()
 
 
 # ------------------------------------------ what self-review caught (09-05)
