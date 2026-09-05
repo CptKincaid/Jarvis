@@ -1198,6 +1198,10 @@ DEFAULTS: dict = {
         "stable_interval_s": 1,
         "min_quiet_s": 4,
         "max_mb": 0,                             # 0 -> remote.max_mb
+        # When a copy reaches HPCOMPUTER under your filename but arrives the
+        # wrong size, may I delete that broken copy of mine? Off: it stays
+        # there under your name and I only tell you about it.
+        "remove_broken_copies": False,
     },
     # jarvis/gate.py -- whether Jarvis answers whoever speaks, or only the
     # people he recognises.  THIS IS RECOGNITION, NOT A LOCK: a photograph

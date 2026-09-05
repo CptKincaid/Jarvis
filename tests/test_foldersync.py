@@ -71,6 +71,10 @@ class FakeTransport:
     def __init__(self, inbox=None, outbox=None):
         self.dirs = {"inbox": dict(inbox or {}), "outbox": dict(outbox or {})}
         self.folders = {"inbox": set(), "outbox": set()}   # FOLDERS over there
+        self.staged = {}          # "<stage>/<inner>" -> (size, stamp)
+        self.stages = set()       # staging directories that exist
+        self.mkdir_fail = {}      # {stage: reason}
+        self.removed = []         # names taken back under HIS filename
         self.fail = ""            # a reason to return from every call
         self.listing_fail = {}    # {key: reason} -- ONE folder, not the link
         self.send_fail = {}       # {local name: reason} -- the FILE, not the link
@@ -97,6 +101,29 @@ class FakeTransport:
                  for n in sorted(self.folders[key])]
         return rows, ""
 
+    # -- the exclusive claim on what we WRITE (row 3) -------------------
+    def stage_open(self, stage):
+        """MKDIR: the one operation on this link that refuses a taken name.
+        MEASURED against the local sftp-server 2026-09-05 -- refused an
+        existing directory AND an existing file, and two sessions racing
+        one mkdir gave exactly one winner in 20 of 20 rounds."""
+        self.calls.append(("stage_open", stage))
+        if self.fail:
+            return self.fail
+        if stage in self.mkdir_fail:
+            return self.mkdir_fail[stage]
+        if stage in self.stages or stage in self.dirs["inbox"]:
+            return "name-taken"
+        self.stages.add(stage)
+        return ""
+
+    def stage_close(self, stage):
+        self.calls.append(("stage_close", stage))
+        if any(k.startswith(stage + "/") for k in self.staged):
+            return "failed"       # rmdir refuses a non-empty directory
+        self.stages.discard(stage)
+        return ""
+
     def send(self, local, name, key="inbox"):
         self.calls.append(("send", name))
         if self.fail:
@@ -105,6 +132,14 @@ class FakeTransport:
             raise AssertionError("nothing may write outside the remote inbox")
         if local.name in self.send_fail or name in self.send_fail:
             return self.send_fail.get(local.name) or self.send_fail[name]
+        stage, slash, _inner = name.partition("/")
+        if slash:
+            if stage not in self.stages:
+                raise AssertionError(f"scp wrote into {stage!r}, which this "
+                                     f"pass never claimed")
+            self.staged[name] = (self.short_write or local.stat().st_size,
+                                 self.stamp)
+            return ""
         if name in self.folders[key]:
             return "failed"       # scp onto a folder: what the regexes miss
         size = self.short_write or local.stat().st_size
@@ -119,11 +154,12 @@ class FakeTransport:
             return self.fail
         if final in self.claim_fail:
             return self.claim_fail[final]
-        if temp not in self.dirs[key]:
+        held = self.staged if "/" in temp else self.dirs[key]
+        if temp not in held:
             return "taken"        # generic "Failure" is all the wire says
         if final in self.dirs[key] or final in self.folders[key]:
             return "taken"        # measured: refused, both files intact
-        self.dirs[key][final] = self.dirs[key].pop(temp)
+        self.dirs[key][final] = held.pop(temp)
         return ""
 
     def discard(self, temp, key="inbox"):
@@ -134,8 +170,32 @@ class FakeTransport:
         self.discarded.append(temp)
         if self.fail:
             return self.fail
+        self.staged.pop(temp, None)
         self.dirs[key].pop(temp, None)
         return ""
+
+    def remove_landed(self, name, key="inbox"):
+        """A copy of ours that landed under HIS filename and failed its size
+        check.  Reachable ONLY with foldersync.remove_broken_copies on."""
+        self.calls.append(("remove_landed", name))
+        self.removed.append(name)
+        if self.fail:
+            return self.fail
+        self.dirs[key].pop(name, None)
+        return ""
+
+    def stat(self, name, key="inbox"):
+        """ONE name, asked about directly -- an answer no listing cap can
+        turn into a lie (finding Q)."""
+        self.calls.append(("stat", name))
+        if self.fail:
+            return None, self.fail
+        if self.listing_fail.get(key):
+            return None, self.listing_fail[key]
+        if name in self.folders[key]:
+            return fs.Entry(name, 4096, self.stamp, True), ""
+        row = self.dirs[key].get(name)
+        return (fs.Entry(name, row[0], row[1]) if row else None), ""
 
     def fetch(self, key, name, dest):
         self.calls.append(("fetch", name))
@@ -377,7 +437,10 @@ def test_a_pushed_file_is_verified_then_moved_to_sent(home):
     # The listing that VERIFIES came after the send, not instead of it --
     # and the bytes went at a temp name of ours, which a CLAIM then renamed
     # onto the name he will see.  Nothing writes at his name.
-    assert [c[0] for c in t.calls] == ["listing", "send", "claim", "listing"]
+    # ROW 3: nothing is written until a staging directory has been taken
+    # exclusively, and the directory is given back at the end of the pass.
+    assert [c[0] for c in t.calls] == ["listing", "stage_open", "send",
+                                       "claim", "listing", "stage_close"]
 
 
 def test_a_short_write_on_the_far_side_leaves_his_file_where_it_is(home):
@@ -536,7 +599,11 @@ def test_a_pulled_file_is_never_visible_half_written(home):
     t.fetch = watching_fetch
     s = syncer(home, t)
     s.pull_once()
-    assert seen == [[fs.PART_PREFIX + "big.bin"]]     # hidden while in flight
+    # The part name carries a pid and a counter now (row 5), so two
+    # passes cannot collide on it and be mistaken for a file of his.
+    assert len(seen) == 1 and len(seen[0]) == 1
+    assert seen[0][0].startswith(fs.PART_PREFIX) and \
+        seen[0][0].endswith("big.bin")
     assert sorted(p.name for p in (home / "Inbox").iterdir()) == ["big.bin"]
 
 
@@ -665,7 +732,8 @@ def test_the_sftp_listing_parse_is_the_measured_format():
            "jarvis-outbox/sub dir\n"
            "-rw-rw-r--    ? hunterp  hunterp 20481 Sep  3  2025 "
            "jarvis-outbox/old report.pdf\n")
-    rows = fs.parse_sftp_entries(out)
+    rows, truncated = fs.parse_sftp_entries(out)
+    assert truncated is False
     assert [(r.name, r.size, r.stamp, r.is_dir) for r in rows] == [
         ("a.txt", 1, "Sep 3 12:21", False),
         # KEPT, not dropped.  A folder over there is a name that is taken,
@@ -1069,7 +1137,10 @@ def test_the_landing_takes_the_atomic_link_and_never_a_check(home):
         mp.setattr(os, "link", watch_link)
         mp.setattr(os, "open", watch_open)
         syncer(home, t).pull_once()
-    assert used == ["link"]
+    # The O_EXCL is the PART FILE being claimed before a byte moves (row 5);
+    # the landing itself is still the atomic link, which is what this test
+    # exists to hold, and it must not quietly degrade to the fallback.
+    assert used == ["o_excl", "link"]
     assert (home / "Inbox" / "notes.txt").exists()
 
 
@@ -1276,7 +1347,7 @@ def test_the_sftp_listing_keeps_folders_instead_of_dropping_them(home):
            "jarvis-inbox/a.txt\n"
            "drwxrwxr-x    ? hunterp  hunterp 4096 Sep  3 12:21 "
            "jarvis-inbox/reports\n")
-    rows = fs.parse_sftp_entries(out)
+    rows, _truncated = fs.parse_sftp_entries(out)
     assert [(r.name, r.is_dir) for r in rows] == [("a.txt", False),
                                                   ("reports", True)]
 
@@ -1462,8 +1533,11 @@ def test_the_push_writes_at_a_name_of_ours_and_never_at_his(home):
     s.push_once()
     written = [name for kind, name in t.calls if kind == "send"]
     assert len(written) == 1
-    assert written[0].startswith(remote.REMOTE_TEMP_PREFIX)
-    assert written[0].endswith(".tmp")
+    # ROW 3: not merely a name of ours, a name INSIDE a directory of ours
+    # that the far side refused to let anybody else create.
+    stage, _, inner = written[0].partition("/")
+    assert remote.is_remote_stage(stage) and inner == "f0"
+    assert stage in [n for kind, n in t.calls if kind == "stage_open"]
     assert t.claims == [(written[0], "report.pdf")]
 
 
@@ -1525,20 +1599,33 @@ def test_the_number_of_claim_attempts_is_bounded(home):
     assert 0 < len(t.claims) <= fs.MAX_CLAIM_TRIES
 
 
-def test_a_leftover_temp_of_ours_is_taken_off_his_machine_next_pass(home):
-    """A process killed between the copy and the claim leaves a temp in his
-    Inbox.  It is ours, it is named ours, and it is the only thing this
-    module may ever delete over there."""
+def test_a_leftover_that_merely_LOOKS_like_ours_is_left_where_it_is(home):
+    """DELIBERATELY REVERSED IN ROUND 4, and this is finding M.
+
+    This used to assert that anything shaped like ``jarvis-part-*.tmp`` was
+    swept off his machine, on the reasoning that the shape proved it was
+    ours.  It does not: ``jarvis-part-notes.tmp`` is a name HE can choose,
+    and one was measured being deleted with no event, no note and nothing in
+    status.txt -- and the same sweep ate the VOICE lane's in-flight file,
+    which then told him a file of his was holding the name.
+
+    A shape is not an identity.  Only a staging folder this process created
+    in this run is ever swept; anything else of that shape is left alone and
+    COUNTED, so the litter is visible instead of being cleared by force.
+    """
     t = FakeTransport()
-    stale = remote.remote_temp_name(0)
+    stale = remote.remote_temp_name(0)          # a previous run's, or his
     t.dirs["inbox"][stale] = (10, t.stamp)
     t.dirs["inbox"]["his report.pdf"] = (5, t.stamp)
     drop(home, "new.txt", b"a")
     s = syncer(home, t)
     s.push_once()
-    assert stale in t.discarded
-    assert stale not in t.dirs["inbox"]
+    assert t.discarded == []
+    assert stale in t.dirs["inbox"]                            # left alone
     assert "his report.pdf" in t.dirs["inbox"]                 # untouched
+    assert s._foreign_temps == 1
+    s.write_status()
+    assert "I did not make them" in (home / "status.txt").read_text()
 
 
 def test_the_verification_is_against_the_name_we_actually_took(home):

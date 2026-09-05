@@ -89,11 +89,13 @@ repo can reach a network, a host key or a disk it did not make.
 from __future__ import annotations
 
 import errno
+import itertools
 import json
 import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -352,6 +354,13 @@ FAIL_LINES = {
                 "sir; rename it and I'll send it.",
     "exists": "There's already a file by that name where I'd put it, sir; "
               "I've left yours alone.",
+    # NOT the line above, and that distinction is finding M2.  When our own
+    # staged copy disappears mid-flight, nothing was holding his name -- so
+    # "there's already a file by that name" is simply false, and it was
+    # being said every time the folder lane's sweep ate this lane's file.
+    "staging-gone": "Something removed the copy I was staging on {name} "
+                    "before I could put it in place, sir; nothing of yours "
+                    "was touched, and I'll try it again.",
     # The far side's OWN shell said it does not know the command (F07): a
     # POSIX row sent to cmd.exe, or a Windows row sent to sh.  That is a
     # remote.os problem on this side, and it names the command so he can
@@ -904,14 +913,43 @@ RENAME_FLAG = "-l"
 REMOTE_TEMP_PREFIX = "jarvis-part-"
 REMOTE_TEMP_SUFFIX = ".tmp"
 
+# A STAGING DIRECTORY of ours on the far side, and the file inside it.  See
+# :func:`sftp_mkdir` for why a directory is the claim.
+REMOTE_STAGE_SUFFIX = ".d"
+STAGE_FILE = "f"
 
-def remote_temp_name(seq: int = 0) -> str:
+# FINDING O.  ``remote_temp_name()`` was pid + second + a counter the CALLER
+# supplied, and remote.push supplied none -- so it defaulted to 0 and two
+# spoken sends inside the same second shared a staging name, each scp
+# truncating the other's bytes.  The counter belongs to the process, not to
+# whoever remembers to pass one; an explicit ``seq`` is still honoured
+# because foldersync numbers its own files within a pass.
+_NAME_SEQ = itertools.count()
+_NAME_LOCK = threading.Lock()
+
+
+def _next_seq() -> int:
+    with _NAME_LOCK:
+        return next(_NAME_SEQ)
+
+
+def remote_temp_name(seq: int = None) -> str:
     """A name in the remote inbox that is ours beyond argument: the pid, the
     second, and a counter, so two passes and two processes cannot collide
     even if the lock ever failed.  It satisfies SAFE_REMOTE_NAME_RX, so it
     goes through the same vetting every other remote name does."""
+    seq = _next_seq() if seq is None else seq
     return (f"{REMOTE_TEMP_PREFIX}{os.getpid()}-{int(time.time())}-"
             f"{int(seq)}{REMOTE_TEMP_SUFFIX}")
+
+
+def remote_stage_name(seq: int = None) -> str:
+    """The name of a staging DIRECTORY of ours, same shape, ``.d`` on the
+    end so it can never be mistaken for -- or mistake itself for -- one of
+    the ``.tmp`` part files."""
+    seq = _next_seq() if seq is None else seq
+    return (f"{REMOTE_TEMP_PREFIX}{os.getpid()}-{int(time.time())}-"
+            f"{int(seq)}{REMOTE_STAGE_SUFFIX}")
 
 
 def is_remote_temp(name: str) -> bool:
@@ -920,6 +958,62 @@ def is_remote_temp(name: str) -> bool:
     return (base.startswith(REMOTE_TEMP_PREFIX)
             and base.endswith(REMOTE_TEMP_SUFFIX)
             and bool(SAFE_REMOTE_NAME_RX.match(base)))
+
+
+def is_remote_stage(name: str) -> bool:
+    """Is this basename a staging DIRECTORY of ours?"""
+    base = os.path.basename(name or "")
+    return (base.startswith(REMOTE_TEMP_PREFIX)
+            and base.endswith(REMOTE_STAGE_SUFFIX)
+            and bool(SAFE_REMOTE_NAME_RX.match(base)))
+
+
+def _ours_over_there(path: str) -> bool:
+    """A remote path this module is allowed to write over or delete without
+    asking anybody: a part file of our own shape, or ANYTHING inside a
+    staging directory of our own shape -- which we only ever get by having
+    created that directory exclusively (see :func:`sftp_mkdir`)."""
+    text = str(path or "")
+    return is_remote_temp(os.path.basename(text)) or \
+        is_remote_stage(os.path.basename(os.path.dirname(text)))
+
+
+# ---- claiming the name we WRITE at, not just the name he sees ----------
+# ROW 3 and ROW 5 of the round-3 table, and the third time this same shape
+# has been found here.  ``rename -l`` claims the name HE will see, but the
+# bytes still went to a temp name with NO check of any kind: an attacker
+# measured a 99999-byte file at that name replaced by 30 bytes, with the
+# pass reporting "sent".  The window is the whole transfer and the guard
+# was only that the name is improbable.
+#
+# SFTP has no exclusive create for a FILE -- there is no no-clobber flag on
+# put, and that is exactly what round 3 measured.  It has exactly one
+# operation that creates a name and refuses if it is taken: MKDIR.
+#
+# MEASURED on this box 2026-09-05, `sftp -q -b - -D
+# /usr/lib/openssh/sftp-server` (no socket, no HPCOMPUTER):
+#   * mkdir at a free name        -> rc 0
+#   * mkdir again at that name    -> rc 1, `remote mkdir "...": Failure`
+#   * mkdir over an existing FILE -> rc 1, the same
+#   * two sessions racing one mkdir, 20 rounds -> exactly one winner 20/20,
+#     never both, never neither
+#   * `rename -l` ACROSS directories, onto a taken name -> rc 1 with a
+#     99999-byte file at the target still 99999 bytes and our own staged
+#     file intact
+#   * rmdir of a NON-EMPTY directory -> rc 1: the release can never take a
+#     byte with it
+# So: create a directory exclusively, put the bytes INSIDE it (where no
+# name can be anyone's but ours, by construction), claim his name out of it
+# with `rename -l`, and rmdir the empty shell.  Two extra round trips per
+# transfer; nothing else on this link can refuse a write.
+#
+# HONESTLY MODELLED, NOT MEASURED: the far side is OpenSSH for Windows and
+# no probe of it is allowed from here.  The POSIX numbers above are real;
+# the Windows behaviour is inferred from the protocol (SSH_FXP_MKDIR over
+# CreateDirectory, which fails with ERROR_ALREADY_EXISTS).  If Windows were
+# to allow mkdir over an existing directory, this degrades to exactly
+# today's behaviour and no further -- the inner name is still ours by
+# shape -- so the change cannot be worse than what it replaces.
 
 
 def sftp_rename(conf: RemoteConfig, src: str, dst: str) -> SshResult:
@@ -944,20 +1038,67 @@ def sftp_rename(conf: RemoteConfig, src: str, dst: str) -> SshResult:
     return run_sftp(conf, f'rename {RENAME_FLAG} "{src}" "{dst}"')
 
 
-def sftp_remove(conf: RemoteConfig, path: str) -> SshResult:
+def sftp_mkdir(conf: RemoteConfig, path: str) -> SshResult:
+    """CLAIM a staging directory on the far side.  Succeeds only if nothing
+    at all holds that name -- not a file, not a directory.
+
+    The only exclusive create SFTP offers, and therefore the only way the
+    bytes of a transfer can go somewhere that is ours rather than somewhere
+    that is merely improbably his.  Refuses any name that is not a staging
+    directory of our own shape, so this cannot be pointed at a folder of
+    his by a caller that gets confused.
+    """
+    if not path or not is_remote_stage(os.path.basename(path)):
+        log.warning("remote: refusing to create a directory that is not one "
+                    "of my own staging names")
+        return SshResult(False, reason="denied")
+    if _SFTP_UNQUOTABLE_RX.search(path):
+        return SshResult(False, reason="odd-name")
+    return run_sftp(conf, f'mkdir "{path}"')
+
+
+def sftp_rmdir(conf: RemoteConfig, path: str) -> SshResult:
+    """Release a staging directory of ours.  Guarded by the same name rule
+    as :func:`sftp_mkdir`, and the server itself refuses a directory that
+    is not empty (measured: rc 1), so this operation can never take a byte
+    of anything with it."""
+    if not path or not is_remote_stage(os.path.basename(path)):
+        log.warning("remote: refusing to remove a directory that is not one "
+                    "of my own staging names")
+        return SshResult(False, reason="denied")
+    if _SFTP_UNQUOTABLE_RX.search(path):
+        return SshResult(False, reason="odd-name")
+    return run_sftp(conf, f'rmdir "{path}"')
+
+
+def sftp_remove(conf: RemoteConfig, path: str, *,
+                claimed: bool = False) -> SshResult:
     """Delete ONE in-flight file OF OURS from the far side.
 
     The guard is the point.  Nothing in Jarvis may delete a file of his on
     HPCOMPUTER, so this refuses every name that is not one
-    :func:`remote_temp_name` made -- a caller that passes his report.pdf
-    gets "denied" and no session is opened at all.
+    :func:`remote_temp_name` made, or one INSIDE a staging directory we
+    created exclusively -- a caller that passes his report.pdf gets
+    "denied" and no session is opened at all.
+
+    ``claimed=True`` is the ONE widening, and it exists only for the
+    setting he has not answered yet: a copy that landed under HIS filename
+    and then failed its size check, which the lane can otherwise never take
+    back (see ``foldersync.remove_broken_copies``, shipped OFF).  It is a
+    keyword, it is never a default, the caller must have created that exact
+    name in this run, and it is logged at WARNING every single time so a
+    delete over there is never silent.
     """
-    if not path or not is_remote_temp(path):
+    if not path or not (claimed or _ours_over_there(path)):
         log.warning("remote: refusing to delete a name that is not one of "
                     "my own in-flight files")
         return SshResult(False, reason="denied")
     if _SFTP_UNQUOTABLE_RX.search(path):
         return SshResult(False, reason="odd-name")
+    if claimed and not _ours_over_there(path):
+        log.warning("remote: removing %s on %s -- a copy I made in this run "
+                    "that arrived the wrong size, because "
+                    "foldersync.remove_broken_copies is on", path, conf.name)
     return run_sftp(conf, f'rm "{path}"')
 
 
@@ -1088,6 +1229,23 @@ def push(conf: RemoteConfig, local: Path) -> SshResult:
     with :func:`sftp_rename`, which refuses a name that is taken.  A refusal
     is "exists" -- the line this module has always had for the pull side and
     could never reach on this one -- and his file is untouched.
+
+    ROUND 4 adds the half round 3 left out.  The temp name was ours only by
+    being improbable: the scp that wrote it had no claim on it at all, and a
+    99999-byte file at that name was measured being replaced by 30 bytes
+    with the push reporting success.  So the transfer now happens inside a
+    staging DIRECTORY taken with :func:`sftp_mkdir`, which is the one
+    exclusive create this link has.  Four round trips instead of two --
+    mkdir, scp, rename, rmdir -- and the two extra are the price of the
+    write having a claim on it.
+
+    And the false line (M2): when the rename fails, the far side says only
+    "Failure", which round 3 read as "his name is taken" ALWAYS.  If our own
+    staged file has gone -- which is exactly what happened when the folder
+    lane's pattern sweep ate it mid-flight -- that answer is a lie: nothing
+    held the name.  So a failed claim now ASKS what is in our staging
+    directory, one round trip, only on failure, and says "staging-gone"
+    when the honest answer is that our own copy went missing.
     """
     why = missing_reason(conf)
     if why:
@@ -1097,33 +1255,62 @@ def push(conf: RemoteConfig, local: Path) -> SshResult:
     if bad:
         return SshResult(False, reason=bad)
     target = inbox_target(conf, local.name)
-    staging = inbox_target(conf, remote_temp_name())
-    if not target or not staging:
+    stage = inbox_target(conf, remote_stage_name())
+    if not target or not stage:
         return SshResult(False, reason="odd-name")
-    res = run_copy(conf, str(local), staging, push=True)
-    if not res.ok:
-        if res.reason in ("unreachable", "timeout"):
+    made = sftp_mkdir(conf, stage)
+    if not made.ok:
+        reason = made.reason or "failed"
+        if reason in ("unreachable", "timeout"):
+            reason = unreachable_reason(conf) or reason
+        return SshResult(False, out=made.out, err=made.err, reason=reason)
+    staging = f"{stage}/{STAGE_FILE}"
+    try:
+        res = run_copy(conf, str(local), staging, push=True)
+        if not res.ok:
+            sftp_remove(conf, staging)
+            if res.reason in ("unreachable", "timeout"):
+                better = unreachable_reason(conf)
+                if better:
+                    return SshResult(False, out=res.out, err=res.err,
+                                     reason=better)
+            return res
+        claim = sftp_rename(conf, staging, target)
+        if claim.ok:
+            return SshResult(True, out=res.out, err=res.err)
+        # Before blaming his file for holding the name, find out whether our
+        # own copy is even still there.  Only on the failure path.
+        gone = staged_file_missing(conf, stage)
+        # Our own bytes are sitting in his inbox under a name of ours.  Take
+        # them away rather than leave litter; the guard in sftp_remove means
+        # this line can never reach anything else.
+        sftp_remove(conf, staging)
+        if claim.reason in ("unreachable", "timeout"):
             better = unreachable_reason(conf)
             if better:
-                return SshResult(False, out=res.out, err=res.err,
-                                 reason=better)
-        return res
-    claim = sftp_rename(conf, staging, target)
-    if claim.ok:
-        return SshResult(True, out=res.out, err=res.err)
-    # Our own bytes are sitting in his inbox under a name of ours.  Take
-    # them away rather than leave litter; the guard in sftp_remove means
-    # this line can never reach anything else.
-    sftp_remove(conf, staging)
-    if claim.reason in ("unreachable", "timeout"):
-        better = unreachable_reason(conf)
-        if better:
-            return SshResult(False, err=claim.err, reason=better)
-    # The wire says only "Failure", for a held name and for a malformed
-    # path alike, so any failure is read as "I did not get that name".
-    return SshResult(False, out=claim.out, err=claim.err,
-                     reason=("exists" if claim.reason in ("failed", "")
-                             else claim.reason))
+                return SshResult(False, err=claim.err, reason=better)
+        if claim.reason in ("failed", ""):
+            # The wire says only "Failure", for a held name and for a
+            # vanished source alike.  One of those is his file; the other
+            # is ours going missing, and saying the first when it was the
+            # second is the whole of M2.
+            reason = "staging-gone" if gone else "exists"
+        else:
+            reason = claim.reason
+        return SshResult(False, out=claim.out, err=claim.err, reason=reason)
+    finally:
+        sftp_rmdir(conf, stage)
+
+
+def staged_file_missing(conf: RemoteConfig, stage: str) -> bool:
+    """Has something taken our own staged copy away?  True only when the far
+    side ANSWERED and our file was not in the answer; a listing that could
+    not be had is not evidence either way, so it says False and the caller
+    falls back to the older, blunter reading."""
+    res = _list_sftp(conf, stage)
+    if not res.ok:
+        return False
+    return STAGE_FILE not in sftp_listing(res.out)
 
 
 def pull_target(conf: RemoteConfig, name: str) -> Path:

@@ -122,50 +122,29 @@ a way to see what happened.
 
 -------------------------------------------- every read-then-write, listed
 
-The shape that has now bitten this lane twice is: ask whether a name is
-free, and then write at it.  Round 2 swept for it and wrote "nothing else
-in the repo has either shape" -- which was FALSE, because that sweep looked
-only for a local ``os.replace`` and never at a REMOTE write.  So here is
-the whole list, both sides, with the width of each window.  A future sweep
-starts by checking this table is still true.
+THE TABLE THAT USED TO BE HERE IS GONE, and that is the point.
 
-  WHERE                          CHECK -> WRITE            WINDOW
-  ---------------------------------------------------------------------
-  foldersync push (F-J)          listing -> scp            WAS minutes
-                                 now: scp to OUR temp,     now NONE: the
-                                 then `rename -l`          kernel refuses
-  foldersync pull (F-F, rd 2)    listing -> land           NONE: os.link
-  foldersync _move_to_sent       (none) -> land_beside     NONE: os.link
-  land_beside, no-hardlink path  O_EXCL -> os.replace      ~0.011 ms, and
-    (FAT/exFAT only; his Desktop is ext4)                  over a 0-byte
-                                                           file OF OURS
-  remote.push (voice lane)       NONE AT ALL -> scp        WAS total; now
-                                 now: temp + `rename -l`   NONE
-  remote.pull (voice lane)       dest.exists() -> scp      WAS the whole
-                                 now: O_CREAT|O_EXCL       transfer; NONE
-  ledger.save                    read -> tmp + replace     ours, and one
-                                                           process holds a
-                                                           flock
-  history + status + notes       write at a fixed path     ours by name
-                                                           (status.txt,
-                                                           *.jarvis-cannot
-                                                           -send.txt); no
-                                                           read precedes
-                                                           them, so there
-                                                           is no window --
-                                                           but they DO
-                                                           overwrite their
-                                                           own path, which
-                                                           is why both
-                                                           names are ours
-                                                           and reserved
-  the remote part file           scp at a temp of ours     ours by name;
-                                                           deleted only
-                                                           through
-                                                           remote.sftp_
-                                                           remove, which
-                                                           refuses every
-                                                           other shape
+The shape that has now bitten this lane THREE times is: ask whether a name
+is free, and then write at it.  Round 2 swept for it by hand and wrote
+"nothing else in the repo has either shape", which was false.  Round 3
+wrote a table here as the starting point for the next sweep, and that table
+was ALSO wrong -- it was missing the push's own scp at its temp name (an
+unbounded window, measured destroying a 99999-byte file) and it did not
+mention the pull's part file at all (the whole transfer, measured
+destroying another).  Two of the three rounds hand-wrote a map of this
+module and got it wrong; a fourth hand-written map is not the answer.
+
+So the table is DERIVED FROM THE SOURCE, mechanically, by an AST census of
+every read-then-write pair in this module and in jarvis/tools/remote.py,
+and it is pinned by a test that FAILS the moment a pair appears that the
+census does not know about:
+
+    tests/test_write_census.py          the census and the pin
+    ~/vss_env/bin/python -m tests.write_census    prints today's table
+
+Nothing about the windows themselves is any less important for being
+generated -- what changed is only that a new one can no longer be left out
+by somebody editing prose.
 
 ------------------------------------------------------------------- privacy
 
@@ -199,6 +178,15 @@ log = get_logger("foldersync")
 # neither can be picked up and sent -- the first half of "nothing recurses".
 NOTE_SUFFIX = ".jarvis-cannot-send.txt"
 PART_PREFIX = ".jarvis-part-"
+
+# ROW 14.  A note's name is HIS filename plus our suffix, so the name alone
+# proves nothing -- ``report.pdf.jarvis-cannot-send.txt`` is a name he can
+# choose, and it was measured being overwritten and then DELETED by the
+# sweep when report.pdf went away.  A name cannot be the identity, so the
+# CONTENT is: this first line is written on every note we make, checked
+# through an open file descriptor before we truncate one, and required
+# before we remove one.
+NOTE_MARKER = "Jarvis folder sync note."
 
 # Names that are somebody else's half-finished download or lock file.  A
 # browser writes foo.pdf.crdownload and renames; Office leaves ~$doc.docx.
@@ -252,11 +240,42 @@ _NO_HARDLINK = frozenset(
 
 MAX_COPIES = 50          # "name (2)" .. "name (50)", then refuse
 MAX_CLAIM_TRIES = 8      # names TRIED on the far side, per file, per pass
-MAX_TEMP_SWEEP = 5       # leftover part files of ours cleared per pass
+MAX_TEMP_SWEEP = 5       # staging folders OF THIS RUN released per pass
 MAX_ATTEMPTS = 5         # tries at ONE file before it is parked
 RETRY_AFTER_S = 3600.0   # ...and how long it is parked for
 HISTORY_LINES = 500      # the on-disk record, bounded
 LEDGER_CAP = 4000        # remembered remote files, bounded
+
+# FINDING Q.  ``remote.LISTING_CAP`` is 400, and this lane read "not in the
+# first 400 entries" as "not on the machine".  Measured with 400+ files in
+# the Windows Inbox: zebra.pdf was over there at exactly the right size and
+# the note said "HPCOMPUTER reports no such file", and twelve passes left
+# FIVE abandoned copies under his own filenames; the same cap hid an
+# INBOUND file for ever, six passes, with the status still saying "link OK".
+#
+# Both halves are fixed by never letting a CAP mean ABSENCE.
+#  * The verification no longer scans: a name that is not in the listing is
+#    ASKED ABOUT BY NAME (:meth:`SshTransport.stat`), which is an answer
+#    about that name and nothing else.
+#  * The listing itself is read whole, up to a bound two orders of
+#    magnitude larger, and when even that is hit the truncation is a fact
+#    the lane KNOWS and says in status.txt rather than a silence.
+# The per-pass WORK is still bounded -- by the number of transfers, which
+# is the thing that was actually expensive -- so a huge folder makes the
+# lane slower and never blind.
+LISTING_HARD_CAP = 20000
+MAX_PULLS_PER_PASS = 100
+
+# A landing recorded before the claim (FINDING L) is resolved on the next
+# pass; if his file never comes back, the row is forgotten after this.
+LANDED_FORGET_S = 7 * 86400.0
+
+# The one question that is HIS: may the lane take back a copy that landed
+# under his filename on Windows and then failed its size check?  Doing so
+# widens what this lane may delete over there from "a name of my own shape"
+# to "a name I created in this run", which changes a promise, so it is a
+# setting and the setting ships OFF.
+DEFAULTS_REMOVE_BROKEN = False
 # A remote file the far side has stopped listing is forgotten after this.
 # Nothing live is ever evicted by the cap: remote.LISTING_CAP bounds a
 # listing at 400 entries and every one of them is refreshed on every pass,
@@ -299,6 +318,11 @@ class SyncConfig:
     stable_interval_s: float = 1.0
     min_quiet_s: float = 4.0
     max_mb: float = 0.0              # 0 -> inherit remote.max_mb
+    # OFF, and his to turn on.  When a copy reaches HPCOMPUTER under your
+    # filename but arrives the wrong size, this lets me delete that broken
+    # copy of mine; with it off the broken copy stays there under your name
+    # and I only tell you about it.
+    remove_broken_copies: bool = DEFAULTS_REMOVE_BROKEN
 
 
 @dataclass(frozen=True)
@@ -502,6 +526,51 @@ def land_beside(source: Path, folder: Path, name: str) -> str:
     return ""
 
 
+def _marked(fd: int) -> bool:
+    """Does the file behind this OPEN descriptor start with our note
+    marker?  Through the fd rather than the path, so the answer is about
+    the inode we are going to write to and not about whatever happens to
+    hold the name a moment later."""
+    try:
+        os.lseek(fd, 0, os.SEEK_SET)
+        head = os.read(fd, len(NOTE_MARKER.encode()))
+        os.lseek(fd, 0, os.SEEK_SET)
+    except OSError:
+        return False
+    return head == NOTE_MARKER.encode()
+
+
+def _unlink_if_ours(path: Path) -> bool:
+    """Remove a note only if it carries our marker.  A file of his at that
+    name -- and the name is his filename plus our suffix, so it is a name
+    he can have -- is left exactly where it is.
+
+    Stated rather than hidden: between reading the marker and unlinking
+    there is a sub-millisecond window in which he could replace that file
+    with one of his own.  It cannot be closed with a syscall (there is no
+    unlink-this-inode), and it is a very long way from the measured
+    behaviour it replaces, which was to delete any name ending in the
+    suffix without looking inside it at all.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return False
+    try:
+        ours = _marked(fd)
+    finally:
+        os.close(fd)
+    if not ours:
+        log.info("foldersync: %s is not one of my notes; leaving it",
+                 path.name)
+        return False
+    try:
+        os.unlink(path)
+    except OSError:
+        return False
+    return True
+
+
 def _unlink_after_landing(source: Path, dest: Path) -> None:
     """The second half of the move.  If it fails the file exists in BOTH
     places, which is the safe direction and is said out loud rather than
@@ -597,6 +666,8 @@ def read_config(cfg) -> SyncConfig:
         stable_interval_s=num("stable_interval_s", 1.0, 0.1, 10.0),
         min_quiet_s=num("min_quiet_s", 4.0, 0.0, 600.0),
         max_mb=num("max_mb", 0.0, 0.0, 100000.0),
+        remove_broken_copies=bool(get("remove_broken_copies",
+                                      DEFAULTS_REMOVE_BROKEN)),
     )
 
 
@@ -727,8 +798,9 @@ def _inside(path: Path, root: Path) -> bool:
 _SFTP_FIELDS = 8          # mode links user group size mon day time  name
 
 
-def parse_sftp_entries(out: str) -> list:
-    """Name, SIZE and date text out of an ``sftp ls -ln``.
+def parse_sftp_entries(out: str) -> tuple:
+    """``(rows, truncated)``: name, SIZE and date text out of an ``sftp
+    ls -ln``, plus whether the answer was longer than we would read.
 
     ``remote.sftp_listing`` reads the same output and keeps only the names,
     which is all a spoken "fetch me the budget one" needs.  This lane needs
@@ -744,7 +816,16 @@ def parse_sftp_entries(out: str) -> list:
         drwxrwxr-x    ? hunterp  hunterp 4096 Sep  3 12:21 jarvis-outbox/sub dir
     """
     rows = []
-    for raw in (out or "").splitlines()[:remote.LISTING_CAP + 1]:
+    lines = (out or "").splitlines()
+    # FINDING Q: the cap used to be remote.LISTING_CAP (400) and silently
+    # threw the rest away, which is how entry 401 became invisible for ever.
+    # It is two orders of magnitude larger now AND the caller is told when
+    # it bit, so a truncation is never mistaken for an empty folder.
+    truncated = False
+    for raw in lines:
+        if len(rows) >= LISTING_HARD_CAP:
+            truncated = True
+            break
         line = raw.rstrip()
         if not line or line.startswith("sftp>"):
             continue
@@ -766,7 +847,19 @@ def parse_sftp_entries(out: str) -> list:
         # this lane needs to see it, and never fetches one.
         rows.append(Entry(name, size, " ".join(fields[5:8]),
                           line[0] == "d"))
-    return rows
+    return rows, truncated
+
+
+def _ours_to_move(name: str) -> bool:
+    """A remote name this lane may rename or delete without asking: a part
+    file of our own shape, or anything inside a staging directory we took
+    exclusively.  The second case is the stronger of the two -- the first
+    is a name PATTERN, and a pattern is what finding M was."""
+    stage, slash, inner = (name or "").partition("/")
+    if slash:
+        return bool(remote.is_remote_stage(stage) and inner
+                    and inner == os.path.basename(inner))
+    return remote.is_remote_temp(name)
 
 
 class SshTransport:
@@ -781,20 +874,70 @@ class SshTransport:
 
     def __init__(self, conf: remote.RemoteConfig):
         self.conf = conf
+        self.last_truncated = False
 
     # -- where a push may land -----------------------------------------
     def target(self, name: str) -> str:
-        """The remote path for a pushed basename, or "" if this module will
-        not write that name.  ``name`` must already BE a basename: a caller
-        that passes ``../x`` or ``a/b`` gets "" rather than a cleaned-up
-        path, because silently rewriting a path is how one escapes."""
-        if not name or name != os.path.basename(name):
+        """The remote path for a pushed name, or "" if this module will not
+        write it.  ``name`` is a basename, or ONE staging directory of our
+        own shape plus a name inside it -- nothing else.  A caller that
+        passes ``../x`` or ``a/b`` gets "" rather than a cleaned-up path,
+        because silently rewriting a path is how one escapes.
+        """
+        if not name:
+            return ""
+        stage, slash, inner = name.partition("/")
+        if slash:
+            # Inside a staging directory we created EXCLUSIVELY, so every
+            # name in it is ours by construction (row 3).
+            if not remote.is_remote_stage(stage) or not inner:
+                return ""
+            if inner != os.path.basename(inner) or windows_name_problem(inner):
+                return ""
+            base = self.target(stage)
+            return f"{base}/{inner}" if base else ""
+        if name != os.path.basename(name):
             return ""
         if windows_name_problem(name):
             return ""
         return remote.inbox_target(self.conf, name)
 
+    # -- the claim on what we WRITE, not just on what he sees ----------
+    def stage_open(self, stage: str) -> str:
+        """Take a staging directory on the far side, exclusively.  "" or a
+        reason.  This is row 3's fix: until this returns "", nothing of ours
+        writes a byte over there."""
+        why = remote.missing_reason(self.conf)
+        if why:
+            return why
+        if not remote.is_remote_stage(stage):
+            return "odd-name"
+        path = self.target(stage)
+        if not path:
+            return "odd-name"
+        res = remote.sftp_mkdir(self.conf, path)
+        if res.ok:
+            return ""
+        if res.reason in ("unreachable", "timeout"):
+            return remote.unreachable_reason(self.conf) or res.reason
+        # mkdir says only "Failure" when the name is held -- and a name of
+        # this shape being held is either our own crashed run or something
+        # very strange, so it is a reason, never a silence.
+        return "name-taken" if res.reason in ("failed", "") else res.reason
+
+    def stage_close(self, stage: str) -> str:
+        """Give the staging directory back.  The far side refuses a
+        directory that is not empty, so this can never take a byte."""
+        if not remote.is_remote_stage(stage):
+            return "denied"
+        path = self.target(stage)
+        if not path:
+            return "odd-name"
+        res = remote.sftp_rmdir(self.conf, path)
+        return "" if res.ok else (res.reason or "failed")
+
     def listing(self, key: str) -> tuple:
+        self.last_truncated = False
         why = remote.missing_reason(self.conf)
         if why:
             return [], why
@@ -812,7 +955,49 @@ class SshTransport:
             if reason in ("unreachable", "timeout"):
                 reason = remote.unreachable_reason(self.conf) or reason
             return [], reason
-        return parse_sftp_entries(res.out), ""
+        rows, truncated = parse_sftp_entries(res.out)
+        self.last_truncated = truncated
+        return rows, ""
+
+    def stat(self, name: str, key: str = "inbox") -> tuple:
+        """ASK ABOUT ONE NAME.  ``(Entry, "")`` when it is there,
+        ``(None, "")`` when the far side ANSWERED and it is not, and
+        ``(None, reason)`` when the far side could not answer at all.
+
+        FINDING Q's fix.  A folder listing is capped, and a capped listing
+        is evidence about the first N names and about nothing else -- which
+        is how a file that had landed at exactly the right size was
+        reported as "HPCOMPUTER reports no such file", twelve times, each
+        one leaving another copy under his own filename.  One name is one
+        question and gets one answer.
+        """
+        why = remote.missing_reason(self.conf)
+        if why:
+            return None, why
+        folder = remote.remote_dir(self.conf, key)
+        if not folder:
+            return None, "not-there"
+        if not remote.SAFE_REMOTE_NAME_RX.match(name or ""):
+            return None, "odd-name"
+        path = f"{remote.scp_path(folder).rstrip('/')}/{name}"
+        if remote._SFTP_UNQUOTABLE_RX.search(path):
+            return None, "odd-name"
+        res = remote.run_sftp(self.conf, f'ls -ln "{path}"')
+        if not res.ok:
+            # `Can't ls: "..." not found` classifies as not-there, and for
+            # ONE NAME that is the answer "it is not there" -- not a folder
+            # problem and not an outage.
+            if res.reason == "not-there":
+                return None, ""
+            reason = res.reason
+            if reason in ("unreachable", "timeout"):
+                reason = remote.unreachable_reason(self.conf) or reason
+            return None, reason
+        rows, _truncated = parse_sftp_entries(res.out)
+        for row in rows:
+            if row.name == name:
+                return row, ""
+        return None, ""
 
     def send(self, local: Path, name: str, key: str = "inbox") -> str:
         why = remote.missing_reason(self.conf)
@@ -859,7 +1044,7 @@ class SshTransport:
             return why
         if key != "inbox":
             return "denied"
-        if not remote.is_remote_temp(temp):
+        if not _ours_to_move(temp):
             return "odd-name"     # we only ever rename OUR OWN part file
         src, dst = self.target(temp), self.target(final)
         if not src or not dst:
@@ -875,12 +1060,27 @@ class SshTransport:
         """Take one in-flight file OF OURS off his machine again.  Refuses
         any other name here as well as in remote.sftp_remove -- the one
         delete this lane can do is guarded at both ends."""
-        if key != "inbox" or not remote.is_remote_temp(temp):
+        if key != "inbox" or not _ours_to_move(temp):
             return "denied"
         dest = self.target(temp)
         if not dest:
             return "odd-name"
         res = remote.sftp_remove(self.conf, dest)
+        return "" if res.ok else (res.reason or "failed")
+
+    def remove_landed(self, name: str, key: str = "inbox") -> str:
+        """Take back a copy that landed under HIS filename and then failed
+        its size check.  The ONLY call in this lane that deletes a name he
+        could have chosen, it exists only for
+        ``foldersync.remove_broken_copies`` (shipped OFF), and the caller
+        must have created that exact name in this run -- see
+        :meth:`Syncer._remove_broken_copy`, which holds the identity."""
+        if key != "inbox":
+            return "denied"
+        dest = self.target(name)
+        if not dest or "/" in name:
+            return "odd-name"
+        res = remote.sftp_remove(self.conf, dest, claimed=True)
         return "" if res.ok else (res.reason or "failed")
 
     def fetch(self, key: str, name: str, dest: Path) -> str:
@@ -915,6 +1115,10 @@ class Ledger:
         self.cap = max(1, int(cap))
         self.pulled: dict = {}
         self.fails: dict = {}
+        # FINDING L.  {push key: {"name", "size", "landed": bool, "t"}} --
+        # the name this process is ABOUT TO TAKE on the far side, written
+        # to disk BEFORE the claim goes out.  See :meth:`mark_claiming`.
+        self.landed: dict = {}
         self.load()
 
     def load(self) -> None:
@@ -928,15 +1132,33 @@ class Ledger:
                        if isinstance(v, dict)}
         self.fails = {k: v for k, v in (data.get("fails") or {}).items()
                       if isinstance(v, dict)}
+        self.landed = {k: v for k, v in (data.get("landed") or {}).items()
+                       if isinstance(v, dict) and v.get("name")}
 
     def save(self) -> None:
         self._trim()
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             tmp = self.path.with_suffix(".tmp")
-            tmp.write_text(json.dumps(
-                {"version": 1, "pulled": self.pulled, "fails": self.fails}))
+            # FSYNC, and it is not ceremony.  The landing record is what
+            # makes a duplicate impossible rather than unlikely (finding L),
+            # and a record that is only in the page cache is not a record: a
+            # power cut between writing it and taking the name would lose
+            # exactly the fact the next pass needs.  A process kill survives
+            # the cache; the wall socket does not.  Both the file and the
+            # directory entry, which is the standard pair.
+            with open(tmp, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(
+                    {"version": 1, "pulled": self.pulled,
+                     "fails": self.fails, "landed": self.landed}))
+                fh.flush()
+                os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            dirfd = os.open(self.path.parent, os.O_RDONLY)
+            try:
+                os.fsync(dirfd)
+            finally:
+                os.close(dirfd)
         except OSError:
             log.warning("foldersync: cannot write the ledger at %s",
                         self.path, exc_info=True)
@@ -968,7 +1190,61 @@ class Ledger:
                     if now - float(r.get("last_seen") or 0) > FORGET_AFTER_S]:
             self.pulled.pop(key, None)
 
+    # -- what is already on the far side, or about to be ----------------
+    def mark_claiming(self, key: str, name: str, size: int,
+                      now: Optional[float] = None) -> None:
+        """Write down the name we are ABOUT TO TAKE, before we take it.
+
+        THE ORDERING THAT MAKES THE DUPLICATE IMPOSSIBLE (finding L).  The
+        only step that puts his filename on HPCOMPUTER is the ``rename -l``,
+        so the record goes to disk BEFORE that call and is resolved by
+        ASKING the far side afterwards:
+
+          crash before this row exists  -> nothing at his name -> resend, and
+                                           a resend is correct
+          crash after it, before the rename -> next pass asks: not there ->
+                                           the row is dropped and it is sent
+          crash after the rename -> next pass asks: there, at our size ->
+                                           it is treated as landed and his
+                                           original is MOVED, never resent
+          the move itself fails (his hand) -> the row survives and the same
+                                           question is asked next pass
+
+        There is no window in which "it landed" is known only in memory, so
+        the duplicate is not unlikely, it is unreachable.
+        """
+        now = time.time() if now is None else now
+        self.landed[key] = {"name": name, "size": int(size), "landed": False,
+                            "t": now}
+        self._trim()
+
+    def mark_landed(self, key: str, name: str,
+                    now: Optional[float] = None) -> None:
+        now = time.time() if now is None else now
+        self.landed[key] = {"name": name,
+                            "size": int((self.landed.get(key) or {})
+                                        .get("size") or 0),
+                            "landed": True, "t": now}
+
+    def landed_row(self, key: str, now: Optional[float] = None) -> dict:
+        now = time.time() if now is None else now
+        row = self.landed.get(key)
+        if not row:
+            return {}
+        if now - float(row.get("t") or 0) > LANDED_FORGET_S:
+            self.landed.pop(key, None)
+            return {}
+        return row
+
+    def clear_landed(self, key: str) -> None:
+        self.landed.pop(key, None)
+
     def _trim(self) -> None:
+        if len(self.landed) > self.cap:
+            keep = sorted(self.landed.items(),
+                          key=lambda kv: float(kv[1].get("t") or 0),
+                          reverse=True)[:self.cap]
+            self.landed = dict(keep)
         if len(self.pulled) > self.cap:
             keep = sorted(self.pulled.items(),
                           key=lambda kv: float(kv[1].get("last_seen") or 0),
@@ -1061,9 +1337,20 @@ class Syncer:
         self._recent: list = []
         self._status_text = ""
         self._config_problems: dict = {}     # {folder key: (path, reason)}
-        self._temp_seq = 0                   # our in-flight names, per pass
         self._skipped_names = False
         self._skipped_dirs = False
+        # IDENTITY, not a pattern (findings M and M2).  Only a staging
+        # directory THIS process created in THIS run is ever swept, so a
+        # file of his that happens to match the shape, and the voice lane's
+        # in-flight file, are both simply never looked at.
+        self._my_stages: set = set()
+        self._stage = ""                     # the one open this pass
+        self._inner_seq = 0                  # files inside it
+        self._claimed_here: set = set()      # names WE took, this run
+        self._noted_foreign = False
+        self._foreign_temps = 0
+        self._listing_truncated = False
+        self._note_refused = False
 
     # -- small helpers ---------------------------------------------------
     @staticmethod
@@ -1100,29 +1387,63 @@ class Syncer:
             # as "Why: auth." otherwise.  The lane already owns a sentence
             # for every one of them.
             why = remote.fail_line(self.rconf, reason).rstrip(".")
-        text = (f"Jarvis could not send {target.name}.\n\n"
+        text = (f"{NOTE_MARKER}\n\n"
+                f"Jarvis could not send {target.name}.\n\n"
                 f"Why: {why or reason}.\n")
         if extra:
             text += f"\n{extra}\n"
         text += ("\nYour file has not been moved, changed or deleted. Fix the\n"
                  "reason above (usually: rename it) and I will send it on the\n"
                  "next pass. This note disappears by itself when I can.\n")
+        self._write_note(target.parent / (target.name + NOTE_SUFFIX), text)
+
+    def _write_note(self, path: Path, text: str) -> None:
+        """ROW 14.  ``<his file>.jarvis-cannot-send.txt`` is a name HE can
+        choose, and a plain ``write_text`` at it destroyed the file of his
+        that was measured sitting there.
+
+        So: CREATE it exclusively, or -- if something is already at that
+        name -- open it WITHOUT truncating, read the marker line through
+        that same file descriptor, and only then truncate and write.  The
+        check and the write are on one fd bound to one inode, so a file he
+        puts there afterwards cannot be hit by a decision taken about the
+        file that was there before.
+        """
         try:
-            (target.parent / (target.name + NOTE_SUFFIX)).write_text(
-                text, encoding="utf-8")
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            try:
+                fd = os.open(path, os.O_RDWR)
+            except OSError:
+                log.debug("foldersync: cannot open a note", exc_info=True)
+                return
+            if not _marked(fd):
+                os.close(fd)
+                if not self._note_refused:
+                    self._note_refused = True
+                    log.warning("foldersync: %s is a file of yours, not one "
+                                "of my notes; I have left it alone and said "
+                                "nothing beside the file", path.name)
+                return
+        except OSError:
+            log.debug("foldersync: cannot write a note", exc_info=True)
+            return
+        try:
+            with os.fdopen(fd, "r+", encoding="utf-8") as fh:
+                fh.seek(0)
+                fh.truncate(0)
+                fh.write(text)
         except OSError:
             log.debug("foldersync: cannot write a note", exc_info=True)
 
     def clear_note(self, target: Path) -> None:
-        try:
-            (target.parent / (target.name + NOTE_SUFFIX)).unlink()
-        except OSError:
-            pass
+        _unlink_if_ours(target.parent / (target.name + NOTE_SUFFIX))
 
     def _sweep_notes(self) -> None:
         """Our own notes whose file has gone are ours to remove -- an Outbox
         littered with explanations of files he already dealt with is worse
-        than no explanation."""
+        than no explanation.  OURS is decided by the marker inside, never by
+        the name: the name is his filename plus a suffix (row 14)."""
         try:
             entries = list(self.paths.outbox.iterdir())
         except OSError:
@@ -1132,10 +1453,7 @@ class Syncer:
                 continue
             base = self.paths.outbox / p.name[:-len(NOTE_SUFFIX)]
             if not base.exists():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
+                _unlink_if_ours(p)
 
     # -- what the scanner will look at -----------------------------------
     def _candidates(self) -> list:
@@ -1153,12 +1471,26 @@ class Syncer:
 
     # ------------------------------------------------------------- pushing
     def push_once(self, now: Optional[float] = None) -> list:
+        try:
+            return self._push_once(now)
+        finally:
+            self._close_stage()
+
+    def _push_once(self, now: Optional[float] = None) -> list:
         now = time.time() if now is None else now
         events: list = []
         self._sweep_notes()
         roots = filepick.expand_roots(self.rconf.local_roots)
         ready: list = []
+        outstanding: list = []
         for p in self._candidates():
+            # FINDING L, first half.  A file with an unresolved landing
+            # record is not a candidate for SENDING at all until the far
+            # side has been asked whether it is already over there.
+            row = self.ledger.landed_row(f"push:{p.name}|{stat_key(p)}", now)
+            if row:
+                outstanding.append((p, row))
+                continue
             bad = filepick.check_file(p, roots, self.max_mb)
             if not bad:
                 bad = path_problem(remote.remote_dir(self.rconf, "inbox"),
@@ -1178,26 +1510,42 @@ class Syncer:
             if self.ledger.blocked(f"push:{p.name}|{stat_key(p)}", now):
                 continue
             ready.append(p)
-        if not ready:
+        if not ready and not outstanding:
             for e in events:
                 self.record(e)
             return events
 
         entries, why = self.transport.listing("inbox")
         if why:
-            events.append(self._listing_failed(now, "inbox", why, len(ready)))
+            events.append(self._listing_failed(now, "inbox", why,
+                                               len(ready) + len(outstanding)))
             for e in events:
                 if e.direction not in NOT_A_FILE:
                     self.record(e)
             return events
         self._mark_up(now, "inbox")
-        self._sweep_remote_temps(entries)
+        self._listing_truncated = getattr(self.transport, "last_truncated",
+                                          False)
+        self._sweep_my_stages(entries)
+
+        # Resolve first, send second: nothing may be sent while a record
+        # says it may already be over there.
+        for p, row in outstanding:
+            events += self._resolve_landing(p, row, now)
 
         taken = {e.name for e in entries}
         sent: list = []
         for p in ready:
             size = self._size(p)
-            landed, reason = self._send_and_claim(p, taken)
+            key = f"push:{p.name}|{stat_key(p)}"   # while the file is HERE
+            try:
+                landed, reason = self._send_and_claim(p, taken, now, key)
+            except OSError:
+                # His hand, on his own file, while we were reading it.  One
+                # file's accident is not the pass's death (finding L).
+                log.warning("foldersync: %s went while I was sending it; "
+                            "carrying on", p.name, exc_info=True)
+                continue
             if reason:
                 # A FILE that will not go is not a LINK that is down.  The
                 # only thing that can speak for the machine is the machine,
@@ -1219,13 +1567,12 @@ class Syncer:
                     # charged an attempt.
                     self.note(p, reason)
                 else:
-                    n = self.ledger.bump(f"push:{p.name}|{stat_key(p)}",
-                                         reason, now)
+                    n = self.ledger.bump(key, reason, now)
                     self.note(p, reason, f"Attempt {n} of {MAX_ATTEMPTS}.")
                 events.append(Event(now, "push", p.name, size, reason))
                 continue
             taken.add(landed)
-            sent.append((p, landed, size))
+            sent.append((p, landed, size, key))
 
         if sent:
             events += self._verify_and_move(sent, now)
@@ -1235,7 +1582,82 @@ class Syncer:
         self.ledger.save()
         return events
 
-    def _send_and_claim(self, p: Path, taken) -> tuple:
+    def _resolve_landing(self, p: Path, row: dict, now: float) -> list:
+        """One outstanding landing record, settled by ASKING the far side.
+
+        The other half of finding L.  A record says "I was about to take the
+        name N for this file, or I had just taken it".  Only HPCOMPUTER can
+        say which, so it is asked about that ONE name -- never inferred from
+        a listing that is capped (finding Q) -- and the three answers are
+        the three different things to do.
+        """
+        key = f"push:{p.name}|{stat_key(p)}"
+        name, size = str(row.get("name") or ""), int(row.get("size") or 0)
+        entry, why = self.transport.stat(name, "inbox")
+        if why:
+            # Cannot ask.  Keep the record: guessing either way is how a
+            # file gets sent twice or dropped.
+            return [Event(now, "push", p.name, size, "unverified", why)]
+        if entry is None or entry.is_dir or entry.size != size:
+            # It never landed.  Drop the record; the file goes back through
+            # the ORDINARY path on the next pass -- deliberately not this
+            # one, so quiescence, the size cap, the name rules and the
+            # per-file attempt limit are all applied in the one place that
+            # applies them, and a repeatedly-failing file cannot use this
+            # branch to skip its own parking.
+            self.ledger.clear_landed(key)
+            self.ledger.save()
+            return []
+        # It IS over there, at our size.  His original has never been moved,
+        # so move it now -- and do NOT send it again.
+        self.ledger.mark_landed(key, name, now)
+        self.ledger.save()
+        moved = self._move_to_sent(p)
+        if moved:
+            self.ledger.clear_landed(key)
+            self.ledger.clear(key)
+            self.clear_note(p)
+            self.ledger.save()
+        log.info("foldersync: %s was already on %s as %s from an earlier "
+                 "pass; moving yours to Sent rather than sending it again",
+                 p.name, self.rconf.name, name)
+        return [Event(now, "push", p.name, size, "sent", name)]
+
+    def _open_stage(self) -> tuple:
+        """The one staging directory this pass writes into, taken the only
+        way this link can take a name exclusively.  ``(name, "")`` or
+        ``("", reason)``."""
+        if self._stage:
+            return self._stage, ""
+        folder = remote.remote_dir(self.rconf, "inbox")
+        stage = remote.remote_stage_name()
+        # The FILE goes inside the folder, so the folder's own name is not
+        # the whole path Windows has to accept -- leave room for "/f<n>".
+        if path_problem(folder, stage) or \
+                path_problem(folder, f"{stage} f000000"):
+            return "", "name-too-long"
+        why = self.transport.stage_open(stage)
+        if why:
+            return "", why
+        self._stage = stage
+        self._my_stages.add(stage)
+        self._inner_seq = 0
+        return stage, ""
+
+    def _close_stage(self) -> None:
+        stage, self._stage = self._stage, ""
+        if not stage:
+            return
+        why = self.transport.stage_close(stage)
+        if why:
+            log.info("foldersync: my staging folder %s is still on %s (%s); "
+                     "it is empty and I will take it away on a later pass",
+                     stage, self.rconf.name, why)
+        else:
+            self._my_stages.discard(stage)
+
+    def _send_and_claim(self, p: Path, taken, now: float,
+                        key: str) -> tuple:
         """Put ONE file of his on HPCOMPUTER without ever writing at a name
         that could be his.  ``(landed_name, "")`` or ``("", reason)``.
 
@@ -1268,24 +1690,32 @@ class Syncer:
         candidates = claim_candidates(p.name, taken)
         if not candidates:
             return "", "too-many-copies"
-        folder = remote.remote_dir(self.rconf, "inbox")
-        temp = remote.remote_temp_name(self._temp_seq)
-        self._temp_seq += 1
-        if path_problem(folder, temp):
-            # His name fits and ours does not: the FOLDER is too deep for
-            # Windows, which is his to shorten and not this file's fault.
-            return "", "name-too-long"
+        stage, why = self._open_stage()
+        if why:
+            return "", why
+        temp = f"{stage}/f{self._inner_seq}"
+        self._inner_seq += 1
         reason = self.transport.send(p, temp)
         if reason:
-            # A partial temp may be on the far side, but the far side has
-            # just failed us and this is not the moment to ask it for a
-            # delete.  It is ours, it is named ours, and the sweep at the
-            # top of a later pass takes it away.
+            # A partial file may be in our staging folder, but the far side
+            # has just failed us and this is not the moment to ask it for a
+            # delete.  It is inside a directory of ours; the close at the
+            # end of the pass, or a later pass, takes it away.
             return "", reason
+        size = self._size(p)
         for candidate in candidates:
+            # DURABLE BEFORE THE CLAIM.  The rename is the only step that
+            # can put his filename on that machine, so the record of which
+            # name we are taking is on disk before it goes out -- see
+            # Ledger.mark_claiming for the four crash points this covers.
+            self.ledger.mark_claiming(key, candidate, size, now)
+            self.ledger.save()
             why = self.transport.claim(temp, candidate)
             if not why:
+                self._claimed_here.add(candidate)
                 return candidate, ""
+            self.ledger.clear_landed(key)
+            self.ledger.save()
             if why != "taken":
                 self._discard(temp)
                 return "", why
@@ -1300,17 +1730,43 @@ class Syncer:
                      "will take it away on a later pass", temp,
                      self.rconf.name, why)
 
-    def _sweep_remote_temps(self, entries) -> None:
-        """Part files left behind by a pass that died between the copy and
-        the claim.  They are ours by name -- pid, second and counter -- and
-        they are the ONLY thing on that machine this lane ever deletes;
-        :func:`remote.sftp_remove` refuses every other shape independently.
-        Bounded per pass so a folder full of them cannot eat a pass.
+    def _sweep_my_stages(self, entries) -> None:
+        """Staging folders THIS PROCESS took in THIS RUN and did not manage
+        to give back.  Bounded per pass.
+
+        FINDINGS M AND M2, and the whole reason this method is not what it
+        was.  It used to delete anything matching ``jarvis-part-*.tmp``,
+        which is a PATTERN -- and a pattern is a guess about who made a
+        file.  MEASURED: a file of HIS at ``jarvis-part-notes.tmp`` was
+        deleted with no event, no note and no line in status.txt, and the
+        same sweep ate the VOICE lane's in-flight file mid-transfer, after
+        which the voice lane told him "There's already a file by that name
+        where I'd put it, sir" -- which was false; nothing held the name,
+        we had taken our own file away.  It fired up to 120 times an hour.
+
+        So the guard is an IDENTITY: a name is swept only if it is in the
+        set this process built by CREATING it.  Anything else of that shape
+        -- his, the voice lane's, or one of ours from a run that has since
+        died -- is left alone and COUNTED, and the count goes in
+        status.txt so litter is visible rather than tidied away by force.
         """
-        stale = [e.name for e in entries
-                 if not e.is_dir and remote.is_remote_temp(e.name)]
-        for name in stale[:MAX_TEMP_SWEEP]:
-            self._discard(name)
+        listed = {e.name for e in entries if e.is_dir}
+        mine = [n for n in sorted(self._my_stages)
+                if n in listed and n != self._stage]
+        for name in mine[:MAX_TEMP_SWEEP]:
+            if not self.transport.stage_close(name):
+                self._my_stages.discard(name)
+        self._foreign_temps = sum(
+            1 for e in entries
+            if (remote.is_remote_temp(e.name)
+                or (remote.is_remote_stage(e.name)
+                    and e.name not in self._my_stages)))
+        if self._foreign_temps and not self._noted_foreign:
+            self._noted_foreign = True
+            log.info("foldersync: there are %d file(s) on %s shaped like my "
+                     "own in-flight ones that I did not make; I have left "
+                     "every one of them alone", self._foreign_temps,
+                     self.rconf.name)
 
     def _verify_and_move(self, sent: list, now: float) -> list:
         """The far side is LISTED again and every landed name must be there
@@ -1334,7 +1790,7 @@ class Syncer:
             # opened a second connection to a box that had just refused a
             # first.  It is a link event now.  The files are NOT counted
             # against: an outage must never park a file of his.
-            for p, _landed, size in sent:
+            for p, _landed, size, _key in sent:
                 events.append(Event(now, "push", p.name, size, "unverified",
                                     why))
             events.append(self._listing_failed(now, "inbox", why, len(sent)))
@@ -1343,26 +1799,94 @@ class Syncer:
         # never be read as a byte count -- excluded, so the check fails
         # loudly instead of passing by coincidence.
         sizes = {e.name: e.size for e in entries if not e.is_dir}
-        for p, landed, size in sent:
+        for p, landed, size, key in sent:
+            # `key` was computed while his file was still in the Outbox: it
+            # is the one the NEXT pass will look up if his hand takes the
+            # file away before the move, so it must not be recomputed here.
             there = sizes.get(landed)
+            if there is None:
+                # FINDING Q.  "Not in the listing" is NOT "not there": the
+                # listing is capped, and a Windows Inbox with 400+ files in
+                # it made this branch report a file that had landed
+                # perfectly as missing, twelve times, leaving five copies
+                # under his own name.  So ASK ABOUT THAT NAME.
+                entry, why = self.transport.stat(landed, "inbox")
+                if why:
+                    events.append(Event(now, "push", p.name, size,
+                                        "unverified", why))
+                    continue
+                there = entry.size if entry is not None and not entry.is_dir \
+                    else None
             if there != size:
-                key = f"push:{p.name}|{stat_key(p)}"
+                # It is over there and it is WRONG, which is a settled
+                # answer: the landing record has done its job and must go,
+                # or the next pass would spend a round trip re-asking a
+                # question this one just answered.
+                self.ledger.clear_landed(key)
                 n = self.ledger.bump(key, "verify-failed", now)
-                self.note(p, "verify-failed",
-                          f"I copied {size} bytes but HPCOMPUTER reports "
-                          f"{there if there is not None else 'no such file'}. "
-                          f"Attempt {n} of {MAX_ATTEMPTS}.")
+                extra = (f"I copied {size} bytes but HPCOMPUTER reports "
+                         f"{there if there is not None else 'no such file'}. "
+                         f"Attempt {n} of {MAX_ATTEMPTS}.")
+                detail = str(there)
+                took_back = self._remove_broken_copy(landed)
+                if took_back:
+                    detail = f"{there} (broken copy removed)"
+                else:
+                    extra += ("\nThe broken copy is still on HPCOMPUTER under "
+                              "your filename. I do not delete anything of "
+                              "yours over there; set "
+                              "foldersync.remove_broken_copies to true in "
+                              "~/.config/jarvis/assistant.json if you would "
+                              "rather I took my own bad copies back.")
+                self.note(p, "verify-failed", extra)
                 events.append(Event(now, "push", p.name, size,
-                                    "verify-failed", str(there)))
+                                    "verify-failed", detail))
                 continue
-            key = f"push:{p.name}|{stat_key(p)}"    # BEFORE the move: after
-            moved = self._move_to_sent(p)           # it, stat_key() is ""
+            # FINDING L.  On disk BEFORE the move, so a move that fails --
+            # because his hand took the file -- is resolved next pass by
+            # asking, and never by sending it a second time.
+            self.ledger.mark_landed(key, landed, now)
+            self.ledger.save()
+            moved = self._move_to_sent(p)
             self.ledger.clear(key)
+            if moved:
+                self.ledger.clear_landed(key)
             self.clear_note(p)
             events.append(Event(now, "push", p.name, size, "sent", landed))
-            if moved != p.name:
+            if moved and moved != p.name:
                 log.info("foldersync: kept %s as %s in Sent", p.name, moved)
         return events
+
+    def _remove_broken_copy(self, landed: str) -> bool:
+        """THE ONE QUESTION THAT IS HIS, and it ships answered NO.
+
+        When a copy reaches HPCOMPUTER under his filename and then fails
+        its size check, the lane cannot take it back: the promise is that
+        it never deletes anything of his over there, and a name he could
+        have chosen is indistinguishable from one of his.  MEASURED: five
+        orphaned copies of one file after twelve passes.  Taking it back
+        means widening that promise from "a name of my own shape" to "a
+        name I created in this run", which is a change to what he was
+        told, so it is a SETTING and the setting is OFF.
+
+        With it on, the identity is held HERE -- ``self._claimed_here`` is
+        the set of names this process actually took with a ``rename -l`` --
+        and remote.sftp_remove logs every such delete at WARNING.
+        """
+        if not self.conf.remove_broken_copies:
+            return False
+        if landed not in self._claimed_here:
+            return False                    # not a name we took: not ours
+        why = self.transport.remove_landed(landed)
+        if why:
+            log.warning("foldersync: I could not take my broken copy of %s "
+                        "off %s (%s)", landed, self.rconf.name, why)
+            return False
+        self._claimed_here.discard(landed)
+        log.warning("foldersync: removed my own broken copy of %s from %s "
+                    "(foldersync.remove_broken_copies is on)", landed,
+                    self.rconf.name)
+        return True
 
     def _move_to_sent(self, p: Path) -> str:
         """His original, out of the Outbox and into Sent -- MOVED, never
@@ -1374,11 +1898,32 @@ class Syncer:
         still a check followed by an ``os.replace``, and a window that
         small is still a window.  It lands through the same
         :func:`land_beside` as the pull now, so there is none.
+
+        FINDING L.  It also has to survive HIS HAND: a file dragged back out
+        of the Outbox while this pass was in flight raised FileNotFoundError
+        out of ``os.link`` and killed the whole pass -- status.txt was never
+        rewritten, the inbound half never ran, and a file that HAD landed
+        was left in the Outbox and sent again next pass.  A vanished
+        original is not an error here; it is him, doing the thing the folder
+        is for.  It returns "" and the landing record in the ledger is what
+        stops the duplicate.
         """
-        self.paths.sent.mkdir(parents=True, exist_ok=True)
-        moved = (land_beside(p, self.paths.sent, p.name)
-                 or land_beside(p, self.paths.sent,
-                                f"{p.name}.{int(time.time())}-{os.getpid()}"))
+        try:
+            self.paths.sent.mkdir(parents=True, exist_ok=True)
+            moved = (land_beside(p, self.paths.sent, p.name)
+                     or land_beside(p, self.paths.sent,
+                                    f"{p.name}.{int(time.time())}-"
+                                    f"{os.getpid()}"))
+        except FileNotFoundError:
+            log.info("foldersync: %s was taken out of the Outbox before I "
+                     "could move it to Sent; it is on %s and I will not "
+                     "send it again", p.name, self.rconf.name)
+            return ""
+        except OSError:
+            log.warning("foldersync: could not move %s to Sent; it stays in "
+                        "the Outbox and is not sent again", p.name,
+                        exc_info=True)
+            return ""
         if not moved:
             # Fifty-one names taken, and the stamped one too.  Say so
             # rather than report a move that did not happen: his file is
@@ -1399,6 +1944,9 @@ class Syncer:
         if why:
             return [self._listing_failed(now, self.conf.pull_from, why, 0)]
         self._mark_up(now, self.conf.pull_from)
+        self._listing_truncated = (self._listing_truncated
+                                   or getattr(self.transport,
+                                              "last_truncated", False))
 
         usable = []
         for e in entries:
@@ -1428,11 +1976,22 @@ class Syncer:
             log.warning("foldersync: cannot read %s", self.paths.inbox)
             return events
 
+        fetched = 0
         for entry in usable:
             if self.ledger.has(entry.key):
                 continue
             if self.ledger.blocked(f"pull:{entry.key}", now):
                 continue
+            if fetched >= MAX_PULLS_PER_PASS:
+                # A WORK bound, not a visibility one (finding Q).  Every
+                # entry stays in the listing and in the ledger sweep, so
+                # the queue drains over the following passes; what is
+                # bounded is how long one pass may spend transferring.
+                log.info("foldersync: %d more file(s) waiting on %s; taking "
+                         "them on the next passes", len(usable) - fetched,
+                         self.rconf.name)
+                break
+            fetched += 1
             # A cheap look BEFORE the transfer, so a name with fifty
             # copies already costs no bytes.  It is not the decision: the
             # name is chosen and claimed in one step, after the fetch, by
@@ -1441,7 +2000,11 @@ class Syncer:
                 events.append(Event(now, "pull", entry.name, entry.size,
                                     "too-many-copies"))
                 continue
-            part = self.paths.inbox / (PART_PREFIX + entry.name)
+            part, reason = self._claim_part(entry.name)
+            if not part:
+                events.append(Event(now, "pull", entry.name, entry.size,
+                                    reason))
+                continue
             reason = self.transport.fetch(self.conf.pull_from, entry.name,
                                           part)
             if reason:
@@ -1494,6 +2057,39 @@ class Syncer:
                 self.record(e)
         self.ledger.save()
         return events
+
+    def _claim_part(self, name: str) -> tuple:
+        """``(path, "")`` for a part file in his Inbox that is OURS by the
+        kernel's word, or ``("", reason)``.
+
+        ROW 5, and the third appearance of the same shape in this lane.
+        The puller wrote straight into ``.jarvis-part-<his name>`` with no
+        check and no ``O_EXCL`` at all: a 99999-byte file measured sitting
+        at that name was destroyed by the transfer and the pass reported
+        "received".  The window was the whole transfer, up to
+        remote.MAX_TRANSFER_S.
+
+        ``O_CREAT|O_EXCL`` is one syscall that either creates the name or
+        refuses because somebody holds it -- the same operation
+        :func:`land_beside` and ``remote.pull`` already use.  The name also
+        carries a pid and a counter now, so two passes, two processes or a
+        crashed run cannot collide on it and be mistaken for his file.
+        """
+        for n in range(MAX_CLAIM_TRIES):
+            self._inner_seq += 1
+            part = self.paths.inbox / (
+                f"{PART_PREFIX}{os.getpid()}-{self._inner_seq}-{name}")
+            try:
+                fd = os.open(part, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            except FileExistsError:
+                continue
+            except OSError:
+                log.warning("foldersync: cannot claim a part file in %s",
+                            self.paths.inbox, exc_info=True)
+                return None, "denied"
+            os.close(fd)
+            return part, ""
+        return None, "name-taken"
 
     # ------------------------------------------------------------- the link
     def _probe_link(self, key: str) -> tuple:
@@ -1635,13 +2231,46 @@ class Syncer:
 
     # -------------------------------------------------------------- a pass
     def run_pass(self, now: Optional[float] = None) -> list:
+        """Both halves, and then the truth on his desk -- WHATEVER happened.
+
+        FINDING L's third consequence.  The two halves and the status write
+        used to be three statements in a row, so anything that raised in
+        the first one skipped the other two: a file dragged out of the
+        Outbox mid-pass left status.txt saying "outbox empty" beside a
+        7-byte file of his that was sitting right there, and the inbound
+        half did not run at all.  A status file that is untrue is one of
+        his stated conditions for merging this, so the write is in a
+        ``finally`` and each half is fenced off from the other.
+
+        The fences are deliberately narrow: they catch, they LOG WITH A
+        TRACEBACK, and they put the failure in the record as an event.
+        Nothing is swallowed quietly.
+        """
         now = time.time() if now is None else now
         self._pass_down = False
-        events = self.push_once(now)
-        events += self.pull_once(now)
-        self._last_pass = now
-        self.write_status()
+        self._listing_truncated = False      # this pass's word, not the last's
+        events: list = []
+        try:
+            events += self._half(self.push_once, now, "push")
+            events += self._half(self.pull_once, now, "pull")
+        finally:
+            self._last_pass = now
+            try:
+                self.write_status()
+            except Exception:               # noqa: BLE001 - never leave a lie
+                log.exception("foldersync: cannot write the status file")
         return events
+
+    def _half(self, fn, now: float, direction: str) -> list:
+        try:
+            return fn(now)
+        except Exception:                   # noqa: BLE001 - one half only
+            log.exception("foldersync: the %s half of this pass failed; the "
+                          "other half still runs and nothing is lost",
+                          direction)
+            event = Event(now, direction, "", 0, "pass-failed")
+            self.record(event)
+            return [event]
 
     # ------------------------------------------------------------- status
     def status_text(self) -> str:
@@ -1679,6 +2308,17 @@ class Syncer:
             else:
                 lines.append(f"setup     "
                              f"{remote.fail_line(self.rconf, why)}")
+        if self._listing_truncated:
+            # FINDING Q.  A folder too big to read whole is a FACT he is
+            # told, never a silence that looks like an empty folder.
+            lines.append(f"folder    more than {LISTING_HARD_CAP} files on "
+                         f"{self.rconf.name}; I am working through them")
+            lines.append("          a pass at a time and nothing is lost.")
+        if self._foreign_temps:
+            lines.append(f"note      {self._foreign_temps} file(s) on "
+                         f"{self.rconf.name} look like my own in-flight")
+            lines.append("          ones but I did not make them, so I have "
+                         "left them alone.")
         lines.append(f"outbox    {len(waiting)} waiting"
                      if waiting else "outbox    empty")
         for name in waiting[:10]:

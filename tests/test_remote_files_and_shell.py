@@ -474,7 +474,11 @@ def test_a_good_push_uses_the_inbox_and_the_local_basename(tmp_path, desk,
     f.write_text("x")
     assert remote.push(conf, f).ok
     assert seen["push"] is True
-    assert batches[-1].endswith('"jarvis-inbox/budget.xlsx"')
+    # mkdir the staging directory, scp into it, claim his name, rmdir the
+    # shell -- so the CLAIM is not the last batch any more (row 3).
+    assert [b.split()[0] for b in batches] == ["mkdir", "rename", "rmdir"]
+    claim = next(b for b in batches if b.startswith("rename"))
+    assert claim.endswith('"jarvis-inbox/budget.xlsx"')
 
 
 # ==================================================== tier 2: pulling files
@@ -934,7 +938,8 @@ def test_an_ambiguous_push_hears_its_answer(wired, answer, expect):
     # scp carries a temp name of ours; the CLAIM carries his (F-J).
     assert wired.copied[-1][1].startswith("jarvis-inbox/"
                                           + remote.REMOTE_TEMP_PREFIX)
-    assert wired.renamed[-1].endswith(f'"jarvis-inbox/{expect}"')
+    claim = next(b for b in wired.renamed if b.startswith("rename"))
+    assert claim.endswith(f'"jarvis-inbox/{expect}"')
 
 
 def test_an_ambiguous_pull_hears_its_answer(wired):
@@ -1550,11 +1555,16 @@ def test_a_push_writes_at_a_temp_name_and_claims_the_real_one(tmp_path, desk,
     assert remote.push(conf, f).ok
 
     assert seen["push"] is True
-    assert seen["remote"].startswith("jarvis-inbox/"
-                                     + remote.REMOTE_TEMP_PREFIX)
-    assert seen["remote"].endswith(remote.REMOTE_TEMP_SUFFIX)
-    assert batches[0].split()[:2] == ["rename", "-l"]        # the one that
-    assert batches[0].endswith('"jarvis-inbox/budget.xlsx"')  # refuses
+    # ROW 3: the name scp is given is not merely improbable any more, it
+    # is inside a directory taken with the one exclusive create SFTP has.
+    stage, _, inner = seen["remote"].rpartition("/")
+    assert stage.startswith("jarvis-inbox/" + remote.REMOTE_TEMP_PREFIX)
+    assert remote.is_remote_stage(stage) and inner == remote.STAGE_FILE
+    assert batches[0].split()[0] == "mkdir"                  # the claim on
+    assert batches[0].endswith(f'"{stage}"')                 # what we write
+    assert batches[1].split()[:2] == ["rename", "-l"]        # the one that
+    assert batches[1].endswith('"jarvis-inbox/budget.xlsx"')  # refuses
+    assert batches[-1].split()[0] == "rmdir"
 
 
 def test_a_push_onto_a_name_that_is_held_leaves_his_file_alone(tmp_path, desk,
@@ -1568,6 +1578,11 @@ def test_a_push_onto_a_name_that_is_held_leaves_his_file_alone(tmp_path, desk,
         if batch.startswith("rename"):
             return remote.SshResult(False, err="remote rename ...: Failure",
                                     reason="failed")
+        if batch.startswith("ls"):
+            # our staged copy IS still there, so the name really is held
+            return remote.SshResult(True, out=(
+                "-rw-rw-r--    ? h  h   1 Sep  5 13:45 "
+                f"stage/{remote.STAGE_FILE}\n"))
         return remote.SshResult(True)
 
     monkeypatch.setattr(remote, "run_copy", lambda *a, **k:
@@ -1583,8 +1598,9 @@ def test_a_push_onto_a_name_that_is_held_leaves_his_file_alone(tmp_path, desk,
     assert "There's already a file by that name" in \
         remote.fail_line(conf, res.reason)
     # and our own bytes are taken off his machine again
-    assert [b.split()[0] for b in batches] == ["rename", "rm"]
-    assert remote.REMOTE_TEMP_PREFIX in batches[1]
+    assert [b.split()[0] for b in batches] == \
+        ["mkdir", "rename", "ls", "rm", "rmdir"]
+    assert remote.REMOTE_TEMP_PREFIX in batches[3]
 
 
 def test_nothing_but_our_own_part_file_can_ever_be_deleted_over_there(
