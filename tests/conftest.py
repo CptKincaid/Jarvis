@@ -16,6 +16,8 @@ it. See _firewall_live_log_dir."""
 import os
 import sys
 import socket
+import subprocess as _real_subprocess
+import sys as _sys
 import tempfile
 from pathlib import Path
 
@@ -167,10 +169,307 @@ def _reset_brain_calibration():
         brain._CALIBRATION.update(factor=brain.CALIBRATION_INITIAL, samples=0)
 
 
+# ---------------------------------------------------------------------------
+# THE DESKTOP FIREWALL (2026-09-04, 17:21)
+# ---------------------------------------------------------------------------
+# A probe ran a corpus of "remember ..." sentences through Commander.handle
+# as a plain script. One of them, "jarvis remember heather's face", is a face
+# ENROLMENT, and that rung hands its command line to xclip on :1 -- so the
+# probe overwrote his clipboard while he was working at the desk. Another,
+# "jarvis commit this to memory: ...", matched the bare-substring
+# QUICK_COMMANDS trigger "commit" and ran `git add -A` in ~/vss_env through
+# a shell. Neither was a test; but nothing in this file would have stopped a
+# test doing the same, because the seams below were never blocked here --
+# only the sound server, the room controls and Ollama were.
+#
+# So: inside every jarvis module a Commander.handle call can reach (and the
+# few beside them that fork onto the same shared state), the name
+# ``subprocess`` is replaced for the whole session by a proxy that REFUSES
+# ``run`` and ``Popen``, records the attempt, and raises an OSError naming
+# the module and the program. OSError on purpose: every one of those seams
+# already handles a missing binary that way ("the clipboard wouldn't take
+# it", "Could not read clipboard", an error Status, a debug line), so the
+# suite stays green AND hermetic -- the same reasoning as the Ollama leg
+# above. Everything else on the proxy (PIPE, DEVNULL, CompletedProcess,
+# TimeoutExpired, SubprocessError) is the real module's.
+#
+# Three ways a test still gets a process, all of them deliberate:
+#   1. the seam the module already has (run= / popen= / _run), which is how
+#      every test of these modules is written;
+#   2. a monkeypatch of the GLOBAL subprocess.run / subprocess.Popen: the
+#      proxy forwards to whatever is installed there when it is not the
+#      original (tests/test_oracle.py, test_remote_files_and_shell.py,
+#      test_tts_voice_io.py all do this);
+#   3. ``@pytest.mark.real_subprocess("jarvis.context", ...)`` for a test
+#      that must fork the genuine program (git in a tmp_path repo), which
+#      puts the module back for that one test and nothing else.
+#
+# Import-time defaults are covered too: ``reader._xclip(selection,
+# run=subprocess.run)`` bound the REAL run at import, so the proxy is also
+# written into every default argument in the module that held it.
+_REAL_RUN = _real_subprocess.run
+_REAL_POPEN = _real_subprocess.Popen
+
+
+class DesktopFirewallRefused(OSError):
+    """A jarvis module asked for a subprocess under pytest. OSError so the
+    module's own missing-binary handling absorbs it (see above); the message
+    names the module, the program and the three ways through."""
+
+
+# The session ledger: (test nodeid, module, kind, program) for every refusal.
+_desktop_ledger: list = []
+# The running test's own sink, handed out by the `desktop_attempts` fixture.
+_desktop_current = {"nodeid": "", "sink": None}
+
+# What is wrapped, and why. Read this list before adding a subprocess call
+# to any of these modules: under pytest it will be refused.
+_DESKTOP_MODULES = {
+    "jarvis.commander": "xclip write (transform case), xclip read, xdotool "
+                        "type/key, xdg-open, app launch, QUICK_COMMANDS shell",
+    "jarvis.enrolentry": "xclip write: the 17:21 clipboard overwrite",
+    "jarvis.workflows": "shell steps, xdotool key, notify-send",
+    "jarvis.desktop": "every xdotool/xclip primitive",
+    "jarvis.reader": "xclip -o: the contents of his clipboard/selection",
+    "jarvis.context": "xdotool window titles, git, ps, nvidia-smi, find",
+    "jarvis.brain": "the claude CLI (a paid, acting agent) and the "
+                    "autonomous RUN shell",
+    "jarvis.app": "xdotool windowactivate, notify-send",
+    "jarvis.claude_session": "tmux send-keys into his live Claude sessions, "
+                             "gnome-terminal, xdotool, git init",
+    "jarvis.tts": "the audio player (his speakers) and the F5/Breeze sidecars",
+    "jarvis.classflow": "xdg-open of a document on his screen",
+    "jarvis.jarvis_agent": "the V1 agent: xclip write, xdotool, shell",
+    "jarvis.ask": "the phone client's recorder: it opens a MICROPHONE",
+    "jarvis.roomtone": "paplay: his speakers",
+    "jarvis.voice_check": "pactl sink probes",
+    "jarvis.winddown": "xdotool / gsettings on his session",
+    "jarvis.soundbar": "bluetoothctl on his soundbar",
+    "jarvis.tools.screen": "`import -window root`: a SCREENSHOT of his desktop",
+    "jarvis.tools.timekeeper": "the ringer (his speakers), notify-send",
+    "jarvis.tools.health": "nvidia-smi (hermeticity only)",
+    "jarvis.tools.remote": "ssh into HPCOMPUTER",
+    "jarvis.tools.oracle": "ssh into the Oracle box",
+    "jarvis.channels.notify": "notify-send banners on his desktop",
+    "jarvis.ui.board": "xdotool on the board window",
+    "jarvis.ui.main_window": "xdotool/xprop/xrdb/nvidia-smi from the window",
+}
+# Left alone, and why: jarvis.room / jarvis.mixer (JARVIS_ROOM_CONTROL=0
+# above turns their seam into a no-op before any subprocess); jarvis.presence
+# / jarvis.deskpresence (JARVIS_DESK_PRESENCE=0, their own `_run` seam, and
+# tests/test_presence.py pins that seam's default runner by identity);
+# jarvis.earcons (`_spawn`, above); jarvis.autostart (`_run` seam, and
+# tests/test_autostart.py exercises it against the real systemctl on
+# purpose); jarvis.config (`arecord -l`, a read-only device listing);
+# jarvis.tools.docs (pdftotext over a file the test itself supplies);
+# jarvis.ui.avatar_bake (a build script, never on the reply path).
+# jarvis.cast.focused_window_title binds subprocess INSIDE the function, so
+# it is replaced as a function (below) rather than through the module name.
+_wrapped: list = []          # (module, real subprocess module) to restore
+_rebound: list = []          # (function, old __defaults__, old __kwdefaults__)
+
+
+def _program_of(argv) -> str:
+    if isinstance(argv, (list, tuple)):
+        return str(argv[0]) if argv else ""
+    if isinstance(argv, (str, bytes)):
+        text = argv.decode("utf-8", "replace") if isinstance(argv, bytes) else argv
+        return text.split()[0] if text.split() else ""
+    return repr(argv)
+
+
+# pytest's own scratch root (tmp_path_factory.getbasetemp()), set by the
+# session fixture. Two things under it are not his desktop and are let
+# through: a PROGRAM that lives there (tests/test_web_route.py writes a
+# stand-in `claude` script into tmp_path and runs it), and `git` run WITH
+# `cwd` there (tests/test_context.py and test_standup.py probe repos they
+# built in tmp_path). A shell string is never a list, so `cd ~/vss_env &&
+# git add -A` cannot use either door.
+_TMP_ROOT: list = []
+
+
+def _under_tmp(path) -> bool:
+    if not _TMP_ROOT or path is None:
+        return False
+    try:
+        resolved = Path(str(path)).resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+    root = _TMP_ROOT[0]
+    return resolved == root or root in resolved.parents
+
+
+def _sandboxed(argv, kwargs) -> bool:
+    if not isinstance(argv, (list, tuple)) or not argv:
+        return False
+    program = str(argv[0])
+    if program == "git":
+        return _under_tmp(kwargs.get("cwd"))
+    if program == "find":                     # context._fetch_recent_files
+        return len(argv) > 1 and _under_tmp(argv[1])
+    return "/" in program and _under_tmp(program)
+
+
+def _refuse(owner: str, kind: str, argv):
+    program = _program_of(argv)
+    _desktop_ledger.append((_desktop_current["nodeid"], owner, kind, program))
+    sink = _desktop_current["sink"]
+    if sink is not None:
+        sink.append((owner, kind, program, argv))
+    raise DesktopFirewallRefused(
+        f"{owner} asked subprocess.{kind} for {program!r} under pytest: the "
+        "suite must not fork onto the user's desktop, shell, tmux, ssh, mic "
+        "or speakers (tests/conftest.py, the desktop firewall). Pass the "
+        "module's own seam (run= / popen= / _run), monkeypatch subprocess.run "
+        "or subprocess.Popen on the real module, or mark the test "
+        f"@pytest.mark.real_subprocess({owner!r}) to say you mean it.")
+
+
+class _SubprocessProxy:
+    """Stands in for the ``subprocess`` module inside ONE jarvis module."""
+
+    def __init__(self, owner: str):
+        self._owner = owner
+        real = _real_subprocess
+
+        class Popen(_REAL_POPEN):
+            """A subclass so ``isinstance``, ``except`` and annotations keep
+            working; ``__new__`` never builds one."""
+            def __new__(cls, *args, **kwargs):
+                argv = args[0] if args else kwargs.get("args")
+                if real.Popen is not _REAL_POPEN:        # a test's global fake
+                    return real.Popen(*args, **kwargs)
+                if _sandboxed(argv, kwargs):             # a script in tmp_path
+                    return _REAL_POPEN(*args, **kwargs)
+                _refuse(owner, "Popen", argv)
+
+        Popen.__qualname__ = f"{owner}.subprocess.Popen"
+        self.Popen = Popen
+
+    def run(self, *args, **kwargs):
+        argv = args[0] if args else kwargs.get("args")
+        if _real_subprocess.run is not _REAL_RUN:          # a test's global fake
+            return _real_subprocess.run(*args, **kwargs)
+        if _sandboxed(argv, kwargs):                       # git in a tmp_path repo
+            return _REAL_RUN(*args, **kwargs)
+        _refuse(self._owner, "run", argv)
+
+    # The convenience wrappers build a REAL Popen inside the real module, so
+    # forwarding them would slip past the proxy: refused outright.
+    def call(self, *args, **kwargs):
+        _refuse(self._owner, "call", args[0] if args else kwargs.get("args"))
+
+    def check_call(self, *args, **kwargs):
+        _refuse(self._owner, "check_call", args[0] if args else kwargs.get("args"))
+
+    def check_output(self, *args, **kwargs):
+        _refuse(self._owner, "check_output", args[0] if args else kwargs.get("args"))
+
+    def getoutput(self, cmd, *args, **kwargs):
+        _refuse(self._owner, "getoutput", cmd)
+
+    def getstatusoutput(self, cmd, *args, **kwargs):
+        _refuse(self._owner, "getstatusoutput", cmd)
+
+    def __getattr__(self, name):
+        return getattr(_real_subprocess, name)
+
+    def __repr__(self):
+        return f"<desktop-firewalled subprocess for {self._owner}>"
+
+
+def _rebind_defaults(fn, proxy) -> None:
+    """``def f(run=subprocess.run)`` captured the REAL runner at import; the
+    proxy is written into that default so the seam is still the seam."""
+    swap = {id(_REAL_RUN): proxy.run, id(_REAL_POPEN): proxy.Popen}
+    defaults = getattr(fn, "__defaults__", None)
+    kwdefaults = getattr(fn, "__kwdefaults__", None)
+    hit = (defaults and any(id(v) in swap for v in defaults)) or \
+          (kwdefaults and any(id(v) in swap for v in kwdefaults.values()))
+    if not hit:
+        return
+    _rebound.append((fn, defaults, dict(kwdefaults) if kwdefaults else None))
+    if defaults:
+        fn.__defaults__ = tuple(swap.get(id(v), v) for v in defaults)
+    if kwdefaults:
+        fn.__kwdefaults__ = {k: swap.get(id(v), v) for k, v in kwdefaults.items()}
+
+
+def _wrap_module(name: str) -> bool:
+    try:
+        __import__(name)
+    except Exception:  # noqa: BLE001 - a module this box cannot import is not on the path
+        return False
+    mod = _sys.modules[name]
+    if getattr(mod, "subprocess", None) is not _real_subprocess:
+        return False
+    proxy = _SubprocessProxy(name)
+    _wrapped.append((mod, _real_subprocess))
+    mod.subprocess = proxy
+    import inspect as _inspect
+    for obj in list(vars(mod).values()):
+        if _inspect.isfunction(obj) and obj.__module__ == name:
+            _rebind_defaults(obj, proxy)
+        elif _inspect.isclass(obj) and obj.__module__ == name:
+            for member in list(vars(obj).values()):
+                if _inspect.isfunction(member):
+                    _rebind_defaults(member, proxy)
+    return True
+
+
+def _blocked_focused_window_title(timeout_s: float = 0.5):
+    """cast.focused_window_title imports subprocess inside the function;
+    the real one returns None when xdotool is not there, and so does this."""
+    if _real_subprocess.run is not _REAL_RUN:
+        return _real_focused_window_title(timeout_s)
+    try:
+        _refuse("jarvis.cast", "run", ["xdotool", "getactivewindow", "getwindowname"])
+    except DesktopFirewallRefused:
+        return None
+
+
+_real_focused_window_title = None
+
+
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_subprocess(*modules): put the REAL subprocess module back inside "
+        "the named jarvis modules for this test (the desktop firewall in "
+        "tests/conftest.py refuses run/Popen there otherwise)")
+
+
+@pytest.fixture(autouse=True)
+def _desktop_firewall_turn(request, monkeypatch):
+    """Per test: a fresh sink for `desktop_attempts`, the ledger's nodeid,
+    and the `real_subprocess` marker's opt-in."""
+    _desktop_current["nodeid"] = request.node.nodeid
+    _desktop_current["sink"] = []
+    marker = request.node.get_closest_marker("real_subprocess")
+    for name in (marker.args if marker else ()):
+        mod = _sys.modules.get(name)
+        if mod is None:
+            raise pytest.UsageError(f"real_subprocess: {name} is not imported")
+        monkeypatch.setattr(mod, "subprocess", _real_subprocess)
+    yield
+    _desktop_current["sink"] = None
+    _desktop_current["nodeid"] = ""
+
+
+@pytest.fixture
+def desktop_attempts(request):
+    """The subprocess calls the desktop firewall refused DURING THIS TEST:
+    a list of (module, kind, program, argv), in order. Asking for it says
+    the test owns them (they leave the session-end ledger)."""
+    _owned_nodeids.add(request.node.nodeid)
+    return _desktop_current["sink"]
+
+
 @pytest.fixture(scope="session", autouse=True)
-def _firewall_live_log_dir():
+def _firewall_live_log_dir(tmp_path_factory):
     """Every jarvis path that can write under the log dir points at the
     throwaway directory for the whole session."""
+    _TMP_ROOT[:] = [Path(str(tmp_path_factory.getbasetemp())).resolve()]
     from jarvis import config, logs
     live = Path("/tmp/vss_voice")
     assert logs.LOG_DIR != live, "jarvis.logs still targets the live app"
@@ -259,6 +558,19 @@ def _firewall_live_log_dir():
     from jarvis import earcons
     real_spawn = earcons._spawn
     earcons._spawn = _blocked_player
+    # THE DESKTOP FIREWALL (see the block above _SubprocessProxy): every
+    # subprocess seam a Commander.handle call can reach is refused for the
+    # session. The four the 17:21 incident went through are asserted, not
+    # merely attempted: a box on which jarvis.commander did not import has
+    # no suite to run anyway.
+    global _real_focused_window_title
+    wrapped = [name for name in _DESKTOP_MODULES if _wrap_module(name)]
+    for name in ("jarvis.commander", "jarvis.enrolentry", "jarvis.workflows",
+                 "jarvis.desktop"):
+        assert name in wrapped, f"the desktop firewall did not wrap {name}"
+    from jarvis import cast as _cast
+    _real_focused_window_title = _cast.focused_window_title
+    _cast.focused_window_title = _blocked_focused_window_title
     # The LOCAL MODEL SERVER. Ollama is one shared process on this box and,
     # exactly like the display and the sound server above, there is no
     # per-process instance to point a test at. It also runs under
@@ -310,6 +622,13 @@ def _firewall_live_log_dir():
     finally:
         earcons._spawn = real_spawn
         socket.socket.connect = real_connect
+        _cast.focused_window_title = _real_focused_window_title
+        for fn, defaults, kwdefaults in _rebound:
+            fn.__defaults__ = defaults
+            if kwdefaults is not None:
+                fn.__kwdefaults__ = kwdefaults
+        for mod, real in _wrapped:
+            mod.subprocess = real
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -331,3 +650,33 @@ def pytest_sessionfinish(session, exitstatus):
             rep.write_line("A test lost its FakeSMTP. Pass smtp= to "
                            "mail.send_message or put one on services.smtp.",
                            red=True)
+    # The desktop firewall's ledger: every refusal, by test. Reported, not
+    # failed -- each refusal was already absorbed by the module's own
+    # missing-binary path, so the suite is hermetic either way; this line
+    # is how a test that reaches for the desktop without knowing it gets
+    # noticed and given a seam. A test that owns its refusals (it asked
+    # for `desktop_attempts`) is not listed.
+    unowned = [row for row in _desktop_ledger
+               if row[0] and row[0] not in _owned_nodeids]
+    if unowned:
+        rep = session.config.pluginmanager.get_plugin("terminalreporter")
+        if rep is not None:
+            rep.write_sep("-", "DESKTOP FIREWALL: refused subprocess calls "
+                          "no test owned", yellow=True)
+            # One line per test FILE: a hundred lines for one unseamed boot
+            # path is noise, and the file is where the seam goes.
+            by_file: dict = {}
+            for nodeid, owner, kind, program in unowned:
+                path = nodeid.split("::", 1)[0]
+                calls, tests = by_file.setdefault(path, (set(), set()))
+                calls.add(f"{owner}.{kind}({program})")
+                tests.add(nodeid)
+            for path, (calls, tests) in sorted(by_file.items()):
+                rep.write_line(f"  {path} ({len(tests)} tests): "
+                               f"{', '.join(sorted(calls))}", yellow=True)
+            rep.write_line("Give each a seam (run=/popen=/_run), a global "
+                           "subprocess monkeypatch, `desktop_attempts` or "
+                           "@pytest.mark.real_subprocess.", yellow=True)
+
+
+_owned_nodeids: set = set()

@@ -29,6 +29,7 @@ import pytest
 
 import jarvis.app as app_mod
 import jarvis.channels.notify as notify_mod
+import jarvis.desktop as desktop_mod
 import jarvis.tools.timekeeper as tk_mod
 import jarvis.tts as tts_mod
 from jarvis.config import CONFIG, PATHS
@@ -201,6 +202,12 @@ def seams(monkeypatch):
                         lambda argv, timeout=5.0: runs.append(("notify", argv)))
     monkeypatch.setattr(tk_mod, "_run",
                         lambda argv, **kw: runs.append(("ring", argv)))
+    # JarvisApp.__init__ -> desktop.restore_target() -> list_windows(), i.e.
+    # `xdotool search --onlyvisible --name ""` against HIS display: every
+    # test that built the app read his window titles until the desktop
+    # firewall (tests/conftest.py, 2026-09-04) refused it. An empty desktop
+    # is what a headless box has, so the app boots the same either way.
+    monkeypatch.setattr(desktop_mod, "list_windows", lambda *a, **k: [])
     return runs
 
 
