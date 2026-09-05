@@ -200,6 +200,13 @@ NOT_CAUGHT_LINE = "I did not catch that, sir. Do try me again."
 # that was the whole complaint -- and named him to a stranger besides.
 GUEST_LINE = gate_mod.UNKNOWN_LINE
 GUEST_PHRASE_LINE = gate_mod.UNKNOWN_PHRASE_LINE
+# What _gate_rescue hands back when the dropped clip WAS the spoken phrase:
+# the gate answered it, the window is open, and _process_audio must publish
+# neither a rejection nor a transcript (Knightfall, 2026-09-04).
+PHRASE_CONSUMED = object()
+# The legs on which a clip the speaker filter dropped is let through after
+# all: the camera, the phrase's window, the code's window.
+RESCUE_HOWS = (gate_mod.HOW_FACE, gate_mod.HOW_GRANT, gate_mod.HOW_CODE)
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
 # offer").
 #
@@ -4842,55 +4849,78 @@ class JarvisApp:
 
     def _gate_rescue_inner(self, gate, audio, stats):
         face, running = self._eye_identity(), self._face_running()
-        d = gate.judge("voice", "", stats=stats, rejected=True,
+        # THE PHRASE COSTS ONE DECODE, IN EVERY MODE, and only when an owner
+        # has set one. It is the ONE thing that acts in shadow: a rejected
+        # clip that is the phrase is consumed (Knightfall, 2026-09-04 --
+        # "so he can test it tonight"); everything else shadow still only
+        # logs. Judged once, with the words, so the gate can hear it.
+        result, text = None, ""
+        if self._owner_has_phrase():
+            result = self.transcriber.transcribe(audio)
+            text = (getattr(result, "text", "") or "").strip()
+        d = gate.judge("voice", text, stats=stats, rejected=True,
                        face=face, face_running=running)
+        if d.consumed:
+            self._gate_consumed(d, getattr(result, "confidence", 0.0))
+            return PHRASE_CONSUMED
         if gate.effective_mode() != gate_mod.MODE_ENFORCE:
-            # SHADOW CHANGES NOTHING, and that has to include the rescues.
-            # A face leg that started answering clips the speaker filter
-            # dropped would be a visible change of behaviour he did not ask
-            # for yet -- and the whole value of shadow is that it is safe to
-            # leave on while the log is read. The verdict is logged inside
-            # judge() either way, which is the point of the mode.
-            if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
+            # SHADOW CHANGES NOTHING ELSE, and that has to include the
+            # rescues. A face leg that started answering clips the speaker
+            # filter dropped would be a visible change of behaviour he did
+            # not ask for yet -- and the whole value of shadow is that it is
+            # safe to leave on while the log is read. The verdict is logged
+            # inside judge() either way, which is the point of the mode.
+            if d.admit and d.how in RESCUE_HOWS:
                 log.info("owner-gate: shadow -- the %s leg WOULD have "
                          "rescued this clip for %s", d.how, d.who)
             return None
-        if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
+        if d.admit and d.how in RESCUE_HOWS:
             log.info("owner-gate: the %s leg rescued a clip the speaker "
                      "filter dropped (%s)", d.how, d.who)
-            return audio, stats, self.transcriber.transcribe(audio)
-        if d.admit:
-            return None                # off, shadow or blind: nothing changes
-        if not self._owner_has_phrase():
-            self._refuse_politely(d.line)
-            return None
-        result = self.transcriber.transcribe(audio)
-        second = gate.judge("voice", (getattr(result, "text", "") or "").strip(),
-                            stats=stats, rejected=True, face=face,
-                            face_running=running)
-        if second.admit and second.how == gate_mod.HOW_PHRASE:
-            log.info("owner-gate: the passphrase opened the floor")
-            self._say(gate_mod.PHRASE_OK_LINE)
-            self._followup_after_speech = True
-            return None
-        if second.admit:
+            if result is None:
+                result = self.transcriber.transcribe(audio)
             return audio, stats, result
-        self._refuse_politely(second.line)
+        if d.admit:
+            return None                # off or blind: nothing changes
+        self._refuse_politely(d.line)
         return None
 
-    def _gate_admits(self, text, stats) -> bool:
-        """The admitted path: attribute the turn, and hold a KNOWN person to
-        what a known person may ask for. It cannot refuse HIM -- the speaker
-        filter has already matched him and this reuses that verdict."""
+    def _gate_judge(self, text, stats):
+        """One verdict for the turn, or None when there is no gate or it
+        could not decide (both mean: the turn stands, exactly as today)."""
         gate = getattr(self, "gate", None)
         if gate is None:
-            return True
+            return None
         try:
-            d = gate.judge("voice", text, stats=stats,
-                           face=self._eye_identity(),
-                           face_running=self._face_running())
+            return gate.judge("voice", text, stats=stats,
+                              face=self._eye_identity(),
+                              face_running=self._face_running())
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: judging failed; the turn stands")
+            return None
+
+    def _gate_consumed(self, d, confidence=0.0, speculative=False):
+        """The spoken phrase, answered by the gate: say the line, re-open
+        the mic, close the turn in the ledger, and publish ONLY the
+        redaction -- no UserUtterance, no commander, no model. The log line
+        carries who and which path; the text is never anywhere."""
+        log.info("owner-gate: the phrase turn is consumed for %s; nothing "
+                 "dispatched (mode=%s)", d.who, self.gate.effective_mode())
+        bus.publish(Transcribed(text=d.redact or gate_mod.REDACTED_TEXT,
+                                confidence=float(confidence or 0.0),
+                                accepted=True, speculative=bool(speculative)))
+        self.turns.abandon("gate:phrase")
+        self._say(d.line or gate_mod.PHRASE_OK_LINE)
+        self._followup_after_speech = True
+
+    def _gate_admits(self, text, stats, decision=None) -> bool:
+        """The admitted path: attribute the turn, and hold a KNOWN person to
+        what a known person may ask for. It cannot refuse HIM -- the speaker
+        filter has already matched him and this reuses that verdict.
+        ``decision`` is the verdict _process_audio already took for this
+        turn, so the gate (and its key derivation) runs once, not twice."""
+        d = decision if decision is not None else self._gate_judge(text, stats)
+        if d is None:
             return True
         self._gate_who, self._gate_how = d.who, d.how
         if d.admit:
@@ -4921,6 +4951,8 @@ class JarvisApp:
                 # which is his way back in when he is ill, in the dark, or
                 # turned away. Anything else and today's behaviour stands.
                 rescued = self._gate_rescue(audio, stats, spec is not None)
+                if rescued is PHRASE_CONSUMED:
+                    return             # the gate answered it; nothing else
                 if rescued is None:
                     bus.publish(Transcribed(
                         text="", accepted=False, reject_reason="speaker",
@@ -4932,6 +4964,22 @@ class JarvisApp:
                 audio, stats, result = rescued
                 rejected = False
             text = result.text.strip()
+            # THE GATE, BEFORE THE TRANSCRIPT CAN REACH THE BUS. The spoken
+            # phrase is consumed here in every mode (Knightfall): the turn
+            # ends with the line and the redaction, and the words never
+            # become a Transcribed, a UserUtterance or a dispatch. Judged
+            # once; the admitted path below reuses this verdict. A
+            # low-confidence transcript is judged too, when an owner has a
+            # phrase: an exact match after normalisation is better evidence
+            # than a length-biased score, and not checking would put the
+            # phrase on the bus as a rejected transcript.
+            verdict = None
+            if text and (result.accepted or self._owner_has_phrase()):
+                verdict = self._gate_judge(text, stats)
+                if verdict is not None and verdict.consumed:
+                    self._gate_consumed(verdict, result.confidence,
+                                        spec is not None)
+                    return
             # The confidence gate is no longer the last word. It used to
             # fire BEFORE the commander saw a syllable, so a plain "Yes."
             # answering Jarvis's own "Clear all three off your shopping
@@ -4966,7 +5014,7 @@ class JarvisApp:
                 # It cannot refuse HIM here -- the speaker filter has already
                 # matched him, and this reuses that verdict rather than
                 # taking one of its own.
-                if not self._gate_admits(text, stats):
+                if not self._gate_admits(text, stats, decision=verdict):
                     return
                 self._say_again_count = 0
                 self._maybe_learn_voice(audio, stats)
