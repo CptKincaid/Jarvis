@@ -44,6 +44,7 @@ from jarvis.commander import (
 )
 from jarvis.memory import (
     JarvisMemory,
+    fact_key,
     speech_to_second_person,
     store_fact_from_speech,
 )
@@ -502,8 +503,9 @@ def test_store_fact_from_speech_files_the_second_person_under_a_six_word_key(mem
     stored = store_fact_from_speech(
         mem, "I graduate December 10th 2026 with an electrical engineering degree")
     assert stored == "You graduate December 10th 2026 with an electrical engineering degree"
+    # the key is the case-folded head of the value (see (h) below)
     assert mem.get_all_facts() == {
-        "You graduate December 10th 2026 with": {"value": stored, "time": ANY}}
+        "you graduate december 10th 2026 with": {"value": stored, "time": ANY}}
     # the method form is the same helper (the remember TOOL will call it)
     assert mem.store_fact_from_speech("my locker code is 4412") == "your locker code is 4412"
     assert "your locker code is 4412" in mem.get_all_facts()
@@ -570,3 +572,181 @@ def test_the_stem_fallback_respects_since(mem):
     store_fact_from_speech(mem, "i graduate december 10th 2026")
     assert mem.recall("graduation", since=timedelta(hours=1))
     assert mem.recall("graduation", since=datetime.now() + timedelta(hours=1)) == []
+
+
+# ======================================= the three holes measured on 1641fb3
+# Reviewer + verdict, 2026-09-05, through Commander.handle under the firewall
+# fixtures: (f) 11 of 44 must-not sentences stored a non-fact; (g) a
+# comma-less "X and Y" fact stored only X; (h) the same fact re-said in
+# Whisper's other casing was stored and rendered twice.
+
+# (f) a value that only POINTS at something already said ("for later",
+#     "as well", "everything i just said", "the name i just gave you",
+#     "i said that", "that time we went to austin") or is only a courtesy
+#     ("thanks a lot") is not a fact: the head is bare and he is asked,
+#     exactly as "remember that" asks. Measured: each of the first eleven
+#     stored an entry and spoke "Noted, sir: for later." / "... as well." /
+#     "... everything you just said." -- the two-word floor was the only
+#     guard after the head.
+POINTER_SHAPES = [
+    # the reviewer's eleven, verbatim
+    "jarvis remember that for later",
+    "jarvis remember that for next time",
+    "jarvis remember all of that",
+    "jarvis remember everything i just said",
+    "jarvis remember the last thing i said",
+    "jarvis remember that as well",
+    "jarvis remember that, thanks a lot",
+    "jarvis remember that, thank you very much",
+    "jarvis remember the name i just gave you",
+    "jarvis remember that time we went to austin",
+    "jarvis remember that i said that",
+    # ...and the smallest generalisation of them
+    "jarvis remember it for later",
+    "jarvis remember this for next time",
+    "jarvis remember that too",
+    "jarvis remember that as well, please",
+    "jarvis remember that for when i ask",
+    "jarvis remember that when i ask you",
+    "jarvis remember that for future reference",
+    "jarvis remember all of this, please",
+    "jarvis remember that, thanks",
+    "jarvis remember that, thanks so much",
+    "jarvis remember everything i told you",
+    "jarvis remember the number i just gave you",
+    "jarvis remember the last thing i told you",
+    "jarvis remember that i just said that",
+    "jarvis keep in mind everything i said",
+    "jarvis don't forget that as well",
+    "jarvis put that in your memory for later",
+    "jarvis note that for later",
+]
+
+
+@pytest.mark.parametrize("said", POINTER_SHAPES)
+def test_a_pointer_at_something_already_said_asks_and_stores_nothing(cmdr, services, said):  # noqa: F811
+    res = cmdr.handle(said)
+    services.memory.remember.assert_not_called()
+    services.memory.save_note.assert_not_called()
+    services.brain.think.assert_not_called()
+    assert res.handled and res.reply == ASK_LINE and res.speak is True
+
+
+# ...whole-value only: a fact that CONTAINS one of those phrases is a fact.
+@pytest.mark.parametrize("said,fact", [
+    ("jarvis remember that thank you notes go out on friday",
+     "thank you notes go out on friday"),
+    ("jarvis remember that i said that i'd be late on friday",
+     "you said that you'd be late on friday"),
+    ("jarvis remember that the time we agreed on is 3pm",
+     "the time we agreed on is 3pm"),
+    ("jarvis remember that everything i said in the meeting is confidential",
+     "everything you said in the meeting is confidential"),
+    ("jarvis remember that as well as the thesis i have a lab report due",
+     "as well as the thesis you have a lab report due"),
+])
+def test_a_fact_that_contains_a_pointer_phrase_is_still_a_fact(cmdr, services, said, fact):  # noqa: F811
+    res = cmdr.handle(said)
+    _key, value = _stored(services)
+    assert value == fact
+    assert res.reply == f"Noted, sir: {fact}."
+
+
+# (g) a fact runs to the END of the utterance, courtesy tail aside: a
+#     coordinating "and" inside it is part of the fact, never a clause
+#     boundary. Measured: "remember that my locker code is 4412 and my
+#     parking spot is b14" stored ONLY "your locker code is 4412" -- the
+#     tail "my parking spot is b14" matched the person rung's shape, so
+#     _compound_hijack split the breath, the person rung declined the tail,
+#     and it vanished: no store, no note, no model turn. With a comma before
+#     the "and" the fact was already kept whole.
+TWO_CLAUSE_SHAPES = [
+    ("jarvis remember that my locker code is 4412 and my parking spot is b14",
+     "your locker code is 4412 and your parking spot is b14"),
+    ("jarvis remember my locker code is 4412 and my parking spot is b14",
+     "your locker code is 4412 and your parking spot is b14"),
+    ("jarvis remember that i graduate december 10th 2026 and my thesis defence is in march",
+     "you graduate december 10th 2026 and your thesis defence is in march"),
+    ("jarvis keep in mind that heather prefers email and i prefer the phone",
+     "heather prefers email and you prefer the phone"),
+    ("jarvis don't forget that the lab moved to room 049 and the printer is on the third floor",
+     "the lab moved to room 049 and the printer is on the third floor"),
+    ("jarvis remember that my dentist is dr patel and my doctor is dr lee",
+     "your dentist is dr patel and your doctor is dr lee"),
+    # the courtesy tail still comes off the end of the whole breath
+    ("jarvis remember that my locker code is 4412 and my parking spot is b14, please",
+     "your locker code is 4412 and your parking spot is b14"),
+    # the two controls the reviewer measured whole already
+    ("jarvis remember that my locker code is 4412, and my parking spot is b14",
+     "your locker code is 4412, and your parking spot is b14"),
+    ("jarvis remember that i like jazz and heather likes blues",
+     "you like jazz and heather likes blues"),
+]
+
+
+@pytest.mark.parametrize("said,fact", TWO_CLAUSE_SHAPES)
+def test_a_two_clause_fact_is_stored_whole_in_the_second_person(cmdr, services, said, fact):  # noqa: F811
+    res = cmdr.handle(said)
+    key, value = _stored(services)
+    assert value == fact
+    assert key == " ".join(fact.split()[:6])
+    assert res.reply == f"Noted, sir: {fact}." and res.speak is True
+    services.memory.save_note.assert_not_called()
+    services.brain.think.assert_not_called()
+    services.memory.add_person.assert_not_called()
+
+
+def test_a_remember_and_a_command_in_one_breath_is_one_fact(cmdr, services):  # noqa: F811
+    """The stated trade-off of (g): a remembered fact is one breath, the
+    rule the code already states for 'remind me to buy milk and eggs', so
+    a command after the 'and' is filed inside the fact rather than run.
+    Pinned so the day it changes, it changes on purpose."""
+    res = cmdr.handle("jarvis remember that my locker code is 4412 and set a timer for five minutes")
+    _key, value = _stored(services)
+    assert value == "your locker code is 4412 and set a timer for five minutes"
+    assert res.reply == f"Noted, sir: {value}."
+
+
+# (h) the key is built from the CASE-FOLDED value: Whisper's capitals vary
+#     between takes, and the same fact re-said was stored under two keys
+#     and rendered twice in every prompt (measured: 'Known facts (2):'
+#     with both casings). Replace, never double; the value keeps the
+#     casing of the latest take and the ack is unchanged.
+def test_fact_key_is_case_folded():
+    assert fact_key("You graduate December 10th 2026 with an EE degree") == \
+        "you graduate december 10th 2026 with"
+    assert fact_key("you graduate december 10th 2026") == "you graduate december 10th 2026"
+    assert fact_key("Your Locker Code IS 4412") == "your locker code is 4412"
+
+
+def test_store_fact_from_speech_in_two_casings_is_one_entry(mem):
+    store_fact_from_speech(
+        mem, "I graduate December 10th 2026 with an electrical engineering degree")
+    store_fact_from_speech(
+        mem, "i graduate december 10th 2026 with an electrical engineering degree")
+    facts = mem.get_all_facts()
+    assert list(facts) == ["you graduate december 10th 2026 with"]
+    assert facts["you graduate december 10th 2026 with"]["value"] == \
+        "you graduate december 10th 2026 with an electrical engineering degree"
+
+
+def test_the_same_fact_in_two_casings_renders_once_through_the_rung(cmdr, services, tmp_path):  # noqa: F811
+    """MEASURED against the real store and renderer, through the rung."""
+    services.memory = JarvisMemory(memory_dir=tmp_path / "mem",
+                                   legacy_dir=tmp_path / "legacy", semantic=False)
+    first = cmdr.handle("Jarvis, remember that I graduate December 10th 2026 "
+                        "with an electrical engineering degree.")
+    assert first.reply == ("Noted, sir: You graduate December 10th 2026 "
+                           "with an electrical engineering degree.")
+    second = cmdr.handle("jarvis remember that i graduate december 10th 2026 "
+                         "with an electrical engineering degree")
+    assert second.reply == ("Noted, sir: you graduate december 10th 2026 "
+                            "with an electrical engineering degree.")
+    assert list(services.memory.get_all_facts()) == ["you graduate december 10th 2026 with"]
+    assert services.memory.format_for_context("When do I graduate?") == (
+        "Known facts (1):\n"
+        "  you graduate december 10th 2026 with an electrical engineering degree")
+    # ...and "scratch that" still finds the entry under the folded key
+    res = cmdr.handle("jarvis scratch that")
+    assert res.handled and "forgot" in (res.reply or "").lower()
+    assert services.memory.get_all_facts() == {}

@@ -196,11 +196,51 @@ def is_spoken_question(text) -> bool:
     return _FACT_TAIL_RX.sub("", (text or "").strip(), count=1).rstrip().endswith("?")
 
 
+# A value that only POINTS at something already said, or is only a
+# courtesy, is not a fact. Measured on 1641fb3 (11 of 44 must-not
+# sentences): "remember that for later" filed "for later", "remember that,
+# thanks a lot" filed "thanks a lot", "remember everything i just said"
+# filed "everything you just said", "remember that time we went to
+# austin" filed "time we went to austin" -- the two-word floor was the
+# only guard after the head. Whole-value match on the CLEANED value, in
+# the first person (it runs before the store turns the pronouns), with
+# the demonstrative the head left behind allowed in front ("it for
+# later"). A fact that merely CONTAINS one of these ("thank you notes go
+# out on friday") does not match.
+_FACT_POINTER_RX = re.compile(
+    r"^(?:(?:that|this|it)\s+)?(?:"
+    r"for (?:later|now|next time|the future|future reference|reference|me|us)"
+    r"|(?:for )?(?:when|whenever|if) i ask(?: you)?(?: (?:for|about) (?:it|that|this))?"
+    r"|next time|as well|too|also|again"
+    r"|all (?:of )?(?:that|this|it)|everything"
+    r"|everything i (?:just )?(?:said|told you|mentioned)"
+    r"|the (?:last |first )?(?:thing|name|number|code|date|address|word|bit) i"
+    r" (?:just )?(?:said|told you|gave you|mentioned)"
+    r"|i (?:just )?(?:said|told you|mentioned) (?:that|this|it)"
+    r"|(?:that |this )?time (?:we|i|you)\b.*"
+    r"|(?:thanks|thank you|cheers)(?: (?:a lot|so much|very much|a bunch|kindly|again))?"
+    r")$", re.I)
+
+
+def is_spoken_pointer(text) -> bool:
+    """True when the cleaned value only points at something already said
+    ("for later", "as well", "everything I just said", "the name I just
+    gave you", "I said that", "that time we went to Austin") or is only a
+    courtesy ("thanks a lot"): nothing to file, so the rung asks what to
+    remember, exactly as it does for a bare head."""
+    return _FACT_POINTER_RX.match((text or "").strip()) is not None
+
+
 def fact_key(value) -> str:
-    """The key a spoken fact is filed under: its first six words. A
-    truncated copy of the value, which is why format_for_context prints
-    such a fact once, not as 'key: value'."""
-    return " ".join(str(value or "").split()[:FACT_KEY_WORDS])
+    """The key a spoken fact is filed under: its first six words, CASE-
+    FOLDED. A truncated copy of the value, which is why format_for_context
+    prints such a fact once, not as 'key: value' (_fact_line lower-cases
+    both sides). Folded because Whisper's capitals vary between takes:
+    measured on 1641fb3, "I graduate December 10th 2026 ..." re-said as
+    "i graduate december 10th 2026 ..." was filed under two keys and
+    rendered twice in every prompt. One key, so the later take replaces
+    the earlier one."""
+    return " ".join(str(value or "").lower().split()[:FACT_KEY_WORDS])
 
 
 def store_fact_from_speech(memory, text) -> str:

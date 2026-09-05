@@ -194,7 +194,9 @@ def test_remember_routes_to_persistent_memory(cmdr, services):
     # -- under "Known facts" the model is Jarvis, and "I parked" said that
     # Jarvis did. The key is the first six words of the value.
     assert value == "You parked on level 3"
-    assert key == "You parked on level 3"
+    # the key is the CASE-FOLDED head of the value (tests/test_memory_rung.py
+    # (h)): the value keeps Whisper's capital, the key does not
+    assert key == "you parked on level 3"
     assert res.handled and "You parked on level 3" in res.reply
     services.brain.think.assert_not_called()
 

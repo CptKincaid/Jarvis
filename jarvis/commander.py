@@ -103,6 +103,7 @@ from jarvis.tools.briefing import OFFER_TTL_S
 from jarvis.memory import (
     clean_spoken_fact,
     fact_key,
+    is_spoken_pointer,
     is_spoken_question,
     parse_person_statement,
     parse_since,
@@ -2099,18 +2100,11 @@ _MEM_ASK_RX = re.compile(
     r"^" + _MEM_COURTESY + r"(?:" + _MEM_HEADS + r")\b"
     r"\s*[,:]?\s*(?:(?:of|about)\s+)?(?:that|this|it)?\s*(?:down)?"
     r"(?:[,\s]*(?:please|would you|will you|for me|jarvis|sir))*\s*[.!?]*$", re.I)
-# The head followed straight by a comma or colon: "remember, my locker
-# code is 4412". That comma is the rung's own pause, and _compound_hijack
-# must not read it as a clause boundary (it would split the sentence into
-# an ask plus a people-book miss and store nothing -- measured).
-_MEM_HEAD_PAUSE_RX = re.compile(
-    r"^" + _MEM_COURTESY + r"(?:" + _MEM_HEADS + r")\b\s*(?:(?:that|this)\s*)?[,:]",
-    re.I)
-# ...and the courtesy tail is the rung's too: split on ", thanks", the
-# tail matched the courtesy rung and _try_multi joined "Noted, sir: ...
-# It's rather what I'm for." (measured). clean_spoken_fact strips it.
-_MEM_TAIL_PAUSE_RX = re.compile(
-    r"[,\s]+(?:please|jarvis|sir|thanks|thank you|would you|will you)[.!?,]*$", re.I)
+# A matched fact is never split by _compound_hijack: the comma after the
+# head ("remember, my locker code is 4412"), the courtesy tail (", thanks")
+# and a coordinating "and" inside the fact ("my locker code is 4412 and my
+# parking spot is b14") are all the rung's own -- see the one-breath rule
+# in _compound_hijack.
 ASK_REMEMBER_LINE = "What shall I remember, sir?"
 
 
@@ -2137,7 +2131,9 @@ def _m_remember(t):
     if is_spoken_question(raw_fact):
         return None                    # "remember i asked?" -- the model's
     fact = clean_spoken_fact(raw_fact)
-    if len(fact.split()) < 2:
+    if is_spoken_pointer(fact):
+        return _RememberMatch("ask")   # "remember that for later" -- nothing
+    if len(fact.split()) < 2:          # to file yet, so ask, as a bare head does
         return None                    # "remember me" -- not a fact
     return _RememberMatch("fact", fact)
 
@@ -12522,12 +12518,18 @@ class Commander:
         bare = strip_jarvis_prefix(text)
         if bare is None:
             bare = strip_address(text)
-        # "remember, my locker code is 4412": the comma after the head is
-        # the memory rung's own pause (see _MEM_HEAD_PAUSE_RX), not a
-        # clause boundary -- split, the head alone is an ask and the fact
-        # alone a people-book miss, and nothing is stored (measured).
-        if cmd.name == "remember" and (_MEM_HEAD_PAUSE_RX.match(bare)
-                                       or _MEM_TAIL_PAUSE_RX.search(bare)):
+        # A remembered fact is ONE breath, however many commas or "and"s
+        # it holds -- the rule split_clauses already states for "remind me
+        # to buy milk and eggs". Measured on 1641fb3: "remember that my
+        # locker code is 4412 and my parking spot is b14" was split here
+        # because the tail has the person rung's shape; the person rung
+        # then declined it and the second half vanished -- no store, no
+        # note, no model turn. (Before that, on 861e184, the comma after
+        # the head split "remember, my locker code is 4412" into an ask
+        # plus a people-book miss.) So the fact runs to the end of the
+        # utterance, courtesy tail aside, and a command after the "and" is
+        # filed inside it rather than run.
+        if cmd.name == "remember":
             return False
         parts = split_clauses(bare)
         if len(parts) != MAX_CLAUSES:
