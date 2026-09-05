@@ -188,7 +188,13 @@ def test_a_room_with_no_ladder_says_so_rather_than_borrowing_a_geometry():
     v = sp.fuse(present=True, distance_m=3.2, camera=sp.camera_view({}),
                 zmap=None, overrules=True)
     assert v.zone == sp.NO_LADDER
-    assert "zones.rooms" in v.why
+    # The reason is the house voice, not the config key: 2026-09-05 the
+    # reason column printed `'office' has no camera zone in zones.rooms`
+    # and `a target inside 'at the desk'` -- Python's repr quotes and a
+    # dotted key on his screen. The key still belongs in the notes row,
+    # which is where SensorsPage._build puts it.
+    assert v.why == "no bands are set for this room"
+    assert "zones." not in v.why
 
 
 def test_a_ladder_the_zone_model_refuses_is_refused_here_too_and_named():
@@ -529,7 +535,11 @@ def test_a_target_inside_a_band_is_that_band_without_any_camera():
     v = sp.fuse(present=True, distance_m=3.13, camera=sp.camera_view({}),
                 zmap=_office(), overrules=True)
     assert v.zone == "at the desk" and v.source == "radar"
-    assert "at the desk" in v.why
+    # The band's name is the VERDICT WORD beside the source; the reason
+    # line says how it was reached and no longer repeats the name in
+    # quotes ("a target inside 'at the desk'", 09-05).
+    assert v.word == "AT THE DESK"
+    assert v.why == "the range falls inside this band"
 
 
 # ------------------------------------------------------------ the whole row
