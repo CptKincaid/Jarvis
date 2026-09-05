@@ -6171,7 +6171,12 @@ class JarvisApp:
             return None
         self._restarting = True
         spawn = spawn or relaunch.spawn_relauncher
-        self._say(RESTART_LINE)
+        try:
+            self._say(RESTART_LINE)
+        except Exception:                 # noqa: BLE001 - the line is a courtesy
+            # Review 2026-09-04: a TTS error here left _restarting set for
+            # good and the button dead. He pressed twice; restart anyway.
+            log.exception("restart line could not be spoken; restarting anyway")
         deadline = clock() + RESTART_SAY_WAIT_S
         while self._tts_busy() and clock() < deadline:
             sleep(0.1)

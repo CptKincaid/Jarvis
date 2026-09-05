@@ -360,3 +360,15 @@ def test_importing_and_helping_never_touches_home_or_a_config_module(
     assert r.returncode == 0, r.stderr[-2000:]
     assert "--wait-pid" in r.stdout and "--grace" in r.stdout
     assert _tree(home) == before
+
+
+def test_process_alive_is_false_for_a_zombie_the_parent_never_reaped():
+    """Review 2026-09-04: kill(pid, 0) succeeds on a zombie and its cmdline
+    is empty, so the helper waited forever and launched nothing. The
+    State: line of /proc/<pid>/status settles it: 'Z' is gone."""
+    assert relaunch.process_alive(
+        5, kill=lambda p, s: None, read_cmdline=lambda p: "",
+        read_state=lambda p: "Z (zombie)") is False
+    assert relaunch.process_alive(
+        5, kill=lambda p, s: None, read_cmdline=lambda p: "",
+        read_state=lambda p: "S (sleeping)") is True

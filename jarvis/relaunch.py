@@ -130,8 +130,17 @@ def _read_cmdline(pid: int) -> str:
         return fh.read().decode("utf-8", "replace")
 
 
+def _read_state(pid: int) -> str:
+    """The State: field of /proc/<pid>/status ('Z (zombie)', 'S (sleeping)')."""
+    with open(f"/proc/{int(pid)}/status", "rb") as fh:
+        for line in fh:
+            if line.startswith(b"State:"):
+                return line[6:].decode("utf-8", "replace").strip()
+    return ""
+
+
 def process_alive(pid: int, kill=os.kill, read_cmdline=_read_cmdline,
-                  marker: str = APP_MODULE) -> bool:
+                  marker: str = APP_MODULE, read_state=_read_state) -> bool:
     """Is the OLD JARVIS still there? False on ESRCH, and False when the
     pid now belongs to something whose command line does not mention
     ``jarvis.app`` (the kernel recycles pids; waiting on a stranger would
@@ -147,6 +156,16 @@ def process_alive(pid: int, kill=os.kill, read_cmdline=_read_cmdline,
     except OSError as exc:
         if getattr(exc, "errno", None) == errno.ESRCH:
             return False
+    # A zombie answers kill(pid, 0) and has an empty cmdline; only its
+    # State: line says it is gone. Measured 2026-09-04: without this the
+    # helper waited forever on a dead-but-unreaped Jarvis and launched
+    # nothing. Only a parent that never wait()s can produce one; bash and
+    # systemd --user both reap, so this is belt and braces.
+    try:
+        if read_state(pid).startswith("Z"):
+            return False
+    except OSError:
+        pass
     try:
         cmd = read_cmdline(pid)
     except OSError:

@@ -194,6 +194,9 @@ def seams(monkeypatch):
     # the brain fakes below take (text, callback, force_tool): no streaming
     monkeypatch.setattr(CONFIG, "stream_replies", False)
     monkeypatch.setattr(app_mod, "TTS", FakeTTS)
+    # the running-commit stamp shells out to git, which the desktop
+    # firewall refuses under pytest; stub it so the ledger stays clean
+    monkeypatch.setattr(app_mod, "running_commit", lambda **kw: "")
     monkeypatch.setattr(CONFIG, "talkback", True)
     monkeypatch.setattr(CONFIG, "hotword", False)
     runs: list[tuple[str, list]] = []
@@ -2341,3 +2344,21 @@ def test_main_attaches_the_window_it_creates():
     src = inspect.getsource(app_mod.main)
     assert "attach_window(app, window)" in src
     assert src.index("window = create(") < src.index("attach_window(app, window)")
+
+
+def test_restart_still_restarts_when_the_spoken_line_raises(app, paths):
+    """Review 2026-09-04: a TTS error inside restart() left _restarting set
+    forever, so every later press said 'already in flight' and the button
+    was dead until a manual restart. The line is a courtesy; the restart
+    he pressed for still happens."""
+    order = []
+
+    def boom(*a, **k):
+        raise RuntimeError("tts down")
+    app._say = boom
+    app.close_window = lambda: order.append("close")
+    clock = _Clock()
+    helper = app.restart(spawn=lambda *a, **k: (order.append("spawn"), 7)[1],
+                         sleep=clock.sleep, clock=clock)
+    assert helper == 7
+    assert order == ["spawn", "close"]
