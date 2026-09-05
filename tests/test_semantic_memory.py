@@ -174,7 +174,10 @@ def test_embedder_down_falls_back_to_substring_and_backs_off(mem, embed, monkeyp
     mem.remember("thesis", "the thesis draft is due Friday")      # facts.json still written
     assert mem.get_all_facts()["thesis"]["value"] == "the thesis draft is due Friday"
     assert mem.recall("draft")[0]["key"] == "thesis"               # substring path
-    assert mem.recall("who is my dentist") == []                   # no meaning search
+    # 2026-09-04: the stemmed fallback (memory.stem_match) finds "dentist"
+    # lexically now; the point of this row is that no MEANING search runs
+    # while the embedder is down -- the score says which path answered.
+    assert mem.recall("who is my dentist")[0]["score"] == 0.9      # stem, not meaning
     calls = len(embed.calls)
     mem.recall("who is my dentist")
     assert len(embed.calls) == calls, "a second query inside the back-off hit the embedder"
@@ -199,7 +202,10 @@ def test_chromadb_unavailable_is_substring_only(tmp_path, monkeypatch):
     mem.remember("dentist", "my dentist is Dr Patel")
     assert mem.semantic_available is False
     assert mem.recall("patel")[0]["key"] == "dentist"
-    assert mem.recall("who is my dentist") == []
+    # lexical only: the substring (1.0) and, since 2026-09-04, the stemmed
+    # word overlap (0.9) -- never a meaning search
+    assert mem.recall("who is my dentist")[0]["score"] == 0.9
+    assert mem.recall("play some jazz") == []
     assert "Known facts (1)" in mem.format_for_context("who is my dentist")
 
 

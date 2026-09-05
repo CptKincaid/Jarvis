@@ -203,6 +203,21 @@ def test_an_empty_transcript_is_an_error_but_a_shaky_one_is_dispatched():
     assert ic.transcribe(app, np.zeros(16000, dtype=np.float32)) == "what time is it"
 
 
+def test_a_looping_transcript_is_never_dispatched_from_the_phone():
+    """A repetition loop or a prompt echo is not a low-confidence
+    transcript of something he said, it is Whisper running away; the
+    microphone path never dispatches one and the socket path must not
+    either (review of 69afb9f)."""
+    app = FakeApp()
+    app.result = FakeResult(text="Quennevex, Quennevex, Quennevex, Quennevex,",
+                            accepted=False)
+    app.result.looping = True
+    with pytest.raises(ic.IntercomError) as exc:
+        ic.transcribe(app, np.zeros(16000, dtype=np.float32))
+    assert exc.value.kind == "looping"
+    assert exc.value.text == ic.NOTHING_HEARD_LINE
+
+
 def test_an_app_without_the_decode_seam_fails_cleanly():
     with pytest.raises(ic.IntercomError):
         ic.transcribe(SimpleNamespace(), np.zeros(16000, dtype=np.float32))
