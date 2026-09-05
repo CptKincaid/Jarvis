@@ -66,6 +66,11 @@ SENT_LINE = "Sent to {who}, sir."
 DROPPED_LINE = "Very good, sir; nothing sent."
 SELF_LINE = ("That draft is to {who}, sir, not to you. Yes to send it there, "
              "no to drop it.")
+# A pronoun of the OTHER gender after a read-back (Hunter's 19:00 ruling,
+# 09-04): "send it to him" with Heather pending is not her, so it is not a
+# confirmation. The re-ask names the pending person and the pronoun that
+# IS theirs, so the yes he gives next is to a sentence he has just heard.
+GENDER_LINE = "The draft is to {who}, sir. Send it to {pron}?"
 UNSURE_LINE = ("I'd rather be certain, sir — say yes and I'll send it, "
                "or no and I'll let it go.")
 CHANGED_LINE = ("That file has changed since I read it back, sir; "
@@ -73,6 +78,10 @@ CHANGED_LINE = ("That file has changed since I read it back, sir; "
 GONE_LINE = "That file has gone, sir; nothing was sent."
 EMPTY_LINE = "{what} is empty, sir; there'd be nothing to attach."
 NO_RECIPIENT_LINE = "I've no address for {who}, sir. What is it?"
+# An address he SAID that the parser cannot read whole -- "heather tilde
+# smith at example dot com" (round 4, 09-05). Said back as heard and asked
+# for again; never cut to the part after the word it did not know.
+HEARD_LINE = "I heard {heard}, sir — I can't make an address of that. What is it?"
 WHO_LINE = "Who should I send it to, sir?"
 WHICH_FILE_LINE = "Which file, sir?"
 # The answers to the two questions above, when they miss (F21). One re-ask
@@ -118,6 +127,17 @@ class Draft:
     # answer to come back the same way, the rule _try_briefing_offer
     # already applies to a question that is entirely reversible.
     asked_from: str = "voice"
+    # THE ONE SEAM for the recipient's gender (Hunter's 19:00 ruling,
+    # 09-04): "f" / "m" / None. None by default -- and None means either
+    # pronoun confirms, exactly as before the ruling. Filled by whoever
+    # KNOWS, from an explicit source only: a stored honorific on the person
+    # or on a book row (prepare -> recipient_gender), or a pronoun Hunter
+    # himself used about the person earlier in the same draft conversation
+    # ("her address is dana at ..." -> commander's address answer). Never
+    # from the name: nothing in this file guesses a gender from "Heather".
+    # The address-book branch fills it from its rows later without touching
+    # the confirmation grammar, which reads only this field.
+    to_gender: Optional[str] = None
 
     @property
     def account_label(self) -> str:
@@ -196,6 +216,35 @@ def spoken_address(addr: str) -> str:
                 .replace("_", " underscore ").replace("-", " dash "))
 
 
+def spoken_who(who: str) -> str:
+    """A recipient as he said it, fit to be said back: an address, or the
+    half of one ("heather@example", "heather@"), is spoken; a name --
+    "Mary-Jane" included -- is left alone. Attack 2 (round 4): the
+    no-address line echoed a typed half-address with its "@" in it."""
+    w = " ".join(str(who or "").split())
+    return spoken_address(w).strip() if "@" in w else w
+
+
+def pronoun_for(gender: Optional[str]) -> str:
+    """"her" / "him" for a known gender, "them" for none."""
+    return {"f": "her", "m": "him"}.get(str(gender or "").lower(), "them")
+
+
+def mask_addresses(text: str) -> str:
+    """The sentence with every address in it masked, typed or spoken, for
+    a log line. "yes, to dana@example.com" -> "yes, to d…@example.com";
+    "dana at example dot com" -> "… at example dot com". The address-book
+    review (09-04) found the commander's INFO lines carrying a typed
+    address whole; the log is read by more eyes than the mailbox is."""
+    t = str(text or "")
+    if not t:
+        return t
+    t = _ADDR_RX.sub(lambda m: mail_mod._mask_address(m.group(0).rstrip(".,;:"))
+                     + m.group(0)[len(m.group(0).rstrip(".,;:")):], t)
+    t = _SPOKEN_ADDR_RX.sub(lambda m: "… at " + m.group(2), t)
+    return t
+
+
 def account_words(account: dict) -> str:
     """"your school account"."""
     label = mail_mod.account_label(account)
@@ -217,6 +266,13 @@ def read_back(draft: Draft) -> str:
     return (f"{spoken_name(draft.path)}, {spoken_size(draft.size)}, "
             f"to {_to_words(draft)}, from {account_words(draft.account)}. "
             f"Send it, sir?")
+
+
+def gender_line(draft: Draft) -> str:
+    """The re-ask for a pronoun that is not the pending person's (Hunter's
+    19:00 ruling): names them, and the pronoun that is theirs."""
+    who = draft.to_name or spoken_address(draft.to_addr)
+    return GENDER_LINE.format(who=who, pron=pronoun_for(getattr(draft, "to_gender", None)))
 
 
 def unsure_line(draft: Draft) -> str:
@@ -271,30 +327,208 @@ def refusal_line(match, said: str = "", cap_mb: float = MAX_ATTACHMENT_MB) -> st
 # peyrovi@tamu.edu -- a DIFFERENT, possibly real address, and the one class
 # of mistake the read-back is least likely to catch, because it sounds
 # almost right.
+#
+# Round 4 (09-05) found the same mistake one joiner over: "dot" was the
+# only spoken joiner the parser knew, so "heather underscore smith at
+# example dot com" matched from "smith" and the file went to
+# smith@example.com -- and spoken_address() itself says "_" as
+# "underscore", so Jarvis's OWN read-back of heather_smith@... said back
+# to it word for word went to a stranger. Every joiner the speaker speaks
+# is read here, and a local part with a word in it that is NOT read is
+# never cut to its tail: address_span refuses it and unresolved_address
+# hands it back as heard, for the re-ask.
+_SPOKEN_JOINERS = {"dot": ".", "period": ".", "fullstop": ".",
+                   "underscore": "_", "dash": "-", "hyphen": "-"}
+_LOCAL_JOINER = r"(?:dot|period|full\s+stop|under\s*score|dash|hyphen)"
+_DOMAIN_DOT = r"(?:dot|period|full\s+stop)"
+_DOMAIN_DASH = r"(?:dash|hyphen)"
+_LOCAL_LABEL = r"[A-Za-z0-9][\w+\-]*"
+_DOMAIN_LABEL = r"[A-Za-z0-9][\w\-]*"
 _SPOKEN_ADDR_RX = re.compile(
-    r"\b([A-Za-z0-9][\w+\-]*(?:\s+dot\s+[A-Za-z0-9][\w+\-]*)*)"
+    r"\b(" + _LOCAL_LABEL + r"(?:\s+" + _LOCAL_JOINER + r"\s+" + _LOCAL_LABEL + r")*)"
     r"\s+at\s+"
-    r"([A-Za-z0-9][\w\-]*(?:\s+dot\s+[A-Za-z0-9][\w\-]*)+)", re.I)
-_DOT_RX = re.compile(r"\s+dot\s+", re.I)
+    r"(" + _DOMAIN_LABEL + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*"
+    r"(?:\s+" + _DOMAIN_DOT + r"\s+" + _DOMAIN_LABEL
+    + r"(?:\s+" + _DOMAIN_DASH + r"\s+" + _DOMAIN_LABEL + r")*)+)", re.I)
+_JOINER_RX = re.compile(
+    r"\s+(dot|period|full\s+stop|under\s*score|dash|hyphen)\s+", re.I)
+# Words that name a character an address cannot carry, or one this parser
+# does not read -- and "plus": it IS a character an address can carry, but
+# it is also the second-recipient connector ("send it to her, plus Dana"),
+# and read as "+" it makes one address out of two people. A local part
+# with any of these in it is handed back as heard, never resolved.
+_SPOKEN_SYMBOLS = frozenset((
+    "plus", "minus", "point", "tilde", "squiggle", "apostrophe", "slash",
+    "backslash", "star", "asterisk", "hash", "hashtag", "pound", "ampersand",
+    "percent", "equals", "colon", "semicolon", "comma", "space", "caret",
+    "pipe", "bang", "exclamation", "quote", "quotes", "bracket", "brace",
+    "paren", "parenthesis", "dollar", "sign"))
 _ADDR_RX = re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+")
+# What may stand directly in front of a TYPED address: a space, a bracket,
+# a quote, "mailto:", a comma. Anything else ("heather~smith@example.com")
+# is a character the address cannot carry, and the match is its tail.
+_ADDR_LEAD_OK = frozenset(" \t\n\r<([{\"':;,=>")
 
 
-def parse_address(text: str) -> str:
-    """An email address out of spoken or written text, or ""."""
+def _joined(m: "re.Match") -> str:
+    word = re.sub(r"\s+", "", m.group(1).lower())
+    return _SPOKEN_JOINERS.get(word, "_" if word == "underscore" else ".")
+
+
+def _spoken_lead(raw: str, start: int) -> Optional[int]:
+    """Where a spoken local part REALLY starts when the parser's match at
+    ``start`` has ``<word> <symbol word>`` in front of it -- the start of
+    the earliest such pair -- or None when the match stands on its own."""
+    at = None
+    pre = raw[:start]
+    while True:
+        m = re.search(r"(\S+)\s+(\S+)\s+$", pre)
+        if not m or m.group(2).lower().strip(",.") not in _SPOKEN_SYMBOLS:
+            return at
+        if not re.fullmatch(_LOCAL_LABEL, m.group(1)):
+            return at
+        at = m.start(1)
+        pre = raw[:at]
+
+
+def _typed_lead(raw: str, start: int) -> Optional[int]:
+    """The start of the word a typed address match at ``start`` is the
+    tail of, when the character in front of it is one an address cannot
+    carry; None when the match stands on its own."""
+    if start == 0 or raw[start - 1] in _ADDR_LEAD_OK:
+        return None
+    j = start
+    while j > 0 and not raw[j - 1].isspace():
+        j -= 1
+    return j
+
+
+def address_span(text: str) -> Optional[tuple]:
+    """(address, start, end) of the first address in the text, typed or
+    spoken, or None. The span is in the text AS GIVEN (no whitespace
+    normalising), so a caller can cut the address out of the sentence --
+    which is how the commander's fold keeps its hands off one.
+
+    A match that is only the TAIL of what he said (a joiner word the
+    parser does not read in front of it, a character an address cannot
+    carry) is no address at all: None, and unresolved_address says what
+    was heard."""
+    raw = str(text or "")
+    if not raw.strip():
+        return None
+    m = _ADDR_RX.search(raw)
+    if m:
+        if _typed_lead(raw, m.start()) is not None:
+            return None
+        addr = m.group(0).rstrip(".,;:")
+        return addr, m.start(), m.start() + len(addr)
+    m = _SPOKEN_ADDR_RX.search(raw)
+    if m:
+        if _spoken_lead(raw, m.start()) is not None:
+            return None
+        local = _JOINER_RX.sub(_joined, " ".join(m.group(1).split())).strip()
+        domain = _JOINER_RX.sub(_joined, " ".join(m.group(2).split())).strip()
+        addr = f"{local}@{domain}".replace(" ", "")
+        if re.fullmatch(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+", addr):
+            return addr, m.start(), m.end()
+    return None
+
+
+def unresolved_address(text: str) -> str:
+    """The address he SAID, when it has an address's shape and a local
+    part this parser cannot read whole -- "heather tilde smith at example
+    dot com", "heather~smith@example.com" -- as words fit to be said back
+    (never an "@" in it), or "" when there is no such thing."""
     raw = " ".join(str(text or "").split())
     if not raw:
         return ""
     m = _ADDR_RX.search(raw)
     if m:
-        return m.group(0).strip(".,;:")
+        lead = _typed_lead(raw, m.start())
+        if lead is None:
+            return ""
+        return spoken_address(raw[lead:m.end()].rstrip(".,;:")).strip()
     m = _SPOKEN_ADDR_RX.search(raw)
     if m:
-        local = _DOT_RX.sub(".", m.group(1)).strip()
-        domain = _DOT_RX.sub(".", m.group(2)).strip()
-        addr = f"{local}@{domain}".replace(" ", "")
-        if re.fullmatch(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+", addr):
-            return addr
+        lead = _spoken_lead(raw, m.start())
+        if lead is not None:
+            return raw[lead:m.end()]
     return ""
+
+
+def parse_address(text: str) -> str:
+    """An email address out of spoken or written text, or ""."""
+    span = address_span(" ".join(str(text or "").split()))
+    return span[0] if span else ""
+
+
+# ---- gender, from an EXPLICIT source only (Hunter's 19:00 ruling) -------
+# A stored honorific on the person or a book row, or a pronoun he himself
+# used about the person. No name-based guessing: "Heather" says nothing.
+_HONORIFIC_RX = re.compile(
+    r"^(?P<h>mr|mister|mrs|missus|ms|miss|madam|ma'am|sir|dame|lady|lord)\b\.?\s*",
+    re.I)
+_MALE_HONORIFICS = frozenset(("mr", "mister", "sir", "lord"))
+_FEMALE_HONORIFICS = frozenset(("mrs", "missus", "ms", "miss", "madam", "ma'am",
+                                "dame", "lady"))
+_GENDER_WORDS = {"f": "f", "female": "f", "woman": "f", "she": "f", "her": "f",
+                 "m": "m", "male": "m", "man": "m", "he": "m", "him": "m"}
+_SHE_RX = re.compile(r"\b(?:she|her|hers|herself)\b", re.I)
+_HE_RX = re.compile(r"\b(?:he|him|his|himself)\b", re.I)
+
+
+def strip_honorific(text: str) -> str:
+    """"Mrs Jones" -> "Jones"; "Heather" -> "Heather"."""
+    t = " ".join(str(text or "").split())
+    return _HONORIFIC_RX.sub("", t, count=1).strip()
+
+
+def gender_from_honorific(text) -> Optional[str]:
+    """"Mrs Jones" -> "f", "Mr Jones" -> "m"; "Dr Jones" and a bare name ->
+    None. A stored gender VALUE ("f", "female", "she", "m", "male", "he")
+    is read the same way, so a people-book field can hold either."""
+    t = " ".join(str(text or "").split()).strip(" .,")
+    if not t:
+        return None
+    hit = _GENDER_WORDS.get(t.lower())
+    if hit:
+        return hit
+    m = _HONORIFIC_RX.match(t)
+    if not m:
+        return None
+    h = m.group("h").lower()
+    if h in _MALE_HONORIFICS:
+        return "m"
+    if h in _FEMALE_HONORIFICS:
+        return "f"
+    return None
+
+
+def gender_from_pronouns(text) -> Optional[str]:
+    """The gender of the ONE pronoun a sentence uses about somebody:
+    "her address is ..." -> "f"; "he's at ..." -> "m"; none, or both
+    ("her and his") -> None."""
+    t = str(text or "")
+    she, he = _SHE_RX.search(t), _HE_RX.search(t)
+    if she and not he:
+        return "f"
+    if he and not she:
+        return "m"
+    return None
+
+
+def _book_row(book: dict, key: str) -> Optional[tuple]:
+    """(address, the row's key) for a name, looking THROUGH a stored
+    honorific either way: "heather" finds the row "ms heather", and "Mrs
+    Jones" finds the row "jones"."""
+    low = key.lower()
+    if low in book:
+        return book[low], low
+    bare = strip_honorific(low)
+    for k, addr in book.items():
+        if strip_honorific(k) == bare and bare:
+            return addr, k
+    return None
 
 
 def names_a_real_file(cfg, file_query: str, search_roots=None,
@@ -350,9 +584,9 @@ def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
         return said, ""
     key = re.sub(r"^(?:my|our|the)\s+", "", raw, flags=re.I).strip()
     book = contacts(cfg)
-    hit = book.get(key.lower()) or book.get(raw.lower())
-    if hit:
-        return hit, key
+    row = _book_row(book, key) or _book_row(book, raw)
+    if row:
+        return row[0], key
     resolve = getattr(memory, "resolve_person", None) if memory is not None else None
     if callable(resolve):
         person = None
@@ -369,6 +603,40 @@ def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
             name = str(person.get("name") or key)
             return (addr, name) if addr else ("", name)
     return "", key
+
+
+def recipient_gender(cfg, memory, who: str) -> Optional[str]:
+    """The recipient's gender from an EXPLICIT source, or None: an
+    honorific he said ("Mrs Jones"), an honorific on the book row that
+    resolved the name ("mr jones" for "Jones"), or the people book's own
+    honorific / title / gender field. An address says nothing, and so does
+    a bare name."""
+    raw = " ".join(str(who or "").split()).strip(" .,;:?!")
+    if not raw or parse_address(raw):
+        return None
+    key = re.sub(r"^(?:my|our|the)\s+", "", raw, flags=re.I).strip()
+    hit = gender_from_honorific(key)
+    if hit:
+        return hit
+    row = _book_row(contacts(cfg), key) or _book_row(contacts(cfg), raw)
+    if row:
+        hit = gender_from_honorific(row[1])
+        if hit:
+            return hit
+    resolve = getattr(memory, "resolve_person", None) if memory is not None else None
+    if callable(resolve):
+        for probe in (raw, key):
+            try:
+                person = resolve(probe)
+            except Exception:                          # noqa: BLE001 - store
+                person = None
+            if isinstance(person, dict):
+                for field_name in ("gender", "honorific", "title", "name"):
+                    hit = gender_from_honorific(person.get(field_name) or "")
+                    if hit:
+                        return hit
+                break
+    return None
 
 
 # ------------------------------------------------------------- config
@@ -458,7 +726,11 @@ def prepare(cfg, memory, file_query: str, recipient: str,
 
     addr, who = resolve_recipient(cfg, memory, recipient)
     if not addr:
-        line = NO_RECIPIENT_LINE.format(who=who) if who else WHO_LINE
+        heard = unresolved_address(recipient)
+        if heard:
+            line = HEARD_LINE.format(heard=heard)
+        else:
+            line = NO_RECIPIENT_LINE.format(who=spoken_who(who)) if who else WHO_LINE
         return Prepared(ask=line, status="No address")
 
     account, why = mail_mod.choose_account(
@@ -490,7 +762,8 @@ def prepare(cfg, memory, file_query: str, recipient: str,
                   to_addr=addr, to_name=who, account=account,
                   subject=subject.strip() or default_subject(match.path),
                   body=str(_cfg_get(cfg, "send_file.body", "") or DEFAULT_BODY),
-                  made_at=time.monotonic(), roots=kept)
+                  made_at=time.monotonic(), roots=kept,
+                  to_gender=recipient_gender(cfg, memory, recipient))
     log.info("outbox: drafted %s (%d bytes) to %s from %s", match.path.name,
              match.size, mail_mod._mask_address(addr),
              mail_mod.account_label(account))

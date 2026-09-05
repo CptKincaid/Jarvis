@@ -246,6 +246,13 @@ def transcribe(app, audio, verify: bool = False) -> str:
     text = (getattr(result, "text", "") or "").strip()
     if not text:
         raise IntercomError(NOTHING_HEARD_LINE, "empty")
+    # A repetition loop or a prompt echo is not a doubtful transcript of
+    # something he said, it is Whisper running away; the microphone path
+    # never dispatches one (app._process_audio, reason "looping") and the
+    # phone must not either -- there is no intent gate on this source.
+    if getattr(result, "looping", False):
+        log.info("intercom: repetition loop or prompt echo, not dispatched")
+        raise IntercomError(NOTHING_HEARD_LINE, "looping")
     # Low confidence is NOT fatal here: the microphone path can ask him to
     # say it again, but a phone clip is already sent and re-recording it is
     # the user's own choice, so the best transcript is dispatched and the
