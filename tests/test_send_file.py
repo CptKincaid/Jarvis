@@ -2880,7 +2880,9 @@ def test_the_confirm_paths_log_no_address(cmd, caplog):
 
 def test_mask_addresses():
     assert outbox.mask_addresses("yes, to dana@example.com now") == "yes, to d…@example.com now"
-    assert outbox.mask_addresses("to dana at example dot com") == "to … at example dot com"
+    # The address-book lane's mask (the superset) keeps the first letter,
+    # as mail._mask_address does for a typed one.
+    assert outbox.mask_addresses("to dana at example dot com") == "to d… at example dot com"
     assert outbox.mask_addresses("send it to her") == "send it to her"
 
 
