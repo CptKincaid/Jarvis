@@ -58,9 +58,17 @@ import sys
 import time
 from collections import Counter
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Callable, Optional
 
-from jarvis.config import CONFIG
+# Run as a script from anywhere: `~/vss_env/bin/python scripts/filler_probe.py`
+# has no repo root on sys.path, so `import jarvis` raised ModuleNotFoundError
+# and the instrument could not be run at all -- the same line every other
+# script here already carries (scripts/jarvis_people.py:36,
+# scripts/jarvis_contacts.py:40, scripts/ui_shots.py:120).
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from jarvis.config import CONFIG  # noqa: E402 - after the sys.path line above
 from jarvis.endpoint import trailing_filler
 from jarvis.events import RecordingStopped, bus
 from jarvis.recorder import FILLER_SLACK_S, SAMPLE_RATE

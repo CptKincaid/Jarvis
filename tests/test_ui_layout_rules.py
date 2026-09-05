@@ -152,14 +152,21 @@ def test_slider_snaps_to_the_resolution_and_clamps_to_the_range():
 
 
 def test_holo_slider_rows_fit_the_drawer_with_the_value_inline():
-    """MEASURED 2026-09-05 on :94 at S=2: the widest slider label
-    ('Silence timeout (s)') is 310 px and the drawer's inner width 576.
+    """MEASURED 2026-09-05 on :93 at S=2: the widest slider label
+    ('Silence timeout (s)') is 318 px and the drawer's inner width 576.
     The value sits INLINE at the row's right now, so the track, the two
     gaps and a fixed-width value must fit beside that label. The value box
-    is 5 characters ('0.015' is the widest the drawer shows), 70 px in the
-    caption mono face."""
+    is 5 characters ('0.015' is the widest the drawer shows), 74 px in the
+    caption mono face.
+
+    ROUND 3 (the knightfall-row lane): these two numbers were written down
+    as 310 and 70, which is 12 px of budget that did not exist -- the row
+    really asked for 584 of 576 and the TRACK was squeezed to 156 px. They
+    are the widths the widgets actually render, and the widgets themselves
+    are measured in test_no_drawer_row_asks_for_more_width_than_its_slot,
+    so arithmetic on a mistyped constant cannot pass alone again."""
     from jarvis.ui.views import SettingsDrawer
-    label_w, inner, value_w = 310, 576, 70
+    label_w, inner, value_w = 318, 576, 74
     row = (2 * SettingsDrawer.SLIDER_GAP_HOLO
            + 2 * SettingsDrawer.SLIDER_LEN_HOLO
            + 2 * SettingsDrawer.SLIDER_VALUE_GAP_HOLO + value_w)
@@ -637,11 +644,20 @@ def test_the_band_editor_rows_share_one_baseline(root):
     assert len(units) == 1, units
 
 
-def _build_drawer(root, look: str):
+# The two window sizes this file measures the drawer at. HIS is the app's
+# own default (main_window.DEFAULT_W/H at S=2) and the one he runs; the RIG
+# size is what both the knightfall and the ui-polish reviews rendered at.
+RIG_WINDOW = (STAGE_W, 1440)
+HIS_WINDOW = (1040, 1760)
+
+
+def _build_drawer(root, look: str, size=None):
     import tkinter as tk
     from jarvis.ui import views
     theme.select_look(look)
-    host = tk.Frame(root, width=STAGE_W, height=1440)
+    w, h = size or RIG_WINDOW
+    root.geometry("%dx%d+0+0" % (w, h))
+    host = tk.Frame(root, width=w, height=h)
     host.pack_propagate(False)
     host.pack()
     drawer = views.SettingsDrawer(host, services=None)
@@ -923,3 +939,130 @@ def test_the_rows_keep_one_vertical_rhythm(root):
     assert heights
     assert max(heights) - min(heights) <= wg.px(14), (min(heights),
                                                       max(heights))
+
+
+# ------------------------------------------- no row overruns its slot
+# THE BUG THIS PAIR EXISTS FOR (Hunter, 2026-09-05 12:20, on the merged
+# tip): "the knightfall text doesnt fit in its slot". MEASURED on :93 at
+# S=2, in BOTH window sizes, because the drawer is a fixed 640 px column
+# whatever the window is: the "Knightfall code" row asked for 676 px of a
+# 576 px slot -- 100 px over -- and Tk paid for it by squeezing the Open
+# button from its natural 125 px to 25 px, so the word was drawn into a
+# sliver beside the label; the button under it asked for 578 and had its
+# ring clipped at 576.
+#
+# WHY NEITHER LANE SAW IT, and why this is a rule and not a one-row fix:
+# the drawer holds 3747 px of content in a 1649 px view at his window, so
+# the Privacy rows sit 1317 px below the fold and the photo rig (frame
+# 14-settings) never scrolls down to them. A row can therefore be added,
+# rendered, reviewed and merged with its text hanging out of the slot and
+# nobody's eye on it. These two tests are the eye.
+@pytest.mark.parametrize("size", [RIG_WINDOW, HIS_WINDOW],
+                         ids=["920x1440", "1040x1760"])
+def test_no_drawer_row_asks_for_more_width_than_its_slot(root, size):
+    """The row's REQUESTED width is what its children and their pads add
+    up to; the slot is the width the section box gives it. Asking for more
+    is the defect -- Tk does not wrap a row, it shrinks a child."""
+    drawer = _build_drawer(root, "holo", size=size)
+    over = [(r.winfo_reqwidth(), r.winfo_width(),
+             [k.cget("text") for k in r.winfo_children()
+              if k.winfo_class() == "Label"])
+            for r in _rows_of(drawer)
+            if r.winfo_reqwidth() > r.winfo_width()]
+    assert over == [], over
+
+
+@pytest.mark.parametrize("size", [RIG_WINDOW, HIS_WINDOW],
+                         ids=["920x1440", "1040x1760"])
+def test_no_control_in_the_drawer_is_squeezed_below_its_natural_width(root,
+                                                                     size):
+    """The row-level rule again, per widget, because that is what he SAW:
+    a button 100 px narrower than the word inside it draws a sliver."""
+    drawer = _build_drawer(root, "holo", size=size)
+    squeezed = []
+    for row in _rows_of(drawer):
+        for kid in row.winfo_children():
+            if kid.winfo_width() < kid.winfo_reqwidth():
+                squeezed.append((getattr(kid, "_text", kid.winfo_class()),
+                                 kid.winfo_width(), kid.winfo_reqwidth()))
+    assert squeezed == [], squeezed
+
+
+def test_the_knightfall_row_shows_a_whole_code_and_a_whole_button(root):
+    """The row he named, pinned by its own numbers: the masked box is wide
+    enough for a whole code, the Open button is the rightmost thing on the
+    row (so its ring lands on the control column), and the label, the box
+    and the button together leave the slot room to spare."""
+    from jarvis import passphrase as pp
+    from jarvis.ui.views import SettingsDrawer
+    drawer = _build_drawer(root, "holo", size=HIS_WINDOW)
+    entry = drawer._knightfall_entry
+    open_btn = drawer._knightfall_open
+    row = entry.master
+    label = [k for k in row.winfo_children() if k.winfo_class() == "Label"][0]
+    # a whole eight-character code, masked, inside the box
+    import tkinter.font as tkfont
+    dots = tkfont.Font(font=entry.cget("font")).measure("•" * pp.NEW_CODE_LEN)
+    assert dots <= entry.winfo_width(), (dots, entry.winfo_width())
+    assert SettingsDrawer.KNIGHTFALL_CHARS >= pp.NEW_CODE_LEN
+    # the button is whole, and it is the row's right edge
+    assert open_btn.winfo_width() >= open_btn.winfo_reqwidth()
+    assert open_btn.winfo_x() + open_btn.winfo_width() == row.winfo_width()
+    assert open_btn.winfo_x() >= entry.winfo_x() + entry.winfo_width()
+    # ...and the three of them fit with room left
+    used = (label.winfo_reqwidth() + entry.winfo_reqwidth()
+            + open_btn.winfo_reqwidth())
+    assert used <= row.winfo_width() - 2 * theme.PAD_S, used
+
+
+# ----------------------------------------- the lines the drawer toasts
+# The other half of "doesnt fit in its slot", MEASURED the same day: the
+# line that came back from "Email me a new Knightfall code" was 1541 px of
+# text in an 894 px strip at his window, so widgets.ellipsize cut it to
+# "...nobody is enrolled as an owner yet (scri…". The strip is ONE line by
+# design (widgets.Toast.STRIP_H), so a line the drawer can show has to be
+# written to fit it.
+def _toast_budget(root, width: int) -> int:
+    """The px widgets.Toast.draw() leaves for text in a strip `width` wide."""
+    import tkinter as tk
+    host = tk.Frame(root, bg=theme.BG, width=width, height=200)
+    host.pack_propagate(False)
+    host.pack()
+    anchor = tk.Frame(host, bg=theme.BG, height=wg.px(20))
+    anchor.pack(side="bottom", fill="x")
+    toast = wg.Toast(host)
+    toast.dock(host, before=anchor)
+    toast.show("x", kind="info", ms=100000)
+    root.update_idletasks()
+    root.update()
+    strip = toast._frame
+    item = [i for i in strip.find_all() if strip.type(i) == "text"][0]
+    x1 = strip.winfo_width() - theme.PAD
+    budget = x1 - wg.px(12) - strip.coords(item)[0]
+    toast.hide()
+    host.destroy()
+    return int(budget)
+
+
+@pytest.mark.parametrize("size", [RIG_WINDOW, HIS_WINDOW],
+                         ids=["920x1440", "1040x1760"])
+def test_the_knightfall_lines_the_drawer_toasts_fit_the_strip(root, size):
+    """Every line a press on either Knightfall control can put on screen in
+    the ordinary course -- not wired, refused, accepted, the cooldown, and
+    the one he actually hit: nobody enrolled yet."""
+    import jarvis.app as app_mod
+    from jarvis.ui import views
+    theme.select_look("holo")
+    root.geometry("%dx%d+0+0" % size)
+    root.update_idletasks()
+    font = wg.ui_font(theme.SIZE_LABEL)
+    budget = _toast_budget(root, size[0] - 2)     # the shell's 1 px inset
+    lines = [views.KNIGHTFALL_NOT_WIRED, views.KNIGHTFALL_FAILED,
+             app_mod.KNIGHTFALL_NO_OWNER_LINE, app_mod.KNIGHTFALL_COOLDOWN_LINE,
+             app_mod.KNIGHTFALL_NEW_OK_LINE]
+    too_long = [(line, wg.measure(font, line)) for line in lines
+                if wg.measure(font, line) > budget]
+    assert too_long == [], (budget, too_long)
+    # and the ellipsizer agrees: nothing is cut
+    for line in lines:
+        assert wg.ellipsize(line, font, budget) == line

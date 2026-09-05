@@ -546,6 +546,21 @@ class RoundButton(tk.Canvas):
     BARGRAD_SLICE = False      # redraws with delete("all"); small + on the
                                # flat part of the bar ground anyway
 
+    def set_kind(self, kind: str) -> None:
+        """Change the button's kind after it was built, e.g. to mark the one
+        chip in a row that is currently chosen.
+
+        The colours are resolved through ``_kinds()`` AT CALL TIME, never
+        captured, so a button whose kind changes after a look switch takes
+        the new look's palette (tests/test_theme_look.py fails on def-time
+        capture). The SIZE does not change: the width was measured from the
+        text when the button was built, and a kind is a colour, not a word.
+        """
+        kinds = self._kinds()
+        self._kind = kind
+        self._spec = dict(kinds.get(kind, kinds["default"]))
+        self._draw()
+
     @staticmethod
     def _kinds() -> dict:
         """Kind → colours, built per call (a class-body dict froze the
@@ -590,6 +605,7 @@ class RoundButton(tk.Canvas):
         super().__init__(parent, width=self._btn_w, height=self._btn_h, bg=bg,
                          highlightthickness=1, bd=0, takefocus=1, cursor="hand2")
         _focus_ring(self, bg)
+        self._kind = kind
         kinds = self._kinds()
         self._spec = dict(kinds.get(kind, kinds["default"]))
         self._text = text

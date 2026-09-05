@@ -169,6 +169,37 @@ def _reset_brain_calibration():
         brain._CALIBRATION.update(factor=brain.CALIBRATION_INITIAL, samples=0)
 
 
+@pytest.fixture(autouse=True)
+def _config_defaults_not_his_settings():
+    """A test asserts against the SHIPPED default, never against whatever
+    is in his ~/.aiws_trainer/voice_settings.json today.
+
+    2026-09-05: he turned CONFIG.filler_prompt_hint on -- a real, correct
+    change to his own box, made because the probe measured that the filler
+    hold does nothing without it. Four tests in tests/test_transcriber_prompt.py
+    and tests/test_prompt_echo.py then went red on a green tree, asserting
+    prompts of "Peyrovi, BIOSENSORS" against the live "Peyrovi, BIOSENSORS
+    Um, uh, hmm, er.". Nothing was broken; the tests were reading his
+    settings. That is the same fault as a test that reads the wall clock,
+    and it makes the suite unusable as a merge gate for anyone whose
+    machine is configured differently from the author's.
+
+    Only fields listed here are pinned, and each is pinned to the dataclass
+    default rather than a literal, so the pin tracks the code. A test that
+    WANTS another value still monkeypatches it and wins -- 13 already do.
+    """
+    from dataclasses import fields as _fields
+    from jarvis.config import CONFIG, Config
+    pinned = ("filler_prompt_hint",)
+    defaults = {f.name: f.default for f in _fields(Config) if f.name in pinned}
+    before = {k: getattr(CONFIG, k) for k in defaults}
+    for k, v in defaults.items():
+        setattr(CONFIG, k, v)
+    yield
+    for k, v in before.items():
+        setattr(CONFIG, k, v)
+
+
 # ---------------------------------------------------------------------------
 # THE DESKTOP FIREWALL (2026-09-04, 17:21)
 # ---------------------------------------------------------------------------
