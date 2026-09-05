@@ -601,11 +601,19 @@ def test_tool_spec_and_unconfigured_excuse(tmp_path, monkeypatch):
     # add_event joined get_calendar 2026-08-28 (calendar writing)
     assert sorted(s.name for s in specs) == ["add_event", "get_calendar"]
     assert all(len(sp.description.split()) <= 20 for sp in specs)
-    enum = specs[0].parameters["properties"]["range"]["enum"]
-    assert enum[:4] == ["today", "tomorrow", "week", "next"]
-    # weekday names joined the enum 2026-08-28 so "agenda for Monday" can be
-    # asked for directly instead of degrading to "next" (one event).
-    assert "monday" in enum and "sunday" in enum
+    rng = specs[0].parameters["properties"]["range"]
+    # The enum LEFT on 2026-09-05. Weekday names joined it 2026-08-28 so
+    # "agenda for Monday" could be asked for directly instead of degrading
+    # to "next" (one event) -- but an enum of eleven words also made an
+    # explicit DATE impossible for the model to express, which was half of
+    # the specific-date bug he reported that morning. The eleven still work
+    # (coerce_range, not the schema, is what decides), a date works now too,
+    # and the parameter description carries the menu instead.
+    assert "enum" not in rng
+    assert "2026-09-12" in rng["description"]
+    for word in ("today", "tomorrow", "week", "next", "monday", "sunday"):
+        assert calendar.coerce_range(word, NOW) == word
+    assert calendar.coerce_range("september 12th", NOW) == "2026-09-12"
     reg, _ = tool_registry(tmp_path, FakeCfg(), monkeypatch)
     r = reg.call("get_calendar", {"range": "today"})
     assert not r.ok and r.text == \

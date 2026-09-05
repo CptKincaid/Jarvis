@@ -356,13 +356,254 @@ _TOMORROW_RX = re.compile(
     r"tmws|tmw|tmoro|tmoros)\b", re.I)
 
 
-def coerce_range(value) -> str:
-    """Loose model values -> one of RANGES ("this week" -> "week")."""
-    text = _clean(value).lower().strip(" .?!")
-    if not text:
-        return "today"
+# ------------------------------------------------------- explicit dates
+#
+# HIS REPORT 2026-09-05: "I just tried to have Jarvis tell me about a
+# specific calendar date and he didn't get it."  coerce_range understood
+# ELEVEN values -- today, tomorrow, week, next and the seven weekday names
+# -- and ended in a bare ``return today``, so every explicit date became
+# TODAY in silence.  Measured before the fix, exactly as printed:
+#
+#     "what do i have on september 12th"         -> today
+#     "anything on the 12th"                     -> today
+#     "what about october 3rd"                   -> today
+#     "what is on my calendar on the 20th"       -> today
+#     "do i have anything on sept 12"            -> today
+#     "what do i have on 9/12"                   -> today
+#     "what about the 15th of october"           -> today
+#     "anything on friday the 20th"              -> friday   (the NEXT Friday)
+#
+# He was not merely unanswered: he was answered CONFIDENTLY ABOUT THE WRONG
+# DAY, and the last of those is the sharpest case because it looks handled.
+#
+# A date is carried as an ISO "YYYY-MM-DD" range string.  Both doors coerce
+# -- the forced path through commander.calendar_range and again in
+# get_calendar, the model path once -- so an ISO date has to be a FIXED
+# POINT of this function, and it is (tests pin the second pass).  What
+# cannot be read comes back as ASK_PREFIX + the question to put; nothing
+# unreadable is turned into today ever again.
+ASK_PREFIX = "ask:"
+_ISO_DATE_RX = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+_MONTHS = {"january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3,
+           "mar": 3, "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6,
+           "july": 7, "jul": 7, "august": 8, "aug": 8, "september": 9,
+           "sept": 9, "sep": 9, "october": 10, "oct": 10, "november": 11,
+           "nov": 11, "december": 12, "dec": 12}
+# Longest first so "sept" is not eaten as "sep"; the trailing (?:\.|\b)
+# accepts "sept." AND keeps "may" out of "maybe" -- a bare [a-z]* suffix
+# matched "maybe 3 things" as the 3rd of May.
+_MONTH_ALT = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_MONTH = rf"(?P<mon>{_MONTH_ALT})(?:\.|\b)"
+_ORD = r"(?:st|nd|rd|th)"
+_YEAR = r"(?:,?\s+(?P<y>\d{4}))?"
+_D_ISO_RX = re.compile(r"\b(?P<y>\d{4})-(?P<m>\d{1,2})-(?P<d>\d{1,2})\b")
+_D_MD_RX = re.compile(rf"\b{_MONTH}\s+(?P<d>\d{{1,2}}){_ORD}?{_YEAR}", re.I)
+_D_DM_RX = re.compile(
+    rf"\b(?:the\s+)?(?P<d>\d{{1,2}}){_ORD}?\s+(?:of\s+)?{_MONTH}{_YEAR}", re.I)
+# Month-first, because he is in Texas.  "-" is deliberately NOT a separator:
+# "9-12" is a time range far more often than it is a date.
+_D_NUM_RX = re.compile(
+    r"\b(?P<a>\d{1,2})\s*/\s*(?P<b>\d{1,2})(?:\s*/\s*(?P<y>\d{2,4}))?\b")
+# A BARE ordinal is only a date after on / for / the, which is how all four
+# of his ordinal phrasings say it.  Without that guard "my 2nd class" and
+# "my 1st meeting" become the 2nd and the 1st of the month.
+_D_ORD_RX = re.compile(rf"\b(?:on|for|the)\s+(?:the\s+)?(?P<d>\d{{1,2}}){_ORD}\b",
+                       re.I)
+# The guard on the LAST line of coerce_range: shapes that can only be a
+# date.  A bare ordinal is deliberately absent (see _D_ORD_RX).
+_DATEISH_RX = re.compile(
+    rf"\b(?:{_MONTH_ALT})(?:\.|\b)\s*\d|\b\d{{1,2}}\s*/\s*\d{{1,2}}\b|"
+    r"\b\d{4}-\d{1,2}-\d{1,2}\b", re.I)
+# "what DID I have on the 3rd" is a different question from "what DO I
+# have on the 3rd" -- one looks back, one looks forward.
+_PAST_RX = re.compile(r"\b(?:did|was|were|had)\b", re.I)
+_YESTERDAY_RX = re.compile(r"\byesterday\b", re.I)
+# Bounded scans (house rule): the widest gap between leap days is 8 years,
+# and every day 1..31 falls in some month inside twelve.
+_YEAR_SCAN = 12
+_MONTH_SCAN = 24
+
+
+def is_ask(range) -> bool:
+    """True when coerce_range gave back a QUESTION rather than a day."""
+    return isinstance(range, str) and range.startswith(ASK_PREFIX)
+
+
+def ask_words(range) -> str:
+    """The question to put to him, or ""."""
+    return range[len(ASK_PREFIX):] if is_ask(range) else ""
+
+
+def _ask(question: str) -> str:
+    return ASK_PREFIX + question
+
+
+def as_date(range) -> Optional[date]:
+    """The day an ISO range names, or None for the word ranges and asks."""
+    if isinstance(range, str) and _ISO_DATE_RX.match(range):
+        try:
+            return date.fromisoformat(range)
+        except ValueError:                  # 2026-02-30 and friends
+            return None
+    return None
+
+
+def _month_name(month: int) -> str:
+    return date(2000, month, 1).strftime("%B")
+
+
+def _make_date(year: int, month: int, day: int) -> Optional[date]:
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _resolve_day(month, day: int, year, today: date,
+                 backward: bool) -> Optional[date]:
+    """The day he meant, or None when no real date fits those numbers.
+
+    THE YEAR RULE, decided 2026-09-05: a date with no year is the NEXT
+    occurrence at or after today, or -- when he asked in the past tense --
+    the most recent at or before it.  "January 5th" asked in September is
+    next January because it is the next one; "September 12th" asked on the
+    5th is this month for the same reason; a bare "the 3rd" past the 3rd
+    rolls to next MONTH, not next year.  29 February needs no special case
+    at all: the next one is 2028, which is what the scan finds.
+    """
+    if not 1 <= day <= 31:
+        return None
+    if month is not None and not 1 <= month <= 12:
+        return None
+    if year is not None:
+        return _make_date(year, month or today.month, day)
+    step = -1 if backward else 1
+    if month is not None:
+        for i in range(_YEAR_SCAN):
+            got = _make_date(today.year + step * i, month, day)
+            if got is not None and (got <= today if backward else got >= today):
+                return got
+        return None
+    y, m = today.year, today.month
+    for _ in range(_MONTH_SCAN):
+        got = _make_date(y, m, day)
+        if got is not None and (got <= today if backward else got >= today):
+            return got
+        m += step
+        if m > 12:
+            m, y = 1, y + 1
+        elif m < 1:
+            m, y = 12, y - 1
+    return None
+
+
+def _ask_impossible(month, day: int) -> str:
+    if month and 1 <= month <= 12 and 1 <= day <= 31:
+        return _ask(f"There's no {day}{_suffix(day)} of {_month_name(month)}, "
+                    "sir — which day did you mean?")
+    return _ask("I couldn't make that out as a date, sir — which day did you mean?")
+
+
+def _weekday_disagrees(text: str, day: date) -> Optional[str]:
+    """The question to ask when he named a weekday the date is not.
+
+    DECIDED 2026-09-05: "friday the 20th" where the 20th is a Sunday must
+    NOT quietly become either one.  The old code took the weekday and
+    answered about the next Friday -- a day he never named -- and said
+    nothing about it.  Jarvis now says which day the date really is and
+    offers both readings.
+    """
+    named = None
+    for i, word in enumerate(WEEKDAYS):
+        if re.search(rf"\b{word}\b", text, re.I):
+            named = i
+            break
+    if named is None or named == day.weekday():
+        return None
+    delta = (named - day.weekday()) % 7
+    if delta > 3:                            # the NEAREST such weekday
+        delta -= 7
+    alt = day + timedelta(days=delta)
+    actual = day.strftime("%A")
+    wanted = WEEKDAYS[named].capitalize()
+    return _ask(
+        f"The {day.day}{_suffix(day.day)} of {_month_name(day.month)} is a "
+        f"{actual}, sir, not a {wanted} — did you mean {actual} the "
+        f"{day.day}{_suffix(day.day)}, or {wanted} the "
+        f"{alt.day}{_suffix(alt.day)}?")
+
+
+def _dated(text: str, month, day: int, year, today: date, backward: bool) -> str:
+    got = _resolve_day(month, day, year, today, backward)
+    if got is None:
+        return _ask_impossible(month, day)
+    return _weekday_disagrees(text, got) or got.isoformat()
+
+
+def _explicit_date(text: str, today: date, backward: bool = False) -> Optional[str]:
+    """An ISO date, or an ASK, for anything date-shaped in ``text``; None
+    when he named no date at all.  It NEVER returns "today"."""
+    match = _D_ISO_RX.search(text)
+    if match:
+        got = _make_date(int(match.group("y")), int(match.group("m")),
+                         int(match.group("d")))
+        return got.isoformat() if got is not None else \
+            _ask_impossible(int(match.group("m")), int(match.group("d")))
+    match = _D_MD_RX.search(text) or _D_DM_RX.search(text)
+    if match:
+        year = int(match.group("y")) if match.group("y") else None
+        return _dated(text, _MONTHS[match.group("mon").rstrip(".").lower()],
+                      int(match.group("d")), year, today, backward)
+    match = _D_NUM_RX.search(text)
+    if match:
+        a, b = int(match.group("a")), int(match.group("b"))
+        raw_year = match.group("y")
+        year = None
+        if raw_year:
+            year = int(raw_year) + (2000 if len(raw_year) == 2 else 0)
+        if a > 12:
+            # AMBIGUITY, decided 2026-09-05: slashed dates are month-first
+            # because he is in Texas, so 9/12 is September 12th.  13/5
+            # cannot be month-first -- and quietly switching convention for
+            # one input is exactly the "looks handled and is not" trap that
+            # made "friday the 20th" the worst case of this bug.  Name the
+            # day-month reading and ask.
+            if 1 <= b <= 12 and 1 <= a <= 31:
+                return _ask(f"{a}/{b} isn't a date I can read month-first, sir "
+                            f"— did you mean the {a}{_suffix(a)} of "
+                            f"{_month_name(b)}?")
+            return _ask(f"I couldn't read {a}/{b} as a date, sir — which day "
+                        "did you mean?")
+        return _dated(text, a, b, year, today, backward)
+    match = _D_ORD_RX.search(text)
+    if match:
+        return _dated(text, None, int(match.group("d")), None, today, backward)
+    return None
+
+
+def coerce_range(value, now: datetime = None) -> str:
+    """Loose model values -> a range: one of RANGES ("this week" -> "week"),
+    an ISO date ("september 12th" -> "2026-09-12"), or an ASK.
+
+    ``now`` is the seam; every test injects its own.  Production reads the
+    clock once here, which is the same clock get_calendar is about to use.
+    """
+    raw = _clean(value)
+    if raw.startswith(ASK_PREFIX):
+        return raw                       # already decided; both doors coerce
+    text = raw.lower().strip(" .?!") or "today"
     if text in RANGES:
         return text
+    today = (now or now_local()).date()
+    # The one past day the cache genuinely holds (window() is anchored at
+    # yesterday-midnight), and "today" for it was the same silent bug.
+    if _YESTERDAY_RX.search(text):
+        return (today - timedelta(days=1)).isoformat()
+    # BEFORE the weekday loop, or "friday the 20th" is a Friday he did not
+    # ask for -- that is exactly how the worst case of this bug happened.
+    dated = _explicit_date(text, today, bool(_PAST_RX.search(text)))
+    if dated:
+        return dated
     # "on monday", "for Monday", "this monday"
     for day in WEEKDAYS:
         if re.search(rf"\b{day}\b", text):
@@ -373,6 +614,13 @@ def coerce_range(value) -> str:
         return "week"
     if "next" in text or "upcoming" in text or "soon" in text or "coming up" in text:
         return "next"
+    if _DATEISH_RX.search(text):
+        # Date-shaped and unreadable. ASK; do not assume.
+        return _ask("I couldn't work out which date you meant, sir — "
+                    "which day did you want?")
+    # THE ONE line that may answer "today", and the reason the guard above
+    # it exists: he named no date, so today is the honest default. Every
+    # unrecognised DATE leaves through an ask, never through here.
     return "today"
 
 
@@ -381,12 +629,87 @@ def coerce_range(value) -> str:
 CALENDAR_MAX_SENTENCES = 4
 
 
-def format_events(events, range: str = "today", now: datetime = None) -> str:
-    """The compact text for today / tomorrow / week / next at ``now``."""
-    range = coerce_range(range)
+def date_words(day: date, today: date) -> str:
+    """"Saturday the 12th" inside this month, "Saturday the 3rd of October"
+    outside it, and the year too when it is not this one.
+
+    Naming the month is how he HEARS a wrong pick.  "the 3rd" is
+    unambiguous inside September and dangerous outside it, and the whole
+    complaint was a confident answer about a day he did not ask for.
+    """
+    stem = f"{day.strftime('%A')} the {day.day}{_suffix(day.day)}"
+    if day.year != today.year:
+        return f"{stem} of {_month_name(day.month)} {day.year}"
+    if day.month != today.month:
+        return f"{stem} of {_month_name(day.month)}"
+    return stem
+
+
+def _date_label(day: date, today: date) -> tuple:
+    """(the words after "Nothing on", the words that open a list).
+
+    A date that IS today or tomorrow is worded with the word he has:
+    answering "September 12th" with "Saturday the 12th" is right, doing it
+    for today would be a stilted way to say "today"."""
+    if day == today:
+        return "today", "Today"
+    if day == today + timedelta(days=1):
+        return "tomorrow", "Tomorrow"
+    words = date_words(day, today)
+    return words, words
+
+
+def reachable(today: date, window_days: int = WINDOW_DAYS) -> tuple:
+    """The first and last day the cache actually holds.
+
+    ``CalendarSource._window`` anchors at YESTERDAY-midnight and reaches
+    ``window_days + 1`` days, so the last whole day inside it is
+    ``today + window_days - 1``.  The two must not drift.
+    """
+    return today - timedelta(days=1), today + timedelta(days=window_days - 1)
+
+
+def out_of_reach(day: date, today: date, window_days: int = WINDOW_DAYS) -> str:
+    """"" when the day is inside the cache, else the sentence that says so.
+
+    DECIDED 2026-09-05: a day outside the window is REFUSED BY NAME, never
+    answered "nothing on it".  Those events are missing from the CACHE, not
+    from his calendar, and "Nothing on the 3rd of October, sir" would be
+    the same confident wrong answer he reported, in a new coat.  Widening
+    WINDOW_DAYS is his call, not this function's: it changes what
+    jarvis/calwatch.py reads as a new booking, so every day past the old
+    edge would announce itself once.
+    """
+    lo, hi = reachable(today, window_days)
+    if day < lo:
+        return (f"I only keep the calendar back to yesterday, sir; I can't "
+                f"look as far back as {date_words(day, today)}.")
+    if day > hi:
+        return (f"I only hold the calendar out to {date_words(hi, today)}, "
+                f"sir; {date_words(day, today)} is past that.")
+    return ""
+
+
+def format_events(events, range: str = "today", now: datetime = None,
+                  window_days: int = WINDOW_DAYS) -> str:
+    """The compact text for a date / today / tomorrow / week / next at ``now``."""
     now = now or now_local()
+    range = coerce_range(range, now)
     today = now.date()
+    if is_ask(range):
+        return ask_words(range)
     events = merge_events(events)
+    day = as_date(range)
+    if day is not None:
+        beyond = out_of_reach(day, today, window_days)
+        if beyond:
+            return beyond
+        label, opener = _date_label(day, today)
+        todays = _day_events(events, day)
+        if not todays:
+            return f"Nothing on {label}, sir."
+        return f"{opener}: " + ", ".join(_event_words(e) for e in todays) + \
+            "; nothing else."
     if range in WEEKDAYS:
         # The NEXT such day, counting today. Asked on Friday, "Monday" is the
         # coming Monday, never the one just gone.
@@ -1141,18 +1464,32 @@ def make_tools(cfg, services) -> list[ToolSpec]:
     source = make_source(cfg, services)
 
     def get_calendar(range="today", **_) -> ToolResult:
-        rng = coerce_range(range)
         if not source.configured:
             line = setup_line(cfg, "google_ical")
             return ToolResult(text=line, ok=False, speak=line)
         now = now_local(source.tz)
+        rng = coerce_range(range, now)
+        # A date he cannot have meant is a QUESTION, not a guess. The silent
+        # fall-back to today is the whole of the 2026-09-05 bug, so it dies
+        # here as well as in coerce_range: speak= puts the question to him
+        # verbatim instead of letting the model narrate around it.
+        if is_ask(rng):
+            line = ask_words(rng)
+            return ToolResult(text=line, ok=False, speak=line)
+        # A real day the cache does not hold is refused BY NAME rather than
+        # answered "nothing on it" -- see out_of_reach().
+        want = as_date(rng)
+        if want is not None:
+            beyond = out_of_reach(want, now.date(), source.window_days)
+            if beyond:
+                return ToolResult(text=beyond, ok=False, speak=beyond)
         snap = source.get(rng, now)
         if snap.fetched_at is None:
             if snap.errors:
                 return ToolResult(text="calendar unreachable", ok=False)
             return ToolResult(text="calendar still loading, ask again in a moment",
                               ok=False)
-        text = format_events(snap.events, rng, now)
+        text = format_events(snap.events, rng, now, source.window_days)
         if snap.down:
             # A subscription is unread, so the day is NOT accounted for:
             # take back "; nothing else." before saying which feed is out.
@@ -1162,6 +1499,23 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         if snap.down:
             text += " " + down_words(snap.down, now)
         return ToolResult(text=text, max_sentences=CALENDAR_MAX_SENTENCES)
+
+    def _range_from_words(said: str) -> dict:
+        """The date off HIS words, for a model call that named one.
+
+        Returns {} unless the utterance carries an explicit date, so the
+        model keeps every range it can still get right -- including the
+        ones it resolves from the conversation rather than from the
+        sentence in hand.
+        """
+        try:
+            got = _explicit_date(_clean(said).lower(),
+                                 now_local(source.tz).date(),
+                                 bool(_PAST_RX.search(said or "")))
+        except Exception:                    # noqa: BLE001 - tool boundary
+            log.debug("calendar range derive failed", exc_info=True)
+            return {}
+        return {"range": got} if got else {}
 
     def add_event(text="", calendar=None, **_) -> ToolResult:
         """Add one event. Writes outright when the parse is unambiguous;
@@ -1240,11 +1594,25 @@ def make_tools(cfg, services) -> list[ToolSpec]:
         # THIS tool on "how long is my biosensors lab tomorrow?" -- a
         # question that got "I'm afraid I don't have that information, sir"
         # because nothing in the tool list mentioned duration.
+        # "a date" earns its word in a description this tight because the
+        # model has to know a date is askable at all: with the enum below
+        # gone it is now expressible, and 2026-09-05 showed the model
+        # sending range="today" for "what do i have on september 12th".
+        # ("named" gave up the word; the day word he says is what matters.)
         description=("Events on Hunter's calendar: what's on today, "
-                     "tomorrow, a named weekday, the week, or next; "
+                     "tomorrow, a weekday, a date, the week, or next; "
                      "how long they last."),
         parameters={"type": "object", "properties": {
-            "range": {"type": "string", "enum": list(RANGES),
-                      "description": "today, tomorrow, week or next"}},
+            # No enum. An enum of the eleven word ranges made an explicit
+            # date IMPOSSIBLE for the model to express -- half of the
+            # 2026-09-05 bug lived here rather than in coerce_range.
+            "range": {"type": "string",
+                      "description": ("today, tomorrow, a weekday, week, "
+                                      "next, or a date like 2026-09-12")}},
             "required": ["range"]},
+        # The model fills range from his words and got it wrong for every
+        # explicit date. Only an EXPLICIT date is taken over its value: a
+        # follow-up it resolved from the conversation ("and the next day")
+        # names no date here and keeps its own answer.
+        derive=_range_from_words,
         handler=get_calendar)]

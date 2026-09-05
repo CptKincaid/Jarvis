@@ -9817,12 +9817,18 @@ def place_in(text: str) -> Optional[str]:
     return ""
 
 
-def calendar_range(text: str) -> str:
+def calendar_range(text: str, now=None) -> str:
     """coerce_range over the whole utterance, with one repair: "when's my
     meeting" carries no day, and today is the wrong default for a "when"
-    question -- the first upcoming event is."""
+    question -- the first upcoming event is.
+
+    Since 2026-09-05 the value may also be an ISO date or an ask (see
+    tools/calendar.coerce_range); both pass through get_calendar's own
+    coercion unchanged, which is why that one has to be a fixed point.
+    ``now`` is the seam tests inject.
+    """
     from jarvis.tools.calendar import coerce_range
-    rng = coerce_range(text)
+    rng = coerce_range(text, now)
     t = (text or "").lower()
     if rng == "today" and re.match(r"^\s*when", t) and not re.search(
             r"\btoday\b|tonight|this (?:morning|afternoon|evening)|later", t):
@@ -9863,16 +9869,18 @@ def _route_recognised(d) -> bool:
         and reason != "local:topic"
 
 
-def forced_call(reason: str, text: str) -> Optional[tuple]:
+def forced_call(reason: str, text: str, now=None) -> Optional[tuple]:
     """(tool, args) when the router's reason names the tool and the
-    utterance carries its arguments; None to run the full tool loop."""
+    utterance carries its arguments; None to run the full tool loop.
+
+    ``now`` is the clock seam calendar_range needs to resolve a date."""
     t = (text or "").strip()
     if not t or _CLAUSE_RX.search(t):
         return None
     if reason == "local:calendar":
         if not _CAL_READ_RX.search(t) or _CAL_WRITE_RX.search(t):
             return None
-        return "get_calendar", {"range": calendar_range(t)}
+        return "get_calendar", {"range": calendar_range(t, now)}
     if reason == "local:weather":
         place = place_in(t)
         if place is None:
