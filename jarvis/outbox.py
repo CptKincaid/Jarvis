@@ -293,7 +293,7 @@ def _one_said(m) -> str:
     # and a yes mails it there -- so the skip is spent only when the top
     # level is not one in use either. The cost is "look at the dot com
     # bubble" losing a letter in a log line; the alternative was the
-    # address he said, written out raw, four times (measured, wave B).
+    # address he said written out raw, four times (measured, wave B).
     if first in _NOT_A_DOMAIN_WORD and tld not in _SAID_TLDS:
         return m.group(0)
     if "." in domain and tld not in _SAID_TLDS:
@@ -729,17 +729,33 @@ def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
     return res.addr, res.name
 
 
-def recipient_gender(cfg, memory, who: str) -> Optional[str]:
-    """The recipient's gender from an EXPLICIT source, or None: an
-    honorific he said ("Mrs Jones"), an honorific on the book row that
-    resolved the name ("mr jones" for "Jones"), or the people book's own
-    honorific / title / gender field. An address says nothing, and so does
-    a bare name."""
+def said_gender(who: str) -> Optional[str]:
+    """The gender of an honorific HE SAID in the name itself -- "Mrs
+    Jones" -> "f". Nothing is looked up: this is only what is in the
+    words. An address says nothing, and so does a bare name."""
     raw = " ".join(str(who or "").split()).strip(" .,;:?!")
     if not raw or parse_address(raw):
         return None
     key = re.sub(r"^(?:my|our|the)\s+", "", raw, flags=re.I).strip()
-    hit = gender_from_honorific(key)
+    return gender_from_honorific(key)
+
+
+def recipient_gender(cfg, memory, who: str) -> Optional[str]:
+    """The recipient's gender from an EXPLICIT source, or None: an
+    honorific he said ("Mrs Jones"), an honorific on the LEGACY
+    send_file.contacts key that resolved the name ("mr jones" for
+    "Jones"), or the people book's own honorific / title / gender field.
+    An address says nothing, and so does a bare name.
+
+    Both lookups are keyed by the name he SAID, so this is for a
+    recipient the address book did NOT resolve; ``draft_gender`` is what
+    a book row goes through.
+    """
+    raw = " ".join(str(who or "").split()).strip(" .,;:?!")
+    if not raw or parse_address(raw):
+        return None
+    key = re.sub(r"^(?:my|our|the)\s+", "", raw, flags=re.I).strip()
+    hit = said_gender(raw)
     if hit:
         return hit
     row = _book_row(contacts(cfg), key) or _book_row(contacts(cfg), raw)
@@ -773,11 +789,21 @@ def draft_gender(cfg, memory, who: str,
     recipient_gender's sources -- an honorific he said, a legacy
     send_file.contacts key, the people book. None when nobody knows, and
     then either pronoun confirms, exactly as before the ruling. The name
-    itself is never read."""
-    hit = None
+    itself is never read.
+
+    For a BOOK-resolved person those lookups are shut off (w5d). They are
+    keyed by the name he SAID, not by the row the book picked, so they
+    answer about a DIFFERENT record: with a legacy key "mr jones" beside
+    a book row "Heather Jones", saying "Jones" resolved to Heather and
+    then took the Mr, and "send it to her" was refused with "Send it to
+    him?" (measured). Her own row, or an honorific he said in the same
+    breath, are the only things that know who she is; with neither, the
+    seam stays None and either pronoun confirms.
+    """
     if getattr(res, "from_book", False):
-        hit = gender_from_honorific(getattr(res, "honorific", "") or "")
-    return hit or recipient_gender(cfg, memory, who)
+        return (gender_from_honorific(getattr(res, "honorific", "") or "")
+                or said_gender(who))
+    return recipient_gender(cfg, memory, who)
 
 
 # ------------------------------------------------------------- config

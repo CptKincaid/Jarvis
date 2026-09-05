@@ -15,6 +15,7 @@ import json
 import logging
 import os
 import stat
+import types
 from pathlib import Path
 
 import pytest
@@ -740,6 +741,75 @@ def test_draft_gender_reads_the_row_first_then_what_he_said(roots):  # noqa: F81
     legacy = book_mod.Resolution(addr="jones@example.com", name="Jones")
     assert outbox.draft_gender(cfg, None, "Jones", legacy) == "m", "the legacy key's Mr"
     assert outbox.draft_gender(cfg, None, "Dana", book_mod.Resolution()) is None
+
+
+# ---- the legacy-map cross-wire (w5d) -------------------------------------
+# recipient_gender looks the SAID NAME up in the legacy send_file.contacts
+# map and in the people book. For a BOOK-resolved person that is a
+# different record's gender: "Jones" resolves to Heather Jones in the
+# book, and a legacy key "mr jones" made her draft "m". The book settled
+# who this is, so only what is known about THAT person may fill the seam.
+def test_draft_gender_never_reads_the_legacy_map_for_a_book_row(roots):  # noqa: F811
+    cfg = cfg_with_roots(roots,
+                         **{"send_file.contacts": {"mr jones": "jones@example.com"}})
+    bare = book_mod.Resolution(addr="hjones@example.com", name="Heather Jones",
+                               from_book=True)
+    assert outbox.draft_gender(cfg, None, "Jones", bare) is None, "the legacy Mr is not her"
+    ms = book_mod.Resolution(addr="hjones@example.com", name="Heather Jones",
+                             from_book=True, honorific="Ms")
+    assert outbox.draft_gender(cfg, None, "Jones", ms) == "f", "her own row"
+    # the people book is the same source and the same mistake
+    mem = types.SimpleNamespace(
+        resolve_person=lambda who: {"name": "Jones", "gender": "m"})
+    assert outbox.draft_gender(cfg, mem, "Jones", bare) is None
+    assert outbox.draft_gender(cfg, mem, "Jones", ms) == "f"
+    # NON-book recipients still read both, exactly as before
+    legacy = book_mod.Resolution(addr="jones@example.com", name="Jones")
+    assert outbox.draft_gender(cfg, None, "Jones", legacy) == "m"
+    assert outbox.draft_gender(cfg, mem, "Dana", book_mod.Resolution()) == "m"
+    # and an honorific HE said about the book person is still explicit
+    assert outbox.draft_gender(cfg, None, "Mr Jones", bare) == "m"
+
+
+@pytest.fixture
+def cmd_jones(cmd, two_heathers):  # noqa: F811
+    """A legacy key that carries an honorific -- "mr jones" -- beside a
+    book whose only Jones is Heather Jones."""
+    cmd.services.assistant.data["send_file.contacts"] = {"mr jones": "jones@example.com"}
+    return cmd
+
+
+def test_a_legacy_mr_key_never_genders_a_book_resolved_woman(cmd_jones):
+    """The measured refusal: "send it to her" was answered "Send it to
+    him?" and the file did not go."""
+    c = cmd_jones
+    res = c.handle("email the biosensors handout to Jones", source="voice")
+    assert res.reply.endswith("Send it, sir?"), res.reply
+    assert c._pending_send is not None and c._pending_send.from_book
+    assert c._pending_send.to_name == "Heather Jones"
+    assert c._pending_send.to_gender is None, "her row has no honorific"
+    res = c.handle("send it to her", source="voice")
+    assert res.ack, res
+    assert len(FakeSMTP.made) == 1
+    assert FakeSMTP.made[-1].sent[0]["To"] == "hjones@example.com"
+    assert c._pending_send is None
+
+
+def test_her_own_row_still_fills_the_seam_over_the_legacy_key(cmd, book_file):  # noqa: F811
+    write(book_file, [{"name": "Heather Smith", "email": "heather@example.com",
+                       "honorific": "Dr"},
+                      {"name": "Heather Jones", "email": "hjones@example.com",
+                       "honorific": "Ms"}])
+    cmd.services.assistant.data["send_file.contacts"] = {"mr jones": "jones@example.com"}
+    res = cmd.handle("email the biosensors handout to Jones", source="voice")
+    assert res.reply.endswith("Send it, sir?"), res.reply
+    assert cmd._pending_send is not None and cmd._pending_send.to_gender == "f"
+    res = cmd.handle("send it to him", source="voice")
+    assert not FakeSMTP.made, res
+    assert res.reply == "The draft is to Heather Jones, sir. Send it to her?"
+    assert cmd._pending_send is not None, "the draft is kept for the re-ask"
+    res = cmd.handle("send it to her", source="voice")
+    assert res.ack and FakeSMTP.made[-1].sent[0]["To"] == "hjones@example.com"
 
 
 # ==================================================================
