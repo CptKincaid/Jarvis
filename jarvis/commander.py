@@ -8692,8 +8692,13 @@ REGISTRY: list[Command] = [
     # that, sir" while nothing was stored; two days later he asked and Jarvis
     # searched his documents. The rung now takes the ways he says it.
     Command("remember",
-            _m_re(r"(?:remember(?: that)?|note that|keep in mind(?: that)?|"
-                  r"don'?t forget(?: that)?|make a note(?: that| of)?|"
+            # 2026-09-04 19:20: "note that" and "make a note (that|of)" were
+            # here for six hours and never shipped -- measured, they pulled
+            # "make a note of milk" out of his NOTES list into long-term
+            # facts. The notes rung owns "note"; the fact-vs-note rule is
+            # branch memory-rung's to settle. Not before then.
+            _m_re(r"(?:remember(?: that)?|keep in mind(?: that)?|"
+                  r"don'?t forget(?: that)?|"
                   r"put (?:it|this|that) in your memory(?: that)?) (?!to\b)(.+)"),
             _h_remember, needs=("memory",)),
     # Before "recall": episodic ("when did I last …") vs semantic ("what did
