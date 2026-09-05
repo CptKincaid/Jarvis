@@ -1047,7 +1047,11 @@ def test_the_screen_tool_goes_through_the_guard_and_logs_its_count(
 
 def test_the_docs_no_longer_say_an_agent_may_write_his_config():
     doc = (REPO / "docs" / "assistant-setup.md").read_text(encoding="utf-8")
-    sec = doc.split("## 84.", 1)[1].split("\n## ", 1)[0]
+    # Located by TITLE, not by number: three lanes appended a section on
+    # 2026-09-05 and this one was renumbered 84 -> 86 in the merge. A doc
+    # pin that hardcodes a section number breaks on the next append.
+    sec = doc.split("The brain: how much room he gets to remember in", 1)[1]\
+             .split("\n## ", 1)[0]
     assert "ensure_defaults" in sec
     assert "never writes" in sec
     assert "[screen]" in sec
@@ -1061,7 +1065,11 @@ def test_the_docs_describe_the_round_3_review_fixes():
     and an image round is costed at the allowance but never calibrated
     on. The words the two holes were reported against are gone."""
     doc = (REPO / "docs" / "assistant-setup.md").read_text(encoding="utf-8")
-    sec = doc.split("## 84.", 1)[1].split("\n## ", 1)[0]
+    # Located by TITLE, not by number: three lanes appended a section on
+    # 2026-09-05 and this one was renumbered 84 -> 86 in the merge. A doc
+    # pin that hardcodes a section number breaks on the next append.
+    sec = doc.split("The brain: how much room he gets to remember in", 1)[1]\
+             .split("\n## ", 1)[0]
     assert "tail of the largest tool" in sec
     assert "cut again" in sec
     assert "400 characters" in sec
