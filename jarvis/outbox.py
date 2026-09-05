@@ -66,6 +66,11 @@ SENT_LINE = "Sent to {who}, sir."
 DROPPED_LINE = "Very good, sir; nothing sent."
 SELF_LINE = ("That draft is to {who}, sir, not to you. Yes to send it there, "
              "no to drop it.")
+# A pronoun of the OTHER gender after a read-back (Hunter's 19:00 ruling,
+# 09-04): "send it to him" with Heather pending is not her, so it is not a
+# confirmation. The re-ask names the pending person and the pronoun that
+# IS theirs, so the yes he gives next is to a sentence he has just heard.
+GENDER_LINE = "The draft is to {who}, sir. Send it to {pron}?"
 UNSURE_LINE = ("I'd rather be certain, sir — say yes and I'll send it, "
                "or no and I'll let it go.")
 CHANGED_LINE = ("That file has changed since I read it back, sir; "
@@ -118,6 +123,17 @@ class Draft:
     # answer to come back the same way, the rule _try_briefing_offer
     # already applies to a question that is entirely reversible.
     asked_from: str = "voice"
+    # THE ONE SEAM for the recipient's gender (Hunter's 19:00 ruling,
+    # 09-04): "f" / "m" / None. None by default -- and None means either
+    # pronoun confirms, exactly as before the ruling. Filled by whoever
+    # KNOWS, from an explicit source only: a stored honorific on the person
+    # or on a book row (prepare -> recipient_gender), or a pronoun Hunter
+    # himself used about the person earlier in the same draft conversation
+    # ("her address is dana at ..." -> commander's address answer). Never
+    # from the name: nothing in this file guesses a gender from "Heather".
+    # The address-book branch fills it from its rows later without touching
+    # the confirmation grammar, which reads only this field.
+    to_gender: Optional[str] = None
 
     @property
     def account_label(self) -> str:
@@ -196,6 +212,26 @@ def spoken_address(addr: str) -> str:
                 .replace("_", " underscore ").replace("-", " dash "))
 
 
+def pronoun_for(gender: Optional[str]) -> str:
+    """"her" / "him" for a known gender, "them" for none."""
+    return {"f": "her", "m": "him"}.get(str(gender or "").lower(), "them")
+
+
+def mask_addresses(text: str) -> str:
+    """The sentence with every address in it masked, typed or spoken, for
+    a log line. "yes, to dana@example.com" -> "yes, to d…@example.com";
+    "dana at example dot com" -> "… at example dot com". The address-book
+    review (09-04) found the commander's INFO lines carrying a typed
+    address whole; the log is read by more eyes than the mailbox is."""
+    t = str(text or "")
+    if not t:
+        return t
+    t = _ADDR_RX.sub(lambda m: mail_mod._mask_address(m.group(0).rstrip(".,;:"))
+                     + m.group(0)[len(m.group(0).rstrip(".,;:")):], t)
+    t = _SPOKEN_ADDR_RX.sub(lambda m: "… at " + m.group(2), t)
+    return t
+
+
 def account_words(account: dict) -> str:
     """"your school account"."""
     label = mail_mod.account_label(account)
@@ -217,6 +253,13 @@ def read_back(draft: Draft) -> str:
     return (f"{spoken_name(draft.path)}, {spoken_size(draft.size)}, "
             f"to {_to_words(draft)}, from {account_words(draft.account)}. "
             f"Send it, sir?")
+
+
+def gender_line(draft: Draft) -> str:
+    """The re-ask for a pronoun that is not the pending person's (Hunter's
+    19:00 ruling): names them, and the pronoun that is theirs."""
+    who = draft.to_name or spoken_address(draft.to_addr)
+    return GENDER_LINE.format(who=who, pron=pronoun_for(getattr(draft, "to_gender", None)))
 
 
 def unsure_line(draft: Draft) -> str:
@@ -279,22 +322,101 @@ _DOT_RX = re.compile(r"\s+dot\s+", re.I)
 _ADDR_RX = re.compile(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+")
 
 
-def parse_address(text: str) -> str:
-    """An email address out of spoken or written text, or ""."""
-    raw = " ".join(str(text or "").split())
-    if not raw:
-        return ""
+def address_span(text: str) -> Optional[tuple]:
+    """(address, start, end) of the first address in the text, typed or
+    spoken, or None. The span is in the text AS GIVEN (no whitespace
+    normalising), so a caller can cut the address out of the sentence --
+    which is how the commander's fold keeps its hands off one."""
+    raw = str(text or "")
+    if not raw.strip():
+        return None
     m = _ADDR_RX.search(raw)
     if m:
-        return m.group(0).strip(".,;:")
+        addr = m.group(0).rstrip(".,;:")
+        return addr, m.start(), m.start() + len(addr)
     m = _SPOKEN_ADDR_RX.search(raw)
     if m:
-        local = _DOT_RX.sub(".", m.group(1)).strip()
-        domain = _DOT_RX.sub(".", m.group(2)).strip()
+        local = _DOT_RX.sub(".", " ".join(m.group(1).split())).strip()
+        domain = _DOT_RX.sub(".", " ".join(m.group(2).split())).strip()
         addr = f"{local}@{domain}".replace(" ", "")
         if re.fullmatch(r"[\w.+\-]+@[\w\-]+\.[\w.\-]+", addr):
-            return addr
-    return ""
+            return addr, m.start(), m.end()
+    return None
+
+
+def parse_address(text: str) -> str:
+    """An email address out of spoken or written text, or ""."""
+    span = address_span(" ".join(str(text or "").split()))
+    return span[0] if span else ""
+
+
+# ---- gender, from an EXPLICIT source only (Hunter's 19:00 ruling) -------
+# A stored honorific on the person or a book row, or a pronoun he himself
+# used about the person. No name-based guessing: "Heather" says nothing.
+_HONORIFIC_RX = re.compile(
+    r"^(?P<h>mr|mister|mrs|missus|ms|miss|madam|ma'am|sir|dame|lady|lord)\b\.?\s*",
+    re.I)
+_MALE_HONORIFICS = frozenset(("mr", "mister", "sir", "lord"))
+_FEMALE_HONORIFICS = frozenset(("mrs", "missus", "ms", "miss", "madam", "ma'am",
+                                "dame", "lady"))
+_GENDER_WORDS = {"f": "f", "female": "f", "woman": "f", "she": "f", "her": "f",
+                 "m": "m", "male": "m", "man": "m", "he": "m", "him": "m"}
+_SHE_RX = re.compile(r"\b(?:she|her|hers|herself)\b", re.I)
+_HE_RX = re.compile(r"\b(?:he|him|his|himself)\b", re.I)
+
+
+def strip_honorific(text: str) -> str:
+    """"Mrs Jones" -> "Jones"; "Heather" -> "Heather"."""
+    t = " ".join(str(text or "").split())
+    return _HONORIFIC_RX.sub("", t, count=1).strip()
+
+
+def gender_from_honorific(text) -> Optional[str]:
+    """"Mrs Jones" -> "f", "Mr Jones" -> "m"; "Dr Jones" and a bare name ->
+    None. A stored gender VALUE ("f", "female", "she", "m", "male", "he")
+    is read the same way, so a people-book field can hold either."""
+    t = " ".join(str(text or "").split()).strip(" .,")
+    if not t:
+        return None
+    hit = _GENDER_WORDS.get(t.lower())
+    if hit:
+        return hit
+    m = _HONORIFIC_RX.match(t)
+    if not m:
+        return None
+    h = m.group("h").lower()
+    if h in _MALE_HONORIFICS:
+        return "m"
+    if h in _FEMALE_HONORIFICS:
+        return "f"
+    return None
+
+
+def gender_from_pronouns(text) -> Optional[str]:
+    """The gender of the ONE pronoun a sentence uses about somebody:
+    "her address is ..." -> "f"; "he's at ..." -> "m"; none, or both
+    ("her and his") -> None."""
+    t = str(text or "")
+    she, he = _SHE_RX.search(t), _HE_RX.search(t)
+    if she and not he:
+        return "f"
+    if he and not she:
+        return "m"
+    return None
+
+
+def _book_row(book: dict, key: str) -> Optional[tuple]:
+    """(address, the row's key) for a name, looking THROUGH a stored
+    honorific either way: "heather" finds the row "ms heather", and "Mrs
+    Jones" finds the row "jones"."""
+    low = key.lower()
+    if low in book:
+        return book[low], low
+    bare = strip_honorific(low)
+    for k, addr in book.items():
+        if strip_honorific(k) == bare and bare:
+            return addr, k
+    return None
 
 
 def names_a_real_file(cfg, file_query: str, search_roots=None,
@@ -350,9 +472,9 @@ def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
         return said, ""
     key = re.sub(r"^(?:my|our|the)\s+", "", raw, flags=re.I).strip()
     book = contacts(cfg)
-    hit = book.get(key.lower()) or book.get(raw.lower())
-    if hit:
-        return hit, key
+    row = _book_row(book, key) or _book_row(book, raw)
+    if row:
+        return row[0], key
     resolve = getattr(memory, "resolve_person", None) if memory is not None else None
     if callable(resolve):
         person = None
@@ -369,6 +491,40 @@ def resolve_recipient(cfg, memory, who: str) -> tuple[str, str]:
             name = str(person.get("name") or key)
             return (addr, name) if addr else ("", name)
     return "", key
+
+
+def recipient_gender(cfg, memory, who: str) -> Optional[str]:
+    """The recipient's gender from an EXPLICIT source, or None: an
+    honorific he said ("Mrs Jones"), an honorific on the book row that
+    resolved the name ("mr jones" for "Jones"), or the people book's own
+    honorific / title / gender field. An address says nothing, and so does
+    a bare name."""
+    raw = " ".join(str(who or "").split()).strip(" .,;:?!")
+    if not raw or parse_address(raw):
+        return None
+    key = re.sub(r"^(?:my|our|the)\s+", "", raw, flags=re.I).strip()
+    hit = gender_from_honorific(key)
+    if hit:
+        return hit
+    row = _book_row(contacts(cfg), key) or _book_row(contacts(cfg), raw)
+    if row:
+        hit = gender_from_honorific(row[1])
+        if hit:
+            return hit
+    resolve = getattr(memory, "resolve_person", None) if memory is not None else None
+    if callable(resolve):
+        for probe in (raw, key):
+            try:
+                person = resolve(probe)
+            except Exception:                          # noqa: BLE001 - store
+                person = None
+            if isinstance(person, dict):
+                for field_name in ("gender", "honorific", "title", "name"):
+                    hit = gender_from_honorific(person.get(field_name) or "")
+                    if hit:
+                        return hit
+                break
+    return None
 
 
 # ------------------------------------------------------------- config
@@ -490,7 +646,8 @@ def prepare(cfg, memory, file_query: str, recipient: str,
                   to_addr=addr, to_name=who, account=account,
                   subject=subject.strip() or default_subject(match.path),
                   body=str(_cfg_get(cfg, "send_file.body", "") or DEFAULT_BODY),
-                  made_at=time.monotonic(), roots=kept)
+                  made_at=time.monotonic(), roots=kept,
+                  to_gender=recipient_gender(cfg, memory, recipient))
     log.info("outbox: drafted %s (%d bytes) to %s from %s", match.path.name,
              match.size, mail_mod._mask_address(addr),
              mail_mod.account_label(account))

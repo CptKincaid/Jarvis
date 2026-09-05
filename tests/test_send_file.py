@@ -16,6 +16,7 @@ REFUSE or ASK rather than the one way it sends. Four groups:
   environment escape, so a test that lost its fake fails loudly instead of
   emailing one of his correspondents.
 """
+import logging
 import smtplib
 import time
 import types
@@ -605,8 +606,16 @@ def cmd(tmp_path, monkeypatch, roots):
     spoken = []
     monkeypatch.setattr(Commander, "_speak_now",
                         lambda self, text: spoken.append(text) or True)
+    # Heather's book row carries a stored honorific (Hunter's 19:00 ruling,
+    # 09-04: a pronoun has to match the pending person's gender, and the
+    # gender comes from an EXPLICIT source only -- an honorific on the
+    # person or the row, never the name). "send it to heather" still
+    # resolves through the honorific-stripped key. cmd_plain below is the
+    # same desk with a bare row, where her gender is unknown.
     svc = types.SimpleNamespace(
-        assistant=cfg_with_roots(roots, **{"send_file.from": "school"}),
+        assistant=cfg_with_roots(roots, **{
+            "send_file.from": "school",
+            "send_file.contacts": {"ms heather": "heather@example.com"}}),
         memory=MagicMock(), desktop=MagicMock(), workflows=MagicMock(),
         brain=MagicMock(), context=MagicMock(), tts=MagicMock(),
         timekeeper=MagicMock(), notes=MagicMock(), approvals=MagicMock(),
@@ -623,6 +632,14 @@ def cmd(tmp_path, monkeypatch, roots):
     c = Commander(svc)
     c.spoken = spoken
     return c
+
+
+@pytest.fixture
+def cmd_plain(cmd):
+    """The same desk with a bare book row: Heather's gender is UNKNOWN, so
+    either pronoun confirms, exactly as before the 19:00 ruling."""
+    cmd.services.assistant.data["send_file.contacts"] = {"heather": "heather@example.com"}
+    return cmd
 
 
 def test_the_family_is_registered_and_reachable_without_the_wake_word():
@@ -1537,7 +1554,9 @@ def test_what_counts_as_a_correction(said, want):
 # 18. A pronoun after "to" is a yes, not a new recipient (09-04)
 # ==================================================================
 @pytest.mark.parametrize("said", [
-    "yes, send it to her", "yes send it to him",
+    # ("yes send it to him" moved to GENDER_REASKS, section 24: Heather's
+    # row carries an honorific now, and "him" is not her -- 19:00 ruling)
+    "yes, send it to her",
     "yes go ahead and send it to her", "yes send it to her please",
 ])
 def test_a_yes_that_names_the_recipient_by_pronoun_sends(cmd, said):
@@ -1622,18 +1641,21 @@ def test_a_re_asked_account_does_not_spend_the_read_back(cmd_no_default):
 # ==================================================================
 SEND_CORPUS = [
     # the literal echo of the read-back, on its own
-    "send it to her", "send it to him please", "please send it to her",
+    # ("send it to him please", "yes send it to him please", "yeah, send it
+    # to him" and "yes, send it to his inbox" moved to GENDER_REASKS in
+    # section 24 -- Hunter's 19:00 ruling: "him" is not Heather)
+    "send it to her", "please send it to her",
     "jarvis, send it to her", "send it to her, jarvis", "send that to her now",
     "send it over to her", "Send it to her.",
     # a yes that names the recipient by pronoun
-    "yes, send it to her", "yes send it to him please", "yeah, send it to him",
+    "yes, send it to her",
     "yes please send it to her", "yes, send it to them", "yes, to her",
     "yes go ahead and send it to her", "Yes. Send it to her.",
     "correct, send it to her", "yes, send it to her, thanks",
     # the possessive plus a noun that is still the same person
     "yes send it to her address", "yes, send it to her email",
     "yes, send it to her inbox", "yes send it to her email address",
-    "yes, send it to his inbox", "yes send it to their address",
+    "yes send it to their address",
     "yes to her address please",
     # the demonstrative forms the spec listed
     "yes, to that address", "yes to this address", "yes, send it to that address",
@@ -2203,22 +2225,53 @@ def test_a_different_name_or_a_relative_of_hers_still_never_sends(cmd, said):
 
 
 def test_what_the_fold_does():
+    """The sixth pass (09-04) changed WHAT the name folds to: a neutral
+    demonstrative the grammar already takes as the draft said back ("the
+    same person" / "that address"), never a pronoun -- a synthetic "her" would
+    trip the gender check on a Mr, and the pending name's gender is not
+    the fold's to guess."""
     from jarvis.commander import _send_fold_pending
     draft = types.SimpleNamespace(to_name="Heather", to_addr="heather@example.com")
-    assert _send_fold_pending("yes, to Heather", draft) == "yes, to her"
-    assert _send_fold_pending("yes, to heather's address", draft) == "yes, to her address"
-    assert _send_fold_pending("send it to heather@example.com", draft) == "send it to her"
+    assert _send_fold_pending("yes, to Heather", draft) == "yes, to the same person"
+    assert _send_fold_pending("yes, to heather's address", draft) == "yes, to that address"
+    assert _send_fold_pending("send it to heather@example.com", draft) == "send it to that address"
+    assert _send_fold_pending("send it to heather at example dot com", draft) == "send it to that address"
     assert _send_fold_pending("send it to heather's mother", draft) == "send it to heather's mother"
     assert _send_fold_pending("yes, to Dana", draft) == "yes, to Dana"
-    assert _send_fold_pending("Heather, yes", draft) == "Heather, yes"
+    # the bare name folds only beside a yes of its own; alone it is left
+    # to the re-ask
+    assert _send_fold_pending("Heather, yes", draft) == "the same person, yes"
+    assert _send_fold_pending("yes, Heather", draft) == "yes, the same person"
+    assert _send_fold_pending("Heather", draft) == "Heather"
+    assert _send_fold_pending("Heather?", draft) == "Heather?"
     # a two-word name folds on its first word too
     two = types.SimpleNamespace(to_name="Heather Smith", to_addr="")
-    assert _send_fold_pending("yes, to heather", two) == "yes, to her"
-    assert _send_fold_pending("yes, to Heather Smith", two) == "yes, to her"
+    assert _send_fold_pending("yes, to heather", two) == "yes, to the same person"
+    assert _send_fold_pending("yes, to Heather Smith", two) == "yes, to the same person"
     # a nameless address-only draft folds the address alone
     bare = types.SimpleNamespace(to_name="", to_addr="dana@example.com")
-    assert _send_fold_pending("yes, to dana@example.com", bare) == "yes, to her"
+    assert _send_fold_pending("yes, to dana@example.com", bare) == "yes, to that address"
     assert _send_fold_pending("yes, to dana", bare) == "yes, to dana"
+
+
+@pytest.mark.parametrize("said", [
+    # the pending NAME inside a DIFFERENT address, typed or spoken: the
+    # fold used to make "to her@gmail.com" of it and the next yes went to
+    # a fabricated address (attack 1, round 2)
+    "yes, send it to heather@gmail.com", "yes, send it to heather at gmail dot com",
+    "yes send it to heather.jones@example.com", "to heather@gmail.com",
+    "send it to heather-jones@example.com", "yes, to heather at work dot com",
+    # a fuller name, an "at" phrase and a hyphenated name are not the
+    # pending person either
+    "yes, send it to Heather Jones", "send it to Heather-Jones",
+    "yes, send it to heather at work",
+])
+def test_the_fold_never_rewrites_the_name_inside_an_address(said):
+    from jarvis.commander import _send_fold_pending
+    draft = types.SimpleNamespace(to_name="Heather", to_addr="heather@example.com")
+    assert _send_fold_pending(said, draft) == said, said
+    two = types.SimpleNamespace(to_name="Heather Smith", to_addr="heather@example.com")
+    assert _send_fold_pending(said, two) == said, said
 
 
 @pytest.mark.parametrize("said", ["yes, one to her and one to Dana", "yes send it to the",
@@ -2380,8 +2433,10 @@ def test_a_trailing_then_alone_is_still_a_yes(said):
 # her" SENDS -- "okay" is a filler and "send it to her" is the read-back's
 # own words said back. A trailing "?" still re-asks.
 HUNTERS_RULING_SENDS = [
+    # ("okay, send it to him" moved to GENDER_REASKS, section 24: the
+    # 19:00 ruling -- a pronoun has to match the pending person)
     "okay send it to her", "okay, send it to her", "alright send it to her",
-    "okay, send it to him", "right, send it to her", "sure, send it to her",
+    "right, send it to her", "sure, send it to her",
     "okay send it to heather", "okay, send it to her address",
 ]
 HUNTERS_RULING_REASKS = [
@@ -2408,3 +2463,559 @@ def test_hunters_ruling_a_question_mark_still_re_asks(cmd, said):
     assert res.reply == outbox.unsure_line(cmd._pending_send), (said, res.reply)
     cmd.handle("yes", source="typed")
     assert FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+# ==================================================================
+# 24. The sixth pass (09-04, evening): the round-2 attacks, Hunter's
+#     19:00 gender ruling, and the address-book hand-off
+# ==================================================================
+# Round 2's two attacks and the verdict, reproduced on this harness at
+# 1e27530: 15 of 73 non-confirmations SENT (a "?" not at the very end, a
+# second recipient joined by a comma / full stop / "now" / a second head,
+# a connector run ending on a tail word), the "no, I said X" rung stripped
+# the "?" off "I said yes?" and re-dispatched a bare yes, and the fold
+# rewrote the pending NAME inside a DIFFERENT address so the next yes went
+# to her@gmail.com -- an address he never said. Then Hunter's 19:00
+# ruling: a pronoun has to match the pending person's gender, from an
+# explicit source only. And three hand-offs from the address-book review.
+
+# ---- (a) a "?" ANYWHERE in the cleaned sentence is never a yes ------------
+SIXTH_PASS_QUESTIONS = [
+    "send it to her?!", "yes?!", "send it to her? send it to him.", "to her? really?",
+    "okay send it to him?", "yes, really?", "send it to her? yes.", "positive?",
+    "go?", "please?", "let's go?", "that is correct?",
+]
+# ---- (b) a second recipient by ANY joiner ---------------------------------
+SIXTH_PASS_SECOND_RECIPIENTS = [
+    "send it to her, him", "send it to her, to him", "send it to her, then send it to him",
+    "send it to her and send it to him", "send it to her, now send it to him",
+    "yes, send it to her, send it to him", "send it to her. now him.", "send it to her. him.",
+    "yes, him", "yes, Dana too", "send it to him and her", "yes, her and Dana",
+    "send it to her, him, and Dana", "yes, him, not her", "send it to her or him",
+    "send it to her, her mother too", "yes, them too",
+    # a second recipient after the read-back's own words, by a whole "send
+    # it to" or a "with a copy to" (were a correction to Dana / a spoken
+    # drop on the fixed build's first replay)
+    "okay send it to her, then send it to Dana", "send it to her with a copy to Dana",
+    "send it to her, now send it to Dana", "yes, send it to her and send it to Dana",
+]
+# ---- (c) a trailing connector run ending on and / then / send / plus -----
+SIXTH_PASS_DANGLES = [
+    "yes and then send", "yes and then then", "yes then send", "yes and then go",
+    "yes, but", "yes, or", "send it to her but", "yes and plus", "yes, plus",
+    "send it to her and then and",
+]
+
+
+@pytest.mark.parametrize("said", SIXTH_PASS_QUESTIONS + SIXTH_PASS_SECOND_RECIPIENTS
+                         + SIXTH_PASS_DANGLES)
+def test_the_sixth_pass_holes_are_not_a_yes(said):
+    assert parse_send_answer(said) is not True, said
+
+
+@pytest.mark.parametrize("said", SIXTH_PASS_QUESTIONS + SIXTH_PASS_DANGLES)
+def test_the_sixth_pass_holes_are_asked_again_and_never_sent(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert cmd._pending_send is not None, (said, res.reply)
+    assert res.reply in (outbox.unsure_line(cmd._pending_send),
+                         outbox.gender_line(cmd._pending_send)), (said, res.reply)
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+@pytest.mark.parametrize("said", SIXTH_PASS_SECOND_RECIPIENTS)
+def test_a_second_recipient_by_any_joiner_is_the_re_ask(cmd, said):
+    """The check runs on the WHOLE sentence, before the yes grammar can
+    return True: a comma, a full stop, "now", "or", a second head -- any
+    joiner between two people is the one re-ask, draft kept."""
+    from jarvis.commander import _send_second_recipient
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert cmd._pending_send is not None, (said, res.reply)
+    assert res.reply in (outbox.unsure_line(cmd._pending_send),
+                         outbox.gender_line(cmd._pending_send)), (said, res.reply)
+    assert "no address" not in res.reply.lower(), (said, res.reply)
+    if "Dana" not in said:
+        assert _send_second_recipient(said), said
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+@pytest.mark.parametrize("said", [
+    # one person, said back with a noun on it, a thanks or a trailing then
+    "yes, to her and to her address", "send it to her and thanks", "yes, send it to her, thanks",
+    "send it to her then", "yes, to her, go ahead", "yes, her inbox",
+])
+def test_one_person_twice_is_not_a_second_recipient(said):
+    from jarvis.commander import _send_second_recipient
+    assert not _send_second_recipient(said), said
+    assert parse_send_answer(said) is True, said
+
+
+# ---- (d) the correction rung keeps a trailing "?" -------------------------
+I_SAID_QUESTIONS = [
+    "I said yes?", "I said, yes?", "no, I said yes?", "I said send it to her?",
+    "I meant yes?", "I mean, send it to her?", "I said go ahead?",
+    "what I said was yes?", "I was saying yes?",
+]
+
+
+@pytest.mark.parametrize("text,meant", [
+    ("I said yes?", "yes?"), ("no, I said yes?", "yes?"), ("I said, yes?", "yes?"),
+    ("I mean, send it to her?", "send it to her?"), ("no, I said yes.", "yes"),
+    ("I said yes?.", "yes?"), ("not the terminal, the calendar?", "the calendar?"),
+])
+def test_correction_kind_keeps_the_question_mark(text, meant):
+    from jarvis.commander import correction_kind
+    assert correction_kind(text) == meant
+
+
+@pytest.mark.parametrize("said", I_SAID_QUESTIONS)
+def test_i_said_yes_with_a_question_mark_re_asks_and_never_sends(cmd, said):
+    """The "no, I said X" rung re-dispatches X ahead of the send rung; it
+    used to throw the "?" away first, so "I said yes?" SENT. Now "yes?"
+    reaches the bar. Whisper writes "?" on a rising tone."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert cmd._pending_send is not None, (said, res.reply)
+    assert res.reply == outbox.unsure_line(cmd._pending_send), (said, res.reply)
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+
+
+@pytest.mark.parametrize("said", ["no, I said yes", "I said yes", "no, I said send it to her",
+                                  "I meant yes", "I said go ahead"])
+def test_no_i_said_yes_is_still_a_yes(cmd, said):
+    """The 08-30 design, still pinned: a correction is not a decline."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.ack, (said, res)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+
+
+# ---- (e) the fold and a DIFFERENT address of hers -------------------------
+@pytest.mark.parametrize("said,to", [
+    ("yes, send it to heather@gmail.com", "heather@gmail.com"),
+    ("yes, send it to heather at gmail dot com", "heather@gmail.com"),
+    ("yes send it to heather.jones@example.com", "heather.jones@example.com"),
+    ("send it to heather@gmail.com", "heather@gmail.com"),
+    ("no, to heather@gmail.com", "heather@gmail.com"),
+    ("send it to heather at gmail dot com instead", "heather@gmail.com"),
+])
+def test_another_address_of_hers_is_read_back_as_said_never_mangled(cmd, said, to):
+    """Attack 1's worst class: "yes, send it to heather@gmail.com" was read
+    back "to her at gmail dot com" and the next yes SENT To=her@gmail.com.
+    The address is parsed off the UNFOLDED sentence; the fold stays away
+    from any sentence that holds an address."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert outbox.spoken_address(to) in res.reply, (said, res.reply)
+    assert " her at" not in res.reply and " her dot" not in res.reply, res.reply
+    assert "that address" not in res.reply and "same person" not in res.reply, res.reply
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == to, said
+
+
+@pytest.mark.parametrize("pending,book", [
+    ("Heather", {"ms heather": "heather@example.com"}),
+    ("Heather Smith", {"ms heather smith": "heather@example.com"}),
+])
+def test_a_fuller_name_is_a_correction_to_that_whole_name(cmd, pending, book):
+    """"yes, send it to Heather Jones" with Heather (or Heather Smith)
+    pending is a correction to HEATHER JONES -- not to "Jones", and not the
+    draft said back."""
+    cmd.services.assistant.data["send_file.contacts"] = book
+    res = cmd.handle(f"email the biosensors handout to {pending}", source="typed")
+    assert res.reply.endswith("Send it, sir?") and pending in res.reply, res.reply
+    res = cmd.handle("yes, send it to Heather Jones", source="typed")
+    assert not FakeSMTP.made
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who="Heather Jones"), res.reply
+    assert cmd._pending_send is None
+    assert cmd._pending_sendask is not None and cmd._pending_sendask.kind == "recipient"
+    assert cmd.question_open()
+
+
+# ---- Hunter's 19:00 ruling: a pronoun must match the pending person ------
+# GENDER SOURCE, explicit only: a stored honorific on the person or the book
+# row (Mr / Mrs / Ms / Miss / Sir / Madam), or a pronoun Hunter himself used
+# about the person earlier in the same draft conversation. NO name-based
+# guessing: a bare "heather" row says nothing, and then either pronoun
+# confirms exactly as before. ONE seam: Draft.to_gender, None by default,
+# filled by whoever knows (outbox.prepare from the book / people book, the
+# address answer from his own pronoun), so the address-book branch can fill
+# it from its rows later without touching the grammar.
+GENDER_LINE_HEATHER = "The draft is to Heather, sir. Send it to her?"
+GENDER_REASKS = [
+    # the five the brief moved out of sections 18 / 20 / 23 ...
+    "okay send it to him", "send it to him", "yes, to him", "yeah, send it to him",
+    "send it to him please",
+    # ... and the pinned sends that carried a "him" / "his" with them
+    "yes send it to him", "yes send it to him please", "okay, send it to him",
+    "yes, send it to his inbox",
+    # near neighbours
+    "yes, send it to his address", "send it to him, jarvis", "go on, send it to him",
+    "please send it to him", "yes go ahead and send it to him",
+]
+
+
+@pytest.mark.parametrize("said", GENDER_REASKS)
+def test_a_pronoun_of_the_other_gender_is_not_a_confirmation(cmd, said):
+    """Heather's row says Ms. "him" is not her: the re-ask names the pending
+    person and her pronoun, nothing is sent, the draft is kept, and the yes
+    he gives to THAT sentence sends."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert cmd._pending_send is not None, (said, res.reply)
+    assert res.reply == GENDER_LINE_HEATHER, (said, res.reply)
+    assert res.reply == outbox.gender_line(cmd._pending_send)
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+
+
+@pytest.mark.parametrize("said", GENDER_REASKS)
+def test_the_grammar_itself_stays_gender_blind(said):
+    """The gender lives on the DRAFT, not in the grammar: parse_send_answer
+    still takes "send it to him" as the shape of a yes."""
+    assert parse_send_answer(said) is True, said
+
+
+def test_after_the_gender_re_ask_her_pronoun_sends_and_his_spends_it_aloud(cmd):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.handle("send it to him", source="typed")
+    res = cmd.handle("send it to her", source="typed")
+    assert res.ack and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com"
+    FakeSMTP.made.clear()
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    cmd.handle("send it to him", source="typed")
+    res = cmd.handle("send it to him", source="typed")
+    assert res.reply == outbox.ASK_SPENT_LINE and not FakeSMTP.made
+    assert cmd._pending_send is None
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made
+
+
+@pytest.mark.parametrize("said", ["send it to him", "okay send it to him", "yes, to him",
+                                  "send it to her", "yes send it to his inbox"])
+def test_an_unknown_gender_takes_either_pronoun_exactly_as_before(cmd_plain, said):
+    cmd = cmd_plain
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    assert cmd._pending_send is not None and cmd._pending_send.to_gender is None
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.ack, (said, res)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+
+
+def test_a_mr_on_the_row_makes_her_the_wrong_pronoun(cmd):
+    cmd.services.assistant.data["send_file.contacts"]["mr jones"] = "jones@example.com"
+    res = cmd.handle("email the biosensors handout to Mr Jones", source="typed")
+    assert res.reply.endswith("Send it, sir?") and "to Mr Jones" in res.reply, res.reply
+    assert cmd._pending_send.to_gender == "m"
+    res = cmd.handle("send it to her", source="typed")
+    assert not FakeSMTP.made
+    assert res.reply == "The draft is to Mr Jones, sir. Send it to him?", res.reply
+    res = cmd.handle("send it to him", source="typed")
+    assert res.ack and FakeSMTP.made[-1].sent[0]["To"] == "jones@example.com"
+
+
+def test_the_honorific_on_the_row_counts_when_the_name_is_said_bare(cmd):
+    """The row says "mr jones"; he says "Jones". The row still resolves
+    through its honorific-stripped key, and the honorific is the gender."""
+    cmd.services.assistant.data["send_file.contacts"]["mr jones"] = "jones@example.com"
+    res = cmd.handle("email the biosensors handout to Jones", source="typed")
+    assert res.reply.endswith("Send it, sir?") and "to Jones, at jones at" in res.reply, res.reply
+    assert cmd._pending_send.to_gender == "m"
+    res = cmd.handle("yes, send it to her address", source="typed")
+    assert not FakeSMTP.made
+    assert res.reply == "The draft is to Jones, sir. Send it to him?", res.reply
+
+
+def test_the_people_book_honorific_fills_the_seam(cmd):
+    cmd.services.memory.resolve_person.return_value = {
+        "name": "Dana", "email": "dana@example.com", "honorific": "Mrs"}
+    res = cmd.handle("email the biosensors handout to Dana", source="typed")
+    assert res.reply.endswith("Send it, sir?") and "to Dana" in res.reply, res.reply
+    assert cmd._pending_send.to_gender == "f"
+    res = cmd.handle("send it to him", source="typed")
+    assert not FakeSMTP.made
+    assert res.reply == "The draft is to Dana, sir. Send it to her?", res.reply
+
+
+def test_his_own_pronoun_in_the_draft_conversation_fills_the_seam(cmd):
+    """"I've no address for Dana, sir. What is it?" -- "her address is dana
+    at example dot com". He called Dana "her": that is the pronoun the
+    confirmation has to match."""
+    res = cmd.handle("email the biosensors handout to Dana", source="typed")
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who="Dana")
+    res = cmd.handle("her address is dana at example dot com", source="typed")
+    assert res.reply.endswith("Send it, sir?") and "to Dana, at dana at" in res.reply, res.reply
+    assert cmd._pending_send.to_gender == "f"
+    res = cmd.handle("send it to him", source="typed")
+    assert not FakeSMTP.made
+    assert res.reply == "The draft is to Dana, sir. Send it to her?", res.reply
+    res = cmd.handle("yes, send it to her", source="typed")
+    assert res.ack and FakeSMTP.made[-1].sent[0]["To"] == "dana@example.com"
+
+
+def test_the_seam_and_its_explicit_sources():
+    from jarvis.outbox import Draft, gender_from_honorific, gender_from_pronouns
+    draft = Draft(path=Path("/tmp/x.pdf"), size=1, mtime=0.0, to_addr="a@b.co",
+                  to_name="Heather", account={}, subject="s")
+    assert draft.to_gender is None
+    assert gender_from_honorific("Mrs Jones") == "f"
+    assert gender_from_honorific("Ms Heather") == "f"
+    assert gender_from_honorific("Miss Heather Smith") == "f"
+    assert gender_from_honorific("Madam Secretary") == "f"
+    assert gender_from_honorific("Mr Jones") == "m"
+    assert gender_from_honorific("Mr. Jones") == "m"
+    assert gender_from_honorific("Sir Isaac") == "m"
+    assert gender_from_honorific("Dr Jones") is None
+    assert gender_from_honorific("Heather") is None          # no guessing from a name
+    assert gender_from_honorific("Dana") is None
+    assert gender_from_honorific("James") is None
+    assert gender_from_honorific("f") == "f" and gender_from_honorific("male") == "m"
+    assert gender_from_honorific("") is None
+    assert gender_from_pronouns("her address is dana at example dot com") == "f"
+    assert gender_from_pronouns("he's at jones at example dot com") == "m"
+    assert gender_from_pronouns("his address is x at y dot com") == "m"
+    assert gender_from_pronouns("dana at example dot com") is None
+    assert gender_from_pronouns("her and his") is None       # both: nobody's
+    assert gender_from_pronouns("") is None
+    assert outbox.gender_line(draft) == "The draft is to Heather, sir. Send it to them?"
+    draft.to_gender = "f"
+    assert outbox.gender_line(draft) == "The draft is to Heather, sir. Send it to her?"
+
+
+# ---- hand-off (f): SELF_LINE speaks the address --------------------------
+def test_self_line_speaks_a_typed_address(cmd):
+    res = cmd.handle("email the biosensors handout to dana@example.com", source="typed")
+    assert res.reply.endswith("Send it, sir?") and "dana at example dot com" in res.reply
+    res = cmd.handle("send it to me", source="typed")
+    assert not FakeSMTP.made and cmd._pending_send is not None
+    assert "not to you" in res.reply and "dana at example dot com" in res.reply, res.reply
+    assert "@" not in res.reply, res.reply
+
+
+# ---- hand-off (g): a correction without a yes on it -----------------------
+@pytest.mark.parametrize("said", [
+    "no, to Heather Jones", "no, send it to Heather Jones", "send it to Heather Jones instead",
+    "to Heather Jones", "send it to Heather Jones", "okay, to Heather Jones",
+])
+def test_a_correction_without_a_yes_is_still_a_correction(cmd, said):
+    """Pre-existing on jarvis-v3: these were a SILENT DROP after a
+    read-back, and the "yes" after them sent nothing. A name after "to" is
+    a correction whether or not a yes rides in front of it: the unknown
+    name gets the address question with a slot behind it."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.handled and res.speak, (said, res)
+    assert res.reply == outbox.NO_RECIPIENT_LINE.format(who="Heather Jones"), (said, res.reply)
+    assert cmd._pending_send is None
+    assert cmd._pending_sendask is not None and cmd._pending_sendask.kind == "recipient"
+    res = cmd.handle("yes", source="typed")
+    assert res is not None and res.reply == outbox.ADDRESS_REASK_LINE, (said, res)
+    assert not FakeSMTP.made
+
+
+@pytest.mark.parametrize("said", [
+    "no, to Dana", "no, send it to Dana", "send it to Dana instead", "to Dana",
+    "send it to Dana",
+])
+def test_a_correction_without_a_yes_to_a_known_name_is_read_back(cmd, said):
+    cmd.services.assistant.data["send_file.contacts"]["dana"] = "dana@example.com"
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert "dana at example dot com" in res.reply and "heather" not in res.reply.lower()
+    cmd.handle("yes", source="typed")
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "dana@example.com", said
+
+
+@pytest.mark.parametrize("said", ["no, to Heather", "no, send it to heather", "not to her",
+                                  "no, to her"])
+def test_a_no_with_the_pending_person_on_it_never_sends(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made and res is not None and res.reply, (said, res)
+    assert "no address" not in res.reply.lower(), (said, res.reply)
+    cmd.handle("yes", source="typed")
+    assert not (FakeSMTP.made and FakeSMTP.made[-1].sent
+                and FakeSMTP.made[-1].sent[0]["To"] != "heather@example.com")
+
+
+# ---- hand-off (h): the INFO lines carry no address ------------------------
+def test_the_confirm_paths_log_no_address(cmd, caplog):
+    caplog.set_level(logging.INFO)
+    for said in ("yes, send it to dana@example.com", "send it to dana@example.com",
+                 "yes, send it to dana at example dot com", "no, to dana@example.com",
+                 "dana@example.com", "no, I said send it to dana@example.com",
+                 "yes, send it to her and dana@example.com", "send it to me, dana@example.com",
+                 "dana@example.com please right now if you would be so kind"):
+        cmd.handle("email the biosensors handout to Heather", source="typed")
+        cmd.handle(said, source="typed")
+        cmd.handle("never mind", source="typed")
+    cmd.handle("email the biosensors handout to Dana", source="typed")
+    cmd.handle("dana at example dot com", source="typed")
+    cmd.handle("no", source="typed")
+    cmd.handle("email the biosensors handout to dana@example.com", source="typed")
+    cmd.handle("no", source="typed")
+    assert caplog.text, "nothing was logged at INFO -- the probe proves nothing"
+    assert "dana@example.com" not in caplog.text
+    assert "dana at example dot com" not in caplog.text
+    assert "heather@example.com" not in caplog.text
+    assert not FakeSMTP.made
+
+
+def test_mask_addresses():
+    assert outbox.mask_addresses("yes, to dana@example.com now") == "yes, to d…@example.com now"
+    assert outbox.mask_addresses("to dana at example dot com") == "to … at example dot com"
+    assert outbox.mask_addresses("send it to her") == "send it to her"
+
+
+# ---- the missed yeses --------------------------------------------------
+SIXTH_PASS_SENDS = [
+    "just do it", "just send it", "let's go", "send it already", "send it straight away",
+    "ship it over", "that is correct", "yes, that's it", "yes, exactly", "yes, I'm sure",
+    "positive", "yes, really", "yes, I'm certain", "yes send it, I'm sure",
+    "yes, go ahead, I'm sure", "yes, definitely",
+    # an approval word in front of a head
+    "sounds good, send it", "perfect, send it", "sure thing, send it", "righto, send it",
+    "no worries, send it", "ya, send it", "good, send it", "great, send it",
+    # bare "please" and "go" after a read-back
+    "please", "go",
+    # a three-letter stutter
+    "sen- send it", "sen-send it to her",
+]
+SIXTH_PASS_NAME_SENDS = [
+    "to Heather, yes", "yes, Heather", "Heather, yes, send it", "to Heather please",
+    "yes, to Heather, go ahead", "to Heather", "Heather, send it", "yes to Heather",
+]
+
+
+@pytest.mark.parametrize("said", SIXTH_PASS_SENDS)
+def test_the_sixth_pass_yeses_are_a_yes_to_the_grammar(said):
+    assert parse_send_answer(said) is True, said
+
+
+@pytest.mark.parametrize("said", SIXTH_PASS_SENDS + SIXTH_PASS_NAME_SENDS)
+def test_the_sixth_pass_yeses_send_to_the_pending_address(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.handled and res.ack, (said, res)
+    assert "rather be certain" not in str(res.reply), (said, res.reply)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+    assert cmd._pending_send is None and cmd._send_aside is None
+
+
+@pytest.mark.parametrize("said", SIXTH_PASS_SENDS + SIXTH_PASS_NAME_SENDS + [
+    "yes, I'm sure", "yes, really", "yes, I'm certain", "yes send it, I'm sure", "positive",
+    "yes, go ahead, I'm sure", "yes", "send it to her", "just send it", "please",
+])
+def test_on_the_second_turn_any_yes_the_grammar_takes_sends(cmd, said):
+    """After the one re-ask, the reassurance he gives ("yes, I'm sure")
+    used to be spent aloud -- two yeses and nothing sent."""
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle("okay", source="typed")
+    assert res.reply == outbox.unsure_line(cmd._pending_send) and cmd._pending_send.reasked
+    res = cmd.handle(said, source="typed")
+    assert res is not None and res.ack, (said, res)
+    assert res.reply != outbox.ASK_SPENT_LINE, (said, res.reply)
+    assert FakeSMTP.made and FakeSMTP.made[-1].sent[0]["To"] == "heather@example.com", said
+
+
+@pytest.mark.parametrize("said,want", [
+    ("sen- send it", "send it"), ("sen-send it to her", "send it to her"),
+    ("just send it", "send it"), ("yes, just send it", "yes, send it"),
+    ("perfect, send it", "send it"), ("sure thing, send it", "send it"),
+    ("no worries, send it", "send it"), ("sounds good, send it", "send it"),
+    ("righto, send it", "send it"), ("exactly, send it", "send it"),
+    # not a stutter, not a filler
+    ("e-mail it to her", "e-mail it to her"), ("re-send it", "re-send it"),
+    ("co-op", "co-op"),
+    ("justin, send it", "justin, send it"), ("no worries", "no worries"),
+])
+def test_what_send_clean_takes_off_in_the_sixth_pass(said, want):
+    from jarvis.commander import _send_clean
+    assert _send_clean(said) == want
+
+
+# ---- the guards beside the new heads -------------------------------------
+@pytest.mark.parametrize("said", [
+    "go to Dana", "go away", "let's go to Dana", "ship it over to Dana", "please, to Dana",
+    "just send it to Dana", "positive?", "yes, exactly, and turn the lights off", "really",
+    "sure thing", "no worries", "sounds good", "perfect", "good", "exactly", "exactly?",
+    "go?", "please don't", "please stop", "yes, I'm sure, to Dana",
+    "let's go and turn the lights off", "just", "just to Dana", "ship it over to me",
+    "go on and send it to me", "please send it to me",
+])
+def test_the_sixth_pass_heads_stop_at_the_guards(said):
+    assert parse_send_answer(said) is not True, said
+
+
+@pytest.mark.parametrize("said", ["send it to Heather's", "yes, to her boss's",
+                                  "send it to heather's", "yes, send it to Dana's"])
+def test_a_bare_possessive_is_the_re_ask_not_an_address_for_bosss(cmd, said):
+    """"send it to Heather's" -- the noun fell off an early endpoint. Not
+    a correction to a person called "Heather's": the re-ask."""
+    from jarvis.commander import _send_correction, _send_correction_malformed
+    assert _send_correction(said) is None, said
+    assert _send_correction_malformed(said), said
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res.reply == outbox.unsure_line(cmd._pending_send), (said, res.reply)
+    assert cmd._pending_sendask is None
+
+
+@pytest.mark.parametrize("said", ["go ahead and send it to him too", "yes, I told him I'd send it",
+                                  "okay send it to him when he's back"])
+def test_a_wrong_pronoun_in_a_sentence_nothing_takes_is_the_re_ask_not_a_drop(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert cmd._pending_send is not None, (said, res.reply)
+    assert res.reply in (outbox.unsure_line(cmd._pending_send),
+                         outbox.gender_line(cmd._pending_send)), (said, res.reply)
+
+
+@pytest.mark.parametrize("said", ["Heather", "Heather?", "Dana, yes, send it", "yes, Dana",
+                                  "Heather Jones, yes", "yes, Heather Jones"])
+def test_a_bare_name_or_another_name_beside_a_yes_never_sends(cmd, said):
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made, (said, res)
+    assert res is not None and res.handled and res.reply, (said, res)
+    assert cmd._pending_send is not None or cmd._pending_sendask is not None, said
+
+
+# ---- a late no is a no ----------------------------------------------------
+@pytest.mark.parametrize("said", [
+    "please don't", "send it to her, actually no", "send it to her. no.", "yes, hold on",
+    "yes, send it, no wait", "yeah go ahead, actually no", "yep, send it, hang on",
+    "yes, on second thought don't", "please, no", "yes, wait",
+])
+def test_a_late_no_is_a_no(cmd, said):
+    assert parse_send_answer(said) is False, said
+    cmd.handle("email the biosensors handout to Heather", source="typed")
+    res = cmd.handle(said, source="typed")
+    assert not FakeSMTP.made and res.reply == outbox.DROPPED_LINE, (said, res)
+    assert cmd._pending_send is None
+    cmd.handle("yes", source="typed")
+    assert not FakeSMTP.made
+
+
+@pytest.mark.parametrize("said", ["no worries, send it", "yes, no doubt"])
+def test_a_no_word_that_is_not_a_no_still_sends(said):
+    assert parse_send_answer(said) is True, said

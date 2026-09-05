@@ -5463,6 +5463,14 @@ _SEND_REF = (r"(?:(?:her|his|their|its|that|this|the same|the usual)\s+"
              + _SEND_REF_NOUN +
              r"|her|him|them|it|that|this|the same|the usual|same)")
 _SEND_REF_RX = re.compile(r"^" + _SEND_REF + r"$", re.I)
+# What a TAIL may carry of the above: a ref WITH a noun on it, or "the
+# same" / "the usual". The bare pronouns are deliberately not tail words
+# any more (the sixth pass, 09-04): "send it to her, him", "send it to
+# her. him.", "yes, him" all rode through as a yes on a bare pronoun in
+# the tail, and each names a second person. A bare pronoun is the draft
+# said back only directly after "to" (the _SEND_TO_REF head and tail).
+_SEND_REF_TAIL = (r"(?:(?:her|his|their|its|that|this|the same|the usual)\s+"
+                  + _SEND_REF_NOUN + r"|the same|the usual|same)")
 # The bare pronouns, on their own: what may NOT follow a connector.
 _SEND_BARE_REF = r"(?:her|him|them|it|that|this)"
 _SEND_TO_PREP = r"(?:to|over to|on to|through to)"
@@ -5473,8 +5481,30 @@ _SEND_SAME_ACCT = frozenset(("same", "that", "this", "usual", "that same",
                              "this same", "the same"))
 _SEND_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|then|and|"
               r"send it|send that|go ahead|do it|" + _SEND_TO_REF + r"|"
-              + _SEND_FROM_SAME + r"|" + _SEND_REF +
+              + _SEND_FROM_SAME + r"|" + _SEND_REF_TAIL +
               r"))*[?.!]*$")
+# The approval words a man says in front of a real yes -- "perfect, send
+# it", "sounds good, send it", "sure thing, send it", "righto, send it", "no
+# worries, send it" (the sixth pass, 09-04: each was re-asked, because the
+# lead filler list had none of them and the yes grammar has no head that
+# starts on one). They are fillers in FRONT of a yes and tail words behind
+# one; on their own they are still the maybe they always were. "no
+# worries" is the one that starts on "no": it is stripped as a phrase, and
+# "no worries, don't send it" is still a no because the no grammar runs on
+# what is left.
+_SEND_APPROVAL = (r"(?:sounds good|sounds great|sure thing|no worries|perfect|"
+                  r"righto|great|lovely|brilliant|excellent|wonderful|splendid|"
+                  r"cool|good|very well|very good|fair enough|roger that|roger|"
+                  r"exactly|precisely|indeed)")
+# The reassurance a man adds to a yes he has already given, or gives to
+# the re-ask: "yes, I'm sure", "yes, really", "yes, I'm certain",
+# "positive". Tail words: "yes, really" is a yes, and "really" alone is
+# not (a rising "really" is a question whether or not Whisper wrote the
+# mark).
+_SEND_REASSURE = (r"(?:really|definitely|absolutely|certainly|for sure|of course|"
+                  r"no doubt|i'?m sure|i'?m certain|i'?m positive|positive|"
+                  r"quite sure|honestly|i mean it|that'?s it|exactly|precisely|"
+                  r"indeed|sure)")
 # "ok" / "okay" / "sure" / "alright" are deliberately ABSENT as answers of
 # their own. They are the words a man says while still reading the
 # read-back, and this is the one question in the app where "probably yes"
@@ -5498,13 +5528,22 @@ _SEND_REF_HEAD = (r"(?:(?:her|his|their|that|this|the same|the usual)\s+"
 # "through" joined over/along/off/out/on, and "push it through" with it;
 # "let's do it", "carry on", "that's fine", "that'll do" are heads (the
 # fourth review, 09-04: each was re-asked).
+# The sixth pass (09-04) added "let's go", "ship it over", "send it
+# already / straight away", "that is correct", "that's it", "positive",
+# "ya", and the bare "please" and "go" a man says to a question he has
+# just heard -- each measured as a re-ask on the harness. "go" alone is
+# the truncated "go ahead"; "go to Dana" / "go away" are still not a yes,
+# because nothing after the head may be outside the tail.
 _SEND_YES_HEAD = (
-    r"(?:yes|yeah|yep|yup|aye|affirmative|correct|confirmed?|certainly|"
-    r"absolutely|definitely|of course|go ahead|do it|send it|send that|"
-    r"send it now|please do|that'?s (?:right|correct)|that'?s the one|"
-    r"fire away|off you go|go on(?: then)?|go for it|ship it|"
-    r"let'?s do it|carry on|that'?s fine|that'?ll do|"
-    r"(?:send|push) (?:it|that|this) (?:over|along|off|out|on|through)(?: then)?|"
+    r"(?:yes|yeah|yep|yup|ya|aye|affirmative|correct|confirmed?|certainly|"
+    r"absolutely|definitely|of course|positive|go ahead|do it|send it|send that|"
+    r"send it now|please do|please|that(?:'?s| is) (?:right|correct|it)|"
+    r"that(?:'?s| is) the one|"
+    r"fire away|off you go|go on(?: then)?|go for it|ship it|go|"
+    r"let'?s do it|let'?s go|carry on|that'?s fine|that'?ll do|"
+    r"i'?m sure|i'?m certain|for sure|by all means|"
+    r"(?:send|push|ship) (?:it|that|this) (?:over|along|off|out|on|through)(?: then)?|"
+    r"send (?:it|that|this) (?:already|straight away|right away|immediately)|"
     r"send (?:it|that|this) " + _SEND_TO_PREP + r" " + _SEND_REF + r"|"
     + _SEND_TO_PREP + r" " + _SEND_REF_HEAD + r"|" + _SEND_REF_HEAD + r")")
 # A yes may be followed by another yes: "yes, that's the one", "yes that's
@@ -5516,26 +5555,35 @@ _SEND_YES_HEAD = (
 # send"): an early endpoint took the rest.
 _SEND_YES_TAIL = (r"(?:[.!?,\s]+(?:jarvis|sir|please|thanks|thank you|now|"
                   r"then|and|go|send|" + _SEND_YES_HEAD + r"|" + _SEND_TO_REF + r"|"
-                  + _SEND_FROM_SAME + r"|" + _SEND_REF +
+                  + _SEND_FROM_SAME + r"|" + _SEND_REF_TAIL + r"|"
+                  + _SEND_APPROVAL + r"|" + _SEND_REASSURE +
                   r"))*[?.!]*$")
 _SEND_YES_RX = re.compile(
     r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?" + _SEND_YES_HEAD + _SEND_YES_TAIL,
     re.I)
 # The three BARS on a sentence the grammar above takes (the fourth review,
 # 09-04 -- eight non-confirmations sent, every one through one of these):
-#   1. it ends on "?" -- Whisper writes one on a rising intonation, and
-#      "send it to her?", "yes?", "go on?", "to her address?" are questions
-#      put to me, not answers to mine;
-#   2. it ends on "and" -- "yes, and" is a sentence he was interrupted in
-#      (and so is "yes and then": a trailing "then" alone is "do it then");
+#   1. it holds a "?" ANYWHERE -- Whisper writes one on a rising
+#      intonation, and "send it to her?", "yes?", "go on?", "to her
+#      address?" are questions put to me, not answers to mine. The sixth
+#      pass widened this from the last character to the whole sentence:
+#      "send it to her?!", "yes?!" and "send it to her? send it to him."
+#      each SENT, the "?" swallowed as punctuation or as a separator;
+#   2. it ends on a connector, or on a RUN of connectors and truncated
+#      heads -- "yes, and", "yes and then", "yes and then send", "yes and
+#      then then" are sentences he was interrupted in. A trailing "then"
+#      or "go" or "send" ALONE is still a yes ("do it then", "yes go");
 #   3. a connector ("and" / "then") is followed by a BARE pronoun, with or
 #      without a "to" -- "send it to her and to him", "send it to her, then
 #      him", "yes and him" name a SECOND recipient. A ref with a noun on
-#      it ("and to her address") is still the same person.
+#      it ("and to her address") is still the same person. (The wider
+#      second-recipient rule, any joiner, lives in _send_second_recipient
+#      and runs BEFORE this grammar can say yes.)
 # A barred sentence is a NEAR yes: asked again, never sent, never dropped.
 _SEND_YES_BAR_RX = re.compile(
-    r"\?\s*$"
-    r"|\band(?:[.!?,\s]+then)?[.!?,\s]*$"
+    r"\?"
+    r"|\b(?:and|plus)[.!?,\s]*$"
+    r"|\b(?:and|then|plus)(?:[.!?,\s]+(?:and|then|plus|send|go))+[.!?,\s]*$"
     r"|\b(?:and|then)[.!?,\s]+(?:" + _SEND_TO_PREP + r"\s+)?" + _SEND_BARE_REF
     + r"(?!['\w])(?![.!?,\s]+" + _SEND_REF_NOUN + r"\b)",
     re.I)
@@ -5559,34 +5607,88 @@ def _send_yes_barred(t: str) -> bool:
 # of his own below this rung, exactly as before.
 _SEND_SECOND_RX = re.compile(
     r"(?:^|[.!?,\s])" + _SEND_TO_PREP + r"\s+" + _SEND_REF + r"(?!['\w])"
-    r"[.!?,\s]+(?:and|then|plus|also|as well as|cc|copy(?:ing)?)\b"
+    r"[.!?,\s]+(?:and|then|plus|also|as well as|cc|copy(?:ing)?|"
+    r"with(?: a)? (?:copy|cc)(?: to)?|now)\b"
     r"[.!?,\s]*(?P<rest>\S.*)$", re.I)
+# What may follow the connector and still be a recipient whatever its
+# length: "to X", "cc X", "one to X", a count, an address -- and a whole
+# "send it to X" ("send it to her, then send it to Dana" was a correction
+# to Dana, the sixth pass).
 _SEND_SECOND_HEAD_RX = re.compile(
-    r"^(?:to|cc|copy(?:ing)?|one to|a copy to|copies to|\d+|[^\s@]+@)", re.I)
+    r"^(?:to|cc|copy(?:ing)?|one to|a copy to|copies to|\d+|[^\s@]+@|"
+    r"(?:send|e-?mail|mail) (?:it|that|this|one) (?:to|over to|on to|through to)\b)", re.I)
 _SEND_SECOND_TAIL_RX = re.compile(
-    r"(?:[.!?,\s]+(?:please|thanks|thank you|sir|jarvis|now|too|as well))*"
+    r"(?:(?:^|[.!?,\s]+)(?:please|thanks|thank you|sir|jarvis|now|too|as well)\b)*"
     r"[.!?,\s]*$", re.I)
 
 
+# Every mention of a person by pronoun, with or without the read-back's own
+# "to" in front of it, and what each stands for: "her" / "his" are one
+# person (f), "him" another (m), "them" / "their" a third (t). Two
+# mentions that disagree -- "send it to her, him", "send it to her, to
+# him", "... then send it to him", "send it to her. him." -- name two
+# people, whatever joins them (the sixth pass, 09-04: a comma, a full
+# stop, "now", "or" and a second "send it to" all rode through). A
+# mention with no "to" in front of it and no noun on it ("yes, him",
+# "yes, her and Dana", "send it to her and her mother") is a person the
+# read-back never said back, and is a second recipient too.
+# "the same person" is what _send_fold_pending makes of the pending NAME,
+# and it is a mention of its own kind (p): "send it to her and to Heather"
+# is her twice by his lights, but the fifth pass pinned it as the re-ask,
+# and "send it to her, Heather" should not fare better than "send it to
+# her, him".
+_SEND_MENTION_RX = re.compile(
+    r"(?:^|[.!?,\s])(?P<to>(?:send (?:it|that|this) )?" + _SEND_TO_PREP + r"\s+)?"
+    r"(?P<ref>her|him|them|his|their|the same person)"
+    r"(?P<noun>\s+" + _SEND_REF_NOUN + r"\b)?(?!['\w])",
+    re.I)
+_SEND_MENTION_KIND = {"her": "f", "his": "f", "him": "m", "them": "t", "their": "t",
+                      "the same person": "p"}
+
+
 def _send_second_recipient(t: str) -> bool:
+    """True when the sentence names a SECOND person beside the one he was
+    read: two pronoun mentions that disagree, a bare pronoun the read-back
+    never said, or the read-back's own "to her" with a connector and a
+    recipient-shaped remainder after it. Runs on the WHOLE sentence, and
+    BEFORE the yes grammar may say yes."""
+    kinds = set()
+    for m in _SEND_MENTION_RX.finditer(t):
+        ref = m.group("ref").lower()
+        kinds.add(_SEND_MENTION_KIND[ref])
+        if not m.group("to") and not m.group("noun") and ref != "the same person":
+            # A bare pronoun with no "to": "yes, him", "yes, her and
+            # Dana", "send it to her and her mother". Not the draft said
+            # back -- somebody else. ("her inbox" has a noun on it.)
+            return True
+    if len(kinds - {"t"}) > 1 or (len(kinds) > 1 and "t" in kinds):
+        return True
     m = _SEND_SECOND_RX.search(t)
     if not m:
         return False
     rest = _SEND_SECOND_TAIL_RX.sub("", m.group("rest"), count=1).strip()
     if not rest:
         return False
+    # "yes, to her and to her address": the same person again, with a noun
+    # on it, is not a second recipient.
+    again = re.sub(r"^(?:send (?:it|that|this) )?" + _SEND_TO_PREP + r"\s+", "", rest,
+                   flags=re.I)
+    if _SEND_REF_RX.match(again):
+        return False
     return bool(_SEND_SECOND_HEAD_RX.match(rest)) or len(rest.split()) <= 3
 
 
 def _send_near_yes(text) -> bool:
-    """A yes-shaped sentence one of the bars stopped, or the read-back's
-    own "to her" with a second recipient after it: the one re-ask."""
+    """A yes-shaped sentence one of the bars stopped, or a second
+    recipient by any joiner: the one re-ask."""
     t = _send_clean(text)
-    if not t or _SEND_NO_RX.match(t):
+    if not t or _SEND_NO_RX.match(t) or _SEND_LATE_NO_RX.search(t):
         return False
+    if _send_second_recipient(t):
+        return True
     if _SEND_YES_RX.match(t):
         return _send_yes_barred(t)
-    return _send_second_recipient(t)
+    return False
 # What comes off before the yes / no grammars run (the third review):
 #   * a leading run of fillers -- "um", "uh", "er", "hmm", "well", "so",
 #     "okay", "right", "sure", "alright", "fine" -- after an optional
@@ -5601,18 +5703,24 @@ def _send_near_yes(text) -> bool:
 # then, off you go", "well then, yes" -- and "then, yes"), so "okay then"
 # alone cleans to nothing and is handed back whole; the backchannels Whisper
 # hyphenates ("mm-hmm", "uh-huh") are fillers too (the fourth review).
+# The approval words (_SEND_APPROVAL) are lead fillers too, and "just" is a
+# filler anywhere ("just do it", "just send it", "yes, just send it" -- the
+# sixth pass). Multi-word fillers come first in the alternation so "sure
+# thing" is not "sure" + "thing".
 _SEND_FILLER_LEAD_RX = re.compile(
     r"^((?:jarvis[,\s]+)?)"
     r"(?:(?:mm-hmm|mm hmm|uh-huh|uh huh|um+|uh+|er+|erm|hmm+|hm+|mm+|mhm|"
-    r"well|so|ok(?:ay)?|right|alright|all right|sure|fine|then)\b[,.\s]*)+", re.I)
+    + _SEND_APPROVAL[3:-1] + r"|"
+    r"well|so|ok(?:ay)?|right|alright|all right|sure|fine|then|just)\b[,.\s]*)+", re.I)
 _SEND_FILLER_MID_RX = re.compile(
-    r"\b(?:mm-hmm|uh-huh|um+|uh+|er|erm|hmm+|hm+)\b[,.]*\s*", re.I)
-# A stutter Whisper writes with a hyphen: "y-yes", "s-send it", "ye- yes".
-# A one- or two-letter fragment, a hyphen, and the word it was the start
-# of. "e-mail" is untouched: "mail" does not begin with "e".
-_SEND_STUTTER_RX = re.compile(r"\b([a-z]{1,2})-\s*(?=\1)", re.I)
+    r"\b(?:mm-hmm|uh-huh|um+|uh+|er|erm|hmm+|hm+|just)\b[,.]*\s*", re.I)
+# A stutter Whisper writes with a hyphen: "y-yes", "s-send it", "ye- yes",
+# "sen- send it". A one- to three-letter fragment, a hyphen, and the word
+# it was the start of. "e-mail" is untouched: "mail" does not begin with
+# "e"; "well-wisher" is four letters and a different word.
+_SEND_STUTTER_RX = re.compile(r"\b([a-z]{1,3})-\s*(?=\1)", re.I)
 _SEND_YES_RUN_RX = re.compile(
-    r"\b(yes|yeah|yep|yup|aye)\b(?:[,.\s]+(?:yes|yeah|yep|yup|aye|sure|"
+    r"\b(yes|yeah|yep|yup|ya|aye)\b(?:[,.\s]+(?:yes|yeah|yep|yup|ya|aye|sure|"
     r"ok(?:ay)?)\b)+", re.I)
 _SEND_NO_RUN_RX = re.compile(
     r"\b(no|nope|nah)\b(?:[,.\s]+(?:no|nope|nah)\b)+", re.I)
@@ -5638,11 +5746,20 @@ def _send_clean(text: str) -> str:
 # one where nothing leaves the machine -- a no followed by any yes-shaped
 # thing is a no.
 _SEND_NO_RX = re.compile(
-    r"^(?:jarvis[,\s]+)?(?:no[,\s]+)?"
+    r"^(?:jarvis[,\s]+)?(?:please[,\s]+)?(?:no[,\s]+)?"
     r"(?:no|nope|nah|negative|don'?t|do not|stop|cancel|abort|"
     r"not now|not yet|not that one|wrong one|wrong file|wrong person|"
-    r"hold on|hold off|wait|never ?mind|forget it|scratch that|leave it|"
+    r"hold on|hold off|hang on|wait|never ?mind|forget it|scratch that|leave it|"
     r"no thanks|no thank you|that'?s wrong)" + _SEND_YES_TAIL, re.I)
+# A no said LATE, after the yes he started on: "send it to her, actually
+# no", "yes, hold on", "yes, send it, no wait", "send it to her. no." Each
+# was re-asked (safe, nothing sent) with the draft kept armed for the next
+# stray yes (the sixth pass, 09-04). A sentence that ENDS on a no-word is
+# a no: the draft is dropped, out loud.
+_SEND_LATE_NO_RX = re.compile(
+    r"[.!?,\s]+(?:(?:actually|on second thought|wait|hang on|hold on|no)[.!?,\s]+)*"
+    r"(?:no|nope|nah|don'?t|do not|stop|cancel|abort|hold on|hang on|wait|"
+    r"never ?mind|not yet|not now|forget it|leave it|scratch that)[.!?]*$", re.I)
 _SEND_MAYBE_RX = re.compile(
     r"^(?:jarvis[,\s]+)?"
     r"(?:ok(?:ay)?|alright|all right|sure|fine|right|very well|mhm|mm|"
@@ -5660,10 +5777,14 @@ _SEND_MAYBE_RX = re.compile(
 # or account. Never sent. The "to" must follow a word that makes it a
 # recipient ("send it to", "yes to", "but to"): "Yeah, so you should be
 # able to look that up." has a "to" in it too.
+# A bare "to X" ("to Heather Jones") is the shape too (the address-book
+# hand-off, 09-04): said to a read-back it is a correction, and it used to
+# be a silent drop.
 _SEND_CORRECT_TO_RX = re.compile(
+    r"(?:^(?:jarvis[,\s]+)?|"
     r"\b(?:send|e-?mail|mail|forward|shoot|fire|it|that|this|one|file|"
     r"but|rather|instead|no|yes|yeah|yep|okay|ok|sure|actually)[,\s]+"
-    r"(?:it\s+|that\s+|this\s+)?to\s+(?P<who>[^,.!?]+?)"
+    r"(?:it\s+|that\s+|this\s+)?)to\s+(?P<who>[^,.!?]+?)"
     r"(?:\s+(?:instead|rather|please|thanks|thank you|sir|jarvis|now|then))*"
     r"[.!?,]*$", re.I)
 _SEND_CORRECT_ACCT_RX = re.compile(
@@ -5693,8 +5814,62 @@ def _send_correction_malformed(said: str) -> bool:
     who = tm.group("who").strip()
     if _SEND_REF_RX.match(who):
         return False
+    # "send it to Heather's" / "yes, to her boss's": a possessive with
+    # nothing after it names an address of somebody, not somebody -- an
+    # early endpoint took the noun. The re-ask, not "I've no address for
+    # boss's, sir".
+    if re.search(r"'s$", who, re.I):
+        return True
     who = re.sub(r"^(?:her|his|their)\s+", "", who, flags=re.I)
     return bool(_SEND_WHO_BAD_RX.match(who))
+
+
+def _send_names_someone(said: str, cfg=None, memory=None) -> bool:
+    """True when the sentence plainly names a recipient of its own, with
+    or without a yes on it: an address, a capitalised name after "to", or
+    a name the book knows. The address-book hand-off (09-04): "no, to
+    Heather Jones", "send it to Heather Jones instead" and a bare "to
+    Heather Jones" after a read-back were a SILENT DROP, because the
+    correction was only read off a sentence parse_yes_no called a yes.
+    Lower-case words after "to" that nobody knows ("send it to her
+    tomorrow") are still not a correction."""
+    t = " ".join(str(said or "").split())
+    if not t:
+        return False
+    if outbox.parse_address(t):
+        return True
+    tm = _SEND_CORRECT_TO_RX.search(t)
+    if not tm:
+        return False
+    who = tm.group("who").strip()
+    if not who or _SEND_REF_RX.match(who) or _SEND_WHO_BAD_RX.match(who):
+        return False
+    if who.lower() in _SEND_PRONOUNS or who.lower() in _SEND_SELF or who.endswith("'s"):
+        return False
+    words = who.split()
+    if len(words) <= 3 and all(w[:1].isupper() for w in words):
+        return True
+    if cfg is not None:
+        try:
+            return bool(outbox.resolve_recipient(cfg, memory, who)[0])
+        except Exception:                                  # noqa: BLE001 - book
+            log.debug("resolve_recipient failed", exc_info=True)
+    return False
+
+
+def _send_is_pending_person(who: str, draft) -> bool:
+    """Is the corrected recipient the one he was read? "Heather" with
+    Heather (or Heather Smith) pending, or her own address, is the draft
+    said back -- not a correction to her."""
+    w = " ".join(str(who or "").split()).lower()
+    if not w:
+        return False
+    to_name = " ".join(str(getattr(draft, "to_name", "") or "").split()).lower()
+    to_addr = str(getattr(draft, "to_addr", "") or "").strip().lower()
+    if to_addr and outbox.parse_address(w).lower() == to_addr:
+        return True
+    names = {to_name} | ({to_name.split()[0]} if to_name else set())
+    return w in names - {""}
 
 
 def _send_correction(said: str) -> Optional[tuple[str, str]]:
@@ -5734,7 +5909,7 @@ def _send_correction(said: str) -> Optional[tuple[str, str]]:
             # This is tested BEFORE the possessive is stripped: stripping
             # first is how "her address" became a recipient called
             # "address" (the second review).
-            if _SEND_REF_RX.match(who):
+            if _SEND_REF_RX.match(who) or re.search(r"'s$", who, re.I):
                 who = ""
             else:
                 # "to her work address" names an address of a person, not
@@ -5778,6 +5953,7 @@ class SendAsk:
     made_at: float = 0.0
     reasked: bool = False
     to_name: str = ""          # the name he said, when ``who`` is an address
+    gender: Optional[str] = None   # what the draft conversation has said so far
 
     def stale(self, now: Optional[float] = None) -> bool:
         now = time.monotonic() if now is None else float(now)
@@ -5913,42 +6089,75 @@ def pick_from_answer(text, candidates) -> tuple:
     return scored[0][1], False
 
 
+# "at gmail dot com" with no local part in front of it -- an address
+# shape parse_address will not take, but a destination of its own all the
+# same, and no place for the fold.
+_SEND_AT_DOT_RX = re.compile(r"\bat\s+[\w\-]+(?:\s+dot\s+[\w\-]+)+", re.I)
+
+
 def _send_fold_pending(text: str, draft) -> str:
-    """The pending recipient said by NAME, folded to the pronoun the
-    grammar already takes: "yes, to Heather" -> "yes, to her"; "to
-    heather's address" -> "to her address"; "to heather@x.com" (the
-    draft's own address) -> "to her".
+    """The pending recipient said by NAME (or by the draft's own address),
+    folded to a NEUTRAL form the grammar already takes as the draft said
+    back: "yes, to Heather" -> "yes, to the same person"; "to heather's
+    address" -> "to that address"; "to heather@x.com" (the draft's own
+    address, typed or spoken) -> "to that address"; "yes, Heather" ->
+    "yes, the same person".
 
     The fourth review (09-04): "yes, to Heather" was a CORRECTION to the
     person he had just been read (one needless re-read), "yes, to
     heather's address" became a recipient called "heather's address", and
     "send it to heather" fell past the read-back rung to the send-file
-    family, which asked "Which file, sir?" and armed nothing. Only after
-    "to": "Heather" alone is not folded, and a name that is NOT the
-    pending one still corrects. "to heather's mother" is untouched -- the
-    possessive folds only with one of the read-back's own nouns on it.
+    family, which asked "Which file, sir?" and armed nothing.
+
+    The sixth pass (09-04) rewrote what the fold may touch, after attack
+    1's worst class: the fold turned "to heather@gmail.com" into "to
+    her@gmail.com" and the next yes SENT to that fabricated address. So:
+      * the draft's OWN address is folded first, by its exact span;
+      * any OTHER address in the sentence, or an "at ... dot" shape, means
+        the sentence names a destination of its own -- no fold at all, and
+        the correction reads the address off the UNFOLDED text;
+      * the name folds only when nothing address-like, possessive-like or
+        name-like follows it: not "heather@", "heather.jones", "heather at
+        work", "Heather Jones", "Heather-Jones", "heather's mother";
+      * a BARE name (no "to") folds only beside a yes of its own ("yes,
+        Heather", "Heather, yes, send it"); "Heather" alone is left to the
+        re-ask -- a name on its own is as often a correction as a yes;
+      * the fold never produces a pronoun: "the same person" carries no
+        gender for the 19:00 ruling's check to trip on -- and it is a
+        mention of its own to _send_second_recipient, so "to her and to
+        Heather" is still the re-ask the fifth pass pinned.
+    A name that is NOT the pending one still corrects.
     """
     t = str(text or "")
-    names = []
-    to_name = " ".join(str(getattr(draft, "to_name", "") or "").split())
-    if to_name:
-        names.append(to_name)
-        if " " in to_name:
-            names.append(to_name.split()[0])
     to_addr = str(getattr(draft, "to_addr", "") or "").strip()
     if to_addr:
-        names.append(to_addr)
-    if not names:
+        span = outbox.address_span(t)
+        if span and span[0].lower() == to_addr.lower():
+            t = t[:span[1]] + "that address" + t[span[2]:]
+    if outbox.parse_address(t) or _SEND_AT_DOT_RX.search(t):
         return t
-    alts = "|".join(re.escape(n) for n in sorted(set(names), key=len, reverse=True))
-    rx = re.compile(r"\b(" + _SEND_TO_PREP + r")\s+(?:(?:" + alts +
-                    r")'s\s+(" + _SEND_REF_NOUN + r")\b|(?:" + alts +
-                    r")(?!['\w]))", re.I)
-
-    def _fold(m):
-        return m.group(1) + " her" + (" " + m.group(2) if m.group(2) else "")
-
-    return rx.sub(_fold, t)
+    to_name = " ".join(str(getattr(draft, "to_name", "") or "").split())
+    if not to_name:
+        return t
+    names = {to_name}
+    if " " in to_name:
+        names.add(to_name.split()[0])
+    # The name is matched case-blind (Whisper and his typing disagree on
+    # capitals); the "followed by a capitalised word" lookahead is NOT, or
+    # "to heather please" reads as a surname called Please.
+    alts = "(?i:" + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + ")"
+    after = r"(?![\w'@.\-])(?![ \t]+(?i:at)[ \t])(?![ \t]+[A-Z][a-z])"
+    poss_rx = re.compile(r"\b(" + _SEND_TO_PREP + r")\s+" + alts + r"'s\s+("
+                         + _SEND_REF_NOUN + r")\b", re.I)
+    t = poss_rx.sub(lambda m: m.group(1) + " that " + m.group(2), t)
+    to_rx = re.compile(r"\b(?i:(" + _SEND_TO_PREP + r"))\s+" + alts + after)
+    t = to_rx.sub(lambda m: m.group(1) + " the same person", t)
+    bare_rx = re.compile(r"(?<![\w'@.\-])" + alts + after)
+    if bare_rx.search(t):
+        rest = _send_clean(bare_rx.sub(" ", t))
+        if rest and _SEND_YES_RX.match(rest) and not _send_yes_barred(rest):
+            t = " ".join(bare_rx.sub("the same person", t).split())
+    return t
 
 
 def parse_send_answer(text) -> Optional[bool]:
@@ -5962,11 +6171,33 @@ def parse_send_answer(text) -> Optional[bool]:
     t = _send_clean(text)
     if not t:
         return None
-    if _SEND_NO_RX.match(t):
+    if _SEND_NO_RX.match(t) or _SEND_LATE_NO_RX.search(t):
         return False
+    # A second recipient by ANY joiner is checked on the whole sentence
+    # BEFORE the yes grammar may say yes (the sixth pass, 09-04).
+    if _send_second_recipient(t):
+        return None
     if _SEND_YES_RX.match(t) and not _send_yes_barred(t):
         return True
     return None
+
+
+# The 19:00 ruling (09-04): a pronoun has to match the pending person's
+# gender. "them" / "their" are nobody's and never clash.
+_SEND_HIS_RX = re.compile(r"\b(?:him|his|himself|he)\b", re.I)
+_SEND_HERS_RX = re.compile(r"\b(?:her|hers|herself|she)\b", re.I)
+
+
+def _send_pronoun_clash(t: str, gender) -> tuple[bool, bool]:
+    """(a pronoun of the OTHER gender is in the sentence, a pronoun of the
+    pending person's own gender is too). (False, False) when the gender
+    is unknown: then either pronoun confirms, exactly as before."""
+    g = str(gender or "").lower()
+    if g == "f":
+        return bool(_SEND_HIS_RX.search(t)), bool(_SEND_HERS_RX.search(t))
+    if g == "m":
+        return bool(_SEND_HERS_RX.search(t)), bool(_SEND_HIS_RX.search(t))
+    return False, False
 
 
 def _send_file_pieces(c, t, m=None):
@@ -6019,11 +6250,12 @@ def _send_file_pieces(c, t, m=None):
     addr, _ = outbox.resolve_recipient(cfg, memory, who)
     if not addr:
         if not shape_a:
-            log.info("send-file: %r names no one I can write to", who)
+            log.info("send-file: %r names no one I can write to",
+                     outbox.mask_addresses(who))
             return None
         if not outbox.names_a_real_file(cfg, said_file):
             log.info("send-file: %r names neither a file nor a correspondent",
-                     t[:60])
+                     outbox.mask_addresses(t[:60]))
             return None
     return said_file, who, hint, addr
 
@@ -6049,7 +6281,8 @@ def _send_file_offer(c, prep, who: str, hint: str):
 
 
 def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
-                      to_name: str = "", reasked_kind: str = ""):
+                      to_name: str = "", reasked_kind: str = "",
+                      gender: Optional[str] = None):
     """What every path through the file lane ends in: a read-back, or the
     question it stopped at -- ARMED, so the answer can be heard.
 
@@ -6071,6 +6304,10 @@ def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
     the account: a once re-asked address made the account question --
     never yet asked -- "asked twice; letting it go". The read-back's own
     re-ask lives on the draft and is untouched by either.
+    ``gender`` is what the draft conversation has said about the recipient
+    so far (his own "her address is ..."); it rides on the next question
+    and lands on the draft's to_gender seam when nothing more explicit
+    (an honorific) filled it first.
     """
     if prep.draft is None:
         if prep.candidates:
@@ -6088,11 +6325,13 @@ def _send_file_finish(c, prep, said_file: str, who: str, hint: str,
                 return CommandResult(handled=True, speak=True, status="Dropped",
                                      reply=outbox.ASK_DROPPED_LINE)
             c.stash_sendask(SendAsk(kind=kind, said_file=said_file, who=who,
-                                    hint=hint, to_name=to_name))
+                                    hint=hint, to_name=to_name, gender=gender))
         return CommandResult(handled=True, reply=prep.ask, speak=True,
                              status=prep.status)
     if to_name and not prep.draft.to_name:
         prep.draft.to_name = to_name
+    if gender and getattr(prep.draft, "to_gender", None) is None:
+        prep.draft.to_gender = gender
     c.stash_send(prep.draft)
     return CommandResult(handled=True, reply=outbox.read_back(prep.draft),
                          speak=True, status=prep.status)
@@ -6102,7 +6341,8 @@ def _h_send_file(c, t, m):
     """Arm a file send and read it back. Nothing is sent from here."""
     pieces = _send_file_pieces(c, t, m)
     if pieces is None:
-        log.info("send-file: %r is not a send-a-file request", t)
+        log.info("send-file: %r is not a send-a-file request",
+                 outbox.mask_addresses(t))
         return None
     said_file, who, hint, _addr = pieces
     # ONE read-back at a time. Every ordinary path spends _pending_send in
@@ -9473,11 +9713,17 @@ _CORRECTION_RX = re.compile(
     r"(?:i\s+(?:said|meant|mean|actually said|was saying)|"
     r"what i (?:said|meant) was|that'?s not what i said[,.]?\s*(?:i said)?)"
     r"(?!\s+(?:to|it|that|you|nothing|so|this)\b)"
-    r"[,:]?\s+(?P<meant>.+?)[.!?]*$", re.I)
+    r"[,:]?\s+(?P<meant>.+?)[.!]*$", re.I)
 # "not the terminal, the calendar": the comma is load-bearing; without it
 # "not now" and "not really" are plain sentences.
+# Only "." and "!" come off the meant text: a trailing "?" STAYS (the sixth
+# pass, 09-04). "I said yes?" re-dispatched a bare "yes" ahead of the send
+# rung, and the read-back's "?" bar never saw the question mark -- nine
+# question-shaped sentences SENT the attachment. Whisper writes "?" on a
+# rising tone; the rung's 60 s window is always open right after a
+# read-back; so the meant text keeps the mark and the bar sees it.
 _CORRECTION_NOT_RX = re.compile(
-    r"^(?:no[,.!]?\s+)?not\s+(?P<heard>[^,]{1,60}),\s*(?P<meant>.+?)[.!?]*$", re.I)
+    r"^(?:no[,.!]?\s+)?not\s+(?P<heard>[^,]{1,60}),\s*(?P<meant>.+?)[.!]*$", re.I)
 
 
 def correction_kind(text: str) -> Optional[str]:
@@ -10422,7 +10668,10 @@ class Commander:
         return result
 
     def _handle_inner(self, text: str, source: str, gate: bool = True) -> CommandResult:
-        log.info("handle %r source=%s", text, source)
+        # An address he typed or said is masked in the log (the
+        # address-book hand-off, 09-04): the log is read by more eyes than
+        # the mailbox is.
+        log.info("handle %r source=%s", outbox.mask_addresses(text), source)
         self._raw_text = text          # original casing for handlers that need it
 
         # 1. A ringing alarm owns the next words (spec 5.2 a) -- checked
@@ -10772,7 +11021,8 @@ class Commander:
             if prev is None or time.monotonic() - prev.ts > CORRECTION_WINDOW_S:
                 return None
         heard = prev.text if prev is not None else ""
-        log.info("correction: heard %r -> meant %r", heard, meant)
+        log.info("correction: heard %r -> meant %r", outbox.mask_addresses(heard),
+                 outbox.mask_addresses(meant))
         # Cut the reply in flight: speech now, the model job too (its
         # generation goes stale, so its result is dropped, not remembered).
         _cut_speech(self)
@@ -11112,25 +11362,44 @@ class Commander:
             return None
         self._answered_pending = True
         # The pending recipient's own name is the read-back said back, not
-        # a correction, and it is folded to the pronoun BEFORE any grammar
-        # runs -- so "send it to heather" is a yes here and never reaches
-        # the send-file family below as a new send of "it".
-        text = _send_fold_pending(text, draft)
-        answer = parse_send_answer(text)
+        # a correction, and it is folded to a neutral "the same person"
+        # BEFORE the yes grammar runs -- so "send it to heather" is a yes here and
+        # never reaches the send-file family below as a new send of "it".
+        # The fold is for the YES grammar only: the correction below reads
+        # the UNFOLDED sentence, so an address of hers he says outright is
+        # parsed as said (the sixth pass, 09-04 -- "to heather@gmail.com"
+        # was folded to "to her@gmail.com" and sent there).
+        raw = " ".join(str(text or "").split())
+        folded = _send_fold_pending(raw, draft)
+        masked = outbox.mask_addresses(raw)
+        answer = parse_send_answer(folded)
+        # Hunter's 19:00 ruling (09-04): a pronoun has to match the pending
+        # person's gender, when an explicit source has said what it is.
+        # "send it to him" with Heather pending is not her: not a yes, and
+        # the re-ask names her and her pronoun. With no gender on the draft
+        # either pronoun confirms, exactly as before.
+        clash, _own = _send_pronoun_clash(_send_clean(folded), getattr(draft, "to_gender", None))
+        gendered = answer is True and clash
+        if gendered:
+            log.info("send read-back: %r names a pronoun that is not %s's",
+                     masked, draft.to_name or "the recipient")
+            answer = None
         if answer is None:
-            said = " ".join(str(text or "").split())
+            said = raw
             if _SEND_SELF_RX.search(said):
                 # "send it to me": a redirect to himself. Never a yes, never
                 # a new recipient called "me". The draft is kept armed and he
                 # hears whom it is to, so the next word he says is to a
-                # sentence he has just heard.
+                # sentence he has just heard. A typed address is SPOKEN
+                # here, as the read-back speaks it (the address-book
+                # hand-off).
                 self._pending_send = draft
                 log.info("send read-back: %r redirects to himself; not a yes",
-                         text[:60])
+                         masked[:60])
                 return CommandResult(
                     handled=True, speak=True, status="Confirm?",
                     reply=outbox.SELF_LINE.format(
-                        who=draft.to_name or draft.to_addr))
+                        who=draft.to_name or outbox.spoken_address(draft.to_addr)))
             # A yes that carries a CORRECTION -- "yes, send it to Dana",
             # "yes, but from my work account", "yes, to her work address
             # instead" -- is neither a yes nor a change of subject (F23).
@@ -11143,20 +11412,38 @@ class Commander:
             # "okay" in front, which is past parse_yes_no's six-word line
             # and not a yes-word first -- so the raw form was no yes at all
             # and the correction inside it was lost (the third review).
+            # A correction is read off the UNFOLDED sentence, and it no
+            # longer needs a yes in front of it (the address-book hand-off,
+            # 09-04): "no, to Heather Jones", "send it to Heather Jones
+            # instead" and a bare "to Heather Jones" were a silent drop. A
+            # correction that names the PENDING person ("to Heather?" with
+            # Heather pending) is not a correction to her -- it falls to the
+            # re-ask like any other near miss.
             cleaned = _send_clean(said)
-            fix = _send_correction(cleaned) if parse_yes_no(cleaned) is True else None
+            cfg = self._svc("assistant")
+            memory = self._svc("memory")
+            fix = None
+            # A second recipient ("send it to her and dana@example.com")
+            # outranks a correction: he said "to her" -- the sentence is
+            # about THIS draft -- and then named somebody beside her.
+            second = _send_second_recipient(_send_clean(folded))
+            if not second and (parse_yes_no(cleaned) is True
+                               or _send_names_someone(cleaned, cfg, memory)):
+                fix = _send_correction(cleaned)
+            if fix is not None and _send_is_pending_person(fix[0], draft):
+                fix = ("", fix[1]) if fix[1] else None
             if fix is not None:
                 who, hint = fix
                 log.info("send read-back: %r corrects the draft; asking again",
-                         text[:60])
-                cfg = self._svc("assistant")
+                         masked[:60])
                 to = who or draft.to_name or draft.to_addr
-                prep = outbox.prepare(cfg, self._svc("memory"), str(draft.path),
+                prep = outbox.prepare(cfg, memory, str(draft.path),
                                       to, account_hint=hint or draft.account_label,
                                       chosen=draft.path)
                 return _send_file_finish(self, prep, str(draft.path), to,
                                          hint or draft.account_label,
-                                         to_name="" if who else draft.to_name)
+                                         to_name="" if who else draft.to_name,
+                                         gender=None if who else draft.to_gender)
             # Two ways to be vague, and BOTH get the one re-ask rather than
             # the silent drop. _SEND_MAYBE_RX catches the bare fillers
             # ("okay", "sure"); the second leg catches a yes this grammar
@@ -11176,21 +11463,27 @@ class Commander:
             # (the fourth review).
             vague = bool(_SEND_MAYBE_RX.match(cleaned)) or (
                 len(cleaned.split()) <= 6 and parse_yes_no(cleaned) is True) \
-                or _send_near_yes(cleaned) or (
+                or _send_near_yes(folded) or gendered or clash or (
                     parse_yes_no(cleaned) is True
                     and _send_correction_malformed(cleaned))
             if vague and not draft.reasked:
                 draft.reasked = True
                 self._pending_send = draft
-                log.info("send read-back: %r is not a yes; asking again", text)
+                log.info("send read-back: %r is not a yes; asking again", masked)
+                # The gender line for a sentence that would have been a
+                # clean yes but for its pronoun ("send it to him", "okay,
+                # send it to him"); a second recipient ("send it to her
+                # and to him", "yes and him") gets the ordinary re-ask.
+                line = (outbox.gender_line(draft) if gendered
+                        else outbox.unsure_line(draft))
                 return CommandResult(handled=True, speak=True, status="Confirm?",
-                                     reply=outbox.unsure_line(draft))
+                                     reply=line)
             if vague:
                 # The second vague answer spends the draft -- OUT LOUD. It
                 # used to fall through here to the silent branch, and a
                 # second "sure" was answered by the chat model, or by
                 # nothing (the third review, 09-04).
-                log.info("send draft dropped, asked twice: %r", text)
+                log.info("send draft dropped, asked twice: %r", masked)
                 return CommandResult(handled=True, speak=True,
                                      status="Not sent",
                                      reply=outbox.ASK_SPENT_LINE)
@@ -11208,7 +11501,7 @@ class Commander:
             self._answered_pending = False
             self._send_aside = draft
             log.info("send read-back: %r is not an answer; set aside for "
-                     "the rest of the turn", text)
+                     "the rest of the turn", masked)
             return None
         if not answer:
             log.info("send declined: %s", draft.path.name)
@@ -11293,10 +11586,11 @@ class Commander:
             draft.reasked = True
             self._pending_send = draft
             log.info("send read-back: %r is not an answer (%s); asking again",
-                     said, why)
+                     outbox.mask_addresses(said), why)
             return CommandResult(handled=True, speak=True, status="Confirm?",
                                  reply=outbox.unsure_line(draft))
-        log.info("send draft dropped out loud: %r (%s)", said, why)
+        log.info("send draft dropped out loud: %r (%s)",
+                 outbox.mask_addresses(said), why)
         return CommandResult(handled=True, speak=True, status="Not sent",
                              reply=outbox.ASK_SPENT_LINE)
 
@@ -11347,7 +11641,8 @@ class Commander:
                 or outbox.names_a_real_file(cfg, phrase))
             if not usable:
                 if phrase and len(said.split()) > 6:
-                    log.info("send file question: %r is a new subject", said[:40])
+                    log.info("send file question: %r is a new subject",
+                             outbox.mask_addresses(said)[:40])
                     return None
                 self._answered_pending = True
                 if ask.reasked:
@@ -11358,11 +11653,12 @@ class Commander:
                 return CommandResult(handled=True, speak=True, status="Which file?",
                                      reply=outbox.WHICH_FILE_LINE)
             self._answered_pending = True
-            log.info("send file question: %r names the file", said[:40])
+            log.info("send file question: %r names the file",
+                     outbox.mask_addresses(said)[:40])
             prep = outbox.prepare(cfg, memory, phrase, ask.who,
                                   account_hint=ask.hint)
             return _send_file_finish(self, prep, phrase, ask.who, ask.hint,
-                                     to_name=ask.to_name,
+                                     to_name=ask.to_name, gender=ask.gender,
                                      reasked_kind=ask.kind if ask.reasked else "")
         if ask.kind == "account":
             hint = _account_answer(said)
@@ -11373,7 +11669,8 @@ class Commander:
                 # already lost its wrapping); "what time is it" is a new
                 # subject and keeps its meaning.
                 if not hint or len(hint.split()) > 2:
-                    log.info("send account: %r is a new subject", said[:40])
+                    log.info("send account: %r is a new subject",
+                             outbox.mask_addresses(said)[:40])
                     return None
                 if ask.reasked:
                     self._answered_pending = True
@@ -11394,11 +11691,11 @@ class Commander:
                                      status="Which account?", reply=line)
             self._answered_pending = True
             label = mail_mod.account_label(picked)
-            log.info("send account: %r means %s", said[:40], label)
+            log.info("send account: %r means %s", outbox.mask_addresses(said)[:40], label)
             prep = outbox.prepare(cfg, memory, ask.said_file, ask.who,
                                   account_hint=label)
             return _send_file_finish(self, prep, ask.said_file, ask.who, label,
-                                     to_name=ask.to_name,
+                                     to_name=ask.to_name, gender=ask.gender,
                                      reasked_kind=ask.kind if ask.reasked else "")
         # recipient: an address, or a name the book resolves
         who = _recipient_answer(said)
@@ -11413,7 +11710,8 @@ class Commander:
                 "@" in who or re.search(r"\bat\b", who, re.I) is not None
                 or len(who.split()) <= 3 or parse_yes_no(said) is True)
             if not attempt:
-                log.info("send recipient: %r is a new subject", said[:40])
+                log.info("send recipient: %r is a new subject",
+                         outbox.mask_addresses(said)[:40])
                 return None
             if ask.reasked:
                 self._answered_pending = True
@@ -11425,13 +11723,17 @@ class Commander:
             return CommandResult(handled=True, speak=True, status="No address",
                                  reply=outbox.ADDRESS_REASK_LINE)
         self._answered_pending = True
-        log.info("send recipient: %r resolves", said[:40])
+        log.info("send recipient: %r resolves", outbox.mask_addresses(said)[:40])
         prep = outbox.prepare(cfg, memory, ask.said_file, who,
                               account_hint=ask.hint)
         # An address said outright resolves to a nameless draft; the name
         # he used in the first sentence is what the read-back should say.
+        # "her address is ..." -- the pronoun HE used about the person is
+        # the one the confirmation has to match (the 19:00 ruling), and it
+        # rides to the draft on the gender seam.
         return _send_file_finish(self, prep, ask.said_file, who, ask.hint,
                                  to_name=ask.who if addr else "",
+                                 gender=ask.gender or outbox.gender_from_pronouns(said),
                                  reasked_kind=ask.kind if ask.reasked else "")
 
     def _try_destructive_confirm(self, text: str,
