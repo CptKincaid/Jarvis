@@ -280,6 +280,87 @@ def loop_ratio_limit(seconds: float) -> float:
                LOOP_RATIO_FLOOR + LOOP_RATIO_PER_SECOND * seconds)
 
 
+# ------------------------------------------------------------------
+# The prompt-echo gate
+# ------------------------------------------------------------------
+# The loop the ratio gate cannot see. 2026-09-04, a 4 s follow-up window
+# after a mail answer (he spoke; speaker verify matched 0.54/0.60/0.47):
+#
+#     20:58:40.458  '<surname>, ' x 13 at avg_logprob -0.21 -- caught,
+#                   compression_ratio 7.68 > 4.00 for 5.3 s; "Say that
+#                   again, sir?" and the follow-up mic re-opened.
+#     20:58:45.815  '<surname>, <surname>, <surname>, <surname>,' at
+#                   avg_logprob -0.50 on 3.4 s of audio -- NOT caught.
+#
+# Four repeats of a 14-char unit compress to roughly 1.7-2.0, under
+# loop_ratio_limit(3.4) = 3.7; -0.50 clears MIN_AVG_LOGPROB; and
+# collapse_repeats folds repeated SENTENCES of >= 3 words split on .!?,
+# so comma-joined repetition of one word survives it. It reached the
+# intent classifier, which finds no signal in four words -> UNCERTAIN ->
+# a "Was that for me?" card showing, and speaking, a surname he never
+# said. The word was a term from the initial_prompt itself: a one-off
+# appointment title that jarvis/vocab.py had cut to "<surname>," at the
+# 48-char cap, and a comma-terminated term is exactly the shape a greedy
+# decoder continues on unclear audio. vocab.py now keeps one-off titles
+# and dangling commas out of the prompt; this is the gate for whatever
+# the prompt still carries.
+#
+# What counts as an echo is deliberately narrow, because the ratio gate's
+# own comment protects real insistence -- "stop" x10 (3.06) and "turn it
+# up" x5 (2.46) are things a person says to an assistant that is ignoring
+# him -- and those must keep passing here too: EVERY word of an echo must
+# be a word of the prompt. "stop", "yes", "turn", "it" and "up" are not,
+# so those pass untouched; a sentence that merely contains a prompt term
+# twice is not periodic; two repeats are never an echo.
+ECHO_MIN_REPEATS = 3
+_ECHO_WORD_RX = re.compile(r"[a-z0-9']+")
+
+
+def _echo_words(text) -> list:
+    return _ECHO_WORD_RX.findall(str(text or "").lower())
+
+
+def prompt_echo(text, prompt) -> tuple:
+    """(unit, repeats) when ``text`` is nothing but prompt words repeated,
+    else ("", 0). Case- and punctuation-insensitive; no prompt -> never.
+
+    (i) periodic: the words are ``unit * k`` for the smallest period whose
+        unit fits three times, k >= ECHO_MIN_REPEATS, every unit word a
+        prompt word; ONE trailing word that is a strict prefix of the
+        unit's first word is ignored (sample_len cuts the run mid-word --
+        the 20:58:40 transcript ended that way).
+    (ii) at most two distinct words, all prompt words, the most frequent
+        occurring >= ECHO_MIN_REPEATS times: the logged
+        '<surname>, Appointment, Appointment, Appointment, ...' shape.
+    """
+    words = _echo_words(text)
+    vocab = set(_echo_words(prompt)) if prompt else set()
+    if not words or not vocab:
+        return "", 0
+    n = len(words)
+    for period in range(1, n // ECHO_MIN_REPEATS + 1):
+        unit = words[:period]
+        if any(w not in vocab for w in unit):
+            continue
+        for tail in (0, 1):             # 0: exact; 1: one cut trailing word
+            repeats, rest = divmod(n - tail, period)
+            if rest or repeats < ECHO_MIN_REPEATS:
+                continue
+            if words[:n - tail] != unit * repeats:
+                continue
+            if tail:
+                cut, expect = words[-1], unit[0]   # the next unit's first word
+                if cut == expect or not expect.startswith(cut):
+                    continue
+            return " ".join(unit), repeats
+    distinct = set(words)
+    if len(distinct) <= 2 and distinct <= vocab:
+        top = max(distinct, key=words.count)
+        if words.count(top) >= ECHO_MIN_REPEATS:
+            return top, words.count(top)
+    return "", 0
+
+
 def token_budget(seconds: float) -> int:
     """Cap on the tokens one decode pass may emit, from the clip's length."""
     return int(min(WHISPER_SAMPLE_LEN,
@@ -449,14 +530,20 @@ class TranscribeResult:
     # Length of the audio that produced this, seconds. The loop gate needs
     # it (see loop_ratio_limit); 0.0 means "unknown", which fails OPEN.
     audio_seconds: float = 0.0
+    # prompt_echo(): the prompt term the transcript is made of, and how
+    # many times. ("", 0) for anything that is not an echo.
+    echo_unit: str = ""
+    echo_repeats: int = 0
 
     @property
     def looping(self) -> bool:
         """Whisper ran away repeating itself. See loop_ratio_limit: real
         speech measured 0.33-1.86 at every length tried, the loops 3.04-7.89
         on clips of 0.4-0.85 s, and their avg_logprob (-0.31 to -0.42) is no
-        help at all."""
-        return self.compression_ratio > loop_ratio_limit(self.audio_seconds)
+        help at all. Or it echoed the prompt a few times on a short clip,
+        under that limit -- see prompt_echo, the 20:58:45 turn."""
+        return (self.compression_ratio > loop_ratio_limit(self.audio_seconds)
+                or self.echo_repeats >= ECHO_MIN_REPEATS)
 
     @property
     def accepted(self) -> bool:
@@ -714,6 +801,9 @@ class Transcriber:
             self.load()
 
         lang = self._language()
+        # Once per call: the same string goes to the model and to the
+        # echo gate below, so the gate judges against what Whisper saw.
+        prompt = self._prompt()
 
         seconds = _seconds(audio)
         budget = token_budget(seconds)
@@ -728,7 +818,7 @@ class Transcriber:
                 cpu0 = time.thread_time()
                 result = self._model.transcribe(
                     audio,
-                    initial_prompt=self._prompt(),
+                    initial_prompt=prompt,
                     language=lang,          # None = auto-detect
                     beam_size=1,
                     fp16=True,
@@ -763,7 +853,7 @@ class Transcriber:
         else:
             kwargs = dict(
                 beam_size=5,
-                initial_prompt=self._prompt(),
+                initial_prompt=prompt,
                 vad_filter=True,
                 vad_parameters=dict(min_silence_duration_ms=500),
                 temperature=DECODE_TEMPERATURES,
@@ -796,6 +886,7 @@ class Transcriber:
         _log_slow_decode(time.monotonic() - t_start, lock_wait, cpu, seconds)
 
         text = collapse_repeats(text)
+        echo_unit, echo_repeats = prompt_echo(text, prompt)
 
         if seg_data:
             avg_conf = sum(lp for _, lp in seg_data) / len(seg_data)
@@ -814,6 +905,12 @@ class Transcriber:
             # the pair, not just the ratio.
             log.info("Rejected: repetition loop (compression_ratio=%.2f > "
                      "%.2f for %.1fs of audio)", ratio, limit, seconds)
+        elif echo_repeats >= ECHO_MIN_REPEATS:
+            # The ratio gate let it by; say how far under, because that
+            # pair is what retuning either gate needs.
+            log.info("Rejected: prompt echo (%r x %d; compression_ratio=%.2f "
+                     "under the %.2f loop limit for %.1fs of audio)",
+                     echo_unit, echo_repeats, ratio, limit, seconds)
 
         return TranscribeResult(
             text=text,
@@ -822,6 +919,8 @@ class Transcriber:
             language=language,
             compression_ratio=ratio,
             audio_seconds=seconds,
+            echo_unit=echo_unit,
+            echo_repeats=echo_repeats,
         )
 
     # -- streaming preview ---------------------------------------------
@@ -839,6 +938,7 @@ class Transcriber:
         with self._lock:
             try:
                 lang = self._language()
+                prompt = self._prompt()
 
                 budget = token_budget(_seconds(audio))
 
@@ -852,7 +952,7 @@ class Transcriber:
                     # model lock the final decode is waiting on.
                     result = self._model.transcribe(
                         audio,
-                        initial_prompt=self._prompt(),
+                        initial_prompt=prompt,
                         language=lang,
                         condition_on_previous_text=False,
                         # ...which on its own also drops the vocab prompt
@@ -867,14 +967,15 @@ class Transcriber:
                         sample_len=budget,
                     )
                     self._decoded = True
-                    return (result.get("text") or "").strip()
+                    return self._preview_text(
+                        (result.get("text") or "").strip(), prompt)
 
                 # temperature here too: faster-whisper's own default is the
                 # SIX-rung ladder ([0.0, 0.2, 0.4, 0.6, 0.8, 1.0]), so
                 # without this the preview -- which runs several times a
                 # second, holding the lock the final decode waits on -- is
                 # the one unbounded decode left in the module.
-                kwargs = dict(beam_size=1, initial_prompt=self._prompt(),
+                kwargs = dict(beam_size=1, initial_prompt=prompt,
                               max_new_tokens=budget,
                               temperature=DECODE_TEMPERATURES,
                               condition_on_previous_text=False)
@@ -884,7 +985,19 @@ class Transcriber:
                 segments, _ = self._model.transcribe(audio, **kwargs)
                 text = " ".join(seg.text.strip() for seg in segments).strip()
                 self._decoded = True
-                return text
+                return self._preview_text(text, prompt)
             except Exception:
                 log.exception("partial transcription failed")
                 return ""
+
+    @staticmethod
+    def _preview_text(text: str, prompt: str) -> str:
+        """The preview goes through the echo gate too: the ghost card must
+        never show a name he never said, and the 20:58:45 text WAS shown
+        while he was still talking. Blank, not a log line -- the preview
+        runs several times a second and the final pass logs the reject."""
+        unit, repeats = prompt_echo(text, prompt)
+        if repeats:
+            log.debug("preview blanked: prompt echo %r x %d", unit, repeats)
+            return ""
+        return text

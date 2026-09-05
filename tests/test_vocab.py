@@ -83,11 +83,162 @@ def test_pronunciation_user_keys_join_defaults_stay_out(env):
 
 
 def test_calendar_titles_join(env):
+    """Recurring titles -- his courses -- join once each."""
     _write_calendar(env, ["BIOSENSORS", "Magnetic Resonance Engr",
-                          "BIOSENSORS"])
+                          "BIOSENSORS", "Magnetic Resonance Engr"])
     prompt = vocab.build_prompt()
     assert prompt.count("BIOSENSORS") == 1
     assert "Magnetic Resonance Engr" in prompt
+
+
+# ------------------------------------------ one-off titles stay out
+# 2026-09-04 20:58:45: a surname from a ONE-OFF appointment title, cut by
+# title[:48] to end in "<surname>,", was echoed four times by Whisper on
+# unclear audio and reached the "Was that for me?" card. The live cache
+# held 14 distinct titles, 11 of them one-offs; only the 3 courses recur.
+def test_a_one_off_appointment_title_stays_out_of_the_prompt(env):
+    _write_calendar(env, ["BIOSENSORS", "BIOSENSORS",
+                          "Dentist with Dr. Orbalind"])
+    prompt = vocab.build_prompt()
+    assert "BIOSENSORS" in prompt
+    assert "Orbalind" not in prompt
+
+
+def test_a_title_needs_min_title_recurrence_events_to_join(env):
+    assert vocab.MIN_TITLE_RECURRENCE == 2
+    _write_calendar(env, ["Quennevex Seminar"] * (vocab.MIN_TITLE_RECURRENCE - 1)
+                    + ["Orbalind Lab"] * vocab.MIN_TITLE_RECURRENCE)
+    terms = vocab.build_prompt().split(", ")
+    assert "Orbalind Lab" in terms
+    assert "Quennevex Seminar" not in terms
+
+
+def test_recurrence_counts_across_sources_and_ignores_case_and_spacing(env):
+    """Two calendars can carry the same course; the count is over the
+    whole cache, keyed on the whitespace-collapsed lowercase title, and
+    the first spelling seen is the one that joins."""
+    cache = env / "cache"
+    cache.mkdir(exist_ok=True)
+    payload = {"version": 1, "fetched_at": 1.0, "sources": {
+        "google-1": {"fetched_at": 1.0, "events": [
+            {"title": "Magnetic  Resonance Engr", "location": ""},
+            {"title": "Advising with Orbalind", "location": ""}]},
+        "icloud-1": {"fetched_at": 1.0, "events": [
+            {"title": "magnetic resonance engr", "location": ""}]}}}
+    (cache / "calendar_cache.json").write_text(json.dumps(payload))
+    terms = vocab.build_prompt().split(", ")
+    assert "Magnetic Resonance Engr" in terms
+    assert "magnetic resonance engr" not in terms
+    assert not [t for t in terms if "Orbalind" in t]
+
+
+def test_recurring_titles_keep_first_appearance_order(env):
+    _write_calendar(env, ["Orbalind Lab", "Quennevex Seminar",
+                          "Quennevex Seminar", "Orbalind Lab"])
+    terms = vocab.build_prompt().split(", ")
+    assert terms.index("Orbalind Lab") < terms.index("Quennevex Seminar")
+
+
+def test_untitled_is_still_skipped_even_when_it_recurs(env):
+    _write_calendar(env, ["Untitled", "untitled", "BIOSENSORS", "BIOSENSORS"])
+    terms = vocab.build_prompt().split(", ")
+    assert "BIOSENSORS" in terms
+    assert not [t for t in terms if t.lower() == "untitled"]
+
+
+# ----------------------------------------------------- safe truncation
+def _no_dangling_terms(prompt: str) -> None:
+    assert ",," not in prompt
+    for term in prompt.split(", "):
+        assert term, "an empty term made it into the prompt"
+        assert term == term.strip()
+        assert term[-1] not in ",:;.-", term
+
+
+def test_a_long_title_is_cut_at_a_word_boundary(env):
+    # 53 chars; title[:48] would be "...Laboratory Sectio"
+    title = "Magnetic Resonance Engineering Laboratory Section 502"
+    _write_calendar(env, [title, title])
+    terms = vocab.build_prompt().split(", ")
+    assert "Magnetic Resonance Engineering Laboratory" in terms
+    assert not [t for t in terms if t.endswith("Sectio")]
+    _no_dangling_terms(", ".join(terms))
+
+
+def test_a_title_cut_right_after_a_comma_loses_the_comma(env):
+    # 61 chars; title[:48] is "...Orbalind, Q": the word cut leaves
+    # "...Orbalind," and the punctuation strip takes the comma.
+    title = "Lab Section Meeting with Dr. Sedrick Orbalind, Quennevex Hall"
+    _write_calendar(env, [title, title])
+    terms = vocab.build_prompt().split(", ")
+    assert "Lab Section Meeting with Dr. Sedrick Orbalind" in terms
+    assert "Orbalind, Q" not in ", ".join(terms)
+    _no_dangling_terms(", ".join(terms))
+
+
+def test_a_first_word_longer_than_the_cap_keeps_the_hard_cut(env):
+    title = "Q" * 60
+    _write_calendar(env, [title, title])
+    terms = vocab.build_prompt().split(", ")
+    assert "Q" * 48 in terms
+    assert not [t for t in terms if len(t) > 48 and t.startswith("QQ")]
+
+
+def test_the_live_shape_never_reaches_the_prompt(env):
+    """The invented twin of the 20:58:45 title: 51 chars, one-off, and
+    title[:48] ends exactly on "Quennevex,". Neither the surname nor a
+    double comma may appear."""
+    title = "Appointment: Virtual Visit with S. R. Quennevex, MD"
+    assert title[:48].endswith("Quennevex,")
+    _write_calendar(env, ["BIOSENSORS", "BIOSENSORS", title])
+    prompt = vocab.build_prompt()
+    assert "Quennevex" not in prompt
+    assert "Appointment" not in prompt
+    _no_dangling_terms(prompt)
+
+
+def test_the_live_shape_recurring_is_still_cut_clean(env):
+    """Even if such a title DID recur, the dangling comma cannot survive."""
+    title = "Appointment: Virtual Visit with S. R. Quennevex, MD"
+    _write_calendar(env, [title, title])
+    terms = vocab.build_prompt().split(", ")
+    assert "Appointment: Virtual Visit with S. R. Quennevex" in terms
+    _no_dangling_terms(", ".join(terms))
+
+
+def test_buildings_truncate_at_a_word_boundary_too(env):
+    # speech name is 46 chars; [:32] would be "...Memorial Int"
+    loc = ("College Station Zachariah Quennevex Memorial Interdisciplinary "
+           "Research Pavilion 210")
+    _write_calendar(env, ["BIOSENSORS", "BIOSENSORS"], [loc, loc])
+    terms = vocab.build_prompt().split(", ")
+    assert "Zachariah Quennevex Memorial" in terms
+    assert not [t for t in terms if t.endswith(" Int")]
+    _no_dangling_terms(", ".join(terms))
+
+
+def test_a_term_ending_in_a_comma_is_stripped_from_every_layer(env):
+    (env / "voice_vocab.txt").write_text("Quennevex,\nLibrespot ,")
+    (env / "voice_names.txt").write_text("Orbalind,\n,\n")
+    prompt = vocab.build_prompt()
+    terms = prompt.split(", ")
+    assert "Quennevex" in terms and "Librespot" in terms
+    assert "Orbalind" in terms
+    _no_dangling_terms(prompt)
+
+
+def test_clip_term_helper(env):
+    clip = vocab.clip_term
+    assert clip("Magnetic Resonance Engr", 48) == "Magnetic Resonance Engr"
+    assert clip("Lab Section Meeting with Dr. Orbalind, MD", 40) == \
+        "Lab Section Meeting with Dr. Orbalind"
+    assert clip("Orbalind, Quennevex", 9) == "Orbalind"
+    assert clip("Orbalind, Quennevex", 10) == "Orbalind"
+    assert clip("Orbalind, Quennevex", 12) == "Orbalind"
+    assert clip("Supercalifragilistic Hall", 8) == "Supercal"
+    assert clip("Seminar - ", 48) == "Seminar"
+    assert clip("Seminar:;.-, ", 48) == "Seminar"
+    assert clip(",,,", 48) == ""
 
 
 def test_the_buildings_he_walks_to_are_in_the_prompt(env):

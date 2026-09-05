@@ -20,6 +20,14 @@ cap and harvested material falls off the tail first:
 5. Calendar event titles from the read-only disk cache
    (``~/.cache/jarvis/calendar_cache.json``) -- course names such as
    "BIOSENSORS" arrive here with no network and no CalendarService.
+   RECURRING titles only (MIN_TITLE_RECURRENCE events across every
+   source): a course is a name he says out loud, a one-off appointment,
+   visit or delivery is a name he never says to Jarvis AND private
+   detail. 2026-09-04 20:58:45: a surname from a one-off appointment
+   title, cut by title[:48] to end in "<surname>,", was echoed four
+   times by Whisper on unclear audio and became a "Was that for me?"
+   card showing the name on screen and out loud. The live cache held
+   14 distinct titles, 11 of them one-offs.
 6. Canvas course names via ``canvas.cached_course_names()`` -- a snapshot
    of that tool's module cache, NEVER a fetch.
 7. The buildings in those same events, normalised through
@@ -29,7 +37,12 @@ cap and harvested material falls off the tail first:
 
 Whisper's prompt window is ~224 tokens and which end a backend trims
 differs, so the prompt is capped HERE (PROMPT_CHAR_CAP) and the cap drops
-OUR tail -- the harvested, lowest-priority terms. build_prompt() is called
+OUR tail -- the harvested, lowest-priority terms. Per-term caps (titles
+48, buildings 32) cut at a WORD boundary and strip trailing punctuation
+(clip_term), and build_prompt() strips a trailing comma from EVERY term:
+a comma-separated prompt whose term ends in "," reads as "X,, Y", and a
+term that ends in a comma is exactly the shape a greedy decoder continues
+as "X, X, X, ..." (the 20:58:45 echo above). build_prompt() is called
 on the hot voice path (every partial() too), so the result is cached
 PROMPT_TTL_S seconds; add_name()/save_vocab() bust the cache so a freshly
 taught name reaches the very next attempt.
@@ -57,6 +70,15 @@ PROMPT_TTL_S = 60.0
 MAX_CALENDAR_TITLES = 20
 MAX_BUILDINGS = 8
 MAX_COURSES = 12
+# Events a title must appear in (whitespace-collapsed, lowercased, across
+# every source in the cache) before it is a name worth priming Whisper
+# with. 2 is the smallest count that separates "his courses" (3+ each in
+# the live cache) from the 11 one-off appointments there; a once-a-term
+# seminar with a single event stays out, and it is the seminar's NAME
+# that stays out, never the event.
+MIN_TITLE_RECURRENCE = 2
+TITLE_CHARS = 48
+BUILDING_CHARS = 32
 
 _clock = time.monotonic        # test seam
 _lock = threading.Lock()
@@ -120,6 +142,22 @@ def add_name(name: str) -> bool:
 
 
 # ------------------------------------------------------------- harvesters
+_TRAILING_PUNCT = ",:;.- \t"
+
+
+def clip_term(term: str, cap: int) -> str:
+    """Clip one prompt term to ``cap`` chars at a WORD boundary -- the last
+    whitespace at or before the cap; a first word that alone exceeds the
+    cap keeps the hard cut -- and then strip trailing punctuation, so no
+    term can end in a dangling comma, colon or dash. title[:48] used to
+    cut "... S. <surname>, MD" to "... S. <surname>," (2026-09-04)."""
+    term = " ".join(str(term or "").split())
+    if len(term) > cap:
+        cut = term.rfind(" ", 0, cap + 1)
+        term = term[:cut] if cut > 0 else term[:cap]
+    return term.rstrip(_TRAILING_PUNCT)
+
+
 def _user_vocab() -> str:
     """The raw manual/corrections vocabulary file. Read directly rather
     than through transcriber.load_vocab(): that helper substitutes
@@ -171,7 +209,7 @@ def _parse_calendar_cache() -> tuple:
     hit = _calendar_cached
     if hit is not None and hit[0] == mtime:
         return list(hit[1]), list(hit[2])
-    titles, seen = [], set()
+    order, counts = [], {}          # first spelling seen; events per key
     buildings, seen_b = [], set()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -183,17 +221,25 @@ def _parse_calendar_cache() -> tuple:
                     continue
                 title = " ".join(str(ev.get("title") or "").split())
                 key = title.lower()
-                if title and key != "untitled" and key not in seen:
-                    seen.add(key)
-                    titles.append(title[:48])
-                place = _building_name(ev.get("location"))
+                if title and key != "untitled":
+                    if key not in counts:
+                        counts[key] = 0
+                        order.append(title)
+                    counts[key] += 1
+                place = clip_term(_building_name(ev.get("location")),
+                                  BUILDING_CHARS)
                 if place and place.lower() not in seen_b:
                     seen_b.add(place.lower())
-                    buildings.append(place[:32])
+                    buildings.append(place)
     except Exception:
         log.exception("calendar cache unreadable for the prompt")
         return [], []
-    titles = titles[:MAX_CALENDAR_TITLES]
+    # The cache carries no recurrence field, so recurrence is COUNTED:
+    # a title in fewer than MIN_TITLE_RECURRENCE events is a one-off
+    # appointment, not a course (see the module docstring, item 5).
+    titles = [clip_term(t, TITLE_CHARS) for t in order
+              if counts[t.lower()] >= MIN_TITLE_RECURRENCE]
+    titles = [t for t in titles if t][:MAX_CALENDAR_TITLES]
     buildings = buildings[:MAX_BUILDINGS]
     _calendar_cached = (mtime, titles, buildings)
     return list(titles), list(buildings)
@@ -253,6 +299,14 @@ def build_prompt() -> str:
     for term in (_terms(_user_vocab()) + load_names() + _pronounce_keys()
                  + _terms(DEFAULT_VOCAB) + _calendar_buildings()
                  + _calendar_titles() + _course_names()):
+        # No term may end in a comma, whichever layer it came from: the
+        # prompt is comma-joined, so "X," becomes "X,, Y", and a term
+        # that ends in a comma is the shape Whisper continued as
+        # "<surname>, <surname>, <surname>, <surname>," on 2026-09-04
+        # (a one-off appointment title cut at the cap; see clip_term).
+        term = str(term or "").rstrip(", \t").strip()
+        if not term:
+            continue
         key = term.lower()
         if key in seen:
             continue
