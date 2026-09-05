@@ -31,13 +31,13 @@ recording, no real voiceprint, no camera.
 """
 from __future__ import annotations
 
-import numpy as np
+
 import pytest
 
 from jarvis import speaker as sp
 from jarvis import voicegallery as vg
 from tests.synthvoice import Voices, cos
-from tests.test_voice_multispeaker_wiring import _clip, _FakeEncoder
+from tests.test_voice_multispeaker_wiring import _clip
 from tests.test_voice_owner_lockout import ROW, SLUG, _gate, _verifier
 
 

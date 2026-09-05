@@ -25,7 +25,6 @@ import ast
 import importlib.util
 import os
 
-import pytest
 
 from jarvis import voicegallery as vg
 from tests.synthvoice import Voices
