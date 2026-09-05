@@ -22,6 +22,7 @@ from jarvis.ui import widgets as wg
 MAIN = pathlib.Path(ts.__file__).parent / "main_window.py"
 HIS_W, OLD_W = 1040, 920
 FORBIDDEN_DISPLAYS = (":0", ":1")
+FD_SETSIZE = 1024                    # see tests/test_ui_layout_rules.py
 
 
 # ============================================== the one line that adds it
@@ -93,6 +94,19 @@ def root():
     if d.split(".")[0] in FORBIDDEN_DISPLAYS:
         pytest.fail("that is a desktop display")
     import tkinter as tk
+    # An X connection opened past select()'s FD_SETSIZE ABORTS THE
+    # INTERPRETER rather than raising -- it dumped core in the whole suite
+    # on 2026-09-05 before this guard went in. Every other display-gated
+    # file in this tree makes the same check; this one has to as well.
+    try:
+        fds = len(os.listdir("/proc/self/fd"))
+    except OSError:
+        fds = 0
+    if fds >= FD_SETSIZE - 32:
+        pytest.skip("this process already holds %d open descriptors; an X "
+                    "connection past select()'s FD_SETSIZE (%d) aborts the "
+                    "interpreter. Run this file on its own." % (fds,
+                                                                FD_SETSIZE))
     try:
         r = tk.Tk(screenName=d)
     except tk.TclError as exc:
