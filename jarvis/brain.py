@@ -432,13 +432,46 @@ _ACTION_CLAIM_RX = re.compile(
 # model round on a turn that had already answered, and if the retry says
 # the same true thing, UNBACKED_LINE replaces a TRUE sentence.
 #
-# 1. NEGATION earlier in the same sentence scopes the claim -- "Nothing has
+# 1. NEGATION earlier in the same CLAUSE scopes the claim -- "Nothing has
 #    been added to your list, sir." is the ANSWER to "what's on my list",
-#    and it was being called a lie.
+#    and it was being called a lie. The same CLAUSE, not the same
+#    sentence: judged over the whole sentence, the "No" of "No problem, I
+#    have noted that, sir." was read as governing a claim two clauses
+#    away, and on "Remember that I graduate December 10th 2026" that
+#    reply -- with "Not a problem, sir, I've saved that to memory", "No
+#    worries, I'll remember that", "Not at all, sir; I've made a note of
+#    that", "I can't store that, sir, but I've noted it", "I don't have a
+#    memory tool as such, but I'll keep that in mind" and the streamed
+#    form -- was spoken VERBATIM with nothing stored and no warning
+#    (2026-09-04 reviewer and verdict, measured on the FakeOllama
+#    harness). A negation's reach ends at a clause boundary (, ; : dash),
+#    and a lead-in idiom that wears a negation word and governs nothing
+#    ("no problem", "not to worry", "never fear", "I can't forget that")
+#    is no negation of what follows it, comma or no comma. The real veto
+#    -- "I have not noted", "I haven't saved", "Nothing has been added to
+#    your list" -- sits in the claim's own clause and still holds. The
+#    lead-in must OPEN its clause: "I'm not at all sure I've added milk"
+#    is a hedge, and its "not" stands.
 _CLAIM_NEGATED_RX = re.compile(
     r"\b(?:no|not|nothing|nobody|none|never|neither|nor|without|yet to|"
     r"(?:do|does|did|have|has|had|is|are|was|were|wo|ca|could|would|should)"
     r"n['’]t)\b", re.I)
+_CLAUSE_BOUNDARY_RX = re.compile(r"[,;:—–]|\s-\s")
+_NEGATED_LEAD_IN_RX = re.compile(
+    r"^\s*(?:no problem(?: at all)?|not a problem|no worries|"
+    r"no trouble(?: at all)?|not at all|not to worry|never fear|never mind|"
+    r"(?:do not|don['’]t) (?:worry|fret)|"
+    r"(?:i )?(?:can['’]t|cannot|could not|couldn['’]t|won['’]t|"
+    r"will not|shall not|shan['’]t) forget(?: that| it| this)?)\b", re.I)
+
+
+def _claim_negated(before):
+    """Does a negation govern the claim that begins where ``before``
+    ends? Only one in the claim's own clause counts, and a lead-in idiom
+    opening that clause is not one."""
+    clause = _CLAUSE_BOUNDARY_RX.split(before or "")[-1]
+    clause = _NEGATED_LEAD_IN_RX.sub(" ", clause)
+    return bool(_CLAIM_NEGATED_RX.search(clause))
 # 2. A HEDGE unsays it in the same breath: nothing was done and the model
 #    is not pretending otherwise.
 _CLAIM_HEDGE_RX = re.compile(
@@ -474,7 +507,7 @@ def _sentence_claim(sent, ran=(), backers=None, kinds=None):
     if _CLAIM_HEDGE_RX.search(sent or ""):
         return None
     for m in _ACTION_CLAIM_RX.finditer(sent or ""):
-        if _CLAIM_NEGATED_RX.search(sent[:m.start()]):
+        if _claim_negated(sent[:m.start()]):
             continue
         if _CLAIM_REPORTED_RX.search(sent[:m.start()]):
             continue
@@ -524,8 +557,8 @@ def unbacked_claim(text, ran=(), backers=None, kinds=None):
     """The first first-person action claim in ``text`` ("I've added ...",
     "I'm starting ...") that no tool in ``ran`` backs, else None. Pure.
     Judged one sentence at a time, because both the negation that cancels
-    a claim and the idiom that was never one live inside the sentence that
-    carries them. ``kinds`` narrows it to some claim kinds (claim_kind)."""
+    a claim (within the claim's own clause, _claim_negated) and the idiom
+    that was never one live inside the sentence that carries them. ``kinds`` narrows it to some claim kinds (claim_kind)."""
     for sent in split_sentences(text or ""):
         claim = _sentence_claim(sent, ran, backers, kinds)
         if claim:

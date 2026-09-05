@@ -608,7 +608,7 @@ def _flagged_by(observation_exempt):
         if brain_mod._CLAIM_HEDGE_RX.search(sent):
             continue
         for m in rx.finditer(sent):
-            if brain_mod._CLAIM_NEGATED_RX.search(sent[:m.start()]):
+            if brain_mod._claim_negated(sent[:m.start()]):
                 continue
             if brain_mod._CLAIM_REPORTED_RX.search(sent[:m.start()]):
                 continue
@@ -927,3 +927,157 @@ def test_streamed_a_backed_action_claim_is_not_unsaid_by_the_line(streamed):
     assert tags == [("STREAMED", "3"), ("SPEAK", f"{REMINDER_KEPT} {MEMORY_LINE}")]
     _once(dict(tags)["SPEAK"])
     assert record == THREE_RAN
+
+
+# ------------------------------------ the fifth window's fix (2026-09-05)
+# The round-4 reviewer and verdict each measured, on this harness, that
+# on the order "Remember that I graduate December 10th 2026" the reply
+# "No problem, I have noted that, sir." was spoken VERBATIM with nothing
+# stored and zero warnings -- and so were five more lead-in shapes and the
+# streamed form. Cause, confirmed in code: _sentence_claim vetoed a claim
+# on ANY negation word earlier in the SENTENCE (sent[:m.start()]), so the
+# "No" of "No problem," was read as governing a claim two clauses away.
+# The same line is on jarvis-v3, so this is a fix-forward, not a
+# regression; the persona's own few-shot answers "Not at all, sir.", so
+# the shape is likely in the wild.
+#
+# The rule, finished: a negation vetoes a claim only when it governs the
+# claim's own clause -- the text after the last clause boundary (, ; :
+# dash) -- and a lead-in idiom that wears a negation word and governs
+# nothing ("no problem", "not to worry", "never fear", "I can't forget
+# that") is no negation of what follows it, comma or no comma. A real
+# veto ("I have not noted", "I haven't saved", "Nothing has been added
+# to your list") sits in the claim's own clause and still holds.
+REMEMBER_ORDER = "Remember that I graduate December 10th 2026"
+LEAD_IN_SIX = [
+    "No problem, I have noted that, sir.",
+    "Not a problem, sir, I've saved that to memory.",
+    "No worries, I'll remember that, sir.",
+    "Not at all, sir; I've made a note of that.",
+    "I can't store that, sir, but I've noted it.",
+    "I don't have a memory tool as such, but I'll keep that in mind, sir.",
+]
+
+
+def test_the_order_that_was_measured_is_an_order():
+    assert is_question(REMEMBER_ORDER) is False
+
+
+@pytest.mark.parametrize("line", LEAD_IN_SIX + [
+    # the brief's other lead-ins, each before a real claim
+    "Not a problem — I've saved that to memory.",       # a dash is a boundary
+    "Don't worry, sir, I've noted that.",
+    "Not to worry, I have noted that, sir.",
+    "Never fear, sir, I'll remember that.",
+    "I can't forget that, sir — I've made a note of it.",
+    "No trouble at all, sir, I'll keep that in mind.",
+    "Not at all: I've committed that to memory, sir.",
+    # the same lead-ins with the comma the voice path never hears
+    "No problem sir I've noted that.",
+    "Don't worry sir I'll remember that.",
+    "Never fear I have noted that, sir.",
+    # a bare "No," is a lead-in too
+    "No, sir, I've noted that.",
+])
+def test_a_lead_in_negation_does_not_veto_the_claim(line):
+    assert brain_mod.unbacked_claim(line), line
+    assert brain_mod.claim_kind(brain_mod.unbacked_claim(line)) == "memory", line
+
+
+@pytest.mark.parametrize("line", [
+    # the brief's three
+    "I can't store that from here, sir.",
+    "I haven't saved anything, sir.",
+    "I did not note it, sir.",
+    # the negation in the claim's own clause: still a veto
+    "I have not noted that, sir.",
+    "I won't remember that, sir.",
+    "Nothing has been added to your list, sir.",
+    "Nothing is added to your calendar yet.",
+    "No music is on, sir.",
+    "I don't think the music is on, sir.",
+    "It's not as if I've added milk, sir.",
+    # a hedge that wears "not at all" mid-clause is not a lead-in
+    "I'm not at all sure I've added milk, sir.",
+    # the negation and the claim share a clause AFTER a lead-in
+    "No problem, sir, but I haven't noted anything yet.",
+    "Not to worry, nothing has been added to your list.",
+])
+def test_a_negation_that_governs_the_claim_still_vetoes_it(line):
+    assert brain_mod.unbacked_claim(line) is None, line
+
+
+@pytest.mark.parametrize("line", LEAD_IN_SIX)
+def test_a_lead_in_negation_reply_earns_the_memory_line(setup, caplog, line):
+    """The six the reviewer measured verbatim: on the order, each is now
+    caught, retried, and -- the retry claiming again -- replaced by the
+    memory line alone; nothing stored."""
+    b, fake, record = setup
+    fake.replies = [text_reply(line), text_reply(line)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(REMEMBER_ORDER)
+    assert tags == [("SPEAK", MEMORY_LINE)], line
+    assert record == []
+    assert len(_warnings(caplog)) == 2, line              # the claim, then it stands
+    assert len(fake.chat_payloads()) == 2                 # the one retry
+
+
+def test_a_streamed_lead_in_negation_reply_earns_the_memory_line(streamed, caplog):
+    """The streamed form: the sentence is withheld on the stream (it is
+    one sentence, lead-in and claim together) and he hears the line."""
+    b, fake, record, streams = streamed
+    streams.append(_chunks(LEAD_IN_SIX[0]))
+    fake.replies = [text_reply(LEAD_IN_SIX[0])]
+    spoken = []
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(REMEMBER_ORDER, on_sentence=spoken.append)
+    assert spoken == [MEMORY_LINE]
+    assert tags == [("STREAMED", "1"), ("SPEAK", MEMORY_LINE)]
+    assert record == [] and len(_warnings(caplog)) == 2
+
+
+def test_a_lead_in_negation_reply_still_yields_to_an_honest_retry(setup):
+    b, fake, record = setup
+    fake.replies = [text_reply(LEAD_IN_SIX[0]), text_reply(HONEST)]
+    assert b._chat_sync(REMEMBER_ORDER) == [("SPEAK", HONEST)]
+    assert record == []
+
+
+STRAY_HONEST = ("I'm afraid I have no way to store that, sir, but I'll keep "
+                "that in mind.")
+
+
+def test_an_honest_retry_with_a_stray_claim_is_not_spoken(setup, caplog):
+    """The verdict's H2: the retry's "no way" vetoed its own trailing
+    "I'll keep that in mind" and the stray claim was spoken. It is a
+    second claim; the first reply, stripped, is what he hears."""
+    b, fake, record = setup
+    fake.replies = [text_reply(NOTED), text_reply(STRAY_HONEST)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(STORE)
+    assert tags == [("SPEAK", MEMORY_LINE)]
+    assert record == [] and len(_warnings(caplog)) == 2
+    assert brain_mod.unbacked_claim(STRAY_HONEST) == "I'll keep that in mind"
+
+
+RENDER_THREE_LEAD_IN = ("Seventy-two and cloudy, sir. I've set your reminder for "
+                        "five, sir. No worries, I'll remember that, sir.")
+
+
+def test_the_three_round_count_holds_with_a_lead_in_negation(setup, caplog):
+    """The multi-tool turn with the memory clause worn as a lead-in shape:
+    memory line once, the action denial never, both tools confirmed."""
+    b, fake, record = setup
+    _add_reminder(record)
+    fake.replies = [tool_reply(("get_weather", {"when": "now"}),
+                               ("set_reminder", {"when": "five"})),
+                    text_reply(RENDER_THREE_LEAD_IN),
+                    text_reply(RENDER_THREE_LEAD_IN)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(ORDER_THREE)
+    spoken = dict(tags)["SPEAK"]
+    assert spoken == f"{REMINDER_KEPT} {MEMORY_LINE}"
+    _once(spoken)
+    assert record == THREE_RAN
+    assert len(fake.chat_payloads()) == 3
+    assert len(_warnings(caplog)) == 2
