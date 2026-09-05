@@ -63,14 +63,16 @@ def firewall(tmp_path, monkeypatch):
         cuda=SimpleNamespace(synchronize=lambda: None)))
     return tmp_path
 
-# The invented twin of the live prompt tail: a one-off title cut at the
-# 48-char cap, a course, and the seed's own terms.
-PROMPT = ("Jarvis, Hunter, calendar, office hours, do not disturb, "
-          "BIOSENSORS, Appointment: Virtual Visit with S. R. Quennevex,")
+# The invented twin of the live prompt tail's SHAPE: a one-off title cut
+# at the 48-char cap so that it ends in "<surname>,", a course, and the
+# seed's own terms. Every word of the title is invented.
+PROMPT = ("Jarvis, Hunter, calendar, office hours, do not disturb, timer, "
+          "BIOSENSORS, Consultation: Remote Session with Z. Q. Quennevex,")
 
 FOUR = "Quennevex, Quennevex, Quennevex, Quennevex,"
 THIRTEEN_CUT = "Quennevex, " * 12 + "Quenne"       # sample_len cut it mid-word
-A_THEN_B = "Quennevex, Appointment, Appointment, Appointment, Appointment,"
+A_THEN_B = ("Quennevex, Consultation, Consultation, Consultation, "
+            "Consultation,")
 
 
 # ============================================================ prompt_echo
@@ -91,13 +93,30 @@ def test_a_partial_last_word_must_be_a_strict_prefix_of_the_unit():
 
 
 def test_one_prompt_word_then_another_repeated_is_an_echo():
-    """The logged 'X, Appointment, Appointment, Appointment, ...' shape."""
-    assert prompt_echo(A_THEN_B, PROMPT) == ("appointment", 4)
+    """The logged 'X, <word>, <word>, <word>, ...' shape: a runaway that
+    runs to the END of the decode."""
+    assert prompt_echo(A_THEN_B, PROMPT) == ("consultation", 4)
+    # the same run cut mid-word by sample_len
+    assert prompt_echo(A_THEN_B + " Consul", PROMPT) == ("consultation", 4)
+
+
+def test_calling_him_three_times_then_a_command_word_is_not_an_echo():
+    """Review of 69afb9f: "Jarvis, Jarvis, Jarvis, timer" is a person
+    calling an assistant that is ignoring him and then giving a one-word
+    Tier-1 command that happens to be a seed term. A decoder runaway
+    continues to the end of the output; a real last word ends the run,
+    so the two-word rule needs the repeated word LAST."""
+    assert prompt_echo("Jarvis, Jarvis, Jarvis, timer", PROMPT) == ("", 0)
+    assert prompt_echo("Jarvis, Jarvis, Jarvis, calendar.", PROMPT) == ("", 0)
+    assert prompt_echo("Hunter, Quennevex, Quennevex, Quennevex, Hunter",
+                       PROMPT) == ("", 0)
+    # ...while the pure runaway of the name alone is still an echo
+    assert prompt_echo("Jarvis, Jarvis, Jarvis", PROMPT) == ("jarvis", 3)
 
 
 def test_a_multi_word_unit_three_times_is_an_echo():
-    assert prompt_echo("Virtual Visit, Virtual Visit, Virtual Visit.", PROMPT) \
-        == ("virtual visit", 3)
+    assert prompt_echo("Remote Session, Remote Session, Remote Session.",
+                       PROMPT) == ("remote session", 3)
 
 
 def test_the_smallest_period_wins():
@@ -107,7 +126,7 @@ def test_the_smallest_period_wins():
 
 def test_two_repeats_are_not_an_echo():
     assert prompt_echo("Quennevex, Quennevex", PROMPT) == ("", 0)
-    assert prompt_echo("Virtual Visit, Virtual Visit", PROMPT) == ("", 0)
+    assert prompt_echo("Remote Session, Remote Session", PROMPT) == ("", 0)
 
 
 def test_echo_min_repeats_is_three():
@@ -286,6 +305,23 @@ def test_real_words_with_the_same_prompt_are_not_an_echo(firewall, caplog):
     assert res.echo_repeats == 0 and res.echo_unit == ""
     assert res.looping is False and res.accepted is True
     assert "prompt echo" not in caplog.text
+
+
+def test_an_echo_of_a_sentence_unit_is_judged_before_collapse_repeats(
+        firewall, caplog):
+    """collapse_repeats folds three repeated >= 3-word SENTENCES to one
+    before the gate ran, so the folded phrase reached the classifier as
+    a real utterance (review of 69afb9f). The gate now sees the raw text
+    first; the collapsed text is what is returned and logged."""
+    raw = "Remote Session Quennevex. " * 3
+    tr = _gpu(_gpu_segs(raw.strip()), lambda: PROMPT)
+    with caplog.at_level("INFO"):
+        res = tr.transcribe(_audio(3.4))
+    assert res.text == "Remote Session Quennevex."
+    assert res.echo_unit == "remote session quennevex"
+    assert res.echo_repeats == 3
+    assert res.looping is True and res.accepted is False
+    assert "prompt echo" in caplog.text
 
 
 def test_without_a_provider_the_vocab_file_is_the_prompt(firewall):

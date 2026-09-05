@@ -329,9 +329,13 @@ def prompt_echo(text, prompt) -> tuple:
         prompt word; ONE trailing word that is a strict prefix of the
         unit's first word is ignored (sample_len cuts the run mid-word --
         the 20:58:40 transcript ended that way).
-    (ii) at most two distinct words, all prompt words, the most frequent
-        occurring >= ECHO_MIN_REPEATS times: the logged
-        '<surname>, Appointment, Appointment, Appointment, ...' shape.
+    (ii) at most two distinct words, all prompt words, and the LAST word
+        occurs >= ECHO_MIN_REPEATS times: the logged
+        '<surname>, <word>, <word>, <word>, ...' shape. A decoder
+        runaway runs to the end of the output (or the sample_len cut),
+        so the repeated word must be the last one: "Jarvis, Jarvis,
+        Jarvis, timer" is a person calling an assistant that ignores
+        him and then giving a one-word command, not an echo.
     """
     words = _echo_words(text)
     vocab = set(_echo_words(prompt)) if prompt else set()
@@ -353,11 +357,14 @@ def prompt_echo(text, prompt) -> tuple:
                 if cut == expect or not expect.startswith(cut):
                     continue
             return " ".join(unit), repeats
-    distinct = set(words)
+    body = words
+    if n >= 2 and words[-1] != words[-2] and words[-2].startswith(words[-1]):
+        body = words[:-1]               # sample_len cut the run mid-word
+    distinct = set(body)
     if len(distinct) <= 2 and distinct <= vocab:
-        top = max(distinct, key=words.count)
-        if words.count(top) >= ECHO_MIN_REPEATS:
-            return top, words.count(top)
+        top = body[-1]                  # the run must reach the end
+        if body.count(top) >= ECHO_MIN_REPEATS:
+            return top, body.count(top)
     return "", 0
 
 
@@ -885,8 +892,16 @@ class Transcriber:
         self._decoded = True             # warmup() has nothing left to do
         _log_slow_decode(time.monotonic() - t_start, lock_wait, cpu, seconds)
 
+        # The gate judges the RAW text first: collapse_repeats folds three
+        # repeated sentences of >= 3 words into one, and that folded
+        # phrase is not periodic any more -- it would reach the intent
+        # classifier as a real utterance. The collapsed text is still
+        # what is returned and logged.
+        raw = text
         text = collapse_repeats(text)
-        echo_unit, echo_repeats = prompt_echo(text, prompt)
+        echo_unit, echo_repeats = prompt_echo(raw, prompt)
+        if not echo_repeats:
+            echo_unit, echo_repeats = prompt_echo(text, prompt)
 
         if seg_data:
             avg_conf = sum(lp for _, lp in seg_data) / len(seg_data)

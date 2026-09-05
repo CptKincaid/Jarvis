@@ -20,14 +20,17 @@ cap and harvested material falls off the tail first:
 5. Calendar event titles from the read-only disk cache
    (``~/.cache/jarvis/calendar_cache.json``) -- course names such as
    "BIOSENSORS" arrive here with no network and no CalendarService.
-   RECURRING titles only (MIN_TITLE_RECURRENCE events across every
+   RECURRING titles only (MIN_TITLE_RECURRENCE events within ONE
    source): a course is a name he says out loud, a one-off appointment,
    visit or delivery is a name he never says to Jarvis AND private
    detail. 2026-09-04 20:58:45: a surname from a one-off appointment
    title, cut by title[:48] to end in "<surname>,", was echoed four
    times by Whisper on unclear audio and became a "Was that for me?"
    card showing the name on screen and out loud. The live cache held
-   14 distinct titles, 11 of them one-offs.
+   14 distinct titles, 11 of them one-offs (3 sources, 30 events, no
+   title on more than one source; the 3 courses have 6, 6 and 7
+   events each). Counted per source so that the same appointment
+   mirrored on two calendars is still a one-off.
 6. Canvas course names via ``canvas.cached_course_names()`` -- a snapshot
    of that tool's module cache, NEVER a fetch.
 7. The buildings in those same events, normalised through
@@ -70,12 +73,14 @@ PROMPT_TTL_S = 60.0
 MAX_CALENDAR_TITLES = 20
 MAX_BUILDINGS = 8
 MAX_COURSES = 12
-# Events a title must appear in (whitespace-collapsed, lowercased, across
-# every source in the cache) before it is a name worth priming Whisper
-# with. 2 is the smallest count that separates "his courses" (3+ each in
+# Events a title must appear in (whitespace-collapsed, lowercased, within
+# ONE source of the cache) before it is a name worth priming Whisper
+# with. 2 is the smallest count that separates "his courses" (6+ each in
 # the live cache) from the 11 one-off appointments there; a once-a-term
 # seminar with a single event stays out, and it is the seminar's NAME
-# that stays out, never the event.
+# that stays out, never the event. Known cost: a weekly course whose
+# only meeting inside calendar.WINDOW_DAYS falls on a holiday week or a
+# term boundary loses its name for that fortnight.
 MIN_TITLE_RECURRENCE = 2
 TITLE_CHARS = 48
 BUILDING_CHARS = 32
@@ -150,7 +155,8 @@ def clip_term(term: str, cap: int) -> str:
     whitespace at or before the cap; a first word that alone exceeds the
     cap keeps the hard cut -- and then strip trailing punctuation, so no
     term can end in a dangling comma, colon or dash. title[:48] used to
-    cut "... S. <surname>, MD" to "... S. <surname>," (2026-09-04)."""
+    cut "... <initial>. <surname>, <suffix>" to "... <surname>,"
+    (2026-09-04)."""
     term = " ".join(str(term or "").split())
     if len(term) > cap:
         cut = term.rfind(" ", 0, cap + 1)
@@ -209,12 +215,12 @@ def _parse_calendar_cache() -> tuple:
     hit = _calendar_cached
     if hit is not None and hit[0] == mtime:
         return list(hit[1]), list(hit[2])
-    order, counts = [], {}          # first spelling seen; events per key
+    order, counts = [], {}          # first spelling seen; key -> {source: n}
     buildings, seen_b = [], set()
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
         sources = data.get("sources") if isinstance(data, dict) else None
-        for entry in (sources or {}).values():
+        for name, entry in (sources or {}).items():
             events = entry.get("events") if isinstance(entry, dict) else None
             for ev in events if isinstance(events, list) else []:
                 if not isinstance(ev, dict):
@@ -223,9 +229,10 @@ def _parse_calendar_cache() -> tuple:
                 key = title.lower()
                 if title and key != "untitled":
                     if key not in counts:
-                        counts[key] = 0
+                        counts[key] = {}
                         order.append(title)
-                    counts[key] += 1
+                    per = counts[key]
+                    per[name] = per.get(name, 0) + 1
                 place = clip_term(_building_name(ev.get("location")),
                                   BUILDING_CHARS)
                 if place and place.lower() not in seen_b:
@@ -234,11 +241,14 @@ def _parse_calendar_cache() -> tuple:
     except Exception:
         log.exception("calendar cache unreadable for the prompt")
         return [], []
-    # The cache carries no recurrence field, so recurrence is COUNTED:
-    # a title in fewer than MIN_TITLE_RECURRENCE events is a one-off
-    # appointment, not a course (see the module docstring, item 5).
+    # The cache carries no recurrence field, so recurrence is COUNTED,
+    # and counted WITHIN one source: a one-off appointment mirrored on a
+    # second calendar is the same event twice, not a course, and a
+    # cross-source sum would have put its surname straight back into the
+    # prompt. A course recurs on the calendar that holds it (see the
+    # module docstring, item 5).
     titles = [clip_term(t, TITLE_CHARS) for t in order
-              if counts[t.lower()] >= MIN_TITLE_RECURRENCE]
+              if max(counts[t.lower()].values()) >= MIN_TITLE_RECURRENCE]
     titles = [t for t in titles if t][:MAX_CALENDAR_TITLES]
     buildings = buildings[:MAX_BUILDINGS]
     _calendar_cached = (mtime, titles, buildings)
@@ -299,12 +309,15 @@ def build_prompt() -> str:
     for term in (_terms(_user_vocab()) + load_names() + _pronounce_keys()
                  + _terms(DEFAULT_VOCAB) + _calendar_buildings()
                  + _calendar_titles() + _course_names()):
-        # No term may end in a comma, whichever layer it came from: the
-        # prompt is comma-joined, so "X," becomes "X,, Y", and a term
-        # that ends in a comma is the shape Whisper continued as
+        # No term may begin or end in a comma, whichever layer it came
+        # from: the prompt is comma-joined, so "X," becomes "X,, Y" and
+        # ",X" becomes "Y, ,X" -- an empty list item either way -- and a
+        # term that ends in a comma is the shape Whisper continued as
         # "<surname>, <surname>, <surname>, <surname>," on 2026-09-04
         # (a one-off appointment title cut at the cap; see clip_term).
-        term = str(term or "").rstrip(", \t").strip()
+        # Names, pronunciation keys and titles are never split on commas
+        # before they get here, so both ends are stripped here.
+        term = str(term or "").strip(", \t")
         if not term:
             continue
         key = term.lower()

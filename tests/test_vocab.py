@@ -113,23 +113,48 @@ def test_a_title_needs_min_title_recurrence_events_to_join(env):
     assert "Quennevex Seminar" not in terms
 
 
-def test_recurrence_counts_across_sources_and_ignores_case_and_spacing(env):
-    """Two calendars can carry the same course; the count is over the
-    whole cache, keyed on the whitespace-collapsed lowercase title, and
-    the first spelling seen is the one that joins."""
-    cache = env / "cache"
+def _write_sources(tmp_path, **sources):
+    """sources: name -> list of titles, one event each."""
+    cache = tmp_path / "cache"
     cache.mkdir(exist_ok=True)
     payload = {"version": 1, "fetched_at": 1.0, "sources": {
-        "google-1": {"fetched_at": 1.0, "events": [
-            {"title": "Magnetic  Resonance Engr", "location": ""},
-            {"title": "Advising with Orbalind", "location": ""}]},
-        "icloud-1": {"fetched_at": 1.0, "events": [
-            {"title": "magnetic resonance engr", "location": ""}]}}}
+        name: {"fetched_at": 1.0,
+               "events": [{"title": t, "location": ""} for t in titles]}
+        for name, titles in sources.items()}}
     (cache / "calendar_cache.json").write_text(json.dumps(payload))
+
+
+def test_recurrence_ignores_case_and_spacing_and_keeps_the_first_spelling(env):
+    """Keyed on the whitespace-collapsed lowercase title; the first
+    spelling seen is the one that joins."""
+    _write_sources(env, google=["Magnetic  Resonance Engr",
+                                "Advising with Orbalind",
+                                "magnetic resonance engr"])
     terms = vocab.build_prompt().split(", ")
     assert "Magnetic Resonance Engr" in terms
     assert "magnetic resonance engr" not in terms
     assert not [t for t in terms if "Orbalind" in t]
+
+
+def test_a_one_off_mirrored_on_two_calendars_is_still_a_one_off(env):
+    """Recurrence is counted WITHIN a source. The same appointment carried
+    by a Google and an iCloud calendar is one event twice, not a course,
+    and a cross-source sum would have put its surname straight back into
+    the prompt (review of 69afb9f). Live cache 2026-09-04, counted: 3
+    sources, 30 events, 14 titles, 0 of them in more than one source, so
+    the per-source rule keeps the same 3 courses (6, 6 and 7 events)."""
+    title = "Consult with Dr. Orbalind at Quennevex Clinic"
+    _write_sources(env, google=[title, "BIOSENSORS", "BIOSENSORS"],
+                   icloud=[title], outlook=[title])
+    prompt = vocab.build_prompt()
+    assert "BIOSENSORS" in prompt
+    assert "Orbalind" not in prompt and "Quennevex" not in prompt
+
+
+def test_a_course_on_one_calendar_recurs_even_if_another_mirrors_it_once(env):
+    _write_sources(env, google=["Orbalind Lab", "Orbalind Lab"],
+                   icloud=["Orbalind Lab"])
+    assert "Orbalind Lab" in vocab.build_prompt().split(", ")
 
 
 def test_recurring_titles_keep_first_appearance_order(env):
@@ -184,25 +209,28 @@ def test_a_first_word_longer_than_the_cap_keeps_the_hard_cut(env):
     assert not [t for t in terms if len(t) > 48 and t.startswith("QQ")]
 
 
+# The invented twin of the 20:58:45 title SHAPE: longer than the cap,
+# one-off, and title[:48] ends exactly on "Quennevex,". Every word of it
+# is invented -- the wording, the initial and the suffix are not the live
+# title's.
+LIVE_SHAPE = "Consultations: Remote Session with Q. Quennevex, PhD"
+
+
 def test_the_live_shape_never_reaches_the_prompt(env):
-    """The invented twin of the 20:58:45 title: 51 chars, one-off, and
-    title[:48] ends exactly on "Quennevex,". Neither the surname nor a
-    double comma may appear."""
-    title = "Appointment: Virtual Visit with S. R. Quennevex, MD"
-    assert title[:48].endswith("Quennevex,")
-    _write_calendar(env, ["BIOSENSORS", "BIOSENSORS", title])
+    """Neither the surname nor a double comma may appear."""
+    assert len(LIVE_SHAPE) == 52 and LIVE_SHAPE[:48].endswith("Quennevex,")
+    _write_calendar(env, ["BIOSENSORS", "BIOSENSORS", LIVE_SHAPE])
     prompt = vocab.build_prompt()
     assert "Quennevex" not in prompt
-    assert "Appointment" not in prompt
+    assert "Consultations" not in prompt
     _no_dangling_terms(prompt)
 
 
 def test_the_live_shape_recurring_is_still_cut_clean(env):
     """Even if such a title DID recur, the dangling comma cannot survive."""
-    title = "Appointment: Virtual Visit with S. R. Quennevex, MD"
-    _write_calendar(env, [title, title])
+    _write_calendar(env, [LIVE_SHAPE, LIVE_SHAPE])
     terms = vocab.build_prompt().split(", ")
-    assert "Appointment: Virtual Visit with S. R. Quennevex" in terms
+    assert "Consultations: Remote Session with Q. Quennevex" in terms
     _no_dangling_terms(", ".join(terms))
 
 
@@ -227,10 +255,27 @@ def test_a_term_ending_in_a_comma_is_stripped_from_every_layer(env):
     _no_dangling_terms(prompt)
 
 
+def test_a_term_starting_with_a_comma_cannot_form_an_empty_item(env, monkeypatch):
+    """A leading comma reads as "y, ,x" -- an empty list item from the
+    other side. Names, pronunciation keys and titles are not split on
+    commas, so the strip must take both ends (review of 69afb9f)."""
+    (env / "voice_names.txt").write_text(",Orbalind\n, ,\n")
+    monkeypatch.setattr(vocab, "_pronounce_keys", lambda: [",Quennevex,"])
+    monkeypatch.setattr(vocab, "_calendar_titles", lambda: [",Orbalind Lab"])
+    prompt = vocab.build_prompt()
+    terms = prompt.split(", ")
+    assert "Orbalind" in terms and "Quennevex" in terms
+    assert "Orbalind Lab" in terms
+    assert ", ," not in prompt and not prompt.startswith(",")
+    for term in terms:
+        assert term and term[0] != ","
+    _no_dangling_terms(prompt)
+
+
 def test_clip_term_helper(env):
     clip = vocab.clip_term
     assert clip("Magnetic Resonance Engr", 48) == "Magnetic Resonance Engr"
-    assert clip("Lab Section Meeting with Dr. Orbalind, MD", 40) == \
+    assert clip("Lab Section Meeting with Dr. Orbalind, PhD", 40) == \
         "Lab Section Meeting with Dr. Orbalind"
     assert clip("Orbalind, Quennevex", 9) == "Orbalind"
     assert clip("Orbalind, Quennevex", 10) == "Orbalind"
