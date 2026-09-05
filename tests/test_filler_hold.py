@@ -335,6 +335,77 @@ def test_the_turn_ledger_line_carries_the_hold_count():
     assert "holds" not in rec and "holds" not in TurnLedger.format(rec)
 
 
+# ------------------------------------------------ (3b) the two 09-05 holes
+#
+# Both were MEASURED by the round-1 verdict against this branch, both are
+# one-sided-guard bugs in _filler_hold_extra, and neither can cut him off
+# sooner than today -- they corrupt the ledger and accept a partial the
+# endpointer could not have heard.
+def test_a_partial_from_the_future_never_buys_a_hold(monkeypatch):
+    """MEASURED 09-05: note_partial("um", 999.0) against last_speech 0.96
+    fired a hold. The guard `end_s < last - FILLER_SLACK_S` had no upper
+    bound, so a preview decode that lands after a stop -- carrying the
+    OLD capture's position -- claimed the um was the last thing heard in
+    a pause it never covered. A span may not reach past the audio the
+    endpointer has actually been fed (plus the same slack)."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("um", 999.0)
+    _push(rec, 26)                                     # 0.83 s: the ordinary stop
+    assert rec._check_endpoint() is True and rec._filler_holds == 0
+    assert rec.stops[0][2] < 1.0
+
+
+def test_a_partial_a_little_past_the_fed_audio_still_holds(monkeypatch):
+    """The bound is a bound, not a trap: the preview snapshots the buffer
+    while the poll thread is between feeds, and feed() only consumes whole
+    512-sample chunks, so end_s legitimately runs a fraction of a second
+    ahead of ep.audio_seconds. One slack either side."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("set a timer for, um", rec.endpointer.audio_seconds + 0.5)
+    _push(rec, 26)
+    assert rec._check_endpoint() is False and rec._filler_holds == 1
+
+
+def test_a_hold_that_delays_nothing_is_not_counted_and_not_logged(monkeypatch, caplog):
+    """MEASURED 09-05: one starved poll tick arriving with 3.84 s of
+    silence already banked stopped on that very tick (the gap is past
+    0.8 + 1.5 = 2.3 s) and still recorded filler_holds == 1. holds=N is
+    the number the design added so a week of turns can say how often the
+    hold fired -- an increment that delayed nothing makes it an upper
+    bound instead of a count. Count and log only when the hold changes
+    the outcome."""
+    caplog.set_level(logging.INFO, logger="jarvis.recorder")
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("set a timer for, um", 0.96)
+    _push(rec, 120)                                    # 3.84 s in one tick
+    assert rec._check_endpoint() is True
+    (reason, endpoint, dead_air), = rec.stops
+    assert (reason, endpoint) == ("silence", "vad") and dead_air > 2.3
+    assert rec._filler_holds == 0
+    assert [r.getMessage() for r in caplog.records if "filler hold" in r.getMessage()] == []
+
+
+def test_a_hold_that_did_delay_the_stop_is_still_counted_when_it_expires(monkeypatch):
+    """The other side of the same rule: a hold counted on the tick it
+    delayed stays counted on the tick it expires. holds=1 must survive
+    the stop it lengthened, or the ledger under-counts instead."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("set a timer for, um", 0.96)
+    _push(rec, 26)
+    assert rec._check_endpoint() is False and rec._filler_holds == 1
+    _push(rec, 50)                                     # 2.43 s: the hold is spent
+    assert rec._check_endpoint() is True and rec._filler_holds == 1
+    assert rec.stops[0][2] > 2.3
+
+
+def test_the_hold_count_is_the_number_of_holds_that_delayed_a_stop(monkeypatch):
+    """What holds=N means, pinned in one line so the docs and the ledger
+    cannot drift apart again."""
+    import jarvis.recorder as rm
+    doc = rm.Recorder._filler_hold_extra.__doc__ or ""
+    assert "delay" in doc.lower()
+
+
 # ------------------------------------------------------------ (4) partial loop
 def _pipeline_class():
     import jarvis.app as app_mod

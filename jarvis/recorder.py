@@ -854,7 +854,7 @@ class Recorder:
         if ep.audio_seconds < 0.5:
             return False                      # by audio, not by frame count
         if CONFIG.filler_hold and \
-                gap < CONFIG.endpoint_silence + self._filler_hold_extra(ep):
+                gap < CONFIG.endpoint_silence + self._filler_hold_extra(ep, gap):
             return False
         log.info("Auto-stop: %.2fs after the last word (vad%s)", gap,
                  ", %d filler hold(s)" % self._filler_holds if self._filler_holds else "")
@@ -884,15 +884,38 @@ class Recorder:
         self._filler_holds = 0
         self._filler_hold_key = None
 
-    def _filler_hold_extra(self, ep) -> float:
+    def _filler_hold_extra(self, ep, gap: float) -> float:
         """Seconds to add to endpoint_silence for the pause the VAD is in
-        now: CONFIG.filler_hold_s when the newest preview decode ended on a
-        filler and its span reached to within FILLER_SLACK_S of the last
-        speech, else 0. A hold is counted ONCE per pause (keyed on the
-        last-speech position), never per poll tick and never again for a
-        later re-decode of the same pause; at most CONFIG.filler_max_holds
+        now (`gap` seconds old): CONFIG.filler_hold_s when the newest
+        preview decode ended on a filler and its span reached to within
+        FILLER_SLACK_S of the last speech, else 0.
+
+        A hold is counted ONCE per pause (keyed on the last-speech
+        position), never per poll tick and never again for a later
+        re-decode of the same pause; at most CONFIG.filler_max_holds
         pauses per capture, after which this returns 0 and the ordinary
-        stop happens. Logs each hold once, with the word and the wait."""
+        stop happens. Logs each hold once, with the word and the wait.
+
+        TWO BOUNDS, both from measurements on 09-05, neither of which can
+        stop a capture sooner than the branch already did:
+
+        * The span may not reach past the audio the endpointer has been
+          fed, plus the same slack. The original guard was one-sided
+          (`end_s < last - FILLER_SLACK_S`), so note_partial("um", 999.0)
+          -- a preview decode landing after a stop, carrying the OLD
+          capture's position -- bought a hold in a pause it never covered.
+          The slack on this side too: the preview snapshots the buffer
+          between poll ticks and feed() consumes whole 512-sample chunks,
+          so a legitimate end_s runs a fraction of a second ahead.
+
+        * A hold is counted and logged only when it CHANGES the outcome.
+          One starved poll tick arriving with the gap already past
+          endpoint_silence + filler_hold_s stops on that tick; incrementing
+          there made RecordingStopped.filler_holds -- and the ledger's
+          holds=N, the number the design added so a week of turns could say
+          how often the hold fired -- an upper bound rather than a count of
+          holds that DELAYED a stop. A hold already counted for this pause
+          stays counted on the tick it expires."""
         latest = self._latest_partial
         if latest is None:
             return 0.0
@@ -902,15 +925,20 @@ class Recorder:
         last = ep.last_speech_seconds
         if last is None or end_s < last - FILLER_SLACK_S:
             return 0.0            # speech followed that span: the tail was never decoded
+        if end_s > ep.audio_seconds + FILLER_SLACK_S:
+            return 0.0            # a partial from a capture this endpointer never heard
+        extra = float(CONFIG.filler_hold_s)
         if self._filler_hold_key != last:
             if self._filler_holds >= CONFIG.filler_max_holds:
                 return 0.0
+            if gap >= CONFIG.endpoint_silence + extra:
+                return 0.0        # already past the hold: it would delay nothing
             self._filler_holds += 1
             self._filler_hold_key = last
             log.info("filler hold %d/%d: %r at %.1fs, waiting %.1fs",
                      self._filler_holds, CONFIG.filler_max_holds, filler, last,
                      CONFIG.filler_hold_s)
-        return float(CONFIG.filler_hold_s)
+        return extra
 
     def _check_silence(self) -> bool:
         """Port of monolith 4301-4344. Returns True when it stopped the

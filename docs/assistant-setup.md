@@ -4277,7 +4277,19 @@ of ums whatever the preview saw.
 What the log shows: `filler hold 1/3: 'um' at 3.2s, waiting 1.5s` once
 per hold, and the turn line ends `(stop=vad holds=1)` on a turn where one
 fired (the same field is in turns.jsonl), so a week of turns can say how
-often it happened without anyone reading a transcript.
+often it happened without anyone reading a transcript. **`holds=N` counts
+holds that actually delayed a stop** — nothing else. A hold is counted on
+the tick it postpones the stop, once per pause, and it stays counted on
+the tick it expires; a poll tick that arrives so late the pause is already
+past 0.8 + 1.5 s stops immediately and records no hold, because it waited
+for nothing. (Before 09-05 it counted those too, which made the number an
+upper bound instead of a count.)
+
+The other bound: a preview decode is only allowed to claim the um was the
+last thing heard if its span sits inside the audio the endpointer has
+itself heard — no more than 0.6 s either side of the last speech mark. A
+decode that lands after a stop carries the previous capture's position and
+buys nothing.
 
 **The limit, stated plainly.** The preview re-decodes every 0.9 s and the
 stop is due at 0.8 s, so an um said right after the last preview may never
