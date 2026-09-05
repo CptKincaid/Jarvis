@@ -22,6 +22,7 @@ import email.utils
 import html as _html
 import imaplib
 import mimetypes
+import os
 import re
 import smtplib
 import socket
@@ -585,6 +586,77 @@ class MailSendFailed(RuntimeError):
     """SMTP refused, or the attachment could not be read."""
 
 
+class MailAuthFailed(MailSendFailed):
+    """The provider refused the ACCOUNT, not the message.
+
+    Its own class because it is the one send failure with a fix he can
+    act on -- an app password that has been revoked or rotated -- and
+    "that didn't send, sir" sends him looking at his network instead. The
+    server's reply is deliberately NOT carried: an SMTPAuthenticationError's
+    text quotes the username back, and this travels into a spoken line.
+    """
+
+
+# ------------------------------------------------------- the rehearsal
+# JARVIS_MAIL_DRYRUN=1 replaces the transport with this. It exists because
+# the whole chain -- phrase to path, name to address, read-back, yes,
+# assembled MIME -- could otherwise only be proved by sending a real
+# message to a real person, and there is no undo for a rehearsal that
+# turns out to have been live. It is a CLASS, used exactly where
+# smtplib.SMTP_SSL would be, so nothing on the send path is special-cased
+# for it; ``dry_run`` is the flag the spoken line reads.
+DRYRUN_ENV = "JARVIS_MAIL_DRYRUN"
+
+
+class DryRunSMTP:
+    """A transport that assembles and discards. Opens no socket, ever."""
+
+    dry_run = True
+    #: every message this process rehearsed, newest last
+    made: list = []
+
+    def __init__(self, host, port, timeout=None):
+        self.host, self.port, self.timeout = host, port, timeout
+        self.sent: list = []
+        self.logged_in = None
+        DryRunSMTP.made.append(self)
+
+    def login(self, user, password):
+        # The password is accepted and NOT stored: a rehearsal must not put
+        # an app password anywhere a later print could reach.
+        self.logged_in = (user, "<not stored>")
+
+    def send_message(self, msg):
+        self.sent.append(msg)
+        log.info("mail: REHEARSAL only -- %s bytes assembled, nothing sent",
+                 len(bytes(msg)))
+
+    def quit(self):
+        pass
+
+
+def dryrun_enabled(env=None) -> bool:
+    """Is JARVIS_MAIL_DRYRUN set to something that means yes?"""
+    raw = (env if env is not None else os.environ).get(DRYRUN_ENV, "")
+    return str(raw).strip().lower() in ("1", "true", "yes", "on")
+
+
+def dryrun_transport(env=None):
+    """The class to hand ``send_message``: DryRunSMTP, or None for live.
+
+    None rather than smtplib.SMTP_SSL so the live path stays exactly the
+    default it has always been (``smtp or smtplib.SMTP_SSL`` inside
+    send_message) and this function can never be the thing that picks a
+    transport for a real send.
+    """
+    return DryRunSMTP if dryrun_enabled(env) else None
+
+
+def is_dryrun(smtp) -> bool:
+    """True when this transport assembles but does not deliver."""
+    return bool(getattr(smtp, "dry_run", False))
+
+
 def smtp_host(account: dict) -> str:
     """The submission host for an account.
 
@@ -749,6 +821,11 @@ def send_message(account: dict, to_addr: str, subject: str, body: str,
         # is re-raised with the TYPE only, because it travels into a spoken
         # line and a server that echoes the username would put it there.
         log.warning("mail: send failed (%s)", type(exc).__name__)
+        # A refused app password and a dead wire are different problems
+        # and only one of them is his to fix, so they get different
+        # classes. The server's reply is still not carried.
+        if isinstance(exc, smtplib.SMTPAuthenticationError):
+            raise MailAuthFailed(type(exc).__name__) from exc
         raise MailSendFailed(type(exc).__name__) from exc
     finally:
         for closer in (getattr(conn, "quit", None),):

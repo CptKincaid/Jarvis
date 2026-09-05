@@ -1698,6 +1698,7 @@ TIER1_SAMPLES = {
     # brief; it arms a read-back and never a send, so the gate test can
     # run it safely.
     "send file": "email the lab report to heather",
+    "sent files": "what did i email today",
     "liked songs": "play my liked songs",
     "music resume": "start playing my spotify",   # the 20:56:42 clause
     "diagnostics": "run diagnostics",
