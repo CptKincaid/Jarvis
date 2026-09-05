@@ -521,3 +521,14 @@ def test_it_does_not_tell_him_to_print_a_secret_bearing_file():
     for block in re.findall(r"```bash\n(.*?)```", _section(), re.S):
         assert "cat " not in block
         assert "assistant.json" not in block
+
+
+def test_the_empty_printout_points_at_a_heading_that_exists():
+    """A pointer to a section he cannot find is worse than none: the empty
+    case is exactly the moment he is looking for the next step."""
+    quoted = re.findall(r'"([^"]{20,})"', gl.EMPTY_HELP)
+    assert quoted, "the empty help names no section"
+    heads = [ln.lstrip("# ").strip() for ln in DOC.read_text().splitlines()
+             if ln.startswith("#")]
+    for title in quoted:
+        assert any(title in h for h in heads), "no heading %r" % title
