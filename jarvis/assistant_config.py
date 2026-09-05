@@ -3,9 +3,18 @@
 One file holds every personal-assistant setting and secret: home location,
 Google secret-iCal URLs, the iCloud / Gmail app passwords, the Discord bot
 token, the Claude session rules (allowed dirs, models, skill phrases) and
-the briefing / alarm / autostart options. It is created from DEFAULTS with
-placeholders and mode 0600 on first load, saved atomically (0600), and a
-corrupt file is moved aside as ``assistant.json.bad`` and recreated.
+the briefing / alarm / autostart options. ``load()`` is a READ: it never
+touches the file, whatever it finds (missing, corrupt, loose mode, keys
+added since it was written) -- it notes the finding and merges DEFAULTS in
+memory. Writing the file back is ``ensure_defaults()``, which creates it
+(placeholders, mode 0600) when missing, moves a corrupt one aside as
+``assistant.json.bad`` and recreates it, tightens a loose mode and fills in
+new keys; ONLY jarvis.app calls it, once, at startup. Every other reader --
+a script, jarvis-breeze, a test, an agent's ``import jarvis.brain`` -- gets
+a config it can read and cannot have rewritten. (Until 2026-09-04 load()
+did the write itself, and an agent's import of jarvis.brain rewrote the
+live, secret-bearing file at 15:08 that day; tests/test_config_readonly.py
+imports every jarvis module and checks the bytes and mtime did not move.)
 
 Loading never raises: with an unwritable directory the config lives in
 memory and every ``save()`` logs the failure.
@@ -47,6 +56,50 @@ DEFAULTS: dict = {
     "user": {"name": "Hunter"},
     "units": "us",
     "local_model": "gemma4:26b",
+    # HOW MUCH ROOM THE LOCAL MODEL GETS TO REMEMBER IN (jarvis/brain.py).
+    # The window holds what he is TOLD -- persona, tools, memory, history,
+    # the question, the tool results -- not how hard he thinks; think is
+    # the separate switch below, and it is off.
+    # Every value here is read ONCE, when Jarvis starts, and is then
+    # identical on every single request the brain makes -- Ollama keys its
+    # loaded runner on num_ctx, so asking for a different one mid-run makes
+    # the 25 B model RELOAD (measured 8.8 s) and throws away the prompt
+    # cache with it. A change here therefore needs a Jarvis RESTART; it can
+    # never take effect per turn. See docs/assistant-setup.md, "The brain".
+    "brain": {
+        # The whole window, in tokens: everything the model can see at once
+        # (tool descriptions + persona + memory + history + his question +
+        # the tool results). 16384 is the largest size measured to load
+        # safely on this box: +0.19 GB of KV cache, +0.011 s per turn.
+        # Above it nothing has been watched loading -- raise with care and
+        # watch MemAvailable.
+        "num_ctx": 16384,
+        # The cap on what the model may GENERATE in one round, in tokens:
+        # its reply text, any tool-call JSON, and (only with think on) its
+        # reasoning. It is NOT the cap on what is spoken -- speech is
+        # clamped afterwards by MAX_SPOKEN_SENTENCES / MAX_SPOKEN_CHARS in
+        # jarvis/brain.py, and a reply this budget cuts is cut mid-word.
+        # Real replies come back at 8-28 tokens, so 160 has never yet
+        # bound; a tool call with long arguments is what would hit it.
+        "num_predict": 160,
+        # How much the wording is allowed to vary. Lower is steadier and
+        # flatter; higher is livelier and less predictable.
+        "temperature": 0.7,
+        # Let the model reason to itself before answering. MEASURED OFF for
+        # a reason: at num_predict 160 the reasoning ate the whole budget
+        # and the reply came back EMPTY 6 times out of 6, and the turns
+        # that did finish took 10.9-33.0 s against a 1.3 s baseline. Do not
+        # turn this on without also raising num_predict a long way.
+        "think": False,
+        # Tokens held back for the answer, on top of num_predict, when the
+        # guard below decides whether a round still fits.
+        "answer_reserve_tokens": 128,
+        # THE GUARD. When a round would overflow the window, drop the
+        # OLDEST TOOL RESULT. With this off, Ollama makes room its own way
+        # -- by deleting the oldest messages, which is HIS QUESTION -- and
+        # says nothing about it in any log.
+        "protect_question": True,
+    },
     "home_location": {"city": "", "region": "", "lat": None, "lon": None},
     "location_lookup": True,
     "google_ical_urls": [],
@@ -1344,16 +1397,22 @@ class AssistantConfig:
         self.path: Optional[Path] = Path(path) if path else None
         self._data: dict = _deep_merge(DEFAULTS, data or {})
         self._stamp = _file_stamp(self.path) if self.path else None
+        # What load() found on disk; ensure_defaults() acts on it.
+        self.disk_state = {"missing": False, "corrupt": False,
+                           "loose_mode": False, "new_keys": False}
 
     # ------------------------------------------------------------ loading
     @classmethod
     def load(cls, path: Optional[os.PathLike | str] = None) -> "AssistantConfig":
-        """Never raises.  Creates the file (0600, placeholders) when missing;
-        moves a corrupt one to ``<name>.bad`` and recreates it; fills in any
-        keys added since the file was written."""
+        """Never raises, and NEVER WRITES. Reads the file and merges DEFAULTS
+        over it in memory; a missing or corrupt file, a loose mode and keys
+        DEFAULTS has gained since the file was written are only NOTED (in
+        ``disk_state``) and logged. ``ensure_defaults()`` is the write, and
+        the app is its only caller."""
         p = config_path(path)
         raw: dict = {}
-        need_write = False
+        state = {"missing": False, "corrupt": False, "loose_mode": False,
+                 "new_keys": False}
         try:
             if p.exists():
                 try:
@@ -1362,32 +1421,78 @@ class AssistantConfig:
                         raise ValueError(f"top level is {type(loaded).__name__}")
                     raw = loaded
                 except (ValueError, UnicodeDecodeError) as exc:
-                    bad = p.with_name(p.name + ".bad")
-                    log.warning("assistant config %s is corrupt (%s); "
-                                "moved to %s and recreated", p, exc, bad)
-                    os.replace(p, bad)
-                    raw, need_write = {}, True
+                    log.warning("assistant config %s is corrupt (%s); using "
+                                "defaults in memory (the app moves it aside "
+                                "and recreates it at startup)", p, exc)
+                    state["corrupt"] = True
                 else:
                     try:
                         mode = p.stat().st_mode & 0o777
                         if mode & 0o077:
-                            os.chmod(p, 0o600)
-                            log.warning("assistant config had mode %o; "
-                                        "tightened to 600", mode)
+                            state["loose_mode"] = True
+                            log.warning("assistant config %s has mode %o; the "
+                                        "app tightens it to 600 at startup",
+                                        p, mode)
                     except OSError:
                         log.warning("could not check mode of %s", p)
             else:
-                need_write = True
-                log.info("assistant config missing; creating %s with placeholders", p)
+                state["missing"] = True
+                log.info("assistant config missing at %s; using defaults in "
+                         "memory (the app creates it at startup)", p)
         except OSError:
             log.exception("assistant config %s unreadable; using defaults in memory", p)
         cfg = cls(raw, p)
-        if not need_write and cfg._data != raw:
-            need_write = True          # new keys since the file was written
-            log.info("assistant config %s gained new default keys", p)
-        if need_write:
-            cfg.save()
+        if not state["missing"] and not state["corrupt"] and cfg._data != raw:
+            state["new_keys"] = True        # new keys since the file was written
+            log.info("assistant config %s lacks keys DEFAULTS has gained; "
+                     "using their defaults in memory", p)
+        cfg.disk_state = state
         return cfg
+
+    def ensure_defaults(self) -> bool:
+        """THE write that load() used to do, made explicit: create the file
+        with placeholders (0600) when it is missing, move a corrupt one to
+        ``<name>.bad`` and recreate it, tighten a loose mode to 0600 and
+        write back any keys DEFAULTS has gained. Returns True when the file
+        was touched. Only jarvis.app calls this, once, at startup -- so the
+        one process that owns the file is the only one that rewrites it,
+        and a script, a service or a test that merely loads the config can
+        never race the running app's saves (os.replace, last writer wins).
+        Never raises."""
+        if self.path is None:
+            return False
+        state = getattr(self, "disk_state", None) or {}
+        touched = False
+        p = self.path
+        try:
+            if state.get("corrupt") and p.exists():
+                bad = p.with_name(p.name + ".bad")
+                log.warning("assistant config %s is corrupt; moved to %s and "
+                            "recreated", p, bad)
+                os.replace(p, bad)
+            if state.get("missing") or state.get("corrupt") \
+                    or state.get("new_keys"):
+                if state.get("missing"):
+                    log.info("assistant config missing; creating %s with "
+                             "placeholders", p)
+                elif state.get("new_keys"):
+                    log.info("assistant config %s gained new default keys", p)
+                touched = self.save()
+            elif state.get("loose_mode"):
+                mode = p.stat().st_mode & 0o777
+                if mode & 0o077:
+                    os.chmod(p, 0o600)
+                    log.warning("assistant config had mode %o; tightened "
+                                "to 600", mode)
+                    touched = True
+        except OSError:
+            log.exception("assistant config %s could not be brought up to "
+                          "date; continuing with the in-memory copy", p)
+            return touched
+        if touched:
+            self.disk_state = {"missing": False, "corrupt": False,
+                               "loose_mode": False, "new_keys": False}
+        return touched
 
     # ------------------------------------------------------------- access
     def get(self, dotted: str, default: Any = None) -> Any:

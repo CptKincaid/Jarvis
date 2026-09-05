@@ -4552,3 +4552,213 @@ hint-ON take showing `holds 0` is not evidence the hint failed to help —
 it may be evidence you stuttered cleanly enough to look like an echo. The
 takes worth comparing are the ones with real words around the um, which is
 what the instruction before each take asks you for.
+
+## 86. The brain: how much room he gets to remember in
+
+Everything the local model is *given* now lives in one place you can edit,
+under `brain` in `~/.config/jarvis/assistant.json`. It used to be four
+numbers buried in the code. A value that makes no sense is logged and
+replaced with the default rather than obeyed.
+
+**How these six keys got into your live file, and why that cannot happen
+again.** They are in your `assistant.json` because on 2026-09-04 at 15:08
+an *agent's* `import jarvis.brain` rewrote it — not Jarvis. Two things
+allowed that: importing the brain read the config, and reading the config
+saved it back whenever the defaults had gained a key. Both are closed.
+Loading the config **never writes** now — a missing file, a corrupt file,
+a loose mode or new default keys are only noted and logged. The one write
+is `ensure_defaults()`, which only the running app calls, once, at
+startup (it creates the file, moves a corrupt one to `.bad`, tightens the
+mode, fills in new keys — exactly what loading used to do, in the one
+process that owns the file). And importing the brain reads nothing: the
+app hands its already-loaded config over, and anything else gets a
+read-only load the first time it actually needs a setting. A test imports
+every one of the 152 jarvis modules against a stale, loose config and
+checks the bytes, the mtime and the mode did not move (measured on the
+old code: the same walk grew a 38-byte file to 12,632 bytes in 2 s).
+
+```json
+"brain": {
+  "num_ctx": 16384,
+  "num_predict": 160,
+  "temperature": 0.7,
+  "think": false,
+  "answer_reserve_tokens": 128,
+  "protect_question": true
+}
+```
+
+**First, what the window was and was not.** The 09-04 change was sold as
+"room to think". It is not: thinking is the `think` switch below, and it
+is off. What the window holds is what he is *told* — and the truncation
+it was meant to cure was rare: counted over a week of his log, **1 prompt
+in 5,328 was truncated** (a count from the 09-04 review, not re-measured
+since). Doubling the window buys room to *remember* — a long calendar and
+a long inbox in the same turn, more of the conversation — and it was the
+guard further down, not the size, that fixed the one turn that went wrong.
+
+**`num_ctx` — how much he can hold in his head at once.**
+Everything he sees on a turn shares this: the tool descriptions, his
+persona, what he remembers about you, the last few exchanges, your
+question, and whatever the tools came back with. 16384 is double what he
+had. Costs **0.19 GB of memory** and about **11 milliseconds a turn** —
+both measured, not guessed. It does *not* make his answers longer or
+cleverer. Raising it further is untested: 16384 is the biggest window
+anyone actually watched load on this box, so above that he logs a warning
+and you should watch memory. Below 2048 or above 262144 he ignores you and
+uses 16384.
+
+**`num_predict` — how much he may *generate* in one round.**
+160 tokens. This is **not** how long he speaks. What he says aloud is
+clamped separately, after the model has answered, to four sentences and
+about 450 characters (`MAX_SPOKEN_SENTENCES` / `MAX_SPOKEN_CHARS` in
+`jarvis/brain.py`), and that clamp cuts at a sentence end. This budget
+covers everything the model writes in a round — the reply text *and* the
+JSON of any tool call it makes (and its reasoning, only if `think` is on)
+— and when it binds, it cuts mid-word. His real replies come back at 8-28
+tokens, so 160 has never once stopped him; a tool call with long
+arguments is what would hit it first. Raising it makes long answers
+*possible*, not *likely*.
+
+**`temperature` — how much his wording varies.**
+0.7. Lower is steadier and flatter; higher is livelier and less
+predictable. Cheap to try, instantly reversible.
+
+**`think` — whether he reasons to himself before answering. Leave it off.**
+It was measured on 2026-09-04 and it does not work on this model yet: his
+reasoning is charged to the same `num_predict` budget as his reply, so at
+160 he spent the whole thing thinking and said **nothing at all, six times
+out of six**. Given far more room, 6 of 10 were still empty and the ones
+that finished took 11 to 33 seconds against his usual 1.3. If you turn it
+on he warns you in the log and tells you what your `num_predict` is.
+
+**`answer_reserve_tokens` — headroom kept clear for the reply.** 128.
+You will not need to touch this: since round 3 it is not the only margin.
+The guard works from an *estimate*, and the estimate has a measured error
+— the static prefix was estimated at 3,556 tokens and Ollama counted 3,761,
+5.8% low, which at the old 16,096 ceiling was ~930 tokens against a
+288-token margin (160 + 128). So two more things now sit between the
+estimate and the window: a **calibration factor** the estimate is
+multiplied by, starting at the measured **1.06** and learning from every
+round (below), and a fixed **4% of the window** (655 tokens) taken off the
+ceiling. The arithmetic at the shipped settings: 16384 − 160 − 128 − 655 =
+**15441** is the ceiling; a calibrated estimate passes at a raw estimate of
+at most 14,566; even if the real cost ran 10% above that (16,022 — worse
+than anything measured) the 160-token reply still fits under 16,384.
+
+**`protect_question` — the safety catch. Leave it on.**
+When a turn gets big — a long calendar plus a long email — something has
+to give. Ollama's own way of giving is to delete the *oldest* messages,
+and the oldest message is **your question**. Measured: a 9000-character
+calendar result took his prompt from 8253 tokens down to 7754, and the
+499 tokens that vanished were your question, the background and his
+memory. He then answers something confident and unrelated, and nothing
+anywhere says why. With this on he cuts the *tail of the largest tool
+result* instead — a long calendar loses its evening, not its morning —
+marks the cut in the result so the model knows it is reading part of it
+(the "you may take up to N sentences" note a list-shaped result carries at
+its end is lifted off and put back, so a cut calendar is still read out in
+full sentences), keeps your question, and writes a line in the log saying
+he did it. If the next round overflows again — the mail arrives after the
+calendar — the same result is **cut again**, its marker lifted and put
+back once, rather than the newest result being thrown away (round 3 as
+first shipped had a once-only rule, and on the round after a cut it
+dropped the newest result whole while hundreds of trimmable tokens sat
+in the cut one; the review measured it). A result is never cut below
+**400 characters**: when the largest cannot absorb the whole overflow
+above that floor, every result goes down toward its floor in turn so each
+tool keeps its head — unless even the floors would not fit, in which case
+a drop is unavoidable and he takes it *first*, oldest result first, so the
+newest (the one the model just asked for) is sent whole rather than cut
+to its floor and then thrown away anyway. Round 2 dropped whole every
+time, which for the one result a turn hinged on meant he answered "an
+earlier result was dropped, sir" instead of reading you the morning. What
+the model then sees of a cut result is also what his own checks judge the
+reply against, not the full text it never had.
+
+It guards **every** request he makes to the model, not only the tool
+loop: the spoken summaries, the router's tie-breaker, "explain this
+document", the quizzes, the syllabus reader, the Sunday memory garden,
+both warm-ups — and the screen tool's vision question (`[screen]` in the
+log), which used to post on its own. Those have no tool result to cut, so
+there he cuts the *tail of the material* — the end of the document or
+digest, or the question — and marks the cut, because the instruction in
+front of it is what Ollama would have eaten first. A screenshot is costed
+as a fixed allowance of 1,024 tokens, never as its base64, so an image
+cannot trim the question — and that allowance is charged on the path the
+screen tool actually takes (round 3 as first shipped charged it there at
+zero; measured: the walk put a screen question at 1,122 tokens, the guard
+at 116). A round that carries an image **never feeds the calibration**
+below: whether Ollama's count includes the image, and at what price, is
+not measured here, so its ratio says nothing about the text rate the
+factor tracks. Before that rule, one screenshot question pinned the factor
+at its 2.0 cap and halved the tool loop's trim threshold for the next
+seven rounds.
+
+### How he knows a prompt is too big
+
+He estimates before he sends, with **two rates**: 4.1 characters a token
+for prose and tool descriptions, and **2.25** for tool results — measured
+on the 09-04 calendar turn, where 9,000 characters of calendar cost 3,993
+tokens. Costed at 4.1 alone the estimate ran low by up to 1.8x, and on
+that exact turn the guard would have slept. The estimate costs 0.055 ms a
+round (measured), i.e. nothing.
+
+Then he logs what it *really* cost, from Ollama's own reply, on every
+path:
+
+```
+ctx: prompt 4265/16384 tokens (26%), answer 22/160 (estimated 4310, raw 4066 x1.060) [chat]
+ctx-calibration: 1.060 -> 1.079 (Ollama counted 4265 against an estimate of 4066 [chat])
+ctx: prompt 1900/16384 tokens (12%), answer 30/160 (estimated 1202, raw 1134 x1.060) (1 image at 1024) [screen]
+ctx-calibration: unchanged at 1.060 -- 1 image in the prompt, costed at the 1024-token allowance (...)
+```
+
+The tag at the end names the path — `chat` (the tool loop), `persona`
+(summaries), `route` (the tie-breaker), `json` (documents, quizzes, the
+garden), `warm` and `rewarm` (the warm-ups), `screen` (the vision
+question). Three numbers sit side by side: what Ollama counted, the
+calibrated estimate the guard compared, and the raw estimate with the
+factor it was multiplied by. The second line is the **calibration**: the
+measured-over-raw ratio of that round moves the factor half-way toward
+itself, and the *next* round's guard uses the new factor. It can only make
+him more careful than the measured 1.06 baseline, never less (a count
+below half the estimate is ignored as not a whole-prompt count, and so is
+any round that carried an image), and it is capped at 2.0. Above 90% of
+the window the `ctx:` line becomes a warning. The `warm` line is special: the warm-up sends the static prefix
+and nothing else, so its prompt number **is** the true cost of the
+persona plus the tool schemas.
+
+### Two things to know
+
+**A change here does nothing until Jarvis restarts.** That is deliberate,
+not a missing feature. Ollama keys the loaded model on `num_ctx`, so
+asking for a different one mid-run makes the 25-billion-parameter model
+reload — nearly nine seconds — and on the live server three of four
+attempts to do that hung outright. So the settings are read once, when he
+starts, and are identical on every request until he restarts.
+
+**He tells you what he is running on.** In `/tmp/vss_voice/jarvis.log`,
+one line at startup:
+
+```
+brain: window 16384 tokens, generation per round capped at 160 (reply text
+plus tool calls; speech is clamped separately), temperature 0.7, thinking
+off (assistant.json brain.*; a change needs a restart). Static prefix
+~3556 tokens (persona ~1462 + 28 tool schemas ~2094), 128 reserved ->
+~12540 tokens left for his question, memory, history and tool results.
+Question guard on (trims a round above ~15441 calibrated tokens: 4% of
+the window kept as estimate margin, estimate x1.060 from the last
+measured round).
+```
+
+None of this was visible before.
+
+### Verifying after a restart
+
+```bash
+ollama ps                                          # CONTEXT should read 16384
+grep "brain: window" /tmp/vss_voice/jarvis.log | tail -1
+grep "ctx: prompt" /tmp/vss_voice/jarvis.log | tail -5   # estimate vs real
+```
+If the model will not load at all, put `num_ctx` back to 8192 and restart.

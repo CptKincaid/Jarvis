@@ -395,6 +395,15 @@ class JarvisApp:
     def __init__(self):
         # ---- assistant config first: everything below reads it ------------
         self.assistant = AssistantConfig.load()
+        # THE ONE WRITE. load() is a read everywhere (a script, jarvis-breeze,
+        # a test, an agent's import); the app is the process that owns the
+        # file, so it alone creates it, recreates a corrupt one, tightens
+        # the mode and fills in keys DEFAULTS has gained -- once, here.
+        try:
+            self.assistant.ensure_defaults()
+        except Exception:
+            log.exception("assistant config ensure_defaults failed; "
+                          "continuing with the in-memory copy")
         # How often "sir" lands on the ear (jarvis/address.py). Installed as
         # module state, the way earcons.set_config is, because the two join
         # sites that need it -- quiet.digest and speak_queue's watcher -- are
@@ -434,8 +443,13 @@ class JarvisApp:
         self.brain = JarvisBrain(self.context, self.memory)
         # brain.configure(assistant.local_model): module-level in brain.py;
         # env JARVIS_OLLAMA_MODEL wins inside it.
+        # ...and the model SETTINGS (brain.* -- window, generation budget,
+        # temperature, think, the guard) are handed over from the config
+        # already loaded above: brain.py reads no config of its own, at
+        # import or later (see brain.settings()).
         try:
-            brain_mod.configure(self.assistant.local_model)
+            brain_mod.configure(self.assistant.local_model,
+                                config=self.assistant)
         except Exception:
             log.exception("brain.configure(%s) failed", self.assistant.local_model)
         # The register he last asked for, before the first static_system()
