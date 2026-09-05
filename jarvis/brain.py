@@ -3285,10 +3285,18 @@ class JarvisBrain:
                             if not streaming and streamed_sentences and \
                                     on_sentence is not None and \
                                     not self._stale(gen):
+                                # clean(), not guard(): the retry claims
+                                # nothing (that is why it is here), so
+                                # there is no claim for a lead-in to be
+                                # the yes to and nothing to hold one for.
+                                # guard() would hold "Certainly, sir."
+                                # and hand the next sentence back as a
+                                # pair -- a list in the join below -- or
+                                # keep a trailing "Very well." for ever.
                                 for sent in split_sentences(final):
                                     if len(streamed_sentences) >= cap:
                                         break
-                                    line = guard(sent)
+                                    line = clean(sent)
                                     if not line or line in streamed_sentences:
                                         continue
                                     streamed_sentences.append(line)

@@ -417,3 +417,87 @@ def test_a_lead_in_before_a_tool_call_stays_unspoken_and_the_tool_runs(streamed)
     assert spoken == []
     assert record == [("notes", "add", "milk")]
     assert tags == [("SPEAK", "Noted, sir.")]
+
+
+# ------------------------------------------ the finisher's pass (2026-09-04)
+# The author was stopped before reporting. Each item below was checked
+# against the four commits on the FakeOllama harness; what follows is
+# what was missing or wrong.
+
+# (3) x (4): commit 7e0fccb taught guard() to return a released lead-in
+# AND its sentence as a list; the kept-retry path from 12704c9 still
+# treated guard()'s answer as one string. A retry that opens with an
+# acknowledgement -- "Certainly, sir. I'm afraid I have no way to store
+# that, sir." -- reached `" ".join(streamed_sentences)` with a list in it.
+# The retry is kept only when it CLAIMS NOTHING, so there is no claim for
+# a lead-in to be the yes to and nothing to hold it for: it is spoken as
+# the plain path speaks it, in the model's order.
+ACK_HONEST = "Certainly, sir. I'm afraid I have no way to store that, sir."
+
+
+def test_a_kept_retry_that_opens_with_an_acknowledgement_is_spoken_whole(streamed):
+    b, fake, record, streams = streamed
+    streams.append(_chunks(f"{GREETING} I'll remember that, sir."))
+    fake.replies = [text_reply(ACK_HONEST)]
+    spoken = []
+    tags = b._chat_sync("say hello to my family and remember that I graduate "
+                        "December 10th", on_sentence=spoken.append)
+    assert spoken == [GREETING, "Certainly, sir.",
+                      "I'm afraid I have no way to store that, sir."]
+    assert tags == [("STREAMED", "3"), ("SPEAK", f"{GREETING} {ACK_HONEST}")]
+    assert record == []
+
+
+def test_a_kept_retry_that_ends_with_an_acknowledgement_loses_nothing(streamed):
+    """A trailing "Very well." was held for a sentence that never came
+    and silently dropped; the plain path speaks it."""
+    b, fake, record, streams = streamed
+    streams.append(_chunks(f"{GREETING} I'll remember that, sir."))
+    fake.replies = [text_reply(f"{HONEST} Very well.")]
+    spoken = []
+    tags = b._chat_sync("say hello to my family and remember that I graduate "
+                        "December 10th", on_sentence=spoken.append)
+    assert spoken == [GREETING, HONEST, "Very well."]
+    assert tags == [("STREAMED", "3"), ("SPEAK", f"{GREETING} {HONEST} Very well.")]
+
+
+# (1): _IMPERATIVE_DO_RX matched "do not" as a prefix, so "Do notes sync
+# to my phone?" -- a question -- became an order and armed the guard on a
+# question, the one thing is_question exists to prevent (a retry on a
+# question can write). A word boundary ends the order.
+@pytest.mark.parametrize("text", [
+    "Do notes sync to my phone?",
+    "Do notifications reach my phone",
+    "Do notable events go in the briefing?",
+])
+def test_do_before_a_word_that_starts_with_not_is_still_a_question(text):
+    assert is_question(text) is True, text
+
+
+# (2), the refuter's probe d: the retry for a memory claim runs a real
+# tool (get_time) and its render round claims the store afresh. The
+# render is the reply -- the first would drop the time -- with the claim
+# replaced by the memory line. Pinned on both paths; measured green on
+# 7e0fccb before this section was written (a pin, not a fix).
+def test_a_retry_that_runs_a_tool_and_reclaims_the_store_is_stripped(setup, caplog):
+    b, fake, record = setup
+    fake.replies = [text_reply(NOTED), tool_reply(("get_time", {})),
+                    text_reply(TIME_AND_LIE)]
+    with caplog.at_level("INFO", logger="jarvis.brain"):
+        tags = b._chat_sync(STORE)
+    assert tags == [("SPEAK", f"It's five past four, sir. {MEMORY_LINE}")]
+    assert record == [("get_time", None)]
+    assert len(_warnings(caplog)) == 2
+
+
+def test_a_streamed_retry_that_runs_a_tool_and_reclaims_speaks_the_time_then_the_line(streamed):
+    b, fake, record, streams = streamed
+    streams.append(_chunks(NOTED))                        # withheld, nothing spoken
+    fake.replies = [tool_reply(("get_time", {}))]         # the plain retry: a tool
+    streams.append(_chunks(TIME_AND_LIE))                 # its render round, streamed
+    spoken = []
+    tags = b._chat_sync(STORE, on_sentence=spoken.append)
+    assert spoken == ["It's five past four, sir.", MEMORY_LINE]
+    assert record == [("get_time", None)]
+    assert tags == [("STREAMED", "2"), ("SPEAK", f"It's five past four, sir. {MEMORY_LINE}")]
+

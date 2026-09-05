@@ -730,7 +730,7 @@ _POLITE_ORDER_RX = re.compile(
 # remember / keep / note / make / bear" -- asks nothing; "don't you ...?"
 # and "do you ...?" still do.
 _IMPERATIVE_DO_RX = re.compile(
-    r"^\s*(?:please\s+|jarvis[\s,]+)*(?:do not|don['’]t)(?!\s+you\b)"
+    r"^\s*(?:please\s+|jarvis[\s,]+)*(?:do not|don['’]t)\b(?!\s+you\b)"
     r"|^\s*(?:please\s+|jarvis[\s,]+)*do\s+(?:remember|keep|note|make|bear)\b",
     re.I)
 
