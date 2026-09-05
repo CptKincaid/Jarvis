@@ -148,8 +148,8 @@ from jarvis.ui import theme
 # drifted apart in the first place.
 from jarvis.zones import (ABSENT, NO_OPINION,  # noqa: F401 - re-exported
                           UNPLACED, Band, ZoneMap)
-from jarvis.ui.widgets import (RoundButton, Toggle, px, ui_display, ui_font,
-                               ui_mono)
+from jarvis.ui.widgets import (RoundButton, Toggle, canvas_size, px,
+                               ui_display, ui_font, ui_mono)
 
 log = get_logger("ui.sensors_page")
 
@@ -175,9 +175,51 @@ TONES = (TONE_OK, TONE_WARN, TONE_ERR, TONE_MUTED, TONE_FAINT)
 # The standing caption, and the one shown after a write. They are separate
 # because the standing one sat under an unpressed SAVE button reading
 # "saved to assistant.json" -- which is a claim, not a caption.
-RESTART_NOTE = "edits apply at the next Jarvis restart — nothing reloads the config"
+# One short line each: they sit in a caption column beside a button, and
+# the 09-05 pass found the standing one long enough to wrap there.
+RESTART_NOTE = "applies at the next Jarvis restart"
 SAVED_NOTE = "saved — restart Jarvis to apply it"
 NOT_WIRED_NOTE = "assistant settings not wired"
+# What jarvis-v3 printed here. CLASSIC IS FROZEN (see `restyled`), and this
+# caption is on the frame, so the old sentence has to still exist.
+RESTART_NOTE_V3 = ("edits apply at the next Jarvis restart — nothing "
+                   "reloads the config")
+
+
+# ------------------------------------------------------------ the look gate
+def restyled(look: Optional[str] = None) -> bool:
+    """True when the 2026-09-05 relayout draws this page; False for the
+    look that must render EXACTLY as jarvis-v3 4b7d373 did.
+
+    WHY THIS EXISTS. He asked for the SENSORS tab and the settings area to
+    be cleaned up. He did not ask for the classic look to change, and the
+    09-05 relayout changed it by 175,076 px of 1,324,800 at 920x1440 and
+    202,322 px at the window he actually runs (1040x1760) -- MEASURED on
+    the photo rig, frames 25/26/27. So classic is FROZEN at the v3 tip and
+    every 09-05 improvement is holo's, which is the look he runs
+    (theme.DEFAULT_LOOK).
+
+    A CORRECTION TO THE RIG NOTE THIS WORK STARTED FROM. Frames 25, 26 and
+    27 were said to be the rig's byte-stable frames. 25 and 27 are; 26 is
+    NOT. MEASURED both ways: two renders of the SAME v3 tree differ by 268
+    px at y418..435 x936..962 at 1040x1760, and two renders of the same
+    FIXED tree differ by 309 px at y448..465 x816..842 at 920x1440 -- the
+    round-trip readout, which is a live measurement and flips a digit
+    between runs. It sometimes matches by luck, which is how it came to be
+    called stable. A 0-px claim about frame 26 needs the same-code A/B
+    beside it.
+
+    READ AT CALL TIME, never captured at def time: a look token captured
+    when the module is imported freezes the import-time look, and
+    tests/test_theme_look.py scans this file for exactly that.
+    """
+    return (look or theme.LOOK) == "holo"
+
+
+def restart_note() -> str:
+    """The standing caption under SAVE. Read at CALL time, so the frozen
+    classic look keeps the sentence jarvis-v3 printed."""
+    return RESTART_NOTE if restyled() else RESTART_NOTE_V3
 
 # ------------------------------------------------------------- the geometry
 # The distance entity, addressed by its NAME exactly as the presence one is:
@@ -713,6 +755,64 @@ def band_fraction(metres, lo: float, hi: float) -> Optional[float]:
     return (m - lo) / (hi - lo)
 
 
+def _finite(value) -> Optional[float]:
+    """A float, or None for anything a typed box or a config can hold."""
+    try:
+        f = float(value)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+def room_scale(pairs) -> Optional[tuple]:
+    """(lo, hi): the whole ladder a room's bands are drawn on, or None
+    when nothing usable was given."""
+    ok = [(a, b) for a, b in ((_finite(x), _finite(y)) for x, y in pairs or ())
+          if a is not None and b is not None and b > a]
+    if not ok:
+        return None
+    return min(a for a, _b in ok), max(b for _a, b in ok)
+
+
+def band_span(near, far, lo, hi) -> Optional[tuple]:
+    """Where one band sits on its room's scale, as (x0, x1) fractions.
+
+    THIS IS WHY THE BARS STOPPED BEING SLIDERS (2026-09-05, round 1). Each
+    bar used to be a full-width track from the band's near edge to its far
+    edge with the live range marked on it -- and the mark is absent
+    whenever the range is outside the band, which is most of the time.
+    MEASURED on the 09-05 frames: one of four bars carried a mark on the
+    live shot and NONE of four on the fault shot, so what he saw was four
+    identical tracks with two end stops and nothing between them, i.e.
+    four sliders with the handle missing (his words). A bar drawn as the
+    band's SHARE of the room instead is ink he can read with no live
+    reading at all, the bands step across the row like the ladder they
+    are, and a gap in the ladder is a gap on the page.
+    """
+    near, far, lo, hi = (_finite(near), _finite(far), _finite(lo),
+                         _finite(hi))
+    if None in (near, far, lo, hi) or hi <= lo or far <= near:
+        return None
+    span = hi - lo
+    x0 = max(0.0, min(1.0, (near - lo) / span))
+    x1 = max(0.0, min(1.0, (far - lo) / span))
+    return (x0, x1) if x1 > x0 else None
+
+
+def spans_for_room(pairs) -> tuple:
+    """Every band of ONE room, in order, as spans on that room's scale.
+
+    Fed from the typed boxes as well as from the config, so a band he is
+    widening grows under his hands; a box holding junk drops that one bar
+    and leaves the rest of the ladder alone.
+    """
+    pairs = tuple(pairs or ())
+    scale = room_scale(pairs)
+    if scale is None:
+        return tuple(None for _ in pairs)
+    return tuple(band_span(a, b, scale[0], scale[1]) for a, b in pairs)
+
+
 @dataclass(frozen=True)
 class BandEdit:
     """One band as the page holds it while he types in it.
@@ -1017,7 +1117,18 @@ def camera_text(view: CameraView) -> tuple:
     if not view.asked:
         return "FACE %s identity not running" % DASH, TONE_MUTED
     if not view.name:
-        return "FACE  UNKNOWN  %.2f" % view.score, TONE_WARN
+        # AN UNRECOGNISED FACE IS NOT A FAULT (2026-09-05, round 2). This
+        # line was amber and untested -- the one state on the page that
+        # broke the rule the round-1 pass wrote three docstrings about
+        # ("amber is reserved for a fault ... it is the only orange thing
+        # on the page"). A camera that sees a face it cannot name HAS
+        # answered: it reports a person and the confidence it reached, and
+        # the score beside the word already says how sure it is. Nothing is
+        # broken, so nothing is amber; it reads like the other two
+        # answered-but-no-identity lines (NO FACE, identity not running).
+        # Classic is frozen at v3, which painted it amber.
+        return ("FACE  UNKNOWN  %.2f" % view.score,
+                TONE_MUTED if restyled() else TONE_WARN)
     return "FACE  %s  %.2f" % (view.name, view.score), TONE_OK
 
 
@@ -1044,6 +1155,38 @@ class Verdict:
     word: str
     source: str            # "camera" | "radar" | "" (nobody had an opinion)
     why: str
+
+
+def _fuse_v3(v, *, saw_face: bool, speak: bool, distance_m, zmap) -> Verdict:
+    """The reason line and the source EXACTLY as jarvis-v3 4b7d373 wrote
+    them, for the frozen classic look (``restyled``).
+
+    Kept as its own function rather than as branches inside ``fuse`` so
+    the frozen sentences are one block that can be diffed against the v3
+    tip, and so nothing here can drift when the holo wording changes
+    again. Two real differences live in here besides the wording: the
+    camera clause was APPENDED to the rule's sentence with a semicolon
+    (which is what made the line wrap), and RULE_SILENT still named the
+    radar whenever a face had been seen.
+    """
+    if v.rule == zn.RULE_BAND:
+        why = "a target inside %r" % v.zone
+    elif v.rule == zn.RULE_UNPLACED:
+        why = ("presence with no usable range — someone is in the room, the "
+               "band is unknown" if distance_m is None else
+               "%.2f m is in a gap between the bands, so the room is the "
+               "only honest answer" % distance_m)
+    elif v.rule == zn.RULE_EMPTY:
+        why = "the radar reads empty"
+    else:
+        why = "neither leg has an opinion — this is not an empty room"
+    if saw_face and not speak:
+        why += "; the camera sees a face but is not allowed to overrule"
+    elif saw_face:
+        why += ("; the camera sees a face but %r has no camera zone in %s"
+                % (zmap.room, OPTION_ROOMS))
+    source = "" if v.rule == zn.RULE_SILENT and not saw_face else "radar"
+    return Verdict(v.zone, zone_word(v.zone), source, why)
 
 
 def fuse(*, present: Optional[bool], distance_m, camera: CameraView,
@@ -1082,8 +1225,10 @@ def fuse(*, present: Optional[bool], distance_m, camera: CameraView,
     name a place.
     """
     saw_face = bool(camera is not None and camera.sees_a_face)
+    new = restyled()
     if zmap is None:
         return Verdict(NO_LADDER, zone_word(NO_LADDER), "",
+                       "no bands are set for this room" if new else
                        "there is no ladder for this room in %s, so a range "
                        "cannot be given a name" % OPTION_ROOMS)
     speak = saw_face and (overrules or present is None)
@@ -1091,30 +1236,49 @@ def fuse(*, present: Optional[bool], distance_m, camera: CameraView,
     v = zn.verdict(zmap, presence=present, distance_m=distance_m,
                    camera=opinion)
     if v.rule == zn.RULE_CAMERA:
-        why = ("the camera can see a face; the radar's range is not asked"
-               if present is not None else
-               "the radar has no opinion; the camera can see a face")
+        if new:
+            why = ("the camera sees a face; the radar is not asked"
+                   if present is not None else
+                   "the radar is silent; the camera sees a face")
+        else:
+            why = ("the camera can see a face; the radar's range is not asked"
+                   if present is not None else
+                   "the radar has no opinion; the camera can see a face")
         return Verdict(v.zone, zone_word(v.zone), "camera", why)
-    if v.rule == zn.RULE_BAND:
-        why = "a target inside %r" % v.zone
-    elif v.rule == zn.RULE_UNPLACED:
-        why = ("presence with no usable range — someone is in the room, the "
-               "band is unknown" if distance_m is None else
-               "%.2f m is in a gap between the bands, so the room is the "
-               "only honest answer" % distance_m)
-    elif v.rule == zn.RULE_EMPTY:
-        why = "the radar reads empty"
-    else:
-        why = "neither leg has an opinion — this is not an empty room"
+    if not new:
+        return _fuse_v3(v, saw_face=saw_face, speak=speak,
+                        distance_m=distance_m, zmap=zmap)
+    # ONE SHORT LINE (2026-09-05). These sentences used to run to 75
+    # characters and then GREW a semicolon clause about the camera, so at
+    # his window they wrapped mid-phrase into a second grey line under a
+    # block that already had four. The reason line is now one line, and
+    # when the camera saw a face and still did not win, THAT is the line --
+    # it is the surprising fact, and the verdict word already carries what
+    # the radar decided.
     if saw_face and not speak:
-        why += "; the camera sees a face but is not allowed to overrule"
+        why = "the camera sees a face but may not overrule"
     elif saw_face:
         # It was allowed and still did not win, which leaves exactly one
         # reason: this room's camera_zone is blank, i.e. the config says
         # there is no lens here (jarvis/zones.py, ZoneMap.has_camera).
-        why += ("; the camera sees a face but %r has no camera zone in %s"
-                % (zmap.room, OPTION_ROOMS))
-    source = "" if v.rule == zn.RULE_SILENT and not saw_face else "radar"
+        why = "the camera sees a face; this room has no camera zone"
+    elif v.rule == zn.RULE_BAND:
+        # NOT "a target inside %r": the verdict word beside it already
+        # names the band, and %r put Python's quotes on the page.
+        why = "the range falls inside this band"
+    elif v.rule == zn.RULE_UNPLACED:
+        why = ("someone is in the room; the range is unknown"
+               if distance_m is None else
+               "%.2f m is in a gap between the bands" % distance_m)
+    elif v.rule == zn.RULE_EMPTY:
+        why = "the radar reads empty"
+    else:
+        why = "neither leg has an opinion — not an empty room"
+    # RULE_SILENT is "neither leg answered", and a face the camera was not
+    # allowed to use is not an answer: naming the radar there printed
+    # "NO OPINION · radar" under a radar that had said nothing (measured
+    # under pytest 09-05, a room whose camera_zone is blank).
+    source = "" if v.rule == zn.RULE_SILENT else "radar"
     return Verdict(v.zone, zone_word(v.zone), source, why)
 
 
@@ -1213,14 +1377,24 @@ def age_text(now: float, at: float) -> str:
 
 
 def presence_words(present: Optional[bool]) -> tuple:
-    """(word, tone) for the presence bit. NO OPINION is its own state and
-    wears the warning tone, so it can never be mistaken for EMPTY at a
-    glance from a desk chair."""
+    """(word, tone) for the presence bit.
+
+    NO OPINION is FAINT, not amber (2026-09-05, round 1). His brief:
+    "reserve orange for a fault only ... make it the only orange." The
+    round-0 pass fixed the explanation lines and the amber count did not
+    move -- MEASURED on the frames, 3 amber lines before and 3 after on
+    the live shot, 6 and 6 on the fault shot -- because a dark room still
+    shouted the state word twice, once in the header and once on the radar
+    leg. Three tones already tell the three states apart (PRESENT reads
+    live, EMPTY reads muted, NO OPINION reads faintest of all), and the
+    amber fault line directly under it says WHY there is no answer.
+    """
     if present is True:
         return "PRESENT", TONE_OK
     if present is False:
         return "EMPTY", TONE_MUTED
-    return "NO OPINION", TONE_WARN
+    # Classic is frozen at v3, which shouted this one amber (`restyled`).
+    return "NO OPINION", TONE_FAINT if restyled() else TONE_WARN
 
 
 def fault_line(status: Any, present: Optional[bool] = None) -> str:
@@ -1305,6 +1479,83 @@ def page_rows(readings, camera_status: Any, ladders: Ladders, overrules: bool,
                          camera=cam, zmap=ladders.for_room(r.name),
                          overrules=overrules)))
     return out
+
+
+
+# ------------------------------------------------- what a room block draws
+# THE TYPE RULES (2026-09-05). His words: "they look a little unprofessional
+# and some of text doesnt sit right." Three type styles were fighting inside
+# one room block -- a bold display header beside a large display word beside
+# a large MONOSPACE range beside a small grey caption -- and the two
+# explanation sentences mixed grey and orange with no legend for which was
+# which. The rules the widget renders by, kept out here so they are tested
+# with no display:
+#
+#   * ONE sans face for every label and every word; the monospace face is
+#     for NUMERIC READOUTS ONLY (readout_is_numeric).
+#   * TWO sizes in a block: the header line, and the detail lines.
+#   * ONE muted style for the reason line. AMBER IS RESERVED FOR A FAULT,
+#     so on this page the fault line is the only orange thing (see
+#     explanation_lines) and it appears only when a leg had no opinion.
+#     MEASURED off the rendered frames at 920x1440 (amber ink runs in the
+#     page body, anti-aliasing filtered): the live shot went 3 -> 3 -> 1
+#     across the two passes and the fault shot 6 -> 6 -> 2, which is one
+#     fault line per dark room and nothing else. The first pass fixed the
+#     reason lines and moved the count not at all, because the STATE WORD
+#     was amber twice over in a dark room (presence_words, verdict_tone).
+#   * The verdict's SOURCE sits beside the verdict word, not glued onto the
+#     front of the reason sentence.
+
+
+def readout_is_numeric(text: str) -> bool:
+    """True when a readout is a NUMBER and may be drawn in the monospace
+    face. The dash is a word: the KITCHEN header drew its '—' placeholder
+    in mono beside a sans header, which is the sort of thing that reads as
+    a broken font rather than as a missing value."""
+    return any(ch.isdigit() for ch in (text or ""))
+
+
+def verdict_tone(zone: str) -> str:
+    """The tone the fused word wears. A zone that was NAMED is the page's
+    answer and reads live; a zone nobody could name is the faintest thing
+    on the row. Neither is amber -- see presence_words."""
+    return TONE_FAINT if zone in (NO_OPINION, NO_LADDER) else TONE_OK
+
+
+def source_text(verdict: Verdict) -> str:
+    """The leg that answered, as it is drawn AFTER the verdict word
+    ("AT THE DESK · camera"), or "" when neither leg spoke."""
+    return ("· %s" % verdict.source) if getattr(verdict, "source", "") else ""
+
+
+def explanation_lines(row: "RoomRow") -> tuple:
+    """((text, tone), ...) for the lines under a room's readouts.
+
+    At most two, in this order: the reason, always, in the muted tone; the
+    fault, only when there is one, in the warning tone. Nothing else on
+    this page is amber, so orange means "a leg could not answer" and needs
+    no legend.
+    """
+    out = [(row.verdict.why, TONE_FAINT)]
+    if row.fault:
+        out.append((row.fault, TONE_WARN))
+    return tuple(out)
+
+
+def marker_shape(look: Optional[str] = None) -> str:
+    """"needle" | "dot": how a band bar draws the live range.
+
+    The bars are READOUTS, not sliders -- the marker is absent when the
+    range is outside the band (band_fraction), which is the one honest
+    thing the strip can do. Changing the marker was not enough on its own,
+    though: MEASURED on the rendered frames, 0 of 4 bars carried a solid
+    span and only the one bar holding the live range carried a mark at
+    all, so four bare tracks still read as four broken sliders. What fixed
+    that is the SPAN (band_span, _BandBar); the marker shape is the second
+    half of it. In holo it is a needle across the band; classic keeps the
+    dot it was pinned with.
+    """
+    return "needle" if (look or theme.LOOK) == "holo" else "dot"
 
 
 WAITING_WORD = "READING…"
@@ -1630,29 +1881,102 @@ def _spoken(spec) -> str:
 
 # =========================================================== the Tk surface
 class _BandBar(tk.Canvas):
-    """``[0.8]---#---[1.8] m``: the band, with the live range on it.
+    """``——[####]————`` : one band's own stretch of its room's ladder.
 
-    The marker is simply ABSENT when the reading is outside the band (see
-    ``band_fraction``) -- a marker clamped to an end would read as a
-    reading that is in the band, which is the one thing this strip must
-    never say.
+    NOT A SLIDER, AND IT NO LONGER LOOKS LIKE ONE (2026-09-05, round 1).
+    It used to draw a full-width track with an end stop at each end and a
+    marker for the live range -- and ``band_fraction`` returns None
+    whenever that range is outside this band, which is most of the time
+    and ALWAYS when nothing is being read. MEASURED on the 09-05 frames:
+    one of four bars carried a marker on the live shot, none of four on
+    the fault shot. Four bare tracks with two end stops read as four
+    sliders whose handle had gone missing, which is exactly what he
+    reported.
+
+    So the bar draws what it actually knows. The rail is the room's WHOLE
+    ladder; the solid bar is this band's share of it (``band_span``); the
+    live range is a mark inside the bar, and only inside the bar that owns
+    it. Two bands of one room therefore start at different x -- a shape no
+    slider can have -- a gap in the ladder shows as a gap, and every row
+    carries ink with no reading at all.
     """
 
     H = 18                                # design units
+    BAR = 4                               # the solid band, in design units
 
     def __init__(self, parent, bg=None):
         bg = bg or parent.cget("bg")
         super().__init__(parent, height=px(type(self).H), bg=bg,
                          highlightthickness=0, bd=0)
         self._frac: Optional[float] = None
+        self._span: Optional[tuple] = None
         self.bind("<Configure>", lambda e: self._draw(), add=True)
 
+    def set_span(self, span: Optional[tuple]) -> None:
+        """Where this band sits on the room's scale, or None when the
+        ladder cannot be read (a box holding junk while he types)."""
+        self._span = span
+        self._draw()
+
     def set(self, fraction: Optional[float]) -> None:
+        """Where the live range sits INSIDE this band, or None when it is
+        outside it -- a mark parked on an end would read as a reading that
+        is in the band, which is the one thing this strip must never say."""
         self._frac = fraction
         self._draw()
 
+    def marked(self) -> bool:
+        return self._frac is not None and self._span is not None
+
+    def _rail(self) -> tuple:
+        w = canvas_size(self, px(40))[0]
+        pad = px(6)
+        return pad, max(pad + px(8), w - pad)
+
+    def span_px(self) -> tuple:
+        """(x0, x1) of the solid bar in device px -- what the tests measure
+        instead of looking at the picture."""
+        x0, x1 = self._rail()
+        if not self._span:
+            return x0, x0
+        return (x0 + (x1 - x0) * self._span[0],
+                x0 + (x1 - x0) * self._span[1])
+
     def _draw(self) -> None:
         self.delete("all")
+        if not restyled():
+            return self._draw_v3()
+        h = canvas_size(self, px(40), px(8))[1]
+        y = h / 2
+        x0, x1 = self._rail()
+        stroke = max(1, px(1))
+        self.create_line(x0, y, x1, y, fill=theme.LINE, width=stroke)
+        if not self._span:
+            return
+        bx0, bx1 = self.span_px()
+        bar = max(2, px(type(self).BAR))
+        self.create_rectangle(bx0, y - bar / 2, bx1, y + bar / 2,
+                              fill=theme.RAMP60, outline="")
+        if self._frac is None:
+            return
+        x = bx0 + (bx1 - bx0) * max(0.0, min(1.0, float(self._frac)))
+        if marker_shape() == "needle":
+            self.create_line(x, y - px(6), x, y + px(6), fill=theme.FOCAL,
+                             width=max(1, px(2)))
+            return
+        r = px(4)
+        self.create_oval(x - r, y - r, x + r, y + r, fill=theme.FOCAL,
+                         outline="")
+
+    def _draw_v3(self) -> None:
+        """``[0.8]---#---[1.8] m``: the strip EXACTLY as jarvis-v3 drew it
+        -- a full-width track, an end stop at each end, and a round dot
+        where the live range falls. Classic is frozen (``restyled``).
+
+        The span is not drawn here at all: ``set_span`` still records it
+        (``span_px`` is what the tests measure), it simply has no ink in
+        this look, which is the shape v3 shipped.
+        """
         w = max(self.winfo_width(), px(40))
         h = max(self.winfo_height(), px(8))
         y = h / 2
@@ -1671,12 +1995,78 @@ class _BandBar(tk.Canvas):
 
 
 class _RoomBlock(tk.Frame):
-    """One room: the sensor line, the camera line, the verdict line, and a
-    fault line that is packed only when there is one."""
+    """One room, in five lines at most and in TWO type sizes.
+
+    THE SHAPE (2026-09-05)::
+
+        OFFICE  AT THE DESK · camera            1.4 m   <1 ms
+          radar     PRESENT
+          camera    FACE hunterp 0.71
+          the camera sees a face; the radar is not asked
+          no answer from the sensor (2 in a row)          <- amber, faults only
+
+    The HEADER carries the answer (the fused zone) and the two numbers; the
+    detail lines carry the two LEGS, named symmetrically, on one label
+    column; the reason is one muted line and the fault is the only amber
+    thing on the page. Before today the header carried PRESENT (a leg) in
+    the display face beside a monospace range, the verdict sat in a detail
+    row in a third size, and the reason line was prefixed with the source
+    and ran long enough to wrap into a second grey line.
+    """
+
+    CAP_W = 9                 # the label column, in caption-face characters
 
     def __init__(self, parent, bg: str):
         super().__init__(parent, bg=bg)
         self._bg = bg
+        # WHICH TREE THIS BLOCK IS. Read once, HERE -- a block is built
+        # after create() has selected the look and is never re-looked, and
+        # apply() has to talk to the widgets that actually exist. It is a
+        # call-time read of theme.LOOK, not a def-time capture.
+        self._restyled = restyled()
+        if not self._restyled:
+            self._build_v3(bg)
+            return
+        head = tk.Frame(self, bg=bg)
+        head.pack(fill="x")
+        flat = dict(bg=bg, bd=0, padx=0, pady=0)     # Tk's default 1px
+        # border + 1px pady on EVERY label is 4 px a line, and this block
+        # is five lines twice over.
+        self.name = tk.Label(head, font=ui_display(theme.SIZE_LABEL, "semibold"),
+                             fg=theme.INK, anchor="w",
+                             width=type(self).CAP_W, **flat)
+        self.name.pack(side="left")
+        self.rtt = tk.Label(head, font=ui_mono(theme.SIZE_CAPTION),
+                            fg=theme.FAINT, anchor="e", width=7, **flat)
+        self.rtt.pack(side="right")
+        self.distance = tk.Label(head, font=ui_mono(theme.SIZE_LABEL),
+                                 fg=theme.FOCAL, anchor="e", width=7, **flat)
+        self.distance.pack(side="right", padx=(0, px(8)))
+        self.verdict = tk.Label(head, font=ui_display(theme.SIZE_LABEL),
+                                fg=theme.MUTED, anchor="w", **flat)
+        self.verdict.pack(side="left")
+        # The leg that answered, beside the word rather than glued to the
+        # front of the reason sentence ("camera · the camera can see...").
+        self.source = tk.Label(head, font=ui_display(theme.SIZE_CAPTION),
+                               fg=theme.FAINT, anchor="w", **flat)
+        self.source.pack(side="left", padx=(px(8), 0))
+
+        _, self.presence = self._line("radar")
+        _, self.camera = self._line("camera")
+        _, self.why = self._line("")
+        # The fault row is the only one that comes and goes: it is packed by
+        # apply() when a leg had no opinion and forgotten when it does.
+        self._fault_row, self.fault = self._line("", tone=theme.WARN)
+        self._fault_row.pack_forget()
+        self.bind("<Configure>", self._wrap, add=True)
+
+    # ------------------------------------------------- the frozen classic
+    def _build_v3(self, bg: str) -> None:
+        """The block EXACTLY as jarvis-v3 4b7d373 built it: the room name
+        and the PRESENCE word in the header beside a monospace range, the
+        camera and the verdict in two captioned sub-rows in a third size,
+        and the reason and fault packed straight onto the block on a
+        hand-set px(96) indent. Classic is frozen (``restyled``)."""
         head = tk.Frame(self, bg=bg)
         head.pack(fill="x")
         self.name = tk.Label(head, font=ui_display(theme.SIZE_LABEL, "semibold"),
@@ -1692,26 +2082,21 @@ class _RoomBlock(tk.Frame):
                                  fg=theme.MUTED, bg=bg, anchor="w")
         self.presence.pack(side="left")
 
-        self.camera = self._sub("camera")
-        self.verdict = self._sub("verdict")
+        self.camera = self._sub_v3("camera")
+        self.verdict = self._sub_v3("verdict")
         self.fault = tk.Label(self, font=ui_font(theme.SIZE_CAPTION),
                               fg=theme.WARN, bg=bg, anchor="w",
                               justify="left")
         self.why = tk.Label(self, font=ui_font(theme.SIZE_CAPTION),
                             fg=theme.FAINT, bg=bg, anchor="w", justify="left")
         self.why.pack(fill="x", padx=(px(96), 0))
+        # There is no `source` label in this tree: v3 glued the source onto
+        # the front of the reason sentence. apply_v3 does the same.
+        self.source = None
+        self._fault_row = None
         self.bind("<Configure>", self._wrap, add=True)
 
-    def _wrap(self, event) -> None:
-        """Tk labels do not wrap without an explicit pixel width, and these
-        two carry the only long sentences on the page. Without this the
-        reason line was cut mid-word at his window ("...the radar's range
-        is n") -- measured on the photo rig, 2026-09-03."""
-        width = max(px(120), int(event.width) - px(104))
-        for label in (self.fault, self.why):
-            label.configure(wraplength=width)
-
-    def _sub(self, caption: str) -> tk.Label:
+    def _sub_v3(self, caption: str) -> tk.Label:
         row = tk.Frame(self, bg=self._bg)
         row.pack(fill="x")
         tk.Label(row, text=caption, font=ui_font(theme.SIZE_CAPTION),
@@ -1722,7 +2107,7 @@ class _RoomBlock(tk.Frame):
         value.pack(side="left")
         return value
 
-    def apply(self, row: RoomRow) -> None:
+    def _apply_v3(self, row: RoomRow) -> None:
         self.name.configure(text=row.label.upper())
         self.presence.configure(text=row.presence_word,
                                 fg=tone_color(row.presence_tone))
@@ -1742,6 +2127,66 @@ class _RoomBlock(tk.Frame):
             self.fault.pack(fill="x", padx=(px(96), 0))
         else:
             self.fault.pack_forget()
+
+    def _line(self, caption: str, tone: Optional[str] = None) -> tuple:
+        """One detail line: a fixed caption column and a value beside it.
+
+        Every line goes through here -- INCLUDING the two that have no
+        caption -- so the reason and the fault land on exactly the same x
+        as the two leg values instead of on a hand-guessed indent.
+        """
+        row = tk.Frame(self, bg=self._bg)
+        row.pack(fill="x")
+        tk.Label(row, text=caption, font=ui_display(theme.SIZE_CAPTION),
+                 fg=theme.FAINT, bg=self._bg, anchor="w", bd=0, padx=0,
+                 pady=0, width=type(self).CAP_W).pack(side="left",
+                                                      padx=(px(10), 0))
+        value = tk.Label(row, font=ui_display(theme.SIZE_CAPTION),
+                         fg=(tone or theme.MUTED), bg=self._bg, anchor="w",
+                         justify="left", bd=0, padx=0, pady=0)
+        value.pack(side="left")
+        return row, value
+
+    def _wrap(self, event) -> None:
+        """Tk labels do not wrap without an explicit pixel width, and these
+        two carry the only sentences on the page. They are one short line
+        each by construction now (fuse / fault_line), but a wider band name
+        or a longer blocked reason must still wrap at the column rather
+        than be cut mid-word ("...the radar's range is n", measured on the
+        photo rig 2026-09-03)."""
+        width = max(px(120), int(event.width)
+                    - (px(110) if self._restyled else px(104)))
+        for label in (self.fault, self.why):
+            label.configure(wraplength=width)
+
+    def apply(self, row: RoomRow) -> None:
+        if not self._restyled:
+            return self._apply_v3(row)
+        self.name.configure(text=row.label.upper())
+        self.presence.configure(text=row.presence_word,
+                                fg=tone_color(row.presence_tone))
+        # MONOSPACE IS FOR NUMBERS. A dash is a word and is drawn in the
+        # header's own face; the moment a real range lands it becomes a
+        # readout again (readout_is_numeric).
+        for label, text, size in ((self.distance, row.distance_text,
+                                   theme.SIZE_LABEL),
+                                  (self.rtt, row.rtt_text,
+                                   theme.SIZE_CAPTION)):
+            label.configure(text=text,
+                            font=(ui_mono(size) if readout_is_numeric(text)
+                                  else ui_display(size)))
+        self.camera.configure(text=row.camera_text,
+                              fg=tone_color(row.camera_tone))
+        self.verdict.configure(text=row.verdict.word,
+                               fg=tone_color(verdict_tone(row.verdict.zone)))
+        self.source.configure(text=source_text(row.verdict))
+        lines = explanation_lines(row)
+        self.why.configure(text=lines[0][0], fg=tone_color(lines[0][1]))
+        if len(lines) > 1:
+            self.fault.configure(text=lines[1][0], fg=tone_color(lines[1][1]))
+            self._fault_row.pack(fill="x")
+        else:
+            self._fault_row.pack_forget()
 
 
 class SensorsPage(tk.Frame):
@@ -1773,21 +2218,26 @@ class SensorsPage(tk.Frame):
     this page's own tab row (95 px) paid for the strip (80 px, identical
     in the two looks) with 15 px over.
 
-    WHAT THE BAND ROWS COST, MEASURED 2026-09-03 after the zone model was
-    unified -- one row per BAND now, not two rows for ever. Tk on a private
-    Xvfb at 920x1440, holo, scale 2.0, with the worst case packed: a fault
-    line AND a reason line on every room, and a config note at the foot::
+    WHAT IT COSTS AND WHERE IT GOES, RE-MEASURED 2026-09-05 on :94 at
+    920x1440, S=2, holo, with the camera pane packed and BOTH rooms in
+    their worst state (a fault line AND a reason line on each). The stage
+    is 852 px; the pinned foot takes 133 of it; the scrolling body asks
+    for 690 into a 719-px viewport::
 
-        rooms  bands   winfo_reqheight()
-        1      2       417 px
-        2      4       638 px
-        2      5       686 px
+        before 09-05   body 1043 px into 852   -> 191 px CUT OFF
+        after  09-05   body  690 px into 719   -> fits, 29 px spare
 
-    Against the 1044-px holo stage span above, the widest of those leaves
-    358 px. His config today is one polled room, which is the 417. What is
-    NOT measured is a ladder with more bands than five or a third sensor;
-    the arithmetic is roughly 48 px a band, so the stage runs out somewhere
-    past a dozen -- if it ever does, the tune section is what should scroll.
+    The 353 px came off in four places, in order of size: the block was
+    retyped to two sizes (a 46-px header line and 32-px detail lines, from
+    50 + 5x36); the overrule toggle moved into the pinned foot; the band
+    rows lost the display-size label and Tk's default label border; and the
+    rule between the two halves lost half its air.
+
+    Past that -- a third sensor, or a ladder with more bands -- the body
+    SCROLLS (``overflow_px``, ``_sync_thumb``), and SAVE, the age, the
+    caption and the overrule toggle stay pinned below it. Roughly 37 px a
+    band and 174 px a room, so the second screen starts somewhere past
+    three rooms.
 
     Nothing here polls until ``show()`` and nothing keeps polling after
     ``hide()``. After 09-03 that is a generation number rather than a stop
@@ -1812,6 +2262,17 @@ class SensorsPage(tk.Frame):
         self._rows: list = []
         self._last: tuple = ()            # the readings the rows were painted from
         self._tick_id = None
+        # THE SCROLLING VIEW IS HOLO'S. Classic is frozen at jarvis-v3
+        # (``restyled``), which packed one plain column, so every method
+        # that drives the scroll checks for the canvas rather than
+        # assuming it. None, not missing: a getattr() default would hide a
+        # real build failure.
+        self._canvas = None
+        self._body = None
+        self._thumb = None
+        self._foot = None
+        self._save_btn = None
+        self._rooms_bands: list = []
 
         self.specs = self._room_specs()
         # ONE zone model: the ladders come from zones.rooms through
@@ -1861,13 +2322,189 @@ class SensorsPage(tk.Frame):
 
     # -------------------------------------------------------------- build
     def _build(self) -> None:
+        """ONE COLUMN: the body, then the foot, then whatever is left over.
+
+        Hunter, 2026-09-05: the last band row ("camera overrules radar")
+        was cut off at the bottom, hidden behind the camera pane, and SAVE
+        with it. Measured on :94 at S=2 in his 920x1440 window with the
+        pane packed, both rooms dark and every line drawn: the page asked
+        for 1043 px into an 852-px stage.
+
+        Two things fix it, and both are needed. The block and band rows
+        were retyped and retightened so his config FITS (measured below);
+        and what is left is a scrolling view, so a ladder with more bands
+        or a third sensor scrolls instead of vanishing. SAVE, the age and
+        the caption sit OUTSIDE the scroll -- a save button that scrolls
+        away is a save button he cannot find.
+
+        AND THE FOOT FOLLOWS THE CONTENT (round 1). Pinning it to the
+        bottom of the frame traded the clipped row for a VOID: measured at
+        the geometry he actually runs (main_window's own default, 520x880
+        design units, i.e. 1040x1760 at S=2), 408 px of nothing between the
+        last band row and SAVE -- 23% of the window -- because his config
+        FITS there with room to spare. So the scrolling view is sized to
+        its content and capped at the room the foot leaves it
+        (``_avail_px``): when the page fits, the foot sits under the last
+        band row and the slack falls off the bottom, where a finished page
+        ends; when it does not, the view stops at the foot and the body
+        scrolls under it, exactly as before.
+
+        AND THE SLACK STAYS THERE (round 2, a decision). RE-MEASURED off
+        the rig at his window, counting blank rows in the ink: this page
+        has ONE run of 428 blank rows, y976..1403, i.e. 24% of the window,
+        and it is below the last line. The v3 tip had 198 blank rows at
+        y622..819 -- the same slack, in the MIDDLE, which is the shape he
+        photographed. Filling 428 px would mean growing rows the content
+        does not need (and rows that jump whenever a fault line appears),
+        or shrinking the page to its content, which uncovers the
+        transcript this page is placed over (``cover``). So the rule that
+        is pinned is the SHAPE: one run of slack, and it is the last thing
+        on the page (tests/test_ui_layout_rules.py,
+        test_the_pages_only_slack_is_at_the_bottom_where_a_page_ends).
+        """
+        if not restyled():
+            return self._build_v3()
         bg = theme.TV_BG
-        # NO tab row of its own any more. The console has a real one
-        # (jarvis/ui/tab_strip.py) directly under the wordmark, which is
-        # what he asked for, and two rows of tabs on one screen is a
-        # question about which of them is in charge. Dropping it also pays
-        # for the strip: it cost this page more vertical than the strip
-        # costs the stage (measured, scripts/ui_shots.py).
+        # ---- the foot. BUILT here and PACKED after the view, so it lands
+        # directly under the content instead of at the frame's bottom edge.
+        self._foot = foot = tk.Frame(self, bg=bg)
+        # SAVE and the age share ONE row; the caption gets the next one to
+        # itself. Packing all three into `foot` put the caption between the
+        # button and the age and cut it mid-word -- photographed 09-03,
+        # which is the same trap that put this caption below the button in
+        # the first place.
+        act = tk.Frame(foot, bg=bg)
+        act.pack(fill="x")
+        self._save_btn = RoundButton(act, text="SAVE", kind="default",
+                                     size=theme.SIZE_CAPTION, bg=bg,
+                                     pad_y=5, command=self.save)
+        self._save_btn.pack(side="left")
+        # THE OVERRULE TOGGLE LIVES HERE, not at the end of the band list.
+        # It was the last row of a scrolling column and it is the row he
+        # photographed cut in half behind the camera pane; it is also not a
+        # band -- it is the one SETTING on this page, so it belongs beside
+        # the button that writes it, where it cannot be scrolled away.
+        self._overrule = Toggle(act, value=self.overrules, bg=bg)
+        self._overrule.pack(side="right")
+        self._overrule.command = self._on_overrule
+        tk.Label(act, text="camera overrules radar",
+                 font=ui_display(theme.SIZE_CAPTION), fg=theme.MUTED, bg=bg,
+                 anchor="e", bd=0, padx=0, pady=0).pack(side="right",
+                                                        padx=(0, px(10)))
+        line = tk.Frame(foot, bg=bg)
+        line.pack(fill="x", pady=(px(4), 0))
+        # The staleness readout, sharing the caption row so it costs no
+        # height. It is driven by the page's own 1 s tick, not by the poll,
+        # so a poll that has stopped makes this number CLIMB rather than
+        # freeze -- which is the whole point of putting an age on a numbers
+        # page.
+        self._age = tk.Label(line, font=ui_display(theme.SIZE_CAPTION),
+                             fg=theme.FAINT, bg=bg, anchor="e", bd=0,
+                             padx=0, pady=0)
+        self._age.pack(side="right", padx=(px(12), 0))
+        # BELOW the button, not beside it: beside it the caption had ~750 px
+        # of a 920-px window and was cut mid-word on the photo rig, and the
+        # refusal message a bad band edit puts here is longer still.
+        self._note = tk.Label(line, text=restart_note(),
+                              font=ui_display(theme.SIZE_CAPTION),
+                              fg=theme.FAINT, bg=bg, anchor="w",
+                              justify="left", bd=0, padx=0, pady=0)
+        self._note.pack(side="left", fill="x", expand=True)
+        self._notes = tk.Label(foot, font=ui_display(theme.SIZE_CAPTION),
+                               fg=theme.WARN, bg=bg, anchor="w",
+                               justify="left", bd=0, padx=0, pady=0)
+
+        # ---- the scrolling view, packed FIRST and sized to its content
+        view = tk.Frame(self, bg=bg)
+        view.pack(side="top", fill="x")
+        foot.pack(side="top", fill="x", padx=theme.PAD,
+                  pady=(theme.PAD_S, px(12)))
+        self._canvas = tk.Canvas(view, bg=bg, highlightthickness=0, bd=0,
+                                 height=px(40))
+        self._canvas.pack(side="left", fill="x", expand=True)
+        # A 2px cyan strip on the canvas' right edge, shown ONLY when there
+        # is something below the fold. A page that scrolls with no mark
+        # saying so is a page whose bottom rows he has no reason to look for.
+        self._thumb = tk.Frame(self._canvas, bg=theme.CYAN_DIM,
+                               width=max(2, px(2)))
+        self._body = tk.Frame(self._canvas, bg=bg)
+        self._body_win = self._canvas.create_window(
+            0, 0, anchor="nw", window=self._body)
+        self._canvas.bind("<Configure>", lambda e: self._sync_view(), add=True)
+        self._body.bind("<Configure>", lambda e: self._sync_view(), add=True)
+        self._canvas.bind("<Enter>", self._grab_wheel, add=True)
+        self._canvas.bind("<Leave>", self._drop_wheel, add=True)
+
+        body = tk.Frame(self._body, bg=bg)
+        body.pack(fill="both", expand=True, padx=theme.PAD,
+                  pady=(theme.PAD_S, 0))
+        if not self.specs:
+            tk.Label(body, text=empty_state_line(self._get_option),
+                     font=ui_display(theme.SIZE_LABEL), fg=theme.FAINT, bg=bg,
+                     anchor="w", justify="left",
+                     wraplength=px(420)).pack(fill="x")
+        for spec in self.specs:
+            block = _RoomBlock(body, bg)
+            block.pack(fill="x", pady=(0, px(6)))
+            self._blocks[spec.name] = block
+
+        tk.Frame(self._body, bg=theme.LINE, height=max(1, px(1))).pack(
+            fill="x", padx=theme.PAD, pady=px(6))
+        tune = tk.Frame(self._body, bg=bg)
+        tune.pack(fill="x", padx=theme.PAD)
+        # ONE ROW PER BAND, named by the band, grouped by room. The two
+        # fixed rows that used to live here were the page's own two-band
+        # model; his office ladder has its own names and his kitchen has
+        # different ones again, and a page that could only edit "desk" and
+        # "room" could not edit either of them.
+        self._bands = []                  # in the order they are packed
+        self._rooms_bands = []            # the same rows, grouped by room:
+        # a band's bar is drawn on ITS ROOM's scale, so the group is what
+        # the redraw works on (_resync_spans).
+        first = True
+        for spec in self.specs:
+            zmap = self.ladders.for_room(spec.name)
+            if zmap is None:
+                tk.Label(tune, text="%s: no ladder in %s — add one and "
+                                    "restart" % (_spoken(spec), OPTION_ROOMS),
+                         font=ui_display(theme.SIZE_CAPTION), fg=theme.WARN,
+                         bg=bg, anchor="w").pack(fill="x")
+                continue
+            if len(self.specs) > 1:
+                # A room label needs air ABOVE it and none below: with the
+                # same pady on both sides it read as a caption for the row
+                # above as easily as for the rows under it (09-05).
+                tk.Label(tune, text=theme.caption(_spoken(spec), surface=False),
+                         font=ui_display(theme.SIZE_CAPTION, "semibold"),
+                         fg=theme.FAINT, bg=bg, anchor="w", bd=0, padx=0,
+                         pady=0).pack(
+                    fill="x", pady=(0 if first else px(10), px(3)))
+                first = False
+            room = zn._room_key(spec.name)
+            rows = [self._band_row(tune, room, band) for band in zmap.bands]
+            self._bands.extend(rows)
+            self._rooms_bands.append(rows)
+        self._resync_spans()
+
+        self.bind("<Configure>", lambda e: [
+            w.configure(wraplength=max(px(160), int(e.width) - 2 * theme.PAD))
+            for w in (self._notes, self._note)], add=True)
+        self._show_notes()
+
+    # ------------------------------------------------- the frozen classic
+    def _build_v3(self) -> None:
+        """The page EXACTLY as jarvis-v3 4b7d373 packed it: one plain
+        column with no scrolling view, the overrule toggle as the last row
+        of the tune list, and the foot pinned under it.
+
+        CLASSIC IS FROZEN, AND THAT HAS A PRICE (``restyled``). This is the
+        layout he photographed with "camera overrules radar" cut off under
+        the camera pane at 920x1440 in the worst case, and the fix for that
+        is holo's. He runs holo (theme.DEFAULT_LOOK) and he did not ask for
+        classic to change; the 09-05 relayout moved it by 175,076 px at
+        920x1440 and 202,322 px at his own window, MEASURED on the rig.
+        """
+        bg = theme.TV_BG
         body = tk.Frame(self, bg=bg)
         body.pack(fill="both", expand=True, padx=theme.PAD,
                   pady=(theme.PAD_S, 0))
@@ -1878,9 +2515,6 @@ class SensorsPage(tk.Frame):
                      wraplength=px(420)).pack(fill="x")
         for spec in self.specs:
             block = _RoomBlock(body, bg)
-            # px(4), not PAD_S: with a fault line AND a reason line on both
-            # rooms (state 27 of the photo rig) the column was ~4 px taller
-            # than the stage and Tk clipped the last caption's descenders.
             block.pack(fill="x", pady=(0, px(4)))
             self._blocks[spec.name] = block
 
@@ -1888,11 +2522,6 @@ class SensorsPage(tk.Frame):
             fill="x", padx=theme.PAD, pady=theme.PAD_S)
         tune = tk.Frame(self, bg=bg)
         tune.pack(fill="x", padx=theme.PAD)
-        # ONE ROW PER BAND, named by the band, grouped by room. The two
-        # fixed rows that used to live here were the page's own two-band
-        # model; his office ladder has its own names and his kitchen has
-        # different ones again, and a page that could only edit "desk" and
-        # "room" could not edit either of them.
         self._bands = []                  # in the order they are packed
         for spec in self.specs:
             zmap = self.ladders.for_room(spec.name)
@@ -1919,28 +2548,18 @@ class SensorsPage(tk.Frame):
         self._overrule.pack(side="right")
         self._overrule.command = self._on_overrule
 
-        foot = tk.Frame(self, bg=bg)
+        self._foot = foot = tk.Frame(self, bg=bg)
         foot.pack(fill="x", padx=theme.PAD, pady=(theme.PAD_S, theme.PAD))
-        # SAVE and the age share ONE row; the caption gets the next one to
-        # itself. Packing all three into `foot` put the caption between the
-        # button and the age and cut it mid-word -- photographed 09-03,
-        # which is the same trap that put this caption below the button in
-        # the first place.
         row = tk.Frame(foot, bg=bg)
         row.pack(fill="x")
-        RoundButton(row, text="SAVE", kind="default", size=theme.SIZE_CAPTION,
-                    bg=bg, command=self.save).pack(side="left")
-        # The staleness readout, on the SAVE row so it costs no height. It
-        # is driven by the page's own 1 s tick, not by the poll, so a poll
-        # that has stopped makes this number CLIMB rather than freeze --
-        # which is the whole point of putting an age on a numbers page.
+        self._save_btn = RoundButton(row, text="SAVE", kind="default",
+                                     size=theme.SIZE_CAPTION, bg=bg,
+                                     command=self.save)
+        self._save_btn.pack(side="left")
         self._age = tk.Label(row, font=ui_font(theme.SIZE_CAPTION),
                              fg=theme.FAINT, bg=bg, anchor="e")
         self._age.pack(side="right", padx=(px(12), 0))
-        # BELOW the button, not beside it: beside it the caption had ~750 px
-        # of a 920-px window and was cut mid-word on the photo rig, and the
-        # refusal message a bad band edit puts here is longer still.
-        self._note = tk.Label(foot, text=RESTART_NOTE,
+        self._note = tk.Label(foot, text=restart_note(),
                               font=ui_font(theme.SIZE_CAPTION), fg=theme.FAINT,
                               bg=bg, anchor="w", justify="left")
         self._note.pack(fill="x", pady=(px(4), 0))
@@ -1952,15 +2571,190 @@ class SensorsPage(tk.Frame):
             for w in (self._notes, self._note)], add=True)
         self._show_notes()
 
+    # ------------------------------------------------------- the scroll
+    def _sync_view(self) -> None:
+        """Keep the scroll region, the body's width and the thumb honest.
+
+        Called on every <Configure> of either the viewport or the body, so
+        a fault line appearing or a room block growing re-measures rather
+        than leaving a stale region behind.
+        """
+        if self._canvas is None:          # frozen classic (``restyled``)
+            return
+        try:
+            width = self._canvas.winfo_width()
+            self._canvas.itemconfigure(self._body_win, width=width)
+            # HEIGHT FOLLOWS THE CONTENT, capped at the room the foot
+            # leaves. Set only when it CHANGES: a canvas that reconfigures
+            # itself on its own <Configure> would loop.
+            want = min(self._body.winfo_reqheight(), self._avail_px())
+            if want > 0 and want != self._canvas.winfo_reqheight():
+                self._canvas.configure(height=want)
+            self._canvas.configure(
+                scrollregion=self._canvas.bbox("all") or (0, 0, 0, 0))
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("sensors page: scroll region unreadable", exc_info=True)
+            return
+        self._sync_thumb()
+
+    def _avail_px(self) -> int:
+        """How much height the scrolling view may take: the page, less
+        what the foot needs. 0 before the page has been laid out, and 0
+        for the frozen classic look, which has no scrolling view."""
+        if self._foot is None or self._canvas is None:
+            return 0
+        try:
+            height = self._page_h()
+            if height <= 1:
+                return 0
+            foot = (self._foot.winfo_reqheight() + theme.PAD_S + px(12))
+            return max(px(40), height - foot)
+        except Exception:                 # noqa: BLE001 - torn down
+            return 0
+
+    def _page_h(self) -> int:
+        """The frame's own height, which is what it was PLACED with -- a
+        frame whose children are packed reports its request until the
+        geometry manager has run once."""
+        try:
+            return max(int(self.winfo_height()), 1)
+        except Exception:                 # noqa: BLE001 - torn down
+            return 1
+
+    def _sync_thumb(self) -> None:
+        if self._canvas is None:          # frozen classic (``restyled``)
+            return
+        view_h = self._canvas.winfo_height()
+        over = self.overflow_px()
+        if over <= 0 or view_h <= 1:
+            try:
+                self._thumb.place_forget()
+                self._canvas.yview_moveto(0.0)
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("sensors page: thumb hide failed", exc_info=True)
+            return
+        content = view_h + over
+        top = self._canvas.canvasy(0)
+        frac = max(0.08, view_h / float(content))
+        try:
+            self._thumb.place(relx=1.0, x=-px(3), anchor="nw",
+                              y=int(top / content * view_h),
+                              height=max(px(12), int(frac * view_h)))
+            self._thumb.lift()
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("sensors page: thumb place failed", exc_info=True)
+
+    def overflow_px(self) -> int:
+        """How much taller the body is than the viewport. 0 = it all fits.
+
+        The number this page was built around: at his window, with his
+        config and both rooms in their worst state, it must be 0
+        (tests/test_ui_layout_rules.py measures it on a private display).
+        """
+        if self._canvas is None:          # frozen classic: it never scrolls
+            return 0
+        try:
+            room = self._avail_px() or self._canvas.winfo_height()
+            return max(0, self._body.winfo_reqheight() - room)
+        except Exception:                 # noqa: BLE001 - torn down
+            return 0
+
+    def _scroll(self, units: int) -> None:
+        if self.overflow_px() <= 0:
+            return
+        try:
+            self._canvas.yview_scroll(units, "units")
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("sensors page: scroll failed", exc_info=True)
+            return
+        self._sync_thumb()
+
+    def _grab_wheel(self, _e=None) -> None:
+        if self._canvas is None:
+            return
+        self._canvas.bind_all("<Button-4>", lambda e: self._scroll(-2))
+        self._canvas.bind_all("<Button-5>", lambda e: self._scroll(2))
+
+    def _drop_wheel(self, _e=None) -> None:
+        if self._canvas is None:
+            return
+        for seq in ("<Button-4>", "<Button-5>"):
+            try:
+                self._canvas.unbind_all(seq)
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("sensors page: wheel unbind failed", exc_info=True)
+
+    def _resync_spans(self) -> None:
+        """Redraw every room's bars from what is CURRENTLY in its boxes.
+
+        Called at build and on every keystroke in a band box, so the
+        ladder under his hands follows what he typed rather than what the
+        config held when the page opened. Junk in one box drops that one
+        bar (spans_for_room) instead of the room's whole ladder.
+        """
+        for rows in self._rooms_bands:
+            pairs = [(r["lo"].get(), r["hi"].get()) for r in rows]
+            spans = spans_for_room(pairs)
+            for row, span, (lo, hi) in zip(rows, spans, pairs):
+                row["span"] = span
+                row["bar"].set_span(span)
+                # The live mark is drawn INSIDE the span, so the bounds it
+                # is measured against have to be the same ones the span
+                # was drawn from -- otherwise the needle drifts off the
+                # bar while he is typing. Unparseable boxes keep the
+                # config's numbers.
+                lo, hi = _finite(lo), _finite(hi)
+                if lo is not None and hi is not None and hi > lo:
+                    row["near_m"], row["far_m"] = lo, hi
+
     def _band_row(self, parent, room: str, band) -> dict:
+        """``at the desk  [2.25] ——[####]—— [3.75] m`` on ONE baseline.
+
+        The unit is a column of its own (a fixed width, packed to the far
+        right) rather than a label that floats off the end of whatever the
+        number happened to be -- the "m"s were ragged on the 09-05 shot.
+        """
+        bg = theme.TV_BG
+        if not restyled():
+            return self._band_row_v3(parent, room, band)
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", pady=px(2))
+        tk.Label(row, text=band.name, font=ui_display(theme.SIZE_CAPTION),
+                 fg=theme.MUTED, bg=bg, anchor="w", width=18, bd=0, padx=0,
+                 pady=0).pack(side="left")
+        unit = tk.Label(row, text="m", font=ui_display(theme.SIZE_CAPTION),
+                        fg=theme.FAINT, bg=bg, anchor="w", width=2, bd=0,
+                        padx=0, pady=0)
+        unit.pack(side="right", padx=(px(6), 0))
+        hi_e = self._entry(row, band.far_m)
+        hi_e.pack(side="right")
+        lo_e = self._entry(row, band.near_m)
+        lo_e.pack(side="left", padx=(0, px(8)))
+        bar = _BandBar(row, bg=bg)
+        bar.pack(side="left", fill="x", expand=True, padx=(0, px(8)))
+        for entry in (lo_e, hi_e):
+            entry.bind("<KeyRelease>", lambda _e: self._resync_spans(),
+                       add=True)
+            entry.bind("<FocusOut>", lambda _e: self._resync_spans(),
+                       add=True)
+        return {"room": room, "name": band.name, "lo": lo_e, "hi": hi_e,
+                "bar": bar, "unit": unit, "span": None,
+                "near_m": band.near_m, "far_m": band.far_m}
+
+    def _band_row_v3(self, parent, room: str, band) -> dict:
+        """The band row EXACTLY as jarvis-v3 packed it: a display-size band
+        name in a 13-character column, the unit floating off the end of
+        whatever the number happened to be, and no live redraw while he
+        types. Classic is frozen (``restyled``)."""
         bg = theme.TV_BG
         row = tk.Frame(parent, bg=bg)
         row.pack(fill="x", pady=px(4))
         tk.Label(row, text=band.name, font=ui_font(theme.SIZE_LABEL),
                  fg=theme.MUTED, bg=bg, anchor="w",
                  width=13).pack(side="left")
-        tk.Label(row, text="m", font=ui_font(theme.SIZE_CAPTION),
-                 fg=theme.FAINT, bg=bg).pack(side="right", padx=(px(4), 0))
+        unit = tk.Label(row, text="m", font=ui_font(theme.SIZE_CAPTION),
+                        fg=theme.FAINT, bg=bg)
+        unit.pack(side="right", padx=(px(4), 0))
         hi_e = self._entry(row, band.far_m)
         hi_e.pack(side="right")
         lo_e = self._entry(row, band.near_m)
@@ -1968,11 +2762,13 @@ class SensorsPage(tk.Frame):
         bar = _BandBar(row, bg=bg)
         bar.pack(side="left", fill="x", expand=True, padx=(0, px(6)))
         return {"room": room, "name": band.name, "lo": lo_e, "hi": hi_e,
-                "bar": bar, "near_m": band.near_m, "far_m": band.far_m}
+                "bar": bar, "unit": unit, "span": None,
+                "near_m": band.near_m, "far_m": band.far_m}
 
     def _entry(self, parent, value: float) -> tk.Entry:
+        size = theme.SIZE_CAPTION if restyled() else theme.SIZE_LABEL
         e = tk.Entry(parent, width=5, justify="center",
-                     font=ui_mono(theme.SIZE_LABEL), fg=theme.INK,
+                     font=ui_mono(size), fg=theme.INK,
                      bg=theme.SURFACE, insertbackground=theme.CYAN,
                      relief="flat", highlightthickness=1,
                      highlightbackground=theme.LINE,
@@ -2033,6 +2829,9 @@ class SensorsPage(tk.Frame):
         self._open = False
         self.poller.stop()
         self._untick()
+        # bind_all is GLOBAL: a wheel binding left behind would scroll a
+        # hidden page from anywhere in the console.
+        self._drop_wheel()
         try:
             self.place_forget()
         except Exception:                 # noqa: BLE001 - a dead widget
@@ -2137,7 +2936,11 @@ class SensorsPage(tk.Frame):
             notes += band_notes(self.ladders.for_room(spec.name))
         if notes:
             self._notes.configure(text="\n".join(notes))
-            self._notes.pack(fill="x", padx=theme.PAD, pady=(0, theme.PAD_S))
+            if restyled():
+                self._notes.pack(fill="x", pady=(px(4), 0))
+            else:                         # frozen classic (``restyled``)
+                self._notes.pack(fill="x", padx=theme.PAD,
+                                 pady=(0, theme.PAD_S))
         else:
             self._notes.pack_forget()
 

@@ -72,10 +72,15 @@ from jarvis import desktop as desktop_mod
 from jarvis import earcons
 from jarvis import gate as gate_mod
 from jarvis import honorific as honorific_mod
+from jarvis import passphrase as pp
 from jarvis import identity as identity_mod
 from jarvis import scope as scope_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
+# The one module in the package that may call the mail transport
+# (tests/test_send_file.py pins it); Knightfall's rotated code goes out
+# through outbox.send_notice.
+from jarvis import outbox
 from jarvis import relaunch
 from jarvis import vocab as vocab_mod
 from jarvis.assistant_config import AssistantConfig
@@ -202,6 +207,33 @@ NOT_CAUGHT_LINE = "I did not catch that, sir. Do try me again."
 # that was the whole complaint -- and named him to a stranger besides.
 GUEST_LINE = gate_mod.UNKNOWN_LINE
 GUEST_PHRASE_LINE = gate_mod.UNKNOWN_PHRASE_LINE
+# What _gate_rescue hands back when the dropped clip WAS the spoken phrase:
+# the gate answered it, the window is open, and _process_audio must publish
+# neither a rejection nor a transcript (Knightfall, 2026-09-04).
+PHRASE_CONSUMED = object()
+# The legs on which a clip the speaker filter dropped is let through after
+# all: the camera, the phrase's window, the code's window.
+RESCUE_HOWS = (gate_mod.HOW_FACE, gate_mod.HOW_GRANT, gate_mod.HOW_CODE)
+# ...and the two of those he opened HIMSELF. See _gate_rescue_inner: these
+# act in shadow, the camera does not.
+WINDOW_HOWS = gate_mod.WINDOW_HOWS
+# The typed code (knightfall_code / knightfall_new_code below). The mail
+# carries two lines: the code, then this sentence. The Status lines never
+# carry a code.
+KNIGHTFALL_SUBJECT = "Knightfall"
+KNIGHTFALL_BODY_LINE = "Typed only, never spoken. This replaces the old one."
+KNIGHTFALL_OK_LINE = "Knightfall accepted, sir; a new code is in your inbox."
+KNIGHTFALL_NEW_OK_LINE = "Knightfall: a new code is in your inbox."
+KNIGHTFALL_COOLDOWN_LINE = "Knightfall: one code a minute, sir."
+KNIGHTFALL_COOLDOWN_S = 60.0
+# ONE ROTATION AT A TIME. check -> open -> mail -> store is not atomic, and
+# the drawer runs each press on its own thread: two presses measured
+# (verdict, 2026-09-05) both passed the check against the OLD hash, both
+# mailed, and both said "a new code is in your inbox" -- one of which was
+# dead on arrival, with nothing to say which. Process-wide because there is
+# one keyboard and one drawer; held across the send, so the second press
+# reads the state the first one left rather than the state it found.
+_KNIGHTFALL_LOCK = threading.RLock()
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
 # offer").
 #
@@ -368,6 +400,15 @@ class JarvisApp:
     def __init__(self):
         # ---- assistant config first: everything below reads it ------------
         self.assistant = AssistantConfig.load()
+        # THE ONE WRITE. load() is a read everywhere (a script, jarvis-breeze,
+        # a test, an agent's import); the app is the process that owns the
+        # file, so it alone creates it, recreates a corrupt one, tightens
+        # the mode and fills in keys DEFAULTS has gained -- once, here.
+        try:
+            self.assistant.ensure_defaults()
+        except Exception:
+            log.exception("assistant config ensure_defaults failed; "
+                          "continuing with the in-memory copy")
         # How often "sir" lands on the ear (jarvis/address.py). Installed as
         # module state, the way earcons.set_config is, because the two join
         # sites that need it -- quiet.digest and speak_queue's watcher -- are
@@ -407,8 +448,13 @@ class JarvisApp:
         self.brain = JarvisBrain(self.context, self.memory)
         # brain.configure(assistant.local_model): module-level in brain.py;
         # env JARVIS_OLLAMA_MODEL wins inside it.
+        # ...and the model SETTINGS (brain.* -- window, generation budget,
+        # temperature, think, the guard) are handed over from the config
+        # already loaded above: brain.py reads no config of its own, at
+        # import or later (see brain.settings()).
         try:
-            brain_mod.configure(self.assistant.local_model)
+            brain_mod.configure(self.assistant.local_model,
+                                config=self.assistant)
         except Exception:
             log.exception("brain.configure(%s) failed", self.assistant.local_model)
         # The register he last asked for, before the first static_system()
@@ -3130,6 +3176,22 @@ class JarvisApp:
         invents something. That is Hunter's "2- keeps showing up after a
         response and hes listening back for me": the card was still up
         because nobody had ever been able to take it down.
+
+        THE FILLER HOLD (jarvis/recorder.py, CONFIG.filler_hold): every
+        greedy decode here is reported to recorder.note_partial() with the
+        capture second the decoded span ENDS at, so a preview ending on
+        "um" can hold the stop open. Only the greedy preview reports. The
+        speculative pass does not: its prompt never carries the filler
+        hint and its clean full decode is the one most likely to have
+        dropped the um, so letting it overrule the preview would defeat
+        the experiment scripts/filler_probe.py exists to run. LIMIT: this
+        loop's cadence (_PARTIAL_INTERVAL_S, 0.9 s) is slower than the
+        endpoint (CONFIG.endpoint_silence, 0.8 s), and the speculative
+        pass parks the preview for a full decode from 0.3 s into a pause,
+        so a filler spoken after the last snapshot may never be decoded
+        before the stop is due. The recorder does NOT decode the tail
+        itself (that would be a decode on every turn's stop): it stops as
+        before. How often that happens is a number the probe measures.
         """
         last = ""
         due = 0.0                       # next greedy preview (monotonic)
@@ -3145,8 +3207,22 @@ class JarvisApp:
                     time.sleep(self._SPECULATE_POLL_S)
                     continue
                 started = time.monotonic()
+                # BEFORE the snapshot, never after: this stamps the note
+                # with the capture the audio came from. If the capture
+                # turns over between this read and the snapshot the note
+                # carries the OLD id and the recorder drops it -- a
+                # mismatch may only ever discard, never accept a stale
+                # note. Reading it after the decode would do the opposite.
+                capture = getattr(self.recorder, "capture_id", None)
                 audio = self.recorder.snapshot_audio()
+                end_s = 0.0
                 if audio is not None:
+                    # Where the span ENDS in capture seconds: the whole
+                    # buffer, measured BEFORE the trim below. The recorder
+                    # compares it with the VAD's last-speech position
+                    # (note_partial, the filler hold); the decode wallclock
+                    # would be the wrong clock for that.
+                    end_s = len(audio) / SAMPLE_RATE
                     audio = audio[-int(SAMPLE_RATE * self._PARTIAL_MAX_S):]
                 if audio is not None and len(audio) >= int(
                         SAMPLE_RATE * self._PARTIAL_MIN_S):
@@ -3162,6 +3238,13 @@ class JarvisApp:
                     except Exception:
                         log.debug("partial decode failed", exc_info=True)
                         text = ""
+                    # Every decode, changed or not, failed or not: a
+                    # failed decode reports "" so a stale um cannot keep
+                    # holding the mic open. Guarding this on
+                    # recorder.recording is the WRONG fix for the
+                    # cross-capture race -- it would drop exactly the note
+                    # that clears a stale um. The capture stamp does it.
+                    self._note_partial(text, end_s, capture)
                     # only publish on change: the ghost card redraws on
                     # every event, and whisper often returns the same text.
                     if text and text != last and self.recorder.recording:
@@ -3190,6 +3273,50 @@ class JarvisApp:
                 self._partial_shown = False
                 self.preview_probe.retracted(PATH_GREEDY)
                 bus.publish(PartialText(text=""))
+
+    def _drop_partial(self) -> None:
+        """Take the ghost card down NOW, whatever is on it.
+
+        The turn that consumes the passphrase has no UserUtterance to
+        replace the preview with and no rejection to make the UI clear it,
+        so this is the only thing that can. Used by _gate_consumed.
+
+        PUBLISHED UNCONDITIONALLY, and that asymmetry is the whole design:
+        a redundant clear costs one no-op call on a pane that is already
+        empty, while a clear that did not fire leaves his passphrase
+        legible on the glass. The probe's retraction counter is only
+        bumped when this process believes a card was up, so the preview
+        ledger keeps meaning what it meant.
+
+        Every step is guarded because this runs in front of a redaction:
+        an instrument, a bus subscriber or a stand-in without a probe must
+        not be able to keep the words on screen by raising.
+        """
+        try:
+            if getattr(self, "_partial_shown", False):
+                self._partial_shown = False
+                try:
+                    self.preview_probe.retracted(PATH_GREEDY)
+                except Exception:              # noqa: BLE001 - instrument
+                    log.debug("preview retraction failed", exc_info=True)
+            bus.publish(PartialText(text=""))
+        except Exception:                      # noqa: BLE001 - never fatal
+            log.exception("the preview card could not be taken down")
+
+    def _note_partial(self, text: str, end_s: float,
+                      capture_id=None) -> None:
+        """Hand the preview's newest decode to the recorder's filler hold,
+        stamped with the capture its audio came from (Recorder.note_partial
+        drops a note from any other). getattr, because the preview-thread
+        tests drive _partial_loop with bare recorder fakes -- and a preview
+        must never fail the capture."""
+        note = getattr(self.recorder, "note_partial", None)
+        if note is None:
+            return
+        try:
+            note(text, end_s, capture_id)
+        except Exception:
+            log.debug("note_partial failed", exc_info=True)
 
     # ------------------------------------------- speculative transcription
     #
@@ -3250,7 +3377,63 @@ class JarvisApp:
             if filtered is None:
                 return audio, stats, True, None
             audio = filtered
-        return audio, stats, False, self.transcriber.transcribe(audio)
+        return audio, stats, False, self._clip_decode(audio)
+
+    def _clip_decode(self, audio):
+        """THE DECODE, REDACTED WHENEVER IT COULD BE THE SECRET.
+
+        The earlier fix closed jarvis/transcriber.py's `Transcribed: %r`
+        line on the RESCUE leg only -- a clip the speaker filter dropped.
+        That is not the leg he is on. When the filter MATCHES him (the
+        common case, and the one he tests in) this is the decode, and it
+        wrote the spoken passphrase to jarvis.log in plaintext at INFO in
+        shadow, enforce and off alike -- measured on a fresh copy at
+        ecb5abc, and again here by tests/test_knightfall_log_leak.py
+        before this method existed.
+
+        So: when an owner has a phrase set, EVERY clip is decoded quietly
+        and the words are written down only by ``_log_transcript`` below,
+        after the gate has said they are not the phrase. When no owner has
+        one there is no secret to protect and nothing changes at all --
+        not the decode, not the line, not its position in the log.
+
+        The cost is the one the redaction cannot avoid: on a turn the gate
+        consumes, no `Transcribed:` line carries words, because there are
+        no words that may be carried. The numbers stay in both cases.
+        """
+        if self._owner_has_phrase():
+            return self._gate_quiet_decode(audio)
+        return self.transcriber.transcribe(audio)
+
+    def _loggable(self, text) -> str:
+        """``repr(text)`` for a log line -- or the redaction, when an owner
+        has a phrase set and nothing has yet ruled these words are not it.
+
+        The rule this whole pass enforces, in one place: WORDS ARE WRITTEN
+        DOWN ONLY AFTER SOMETHING HAS SAID THEY ARE NOT THE PHRASE.
+        """
+        if text and self._owner_has_phrase():
+            return repr(gate_mod.REDACTED_TEXT)
+        return repr(text)
+
+    def _log_transcript(self, result) -> None:
+        """The `Transcribed:` line the quiet decode deliberately did not
+        write, now that the gate has cleared these words.
+
+        Only when the decode was actually redacted -- otherwise
+        jarvis/transcriber.py already wrote the line and this would double
+        it. Deliberately the same wording and the same numbers as that
+        line, so a reader of jarvis.log (and every grep and script written
+        against it, scripts/measure_confidence_gate.py included) sees one
+        format, not two.
+        """
+        if not self._owner_has_phrase():
+            return                     # transcriber.py wrote it already
+        text = getattr(result, "text", "") or ""
+        if not text:
+            return                     # nothing was said; nothing to say
+        log.info("Transcribed: %r (avg_logprob=%.2f)", text,
+                 float(getattr(result, "confidence", 0.0) or 0.0))
 
     def decode_clip(self, audio, verify=True):
         """Public seam for _decode_clip: the command socket's intercom must
@@ -3315,9 +3498,16 @@ class JarvisApp:
                 text, path=PATH_SPECULATIVE,
                 audio_s=getattr(result, "audio_seconds", None))
             bus.publish(PartialText(text=text))
+        # REDACTED FOR THE SAME REASON THE DECODE IS. This is a DEBUG line
+        # rather than the INFO one the verdict measured, so it only reaches
+        # jarvis.log when he has turned debug logging on -- which is exactly
+        # what he does when something is wrong, i.e. the session in which
+        # the phrase is most likely to be said and least likely to be
+        # noticed. The words reach the log from _log_transcript once the
+        # gate has cleared them, and from nowhere else.
         log.debug("speculative decode at last_speech=%.2fs took %.2fs (%s)",
                   key, spec.finished - spec.started,
-                  "rejected" if spec.rejected else repr(text))
+                  "rejected" if spec.rejected else self._loggable(text))
         return True
 
     def _take_speculation(self):
@@ -4868,7 +5058,11 @@ class JarvisApp:
             return
         if ev.dead_air_s is not None:
             self.turns.mark("speech_end", at=ev.t - ev.dead_air_s)
-        self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason)
+        # holds=N only when the filler hold fired: a turn without one keeps
+        # the line it always had.
+        holds = int(getattr(ev, "filler_holds", 0) or 0)
+        notes = {"holds": str(holds)} if holds else {}
+        self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason, **notes)
 
     def _turn_on_transcribed(self, ev):
         # A reused speculative decode makes "stt" the time from the stop to
@@ -4967,6 +5161,24 @@ class JarvisApp:
         self._last_guest_ts = now
         self._say(line)
 
+    def _gate_quiet_decode(self, audio):
+        """THE DECODE THAT MAY BE A SECRET, and the only one taken behind
+        the gate's back. ``transcribe_quiet`` is the same decode with the
+        words left out of jarvis/transcriber.py's INFO line -- which is
+        upstream of every redaction this module does, and so was where the
+        phrase he says in shadow actually landed (verdict, 2026-09-05).
+
+        Duck-typed on purpose: the transcriber is a seam (jarvis/intercom.py
+        hands clips in over the command socket, the tests stand in their
+        own), and a stand-in without the quiet decode still works -- it
+        simply logs what it logged before.
+        """
+        fn = getattr(self.transcriber, "transcribe_quiet", None)
+        if fn is None:
+            log.debug("owner-gate: this transcriber has no redacting decode")
+            fn = self.transcriber.transcribe
+        return fn(audio)
+
     def _gate_rescue(self, audio, stats, speculative):
         """A clip the speaker filter dropped: `(audio, stats, result)` to let
         it through after all, or None to keep today's behaviour.
@@ -4987,63 +5199,126 @@ class JarvisApp:
         if gate is None:
             return None
         try:
-            return self._gate_rescue_inner(gate, audio, stats)
+            return self._gate_rescue_inner(gate, audio, stats,
+                                           speculative=speculative)
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: the rescue failed; the clip is "
                           "dropped exactly as it was before")
             return None
 
-    def _gate_rescue_inner(self, gate, audio, stats):
+    def _gate_rescue_inner(self, gate, audio, stats, speculative=False):
         face, running = self._eye_identity(), self._face_running()
-        d = gate.judge("voice", "", stats=stats, rejected=True,
+        # THE PHRASE COSTS ONE DECODE, IN EVERY MODE, and only when an owner
+        # has set one. It is the ONE thing that acts in shadow: a rejected
+        # clip that is the phrase is consumed (Knightfall, 2026-09-04 --
+        # "so he can test it tonight"); everything else shadow still only
+        # logs. Judged once, with the words, so the gate can hear it.
+        result, text = None, ""
+        if self._owner_has_phrase():
+            result = self._gate_quiet_decode(audio)
+            text = (getattr(result, "text", "") or "").strip()
+        d = gate.judge("voice", text, stats=stats, rejected=True,
                        face=face, face_running=running)
+        if d.consumed:
+            self._gate_consumed(d, getattr(result, "confidence", 0.0),
+                                speculative)
+            return PHRASE_CONSUMED
+        if d.admit and d.how in WINDOW_HOWS:
+            # A WINDOW HE OPENED HIMSELF ACTS IN EVERY MODE THAT OPENS ONE,
+            # and this is the line that makes "Thank you, sir. I'm
+            # listening." true. It used to sit BELOW the shadow return, so
+            # in shadow -- HIS LIVE MODE -- the phrase said it was
+            # listening and then the speaker filter dropped his very next
+            # clip, exactly as it had dropped the one that made him say the
+            # phrase. Measured 2026-09-05: dispatched == [] in shadow
+            # against [("what time is it", "voice")] in enforce, for the
+            # phrase's window and the typed code's window alike.
+            #
+            # It is not shadow leaking. Shadow's rule is that the gate must
+            # not start ACTING ON ITS OWN JUDGEMENT -- a face leg answering
+            # clips he never asked it to answer is a behaviour change he did
+            # not ask for, and it still only logs, below. This is the
+            # opposite thing: he said the phrase, or he typed the code, and
+            # the only content of either is "let me in". The phrase already
+            # acts in shadow by consuming the turn and speaking a line; the
+            # five minutes it buys is the same instruction, and refusing to
+            # honour it made the feature inert in the one mode he runs.
+            log.info("owner-gate: the %s window rescued a clip the speaker "
+                     "filter dropped (%s, mode=%s)", d.how, d.who,
+                     gate.effective_mode())
+            if result is None:
+                result = self.transcriber.transcribe(audio)
+            return audio, stats, result
         if gate.effective_mode() != gate_mod.MODE_ENFORCE:
-            # SHADOW CHANGES NOTHING, and that has to include the rescues.
-            # A face leg that started answering clips the speaker filter
-            # dropped would be a visible change of behaviour he did not ask
-            # for yet -- and the whole value of shadow is that it is safe to
-            # leave on while the log is read. The verdict is logged inside
-            # judge() either way, which is the point of the mode.
-            if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
+            # SHADOW CHANGES NOTHING ELSE, and that has to include the
+            # rescues. A face leg that started answering clips the speaker
+            # filter dropped would be a visible change of behaviour he did
+            # not ask for yet -- and the whole value of shadow is that it is
+            # safe to leave on while the log is read. The verdict is logged
+            # inside judge() either way, which is the point of the mode.
+            if d.admit and d.how in RESCUE_HOWS:
                 log.info("owner-gate: shadow -- the %s leg WOULD have "
                          "rescued this clip for %s", d.how, d.who)
             return None
-        if d.admit and d.how in (gate_mod.HOW_FACE, gate_mod.HOW_GRANT):
+        if d.admit and d.how in RESCUE_HOWS:
             log.info("owner-gate: the %s leg rescued a clip the speaker "
                      "filter dropped (%s)", d.how, d.who)
-            return audio, stats, self.transcriber.transcribe(audio)
-        if d.admit:
-            return None                # off, shadow or blind: nothing changes
-        if not self._owner_has_phrase():
-            self._refuse_politely(d.line)
-            return None
-        result = self.transcriber.transcribe(audio)
-        second = gate.judge("voice", (getattr(result, "text", "") or "").strip(),
-                            stats=stats, rejected=True, face=face,
-                            face_running=running)
-        if second.admit and second.how == gate_mod.HOW_PHRASE:
-            log.info("owner-gate: the passphrase opened the floor")
-            self._say(gate_mod.PHRASE_OK_LINE)
-            self._followup_after_speech = True
-            return None
-        if second.admit:
+            if result is None:
+                result = self.transcriber.transcribe(audio)
             return audio, stats, result
-        self._refuse_politely(second.line)
+        if d.admit:
+            return None                # off or blind: nothing changes
+        self._refuse_politely(d.line)
         return None
 
-    def _gate_admits(self, text, stats) -> bool:
-        """The admitted path: attribute the turn, and hold a KNOWN person to
-        what a known person may ask for. It cannot refuse HIM -- the speaker
-        filter has already matched him and this reuses that verdict."""
+    def _gate_judge(self, text, stats):
+        """One verdict for the turn, or None when there is no gate or it
+        could not decide (both mean: the turn stands, exactly as today)."""
         gate = getattr(self, "gate", None)
         if gate is None:
-            return True
+            return None
         try:
-            d = gate.judge("voice", text, stats=stats,
-                           face=self._eye_identity(),
-                           face_running=self._face_running())
+            return gate.judge("voice", text, stats=stats,
+                              face=self._eye_identity(),
+                              face_running=self._face_running())
         except Exception:                          # noqa: BLE001 - never fatal
             log.exception("owner-gate: judging failed; the turn stands")
+            return None
+
+    def _gate_consumed(self, d, confidence=0.0, speculative=False):
+        """The spoken phrase, answered by the gate: say the line, re-open
+        the mic, close the turn in the ledger, and publish ONLY the
+        redaction -- no UserUtterance, no commander, no model. The log line
+        carries who and which path; the text is never anywhere."""
+        # THE GLASS FIRST, BEFORE ANYTHING ELSE GETS TO RUN. While he speaks,
+        # _partial_loop and _maybe_speculate publish PartialText(<the words>)
+        # and the pane draws a ghost card. Publishing the redaction does NOT
+        # take it down: MainWindow._ev_transcribed clears the partial only
+        # when the event is NOT accepted or is empty, and this event is
+        # accepted and non-empty, while add_user -- the pane's other clearer
+        # -- never runs because the whole point is that no UserUtterance
+        # follows. So the phrase stayed legible on screen after a log line
+        # had been carefully redacted in front of it. Measured 2026-09-05 in
+        # all three modes: transcript calls were [("show", <the phrase>)]
+        # with no ("clear", "").
+        self._drop_partial()
+        log.info("owner-gate: the phrase turn is consumed for %s; nothing "
+                 "dispatched (mode=%s)", d.who, self.gate.effective_mode())
+        bus.publish(Transcribed(text=d.redact or gate_mod.REDACTED_TEXT,
+                                confidence=float(confidence or 0.0),
+                                accepted=True, speculative=bool(speculative)))
+        self.turns.abandon("gate:phrase")
+        self._say(d.line or gate_mod.PHRASE_OK_LINE)
+        self._followup_after_speech = True
+
+    def _gate_admits(self, text, stats, decision=None) -> bool:
+        """The admitted path: attribute the turn, and hold a KNOWN person to
+        what a known person may ask for. It cannot refuse HIM -- the speaker
+        filter has already matched him and this reuses that verdict.
+        ``decision`` is the verdict _process_audio already took for this
+        turn, so the gate (and its key derivation) runs once, not twice."""
+        d = decision if decision is not None else self._gate_judge(text, stats)
+        if d is None:
             return True
         if not d.admit:
             # NOT ATTRIBUTED. Round 3 measured this the other way round:
@@ -5091,6 +5366,8 @@ class JarvisApp:
                 # which is his way back in when he is ill, in the dark, or
                 # turned away. Anything else and today's behaviour stands.
                 rescued = self._gate_rescue(audio, stats, spec is not None)
+                if rescued is PHRASE_CONSUMED:
+                    return             # the gate answered it; nothing else
                 if rescued is None:
                     bus.publish(Transcribed(
                         text="", accepted=False, reject_reason="speaker",
@@ -5102,6 +5379,27 @@ class JarvisApp:
                 audio, stats, result = rescued
                 rejected = False
             text = result.text.strip()
+            # THE GATE, BEFORE THE TRANSCRIPT CAN REACH THE BUS. The spoken
+            # phrase is consumed here in every mode (Knightfall): the turn
+            # ends with the line and the redaction, and the words never
+            # become a Transcribed, a UserUtterance or a dispatch. Judged
+            # once; the admitted path below reuses this verdict. A
+            # low-confidence transcript is judged too, when an owner has a
+            # phrase: an exact match after normalisation is better evidence
+            # than a length-biased score, and not checking would put the
+            # phrase on the bus as a rejected transcript.
+            verdict = None
+            if text and (result.accepted or self._owner_has_phrase()):
+                verdict = self._gate_judge(text, stats)
+                if verdict is not None and verdict.consumed:
+                    self._gate_consumed(verdict, result.confidence,
+                                        spec is not None)
+                    return
+            # THE WORDS ARE WRITTEN DOWN HERE, NOT IN THE DECODE, whenever
+            # an owner has a phrase set: _clip_decode redacted the line so
+            # that a phrase-shaped clip could be judged before anything
+            # logged it, and this is the gate saying it was ordinary.
+            self._log_transcript(result)
             # The confidence gate is no longer the last word. It used to
             # fire BEFORE the commander saw a syllable, so a plain "Yes."
             # answering Jarvis's own "Clear all three off your shopping
@@ -5136,7 +5434,7 @@ class JarvisApp:
                 # It cannot refuse HIM here -- the speaker filter has already
                 # matched him, and this reuses that verdict rather than
                 # taking one of its own.
-                if not self._gate_admits(text, stats):
+                if not self._gate_admits(text, stats, decision=verdict):
                     return
                 # The reading _gate_admits just installed, carried by
                 # value. Only this thread writes it and only this thread
@@ -6403,6 +6701,162 @@ class JarvisApp:
         else:
             self.quit()
 
+    # ---------------------------------------------- Knightfall, typed
+    def knightfall_code(self, code, *, mail=None, smtp=None, now=None) -> str:
+        """THE TYPED PATH (Hunter, 2026-09-04: "a and b"). The drawer's
+        masked entry lands here, off the Tk thread. Returns the one line
+        the drawer toasts; it never contains a code.
+
+        The check is ``gate.check_override_code`` -- the same function the
+        people CLI uses, on the gate's OWN code counter (separate from the
+        phrase's, so burning one never closes the other). A refusal is its
+        reason and nothing else. On success the window opens on the code
+        leg exactly as the phrase opens it, and the code ROTATES: a fresh
+        one is mailed to his own address from his own first account, and
+        only a returned Message-ID lets the new hash be stored -- a mail
+        that did not go leaves the old code standing, and the line says
+        which happened. The plaintext is deleted the moment it is hashed;
+        the log carries who and which path.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return "Knightfall: the gate is not built; see the log"
+        with _KNIGHTFALL_LOCK:
+            who, why = gate_mod.check_override_code(gate.registry, code,
+                                                    attempts=gate.code_attempts)
+            del code
+            if not who:
+                return "Knightfall: %s" % why
+            gate.open_window(who, gate_mod.HOW_CODE, now=now)
+            line, _mailed = self._knightfall_rotate(who, mail=mail,
+                                                    smtp=smtp, accepted=True)
+            return line
+
+    def knightfall_new_code(self, *, mail=None, smtp=None, now=None) -> str:
+        """THE BOOTSTRAP: "Email me a new Knightfall code". The same
+        generate -> mail -> store sequence, for the first owner, and it
+        opens no window -- mailing a code is not typing one.
+
+        KEYBOARD = OWNER IS THE EXISTING RULE, not a new one: whoever is
+        at this keyboard can already edit or delete the registry, which is
+        the argument ``check_override_code``'s docstring makes and this
+        does not make twice. So there is no second check here -- only a
+        cooldown of KNIGHTFALL_COOLDOWN_S, so a stuck button cannot spam
+        his inbox.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return "Knightfall: the gate is not built; see the log"
+        t = time.monotonic() if now is None else float(now)
+        with _KNIGHTFALL_LOCK:
+            last = getattr(self, "_knightfall_new_ts", None)
+            if last is not None and t - last < KNIGHTFALL_COOLDOWN_S:
+                return KNIGHTFALL_COOLDOWN_LINE
+            try:
+                who = gate._owner_label()
+            except Exception:                      # noqa: BLE001 - no registry
+                who = ""
+            if not who:
+                return ("Knightfall: nobody is enrolled as an owner yet "
+                        "(scripts/jarvis_people.py add ... --role owner)")
+            line, mailed = self._knightfall_rotate(who, mail=mail, smtp=smtp,
+                                                   accepted=False)
+            # THE CLOCK STARTS ON A CODE THAT ACTUALLY LEFT. It used to be
+            # stamped before the send, so a press that mailed nothing --
+            # no account configured, the transport refusing -- answered
+            # "one code a minute, sir" to the next press and made him wait
+            # for a minute to be told the same thing again (R8b).
+            if mailed:
+                self._knightfall_new_ts = t
+            return line
+
+    def _knightfall_rotate(self, who, *, mail=None, smtp=None,
+                           accepted=False):
+        """Generate -> mail FIRST -> store ONLY on a Message-ID. Returns
+        ``(line, mailed)``: the line to show, and whether a code actually
+        left this machine (the bootstrap's cooldown starts on that, not on
+        the press). ``mail`` is the mail module (a seam for the tests);
+        ``smtp`` is the transport class the mail module takes.
+
+        THE TRANSPORT IS REACHED THROUGH jarvis/outbox.py, like every other
+        send in this package, and by its narrowest door: send_notice takes
+        no recipient, so a Knightfall code can only ever go to his own
+        account's own address.
+
+        NOTHING THE TRANSPORT SAYS IS REPEATED. The reason in the line and
+        in the log is the exception's TYPE. It used to be str(exc), which
+        trusts a seam to be discreet about a body it was just handed: with
+        a transport whose error quoted the first line of the mail, the
+        freshly rotated code came back in the line the drawer toasts
+        (verdict, 2026-09-05, measured).
+        """
+        head = "Knightfall accepted, sir; " if accepted else "Knightfall: "
+        keep = head + "the code stays as it is (mail: %s)."
+        if mail is None:
+            from jarvis.tools import mail as mail_mod
+            mail = mail_mod
+        try:
+            accounts = mail.mail_accounts(self.assistant)
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the mail accounts could not be read")
+            accounts = []
+        if not accounts:
+            return keep % "no mail account is configured", False
+        account = accounts[0]
+        new = pp.new_code()
+        body = "%s\n%s\n" % (new, KNIGHTFALL_BODY_LINE)
+        try:
+            msgid = outbox.send_notice(account, KNIGHTFALL_SUBJECT, body,
+                                       smtp=smtp, mail=mail)
+        except Exception as exc:                   # noqa: BLE001 - transport
+            # MailSendFailed, or anything else the transport did: the old
+            # code stands, and only the TYPE of what went wrong is said.
+            del new, body
+            why = type(exc).__name__
+            log.warning("knightfall: the new code could not be mailed (%s); "
+                        "the old one stands", why)
+            return keep % why, False
+        del body
+        if not msgid:
+            del new
+            return keep % "no Message-ID came back", True
+        hashed = pp.hash_secret(new)
+        del new
+        registry = getattr(self.gate, "registry", None)
+        person = registry.person(who) if registry is not None else None
+        old = person.code_hash if person is not None else ""
+        # EVERY FAILURE HERE IS A LINE, NOT AN EXCEPTION. Registry.save()
+        # catches OSError and nothing else, and this is documented to
+        # return a line -- the drawer's thread has no other way to tell him
+        # what happened, and an exception here would leave the mailed code
+        # stored in memory and not on disk (R7).
+        try:
+            ok, why = (registry.set_secret(who, "code_hash", hashed)
+                       if registry is not None else (False, "no registry"))
+            stored = bool(ok and registry.save())
+        except Exception as exc:                   # noqa: BLE001 - registry
+            log.exception("knightfall: storing the new code failed")
+            ok, why, stored = False, type(exc).__name__, False
+        if stored:
+            log.info("knightfall: %s rotated the code at the keyboard; the "
+                     "new one is in the mail", who)
+            return (KNIGHTFALL_OK_LINE if accepted
+                    else KNIGHTFALL_NEW_OK_LINE), True
+        # The mail went, the store did not. Put the old hash back so the
+        # old code works in memory as it still does on disk: never a state
+        # where no code works. The one in the inbox is dead, and he is told.
+        if registry is not None:
+            try:
+                registry.set_secret(who, "code_hash", old)
+            except Exception:                      # noqa: BLE001 - registry
+                log.exception("knightfall: the old hash could not be put "
+                              "back in memory; it is still on disk")
+        log.error("knightfall: the new code was mailed but could not be "
+                  "stored (%s); the old code stands",
+                  why or "the registry could not be written")
+        return head + ("the new code could not be stored, so the old one "
+                       "stands; the one in your inbox will not work."), True
+
     # ------------------------------------------------------------ UI hooks
     def ui_service_kwargs(self) -> dict:
         """Everything the UI's Services dataclass may take (spec 9.10);
@@ -6439,6 +6893,11 @@ class JarvisApp:
             # UI that does not declare them.
             restart=self.restart,
             code_status=self.code_status,
+            # Knightfall: the drawer's masked entry and its bootstrap
+            # button. Both return the one line the drawer toasts, and
+            # both run off the Tk thread (KnightfallControl).
+            knightfall_code=self.knightfall_code,
+            knightfall_new_code=self.knightfall_new_code,
             calibrate_noise=self.calibrate_noise,
             enroll_speaker=self.enroll_speaker,
             train_wakeword=self.train_wakeword,

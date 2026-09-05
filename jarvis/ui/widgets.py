@@ -1,7 +1,8 @@
 """Canvas-drawn flat widgets for the Jarvis V3 UI.
 
 Primitives: round_rect / RoundedField, frame_rect (the holo thin frame),
-Card (slab | frame), RoundButton, Toggle (animated), Meter, Chip, Tooltip
+Card (slab | frame), RoundButton, Toggle (animated), Slider (thin track +
+round handle, with slider_snap/slider_format), Meter, Chip, Tooltip
 (timing ported from voice_input_gui.py 968-1009), Toast, ellipsize helper.
 All colors and fonts come from jarvis.ui.theme tokens ONLY — and are read at
 CALL time (never a def default or class-body dict), so theme.select_look()
@@ -12,6 +13,7 @@ parent the caller owns, so importing this file never requires a display.
 """
 from __future__ import annotations
 
+import math
 import tkinter as tk
 import tkinter.font as tkfont
 from typing import Callable, Optional
@@ -53,6 +55,23 @@ def get_scale() -> float:
 def px(v) -> int:
     """Design-unit pixels → device pixels at the global UI scale S."""
     return round(v * _SCALE[0])
+
+
+def canvas_size(c: tk.Canvas, w_min: int = 0, h_min: int = 0) -> tuple:
+    """A canvas' INTERIOR size in the coordinates its items are drawn in.
+
+    ``winfo_width()`` counts the highlight border on BOTH sides, and every
+    canvas here has one (the focus ring). Drawing to ``winfo_width() - k``
+    therefore aims k-1 px PAST the last visible column and the far edge is
+    clipped away -- MEASURED 2026-09-05 on the settings drawer: the holo
+    buttons' ring ended 1 px outside their own canvas while the toggles'
+    track ended 5 px inside theirs, which is the 6 px the control column
+    was out of true. An unmapped canvas reports 1, so the caller's own
+    requested size is the floor.
+    """
+    bd = 2 * (int(c.cget("highlightthickness") or 0) + int(c.cget("bd") or 0))
+    return (max(int(c.winfo_width()) - bd, w_min),
+            max(int(c.winfo_height()) - bd, h_min))
 
 
 def ui_font(size: int, weight: str = "normal") -> tuple:
@@ -629,8 +648,22 @@ class RoundButton(tk.Canvas):
 
     def _draw(self):
         self.delete("all")
-        w = max(self.winfo_width(), self._btn_w)
-        h = max(self.winfo_height(), self._btn_h)
+        # INTERIOR size: the ring used to be laid out on winfo_width(), so
+        # every button drew its right and bottom edge outside its own
+        # canvas and had them clipped (measured 09-05: the ink ended 1 px
+        # PAST the widget while a toggle's ended 5 px inside it).
+        #
+        # HOLO ONLY, and theme.LOOK is read HERE, at paint time. The fix
+        # moves every button and toggle in the tree by up to 2 px, and
+        # classic is frozen at jarvis-v3 4b7d373: MEASURED on the rig, the
+        # un-gated change cost classic 13,055 px in the settings-drawer
+        # crop and all 1,117 px of the chat header's drift. He asked for
+        # the sensors tab and the settings area, not for the other look.
+        if theme.LOOK == "holo":
+            w, h = canvas_size(self, self._btn_w, self._btn_h)
+        else:
+            w = max(self.winfo_width(), self._btn_w)
+            h = max(self.winfo_height(), self._btn_h)
         outline = self._spec.get("outline", "")
         if self._state == "disabled":
             fill, fg = ("" if outline else theme.RAISED), theme.FAINT
@@ -725,12 +758,216 @@ class Toggle(tk.Canvas):
         on_f = self._pos
         track = theme.CYAN_SOFT if on_f > 0.5 else theme.LINE
         knob = theme.CYAN if on_f > 0.5 else theme.MUTED
-        round_rect(self, px(1), px(3), self.W - px(2), self.H - px(4),
+        # The same inset the button's ring uses, so a toggle and a button
+        # in one control column share an ink edge (they were 6 px apart).
+        # HOLO ONLY (see RoundButton._draw): classic is frozen at v3, which
+        # ended the track at W - px(2).
+        if theme.LOOK == "holo":
+            inset = max(1, px(1))
+            x1 = self.W - inset - 1
+        else:
+            inset, x1 = px(1), self.W - px(2)
+        round_rect(self, inset, px(3), x1, self.H - px(4),
                    radius=(self.H - px(7)) / 2, fill=track, outline="")
         r = (self.H - px(10)) / 2
         cx = px(4) + r + on_f * (self.W - 2 * (px(4) + r))
         cy = self.H / 2 - 0.5
         self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=knob, outline="")
+
+
+# ------------------------------------------------------------------ Slider
+# The number rules live OUTSIDE the widget so the drawer's three rows can be
+# tested with no display at all (the split jarvis/ui/views.py already makes).
+def slider_decimals(res) -> int:
+    """How many decimals a step of `res` actually carries: 0.001 -> 3,
+    0.5 -> 1, 1 -> 0. A stock tk.Scale derives its own from `resolution`
+    and this reproduces it, so a look switch cannot change the digits."""
+    try:
+        step = abs(float(res))
+    except (TypeError, ValueError):
+        return 2
+    if not (step > 0.0) or step != step or step in (float("inf"),):
+        return 2
+    text = ("%.10f" % step).rstrip("0")
+    frac = text.split(".", 1)[1] if "." in text else ""
+    return min(6, len(frac))
+
+
+def slider_format(value, res) -> str:
+    """The value as the row prints it. Digits come from the RESOLUTION,
+    not from the value, so 0.30 does not collapse to 0.3 the moment the
+    handle lands on a round number."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v != v:                                   # NaN
+        v = 0.0
+    return "%.*f" % (slider_decimals(res), v)
+
+
+def slider_snap(value, lo: float, hi: float, res) -> float:
+    """Clamp into [lo, hi] and land on a whole step from `lo`.
+
+    Junk (a string, a NaN, None) lands on `lo` rather than raising: this
+    runs inside a drag and inside bind_config, and a settings row that
+    throws while he is dragging it is a settings row he cannot use.
+    """
+    lo, hi = float(lo), float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return lo
+    if v != v:                                   # NaN
+        return lo
+    v = max(lo, min(hi, v))
+    try:
+        step = abs(float(res))
+    except (TypeError, ValueError):
+        step = 0.0
+    if step > 0.0:
+        v = lo + math.floor((v - lo) / step + 0.5) * step
+        v = max(lo, min(hi, v))
+    return round(v, slider_decimals(res))
+
+
+class Slider(tk.Canvas):
+    """A thin track with a round handle -- the holo answer to tk.Scale.
+
+    WHY IT EXISTS. The settings drawer drew three stock Tk scales: a
+    grooved Motif trough, a slab knob and the value floated ABOVE the
+    widget, which is nothing like the toggles beside them and put the
+    number on its own line half over the label (photographed 09-05,
+    shot 14). This draws the same control in the console's own language --
+    1px track, round handle -- and the VALUE is a plain Label the row owns
+    (``self.label``), so it sits inline on the row's baseline.
+
+    The number rules are ``slider_snap`` / ``slider_format`` above, which
+    is where the tk.Scale semantics (from_/to/resolution) are reproduced.
+    ``command`` is called with the new float on a USER change only, never
+    from ``set()`` -- the same contract Toggle keeps.
+    """
+
+    LEN, H = 112, 20               # design units; instances scale by S
+    TRACK, KNOB = 1, 6             # track stroke, handle radius
+
+    def __init__(self, parent, lo=0.0, hi=1.0, res=0.01, value=None,
+                 command: Optional[Callable] = None, bg=None, length=None,
+                 label: bool = True):
+        bg = bg or parent.cget("bg")
+        self.lo, self.hi, self.res = float(lo), float(hi), res
+        self._len = px(length if length is not None else type(self).LEN)
+        self._h = px(type(self).H)
+        super().__init__(parent, width=self._len, height=self._h, bg=bg,
+                         highlightthickness=1, bd=0, takefocus=1,
+                         cursor="hand2")
+        _focus_ring(self, bg)
+        self.command = command
+        self._value = slider_snap(self.lo if value is None else value,
+                                  self.lo, self.hi, self.res)
+        self._hovered = False
+        # The readout is a LABEL, not painted into the canvas: it has to
+        # share the ROW's baseline with the label on the left, and a
+        # number drawn inside this widget could only ever share the
+        # track's. The row packs it; the widget keeps it in step.
+        self.label = None
+        if label:
+            self.label = tk.Label(parent, text=slider_format(self._value,
+                                                             self.res),
+                                  font=ui_mono(theme.SIZE_CAPTION),
+                                  fg=theme.MUTED, bg=bg, anchor="e")
+        self._draw()
+        self.bind("<Configure>", lambda e: self._draw(), add=True)
+        self.bind("<ButtonPress-1>", self._press, add=True)
+        self.bind("<B1-Motion>", self._drag, add=True)
+        self.bind("<Enter>", lambda e: self._hover(True), add=True)
+        self.bind("<Leave>", lambda e: self._hover(False), add=True)
+        self.bind("<Left>", lambda e: self._nudge(-1), add=True)
+        self.bind("<Right>", lambda e: self._nudge(1), add=True)
+        self.bind("<Up>", lambda e: self._nudge(1), add=True)
+        self.bind("<Down>", lambda e: self._nudge(-1), add=True)
+
+    # -------------------------------------------------------------- value
+    def get(self) -> float:
+        return self._value
+
+    def set(self, value, notify: bool = False) -> None:
+        snapped = slider_snap(value, self.lo, self.hi, self.res)
+        changed = snapped != self._value
+        self._value = snapped
+        self._sync_label()
+        self._draw()
+        if changed and notify and self.command:
+            try:
+                self.command(snapped)
+            except Exception:             # noqa: BLE001 - a caller's callback
+                log.exception("slider command failed")
+
+    def _sync_label(self) -> None:
+        if self.label is None:
+            return
+        try:
+            self.label.configure(text=slider_format(self._value, self.res))
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("slider label update failed", exc_info=True)
+
+    # ---------------------------------------------------------- geometry
+    def _span(self) -> tuple:
+        """(x0, x1) of the track: the handle's centre never leaves it, so
+        the knob cannot be half off the widget at either end."""
+        w = canvas_size(self, self._len)[0]
+        r = px(type(self).KNOB)
+        return r + 1, max(r + 2, w - r - 2)
+
+    def _fraction(self) -> float:
+        span = self.hi - self.lo
+        if not span:
+            return 0.0
+        return max(0.0, min(1.0, (self._value - self.lo) / span))
+
+    def _from_x(self, x: float) -> float:
+        x0, x1 = self._span()
+        frac = 0.0 if x1 <= x0 else (float(x) - x0) / (x1 - x0)
+        return self.lo + max(0.0, min(1.0, frac)) * (self.hi - self.lo)
+
+    # ------------------------------------------------------------- events
+    def _press(self, event):
+        self.focus_set()
+        self.set(self._from_x(event.x), notify=True)
+
+    def _drag(self, event):
+        self.set(self._from_x(event.x), notify=True)
+
+    def _nudge(self, steps: int):
+        try:
+            step = abs(float(self.res)) or (self.hi - self.lo) / 20.0
+        except (TypeError, ValueError):
+            step = (self.hi - self.lo) / 20.0
+        self.set(self._value + steps * step, notify=True)
+        return "break"
+
+    def _hover(self, on: bool):
+        self._hovered = bool(on)
+        self._draw()
+
+    # -------------------------------------------------------------- paint
+    def _draw(self):
+        self.delete("all")
+        x0, x1 = self._span()
+        # the INTERIOR centre: winfo_height() counts the focus ring on both
+        # sides, so a track laid out on it sits 2 px below the row's middle
+        y = canvas_size(self, self._len, self._h)[1] / 2
+        stroke = max(1, px(type(self).TRACK))
+        self.create_line(x0, y, x1, y, fill=theme.LINE, width=stroke)
+        cx = x0 + (x1 - x0) * self._fraction()
+        if cx > x0:
+            self.create_line(x0, y, cx, y, fill=theme.CYAN_DIM, width=stroke)
+        r = px(type(self).KNOB)
+        self.create_oval(cx - r, y - r, cx + r, y + r,
+                         fill=(theme.CYAN if self._hovered else theme.FOCAL),
+                         outline="")
 
 
 # ------------------------------------------------------------------- Meter

@@ -4330,3 +4330,435 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
   face baseline needs three detections in the last five seconds.
 * One hand. Two hands out at the lens is not this gesture, on purpose.
 * A question on the floor (a read-back waiting on your yes) blocks a grab.
+
+## 84. Knightfall: the two ways back in when he will not admit you
+
+The owner gate (`owner.mode`) decides whether a turn is answered and in
+whose name. **Enforcement is still `shadow`** — in shadow the gate logs the
+verdict it *would* have given and refuses nobody. Knightfall is the pair of
+doors that work even when the voice check will not open: **a phrase you
+say**, and **a code you type**.
+
+Both open the same thing: a **five-minute window** in which turns are
+attributed to you. Read that plainly — the window admits the *room*, not
+your voice. Anyone speaking during those five minutes is taken for you.
+That is the deliberate trade the gate was built with (`jarvis/gate.py`,
+GRANT_S = 300 s); the code does not shorten it, it only adds a second way
+to open it.
+
+**One thing in shadow did change, on 2026-09-05, and it is the thing that
+makes the feature work at all in the mode you actually run.** The clip that
+gets thrown away is thrown away by the *speaker filter*, which is not the
+gate and does not care what mode the gate is in. Until this fix, a window
+you had opened by hand was honoured only under `enforce`: in shadow you said
+the phrase, heard "I'm listening", and your very next sentence was dropped
+exactly as the one before it had been — measured, nothing dispatched at all.
+Now an open window takes those clips in shadow too. The gate still does not
+start answering on its *own* judgement in shadow — a face it recognises
+still only writes "would have" to the log. The difference is that a window
+is not its judgement, it is your instruction.
+
+### Setting them (you type these; nothing else can)
+
+```bash
+cd ~/Jarvis
+~/vss_env/bin/python scripts/jarvis_people.py set-phrase hunter
+~/vss_env/bin/python scripts/jarvis_people.py set-code hunter
+```
+
+Each prompts twice, never echoes, and never takes the secret from the
+command line (`ps` would show it to the whole machine). The label is
+optional — leave it out and it uses the configured owner. Both refuse
+anyone who is not an owner, and both refuse to run from anything but a
+keyboard.
+
+* `set-phrase` is the **spoken** way in. At least 12 letters and digits once
+  punctuation is dropped; "Knightfall protocol" is 19, so it passes. What is
+  stored is the *normalised* form (lower case, no punctuation), because
+  Whisper capitalises and punctuates as it pleases.
+* `set-code` is the **typed** break-glass, at least 6 characters. It is never
+  accepted over the microphone, so it cannot be overheard or replayed.
+  Surrounding spaces are dropped at both ends now, so a stray keystroke at
+  the prompt cannot make a code you can never type again.
+
+Neither is stored: both are salted-hashed (scrypt), and nothing in this
+repository can read either back.
+
+### Saying it
+
+Say the phrase **on its own**, or straight after the wake word — "Jarvis,
+Knightfall protocol". Both are consumed. A phrase buried in the middle of a
+longer sentence is *not*: matching every span of every sentence would cost a
+key derivation each (~18 ms), on every turn, and that is a price ordinary
+talking should not pay.
+
+When it matches, the turn ends there: he says "Thank you, sir. I'm
+listening.", re-opens the microphone, and **dispatches nothing** — no
+command, no model, no transcript. The log line names who and which path.
+This works with `owner.mode` set to `off`, `shadow` or `enforce`.
+
+**With the gate `off` he says "Thank you, sir." instead**, and the shorter
+line is the honest one: `off` is the single mode that opens no window (there
+is nothing to admit you past), so the speaker filter goes on dropping your
+clips and "I'm listening" would have been a promise the code does not keep.
+The two lines are deliberately different so that you, who know what they
+mean, can hear which mode you are in; neither names the phrase, the mode, or
+the fact that anything was recognised, because both are said out loud in a
+room that may hold whoever was just refused.
+
+**Where the words go.** On a turn the phrase matches, they go nowhere: not
+the log, not the bus, not the transcript pane, not the history, not the
+model. That claim used to be false in the place it mattered most — the
+decode wrote `Transcribed: '<your phrase>'` to `jarvis.log` at INFO before
+the gate had seen a syllable, on the ordinary path where the speaker filter
+*recognises* you, and the ghost card left the words legible on screen after
+the log line had been carefully redacted in front of them. Both were
+measured on 2026-09-05 and both are closed: while any owner has a phrase
+set, every clip is decoded quietly and the words are written down only
+*after* the gate has said they were not the phrase. The cost is small and
+worth naming: an ordinary sentence's `Transcribed:` line now appears a
+moment later in the log than it used to, and a clip sent from your phone
+over the intercom does not get one at all (nothing on that path can rule the
+words are not the phrase). The numbers — `avg_logprob`, the rejections, the
+speaker scores — are untouched everywhere.
+
+Five wrong phrase-shaped guesses in five minutes close the phrase until the
+window passes. **Your own sentences never count against that — but only
+yours.** Until 2026-09-05 the exemption was given to *anybody the gate could
+name*, so a known guest in front of the lens turned the limiter off
+completely: 40 phrase-shaped guesses cost 40 key derivations with a known
+face in view, against 5 with nobody named. It is now bound to the owner.
+
+### Typing it
+
+Settings → Privacy → **Knightfall code**: a masked box and **Open**. The box
+is cleared the moment you press it, before anything else happens. The line
+that comes back is the only answer, and it never contains a code.
+
+Using the code **rotates** it. A fresh eight-character code (no `0`/`o`,
+no `1`/`l`) is mailed to your first configured mail account, from that same
+account, subject "Knightfall" — and only when the mail server hands back a
+Message-ID is the new one stored. So:
+
+* mail sent → the new code is live, the old one is dead, and it is in your
+  inbox;
+* mail refused, no account configured, no Message-ID → **the old code stays
+  valid** and the line says so. There is never a moment with no working
+  code.
+
+**Email me a new Knightfall code** does the same thing without typing
+anything — that is how you get the first one — and it answers at most once a
+minute. A press that mailed nothing does not start that minute.
+
+The typed code is a way back in, not a wall: anybody already at this
+keyboard can edit or delete `people.json`, which turns the gate off
+entirely. It is written down here so it is not mistaken for security.
+
+### If it does not work
+
+* `grep knightfall /tmp/vss_voice/jarvis.log` — the lines carry who and
+  which path (`the phrase opened the floor to …`, `the code opened the
+  floor to …`) and never the words.
+* Phrase not heard? The spoken form has to match the stored one exactly
+  once punctuation and case are dropped. Set it again — `set-phrase`
+  overwrite is the only cure, since nothing can read the old one back.
+* No mail? `mail_accounts` reads `gmail.accounts` from
+  `~/.config/jarvis/assistant.json`; with none configured the button says so
+  and changes nothing.
+
+## 85. "Um" buys you time (the filler hold)
+
+He used to close the mic 0.8 s after your last sound (`endpoint_silence`),
+so a thinking pause after "set a timer for, um…" ended the capture
+mid-sentence and he acted on half a command. Now the live preview — the
+ghost card that types while you speak — reports its newest decode to the
+recorder, and when that decode **ends on a filler** (um, uh, hmm, er…) and
+nothing has been heard since, the stop waits longer. That extra wait is a
+*hold*. All four settings live in jarvis/config.py (`Config`), not in
+assistant.json:
+
+| setting | default | what it does |
+|---|---|---|
+| `filler_hold` | `true` | the feature; `false` is the old 0.8 s stop |
+| `filler_hold_s` | `1.5` | how much longer a pause after an um may last — 0.8 + 1.5 = 2.3 s |
+| `filler_max_holds` | `3` | holds per capture; after that the ordinary stop, so an "um… um… um…" cannot hold the mic forever |
+| `filler_prompt_hint` | `false` | adds "Um, uh, hmm, er." to the *preview's* Whisper prompt so it writes fillers down instead of dropping them. **Unmeasured — ships off; the probe below decides.** |
+
+The hint never reaches the final transcription: your commands stay clean
+of ums whatever the preview saw. And the preview's own prompt-echo gate
+judges the text against the *hinted* prompt, so if Whisper ever runs away
+and simply reads "Um, uh, hmm, er." back at you, the ghost card stays
+blank and no hold is bought on it. That gate needs a phrase repeated three
+times before it will call it an echo — the right floor for *your* words,
+since "yes yes" is a man being emphatic — so the hint gets a second,
+narrower gate of its own: the hint is a string Jarvis put in the prompt,
+not something you said, so **one** whole read-back of it is enough to
+blank the card. It fires only on whole repeats of that exact string, so a
+real "…um" is never touched. (Before 09-05 a one- or two-fold runaway got
+through, showed you four words you never said, and — because it ends on
+"er" — bought a 1.5 s hold on it.)
+
+What the log shows: `filler hold 1/3: 'um' at 3.2s, waiting 1.5s` once
+per hold, and the turn line ends `(stop=vad holds=1)` on a turn where one
+fired (the same field is in turns.jsonl), so a week of turns can say how
+often it happened without anyone reading a transcript. **`holds=N` counts
+holds that actually delayed a stop** — nothing else. A hold is counted on
+the tick it postpones the stop, once per pause, and it stays counted on
+the tick it expires; a poll tick that arrives so late the pause is already
+past 0.8 + 1.5 s stops immediately and records no hold, because it waited
+for nothing. (Before 09-05 it counted those too, which made the number an
+upper bound instead of a count.)
+
+The other bound: a preview decode is only allowed to claim the um was the
+last thing heard if its span sits inside the audio the endpointer has
+itself heard — no more than 0.6 s either side of the last speech mark.
+
+And every decode is **stamped with the capture it came from**. A decode
+takes a few hundred milliseconds, so the capture it started in can end and
+the next one open before it returns; that decode carries the old capture's
+words and the old capture's position, and the recorder throws it away
+rather than letting it hold the new capture's first pause. Before 09-05 it
+did not, and a short previous capture landed squarely inside both bounds
+above — measured, a capture in which you had said no filler at all logged
+`filler hold 1/3: 'um' at 1.0s`. The stamp is required, with no "trust me"
+default: a note that is not this capture's is dropped.
+
+**The limit, stated plainly.** The preview re-decodes every 0.9 s and the
+stop is due at 0.8 s, so an um said right after the last preview may never
+be decoded before the stop is due — he does not decode it at that moment
+(that would add a decode to every turn); he stops as before. How often
+that race is lost is a number nobody has yet, and the only place to get
+it is a microphone:
+
+```bash
+~/vss_env/bin/python scripts/filler_probe.py            # 4 takes: hint off, on, off, on
+~/vss_env/bin/python scripts/filler_probe.py --show     # also print each transcript's words
+```
+
+Run it with Jarvis stopped (a live Jarvis would answer what you say to
+it). Before each take it tells you what to say; after each it prints the
+fillers the preview saw and when, the last speech second, the gap that
+ended the capture, holds fired, whether the tail was ever decoded, and the
+transcript's *length* — then asks whether you were cut off. It never
+saves audio and never prints the words unless you pass `--show`. Paste
+back the four summary lines at the end; they settle `filler_hold_s`,
+`filler_prompt_hint`, and whether the race above is worth fixing.
+
+**Reading the hint-ON takes.** With `filler_prompt_hint` on, a take that
+was nothing but stutter ("um um um") can end up with *fewer* holds, not
+more: the prompt-echo gate sees a preview made only of prompt words and
+blanks it, and a blank preview has no trailing filler to hold on. So a
+hint-ON take showing `holds 0` is not evidence the hint failed to help —
+it may be evidence you stuttered cleanly enough to look like an echo. The
+takes worth comparing are the ones with real words around the um, which is
+what the instruction before each take asks you for.
+
+## 86. The brain: how much room he gets to remember in
+
+Everything the local model is *given* now lives in one place you can edit,
+under `brain` in `~/.config/jarvis/assistant.json`. It used to be four
+numbers buried in the code. A value that makes no sense is logged and
+replaced with the default rather than obeyed.
+
+**How these six keys got into your live file, and why that cannot happen
+again.** They are in your `assistant.json` because on 2026-09-04 at 15:08
+an *agent's* `import jarvis.brain` rewrote it — not Jarvis. Two things
+allowed that: importing the brain read the config, and reading the config
+saved it back whenever the defaults had gained a key. Both are closed.
+Loading the config **never writes** now — a missing file, a corrupt file,
+a loose mode or new default keys are only noted and logged. The one write
+is `ensure_defaults()`, which only the running app calls, once, at
+startup (it creates the file, moves a corrupt one to `.bad`, tightens the
+mode, fills in new keys — exactly what loading used to do, in the one
+process that owns the file). And importing the brain reads nothing: the
+app hands its already-loaded config over, and anything else gets a
+read-only load the first time it actually needs a setting. A test imports
+every one of the 152 jarvis modules against a stale, loose config and
+checks the bytes, the mtime and the mode did not move (measured on the
+old code: the same walk grew a 38-byte file to 12,632 bytes in 2 s).
+
+```json
+"brain": {
+  "num_ctx": 16384,
+  "num_predict": 160,
+  "temperature": 0.7,
+  "think": false,
+  "answer_reserve_tokens": 128,
+  "protect_question": true
+}
+```
+
+**First, what the window was and was not.** The 09-04 change was sold as
+"room to think". It is not: thinking is the `think` switch below, and it
+is off. What the window holds is what he is *told* — and the truncation
+it was meant to cure was rare: counted over a week of his log, **1 prompt
+in 5,328 was truncated** (a count from the 09-04 review, not re-measured
+since). Doubling the window buys room to *remember* — a long calendar and
+a long inbox in the same turn, more of the conversation — and it was the
+guard further down, not the size, that fixed the one turn that went wrong.
+
+**`num_ctx` — how much he can hold in his head at once.**
+Everything he sees on a turn shares this: the tool descriptions, his
+persona, what he remembers about you, the last few exchanges, your
+question, and whatever the tools came back with. 16384 is double what he
+had. Costs **0.19 GB of memory** and about **11 milliseconds a turn** —
+both measured, not guessed. It does *not* make his answers longer or
+cleverer. Raising it further is untested: 16384 is the biggest window
+anyone actually watched load on this box, so above that he logs a warning
+and you should watch memory. Below 2048 or above 262144 he ignores you and
+uses 16384.
+
+**`num_predict` — how much he may *generate* in one round.**
+160 tokens. This is **not** how long he speaks. What he says aloud is
+clamped separately, after the model has answered, to four sentences and
+about 450 characters (`MAX_SPOKEN_SENTENCES` / `MAX_SPOKEN_CHARS` in
+`jarvis/brain.py`), and that clamp cuts at a sentence end. This budget
+covers everything the model writes in a round — the reply text *and* the
+JSON of any tool call it makes (and its reasoning, only if `think` is on)
+— and when it binds, it cuts mid-word. His real replies come back at 8-28
+tokens, so 160 has never once stopped him; a tool call with long
+arguments is what would hit it first. Raising it makes long answers
+*possible*, not *likely*.
+
+**`temperature` — how much his wording varies.**
+0.7. Lower is steadier and flatter; higher is livelier and less
+predictable. Cheap to try, instantly reversible.
+
+**`think` — whether he reasons to himself before answering. Leave it off.**
+It was measured on 2026-09-04 and it does not work on this model yet: his
+reasoning is charged to the same `num_predict` budget as his reply, so at
+160 he spent the whole thing thinking and said **nothing at all, six times
+out of six**. Given far more room, 6 of 10 were still empty and the ones
+that finished took 11 to 33 seconds against his usual 1.3. If you turn it
+on he warns you in the log and tells you what your `num_predict` is.
+
+**`answer_reserve_tokens` — headroom kept clear for the reply.** 128.
+You will not need to touch this: since round 3 it is not the only margin.
+The guard works from an *estimate*, and the estimate has a measured error
+— the static prefix was estimated at 3,556 tokens and Ollama counted 3,761,
+5.8% low, which at the old 16,096 ceiling was ~930 tokens against a
+288-token margin (160 + 128). So two more things now sit between the
+estimate and the window: a **calibration factor** the estimate is
+multiplied by, starting at the measured **1.06** and learning from every
+round (below), and a fixed **4% of the window** (655 tokens) taken off the
+ceiling. The arithmetic at the shipped settings: 16384 − 160 − 128 − 655 =
+**15441** is the ceiling; a calibrated estimate passes at a raw estimate of
+at most 14,566; even if the real cost ran 10% above that (16,022 — worse
+than anything measured) the 160-token reply still fits under 16,384.
+
+**`protect_question` — the safety catch. Leave it on.**
+When a turn gets big — a long calendar plus a long email — something has
+to give. Ollama's own way of giving is to delete the *oldest* messages,
+and the oldest message is **your question**. Measured: a 9000-character
+calendar result took his prompt from 8253 tokens down to 7754, and the
+499 tokens that vanished were your question, the background and his
+memory. He then answers something confident and unrelated, and nothing
+anywhere says why. With this on he cuts the *tail of the largest tool
+result* instead — a long calendar loses its evening, not its morning —
+marks the cut in the result so the model knows it is reading part of it
+(the "you may take up to N sentences" note a list-shaped result carries at
+its end is lifted off and put back, so a cut calendar is still read out in
+full sentences), keeps your question, and writes a line in the log saying
+he did it. If the next round overflows again — the mail arrives after the
+calendar — the same result is **cut again**, its marker lifted and put
+back once, rather than the newest result being thrown away (round 3 as
+first shipped had a once-only rule, and on the round after a cut it
+dropped the newest result whole while hundreds of trimmable tokens sat
+in the cut one; the review measured it). A result is never cut below
+**400 characters**: when the largest cannot absorb the whole overflow
+above that floor, every result goes down toward its floor in turn so each
+tool keeps its head — unless even the floors would not fit, in which case
+a drop is unavoidable and he takes it *first*, oldest result first, so the
+newest (the one the model just asked for) is sent whole rather than cut
+to its floor and then thrown away anyway. Round 2 dropped whole every
+time, which for the one result a turn hinged on meant he answered "an
+earlier result was dropped, sir" instead of reading you the morning. What
+the model then sees of a cut result is also what his own checks judge the
+reply against, not the full text it never had.
+
+It guards **every** request he makes to the model, not only the tool
+loop: the spoken summaries, the router's tie-breaker, "explain this
+document", the quizzes, the syllabus reader, the Sunday memory garden,
+both warm-ups — and the screen tool's vision question (`[screen]` in the
+log), which used to post on its own. Those have no tool result to cut, so
+there he cuts the *tail of the material* — the end of the document or
+digest, or the question — and marks the cut, because the instruction in
+front of it is what Ollama would have eaten first. A screenshot is costed
+as a fixed allowance of 1,024 tokens, never as its base64, so an image
+cannot trim the question — and that allowance is charged on the path the
+screen tool actually takes (round 3 as first shipped charged it there at
+zero; measured: the walk put a screen question at 1,122 tokens, the guard
+at 116). A round that carries an image **never feeds the calibration**
+below: whether Ollama's count includes the image, and at what price, is
+not measured here, so its ratio says nothing about the text rate the
+factor tracks. Before that rule, one screenshot question pinned the factor
+at its 2.0 cap and halved the tool loop's trim threshold for the next
+seven rounds.
+
+### How he knows a prompt is too big
+
+He estimates before he sends, with **two rates**: 4.1 characters a token
+for prose and tool descriptions, and **2.25** for tool results — measured
+on the 09-04 calendar turn, where 9,000 characters of calendar cost 3,993
+tokens. Costed at 4.1 alone the estimate ran low by up to 1.8x, and on
+that exact turn the guard would have slept. The estimate costs 0.055 ms a
+round (measured), i.e. nothing.
+
+Then he logs what it *really* cost, from Ollama's own reply, on every
+path:
+
+```
+ctx: prompt 4265/16384 tokens (26%), answer 22/160 (estimated 4310, raw 4066 x1.060) [chat]
+ctx-calibration: 1.060 -> 1.079 (Ollama counted 4265 against an estimate of 4066 [chat])
+ctx: prompt 1900/16384 tokens (12%), answer 30/160 (estimated 1202, raw 1134 x1.060) (1 image at 1024) [screen]
+ctx-calibration: unchanged at 1.060 -- 1 image in the prompt, costed at the 1024-token allowance (...)
+```
+
+The tag at the end names the path — `chat` (the tool loop), `persona`
+(summaries), `route` (the tie-breaker), `json` (documents, quizzes, the
+garden), `warm` and `rewarm` (the warm-ups), `screen` (the vision
+question). Three numbers sit side by side: what Ollama counted, the
+calibrated estimate the guard compared, and the raw estimate with the
+factor it was multiplied by. The second line is the **calibration**: the
+measured-over-raw ratio of that round moves the factor half-way toward
+itself, and the *next* round's guard uses the new factor. It can only make
+him more careful than the measured 1.06 baseline, never less (a count
+below half the estimate is ignored as not a whole-prompt count, and so is
+any round that carried an image), and it is capped at 2.0. Above 90% of
+the window the `ctx:` line becomes a warning. The `warm` line is special: the warm-up sends the static prefix
+and nothing else, so its prompt number **is** the true cost of the
+persona plus the tool schemas.
+
+### Two things to know
+
+**A change here does nothing until Jarvis restarts.** That is deliberate,
+not a missing feature. Ollama keys the loaded model on `num_ctx`, so
+asking for a different one mid-run makes the 25-billion-parameter model
+reload — nearly nine seconds — and on the live server three of four
+attempts to do that hung outright. So the settings are read once, when he
+starts, and are identical on every request until he restarts.
+
+**He tells you what he is running on.** In `/tmp/vss_voice/jarvis.log`,
+one line at startup:
+
+```
+brain: window 16384 tokens, generation per round capped at 160 (reply text
+plus tool calls; speech is clamped separately), temperature 0.7, thinking
+off (assistant.json brain.*; a change needs a restart). Static prefix
+~3556 tokens (persona ~1462 + 28 tool schemas ~2094), 128 reserved ->
+~12540 tokens left for his question, memory, history and tool results.
+Question guard on (trims a round above ~15441 calibrated tokens: 4% of
+the window kept as estimate margin, estimate x1.060 from the last
+measured round).
+```
+
+None of this was visible before.
+
+### Verifying after a restart
+
+```bash
+ollama ps                                          # CONTEXT should read 16384
+grep "brain: window" /tmp/vss_voice/jarvis.log | tail -1
+grep "ctx: prompt" /tmp/vss_voice/jarvis.log | tail -5   # estimate vs real
+```
+If the model will not load at all, put `num_ctx` back to 8192 and restart.

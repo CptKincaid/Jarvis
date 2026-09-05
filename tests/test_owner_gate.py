@@ -329,15 +329,23 @@ def test_a_near_miss_is_indistinguishable_from_an_unrelated_sentence(
 
 
 def test_the_key_derivation_stays_off_the_turn_budget(tmp_path):
-    """It runs only when recognition already failed AND the words were
-    phrase-shaped. An ordinary refused sentence must not pay 20 ms."""
+    """The pre-filter is unchanged: a short sentence ("no") never pays.
+
+    CHANGED 2026-09-04 (Knightfall): the phrase is now consumed in every
+    mode, whether or not the voice was recognised -- so a RECOGNISED
+    owner's phrase-shaped sentence pays one derivation too (~20 ms, the
+    measured cost, tests/test_knightfall_kdf_cost.py). What it must never
+    pay is an ATTEMPT: his own sentences do not count against the
+    limiter, or the sixth one would close the phrase for the window."""
     g = _gate(tmp_path, phrase=True)
     g.judge("voice", "no", stats=MATCHED, rejected=True)
     assert g.kdf_calls == 0
     g.judge("voice", "xxx not a real phrase yyy", stats=MATCHED, rejected=True)
     assert g.kdf_calls == 1
     g.judge("voice", "what time is it", stats=MATCHED)   # he was recognised
-    assert g.kdf_calls == 1
+    assert g.kdf_calls == 2
+    assert g.phrase_attempts.allow()[0] is True
+    assert len(g.phrase_attempts._hits) == 1, "only the stranger's counted"
 
 
 def test_the_passphrase_limit_is_a_cool_off_with_a_stated_number(tmp_path):

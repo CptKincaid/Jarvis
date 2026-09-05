@@ -485,6 +485,13 @@ class Services:
     # badge reads state() off the same 5 s pass room_state uses. Optional,
     # so a stand-in Services in the tests simply has no badge to update.
     sensing: Optional[Any] = None
+    # Knightfall (2026-09-04): the TYPED way back in, in the drawer's
+    # Privacy section. knightfall_code(code) takes what was typed and
+    # answers with ONE LINE to toast -- never a code; knightfall_new_code()
+    # mails a fresh one when there is none to type yet. Optional, so a
+    # stand-in Services simply has no row that works.
+    knightfall_code: Optional[Callable] = None
+    knightfall_new_code: Optional[Callable] = None
     # Alt+F4 / WM close on the Board. The app owns the BoardFeed (a 5 s poll
     # that spawns nvidia-smi and walks tmux), so only the app can stop it —
     # without this seam a WM close withdrew the window and left that thread

@@ -38,6 +38,38 @@ SPEECH_ON = 0.5                 # probability above which a chunk is speech
 SPEECH_OFF = 0.35               # ...and below which it is not (hysteresis)
 MIN_SPEECH_CHUNKS = 4           # ~130 ms of speech before "speech started"
 
+# Filler sounds that mean "still thinking". Pure fillers ONLY -- never
+# common words like "like", "so", "well", which end real sentences. The one
+# list: jarvis.commander imports this name (it owned a copy nothing read).
+# Read by trailing_filler() below, which the recorder's filler hold uses to
+# decide that the newest partial decode ended on one of these.
+FILLER_WORDS = frozenset({
+    "uh", "um", "uhh", "umm", "hmm", "hm", "er", "ah", "ehh", "eh",
+    "erm", "uhhh", "ummm",
+})
+# What whisper hangs on a filler: "um," "uh..." "Hmm?" "um -" (the dash and
+# the dots can also arrive as their own token, which is why the loop below
+# skips a token that strips to nothing).
+_EDGE_PUNCT = ".,;:!?…-—–'\"()[]"
+
+
+def trailing_filler(text) -> str:
+    """The last word of ``text`` when it is a filler, else ''.
+
+    Punctuation and case are stripped from the edges of the token, so
+    'um,' 'uh...' and 'Hmm?' all count; a final token that is ONLY
+    punctuation ('for um ...') is skipped so the word before it is judged.
+    Interior punctuation is kept: 'uh-huh' is an answer, not a filler.
+    """
+    if not text:
+        return ""
+    for tok in reversed(str(text).split()):
+        word = tok.strip(_EDGE_PUNCT).lower()
+        if not word:
+            continue
+        return word if word in FILLER_WORDS else ""
+    return ""
+
 
 class _Resampler:
     """native rate -> 16 kHz by polyphase, continuous across calls.

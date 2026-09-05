@@ -24,6 +24,23 @@ local_line, the warm-up) uses that same prefix and the same num_ctx: a
 different prefix would evict the cache, a different num_ctx would make
 Ollama reload the model.
 
+What the model is GIVEN -- the window, the per-round generation budget,
+the temperature, whether it reasons, and the guard that keeps his question
+in the window -- is his to tune in ``~/.config/jarvis/assistant.json``
+under ``brain``. It is read ONCE per process into SETTINGS -- handed over
+by the app from the config it already loaded (configure(config=...)), or
+on first use for anything else; never at import, because an import must
+not read his config, let alone write it (see the block by ModelSettings
+for why once and not per request) -- and a change needs a restart.
+The settings actually in force, and the room they leave for the
+answer, are logged in one line the first time the prompt is built:
+log_settings(). Every /api/chat request this module makes -- the tool
+loop (streamed or not), the persona helpers, the router tie-breaker, the
+JSON helpers and both warm-ups -- goes through the guard before it is sent
+(fit_prompt / fit_material) and logs Ollama's own prompt_eval_count after
+(_log_round_tokens), so the estimate can be checked against the real
+number on every path, not one.
+
 Persona (film JARVIS): VOICE_RULES is the single description of the voice
 and is shared by all three prompts; FEW_SHOT_PINNED (you there / thanks /
 good night) is always shown; FEW_SHOT_POOL holds one or two variants for
@@ -45,6 +62,8 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import dataclasses
+from dataclasses import dataclass
 from pathlib import Path
 
 from jarvis import address as address_mod
@@ -54,7 +73,7 @@ from jarvis.config import MACHINE
 from jarvis.events import BrainState, Status, bus
 from jarvis.logs import get_logger
 from jarvis.router import is_question
-from jarvis.tools.registry import ToolResult
+from jarvis.tools.registry import CHARS_PER_TOKEN, ToolResult
 from jarvis.tts import TTS as _TTS
 
 log = get_logger("brain")
@@ -103,13 +122,235 @@ TURN_WORK_BUDGET_S = CHAT_WALL_BUDGET_S - RENDER_RESERVE_S
 # on a third of the bench's router questions. 5 s keeps the
 # tie-breaker useful; the router only asks when its rules are torn.
 CLASSIFY_TIMEOUT_S = 5.0
-NUM_CTX = 8192                 # identical on EVERY request (see module doc)
-# Sampling options for Tier 2 (num_predict caps a two-sentence reply; the
-# stop strings end a run-on transcript before the model writes Hunter's
-# next line for him).
-CHAT_OPTIONS = {"num_ctx": NUM_CTX, "temperature": 0.7, "num_predict": 160,
-                "stop": ["\nUser:", "\nHunter:"]}
-OLLAMA_OPTIONS = CHAT_OPTIONS  # legacy name
+
+# ----------------------------------------------------------------------
+# Model settings (assistant.json ``brain.*``)
+# ----------------------------------------------------------------------
+# THE ONE-VALUE INVARIANT, and it is why this is not a per-request option.
+# Ollama keys its loaded runner on num_ctx: a request that asks for a
+# different one makes the 25 B model RELOAD (measured 8.838 s on this box)
+# and throws the prefix cache away with it, so a num_ctx that varied per
+# turn would cost him a reload a turn. Three of four attempts to change it
+# on the LIVE server hung indefinitely instead.
+#
+# So the config is read ONCE per process into SETTINGS (on first use, or
+# handed in by the app -- never at import); NUM_CTX is that one
+# value; and every request this module makes (chat, classify_route,
+# summarize, local_line, the JSON helpers, the warm-up) and every request
+# jarvis/tools/screen.py makes alongside it sends exactly that number.
+# _options() re-asserts it over any caller's override, so a caller cannot
+# reach past it. Changing brain.num_ctx in assistant.json therefore needs a
+# Jarvis RESTART -- by design, not by omission.
+# tests/test_brain_room.py proves both halves: one value on every request,
+# and a config edited after import changing nothing.
+@dataclass(frozen=True)
+class ModelSettings:
+    """What the local model is given, in force for the life of the process."""
+    num_ctx: int = 16384            # the whole window, in tokens
+    # num_predict is the cap on what the model may GENERATE in one round:
+    # its reply text, any tool-call JSON, and (only if think is on) its
+    # reasoning. It is NOT the cap on what is SPOKEN -- speech is clamped
+    # after the fact by MAX_SPOKEN_SENTENCES / MAX_SPOKEN_CHARS /
+    # HARD_SPOKEN_CHARS further down this module, and a reply this budget
+    # cuts off is cut mid-sentence, not trimmed to a sentence end. Real
+    # replies come back at 8-28 tokens, so at 160 it has not yet bound.
+    num_predict: int = 160          # generation budget per round, in tokens
+    temperature: float = 0.7
+    think: bool = False             # model-side reasoning (measured off)
+    answer_reserve_tokens: int = 128
+    protect_question: bool = True   # the guard in fit_prompt()
+
+    def ceiling_for(self, num_predict=None) -> int:
+        """CALIBRATED prompt tokens a request may use before the guard trims.
+
+        Below the window by the round's own generation budget, the reserve,
+        AND an estimate-error margin of ESTIMATE_MARGIN of the window: a
+        prompt that fills the window leaves nothing to answer WITH, and
+        Ollama accepts it anyway -- measured 2026-09-04, an 8175-token
+        prompt accepted with num_predict 160 at num_ctx 8192, i.e. 17
+        tokens of room for a 160-token reply. The margin is there because
+        the guard compares an ESTIMATE: at 16384 the reserve alone (160 +
+        128 = 288) was smaller than the estimate's own measured error (the
+        static prefix estimated 3556, counted 3761, 5.8% low -- ~930 tokens
+        at the old 16096 ceiling). The arithmetic at the shipped settings:
+        16384 - 160 - 128 - 655 (4%) = 15441 ceiling; a calibrated estimate
+        (raw x 1.06) passes at raw <= 14566; even a real cost 10% above raw
+        (16022, worse than anything measured) plus the 160-token reply is
+        16182 < 16384. ``num_predict`` is the request's own override (a
+        warm-up asks for 1, explain_text for 420); None means the
+        configured one."""
+        predict = self.num_predict if num_predict is None else num_predict
+        try:
+            predict = int(predict)
+        except (TypeError, ValueError):
+            predict = self.num_predict
+        window = int(self.num_ctx)
+        return max(1024, window - predict - int(self.answer_reserve_tokens)
+                   - int(window * ESTIMATE_MARGIN))
+
+    @property
+    def prompt_ceiling(self) -> int:
+        """ceiling_for() at the configured num_predict: the tool loop's."""
+        return self.ceiling_for(None)
+
+
+# The guard's estimate-error margin, as a fraction of the window, taken off
+# the ceiling on top of answer_reserve_tokens (see ceiling_for for the
+# arithmetic). 4% of 16384 is 655 tokens: the whole of the measured 5.8%
+# under-estimate of the static prefix is covered by the calibration factor
+# below (CALIBRATION_INITIAL), and this margin covers the same error again
+# on the part of the prompt no round has calibrated yet.
+ESTIMATE_MARGIN = 0.04
+
+# Bounds are sanity rails, not opinions: outside them the default is used
+# and the reason is logged, because a typo in his config must not put this
+# box back in the state that needed a hard power-off on 2026-08-28.
+_CTX_MEASURED_SAFE = 16384      # the largest context anyone watched load
+_MODEL_MAX_CTX = 262144         # gemma4:26b's own advertised context length
+
+
+def _cfg_number(cfg, key, default, lo, hi, cast):
+    raw = default if cfg is None else cfg.get("brain." + key, default)
+    try:
+        value = cast(raw)
+    except (TypeError, ValueError):
+        log.warning("brain.%s is %r, which is not a number; using %r",
+                    key, raw, default)
+        return default
+    if not lo <= value <= hi:
+        log.warning("brain.%s is %r, outside the safe range %r-%r; using %r",
+                    key, value, lo, hi, default)
+        return default
+    return value
+
+
+def _cfg_bool(cfg, key, default):
+    raw = default if cfg is None else cfg.get("brain." + key, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str) and raw.strip().lower() in {
+            "1", "true", "yes", "on", "0", "false", "no", "off"}:
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    log.warning("brain.%s is %r, which is not true or false; using %r",
+                key, raw, default)
+    return default
+
+
+def model_settings(cfg=None) -> ModelSettings:
+    """Build ModelSettings from an AssistantConfig. Never raises: a missing
+    key, a typo or a number outside the rails logs and falls back to the
+    default, because the brain has to start either way.
+
+    Pure apart from those log lines, so a test can hand it a fake config;
+    the PROCESS-WIDE value is SETTINGS, built once by _build_settings()
+    (on first use, or from the app's own config via configure()) and
+    never rebuilt. With cfg None it READS the config -- AssistantConfig.load()
+    is a read since 2026-09-04 and cannot write the file back.
+    """
+    if cfg is None:
+        try:
+            from jarvis.assistant_config import AssistantConfig
+            cfg = AssistantConfig.load()
+        except Exception:
+            log.exception("brain: assistant config unreadable; using the "
+                          "built-in model settings")
+            cfg = None
+    d = ModelSettings()
+    got = ModelSettings(
+        num_ctx=_cfg_number(cfg, "num_ctx", d.num_ctx,
+                            2048, _MODEL_MAX_CTX, int),
+        num_predict=_cfg_number(cfg, "num_predict", d.num_predict,
+                                16, 8192, int),
+        temperature=_cfg_number(cfg, "temperature", d.temperature,
+                                0.0, 2.0, float),
+        think=_cfg_bool(cfg, "think", d.think),
+        answer_reserve_tokens=_cfg_number(
+            cfg, "answer_reserve_tokens", d.answer_reserve_tokens,
+            0, 4096, int),
+        protect_question=_cfg_bool(cfg, "protect_question",
+                                   d.protect_question),
+    )
+    if got.num_ctx > _CTX_MEASURED_SAFE:
+        log.warning("brain.num_ctx is %d, above the %d that was actually "
+                    "watched loading on this box; watch MemAvailable, and "
+                    "check `ollama ps` says CONTEXT %d after the restart",
+                    got.num_ctx, _CTX_MEASURED_SAFE, got.num_ctx)
+    if got.think:
+        log.warning("brain.think is ON. Measured 2026-09-04: reasoning is "
+                    "charged to num_predict, so at 160 the model spent the "
+                    "whole budget thinking and returned an EMPTY reply 6 "
+                    "times out of 6, and the turns that did finish took "
+                    "10.9-33.0 s. num_predict is %d.", got.num_predict)
+    return got
+
+
+# SETTINGS, NUM_CTX, CHAT_OPTIONS and OLLAMA_OPTIONS are module attributes
+# built ONCE per process by _build_settings() -- on first use, through the
+# module __getattr__ at the bottom of this file or settings()/num_ctx()
+# inside it -- and never rebuilt. They are deliberately NOT built here:
+# until 2026-09-04 this read `SETTINGS = model_settings()`, which called
+# AssistantConfig.load() the moment anything imported jarvis.brain (an
+# agent, a script, jarvis-breeze at boot, the test suite), and load() then
+# WROTE his secret-bearing assistant.json whenever DEFAULTS had gained a
+# key; that is what rewrote the live file at 15:08 that day. Both ends are
+# closed now: load() cannot write (assistant_config.ensure_defaults is the
+# app's explicit write), and an import of this module reads no config at
+# all -- tests/test_config_readonly.py imports every jarvis module and
+# checks the file's bytes and mtime did not move.
+#
+# NUM_CTX is identical on EVERY request (see above). CHAT_OPTIONS are the
+# sampling options for Tier 2 (num_predict is the per-round generation
+# budget -- reply text plus tool-call JSON -- not the spoken cap, which is
+# MAX_SPOKEN_* below; the stop strings end a run-on transcript before the
+# model writes Hunter's next line for him). Built from SETTINGS, so these
+# are one value too. OLLAMA_OPTIONS is the legacy name for CHAT_OPTIONS.
+_LAZY_NAMES = ("SETTINGS", "NUM_CTX", "CHAT_OPTIONS", "OLLAMA_OPTIONS")
+_SETTINGS_LOCK = threading.Lock()
+_SETTINGS_SOURCE: list = []    # ["app"] or ["first use"], once built
+
+
+def _build_settings(cfg=None, source="first use"):
+    """Build the four module values once; return SETTINGS. A SETTINGS a
+    test has already installed is kept (setdefault) -- the wire values
+    NUM_CTX / CHAT_OPTIONS still come from the config, which is what the
+    tiny-window tests rely on."""
+    g = globals()
+    with _SETTINGS_LOCK:
+        if "NUM_CTX" not in g:
+            built = model_settings(cfg)
+            g.setdefault("SETTINGS", built)
+            g["NUM_CTX"] = built.num_ctx
+            g["CHAT_OPTIONS"] = {"num_ctx": built.num_ctx,
+                                 "temperature": built.temperature,
+                                 "num_predict": built.num_predict,
+                                 "stop": ["\nUser:", "\nHunter:"]}
+            g["OLLAMA_OPTIONS"] = g["CHAT_OPTIONS"]
+            _SETTINGS_SOURCE.append(source)
+            log.info("brain: model settings built once from %s (window %d, "
+                     "generation per round %d, temperature %s, thinking %s)",
+                     source, built.num_ctx, built.num_predict,
+                     built.temperature, "on" if built.think else "off")
+        return g["SETTINGS"]
+
+
+def settings() -> ModelSettings:
+    """The ModelSettings in force (built on first call)."""
+    s = globals().get("SETTINGS")
+    return s if s is not None else _build_settings()
+
+
+def num_ctx() -> int:
+    """The one num_ctx on the wire (built on first call)."""
+    n = globals().get("NUM_CTX")
+    if n is None:
+        _build_settings()
+        n = globals()["NUM_CTX"]
+    return n
+
+
+def settings_source() -> str:
+    """'app', 'first use', or '' while nothing has built them yet."""
+    return _SETTINGS_SOURCE[0] if _SETTINGS_SOURCE else ""
 # 30 s, not 300. This loop is the ONLY thing that notices the chat model
 # has fallen out of Ollama's single slot, and at 300 s a turn could pay a
 # ~7 s reload for up to five minutes after any second-model request --
@@ -126,8 +367,11 @@ INCLUDE_GIT_LINE = True        # latency knob (spec 4.3): drop "Git:" lines
 # window: Ollama drops it silently and the model then answers something
 # confident and unrelated. Cap it here (the ONE place every tool result
 # passes through) and say in the message itself that it was cut, so the
-# model can say so too. 4 000 chars ~ 1 000 tokens; the whole turn is
-# allowed 8 000, leaving room for the ~2 700-token static prefix.
+# model can say so too. This comment used to say "4 000 chars ~ 1 000
+# tokens"; measured 2026-09-04, calendar and mail text runs 2.25 chars per
+# token, so 4 000 chars is nearer 1 780 -- wrong, but wrong in the safe
+# direction, and at the larger window it no longer bites. fit_prompt() is
+# what actually holds the line now; these two caps are the first defence.
 MAX_TOOL_TEXT_CHARS = 4000       # one tool result
 MAX_TOOL_TEXT_TOTAL_CHARS = 8000  # every tool result in one turn
 TOOL_ARGS_LOG_CHARS = 200        # tool args in the "tool X -> ok" log line
@@ -1280,17 +1524,14 @@ def warm_static(timeout=300):
         return False
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": ""}]
-    payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
-                            num_predict=1)
     try:
-        _http("/api/chat", payload, timeout=timeout)
+        _chat_once(messages, _registry_schemas(_REGISTRY), timeout=timeout,
+                   label="rewarm", num_predict=1)
         log.info("ollama: static prefix re-warmed (register %s)", register())
         return True
     except Exception as exc:                       # noqa: BLE001
         log.warning("ollama: static re-warm failed: %s", exc)
         return False
-    finally:
-        _unpin_if_lent(payload)
 
 
 # ----------------------------------------------------------------------
@@ -1302,9 +1543,17 @@ _REGISTRY = None
 _RESIDENCY = {"unloaded_once": False, "thread": None, "lent": False}
 
 
-def configure(model=None):
+def configure(model=None, config=None):
     """Choose the local model (app start, from assistant.local_model); the
-    JARVIS_OLLAMA_MODEL env var wins. Returns the model in force."""
+    JARVIS_OLLAMA_MODEL env var wins. Returns the model in force.
+
+    ``config`` is the app's already-loaded AssistantConfig: the brain.*
+    model settings are built from it here, ONCE, instead of this module
+    reading (or, before 2026-09-04, writing) a config of its own. If
+    something built them earlier -- a first use before the app got here
+    -- they are kept, because a rebuild would send Ollama a second num_ctx
+    (the one-value invariant); it is logged as a warning only when the
+    values actually differ from what the config says."""
     global OLLAMA_MODEL
     chosen = (os.environ.get("JARVIS_OLLAMA_MODEL") or model or
               OLLAMA_MODEL).strip()
@@ -1312,6 +1561,17 @@ def configure(model=None):
         log.info("ollama model: %s -> %s", OLLAMA_MODEL, chosen)
         OLLAMA_MODEL = chosen
         _RESIDENCY["unloaded_once"] = False
+    if config is not None:
+        if "NUM_CTX" not in globals():
+            _build_settings(config, source="app")
+        else:
+            wanted = model_settings(config)
+            if wanted != settings():
+                log.warning("brain: model settings were already built (%s) "
+                            "before the app handed its config over, and "
+                            "differ from it; keeping the built ones -- they "
+                            "are one value per process",
+                            settings_source())
     return OLLAMA_MODEL
 
 
@@ -1459,9 +1719,10 @@ def _split_complete_sentences(buf):
 
 
 def _options(**overrides):
-    opts = dict(CHAT_OPTIONS)
+    ctx = num_ctx()                    # builds the settings on first use
+    opts = dict(globals()["CHAT_OPTIONS"])
     opts.update(overrides)
-    opts["num_ctx"] = NUM_CTX          # never varies: a change reloads the model
+    opts["num_ctx"] = ctx              # never varies: a change reloads the model
     return opts
 
 
@@ -1470,7 +1731,10 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
     # still slips through (a caller that skipped _check_lent) must not pin
     # it again, so the payload itself says "unload after this one".
     payload = {"model": OLLAMA_MODEL, "messages": messages, "stream": False,
-               "think": False,
+               # brain.think in assistant.json; measured off (see
+               # model_settings) -- and the reasoning scrubber below is
+               # only DEFENSIVE while it stays off.
+               "think": settings().think,
                "keep_alive": 0 if _RESIDENCY.get("lent") else -1,
                "options": _options(**opt_overrides)}
     if tools:
@@ -1526,6 +1790,595 @@ def _scoped_call(registry, name, args, owner=None, who=None, **kw):
     return registry.call(name, args, **kw)
 
 
+_SETTINGS_LOGGED = []
+
+
+def log_settings(registry=None):
+    """One line, once, naming the settings in force and the room they leave
+    for the ANSWER.
+
+    The tool registry sets the precedent: it reports its own cost the
+    moment it becomes a prompt, because a budget nobody can see is a budget
+    nobody checks. This is the same idea for the window itself -- until
+    2026-09-04 nothing in jarvis.log said how big the window was, what the
+    static prefix cost, or how little was left, and a prompt Ollama had
+    silently truncated looked exactly like one that fitted.
+
+    Estimates use the registry's own measured chars-per-token; the ACTUAL
+    number arrives per round from Ollama in _log_round_tokens().
+    """
+    if _SETTINGS_LOGGED:
+        return
+    _SETTINGS_LOGGED.append(True)
+    try:
+        system_tokens = int(len(static_system()) / CHARS_PER_TOKEN)
+    except Exception:
+        system_tokens = 0
+    tools = 0
+    schema_tokens = 0
+    try:
+        if registry is not None:
+            tools = len(registry)
+            schema_tokens = registry.schema_tokens()
+    except Exception:
+        log.debug("brain: tool schema cost unavailable for the settings line")
+    prefix = system_tokens + schema_tokens
+    S = settings()
+    left = S.num_ctx - prefix - S.num_predict - S.answer_reserve_tokens
+    log.info(
+        "brain: window %d tokens, generation per round capped at %d "
+        "(reply text plus tool calls; speech is clamped separately), "
+        "temperature %s, thinking %s (assistant.json brain.*; a change "
+        "needs a restart). Static prefix ~%d tokens (persona ~%d + %d tool "
+        "schemas ~%d), %d reserved -> ~%d tokens left for his question, "
+        "memory, history and tool results. Question guard %s (trims a "
+        "round above ~%d calibrated tokens: %d%% of the window kept as "
+        "estimate margin, estimate x%.3f from the last measured round).",
+        S.num_ctx, S.num_predict, S.temperature,
+        "on" if S.think else "off", prefix, system_tokens, tools,
+        schema_tokens, S.answer_reserve_tokens, left,
+        "on" if S.protect_question else "OFF",
+        S.prompt_ceiling, int(ESTIMATE_MARGIN * 100), calibration_factor())
+    if left < 1024:
+        log.warning("brain: only ~%d tokens are left for his actual turn "
+                    "after the persona and the tool schemas; raise "
+                    "brain.num_ctx or register fewer tools", left)
+
+
+# What replaces a tool result the guard had to drop. It stays in the
+# transcript as a message rather than vanishing: an unanswered tool_call is
+# an invitation to make the call again, and the model can say what it lost.
+TOOL_DROPPED_TEXT = ("[an earlier result was dropped to keep the question "
+                     "itself inside the model's window]")
+# ...but dropping whole is the LAST resort. The guard cuts the TAIL of the
+# LARGEST result (as fit_material does for a document) and marks the cut,
+# so a long calendar loses its evening rather than its morning: a review
+# probe (num_ctx 2048, one 3 900-char calendar result) showed the
+# drop-whole rule replacing the ONLY result the model needed and the turn
+# ending as "an earlier result was dropped, sir" instead of a partial
+# calendar. A result already cut is cut AGAIN on a later round that
+# overflows (the round-3 review measured the once-only rule dropping the
+# NEWEST result -- the one the model had just asked for -- whole, while
+# hundreds of trimmable tokens sat in the cut one). Only when every result
+# is down to MIN_TOOL_KEEP_CHARS is one dropped whole, the oldest first.
+TOOL_CUT_TEXT = ("\n[cut here to keep the question in the model's window; "
+                 "the result went on]")
+MIN_TOOL_KEEP_CHARS = 400
+# tool_message() appends SENTENCE_ALLOWANCE to a list-shaped result, at the
+# END. It is instruction, not data: a tail cut lifts it off first and puts
+# it back after the marker, or a cut calendar would also lose the model's
+# permission to name more than two of its items. Built from the template
+# itself so the two cannot drift apart.
+_ALLOWANCE_RX = re.compile(
+    re.escape(SENTENCE_ALLOWANCE.format(n="\x00")).replace("\x00", r"\d+")
+    + r"\Z")
+
+
+def _split_allowance(content):
+    """(body, allowance-suffix-or-empty) of a tool message's content."""
+    m = _ALLOWANCE_RX.search(content or "")
+    if not m:
+        return content, ""
+    return content[:m.start()], content[m.start():]
+
+
+def _split_cut(body):
+    """(text, was_cut) of a tool body: the cut marker an earlier round left
+    at its end is lifted off so the body can be cut again and re-marked
+    once, never marked twice."""
+    if body.endswith(TOOL_CUT_TEXT):
+        return body[:-len(TOOL_CUT_TEXT)], True
+    return body, False
+
+
+def seen_after_guard(edits, index, ran_results, tool_texts):
+    """After fit_prompt: bring the loop's records to what the model NOW
+    sees of each result the guard cut or dropped -- the kept head with its
+    cut marker, or the dropped marker -- so the coverage and provenance
+    checks judge a reply against the text the model actually had, not
+    words it never saw. ``edits`` is fit_prompt's ``changed`` list,
+    ``index`` maps id(message) -> position in ran_results / tool_texts.
+    Returns the positions updated."""
+    done = []
+    for msg, _kind, _before in edits or ():
+        i = index.get(id(msg))
+        if i is None or i >= len(ran_results) or i >= len(tool_texts):
+            continue
+        seen = msg.get("content") or ""
+        name, result = ran_results[i]
+        try:
+            result = dataclasses.replace(result, text=seen)
+        except (TypeError, ValueError):
+            from jarvis.tools.registry import ToolResult
+            result = ToolResult(text=seen, ok=getattr(result, "ok", True),
+                                max_sentences=getattr(result, "max_sentences", 2),
+                                card=getattr(result, "card", None),
+                                speak=getattr(result, "speak", None))
+        ran_results[i] = (name, result)
+        tool_texts[i] = seen
+        done.append(i)
+    return done
+
+
+# ----------------------------------------------------------------------
+# The window guard: estimate, trim, then log what it really cost
+# ----------------------------------------------------------------------
+# TWO rates, because one was wrong by up to 1.8x in the direction that
+# hurts. The registry's 4.1 chars per token was measured on schema JSON and
+# persona prose (three points, 3.95-4.26). Tool RESULTS are not prose:
+# calendar and mail text -- times, addresses, subject lines, punctuation --
+# tokenizes at 2.25 chars per token, measured 2026-09-04 on the live server
+# (a 9 000-char calendar result cost 3 993 prompt tokens: 8253 - 4260 of
+# static prefix and turn). Estimating those at 4.1 said 2 195, and at that
+# figure the guard would NOT have fired on the very turn it exists for.
+PROSE_CHARS_PER_TOKEN = CHARS_PER_TOKEN     # persona, schemas, his words
+TOOL_CHARS_PER_TOKEN = 2.25                 # tool results and tool-call JSON
+# Chat-template markers per message (<start_of_turn>role ... <end_of_turn>).
+# Not measured; about four, and erring high is the safe direction.
+MESSAGE_OVERHEAD_TOKENS = 4
+# An image in a message (the screen tool) is not text: gemma-family models
+# spend a fixed block of tokens per image. Not measured on this box; 1024
+# is above the 256-token figure the model card gives, erring high. It is
+# costed by _image_tokens() in BOTH estimators (the per-message walk and
+# fit_material's dense figure): the round-3 review measured fit_material
+# costing the screen question's image at ZERO, because it summed the
+# other messages and the last one's text and never looked at its images.
+IMAGE_TOKENS_ALLOWANCE = 1024
+
+
+def _image_tokens(msg) -> int:
+    """The fixed allowance for the images one message carries: never
+    their base64 (a screenshot is ~200 000 chars), never zero."""
+    images = msg.get("images") if isinstance(msg, dict) else None
+    if not images:
+        return 0
+    try:
+        return IMAGE_TOKENS_ALLOWANCE * len(images)
+    except TypeError:
+        return IMAGE_TOKENS_ALLOWANCE
+
+
+def image_count(messages) -> int:
+    """How many images a request carries, for _log_round_tokens: a round
+    with one is logged like any other but does NOT calibrate."""
+    n = 0
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("images"):
+            try:
+                n += len(m["images"])
+            except TypeError:
+                n += 1
+    return n
+
+# CALIBRATION: the estimate is checked against Ollama's own prompt_eval_count
+# on every round (_log_round_tokens), and the ratio measured/estimated is
+# carried forward as a correction factor the guard multiplies the NEXT
+# round's estimate by. It starts at the measured under-estimate of the
+# static prefix (2026-09-04: estimated 3556, counted 3761 -> 1.058) so the
+# very first round is already corrected; it is an EMA (half old, half new)
+# clamped to [CALIBRATION_INITIAL, CALIBRATION_MAX] -- it can only ever make
+# the guard MORE cautious than the measured baseline, never less, because
+# the failure it prevents is silent and the cost of over-caution is a
+# tail-trim. A count below half the estimate is not used: it cannot be a
+# whole-prompt count (a prefix-cache hit reporting only the tail is the
+# suspected cause, not verified), and a low count is never a truncation
+# risk anyway. A round that carries an IMAGE is not used either: whether
+# Ollama's count includes the image's tokens, and how many, is unmeasured
+# (256 per the model card, 1024 allowed for), so its ratio says nothing
+# about the text rate the factor tracks -- the round-3 review measured ONE
+# screen question pinning the process-wide factor at the 2.0 clamp and
+# halving the tool loop's raw trim threshold (14566 -> 7720) for the next
+# seven rounds. Every change is logged with both numbers.
+CALIBRATION_INITIAL = 1.06
+CALIBRATION_MAX = 2.0
+CALIBRATION_ALPHA = 0.5
+_CALIBRATION = {"factor": CALIBRATION_INITIAL, "samples": 0}
+
+
+def calibration_factor() -> float:
+    return _CALIBRATION["factor"]
+
+
+def calibrated(estimate) -> int:
+    """An estimate with the running correction applied: what the guard
+    compares against the ceiling."""
+    return int(estimate * _CALIBRATION["factor"] + 0.5)
+
+
+def _calibrate(used, estimated, label="chat", images=0):
+    """Fold one measured (used) vs estimated pair into the factor. A round
+    that carried an image is logged and left out (see the block above)."""
+    try:
+        used, estimated = int(used), int(estimated)
+    except (TypeError, ValueError):
+        return
+    if used <= 0 or estimated <= 0:
+        return
+    if images:
+        log.info("ctx-calibration: unchanged at %.3f -- %d image%s in the "
+                 "prompt, costed at the %d-token allowance (Ollama counted "
+                 "%d against an estimate of %d [%s]; an image round says "
+                 "nothing about the text rate)", _CALIBRATION["factor"],
+                 images, "" if images == 1 else "s", IMAGE_TOKENS_ALLOWANCE,
+                 used, estimated, label)
+        return
+    ratio = used / estimated
+    if ratio < 0.5:
+        log.debug("ctx: %d counted against an estimate of %d [%s] is not a "
+                  "whole-prompt count; calibration unchanged", used,
+                  estimated, label)
+        return
+    old = _CALIBRATION["factor"]
+    new = old + CALIBRATION_ALPHA * (ratio - old)
+    new = max(CALIBRATION_INITIAL, min(CALIBRATION_MAX, new))
+    _CALIBRATION["factor"] = round(new, 4)
+    _CALIBRATION["samples"] += 1
+    if abs(new - old) >= 0.005:
+        log.info("ctx-calibration: %.3f -> %.3f (Ollama counted %d against "
+                 "an estimate of %d [%s])", old, new, used, estimated, label)
+
+# Schema cost, cached by tool NAMES. The tools block is byte-stable for a
+# fixed tool set (registry.schemas(), the static-prefix rule), so its
+# json.dumps is done once per tool set rather than once per round. The
+# per-round json.dumps this replaces was measured at 0.055 ms for a 30 KB
+# transcript-plus-tools (2026-09-04, this box): it never mattered against a
+# 1.3 s turn, but the cache is free and the two-rate walk needs the
+# messages individually anyway.
+_SCHEMA_TOKENS_CACHE: dict = {}
+
+
+def _schema_tokens(tools) -> int:
+    if not tools:
+        return 0
+    try:
+        key = tuple((t.get("function") or {}).get("name") or repr(t)
+                    for t in tools)
+    except Exception:                      # noqa: BLE001 - a junk tools list
+        key = None
+    if key is not None and key in _SCHEMA_TOKENS_CACHE:
+        return _SCHEMA_TOKENS_CACHE[key]
+    try:
+        tokens = int(len(json.dumps(tools, default=str))
+                     / PROSE_CHARS_PER_TOKEN)
+    except (TypeError, ValueError):
+        return 0
+    if key is not None and len(_SCHEMA_TOKENS_CACHE) < 64:
+        _SCHEMA_TOKENS_CACHE[key] = tokens
+    return tokens
+
+
+def _message_tokens(msg) -> int:
+    """One message's estimated cost: prose at the prose rate, a tool result
+    or a tool call at the dense rate, plus the template markers."""
+    if not isinstance(msg, dict):
+        return int(len(str(msg)) / TOOL_CHARS_PER_TOKEN)
+    content = msg.get("content")
+    content = content if isinstance(content, str) else str(content or "")
+    rate = (TOOL_CHARS_PER_TOKEN if msg.get("role") == "tool"
+            else PROSE_CHARS_PER_TOKEN)
+    tokens = len(content) / rate + MESSAGE_OVERHEAD_TOKENS
+    calls = msg.get("tool_calls")
+    if calls:
+        try:
+            tokens += len(json.dumps(calls, default=str)) / TOOL_CHARS_PER_TOKEN
+        except (TypeError, ValueError):
+            pass
+    tokens += _image_tokens(msg)
+    return int(tokens)
+
+
+def estimate_prompt_tokens(messages, tools=None):
+    """Roughly what a request's prompt will cost, in tokens.
+
+    Two rates (see the block above): prose at the registry's measured 4.1
+    chars per token, tool results and tool-call JSON at the measured 2.25.
+    It is an estimate on purpose -- the exact count is only knowable after
+    the fact, and _log_round_tokens() logs that one from Ollama's own reply
+    beside this one, on every path, so the two can be compared in the log.
+    This is the RAW figure; the guards compare calibrated() of it."""
+    try:
+        total = sum(_message_tokens(m) for m in (messages or []))
+    except Exception:                      # noqa: BLE001 - never block a turn
+        return 0
+    return total + _schema_tokens(tools)
+
+
+def fit_prompt(messages, tools=None, ceiling=None, num_predict=None,
+               label="chat", changed=None):
+    """THE GUARD for the tool loop (assistant.json ``brain.protect_question``).
+
+    When a round would overflow the window, shorten the LARGEST TOOL RESULT
+    -- because if we do not, Ollama makes room its own way, and its way is
+    to delete whole messages oldest-first after the system prompt. That is
+    HIS QUESTION. Measured 2026-09-04 on the live server: a 9 000-char
+    calendar result took prompt_eval_count from 8253 DOWN to 7754 --
+    exactly the 499 tokens of his question, background and memory -- and a
+    10 000-char one collapsed it to 3761, i.e. the system prompt and the
+    tool schemas alone. No error, no log line, nothing; the model then
+    answered something confident and unrelated.
+
+    Largest result first (ties: the oldest): its tail is cut to absorb the
+    overflow (TOOL_CUT_TEXT marks the cut). A result cut on an earlier
+    round is cut AGAIN, its marker lifted and put back once: the once-only
+    rule this replaces skipped the cut result and dropped the NEWEST whole
+    (measured, round-3 review: a 600-char mail result gone and the prompt
+    still over, with 937 chars of cut calendar left untouched). When the
+    largest cannot absorb it all above MIN_TOOL_KEEP_CHARS, one of two
+    things: if every result cut to that floor would fit, the largest goes
+    to its floor and the next largest takes the rest (every tool keeps
+    its head); if even the floors would not fit, a drop is unavoidable and
+    the OLDEST result is replaced whole by TOOL_DROPPED_TEXT first -- the
+    newest is the one the model just asked for, and dropping first is
+    what lets it keep more than a floor. The estimate compared is
+    calibrated() -- the raw estimate times the factor measured on earlier
+    rounds.
+
+    Mutates ``messages`` in place and returns (results dropped WHOLE,
+    calibrated estimate). ``changed``, when a list, receives one
+    (message, "cut" | "dropped", previous content) per message touched,
+    so the caller can record what the model actually saw.
+    """
+    S = settings()
+    if ceiling is None:
+        ceiling = S.ceiling_for(num_predict)
+    ceiling = int(ceiling)
+    estimate = calibrated(estimate_prompt_tokens(messages, tools))
+    if estimate <= ceiling or not S.protect_question:
+        return 0, estimate
+    dropped = 0
+    factor = calibration_factor()
+    slack = int(MESSAGE_OVERHEAD_TOKENS * TOOL_CHARS_PER_TOKEN)
+
+    def floors_fit(live):
+        """Would the prompt fit with every standing result at its floor?"""
+        by_pos = {x[1]: x for x in live}
+        shadow = []
+        for pos, msg in enumerate(messages):
+            x = by_pos.get(pos)
+            if x is None:
+                shadow.append(msg)
+                continue
+            size, _p, _m, body, suffix, was_cut, _c = x
+            if size > MIN_TOOL_KEEP_CHARS:
+                floor = body[:MIN_TOOL_KEEP_CHARS].rstrip() + TOOL_CUT_TEXT
+            else:
+                floor = body + (TOOL_CUT_TEXT if was_cut else "")
+            shadow.append({"role": "tool", "content": floor + suffix})
+        return calibrated(estimate_prompt_tokens(shadow, tools)) <= ceiling
+
+    while estimate > ceiling:
+        # every result still standing, as (body chars, position, ...):
+        # the body is the data in front of the sentence allowance (kept
+        # whole, it is instruction) with an earlier round's cut marker
+        # lifted off, so "largest" means largest data, marked or not
+        live = []
+        for pos, msg in enumerate(messages):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
+                continue
+            content = msg.get("content") or ""
+            if content == TOOL_DROPPED_TEXT:
+                continue
+            body, suffix = _split_allowance(content)
+            body, was_cut = _split_cut(body)
+            live.append((len(body), pos, msg, body, suffix, was_cut, content))
+        if not live:
+            break
+        over = estimate - ceiling
+        # a cut must SAVE something: past the floor, and (the first time)
+        # more than the marker it adds
+        cuttable = [x for x in live
+                    if x[0] - MIN_TOOL_KEEP_CHARS > (0 if x[5] else len(TOOL_CUT_TEXT))]
+        target = max(cuttable, key=lambda x: (x[0], -x[1])) if cuttable else None
+        if target is not None:
+            size, pos, msg, body, suffix, was_cut, content = target
+            # chars to remove at the dense rate, un-calibrated back to raw
+            # chars, plus the marker (unless already paid for) and a line
+            # of slack so one pass fits
+            cut = int(over * TOOL_CHARS_PER_TOKEN / factor) + slack \
+                + (0 if was_cut else len(TOOL_CUT_TEXT))
+            keep = len(body) - cut
+            if keep < MIN_TOOL_KEEP_CHARS and not floors_fit(live):
+                target = None          # a drop is unavoidable: take it first
+        if target is not None:
+            keep = max(MIN_TOOL_KEEP_CHARS, keep)
+            head = body[:keep]
+            nl = head.rfind("\n")
+            if nl > keep // 2 and nl >= MIN_TOOL_KEEP_CHARS:
+                head = head[:nl]           # cut at a line, as cap_tool_text does
+            msg["content"] = head.rstrip() + TOOL_CUT_TEXT + suffix
+            kind = "cut"
+            log.warning("%s: prompt ~%d tokens over the %d-token ceiling; "
+                        "cut the last %d of %d chars of the largest result "
+                        "(%s%s) so his question stays in the window",
+                        label, estimate, ceiling, len(body) - len(head),
+                        len(body), msg.get("tool_name") or "tool",
+                        ", again" if was_cut else "")
+        else:
+            size, pos, msg, body, suffix, was_cut, content = \
+                min(live, key=lambda x: x[1])
+            msg["content"] = TOOL_DROPPED_TEXT
+            dropped += 1
+            kind = "dropped"
+            log.warning("%s: prompt ~%d tokens over the %d-token ceiling, "
+                        "and it would still be over with every result cut "
+                        "to its %d-char floor; dropped the oldest result "
+                        "(%s, %d chars) whole so his question stays in the "
+                        "window", label, estimate, ceiling,
+                        MIN_TOOL_KEEP_CHARS, msg.get("tool_name") or "tool",
+                        len(content))
+        if changed is not None:
+            changed.append((msg, kind, content))
+        estimate = calibrated(estimate_prompt_tokens(messages, tools))
+    if estimate > ceiling:
+        # Nothing left that is safe to take: what remains is the system
+        # prompt, the tool schemas and his turn, and his turn is the one
+        # thing this whole guard exists to keep.
+        log.warning("%s: prompt is still ~%d tokens against a %d-token "
+                    "ceiling with every tool result dropped (%d) or at its "
+                    "%d-char floor; Ollama may truncate this round. Raise "
+                    "brain.num_ctx.", label, estimate, ceiling, dropped,
+                    MIN_TOOL_KEEP_CHARS)
+    return dropped, estimate
+
+
+# What marks the cut end of material the guard had to shorten, so the
+# model can say the text went on rather than treating the cut as the end.
+MATERIAL_CUT_TEXT = "\n[cut here to fit the model's window; the text goes on]"
+
+
+def fit_material(messages, tools=None, ceiling=None, num_predict=None,
+                 label="chat"):
+    """THE GUARD for the one-shot requests, which have no tool result to
+    drop: the persona helpers (summarize, local_line), the router
+    tie-breaker, the JSON helpers (explain_text, make_quiz, read_syllabus,
+    extract_facts, grade_answer) and the warm-ups.
+
+    Their prompt is the static system prompt plus ONE user message whose
+    tail is the material -- a Claude result, a mail digest, the document,
+    the study text, the journal. Overflowing that does not lose his
+    question (there is none in it) but it does lose the instruction, which
+    comes FIRST and is what Ollama's oldest-first eviction would take. So
+    the guard here shortens the TAIL of the last user message until the
+    estimate fits, and marks the cut.
+
+    The material is costed at the DENSE rate here, whatever the estimator
+    would say for a user message: a mail digest really is that dense, and
+    the cost of being wrong the other way is the instruction. At the
+    shipped settings a 12 000-char document still fits with room to
+    spare, so over-trimming prose only happens in a window that could not
+    have held it anyway. Mutates ``messages`` in place and returns (chars
+    cut, estimated tokens -- the dense one).
+    """
+    S = settings()
+    if ceiling is None:
+        ceiling = S.ceiling_for(num_predict)
+    ceiling = int(ceiling)
+    last = None
+    for msg in reversed(messages or []):
+        if isinstance(msg, dict) and msg.get("role") == "user" \
+                and isinstance(msg.get("content"), str):
+            last = msg
+            break
+    if last is None:
+        estimate = calibrated(estimate_prompt_tokens(messages, tools))
+        if estimate > ceiling and S.protect_question:
+            log.warning("%s: prompt ~%d tokens against a %d-token ceiling "
+                        "with no material to trim; Ollama may truncate it. "
+                        "Raise brain.num_ctx.", label, estimate, ceiling)
+        return 0, estimate
+    base = estimate_prompt_tokens([m for m in messages if m is not last],
+                                  tools)
+    # the screen question rides its screenshot on THIS message: the fixed
+    # allowance per image, or the guard costs it at zero (measured, round
+    # 3 review: 116 tokens for a prompt the walk put at 1122)
+    base += _image_tokens(last)
+    factor = calibration_factor()
+
+    def dense(text):
+        return calibrated(base + len(text) / TOOL_CHARS_PER_TOKEN
+                          + MESSAGE_OVERHEAD_TOKENS)
+
+    content = last["content"]
+    estimate = dense(content)
+    if estimate <= ceiling or not S.protect_question:
+        return 0, estimate
+    over = estimate - ceiling
+    cut = int(over * TOOL_CHARS_PER_TOKEN / factor) + len(MATERIAL_CUT_TEXT)
+    keep = max(0, len(content) - cut)
+    last["content"] = content[:keep].rstrip() + MATERIAL_CUT_TEXT
+    estimate = dense(last["content"])
+    log.warning("%s: prompt ~%d tokens over the %d-token ceiling; cut the "
+                "last %d of %d chars of material to fit (~%d tokens now)",
+                label, over + ceiling, ceiling, len(content) - keep,
+                len(content), estimate)
+    return len(content) - keep, estimate
+
+def _log_round_tokens(data, estimated=0, label="chat", images=0):
+    """What the request ACTUALLY cost, from Ollama's own reply.
+
+    prompt_eval_count is in every /api/chat body -- the same body this
+    module already reads load_duration out of -- and until 2026-09-04 it
+    appeared nowhere in jarvis.log or turns.jsonl. So the one number that
+    says whether his question survived into the window was being thrown
+    away on every single turn. Logged on every path now, with the path's
+    label and the estimate beside it, so the estimate can be checked: on a
+    warm-up the number IS the static prefix's real cost. ``images`` is how
+    many the prompt carried (image_count): logged, never calibrated on."""
+    if not isinstance(data, dict):
+        return
+    try:
+        used = int(data.get("prompt_eval_count") or 0)
+    except (TypeError, ValueError):
+        return
+    if used <= 0:
+        return
+    try:
+        out = int(data.get("eval_count") or 0)
+    except (TypeError, ValueError):
+        out = 0
+    window = num_ctx()
+    pct = (100.0 * used / window) if window else 0.0
+    line = ("ctx: prompt %d/%d tokens (%.0f%%), answer %d/%d"
+            % (used, window, pct, out, settings().num_predict))
+    if estimated:
+        # `estimated` is the calibrated figure the guard compared; the raw
+        # one it came from is what the next round's factor is measured on.
+        raw = int(estimated / calibration_factor() + 0.5)
+        line += " (estimated %d, raw %d x%.3f)" % (estimated, raw,
+                                                    calibration_factor())
+        if images:
+            line += " (%d image%s at %d)" % (
+                images, "" if images == 1 else "s", IMAGE_TOKENS_ALLOWANCE)
+        _calibrate(used, raw, label, images=images)
+    line += " [%s]" % label
+    if pct >= 90.0:
+        log.warning("%s -- close to the window; Ollama drops the OLDEST "
+                    "messages when it overflows, which is his question",
+                    line)
+    else:
+        log.info("%s", line)
+
+
+def _chat_once(messages, tools=None, timeout=OLLAMA_TIMEOUT_S, fmt=None,
+               label="chat", **opt_overrides):
+    """One /api/chat request outside the tool loop, through the guard.
+
+    fit_material() before it is sent, _log_round_tokens() after, and the
+    lend race unpinned in a finally -- the same three things the tool loop
+    does around its own rounds. Every one-shot caller (both warm-ups, the
+    persona helpers, the router tie-breaker, the JSON helpers) goes through
+    here so none of them can skip the guard or lose the real count. Raises
+    what _http raises; callers keep their own excuses."""
+    _, estimate = fit_material(messages, tools, label=label,
+                               num_predict=opt_overrides.get("num_predict"))
+    payload = _chat_payload(messages, tools, fmt=fmt, **opt_overrides)
+    try:
+        data = _http("/api/chat", payload, timeout=timeout)
+    finally:
+        _unpin_if_lent(payload)
+    _log_round_tokens(data, estimate, label=label)
+    return data
+
 def _registry_schemas(registry, text=None, owner=None):
     """Every registered tool, every turn -- for HIM. A per-turn subset
     chosen from the text was tried (2026-08-30) and dropped: the chat
@@ -1538,6 +2391,7 @@ def _registry_schemas(registry, text=None, owner=None):
     cache: her turn already carries a different system prompt (the
     addressee clause), so its prefix is cold whatever the tool block says,
     and his stays exactly the bytes it was."""
+    log_settings(registry)
     if registry is None:
         return []
     try:
@@ -1613,15 +2467,14 @@ def ensure_resident(first=None):
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": ""}]
     t0 = time.monotonic()
-    payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
-                            num_predict=1)
     try:
-        data = _http("/api/chat", payload, timeout=300)
+        # _chat_once unpins in its own finally: a 300 s warm can race
+        # release(). Its ctx line is the REAL cost of the static prefix.
+        data = _chat_once(messages, _registry_schemas(_REGISTRY), timeout=300,
+                          label="warm", num_predict=1)
     except Exception as exc:
         log.warning("ollama: warm-up of %s failed: %s", OLLAMA_MODEL, exc)
         return False
-    finally:
-        _unpin_if_lent(payload)            # a 300 s warm can race release()
     load_s = (data.get("load_duration") or 0) / 1e9 or \
         (time.monotonic() - t0)
     log.info("ollama: %s resident (load %.1f s)", OLLAMA_MODEL, load_s)
@@ -2337,12 +3190,11 @@ def _persona_request(instruction, text, n, timeout, num_predict):
     _check_lent()          # summarize/local_line fall back to their text
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": _persona_turn(instruction, text, n)}]
-    payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
-                            num_predict=num_predict)
-    try:
-        data = _http("/api/chat", payload, timeout=timeout)
-    finally:
-        _unpin_if_lent(payload)
+    # The material (a Claude result, a mail digest) is the tail of that one
+    # user message, so the guard's tail-trim in _chat_once cuts the
+    # material and never the instruction in front of it.
+    data = _chat_once(messages, _registry_schemas(_REGISTRY), timeout=timeout,
+                      label="persona", num_predict=num_predict)
     msg = data.get("message") or {}
     if msg.get("tool_calls"):
         return ""
@@ -2392,13 +3244,12 @@ def classify_route(text, timeout=CLASSIFY_TIMEOUT_S):
                             f"{(text or '').strip()}"}]
     try:
         _check_lent()      # the router's rules decide alone while lent
-        payload = _chat_payload(messages, _registry_schemas(_REGISTRY),
-                                fmt=ROUTE_FORMAT, num_predict=40,
-                                temperature=0.0)
-        try:
-            data = _http("/api/chat", payload, timeout=timeout)
-        finally:
-            _unpin_if_lent(payload)
+        # His utterance is a few hundred characters at most, so the guard
+        # has nothing to do here in practice; it runs anyway so the router's
+        # prompt_eval_count is logged like every other request's.
+        data = _chat_once(messages, _registry_schemas(_REGISTRY),
+                          timeout=timeout, fmt=ROUTE_FORMAT, label="route",
+                          num_predict=40, temperature=0.0)
         obj = json.loads((data.get("message") or {}).get("content") or "{}")
         route = str(obj.get("route", "")).strip().lower()
         confidence = float(obj.get("confidence", 0.0))
@@ -2459,13 +3310,13 @@ def _json_request(instruction, fmt, timeout, num_predict, temperature=0.2):
     None on any failure (callers speak a fixed excuse)."""
     messages = [{"role": "system", "content": static_system()},
                 {"role": "user", "content": instruction}]
-    payload = _chat_payload(messages, None, fmt=fmt, num_predict=num_predict,
-                            temperature=temperature)
     try:
-        try:
-            data = _http("/api/chat", payload, timeout=timeout)
-        finally:
-            _unpin_if_lent(payload)
+        # Every caller writes its material (the document, the study text,
+        # the journal, the syllabus) LAST in the instruction, so the guard's
+        # tail-trim cuts the material's tail and keeps the instruction.
+        data = _chat_once(messages, None, timeout=timeout, fmt=fmt,
+                          label="json", num_predict=num_predict,
+                          temperature=temperature)
         content, _calls = _message_parts(data)
         obj = json.loads(content or "{}")
     except Exception as exc:               # noqa: BLE001 - one seam, one excuse
@@ -3192,6 +4043,11 @@ class JarvisBrain:
         # the turn, so when an authored speak= line tries to end it the
         # loop can see whether an ANSWER is still owed.
         ran_results = []
+        # The message object each result became, by ran_results index, so
+        # that when the guard cuts or drops one the two lists above can be
+        # brought to what the model ACTUALLY saw (the provenance and
+        # coverage checks judge the reply against them).
+        tool_msgs = {}
         held_lines = []            # authored lines the check held back
         held_said = False          # ...and whether the reply carries them yet
         # How much of ran_results has already been put into SPOKEN words.
@@ -3265,7 +4121,10 @@ class JarvisBrain:
                 # appended after the budget accounting: this is instruction,
                 # not tool data, and must not squeeze the result itself out
                 content += SENTENCE_ALLOWANCE.format(n=allowed)
-            return {"role": "tool", "content": content, "tool_name": name}
+            msg = {"role": "tool", "content": content, "tool_name": name}
+            tool_msgs[id(msg)] = len(ran_results) - 1   # note() ran first
+            return msg
+
 
         rounds_left = max(1, int(max_rounds or 1))
         render_only = False        # next round writes; it may not call tools
@@ -3480,6 +4339,16 @@ class JarvisBrain:
                         told += HELD_LINE_NOTE.format(
                             lines=" ".join(held_lines))
                     messages.append({"role": "user", "content": told})
+                # THE GUARD, before every round: keep his question in
+                # the window rather than letting Ollama delete it to make
+                # room for a tool result (see fit_prompt).
+                edits = []
+                _, prompt_estimate = fit_prompt(messages, round_tools,
+                                                changed=edits)
+                if edits:
+                    # tool_texts / ran_results now hold what the model
+                    # SEES of a cut or dropped result (seen_after_guard)
+                    seen_after_guard(edits, tool_msgs, ran_results, tool_texts)
                 round_started = time.monotonic()
                 streaming = on_sentence is not None and not plain_round
                 plain_round = False
@@ -3519,6 +4388,7 @@ class JarvisBrain:
                 # budget, since the budget is wall MINUS this.
                 server_s += min(max(0.0, (data.get("load_duration") or 0) / 1e9),
                                 max(0.0, time.monotonic() - round_started))
+                _log_round_tokens(data, prompt_estimate)
                 if render_only and calls:
                     # Some models emit tool_calls even with none offered.
                     log.warning("chat: render round asked for %d more tools; "
@@ -4227,3 +5097,14 @@ class JarvisBrain:
             actions.append(("SPEAK", clean))
 
         return actions
+
+
+def __getattr__(name):
+    """SETTINGS / NUM_CTX / CHAT_OPTIONS / OLLAMA_OPTIONS, built on first
+    access (PEP 562) rather than at import -- see the block above
+    _build_settings for why an import of this module must not read the
+    config."""
+    if name in _LAZY_NAMES:
+        _build_settings()
+        return globals()[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
