@@ -546,3 +546,786 @@ def label_fault(label) -> str:
                 "lower-case letters, digits, - and _, starting with a "
                 "letter or a digit, at most 31 characters" % text)
     return ""
+
+
+# ============================================================ the Tk surface
+import tkinter as tk                                   # noqa: E402
+
+from jarvis.ui import theme                            # noqa: E402
+from jarvis.ui.widgets import RoundButton, px, ui_display, ui_font  # noqa: E402
+
+# Design units, at the 96-dpi baseline; px() scales them by S. Every COLOUR
+# below is read inside a method, never bound here: tests/test_theme_look.py
+# globs jarvis/ui/*.py and a token captured at def time freezes the
+# import-time look.
+BLOCK_GAP = 6
+ROLE_WORDS = {ROLE_OWNER: "OWNER", ROLE_KNOWN: "KNOWN"}
+LOCK_TICK_MS = 1000
+
+
+class UsersPage(tk.Frame):
+    """The USERS surface, placed over the console's stage.
+
+    WHERE THE TAB IS: the strip under the wordmark (jarvis/ui/tab_strip.py),
+    added with one line in ``main_window._fill_tabs``. This page draws no
+    tabs of its own -- two rows of tabs on one screen is a question about
+    which of them is in charge.
+
+    WHY IT COVERS THE REACTOR TOO, the same reason SensorsPage does: it is
+    a list that grows, and over the transcript alone the foot falls off the
+    bottom. ``cover`` is the widgets whose union it should span.
+
+    THE SCROLLING BODY AND THE PINNED FOOT ARE THERE FROM THE FIRST BUILD.
+    That is not caution: on 2026-09-05 Hunter photographed the sensors page
+    with its last band row and its SAVE button off the bottom of the stage,
+    and this page's height is a function of how many people he enrols. The
+    "Add a person" button and the standing note never scroll; MEASURED at
+    both 1040x1760 and 920x1440 in both looks, with twelve people on the
+    page (tests/test_users_page_display.py).
+
+    NOTHING HERE POLLS. Unlike SENSORS there is nothing to poll: the
+    registry is a file. It is read on ``show()`` and re-read immediately
+    before every write, by the app seam itself.
+    """
+
+    def __init__(self, host, services=None, cover=(),
+                 on_close: Optional[Callable] = None, toast=None,
+                 clock: Callable[[], float] = time.monotonic):
+        super().__init__(host, bg=theme.TV_BG)
+        self.host = host
+        self.cover = tuple(w for w in (cover or ()) if w is not None)
+        self.services = services
+        self._on_close = on_close
+        self._toast_bar = toast
+        self._toasts: list = []           # every line this page showed
+        self._open = False
+        self._snapshot: dict = {}
+        self._rows: Tuple[Row, ...] = ()
+        self._row_widgets: dict = {}
+        self._lock = Lock(clock=clock)
+        self._forget = ForgetArm(clock=clock)
+        self._role_arm = ""               # the label whose promotion is armed
+        self._adding = False
+        self._lock_tick = None
+        self._canvas = None
+        self._body = None
+        self._body_win = None
+        self._thumb = None
+        self._head = None
+        self._foot = None
+        self._add_btn = None
+        self._code_entry = None
+        self._build()
+
+    # ----------------------------------------------------------- services
+    def _service(self, name):
+        return getattr(self.services, name, None) if self.services else None
+
+    def toast(self, line, kind="info") -> None:
+        """One place every line this page shows goes through, so a test can
+        read them back and a hash could only appear here on purpose."""
+        self._toasts.append((str(line), kind))
+        bar = self._toast_bar
+        if bar is not None:
+            try:
+                bar.show(str(line), kind=kind)
+            except Exception:             # noqa: BLE001 - a toast bar
+                log.debug("users page: the toast failed", exc_info=True)
+
+    # -------------------------------------------------------------- build
+    def _build(self) -> None:
+        """ONE COLUMN: a pinned head, a scrolling body, a pinned foot.
+
+        The head carries the gate's own sentence and the lock, and it is
+        pinned for the same reason the foot is: an unlock box he has to
+        scroll to find is an unlock box he types his code into twice.
+        """
+        bg = theme.TV_BG
+        self._head = tk.Frame(self, bg=bg)
+        self._head.pack(side="top", fill="x", padx=theme.PAD,
+                        pady=(theme.PAD_S, 0))
+        self._gate_lbl = tk.Label(
+            self._head, text="", font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.MUTED, bg=bg, anchor="w", justify="left", bd=0,
+            padx=0, pady=0)
+        self._gate_lbl.pack(fill="x")
+        self._admin_lbl = tk.Label(
+            self._head, text="", font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.FAINT, bg=bg, anchor="w", justify="left", bd=0,
+            padx=0, pady=0)
+        self._admin_lbl.pack(fill="x", pady=(px(2), 0))
+        self._lock_row = tk.Frame(self._head, bg=bg)
+        self._lock_row.pack(fill="x", pady=(px(6), 0))
+        self._code_entry = tk.Entry(
+            self._lock_row, show="•", width=14, bd=0, relief="flat",
+            bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+            fg=theme.INK, insertbackground=theme.CYAN,
+            font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+        self._code_entry.pack(side="left", ipady=px(3))
+        self._unlock_btn = RoundButton(self._lock_row, text="Unlock",
+                                       kind="ghost", bg=bg, pad_x=8, pad_y=4,
+                                       command=self._unlock_pressed)
+        self._unlock_btn.pack(side="left", padx=(theme.PAD_S, 0))
+        self._lock_btn = RoundButton(self._lock_row, text="Lock", kind="ghost",
+                                     bg=bg, pad_x=8, pad_y=4,
+                                     command=self._lock_pressed)
+        self._lock_btn.pack(side="left", padx=(px(4), 0))
+        self._lock_lbl = tk.Label(
+            self._lock_row, text="", font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.FAINT, bg=bg, anchor="w", bd=0, padx=0, pady=0)
+        self._lock_lbl.pack(side="left", fill="x", expand=True,
+                            padx=(theme.PAD_S, 0))
+
+        # ---- the pinned foot, built BEFORE the view so it packs under it
+        self._foot = tk.Frame(self, bg=bg)
+        act = tk.Frame(self._foot, bg=bg)
+        act.pack(fill="x")
+        self._add_btn = RoundButton(act, text="Add a person", kind="accent",
+                                    bg=bg, pad_x=12, pad_y=5,
+                                    command=self._add_pressed)
+        self._add_btn.pack(side="left")
+        self._path_lbl = tk.Label(
+            act, text="", font=ui_display(theme.SIZE_CAPTION),
+            fg=theme.FAINT, bg=bg, anchor="e", bd=0, padx=0, pady=0)
+        self._path_lbl.pack(side="right", padx=(theme.PAD_S, 0))
+        self._note_lbl = tk.Label(
+            self._foot, text="\n".join("· " + line for line in CANNOT_DO),
+            font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
+            anchor="w", justify="left", bd=0, padx=0, pady=0)
+        self._note_lbl.pack(fill="x", pady=(px(6), 0))
+
+        # ---- the scrolling view, packed FIRST and sized to its content
+        view = tk.Frame(self, bg=bg)
+        view.pack(side="top", fill="x")
+        self._foot.pack(side="top", fill="x", padx=theme.PAD,
+                        pady=(theme.PAD_S, px(12)))
+        self._canvas = tk.Canvas(view, bg=bg, highlightthickness=0, bd=0,
+                                 height=px(40))
+        self._canvas.pack(side="left", fill="x", expand=True)
+        # A 2px strip on the canvas' right edge, shown ONLY when there is
+        # something below the fold: a page that scrolls with no mark saying
+        # so is a page whose bottom rows he has no reason to look for.
+        self._thumb = tk.Frame(self._canvas, bg=theme.CYAN_DIM,
+                               width=max(2, px(2)))
+        self._body = tk.Frame(self._canvas, bg=bg)
+        self._body_win = self._canvas.create_window(0, 0, anchor="nw",
+                                                    window=self._body)
+        self._canvas.bind("<Configure>", lambda e: self._sync_view(), add=True)
+        self._body.bind("<Configure>", lambda e: self._sync_view(), add=True)
+        self._canvas.bind("<Enter>", self._grab_wheel, add=True)
+        self._canvas.bind("<Leave>", self._drop_wheel, add=True)
+        self.bind("<Configure>", self._wrap, add=True)
+        self._paint()
+
+    def _wrap(self, event) -> None:
+        width = max(px(160), int(event.width) - 2 * theme.PAD)
+        for label in (self._gate_lbl, self._admin_lbl, self._note_lbl):
+            try:
+                label.configure(wraplength=width)
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("users page: wrap failed", exc_info=True)
+
+    # --------------------------------------------------------- open/close
+    def place_box(self) -> dict:
+        """The place() kwargs that cover ``cover``, or the whole host --
+        measured off the LIVE geometry, so a hidden footer or a packed
+        camera pane cannot put the page out of step."""
+        if not self.cover:
+            return dict(x=0, y=0, relwidth=1.0, relheight=1.0)
+        try:
+            self.host.update_idletasks()
+            tops = [w.winfo_y() for w in self.cover]
+            bottoms = [w.winfo_y() + w.winfo_height() for w in self.cover]
+            top, height = min(tops), max(bottoms) - min(tops)
+        except Exception:                 # noqa: BLE001 - an unmapped widget
+            log.debug("users page: cover geometry unreadable", exc_info=True)
+            return dict(x=0, y=0, relwidth=1.0, relheight=1.0)
+        if height < 1:
+            return dict(x=0, y=0, relwidth=1.0, relheight=1.0)
+        return dict(x=0, y=top, relwidth=1.0, height=height)
+
+    @property
+    def is_open(self) -> bool:
+        return self._open
+
+    def toggle(self) -> None:
+        self.hide() if self._open else self.show()
+
+    def show(self) -> None:
+        if self._open:
+            return
+        self._open = True
+        self.place(in_=self.host, **self.place_box())
+        self.lift()
+        # Read the file NOW rather than on a timer: it is a file, and it
+        # changes when he changes it.
+        self.refresh()
+        self._tick_lock()
+
+    def hide(self) -> None:
+        if not self._open:
+            return
+        self._open = False
+        # LEAVING THE TAB RELOCKS AT ONCE. The dwell is for a run of edits
+        # in one sitting, not for a console left open on his desk.
+        self._lock.lock()
+        self._forget.disarm()
+        self._role_arm = ""
+        self._adding = False
+        self._untick()
+        # bind_all is GLOBAL: a wheel binding left behind would scroll a
+        # hidden page from anywhere in the console.
+        self._drop_wheel()
+        try:
+            self.place_forget()
+        except Exception:                 # noqa: BLE001 - a dead widget
+            log.debug("users page: unplace failed", exc_info=True)
+        if self._on_close:
+            try:
+                self._on_close()
+            except Exception:             # noqa: BLE001 - a callback
+                log.exception("users page: on_close failed")
+
+    # ------------------------------------------------------------ reading
+    def refresh(self) -> None:
+        fn = self._service("people_snapshot")
+        snap = {}
+        if fn is not None:
+            try:
+                snap = fn() or {}
+            except Exception:             # noqa: BLE001 - the app boundary
+                log.exception("users page: the snapshot failed")
+                snap = {}
+        self._snapshot = snap if isinstance(snap, dict) else {}
+        self._rows = rows_from(self._snapshot)
+        self._paint()
+
+    @property
+    def admin_state(self) -> str:
+        from jarvis import gate as gate_mod
+        return str(self._snapshot.get("admin") or gate_mod.ADMIN_REFUSE)
+
+    def _plan(self) -> BootstrapPlan:
+        return bootstrap_plan(self._snapshot.get("fault_kind") or "",
+                              self._snapshot.get("path") or "")
+
+    # ------------------------------------------------------------- paint
+    def _paint(self) -> None:
+        """Rebuild the body from the snapshot. Cheap: a handful of labels
+        per person, and it happens on open and after a write, never on a
+        clock."""
+        if self._body is None:
+            return
+        bg = theme.TV_BG
+        self._gate_lbl.configure(
+            text=self._snapshot.get("gate_line")
+            or "owner-gate: nothing has been read yet", fg=theme.MUTED)
+        plan = self._plan()
+        self._admin_lbl.configure(
+            text=plan.line or self._snapshot.get("admin_line") or "",
+            fg=theme.WARN if (plan.line and not plan.may_create)
+            else theme.FAINT)
+        self._path_lbl.configure(text=self._snapshot.get("path") or "")
+        for child in list(self._body.winfo_children()):
+            child.destroy()
+        self._row_widgets = {}
+        if self._adding:
+            self._build_add_form(self._body, bg)
+        if not self._rows and not self._adding:
+            tk.Label(self._body,
+                     text=("Nobody is enrolled." if not plan.line
+                           else "No rows could be read from the people file."),
+                     font=ui_display(theme.SIZE_LABEL), fg=theme.FAINT,
+                     bg=bg, anchor="w", justify="left").pack(
+                fill="x", padx=theme.PAD, pady=(theme.PAD_S, 0))
+        for row in self._rows:
+            self._build_block(self._body, bg, row)
+        self._add_btn.set_enabled(self._may_add())
+        self._paint_lock()
+        self._sync_view()
+
+    def _may_add(self) -> bool:
+        plan = self._plan()
+        if plan.line:
+            # A bootstrap offers exactly one action; a broken file offers
+            # none at all, and the button is the thing that says which.
+            return bool(plan.may_create)
+        return may("add", self.admin_state, self._lock)[0] or \
+            self.admin_state != "code_required"
+
+    def _paint_lock(self) -> None:
+        from jarvis import gate as gate_mod
+        state = self.admin_state
+        if state != gate_mod.ADMIN_CODE:
+            for w in (self._code_entry, self._unlock_btn, self._lock_btn):
+                try:
+                    w.pack_forget()
+                except Exception:         # noqa: BLE001 - torn down
+                    pass
+            self._lock_lbl.configure(
+                text=self._snapshot.get("admin_line") or "", fg=theme.FAINT)
+            return
+        if self._lock.locked():
+            self._lock_lbl.configure(text="locked — the override code opens "
+                                          "this tab and nothing else",
+                                     fg=theme.FAINT)
+        else:
+            self._lock_lbl.configure(
+                text="unlocked for %d s" % int(self._lock.remaining()),
+                fg=theme.CYAN)
+
+    def _tick_lock(self) -> None:
+        """Repaint the countdown once a second. The clock is what relocks
+        the page, not this timer: a press that lands after the window
+        passed is refused by ``Lock`` whether or not Tk ran the tick."""
+        self._lock_tick = None
+        if not self._open:
+            return
+        self._paint_lock()
+        try:
+            self._lock_tick = self.after(LOCK_TICK_MS, self._tick_lock)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the lock tick failed", exc_info=True)
+
+    def _untick(self) -> None:
+        if self._lock_tick is None:
+            return
+        try:
+            self.after_cancel(self._lock_tick)
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: tick cancel failed", exc_info=True)
+        self._lock_tick = None
+
+    # ------------------------------------------------------- one person
+    def _build_block(self, parent, bg, row: Row) -> None:
+        block = tk.Frame(parent, bg=bg)
+        block.pack(fill="x", padx=theme.PAD, pady=(0, px(BLOCK_GAP)))
+        head = tk.Frame(block, bg=bg)
+        head.pack(fill="x")
+        tk.Label(head, text=row.display,
+                 font=ui_display(theme.SIZE_BODY, "semibold"), fg=theme.INK,
+                 bg=bg, anchor="w", bd=0, padx=0, pady=0).pack(side="left")
+        tk.Label(head, text=row.label, font=ui_display(theme.SIZE_CAPTION),
+                 fg=theme.FAINT, bg=bg, anchor="w", bd=0, padx=0,
+                 pady=0).pack(side="left", padx=(theme.PAD_S, 0))
+        tk.Label(head, text=ROLE_WORDS.get(row.role, row.role.upper()),
+                 font=ui_display(theme.SIZE_CAPTION, "semibold"),
+                 fg=theme.CYAN if row.role == ROLE_OWNER else theme.MUTED,
+                 bg=bg, anchor="w", bd=0, padx=0,
+                 pady=0).pack(side="left", padx=(theme.PAD_S, 0))
+        forget = RoundButton(head, text="Forget", kind="ghost", bg=bg,
+                             pad_x=8, pad_y=4,
+                             command=lambda who=row.label: self._forget_pressed(who))
+        forget.pack(side="right")
+        role = RoundButton(
+            head, text=("Make known" if row.role == ROLE_OWNER
+                        else "Make owner"),
+            kind="ghost", bg=bg, pad_x=8, pad_y=4,
+            command=lambda who=row.label, r=row.role: self._role_pressed(who, r))
+        role.pack(side="right", padx=(0, px(4)))
+        forget.set_enabled(row.can_forget)
+        role.set_enabled(row.can_change_role)
+        self._row_widgets[row.label] = {"forget": forget, "role": role,
+                                        "block": block}
+        tk.Label(block, text=row.detail, font=ui_display(theme.SIZE_CAPTION),
+                 fg=theme.WARN if row.face_tone == "warn" else theme.MUTED,
+                 bg=bg, anchor="w", justify="left", bd=0, padx=0,
+                 pady=0).pack(fill="x", pady=(px(2), 0))
+        why = row.forget_why or row.role_why
+        if why:
+            tk.Label(block, text=why, font=ui_display(theme.SIZE_CAPTION),
+                     fg=theme.FAINT, bg=bg, anchor="w", justify="left",
+                     bd=0, padx=0, pady=0).pack(fill="x")
+        if self._forget.armed_for == row.label:
+            self._build_forget_panel(block, bg, row.label)
+        if self._role_arm == row.label:
+            self._build_role_panel(block, bg, row.label)
+
+    def _build_forget_panel(self, parent, bg, label) -> None:
+        tk.Label(parent, text="\n".join(forget_warning(label)),
+                 font=ui_display(theme.SIZE_CAPTION), fg=theme.WARN, bg=bg,
+                 anchor="w", justify="left", bd=0, padx=0,
+                 pady=0).pack(fill="x", pady=(px(4), 0))
+        cmd = tk.Frame(parent, bg=bg)
+        cmd.pack(fill="x", pady=(px(2), 0))
+        command = forget_face_command(label)
+        tk.Label(cmd, text=command, font=ui_font(theme.SIZE_CAPTION),
+                 fg=theme.FAINT, bg=bg, anchor="w", justify="left",
+                 bd=0, padx=0, pady=0).pack(side="left", fill="x",
+                                            expand=True)
+        RoundButton(cmd, text="Copy", kind="ghost", bg=bg, pad_x=8, pad_y=4,
+                    command=lambda c=command: self._copy(c)).pack(side="right")
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", pady=(px(4), 0))
+        entry = tk.Entry(row, width=18, bd=0, relief="flat",
+                         bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+                         fg=theme.INK, insertbackground=theme.CYAN,
+                         font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+        entry.pack(side="left", ipady=px(3))
+        RoundButton(row, text="Forget %s" % label, kind="ghost", bg=bg,
+                    pad_x=10, pad_y=4,
+                    command=lambda who=label, e=entry:
+                    self._forget_confirm(who, e.get())).pack(
+            side="left", padx=(theme.PAD_S, 0))
+        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8,
+                    pad_y=4, command=self._cancel).pack(side="left",
+                                                        padx=(px(4), 0))
+        self._row_widgets.setdefault(label, {})["confirm"] = entry
+
+    def _build_role_panel(self, parent, bg, label) -> None:
+        owners = [r.label for r in self._rows if r.role == ROLE_OWNER]
+        tk.Label(parent,
+                 text=("Making a second owner has to name the first. "
+                       "Type %s to confirm." % ", ".join(owners)),
+                 font=ui_display(theme.SIZE_CAPTION), fg=theme.WARN, bg=bg,
+                 anchor="w", justify="left", bd=0, padx=0,
+                 pady=0).pack(fill="x", pady=(px(4), 0))
+        row = tk.Frame(parent, bg=bg)
+        row.pack(fill="x", pady=(px(2), 0))
+        entry = tk.Entry(row, width=18, bd=0, relief="flat",
+                         bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+                         fg=theme.INK, insertbackground=theme.CYAN,
+                         font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+        entry.pack(side="left", ipady=px(3))
+        RoundButton(row, text="Make %s an owner" % label, kind="ghost",
+                    bg=bg, pad_x=10, pad_y=4,
+                    command=lambda who=label, e=entry:
+                    self._role_confirm(who, e.get())).pack(
+            side="left", padx=(theme.PAD_S, 0))
+        RoundButton(row, text="Cancel", kind="ghost", bg=bg, pad_x=8,
+                    pad_y=4, command=self._cancel).pack(side="left",
+                                                        padx=(px(4), 0))
+
+    # ------------------------------------------------------- the add form
+    def _build_add_form(self, parent, bg) -> None:
+        plan = self._plan()
+        box = tk.Frame(parent, bg=bg)
+        box.pack(fill="x", padx=theme.PAD, pady=(0, px(BLOCK_GAP)))
+        first_only = plan.first_owner_only
+        tk.Label(box, text=("Create the first owner" if first_only
+                            else "Add a person"),
+                 font=ui_display(theme.SIZE_BODY, "semibold"), fg=theme.INK,
+                 bg=bg, anchor="w", bd=0, padx=0, pady=0).pack(fill="x")
+        self._add_fields = {}
+        for key, caption in (("name", "name, as he should say it"),
+                             ("label", "label (lower-case, no spaces)"),
+                             ("face", "face gallery label (optional)")):
+            row = tk.Frame(box, bg=bg)
+            row.pack(fill="x", pady=(px(3), 0))
+            tk.Label(row, text=caption, font=ui_display(theme.SIZE_CAPTION),
+                     fg=theme.FAINT, bg=bg, anchor="w", width=26, bd=0,
+                     padx=0, pady=0).pack(side="left")
+            entry = tk.Entry(
+                row, width=20, bd=0, relief="flat",
+                bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+                fg=theme.INK, insertbackground=theme.CYAN,
+                font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+            entry.pack(side="left", ipady=px(3))
+            self._add_fields[key] = entry
+        # THE ROLE. The first row in an empty or ownerless registry must be
+        # an OWNER or the registry stays unusable, so there is no choice to
+        # offer there -- and a general "add person" with a role dropdown is
+        # exactly how somebody makes a KNOWN row and wonders why the gate
+        # is still off.
+        self._add_owner = bool(first_only)
+        if not first_only:
+            row = tk.Frame(box, bg=bg)
+            row.pack(fill="x", pady=(px(3), 0))
+            tk.Label(row, text="role", font=ui_display(theme.SIZE_CAPTION),
+                     fg=theme.FAINT, bg=bg, anchor="w", width=26, bd=0,
+                     padx=0, pady=0).pack(side="left")
+            self._role_btn = RoundButton(
+                row, text="known", kind="ghost", bg=bg, pad_x=10, pad_y=4,
+                command=self._toggle_new_role)
+            self._role_btn.pack(side="left")
+            row2 = tk.Frame(box, bg=bg)
+            row2.pack(fill="x", pady=(px(3), 0))
+            tk.Label(row2, text="existing owner's label (owners only)",
+                     font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT,
+                     bg=bg, anchor="w", width=26, bd=0, padx=0,
+                     pady=0).pack(side="left")
+            self._add_fields["confirm_owner"] = tk.Entry(
+                row2, width=20, bd=0, relief="flat",
+                bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+                fg=theme.INK, insertbackground=theme.CYAN,
+                font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+            self._add_fields["confirm_owner"].pack(side="left", ipady=px(3))
+            # THEIR AGREEMENT, in the shared words, shown before it is asked
+            # for -- a consent nobody could read is not a consent.
+            tk.Label(box, text="\n".join(cs.lines_for(cs.WHAT_ROW,
+                                                      {"who": "this person"})),
+                     font=ui_display(theme.SIZE_CAPTION), fg=theme.MUTED,
+                     bg=bg, anchor="w", justify="left", bd=0, padx=0,
+                     pady=0).pack(fill="x", pady=(px(6), 0))
+            row3 = tk.Frame(box, bg=bg)
+            row3.pack(fill="x", pady=(px(3), 0))
+            tk.Label(row3, text="they type their own label to agree",
+                     font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT,
+                     bg=bg, anchor="w", width=26, bd=0, padx=0,
+                     pady=0).pack(side="left")
+            self._add_fields["consent"] = tk.Entry(
+                row3, width=20, bd=0, relief="flat",
+                bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+                fg=theme.INK, insertbackground=theme.CYAN,
+                font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+            self._add_fields["consent"].pack(side="left", ipady=px(3))
+        act = tk.Frame(box, bg=bg)
+        act.pack(fill="x", pady=(px(6), 0))
+        RoundButton(act, text="Create", kind="accent", bg=bg, pad_x=12,
+                    pad_y=5, command=self._create_pressed).pack(side="left")
+        RoundButton(act, text="Cancel", kind="ghost", bg=bg, pad_x=10,
+                    pad_y=5, command=self._cancel).pack(side="left",
+                                                        padx=(theme.PAD_S, 0))
+        tk.Label(box, text=("A face and a voice are still enrolled at a "
+                            "terminal; this only says who Jarvis knows."),
+                 font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
+                 anchor="w", justify="left", bd=0, padx=0,
+                 pady=0).pack(fill="x", pady=(px(4), 0))
+
+    def _toggle_new_role(self) -> None:
+        self._add_owner = not self._add_owner
+        try:
+            self._role_btn.set_text("owner" if self._add_owner else "known")
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the role button is gone", exc_info=True)
+
+    # ------------------------------------------------------------ presses
+    def _guard(self, action: str) -> bool:
+        ok, why = may(action, self.admin_state, self._lock)
+        if not ok:
+            self.toast(why, "warn")
+        return ok
+
+    def _unlock_pressed(self) -> str:
+        return UsersUnlockControl(
+            self.services, read=lambda: self._code_entry.get(),
+            clear=lambda: self._code_entry.delete(0, "end"),
+            toast=self.toast, later=lambda fn: self.after(0, fn),
+            on_unlocked=self._unlocked).unlock_pressed()
+
+    def _unlocked(self) -> None:
+        self._lock.unlock()
+        self._paint_lock()
+
+    def _lock_pressed(self) -> None:
+        self._lock.lock()
+        self._cancel()
+
+    def _cancel(self) -> None:
+        self._forget.disarm()
+        self._role_arm = ""
+        self._adding = False
+        self._paint()
+
+    def _copy(self, text: str) -> None:
+        """The clipboard, through the seam that already owns it. Never a
+        direct write: his selections are his, and a page that clobbers one
+        while he is pasting is the bug this codebase already has a rule
+        about."""
+        from jarvis import enrolentry
+        try:
+            landed = enrolentry.to_clipboard(text)
+        except Exception:                 # noqa: BLE001 - the clipboard
+            log.debug("users page: the clipboard hook raised", exc_info=True)
+            landed = False
+        self.toast("The command is on your clipboard, sir." if landed
+                   else "The clipboard would not take it; it is on screen.",
+                   "ok" if landed else "warn")
+
+    def _forget_pressed(self, label: str) -> None:
+        if not self._guard("forget"):
+            return
+        self._role_arm = ""
+        self._forget.press(label)
+        self._paint()
+
+    def _forget_confirm(self, label: str, typed) -> None:
+        if not self._guard("forget"):
+            return
+        verdict = self._forget.confirm(label, typed)
+        if verdict == "expired":
+            self.toast("That confirmation has gone cold, sir; press Forget "
+                       "again.", "warn")
+            self._paint()
+            return
+        if verdict == "refused":
+            self.toast("Type %s exactly to confirm, sir." % label, "warn")
+            return
+        self._write("people_forget", label)
+
+    def _role_pressed(self, label: str, role: str) -> None:
+        if not self._guard("set_role"):
+            return
+        self._forget.disarm()
+        if role == ROLE_OWNER:
+            # A demotion needs no second owner named; the registry refuses
+            # to leave nobody in charge on its own.
+            self._write("people_set_role", label, ROLE_KNOWN)
+            return
+        self._role_arm = label
+        self._paint()
+
+    def _role_confirm(self, label: str, typed) -> None:
+        if not self._guard("set_role"):
+            return
+        owners = [r.label for r in self._rows if r.role == ROLE_OWNER]
+        ok, why = owner_confirmed(ROLE_OWNER, owners, typed)
+        if not ok:
+            self.toast(why, "warn")
+            return
+        self._role_arm = ""
+        self._write("people_set_role", label, ROLE_OWNER,
+                    confirm_existing_owner=str(typed or "").strip().lower())
+
+    def _add_pressed(self) -> None:
+        if not self._guard("add"):
+            return
+        self._adding = not self._adding
+        self._forget.disarm()
+        self._role_arm = ""
+        self._paint()
+
+    def _create_pressed(self) -> None:
+        if not self._guard("add"):
+            return
+        fields = getattr(self, "_add_fields", {})
+        label = str(fields["label"].get() if "label" in fields else "")
+        label = label.strip().lower()
+        fault = label_fault(label)
+        if fault:
+            self.toast(fault, "warn")
+            return
+        role = ROLE_OWNER if self._add_owner else ROLE_KNOWN
+        owners = [r.label for r in self._rows if r.role == ROLE_OWNER]
+        confirm = str(fields["confirm_owner"].get()
+                      if "confirm_owner" in fields else "").strip().lower()
+        ok, why = owner_confirmed(role, owners, confirm)
+        if not ok:
+            self.toast(why, "warn")
+            return
+        how = "owner"
+        if role != ROLE_OWNER:
+            typed = fields["consent"].get() if "consent" in fields else ""
+            ok, how = take_consent(label, owner="", show=None,
+                                   ask=lambda: typed,
+                                   mapped=self.winfo_ismapped)
+            if not ok:
+                self.toast(how, "warn")
+                return
+        self._write("people_add", label=label,
+                    name=str(fields["name"].get() if "name" in fields
+                             else "").strip(),
+                    role=role,
+                    face=str(fields["face"].get() if "face" in fields
+                             else "").strip().lower(),
+                    consent=how,
+                    confirm_existing_owner=confirm or None)
+
+    def _write(self, name: str, *args, **kw) -> None:
+        fn = self._service(name)
+        if fn is None:
+            self.toast(UNLOCK_NOT_WIRED, "warn")
+            return
+        try:
+            ok, line = fn(*args, **kw)
+        except Exception:                 # noqa: BLE001 - the app boundary
+            log.exception("users page: %s failed", name)
+            ok, line = False, "That did not work, sir; see the log."
+        if ok:
+            # Each successful action re-arms the dwell, so a run of edits
+            # is one code rather than five.
+            self._lock.touch()
+            self._adding = False
+        self.toast(str(line), "ok" if ok else "warn")
+        self.refresh()
+
+    # -------------------------------------------------------- the scroll
+    def _sync_view(self) -> None:
+        if self._canvas is None:
+            return
+        try:
+            width = self._canvas.winfo_width()
+            self._canvas.itemconfigure(self._body_win, width=width)
+            want = min(self._body.winfo_reqheight(), self._avail_px())
+            if want > 0 and want != self._canvas.winfo_reqheight():
+                self._canvas.configure(height=want)
+            self._canvas.configure(
+                scrollregion=self._canvas.bbox("all") or (0, 0, 0, 0))
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: scroll region unreadable", exc_info=True)
+            return
+        self._sync_thumb()
+
+    def _avail_px(self) -> int:
+        """How much height the scrolling body may take: the page, less what
+        the pinned head and the pinned foot need. THIS is what keeps the
+        Add button on screen at his window with a dozen people on it."""
+        if self._foot is None or self._canvas is None or self._head is None:
+            return 0
+        try:
+            height = max(int(self.winfo_height()), 1)
+            if height <= 1:
+                return 0
+            head = self._head.winfo_reqheight() + theme.PAD_S
+            foot = self._foot.winfo_reqheight() + theme.PAD_S + px(12)
+            return max(px(40), height - head - foot)
+        except Exception:                 # noqa: BLE001 - torn down
+            return 0
+
+    def _sync_thumb(self) -> None:
+        if self._canvas is None:
+            return
+        view_h = self._canvas.winfo_height()
+        over = self.overflow_px()
+        if over <= 0 or view_h <= 1:
+            try:
+                self._thumb.place_forget()
+                self._canvas.yview_moveto(0.0)
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("users page: thumb hide failed", exc_info=True)
+            return
+        content = view_h + over
+        top = self._canvas.canvasy(0)
+        frac = max(0.08, view_h / float(content))
+        try:
+            self._thumb.place(relx=1.0, x=-px(3), anchor="nw",
+                              y=int(top / content * view_h),
+                              height=max(px(12), int(frac * view_h)))
+            self._thumb.lift()
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: thumb place failed", exc_info=True)
+
+    def overflow_px(self) -> int:
+        """How much taller the body is than the viewport. 0 = it all fits."""
+        if self._canvas is None:
+            return 0
+        try:
+            room = self._avail_px() or self._canvas.winfo_height()
+            return max(0, self._body.winfo_reqheight() - room)
+        except Exception:                 # noqa: BLE001 - torn down
+            return 0
+
+    def _scroll(self, units: int) -> None:
+        if self.overflow_px() <= 0:
+            return
+        try:
+            self._canvas.yview_scroll(units, "units")
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: scroll failed", exc_info=True)
+            return
+        self._sync_thumb()
+
+    def _grab_wheel(self, _e=None) -> None:
+        if self._canvas is None:
+            return
+        self._canvas.bind_all("<Button-4>", lambda e: self._scroll(-2))
+        self._canvas.bind_all("<Button-5>", lambda e: self._scroll(2))
+
+    def _drop_wheel(self, _e=None) -> None:
+        if self._canvas is None:
+            return
+        for seq in ("<Button-4>", "<Button-5>"):
+            try:
+                self._canvas.unbind_all(seq)
+            except Exception:             # noqa: BLE001 - torn down
+                log.debug("users page: wheel unbind failed", exc_info=True)

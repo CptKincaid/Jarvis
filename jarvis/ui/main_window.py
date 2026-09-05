@@ -1388,6 +1388,11 @@ class MainWindow:
         # from the two widgets handed to it, so a hidden footer or a packed
         # camera pane cannot put it out of step.
         self.sensors = self._build_sensors()
+        # The USERS page (jarvis/ui/users_page.py) covers the same span for
+        # the same reason: it is a LIST that grows with the number of
+        # people, so over the transcript alone its pinned foot -- the "Add
+        # a person" button and the standing note -- falls off the bottom.
+        self.users = self._build_users()
         self._fill_tabs()
 
     def _build_tabs(self):
@@ -1414,6 +1419,19 @@ class MainWindow:
         if self.sensors is not None:
             strip.add("sensors", "SENSORS", select=self.sensors.show,
                       leave=self.sensors.hide)
+        if self.users is not None:
+            # Hunter, 2026-09-05: "a better process for processing users,
+            # prefereably through a users tab". MEASURED on a private Xvfb
+            # at S=2, IDENTICAL in both looks: CHAT 110 px, SENSORS 158,
+            # USERS 127 requested. With their trailing gaps that is 431 px
+            # of the 976 the row has at his 1040-px window (545 spare) and
+            # of the 856 it has at the older 920 (425 spare), and
+            # strip_clipped() is empty at both. The design ESTIMATED this
+            # tab at 134 px from the word ROOMS; the real word is 127.
+            # tests/test_users_tab_wiring.py measures it rather than
+            # trusting this comment.
+            strip.add("users", "USERS", select=self.users.show,
+                      leave=self.users.hide)
         # CHAT is added first and is therefore already selected; nothing is
         # shown or hidden for it, because the stage under it is what is on
         # screen at build time.
@@ -1446,6 +1464,32 @@ class MainWindow:
         except Exception:                     # noqa: BLE001 - optional lane
             log.exception("sensors page could not be built")
             return None
+
+    def _build_users(self):
+        """The USERS page, or None.
+
+        Imported HERE rather than at module scope so a management surface
+        can never be the reason the console fails to start -- the rule
+        _build_sensors and _build_preview both follow. The page holds no
+        Person and no hash: everything it draws comes through
+        Services.people_snapshot, which returns redacted rows.
+        """
+        try:
+            from jarvis.ui.users_page import UsersPage
+            return UsersPage(self.shell, services=self.services,
+                             cover=(self.reactor, self.transcript),
+                             on_close=self._users_closed, toast=self.toast)
+        except Exception:                     # noqa: BLE001 - optional lane
+            log.exception("users page could not be built")
+            return None
+
+    def _users_closed(self):
+        """The page hid itself. Put the strip back on CHAT so the lit tab
+        matches the screen; select() is idempotent, so the strip's own CHAT
+        press -- which is what called hide() -- does not come back round."""
+        strip = getattr(self, "tabs", None)
+        if strip is not None:
+            strip.select("chat")
 
     def _sensors_closed(self):
         """The page hid itself (quit, or anything else that calls hide()).
@@ -1983,6 +2027,15 @@ class MainWindow:
                 self.sensors.hide()
         except Exception:
             log.exception("sensors page stop failed")
+        # The users page holds no thread and no device, only a one-second
+        # repaint of its unlock countdown -- but hiding it also RELOCKS it,
+        # and a console that quit with the tab unlocked would come back up
+        # having forgotten why.
+        try:
+            if getattr(self, "users", None) is not None:
+                self.users.hide()
+        except Exception:
+            log.exception("users page stop failed")
         if self.board is not None:
             try:
                 self.board.destroy()
@@ -2324,11 +2377,14 @@ class MainWindow:
         self._tabs_hidden = hidden
         strip = getattr(self, "tabs", None)
         if hidden:
-            page = getattr(self, "sensors", None)
+            pages = [getattr(self, "sensors", None),
+                     getattr(self, "users", None)]
             if strip is not None and "chat" in strip.keys:
                 strip.select("chat")      # runs leave() -> the page hides
-            elif page is not None:
-                page.hide()
+            else:
+                for page in pages:
+                    if page is not None:
+                        page.hide()
         if strip is None:
             return
         try:
