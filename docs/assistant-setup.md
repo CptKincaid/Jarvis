@@ -4252,3 +4252,99 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
   face baseline needs three detections in the last five seconds.
 * One hand. Two hands out at the lens is not this gesture, on purpose.
 * A question on the floor (a read-back waiting on your yes) blocks a grab.
+
+## 84. Knightfall: the two ways back in when he will not admit you
+
+The owner gate (`owner.mode`) decides whether a turn is answered and in
+whose name. **Enforcement is still `shadow` and nothing in this section
+changes it** — in shadow the gate logs the verdict it *would* have given and
+refuses nobody. Knightfall is the pair of doors that work even when the
+voice check will not open: **a phrase you say**, and **a code you type**.
+
+Both open the same thing: a **five-minute window** in which turns are
+attributed to you. Read that plainly — the window admits the *room*, not
+your voice. Anyone speaking during those five minutes is taken for you.
+That is the deliberate trade the gate was built with (`jarvis/gate.py`,
+GRANT_S = 300 s); the code does not shorten it, it only adds a second way
+to open it.
+
+### Setting them (you type these; nothing else can)
+
+```bash
+cd ~/Jarvis
+~/vss_env/bin/python scripts/jarvis_people.py set-phrase hunter
+~/vss_env/bin/python scripts/jarvis_people.py set-code hunter
+```
+
+Each prompts twice, never echoes, and never takes the secret from the
+command line (`ps` would show it to the whole machine). The label is
+optional — leave it out and it uses the configured owner. Both refuse
+anyone who is not an owner, and both refuse to run from anything but a
+keyboard.
+
+* `set-phrase` is the **spoken** way in. At least 12 letters and digits once
+  punctuation is dropped; "Knightfall protocol" is 19, so it passes. What is
+  stored is the *normalised* form (lower case, no punctuation), because
+  Whisper capitalises and punctuates as it pleases.
+* `set-code` is the **typed** break-glass, at least 6 characters. It is never
+  accepted over the microphone, so it cannot be overheard or replayed.
+  Surrounding spaces are dropped at both ends now, so a stray keystroke at
+  the prompt cannot make a code you can never type again.
+
+Neither is stored: both are salted-hashed (scrypt), and nothing in this
+repository can read either back.
+
+### Saying it
+
+Say the phrase **on its own**, or straight after the wake word — "Jarvis,
+Knightfall protocol". Both are consumed. A phrase buried in the middle of a
+longer sentence is *not*: matching every span of every sentence would cost a
+key derivation each (~18 ms), on every turn, and that is a price ordinary
+talking should not pay.
+
+When it matches, the turn ends there: he says "Thank you, sir. I'm
+listening.", re-opens the microphone, and **dispatches nothing** — no
+command, no model, no transcript. The log line names who and which path; the
+words themselves are never written down, in any mode. This works with
+`owner.mode` set to `off`, `shadow` or `enforce`.
+
+Five wrong phrase-shaped guesses in five minutes from a voice nobody
+recognises close the phrase until the window passes. Your own sentences
+never count against that.
+
+### Typing it
+
+Settings → Privacy → **Knightfall code**: a masked box and **Open**. The box
+is cleared the moment you press it, before anything else happens. The line
+that comes back is the only answer, and it never contains a code.
+
+Using the code **rotates** it. A fresh eight-character code (no `0`/`o`,
+no `1`/`l`) is mailed to your first configured mail account, from that same
+account, subject "Knightfall" — and only when the mail server hands back a
+Message-ID is the new one stored. So:
+
+* mail sent → the new code is live, the old one is dead, and it is in your
+  inbox;
+* mail refused, no account configured, no Message-ID → **the old code stays
+  valid** and the line says so. There is never a moment with no working
+  code.
+
+**Email me a new Knightfall code** does the same thing without typing
+anything — that is how you get the first one — and it answers at most once a
+minute. A press that mailed nothing does not start that minute.
+
+The typed code is a way back in, not a wall: anybody already at this
+keyboard can edit or delete `people.json`, which turns the gate off
+entirely. It is written down here so it is not mistaken for security.
+
+### If it does not work
+
+* `grep knightfall /tmp/vss_voice/jarvis.log` — the lines carry who and
+  which path (`the phrase opened the floor to …`, `the code opened the
+  floor to …`) and never the words.
+* Phrase not heard? The spoken form has to match the stored one exactly
+  once punctuation and case are dropped. Set it again — `set-phrase`
+  overwrite is the only cure, since nothing can read the old one back.
+* No mail? `mail_accounts` reads `gmail.accounts` from
+  `~/.config/jarvis/assistant.json`; with none configured the button says so
+  and changes nothing.

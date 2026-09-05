@@ -1980,6 +1980,97 @@ class RestartArm:
         self._armed_at = None
 
 
+# Knightfall, in the drawer (2026-09-04). The typed code is the break-glass
+# for when the spoken passphrase cannot work either; these are the strings
+# the control uses, kept together so nothing here can drift into carrying a
+# code. NONE of them interpolates anything: a Status line comes back from
+# the app already safe, and a failure says only that it failed.
+KNIGHTFALL_NOT_WIRED = "Knightfall not wired"
+KNIGHTFALL_FAILED = "Knightfall: that did not work, sir; see the log"
+# What makes a returned line a GOOD one. The app's success lines are
+# "Knightfall accepted, sir; ..." and "... a new code is in your inbox.";
+# every refusal, cooldown and mail failure is a warn.
+KNIGHTFALL_OK_MARKS = ("Knightfall accepted", "in your inbox")
+
+
+class KnightfallControl:
+    """The Knightfall row's logic, WITHOUT Tk -- the RestartArm pattern, for
+    the same reason: a control that can only be exercised by building a
+    window cannot be tested here at all.
+
+    THE ENTRY IS CLEARED BEFORE THE SERVICE IS CALLED, not after it
+    returns. The service mails a code and can block for seconds on a
+    socket; a typed code must not sit on screen while that happens, and it
+    must not still be there if the drawer is closed mid-call.
+
+    Four seams, all injected: ``read``/``clear`` are the entry, ``toast``
+    shows a line, ``later`` marshals back onto the Tk thread, and ``spawn``
+    runs the call off it (a daemon thread by default). The thread is named
+    "knightfall" -- never anything derived from what was typed.
+    """
+
+    def __init__(self, services, *, read: Callable[[], str],
+                 clear: Callable[[], None], toast: Callable,
+                 later: Callable[[Callable], None],
+                 spawn: Optional[Callable] = None):
+        self.services = services
+        self.read = read
+        self.clear = clear
+        self.toast = toast
+        self.later = later
+        self.spawn = spawn or self._thread
+
+    @staticmethod
+    def _thread(fn, *args):
+        threading.Thread(target=fn, args=args, daemon=True,
+                         name="knightfall").start()
+
+    def _service(self, name):
+        return getattr(self.services, name, None) if self.services else None
+
+    @staticmethod
+    def kind_of(line: str) -> str:
+        return "ok" if any(mark in (line or "")
+                           for mark in KNIGHTFALL_OK_MARKS) else "warn"
+
+    def _not_wired(self) -> str:
+        log.warning("knightfall: no service is wired to this drawer")
+        self.toast(KNIGHTFALL_NOT_WIRED, "warn")
+        return "not wired"
+
+    def _run(self, fn, *args):
+        try:
+            line = fn(*args)
+        except Exception:  # noqa: BLE001 - the service's own boundary
+            # NOT the exception's text: it came from a mail transport, and
+            # the thing being mailed is a code.
+            log.exception("knightfall: the service failed")
+            line = KNIGHTFALL_FAILED
+        line = str(line or KNIGHTFALL_FAILED)
+        self.later(lambda: self.toast(line, self.kind_of(line)))
+
+    def open_pressed(self) -> str:
+        """The Open button: read the code, clear the entry AT ONCE, hand it
+        to the app off this thread. "started" or "not wired"."""
+        code = self.read()
+        self.clear()
+        fn = self._service("knightfall_code")
+        if fn is None:
+            del code
+            return self._not_wired()
+        self.spawn(self._run, fn, code)
+        del code
+        return "started"
+
+    def new_pressed(self) -> str:
+        """"Email me a new Knightfall code": the bootstrap, no entry."""
+        fn = self._service("knightfall_new_code")
+        if fn is None:
+            return self._not_wired()
+        self.spawn(self._run, fn)
+        return "started"
+
+
 class SettingsDrawer(tk.Frame):
     """320px slide-over from the right (RAISED, scrollable). Groups per the
     V3 spec. Every control binds CONFIG via bind_config(); changes persist
@@ -2440,6 +2531,10 @@ class SettingsDrawer(tk.Frame):
                             "left or right. Needs the camera preview on.")
         self._info_row(box, "The microphone stays on while offline — say "
                             "“come back online” to switch sensing back on.")
+        # Knightfall (2026-09-04): the TYPED way back in when the spoken
+        # passphrase cannot work either. In Privacy because it is a way
+        # past the owner gate, which is what the rows above are about.
+        self._knightfall_row(box)
 
         # System
         box = self._section("System")
@@ -2455,6 +2550,49 @@ class SettingsDrawer(tk.Frame):
         self._code_status_lbl = self._info_row(box, self._code_status_text())
         self._restart_row(box)
         tk.Frame(self._inner, bg=theme.RAISED, height=theme.PAD_L).pack()
+
+    # ---------------------------------------------------- Knightfall
+    def _knightfall_row(self, box):
+        """A masked entry with an Open button, and the bootstrap button
+        under it. The entry is never bound to CONFIG and never read except
+        by the press: nothing here persists a code anywhere."""
+        row = self._row(box, "Knightfall code")
+        self._knightfall_entry = tk.Entry(
+            row, show="•", width=12, bd=0, relief="flat",
+            bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+            fg=theme.INK, insertbackground=theme.CYAN,
+            font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
+        self._knightfall_entry.pack(side="right", padx=(theme.PAD_S, 0))
+        self._knightfall_open = RoundButton(
+            row, text="Open", kind="ghost", bg=theme.RAISED, pad_x=8,
+            pad_y=4, command=self._knightfall_open_pressed)
+        self._knightfall_open.pack(side="right")
+        self._knightfall_new = self._button_row(
+            box, "Email me a new Knightfall code",
+            self._knightfall_new_pressed)
+        self._info_row(box, "Typed only, never spoken. Using it emails you "
+                            "the next one.")
+        return self._knightfall_entry
+
+    def _knightfall_control(self) -> KnightfallControl:
+        entry = getattr(self, "_knightfall_entry", None)
+        return KnightfallControl(
+            self.services,
+            read=(lambda: entry.get()) if entry is not None else (lambda: ""),
+            clear=(lambda: entry.delete(0, "end")) if entry is not None
+            else (lambda: None),
+            toast=self._knightfall_toast,
+            later=lambda fn: self.after(0, fn))
+
+    def _knightfall_toast(self, text, kind="info"):
+        if self.toast:
+            self.toast.show(text, kind=kind)
+
+    def _knightfall_open_pressed(self):
+        return self._knightfall_control().open_pressed()
+
+    def _knightfall_new_pressed(self):
+        return self._knightfall_control().new_pressed()
 
     # ------------------------------------------------- restart button
     def _restart_row(self, box):
