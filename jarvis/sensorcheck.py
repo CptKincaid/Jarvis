@@ -96,16 +96,15 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from jarvis.config import PATHS
 from jarvis.logs import get_logger
 from jarvis.roomsensor import DEFAULT_TIMEOUT_S, RoomSensor
+from jarvis.sensorprofile import profile_dir, profile_path
 from jarvis.sensing import RADAR
 
 log = get_logger("sensorcheck")
@@ -218,24 +217,13 @@ def wanted_gates(profile: Optional[dict]) -> Optional[Tuple[int, int]]:
 
 
 # ---------------------------------------------------------------- profiles
-def profile_dir() -> Path:
-    """Where ``scripts/room_sensor.py`` keeps the profiles.
-
-    Derived from ``PATHS.ASSISTANT_CONFIG`` rather than from ``Path.home()``
-    so that the suite's redirect of the config directory carries this with
-    it -- the tests must never read the real profiles, which hold his
-    Wi-Fi PSK.
-    """
-    return PATHS.ASSISTANT_CONFIG.parent / "room-sensors"
-
-
-def profile_path(room: str, directory: Optional[Path] = None) -> Path:
-    """``<dir>/<room>.json``, slugged exactly as ``Profile.path_for``."""
-    slug = re.sub(r"[^a-z0-9-]+", "-", str(room).lower()).strip("-")
-    return Path(directory if directory is not None else profile_dir()) / \
-        ("%s.json" % slug)
-
-
+# WHERE A PROFILE LIVES IS SPELLED ONCE, in jarvis/sensorprofile.py, which
+# is also what the SENSORS page's setup sheet reads and writes. This module
+# had its own copy of both functions until 2026-09-05; two copies of "where
+# the profile lives" is how a boot check and a setup sheet come to disagree
+# about which file they are arguing over. The narrow read below is still
+# this module's own -- that is a promise about what it HOLDS, not about
+# where it looks.
 def read_profile(room: str, directory: Optional[Path] = None) -> Optional[dict]:
     """The TWO geometry fields of a room's profile, or None.
 

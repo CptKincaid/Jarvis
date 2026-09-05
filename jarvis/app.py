@@ -223,7 +223,30 @@ KNIGHTFALL_BODY_LINE = "Typed only, never spoken. This replaces the old one."
 KNIGHTFALL_OK_LINE = "Knightfall accepted, sir; a new code is in your inbox."
 KNIGHTFALL_NEW_OK_LINE = "Knightfall: a new code is in your inbox."
 KNIGHTFALL_COOLDOWN_LINE = "Knightfall: one code a minute, sir."
+# The bootstrap with an empty people book. MEASURED on :93 at S=2
+# (2026-09-05): the line this replaced was 1541 px of text in a toast strip
+# that holds 894 px at his window, so widgets.ellipsize cut it mid-word --
+# "...nobody is enrolled as an owner yet (scri" -- which is the "knightfall
+# text doesnt fit in its slot" he reported. The strip is ONE line by design
+# (widgets.Toast.STRIP_H), so the fix is a line that fits: 580 px, whole at
+# 920x1440 as well. The state it describes is CORRECT and unchanged --
+# Knightfall cannot work until somebody is enrolled as an owner -- and the
+# command that fixes it goes to the log, which is where a line too long for
+# the strip belongs (docs/assistant-setup.md, "If it does not work").
+KNIGHTFALL_NO_OWNER_LINE = "Knightfall: enrol an owner first, sir."
+KNIGHTFALL_NO_OWNER_LOG = ("knightfall: nobody is enrolled as an owner yet; "
+                           "run scripts/jarvis_people.py add <you> "
+                           "--role owner")
 KNIGHTFALL_COOLDOWN_S = 60.0
+# The rotation's failure lines carry the exception's TYPE, never its words,
+# because that text came from a transport that had just been handed a code.
+# This one is different in a way worth writing down: it is raised by
+# mail.notice_destination BEFORE anything reaches a transport, so it can be
+# a sentence he can act on. It is still a CONSTANT rather than str(exc), so
+# there is no channel from an exception's words to the toast -- and it names
+# no address, because the toast is on screen.
+KNIGHTFALL_BAD_DESTINATION = ("the notice address in your config is not an "
+                              "email address")
 # ONE ROTATION AT A TIME. check -> open -> mail -> store is not atomic, and
 # the drawer runs each press on its own thread: two presses measured
 # (verdict, 2026-09-05) both passed the check against the OLD hash, both
@@ -6918,8 +6941,8 @@ class JarvisApp:
             except Exception:                      # noqa: BLE001 - no registry
                 who = ""
             if not who:
-                return ("Knightfall: nobody is enrolled as an owner yet "
-                        "(scripts/jarvis_people.py add ... --role owner)")
+                log.warning(KNIGHTFALL_NO_OWNER_LOG)
+                return KNIGHTFALL_NO_OWNER_LINE
             line, mailed = self._knightfall_rotate(who, mail=mail, smtp=smtp,
                                                    accepted=False)
             # THE CLOCK STARTS ON A CODE THAT ACTUALLY LEFT. It used to be
@@ -6930,6 +6953,45 @@ class JarvisApp:
             if mailed:
                 self._knightfall_new_ts = t
             return line
+
+    def knightfall_status(self) -> dict:
+        """What the drawer's Knightfall caption needs, for
+        ui.views.format_knightfall_status. Three keys:
+
+        * ``to`` -- the MASKED destination the next code would go to, or
+          "" when there is none. Masked because the drawer is on screen
+          and a full address does not need to be.
+        * ``problem`` -- a fixed sentence when his configured destination
+          is not usable, "" otherwise.
+        * ``setup`` -- where to configure a mailbox, when there is none.
+
+        WHY IT EXISTS AT ALL. The caption under the button was the flat
+        sentence "Using it emails you the next one" -- which was false in
+        the state he was actually in (zero mail accounts configured,
+        measured 2026-09-05): the button mails nothing, and the promise
+        was made before he pressed. A read only: no socket, no code.
+        """
+        from jarvis.tools import mail as mail_mod
+        out = {"to": "", "problem": "", "setup": ""}
+        try:
+            accounts = mail_mod.mail_accounts(self.assistant)
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the mail accounts could not be read")
+            accounts = []
+        if not accounts:
+            try:
+                out["setup"] = mail_mod.setup_line(self.assistant)
+            except Exception:                      # noqa: BLE001 - config
+                log.exception("knightfall: the setup line could not be read")
+            return out
+        try:
+            out["to"] = mail_mod._mask_address(
+                mail_mod.notice_destination(accounts[0]))
+        except mail_mod.NoticeAddressInvalid:
+            out["problem"] = KNIGHTFALL_BAD_DESTINATION
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the notice destination is unreadable")
+        return out
 
     def _knightfall_rotate(self, who, *, mail=None, smtp=None,
                            accepted=False):
@@ -6953,8 +7015,11 @@ class JarvisApp:
         """
         head = "Knightfall accepted, sir; " if accepted else "Knightfall: "
         keep = head + "the code stays as it is (mail: %s)."
+        # The REAL module either way: `mail` is the seam a test substitutes
+        # for the transport, but the destination and the refusal that goes
+        # with it are decided against the real one (see outbox.send_notice).
+        from jarvis.tools import mail as mail_mod
         if mail is None:
-            from jarvis.tools import mail as mail_mod
             mail = mail_mod
         try:
             accounts = mail.mail_accounts(self.assistant)
@@ -6969,6 +7034,17 @@ class JarvisApp:
         try:
             msgid = outbox.send_notice(account, KNIGHTFALL_SUBJECT, body,
                                        smtp=smtp, mail=mail)
+        except mail_mod.NoticeAddressInvalid:
+            # HIS CONFIG, not the transport: notice_destination refused a
+            # destination that is not an address, before a socket was
+            # opened. Nothing was sent and nothing is stored, so the old
+            # code stands -- and he is told what to fix rather than a
+            # class name, because these words are ours and never touched
+            # a mail server.
+            del new, body
+            log.warning("knightfall: the configured notice address is not "
+                        "an address; the old code stands")
+            return keep % KNIGHTFALL_BAD_DESTINATION, False
         except Exception as exc:                   # noqa: BLE001 - transport
             # MailSendFailed, or anything else the transport did: the old
             # code stands, and only the TYPE of what went wrong is said.
@@ -7059,11 +7135,16 @@ class JarvisApp:
             # both run off the Tk thread (KnightfallControl).
             knightfall_code=self.knightfall_code,
             knightfall_new_code=self.knightfall_new_code,
-            # The USERS tab (jarvis/ui/users_page.py). Five narrow seams:
-            # a redacted snapshot, the administrative unlock, and the three
-            # writes. Each answers ONE line to toast and never a hash.
-            # build_ui_services drops them on a UI that does not declare
-            # them, so either merge order is safe.
+            knightfall_status=self.knightfall_status,
+            # The USERS tab (jarvis/ui/users_page.py). Seven narrow seams:
+            # a redacted snapshot, the administrative unlock, the three
+            # writes, and the two that stop the PAGE being the guard --
+            # people_admin_state re-reads the file so a code set at a
+            # terminal is noticed while the tab is open, people_relock
+            # shuts the app's dwell when he leaves it. Each answers ONE
+            # line to toast and never a hash. build_ui_services drops them
+            # on a UI that does not declare them, so either merge order is
+            # safe.
             people_snapshot=self.people_snapshot,
             people_unlock=self.people_unlock,
             people_add=self.people_add,

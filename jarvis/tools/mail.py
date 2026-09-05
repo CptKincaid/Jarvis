@@ -136,7 +136,11 @@ def gmail_settings(cfg) -> Optional[dict]:
             # from this account does not have to re-read the config; blank
             # is fine, smtp_host() derives one from the IMAP host.
             "smtp_host": str(_cfg_get(cfg, "gmail.smtp_host", "") or "").strip(),
-            "from_name": str(_cfg_get(cfg, "gmail.from_name", "") or "").strip()}
+            "from_name": str(_cfg_get(cfg, "gmail.from_name", "") or "").strip(),
+            # Where a NOTICE from this account goes (notice_destination
+            # above). Blank = the account's own address, i.e. today.
+            "notice_to": str(_cfg_get(cfg, "gmail.notice_to", "")
+                             or "").strip()}
 
 
 def mail_accounts(cfg) -> list[dict]:
@@ -182,6 +186,12 @@ def mail_accounts(cfg) -> list[dict]:
             # Gmail's server with the wrong credentials (F22, 09-03).
             "smtp_host": str(entry.get("smtp_host") or "").strip(),
             "from_name": str(entry.get("from_name") or "").strip(),
+            # PER ACCOUNT, and deliberately NOT inherited from the
+            # top-level gmail.notice_to -- the same trap as smtp_host in
+            # F22, where one top-level key silently applied to mailboxes
+            # it was never meant for. A top-level notice_to belongs to the
+            # legacy single mailbox and stops there.
+            "notice_to": str(entry.get("notice_to") or "").strip(),
         })
     return out
 
@@ -583,6 +593,59 @@ NO_ACCOUNT_LINE = "I'm not sure which account to send from, sir."
 
 class MailSendFailed(RuntimeError):
     """SMTP refused, or the attachment could not be read."""
+
+
+class NoticeAddressInvalid(MailSendFailed):
+    """``notice_to`` is set in his config to something that is not an
+    address. A MailSendFailed so every existing ``except`` still holds."""
+
+
+# What a notice destination has to look like. Deliberately its own pattern
+# and not outbox's _ADDR_RX: that one SEARCHES spoken text for something
+# address-shaped and may legitimately find one inside a sentence, while
+# this one is a whole-string check on a value he typed into a config file.
+# One address, no display name, no comma list -- a notice has exactly one
+# recipient, and "a@b.com, c@d.com" quietly becoming one malformed
+# recipient is the kind of thing that should be said out loud, not sent.
+_NOTICE_ADDR_RX = re.compile(r"[\w.+\-]+@[\w\-]+(\.[\w\-]+)+\Z")
+
+
+def notice_destination(account: dict) -> str:
+    """Where a NOTICE for this account goes; raises NoticeAddressInvalid.
+
+    THIS IS THE WHOLE DESIGN OF THE FEATURE, so it is worth stating here.
+    ``outbox.send_notice`` has no recipient parameter -- that is the guard
+    that makes "can a tool loop mail a stranger?" answerable, and it must
+    not be given one. But Hunter wants the rotated Knightfall code sent to
+    the mailbox his Oracle backup mails to, which is a different address
+    from the sending account's own.
+
+    The difference that makes that safe: an address the ADMINISTRATOR put
+    in his config file is not the same thing as an address a CALLER passes
+    at runtime. So the destination rides on the account object, which
+    ``mail_accounts()`` mints out of his config alongside the SMTP
+    credential -- one function, one file. Anything that could forge the
+    destination would have to forge ``address`` and ``password`` too, and
+    something holding sending credentials never needed this seam.
+
+    ``notice_to`` unset, blank or whitespace -> the account's own address,
+    exactly as before this key existed: the change is invisible until he
+    opts in, and unset can never mean "nowhere".
+
+    ``notice_to`` set to something that is not an address -> REFUSED, not
+    quietly self-sent. He set the key because he expects the code at the
+    address he named; a silent fallback would leave a live code in a
+    different inbox while he waited at the one he chose.
+    """
+    acct = account if isinstance(account, dict) else {}
+    configured = str(acct.get("notice_to") or "").strip()
+    if configured:
+        if not _NOTICE_ADDR_RX.match(configured):
+            # NOT the value itself: this text reaches a toast on his screen.
+            raise NoticeAddressInvalid("the configured notice address is "
+                                       "not an email address")
+        return configured
+    return str(acct.get("address") or "").strip()
 
 
 def smtp_host(account: dict) -> str:
