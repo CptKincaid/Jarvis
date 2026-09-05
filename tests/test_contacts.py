@@ -831,7 +831,9 @@ def test_a_broken_file_in_a_fresh_process_refuses_the_cli_add(book_file):
     proc = subprocess.run([sys.executable, str(SCRIPT), "remove", "Heather Smith",
                            "--yes"], env=env, capture_output=True, text=True,
                           timeout=60)
-    assert proc.returncode == 2 and "REFUSED:" in proc.stdout
+    assert proc.returncode == 2
+    assert proc.stdout.startswith("REFUSED: " + BROKEN), proc.stdout
+    assert proc.stdout.rstrip().endswith(FIX_IT), "remove says the file is broken"
     assert book_file.read_text(encoding="utf-8") == text
 
 
@@ -1055,3 +1057,432 @@ def test_the_docs_and_the_cli_help_admit_gmail_con_cannot_be_caught(cli, capsys)
     with pytest.raises(SystemExit):
         cli.main(["add", "--help"])
     assert "gmail.con" in capsys.readouterr().out
+
+
+# ==================================================================
+# 7. The re-review (round 2): a one-word row he can actually choose,
+#    "Dr Heather" is the same question, a symlinked book stays one, the
+#    CLI says "broken" when it is, and four small leftovers
+# ==================================================================
+ONE_WORD = [{"name": "Heather", "email": "h@example.com"},
+            {"name": "Heather Jones", "email": "hj@example.com"}]
+
+
+# ---- (B1) the ordinal picks the row of the list that was READ, by identity
+@pytest.mark.parametrize("said, who, addr", [
+    ("the first one", "Heather", "h@example.com"),
+    ("1", "Heather", "h@example.com"),
+    ("number one", "Heather", "h@example.com"),
+    ("the second one", "Heather Jones", "hj@example.com"),
+    ("2", "Heather Jones", "hj@example.com"),
+    ("Jones", "Heather Jones", "hj@example.com"),
+    ("Heather Jones", "Heather Jones", "hj@example.com"),
+])
+def test_an_ordinal_picks_the_one_word_row_of_the_list_that_was_read(
+        cmd_book, said, who, addr):
+    """The reviewed loop: "the first one" re-resolved the spoken name
+    "Heather", the collision rule asked again, and a FRESH slot was made
+    every time -- the same question four times running, never a pick,
+    never the drop. The answer names a row of the list he was read; it is
+    resolved by that row's identity and never back through the name."""
+    write(book_mod.book_path(), ONE_WORD)
+    res = cmd_book.handle("email the biosensors handout to Heather", source="voice")
+    assert res.reply == "Which Heather, sir — Heather or Heather Jones?"
+    res = cmd_book.handle(said, source="voice")
+    assert res is not None and res.reply.endswith("Send it, sir?"), (said, res)
+    assert f"to {who}, from your school account" in res.reply
+    assert "example" not in res.reply, "the address is never spoken"
+    assert res.display_only == f"to {addr}", "and it is shown"
+    assert cmd_book._pending_send is not None
+    assert cmd_book._pending_sendask is None
+    assert not FakeSMTP.made
+
+
+@pytest.mark.parametrize("said, who, addr", [
+    ("the second one", "Mum", "linda@example.com"),
+    ("2", "Mum", "linda@example.com"),
+    ("the first one", "Sam Mum", "sam@example.com"),
+    ("Sam Mum", "Sam Mum", "sam@example.com"),
+])
+def test_sam_mum_and_mum_the_ordinal_picks_and_the_yes_sends_there(cmd_book, said,
+                                                                   who, addr):
+    write(book_mod.book_path(), [{"name": "Sam Mum", "email": "sam@example.com"},
+                                 {"name": "Mum", "email": "linda@example.com"}])
+    res = cmd_book.handle("email the biosensors handout to Mum", source="voice")
+    assert res.reply == "Which Mum, sir — Sam Mum or Mum?"
+    res = cmd_book.handle(said, source="voice")
+    assert f"to {who}, from your school account" in res.reply, res
+    assert res.display_only == f"to {addr}"
+    assert cmd_book._pending_send is not None and not FakeSMTP.made
+    res = cmd_book.handle("yes", source="voice")
+    assert res.ack and FakeSMTP.made[-1].sent[0]["To"] == addr
+    assert cmd_book.spoken == [f"Sent to {who}, sir."]
+
+
+def test_a_miss_spends_the_same_question_and_an_ordinal_then_still_picks(cmd_book):
+    write(book_mod.book_path(), ONE_WORD)
+    cmd_book.handle("email the biosensors handout to Heather", source="voice")
+    ask = cmd_book._pending_sendask
+    assert ask is not None and ask.kind == "person" and ask.reasked is False
+    res = cmd_book.handle("Heather", source="voice")     # the ambiguity itself
+    assert res.reply == "The full name, sir — Heather or Heather Jones?"
+    assert cmd_book._pending_sendask is ask, "the SAME slot, not a fresh one"
+    assert ask.reasked is True
+    res = cmd_book.handle("the first one", source="voice")
+    assert "to Heather, from your school account" in res.reply, res
+    assert res.display_only == "to h@example.com"
+    assert cmd_book._pending_sendask is None and not FakeSMTP.made
+
+
+def test_two_misses_are_the_drop_never_the_same_question_again(cmd_book):
+    write(book_mod.book_path(), ONE_WORD)
+    cmd_book.handle("email the biosensors handout to Heather", source="voice")
+    ask = cmd_book._pending_sendask
+    res = cmd_book.handle("Heather", source="voice")
+    assert res.reply.startswith("The full name, sir") and cmd_book._pending_sendask is ask
+    res = cmd_book.handle("Heather", source="voice")
+    assert res.reply == outbox.ASK_DROPPED_LINE and res.status == "Dropped"
+    assert cmd_book._pending_sendask is None and cmd_book._pending_send is None
+    # with no question on the floor an ordinal answers nothing
+    res = cmd_book.handle("the first one", source="voice")
+    assert res is None or not str(res.reply or "").startswith("Which Heather")
+    assert cmd_book._pending_send is None and cmd_book._pending_sendask is None
+    assert not FakeSMTP.made
+
+
+def test_a_row_that_went_between_the_question_and_the_answer_is_a_miss(cmd_book):
+    """He was read a list; by the time he answers the row is gone (a hand
+    edit). Re-resolving the NAME would quietly find the other Heather; by
+    identity it is nobody, so it is a miss and the question is spent."""
+    write(book_mod.book_path(), ONE_WORD)
+    cmd_book.handle("email the biosensors handout to Heather", source="voice")
+    ask = cmd_book._pending_sendask
+    write(book_mod.book_path(), ONE_WORD[1:])
+    res = cmd_book.handle("the first one", source="voice")
+    assert res.reply.startswith("The full name, sir"), res
+    assert cmd_book._pending_sendask is ask and ask.reasked is True
+    assert cmd_book._pending_send is None and not FakeSMTP.made
+
+
+def test_pick_is_by_identity_and_never_a_question(book_file):
+    write(book_file, ONE_WORD)
+    book = book_mod.current()
+    assert book.resolve("Heather").ambiguous, "the name is the question"
+    res = book.pick("Heather")
+    assert res is not None and res.found and res.addr == "h@example.com"
+    assert res.name == "Heather" and res.from_book and res.matched_on == "full name"
+    assert book.pick("Heather Jones").addr == "hj@example.com"
+    assert book.pick("Jones") is None, "a full name only, never a part"
+    assert book.pick("Nobody") is None
+
+
+# ---- (A3) honorific + a flagged one-word name is the same question
+def test_dr_heather_against_a_flagged_one_word_row_is_a_question(book_file):
+    write(book_file, [{"name": "Heather", "email": "h@example.com", "honorific": "Dr"},
+                      {"name": "Heather Jones", "email": "hj@example.com"}])
+    book = book_mod.current()
+    for said in ("Dr Heather", "Dr. Heather", "dr heather"):
+        res = book.resolve(said)
+        assert res.ambiguous and res.candidates == ["Heather", "Heather Jones"], (said, res)
+    # the two-word name and its honorific form stay exact
+    assert book.resolve("Heather Jones").addr == "hj@example.com"
+    assert book.resolve("Jones").addr == "hj@example.com"
+    # the honorific on both rows changes nothing
+    write(book_file, [{"name": "Heather", "email": "h@example.com", "honorific": "Dr"},
+                      {"name": "Heather Jones", "email": "hj@example.com",
+                       "honorific": "Dr"}])
+    assert book.resolve("Dr Heather").candidates == ["Heather", "Heather Jones"]
+    assert book.resolve("Dr Heather Jones").addr == "hj@example.com"
+    # and as the ANSWER to the question it is the ambiguity again, not a pick
+    cands = ["Heather", "Heather Jones"]
+    assert book.choose("Dr Heather", cands) is None
+    assert book.choose("Dr Heather Jones", cands) == "Heather Jones"
+    assert book.choose("Jones", cands) == "Heather Jones"
+
+
+def test_control_dr_smith_beside_dr_heather_smith_still_asks(book_file):
+    write(book_file, [{"name": "Smith", "email": "s@example.com", "honorific": "Dr"},
+                      {"name": "Heather Smith", "email": "hs@example.com",
+                       "honorific": "Dr"}])
+    book = book_mod.current()
+    assert book.resolve("Dr Smith").candidates == ["Smith", "Heather Smith"]
+    assert book.resolve("Smith").candidates == ["Smith", "Heather Smith"]
+    assert book.resolve("Dr Heather Smith").addr == "hs@example.com"
+    assert book.resolve("Heather").addr == "hs@example.com"
+
+
+def test_an_exact_two_word_name_with_its_honorific_still_wins(two_heathers):
+    book = book_mod.current()
+    assert book.resolve("Dr Heather Smith").addr == "heather@example.com"
+    assert book.resolve("Dr Smith").addr == "heather@example.com"
+
+
+def test_the_commander_asks_for_dr_heather_and_the_ordinal_picks(cmd_book):
+    write(book_mod.book_path(), [{"name": "Heather", "email": "h@example.com",
+                                  "honorific": "Dr"},
+                                 {"name": "Heather Jones", "email": "hj@example.com"}])
+    res = cmd_book.handle("email the biosensors handout to Dr Heather", source="voice")
+    assert res.reply.startswith("Which") and res.reply.endswith("Heather or Heather Jones?"), res
+    assert res.status == "Which person?" and cmd_book._pending_send is None
+    res = cmd_book.handle("the first one", source="voice")
+    assert "to Dr Heather, from your school account" in res.reply, res
+    assert res.display_only == "to h@example.com"
+    assert not FakeSMTP.made
+
+
+# ---- (A2) a symlinked book stays a symlink; the write lands beside the target
+def _no_temp_litter(*dirs):
+    return all(not list(Path(d).glob(".contacts-*")) for d in dirs)
+
+
+def test_a_symlinked_book_stays_a_symlink_and_the_target_gets_the_row(tmp_path, book_file):
+    target = tmp_path / "dotfiles" / "book.json"
+    write(target, [{"name": "Mum", "email": "linda@example.com"}])
+    book_file.parent.mkdir(parents=True, exist_ok=True)
+    book_file.symlink_to(target)
+    book = book_mod.current()
+    assert book.resolve("Mum").found
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is not None, why
+    assert book_file.is_symlink(), "the link is replaced by a regular file"
+    assert Path(os.readlink(book_file)) == target
+    names = [r["name"] for r in json.loads(target.read_text())["contacts"]]
+    assert names == ["Mum", "Dana Ruiz"], "the row went to the REAL file"
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert _no_temp_litter(book_file.parent, target.parent)
+    # a hand edit of the target is live on the next resolve, no restart
+    data = json.loads(target.read_text())
+    data["contacts"].append({"name": "Zed Zorro", "email": "zed@example.com"})
+    target.write_text(json.dumps(data), encoding="utf-8")
+    assert book.resolve("Zed Zorro").addr == "zed@example.com"
+    assert book.resolve("Dana Ruiz").addr == "dana@example.com"
+    # remove writes beside the target too
+    gone, why = book.remove("Mum", "linda@example.com")
+    assert gone is not None and book_file.is_symlink()
+    names = [r["name"] for r in json.loads(target.read_text())["contacts"]]
+    assert names == ["Dana Ruiz", "Zed Zorro"]
+
+
+def test_a_dangling_symlink_gets_its_target_created(tmp_path, book_file):
+    target = tmp_path / "dotfiles" / "book.json"        # dotfiles/ does not exist
+    book_file.parent.mkdir(parents=True, exist_ok=True)
+    book_file.symlink_to(target)
+    book = book_mod.current()
+    assert book.broken == "" and book.contacts == [], "a missing target is an empty book"
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is not None, why
+    assert book_file.is_symlink() and target.is_file()
+    assert [r["name"] for r in json.loads(target.read_text())["contacts"]] == ["Dana Ruiz"]
+    assert stat.S_IMODE(target.stat().st_mode) == 0o600
+    assert book.resolve("Dana Ruiz").found
+
+
+# ---- (A1) the CLI says the book is broken, not "nothing in the book"
+def test_cli_remove_and_show_on_a_broken_file_say_the_promised_line(cli, two_heathers, capsys):
+    text = _corrupt(two_heathers)
+    line = (f"REFUSED: contacts.json is not valid JSON ({two_heathers}) "
+            "— fix it by hand first")
+    assert cli.main(["remove", "Heather Smith", "--yes"]) == 2
+    assert capsys.readouterr().out.strip() == line
+    assert cli.main(["show", "Heather Smith"]) == 2
+    out = capsys.readouterr().out.strip()
+    assert out == line, out
+    assert "UNKNOWN" not in out and "nothing in the book" not in out
+    assert two_heathers.read_text(encoding="utf-8") == text
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads anything")
+def test_cli_remove_and_show_on_an_unreadable_file_say_so(cli, two_heathers, capsys):
+    two_heathers.chmod(0)
+    try:
+        line = (f"REFUSED: contacts.json could not be read ({two_heathers}) "
+                "— fix it by hand first")
+        assert cli.main(["remove", "Mum", "--yes"]) == 2
+        assert capsys.readouterr().out.strip() == line
+        assert cli.main(["show", "Mum"]) == 2
+        assert capsys.readouterr().out.strip() == line
+    finally:
+        two_heathers.chmod(0o600)
+
+
+# ---- (a) empty is empty, a BOM is a BOM, anything else is broken
+@pytest.mark.parametrize("text", ["", "\n", "   \n\t \n"])
+def test_an_empty_or_whitespace_file_is_an_empty_writable_book(book_file, text):
+    """`touch contacts.json` then `add` must work: a 0-byte file is what a
+    missing file is, an empty book, not a broken one."""
+    book_file.parent.mkdir(parents=True, exist_ok=True)
+    book_file.write_text(text, encoding="utf-8")
+    book = book_mod.current()
+    assert book.broken == "" and book.contacts == [] and book.skipped == []
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is not None, why
+    data = json.loads(book_file.read_text(encoding="utf-8"))
+    assert data == {"format": 1, "contacts": [{"name": "Dana Ruiz",
+                                              "email": "dana@example.com"}]}
+
+
+def test_a_utf8_bom_is_stripped_on_read(book_file):
+    body = json.dumps({"format": 1, "contacts": [
+        {"name": "Mum", "email": "linda@example.com"}], "comment": "kept"})
+    book_file.parent.mkdir(parents=True, exist_ok=True)
+    book_file.write_bytes(b"\xef\xbb\xbf" + body.encode("utf-8"))
+    book = book_mod.current()
+    assert book.broken == "", book.broken
+    assert book.resolve("Mum").addr == "linda@example.com"
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is not None, why
+    raw = book_file.read_bytes()
+    assert not raw.startswith(b"\xef\xbb\xbf"), "the rewrite is plain UTF-8"
+    data = json.loads(raw.decode("utf-8"))
+    assert [r["name"] for r in data["contacts"]] == ["Mum", "Dana Ruiz"]
+    assert data["comment"] == "kept"
+
+
+@pytest.mark.parametrize("text", ["{", "[]", "null", "42", '"book"', "{,}",
+                                  '{"format": 1, "contacts": [}',
+                                  "﻿{"])
+def test_anything_else_malformed_stays_broken(book_file, text):
+    book_file.parent.mkdir(parents=True, exist_ok=True)
+    book_file.write_text(text, encoding="utf-8")
+    book = book_mod.current()
+    assert book.broken.startswith("contacts.json") and book.broken.endswith(FIX_IT), text
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is None and why == book.broken
+    assert book_file.read_text(encoding="utf-8") == text
+
+
+# ---- (c) an alias that is someone's name loses the ALIAS, not a person
+@pytest.mark.parametrize("order", ["alias row first", "name row first"])
+def test_an_alias_that_is_someones_name_drops_the_alias_and_keeps_both_people(
+        book_file, order):
+    mum = {"name": "Mum", "email": "linda@example.com", "aliases": ["mom", "Heather"]}
+    heather = {"name": "Heather", "email": "h@example.com"}
+    rows = [mum, heather] if order == "alias row first" else [heather, mum]
+    write(book_file, rows)
+    before = book_file.read_text(encoding="utf-8")
+    book = book_mod.current()
+    assert sorted(c.name for c in book.contacts) == ["Heather", "Mum"], "both kept"
+    assert book.skipped == [] and book.flagged == []
+    assert book.resolve("Heather").addr == "h@example.com", "the NAME wins"
+    assert book.resolve("Mum").addr == "linda@example.com"
+    assert book.resolve("mom").addr == "linda@example.com", "the other alias stays"
+    assert len(book.trimmed) == 1
+    t = book.trimmed[0]
+    assert t.name == "Mum" and t.index == rows.index(mum)
+    assert "Heather" in t.why and "alias" in t.why.lower(), t.why
+    assert "example.com" not in t.why
+    assert book.public()["trimmed"] == [{"index": t.index, "name": "Mum", "why": t.why}]
+    assert book_file.read_text(encoding="utf-8") == before, "a load writes nothing"
+    # a rewrite keeps HIS alias in the file: the file is his
+    book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    kept = [r for r in json.loads(book_file.read_text())["contacts"] if r["name"] == "Mum"]
+    assert kept[0]["aliases"] == ["mom", "Heather"]
+
+
+def test_an_alias_that_is_a_first_name_or_another_alias_is_trimmed_too(book_file):
+    write(book_file, [{"name": "Heather Jones", "email": "hj@example.com"},
+                      {"name": "Mum", "email": "linda@example.com",
+                       "aliases": ["Heather", "mom"]},
+                      {"name": "Dad", "email": "dad@example.com", "aliases": ["mom", "pa"]}])
+    book = book_mod.current()
+    assert [c.name for c in book.contacts] == ["Heather Jones", "Mum", "Dad"]
+    assert book.resolve("Heather").addr == "hj@example.com"
+    assert book.resolve("mom").addr == "linda@example.com", "first in the file keeps it"
+    assert book.resolve("pa").addr == "dad@example.com"
+    assert [(t.name, t.index) for t in book.trimmed] == [("Mum", 1), ("Dad", 2)]
+
+
+def test_cli_list_and_the_page_show_the_dropped_alias(cli, book_file, capsys):
+    write(book_file, [{"name": "Heather", "email": "h@example.com"},
+                      {"name": "Mum", "email": "linda@example.com", "aliases": ["Heather"]}])
+    assert cli.main(["list"]) == 0
+    out = capsys.readouterr().out
+    assert "2 people in" in out
+    assert "row 2 Mum:" in out and "Heather" in out.split("row 2 Mum:")[1]
+    assert "(kept)" in out and "alias" in out.lower()
+    assert cli.main(["show", "Heather"]) == 0
+    assert "FOUND: Heather <h@example.com>" in capsys.readouterr().out
+
+
+def test_add_still_refuses_an_alias_that_is_someones_name(two_heathers):
+    book = book_mod.current()
+    before = two_heathers.read_text(encoding="utf-8")
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com",
+                             "aliases": ["Heather"]})
+    assert contact is None and "already how" in why
+    contact, why = book.add({"name": "Advisor", "email": "dana@example.com"})
+    assert contact is None and "already an alias" in why
+    assert two_heathers.read_text(encoding="utf-8") == before
+
+
+# ---- (f) the commander's INFO lines never carry an address he typed
+def test_the_commander_log_masks_an_address_he_typed(cmd_book, caplog):
+    with caplog.at_level(logging.INFO, logger="jarvis.commander"):
+        cmd_book.handle("email the biosensors handout to Heather Smith", source="voice")
+        cmd_book.handle("yes, to hjones@example.com", source="voice")
+        cmd_book.handle("no", source="voice")
+        cmd_book.handle("email the biosensors handout to dana@example.com",
+                        source="voice")
+    lines = [r.getMessage() for r in caplog.records if r.name == "jarvis.commander"]
+    assert lines, "the commander logged nothing at INFO"
+    assert "hjones@example.com" not in caplog.text
+    assert "dana@example.com" not in caplog.text
+    handled = [ln for ln in lines if ln.startswith("handle ")]
+    assert any("h…@example.com" in ln for ln in handled), handled
+    assert any("d…@example.com" in ln for ln in handled), handled
+    readback = [ln for ln in lines if ln.startswith("send read-back:")
+                and "corrects the draft" in ln]
+    assert readback and all("h…@example.com" in ln for ln in readback), readback
+    assert not FakeSMTP.made
+
+
+def test_mask_addresses_masks_every_address_in_a_sentence():
+    assert outbox.mask_addresses("yes, to hjones@example.com") == "yes, to h…@example.com"
+    assert outbox.mask_addresses("cc a@x.org and b@y.co.uk.") == "cc a…@x.org and b…@y.co.uk."
+    assert outbox.mask_addresses("no address here") == "no address here"
+    assert outbox.mask_addresses("") == ""
+
+
+# ---- the stamp while broken: a fix that lands in the same tick as the
+#      last good write, byte-identical, must still be seen
+def test_a_fix_in_the_same_tick_as_the_last_good_write_is_still_seen(two_heathers,
+                                                                      monkeypatch):
+    """Measured once in a two-file run (test_a_fixed_file_writes_again, 1 in
+    326): the fixed file was byte-identical to the one the Book had loaded
+    and landed inside the filesystem's ~1 ms tick, so its stamp EQUALLED
+    the last good stamp, refresh() short-circuited on it, and the book
+    stayed broken with the file already fixed. (Comparing against the
+    BROKEN stamp instead fails the other way: a chmod and its undo in one
+    tick, test_an_unreadable_file_refuses_a_write.) So a broken book is
+    re-read on every refresh. The stamps are held here so the tick is a
+    fact of the test, not a race."""
+    good = ("mtime-1", 200, "ctime-1")
+    held = {"stamp": good}
+    monkeypatch.setattr(book_mod, "_stamp", lambda path: held["stamp"])
+    book = book_mod.current()
+    assert book.broken == "" and book.resolve("Mum").found
+    _corrupt(two_heathers)
+    held["stamp"] = ("mtime-1", 201, "ctime-1")       # same tick, one byte more
+    assert book.add({"name": "Dana Ruiz", "email": "dana@example.com"})[0] is None
+    assert book.broken.startswith(BROKEN)
+    write(two_heathers, TWO_HEATHERS)
+    held["stamp"] = good                    # the fix: identical bytes, same tick
+    contact, why = book.add({"name": "Dana Ruiz", "email": "dana@example.com"})
+    assert contact is not None and why == "", why
+    assert book.broken == ""
+    assert book.resolve("Dana Ruiz").addr == "dana@example.com"
+
+
+def test_the_stamp_carries_the_inode_so_a_rename_over_is_always_a_change(two_heathers):
+    """A same-size rewrite that lands in the same tick is missed by
+    (mtime_ns, size, ctime_ns); a rename-over (an editor's atomic save,
+    the CLI's own write) is a NEW inode, and the inode in the stamp makes
+    that half of the window a change every time."""
+    before = book_mod._stamp(two_heathers)
+    assert two_heathers.stat().st_ino in before, before
+    tmp = two_heathers.with_name("saved.json")
+    tmp.write_bytes(two_heathers.read_bytes())
+    os.replace(tmp, two_heathers)
+    after = book_mod._stamp(two_heathers)
+    assert after != before
+    assert two_heathers.stat().st_ino in after

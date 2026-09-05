@@ -211,6 +211,29 @@ def spoken_address(addr: str) -> str:
                 .replace("_", " underscore ").replace("-", " dash "))
 
 
+_ADDRESS_IN_TEXT_RX = re.compile(r"[^\s@<>,;]+@[^\s@<>,;]+")
+
+
+def mask_addresses(text) -> str:
+    """"yes, to hjones@example.com" -> "yes, to h…@example.com": every
+    address-shaped token in a sentence masked the way mail and this
+    module already mask a single address, for a log line that carries
+    what he TYPED. The rest of the sentence is kept -- it is the line's
+    whole point -- and a trailing full stop stays outside the mask."""
+    text = str(text or "")
+    if "@" not in text:
+        return text
+
+    def _one(m):
+        token = m.group(0)
+        tail = ""
+        while token and token[-1] in ".,;:!?":
+            tail, token = token[-1] + tail, token[:-1]
+        return mail_mod._mask_address(token) + tail
+
+    return _ADDRESS_IN_TEXT_RX.sub(_one, text)
+
+
 def account_words(account: dict) -> str:
     """"your school account"."""
     label = mail_mod.account_label(account)
@@ -462,7 +485,8 @@ def prepare(cfg, memory, file_query: str, recipient: str,
             account_hint: str = "", subject: str = "",
             now: Optional[float] = None,
             search_roots: Optional[list] = None,
-            chosen=None) -> Prepared:
+            chosen=None,
+            resolved: Optional[contacts_mod.Resolution] = None) -> Prepared:
     """Turn the request into a Draft, or into the question to ask.
 
     Checked in the order a failure is cheapest to say: is there a mailbox
@@ -474,6 +498,13 @@ def prepare(cfg, memory, file_query: str, recipient: str,
     as a spoken phrase rather than round the side of it, so the containment
     check, the cap and the mtime the draft records are the ones every other
     send passed; the only thing it skips is the guessing.
+
+    ``resolved`` is the recipient already settled: the answer to "Which
+    Heather, sir?" names ONE row of the list that was read out, and the
+    commander resolves it by that row's identity (contacts.Book.pick).
+    Going back through ``resolve`` with the row's name would, for a
+    one-word row beside "Heather Jones", ask the question again -- the
+    reviewed loop. Everything after the recipient is unchanged.
     """
     accounts = mail_mod.mail_accounts(cfg)
     if not accounts:
@@ -502,7 +533,7 @@ def prepare(cfg, memory, file_query: str, recipient: str,
         return Prepared(ask=EMPTY_LINE.format(what=spoken_name(match.path)),
                         status="Refused: empty")
 
-    res = resolve(cfg, memory, recipient)
+    res = resolved if resolved is not None else resolve(cfg, memory, recipient)
     addr, who = res.addr, res.name
     if res.ambiguous:
         # Two rows in the address book answer to the name he said. A

@@ -1255,3 +1255,47 @@ def test_the_page_refuses_the_reviewers_bad_addresses(server, book):
                                                  "email": bad})
         assert status == 400 and "bad address" in out["error"], bad
     assert not book.exists()
+
+
+def test_the_409_carries_the_check_that_actually_failed(server, book):
+    """A broken book AND a bad row: the row is refused for its own reason
+    (400, the validation text); a good row on a broken book is refused
+    because the book is broken (409, the fix-it-by-hand line). The
+    status names the check that failed, never the other one."""
+    text = ('{\n  "format": 1,\n  "contacts": [\n'
+            '    {"name": "Heather Smith", "email": "heather@example.com"},\n'
+            '  ]\n}\n')
+    book.parent.mkdir(parents=True, exist_ok=True)
+    book.write_text(text, encoding="utf-8")
+    status, out = contacts_post(server.srv, {"op": "add", "name": "Dana Ruiz",
+                                             "email": "x@-.-"})
+    assert status == 400 and "bad address" in out["error"], out
+    assert "not valid JSON" not in out["error"]
+    status, out = contacts_post(server.srv, {"op": "add", "name": "Dana Ruiz",
+                                             "email": "dana@example.com"})
+    assert status == 409, out
+    assert out["error"].startswith("REFUSED: contacts.json is not valid JSON")
+    assert "bad address" not in out["error"]
+    status, out = contacts_post(server.srv, {"op": "remove", "name": "Heather Smith",
+                                             "email": "heather@example.com"})
+    assert status == 409 and out["error"].startswith("REFUSED: contacts.json")
+    assert book.read_text(encoding="utf-8") == text, "byte-identical throughout"
+
+
+def test_the_page_lists_an_alias_it_passed_over_and_keeps_both_people(server, book):
+    """An alias that is someone else's name: the page's JSON carries the
+    row that lost the alias, the reason, and BOTH people -- the numbers
+    the page's list renders from (the JavaScript is not driven here)."""
+    book.parent.mkdir(parents=True, exist_ok=True)
+    book.write_text(json.dumps({"format": 1, "contacts": [
+        {"name": "Heather", "email": "h@example.com"},
+        {"name": "Mum", "email": "linda@example.com", "aliases": ["Heather", "mom"]},
+    ]}), encoding="utf-8")
+    status, out = call(server.srv, "GET", "/api/contacts", token=server.srv.token)
+    assert status == 200, out
+    assert [c["name"] for c in out["contacts"]] == ["Heather", "Mum"]
+    assert out["contacts"][1]["aliases"] == ["mom"], "the alias is not used"
+    assert out["skipped"] == [] and out["flagged"] == []
+    assert out["trimmed"] == [{"index": 1, "name": "Mum", "why": out["trimmed"][0]["why"]}]
+    assert "Heather" in out["trimmed"][0]["why"] and "alias" in out["trimmed"][0]["why"]
+    assert "example.com" not in out["trimmed"][0]["why"]

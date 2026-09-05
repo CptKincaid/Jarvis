@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import inspect
 import json
+import logging
 import os
 import random
 import re
@@ -119,6 +120,34 @@ from jarvis.router import (ROUTER_QUESTION, WEB_CUE_RX, RouteDecision,
                            estimate_size, local_cues, normalise)
 
 log = get_logger("commander")
+
+
+class _MaskTypedAddresses(logging.Filter):
+    """An address he TYPES ("yes, to hjones@example.com") reached the log
+    unmasked through the lines that echo the sentence ("handle ...", "send
+    read-back: ... corrects the draft"). outbox and mail mask theirs; this
+    masks the commander's at the logger, so every present and future line
+    that carries an utterance is covered, including the confirm lane's,
+    which another branch owns and this one does not touch."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and any(
+                isinstance(a, str) and "@" in a for a in args):
+            record.args = tuple(outbox.mask_addresses(a)
+                                if isinstance(a, str) and "@" in a else a
+                                for a in args)
+        elif isinstance(args, dict):
+            if any(isinstance(a, str) and "@" in a for a in args.values()):
+                record.args = {k: outbox.mask_addresses(a)
+                               if isinstance(a, str) and "@" in a else a
+                               for k, a in args.items()}
+        if isinstance(record.msg, str) and "@" in record.msg:
+            record.msg = outbox.mask_addresses(record.msg)
+        return True
+
+
+log.addFilter(_MaskTypedAddresses())
 
 # Fixed persona lines (spec 3.4) — prewarmed in the speech cache by the app.
 ALLOWED_LINE = "Allowed, sir."
@@ -10218,7 +10247,7 @@ class Commander:
         return result
 
     def _handle_inner(self, text: str, source: str, gate: bool = True) -> CommandResult:
-        log.info("handle %r source=%s", text, source)
+        log.info("handle %r source=%s", outbox.mask_addresses(text), source)
         self._raw_text = text          # original casing for handlers that need it
 
         # 1. A ringing alarm owns the next words (spec 5.2 a) -- checked
@@ -11090,13 +11119,39 @@ class Commander:
                 return CommandResult(handled=True, speak=True,
                                      status=outbox.WHICH_PERSON_STATUS,
                                      reply=contacts_mod.reask_line(ask.candidates))
+            # The row he named, by IDENTITY -- never the name back through
+            # resolve. "The first one" of "Heather or Heather Jones" is the
+            # row called Heather; resolving the name "Heather" would find
+            # the same two rows and ask again, with a fresh slot each time
+            # (the reviewed loop). A row that has gone since the list was
+            # read is a miss on the same question, not a re-resolve that
+            # could quietly land on the other Heather.
+            try:
+                row = contacts_mod.current().pick(picked)
+            except Exception:                  # noqa: BLE001 - a file read
+                log.exception("send person: the address book could not be read")
+                row = None
+            if row is None:
+                log.info("send person: %r named %s, which has gone; asking again",
+                         said[:40], picked)
+                if ask.reasked:
+                    self._answered_pending = True
+                    return CommandResult(handled=True, speak=True,
+                                         status="Dropped",
+                                         reply=outbox.ASK_DROPPED_LINE)
+                ask.reasked = True
+                self._pending_sendask = ask
+                self._answered_pending = True
+                return CommandResult(handled=True, speak=True,
+                                     status=outbox.WHICH_PERSON_STATUS,
+                                     reply=contacts_mod.reask_line(ask.candidates))
             self._answered_pending = True
             log.info("send person: %r means %s", said[:40], picked)
-            # The FULL name goes back through prepare: an exact full name
-            # resolves outright in the book, so this is the ordinary path
-            # with the ambiguity taken out of it, and nothing is sent.
+            # Back through prepare with the recipient SETTLED, so the file,
+            # the cap and the account are checked as for every other send
+            # and the read-back is the ordinary one; nothing is sent.
             prep = outbox.prepare(cfg, memory, ask.said_file, picked,
-                                  account_hint=ask.hint)
+                                  account_hint=ask.hint, resolved=row)
             return _send_file_finish(self, prep, ask.said_file, picked,
                                      ask.hint,
                                      reasked_kind="person" if ask.reasked else "")

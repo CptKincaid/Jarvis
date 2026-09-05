@@ -78,6 +78,8 @@ def do_list(book: book_mod.Book, as_json: bool) -> int:
         say(f"BAD (not used): row {s.index + 1} {s.name or '(no name)'}: {s.why}")
     for f in book.flagged:
         say(f"AMBIGUOUS (kept): row {f.index + 1} {f.name}: {f.why}")
+    for t in book.trimmed:
+        say(f"ALIAS NOT USED (kept): row {t.index + 1} {t.name}: {t.why}")
     if book.broken:
         say(f"REFUSED: {book.broken} (this is the last good book; nothing "
             "can be added or removed until it reads)")
@@ -88,6 +90,13 @@ def do_list(book: book_mod.Book, as_json: bool) -> int:
 
 
 def do_show(book: book_mod.Book, name: str) -> int:
+    book.refresh()
+    if book.broken:
+        # A fresh process has NO last good rows, so the verdict on a broken
+        # file would be UNKNOWN for everyone -- true of the book in memory,
+        # a lie about the one on disk. Say which.
+        say(f"REFUSED: {book.broken}")
+        return EXIT_REFUSED
     res = book.resolve(name)
     if res.found:
         say(f"FOUND: {res.name} <{res.addr}> (matched on {res.matched_on})")
@@ -118,6 +127,12 @@ def do_add(book: book_mod.Book, args) -> int:
 
 
 def do_remove(book: book_mod.Book, args) -> int:
+    book.refresh()
+    if book.broken:
+        # Before resolving: against the empty last-good book of a fresh
+        # process the row is "not in the book", which reads as gone.
+        say(f"REFUSED: {book.broken}")
+        return EXIT_REFUSED
     res = book.resolve(args.name)
     if res.unknown:
         say(f"REFUSED: nothing in the book for {args.name!r}")

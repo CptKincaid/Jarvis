@@ -917,9 +917,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._error(500, "the address book could not be written")
             return
         if contact is None:
-            if book.broken:
+            if book.broken and why == book.broken:
                 # The file on disk cannot be read: nothing is written,
                 # and the last good rows are never written back over it.
+                # Keyed on WHICH check refused: a bad row on a broken
+                # book is refused for the row (400, below), and the 409
+                # carries the fix-it-by-hand line only when that is why.
                 self._error(409, "REFUSED: " + why)
                 return
             self._error(400, why)
@@ -2365,6 +2368,19 @@ never spoken.</p>
       name.appendChild(text("span", "badge", "ambiguous, kept"));
       who.appendChild(name);
       who.appendChild(text("div", "meta", f.why));
+      li.appendChild(who);
+      list.appendChild(li);
+    });
+    (out.trimmed || []).forEach(function (t) {
+      /* An alias that is someone else's name: the row is kept and used,
+         the alias is not, and the file still has it. */
+      var li = document.createElement("li");
+      li.className = "bad";
+      var who = text("div", "who", "");
+      var name = text("div", "name", "row " + (t.index + 1) + ": " + t.name);
+      name.appendChild(text("span", "badge", "alias not used, row kept"));
+      who.appendChild(name);
+      who.appendChild(text("div", "meta", t.why));
       li.appendChild(who);
       list.appendChild(li);
     });

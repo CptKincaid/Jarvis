@@ -201,6 +201,20 @@ class Contact:
             keys.add(f"{hon} {self.surname}")
         return {k for k in keys if k}
 
+    def exact_keys(self) -> set:
+        """The spellings that are this person's WHOLE name: the full name
+        and honorific + full name. Saying one of these is saying all of
+        it, so it wins outright over a rival who merely shares a first
+        name or a surname -- unless the whole name IS a rival's first name
+        or surname (the flagged one-word collision, "Heather" beside
+        "Heather Jones"). Then "Heather" and "Dr Heather" alike are the
+        question itself: the Dr adds nothing the other row denies."""
+        keys = {self.full}
+        hon = normalise(self.honorific)
+        if hon:
+            keys.add(f"{hon} {self.full}")
+        return {k for k in keys if k}
+
     def alias_keys(self) -> set:
         return {normalise(a) for a in self.aliases if normalise(a)}
 
@@ -299,12 +313,10 @@ def validate_row(raw) -> tuple[Optional[Contact], str]:
 
 
 def _duplicate(existing, new: Contact) -> str:
-    """The SKIP class: a second row that is the same person, or an alias
-    that is someone else's name. On load the later row is dropped."""
+    """The SKIP class: a second row that is the same person. On load the
+    later row is dropped."""
     new_full = new.full
     new_email = new.email.lower()
-    new_aliases = new.alias_keys()
-    new_names = new.name_keys()
     for other in existing:
         if other is new:
             continue
@@ -312,6 +324,19 @@ def _duplicate(existing, new: Contact) -> str:
             return f"already in the book as {other.name}"
         if other.email.lower() == new_email:
             return f"that address is already in the book as {other.name}"
+    return ""
+
+
+def _alias_clash(existing, new: Contact) -> str:
+    """An alias that is someone else's name or alias, or a name that is
+    someone else's alias. A REFUSAL on add (check_unique); on load the
+    alias alone is trimmed and both people kept (Book._install), because a
+    nickname he typed for one person must never cost him another."""
+    new_aliases = new.alias_keys()
+    new_names = new.name_keys()
+    for other in existing:
+        if other is new:
+            continue
         clash = new_aliases & other.keys()
         if clash:
             return (f"alias {sorted(clash)[0]!r} is already how {other.name} "
@@ -326,6 +351,8 @@ def _duplicate(existing, new: Contact) -> str:
 def _how_known(contact: Contact, key: str) -> str:
     """"first name" / "surname" / "Dr + surname" -- how ``key`` is one of
     ``contact``'s own name keys."""
+    if key == contact.full:
+        return "name"
     if key == contact.first and key != contact.surname:
         return "first name"
     if key == contact.surname:
@@ -362,7 +389,7 @@ def check_unique(existing, new: Contact) -> str:
     or honorific + surname ("Heather" beside "Heather Jones", "Dr Smith"
     beside Dr Heather Smith) -- a one-word name has to be unique.
     """
-    why = _duplicate(existing, new)
+    why = _duplicate(existing, new) or _alias_clash(existing, new)
     if why:
         return why
     for other in existing:
@@ -445,7 +472,16 @@ def _write_private(path: Path, text: str) -> None:
     """Atomic 0600 write: mkstemp in the same directory (0600 by mkstemp),
     fsync, os.replace, chmod to be sure. The same dance as
     assistant_config and identity keep; a third copy rather than a shared
-    module because consolidating the three is its own change."""
+    module because consolidating the three is its own change.
+
+    Beside the REAL file: os.replace over a symlink replaces the link
+    itself, which is how a dotfiles-managed book was silently turned into
+    a regular file on its first add (the target kept the old rows and a
+    later hand edit of it was invisible). Resolved first, the write lands
+    in the target's directory and the link stays a link; a dangling link
+    gets its target created.
+    """
+    path = Path(os.path.realpath(path))
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd, tmp = tempfile.mkstemp(prefix=".contacts-", suffix=".tmp",
                                dir=str(path.parent))
@@ -466,11 +502,16 @@ def _write_private(path: Path, text: str) -> None:
 
 
 def _stamp(path: Path):
-    """(mtime_ns, size, ctime_ns). ctime is in it so a chmod -- which moves
-    neither mtime nor size -- still counts as the file having changed."""
+    """(mtime_ns, size, ctime_ns, inode). ctime is in it so a chmod -- which
+    moves neither mtime nor size -- still counts as the file having
+    changed; the inode so a rename-over (an editor's atomic save, the
+    CLI's own write) is a change even when it lands inside the
+    filesystem's time tick with the same size. A same-size rewrite IN
+    PLACE inside that tick is the one edit this cannot see, and no hand
+    lands one."""
     try:
         st = path.stat()
-        return (st.st_mtime_ns, st.st_size, st.st_ctime_ns)
+        return (st.st_mtime_ns, st.st_size, st.st_ctime_ns, st.st_ino)
     except OSError:
         return None
 
@@ -479,8 +520,8 @@ class Book:
     """The book as last read, and the stamp it was read at.
 
     ``current()`` is the door: it re-stats the file every time and re-reads
-    when the (mtime_ns, size, ctime_ns) stamp has moved -- one stat per send, per
-    question answer, per correction. An edit by hand, by the CLI or by the
+    when the (mtime_ns, size, ctime_ns, inode) stamp has moved -- one stat
+    per send, per question answer, per correction. An edit by hand, by the CLI or by the
     page is live on the next resolve with no restart, and AssistantConfig
     stays load-once.
     """
@@ -491,6 +532,7 @@ class Book:
         self.contacts: list = []         # the validated ones
         self.skipped: list = []          # bad rows: not used, kept in the file
         self.flagged: list = []          # collisions: used, but as a question
+        self.trimmed: list = []          # aliases not used: the row is kept
         self.extra: dict = {}            # unknown top-level keys, kept
         # Why the file on disk cannot be read right now, or "". While it is
         # set the rows above are the LAST GOOD book, for resolving only:
@@ -506,7 +548,18 @@ class Book:
         """Re-read if the file moved. Never raises."""
         with self._lock:
             stamp = _stamp(self.path)
-            if self._loaded and stamp == self.stamp:
+            # A BROKEN file is re-read on every refresh, never short-
+            # circuited on its stamp. Kernel file times are coarse (a tick
+            # of ~1 ms here), so the fix he makes can land in the same tick
+            # as the break (a chmod and its undo) or restore the exact bytes
+            # in the same tick as the last good write -- and against either
+            # stamp the fixed file compares "unchanged" and the book stays
+            # broken with the file already fixed. Seen both ways in the
+            # suite, where a whole test runs inside one tick. The cost is
+            # one read per resolve while the book is broken -- the state
+            # the warning asks him to end -- and the stamp still gates the
+            # warning to once per change.
+            if self._loaded and not self.broken and stamp == self.stamp:
                 return self
             if stamp is None:
                 # Missing file = empty book. Not an error, not a log line:
@@ -514,7 +567,13 @@ class Book:
                 self._install([], {}, None)
                 return self
             try:
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
+                # utf-8-sig: a BOM from a Windows editor is not a syntax
+                # error. A 0-byte or whitespace-only file (`touch`) is what
+                # a missing file is -- an empty, writable book -- and not
+                # a broken one; anything else that is not JSON stays broken.
+                text = self.path.read_text(encoding="utf-8-sig")
+                raw = (json.loads(text) if text.strip()
+                       else {"format": FORMAT, "contacts": []})
                 if not isinstance(raw, dict):
                     raise ValueError("not an object")
                 if raw.get("format") != FORMAT:
@@ -548,7 +607,7 @@ class Book:
             return self
 
     def _install(self, rows: list, extra: dict, stamp) -> None:
-        contacts, skipped, flagged = [], [], []
+        contacts, skipped, flagged, trimmed = [], [], [], []
         for i, row in enumerate(rows):
             contact, why = validate_row(row)
             if contact is not None:
@@ -561,6 +620,30 @@ class Book:
                 continue
             contact.index = i
             contacts.append(contact)
+        # An alias that is another row's NAME (full, first, surname, with
+        # or without the honorific), or an earlier row's alias: the alias
+        # is not used and the row is. A name beats an alias in either
+        # file order; between two aliases the first in the file keeps it.
+        # In memory only -- the file keeps his alias (a rewrite carries
+        # the raw rows), and the page/CLI list says which one was passed
+        # over and why.
+        for c in contacts:
+            for alias in list(c.aliases):
+                key = normalise(alias)
+                owner = next((o for o in contacts if o is not c
+                              and key in o.name_keys()), None)
+                if owner is not None:
+                    why = (f"alias {alias!r} not used: it is {owner.name}'s "
+                           f"{_how_known(owner, key)}")
+                else:
+                    owner = next((o for o in contacts if o.index < c.index
+                                  and key in o.alias_keys()), None)
+                    if owner is None:
+                        continue
+                    why = (f"alias {alias!r} not used: it is already how "
+                           f"{owner.name} is known")
+                c.aliases.remove(alias)
+                trimmed.append(Skipped(index=c.index, name=c.name, why=why))
         # A one-word name that is also someone's first name or surname:
         # BOTH rows stay (they are his, and each is a real person) and
         # both are flagged, because the name now resolves as a question.
@@ -577,6 +660,7 @@ class Book:
         self.contacts = contacts
         self.skipped = skipped
         self.flagged = flagged
+        self.trimmed = trimmed
         self.extra = extra
         self.broken = ""
         self.stamp = stamp
@@ -591,6 +675,10 @@ class Book:
             log.warning("contacts: %d row(s) in %s collide: %s", len(flagged),
                         self.path, "; ".join(
                             f"#{f.index + 1} {f.name}: {f.why}" for f in flagged))
+        if trimmed:
+            log.warning("contacts: %d alias(es) in %s not used: %s", len(trimmed),
+                        self.path, "; ".join(
+                            f"#{t.index + 1} {t.name}: {t.why}" for t in trimmed))
 
     # ------------------------------------------------------------- reads
     def resolve(self, said) -> Resolution:
@@ -603,11 +691,13 @@ class Book:
         # when another row shares the first name: he said all of it --
         # UNLESS the whole name is also another row's first name or
         # surname (a flagged collision, "Heather" beside "Heather Jones").
-        # Then it is the ambiguity itself, and a question.
+        # Then it is the ambiguity itself, and a question -- said with the
+        # honorific too ("Dr Heather"): the Dr is on the one-word row, and
+        # nothing in the book says Heather Jones is not one.
         for c in self.contacts:
-            hon = normalise(c.honorific)
-            if key == c.full or (hon and key == f"{hon} {c.full}"):
-                rivals = [o for o in self.contacts if o is not c and key in o.keys()]
+            if key in c.exact_keys():
+                rivals = [o for o in self.contacts if o is not c
+                          and (key in o.keys() or c.full in o.keys())]
                 if rivals:
                     names = [o.name for o in self.contacts if o is c or o in rivals]
                     return Resolution(candidates=names, from_book=True)
@@ -632,6 +722,20 @@ class Book:
                 return c
         return None
 
+    def pick(self, name: str) -> Optional[Resolution]:
+        """The answer to "Which Heather?" as a FOUND resolution: the row
+        whose full name this is, by identity -- never back through
+        resolve(), whose collision rule would ask the question again for
+        a one-word row ("the first one" of "Heather or Heather Jones" is
+        the row called Heather, not the name Heather). None when the row
+        has gone since the list was read: the caller treats that as a
+        miss rather than re-resolving the name to a different person."""
+        c = self.by_name(name)
+        if c is None:
+            return None
+        return Resolution(addr=c.email, name=c.name, from_book=True,
+                          honorific=c.honorific, matched_on="full name")
+
     def choose(self, said, candidates) -> Optional[str]:
         """The answer to "Which Heather?": ONE of ``candidates`` (full
         names), named exactly, or None.
@@ -653,6 +757,14 @@ class Book:
         # name of "Heather Jones") is the question being asked, not an
         # answer to it.
         owners = [c for c in rows if key in c.keys()]
+        # A whole name, with or without its honorific, that is also a
+        # rival's first name or surname is owned by that rival too: "Dr
+        # Heather" for the one-word Dr Heather beside Heather Jones is the
+        # same question as "Heather", and the ordinal is the way through.
+        for c in list(owners):
+            if key in c.exact_keys():
+                owners += [o for o in rows if o is not c and o not in owners
+                           and c.full in o.keys()]
         if len(owners) != 1:
             return None
         c = owners[0]
@@ -716,6 +828,8 @@ class Book:
                             for s in self.skipped],
                 "flagged": [{"index": f.index, "name": f.name, "why": f.why}
                             for f in self.flagged],
+                "trimmed": [{"index": t.index, "name": t.name, "why": t.why}
+                            for t in self.trimmed],
                 "broken": self.broken,
                 "path": display_path(self.path)}
 

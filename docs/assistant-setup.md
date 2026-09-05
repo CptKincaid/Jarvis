@@ -4063,16 +4063,30 @@ Three rules keep the file honest, and each is worth knowing:
   from a hand edit, the wrong `format`, a permission: Jarvis keeps the
   last good rows *for resolving only*, and every `add`/`remove` — CLI and
   page — refuses with `REFUSED: contacts.json is not valid JSON (<path>)
-  — fix it by hand first` and writes nothing. In a fresh process the last
-  good book is empty, and writing that back would have been the loss.
+  — fix it by hand first` and writes nothing; `show` and `remove` say
+  that same line rather than "nothing in the book", because in a fresh
+  process the last good book is empty, and writing that back would have
+  been the loss. An empty or whitespace-only file (`touch`) is an empty
+  book, not a broken one, and a UTF-8 BOM is ignored.
 * **A one-word name has to be unique.** "Heather" beside "Heather Jones",
   or "Smith" beside "Sam Smith", is refused on `add`; if you hand-edit
   both in, both rows are kept and flagged, and "Heather" becomes a
   question ("Which Heather, sir — Heather or Heather Jones?") rather than
-  a pick — answer with the two-word name or "the first one". A one-word
-  row that clashes with nobody ("Mum") reads back fine.
+  a pick — so does "Dr Heather", whatever honorific either row carries.
+  Answer with the two-word name, or "the first one" / "1" / "number one"
+  for the one-word row: the ordinal picks the row of the list you were
+  read, never the name again. One miss gets the list once more; a second
+  miss lets it go. A one-word row that clashes with nobody ("Mum") reads
+  back fine.
+* **An alias never costs a person.** An alias that is someone else's name
+  (or an earlier row's alias) is refused on `add`; hand-edited in, the
+  *alias* is passed over and both rows are kept and used — the name wins
+  in either file order — and `list` and the page say which alias and why.
+  The file still has it.
 
-The file is written 0600.
+The file is written 0600. If `contacts.json` is a symlink (a dotfiles
+checkout), it stays one: writes land beside the real file, and a dangling
+link gets its target created.
 
 ### Things it deliberately will not do
 
