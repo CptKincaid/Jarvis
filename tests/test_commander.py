@@ -198,8 +198,6 @@ def test_remember_routes_to_persistent_memory(cmdr, services):
 @pytest.mark.parametrize("said,fact", [
     ("jarvis put it in your memory that i graduate december 10th 2026 with an electrical engineering degree",
      "i graduate december 10th 2026 with an electrical engineering degree"),
-    ("jarvis make a note that the boiler man comes on tuesday", "the boiler man comes on tuesday"),
-    ("jarvis note that my locker code is 4412", "my locker code is 4412"),
     ("jarvis keep in mind that heather prefers email", "heather prefers email"),
     ("jarvis don't forget that the lab moved to room 049", "the lab moved to room 049"),
 ])
@@ -220,6 +218,21 @@ def test_the_ways_he_actually_says_remember_reach_the_store(cmdr, services, said
 def test_remember_to_is_still_not_a_fact(cmdr, services):
     cmdr.handle("jarvis don't forget to call mum")
     assert services.memory.remember.call_count == 0
+
+
+@pytest.mark.parametrize("said", [
+    "jarvis make a note of milk",
+    "jarvis make a note of milk and eggs",
+    "jarvis note that down",
+])
+def test_a_note_is_still_a_note_not_a_fact(cmdr, services, said):
+    """Measured 2026-09-04 on 7539478: 'note that' / 'make a note (of)' in the
+    remember rung pulled these out of his notes list into facts.json. The
+    notes rung owns them; nothing here may reach long-term memory."""
+    res = cmdr.handle(said)
+    assert services.memory.remember.call_count == 0
+    assert res.handled
+    services.brain.think.assert_not_called()
 
 
 def test_recall_routes_to_memory(cmdr, services):
