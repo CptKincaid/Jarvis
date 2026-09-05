@@ -1158,3 +1158,29 @@ def test_a_locked_room_box_keeps_the_consoles_own_colours(root, tmp_path):
     assert str(entry.cget("state")) == "disabled"
     assert str(entry.cget("disabledbackground")) == str(entry.cget("bg"))
     assert str(entry.cget("disabledforeground")) != "" 
+
+
+def test_the_scroll_mark_is_visible_when_there_is_more_below(root, tmp_path):
+    """PHOTOGRAPHED at 1040x1760: the sheet's body ran past the fold with no
+    mark saying so -- the OTA row, the board fold and the "what this cannot
+    do" paragraph were all below it and nothing on screen suggested there was
+    anything there. The 2 px strip was PLACED but stacked UNDER the body
+    window, because a Canvas stacks its children in creation order and the
+    body is created second and fills the width. jarvis/ui/sensors_page.py's
+    own thumb lifts itself for exactly this reason."""
+    _write_raw(tmp_path, "office")
+    import tkinter as tk
+    from jarvis.ui import sensor_setup as mod
+    host = tk.Frame(root, width=HIS_W, height=700)   # short on purpose
+    host.pack_propagate(False)
+    host.pack()
+    sheet = mod.SetupSheet(host, services=_Services(), directory=tmp_path)
+    sheet.show()
+    sheet.select("office")
+    root.update_idletasks()
+    assert sheet.overflow_px() > 0
+    assert sheet._thumb.winfo_ismapped()
+    # ...and it is the topmost child of the canvas, not hidden behind the body
+    assert sheet._canvas.winfo_children()[-1] is sheet._thumb
+    assert sheet._thumb.winfo_width() >= 2
+    sheet.hide()

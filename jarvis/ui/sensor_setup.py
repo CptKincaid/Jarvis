@@ -1252,13 +1252,21 @@ class SetupSheet(tk.Frame):
         try:
             if over <= 0:
                 self._thumb.place_forget()
+                self._canvas.yview_moveto(0.0)
                 return
             height = max(1, self._canvas.winfo_height())
             span = max(px(20), int(height * height / (height + over)))
             top = self._canvas.canvasy(0)
-            frac = 0.0 if over <= 0 else max(0.0, min(1.0, top / float(over)))
-            self._thumb.place(x=max(0, self._canvas.winfo_width() - px(2)),
+            frac = max(0.0, min(1.0, top / float(over)))
+            self._thumb.place(relx=1.0, x=-px(3), anchor="nw",
                               y=int(frac * (height - span)), height=span)
+            # LIFTED. A Canvas stacks its children in creation order and the
+            # body window is created after the thumb and fills the width, so
+            # without this the mark is placed and invisible -- photographed
+            # at 1040x1760, a sheet with the OTA row, the board fold and the
+            # "what this cannot do" paragraph below the fold and nothing on
+            # screen suggesting they were there.
+            self._thumb.lift()
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("sensor setup: the thumb could not be placed",
                       exc_info=True)
