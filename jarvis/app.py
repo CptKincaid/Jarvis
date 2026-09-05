@@ -71,6 +71,7 @@ from jarvis import arrival as arrival_mod
 from jarvis import desktop as desktop_mod
 from jarvis import earcons
 from jarvis import gate as gate_mod
+from jarvis import passphrase as pp
 from jarvis import identity as identity_mod
 from jarvis import selfstate, speak_queue, standup, voice_check
 from jarvis import leavetime as leavetime_mod
@@ -207,6 +208,15 @@ PHRASE_CONSUMED = object()
 # The legs on which a clip the speaker filter dropped is let through after
 # all: the camera, the phrase's window, the code's window.
 RESCUE_HOWS = (gate_mod.HOW_FACE, gate_mod.HOW_GRANT, gate_mod.HOW_CODE)
+# The typed code (knightfall_code / knightfall_new_code below). The mail
+# carries two lines: the code, then this sentence. The Status lines never
+# carry a code.
+KNIGHTFALL_SUBJECT = "Knightfall"
+KNIGHTFALL_BODY_LINE = "Typed only, never spoken. This replaces the old one."
+KNIGHTFALL_OK_LINE = "Knightfall accepted, sir; a new code is in your inbox."
+KNIGHTFALL_NEW_OK_LINE = "Knightfall: a new code is in your inbox."
+KNIGHTFALL_COOLDOWN_LINE = "Knightfall: one code a minute, sir."
+KNIGHTFALL_COOLDOWN_S = 60.0
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
 # offer").
 #
@@ -6252,6 +6262,124 @@ class JarvisApp:
             fn()
         else:
             self.quit()
+
+    # ---------------------------------------------- Knightfall, typed
+    def knightfall_code(self, code, *, mail=None, smtp=None, now=None) -> str:
+        """THE TYPED PATH (Hunter, 2026-09-04: "a and b"). The drawer's
+        masked entry lands here, off the Tk thread. Returns the one line
+        the drawer toasts; it never contains a code.
+
+        The check is ``gate.check_override_code`` -- the same function the
+        people CLI uses, on the gate's OWN code counter (separate from the
+        phrase's, so burning one never closes the other). A refusal is its
+        reason and nothing else. On success the window opens on the code
+        leg exactly as the phrase opens it, and the code ROTATES: a fresh
+        one is mailed to his own address from his own first account, and
+        only a returned Message-ID lets the new hash be stored -- a mail
+        that did not go leaves the old code standing, and the line says
+        which happened. The plaintext is deleted the moment it is hashed;
+        the log carries who and which path.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return "Knightfall: the gate is not built; see the log"
+        who, why = gate_mod.check_override_code(gate.registry, code,
+                                                attempts=gate.code_attempts)
+        del code
+        if not who:
+            return "Knightfall: %s" % why
+        gate.open_window(who, gate_mod.HOW_CODE, now=now)
+        return self._knightfall_rotate(who, mail=mail, smtp=smtp,
+                                       accepted=True)
+
+    def knightfall_new_code(self, *, mail=None, smtp=None, now=None) -> str:
+        """THE BOOTSTRAP: "Email me a new Knightfall code". The same
+        generate -> mail -> store sequence, for the first owner, and it
+        opens no window -- mailing a code is not typing one.
+
+        KEYBOARD = OWNER IS THE EXISTING RULE, not a new one: whoever is
+        at this keyboard can already edit or delete the registry, which is
+        the argument ``check_override_code``'s docstring makes and this
+        does not make twice. So there is no second check here -- only a
+        cooldown of KNIGHTFALL_COOLDOWN_S, so a stuck button cannot spam
+        his inbox.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return "Knightfall: the gate is not built; see the log"
+        t = time.monotonic() if now is None else float(now)
+        last = getattr(self, "_knightfall_new_ts", None)
+        if last is not None and t - last < KNIGHTFALL_COOLDOWN_S:
+            return KNIGHTFALL_COOLDOWN_LINE
+        try:
+            who = gate._owner_label()
+        except Exception:                          # noqa: BLE001 - no registry
+            who = ""
+        if not who:
+            return ("Knightfall: nobody is enrolled as an owner yet "
+                    "(scripts/jarvis_people.py add ... --role owner)")
+        self._knightfall_new_ts = t
+        return self._knightfall_rotate(who, mail=mail, smtp=smtp,
+                                       accepted=False)
+
+    def _knightfall_rotate(self, who, *, mail=None, smtp=None,
+                           accepted=False) -> str:
+        """Generate -> mail FIRST -> store ONLY on a Message-ID. Returns
+        the line. ``mail`` is the mail module (a seam for the tests);
+        ``smtp`` is the transport class send_message takes."""
+        head = "Knightfall accepted, sir; " if accepted else "Knightfall: "
+        keep = head + "the code stays as it is (mail: %s)."
+        if mail is None:
+            from jarvis.tools import mail as mail_mod
+            mail = mail_mod
+        try:
+            accounts = mail.mail_accounts(self.assistant)
+        except Exception:                          # noqa: BLE001 - config
+            log.exception("knightfall: the mail accounts could not be read")
+            accounts = []
+        if not accounts:
+            return keep % "no mail account is configured"
+        account = accounts[0]
+        new = pp.new_code()
+        body = "%s\n%s\n" % (new, KNIGHTFALL_BODY_LINE)
+        try:
+            msgid = mail.send_message(account, to_addr=account["address"],
+                                      subject=KNIGHTFALL_SUBJECT, body=body,
+                                      smtp=smtp)
+        except Exception as exc:                   # noqa: BLE001 - transport
+            # MailSendFailed, or anything else the transport did: the old
+            # code stands. str(exc) is a host or an exception TYPE name
+            # (mail.send_message re-raises with the type only), never the
+            # credential and never the code.
+            del new, body
+            log.warning("knightfall: the new code could not be mailed (%s); "
+                        "the old one stands", exc)
+            return keep % exc
+        del body
+        if not msgid:
+            del new
+            return keep % "no Message-ID came back"
+        hashed = pp.hash_secret(new)
+        del new
+        registry = getattr(self.gate, "registry", None)
+        person = registry.person(who) if registry is not None else None
+        old = person.code_hash if person is not None else ""
+        ok, why = (registry.set_secret(who, "code_hash", hashed)
+                   if registry is not None else (False, "no registry"))
+        if ok and registry.save():
+            log.info("knightfall: %s rotated the code at the keyboard; the "
+                     "new one is in the mail", who)
+            return KNIGHTFALL_OK_LINE if accepted else KNIGHTFALL_NEW_OK_LINE
+        # The mail went, the store did not. Put the old hash back so the
+        # old code works in memory as it still does on disk: never a state
+        # where no code works. The one in the inbox is dead, and he is told.
+        if registry is not None:
+            registry.set_secret(who, "code_hash", old)
+        log.error("knightfall: the new code was mailed but could not be "
+                  "stored (%s); the old code stands",
+                  why or "the registry could not be written")
+        return head + ("the new code could not be stored, so the old one "
+                       "stands; the one in your inbox will not work.")
 
     # ------------------------------------------------------------ UI hooks
     def ui_service_kwargs(self) -> dict:

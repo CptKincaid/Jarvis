@@ -36,6 +36,7 @@ import binascii
 import hmac
 import os
 import re
+import secrets
 import time
 from dataclasses import dataclass, field
 from hashlib import scrypt
@@ -95,6 +96,21 @@ def phrase_ok(plain) -> Tuple[bool, str]:
         return False, ("a spoken passphrase needs at least %d letters and "
                        "digits once punctuation is dropped" % MIN_PHRASE_LEN)
     return True, ""
+
+
+# A ROTATED code (Knightfall, 2026-09-04) is generated here rather than
+# chosen: eight characters from an alphabet he can read back off a phone
+# screen without guessing -- no 0/o, no 1/l -- and it is his only until he
+# next types it, when the next one is mailed. secrets, never random.
+CODE_ALPHABET = "abcdefghijkmnpqrstuvwxyz23456789"
+NEW_CODE_LEN = 8
+
+
+def new_code(length: int = NEW_CODE_LEN) -> str:
+    """A fresh typed code. The caller mails it, hashes it, and deletes it;
+    nothing here keeps it."""
+    return "".join(secrets.choice(CODE_ALPHABET)
+                   for _ in range(max(MIN_CODE_LEN, int(length))))
 
 
 def code_ok(plain) -> Tuple[bool, str]:
