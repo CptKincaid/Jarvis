@@ -662,6 +662,25 @@ def _firewall_live_log_dir(tmp_path_factory):
             mod.subprocess = real
 
 
+@pytest.fixture(autouse=True)
+def _addressee_is_the_owner():
+    """Every test starts and ends addressing HUNTER.
+
+    ``brain.set_addressee`` is module state, like ``set_register``, and the
+    owner gate writes it on every judged turn. A test that admits Heather
+    and does not reset it leaves the next test's prompt addressed to her --
+    which is how tests/test_persona.py started failing only when run after
+    tests/test_owner_gate_wiring.py. Reset here rather than in each test,
+    because the next one to forget is the one that matters.
+    """
+    from jarvis import brain as _brain
+    _brain.set_addressee("", "sir")
+    try:
+        yield
+    finally:
+        _brain.set_addressee("", "sir")
+
+
 def pytest_sessionfinish(session, exitstatus):
     """The SMTP firewall's second belt (F24, 09-03). SmtpFirewallRefused
     already comes out of the test that lost its fake; this catches the one

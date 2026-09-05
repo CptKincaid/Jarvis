@@ -88,6 +88,40 @@ ONE DOCUMENTED INVARIANT IS DELIBERATELY SUSPENDED HERE, AND SAID OUT LOUD
     is not written there because another branch is live in that file. It is
     a merge-time edit, deliberately not taken here.
 
+SAYING YOUR NAME IS A NARROWING INPUT, NOT A PASSWORD
+    "for them to 'login' they say there first and last name" -- and a name
+    said out loud is not proof of being that person: it is overheard by
+    everybody in the room and repeatable by any of them. So a claimed name
+    NARROWS who a real leg is asked to confirm and never admits on its own.
+    ``jarvis/signin.py`` turns words into at most one label,
+    ``recognise.Verdict.claimed`` carries it, and a claim with nothing
+    behind it produces the SAME empty verdict an unrelated sentence does.
+    All it buys is a kinder refusal.
+
+    THE HONEST LIMITATION, said out loud rather than discovered: the
+    confirming leg for anybody but Hunter is the CAMERA, because
+    ``jarvis/speaker.py`` holds one voiceprint and one centroid and
+    ``identity.Registry.add_person`` therefore refuses ``voice=True`` on a
+    non-owner row. So Mara and Heather can sign in only where the camera
+    can see them -- the office, camera on, outside the 9pm-7am curfew. At
+    night their sign-in cannot complete, and SIGNIN_NO_LEG_LINE says so.
+
+WHAT A KNOWN PERSON MAY ASK FOR, AND THE ONE THING THAT WIDENED
+    Unchanged and default-deny: _HIS vetoes settings, his data and
+    anything that leaves the machine, and it wins over everything. _OPEN
+    allows the time, the date, the weather and the music transport. NEW:
+    a turn matching neither _HIS nor _ACTIONS -- no imperative verb in it
+    -- is a QUESTION, and is answered as plain chat with no tools. That is
+    his own "I'll answer what I can" read as what it says; the refuse list
+    did not move.
+
+HE CANNOT LOCK HIMSELF OUT, AND IT IS ENFORCED RATHER THAN ADVISED
+    ``_mode_unsafe`` downgrades ``enforce`` to ``shadow``, with a logged
+    reason, whenever no owner row carries an override code -- because a
+    wrong verdict would then have no typed way back in. Lockout stops
+    being a thing he has to be careful about and becomes a state this code
+    does not enter.
+
 FAILING OPEN ON ITS OWN FAILURE IS NOT FAILING OPEN ON A NEGATIVE
     A missing, corrupt or unreadable registry, nothing enrolled, no leg
     running at all, a raised exception anywhere inside ``judge`` -- all of
@@ -102,6 +136,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Tuple
 
 from jarvis import passphrase as pp
+from jarvis import signin
 from jarvis.identity import (ROLE_KNOWN, ROLE_OWNER, ROLE_UNKNOWN, Registry,
                              startup_line)
 from jarvis.logs import get_logger
@@ -152,6 +187,16 @@ DEADMAN_TURNS = 3
 # What the transcript is replaced with before anything can publish it.
 REDACTED_TEXT = "«passphrase»"
 
+# HOW OFTEN THE SIGN-IN SENTENCE MAY BE SAID, per claimed label. A room in
+# which a name keeps coming up in conversation must not turn Jarvis into a
+# doorman repeating himself; one sentence a minute per name is a prompt, a
+# sentence a turn is a chant.
+SIGNIN_COOLDOWN_S = 60.0
+# ...and how often the WELCOME may be said once somebody is actually
+# confirmed, so an ordinary conversation is not prefixed with "Signed in"
+# on every turn.
+SIGNIN_GREET_S = 900.0
+
 # HOW LONG THE PASSPHRASE BUYS, and why it has to buy anything at all.
 # Admitting only the turn that CONTAINED the phrase would be a dead end of a
 # new shape: the phrase is not a command, so the next thing he says is the
@@ -171,8 +216,13 @@ GRANT_S = 300.0
 # ------------------------------------------------------------- the wording
 # Replacing app.py's "I only answer to Hunter, sir.", which named no way back
 # in -- that was the whole complaint -- and named him to a stranger besides.
-UNKNOWN_LINE = ("I don't recognise your voice. The owner can enrol you here "
-                "at the keyboard.")
+# IT STILL NAMES NO OWNER. Somebody the gate does not recognise is told
+# there is a way in, not who to go and find -- tests/test_owner_gate.py::
+# test_the_refusal_never_says_a_name_it_does_not_know has held that line
+# since the gate was written and this rewording does not weaken it.
+UNKNOWN_LINE = ("I don't recognise you. Say your first and last name and "
+                "I'll see if you're on file, or the owner can enrol you "
+                "here at the keyboard.")
 UNKNOWN_PHRASE_LINE = ("I don't recognise your voice. Say the passphrase and "
                        "I'll open up, or the owner can enrol you here at the "
                        "keyboard.")
@@ -197,8 +247,64 @@ PHRASE_OK_LINE = "Thank you, sir. I'm listening."
 # recognised -- and deliberately DIFFERENT from PHRASE_OK_LINE, so that he,
 # who knows what the two mean, can hear which mode he is in.
 PHRASE_OFF_LINE = "Thank you, sir."
+# A NAME LANDED AND A LEG COULD STILL CONFIRM IT. Says neither "you are
+# in" nor "you are lying": a name is not proof, and the person saying it is
+# far more often exactly who they say they are.
+SIGNIN_PENDING_LINE = ("I have a {name} on file. I can't confirm that's you "
+                       "from a name alone — look at the camera for a moment "
+                       "and I'll take another look.")
+# A NAME LANDED AND NOTHING CAN CONFIRM IT: the camera is off, or the
+# curfew has it dark, or they have no face enrolled. This is the honest
+# consequence of there being ONE voiceprint on this machine -- see
+# identity.Registry.add_person's refusal -- and it is said out loud rather
+# than left as a mystery.
+SIGNIN_NO_LEG_LINE = ("I have a {name} on file, but I've no way to confirm "
+                      "it just now — the camera's off. The owner can sign "
+                      "you in at the keyboard.")
+# Confirmed. HIS WORDING, VERBATIM (09-04): "Voice and identity
+# recognized, welcome back <first name>. How may I be of assistance
+# today?" -- the same sentence jarvis/signinlines.py carries on the
+# voice-multispeaker branch, so the two cannot disagree at the merge. A
+# {first} template: the name does the work of address, there is no
+# honorific in it, and Mara and Heather -- "ma'am" everywhere else --
+# hear their own first name here. Like every {name} template it is never
+# prewarmed.
+SIGNIN_OK_LINE = ("Voice and identity recognized, welcome back {first}. "
+                  "How may I be of assistance today?")
+# A KNOWN person reaching for a setting or a privilege. A {name} template
+# like KNOWN_SCOPE_LINE, and for the same reason: he is already recognised
+# and greeted by name, and a refusal that says his name back is a refusal
+# and not a snub. It carries NO honorific -- the name does that work -- so
+# there is nothing here for the swap to get wrong.
+NOT_YOURS_LINE = "That's Hunter's to change, {name}. I'll leave it be."
+# Anyone asking OUT LOUD to have somebody enrolled. Consent is not
+# weakened and has no spoken equivalent: scripts/face_enrol.consent
+# requires a terminal and requires the person to type their own name.
+ENROL_AT_KEYBOARD_LINE = ("Enrolling somebody else has to happen at the "
+                          "keyboard, sir — they need to read what's stored "
+                          "and type their own name.")
+# {name} templates are never prewarmed -- KNOWN_SCOPE_LINE, NOT_YOURS_LINE
+# and now SIGNIN_OK_LINE are out for that reason. ENROL_AT_KEYBOARD_LINE is
+# prewarmed AS AUTHORED, which caches the "sir" rendering; the "ma'am"
+# rendering is a cache miss the first time a ma'am person hears it, which
+# is a latency cost and not a defect.
 PREWARM_LINES = (UNKNOWN_LINE, UNKNOWN_PHRASE_LINE, STANDDOWN_LINE,
-                 PHRASE_OK_LINE, PHRASE_OFF_LINE)
+                 PHRASE_OK_LINE, PHRASE_OFF_LINE, ENROL_AT_KEYBOARD_LINE)
+
+
+def first_name(person, fallback: str = "") -> str:
+    """What ``{first}`` renders as: the typed first name, else the first
+    word of the display name, else ``fallback``."""
+    if person is None:
+        return fallback
+    first = str(getattr(person, "first", "") or "").strip()
+    if first:
+        return first
+    try:
+        words = str(person.display() or "").split()
+    except Exception:  # noqa: BLE001 - a row that cannot say
+        words = []
+    return words[0] if words else fallback
 
 # ------------------------------------------------------------- the scope
 # What a KNOWN person may do. DEFAULT-DENY: an explicit allow-list, and
@@ -222,6 +328,29 @@ _HIS = re.compile(
     r"settings?|config(?:ure|uration)?|enrol|enroll|volume\s+of\s+my|"
     r"send|text|cast|remote|hpcomputer|ssh|shut\s*down|restart|"
     r"camera|curfew|passphrase|override)\b", re.I)
+
+# ...and the third band, which is the ONE scope change this pass makes.
+# He asked for "I'll answer what I can" out loud, and a KNOWN person asking
+# "how far is the moon" was being refused with a line about the music.
+#
+# THE RULE, and it is default-deny still: _HIS vetoes first and is
+# unchanged; _OPEN allows; and what is left is allowed ONLY IF IT IS NOT AN
+# IMPERATIVE. A question is answered as plain chat with no tools. Anything
+# with an ACTING VERB in it -- send, open, run, set, turn, enrol, delete,
+# write, buy, order, call, remind, add, install, move, play-to-a-device --
+# is refused even though _HIS never named it, because the list of things a
+# stranger might ask Jarvis to DO is open-ended and an allow-list of verbs
+# would be a list somebody has to remember to extend.
+_ACTIONS = re.compile(
+    r"\b(?:send|open|launch|start|stop|run|execute|set|change|turn|switch|"
+    r"enrol|enroll|register|sign\s+(?:me\s+)?in|delete|remove|forget|write|"
+    r"type|buy|order|book|call|ring|remind|add|create|make|install|update|"
+    r"upgrade|download|upload|move|rename|copy|paste|clear|reset|reboot|"
+    r"lock|unlock|grant|allow|give\s+me\s+access|log\s*in)\b", re.I)
+
+# Asking, out loud, to have somebody enrolled. Answered with one sentence
+# naming the keyboard; never with a flow.
+_ENROL = re.compile(r"\b(?:enrol|enroll|enrolment|enrollment)\b", re.I)
 
 
 @dataclass
@@ -268,6 +397,10 @@ class OwnerGate:
         self._grant_who = ""
         self._grant_until = 0.0
         self._grant_how = HOW_PHRASE      # which path opened the window
+        # label -> monotonic stamp, so a name that keeps coming up in
+        # conversation cannot loop the sign-in sentence.
+        self._signin_said: dict = {}
+        self._welcomed: dict = {}
         # TWO limiters, never shared, different limits. Burning the
         # passphrase attempts must not lock out the break-glass, or the
         # fallback of last resort fails exactly when it is needed.
@@ -316,7 +449,32 @@ class OwnerGate:
             return MODE_OFF
         if self.stood_down and mode == MODE_ENFORCE:
             return MODE_SHADOW
+        if mode == MODE_ENFORCE and not self._owner_can_get_back_in():
+            # HE CANNOT LOCK HIMSELF OUT, and this is the layer that makes
+            # that a state the code will not enter rather than a thing he
+            # has to be careful about. Enforce with no override code set
+            # means a wrong verdict has no way back that is not "edit
+            # people.json by hand" -- so it runs in SHADOW and says why.
+            log.warning(
+                "owner-gate: enforce was asked for, but %s has no override "
+                "code set, so a wrong verdict would have no way back in. "
+                "Running in shadow. Set one with: "
+                "scripts/jarvis_people.py set-code", self._owner_label()
+                or "the owner")
+            return MODE_SHADOW
         return mode
+
+    def _owner_can_get_back_in(self) -> bool:
+        """Is there a TYPED break-glass on some owner row?
+
+        The code and not the passphrase: the passphrase travels the
+        microphone, and a microphone is one of the things that can be
+        broken when he needs a way in.
+        """
+        try:
+            return any(p.code_hash for p in self.registry.owners())
+        except Exception:  # noqa: BLE001 - a registry that cannot say has none
+            return False
 
     def effective_mode(self) -> str:
         try:
@@ -352,12 +510,29 @@ class OwnerGate:
         if role != ROLE_KNOWN:
             return False, UNKNOWN_LINE
         words = str(text or "")
+        if _ENROL.search(words):
+            # Asked OUT LOUD to enrol somebody. Consent is not weakened and
+            # has no spoken equivalent: scripts/face_enrol.consent demands a
+            # terminal and demands the person type their own name. This
+            # sentence is the answer, and it is the whole answer.
+            return False, ENROL_AT_KEYBOARD_LINE
         if _HIS.search(words):
-            return False, KNOWN_SCOPE_LINE
+            # Settings, his data, anything that leaves the machine. The
+            # veto wins over everything below it, including a question
+            # shape: "what's in my inbox" is still his.
+            return False, NOT_YOURS_LINE
         for rx in _OPEN:
             if rx.search(words):
                 return True, ""
-        return False, KNOWN_SCOPE_LINE
+        if _ACTIONS.search(words):
+            # Not his data, but still an instruction to act. Refused with
+            # the scope line, which names what a known person MAY have.
+            return False, KNOWN_SCOPE_LINE
+        # Neither his, nor an open intent, nor an imperative: a question.
+        # Answered as ordinary chat. "No tools behind it" is enforced in
+        # the loop, not here: brain.KNOWN_TOOLS is what her turn is
+        # offered, and brain._scoped_call refuses the rest by name.
+        return True, ""
 
     # ----------------------------------------------------------- the legs
     def _voice_leg(self, stats, rejected) -> Tuple[str, bool]:
@@ -397,6 +572,54 @@ class OwnerGate:
         if person is not None:
             return person.label, True
         return self.registry.face_labels().get(name, ""), True
+
+    def _name_leg(self, text) -> str:
+        """WHOM THE WORDS CLAIMED TO BE. Never an admission.
+
+        ``jarvis/signin.py`` is pure and returns a label to CONFIRM. An
+        owner's label is deliberately never returned from here: naming him
+        to somebody the gate does not recognise is the thing
+        ``UNKNOWN_LINE`` was rewritten to stop doing, and he is recognised
+        by his voice anyway.
+        """
+        try:
+            label = signin.candidate_from_name(text, self.registry.people)
+        except Exception:  # noqa: BLE001 - a claim that cannot be read is none
+            log.debug("gate: the sign-in claim could not be read",
+                      exc_info=True)
+            return ""
+        if not label or self.registry.role_of(label) == ROLE_OWNER:
+            return ""
+        return label
+
+    def _once_per(self, book: dict, key: str, gap: float, now) -> bool:
+        """True at most once per ``gap`` seconds for ``key``."""
+        if not key:
+            return False
+        t = self._now(now)
+        last = float(book.get(key, -1e9))
+        if t - last < float(gap):
+            return False
+        book[key] = t
+        return True
+
+    def _signin_line(self, claimed: str, face_on: bool, now) -> str:
+        """The sentence for a name that landed with nothing confirming it.
+
+        TWO SENTENCES, AND THE DIFFERENCE IS HONEST. If a camera is running
+        there is still something that could name them, so the line asks
+        them to look at it. If nothing is running, saying "look at the
+        camera" would be a dead end -- and the reason it is dark (the
+        curfew, the office, an off switch) is exactly the limitation that
+        follows from there being ONE voiceprint on this machine.
+        """
+        person = self.registry.person(claimed)
+        name = person.display() if person is not None else claimed
+        if not self._once_per(self._signin_said, claimed,
+                              SIGNIN_COOLDOWN_S, now):
+            return ""
+        template = SIGNIN_PENDING_LINE if face_on else SIGNIN_NO_LEG_LINE
+        return template.format(name=name)
 
     def _now(self, now) -> float:
         return time.monotonic() if now is None else float(now)
@@ -548,7 +771,8 @@ class OwnerGate:
         face_says, face_on = self._face_leg(face, face_running)
         named = recognise(Legs(voice_says=voice_says,
                                voice_running=voice_running,
-                               face_says=face_says, face_running=face_on),
+                               face_says=face_says, face_running=face_on,
+                               name_says=self._name_leg(text)),
                           roles, owner)
 
         # THE PHRASE, BEFORE ANYTHING ELSE CAN ACT ON THE WORDS. Whether a
@@ -607,10 +831,23 @@ class OwnerGate:
             person = self.registry.person(verdict.who)
             name = person.display() if person is not None else verdict.who
             if ok:
+                greeting = ""
+                if verdict.claimed and verdict.claimed == verdict.who \
+                        and verdict.role != ROLE_OWNER:
+                    # The sign-in COMPLETED: they said a name and a real leg
+                    # confirmed it in the same turn. The name narrowed, the
+                    # leg admitted -- never the other way round.
+                    log.info("gate: %s said their name and the %s leg "
+                             "confirmed it", verdict.who, verdict.how)
+                    if self._once_per(self._welcomed, verdict.who,
+                                      SIGNIN_GREET_S, now):
+                        greeting = SIGNIN_OK_LINE.format(
+                            first=first_name(person, name))
                 log.info("gate: %s (%s) on the %s leg", verdict.who,
                          verdict.role, verdict.how)
                 return Decision(admit=True, who=verdict.who, role=verdict.role,
-                                how=verdict.how, why=verdict.why)
+                                how=verdict.how, line=greeting,
+                                why=verdict.why)
             log.info("gate: %s is %s; that one is out of scope", verdict.who,
                      verdict.role)
             refuse = Decision(admit=False, who=verdict.who, role=verdict.role,
@@ -624,6 +861,19 @@ class OwnerGate:
 
         # Nobody. The refusal NAMES THE WAY BACK IN rather than being a dead
         # end, and it never names an owner to somebody it does not know.
+        if verdict.claimed:
+            # A NAME WAS CLAIMED AND NOTHING CONFIRMED IT. Nothing has been
+            # admitted -- the verdict above is the same empty one an
+            # unrelated sentence produces -- and this only chooses a kinder
+            # sentence than "I don't recognise you".
+            log.info("gate: a name was claimed (%s) and no leg confirmed "
+                     "it; nothing was admitted", verdict.claimed)
+            line = self._signin_line(verdict.claimed, face_on, now)
+            if mode != MODE_ENFORCE:
+                return Decision(admit=True, how=HOW_NOBODY, would_refuse=True,
+                                why=verdict.why)
+            return Decision(admit=False, how=HOW_NOBODY, line=line,
+                            why=verdict.why)
         has_phrase = any(p.phrase_hash for p in self.registry.owners())
         line = UNKNOWN_PHRASE_LINE if has_phrase else UNKNOWN_LINE
         if mode != MODE_ENFORCE:

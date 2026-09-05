@@ -233,7 +233,11 @@ def test_the_transcript_confidence_reaches_the_commander(monkeypatch):
 
     a._process_audio(np.zeros(16000, dtype=np.float32))
 
-    assert seen == [("cancel all my alarms", "voice", {"confidence": -0.8})]
+    # The addressee rides alongside from round-3 (09-05): _process_audio
+    # reads back the attribution _gate_admits installed for THIS turn and
+    # hands it down by value. With no gate here that is the owner.
+    assert seen == [("cancel all my alarms", "voice",
+                     {"confidence": -0.8, "addressee": ("", "sir")})]
     assert not a._audio_busy.is_set()
 
 
@@ -262,7 +266,13 @@ def test_dispatch_forwards_confidence_only_when_it_has_one():
     a = _dispatch_app(handle)
     a._dispatch("hello", "voice", confidence=-0.4)
     a._dispatch("hello", "typed")
-    assert seen == [{"confidence": -0.4}, {}]
+    # ``addressee`` rides alongside from round-3 (09-05): _dispatch takes
+    # ONE reading of whose turn this is and carries it into handle rather
+    # than letting the commander look it up after its lock wait. The
+    # confidence contract this test pins is unchanged -- present for a
+    # voice turn, absent for a typed one.
+    assert [kw.get("confidence", "absent") for kw in seen] == [-0.4, "absent"]
+    assert [kw["addressee"] for kw in seen] == [("", "sir"), ("", "sir")]
 
 
 def test_dispatch_records_the_exchange_under_the_corrected_text():

@@ -281,7 +281,8 @@ def test_the_first_wake_briefing_no_longer_reads_the_review_out(monkeypatch, tmp
     assert a.said == ["Your briefing for today, sir."]
     assert "speaker gate" in a.day_review_text("yesterday"), \
         "the digest must still be one question away"
-    assert len(a.chats) == 1 and a.chats[0][1] == {"force_tool": "get_briefing"}
+    assert len(a.chats) == 1 and a.chats[0][1] == {
+        "force_tool": "get_briefing", "addressee": ("", "sir")}
 
 
 def test_first_wake_says_nothing_about_a_day_with_no_data(monkeypatch, tmp_path):

@@ -68,11 +68,12 @@ from pathlib import Path
 
 from jarvis import address as address_mod
 from jarvis import arc as arc_mod
+from jarvis import scope as scope_mod
 from jarvis.config import MACHINE
 from jarvis.events import BrainState, Status, bus
 from jarvis.logs import get_logger
 from jarvis.router import is_question
-from jarvis.tools.registry import CHARS_PER_TOKEN
+from jarvis.tools.registry import CHARS_PER_TOKEN, ToolResult
 from jarvis.tts import TTS as _TTS
 
 log = get_logger("brain")
@@ -1160,6 +1161,95 @@ REGISTER_CLAUSES = {
 }
 _REGISTER = {"name": DEFAULT_REGISTER}
 
+# ----------------------------------------------------------------------
+# Who is being spoken to — the prompt half of the honorific
+# ----------------------------------------------------------------------
+# BELT TO THE SWAP'S BRACES, and the swap is the authority. Every spoken
+# line, model-generated or authored, goes through
+# ``address.swap_addresses`` at ``app._say`` and ``commander._speak``, so
+# a model that keeps generating "sir" is already corrected. This exists so
+# it does not have to generate it in the first place -- and so the prompt
+# does not tell the model, in front of Mara, to call her "he".
+#
+# THE OWNER PATH RETURNS THE EXISTING STRINGS VERBATIM. Not templated, not
+# rebuilt, not re-rendered: the frozen literals, so gemma4's behaviour for
+# Hunter is bit-identical to the day before this landed and the tuned
+# prompt cannot drift.
+#
+# THE STATE ITSELF LIVES IN jarvis/scope.py, per turn and with a TTL, so
+# that the tool loop here, commander's Tier 1 and app's dispatch all read
+# the one attribution and it expires for all of them at once. The three
+# functions below are that module's, kept under their old names because
+# ``brain.set_addressee`` is what the app and the tests call.
+
+# The clause that rides in the {register} slot -- which sits immediately in
+# front of "Now answer Hunter as Jarvis... and call him sir", so the
+# correction lands next to the thing it is correcting.
+ADDRESSEE_CLAUSE = (
+    "You are speaking to {name}, who is not Hunter. Wherever the rules "
+    "above say \"he\", \"him\" or \"Hunter\", they mean {name} for this "
+    "reply. {address}\n\n")
+ADDRESS_WITH_HONORIFIC = ("Call them \"{honorific}\" most of the time and "
+                          "\"{name}\" now and then.")
+ADDRESS_BY_NAME_ONLY = ("Call them \"{name}\" now and then, and use no "
+                        "other form of address.")
+
+
+def set_addressee(name: str = "", honorific: str = "sir",
+                  now=None) -> tuple:
+    """WHO the next prompt is written for. Empty name = Hunter.
+
+    Called from ``JarvisApp._gate_admits`` with what the owner gate
+    attributed the turn to, and cleared by ``JarvisApp._dispatch`` for
+    every source the gate does not judge. Module state in jarvis/scope.py,
+    stamped: a guest attribution expires after honorific.ADDRESSEE_TTL.
+
+    THIS DOES NOT, AND MUST NOT, RESET THE STATIC PROMPT. The review of
+    09-04 found the honorific leaking across turns: this wrote the state
+    and ``static_system()`` went on handing every live caller the ONE
+    cached render, so Mara's "ma'am" clause reached Hunter's next turn
+    and his "sir" reached hers. Clearing the cache here would have fixed
+    the leak and broken two promises instead -- the few-shots are sampled
+    once per process, and his prefix must stay warm in Ollama while a
+    guest is answered. So the cache is KEYED on the addressee
+    (``static_system``): his render is built once and handed back byte
+    for byte the moment the room is his again.
+
+    RETURNS THE READING IT INSTALLED (round-3, 09-05), so the attributor
+    carries it into the turn instead of every consumer looking the module
+    state up again after a wait -- see jarvis/scope.py.
+    """
+    return scope_mod.set_addressee(name, honorific, now=now)
+
+
+def addressee(now=None) -> tuple:
+    """``(display name, honorific)``. ``("", "sir")`` means the owner --
+    and so does a guest attribution older than the TTL."""
+    return scope_mod.addressee(now)
+
+
+def is_owner_addressee(now=None) -> bool:
+    """True when the prompt should be the frozen owner one, byte for byte."""
+    return scope_mod.is_owner(now)
+
+
+def addressee_clause(name: str = "", honorific: str = "sir") -> str:
+    """The clause for a NON-OWNER addressee, or "" for the owner.
+
+    "" for the owner is the whole point: an empty string rendered into
+    ``{register}`` leaves the prompt exactly as it was.
+    """
+    if not name:
+        return ""
+    if honorific:
+        address = ADDRESS_WITH_HONORIFIC.format(honorific=honorific,
+                                                name=name)
+    else:
+        # A person who chose no form of address. The prompt says so
+        # explicitly rather than leaving the model to fall back on "sir".
+        address = ADDRESS_BY_NAME_ONLY.format(name=name)
+    return ADDRESSEE_CLAUSE.format(name=name, address=address)
+
 
 def register() -> str:
     """The register in force for this process ("normal" until set)."""
@@ -1311,7 +1401,7 @@ If something fails, use [SPEAK] to explain and suggest alternatives.
 
 
 def build_ollama_system(context_text="", memory_text="", shots=None,
-                        register=None):
+                        register=None, addressee_to=None):
     """Render the Tier 2 STATIC system prompt.
 
     context_text / memory_text are accepted for the older call shape and
@@ -1320,12 +1410,19 @@ def build_ollama_system(context_text="", memory_text="", shots=None,
     explicit list for a fixed prompt. ``register`` defaults to the one in
     force and renders as nothing at all when it is "normal", so a normal
     prompt is byte-identical to the one before registers existed.
+    ``addressee_to`` is the ``(name, honorific)`` pair to write for;
+    it defaults to ``addressee()`` and is passed explicitly by
+    ``static_system`` so the render and its cache key cannot disagree.
     """
     name = register if register in REGISTERS else _REGISTER["name"]
     if shots is None:
         shots = select_few_shots(register=name)
-    return JARVIS_SYSTEM.format(examples=format_few_shots(shots),
-                                register=REGISTER_CLAUSES.get(name, ""))
+    who, hon = addressee_to if addressee_to is not None else addressee()
+    # THE OWNER PATH IS THE UNTOUCHED ONE: addressee_clause returns "" and
+    # the render is character for character the one that shipped.
+    return JARVIS_SYSTEM.format(
+        examples=format_few_shots(shots),
+        register=REGISTER_CLAUSES.get(name, "") + addressee_clause(who, hon))
 
 
 def build_user_turn(context_text="", memory_text="", text=""):
@@ -1346,28 +1443,55 @@ def build_user_turn(context_text="", memory_text="", text=""):
 # the streaming path and the tool loop at once, and two threads racing to
 # rebuild it would draw two DIFFERENT few-shot samples — one turn would ship
 # a prefix nothing had cached.
-_STATIC = {}
+#
+# ONE RENDER PER ADDRESSEE. "system" is keyed on (register, addressee name,
+# honorific) and "shots" on the register alone, so a guest's prompt is
+# built from the SAME few-shot sample as Hunter's and his render is never
+# rebuilt behind her: the owner key hands back the identical object, and
+# Ollama still holds its prefix. A single cached string was the 09-04
+# leak -- set_addressee wrote the state, every live caller read the stale
+# render, and the previous person's honorific survived into the next turn.
+_STATIC = {"shots": {}, "system": {}}
 _STATIC_LOCK = threading.Lock()
 
 
-def static_system():
-    """The system prompt every Tier 2 request sends; byte-identical for the
-    life of the process (few-shots sampled once) until set_register()."""
-    system = _STATIC.get("system")
+def _static_key(addressee_to=None):
+    who, hon = addressee() if addressee_to is None else addressee_to
+    return (_REGISTER["name"], who, hon)
+
+
+def static_system(addressee_to=None):
+    """The system prompt every Tier 2 request sends. Byte-identical for
+    the life of the process per addressee (few-shots sampled once) until
+    set_register(); the render follows ``addressee()`` on every call, so
+    the person the gate named is the person the prompt is written for.
+
+    ``addressee_to`` is the caller's OWN reading for the turn -- the tool
+    loop takes one at the top and hands it here, so the prompt and the
+    tool scope of a turn cannot disagree."""
+    key = _static_key(addressee_to)
+    system = _STATIC["system"].get(key)
     if system is not None:
         return system
     with _STATIC_LOCK:
-        system = _STATIC.get("system")
+        system = _STATIC["system"].get(key)
         if system is None:
-            system = build_ollama_system()
-            _STATIC["system"] = system
+            register_name = key[0]
+            shots = _STATIC["shots"].get(register_name)
+            if shots is None:
+                shots = select_few_shots(register=register_name)
+                _STATIC["shots"][register_name] = shots
+            system = build_ollama_system(shots=shots, register=register_name,
+                                         addressee_to=key[1:])
+            _STATIC["system"][key] = system
         return system
 
 
 def reset_static_prompt():
     """Forget the sampled prompt (set_register, tests, the eval harness)."""
     with _STATIC_LOCK:
-        _STATIC.clear()
+        _STATIC["shots"].clear()
+        _STATIC["system"].clear()
 
 
 def set_register(name):
@@ -1618,6 +1742,52 @@ def _chat_payload(messages, tools=None, fmt=None, **opt_overrides):
     if fmt is not None:
         payload["format"] = fmt
     return payload
+
+
+# What a KNOWN person's turn may reach through the tool loop. DEFAULT-DENY,
+# the same reading gate.allowed_for takes of his "the time, the weather,
+# music": an allow-list, and everything else is his. The gate's regexes
+# refuse the turns that NAME his things; this is the belt for the ones
+# that do not -- "anything on today?", "what did I write down?" -- which
+# pass the gate as plain questions and used to arrive at gemma4 with
+# get_calendar, notes, get_mail and the rest offered on the turn. The
+# gate's own comment promised "answered as ordinary chat, with no tools
+# behind it"; this is that promise, in code (review finding 2, 09-04).
+KNOWN_TOOLS = frozenset({"get_time", "get_weather"})
+# Spoken when a guest's turn asks for one of his tools anyway -- the model
+# hallucinating a name it was not offered, or a commander short-cut that
+# forces one. Authored, so it ends the turn; no result of his is rendered.
+KNOWN_TOOL_LINE = scope_mod.HIS_LINE
+
+
+def tool_in_scope(name, owner=None) -> bool:
+    """May THIS turn run ``name``? True for the owner, always; a known
+    person gets KNOWN_TOOLS and nothing else. ``owner`` is the turn's own
+    reading of ``is_owner_addressee()`` when the caller took one."""
+    if owner is None:
+        owner = is_owner_addressee()
+    return bool(owner) or name in KNOWN_TOOLS
+
+
+def _scope_refusal(name, who=None):
+    """The ok=False result a refused tool call hands the loop. ``who`` is
+    the name the turn was opened for; the loop passes its own reading so
+    a guest whose turn is still running is addressed as herself even if
+    the gate has since named the next person."""
+    if who is None:
+        who, _hon = addressee()
+    line = scope_mod.refusal(who)
+    log.info("chat: %s is not offered to %s; refused", name, who or "?")
+    return ToolResult(text="not available to this person", ok=False,
+                      speak=line, max_sentences=2)
+
+
+def _scoped_call(registry, name, args, owner=None, who=None, **kw):
+    """``registry.call`` behind the scope: the ONE door every tool call in
+    the loop goes through, forced or model-chosen."""
+    if not tool_in_scope(name, owner):
+        return _scope_refusal(name, who)
+    return registry.call(name, args, **kw)
 
 
 _SETTINGS_LOGGED = []
@@ -2209,21 +2379,39 @@ def _chat_once(messages, tools=None, timeout=OLLAMA_TIMEOUT_S, fmt=None,
     _log_round_tokens(data, estimate, label=label)
     return data
 
-def _registry_schemas(registry, text=None):
-    """Every registered tool, every turn. A per-turn subset chosen from
-    the text was tried (2026-08-30) and dropped: the chat template renders
-    the tools into the prefix, so a subset that changes between turns
-    evicts Ollama's prefix cache (module doc, "static-prefix rule") and
-    costs more prefill than the schemas it saves. ``text`` is accepted for
-    the older call shape and ignored."""
+def _registry_schemas(registry, text=None, owner=None):
+    """Every registered tool, every turn -- for HIM. A per-turn subset
+    chosen from the text was tried (2026-08-30) and dropped: the chat
+    template renders the tools into the prefix, so a subset that changes
+    between turns evicts Ollama's prefix cache (module doc, "static-prefix
+    rule") and costs more prefill than the schemas it saves. ``text`` is
+    accepted for the older call shape and ignored.
+
+    A KNOWN person's turn is offered KNOWN_TOOLS only. That costs no
+    cache: her turn already carries a different system prompt (the
+    addressee clause), so its prefix is cold whatever the tool block says,
+    and his stays exactly the bytes it was."""
     log_settings(registry)
     if registry is None:
         return []
     try:
-        return registry.schemas()
+        schemas = registry.schemas()
     except Exception:
         log.exception("tool registry schemas failed")
         return []
+    if owner is None:
+        owner = is_owner_addressee()
+    if owner:
+        return schemas
+    return [sc for sc in schemas
+            if tool_in_scope(_schema_name(sc), owner=False)]
+
+
+def _schema_name(schema):
+    try:
+        return str(schema["function"]["name"])
+    except Exception:                                  # noqa: BLE001
+        return ""
 
 
 def _same_model(a, b):
@@ -3342,16 +3530,26 @@ class JarvisBrain:
     # Public API
     # ------------------------------------------------------------------
     def chat(self, text, callback=None, force_tool=None, force_args=None,
-             max_rounds=3, on_sentence=None):
+             max_rounds=3, on_sentence=None, addressee=None):
         """Tier 2 with tools on a worker thread; callback gets the tags
         ([("BRIEFING", json)] when a card was produced, then ("SPEAK",
-        line))."""
+        line)). ``addressee`` is ``(name, honorific)`` when the caller
+        knows who the turn is for (``scope.OWNER`` for a proactive call);
+        None reads the per-turn attribution once, HERE."""
         if not self._acquire_busy():
             if callback:
                 callback([("SPEAK",
                            "Still on the last one, sir. One moment.")])
             return None
         gen = self._job_gen                   # this job's identity, for cancel()
+        # THE ONE READING FOR THIS WHOLE JOB, taken on the CALLER'S thread
+        # and before the worker starts, then carried as a value to the
+        # prompt/schemas (_chat_sync) AND to the filing (_remember). It used
+        # to be taken inside _chat_sync, which was still correct for the
+        # prompt but left _remember with nothing at all -- so the tail of a
+        # guest's job wrote her sentence into his ring, his journal and his
+        # habits (round-3 blocker, measured 09-05).
+        turn_addr = scope_mod.reading(addressee)
 
         def _live():
             # cancel() then a new job: the new acquire resets _cancelled,
@@ -3367,11 +3565,12 @@ class JarvisBrain:
                 tags = self._chat_sync(text, force_tool=force_tool,
                                        force_args=force_args,
                                        max_rounds=max_rounds,
-                                       on_sentence=on_sentence, gen=gen)
+                                       on_sentence=on_sentence, gen=gen,
+                                       addressee=turn_addr)
                 if not _live():
                     log.info("chat cancelled; dropping result")
                     return
-                self._remember(text, tags)
+                self._remember(text, tags, addressee=turn_addr)
                 if callback:
                     callback(tags)
             except Exception:
@@ -3397,11 +3596,20 @@ class JarvisBrain:
         return classify_route(text, timeout=timeout)
 
     def web_answer(self, question, callback=None, model="haiku",
-                   timeout=WEB_TIMEOUT_S):
+                   timeout=WEB_TIMEOUT_S, addressee=None):
         """Answer a question from the web through a one-shot `claude -p` on
         a worker thread; the callback gets [("SPEAK", line)] like chat().
         Returns the thread, or None when the CLI is missing or the brain is
-        busy (the busy line is spoken through the callback)."""
+        busy (the busy line is spoken through the callback).
+
+        ``addressee`` is the turn's reading, as for ``chat``. No guest
+        reaches here today -- ``commander._handle_known`` step 5 goes to
+        ``chat`` and says so in as many words ("no web one-shot carrying
+        his recent conversation") -- so this is default-deny rather than a
+        measured leak. It is worth having twice over: the tail files the
+        exchange in his record, and the prompt itself carries his recent
+        conversation OFF THIS MACHINE.
+        """
         if not MACHINE.claude_bin:
             return None
         if not self._acquire_busy():
@@ -3409,6 +3617,8 @@ class JarvisBrain:
                 callback([("SPEAK", "Still on the last one, sir. One moment.")])
             return False                  # busy: already spoken (None = no CLI)
         gen = self._job_gen               # this job's identity, for cancel()
+        turn_addr = scope_mod.reading(addressee)   # ONE reading, before the job
+        his_turn = not turn_addr[0]
 
         # "Look it up" needs a referent: the one-shot has no history unless
         # it is handed some.
@@ -3417,7 +3627,8 @@ class JarvisBrain:
             # The last exchanges only. format_for_prompt() also carries the
             # git state, the active window title and the session log, and
             # this prompt leaves the machine.
-            if self._context and hasattr(self._context, "recent_conversation_text"):
+            if his_turn and self._context and \
+                    hasattr(self._context, "recent_conversation_text"):
                 recent = self._context.recent_conversation_text() or ""
         except Exception:
             log.debug("web answer: context unavailable", exc_info=True)
@@ -3443,7 +3654,7 @@ class JarvisBrain:
                 log.info("web answer (%s): %.80s", model, line)
                 tags = [("SPEAK", line)]
                 try:
-                    self._remember(question, tags)
+                    self._remember(question, tags, addressee=turn_addr)
                 except Exception:
                     log.debug("web answer remember failed", exc_info=True)
                 if callback:
@@ -3485,14 +3696,22 @@ class JarvisBrain:
     def read_syllabus(self, text, today="", timeout=SYLLABUS_TIMEOUT_S):
         return read_syllabus(text, today=today, timeout=timeout)
 
-    def think(self, user_input, callback=None):
+    def think(self, user_input, callback=None, addressee=None):
         """Legacy entry (deploy/autonomous era): a local question goes to
-        the tool loop, anything else to Claude's tag protocol."""
+        the tool loop, anything else to Claude's tag protocol.
+
+        ``addressee`` is the turn's reading, as for ``chat``.
+        ``commander._handle_known`` step 5 falls back here when the brain
+        in play has no ``chat`` (a stand-in, or an older build), so a
+        guest's sentence CAN arrive -- and the tail files it in his
+        record through the same ``_remember``.
+        """
         if not self._acquire_busy():
             if callback:
                 callback([("SPEAK",
                            "Still on the last one, sir. One moment.")])
             return
+        turn_addr = scope_mod.reading(addressee)   # ONE reading, before the job
 
         def _process():
             bus.publish(BrainState(state="thinking"))
@@ -3506,7 +3725,7 @@ class JarvisBrain:
                     log.info("think cancelled; dropping result")
                     return
 
-                self._remember(user_input, actions)
+                self._remember(user_input, actions, addressee=turn_addr)
                 if callback:
                     callback(actions)
             except Exception:
@@ -3632,7 +3851,43 @@ class JarvisBrain:
             self._job_gen = getattr(self, "_job_gen", 0) + 1
             return True
 
-    def _remember(self, user_input, tags):
+    def _remember(self, user_input, tags, addressee=None):
+        """File the turn in HIS record -- and only if it was his.
+
+        ``addressee`` is the turn's reading, taken by the caller on the
+        caller's thread and carried here as a VALUE (jarvis/scope.py). It
+        is not looked up here on purpose: this runs at the END of a model
+        job, minutes of wall clock after the words were attributed, so an
+        ambient read would file the turn under whoever the gate happens to
+        be naming when the worker lands.
+
+        ROUND-3 BLOCKER, MEASURED 09-05. ``app._after_dispatch`` gated the
+        SYNCHRONOUS half; this is the asynchronous one, and it was
+        ungated. ``commander._handle_known`` step 5 -- the door every
+        guest question that is not the clock or arithmetic goes through --
+        hands the words to ``chat``, and the tail of that job wrote three
+        of his things at once:
+
+          * ``memory.log_habit`` learned her sentence as one of his habits;
+          * ``context.add_exchange`` appended it to his conversation ring;
+          * that call ``_journal_write``s it to his plaintext day file --
+            recorded ('exchange', {'user': "what's the weather like",
+            'jarvis': "Ten degrees, ma'am."}).
+
+        And it was never write-only: the ring ``add_exchange`` appends to
+        is the ring ``_dynamic_context`` renders into HIS next prompt.
+        Measured on the tip, his next payload carried "about the spare
+        key\n  Jarvis: Ten degrees, ma'am." -- her question read back to
+        him as his own background.
+
+        Nothing of his is DISCLOSED by any of this. His record is still
+        his: a turn that was not his leaves no trace in it.
+        """
+        who = scope_mod.reading(addressee)[0]
+        if who:
+            # Not a refusal -- her turn was answered. Only the filing stops.
+            log.info("scope: %s's turn is not filed in his record", who)
+            return
         spoken = " ".join(d for t, d in tags if t == "SPEAK")
         if self._memory:
             try:
@@ -3665,7 +3920,12 @@ class JarvisBrain:
     def _dynamic_context(self, text=""):
         """The per-turn background: context + memory. ``text`` (Hunter's
         words) lets the memory pick the facts RELEVANT to this utterance;
-        it stays in the user turn, never the static system prompt."""
+        it stays in the user turn, never the static system prompt.
+
+        Called for HIS turn only: _chat_sync hands a known person's turn
+        ("", "") instead. The signature is a seam six tests stub with
+        ``lambda text="": ("", "")``, so the scope is decided at the call
+        site and not here."""
         ctx_text = ""
         if self._context:
             ctx = self._context.get_context("standard")
@@ -3734,7 +3994,7 @@ class JarvisBrain:
         return self._cancelled or (gen is not None and self._job_gen != gen)
 
     def _chat_sync(self, text, force_tool=None, force_args=None, max_rounds=3,
-                   on_sentence=None, gen=None):
+                   on_sentence=None, gen=None, addressee=None):
         """The tool loop (spec 4.2), synchronous. Returns tags.
 
         ``on_sentence(sentence)``: when given, the final model turn is
@@ -3753,11 +4013,26 @@ class JarvisBrain:
                                kind="info"))
             return [("SPEAK", MODEL_LENT_LINE)]
         registry = self.registry
-        ctx_text, mem_text = self._dynamic_context(text)
-        messages = [{"role": "system", "content": static_system()},
+        # ONE reading of who the turn is for -- exactly one: the prompt
+        # render, the schemas offered, the background handed to the model
+        # and every call refused below all take THIS pair, even if the
+        # gate names the next person while this turn is still on the
+        # worker. A caller that knows (a proactive briefing) passes it in.
+        turn_addr = tuple(addressee) if addressee is not None \
+            else scope_mod.addressee()
+        turn_who = turn_addr[0]
+        owner_turn = not turn_who
+        # A guest's turn carries NONE of his background: the context block
+        # is his active window, his git state, his recent conversation and
+        # his screen; the memory block is what he told me about his life.
+        # None of it is hers to be answered from, with or without a tool.
+        ctx_text, mem_text = (self._dynamic_context(text) if owner_turn
+                              else ("", ""))
+        messages = [{"role": "system",
+                     "content": static_system(addressee_to=turn_addr)},
                     {"role": "user",
                      "content": build_user_turn(ctx_text, mem_text, text)}]
-        tools = _registry_schemas(registry, text)
+        tools = _registry_schemas(registry, text, owner=owner_turn)
         started = time.monotonic()
         cap = MAX_SPOKEN_SENTENCES
         card = None
@@ -3927,7 +4202,8 @@ class JarvisBrain:
             # exactly that question, so the read mail newer than the answer
             # it gave was never searched.
             args = dict(force_args or {})
-            result = registry.call(force_tool, args)
+            result = _scoped_call(registry, force_tool, args,
+                                  owner=owner_turn, who=turn_who)
             note(result, force_tool, args)
             if result.speak:
                 speak = authored_line(result) or result.speak
@@ -4309,8 +4585,9 @@ class JarvisBrain:
                     # key can still read it off HIS words (ToolSpec.derive):
                     # taking a knob away from the model must not mean the
                     # words lose it too.
-                    result = registry.call(name, args, from_model=True,
-                                           utterance=text)
+                    result = _scoped_call(registry, name, args,
+                                          owner=owner_turn, who=turn_who,
+                                          from_model=True, utterance=text)
                     note(result, name, args)
                     messages.append(tool_message(result, name))
                     ran += 1
