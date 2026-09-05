@@ -495,3 +495,52 @@ def test_classic_still_clips_at_his_window_because_it_is_frozen(root):
     hsave = holo._save_btn
     assert hsave.winfo_rooty() + hsave.winfo_height() <= \
         holo.winfo_rooty() + holo.winfo_height()
+
+
+def _build_drawer(root, look: str):
+    import tkinter as tk
+    from jarvis.ui import views
+    theme.select_look(look)
+    host = tk.Frame(root, width=STAGE_W, height=1440)
+    host.pack_propagate(False)
+    host.pack()
+    drawer = views.SettingsDrawer(host, services=None)
+    drawer.place(in_=host, relx=1.0, y=0, x=0, anchor="ne", relheight=1.0,
+                 width=drawer.WIDTH)
+    root.update_idletasks()
+    return drawer
+
+
+def test_the_classic_knightfall_row_still_overruns_because_it_is_frozen(root):
+    """THE PRICE OF FREEZING CLASSIC, second entry (2026-09-05).
+
+    Hunter, on the merged tip: "the knightfall text doesnt fit in its
+    slot". MEASURED on :93 at S=2: the row asks for 676 px of a 576 px
+    slot, so Tk squeezes the Open button from 125 px to 25 and draws the
+    word as a sliver; the button under it asks for 578 and is clipped at
+    576. The fix is HOLO's -- holo is what he runs (theme.DEFAULT_LOOK) --
+    and classic keeps the 09-04 row, wording, widths and overflow, exactly
+    as it keeps the clipped sensors page above.
+
+    If this test ever fails, the classic drawer has been relaid out:
+    revisit the freeze with him or re-measure the whole frozen set."""
+    from jarvis.ui.views import SettingsDrawer
+    drawer = _build_drawer(root, "classic")
+    row = drawer._knightfall_entry.master
+    assert row.winfo_reqwidth() > row.winfo_width(), (row.winfo_reqwidth(),
+                                                      row.winfo_width())
+    open_btn = drawer._knightfall_open
+    assert open_btn.winfo_width() < open_btn.winfo_reqwidth()
+    # the v3 words and the v3 box, untouched
+    label = [k for k in row.winfo_children()
+             if k.winfo_class() == "Label"][0]
+    assert label.cget("text") == "Knightfall code"
+    assert drawer._knightfall_new._text == "Email me a new Knightfall code"
+    assert int(drawer._knightfall_entry.cget("width")) == 12
+    assert label.cget("text") != SettingsDrawer.KNIGHTFALL_LABEL_HOLO
+    # ...and holo, the same row, fits with room to spare
+    holo = _build_drawer(root, "holo")
+    hrow = holo._knightfall_entry.master
+    assert hrow.winfo_reqwidth() <= hrow.winfo_width()
+    assert holo._knightfall_open.winfo_width() >= \
+        holo._knightfall_open.winfo_reqwidth()
