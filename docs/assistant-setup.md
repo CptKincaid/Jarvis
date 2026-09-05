@@ -4331,7 +4331,7 @@ counters follow the rate the camera *delivers* (~7.5 fps), not the
 * One hand. Two hands out at the lens is not this gesture, on purpose.
 * A question on the floor (a read-back waiting on your yes) blocks a grab.
 
-## 84. "Um" buys you time (the filler hold)
+## 85. "Um" buys you time (the filler hold)
 
 He used to close the mic 0.8 s after your last sound (`endpoint_silence`),
 so a thinking pause after "set a timer for, um…" ended the capture
@@ -4353,7 +4353,15 @@ The hint never reaches the final transcription: your commands stay clean
 of ums whatever the preview saw. And the preview's own prompt-echo gate
 judges the text against the *hinted* prompt, so if Whisper ever runs away
 and simply reads "Um, uh, hmm, er." back at you, the ghost card stays
-blank and no hold is bought on it.
+blank and no hold is bought on it. That gate needs a phrase repeated three
+times before it will call it an echo — the right floor for *your* words,
+since "yes yes" is a man being emphatic — so the hint gets a second,
+narrower gate of its own: the hint is a string Jarvis put in the prompt,
+not something you said, so **one** whole read-back of it is enough to
+blank the card. It fires only on whole repeats of that exact string, so a
+real "…um" is never touched. (Before 09-05 a one- or two-fold runaway got
+through, showed you four words you never said, and — because it ends on
+"er" — bought a 1.5 s hold on it.)
 
 What the log shows: `filler hold 1/3: 'um' at 3.2s, waiting 1.5s` once
 per hold, and the turn line ends `(stop=vad holds=1)` on a turn where one
@@ -4368,9 +4376,17 @@ upper bound instead of a count.)
 
 The other bound: a preview decode is only allowed to claim the um was the
 last thing heard if its span sits inside the audio the endpointer has
-itself heard — no more than 0.6 s either side of the last speech mark. A
-decode that lands after a stop carries the previous capture's position and
-buys nothing.
+itself heard — no more than 0.6 s either side of the last speech mark.
+
+And every decode is **stamped with the capture it came from**. A decode
+takes a few hundred milliseconds, so the capture it started in can end and
+the next one open before it returns; that decode carries the old capture's
+words and the old capture's position, and the recorder throws it away
+rather than letting it hold the new capture's first pause. Before 09-05 it
+did not, and a short previous capture landed squarely inside both bounds
+above — measured, a capture in which you had said no filler at all logged
+`filler hold 1/3: 'um' at 1.0s`. The stamp is required, with no "trust me"
+default: a note that is not this capture's is dropped.
 
 **The limit, stated plainly.** The preview re-decodes every 0.9 s and the
 stop is due at 0.8 s, so an um said right after the last preview may never
@@ -4392,3 +4408,12 @@ transcript's *length* — then asks whether you were cut off. It never
 saves audio and never prints the words unless you pass `--show`. Paste
 back the four summary lines at the end; they settle `filler_hold_s`,
 `filler_prompt_hint`, and whether the race above is worth fixing.
+
+**Reading the hint-ON takes.** With `filler_prompt_hint` on, a take that
+was nothing but stutter ("um um um") can end up with *fewer* holds, not
+more: the prompt-echo gate sees a preview made only of prompt words and
+blanks it, and a blank preview has no trailing filler to hold on. So a
+hint-ON take showing `holds 0` is not evidence the hint failed to help —
+it may be evidence you stuttered cleanly enough to look like an echo. The
+takes worth comparing are the ones with real words around the um, which is
+what the instruction before each take asks you for.

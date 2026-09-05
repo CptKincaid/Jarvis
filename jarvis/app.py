@@ -3051,6 +3051,13 @@ class JarvisApp:
                     time.sleep(self._SPECULATE_POLL_S)
                     continue
                 started = time.monotonic()
+                # BEFORE the snapshot, never after: this stamps the note
+                # with the capture the audio came from. If the capture
+                # turns over between this read and the snapshot the note
+                # carries the OLD id and the recorder drops it -- a
+                # mismatch may only ever discard, never accept a stale
+                # note. Reading it after the decode would do the opposite.
+                capture = getattr(self.recorder, "capture_id", None)
                 audio = self.recorder.snapshot_audio()
                 end_s = 0.0
                 if audio is not None:
@@ -3077,8 +3084,11 @@ class JarvisApp:
                         text = ""
                     # Every decode, changed or not, failed or not: a
                     # failed decode reports "" so a stale um cannot keep
-                    # holding the mic open.
-                    self._note_partial(text, end_s)
+                    # holding the mic open. Guarding this on
+                    # recorder.recording is the WRONG fix for the
+                    # cross-capture race -- it would drop exactly the note
+                    # that clears a stale um. The capture stamp does it.
+                    self._note_partial(text, end_s, capture)
                     # only publish on change: the ghost card redraws on
                     # every event, and whisper often returns the same text.
                     if text and text != last and self.recorder.recording:
@@ -3108,15 +3118,18 @@ class JarvisApp:
                 self.preview_probe.retracted(PATH_GREEDY)
                 bus.publish(PartialText(text=""))
 
-    def _note_partial(self, text: str, end_s: float) -> None:
-        """Hand the preview's newest decode to the recorder's filler hold.
-        getattr, because the preview-thread tests drive _partial_loop with
-        bare recorder fakes -- and a preview must never fail the capture."""
+    def _note_partial(self, text: str, end_s: float,
+                      capture_id=None) -> None:
+        """Hand the preview's newest decode to the recorder's filler hold,
+        stamped with the capture its audio came from (Recorder.note_partial
+        drops a note from any other). getattr, because the preview-thread
+        tests drive _partial_loop with bare recorder fakes -- and a preview
+        must never fail the capture."""
         note = getattr(self.recorder, "note_partial", None)
         if note is None:
             return
         try:
-            note(text, end_s)
+            note(text, end_s, capture_id)
         except Exception:
             log.debug("note_partial failed", exc_info=True)
 

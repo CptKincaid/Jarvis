@@ -230,6 +230,7 @@ class Recorder:
     _latest_partial = None        # (filler, audio_end_s, wallclock) of the newest preview decode
     _filler_holds = 0             # distinct pauses held this capture
     _filler_hold_key = None       # last_speech_seconds of the pause being held
+    _capture_id = 0               # bumped by every start(); see note_partial
 
     def __init__(self, arbiter: MicArbiter, speaker_verifier=None):
         self._arbiter = arbiter
@@ -867,19 +868,56 @@ class Recorder:
         return True
 
     # -- the filler hold ---------------------------------------------------
-    def note_partial(self, text: str, audio_end_s: float) -> None:
+    @property
+    def capture_id(self) -> int:
+        """Which capture is open. The preview reads this BEFORE it
+        snapshots the buffer and hands it back to note_partial, so a decode
+        that outlives its own capture can be told apart from this one's."""
+        return self._capture_id
+
+    def note_partial(self, text: str, audio_end_s: float,
+                     capture_id) -> None:
         """The live preview's newest decode. Called by the app's partial
         loop after EVERY decode (not only a changed one -- a hold must
         survive whisper returning the same "…um" twice), with the capture
         position, in seconds, that the decoded span ends at. Only the
         trailing filler (jarvis.endpoint.trailing_filler) is kept; the
         recorder never sees or stores the words. Safe from any thread: one
-        tuple assignment, read whole by _filler_hold_extra."""
+        tuple assignment, read whole by _filler_hold_extra.
+
+        ``capture_id`` is the capture the AUDIO came from -- Recorder.
+        capture_id read before the snapshot. A decode takes hundreds of ms,
+        so the capture it started in can stop and the NEXT one open before
+        it returns; that note carries the old capture's words and the old
+        capture's position, and it held the new capture's first pause
+        (MEASURED 09-05 at shipped defaults: `filler hold 1/3: 'um' at
+        1.0s` on a capture with no filler in it). The round-1 span bounds
+        cannot see it -- a SHORT previous capture leaves end_s inside both
+        of them.
+
+        Identity, NOT a flag: guarding on self.recording instead reads a
+        different moment from the snapshot, and it would drop the note a
+        decode makes after the stop -- which must still arrive, or a stale
+        um keeps holding the mic (the partial loop's design item 4).
+        The stamp is REQUIRED and there is no vouching path: a note is
+        used only when its stamp equals the open capture's id, so an
+        unstamped None is simply not equal and is dropped. A default that
+        meant "trust me" is how this hole would be reopened by the next
+        caller that forgets.
+        """
+        if capture_id != self._capture_id:
+            return                    # a decode that outlived its capture
         self._latest_partial = (trailing_filler(text), float(audio_end_s),
                                 time.monotonic())
 
     def _reset_filler_hold(self) -> None:
-        """New capture: no partial yet, no holds."""
+        """New capture: a new id, then no partial and no holds.
+
+        The id moves FIRST, and the order is load-bearing: a note landing
+        between the two statements must read the NEW id and be dropped.
+        Clearing first would leave a window in which the old capture's id
+        still matched and its note survived the reset."""
+        self._capture_id += 1
         self._latest_partial = None
         self._filler_holds = 0
         self._filler_hold_key = None

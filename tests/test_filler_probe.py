@@ -104,9 +104,11 @@ class FakeRecorder:
         self.last_audio = None
         self._stop_after, self._holds, self._gap = stop_after, holds, gap
         self._endpoint, self._auto = endpoint, auto_stop
+        self.capture_id = 1              # as the real Recorder: bumped by start()
 
     def start(self):
         self.starts += 1
+        self.capture_id += 1
         self.recording = True
 
     def snapshot_audio(self):
@@ -115,7 +117,9 @@ class FakeRecorder:
     def snapshot_final(self):
         return self.snapshot_audio()
 
-    def note_partial(self, text, audio_end_s):
+    def note_partial(self, text, audio_end_s, capture_id=None):
+        # The real Recorder drops a note stamped with a finished capture.
+        assert capture_id == self.capture_id, (capture_id, self.capture_id)
         self.notes.append((text, audio_end_s))
         self.decodes += 1
         if self._auto and self.decodes >= self._stop_after:

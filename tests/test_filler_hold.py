@@ -165,7 +165,7 @@ def test_a_trailing_filler_in_the_newest_partial_holds_the_stop(monkeypatch):
     """"set a timer for, um" then a thinking pause: the 0.8 s endpoint
     would have cut him off; the hold waits filler_hold_s longer."""
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um", 0.96)     # decoded through the um
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)     # decoded through the um
     _push(rec, 26)                                     # 0.83 s gap: the old stop
     assert rec._check_endpoint() is False and rec.stops == []
     assert rec._filler_holds == 1
@@ -180,7 +180,7 @@ def test_a_trailing_filler_in_the_newest_partial_holds_the_stop(monkeypatch):
 def test_a_filler_mid_sentence_does_not_hold(monkeypatch):
     """"for, um, ten minutes": the um was not the last word."""
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um, ten minutes", 0.96)
+    rec.note_partial("set a timer for, um, ten minutes", 0.96, rec.capture_id)
     _push(rec, 26)
     assert rec._check_endpoint() is True and rec._filler_holds == 0
     assert rec.stops[0][2] < 1.0
@@ -196,7 +196,7 @@ def test_a_partial_older_than_the_last_speech_by_more_than_the_slack_does_not_ho
     rec = _recorder(VoiceEndpointer(model=ScriptedVAD([0.9] * 60 + [0.0] * 400)))
     _push(rec, 60)                                     # 1.92 s of speech
     assert rec._check_endpoint() is False
-    rec.note_partial("set a timer for, um", 1.0)       # 0.92 s before the last speech
+    rec.note_partial("set a timer for, um", 1.0, rec.capture_id)       # 0.92 s before the last speech
     _push(rec, 26)
     assert rec._check_endpoint() is True and rec._filler_holds == 0
 
@@ -209,14 +209,14 @@ def test_a_partial_within_the_slack_of_the_last_speech_counts_as_last(monkeypatc
     counts. A wrong hold costs one hold_s once; a missed one cuts him off."""
     rec = _speaks_then_pauses(monkeypatch)
     assert recorder_mod.FILLER_SLACK_S == 0.6
-    rec.note_partial("set a timer for, um", 0.96 - 0.5)
+    rec.note_partial("set a timer for, um", 0.96 - 0.5, rec.capture_id)
     _push(rec, 26)
     assert rec._check_endpoint() is False and rec._filler_holds == 1
 
 
 def test_a_hold_is_counted_once_per_pause_not_per_tick_or_per_redecode(monkeypatch):
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um", 0.96)
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)
     _push(rec, 26)
     assert rec._check_endpoint() is False and rec._filler_holds == 1
     for _ in range(6):                                 # six more poll ticks
@@ -224,7 +224,7 @@ def test_a_hold_is_counted_once_per_pause_not_per_tick_or_per_redecode(monkeypat
         assert rec._check_endpoint() is False
     assert rec._filler_holds == 1
     # the preview re-decodes the SAME pause 0.9 s later and still ends on um
-    rec.note_partial("set a timer for, um", rec.endpointer.audio_seconds)
+    rec.note_partial("set a timer for, um", rec.endpointer.audio_seconds, rec.capture_id)
     _push(rec, 1)
     assert rec._check_endpoint() is False
     assert rec._filler_holds == 1
@@ -233,7 +233,7 @@ def test_a_hold_is_counted_once_per_pause_not_per_tick_or_per_redecode(monkeypat
 def test_the_hold_is_logged_once_with_the_word_and_the_wait(monkeypatch, caplog):
     caplog.set_level(logging.INFO, logger="jarvis.recorder")
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um", 0.96)
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)
     _push(rec, 26)
     rec._check_endpoint()
     for _ in range(4):
@@ -252,13 +252,13 @@ def test_at_most_filler_max_holds_distinct_pauses_per_capture(monkeypatch):
     for pause in (1, 2):
         _push(rec, 30)                                 # speech
         assert rec._check_endpoint() is False
-        rec.note_partial("set a timer for, um", ep.last_speech_seconds)
+        rec.note_partial("set a timer for, um", ep.last_speech_seconds, rec.capture_id)
         _push(rec, 30)                                 # 0.96 s pause: held
         assert rec._check_endpoint() is False and rec.stops == []
         assert rec._filler_holds == pause
     _push(rec, 30)                                     # speech again
     assert rec._check_endpoint() is False
-    rec.note_partial("set a timer for, um", ep.last_speech_seconds)
+    rec.note_partial("set a timer for, um", ep.last_speech_seconds, rec.capture_id)
     _push(rec, 30)                                     # third pause: the cap
     assert rec._check_endpoint() is True
     assert rec._filler_holds == 2 and rec.stops[0][2] < 1.0
@@ -266,7 +266,7 @@ def test_at_most_filler_max_holds_distinct_pauses_per_capture(monkeypatch):
 
 def test_the_hold_is_off_by_config(monkeypatch):
     rec = _speaks_then_pauses(monkeypatch, filler_hold=False)
-    rec.note_partial("set a timer for, um", 0.96)
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)
     _push(rec, 26)
     assert rec._check_endpoint() is True and rec._filler_holds == 0
 
@@ -275,7 +275,7 @@ def test_the_hold_never_applies_before_the_endpoint_silence_itself(monkeypatch):
     """The hold lengthens a stop that was about to happen; it is not
     counted while the user is still inside the ordinary 0.8 s."""
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um", 0.96)
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)
     _push(rec, 10)                                     # 0.32 s gap
     assert rec._check_endpoint() is False and rec._filler_holds == 0
 
@@ -349,7 +349,7 @@ def test_a_partial_from_the_future_never_buys_a_hold(monkeypatch):
     a pause it never covered. A span may not reach past the audio the
     endpointer has actually been fed (plus the same slack)."""
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("um", 999.0)
+    rec.note_partial("um", 999.0, rec.capture_id)
     _push(rec, 26)                                     # 0.83 s: the ordinary stop
     assert rec._check_endpoint() is True and rec._filler_holds == 0
     assert rec.stops[0][2] < 1.0
@@ -361,7 +361,7 @@ def test_a_partial_a_little_past_the_fed_audio_still_holds(monkeypatch):
     512-sample chunks, so end_s legitimately runs a fraction of a second
     ahead of ep.audio_seconds. One slack either side."""
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um", rec.endpointer.audio_seconds + 0.5)
+    rec.note_partial("set a timer for, um", rec.endpointer.audio_seconds + 0.5, rec.capture_id)
     _push(rec, 26)
     assert rec._check_endpoint() is False and rec._filler_holds == 1
 
@@ -376,7 +376,7 @@ def test_a_hold_that_delays_nothing_is_not_counted_and_not_logged(monkeypatch, c
     the outcome."""
     caplog.set_level(logging.INFO, logger="jarvis.recorder")
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um", 0.96)
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)
     _push(rec, 120)                                    # 3.84 s in one tick
     assert rec._check_endpoint() is True
     (reason, endpoint, dead_air), = rec.stops
@@ -390,7 +390,7 @@ def test_a_hold_that_did_delay_the_stop_is_still_counted_when_it_expires(monkeyp
     delayed stays counted on the tick it expires. holds=1 must survive
     the stop it lengthened, or the ledger under-counts instead."""
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial("set a timer for, um", 0.96)
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)
     _push(rec, 26)
     assert rec._check_endpoint() is False and rec._filler_holds == 1
     _push(rec, 50)                                     # 2.43 s: the hold is spent
@@ -404,6 +404,80 @@ def test_the_hold_count_is_the_number_of_holds_that_delayed_a_stop(monkeypatch):
     import jarvis.recorder as rm
     doc = rm.Recorder._filler_hold_extra.__doc__ or ""
     assert "delay" in doc.lower()
+
+
+# ----------------------------------------- (3c) the 09-05 cross-capture race
+#
+# BLOCKER B, verdict round 2 finding 1, reproduced at SHIPPED DEFAULTS. The
+# preview snapshots capture N and the model is still running when capture N
+# stops and capture N+1 starts (start() -> _reset_filler_hold()). The decode
+# then lands on the NEW capture carrying the OLD one's words and the OLD
+# one's position, and buys a hold on capture N+1's FIRST pause -- measured
+# `filler hold 1/3: 'um' at 1.0s, waiting 1.5s` on a capture in which he had
+# said no filler at all.
+#
+# The round-1 bounds do not cover it. They reject a stale span that is far
+# from the new capture's last-speech mark (`end_s < last - FILLER_SLACK_S`)
+# or past the audio this endpointer has been fed (`end_s > audio_seconds +
+# FILLER_SLACK_S`) -- but a SHORT capture N leaves end_s squarely inside
+# both, and the preview only decodes from _PARTIAL_MIN_S (0.7 s) up, so
+# every short capture lands there.
+#
+# The obvious one-line fix -- guarding the note on self.recorder.recording,
+# the guard the publish two lines below already carries -- is WRONG: it
+# reads a flag at a DIFFERENT MOMENT from the snapshot, and it turns design
+# item 4 red (a decode that returns after the stop must still report, or a
+# stale um keeps holding). The note's identity belongs to the capture its
+# AUDIO came from, so the preview stamps each note with the capture id it
+# read before snapshotting, and the recorder drops a note from any other.
+def test_a_new_capture_gets_a_new_id_before_the_old_note_is_cleared():
+    """Order matters: the id must move FIRST. A note landing between the
+    two statements reads the new id and is dropped; clearing first would
+    leave a window where the old id still matches."""
+    rec = object.__new__(Recorder)
+    first = rec.capture_id
+    rec._reset_filler_hold()
+    assert rec.capture_id != first
+    src = inspect.getsource(Recorder._reset_filler_hold)
+    assert src.index("_capture_id") < src.index("_latest_partial"), src
+
+
+def test_a_note_stamped_with_a_finished_capture_never_holds(monkeypatch):
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("set a timer for, um", 1.4, rec.capture_id - 1)
+    _push(rec, 26)                                   # 0.83 s: the ordinary stop
+    assert rec._check_endpoint() is True and rec._filler_holds == 0
+    assert rec.stops[0][2] < 1.0
+
+
+def test_a_decode_from_the_previous_capture_cannot_hold_the_next_ones_pause(monkeypatch):
+    """The race itself: capture 1 was 1.4 s long, its decode lands after
+    capture 2's start() has already reset the hold state."""
+    rec = _speaks_then_pauses(monkeypatch)
+    one = rec.capture_id
+    rec._reset_filler_hold()                         # capture 2 start()
+    rec.note_partial("set a timer for, um", 1.4, one)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True and rec._filler_holds == 0
+
+
+def test_an_unstamped_note_is_dropped_rather_than_vouched_for(monkeypatch):
+    """No "trust me" default. A stamp that is not the open capture's id --
+    None included -- is not this capture's, so it is dropped. A default
+    meaning "the caller vouches" is how this hole gets reopened by the next
+    caller that forgets to stamp."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("set a timer for, um", 0.96, None)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True and rec._filler_holds == 0
+
+
+def test_a_note_from_the_capture_it_was_taken_in_still_holds(monkeypatch):
+    """The stamp may only ever DISCARD. The ordinary path is untouched."""
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial("set a timer for, um", 0.96, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is False and rec._filler_holds == 1
 
 
 # ------------------------------------------------------------ (4) partial loop
@@ -427,12 +501,14 @@ def test_the_partial_loop_reports_every_decode_to_the_recorder_with_the_buffer_e
 
     class Rec:
         recording = True
+        capture_id = 4
         notes = []
 
         def snapshot_audio(self):
             return np.zeros(int(SAMPLE_RATE * 2.0), dtype=np.float32)
 
-        def note_partial(self, text, audio_end_s):
+        def note_partial(self, text, audio_end_s, capture_id=None):
+            assert capture_id == 4, capture_id     # stamped with THIS capture
             Rec.notes.append((text, audio_end_s))
 
     class Tr:
@@ -459,6 +535,7 @@ def test_the_partial_loop_reports_a_failed_decode_as_no_filler(monkeypatch):
 
     class Rec:
         recording = True
+        capture_id = 4
         notes = []
 
         def snapshot_audio(self):
@@ -467,7 +544,8 @@ def test_the_partial_loop_reports_a_failed_decode_as_no_filler(monkeypatch):
                 Rec.recording = False
             return np.zeros(int(SAMPLE_RATE * 1.0), dtype=np.float32)
 
-        def note_partial(self, text, audio_end_s):
+        def note_partial(self, text, audio_end_s, capture_id=None):
+            assert capture_id == 4, capture_id
             Rec.notes.append((text, audio_end_s))
 
     class Tr:
@@ -479,6 +557,45 @@ def test_the_partial_loop_reports_a_failed_decode_as_no_filler(monkeypatch):
     pipe._PARTIAL_INTERVAL_S, pipe._PARTIAL_MIN_S = 0.01, 0.5
     pipe._partial_loop()
     assert Rec.notes and all(t == "" for t, _ in Rec.notes), Rec.notes
+
+
+def test_the_preview_stamps_its_note_with_the_capture_it_snapshotted(monkeypatch):
+    """Read BEFORE the snapshot, deliberately: if the capture turns over
+    between the read and the snapshot, the note carries the OLD id and is
+    dropped. A mismatch may only ever discard a note, never accept a stale
+    one -- reading it after would do the opposite."""
+    monkeypatch.setattr(events_mod.bus, "publish", lambda ev: None)
+    seen = []
+
+    class Rec:
+        recording = True
+        capture_id = 7
+
+        def snapshot_audio(self):
+            Rec.capture_id = 8            # the capture turns over right here
+            return np.zeros(int(SAMPLE_RATE * 1.0), dtype=np.float32)
+
+        def note_partial(self, text, audio_end_s, capture_id=None):
+            seen.append(capture_id)
+            Rec.recording = False
+
+    class Tr:
+        def partial(self, audio):
+            return "set a timer for, um"
+
+    pipe = object.__new__(_pipeline_class())
+    pipe.recorder, pipe.transcriber = Rec(), Tr()
+    pipe._PARTIAL_INTERVAL_S, pipe._PARTIAL_MIN_S, pipe._PARTIAL_MAX_S = 0.01, 0.5, 1.0
+    pipe._partial_loop()
+    assert seen == [7], seen
+
+
+def test_the_probe_stamps_its_note_too():
+    """scripts/filler_probe.py runs the same loop by hand; an unstamped
+    note there would reopen the hole in the one instrument he runs."""
+    src = inspect.getsource(__import__("scripts.filler_probe",
+                                       fromlist=["run_take"]).run_take)
+    assert "note_partial(text, end_s, capture)" in src, src
 
 
 def test_the_partial_loop_docstring_states_the_cadence_limit():
@@ -660,6 +777,101 @@ def test_the_hinted_prompt_does_not_blank_a_real_command(firewall, monkeypatch):
     assert tr_mod.prompt_echo("um um um", hinted)[1] >= 2
 
 
+# --------------------------- (6b) the hint runaway UNDER three repeats
+#
+# BLOCKER C, verdict round 2 FINDING 2. prompt_echo will not call a preview
+# an echo until a unit repeats ECHO_MIN_REPEATS (3) times, and that floor is
+# right for HIS words: "yes yes" is a man being emphatic, not a decoder
+# looping. The hint is NOT his words. "Um, uh, hmm, er." is a four-word
+# string this module injects into the PREVIEW's prompt so whisper will write
+# his fillers down -- so read back even ONCE it is a runaway. At k=1 and k=2
+# prompt_echo passes it: four words he never said land on the ghost card,
+# and trailing_filler of them is "er", so note_partial buys a 1.5 s hold on
+# a decoder runaway. Closing it must not touch ECHO_MIN_REPEATS (that would
+# blank his real insistence) and must not touch the hold (a genuine
+# trailing um must still hold) -- so the gate is narrowed to exactly what
+# this module itself put in the prompt.
+def test_the_repeat_floor_is_why_a_short_hint_runaway_got_through():
+    """The underlying fact, pinned so the fix is not mistaken for a
+    prompt_echo bug: at one and two repeats prompt_echo says 'not an echo',
+    and it is RIGHT to -- three is its floor for everything else."""
+    hint = tr_mod.FILLER_PROMPT_HINT
+    prompt = "Peyrovi, BIOSENSORS " + hint
+    assert tr_mod.ECHO_MIN_REPEATS == 3
+    assert tr_mod.prompt_echo(hint, prompt)[1] == 0
+    assert tr_mod.prompt_echo(f"{hint} {hint}", prompt)[1] == 0
+    assert tr_mod.prompt_echo(f"{hint} {hint} {hint}", prompt)[1] >= 3
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 4])
+def test_a_hint_runaway_is_blanked_at_every_repeat_count(k):
+    hint = tr_mod.FILLER_PROMPT_HINT
+    prompt = "Peyrovi, BIOSENSORS " + hint
+    assert tr_mod.Transcriber._preview_text(" ".join([hint] * k), prompt) == ""
+
+
+def test_a_hint_runaway_cut_mid_pass_is_blanked_too():
+    """sample_len stops the decode anywhere: one whole hint plus part of
+    the next, including a word cut in half."""
+    hint = tr_mod.FILLER_PROMPT_HINT
+    prompt = "Peyrovi, BIOSENSORS " + hint
+    for text in (f"{hint} Um,", f"{hint} Um, uh,", f"{hint} Um, uh, hmm",
+                 f"{hint} {hint} Um, u"):
+        assert tr_mod.Transcriber._preview_text(text, prompt) == "", text
+
+
+def test_a_real_trailing_um_still_reaches_the_card_and_the_hold():
+    """The hold's whole input. Narrowing the gate may not cost this."""
+    hint = tr_mod.FILLER_PROMPT_HINT
+    prompt = "Peyrovi, BIOSENSORS " + hint
+    for text in ("set a timer for, um", "um", "uh", "um, what is the weather",
+                 "set a timer for ten minutes"):
+        assert tr_mod.Transcriber._preview_text(text, prompt) == text, text
+    assert ep_mod.trailing_filler("set a timer for, um") == "um"
+
+
+def test_the_runaway_gate_only_removes_what_this_module_put_in_the_prompt():
+    """No hint in the prompt the model was given -> this gate says nothing
+    and prompt_echo's ordinary rules decide. Same principle as the merge:
+    judge the text against the prompt the model ACTUALLY had."""
+    hint = tr_mod.FILLER_PROMPT_HINT
+    plain = "Peyrovi, BIOSENSORS"
+    assert tr_mod.Transcriber._preview_text(hint, plain) == hint
+    assert tr_mod.hint_echo(hint, plain) == 0
+    assert tr_mod.hint_echo(f"{hint} {hint}", plain + " " + hint) == 2
+
+
+@pytest.mark.parametrize("make", [_gpu, _cpu], ids=["gpu", "cpu"])
+@pytest.mark.parametrize("k", [1, 2])
+def test_a_short_hint_runaway_buys_no_hold(firewall, monkeypatch, make, k):
+    """End to end: the decoder runs away twice, partial() reports "", and
+    the recorder's newest partial has no trailing filler -- so the capture
+    ends at the ordinary endpoint instead of waiting 1.5 s on words he
+    never said."""
+    monkeypatch.setattr(tr_mod.CONFIG, "filler_prompt_hint", True)
+    runaway = " ".join([tr_mod.FILLER_PROMPT_HINT] * k)
+    tr = make(lambda: "Peyrovi, BIOSENSORS")
+
+    def transcribe(audio, **kw):
+        tr._model.prompts.append(kw.get("initial_prompt"))
+        if tr._gpu:
+            return {"segments": [{"text": runaway}], "language": "en",
+                    "text": runaway}
+        return iter([SimpleNamespace(text=runaway, avg_logprob=-0.3)]), \
+            SimpleNamespace(language="en")
+
+    tr._model.transcribe = transcribe
+    shown = tr.partial(AUDIO)
+    assert shown == "", shown
+    assert ep_mod.trailing_filler(shown) == ""
+
+    rec = _speaks_then_pauses(monkeypatch)
+    rec.note_partial(shown, 0.96, rec.capture_id)
+    _push(rec, 26)
+    assert rec._check_endpoint() is True and rec._filler_holds == 0
+    assert rec.stops[0][2] < 1.0
+
+
 # ------------------------------------------------ (7) the one invariant
 @pytest.mark.parametrize("end_s", [0.0, 0.5, 0.96, 1.2, 5.0, 999.0])
 @pytest.mark.parametrize("text", ["set a timer for, um", "set a timer for uh",
@@ -689,7 +901,7 @@ def test_no_partial_of_any_shape_ends_a_capture_before_the_ordinary_endpoint(
     _check_endpoint feeds the endpointer, so audio_seconds cannot move
     inside a loop that merely appends frames)."""
     rec = _speaks_then_pauses(monkeypatch)
-    rec.note_partial(text, end_s)
+    rec.note_partial(text, end_s, rec.capture_id)
     for _ in range(200):
         _push(rec, 5)
         if rec._check_endpoint():

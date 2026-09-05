@@ -375,6 +375,49 @@ def prompt_echo(text, prompt) -> tuple:
     return "", 0
 
 
+def hint_echo(text, prompt) -> int:
+    """Whole FILLER_PROMPT_HINTs ``text`` is reading back, or 0.
+
+    BLOCKER C, measured 09-05 (verdict round 2, finding 2). prompt_echo
+    will not call a preview an echo until a unit repeats ECHO_MIN_REPEATS
+    (3) times, and that floor is RIGHT for his words -- "yes yes" is a man
+    being emphatic, not a decoder looping, and lowering it would blank his
+    real insistence. But the hint is not his words: FILLER_PROMPT_HINT is a
+    four-word string this module injects into the PREVIEW's prompt so
+    whisper will write his fillers down. Read back even ONCE it is a
+    runaway. At k=1 and k=2 prompt_echo passed it, so "Um, uh, hmm, er."
+    landed on the ghost card as four words he never said -- and
+    trailing_filler of it is "er", so the recorder's filler hold bought
+    1.5 s of extra mic on a decoder runaway.
+
+    Deliberately narrow, so the hold keeps working: it fires only on WHOLE
+    repeats of the injected string, and only when that string really was in
+    the prompt the model was given (the merge's principle -- judge the text
+    against the prompt it actually had). A lone "um", "uh", or "set a timer
+    for, um" is shorter than the unit and is never touched, which is the
+    input the hold exists to read. One cut repeat is allowed at the end:
+    sample_len stops the decode anywhere, including mid-word.
+    """
+    if not prompt or FILLER_PROMPT_HINT not in prompt:
+        return 0
+    unit = _echo_words(FILLER_PROMPT_HINT)
+    words = _echo_words(text)
+    if not unit:
+        return 0
+    whole = len(words) // len(unit)
+    if whole < 1 or words[:whole * len(unit)] != unit * whole:
+        return 0
+    tail = words[whole * len(unit):]
+    if tail:
+        head, cut = tail[:-1], tail[-1]
+        if head != unit[:len(head)]:
+            return 0
+        expect = unit[len(head)]        # the word the next repeat is on
+        if cut != expect and not expect.startswith(cut):
+            return 0
+    return whole
+
+
 def token_budget(seconds: float) -> int:
     """Cap on the tokens one decode pass may emit, from the clip's length."""
     return int(min(WHISPER_SAMPLE_LEN,
@@ -1060,7 +1103,15 @@ class Transcriber:
         """The preview goes through the echo gate too: the ghost card must
         never show a name he never said, and the 20:58:45 text WAS shown
         while he was still talking. Blank, not a log line -- the preview
-        runs several times a second and the final pass logs the reject."""
+        runs several times a second and the final pass logs the reject.
+
+        TWO gates, and the hint one runs FIRST because prompt_echo cannot
+        see it: prompt_echo needs three repeats, and a hint runaway is a
+        runaway at one (hint_echo, BLOCKER C)."""
+        hint_repeats = hint_echo(text, prompt)
+        if hint_repeats:
+            log.debug("preview blanked: filler-hint runaway x %d", hint_repeats)
+            return ""
         unit, repeats = prompt_echo(text, prompt)
         if repeats:
             log.debug("preview blanked: prompt echo %r x %d", unit, repeats)

@@ -215,6 +215,7 @@ def run_take(pipe: Pipeline, n: int, hint: bool, ask: Callable, say: Callable,
                 sleep(POLL_S)
                 continue
             started = clock()
+            capture = getattr(recorder, "capture_id", None)   # BEFORE the snapshot
             audio = recorder.snapshot_audio()
             if audio is not None and len(audio) >= int(SAMPLE_RATE * min_s):
                 end_s = len(audio) / SAMPLE_RATE           # the buffer's END
@@ -223,7 +224,7 @@ def run_take(pipe: Pipeline, n: int, hint: bool, ask: Callable, say: Callable,
                     text = (transcriber.partial(audio) or "").strip()
                 except Exception:
                     text = ""
-                recorder.note_partial(text, end_s)
+                recorder.note_partial(text, end_s, capture)
                 partials.append((end_s, trailing_filler(text), text))
             due = clock() + max(0.05, cadence_s - (clock() - started))
         deadline = clock() + STOP_WAIT_S
