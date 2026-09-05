@@ -1980,6 +1980,31 @@ class RestartArm:
         self._armed_at = None
 
 
+def config_cast(caster, value):
+    """Cast a widget's value to the type the CONFIG field already holds.
+
+    WHY IT IS NOT JUST ``caster(value)`` (2026-09-05). Every slider row
+    used to be a tk.Scale, and a Scale hands its command a STRING. For an
+    int-typed setting ``int("2.5")`` RAISES, so bind_config logged "bad
+    value" and wrote nothing -- the edit was refused, loudly enough to
+    find. The holo Slider hands a FLOAT, and ``int(2.5)`` does not raise:
+    it truncates to 2 and writes 2 to his config off a handle he dragged
+    to 2.5. Swapping the widget quietly swapped a refusal for a wrong
+    value.
+
+    So a fraction offered to an int setting is refused here the way the
+    Scale refused it, and a whole number (2.0, "2") still casts. Every row
+    on the drawer today is a float (noise_threshold, silence_timeout,
+    speaker_threshold), which is why this was latent and why it is worth
+    pinning before the first int row arrives.
+    """
+    if caster is int and isinstance(value, float):
+        if not math.isfinite(value) or not value.is_integer():
+            raise ValueError("%r is not a whole number" % (value,))
+        return int(value)
+    return caster(value)
+
+
 class SettingsDrawer(tk.Frame):
     """320px slide-over from the right (RAISED, scrollable). Groups per the
     V3 spec. Every control binds CONFIG via bind_config(); changes persist
@@ -2107,7 +2132,7 @@ class SettingsDrawer(tk.Frame):
 
         def save(value):
             try:
-                value = caster(value)
+                value = config_cast(caster, value)
             except (TypeError, ValueError):
                 log.warning("bind_config: bad value %r for %s", value, var_name)
                 return

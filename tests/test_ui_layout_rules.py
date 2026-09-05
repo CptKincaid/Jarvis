@@ -104,6 +104,39 @@ def test_slider_formatting_never_raises_on_junk():
     assert wg.slider_decimals("x") == 2
 
 
+def test_an_int_setting_is_never_silently_truncated_by_the_slider():
+    """THE CAST THE SLIDER CHANGED UNDER bind_config (2026-09-05, round 2).
+
+    bind_config takes its caster from the CONFIG value's own type
+    (``caster = type(current)``) and every drawer row used to hand it a
+    tk.Scale, which reports a STRING. For an int-typed setting that made
+    ``int("2.5")`` raise, the value was refused and the row logged "bad
+    value" -- nothing was written. The holo Slider hands a FLOAT instead,
+    and ``int(2.5)`` does not raise: it TRUNCATES to 2 and writes 2 to his
+    config, quietly, off a handle he dragged to 2.5.
+
+    All three rows on the drawer today are floats, so this is latent --
+    which is exactly why it needs a test now rather than after the first
+    int row lands. A whole number still casts; a fraction is refused, the
+    way the stock Scale refused it.
+    """
+    from jarvis.ui import views
+    assert views.config_cast(int, 3.0) == 3
+    assert views.config_cast(int, "3") == 3
+    assert views.config_cast(int, 3) == 3
+    with pytest.raises(ValueError):
+        views.config_cast(int, 2.5)
+    with pytest.raises(ValueError):
+        views.config_cast(int, "2.5")            # what tk.Scale did
+    # floats and bools are untouched: they are what the drawer holds today
+    assert views.config_cast(float, 2.5) == pytest.approx(2.5)
+    assert views.config_cast(float, "0.015") == pytest.approx(0.015)
+    assert views.config_cast(bool, True) is True
+    # and NaN/inf cannot become an int at all
+    with pytest.raises(ValueError):
+        views.config_cast(int, float("nan"))
+
+
 def test_slider_snaps_to_the_resolution_and_clamps_to_the_range():
     assert wg.slider_snap(0.0163, 0.005, 0.05, 0.001) == pytest.approx(0.016)
     assert wg.slider_snap(2.74, 2.0, 20.0, 0.5) == pytest.approx(2.5)
