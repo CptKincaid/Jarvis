@@ -293,3 +293,38 @@ def test_main_refuses_a_live_display_before_starting_anything(rig, tmp_path,
     assert touched == []
     assert "refuse_live_display(display)" in open(rig.__file__).read() \
         or "refuse_live_display(args.display)" in open(rig.__file__).read()
+
+
+# ------------------------------------------- the sensor-setup state (29)
+def test_the_setup_state_photographs_an_invented_profile_never_his(rig, source):
+    """State 29 opens the setup sheet, which reads a room-sensor profile --
+    the file that holds his Wi-Fi PSK and the device's OTA password.
+
+    TWO INDEPENDENT GUARANTEES, and both are asserted here. (a) The rig
+    writes its OWN profile with invented values: an invented SSID, a
+    TEST-NET-1 address, and two secrets that are literal constants in this
+    file. (b) It writes them through jarvis.sensorprofile, whose directory
+    derives from PATHS.ASSISTANT_CONFIG -- which _firewall_env has already
+    redirected into the shot directory -- so the write lands in the
+    throwaway tree and the real profiles are never opened.
+
+    And the sheet renders "set" / "not set" for a secret and never the
+    value (tests/test_ui_sensor_setup.py measures that over the whole widget
+    tree), so even a real profile would photograph nothing.
+    """
+    assert ("29", "sensor-setup") in [(n, s) for n, s, _w in rig.STATES]
+    assert rig.RIG_SSID and rig.RIG_PSK and rig.RIG_OTA
+    for value in (rig.RIG_PSK, rig.RIG_OTA):
+        assert "invented" in value
+    assert "sensorprofile.write" in source
+    assert source.index("_firewall_env") < source.index("RIG_PSK")
+    # the profile's address is a documentation literal, like the two rooms
+    assert rig.RIG_IP.startswith("192.0.2.")
+
+
+def test_the_setup_state_is_skipped_in_classic_and_says_why(source):
+    """The SETUP button is holo's: classic is pixel-frozen at the jarvis-v3
+    tip, so it has no such control and photographing the state there would
+    produce a second copy of frame 26 under a name that claims otherwise."""
+    assert 'self.skip("29", "sensor-setup"' in source
+    assert "restyled()" in source
