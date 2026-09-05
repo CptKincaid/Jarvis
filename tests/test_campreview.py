@@ -2465,3 +2465,156 @@ def test_a_detector_that_raises_is_said_on_the_pane_not_drawn_as_an_empty_room(
     warned = [r for r in caplog.records if r.name == "jarvis.campreview"
               and r.levelno >= logging.WARNING]
     assert len(warned) == 2
+
+
+# ================================ what the drain threw away, in the numbers
+class DrainingFeed(FakeFeed):
+    """A feed whose device drains its stale buffers, the way
+    ``jarvis.camera.CameraFeed`` over a ``DrainingCapture`` does. ``drops``
+    is how many the drain discarded on each capture."""
+
+    def __init__(self, drops=(), **kw):
+        FakeFeed.__init__(self, **kw)
+        self._drops = list(drops)
+        self.stale_dropped = 0
+
+    def capture(self):
+        if self._drops:
+            self.stale_dropped += int(self._drops.pop(0))
+        return FakeFeed.capture(self)
+
+
+def test_the_drop_count_reaches_the_numbers_and_becomes_a_rate():
+    """A drain that is silently eating half the stream has to be findable by
+    grep. The cumulative count comes up from the feed and the pipeline turns
+    it into frames-a-second against its own clock -- the same clock the
+    picture rate is measured on, so the two numbers are comparable."""
+    clock = Clock(10.0)
+    feed = DrainingFeed(drops=[0, 9, 9])
+    pipe = cp.PreviewPipeline(feed, detector=FakeDetector(),
+                              observe=observer(), now=clock)
+    shot = pipe.grab((64, 36), seq=1)
+    assert shot.dropped == 0 and shot.drop_fps == 0.0
+    clock.tick(1.0)
+    shot = pipe.grab((64, 36), seq=2)
+    assert shot.dropped == 9
+    assert shot.drop_fps == pytest.approx(9.0)
+    clock.tick(0.5)
+    shot = pipe.grab((64, 36), seq=3)
+    assert shot.dropped == 18
+    assert shot.drop_fps == pytest.approx(18.0)      # 9 in half a second
+    data = shot.numbers_only()
+    assert data["dropped"] == 18
+    assert data["drop_fps"] == pytest.approx(18.0)
+
+
+def test_a_feed_that_does_not_drain_reports_no_drops_rather_than_raising():
+    """Not every feed has a drain under it -- the suite's do not, and nor
+    does a device without grab/retrieve. That is 0, not an AttributeError
+    inside the one call that must never raise."""
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=FakeDetector(),
+                              observe=observer(), now=Clock(1.0))
+    shot = pipe.grab((64, 36), seq=1)
+    assert shot.dropped == 0 and shot.drop_fps == 0.0
+
+
+def test_the_numbers_line_says_how_many_frames_the_drain_ate(caplog):
+    """It goes NEXT TO THE RATE on the preview's own one-line summary. A
+    drop rate near the delivered rate means the consumer is far behind the
+    device; a drop rate of zero at a healthy picture rate means the drain
+    is costing nothing, which is the case it has to cost nothing in."""
+    clock = Clock(100.0)
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         pipeline=FakePipeline(), sensing=Policy(),
+                         now=clock)
+    shot = cp.PreviewShot(image=object(), reason=cp.REASON_LIVE,
+                          cap_w=1280, cap_h=720, fps=6.0, grab_ms=4.0,
+                          dropped=180, drop_fps=9.0)
+    with caplog.at_level(logging.INFO, logger="jarvis.campreview"):
+        w._maybe_log(shot)
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "jarvis.campreview"]
+    assert any("6.0 fps" in m and "drop 9.0/s" in m for m in lines), lines
+
+
+def test_the_drain_state_reaches_the_numbers_not_only_its_count():
+    """A drop count alone cannot tell an inert drain from a drain with
+    nothing to do: both report drop 0.0/s. So what the drain itself knows --
+    that it is on, the delivered interval it measured, how often a bound
+    stopped it short -- comes up from the feed and onto the shot."""
+    feed = DrainingFeed(drops=[0])
+    feed.drain = {"on": True, "interval_ms": 67.8, "longest_ms": 71.2,
+                  "bounded": 2, "queued": 1.2, "depth": 4}
+    pipe = cp.PreviewPipeline(feed, detector=FakeDetector(),
+                              observe=observer(), now=Clock(10.0))
+    shot = pipe.grab((64, 36), seq=1)
+    assert shot.drain_on is True
+    assert shot.drain_ms == pytest.approx(67.8)
+    assert shot.drain_bounded == 2
+    data = shot.numbers_only()
+    assert data["drain_on"] is True and data["drain_ms"] == pytest.approx(67.8)
+
+
+def test_a_feed_with_no_drain_says_off_rather_than_a_healthy_zero():
+    pipe = cp.PreviewPipeline(FakeFeed(), detector=FakeDetector(),
+                              observe=observer(), now=Clock(1.0))
+    shot = pipe.grab((64, 36), seq=1)
+    assert shot.drain_on is False
+    assert shot.drain_ms == 0.0
+
+
+def test_the_numbers_line_says_whether_the_drain_is_doing_anything(caplog):
+    """NEXT TO THE RATE, because that is where the question is asked. A
+    drain that has switched itself off, or one under a device it cannot
+    drain, reads "drain off" -- not the same drop 0.0/s a healthy one
+    reports."""
+    clock = Clock(100.0)
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         pipeline=FakePipeline(), sensing=Policy(),
+                         now=clock)
+    live = cp.PreviewShot(image=object(), reason=cp.REASON_LIVE,
+                          cap_w=1280, cap_h=720, fps=6.0, grab_ms=4.0,
+                          dropped=180, drop_fps=9.0, drain_on=True,
+                          drain_ms=67.8, drain_bounded=3)
+    with caplog.at_level(logging.INFO, logger="jarvis.campreview"):
+        w._maybe_log(live)
+        clock.tick(cp.PreviewWorker.LOG_EVERY_S + 1.0)
+        w._maybe_log(cp.PreviewShot(image=object(), reason=cp.REASON_LIVE,
+                                    cap_w=1280, cap_h=720, fps=6.0,
+                                    grab_ms=4.0))
+    lines = [r.getMessage() for r in caplog.records
+             if r.name == "jarvis.campreview"]
+    assert any("drop 9.0/s" in m and "drain on 67.8 ms" in m and "3 bounded"
+               in m for m in lines), lines
+    assert any("drain off" in m for m in lines), lines
+
+
+class VerbatimPipeline(FakePipeline):
+    """A pipeline that hands its shot back UNCHANGED. ``FakePipeline``
+    rebuilds one field by field, which is exactly what would hide the bug
+    this test is looking for."""
+
+    def grab(self, box, seq=0):
+        self.grabs += 1
+        return self._shot
+
+
+def test_the_worker_carries_the_drain_numbers_onto_the_shot_it_publishes():
+    """The worker REBUILDS a live shot to stamp its own measured fps on it,
+    and a field left out of that rebuild is a field the pane and the log
+    never see -- the numbers line would print drop 0.0/s over a drain
+    discarding half the stream. This is the test that catches it."""
+    clock = Clock(500.0)
+    pipe = VerbatimPipeline(shot=cp.PreviewShot(
+        image=object(), reason=cp.REASON_LIVE, cap_w=1280, cap_h=720,
+        grab_ms=4.0, dropped=42, drop_fps=7.5, drain_on=True,
+        drain_ms=67.8, drain_bounded=1))
+    w = cp.PreviewWorker(get_option=options(**{cp.OPTION_ENABLED: True}),
+                         pipeline=pipe, sensing=Policy(), now=clock)
+    out = w.cycle()
+    assert out.live is True                  # it went down the rebuild path
+    assert out.dropped == 42
+    assert out.drop_fps == pytest.approx(7.5)
+    assert out.drain_on is True
+    assert out.drain_ms == pytest.approx(67.8)
+    assert out.drain_bounded == 1
