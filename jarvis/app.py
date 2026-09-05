@@ -255,6 +255,22 @@ KNIGHTFALL_BAD_DESTINATION = ("the notice address in your config is not an "
 # one keyboard and one drawer; held across the send, so the second press
 # reads the state the first one left rather than the state it found.
 _KNIGHTFALL_LOCK = threading.RLock()
+
+# ---------------------------------------------- the people book's own lock
+# HOW LONG A TYPED OVERRIDE CODE IS GOOD FOR, and it lives HERE rather than
+# in the users page because the page is not the guard. The page kept its own
+# 120-second dwell and decided from it; a decision made in the UI is not a
+# decision at all, because the UI is not what performs the write.
+#
+# A dwell rather than a prompt per press: the terminal tool authorises ONCE
+# per invocation and then acts, and asking on every click trains him to type
+# a break-glass code constantly -- one more exposure on his display each
+# time. It is re-armed by each successful write and dropped the moment he
+# leaves the tab.
+PEOPLE_UNLOCK_S = 120.0
+# One keyboard, one people book. Held across read-decide-write so two
+# presses on two threads cannot both pass a check made before either wrote.
+_PEOPLE_LOCK = threading.RLock()
 # The first-wake briefing OFFERS itself (Hunter, 2026-09-02: "He should
 # offer").
 #
@@ -6565,6 +6581,341 @@ class JarvisApp:
                                                     smtp=smtp, accepted=True)
             return line
 
+    # ------------------------------------------- the people book (USERS tab)
+    def people_snapshot(self) -> dict:
+        """Everything the USERS tab draws, and NOTHING it must not hold.
+
+        Rows come from ``Person.redacted()``, which replaces both salted
+        hashes with a bare yes/no and is already documented as safe for a
+        log, a report or the pane. A hash never crosses out of the app, so
+        it cannot reach a widget even by accident.
+
+        ``admin`` is ``gate.admin_gate``'s answer -- the SAME decision
+        ``scripts/jarvis_people.py`` asks, so the tab and the terminal tool
+        cannot come to different conclusions about whether a code is owed.
+
+        The gallery LABELS are listed too, so the tab can flag a face
+        pointer that resolves to nothing (that is exactly how the face leg
+        silently stops naming anyone). Labels are strings stored beside the
+        embeddings; nothing here opens a device or reads a frame.
+
+        THE ROWS AND THE DECISION COME OFF DISK, not from ``gate.registry``.
+        That object is rebound only by ``reload()``, which nothing calls
+        until a write from this tab succeeds -- so a code, a row or a role
+        set at a terminal was invisible here until he happened to change
+        something, and the tab's "read the file NOW on open" was not
+        reading the file at all. ``gate_line`` is the exception and stays
+        the GATE's own sentence, because that one describes what the
+        running gate is doing rather than what the file says; when the two
+        disagree, the disagreement is the thing worth seeing.
+
+        NEVER RAISES. A page that cannot be painted must not be able to
+        take the console down with it.
+        """
+        out = {"people": [], "gate_line": "", "fault_kind": "",
+               "path": "", "gallery": [], "admin": gate_mod.ADMIN_REFUSE,
+               "admin_line": ""}
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            out["admin_line"] = ("the owner gate is not built, so nobody "
+                                 "can be changed from here")
+            return out
+        registry, why = self._people_registry()
+        if registry is None:
+            out["admin_line"] = why
+            return out
+        try:
+            out["people"] = [p.redacted() for p in registry.people]
+            out["fault_kind"] = str(getattr(registry, "fault_kind", "") or "")
+            out["path"] = str(getattr(registry, "path", "") or "")
+            out["admin"], out["admin_line"] = gate_mod.admin_gate(registry)
+        except Exception:                          # noqa: BLE001 - a page
+            log.exception("users: the people snapshot could not be built")
+            return out
+        try:
+            out["gate_line"] = gate.startup_line(
+                voice_ok=bool(CONFIG.speaker_verify),
+                face_ok=False, face_why="not asked from this tab")
+        except Exception:                          # noqa: BLE001 - a line
+            log.exception("users: the gate line could not be built")
+        try:
+            out["gallery"] = list(gallery_labels())
+        except Exception:                          # noqa: BLE001 - optional
+            log.exception("users: the gallery labels could not be listed")
+        return out
+
+    def _people_registry(self) -> tuple:
+        """The people book AS IT IS NOW, re-read from disk. ``(reg, why)``.
+
+        NEVER ``gate.registry``. That object is the copy this process
+        loaded at boot and rebinds only when something calls ``reload``,
+        and the whole defect this method exists to close is that the tab
+        decided from a copy that old: he set an override code at a terminal
+        and the in-process copy had never heard of it.
+
+        The window is not closed by this, only shrunk: the terminal tool is
+        a separate PROCESS and nothing here can lock against it. What it
+        does guarantee is that the decision and the write are made from the
+        same read, moments apart, instead of from a snapshot taken when a
+        tab was opened.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return None, "the owner gate is not built; see the log"
+        try:
+            path = getattr(gate.registry, "path", None)
+            return identity_mod.Registry.load(path), ""
+        except Exception:                          # noqa: BLE001 - a boundary
+            log.exception("users: the people file could not be re-read")
+            return None, "the people file could not be read; see the log"
+
+    def _people_unlock_left(self, now=None) -> float:
+        """Seconds the typed code still buys. Zero is locked."""
+        t = time.monotonic() if now is None else float(now)
+        with _PEOPLE_LOCK:
+            until = float(getattr(self, "_people_unlock_until", 0.0) or 0.0)
+        return max(0.0, until - t)
+
+    def _people_open_unlock(self, now=None) -> None:
+        """Arm the dwell. ONLY ever called where a code was just proved --
+        ``people_unlock`` on a match, and a successful write that had to
+        present one. A bootstrap write must not call it: making the first
+        owner proves nothing about a code, and a window left open there is
+        exactly the hole a code set seconds later would fall into."""
+        t = time.monotonic() if now is None else float(now)
+        with _PEOPLE_LOCK:
+            self._people_unlock_until = t + PEOPLE_UNLOCK_S
+
+    def people_relock(self) -> None:
+        """Shut it now: the Lock button, and leaving the tab.
+
+        THE PAGE RELOCKING ITSELF IS NOT ENOUGH, because the page is not
+        the guard. A page that dropped its own dwell and left this one
+        standing would look locked and not be."""
+        with _PEOPLE_LOCK:
+            self._people_unlock_until = 0.0
+
+    def people_admin_state(self, now=None) -> dict:
+        """The lock decision, RE-READ FROM DISK, plus what the dwell has
+        left. ``{"admin", "admin_line", "unlocked_s"}``. NEVER RAISES.
+
+        This is what lets the tab notice a code set at a terminal while it
+        is open. ``people_snapshot`` also carries the decision, but it
+        rebuilds every row, the startup line and the gallery listing, which
+        is too much to do on a one-second tick; this reads one small JSON
+        file and answers.
+
+        IT IS NOT THE GUARD EITHER. It exists so the page can DRAW the
+        right thing; ``_people_write`` re-decides for itself at the write.
+        """
+        out = {"admin": gate_mod.ADMIN_REFUSE, "admin_line": "",
+               "unlocked_s": 0.0}
+        registry, why = self._people_registry()
+        if registry is None:
+            out["admin_line"] = why
+            return out
+        try:
+            out["admin"], out["admin_line"] = gate_mod.admin_gate(registry)
+        except Exception:                          # noqa: BLE001 - a page
+            log.exception("users: the admin state could not be decided")
+            return out
+        out["unlocked_s"] = self._people_unlock_left(now=now)
+        return out
+
+    def people_unlock(self, code, *, now=None) -> tuple:
+        """The typed override code, from the tab. ``(ok, line)``.
+
+        AGAINST THE FILE AS IT IS NOW, not the gate's boot-time copy. That
+        was a second face of the same staleness and it failed CLOSED in a
+        way he could not get out of: set a code at a terminal, come back to
+        the running app, type the right code, and the in-memory registry
+        carried no ``code_hash`` at all -- so the answer was "no override
+        code has been set" and the only cure was restarting Jarvis.
+
+        THIS OPENS NO VOICE WINDOW, and the difference from
+        ``knightfall_code`` two methods up is deliberate rather than an
+        oversight: Knightfall's whole job is to let the microphone answer
+        him for five minutes, and an ADMINISTRATIVE unlock that did the
+        same would make Jarvis answer whoever is standing in the room. The
+        terminal tool grants no such thing for `add` or `forget`, and
+        neither does this. What it opens is a WRITE dwell, checked by
+        ``_people_write`` and by nothing else.
+
+        The counter is the gate's OWN ``code_attempts``. A fresh one here
+        would silently double the budget from ten tries per five minutes to
+        twenty, because the tab -- unlike the CLI -- is inside this process,
+        and it is the CODE's counter rather than the spoken phrase's so
+        burning one can never close the other.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return False, "the owner gate is not built; see the log"
+        registry, why = self._people_registry()
+        if registry is None:
+            return False, why
+        try:
+            who, why = gate_mod.check_override_code(
+                registry, code, attempts=gate.code_attempts)
+        except Exception as exc:                   # noqa: BLE001 - never str
+            # Never the exception's text and never a traceback: what that
+            # call was handed is a code, and an exception is free to quote
+            # its argument back into the log.
+            log.error("users: the override check failed (%s)",
+                      type(exc).__name__)
+            return False, "that check failed; see the log"
+        finally:
+            del code
+        if not who:
+            return False, why
+        self._people_open_unlock(now=now)
+        return True, "Unlocked, sir."
+
+    def _people_write(self, what: str, change, *, now=None) -> tuple:
+        """Re-read, DECIDE, mutate, save, reload the gate. ``(ok, line)``.
+
+        THIS IS WHERE THE AUTHORITY TO CHANGE THE REGISTRY IS DECIDED, and
+        it is decided from the registry as it is at the moment of the
+        write. It used to be decided by the users page, from a snapshot
+        read when the tab was OPENED, and this seam re-read the file only
+        to refuse the CORRUPT case -- so the code case was enforced in
+        exactly one place, from possibly-stale data. The sequence the page
+        itself teaches walked straight through it: make the first owner in
+        the tab (no code, correctly open), go and set a code at a terminal,
+        come back to the same open tab, and forget somebody with nothing
+        asked for.
+
+        THE RULE IS NOT INVENTED HERE. ``gate.admin_gate`` is the same
+        three-and-a-half-case decision ``scripts/jarvis_people.py::
+        _authorise`` asks, and a test greps both:
+
+        * no registry or no owner -- anybody at this keyboard may make the
+          FIRST owner, because otherwise a fresh install is a brick;
+        * an owner with NO code -- allowed, and the page says so out loud;
+        * an owner WITH a code -- ``gate.check_override_code`` must have
+          admitted one, within ``PEOPLE_UNLOCK_S``;
+        * the file is there and BROKEN -- refused outright, and that
+          outranks everything above. ``Registry.load`` answers with an
+          EMPTY people list for a file that failed to parse, so an
+          add-then-save would write a one-row registry over whatever it
+          held. There is no history and no backup.
+
+        RE-READ FIRST, EVERY TIME. The terminal tool is a separate process
+        and nothing in this one can lock against it, so a write that used a
+        registry read minutes ago would silently drop whatever was typed at
+        a terminal in between. Re-reading immediately before the mutation
+        shrinks that window; it does not close it, and the tab says so.
+        """
+        gate = getattr(self, "gate", None)
+        if gate is None:
+            return False, "the owner gate is not built; see the log"
+        with _PEOPLE_LOCK:
+            return self._people_write_now(what, change, gate, now)
+
+    def _people_write_now(self, what, change, gate, now) -> tuple:
+        """``_people_write`` with ``_PEOPLE_LOCK`` already held. Split out
+        only so the lock is one line rather than a body-wide indent; the
+        decision and the reasoning are in ``_people_write``'s docstring."""
+        registry, why = self._people_registry()
+        if registry is None:
+            return False, why
+        state, why = gate_mod.admin_gate(registry)
+        if state == gate_mod.ADMIN_REFUSE:
+            return False, why
+        if (state == gate_mod.ADMIN_CODE
+                and self._people_unlock_left(now=now) <= 0.0):
+            # The name of the action and nothing else. What was typed is
+            # not here to be logged, and must never become loggable.
+            log.info("users: %s refused -- the override code is owed", what)
+            return False, gate_mod.ADMIN_CODE_OWED
+        try:
+            ok, line = change(registry)
+        except Exception:                          # noqa: BLE001 - a boundary
+            log.exception("users: the %s failed", what)
+            return False, "that did not work, sir; see the log"
+        if not ok:
+            return False, line
+        if not registry.save():
+            return False, "the people file could not be written; see the log"
+        if state == gate_mod.ADMIN_CODE:
+            # A run of edits is one code rather than five -- but ONLY on
+            # the leg where a code was actually presented. Re-arming after
+            # a bootstrap write would hand a free window to whatever the
+            # registry became a moment later.
+            self._people_open_unlock(now=now)
+        try:
+            # LIVE, with no restart. reload() rebinds gate.registry -- one
+            # attribute swap, which the audio path then reads. The sensors
+            # page says "restart to apply"; this one does not have to.
+            gate.reload()
+        except Exception:                          # noqa: BLE001 - a boundary
+            log.exception("users: the gate could not be reloaded")
+            return True, line + " (restart Jarvis for it to take effect)"
+        log.info("users: %s -- %s", what, line)
+        return True, line
+
+    def people_add(self, *, label, name="", role=identity_mod.ROLE_KNOWN,
+                   face="", face_dim=0, voice=False, consent="",
+                   confirm_existing_owner=None, now=None) -> tuple:
+        """Enrol somebody from the tab. ``(ok, line)``.
+
+        A NON-OWNER WITHOUT A CONSENT RECORD IS REFUSED HERE, not merely
+        discouraged in the UI. The record is the only durable evidence that
+        the agreement happened at all, and the tab must not become the way
+        around the rule the terminal tool enforces.
+        """
+        who = str(label or "").strip().lower()
+        role = (identity_mod.ROLE_OWNER
+                if role == identity_mod.ROLE_OWNER else identity_mod.ROLE_KNOWN)
+        if role != identity_mod.ROLE_OWNER and not str(consent or "").strip():
+            return False, ("adding %s takes their consent, and no consent "
+                           "was recorded" % (who or "somebody"))
+
+        def change(registry):
+            person = identity_mod.Person(
+                label=who, name=str(name or "").strip(), role=role,
+                voice=bool(voice), face=str(face or "").strip().lower(),
+                face_dim=int(face_dim or 0),
+                consent=str(consent or "").strip())
+            ok, why = registry.add_person(
+                person, confirm_existing_owner=confirm_existing_owner)
+            if not ok:
+                return False, why
+            return True, "%s is enrolled as %s (consent: %s)" % (
+                who, role, person.consent or "-")
+
+        return self._people_write("add", change, now=now)
+
+    def people_set_role(self, label, role, *,
+                        confirm_existing_owner=None, now=None) -> tuple:
+        who = str(label or "").strip().lower()
+
+        def change(registry):
+            ok, why = registry.set_role(
+                who, role, confirm_existing_owner=confirm_existing_owner)
+            return (True, "%s is now %s" % (who, role)) if ok else (False, why)
+
+        return self._people_write("set-role", change, now=now)
+
+    def people_forget(self, label, *, now=None) -> tuple:
+        """Remove a row, and SAY WHAT SURVIVED IT.
+
+        MEASURED in ``identity.Registry.forget``: it removes the row and
+        nothing else. The face gallery entry is untouched, so a line that
+        said only "forgotten" would leave him believing a gallery was
+        scrubbed when it was not.
+        """
+        who = str(label or "").strip().lower()
+
+        def change(registry):
+            ok, why = registry.forget(who)
+            if not ok:
+                return False, why
+            return True, ("%s is forgotten here. Their face measurements "
+                          "stay in the gallery until that command is run."
+                          % who)
+
+        return self._people_write("forget", change, now=now)
+
     def knightfall_new_code(self, *, mail=None, smtp=None, now=None) -> str:
         """THE BOOTSTRAP: "Email me a new Knightfall code". The same
         generate -> mail -> store sequence, for the first owner, and it
@@ -6802,6 +7153,22 @@ class JarvisApp:
             knightfall_code=self.knightfall_code,
             knightfall_new_code=self.knightfall_new_code,
             knightfall_status=self.knightfall_status,
+            # The USERS tab (jarvis/ui/users_page.py). Seven narrow seams:
+            # a redacted snapshot, the administrative unlock, the three
+            # writes, and the two that stop the PAGE being the guard --
+            # people_admin_state re-reads the file so a code set at a
+            # terminal is noticed while the tab is open, people_relock
+            # shuts the app's dwell when he leaves it. Each answers ONE
+            # line to toast and never a hash. build_ui_services drops them
+            # on a UI that does not declare them, so either merge order is
+            # safe.
+            people_snapshot=self.people_snapshot,
+            people_unlock=self.people_unlock,
+            people_add=self.people_add,
+            people_set_role=self.people_set_role,
+            people_forget=self.people_forget,
+            people_admin_state=self.people_admin_state,
+            people_relock=self.people_relock,
             calibrate_noise=self.calibrate_noise,
             enroll_speaker=self.enroll_speaker,
             train_wakeword=self.train_wakeword,
@@ -6844,6 +7211,27 @@ class JarvisApp:
                          if getattr(getattr(self, "desk", None), "enabled", False)
                          else None),
         )
+
+
+def gallery_labels() -> tuple:
+    """The face gallery's LABELS, with no lens involved at all.
+
+    A gallery generation is 128 floats and a string per take; this reads
+    the strings so the USERS tab can say whether a row's face pointer
+    resolves to anything. It imports no camera module, opens no device and
+    touches no frame -- the same split jarvis/enrolentry.py already makes.
+    Any failure is an empty tuple: a chip that cannot be drawn is not worth
+    a traceback out of a repaint.
+    """
+    try:
+        from jarvis.facegallery import default_gallery
+        gallery = default_gallery()
+        gallery.load()
+        return tuple(gallery.labels())
+    except Exception:                              # noqa: BLE001 - optional
+        log.debug("users: the face gallery could not be listed",
+                  exc_info=True)
+        return ()
 
 
 def build_ui_services(services_cls, kwargs: dict):

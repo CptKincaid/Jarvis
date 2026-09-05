@@ -13,10 +13,12 @@ is A WAY BACK IN FOR THE OWNER, not a defence against them, and this file
 will not pretend otherwise.
 
 CONSENT IS NOT REINVENTED HERE. Enrolling somebody else takes THEIR
-agreement, and this imports ``scripts/face_enrol.consent`` rather than
-writing a second rule that could drift from the first: it already requires
-stdin AND stdout to be terminals, refuses ``--json``, refuses ``--auto``,
-and makes the person type their own name.
+agreement, and this calls ``jarvis/consent.py`` -- the one file holding the
+words and the "type your own label, exactly" rule -- rather than writing a
+second one that could drift. Its terminal taker still requires stdin AND
+stdout to be terminals, and the text it shows is the one that matches what
+this command stores: a name, a role and a face LABEL, and no measurement of
+anybody. The camera's own ceremony stays in ``scripts/face_enrol.py``.
 
     jarvis_people.py list
     jarvis_people.py add heather --name Heather --role known --face heather
@@ -31,10 +33,10 @@ import argparse
 import getpass
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from jarvis import consent                                # noqa: E402
 from jarvis import gate as gate_mod                       # noqa: E402
 from jarvis import passphrase as pp                       # noqa: E402
 from jarvis.assistant_config import AssistantConfig       # noqa: E402
@@ -68,7 +70,14 @@ def _keyboard_only(what: str) -> str:
 def _authorise(reg: Registry) -> tuple:
     """``(ok, why)`` -- may whoever is at this keyboard administer the gate?
 
-    THREE CASES, and the first two are the ones that keep this from becoming
+    THE DECISION IS NOT MADE HERE. ``gate.admin_gate`` makes it, because
+    the users tab (jarvis/ui/users_page.py) asks the same question and two
+    implementations of "may this keyboard administer the gate" is exactly
+    how the two drift apart. This function still does its own ASKING --
+    getpass, a tty check -- and ``check_override_code`` is still the only
+    thing that checks a code.
+
+    FOUR CASES, and the first two are the ones that keep this from becoming
     a brick:
 
     * NO USABLE REGISTRY, or no owner in it. Anybody at the keyboard may
@@ -80,10 +89,16 @@ def _authorise(reg: Registry) -> tuple:
     * AN OWNER HAS SET A CODE. It is asked for, never echoed, and rate
       limited on its own counter -- burning the spoken passphrase's attempts
       must not close the break-glass.
+    * THE FILE IS THERE AND BROKEN. REFUSED, and this one is new (2026-09-05).
+      It used to fall into the first case, so `add` on a registry that failed
+      to parse wrote a fresh one-row file over the top of everyone in it.
     """
-    if not reg.usable or not reg.owners():
+    state, why = gate_mod.admin_gate(reg)
+    if state == gate_mod.ADMIN_REFUSE:
+        return False, why
+    if state == gate_mod.ADMIN_FIRST:
         return True, "first"
-    if not any(p.code_hash for p in reg.owners()):
+    if state == gate_mod.ADMIN_NOCODE:
         return True, "nocode"
     why = _keyboard_only("the override code")
     if why:
@@ -149,17 +164,20 @@ def do_add(reg: Registry, cfg, args) -> int:
     role = ROLE_OWNER if args.role == ROLE_OWNER else ROLE_KNOWN
     owner = owner_label(cfg)
     if role == ROLE_KNOWN:
-        # Somebody else's biometric data. Their agreement, taken by the
-        # existing rule rather than a new one.
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        from face_enrol import consent as face_consent
-        shim = SimpleNamespace(json=False, auto=False, yes=False)
-        ok, how = face_consent(label, owner, PATHS.FACE_GALLERY, say, shim)
+        # Somebody else's data. Their agreement, taken by the ONE rule
+        # (jarvis/consent.py) rather than a second one -- and with the text
+        # that matches what `add` actually stores. It writes a NAME, a ROLE
+        # and a face LABEL; it captures nothing, so the face paragraph
+        # ("128 numbers per take") over-claimed here. The lens has its own
+        # ceremony in scripts/face_enrol.py and that is unchanged.
+        ok, how = consent.take_at_terminal(
+            label, what=consent.WHAT_ROW, owner=owner, say=say,
+            fields={"who": label, "root": str(PATHS.FACE_GALLERY)})
         if not ok:
             say("REFUSED: %s" % how)
             return 2
     else:
-        how = "owner"
+        how = consent.HOW_OWNER
     person = Person(label=label, name=str(args.name or "").strip(),
                     role=role, voice=bool(args.voice),
                     face=str(args.face or "").strip().lower(),

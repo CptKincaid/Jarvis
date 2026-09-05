@@ -233,6 +233,19 @@ def _write_private(path: Path, text: str) -> None:
     os.chmod(path, 0o600)
 
 
+# WHY a registry is unusable, as a TOKEN. ``fault`` is an English
+# sentence for a human; a caller that has to BRANCH on the reason cannot
+# match on prose. The one branch that matters is FAULT_MALFORMED /
+# FAULT_UNREADABLE: for those two ``people`` comes back EMPTY even though
+# the file holds rows, so an add-then-save writes a one-row registry over
+# the top of them, and there is no history and no backup.
+FAULT_NONE = ""
+FAULT_MISSING = "missing"          # no file: a fresh install, enrol away
+FAULT_UNREADABLE = "unreadable"    # the file exists and would not open
+FAULT_MALFORMED = "malformed"      # it opened and is not a registry
+FAULT_OWNERLESS = "ownerless"      # it parsed, rows are loaded, no owner
+
+
 @dataclass
 class Registry:
     """The people Jarvis knows. ``usable`` is the gate's off switch."""
@@ -241,6 +254,8 @@ class Registry:
     people: List[Person] = field(default_factory=list)
     usable: bool = False
     fault: str = ""
+    # The same fault, as a token a caller can branch on (see above).
+    fault_kind: str = FAULT_NONE
 
     # ------------------------------------------------------------ read
     @classmethod
@@ -257,18 +272,22 @@ class Registry:
             raw = p.read_text(encoding="utf-8")
         except FileNotFoundError:
             reg.fault = ("nobody is enrolled yet: %s does not exist" % p)
+            reg.fault_kind = FAULT_MISSING
             return reg
         except OSError as exc:
             reg.fault = ("%s could not be read (%s)"
                          % (p, type(exc).__name__))
+            reg.fault_kind = FAULT_UNREADABLE
             return reg
         try:
             data = json.loads(raw)
         except Exception:  # noqa: BLE001 - any parse failure is one fault
             reg.fault = "%s is not readable JSON" % p
+            reg.fault_kind = FAULT_MALFORMED
             return reg
         if not isinstance(data, dict) or not isinstance(data.get("people"), list):
             reg.fault = "%s is not shaped like a registry" % p
+            reg.fault_kind = FAULT_MALFORMED
             return reg
         for row in data["people"]:
             person = Person.from_json(row)
@@ -283,6 +302,10 @@ class Registry:
         if not any(p_.role == ROLE_OWNER for p_ in reg.people):
             reg.fault = ("%s names no owner, so there is nobody who could "
                          "enrol one" % p)
+            # The rows PARSED and are loaded, so adding an owner here adds
+            # to them rather than replacing them: this fault is safe to
+            # write over and the two above are not.
+            reg.fault_kind = FAULT_OWNERLESS
             return reg
         reg.usable = True
         return reg
@@ -348,6 +371,7 @@ class Registry:
         self.usable = bool(self.owners())
         if self.usable:
             self.fault = ""
+            self.fault_kind = FAULT_NONE
         return True, ""
 
     def set_role(self, label, role, *,
