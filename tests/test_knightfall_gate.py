@@ -285,3 +285,17 @@ def test_the_phrase_inside_a_longer_sentence_is_a_known_limit(tmp_path):
     d = g.judge("voice", "run the xxx not a real phrase xxx now",
                 stats=MATCHED)
     assert d.consumed is False
+
+
+def test_with_the_gate_off_the_phrase_opens_no_window(tmp_path):
+    """Consumed, but nothing is granted: off already admits everything, so
+    a window would be a five-minute admission created by an UNLIMITED
+    guessing path (the limiter is off in this mode) that would still be
+    open if the mode were moved to enforce a minute later."""
+    g = _gate(tmp_path, mode="off", phrase=True)
+    for _ in range(8):
+        assert g.judge("voice", WRONG, stats=MATCHED, now=0.0).consumed is False
+    d = g.judge("voice", SAID, stats=MATCHED, now=0.0)
+    assert d.consumed is True
+    assert g._granted(1.0) == ""
+    assert g.phrase_attempts._hits == []

@@ -407,10 +407,25 @@ class OwnerGate:
                  _OPENER_NAMES[self._grant_how], self._grant_who, GRANT_S,
                  self.effective_mode())
 
-    def _phrase_consumed(self, who: str, now) -> "Decision":
-        """The one verdict the phrase produces, in EVERY mode: the window
-        opens and the turn ends here. Nothing of the words travels -- the
-        text is REDACTED_TEXT and the app dispatches nothing."""
+    def _phrase_consumed(self, who: str, now, *,
+                         window: bool = True) -> "Decision":
+        """The one verdict the phrase produces, in EVERY mode: the turn
+        ends here. Nothing of the words travels -- the text is
+        REDACTED_TEXT and the app dispatches nothing.
+
+        ``window`` is False in MODE_OFF only. Off already admits every
+        turn, so the window would buy him nothing -- while the phrase
+        check in that mode is deliberately unlimited, and an unlimited
+        path that leaves a five-minute admission behind it would still be
+        open if the mode were moved to enforce a minute later."""
+        if not window:
+            log.info("gate: the phrase was consumed for %s; the gate is off, "
+                     "so no floor was opened", who)
+            return Decision(admit=True, who=who, role=ROLE_OWNER,
+                            how=HOW_PHRASE, line=PHRASE_OK_LINE,
+                            redact=REDACTED_TEXT, consumed=True,
+                            why="the phrase; the gate is off and answered "
+                                "this turn")
         self.open_window(who, HOW_PHRASE, now=now)
         return Decision(admit=True, who=who, role=ROLE_OWNER,
                         how=HOW_PHRASE, line=PHRASE_OK_LINE,
@@ -505,7 +520,7 @@ class OwnerGate:
             # would put the phrase back on the bus -- the leak this closes.
             spoke = self._try_phrase(text, now, limited=False)
             if spoke:
-                return self._phrase_consumed(spoke, now)
+                return self._phrase_consumed(spoke, now, window=False)
             return Decision(admit=True, how=HOW_OFF,
                             why=getattr(self.registry, "fault", "")
                                 or "the gate is switched off")
