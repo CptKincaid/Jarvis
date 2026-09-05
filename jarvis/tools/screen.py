@@ -39,9 +39,10 @@ only -- it never loads a model, so it cannot evict anything).
 
 Privacy: the screenshot lives only in memory; it is written to disk ONLY
 with JARVIS_DEBUG_SCREEN=1 (``~/.cache/jarvis/screen_last.jpg``, 0600),
-and the image bytes are never logged — sizes and timings only.  The
-gnome-screenshot fallback has no stdout mode, so it round-trips through a
-0700 temp dir that is removed before the function returns.
+and the image bytes are never logged — sizes and timings only.  Nothing
+else reaches disk: the ImageMagick fallback is asked for ``png:-`` and the
+PNG comes back on stdout, so there is no temp file to clean up and no
+window for one to leak from.
 """
 from __future__ import annotations
 
@@ -130,8 +131,10 @@ def _grab_pil(display: str):
 
 
 def _grab_cli(display: str):
-    """gnome-screenshot, then ImageMagick ``import``; None when neither is
-    installed or both failed."""
+    """ImageMagick ``import`` on the X root window (``png:-``, straight to
+    stdout -- nothing is written to disk); None when ``import`` is missing
+    or the grab failed.  There is deliberately no gnome-screenshot path;
+    the comment below says why."""
     from PIL import Image
     env = _display_env(display)
     # No gnome-screenshot: the project spec forbids it (it drives the Shell's

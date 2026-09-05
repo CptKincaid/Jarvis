@@ -18,6 +18,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 from PIL import Image
@@ -298,6 +299,38 @@ def test_grab_cli_skips_gnome_screenshot_and_uses_import(monkeypatch, tmp_path):
     assert img.size == (640, 480)
     assert [c[0] for c in calls] == ["import"]          # gnome-screenshot is forbidden by spec
     assert all(c[2] == ":9" for c in calls), "the fallbacks are told which display"
+
+
+def test_the_docstrings_describe_the_grab_path_the_code_actually_takes():
+    """The prose outlived the code it described.
+
+    jarvis-v3 REMOVED the gnome-screenshot path -- screen.py's own comment
+    in ``_grab_cli`` says "the project spec forbids it (it drives the
+    Shell's screenshot UI)" and the test above pins that ``import`` is the
+    only binary run.  But the prose that described the removed path stayed:
+    the module docstring still promised a "gnome-screenshot fallback" that
+    "round-trips through a 0700 temp dir that is removed before the
+    function returns", and ``_grab_cli``'s own docstring still promised
+    "gnome-screenshot, then ImageMagick ``import``".
+
+    There is no temp dir in this module at ALL -- ``import`` is asked for
+    ``png:-`` and the PNG comes back on stdout -- so a reader chasing the
+    cleanup path was chasing code that does not exist, and a reader
+    auditing what touches disk was given one extra thing to worry about
+    that never happens.  Pin the docs to the code both ways: what the
+    source does, and what the docstrings are allowed to claim."""
+    src = Path(scr.__file__).read_text()
+    # What the code actually does: one CLI grabber, PNG on stdout, no disk.
+    assert "png:-" in src
+    assert "tempfile" not in src and "mkdtemp" not in src
+    assert "0700" not in src, "no 0700 directory exists in this module"
+    doc = f"{scr.__doc__ or ''}\n{scr._grab_cli.__doc__ or ''}"
+    # What the docstrings may not claim.
+    assert "0700" not in doc, "the docstring invents a temp dir the code never makes"
+    for gone in ("gnome-screenshot fallback", "gnome-screenshot, then"):
+        assert gone not in doc, f"docstring still promises {gone!r}"
+    # ...and what they must still say, so this is not just a deletion.
+    assert "ImageMagick" in (scr._grab_cli.__doc__ or "")
 
 
 
