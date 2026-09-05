@@ -4465,3 +4465,90 @@ entirely. It is written down here so it is not mistaken for security.
 * No mail? `mail_accounts` reads `gmail.accounts` from
   `~/.config/jarvis/assistant.json`; with none configured the button says so
   and changes nothing.
+
+## 85. "Um" buys you time (the filler hold)
+
+He used to close the mic 0.8 s after your last sound (`endpoint_silence`),
+so a thinking pause after "set a timer for, um…" ended the capture
+mid-sentence and he acted on half a command. Now the live preview — the
+ghost card that types while you speak — reports its newest decode to the
+recorder, and when that decode **ends on a filler** (um, uh, hmm, er…) and
+nothing has been heard since, the stop waits longer. That extra wait is a
+*hold*. All four settings live in jarvis/config.py (`Config`), not in
+assistant.json:
+
+| setting | default | what it does |
+|---|---|---|
+| `filler_hold` | `true` | the feature; `false` is the old 0.8 s stop |
+| `filler_hold_s` | `1.5` | how much longer a pause after an um may last — 0.8 + 1.5 = 2.3 s |
+| `filler_max_holds` | `3` | holds per capture; after that the ordinary stop, so an "um… um… um…" cannot hold the mic forever |
+| `filler_prompt_hint` | `false` | adds "Um, uh, hmm, er." to the *preview's* Whisper prompt so it writes fillers down instead of dropping them. **Unmeasured — ships off; the probe below decides.** |
+
+The hint never reaches the final transcription: your commands stay clean
+of ums whatever the preview saw. And the preview's own prompt-echo gate
+judges the text against the *hinted* prompt, so if Whisper ever runs away
+and simply reads "Um, uh, hmm, er." back at you, the ghost card stays
+blank and no hold is bought on it. That gate needs a phrase repeated three
+times before it will call it an echo — the right floor for *your* words,
+since "yes yes" is a man being emphatic — so the hint gets a second,
+narrower gate of its own: the hint is a string Jarvis put in the prompt,
+not something you said, so **one** whole read-back of it is enough to
+blank the card. It fires only on whole repeats of that exact string, so a
+real "…um" is never touched. (Before 09-05 a one- or two-fold runaway got
+through, showed you four words you never said, and — because it ends on
+"er" — bought a 1.5 s hold on it.)
+
+What the log shows: `filler hold 1/3: 'um' at 3.2s, waiting 1.5s` once
+per hold, and the turn line ends `(stop=vad holds=1)` on a turn where one
+fired (the same field is in turns.jsonl), so a week of turns can say how
+often it happened without anyone reading a transcript. **`holds=N` counts
+holds that actually delayed a stop** — nothing else. A hold is counted on
+the tick it postpones the stop, once per pause, and it stays counted on
+the tick it expires; a poll tick that arrives so late the pause is already
+past 0.8 + 1.5 s stops immediately and records no hold, because it waited
+for nothing. (Before 09-05 it counted those too, which made the number an
+upper bound instead of a count.)
+
+The other bound: a preview decode is only allowed to claim the um was the
+last thing heard if its span sits inside the audio the endpointer has
+itself heard — no more than 0.6 s either side of the last speech mark.
+
+And every decode is **stamped with the capture it came from**. A decode
+takes a few hundred milliseconds, so the capture it started in can end and
+the next one open before it returns; that decode carries the old capture's
+words and the old capture's position, and the recorder throws it away
+rather than letting it hold the new capture's first pause. Before 09-05 it
+did not, and a short previous capture landed squarely inside both bounds
+above — measured, a capture in which you had said no filler at all logged
+`filler hold 1/3: 'um' at 1.0s`. The stamp is required, with no "trust me"
+default: a note that is not this capture's is dropped.
+
+**The limit, stated plainly.** The preview re-decodes every 0.9 s and the
+stop is due at 0.8 s, so an um said right after the last preview may never
+be decoded before the stop is due — he does not decode it at that moment
+(that would add a decode to every turn); he stops as before. How often
+that race is lost is a number nobody has yet, and the only place to get
+it is a microphone:
+
+```bash
+~/vss_env/bin/python scripts/filler_probe.py            # 4 takes: hint off, on, off, on
+~/vss_env/bin/python scripts/filler_probe.py --show     # also print each transcript's words
+```
+
+Run it with Jarvis stopped (a live Jarvis would answer what you say to
+it). Before each take it tells you what to say; after each it prints the
+fillers the preview saw and when, the last speech second, the gap that
+ended the capture, holds fired, whether the tail was ever decoded, and the
+transcript's *length* — then asks whether you were cut off. It never
+saves audio and never prints the words unless you pass `--show`. Paste
+back the four summary lines at the end; they settle `filler_hold_s`,
+`filler_prompt_hint`, and whether the race above is worth fixing.
+
+**Reading the hint-ON takes.** With `filler_prompt_hint` on, a take that
+was nothing but stutter ("um um um") can end up with *fewer* holds, not
+more: the prompt-echo gate sees a preview made only of prompt words and
+blanks it, and a blank preview has no trailing filler to hold on. So a
+hint-ON take showing `holds 0` is not evidence the hint failed to help —
+it may be evidence you stuttered cleanly enough to look like an echo. The
+takes worth comparing are the ones with real words around the um, which is
+what the instruction before each take asks you for.

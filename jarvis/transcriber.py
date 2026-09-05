@@ -211,6 +211,13 @@ REDACTED_WORDS = "«passphrase»"
 #    the same median (3.5/s on the 0.85 s cuts, 3.6/s on the 0.55 s cuts).
 #    Only the runaway tail differs, and that is what the loop gate catches.
 DECODE_TEMPERATURES = (0.0,)
+# What the PREVIEW's initial_prompt gains when CONFIG.filler_prompt_hint is
+# on. Whisper is trained on clean transcripts and tends to drop
+# disfluencies, and the filler hold (jarvis/recorder.py) can only hold on
+# an "um" it was shown. The final transcribe() NEVER carries this: commands
+# must stay clean. Words from jarvis.endpoint.FILLER_WORDS. UNMEASURED --
+# the setting ships off until scripts/filler_probe.py says it helps.
+FILLER_PROMPT_HINT = "Um, uh, hmm, er."
 
 # Tokens a real utterance can contain. The fastest of those 113 clips
 # emitted 8.89 tokens/second ("That didn't work, sir" cut to 0.9 s); the
@@ -372,6 +379,49 @@ def prompt_echo(text, prompt) -> tuple:
         if body.count(top) >= ECHO_MIN_REPEATS:
             return top, body.count(top)
     return "", 0
+
+
+def hint_echo(text, prompt) -> int:
+    """Whole FILLER_PROMPT_HINTs ``text`` is reading back, or 0.
+
+    BLOCKER C, measured 09-05 (verdict round 2, finding 2). prompt_echo
+    will not call a preview an echo until a unit repeats ECHO_MIN_REPEATS
+    (3) times, and that floor is RIGHT for his words -- "yes yes" is a man
+    being emphatic, not a decoder looping, and lowering it would blank his
+    real insistence. But the hint is not his words: FILLER_PROMPT_HINT is a
+    four-word string this module injects into the PREVIEW's prompt so
+    whisper will write his fillers down. Read back even ONCE it is a
+    runaway. At k=1 and k=2 prompt_echo passed it, so "Um, uh, hmm, er."
+    landed on the ghost card as four words he never said -- and
+    trailing_filler of it is "er", so the recorder's filler hold bought
+    1.5 s of extra mic on a decoder runaway.
+
+    Deliberately narrow, so the hold keeps working: it fires only on WHOLE
+    repeats of the injected string, and only when that string really was in
+    the prompt the model was given (the merge's principle -- judge the text
+    against the prompt it actually had). A lone "um", "uh", or "set a timer
+    for, um" is shorter than the unit and is never touched, which is the
+    input the hold exists to read. One cut repeat is allowed at the end:
+    sample_len stops the decode anywhere, including mid-word.
+    """
+    if not prompt or FILLER_PROMPT_HINT not in prompt:
+        return 0
+    unit = _echo_words(FILLER_PROMPT_HINT)
+    words = _echo_words(text)
+    if not unit:
+        return 0
+    whole = len(words) // len(unit)
+    if whole < 1 or words[:whole * len(unit)] != unit * whole:
+        return 0
+    tail = words[whole * len(unit):]
+    if tail:
+        head, cut = tail[:-1], tail[-1]
+        if head != unit[:len(head)]:
+            return 0
+        expect = unit[len(head)]        # the word the next repeat is on
+        if cut != expect and not expect.startswith(cut):
+            return 0
+    return whole
 
 
 def token_budget(seconds: float) -> int:
@@ -627,6 +677,19 @@ class Transcriber:
             except Exception:
                 log.exception("prompt provider failed; using vocab file")
         return load_vocab()
+
+    def _partial_prompt(self) -> str:
+        """_prompt() plus FILLER_PROMPT_HINT when CONFIG.filler_prompt_hint
+        is on -- the PREVIEW's prompt only. transcribe() calls _prompt()
+        itself, so the hint can never reach a command. partial() builds
+        this ONCE per pass and hands the same string to the decoder and to
+        _preview_text: the echo gate has to judge what the model was
+        actually given, or the hint's own runaway reaches the ghost card
+        (measured 09-05)."""
+        base = self._prompt()
+        if not CONFIG.filler_prompt_hint:
+            return base
+        return f"{base} {FILLER_PROMPT_HINT}".strip()
 
     # -- model ----------------------------------------------------------
     @property
@@ -986,7 +1049,37 @@ class Transcriber:
         with self._lock:
             try:
                 lang = self._language()
-                prompt = self._prompt()
+                # MERGE CONFLICT, RESOLVED -- DO NOT RE-PICK THE OTHER
+                # SIDE. jarvis-v3 (fix-prompt-echo) hoisted
+                # `prompt = self._prompt()` to one call per pass and feeds
+                # that same string to _preview_text below; filler-hold
+                # rewrote the same two lines to
+                # `initial_prompt=self._partial_prompt()`. The hunks look
+                # independent, so the hand-merge keeps BOTH sides
+                # literally -- and that resolution is measurably wrong
+                # twice over (09-05):
+                #   * two prompt builds per preview. The provider is
+                #     jarvis.vocab.build_prompt -- a calendar cache and the
+                #     people store -- run several times a second while he
+                #     is talking. test_prompt_echo.py::
+                #     test_the_preview_fetches_the_prompt_once_per_pass
+                #     goes red as `assert [1, 1] == [1]`.
+                #   * the hint becomes INVISIBLE to the gate. The decoder
+                #     is handed the hint but the gate judges against the
+                #     un-hinted prompt, so "Um, uh, hmm, er." x3 -- the
+                #     comma-separated-list runaway this gate exists for --
+                #     lands verbatim on the ghost card, and its trailing
+                #     "er" then buys a 1.5 s filler hold on a decoder
+                #     runaway. test_filler_hold.py::
+                #     test_an_echoed_hint_is_blanked_by_the_preview_gate
+                #     and ::test_the_echo_gate_is_handed_the_very_string_
+                #     the_decoder_was_given both go red.
+                # THE RESOLUTION: ONE build per pass, and the SAME string
+                # to the decoder and to the echo gate. _partial_prompt()
+                # is _prompt() plus FILLER_PROMPT_HINT when the hint is
+                # on; transcribe() still calls _prompt() itself, so the
+                # hint can never reach a command.
+                prompt = self._partial_prompt()
 
                 budget = token_budget(_seconds(audio))
 
@@ -1043,7 +1136,15 @@ class Transcriber:
         """The preview goes through the echo gate too: the ghost card must
         never show a name he never said, and the 20:58:45 text WAS shown
         while he was still talking. Blank, not a log line -- the preview
-        runs several times a second and the final pass logs the reject."""
+        runs several times a second and the final pass logs the reject.
+
+        TWO gates, and the hint one runs FIRST because prompt_echo cannot
+        see it: prompt_echo needs three repeats, and a hint runaway is a
+        runaway at one (hint_echo, BLOCKER C)."""
+        hint_repeats = hint_echo(text, prompt)
+        if hint_repeats:
+            log.debug("preview blanked: filler-hint runaway x %d", hint_repeats)
+            return ""
         unit, repeats = prompt_echo(text, prompt)
         if repeats:
             log.debug("preview blanked: prompt echo %r x %d", unit, repeats)

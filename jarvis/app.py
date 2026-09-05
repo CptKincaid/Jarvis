@@ -3052,6 +3052,22 @@ class JarvisApp:
         invents something. That is Hunter's "2- keeps showing up after a
         response and hes listening back for me": the card was still up
         because nobody had ever been able to take it down.
+
+        THE FILLER HOLD (jarvis/recorder.py, CONFIG.filler_hold): every
+        greedy decode here is reported to recorder.note_partial() with the
+        capture second the decoded span ENDS at, so a preview ending on
+        "um" can hold the stop open. Only the greedy preview reports. The
+        speculative pass does not: its prompt never carries the filler
+        hint and its clean full decode is the one most likely to have
+        dropped the um, so letting it overrule the preview would defeat
+        the experiment scripts/filler_probe.py exists to run. LIMIT: this
+        loop's cadence (_PARTIAL_INTERVAL_S, 0.9 s) is slower than the
+        endpoint (CONFIG.endpoint_silence, 0.8 s), and the speculative
+        pass parks the preview for a full decode from 0.3 s into a pause,
+        so a filler spoken after the last snapshot may never be decoded
+        before the stop is due. The recorder does NOT decode the tail
+        itself (that would be a decode on every turn's stop): it stops as
+        before. How often that happens is a number the probe measures.
         """
         last = ""
         due = 0.0                       # next greedy preview (monotonic)
@@ -3067,8 +3083,22 @@ class JarvisApp:
                     time.sleep(self._SPECULATE_POLL_S)
                     continue
                 started = time.monotonic()
+                # BEFORE the snapshot, never after: this stamps the note
+                # with the capture the audio came from. If the capture
+                # turns over between this read and the snapshot the note
+                # carries the OLD id and the recorder drops it -- a
+                # mismatch may only ever discard, never accept a stale
+                # note. Reading it after the decode would do the opposite.
+                capture = getattr(self.recorder, "capture_id", None)
                 audio = self.recorder.snapshot_audio()
+                end_s = 0.0
                 if audio is not None:
+                    # Where the span ENDS in capture seconds: the whole
+                    # buffer, measured BEFORE the trim below. The recorder
+                    # compares it with the VAD's last-speech position
+                    # (note_partial, the filler hold); the decode wallclock
+                    # would be the wrong clock for that.
+                    end_s = len(audio) / SAMPLE_RATE
                     audio = audio[-int(SAMPLE_RATE * self._PARTIAL_MAX_S):]
                 if audio is not None and len(audio) >= int(
                         SAMPLE_RATE * self._PARTIAL_MIN_S):
@@ -3084,6 +3114,13 @@ class JarvisApp:
                     except Exception:
                         log.debug("partial decode failed", exc_info=True)
                         text = ""
+                    # Every decode, changed or not, failed or not: a
+                    # failed decode reports "" so a stale um cannot keep
+                    # holding the mic open. Guarding this on
+                    # recorder.recording is the WRONG fix for the
+                    # cross-capture race -- it would drop exactly the note
+                    # that clears a stale um. The capture stamp does it.
+                    self._note_partial(text, end_s, capture)
                     # only publish on change: the ghost card redraws on
                     # every event, and whisper often returns the same text.
                     if text and text != last and self.recorder.recording:
@@ -3141,6 +3178,21 @@ class JarvisApp:
             bus.publish(PartialText(text=""))
         except Exception:                      # noqa: BLE001 - never fatal
             log.exception("the preview card could not be taken down")
+
+    def _note_partial(self, text: str, end_s: float,
+                      capture_id=None) -> None:
+        """Hand the preview's newest decode to the recorder's filler hold,
+        stamped with the capture its audio came from (Recorder.note_partial
+        drops a note from any other). getattr, because the preview-thread
+        tests drive _partial_loop with bare recorder fakes -- and a preview
+        must never fail the capture."""
+        note = getattr(self.recorder, "note_partial", None)
+        if note is None:
+            return
+        try:
+            note(text, end_s, capture_id)
+        except Exception:
+            log.debug("note_partial failed", exc_info=True)
 
     # ------------------------------------------- speculative transcription
     #
@@ -4839,7 +4891,11 @@ class JarvisApp:
             return
         if ev.dead_air_s is not None:
             self.turns.mark("speech_end", at=ev.t - ev.dead_air_s)
-        self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason)
+        # holds=N only when the filler hold fired: a turn without one keeps
+        # the line it always had.
+        holds = int(getattr(ev, "filler_holds", 0) or 0)
+        notes = {"holds": str(holds)} if holds else {}
+        self.turns.mark("stop", at=ev.t, stop=ev.endpoint or ev.reason, **notes)
 
     def _turn_on_transcribed(self, ev):
         # A reused speculative decode makes "stt" the time from the stop to
