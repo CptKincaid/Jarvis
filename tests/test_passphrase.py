@@ -162,3 +162,26 @@ def test_the_module_logs_nothing_at_all():
 def test_nothing_here_carries_a_repr_that_could_hold_a_secret():
     a = pp.Attempts(limit=3, window_s=10.0)
     assert FAKE_PHRASE not in repr(a)
+
+
+# ------------------------------------ round 2: the whitespace trap (R10)
+def test_a_secret_typed_with_a_stray_space_still_works():
+    """HIS BREAK-GLASS USED TO DIE ON ONE KEYSTROKE. hash_secret hashed the
+    raw getpass string while check_override_code strips before checking, so
+    a code set as "xxx000 " could be typed neither with the space nor
+    without it -- and the CLI said "set." either way. Both ends strip now,
+    so the two agree."""
+    stored = pp.hash_secret(FAKE_CODE + " ")
+    assert pp.check_secret(FAKE_CODE, stored) is True
+    assert pp.check_secret(FAKE_CODE + " ", stored) is True
+    assert pp.check_secret(" " + FAKE_CODE + "\n", stored) is True
+    assert pp.check_secret(OTHER, stored) is False
+
+
+def test_the_two_ends_hash_the_same_thing():
+    """check_secret used to test the STRIPPED string for emptiness and then
+    hash the RAW one; that asymmetry is what made the trap invisible."""
+    assert pp.check_secret("  " + FAKE_PHRASE + "  ",
+                           pp.hash_secret(FAKE_PHRASE)) is True
+    assert pp.check_secret("", pp.hash_secret(FAKE_CODE)) is False
+    assert pp.check_secret("   ", pp.hash_secret(FAKE_CODE)) is False

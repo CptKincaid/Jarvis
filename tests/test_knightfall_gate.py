@@ -223,3 +223,65 @@ def test_no_new_threshold_and_no_lock_wording():
     from tests.test_owner_registry import no_overstatement
     test_the_gate_owns_no_voice_threshold(None)
     no_overstatement(gt)
+
+
+# ------------------------------------ round 2: the holes the verdict found
+# The verdict (2026-09-05) measured three ways the phrase's PLAINTEXT still
+# travelled: with owner.mode=off it was dispatched as an ordinary command,
+# a wake-word prefix ("jarvis <phrase>") was not consumed, and a code set
+# with a stray space could never be typed. These pin all three.
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+def test_the_phrase_is_consumed_with_the_gate_off_as_well(tmp_path, mode):
+    """OFF IS NOT A REASON TO SAY IT OUT LOUD. _judge used to return
+    HOW_OFF at the top, before the phrase was ever tried, so the one mode
+    where the gate is switched off was the one mode that put his phrase on
+    the bus and into the commander."""
+    g = _gate(tmp_path, mode=mode, phrase=True)
+    d = g.judge("voice", SAID, stats=MATCHED)
+    assert _consumed(d) == (True, gt.HOW_PHRASE, gt.PHRASE_OK_LINE,
+                            gt.REDACTED_TEXT)
+    assert d.admit is True and d.who == "hunter"
+    assert FAKE_PHRASE not in (d.redact or "") + (d.line or "") + (d.why or "")
+
+
+def test_with_the_gate_off_an_ordinary_turn_is_still_untouched(tmp_path):
+    g = _gate(tmp_path, mode="off", phrase=True)
+    d = g.judge("voice", "what is the weather", stats=MATCHED)
+    assert d.consumed is False and d.how == gt.HOW_OFF and d.admit is True
+
+
+@pytest.mark.parametrize("mode", ["off", "shadow", "enforce"])
+@pytest.mark.parametrize("said", ["Jarvis, xxx not a real phrase xxx.",
+                                  "Hey Jarvis xxx not a real phrase xxx",
+                                  "OK Jarvis, xxx not a real phrase xxx."])
+def test_the_wake_word_in_front_of_it_is_still_the_phrase(tmp_path, mode,
+                                                          said):
+    """What Whisper hands over for "Jarvis, <phrase>" -- the recorder keeps
+    the wake word in the clip. Matching the WHOLE utterance only meant that
+    the commonest way to say it was dispatched instead."""
+    g = _gate(tmp_path, mode=mode, phrase=True)
+    d = g.judge("voice", said, stats=MATCHED)
+    assert d.consumed is True and d.how == gt.HOW_PHRASE
+
+
+def test_the_vocative_costs_at_most_one_extra_derivation(tmp_path):
+    """The bound, measured rather than asserted: one candidate per owner
+    for an ordinary sentence, two when it opens with the wake word."""
+    g = _gate(tmp_path, mode="shadow", phrase=True)
+    g.judge("voice", "please read me the news from this morning",
+            stats=MATCHED)
+    plain = g.kdf_calls
+    g.judge("voice", "jarvis please read me the news from this morning",
+            stats=MATCHED)
+    assert (plain, g.kdf_calls - plain) == (1, 2)
+
+
+def test_the_phrase_inside_a_longer_sentence_is_a_known_limit(tmp_path):
+    """NOT consumed, and deliberately: matching every span of a sentence
+    costs one scrypt per span (~18 ms each, measured), which would be paid
+    on every phrase-shaped turn. The docs tell him to say it on its own or
+    after the wake word; this pins the limit so it cannot be forgotten."""
+    g = _gate(tmp_path, mode="enforce", phrase=True)
+    d = g.judge("voice", "run the xxx not a real phrase xxx now",
+                stats=MATCHED)
+    assert d.consumed is False

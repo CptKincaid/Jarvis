@@ -407,6 +407,16 @@ class OwnerGate:
                  _OPENER_NAMES[self._grant_how], self._grant_who, GRANT_S,
                  self.effective_mode())
 
+    def _phrase_consumed(self, who: str, now) -> "Decision":
+        """The one verdict the phrase produces, in EVERY mode: the window
+        opens and the turn ends here. Nothing of the words travels -- the
+        text is REDACTED_TEXT and the app dispatches nothing."""
+        self.open_window(who, HOW_PHRASE, now=now)
+        return Decision(admit=True, who=who, role=ROLE_OWNER,
+                        how=HOW_PHRASE, line=PHRASE_OK_LINE,
+                        redact=REDACTED_TEXT, consumed=True,
+                        why="the phrase; the gate answered this turn")
+
     def _try_phrase(self, text, now, *, limited: bool = True) -> str:
         """The owner's phrase, or "". The key derivation runs ONLY when the
         words were phrase-shaped (the cheap pre-filter, unchanged), so
@@ -440,13 +450,16 @@ class OwnerGate:
                 log.info("gate: too many passphrase attempts; %.0fs to wait",
                          wait)
                 return ""
-        offered = pp.normalise_spoken(text)
+        offered = pp.spoken_candidates(text)
+        if not offered:
+            return ""
         if limited:
             self.phrase_attempts.record(now=now)
         for person in owners:
-            self.kdf_calls += 1
-            if pp.check_secret(offered, person.phrase_hash):
-                return person.label
+            for candidate in offered:
+                self.kdf_calls += 1
+                if pp.check_secret(candidate, person.phrase_hash):
+                    return person.label
         return ""
 
     # -------------------------------------------------------- the verdict
@@ -476,6 +489,23 @@ class OwnerGate:
 
         mode = self._mode_unsafe()
         if mode == MODE_OFF:
+            # OFF ADMITS EVERYTHING; IT DOES NOT REPEAT HIS PASSPHRASE.
+            # This return used to be the first thing in the function, so
+            # the one mode where the gate is switched off was the one mode
+            # that dispatched the phrase as an ordinary command -- onto the
+            # bus, into the history, the transcript pane and the model
+            # (verdict, 2026-09-05). Consuming it here costs nothing but
+            # the derivation and gives away nothing: the window it opens
+            # grants what off already grants.
+            #
+            # UNLIMITED, and that is the point of it: the limiter exists to
+            # stop a stranger guessing his way past a gate, and there is no
+            # gate here to guess past. If his own sentences burned attempts
+            # in this mode, the sixth phrase-shaped one in five minutes
+            # would put the phrase back on the bus -- the leak this closes.
+            spoke = self._try_phrase(text, now, limited=False)
+            if spoke:
+                return self._phrase_consumed(spoke, now)
             return Decision(admit=True, how=HOW_OFF,
                             why=getattr(self.registry, "fault", "")
                                 or "the gate is switched off")
@@ -496,11 +526,7 @@ class OwnerGate:
         # nobody recognised (see _try_phrase).
         spoke = self._try_phrase(text, now, limited=not named.who)
         if spoke:
-            self.open_window(spoke, HOW_PHRASE, now=now)
-            return Decision(admit=True, who=spoke, role=ROLE_OWNER,
-                            how=HOW_PHRASE, line=PHRASE_OK_LINE,
-                            redact=REDACTED_TEXT, consumed=True,
-                            why="the phrase; the gate answered this turn")
+            return self._phrase_consumed(spoke, now)
 
         if not voice_running and not face_on:
             # NOTHING IS MEASURING. That is not "nobody is here", and it
