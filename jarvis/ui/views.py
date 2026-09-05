@@ -35,9 +35,9 @@ from jarvis.events import UserUtterance, bus
 from jarvis.logs import get_logger
 from jarvis.relaunch import format_code_status
 from jarvis.ui import theme
-from jarvis.ui.widgets import (BarGradient, Card, RoundButton, Toast, Toggle,
-                               Tooltip, chamfer_rect, frame_rect, measure, px,
-                               ui_display, ui_font, ui_mono)
+from jarvis.ui.widgets import (BarGradient, Card, RoundButton, Slider, Toast,
+                               Toggle, Tooltip, chamfer_rect, frame_rect,
+                               measure, px, ui_display, ui_font, ui_mono)
 
 log = get_logger("ui.views")
 
@@ -2100,7 +2100,8 @@ class SettingsDrawer(tk.Frame):
         """Bind a widget to CONFIG.<var_name>: initialize from CONFIG and
         persist edits back via CONFIG.update() (debounced 300ms).
 
-        Supports Toggle, tk.Scale, tk.StringVar (pickers) and tk.Entry."""
+        Supports Toggle, Slider, tk.Scale, tk.StringVar (pickers) and
+        tk.Entry."""
         current = getattr(CONFIG, var_name)
         caster = type(current)
 
@@ -2121,6 +2122,12 @@ class SettingsDrawer(tk.Frame):
 
         if isinstance(widget, Toggle):
             widget.set(bool(current), animate=False)
+            widget.command = save
+        elif isinstance(widget, Slider):
+            # set() with notify=False: seeding a row from CONFIG is not an
+            # edit, and a debounced save fired at BUILD time would write
+            # the file every time the drawer is constructed.
+            widget.set(current, notify=False)
             widget.command = save
         elif isinstance(widget, tk.Scale):
             widget.set(current)
@@ -2224,36 +2231,74 @@ class SettingsDrawer(tk.Frame):
                       joinstyle="miter")
         return c
 
-    # Holo scale rows (U12): the Scale's value is drawn centred over the
-    # knob, and at the low end of the range the knob is at the trough's
-    # left edge, so the value overhangs the widget's left edge and lands
-    # against the label ('Silence timeout (s)2.5', measured on the 09-03
-    # shot 14). Measured at S=2 the label is 314 px and the drawer's inner
-    # width 576, so the px(130) trough left 2 px for a gap: the trough
-    # shortens to SCALE_LEN_HOLO and SCALE_GAP_HOLO keeps the value off
-    # the label at every knob position (a 36-px value overhangs ~18).
-    SCALE_LEN_HOLO = 112
-    SCALE_GAP_HOLO = 12
+    # THE SLIDER ROWS (2026-09-05, his "some of text doesnt sit right").
+    # Until today these were stock tk.Scales: a grooved Motif trough, a slab
+    # knob, and showvalue=True floating the number ABOVE the widget on a
+    # line of its own -- so "0.015" sat over the track instead of on the
+    # row, and at the low end the knob's centred value overhung into the
+    # label. Nothing about it matched the toggles two rows up.
+    #
+    # In holo the row is now: label ... [thin track + round handle] value,
+    # all on ONE baseline, through the shared jarvis/ui/widgets.py Slider.
+    # Classic keeps the stock Scale, token for token (tests/test_theme_look).
+    #
+    # THE WIDTH BUDGET, MEASURED on :94 at S=2 (2026-09-05): the drawer's
+    # inner width is 576 px, the widest slider label ("Silence timeout (s)")
+    # is 310 px, and the value is 70 px ("0.015" in the caption mono face).
+    # 310 + 16 + 160 + 12 + 70 = 568 leaves 8 px of slack -- the arithmetic
+    # is pinned in tests/test_ui_layout_rules.py so a longer label or a
+    # longer track cannot silently collide again.
+    SLIDER_LEN_HOLO = 80          # design units: the track
+    SLIDER_GAP_HOLO = 8           # label -> track
+    SLIDER_VALUE_GAP_HOLO = 6     # track -> value
+    SLIDER_VALUE_CHARS = 5        # "0.015" is the widest value the drawer shows
+    SCALE_LEN_CLASSIC = 130
 
     def _scale_row(self, box, label, var_name, lo, hi, res, on_change=None):
+        """One slider row. The call site is unchanged in either look."""
         row = self._row(box, label)
-        holo = theme.LOOK == "holo"
-        scale = tk.Scale(row, from_=lo, to=hi, resolution=res,
-                         orient="horizontal",
-                         length=px(self.SCALE_LEN_HOLO if holo else 130),
-                         bg=theme.RAISED, fg=theme.MUTED,
-                         troughcolor=theme.LINE, highlightthickness=0, bd=0,
-                         activebackground=theme.CYAN,
-                         font=ui_font(theme.SIZE_CAPTION),
-                         showvalue=True)
-        scale.pack(side="right", padx=(px(self.SCALE_GAP_HOLO) if holo else 0, 0))
-        self.bind_config(var_name, scale, on_change)
-        return scale
+        if theme.LOOK != "holo":
+            scale = tk.Scale(row, from_=lo, to=hi, resolution=res,
+                             orient="horizontal",
+                             length=px(self.SCALE_LEN_CLASSIC),
+                             bg=theme.RAISED, fg=theme.MUTED,
+                             troughcolor=theme.LINE, highlightthickness=0,
+                             bd=0, activebackground=theme.CYAN,
+                             font=ui_font(theme.SIZE_CAPTION), showvalue=True)
+            scale.pack(side="right")
+            self.bind_config(var_name, scale, on_change)
+            return scale
+        slider = Slider(row, lo=lo, hi=hi, res=res, bg=theme.RAISED,
+                        length=self.SLIDER_LEN_HOLO)
+        # The value is packed FIRST so it is the rightmost thing on the row
+        # and every slider row's number shares one right edge.
+        slider.label.configure(width=self.SLIDER_VALUE_CHARS)
+        slider.label.pack(side="right",
+                          padx=(px(self.SLIDER_VALUE_GAP_HOLO), 0))
+        slider.pack(side="right", padx=(px(self.SLIDER_GAP_HOLO), 0))
+        self.bind_config(var_name, slider, on_change)
+        return slider
 
     def _button_row(self, box, label, command):
-        btn = RoundButton(box, text=label, kind="default", bg=theme.RAISED,
-                          command=command)
-        btn.pack(anchor="w", pady=px(4))
+        """A button on its own row. SIGNATURE AND CALL SITE UNCHANGED.
+
+        In holo it goes in a row frame and is packed to the RIGHT, so its
+        right edge is the toggles' right edge and the drawer keeps one
+        two-column rhythm; it also gives the row the same pady as every
+        other row, which is what made the gap under "Calibrate noise"
+        bigger than the gaps around it. Classic keeps the left-anchored
+        button packed straight into the section box.
+        """
+        if theme.LOOK != "holo":
+            btn = RoundButton(box, text=label, kind="default",
+                              bg=theme.RAISED, command=command)
+            btn.pack(anchor="w", pady=px(4))
+            return btn
+        row = tk.Frame(box, bg=theme.RAISED)
+        row.pack(fill="x", pady=px(4))
+        btn = RoundButton(row, text=label, kind="default", bg=theme.RAISED,
+                          command=command, pad_y=5)
+        btn.pack(side="right")
         return btn
 
     def _info_row(self, box, text: str):

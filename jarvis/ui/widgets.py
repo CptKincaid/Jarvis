@@ -1,7 +1,8 @@
 """Canvas-drawn flat widgets for the Jarvis V3 UI.
 
 Primitives: round_rect / RoundedField, frame_rect (the holo thin frame),
-Card (slab | frame), RoundButton, Toggle (animated), Meter, Chip, Tooltip
+Card (slab | frame), RoundButton, Toggle (animated), Slider (thin track +
+round handle, with slider_snap/slider_format), Meter, Chip, Tooltip
 (timing ported from voice_input_gui.py 968-1009), Toast, ellipsize helper.
 All colors and fonts come from jarvis.ui.theme tokens ONLY — and are read at
 CALL time (never a def default or class-body dict), so theme.select_look()
@@ -12,6 +13,7 @@ parent the caller owns, so importing this file never requires a display.
 """
 from __future__ import annotations
 
+import math
 import tkinter as tk
 import tkinter.font as tkfont
 from typing import Callable, Optional
@@ -731,6 +733,199 @@ class Toggle(tk.Canvas):
         cx = px(4) + r + on_f * (self.W - 2 * (px(4) + r))
         cy = self.H / 2 - 0.5
         self.create_oval(cx - r, cy - r, cx + r, cy + r, fill=knob, outline="")
+
+
+# ------------------------------------------------------------------ Slider
+# The number rules live OUTSIDE the widget so the drawer's three rows can be
+# tested with no display at all (the split jarvis/ui/views.py already makes).
+def slider_decimals(res) -> int:
+    """How many decimals a step of `res` actually carries: 0.001 -> 3,
+    0.5 -> 1, 1 -> 0. A stock tk.Scale derives its own from `resolution`
+    and this reproduces it, so a look switch cannot change the digits."""
+    try:
+        step = abs(float(res))
+    except (TypeError, ValueError):
+        return 2
+    if not (step > 0.0) or step != step or step in (float("inf"),):
+        return 2
+    text = ("%.10f" % step).rstrip("0")
+    frac = text.split(".", 1)[1] if "." in text else ""
+    return min(6, len(frac))
+
+
+def slider_format(value, res) -> str:
+    """The value as the row prints it. Digits come from the RESOLUTION,
+    not from the value, so 0.30 does not collapse to 0.3 the moment the
+    handle lands on a round number."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        v = 0.0
+    if v != v:                                   # NaN
+        v = 0.0
+    return "%.*f" % (slider_decimals(res), v)
+
+
+def slider_snap(value, lo: float, hi: float, res) -> float:
+    """Clamp into [lo, hi] and land on a whole step from `lo`.
+
+    Junk (a string, a NaN, None) lands on `lo` rather than raising: this
+    runs inside a drag and inside bind_config, and a settings row that
+    throws while he is dragging it is a settings row he cannot use.
+    """
+    lo, hi = float(lo), float(hi)
+    if hi < lo:
+        lo, hi = hi, lo
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return lo
+    if v != v:                                   # NaN
+        return lo
+    v = max(lo, min(hi, v))
+    try:
+        step = abs(float(res))
+    except (TypeError, ValueError):
+        step = 0.0
+    if step > 0.0:
+        v = lo + math.floor((v - lo) / step + 0.5) * step
+        v = max(lo, min(hi, v))
+    return round(v, slider_decimals(res))
+
+
+class Slider(tk.Canvas):
+    """A thin track with a round handle -- the holo answer to tk.Scale.
+
+    WHY IT EXISTS. The settings drawer drew three stock Tk scales: a
+    grooved Motif trough, a slab knob and the value floated ABOVE the
+    widget, which is nothing like the toggles beside them and put the
+    number on its own line half over the label (photographed 09-05,
+    shot 14). This draws the same control in the console's own language --
+    1px track, round handle -- and the VALUE is a plain Label the row owns
+    (``self.label``), so it sits inline on the row's baseline.
+
+    The number rules are ``slider_snap`` / ``slider_format`` above, which
+    is where the tk.Scale semantics (from_/to/resolution) are reproduced.
+    ``command`` is called with the new float on a USER change only, never
+    from ``set()`` -- the same contract Toggle keeps.
+    """
+
+    LEN, H = 112, 20               # design units; instances scale by S
+    TRACK, KNOB = 1, 6             # track stroke, handle radius
+
+    def __init__(self, parent, lo=0.0, hi=1.0, res=0.01, value=None,
+                 command: Optional[Callable] = None, bg=None, length=None,
+                 label: bool = True):
+        bg = bg or parent.cget("bg")
+        self.lo, self.hi, self.res = float(lo), float(hi), res
+        self._len = px(length if length is not None else type(self).LEN)
+        self._h = px(type(self).H)
+        super().__init__(parent, width=self._len, height=self._h, bg=bg,
+                         highlightthickness=1, bd=0, takefocus=1,
+                         cursor="hand2")
+        _focus_ring(self, bg)
+        self.command = command
+        self._value = slider_snap(self.lo if value is None else value,
+                                  self.lo, self.hi, self.res)
+        self._hovered = False
+        # The readout is a LABEL, not painted into the canvas: it has to
+        # share the ROW's baseline with the label on the left, and a
+        # number drawn inside this widget could only ever share the
+        # track's. The row packs it; the widget keeps it in step.
+        self.label = None
+        if label:
+            self.label = tk.Label(parent, text=slider_format(self._value,
+                                                             self.res),
+                                  font=ui_mono(theme.SIZE_CAPTION),
+                                  fg=theme.MUTED, bg=bg, anchor="e")
+        self._draw()
+        self.bind("<Configure>", lambda e: self._draw(), add=True)
+        self.bind("<ButtonPress-1>", self._press, add=True)
+        self.bind("<B1-Motion>", self._drag, add=True)
+        self.bind("<Enter>", lambda e: self._hover(True), add=True)
+        self.bind("<Leave>", lambda e: self._hover(False), add=True)
+        self.bind("<Left>", lambda e: self._nudge(-1), add=True)
+        self.bind("<Right>", lambda e: self._nudge(1), add=True)
+        self.bind("<Up>", lambda e: self._nudge(1), add=True)
+        self.bind("<Down>", lambda e: self._nudge(-1), add=True)
+
+    # -------------------------------------------------------------- value
+    def get(self) -> float:
+        return self._value
+
+    def set(self, value, notify: bool = False) -> None:
+        snapped = slider_snap(value, self.lo, self.hi, self.res)
+        changed = snapped != self._value
+        self._value = snapped
+        self._sync_label()
+        self._draw()
+        if changed and notify and self.command:
+            try:
+                self.command(snapped)
+            except Exception:             # noqa: BLE001 - a caller's callback
+                log.exception("slider command failed")
+
+    def _sync_label(self) -> None:
+        if self.label is None:
+            return
+        try:
+            self.label.configure(text=slider_format(self._value, self.res))
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("slider label update failed", exc_info=True)
+
+    # ---------------------------------------------------------- geometry
+    def _span(self) -> tuple:
+        """(x0, x1) of the track: the handle's centre never leaves it, so
+        the knob cannot be half off the widget at either end."""
+        w = max(self.winfo_width(), self._len)
+        r = px(type(self).KNOB)
+        return r + 1, max(r + 2, w - r - 2)
+
+    def _fraction(self) -> float:
+        span = self.hi - self.lo
+        if not span:
+            return 0.0
+        return max(0.0, min(1.0, (self._value - self.lo) / span))
+
+    def _from_x(self, x: float) -> float:
+        x0, x1 = self._span()
+        frac = 0.0 if x1 <= x0 else (float(x) - x0) / (x1 - x0)
+        return self.lo + max(0.0, min(1.0, frac)) * (self.hi - self.lo)
+
+    # ------------------------------------------------------------- events
+    def _press(self, event):
+        self.focus_set()
+        self.set(self._from_x(event.x), notify=True)
+
+    def _drag(self, event):
+        self.set(self._from_x(event.x), notify=True)
+
+    def _nudge(self, steps: int):
+        try:
+            step = abs(float(self.res)) or (self.hi - self.lo) / 20.0
+        except (TypeError, ValueError):
+            step = (self.hi - self.lo) / 20.0
+        self.set(self._value + steps * step, notify=True)
+        return "break"
+
+    def _hover(self, on: bool):
+        self._hovered = bool(on)
+        self._draw()
+
+    # -------------------------------------------------------------- paint
+    def _draw(self):
+        self.delete("all")
+        x0, x1 = self._span()
+        y = max(self.winfo_height(), self._h) / 2
+        stroke = max(1, px(type(self).TRACK))
+        self.create_line(x0, y, x1, y, fill=theme.LINE, width=stroke)
+        cx = x0 + (x1 - x0) * self._fraction()
+        if cx > x0:
+            self.create_line(x0, y, cx, y, fill=theme.CYAN_DIM, width=stroke)
+        r = px(type(self).KNOB)
+        self.create_oval(cx - r, y - r, cx + r, y + r,
+                         fill=(theme.CYAN if self._hovered else theme.FOCAL),
+                         outline="")
 
 
 # ------------------------------------------------------------------- Meter
