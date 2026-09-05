@@ -154,6 +154,52 @@ def _blocked_player(argv) -> bool:
 _blocked_player.calls = []
 
 
+# CONFIG fields the suite must not read off his live box. Add a name here
+# when a setting he can flip changes what a test asserts.
+_PINNED_CONFIG_FIELDS = ("filler_prompt_hint",)
+
+
+@pytest.fixture(autouse=True)
+def _pin_live_tuning_settings():
+    """CONFIG is read from his LIVE ~/.aiws_trainer/voice_settings.json.
+
+    Everything else in this firewall redirects a PATH, but CONFIG is built
+    at import time from that file and nothing here redirects it -- so a
+    setting he changes on the box changes what the suite asserts. On
+    2026-09-05 he turned ``filler_prompt_hint`` on by hand at 11:5x and
+    FOUR tests went red on a tree where nothing had been committed
+    (test_prompt_echo::test_the_preview_fetches_the_prompt_once_per_pass
+    and three in test_transcriber_prompt), each of them asserting the
+    preview's initial_prompt equals the vocab prompt -- true only while
+    the hint is off, which is how it ships.
+
+    Pinned to the DATACLASS DEFAULT rather than to a literal, so the pin
+    follows the shipped value instead of freezing today's. A test that
+    wants the other state still monkeypatches it itself (test_filler_hold
+    turns it on); this only stops the box deciding.
+
+    Saved and restored by hand rather than through ``monkeypatch``: this
+    is autouse over the whole suite, and requesting monkeypatch here would
+    build that fixture before every other one and unwind its undo stack
+    after them, which is a scheduling change nothing in this file needs.
+    A test's own monkeypatch still wins -- it is set up later, so its
+    teardown runs first and lands back on the pinned default.
+    """
+    import dataclasses
+
+    from jarvis.config import CONFIG
+    saved = {}
+    for field in dataclasses.fields(CONFIG):
+        if field.name in _PINNED_CONFIG_FIELDS:
+            saved[field.name] = getattr(CONFIG, field.name)
+            setattr(CONFIG, field.name, field.default)
+    try:
+        yield
+    finally:
+        for name, was in saved.items():
+            setattr(CONFIG, name, was)
+
+
 @pytest.fixture(autouse=True)
 def _reset_brain_calibration():
     """brain._CALIBRATION is process state fed by every fake Ollama reply's

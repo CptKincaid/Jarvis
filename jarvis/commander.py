@@ -97,7 +97,7 @@ from jarvis import pronounce, standup
 from jarvis import reader as reader_mod
 from jarvis import soundbar as soundbar_mod
 from jarvis.config import CONFIG, PATHS
-from jarvis.endpoint import FILLER_WORDS  # noqa: F401 - one list; see endpoint.py
+from jarvis.endpoint import FILLER_WORDS, strip_fillers  # noqa: F401 - one list; see endpoint.py
 from jarvis.tools.location import clock_words
 from jarvis.events import (ClearTranscript, JarvisReply, SensingChanged,
                            Status, bus)
@@ -3130,6 +3130,37 @@ _BRIEFING_NO_RX = re.compile(
 BRIEFING_OFFER_TTL_S = 60.0
 
 
+def briefing_answer(text) -> Optional[bool]:
+    """True / False / None for "Shall I run your briefing, sir?".
+
+    THE 12:24 BUG, in one function so the rung and its tests judge the
+    same thing. The live log, four consecutive lines:
+
+        first wake of the day: offering the briefing
+        speaking (breeze): Shall I run your briefing, sir?
+        Transcribed: 'Uh, yeah.'
+        briefing offer: 'Uh, yeah.' is a new subject
+
+    Both grammars above are end-anchored on the answer word after an
+    optional "jarvis", which is what keeps "yes, turn the lights off" a
+    command -- and it is right that they are. What was wrong is that the
+    sentence they were handed still had his throat-clearing on the front,
+    so an unambiguous yes was not answer-SHAPED and the day's only offer
+    was spent on it. The filled pause comes off FIRST and the anchoring is
+    untouched: a filler that is the whole utterance strips to "" and is no
+    answer, and "uh, what time is it" strips to "what time is it", which
+    these grammars refuse exactly as they refused it before.
+    """
+    stripped = strip_fillers(text).strip()
+    if not stripped:
+        return None
+    if _BRIEFING_YES_RX.match(stripped):
+        return True
+    if _BRIEFING_NO_RX.match(stripped):
+        return False
+    return None
+
+
 def _event_offer_expired(pending: dict) -> bool:
     """Is a calendar read-back ("...Shall I add it, sir?") past its life?
 
@@ -5948,6 +5979,14 @@ def _send_clean(text: str) -> str:
     out = _SEND_STUTTER_RX.sub("", t)
     out = _SEND_FILLER_LEAD_RX.sub(r"\1", out)
     out = _SEND_FILLER_MID_RX.sub("", out)
+    # ...and then the canonical list, for the fillers this lane's own two
+    # regexes never had: "ah", "eh", "ehh" (jarvis.endpoint.FILLER_WORDS,
+    # the filler hold's list). Two lists drift, and these three are the
+    # drift -- "ah, send it to her" was not a yes and was re-asked.
+    # AFTER the lead regex, never before: "uh huh" is a multi-word
+    # backchannel it strips whole, and an edge strip that ran first would
+    # take the "uh" and leave "huh, send it", which is no answer at all.
+    out = strip_fillers(out)
     out = _SEND_YES_RUN_RX.sub(r"\1", out)
     out = _SEND_NO_RUN_RX.sub(r"\1", out)
     out = " ".join(out.split()).strip(" ,.")
@@ -9721,7 +9760,16 @@ def parse_yes_no(text):
 
     Whole-word matching only: substring matching would make "nothing",
     "north" and "you know" all mean no.
+
+    A filled pause at either end comes off first (jarvis.endpoint.
+    strip_fillers, the filler hold's own list). The word BAG would have
+    read "Uh, yeah." as a yes anyway -- but the six-word overheard-speech
+    guard below counts WORDS, and "uh" is not one of his: a padded count
+    pushed a six-word answer over the line, and a leading filler made
+    ``words[0]`` a filler rather than the yes that waives the guard. An
+    utterance that is nothing but fillers strips to "" and is neither.
     """
+    text = strip_fillers(text)          # "" for None, "" and "uh..." alike
     if not text:
         return None
     lowered = re.sub(r"[^a-z0-9\s']+", " ", str(text).lower())
@@ -10140,15 +10188,35 @@ _UNDO_TAIL_RX = re.compile(r"^[\s,.!]*(?:please|jarvis|sir|instead)?[\s,.!]*$", 
 # 2026-09-01 21:10:23) was a perfect undo with a hesitation in it, and the
 # hesitation sent it to the intent classifier, which asked "Was that for
 # me?" and then let the model answer "I'll stand down" -- doing nothing.
+# The spellings come from jarvis.endpoint.FILLER_WORDS so the two cannot
+# drift -- they already had (this list had no "eh" and no bare "hm") -- plus
+# the run-on shapes and the two words that are fillers HERE and nowhere
+# else: "like", and "mm" without the h. endpoint.py's list is deliberately
+# free of common words, because it also decides whether the microphone
+# stays open; inside an undo phrase there is nothing "like" can mean.
 _FILLER_RX = re.compile(
-    r",?\s*(?<![a-z])(?:uh+m*|um+|er+m?|ah+|hmm+|mm+|like)(?![a-z])[,.!?…]*", re.I)
+    r",?\s*(?<![a-z])(?:"
+    + "|".join(sorted(FILLER_WORDS, key=len, reverse=True))
+    + r"|uh+m*|um+|er+m?|ah+|hmm+|mm+|like)(?![a-z])[,.!?…]*", re.I)
 _ELLIPSIS_RX = re.compile(r"\.{2,}|…")
 
 
-def strip_fillers(text: str) -> str:
-    """The utterance without its ums, uhs and ellipses, whitespace
-    collapsed. Case-insensitive and punctuation-tolerant; used only where
-    a filler can carry no meaning (the undo phrase)."""
+def strip_inline_fillers(text: str) -> str:
+    """The utterance without its ums, uhs and ellipses ANYWHERE in it,
+    whitespace collapsed. Case-insensitive and punctuation-tolerant; used
+    only where a filler can carry no meaning (the undo phrase) -- the live
+    "BELAY THAT LAST Uhhh... ORDER" is an undo with a hesitation in the
+    MIDDLE of it.
+
+    NOT jarvis.endpoint.strip_fillers, and the difference is the whole
+    reason this has its own name (2026-09-05): that one takes fillers off
+    the two ENDS of an ANSWER and leaves the inside alone, because eating
+    an interior "um" would rewrite dictation. This one is the opposite
+    trade on a fixed phrase. It used to be called ``strip_fillers`` too,
+    and being a module global it SHADOWED the import for every caller in
+    this file -- so the answer parsers below were quietly running the undo
+    lane's rules. Two names, two jobs, one vocabulary.
+    """
     t = _ELLIPSIS_RX.sub(" ", str(text or ""))
     t = _FILLER_RX.sub(" ", t)
     return re.sub(r"\s+", " ", t).strip(" ,")
@@ -10156,7 +10224,7 @@ def strip_fillers(text: str) -> str:
 
 def _undo_match(text: str):
     """The _UNDO_RX match for a whole-utterance undo, else None."""
-    t = strip_fillers(text)
+    t = strip_inline_fillers(text)
     m = _UNDO_RX.match(t)
     if m and _UNDO_TAIL_RX.match(t[m.end():]):
         return m
@@ -12586,7 +12654,12 @@ class Commander:
         except Exception:
             log.exception("approvals.pending failed")
             return None
-        t = (strip_jarvis_prefix(text) or text).strip().lower()
+        # The filled pause comes off before the grammar, not inside it:
+        # _YES_RX / _NO_RX stay end-anchored (that is what keeps "no, turn
+        # the lights off" a command), and "uh, yes" is still a yes.
+        t = strip_fillers((strip_jarvis_prefix(text) or text).strip().lower())
+        if not t:
+            return None
         if _YES_RX.match(t):
             ap.answer(True, source=source)
             return CommandResult(handled=True, reply=ALLOWED_LINE, speak=True,
@@ -12711,8 +12784,9 @@ class Commander:
         does an offer older than BRIEFING_OFFER_TTL_S.
 
         What is NOT the same is what counts as a clear yes or no. The other
-        offers ride parse_yes_no; this one has _BRIEFING_YES_RX /
-        _BRIEFING_NO_RX, which are end-anchored, because this offer is put
+        offers ride parse_yes_no; this one has ``briefing_answer`` and its
+        _BRIEFING_YES_RX / _BRIEFING_NO_RX, which are end-anchored (over a
+        sentence with its filled pauses taken off), because this offer is put
         once a day behind an ARBITRARY first request rather than inside a
         briefing he just heard, and it holds an open microphone. A word bag
         at that exposure swallowed commands ("skip this song", "later today
@@ -12758,14 +12832,11 @@ class Commander:
         if made and time.time() - made > BRIEFING_OFFER_TTL_S:
             log.info("briefing offer expired; %r is a new subject", text[:40])
             return None
-        stripped = str(text or "").strip()
-        if _BRIEFING_YES_RX.match(stripped):
-            answer = True
-        elif _BRIEFING_NO_RX.match(stripped):
-            answer = False
-        else:
+        answer = briefing_answer(text)
+        if answer is None:
             # Not answer-SHAPED, so not an answer: the offer is gone and
-            # the words keep their own meaning.
+            # the words keep their own meaning. The ORIGINAL words are
+            # logged and routed -- the filler strip is for judging only.
             log.info("briefing offer: %r is a new subject", text[:40])
             return None
         if not answer:
@@ -13121,7 +13192,11 @@ class Commander:
             self._pending_terminal_slug = ""
             log.info("terminal offer expired; %r is a new subject", text[:40])
             return None
-        t = text.strip()
+        t = strip_fillers(text.strip())
+        if not t:
+            # Nothing but a filled pause: not an answer, and not a new
+            # subject either. The offer stands.
+            return None
         if _YES_RX.match(t) or _OPEN_IT_RX.match(t):
             self._pending_terminal_slug = ""
             claude = self._svc("claude")

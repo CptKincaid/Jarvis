@@ -44,6 +44,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Callable, Optional
 
+from jarvis.endpoint import strip_fillers
 from jarvis.logs import get_logger
 
 log = get_logger("dialogue")
@@ -383,7 +384,12 @@ class WeekPlanner(Session):
                 f"{hour_words(self.proposal.hour)}?")
 
     def settle(self, text: str) -> Optional[str]:
-        t = (text or "").strip().rstrip(".!?")
+        # The filled pause first (jarvis.endpoint.strip_fillers, one list
+        # with the recorder's filler hold): _YES_RX / _SKIP_RX are anchored
+        # on the answer word, so "uh, yes" used to drop the whole walk and
+        # route as a command. A reply that is only a filler strips to ""
+        # and settles nothing -- the question stays on the table.
+        t = strip_fillers(text or "").strip().rstrip(".!?")
         if not t or self.current is None:
             return None
         if _SKIP_RX.match(t):

@@ -51,6 +51,9 @@ FILLER_WORDS = frozenset({
 # the dots can also arrive as their own token, which is why the loop below
 # skips a token that strips to nothing).
 _EDGE_PUNCT = ".,;:!?…-—–'\"()[]"
+# What strip_fillers() below walks over from either end: a filler, or a
+# token that was only punctuation. Built once -- it is read inside a loop.
+_SKIPPABLE = FILLER_WORDS | {""}
 
 
 def trailing_filler(text) -> str:
@@ -69,6 +72,62 @@ def trailing_filler(text) -> str:
             continue
         return word if word in FILLER_WORDS else ""
     return ""
+
+
+def strip_fillers(text) -> str:
+    """``text`` with the filled pauses taken off BOTH ends, or "".
+
+    2026-09-05 12:24, the live log, four lines apart:
+
+        speaking (breeze): Shall I run your briefing, sir?
+        Transcribed: 'Uh, yeah.'
+        briefing offer: 'Uh, yeah.' is a new subject
+
+    He said yes. Every answer grammar in the app is anchored on the answer
+    WORD -- ``^(?:jarvis[,\\s]+)?(?:yes|yeah|...)...$`` -- so a leading
+    "Uh," made the sentence un-answer-shaped and his yes was thrown away.
+    A man clears his throat before he answers; that is not a change of
+    subject.
+
+    Same list as ``trailing_filler`` above and the recorder's filler hold,
+    for the reason that comment gives: two lists WILL drift, and the two
+    halves of this would then disagree about what a filler is.
+
+    THE EDGES ONLY, and deliberately:
+
+    * the INSIDE of a sentence is untouched -- "tell him um I am late" is
+      dictation, and eating the "um" would rewrite what he said;
+    * interior punctuation still counts, so "uh-huh" survives whole. It is
+      a backchannel YES on the send read-back, and shaving it to "huh"
+      would turn consent into no answer at all;
+    * an utterance that is NOTHING but fillers returns "", so "uh..." can
+      never become a yes. Callers read "" as "not an answer" and keep the
+      original text for the log and for routing.
+
+    The separators an edge filler leaves behind ("yeah, uh" -> "yeah,")
+    come off with it: the grammars end on ``[?.!]*$`` and a dangling comma
+    is as fatal to them as the filler was. A terminal . ! ? is kept --
+    "yes." and "yes?" are different answers, and the question mark is a
+    bar on the send read-back.
+    """
+    if not text:
+        return ""
+    toks = str(text).split()
+
+    def _word(tok: str) -> str:
+        return tok.strip(_EDGE_PUNCT).lower()
+
+    start, end = 0, len(toks)
+    # A token that strips to nothing is punctuation standing alone ("um -");
+    # it is passed over rather than ending the run, exactly as
+    # trailing_filler passes over it.
+    while start < end and _word(toks[start]) in _SKIPPABLE:
+        start += 1
+    while end > start and _word(toks[end - 1]) in _SKIPPABLE:
+        end -= 1
+    if start == 0 and end == len(toks):
+        return str(text)                    # nothing to do: hand it back whole
+    return " ".join(toks[start:end]).strip(" \t,;:-–—")
 
 
 class _Resampler:
