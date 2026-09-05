@@ -797,28 +797,50 @@ def test_the_module_docstring_names_the_default_model_the_code_actually_has():
 
 
 def test_the_docstrings_do_not_promise_a_model_turn_the_tool_skips(wired):
-    """The answer goes STRAIGHT to the speaker; no model turn phrases it.
+    """What this module authors is a ``speak=`` line, and what happens to
+    that line NEXT is brain.py's business, not this module's.
 
-    ``ToolResult.speak`` is documented in registry.py as "verbatim line;
-    skips the model turn", and brain.py's own post-mortem records that "the
-    loop's ``if result.speak: break`` ended the turn on it".  screen_qa sets
-    speak= on every successful answer, deliberately: the comment beside the
-    return says a second model turn "would be refused" because the vision
-    call can take 25 s against an 8 s tool-loop budget.  Two sentences still
-    described the OTHER design -- the module docstring's "the brain's model
-    turn then phrases the reply" and ``tidy_answer``'s "(the brain rephrases
-    what is left)" -- and ``tidy_answer`` is called from exactly one place,
-    ``ask_screen``, whose result is the speak= line.  Nothing rephrases it."""
+    This docstring has now been wrong in BOTH directions, which is why the
+    test pins the qualification rather than either half of it.  The first
+    version promised "the brain's model turn then phrases the reply"; the
+    correction over-swung to "no model turn rephrases it", which reads as
+    never.  MEASURED (verdict, 2026-09-05, driving a real JarvisBrain over a
+    faked Ollama and counting /api/chat rounds): screen_qa ALONE is one
+    round and the authored line is spoken as it stands, but screen_qa beside
+    a read he is still owed is TWO rounds, the render round can phrase the
+    screen content in its own words, and it can drop the authored line
+    entirely.  The rule already sat one module away, beside
+    ``brain.answer_owed``: "an authored line ends the turn alone, and held
+    beside an owed read it is appended to the render round's reply."  The
+    ``if result.speak: break`` loop the short claim rested on was REMOVED --
+    brain.py says so where it used to be -- so a comment resting on it is
+    describing a deleted code path.  Driven end to end by
+    tests/test_reply_coverage.py::test_a_read_that_authors_its_own_line_still_lets_the_rest_run.
+    """
     vision, _ = wired
     res = tool().call("screen_qa", {"question": "what is showing"})
     assert res.ok
-    # Verbatim: what the vision model said is what gets spoken.
+    # Verbatim OUT OF THE TOOL: what the vision model said is what is
+    # authored. Where it goes after that is the brain's decision.
     assert res.speak == vision.content
     doc = f"{scr.__doc__ or ''}\n{scr.tidy_answer.__doc__ or ''}"
-    for claim in ("model turn then phrases", "brain rephrases"):
-        assert claim not in doc, f"docstring still promises {claim!r}"
-    # ...and the reason the tool skips it must stay in the source.
-    assert "goes straight to the speaker" in Path(scr.__file__).read_text()
+    src = Path(scr.__file__).read_text()
+    # Neither wrong version, in either direction.
+    for claim in ("model turn then phrases", "brain rephrases",
+                  "no model turn rephrases it",
+                  "ends the turn without a model round"):
+        assert claim not in doc, f"docstring is promising {claim!r} again"
+    # ...and the qualification itself must survive the next tidy-up: the
+    # word that carries it is "owed", and it has to appear in the same
+    # breath as the render round in BOTH docstrings and in the source.
+    for where, text in (("module", scr.__doc__ or ""),
+                        ("tidy_answer", scr.tidy_answer.__doc__ or ""),
+                        ("source", src)):
+        assert "owed" in text and "render round" in text, (
+            f"the {where} text dropped the qualification: a speak= line "
+            f"ends the turn ALONE, not beside a read he is owed")
+    # ...and the reason the tool authors it at all must stay in the source.
+    assert "goes straight to the speaker" in src
 
 
 def test_a_model_whose_capabilities_are_unknown_is_still_told_not_to_think(wired,

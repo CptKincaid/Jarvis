@@ -2,8 +2,21 @@
 
 One tool, ``screen_qa(question)``: grab the active display, shrink it to
 ``screen.max_width`` pixels wide, JPEG + base64, and ask Ollama's
-``screen.model`` for a short spoken answer, which goes STRAIGHT to the
-speaker (``speak=``) -- no model turn rephrases it.  The active window title
+``screen.model`` for a short spoken answer, handed back as an authored
+``speak=`` line.  WHAT BECOMES OF THAT LINE DEPENDS ON WHAT ELSE THE TURN
+OWES, and the unqualified form of this sentence has now been wrong in this
+docstring twice, in both directions.  ALONE, the line ends the turn as it
+stands and no model round rephrases it -- which is the point, because the
+vision call can take 25 s against an 8 s tool-loop budget.  HELD BESIDE A
+READ HE IS STILL OWED, it is appended to the render round's reply, and that
+round may phrase the screen content in its own words or drop this line
+altogether.  That is brain.py's rule, stated there beside ``answer_owed``
+("an authored line ends the turn alone, and held beside an owed read it is
+appended to the render round's reply"), and driven by
+tests/test_reply_coverage.py::test_a_read_that_authors_its_own_line_still_lets_the_rest_run.
+The ``if result.speak: break`` loop that would have made the short form true
+was REMOVED (brain.py says so where it used to be), so any comment resting
+on it is describing a deleted code path.  The active window title
 (xdotool) rides along in the prompt as context, because a screenshot of a
 terminal says nothing about WHICH terminal.
 
@@ -445,9 +458,12 @@ def vision_payload(model: str, b64: str, question: str, title: str,
 
 def tidy_answer(text, cap: int = ANSWER_WORD_CAP) -> str:
     """Plain prose, whitespace collapsed, at most ``cap`` words, cut at the
-    last sentence end that fits.  What is left is SPOKEN AS IT STANDS: the
-    only caller is ``ask_screen``, whose answer becomes screen_qa's ``speak=``
-    line, and a speak= line ends the turn without a model round."""
+    last sentence end that fits.  The only caller is ``ask_screen``, whose
+    answer becomes screen_qa's ``speak=`` line.  It is spoken AS IT STANDS
+    only when the turn owes nothing else; held beside an owed read it goes
+    into the render round with the rest, where the model may re-word it or
+    leave it out.  See the module docstring -- and do not shorten either
+    sentence back to an unqualified one."""
     text = _MARKDOWN.sub(lambda m: m.group(1) or " ", str(text or ""))
     text = " ".join(text.split()).strip()
     if not text:
@@ -637,10 +653,16 @@ def make_tools(cfg, services) -> list[ToolSpec]:
                  orig[0], orig[1], small[0], small[1], len(b64) * 3 // 4096,
                  model, time.monotonic() - t0)
         text = f"Active window: {title}. {answer}" if title else answer
-        # speak=answer: the vision call can take 25 s and the brain's tool
-        # loop budget is 8 s, so a second model turn to phrase this would be
-        # refused and "I have the result but..." spoken instead. The answer
-        # was asked for in spoken form; it goes straight to the speaker.
+        # speak=answer: WITHIN THE TOOL LOOP nothing rephrases this. The
+        # vision call can take 25 s against an 8 s loop budget, so asking
+        # for a second model turn to phrase it would be refused and "I have
+        # the result but..." spoken instead; the answer was asked for in
+        # spoken form, so it is authored here: it goes straight to the speaker.
+        # THAT IS AS FAR AS THIS MODULE'S SAY GOES. If the same
+        # turn also owes him a read, the render round takes this line with
+        # the rest and may re-word it or drop it -- brain.py's rule beside
+        # answer_owed, not this module's. Do not restate it as "no model
+        # turn ever rephrases it": that has been wrong here twice.
         return ToolResult(text=text, max_sentences=MAX_SENTENCES, speak=answer)
 
     return [ToolSpec(
