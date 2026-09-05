@@ -455,12 +455,39 @@ class OwnerGate:
         # EVERYTHING THE GALLERY SAYS IS IN ITS OWN LABEL SPACE, and the
         # registry's is the one the verdict is made in: see _registry_label.
         who = self._registry_label(stats.get("who"))
+        owner = self._owner_label()
+        if who and stats.get("who_is_owner"):
+            # A NAME THE MATCHING LAYER SAYS IS THE OWNER'S OWN POOL IS THE
+            # OWNER, WHATEVER IT IS SPELLED.
+            #
+            # ``who_is_owner`` is speaker._ident's own second read --
+            # ``_pool_of_label(who) == ""``, the voiceprint's pool, decided by
+            # MEASUREMENT (the centroid measures as voiceprint.npz) or by
+            # PROVENANCE (the takes were carried out of it). It is a fact from
+            # the instrument, not an inference here: this leg does not try to
+            # tell his old gallery slug from a stray label it has never heard
+            # of, because it cannot, and a dict that does not carry the key is
+            # read exactly as it was before.
+            #
+            # THIS IS THE THIRD NAME, and it is what a rename leaves behind.
+            # ``_registry_label`` already reconciles two (his config slug and
+            # his typed registry row). A box he has renamed himself on holds a
+            # THIRD: the gallery label the old slug wrote, which no registry
+            # knows. Measured 2026-09-05 with the round-3 fold in place and
+            # the old slug still on disk, his own turns were still refused 55
+            # of 100 -- the fold correctly ranked one man once, and then the
+            # winning row wore a name the registry had never heard of and
+            # ``recognise`` dropped it. The pool is the fact; the spelling is
+            # not.
+            if who != owner:
+                log.info("gate: the voice named %r, which is the owner's own "
+                         "pool; that is %s", stats.get("who"), owner or "him")
+            who = owner or who
         if who:
             # A NAMED match means the person the gallery named. No threshold
             # is applied here and none ever may be. Both bars live in
             # jarvis/voicegallery.py, which is where the numbers were measured.
             return who, True
-        owner = self._owner_label()
         # A NAMELESS MATCH IS THE OWNER ONLY WHEN IT WAS MEASURED ON HIS POOL
         # AND THE GALLERY'S BEST GUESS IS NOT SOMEBODY ELSE. Two facts, both
         # from speaker.filter_segments, and neither is a count of labels:

@@ -325,6 +325,100 @@ def voiceprint_vectors(path):
         return []
 
 
+def his_labels(gallery, vectors=None):
+    """Every gallery label that IS the owner's pool, by the two routes the
+    runtime uses -- ``speaker._owner_pools``' question, asked here so the
+    script and the runtime cannot come to different answers.
+
+    1. PROVENANCE: the takes were carried out of ``voiceprint.npz``
+       (``--migrate`` or ``--reanchor`` stamped every one of them). His by
+       construction, whatever the pool measures today.
+    2. MEASUREMENT: the pool's centroid is within ``OWNER_POOL_COSINE`` of
+       the voiceprint's. This is the route that catches a pool nobody
+       stamped, and it is the only route on a box with no provenance.
+
+    MORE THAN ONE IS THE ROUND-3 BLOCKER. Two labels holding one voice made
+    the gallery rank him against himself: the margin is a floor on his own
+    within-person noise, so it could never be cleared, ``near_miss`` fired
+    every turn and the gate answered "I can't tell which of you" to him,
+    alone -- 0 of 100 measured 2026-09-05. ``identify(same=...)`` now folds
+    them so it is no longer a lockout, but one voice still belongs under one
+    label and --status says so.
+    """
+    labels = list(gallery.labels())
+    try:
+        carried = set(gallery.voiceprint_labels())
+    except Exception:  # noqa: BLE001 - an unreadable store attests nothing
+        carried = set()
+    mine = None
+    vecs = voiceprint_vectors(PATHS.VOICEPRINT) if vectors is None else vectors
+    if vecs:
+        mine = vg.centroid(list(vecs))
+    out = []
+    for label in labels:
+        if label in carried:
+            out.append(label)
+            continue
+        if mine is None:
+            continue
+        theirs = vg.centroid(gallery.embeddings(label))
+        if theirs is not None and vg.cosine(theirs, mine) >= vg.OWNER_POOL_COSINE:
+            out.append(label)
+    return out
+
+
+def delete_ok(gallery, label, owner, vectors=None):
+    """``(ok, why not)``: may ``--delete`` take this label away?
+
+    THE HOLE THIS CLOSES, measured by the round-3 review on 2026-09-05 and
+    identical on d41c17d, so it is older than this lane's round 2.
+    ``--delete --label <his own label>`` had NO guard at all. On a box with a
+    guest enrolled it walked straight back to the layout ``owner_ready``
+    refuses to BUILD -- him in ``voiceprint.npz`` only, her in the gallery --
+    where ``identify`` cannot rank him against her at all and answers his own
+    voice with the one label it has: measured 80 of 100 of his turns admitted
+    at apart 0.7 and 34 of 100 at apart 1.0, against 100 of 100 migrated.
+
+    THE RULE IS "NOT THE LAST ONE, WHILE SOMEBODY ELSE IS ENROLLED", and each
+    half is load-bearing:
+
+    * NOT THE LAST. With two labels of his (the blocker's layout) either may
+      go -- that IS the tidy-up, and refusing it would leave him with a fault
+      --status names and no command that clears it.
+    * WHILE SOMEBODY ELSE IS ENROLLED. With nobody else in the gallery,
+      removing his label returns the box to exactly what it was before this
+      feature existed: him in ``voiceprint.npz``, matched nameless, admitted.
+      Nothing to protect him from, so nothing to refuse.
+
+    ``--yes`` OVERRIDES IT, because it is his voice and his machine and a
+    withdrawal of his own consent must not be something the tool can veto.
+    The refusal exists to make the cost visible, not to lock a door.
+    """
+    label = str(label or "")
+    if label not in gallery.labels():
+        return True, ""                    # nothing to lose; purge_label says so
+    mine = his_labels(gallery, vectors)
+    if label not in mine or len(mine) > 1:
+        return True, ""
+    others = [x for x in gallery.labels() if x != label]
+    if not others:
+        return True, ""
+    return False, (
+        "%s is the ONLY pool in the gallery that is the owner's, and %s "
+        "is still enrolled. Deleting it leaves the gallery holding other "
+        "people and not him -- the layout enrolment refuses to build, "
+        "because the gallery then cannot rank him against anybody and "
+        "answers his own voice with somebody else's label (measured: 34 of "
+        "100 of his turns admitted at the widest separation the script will "
+        "enrol, against 100 of 100 with his pool present).\n"
+        "If his pool has come APART from voiceprint.npz, repair it rather "
+        "than removing it -- no microphone needed:\n"
+        "    %s %s --reanchor\n"
+        "If you mean to take his voice out of the gallery anyway, remove the "
+        "others first, or say so: --delete --label %s --yes"
+        % (label, ", ".join(others), sys.executable, __file__, label))
+
+
 def pool_ok(gallery, label, vectors, owner="", owner_vectors=None):
     """``(ok, why not)`` for a FINISHED pool, before it is saved.
 
@@ -490,10 +584,29 @@ def _owner_anchor_line(gallery, label) -> None:
         return
     print("               anchor : %.4f of %s, under %.2f"
           % (sim, PATHS.VOICEPRINT.name, vg.OWNER_POOL_COSINE))
+    if gallery.carried_from_voiceprint(label):
+        # STALE, NOT STOLEN, AND THE TWO USED TO PRINT THE SAME SENTENCE.
+        # This pool was COPIED OUT OF voiceprint.npz, so it is his by
+        # construction and speaker._disowned no longer drops it -- he is not
+        # refused. What it does cost is real and is the whole reason this
+        # line still shouts: passive learning stalls while the pool is off
+        # its anchor, and every margin is measured against a centroid that no
+        # longer describes what the microphone hears. The usual cause is
+        # scripts/enroll_voice.py re-recording the voiceprint afterwards.
+        print("  ** his pool and his voiceprint have come APART. He is still "
+              "read as\n     himself -- this pool came out of %s, so it is "
+              "his whatever it\n     measures -- but passive learning is "
+              "stalled and every margin is\n     measured against a stale "
+              "centroid. Put them back, no microphone\n     needed:"
+              "\n         %s %s --reanchor **"
+              % (PATHS.VOICEPRINT.name, sys.executable, __file__))
+        return
     print("  ** this pool is NOT being read as %s. Jarvis will refuse his own "
-          "turns.\n     Nothing was recorded wrong -- his voiceprint and his "
-          "pool have come\n     apart. Put them back, no microphone needed:"
-          "\n         %s %s --reanchor **" % (label, sys.executable, __file__))
+          "turns.\n     Takes recorded under his name by somebody ELSE look "
+          "exactly like\n     this, which is why nothing here assumes it is "
+          "him. If it IS his own\n     pool, carry his voiceprint in over "
+          "it:\n         %s %s --reanchor **"
+          % (label, sys.executable, __file__))
 
 
 # ------------------------------------------------------------------ reporting
@@ -512,9 +625,28 @@ def show_status(gallery) -> None:
         return
     print("enrolled        :")
     owner = owner_label(CONFIG)
-    if owner and owner not in gallery.labels():
+    mine = his_labels(gallery)
+    if owner and owner not in gallery.labels() and not mine:
         print("  ** the owner (%s) is NOT in the gallery: it cannot tell him "
               "from anybody here. Run --migrate. **" % owner)
+    if len(mine) > 1:
+        # THE ROUND-3 BLOCKER, NAMED WHERE HE WOULD LOOK FOR IT. Two labels
+        # holding one voice used to refuse him every turn (0 of 100, measured
+        # 2026-09-05) and NOTHING said so: the log was silent, --status
+        # printed two healthy-looking pools, and the recovery was a command
+        # nobody had written down. identify(same=...) folds them now, so this
+        # is untidiness rather than a lockout -- but an untidiness that
+        # stalls passive learning and confuses every margin, so it is still
+        # printed first and still has one command.
+        print("  ** MORE THAN ONE LABEL HOLDS THE OWNER'S VOICE: %s."
+              % ", ".join(mine))
+        print("     One voice belongs under one label. Jarvis folds them "
+              "rather than\n     ranking him against himself, so he is not "
+              "locked out -- but keep one:")
+        print("         %s %s --delete --label %s"
+              % (sys.executable, __file__, mine[0]))
+        print("     (the one to keep is the one --migrate would write now: "
+              "%s) **" % (owner or "the owner's label"))
     for label in gallery.labels():
         n = gallery.count(label)
         floor = gallery.genuine_floor(label)
@@ -526,7 +658,7 @@ def show_status(gallery) -> None:
                  "-" if floor is None else "%.3f" % floor))
         if gallery.consent(label):
             print("               consent: %s" % gallery.consent(label))
-        if owner and label == owner:
+        if label in mine or (owner and label == owner):
             _owner_anchor_line(gallery, label)
     print("\nseparation between enrolled people:")
     for line in separation_report(gallery):
@@ -653,6 +785,10 @@ def main(argv=None) -> int:
         return 2
 
     if args.delete:
+        ok, why = delete_ok(gallery, args.label, owner)
+        if not ok and not args.yes:
+            print("REFUSED: %s" % why, file=sys.stderr)
+            return 6
         out = gallery.purge_label(args.label, reason="consent withdrawn")
         print("removed from %d generation(s); %d file(s) overwritten and "
               "unlinked." % (len(out["generations_with"]), out["removed"]))

@@ -270,6 +270,38 @@ ABSTAIN_SECONDS = 1.5
 # the per-person genuine floor, the margin-won label and the cap.
 MAX_PASSIVE = 0
 
+# WHAT A POOL CARRIED OUT OF ``voiceprint.npz`` SAYS ABOUT ITSELF, and the
+# reason it is a note rather than a guess.
+#
+# ``migrate_voiceprint`` and ``reanchor_voiceprint`` are the only two writers
+# that copy the single-speaker voiceprint into a label, and both stamp every
+# take they write with ``src="legacy"`` and this note. Nothing else can
+# produce one: the microphone path (scripts/voice_enrol.py) writes
+# ``src="enrol"`` with the prompt line as its note.
+#
+# SO PROVENANCE ANSWERS A QUESTION THE COSINE CANNOT. ``OWNER_POOL_COSINE``
+# asks "does this pool measure as the voiceprint TODAY", which is the right
+# question for a pool somebody recorded at the microphone under his name --
+# that is precisely the impostor shape, and it stays measured. It is the
+# WRONG question for a pool that was COPIED OUT OF the voiceprint and has
+# since gone stale, because that pool is his by construction and the only way
+# to make one is to be able to write ``voiceprint.npz`` -- at which point you
+# are already the owner as far as ``speaker._owner_pools`` is concerned. That
+# is the same threat model ``reanchor_voiceprint``'s docstring states and the
+# 2026-09-05 review confirmed.
+#
+# The distinction is load-bearing, not tidy. Both round-3 lockouts are one
+# man ranked against himself:
+#
+#   two labels both measuring as the voiceprint  (a second --migrate under a
+#     new label after he renames himself)          alias 1.0000, refused 0/100
+#   one measuring, one stale                      (--migrate, re-enrol the
+#     voiceprint, rename, --migrate again)         alias 0.919,  refused 0/100
+#
+# The cosine alone folds the first and cannot see the second.
+VOICEPRINT_NOTE = "from voiceprint.npz format 2"
+VOICEPRINT_SRC = "legacy"
+
 
 @dataclass(frozen=True)
 class Take:
@@ -440,6 +472,37 @@ def cosine(a, b) -> float:
     if na == 0.0 or nb == 0.0 or not np.isfinite(na) or not np.isfinite(nb):
         return 0.0
     return float(np.dot(a, b) / (na * nb))
+
+
+def _fold_same(ranked, same):
+    """``(ranking with one row per person, the rows dropped)``.
+
+    ``same`` is an iterable of label GROUPS -- each group a set of labels one
+    caller has attested hold one person. Within a group the highest-scoring
+    row survives and the others are dropped; a label in no group is its own
+    person and is untouched. Pure, and separate from ``identify`` so the rule
+    can be tested without a gallery, a threshold or an embedding.
+
+    LABELS ONLY, NEVER SCORES. Nothing here compares cosines to decide who is
+    who -- that would be the gallery quietly folding two people who happen to
+    sit close together, which is the escalation this lane spent round 3
+    closing. The grouping arrives already decided.
+    """
+    groups = [set(str(x) for x in g) for g in (same or ())
+              if g and len(set(g)) > 1]
+    if not groups:
+        return list(ranked), []
+    seen, out, dropped = set(), [], []
+    for label, score in ranked:
+        mine = next((i for i, g in enumerate(groups) if label in g), None)
+        if mine is None:
+            out.append((label, score))
+        elif mine in seen:
+            dropped.append((label, score))
+        else:
+            seen.add(mine)
+            out.append((label, score))
+    return out, dropped
 
 
 def centroid(vectors) -> Optional[np.ndarray]:
@@ -651,7 +714,8 @@ class VoiceGallery:
 
     # ---------------------------------------------------------- the verdict
     def identify(self, vec, speech_s: float,
-                 threshold: Optional[float] = None) -> VoiceVerdict:
+                 threshold: Optional[float] = None,
+                 same=()) -> VoiceVerdict:
         """Who this embedding is, or UNKNOWN. NOBODY IS NAMED BY DEFAULT.
 
         Takes an EMBEDDING and the seconds of TRIMMED SPEECH it came from --
@@ -698,6 +762,38 @@ class VoiceGallery:
         PROVISIONAL. A label with fewer than ``MIN_TAKES_TO_NAME`` takes
         scores and logs but never names -- its centroid has not settled (cos
         to the converged position measures 0.841 at k=2 against 0.975 at k=8).
+
+        ``same`` IS A SET OF LABELS THE CALLER ATTESTS ARE ONE PERSON, AND
+        THEY GET ONE ROW OF THE RANKING. This is a design change and the
+        measurement forced it. ``MARGIN`` is derived by splitting HIS OWN
+        fourteen takes into two pretend people: it is the floor on what one
+        person's own within-person noise can produce, and its whole meaning is
+        "this gap is bigger than one voice's spread". Two labels holding the
+        SAME PERSON produce a gap that is BY CONSTRUCTION within-person noise,
+        so ranking them against each other asks the margin the one question it
+        was derived to answer NO to -- and it answers NO, every turn, forever.
+        Measured 2026-09-05, his voice under two gallery labels with nobody
+        else in the room: margin ~0.00 against the 0.20 bar, near_miss 100 of
+        100, and ``gate._voice_leg`` answering "that is nobody, not the owner"
+        to him, alone, 0 of 100 admitted at apart 0.3 AND 1.0, both when the
+        second label is a byte-copy of the first (alias 1.0000) and when it is
+        a genuine second enrolment of the same man (alias 0.920).
+
+        THE FOLD KEEPS THE HIGHEST-SCORING MEMBER AND DROPS THE REST, and it
+        invents nothing: every row that survives is a real ``(label, cosine)``
+        pair measured against a real centroid, so the invariant the round-2
+        fix established -- ``score`` is the score OF ``top_label`` -- still
+        holds by construction. Nothing is averaged, no centroid is synthesised
+        and no score is raised. The dropped members are named in ``why`` so
+        the log can still say which label lost and by how little.
+
+        WHO DECIDES ``same`` IS NOT THIS MODULE. This file is arithmetic and
+        has no business deciding who owns the machine, exactly as with the
+        abstention fallback: ``speaker._owner_pools`` MEASURES the grouping
+        (a label is his when its centroid measures as ``voiceprint.npz``, or
+        when its takes were carried out of it) and passes it in. A caller that
+        passes nothing gets the old behaviour, so a gallery used on its own
+        cannot silently fold anybody.
         """
         speech_s = float(speech_s or 0.0)
         bar = ACCEPT_DEFAULT if threshold is None else float(threshold)
@@ -719,21 +815,25 @@ class VoiceGallery:
         # which is the fault this shape replaced.
         ranked = sorted(((label, cosine(vec, c)) for label, c in cents.items()),
                         key=lambda kv: kv[1], reverse=True)
+        ranked, folded = _fold_same(ranked, same)
         top, top_s = ranked[0]
         second, second_s = ranked[1] if len(ranked) > 1 else ("", 0.0)
         margin = (top_s - second_s) if second else None
         common = {"speech_s": speech_s,
                   "scores": tuple((k, float(v)) for k, v in ranked)}
+        also = ("" if not folded else
+                " [%s: the same person under another label]"
+                % ", ".join("%s %.3f" % kv for kv in folded))
 
         if top_s < bar:
             # Indistinguishable from an unrelated voice, on purpose: this is
             # the branch the ordinary UNKNOWN line answers.
-            return VoiceVerdict(why="best %.3f below %.2f" % (top_s, bar),
-                                **common)
+            return VoiceVerdict(why="best %.3f below %.2f%s"
+                                    % (top_s, bar, also), **common)
         if margin is not None and margin < MARGIN:
             return VoiceVerdict(
-                why="margin %.3f below %.2f (%s %.3f, %s %.3f)"
-                    % (margin, MARGIN, top, top_s, second, second_s),
+                why="margin %.3f below %.2f (%s %.3f, %s %.3f)%s"
+                    % (margin, MARGIN, top, top_s, second, second_s, also),
                 **common)
         if self.provisional(top):
             return VoiceVerdict(
@@ -741,7 +841,37 @@ class VoiceGallery:
                 why="%s has only %d take(s); %d before a name"
                     % (top, self.count(top), MIN_TAKES_TO_NAME),
                 **common)
-        return VoiceVerdict(who=top, why="%s at %.3f" % (top, top_s), **common)
+        return VoiceVerdict(who=top, why="%s at %.3f%s" % (top, top_s, also),
+                            **common)
+
+    def carried_from_voiceprint(self, label: str) -> bool:
+        """Was this label's pool COPIED OUT OF ``voiceprint.npz``?
+
+        A fact about how the takes got here, not about what they measure --
+        see ``VOICEPRINT_NOTE`` for why the two questions are different and
+        which lockout each one closes.
+
+        TRUE NEEDS EVERY ENROLMENT TAKE TO CARRY THE STAMP, and one microphone
+        take anywhere in the pool is enough to say no. That is the direction
+        that matters: a pool somebody recorded under his name at the mic is
+        the impostor shape the cosine guard exists for, and mixing one such
+        take into a migrated pool must not launder the lot. Passive takes are
+        ignored -- they are the pool teaching itself, and a pool that started
+        as his voiceprint and has learned a little is still his.
+        """
+        tks = self.takes(str(label))
+        stamped = [t for t in tks if t.src != "passive"]
+        if len(stamped) < 2:
+            return False
+        return all(t.src == VOICEPRINT_SRC and t.note.endswith(VOICEPRINT_NOTE)
+                   for t in stamped)
+
+    def voiceprint_labels(self) -> Tuple[str, ...]:
+        """Every label whose pool was carried out of ``voiceprint.npz``, in
+        the order the store holds them. More than one is the round-3 blocker
+        (one man, two labels) and the scripts print it as a fault."""
+        return tuple(lab for lab in self.labels()
+                     if self.carried_from_voiceprint(lab))
 
     def genuine_floor(self, label: str) -> Optional[float]:
         """The BOTTOM of this person's own measured band: the smallest
@@ -1508,13 +1638,44 @@ class VoiceGallery:
                 "as his -- that is a re-anchor, not a second migration: "
                 "scripts/voice_enrol.py --reanchor" % label)
             return out
+        # AND NEVER UNDER A SECOND NAME. THIS IS THE ROUND-3 BLOCKER'S DOOR,
+        # and the guard above was per-LABEL so it stood wide open.
+        #
+        # He edits his name in assistant.json, ``identity.owner_label(cfg)``
+        # changes, he re-runs --migrate, and it SUCCEEDS: the old slug's
+        # label stays on disk and his voice is now under two labels. Measured
+        # 2026-09-05, that layout refused him his own turns 0 of 100 with
+        # nobody else in the room -- identify() ranked the two of them
+        # against each other and the margin, which is a floor on his OWN
+        # within-person noise, could never be cleared by one man.
+        # ``identify(same=...)`` now folds them so an existing box is not
+        # locked out, and this stops another one being built: one voice, one
+        # label, and the store says which one and how to move it.
+        #
+        # PROVENANCE, NOT THE COSINE. A label that came out of voiceprint.npz
+        # and has since gone stale (he re-recorded it) still blocks, because
+        # it is still his and it would still be ranked beside the new one.
+        already = self.voiceprint_labels()
+        if already:
+            out["why"] = (
+                "his voiceprint is already in the voice gallery as %s, and a "
+                "second label of one voice locks him out: the gallery ranks "
+                "the two against each other and no margin can separate a man "
+                "from himself. One voice, one label. If you have renamed "
+                "yourself, move it rather than adding to it:\n"
+                "    scripts/voice_enrol.py --delete --label %s\n"
+                "    scripts/voice_enrol.py --migrate\n"
+                "If %s no longer matches voiceprint.npz, repair it in place "
+                "instead: scripts/voice_enrol.py --reanchor --label %s"
+                % (", ".join(already), already[0], already[0], already[0]))
+            return out
         staged = self._stage_voiceprint(src, out)
         if staged is None:
             return out
         before = dict(self._pool), dict(self._takes), dict(self._consent)
         for arr in staged:
             self.add(label, arr, src="legacy",
-                     note="migrated from voiceprint.npz format 2")
+                     note="migrated " + VOICEPRINT_NOTE)
         # The owner's own pool is his own consent; identity.Person carries the
         # same distinction ("owner" vs "typed") and face_enrol.consent draws it
         # in exactly this place.
@@ -1710,7 +1871,7 @@ class VoiceGallery:
             self._takes[label] = []
             for arr in staged:
                 self.add(label, arr, src="legacy",
-                         note="re-anchored from voiceprint.npz format 2")
+                         note="re-anchored " + VOICEPRINT_NOTE)
             if not self.consent(label):
                 self.set_consent(label, "owner")
             out["generation"] = self.save(

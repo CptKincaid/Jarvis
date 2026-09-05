@@ -367,3 +367,121 @@ def test_the_status_report_prints_the_margin(gal):
     lines = voice_enrol.separation_report(gal)
     assert len(lines) == 1
     assert "margin" in lines[0] and "%.2f" % vg.MARGIN in lines[0]
+
+
+# ============================ the owner's own label is not a thing to delete
+# lightly, and re-recording his voiceprint is not a thing to do silently
+def _carry(gallery, label, vectors):
+    """``--migrate``'s write: the voiceprint's vectors, provenance stamp and
+    all. The stamp is what both scripts and speaker._owner_pools read."""
+    for e in vectors:
+        gallery.add(label, e, src=vg.VOICEPRINT_SRC,
+                    note="migrated " + vg.VOICEPRINT_NOTE)
+    gallery.set_consent(label, "owner")
+
+
+def test_his_labels_finds_his_pool_by_provenance_and_by_measurement(gal):
+    """The two routes ``speaker._owner_pools`` uses, asked here so the script
+    and the runtime cannot come to different answers about who he is."""
+    world = Voices(seed=41, apart=0.3)
+    him = world.takes("hunter", 14)
+    _carry(gal, "hunterpeyrovi", him)                 # provenance
+    for e in him:                                     # measurement only
+        gal.add("hunter", e, src="enrol")
+    _fill(gal, world, "mara", 10, src="enrol")
+    assert voice_enrol.his_labels(gal, him) == ["hunter", "hunterpeyrovi"]
+    # with no voiceprint to measure against, provenance is the only route
+    assert voice_enrol.his_labels(gal, []) == ["hunterpeyrovi"]
+
+
+def test_delete_refuses_his_last_pool_while_somebody_else_is_enrolled(gal):
+    """C1-THIRD, THE ROUND-3 REVIEW'S THIRD REMAINING HOLE, and it had no
+    guard at all. ``--delete --label <his own label>`` walked back to the
+    layout ``owner_ready`` refuses to BUILD -- him in voiceprint.npz only, a
+    guest in the gallery -- where his own turns measured 80 of 100 at apart
+    0.7 and 34 of 100 at apart 1.0 against 100 of 100 migrated."""
+    world = Voices(seed=42, apart=0.3)
+    him = world.takes("hunter", 14)
+    _carry(gal, "hunter", him)
+    _fill(gal, world, "mara", 10, src="enrol")
+    ok, why = voice_enrol.delete_ok(gal, "hunter", "hunter", him)
+    assert not ok
+    assert "--reanchor" in why and "--yes" in why
+    # ...and taking HER away is untouched: consent withdrawal is not gated.
+    ok, _why = voice_enrol.delete_ok(gal, "mara", "hunter", him)
+    assert ok
+
+
+def test_delete_allows_the_spare_when_two_labels_hold_his_voice(gal):
+    """The tidy-up for the round-3 blocker must not be refused by the guard
+    that protects the last one: with two labels of his, either may go."""
+    world = Voices(seed=43, apart=0.3)
+    him = world.takes("hunter", 14)
+    _carry(gal, "hunterpeyrovi", him)
+    _carry(gal, "hunter", him)
+    _fill(gal, world, "mara", 10, src="enrol")
+    for label in ("hunter", "hunterpeyrovi"):
+        ok, why = voice_enrol.delete_ok(gal, label, "hunter", him)
+        assert ok, why
+
+
+def test_delete_allows_his_label_when_nobody_else_is_enrolled(gal):
+    """Nothing to protect him from: removing his label with an otherwise
+    empty gallery returns the box to what it was before this feature -- him
+    in voiceprint.npz, matched nameless, admitted."""
+    world = Voices(seed=44, apart=0.3)
+    him = world.takes("hunter", 14)
+    _carry(gal, "hunter", him)
+    ok, why = voice_enrol.delete_ok(gal, "hunter", "hunter", him)
+    assert ok, why
+    # and a label nobody enrolled is nothing to refuse
+    assert voice_enrol.delete_ok(gal, "nobody", "hunter", him)[0]
+
+
+def test_status_names_two_labels_of_his_voice_and_the_command(gal, capsys,
+                                                              monkeypatch,
+                                                              tmp_path):
+    """THE THING NOTHING SAID. The round-3 blocker's recovery was
+    ``--delete --label <the old slug>`` and no output anywhere named it."""
+    world = Voices(seed=45, apart=0.3)
+    him = world.takes("hunter", 14)
+    _carry(gal, "hunterpeyrovi", him)
+    _carry(gal, "hunter", him)
+    monkeypatch.setattr(voice_enrol.PATHS, "VOICEPRINT",
+                        tmp_path / "nothing.npz")
+    voice_enrol.show_status(gal)
+    out = capsys.readouterr().out
+    assert "MORE THAN ONE LABEL HOLDS THE OWNER'S VOICE" in out
+    assert "--delete --label" in out
+
+
+def test_status_calls_a_stale_carried_pool_stale_and_not_stolen(gal, capsys,
+                                                                monkeypatch,
+                                                                tmp_path):
+    """The two used to print the same sentence -- "NOT being read as him,
+    Jarvis will refuse his own turns" -- and for a pool carried out of
+    voiceprint.npz that is now false: it IS read as his, and what it costs is
+    stalled passive learning and stale margins."""
+    world = Voices(seed=46, apart=0.3)
+    _carry(gal, "hunter", world.takes("hunter", 14))
+    src = tmp_path / "voiceprint.npz"
+    import numpy as np
+    later = Voices(seed=47, apart=0.3)
+    later.shared = world.shared
+    later._identity["hunter"] = world.identity("hunter")
+    np.savez(src, _format=np.array([2]),
+             **{"emb_%04d" % i: np.asarray(e, dtype=np.float32)
+                for i, e in enumerate(later.takes("hunter", 14))})
+    monkeypatch.setattr(voice_enrol.PATHS, "VOICEPRINT", src)
+    monkeypatch.setattr(voice_enrol, "owner_label", lambda cfg: "hunter")
+    voice_enrol.show_status(gal)
+    out = capsys.readouterr().out
+    assert "come APART" in out and "--reanchor" in out
+    assert "will refuse his own turns" not in out
+
+    # and the impostor shape still gets the hard sentence
+    gal2 = vg.VoiceGallery(root=None)
+    _fill(gal2, Voices(seed=48, apart=0.3), "hunter", 14, src="enrol")
+    voice_enrol.show_status(gal2)
+    out2 = capsys.readouterr().out
+    assert "NOT being read as" in out2

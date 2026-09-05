@@ -341,8 +341,8 @@ def test_the_bound_and_the_door_are_the_same_number(rig):
     assert sp.MIGRATED_ALIAS_COSINE == vg.OWNER_POOL_COSINE
 
     # ...and the two agree on a WORKED case, not only on a constant: the
-    # centroid a refused sample would have produced is one the runtime would
-    # have disowned, measured rather than argued.
+    # centroid a refused sample would have produced is one that measures on
+    # the far side of the same line, measured rather than argued.
     v, enc, gate = rig
     world = Voices(seed=3, apart=0.3)
     _layout(v, enc, world)
@@ -352,9 +352,31 @@ def test_the_bound_and_the_door_are_the_same_number(rig):
     assert v._would_leave_his_own_pool(refused)
     cents = dict(v._all_centroids())
     cents[""] = refused
-    assert v._disowned(cents) == frozenset({"hunter"})
-    assert v._disowned(v._all_centroids()) == frozenset(), (
+    assert v._owner_alias_cosine(cents) < sp.MIGRATED_ALIAS_COSINE
+    assert v._owner_alias_cosine(v._all_centroids()) >= sp.MIGRATED_ALIAS_COSINE, (
         "the committed centroid is on the wrong side of the same line")
+
+    # AND THE DOOR ITSELF, WHICH IS NOW TWO QUESTIONS RATHER THAN ONE.
+    # ``_disowned`` exists to catch takes recorded under his name BY SOMEBODY
+    # ELSE at the microphone -- those carry src="enrol". A pool CARRIED OUT OF
+    # voiceprint.npz at the same cosine is his own, gone stale because he
+    # re-recorded the voiceprint, and disowning it cost him his own turns
+    # (measured 2026-09-05 by the round-3 review: 14 of 100 at apart 1.0).
+    # Same numbers, opposite answers, and the difference is provenance.
+    assert v._disowned(cents) == frozenset(), (
+        "a pool carried out of voiceprint.npz is stale, never stolen")
+    mic = sp.SpeakerVerifier(owner_label="hunter")
+    mic._model_loaded = True
+    mic.gallery = vg.VoiceGallery(root=None)
+    for e in world.takes("hunter", 14):
+        mic.gallery.add("hunter", e, src="enrol", note="a prompt line")
+    mic._embeddings = list(v._embeddings)
+    mic._recompute_centroid()
+    mic_cents = dict(mic._all_centroids())
+    mic_cents[""] = refused
+    assert mic._owner_alias_cosine(mic_cents) < sp.MIGRATED_ALIAS_COSINE
+    assert mic._disowned(mic_cents) == frozenset({"hunter"}), (
+        "a pool of microphone takes under his name is still disowned")
 
 
 # ======================================================== 3. the recovery
@@ -377,8 +399,8 @@ def _write_voiceprint(path, vectors):
     return path
 
 
-def test_a_disowned_owner_has_a_supported_way_back_with_no_re_enrolment(rig,
-                                                                        tmp_path):
+def test_a_drifted_owner_has_a_supported_way_back_with_no_re_enrolment(rig,
+                                                                       tmp_path):
     """THE LANE'S OWN HARD RULE. He does not pay for multi-speaker with a
     re-enrolment -- not to get in, and not to get back in.
 
@@ -386,27 +408,33 @@ def test_a_disowned_owner_has_a_supported_way_back_with_no_re_enrolment(rig,
     voiceprint he already has, no microphone, no takes, no file deleted by
     hand.
 
-    APART 1.0, AND THE REASON MATTERS. Once the reported-score fault above is
-    fixed, a drifted box at apart 0.3 admits him again anyway -- the guest is
-    so far off that nothing outscores him. The lockout SURVIVES that fix
-    wherever the guest's own centroid clears the 0.30 bar on his voice, which
-    at apart 1.0 it does (measured 0.41 here). So the two faults really are
-    independent, and this is the one the recovery is for: he is still
-    DISOWNED, his own label is still not read as his, and no amount of the
-    first fix gets it back.
+    THE NUMBER CHANGED ON 2026-09-05 AND THE OLD ONE IS WRITTEN DOWN HERE.
+    This test used to assert that a drifted box still REFUSED him most of his
+    turns (8 of 30 admitted at apart 1.0) and that the re-anchor was what got
+    them back. It was measuring a second fault stacked on the drift:
+    ``_disowned`` dropped his own migrated pool out of the matchable set the
+    moment it fell under the 0.98 line, so the one instrument that knew his
+    voice stopped being asked. A pool CARRIED OUT OF voiceprint.npz is his by
+    construction -- the impostor shape ``_disowned`` exists for is microphone
+    takes under his name, which carry src="enrol" -- so it is no longer
+    disowned, and the drift on its own now costs him NOTHING: 30 of 30 before
+    the re-anchor as well as after.
 
-    THE NUMBER, STATED HONESTLY. With the reported score fixed this is not
-    the reported 0 of 100 any more -- it is 8 of 30 here, because on some
-    clips the guest happens to fall under the bar and he gets through. A
-    two-thirds refusal rate on his own box is the thing being repaired; the
-    original 0 of 100 was the two faults compounding."""
+    THE RE-ANCHOR IS STILL THE REPAIR AND IS STILL NEEDED. The anchor cosine
+    is still under the line, ``--status`` still reports it, passive learning
+    is still stalled while it is (that is C2, and it is the intended cost),
+    and this is still the only way back that spends no takes. What changed is
+    that he is no longer locked out while he waits to run it.
+    """
     v, enc, gate = rig
     world = Voices(seed=3, apart=1.0)
     pool = _drifted(v, enc, world)
     assert _anchor_cos(v) < vg.OWNER_POOL_COSINE, "the drift did not reproduce"
     before, _s = _turns(v, enc, gate, world)
-    assert before <= 10, ("expected the drift to still cost him most of his "
-                          "turns; it admitted %d of 30" % before)
+    print("MEASURED drifted-before-reanchor apart=1.0: admitted=%d/30 "
+          "anchor=%.4f" % (before, _anchor_cos(v)))
+    assert before == 30, ("the drift itself must not cost him a turn; it "
+                          "admitted %d of 30" % before)
 
     src = _write_voiceprint(tmp_path / "vp.npz", pool)
     out = v.gallery.reanchor_voiceprint("hunter", path=src)
