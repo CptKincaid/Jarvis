@@ -595,6 +595,7 @@ def label_fault(label) -> str:
 
 # ============================================================ the Tk surface
 import tkinter as tk                                   # noqa: E402
+from tkinter import font as tkfont                     # noqa: E402
 
 from jarvis.ui import theme                            # noqa: E402
 from jarvis.ui.widgets import RoundButton, px, ui_display, ui_font  # noqa: E402
@@ -762,10 +763,23 @@ class UsersPage(tk.Frame):
         self._cancel_btn = RoundButton(act, text="Cancel", kind="ghost",
                                        bg=bg, pad_x=10, pad_y=5,
                                        command=self._cancel)
+        # THE PATH IS THE LEAST IMPORTANT THING IN THIS ROW, so it gives up
+        # its width first. It is NOT packed here: the packer allocates in
+        # pack-call order, and packing it at build time -- before Create and
+        # Cancel are packed at paint time -- gave it the full 380 px of the
+        # people.json path and cut the right-hand end off "Cancel".
+        # MEASURED 2026-09-05 at 920x1440, on the shipped merge: the foot
+        # read "Create  Cance|/home/example/.local/state/jarvis/people.json".
+        # This is the SECOND time this exact defect has been fixed in this
+        # file -- see the destructive panel's row, which solved it the same
+        # way -- so the rule is written down rather than fixed again:
+        # BUTTONS TAKE THEIR WIDTH FIRST, the path takes what is left, and
+        # what is left is measured, not guessed.
         self._path_lbl = tk.Label(
             act, text="", font=ui_display(theme.SIZE_CAPTION),
             fg=theme.FAINT, bg=bg, anchor="e", bd=0, padx=0, pady=0)
-        self._path_lbl.pack(side="right", padx=(theme.PAD_S, 0))
+        self._path_full = ""
+        self._act_row = act
         self._note_lbl = tk.Label(
             self._foot, text="\n".join("· " + line for line in CANNOT_DO),
             font=ui_display(theme.SIZE_CAPTION), fg=theme.FAINT, bg=bg,
@@ -941,7 +955,7 @@ class UsersPage(tk.Frame):
             text=plan.line or self._snapshot.get("admin_line") or "",
             fg=theme.WARN if (plan.line and not plan.may_create)
             else theme.FAINT)
-        self._path_lbl.configure(text=self._snapshot.get("path") or "")
+        self._path_full = self._snapshot.get("path") or ""
         for child in list(self._body.winfo_children()):
             child.destroy()
         self._row_widgets = {}
@@ -977,8 +991,54 @@ class UsersPage(tk.Frame):
                 self._cancel_btn.pack_forget()
                 if not self._add_btn.winfo_ismapped():
                     self._add_btn.pack(side="left")
+            # LAST, always: re-packing it here is what puts it behind the
+            # buttons in the packer's allocation order, whichever buttons
+            # this state has.
+            self._path_lbl.pack_forget()
+            self._path_lbl.pack(side="right", padx=(theme.PAD_S, 0))
+            self._fit_path()
         except Exception:                 # noqa: BLE001 - torn down
             log.debug("users page: the foot could not be repacked",
+                      exc_info=True)
+
+    def _fit_path(self, event=None) -> None:
+        """Trim the people-file path from the LEFT until it fits the room
+        the buttons left it, with a leading ellipsis.
+
+        The TAIL is the part that identifies the file, so the head is what
+        goes. A path that will not fit at all becomes the bare file name,
+        and a file name that still will not fit becomes nothing -- an empty
+        label is honest; half a word beside a half-drawn button is not.
+        """
+        full = getattr(self, "_path_full", "") or ""
+        try:
+            row = self._act_row
+            room = int(row.winfo_width()) or int(row.winfo_reqwidth())
+            for btn in row.winfo_children():
+                if btn is not self._path_lbl and btn.winfo_ismapped():
+                    room -= int(btn.winfo_reqwidth())
+            room -= 2 * theme.PAD_S
+            font = tkfont.Font(font=self._path_lbl.cget("font"))
+            if room <= 0 or not full:
+                self._path_lbl.configure(text="")
+                return
+            if font.measure(full) <= room:
+                self._path_lbl.configure(text=full)
+                return
+            # Give up leading path segments first; then characters.
+            parts = full.split("/")
+            while len(parts) > 1:
+                parts.pop(0)
+                shown = "\u2026/" + "/".join(parts)
+                if font.measure(shown) <= room:
+                    self._path_lbl.configure(text=shown)
+                    return
+            name = parts[-1] if parts else ""
+            while name and font.measure("\u2026" + name) > room:
+                name = name[1:]
+            self._path_lbl.configure(text=("\u2026" + name) if name else "")
+        except Exception:                 # noqa: BLE001 - torn down
+            log.debug("users page: the path could not be fitted",
                       exc_info=True)
 
     def _may_add(self) -> bool:

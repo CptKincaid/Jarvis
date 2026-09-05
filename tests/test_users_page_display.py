@@ -901,3 +901,100 @@ def test_every_form_row_fits_the_window(root, geom):
     for w in _walk(page._body):
         if w.__class__.__name__ == "Label":
             assert w.winfo_reqwidth() <= width, (geom, w.cget("text")[:50])
+
+
+# ------------------------------------------- the foot row: buttons take first
+def _foot_widget(page, kind):
+    """The live widget for 'create'/'cancel'/'path' out of the pinned foot."""
+    return {"create": page._create_btn, "cancel": page._cancel_btn,
+            "path": page._path_lbl}[kind]
+
+
+# 920x1440 is the geometry the console was PHOTOGRAPHED at on 2026-09-05
+# (scripts/ui_shots.py --geometry 920x1440 --scale 2.0), and it is the
+# narrow end of what he uses; 1040x1760 is the stage size the rest of this
+# file measures at. The defect below was invisible at the wider one, which
+# is exactly why the pin has to carry both.
+SHOT_W, SHOT_H = 920, 1440
+
+
+@pytest.mark.parametrize("geometry", [(SHOT_W, SHOT_H), (HIS_W, HIS_H)],
+                         ids=["photographed-920x1440", "his-stage-1040x1760"])
+def test_the_cancel_button_is_drawn_whole_beside_a_long_people_path(
+        root, geometry):
+    """MEASURED on the shipped merge, 2026-09-05: the foot read
+    "Create  Cance|/home/example/.local/state/jarvis/people.json" -- the
+    path label had been packed at BUILD time, before Create and Cancel were
+    packed at paint time, so the packer gave it its full width and cut the
+    right-hand end off Cancel.
+
+    This is the SECOND time this exact defect has been fixed in this file;
+    the destructive panel's row carries the first. The rule both share: the
+    BUTTONS take their width first and the path takes what is left."""
+    snap = dict(_snapshot())
+    snap["path"] = "/home/hunterp/.local/state/jarvis/people.json"
+    page, _, host = _page(root, snapshot=snap, geometry=geometry)
+    page._adding = True
+    page._paint()
+    root.update_idletasks()
+    root.update()
+    cancel = _foot_widget(page, "cancel")
+    create = _foot_widget(page, "create")
+    assert cancel.winfo_ismapped() and create.winfo_ismapped()
+    # THE SQUEEZE IS THE SIGNAL. Tk does not overflow the parent; it hands
+    # the LEFT-packed buttons whatever the right-packed label left and
+    # narrows them, so a cut button keeps its winfo_reqwidth() and loses
+    # winfo_width(). MEASURED pre-fix at 2.0 scale, with the path label
+    # asking for 524 px at every window width:
+    #     1040 px window -> Cancel 159 of 159   (fits; the defect is hidden)
+    #      920 px window -> Cancel 138 of 159   (the photograph)
+    #      880 px window -> Cancel  98 of 159
+    #      800 px window -> Cancel  18 of 159
+    #      760 px window -> Cancel   1 of 159   (gone entirely)
+    # 1040 is why this pin carries both geometries: at his wider stage the
+    # bug is invisible, and a pin that only measured there would have
+    # passed on the broken build.
+    row = cancel.master
+    for name, btn in (("Create", create), ("Cancel", cancel)):
+        assert btn.winfo_width() >= btn.winfo_reqwidth(), (
+            "%s is drawn %d px wide in a %d px row but needs %d -- the "
+            "path label took the room" % (name, btn.winfo_width(),
+                                          row.winfo_width(),
+                                          btn.winfo_reqwidth()))
+
+
+def test_the_path_gives_up_its_width_and_keeps_the_tail(root):
+    """The tail names the file, so the HEAD is what goes. An elided path
+    must still end in the file name, and must never be wider than the room
+    the buttons left it."""
+    snap = dict(_snapshot())
+    snap["path"] = ("/home/hunterp/some/deliberately/very/long/path/that/"
+                    "cannot/possibly/fit/beside/two/buttons/people.json")
+    page, _, host = _page(root, snapshot=snap, geometry=(SHOT_W, SHOT_H))
+    page._adding = True
+    page._paint()
+    root.update_idletasks()
+    root.update()
+    shown = page._path_lbl.cget("text")
+    assert shown != snap["path"], "the path was not trimmed at all"
+    if shown:
+        assert shown.endswith("people.json") or shown.startswith("…")
+        row_w = page._path_lbl.master.winfo_width()
+        assert page._path_lbl.winfo_reqwidth() < row_w, (
+            "the trimmed path still asks for %d px of a %d px row"
+            % (page._path_lbl.winfo_reqwidth(), row_w))
+    # ...and Cancel is still whole beside it.
+    cancel = _foot_widget(page, "cancel")
+    assert cancel.winfo_width() >= cancel.winfo_reqwidth()
+
+
+def test_a_short_path_is_shown_in_full(root):
+    """The fix must not trim what already fits."""
+    snap = dict(_snapshot())
+    snap["path"] = "/tmp/p.json"
+    page, _, host = _page(root, snapshot=snap)
+    page._adding = True
+    page._paint()
+    root.update_idletasks()
+    root.update()
+    assert page._path_lbl.cget("text") == "/tmp/p.json"
