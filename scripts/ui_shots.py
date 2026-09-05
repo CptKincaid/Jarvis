@@ -594,7 +594,7 @@ class DeskIdle:
 
 
 class RigPeople:
-    """An INVENTED people book for the USERS page (states 29-31).
+    """An INVENTED people book for the USERS page (states 30-32).
 
     HIS OWN REGISTRY IS NEVER OPENED. jarvis/identity.py reads
     PATHS.OWNER_REGISTRY, and nothing in this file names that path or
@@ -625,6 +625,23 @@ class RigPeople:
              "enrolled_at": "2026-03-02T18:05:11"},
         ]
         self.calls: list = []
+        # The app's dwell, which is what the WRITES consult -- the page's
+        # own Lock is a mirror of it. The rig carries one so the frames
+        # photograph the real arrangement rather than the older app half
+        # that had no such seam.
+        self.unlocked = False
+
+    def admin_state(self) -> dict:
+        from jarvis import gate as gate_mod
+        self.calls.append("admin_state")
+        return {"admin": gate_mod.ADMIN_CODE,
+                "admin_line": ("an owner has set an override code, so it is "
+                               "asked for before anything is changed"),
+                "unlocked_s": 120.0 if self.unlocked else 0.0}
+
+    def relock(self) -> None:
+        self.calls.append("relock")
+        self.unlocked = False
 
     def snapshot(self) -> dict:
         from jarvis import gate as gate_mod
@@ -643,6 +660,7 @@ class RigPeople:
     def unlock(self, code) -> tuple:
         self.calls.append("unlock")
         del code
+        self.unlocked = True
         return True, "Unlocked, sir."
 
     def add(self, **kw) -> tuple:
@@ -717,6 +735,8 @@ def build_services(sensing: Optional[RigSensing] = None,
     svc.people_add = book.add
     svc.people_set_role = book.set_role
     svc.people_forget = book.forget
+    svc.people_admin_state = book.admin_state
+    svc.people_relock = book.relock
     svc._rig_people = book               # type: ignore[attr-defined]
     svc._rig_calls = calls               # type: ignore[attr-defined]
     return svc
@@ -1318,7 +1338,7 @@ class Rig:
         S(lambda: (OPTIONS.__setitem__("camera.preview", False),
                    win._on_config_change(CAMERA_PREVIEW_OPTION, False)), 400)
 
-        # 29-31 the USERS page ---------------------------------------------
+        # 30-32 the USERS page ---------------------------------------------
         # The people are RigPeople's INVENTED rows (build_services). His own
         # registry is never opened: the page reaches the app only through
         # Services.people_snapshot, and nothing in this file names
@@ -1340,6 +1360,11 @@ class Rig:
 
         def users_forget():
             page = win.users
+            # THROUGH THE APP'S DWELL, not the page's: the page Lock is a
+            # mirror the tick re-seeds from RigPeople every second, so
+            # unlocking only the mirror would relock a second later and the
+            # frame would photograph a refusal.
+            page.services._rig_people.unlocked = True
             page._lock.unlock()
             page._forget_pressed("pemberton")
 
