@@ -195,9 +195,19 @@ def restyled(look: Optional[str] = None) -> bool:
     be cleaned up. He did not ask for the classic look to change, and the
     09-05 relayout changed it by 175,076 px of 1,324,800 at 920x1440 and
     202,322 px at the window he actually runs (1040x1760) -- MEASURED on
-    the photo rig, frames 25/26/27, which are the six byte-stable frames
-    the rig produces. So classic is FROZEN at the v3 tip and every 09-05
-    improvement is holo's, which is the look he runs (theme.DEFAULT_LOOK).
+    the photo rig, frames 25/26/27. So classic is FROZEN at the v3 tip and
+    every 09-05 improvement is holo's, which is the look he runs
+    (theme.DEFAULT_LOOK).
+
+    A CORRECTION TO THE RIG NOTE THIS WORK STARTED FROM. Frames 25, 26 and
+    27 were said to be the rig's byte-stable frames. 25 and 27 are; 26 is
+    NOT. MEASURED both ways: two renders of the SAME v3 tree differ by 268
+    px at y418..435 x936..962 at 1040x1760, and two renders of the same
+    FIXED tree differ by 309 px at y448..465 x816..842 at 920x1440 -- the
+    round-trip readout, which is a live measurement and flips a digit
+    between runs. It sometimes matches by luck, which is how it came to be
+    called stable. A 0-px claim about frame 26 needs the same-code A/B
+    beside it.
 
     READ AT CALL TIME, never captured at def time: a look token captured
     when the module is imported freezes the import-time look, and
