@@ -242,9 +242,26 @@ def test_the_privacy_section_builds_the_row_with_a_masked_entry():
     assert "self._knightfall_row(box)" in src[priv:system]
     row = inspect.getsource(SettingsDrawer._knightfall_row)
     assert 'show="•"' in row
+    assert views_mod.KNIGHTFALL_NOT_WIRED == "Knightfall not wired"
+    # CLASSIC keeps the 09-04 words exactly; it is frozen
+    # (tests/test_ui_classic_frozen.py) and its row still overflows.
     assert '"Knightfall code"' in row
     assert '"Email me a new Knightfall code"' in row
-    assert views_mod.KNIGHTFALL_NOT_WIRED == "Knightfall not wired"
+    # HOLO -- the look he runs -- has the words that FIT the 576 px slot:
+    # the full label left no arrangement that did (2026-09-05).
+    assert SettingsDrawer.KNIGHTFALL_LABEL_HOLO == "Knightfall"
+    assert SettingsDrawer.KNIGHTFALL_NEW_HOLO == "Email me a new code"
+    assert "KNIGHTFALL_LABEL_HOLO" in row and "KNIGHTFALL_NEW_HOLO" in row
+    # the look is read at CALL time, never captured beside the def
+    assert 'theme.LOOK == "holo"' in row
+
+
+def test_the_masked_box_is_sized_from_the_code_the_generator_makes():
+    """A box narrower than a code shows him a code that scrolls. The
+    number is the drawer's, the length is passphrase's, and they are
+    pinned to each other rather than both being hand-picked."""
+    from jarvis import passphrase as pp
+    assert SettingsDrawer.KNIGHTFALL_CHARS >= pp.NEW_CODE_LEN == 8
 
 
 # ------------------------------------------- what the row says, and when

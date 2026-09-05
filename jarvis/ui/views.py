@@ -2398,13 +2398,16 @@ class SettingsDrawer(tk.Frame):
     # all on ONE baseline, through the shared jarvis/ui/widgets.py Slider.
     # Classic keeps the stock Scale, token for token (tests/test_theme_look).
     #
-    # THE WIDTH BUDGET, MEASURED on :94 at S=2 (2026-09-05): the drawer's
-    # inner width is 576 px, the widest slider label ("Silence timeout (s)")
-    # is 310 px, and the value is 70 px ("0.015" in the caption mono face).
-    # 310 + 16 + 160 + 12 + 70 = 568 leaves 8 px of slack -- the arithmetic
-    # is pinned in tests/test_ui_layout_rules.py so a longer label or a
-    # longer track cannot silently collide again.
-    SLIDER_LEN_HOLO = 80          # design units: the track
+    # THE WIDTH BUDGET, RE-MEASURED on :93 at S=2 (2026-09-05, the
+    # knightfall-row lane). The drawer's inner width is 576 px. The first
+    # pass wrote the widest slider label ("Silence timeout (s)") down as
+    # 310 px and the value as 70; both were short -- the label renders 318
+    # and the value 74 -- so the row asked for 318 + 16 + 164 + 12 + 74 =
+    # 584 and the TRACK paid the 8 px, coming back 156 px wide against its
+    # natural 164. Measuring the widgets instead of the arithmetic is how
+    # that surfaced (test_no_drawer_row_asks_for_more_width_than_its_slot).
+    # 318 + 16 + 148 + 12 + 74 = 568 puts the 8 px of slack back.
+    SLIDER_LEN_HOLO = 74          # design units: the track
     SLIDER_GAP_HOLO = 8           # label -> track
     SLIDER_VALUE_GAP_HOLO = 6     # track -> value
     SLIDER_VALUE_CHARS = 5        # "0.015" is the widest value the drawer shows
@@ -2672,23 +2675,67 @@ class SettingsDrawer(tk.Frame):
         tk.Frame(self._inner, bg=theme.RAISED, height=theme.PAD_L).pack()
 
     # ---------------------------------------------------- Knightfall
+    #
+    # THE ROW'S WIDTH BUDGET, MEASURED on :93 at S=2 (2026-09-05), after
+    # Hunter restarted onto the merged tip: "the knightfall text doesnt fit
+    # in its slot". The row ASKED for 676 px of a 576 px slot -- 100 px
+    # over -- and Tk does not wrap a row, it shrinks a child: the Open
+    # button came back 25 px wide against its natural 125, so the word was
+    # drawn as a sliver beside the label. The button under it asked for 578
+    # and had its ring clipped at 576.
+    #
+    # It was never a question of HIS window. The drawer is a fixed 640 px
+    # column at any window size, so the overflow was identical at 920x1440
+    # and at his 1040x1760. What his window changed is nothing; what hid it
+    # is the FOLD -- 3747 px of drawer in a 1649 px view, so these rows sit
+    # 1317 px below the top and the photo rig's 14-settings frame never
+    # scrolls to them. tests/test_ui_layout_rules.py now measures the rows
+    # rather than trusting a frame.
+    #
+    # Holo's row is now  label 164 + 16 + box 186 + 16 + Open 149 = 531  in
+    # 576, with the Open button RIGHTMOST so its ring lands on the same
+    # control column as every other button (and "Knightfall code" shortens
+    # to "Knightfall": with the full label no arrangement fits -- even a
+    # six-character box overruns by 2 px). CLASSIC IS FROZEN
+    # (tests/test_ui_classic_frozen.py) and keeps the 09-04 row exactly,
+    # overflow included; he runs holo.
+    KNIGHTFALL_CHARS = 8       # a whole code, masked: passphrase.NEW_CODE_LEN
+    KNIGHTFALL_LABEL_HOLO = "Knightfall"
+    KNIGHTFALL_NEW_HOLO = "Email me a new code"
+
     def _knightfall_row(self, box):
         """A masked entry with an Open button, and the bootstrap button
         under it. The entry is never bound to CONFIG and never read except
         by the press: nothing here persists a code anywhere."""
-        row = self._row(box, "Knightfall code")
+        holo = theme.LOOK == "holo"          # at CALL time, never at def
+        row = self._row(box, self.KNIGHTFALL_LABEL_HOLO if holo
+                        else "Knightfall code")
         self._knightfall_entry = tk.Entry(
-            row, show="•", width=12, bd=0, relief="flat",
-            bg=theme.BG if theme.LOOK == "holo" else theme.SURFACE,
+            row, show="•", width=self.KNIGHTFALL_CHARS if holo else 12,
+            bd=0, relief="flat",
+            bg=theme.BG if holo else theme.SURFACE,
             fg=theme.INK, insertbackground=theme.CYAN,
             font=ui_font(theme.SIZE_LABEL), highlightthickness=0)
-        self._knightfall_entry.pack(side="right", padx=(theme.PAD_S, 0))
-        self._knightfall_open = RoundButton(
-            row, text="Open", kind="ghost", bg=theme.RAISED, pad_x=8,
-            pad_y=4, command=self._knightfall_open_pressed)
-        self._knightfall_open.pack(side="right")
+        if holo:
+            # packed FIRST so it is the rightmost thing on the row: the
+            # button is the control, and the control column is the right
+            # edge. kind="default" (not ghost) for the same reason -- the
+            # ink edge a ringed button draws is the one every other button
+            # in the drawer draws.
+            self._knightfall_open = RoundButton(
+                row, text="Open", kind="default", bg=theme.RAISED, pad_y=5,
+                command=self._knightfall_open_pressed)
+            self._knightfall_open.pack(side="right")
+            self._knightfall_entry.pack(side="right", padx=theme.PAD_S)
+        else:
+            self._knightfall_entry.pack(side="right", padx=(theme.PAD_S, 0))
+            self._knightfall_open = RoundButton(
+                row, text="Open", kind="ghost", bg=theme.RAISED, pad_x=8,
+                pad_y=4, command=self._knightfall_open_pressed)
+            self._knightfall_open.pack(side="right")
         self._knightfall_new = self._button_row(
-            box, "Email me a new Knightfall code",
+            box, self.KNIGHTFALL_NEW_HOLO if holo
+            else "Email me a new Knightfall code",
             self._knightfall_new_pressed)
         # The caption is NOT a literal: it names the masked destination the
         # next code would go to, or says there is no mail account and the

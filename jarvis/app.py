@@ -223,6 +223,20 @@ KNIGHTFALL_BODY_LINE = "Typed only, never spoken. This replaces the old one."
 KNIGHTFALL_OK_LINE = "Knightfall accepted, sir; a new code is in your inbox."
 KNIGHTFALL_NEW_OK_LINE = "Knightfall: a new code is in your inbox."
 KNIGHTFALL_COOLDOWN_LINE = "Knightfall: one code a minute, sir."
+# The bootstrap with an empty people book. MEASURED on :93 at S=2
+# (2026-09-05): the line this replaced was 1541 px of text in a toast strip
+# that holds 894 px at his window, so widgets.ellipsize cut it mid-word --
+# "...nobody is enrolled as an owner yet (scri" -- which is the "knightfall
+# text doesnt fit in its slot" he reported. The strip is ONE line by design
+# (widgets.Toast.STRIP_H), so the fix is a line that fits: 580 px, whole at
+# 920x1440 as well. The state it describes is CORRECT and unchanged --
+# Knightfall cannot work until somebody is enrolled as an owner -- and the
+# command that fixes it goes to the log, which is where a line too long for
+# the strip belongs (docs/assistant-setup.md, "If it does not work").
+KNIGHTFALL_NO_OWNER_LINE = "Knightfall: enrol an owner first, sir."
+KNIGHTFALL_NO_OWNER_LOG = ("knightfall: nobody is enrolled as an owner yet; "
+                           "run scripts/jarvis_people.py add <you> "
+                           "--role owner")
 KNIGHTFALL_COOLDOWN_S = 60.0
 # The rotation's failure lines carry the exception's TYPE, never its words,
 # because that text came from a transport that had just been handed a code.
@@ -6576,8 +6590,8 @@ class JarvisApp:
             except Exception:                      # noqa: BLE001 - no registry
                 who = ""
             if not who:
-                return ("Knightfall: nobody is enrolled as an owner yet "
-                        "(scripts/jarvis_people.py add ... --role owner)")
+                log.warning(KNIGHTFALL_NO_OWNER_LOG)
+                return KNIGHTFALL_NO_OWNER_LINE
             line, mailed = self._knightfall_rotate(who, mail=mail, smtp=smtp,
                                                    accepted=False)
             # THE CLOCK STARTS ON A CODE THAT ACTUALLY LEFT. It used to be
